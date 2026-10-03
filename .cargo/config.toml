@@ -1,0 +1,5 @@
+[build]
+rustflags = ["-C", "target-cpu=native"]
+
+[target.'cfg(target_os = "linux")']
+runner = "scripts/ozzy_run.sh"

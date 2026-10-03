@@ -1,0 +1,3 @@
+FROM docker.io/library/debian:trixie-slim
+COPY ozy_broker /usr/local/bin/ozy_broker
+ENTRYPOINT ["/usr/local/bin/ozy_broker"]

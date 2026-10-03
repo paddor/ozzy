@@ -1,0 +1,63 @@
+[package]
+autotests = false
+name = "ozzy-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Embedded Ozzy broker runtime and native SDK over OMQ."
+readme = "README.md"
+publish = false
+
+[features]
+default = []
+lz4-transport = ["omq-tokio/lz4"]
+lz4-storage = ["ozzy-journal-segment/lz4"]
+simulation = []
+# Batch-level read-cache counters for measurement builds.
+storage-metrics = ["ozzy-journal-segment/storage-metrics"]
+
+[dependencies]
+ahash.workspace = true
+arc-swap = { workspace = true }
+bytes.workspace = true
+fanring = { workspace = true, features = ["async"] }
+futures.workspace = true
+omq-tokio.workspace = true
+serde_json.workspace = true
+pin-project-lite.workspace = true
+smallvec.workspace = true
+ozzy-core.workspace = true
+ozzy-proto.workspace = true
+ozzy-replication.workspace = true
+ozzy-journal.workspace = true
+ozzy-io.workspace = true
+ozzy-journal-segment.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "sync", "time"] }
+uuid.workspace = true
+xxhash-rust.workspace = true
+lz4rip.workspace = true
+
+[dev-dependencies]
+ozzy-io = { workspace = true, features = ["simulation"] }
+ozzy-io-pool.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
+
+[[test]]
+name = "ozzy_raw_notify_ban"
+path = "tests/raw_notify_ban.rs"
+
+[[test]]
+name = "ozzy_replica_transport"
+path = "tests/replica_transport.rs"
+
+[[test]]
+name = "ozzy_replication"
+path = "tests/replication.rs"

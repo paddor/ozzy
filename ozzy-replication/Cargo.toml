@@ -1,0 +1,78 @@
+[package]
+autotests = false
+name = "ozzy-replication"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Deterministic replication state for Ozzy."
+readme = "README.md"
+publish = false
+
+[dependencies]
+bytes.workspace = true
+ozzy-core.workspace = true
+ozzy-journal.workspace = true
+ozzy-proto.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
+
+[[test]]
+name = "ozzy_configuration_record"
+path = "tests/configuration_record.rs"
+
+[[test]]
+name = "ozzy_driver"
+path = "tests/driver.rs"
+
+[[test]]
+name = "ozzy_flow"
+path = "tests/flow.rs"
+
+[[test]]
+name = "ozzy_flow_probe"
+path = "tests/flow_probe.rs"
+
+[[test]]
+name = "ozzy_flow_transmit"
+path = "tests/flow_transmit.rs"
+
+[[test]]
+name = "ozzy_lost_state"
+path = "tests/lost_state.rs"
+
+[[test]]
+name = "ozzy_normal"
+path = "tests/normal.rs"
+
+[[test]]
+name = "ozzy_persisting"
+path = "tests/persisting.rs"
+
+[[test]]
+name = "ozzy_view_change"
+path = "tests/view_change.rs"
+
+[[test]]
+name = "ozzy_wire"
+path = "tests/wire.rs"
+
+[[test]]
+name = "ozzy_wire_election"
+path = "tests/wire_election.rs"
+
+[[test]]
+name = "ozzy_wire_flow"
+path = "tests/wire_flow.rs"
+
+[[test]]
+name = "ozzy_wire_recovery"
+path = "tests/wire_recovery.rs"
+
+[[test]]
+name = "ozzy_wire_transfer"
+path = "tests/wire_transfer.rs"

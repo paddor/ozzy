@@ -1,0 +1,98 @@
+[package]
+autotests = false
+name = "ozzy-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Benchmark and comparison runner for Ozzy."
+readme = "README.md"
+publish = false
+
+[features]
+# Separate instrumented runs. Never label these as uninstrumented timing rows.
+allocation-counting = []
+comparisons = ["dep:iggy", "dep:rdkafka", "dep:tracing-subscriber", "ozzy-runtime/storage-metrics"]
+
+[[bin]]
+name = "ozy_timed_bench"
+path = "src/bin/ozy_timed_bench.rs"
+
+[[bin]]
+name = "ozy_segment_verify_bench"
+path = "src/bin/ozy_segment_verify_bench.rs"
+
+[[bin]]
+name = "ozy_chart"
+path = "src/bin/ozy_chart.rs"
+
+[[bin]]
+name = "ozy_compare"
+path = "src/bin/ozy_compare.rs"
+
+[[bin]]
+name = "ozy_workloads"
+path = "src/bin/ozy_workloads.rs"
+
+[[bin]]
+name = "ozy_profile"
+path = "src/bin/ozy_profile.rs"
+
+[[bin]]
+name = "ozy_disk_probe"
+path = "src/bin/ozy_disk_probe.rs"
+
+[[bin]]
+name = "ozy_lz4_dict_bench"
+path = "src/bin/ozy_lz4_dict_bench.rs"
+
+[dependencies]
+bytes.workspace = true
+clap.workspace = true
+futures.workspace = true
+itoa = "1.0"
+libc = "0.2"
+lz4rip.workspace = true
+plotters = { version = "0.3", default-features = false, features = ["svg_backend", "line_series"] }
+iggy = { git = "https://github.com/apache/iggy.git", rev = "71f29618ba04917fded0ef5cd085c206fef0ee49", optional = true }
+rdkafka = { version = "=0.38.0", optional = true }
+tracing-subscriber = { version = "0.3", optional = true, features = ["fmt"] }
+omq-tokio = { workspace = true, features = ["lz4"] }
+serde_json.workspace = true
+sha2 = "0.10"
+signal-hook = "0.3"
+regex = "1"
+toml = "0.8"
+rustix = { workspace = true, features = ["time", "thread"] }
+ozzy = { workspace = true, features = ["lz4-transport"] }
+ozzy-broker.workspace = true
+ozzy-config.workspace = true
+ozzy-journal.workspace = true
+ozzy-journal-segment = { workspace = true, features = ["lz4"] }
+ozzy-proto.workspace = true
+ozzy-replication.workspace = true
+ozzy-runtime.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["process", "io-util"] }
+uuid.workspace = true
+
+[lints]
+workspace = true
+
+[[test]]
+name = "ozzy_automation"
+path = "tests/automation.rs"
+
+[[test]]
+name = "ozzy_timed"
+path = "tests/timed.rs"
+
+[[test]]
+name = "ozzy_native"
+path = "tests/native.rs"
+
+[[example]]
+name = "ozzy_iggy_rc_logout"
+path = "examples/iggy_rc_logout.rs"

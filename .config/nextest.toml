@@ -1,0 +1,8 @@
+[test-groups.broker-lifecycle]
+# Each case starts several real brokers, SDK runtimes, and shared disk pools.
+# Keep lifecycle qualification isolated from other broker lifecycle cases.
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'package(ozzy-broker) & (test(journals::serving::) | test(process::))'
+test-group = 'broker-lifecycle'

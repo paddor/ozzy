@@ -1,0 +1,26 @@
+[package]
+autotests = false
+name = "ozzy-io-aio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Backend-owned Linux AIO execution for Ozzy"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+rustix = { workspace = true, features = ["event"] }
+ozzy-io.workspace = true
+ozzy-io-pool.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
+
+[[test]]
+name = "ozzy_aio_backend"
+path = "tests/backend.rs"

@@ -1,0 +1,10 @@
+/.claude/
+/target/
+/tmp/
+Cargo.lock.bak
+perf.data*
+*.log
+.DS_Store
+__pycache__/
+/doc/charts/**/*.json
+/doc/charts/**/*.jsonl

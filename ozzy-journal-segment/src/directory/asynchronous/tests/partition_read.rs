@@ -1,0 +1,282 @@
+use super::*;
+use crate::{
+    AsyncJournalPartitionIndex as Index, AsyncPartitionReadLimits as ReadConfig, JournalIndexError,
+    PreparedOperationRecords, SharedJournalOperation,
+};
+use ozzy_journal::{ReadLimits, operation::canonical_body_digest};
+use ozzy_proto::Offset;
+
+fn read_config(resident: usize) -> ReadConfig {
+    ReadConfig {
+        index: crate::IndexBuildLimits {
+            max_resident_bytes: resident,
+            ..indexes::build_limits()
+        },
+        cached_index_bytes: 1024,
+        cached_indexes: 2,
+        concurrent_reads: 1,
+    }
+}
+
+fn append(
+    controller: &mut Controller,
+    journal: Journal,
+    index: &mut Index,
+    number: u8,
+    backing: usize,
+) -> Journal {
+    let bytes = indexes::append_body(number);
+    let backing = backing.max(bytes.len());
+    let operation = CanonicalOperation {
+        kind: OperationKind::Append,
+        body: &bytes,
+        ..operation(&journal)
+    };
+    let records = PreparedOperationRecords::new(
+        operation.header(),
+        bytes.clone().into(),
+        limits().operations,
+    )
+    .unwrap()
+    .with_shared_backing_bytes(backing.max(bytes.len()));
+    let mut pipeline = journal.begin_write_pipeline(1).unwrap();
+    let group = pipeline
+        .begin_group_encoding()
+        .unwrap()
+        .encode_shared_raw(vec![SharedJournalOperation {
+            header: operation.header(),
+            body_digest: canonical_body_digest(&bytes),
+            body: bytes.into(),
+        }])
+        .unwrap();
+    let work = pipeline.prepare(group, backing).unwrap();
+    let completed = drive(controller, work.write());
+    let locations = pipeline.complete(completed).unwrap();
+    let journal = pipeline.finish().unwrap();
+    index.appended(&journal, &locations, &[records]).unwrap();
+    journal
+}
+
+fn capture(
+    index: &Index,
+    journal: &Journal,
+    first: u64,
+    end: u64,
+    through: u64,
+) -> crate::AsyncPartitionRead {
+    index
+        .prepare_read(
+            journal,
+            indexes::partition(),
+            Offset::new(first),
+            Offset::new(end),
+            through,
+            ReadLimits {
+                max_records: 16,
+                max_bytes: 8192,
+            },
+        )
+        .unwrap()
+}
+
+fn read(controller: &mut Controller, captured: crate::AsyncPartitionRead) -> (Vec<u64>, usize) {
+    let mut offsets = Vec::new();
+    let mut jobs = 0;
+    drive_with(
+        controller,
+        captured.visit(|span| {
+            for record in span.records() {
+                assert_eq!(record.parts().next().unwrap(), b"payload");
+                offsets.push(record.offset().get());
+            }
+            span.len()
+        }),
+        |_| {
+            jobs += 1;
+            Effect::Normal
+        },
+    )
+    .unwrap();
+    (offsets, jobs)
+}
+
+#[test]
+fn async_incremental_reads_capture_exact_prefix_without_file_work() {
+    let (mut controller, journal) = empty_journal();
+    let mut index = drive(&mut controller, Index::open(&journal, read_config(8192))).unwrap();
+    let journal = append(&mut controller, journal, &mut index, 0, 0);
+    let captured = capture(&index, &journal, 0, 1, 1);
+    assert!(journal.pins.is_pinned(1).unwrap());
+    assert!(matches!(
+        index.prepare_read(
+            &journal,
+            indexes::partition(),
+            Offset::ZERO,
+            Offset::new(1),
+            1,
+            ReadLimits {
+                max_records: 1,
+                max_bytes: 8192
+            }
+        ),
+        Err(JournalIndexError::ReadIndexCapacity)
+    ));
+    let journal = append(&mut controller, journal, &mut index, 1, 0);
+    assert_eq!(read(&mut controller, captured), (vec![0], 0));
+    assert!(!journal.pins.is_pinned(1).unwrap());
+    let captured = capture(&index, &journal, 0, 2, 1);
+    assert_eq!(read(&mut controller, captured), (vec![0], 0));
+    let captured = capture(&index, &journal, 0, 2, 2);
+    assert_eq!(read(&mut controller, captured), (vec![0, 1], 0));
+    drive(&mut controller, journal.close()).unwrap();
+}
+
+#[test]
+fn async_resident_delivery_releases_file_protection_and_keeps_bounded_selection() {
+    let (mut controller, journal) = empty_journal();
+    let mut index = drive(&mut controller, Index::open(&journal, read_config(0))).unwrap();
+    let journal = append(&mut controller, journal, &mut index, 0, 0);
+    let resident = capture(&index, &journal, 0, 1, 1).into_resident().unwrap();
+    assert!(!journal.pins.is_pinned(1).unwrap());
+    let mut journal = append(&mut controller, journal, &mut index, 1, 0);
+    let cold = capture(&index, &journal, 0, 1, 1)
+        .into_resident()
+        .unwrap_err();
+    assert_eq!(read(&mut controller, cold).0, [0]);
+    drive(&mut controller, journal.roll_active(32768, 4)).unwrap();
+    index.rolled(&journal).unwrap();
+    let mut offsets = Vec::new();
+    resident
+        .visit_spans(|span| {
+            offsets.extend(span.records().map(|record| record.offset().get()));
+            span.len()
+        })
+        .unwrap();
+    assert_eq!(offsets, [0]);
+    assert!(controller.jobs().is_empty());
+    drive(&mut controller, journal.close()).unwrap();
+}
+
+#[test]
+fn async_read_cache_charges_whole_backing_and_evicted_reads_still_work() {
+    for (resident, backing) in [(0, 0), (1024, 4096)] {
+        let (mut controller, journal) = empty_journal();
+        let mut index = drive(
+            &mut controller,
+            Index::open(&journal, read_config(resident)),
+        )
+        .unwrap();
+        let journal = append(&mut controller, journal, &mut index, 0, backing);
+        // The existing cache permits one newest oversized operation. Evict it
+        // with a successor to exercise the cold path and full-backing charge.
+        let journal = append(&mut controller, journal, &mut index, 1, backing);
+        let captured = capture(&index, &journal, 0, 1, 1);
+        let (offsets, jobs) = read(&mut controller, captured);
+        assert_eq!(offsets, [0]);
+        assert!(jobs > 0);
+        drive(&mut controller, journal.close()).unwrap();
+    }
+}
+
+#[test]
+fn async_reader_predecessors_survive_rolls_and_cold_cache_misses() {
+    let (mut controller, mut journal) = empty_journal();
+    let mut config = read_config(0);
+    config.cached_index_bytes = 0;
+    let mut index = drive(&mut controller, Index::open(&journal, config)).unwrap();
+    journal = append(&mut controller, journal, &mut index, 0, 0);
+    let captured = capture(&index, &journal, 0, 1, 1);
+    for number in 1..=3 {
+        drive(&mut controller, journal.roll_active(32768, 4)).unwrap();
+        index.rolled(&journal).unwrap();
+        journal = append(&mut controller, journal, &mut index, number, 0);
+    }
+    assert_eq!(read(&mut controller, captured).0, [0]);
+    for number in 0..4 {
+        let captured = capture(&index, &journal, number, number + 1, 4);
+        assert_eq!(read(&mut controller, captured).0, [number]);
+    }
+    // Opening builds active state once, not again for each read.
+    let reopened = drive(&mut controller, Index::open(&journal, config)).unwrap();
+    let captured = capture(&reopened, &journal, 3, 4, 4);
+    assert_eq!(read(&mut controller, captured).0, [3]);
+    drive(&mut controller, journal.close()).unwrap();
+}
+
+#[test]
+fn async_read_cancellation_releases_admission_without_invalidating_owner() {
+    let (mut controller, journal) = empty_journal();
+    let mut index = drive(&mut controller, Index::open(&journal, read_config(0))).unwrap();
+    let journal = append(&mut controller, journal, &mut index, 0, 0);
+    let journal = append(&mut controller, journal, &mut index, 1, 0);
+    let captured = capture(&index, &journal, 0, 1, 1);
+    drop(captured);
+    assert!(!journal.pins.is_pinned(1).unwrap());
+    let captured = capture(&index, &journal, 0, 1, 1);
+    #[expect(
+        clippy::redundant_closure_for_method_calls,
+        reason = "closure is higher-ranked over record lifetime"
+    )]
+    let mut future = Box::pin(captured.visit(|span| span.len()));
+    assert!(poll(future.as_mut()).is_pending());
+    let jobs = controller.jobs();
+    assert_eq!(jobs.len(), 1);
+    drop(future);
+    for (id, _) in jobs {
+        controller.execute(id, Effect::Normal).unwrap();
+        controller.deliver(id).unwrap();
+    }
+    let captured = capture(&index, &journal, 0, 1, 1);
+    assert_eq!(read(&mut controller, captured).0, [0]);
+    drive(&mut controller, journal.close()).unwrap();
+}
+
+#[test]
+fn async_read_obeys_byte_limits_and_rejects_uninstalled_index_growth() {
+    let (mut controller, journal) = empty_journal();
+    let mut index = drive(&mut controller, Index::open(&journal, read_config(8192))).unwrap();
+    let mut journal = append(&mut controller, journal, &mut index, 0, 0);
+    journal = append(&mut controller, journal, &mut index, 1, 0);
+    for bytes in [1, 7, 13] {
+        let captured = index
+            .prepare_read(
+                &journal,
+                indexes::partition(),
+                Offset::ZERO,
+                Offset::new(2),
+                2,
+                ReadLimits {
+                    max_records: 2,
+                    max_bytes: bytes,
+                },
+            )
+            .unwrap();
+        assert_eq!(read(&mut controller, captured).0, [0]);
+    }
+    let body = indexes::append_body(2);
+    let operation = CanonicalOperation {
+        kind: OperationKind::Append,
+        body: &body,
+        ..operation(&journal)
+    };
+    drive(
+        &mut controller,
+        journal.append(&[operation], BodyEncoding::Raw),
+    )
+    .unwrap();
+    assert!(matches!(
+        index.prepare_read(
+            &journal,
+            indexes::partition(),
+            Offset::ZERO,
+            Offset::new(3),
+            3,
+            ReadLimits {
+                max_records: 3,
+                max_bytes: 8192
+            }
+        ),
+        Err(JournalIndexError::StaleCatalog)
+    ));
+    drive(&mut controller, journal.close()).unwrap();
+}

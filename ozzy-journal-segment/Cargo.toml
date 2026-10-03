@@ -1,0 +1,128 @@
+[package]
+autotests = false
+name = "ozzy-journal-segment"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Segmented append-only journal implementation for Ozzy."
+readme = "README.md"
+publish = false
+
+[features]
+simulation = []
+storage-metrics = []
+lz4 = []
+
+[dependencies]
+ahash.workspace = true
+bytes.workspace = true
+lz4rip.workspace = true
+smallvec.workspace = true
+ozzy-journal.workspace = true
+ozzy-proto.workspace = true
+ozzy-core.workspace = true
+ozzy-io.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ozzy-io-aio.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc = "0.2"
+rustix.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+ozzy-io = { workspace = true, features = ["simulation"] }
+ozzy-io-pool.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
+
+[[test]]
+name = "ozzy_canonical_recovery"
+path = "tests/canonical_recovery.rs"
+
+[[test]]
+name = "ozzy_checkpoint"
+path = "tests/checkpoint.rs"
+
+[[test]]
+name = "ozzy_checkpoint_state"
+path = "tests/checkpoint_state.rs"
+
+[[test]]
+name = "ozzy_codec"
+path = "tests/codec.rs"
+
+[[test]]
+name = "ozzy_configuration"
+path = "tests/configuration.rs"
+
+[[test]]
+name = "ozzy_directory"
+path = "tests/directory.rs"
+
+[[test]]
+name = "ozzy_history"
+path = "tests/history.rs"
+
+[[test]]
+name = "ozzy_index"
+path = "tests/index.rs"
+
+[[test]]
+name = "ozzy_index_builder"
+path = "tests/index_builder.rs"
+
+[[test]]
+name = "ozzy_index_file"
+path = "tests/index_file.rs"
+
+[[test]]
+name = "ozzy_lock_lifetime"
+path = "tests/lock_lifetime.rs"
+
+[[test]]
+name = "ozzy_metadata"
+path = "tests/metadata.rs"
+
+[[test]]
+name = "ozzy_placement"
+path = "tests/placement.rs"
+
+[[test]]
+name = "ozzy_recovery_configuration"
+path = "tests/recovery_configuration.rs"
+
+[[test]]
+name = "ozzy_relocation"
+path = "tests/relocation.rs"
+
+[[test]]
+name = "ozzy_suffix"
+path = "tests/suffix.rs"
+
+[[test]]
+name = "ozzy_suffix_stream"
+path = "tests/suffix_stream.rs"
+
+[[test]]
+name = "ozzy_volume"
+path = "tests/volume.rs"
+
+[[test]]
+name = "ozzy_write_metrics"
+path = "tests/write_metrics.rs"
+
+[[test]]
+name = "ozzy_writer"
+path = "tests/writer.rs"
+
+[[test]]
+name = "ozzy_writer_reuse"
+path = "tests/writer_reuse.rs"

@@ -1,0 +1,50 @@
+[package]
+autotests = false
+name = "ozzy-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Sans-I/O application protocol and message types for Ozzy."
+readme = "README.md"
+publish = false
+
+[dependencies]
+bytes.workspace = true
+lz4rip.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true
+
+[[test]]
+name = "ozzy_append"
+path = "tests/append.rs"
+
+[[test]]
+name = "ozzy_append_validation"
+path = "tests/append_validation.rs"
+
+[[test]]
+name = "ozzy_envelope"
+path = "tests/envelope.rs"
+
+[[test]]
+name = "ozzy_handshake"
+path = "tests/handshake.rs"
+
+[[test]]
+name = "ozzy_nack"
+path = "tests/nack.rs"
+
+[[test]]
+name = "ozzy_reader"
+path = "tests/reader.rs"
+
+[[test]]
+name = "ozzy_stream"
+path = "tests/stream.rs"

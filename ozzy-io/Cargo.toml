@@ -1,0 +1,20 @@
+[package]
+name = "ozzy-io"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Owned asynchronous file operations and resource contracts for Ozzy"
+
+[features]
+simulation = []
+
+[dependencies]
+bytes.workspace = true
+fanring.workspace = true
+futures.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+
+[lints]
+workspace = true

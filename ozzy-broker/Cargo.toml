@@ -1,0 +1,46 @@
+[package]
+name = "ozzy-broker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Ozzy broker deployment and startup integration."
+publish = false
+
+[dependencies]
+bytes.workspace = true
+clap.workspace = true
+futures.workspace = true
+omq-tokio.workspace = true
+ozzy-config.workspace = true
+ozzy-io.workspace = true
+ozzy-io-pool.workspace = true
+ozzy-journal.workspace = true
+ozzy-journal-segment.workspace = true
+ozzy-proto.workspace = true
+ozzy-replication.workspace = true
+ozzy-runtime.workspace = true
+tokio = { workspace = true, features = ["time"] }
+tempfile.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true, features = ["thread"] }
+ozzy-io-aio.workspace = true
+
+[dev-dependencies]
+ozzy-io = { workspace = true, features = ["simulation"] }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "ozy_broker"
+path = "src/main.rs"
+
+[[test]]
+name = "ozzy_broker_config"
+path = "tests/config.rs"

@@ -1,0 +1,36 @@
+[package]
+autotests = false
+name = "ozzy-io-pool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Explicit bounded file workers for Ozzy"
+
+[dependencies]
+fanring.workspace = true
+futures.workspace = true
+ozzy-io.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix.workspace = true
+libc = "0.2"
+
+[dev-dependencies]
+bytes.workspace = true
+futures.workspace = true
+ozzy-io = { workspace = true, features = ["simulation"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["time"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+ozzy-io-aio.workspace = true
+
+[lints]
+workspace = true
+
+[[test]]
+name = "ozzy_io_conformance"
+path = "tests/conformance.rs"

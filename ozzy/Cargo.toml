@@ -1,0 +1,32 @@
+[package]
+autotests = false
+name = "ozzy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Native writer and reader SDK for Ozzy brokers over OMQ."
+readme = "README.md"
+publish = false
+
+[features]
+default = []
+lz4-transport = ["omq-tokio/lz4", "ozzy-runtime/lz4-transport"]
+lz4-storage = ["ozzy-runtime/lz4-storage"]
+
+[dependencies]
+omq-tokio.workspace = true
+ozzy-proto.workspace = true
+ozzy-runtime.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true
+
+[[test]]
+name = "ozzy_dependency_graph"
+path = "tests/dependency_graph.rs"

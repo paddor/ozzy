@@ -1,0 +1,119 @@
+//! Render OMQ-style SVG charts from validated append-only result ledgers.
+#![forbid(unsafe_code)]
+mod chart;
+
+use clap::Parser;
+use ozzy_bench::automation::{self, Result, records};
+use std::path::PathBuf;
+
+#[derive(Debug, Parser)]
+struct Args {
+    /// Completed run; repeat for disjoint modes from the same checkout.
+    #[arg(long, required = true)]
+    run_id: Vec<String>,
+    /// Select measured modes before attaching cached comparisons.
+    #[arg(long, value_delimiter = ',')]
+    modes: Vec<String>,
+    /// Explicit compatible Iggy baseline for local Ozzy-only runs.
+    #[arg(long)]
+    iggy_run_id: Option<String>,
+    /// Cached Iggy reference retaining its original batch ceiling and workload revision.
+    #[arg(long, conflicts_with_all = ["iggy_run_id", "external_reference_run_id"])]
+    iggy_reference_run_id: Vec<String>,
+    /// Independently measured Redpanda reference alongside cached Iggy results.
+    #[arg(long, conflicts_with_all = ["iggy_run_id", "external_reference_run_id"])]
+    redpanda_reference_run_id: Vec<String>,
+    /// Cached Iggy and Redpanda references, retaining each original measurement.
+    #[arg(long, conflicts_with_all = ["iggy_run_id", "iggy_reference_run_id"])]
+    external_reference_run_id: Vec<String>,
+    /// Scheduled-arrival latency versus offered load, in separate SVGs.
+    #[arg(long, conflicts_with = "iggy_run_id")]
+    fixed_load: bool,
+    /// Explicit single-case backlog failures, annotated without latency values.
+    #[arg(long, requires = "fixed_load")]
+    failed_run_id: Vec<String>,
+    /// SVG root. Defaults to doc/charts.
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
+    /// Optional descriptive filename suffix, for example control.
+    #[arg(long, default_value = "")]
+    suffix: String,
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+    if !args
+        .suffix
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err("suffix must contain only ASCII letters, digits, or hyphens".into());
+    }
+    automation::isolation::require_idle()?;
+    let mut data = if args.fixed_load {
+        records::select_fixed_load(&automation::cache(), &args.run_id)?
+    } else {
+        records::select(
+            &automation::cache(),
+            &args.run_id,
+            args.iggy_run_id.as_deref(),
+        )?
+    };
+    records::retain_modes(&mut data, &args.modes)?;
+    let (references, implementations): (_, &[_]) = if args.external_reference_run_id.is_empty() {
+        (&args.iggy_reference_run_id, &["iggy"])
+    } else {
+        (&args.external_reference_run_id, &["iggy", "redpanda"])
+    };
+    if !references.is_empty() {
+        if !args.fixed_load && references.len() != 1 {
+            return Err("saturation charts require one external reference run".into());
+        }
+        records::include_references(
+            &automation::cache(),
+            &mut data,
+            references,
+            implementations,
+            args.fixed_load,
+        )?;
+    }
+    if !args.redpanda_reference_run_id.is_empty() {
+        if !args.fixed_load && args.redpanda_reference_run_id.len() != 1 {
+            return Err("saturation charts require one Redpanda reference run".into());
+        }
+        records::include_references(
+            &automation::cache(),
+            &mut data,
+            &args.redpanda_reference_run_id,
+            &["redpanda"],
+            args.fixed_load,
+        )?;
+    }
+    if !args.failed_run_id.is_empty() {
+        records::include_failed_loads(&automation::cache(), &mut data, &args.failed_run_id)?;
+        records::retain_modes(&mut data, &args.modes)?;
+    }
+    let output = args
+        .output_dir
+        .unwrap_or_else(|| automation::root().join("doc/charts"));
+    let cache = std::path::Path::new(automation::SSD).join("ozzy-chart-inputs");
+    std::fs::create_dir_all(&cache)?;
+    let suffix = if args.suffix.is_empty() {
+        String::new()
+    } else {
+        format!("-{}", args.suffix)
+    };
+    let kind = if args.fixed_load { "-fixed-load" } else { "" };
+    let modes = if args.modes.is_empty() {
+        String::new()
+    } else {
+        format!("-{}", args.modes.join("-"))
+    };
+    let input = cache.join(format!("{}{modes}{kind}{suffix}.json", args.run_id[0]));
+    automation::json_file(&input, &data)?;
+    if args.fixed_load {
+        chart::render_fixed_load(&data, &output, &suffix)
+    } else {
+        chart::render(&data, &output, &suffix)
+    }
+}

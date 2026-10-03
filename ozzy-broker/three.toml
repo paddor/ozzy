@@ -1,0 +1,66 @@
+[cluster]
+mode = "three"
+
+[topics.orders]
+partitions = 6
+confirmation = "disk-quorum"
+
+[brokers.broker-0.endpoints]
+peer = "tcp://127.0.0.1:7200"
+reader_pub = "tcp://127.0.0.1:7201"
+
+[brokers.broker-0.devices.ssd]
+root = "/mnt/ssd/tmp/ozzy-three/broker-0"
+controller = "ssd"
+
+[brokers.broker-0.devices.ssd.workers]
+backend = "pool"
+write_threads = 1
+
+[[brokers.broker-0.topology.shards]]
+id = 0
+device = "ssd"
+
+[[brokers.broker-0.topology.shards]]
+id = 1
+device = "ssd"
+
+[brokers.broker-1.endpoints]
+peer = "tcp://127.0.0.1:7210"
+reader_pub = "tcp://127.0.0.1:7211"
+
+[brokers.broker-1.devices.ssd]
+root = "/mnt/ssd/tmp/ozzy-three/broker-1"
+controller = "ssd"
+
+[brokers.broker-1.devices.ssd.workers]
+backend = "pool"
+write_threads = 1
+
+[[brokers.broker-1.topology.shards]]
+id = 0
+device = "ssd"
+
+[[brokers.broker-1.topology.shards]]
+id = 1
+device = "ssd"
+
+[brokers.broker-2.endpoints]
+peer = "tcp://127.0.0.1:7220"
+reader_pub = "tcp://127.0.0.1:7221"
+
+[brokers.broker-2.devices.ssd]
+root = "/mnt/ssd/tmp/ozzy-three/broker-2"
+controller = "ssd"
+
+[brokers.broker-2.devices.ssd.workers]
+backend = "pool"
+write_threads = 1
+
+[[brokers.broker-2.topology.shards]]
+id = 0
+device = "ssd"
+
+[[brokers.broker-2.topology.shards]]
+id = 1
+device = "ssd"

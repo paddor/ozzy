@@ -1,0 +1,31 @@
+[package]
+autotests = false
+name = "ozzy-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Deterministic owner state for Ozzy."
+readme = "README.md"
+publish = false
+
+[dependencies]
+ahash.workspace = true
+smallvec.workspace = true
+bytes.workspace = true
+ozzy-journal.workspace = true
+ozzy-proto.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
+
+[[test]]
+name = "ozzy_snapshot"
+path = "tests/snapshot.rs"
+
+[[test]]
+name = "ozzy_state"
+path = "tests/state.rs"

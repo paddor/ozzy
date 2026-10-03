@@ -1,0 +1,43 @@
+[package]
+autotests = false
+name = "ozzy-journal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Journal contracts and local durability evidence for Ozzy."
+readme = "README.md"
+publish = false
+
+[dependencies]
+xxhash-rust.workspace = true
+bytes.workspace = true
+lz4rip.workspace = true
+smallvec.workspace = true
+ozzy-proto.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
+
+[[test]]
+name = "ozzy_operation"
+path = "tests/operation.rs"
+
+[[test]]
+name = "ozzy_operation_allocations"
+path = "tests/operation_allocations.rs"
+
+[[test]]
+name = "ozzy_progress"
+path = "tests/progress.rs"
+
+[[test]]
+name = "ozzy_packed_records"
+path = "tests/packed_records.rs"
+
+[[test]]
+name = "ozzy_indexed_records"
+path = "tests/indexed_records.rs"

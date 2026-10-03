@@ -1,0 +1,24 @@
+[package]
+name = "ozzy-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Validated deployment configuration and persistent identity for Ozzy."
+publish = false
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+uuid = { workspace = true, features = ["serde"] }
+xxhash-rust.workspace = true
+
+[lints]
+workspace = true
+
+[[test]]
+name = "ozzy_config"
+path = "tests/config.rs"

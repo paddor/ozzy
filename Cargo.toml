@@ -1,0 +1,97 @@
+[workspace]
+members = [
+    "ozzy",
+    "ozzy-bench",
+    "ozzy-broker",
+    "ozzy-core",
+    "ozzy-config",
+    "ozzy-io",
+    "ozzy-io-pool",
+    "ozzy-io-aio",
+    "ozzy-proto",
+    "ozzy-replication",
+    "ozzy-runtime",
+    "ozzy-journal",
+    "ozzy-journal-segment",
+    "ozzy-sim",
+]
+default-members = [
+    "ozzy",
+    "ozzy-broker",
+    "ozzy-core",
+    "ozzy-config",
+    "ozzy-io",
+    "ozzy-io-pool",
+    "ozzy-io-aio",
+    "ozzy-proto",
+    "ozzy-replication",
+    "ozzy-runtime",
+    "ozzy-journal",
+    "ozzy-journal-segment",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "ISC"
+authors = ["Patrik Wenger <paddor@gmail.com>"]
+repository = "https://github.com/paddor/ozzy"
+
+[workspace.dependencies]
+ahash = "0.8.12"
+arc-swap = "1.9.2"
+bytes = "1.12.1"
+clap = { version = "4.6.6", features = ["derive"] }
+fanring = { version = "0.3.7", features = ["async"] }
+futures = "0.3.34"
+lz4rip = { version = "0.11.7", default-features = false, features = ["std"] }
+omq-tokio = { path = "../omq.rs/omq-tokio", version = "0.24.0", default-features = false }
+pin-project-lite = "0.2.17"
+rustix = { version = "1.1.4", features = ["fs"] }
+smallvec = "1.15.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ozzy = { path = "ozzy" }
+ozzy-broker = { path = "ozzy-broker" }
+ozzy-core = { path = "ozzy-core" }
+ozzy-config = { path = "ozzy-config" }
+ozzy-io = { path = "ozzy-io" }
+ozzy-io-pool = { path = "ozzy-io-pool" }
+ozzy-io-aio = { path = "ozzy-io-aio" }
+ozzy-proto = { path = "ozzy-proto" }
+ozzy-replication = { path = "ozzy-replication" }
+ozzy-runtime = { path = "ozzy-runtime" }
+ozzy-journal = { path = "ozzy-journal" }
+ozzy-journal-segment = { path = "ozzy-journal-segment" }
+tempfile = "3.27.0"
+thiserror = "2.0.20"
+tokio = { version = "1.52.0", features = ["macros", "rt-multi-thread", "signal"] }
+toml = "0.8.23"
+uuid = { version = "1.26.0", features = ["v7"] }
+xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
+
+[workspace.lints.rust]
+missing_debug_implementations = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unreachable_pub = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+
+[profile.bench]
+debug = "line-tables-only"
+
+[profile.release]
+debug = "line-tables-only"

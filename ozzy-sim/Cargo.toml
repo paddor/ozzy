@@ -1,0 +1,55 @@
+[package]
+autotests = false
+name = "ozzy-sim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Deterministic workloads and fault simulation for Ozzy components."
+readme = "README.md"
+publish = false
+
+[dependencies]
+ozzy-core.workspace = true
+ozzy-journal.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true
+futures.workspace = true
+omq-tokio.workspace = true
+ozzy-journal-segment = { workspace = true, features = ["lz4", "simulation"] }
+ozzy-proto.workspace = true
+ozzy-replication.workspace = true
+ozzy-runtime = { workspace = true, features = ["simulation"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+
+[lints]
+workspace = true
+
+[[test]]
+name = "ozzy_canonical_state"
+path = "tests/canonical_state.rs"
+
+[[test]]
+name = "ozzy_driver_liveness"
+path = "tests/driver_liveness.rs"
+
+[[test]]
+name = "ozzy_lifecycle"
+path = "tests/lifecycle.rs"
+
+[[test]]
+name = "ozzy_replication"
+path = "tests/replication.rs"
+
+[[test]]
+name = "ozzy_segment_replay"
+path = "tests/segment_replay.rs"
+
+[[test]]
+name = "ozzy_view_change_storage"
+path = "tests/view_change_storage.rs"

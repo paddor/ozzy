@@ -1,0 +1,8 @@
+doc-valid-idents = [
+    "..",
+    "OMQ",
+    "Ozzy",
+    "UUIDv7",
+    "ZeroMQ",
+    "ZMTP",
+]

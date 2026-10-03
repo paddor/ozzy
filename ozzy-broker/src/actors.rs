@@ -1,0 +1,323 @@
+//! Native actor construction from checked journal and deployment bounds.
+
+use crate::{CheckedConfig, JournalConfig, OpenedPartition, PartitionAuthority, StartupError};
+use ozzy_config::PartitionPlacement;
+use ozzy_proto::{LinkSessionId, NodeId, PartitionIncarnation};
+use ozzy_replication::{PipelineLimits, driver::Timing, flow::ProbeTiming};
+use ozzy_runtime::{
+    replica_actor::{
+        ActorConfig, ActorIds, LocalActor, LocalActorConfig, PartitionActor, ProposalSubmitter,
+        ReplicaActor, ScheduledReplica, SyncBatchTarget,
+    },
+    replica_journal::{InstallationConfig, ProposalBuffer, ShardJournalConfig},
+    replica_transport::QueueLimits,
+};
+use std::{collections::BTreeMap, time::Duration};
+
+/// Native per-partition work bounds. These do not advertise shard credit or
+/// replace aggregate memory admission. Replicated session entries are filled
+/// from independently established broker links when the actor is constructed.
+#[derive(Debug, Clone)]
+pub enum ActorSettings {
+    Local(LocalActorConfig),
+    Replicated {
+        journal: ShardJournalConfig,
+        actor: Box<ActorConfig>,
+    },
+}
+
+/// Shard-local actor and the bounded proposal resources used by native services.
+/// Construction starts no task, socket, journal worker, or device worker.
+#[derive(Debug)]
+pub struct StartedPartition {
+    pub cluster: uuid::Uuid,
+    pub placement: PartitionPlacement,
+    pub incarnation: PartitionIncarnation,
+    pub actor: PartitionActor,
+    pub proposal: ProposalSubmitter,
+    pub buffer: ProposalBuffer,
+}
+
+impl StartedPartition {
+    /// Prepare the configured partition in this service's empty proposal lease.
+    /// Submit when local authority allows writes, then await the normal proposal
+    /// result. Repeating after restart or an uncertain reply does not create a
+    /// second operation. Existing retention policy remains unchanged.
+    pub fn prepare_partition(&mut self) -> Result<(), StartupError> {
+        prepare_partition(
+            &mut self.buffer,
+            self.cluster,
+            &self.placement,
+            self.incarnation,
+        )
+    }
+}
+
+pub(crate) fn prepare_partition(
+    buffer: &mut ProposalBuffer,
+    cluster: uuid::Uuid,
+    placement: &PartitionPlacement,
+    incarnation: PartitionIncarnation,
+) -> Result<(), StartupError> {
+    use ozzy_journal::operation::{CreatePartition, RetentionPolicy};
+    use ozzy_proto::{OwnerEpoch, PartitionId};
+    buffer
+        .prepare_partition(CreatePartition {
+            partition: incarnation,
+            stream: &cluster.hyphenated().to_string(),
+            topic: &placement.topic,
+            partition_id: PartitionId::new(placement.partition),
+            owner_epoch: OwnerEpoch::INITIAL,
+            retention: RetentionPolicy::default(),
+        })
+        .map_err(|source| StartupError::Journal {
+            path: placement.directory.clone(),
+            source,
+        })
+}
+
+impl ActorSettings {
+    pub(crate) fn new(
+        checked: &CheckedConfig,
+        placement: &PartitionPlacement,
+        config: &JournalConfig,
+    ) -> Result<Self, StartupError> {
+        let journal = ShardJournalConfig::default();
+        let JournalConfig::Replicated(config) = config else {
+            let JournalConfig::Local(config) = config else {
+                unreachable!()
+            };
+            return Ok(Self::Local(LocalActorConfig {
+                journal,
+                proposal_lanes: 2,
+                proposal_capacity: config.append_limits.max_operations,
+                turn_steps: 16,
+            }));
+        };
+        // Every broker reads the same document. A common packet profile must
+        // fit even the smallest shard budget, independent of local CPU count or
+        // partition placement. Shard-local pipeline sizes can still differ.
+        let operations = checked
+            .deployment
+            .deployment()
+            .brokers
+            .values()
+            .flat_map(|broker| &broker.topology.shards)
+            .map(|shard| shard.budget.append_slots)
+            .fold(64, usize::min);
+        let pipeline = config.append_limits;
+        let replay_cache = replay_cache_limits(checked, placement, pipeline)?;
+        if operations == 0 || operations > pipeline.max_operations {
+            return Err(StartupError::Runtime(
+                "common replica transfer exceeds local pipeline".into(),
+            ));
+        }
+        let transfer = PipelineLimits {
+            max_operations: operations,
+            max_body_bytes: pipeline.max_body_bytes,
+        };
+        let message_bytes = operations
+            .checked_mul(86)
+            .and_then(|bytes| bytes.checked_add(288))
+            .and_then(|bytes| bytes.checked_add(transfer.max_body_bytes))
+            .ok_or_else(|| StartupError::Runtime("replica packet bound overflow".into()))?;
+        let queue_bytes = message_bytes
+            .checked_mul(4)
+            .ok_or_else(|| StartupError::Runtime("replica queue bound overflow".into()))?;
+        let segment_capacity = config.limits.io.max_segment_bytes;
+        let max_staged_bytes = segment_capacity
+            .checked_mul(config.limits.metadata.max_segments as u64)
+            .ok_or_else(|| StartupError::Runtime("replica installation bound overflow".into()))?;
+        Ok(Self::Replicated {
+            journal,
+            actor: Box::new(ActorConfig {
+                sessions: [LinkSessionId::from_bytes([0; 16]); 3],
+                timing: Timing {
+                    heartbeat: Duration::from_millis(100),
+                    retransmit: Duration::from_millis(100),
+                    primary_timeout: Duration::from_secs(1),
+                    election_timeout: Duration::from_secs(2),
+                    max_election_timeout: Duration::from_secs(8),
+                },
+                flow_probe: ProbeTiming {
+                    initial: Duration::from_millis(10),
+                    maximum: Duration::from_millis(100),
+                },
+                pipeline,
+                replay_cache,
+                transfer,
+                sync_batch_target: SyncBatchTarget::half_window(pipeline),
+                sync_batch_max_age: Duration::from_millis(1),
+                proposal_lanes: 2,
+                proposal_capacity: pipeline.max_operations,
+                control: QueueLimits {
+                    messages: 8,
+                    bytes: 8192,
+                    message_bytes: 1024,
+                },
+                data: QueueLimits {
+                    messages: 4,
+                    bytes: queue_bytes,
+                    message_bytes,
+                },
+                installation: InstallationConfig {
+                    segment_capacity,
+                    body_encoding: ozzy_journal_segment::BodyEncoding::Raw,
+                    max_staged_bytes,
+                    max_orphan_probes: 16,
+                },
+            }),
+        })
+    }
+}
+
+fn replay_cache_limits(
+    checked: &CheckedConfig,
+    placement: &PartitionPlacement,
+    pipeline: PipelineLimits,
+) -> Result<PipelineLimits, StartupError> {
+    let shard = checked
+        .plan
+        .shards
+        .iter()
+        .find(|shard| shard.id == placement.shard)
+        .ok_or_else(|| StartupError::Runtime("partition has no application shard".into()))?;
+    let partitions_on_shard = checked
+        .plan
+        .partitions
+        .iter()
+        .filter(|partition| partition.shard == placement.shard)
+        .count();
+    if partitions_on_shard == 0 {
+        return Err(StartupError::Runtime(
+            "partition has no shard placement".into(),
+        ));
+    }
+    let cache_share = usize::try_from(shard.budget.resident_bytes / 2 / partitions_on_shard as u64)
+        .unwrap_or(usize::MAX);
+    // The existing pipeline bound stays intact. Extra replay capacity uses at
+    // most half of the shard's resident budget across its partitions.
+    let body_bytes = pipeline
+        .max_body_bytes
+        .saturating_mul(8)
+        .min(pipeline.max_body_bytes.max(cache_share))
+        .min(u32::MAX as usize);
+    Ok(PipelineLimits {
+        max_operations: pipeline.max_operations,
+        max_body_bytes: body_bytes,
+    })
+}
+
+impl OpenedPartition {
+    /// Construct on the assigned shard after journal startup. Sessions come
+    /// from the broker's established link table, never incoming packet claims.
+    /// Absent brokers remain unbound; startup does not wait for their links.
+    /// Recovered replicated journals still elect a leader before serving writes.
+    /// Memory is the shard's shared data owner; empty leases reserve no payload.
+    /// Deterministic harnesses inject both IDs and record timestamps.
+    /// Replicated followers start with zero receive credit. The shard must back
+    /// grants with shared memory and dispatch reservations before advertising.
+    pub fn into_actor(
+        mut self,
+        memory: &ozzy_runtime::memory::Owner,
+        sessions: &BTreeMap<NodeId, LinkSessionId>,
+        ids: ActorIds,
+        timestamp: impl Fn() -> u64 + 'static,
+    ) -> Result<StartedPartition, StartupError> {
+        self.journal
+            .bind_append_memory(memory)
+            .map_err(|source| StartupError::Journal {
+                path: self.placement.directory.clone(),
+                source,
+            })?;
+        self.start_actor(sessions, ids, timestamp)
+    }
+
+    /// Construct with an allocation allowance issued by the shard memory owner.
+    /// The journal can allocate only against that allowance. Unused reservations
+    /// and actual backing buffers share the owner's physical byte/count bounds.
+    pub fn into_reserved_actor(
+        mut self,
+        capacity: &ozzy_runtime::memory::Capacity,
+        sessions: &BTreeMap<NodeId, LinkSessionId>,
+        ids: ActorIds,
+        timestamp: impl Fn() -> u64 + 'static,
+    ) -> Result<StartedPartition, StartupError> {
+        self.journal
+            .bind_append_capacity(capacity)
+            .map_err(|source| StartupError::Journal {
+                path: self.placement.directory.clone(),
+                source,
+            })?;
+        self.start_actor(sessions, ids, timestamp)
+    }
+
+    fn start_actor(
+        self,
+        sessions: &BTreeMap<NodeId, LinkSessionId>,
+        ids: ActorIds,
+        timestamp: impl Fn() -> u64 + 'static,
+    ) -> Result<StartedPartition, StartupError> {
+        let error = |reason: String| {
+            StartupError::Runtime(format!(
+                "partition {}/{}: {reason}",
+                self.placement.topic, self.placement.partition
+            ))
+        };
+        let (actor, proposal, buffer) = match (self.authority, self.actors) {
+            (PartitionAuthority::Local(driver), ActorSettings::Local(config)) => {
+                let mut actor = LocalActor::new(self.journal, driver, config, timestamp)
+                    .map_err(|failure| error(failure.to_string()))?;
+                let buffer = actor
+                    .lease_proposal_buffer()
+                    .map_err(|failure| error(failure.to_string()))?;
+                let proposal = actor
+                    .take_submitter()
+                    .expect("one configured proposal lane");
+                (PartitionActor::Local(Box::new(actor)), proposal, buffer)
+            }
+            (
+                PartitionAuthority::Replicated(startup),
+                ActorSettings::Replicated { journal, mut actor },
+            ) => {
+                actor.sessions = [LinkSessionId::from_bytes([0; 16]); 3];
+                for (slot, peer) in startup.configuration().voters().iter().enumerate() {
+                    if *peer != startup.local()
+                        && let Some(session) = sessions.get(peer)
+                    {
+                        if session.as_bytes() == &[0; 16] {
+                            return Err(error("zero established broker session".into()));
+                        }
+                        actor.sessions[slot] = *session;
+                    }
+                }
+                let journal = self
+                    .journal
+                    .into_shard_journal(journal, timestamp)
+                    .map_err(|failure| error(failure.to_string()))?;
+                let mut actor =
+                    ReplicaActor::new_with_reserved_credit(journal, startup, *actor, ids)
+                        .map_err(|failure| error(failure.to_string()))?;
+                actor.enable_recovery();
+                let buffer = actor
+                    .lease_proposal_buffer()
+                    .map_err(|failure| error(failure.to_string()))?;
+                let proposal = actor
+                    .take_submitter()
+                    .expect("one configured proposal lane");
+                let actor =
+                    ScheduledReplica::new(actor).map_err(|failure| error(failure.to_string()))?;
+                (PartitionActor::Replicated(actor), proposal, buffer)
+            }
+            _ => return Err(error("partition mode differs from actor settings".into())),
+        };
+        Ok(StartedPartition {
+            cluster: self.cluster,
+            placement: self.placement,
+            incarnation: self.incarnation,
+            actor,
+            proposal,
+            buffer,
+        })
+    }
+}
