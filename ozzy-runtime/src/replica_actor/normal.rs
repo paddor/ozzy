@@ -18,13 +18,10 @@ use super::{
     PendingIo, Prefix, ProposalOutcome, ReplicaActor, Scope, SendClass,
 };
 
-/// Consecutive journal turns that may carry a new proposal before one turn
-/// leaves the slot to sync, donor, flow and replay scheduling.
-const MAX_PROPOSAL_TURNS: usize = 8;
-
 #[derive(Debug)]
 pub(super) struct Live {
     pub(super) retry: bool,
+    pub(super) published: bool,
     pub(super) scope: Scope,
     pub(super) generation: JournalGeneration,
     pub(super) predecessor: Prefix,
@@ -40,14 +37,11 @@ pub(super) struct Work {
     pub(super) live: VecDeque<Live>,
     pub(super) waiting: Option<Submission>,
     validating: Option<Reply>,
-    // Core-admitted proposal whose install rides on the next journal turn.
-    ready: Option<(
+    // Core-admitted proposal waiting for physical journal capacity.
+    pub(super) ready: Option<(
         ozzy_replication::WriteTicket,
         crate::replica_journal::ValidatedAppend,
     )>,
-    // Consecutive turns that carried a proposal. Bounded so that sync, donor,
-    // flow and replay work get the journal slot under sustained intake.
-    proposal_turns: usize,
     // A proposal is waiting for live-window room; counts each wait once.
     window_full: bool,
     // Written work not yet captured by a submitted barrier. An older captured
@@ -68,7 +62,7 @@ pub(super) struct Work {
     replay_peer: usize,
     replay_plan: Option<replay::Plan>,
     replay_blocked: [Option<replay::Blocked>; 3],
-    receive: receive::Receive,
+    pub(super) receive: receive::Receive,
     recent: recent::Recent,
     pub(super) flow: Flow,
 }
@@ -81,7 +75,6 @@ impl Work {
         pipeline: ozzy_replication::PipelineLimits,
         replay_cache: ozzy_replication::PipelineLimits,
         flow: Flow,
-        reserved_credit: bool,
     ) -> Result<Self, ActorError> {
         Ok(Self {
             scope: channel.scope,
@@ -89,7 +82,6 @@ impl Work {
             waiting: None,
             validating: None,
             ready: None,
-            proposal_turns: 0,
             window_full: false,
             needs_sync: false,
             sync_batch_attempts: 0,
@@ -103,7 +95,7 @@ impl Work {
             replay_peer: 0,
             replay_plan: None,
             replay_blocked: [None; 3],
-            receive: receive::Receive::new(receive_buffer, channel, pipeline, reserved_credit)?,
+            receive: receive::Receive::new(receive_buffer, channel, pipeline)?,
             recent: recent::Recent::new(replay_cache),
             flow,
         })
@@ -121,32 +113,12 @@ impl Work {
         self.receive.ledger.available()
     }
 
-    pub(super) fn bind_receive_capacity(
-        &mut self,
-        capacity: &crate::memory::Capacity,
-    ) -> Result<(), ActorError> {
-        self.receive.bind_capacity(capacity)
-    }
-
-    pub(super) fn grant_receive(
-        &mut self,
-        channel: ozzy_replication::flow::Channel,
-        operations: u64,
-        bytes: u64,
-    ) -> Result<(), ozzy_replication::flow::FlowError> {
-        self.receive.ledger.grant(channel, operations, bytes)
-    }
-
     pub(super) fn receive_epoch(&self) -> ozzy_replication::flow::ReceiveEpoch {
         self.receive.ledger.report().channel.epoch
     }
-
-    pub(super) fn reserved_receive_credit(&self) -> bool {
-        self.receive.ledger.is_reserved()
-    }
 }
 
-impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
+impl ReplicaActor {
     pub(super) fn normal_round(&mut self, now: Duration) -> Result<(), ActorError> {
         if self.work.scope != self.driver.scope() {
             self.work.scope = self.driver.scope();
@@ -182,7 +154,7 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
                         predecessor: live.predecessor,
                         end: live.end,
                         operations: buffer.len(),
-                        body_bytes: buffer.body_bytes(),
+                        retained_bytes: buffer.retained_bytes(),
                         packets: live.packets,
                     });
                 }
@@ -301,7 +273,6 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
         let snapshot = self.driver.normal().expect("normal scheduling").snapshot();
         let primary = self.configuration.primary(snapshot.scope.view) == self.local;
         debug_assert!(self.work.ready.is_none(), "ready admission rides its turn");
-        self.work.proposal_turns = 0;
         if snapshot.applied != snapshot.committed {
             let ticket = self.driver.begin_validation()?;
             // A staged suffix validates in the same turn, before the apply.
@@ -317,10 +288,7 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
                     ..Default::default()
                 });
             }
-            self.pending = Some(PendingIo::Apply(
-                self.journal.apply_committed(ticket)?,
-                ticket,
-            ));
+            self.pending = Some(PendingIo::Apply(self.journal.apply_committed(ticket)?));
             return Ok(());
         }
         if self.sync_due(primary, now) {
@@ -431,45 +399,37 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
         Ok(Some((ticket, submission.buffer)))
     }
 
-    /// Send the admission of a core-accepted proposal without a separate round
-    /// trip. The same turn applies the committed prefix and, within the
-    /// fairness bound and unless a sync batch is due, validates the next
-    /// proposal.
-    pub(super) fn send_ready_turn(&mut self, now: Duration) -> Result<(), ActorError> {
+    /// Install the accepted batch directly. The next validation observes its
+    /// installed image in the next bounded actor turn.
+    pub(super) fn send_ready_turn(&mut self, _now: Duration) -> Result<(), ActorError> {
         let Some(admit) = self.work.ready.take() else {
             return Ok(());
         };
-        let snapshot = self.driver.normal().expect("admitted in normal").snapshot();
-        let primary = self.configuration.primary(snapshot.scope.view) == self.local;
-        let ticket = self.driver.begin_validation()?;
-        let sync_due = self.sync_due(primary, now);
-        if sync_due && self.pending_sync.is_none() {
-            self.schedule_sync()?;
-            // As in scheduling: the captured group syncs while the next fills.
-            self.ingress.resume();
-        }
-        let next = !sync_due && self.work.proposal_turns < MAX_PROPOSAL_TURNS;
-        let propose = if primary && next {
-            self.take_proposal(&snapshot)?
+        let apply = if self.driver.normal().is_some_and(|normal| {
+            let snapshot = normal.snapshot();
+            snapshot.applied != snapshot.committed
+        }) {
+            Some(self.driver.begin_validation()?)
         } else {
             None
         };
-        let validate = if !primary && next {
-            self.take_received()?
-        } else {
-            None
-        };
-        // Only `schedule_normal` resets the count, so turns queued behind an
-        // install-only turn still leave the slot to other work in time.
-        if propose.is_some() || validate.is_some() {
-            self.work.proposal_turns += 1;
-        }
-        self.submit_turn(crate::replica_journal::Turn {
+        let turn = Box::new(crate::replica_journal::Turn {
             admit: Some(admit),
-            propose,
-            validate,
-            apply: (snapshot.applied != snapshot.committed).then_some(ticket),
-        })
+            apply,
+            ..Default::default()
+        });
+        assert!(self.pending.is_none());
+        match self.journal.turn(turn) {
+            Ok(completion) => self.pending = Some(PendingIo::Turn(completion)),
+            Err(rejected) if rejected.reason == crate::replica_journal::SubmitError::Full => {
+                // Retained backing can fill the physical backlog before the
+                // core's operation/body window fills. Keep the same validated
+                // batch in its existing slot until physical progress frees it.
+                self.work.ready = rejected.value.admit;
+            }
+            Err(rejected) => return Err(rejected.reason.into()),
+        }
+        Ok(())
     }
 
     /// Record live-window occupancy after a core admission.
@@ -491,15 +451,10 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
 
     fn submit_turn(&mut self, turn: crate::replica_journal::Turn) -> Result<(), ActorError> {
         assert!(self.pending.is_none());
-        let behind =
-            (turn.propose.is_none() && turn.validate.is_none()).then_some(super::io::Behind {
-                applying: turn.apply,
-            });
         self.pending = Some(PendingIo::Turn(
             self.journal
                 .turn(Box::new(turn))
                 .map_err(|rejected| rejected.reason)?,
-            behind,
         ));
         Ok(())
     }

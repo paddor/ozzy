@@ -1,7 +1,9 @@
 use super::{
-    Binding, Context, Duration, Future, GroupId, IntakeMessage, Kind, LinkSessionId, NativeReceive,
-    PartitionStatus, Poll, ProposalOutcome, StartupError, State, admission, failure,
+    BTreeMap, Binding, Bootstrap, Context, Duration, Future, GroupId, Kind, LinkSessionId,
+    NativeReceive, NodeId, PartitionActors, PartitionStatus, Poll, ProposalOutcome, StartupError,
+    State, failure,
 };
+use ozzy_proto::PartitionIncarnation;
 
 impl State {
     pub(super) fn poll(
@@ -10,6 +12,7 @@ impl State {
         binding: &mut Binding,
         now: Duration,
     ) -> Poll<Result<(), StartupError>> {
+        ozzy_runtime::profiling::event(ozzy_runtime::profiling::Event::ShardTurn);
         let result = self.turn(cx, binding, now);
         match result {
             Ok(()) => Poll::Pending,
@@ -37,26 +40,7 @@ impl State {
             .expect("installed publisher")
             .poll_progress(cx, &self.actors, &mut binding.port)
             .map_err(failure)?;
-        self.admission.begin_turn(
-            cx,
-            binding,
-            &mut admission::ActorAdapter {
-                actors: &mut self.actors,
-                bootstrap: &self.bootstrap,
-                indices: &self.indices,
-                local: self.config.local,
-            },
-        )?;
         self.receive_inputs(cx, binding, now)?;
-        self.admission.finish_turn(
-            binding,
-            &mut admission::ActorAdapter {
-                actors: &mut self.actors,
-                bootstrap: &self.bootstrap,
-                indices: &self.indices,
-                local: self.config.local,
-            },
-        )?;
         self.group_cursor = (self.group_cursor + 16) % self.identities.len().max(1);
         Ok(())
     }
@@ -194,12 +178,16 @@ impl State {
                 .startup_actor(group)
                 .map_err(failure)?
                 .ok_or_else(|| failure("unpublished recovery handoff"))?;
+            actor
+                .bind_receive_owner(&self.replica_memory)
+                .map_err(failure)?;
+            actor.enable_publication();
             let (bootstrap, native) = super::build::recovered_services(
                 actor,
                 plan,
                 &self.config,
-                &self.destinations[index * 4],
-                &self.destinations[index * 4 + 1],
+                &self.data_memory,
+                &self.control_memory,
             )?;
             self.actors
                 .install_native(native, binding.links.clone())
@@ -222,7 +210,7 @@ impl State {
     }
 
     fn client_ready(&self, group: GroupId, partition: ozzy_proto::PartitionIncarnation) -> bool {
-        admission::client_ready(
+        client_ready(
             &self.actors,
             &self.bootstrap,
             &self.indices,
@@ -238,67 +226,102 @@ impl State {
         binding: &Binding,
         now: Duration,
     ) -> Result<(), StartupError> {
-        let slots = self.admission.intake.reservation_slots();
-        for offset in 0..slots.min(16) {
-            if let Some(received) = self
-                .admission
-                .intake
-                .retry_deferred(
-                    (self.admission.cursor + offset) % slots,
-                    &binding.links,
-                    &self.routes,
-                )
-                .map_err(failure)?
-                && self.deliver_input(binding, received, now)?
-            {
-                cx.waker().wake_by_ref();
-            }
-        }
-        for _ in 0..16 {
-            let Some(received) = self
-                .admission
-                .intake
-                .receive(&binding.links, &self.routes)
-                .map_err(failure)?
-            else {
-                break;
-            };
-            if self.deliver_input(binding, received, now)? {
-                cx.waker().wake_by_ref();
-            }
+        for lane in [3, 2, 1, 0] {
+            self.receive_data(cx, binding, lane, now)?;
         }
         Ok(())
     }
 
-    fn deliver_input(
+    fn receive_data(
         &mut self,
+        cx: &mut Context<'_>,
         binding: &Binding,
-        received: IntakeMessage,
+        lane: usize,
         now: Duration,
-    ) -> Result<bool, StartupError> {
-        if !received.current {
-            return Ok(true);
+    ) -> Result<(), StartupError> {
+        let mut bytes = 0usize;
+        for _ in 0..16 {
+            if bytes >= 2 * 1024 * 1024 {
+                cx.waker().wake_by_ref();
+                return Ok(());
+            }
+            let (pending, queue) = (&mut self.pending[lane], &mut self.incoming[lane]);
+            let input = if let Some(input) = pending.take() {
+                input
+            } else if let Some(input) = queue.try_recv().map_err(failure)? {
+                input
+            } else {
+                return Ok(());
+            };
+            bytes = bytes.saturating_add(input.message.max_message_size_len());
+            let current = binding.links.get(input.binding.peer).is_some_and(|link| {
+                link.binding == input.binding
+                    && self.routes.route(&input.message, input.binding).ok() == Some(input.route)
+            });
+            if !current {
+                continue;
+            }
+            let group = input.route.placement.group;
+            let result = if input.binding.kind == Kind::Broker {
+                let normal = input.message.part_slice(1).is_some_and(|header| {
+                    header.get(5) == Some(&(ozzy_proto::Opcode::PrepareFlow as u8))
+                });
+                if normal {
+                    if self
+                        .actors
+                        .receive_data(group, &input.message, now)
+                        .map_err(failure)?
+                    {
+                        NativeReceive::Accepted
+                    } else {
+                        NativeReceive::Busy
+                    }
+                } else {
+                    self.sync_group(group, binding, now)?;
+                    self.actors
+                        .receive(group, &input.message, now)
+                        .map_err(failure)?;
+                    NativeReceive::Accepted
+                }
+            } else if self.client_ready(group, input.route.placement.partition) {
+                self.actors
+                    .receive_client(group, &input.message, now)
+                    .map_err(failure)?
+            } else {
+                self.actors
+                    .defer_client(group, &input.message, now)
+                    .map_err(failure)?
+            };
+            if result == NativeReceive::Busy {
+                self.pending[lane] = Some(input);
+                return Ok(());
+            }
+            if bytes >= 2 * 1024 * 1024 {
+                cx.waker().wake_by_ref();
+                return Ok(());
+            }
+            if result == NativeReceive::Ignored {
+                ozzy_runtime::profiling::event(ozzy_runtime::profiling::Event::ShardInputDiscarded);
+            }
         }
-        let group = received.request.route.placement.group;
-        let result = if received.request.binding.kind == Kind::Broker {
-            self.sync_group(group, binding, now)?;
-            self.actors
-                .receive(group, &received.message, now)
-                .map_err(failure)?;
-            NativeReceive::Accepted
-        } else if self.client_ready(group, received.request.route.placement.partition) {
-            self.actors
-                .receive_client(group, &received.message, now)
-                .map_err(failure)?
-        } else {
-            self.actors
-                .defer_client(group, &received.message, now)
-                .map_err(failure)?
-        };
-        if result == NativeReceive::Busy {
-            self.admission.intake.defer(received).map_err(failure)?;
-            return Ok(false);
-        }
-        Ok(true)
+        cx.waker().wake_by_ref();
+        Ok(())
     }
+}
+
+pub(in crate::serving::shard) fn client_ready(
+    actors: &PartitionActors,
+    bootstrap: &[Option<Bootstrap>],
+    indices: &BTreeMap<GroupId, usize>,
+    local: NodeId,
+    group: GroupId,
+    partition: PartitionIncarnation,
+) -> bool {
+    indices.get(&group).is_some_and(|&index| {
+        bootstrap[index]
+            .as_ref()
+            .is_some_and(|bootstrap| bootstrap.done)
+    }) || actors
+        .route_state(group, partition)
+        .is_some_and(|route| route.leader.is_some_and(|leader| leader != local))
 }

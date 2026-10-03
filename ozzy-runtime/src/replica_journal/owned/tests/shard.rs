@@ -1,13 +1,13 @@
 use super::*;
 use crate::replica_journal::{
-    JournalCompletion, ProposalValidation, ReplicaJournal, ShardJournal, ShardJournalConfig,
+    JournalCompletion, ProposalValidation, ReplicaJournal, ShardJournalConfig,
 };
 use ozzy_replication::{Admission, driver::ReplicaDriver};
 
 #[cfg(feature = "simulation")]
 mod actors;
 
-type Adapter = ReplicaJournal<ShardJournal>;
+type Adapter = ReplicaJournal;
 
 fn adapter(
     controller: &mut Controller,
@@ -100,7 +100,20 @@ fn admit(
         )
         .unwrap();
     let ticket = driver.begin_validation().unwrap();
-    let request = adapter.propose_append(ticket, buffer).unwrap();
+    let request = loop {
+        match adapter.propose_append(ticket, buffer) {
+            Ok(request) => break request,
+            Err(rejected) => {
+                assert_eq!(rejected.reason, crate::replica_journal::SubmitError::Full);
+                buffer = rejected.value;
+                pump(adapter);
+                for (id, _) in controller.jobs() {
+                    controller.execute(id, Effect::Normal).unwrap();
+                    controller.deliver(id).unwrap();
+                }
+            }
+        }
+    };
     let ProposalValidation::Ready(validated) = complete(controller, adapter, request).unwrap()
     else {
         panic!("fresh proposal");
@@ -124,7 +137,7 @@ fn admit(
 }
 
 #[test]
-fn shard_adapter_installs_reordered_writes_in_order_and_captures_exact_sync() {
+fn shard_adapter_settles_writes_before_cold_control_validation_and_captures_exact_sync() {
     for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
         let (mut controller, io) = setup();
         let (mut journal, mut driver) = adapter(&mut controller, io, "/journal", 5, policy, 2);
@@ -133,11 +146,11 @@ fn shard_adapter_installs_reordered_writes_in_order_and_captures_exact_sync() {
         for _ in 0..16 {
             pump(&mut journal);
         }
-        // Real backend jobs may finish in reverse order. Owner installation
-        // stays ordered and only complete logical commands yield write tickets.
+        // A fresh control identity may require a file read. Its validation
+        // waits for the earlier physical write to settle.
         let jobs = controller.jobs();
-        assert_eq!(jobs.len(), 2, "two independently executing writes");
-        for (id, _) in jobs.into_iter().rev() {
+        assert_eq!(jobs.len(), 1, "only the later write remains pending");
+        for (id, _) in jobs {
             controller.execute(id, Effect::Normal).unwrap();
             controller.deliver(id).unwrap();
         }

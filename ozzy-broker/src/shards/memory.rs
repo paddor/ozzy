@@ -7,7 +7,11 @@ use std::{collections::BTreeMap, io};
 /// Cloned owners share these budgets across every partition on the shard.
 #[derive(Debug)]
 pub struct ShardMemory {
+    /// Writer canonical work. Shares the resident budget with follower progress.
     pub data: Owner,
+    /// Follower canonical work, independently reserved in replicated serving.
+    pub replica: Owner,
+    /// Independent retained control-message allocation owner.
     pub control: Owner,
 }
 
@@ -17,6 +21,7 @@ pub(super) struct Plan {
     domain: Domain,
     data: Limits,
     control: Limits,
+    follower_progress: bool,
 }
 
 impl Domains {
@@ -61,7 +66,11 @@ impl Domains {
         Ok(Self(domains))
     }
 
-    pub(super) fn plan(&self, shard: &ShardPlan) -> Result<Plan, StartupError> {
+    pub(super) fn plan(
+        &self,
+        shard: &ShardPlan,
+        follower_progress: bool,
+    ) -> Result<Plan, StartupError> {
         let limits = |bytes, buffers| -> Result<Limits, StartupError> {
             let bytes = usize::try_from(bytes).map_err(|_| StartupError::Shard {
                 shard: shard.id,
@@ -77,6 +86,7 @@ impl Domains {
             domain: self.0[&shard.affinity.numa_node].clone(),
             data: limits(shard.budget.resident_bytes, shard.budget.append_slots)?,
             control: limits(shard.budget.control_bytes, shard.budget.control_slots)?,
+            follower_progress,
         })
     }
 }
@@ -84,9 +94,64 @@ impl Domains {
 impl Plan {
     // Called only after affinity is set on the destination thread.
     pub(super) fn allocate(self) -> io::Result<ShardMemory> {
+        if !self.follower_progress {
+            let data = self.domain.owner(self.data)?;
+            return Ok(ShardMemory {
+                replica: data.clone(),
+                data,
+                control: self.domain.owner(self.control)?,
+            });
+        }
+        let replica_bytes = self.data.bytes / 2;
+        let replica_buffers = self.data.buffers / 2;
+        let replica = Limits {
+            bytes: replica_bytes,
+            buffers: replica_buffers,
+            cache_bytes: replica_bytes,
+        };
+        let data = Limits {
+            bytes: self.data.bytes - replica_bytes,
+            buffers: self.data.buffers - replica_buffers,
+            cache_bytes: self.data.bytes - replica_bytes,
+        };
         Ok(ShardMemory {
-            data: self.domain.owner(self.data)?,
+            data: self.domain.owner(data)?,
+            replica: self.domain.owner(replica)?,
             control: self.domain.owner(self.control)?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn full_writer_memory_cannot_consume_follower_progress() {
+        let domain = Domain::new(None, 10_240).unwrap();
+        let memory = Plan {
+            domain: domain.clone(),
+            data: Limits {
+                bytes: 8192,
+                buffers: 8,
+                cache_bytes: 8192,
+            },
+            control: Limits {
+                bytes: 2048,
+                buffers: 2,
+                cache_bytes: 2048,
+            },
+            follower_progress: true,
+        }
+        .allocate()
+        .unwrap();
+        assert_eq!(domain.reserved_bytes(), 10_240);
+        let writer = memory.data.lease(4096).await.unwrap();
+        let follower = memory.replica.lease(4096).await.unwrap();
+        let control = memory.control.lease(2048).await.unwrap();
+        assert_eq!(memory.data.allocated_bytes(), 4096);
+        assert_eq!(memory.replica.allocated_bytes(), 4096);
+        drop((writer, follower, control, memory));
+        assert_eq!(domain.reserved_bytes(), 0);
     }
 }

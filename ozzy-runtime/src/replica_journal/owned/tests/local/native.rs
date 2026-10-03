@@ -34,8 +34,7 @@ fn limits() -> DataLimits {
 }
 
 fn link(peer: u8, session: u8) -> Link {
-    let parameters =
-        handshake::Parameters::streaming(limits(), handshake::PRODUCER, 4, 4096).unwrap();
+    let parameters = handshake::Parameters::streaming(limits(), handshake::PRODUCER).unwrap();
     Link {
         binding: Binding {
             peer: NodeId::from_bytes([peer; 16]),
@@ -88,7 +87,7 @@ fn intake_access_reserved(
     actor: &mut crate::replica_actor::LocalActor,
     access: NativeAccess,
     incarnation: PartitionIncarnation,
-    capacities: Option<(&crate::memory::Capacity, &crate::memory::Capacity)>,
+    capacities: Option<(&crate::memory::Owner, &crate::memory::Owner)>,
 ) -> NativeIntake {
     intake_access_profile(actor, access, incarnation, capacities, limits())
 }
@@ -97,7 +96,7 @@ fn intake_access_profile(
     actor: &mut crate::replica_actor::LocalActor,
     access: NativeAccess,
     incarnation: PartitionIncarnation,
-    capacities: Option<(&crate::memory::Capacity, &crate::memory::Capacity)>,
+    capacities: Option<(&crate::memory::Owner, &crate::memory::Owner)>,
     wire: DataLimits,
 ) -> NativeIntake {
     let config = NativeIntakeConfig {
@@ -118,7 +117,7 @@ fn intake_access_profile(
             if let Some((control, data)) = capacities {
                 let stride = config.requests_per_writer + 1;
                 buffer
-                    .bind_capacity(if index.is_multiple_of(stride) {
+                    .bind_owner(if index.is_multiple_of(stride) {
                         control
                     } else {
                         data
@@ -370,7 +369,7 @@ fn deferred_writer_open_returns_retry_without_proposing_or_advancing_epoch() {
     assert_eq!(output.len(), 1);
     let reply = output.pop().unwrap();
     let retry = ozzy_proto::nack::decode(packet(&reply), limits().envelope).unwrap();
-    assert_eq!(retry.retry, ozzy_proto::nack::RetryClass::AfterCredit);
+    assert_eq!(retry.retry, ozzy_proto::nack::RetryClass::AfterBackoff);
     assert_eq!(
         intake.receive(&request, link(70, 80), hint).unwrap(),
         NativeReceive::Accepted

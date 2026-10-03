@@ -21,6 +21,7 @@ pub(crate) struct ResidentOperations {
     order: VecDeque<Retained>,
     bytes: usize,
     limit: usize,
+    max_operations: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -40,20 +41,26 @@ struct Retained {
 
 impl Default for ResidentOperations {
     fn default() -> Self {
-        Self::with_limit(DEFAULT_RESIDENT_BYTES)
+        Self::with_limits(DEFAULT_RESIDENT_BYTES, usize::MAX)
     }
 }
 
 impl ResidentOperations {
     /// Empty store that retains at most `limit` bytes. The newest operation
     /// stays even when it alone exceeds the limit.
+    #[cfg(test)]
     pub(crate) fn with_limit(limit: usize) -> Self {
+        Self::with_limits(limit, usize::MAX)
+    }
+
+    pub(crate) fn with_limits(limit: usize, max_operations: usize) -> Self {
         Self {
             current: None,
             previous: None,
             order: VecDeque::new(),
             bytes: 0,
             limit,
+            max_operations,
         }
     }
 
@@ -113,7 +120,9 @@ impl ResidentOperations {
             bytes,
         });
         self.bytes += bytes;
-        while self.bytes > self.limit && self.order.len() > 1 {
+        while (self.bytes > self.limit || self.order.len() > self.max_operations)
+            && self.order.len() > 1
+        {
             let oldest = self.order.pop_front().expect("nonempty order");
             self.bytes -= oldest.bytes;
             for segment in self.current.iter_mut().chain(self.previous.iter_mut()) {
@@ -185,6 +194,7 @@ impl ResidentOperations {
             order: VecDeque::new(),
             bytes: 0,
             limit: usize::MAX,
+            max_operations: usize::MAX,
         }))
     }
 
@@ -289,5 +299,27 @@ mod tests {
                 .is_none(),
             "an evicted operation makes the read use the file"
         );
+    }
+
+    #[test]
+    fn operation_budget_evicts_small_bodies_before_byte_budget() {
+        let group = GroupId::from_bytes([2; 16]);
+        let source = IndexSource {
+            group_id: group,
+            segment_id: 1,
+            valid_bytes: u64::MAX,
+            segment_digest: Digest::ZERO,
+            first_op_number: 0,
+            last_op_number: 0,
+            last_operation_digest: Digest::ZERO,
+        };
+        let mut resident = ResidentOperations::with_limits(4096, 2);
+        for op in 1..=3 {
+            resident.insert_prepared(group, 1, &[operation(1, op, 16)]);
+        }
+        assert_eq!(resident.retained_bytes(), 32);
+        assert!(!resident.contains(source, operation(1, 1, 16).location));
+        assert!(resident.contains(source, operation(1, 2, 16).location));
+        assert!(resident.contains(source, operation(1, 3, 16).location));
     }
 }

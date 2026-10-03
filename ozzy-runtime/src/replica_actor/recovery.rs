@@ -97,7 +97,7 @@ enum Outcome {
 
 enum Transition<J: RecoveryStorage> {
     Retry(Box<RecoveryActor<J>>),
-    Normal(Box<ReplicaActor<J::Normal>>),
+    Normal(Box<ReplicaActor>),
 }
 
 /// Explicit replacement-voter role. Owns no normal core or producer admission.
@@ -133,7 +133,6 @@ pub struct RecoveryActor<J: RecoveryStorage = ShardRecoveringJournal> {
     wire_limits: WireLimits,
     outbox: ReplicaOutbox,
     status: watch::Sender<ActorStatus>,
-    reserved_credit: bool,
 }
 
 impl<J: RecoveryStorage> RecoveryActor<J> {
@@ -230,7 +229,6 @@ impl<J: RecoveryStorage> RecoveryActor<J> {
             wire_limits,
             outbox,
             status,
-            reserved_credit: false,
         })
     }
 
@@ -251,11 +249,8 @@ impl<J: RecoveryStorage> RecoveryActor<J> {
                 let (journal, startup) = journal
                     .adopt(&mut self.recovery, publication, self.abandoning, generation)
                     .await?;
-                let mut actor = if self.reserved_credit {
-                    ReplicaActor::new_with_reserved_credit(journal, startup, self.config, self.ids)?
-                } else {
-                    ReplicaActor::new_with_ids(journal, startup, self.config, self.ids)?
-                };
+                let mut actor =
+                    ReplicaActor::new_with_ids(journal, startup, self.config, self.ids)?;
                 actor.enable_recovery();
                 actor.status = self.status;
                 Ok(Transition::Normal(Box::new(actor)))
@@ -268,7 +263,6 @@ impl<J: RecoveryStorage> RecoveryActor<J> {
                 let (journal, startup) = journal.restart(self.full_retry, generations).await?;
                 let mut next =
                     Self::new_with_ids(journal, startup, self.config, self.timing, self.ids)?;
-                next.reserved_credit = self.reserved_credit;
                 if let Some((from, scope)) = self.observed {
                     next.observe(from, scope)?;
                 }

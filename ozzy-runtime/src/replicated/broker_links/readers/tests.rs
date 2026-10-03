@@ -11,12 +11,12 @@ fn config() -> BrokerLinksConfig {
         max_parts: 4,
         max_record_bytes: 1024,
     };
-    let mut parameters =
-        handshake::Parameters::streaming(data, handshake::CONSUMER, 8, 8192).unwrap();
+    let mut parameters = handshake::Parameters::streaming(data, handshake::CONSUMER).unwrap();
     parameters.capabilities |= handshake::OWNER_READ;
     BrokerLinksConfig {
         local: NodeId::from_bytes([1; 16]),
         brokers: vec![super::super::BrokerAddress {
+            data_endpoint: "inproc://reader-unit-data".parse().unwrap(),
             node: NodeId::from_bytes([2; 16]),
             endpoint: "inproc://reader-inbox-unit".parse().unwrap(),
         }],
@@ -47,6 +47,7 @@ fn declared_reader_reservation_admits_all_subscriptions_and_one_byte_less_does_n
         let mut config = config();
         config.brokers = (0..brokers)
             .map(|index| super::super::BrokerAddress {
+                data_endpoint: "inproc://reader-unit-data".parse().unwrap(),
                 node: NodeId::from_bytes([index as u8 + 2; 16]),
                 endpoint: format!("inproc://reader-budget-{index}").parse().unwrap(),
             })

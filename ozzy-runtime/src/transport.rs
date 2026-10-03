@@ -13,7 +13,7 @@ pub fn socket_options() -> omq_tokio::Options {
 /// Submit an existing native routing envelope through a checked identity view.
 /// The body is unchanged on Full, including its original buffer ownership.
 /// Routing frames remain internal Ozzy metadata until their owner is converted.
-pub(crate) fn try_send_peer(
+pub fn try_send_peer(
     socket: &omq_tokio::IdentitySocket,
     mut packet: omq_tokio::Message,
 ) -> Result<(), omq_tokio::TrySendError> {

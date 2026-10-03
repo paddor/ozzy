@@ -17,6 +17,7 @@ use ozzy_core::state::{IdentityClaim, IdentityKey};
 use ozzy_io::{OpenMode, Operation};
 
 #[derive(Debug, Clone)]
+/// Exact captured journal index and deletion protection for bounded reads.
 pub struct Snapshot {
     pub(crate) access: Access,
     pub(crate) root: PathBuf,
@@ -34,12 +35,15 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Exact group, node, volume, store, and store-generation binding.
     pub const fn identity(&self) -> GroupIdentity {
         self.identity
     }
+    /// Exact upper canonical operation prefix visible through this capture.
     pub const fn through(&self) -> LogPosition {
         self.through
     }
+    /// Exact segment references protected by this captured journal view.
     pub fn segment_references(&self) -> &[SegmentReference] {
         &self.references
     }
@@ -113,6 +117,7 @@ impl Snapshot {
             .is_some_and(|operation| operation.digest == position.digest))
     }
 
+    /// Read and validate one record at an exact partition-global offset.
     pub async fn read_offset(
         &self,
         partition: PartitionIncarnation,
@@ -124,6 +129,7 @@ impl Snapshot {
         Ok(Some(self.read_location(location).await?))
     }
 
+    /// Read one exact record together with its canonical operation coordinate.
     pub async fn read_offset_with_position(
         &self,
         partition: PartitionIncarnation,
@@ -271,6 +277,7 @@ impl Snapshot {
         Ok(records)
     }
 
+    /// Read and validate one record by exact partition and message identity.
     pub async fn read_message(
         &self,
         partition: PartitionIncarnation,
@@ -325,6 +332,7 @@ impl Snapshot {
         Ok(Some(record))
     }
 
+    /// Look up an exact canonical control-operation identity.
     pub async fn find_operation(
         &self,
         id: OperationId,
@@ -380,6 +388,7 @@ impl Snapshot {
         Ok(self.sealed.find_operation(id, through).await?)
     }
 
+    /// Resolve exact persistent control-operation identity without inventing missing evidence.
     pub async fn identity_claim(&self, key: IdentityKey) -> Result<Option<IdentityClaim>, Error> {
         self.identity_claim_through(key, self.through.op_number)
             .await

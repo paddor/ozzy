@@ -72,7 +72,7 @@ impl InstalledJournal {
     }
 }
 
-impl<E> ReplicaJournal<E> {
+impl ReplicaJournal {
     /// Start selected-generation staging after the exact durable view promise.
     /// Old history remains selected until finish. Keep any advertised source pinned;
     /// a selected local source must already have been captured. Disk work, including

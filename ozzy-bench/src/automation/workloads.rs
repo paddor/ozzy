@@ -32,56 +32,80 @@ fn disk(profile: &str) -> bool {
 #[command(
     about = "Serial verified workload sweeps; external profiles require one prestarted test server"
 )]
+/// General native and externally managed workload sweep options.
 pub struct Args {
     #[arg(long)]
+    /// Explicit workload worker executable; none uses the checkout-specific release worker.
     pub executable: Option<PathBuf>,
     #[arg(
         long,
         value_delimiter = ',',
         default_value = "single-durable,replicated-persisting"
     )]
+    /// Native or external persistence profiles included in the sweep.
     pub profiles: Vec<String>,
     #[arg(long, value_delimiter = ',', default_value = "128")]
+    /// Payload byte sizes included in the sweep.
     pub sizes: Vec<u64>,
     #[arg(long, value_delimiter = ',', default_value = "1,4")]
+    /// Application worker counts included in the sweep.
     pub workers: Vec<u64>,
     #[arg(long, default_value_t = 4)]
+    /// Total producer connections across application workers.
     pub connections: u64,
     #[arg(long, default_value_t = 1024)]
+    /// Maximum records retained or submitted per producer request.
     pub request_records: u64,
     #[arg(long, default_value_t = 0)]
+    /// Explicit record batch size; zero selects natural batching.
     pub writer_batch_records: u64,
     #[arg(long, default_value_t = 3)]
+    /// Maximum outstanding confirmed APPEND requests per connection.
     pub writer_inflight_appends: u64,
     #[arg(long, default_value_t = 3.0)]
+    /// Measured submission window in seconds.
     pub duration: f64,
     #[arg(long, default_value_t = 0.25)]
+    /// Unmeasured warmup window in seconds.
     pub warmup: f64,
     #[arg(long, default_value_t = 3)]
+    /// Independent repetitions per expanded case.
     pub repetitions: u64,
     #[arg(long)]
+    /// Consumer process count; none derives a bounded default from connections.
     pub reader_workers: Option<u64>,
     #[arg(long)]
+    /// Native application owner count; none derives a bounded default from connections.
     pub app_threads: Option<u64>,
     #[arg(long, value_delimiter = ',', default_value = "64")]
+    /// Physical segment capacities included in the sweep, in MiB.
     pub segment_mib: Vec<u64>,
     #[arg(long)]
+    /// Optional document describing the three broker hosts and storage roots.
     pub placements: Option<PathBuf>,
     #[arg(long)]
+    /// Reachable TCP benchmark-control bind for remote workers.
     pub control_bind: Option<String>,
     #[arg(long, default_value = "127.0.0.1:19092")]
+    /// Client endpoint of the externally managed Kafka server.
     pub kafka_endpoint: String,
     #[arg(long, default_value = "127.0.0.1:19094")]
+    /// Client endpoint of the externally managed Redpanda server.
     pub redpanda_endpoint: String,
     #[arg(long, default_value = "127.0.0.1:18090")]
+    /// Client endpoint of the externally managed Iggy server.
     pub iggy_endpoint: String,
     #[arg(long)]
+    /// Optional Kafka container name used for liveness supervision.
     pub kafka_container: Option<String>,
     #[arg(long)]
+    /// Optional Redpanda container name used for liveness supervision.
     pub redpanda_container: Option<String>,
     #[arg(long)]
+    /// Optional Iggy container name used for liveness supervision.
     pub iggy_container: Option<String>,
     #[arg(long)]
+    /// Emit the case matrix without launching measured workers.
     pub dry_run: bool,
 }
 
@@ -102,6 +126,7 @@ impl Args {
             _ => (&self.kafka_endpoint, self.kafka_container.as_deref()),
         }
     }
+    /// Reject unsupported profiles, invalid capacities, and conflicting worker placement.
     pub fn validate(&self) -> Result<()> {
         if std::env::var_os("OZZY_BENCH_AFFINITY").is_some() {
             return Err("workload sweeps do not support legacy affinity placement".into());
@@ -162,6 +187,7 @@ impl Args {
         }
         Ok(())
     }
+    /// Expand profiles, sizes, worker counts, and segment capacities into serial cases.
     pub fn cases(&self) -> Vec<Value> {
         let mut cases = vec![];
         for profile in &self.profiles {
@@ -197,6 +223,7 @@ impl Args {
         }
         cases
     }
+    /// Build workload worker arguments for one expanded case and storage directory.
     pub fn command(&self, case: &Value, storage: &Path) -> Vec<String> {
         let profile = case["profile"].as_str().unwrap();
         let external = EXTERNAL.contains(&profile);
@@ -368,6 +395,7 @@ async fn execute_matrix(
     Ok(rows)
 }
 
+/// Execute supervised cases serially and append verified measurement rows.
 pub async fn run(mut args: Args) -> Result<()> {
     install_signals()?;
     args.validate()?;

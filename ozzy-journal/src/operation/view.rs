@@ -2,7 +2,10 @@
 
 use std::iter::FusedIterator;
 
-use ozzy_proto::MessageId;
+use ozzy_proto::{
+    MessageId, Offset, OwnerEpoch, PartitionIncarnation, ProducerEpoch, ProducerId,
+    ProducerSequence,
+};
 use smallvec::SmallVec;
 
 use super::{
@@ -98,16 +101,12 @@ pub(super) fn validated_wire_batch(
         return Err(OperationCodecError::InvalidPreparedPayload);
     }
     let summary = AppendBatchSummary {
-        partition: super::PartitionIncarnation::from_bytes(body[4..20].try_into().unwrap()),
-        owner_epoch: super::OwnerEpoch::new(u64::from_be_bytes(body[20..28].try_into().unwrap())),
-        producer_id: super::ProducerId::from_bytes(body[28..44].try_into().unwrap()),
-        producer_epoch: super::ProducerEpoch::new(u64::from_be_bytes(
-            body[44..52].try_into().unwrap(),
-        )),
-        first_sequence: super::ProducerSequence::new(u64::from_be_bytes(
-            body[52..60].try_into().unwrap(),
-        )),
-        first_offset: super::Offset::new(u64::from_be_bytes(body[60..68].try_into().unwrap())),
+        partition: PartitionIncarnation::from_bytes(body[4..20].try_into().unwrap()),
+        owner_epoch: OwnerEpoch::new(u64::from_be_bytes(body[20..28].try_into().unwrap())),
+        producer_id: ProducerId::from_bytes(body[28..44].try_into().unwrap()),
+        producer_epoch: ProducerEpoch::new(u64::from_be_bytes(body[44..52].try_into().unwrap())),
+        first_sequence: ProducerSequence::new(u64::from_be_bytes(body[52..60].try_into().unwrap())),
+        first_offset: Offset::new(u64::from_be_bytes(body[60..68].try_into().unwrap())),
         record_count: proof.record_count(),
         nonzero_message_ids: proof.nonzero_message_ids(),
     };
@@ -156,6 +155,7 @@ pub(super) fn validated_wire_batch(
         prepared_payload,
         records,
         descriptors: descriptor_view,
+        uniform_part_bytes: proof.uniform_part_bytes(),
     })
 }
 
@@ -255,17 +255,27 @@ pub struct AppendBatchView<'a> {
     pub prepared_payload: Option<PreparedAppendPayload<'a>>,
     pub(super) records: Option<AppendRecords<'a>>,
     pub(super) descriptors: AppendRecordDescriptors<'a>,
+    pub(super) uniform_part_bytes: Option<usize>,
 }
 
 /// Producer payload block preserved unchanged through replication and storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PreparedAppendPayload<'a> {
+    /// Payload representation preserved through persistence and replay.
     pub encoding: ozzy_proto::append::PayloadEncoding,
+    /// Exact whole-payload byte count after decoding the prepared block.
     pub decoded_bytes: usize,
+    /// Exact prepared block bytes, borrowed from the canonical body.
     pub encoded: &'a [u8],
 }
 
 impl<'a> AppendBatchView<'a> {
+    /// Part length for a general descriptor table containing only single-part
+    /// raw records of that length. Packed tables and mixed shapes return `None`.
+    /// The validating walk establishes this property without a second scan.
+    pub const fn uniform_raw_record_bytes(&self) -> Option<usize> {
+        self.uniform_part_bytes
+    }
     /// Independently iterable records. Whole-APPEND encoded views must use
     /// [`Self::raw_records`] or descriptor iteration until explicitly decoded.
     pub fn records(&self) -> AppendRecords<'a> {
@@ -322,8 +332,11 @@ impl<'a> AppendRecordDescriptors<'a> {
 /// One record identity and its logical multipart lengths.
 #[derive(Debug, Clone)]
 pub struct AppendRecordDescriptor<'a> {
+    /// Payload representation preserved through persistence and replay.
     pub encoding: ozzy_proto::data::Encoding,
+    /// Application record identity preserved through retry and replay.
     pub message_id: MessageId,
+    /// Logical multipart lengths, available without payload decoding.
     pub part_lengths: AppendPartLengths<'a>,
 }
 

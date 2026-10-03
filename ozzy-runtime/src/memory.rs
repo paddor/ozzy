@@ -9,24 +9,8 @@ mod owner;
 mod tests;
 
 pub(crate) use owner::{Allocator, Arena};
-pub(crate) use owner::{Allowance as ForeignAllowance, Charge as ForeignCharge};
-pub use owner::{Buffer, Capacity, Owner, Quota};
+pub use owner::{Buffer, Owner};
 
-/// Journal construction retains allocation authority through recovery handoff.
-#[derive(Clone, Debug)]
-pub(crate) enum AllocationSource {
-    Shared(Owner),
-    Reserved(Capacity),
-}
-
-impl AllocationSource {
-    pub(crate) fn allocator(&self) -> Allocator {
-        match self {
-            Self::Shared(owner) => owner.allocator(),
-            Self::Reserved(capacity) => capacity.allocator(),
-        }
-    }
-}
 use std::{
     io,
     sync::{

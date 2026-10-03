@@ -266,6 +266,15 @@ impl RouteCache {
 
     /// Highest current observation, including a newer view with no leader.
     pub fn route(&self, group: GroupId) -> Result<Option<RouteState>, RouteCacheError> {
+        self.route_matching(group, |_, _| true)
+    }
+
+    /// Select only observations whose physical session is still current.
+    pub(crate) fn route_matching(
+        &self,
+        group: GroupId,
+        mut current: impl FnMut(NodeId, LinkSessionId) -> bool,
+    ) -> Result<Option<RouteState>, RouteCacheError> {
         if self.topic.partition_by_group(group).is_none() {
             return Err(RouteCacheError::Invalid);
         }
@@ -273,7 +282,10 @@ impl RouteCache {
         let mut conflict = false;
         for key in self.by_group.get(&group).into_iter().flatten() {
             let registration = self.registrations.get(key).expect("indexed registration");
-            if !registration.snapshot || registration.resync {
+            if !registration.snapshot
+                || registration.resync
+                || !current(key.0, registration.session)
+            {
                 continue;
             }
             let Some(route) = registration.routes.get(&group) else {
@@ -300,10 +312,6 @@ impl RouteCache {
         } else {
             Ok(best.cloned())
         }
-    }
-
-    pub(crate) fn session(&self, peer: NodeId) -> Option<LinkSessionId> {
-        self.sessions.get(&peer).copied()
     }
 
     fn remove_peer(&mut self, peer: NodeId) {

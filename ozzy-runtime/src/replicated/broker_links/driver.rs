@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use bytes::Bytes;
+use futures::StreamExt;
 use omq_tokio::{
     IdentitySocket, Message, MonitorEvent, MonitorStream, MonitorTryRecvError, TrySendError,
 };
@@ -13,13 +14,13 @@ use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
 use super::{BrokerLinkError, BrokerLinksConfig, Peer, SdkClock, Shared};
 
 const TURN: usize = 32;
+const TURN_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub(super) enum Body {
     Topic(directory::TopicRequest),
     Open(producer::Open),
     Subscribe(reader::Subscribe),
-    Credit(reader::Credit),
     Ack(reader::Ack),
     Unsubscribe(reader::Subscribed),
 }
@@ -30,7 +31,6 @@ impl Body {
             Self::Topic(_) => (Opcode::StateSnapshotRequest, Opcode::StateSnapshot),
             Self::Open(_) => (Opcode::OpenProducer, Opcode::ProducerOpened),
             Self::Subscribe(_) => (Opcode::Subscribe, Opcode::Subscribed),
-            Self::Credit(_) => (Opcode::Credit, Opcode::Credit),
             Self::Ack(_) => (Opcode::Ack, Opcode::Ack),
             Self::Unsubscribe(_) => (Opcode::Unsubscribe, Opcode::Unsubscribed),
         }
@@ -54,7 +54,6 @@ impl Body {
             Self::Subscribe(subscribe) => {
                 reader::encode_subscribe(envelope, subscribe, metadata, limits)?
             }
-            Self::Credit(credit) => reader::encode_credit(envelope, *credit, metadata, limits)?,
             Self::Ack(ack) => reader::encode_ack(envelope, *ack, metadata, limits)?,
             Self::Unsubscribe(subscribed) => {
                 reader::encode_unsubscribe(envelope, *subscribed, metadata, limits)?
@@ -89,16 +88,8 @@ struct Active {
     session: LinkSessionId,
 }
 
-enum Event {
-    Input(Option<Command>),
-    Message(Result<(Bytes, Message), omq_tokio::Error>),
-    Monitor(Result<MonitorEvent, omq_tokio::MonitorRecvError>),
-    Wake,
-}
-
-pub(super) struct Driver {
+pub(super) struct LinkState {
     socket: Arc<IdentitySocket>,
-    monitor: MonitorStream,
     input: mpsc::Receiver<Command>,
     peer: Arc<Peer>,
     shared: Arc<Shared>,
@@ -116,10 +107,9 @@ pub(super) struct Driver {
     watches: super::routing::Watcher,
 }
 
-impl Driver {
+impl LinkState {
     pub(super) fn new(
         socket: Arc<IdentitySocket>,
-        monitor: MonitorStream,
         input: mpsc::Receiver<Command>,
         peer: Arc<Peer>,
         shared: Arc<Shared>,
@@ -129,7 +119,6 @@ impl Driver {
         Self {
             watches: super::routing::Watcher::new(shared.clone(), remote, config),
             socket,
-            monitor,
             input,
             peer,
             shared,
@@ -147,157 +136,63 @@ impl Driver {
         }
     }
 
-    pub(super) async fn run(mut self) {
-        let result = self.serve().await;
-        self.fence();
-        self.sending = None;
-        self.peer.slots.close();
-        // Drop the coordinated receiver before close waits, reclaiming queued
-        // observers even while application handles retain live senders.
-        drop(self.input);
-        let result = result.and(
-            self.socket
-                .as_ref()
-                .clone()
-                .into_inner()
-                .close()
-                .await
-                .map_err(BrokerLinkError::from),
-        );
-        if let Err(error) = result {
-            let _ = self.shared.failure.set(error.to_string());
+    fn progress(&mut self, now: Duration) -> Result<bool, BrokerLinkError> {
+        self.expire(now);
+        let mut full = self.watches.progress(now)?;
+        if self.shared.sessions.session(self.remote).is_none() && now >= self.next_hello {
+            self.handshake = Some(Message::with_prefix(
+                Bytes::copy_from_slice(self.remote.as_bytes()),
+                Message::multipart(self.shared.sessions.start(self.remote)?),
+            ));
+            self.next_hello = now.saturating_add(self.retry);
         }
-        self.peer.closed.close();
-        self.shared.changed.notify_changed();
-    }
-
-    async fn serve(&mut self) -> Result<(), BrokerLinkError> {
-        loop {
-            tokio::task::consume_budget().await;
-            if self.shared.stop.is_closed() {
-                return Ok(());
-            }
-            let now = self.clock.now();
-            let generation = self.shared.changed.generation();
-            let mut full_turn = self.receive_ready()?;
-            self.expire(now);
-            full_turn |= self.watches.progress(now)?;
-            if self.shared.sessions.session(self.remote).is_none() && now >= self.next_hello {
-                self.handshake = Some(Message::with_prefix(
-                    Bytes::copy_from_slice(self.remote.as_bytes()),
-                    Message::multipart(self.shared.sessions.start(self.remote)?),
-                ));
-                self.next_hello = now.saturating_add(self.retry);
-            }
-            self.flush_handshake()?;
-            self.flush_watch()?;
-            for index in 0..TURN {
-                if self.sending.is_none() {
-                    match self.input.try_recv() {
-                        Ok(command) => {
-                            self.sending = Some(Waiting {
-                                command,
-                                frame: None,
-                            });
-                        }
-                        Err(mpsc::error::TryRecvError::Empty) => break,
-                        Err(mpsc::error::TryRecvError::Disconnected) => return Ok(()),
+        self.flush_handshake()?;
+        self.flush_watch()?;
+        for index in 0..TURN {
+            if self.sending.is_none() {
+                match self.input.try_recv() {
+                    Ok(command) => {
+                        self.sending = Some(Waiting {
+                            command,
+                            frame: None,
+                        });
                     }
+                    Err(_) => break,
                 }
-                if !self.send(now)? {
-                    break;
-                }
-                full_turn |= index + 1 == TURN;
             }
-            if full_turn {
-                tokio::task::yield_now().await;
-                continue;
+            if !self.send(now)? {
+                break;
             }
-            let deadline = self
-                .active
-                .values()
-                .map(|active| active.command.deadline)
-                .chain(self.sending.iter().map(|waiting| waiting.command.deadline))
-                .chain(
-                    self.shared
-                        .sessions
-                        .session(self.remote)
-                        .is_none()
-                        .then_some(self.next_hello),
-                )
-                .chain(self.watches.deadline())
-                .min();
-            // An absent route is not socket-capacity pressure. Its capacity
-            // future may already be ready, starving every other SDK link.
-            // Await connection events or the next HELLO retry instead.
-            let frame = self
-                .handshake
-                .as_ref()
-                .or_else(|| {
-                    self.sending
-                        .as_ref()
-                        .and_then(|waiting| waiting.frame.as_ref())
-                })
-                .or_else(|| self.watches.frame());
-            let event = tokio::select! {
-                () = self.shared.stop.closed() => return Ok(()),
-                command = self.input.recv(), if self.sending.is_none() => Event::Input(command),
-                () = self.shared.changed.changed_after(generation) => Event::Wake,
-                () = self.watches.capacity_ready() => Event::Wake,
-                message = self.socket.recv_from() => Event::Message(message),
-                event = self.monitor.recv() => Event::Monitor(event),
-                () = async { match frame {
-                    Some(frame) if !self.missing_route => self.socket.wait_send_progress_for(frame).await,
-                    _ => std::future::pending().await,
-                }} => Event::Wake,
-                () = async { match deadline {
-                    Some(deadline) => self.clock.until(deadline).await,
-                    None => std::future::pending().await,
-                }} => Event::Wake,
-            };
-            match event {
-                Event::Input(Some(command)) => {
-                    self.sending = Some(Waiting {
-                        command,
-                        frame: None,
-                    });
-                }
-                Event::Input(None) => return Ok(()),
-                Event::Wake => {}
-                Event::Message(message) => {
-                    let (identity, body) = message?;
-                    self.receive(&Message::with_prefix(identity, body))?;
-                }
-                Event::Monitor(event) => self.observe(event.map_err(|_| {
-                    BrokerLinkError::Failed("SDK transport monitor lost events".to_owned())
-                })?)?,
-            }
+            full |= index + 1 == TURN;
         }
+        Ok(full)
     }
 
-    fn receive_ready(&mut self) -> Result<bool, BrokerLinkError> {
-        let mut full_turn = false;
-        for index in 0..TURN {
-            match self.monitor.try_recv() {
-                Ok(event) => self.observe(event)?,
-                Err(MonitorTryRecvError::Empty) => break,
-                Err(_) => {
-                    return Err(BrokerLinkError::Failed(
-                        "SDK transport monitor lost events".to_owned(),
-                    ));
-                }
-            }
-            full_turn |= index + 1 == TURN;
-        }
-        for index in 0..TURN {
-            match self.socket.try_recv_from() {
-                Ok((identity, body)) => self.receive(&Message::with_prefix(identity, body))?,
-                Err(omq_tokio::Error::WouldBlock) => break,
-                Err(error) => return Err(error.into()),
-            }
-            full_turn |= index + 1 == TURN;
-        }
-        Ok(full_turn)
+    fn deadline(&self) -> Option<Duration> {
+        self.active
+            .values()
+            .map(|active| active.command.deadline)
+            .chain(self.sending.iter().map(|waiting| waiting.command.deadline))
+            .chain(
+                self.shared
+                    .sessions
+                    .session(self.remote)
+                    .is_none()
+                    .then_some(self.next_hello),
+            )
+            .chain(self.watches.deadline())
+            .min()
+    }
+
+    fn frame(&self) -> Option<&Message> {
+        self.handshake
+            .as_ref()
+            .or_else(|| {
+                self.sending
+                    .as_ref()
+                    .and_then(|waiting| waiting.frame.as_ref())
+            })
+            .or_else(|| self.watches.frame())
     }
 
     fn observe(&mut self, event: MonitorEvent) -> Result<(), BrokerLinkError> {
@@ -493,16 +388,16 @@ impl Driver {
             return Ok(());
         }
         if self.shared.sessions.session(self.remote) == packet.envelope.session
-            && (packet.envelope.opcode == Opcode::Records
-                || packet.envelope.opcode == Opcode::Nack
-                    && packet
-                        .envelope
-                        .request_id
-                        .is_none_or(|id| !self.active.contains_key(&id)))
+            && packet.envelope.opcode == Opcode::Nack
+            && packet
+                .envelope
+                .request_id
+                .is_none_or(|id| !self.active.contains_key(&id))
             && self
                 .shared
                 .readers
                 .receive(self.remote, message, packet, self.limits)
+                .is_ok()
         {
             return Ok(());
         }
@@ -583,6 +478,260 @@ impl Driver {
             self.shared.changed.notify_changed();
         }
         Ok(())
+    }
+}
+
+enum Event {
+    Control((Bytes, Message)),
+    Data((omq_tokio::ReceiveReceipt, Message)),
+    Monitor(MonitorEvent),
+    Wake,
+}
+
+/// Exactly one control and one data socket per SDK owner, each connected to
+/// every configured broker. Per-broker state never receives or closes a socket.
+pub(super) struct Driver {
+    control: Arc<IdentitySocket>,
+    data: Arc<IdentitySocket>,
+    monitor: MonitorStream,
+    links: Vec<LinkState>,
+    shared: Arc<Shared>,
+    cursor: usize,
+    paused: BTreeMap<NodeId, omq_tokio::ReceiveSource>,
+}
+
+impl Driver {
+    pub(super) fn new(
+        control: Arc<IdentitySocket>,
+        data: Arc<IdentitySocket>,
+        monitor: MonitorStream,
+        links: Vec<LinkState>,
+        shared: Arc<Shared>,
+    ) -> Self {
+        Self {
+            control,
+            data,
+            monitor,
+            links,
+            shared,
+            cursor: 0,
+            paused: BTreeMap::new(),
+        }
+    }
+
+    pub(super) async fn run(mut self) {
+        let result = self.serve().await;
+        for link in &mut self.links {
+            link.fence();
+            link.sending = None;
+            link.peer.slots.close();
+        }
+        let control = self.control.as_ref().clone().into_inner().close().await;
+        let data = self.data.as_ref().clone().into_inner().close().await;
+        if let Err(error) = result
+            .and(control.map_err(BrokerLinkError::from))
+            .and(data.map_err(BrokerLinkError::from))
+        {
+            let _ = self.shared.failure.set(error.to_string());
+        }
+        for link in &self.links {
+            link.peer.closed.close();
+        }
+        self.shared.changed.notify_changed();
+    }
+
+    fn observe(&mut self, event: MonitorEvent) -> Result<(), BrokerLinkError> {
+        let (MonitorEvent::HandshakeSucceeded { peer, .. }
+        | MonitorEvent::Disconnected { peer, .. }) = &event
+        else {
+            return Ok(());
+        };
+        let node = peer
+            .peer_identity
+            .as_deref()
+            .and_then(|id| <[u8; 16]>::try_from(id).ok())
+            .map(NodeId::from_bytes);
+        if let Some(link) = self
+            .links
+            .iter_mut()
+            .find(|link| Some(link.remote) == node || link.connection == Some(peer.connection_id))
+        {
+            link.observe(event)?;
+        }
+        Ok(())
+    }
+
+    fn receive_control(&mut self, identity: Bytes, body: Message) -> Result<(), BrokerLinkError> {
+        let Some(remote) = <[u8; 16]>::try_from(identity.as_ref())
+            .ok()
+            .map(NodeId::from_bytes)
+        else {
+            return Ok(());
+        };
+        if let Some(link) = self.links.iter_mut().find(|link| link.remote == remote) {
+            link.receive(&Message::with_prefix(identity, body))?;
+        }
+        Ok(())
+    }
+
+    fn receive_data(
+        &mut self,
+        receipt: omq_tokio::ReceiveReceipt,
+        body: Message,
+    ) -> Result<(), BrokerLinkError> {
+        let Some(identity) = receipt.identity_bytes() else {
+            return Ok(());
+        };
+        let Some(remote) = <[u8; 16]>::try_from(identity.as_ref())
+            .ok()
+            .map(NodeId::from_bytes)
+        else {
+            return Ok(());
+        };
+        let message = Message::with_prefix(identity, body.clone());
+        let Ok(packet) = packet(&message, remote, self.links[0].limits) else {
+            return Ok(());
+        };
+        if self.shared.sessions.session(remote).is_none()
+            || self.shared.sessions.session(remote) != packet.envelope.session
+            || packet.envelope.opcode != Opcode::Records
+        {
+            return Ok(());
+        }
+        if self
+            .shared
+            .readers
+            .receive(remote, &message, packet, self.links[0].limits)
+            .is_err()
+            && let Some(source) = receipt.source().cloned()
+        {
+            match self.data.unshift(receipt, body) {
+                Ok(()) => {
+                    self.paused.insert(remote, source);
+                }
+                Err(error) if matches!(error.error, omq_tokio::Error::Closed) => {}
+                Err(error) => return Err(error.error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one bounded control and data socket owner turn"
+    )]
+    async fn serve(&mut self) -> Result<(), BrokerLinkError> {
+        loop {
+            if self.shared.stop.is_closed() {
+                return Ok(());
+            }
+            let generation = self.shared.changed.generation();
+            let readers = self.shared.readers.changed.generation();
+            let mut full = false;
+            // Lifecycle events fence root sessions before their queued input.
+            for index in 0..TURN {
+                match self.monitor.try_recv() {
+                    Ok(event) => self.observe(event)?,
+                    Err(MonitorTryRecvError::Empty) => break,
+                    Err(_) => {
+                        return Err(BrokerLinkError::Failed(
+                            "SDK transport monitor lost events".into(),
+                        ));
+                    }
+                }
+                full |= index + 1 == TURN;
+            }
+            let mut control_bytes = 0usize;
+            for index in 0..TURN {
+                match self.control.try_recv_from() {
+                    Ok((identity, body)) => {
+                        control_bytes += body.byte_len();
+                        self.receive_control(identity, body)?;
+                    }
+                    Err(omq_tokio::Error::WouldBlock) => break,
+                    Err(error) => return Err(error.into()),
+                }
+                full |= index + 1 == TURN || control_bytes >= TURN_BYTES;
+                if control_bytes >= TURN_BYTES {
+                    break;
+                }
+            }
+            // Retry exact paused sources once per bounded turn. OMQ keeps other
+            // broker connections runnable while retained reader backing is full.
+            for (remote, source) in std::mem::take(&mut self.paused) {
+                match self.data.try_recv_from_source(Some(&source)) {
+                    Ok((receipt, body)) => self.receive_data(receipt, body)?,
+                    Err(omq_tokio::Error::WouldBlock) => {
+                        self.paused.insert(remote, source);
+                    }
+                    Err(omq_tokio::Error::Closed) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            let mut data_bytes = 0usize;
+            for index in 0..TURN {
+                match self.data.try_recv_from_source(None) {
+                    Ok((receipt, body)) => {
+                        data_bytes += body.byte_len();
+                        self.receive_data(receipt, body)?;
+                    }
+                    Err(omq_tokio::Error::WouldBlock) => break,
+                    Err(error) => return Err(error.into()),
+                }
+                full |= index + 1 == TURN || data_bytes >= TURN_BYTES;
+                if data_bytes >= TURN_BYTES {
+                    break;
+                }
+            }
+            let now = self.links[0].clock.now();
+            for _ in 0..self.links.len() {
+                let index = self.cursor;
+                self.cursor = (index + 1) % self.links.len();
+                full |= self.links[index].progress(now)?;
+            }
+            if full {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            let deadline = self.links.iter().filter_map(LinkState::deadline).min();
+            let event = {
+                let waits = futures::stream::FuturesUnordered::new();
+                for link in &self.links {
+                    let socket = self.control.clone();
+                    let frame = link.frame().filter(|_| !link.missing_route).cloned();
+                    waits.push(async move {
+                        if let Some(frame) = frame {
+                            socket.wait_send_progress_for(&frame).await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    });
+                }
+                let mut waits = std::pin::pin!(waits);
+                let capacity = futures::stream::FuturesUnordered::new();
+                for link in &self.links {
+                    capacity.push(link.watches.capacity_ready());
+                }
+                let mut capacity = std::pin::pin!(capacity);
+                tokio::select! {
+                    () = self.shared.stop.closed() => return Ok(()),
+                    () = self.shared.changed.changed_after(generation) => Event::Wake,
+                    () = self.shared.readers.changed.changed_after(readers) => Event::Wake,
+                    _ = waits.next() => Event::Wake,
+                    _ = capacity.next() => Event::Wake,
+                    received = self.control.recv_from() => Event::Control(received?),
+                    received = self.data.recv_from_source(None) => Event::Data(received?),
+                    event = self.monitor.recv() => Event::Monitor(event.map_err(|_| BrokerLinkError::Failed("SDK transport monitor lost events".into()))?),
+                    () = async { if let Some(deadline) = deadline { self.links[0].clock.until(deadline).await } else { std::future::pending().await } } => Event::Wake,
+                }
+            };
+            match event {
+                Event::Control((identity, body)) => self.receive_control(identity, body)?,
+                Event::Data((receipt, body)) => self.receive_data(receipt, body)?,
+                Event::Monitor(event) => self.observe(event)?,
+                Event::Wake => {}
+            }
+        }
     }
 }
 

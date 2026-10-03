@@ -51,25 +51,6 @@ impl Cursor {
         Ok(())
     }
 
-    pub(super) fn credit(&mut self, links: &BrokerLinks) -> Result<(), BrokerLinkError> {
-        if self.returning.is_some() {
-            return Ok(());
-        }
-        let (broker, _, selected) = self.selected.ok_or(BrokerLinkError::Session)?;
-        let credit = reader::Credit {
-            subscription: selected.subscription,
-            source: selected.source,
-            records: self.records,
-            bytes: self.bytes,
-        };
-        let links = links.clone();
-        self.sent_credit = (self.records, self.bytes);
-        self.returning = Some(Box::pin(async move {
-            links.reader_credit(broker, credit).await
-        }));
-        Ok(())
-    }
-
     pub(in crate::replicated::topic_reader) async fn acknowledge(
         &self,
         links: &BrokerLinks,
@@ -104,11 +85,9 @@ impl Cursor {
             .map(|(broker, _, selected)| (broker, selected))
             .or_else(|| self.inbox.selected());
         self.opening = None;
-        self.returning = None;
         self.pending = None;
         self.held = None;
         self.ready = None;
-        self.released = None;
         self.inbox.clear();
         self.canceling.take().or_else(|| {
             selected.map(|(broker, selected)| {
@@ -131,11 +110,6 @@ impl Cursor {
                     self.opening = None;
                     self.selected = Some(selected);
                     self.accepted = Some(selected);
-                    let (records, bytes) = links.reader_window()?;
-                    self.records = records;
-                    self.bytes = bytes;
-                    self.sent_credit = (0, 0);
-                    self.credit(links)?;
                 }
                 Poll::Ready(Err(error)) => {
                     self.opening = None;
@@ -143,13 +117,13 @@ impl Cursor {
                         return Err(error.into());
                     }
                     routes.refresh(self.number)?;
-                    // A credit refusal names no other source. Ask the same
+                    // A temporary refusal names no other source. Ask the same
                     // broker again as soon as any other refused request.
                     self.due = now
                         + if matches!(
                             error,
                             BrokerLinkError::Rejected {
-                                retry: ozzy_proto::nack::RetryClass::AfterCredit,
+                                retry: ozzy_proto::nack::RetryClass::AfterBackoff,
                                 ..
                             }
                         ) {
@@ -166,21 +140,16 @@ impl Cursor {
 
     pub(super) fn poll_returns(
         &mut self,
-        links: &BrokerLinks,
         routes: &TopicRoutes,
         cx: &mut Context<'_>,
     ) -> Result<(), TopicReaderError> {
-        for cancel in [true, false] {
-            let pending = if cancel {
-                &mut self.canceling
-            } else {
-                &mut self.returning
-            };
+        {
+            let pending = &mut self.canceling;
             let result = pending.as_mut().map(|pending| pending.as_mut().poll(cx));
             match result {
                 Some(Poll::Ready(Ok(()))) => {
                     *pending = None;
-                    if cancel && self.live.is_paused() {
+                    if self.live.is_paused() {
                         // A held publication may have found its gap while the
                         // old replay subscription was still closing.
                         self.due = Duration::ZERO;
@@ -197,12 +166,6 @@ impl Cursor {
                 Some(Poll::Pending) | None => {}
             }
         }
-        if self.selected.is_some()
-            && self.returning.is_none()
-            && self.sent_credit != (self.records, self.bytes)
-        {
-            self.credit(links)?;
-        }
         Ok(())
     }
 
@@ -211,8 +174,6 @@ impl Cursor {
             && let Some((broker, _, selected)) = self.selected.take()
         {
             let links = links.clone();
-            self.returning = None;
-            self.released = None;
             self.inbox.clear();
             self.canceling = Some(Box::pin(async move {
                 links.unsubscribe(broker, selected).await

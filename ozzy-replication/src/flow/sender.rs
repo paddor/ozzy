@@ -8,7 +8,7 @@ mod tests;
 /// One peer's absolute send reservations and bounded sent-but-unreceipted ledger.
 ///
 /// No payload ownership or quorum state lives here. Keep one instance per peer;
-/// a slow peer cannot consume another peer's credits. Updates allocate no memory.
+/// a slow peer cannot consume another peer's local capacity. Updates allocate no memory.
 #[derive(Debug)]
 pub struct Sender {
     report: Report,
@@ -99,11 +99,7 @@ impl Sender {
         if report.revision < self.report.revision {
             return Ok(false);
         }
-        if report.revision == self.report.revision
-            || report.operation_limit < self.report.operation_limit
-            || report.byte_limit < self.report.byte_limit
-            || report.received_bytes <= self.sent_bytes
-        {
+        if report.revision == self.report.revision || report.received_bytes <= self.sent_bytes {
             return Err(FlowError::Report);
         }
         self.pending.clear();
@@ -134,17 +130,13 @@ impl Sender {
         self.report.received
     }
 
-    /// Intersection of unreserved remote credits and local outstanding capacity.
-    /// May be zero; not a reservation. Remote credit cannot grow the local ledger.
+    /// Remaining local outstanding capacity.
+    /// May be zero; not a reservation. Reports cannot grow the local ledger.
     pub fn available(&self) -> PipelineLimits {
-        let remote_count = self.report.operation_limit - (self.sent.op.0 - self.report.base.op.0);
-        let remote_bytes = self.report.byte_limit - self.sent_bytes;
-        let local_count = self.limits.max_operations - self.pending.len();
-        let local_bytes =
-            self.limits.max_body_bytes as u64 - (self.sent_bytes - self.report.received_bytes);
         PipelineLimits {
-            max_operations: remote_count.min(local_count as u64) as usize,
-            max_body_bytes: remote_bytes.min(local_bytes) as usize,
+            max_operations: self.limits.max_operations - self.pending.len(),
+            max_body_bytes: self.limits.max_body_bytes
+                - (self.sent_bytes - self.report.received_bytes) as usize,
         }
     }
 
@@ -154,7 +146,7 @@ impl Sender {
         self.pending.iter()
     }
 
-    /// Reserve credit once for a new contiguous suffix retained in the local send path.
+    /// Charge local metadata once for a new contiguous suffix in the send path.
     ///
     /// Reserve local payload/outbox capacity first. After success the adapter must
     /// retain the transmission across local backpressure or fence the whole epoch.
@@ -175,10 +167,7 @@ impl Sender {
             .sent_bytes
             .checked_add(bytes)
             .ok_or(FlowError::Exhausted)?;
-        if end.op.0 - self.report.base.op.0 > self.report.operation_limit
-            || total > self.report.byte_limit
-            || total - self.report.received_bytes > self.limits.max_body_bytes as u64
-        {
+        if total - self.report.received_bytes > self.limits.max_body_bytes as u64 {
             return Err(FlowError::Capacity);
         }
         self.pending.extend(operations.iter().copied());
@@ -187,7 +176,7 @@ impl Sender {
         Ok(())
     }
 
-    /// Incorporate same-epoch receipt/credit progress. Return false for stale or exact repeats.
+    /// Incorporate same-epoch receipt progress. Return false for stale or exact repeats.
     ///
     /// Check the exact receipt boundary and cumulative bytes against reserved sends
     /// before freeing metadata. Conflicting same-revision reports and all retractions
@@ -211,8 +200,7 @@ impl Sender {
             };
         }
         if report.received.op < self.report.received.op
-            || report.operation_limit < self.report.operation_limit
-            || report.byte_limit < self.report.byte_limit
+            || report.received_bytes < self.report.received_bytes
         {
             return Err(FlowError::Report);
         }

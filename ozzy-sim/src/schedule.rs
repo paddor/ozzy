@@ -3,7 +3,9 @@
 /// Reduced sequence and the number of replays used to establish it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reduction<T> {
+    /// Remaining schedule known to reproduce the classified failure.
     pub events: Vec<T>,
+    /// Replay predicate calls consumed, including the initial check.
     pub attempts: usize,
 }
 

@@ -42,6 +42,7 @@ xxhash-rust.workspace = true
 lz4rip.workspace = true
 
 [dev-dependencies]
+loom = "0.7"
 ozzy-io = { workspace = true, features = ["simulation"] }
 ozzy-io-pool.workspace = true
 tempfile.workspace = true
@@ -49,6 +50,10 @@ tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "ozzy_loom"
+path = "tests/loom.rs"
 
 [[test]]
 name = "ozzy_raw_notify_ban"

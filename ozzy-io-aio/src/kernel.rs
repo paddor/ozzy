@@ -73,6 +73,7 @@ impl AlignedBuf {
         }
     }
 
+    /// Page-aligned payload bytes, excluding allocation padding.
     pub fn as_slice(&self) -> &[u8] {
         &self.bytes[self.start..]
     }
@@ -145,10 +146,12 @@ impl<T, F: AsFd> AioContext<T, F> {
         })
     }
 
+    /// Configured maximum number of kernel requests in flight.
     pub fn depth(&self) -> usize {
         self.slots.len()
     }
 
+    /// Requests whose buffers and jobs remain owned by the kernel context.
     pub const fn in_flight(&self) -> usize {
         self.in_flight
     }

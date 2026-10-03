@@ -8,6 +8,7 @@ use std::{
     path::Path,
 };
 
+/// Result-row identifier for the required benchmark isolation contract.
 pub const CONTRACT: &str = "fresh-server-per-case; no-other-broker-resident; process-group-audit";
 const BENCHMARKS: &[&str] = &[
     "ozy_timed_bench",
@@ -33,6 +34,7 @@ const COMPETITORS: &[&str] = &[
 ];
 const SERVERS: &[&str] = &["iggy-server", "redpanda", "java"];
 
+/// Read the allowed CPU IDs for a process, defaulting to the current process.
 pub fn cpus(pid: Option<u32>) -> Result<Vec<usize>> {
     let mask = sched_getaffinity(pid.map(|id| Pid::from_raw(id.try_into().unwrap()).unwrap()))?;
     Ok((0..CpuSet::MAX_CPU)
@@ -40,6 +42,7 @@ pub fn cpus(pid: Option<u32>) -> Result<Vec<usize>> {
         .collect())
 }
 
+/// Restrict a process to the selected CPU IDs.
 pub fn pin(pid: Option<u32>, cpus: &[usize]) -> Result<()> {
     if cpus.is_empty() || cpus.iter().any(|&cpu| cpu >= CpuSet::MAX_CPU) {
         return Err("invalid CPU mask".into());
@@ -127,6 +130,7 @@ fn inspect(path: &Path) -> Result<Option<Value>> {
     ))
 }
 
+/// Enumerate relevant resident broker and benchmark processes.
 pub fn processes() -> Result<Vec<Value>> {
     let mut found = vec![];
     for entry in fs::read_dir("/proc")? {
@@ -159,10 +163,12 @@ fn disappeared(error: &(dyn std::error::Error + 'static)) -> bool {
     })
 }
 
+/// Construct initial isolation evidence before observations are collected.
 pub fn empty_proof() -> Value {
     json!({"contract":CONTRACT,"resident_processes":[]})
 }
 
+/// Reject competing resident servers before launching a fresh case.
 pub fn require_idle() -> Result<Value> {
     let found = processes()?;
     if !found.is_empty() {
@@ -172,6 +178,7 @@ pub fn require_idle() -> Result<Value> {
 }
 
 #[derive(Debug)]
+/// Retained process and remote isolation evidence for one benchmark case.
 pub struct Guard {
     remote: Option<super::distributed::Audit>,
     implementation: String,
@@ -183,6 +190,7 @@ pub struct Guard {
 }
 
 impl Guard {
+    /// Track the selected implementation and its primary server process.
     pub fn new(implementation: &str, server_pid: Option<u32>) -> Self {
         Self {
             remote: None,
@@ -196,6 +204,7 @@ impl Guard {
     }
 
     #[must_use]
+    /// Extend the allowed process set with all server processes in this case.
     pub fn with_servers(mut self, pids: &[u32]) -> Self {
         self.server_pids = pids.iter().copied().collect();
         self
@@ -233,6 +242,7 @@ impl Guard {
         Ok(self)
     }
 
+    /// Inspect current processes and fail on competing work outside the case process group.
     pub fn check(&mut self, group: u32) -> Result<()> {
         if let Some(remote) = &mut self.remote {
             remote.check()?;
@@ -240,9 +250,11 @@ impl Guard {
         self.check_processes(group, processes()?)
     }
 
+    /// Attach the distributed isolation monitor for this case.
     pub fn set_remote(&mut self, audit: super::distributed::Audit) {
         self.remote = Some(audit);
     }
+    /// Stop an attached remote audit and return its final evidence.
     pub fn finish_remote(&mut self) -> Result<Value> {
         Ok(self
             .remote
@@ -252,6 +264,7 @@ impl Guard {
             .unwrap_or(Value::Null))
     }
 
+    /// Validate a captured process inventory against the allowed case processes.
     pub fn check_processes(&mut self, group: u32, found: Vec<Value>) -> Result<()> {
         let mut servers_seen = BTreeSet::new();
         for process in found {
@@ -311,6 +324,7 @@ impl Guard {
         Ok(())
     }
 
+    /// Serialize collected isolation evidence or return the detected interference.
     pub fn report(&self) -> Result<Value> {
         if self.samples == 0 {
             return Err("benchmark isolation was not observed".into());

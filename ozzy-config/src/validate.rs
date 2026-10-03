@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::{
     Broker, ConfigError, Confirmation, Deployment, DeploymentMode, QueueBudget, Shard, invalid,
+    schema::MAX_APPEND_BYTES,
 };
 
 /// Structurally valid configuration. Host checks are performed for the selected
@@ -54,6 +55,7 @@ impl Deployment {
             optional_id(broker.id, &mut ids, &path)?;
             for endpoint in [
                 Some(&broker.endpoints.peer),
+                Some(&broker.endpoints.data_peer),
                 Some(&broker.endpoints.reader_pub),
                 broker.endpoints.follower_pub.as_ref(),
             ]
@@ -83,7 +85,7 @@ impl Deployment {
                 )?;
             }
             // One accepted APPEND needs receive backing and two canonical
-            // buffers before its destination can advertise credit. Leave one
+            // buffers while its destination admits work. Leave one
             // further body for framing and in-flight settlement.
             let max_append = self
                 .topics
@@ -162,8 +164,12 @@ fn validate_topics(config: &Deployment, ids: &mut BTreeSet<Uuid>) -> Result<(), 
             "confirmation policy is incompatible with deployment mode",
         )?;
         require(
-            topic.max_append_bytes > 0
-                && topic.segment_bytes >= 1024 * 1024
+            topic.max_append_bytes > 0 && topic.max_append_bytes <= MAX_APPEND_BYTES,
+            &path,
+            "max_append_bytes must be at most 8 MiB",
+        )?;
+        require(
+            topic.segment_bytes >= 1024 * 1024
                 && topic.segment_bytes % 4096 == 0
                 && topic.max_append_bytes <= topic.segment_bytes / 2,
             &path,

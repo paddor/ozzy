@@ -1,10 +1,11 @@
 use super::*;
 use crate::replica_actor::{ScheduleError, ScheduledReplica};
 
-type Scheduled = ScheduledReplica<ShardJournal>;
+type Scheduled = ScheduledReplica;
 
 mod disconnected;
 mod native;
+mod publications;
 mod routes;
 mod set;
 
@@ -232,7 +233,7 @@ fn envelope(message: &Message) -> ozzy_proto::Envelope {
 
 fn opcode(message: &Message) -> ozzy_proto::Opcode {
     if message.len() == 2 {
-        ozzy_proto::Opcode::ReplicaCredit
+        ozzy_proto::Opcode::ReplicaReceipt
     } else {
         envelope(message).opcode
     }
@@ -372,6 +373,12 @@ fn scheduled_idle_wait_wakes_for_intake_and_cancellation_cannot_lose_it() {
         let waker = Waker::from(wake.clone());
         let mut cx = Context::from_waker(&waker);
         let mut waiting = Box::pin(actor.changed(Duration::ZERO));
+        // Direct owner startup may already have completed an activation action.
+        if matches!(waiting.as_mut().poll(&mut cx), Poll::Ready(Ok(()))) {
+            drop(waiting);
+            actor.advance(Duration::ZERO).unwrap();
+            waiting = Box::pin(actor.changed(Duration::ZERO));
+        }
         assert!(waiting.as_mut().poll(&mut cx).is_pending());
         if cancel {
             drop(waiting);

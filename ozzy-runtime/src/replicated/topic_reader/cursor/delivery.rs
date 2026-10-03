@@ -4,6 +4,7 @@ use super::{
     BrokerLinkError, BrokerLinks, Bytes, Context, Cursor, Decoder, Duration, FrameRecords, Message,
     Offset, Publication, Replayed, TopicReaderError, TopicRecord, TopicRoutes, reader,
 };
+use ozzy_core::live::CursorError;
 use ozzy_proto::Opcode;
 
 impl Cursor {
@@ -73,7 +74,7 @@ impl Cursor {
             if matches!(
                 nack.retry,
                 ozzy_proto::nack::RetryClass::AfterAuthorityRefresh
-                    | ozzy_proto::nack::RetryClass::AfterCredit
+                    | ozzy_proto::nack::RetryClass::AfterBackoff
                     | ozzy_proto::nack::RetryClass::UnknownOutcome
             ) {
                 self.reset();
@@ -94,21 +95,24 @@ impl Cursor {
         {
             return Ok(());
         }
-        let decision = self
-            .live
-            .replayed(
-                delivery.header.first_offset,
-                delivery.records.len() as u64,
-                now,
-            )
-            .map_err(|_| BrokerLinkError::Response)?;
+        let decision = match self.live.replayed(
+            delivery.header.first_offset,
+            delivery.records.len() as u64,
+            now,
+        ) {
+            Ok(decision) => decision,
+            Err(CursorError::Replay) => {
+                // Data routing can lag the independent control connection.
+                // Reopen exact history after a lost or reordered replay frame.
+                self.reset();
+                cx.waker().wake_by_ref();
+                return Ok(());
+            }
+            Err(_) => return Err(BrokerLinkError::Response.into()),
+        };
         if decision == Replayed::Ignore {
             return Ok(());
         }
-        self.released = Some((
-            delivery.records.len() as u64,
-            delivery.records.as_records().payload_bytes() as u64,
-        ));
         self.pending = Some(FrameRecords::new(delivery.records, message).into_batch(0));
         self.pending_live = false;
         if let Replayed::DeliverThenHeld { skip } = decision {
@@ -169,7 +173,6 @@ impl Cursor {
             Publication::Deliver { skip } => {
                 self.pending = Some(FrameRecords::new(delivery.records, message).into_batch(skip));
                 self.pending_live = true;
-                self.released = None;
             }
         }
         Ok(())

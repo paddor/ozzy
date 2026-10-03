@@ -1,20 +1,23 @@
 //! Deterministic canonical-operation state transitions.
 
-use ahash::{AHashMap as HashMap, AHashSet as HashSet};
+use ahash::AHashMap as HashMap;
 use smallvec::SmallVec;
 
-use ozzy_journal::operation::{
-    Append, AppendBatchSummary, AppendSummary, Assign, Barrier, CreatePartition, OpenProducer,
-    OperationBody, PartitionPolicy, ProducerResultFloor, Progress, ProgressOwner, RetentionPolicy,
-    Trim,
-};
+use ozzy_journal::operation::{ProgressOwner, RetentionPolicy};
 use ozzy_proto::{
     ConsumerGroupId, ConsumerMemberId, Offset, OperationId, OwnerEpoch, PartitionId,
     PartitionIncarnation, ProducerEpoch, ProducerId, ProducerSequence, SubscriptionId,
 };
 use thiserror::Error;
 
+mod admission;
+mod append;
+mod identity;
 mod images;
+mod installation;
+pub use identity::{
+    IdentityClaim, IdentityIndex, IdentityIndexError, IdentityKey, MemoryIdentityIndex,
+};
 mod producer;
 mod snapshot;
 
@@ -31,10 +34,15 @@ pub use snapshot::{
 /// Bounds for live application metadata. Historical identities live in indexes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StateLimits {
+    /// Maximum live partition incarnations.
     pub max_partitions: usize,
+    /// Maximum live producer sessions across partitions.
     pub max_producers: usize,
+    /// Maximum retained producer sequence-to-offset spans.
     pub max_retry_spans: usize,
+    /// Maximum individual or group progress entries.
     pub max_progress: usize,
+    /// Maximum consumer-group partition assignments.
     pub max_assignments: usize,
 }
 
@@ -53,28 +61,39 @@ impl Default for StateLimits {
 /// Immutable logical address bound to one partition incarnation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PartitionAddress {
+    /// Logical stream namespace.
     pub stream: String,
+    /// Logical topic name.
     pub topic: String,
+    /// Partition number within the topic.
     pub partition_id: PartitionId,
 }
 
 /// Compact live state reconstructed for one partition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalPartition {
+    /// Immutable logical address for this incarnation.
     pub address: PartitionAddress,
+    /// Current owner fence for this partition.
     pub owner_epoch: OwnerEpoch,
     producers: HashMap<ProducerId, CanonicalProducer>,
+    /// Next partition-global record offset.
     pub next_offset: Offset,
+    /// Earliest offset retained by the current policy.
     pub retained_from: Offset,
+    /// Current retention-policy revision.
     pub policy_revision: u64,
+    /// Installed retention policy.
     pub retention: RetentionPolicy,
 }
 
 impl CanonicalPartition {
+    /// Look up one partition-local producer session.
     pub fn producer(&self, producer: ProducerId) -> Option<&CanonicalProducer> {
         self.producers.get(&producer)
     }
 
+    /// Iterate partition-local producer sessions in unspecified order.
     pub fn producers(&self) -> impl ExactSizeIterator<Item = (ProducerId, &CanonicalProducer)> {
         self.producers.iter().map(|(id, state)| (*id, state))
     }
@@ -94,160 +113,10 @@ impl CanonicalPartition {
 /// Current consumer-group assignment for one partition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AssignmentState {
+    /// Current assignment fence.
     pub epoch: u64,
+    /// Assigned member, or no owner when revoked.
     pub member: Option<ConsumerMemberId>,
-}
-
-/// Exact control-operation identity checked against persistent indexes and
-/// bounded overlays.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct IdentityKey(OperationId);
-
-impl IdentityKey {
-    pub const fn operation(operation_id: OperationId) -> Self {
-        Self(operation_id)
-    }
-
-    pub const fn operation_id(self) -> OperationId {
-        self.0
-    }
-}
-
-/// Control-operation identity plus its deterministic result coordinate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IdentityClaim {
-    pub operation_id: OperationId,
-    pub op_number: u64,
-}
-
-impl IdentityClaim {
-    pub const fn key(self) -> IdentityKey {
-        IdentityKey::operation(self.operation_id)
-    }
-}
-
-/// Exact committed index plus bounded unindexed/speculative overlay.
-///
-/// `reserve` is atomic: an error inserts no claim. It performs no blocking I/O;
-/// storage adapters resolve disk lookup and capacity before entering the core.
-pub trait IdentityIndex {
-    fn lookup(&self, key: IdentityKey) -> Result<Option<IdentityClaim>, IdentityIndexError>;
-
-    /// Check whether this many additional unique claims fit.
-    fn check_capacity(&self, additional: usize) -> Result<(), IdentityIndexError>;
-
-    /// Validate an atomic reservation without changing the index.
-    fn check_reserve(&self, claims: &[IdentityClaim]) -> Result<(), IdentityIndexError>;
-
-    fn reserve(&mut self, claims: &[IdentityClaim]) -> Result<(), IdentityIndexError>;
-
-    /// Install claims already validated against this exact index generation.
-    ///
-    /// Canonical transition plans are opaque and revision-bound. The state
-    /// engine uses this after `prepare` has checked every identity and the
-    /// index cannot have changed independently. Implementations may skip
-    /// duplicate lookups, but must still preserve capacity and atomicity.
-    fn reserve_validated(&mut self, claims: &[IdentityClaim]) -> Result<(), IdentityIndexError> {
-        self.reserve(claims)
-    }
-}
-
-/// Bounded exact in-memory identity index for tests, simulation, and overlays.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemoryIdentityIndex {
-    capacity: usize,
-    claims: HashMap<OperationId, u64>,
-}
-
-impl MemoryIdentityIndex {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            claims: HashMap::new(),
-        }
-    }
-
-    pub fn get(&self, key: IdentityKey) -> Option<IdentityClaim> {
-        self.claims
-            .get(&key.operation_id())
-            .map(|op_number| IdentityClaim {
-                operation_id: key.operation_id(),
-                op_number: *op_number,
-            })
-    }
-
-    pub const fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    pub fn len(&self) -> usize {
-        self.claims.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.claims.is_empty()
-    }
-
-    pub fn clear(&mut self) {
-        self.claims.clear();
-    }
-
-    pub fn claims(&self) -> impl ExactSizeIterator<Item = IdentityClaim> + '_ {
-        self.claims
-            .iter()
-            .map(|(operation_id, op_number)| IdentityClaim {
-                operation_id: *operation_id,
-                op_number: *op_number,
-            })
-    }
-}
-
-impl IdentityIndex for MemoryIdentityIndex {
-    fn lookup(&self, key: IdentityKey) -> Result<Option<IdentityClaim>, IdentityIndexError> {
-        Ok(self.get(key))
-    }
-
-    fn check_capacity(&self, additional: usize) -> Result<(), IdentityIndexError> {
-        if self.claims.len().saturating_add(additional) > self.capacity {
-            return Err(IdentityIndexError::Capacity);
-        }
-        Ok(())
-    }
-
-    fn check_reserve(&self, claims: &[IdentityClaim]) -> Result<(), IdentityIndexError> {
-        let keys = claims
-            .iter()
-            .map(|claim| claim.key())
-            .collect::<HashSet<_>>();
-        if keys.len() != claims.len()
-            || keys
-                .iter()
-                .any(|key| self.claims.contains_key(&key.operation_id()))
-        {
-            return Err(IdentityIndexError::Conflict);
-        }
-        self.check_capacity(keys.len())
-    }
-
-    fn reserve(&mut self, claims: &[IdentityClaim]) -> Result<(), IdentityIndexError> {
-        self.check_reserve(claims)?;
-        self.claims.extend(
-            claims
-                .iter()
-                .map(|claim| (claim.operation_id, claim.op_number)),
-        );
-        Ok(())
-    }
-
-    fn reserve_validated(&mut self, claims: &[IdentityClaim]) -> Result<(), IdentityIndexError> {
-        self.check_capacity(claims.len())?;
-        self.claims.extend(
-            claims
-                .iter()
-                .map(|claim| (claim.operation_id, claim.op_number)),
-        );
-        Ok(())
-    }
 }
 
 /// Infallible state mutation prepared against one exact state revision.
@@ -260,10 +129,12 @@ pub struct TransitionPlan {
 }
 
 impl TransitionPlan {
+    /// Canonical operation number bound to this prepared transition.
     pub const fn op_number(&self) -> u64 {
         self.op_number
     }
 
+    /// Control identities reserved by this prepared transition.
     pub fn identity_claims(&self) -> &[IdentityClaim] {
         &self.claims
     }
@@ -340,23 +211,8 @@ struct AppendCursor {
     next_offset: Offset,
 }
 
-// Four or fewer partition cursors stay inline. Larger grouped appends switch
-// to a set so hostile/many-partition input cannot create a quadratic scan.
-fn insert_append_partition(
-    cursors: &[AppendCursor],
-    partitions: &mut HashSet<PartitionIncarnation>,
-    partition: PartitionIncarnation,
-) -> bool {
-    if cursors.len() < 4 {
-        return !cursors.iter().any(|cursor| cursor.partition == partition);
-    }
-    if partitions.is_empty() {
-        partitions.extend(cursors.iter().map(|cursor| cursor.partition));
-    }
-    partitions.insert(partition)
-}
-
 impl CanonicalState {
+    /// Create empty application state with explicit metadata bounds.
     pub fn new(limits: StateLimits) -> Self {
         Self {
             limits,
@@ -370,10 +226,23 @@ impl CanonicalState {
         }
     }
 
+    fn require_next_operation(&self, op_number: u64) -> Result<(), StateError> {
+        let expected = self
+            .revision
+            .checked_add(1)
+            .ok_or(StateError::RevisionExhausted)?;
+        if expected != op_number {
+            return Err(StateError::OperationNumberMismatch);
+        }
+        Ok(())
+    }
+
+    /// Current mutation revision used to fence prepared transitions.
     pub const fn revision(&self) -> u64 {
         self.revision
     }
 
+    /// Look up live state for one exact partition incarnation.
     pub fn partition(&self, partition: PartitionIncarnation) -> Option<&CanonicalPartition> {
         self.partitions.get(&partition)
     }
@@ -392,6 +261,7 @@ impl CanonicalState {
             .map(|(partition, state)| (*partition, state))
     }
 
+    /// Look up the current consumer-group assignment for a partition.
     pub fn assignment(
         &self,
         group: ConsumerGroupId,
@@ -402,585 +272,13 @@ impl CanonicalState {
             .copied()
     }
 
+    /// Look up the declared exclusive progress offset for an owner and partition.
     pub fn progress(
         &self,
         owner: ProgressOwner,
         partition: PartitionIncarnation,
     ) -> Option<Offset> {
         self.progress.get(&progress_key(owner, partition)).copied()
-    }
-
-    /// Validate one decoded operation and freeze its deterministic mutation.
-    ///
-    /// `committed` supplies the visibility bound for consumer progress. It may
-    /// equal `self` when preparing a committed transition.
-    pub fn prepare(
-        &self,
-        op_number: u64,
-        body: &OperationBody<'_>,
-        identities: &impl IdentityIndex,
-        committed: &Self,
-    ) -> Result<TransitionPlan, StateError> {
-        let expected_op_number = self
-            .revision
-            .checked_add(1)
-            .ok_or(StateError::RevisionExhausted)?;
-        if op_number != expected_op_number {
-            return Err(StateError::OperationNumberMismatch);
-        }
-        let (mutation, claims) = match body {
-            OperationBody::CreatePartition(value) => self.prepare_create(value)?,
-            OperationBody::OpenProducer(value) => {
-                self.prepare_open(*value, op_number, identities)?
-            }
-            OperationBody::Append(value) => self.prepare_append(value)?,
-            OperationBody::Progress(value) => {
-                self.prepare_progress(*value, op_number, identities, committed)?
-            }
-            OperationBody::Assign(value) => self.prepare_assign(*value, op_number, identities)?,
-            OperationBody::Trim(value) => self.prepare_trim(*value, op_number, identities)?,
-            OperationBody::PartitionPolicy(value) => {
-                self.prepare_policy(*value, op_number, identities)?
-            }
-            OperationBody::Barrier(value) => Self::prepare_barrier(*value, op_number, identities)?,
-            OperationBody::ProducerResultFloor(value) => {
-                self.prepare_producer_result_floor(*value, op_number, identities)?
-            }
-        };
-        Ok(TransitionPlan {
-            expected_revision: self.revision,
-            op_number,
-            mutation,
-            claims,
-        })
-    }
-
-    /// Atomically reserve identities, then apply a previously prepared plan.
-    pub fn apply(
-        &mut self,
-        plan: TransitionPlan,
-        identities: &mut impl IdentityIndex,
-    ) -> Result<(), StateError> {
-        if plan.expected_revision != self.revision {
-            return Err(StateError::StalePlan);
-        }
-        let next_revision = self
-            .revision
-            .checked_add(1)
-            .ok_or(StateError::RevisionExhausted)?;
-        identities.reserve_validated(&plan.claims)?;
-        self.apply_mutation(plan.mutation);
-        self.revision = next_revision;
-        Ok(())
-    }
-
-    pub(super) fn install_prepared(&mut self, plan: TransitionPlan) {
-        debug_assert_eq!(plan.expected_revision, self.revision);
-        debug_assert_eq!(plan.op_number, self.revision + 1);
-        self.apply_mutation(plan.mutation);
-        self.revision = plan.op_number;
-    }
-
-    fn prepare_create(
-        &self,
-        value: &CreatePartition<'_>,
-    ) -> Result<(Mutation, Vec<IdentityClaim>), StateError> {
-        require_id("partition", value.partition.as_bytes())?;
-        if value.stream.is_empty() || value.topic.is_empty() {
-            return Err(StateError::MalformedBody(
-                "partition names must not be empty",
-            ));
-        }
-        if value.owner_epoch.get() == 0 {
-            return Err(StateError::ZeroValue("owner epoch"));
-        }
-        if self.partitions.contains_key(&value.partition) {
-            return Err(StateError::PartitionExists);
-        }
-        if self.partitions.len() >= self.limits.max_partitions {
-            return Err(StateError::LimitExceeded("partitions"));
-        }
-        let address = PartitionAddress {
-            stream: value.stream.to_owned(),
-            topic: value.topic.to_owned(),
-            partition_id: value.partition_id,
-        };
-        if self.addresses.contains_key(&address) {
-            return Err(StateError::PartitionAddressExists);
-        }
-        Ok((
-            Mutation::Create {
-                partition: value.partition,
-                state: CanonicalPartition {
-                    address,
-                    owner_epoch: value.owner_epoch,
-                    producers: HashMap::new(),
-                    next_offset: Offset::ZERO,
-                    retained_from: Offset::ZERO,
-                    policy_revision: 1,
-                    retention: value.retention,
-                },
-            },
-            Vec::new(),
-        ))
-    }
-
-    fn prepare_open(
-        &self,
-        value: OpenProducer,
-        op_number: u64,
-        identities: &impl IdentityIndex,
-    ) -> Result<(Mutation, Vec<IdentityClaim>), StateError> {
-        let partition = self.require_partition(value.partition)?;
-        require_id("producer", value.producer_id.as_bytes())?;
-        let producer = partition.producer(value.producer_id);
-        if producer.is_none() && self.producer_count >= self.limits.max_producers {
-            return Err(StateError::LimitExceeded("producers"));
-        }
-        let current_epoch = producer.map(|producer| producer.producer_epoch);
-        if value.expected_epoch != current_epoch {
-            return Err(StateError::ProducerEpochMismatch);
-        }
-        if value.new_epoch.get() == 0 || current_epoch.is_some_and(|epoch| value.new_epoch <= epoch)
-        {
-            return Err(StateError::ProducerEpochNotAdvanced);
-        }
-        let claims = operation_claim(value.operation_id, op_number, identities)?;
-        Ok((
-            Mutation::OpenProducer {
-                partition: value.partition,
-                producer: value.producer_id,
-                new_epoch: value.new_epoch,
-            },
-            claims,
-        ))
-    }
-
-    fn prepare_append(
-        &self,
-        value: &Append<'_>,
-    ) -> Result<(Mutation, Vec<IdentityClaim>), StateError> {
-        if value.batches.is_empty() {
-            return Err(StateError::MalformedBody(
-                "append must contain at least one batch",
-            ));
-        }
-        let mut cursors = SmallVec::with_capacity(value.batches.len());
-        let claims = Vec::new();
-        let mut partitions = HashSet::new();
-        for batch in &value.batches {
-            if batch.records.is_empty() {
-                return Err(StateError::MalformedBody(
-                    "append batch must contain at least one record",
-                ));
-            }
-            if !insert_append_partition(&cursors, &mut partitions, batch.partition) {
-                return Err(StateError::DuplicateAppendPartition);
-            }
-            let cursor = self.append_cursor(AppendBatchSummary {
-                partition: batch.partition,
-                owner_epoch: batch.owner_epoch,
-                producer_id: batch.producer_id,
-                producer_epoch: batch.producer_epoch,
-                first_sequence: batch.first_sequence,
-                first_offset: batch.first_offset,
-                record_count: batch.records.len(),
-                nonzero_message_ids: true,
-            })?;
-            for record in &batch.records {
-                require_id("message", record.message_id.as_bytes())?;
-                if record.parts.is_empty() {
-                    return Err(StateError::MalformedBody(
-                        "append record must contain at least one part",
-                    ));
-                }
-            }
-            cursors.push(cursor);
-        }
-        self.check_retry_span_budget(&cursors)?;
-        Ok((Mutation::Append(cursors), claims))
-    }
-
-    /// Validate schema-checked append metadata without materializing records.
-    /// Same epoch, ownership, position, ID, and duplicate-partition checks as
-    /// [`Self::prepare`]. The summary is constructed only by the body decoder.
-    pub fn prepare_append_summary(
-        &self,
-        op_number: u64,
-        summary: &AppendSummary,
-    ) -> Result<TransitionPlan, StateError> {
-        if self
-            .revision
-            .checked_add(1)
-            .ok_or(StateError::RevisionExhausted)?
-            != op_number
-        {
-            return Err(StateError::OperationNumberMismatch);
-        }
-        let mut cursors = SmallVec::with_capacity(summary.batches().len());
-        let mut partitions = HashSet::new();
-        for &batch in summary.batches() {
-            if !insert_append_partition(&cursors, &mut partitions, batch.partition) {
-                return Err(StateError::DuplicateAppendPartition);
-            }
-            cursors.push(self.append_cursor(batch)?);
-        }
-        self.check_retry_span_budget(&cursors)?;
-        Ok(TransitionPlan {
-            expected_revision: self.revision,
-            op_number,
-            mutation: Mutation::Append(cursors),
-            claims: Vec::new(),
-        })
-    }
-
-    fn append_cursor(&self, batch: AppendBatchSummary) -> Result<AppendCursor, StateError> {
-        let partition = self.require_partition(batch.partition)?;
-        if batch.owner_epoch != partition.owner_epoch {
-            return Err(StateError::OwnerEpochMismatch);
-        }
-        let producer = partition
-            .producer(batch.producer_id)
-            .ok_or(StateError::ProducerMismatch)?;
-        if batch.producer_epoch != producer.producer_epoch {
-            return Err(StateError::ProducerEpochMismatch);
-        }
-        if batch.first_sequence != producer.next_producer_sequence {
-            return Err(StateError::ProducerSequenceMismatch);
-        }
-        if batch.first_offset != partition.next_offset {
-            return Err(StateError::OffsetMismatch);
-        }
-        let count = u64::try_from(batch.record_count).map_err(|_| StateError::PositionExhausted)?;
-        let next_sequence = batch
-            .first_sequence
-            .get()
-            .checked_add(count)
-            .map(ProducerSequence::new)
-            .ok_or(StateError::PositionExhausted)?;
-        let next_offset = batch
-            .first_offset
-            .get()
-            .checked_add(count)
-            .map(Offset::new)
-            .ok_or(StateError::PositionExhausted)?;
-        if !batch.nonzero_message_ids {
-            return Err(StateError::ZeroValue("message"));
-        }
-        Ok(AppendCursor {
-            partition: batch.partition,
-            producer: batch.producer_id,
-            first_sequence: batch.first_sequence,
-            first_offset: batch.first_offset,
-            records: count,
-            new_span: producer.needs_result_span(batch.first_offset),
-            next_sequence,
-            next_offset,
-        })
-    }
-
-    fn check_retry_span_budget(&self, cursors: &[AppendCursor]) -> Result<(), StateError> {
-        let additional = cursors.iter().filter(|cursor| cursor.new_span).count();
-        if self
-            .retry_span_count
-            .checked_add(additional)
-            .is_none_or(|total| total > self.limits.max_retry_spans)
-        {
-            return Err(StateError::LimitExceeded("producer retry spans"));
-        }
-        Ok(())
-    }
-
-    fn prepare_progress(
-        &self,
-        value: Progress,
-        op_number: u64,
-        identities: &impl IdentityIndex,
-        committed: &Self,
-    ) -> Result<(Mutation, Vec<IdentityClaim>), StateError> {
-        self.require_partition(value.partition)?;
-        let key = progress_key(value.owner, value.partition);
-        require_progress_owner(value.owner)?;
-        match (value.owner, value.assignment_epoch) {
-            (ProgressOwner::Subscription(_), None) | (ProgressOwner::ConsumerGroup(_), Some(_)) => {
-            }
-            (ProgressOwner::Subscription(_), Some(_)) => {
-                return Err(StateError::MalformedBody(
-                    "subscription progress cannot carry an assignment epoch",
-                ));
-            }
-            (ProgressOwner::ConsumerGroup(_), None) => {
-                return Err(StateError::MalformedBody(
-                    "consumer-group progress requires an assignment epoch",
-                ));
-            }
-        }
-        let current = self.progress.get(&key).copied();
-        if current != value.expected_progress {
-            return Err(StateError::ProgressMismatch);
-        }
-        if current.is_some_and(|offset| value.new_progress <= offset) {
-            return Err(StateError::ProgressNotAdvanced);
-        }
-        let committed_partition = committed.require_partition(value.partition)?;
-        if value.new_progress >= committed_partition.next_offset {
-            return Err(StateError::ProgressBeyondCommit);
-        }
-        if let ProgressOwner::ConsumerGroup(group) = value.owner {
-            let assignment = self
-                .assignments
-                .get(&AssignmentKey(group, value.partition))
-                .ok_or(StateError::MissingAssignment)?;
-            if value.assignment_epoch != Some(assignment.epoch) {
-                return Err(StateError::AssignmentEpochMismatch);
-            }
-        }
-        if current.is_none() && self.progress.len() >= self.limits.max_progress {
-            return Err(StateError::LimitExceeded("progress owners"));
-        }
-        let claims = operation_claim(value.operation_id, op_number, identities)?;
-        Ok((
-            Mutation::Progress {
-                key,
-                value: value.new_progress,
-            },
-            claims,
-        ))
-    }
-
-    fn prepare_assign(
-        &self,
-        value: Assign,
-        op_number: u64,
-        identities: &impl IdentityIndex,
-    ) -> Result<(Mutation, Vec<IdentityClaim>), StateError> {
-        self.require_partition(value.partition)?;
-        require_id("consumer group", value.consumer_group_id.as_bytes())?;
-        if let Some(member) = value.new_member {
-            require_id("consumer member", member.as_bytes())?;
-        }
-        let key = AssignmentKey(value.consumer_group_id, value.partition);
-        let current = self
-            .assignments
-            .get(&key)
-            .copied()
-            .unwrap_or(AssignmentState {
-                epoch: 0,
-                member: None,
-            });
-        if value.expected_assignment_epoch != current.epoch {
-            return Err(StateError::AssignmentEpochMismatch);
-        }
-        if value.expected_assignment_epoch.checked_add(1) != Some(value.new_assignment_epoch) {
-            return Err(StateError::AssignmentEpochNotAdvanced);
-        }
-        if !self.assignments.contains_key(&key)
-            && self.assignments.len() >= self.limits.max_assignments
-        {
-            return Err(StateError::LimitExceeded("assignments"));
-        }
-        let claims = operation_claim(value.operation_id, op_number, identities)?;
-        Ok((
-            Mutation::Assign {
-                key,
-                value: AssignmentState {
-                    epoch: value.new_assignment_epoch,
-                    member: value.new_member,
-                },
-            },
-            claims,
-        ))
-    }
-
-    fn prepare_trim(
-        &self,
-        value: Trim,
-        op_number: u64,
-        identities: &impl IdentityIndex,
-    ) -> Result<(Mutation, Vec<IdentityClaim>), StateError> {
-        let partition = self.require_partition(value.partition)?;
-        if value.expected_floor != partition.retained_from {
-            return Err(StateError::TrimFloorMismatch);
-        }
-        if value.new_floor <= value.expected_floor || value.new_floor > partition.next_offset {
-            return Err(StateError::InvalidTrimFloor);
-        }
-        if partition
-            .producer_result_offset_floor()
-            .is_none_or(|retry_floor| value.new_floor > retry_floor)
-        {
-            return Err(StateError::TrimBeyondProducerResults);
-        }
-        let claims = operation_claim(value.operation_id, op_number, identities)?;
-        Ok((
-            Mutation::Trim {
-                partition: value.partition,
-                retained_from: value.new_floor,
-            },
-            claims,
-        ))
-    }
-
-    fn prepare_policy(
-        &self,
-        value: PartitionPolicy,
-        op_number: u64,
-        identities: &impl IdentityIndex,
-    ) -> Result<(Mutation, Vec<IdentityClaim>), StateError> {
-        let partition = self.require_partition(value.partition)?;
-        if value.expected_revision != partition.policy_revision {
-            return Err(StateError::PolicyRevisionMismatch);
-        }
-        if value.expected_revision.checked_add(1) != Some(value.new_revision) {
-            return Err(StateError::PolicyRevisionNotAdvanced);
-        }
-        let claims = operation_claim(value.operation_id, op_number, identities)?;
-        Ok((
-            Mutation::Policy {
-                partition: value.partition,
-                revision: value.new_revision,
-                retention: value.retention,
-            },
-            claims,
-        ))
-    }
-
-    fn prepare_producer_result_floor(
-        &self,
-        value: ProducerResultFloor,
-        op_number: u64,
-        identities: &impl IdentityIndex,
-    ) -> Result<(Mutation, Vec<IdentityClaim>), StateError> {
-        let partition = self.require_partition(value.partition)?;
-        let producer = partition
-            .producer(value.producer_id)
-            .ok_or(StateError::ProducerMismatch)?;
-        if value.producer_epoch != producer.producer_epoch {
-            return Err(StateError::ProducerEpochMismatch);
-        }
-        if value.expected_floor != producer.producer_result_floor {
-            return Err(StateError::ProducerResultFloorMismatch);
-        }
-        if value.new_floor <= value.expected_floor
-            || value.new_floor > producer.next_producer_sequence
-        {
-            return Err(StateError::InvalidProducerResultFloor);
-        }
-        let claims = operation_claim(value.operation_id, op_number, identities)?;
-        Ok((
-            Mutation::ProducerResultFloor {
-                partition: value.partition,
-                producer: value.producer_id,
-                floor: value.new_floor,
-            },
-            claims,
-        ))
-    }
-
-    fn prepare_barrier(
-        value: Barrier,
-        op_number: u64,
-        identities: &impl IdentityIndex,
-    ) -> Result<(Mutation, Vec<IdentityClaim>), StateError> {
-        Ok((
-            Mutation::Barrier,
-            operation_claim(value.operation_id, op_number, identities)?,
-        ))
-    }
-
-    fn require_partition(
-        &self,
-        partition: PartitionIncarnation,
-    ) -> Result<&CanonicalPartition, StateError> {
-        self.partitions
-            .get(&partition)
-            .ok_or(StateError::UnknownPartition)
-    }
-
-    fn apply_mutation(&mut self, mutation: Mutation) {
-        match mutation {
-            Mutation::Create { partition, state } => {
-                self.addresses.insert(state.address.clone(), partition);
-                self.partitions.insert(partition, state);
-            }
-            Mutation::OpenProducer {
-                partition,
-                producer,
-                new_epoch,
-            } => {
-                let state = self.partitions.get_mut(&partition).expect("validated plan");
-                if let Some(previous) = state
-                    .producers
-                    .insert(producer, CanonicalProducer::new(new_epoch))
-                {
-                    self.retry_span_count -= previous.result_spans().len();
-                } else {
-                    self.producer_count += 1;
-                }
-            }
-            Mutation::Append(cursors) => {
-                for cursor in cursors {
-                    let state = self
-                        .partitions
-                        .get_mut(&cursor.partition)
-                        .expect("validated plan");
-                    state
-                        .producers
-                        .get_mut(&cursor.producer)
-                        .expect("validated producer")
-                        .record_assignment(
-                            cursor.first_sequence,
-                            cursor.first_offset,
-                            cursor.records,
-                            self.limits.max_retry_spans,
-                        )
-                        .expect("validated assignment");
-                    self.retry_span_count += usize::from(cursor.new_span);
-                    state.next_offset = cursor.next_offset;
-                }
-            }
-            Mutation::Progress { key, value } => {
-                self.progress.insert(key, value);
-            }
-            Mutation::Assign { key, value } => {
-                self.assignments.insert(key, value);
-            }
-            Mutation::Trim {
-                partition,
-                retained_from,
-            } => {
-                self.partitions
-                    .get_mut(&partition)
-                    .expect("validated plan")
-                    .retained_from = retained_from;
-            }
-            Mutation::Policy {
-                partition,
-                revision,
-                retention,
-            } => {
-                let state = self.partitions.get_mut(&partition).expect("validated plan");
-                state.policy_revision = revision;
-                state.retention = retention;
-            }
-            Mutation::ProducerResultFloor {
-                partition,
-                producer,
-                floor,
-            } => {
-                let producer = self
-                    .partitions
-                    .get_mut(&partition)
-                    .expect("validated plan")
-                    .producers
-                    .get_mut(&producer)
-                    .expect("validated producer");
-                let previous = producer.result_spans().len();
-                producer.expire_results(floor);
-                self.retry_span_count -= previous - producer.result_spans().len();
-            }
-            Mutation::Barrier => {}
-        }
     }
 }
 
@@ -1022,82 +320,103 @@ fn require_id(kind: &'static str, bytes: &[u8; 16]) -> Result<(), StateError> {
     }
 }
 
-/// Atomic identity-overlay reservation failure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-pub enum IdentityIndexError {
-    #[error("identity already exists")]
-    Conflict,
-    #[error("identity overlay capacity exhausted")]
-    Capacity,
-    #[error("persistent identity lookup is unavailable")]
-    LookupUnavailable,
-}
-
 /// Deterministic canonical application-state validation failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum StateError {
     #[error(transparent)]
+    /// The exact identity index rejected lookup or reservation.
     IdentityIndex(#[from] IdentityIndexError),
     #[error("state transition plan is stale")]
+    /// The prepared transition belongs to an obsolete state revision.
     StalePlan,
     #[error("state revision exhausted")]
+    /// The state mutation revision cannot advance.
     RevisionExhausted,
     #[error("operation number is not the next state revision")]
+    /// Canonical operation numbers are not consecutive.
     OperationNumberMismatch,
     #[error("malformed canonical operation body: {0}")]
+    /// The decoded operation body violates its contract.
     MalformedBody(&'static str),
     #[error("{0} must be nonzero")]
+    /// A required nonzero field is zero.
     ZeroValue(&'static str),
     #[error("{0} limit exceeded")]
+    /// The operation or snapshot exceeds a configured resource bound.
     LimitExceeded(&'static str),
     #[error("partition incarnation already exists")]
+    /// The partition incarnation already exists.
     PartitionExists,
     #[error("partition logical address already exists")]
+    /// Another incarnation already owns this logical address.
     PartitionAddressExists,
     #[error("partition does not exist")]
+    /// The referenced partition incarnation does not exist.
     UnknownPartition,
     #[error("producer session is not open in this partition")]
+    /// The operation names a different producer session.
     ProducerMismatch,
     #[error("partition owner epoch does not match")]
+    /// The operation carries an obsolete or foreign owner fence.
     OwnerEpochMismatch,
     #[error("producer epoch does not match")]
+    /// The operation carries a different producer-session fence.
     ProducerEpochMismatch,
     #[error("producer epoch did not advance")]
+    /// A producer-session transition does not advance its fence.
     ProducerEpochNotAdvanced,
     #[error("producer sequence does not match")]
+    /// Producer sequences are not consecutive with session state.
     ProducerSequenceMismatch,
     #[error("partition offset does not match")]
+    /// Assigned offsets are not consecutive with partition state.
     OffsetMismatch,
     #[error("append contains more than one batch for a partition")]
+    /// An APPEND repeats the same partition incarnation.
     DuplicateAppendPartition,
     #[error("producer sequence or partition offset exhausted")]
+    /// A record offset or sequence cannot advance.
     PositionExhausted,
     #[error("message or operation identity already exists")]
+    /// Retry identity conflicts with a previously recorded result.
     IdentityConflict,
     #[error("consumer progress expectation does not match")]
+    /// The expected progress offset differs from current state.
     ProgressMismatch,
     #[error("consumer progress did not advance")]
+    /// The declared progress does not advance.
     ProgressNotAdvanced,
     #[error("consumer progress exceeds committed records")]
+    /// Consumer progress would pass confirmed application state.
     ProgressBeyondCommit,
     #[error("consumer-group assignment does not exist")]
+    /// The consumer group has no assignment for this partition.
     MissingAssignment,
     #[error("consumer-group assignment epoch does not match")]
+    /// The assignment fence differs from current state.
     AssignmentEpochMismatch,
     #[error("consumer-group assignment epoch did not advance by one")]
+    /// The assignment transition does not advance its fence.
     AssignmentEpochNotAdvanced,
     #[error("trim floor expectation does not match")]
+    /// The expected retention floor differs from current state.
     TrimFloorMismatch,
     #[error("trim floor did not advance within the partition range")]
+    /// The proposed retention floor is outside the valid record range.
     InvalidTrimFloor,
     #[error("trim floor exceeds expired producer retry results")]
+    /// Retention would remove still-required producer retry results.
     TrimBeyondProducerResults,
     #[error("partition policy revision does not match")]
+    /// The expected policy revision differs from current state.
     PolicyRevisionMismatch,
     #[error("partition policy revision did not advance by one")]
+    /// The policy transition does not advance its revision.
     PolicyRevisionNotAdvanced,
     #[error("producer retry-result floor expectation does not match")]
+    /// The expected producer retry floor differs from session state.
     ProducerResultFloorMismatch,
     #[error("producer retry-result floor did not advance within the current session")]
+    /// The proposed retry floor is outside the producer result range.
     InvalidProducerResultFloor,
 }

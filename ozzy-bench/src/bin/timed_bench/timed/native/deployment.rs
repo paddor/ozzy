@@ -70,7 +70,7 @@ impl Prepared {
             self.brokers
                 .iter()
                 .map(|broker| json!({"node": self.identity.brokers[&broker.name],
-                "endpoint": broker.endpoints.peer}))
+                "data_endpoint": broker.endpoints.data_peer, "endpoint": broker.endpoints.peer}))
                 .collect::<Vec<_>>()
         );
         Ok(json!({"command": "connect", "native": native}))
@@ -119,7 +119,7 @@ fn specifications(
             {
                 return Err(error("invalid prepared broker resources"));
             }
-            for endpoint in [&endpoints.peer, &endpoints.reader_pub]
+            for endpoint in [&endpoints.peer, &endpoints.data_peer, &endpoints.reader_pub]
                 .into_iter()
                 .chain(endpoints.follower_pub.iter())
             {

@@ -1,12 +1,9 @@
+#![cfg(target_os = "linux")]
+
 use super::*;
 
 #[tokio::test]
-#[cfg(target_os = "linux")]
-#[expect(
-    clippy::too_many_lines,
-    reason = "linear real-backend repair and restart fixture"
-)]
-async fn pool_and_aio_repair_are_readable_by_strict_legacy_recovery() {
+async fn pool_and_aio_repair_reopen_exact_history_and_preserve_original_files() {
     for aio in [false, true] {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("group");
@@ -16,18 +13,7 @@ async fn pool_and_aio_repair_are_readable_by_strict_legacy_recovery() {
             handles: 32,
             limits: io_limits(),
         };
-        let (pool, aio_backend, mut clients) = if aio {
-            let (backend, clients) = ozzy_io_aio::Aio::new(ozzy_io_aio::Config {
-                pool: config,
-                depth: 1,
-            })
-            .unwrap();
-            (None, Some(backend), clients)
-        } else {
-            let (backend, clients) = ozzy_io_pool::Pool::new(config).unwrap();
-            (Some(backend), None, clients)
-        };
-        let io = Local::new(clients.remove(0));
+        let (backend, io) = device(aio, config);
         let mut limits = limits();
         limits.io.direct = aio;
         let mut journal = Journal::format(
@@ -51,6 +37,9 @@ async fn pool_and_aio_repair_are_readable_by_strict_legacy_recovery() {
         journal.sync_through(position).await.unwrap();
         journal.publish_durable_progress().await.unwrap();
         let accepted = journal.accepted_position().unwrap();
+        let mut damaged = std::fs::read(root.join("segments/1.log")).unwrap();
+        damaged[0] = 99;
+        let healthy = std::fs::read(root.join("segments/2.log")).unwrap();
         let file = journal
             .access
             .open(
@@ -94,25 +83,54 @@ async fn pool_and_aio_repair_are_readable_by_strict_legacy_recovery() {
         assert_eq!(journal.accepted_position().unwrap(), accepted);
         assert_eq!(journal.manifest.segments[0].file_generation, 1);
         drop(journal);
-        if let Some(pool) = pool {
-            pool.shutdown().await;
-        }
-        if let Some(aio) = aio_backend {
-            aio.shutdown().await;
-        }
-        let directory = GroupDirectory::open_with_configuration(
+        backend.shutdown().await;
+        assert_eq!(std::fs::read(root.join("segments/1.log")).unwrap(), damaged);
+        assert_eq!(std::fs::read(root.join("segments/2.log")).unwrap(), healthy);
+        let (backend, io) = device(aio, config);
+        let journal = Journal::open(
             root,
+            io,
             identity(),
-            MetadataLimits::default(),
-            CONFIG,
+            Some(CONFIG),
+            JournalGeneration(10),
+            limits,
         )
+        .await
         .unwrap();
-        let journal = directory
-            .recover(JournalGeneration(10), limits.decode, limits.operations)
-            .unwrap();
         assert_eq!(journal.accepted_position().unwrap(), accepted);
         assert_eq!(journal.committed_position().unwrap(), LogPosition::GENESIS);
-        assert_eq!(journal.directory().manifest().last_normal_view, 0);
-        assert_eq!(journal.directory().manifest().promised_view, 7);
+        assert_eq!(journal.manifest.last_normal_view, 0);
+        assert_eq!(journal.manifest.promised_view, 7);
+        journal.close().await.unwrap();
+        backend.shutdown().await;
+    }
+}
+
+#[derive(Debug)]
+enum Device {
+    Pool(ozzy_io_pool::Pool),
+    Aio(ozzy_io_aio::Aio),
+}
+
+fn device(aio: bool, config: ozzy_io_pool::Config) -> (Device, Local) {
+    if aio {
+        let (backend, mut clients) = ozzy_io_aio::Aio::new(ozzy_io_aio::Config {
+            pool: config,
+            depth: 1,
+        })
+        .unwrap();
+        (Device::Aio(backend), Local::new(clients.remove(0)))
+    } else {
+        let (backend, mut clients) = ozzy_io_pool::Pool::new(config).unwrap();
+        (Device::Pool(backend), Local::new(clients.remove(0)))
+    }
+}
+
+impl Device {
+    async fn shutdown(self) {
+        match self {
+            Self::Pool(pool) => pool.shutdown().await,
+            Self::Aio(aio) => aio.shutdown().await,
+        }
     }
 }

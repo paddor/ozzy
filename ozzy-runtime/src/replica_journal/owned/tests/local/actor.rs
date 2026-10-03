@@ -318,3 +318,80 @@ fn local_actor_shutdown_drains_after_io_failure_and_closes_callers() {
     };
     assert!(result.is_err());
 }
+
+#[test]
+fn local_actor_waits_for_retained_backing_before_installing_the_next_append() {
+    let (mut controller, io) = setup();
+    let memory = payload_owner(32768);
+    let mut actor = actor_with_partition_memory(
+        &mut controller,
+        io,
+        1,
+        &[12],
+        partition(),
+        PartitionId::ZERO,
+        Some(&memory),
+    );
+    memory.trim_cache();
+    let cached = [
+        memory.try_lease(8192).unwrap(),
+        memory.try_lease(8192).unwrap(),
+    ];
+    drop(cached);
+    let mut first = actor.lease_proposal_buffer().unwrap();
+    first.prepare_append(request(12, 0, 1)).unwrap();
+    let mut second = actor.lease_proposal_buffer().unwrap();
+    second.prepare_append(request(12, 1, 1)).unwrap();
+    let mut lane = actor.take_submitter().unwrap();
+    let mut first = Box::pin(lane.try_submit(first).unwrap());
+    let mut held = Vec::new();
+    for _ in 0..10000 {
+        pump(&mut actor);
+        for (id, _) in controller.jobs() {
+            if matches!(controller.operation(id).unwrap().unprotected(), Operation::Write { offset, .. } if *offset >= 4096)
+            {
+                held.push(id);
+            } else {
+                controller.execute(id, Effect::Normal).unwrap();
+                controller.deliver(id).unwrap();
+            }
+        }
+        if !held.is_empty() {
+            break;
+        }
+    }
+    assert!(!held.is_empty());
+    let mut second = Box::pin(lane.try_submit(second).unwrap());
+    for _ in 0..32 {
+        pump(&mut actor);
+    }
+    assert!(poll(first.as_mut()).is_pending());
+    assert!(poll(second.as_mut()).is_pending());
+    assert!(held.iter().all(|id| controller.operation(*id).is_some()));
+    let mut done = [false; 2];
+    for _ in 0..10000 {
+        pump(&mut actor);
+        for (id, _) in controller.jobs() {
+            controller.execute(id, Effect::Normal).unwrap();
+            controller.deliver(id).unwrap();
+        }
+        for (index, pending) in [&mut first, &mut second].into_iter().enumerate() {
+            if !done[index]
+                && let Poll::Ready(reply) = poll(pending.as_mut())
+            {
+                let reply = reply.unwrap();
+                assert!(matches!(reply.outcome, ProposalOutcome::Committed { .. }));
+                assert_eq!(
+                    coordinates(&reply.buffer.0),
+                    [(index as u64, index as u64, 777, 1)]
+                );
+                done[index] = true;
+            }
+        }
+        if done == [true; 2] {
+            break;
+        }
+    }
+    assert_eq!(done, [true; 2]);
+    close(&mut controller, actor);
+}

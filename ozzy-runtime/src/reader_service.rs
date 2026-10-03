@@ -1,4 +1,4 @@
-//! Shared reader cursor outcomes, bounded delivery credit, and response payloads.
+//! Shared reader cursor outcomes, bounded delivery storage, and response payloads.
 
 use bytes::Bytes;
 pub(crate) use ozzy_core::reader::ReadOutcome as ReadState;
@@ -24,6 +24,19 @@ pub(crate) fn reader_frame(
     }
 }
 
+/// Use the single PUB output lease so slow inproc subscribers cannot retain
+/// writer allocations. Packed payload bytes remain unchanged without decoding.
+pub(crate) fn publication_frame(
+    mut payload: crate::replicated::payload::Lease,
+    shared: Option<Bytes>,
+) -> Bytes {
+    if let Some(bytes) = shared {
+        assert!(bytes.len() <= payload.body.capacity());
+        payload.body.extend_from_slice(&bytes);
+    }
+    reader_frame(payload, None)
+}
+
 mod delivery;
 pub(crate) use delivery::Delivery;
 
@@ -45,7 +58,7 @@ impl Failure {
             code,
             retry: match code {
                 5 | 12 => RetryClass::AfterAuthorityRefresh,
-                10 => RetryClass::AfterCredit,
+                10 => RetryClass::AfterBackoff,
                 11 => RetryClass::UnknownOutcome,
                 _ => RetryClass::Permanent,
             },
@@ -66,5 +79,40 @@ impl Failure {
         failure.detail[8..].copy_from_slice(&(parts as u64).to_be_bytes());
         failure.size = 16;
         failure
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{memory, replicated::payload::Payload, signal::DataSignal};
+    use std::sync::Arc;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn publication_releases_writer_backing_before_a_slow_subscriber_drops_it() {
+        let owner = memory::Domain::new(None, 4096)
+            .unwrap()
+            .owner(memory::Limits {
+                bytes: 4096,
+                buffers: 1,
+                cache_bytes: 0,
+            })
+            .unwrap();
+        let mut source = owner.try_lease(4096).unwrap();
+        source.as_mut().fill(7);
+        let payload = Payload::notifying(4096, Arc::new(DataSignal::default()));
+        let frame = publication_frame(payload.try_take().unwrap(), Some(source.freeze()));
+        assert_eq!(frame.as_ref(), &[7; 4096]);
+        assert!(payload.try_take().is_none(), "one outstanding PUB payload");
+        owner.trim_cache();
+        assert!(
+            owner.try_lease(4096).is_ok(),
+            "a retained PUB frame cannot consume writer admission"
+        );
+        drop(frame);
+        assert!(
+            payload.try_take().is_some(),
+            "last drop returns the PUB buffer"
+        );
     }
 }

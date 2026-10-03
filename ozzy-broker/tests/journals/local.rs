@@ -55,15 +55,12 @@ async fn configured_actor(backend: IoBackend) {
     let (devices, mut lanes) = DevicePools::start(&checked.plan).unwrap();
     let io = ozzy_io::Local::new(lanes.remove(0).client);
     assert!(
-        plan.clone()
-            .open(io.clone(), JournalGeneration(1))
+        Box::pin(plan.clone().open(io.clone(), JournalGeneration(1)))
             .await
             .is_err()
     );
     assert!(!plan.placement.directory.exists());
-    let mut opened = plan
-        .clone()
-        .format(io.clone(), JournalGeneration(2))
+    let mut opened = Box::pin(plan.clone().format(io.clone(), JournalGeneration(2)))
         .await
         .unwrap();
     let budget = &checked.plan.shards[0].budget;
@@ -97,8 +94,7 @@ async fn configured_actor(backend: IoBackend) {
     memory.trim_cache();
     assert_eq!(memory.allocated_bytes(), 0);
     assert!(
-        plan.clone()
-            .format(io.clone(), JournalGeneration(3))
+        Box::pin(plan.clone().format(io.clone(), JournalGeneration(3)))
             .await
             .is_err()
     );
@@ -109,8 +105,7 @@ async fn configured_actor(backend: IoBackend) {
         .partitions
         .remove(0);
     assert!(
-        altered
-            .open(io.clone(), JournalGeneration(4))
+        Box::pin(altered.open(io.clone(), JournalGeneration(4)))
             .await
             .is_err()
     );
@@ -121,12 +116,11 @@ async fn configured_actor(backend: IoBackend) {
         .partitions
         .remove(0);
     assert!(
-        altered
-            .open(io.clone(), JournalGeneration(4))
+        Box::pin(altered.open(io.clone(), JournalGeneration(4)))
             .await
             .is_err()
     );
-    let opened = plan.open(io, JournalGeneration(4)).await.unwrap();
+    let opened = Box::pin(plan.open(io, JournalGeneration(4))).await.unwrap();
     let PartitionAuthority::Local(driver) = opened.authority else {
         panic!("wrong local mode")
     };

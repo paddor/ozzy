@@ -10,6 +10,7 @@ use std::{
     path::Path,
 };
 
+/// Append a result row to the implementation ledger and this run directory.
 pub fn append(directory: &Path, implementation: &str, row: &Value) -> Result<()> {
     if !matches!(implementation, "ozzy" | "iggy" | "kafka" | "redpanda") {
         return Err("unknown result implementation".into());
@@ -26,6 +27,7 @@ pub fn append(directory: &Path, implementation: &str, row: &Value) -> Result<()>
     Ok(())
 }
 
+/// Read only successful completed measurements from a result ledger.
 pub fn completed(path: &Path) -> Result<Vec<Value>> {
     let rows = match fs::File::open(path) {
         Ok(file) => BufReader::new(file)
@@ -53,6 +55,7 @@ pub fn completed(path: &Path) -> Result<Vec<Value>> {
         .collect())
 }
 
+/// Aggregate repeated measurements while retaining their provenance.
 pub fn summarize(rows: &[Value]) -> Result<Value> {
     let mut groups = BTreeMap::<String, Vec<&Value>>::new();
     for row in rows {
@@ -173,12 +176,14 @@ fn controls(row: &Value) -> Result<Value> {
     )
 }
 
+/// Select comparison runs and optional baseline rows for chart generation.
 pub fn select(directory: &Path, ids: &[String], baseline: Option<&str>) -> Result<Value> {
-    select_inner(directory, ids, baseline, false)
+    select_inner(directory, ids, baseline, false, None)
 }
 
+/// Select offered-load results, retaining every requested run identifier.
 pub fn select_fixed_load(directory: &Path, ids: &[String]) -> Result<Value> {
-    select_inner(directory, ids, None, true)
+    select_inner(directory, ids, None, true, None)
 }
 
 /// Independently validated historical reference, not an identical-workload baseline.
@@ -198,6 +203,7 @@ pub fn select_with_external_reference(directory: &Path, ids: &[String], id: &str
     )
 }
 
+/// Join selected load runs with compatible external reference rows.
 pub fn select_fixed_load_with_external_reference(
     directory: &Path,
     ids: &[String],
@@ -206,6 +212,7 @@ pub fn select_fixed_load_with_external_reference(
     select_with_references(directory, ids, reference_ids, &["iggy", "redpanda"], true)
 }
 
+/// Join selected load runs with the compatible Iggy reference ledger.
 pub fn select_fixed_load_with_iggy_reference(
     directory: &Path,
     ids: &[String],
@@ -227,6 +234,7 @@ fn comparable_reference(value: &Value) -> Value {
     // External adapters do not use native APPEND, disk, or reader controls.
     // These settings stay in each selection's recorded controls and captions.
     config.remove("writer_inflight_appends");
+    config.remove("native_batch_target_bytes");
     config.remove("disk_aio_depth");
     config.remove("disk_io_backend");
     config.remove("disk_direct_io");
@@ -307,6 +315,29 @@ pub fn include_references(
     implementations: &[&str],
     fixed_load: bool,
 ) -> Result<()> {
+    include_references_with_ozzy_only_rates(
+        directory,
+        data,
+        reference_ids,
+        implementations,
+        fixed_load,
+        &[],
+    )
+}
+
+/// Keep explicitly measured Ozzy-only loads while attaching external series
+/// at every other selected load. Older comparison runs have no 1M/s sample.
+pub fn include_references_with_ozzy_only_rates(
+    directory: &Path,
+    data: &mut Value,
+    reference_ids: &[String],
+    implementations: &[&str],
+    fixed_load: bool,
+    ozzy_only_rates: &[u64],
+) -> Result<()> {
+    if !fixed_load && !ozzy_only_rates.is_empty() {
+        return Err("Ozzy-only rates require a fixed-load chart".into());
+    }
     if implementations.is_empty()
         || implementations
             .iter()
@@ -314,11 +345,13 @@ pub fn include_references(
     {
         return Err("select at least one supported external reference implementation".into());
     }
-    let reference = if fixed_load {
-        select_fixed_load(directory, reference_ids)?
-    } else {
-        select(directory, reference_ids, None)?
-    };
+    let reference = select_inner(
+        directory,
+        reference_ids,
+        None,
+        fixed_load,
+        Some(implementations),
+    )?;
     if comparable_reference(data) != comparable_reference(&reference) {
         return Err("incompatible reference host, compiler, or measurement settings".into());
     }
@@ -327,6 +360,7 @@ pub fn include_references(
     let existing = rows
         .iter()
         .chain(data["incomplete"].as_array().into_iter().flatten());
+    validate_ozzy_only_rates(data, &reference, implementations, ozzy_only_rates)?;
     if !existing.clone().any(|r| r["case"]["impl"] == "ozzy")
         || existing
             .clone()
@@ -334,24 +368,7 @@ pub fn include_references(
     {
         return Err("reference selection requires Ozzy and a new external series".into());
     }
-    let wanted: BTreeSet<_> = existing
-        .clone()
-        .filter(|row| row["case"]["impl"] == "ozzy")
-        .map(reference_case_key)
-        .collect();
-    if fixed_load {
-        for rate in existing
-            .filter(|row| row["case"]["impl"] == "ozzy")
-            .map(|row| row["case"]["rate"].to_string())
-        {
-            if !same_fixed_load_timing(
-                &data["fixed_load_windows"][&rate],
-                &reference["fixed_load_windows"][&rate],
-            ) {
-                return Err("reference fixed-load timing differs".into());
-            }
-        }
-    }
+    let wanted = referenced_ozzy_cases(data, &reference, fixed_load, ozzy_only_rates)?;
     let selected: Vec<_> = references
         .iter()
         .filter(|r| {
@@ -396,9 +413,75 @@ pub fn include_references(
         data["references"][*implementation] = json!({
             "run_id":reference_ids[0],"run_ids":reference_ids,
             "compatibility":reference["compatibility"],
+            "compatibility_by_run":reference["compatibility_by_run"],
             "sources":reference["sources"],"executables":reference["executables"],
             "identical_workload":false
         });
+    }
+    Ok(())
+}
+
+fn referenced_ozzy_cases(
+    data: &Value,
+    reference: &Value,
+    fixed_load: bool,
+    ozzy_only_rates: &[u64],
+) -> Result<BTreeSet<String>> {
+    let selected: Vec<_> = data["summary"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(data["incomplete"].as_array().into_iter().flatten())
+        .filter(|row| {
+            row["case"]["impl"] == "ozzy"
+                && !row["case"]["rate"]
+                    .as_u64()
+                    .is_some_and(|rate| ozzy_only_rates.contains(&rate))
+        })
+        .collect();
+    if fixed_load {
+        for row in &selected {
+            let rate = row["case"]["rate"].to_string();
+            if !same_fixed_load_timing(
+                &data["fixed_load_windows"][&rate],
+                &reference["fixed_load_windows"][&rate],
+            ) {
+                return Err("reference fixed-load timing differs".into());
+            }
+        }
+    }
+    Ok(selected.into_iter().map(reference_case_key).collect())
+}
+
+fn validate_ozzy_only_rates(
+    data: &Value,
+    reference: &Value,
+    implementations: &[&str],
+    rates: &[u64],
+) -> Result<()> {
+    let measured = data["summary"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(data["incomplete"].as_array().into_iter().flatten());
+    let external = reference["summary"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(reference["incomplete"].as_array().into_iter().flatten());
+    for rate in rates {
+        if !measured
+            .clone()
+            .any(|row| row["case"]["impl"] == "ozzy" && row["case"]["rate"] == *rate)
+        {
+            return Err(format!("no selected Ozzy measurement at {rate}/s").into());
+        }
+        if external.clone().any(|row| {
+            implementations.contains(&row["case"]["impl"].as_str().unwrap_or(""))
+                && row["case"]["rate"] == *rate
+        }) {
+            return Err(format!("external reference already measures {rate}/s").into());
+        }
     }
     Ok(())
 }
@@ -466,6 +549,7 @@ fn select_inner(
     ids: &[String],
     baseline: Option<&str>,
     fixed_load: bool,
+    reference_implementations: Option<&[&str]>,
 ) -> Result<Value> {
     if ids.is_empty() {
         return Err("select at least one completed run".into());
@@ -473,6 +557,9 @@ fn select_inner(
     let mut rows = load_rows(directory)?;
     // Historical ledgers stay append-only. Charts show supported storage codecs.
     rows.retain(|row| matches!(row["case"]["codec"].as_str(), Some("raw" | "lz4")));
+    if let Some(implementations) = reference_implementations {
+        rows.retain(|row| implementations.contains(&row["case"]["impl"].as_str().unwrap_or("")));
+    }
     let mut selected = vec![];
     for id in ids {
         let found: Vec<_> = rows
@@ -511,31 +598,12 @@ fn select_inner(
         }
         selected.extend(found);
     }
-    let compare = |row: &Value| -> Result<Value> {
-        let mut value = compatibility(row)?;
-        if fixed_load {
-            let config = value["configuration"].as_object_mut().unwrap();
-            config.remove("records_per_second");
-            config.remove("duration");
-            // Stage windows are checked per rate; ramps may end at different rates.
-            config.remove("ramp");
-        }
-        Ok(value)
-    };
     let (failed, measured) = split_failures(&selected, fixed_load)?;
     let windows = fixed_load
         .then(|| fixed_load_windows(&selected))
         .transpose()?;
-    let expected = compare(&selected[0])?;
-    if selected
-        .iter()
-        .map(compare)
-        .collect::<Result<Vec<_>>>()?
-        .iter()
-        .any(|c| *c != expected)
-    {
-        return Err("incompatible workload, host, compiler, or measurement configuration".into());
-    }
+    let (expected, compatibility_by_run) =
+        validated_controls(&selected, fixed_load, reference_implementations.is_some())?;
     if selected
         .iter()
         .map(|r| {
@@ -557,6 +625,9 @@ fn select_inner(
     }
     same_ozzy_source(&selected)?;
     let mut data = finish_selection(ids, baseline, &selected, &measured, &expected)?;
+    if reference_implementations.is_some() {
+        data["compatibility_by_run"] = compatibility_by_run;
+    }
     if let Some(windows) = windows {
         data["fixed_load_windows"] = windows;
     }
@@ -564,6 +635,49 @@ fn select_inner(
         data["incomplete"] = json!(failed);
     }
     Ok(data)
+}
+
+fn validated_controls(
+    selected: &[Value],
+    fixed_load: bool,
+    external_reference: bool,
+) -> Result<(Value, Value)> {
+    let compare = |row: &Value| -> Result<Value> {
+        let mut value = compatibility(row)?;
+        if fixed_load {
+            let config = value["configuration"].as_object_mut().unwrap();
+            config.remove("records_per_second");
+            config.remove("duration");
+            // Stage windows are checked per rate; ramps may end at different rates.
+            config.remove("ramp");
+        }
+        Ok(value)
+    };
+    let controls = selected.iter().map(compare).collect::<Result<Vec<_>>>()?;
+    let expected = &controls[0];
+    // External references may span workload/dependency revisions. Each run
+    // must still be internally uniform and retain its original controls.
+    let mut compatibility_by_run = serde_json::Map::new();
+    for (row, controls) in selected.iter().zip(&controls) {
+        let id = row["run_id"].as_str().ok_or("missing run ID")?;
+        if let Some(prior) = compatibility_by_run.insert(id.into(), controls.clone())
+            && prior != *controls
+        {
+            return Err("incompatible measurement settings within one run".into());
+        }
+    }
+    let matches = |controls: &Value| {
+        if external_reference {
+            comparable_reference(&json!({"compatibility":controls}))
+                == comparable_reference(&json!({"compatibility":expected}))
+        } else {
+            controls == expected
+        }
+    };
+    if !controls.iter().all(matches) {
+        return Err("incompatible workload, host, compiler, or measurement configuration".into());
+    }
+    Ok((expected.clone(), json!(compatibility_by_run)))
 }
 
 fn same_ozzy_source(rows: &[Value]) -> Result<()> {
@@ -734,7 +848,7 @@ fn finish_selection(
             row["configuration"]["payload_compression"].clone()
         });
     Ok(
-        json!({"run_ids":ids,"baseline_run_id":baseline,"compatibility":expected,"sources":sources,"executables":executables,"versions":versions,"batch_records":batch_records(selected)?,"writer_protocols":writer_protocols(selected)?,"payload_compression":payload_compression,"summary":summarize(measured)?}),
+        json!({"run_ids":ids,"baseline_run_id":baseline,"compatibility":expected,"sources":sources,"executables":executables,"versions":versions,"batch_records":batch_records(selected)?,"writer_protocols":writer_protocols(selected)?,"writer_payload_caps":writer_payload_caps(selected)?,"payload_compression":payload_compression,"summary":summarize(measured)?}),
     )
 }
 
@@ -754,6 +868,21 @@ fn batch_records(rows: &[Value]) -> Result<Value> {
         }
     }
     Ok(Value::Object(limits))
+}
+
+// The worker's effective payload bound can be smaller than its requested target.
+// Preserve the largest observed bound per mode for captions across record sizes.
+fn writer_payload_caps(rows: &[Value]) -> Result<Value> {
+    let mut caps = BTreeMap::<&str, u64>::new();
+    for row in rows.iter().filter(|row| row["case"]["impl"] == "ozzy") {
+        let mode = row["case"]["mode"].as_str().ok_or("missing mode")?;
+        if let Some(bytes) = row["raw"]["writer_batch_payload_bytes_max"].as_u64() {
+            caps.entry(mode)
+                .and_modify(|cap| *cap = (*cap).max(bytes))
+                .or_insert(bytes);
+        }
+    }
+    Ok(json!(caps))
 }
 
 fn writer_protocols(rows: &[Value]) -> Result<Value> {

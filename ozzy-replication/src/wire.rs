@@ -73,7 +73,7 @@ impl PeerBinding {
         })
     }
 
-    /// Require credited normal payloads bound to this locally issued receive epoch.
+    /// Require epoch-bound normal payloads bound to this locally issued receive epoch.
     ///
     /// Set only from the receiver's own current flow state, never incoming fields.
     /// Rejects legacy PREPARE and stale `PREPARE_FLOW` before decoding/hashing bodies.
@@ -94,6 +94,34 @@ pub struct WireLimits {
     pub max_operations: usize,
 }
 
+impl WireLimits {
+    /// Conservative shared prepare/history profile. Round the largest fixed
+    /// metadata span up to 16 bytes, preserving room for control exchanges.
+    pub fn for_transfer(max_operations: usize, max_body_bytes: usize) -> Option<Self> {
+        let fixed = transfer::FETCH_BYTES
+            .max(transfer::OPS_FIXED_BYTES)
+            .max(prepare::BATCH_BYTES + 16)
+            .next_multiple_of(16);
+        Some(Self {
+            envelope: EnvelopeLimits {
+                max_metadata_bytes: max_operations
+                    .checked_mul(prepare::DESCRIPTOR_BYTES)?
+                    .checked_add(fixed)?,
+                max_payload_bytes: max_body_bytes,
+            },
+            max_operations,
+        })
+    }
+
+    /// Bound a routed native message, including its 16-byte destination identity.
+    pub fn message_bytes(self) -> Option<usize> {
+        self.envelope
+            .max_metadata_bytes
+            .checked_add(self.envelope.max_payload_bytes)?
+            .checked_add(ozzy_proto::ENVELOPE_BYTES + 16)
+    }
+}
+
 impl Default for WireLimits {
     fn default() -> Self {
         Self {
@@ -103,33 +131,18 @@ impl Default for WireLimits {
     }
 }
 
-/// Session-scoped cumulative absolute grant, not a per-message increment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Grant {
-    /// Monotonic credit revision, interpreted by the session owner.
-    pub revision: u64,
-    /// Maximum cumulative records allowed in the current session.
-    pub record_limit: u64,
-    /// Maximum cumulative canonical body bytes allowed in the current session.
-    pub byte_limit: u64,
-}
-
 /// Fixed-size replica control metadata. Receipt alone has no authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Control {
-    /// Cumulative durable backup evidence plus its current session grant.
+    /// Cumulative durable backup evidence plus its current session fence.
     PrepareOk {
         /// Matching contiguous prefix after successful disk synchronization.
         ack: PrepareOk,
-        /// Independent flow-control evidence; never counts as a quorum vote.
-        grant: Grant,
     },
     /// Cumulative retained-memory evidence with independent background persistence.
     PrepareRetained {
         /// Validated bytes retained until application and persistence complete.
         ack: RetainedPrepareOk,
-        /// Independent flow-control evidence; never counts as a quorum vote.
-        grant: Grant,
     },
     /// Primary's cumulative commit announcement or idle heartbeat.
     Commit(Commit),
@@ -219,11 +232,11 @@ pub fn encode_control(
     let metadata_bytes = match message {
         Control::PrepareOk { ack, .. } => {
             validate_prefix(ack.durable)?;
-            COMMON_BYTES + 40 + 1 + 24
+            COMMON_BYTES + 40 + 1
         }
         Control::PrepareRetained { ack, .. } => {
             validate_prefix(ack.retained)?;
-            COMMON_BYTES + 40 + 1 + 24
+            COMMON_BYTES + 40 + 1
         }
         Control::Commit(message) => {
             validate_prefix(message.committed)?;
@@ -257,19 +270,13 @@ pub fn encode_control(
     let mut writer = Writer::new(&mut output[..metadata_bytes]);
     writer.scope(scope, sender);
     match message {
-        Control::PrepareOk { ack, grant } => {
+        Control::PrepareOk { ack } => {
             writer.prefix(ack.durable);
             writer.bytes(&[2]);
-            writer.u64(grant.revision);
-            writer.u64(grant.record_limit);
-            writer.u64(grant.byte_limit);
         }
-        Control::PrepareRetained { ack, grant } => {
+        Control::PrepareRetained { ack } => {
             writer.prefix(ack.retained);
             writer.bytes(&[3]);
-            writer.u64(grant.revision);
-            writer.u64(grant.record_limit);
-            writer.u64(grant.byte_limit);
         }
         Control::Commit(message) => writer.prefix(message.committed),
         Control::StartViewChange(_) | Control::ExitView(_) => {}
@@ -296,6 +303,7 @@ pub fn route(packet: ozzy_proto::Packet<'_>, limits: EnvelopeLimits) -> Result<S
             | Opcode::ReplicaState
             | Opcode::Prepare
             | Opcode::PrepareFlow
+            | Opcode::PreparePub
             | Opcode::PrepareOk
             | Opcode::Commit
             | Opcode::ExitView
@@ -311,7 +319,7 @@ pub fn route(packet: ozzy_proto::Packet<'_>, limits: EnvelopeLimits) -> Result<S
     }
     if !matches!(
         packet.envelope.opcode,
-        Opcode::Prepare | Opcode::PrepareFlow | Opcode::Ops
+        Opcode::Prepare | Opcode::PrepareFlow | Opcode::PreparePub | Opcode::Ops
     ) && !packet.payload.is_empty()
     {
         return Err(WireError::Payload);
@@ -386,25 +394,18 @@ pub fn decode<'a>(
         Opcode::PrepareOk => {
             let prefix = reader.prefix()?;
             let evidence = reader.bytes::<1>()?[0];
-            let grant = Grant {
-                revision: reader.u64()?,
-                record_limit: reader.u64()?,
-                byte_limit: reader.u64()?,
-            };
             match (binding.configuration.policy(), evidence) {
                 (QuorumPolicy::Durable, 2) => Control::PrepareOk {
                     ack: PrepareOk {
                         scope,
                         durable: prefix,
                     },
-                    grant,
                 },
                 (QuorumPolicy::Replicated, 3) => Control::PrepareRetained {
                     ack: RetainedPrepareOk {
                         scope,
                         retained: prefix,
                     },
-                    grant,
                 },
                 _ => return Err(WireError::Evidence),
             }
@@ -558,7 +559,7 @@ impl<'a> Writer<'a> {
 /// Structural wire failure. No rejection changes replica or journal state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
-    /// Invalid receipt/credit metadata or mismatched local receive incarnation.
+    /// Invalid receipt metadata or mismatched local receive incarnation.
     #[error(transparent)]
     Flow(#[from] FlowError),
     /// Response does not match the live source, request, range, or response bound.

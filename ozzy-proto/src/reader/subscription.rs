@@ -97,58 +97,6 @@ impl Target {
     }
 }
 
-/// Cumulative grants since this subscription generation began. Duplicate grants
-/// do not add capacity. A correlated reply echoes accepted capacity, never
-/// record persistence or application processing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Credit {
-    /// Session-scoped subscription generation.
-    pub subscription: Subscription,
-    /// Exact subscribed source.
-    pub source: Source,
-    /// Total records this generation may send, including already sent records.
-    pub records: u64,
-    /// Total payload bytes this generation may send, including already sent bytes.
-    pub bytes: u64,
-}
-
-/// Encode cumulative credit. Receivers validate it against their live window.
-pub fn encode_credit(
-    envelope: Envelope,
-    credit: Credit,
-    output: &mut Vec<u8>,
-    limits: EnvelopeLimits,
-) -> Result<[u8; ENVELOPE_BYTES], CodecError> {
-    credit.subscription.validate()?;
-    credit.source.validate()?;
-    let header = prepare(
-        envelope,
-        Opcode::Credit,
-        envelope.response,
-        48 + credit.source.size(),
-        output,
-        limits,
-    )?;
-    credit.subscription.encode(output);
-    credit.source.encode(output);
-    output.extend_from_slice(&credit.records.to_be_bytes());
-    output.extend_from_slice(&credit.bytes.to_be_bytes());
-    Ok(header)
-}
-
-/// Decode one complete cumulative grant without allocations.
-pub fn decode_credit(packet: Packet<'_>, limits: EnvelopeLimits) -> Result<Credit, CodecError> {
-    let mut cursor = control(packet, Opcode::Credit, packet.envelope.response, limits)?;
-    let credit = Credit {
-        subscription: Subscription::decode(&mut cursor)?,
-        source: Source::decode(&mut cursor)?,
-        records: cursor.u64()?,
-        bytes: cursor.u64()?,
-    };
-    end(cursor)?;
-    Ok(credit)
-}
-
 fn encode_close(
     envelope: Envelope,
     subscription: Subscribed,

@@ -32,6 +32,7 @@ pub struct CompletedSync {
 }
 
 impl PreparedSync {
+    /// Execute the prepared metadata publication and return its fenced completion.
     pub async fn publish(mut self) -> CompletedSync {
         let result = async {
             if let Some(barrier) = self.barrier.take() {

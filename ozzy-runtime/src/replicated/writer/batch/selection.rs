@@ -12,13 +12,12 @@ pub(super) struct Selection {
 
 impl Selection {
     /// Shapes are (wire bytes, part count, encoding). A soft target never splits a
-    /// record; hard limits and peer credit always apply, including to singletons.
+    /// record; hard packet limits also apply to singletons.
     pub(super) fn collect(
         shapes: impl Iterator<Item = (usize, usize, Encoding)>,
         limits: DataLimits,
         target_bytes: usize,
         cap: usize,
-        byte_credit: usize,
         fixed: usize,
     ) -> Result<Self, Error> {
         let mut selected = Self {
@@ -29,7 +28,7 @@ impl Selection {
         let mut metadata = fixed;
         let mut parts = 0;
         let mut logical = 0;
-        let payload_limit = limits.envelope.max_payload_bytes.min(byte_credit);
+        let payload_limit = limits.envelope.max_payload_bytes;
         for (bytes, record_parts, encoding) in shapes {
             let original = match encoding {
                 Encoding::Raw => bytes,
@@ -96,9 +95,9 @@ mod tests {
     }
 
     #[test]
-    fn target_preserves_large_singleton_but_credit_still_bounds_it() {
+    fn target_preserves_large_singleton_but_hard_limits_still_bound_it() {
         let shapes = [(512, 1, Encoding::Raw), (16, 1, Encoding::Raw)];
-        let selected = Selection::collect(shapes.into_iter(), limits(), 128, 8, 4096, 100).unwrap();
+        let selected = Selection::collect(shapes.into_iter(), limits(), 128, 8, 100).unwrap();
         assert_eq!(
             selected,
             Selection {
@@ -107,18 +106,18 @@ mod tests {
                 full: true
             }
         );
-        let selected = Selection::collect(shapes.into_iter(), limits(), 128, 8, 511, 100).unwrap();
-        assert_eq!(selected.records, 0);
+        let mut hard = limits();
+        hard.max_record_bytes = 511;
+        assert!(Selection::collect(shapes.into_iter(), hard, 128, 8, 100).is_err());
     }
 
     #[test]
-    fn empty_parts_charge_descriptors_and_part_credit() {
+    fn empty_parts_charge_descriptors_and_part_limits() {
         let selected = Selection::collect(
             [(0, 4, Encoding::Raw), (0, 5, Encoding::Raw)].into_iter(),
             limits(),
             128,
             8,
-            4096,
             100,
         )
         .unwrap();
@@ -133,29 +132,15 @@ mod tests {
         let mut bounds = limits();
         bounds.envelope.max_metadata_bytes = 135;
         assert!(
-            Selection::collect(
-                [(0, 4, Encoding::Raw)].into_iter(),
-                bounds,
-                128,
-                8,
-                4096,
-                100
-            )
-            .is_err()
+            Selection::collect([(0, 4, Encoding::Raw)].into_iter(), bounds, 128, 8, 100).is_err()
         );
     }
 
     #[test]
     fn sparse_batch_is_ready_and_renegotiated_oversize_is_rejected_when_first() {
-        let selected = Selection::collect(
-            [(16, 1, Encoding::Raw)].into_iter(),
-            limits(),
-            128,
-            8,
-            4096,
-            100,
-        )
-        .unwrap();
+        let selected =
+            Selection::collect([(16, 1, Encoding::Raw)].into_iter(), limits(), 128, 8, 100)
+                .unwrap();
         assert_eq!(
             selected,
             Selection {
@@ -169,7 +154,6 @@ mod tests {
             limits(),
             4096,
             8,
-            4096,
             100,
         )
         .unwrap();
@@ -180,7 +164,6 @@ mod tests {
                 limits(),
                 4096,
                 8,
-                4096,
                 100
             )
             .is_err()

@@ -3,7 +3,7 @@
 //! The live stream is loss-tolerant and shared by every reader of a partition.
 //! The replay path is the reader's own exact-offset subscription. This cursor
 //! decides, per message, what is delivered and which path is active. The adapter
-//! owns payloads, sockets, sources, and credit; it retains one held publication,
+//! owns payloads, sockets, sources, and local capacity; it retains one held publication,
 //! pauses live reads while [`LiveCursor::is_paused`], and keeps its replay
 //! subscription equal to [`LiveCursor::replay`].
 
@@ -26,7 +26,10 @@ pub enum Publication {
     /// Every record was delivered before. Drop the message.
     Drop,
     /// Deliver the records after the first `skip`.
-    Deliver { skip: u64 },
+    Deliver {
+        /// Already delivered records to omit from this publication.
+        skip: u64,
+    },
     /// Records are missing before this message. Retain it and pause live reads.
     Hold,
 }
@@ -40,7 +43,10 @@ pub enum Replayed {
     Deliver,
     /// Deliver every record, then the held publication after its first `skip`
     /// records, or release it when none remain. Resume live reads.
-    DeliverThenHeld { skip: Option<u64> },
+    DeliverThenHeld {
+        /// Prefix to omit from the held publication; none means it is obsolete.
+        skip: Option<u64>,
+    },
 }
 
 /// The adapter violated this cursor's contract. No state changed.

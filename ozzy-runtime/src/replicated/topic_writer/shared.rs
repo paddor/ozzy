@@ -5,7 +5,7 @@ use super::{
     TopicWriterError, Writer, WriterConfig, WriterError,
 };
 use crate::{
-    replicated::{BrokerLinks, DataLimits, PartitionTarget, TopicRoutes, WriterStats},
+    replicated::{BrokerLinks, DataLimits, TopicRoutes, WriterStats},
     topic_metadata::TopicMetadata,
 };
 use ozzy_proto::{ProducerId, TopicId};
@@ -15,7 +15,7 @@ use std::time::Duration;
 /// owner's aggregate limits include all these unused queues and active frames.
 #[derive(Clone, Debug)]
 pub struct SharedTopicWriterConfig {
-    /// Request bounds, further restricted by negotiated broker credit.
+    /// Request bounds, bounded by directional broker packet limits.
     pub limits: DataLimits,
     /// Adaptive whole-APPEND LZ4. Disable when transport compression is enabled.
     pub compress_payloads: bool,
@@ -32,7 +32,7 @@ impl SharedTopicWriterConfig {
     /// `reply_metadata_bytes` is the SDK owner's advertised receive bound.
     /// Reserve every partition's `idle_bytes`, admitted requests separately,
     /// and one extra `request_bytes` for writer opening progress. Overflow or
-    /// empty windows return `None`. This grants no broker or partition credit.
+    /// empty windows return `None`. This reserves local SDK storage only.
     pub fn link_reservation(
         &self,
         reply_metadata_bytes: usize,
@@ -169,13 +169,13 @@ impl SharedTopicWriter {
                 .metadata()
                 .partition(number)
                 .expect("complete numeric topic");
-            let target = PartitionTarget::Group(partition.incarnation);
+            let target = partition.incarnation;
             let writer = Writer::open_shared(
                 &routes,
                 number,
                 WriterConfig {
                     policy: routes.metadata().policy(),
-                    partition: target.clone(),
+                    partition: target,
                     owner_epoch: 1,
                     producer_id: producer,
                     producer_epoch: 1,
@@ -241,7 +241,7 @@ impl SharedTopicWriter {
         })
     }
     /// Capture all admitted partition prefixes before polling. Each partition
-    /// keeps independent progress while other partitions wait for credit.
+    /// keeps independent progress while other partitions wait for confirmation.
     pub fn flush(
         &self,
     ) -> impl std::future::Future<Output = Result<(), WriterError>> + Send + 'static + use<> {

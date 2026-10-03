@@ -115,22 +115,27 @@ impl SegmentIndex {
         ))
     }
 
+    /// Exact immutable segment prefix from which this index was derived.
     pub fn source(&self) -> IndexSource {
         self.view().source()
     }
 
+    /// Number of record-offset selectors.
     pub fn offset_count(&self) -> usize {
         self.view().offset_count()
     }
 
+    /// Number of message-identity selectors.
     pub fn message_count(&self) -> usize {
         self.view().message_count()
     }
 
+    /// Number of canonical operation-identity selectors.
     pub fn operation_count(&self) -> usize {
         self.view().operation_count()
     }
 
+    /// Look up an exact partition incarnation and global record offset.
     pub fn find_offset(
         &self,
         partition: PartitionIncarnation,
@@ -139,6 +144,7 @@ impl SegmentIndex {
         self.view().find_offset(partition, offset)
     }
 
+    /// Look up an exact partition incarnation and record identity.
     pub fn find_message(
         &self,
         partition: PartitionIncarnation,
@@ -147,10 +153,12 @@ impl SegmentIndex {
         self.view().find_message(partition, message_id)
     }
 
+    /// Look up an exact canonical control-operation identity.
     pub fn find_operation(&self, operation_id: OperationId) -> Option<OperationIndexEntry> {
         self.view().find_operation(operation_id)
     }
 
+    /// Borrow the exact encoded physical representation.
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -923,25 +931,41 @@ impl Drop for BuildWorkspace {
 #[derive(Debug, Error)]
 pub enum IndexBuildError {
     #[error(transparent)]
+    /// A physical file operation failed.
     Io(#[from] io::Error),
     #[error(transparent)]
+    /// The encoded index representation is invalid.
     File(#[from] IndexFileError),
     #[error(transparent)]
+    /// Canonical records could not yield a valid derived index.
     Derive(#[from] IndexError),
     #[error("index source does not match validated segment")]
+    /// Index source does not match validated segment.
     SourceMismatch,
     #[error("invalid index build resource limits")]
+    /// Invalid index build resource limits.
     InvalidBuildLimits,
     #[error("one operation needs {actual} index-buffer bytes; limit is {limit}")]
-    OperationExceedsBuffer { actual: usize, limit: usize },
+    /// One operation needs index-buffer bytes; limit is.
+    OperationExceedsBuffer {
+        #[doc = "Observed size, count, or fenced field value."]
+        actual: usize,
+        #[doc = "Configured maximum for the reported resource."]
+        limit: usize,
+    },
     #[error("staging run is empty, truncated, or has the wrong width")]
+    /// Staging run is empty, truncated, or has the wrong width.
     InvalidRun,
     #[error("index build exceeded staging run limit {0}")]
+    /// Index build exceeded staging run limit.
     RunLimitExceeded(usize),
     #[error("could not allocate a unique index staging workspace")]
+    /// Could not allocate a unique index staging workspace.
     WorkspaceExhausted,
     #[error("index path is not a regular file")]
+    /// The named artifact is not a regular file.
     NotRegularFile,
     #[error("index or staging path is not a directory")]
+    /// The named artifact is not a directory.
     NotDirectory,
 }

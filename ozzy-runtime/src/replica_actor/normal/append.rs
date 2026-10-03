@@ -10,7 +10,7 @@ use crate::replica_journal::ProposalValidation;
 use ozzy_replication::wire::{Operation, Prepare, PrepareBatch};
 use ozzy_replication::{Admission, Commit, NormalReplica, ReplicationError};
 
-impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
+impl ReplicaActor {
     /// False leaves a valid packet waiting for predecessors or admission space.
     pub(in crate::replica_actor) fn receive_prepare(
         &mut self,
@@ -41,7 +41,9 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
             .receive
             .stage(batch, &snapshot, self.config.pipeline)?;
         // Staging is neither admission nor durability. ACK only the core prefix.
-        self.ack_at = now;
+        if consumed {
+            self.ack_at = now;
+        }
         Ok(consumed)
     }
 
@@ -74,7 +76,11 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
                 if let Some(ticket) = turn.applied {
                     self.complete_applied(ticket)?;
                 }
-                self.send_ready_turn(now)?;
+                if let Some(deferred) = turn.deferred {
+                    self.submit_turn(*deferred)?;
+                } else {
+                    self.send_ready_turn(now)?;
+                }
             }
             Completed::Replay(fetched, to) => self.complete_replay(fetched, to, now)?,
             _ => unreachable!("election completions handled separately"),
@@ -124,6 +130,7 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
             self.work.sync_batch_body_bytes += body_bytes;
             self.work.sync_batch_started.get_or_insert(now);
             if self.pending_sync.is_none()
+                && self.journal.available_command_slots() != 0
                 && let Some(normal) = self.driver.normal()
             {
                 let primary =
@@ -203,7 +210,7 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
             }
             Err(DriverError::StaleValidation) => {
                 crate::profiling::event(crate::profiling::Event::ReplicaStaleValidation);
-                self.retract_received()?;
+                self.retract_received(now)?;
                 self.recycle(validated.into_buffer());
             }
             Err(error) => return Err(error.into()),
@@ -291,6 +298,7 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
         assert!(self.work.live.len() < self.config.proposal_capacity);
         self.work.live.push_back(Live {
             retry: false,
+            published: false,
             scope: validation.scope(),
             generation: validation.generation(),
             predecessor: validation.accepted(),
@@ -334,10 +342,11 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
             );
         } else {
             // Duplicate waiters consume the same global ingress permits, not new
-            // operations, flow credit, PREPARE packets, or retransmission cache.
+            // operations, flow metadata, PREPARE packets, or retransmission cache.
             assert!(self.work.live.len() < self.config.proposal_capacity);
             self.work.live.push_back(Live {
                 retry: true,
+                published: true,
                 scope: validation.scope(),
                 generation: validation.generation(),
                 predecessor: through,

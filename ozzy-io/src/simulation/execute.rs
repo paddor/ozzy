@@ -23,6 +23,7 @@ pub(super) struct Files {
     locks: BTreeMap<u64, u64>,
     limit: usize,
     used: Vec<usize>,
+    closed: bool,
 }
 
 impl Files {
@@ -34,6 +35,7 @@ impl Files {
             locks: BTreeMap::new(),
             limit,
             used: vec![0; shards],
+            closed: false,
         }
     }
 
@@ -49,6 +51,7 @@ impl Files {
     }
 
     pub(super) fn clear(&mut self) {
+        self.closed |= !self.handles.is_empty();
         self.handles.clear();
         self.locks.clear();
         self.used.fill(0);
@@ -58,8 +61,13 @@ impl Files {
         self.handles.values().map(|open| open.inode)
     }
 
+    pub(super) fn take_closed(&mut self) -> bool {
+        std::mem::take(&mut self.closed)
+    }
+
     fn remove(&mut self, key: u64) -> Option<Opened> {
         let open = self.handles.remove(&key)?;
+        self.closed = true;
         self.used[open.origin] -= 1;
         if self.locks.get(&open.inode) == Some(&key) {
             self.locks.remove(&open.inode);

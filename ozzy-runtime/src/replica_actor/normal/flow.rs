@@ -1,4 +1,4 @@
-//! Receipt/credit transport policy; durable votes remain in the replication driver.
+//! Receipt and repair transport policy; durable votes remain in the replication driver.
 
 use std::collections::VecDeque;
 
@@ -28,6 +28,8 @@ struct ReceiptBinding {
 #[derive(Debug)]
 pub(in crate::replica_actor) struct Flow {
     key: Option<(Scope, JournalGeneration)>,
+    pub(in crate::replica_actor) publication_enabled: bool,
+    pub(in crate::replica_actor) publication: Option<Message>,
     pub(in crate::replica_actor) peers: [Option<Transmitter>; 3],
     history: VecDeque<ozzy_replication::flow::Operation>,
     history_limit: usize,
@@ -35,8 +37,9 @@ pub(in crate::replica_actor) struct Flow {
     published: Option<Report>,
     handles: [Option<(ozzy_replication::flow::Channel, u32)>; 3],
     local_handle: Option<ReceiptBinding>,
-    // Validated leader/session hint only. It never establishes accepted history.
-    receive_target: Option<(usize, ozzy_replication::OpNumber, usize)>,
+    receive_progress: ozzy_core::live::LiveProgress,
+    missing: Option<ozzy_replication::OpNumber>,
+    pub(in crate::replica_actor) pending_publication: Option<ozzy_replication::OpNumber>,
 }
 
 impl Flow {
@@ -65,8 +68,12 @@ impl Flow {
             .max_operations
             .checked_add(config.replay_cache.max_operations)
             .ok_or(ActorError::Limits)?;
+        let mut receive_progress = ozzy_core::live::LiveProgress::new(config.flow_probe.initial);
+        receive_progress.advanced(0, Duration::ZERO);
         Ok(Self {
             key,
+            publication_enabled: false,
+            publication: None,
             peers,
             history: VecDeque::with_capacity(history_limit),
             history_limit,
@@ -74,17 +81,20 @@ impl Flow {
             published: None,
             handles: [None; 3],
             local_handle: None,
-            receive_target: None,
+            receive_progress,
+            missing: None,
+            pending_publication: None,
         })
     }
 
     pub(super) fn change_scope(&mut self, scope: Scope, now: Duration) -> Result<(), ActorError> {
         self.key = None;
+        self.publication = None;
         self.history.clear();
         self.published = None;
         self.handles = [None; 3];
         self.local_handle = None;
-        self.receive_target = None;
+        self.reset_receipt(ozzy_replication::OpNumber(0), now);
         for peer in self.peers.iter_mut().flatten() {
             peer.change_scope(scope, now)?;
         }
@@ -102,6 +112,8 @@ impl Flow {
             .replace_session(now)?;
         self.published = None;
         self.handles[voter] = None;
+        // Dispatcher fencing can discard the held frame on a link change.
+        self.pending_publication = None;
         if self
             .local_handle
             .as_ref()
@@ -109,21 +121,41 @@ impl Flow {
         {
             self.local_handle = None;
         }
-        if self
-            .receive_target
-            .is_some_and(|(from, _, _)| from == voter)
-        {
-            self.receive_target = None;
-        }
         Ok(())
     }
 
-    pub(in crate::replica_actor) fn receive_target(&self) -> Option<ozzy_replication::OpNumber> {
-        self.receive_target.map(|(_, prefix, _)| prefix)
+    pub(in crate::replica_actor) fn clear_compact_receipt(&mut self) {
+        if let Some(bound) = &mut self.local_handle {
+            bound.established = false;
+        }
     }
 
-    pub(in crate::replica_actor) fn receive_body_bytes(&self) -> Option<usize> {
-        self.receive_target.map(|(_, _, bytes)| bytes)
+    pub(in crate::replica_actor) fn observe_receipt(
+        &mut self,
+        received: ozzy_replication::OpNumber,
+        missing: Option<ozzy_replication::OpNumber>,
+        publication: bool,
+        now: Duration,
+    ) {
+        if publication {
+            self.receive_progress.advanced(received.0, now);
+        }
+        if self.missing.is_some_and(|end| end <= received) {
+            self.missing = None;
+        }
+        if self.pending_publication.is_some_and(|end| end <= received) {
+            self.pending_publication = None;
+        }
+        if let Some(end) = missing.filter(|end| *end > received) {
+            self.missing = Some(self.missing.map_or(end, |previous| previous.max(end)));
+        }
+    }
+
+    fn reset_receipt(&mut self, received: ozzy_replication::OpNumber, now: Duration) {
+        self.receive_progress.reset();
+        self.receive_progress.advanced(received.0, now);
+        self.missing = None;
+        self.pending_publication = None;
     }
 
     pub(super) fn remember(&mut self, operation: ozzy_replication::flow::Operation) {
@@ -155,7 +187,7 @@ pub(super) enum PacketSend {
     Miss,
 }
 
-impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
+impl ReplicaActor {
     pub(in crate::replica_actor) fn receive_flow(
         &mut self,
         voter: usize,
@@ -171,20 +203,25 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
             FlowMessage::Probe(probe) if from == primary && probe.scope == self.driver.scope() => {
                 let report = self.work.receive.ledger.report();
                 if report.channel.scope == probe.scope {
-                    if self
+                    let limit = self
                         .work
                         .flow
-                        .receive_target
-                        .is_none_or(|(_, previous, _)| probe.available >= previous)
-                    {
-                        self.work.flow.receive_target = Some((
-                            voter,
-                            probe.available,
-                            usize::try_from(probe.minimum_body_bytes)
-                                .map_err(|_| ActorError::Limits)?,
-                        ));
-                    }
-                    self.send_flow_state(voter, report, Some(probe.request_id))?;
+                        .publication_enabled
+                        .then(|| {
+                            if self.work.flow.pending_publication.is_some() {
+                                // The shard already owns the next contiguous
+                                // frame. Repair cannot make local room for it.
+                                return Some(report.received.op.0);
+                            }
+                            self.work.flow.receive_progress.repair_limit(
+                                report.received.op.0,
+                                self.work.flow.missing.map(|end| end.0),
+                                now,
+                            )
+                        })
+                        .flatten()
+                        .map(|limit| ozzy_replication::OpNumber(limit.min(probe.tail.op.0)));
+                    self.send_flow_state(voter, report, Some(probe.request_id), limit)?;
                 }
             }
             FlowMessage::State(state) if primary == self.local => {
@@ -249,7 +286,8 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
                 .map_err(TransmitError::from)?;
             self.work.flow.key = Some(key);
             self.work.flow.published = None;
-            self.work.flow.receive_target = None;
+            let received = self.work.receive_report().received.op;
+            self.work.flow.reset_receipt(received, now);
             self.bind_receive_epoch();
         }
         if self.configuration.primary(snapshot.scope.view) != self.local {
@@ -281,27 +319,7 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
                 continue;
             }
             let queued = self.outbox.queued(to, SendClass::Data).expect("peer").0 > 0;
-            let after = peer
-                .sender()
-                .map_or(snapshot.committed.op, |sender| sender.sent().op);
-            // Back progress on the next operation, rather than reserving the
-            // whole pending suffix independently for every idle partition.
-            let minimum_body_bytes = self
-                .work
-                .flow
-                .history
-                .iter()
-                .find(|op| op.prefix.op > after)
-                .map_or(0, |op| op.body_bytes);
-            let minimum_body_bytes = if minimum_body_bytes == 0 && after < snapshot.accepted.op {
-                self.config.transfer.max_body_bytes as u64
-            } else {
-                minimum_body_bytes.max(1)
-            }
-            .min(self.config.transfer.max_body_bytes as u64);
-            let Some(probe) =
-                peer.poll_probe(snapshot.accepted, minimum_body_bytes, queued, now)?
-            else {
+            let Some(probe) = peer.poll_probe(snapshot.accepted, queued, now)? else {
                 continue;
             };
             let encoded = wire::encode_flow_probe(
@@ -329,25 +347,7 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
         }
     }
 
-    pub(in crate::replica_actor) fn revoke_unused_receive(&mut self) -> Result<Report, ActorError> {
-        crate::profiling::event(crate::profiling::Event::ReplicaCreditRevocation);
-        let scope = self.work.receive.ledger.report().channel.scope;
-        let epoch = self.ids.channel(scope)?.epoch;
-        let report = self
-            .work
-            .receive
-            .ledger
-            .revoke_unused(epoch)
-            .map_err(TransmitError::from)?;
-        self.work.flow.published = None;
-        self.bind_receive_epoch();
-        // Keep queued bodies, validation tickets, and accepted file work. This
-        // revokes only unused grants, unlike rejection of a staged suffix.
-        self.ready_work.mark();
-        Ok(report)
-    }
-
-    pub(super) fn retract_received(&mut self) -> Result<(), ActorError> {
+    pub(super) fn retract_received(&mut self, now: Duration) -> Result<(), ActorError> {
         if let Some(snapshot) = self
             .driver
             .normal()
@@ -361,6 +361,8 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
                 .retract(self.ids.channel(snapshot.scope)?.epoch, snapshot.accepted)
                 .map_err(TransmitError::from)?;
             self.work.flow.published = None;
+            let received = self.work.receive_report().received.op;
+            self.work.flow.reset_receipt(received, now);
             self.bind_receive_epoch();
         }
         self.work.receive.reset();
@@ -372,15 +374,7 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
             return Ok(());
         }
         let report = self.work.receive.ledger.report();
-        // Returning a retained body can change the internal revision alone.
-        // No remote counter changed until admission actually renews credit.
-        if self.work.flow.published.is_some_and(|old| {
-            old == Report {
-                revision: old.revision,
-                ..report
-            }
-        }) || report.channel.scope != self.driver.scope()
-        {
+        if self.work.flow.published == Some(report) || report.channel.scope != self.driver.scope() {
             return Ok(());
         }
         let primary = self.configuration.primary(report.channel.scope.view);
@@ -393,7 +387,7 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
             .iter()
             .position(|peer| *peer == primary)
             .expect("primary");
-        self.send_flow_state(voter, report, None)?;
+        self.send_flow_state(voter, report, None, None)?;
         self.work.flow.published = Some(report);
         Ok(())
     }
@@ -403,6 +397,7 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
         voter: usize,
         report: Report,
         request_id: Option<ozzy_proto::RequestId>,
+        repair_limit: Option<ozzy_replication::OpNumber>,
     ) -> Result<(), ActorError> {
         let to = self.configuration.voters()[voter];
         let Some(session) = self.session(to) else {
@@ -430,14 +425,14 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
             handle,
             report,
             request_id,
-            repair_limit: None,
+            repair_limit,
         };
         if state.request_id.is_none() && confirmed {
             let compact = wire::CompactState::from_report(handle, state.report)?.encode()?;
-            crate::profiling::event(crate::profiling::Event::CompactCredit);
+            crate::profiling::event(crate::profiling::Event::CompactReceipt);
             return self.enqueue(to, SendClass::Receipt, Message::from_slice(&compact));
         }
-        crate::profiling::event(crate::profiling::Event::FullCredit);
+        crate::profiling::event(crate::profiling::Event::FullReceipt);
         let encoded = wire::encode_flow_state(
             self.local,
             session,
@@ -599,7 +594,7 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
             .expect("remote peer")
             .open_verified(request, base, received, now)?;
         if opened {
-            // Old-incarnation packets keep their old epochs, never new credits.
+            // Old-incarnation packets keep their old epochs.
             if !same_channel {
                 self.outbox
                     .discard(self.configuration.voters()[voter], SendClass::Data);
@@ -695,6 +690,39 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
         if !self.application_ready() {
             return Ok(());
         }
+        if self.work.flow.publication_enabled && self.work.flow.publication.is_none() {
+            let snapshot = self.driver.normal().expect("normal publication").snapshot();
+            if let Some(live) = self
+                .work
+                .live
+                .iter_mut()
+                .find(|live| !live.published && live.scope == snapshot.scope)
+            {
+                let packet = live
+                    .packets
+                    .iter()
+                    .flatten()
+                    .next()
+                    .expect("new canonical packet");
+                let frames: [&[u8]; 3] =
+                    std::array::from_fn(|i| packet.part_slice(i).expect("template"));
+                let encoded = wire::encode_publication(
+                    self.local,
+                    &frames,
+                    snapshot.committed,
+                    &mut self.metadata,
+                    self.wire_limits,
+                )?;
+                self.work.flow.publication = Some(Message::multipart([
+                    Bytes::copy_from_slice(snapshot.scope.group_id.as_bytes()),
+                    Bytes::copy_from_slice(&encoded.header),
+                    Bytes::copy_from_slice(&self.metadata[..encoded.metadata_bytes]),
+                    packet.part_bytes(2).expect("template body"),
+                ]));
+                live.published = true;
+                self.ready_work.mark();
+            }
+        }
         for index in 0..self.work.live.len() {
             for voter in 0..3 {
                 let live = &mut self.work.live[index];
@@ -720,7 +748,7 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
         end: Prefix,
     ) -> Result<(PacketSend, Message), ActorError> {
         // Return the owned template on every nonterminal path. Polling a live
-        // window without credit/new work must not clone its multipart vectors.
+        // window without local room/new work must not clone its multipart vectors.
         let to = self.configuration.voters()[voter];
         let Some(session) = self.session(to) else {
             return Ok((PacketSend::Wait, packet));
@@ -740,11 +768,22 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
         if repair.is_none() && peer.repair(false).is_some() {
             return Ok((PacketSend::Wait, packet));
         }
+        if self.work.flow.publication_enabled && repair.is_none() && !peer.needs_catch_up() {
+            return Ok((PacketSend::Wait, packet));
+        }
         let cursor = repair.map_or(sender.sent(), |repair| repair.after);
         if cursor.op < predecessor.op || cursor.op >= end.op {
             return Ok((PacketSend::Miss, packet));
         }
         if repair.is_some_and(|repair| end.op > repair.through.op) {
+            return Ok((PacketSend::Miss, packet));
+        }
+        if self.work.flow.publication_enabled
+            && repair.is_none()
+            && peer
+                .catch_up_through()
+                .is_none_or(|through| end.op > through)
+        {
             return Ok((PacketSend::Miss, packet));
         }
         let epoch = sender.channel().epoch;

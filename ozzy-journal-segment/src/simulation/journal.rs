@@ -25,8 +25,11 @@ const CAPACITY: u64 = 1024 * 1024;
 /// Decoded storage state. The scheduler may observe it; it supplies no vote.
 #[derive(Debug)]
 pub struct Recovered {
+    /// Metadata generation selected after simulated reopen.
     pub manifest: Manifest,
+    /// Whether recovered evidence permits this replica to vote.
     pub admitted: bool,
+    /// Validated canonical operations recovered from the selected segment.
     pub operations: Vec<DecodedOperation<'static>>,
 }
 

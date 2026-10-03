@@ -71,7 +71,7 @@ impl PinnedRecovery {
     }
 }
 
-impl<E> ReplicaJournal<E> {
+impl ReplicaJournal {
     /// Queue synchronization and capture of a primary's exact accepted snapshot.
     ///
     /// Obtain `response` from the activated normal core before submitting. Its

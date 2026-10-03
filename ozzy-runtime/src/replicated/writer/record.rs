@@ -7,7 +7,8 @@ use smallvec::SmallVec;
 /// One application record, independent of transport or broker grouping.
 ///
 /// Single payloads up to 62 bytes are stored in transport form at once, so
-/// admission moves them without another copy; up to 128 bytes live inline.
+/// admission moves them without another copy; up to 128 bytes stay inline
+/// through SDK intake and grouping.
 /// Larger single buffers remain shared until admission can reuse their unique
 /// storage. Multipart descriptors use inline storage for two parts and
 /// preserve empty parts and their ordering.
@@ -132,6 +133,14 @@ impl RecordInput {
                     .try_fold(0_usize, |sum, part| sum.checked_add(part.len())),
             ),
         }
+    }
+
+    /// Move the caller's inline bytes into SDK intake without transport packing.
+    pub(super) fn take_inline(&mut self) -> Option<InlineBody> {
+        let InputBody::Inline(body) = &mut self.body else {
+            return None;
+        };
+        Some(std::mem::replace(body, InlineBody::empty()))
     }
 
     pub(super) fn take_payload(&mut self, bytes: usize) -> omq_tokio::message::Payload {

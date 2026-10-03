@@ -41,8 +41,9 @@ fn fixture_backend(
     let count = if mode == DeploymentMode::Single { 1 } else { 3 };
     for index in 0..count {
         let mut broker = template.clone();
-        broker.endpoints.peer = format!("tcp://127.0.0.1:{}", 7100 + index * 2);
-        broker.endpoints.reader_pub = format!("tcp://127.0.0.1:{}", 7101 + index * 2);
+        broker.endpoints.peer = format!("tcp://127.0.0.1:{}", 7100 + index * 4);
+        broker.endpoints.data_peer = format!("tcp://127.0.0.1:{}", 7103 + index * 4);
+        broker.endpoints.reader_pub = format!("tcp://127.0.0.1:{}", 7101 + index * 4);
         let device = broker.devices.get_mut("ssd").unwrap();
         device.root = root.join(format!("broker-{index}"));
         device.workers.backend = backend;

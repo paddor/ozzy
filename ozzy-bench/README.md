@@ -13,11 +13,15 @@ ozy_compare --impl ozzy --check-only
 ozy_compare --impl ozzy --modes durable,replicated-persisting \
   --sizes 128,1024,8192 --partitions 8 --segment-mib 1024 \
   --broker-cpus 0/1/2 --client-cpus 3,4,5 \
-  --aio-depth 8 --writer-inflight-appends 1 \
+  --aio-depth 8 --writer-inflight-appends 3 --request-records 2048 \
+  --writer-batch-target-kib 2048 \
   --warmup 2 --duration 8 --repetitions 3
 ```
 
-- Run builds, benchmarks and profilers **serially** on an otherwise idle VM.
+- Run builds, benchmarks and profilers **serially** on an otherwise idle machine.
+  Pin brokers and clients to disjoint CPU sets. Keep host scheduling and device
+  settings fixed; repeat the baseline after changes. Clean obsolete artifacts
+  and trim the idle SSD during daily sustained benchmark work.
 - Use the mounted SSD for storage. Native disk commands need
   `--storage-dir /mnt/ssd/tmp/ozzy-bench`; `TMPDIR` alone is insufficient.
 - Comparisons and profiles check the mount and run `sync -f /mnt/ssd/tmp`
@@ -66,7 +70,8 @@ ozy_compare --impl ozzy --modes buffered --sizes 16 \
   --warmup 1 --duration 3 --checks focused
 ```
 
-`--checks focused` limits build checks to formatting and worker lint/build.
+`--checks focused` runs formatting and the worker build. Run affected unit tests
+before measuring; run Clippy and the full test suite before committing.
 Isolation, source fingerprints, warnings and reader verification stay enforced.
 Short runs screen experiments; repeat promising changes before keeping them.
 Broker sockets use dedicated OMQ I/O threads. `--broker-io-threads` sets their
@@ -119,12 +124,13 @@ partition; writer order and full-byte digests are checked independently.
 | `--live-readers` | Off. Ozzy disk groups only: the leader publishes confirmed records once per partition and readers take live records from that publication; history and gaps still use their subscription. Each reader is verified exactly as before |
 | `--readers-per-partition` | 1. Ozzy only: each additional reader is its own process and verifies every record. One group admits at most 32 readers. Delivery rate is the mean per reader; delivery latency covers all readers |
 | `--shards` | Native local shards; default minimum of partitions and broker CPU count |
-| `--request-records` | Records per request: native queue capacity per APPEND slot (minimum 1024) and Iggy's records per request |
+| `--request-records` | Native APPEND record ceiling and queue capacity per slot (queue minimum 1024); Iggy's records per request. Native charts use 2048. |
 | APPEND packing | SDK and leader use adaptive LZ4 at/above 2 KiB |
 | `--payload-compression off` | Ozzy only: no SDK LZ4 and no leader packing; plain payload bytes on the wire, in replication and on disk |
 | SDK grouping | Comparisons collect available records into SDK APPENDs, no linger |
 | Broker proposals | Each SDK APPEND becomes one partition-local proposal. The frontend does not combine APPENDs from several writers |
-| `--writer-inflight-appends` | 1; SDK request cap until full confirmation. Higher values remain configurable. |
+| `--writer-inflight-appends` | 1 by default; charts use 3. SDK request cap until full confirmation. |
+| `--writer-batch-target-kib` | 832 by default; native SDK APPEND payload target. Record, segment, and broker's 8 MiB message bounds clamp the effective cap. Results verify the effective bytes. |
 | `--reader-records` | 16384 records per native delivery / Iggy poll |
 | `--reader-payload-mib` | 128 MiB reply cap; record count is reduced to fit |
 | `--segment-mib` | Physical segment limit: 1 GiB for records of at least 1 KiB, else 256 MiB |
@@ -134,13 +140,22 @@ partition; writer order and full-byte digests are checked independently.
 | `--aio-depth` | `1`; kernel AIO data writes in flight per broker device controller, 1 to 64. Shards share this bound. Power-loss recovery discards a hole and later writes only after the durable position |
 
 Native writers use transparent APPEND grouping over
-[PEER for APPENDs, control, and confirmations](../doc/PROTOCOL.md). Live readers retain broker PUB and SDK SUB.
-Broker credit and producer queue capacity bound outstanding records. Sparse
+[separate data/control PEER sockets](../doc/PROTOCOL.md). Live readers retain broker PUB and SDK SUB.
+Saturation and fixed-load callers bound ready work to 256 records or 2 MiB per
+turn. Ready confirmations drain in batches; every receipt and latency sample
+is still checked individually.
+Local SDK request/byte bounds and OMQ backpressure bound outstanding records. Sparse
 traffic sends single-record APPENDs without waiting for more arrivals.
-`--request-records 1024` sets queue capacity per APPEND slot; grouping has no
-linger. One APPEND
-has at most 2,048 records. `--writer-inflight-appends` bounds those requests
+`--request-records` sets the APPEND record ceiling and queue capacity per slot
+(at least 1,024 queue entries); grouping has no linger. One APPEND
+has at most 2,048 records. Charts use 2,048 records and a 2 MiB byte target.
+`--writer-inflight-appends` bounds those requests
 until fully confirmed.
+At 8 KiB, the default byte target permits about 104 records per APPEND.
+Increase `--writer-batch-target-kib` independently of the record queue to measure
+larger batches. Sparse traffic still sends promptly, without waiting to fill them.
+The live reader queue keeps at most 64 frames and a 52 MiB payload window;
+larger frames reduce its slot count. Results record that effective queue size.
 Results record and verify the selected protocol against actual send counters.
 Keep each result's measured transport label; a protocol decision does not relabel
 older measurements or charts.
@@ -164,7 +179,7 @@ otherwise capacity follows the request record ceiling, capped at 2048 for Ozzy.
 Bounded queues feed SDK preparation and I/O. Local shards collect received
 requests independently. Hard record/protocol bounds remain separate.
 
-Partial confirmations release confirmed records and byte credit, but retain
+Partial confirmations release confirmed records and their retained-byte budget, but retain
 the APPEND slot until its final record. Producer inboxes remain finite. Iggy's adapter permits one outstanding request per
 connection. Reader limits are independent of writer batching.
 
@@ -189,7 +204,15 @@ stream of OMQ's compression benchmark: five newline-separated event kinds after
 the 8 B clock, cut at the exact record size, with no filler text. Each writer
 lane cycles through a pool of distinct bodies built once: 8 MiB of bodies, and
 at least one request's records. No codec window or request sees a body twice.
-The clock is read every 64 records. Generation and full verification are timed.
+The clock is read every 64 records. Bodies are built before measurement;
+record assembly, clock reads, and full-byte verification are timed. The final event may be cut mid-field to keep the exact requested size;
+consumers verify the original bytes rather than parsing them as JSON.
+
+The maximum-APPEND corpus check finds no duplicate bodies or complete events.
+With zero clocks, LZ4 retains 25.5%, 26.7%, and 26.3% of raw bytes at
+128 B, 1 KiB, and 8 KiB. Tests require 20%-50% retention at all three sizes.
+This checks the event workload, not a universal application compression ratio.
+Use `--patterns random` for the incompressible control.
 
 `--patterns random` supplies an incompressible control; `structured` retains the
 older repetitive corpus for diagnostics. Explicit `json` requires sizes above
@@ -253,7 +276,7 @@ ceiling.
 Broker rows report sampled confirmation-to-persistence lag and bounded pending
 bytes/operations. Sampling can miss peaks. Final snapshots require all accepted
 operations persisted; that drain remains outside writer latency measurement.
-See [restart limits](../doc/REPLICATION.md#receipt-credit-and-repair).
+See [restart limits](../doc/REPLICATION.md#receipt-and-repair).
 
 ### Iggy and isolation
 
@@ -337,6 +360,11 @@ Pacing uses absolute monotonic `timerfd` deadlines, without millisecond rounding
 or busy waiting. Late admission never resets timestamps. An arrival still
 unadmitted 1 s after its due time fails the run. Never add or subtract percentiles. At 100 records/s,
 30 seconds supplies 3000 samples; longer repeated runs are needed for stable p99.
+Partial reruns use `--replace-run-id ID` alongside the full `--run-id`.
+Only existing Ozzy cases from an identical worker binary and matching controls
+can replace measurements; other cases and both runs' provenance remain.
+Charts refuse to drop existing systems, record sizes, or offered rates.
+
 Keep fixed-load results separate from saturation curves.
 
 ### Size and concurrency sweeps
@@ -427,9 +455,15 @@ ozy_profile --case-dir /mnt/ssd/tmp/ozzy-artifacts/runs/RUN/CASE --kind stages
 Defaults: 2 s warmup, 5 s measurement; override with `--warmup` and `--duration`.
 Profiles go under `/mnt/ssd/tmp/ozzy-profiles/`. CPU sampling defaults to 99 Hz;
 use `--frequency 499` for more samples. Profile timings are not comparisons.
+Comparison builds report each broker's resident/historical delivery counts and
+shared/copied reader bytes under `usage.record_deliveries`. These counters cover
+the process lifetime, including warmup and drain.
 Stage profiles publish thread-owned counters over local OMQ PUB/SUB.
 The profiler binds abstract IPC, merges thread snapshots, and prints live
 repair and refusal alerts. Shards publish directly without a shared counter table.
+Add `--counter-trace` to a stage profile to retain timestamped SUB snapshots
+under `/mnt/ssd/tmp/ozzy-profiles/` for correlation after the run. Only the
+collector writes the artifact, after all workers stop.
 CPU profiles disable ASLR to avoid stale parent mappings in `perf`'s unwinder.
 Profiles place the controller on saved client CPUs. Production broker placement
 comes from the case command; the old worker-affinity environment is not replayed.
@@ -480,6 +514,8 @@ The chart shows each implementation's batch ceiling. This is not an
 identical-workload baseline; both provenances remain in
 the cached chart input. External references retain their original dependency
 provenance; current Ozzy-only OMQ/fanring changes do not invalidate them.
+References may span revisions across runs. Each run must remain internally
+consistent; chart inputs keep its workload fingerprint and controls separately.
 Prefer reuse over rerunning unchanged external systems.
 Native APPEND windows, disk settings, and live-reader delivery may differ from
 cached external rows. Their adapters do not use those controls. Captions and
@@ -494,32 +530,44 @@ overload annotations and original run provenance.
   `doc/charts/cluster/replicated-persisting.svg`, plus each mode's
   `-fixed-load.svg` form. No buffered or suffixed variants in `doc/charts/`.
 - OMQ style: black background, shared fonts/palette/grids, lines and measured dots.
+- Titles include `at saturation` or `at fixed load`. Hardware subtitles use the
+  recorded CPU model. Optional repo-root `.chart_hw` uses OMQ's `prefix` and
+  `postfix` keys, joined around that model. This file is local and gitignored:
+
+  ```text
+  prefix=Linux VM on a 2018 Mac Mini
+  postfix=6 cores, performance governor, turbo off
+  ```
+
 - Writer confirmation left, verified reader right. Throughput above latency.
 - Each throughput panel overlays dashed records/s (left axis) and solid decimal
   MB/s (right axis), across every measured size. Higher is better.
-- Latency uses a 0-300 ms linear scale with 20 ms ticks. Solid P99 lines and
+- Latency uses a 0-400 ms linear scale. Solid P99 lines and
   thin P50-P99.9 whiskers use repetition medians. Triangles mark values above
-  300 ms. Missing P99.9 leaves only the P50-P99 lower whisker.
+  400 ms. Missing P99.9 leaves only the P50-P99 lower whisker. Backlog-limit
+  labels sit on the right of each fixed-load panel.
 - Throughput whiskers retain the min/max across repetitions.
 - Footer: series, writer count and explicit request ceiling. No journal-byte panel.
 - Generate charts only when explicitly requested. Refresh these six paths.
   Chart-input artifacts go under `/mnt/ssd/tmp/ozzy-chart-inputs/`.
 
 Selection rejects incomplete repetitions, mixed Ozzy revisions, incompatible
-settings and missing audit evidence. No smoothing or extrapolation. Subtitles
-identify warmup and measurement durations.
+settings and missing audit evidence. No smoothing or extrapolation. Timing
+windows remain in the saved chart inputs and benchmark description.
 
 Fixed-load charts use `single/` or `cluster/`, named `MODE-fixed-load.svg`: one
 panel per record size, top to bottom; offered records/s on X, scheduled-arrival
 latency on Y. Each system's writer confirmation uses its color and its verified
 reader a lighter shade; P99 lines and P50-P99.9 whiskers use the same style as
 saturation latency panels. Select one Ozzy build;
-include compatible Iggy and Redpanda runs with additional `--run-id` arguments.
-Durations may differ between rates (shown in the subtitle), but must match between
+include compatible Iggy and Redpanda runs with the reference flags above.
+Durations may differ between rates, but must match between
 sizes and modes at each rate. Saturation files remain separate.
 Use `--failed-run-id ID` for an explicitly selected single-case scheduled-backlog
-failure. It adds a legend annotation and a gap, never a latency value. Its build,
-settings, broker version, and failure artifacts must match the selected results.
+failure. It adds an annotation and a gap when no completed attempt exists.
+A separate failed repeat keeps the completed attempt plotted and labels the
+repeat. Failures supply no latency samples. Build, settings, broker version,
+and failure artifacts must match the selected results.
 Timed reports retain merged histogram bins for later percentile extraction.
 
 ### Iggy logout diagnostic
@@ -681,7 +729,7 @@ client traffic. A leader plus local follower can confirm without crossing it.
 Writers/readers stay on the coordinator host, so latency uses one monotonic clock.
 Never subtract broker clocks. Stop all local/remote workers before another run;
 forced termination can leave scratch. Multiple brokers sharing a host/disk still
-share a failure domain. See [fault tests](../doc/VALIDATION.md#cross-host-process-tests).
+share a failure domain. See [fault tests](../doc/VALIDATION.md#test-layers).
 
 ## Process control
 

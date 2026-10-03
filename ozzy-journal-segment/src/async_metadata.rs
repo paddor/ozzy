@@ -4,7 +4,7 @@
 
 mod files;
 mod selected;
-pub use selected::Selected;
+pub(crate) use selected::Selected;
 #[cfg(test)]
 mod tests;
 
@@ -16,16 +16,16 @@ use std::{io, path::PathBuf};
 /// Limits on caller-owned metadata and on each physical transfer. Pending
 /// publication bytes remain part of the partition's bounded resident state.
 #[derive(Clone, Copy, Debug)]
-pub struct Limits {
-    pub max_file_bytes: usize,
-    pub chunk_bytes: usize,
+pub(crate) struct Limits {
+    pub(crate) max_file_bytes: usize,
+    pub(crate) chunk_bytes: usize,
 }
 
 /// Exclusively locked metadata directory. No OS descriptors live here. Submitted
 /// publication jobs retain the lock independently of this object's lifetime.
 /// Failed or canceled publication fences this owner until it is reopened.
 #[derive(Debug)]
-pub struct Directory {
+pub(crate) struct Directory {
     files: files::Files,
     faulted: bool,
 }
@@ -48,10 +48,15 @@ impl Directory {
         crate::async_files::Access {
             io: self.files.io.clone(),
             protection: Some(self.files.lock.clone()),
+            readers: self.files.readers.clone(),
         }
     }
 
-    pub fn root(&self) -> &std::path::Path {
+    pub(crate) async fn close(self) -> Result<(), DirectoryError> {
+        self.files.close_all().await
+    }
+
+    pub(crate) fn root(&self) -> &std::path::Path {
         &self.files.root
     }
 
@@ -84,7 +89,11 @@ impl Directory {
     /// Acquire a directory for metadata initialization. This may create its lock
     /// file, but never creates identity or journal data. Existing-store startup
     /// must use `open_existing`, which cannot create even a missing lock.
-    pub async fn open(root: PathBuf, io: Local, limits: Limits) -> Result<Self, DirectoryError> {
+    pub(crate) async fn open(
+        root: PathBuf,
+        io: Local,
+        limits: Limits,
+    ) -> Result<Self, DirectoryError> {
         Ok(Self {
             files: files::Files::open(root, io, limits, true).await?,
             faulted: false,
@@ -92,7 +101,7 @@ impl Directory {
     }
 
     /// Acquire an established store without creating any missing file.
-    pub async fn open_existing(
+    pub(crate) async fn open_existing(
         root: PathBuf,
         io: Local,
         limits: Limits,
@@ -103,7 +112,7 @@ impl Directory {
         })
     }
 
-    pub const fn is_faulted(&self) -> bool {
+    pub(crate) const fn is_faulted(&self) -> bool {
         self.faulted
     }
 
@@ -124,7 +133,7 @@ impl Directory {
 
     /// Select an unused immutable generation and publish its exact bytes. The
     /// caller installs this returned manifest only after selecting CURRENT.
-    pub async fn publish_manifest(
+    pub(crate) async fn publish_manifest(
         &mut self,
         previous: &Manifest,
         next: Manifest,
@@ -155,7 +164,7 @@ impl Directory {
     }
 
     /// Replace CURRENT after its referenced manifest and segments are durable.
-    pub async fn select_current(
+    pub(crate) async fn select_current(
         &mut self,
         current: CurrentReference,
     ) -> Result<(), DirectoryError> {
@@ -172,7 +181,7 @@ impl Directory {
     }
 
     /// Install immutable metadata. Existing bytes must match exactly.
-    pub async fn install_immutable(
+    pub(crate) async fn install_immutable(
         &mut self,
         name: &str,
         bytes: &[u8],
@@ -186,7 +195,7 @@ impl Directory {
 
     /// Replace mutable metadata through an unselected temporary and directory
     /// barrier. The temporary must be a distinct hidden `.tmp` basename.
-    pub async fn replace(
+    pub(crate) async fn replace(
         &mut self,
         target: &str,
         temporary: &str,
@@ -216,7 +225,7 @@ impl Directory {
 
     /// Publish a prevalidated DURABLE record into both copies. The caller owns
     /// sequence/position validation and selects the older copy first.
-    pub async fn overwrite_evidence(
+    pub(crate) async fn overwrite_evidence(
         &mut self,
         first: usize,
         bytes: &[u8],

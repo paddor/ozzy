@@ -14,7 +14,9 @@ use tokio::sync::Notify;
 /// Separate capacity for barriers/recovery. Ordinary work cannot consume it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Class {
+    /// Ordinary file work, including segment writes and reads.
     Data,
+    /// Reserved barriers, recovery, and other work needed to release capacity.
     Progress,
 }
 
@@ -27,9 +29,12 @@ impl Class {
     }
 }
 
+/// Operation count and retained-byte count for one traffic class.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Quota {
+    /// Operation count, including retained completions.
     pub operations: usize,
+    /// Retained backing bytes, including results and backend scratch.
     pub bytes: usize,
 }
 
@@ -37,12 +42,16 @@ pub struct Quota {
 /// partitions or submission lanes does not multiply it. Idle shares are not lent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
+    /// Application shards sharing this fixed device budget.
     pub shards: usize,
+    /// Aggregate allowance for ordinary work.
     pub data: Quota,
+    /// Aggregate allowance reserved for progress work.
     pub progress: Quota,
 }
 
 impl Limits {
+    /// Check nonzero per-shard shares and aggregate overflow.
     pub fn validate(self) -> io::Result<Self> {
         if self.shards == 0
             || [self.data, self.progress]
@@ -63,6 +72,7 @@ impl Limits {
         Ok(self)
     }
 
+    /// Fixed count/byte share for a configured shard; panics for a foreign shard.
     pub fn share(self, shard: usize, class: Class) -> Quota {
         assert!(shard < self.shards);
         let total = match class {
@@ -77,6 +87,7 @@ impl Limits {
     }
 }
 
+/// Shared capacity observations; mutable ledgers remain on their shard owners.
 #[derive(Clone, Debug)]
 pub struct Admission(Arc<Shared>);
 
@@ -164,6 +175,7 @@ pub struct Charge {
 }
 
 impl Admission {
+    /// Create admission for validated fixed device limits.
     pub fn new(limits: Limits) -> io::Result<Self> {
         let limits = limits.validate()?;
         Ok(Self(Arc::new(Shared {
@@ -177,6 +189,7 @@ impl Admission {
         })))
     }
 
+    /// Configured aggregate device bounds.
     pub fn limits(&self) -> Limits {
         self.0.limits
     }
@@ -245,6 +258,7 @@ impl Admission {
         }
     }
 
+    /// Observed retained count/bytes for one shard and traffic class.
     pub fn used(&self, shard: usize, class: Class) -> Quota {
         let observed = &self.0.observed[shard][class.index()];
         Quota {
@@ -275,6 +289,7 @@ impl Lane {
         }
     }
 
+    /// Reserve one operation and retained bytes; return `WouldBlock` on pressure.
     pub fn try_charge(&mut self, class: Class, bytes: usize) -> io::Result<Charge> {
         self.collect();
         let shard = self.shard;

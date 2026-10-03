@@ -314,7 +314,6 @@ fn admit_rejoin(
                     1,
                     Control::PrepareOk {
                         ack: normal.acknowledgment().unwrap(),
-                        grant: grant(),
                     },
                 ));
             }
@@ -349,14 +348,6 @@ fn admit_rejoin(
         "all links/storage healthy, but rejoin cannot activate: {:?}",
         replicas.each_ref().map(ReplicaDriver::scope)
     );
-}
-
-fn grant() -> Grant {
-    Grant {
-        revision: 1,
-        record_limit: 8,
-        byte_limit: 8192,
-    }
 }
 
 fn complete_modeled_installation(
@@ -427,17 +418,7 @@ fn commit_after_rejoin(
     // Specifically require the rejoined voter's durable ACK, not just the old pair.
     let ack = replicas[2].normal().unwrap().acknowledgment().unwrap();
     replicas[1]
-        .receive(
-            node(2),
-            wire_control(
-                2,
-                Control::PrepareOk {
-                    ack,
-                    grant: grant(),
-                },
-            ),
-            now,
-        )
+        .receive(node(2), wire_control(2, Control::PrepareOk { ack }), now)
         .unwrap();
     let commit = replicas[1].normal().unwrap().announcement().unwrap();
     assert_eq!(commit.committed, operation.prefix());
@@ -510,10 +491,7 @@ fn older_view_traffic_at_an_installed_newer_view_replica_is_inert() {
                 committed: acknowledged,
             }),
             Control::StartViewChange(StartViewChange { scope: old_scope }),
-            Control::PrepareOk {
-                ack,
-                grant: grant(),
-            },
+            Control::PrepareOk { ack },
         ];
         for control in controls {
             // A view-zero election start has no wire form; deliver it directly.

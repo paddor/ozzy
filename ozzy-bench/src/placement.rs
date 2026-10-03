@@ -10,14 +10,20 @@ use std::{
 };
 
 #[derive(Debug, Clone)]
+/// One broker host, reachable bind address, storage parent, and CPU placement.
 pub struct Placement {
+    /// Reachable address used to reserve this broker public sockets.
     pub bind: IpAddr,
+    /// Optional SSH host and source checkout; none executes locally.
     pub remote: Option<(String, PathBuf)>,
+    /// Explicit broker storage parent on the selected host.
     pub storage_dir: Option<PathBuf>,
+    /// Explicit CPU IDs available to the broker process.
     pub cpus: Option<Vec<usize>>,
 }
 
 impl Placement {
+    /// Load exactly three placements or use the default local placements.
     pub fn load(path: Option<&Path>) -> BenchResult<[Self; 3]> {
         let Some(path) = path else {
             return Ok(std::array::from_fn(|_| Self {
@@ -37,6 +43,7 @@ impl Placement {
         Self::parse(&bytes)
     }
 
+    /// Parse and validate exactly three placements from the JSON document.
     pub fn parse(bytes: &[u8]) -> BenchResult<[Self; 3]> {
         let value: Value = serde_json::from_slice(bytes)?;
         let entries = value
@@ -116,6 +123,7 @@ impl Placement {
         })
     }
 
+    /// Render configured CPU IDs for affinity commands.
     pub fn cpu_list(&self) -> Option<String> {
         self.cpus.as_ref().map(|cpus| {
             cpus.iter()
@@ -190,10 +198,11 @@ fn execution_thread(path: &Path, tid: u32, scheduler_wait: bool) -> BenchResult<
         // A task can exit after read_dir, or between proc reads and affinity.
         // Process CPU counters still include that task's completed work.
         Err(error)
-            if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-                || error.downcast_ref::<rustix::io::Errno>() == Some(&rustix::io::Errno::SRCH) =>
+            if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                error.kind() == std::io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ESRCH)
+            }) || error.downcast_ref::<rustix::io::Errno>()
+                == Some(&rustix::io::Errno::SRCH) =>
         {
             Ok(None)
         }
@@ -201,6 +210,7 @@ fn execution_thread(path: &Path, tid: u32, scheduler_wait: bool) -> BenchResult<
     }
 }
 
+/// Capture filesystem, mount, and device evidence for the storage parent.
 pub fn storage(parent: &Path) -> BenchResult<Value> {
     use std::os::unix::fs::MetadataExt;
     let path = std::fs::canonicalize(parent)?;

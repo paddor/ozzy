@@ -7,7 +7,7 @@ use crate::replica_journal::{
     commands::read_fault,
     producer::{self, Assignment, Plan},
 };
-use ozzy_journal::operation::{OperationBody, decode_operation_body};
+use ozzy_journal::operation::{OperationBody, OperationKind, decode_operation_body};
 use ozzy_journal_segment::{DecodedBatches, JournalIndexError};
 use ozzy_replication::{Prefix, driver::ValidationTicket};
 
@@ -19,10 +19,44 @@ enum Prepared {
     Retry(Prefix),
 }
 
-// Bound retry scratch while amortizing authoritative operation reads/decoding.
-const RETRY_READ_RECORDS: usize = 32;
+// A protocol APPEND is one canonical operation. Read all its records together
+// so a cold retry does not reread and decode that operation for each small
+// verification chunk. ReadLimits still bounds the returned payload bytes.
+const RETRY_READ_RECORDS: usize = 2048;
 
 impl OwnedJournal {
+    /// Cold retries and control identities may read files while holding the
+    /// journal owner. Let earlier writes finish before starting that read.
+    pub(in crate::replica_journal) fn validation_may_read(&self, buffer: &AppendBuffer) -> bool {
+        if !buffer.is_producer() {
+            return buffer.producer_session.is_some()
+                || buffer.operations().any(|operation| {
+                    operation.kind != OperationKind::Append
+                        && decode_operation_body(
+                            operation.kind,
+                            operation.body,
+                            self.limits.operations,
+                        )
+                        .map_or(true, |body| body.operation_id().is_some())
+                });
+        }
+        let Ok(images) = self.images() else {
+            return true;
+        };
+        (0..buffer.len()).any(|index| {
+            !matches!(
+                producer::plan(
+                    images.speculative(),
+                    buffer,
+                    index,
+                    self.buffer_generation,
+                    self.limits.operations,
+                ),
+                Ok(Plan::Fresh(_))
+            )
+        })
+    }
+
     /// Lease a body-only request arena from this owner's existing bounded pool.
     pub fn lease_proposal_buffer(
         &self,
@@ -206,22 +240,34 @@ impl OwnedJournal {
                 index += 1;
                 continue;
             }
-            if snapshot.is_none() {
-                snapshot = Some(self.journal.retry_snapshot(self.recovery.index).await?);
-            }
             let offsets = self.cold_retry_offsets(&retry, index, &mut decoded)?;
-            let records = snapshot
+            let limits = ozzy_journal::ReadLimits {
+                max_records: RETRY_READ_RECORDS,
+                max_bytes: self.limits.operations.max_payload_bytes,
+            };
+            let recent = self
+                .reader
                 .as_ref()
-                .expect("retry snapshot")
+                .ok_or(JournalError::AppendMismatch)?
                 .read_offsets_with_positions(
+                    self.journal.readable()?,
                     retry.batch.partition,
                     &offsets,
-                    ozzy_journal::ReadLimits {
-                        max_records: RETRY_READ_RECORDS,
-                        max_bytes: self.limits.operations.max_payload_bytes,
-                    },
+                    limits,
                 )
                 .await?;
+            let records = if let Some(records) = recent {
+                records
+            } else {
+                if snapshot.is_none() {
+                    snapshot = Some(self.journal.retry_snapshot(self.recovery.index).await?);
+                }
+                snapshot
+                    .as_ref()
+                    .expect("retry snapshot")
+                    .read_offsets_with_positions(retry.batch.partition, &offsets, limits)
+                    .await?
+            };
             if records.is_empty() {
                 return Err(JournalIndexError::MissingOffset(offset).into());
             }

@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use super::{Receiver, RecvError, Sender, TryRecvError, TrySendError};
+use super::{Receiver, Sender, TryRecvError, TrySendError};
 use crate::signal::{CloseSignal, DataSignal, StateSignal};
 
 #[derive(Debug, Default)]
@@ -93,22 +93,12 @@ impl<T> Drop for NotifiedSender<T> {
 }
 
 impl<T> NotifiedReceiver<T> {
-    pub(crate) fn owned_ready(&self) -> impl std::future::Future<Output = ()> + use<T> {
-        let signals = self.signals.clone();
-        async move {
-            tokio::select! {
-                () = signals.data.ready() => {},
-                () = signals.closed.closed() => {},
-            }
-        }
-    }
-
-    /// Wait without blocking the executor hosting this receiver.
-    pub(crate) async fn recv_async(&mut self) -> Result<T, RecvError> {
+    #[cfg(test)]
+    async fn recv_async(&mut self) -> Result<T, super::RecvError> {
         loop {
             match self.try_recv() {
                 Ok(value) => return Ok(value),
-                Err(TryRecvError::Disconnected) => return Err(RecvError),
+                Err(TryRecvError::Disconnected) => return Err(super::RecvError),
                 Err(TryRecvError::Empty) => self.ready().await,
             }
         }
@@ -212,16 +202,6 @@ mod tests {
             first.send(5).await,
             Err(TrySendError::Disconnected(5))
         ));
-    }
-
-    #[tokio::test]
-    async fn owned_readiness_observes_receiver_closure_with_live_sender() {
-        let (sender, receiver) = notified_channel::<u8>(1);
-        let mut ready = Box::pin(receiver.owned_ready());
-        assert!(futures::poll!(ready.as_mut()).is_pending());
-        drop(receiver);
-        bounded(ready).await;
-        assert!(sender.is_disconnected());
     }
 
     #[derive(Default)]

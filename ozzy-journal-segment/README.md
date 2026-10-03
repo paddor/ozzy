@@ -14,6 +14,6 @@ explicit durable or buffered policy. A writer reply follows the configured
 confirmation boundary, never a transport receipt.
 
 `GroupDirectory` and `SegmentWriter` remain for offline volume and
-relocation work, broker startup preflight, and older segment tests. They are
+relocation work and older segment tests. Broker startup uses async backends. They are
 not a second broker execution path. The old blocking store wrapper, detached
 sealed-read cache, and packed-output buffer have been removed.

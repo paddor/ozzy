@@ -4,8 +4,8 @@ mod validation;
 pub use validation::Validation;
 
 use super::{
-    HistoryChunk, HistoryError as Error, HistoryState, LoadedSegment, Source, before,
-    largest_captured_prefix, reserve_buffers, validate_segment_capacities,
+    HistoryChunk, HistoryError as Error, HistoryState, Source, before, largest_captured_prefix,
+    reserve_buffers, validate_segment_capacities,
 };
 use crate::{
     AsyncJournalLimits, Digest, GroupIdentity, LogPosition, Manifest, SealedSegment,
@@ -147,6 +147,7 @@ impl History {
         })
     }
 
+    /// Exact group, node, volume, store, and store-generation binding.
     pub const fn identity(&self) -> GroupIdentity {
         self.state.identity()
     }
@@ -170,12 +171,85 @@ impl History {
             max_segment_bytes: self.state.bytes.capacity(),
         }
     }
+
+    /// Reuse an already checked physical prefix when a fresh live capture only
+    /// extends the same segment. The next read checks every new group and the
+    /// new captured seal before exposing any suffix operation.
+    pub fn reuse_checked_prefix(&mut self, previous: &mut Self) -> Result<bool, Error> {
+        let Some(loaded) = previous.state.loaded.as_ref() else {
+            return Ok(false);
+        };
+        let index = loaded.index;
+        let Some(&old) = previous.state.pin.references.get(index) else {
+            return Ok(false);
+        };
+        let Some(&new) = self.state.pin.references.get(index) else {
+            return Ok(false);
+        };
+        if self.state.identity != previous.state.identity
+            || self.state.generation != previous.state.generation
+            || self.state.configuration_epoch != previous.state.configuration_epoch
+            || self.state.promised_view != previous.state.promised_view
+            || self.state.decode != previous.state.decode
+            || self.state.operations != previous.state.operations
+            || (
+                old.segment_id,
+                old.file_generation,
+                old.first_group_number,
+                old.first_chain,
+                old.capacity,
+            ) != (
+                new.segment_id,
+                new.file_generation,
+                new.first_group_number,
+                new.first_chain,
+                new.capacity,
+            )
+            || loaded.valid_bytes != previous.state.bytes.len() as u64
+            || loaded.digest.finish() != previous.state.seal(index).digest
+            || loaded.valid_bytes > self.state.seal(index).valid_bytes
+            || previous.state.through.op_number > self.state.through.op_number
+            || (previous.state.through.op_number == self.state.through.op_number
+                && previous.state.through != self.state.through)
+            || (loaded.valid_bytes == self.state.seal(index).valid_bytes
+                && loaded.digest.finish() != self.state.seal(index).digest)
+        {
+            return Ok(false);
+        }
+        let target =
+            usize::try_from(self.state.seal(index).valid_bytes).map_err(|_| Error::Capacity)?;
+        let capacity = usize::try_from(new.capacity).map_err(|_| Error::Capacity)?;
+        let extra = (capacity - target).min(16 * 1024 * 1024);
+        previous
+            .state
+            .bytes
+            .try_reserve_exact(target + extra - previous.state.bytes.len())
+            .map_err(|_| Error::Capacity)?;
+        previous
+            .state
+            .entries
+            .try_reserve(
+                256.min(
+                    self.state
+                        .entry_limit
+                        .saturating_sub(previous.state.entries.len()),
+                ),
+            )
+            .map_err(|_| Error::Capacity)?;
+        self.state.bytes = std::mem::take(&mut previous.state.bytes);
+        self.state.entries = std::mem::take(&mut previous.state.entries);
+        self.state.loaded = previous.state.loaded.take();
+        Ok(true)
+    }
+    /// Journal-owner generation fencing these captured bytes or completions.
     pub const fn generation(&self) -> JournalGeneration {
         self.state.generation()
     }
+    /// Exact upper canonical operation prefix visible through this capture.
     pub const fn through(&self) -> LogPosition {
         self.state.through()
     }
+    /// Exact canonical prefix immediately before captured history.
     pub fn predecessor(&self) -> LogPosition {
         self.state.predecessor()
     }
@@ -214,12 +288,58 @@ impl History {
     }
 
     async fn load(&mut self, at: usize) -> Result<(), Error> {
-        if self
-            .state
-            .loaded
-            .as_ref()
-            .is_some_and(|loaded| loaded.index == at)
+        if let Some(loaded) = self.state.loaded.as_ref()
+            && loaded.index == at
         {
+            let start = usize::try_from(loaded.valid_bytes).map_err(|_| Error::Capacity)?;
+            let seal = self.state.seal(at);
+            if loaded.valid_bytes == seal.valid_bytes {
+                let expected = self
+                    .state
+                    .pin
+                    .references
+                    .get(at + 1)
+                    .map_or(self.state.physical_through, |next| before(next.first_chain));
+                return if loaded.digest.finish() == seal.digest
+                    && before(loaded.next_chain) == expected
+                {
+                    Ok(())
+                } else {
+                    Err(Error::Source)
+                };
+            }
+            let length = usize::try_from(seal.valid_bytes).map_err(|_| Error::Capacity)?;
+            let reference = self.state.pin.references[at];
+            if start > length || seal.valid_bytes > reference.capacity {
+                return Err(Error::Source);
+            }
+            self.state.bytes.truncate(start);
+            let file = self
+                .access
+                .open(self.state.pin.path(at), OpenMode::Read, false, false)
+                .await?;
+            let actual = self.access.length(&file).await?;
+            if actual < seal.valid_bytes || actual > reference.capacity {
+                return Err(Error::Source);
+            }
+            let read = self
+                .access
+                .read_append(
+                    &file,
+                    start as u64,
+                    length - start,
+                    self.chunk,
+                    &mut self.state.bytes,
+                )
+                .await;
+            self.access.done(Operation::Close { handle: file }).await?;
+            read?;
+            if let Err(error) = self.state.extend_loaded(at) {
+                self.state.loaded = None;
+                self.state.entries.clear();
+                self.state.bytes.clear();
+                return Err(error);
+            }
             return Ok(());
         }
         self.state.loaded = None;
@@ -246,10 +366,7 @@ impl History {
         let mut entries = std::mem::take(&mut self.state.entries);
         let result = self.state.index_segment(at, &mut entries);
         self.state.entries = entries;
-        self.state.loaded = Some(LoadedSegment {
-            index: at,
-            header: result?,
-        });
+        self.state.loaded = Some(result?);
         Ok(())
     }
 }

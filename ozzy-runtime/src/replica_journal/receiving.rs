@@ -1,6 +1,6 @@
 //! Recovery-only ownership of a marker-backed replacement journal.
 
-mod driver;
+pub(super) mod driver;
 pub use driver::{RecoveryStorage, ShardRecoveringJournal};
 
 use super::{AppendBuffer, InstallationConfig, JournalError, completion};

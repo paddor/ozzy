@@ -1,6 +1,6 @@
 //! Recovery ownership used by both legacy and shard-local protocol actors.
 
-mod local;
+pub(in crate::replica_journal) mod local;
 pub use local::ShardRecoveringJournal;
 
 use super::{
@@ -8,8 +8,8 @@ use super::{
     ReceivedChunk, Recovery, RecoveryPlan, RecoveryStartup, RecoveryTicket,
 };
 use crate::replica_journal::{
-    JournalCompletion, JournalExecution, JournalStartup, OwnedRecoveryGenerations, Rejected,
-    ReplicaJournal, SubmitError,
+    JournalCompletion, JournalStartup, OwnedRecoveryGenerations, Rejected, ReplicaJournal,
+    SubmitError,
 };
 use std::{
     future::Future,
@@ -20,7 +20,6 @@ use std::{
 /// a normal journal, and that journal still requires election/activation.
 pub trait RecoveryStorage: std::fmt::Debug + Sized {
     /// Execution placement retained when recovery reopens for election.
-    type Normal: JournalExecution;
     /// Lease a bounded transfer arena from this exact incarnation.
     fn lease_append_buffer(&self) -> Result<AppendBuffer, SubmitError>;
     /// Queue one authorized transfer attempt.
@@ -67,5 +66,5 @@ pub trait RecoveryStorage: std::fmt::Debug + Sized {
         publication: PublishedRecovery,
         abandoned: bool,
         generation: JournalGeneration,
-    ) -> impl Future<Output = Result<(ReplicaJournal<Self::Normal>, JournalStartup), JournalError>>;
+    ) -> impl Future<Output = Result<(ReplicaJournal, JournalStartup), JournalError>>;
 }

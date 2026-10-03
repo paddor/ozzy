@@ -21,6 +21,7 @@ pub struct Index {
 }
 
 impl Index {
+    /// Bind an exact captured journal index to a bounded in-memory identity overlay.
     pub fn new(
         snapshot: AsyncJournalIndexSnapshot,
         overlay_capacity: usize,
@@ -34,9 +35,11 @@ impl Index {
         }
     }
 
+    /// Borrow the exact captured journal-index source.
     pub fn snapshot(&self) -> &AsyncJournalIndexSnapshot {
         &self.snapshot
     }
+    /// Borrow bounded identity claims not yet represented by the captured disk index.
     pub const fn overlay(&self) -> &MemoryIdentityIndex {
         &self.overlay
     }
@@ -136,9 +139,12 @@ impl IdentityIndex for Index {
 }
 
 #[derive(Debug, Error)]
+/// Persistent identity resolution or bounded overlay reservation failed.
 pub enum ResolveError {
     #[error(transparent)]
+    /// Exact identity lookup or overlay reservation failed.
     Lookup(#[from] JournalIndexError),
     #[error(transparent)]
+    /// Exact operation-identity lookup or reservation failed.
     Identity(#[from] IdentityIndexError),
 }

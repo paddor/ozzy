@@ -30,12 +30,7 @@ fn reader_control_uses_same_partition_mapping_without_writer_data_credit() {
     let target = placement(0, 7);
     let table = RoutingTable::new(&[7], &[target], 1, EnvelopeLimits::default()).unwrap();
     let binding = binding(Kind::Client);
-    for opcode in [
-        Opcode::Subscribe,
-        Opcode::Credit,
-        Opcode::Ack,
-        Opcode::Unsubscribe,
-    ] {
+    for opcode in [Opcode::Subscribe, Opcode::Ack, Opcode::Unsubscribe] {
         let destination = table
             .route(&reader(target, binding, opcode), binding)
             .unwrap();

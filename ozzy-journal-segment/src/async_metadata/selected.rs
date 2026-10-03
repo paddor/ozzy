@@ -13,18 +13,18 @@ use std::io;
 /// Exactly the metadata selected by CURRENT, with identity/digests checked.
 /// This is not a recovered journal or proof that its referenced history exists.
 #[derive(Debug)]
-pub struct Selected {
-    pub current: CurrentReference,
-    pub manifest: Manifest,
-    pub configuration: Option<Vec<u8>>,
-    pub protected: LogPosition,
+pub(crate) struct Selected {
+    pub(crate) current: CurrentReference,
+    pub(crate) manifest: Manifest,
+    pub(crate) configuration: Option<Vec<u8>>,
+    pub(crate) protected: LogPosition,
 }
 
 impl Directory {
     /// Load the selected generation, never fall back to an older manifest or
     /// manufacture absent configuration. Expected configuration is resynchronized
     /// before success, matching the existing intact-store admission boundary.
-    pub async fn read_selected(
+    pub(crate) async fn read_selected(
         &mut self,
         expected: GroupIdentity,
         limits: MetadataLimits,

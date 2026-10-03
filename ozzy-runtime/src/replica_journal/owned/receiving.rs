@@ -61,7 +61,7 @@ pub struct RecoveringJournal {
     attempt: Option<RecoveryTicket>,
     published: Option<PublishedRecovery>,
     buffers: Arc<Semaphore>,
-    pub(in crate::replica_journal) append_memory: Option<crate::memory::AllocationSource>,
+    pub(in crate::replica_journal) append_memory: Option<crate::memory::Owner>,
     append_leased: std::cell::Cell<bool>,
     faulted: bool,
 }
@@ -246,7 +246,7 @@ impl RecoveringJournal {
             permit,
             self.append_memory
                 .as_ref()
-                .map(crate::memory::AllocationSource::allocator),
+                .map(crate::memory::Owner::allocator),
         ))
     }
 
@@ -255,22 +255,12 @@ impl RecoveringJournal {
         &mut self,
         memory: &crate::memory::Owner,
     ) -> Result<(), JournalError> {
-        self.bind_append_source(crate::memory::AllocationSource::Shared(memory.clone()))
-    }
-
-    /// Use only allocation capacity explicitly reserved by the shared shard
-    /// owner. The allowance survives recovery and is initially permitted to be
-    /// empty. Reserve enough physical allocations before advertising intake.
-    pub fn bind_append_capacity(
-        &mut self,
-        capacity: &crate::memory::Capacity,
-    ) -> Result<(), JournalError> {
-        self.bind_append_source(crate::memory::AllocationSource::Reserved(capacity.clone()))
+        self.bind_append_source(memory.clone())
     }
 
     pub(in crate::replica_journal) fn bind_append_source(
         &mut self,
-        memory: crate::memory::AllocationSource,
+        memory: crate::memory::Owner,
     ) -> Result<(), JournalError> {
         if self.append_memory.is_some() || self.append_leased.get() {
             return Err(JournalError::Configuration);

@@ -9,7 +9,7 @@ use ozzy_proto::{CheckpointId, Offset, PartitionIncarnation};
 use thiserror::Error;
 
 use crate::store_lock::StoreLock;
-use crate::{CheckpointImage, CheckpointLimits, SegmentReference, SegmentScan};
+use crate::{SegmentReference, SegmentScan};
 
 /// Exact committed earliest-retained offset per partition.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +18,7 @@ pub struct RetentionFloors {
 }
 
 impl RetentionFloors {
+    /// Validate and sort unique partition-incarnation retention floors.
     pub fn new(mut entries: Vec<(PartitionIncarnation, Offset)>) -> Result<Self, RetentionError> {
         if entries
             .iter()
@@ -32,6 +33,7 @@ impl RetentionFloors {
         Ok(Self { entries })
     }
 
+    /// Look up the declared retention floor for an exact partition incarnation.
     pub fn get(&self, partition: PartitionIncarnation) -> Option<Offset> {
         self.entries
             .binary_search_by(|(key, _)| key.as_bytes().cmp(partition.as_bytes()))
@@ -39,14 +41,17 @@ impl RetentionFloors {
             .map(|index| self.entries[index].1)
     }
 
+    /// Iterate validated partition retention floors in sorted order.
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (PartitionIncarnation, Offset)> + '_ {
         self.entries.iter().copied()
     }
 
+    /// Number of partition retention floors.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    /// Whether no partition retention floors remain.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -71,6 +76,7 @@ pub struct RetentionResult {
     pub unreferenced_segment_ids: Vec<u64>,
     /// Unreferenced segments physically deleted during this call.
     pub removed_segment_ids: Vec<u64>,
+    /// Logical file bytes removed, excluding allocation overhead.
     pub reclaimed_bytes: u64,
     /// First otherwise-eligible segment held by a live reader/transfer.
     pub blocked_by_pin: Option<u64>,
@@ -80,40 +86,55 @@ pub struct RetentionResult {
 /// indivisible; a budget smaller than the oldest eligible segment refuses work.
 #[derive(Debug, Clone, Copy)]
 pub struct RetentionScanBudget {
+    /// Maximum selected or scanned physical segments.
     pub max_segments: usize,
+    /// Maximum physical bytes read in this maintenance step.
     pub max_read_bytes: usize,
+    /// Cooperative elapsed-time bound between complete decoding or scan units.
     pub max_work: std::time::Duration,
 }
 
 /// Manifest publication only. Incremental orphan cleanup performs deletion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetiredPrefix {
+    /// Retired segment IDs removed from the selected manifest.
     pub unreferenced_segment_ids: Vec<u64>,
+    /// Physical segments checked against canonical retention floors.
     pub scanned_segments: usize,
+    /// Physical segment bytes visited by this bounded scan.
     pub scanned_bytes: usize,
 }
 
 /// Result of deleting segment generations absent from the selected manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnreferencedSegmentCleanup {
+    /// Physical segment IDs removed after their derived indexes were synchronized.
     pub removed_segment_ids: Vec<u64>,
+    /// Unselected segment IDs retained by live deletion protection.
     pub pinned_segment_ids: Vec<u64>,
+    /// Logical file bytes removed, excluding allocation overhead.
     pub reclaimed_bytes: u64,
 }
 
 /// Result of deleting checkpoint directories absent from the selected manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnreferencedCheckpointCleanup {
+    /// Unselected checkpoint directories removed in this turn.
     pub removed_checkpoint_ids: Vec<CheckpointId>,
+    /// Unselected checkpoint IDs retained by live build or read protection.
     pub pinned_checkpoint_ids: Vec<CheckpointId>,
+    /// Logical file bytes removed, excluding allocation overhead.
     pub reclaimed_bytes: u64,
 }
 
 /// Result of deleting manifest generations outside the protected recovery sources.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnreferencedMetadataCleanup {
+    /// Unselected and unprotected manifest generations removed.
     pub removed_manifest_generations: Vec<u64>,
+    /// Recognized unselected temporary metadata files removed.
     pub removed_temporary_files: Vec<String>,
+    /// Logical file bytes removed, excluding allocation overhead.
     pub reclaimed_bytes: u64,
 }
 
@@ -127,10 +148,12 @@ pub struct SegmentPin {
 }
 
 impl SegmentPin {
+    /// Exact protected segment references in caller selection order.
     pub fn references(&self) -> &[SegmentReference] {
         &self.references
     }
 
+    /// Resolve a captured physical segment ID to its exact path.
     pub fn segment_path(&self, segment_id: u64) -> Option<PathBuf> {
         self.references
             .iter()
@@ -142,23 +165,6 @@ impl SegmentPin {
 impl Drop for SegmentPin {
     fn drop(&mut self) {
         self.registry.release(&self.references);
-    }
-}
-
-/// Validated selected checkpoint protected from physical cleanup.
-#[derive(Debug)]
-pub struct CheckpointPin {
-    image: CheckpointImage,
-    limits: CheckpointLimits,
-}
-
-impl CheckpointPin {
-    pub const fn image(&self) -> &CheckpointImage {
-        &self.image
-    }
-
-    pub fn read_state(&self) -> Result<Vec<u8>, crate::CheckpointError> {
-        self.image.read_state(self.limits)
     }
 }
 
@@ -260,21 +266,6 @@ impl PinRegistry {
         Ok(ordinary)
     }
 
-    pub(crate) fn acquire_checkpoint(
-        self: &Arc<Self>,
-        mut image: CheckpointImage,
-        limits: CheckpointLimits,
-        group_lock: Arc<StoreLock>,
-    ) -> Result<CheckpointPin, RetentionError> {
-        let checkpoint_id = image.manifest().checkpoint_id;
-        image.attach_lease(self.acquire_checkpoint_lease(
-            checkpoint_id,
-            image.manifest().source_manifest_generation,
-            group_lock,
-        )?);
-        Ok(CheckpointPin { image, limits })
-    }
-
     pub(crate) fn acquire_checkpoint_lease<L>(
         self: &Arc<Self>,
         checkpoint_id: CheckpointId,
@@ -321,22 +312,6 @@ impl PinRegistry {
             .map_err(|_| RetentionError::Poisoned)?
             .get(&generation)
             .is_some_and(|count| *count != 0))
-    }
-
-    pub(crate) fn any_pinned(&self) -> Result<bool, RetentionError> {
-        let segments = self
-            .segments
-            .lock()
-            .map_err(|_| RetentionError::Poisoned)?
-            .values()
-            .any(|count| *count != 0);
-        let checkpoints = self
-            .checkpoints
-            .lock()
-            .map_err(|_| RetentionError::Poisoned)?
-            .values()
-            .any(|count| *count != 0);
-        Ok(segments || checkpoints)
     }
 
     fn release(&self, references: &[SegmentReference]) {
@@ -424,19 +399,27 @@ pub(crate) fn segments_root(root: &Path) -> PathBuf {
 #[derive(Debug, Error)]
 pub enum RetentionError {
     #[error(transparent)]
+    /// Canonical operation-body validation failed.
     Operation(#[from] ozzy_journal::operation::OperationCodecError),
     #[error("retention floor contains a zero partition identity")]
+    /// Retention floor contains a zero partition identity.
     ZeroPartition,
     #[error("retention floor contains a duplicate partition")]
+    /// Retention floor contains a duplicate partition.
     DuplicatePartition,
     #[error("segment pin request contains a duplicate segment")]
+    /// Segment pin request contains a duplicate segment.
     DuplicateSegment,
     #[error("segment pin set is empty")]
+    /// Segment pin set is empty.
     EmptyPin,
     #[error("segment pin count overflow")]
+    /// Segment pin count overflow.
     PinOverflow,
     #[error("segment pin registry is poisoned")]
+    /// Segment pin registry is poisoned.
     Poisoned,
     #[error("retention integer or length overflow")]
+    /// Integer or byte-count arithmetic overflows the supported range.
     LengthOverflow,
 }

@@ -149,6 +149,7 @@ impl<'a> AppendRecordList<'a> {
         Ok(())
     }
 
+    /// Number of logical records in this list.
     pub fn len(&self) -> usize {
         match &self.0 {
             Storage::Described(records) => records.len(),
@@ -157,6 +158,7 @@ impl<'a> AppendRecordList<'a> {
         }
     }
 
+    /// Whether the logical record list is empty.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -178,6 +180,7 @@ impl<'a> AppendRecordList<'a> {
         }
     }
 
+    /// Iterate borrowed records without materializing a new descriptor table.
     pub fn iter(&self) -> RecordIter<'_, 'a> {
         match &self.0 {
             Storage::Batches { slices, len } => RecordIter {
@@ -202,6 +205,7 @@ impl<'a> AppendRecordList<'a> {
         }
     }
 
+    /// Borrow the record at this zero-based list position.
     pub fn get(&self, mut index: usize) -> Option<RecordRef<'_>> {
         match &self.0 {
             Storage::Batches { slices, .. } => {
@@ -274,7 +278,9 @@ impl<'a, 'data> IntoIterator for &'a AppendRecordList<'data> {
 pub struct RecordRef<'a> {
     /// Payload representation, preserved through persistence and replay.
     pub encoding: ozzy_proto::data::Encoding,
+    /// Application record identity preserved through retry and replay.
     pub message_id: MessageId,
+    /// Opaque payload parts in record order.
     pub parts: RecordParts<'a>,
 }
 
@@ -313,13 +319,18 @@ impl<'a> RecordRef<'a> {
 /// Borrowed multipart descriptors; no allocation even for many parts.
 #[derive(Debug, Clone, Copy)]
 pub enum RecordParts<'a> {
+    /// Borrowed slices from an explicitly described record.
     Described(&'a [&'a [u8]]),
+    /// Borrowed views of reference-counted owned payload parts.
     Owned(&'a [Bytes]),
+    /// One contiguous payload part.
     Single(&'a [u8]),
+    /// Multipart views decoded lazily from a validated wire descriptor.
     Encoded(ozzy_proto::data::EncodedParts<'a>),
 }
 
 impl<'a> RecordParts<'a> {
+    /// Number of logical parts in this payload view.
     pub fn len(self) -> usize {
         match self {
             Self::Described(parts) => parts.len(),
@@ -329,10 +340,12 @@ impl<'a> RecordParts<'a> {
         }
     }
 
+    /// Whether this payload view has no parts.
     pub fn is_empty(self) -> bool {
         self.len() == 0
     }
 
+    /// Iterate borrowed payload parts in record order.
     pub fn iter(self) -> impl ExactSizeIterator<Item = &'a [u8]> + Clone {
         match self {
             Self::Described(p) => PartIter::Described(p.iter()),

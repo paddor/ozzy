@@ -1,4 +1,4 @@
-//! One SDK PEER link per configured broker, shared by topic and writer control.
+//! Two SDK PEER sockets across all brokers: control/replies and data/replay.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -38,6 +38,8 @@ pub struct BrokerAddress {
     pub node: NodeId,
     /// Shared native PEER endpoint.
     pub endpoint: Endpoint,
+    /// Independent APPEND and replay data endpoint.
+    pub data_endpoint: Endpoint,
 }
 
 /// Fixed shared-link and control-resource bounds for one SDK owner.
@@ -89,7 +91,7 @@ impl BrokerLinksConfig {
 
 #[derive(Debug)]
 struct Peer {
-    socket: Arc<IdentitySocket>,
+    data: Arc<IdentitySocket>,
     sender: mpsc::Sender<driver::Command>,
     slots: Arc<Semaphore>,
     closed: CloseSignal,
@@ -147,6 +149,10 @@ impl BrokerLinks {
     }
 
     /// Inject distinct startup namespaces for link fences and request IDs.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "initialize both sockets and unwind partial owners together"
+    )]
     pub async fn connect_with_ids(
         runtime: &WriterRuntime,
         mut config: BrokerLinksConfig,
@@ -186,34 +192,39 @@ impl BrokerLinks {
                 let message_bytes =
                     crate::transport::message_size_limit(config.parameters.receive.envelope)
                         .ok_or(BrokerLinkError::Configuration)?;
+                let hwm = slots + config.append.map_or(0, |limits| limits.requests) + 4;
+                let options = crate::transport::socket_options()
+                    .identity(Bytes::copy_from_slice(config.local.as_bytes()))
+                    .router_mandatory(true)
+                    .send_hwm(hwm as u32)
+                    .recv_hwm(hwm as u32)
+                    .max_message_size(message_bytes)
+                    .linger(Duration::from_millis(5));
+                let socket = Arc::new(
+                    sdk.context()
+                        .socket(SocketType::Peer, options.clone())
+                        .identity_routing()?,
+                );
+                let data = Arc::new(
+                    sdk.context()
+                        .socket(SocketType::Peer, options)
+                        .identity_routing()?,
+                );
+                let monitor = socket.monitor();
                 for (index, address) in config.brokers.iter().enumerate() {
                     let count = slots / config.brokers.len()
                         + usize::from(index < slots % config.brokers.len());
-                    let hwm = count + config.append.map_or(0, |limits| limits.requests) + 4;
-                    let options = crate::transport::socket_options()
-                        .identity(Bytes::copy_from_slice(config.local.as_bytes()))
-                        .router_mandatory(true)
-                        .send_hwm(hwm as u32)
-                        .recv_hwm(hwm as u32)
-                        .max_message_size(message_bytes)
-                        .linger(Duration::from_millis(5));
-                    let socket = Arc::new(
-                        sdk.context()
-                            .socket(SocketType::Peer, options)
-                            .identity_routing()?,
-                    );
-                    let monitor = socket.monitor();
                     socket.connect(address.endpoint.clone()).await?;
+                    data.connect(address.data_endpoint.clone()).await?;
                     let (sender, input) = mpsc::channel(count);
                     let peer = Arc::new(Peer {
-                        socket: socket.clone(),
+                        data: data.clone(),
                         sender,
                         slots: Arc::new(Semaphore::new(count)),
                         closed: CloseSignal::default(),
                     });
-                    drivers.push(driver::Driver::new(
-                        socket,
-                        monitor,
+                    drivers.push(driver::LinkState::new(
+                        socket.clone(),
                         input,
                         peer.clone(),
                         shared.clone(),
@@ -232,6 +243,7 @@ impl BrokerLinks {
                         publication_drivers.push(driver);
                     }
                 }
+                let driver = driver::Driver::new(socket, data, monitor, drivers, shared.clone());
                 let links = Self(Arc::new(Inner {
                     config,
                     peers,
@@ -239,9 +251,7 @@ impl BrokerLinks {
                     shared,
                     runtime: sdk,
                 }));
-                for driver in drivers {
-                    tokio::spawn(driver.run());
-                }
+                tokio::spawn(driver.run());
                 for driver in publication_drivers {
                     tokio::spawn(driver.run());
                 }
@@ -253,10 +263,10 @@ impl BrokerLinks {
 
     /// Fixed physical socket count, independent of topics or partition count.
     pub fn socket_count(&self) -> usize {
-        self.0.peers.len() + self.0.publications.len()
+        2 + self.0.publications.len()
     }
 
-    /// Delay before a request refused for credit is sent again.
+    /// Delay before a refused request is sent again.
     pub(in crate::replicated) fn retry_interval(&self) -> Duration {
         self.0.config.retry_interval
     }
@@ -475,6 +485,7 @@ impl BrokerLinks {
                     reply,
                 })
                 .map_err(|_| self.closed_error())?;
+            self.0.shared.changed.notify_changed();
             observer
                 .received
                 .as_mut()
@@ -561,6 +572,11 @@ fn validate(config: &BrokerLinksConfig) -> Result<usize, BrokerLinkError> {
                 || !unique.insert(broker.node)
                 || !matches!(
                     broker.endpoint,
+                    Endpoint::Tcp { .. } | Endpoint::Ipc(_) | Endpoint::Inproc { .. }
+                )
+                || broker.data_endpoint == broker.endpoint
+                || !matches!(
+                    broker.data_endpoint,
                     Endpoint::Tcp { .. } | Endpoint::Ipc(_) | Endpoint::Inproc { .. }
                 )
         })

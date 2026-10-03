@@ -4,7 +4,7 @@
 use super::super::pacing::{self, Plan};
 use super::{
     Config, Counts, GroupId, PendingRecord, ReceiptCheck, RecordInput, Result, VecDeque, Window,
-    Writer, metrics, record_input, validate_receipt,
+    Writer, metrics, record_input, turn_records, validate_receipt,
 };
 
 struct Pending {
@@ -29,6 +29,7 @@ pub(super) async fn produce(
     let mut check = writer.receipt_check();
     let mut pending = VecDeque::with_capacity(config.args.request_records);
     let mut scratch = Vec::with_capacity(RecordInput::INLINE_BYTES);
+    let turn_records = turn_records(config);
     // An overloaded ramp lowers the limit to the arrivals of earlier stages.
     let mut limit = plan.total();
     while *sequence < limit {
@@ -78,6 +79,9 @@ pub(super) async fn produce(
             due,
         });
         *sequence += 1;
+        if sequence.is_multiple_of(turn_records) {
+            tokio::task::yield_now().await;
+        }
         if limit == plan.total()
             && let Some(stage) = plan.check_backlog(*sequence, metrics::monotonic_ns())?
         {
@@ -100,10 +104,22 @@ async fn observe_front(
     check: &mut ReceiptCheck,
 ) -> Result<()> {
     let first = pending.front().expect("nonempty confirmation queue");
-    let receipt = first.record.confirmed().await?;
+    let mut receipt = Some(first.record.confirmed().await);
     let finished = metrics::monotonic_ns();
-    validate_receipt(&receipt, first.sequence, config, group, lane, check)?;
-    counts.scheduled_complete(first.due, first.start, finished)?;
-    pending.pop_front();
+    // One APPEND confirms many records together. Read the clock once and use
+    // ready receipts directly, as in saturation, instead of selecting per record.
+    for _ in 0..turn_records(config) {
+        let Some(confirmed) = receipt else {
+            return Ok(());
+        };
+        let first = pending.front().expect("nonempty confirmation queue");
+        validate_receipt(&confirmed?, first.sequence, config, group, lane, check)?;
+        counts.scheduled_complete(first.due, first.start, finished)?;
+        pending.pop_front();
+        receipt = pending
+            .front()
+            .and_then(|first| first.record.try_confirmed());
+    }
+    tokio::task::yield_now().await;
     Ok(())
 }

@@ -1,41 +1,5 @@
 use super::*;
 
-pub(super) fn grant_writer(
-    input: &mut dispatch::Receiver<Message>,
-    client: &Client,
-    service: &mut Service,
-    keys: &mut BTreeMap<(GroupId, ProducerId), dispatch::GrantKey>,
-    group: GroupId,
-    writer: ProducerId,
-) {
-    if keys.contains_key(&(group, writer)) {
-        return;
-    }
-    let grant = input
-        .credits()
-        .grant(
-            client,
-            Class::Data,
-            Quota {
-                messages: 2,
-                bytes: 8 * 1024,
-            },
-        )
-        .unwrap();
-    let key = grant.key();
-    service
-        .install(
-            link(70, 80).binding.peer,
-            Subject {
-                group,
-                writer: Some(writer),
-            },
-            grant,
-        )
-        .unwrap();
-    keys.insert((group, writer), key);
-}
-
 pub(super) fn incarnation(number: usize) -> PartitionIncarnation {
     if number == 0 {
         partition()
@@ -57,18 +21,31 @@ pub(super) fn budgets(partitions: usize) -> Budgets {
 pub(super) fn service(
     local: NodeId,
     groups: &[GroupId],
-    data: &crate::memory::Owner,
-    control: &crate::memory::Owner,
+    _data: &crate::memory::Owner,
+    _control: &crate::memory::Owner,
     wire: DataLimits,
-) -> (Service, dispatch::Receiver<Message>) {
+) -> (Service, TestInput) {
     let capacity = budgets(groups.len());
-    let (sender, mut receiver) = dispatch::channel(dispatch::Limits {
-        capacity,
-        clients: 2,
-        grants: 2 * groups.len() + 1,
-    })
+    let (data, data_rx) = data_channel(
+        &omq_tokio::Context::new(),
+        7,
+        Kind::Client,
+        Class::Data,
+        16,
+        8192,
+        capacity.data.bytes,
+    )
     .unwrap();
-    receiver.credits().bind_memory(data, control).unwrap();
+    let (control, control_rx) = data_channel(
+        &omq_tokio::Context::new(),
+        7,
+        Kind::Client,
+        Class::Control,
+        16,
+        8192,
+        capacity.control.bytes,
+    )
+    .unwrap();
     let placements = groups
         .iter()
         .enumerate()
@@ -88,10 +65,10 @@ pub(super) fn service(
     let dispatcher = Dispatcher::new(
         local,
         routes,
-        vec![(7, sender)],
+        vec![(7, data), (7, control)],
         DispatcherLimits {
             peers: 2,
-            grants_per_class: 2 * groups.len(),
+
             replies: ReplyLimits {
                 data: queue,
                 control: queue,
@@ -99,7 +76,7 @@ pub(super) fn service(
         },
     )
     .unwrap();
-    let parameters = handshake::Parameters::streaming(wire, handshake::OWNER, 4, 4096).unwrap();
+    let parameters = handshake::Parameters::streaming(wire, handshake::OWNER).unwrap();
     (
         Service::new(
             dispatcher,
@@ -110,7 +87,7 @@ pub(super) fn service(
         .unwrap()
         .with_trusted_clients(2)
         .unwrap(),
-        receiver,
+        TestInput([data_rx, control_rx]),
     )
 }
 

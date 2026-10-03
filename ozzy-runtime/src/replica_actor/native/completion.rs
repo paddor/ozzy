@@ -132,6 +132,9 @@ impl NativeIntake {
         retry: RetryClass,
         hint: AuthorityHint,
     ) -> Result<Message, NativeIntakeError> {
+        if retry == RetryClass::AfterBackoff {
+            crate::profiling::event(crate::profiling::Event::NativeAdmissionRefusal);
+        }
         let detail = if matches!(code, 5 | 12 | 13) {
             Some(hint.encode()?)
         } else {

@@ -14,6 +14,7 @@ pub struct WriteBuffer {
 }
 
 impl WriteBuffer {
+    /// Own one buffer and charge its full allocated capacity.
     pub fn from_vec(bytes: Vec<u8>) -> Self {
         let retained_bytes = bytes.capacity();
         let length = bytes.len();
@@ -44,12 +45,15 @@ impl WriteBuffer {
         })
     }
 
+    /// Ordered payload views for scatter/gather writes.
     pub fn parts(&self) -> &[Bytes] {
         &self.parts
     }
+    /// Total visible bytes across all payload parts.
     pub const fn len(&self) -> usize {
         self.length
     }
+    /// Whether the write contains no visible payload bytes.
     pub const fn is_empty(&self) -> bool {
         self.length == 0
     }
@@ -65,35 +69,52 @@ impl WriteBuffer {
     }
 }
 
+/// Access and creation policy for a file handle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpenMode {
+    /// Open an existing file for reads.
     Read,
+    /// Open an existing file for reads and writes.
     ReadWrite,
+    /// Create a new file, refusing an existing path.
     CreateNew,
 }
 
+/// Physical barrier scope; neither form establishes journal authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncMode {
+    /// Persist file data and metadata needed to retrieve it.
     Data,
+    /// Persist file data and all file metadata.
     All,
 }
 
+/// Backend-neutral directory entry classification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileKind {
+    /// Regular file.
     File,
+    /// Directory.
     Directory,
+    /// Entry with another filesystem type.
     Other,
 }
 
+/// File type and current logical byte length.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Metadata {
+    /// Entry type reported by the backend.
     pub kind: FileKind,
+    /// Logical length in bytes.
     pub length: u64,
 }
 
+/// One owned directory name and its backend-reported type.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Entry {
+    /// Name relative to the listed directory.
     pub name: OsString,
+    /// Entry type reported by the backend.
     pub kind: FileKind,
 }
 
@@ -106,72 +127,119 @@ pub enum Operation {
     /// No nested wrappers; at most 64 handles from this backend. Explicit close requires
     /// settling dependent work first. This does not acquire an OS file lock.
     Protected {
+        /// Physical operation whose additional handle lifetimes are protected.
         operation: Box<Operation>,
+        /// Handles retained until physical execution settles.
         handles: Vec<Handle>,
     },
+    /// Open a file under explicit access, direct-I/O, and write-sync policies.
     Open {
+        /// Backend path to the target entry.
         path: PathBuf,
+        /// Selected access or barrier policy.
         mode: OpenMode,
+        /// Request direct I/O, subject to backend alignment checks.
         direct: bool,
+        /// Request synchronous file-data writes when opening the file.
         data_sync: bool,
     },
+    /// Open a directory handle for metadata barriers.
     OpenDirectory {
+        /// Backend path to the target entry.
         path: PathBuf,
     },
+    /// Read a bounded range; a short result is allowed.
     Read {
+        /// Backend-owned target handle.
         handle: Handle,
+        /// Starting byte offset in the file.
         offset: u64,
+        /// Requested byte count or logical file length.
         length: usize,
     },
+    /// Write owned scatter/gather bytes at an explicit file offset.
     Write {
+        /// Backend-owned target handle.
         handle: Handle,
+        /// Starting byte offset in the file.
         offset: u64,
+        /// Owned payload and full backing-allocation charge.
         data: WriteBuffer,
     },
+    /// Inspect an open handle without reopening its path.
     Metadata {
+        /// Backend-owned target handle.
         handle: Handle,
     },
+    /// Set logical file length; shrinking discards the suffix.
     SetLength {
+        /// Backend-owned target handle.
         handle: Handle,
+        /// Requested byte count or logical file length.
         length: u64,
     },
+    /// Reserve physical space for a file range.
     Allocate {
+        /// Backend-owned target handle.
         handle: Handle,
+        /// Starting byte offset in the file.
         offset: u64,
+        /// Requested byte count or logical file length.
         length: u64,
     },
+    /// Run the selected physical barrier on an open handle.
     Sync {
+        /// Backend-owned target handle.
         handle: Handle,
+        /// Selected access or barrier policy.
         mode: SyncMode,
     },
+    /// Acquire the backend-supported exclusive file lock.
     LockExclusive {
+        /// Backend-owned target handle.
         handle: Handle,
     },
     /// Invalidates every clone. Caller must first settle dependent operations.
     Close {
+        /// Backend-owned target handle.
         handle: Handle,
     },
     /// Refuse oversized listings instead of allocating without a bound.
     ReadDirectory {
+        /// Backend path to the target entry.
         path: PathBuf,
+        /// Maximum entries retained by this listing.
         max_entries: usize,
+        /// Maximum aggregate name storage retained by this listing.
         max_name_bytes: usize,
     },
+    /// Create one directory, refusing an existing entry.
     CreateDirectory {
+        /// Backend path to the target entry.
         path: PathBuf,
     },
+    /// Rename an entry; directory durability requires a separate barrier.
     Rename {
+        /// Existing entry path.
         source: PathBuf,
+        /// New entry path.
         destination: PathBuf,
     },
+    /// Create another name for an existing file.
     HardLink {
+        /// Existing entry path.
         source: PathBuf,
+        /// New entry path.
         destination: PathBuf,
     },
+    /// Remove a file name; existing handles retain their file lifetime.
     RemoveFile {
+        /// Backend path to the target entry.
         path: PathBuf,
     },
+    /// Remove an empty directory.
     RemoveDirectory {
+        /// Backend path to the target entry.
         path: PathBuf,
     },
 }
@@ -251,13 +319,20 @@ fn end_offset(offset: u64, length: u64) -> Option<u64> {
         .filter(|end| i64::try_from(*end).is_ok())
 }
 
+/// Physical operation result; short transfers remain explicit.
 #[derive(Debug)]
 pub enum Outcome {
+    /// New backend-owned file or directory handle.
     Opened(Handle),
+    /// Read bytes, which may be shorter than requested.
     Read(ReadBuffer),
+    /// Number of bytes physically written; callers must check for short writes.
     Written(usize),
+    /// Observed handle type and logical length.
     Metadata(Metadata),
+    /// Owned entries within the requested listing bounds.
     Directory(Vec<Entry>),
+    /// Successful operation with no additional result data.
     Done,
 }
 
@@ -270,6 +345,7 @@ pub struct ReadBuffer {
 }
 
 impl ReadBuffer {
+    /// Retain the admitted allocation and expose only its completed prefix.
     pub fn new(bytes: Box<[u8]>, length: usize) -> io::Result<Self> {
         if length > bytes.len() {
             return Err(io::ErrorKind::InvalidData.into());
@@ -277,6 +353,7 @@ impl ReadBuffer {
         Ok(Self { bytes, length })
     }
 
+    /// Completed read bytes, excluding unused admitted capacity.
     pub fn as_slice(&self) -> &[u8] {
         &self.bytes[..self.length]
     }

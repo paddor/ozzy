@@ -9,9 +9,6 @@ use super::{
 
 const DEFAULT_ORPHAN_PROBES: usize = 64;
 
-mod detached;
-pub use detached::{CompletedJournalRoll, PendingJournalRoll, PreparedJournalRoll};
-
 /// Allocation work captured without disk I/O from one live journal generation.
 /// The final successor header is deliberately not constructed until rollover.
 #[derive(Debug)]
@@ -76,6 +73,7 @@ impl SegmentPreparation {
 }
 
 impl PreparedSegment {
+    /// Configured physical segment capacity in bytes.
     pub const fn capacity(&self) -> u64 {
         self.scope.capacity
     }
@@ -205,12 +203,6 @@ impl OpenGroupJournal {
             next_writer.set_write_mode(
                 &directory.root.join(segment_name(prepared.segment_id)),
                 crate::SegmentWriteMode::DataSync,
-            )?;
-        }
-        if directory.direct {
-            next_writer.set_direct(
-                &directory.root.join(segment_name(prepared.segment_id)),
-                true,
             )?;
         }
         writer.transfer_encode_buffers_to(&mut next_writer);

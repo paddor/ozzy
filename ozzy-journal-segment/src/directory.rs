@@ -1,21 +1,14 @@
 pub(crate) mod asynchronous;
 pub(crate) mod evidence;
-pub use evidence::{CompletedDurableProgress, PreparedDurableProgress};
-mod indexed_append;
 mod maintenance;
 pub(crate) mod memory_voting;
 mod owned_write;
-#[cfg(target_os = "linux")]
-pub use owned_write::JournalAio;
-pub(crate) use owned_write::start_writeback_range;
 pub use owned_write::{
-    CompletedJournalWrite, JournalGroupEncoder, JournalGroupEncoding, JournalWriteEvent,
-    JournalWritePipeline, JournalWriteback, PendingJournalWrite, PreencodedJournalGroup,
-    PreparedJournalWrite, SharedJournalOperation,
+    JournalGroupEncoder, JournalGroupEncoding, PreencodedJournalGroup, SharedJournalOperation,
 };
 mod orphans;
-pub use maintenance::{MaintenanceBudget, MetadataCleanup, MetadataCleanupStep};
-pub use orphans::{OrphanCleanup, OrphanCleanupStep};
+pub use maintenance::MaintenanceBudget;
+pub use orphans::OrphanCleanupStep;
 pub(crate) mod publication;
 mod read_capture;
 mod sealed_source;
@@ -25,10 +18,7 @@ mod roll;
 pub use recovery::{
     RecoveryPublication, RecoveryPublicationError, RepairRange, SealedRepair, SealedRepairLimits,
 };
-pub use roll::{
-    CompletedJournalRoll, PendingJournalRoll, PreparedJournalRoll, PreparedSegment,
-    SegmentPreparation,
-};
+pub use roll::{PreparedSegment, SegmentPreparation};
 #[cfg(test)]
 mod progress_tests;
 
@@ -49,18 +39,18 @@ use crate::retention::{PinRegistry, scan_is_below_floors};
 use crate::store_lock::StoreLock;
 use crate::{
     ActiveSegmentIndex, CURRENT_BYTES, CanonicalRecoveryRequirements, ChainPosition,
-    CheckpointError, CheckpointImage, CheckpointLimits, CheckpointPin, CheckpointPlan,
-    CheckpointReference, CheckpointSpec, CodecError, CommitMode, CurrentReference, DecodeLimits,
-    DecodedOperation, GROUP_IDENTITY_BYTES, GroupIdentity, IndexBuildError, IndexBuildLimits,
-    IndexCatalogError, IndexSource, JournalIndexBoundary, JournalIndexError, JournalIndexSnapshot,
-    LogPosition, Manifest, MetadataError, MetadataLimits, RetentionError, RetentionFloors,
-    RetentionResult, RetentionScanBudget, RetiredPrefix, SEGMENT_HEADER_BYTES, SegmentHeader,
-    SegmentIndex, SegmentIndexCatalog, SegmentReference, SegmentWriteMode, SegmentWriter,
-    TailState, UnreferencedCheckpointCleanup, UnreferencedMetadataCleanup,
-    UnreferencedSegmentCleanup, WriterError, WriterPosition, checkpoint_name, decode_current,
-    decode_group_identity, decode_manifest, decode_segment_header, encode_current,
-    encode_group_identity, encode_manifest_with_limits, encode_segment_header, manifest_digest,
-    open_checkpoint, open_segment_index, scan_segment, segment_index_name,
+    CheckpointError, CheckpointImage, CheckpointLimits, CheckpointPlan, CheckpointReference,
+    CheckpointSpec, CodecError, CommitMode, CurrentReference, DecodeLimits, DecodedOperation,
+    GROUP_IDENTITY_BYTES, GroupIdentity, IndexBuildError, IndexBuildLimits, IndexCatalogError,
+    IndexSource, JournalIndexBoundary, JournalIndexError, JournalIndexSnapshot, LogPosition,
+    Manifest, MetadataError, MetadataLimits, RetentionError, RetentionFloors, RetentionResult,
+    RetentionScanBudget, RetiredPrefix, SEGMENT_HEADER_BYTES, SegmentHeader, SegmentIndex,
+    SegmentIndexCatalog, SegmentReference, SegmentWriteMode, SegmentWriter, TailState,
+    UnreferencedCheckpointCleanup, UnreferencedMetadataCleanup, UnreferencedSegmentCleanup,
+    WriterError, WriterPosition, checkpoint_name, decode_current, decode_group_identity,
+    decode_manifest, decode_segment_header, encode_current, encode_group_identity,
+    encode_manifest_with_limits, encode_segment_header, manifest_digest, open_checkpoint,
+    open_segment_index, scan_segment, segment_index_name,
 };
 
 const LOCK_FILE: &str = "group.lock";
@@ -86,8 +76,6 @@ pub struct GroupDirectory {
     pub(crate) limits: MetadataLimits,
     configuration: Option<Box<[u8]>>,
     pub(crate) data_sync: bool,
-    /// Write jobs use a separate `O_DIRECT` descriptor for the active segment.
-    pub(crate) direct: bool,
 }
 
 /// Recovered active writer coupled to its exclusive group-directory lock.
@@ -148,7 +136,6 @@ struct RollSegmentPreparation<'a> {
     decode_limits: DecodeLimits,
     operation_limits: OperationLimits,
     pub(crate) data_sync: bool,
-    pub(crate) direct: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -258,34 +245,13 @@ impl BufferedRollPublication {
 /// One accepted operation borrowed from a bounded replay segment buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplayedOperation<'a> {
+    /// Canonical operation selected for replay or indexing.
     pub operation: &'a DecodedOperation<'a>,
+    /// Whether this replayed operation belongs to confirmed history.
     pub committed: bool,
 }
 
 impl GroupDirectory {
-    /// Select active-segment I/O before recovery. The default is Linux `O_DSYNC`.
-    /// Buffered owners must explicitly select `Buffered` on each reopen.
-    /// Metadata publication and recovery retain their independent barriers.
-    pub fn with_write_mode(mut self, mode: SegmentWriteMode) -> Result<Self, DirectoryError> {
-        let enabled = mode == SegmentWriteMode::DataSync;
-        if enabled && !cfg!(any(target_os = "linux", target_os = "android")) {
-            return Err(
-                io::Error::new(io::ErrorKind::Unsupported, "O_DSYNC requires Linux").into(),
-            );
-        }
-        self.data_sync = enabled;
-        Ok(self)
-    }
-
-    /// Write groups through a separate `O_DIRECT` descriptor for every active
-    /// segment, bypassing the page cache. Requires Linux and a file system that
-    /// accepts 4 KiB-aligned direct I/O; opening the journal fails otherwise.
-    #[must_use]
-    pub const fn with_direct_io(mut self, enabled: bool) -> Self {
-        self.direct = enabled;
-        self
-    }
-
     /// Explicitly format a new externally committed group with immutable configuration.
     ///
     /// The adapter must first validate the complete configuration, including its
@@ -440,7 +406,6 @@ impl GroupDirectory {
             limits,
             configuration: None,
             data_sync: true,
-            direct: false,
         })
     }
 
@@ -516,7 +481,6 @@ impl GroupDirectory {
             limits,
             configuration,
             data_sync: true,
-            direct: false,
         })
     }
 
@@ -696,30 +660,26 @@ impl GroupDirectory {
         if self.data_sync {
             writer.set_write_mode(path, SegmentWriteMode::DataSync)?;
         }
-        if self.direct {
-            writer.set_direct(path, true)?;
-            // Recovery read the segment through the page cache. Drop those
-            // pages so direct writes need not invalidate them.
-            #[cfg(target_os = "linux")]
-            rustix::fs::fadvise(file, 0, None, rustix::fs::Advice::DontNeed)
-                .map_err(io::Error::from)?;
-        }
         let _ = file;
         Ok(())
     }
 
+    /// Filesystem directory bound to this owner.
     pub fn root(&self) -> &Path {
         &self.root
     }
 
+    /// Exact group, node, volume, store, and store-generation binding.
     pub const fn identity(&self) -> GroupIdentity {
         self.identity
     }
 
+    /// Validated reference selecting the current manifest generation.
     pub const fn current(&self) -> CurrentReference {
         self.current
     }
 
+    /// Exact validated metadata manifest held by this object.
     pub const fn manifest(&self) -> &Manifest {
         &self.manifest
     }
@@ -735,6 +695,7 @@ impl GroupDirectory {
         Ok(self.root.join(segment_reference_name(reference)))
     }
 
+    /// Configured manifest byte and selected-segment bounds.
     pub const fn metadata_limits(&self) -> MetadataLimits {
         self.limits
     }
@@ -782,10 +743,12 @@ impl OpenGroupJournal {
         evidence::protected(&directory.root, &directory.manifest)?;
         Ok(())
     }
+    /// Borrow the exclusive selected group directory.
     pub const fn directory(&self) -> &GroupDirectory {
         &self.directory
     }
 
+    /// Borrow the active physical segment writer.
     pub const fn writer(&self) -> &SegmentWriter<Arc<File>> {
         &self.writer
     }
@@ -823,31 +786,6 @@ impl OpenGroupJournal {
         self.decode_limits
     }
 
-    /// Largest uncompressed canonical body that fits an empty segment and all
-    /// decoder bounds. Includes entry, seal and physical alignment overhead.
-    pub fn append_body_limit(&self) -> usize {
-        let usable = self
-            .writer
-            .header()
-            .capacity()
-            .saturating_sub(crate::SEGMENT_HEADER_BYTES as u64);
-        let aligned =
-            usable / crate::WRITE_GROUP_ALIGNMENT as u64 * crate::WRITE_GROUP_ALIGNMENT as u64;
-        let physical =
-            aligned.saturating_sub((crate::ENTRY_HEADER_BYTES + crate::GROUP_SEAL_BYTES) as u64);
-        usize::try_from(physical)
-            .unwrap_or(usize::MAX)
-            .min(self.operation_limits.max_body_bytes)
-            .min(
-                self.decode_limits
-                    .max_entry_bytes
-                    .saturating_sub(crate::ENTRY_HEADER_BYTES),
-            )
-            .min(self.decode_limits.max_decoded_body_bytes)
-            .min(self.decode_limits.max_group_decoded_body_bytes)
-            .min(self.decode_limits.max_segment_decoded_body_bytes)
-    }
-
     /// Complete local write prefix, without durability or commit evidence.
     pub fn written_position(&self) -> Result<LogPosition, DirectoryError> {
         position_before(self.writer.written_position().next_chain())
@@ -870,39 +808,6 @@ impl OpenGroupJournal {
         } else {
             Ok(self.directory.manifest.committed)
         }
-    }
-
-    pub(crate) fn any_artifact_pinned(&self) -> Result<bool, RetentionError> {
-        self.pins.any_pinned()
-    }
-
-    /// Open and pin the exact checkpoint selected by the current manifest.
-    pub fn pin_selected_checkpoint(
-        &self,
-        limits: CheckpointLimits,
-    ) -> Result<Option<CheckpointPin>, DirectoryError> {
-        let Some(reference) = self.directory.manifest.checkpoint else {
-            return Ok(None);
-        };
-        let image = open_checkpoint(
-            self.directory
-                .root
-                .join("checkpoints")
-                .join(checkpoint_name(reference.checkpoint_id)),
-            self.directory.identity.group_id,
-            self.directory.identity.store_id,
-            limits,
-        )?;
-        if image.manifest_digest() != reference.manifest_digest
-            || image.manifest().position != reference.position
-        {
-            return Err(DirectoryError::CheckpointMismatch);
-        }
-        Ok(Some(self.pins.acquire_checkpoint(
-            image,
-            limits,
-            Arc::clone(&self.directory.lock),
-        )?))
     }
 
     /// Delete segment generations absent from the selected manifest.
@@ -1139,7 +1044,7 @@ impl OpenGroupJournal {
 
     /// Freeze the exact complete prefix covered by a later synchronization.
     pub const fn begin_sync(&self) -> WriterPosition {
-        self.writer.begin_sync()
+        self.writer.state.begin_sync()
     }
 
     /// Reserve the active writer's reusable physical-group buffer.
@@ -1185,27 +1090,6 @@ impl OpenGroupJournal {
             .manifest
             .checkpoint
             .map_or(LogPosition::GENESIS, |checkpoint| checkpoint.position);
-        self.replay_from(replay_start, visit)
-    }
-
-    /// Replay all retained accepted operations, including checkpoint-covered data.
-    ///
-    /// Used to reconstruct retained payload/result indexes. Canonical state must
-    /// still start from the selected checkpoint, not reapply this older prefix.
-    pub fn replay_retained_accepted<E>(
-        &self,
-        visit: impl FnMut(ReplayedOperation<'_>) -> Result<(), E>,
-    ) -> Result<(), ReplayError<E>>
-    where
-        E: std::error::Error + 'static,
-    {
-        let first = self
-            .directory
-            .manifest
-            .segments
-            .first()
-            .expect("validated manifest retains an active segment");
-        let replay_start = position_before(first.first_chain).map_err(ReplayError::Journal)?;
         self.replay_from(replay_start, visit)
     }
 
@@ -1498,7 +1382,7 @@ impl OpenGroupJournal {
     }
 
     /// Drop a bounded eligible prefix from the manifest, leaving physical deletion
-    /// to `cleanup_orphan_step`. Floors must describe the selected checkpoint's
+    /// to `reclaim_unreferenced_segments`. Floors must describe the selected checkpoint's
     /// committed state. The segment scan has byte/count and cooperative time bounds;
     /// checkpoint verification remains a full pass bounded by `checkpoint_limits`.
     pub fn retire_sealed_prefix(
@@ -1950,7 +1834,6 @@ impl OpenGroupJournal {
                     decode_limits,
                     operation_limits,
                     data_sync: directory.data_sync,
-                    direct: directory.direct,
                 },
                 observer,
             );
@@ -1982,8 +1865,10 @@ impl OpenGroupJournal {
 #[derive(Debug, Error)]
 pub enum ReplayError<E: std::error::Error + 'static> {
     #[error(transparent)]
+    /// A journal operation rejected its input or exact source.
     Journal(DirectoryError),
     #[error("operation replay was rejected by the state builder")]
+    /// Operation replay was rejected by the state builder.
     Visitor(#[source] E),
 }
 
@@ -1991,34 +1876,49 @@ pub enum ReplayError<E: std::error::Error + 'static> {
 #[derive(Debug, Error)]
 pub enum DirectoryError {
     #[error(transparent)]
+    /// A physical file operation failed.
     Io(#[from] io::Error),
     #[error(transparent)]
+    /// Physical segment framing or integrity validation failed.
     Codec(#[from] CodecError),
     #[error(transparent)]
+    /// Journal metadata validation failed.
     Metadata(#[from] MetadataError),
     #[error(transparent)]
+    /// Canonical operation-body validation failed.
     Operation(#[from] OperationCodecError),
     #[error(transparent)]
+    /// The segment writer rejected this transition.
     Writer(#[from] WriterError),
     #[error(transparent)]
+    /// Derived index construction or validation failed.
     Index(#[from] IndexBuildError),
     #[error(transparent)]
+    /// The captured index catalog rejected its source or selection.
     IndexCatalog(#[from] IndexCatalogError),
     #[error(transparent)]
+    /// Checkpoint construction or validation failed.
     Checkpoint(#[from] CheckpointError),
     #[error(transparent)]
+    /// Retention or deletion protection rejected this transition.
     Retention(#[from] RetentionError),
     #[error("group directory parent is missing")]
+    /// Group directory parent is missing.
     MissingParent,
     #[error("group directory already exists")]
+    /// Group directory already exists.
     StoreAlreadyExists,
     #[error("group directory is already owned by another process")]
+    /// Group directory is already owned by another process.
     Locked,
     #[error("{0} is not a regular file")]
+    /// The named artifact is not a regular file.
     NotRegularFile(&'static str),
     #[error("{0} is not a directory")]
+    /// The named artifact is not a directory.
     NotDirectory(&'static str),
     #[error("configured group identity does not match stored identity")]
+    /// Configured group identity does not match stored identity.
     IdentityMismatch,
     /// Expected immutable adapter configuration is missing or differs from disk.
     #[error("configured consensus membership does not match stored configuration")]
@@ -2030,74 +1930,113 @@ pub enum DirectoryError {
     #[error("invalid group configuration length")]
     ConfigurationLength,
     #[error("CURRENT does not identify stored group manifest")]
+    /// CURRENT does not identify stored group manifest.
     CurrentMismatch,
     #[error("initial segment does not match group genesis")]
+    /// Initial segment does not match group genesis.
     InvalidInitialSegment,
     #[error("physical segment allocation is unsupported on this platform")]
+    /// Physical segment allocation is unsupported on this platform.
     AllocationUnsupported,
     #[error("manifest successor generation or identity is invalid")]
+    /// Manifest successor generation or identity is invalid.
     ManifestGeneration,
     #[error("manifest references invalid or missing segment {0}")]
+    /// Manifest references invalid or missing segment.
     SegmentMismatch(u64),
     #[error("manifest contains no active segment")]
+    /// Manifest contains no active segment.
     MissingActiveSegment,
     #[error("active segment changes require an atomic writer roll")]
+    /// Active segment changes require an atomic writer roll.
     ActiveSegmentChangeRequiresRoll,
     #[error("checkpoint changes require checkpoint installation")]
+    /// Checkpoint changes require checkpoint installation.
     CheckpointChangeRequiresInstall,
     #[error("cannot checkpoint the empty journal")]
+    /// Cannot checkpoint the empty journal.
     CheckpointAtGenesis,
     #[error("local durable progress must be published before checkpoint capture")]
+    /// Local durable progress must be published before checkpoint capture.
     LocalProgressUnpublished,
     #[error("checkpoint does not match its source manifest or current retained journal")]
+    /// Checkpoint does not match its source manifest or current retained journal.
     CheckpointMismatch,
     #[error("checkpoint position must advance beyond the selected checkpoint")]
+    /// Checkpoint position must advance beyond the selected checkpoint.
     CheckpointRegression,
     #[error("physical retention requires an installed checkpoint")]
+    /// Physical retention requires an installed checkpoint.
     RetentionRequiresCheckpoint,
     #[error("retention scan budget is zero or cannot hold one eligible segment")]
+    /// Retention scan budget is zero or cannot hold one eligible segment.
     RetentionScanBudget,
     #[error("configuration changes require configuration installation")]
+    /// Configuration changes require configuration installation.
     ConfigurationChangeRequiresInstall,
     #[error("journal commit mode is immutable after format")]
+    /// Journal commit mode is immutable after format.
     CommitModeChange,
     #[error("ordinary metadata installation cannot regress hard state")]
+    /// Ordinary metadata installation cannot regress hard state.
     HardStateRegression,
     #[error("operation position {0} is beyond the synchronized journal prefix")]
+    /// Operation position is beyond the synchronized journal prefix.
     PositionNotDurable(u64),
     #[error("operation position {0} does not match the retained journal")]
+    /// Operation position does not match the retained journal.
     PositionMismatch(u64),
     #[error("active segment contains writes not covered by a successful sync")]
+    /// Active segment contains writes not covered by a successful sync.
     ActiveSegmentNotDurable,
     #[error("a buffered segment roll is still awaiting publication")]
+    /// A buffered segment roll is still awaiting publication.
     RollPublicationPending,
     #[error("buffered roll completion does not match the live journal")]
+    /// Buffered roll completion does not match the live journal.
     RollPublicationMismatch,
     #[error("prepared successor does not match the live journal generation")]
+    /// Prepared successor does not match the live journal generation.
     PreparedSegmentMismatch,
     #[error("an empty active segment cannot be rolled")]
+    /// An empty active segment cannot be rolled.
     EmptyActiveSegment,
     #[error("physical segment ID space exhausted")]
+    /// Physical segment ID space exhausted.
     SegmentIdExhausted,
     #[error("orphan segment {0} conflicts with the requested roll")]
+    /// Orphan segment conflicts with the requested roll.
     OrphanSegmentConflict(u64),
     /// No successor name was available within the caller's roll work budget.
     #[error("segment roll exhausted {limit} occupied-name probes")]
-    RollProbeLimit { limit: usize },
+    RollProbeLimit {
+        #[doc = "Configured maximum for the reported resource."]
+        limit: usize,
+    },
     #[error("segment {0} is active, absent, or otherwise not sealed")]
+    /// Segment is active, absent, or otherwise not sealed.
     SegmentNotSealed(u64),
     #[error("immutable metadata path already contains different bytes")]
+    /// Immutable metadata path already contains different bytes.
     ImmutableConflict,
     #[error("{object} size {actual} does not equal {expected}")]
+    /// The physical file length differs from its exact required size.
     WrongFileSize {
+        /// Named physical or encoded object that failed validation.
         object: &'static str,
+        /// Observed size, count, or fenced field value.
         actual: u64,
+        /// Expected size, count, or fenced field value.
         expected: u64,
     },
     #[error("{object} size {actual} exceeds limit {limit}")]
+    /// The physical file exceeds its configured size bound.
     FileLimit {
+        /// Named physical or encoded object that failed validation.
         object: &'static str,
+        /// Observed size, count, or fenced field value.
         actual: u64,
+        /// Configured maximum for the reported resource.
         limit: usize,
     },
 }
@@ -2681,9 +2620,9 @@ fn validate_buffered_roll_boundary(
     validate_buffered_roll_state(&directory.manifest, writer)
 }
 
-fn validate_buffered_roll_state<I>(
+fn validate_buffered_roll_state(
     manifest: &Manifest,
-    writer: &SegmentWriter<I>,
+    writer: &crate::writer::SegmentState,
 ) -> Result<RollBoundary, DirectoryError> {
     if writer.is_faulted() {
         return Err(WriterError::Faulted.into());
@@ -2909,10 +2848,10 @@ fn validate_metadata_positions(
     Ok(())
 }
 
-fn validate_replay_scan<I>(
+fn validate_replay_scan(
     reference: &SegmentReference,
     scan: &crate::SegmentScan<'_>,
-    writer: &SegmentWriter<I>,
+    writer: &crate::writer::SegmentState,
 ) -> Result<(), DirectoryError> {
     if let Some(sealed) = reference.sealed {
         if scan.valid_bytes != sealed.valid_bytes
@@ -2976,7 +2915,6 @@ fn prepare_roll_segment(
         decode_limits,
         operation_limits,
         data_sync,
-        direct,
     } = preparation;
     let path = root.join(segment_name(header.segment_id()));
     let mut writer = match OpenOptions::new()
@@ -3039,9 +2977,6 @@ fn prepare_roll_segment(
     };
     if data_sync {
         writer.set_write_mode(&path, SegmentWriteMode::DataSync)?;
-    }
-    if direct {
-        writer.set_direct(&path, true)?;
     }
     sync_directory(&root.join("segments"))?;
     observer.completed(PersistencePhase::SegmentsDirectorySynced)?;

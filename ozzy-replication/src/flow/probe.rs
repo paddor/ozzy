@@ -16,11 +16,9 @@ pub struct Probe {
     pub request_id: RequestId,
     /// Primary's outstanding tail at request creation, not a commit assertion.
     pub tail: Prefix,
-    /// Highest locally available operation, including unsent work awaiting
-    /// receive credit. Admission hint only, never a repair or commit boundary.
+    /// Highest locally available operation, including unsent publications.
+    /// Availability hint only, never a repair or commit boundary.
     pub available: OpNumber,
-    /// Bytes needed by the next bounded data packet. Admission hint only.
-    pub minimum_body_bytes: u64,
 }
 
 /// Independent status-query pacing, not election or durable-progress timing.
@@ -54,7 +52,7 @@ pub enum ProbeError {
 
 /// Allocation-free, one-outstanding-request scheduler for one authenticated peer.
 ///
-/// Poll only when the adapter needs receipt/credit status. Opening is immediate;
+/// Poll only when the adapter needs receipt status. Opening is immediate;
 /// unanswered small requests back off to an explicit ceiling. Repeated calls at
 /// one instant emit at most one pending request. New work after a completed
 /// exchange opens immediately; unchanged status retains its pacing delay.
@@ -111,7 +109,6 @@ impl ProbeScheduler {
         scope: Scope,
         tail: Prefix,
         available: OpNumber,
-        minimum_body_bytes: u64,
         now: Duration,
     ) -> Result<Option<Probe>, ProbeError> {
         self.check_time(now)?;
@@ -121,7 +118,6 @@ impl ProbeScheduler {
             || tail.op.0 == u64::MAX
             || available < tail.op
             || available.0 == u64::MAX
-            || minimum_body_bytes == 0
         {
             return Err(ProbeError::Invalid);
         }
@@ -145,7 +141,7 @@ impl ProbeScheduler {
                     scope,
                     tail,
                     available,
-                    minimum_body_bytes,
+
                     request_id: RequestId::from_bytes(self.next_id.to_be_bytes()),
                 },
                 next_id,

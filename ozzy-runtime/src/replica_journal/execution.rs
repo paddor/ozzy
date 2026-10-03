@@ -1,20 +1,78 @@
-//! Journal execution placement. Command admission and replication authority do
-//! not depend on whether progress is polled locally or by the legacy worker.
+//! Concrete actor-owned storage execution. All normal policies share one owner.
 
+use super::{ShardJournal, receiving::driver::local};
 use std::task::{Context, Poll};
 
-/// Execution owned by a journal adapter. Implementations retain pending work
-/// across canceled polls and report terminal failure only after settling it.
-/// No polling method may block the calling application thread.
-pub trait JournalExecution: std::fmt::Debug {
-    /// Conservative control-identity room at the actor's accepted position.
-    /// Zero pauses new validation while application and persistence drain.
-    /// Legacy execution has no shard-local capacity observation.
-    fn control_capacity(&self, _accepted: ozzy_replication::OpNumber) -> usize {
-        usize::MAX
-    }
+#[derive(Debug)]
+pub(super) enum Execution {
+    Normal(ShardJournal),
+    Recovery(local::Execution),
+}
 
-    /// Drive admitted work. Pending work must arrange a wakeup. On termination,
-    /// return whether this journal faulted; later polls return the same result.
-    fn poll_finished(&mut self, cx: &mut Context<'_>) -> Poll<bool>;
+impl Execution {
+    pub(super) fn control_capacity(&self, accepted: ozzy_replication::OpNumber) -> usize {
+        match self {
+            Self::Normal(owner) => owner.control_capacity(accepted),
+            Self::Recovery(_) => 0,
+        }
+    }
+    pub(super) fn poll_finished(&mut self, cx: &mut Context<'_>) -> Poll<bool> {
+        match self {
+            Self::Normal(owner) => owner.poll_finished(cx),
+            Self::Recovery(owner) => owner.poll_finished(cx),
+        }
+    }
+    pub(super) fn is_closed(&self) -> bool {
+        match self {
+            Self::Normal(owner) => owner.is_closed(),
+            Self::Recovery(owner) => owner.is_closed(),
+        }
+    }
+    pub(super) fn available(&self) -> usize {
+        match self {
+            Self::Normal(owner) => owner.available(),
+            Self::Recovery(owner) => owner.available(),
+        }
+    }
+    pub(super) fn settled(&self) -> bool {
+        match self {
+            Self::Normal(owner) => owner.settled(),
+            Self::Recovery(_) => false,
+        }
+    }
+    pub(super) fn validation_ready(&self, buffer: &super::AppendBuffer) -> bool {
+        match self {
+            Self::Normal(owner) => owner.validation_ready(buffer),
+            Self::Recovery(_) => false,
+        }
+    }
+    pub(super) fn close(&mut self) {
+        match self {
+            Self::Normal(owner) => owner.close(),
+            Self::Recovery(owner) => owner.close(),
+        }
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "refusal preserves ownership of the original action"
+    )]
+    pub(super) fn submit(
+        &mut self,
+        command: super::commands::Command,
+    ) -> Result<(), (super::SubmitError, super::commands::Command)> {
+        match self {
+            Self::Normal(owner) => owner
+                .submit(command)
+                .map_err(|command| (super::SubmitError::Full, command)),
+            Self::Recovery(owner) => owner
+                .submit(command)
+                .map_err(|command| (super::SubmitError::Full, command)),
+        }
+    }
+    pub(super) fn recovery(&mut self) -> &mut local::Execution {
+        match self {
+            Self::Recovery(owner) => owner,
+            Self::Normal(_) => unreachable!("recovery owner never changes execution in place"),
+        }
+    }
 }

@@ -336,11 +336,6 @@ impl Actor {
             self.other(),
             Control::PrepareOk {
                 ack: self.driver.normal().unwrap().acknowledgment().unwrap(),
-                grant: Grant {
-                    revision: 1,
-                    record_limit: 8,
-                    byte_limit: 8192,
-                },
             },
         )
         .await;

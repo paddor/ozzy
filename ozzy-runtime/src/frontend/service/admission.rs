@@ -1,14 +1,9 @@
 //! Explicit admission for a trusted client transport domain.
 
 use super::{
-    Access, BROKER_ROLE, Envelope, Kind, NodeId, Opcode, Peer, ReceiveError, Service, ServiceError,
-    handshake, nack,
+    Access, BROKER_ROLE, Binding, Kind, Link, NodeId, Opcode, Peer, ReceiveError, Service,
+    ServiceError, handshake, routed,
 };
-use crate::{
-    dispatch::{Error, SendFailure},
-    frontend::{GrantRequest, Rejected, Rejection, Routed},
-};
-use omq_tokio::Message;
 
 pub(super) fn validate_roles(kind: Kind, roles: u32) -> Result<(), ReceiveError> {
     let valid = match kind {
@@ -19,6 +14,68 @@ pub(super) fn validate_roles(kind: Kind, roles: u32) -> Result<(), ReceiveError>
 }
 
 impl Service {
+    /// Install the negotiated link only after dispatcher and watch fencing.
+    pub(super) fn receive_handshake(
+        &mut self,
+        peer: NodeId,
+        kind: Kind,
+        packet: ozzy_proto::Packet<'_>,
+        envelope: ozzy_proto::EnvelopeLimits,
+    ) -> Result<(), ReceiveError> {
+        let hello = handshake::decode(packet, envelope)?;
+        // These bits constrain the authorized profile. They do not authorize
+        // a routing identity or establish replication membership.
+        validate_roles(kind, hello.parameters.roles)?;
+        let handled = self.sessions.receive(peer, packet)?;
+        if handled.replaced {
+            let binding = Binding {
+                peer,
+                kind,
+                session: self.sessions.session(peer).expect("established handshake"),
+            };
+            if let Err(error) = self.dispatcher.bind(binding) {
+                self.dispatcher.disconnect(peer);
+                self.sessions.disconnect(peer);
+                self.set_link(peer, None);
+                self.peers
+                    .get_mut(&peer)
+                    .expect("authorized peer")
+                    .handshake = None;
+                return Err(error.into());
+            }
+            if kind == Kind::Client
+                && let Some(watches) = &mut self.watches
+                && let Err(error) = watches.bind(peer, binding.session)
+            {
+                self.dispatcher.disconnect(peer);
+                self.sessions.disconnect(peer);
+                self.set_link(peer, None);
+                return Err(ReceiveError::Watch(error));
+            }
+            self.set_link(
+                peer,
+                Some(Link {
+                    binding,
+                    send: self.sessions.send_limits(peer)?,
+                    remote: self
+                        .sessions
+                        .remote_parameters(peer)
+                        .expect("established handshake"),
+                }),
+            );
+            let state = self.peers.get_mut(&peer).expect("authorized peer");
+            state.handshake = None;
+            state.awaiting_welcome = handled.reply.is_some();
+        }
+        if let Some(reply) = handled.reply {
+            self.peers
+                .get_mut(&peer)
+                .expect("authorized peer")
+                .handshake = Some(routed(peer, reply));
+        }
+        Ok(())
+    }
+
     /// Bound physical connection metadata, including trusted clients before HELLO.
     pub fn transport_peer_capacity(&self) -> usize {
         self.trusted_maximum.max(self.peers.len())
@@ -30,82 +87,6 @@ impl Service {
             || (self.peers.len() < self.trusted_maximum
                 && peer != self.dispatcher.local
                 && peer.as_bytes() != &[0; 16])
-    }
-
-    pub(super) fn receive_partition(
-        &mut self,
-        peer: NodeId,
-        envelope: Envelope,
-        message: Message,
-        retained_bytes: usize,
-    ) -> Result<Option<Routed>, ReceiveError> {
-        let route = self
-            .links
-            .get(peer)
-            .and_then(|link| self.dispatcher.routes.route(&message, link.binding).ok());
-        match self.dispatcher.dispatch(peer, message, retained_bytes) {
-            Ok(route) => Ok(Some(route)),
-            Err(Rejected { reason, message }) => {
-                if matches!(reason, Rejection::Fence(_)) {
-                    crate::profiling::event(
-                        crate::profiling::Event::DispatcherReplicaFenceRejected,
-                    );
-                }
-                if matches!(
-                    reason,
-                    Rejection::NoGrant
-                        | Rejection::Admission(SendFailure::Admission(
-                            Error::Full | Error::Revoked
-                        ))
-                ) && let Some(route) = route
-                    && let Some(requests) = self.requests.get_mut(&route.placement.shard)
-                    && let Some(link) = self.links.get(peer)
-                {
-                    requests.request(
-                        GrantRequest {
-                            binding: link.binding,
-                            route,
-                        },
-                        retained_bytes,
-                    );
-                    // Retain only response metadata. The refused payload never
-                    // becomes pending dispatcher or shard application work.
-                    drop(message);
-                    if link.binding.kind == Kind::Broker
-                        && route.class == crate::dispatch::Class::Data
-                    {
-                        crate::profiling::event(crate::profiling::Event::DispatcherBrokerRefusal);
-                        let cause = match reason {
-                            Rejection::NoGrant => crate::profiling::Event::DispatcherBrokerNoGrant,
-                            Rejection::Admission(SendFailure::Admission(Error::Full)) => {
-                                crate::profiling::Event::DispatcherBrokerGrantFull
-                            }
-                            Rejection::Admission(SendFailure::Admission(Error::Revoked)) => {
-                                crate::profiling::Event::DispatcherBrokerGrantRevoked
-                            }
-                            _ => unreachable!("broker refusal must be a grant failure"),
-                        };
-                        crate::profiling::event(cause);
-                    }
-                    if link.binding.kind == Kind::Client && envelope.request_id.is_some() {
-                        crate::profiling::event(crate::profiling::Event::DispatcherCreditRefusal);
-                        match reason {
-                            Rejection::NoGrant => crate::profiling::event(
-                                crate::profiling::Event::DispatcherMissingGrant,
-                            ),
-                            Rejection::Admission(SendFailure::Admission(Error::Full)) => {
-                                crate::profiling::event(
-                                    crate::profiling::Event::DispatcherGrantExhausted,
-                                );
-                            }
-                            _ => {}
-                        }
-                        self.reject_directory(peer, envelope, 10, nack::RetryClass::AfterCredit)?;
-                    }
-                }
-                Err(ReceiveError::Dispatch(reason))
-            }
-        }
     }
 
     /// Allow additional client identities from an explicitly trusted transport

@@ -11,9 +11,10 @@ asynchronous storage backends. The fixed-three replication core and canonical
 journal state live in separate crates.
 
 Broker integration uses `ReplicaJournal<ShardJournal>`, shared topic SDKs,
-and the shared frontend. The old journal worker and actor-owned client
-services have been removed. Blocking segment execution remains for older
-segment tests and offline operations.
+and the shared frontend. Dispatcher/shard work uses separate data/control OMQ
+inproc lanes with bounded turns. SDK caller lanes and backend jobs/completions
+still use local typed rings; storage sockets are not implemented. Partition
+actors own journals directly. Blocking segment APIs serve tests and offline work.
 
 See [design](../DESIGN.md) for ownership and confirmation boundaries,
 [runtime](../doc/RUNTIME.md) for scheduling and resource limits, and

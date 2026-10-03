@@ -49,6 +49,7 @@ impl Journal {
             .await
     }
 
+    /// Capture selected confirmed history for a fresh physical and canonical scrub.
     pub async fn begin_storage_validation(
         &mut self,
         max_segment_bytes: usize,
@@ -60,6 +61,7 @@ impl Journal {
         ))
     }
 
+    /// Capture the exact written prefix for a fresh bounded scrub.
     pub async fn begin_written_storage_validation(
         &mut self,
         max_segment_bytes: usize,

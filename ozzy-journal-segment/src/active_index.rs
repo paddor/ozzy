@@ -17,13 +17,13 @@ mod tests;
 
 /// Exact accepted active-segment entries bounded by encoded index footprint.
 #[derive(Debug, Clone)]
-pub struct ActiveSegmentIndex {
+pub(crate) struct ActiveSegmentIndex {
     image: SegmentIndexImage,
 }
 
 impl ActiveSegmentIndex {
     /// Build through one exact operation, ignoring later complete physical groups.
-    pub fn build(
+    pub(crate) fn build(
         scan: &SegmentScan<'_>,
         through_op: u64,
         operation_limits: OperationLimits,
@@ -67,19 +67,11 @@ impl ActiveSegmentIndex {
         }))
     }
 
-    pub const fn source(&self) -> IndexSource {
+    pub(crate) const fn source(&self) -> IndexSource {
         self.image.source()
     }
 
-    pub fn offset_count(&self) -> usize {
-        self.image.offsets().len()
-    }
-
-    pub fn message_count(&self) -> usize {
-        self.image.messages().len()
-    }
-
-    pub fn operation_count(&self) -> usize {
+    pub(crate) fn operation_count(&self) -> usize {
         self.image.operations().len()
     }
 
@@ -87,7 +79,7 @@ impl ActiveSegmentIndex {
         self.image.offsets()
     }
 
-    pub fn find_offset(
+    pub(crate) fn find_offset(
         &self,
         partition: PartitionIncarnation,
         offset: Offset,
@@ -105,7 +97,7 @@ impl ActiveSegmentIndex {
             .map(|index| self.image.offsets()[index])
     }
 
-    pub fn find_message(
+    pub(crate) fn find_message(
         &self,
         partition: PartitionIncarnation,
         message_id: MessageId,
@@ -125,7 +117,7 @@ impl ActiveSegmentIndex {
             .filter(|entry| entry.partition == partition && entry.message_id == message_id)
     }
 
-    pub fn find_operation(&self, operation_id: OperationId) -> Option<OperationIndexEntry> {
+    pub(crate) fn find_operation(&self, operation_id: OperationId) -> Option<OperationIndexEntry> {
         self.image
             .operations()
             .binary_search_by(|entry| entry.operation_id.as_bytes().cmp(operation_id.as_bytes()))
@@ -203,19 +195,33 @@ fn validate_limits(limits: IndexLimits) -> Result<(), ActiveIndexError> {
 #[derive(Debug, Error)]
 pub enum ActiveIndexError {
     #[error(transparent)]
+    /// Derived index construction or validation failed.
     Index(#[from] crate::IndexError),
     #[error(transparent)]
+    /// The encoded index representation is invalid.
     File(#[from] IndexFileError),
     #[error("active index resource limits are invalid")]
+    /// Active index resource limits are invalid.
     InvalidLimits,
     #[error("active scan ends at operation {last}, before requested operation {requested}")]
-    PositionNotCovered { requested: u64, last: u64 },
+    /// Active scan ends at operation, before requested operation.
+    PositionNotCovered {
+        #[doc = "Requested canonical operation number."]
+        requested: u64,
+        #[doc = "Last canonical operation covered by this source."]
+        last: u64,
+    },
     #[error("active index integer or length overflow")]
+    /// Integer or byte-count arithmetic overflows the supported range.
     LengthOverflow,
     #[error("{kind} limit exceeded: {actual} > {limit}")]
+    /// The named resource exceeds its configured bound.
     LimitExceeded {
+        /// Resource bound that rejected the operation.
         kind: &'static str,
+        /// Observed size, count, or fenced field value.
         actual: usize,
+        /// Configured maximum for the reported resource.
         limit: usize,
     },
 }

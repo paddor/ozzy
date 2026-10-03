@@ -4,6 +4,7 @@
 //! Operations may finish out of order. Await dependent operations explicitly,
 //! especially writes before barriers, publication, or close. Only the caller
 //! decides which completed bytes belong to its journal's durable prefix.
+#![warn(missing_docs)]
 #![forbid(unsafe_code)]
 
 mod admission;
@@ -32,17 +33,23 @@ pub trait Backend: fmt::Debug + Send {
     /// On rejection, return the unmodified operation. No physical work started.
     fn submit(&mut self, class: Class, operation: Operation) -> Result<Completion, Rejected>;
 
+    /// The device-wide admission and capacity-wakeup owner.
     fn admission(&self) -> &Admission;
+    /// Application shard whose fixed quota backs this lane.
     fn shard(&self) -> usize;
 }
 
+/// An operation returned unchanged before physical execution starts.
 #[derive(Debug)]
 pub struct Rejected {
+    /// Reason admission or local validation failed.
     pub error: io::Error,
+    /// Original operation, including its owned buffers and handles.
     pub operation: Box<Operation>,
 }
 
 impl Rejected {
+    /// Preserve an unsubmitted operation with its rejection reason.
     pub fn new(error: io::Error, operation: Operation) -> Self {
         Self {
             error,

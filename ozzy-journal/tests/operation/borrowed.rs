@@ -34,6 +34,93 @@ fn described(records: &[OwnedRecord]) -> AppendRecordList<'_> {
 }
 
 #[test]
+fn wire_proofs_check_destination_limits_and_patched_positions() {
+    use ozzy_journal::operation::append_wire_record_batch;
+    use ozzy_proto::data::{DataLimits, decode_record_descriptors};
+
+    // Two raw wire records, each with three parts (including an empty part).
+    let mut metadata = 2_u32.to_be_bytes().to_vec();
+    for id in [5, 6] {
+        metadata.extend_from_slice(&[id; 16]);
+        for value in [3_u32, 3, 0, 3] {
+            metadata.extend_from_slice(&value.to_be_bytes());
+        }
+    }
+    let payload = b"abcdefabcdef".to_vec();
+    let descriptors =
+        decode_record_descriptors(&metadata, payload.len(), 0, DataLimits::default()).unwrap();
+    let header = AppendHeader {
+        partition: PartitionIncarnation::from_bytes([1; 16]),
+        owner_epoch: OwnerEpoch::INITIAL,
+        producer_id: ProducerId::from_bytes([2; 16]),
+        producer_epoch: ProducerEpoch::INITIAL,
+        first_sequence: ProducerSequence::new(4),
+        first_offset: Offset::new(40),
+        append_timestamp_millis: 77,
+    };
+    let limits = OperationLimits::default();
+    for encoding in [
+        ozzy_proto::append::PayloadEncoding::Raw,
+        ozzy_proto::append::PayloadEncoding::Lz4,
+    ] {
+        let encoded = match encoding {
+            ozzy_proto::append::PayloadEncoding::Raw => payload.clone(),
+            ozzy_proto::append::PayloadEncoding::Lz4 => lz4rip::block::compress(&payload),
+        };
+        let mut canonical = Vec::new();
+        let (_, proof) = append_wire_record_batch(
+            &mut canonical,
+            header,
+            descriptors,
+            encoding,
+            &encoded,
+            limits,
+        )
+        .unwrap();
+        let batch = proof.batch(&canonical, limits).unwrap();
+        assert_eq!(
+            batch.summary,
+            decode_append_batches(&canonical, limits).unwrap()[0].summary
+        );
+        for strict in [
+            OperationLimits {
+                max_body_bytes: canonical.len() - 1,
+                ..limits
+            },
+            OperationLimits {
+                max_records: 1,
+                ..limits
+            },
+            OperationLimits {
+                max_parts: 5,
+                ..limits
+            },
+            OperationLimits {
+                max_payload_bytes: payload.len() - 1,
+                ..limits
+            },
+            OperationLimits {
+                max_append_batches: 0,
+                ..limits
+            },
+        ] {
+            assert!(matches!(
+                proof.batch(&canonical, strict),
+                Err(OperationCodecError::LimitExceeded { .. })
+            ));
+        }
+        for position in [52..60, 60..68] {
+            let mut patched = canonical.clone();
+            patched[position].copy_from_slice(&u64::MAX.to_be_bytes());
+            assert_eq!(
+                proof.batch(&patched, limits).unwrap_err(),
+                OperationCodecError::AppendPositionOverflow
+            );
+        }
+    }
+}
+
+#[test]
 fn prepared_lz4_is_exact_and_replaces_raw_canonical_payload() {
     let raw = vec![b'x'; 4096];
     let records = [OwnedRecord {

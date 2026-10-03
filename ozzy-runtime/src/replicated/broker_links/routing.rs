@@ -111,7 +111,7 @@ pub struct RouteGeneration {
 
 impl TopicRoutes {
     /// Cached storage charged for one topic, including immutable metadata,
-    /// routing registrations and coalesced hints. No partition credit is added.
+    /// routing registrations and coalesced hints. No partition authority is added.
     pub fn reservation_bytes(partitions: usize) -> Option<usize> {
         if partitions == 0 {
             return None;
@@ -180,27 +180,20 @@ impl TopicRoutes {
     }
 
     /// Best current view, possibly without a leader. Hints from an obsolete
-    /// physical session are removed before comparing election views.
+    /// physical session are ignored before comparing election views.
     pub fn route(&self, number: u32) -> Result<Option<RouteState>, BrokerLinkError> {
         if self.links.0.shared.stop.is_closed() {
             return Err(BrokerLinkError::Closed);
         }
         let group = self.group(number)?;
-        let mut cache = self.state.cache.lock().expect("SDK route cache poisoned");
-        let mut changed = false;
-        for broker in self.state.topic.brokers() {
-            let current = self.links.session(broker.node);
-            if let Some(old) = cache.session(broker.node)
-                && Some(old) != current
-            {
-                changed |= cache.disconnect(broker.node, old);
-            }
-        }
-        let result = cache.route(group)?;
-        drop(cache);
-        if changed {
-            self.state.changed.notify_changed();
-        }
+        let result = self
+            .state
+            .cache
+            .lock()
+            .expect("SDK route cache poisoned")
+            .route_matching(group, |peer, session| {
+                self.links.session(peer) == Some(session)
+            })?;
         if result.is_none() {
             let rejected = self
                 .state

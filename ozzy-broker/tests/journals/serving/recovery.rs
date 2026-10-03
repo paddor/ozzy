@@ -122,7 +122,7 @@ async fn replace(policy: Confirmation) {
     // needs the rebuilt partition to finish recovery, elect, and retain history.
     write_wave(&brokers, &mut writer, &mut expected, 6, false).await;
     read_topic(&brokers, &sdk, &expected).await;
-    assert_eq!(sdk.socket_count(), 6, "recovery added SDK sockets");
+    assert_eq!(sdk.socket_count(), 5, "recovery added SDK sockets");
     live_many(&brokers, "close recovered topic writer", writer.close())
         .await
         .unwrap();

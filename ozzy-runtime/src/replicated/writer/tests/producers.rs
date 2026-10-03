@@ -8,6 +8,25 @@ fn config(records: usize, bytes: usize) -> WriterConfig {
     }
 }
 
+#[tokio::test]
+async fn a_record_larger_than_remaining_inbox_bytes_yields_until_capacity_returns() {
+    let (mut writer, mut driver) = channel(WriterConfig {
+        max_producers: 1,
+        batch_target_bytes: 64,
+        ..config(8, 64)
+    });
+    let mut pending = Vec::new();
+    for _ in 0..3 {
+        pending.push(writer.send(input(1, &[1; 48])).await.unwrap());
+    }
+    assert!(writer.send(input(2, &[2; 32])).now_or_never().is_none());
+    assert_eq!(writer.shared.next_sequence(), 3);
+    confirm(&mut driver, 1, 0).unwrap();
+    assert_eq!(pending[0].confirmed().await.unwrap().offset, 0);
+    assert!(pending[1].try_confirmed().is_none());
+    assert_eq!(writer.send(input(3, &[3; 32])).await.unwrap().sequence(), 3);
+}
+
 #[test]
 fn delayed_ticket_bounds_reorder_even_when_other_lanes_keep_draining() {
     let (writer, mut driver) = channel(config(2, 128));
@@ -43,10 +62,7 @@ fn delayed_publication_restores_global_order_across_window_wraps() {
                 encoding: ozzy_proto::data::Encoding::Raw,
                 admitted_at: None,
                 sequence,
-                completion: Arc::new(state::RecordCompletion {
-                    message_id: input.message_id,
-                    offset: std::sync::OnceLock::new(),
-                }),
+                completion: state::Completion::new(input.message_id),
                 lengths: None,
                 body: super::super::payload::Body::take(&mut input, bytes.len()),
             })
@@ -176,7 +192,7 @@ fn concurrent_producers_wrap_the_window_without_sequence_gaps_or_reordering() {
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "producer/credit progress stalled"
+                "producer/capacity progress stalled"
             );
             std::thread::yield_now();
         }
@@ -283,28 +299,59 @@ async fn full_producer_lanes_do_not_make_blocked_producers_wake_each_other() {
 }
 
 #[test]
-fn batching_inbox_holds_one_ready_request_of_bytes() {
+fn batching_inbox_bounds_one_ready_request_and_lookahead_bytes() {
     let mut settings = super::config(2, 64);
     settings.batch_target_bytes = 64;
     settings.limits.max_records = 64;
     let (mut writer, mut driver) = Shared::channel_with_capacity(settings, 1024);
-    // One ready request: eight 8-byte records, far below the record bound.
+    // One 64-byte request, a 64-byte lookahead record, and bounded part tables.
     let mut admitted = 0;
     while writer.admit(&mut input(1, b"12345678"), 8).is_some() {
         admitted += 1;
     }
-    assert_eq!(admitted, 8);
-    assert_eq!(driver.inbox.used_bytes(), 64);
+    assert_eq!(admitted, 20);
+    assert_eq!(driver.inbox.used_bytes(), 160);
     driver.settle();
     driver.stage(4);
-    assert_eq!(driver.inbox.used_bytes(), 32);
+    assert_eq!(driver.inbox.used_bytes(), 128);
     assert!(writer.admit(&mut input(1, b"12345678"), 8).is_some());
     // Staging everything returns all bytes; a full-slot record fits again.
     // Each settle round accepts at most one request's bytes.
-    while driver.admission.records.len() < 9 {
+    while driver.admission.records.len() < 21 {
         driver.settle();
     }
-    driver.stage(9);
+    driver.stage(21);
     assert_eq!(driver.inbox.used_bytes(), 0);
     assert!(writer.admit(&mut input(1, &[7; 64]), 64).is_some());
+}
+
+#[tokio::test]
+async fn empty_multipart_records_charge_tables_until_request_preparation() {
+    let mut settings = super::config(8, 64);
+    settings.batch_target_bytes = 16;
+    settings.limits.max_record_bytes = 16;
+    let (mut writer, mut driver) = channel(settings);
+    let record = || RecordInput::multipart(MessageId::new(), [const { Bytes::new() }; 4]);
+    let mut pending = Vec::new();
+    for _ in 0..4 {
+        pending.push(writer.send(record()).await.unwrap());
+    }
+    assert_eq!(driver.inbox.used_bytes(), 64);
+    assert!(writer.send(record()).now_or_never().is_none());
+    assert_eq!(writer.shared.next_sequence(), 4);
+    driver.settle();
+    driver.stage(2);
+    assert_eq!(driver.inbox.used_bytes(), 32);
+    driver.stage(2);
+    assert_eq!(driver.inbox.used_bytes(), 32);
+    let admitted = writer.send(record()).await.unwrap();
+    assert_eq!(admitted.sequence(), 4);
+    assert!(
+        pending
+            .iter()
+            .all(|receipt| receipt.try_confirmed().is_none())
+    );
+    confirm(&mut driver, 5, 0).unwrap();
+    assert_eq!(driver.inbox.used_bytes(), 0);
+    assert_eq!(admitted.confirmed().await.unwrap().offset, 4);
 }

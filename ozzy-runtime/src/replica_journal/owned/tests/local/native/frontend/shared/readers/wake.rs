@@ -280,3 +280,56 @@ async fn received_records_are_delivered_while_another_partition_is_quiet() {
     .await
     .unwrap();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn unroutable_first_replay_frame_reopens_at_the_exact_offset() {
+    tokio::time::timeout(Duration::from_secs(10), replay_gap())
+        .await
+        .unwrap();
+}
+
+async fn replay_gap() {
+    let (mut harness, links, clock, _) = setup_shared_profile(&[], 1, Some((8, 8192, 4))).await;
+    harness.publish = false;
+    let mut writer = open_writer(&mut harness, &links).await;
+    for n in 0..8 {
+        let pending = writer
+            .send(
+                RecordInput::copy_from_slice(MessageId::from_bytes([50 + n; 16]), &[n; 8]),
+                None,
+            )
+            .await
+            .unwrap();
+        harness.drive(pending.confirmed(), true).await.unwrap();
+    }
+    harness.readers.unroutable_records = 1;
+    let mut reader = harness
+        .drive(
+            TopicReader::open(links.clone(), "orders", TopicReaderConfig::default()),
+            true,
+        )
+        .await
+        .unwrap();
+    for n in 0..8 {
+        let record = harness.drive(reader.next(), true).await.unwrap();
+        assert_eq!(record.offset, Offset::new(u64::from(n)));
+        assert_eq!(record.message_id, MessageId::from_bytes([50 + n; 16]));
+        assert_eq!(record.payload[0].as_ref(), &[n; 8]);
+    }
+    let subscriptions = harness
+        .readers
+        .requests
+        .iter()
+        .filter(|(opcode, _)| *opcode == Opcode::Subscribe)
+        .map(|(_, subscription)| *subscription)
+        .collect::<Vec<_>>();
+    assert_eq!(subscriptions.len(), 2);
+    assert_eq!(subscriptions[0].id, subscriptions[1].id);
+    assert_ne!(subscriptions[0].generation, subscriptions[1].generation);
+    assert_eq!(clock.now(), Duration::ZERO);
+    assert_eq!(reader.checkpoint().positions, vec![(0, Offset::new(8))]);
+    harness.drive(reader.close(), true).await.unwrap();
+    harness.drive(writer.close(), true).await.unwrap();
+    harness.drive(links.shutdown(), true).await.unwrap();
+    harness.shutdown().await;
+}

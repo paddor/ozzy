@@ -35,6 +35,7 @@ impl Drop for ProcessGroup {
     }
 }
 
+/// Run and supervise one controlled worker until completion or its deadline.
 pub async fn execute(
     command: &[String],
     directory: &Path,
@@ -123,6 +124,7 @@ pub async fn execute(
 }
 
 #[derive(Debug)]
+/// Captured process CPU time used to compute measurement-window utilization.
 pub struct CpuSnapshot {
     at: Instant,
     ticks: u64,
@@ -131,10 +133,12 @@ pub struct CpuSnapshot {
 }
 
 impl CpuSnapshot {
+    /// Capture CPU accounting for the selected process or current process.
     pub fn take(pid: Option<u32>) -> Result<Self> {
         Self::take_servers(&pid.into_iter().collect::<Vec<_>>())
     }
 
+    /// Capture combined CPU accounting for the supplied server processes.
     pub fn take_servers(pids: &[u32]) -> Result<Self> {
         let stat = fs::read_to_string("/proc/stat")?;
         let ticks = stat
@@ -175,6 +179,7 @@ impl CpuSnapshot {
             processes,
         })
     }
+    /// Compute CPU time and utilization between two compatible snapshots.
     pub fn elapsed(&self, after: &Self) -> Result<Value> {
         let seconds = after.at.duration_since(self.at).as_secs_f64();
         let ticks = after

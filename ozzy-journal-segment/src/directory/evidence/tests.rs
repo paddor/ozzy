@@ -134,7 +134,7 @@ fn failed_evidence_publication_fences_and_never_erases_prior_evidence() {
             .is_err()
     );
     assert!(journal.writer.is_faulted());
-    assert!(journal.prepare_durable_progress().is_err());
+    assert!(journal.publish_durable_progress().is_err());
     assert!(
         protected(&journal.directory.root, &journal.directory.manifest)
             .unwrap()
@@ -227,11 +227,15 @@ fn publication_alternates_the_first_copy_and_never_starts_with_the_newest() {
         journal.sync_through(position).unwrap();
         let before = fs::read(&path).unwrap();
         let copies = Copies::decode_file(&before, &journal.directory.manifest).unwrap();
-        let prepared = journal.prepare_durable_progress().unwrap().unwrap();
+        let (bytes, first) = copies
+            .next(
+                &journal.directory.manifest,
+                journal.accepted_position().unwrap(),
+            )
+            .unwrap();
         // Tear the first write: the other copy must still decode the prior prefix.
         let mut torn = before.clone();
-        torn[prepared.first * COPY_STRIDE..][..RECORD_BYTES / 2]
-            .copy_from_slice(&prepared.bytes[..RECORD_BYTES / 2]);
+        torn[first * COPY_STRIDE..][..RECORD_BYTES / 2].copy_from_slice(&bytes[..RECORD_BYTES / 2]);
         assert_eq!(
             Copies::decode_file(&torn, &journal.directory.manifest)
                 .unwrap()
@@ -239,8 +243,7 @@ fn publication_alternates_the_first_copy_and_never_starts_with_the_newest() {
                 .unwrap(),
             copies.protected(&journal.directory.manifest).unwrap()
         );
-        let completed = prepared.publish();
-        journal.complete_durable_progress(completed).unwrap();
+        journal.publish_durable_progress().unwrap();
         let after =
             Copies::decode_file(&fs::read(&path).unwrap(), &journal.directory.manifest).unwrap();
         assert!(after.mirrored());

@@ -1,6 +1,6 @@
 //! Production broker lifecycle under the existing bounded process supervisor.
 
-use super::super::{Config, command, launch, measurement::BrokerMeter};
+use super::super::{Config, command, command_with_timeout, launch, measurement::BrokerMeter};
 use crate::bench::{Result, error};
 use ozzy_bench::native::{BrokerWorker, PreparedBroker};
 use serde_json::{Value, json};
@@ -38,13 +38,22 @@ pub(in crate::bench::timed) async fn run(config: Config) -> Result<()> {
     .map_err(Into::into);
     let (mut meter, identity) = result?;
     drained?;
+    let execution = tokio::time::timeout(
+        Duration::from_secs(config.args.drain_timeout_secs),
+        observe_drained_threads(),
+    )
+    .await
+    .map_err(|cause| error(format!("production broker thread drain: {cause}")))??;
     let mut usage = meter
         .finish()
         .map_err(|cause| error(format!("production broker drained usage: {cause}")))?;
+    usage["execution"] = execution;
     // These process-global counters belong to the legacy journal workers.
     // Production persistence observations come from the actual owners.
     usage.as_object_mut().unwrap().remove("journal_reads");
     usage.as_object_mut().unwrap().remove("journal_writes");
+    #[cfg(feature = "comparisons")]
+    report_record_deliveries(&mut usage);
     launch::reply(&json!({
         "event": "drained", "identity": identity,
         "usage": usage,
@@ -57,6 +66,46 @@ pub(in crate::bench::timed) async fn run(config: Config) -> Result<()> {
         return Err(error("production broker command after drain"));
     }
     Ok(())
+}
+
+#[cfg(feature = "comparisons")]
+fn report_record_deliveries(usage: &mut Value) {
+    let counters = ozzy_runtime::storage_metrics::snapshot();
+    usage["record_deliveries"] = json!({
+        "scope": "process lifetime, including warmup, measurement, and drain",
+        "journal_records": counters.journal_records,
+        "background_resident_reads": counters.background_resident_reads,
+        "direct_resident_reads": counters.direct_resident_reads,
+        "historical_read_deliveries": counters.historical_read_deliveries,
+        "shared_reader_bytes": counters.shared_reader_bytes,
+        "copied_reader_bytes": counters.copied_reader_bytes,
+        "prepared_operations": counters.prepared_operations,
+        "prepared_payload_bytes_max": counters.prepared_payload_bytes_max,
+    });
+}
+
+/// pthread join can finish before Linux removes its final proc task entry.
+/// Report physical drain only after those entries disappear. A surviving
+/// worker still fails the caller's bounded deadline.
+async fn observe_drained_threads() -> Result<Value> {
+    loop {
+        let execution = ozzy_bench::placement::execution()?;
+        let owned = execution["threads"]
+            .as_array()
+            .ok_or_else(|| error("missing broker thread observation"))?
+            .iter()
+            .any(|thread| {
+                thread["name"].as_str().is_some_and(|name| {
+                    name.starts_with("ozzy_app-")
+                        || name == "ozzy_dispatch"
+                        || name.starts_with("ozzy_io-")
+                })
+            });
+        if !owned {
+            return Ok(execution);
+        }
+        tokio::task::yield_now().await;
+    }
 }
 
 async fn prepare(
@@ -75,7 +124,7 @@ async fn prepare(
         "event": "prepared", "index": index, "pid": std::process::id(),
         "broker": format!("broker-{index}"), "directory": resources.directory(),
         "root": resources.root(), "endpoints": {
-            "peer": resources.endpoints().peer, "reader_pub": resources.endpoints().reader_pub,
+            "peer": resources.endpoints().peer, "data_peer": resources.endpoints().data_peer, "reader_pub": resources.endpoints().reader_pub,
             "follower_pub": resources.endpoints().follower_pub,
         },
         "storage": ozzy_bench::placement::storage(&config.args.storage_dir)?,
@@ -112,7 +161,14 @@ async fn measure(
     command(input, "start").await?;
     let mut meter = BrokerMeter::default();
     meter.start()?;
-    command(input, "drain").await?;
+    // The controller waits for writer and reader reports before requesting
+    // drain. A long ramp can exceed the ordinary 60-second command timeout.
+    let drain_wait = Duration::from_secs_f64(
+        30.0 + config.args.warmup
+            + config.args.duration.unwrap()
+            + config.args.drain_timeout_secs as f64,
+    );
+    command_with_timeout(input, "drain", drain_wait).await?;
     Ok((meter, identity))
 }
 
@@ -133,7 +189,7 @@ fn ready(config: &Config, worker: &BrokerWorker, broker: &ozzy_broker::Broker) -
     Ok(json!({
         "event": "ready", "index": config.args.worker_index,
         "pid": std::process::id(), "broker": worker.broker, "node": local.broker,
-        "endpoint": configured.endpoints.peer,
+        "data_endpoint": configured.endpoints.data_peer, "endpoint": configured.endpoints.peer,
         "reader_publication": configured.endpoints.reader_pub,
         "follower_publication": configured.endpoints.follower_pub,
         "host": std::fs::read_to_string("/proc/sys/kernel/hostname")?.trim(),

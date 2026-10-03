@@ -21,7 +21,6 @@ pub(super) struct Cursor {
     /// None starts at the applied end: only later records are read.
     from: Option<Offset>,
     position: Option<PartitionReadCursor>,
-    opening: Option<JournalCompletion<PartitionReadCursor>>,
     reading: Option<JournalCompletion<ReadDelivery>>,
     read_started: Option<std::time::Instant>,
     buffer: Option<PartitionReadLease>,
@@ -33,7 +32,6 @@ impl Cursor {
             pool,
             from,
             position: None,
-            opening: None,
             reading: None,
             read_started: None,
             buffer: None,
@@ -41,40 +39,30 @@ impl Cursor {
     }
 
     /// Resolve the start once. The position names the next offset and owner epoch.
-    pub(super) fn poll_open<E>(
+    pub(super) fn poll_open(
         &mut self,
         partition: ozzy_proto::PartitionIncarnation,
         ticket: ValidationTicket,
-        journal: &mut ReplicaJournal<E>,
-        cx: &mut Context<'_>,
+        journal: &ReplicaJournal,
     ) -> Poll<Result<PartitionReadCursor, Failure>> {
         if let Some(position) = self.position {
             return Poll::Ready(Ok(position));
         }
-        if self.opening.is_none() {
-            let opening = match self.from {
-                Some(from) => journal.open_reader(ticket, partition, from),
-                None => journal.open_reader_at_end(ticket, partition),
-            };
-            match opening {
-                Ok(completion) => self.opening = Some(completion),
-                Err(SubmitError::Full) => return Poll::Pending,
-                Err(_) => return Poll::Ready(Err(Failure::new(11))),
-            }
-        }
-        let opened =
-            std::task::ready!(Pin::new(self.opening.as_mut().expect("pending open")).poll(cx));
-        self.opening = None;
-        let position = opened.map_err(|error| failure(&error))?;
+        let Some(position) = journal
+            .open_reader(ticket, partition, self.from)
+            .map_err(|error| failure(&error))?
+        else {
+            return Poll::Pending;
+        };
         self.position = Some(position);
         Poll::Ready(Ok(position))
     }
 
-    pub(super) fn poll<E>(
+    pub(super) fn poll(
         &mut self,
         source: Source,
         ticket: ValidationTicket,
-        journal: &mut ReplicaJournal<E>,
+        journal: &mut ReplicaJournal,
         output: &mut RecordsEncoder<'_>,
         maximum: ozzy_proto::data::DataLimits,
         cx: &mut Context<'_>,
@@ -88,7 +76,7 @@ impl Cursor {
         else {
             return Poll::Ready(Err(Failure::new(2)));
         };
-        let cursor = std::task::ready!(self.poll_open(partition, ticket, journal, cx))?;
+        let cursor = std::task::ready!(self.poll_open(partition, ticket, journal))?;
         if cursor.scope() != ticket.scope()
             || cursor.generation() != ticket.generation()
             || cursor.owner_epoch().get() != owner_epoch
@@ -138,11 +126,6 @@ impl Cursor {
                 } else {
                     ReadState::More
                 }))
-            }
-            Err(JournalError::Read(PartitionReadError::RecordTooLarge { bytes, parts }))
-                if bytes <= maximum.envelope.max_payload_bytes && parts <= maximum.max_parts =>
-            {
-                Poll::Ready(Ok(ReadState::Credit))
             }
             Err(error) => Poll::Ready(Err(failure(&error))),
         }

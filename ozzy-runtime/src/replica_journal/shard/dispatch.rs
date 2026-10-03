@@ -7,10 +7,10 @@ use crate::replica_journal::{JournalError, ProposalValidation, Turn, TurnResult}
     reason = "exhaustive shared command protocol; detached work lives in jobs"
 )]
 pub(super) async fn run(
-    mut state: State,
+    mut state: Box<State>,
     command: Command,
     timestamp: u64,
-) -> (State, Option<Job>, bool) {
+) -> (Box<State>, Option<Job>, bool) {
     let Command {
         action,
         _permit: permit,
@@ -47,7 +47,9 @@ pub(super) async fn run(
         } => finish(done, state.owner.admit_append(ticket, validated), permit),
         Action::Apply { ticket, done } => finish(done, state.owner.apply(ticket), permit),
         Action::Turn { turn, done } => {
-            let result = turn_work(&mut state, *turn, timestamp).await.map(Box::new);
+            let result = Box::pin(turn_work(&mut state, *turn, timestamp))
+                .await
+                .map(Box::new);
             let failed = crate::replica_journal::turn::faulted(&result);
             drop(permit);
             let _ = done.send(result);
@@ -73,16 +75,6 @@ pub(super) async fn run(
             };
             finish(done, result, permit)
         }
-        Action::OpenReader {
-            ticket,
-            partition,
-            from,
-            done,
-        } => finish_read(
-            done,
-            state.owner.open_reader(ticket, partition, from),
-            permit,
-        ),
         Action::ReadPartition {
             read_permit,
             cursor,
@@ -219,15 +211,7 @@ pub(super) async fn run(
             budget,
             done,
         } => {
-            let result = super::jobs::cleanup(&mut state, ticket, budget, false)
-                .await
-                .map(|cleaned| ozzy_journal_segment::OrphanCleanupStep {
-                    work_units: cleaned.removed_objects,
-                    reclaimed_bytes: cleaned.reclaimed_bytes,
-                    // Async cleanup reports removed objects, not a legacy scan
-                    // cursor. Do not invent file counts or whole-cycle completion.
-                    ..Default::default()
-                });
+            let result = super::jobs::cleanup(&mut state, ticket, budget, false).await;
             finish_read(done, result, permit)
         }
         Action::CleanupMetadata {
@@ -235,13 +219,7 @@ pub(super) async fn run(
             budget,
             done,
         } => {
-            let result = super::jobs::cleanup(&mut state, ticket, budget, true)
-                .await
-                .map(|cleaned| ozzy_journal_segment::MetadataCleanupStep {
-                    removed_files: cleaned.removed_objects,
-                    reclaimed_bytes: cleaned.reclaimed_bytes,
-                    ..Default::default()
-                });
+            let result = super::jobs::cleanup(&mut state, ticket, budget, true).await;
             finish_read(done, result, permit)
         }
         // Only a nonvoting recovery handle exposes receiving commands.
@@ -260,6 +238,29 @@ async fn turn_work(
         .admit
         .map(|(ticket, validated)| state.owner.admit_append(ticket, validated))
         .transpose()?;
+    if admitted.is_some()
+        && (turn
+            .propose
+            .as_ref()
+            .is_some_and(|(_, buffer)| state.owner.validation_may_read(&buffer.0))
+            || turn
+                .validate
+                .as_ref()
+                .is_some_and(|(_, buffer)| state.owner.validation_may_read(buffer)))
+    {
+        return Ok(TurnResult {
+            admitted,
+            proposal: None,
+            validated: None,
+            applied: None,
+            deferred: Some(Box::new(Turn {
+                propose: turn.propose,
+                validate: turn.validate,
+                apply: turn.apply,
+                ..Default::default()
+            })),
+        });
+    }
     let proposal = match turn.propose {
         Some((ticket, buffer)) => Some(state.owner.propose_append(ticket, buffer, timestamp).await),
         None => None,
@@ -277,5 +278,6 @@ async fn turn_work(
         proposal,
         validated,
         applied,
+        deferred: None,
     })
 }

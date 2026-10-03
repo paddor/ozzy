@@ -12,9 +12,13 @@ type Inode = u64;
 /// by one file/directory operation; no unbounded trace or orphan list is kept.
 #[derive(Clone, Copy, Debug)]
 pub struct ImageLimits {
+    /// Maximum file and directory inodes in the simulated image.
     pub nodes: usize,
+    /// Maximum aggregate dirty and durable directory entries.
     pub directory_entries: usize,
+    /// Maximum logical bytes in any one file image.
     pub file_bytes: usize,
+    /// Maximum aggregate dirty and durable file storage.
     pub total_bytes: usize,
 }
 
@@ -92,10 +96,12 @@ impl Default for Image {
 }
 
 impl Image {
+    /// Borrow file bytes from either the dirty image or durable media.
     pub fn bytes(&self, path: &Path, durable: bool) -> io::Result<&[u8]> {
         self.file(self.resolve(path, durable)?, durable)
     }
 
+    /// Test namespace reachability in the selected dirty or durable image.
     pub fn exists(&self, path: &Path, durable: bool) -> bool {
         self.resolve(path, durable).is_ok()
     }

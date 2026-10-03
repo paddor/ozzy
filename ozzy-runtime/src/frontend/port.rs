@@ -1,35 +1,31 @@
-//! Bounded shard-to-dispatcher commands. The shard owns command capacity;
-//! final aliases return it through a bounded mailbox.
+//! Bounded shard-to-dispatcher commands over separate OMQ inproc lanes.
+//! Payload leases follow final aliases; completions are correlated on the shard.
 
+mod retention;
+mod service;
+mod wire;
+use super::inproc::Inbox;
+use super::{PublicationResult, ReplyError, RouteState, ServiceError};
+use crate::{
+    dispatch::{self, Budget, Class},
+    signal::Closed,
+};
+use omq_tokio::Message;
+use retention::{Capacity, Retention};
+pub(super) use service::Mailbox;
+pub use service::PortSetupError;
 use std::{
+    collections::BTreeMap,
     future::Future,
-    ops::Bound::{Excluded, Unbounded},
     pin::Pin,
-    sync::Arc,
     task::{Context, Poll},
 };
+use tokio::sync::oneshot;
+use wire::Status;
 
-use bytes::Bytes;
-use omq_tokio::Message;
-use ozzy_proto::NodeId;
-use tokio::sync::{mpsc, oneshot};
-
-use super::{
-    GrantSpec, PublicationResult, ReplyError, RouteState, Service, ServiceError, SetupError,
-};
-use crate::{
-    command_channel::{
-        NotifiedReceiver, NotifiedSender, TryRecvError, TrySendError, notified_channel,
-    },
-    dispatch::{self, Budget, Budgets, Class, Grant},
-    signal::{CloseSignal, StateSignal},
-};
-
-// Covers command, one-shot reply, retention adapters, and frame descriptors.
+// Covers command, correlation entry, one-shot reply, adapters and descriptors.
 const COMMAND_BYTES: usize = 1024;
 
-/// Dispatcher installation outcome. Failure returns unused owning credit.
-pub type InstallResult = Result<(), (SetupError, Grant)>;
 /// Dispatcher reply-queue admission outcome. Full preserves the owning message.
 pub type ReplyResult = Result<(), (ReplyError, Message)>;
 /// One trusted shard's route publication outcome. Queue admission is not an
@@ -53,134 +49,34 @@ struct Completion<T> {
     _retention: Retention,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum Release {
-    Queue(usize),
-    Retained(usize, usize),
-}
-
+/// Observer of one bounded dispatcher command. Poll `Port::poll_progress`
+/// beside this future on the shard owner. Canceling observation does not undo
+/// accepted work. Record identity and retries belong to the application protocol.
 #[derive(Debug)]
-struct Return {
-    sender: mpsc::Sender<Release>,
-    changed: Arc<StateSignal>,
-    closed: CloseSignal,
+pub struct Pending<T> {
+    receiver: oneshot::Receiver<Completion<T>>,
+    closed: Pin<Box<Closed>>,
 }
-
-impl Return {
-    fn release(&self, released: Release) {
-        match self.sender.try_send(released) {
-            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                panic!("bounded port return mailbox overflowed")
-            }
-        }
-        self.changed.notify_changed();
-    }
-}
-
-#[derive(Debug)]
-struct QueueSlot {
-    bucket: usize,
-    returns: Arc<Return>,
-}
-
-impl Drop for QueueSlot {
-    fn drop(&mut self) {
-        self.returns.release(Release::Queue(self.bucket));
-    }
-}
-
-#[derive(Clone, Debug)]
-struct Retention(Arc<Retained>);
-
-#[derive(Debug)]
-struct Retained {
-    bucket: usize,
-    bytes: usize,
-    returns: Arc<Return>,
-}
-
-impl Drop for Retained {
-    fn drop(&mut self) {
-        self.returns
-            .release(Release::Retained(self.bucket, self.bytes));
-    }
-}
-
-#[derive(Debug)]
-struct TrackedBytes {
-    bytes: Bytes,
-    _retention: Retention,
-}
-
-impl AsRef<[u8]> for TrackedBytes {
-    fn as_ref(&self) -> &[u8] {
-        &self.bytes
-    }
-}
-
-impl Retention {
-    fn attach(&self, bytes: Bytes) -> Bytes {
-        debug_assert!(bytes.len() <= self.0.bytes);
-        Bytes::from_owner(TrackedBytes {
-            bytes,
-            _retention: self.clone(),
-        })
-    }
-}
-
-#[derive(Debug)]
-struct Queued {
-    value: Command,
-    class: Class,
-    queue: QueueSlot,
-    retention: Retention,
-}
-
-#[derive(Debug)]
-struct Received<T> {
-    value: T,
-    class: Class,
-    retention: Retention,
-}
-
-impl Received<Message> {
-    fn into_retained_message(self) -> Message {
-        Message::multipart_payloads((0..self.value.len()).map(|index| {
-            omq_tokio::message::Payload::from_bytes(
-                self.retention
-                    .attach(self.value.part_bytes(index).expect("frame index")),
-            )
-        }))
-    }
-}
-
-/// Observer of one bounded dispatcher command. Canceling observation does not
-/// undo an installation or transmission. Revoke a grant by its shard-held key
-/// when abandoning it. Record retry state belongs to the application protocol.
-#[derive(Debug)]
-pub struct Pending<T>(oneshot::Receiver<Completion<T>>);
 
 impl<T> Future for Pending<T> {
     type Output = Result<T, PortError>;
-
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.0).poll(cx).map(|result| {
-            result
-                .map(|completion| completion.result)
-                .map_err(|_| PortError::Closed)
-        })
+        if let Poll::Ready(result) = Pin::new(&mut self.receiver).poll(cx) {
+            return Poll::Ready(
+                result
+                    .map(|completion| completion.result)
+                    .map_err(|_| PortError::Closed),
+            );
+        }
+        self.closed
+            .as_mut()
+            .poll(cx)
+            .map(|()| Err(PortError::Closed))
     }
 }
 
 #[derive(Debug)]
 enum Command {
-    Install {
-        peer: NodeId,
-        spec: Box<GrantSpec>,
-        grant: Grant,
-        reply: oneshot::Sender<Completion<InstallResult>>,
-    },
     Reply {
         message: Message,
         reply: oneshot::Sender<Completion<ReplyResult>>,
@@ -195,56 +91,79 @@ enum Command {
     },
 }
 
-/// One application shard's outgoing fanring producer. Data cannot consume its
-/// control slots. Unobserved completions and socket-retained aliases keep their
-/// count/byte charges, so neither creates an unbounded side queue.
+impl Command {
+    fn kind(&self) -> u8 {
+        match self {
+            Self::Reply { .. } => 0,
+            Self::Publication { .. } => 1,
+            Self::Route { .. } => 2,
+        }
+    }
+    fn complete(self, status: Status, retention: Retention) {
+        match (self, status) {
+            (Self::Reply { message, reply }, Status::Reply(result)) => {
+                let _ = reply.send(Completion {
+                    result: result.map_err(|error| (error, message)),
+                    _retention: retention,
+                });
+            }
+            (Self::Publication { message, reply }, Status::Publication(result)) => {
+                let _ = reply.send(Completion {
+                    result: result.map_err(|error| (error, message)),
+                    _retention: retention,
+                });
+            }
+            (Self::Route { reply, .. }, Status::Route(result)) => {
+                let _ = reply.send(Completion {
+                    result: wire::route_result(result),
+                    _retention: retention,
+                });
+            }
+            _ => unreachable!("completion kind checked before removing request"),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Request {
+    command: Command,
+    retention: Retention,
+}
+
+/// Shard-owned command sockets and bounded completion correlations. Data cannot
+/// consume control capacity. Unobserved completions and socket-retained aliases
+/// keep their count/byte charges until physical release.
 #[derive(Debug)]
 pub struct Port {
-    sender: NotifiedSender<Queued>,
-    limits: [Budget; 3],
-    used: [Budget; 3],
-    returned: mpsc::Receiver<Release>,
-    returns: Arc<Return>,
+    lanes: [Inbox; 2],
+    capacity: Capacity,
+    requests: BTreeMap<u64, Request>,
+    incarnation: ozzy_proto::RequestId,
+    next_id: u64,
+    _context: omq_tokio::Context,
+}
+
+impl Drop for Port {
+    fn drop(&mut self) {
+        self.capacity.returns.closed.close();
+    }
 }
 
 impl Port {
     /// Capture before admission and use `changed_after` if capacity is full.
     pub fn generation(&self) -> u64 {
-        self.returns.changed.generation()
+        self.capacity.returns.changed.generation()
     }
 
     /// Independent readiness observation, cancel-safe across later send calls.
     pub fn changed_after(&self, generation: u64) -> impl Future<Output = ()> + use<> {
-        let changed = self.returns.changed.clone();
-        let closed = self.returns.closed.clone();
+        let changed = self.capacity.returns.changed.clone();
+        let closed = self.capacity.returns.closed.clone();
         async move {
             tokio::select! {
                 () = changed.changed_after(generation) => {},
                 () = closed.closed() => {},
             }
-        }
-    }
-
-    /// Submit a shard-issued ingress reservation. Await successful installation
-    /// before advertising its protocol credit. This queue has separate control
-    /// capacity from payload replies. Rejection retains the original token.
-    pub fn try_install(
-        &mut self,
-        peer: NodeId,
-        spec: impl Into<GrantSpec>,
-        grant: Grant,
-    ) -> Result<Pending<InstallResult>, (PortError, Grant)> {
-        let (reply, receiver) = oneshot::channel();
-        let command = Command::Install {
-            peer,
-            spec: Box::new(spec.into()),
-            grant,
-            reply,
-        };
-        match self.submit(Class::Control, COMMAND_BYTES, command) {
-            Ok(()) => Ok(Pending(receiver)),
-            Err((error, Command::Install { grant, .. })) => Err((error, grant)),
-            Err(_) => unreachable!("unchanged command"),
         }
     }
 
@@ -261,17 +180,12 @@ impl Port {
         if message.len() != 4 && message.len() != 2 {
             return Err((PortError::Frames, message));
         }
-        let Some(bytes) = retained_bytes.checked_add(COMMAND_BYTES).filter(|_| {
-            retained_bytes
-                >= message
-                    .max_message_size_len()
-                    .saturating_add(std::mem::size_of::<Message>())
-        }) else {
+        let Some(bytes) = message_charge(&message, retained_bytes) else {
             return Err((PortError::Charge, message));
         };
         let (reply, receiver) = oneshot::channel();
         match self.submit(class, bytes, Command::Reply { message, reply }) {
-            Ok(()) => Ok(Pending(receiver)),
+            Ok(()) => Ok(self.pending(receiver)),
             Err((error, Command::Reply { message, .. })) => Err((error, message)),
             Err(_) => unreachable!("unchanged command"),
         }
@@ -288,27 +202,22 @@ impl Port {
         if message.len() != 4
             || message
                 .part_slice(0)
-                .is_none_or(|prefix| prefix.len() != 32)
+                .is_none_or(|prefix| !matches!(prefix.len(), 16 | 32))
         {
             return Err((PortError::Frames, message));
         }
-        let Some(bytes) = retained_bytes.checked_add(COMMAND_BYTES).filter(|_| {
-            retained_bytes
-                >= message
-                    .max_message_size_len()
-                    .saturating_add(std::mem::size_of::<Message>())
-        }) else {
+        let Some(bytes) = message_charge(&message, retained_bytes) else {
             return Err((PortError::Charge, message));
         };
         let (reply, receiver) = oneshot::channel();
         let command = Command::Publication { message, reply };
-        let result = if self.limits[2] == Budget::default() {
+        let result = if self.capacity.limits[2] == Budget::default() {
             Err((PortError::Publication, command))
         } else {
             self.submit_bucket(2, Class::Data, bytes, command)
         };
         match result {
-            Ok(()) => Ok(Pending(receiver)),
+            Ok(()) => Ok(self.pending(receiver)),
             Err((error, Command::Publication { message, .. })) => Err((error, message)),
             Err(_) => unreachable!("unchanged publication"),
         }
@@ -330,10 +239,69 @@ impl Port {
             COMMAND_BYTES,
             Command::Route { route, reply },
         ) {
-            Ok(()) => Ok(Pending(receiver)),
+            Ok(()) => Ok(self.pending(receiver)),
             Err((error, Command::Route { route, .. })) => Err((error, route)),
             Err(_) => unreachable!("unchanged route command"),
         }
+    }
+
+    fn pending<T>(&self, receiver: oneshot::Receiver<Completion<T>>) -> Pending<T> {
+        Pending {
+            receiver,
+            closed: Box::pin(self.capacity.returns.closed.closed()),
+        }
+    }
+
+    /// Drain a bounded completion batch and register OMQ receive wakeups. Call
+    /// on the shard owner before polling command observers. No destination wait
+    /// blocks another lane. Returns whether any command outcome was observed.
+    pub fn poll_progress(&mut self, cx: &mut Context<'_>) -> Result<bool, PortError> {
+        let progressed = self.collect_results()?;
+        for lane in &mut self.lanes {
+            if let Poll::Ready(result) = lane.poll_ready(cx) {
+                result.map_err(|_| PortError::Closed)?;
+                cx.waker().wake_by_ref();
+            }
+        }
+        Ok(progressed)
+    }
+
+    fn collect_results(&mut self) -> Result<bool, PortError> {
+        if self.capacity.returns.closed.is_closed() {
+            self.requests.clear();
+            self.capacity.collect();
+            return Ok(false);
+        }
+        let mut progressed = false;
+        for index in [1, 0] {
+            for _ in 0..16 {
+                match self.lanes[index].try_recv() {
+                    Ok(message) => {
+                        self.observe(&message)?;
+                        progressed = true;
+                    }
+                    Err(omq_tokio::Error::WouldBlock) => break,
+                    Err(_) => return Err(PortError::Closed),
+                }
+            }
+        }
+        self.capacity.collect();
+        Ok(progressed)
+    }
+
+    fn observe(&mut self, message: &Message) -> Result<(), PortError> {
+        let (key, status) = wire::decode_completion(message)?;
+        if key.generation != self.incarnation
+            || self
+                .requests
+                .get(&key.id)
+                .is_none_or(|request| request.command.kind() != status.kind())
+        {
+            return Ok(());
+        }
+        let request = self.requests.remove(&key.id).expect("checked correlation");
+        request.command.complete(status, request.retention);
+        Ok(())
     }
 
     fn submit(
@@ -352,333 +320,50 @@ impl Port {
         bytes: usize,
         command: Command,
     ) -> Result<(), (PortError, Command)> {
-        self.collect_returns();
-        if self.returns.closed.is_closed() || self.sender.is_disconnected() {
-            return Err((PortError::Admission(dispatch::SendFailure::Closed), command));
+        if let Err(error) = self.collect_results() {
+            return Err((error, command));
         }
-        let limit = self.limits[bucket];
-        let used = &mut self.used[bucket];
-        if used.queue_slots >= limit.queue_slots
-            || used.retained_messages >= limit.retained_messages
-            || bytes > limit.bytes.saturating_sub(used.bytes)
-        {
-            return Err((
-                PortError::Admission(dispatch::SendFailure::Admission(dispatch::Error::Full)),
-                command,
-            ));
-        }
-        used.queue_slots += 1;
-        used.retained_messages += 1;
-        used.bytes += bytes;
-        let queued = Queued {
-            value: command,
-            class,
-            queue: QueueSlot {
-                bucket,
-                returns: self.returns.clone(),
-            },
-            retention: Retention(Arc::new(Retained {
-                bucket,
-                bytes,
-                returns: self.returns.clone(),
-            })),
+        let (queue, retention) = match self.capacity.reserve(bucket, bytes) {
+            Ok(reserved) => reserved,
+            Err(error) => return Err((error, command)),
         };
-        match self.sender.try_send(queued) {
-            Ok(()) => Ok(()),
+        let key = wire::Key {
+            generation: self.incarnation,
+            id: self.next_id,
+        };
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .expect("port request identity exhausted");
+        let message = wire::command(key, class, &command, queue, &retention);
+        match self.lanes[index(class)].socket.try_send(message) {
+            Ok(()) => {
+                self.requests.insert(key.id, Request { command, retention });
+                Ok(())
+            }
             Err(error) => {
-                let (queued, reason) = match error {
-                    TrySendError::Full(queued) => {
-                        (queued, dispatch::SendFailure::CapacityInvariant)
+                let reason = match error {
+                    omq_tokio::TrySendError::Full(_) => {
+                        dispatch::SendFailure::Admission(dispatch::Error::Full)
                     }
-                    TrySendError::Disconnected(queued) => (queued, dispatch::SendFailure::Closed),
+                    omq_tokio::TrySendError::Closed => dispatch::SendFailure::Closed,
+                    omq_tokio::TrySendError::Error(_) => dispatch::SendFailure::CapacityInvariant,
                 };
-                let Queued {
-                    value,
-                    queue,
-                    retention,
-                    ..
-                } = queued;
-                drop(queue);
                 drop(retention);
-                self.collect_returns();
-                Err((PortError::Admission(reason), value))
-            }
-        }
-    }
-
-    fn collect_returns(&mut self) {
-        while let Ok(released) = self.returned.try_recv() {
-            match released {
-                Release::Queue(bucket) => self.used[bucket].queue_slots -= 1,
-                Release::Retained(bucket, bytes) => {
-                    self.used[bucket].retained_messages -= 1;
-                    self.used[bucket].bytes -= bytes;
-                }
+                self.capacity.collect();
+                Err((PortError::Admission(reason), command))
             }
         }
     }
 }
 
-#[derive(Debug)]
-pub(super) struct Mailbox {
-    receiver: NotifiedReceiver<Queued>,
-    returns: Arc<Return>,
-    closed: bool,
-}
-
-impl Drop for Mailbox {
-    fn drop(&mut self) {
-        self.returns.closed.close();
-    }
-}
-
-impl Service {
-    /// Construct on the dispatcher, then send the port to this configured shard.
-    /// At most one port per shard. Outbound budgets are independent of ingress
-    /// and per-peer socket queues, and never multiply after reconnects.
-    pub fn port(&mut self, shard: u32, capacity: Budgets) -> Result<Port, SetupError> {
-        self.make_port(shard, capacity, None)
-    }
-
-    /// Reserve publication capacity inside the configured outgoing data budget.
-    /// PUB aliases cannot consume the remaining reply allowance. Both share the
-    /// same bounded fanring and retain independent grant/accounting lifetimes.
-    pub fn port_with_publications(
-        &mut self,
-        shard: u32,
-        capacity: Budgets,
-        publications: Budget,
-    ) -> Result<Port, SetupError> {
-        if publications.queue_slots == 0
-            || publications.retained_messages == 0
-            || publications.bytes < COMMAND_BYTES
-            || publications.queue_slots >= capacity.data.queue_slots
-            || publications.retained_messages >= capacity.data.retained_messages
-            || publications.bytes >= capacity.data.bytes
-        {
-            return Err(SetupError::Limits);
-        }
-        self.make_port(shard, capacity, Some(publications))
-    }
-
-    fn make_port(
-        &mut self,
-        shard: u32,
-        capacity: Budgets,
-        publications: Option<Budget>,
-    ) -> Result<Port, SetupError> {
-        if !self.dispatcher.routes.shards.contains(&shard) || self.ports.contains_key(&shard) {
-            return Err(SetupError::Destination);
-        }
-        if capacity.control.bytes < COMMAND_BYTES {
-            return Err(SetupError::Limits);
-        }
-        let mut replies = capacity;
-        if let Some(publications) = publications {
-            replies.data.queue_slots -= publications.queue_slots;
-            replies.data.retained_messages -= publications.retained_messages;
-            replies.data.bytes -= publications.bytes;
-        }
-        if ![replies.data, replies.control]
-            .into_iter()
-            .all(valid_budget)
-        {
-            return Err(SetupError::Limits);
-        }
-        let limits = [
-            replies.data,
-            replies.control,
-            publications.unwrap_or_default(),
-        ];
-        let slots = limits
-            .iter()
-            .try_fold(0usize, |sum, budget| sum.checked_add(budget.queue_slots))
-            .filter(|slots| *slots > 0 && *slots <= fanring::mpsc::MAX_CAPACITY_PER_SENDER)
-            .ok_or(SetupError::Limits)?;
-        let returns_capacity = limits
-            .iter()
-            .try_fold(0usize, |sum, budget| {
-                sum.checked_add(budget.queue_slots)?
-                    .checked_add(budget.retained_messages)
-            })
-            .ok_or(SetupError::Limits)?;
-        let (sender, receiver) = notified_channel(slots);
-        let (return_to, returned) = mpsc::channel(returns_capacity);
-        let returns = Arc::new(Return {
-            sender: return_to,
-            changed: Arc::new(StateSignal::default()),
-            closed: CloseSignal::default(),
-        });
-        self.ports.insert(
-            shard,
-            Mailbox {
-                receiver,
-                returns: returns.clone(),
-                closed: false,
-            },
-        );
-        Ok(Port {
-            sender,
-            limits,
-            used: [Budget::default(); 3],
-            returned,
-            returns,
-        })
-    }
-
-    /// Process at most one shard command, rotating even after empty/full peers.
-    /// Installation and reply rejection are returned to their bounded observer.
-    pub fn poll_command(&mut self) -> Result<bool, dispatch::Error> {
-        let next = self
-            .port_turn
-            .and_then(|last| self.ports.range((Excluded(last), Unbounded)).next())
-            .or_else(|| self.ports.first_key_value())
-            .map(|(&id, _)| id);
-        let Some(shard) = next else { return Ok(false) };
-        self.port_turn = Some(shard);
-        let mailbox = self.ports.get_mut(&shard).expect("selected shard");
-        if mailbox.closed {
-            return Ok(false);
-        }
-        let received = match mailbox.receiver.try_recv() {
-            Ok(received) => received,
-            Err(TryRecvError::Empty) => return Ok(false),
-            Err(TryRecvError::Disconnected) => {
-                mailbox.closed = true;
-                return Ok(true);
-            }
-        };
-        let Queued {
-            value,
-            class,
-            queue,
-            retention,
-        } = received;
-        drop(queue);
-        self.apply_command(
-            shard,
-            Received {
-                value,
-                class,
-                retention,
-            },
-        );
-        Ok(true)
-    }
-
-    fn apply_command(
-        &mut self,
-        shard: u32,
-        Received {
-            value,
-            class,
-            retention,
-        }: Received<Command>,
-    ) {
-        match value {
-            Command::Install {
-                peer,
-                spec,
-                grant,
-                reply,
-            } => {
-                let result = if spec.target().shard(&self.dispatcher.routes) == Some(shard) {
-                    self.install(peer, *spec, grant)
-                } else {
-                    Err((SetupError::Destination, grant))
-                };
-                let _ = reply.send(Completion {
-                    result,
-                    _retention: retention,
-                });
-            }
-            Command::Reply { message, reply } => {
-                // Keep an unwrapped alias only through admission. A full peer
-                // returns it without retaining this queue's byte reservation,
-                // so retry cannot deadlock while asking for its own old credit.
-                let retry = message.clone();
-                let retained = Received {
-                    value: message,
-                    class,
-                    retention: retention.clone(),
-                }
-                .into_retained_message();
-                let result = self
-                    .try_reply(class, retained)
-                    .map_err(|(error, _)| (error, retry));
-                let _ = reply.send(Completion {
-                    result,
-                    _retention: retention,
-                });
-            }
-            Command::Route { route, reply } => {
-                let result = if self
-                    .dispatcher
-                    .routes
-                    .partitions
-                    .get(&route.group)
-                    .is_some_and(|placement| {
-                        placement.shard == shard && placement.partition == route.partition
-                    }) {
-                    self.publish_route(&route).map_err(RouteError::from)
-                } else {
-                    Err(RouteError::Destination)
-                };
-                let _ = reply.send(Completion {
-                    result,
-                    _retention: retention,
-                });
-            }
-            Command::Publication { message, reply } => {
-                let retry = message.clone();
-                let retained = Received {
-                    value: message,
-                    class,
-                    retention: retention.clone(),
-                }
-                .into_retained_message();
-                let result = self
-                    .publish(shard, retained)
-                    .map_err(|(error, _)| (error, retry));
-                let _ = reply.send(Completion {
-                    result,
-                    _retention: retention,
-                });
-            }
-        }
-    }
-
-    /// Wait for commands, released backing capacity, or socket progress. Both
-    /// command and socket paths use bounded turns. Canceling the wait leaves
-    /// accepted commands and queued replies owned by this service.
-    pub async fn progress(
-        &mut self,
-        socket: &omq_tokio::IdentitySocket,
-    ) -> Result<(), ProgressError> {
-        use futures::{StreamExt, stream::FuturesUnordered};
-        let mut waits: FuturesUnordered<Pin<Box<dyn Future<Output = ()>>>> =
-            FuturesUnordered::new();
-        for mailbox in self.ports.values_mut().filter(|mailbox| !mailbox.closed) {
-            waits.push(Box::pin(mailbox.receiver.owned_ready()));
-        }
-        for index in 0..self.ports.len() {
-            if self.poll_command()? {
-                return Ok(());
-            }
-            if index % 64 == 63 {
-                tokio::task::yield_now().await;
-            }
-        }
-        if self.poll_watch()? {
-            return Ok(());
-        }
-        tokio::select! {
-            result = self.flush_ready(socket), if self.has_pending() => result?,
-            _ = waits.next(), if !waits.is_empty() => {},
-            else => std::future::pending().await,
-        }
-        Ok(())
-    }
+fn message_charge(message: &Message, retained_bytes: usize) -> Option<usize> {
+    retained_bytes.checked_add(COMMAND_BYTES).filter(|_| {
+        retained_bytes
+            >= message
+                .max_message_size_len()
+                .saturating_add(std::mem::size_of::<Message>())
+    })
 }
 
 const fn index(class: Class) -> usize {

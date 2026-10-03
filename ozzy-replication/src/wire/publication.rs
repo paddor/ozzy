@@ -8,8 +8,11 @@ use ozzy_proto::{GroupId, NodeId, Opcode};
 /// header denotes actor-owned unbound metadata, never an accepted wire packet.
 #[derive(Debug, Clone, Copy)]
 pub struct PublicationPart<'a> {
+    /// Encoded header, metadata, and payload frames, in that order.
     pub frames: [&'a [u8]; 3],
+    /// Exact canonical prefix immediately before these operations.
     pub predecessor: Prefix,
+    /// Exact canonical prefix after these consecutive operations.
     pub end: Prefix,
 }
 

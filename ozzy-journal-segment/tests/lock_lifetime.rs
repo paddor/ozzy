@@ -11,8 +11,7 @@ use std::time::Duration;
 use ozzy_journal::progress::JournalGeneration;
 use ozzy_journal_segment::{
     DecodeLimits, Digest, DirectoryError, GroupDirectory, GroupIdentity, MetadataLimits,
-    MountPolicy, OperationLimits, PlacementDirectory, PlacementLimits, SegmentHeader,
-    VolumeDirectory, VolumeIdentity,
+    OperationLimits, SegmentHeader,
 };
 use ozzy_proto::{GroupId, NodeId, StoreId, VolumeId};
 
@@ -120,34 +119,4 @@ fn detached_pin_keeps_ownership_until_its_release_even_with_a_forked_child() {
     drop(pin);
     let reopened = GroupDirectory::open(&root, identity, MetadataLimits::default()).unwrap();
     assert_eq!(reopened.identity(), identity);
-}
-
-#[test]
-fn volume_reopens_after_owner_drop_while_unrelated_child_is_before_exec() {
-    let temporary = tempfile::TempDir::new().unwrap();
-    let identity = VolumeIdentity {
-        volume_id: identity().volume_id,
-    };
-    let volume =
-        VolumeDirectory::format_new(temporary.path(), identity, MountPolicy::PortableIdentity)
-            .unwrap();
-    let _child = HeldFork::start();
-    drop(volume);
-    let reopened =
-        VolumeDirectory::open(temporary.path(), identity, MountPolicy::PortableIdentity).unwrap();
-    assert_eq!(reopened.identity(), identity);
-}
-
-#[test]
-fn placement_reopens_after_owner_drop_while_unrelated_child_is_before_exec() {
-    let temporary = tempfile::TempDir::new().unwrap();
-    let root = temporary.path().join("placement");
-    let node = identity().replica_node_id;
-    let directory =
-        PlacementDirectory::format_new(&root, node, Vec::new(), PlacementLimits::default())
-            .unwrap();
-    let _child = HeldFork::start();
-    drop(directory);
-    let reopened = PlacementDirectory::open(&root, node, PlacementLimits::default()).unwrap();
-    assert_eq!(reopened.current().generation, 1);
 }

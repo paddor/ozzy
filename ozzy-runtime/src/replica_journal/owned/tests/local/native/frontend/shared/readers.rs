@@ -295,8 +295,13 @@ async fn overlap() {
     assert_eq!(healthy.partition, 1);
     assert_eq!(healthy.offset, Offset::ZERO);
     assert_eq!(healthy.message_id, MessageId::from_bytes([90; 16]));
+    assert_eq!(
+        reader.stats().live_records,
+        1,
+        "healthy record uses PUB before repair is released"
+    );
     for message in harness.readers.records.drain(..) {
-        harness.server.try_send(message).unwrap();
+        harness.data_server.try_send(message).unwrap();
     }
     harness.readers.hold_records = false;
     for n in 0..5 {
@@ -314,10 +319,11 @@ async fn overlap() {
             "unpolled cancellation keeps individual progress"
         );
     }
-    assert_eq!(
-        reader.stats().live_records,
-        2,
-        "healthy record and held suffix use PUB"
+    let stats = reader.stats();
+    assert_eq!(stats.live_records + stats.replayed_records, 6);
+    assert!(
+        stats.replayed_records >= 2,
+        "the missing prefix uses PEER repair"
     );
     harness.drive(reader.close(), true).await.unwrap();
     harness.drive(writer.close(), true).await.unwrap();

@@ -1,11 +1,7 @@
 use super::*;
 use crate::replica_journal::{JournalCompletion, OwnedWriteStep};
 use ozzy_journal::operation::{CanonicalOperation, OperationKind, logical_operation_digest};
-use ozzy_replication::{
-    Admission, OpNumber, WriteTicket,
-    driver::ReplicaDriver,
-    wire::{Control, Grant},
-};
+use ozzy_replication::{Admission, OpNumber, WriteTicket, driver::ReplicaDriver, wire::Control};
 
 pub(super) struct Replica {
     pub(super) journal: OwnedJournal,
@@ -146,19 +142,12 @@ pub(super) fn synchronize(controller: &mut Controller, replica: &mut Replica) {
 
 pub(super) fn confirm(primary: &mut Replica, backup: &Replica, mode: QuorumPolicy) {
     let normal = backup.driver.normal().unwrap();
-    let grant = Grant {
-        revision: 1,
-        record_limit: 16,
-        byte_limit: 8192,
-    };
     let message = match mode {
         QuorumPolicy::Durable => Control::PrepareOk {
             ack: normal.acknowledgment().unwrap(),
-            grant,
         },
         QuorumPolicy::Replicated => Control::PrepareRetained {
             ack: normal.retained_acknowledgment().unwrap(),
-            grant,
         },
     };
     primary
@@ -249,8 +238,7 @@ pub(super) fn initialize_writer(
     receipt
 }
 
-#[test]
-fn owned_sdk_lz4_payload_survives_write_history_and_recovery_byte_exact() {
+fn packed_append_body(limits: ozzy_journal::operation::OperationLimits, payload: &[u8]) -> Vec<u8> {
     use ozzy_journal::operation::{
         Append, AppendBatch, AppendPackResult, AppendPackScratch, AppendRecord, OperationBody,
         encode_operation_body, pack_append_payload,
@@ -259,16 +247,8 @@ fn owned_sdk_lz4_payload_survives_write_history_and_recovery_byte_exact() {
         MessageId, Offset, OwnerEpoch, PartitionIncarnation, ProducerEpoch, ProducerId,
         ProducerSequence,
     };
-    use ozzy_replication::{LogSource, wire::FetchOps};
-
-    let (mut controller, io) = setup();
-    let mut replica = replica(&mut controller, io.clone(), 0, QuorumPolicy::Durable, 8192);
-    let limits = replica.config.limits.operations;
     let partition = PartitionIncarnation::from_bytes([11; 16]);
     let producer_id = ProducerId::from_bytes([12; 16]);
-    let receipt = initialize_writer(&mut controller, &mut replica);
-    let predecessor = replica.driver.normal().unwrap().snapshot().accepted;
-    let payload = vec![42; 4096];
     let append = OperationBody::Append(Append {
         batches: vec![AppendBatch {
             partition,
@@ -281,7 +261,7 @@ fn owned_sdk_lz4_payload_survives_write_history_and_recovery_byte_exact() {
             records: vec![AppendRecord {
                 encoding: ozzy_proto::data::Encoding::Raw,
                 message_id: MessageId::from_bytes([14; 16]),
-                parts: vec![payload.as_slice()].into(),
+                parts: vec![payload].into(),
             }]
             .into(),
         }],
@@ -296,6 +276,21 @@ fn owned_sdk_lz4_payload_survives_write_history_and_recovery_byte_exact() {
         .unwrap(),
         AppendPackResult::Packed { .. }
     ));
+    packed
+}
+
+#[test]
+fn owned_sdk_lz4_payload_survives_write_history_and_recovery_byte_exact() {
+    use ozzy_proto::{Offset, PartitionIncarnation};
+    use ozzy_replication::{LogSource, wire::FetchOps};
+
+    let (mut controller, io) = setup();
+    let mut replica = replica(&mut controller, io.clone(), 0, QuorumPolicy::Durable, 8192);
+    let partition = PartitionIncarnation::from_bytes([11; 16]);
+    let receipt = initialize_writer(&mut controller, &mut replica);
+    let predecessor = replica.driver.normal().unwrap().snapshot().accepted;
+    let payload = vec![42; 4096];
+    let packed = packed_append_body(replica.config.limits.operations, &payload);
     let (_, mut reused, append_receipt) = admit_encoded(
         &mut controller,
         &mut replica,
@@ -343,6 +338,101 @@ fn owned_sdk_lz4_payload_survives_write_history_and_recovery_byte_exact() {
     .unwrap();
     assert_eq!(startup.recovered().unwrap().log.accepted, source.accepted);
     drive(&mut controller, journal.shutdown()).unwrap();
+}
+
+#[test]
+fn owned_follower_writes_primary_validated_lz4_payload() {
+    use ozzy_journal::operation::{canonical_body_digest, decode_append_summary};
+    use ozzy_proto::{LinkSessionId, Offset, PartitionIncarnation};
+    use ozzy_replication::wire::{
+        PeerBinding, Prepare, ReplicaMessage, WireLimits, decode, encode_prepare_metadata,
+    };
+
+    let (mut controller, io) = setup();
+    let mut follower = replica(&mut controller, io, 1, QuorumPolicy::Durable, 8192);
+    let initial = initialize_writer(&mut controller, &mut follower);
+    let limits = follower.config.limits.operations;
+    let partition = PartitionIncarnation::from_bytes([11; 16]);
+    let payload = vec![42; 4096];
+    let packed = packed_append_body(limits, &payload);
+    // The primary validates before canonical construction. Decode only proves
+    // that the transmitted bytes match the primary's body digest.
+    decode_append_summary(&packed, limits).unwrap();
+    let ticket = follower.driver.begin_validation().unwrap();
+    let predecessor = ticket.accepted();
+    let primary = NodeId::from_bytes([1; 16]);
+    let session = LinkSessionId::from_bytes([9; 16]);
+    let operation = ozzy_replication::wire::Operation::from_verified(
+        CanonicalOperation {
+            group_id: ticket.scope().group_id,
+            configuration_epoch: ticket.scope().configuration_epoch,
+            original_view: ticket.scope().view,
+            op_number: predecessor.op.0 + 1,
+            previous_digest: predecessor.digest,
+            kind: OperationKind::Append,
+            body: &packed,
+        },
+        canonical_body_digest(&packed),
+    );
+    let operations = [operation];
+    let prepare_message = Prepare {
+        scope: ticket.scope(),
+        committed: Prefix::GENESIS,
+        operations: &operations,
+    };
+    let mut metadata = [0; 512];
+    let wire = encode_prepare_metadata(
+        primary,
+        session,
+        prepare_message,
+        &mut metadata,
+        WireLimits::default(),
+    )
+    .unwrap();
+    let binding = PeerBinding::new(
+        follower.config.configuration.configuration(),
+        primary,
+        session,
+    )
+    .unwrap();
+    let frames: [&[u8]; 3] = [&wire.header, &metadata[..wire.metadata_bytes], &packed];
+    let ReplicaMessage::Prepare(batch) = decode(&frames, binding, WireLimits::default()).unwrap()
+    else {
+        panic!("prepare");
+    };
+    let mut buffer = follower.journal.lease_append_buffer().unwrap();
+    buffer
+        .push_primary_verified(batch.verified_operations().next().unwrap())
+        .unwrap();
+    assert!(buffer.primary_payloads_validated());
+    let mut validated = drive(
+        &mut controller,
+        follower.journal.validate_append(ticket, buffer),
+    )
+    .unwrap();
+    assert!(follower.journal.can_admit(&mut validated));
+    let Admission::Write { ticket: write, .. } = follower
+        .driver
+        .prepare_validated(primary, ticket, validated.prepared(), Duration::ZERO)
+        .unwrap()
+    else {
+        panic!("write ticket");
+    };
+    let (_, _, receipt) = follower
+        .journal
+        .admit_append(write, validated)
+        .unwrap()
+        .into_parts();
+    let work = prepare(&mut follower);
+    let records = finish(&mut controller, &mut follower, work);
+    let last = records.records.last().unwrap();
+    let decoded = last.decoded_batches();
+    let stored = last.record(partition, Offset::ZERO, &decoded).unwrap();
+    assert_eq!(stored.parts().next().unwrap(), payload.as_slice());
+    settle(&mut follower, initial);
+    settle(&mut follower, receipt);
+    synchronize(&mut controller, &mut follower);
+    drive(&mut controller, follower.journal.shutdown()).unwrap();
 }
 
 #[test]

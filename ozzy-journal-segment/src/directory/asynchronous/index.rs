@@ -28,6 +28,7 @@ impl Journal {
         Ok((reference, source))
     }
 
+    /// Open a derived index bound to an exact selected sealed segment.
     pub async fn open_sealed_index(
         &self,
         segment: u64,

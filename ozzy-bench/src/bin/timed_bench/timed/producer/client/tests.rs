@@ -64,16 +64,18 @@ async fn start_broker(partitions: u32) -> (tempfile::TempDir, ozzy_broker::Broke
     let reservations = [
         TcpListener::bind("127.0.0.1:0").unwrap(),
         TcpListener::bind("127.0.0.1:0").unwrap(),
+        TcpListener::bind("127.0.0.1:0").unwrap(),
     ];
     let peer = format!("tcp://{}", reservations[0].local_addr().unwrap());
     let readers = format!("tcp://{}", reservations[1].local_addr().unwrap());
+    let data_peer = format!("tcp://{}", reservations[2].local_addr().unwrap());
     let root = toml::Value::String(directory.path().join("local").to_str().unwrap().into());
-    // Four writers need independent backed grants while the reader copies run.
+    // Four writers need independent bounded request state while the reader copies run.
     let document = format!(
         "[cluster]\nmode = \"single\"\n\
          [topics.orders]\nconfirmation = \"local-durable\"\npartitions = {partitions}\n\
          segment_bytes = 1048576\nmax_append_bytes = 65536\n\
-         [brokers.local.endpoints]\npeer = \"{peer}\"\nreader_pub = \"{readers}\"\n\
+         [brokers.local.endpoints]\npeer = \"{peer}\"\ndata_peer = \"{data_peer}\"\nreader_pub = \"{readers}\"\n\
          [brokers.local.devices.ssd]\nroot = {root}\ncontroller = \"ssd\"\n\
          [brokers.local.devices.ssd.workers]\nbackend = \"pool\"\n\
          write_threads = 1\nmax_inflight = 8\nqueued_jobs = 32\nqueued_bytes = 8388608\n\
@@ -86,7 +88,7 @@ async fn start_broker(partitions: u32) -> (tempfile::TempDir, ozzy_broker::Broke
     let checked = deployment.checked("local").unwrap();
     let setup = json!({
         "topic":"orders", "partitions":partitions,
-        "brokers":[{"node":checked.identity.brokers["local"].to_string(), "endpoint":peer}],
+        "brokers":[{"node":checked.identity.brokers["local"].to_string(), "endpoint":peer, "data_endpoint":data_peer}],
         "append":{"writers":4*partitions, "requests":16*partitions,
             "records":128*partitions, "bytes":268_435_456_u64*u64::from(partitions)},
         "reader":{"subscriptions":2*partitions, "bytes":16_777_216, "queue_messages":4},
@@ -109,7 +111,7 @@ async fn exercise_pacing(record_bytes: usize, read: bool) {
     let (writers, links) = connect_shared(&runtime, &config, &setup, 0..4)
         .await
         .unwrap();
-    assert_eq!(links.socket_count(), 1);
+    assert_eq!(links.socket_count(), 2);
     for lane in 0..4 {
         super::super::build_payload_pool(&config, lane).unwrap();
     }
@@ -221,7 +223,7 @@ async fn partition_workers() {
             let (assigned, connection) = native::connect(&runtime, &config, &setup, index)
                 .await
                 .unwrap();
-            assert_eq!(connection.socket_count(), 2);
+            assert_eq!(connection.socket_count(), 3);
             links.push(connection);
             tasks.extend(assigned);
         }
@@ -269,8 +271,8 @@ async fn check_readers(
     use super::super::super::reader::native;
     let (tasks, links) = native::connect(runtime, config, setup, 0).await.unwrap();
     assert_eq!(tasks.len(), 2);
-    // Both logical readers share one PEER and one SUB socket.
-    assert_eq!(links.socket_count(), 2);
+    // Both logical readers share two PEER sockets and one SUB socket.
+    assert_eq!(links.socket_count(), 3);
     let (_finish, finished) = tokio::sync::watch::channel(Some(vec![1, 1, 0, 0]));
     let reports = try_join_all(
         tasks

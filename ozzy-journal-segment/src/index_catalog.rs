@@ -22,22 +22,29 @@ const OFFSET_HINT_CAPACITY: usize = 64;
 /// Message identity plus corresponding authoritative record location.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexedMessageLocation {
+    /// Exact immutable segment prefix binding this selector.
     pub source: IndexSource,
+    /// Message-identity selector for this exact record.
     pub message: MessageIndexEntry,
+    /// Offset selector for the same selected record.
     pub offset: OffsetIndexEntry,
 }
 
 /// Offset result bound to its source segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexedOffsetLocation {
+    /// Exact immutable segment prefix binding this selector.
     pub source: IndexSource,
+    /// Validated record or operation selector bound to the exact source.
     pub entry: OffsetIndexEntry,
 }
 
 /// Operation-ID result bound to its source segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexedOperationLocation {
+    /// Exact immutable segment prefix binding this selector.
     pub source: IndexSource,
+    /// Validated record or operation selector bound to the exact source.
     pub entry: OperationIndexEntry,
 }
 
@@ -77,6 +84,7 @@ struct OffsetHint {
 }
 
 impl SegmentIndexCatalog {
+    /// Open and validate exact selected index sources within the configured bounds.
     pub fn open(
         directory: impl AsRef<Path>,
         sources: Vec<IndexSource>,
@@ -132,18 +140,22 @@ impl SegmentIndexCatalog {
         })
     }
 
+    /// Persistent replication-group identity.
     pub const fn group_id(&self) -> Option<GroupId> {
         self.group_id
     }
 
+    /// Number of exact segment sources in this catalog.
     pub fn segment_count(&self) -> usize {
         self.sources.len()
     }
 
+    /// Exact immutable segment sources in catalog order.
     pub fn sources(&self) -> &[IndexSource] {
         &self.sources
     }
 
+    /// Look up an exact partition incarnation and global record offset.
     pub fn find_offset(
         &self,
         partition: PartitionIncarnation,
@@ -214,6 +226,7 @@ impl SegmentIndexCatalog {
         Ok(None)
     }
 
+    /// Look up an exact partition incarnation and record identity.
     pub fn find_message(
         &self,
         partition: PartitionIncarnation,
@@ -251,6 +264,7 @@ impl SegmentIndexCatalog {
         Ok(None)
     }
 
+    /// Look up an exact canonical control-operation identity.
     pub fn find_operation(
         &self,
         operation_id: OperationId,
@@ -443,13 +457,18 @@ fn validate_sources(sources: &[IndexSource]) -> Result<(), IndexCatalogError> {
 #[derive(Debug, Error)]
 pub enum IndexCatalogError {
     #[error(transparent)]
+    /// A physical file operation failed.
     Io(#[from] std::io::Error),
     #[error(transparent)]
+    /// Derived index construction or validation failed.
     Index(#[from] IndexBuildError),
     #[error("index catalog path is not a directory")]
+    /// The named artifact is not a directory.
     NotDirectory,
     #[error("index catalog sources are from different or discontinuous histories")]
+    /// Index catalog sources are from different or discontinuous histories.
     InvalidSources,
     #[error("validated message index has no matching offset entry")]
+    /// Validated message index has no matching offset entry.
     InconsistentIndex,
 }

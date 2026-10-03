@@ -29,6 +29,7 @@ pub struct Opening {
 }
 
 impl Opening {
+    /// Exact validated metadata manifest held by this object.
     pub const fn manifest(&self) -> &Manifest {
         &self.selected.manifest
     }
@@ -119,6 +120,7 @@ impl Journal {
         let access = Access {
             io: io.clone(),
             protection: None,
+            readers: std::rc::Rc::default(),
         };
         let directory = access.open_directory(parent.clone()).await?;
         access.done(Operation::Close { handle: directory }).await?;

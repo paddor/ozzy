@@ -57,7 +57,7 @@ impl RecordBuffer {
         }
     }
 
-    /// Append one whole record within current count/part/byte credit. Failure
+    /// Append one whole record within current count/part/byte capacity. Failure
     /// leaves contents and capacities unchanged. Parts must repeat when cloned.
     pub fn push<'a>(
         &mut self,

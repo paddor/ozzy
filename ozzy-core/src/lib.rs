@@ -2,6 +2,7 @@
 //!
 //! Group authority lives in `ozzy-replication`. These modules perform no I/O.
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 pub mod live;
 pub mod reader;

@@ -35,11 +35,15 @@ fn service(routes: Vec<directory::RouteState>) -> Service {
         })
         .collect();
     let table = RoutingTable::new(&[7], &placements, 2, EnvelopeLimits::default()).unwrap();
-    let (sender, _input) = dispatch::channel::<Message>(dispatch::Limits {
-        capacity: budgets(),
-        clients: 1,
-        grants: 1,
-    })
+    let (sender, _input) = crate::frontend::data_channel(
+        &omq_tokio::Context::new(),
+        7,
+        Kind::Client,
+        dispatch::Class::Control,
+        1,
+        4096,
+        8192,
+    )
     .unwrap();
     let queue = QueueLimits {
         messages: 2,
@@ -52,7 +56,7 @@ fn service(routes: Vec<directory::RouteState>) -> Service {
         vec![(7, sender)],
         DispatcherLimits {
             peers: 1,
-            grants_per_class: 1,
+
             replies: ReplyLimits {
                 data: queue,
                 control: queue,
@@ -273,7 +277,9 @@ fn scenario(policy: QuorumPolicy) {
         &mut service,
         identities.iter().map(|identity| identity.0).collect(),
     );
-    let mut port = service.port(7, budgets()).unwrap();
+    let mut port = service
+        .port(&omq_tokio::Context::new(), 7, budgets())
+        .unwrap();
     let mut publisher = RoutePublisher::new(&shards[1], &identities, 1).unwrap();
     let mut cx = Context::from_waker(Waker::noop());
     // The sole control slot stays occupied by the older first publication.

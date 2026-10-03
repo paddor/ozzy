@@ -322,27 +322,42 @@ async fn refused_subscription_is_sent_again_at_the_request_retry_interval() {
             )
             .await
             .unwrap();
-        let mut refused_at = None;
-        for _ in 0..3000 {
+        let retry = Duration::from_millis(100);
+        // Socket workers run independently of virtual time. Observe receipt
+        // before advancing time, then keep time fixed during each delivery.
+        for _ in 0..10000 {
             harness.pump(true);
             assert!(futures::poll!(pin!(reader.next())).is_pending());
-            if refused_at.is_none() && harness.readers.refuse_subscribes == 0 {
-                refused_at = Some(clock.now());
+            if reader.deadline() == Some(retry) {
+                break;
             }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(clock.now(), Duration::ZERO);
+        assert_eq!(reader.deadline(), Some(retry), "refusal was not observed");
+        assert_eq!(harness.readers.requests.len(), 1);
+        clock.advance(Duration::from_millis(99)).unwrap();
+        for _ in 0..1000 {
+            harness.pump(true);
+            assert!(futures::poll!(pin!(reader.next())).is_pending());
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            harness.readers.requests.len(),
+            1,
+            "subscription retried early"
+        );
+        clock.advance(retry).unwrap();
+        for _ in 0..10000 {
+            harness.pump(true);
+            assert!(futures::poll!(pin!(reader.next())).is_pending());
             if harness.readers.requests.len() == 2 {
                 break;
             }
-            clock
-                .advance(clock.now().saturating_add(Duration::from_millis(1)))
-                .unwrap();
             tokio::task::yield_now().await;
         }
         assert_eq!(harness.readers.requests.len(), 2, "no second subscription");
-        let waited = clock.now().saturating_sub(refused_at.unwrap());
-        assert!(
-            waited <= Duration::from_millis(150),
-            "the refused subscription waited {waited:?}"
-        );
+        assert_eq!(clock.now(), retry);
         harness.drive(links.shutdown(), true).await.unwrap();
         let _ = harness.drive(reader.close(), true).await;
         harness.shutdown().await;

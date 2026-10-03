@@ -1076,23 +1076,6 @@ fn group_subscription_credit_and_cancellation_are_fenced_and_exact() {
     for n in 0..bytes.len() {
         assert!(reader::decode_subscribe(packet(e, &bytes[..n]), limits).is_err());
     }
-    let credit = reader::Credit {
-        subscription: subscription(),
-        source,
-        records: 1024,
-        bytes: 1024 * 1024,
-    };
-    let e = envelope(Opcode::Credit, false);
-    reader::encode_credit(e, credit, &mut bytes, limits).unwrap();
-    assert_eq!(
-        reader::decode_credit(packet(e, &bytes), limits).unwrap(),
-        credit
-    );
-    for n in 0..bytes.len() {
-        assert!(reader::decode_credit(packet(e, &bytes[..n]), limits).is_err());
-    }
-    bytes.push(0);
-    assert!(reader::decode_credit(packet(e, &bytes), limits).is_err());
     let selected = Subscribed {
         subscription: subscription(),
         source,
@@ -1109,33 +1092,6 @@ fn group_subscription_credit_and_cancellation_are_fenced_and_exact() {
         reader::decode_unsubscribed(packet(e, &bytes), limits).unwrap(),
         selected
     );
-}
-
-#[test]
-fn correlated_credit_confirms_exact_subscription_capacity() {
-    let limits = DataLimits::default().envelope;
-    let credit = reader::Credit {
-        subscription: subscription(),
-        source: sources()[1],
-        records: 3,
-        bytes: 4096,
-    };
-    let mut bytes = Vec::with_capacity(1024);
-    let reply = envelope(Opcode::Credit, true);
-    reader::encode_credit(reply, credit, &mut bytes, limits).unwrap();
-    assert_eq!(
-        reader::decode_credit(packet(reply, &bytes), limits).unwrap(),
-        credit
-    );
-    assert_eq!(
-        reader::route_subscription(packet(reply, &bytes), limits).unwrap(),
-        (credit.subscription, credit.source)
-    );
-    let uncorrelated = Envelope {
-        request_id: None,
-        ..reply
-    };
-    assert!(reader::encode_credit(uncorrelated, credit, &mut bytes, limits).is_err());
 }
 
 #[test]

@@ -143,6 +143,8 @@ impl Process {
             args.aio_depth.to_string(),
             "--writer-batch-records".into(),
             args.writer_batch_records.to_string(),
+            "--writer-batch-target-kib".into(),
+            args.writer_batch_target_kib.to_string(),
             "--writer-inflight-appends".into(),
             args.writer_inflight_appends.to_string(),
             "--reader-records".into(),

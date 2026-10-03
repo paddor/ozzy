@@ -158,11 +158,8 @@ async fn multiple() {
     assert_eq!(keyless.partition(), 0);
     assert_eq!(keyless.sequence(), 1);
     harness.drive(keyless.confirmed(), true).await.unwrap();
-    assert_eq!(links.socket_count(), 3);
-    assert_eq!(
-        links.session(authority.primary),
-        harness.client.as_ref().map(|client| client.1)
-    );
+    assert_eq!(links.socket_count(), 2);
+    assert_eq!(links.session(authority.primary), harness.session);
     // Drained unused owners returned their aggregate reservation.
     let idle = harness
         .drive(
@@ -245,7 +242,7 @@ async fn scenario() {
     assert_eq!(first.record.policy, Policy::LocalDurable);
     assert_eq!(second.record.policy, Policy::LocalDurable);
     assert_eq!(links.session(authority.primary), Some(session));
-    assert_eq!(links.socket_count(), 3);
+    assert_eq!(links.socket_count(), 2);
     harness.drive(a.flush(), true).await.unwrap();
     harness.drive(a.close(), true).await.unwrap();
     harness.drive(b.close(), true).await.unwrap();

@@ -3,8 +3,11 @@ use std::{io, sync::Arc, sync::mpsc};
 /// Execution role, independent of partition count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Worker {
+    /// Ordinary execution worker with its fixed pool index.
     Data(usize),
+    /// Worker for reserved barriers, recovery, and release work.
     Progress,
+    /// Worker owning the direct-write driver and its kernel state.
     Direct,
 }
 

@@ -7,7 +7,9 @@ use fanring::teardown::Coordinated;
 
 mod notified;
 
-pub(crate) use fanring::mpsc::{RecvError, TryRecvError, TrySendError};
+#[cfg(test)]
+pub(crate) use fanring::mpsc::RecvError;
+pub(crate) use fanring::mpsc::{TryRecvError, TrySendError};
 pub(crate) use notified::{NotifiedReceiver, NotifiedSender, notified_channel};
 
 pub(crate) type Sender<T> = fanring::mpsc::Sender<T, Coordinated>;

@@ -10,13 +10,12 @@ use crate::{
     ApplicationShards, CheckedConfig, DevicePools, Frontend, JournalPlan, RecoverySelection,
     StartupError,
 };
+pub(crate) use config::NATIVE_ARENAS;
 use drain::DeviceDrain;
+pub use drain::StorageOwner;
 use omq_tokio::Context;
 use ozzy_config::BrokerIdentity;
-use ozzy_runtime::{
-    dispatch,
-    frontend::{GrantRequests, Links, Port},
-};
+use ozzy_runtime::frontend::{DataSender, Links, Port};
 use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::{mpsc, oneshot};
 
@@ -31,7 +30,10 @@ pub struct Broker {
 
 struct Registration {
     id: u32,
-    sender: dispatch::Sender<omq_tokio::Message>,
+    sender: DataSender,
+    broker_control: DataSender,
+    data: DataSender,
+    replica: DataSender,
     routes: Vec<ozzy_proto::directory::RouteState>,
     handoff: oneshot::Sender<Binding>,
 }
@@ -39,7 +41,6 @@ struct Registration {
 struct Binding {
     links: Links,
     port: Port,
-    requests: GrantRequests,
 }
 
 impl Broker {
@@ -94,23 +95,66 @@ impl Broker {
         );
         crate::check_volumes(&checked, &local)?;
         journals.check_recovery_intents()?;
-        let config = Arc::new(config::Config::new(&checked)?);
-        let checked = Arc::new(checked);
+        let omq = context.unwrap_or_else(|| {
+            Context::with_config_and_name(
+                omq_tokio::ContextConfig {
+                    io_threads: checked.plan.omq_io_threads,
+                },
+                format!("ozzy_omq-{}", checked.plan.name),
+            )
+        });
         let (devices, lanes) = DevicePools::start(&checked.plan)?;
+        Self::start_on_lanes(checked, journals, omq, lanes, devices).await
+    }
+
+    /// Serve using an externally owned file backend. The caller must provision
+    /// and validate its volume bindings before this call. Partition identity and
+    /// recovery preflight use the supplied backend and never format missing data.
+    /// Storage remains owned through canceled startup and shutdown observations.
+    pub async fn start_trusted_with_storage<B: ozzy_io::Backend + 'static>(
+        checked: CheckedConfig,
+        local: BrokerIdentity,
+        context: Context,
+        lanes: Vec<crate::ShardIo<B>>,
+        storage: impl StorageOwner,
+    ) -> Result<Self, StartupError> {
+        let journals = Arc::new(JournalPlan::from_trusted_deployment(&checked, &local)?);
+        Self::start_on_lanes(checked, journals, context, lanes, storage).await
+    }
+
+    async fn start_on_lanes<B: ozzy_io::Backend + 'static>(
+        checked: CheckedConfig,
+        journals: Arc<JournalPlan>,
+        omq: Context,
+        lanes: Vec<crate::ShardIo<B>>,
+        devices: impl StorageOwner,
+    ) -> Result<Self, StartupError> {
+        let config = Arc::new(config::Config::new(&checked, omq.clone())?);
+        let checked = Arc::new(checked);
         let application_start =
             StartupRegistration::new(Arc::new(Lifecycle::new(checked.plan.shards.len())));
         let frontend_start = StartupRegistration::new(Arc::new(Lifecycle::new(1)));
         let devices = DeviceDrain::new(devices, application_start.state(), frontend_start.state());
         let (send, mut registrations) = mpsc::channel(checked.plan.shards.len());
+        let preflight = Arc::new(tokio::sync::Barrier::new(checked.plan.shards.len()));
         let application = ApplicationShards::start_registered(
             &checked.plan,
             lanes,
             {
                 let journals = journals.clone();
                 let config = config.clone();
-                move |shard| shard::run(shard, journals.clone(), config.clone(), send.clone())
+                move |shard| {
+                    shard::run(
+                        shard,
+                        journals.clone(),
+                        config.clone(),
+                        send.clone(),
+                        preflight.clone(),
+                    )
+                }
             },
             application_start,
+            !config.brokers.is_empty(),
         );
         let frontend = async {
             let mut registered = BTreeMap::new();
@@ -132,6 +176,7 @@ impl Broker {
                     .serve(
                         service,
                         serving_config.brokers.clone(),
+                        serving_config.followers.clone(),
                         serving_config.buffers,
                         std::time::Duration::from_millis(10),
                     )
@@ -143,7 +188,7 @@ impl Broker {
                 config.local,
                 endpoints,
                 config.transport,
-                context,
+                Some(omq),
                 factory,
                 frontend_start,
             )
@@ -178,12 +223,15 @@ impl Broker {
         }
     }
 
+    /// Number of application-shard owner threads.
     pub fn application_threads(&self) -> usize {
         self.application.thread_count()
     }
+    /// Number of broker-owned dispatcher threads.
     pub fn dispatcher_threads(&self) -> usize {
         self.frontend.dispatcher_threads()
     }
+    /// Number of OMQ-owned transport threads.
     pub fn io_threads(&self) -> usize {
         self.frontend.io_threads()
     }

@@ -1,38 +1,49 @@
+mod lifecycle;
 use super::*;
-use crate::dispatch::{Budget, Quota, SendFailure};
-use crate::frontend::GrantTarget;
+use crate::dispatch::{Budget, Budgets, SendFailure};
+use crate::frontend::Service;
 use crate::frontend::service::tests::{begin, remote, reply, setup};
-use crate::frontend::{Subject, WatchLimits, WatchRegistry};
-use ozzy_proto::{Opcode, ProducerId, directory, handshake};
+use crate::frontend::{WatchLimits, WatchRegistry};
+use bytes::Bytes;
+use ozzy_proto::{NodeId, Opcode, directory, handshake};
 
-fn capacity() -> Budgets {
-    Budgets {
-        data: Budget {
-            queue_slots: 1,
-            retained_messages: 1,
-            bytes: 4096,
+#[tokio::test]
+async fn progress_retries_network_send_after_registering_capacity_wait() {
+    let (mut service, _lanes, _) = setup();
+    let client = remote(1, handshake::PRODUCER);
+    let (binding, _) = begin(&mut service, &client, NodeId::from_bytes([1; 16]));
+    service
+        .try_reply(Class::Data, reply(binding, Opcode::Records))
+        .unwrap();
+    let available = std::rc::Rc::new(std::cell::Cell::new(false));
+    let for_send = available.clone();
+    let mut progress = Box::pin(service.progress_with(
+        move |message| {
+            if for_send.get() {
+                Ok(())
+            } else {
+                Err(omq_tokio::TrySendError::Full(message))
+            }
         },
-        control: Budget {
-            queue_slots: 2,
-            retained_messages: 2,
-            bytes: 8192,
+        |_| {
+            let available = available.clone();
+            Box::pin(std::future::poll_fn(move |_| {
+                // Space became available before this waiter captured its baseline.
+                available.set(true);
+                Poll::Pending
+            }))
         },
-    }
-}
-
-fn ingress_capacity() -> Budgets {
-    let mut limits = capacity();
-    limits.control.queue_slots = 1;
-    limits.control.bytes = 4096;
-    limits
+    ));
+    assert!(futures::poll!(progress.as_mut()).is_ready());
 }
 
 #[tokio::test]
 async fn reply_capacity_follows_transport_aliases_and_unobserved_completions() {
+    let context = omq_tokio::Context::new();
     let (mut service, _lanes, _) = setup();
     let client = remote(1, handshake::PRODUCER);
     let (binding, _) = begin(&mut service, &client, NodeId::from_bytes([1; 16]));
-    let mut port = service.port(0, capacity()).unwrap();
+    let mut port = service.port(&context, 0, capacity()).unwrap();
     let packet = reply(binding, Opcode::Records);
     let pending = port.try_reply(Class::Data, packet.clone(), 2048).unwrap();
     assert!(service.poll_command().unwrap());
@@ -56,14 +67,14 @@ async fn reply_capacity_follows_transport_aliases_and_unobserved_completions() {
     // The reply observer itself is bounded until it consumes the outcome.
     assert!(port.try_reply(Class::Data, packet.clone(), 2048).is_err());
     let generation = port.generation();
-    pending.await.unwrap().unwrap();
+    observe(&mut port, pending).await.unwrap().unwrap();
     let ready = port.changed_after(generation);
     tokio::time::timeout(std::time::Duration::from_secs(1), ready)
         .await
         .unwrap();
     let pending = port.try_reply(Class::Data, packet, 2048).unwrap();
     assert!(service.poll_command().unwrap());
-    pending.await.unwrap().unwrap();
+    observe(&mut port, pending).await.unwrap().unwrap();
     let mut backing = None;
     service
         .flush(|message| {
@@ -86,10 +97,11 @@ async fn reply_capacity_follows_transport_aliases_and_unobserved_completions() {
 
 #[tokio::test]
 async fn full_port_wakes_when_dispatcher_exits() {
+    let context = omq_tokio::Context::new();
     let (mut service, _lanes, _) = setup();
     let client = remote(1, handshake::PRODUCER);
     let (binding, _) = begin(&mut service, &client, NodeId::from_bytes([1; 16]));
-    let mut port = service.port(0, capacity()).unwrap();
+    let mut port = service.port(&context, 0, capacity()).unwrap();
     let packet = reply(binding, Opcode::Records);
     let pending = port.try_reply(Class::Data, packet.clone(), 2048).unwrap();
     let generation = port.generation();
@@ -104,11 +116,12 @@ async fn full_port_wakes_when_dispatcher_exits() {
         port.try_reply(Class::Data, packet, 2048),
         Err((PortError::Admission(SendFailure::Closed), _))
     ));
-    assert_eq!(pending.await, Err(PortError::Closed));
+    assert_eq!(observe(&mut port, pending).await, Err(PortError::Closed));
 }
 
 #[tokio::test]
 async fn full_peer_returns_original_message_and_cannot_deadlock_its_own_retry_credit() {
+    let context = omq_tokio::Context::new();
     let (mut service, _lanes, _) = setup();
     let client = remote(1, handshake::PRODUCER);
     let (binding, _) = begin(&mut service, &client, NodeId::from_bytes([1; 16]));
@@ -117,152 +130,24 @@ async fn full_peer_returns_original_message_and_cannot_deadlock_its_own_retry_cr
             .try_reply(Class::Data, reply(binding, Opcode::Records))
             .unwrap();
     }
-    let mut port = service.port(0, capacity()).unwrap();
+    let mut port = service.port(&context, 0, capacity()).unwrap();
     let pending = port
         .try_reply(Class::Data, reply(binding, Opcode::Records), 2048)
         .unwrap();
     service.poll_command().unwrap();
-    let (error, message) = pending.await.unwrap().unwrap_err();
+    let (error, message) = observe(&mut port, pending).await.unwrap().unwrap_err();
     assert_eq!(error, ReplyError::Full);
     service.poll_command().unwrap();
     // Keep returned bytes alive while reusing the released queue reservation.
     let again = port.try_reply(Class::Data, message, 2048).unwrap();
     service.flush(|_| Ok(())).unwrap();
     service.poll_command().unwrap();
-    again.await.unwrap().unwrap();
-}
-
-#[tokio::test]
-async fn grant_installation_uses_reserved_control_and_checks_originating_shard() {
-    let (mut service, mut lanes, placements) = setup();
-    let client = remote(1, handshake::PRODUCER);
-    let (binding, _) = begin(&mut service, &client, NodeId::from_bytes([1; 16]));
-    let mut port = service.port(0, capacity()).unwrap();
-    let data = port
-        .try_reply(Class::Data, reply(binding, Opcode::Records), 2048)
-        .unwrap();
-    let owner = lanes[0]
-        .credits()
-        .client(binding.session, ingress_capacity())
-        .unwrap();
-    let grant = lanes[0]
-        .credits()
-        .grant(
-            &owner,
-            Class::Data,
-            Quota {
-                messages: 1,
-                bytes: 4096,
-            },
-        )
-        .unwrap();
-    let subject = Subject {
-        group: placements[0].group,
-        writer: Some(ProducerId::from_bytes([4; 16])),
-    };
-    let installed = port.try_install(binding.peer, subject, grant).unwrap();
-    for _ in 0..2 {
-        assert!(service.poll_command().unwrap());
-    }
-    data.await.unwrap().unwrap();
-    installed.await.unwrap().unwrap();
-    service
-        .receive(
-            crate::frontend::test_support::append(placements[0], binding),
-            4096,
-        )
-        .unwrap();
-    assert!(lanes[0].try_recv().unwrap().is_some());
-    let mut wrong_port = service.port(17, capacity()).unwrap();
-    let grant = lanes[0]
-        .credits()
-        .grant(
-            &owner,
-            Class::Control,
-            Quota {
-                messages: 1,
-                bytes: 4096,
-            },
-        )
-        .unwrap();
-    let result = wrong_port
-        .try_install(
-            binding.peer,
-            Subject {
-                writer: None,
-                ..subject
-            },
-            grant,
-        )
-        .unwrap();
-    for _ in 0..2 {
-        service.poll_command().unwrap();
-    }
-    let (error, grant) = result.await.unwrap().unwrap_err();
-    assert_eq!(error, SetupError::Destination);
-    let result = wrong_port
-        .try_install(binding.peer, GrantTarget::Control(0), grant)
-        .unwrap();
-    for _ in 0..2 {
-        service.poll_command().unwrap();
-    }
-    let (error, grant) = result.await.unwrap().unwrap_err();
-    assert_eq!(error, SetupError::Destination);
-    let result = port
-        .try_install(binding.peer, GrantTarget::Control(0), grant)
-        .unwrap();
-    for _ in 0..2 {
-        service.poll_command().unwrap();
-    }
-    result.await.unwrap().unwrap();
-}
-
-#[tokio::test]
-async fn cancellation_keeps_installed_grant_revocable_and_service_drop_closes_observers() {
-    let (mut service, mut lanes, placements) = setup();
-    let client = remote(1, handshake::PRODUCER);
-    let (binding, _) = begin(&mut service, &client, NodeId::from_bytes([1; 16]));
-    let mut port = service.port(0, capacity()).unwrap();
-    let owner = lanes[0]
-        .credits()
-        .client(binding.session, ingress_capacity())
-        .unwrap();
-    let grant = lanes[0]
-        .credits()
-        .grant(
-            &owner,
-            Class::Data,
-            Quota {
-                messages: 1,
-                bytes: 4096,
-            },
-        )
-        .unwrap();
-    let key = grant.key();
-    drop(
-        port.try_install(
-            binding.peer,
-            Subject {
-                group: placements[0].group,
-                writer: Some(ProducerId::from_bytes([4; 16])),
-            },
-            grant,
-        )
-        .unwrap(),
-    );
-    service.poll_command().unwrap();
-    assert_eq!(owner.usage(Class::Data).bytes, 4096);
-    lanes[0].credits().revoke_key(&key).unwrap();
-    assert_eq!(owner.usage(Class::Data), Budget::default());
-    let pending = port
-        .try_reply(Class::Data, reply(binding, Opcode::Records), 2048)
-        .unwrap();
-    drop(service);
-    assert_eq!(pending.await, Err(PortError::Closed));
+    observe(&mut port, again).await.unwrap().unwrap();
 }
 
 #[tokio::test]
 async fn route_publication_is_bounded_to_its_partition_owner_shard() {
+    let context = omq_tokio::Context::new();
     let (mut service, _lanes, placements) = setup();
     let mut route = directory::RouteState {
         group: placements[0].group,
@@ -292,8 +177,8 @@ async fn route_publication_is_bounded_to_its_partition_owner_shard() {
             .unwrap(),
         )
         .unwrap();
-    let mut right = service.port(0, capacity()).unwrap();
-    let mut wrong = service.port(17, capacity()).unwrap();
+    let mut right = service.port(&context, 0, capacity()).unwrap();
+    let mut wrong = service.port(&context, 17, capacity()).unwrap();
     let mut invalid = route.clone();
     invalid.members = [
         service.local(),
@@ -309,19 +194,19 @@ async fn route_publication_is_bounded_to_its_partition_owner_shard() {
         service.poll_command().unwrap();
     }
     assert!(matches!(
-        rejected.await.unwrap(),
+        observe(&mut wrong, rejected).await.unwrap(),
         Err(RouteError::Destination)
     ));
     let published = right.try_route(route.clone()).unwrap();
     for _ in 0..2 {
         service.poll_command().unwrap();
     }
-    assert!(published.await.unwrap().unwrap());
+    assert!(observe(&mut right, published).await.unwrap().unwrap());
     let repeated = right.try_route(route).unwrap();
     for _ in 0..2 {
         service.poll_command().unwrap();
     }
-    assert!(!repeated.await.unwrap().unwrap());
+    assert!(!observe(&mut right, repeated).await.unwrap().unwrap());
 }
 
 fn publication(route: &RouteState, local: NodeId) -> Message {
@@ -369,6 +254,7 @@ fn publication(route: &RouteState, local: NodeId) -> Message {
 #[tokio::test]
 async fn reader_publications_fence_sources_and_charge_transport_aliases() {
     use crate::frontend::PublicationError;
+    let context = omq_tokio::Context::new();
     let (mut service, _lanes, placements) = setup();
     let local = service.local();
     let mut route = directory::RouteState {
@@ -392,17 +278,17 @@ async fn reader_publications_fence_sources_and_charge_transport_aliases() {
         bytes: 4096,
     };
     let mut right = service
-        .port_with_publications(0, outgoing, allowance)
+        .port_with_publications(&context, 0, outgoing, allowance)
         .unwrap();
     let mut wrong = service
-        .port_with_publications(17, outgoing, allowance)
+        .port_with_publications(&context, 17, outgoing, allowance)
         .unwrap();
     let rejected = wrong.try_publish(publication(&route, local), 2048).unwrap();
     for _ in 0..2 {
         service.poll_command().unwrap();
     }
     assert!(matches!(
-        rejected.await.unwrap(),
+        observe(&mut wrong, rejected).await.unwrap(),
         Err((PublicationError::Destination, _))
     ));
 
@@ -410,7 +296,7 @@ async fn reader_publications_fence_sources_and_charge_transport_aliases() {
     for _ in 0..2 {
         service.poll_command().unwrap();
     }
-    pending.await.unwrap().unwrap();
+    observe(&mut right, pending).await.unwrap().unwrap();
     let transmitted = service
         .take_publication()
         .expect("current source publication");
@@ -428,7 +314,7 @@ async fn reader_publications_fence_sources_and_charge_transport_aliases() {
     for _ in 0..2 {
         service.poll_command().unwrap();
     }
-    reply.await.unwrap().unwrap();
+    observe(&mut right, reply).await.unwrap().unwrap();
     service.flush(|_| Ok(())).unwrap();
     // Control progress stays available while the data alias retains its charge.
     route.view = 3;
@@ -437,7 +323,7 @@ async fn reader_publications_fence_sources_and_charge_transport_aliases() {
     for _ in 0..2 {
         service.poll_command().unwrap();
     }
-    assert!(changed.await.unwrap().unwrap());
+    assert!(observe(&mut right, changed).await.unwrap().unwrap());
     drop(alias);
     for _ in 0..2 {
         service.poll_command().unwrap();
@@ -447,7 +333,7 @@ async fn reader_publications_fence_sources_and_charge_transport_aliases() {
         service.poll_command().unwrap();
     }
     assert!(matches!(
-        stale.await.unwrap(),
+        observe(&mut right, stale).await.unwrap(),
         Err((PublicationError::Stale, _))
     ));
 
@@ -461,7 +347,7 @@ async fn reader_publications_fence_sources_and_charge_transport_aliases() {
     for _ in 0..2 {
         service.poll_command().unwrap();
     }
-    queued.await.unwrap().unwrap();
+    observe(&mut right, queued).await.unwrap().unwrap();
     route.view = 5;
     route.leader = None;
     service.publish_route(&route).unwrap();
@@ -489,10 +375,101 @@ fn publication_watch(service: &mut Service, route: directory::RouteState) {
         .unwrap();
 }
 
+#[test]
+fn follower_and_reader_publications_have_independent_fair_slots() {
+    let (mut service, _lanes, placements) = setup();
+    let local = service.local();
+    let placement = placements[0];
+    let route = directory::RouteState {
+        group: placement.group,
+        config_epoch: 1,
+        partition: placement.partition,
+        members: [
+            local,
+            NodeId::from_bytes([8; 16]),
+            NodeId::from_bytes([7; 16]),
+        ]
+        .into(),
+        view: 2,
+        leader: Some(local),
+    };
+    publication_watch(&mut service, route.clone());
+    let original = crate::frontend::test_support::control(
+        placement,
+        crate::frontend::test_support::binding(crate::frontend::Kind::Broker),
+    );
+    let mut metadata = original.part_bytes(2).unwrap().to_vec();
+    metadata[24..32].copy_from_slice(&route.view.to_be_bytes());
+    metadata[32..48].copy_from_slice(local.as_bytes());
+    let header = ozzy_proto::Envelope {
+        opcode: Opcode::PreparePub,
+        response: false,
+        request_id: None,
+        sender: local,
+        session: None,
+    }
+    .encode_header(metadata.len(), 0, service.envelope_limits())
+    .unwrap();
+    let follower = Message::multipart([
+        Bytes::copy_from_slice(placement.group.as_bytes()),
+        Bytes::copy_from_slice(&header),
+        Bytes::from(metadata),
+        Bytes::new(),
+    ]);
+    let reader = publication(&route, local);
+    service.publish(0, follower.clone()).unwrap();
+    assert!(matches!(
+        service.publish(0, follower.clone()),
+        Err((super::super::PublicationError::Full, _))
+    ));
+    service.publish(0, reader).unwrap();
+    assert_eq!(
+        service.take_publication().unwrap().part_slice(0),
+        Some(placement.group.as_bytes().as_slice())
+    );
+    service.publish(0, follower).unwrap();
+    assert_eq!(
+        service
+            .take_publication()
+            .unwrap()
+            .part_slice(0)
+            .unwrap()
+            .len(),
+        32
+    );
+    assert_eq!(
+        service.take_publication().unwrap().part_slice(0),
+        Some(placement.group.as_bytes().as_slice())
+    );
+}
+
 fn publication_capacity() -> Budgets {
     let mut outgoing = capacity();
     outgoing.data.queue_slots += 1;
     outgoing.data.retained_messages += 1;
     outgoing.data.bytes += 4096;
     outgoing
+}
+
+fn capacity() -> Budgets {
+    Budgets {
+        data: Budget {
+            queue_slots: 1,
+            retained_messages: 1,
+            bytes: 4096,
+        },
+        control: Budget {
+            queue_slots: 2,
+            retained_messages: 2,
+            bytes: 8192,
+        },
+    }
+}
+
+async fn observe<T>(port: &mut Port, mut pending: Pending<T>) -> Result<T, PortError> {
+    std::future::poll_fn(|cx| {
+        port.poll_progress(cx)?;
+        Pin::new(&mut pending).poll(cx)
+    })
+    .await
 }

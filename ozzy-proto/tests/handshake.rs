@@ -194,9 +194,9 @@ fn capability_lists_require_sorted_unique_ids_and_reject_unknown_required_ids() 
 }
 
 #[test]
-fn streaming_requires_explicit_negotiation_and_preserves_directional_windows() {
+fn streaming_requires_explicit_negotiation_and_preserves_directional_bounds() {
     let limits = DataLimits::default();
-    let parameters = Parameters::streaming(limits, handshake::PRODUCER, 4000, 32 << 20).unwrap();
+    let parameters = Parameters::streaming(limits, handshake::PRODUCER).unwrap();
     assert_eq!(handshake::OWNER_STREAM, 1 << 12);
     assert_eq!(
         parameters.capabilities,
@@ -212,10 +212,9 @@ fn streaming_requires_explicit_negotiation_and_preserves_directional_windows() {
         old_owner.select(parameters),
         Err(HandshakeError::Capabilities)
     );
-    let owner = Parameters::streaming(limits, handshake::OWNER, 8000, 64 << 20).unwrap();
+    let owner = Parameters::streaming(limits, handshake::OWNER).unwrap();
     let selected = owner.select(parameters).unwrap();
-    assert_eq!(selected.inflight_records, 8000);
-    assert_eq!(selected.inflight_bytes, 64 << 20);
+    assert_eq!(selected.receive, owner.receive);
     let hello = Handshake {
         parameters,
         ..hello()
@@ -236,23 +235,11 @@ fn streaming_requires_explicit_negotiation_and_preserves_directional_windows() {
             b"\0\0\0\x08\0\0\0\x02\0\x01\0\x0d"
         );
     }
-    for (records, bytes) in [
-        (0, 32 << 20),
-        (limits.max_records as u64 - 1, 32 << 20),
-        (4000, 0),
-        (4000, limits.envelope.max_payload_bytes as u64 - 1),
-    ] {
-        assert_eq!(
-            Parameters::streaming(limits, handshake::PRODUCER, records, bytes),
-            Err(HandshakeError::Parameters)
-        );
-    }
 }
 
 #[test]
 fn streaming_capability_requires_append_and_all_known_ids_round_trip() {
-    let mut parameters =
-        Parameters::streaming(DataLimits::default(), handshake::PRODUCER, 4000, 32 << 20).unwrap();
+    let mut parameters = Parameters::streaming(DataLimits::default(), handshake::PRODUCER).unwrap();
     parameters.capabilities = handshake::OWNER_STREAM;
     parameters.required_capabilities = handshake::OWNER_STREAM;
     assert_eq!(parameters.validate(), Err(HandshakeError::Parameters));

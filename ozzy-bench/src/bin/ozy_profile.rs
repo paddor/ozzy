@@ -16,7 +16,7 @@ use std::{
 
 #[derive(Default)]
 struct CounterFeed {
-    previous: [u64; 8],
+    previous: [u64; 6],
     previous_elapsed_ms: u64,
     sequence: u64,
     samples: u64,
@@ -50,18 +50,24 @@ async fn bind_counters(directory: &Path) -> Result<(Context, Socket, String)> {
 async fn watch_counters(
     socket: &Socket,
     feeds: &mut BTreeMap<(u64, String), CounterFeed>,
+    trace: Option<&mut Vec<Value>>,
+    started: Instant,
 ) -> Result<()> {
+    let mut trace = trace;
     loop {
         let message = socket.recv().await?;
-        observe_counters(&message, feeds)?;
+        observe_counters(&message, feeds, trace.as_deref_mut(), started)?;
     }
 }
 
 fn observe_counters(
     message: &omq_tokio::Message,
     feeds: &mut BTreeMap<(u64, String), CounterFeed>,
+    trace: Option<&mut Vec<Value>>,
+    started: Instant,
 ) -> Result<()> {
-    let row: Value = serde_json::from_slice(
+    let received_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+    let mut row: Value = serde_json::from_slice(
         message
             .part_slice(0)
             .ok_or("counter message has no payload")?,
@@ -88,50 +94,40 @@ fn observe_counters(
             row["events"]["replica_repair"]
                 .as_u64()
                 .ok_or("missing repairs")?,
-            row["events"]["dispatcher_broker_no_grant"]
+            row["events"]["native_proposal_refusal"]
                 .as_u64()
-                .ok_or("missing broker no-grant count")?,
-            row["events"]["dispatcher_broker_grant_full"]
+                .ok_or("missing proposal refusal count")?,
+            row["events"]["native_admission_refusal"]
                 .as_u64()
-                .ok_or("missing broker full-grant count")?,
-            row["events"]["dispatcher_broker_grant_revoked"]
+                .ok_or("missing admission refusal count")?,
+            row["events"]["shard_reply_refusal"]
                 .as_u64()
-                .ok_or("missing broker revoked-grant count")?,
-            row["events"]["dispatcher_broker_message_full"]
+                .ok_or("missing shard reply refusal count")?,
+            row["events"]["shard_port_refusal"]
                 .as_u64()
-                .ok_or("missing broker message-full count")?,
-            row["events"]["dispatcher_broker_byte_full"]
-                .as_u64()
-                .ok_or("missing broker byte-full count")?,
-            row["events"]["dispatcher_broker_other_full"]
-                .as_u64()
-                .ok_or("missing broker other-full count")?,
+                .ok_or("missing shard port refusal count")?,
         ];
-        let delta = std::array::from_fn::<_, 8, _>(|slot| {
+        let delta = std::array::from_fn::<_, 6, _>(|slot| {
             current[slot].saturating_sub(feed.previous[slot])
         });
         feed.previous = current;
-        let refused = delta[2] + delta[3] + delta[4];
+        let refused: u64 = delta[2..].iter().sum();
         if ((delta[1] >= 8 && delta[1] >= delta[0] / 2) || refused >= 8)
             && feed
                 .last_alert
                 .is_none_or(|at| at.elapsed() >= Duration::from_millis(200))
         {
             println!(
-                "COUNTER_RATE pid={pid} thread={thread} interval_ms={interval_ms} fresh={} repair={} refused={} (no_grant={} full={} revoked={}; full_messages={} full_bytes={} full_other={})",
-                delta[0],
-                delta[1],
-                refused,
-                delta[2],
-                delta[3],
-                delta[4],
-                delta[5],
-                delta[6],
-                delta[7]
+                "COUNTER_RATE pid={pid} thread={thread} interval_ms={interval_ms} fresh={} repair={} refused={} (proposal={} admission={} reply={} port={})",
+                delta[0], delta[1], refused, delta[2], delta[3], delta[4], delta[5]
             );
             std::io::stdout().flush()?;
             feed.last_alert = Some(Instant::now());
         }
+    }
+    if let Some(trace) = trace {
+        row["collector_elapsed_ns"] = json!(received_ns);
+        trace.push(row);
     }
     Ok(())
 }
@@ -221,6 +217,28 @@ mod counter_tests {
     use super::*;
 
     #[test]
+    fn counter_trace_retains_received_snapshot_and_collector_time() {
+        ozzy_runtime::profiling::enable();
+        let events: BTreeMap<_, _> = ozzy_runtime::profiling::events()
+            .unwrap()
+            .into_iter()
+            .collect();
+        let row = json!({
+            "pid":42,"thread":"shard-a","sequence":1,"elapsed_ms":20,
+            "events":events,"stages":[]
+        });
+        let message = omq_tokio::Message::from(serde_json::to_vec(&row).unwrap());
+        let mut feeds = BTreeMap::new();
+        let mut trace = Vec::new();
+        observe_counters(&message, &mut feeds, Some(&mut trace), Instant::now()).unwrap();
+        assert_eq!(trace.len(), 1);
+        assert_eq!(trace[0]["events"], row["events"]);
+        assert_eq!(trace[0]["stages"], row["stages"]);
+        assert!(trace[0]["collector_elapsed_ns"].as_u64().is_some());
+        assert_eq!(feeds[&(42, "shard-a".to_owned())].samples, 1);
+    }
+
+    #[test]
     fn merge_sums_counts_but_keeps_largest_peak() {
         let mut row = json!({
             "brokers":[{"identity":{"pid":42},"usage":{}}],
@@ -274,6 +292,9 @@ struct Args {
     /// Replay the workload with the current verified build instead of the case binary.
     #[arg(long)]
     current_build: bool,
+    /// Retain received SUB snapshots in an SSD artifact for time correlation.
+    #[arg(long)]
+    counter_trace: bool,
 }
 
 fn replace(command: &mut [String], name: &str, value: String) -> Result<()> {
@@ -565,7 +586,7 @@ fn verify_live_readers(row: &Value) -> Result<()> {
         || row["live_readers"] != true
         || live_records == 0
         || row["reader_transport"]
-            != "TCP PUB/SUB live records; PEER subscriptions, replay, gap repair, and credit"
+            != "TCP PUB/SUB live records; PEER subscriptions, replay, gap repair"
     {
         return Err("profile did not use production live readers".into());
     }
@@ -654,9 +675,16 @@ async fn execute_profile(
     );
     if let Some((_context, socket, endpoint)) = counters {
         let mut feeds = BTreeMap::new();
-        let mut row = tokio::select! {
-            result = run => result?,
-            result = watch_counters(&socket, &mut feeds) => {
+        let mut trace = Vec::new();
+        let started = Instant::now();
+        let result = tokio::select! {
+            result = run => result,
+            result = watch_counters(
+                &socket,
+                &mut feeds,
+                args.counter_trace.then_some(&mut trace),
+                started,
+            ) => {
                 result?;
                 return Err("counter monitor stopped".into());
             }
@@ -667,13 +695,32 @@ async fn execute_profile(
             else {
                 break;
             };
-            observe_counters(&message, &mut feeds)?;
+            observe_counters(
+                &message,
+                &mut feeds,
+                args.counter_trace.then_some(&mut trace),
+                started,
+            )?;
         }
         let samples: u64 = feeds.values().map(|feed: &CounterFeed| feed.samples).sum();
         let dropped: u64 = feeds.values().map(|feed| feed.dropped).sum();
         if feeds.is_empty() {
             return Err("local counter SUB received no worker samples".into());
         }
+        if args.counter_trace {
+            if dropped != 0 || trace.len() as u64 != samples {
+                return Err("counter trace lost PUB snapshots".into());
+            }
+            let path = directory.join("counter-samples.jsonl");
+            let mut file = std::io::BufWriter::new(fs::File::create(&path)?);
+            for snapshot in &trace {
+                serde_json::to_writer(&mut file, snapshot)?;
+                file.write_all(b"\n")?;
+            }
+            file.flush()?;
+            println!("COUNTER_TRACE {} samples={samples}", path.display());
+        }
+        let mut row = result?;
         merge_counters(&mut row, &feeds)?;
         println!(
             "COUNTER_FEED {endpoint} threads={} samples={samples} missed={dropped}",
@@ -690,6 +737,9 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     if !(0.1..=30.0).contains(&args.duration) || !(0.0..=10.0).contains(&args.warmup) {
         return Err("invalid bounded profile duration".into());
+    }
+    if args.counter_trace && args.kind != "stages" {
+        return Err("counter traces require --kind stages".into());
     }
     automation::install_signals()?;
     isolation::require_idle()?;
@@ -797,6 +847,7 @@ mod tests {
             warmup: 1.0,
             frequency: 99,
             current_build: false,
+            counter_trace: false,
         };
         let mut command = vec![
             "taskset".into(),
@@ -863,7 +914,7 @@ mod tests {
     #[test]
     fn profiles_require_production_readers_on_the_live_publication_path() {
         let row = json!({"broker_runtime":"production-deployment", "native_reader_api":"decoded-records", "live_readers":true,
-            "reader_transport":"TCP PUB/SUB live records; PEER subscriptions, replay, gap repair, and credit",
+            "reader_transport":"TCP PUB/SUB live records; PEER subscriptions, replay, gap repair",
             "readers":[{"topic_readers":[{"live_records":2,"replayed_records":0}]}]});
         verify_live_readers(&row).unwrap();
         let mut replay_only = row.clone();

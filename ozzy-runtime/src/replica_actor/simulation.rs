@@ -19,15 +19,15 @@ pub use super::recovery::simulation::{ControlledRecovery, RecoveryTransition};
 /// Time is monotonic from actor startup and is never derived from disk latency.
 /// After a terminal actor error, only observation and shutdown are allowed.
 #[derive(Debug)]
-pub struct ControlledReplica<E = crate::replica_journal::ShardJournal> {
-    actor: Box<ReplicaActor<E>>,
+pub struct ControlledReplica {
+    actor: Box<ReplicaActor>,
     now: Duration,
     active: bool,
 }
 
-impl<E: crate::replica_journal::JournalExecution> ControlledReplica<E> {
+impl ControlledReplica {
     /// Take a newly constructed actor. No work runs until explicitly advanced.
-    pub fn new(actor: ReplicaActor<E>) -> Self {
+    pub fn new(actor: ReplicaActor) -> Self {
         Self {
             actor: Box::new(actor),
             now: Duration::ZERO,

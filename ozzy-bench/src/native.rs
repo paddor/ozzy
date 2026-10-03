@@ -13,11 +13,18 @@ use std::{
 
 mod prepare;
 pub use prepare::PreparedBroker;
+mod batch;
+pub use batch::{
+    AppendBudget, DEFAULT_SDK_BATCH_TARGET_BYTES, peer_payload_capacity, reader_queue_messages,
+    segment_body_capacity,
+};
 
 /// Shared TOML and persistent identity for one benchmark run.
 #[derive(Debug, Clone)]
 pub struct DeploymentArtifact {
+    /// Path to the validated shared deployment TOML.
     pub configuration: PathBuf,
+    /// Path to persistent deployment or broker identity, as required by this owner.
     pub identity: PathBuf,
 }
 
@@ -82,8 +89,11 @@ impl DeploymentArtifact {
 /// One named broker's established deployment and local store bindings.
 #[derive(Debug, Clone)]
 pub struct BrokerWorker {
+    /// Shared deployment documents used by this named broker worker.
     pub deployment: DeploymentArtifact,
+    /// Broker name selecting placement and device bindings from the deployment.
     pub broker: String,
+    /// Path to persistent deployment or broker identity, as required by this owner.
     pub identity: PathBuf,
 }
 

@@ -187,9 +187,13 @@ struct Args {
     /// Native APPEND requests awaiting full confirmation per writer connection.
     #[arg(long, default_value_t = 3)]
     writer_inflight_appends: usize,
-    /// Optional timed SDK request bound. Zero drains available in-flight credit.
+    /// Optional timed SDK request bound. Zero drains available in-flight capacity.
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=65536))]
     writer_batch_records: u32,
+    /// Native SDK APPEND collection ceiling in KiB, before record/segment clamping.
+    #[arg(long, default_value_t = (ozzy_bench::native::DEFAULT_SDK_BATCH_TARGET_BYTES / 1024) as u32,
+        value_parser = clap::value_parser!(u32).range(1..=16384))]
+    writer_batch_target_kib: u32,
     /// Timed SDK collection delay, independent of confirmation latency.
     #[arg(skip = 0u64)]
     writer_linger_us: u64,

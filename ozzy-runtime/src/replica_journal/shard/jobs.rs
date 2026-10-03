@@ -145,7 +145,7 @@ pub(super) async fn cleanup(
     metadata: bool,
 ) -> Result<journal::OwnedCleanedStorage, JournalError> {
     use journal::OwnedStorageCleanup as Class;
-    if budget.max_entries == 0 || budget.max_work.is_zero() {
+    if budget.max_entries == 0 {
         return Err(JournalError::Configuration);
     }
     let kind = if metadata {

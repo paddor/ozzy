@@ -38,8 +38,9 @@ pub(in crate::bench::timed) fn topology(config: &Config, brokers: &[Value]) -> R
         "writer_linger_us": config.args.writer_linger_us,
         "reader_records_max": config.reader_records(),
         "reader_payload_bytes_max": config.reader_limits().envelope.max_payload_bytes,
+        "reader_queue_messages": config.live_queue_messages(),
         "readers_per_partition": config.args.readers_per_partition, "live_readers": true,
-        "reader_transport": "TCP PUB/SUB live records; PEER subscriptions, replay, gap repair, and credit",
+        "reader_transport": "TCP PUB/SUB live records; PEER subscriptions, replay, gap repair",
     });
     row.as_object_mut().unwrap().extend(json!({
         "commit_policy": match config.args.system {
@@ -58,7 +59,7 @@ pub(in crate::bench::timed) fn topology(config: &Config, brokers: &[Value]) -> R
         "broker_omq_io_threads": observed("omq_io_threads")?, "broker_omq_mode": "dedicated-io",
         "broker_application_runtime": "one Tokio current_thread runtime per application shard",
         "broker_peer_receive_queues": "ordinary socket receive; dispatcher and bounded shard fanrings",
-        "broker_peer_payload_budget_scope": "shard grants include unused credit and retained backing; control capacity is separate",
+        "broker_peer_payload_budget_scope": "local writer/follower queues and resident owners are bounded per shard; follower progress and control capacity are reserved",
         "partition_assignment": "shared topic writers; keyed XXH3-64 modulo persisted partition count",
         "client_application_threads_per_process": 1,
         "client_control_omq_io_threads": config.args.io_threads,

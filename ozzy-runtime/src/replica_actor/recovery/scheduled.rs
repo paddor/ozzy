@@ -2,7 +2,6 @@
 
 use super::{ActorError, ActorStatus, Outcome, RecoveryActor, RecoveryStorage, Transition};
 use crate::{
-    memory::Capacity,
     replica_actor::{ScheduleError, ScheduledReplica},
     replica_journal::ShardRecoveringJournal,
     replica_transport::SendClass,
@@ -22,7 +21,7 @@ use std::{
 enum Phase<J: RecoveryStorage> {
     Active(Box<RecoveryActor<J>>),
     Changing(LocalBoxFuture<'static, Result<Transition<J>, ActorError>>),
-    Ready(ScheduledReplica<J::Normal>),
+    Ready(ScheduledReplica),
     Stopped,
 }
 
@@ -35,7 +34,7 @@ pub struct ScheduledRecovery<J: RecoveryStorage = ShardRecoveringJournal> {
     local: NodeId,
     sessions: [LinkSessionId; 3],
     status: tokio::sync::watch::Receiver<ActorStatus>,
-    capacity: Option<Capacity>,
+    owner: Option<crate::memory::Owner>,
     now: Duration,
     origin: Option<Duration>,
     active: bool,
@@ -51,30 +50,25 @@ impl<J: RecoveryStorage> std::fmt::Debug for ScheduledRecovery<J> {
     }
 }
 
-impl<J: RecoveryStorage + 'static> ScheduledRecovery<J>
-where
-    J::Normal: 'static,
-{
-    /// Shared scheduling always hands off with zero unbacked follower credit.
+impl<J: RecoveryStorage + 'static> ScheduledRecovery<J> {
+    /// Shared scheduling hands off without remotely granted follower capacity.
     /// Bind the empty transfer arena to a destination allowance before polling.
-    pub fn new(mut actor: RecoveryActor<J>) -> Self {
-        actor.reserved_credit = true;
+    pub fn new(actor: RecoveryActor<J>) -> Self {
         Self {
             configuration: actor.configuration,
             local: actor.local,
             sessions: actor.config.sessions,
             status: actor.subscribe(),
             phase: Phase::Active(Box::new(actor)),
-            capacity: None,
+            owner: None,
             now: Duration::ZERO,
             origin: None,
             active: true,
         }
     }
 
-    /// Charge transfer allocations to the exact shard-issued receive allowance.
-    /// The normal journal retains its general shard owner for other work.
-    pub fn bind_receive_capacity(&mut self, capacity: &Capacity) -> Result<(), ActorError> {
+    /// Charge recovery buffers to the shard's bounded replication memory.
+    pub fn bind_receive_owner(&mut self, owner: &crate::memory::Owner) -> Result<(), ActorError> {
         let Phase::Active(actor) = &mut self.phase else {
             return Err(ActorError::StartupMismatch);
         };
@@ -82,8 +76,8 @@ where
             .buffer
             .as_mut()
             .ok_or(ActorError::History)?
-            .bind_capacity(capacity)?;
-        self.capacity = Some(capacity.clone());
+            .bind_allocator(&owner.allocator())?;
+        self.owner = Some(owner.clone());
         Ok(())
     }
 
@@ -311,12 +305,12 @@ where
                         set_session(&mut actor, slot, session, Duration::ZERO)?;
                     }
                 }
-                if let Some(capacity) = &self.capacity {
+                if let Some(owner) = &self.owner {
                     actor
                         .buffer
                         .as_mut()
                         .ok_or(ActorError::History)?
-                        .bind_capacity(capacity)?;
+                        .bind_allocator(&owner.allocator())?;
                 }
                 self.origin = Some(now);
                 Phase::Active(actor)
@@ -338,8 +332,8 @@ where
                             .map_err(schedule_actor)?;
                     }
                 }
-                if let Some(capacity) = &self.capacity {
-                    actor.bind_receive_capacity(capacity)?;
+                if let Some(owner) = &self.owner {
+                    actor.bind_receive_owner(owner)?;
                 }
                 Phase::Ready(actor)
             }
@@ -350,7 +344,7 @@ where
 
     /// Take the fully published, election-fenced actor exactly once. Install its
     /// native services before its first normal scheduling turn.
-    pub fn take_ready(&mut self) -> Option<ScheduledReplica<J::Normal>> {
+    pub fn take_ready(&mut self) -> Option<ScheduledReplica> {
         if !matches!(self.phase, Phase::Ready(_)) {
             return None;
         }

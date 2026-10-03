@@ -68,7 +68,7 @@ pub(super) struct Transfer {
     retry_at: Duration,
 }
 
-impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
+impl ReplicaActor {
     pub(super) fn start_transfer(
         &mut self,
         scope: Scope,

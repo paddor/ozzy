@@ -1,6 +1,6 @@
 use super::*;
 use ozzy_replication::driver::{Action, ReplicaDriver, Timing};
-use ozzy_replication::wire::{Control, Grant};
+use ozzy_replication::wire::Control;
 use std::time::Duration;
 
 fn now(millis: u64) -> Duration {
@@ -46,11 +46,6 @@ fn confirm(driver: &mut ReplicaDriver, operation: PreparedOperation, millis: u64
                     scope: driver.scope(),
                     retained: operation.prefix(),
                 },
-                grant: Grant {
-                    revision: 1,
-                    record_limit: 2,
-                    byte_limit: 32,
-                },
             },
             now(millis),
         )
@@ -70,11 +65,6 @@ fn retained_vote_during_validation_does_not_require_revalidation_or_durability()
                 ack: ozzy_replication::RetainedPrepareOk {
                     scope: driver.scope(),
                     retained: first.prefix(),
-                },
-                grant: Grant {
-                    revision: 1,
-                    record_limit: 2,
-                    byte_limit: 32,
                 },
             },
             now(2),

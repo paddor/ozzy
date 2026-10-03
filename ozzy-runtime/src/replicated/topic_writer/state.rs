@@ -46,7 +46,7 @@ impl Partitions {
             .iter()
             .map(|partition| {
                 Ok(Partition {
-                    target: partition.target.clone(),
+                    target: partition.target,
                     writer: partition.writer.try_clone()?,
                 })
             })
@@ -80,7 +80,7 @@ impl Partitions {
                 .send(record)
                 .await
                 .map_err(|source| TopicWriterError::Send {
-                    partition: partition.target.clone(),
+                    partition: partition.target,
                     source,
                 })?;
         Ok((index, pending))

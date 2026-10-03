@@ -94,7 +94,7 @@ fn confirmation_policy_is_part_of_the_immutable_configuration() {
 fn retained_wire_evidence_is_distinct_and_cannot_be_retyped_as_disk_evidence() {
     use ozzy_proto::LinkSessionId;
     use ozzy_replication::wire::{
-        Control, Grant, PeerBinding, ReplicaMessage, WireError, WireLimits, decode, encode_control,
+        Control, PeerBinding, ReplicaMessage, WireError, WireLimits, decode, encode_control,
     };
 
     let configuration = record(QuorumPolicy::Replicated).configuration();
@@ -102,13 +102,8 @@ fn retained_wire_evidence_is_distinct_and_cannot_be_retyped_as_disk_evidence() {
     let follower = replica(configuration, 1);
     let message = Control::PrepareRetained {
         ack: follower.retained_acknowledgment().unwrap(),
-        grant: Grant {
-            revision: 1,
-            record_limit: 0,
-            byte_limit: 0,
-        },
     };
-    let mut metadata = [0; 145];
+    let mut metadata = [0; 121];
     let encoded = encode_control(node(1), session, message, &mut metadata).unwrap();
     assert_eq!(metadata[120], 3);
     let binding = PeerBinding::new(configuration, node(1), session).unwrap();
@@ -138,11 +133,6 @@ fn retained_wire_evidence_is_distinct_and_cannot_be_retyped_as_disk_evidence() {
         ack: ozzy_replication::RetainedPrepareOk {
             scope: durable.scope(),
             retained: Prefix::GENESIS,
-        },
-        grant: Grant {
-            revision: 1,
-            record_limit: 0,
-            byte_limit: 0,
         },
     };
     let encoded = encode_control(node(1), session, forged, &mut metadata).unwrap();

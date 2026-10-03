@@ -7,6 +7,7 @@
 pub struct BrokerCpus(Vec<Vec<usize>>);
 
 impl BrokerCpus {
+    /// Parse one shared CPU set or slash-separated per-broker sets.
     pub fn parse(text: &str) -> Result<Self, String> {
         let sets = text
             .split('/')
@@ -34,6 +35,7 @@ impl BrokerCpus {
         all
     }
 
+    /// Explicit CPU IDs in each parsed broker set.
     pub fn sets(&self) -> &[Vec<usize>] {
         &self.0
     }

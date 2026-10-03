@@ -92,16 +92,8 @@ name = "ozzy_metadata"
 path = "tests/metadata.rs"
 
 [[test]]
-name = "ozzy_placement"
-path = "tests/placement.rs"
-
-[[test]]
 name = "ozzy_recovery_configuration"
 path = "tests/recovery_configuration.rs"
-
-[[test]]
-name = "ozzy_relocation"
-path = "tests/relocation.rs"
 
 [[test]]
 name = "ozzy_suffix"
@@ -110,10 +102,6 @@ path = "tests/suffix.rs"
 [[test]]
 name = "ozzy_suffix_stream"
 path = "tests/suffix_stream.rs"
-
-[[test]]
-name = "ozzy_volume"
-path = "tests/volume.rs"
 
 [[test]]
 name = "ozzy_write_metrics"

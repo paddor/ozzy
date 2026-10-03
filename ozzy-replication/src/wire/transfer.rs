@@ -11,8 +11,8 @@ use super::{
 use crate::{JournalGeneration, LogSource, Prefix, Scope};
 
 const SOURCE_BYTES: usize = 16 + 16 + 40;
-const FETCH_BYTES: usize = COMMON_BYTES + SOURCE_BYTES + 40 + 4 + 4;
-const OPS_FIXED_BYTES: usize = COMMON_BYTES + SOURCE_BYTES + 40 + 4;
+pub(super) const FETCH_BYTES: usize = COMMON_BYTES + SOURCE_BYTES + 40 + 4 + 4;
+pub(super) const OPS_FIXED_BYTES: usize = COMMON_BYTES + SOURCE_BYTES + 40 + 4;
 
 /// One bounded request into a previously advertised immutable history.
 ///

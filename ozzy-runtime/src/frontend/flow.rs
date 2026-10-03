@@ -1,4 +1,4 @@
-//! Bounded compact-channel routing hints. Actors retain all credit authority.
+//! Bounded compact-channel routing hints. Actors retain all partition authority.
 
 use std::collections::BTreeMap;
 
@@ -68,7 +68,7 @@ impl super::Service {
             omq_tokio::message::Payload::from_slice(message.part_slice(1).unwrap()),
         ]);
         self.dispatcher
-            .dispatch(peer, routed, retained_bytes)
+            .dispatch_data(peer, routed, retained_bytes)
             .map(Some)
             .map_err(|rejected| ReceiveError::Dispatch(rejected.reason))
     }
@@ -133,8 +133,6 @@ mod tests {
                 base: Prefix::GENESIS,
                 received: Prefix::GENESIS,
                 received_bytes: 0,
-                operation_limit: 0,
-                byte_limit: 0,
             },
         }
     }

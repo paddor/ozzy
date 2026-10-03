@@ -4,7 +4,6 @@ use ozzy_journal::operation::{
 };
 use ozzy_proto::OperationId;
 use ozzy_proto::{GroupId, LinkSessionId, NodeId};
-use ozzy_replication::wire::Grant;
 use ozzy_replication::wire::{
     Control, PeerBinding, ReplicaMessage, WireLimits, decode, encode_control,
 };
@@ -177,17 +176,12 @@ fn decoded_durable_ack_still_waits_for_the_primary_disk_boundary() {
     backup.complete_sync(backup.begin_sync().unwrap()).unwrap();
     let message = Control::PrepareOk {
         ack: backup.acknowledgment().unwrap(),
-        grant: Grant {
-            revision: 7,
-            record_limit: 2,
-            byte_limit: 1024,
-        },
     };
-    let mut metadata = [0; 145];
+    let mut metadata = [0; 121];
     let encoded = encode_control(node(1), session(), message, &mut metadata).unwrap();
     assert_eq!(metadata[120], 2); // Durable evidence, not RAM or socket receipt.
     let binding = PeerBinding::new(configuration(), node(1), session()).unwrap();
-    let ReplicaMessage::Control(Control::PrepareOk { ack, grant }) = decode(
+    let ReplicaMessage::Control(Control::PrepareOk { ack }) = decode(
         &[&encoded.header, &metadata, &[]],
         binding,
         WireLimits::default(),
@@ -195,7 +189,6 @@ fn decoded_durable_ack_still_waits_for_the_primary_disk_boundary() {
     .unwrap() else {
         panic!("prepare ACK");
     };
-    assert_eq!(grant.revision, 7);
     primary.receive_ack(node(1), ack).unwrap();
     assert_eq!(primary.snapshot().committed, Prefix::GENESIS);
     primary
@@ -557,13 +550,8 @@ fn peer_session_configuration_and_weaker_votes_cannot_reach_the_core() {
             scope: configuration().scope(),
             durable: Prefix::GENESIS,
         },
-        grant: Grant {
-            revision: 1,
-            record_limit: 2,
-            byte_limit: 1024,
-        },
     };
-    let mut metadata = [0; 145];
+    let mut metadata = [0; 121];
     let encoded = encode_control(node(1), session(), message, &mut metadata).unwrap();
     for evidence in [0, 1, 3, 255] {
         let mut bad = metadata;

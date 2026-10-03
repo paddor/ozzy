@@ -11,9 +11,7 @@ use super::{
     NoopObserver, OpenGroupJournal, Path, PersistenceObserver, SegmentHeader, WriterError,
     position_regresses, publication,
 };
-use crate::store_lock::StoreLock;
 use std::fs::File;
-use std::sync::Arc;
 
 pub(crate) const NAME: &str = "DURABLE";
 pub(crate) const RECORD_BYTES: usize = 192;
@@ -232,7 +230,7 @@ fn read_records(file: &File) -> Result<[[u8; RECORD_BYTES]; 2], DirectoryError> 
 #[derive(Debug)]
 pub(crate) struct Evidence {
     records: [[u8; RECORD_BYTES]; 2],
-    file: Arc<File>,
+    file: File,
 }
 
 impl Evidence {
@@ -255,10 +253,7 @@ impl Evidence {
         }
         let records = read_records(&file)?;
         Copies::new(&records, manifest)?.protected(manifest)?;
-        Ok(Some(Box::new(Self {
-            records,
-            file: Arc::new(file),
-        })))
+        Ok(Some(Box::new(Self { records, file })))
     }
 }
 
@@ -326,19 +321,6 @@ impl OpenGroupJournal {
         &mut self,
         observer: &mut impl PersistenceObserver,
     ) -> Result<(), DirectoryError> {
-        let Some(prepared) = self.prepare_durable_progress()? else {
-            return Ok(());
-        };
-        let result = prepared.publish_observing(observer);
-        self.complete_durable_progress(result)
-    }
-
-    /// Capture `DURABLE` publication for the exact synchronized accepted prefix.
-    /// `None` means the evidence already covers it. The owner must install the
-    /// completion before it prepares another publication or mutates authority.
-    pub fn prepare_durable_progress(
-        &self,
-    ) -> Result<Option<PreparedDurableProgress>, DirectoryError> {
         if self.writer.is_faulted() {
             return Err(WriterError::Faulted.into());
         }
@@ -350,7 +332,7 @@ impl OpenGroupJournal {
         let manifest = &self.directory.manifest;
         let evidence = self
             .evidence
-            .as_ref()
+            .as_mut()
             .ok_or(DirectoryError::CurrentMismatch)?;
         let copies = Copies::new(&evidence.records, manifest)?;
         let protected = copies.protected(manifest)?;
@@ -358,86 +340,17 @@ impl OpenGroupJournal {
             return Err(DirectoryError::HardStateRegression);
         }
         if protected == accepted {
-            return Ok(None);
+            return Ok(());
         }
         let (bytes, first) = copies.next(manifest, accepted)?;
-        Ok(Some(PreparedDurableProgress {
-            file: Arc::clone(&evidence.file),
-            _lock: Arc::clone(&self.directory.lock),
-            bytes,
+        publication::overwrite_evidence(
+            &mut publication::OpenEvidence(&evidence.file),
             first,
-            manifest_generation: manifest.generation,
-        }))
-    }
-
-    /// Install one publication. Failure, or a manifest selected after capture,
-    /// fences the writer: the evidence may or may not have reached the device.
-    pub fn complete_durable_progress(
-        &mut self,
-        completed: CompletedDurableProgress,
-    ) -> Result<(), DirectoryError> {
-        let result = if completed.manifest_generation == self.directory.manifest.generation {
-            completed.result
-        } else {
-            Err(DirectoryError::CurrentMismatch)
-        };
-        match (&result, &mut self.evidence) {
-            (Ok(()), Some(evidence)) => evidence.records = [completed.record; 2],
-            (Ok(()), None) => {}
-            (Err(_), _) => self.writer.fence(),
-        }
-        result
-    }
-}
-
-/// Owned `DURABLE` publication. It holds the store lock and runs on any thread.
-#[derive(Debug)]
-#[must_use = "publish this evidence and install its completion"]
-pub struct PreparedDurableProgress {
-    file: Arc<File>,
-    _lock: Arc<StoreLock>,
-    bytes: [u8; RECORD_BYTES],
-    first: usize,
-    manifest_generation: u64,
-}
-
-/// Physical result of one `DURABLE` publication, pending installation.
-#[derive(Debug)]
-#[must_use = "install this completion on its owning journal"]
-pub struct CompletedDurableProgress {
-    manifest_generation: u64,
-    /// The record both copies hold once the publication succeeded.
-    record: [u8; RECORD_BYTES],
-    result: Result<(), DirectoryError>,
-}
-
-impl PreparedDurableProgress {
-    /// Overwrite both copies in place, one after the other, under one barrier.
-    pub fn publish(self) -> CompletedDurableProgress {
-        self.publish_observing(&mut NoopObserver)
-    }
-
-    fn publish_observing(
-        self,
-        observer: &mut impl PersistenceObserver,
-    ) -> CompletedDurableProgress {
-        CompletedDurableProgress {
-            manifest_generation: self.manifest_generation,
-            record: self.bytes,
-            result: publication::overwrite_evidence(
-                &mut publication::OpenEvidence(&self.file),
-                self.first,
-                &self.bytes,
-                observer,
-            ),
-        }
-    }
-}
-
-impl CompletedDurableProgress {
-    /// Physical result only. The owner must still install the completion.
-    pub const fn succeeded(&self) -> bool {
-        self.result.is_ok()
+            &bytes,
+            observer,
+        )?;
+        evidence.records = [bytes; 2];
+        Ok(())
     }
 }
 

@@ -142,7 +142,7 @@ impl<'a> RecordsEncoder<'a> {
         self.records == 0
     }
 
-    /// Decoded record bytes charged against reader credit.
+    /// Decoded record bytes charged against local output limits.
     pub const fn decoded_payload_bytes(&self) -> usize {
         self.decoded_payload_bytes
     }
@@ -186,7 +186,7 @@ impl<'a> RecordsEncoder<'a> {
 
     /// Append an encoded descriptor table (without a collection count) and its
     /// exact payload. Validate every descriptor and all destination limits before
-    /// copying either span. Failure leaves output and credit unchanged.
+    /// copying either span. Failure leaves output and capacity unchanged.
     pub fn extend_packed(
         &mut self,
         descriptors: &[u8],
@@ -211,60 +211,6 @@ impl<'a> RecordsEncoder<'a> {
         data::capacity(self.payload, bytes)?;
         let parts =
             data::validate_record_entries(descriptors, payload, count, first, self.remaining())?.0;
-        self.metadata.extend_from_slice(descriptors);
-        self.payload.extend_from_slice(payload);
-        self.records = records;
-        self.parts += parts;
-        self.metadata[self.count_at..self.count_at + 4]
-            .copy_from_slice(&(records as u32).to_be_bytes());
-        self.set_raw_payload_bytes();
-        Ok(())
-    }
-
-    /// Append a descriptor table and payload that this process validated when
-    /// it admitted them, with their known part total. Every destination limit
-    /// and credit is checked as in [`Self::extend_packed`]; the descriptor walk
-    /// is not repeated. Debug builds re-validate the table.
-    pub fn extend_validated(
-        &mut self,
-        descriptors: &[u8],
-        payload: &[u8],
-        count: usize,
-        parts: usize,
-    ) -> Result<(), CodecError> {
-        if self.has_encoded_payload() {
-            return Err(CodecError::Limit);
-        }
-        self.materialize();
-        let first = self
-            .first_offset
-            .checked_add(self.records as u64)
-            .ok_or(CodecError::Length)?;
-        let records = data::add(self.records, count)?;
-        data::count(records)?;
-        let remaining = self.remaining();
-        data::record_count(count, first, remaining)?;
-        if parts < count || parts > remaining.max_parts {
-            return Err(CodecError::Limit);
-        }
-        // Each record has a 16-byte identity, a 4-byte part count, and 4 bytes
-        // per part; a table shorter than that cannot cover `count` records.
-        let minimum = data::add(count.checked_mul(20).ok_or(CodecError::Length)?, parts * 4)?;
-        if descriptors.len() < minimum {
-            return Err(CodecError::Length);
-        }
-        let size = data::add(self.metadata.len(), descriptors.len())?;
-        let bytes = data::add(self.payload.len(), payload.len())?;
-        self.envelope
-            .validate_frames(size, bytes, self.limits.envelope)?;
-        data::capacity(self.metadata, size)?;
-        data::capacity(self.payload, bytes)?;
-        debug_assert_eq!(
-            data::validate_record_entries(descriptors, payload, count, first, remaining)
-                .map(|(parts, _)| parts),
-            Ok(parts),
-            "validated table matches its index"
-        );
         self.metadata.extend_from_slice(descriptors);
         self.payload.extend_from_slice(payload);
         self.records = records;

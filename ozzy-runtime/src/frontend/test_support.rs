@@ -107,17 +107,6 @@ pub(super) fn reader(target: Placement, binding: Binding, opcode: Opcode) -> Mes
             &mut metadata,
             limits,
         ),
-        Opcode::Credit => reader::encode_credit(
-            envelope,
-            reader::Credit {
-                subscription,
-                source,
-                records: 10,
-                bytes: 1000,
-            },
-            &mut metadata,
-            limits,
-        ),
         Opcode::Ack => reader::encode_ack(
             envelope,
             reader::Ack {

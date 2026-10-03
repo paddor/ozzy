@@ -1,6 +1,6 @@
 use super::{
     ActorError, AdmittedAppend, Live, LocalActor, Pending, PendingSync, ProposalOutcome,
-    ProposalValidation, ValidationTicket,
+    ProposalValidation, ValidatedAppend, WriteTicket,
 };
 use crate::replica_actor::io::SyncEvent;
 use std::{
@@ -8,25 +8,6 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-
-enum Completed {
-    Propose(ProposalValidation),
-    Admit(AdmittedAppend),
-    Apply(ValidationTicket),
-}
-
-impl Pending {
-    fn poll(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<Completed, crate::replica_journal::JournalError>> {
-        match self {
-            Self::Propose(work) => Pin::new(work).poll(cx).map_ok(Completed::Propose),
-            Self::Admit(work) => Pin::new(work).poll(cx).map_ok(Completed::Admit),
-            Self::Apply(work) => Pin::new(work).poll(cx).map_ok(Completed::Apply),
-        }
-    }
-}
 
 impl LocalActor {
     pub(super) fn progress(&mut self, cx: &mut Context<'_>) -> Result<bool, ActorError> {
@@ -42,10 +23,13 @@ impl LocalActor {
             self.driver.complete_write(result?)?;
             changed = true;
         }
-        let sync = self
-            .sync
-            .as_mut()
-            .map_or(Poll::Pending, |sync| std::pin::pin!(sync.wait()).poll(cx));
+        let sync = if self.journal.available_command_slots() == 0 {
+            Poll::Pending
+        } else {
+            self.sync
+                .as_mut()
+                .map_or(Poll::Pending, |sync| std::pin::pin!(sync.wait()).poll(cx))
+        };
         if let Poll::Ready(result) = sync {
             self.sync = match result? {
                 SyncEvent::Ready(ready) => {
@@ -71,12 +55,8 @@ impl LocalActor {
             };
             changed = true;
         }
-        if let Some(pending) = &mut self.pending
-            && let Poll::Ready(result) = pending.poll(cx)
-        {
-            self.pending = None;
-            self.complete(result?)?;
-            changed = true;
+        if self.journal.available_command_slots() != 0 {
+            changed |= self.poll_pending(cx)?;
         }
         if let Some(front) = self.live.front()
             && front.buffer.is_some()
@@ -100,38 +80,62 @@ impl LocalActor {
         Ok(changed)
     }
 
-    fn complete(&mut self, done: Completed) -> Result<(), ActorError> {
-        match done {
-            Completed::Apply(ticket) => {
-                crate::profiling::finish(
-                    crate::profiling::Stage::LocalApply,
-                    self.apply_started_at.take(),
-                );
-                self.driver.apply_through(ticket.committed())?;
-            }
-            Completed::Admit(admitted) => {
-                crate::profiling::finish(
-                    crate::profiling::Stage::LocalAdmit,
-                    self.admit_started_at.take(),
-                );
-                let (ticket, buffer, persistence) = admitted.into_parts();
-                let live = self.live.back_mut().ok_or(ActorError::History)?;
-                if live.through.op != ticket.through() || live.buffer.is_some() {
-                    return Err(ActorError::History);
+    fn poll_pending(&mut self, cx: &mut Context<'_>) -> Result<bool, ActorError> {
+        let Some(mut pending) = self.pending.take() else {
+            return Ok(false);
+        };
+        let changed = match &mut pending {
+            Pending::Ready(_) => false,
+            Pending::Propose(work) => match Pin::new(work).poll(cx) {
+                Poll::Pending => false,
+                Poll::Ready(result) => {
+                    crate::profiling::finish(
+                        crate::profiling::Stage::LocalPropose,
+                        self.propose_started_at.take(),
+                    );
+                    self.complete_proposal(result?)?;
+                    true
                 }
-                live.buffer = Some(buffer);
-                live.reply.admitted();
-                self.persistence
-                    .push_back((persistence, crate::profiling::start()));
-            }
-            Completed::Propose(proposal) => {
-                crate::profiling::finish(
-                    crate::profiling::Stage::LocalPropose,
-                    self.propose_started_at.take(),
-                );
-                self.complete_proposal(proposal)?;
-            }
+            },
+            Pending::Admit(work) => match Pin::new(work).poll(cx) {
+                Poll::Pending => false,
+                Poll::Ready(result) => {
+                    self.complete_admission(result?)?;
+                    true
+                }
+            },
+            Pending::Apply(work) => match Pin::new(work).poll(cx) {
+                Poll::Pending => false,
+                Poll::Ready(result) => {
+                    crate::profiling::finish(
+                        crate::profiling::Stage::LocalApply,
+                        self.apply_started_at.take(),
+                    );
+                    self.driver.apply_through(result?.committed())?;
+                    true
+                }
+            },
+        };
+        if !changed {
+            self.pending = Some(pending);
         }
+        Ok(changed)
+    }
+
+    fn complete_admission(&mut self, admitted: AdmittedAppend) -> Result<(), ActorError> {
+        crate::profiling::finish(
+            crate::profiling::Stage::LocalAdmit,
+            self.admit_started_at.take(),
+        );
+        let (ticket, buffer, persistence) = admitted.into_parts();
+        let live = self.live.back_mut().ok_or(ActorError::History)?;
+        if live.through.op != ticket.through() || live.buffer.is_some() {
+            return Err(ActorError::History);
+        }
+        live.buffer = Some(buffer);
+        live.reply.admitted();
+        self.persistence
+            .push_back((persistence, crate::profiling::start()));
         Ok(())
     }
 
@@ -160,14 +164,28 @@ impl LocalActor {
                     reply,
                     buffer: None,
                 });
-                self.pending = Some(Pending::Admit(
-                    self.journal
-                        .admit_append(ticket, validated)
-                        .map_err(|rejected| rejected.reason)?,
-                ));
-                self.admit_started_at = crate::profiling::start();
+                self.admit_ready(ticket, validated)?;
             }
         }
         Ok(())
+    }
+
+    pub(super) fn admit_ready(
+        &mut self,
+        ticket: WriteTicket,
+        validated: ValidatedAppend,
+    ) -> Result<bool, ActorError> {
+        match self.journal.admit_append(ticket, validated) {
+            Ok(completion) => {
+                self.pending = Some(Pending::Admit(completion));
+                self.admit_started_at = crate::profiling::start();
+                Ok(true)
+            }
+            Err(rejected) if rejected.reason == crate::replica_journal::SubmitError::Full => {
+                self.pending = Some(Pending::Ready(Box::new((ticket, rejected.value))));
+                Ok(false)
+            }
+            Err(rejected) => Err(rejected.reason.into()),
+        }
     }
 }

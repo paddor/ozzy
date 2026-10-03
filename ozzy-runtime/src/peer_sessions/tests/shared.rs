@@ -2,7 +2,7 @@ use super::*;
 use std::num::NonZeroU64;
 
 fn profile(roles: u32) -> Parameters {
-    let mut profile = Parameters::streaming(DataLimits::default(), roles, 65_536, 1 << 30).unwrap();
+    let mut profile = Parameters::streaming(DataLimits::default(), roles).unwrap();
     profile.capabilities |= handshake::OWNER_READ | handshake::OWNER_ROUTING;
     profile.required_capabilities = 0;
     profile
@@ -44,10 +44,14 @@ fn shared_link_negotiation_replays_identical_crossed_reconnects() {
 
 #[test]
 fn mixed_clients_preserve_directional_profiles_without_partition_attachment() {
-    let broker = configured(1, profile(handshake::OWNER), 0, 3);
+    let mut local = profile(handshake::OWNER);
+    local.receive.max_parts = 64;
+    local.receive.envelope.max_metadata_bytes = 1024;
+    let broker = configured(1, local, 0, 3);
     for (id, role) in [(2, handshake::PRODUCER), (3, handshake::CONSUMER)] {
         let mut parameters = profile(role);
         parameters.receive.max_records = 32;
+        parameters.receive.max_parts = 128;
         parameters.receive.envelope.max_payload_bytes = 8192;
         parameters.receive.max_record_bytes = 8192;
         if role == handshake::CONSUMER {
@@ -62,10 +66,20 @@ fn mixed_clients_preserve_directional_profiles_without_partition_attachment() {
         assert_eq!(selected.roles, role);
         assert_eq!(selected.receive, parameters.receive);
         assert_eq!(selected.capabilities, parameters.capabilities);
-        assert_eq!(broker.send_limits(node(id)).unwrap().max_records, 32);
+        let expected = DataLimits {
+            envelope: ozzy_proto::EnvelopeLimits {
+                max_metadata_bytes: 1024,
+                max_payload_bytes: 8192,
+            },
+            max_records: 32,
+            max_parts: 64,
+            max_record_bytes: 8192,
+        };
+        assert_eq!(broker.send_limits(node(id)).unwrap(), expected);
+        assert_eq!(client.send_limits(node(1)).unwrap(), expected);
         assert_eq!(
             client.remote_parameters(node(1)).unwrap().receive,
-            profile(handshake::OWNER).receive
+            local.receive
         );
     }
     assert_ne!(broker.session(node(2)), broker.session(node(3)));

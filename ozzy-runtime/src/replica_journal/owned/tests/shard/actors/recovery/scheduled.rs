@@ -56,9 +56,8 @@ fn recovery_retry_retains_latest_sessions_and_starts_new_relative_deadlines() {
 fn retry(policy: QuorumPolicy) {
     let (mut controller, io) = setup();
     let (actor, memory) = recovery_actor(&mut controller, io, policy, [ZERO_SESSION; 3]);
-    let capacity = memory.capacity();
     let mut actor = ScheduledRecovery::new(actor);
-    actor.bind_receive_capacity(&capacity).unwrap();
+    actor.bind_receive_owner(&memory).unwrap();
     let origin = Duration::from_secs(3600);
     assert!(turn(&mut actor, origin).is_empty());
     let peer = NodeId::from_bytes([1; 16]);
@@ -181,18 +180,8 @@ fn rebuild(policy: QuorumPolicy) {
     }
     assert!(confirmed);
     let (actor, memory) = recovery_actor(&mut controller, io, policy, actor_config().sessions);
-    let capacity = memory.capacity();
-    memory
-        .reserve(
-            &capacity,
-            crate::memory::Quota {
-                bytes: 32768,
-                buffers: 2,
-            },
-        )
-        .unwrap();
     let mut recovering = ScheduledRecovery::new(actor);
-    recovering.bind_receive_capacity(&capacity).unwrap();
+    recovering.bind_receive_owner(&memory).unwrap();
     finish_transfer(&mut controller, &mut actors, &mut recovering);
     assert!(!recovering.status().application_ready);
     turn(&mut recovering, Duration::ZERO);
@@ -226,7 +215,7 @@ fn rebuild(policy: QuorumPolicy) {
     }
     let mut replacement = replacement.expect("shared recovery must publish and reopen");
     assert!(!replacement.status().application_ready);
-    assert!(replacement.receive_credit().is_none());
+    assert!(replacement.receive_receipt().is_none());
     assert!(
         replacement
             .disconnect_session(peer, latest, Duration::ZERO)
@@ -235,11 +224,7 @@ fn rebuild(policy: QuorumPolicy) {
     replacement
         .replace_session(peer, ZERO_SESSION, first, Duration::ZERO)
         .unwrap();
-    // Empty receive allowance must not poison normal proposal/read/donor work.
-    let unused = capacity.remaining();
-    if unused != crate::memory::Quota::default() {
-        capacity.release(unused).unwrap();
-    }
+    // Follower staging and normal proposal work share the bounded shard owner.
     let mut proposal = replacement
         .lease_proposal_buffer_with_limits(pipeline())
         .unwrap();
@@ -317,12 +302,13 @@ fn activate(
         if replacement.status().application_ready {
             assert!(replacement.status().scope.view > 0);
             assert_eq!(replacement.status().normal.unwrap().applied.op.0, 1);
+            replacement.advance(now).unwrap();
             let (_, report) = replacement
-                .receive_credit()
+                .receive_receipt()
                 .expect("replacement is a follower");
             assert_eq!(
-                report.operation_limit, 0,
-                "handoff fabricated unbacked receive credit"
+                report.received,
+                replacement.status().normal.unwrap().accepted
             );
             activated = true;
             break;

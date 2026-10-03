@@ -95,5 +95,5 @@ async fn wave(
     let writing = live::write(brokers, writer, records);
     let reading = live::read(brokers, reader, expected, positions);
     futures::join!(writing, reading);
-    assert_eq!(sdk.socket_count(), 6, "three PEER and three SUB sockets");
+    assert_eq!(sdk.socket_count(), 5, "two PEER and three SUB sockets");
 }

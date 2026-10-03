@@ -1,5 +1,6 @@
 //! Canonical journal operations, progress, integrity, and work limits.
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 pub mod integrity;
 pub mod operation;

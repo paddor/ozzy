@@ -1,7 +1,6 @@
 //! Partition scheduling without owning a PEER or PUB socket.
 
 use super::{ActorError, ActorStatus, ReplicaActor};
-use crate::replica_journal::{JournalExecution, ShardJournal};
 use crate::replica_transport::FlushProgress;
 use crate::replica_transport::SendClass;
 use omq_tokio::{Message, TrySendError};
@@ -13,18 +12,18 @@ use std::time::Duration;
 /// decoded transport messages, monotonic timer observations and bounded sends.
 /// Each partition waits for storage independently. No thread or task is created.
 #[derive(Debug)]
-pub struct ScheduledReplica<E = ShardJournal> {
-    actor: Box<ReplicaActor<E>>,
+pub struct ScheduledReplica {
+    actor: Box<ReplicaActor>,
     now: Duration,
     active: bool,
 }
 
-impl<E: JournalExecution> ScheduledReplica<E> {
+impl ScheduledReplica {
     pub(super) fn read_access(
         &mut self,
     ) -> (
         Option<ozzy_replication::driver::ValidationTicket>,
-        &mut crate::replica_journal::ReplicaJournal<E>,
+        &mut crate::replica_journal::ReplicaJournal,
     ) {
         let ticket = (self.active
             && self.actor.application_ready()
@@ -51,15 +50,25 @@ impl<E: JournalExecution> ScheduledReplica<E> {
         self.actor.lease_proposal_buffer_with_limits(limits)
     }
 
-    /// Bind follower staging to allowance supplied by the shared shard owner.
-    /// Call before serving; every replacement receive arena keeps this source.
-    pub fn bind_receive_capacity(
-        &mut self,
-        capacity: &crate::memory::Capacity,
-    ) -> Result<(), ActorError> {
-        self.actor.work.bind_receive_capacity(capacity)?;
-        self.actor.history_receive_allocator = Some(capacity.allocator());
+    /// Bind normal follower payload allocations directly to the shard budget.
+    /// Call before serving. All replacement arenas keep the same owner.
+    pub fn bind_receive_owner(&mut self, owner: &crate::memory::Owner) -> Result<(), ActorError> {
+        self.actor
+            .work
+            .receive
+            .queued
+            .bind_allocator(&owner.allocator())?;
+        self.actor.work.receive.allocator = Some(owner.allocator());
+        self.actor.history_receive_allocator = Some(owner.allocator());
         Ok(())
+    }
+
+    /// The adapter provides group PUB delivery and bounded PEER gap repair.
+    pub fn enable_publication(&mut self) {
+        self.actor.work.flow.publication_enabled = true;
+        for peer in self.actor.work.flow.peers.iter_mut().flatten() {
+            peer.enable_broadcast();
+        }
     }
 
     /// Pending received proposals still need the canonical destination allowance.
@@ -83,7 +92,7 @@ impl<E: JournalExecution> ScheduledReplica<E> {
     }
 
     /// Transfer an actor without per-partition socket services.
-    pub fn new(actor: ReplicaActor<E>) -> Result<Self, ScheduleError> {
+    pub fn new(actor: ReplicaActor) -> Result<Self, ScheduleError> {
         Ok(Self {
             actor: Box::new(actor),
             now: Duration::ZERO,
@@ -106,10 +115,37 @@ impl<E: JournalExecution> ScheduledReplica<E> {
         self.finish(result)
     }
 
+    /// Deliver normal follower data. False retains one contiguous frame at the
+    /// shard until storage/memory progresses. Gaps are consumed for PEER repair.
+    pub fn receive_data(
+        &mut self,
+        message: &Message,
+        now: Duration,
+    ) -> Result<bool, ScheduleError> {
+        self.observe(now)?;
+        let committed = self
+            .actor
+            .driver
+            .normal()
+            .map(|normal| normal.snapshot().committed);
+        let result = self.actor.receive_data(message, now);
+        if result.as_ref().is_ok_and(|consumed| *consumed)
+            || committed
+                != self
+                    .actor
+                    .driver
+                    .normal()
+                    .map(|normal| normal.snapshot().committed)
+        {
+            self.actor.ready_work.mark();
+        }
+        self.finish(result)
+    }
+
     /// Replace one independently established broker link. The adapter supplies a
     /// fresh session and fences its own old grants and queued replies first.
     /// An obsolete replacement cannot overwrite a newer binding. Duplicates are
-    /// harmless. This changes no election, journal, receive-credit, or proposal
+    /// harmless. This changes no election, journal, retained-history, or proposal
     /// authority. Already admitted file work continues under its existing tickets.
     pub fn replace_session(
         &mut self,
@@ -148,8 +184,8 @@ impl<E: JournalExecution> ScheduledReplica<E> {
     }
 
     /// Fence a disconnected broker before accepting more input from it. This
-    /// leaves membership, journal work, accepted proposals, and spent receive
-    /// credit intact. Reconnect uses `replace_session` with a zero expected ID.
+    /// leaves membership, journal work, accepted proposals, and retained receive
+    /// bodies intact. Reconnect uses `replace_session` with a zero expected ID.
     /// A delayed disconnect cannot fence a newer independently negotiated link.
     pub fn disconnect_session(
         &mut self,
@@ -199,11 +235,27 @@ impl<E: JournalExecution> ScheduledReplica<E> {
     /// returns; transport submission is never a replication confirmation.
     pub fn flush(
         &mut self,
-        try_send: impl FnMut(Message) -> Result<(), TrySendError>,
+        mut try_send: impl FnMut(Message) -> Result<(), TrySendError>,
     ) -> Result<FlushProgress, ScheduleError> {
         self.observe(self.now)?;
         // Publish the latest counters once, after the bounded input/journal
         // turn. Retaining several packets never queues intermediate reports.
+        if let Some(message) = self.actor.work.flow.publication.take() {
+            match try_send(message) {
+                Ok(()) => crate::profiling::event(crate::profiling::Event::ReplicaPublication),
+                Err(TrySendError::Full(message)) => {
+                    // Local handoff pressure precedes lossy PUB. Keep this
+                    // actor's single frame until the dispatcher slot returns.
+                    self.actor.work.flow.publication = Some(message);
+                }
+                Err(TrySendError::Closed) => {
+                    return self.finish(Err(ActorError::Transport(omq_tokio::Error::Closed)));
+                }
+                Err(TrySendError::Error(error)) => {
+                    return self.finish(Err(ActorError::Transport(error)));
+                }
+            }
+        }
         let result = self.actor.publish_receipt().and_then(|()| {
             self.actor
                 .outbox
@@ -270,7 +322,7 @@ impl<E: JournalExecution> ScheduledReplica<E> {
     /// Current follower receive window and its leader. This is an observation,
     /// never permission to consume shard memory. Absent while authority is not
     /// ready, on leaders, or before receive state matches the installed scope.
-    pub fn receive_credit(&self) -> Option<(NodeId, ozzy_replication::flow::Report)> {
+    pub fn receive_receipt(&self) -> Option<(NodeId, ozzy_replication::flow::Report)> {
         let report = self.actor.work.receive_report();
         let leader = self
             .actor
@@ -284,83 +336,21 @@ impl<E: JournalExecution> ScheduledReplica<E> {
         .then_some((leader, report))
     }
 
-    /// Free partition capacity after unused grants and retained operations.
-    /// This observation still needs backing from the shard and dispatcher.
+    /// Free local partition capacity after retained operations.
+    /// Actual payload allocation also checks the reserved shard memory owner.
     pub fn receive_capacity(&self) -> Option<ozzy_replication::PipelineLimits> {
-        self.receive_credit()?;
+        self.receive_receipt()?;
         Some(self.actor.work.receive_capacity())
     }
 
     /// Exact follower epoch independent of link availability or temporary
-    /// intake fencing. Used to revoke unused reservations during disconnect.
+    /// intake fencing. Stale data must still match this incarnation.
     pub fn receive_channel(&self) -> Option<ozzy_replication::flow::Channel> {
         let channel = self.actor.work.receive_report().channel;
         (self.active
-            && self.actor.work.reserved_receive_credit()
             && self.actor.driver.scope() == channel.scope
             && self.actor.configuration.primary(channel.scope.view) != self.actor.local)
             .then_some(channel)
-    }
-
-    /// Outstanding tail advertised by the current, independently bound leader.
-    /// A shard may use this hint to schedule capacity for active partitions.
-    /// It proves no history or confirmation and grants no credit. Reconnect and
-    /// scope changes clear it; receiving through the hinted tail consumes it.
-    pub fn receive_target(&self) -> Option<ozzy_replication::OpNumber> {
-        let (_, report) = self.receive_credit()?;
-        self.actor
-            .work
-            .flow
-            .receive_target()
-            .filter(|&tail| tail > report.received.op)
-    }
-
-    /// Conservative next-packet body demand from the currently bound leader.
-    pub fn receive_body_bytes(&self) -> Option<usize> {
-        self.receive_target()?;
-        self.actor.work.flow.receive_body_bytes()
-    }
-
-    /// Advertise capacity only after the shard backs it with destination and
-    /// dispatch reservations. This exact epoch must still be current. Failing
-    /// admission changes no receive counters and does not stop the actor.
-    /// Actual retained-buffer release, not receipt or confirmation, permits
-    /// the shard to reuse its byte reservations.
-    pub fn grant_receive(
-        &mut self,
-        channel: ozzy_replication::flow::Channel,
-        operations: u64,
-        bytes: u64,
-    ) -> Result<(), ozzy_replication::flow::FlowError> {
-        use ozzy_replication::flow::FlowError;
-        let (_, current) = self.receive_credit().ok_or(FlowError::Channel)?;
-        if current.channel != channel {
-            return Err(FlowError::Channel);
-        }
-        self.actor.work.grant_receive(channel, operations, bytes)?;
-        self.actor.ready_work.mark();
-        Ok(())
-    }
-
-    /// Fence unused follower credit with a fresh injected receive epoch. The
-    /// shard must revoke the old dispatcher token before reusing its unused
-    /// reservation. Queued, validating, and accepted bodies remain charged and
-    /// continue normally; revocation is neither cancellation nor confirmation.
-    /// Works after link loss too. Membership, view, and link session stay fixed.
-    pub fn revoke_receive(
-        &mut self,
-        channel: ozzy_replication::flow::Channel,
-    ) -> Result<ozzy_replication::flow::Report, ScheduleError> {
-        use ozzy_replication::flow::FlowError;
-        self.observe(self.now)?;
-        if !self.actor.work.reserved_receive_credit() {
-            return Err(FlowError::Invalid.into());
-        }
-        if self.receive_channel() != Some(channel) {
-            return Err(FlowError::Channel.into());
-        }
-        let result = self.actor.revoke_unused_receive();
-        self.finish(result)
     }
 
     /// Close intake and drain admitted journal work without adding confirmation.
@@ -392,13 +382,9 @@ impl<E: JournalExecution> ScheduledReplica<E> {
 /// Rejected external schedule or terminal partition failure.
 #[derive(Debug, thiserror::Error)]
 pub enum ScheduleError {
-    /// Stale receive epoch or unsupported credit mode; the actor stays active.
-    #[error(transparent)]
-    Credit(#[from] ozzy_replication::flow::FlowError),
     /// Unknown/local peer, zero session, or replacement of an obsolete binding.
     #[error("invalid or obsolete partition link binding")]
     Binding,
-    /// This interface cannot drive legacy socket-owning services.
     /// No event was delivered because its time precedes an earlier observation.
     #[error("partition scheduling time moved backward")]
     TimeReversed,

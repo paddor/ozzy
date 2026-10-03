@@ -8,10 +8,11 @@ use crate::replica_transport::QueueLimits;
 use omq_tokio::Message;
 use ozzy_proto::LinkSessionId;
 mod identities;
+mod maintenance;
 mod recovery;
 mod scheduled;
 
-type Actor = ControlledReplica<ShardJournal>;
+type Actor = ControlledReplica;
 
 fn actor_config() -> ActorConfig {
     ActorConfig {
@@ -245,7 +246,7 @@ fn unstarted_actor(
     policy: QuorumPolicy,
     broker: u8,
     identities: usize,
-) -> ReplicaActor<ShardJournal> {
+) -> ReplicaActor {
     unstarted_actor_with_sessions(
         controller,
         io,
@@ -265,7 +266,7 @@ fn unstarted_actor_with_sessions(
     broker: u8,
     identities: usize,
     sessions: [LinkSessionId; 3],
-) -> ReplicaActor<ShardJournal> {
+) -> ReplicaActor {
     let leader = group % 3;
     let mut config = config(&format!("/g{group}-b{broker}"), group + 4, policy);
     let mut voters = std::array::from_fn(|n| ConfiguredVoter {

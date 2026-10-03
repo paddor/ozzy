@@ -56,7 +56,8 @@ impl ReaderLinkLimits {
             .checked_add(receive.max_parts.checked_mul(256)?)?
             .checked_add(decode)?
             .checked_mul(frame_slots(self.queue_messages))?
-            .checked_add(decode)?;
+            .checked_add(decode)?
+            .checked_add(receive.envelope.max_metadata_bytes.checked_add(256)?)?;
         let transport = message
             .checked_add(4096)?
             .checked_mul(self.queue_messages)?
@@ -97,7 +98,7 @@ struct State {
     selected: Option<Selection>,
     messages: VecDeque<Message>,
     publications: VecDeque<Message>,
-    overflow: bool,
+    rejection: Option<Message>,
 }
 
 #[derive(Debug)]
@@ -122,7 +123,7 @@ pub(super) struct Registry {
     entries: Mutex<BTreeMap<SubscriptionId, Weak<Inbox>>>,
     slots: Arc<Semaphore>,
     queue: usize,
-    changed: Arc<StateSignal>,
+    pub(super) changed: Arc<StateSignal>,
     topology: Mutex<Topology>,
     pub(super) interests: Arc<StateSignal>,
 }
@@ -328,7 +329,7 @@ impl Registry {
         };
         let mut state = inbox.state.lock().expect("reader inbox poisoned");
         state.messages.clear();
-        state.overflow = false;
+        state.rejection = None;
         state.selected = Some(Selection {
             broker,
             session,
@@ -346,7 +347,7 @@ impl Registry {
         message: &Message,
         packet: Packet<'_>,
         limits: EnvelopeLimits,
-    ) -> bool {
+    ) -> Result<bool, Arc<Inbox>> {
         let entries = self.entries.lock().expect("reader registry poisoned");
         let target = if packet.envelope.opcode == Opcode::Records {
             reader::route_subscription(packet, limits)
@@ -388,21 +389,27 @@ impl Registry {
         drop(entries);
         if let Some(inbox) = target {
             let mut state = inbox.state.lock().expect("reader inbox poisoned");
-            if !state.overflow {
+            if packet.envelope.opcode == Opcode::Nack {
+                // One terminal reply has reserved metadata backing independent
+                // of record aliases. Slow readers cannot stall control replies.
+                state.rejection =
+                    Some(Message::multipart((0..4).map(|i| {
+                        Bytes::copy_from_slice(message.part_slice(i).expect("four frames"))
+                    })));
+            } else {
                 let compact = (state.messages.len() < inbox.queue)
                     .then(|| inbox.compact(message))
                     .flatten();
-                if let Some(message) = compact {
-                    state.messages.push_back(message);
-                } else {
-                    state.overflow = true;
-                    state.messages.clear();
-                }
+                let Some(message) = compact else {
+                    drop(state);
+                    return Err(inbox);
+                };
+                state.messages.push_back(message);
             }
             drop(state);
             self.changed.notify_changed();
         }
-        true
+        Ok(true)
     }
 }
 
@@ -440,23 +447,32 @@ impl Inbox {
             .as_ref()
             .map(|selected| (selected.broker, selected.subscribed))
     }
-    pub(in crate::replicated) fn pop(&self) -> Result<Option<Message>, BrokerLinkError> {
+    pub(in crate::replicated) fn pop(&self) -> Option<Message> {
         let mut state = self.state.lock().expect("reader inbox poisoned");
-        if state.overflow {
-            return Err(BrokerLinkError::Session);
+        let message = state
+            .messages
+            .pop_front()
+            .or_else(|| state.rejection.take());
+        drop(state);
+        if message.is_some() {
+            self.changed.notify_changed();
         }
-        Ok(state.messages.pop_front())
+        message
     }
     pub(in crate::replicated) fn clear(&self) {
         let mut state = self.state.lock().expect("reader inbox poisoned");
         state.messages.clear();
         state.selected = None;
-        state.overflow = false;
+        state.rejection = None;
+        drop(state);
+        self.changed.notify_changed();
     }
     pub(in crate::replicated) fn reset_delivery(&self) {
         let mut state = self.state.lock().expect("reader inbox poisoned");
         state.messages.clear();
-        state.overflow = false;
+        state.rejection = None;
+        drop(state);
+        self.changed.notify_changed();
         // Keep uncertain broker state available to close. A replacement
         // Subscribe overwrites this selection and fences its queued records.
     }
@@ -500,18 +516,6 @@ impl BrokerLinks {
     ) -> Result<(), BrokerLinkError> {
         self.0.shared.readers.topic(topic)
     }
-    pub(in crate::replicated) fn reader_window(&self) -> Result<(u64, u64), BrokerLinkError> {
-        let limits = self.0.config.reader.ok_or(BrokerLinkError::Configuration)?;
-        let parameters = self.reader_parameters();
-        let records = (parameters.inflight_records / limits.subscriptions as u64)
-            .min(parameters.receive.max_records as u64);
-        let bytes = (parameters.inflight_bytes / limits.subscriptions as u64)
-            .min(parameters.receive.envelope.max_payload_bytes as u64);
-        if records == 0 || bytes < parameters.receive.max_record_bytes as u64 {
-            return Err(BrokerLinkError::Configuration);
-        }
-        Ok((records, bytes))
-    }
     pub(in crate::replicated) fn reader_inbox(
         &self,
         prefix: Bytes,
@@ -548,20 +552,6 @@ impl BrokerLinks {
         }
         Ok(selected)
     }
-    pub(in crate::replicated) async fn reader_credit(
-        &self,
-        broker: NodeId,
-        credit: reader::Credit,
-    ) -> Result<(), BrokerLinkError> {
-        let message = self
-            .request_reader_control(broker, driver::Body::Credit(credit))
-            .await?;
-        let packet = driver::packet(&message, broker, self.0.config.parameters.receive.envelope)?;
-        if reader::decode_credit(packet, self.0.config.parameters.receive.envelope)? != credit {
-            return Err(BrokerLinkError::Response);
-        }
-        Ok(())
-    }
     pub(in crate::replicated) async fn reader_ack(
         &self,
         broker: NodeId,
@@ -589,7 +579,7 @@ impl BrokerLinks {
         loop {
             match self.request_until(broker, body.clone(), deadline).await {
                 Err(BrokerLinkError::Rejected {
-                    retry: ozzy_proto::nack::RetryClass::AfterCredit,
+                    retry: ozzy_proto::nack::RetryClass::AfterBackoff,
                     ..
                 }) if self.clock().now() < deadline => {
                     self.clock()
@@ -623,7 +613,7 @@ impl BrokerLinks {
             {
                 Ok(message) => break message,
                 Err(BrokerLinkError::Rejected {
-                    retry: ozzy_proto::nack::RetryClass::AfterCredit,
+                    retry: ozzy_proto::nack::RetryClass::AfterBackoff,
                     ..
                 }) if self.0.config.clock.now() < deadline => {
                     self.0

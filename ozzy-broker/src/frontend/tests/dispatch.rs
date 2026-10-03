@@ -6,32 +6,13 @@ use ozzy_proto::{
     ProducerId, RequestId, SubscriptionId, append, data::Authority, reader,
 };
 use ozzy_runtime::{
-    dispatch::{self, Budget, Budgets, Class, Quota},
+    dispatch::Class,
     frontend::{
         Binding, Dispatcher, DispatcherLimits, Kind, Placement, Rejection, ReplyLimits,
-        RoutingTable, Subject,
+        RoutingTable,
     },
     replica_transport::QueueLimits,
 };
-
-fn budgets() -> dispatch::Limits {
-    dispatch::Limits {
-        capacity: Budgets {
-            data: Budget {
-                queue_slots: 2,
-                retained_messages: 2,
-                bytes: 8192,
-            },
-            control: Budget {
-                queue_slots: 1,
-                retained_messages: 1,
-                bytes: 4096,
-            },
-        },
-        clients: 1,
-        grants: 2,
-    }
-}
 
 fn target(shard: u32) -> Placement {
     Placement {
@@ -114,9 +95,7 @@ fn message(binding: Binding, target: Placement, control: bool) -> Message {
 
 type LaneSetup = (
     u32,
-    dispatch::Sender<Message>,
-    dispatch::Grant,
-    dispatch::Grant,
+    [ozzy_runtime::frontend::DataSender; 2],
     std::thread::ThreadId,
 );
 
@@ -128,35 +107,28 @@ async fn run_shard(
     release_stalled: Arc<Semaphore>,
 ) -> Result<(), StartupError> {
     let id = context.plan.id;
-    let (sender, mut receiver) = dispatch::channel::<Message>(budgets()).unwrap();
-    let client = receiver
-        .credits()
-        .client(binding.session, budgets().capacity)
-        .unwrap();
-    let data = receiver
-        .credits()
-        .grant(
-            &client,
-            Class::Data,
-            Quota {
-                messages: 2,
-                bytes: 8192,
-            },
-        )
-        .unwrap();
-    let control = receiver
-        .credits()
-        .grant(
-            &client,
-            Class::Control,
-            Quota {
-                messages: 1,
-                bytes: 4096,
-            },
-        )
-        .unwrap();
+    let (data, mut data_rx) = ozzy_runtime::frontend::data_channel(
+        &omq_tokio::Context::new(),
+        id,
+        Kind::Client,
+        Class::Data,
+        2,
+        4096,
+        16384,
+    )
+    .unwrap();
+    let (control, mut control_rx) = ozzy_runtime::frontend::data_channel(
+        &omq_tokio::Context::new(),
+        id,
+        Kind::Client,
+        Class::Control,
+        1,
+        4096,
+        8192,
+    )
+    .unwrap();
     setup
-        .send((id, sender, data, control, std::thread::current().id()))
+        .send((id, [data, control], std::thread::current().id()))
         .await
         .unwrap();
     context.ready()?;
@@ -166,18 +138,24 @@ async fn run_shard(
     let count = if id == 0 { 3 } else { 1 };
     let mut classes = Vec::new();
     for _ in 0..count {
-        receiver.ready().await;
-        let work = receiver.try_recv().unwrap().unwrap();
-        assert_eq!(work.session, binding.session);
-        classes.push(work.class);
-        let message = work.into_retained_message();
+        let work = if let Some(work) = control_rx
+            .try_recv()
+            .unwrap()
+            .or_else(|| data_rx.try_recv().unwrap())
+        {
+            work
+        } else {
+            tokio::select! { input = control_rx.ready() => input.unwrap(), input = data_rx.ready() => input.unwrap() }
+        };
+        assert_eq!(work.binding.session, binding.session);
+        classes.push(work.route.class);
+        let message = work.message;
         if classes.last() == Some(&Class::Data) {
             assert_eq!(message.part_slice(3), Some(b"opaque payload".as_slice()));
         }
     }
     observed.send((id, classes)).await.unwrap();
     context.shutdown.requested().await;
-    drop(client);
     Ok(())
 }
 
@@ -185,8 +163,7 @@ async fn run_frontend(
     mut context: FrontendContext,
     binding: Binding,
     shard_threads: Vec<std::thread::ThreadId>,
-    senders: Vec<(u32, dispatch::Sender<Message>)>,
-    grants: Vec<(u32, dispatch::Grant, dispatch::Grant)>,
+    senders: Vec<(u32, ozzy_runtime::frontend::DataSender)>,
     delivered: oneshot::Sender<usize>,
 ) -> Result<(), StartupError> {
     assert!(!shard_threads.contains(&std::thread::current().id()));
@@ -208,7 +185,7 @@ async fn run_frontend(
         senders,
         DispatcherLimits {
             peers: 1,
-            grants_per_class: 2,
+
             replies: ReplyLimits {
                 control: queue,
                 data: queue,
@@ -217,28 +194,6 @@ async fn run_frontend(
     )
     .unwrap();
     dispatcher.bind(binding).unwrap();
-    for (id, data, control) in grants {
-        dispatcher
-            .install(
-                binding.peer,
-                Subject {
-                    group: target(id).group,
-                    writer: Some(ProducerId::from_bytes([4; 16])),
-                },
-                data,
-            )
-            .unwrap();
-        dispatcher
-            .install(
-                binding.peer,
-                Subject {
-                    group: target(id).group,
-                    writer: None,
-                },
-                control,
-            )
-            .unwrap();
-    }
     context.ready()?;
     let mut rejected = 0;
     for _ in 0..5 {
@@ -248,10 +203,10 @@ async fn run_frontend(
         };
         // Trusted inproc fixture owns bounded fresh 1 KiB frame buffers.
         // This is not a general charge for network receive allocations.
-        if let Err(failure) = dispatcher.dispatch(binding.peer, message, 4096) {
+        if let Err(failure) = dispatcher.dispatch_data(binding.peer, message, 4096) {
             assert!(matches!(
                 failure.reason,
-                Rejection::Admission(dispatch::SendFailure::Admission(dispatch::Error::Full))
+                Rejection::Data(ozzy_runtime::frontend::DataPressure::Full { .. })
             ));
             rejected += 1;
         }
@@ -289,12 +244,12 @@ async fn ordinary_peer_dispatch_preserves_healthy_shard_and_reserved_control_pro
         .await
         .unwrap();
         let mut senders = Vec::new();
-        let mut grants = Vec::new();
         let mut shard_threads = Vec::new();
         for _ in 0..2 {
-            let (id, sender, data, control, thread) = setups.recv().await.unwrap();
-            senders.push((id, sender));
-            grants.push((id, data, control));
+            let (id, lanes, thread) = setups.recv().await.unwrap();
+            for lane in lanes {
+                senders.push((id, lane));
+            }
             shard_threads.push(thread);
         }
         let context = Context::new();
@@ -306,9 +261,7 @@ async fn ordinary_peer_dispatch_preserves_healthy_shard_and_reserved_control_pro
             &endpoints,
             limits(),
             context.clone(),
-            move |context| {
-                run_frontend(context, binding, shard_threads, senders, grants, delivered)
-            },
+            move |context| run_frontend(context, binding, shard_threads, senders, delivered),
         )
         .await
         .unwrap();
@@ -330,7 +283,7 @@ async fn ordinary_peer_dispatch_preserves_healthy_shard_and_reserved_control_pro
         release_stalled.add_permits(1);
         assert_eq!(
             observations.recv().await.unwrap(),
-            (0, vec![Class::Data, Class::Data, Class::Control])
+            (0, vec![Class::Control, Class::Data, Class::Data])
         );
         sdk.close().await.unwrap();
         frontend.shutdown().await.unwrap();

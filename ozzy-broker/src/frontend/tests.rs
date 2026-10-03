@@ -44,6 +44,7 @@ fn endpoints(follower: bool) -> Endpoints {
     let name = ozzy_proto::RequestId::new();
     Endpoints {
         peer: format!("inproc://{name}-peer"),
+        data_peer: format!("inproc://{name}-data"),
         reader_pub: format!("inproc://{name}-reader"),
         follower_pub: follower.then(|| format!("inproc://{name}-follower")),
     }

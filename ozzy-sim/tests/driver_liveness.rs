@@ -11,7 +11,7 @@ use ozzy_journal::operation::{
 use ozzy_proto::{GroupId, LinkSessionId, NodeId, OperationId};
 use ozzy_replication::driver::{Action, ReplicaDriver, Timing};
 use ozzy_replication::wire::{
-    Control, Grant, PeerBinding, ReplicaMessage, WireLimits, decode, encode_control,
+    Control, PeerBinding, ReplicaMessage, WireLimits, decode, encode_control,
 };
 use ozzy_replication::{
     Admission, Configuration, Digest, JournalGeneration, NormalReplica, PipelineLimits, Prefix,
@@ -103,21 +103,7 @@ fn commit_on_healthy_pair(
     }
     let ack = replicas[1].normal().unwrap().acknowledgment().unwrap();
     replicas[0]
-        .receive(
-            node(1),
-            wire(
-                1,
-                Control::PrepareOk {
-                    ack,
-                    grant: Grant {
-                        revision: 1,
-                        record_limit: 8,
-                        byte_limit: 4096,
-                    },
-                },
-            ),
-            now,
-        )
+        .receive(node(1), wire(1, Control::PrepareOk { ack }), now)
         .unwrap();
     let commit = replicas[0].normal().unwrap().announcement().unwrap();
     assert_eq!(commit.committed, operation.prefix());

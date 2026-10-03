@@ -26,7 +26,7 @@ pub enum RecoveryTransition<J: RecoveryStorage = ShardRecoveringJournal> {
     Retry(Box<ControlledRecovery<J>>),
     /// Fully published replica, still fenced and requiring election/activation.
     /// Configure client admission before placing it in `ControlledReplica` or OMQ.
-    Normal(Box<ReplicaActor<J::Normal>>),
+    Normal(Box<ReplicaActor>),
 }
 
 impl<J: RecoveryStorage> ControlledRecovery<J> {

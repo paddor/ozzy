@@ -29,9 +29,10 @@ operation data into prefixes; Rust simulation retains values. A TLC `Write`
 is one complete group, not a partial byte write. Its success history is an
 external oracle retained across simulated power cuts.
 
-`PrimaryRestart` and `PrepareReplacement` capture design-review counterexamples before the replica
-core exists. They do not elect a primary or prove quorum selection. They need
-production Rust trace regressions when replication lands. The restart model
+`PrimaryRestart` and `PrepareReplacement` retain small design-review
+counterexamples. The production core now exists, with restart and selected-history
+regressions in Rust. These models do not elect a primary or prove quorum selection.
+The restart model
 abstracts successful new-view establishment; the replacement model explicitly
 assumes the selected suffix is authorized and the prepare was not committed.
 
@@ -62,6 +63,13 @@ These are selected-function properties, not a proof of journal contents or I/O.
 Kani may report unsupported constructs in unreachable dependency code. Default
 reachability/undefined-function checks remain enabled; a reachable unsupported
 construct must fail verification. Do not suppress checks to obtain success.
+
+## Loom
+
+Run `scripts/test.sh loom`. Production SDK counters and receipt slots use Loom
+atomics to explore admission/cancellation/release, persistent readiness, capacity
+observation and exact offset publication. Tokio/OMQ internals and disk/message
+orders remain outside these models; see [validation](../doc/VALIDATION.md#loom).
 
 ## Rust simulation
 

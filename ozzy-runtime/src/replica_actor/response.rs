@@ -14,7 +14,7 @@ pub(super) fn rejection(error: &JournalError) -> (u16, RetryClass) {
                 (6, RetryClass::Permanent)
             }
             AppendAdmissionError::Sequence => (7, RetryClass::Permanent),
-            AppendAdmissionError::SequenceGap => (10, RetryClass::AfterCredit),
+            AppendAdmissionError::SequenceGap => (10, RetryClass::AfterBackoff),
             AppendAdmissionError::RetryConflict => (8, RetryClass::Permanent),
             AppendAdmissionError::RetryHistoryExpired => (9, RetryClass::Permanent),
         },

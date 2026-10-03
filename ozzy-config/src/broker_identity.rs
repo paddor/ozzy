@@ -12,9 +12,13 @@ use uuid::Uuid;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrokerIdentity {
+    /// Persistent cluster namespace.
     pub cluster: Uuid,
+    /// Persistent local broker ID.
     pub broker: Uuid,
+    /// Physical volume IDs by configured device name.
     pub volumes: BTreeMap<String, Uuid>,
+    /// Local partition-store bindings in numeric partition order.
     pub topics: BTreeMap<String, Vec<PartitionStore>>,
 }
 
@@ -23,10 +27,15 @@ pub struct BrokerIdentity {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PartitionStore {
+    /// Zero-based topic partition number.
     pub partition: u32,
+    /// Persistent partition replication-group ID.
     pub group: Uuid,
+    /// Persistent containing volume ID.
     pub volume: Uuid,
+    /// Persistent local journal-store ID.
     pub store: Uuid,
+    /// Store incarnation fenced against obsolete physical work.
     pub generation: u64,
 }
 
@@ -35,16 +44,21 @@ pub struct PartitionStore {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VolumeIdentity {
+    /// Persistent cluster namespace.
     pub cluster: Uuid,
+    /// Persistent owning broker ID.
     pub broker: Uuid,
+    /// Persistent physical volume ID.
     pub volume: Uuid,
 }
 
 impl VolumeIdentity {
+    /// Encode a checksummed persistent volume identity.
     pub fn encode(&self) -> Result<String, ConfigError> {
         crate::record::encode("volume", self)
     }
 
+    /// Check integrity and parse a persistent volume identity.
     pub fn decode(input: &str) -> Result<Self, ConfigError> {
         crate::record::decode("volume", input)
     }

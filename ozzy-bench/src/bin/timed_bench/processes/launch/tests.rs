@@ -56,6 +56,8 @@ fn timed_reader_and_writer_bounds_reach_child_processes() {
         "--json-payload",
         "--writer-inflight-appends",
         "3",
+        "--writer-batch-target-kib",
+        "4096",
         "--reader-records",
         "2048",
         "--reader-payload-mib",
@@ -77,6 +79,7 @@ fn timed_reader_and_writer_bounds_reach_child_processes() {
     assert_eq!(child.readers_per_partition, 3);
     assert!(child.live_readers);
     assert_eq!(child.writer_inflight_appends, 3);
+    assert_eq!(child.writer_batch_target_kib, 4096);
     assert_eq!(child.reader_records, 2048);
     assert_eq!(child.reader_payload_mib, 2);
     assert!(child.json_payload);

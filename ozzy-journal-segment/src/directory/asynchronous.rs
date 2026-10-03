@@ -51,22 +51,34 @@ use std::path::Path;
 /// Per-journal limits complement, never replace, the shared device budget.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
+    /// Selected-manifest decoding bounds.
     pub metadata: MetadataLimits,
+    /// Physical segment framing and decoded-body bounds.
     pub decode: DecodeLimits,
+    /// Canonical operation-body decoding bounds.
     pub operations: OperationLimits,
+    /// Checkpoint construction and decoding bounds.
     pub checkpoint: CheckpointLimits,
+    /// Physical transfer, segment capacity, and write-mode bounds.
     pub io: AsyncSegmentOptions,
+    /// Maximum entries returned by one bounded directory listing.
     pub directory_entries: usize,
+    /// Maximum combined filename bytes per directory listing.
     pub directory_name_bytes: usize,
 }
 
 /// Explicit new-store specification. Opening a store never constructs this.
 #[derive(Debug)]
 pub struct Format {
+    /// Exact group, node, volume, store, and store-generation binding.
     pub identity: GroupIdentity,
+    /// Selected membership/configuration epoch.
     pub configuration_epoch: u64,
+    /// Explicit journal durability and metadata-acceptance mode.
     pub commit_mode: CommitMode,
+    /// Validated genesis segment header for explicit formatting.
     pub first_segment: SegmentHeader,
+    /// Exact immutable adapter configuration bytes.
     pub configuration: Vec<u8>,
 }
 
@@ -88,21 +100,27 @@ pub struct Journal {
 }
 
 impl Journal {
+    /// Filesystem directory bound to this owner.
     pub fn root(&self) -> &Path {
         self.directory.root()
     }
+    /// Exact validated metadata manifest held by this object.
     pub const fn manifest(&self) -> &Manifest {
         &self.manifest
     }
+    /// Validated reference selecting the current manifest generation.
     pub const fn current(&self) -> CurrentReference {
         self.current
     }
+    /// Exact persisted adapter configuration bytes, when present.
     pub fn configuration(&self) -> Option<&[u8]> {
         self.configuration.as_deref()
     }
+    /// Borrow the active physical segment writer.
     pub const fn writer(&self) -> &AsyncSegmentWriter {
         &self.writer
     }
+    /// Whether failure or canceled mutation fences further use.
     pub fn is_faulted(&self) -> bool {
         self.interrupted || self.writer.is_faulted() || self.directory.is_faulted()
     }
@@ -114,9 +132,11 @@ impl Journal {
         Ok(())
     }
 
+    /// Exact written canonical prefix; this does not prove durability.
     pub fn written_position(&self) -> Result<LogPosition, DirectoryError> {
         position_before(self.writer.written_position().next_chain())
     }
+    /// Canonical prefix accepted under this journal mode.
     pub fn accepted_position(&self) -> Result<LogPosition, DirectoryError> {
         position_before(
             if self.manifest.commit_mode == CommitMode::LocalDurable {
@@ -127,6 +147,7 @@ impl Journal {
             .next_chain(),
         )
     }
+    /// Confirmed canonical prefix exposed by this journal mode.
     pub fn committed_position(&self) -> Result<LogPosition, DirectoryError> {
         self.healthy()?;
         if self.manifest.commit_mode == CommitMode::LocalDurable {
@@ -146,6 +167,7 @@ impl Journal {
         Ok(())
     }
 
+    /// Write canonical operations to the active segment; writing alone does not confirm records.
     pub async fn append(
         &mut self,
         operations: &[CanonicalOperation<'_>],
@@ -243,6 +265,7 @@ impl Journal {
         Ok(())
     }
 
+    /// Synchronize an exact written generation and prefix without granting application commitment.
     pub async fn sync_through(
         &mut self,
         position: WriterPosition,

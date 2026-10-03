@@ -88,6 +88,7 @@ fn minimum_and_large_record_profiles_fit_the_broker_receive_declaration() {
                     root: "/native-profile-check/broker-0".into(),
                     endpoints: ozzy_config::Endpoints {
                         peer: "tcp://127.0.0.1:40000".into(),
+                        data_peer: "tcp://127.0.0.1:40002".into(),
                         reader_pub: "tcp://127.0.0.1:40001".into(),
                         follower_pub: None,
                     },
@@ -180,6 +181,7 @@ async fn start(size: &str) -> (Config, tempfile::TempDir, ozzy_broker::Broker, S
         .tempdir_in(executable.parent().unwrap())
         .unwrap();
     let reservations = [
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
         TcpListener::bind("127.0.0.1:0").unwrap(),
         TcpListener::bind("127.0.0.1:0").unwrap(),
     ];
@@ -191,6 +193,7 @@ async fn start(size: &str) -> (Config, tempfile::TempDir, ozzy_broker::Broker, S
             root: directory.path().join("data"),
             endpoints: ozzy_config::Endpoints {
                 peer: peer.clone(),
+                data_peer: format!("tcp://{}", reservations[2].local_addr().unwrap()),
                 reader_pub: format!("tcp://{}", reservations[1].local_addr().unwrap()),
                 follower_pub: None,
             },
@@ -201,7 +204,7 @@ async fn start(size: &str) -> (Config, tempfile::TempDir, ozzy_broker::Broker, S
     let setup = Setup::parse(
         &config,
         &json!({"topic": "benchmark", "partitions": 2,
-            "brokers": [{"node": checked.identity.brokers["local"].to_string(), "endpoint": peer}],
+            "brokers": [{"node": checked.identity.brokers["local"].to_string(), "endpoint": peer, "data_endpoint": checked.deployment.deployment().brokers["local"].endpoints.data_peer}],
         }),
     )
     .unwrap();

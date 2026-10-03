@@ -59,7 +59,7 @@ pub enum RetryClass {
     /// Correct the request; repeating unchanged bytes cannot resolve this rejection.
     Permanent = 1,
     /// Retry after local/remote capacity becomes available.
-    AfterCredit = 2,
+    AfterBackoff = 2,
     /// Negotiate a fresh link session before retrying unchanged append identity.
     AfterReconnect = 3,
     /// Refresh group/owner authority without changing append identity.
@@ -122,7 +122,7 @@ pub fn decode(packet: Packet<'_>, limits: EnvelopeLimits) -> Result<Nack<'_>, Na
     let code = u16::from_be_bytes(take(&mut bytes, 2)?.try_into().expect("field size"));
     let retry = match take(&mut bytes, 1)?[0] {
         1 => RetryClass::Permanent,
-        2 => RetryClass::AfterCredit,
+        2 => RetryClass::AfterBackoff,
         3 => RetryClass::AfterReconnect,
         4 => RetryClass::AfterAuthorityRefresh,
         5 => RetryClass::UnknownOutcome,

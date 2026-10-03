@@ -73,7 +73,7 @@ fn asynchronous(
     image: &[u8],
     initial: ChainPosition,
     validation: RecoveryValidation,
-) -> (Result<Recovery<()>, WriterError>, usize) {
+) -> (Result<Recovery, WriterError>, usize) {
     run(prepare_async(
         image,
         JournalGeneration(2),
@@ -96,7 +96,6 @@ fn cooperative_recovery_validates_each_operation_inside_one_group() {
     );
     let result = result.unwrap();
     let expected = prepare(
-        (),
         &image,
         JournalGeneration(2),
         1,

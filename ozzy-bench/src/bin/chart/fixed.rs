@@ -3,7 +3,8 @@
 //! confirmation and verified reader latency together in every panel.
 use super::{
     AXIS, BACKGROUND, CONTENT_WIDTH, Chart, FOOTER_HEIGHT, GRID, Metric, SERIES, Series, TEXT, TOP,
-    WIDTH, XAxis, draw_series, id, legend, metric_range, percentile_key, sizes, style, x_values,
+    WIDTH, XAxis, clipped_latency_labels, draw_series, id, legend, metric_range, percentile_key,
+    sizes, style, x_values,
 };
 use ozzy_bench::automation::Result;
 use plotters::{
@@ -62,6 +63,14 @@ pub(crate) fn render(data: &Value, output: &Path, suffix: &str) -> Result<()> {
     if modes.is_empty() {
         return Err("empty fixed-load summary".into());
     }
+    let ozzy_only_rates: BTreeSet<u64> = data["ozzy_only_rates"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|rate| rate.as_u64().ok_or("invalid Ozzy-only rate"))
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .collect();
     // Validate every panel before writing any chart.
     for (mode, rows) in &modes {
         super::coverage::check(
@@ -77,7 +86,16 @@ pub(crate) fn render(data: &Value, output: &Path, suffix: &str) -> Result<()> {
                     .copied()
                     .filter(|r| id(r) == series.id)
                     .collect();
-                if !selected.is_empty() && x_values(&selected, XAxis::Rate)? != rates {
+                let expected: Vec<_> = if series.id == "ozzy/raw" {
+                    rates.clone()
+                } else {
+                    rates
+                        .iter()
+                        .copied()
+                        .filter(|rate| !ozzy_only_rates.contains(rate))
+                        .collect()
+                };
+                if !selected.is_empty() && x_values(&selected, XAxis::Rate)? != expected {
                     return Err("fixed-load series has missing offered rates".into());
                 }
             }
@@ -123,7 +141,7 @@ fn render_mode(
         titles.push((
             CONTENT_WIDTH / 2,
             top - 6,
-            format!("{} records (ms, 0-300)", style::size(*size)),
+            format!("{} records (ms, 0-400)", style::size(*size)),
         ));
     }
     root.draw_text(
@@ -147,8 +165,8 @@ fn render_mode(
     style::finish(
         &path,
         height,
-        super::mode_title(mode),
-        "Fixed load",
+        &format!("{} at fixed load", super::mode_title(mode)),
+        super::hardware::subtitle(data).as_deref().unwrap_or(""),
         &titles,
         rows,
     )?;
@@ -161,27 +179,40 @@ fn backlog_note(
     area: &DrawingArea<SVGBackend<'_>, plotters::coord::Shift>,
     rows: &[&Value],
 ) -> Result<()> {
-    let mut seen = BTreeSet::new();
-    let failed: Vec<_> = SERIES
-        .iter()
-        .flat_map(|series| {
-            rows.iter()
-                .filter(|row| id(row) == series.id && row.get("failure").is_some())
-                .map(|row| {
-                    format!(
-                        "{} {}",
-                        series.label,
-                        XAxis::Rate.label(row["case"]["rate"].as_u64().unwrap_or(0))
-                    )
-                })
-        })
-        .filter(|label| seen.insert(label.clone()))
-        .collect();
-    if !failed.is_empty() {
+    let mut notes = vec![];
+    for (repeat, label) in [(false, "backlog limit"), (true, "failed repeat")] {
+        let mut seen = BTreeSet::new();
+        let failed: Vec<_> = SERIES
+            .iter()
+            .flat_map(|series| {
+                rows.iter()
+                    .filter(|row| {
+                        id(row) == series.id
+                            && row.get("failure").is_some()
+                            && (row["repeat"] == true) == repeat
+                    })
+                    .map(|row| {
+                        format!(
+                            "{} {}",
+                            series.label,
+                            XAxis::Rate.label(row["case"]["rate"].as_u64().unwrap_or(0))
+                        )
+                    })
+            })
+            .filter(|label| seen.insert(label.clone()))
+            .collect();
+        if !failed.is_empty() {
+            notes.push(format!("{label}: {}", failed.join(", ")));
+        }
+    }
+    if !notes.is_empty() {
         area.draw_text(
-            &format!("backlog limit: {}", failed.join(", ")),
-            &("sans-serif", 10).into_font().color(&super::MUTED),
-            (360, 4),
+            &notes.join("; "),
+            &("sans-serif", 10)
+                .into_font()
+                .color(&super::MUTED)
+                .pos(Pos::new(HPos::Right, VPos::Top)),
+            (i32::try_from(CONTENT_WIDTH)? - 30, 5),
         )?;
     }
     Ok(())
@@ -261,6 +292,12 @@ fn panel(
             draw_series(chart.plotting_area(), rows, (rates, axis), metric, series)?;
         }
     }
+    clipped_latency_labels(
+        chart.plotting_area(),
+        rows,
+        rates,
+        &[(READER, true), (WRITER, false)],
+    )?;
     Ok(())
 }
 
@@ -302,13 +339,13 @@ mod tests {
         );
         let path = temp.path().join("single/durable-fixed-load.svg");
         let svg = std::fs::read_to_string(&path).unwrap();
-        assert!(svg.contains(">Fixed load</text>"));
+        assert!(svg.contains("confirmations at fixed load</text>"));
         for label in ["100/s", "1K/s", "10K/s", "100K/s"] {
             assert_eq!(svg.matches(&format!(">\n{label}\n</text>")).count(), 3);
         }
-        assert!(svg.contains("128 B records (ms, 0-300)"));
-        assert!(svg.contains("1 KiB records (ms, 0-300)"));
-        assert!(svg.contains("8 KiB records (ms, 0-300)"));
+        assert!(svg.contains("128 B records (ms, 0-400)"));
+        assert!(svg.contains("1 KiB records (ms, 0-400)"));
+        assert!(svg.contains("8 KiB records (ms, 0-400)"));
         assert_eq!(svg.matches("Offered records/s (log, total)").count(), 1);
         assert!(svg.contains("Writer confirmation: full color; verified reader: lighter shade"));
         // Ozzy writer red and its lighter reader shade share each panel.
@@ -329,6 +366,16 @@ mod tests {
                 .contains("iggy/raw")
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), svg);
+
+        for (field, value) in [("size", 1024), ("rate", 100_000)] {
+            let mut partial = data.clone();
+            partial["summary"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|row| row["case"][field] == value);
+            assert!(render(&partial, temp.path(), "").is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), svg);
+        }
 
         let mut cluster = data.clone();
         for row in cluster["summary"].as_array_mut().unwrap() {
@@ -369,5 +416,66 @@ mod tests {
         assert!(render(&gap, temp.path(), "").is_err());
         data["summary"][0]["measurements"]["scheduled_ack_p99_us"] = Value::Null;
         assert!(render(&data, temp.path(), "").is_err());
+    }
+
+    #[test]
+    fn fixed_load_labels_clipped_writer_and_reader_percentiles() {
+        let mut data = fixture();
+        let row = data["summary"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|row| {
+                row["case"]["impl"] == "ozzy"
+                    && row["case"]["size"] == 8192
+                    && row["case"]["rate"] == 100_000
+            })
+            .unwrap();
+        row["measurements"]["scheduled_ack_p99_us"] =
+            json!({"minimum":500_000,"median":500_000,"maximum":500_000});
+        row["measurements"]["scheduled_ack_p999_us"] =
+            json!({"minimum":700_000,"median":700_000,"maximum":700_000});
+        row["measurements"]["scheduled_delivery_p999_us"] =
+            json!({"minimum":450_000,"median":450_000,"maximum":450_000});
+        let temp = tempfile::tempdir().unwrap();
+        render(&data, temp.path(), "").unwrap();
+        let svg =
+            std::fs::read_to_string(temp.path().join("single/durable-fixed-load.svg")).unwrap();
+        assert!(svg.contains("P99 500 / P99.9 700 ms"));
+        assert!(svg.contains("P99.9 450 ms"));
+    }
+
+    #[test]
+    fn failed_repeat_keeps_the_completed_runs_latency_lines() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut data = fixture();
+        render(&data, temp.path(), "").unwrap();
+        let path = temp.path().join("single/durable-fixed-load.svg");
+        let before = std::fs::read_to_string(&path).unwrap();
+        let case = data["summary"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| {
+                row["case"]["impl"] == "ozzy"
+                    && row["case"]["size"] == 1024
+                    && row["case"]["rate"] == 10_000
+            })
+            .unwrap()["case"]
+            .clone();
+        data["incomplete"] =
+            json!([{"case":case,"failure":"scheduled backlog limit exceeded","repeat":true}]);
+        render(&data, temp.path(), "").unwrap();
+        let after = std::fs::read_to_string(path).unwrap();
+        let lines = |svg: &str| -> Vec<String> {
+            svg.lines()
+                .filter(|line| {
+                    line.contains("stroke=\"#EF4444\"") || line.contains("stroke=\"#F7A1A1\"")
+                })
+                .map(str::to_owned)
+                .collect()
+        };
+        assert_eq!(lines(&before), lines(&after));
+        assert!(after.contains("failed repeat: Ozzy 10K/s"));
     }
 }

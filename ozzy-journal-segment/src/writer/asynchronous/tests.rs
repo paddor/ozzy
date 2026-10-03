@@ -1,4 +1,5 @@
 use super::*;
+use crate::SegmentWriter;
 use crate::test_io::{drive, drive_with, poll};
 use crate::{Digest, OperationKind, OperationLimits};
 use ozzy_io::simulation::{self, Controller, Effect, Image, ImageLimits};
@@ -410,6 +411,52 @@ fn interrupted_tail_repair_and_failed_barrier_never_report_recovery_success() {
 }
 
 #[test]
+fn failed_sync_fences_without_advancing_evidence_or_stable_record_bytes() {
+    for effect in [
+        Effect::FailBefore(io::ErrorKind::Other),
+        Effect::FailAfter(io::ErrorKind::Other),
+    ] {
+        let (mut controller, io) = setup(Image::default());
+        let mut writer = create(&mut controller, io, "/segment");
+        let before = writer.durable_position();
+        let written = append(&mut controller, &mut writer);
+        assert!(matches!(
+            drive_with(&mut controller, writer.sync_through(written), |op| {
+                assert!(matches!(op, Operation::Sync { .. }));
+                effect
+            }),
+            Err(WriterError::Io(_))
+        ));
+        assert!(writer.is_faulted());
+        assert_eq!(writer.written_position(), written);
+        assert_eq!(writer.durable_position(), before);
+        assert!(matches!(
+            drive(&mut controller, writer.sync_through(written)),
+            Err(WriterError::Faulted)
+        ));
+        let (image, _) = controller.crash(true).unwrap();
+        let stable = image.bytes(Path::new("/segment"), true).unwrap();
+        if matches!(effect, Effect::FailBefore(_)) {
+            assert_eq!(
+                crate::scan_segment(stable, 1, ChainPosition::GENESIS, DecodeLimits::default())
+                    .unwrap()
+                    .groups
+                    .len(),
+                0
+            );
+            assert!(stable[SEGMENT_HEADER_BYTES..].iter().all(|byte| *byte == 0));
+        } else {
+            assert_eq!(
+                crate::scan_segment(stable, 1, ChainPosition::GENESIS, DecodeLimits::default())
+                    .unwrap()
+                    .next_chain,
+                written.next_chain()
+            );
+        }
+    }
+}
+
+#[test]
 fn pending_sync_cancellation_keeps_the_installed_durable_boundary() {
     let (mut controller, io) = setup(Image::default());
     let mut writer = create(&mut controller, io, "/segment");
@@ -516,4 +563,82 @@ fn truncated_tail_is_repaired_only_after_canonical_protection_checks() {
             assert_eq!(length, first.end_offset() + 100);
         }
     }
+}
+
+#[test]
+fn read_handles_reuse_exact_sources_and_eviction_keeps_running_leases() {
+    let (mut controller, io) = setup(Image::default());
+    let access = crate::async_files::Access::new(io.clone(), None);
+    let source = crate::IndexSource {
+        group_id: header().group_id(),
+        segment_id: 1,
+        valid_bytes: 4096,
+        segment_digest: Digest::ZERO,
+        first_op_number: 1,
+        last_op_number: 1,
+        last_operation_digest: Digest::ZERO,
+    };
+    for number in 0..5 {
+        drop(create(
+            &mut controller,
+            io.clone(),
+            &format!("/segment-{number}"),
+        ));
+    }
+    let retained = drive(
+        &mut controller,
+        access.read_handle("/segment-0".into(), source),
+    )
+    .unwrap();
+    let observed = controller.trace().len();
+    drop(
+        drive(
+            &mut controller,
+            access.read_handle("/segment-0".into(), source),
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        controller.trace().len(),
+        observed,
+        "a cache hit must issue no file job"
+    );
+    for number in 1..5 {
+        drop(
+            drive(
+                &mut controller,
+                access.read_handle(format!("/segment-{number}").into(), source),
+            )
+            .unwrap(),
+        );
+        assert!(access.readers.borrow().len() <= 4);
+    }
+    assert!(
+        !access
+            .readers
+            .borrow()
+            .iter()
+            .any(|(path, _, _)| path == Path::new("/segment-0"))
+    );
+    assert_eq!(
+        drive(&mut controller, access.length(&retained)).unwrap(),
+        4096
+    );
+    let observed = controller.trace().len();
+    let changed = crate::IndexSource {
+        valid_bytes: source.valid_bytes + 4096,
+        ..source
+    };
+    drop(
+        drive(
+            &mut controller,
+            access.read_handle("/segment-4".into(), changed),
+        )
+        .unwrap(),
+    );
+    assert!(
+        controller.trace().len() > observed,
+        "changed source must reopen"
+    );
+    assert_eq!(access.readers.borrow().len(), 4);
 }

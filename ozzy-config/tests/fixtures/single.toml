@@ -3,6 +3,7 @@ mode = "single"
 
 [brokers.laptop.endpoints]
 peer = "tcp://127.0.0.1:7100"
+data_peer = "tcp://127.0.0.1:7103"
 reader_pub = "tcp://127.0.0.1:7101"
 
 [brokers.laptop.devices.ssd]

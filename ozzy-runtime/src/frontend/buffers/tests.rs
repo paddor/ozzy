@@ -68,6 +68,34 @@ fn compact_metadata_releases_hidden_owners_while_payload_stays_shared() {
 }
 
 #[test]
+fn borrowed_prepare_keeps_original_frame_for_retry() {
+    let source = append(placement(0, 0), binding(Kind::Client));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let original =
+        Message::multipart_payloads((0..4).map(|index| {
+            Payload::from_bytes(oversized(source.part_slice(index).unwrap(), &drops))
+        }));
+    let original_payload = original.part_slice(3).unwrap().as_ptr();
+    let buffers = ReceiveBuffers::new(
+        EnvelopeLimits::default(),
+        ReceiveStorage::Inproc {
+            payload_backing_bytes: 1024 * 1024,
+        },
+    )
+    .unwrap();
+    let (prepared, _) = buffers.prepare_borrowed(&original).unwrap();
+    for index in 0..4 {
+        assert_eq!(prepared.part_slice(index), original.part_slice(index));
+    }
+    assert_eq!(prepared.part_slice(3).unwrap().as_ptr(), original_payload);
+    drop(prepared);
+    assert_eq!(original.part_slice(3).unwrap().as_ptr(), original_payload);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    drop(original);
+    assert_eq!(drops.load(Ordering::SeqCst), 4);
+}
+
+#[test]
 fn empty_control_payload_cannot_retain_hidden_capacity() {
     let source = control(placement(0, 0), binding(Kind::Broker));
     let drops = Arc::new(AtomicUsize::new(0));
@@ -280,4 +308,33 @@ fn writer_credit_covers_every_frame_of_the_refused_allocation_class() {
         buffers.class_retained_bytes(buffers.maximum_retained_bytes()),
         buffers.maximum_retained_bytes()
     );
+}
+
+#[test]
+fn measured_stream_backing_survives_normalization_without_pool_overreservation() {
+    let original = append(placement(0, 0), binding(Kind::Client));
+    let frames = std::array::from_fn::<_, 3, _>(|i| original.part_slice(i + 1).unwrap());
+    let limits = EnvelopeLimits::default();
+    let envelope = ozzy_proto::decode_packet(&frames, limits).unwrap().envelope;
+    let message_bytes = crate::transport::message_size_limit(limits).unwrap();
+    let buffers = ReceiveBuffers::new(limits, ReceiveStorage::Stream { message_bytes }).unwrap();
+    let size = 256 * 1024;
+    let capacity = 512 * 1024;
+    let header = envelope
+        .encode_header(frames[1].len(), size, limits)
+        .unwrap();
+    let bytes = Bytes::from(vec![7; capacity]).slice(..size);
+    let pointer = bytes.as_ptr();
+    let message = Message::multipart_payloads([
+        Payload::from_slice(original.part_slice(0).unwrap()),
+        Payload::from_slice(&header),
+        Payload::from_slice(frames[1]),
+        Payload::from_bytes_with_retained_size(bytes, capacity),
+    ]);
+    let (normalized, charged) = buffers.prepare_borrowed(&message).unwrap();
+    assert_eq!(normalized.part_slice(3).unwrap().as_ptr(), pointer);
+    assert!(charged >= capacity);
+    assert!(charged < capacity + 4096);
+    assert!(normalized.retained_size().unwrap() <= charged);
+    assert_eq!(message.part_slice(3).unwrap().as_ptr(), pointer);
 }

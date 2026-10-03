@@ -31,12 +31,21 @@ pub struct RecoveryDirectory {
 }
 
 impl RecoveryDirectory {
+    /// Release inspected metadata handles before another owner opens the store.
+    pub async fn close(self) -> Result<(), DirectoryError> {
+        drop(self.access);
+        self.directory.close().await
+    }
+
+    /// Filesystem directory bound to this owner.
     pub fn root(&self) -> &Path {
         self.directory.root()
     }
+    /// Exact validated metadata manifest held by this object.
     pub const fn manifest(&self) -> &Manifest {
         &self.manifest
     }
+    /// Validated reference selecting the current manifest generation.
     pub const fn current(&self) -> CurrentReference {
         self.current
     }
@@ -53,8 +62,7 @@ impl RecoveryDirectory {
         Self::open_exact(root, io, identity, configuration, limits).await
     }
 
-    /// Reopen only an explicitly nonvoting directory. Configuration and its
-    /// directory entry are resynchronized before another recovery attempt.
+    /// Inspect only an explicitly nonvoting directory without changing it.
     pub async fn open_recovering(
         root: PathBuf,
         io: Local,

@@ -6,14 +6,19 @@ use super::history::TransferPurpose;
 use super::io::{Completed, FetchPurpose};
 use super::{ActorError, DriverError, Duration, PendingIo, Prefix, ReplicaActor};
 
-impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
+impl ReplicaActor {
     #[expect(
         clippy::too_many_lines,
         reason = "ordered authority and storage scheduling decisions"
     )]
     pub(super) fn schedule(&mut self, now: Duration) -> Result<(), ActorError> {
-        if self.pending.is_some() {
+        if self.pending.is_some() || self.journal.available_command_slots() == 0 {
             return Ok(());
+        }
+        // Core acceptance already owns these bytes. Install them before any
+        // later validation or election action changes the journal image.
+        if self.work.ready.is_some() {
+            return self.send_ready_turn(now);
         }
         // The captured read owns the transfer arena. Normal appends use their
         // own arenas; election/installation waits for its fenced return.
@@ -64,6 +69,9 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
         }
         if self.work.needs_sync && self.driver.normal().is_none() {
             self.schedule_sync()?;
+            return Ok(());
+        }
+        if self.promise.is_some() && !self.journal.settled() {
             return Ok(());
         }
         if let Some(ticket) = self.promise.take() {

@@ -39,7 +39,7 @@ pub(super) struct Outbound {
     usage: BTreeMap<(NodeId, Class), (usize, usize)>,
     limits: [usize; 2],
     next: usize,
-    publication: Option<Publication>,
+    publications: [Option<Publication>; 2],
     publication_bytes: usize,
     envelope: EnvelopeLimits,
 }
@@ -51,23 +51,30 @@ impl Outbound {
             usage: BTreeMap::new(),
             limits: [message_bytes * 4, 1024 * 1024],
             next: 0,
-            publication: None,
+            publications: [None, None],
             publication_bytes: message_bytes + 2048,
             envelope,
         }
     }
 
     pub(super) fn send(&mut self, message: Message) -> Result<(), TrySendError> {
-        if message
-            .part_slice(0)
-            .is_some_and(|prefix| prefix.len() == 32)
+        let frames: [&[u8]; 3] =
+            std::array::from_fn(|index| message.part_slice(index + 1).unwrap_or_default());
+        let opcode = ozzy_proto::decode_packet(&frames, self.envelope)
+            .ok()
+            .map(|packet| packet.envelope.opcode);
+        if opcode == Some(Opcode::PreparePub)
+            || message
+                .part_slice(0)
+                .is_some_and(|prefix| prefix.len() == 32)
         {
             // Retain each partition's prepared frame until this shared slot
             // is available. Publication never consumes reply/control slots.
-            if self.publication.is_some() {
+            let slot = usize::from(opcode != Some(Opcode::PreparePub));
+            if self.publications[slot].is_some() {
                 return Err(TrySendError::Full(message));
             }
-            self.publication = Some(Publication::Ready(message));
+            self.publications[slot] = Some(Publication::Ready(message));
             return Ok(());
         }
         let Some(peer) = message
@@ -124,7 +131,10 @@ impl Outbound {
         port: &mut Port,
         now: Duration,
     ) -> Result<(), StartupError> {
-        self.poll_publication(cx, port)?;
+        port.poll_progress(cx).map_err(failure)?;
+        for slot in 0..2 {
+            self.poll_publication(cx, port, slot)?;
+        }
         // Bound the turn by occupied entries. New entries take the first free
         // slot of their class, so a window over all slots reaches them once
         // per complete pass and holds per-peer capacity for many turns.
@@ -205,18 +215,19 @@ impl Outbound {
         &mut self,
         cx: &mut Context<'_>,
         port: &mut Port,
+        slot: usize,
     ) -> Result<(), StartupError> {
-        let Some(mut publication) = self.publication.take() else {
+        let Some(mut publication) = self.publications[slot].take() else {
             return Ok(());
         };
         if let Publication::Pending(pending) = &mut publication {
             match Pin::new(pending).poll(cx) {
                 Poll::Pending => {
-                    self.publication = Some(publication);
+                    self.publications[slot] = Some(publication);
                     return Ok(());
                 }
                 Poll::Ready(Ok(Err((PublicationError::Full, message)))) => {
-                    self.publication = Some(Publication::Ready(message));
+                    self.publications[slot] = Some(Publication::Ready(message));
                     cx.waker().wake_by_ref();
                     return Ok(());
                 }
@@ -232,11 +243,11 @@ impl Outbound {
         };
         match port.try_publish(message, self.publication_bytes) {
             Ok(pending) => {
-                self.publication = Some(Publication::Pending(pending));
+                self.publications[slot] = Some(Publication::Pending(pending));
                 cx.waker().wake_by_ref();
             }
             Err((ozzy_runtime::frontend::PortError::Admission(_), message)) => {
-                self.publication = Some(Publication::Ready(message));
+                self.publications[slot] = Some(Publication::Ready(message));
             }
             Err((error, _)) => return Err(failure(error)),
         }
@@ -261,9 +272,9 @@ mod tests {
         let envelope = Envelope {
             opcode,
             response: false,
-            request_id: Some(RequestId::from_bytes([1; 16])),
+            request_id: (opcode != Opcode::PreparePub).then_some(RequestId::from_bytes([1; 16])),
             sender: NodeId::from_bytes([2; 16]),
-            session: Some(LinkSessionId::from_bytes([3; 16])),
+            session: (opcode != Opcode::PreparePub).then_some(LinkSessionId::from_bytes([3; 16])),
         };
         let header = envelope.encode_header(0, bytes, limits()).unwrap();
         Message::with_prefix(
@@ -294,7 +305,7 @@ mod tests {
     fn queued_replies_settle_within_two_turns_of_a_responsive_dispatcher() {
         use ozzy_proto::{GroupId, PartitionIncarnation, data::DataLimits, handshake};
         use ozzy_runtime::{
-            dispatch::{self, Budget, Budgets},
+            dispatch::{Budget, Budgets},
             frontend::{
                 Access, Dispatcher, DispatcherLimits, Kind, LinkIds, Placement, ReplyLimits,
                 RoutingTable, Service,
@@ -313,11 +324,15 @@ mod tests {
                 bytes: 1024 * 1024,
             },
         };
-        let (sender, _shard) = dispatch::channel::<Message>(dispatch::Limits {
-            capacity: budgets,
-            clients: 2,
-            grants: 4,
-        })
+        let (sender, _shard) = ozzy_runtime::frontend::data_channel(
+            &omq_tokio::Context::new(),
+            0,
+            Kind::Client,
+            Class::Control,
+            8,
+            128 * 1024,
+            1024 * 1024,
+        )
         .unwrap();
         let routes = RoutingTable::new(
             &[0],
@@ -341,7 +356,7 @@ mod tests {
             vec![(0, sender)],
             DispatcherLimits {
                 peers: 2,
-                grants_per_class: 4,
+
                 replies: ReplyLimits {
                     control: queue,
                     data: queue,
@@ -349,13 +364,8 @@ mod tests {
             },
         )
         .unwrap();
-        let mut parameters = handshake::Parameters::streaming(
-            DataLimits::default(),
-            handshake::OWNER | 8,
-            65536,
-            1 << 30,
-        )
-        .unwrap();
+        let mut parameters =
+            handshake::Parameters::streaming(DataLimits::default(), handshake::OWNER | 8).unwrap();
         parameters.capabilities |= handshake::OWNER_READ | (1 << 3) | (1 << 8);
         parameters.required_capabilities = 0;
         let mut service = Service::new(
@@ -368,7 +378,9 @@ mod tests {
             LinkIds::random(),
         )
         .unwrap();
-        let mut port = service.port(0, budgets).unwrap();
+        let mut port = service
+            .port(&omq_tokio::Context::new(), 0, budgets)
+            .unwrap();
         // Production sizing: 32 clients and the two other brokers.
         let mut outbound = Outbound::new(34, 128 * 1024, limits());
         for _ in 0..8 {
@@ -413,12 +425,31 @@ mod tests {
         assert_eq!(second.part_slice(3), Some(b"records".as_slice()));
         assert!(outbound.usage.is_empty());
         outbound.send(frame(Opcode::Appended, 0)).unwrap();
-        let Some(Publication::Ready(first)) = outbound.publication.take() else {
+        let Some(Publication::Ready(first)) = outbound.publications[1].take() else {
             panic!("first publication must remain queued");
         };
         assert_eq!(first.part_slice(0), Some([1; 32].as_slice()));
         outbound.send(second).unwrap();
         assert_eq!(outbound.usage.len(), 1);
+    }
+
+    #[test]
+    fn follower_publication_pressure_preserves_reader_publication_capacity() {
+        let mut outbound = Outbound::new(1, 2 * 1024 * 1024, limits());
+        outbound.send(frame(Opcode::PreparePub, 32)).unwrap();
+        let reader = Message::multipart([
+            Bytes::from(vec![1; 32]),
+            Bytes::new(),
+            Bytes::new(),
+            Bytes::from_static(b"records"),
+        ]);
+        outbound.send(reader).unwrap();
+        assert!(outbound.publications.iter().all(Option::is_some));
+        assert!(outbound.usage.is_empty());
+        assert!(matches!(
+            outbound.send(frame(Opcode::PreparePub, 32)),
+            Err(TrySendError::Full(_))
+        ));
     }
 
     #[test]

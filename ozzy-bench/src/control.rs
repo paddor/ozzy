@@ -29,25 +29,31 @@ use wire::{Frame, Kind, Route};
 
 const QUEUE: usize = 4;
 const CHUNK: usize = 64 * 1024;
+/// Maximum complete JSON control report retained by one connection.
 pub const MAX_REPORT_BYTES: usize = 128 * 1024 * 1024;
 const DEADLINE: Duration = Duration::from_secs(30);
 const CONTROLLER: [u8; 16] = [0xca; 16];
 
 #[derive(Clone, Debug, Default, clap::Args)]
 #[group(id = "BenchmarkControl")]
+/// OMQ benchmark-controller endpoint and exact run/worker identities.
 pub struct Args {
     /// Explicit reachable TCP bind for remote workers; local control uses abstract IPC.
     #[arg(long)]
     pub control_bind: Option<String>,
     #[arg(long, hide = true)]
+    /// Controller endpoint supplied to a spawned benchmark worker.
     pub control_endpoint: Option<String>,
     #[arg(long, hide = true)]
+    /// Run identity required to accept controller frames.
     pub control_run: Option<Uuid>,
     #[arg(long, hide = true)]
+    /// Worker identity required to route controller frames.
     pub control_worker: Option<Uuid>,
 }
 
 impl Args {
+    /// Append configured hidden control arguments to a worker command.
     pub fn append(&self, arguments: &mut Vec<String>) {
         if let Some(endpoint) = &self.control_endpoint {
             arguments.extend(["--control-endpoint".into(), endpoint.clone()]);
@@ -123,6 +129,7 @@ pub async fn run<T>(
         .await
 }
 
+/// Take the single control receiver within a configured worker scope; panics outside that scope.
 pub fn input() -> mpsc::Receiver<BenchResult<Value>> {
     WORKER.with(|worker| {
         worker
@@ -133,12 +140,14 @@ pub fn input() -> mpsc::Receiver<BenchResult<Value>> {
     })
 }
 
+/// Queue a worker reply, failing when control is unconfigured, full, or closed.
 pub fn reply(value: &Value) -> BenchResult<()> {
     WORKER
         .try_with(|worker| enqueue(&worker.output, Kind::Data, value.clone()))
         .map_err(|_| bench_error("worker control is not configured"))?
 }
 
+/// Receive the expected controller command under the control deadline.
 pub async fn command(
     input: &mut mpsc::Receiver<BenchResult<Value>>,
     expected: &str,
@@ -172,6 +181,7 @@ fn enqueue(output: &mpsc::Sender<Outgoing>, kind: Kind, value: Value) -> BenchRe
 }
 
 #[derive(Debug)]
+/// Owned OMQ control pump with bounded outgoing messages and incoming reports.
 pub struct Connection {
     _context: Context,
     output: mpsc::Sender<Outgoing>,
@@ -189,10 +199,12 @@ pub struct Monitor {
 }
 
 impl Monitor {
+    /// Whether the control pump still runs.
     pub fn is_live(&self) -> bool {
         self.live.load(Ordering::Acquire)
     }
 
+    /// First recorded control-pump failure, if any.
     pub fn failure(&self) -> Option<String> {
         self.failure.lock().expect("control failure").clone()
     }
@@ -290,18 +302,22 @@ impl Connection {
         }
     }
 
+    /// Clone read-only pump liveness and failure supervision.
     pub fn monitor(&self) -> Monitor {
         Monitor {
             live: self.live.clone(),
             failure: self.failure.clone(),
         }
     }
+    /// Queue a control data frame without waiting for destination capacity.
     pub fn send(&self, value: &Value) -> BenchResult<()> {
         enqueue(&self.output, Kind::Data, value.clone())
     }
+    /// Queue a shutdown frame, failing if the bounded control queue cannot accept it.
     pub fn shutdown(&self) -> BenchResult<()> {
         enqueue(&self.output, Kind::Shutdown, Value::Null)
     }
+    /// Receive the next control data frame or terminal pump error.
     pub async fn receive(&mut self) -> BenchResult<Value> {
         self.input
             .as_mut()
@@ -318,6 +334,7 @@ impl Connection {
                 )
             })?
     }
+    /// Poll one control data frame without waiting; propagate terminal pump errors.
     pub fn try_receive(&mut self) -> BenchResult<Option<Value>> {
         match self
             .input

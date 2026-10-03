@@ -147,15 +147,21 @@ impl OpenGroupJournal {
 #[derive(Debug, Error)]
 pub enum CanonicalCheckpointError {
     #[error(transparent)]
+    /// Checkpoint construction or validation failed.
     Checkpoint(#[from] CheckpointError),
     #[error(transparent)]
+    /// Journal directory validation or publication failed.
     Directory(#[from] crate::DirectoryError),
     #[error(transparent)]
+    /// Canonical application-state snapshot validation failed.
     State(#[from] StateSnapshotError),
     #[error("checkpoint does not use the canonical state schema")]
+    /// Checkpoint does not use the canonical state schema.
     SchemaMismatch,
     #[error("canonical state revision does not match checkpoint position")]
+    /// Canonical state revision does not match checkpoint position.
     PositionMismatch,
     #[error("canonical checkpoint does not match selected manifest reference")]
+    /// Canonical checkpoint does not match selected manifest reference.
     SelectionMismatch,
 }

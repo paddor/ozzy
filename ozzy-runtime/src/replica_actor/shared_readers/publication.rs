@@ -1,8 +1,9 @@
 //! Leader-only, applied-record publication without a partition-owned socket.
 
-use super::{ActorError, Cursor, NodeId, Payload, SharedReaderConfig, output::flush, reader_frame};
+use super::{ActorError, Cursor, NodeId, Payload, SharedReaderConfig, output::flush};
 use crate::{
-    replica_journal::{PartitionReadBuffer, PartitionReadLimits, ReplicaJournal, ShardJournal},
+    reader_service::publication_frame,
+    replica_journal::{PartitionReadBuffer, PartitionReadLimits, ReplicaJournal},
     signal::DataSignal,
 };
 use omq_tokio::{Message, TrySendError};
@@ -29,7 +30,7 @@ pub(super) struct Publication {
 
 impl Publication {
     pub(super) fn new(
-        journal: &mut ReplicaJournal<ShardJournal>,
+        journal: &mut ReplicaJournal,
         config: SharedReaderConfig,
         work: Arc<DataSignal>,
     ) -> Result<Self, ActorError> {
@@ -81,7 +82,7 @@ impl Publication {
         local: NodeId,
         config: SharedReaderConfig,
         ticket: Option<ValidationTicket>,
-        journal: &mut ReplicaJournal<ShardJournal>,
+        journal: &mut ReplicaJournal,
         cx: &mut Context<'_>,
         send: &mut impl FnMut(&mut Context<'_>, Message) -> Result<(), TrySendError>,
     ) -> Result<bool, ActorError> {
@@ -96,7 +97,7 @@ impl Publication {
         let Some(ticket) = ticket else {
             return Ok(advanced);
         };
-        let position = match self.cursor.poll_open(config.partition, ticket, journal, cx) {
+        let position = match self.cursor.poll_open(config.partition, ticket, journal) {
             Poll::Pending => return Ok(advanced),
             Poll::Ready(Err(_)) => {
                 self.reset(false);
@@ -141,7 +142,7 @@ impl Publication {
             .poll(source, ticket, journal, &mut output, config.limits, cx)
         {
             Poll::Pending => false,
-            Poll::Ready(Err(_) | Ok(ReadOutcome::Credit)) => {
+            Poll::Ready(Err(_)) => {
                 self.reset(false);
                 return Ok(advanced);
             }
@@ -161,7 +162,7 @@ impl Publication {
             &prefix,
             header,
             &self.metadata,
-            reader_frame(payload, shared),
+            publication_frame(payload, shared),
         ));
         Ok(true)
     }

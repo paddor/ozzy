@@ -3,8 +3,8 @@
 use super::{Journal, validate_operation_bodies};
 use crate::{
     ActiveSegmentIndex, DirectoryError, GroupIdentity, IndexBuildLimits, IndexSource,
-    IndexedReadError, JournalIndexError as Error, OperationLocation, PreparedOperationRecords,
-    RecordSpan, SegmentReference, TailState,
+    IndexedReadError, IndexedRecord, JournalIndexError as Error, LogPosition, OperationLocation,
+    PreparedOperationRecords, RecordSpan, SegmentReference, TailState,
     active_read_index::{ActiveReadIndex, CapturedReadEntries},
     async_files::Access,
     reader::ResidentOperations,
@@ -27,6 +27,9 @@ pub struct Limits {
     /// Active/index-file work and resident payload bounds. As with the existing
     /// reader cache, one newest indivisible operation may exceed residency.
     pub index: IndexBuildLimits,
+    /// Maximum recently written operations retained for readers. Each may
+    /// hold one physical payload buffer even when its body is small.
+    pub max_resident_operations: usize,
     /// Compact sealed-index cache budget. Entries never retain payloads or files.
     pub cached_index_bytes: usize,
     /// Bookkeeping bound, including indexes with no records.
@@ -68,6 +71,28 @@ impl Cache {
             .iter()
             .find(|index| index.source() == source)
             .cloned()
+    }
+
+    fn covering(
+        &self,
+        sources: &[Source],
+        partition: PartitionIncarnation,
+        start: Offset,
+        through: u64,
+    ) -> Option<(Source, Rc<ActiveReadIndex>)> {
+        self.hot.iter().rev().find_map(|index| {
+            if !index.covers(partition, start)
+                || index.end_offset(partition).is_none_or(|end| start >= end)
+            {
+                return None;
+            }
+            sources
+                .iter()
+                .find(|source| {
+                    source.index == index.source() && source.index.first_op_number <= through
+                })
+                .map(|source| (*source, index.clone()))
+        })
     }
 }
 
@@ -214,7 +239,7 @@ impl Index {
     /// read captures are memory-only. Sealed indexes load lazily on read misses.
     pub async fn open(journal: &Journal, limits: Limits) -> Result<Self, Error> {
         journal.healthy()?;
-        if limits.concurrent_reads == 0 {
+        if limits.concurrent_reads == 0 || limits.max_resident_operations == 0 {
             return Err(Error::InvalidReadLimits);
         }
         let active = match journal.record_source()? {
@@ -226,7 +251,10 @@ impl Index {
             generation: journal.writer.written_position().generation(),
             active,
             previous: None,
-            resident: ResidentOperations::with_limit(limits.index.max_resident_bytes),
+            resident: ResidentOperations::with_limits(
+                limits.index.max_resident_bytes,
+                limits.max_resident_operations,
+            ),
             cold: Rc::new(RefCell::new(Cache {
                 hot: VecDeque::new(),
                 bytes: 0,
@@ -246,6 +274,88 @@ impl Index {
             return Err(Error::StaleCatalog);
         }
         Ok(())
+    }
+
+    /// Read exact written offsets from the incremental active index. A miss
+    /// leaves older sealed history to the snapshot path. This avoids scanning
+    /// the growing active segment for each producer retry.
+    pub async fn read_offsets_with_positions(
+        &self,
+        journal: &Journal,
+        partition: PartitionIncarnation,
+        offsets: &[Offset],
+        limits: ReadLimits,
+    ) -> Result<Option<Vec<(IndexedRecord, LogPosition)>>, Error> {
+        self.check_owner(journal)?;
+        if limits.max_records == 0 || limits.max_bytes == 0 {
+            return Err(Error::InvalidReadLimits);
+        }
+        let Some(active) = &self.active else {
+            return Ok(None);
+        };
+        let Some(source) = journal.record_source()? else {
+            return Ok(None);
+        };
+        if active.source() != source.index {
+            return Err(Error::StaleCatalog);
+        }
+        let mut entries = Vec::with_capacity(offsets.len().min(limits.max_records));
+        for &offset in offsets.iter().take(limits.max_records) {
+            let Ok(entry) = active.entry(partition, offset) else {
+                return Ok(None);
+            };
+            entries.push(entry);
+        }
+        let _lease = journal
+            .pins
+            .protect_prepared_segment(source.index.segment_id)
+            .map_err(DirectoryError::from)?;
+        let path = journal
+            .root()
+            .join("segments")
+            .join(source.reference.file_name());
+        let mut output = Vec::with_capacity(entries.len());
+        let mut bytes = 0usize;
+        let mut first = 0;
+        while first < entries.len() {
+            let location = entries[first].location.operation;
+            let mut end = first + 1;
+            while end < entries.len() && entries[end].location.operation == location {
+                end += 1;
+            }
+            let records = crate::reader::asynchronous::read_records(
+                &journal.access,
+                path.clone(),
+                source.index,
+                &entries[first..end],
+                journal.limits.decode,
+                journal.limits.operations,
+                journal.limits.io.chunk_bytes,
+            )
+            .await?;
+            for record in records {
+                let size = record.payload_bytes();
+                if output.is_empty() && size > limits.max_bytes {
+                    return Err(Error::RecordExceedsReadLimit {
+                        actual: size,
+                        limit: limits.max_bytes,
+                    });
+                }
+                if size > limits.max_bytes - bytes {
+                    return Ok(Some(output));
+                }
+                output.push((
+                    record,
+                    LogPosition {
+                        op_number: location.op_number,
+                        digest: location.operation_digest,
+                    },
+                ));
+                bytes += size;
+            }
+            first = end;
+        }
+        Ok(Some(output))
     }
 
     /// Install exactly the selectors and placements returned by an observed
@@ -527,60 +637,77 @@ impl Read {
         &self,
         sources: &[Source],
     ) -> Result<(Source, CapturedReadEntries), Error> {
+        let cached = self
+            .cold
+            .borrow()
+            .covering(sources, self.partition, self.start, self.through);
+        if let Some((source, index)) = cached {
+            return self.capture_index(source, &index);
+        }
         for source in sources
             .iter()
             .rev()
             .filter(|source| source.index.first_op_number <= self.through)
         {
-            let cached = self.cold.borrow().find(source.index);
-            let index = if let Some(cached) = cached {
-                cached
-            } else {
-                let loaded = crate::index_builder::asynchronous::open(
-                    &self.scope.access,
-                    self.scope
-                        .root
-                        .join("indexes")
-                        .join(crate::segment_index_name(source.index)),
-                    source.index,
-                    self.index_limits.file,
-                    self.scope.limits.io.chunk_bytes,
-                )
-                .await;
-                let index = match loaded {
-                    Ok(index) => ActiveReadIndex::from_persisted_async(&index)
-                        .await
-                        .map_err(index_error)?,
-                    Err(crate::IndexBuildError::Io(error))
-                        if error.kind() == std::io::ErrorKind::NotFound =>
-                    {
-                        scan_index(&self.scope, *source, self.index_limits).await?
-                    }
-                    Err(error) => return Err(DirectoryError::from(error).into()),
-                };
-                let index = Rc::new(index);
-                self.cold.borrow_mut().remember(index.clone());
-                index
-            };
+            let index = self.load_index(*source).await?;
             if index.covers(self.partition, self.start)
                 && index
                     .end_offset(self.partition)
                     .is_some_and(|end| self.start < end)
             {
-                let entries = index
-                    .capture(
-                        self.partition,
-                        self.start,
-                        self.end
-                            .min(index.end_offset(self.partition).expect("covered")),
-                        self.limits.max_records,
-                        self.through,
-                    )
-                    .map_err(index_error)?;
-                return Ok((*source, entries));
+                return self.capture_index(*source, &index);
             }
         }
         Err(Error::MissingOffset(self.start))
+    }
+
+    fn capture_index(
+        &self,
+        source: Source,
+        index: &ActiveReadIndex,
+    ) -> Result<(Source, CapturedReadEntries), Error> {
+        let entries = index
+            .capture(
+                self.partition,
+                self.start,
+                self.end
+                    .min(index.end_offset(self.partition).expect("covered")),
+                self.limits.max_records,
+                self.through,
+            )
+            .map_err(index_error)?;
+        Ok((source, entries))
+    }
+
+    async fn load_index(&self, source: Source) -> Result<Rc<ActiveReadIndex>, Error> {
+        if let Some(index) = self.cold.borrow().find(source.index) {
+            return Ok(index);
+        }
+        let loaded = crate::index_builder::asynchronous::open(
+            &self.scope.access,
+            self.scope
+                .root
+                .join("indexes")
+                .join(crate::segment_index_name(source.index)),
+            source.index,
+            self.index_limits.file,
+            self.scope.limits.io.chunk_bytes,
+        )
+        .await;
+        let index = match loaded {
+            Ok(index) => ActiveReadIndex::from_persisted_async(&index)
+                .await
+                .map_err(index_error)?,
+            Err(crate::IndexBuildError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                scan_index(&self.scope, source, self.index_limits).await?
+            }
+            Err(error) => return Err(DirectoryError::from(error).into()),
+        };
+        let index = Rc::new(index);
+        self.cold.borrow_mut().remember(index.clone());
+        Ok(index)
     }
 
     /// Visit borrowed spans, loading each operation once per read. A callback

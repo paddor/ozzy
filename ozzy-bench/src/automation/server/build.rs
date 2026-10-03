@@ -84,6 +84,7 @@ fn identity() -> Result<Value> {
     )
 }
 
+/// Check or build the pinned Iggy server, retaining build diagnostics.
 pub fn prepare(no_build: bool, logs: &Path) -> Result<()> {
     let directory = checkout();
     let stamp = cache().join(format!("iggy-{RELEASE}-build.json"));

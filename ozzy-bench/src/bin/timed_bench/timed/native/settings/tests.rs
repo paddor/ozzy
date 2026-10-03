@@ -23,9 +23,10 @@ fn broker_specs(root: &std::path::Path, count: usize) -> Vec<Broker> {
             name: format!("broker-{index}"),
             root: root.join(format!("broker-{index}")),
             endpoints: Endpoints {
-                peer: format!("tcp://127.0.0.1:{}", 30000 + index * 3),
-                reader_pub: format!("tcp://127.0.0.1:{}", 30001 + index * 3),
-                follower_pub: Some(format!("tcp://127.0.0.1:{}", 30002 + index * 3)),
+                peer: format!("tcp://127.0.0.1:{}", 30000 + index * 4),
+                data_peer: format!("tcp://127.0.0.1:{}", 30003 + index * 4),
+                reader_pub: format!("tcp://127.0.0.1:{}", 30001 + index * 4),
+                follower_pub: Some(format!("tcp://127.0.0.1:{}", 30002 + index * 4)),
             },
         })
         .collect()
@@ -274,6 +275,7 @@ fn native_document_refuses_invalid_fixed_endpoints_and_duplicate_brokers() {
         root: directory.path().join("other"),
         endpoints: Endpoints {
             peer: "tcp://127.0.0.1:31000".into(),
+            data_peer: "tcp://127.0.0.1:31002".into(),
             reader_pub: "tcp://127.0.0.1:31001".into(),
             follower_pub: None,
         },

@@ -30,7 +30,7 @@ impl Donors {
     }
 }
 
-impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
+impl ReplicaActor {
     /// Enable fixed-voter full-WAL recovery service on the existing endpoint.
     /// Only activated normal replicas answer. Source snapshots are immutable per
     /// nonce/view and retained on the journal worker; replies are never votes.

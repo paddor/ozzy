@@ -1,10 +1,8 @@
 use std::fs;
 
-use ozzy_journal::progress::JournalGeneration;
 use ozzy_journal_segment::{
-    CheckpointLimits, DecodeLimits, Digest, DirectoryError, GROUP_CONFIGURATION_MAX_BYTES,
-    GroupDirectory, GroupIdentity, MetadataLimits, MountPolicy, OperationLimits, RelocationError,
-    SegmentHeader, VolumeDirectory, VolumeIdentity, prepare_relocation,
+    Digest, DirectoryError, GROUP_CONFIGURATION_MAX_BYTES, GroupDirectory, GroupIdentity,
+    MetadataLimits, SegmentHeader,
 };
 use ozzy_proto::{GroupId, NodeId, StoreId, VolumeId};
 use tempfile::TempDir;
@@ -174,86 +172,4 @@ fn configuration_symlinks_are_rejected_without_touching_the_target() {
         Err(DirectoryError::NotRegularFile(_))
     ));
     assert_eq!(fs::read(target).unwrap(), CONFIGURATION);
-}
-
-#[test]
-fn relocation_preserves_configuration_and_rejects_a_changed_published_copy() {
-    let temporary = TempDir::new().unwrap();
-    let source_root = temporary.path().join("source");
-    let destination_root = temporary.path().join("destination");
-    fs::create_dir(&source_root).unwrap();
-    fs::create_dir(&destination_root).unwrap();
-    let source = VolumeDirectory::format_new(
-        &source_root,
-        VolumeIdentity {
-            volume_id: identity().volume_id,
-        },
-        MountPolicy::PortableIdentity,
-    )
-    .unwrap();
-    let destination = VolumeDirectory::format_new(
-        &destination_root,
-        VolumeIdentity {
-            volume_id: VolumeId::from_bytes([5; 16]),
-        },
-        MountPolicy::PortableIdentity,
-    )
-    .unwrap();
-    let root = source.group_root(identity().group_id);
-    let journal = GroupDirectory::format_new_with_configuration(
-        &root,
-        identity(),
-        1,
-        &segment(),
-        CONFIGURATION,
-    )
-    .unwrap()
-    .recover(
-        JournalGeneration(1),
-        DecodeLimits::default(),
-        OperationLimits::default(),
-    )
-    .unwrap();
-    let prepared = prepare_relocation(journal, &destination, CheckpointLimits::default()).unwrap();
-    let artifact = prepared.artifact().clone();
-    assert_eq!(
-        fs::read(artifact.destination_root().join("CONFIGURATION")).unwrap(),
-        CONFIGURATION
-    );
-    drop(prepared);
-    let reopened = GroupDirectory::open_with_configuration(
-        artifact.destination_root(),
-        artifact.destination_identity(),
-        MetadataLimits::default(),
-        CONFIGURATION,
-    )
-    .unwrap();
-    assert_eq!(reopened.configuration(), Some(CONFIGURATION));
-    drop(reopened);
-    fs::write(
-        artifact.destination_root().join("CONFIGURATION"),
-        b"changed membership",
-    )
-    .unwrap();
-    let source_journal = GroupDirectory::open_with_configuration(
-        &root,
-        identity(),
-        MetadataLimits::default(),
-        CONFIGURATION,
-    )
-    .unwrap()
-    .recover(
-        JournalGeneration(2),
-        DecodeLimits::default(),
-        OperationLimits::default(),
-    )
-    .unwrap();
-    assert!(matches!(
-        prepare_relocation(source_journal, &destination, CheckpointLimits::default()),
-        Err(RelocationError::DestinationMismatch)
-    ));
-    assert_eq!(
-        fs::read(artifact.destination_root().join("CONFIGURATION")).unwrap(),
-        b"changed membership"
-    );
 }

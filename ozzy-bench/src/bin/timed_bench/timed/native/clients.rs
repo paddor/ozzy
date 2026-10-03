@@ -29,6 +29,7 @@ impl Clients {
                     Ok(BrokerAddress {
                         node: NodeId::from_bytes([index as u8 + 1; 16]),
                         endpoint: format!("inproc://native-preflight-{index}").parse()?,
+                        data_endpoint: format!("inproc://native-preflight-data-{index}").parse()?,
                     })
                 })
                 .collect::<Result<_>>()?,
@@ -63,7 +64,7 @@ impl Clients {
             let mut reader = ReaderLinkLimits {
                 subscriptions,
                 bytes: 0,
-                queue_messages: Config::LIVE_QUEUE_MESSAGES as usize,
+                queue_messages: config.live_queue_messages(),
             };
             reader.bytes = reader
                 .reservation_bytes(Setup::reader_limits(config), setup.brokers.len())

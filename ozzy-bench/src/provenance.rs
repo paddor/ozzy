@@ -9,6 +9,7 @@ use serde_json::Value;
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
+/// Capture source and executable fingerprints for the running benchmark worker.
 pub fn capture() -> Result<Value> {
     let checkout = Path::new(env!("CARGO_MANIFEST_DIR"));
     let git = |arguments: &[&str]| -> Result<String> {
@@ -29,6 +30,7 @@ pub fn capture() -> Result<Value> {
     }))
 }
 
+/// Compute a file SHA-256 fingerprint for measurement provenance.
 pub fn digest(path: &Path) -> Result<String> {
     let mut hasher = ozzy_journal::integrity::IntegrityHasher::new("ozzy benchmark artifact v1");
     let mut file = std::fs::File::open(path)?;

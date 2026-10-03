@@ -6,7 +6,7 @@ use ozzy_proto::RequestId;
 use ozzy_replication::{
     InstallTicket, LogSource, OpNumber,
     driver::{Action, ReplicaDriver},
-    wire::{Control, FetchOps, Grant},
+    wire::{Control, FetchOps},
 };
 
 struct Voter {
@@ -309,19 +309,12 @@ fn installed_pair(controller: &mut Controller, io: Local, mode: QuorumPolicy) ->
     }
     finish(controller, &mut backup, ticket);
     let normal = backup.driver.normal().unwrap();
-    let grant = Grant {
-        revision: 1,
-        record_limit: 8,
-        byte_limit: 8192,
-    };
     let confirmation = match mode {
         QuorumPolicy::Durable => Control::PrepareOk {
             ack: normal.acknowledgment().unwrap(),
-            grant,
         },
         QuorumPolicy::Replicated => Control::PrepareRetained {
             ack: normal.retained_acknowledgment().unwrap(),
-            grant,
         },
     };
     primary

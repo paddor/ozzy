@@ -262,6 +262,7 @@ fn async_sealed_repair_distinguishes_active_damage_and_device_failures() {
     let access = Access {
         io: io.clone(),
         protection: None,
+        readers: std::rc::Rc::default(),
     };
     let mut directory = drive(&mut controller, directory(io)).unwrap();
     let error = drive_with(&mut controller, directory.sealed_damage(32768), |op| {

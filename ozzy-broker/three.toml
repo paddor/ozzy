@@ -7,6 +7,7 @@ confirmation = "disk-quorum"
 
 [brokers.broker-0.endpoints]
 peer = "tcp://127.0.0.1:7200"
+data_peer = "tcp://127.0.0.1:7203"
 reader_pub = "tcp://127.0.0.1:7201"
 
 [brokers.broker-0.devices.ssd]
@@ -27,6 +28,7 @@ device = "ssd"
 
 [brokers.broker-1.endpoints]
 peer = "tcp://127.0.0.1:7210"
+data_peer = "tcp://127.0.0.1:7213"
 reader_pub = "tcp://127.0.0.1:7211"
 
 [brokers.broker-1.devices.ssd]
@@ -47,6 +49,7 @@ device = "ssd"
 
 [brokers.broker-2.endpoints]
 peer = "tcp://127.0.0.1:7220"
+data_peer = "tcp://127.0.0.1:7223"
 reader_pub = "tcp://127.0.0.1:7221"
 
 [brokers.broker-2.devices.ssd]

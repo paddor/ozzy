@@ -18,6 +18,9 @@ pub use receipt::{
     Appended, DecodedAppended, MessageIds, OpPosition, decode_appended, encode_appended,
 };
 
+/// Bytes in the common owner-routed identity header, before policy and descriptors.
+pub const IDENTITY_METADATA_BYTES: usize = 89;
+
 /// Encoding of one complete APPEND payload frame.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[repr(u8)]
@@ -273,7 +276,7 @@ fn encode_frames(
         return Err(CodecError::Length);
     }
     validate_payload_encoding(encoding, decoded_bytes, payload_bytes, limits)?;
-    let metadata_bytes = add(95, descriptors)?;
+    let metadata_bytes = add(IDENTITY_METADATA_BYTES + 6, descriptors)?;
     let header = envelope.encode_header(metadata_bytes, payload_bytes, limits.envelope)?;
     capacity(metadata, metadata_bytes)?;
     if let Some(payload) = payload.as_mut() {
@@ -391,9 +394,10 @@ pub fn validate_append(
         key.first_sequence,
         limits,
     )?;
-    if payload_encoding == PayloadEncoding::Lz4 {
-        lz4rip::block::validate_block(packet.payload, decoded_bytes)
-            .map_err(|_| CodecError::Length)?;
+    if payload_encoding == PayloadEncoding::Lz4
+        && !lz4_block_is_valid(packet.payload, decoded_bytes)
+    {
+        return Err(CodecError::Length);
     }
     Ok(ValidatedAppend {
         authority,
@@ -405,6 +409,77 @@ pub fn validate_append(
         encoded_payload: packet.payload,
         records,
     })
+}
+
+/// Check LZ4 block syntax and exact decoded length without materializing bytes.
+/// The fast path validates the common block layout. The reference validator
+/// handles any valid form the fast path cannot recognize.
+pub fn lz4_block_is_valid(input: &[u8], expected: usize) -> bool {
+    fast_lz4_block_is_valid(input, expected)
+        || lz4rip::block::validate_block(input, expected).is_ok()
+}
+
+fn fast_lz4_block_is_valid(input: &[u8], expected: usize) -> bool {
+    let mut at = 0;
+    let mut produced = 0;
+    loop {
+        let Some(&token) = input.get(at) else {
+            return false;
+        };
+        at += 1;
+        let mut literals = (token >> 4) as usize;
+        if literals == 15 {
+            loop {
+                let Some(&extra) = input.get(at) else {
+                    return false;
+                };
+                at += 1;
+                let Some(sum) = literals.checked_add(extra as usize) else {
+                    return false;
+                };
+                literals = sum;
+                if extra != 255 {
+                    break;
+                }
+            }
+        }
+        if literals > input.len() - at || literals > expected - produced {
+            return false;
+        }
+        at += literals;
+        produced += literals;
+        if at == input.len() {
+            return produced == expected;
+        }
+        if input.len() - at < 2 {
+            return false;
+        }
+        let offset = u16::from_le_bytes([input[at], input[at + 1]]) as usize;
+        at += 2;
+        if offset == 0 || offset > produced {
+            return false;
+        }
+        let mut matched = 4 + (token & 15) as usize;
+        if matched == 19 {
+            loop {
+                let Some(&extra) = input.get(at) else {
+                    return false;
+                };
+                at += 1;
+                let Some(sum) = matched.checked_add(extra as usize) else {
+                    return false;
+                };
+                matched = sum;
+                if extra != 255 {
+                    break;
+                }
+            }
+        }
+        if matched > expected - produced {
+            return false;
+        }
+        produced += matched;
+    }
 }
 
 pub(crate) fn encode_payload_encoding(
@@ -587,5 +662,89 @@ mod owned_payload_tests {
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod lz4_validation_tests {
+    use super::*;
+
+    fn equivalent(input: &[u8], decoded_bytes: usize) {
+        let reference = lz4rip::block::validate_block(input, decoded_bytes).is_ok();
+        assert_eq!(fast_lz4_block_is_valid(input, decoded_bytes), reference);
+        assert_eq!(lz4_block_is_valid(input, decoded_bytes), reference);
+    }
+
+    #[test]
+    fn fast_validator_agrees_on_blocks_and_mutations() {
+        let mut state = 0x85a3_08d3_2f6e_5c41_u64;
+        for decoded_bytes in [0, 1, 15, 16, 256, 4096, 851_968] {
+            let mut raw = Vec::with_capacity(decoded_bytes);
+            for _ in 0..decoded_bytes {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                raw.push(b'a' + (state % 26) as u8);
+            }
+            let block = lz4rip::block::compress(&raw);
+            equivalent(&block, decoded_bytes);
+            equivalent(&block, decoded_bytes.saturating_add(1));
+            if decoded_bytes > 0 {
+                equivalent(&block, decoded_bytes - 1);
+            }
+            for _ in 0..100 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let mut changed = block.clone();
+                let index = state as usize % changed.len();
+                changed[index] ^= ((state >> 32) as u8) | 1;
+                equivalent(&changed, decoded_bytes);
+                equivalent(&changed, decoded_bytes.saturating_add(1));
+            }
+        }
+    }
+
+    #[test]
+    fn fast_validator_agrees_on_arbitrary_input() {
+        let mut state = 0x636e_38a2_9d71_4b52_u64;
+        let mut bytes = [0_u8; 96];
+        for _ in 0..10_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let length = state as usize % (bytes.len() + 1);
+            for byte in &mut bytes[..length] {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *byte = state as u8;
+            }
+            equivalent(&bytes[..length], (state >> 32) as usize % 256);
+        }
+        equivalent(&[0x10, b'a', 1, 0, 0], usize::MAX);
+    }
+
+    #[test]
+    fn fast_validator_agrees_on_short_blocks_and_long_matches() {
+        for first in 0..=u8::MAX {
+            for second in 0..=u8::MAX {
+                let input = [first, second];
+                for expected in [0, 1, 4, 19, 20, 255, 256, usize::MAX] {
+                    equivalent(&input, expected);
+                }
+            }
+        }
+        let block = lz4rip::block::compress(&vec![b'x'; 851_968]);
+        equivalent(&block, 851_968);
+        for cut in (0..block.len()).step_by(17) {
+            equivalent(&block[..cut], 851_968);
+        }
+
+        let mut literals = vec![0xf0, 255, 255, 255, 244];
+        literals.extend_from_slice(&[b'x'; 1024]);
+        equivalent(&literals, 1024);
+        equivalent(&literals[..literals.len() - 1], 1024);
+        equivalent(&literals, 1025);
     }
 }

@@ -37,7 +37,6 @@ fn probe() -> FlowProbe {
         request_id: RequestId::from_bytes([10; 16]),
         tail: Prefix::GENESIS,
         available: ozzy_replication::OpNumber(7),
-        minimum_body_bytes: 1,
     }
 }
 fn state() -> FlowState {
@@ -72,16 +71,15 @@ fn flow_probe_has_golden_bytes_and_keeps_its_exact_correlation() {
         WireLimits::default(),
     )
     .unwrap();
-    let mut golden = [0; 136];
+    let mut golden = [0; 128];
     golden[..16].fill(7);
     golden[23] = 1;
     golden[32..48].fill(1);
     golden[48..80].fill(8);
     golden[127] = 7; // Available work, independently of the sent/repair tail.
-    golden[135] = 1;
-    assert_eq!(encoded.metadata_bytes, 136);
-    assert_eq!(&metadata[..136], &golden);
-    assert_eq!(&metadata[136..], &[0xff; 8]);
+    assert_eq!(encoded.metadata_bytes, 128);
+    assert_eq!(&metadata[..128], &golden);
+    assert_eq!(&metadata[128..], &[0xff; 16]);
     assert_eq!(encoded.header[5], 0x30);
     assert_eq!(&encoded.header[6..8], &[0, 0]);
     assert_eq!(&encoded.header[8..24], probe().request_id.as_bytes());
@@ -98,17 +96,15 @@ fn flow_probe_has_golden_bytes_and_keeps_its_exact_correlation() {
 
 #[test]
 fn flow_report_has_golden_bytes_and_supports_coalesced_notifications() {
-    let mut metadata = [0xff; 228];
-    let mut golden = [0; 220];
+    let mut metadata = [0xff; 212];
+    let mut golden = [0; 204];
     golden[..16].fill(7);
     golden[23] = 1;
     golden[32..48].fill(2);
     golden[48..80].fill(8);
     golden[95] = 20; // Receive epoch, unrelated to writer generation.
     golden[103] = 1; // Report revision.
-    golden[199] = 4; // Absolute operation credit.
-    golden[208..216].fill(0xff); // Unrestricted repair.
-    golden[206] = 1; // Absolute body-byte credit = 256.
+    golden[192..200].fill(0xff); // Unrestricted repair.
     for request_id in [Some(probe().request_id), None] {
         let state = FlowState {
             handle: 1,
@@ -124,10 +120,10 @@ fn flow_report_has_golden_bytes_and_supports_coalesced_notifications() {
             WireLimits::default(),
         )
         .unwrap();
-        golden[219] = 1;
-        assert_eq!(encoded.metadata_bytes, 220);
-        assert_eq!(&metadata[..220], &golden);
-        assert_eq!(&metadata[220..], &[0xff; 8]);
+        golden[203] = 1;
+        assert_eq!(encoded.metadata_bytes, 204);
+        assert_eq!(&metadata[..204], &golden);
+        assert_eq!(&metadata[204..], &[0xff; 8]);
         assert_eq!(encoded.header[5], 0x31);
         assert_eq!(encoded.header[7], u8::from(request_id.is_some()));
         assert_eq!(
@@ -331,7 +327,7 @@ fn wrong_epoch_is_rejected_before_body_hashing_and_legacy_cannot_bypass_credit()
 
 #[test]
 fn invalid_flow_encodings_leave_reusable_output_unchanged() {
-    let mut output = [0xff; 216];
+    let mut output = [0xff; 200];
     let mut invalid = state();
     invalid.report.revision = 0;
     assert!(
@@ -344,7 +340,7 @@ fn invalid_flow_encodings_leave_reusable_output_unchanged() {
         )
         .is_err()
     );
-    assert_eq!(output, [0xff; 216]);
+    assert_eq!(output, [0xff; 200]);
     let limits = WireLimits {
         envelope: ozzy_proto::EnvelopeLimits {
             max_metadata_bytes: 100,
@@ -354,15 +350,15 @@ fn invalid_flow_encodings_leave_reusable_output_unchanged() {
     };
     assert!(wire::encode_flow_probe(node(0), session(), probe(), &mut output, limits).is_err());
     assert!(wire::encode_flow_state(node(1), session(), state(), &mut output, limits).is_err());
-    assert_eq!(output, [0xff; 216]);
+    assert_eq!(output, [0xff; 200]);
 }
 
 #[test]
 fn credit_window_is_not_limited_to_one_wire_payload() {
-    let mut output = [0; 220];
+    let mut output = [0; 204];
     let limits = WireLimits {
         envelope: ozzy_proto::EnvelopeLimits {
-            max_metadata_bytes: 220,
+            max_metadata_bytes: 204,
             max_payload_bytes: 1,
         },
         max_operations: 1,
@@ -456,7 +452,7 @@ fn flow_controls_reject_truncation_extensions_payload_and_bad_correlation() {
 
 #[test]
 fn flow_report_rejects_impossible_credit_receipt_and_epoch_fields() {
-    let mut metadata = [0; 220];
+    let mut metadata = [0; 204];
     let encoded = wire::encode_flow_state(
         node(1),
         session(),
@@ -465,7 +461,7 @@ fn flow_report_rejects_impossible_credit_receipt_and_epoch_fields() {
         WireLimits::default(),
     )
     .unwrap();
-    for (start, end) in [(80, 96), (96, 104), (216, 220)] {
+    for (start, end) in [(80, 96), (96, 104), (200, 204)] {
         let mut invalid = metadata;
         invalid[start..end].fill(0); // Epoch/revision cannot be zero.
         assert!(
@@ -575,7 +571,7 @@ fn held_publication_repair_limit_roundtrips_including_genesis() {
     for limit in [0, 1, 123] {
         let mut state = state();
         state.repair_limit = Some(ozzy_replication::OpNumber(limit));
-        let mut metadata = [0; 220];
+        let mut metadata = [0; 204];
         let encoded = wire::encode_flow_state(
             node(1),
             session(),
@@ -584,7 +580,7 @@ fn held_publication_repair_limit_roundtrips_including_genesis() {
             WireLimits::default(),
         )
         .unwrap();
-        assert_eq!(&metadata[208..216], &limit.to_be_bytes());
+        assert_eq!(&metadata[192..200], &limit.to_be_bytes());
         assert_eq!(
             wire::decode(
                 &[&encoded.header, &metadata, &[]],
@@ -598,15 +594,15 @@ fn held_publication_repair_limit_roundtrips_including_genesis() {
 }
 
 #[test]
-fn compact_receipt_is_exactly_45_bytes_and_keeps_bound_history() {
+fn compact_receipt_is_exactly_29_bytes_and_keeps_bound_history() {
     let bound = state().report;
     let compact = wire::CompactState::from_report(0x0102_0304, bound).unwrap();
     let bytes = compact.encode().unwrap();
-    assert_eq!(bytes.len(), 45);
+    assert_eq!(bytes.len(), 29);
     assert_eq!(&bytes[..5], &[0x54, 1, 2, 3, 4]);
     assert_eq!(wire::CompactState::decode(&bytes).unwrap(), compact);
     assert_eq!(compact.report(bound, bound.received).unwrap(), bound);
-    for end in 0..45 {
+    for end in 0..29 {
         assert!(wire::CompactState::decode(&bytes[..end]).is_err());
     }
     let mut extended = bytes.to_vec();

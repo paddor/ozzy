@@ -23,6 +23,7 @@ pub struct Load {
 }
 
 impl Load {
+    /// Validate an offered-load plan; none selects completion-paced saturation.
     pub fn plan(&self, batch: usize) -> BenchResult<Option<Schedule>> {
         let Some(rate) = self.records_per_second else {
             if self.burst_period_ms.is_some() || self.burst_active_ms.is_some() {
@@ -61,6 +62,7 @@ impl Load {
         }))
     }
 
+    /// Append explicit offered-rate and burst options to a worker command.
     pub fn append_args(&self, command: &mut Command) {
         for (flag, value) in [
             ("--records-per-second", self.records_per_second),
@@ -73,6 +75,7 @@ impl Load {
         }
     }
 
+    /// Result-row label for saturation, steady load, or burst load.
     pub fn label(&self) -> &'static str {
         if self.burst_period_ms.is_some() {
             "bursty"
@@ -83,6 +86,7 @@ impl Load {
         }
     }
 
+    /// Serialize offered-load shape, rate scope, and arrival clock semantics.
     pub fn report(&self) -> Value {
         json!({"shape":self.label(), "offered_records_per_second":self.records_per_second,
             "burst_period_ms":self.burst_period_ms, "burst_active_ms":self.burst_active_ms,
@@ -150,6 +154,7 @@ impl Ramp {
         &self.0
     }
 
+    /// Total configured ramp duration in nanoseconds.
     pub fn duration_ns(&self) -> u64 {
         self.0.iter().map(|(_, ns)| ns).sum()
     }
@@ -199,6 +204,7 @@ struct Stage {
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Immutable absolute arrival plan for steady, burst, or ramp workloads.
 pub struct Schedule {
     stages: [Stage; MAX_STAGES],
     count: usize,
@@ -224,6 +230,7 @@ impl Schedule {
         steady / period * period + steady % period * u128::from(self.active) / period
     }
 
+    /// Compute one batch arrival time from its global ordinal, rejecting clock overflow.
     pub fn due(self, origin: u64, ordinal: u64) -> BenchResult<u64> {
         origin
             .checked_add(u64::try_from(self.relative(ordinal))?)

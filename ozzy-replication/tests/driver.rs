@@ -8,7 +8,7 @@ use ozzy_journal::operation::{
 use ozzy_proto::{GroupId, LinkSessionId, NodeId, OperationId};
 use ozzy_replication::driver::{Action, DriverError, ReplicaDriver, Timing};
 use ozzy_replication::wire::{
-    Control, Grant, PeerBinding, ReplicaMessage, WireLimits, decode, encode_control,
+    Control, PeerBinding, ReplicaMessage, WireLimits, decode, encode_control,
 };
 use ozzy_replication::{
     Admission, Configuration, Digest, FrozenLog, JournalGeneration, NormalReplica, PipelineLimits,
@@ -513,11 +513,6 @@ fn normal_driver_releases_committed_work_but_io_failure_fences_future_actions() 
             node(1),
             Control::PrepareOk {
                 ack: backup.acknowledgment().unwrap(),
-                grant: Grant {
-                    revision: 1,
-                    record_limit: 8,
-                    byte_limit: 1024,
-                },
             },
             now,
         )

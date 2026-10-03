@@ -23,7 +23,7 @@ fn entry(first: u8, count: u8, bytes: usize) -> Entry {
         predecessor: prefix(first - 1),
         end: prefix(first + count - 1),
         operations: usize::from(count),
-        body_bytes: bytes,
+        retained_bytes: bytes,
         packets: [None, None, None],
     }
 }
@@ -70,7 +70,7 @@ fn operation_bound_evicts_without_growing_or_waiting_for_peers() {
         Err(ActorError::History)
     ));
     cache.clear();
-    assert_eq!((cache.operations, cache.body_bytes), (0, 0));
+    assert_eq!((cache.operations, cache.retained_bytes), (0, 0));
     assert_eq!(cache.entries.capacity(), capacity);
 }
 
@@ -84,7 +84,7 @@ fn body_bound_evicts_even_when_operation_slots_remain() {
     cache.retain(entry(2, 1, 50));
     cache.retain(entry(3, 1, 60));
     assert_eq!(
-        (cache.entries.len(), cache.operations, cache.body_bytes),
+        (cache.entries.len(), cache.operations, cache.retained_bytes),
         (1, 1, 60)
     );
     assert_eq!(cache.entries.front().unwrap().predecessor, prefix(2));
@@ -124,4 +124,22 @@ fn view_generation_and_discontinuity_never_join_cached_lineages() {
     cache.retain(next);
     assert_eq!(cache.entries.len(), 1);
     assert_eq!(cache.entries[0].predecessor, prefix(4));
+}
+
+#[test]
+fn oversized_backing_bypasses_cache_and_releases_old_packets() {
+    let mut cache = Recent::new(PipelineLimits {
+        max_operations: 4,
+        max_body_bytes: 100,
+    });
+    cache.retain(entry(1, 1, 80));
+    cache.retain(entry(2, 1, 101));
+    assert!(cache.entries.is_empty());
+    assert_eq!((cache.operations, cache.retained_bytes), (0, 0));
+    cache.retain(entry(3, 1, 40));
+    let last = cache.entries.back().unwrap();
+    assert_eq!(
+        cache.after(last.scope, last.generation, prefix(2)).unwrap(),
+        Some(0)
+    );
 }

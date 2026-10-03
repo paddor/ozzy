@@ -74,6 +74,50 @@ fn trusted_clients_keep_writer_capacity_and_old_io_ownership_separate() {
 }
 
 #[test]
+fn full_proposal_queue_keeps_request_for_shard_retry() {
+    let (mut controller, io) = setup();
+    let mut actor = actor(&mut controller, io, 1);
+    let mut intake = intake_access(
+        &mut actor,
+        NativeAccess::TrustedClients {
+            clients: 1,
+            writers: 5,
+        },
+        partition(),
+    );
+    let link = link(70, 80);
+    let hint = actor.authority_hint();
+    for writer in 40..44 {
+        assert_eq!(
+            intake
+                .receive(
+                    &request(link, hint.authority, writer, writer, partition()),
+                    link,
+                    hint
+                )
+                .unwrap(),
+            NativeReceive::Accepted
+        );
+    }
+    let held = request(link, hint.authority, 44, 44, partition());
+    assert_eq!(
+        intake.receive(&held, link, hint).unwrap(),
+        NativeReceive::Busy
+    );
+    let mut output = Vec::new();
+    settle(&mut controller, &mut actor, &mut intake, &mut output);
+    assert_eq!(output.len(), 4);
+    assert_eq!(
+        intake.receive(&held, link, hint).unwrap(),
+        NativeReceive::Accepted
+    );
+    settle(&mut controller, &mut actor, &mut intake, &mut output);
+    assert_eq!(output.len(), 5);
+    drop(intake);
+    close(&mut controller, actor);
+}
+
+#[test]
 fn idle_writer_arenas_reuse_live_sessions_without_losing_retry_history() {
     let (mut controller, io) = setup();
     let mut actor = actor(&mut controller, io, 1);
@@ -196,6 +240,11 @@ fn scenario(access: NativeAccess, trusted: bool) {
     }
     assert!(output.is_empty());
     assert!(!controller.jobs().is_empty());
+    let blocked_append = append(hint.authority, old, 50, 0, 1);
+    assert_eq!(
+        intake.receive(&blocked_append, old, hint).unwrap(),
+        NativeReceive::Busy
+    );
     // Capacity failure has its own control slot while the first writer owns I/O.
     let second = request(old, hint.authority, 50, 52, partition());
     assert_eq!(
@@ -205,7 +254,7 @@ fn scenario(access: NativeAccess, trusted: bool) {
     for _ in 0..10 {
         progress(&mut actor, &mut intake, None, &mut output, false);
     }
-    rejected(&mut output, 10, RetryClass::AfterCredit);
+    rejected(&mut output, 10, RetryClass::AfterBackoff);
     let second = request(current, hint.authority, 50, 53, partition());
     assert_eq!(
         intake.receive(&second, current, hint).unwrap(),
@@ -214,7 +263,7 @@ fn scenario(access: NativeAccess, trusted: bool) {
     for _ in 0..10 {
         progress(&mut actor, &mut intake, Some(current), &mut output, false);
     }
-    rejected(&mut output, 10, RetryClass::AfterCredit);
+    rejected(&mut output, 10, RetryClass::AfterBackoff);
     // A new session cannot reclaim the old writer's executing arena early.
     for _ in 0..10000 {
         progress(&mut actor, &mut intake, Some(current), &mut output, false);

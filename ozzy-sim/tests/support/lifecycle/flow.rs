@@ -272,7 +272,7 @@ impl Replica {
                 .sender()
                 .is_some_and(|s| s.received() == snapshot.accepted)
                 && self.cursors[to].op >= snapshot.accepted.op)
-                && let Some(probe) = peer.poll_probe(snapshot.accepted, 1, false, now).unwrap()
+                && let Some(probe) = peer.poll_probe(snapshot.accepted, false, now).unwrap()
             {
                 assert_eq!(
                     u128::from_be_bytes(*probe.request_id.as_bytes()) >> 32,

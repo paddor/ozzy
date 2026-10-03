@@ -124,7 +124,13 @@ impl OwnedJournal {
                     ),
                 })?;
         }
-        let prepared = canonical::prepare(images, buffer, self.limits.operations, false)?;
+        let primary_payloads_validated = buffer.primary_payloads_validated();
+        let prepared = canonical::prepare(
+            images,
+            buffer,
+            self.limits.operations,
+            primary_payloads_validated,
+        )?;
         #[cfg(feature = "storage-metrics")]
         for operation in buffer.operations() {
             if operation.kind == OperationKind::Append {

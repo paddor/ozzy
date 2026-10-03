@@ -125,7 +125,7 @@ async fn scenario() {
         Some(old_watch),
         "same-session refresh grew broker registrations"
     );
-    harness.client = None;
+    harness.session = None;
     harness.service.start(link(70, 80).binding.peer).unwrap();
     harness
         .drive(
@@ -162,7 +162,7 @@ async fn scenario() {
         tokio::task::yield_now().await;
     }
     assert_eq!(routes.route(0).unwrap(), Some(latest));
-    assert_eq!(links.socket_count(), 3);
+    assert_eq!(links.socket_count(), 2);
     links.shutdown().await.unwrap();
     harness.shutdown().await;
 }

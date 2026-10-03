@@ -38,6 +38,28 @@ pub struct DataLimits {
     pub max_record_bytes: usize,
 }
 
+impl DataLimits {
+    /// Select the smaller bound in each field for a directional data transfer.
+    #[must_use]
+    pub fn intersection(self, other: Self) -> Self {
+        Self {
+            envelope: EnvelopeLimits {
+                max_metadata_bytes: self
+                    .envelope
+                    .max_metadata_bytes
+                    .min(other.envelope.max_metadata_bytes),
+                max_payload_bytes: self
+                    .envelope
+                    .max_payload_bytes
+                    .min(other.envelope.max_payload_bytes),
+            },
+            max_records: self.max_records.min(other.max_records),
+            max_parts: self.max_parts.min(other.max_parts),
+            max_record_bytes: self.max_record_bytes.min(other.max_record_bytes),
+        }
+    }
+}
+
 #[cfg(test)]
 mod record_limit_tests {
     use super::*;
@@ -130,6 +152,7 @@ pub struct RecordDescriptors<'a> {
     payload_bytes: usize,
     parts: usize,
     nonzero_message_ids: bool,
+    uniform_part_bytes: Option<u32>,
 }
 
 /// One raw record descriptor and its original multipart lengths.
@@ -300,16 +323,23 @@ pub fn decode_record_descriptors(
 ) -> Result<RecordDescriptors<'_>, CodecError> {
     let mut cursor = Cursor(metadata);
     let count = cursor.u32()? as usize;
-    let (parts, descriptors, nonzero_message_ids) =
-        validate_raw_record_entries(cursor.0, count, payload_bytes, first, limits)?;
+    let entries = validate_raw_record_entries(cursor.0, count, payload_bytes, first, limits)?;
     Ok(RecordDescriptors {
         framed: metadata,
-        descriptors,
+        descriptors: entries.descriptors,
         count,
         payload_bytes,
-        parts,
-        nonzero_message_ids,
+        parts: entries.parts,
+        nonzero_message_ids: entries.nonzero_message_ids,
+        uniform_part_bytes: entries.uniform_part_bytes,
     })
+}
+
+pub(super) struct RawRecordEntries<'a> {
+    pub(super) parts: usize,
+    pub(super) descriptors: &'a [u8],
+    pub(super) nonzero_message_ids: bool,
+    pub(super) uniform_part_bytes: Option<u32>,
 }
 
 pub(super) fn validate_raw_record_entries(
@@ -318,7 +348,7 @@ pub(super) fn validate_raw_record_entries(
     payload_bytes: usize,
     first: u64,
     limits: DataLimits,
-) -> Result<(usize, &[u8], bool), CodecError> {
+) -> Result<RawRecordEntries<'_>, CodecError> {
     record_count(count, first, limits)?;
     if payload_bytes > limits.envelope.max_payload_bytes {
         return Err(CodecError::Limit);
@@ -327,7 +357,8 @@ pub(super) fn validate_raw_record_entries(
     let mut decoded = 0_usize;
     let mut total_parts = 0_usize;
     let mut nonzero_message_ids = true;
-    for _ in 0..count {
+    let mut uniform_part_bytes = None;
+    for index in 0..count {
         let before = decoded;
         nonzero_message_ids &= cursor.take(16)? != [0; 16];
         let (parts, encoding) = descriptor(&mut cursor)?;
@@ -342,6 +373,12 @@ pub(super) fn validate_raw_record_entries(
             return Err(CodecError::Limit);
         }
         let lengths = cursor.take(parts.checked_mul(4).ok_or(CodecError::Length)?)?;
+        let single = (parts == 1).then(|| u32::from_be_bytes(lengths.try_into().unwrap()));
+        if index == 0 {
+            uniform_part_bytes = single;
+        } else if uniform_part_bytes != single {
+            uniform_part_bytes = None;
+        }
         for length in lengths.as_chunks::<4>().0 {
             decoded = add(decoded, u32::from_be_bytes(*length) as usize)?;
             if decoded > payload_bytes {
@@ -355,7 +392,12 @@ pub(super) fn validate_raw_record_entries(
     if !cursor.0.is_empty() || decoded != payload_bytes {
         return Err(CodecError::Length);
     }
-    Ok((total_parts, descriptors, nonzero_message_ids))
+    Ok(RawRecordEntries {
+        parts: total_parts,
+        descriptors,
+        nonzero_message_ids,
+        uniform_part_bytes,
+    })
 }
 
 impl<'a> RecordDescriptors<'a> {
@@ -392,6 +434,12 @@ impl<'a> RecordDescriptors<'a> {
     /// Whether every record carries a nonzero retry identity.
     pub const fn nonzero_message_ids(self) -> bool {
         self.nonzero_message_ids
+    }
+
+    /// Part length when every record has exactly one part of that length.
+    /// Computed during validation, including zero-length parts.
+    pub const fn uniform_part_bytes(self) -> Option<u32> {
+        self.uniform_part_bytes
     }
 
     /// Iterate over record identities and multipart lengths.

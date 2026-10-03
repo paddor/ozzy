@@ -73,14 +73,14 @@ fn larger_receiver_window_does_not_expand_sender_admission() {
         sender.observe(receiver.report()).unwrap();
         assert_eq!(sender.outstanding().count(), 0);
     }
-    // Local metadata is free, but the receiver has not released any operations.
-    assert_eq!(sender.available().max_operations, 0);
+    // Receipt frees the sender's local retry metadata. The receiver still
+    // holds all four bodies, so actual retention must wait for local release.
+    assert_eq!(sender.available(), local);
     let next = operations(sender.sent(), &[1]);
-    assert_eq!(
-        sender.record_send(channel(1), &next),
-        Err(FlowError::Capacity)
-    );
-    receiver.release(sender.sent()).unwrap();
+    sender.record_send(channel(1), &next).unwrap();
+    assert_eq!(receiver.retain(channel(1), &next), Err(FlowError::Capacity));
+    receiver.release(receiver.report().received).unwrap();
+    receiver.retain(channel(1), &next).unwrap();
     sender.observe(receiver.report()).unwrap();
     assert_eq!(sender.available(), local);
     // A fresh receiver epoch also preserves the original local capacity.
@@ -92,16 +92,16 @@ fn larger_receiver_window_does_not_expand_sender_admission() {
         sender.record_send(channel(2), &too_large),
         Err(FlowError::Capacity)
     );
-    sender.record_send(channel(2), &next).unwrap();
+    sender
+        .record_send(channel(2), &operations(sender.sent(), &[1]))
+        .unwrap();
     assert_eq!(sender.outstanding().count(), 1);
 }
 
 #[test]
-fn maximal_remote_credit_is_clamped_before_conversion_and_reservation() {
+fn sender_retry_metadata_and_body_limits_stay_local() {
     let receiver = Receiver::new(channel(1), Prefix::GENESIS, limits()).unwrap();
     let mut report = receiver.report();
-    report.operation_limit = u64::MAX;
-    report.byte_limit = u64::MAX;
     let mut sender = Sender::open(report, limits(), Prefix::GENESIS).unwrap();
     assert_eq!(sender.available(), limits());
     let ops = operations(Prefix::GENESIS, &[25; 4]);
@@ -130,7 +130,6 @@ fn non_genesis_epochs_count_only_the_suffix_after_the_applied_base() {
     receiver.retain(channel(1), &ops).unwrap();
     sender.observe(receiver.report()).unwrap();
     assert_eq!(receiver.report().received.op.0, 14);
-    assert_eq!(receiver.report().operation_limit, 4);
     assert_eq!(receiver.report().received_bytes, 100);
     receiver.release(ops[0].prefix).unwrap();
     sender.observe(receiver.report()).unwrap();
@@ -169,7 +168,7 @@ fn operation_number_exhaustion_does_not_wrap_or_charge() {
 }
 
 #[test]
-fn receipt_does_not_return_credit_or_create_durability() {
+fn receipt_frees_sender_metadata_without_freeing_receiver_bodies() {
     let (mut receiver, mut sender) = pair();
     let ops = operations(Prefix::GENESIS, &[25, 25, 25, 25]);
     sender.record_send(channel(1), &ops).unwrap();
@@ -177,16 +176,11 @@ fn receipt_does_not_return_credit_or_create_durability() {
     assert!(sender.observe(receiver.report()).unwrap());
     assert_eq!(sender.outstanding().count(), 0);
     let next = operations(ops[3].prefix, &[1]);
-    assert_eq!(
-        sender.record_send(channel(1), &next),
-        Err(FlowError::Capacity)
-    );
-    assert_eq!(receiver.report().operation_limit, 4);
-    assert_eq!(receiver.report().byte_limit, 100);
+    sender.record_send(channel(1), &next).unwrap();
+    assert_eq!(receiver.retain(channel(1), &next), Err(FlowError::Capacity));
     // Only an application-release event returns space. No durable/quorum API exists here.
     receiver.release(ops[1].prefix).unwrap();
     sender.observe(receiver.report()).unwrap();
-    sender.record_send(channel(1), &next).unwrap();
     receiver.retain(channel(1), &next).unwrap();
 }
 
@@ -211,8 +205,6 @@ fn retraction_rebases_counters_but_keeps_accepted_unapplied_operations_charged()
     assert_eq!(report.base, ops[0].prefix);
     assert_eq!(report.received, ops[2].prefix);
     assert_eq!(report.received_bytes, 50);
-    assert_eq!(report.operation_limit, 4);
-    assert_eq!(report.byte_limit, 100);
     assert_eq!(sender.observe(report), Err(FlowError::Channel));
     assert_eq!(
         receiver.retain(channel(1), &ops[3..]),
@@ -224,13 +216,13 @@ fn retraction_rebases_counters_but_keeps_accepted_unapplied_operations_charged()
     let next = operations(ops[2].prefix, &[50, 1]);
     sender.record_send(channel(2), &next[..1]).unwrap();
     receiver.retain(channel(2), &next[..1]).unwrap();
+    sender.record_send(channel(2), &next[1..]).unwrap();
     assert_eq!(
-        sender.record_send(channel(2), &next[1..]),
+        receiver.retain(channel(2), &next[1..]),
         Err(FlowError::Capacity)
     );
     receiver.release(ops[2].prefix).unwrap();
     sender.observe(receiver.report()).unwrap();
-    sender.record_send(channel(2), &next[1..]).unwrap();
     receiver.retain(channel(2), &next[1..]).unwrap();
 }
 
@@ -282,8 +274,7 @@ fn failed_reopen_keeps_old_sender_reservations() {
         Err(FlowError::History)
     );
     report.received = ops[0].prefix;
-    report.received_bytes = 10;
-    report.byte_limit = 9; // Advertised credit cannot precede its own receipt.
+    report.received_bytes = 0;
     assert_eq!(sender.reopen(report, ops[0].prefix), Err(FlowError::Report));
     assert_eq!(sender.channel(), channel(1));
     assert_eq!(sender.sent(), ops[1].prefix);
@@ -307,7 +298,7 @@ fn duplicate_and_reordered_reports_never_multiply_credit() {
     let next = operations(ops[1].prefix, &[20, 20, 20]);
     sender.record_send(channel(1), &next).unwrap();
     assert_eq!(
-        sender.record_send(channel(1), &operations(next[2].prefix, &[1])),
+        sender.record_send(channel(1), &operations(next[2].prefix, &[1, 1])),
         Err(FlowError::Capacity)
     );
 }
@@ -427,10 +418,8 @@ fn replacement_epoch_charges_retained_state_before_open() {
     assert!(Sender::open(receiver.report(), limits(), Prefix::GENESIS).is_err());
     let mut sender = Sender::open(receiver.report(), limits(), retained[2].prefix).unwrap();
     let next = operations(retained[2].prefix, &[11]);
-    assert_eq!(
-        sender.record_send(channel(2), &next),
-        Err(FlowError::Capacity)
-    );
+    sender.record_send(channel(2), &next).unwrap();
+    assert_eq!(receiver.retain(channel(2), &next), Err(FlowError::Capacity));
 }
 
 #[test]
@@ -455,8 +444,6 @@ fn release_requires_exact_retained_prefix_and_is_idempotent() {
     let after = receiver.report();
     receiver.release(ops[0].prefix).unwrap();
     assert_eq!(receiver.report(), after);
-    assert_eq!(after.byte_limit, 110);
-    assert_eq!(after.operation_limit, 5);
 }
 
 #[test]
@@ -470,7 +457,7 @@ fn changed_duplicate_and_retracted_reports_are_rejected_atomically() {
     sender.observe(receiver.report()).unwrap();
     let current = receiver.report();
     let mut bad = current;
-    bad.byte_limit -= 1; // Same revision, different content.
+    bad.received_bytes -= 1;
     assert_eq!(sender.observe(bad), Err(FlowError::Report));
     bad.revision += 1; // A newer revision cannot retract credit either.
     assert_eq!(sender.observe(bad), Err(FlowError::Report));
@@ -551,7 +538,10 @@ fn seeded_loss_reorder_and_release_schedules_preserve_credit_bounds() {
                 }
                 1 if !data.is_empty() => {
                     let op = data.swap_remove((rng as usize / 6) % data.len());
-                    if op.prefix.op.0 == retained_count as u64 + 1 {
+                    if op.prefix.op.0 == retained_count as u64 + 1
+                        && receiver.available().max_operations > 0
+                        && receiver.available().max_body_bytes >= op.body_bytes as usize
+                    {
                         receiver.retain(channel(1), &[op]).unwrap();
                     } // Drop an out-of-order packet; sender reservation remains.
                 }
@@ -564,7 +554,10 @@ fn seeded_loss_reorder_and_release_schedules_preserve_credit_bounds() {
                     receiver.release(ops[applied].prefix).unwrap();
                     applied += 1;
                 }
-                5 if retained_count < sent => {
+                5 if retained_count < sent
+                    && receiver.available().max_operations > 0
+                    && receiver.available().max_body_bytes >= 20 =>
+                {
                     // Harness requests the missing suffix, reusing its original charge.
                     receiver
                         .retain(channel(1), &ops[retained_count..=retained_count])
@@ -573,8 +566,6 @@ fn seeded_loss_reorder_and_release_schedules_preserve_credit_bounds() {
                 _ => {}
             }
             let report = receiver.report();
-            assert_eq!(report.operation_limit, applied as u64 + 4);
-            assert_eq!(report.byte_limit, applied as u64 * 20 + 100);
             assert!(report.received.op.0 - applied as u64 <= 4);
             assert!(report.received_bytes - applied as u64 * 20 <= 100);
             assert!(sender.outstanding().count() <= 4);

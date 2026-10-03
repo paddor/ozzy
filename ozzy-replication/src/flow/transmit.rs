@@ -27,7 +27,7 @@ impl OpenRequest {
     }
 }
 
-/// One bounded repair range using existing reservations. Never new send credit.
+/// One bounded repair range using existing reservations. Never new send capacity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Repair {
     /// Exact receiver incarnation to put on each packet.
@@ -52,7 +52,7 @@ pub enum StatusOutcome {
 /// Rejected send-policy transition. No error supplies durability or quorum evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum TransmitError {
-    /// Receipt/credit or exact-history validation failed.
+    /// Receipt or exact-history validation failed.
     #[error(transparent)]
     Flow(#[from] FlowError),
     /// Monotonic time or probe identity cannot advance safely.
@@ -60,7 +60,7 @@ pub enum TransmitError {
     Probe(#[from] ProbeError),
 }
 
-/// One peer's preallocated credit ledger, correlated probes, and bounded repair.
+/// One peer's preallocated local ledger, correlated probes, and bounded repair.
 ///
 /// The actor and simulator share this policy. Neither timer expiry nor an
 /// unsolicited partial receipt schedules a retransmission. Only a valid response
@@ -86,7 +86,7 @@ pub struct Transmitter {
 
 impl Transmitter {
     /// Reserve this sender's local metadata window and start fresh probe correlation.
-    /// Remote receive credits are independent and cannot increase this allocation.
+    /// Remote receipt reports cannot increase this allocation.
     pub fn new(
         scope: Scope,
         limits: PipelineLimits,
@@ -160,7 +160,7 @@ impl Transmitter {
     }
 
     /// Fence a changed normal scope while retaining all startup allocations and IDs.
-    /// Reconnection alone does not call this method or reset credit accounting.
+    /// Reconnection alone does not call this method or reset local accounting.
     pub fn change_scope(&mut self, scope: Scope, now: Duration) -> Result<(), TransmitError> {
         if scope == self.scope {
             return Ok(());
@@ -181,12 +181,11 @@ impl Transmitter {
     ///
     /// `transport_pending` includes this peer's locally retained data transmissions.
     /// Do not let a probe overtake that queue and mistake unsent bytes for a gap.
-    /// Poll while durability/receipt/credit remains unresolved, including received
+    /// Poll while durability/receipt remains unresolved, including received
     /// but not durably acknowledged bytes: a receiver can reset after volatile receipt.
     pub fn poll_probe(
         &mut self,
         available: Prefix,
-        minimum_body_bytes: u64,
         transport_pending: bool,
         now: Duration,
     ) -> Result<Option<Probe>, TransmitError> {
@@ -198,13 +197,9 @@ impl Transmitter {
         } else {
             self.sender().map_or(available, Sender::sent)
         };
-        Ok(self.probes.poll(
-            self.scope,
-            tail,
-            available.op.max(tail.op),
-            minimum_body_bytes,
-            now,
-        )?)
+        Ok(self
+            .probes
+            .poll(self.scope, tail, available.op.max(tail.op), now)?)
     }
 
     /// Reserve a fresh suffix once after ensuring the adapter can retain its packet.
@@ -237,7 +232,7 @@ impl Transmitter {
     }
 
     /// A correlated response may stop repair before data already held on SUB.
-    /// The bound grants no credit or history authority and cannot exceed the probe.
+    /// The bound grants no capacity or history authority and cannot exceed the probe.
     pub fn observe_with_repair_limit(
         &mut self,
         report: Report,
@@ -320,9 +315,9 @@ impl Transmitter {
             });
         }
         let Some(probe) = correlated else {
-            // A changed receive epoch can announce renewed capacity between
+            // A changed receive epoch announces reset volatile history between
             // periodic probes. Ask immediately, but keep any live correlation
-            // and history lookup. The hint itself installs no receive credit.
+            // and history lookup. The hint itself installs no receive capacity.
             if self.sender().is_some() && self.announced_channel != Some(report.channel) {
                 self.probes.expedite(now)?;
                 self.announced_channel = Some(report.channel);
@@ -431,7 +426,7 @@ impl Transmitter {
         if transport_pending { None } else { self.repair }
     }
 
-    /// Record one retained retry chunk without charging unique-send credits again.
+    /// Record one retained retry chunk without charging unique-send metadata again.
     /// `through` must name an exact reserved operation inside the current repair.
     pub fn record_repair(&mut self, repair: Repair, through: Prefix) -> Result<(), FlowError> {
         if self.repair != Some(repair) {

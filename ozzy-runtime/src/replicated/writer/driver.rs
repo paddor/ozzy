@@ -7,14 +7,13 @@ use ozzy_proto::nack::{self, AuthorityHint, RetryClass};
 use ozzy_proto::{Envelope, NodeId, Opcode, decode_packet};
 
 use super::batch::{Batch, PayloadView};
-use super::{DataLimits, Error, PartitionTarget, RetryPolicy, Shared};
+use super::{Error, RetryPolicy, Shared};
 
-mod link;
 mod shared;
 mod window;
-use link::{Clock, Link};
+use crate::replicated::{SdkClock as Clock, broker_links::append};
 pub(super) use shared::run_shared;
-use window::{RequestLimit, Sent, Window};
+use window::{Sent, Window};
 
 const TURN_RECORDS: usize = 1024;
 // Scheduling is independent of request size. A one-record request must not
@@ -36,6 +35,15 @@ struct Prepared {
     retained_bytes: usize,
 }
 
+/// Fixed authenticated link and authority for one routed producer attempt.
+struct SessionBinding<'a> {
+    connection: &'a append::Connection,
+    remote: NodeId,
+    local: NodeId,
+    authority: Option<Authority>,
+    retry: RetryPolicy,
+}
+
 struct Session {
     route: Bytes,
     frames: crate::native_frames::ControlFrames,
@@ -46,7 +54,7 @@ struct Session {
     deadline: Option<std::time::Duration>,
     retry_at: Option<std::time::Duration>,
     refused: Option<ozzy_proto::RequestId>,
-    request_limit: RequestLimit,
+    request_capacity: usize,
     clock: Clock,
     batch: Batch,
     compressor: Option<super::compression::Compressor>,
@@ -65,9 +73,9 @@ impl Session {
             deadline: None,
             retry_at: None,
             refused: None,
-            request_limit: RequestLimit::new(shared.config.inflight_appends),
+            request_capacity: shared.config.inflight_appends,
             clock,
-            batch: Batch::new(shared.config.limits.max_records),
+            batch: Batch::new(),
             compressor: shared
                 .config
                 .compress_payloads
@@ -78,21 +86,16 @@ impl Session {
     async fn run(
         mut self,
         shared: &mut super::state::Driver,
-        connection: Link<'_>,
-        remote: NodeId,
-        local: NodeId,
-        authority: Option<Authority>,
-        retry: RetryPolicy,
+        binding: SessionBinding<'_>,
     ) -> Result<(), Failure> {
         loop {
             if self.retry_at.is_some_and(|at| self.clock.now() >= at) && self.replay_ready() {
                 // Preserve the physical session and drain earlier confirmations
                 // before replaying the remaining prefix. Old request IDs cannot
-                // confirm the new window. Transport aliases retain their credit.
-                connection.forget_requests();
+                // confirm the new window. Transport aliases retain their local backing charge.
+                binding.connection.forget_requests();
                 self.window =
                     Window::new(shared.progress.confirmed(), shared.config.inflight_appends);
-                self.request_limit.replayed();
                 self.pending = None;
                 self.retry_at = None;
                 self.refused = None;
@@ -110,18 +113,21 @@ impl Session {
             // window costs each push one atomic swap instead of a task wake.
             let wants_records = self.can_prepare();
             let mut turn = || {
-                match connection.try_recv_many_into(TURN_RECORDS, &mut self.incoming) {
+                match binding
+                    .connection
+                    .try_recv_many_into(TURN_RECORDS, &mut self.incoming)
+                {
                     Ok(_) | Err(omq_tokio::Error::WouldBlock) => {}
                     Err(_) => return Err(Failure::Retry(None)),
                 }
                 let incoming = std::mem::take(&mut self.incoming);
                 let receive_full = incoming.len() == TURN_RECORDS;
                 for message in &incoming {
-                    self.receive(shared, connection, remote, authority, message, retry)?;
+                    self.receive(shared, &binding, message)?;
                 }
                 self.incoming = incoming;
                 self.incoming.clear();
-                let filled = self.send_ready(shared, connection, local, authority, retry)?;
+                let filled = self.send_ready(shared, &binding)?;
                 Ok((filled, receive_full))
             };
             let (filled, receive_full) = if wants_records {
@@ -141,14 +147,14 @@ impl Session {
             let retry_at = self.retry_at.filter(|_| self.replay_ready());
             let linger = self.batch.deadline;
             tokio::select! {
-                message = connection.recv() => {
+                message = binding.connection.recv() => {
                     let message = message.map_err(|_| Failure::Retry(None))?;
-                    self.receive(shared, connection, remote, authority, &message, retry)?;
+                    self.receive(shared, &binding, &message)?;
                 }
                 () = work.ready(), if wants_records => {}
                 () = async {
                     match &self.pending {
-                        Some(pending) => connection.wait_send_progress_for(&pending.message).await,
+                        Some(pending) => binding.connection.wait_send_progress_for(&pending.message).await,
                         None => std::future::pending().await,
                     }
                 } => {}
@@ -157,7 +163,9 @@ impl Session {
                         Some(deadline) => self.clock.until(deadline).await,
                         None => std::future::pending().await,
                     }
-                } => return Err(Failure::Retry(None)),
+                } => {
+                    return Err(Failure::Retry(None));
+                },
                 () = async {
                     match retry_at {
                         Some(at) => self.clock.until(at).await,
@@ -179,7 +187,7 @@ impl Session {
     fn can_prepare(&self) -> bool {
         self.retry_at.is_none()
             && self.pending.is_none()
-            && self.window.requests() < self.request_limit.current()
+            && self.window.requests() < self.request_capacity
     }
 
     fn replay_ready(&self) -> bool {
@@ -189,17 +197,14 @@ impl Session {
     fn send_ready(
         &mut self,
         shared: &mut super::state::Driver,
-        connection: Link<'_>,
-        local: NodeId,
-        authority: Option<Authority>,
-        retry: RetryPolicy,
+        binding: &SessionBinding<'_>,
     ) -> Result<bool, Failure> {
         if self.retry_at.is_some() {
             self.batch.deadline = None;
             return Ok(false);
         }
-        let parameters = connection.parameters().expect("negotiated session");
-        let limits = intersection(shared.config.limits, parameters.receive);
+        let parameters = binding.connection.parameters().expect("negotiated session");
+        let limits = shared.config.limits.intersection(parameters.receive);
         let mut sent_records = 0;
         let mut sent_bytes = 0;
         self.batch.deadline = None;
@@ -208,20 +213,14 @@ impl Session {
                 // A partially confirmed request still occupies one slot. A
                 // transport-blocked prepared request reserves the next slot;
                 // neither queue admission nor partial confirmations release it.
-                if self.window.requests() >= self.request_limit.current() {
+                if self.window.requests() >= self.request_capacity {
                     return Ok(false);
                 }
-                let records = parameters
-                    .inflight_records
-                    .saturating_sub(self.window.next() - shared.progress.confirmed())
-                    as usize;
-                let bytes = parameters
-                    .inflight_bytes
-                    .saturating_sub(self.window.bytes() as u64)
-                    as usize;
+                let next = self.window.next();
+                let in_flight = self.window.requests() != 0;
                 if !self
                     .batch
-                    .select(self.window.next(), limits, records, bytes, shared)
+                    .select(next, limits, in_flight, shared)
                     .map_err(Failure::Fatal)?
                 {
                     if self.batch.waiting_for_payload {
@@ -229,7 +228,9 @@ impl Session {
                         // Keep failure detection active while waiting for OMQ
                         // to release them, so other brokers remain reachable.
                         self.deadline.get_or_insert_with(|| {
-                            self.clock.now().saturating_add(retry.response_timeout)
+                            self.clock
+                                .now()
+                                .saturating_add(binding.retry.response_timeout)
                         });
                     }
                     return Ok(false);
@@ -243,29 +244,18 @@ impl Session {
                         .map_err(|_| Failure::Fatal(Error::AppendCompression))?,
                     None => None,
                 };
-                self.install_pending(
-                    shared,
-                    connection,
-                    local,
-                    authority,
-                    limits,
-                    decoded_payload,
-                    compressed,
-                    retry,
-                )?;
+                self.install_pending(shared, binding, limits, decoded_payload, compressed)?;
             }
             let mut pending = self.pending.take().expect("prepared request");
             let records = (pending.sent.end - self.window.next()) as usize;
-            match connection.try_send(
+            match binding.connection.try_send(
                 pending.message,
-                &pending.sent,
+                pending.sent.id,
+                pending.sent.end,
                 records,
                 pending.retained_bytes,
             ) {
                 Ok(()) => {
-                    if self.request_limit.current() == 1 && shared.config.inflight_appends > 1 {
-                        crate::profiling::event(crate::profiling::Event::SdkSingleFlightAppend);
-                    }
                     pending.sent.admitted_at = crate::profiling::start();
                     shared.stats.record(
                         (pending.sent.end - self.window.next()) as usize,
@@ -276,7 +266,9 @@ impl Session {
                     sent_bytes += pending.payload_bytes;
                     self.window.sent(pending.sent);
                     self.deadline.get_or_insert_with(|| {
-                        self.clock.now().saturating_add(retry.response_timeout)
+                        self.clock
+                            .now()
+                            .saturating_add(binding.retry.response_timeout)
                     });
                     if sent_bytes >= TURN_BYTES {
                         return Ok(true);
@@ -298,36 +290,35 @@ impl Session {
         Ok(true)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn install_pending(
         &mut self,
         shared: &mut super::state::Driver,
-        connection: Link<'_>,
-        local: NodeId,
-        authority: Option<Authority>,
+        binding: &SessionBinding<'_>,
         limits: ozzy_proto::append::DataLimits,
         decoded_payload: Payload,
         compressed: Option<Payload>,
-        retry: RetryPolicy,
     ) -> Result<(), Failure> {
         let (payload_encoding, encoded_payload_bytes) = compressed
             .as_ref()
             .map_or((PayloadEncoding::Raw, decoded_payload.len()), |encoded| {
                 (PayloadEncoding::Lz4, encoded.len())
             });
-        let id = connection.next_request().map_err(Failure::Fatal)?;
+        let id = binding
+            .connection
+            .next_request()
+            .map_err(|error| Failure::Fatal(error.into()))?;
         let envelope = Envelope {
             opcode: Opcode::Append,
             response: false,
             request_id: Some(id),
-            sender: local,
-            session: connection.session(),
+            sender: binding.local,
+            session: binding.connection.session(),
         };
         let header = self
             .batch
             .encode(
                 shared,
-                authority,
+                binding.authority,
                 envelope,
                 PayloadView {
                     decoded: decoded_payload.as_slice(),
@@ -359,21 +350,21 @@ impl Session {
         });
         shared.stage(end);
         self.batch.records.clear();
-        self.deadline
-            .get_or_insert_with(|| self.clock.now().saturating_add(retry.response_timeout));
+        self.deadline.get_or_insert_with(|| {
+            self.clock
+                .now()
+                .saturating_add(binding.retry.response_timeout)
+        });
         Ok(())
     }
 
     fn receive(
         &mut self,
         shared: &mut super::state::Driver,
-        connection: Link<'_>,
-        remote: NodeId,
-        authority: Option<Authority>,
+        binding: &SessionBinding<'_>,
         message: &Message,
-        retry: RetryPolicy,
     ) -> Result<(), Failure> {
-        let Some(frames) = frames(message, remote) else {
+        let Some(frames) = frames(message, binding.remote) else {
             return Ok(());
         };
         let Ok(packet) = decode_packet(
@@ -382,8 +373,8 @@ impl Session {
         ) else {
             return Ok(());
         };
-        if packet.envelope.sender != remote
-            || packet.envelope.session != connection.session()
+        if packet.envelope.sender != binding.remote
+            || packet.envelope.session != binding.connection.session()
             || !packet.envelope.response
             || !self.window.correlates(packet.envelope.request_id)
         {
@@ -392,42 +383,43 @@ impl Session {
         if packet.envelope.opcode == Opcode::Nack {
             let reply = nack::decode(packet, shared.config.limits.envelope)
                 .map_err(|_| Failure::Fatal(Error::Response))?;
-            if reply.retry == RetryClass::AfterCredit {
-                crate::profiling::event(crate::profiling::Event::SdkCreditRefusal);
+            if reply.retry == RetryClass::AfterBackoff {
+                crate::profiling::event(crate::profiling::Event::SdkAdmissionRefusal);
                 let id = packet.envelope.request_id.expect("correlated request");
-                if self.refused.is_none() {
-                    self.request_limit.refused();
-                }
                 if self
                     .refused
                     .is_none_or(|earlier| self.window.precedes(id, earlier))
                 {
                     self.refused = Some(id);
                 }
-                self.retry_at
-                    .get_or_insert_with(|| self.clock.now().saturating_add(retry.initial_backoff));
+                self.retry_at.get_or_insert_with(|| {
+                    self.clock
+                        .now()
+                        .saturating_add(binding.retry.initial_backoff)
+                });
                 return Ok(());
             }
-            return reject_packet(packet, shared.config.limits.envelope, authority.is_some());
+            return reject_packet(
+                packet,
+                shared.config.limits.envelope,
+                binding.authority.is_some(),
+            );
         }
         let apply_at = crate::profiling::start();
-        let (owner_epoch, key, policy, end_sequence, first_offset) = match &shared.config.partition
+        let reply = stream::decode_confirmed(packet, shared.config.limits.envelope)
+            .map_err(|error| Failure::Fatal(error.into()))?;
+        if Some(reply.authority) != binding.authority || reply.partition != shared.config.partition
         {
-            PartitionTarget::Group(partition) => {
-                let reply = stream::decode_confirmed(packet, shared.config.limits.envelope)
-                    .map_err(|error| Failure::Fatal(error.into()))?;
-                if Some(reply.authority) != authority || reply.partition != *partition {
-                    return Err(Failure::Fatal(Error::Response));
-                }
-                (
-                    reply.owner_epoch,
-                    reply.key,
-                    reply.policy,
-                    reply.end_sequence,
-                    reply.first_offset,
-                )
-            }
-        };
+            return Err(Failure::Fatal(Error::Response));
+        }
+        let stream::Confirmed {
+            owner_epoch,
+            key,
+            policy,
+            end_sequence,
+            first_offset,
+            ..
+        } = reply;
         let confirmed = shared.progress.confirmed();
         if owner_epoch != shared.config.owner_epoch
             || key.producer_id != shared.config.producer_id
@@ -444,8 +436,11 @@ impl Session {
             // The broker holds the records before this range from an earlier
             // attempt, and refused or has not yet answered their resent
             // request. Only their own confirmation carries their offsets.
-            self.retry_at
-                .get_or_insert_with(|| self.clock.now().saturating_add(retry.initial_backoff));
+            self.retry_at.get_or_insert_with(|| {
+                self.clock
+                    .now()
+                    .saturating_add(binding.retry.initial_backoff)
+            });
             return Ok(());
         }
         if !self
@@ -460,13 +455,13 @@ impl Session {
         let confirmed_bytes = shared
             .confirm(key.first_sequence, end_sequence, first_offset)
             .map_err(|_| Failure::Fatal(Error::Response))?;
-        let pending_before = self.window.requests();
         self.window.confirm(end_sequence, confirmed_bytes);
-        self.request_limit
-            .confirmed(pending_before - self.window.requests());
-        connection.confirm(end_sequence);
-        self.deadline = (!self.window.is_empty() || self.pending.is_some())
-            .then(|| self.clock.now().saturating_add(retry.response_timeout));
+        binding.connection.confirm(end_sequence);
+        self.deadline = (!self.window.is_empty() || self.pending.is_some()).then(|| {
+            self.clock
+                .now()
+                .saturating_add(binding.retry.response_timeout)
+        });
         crate::profiling::finish(crate::profiling::Stage::ConfirmationApply, apply_at);
         Ok(())
     }
@@ -501,22 +496,4 @@ fn frames(message: &Message, remote: NodeId) -> Option<[Bytes; 3]> {
     Some(std::array::from_fn(|i| {
         message.part_bytes(i + 1).expect("checked frames")
     }))
-}
-
-fn intersection(local: DataLimits, remote: DataLimits) -> DataLimits {
-    DataLimits {
-        envelope: ozzy_proto::EnvelopeLimits {
-            max_metadata_bytes: local
-                .envelope
-                .max_metadata_bytes
-                .min(remote.envelope.max_metadata_bytes),
-            max_payload_bytes: local
-                .envelope
-                .max_payload_bytes
-                .min(remote.envelope.max_payload_bytes),
-        },
-        max_records: local.max_records.min(remote.max_records),
-        max_record_bytes: local.max_record_bytes.min(remote.max_record_bytes),
-        max_parts: local.max_parts.min(remote.max_parts),
-    }
 }

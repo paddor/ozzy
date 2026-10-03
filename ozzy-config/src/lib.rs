@@ -4,6 +4,7 @@
 //! source; restart validates its persisted result. Local CPU/shard placement never
 //! contributes to partition identity or replicated membership.
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 mod broker_identity;
 mod identity;
@@ -17,8 +18,8 @@ pub use identity::{DeploymentIdentity, PartitionIdentity, TopicIdentity};
 pub use placement::{BrokerPlan, ControllerPlan, HostResources, PartitionPlacement, ShardPlan};
 pub use schema::{
     Affinity, Broker, Cluster, Confirmation, Deployment, DeploymentMode, Device, Endpoints,
-    IoBackend, MemoryPool, Omq, PartitionOverride, QueueBudget, ResourceLimits, Shard,
-    StorageWorkers, Topic, Topology,
+    IoBackend, MAX_APPEND_BYTES, MemoryPool, Omq, PartitionOverride, QueueBudget, ResourceLimits,
+    Shard, StorageWorkers, Topic, Topology,
 };
 pub use validate::ValidatedDeployment;
 

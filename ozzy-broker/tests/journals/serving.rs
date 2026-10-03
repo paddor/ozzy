@@ -8,15 +8,17 @@ use ozzy_runtime::replicated::{
 };
 use std::time::Duration;
 
-mod credit;
 mod failover;
 mod large;
 mod live;
 #[cfg(target_os = "linux")]
 mod perf;
+mod pressure;
+mod progress;
 mod recovery;
 mod roll;
 mod sessions;
+mod simulated;
 
 fn deployment(
     root: &Path,
@@ -57,7 +59,10 @@ fn deployment_with_resources(
         let mut broker = template.clone();
         let namespace = uuid::Uuid::now_v7();
         broker.endpoints.peer = format!("inproc://{namespace}-peer");
+        broker.endpoints.data_peer = format!("inproc://{namespace}-data");
         broker.endpoints.reader_pub = format!("inproc://{namespace}-readers");
+        broker.endpoints.follower_pub =
+            (mode == DeploymentMode::Three).then(|| format!("inproc://{namespace}-followers"));
         let device = broker.devices.get_mut("ssd").unwrap();
         device.root = root.join(format!("broker-{index}"));
         device.workers.backend = IoBackend::Pool;
@@ -120,64 +125,71 @@ async fn role_links_with_limits(
     roles: u32,
     wire: DataLimits,
 ) -> BrokerLinks {
+    role_links_with_config(runtime, checked, roles, wire, |_| {}).await
+}
+
+async fn role_links_with_config(
+    runtime: &WriterRuntime,
+    checked: &CheckedConfig,
+    roles: u32,
+    wire: DataLimits,
+    configure: impl FnOnce(&mut BrokerLinksConfig),
+) -> BrokerLinks {
     let mut parameters = if roles & handshake::PRODUCER != 0 {
-        let reader_windows = if wire.max_record_bytes > 1024 { 32 } else { 1 };
-        let bytes = (64 * 1024)
-            .max(32 * wire.max_record_bytes as u64)
-            .max(reader_windows * wire.envelope.max_payload_bytes as u64);
-        let records = 64.max(reader_windows * wire.max_records as u64);
-        handshake::Parameters::streaming(wire, roles, records, bytes).unwrap()
+        handshake::Parameters::streaming(wire, roles).unwrap()
     } else {
-        handshake::Parameters::reader_window(wire, roles, 32).unwrap()
+        handshake::Parameters::reader(wire, roles).unwrap()
     };
     parameters.capabilities |= handshake::OWNER_ROUTING;
     parameters.capabilities |= handshake::OWNER_READ;
-    BrokerLinks::connect(
-        runtime,
-        BrokerLinksConfig {
-            local: NodeId::from_bytes(*Uuid::now_v7().as_bytes()),
-            brokers: checked
-                .identity
-                .brokers
-                .iter()
-                .map(|(name, id)| BrokerAddress {
-                    node: NodeId::from_bytes(*id.as_bytes()),
-                    endpoint: checked.deployment.deployment().brokers[name]
-                        .endpoints
-                        .peer
-                        .parse()
-                        .unwrap(),
-                })
-                .collect(),
-            parameters,
-            requests: 12,
-            control_bytes: (1024 * 1024).max(16 * wire.max_record_bytes),
-            routing_bytes: 1024 * 1024,
-            append: (roles & handshake::PRODUCER != 0).then_some(AppendLinkLimits {
-                writers: 32,
-                requests: 32,
-                records: 128,
-                bytes: (256 * 1024 * 1024).max(32 * wire.max_record_bytes),
-            }),
-            maximum_partitions: checked.plan.partitions.len(),
-            reader: (roles & handshake::CONSUMER != 0).then_some(ReaderLinkLimits {
-                subscriptions: if wire.max_record_bytes > 1024 * 1024 {
-                    1
-                } else {
-                    32
-                },
-                bytes: (16 * 1024 * 1024)
-                    .max(64 * wire.max_record_bytes)
-                    .max(wire.max_records * wire.max_record_bytes * 256),
-                queue_messages: 4,
-            }),
-            request_timeout: Duration::from_secs(5),
-            retry_interval: Duration::from_millis(10),
-            clock: SdkClock::default(),
-        },
-    )
-    .await
-    .unwrap()
+    let mut config = BrokerLinksConfig {
+        local: NodeId::from_bytes(*Uuid::now_v7().as_bytes()),
+        brokers: checked
+            .identity
+            .brokers
+            .iter()
+            .map(|(name, id)| BrokerAddress {
+                node: NodeId::from_bytes(*id.as_bytes()),
+                endpoint: checked.deployment.deployment().brokers[name]
+                    .endpoints
+                    .peer
+                    .parse()
+                    .unwrap(),
+                data_endpoint: checked.deployment.deployment().brokers[name]
+                    .endpoints
+                    .data_peer
+                    .parse()
+                    .unwrap(),
+            })
+            .collect(),
+        parameters,
+        requests: 12,
+        control_bytes: (1024 * 1024).max(16 * wire.max_record_bytes),
+        routing_bytes: 1024 * 1024,
+        append: (roles & handshake::PRODUCER != 0).then_some(AppendLinkLimits {
+            writers: 32,
+            requests: 32,
+            records: 128,
+            bytes: (256 * 1024 * 1024).max(32 * wire.max_record_bytes),
+        }),
+        maximum_partitions: checked.plan.partitions.len(),
+        reader: (roles & handshake::CONSUMER != 0).then_some(ReaderLinkLimits {
+            subscriptions: if wire.max_record_bytes > 1024 * 1024 {
+                1
+            } else {
+                32
+            },
+            bytes: (16 * 1024 * 1024)
+                .max(64 * wire.max_record_bytes)
+                .max(wire.max_records * wire.max_record_bytes * 256),
+            queue_messages: 4,
+        }),
+        request_timeout: Duration::from_secs(5),
+        retry_interval: Duration::from_millis(10),
+        clock: SdkClock::default(),
+    };
+    configure(&mut config);
+    BrokerLinks::connect(runtime, config).await.unwrap()
 }
 
 #[tokio::test(flavor = "current_thread")]

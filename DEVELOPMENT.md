@@ -21,6 +21,7 @@ directory on individual commands. Clippy retains its own compiler wrapper.
 Individual commands:
 
 ```sh
+source scripts/ozzy_tools.sh
 cargo build --workspace
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
@@ -36,6 +37,10 @@ explicitly when working on benchmarks:
 ```sh
 cargo build -p ozzy-bench
 ```
+
+For fast inside-out checks, use `scripts/test.sh core`, `writer`, `inproc`,
+`simulation`, or `loom` before the full gate. [Validation](doc/VALIDATION.md)
+explains each layer and its limits.
 
 ## Verification
 

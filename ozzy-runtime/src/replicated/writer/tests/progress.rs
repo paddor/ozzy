@@ -53,7 +53,7 @@ async fn nonblocking_observation_preserves_confirmed_prefix_after_failure() {
     confirm(&mut driver, 1, 90).unwrap();
     let receipt = first.try_confirmed().unwrap().unwrap();
     assert_eq!(receipt.offset, 90);
-    assert_eq!(receipt.message_id, first.completion.message_id);
+    assert_eq!(receipt.message_id, first.completion.message_id());
     assert!(second.try_confirmed().is_none());
     driver.fail(WriterError::Configuration);
     assert_eq!(first.try_confirmed().unwrap().unwrap().offset, 90);

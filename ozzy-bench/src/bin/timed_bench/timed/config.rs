@@ -4,17 +4,23 @@ use ozzy_proto::{EnvelopeLimits, GroupId, MessageId, append::DataLimits};
 use super::super::{Args, Result, System, error};
 use ozzy_runtime::replicated::Policy;
 
-// Fixed across SDK cap experiments. Broker receive credit must not serialize
-// full APPENDs or change with the writer setting being measured.
-pub(super) const SDK_BATCH_TARGET_BYTES: usize = 832 * 1024;
+// Default for record-count-only SDK batch experiments.
+#[cfg(test)]
+pub(super) const SDK_BATCH_TARGET_BYTES: usize = ozzy_bench::native::DEFAULT_SDK_BATCH_TARGET_BYTES;
 
-pub(super) fn sdk_batch_target(record_bytes: usize) -> usize {
-    SDK_BATCH_TARGET_BYTES.max(record_bytes)
+pub(super) fn sdk_batch_target(args: &Args) -> usize {
+    (args.writer_batch_target_kib as usize * 1024).max(args.record_bytes)
 }
 // A disk-quorum follower overlaps its next write with the previous barrier only
 // while the live window holds many operations. One storage group holds two
 // full SDK batches, which serializes every window behind its own barriers.
 pub(super) const DISK_QUORUM_WINDOW_BYTES: usize = 32 * 1024 * 1024;
+
+// Benchmark defaults, independent of backend selection and write grouping.
+const RP_BACKLOG: ozzy_replication::PipelineLimits = ozzy_replication::PipelineLimits {
+    max_operations: 4096,
+    max_body_bytes: 128 * 1024 * 1024,
+};
 
 fn native_disk(args: &Args) -> bool {
     !external(args)
@@ -61,26 +67,21 @@ fn prepared_operation_bounds(
     writers: usize,
     records: usize,
 ) -> Result<(usize, usize)> {
-    let requested = (records * args.record_bytes).min(sdk_batch_target(args.record_bytes));
-    let fixed = 4 + 76 * writers + records * 24 + 9;
-    let body_limit = if native_disk {
-        let capacity = args.segment_mib * 1024 * 1024;
-        let usable = capacity.saturating_sub(ozzy_journal_segment::SEGMENT_HEADER_BYTES);
-        let aligned = usable / ozzy_journal_segment::WRITE_GROUP_ALIGNMENT
-            * ozzy_journal_segment::WRITE_GROUP_ALIGNMENT;
-        aligned
-            .saturating_sub(
-                ozzy_journal_segment::ENTRY_HEADER_BYTES + ozzy_journal_segment::GROUP_SEAL_BYTES,
-            )
-            .min(args.segment_decoded_mib * 1024 * 1024)
+    let capacity = if native_disk {
+        ozzy_bench::native::segment_body_capacity(
+            args.segment_mib * 1024 * 1024,
+            args.segment_decoded_mib * 1024 * 1024,
+        )
     } else {
         usize::MAX
     };
-    let payload = requested.min(body_limit.saturating_sub(fixed) / 2);
-    if payload < args.record_bytes {
-        return Err(error("segment cannot hold one prepared record operation"));
+    ozzy_bench::native::AppendBudget {
+        writers,
+        records,
+        record_bytes: args.record_bytes,
+        target_bytes: sdk_batch_target(args),
     }
-    Ok((fixed, payload))
+    .bounds(capacity)
 }
 
 impl System {
@@ -144,10 +145,7 @@ impl History {
 }
 
 fn storage_targets_valid(args: &Args) -> bool {
-    let default = ozzy_runtime::replica_journal::WritePipelineConfig::default()
-        .backlog
-        .max_body_bytes
-        >> 20;
+    let default = RP_BACKLOG.max_body_bytes >> 20;
     if args.replication_cache_mib.unwrap_or(default)
         < args.persistence_backlog_mib.unwrap_or(default)
     {
@@ -452,9 +450,7 @@ impl Config {
     pub(super) fn disk_pipeline(&self) -> ozzy_replication::PipelineLimits {
         ozzy_replication::PipelineLimits {
             max_operations: if self.args.system == System::ReplicatedPersisting {
-                ozzy_runtime::replica_journal::WritePipelineConfig::default()
-                    .backlog
-                    .max_operations
+                RP_BACKLOG.max_operations
             } else {
                 ozzy_runtime::replica_journal::MAX_APPEND_OPERATIONS
             },
@@ -462,14 +458,7 @@ impl Config {
             max_body_bytes: if self.args.system == System::ReplicatedPersisting {
                 self.args
                     .persistence_backlog_mib
-                    .map_or_else(
-                        || {
-                            ozzy_runtime::replica_journal::WritePipelineConfig::default()
-                                .backlog
-                                .max_body_bytes
-                        },
-                        |mib| mib * 1024 * 1024,
-                    )
+                    .map_or_else(|| RP_BACKLOG.max_body_bytes, |mib| mib * 1024 * 1024)
                     .max(self.decode_limits().max_group_decoded_body_bytes)
             } else if self.args.system == System::DiskQuorum {
                 DISK_QUORUM_WINDOW_BYTES.max(self.decode_limits().max_group_decoded_body_bytes)
@@ -486,14 +475,7 @@ impl Config {
             cache.max_body_bytes = self
                 .args
                 .replication_cache_mib
-                .map_or_else(
-                    || {
-                        ozzy_runtime::replica_journal::WritePipelineConfig::default()
-                            .backlog
-                            .max_body_bytes
-                    },
-                    |mib| mib * 1024 * 1024,
-                )
+                .map_or_else(|| RP_BACKLOG.max_body_bytes, |mib| mib * 1024 * 1024)
                 .max(self.decode_limits().max_group_decoded_body_bytes);
         }
         cache
@@ -519,8 +501,10 @@ impl Config {
             .max(1)
     }
 
-    /// Publications queued per reader before newer ones are lost and replayed.
-    pub(super) const LIVE_QUEUE_MESSAGES: u32 = 64;
+    /// Preserve the live reader byte window while APPEND payload sizes vary.
+    pub(super) fn live_queue_messages(&self) -> usize {
+        ozzy_bench::native::reader_queue_messages(self.reader_limits().envelope.max_payload_bytes)
+    }
 
     /// Independent reader subscriptions per partition, shared over broker links
     /// in the production adapter.
@@ -582,7 +566,7 @@ impl Config {
         limits.envelope.max_payload_bytes = limits
             .envelope
             .max_payload_bytes
-            .min(sdk_batch_target(self.args.record_bytes))
+            .min(sdk_batch_target(&self.args))
             .min(self.history.operation.max_payload_bytes);
         limits
     }
@@ -962,7 +946,8 @@ mod tests {
             );
             assert_eq!(
                 writer.envelope.max_payload_bytes,
-                (ozzy_runtime::replicated::MAX_APPEND_RECORDS * bytes).min(sdk_batch_target(bytes))
+                (ozzy_runtime::replicated::MAX_APPEND_RECORDS * bytes)
+                    .min(sdk_batch_target(&config.args))
             );
             assert!(
                 config.history.operation.max_payload_bytes >= writer.envelope.max_payload_bytes
@@ -1013,7 +998,7 @@ mod tests {
     }
 
     #[test]
-    fn reader_credit_fits_record_and_payload_bounds_independently_of_writers() {
+    fn reader_capacity_fits_record_and_payload_bounds_independently_of_writers() {
         for (bytes, records) in [(16, 16384), (128, 16384), (1024, 16384), (8192, 16384)] {
             let mut args = Args::parse_from([
                 "bench",
@@ -1035,6 +1020,62 @@ mod tests {
             args.reader_records = 7;
             args.reader_payload_mib = 1;
             assert_eq!(Config::new(args).unwrap().reader_records(), 7);
+        }
+    }
+    #[test]
+    fn production_large_batch_byte_caps_reserve_real_sdk_owners_without_io() {
+        for (target, records, inflight, fits_vm) in [
+            ("832", "2048", "3", true),
+            ("1536", "2048", "3", true),
+            ("2048", "2048", "3", true),
+            ("4096", "512", "2", true),
+            ("4096", "2048", "2", false),
+            ("4096", "2048", "3", false),
+            ("16384", "2048", "3", false),
+        ] {
+            let args = Args::parse_from([
+                "bench",
+                "--system",
+                "replicated-persisting",
+                "--processes",
+                "--network-ingress",
+                "--streaming",
+                "--duration",
+                "1",
+                "--window",
+                "8",
+                "--partitions",
+                "8",
+                "--record-bytes",
+                "8192",
+                "--request-records",
+                records,
+                "--writer-inflight-appends",
+                inflight,
+                "--producer-workers",
+                "4",
+                "--app-threads",
+                "1",
+                "--reader-workers",
+                "8",
+                "--writer-batch-target-kib",
+                target,
+            ]);
+            let config = Config::production(args).unwrap();
+            let expected = (target.parse::<usize>().unwrap() * 1024).min(8 * 1024 * 1024 - 49_241);
+            assert_eq!(config.writer_limits().envelope.max_payload_bytes, expected);
+            assert_eq!(
+                super::super::native::writer_settings(&config).batch_target_bytes,
+                expected
+            );
+            assert!(config.memory_reservation_bytes() > expected as u64);
+            assert_eq!(
+                config.memory_reservation_bytes() < 24 * 1024 * 1024 * 1024,
+                fits_vm,
+                "target={target} records={records} inflight={inflight} bytes={}",
+                config.memory_reservation_bytes()
+            );
+            assert!(config.live_queue_messages() * expected <= 64 * 832 * 1024);
         }
     }
 }

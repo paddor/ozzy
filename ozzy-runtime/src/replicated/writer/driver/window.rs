@@ -18,81 +18,6 @@ pub(super) struct Window {
     sent: VecDeque<Sent>,
 }
 
-// A full window is a probe after credit refusal, not evidence that the broker
-// has room. Wait for sustained clean confirmations before probing again.
-const CLEAN_CONFIRMATIONS_PER_PROBE: usize = 64;
-
-/// A refusal serializes the ambiguous replay prefix. Sustained clean
-/// confirmations then restore half the prior window and grow one slot at a time.
-pub(super) struct RequestLimit {
-    configured: usize,
-    current: usize,
-    recovery: Option<Recovery>,
-}
-
-struct Recovery {
-    half: usize,
-    clean: usize,
-    replayed: bool,
-    restored_half: bool,
-}
-
-impl RequestLimit {
-    pub(super) fn new(configured: usize) -> Self {
-        debug_assert!(configured > 0);
-        Self {
-            configured,
-            current: configured,
-            recovery: None,
-        }
-    }
-
-    pub(super) fn current(&self) -> usize {
-        self.current
-    }
-
-    pub(super) fn refused(&mut self) {
-        let half = self.current.div_ceil(2);
-        self.current = 1;
-        self.recovery = Some(Recovery {
-            half,
-            clean: 0,
-            replayed: false,
-            restored_half: false,
-        });
-    }
-
-    pub(super) fn replayed(&mut self) {
-        if let Some(recovery) = &mut self.recovery {
-            recovery.replayed = true;
-        }
-    }
-
-    pub(super) fn confirmed(&mut self, requests: usize) {
-        let Some(recovery) = &mut self.recovery else {
-            return;
-        };
-        if !recovery.replayed {
-            return;
-        }
-        for _ in 0..requests {
-            recovery.clean += 1;
-            if recovery.clean >= CLEAN_CONFIRMATIONS_PER_PROBE {
-                if !recovery.restored_half {
-                    self.current = recovery.half;
-                    recovery.restored_half = true;
-                } else if self.current < self.configured {
-                    self.current += 1;
-                }
-                recovery.clean = 0;
-            }
-        }
-        if self.current == self.configured {
-            self.recovery = None;
-        }
-    }
-}
-
 impl Window {
     /// Reconnect starts at the shared confirmed prefix, with no old correlations.
     pub(super) fn new(first: u64, capacity: usize) -> Self {
@@ -106,10 +31,6 @@ impl Window {
 
     pub(super) fn next(&self) -> u64 {
         self.next
-    }
-
-    pub(super) fn bytes(&self) -> usize {
-        self.bytes
     }
 
     pub(super) fn requests(&self) -> usize {
@@ -194,14 +115,14 @@ mod tests {
         window.sent(sent(1, 10, 14, 64));
         window.sent(sent(2, 14, 17, 48));
         window.confirm(12, 32);
-        assert_eq!((window.requests(), window.bytes()), (2, 80));
+        assert_eq!((window.requests(), window.bytes), (2, 80));
         assert!(window.correlates(Some(RequestId::from_bytes([1; 16]))));
         window.confirm(14, 32);
-        assert_eq!((window.requests(), window.bytes()), (1, 48));
+        assert_eq!((window.requests(), window.bytes), (1, 48));
         assert!(!window.correlates(Some(RequestId::from_bytes([1; 16]))));
         window.confirm(17, 48);
         assert!(window.is_empty());
-        assert_eq!((window.next(), window.bytes()), (17, 0));
+        assert_eq!((window.next(), window.bytes), (17, 0));
     }
 
     #[test]
@@ -217,7 +138,7 @@ mod tests {
         window.confirm(12, 32);
         let retry = Window::new(12, 1);
         assert_eq!(retry.next(), 12);
-        assert_eq!(retry.bytes(), 0);
+        assert_eq!(retry.bytes, 0);
         assert!(!retry.correlates(Some(RequestId::from_bytes([1; 16]))));
         assert!(!retry.accepts(id, 10, 14, 12));
     }
@@ -261,55 +182,5 @@ mod tests {
         assert!(!window.accepts(first, 10, 12, 10));
         assert!(!window.skips(first, 11, 12, 10));
         assert!(window.accepts(first, 10, 11, 10));
-    }
-
-    #[test]
-    fn refusal_recovers_only_after_sustained_clean_confirmations() {
-        let mut limit = RequestLimit::new(3);
-        limit.refused();
-        assert_eq!(limit.current(), 1);
-        limit.confirmed(2);
-        assert_eq!(limit.current(), 1);
-
-        limit.replayed();
-        limit.confirmed(0); // A partial reply does not free an APPEND slot.
-        assert_eq!(limit.current(), 1);
-        limit.confirmed(CLEAN_CONFIRMATIONS_PER_PROBE - 1);
-        assert_eq!(limit.current(), 1);
-        limit.confirmed(1);
-        assert_eq!(limit.current(), 2);
-        limit.confirmed(CLEAN_CONFIRMATIONS_PER_PROBE - 1);
-        assert_eq!(limit.current(), 2);
-        limit.confirmed(1);
-        assert_eq!(limit.current(), 3);
-    }
-
-    #[test]
-    fn repeated_refusal_halves_the_recovered_window() {
-        let mut limit = RequestLimit::new(8);
-        limit.refused();
-        limit.replayed();
-        limit.confirmed(CLEAN_CONFIRMATIONS_PER_PROBE);
-        assert_eq!(limit.current(), 4);
-        limit.refused();
-        assert_eq!(limit.current(), 1);
-        limit.replayed();
-        limit.confirmed(CLEAN_CONFIRMATIONS_PER_PROBE);
-        assert_eq!(limit.current(), 2);
-        limit.confirmed(CLEAN_CONFIRMATIONS_PER_PROBE - 1);
-        assert_eq!(limit.current(), 2);
-        limit.confirmed(1);
-        assert_eq!(limit.current(), 3);
-
-        limit.refused();
-        limit.replayed();
-        limit.confirmed(CLEAN_CONFIRMATIONS_PER_PROBE);
-        assert_eq!(limit.current(), 2);
-        limit.refused();
-        limit.replayed();
-        limit.confirmed(CLEAN_CONFIRMATIONS_PER_PROBE);
-        assert_eq!(limit.current(), 1);
-        limit.confirmed(CLEAN_CONFIRMATIONS_PER_PROBE);
-        assert_eq!(limit.current(), 2);
     }
 }

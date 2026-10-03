@@ -1,7 +1,8 @@
 # ozzy-proto
 
 Sans-I/O Ozzy protocol. One 64-byte envelope, three application frames, wire
-version 1. No legacy decoder or version-named module tree.
+version 1. Routine REPLICA_RECEIPT has a compact single-frame profile. No legacy
+decoder or version-named module tree.
 
 `handshake` owns negotiation; `append` and `reader` own command schemas.
 `data` shares bounded multipart encoding and borrowed/owned record iterators.

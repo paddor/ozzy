@@ -1,6 +1,6 @@
 //! Owned body preparation; no file handle or mutable journal crosses the worker boundary.
 
-use super::{CanonicalOperation, DirectoryError, OpenGroupJournal, PreencodedJournalGroup};
+use super::{CanonicalOperation, DirectoryError, PreencodedJournalGroup};
 use crate::{BodyEncoding, DecodeLimits, OperationLimits};
 
 /// Reusable compressor state owned by one CPU worker.
@@ -20,31 +20,6 @@ pub struct JournalGroupEncoding {
     validated: Option<OperationLimits>,
     validated_payloads: bool,
     output: Vec<u8>,
-}
-
-impl OpenGroupJournal {
-    /// Capture body-encoding work without changing any written or durable prefix.
-    pub fn begin_group_encoding(&mut self) -> Result<JournalGroupEncoding, DirectoryError> {
-        let mut encoding = self.capture_group_encoding()?;
-        encoding.output = self.writer.take_encode_buffer();
-        Ok(encoding)
-    }
-
-    /// Capture placement-independent encoding while a detached roll owns file I/O.
-    /// The owner must drain all captured work before changing journal authority.
-    pub fn capture_group_encoding(&self) -> Result<JournalGroupEncoding, DirectoryError> {
-        self.require_roll_published()?;
-        if self.writer.is_faulted() {
-            return Err(crate::WriterError::Faulted.into());
-        }
-        Ok(JournalGroupEncoding::captured(
-            self.decode_limits,
-            self.operation_limits,
-            self.directory.manifest.configuration_epoch,
-            self.directory.manifest.promised_view,
-            Vec::new(),
-        ))
-    }
 }
 
 impl JournalGroupEncoding {

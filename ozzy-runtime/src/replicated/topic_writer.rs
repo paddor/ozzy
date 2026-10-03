@@ -1,9 +1,9 @@
 //! One topic writer over shared broker links and partition-local SDK state.
 
 use super::{
-    PartitionTarget, PendingRecord, RecordInput, RecordReceipt, RetryPolicy, Writer, WriterConfig,
-    WriterError,
+    PendingRecord, RecordInput, RecordReceipt, RetryPolicy, Writer, WriterConfig, WriterError,
 };
+use ozzy_proto::PartitionIncarnation;
 
 mod shared;
 pub use shared::{
@@ -34,7 +34,7 @@ pub enum TopicWriterError {
     #[error("topic partition {partition:?}: {source}")]
     Send {
         /// Partition selected before admission.
-        partition: PartitionTarget,
+        partition: PartitionIncarnation,
         /// Underlying writer failure; outcome may be unknown.
         #[source]
         source: WriterError,
@@ -42,7 +42,7 @@ pub enum TopicWriterError {
 }
 
 struct Partition {
-    target: PartitionTarget,
+    target: PartitionIncarnation,
     writer: Writer,
 }
 

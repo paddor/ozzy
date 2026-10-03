@@ -65,6 +65,7 @@ impl Completed {
     }
 }
 
+/// Create one physical-result sender and observer under an admitted charge.
 pub fn completion(charge: Charge) -> (Reply, Completion) {
     let (sender, receiver) = mpsc::channel_with_policy(1);
     let signal = Arc::new(Signal::default());

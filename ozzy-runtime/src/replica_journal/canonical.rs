@@ -58,16 +58,16 @@ pub(super) fn prepare<I: IdentityIndex + Clone>(
     images: &CanonicalImages<I>,
     buffer: &mut AppendBuffer,
     limits: OperationLimits,
-    locally_validated_payload: bool,
+    primary_payloads_validated: bool,
 ) -> Result<(PreparedCanonicalGroup, Vec<PreparedOperationRecords>), JournalError> {
     if buffer
         .operations()
         .all(|operation| operation.kind == OperationKind::Append)
     {
-        let full = !locally_validated_payload && buffer.proofs().all(|proof| proof.is_none());
-        let validated = prepare_appends(images, buffer, limits, locally_validated_payload)?;
-        // Only a full decode under these limits allows skipping storage's body walk.
-        buffer.set_validated(full);
+        let validated = prepare_appends(images, buffer, limits, primary_payloads_validated)?;
+        // Every path checks these limits. Immutable bodies retain the earlier
+        // payload validation, so storage need not walk their descriptors again.
+        buffer.set_validated(true);
         return Ok(validated);
     }
     // Synchronous bounded scratch, never retained across an await.
@@ -95,7 +95,7 @@ fn prepare_appends<I: IdentityIndex + Clone>(
     images: &CanonicalImages<I>,
     buffer: &mut AppendBuffer,
     limits: OperationLimits,
-    locally_validated_payload: bool,
+    primary_payloads_validated: bool,
 ) -> Result<(PreparedCanonicalGroup, Vec<PreparedOperationRecords>), JournalError> {
     let mut summaries = smallvec::SmallVec::<[_; 4]>::new();
     let bodies = buffer.shared_bodies();
@@ -104,9 +104,14 @@ fn prepare_appends<I: IdentityIndex + Clone>(
     for (operation, proof) in buffer.operations().zip(buffer.proofs()) {
         let body = bodies.slice_ref(operation.body);
         let (summary, prepared) = if let Some(proof) = proof {
-            PreparedOperationRecords::new_validated_wire_append(operation.header(), body, proof)
-                .map_err(records_error)?
-        } else if locally_validated_payload {
+            PreparedOperationRecords::new_validated_wire_append(
+                operation.header(),
+                body,
+                proof,
+                limits,
+            )
+            .map_err(records_error)?
+        } else if primary_payloads_validated {
             PreparedOperationRecords::new_append_with_validated_payload(
                 operation.header(),
                 body,
@@ -140,8 +145,13 @@ pub(super) fn retained_records(
         .map(|(operation, proof)| {
             let body = append.payload(operation.body);
             let decoded = if let Some(proof) = proof {
-                PreparedOperationRecords::new_validated_wire_append(operation.header(), body, proof)
-                    .map(|(_, records)| records)
+                PreparedOperationRecords::new_validated_wire_append(
+                    operation.header(),
+                    body,
+                    proof,
+                    limits,
+                )
+                .map(|(_, records)| records)
             } else if operation.kind == OperationKind::Append {
                 PreparedOperationRecords::new_append_with_validated_payload(
                     operation.header(),

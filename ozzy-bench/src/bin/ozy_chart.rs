@@ -4,6 +4,7 @@ mod chart;
 
 use clap::Parser;
 use ozzy_bench::automation::{self, Result, records};
+use serde_json::json;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -11,6 +12,9 @@ struct Args {
     /// Completed run; repeat for disjoint modes from the same checkout.
     #[arg(long, required = true)]
     run_id: Vec<String>,
+    /// Replace measured cases with a rerun of the identical worker binary and controls.
+    #[arg(long)]
+    replace_run_id: Vec<String>,
     /// Select measured modes before attaching cached comparisons.
     #[arg(long, value_delimiter = ',')]
     modes: Vec<String>,
@@ -29,6 +33,9 @@ struct Args {
     /// Scheduled-arrival latency versus offered load, in separate SVGs.
     #[arg(long, conflicts_with = "iggy_run_id")]
     fixed_load: bool,
+    /// Explicit load with an Ozzy measurement but no external reference.
+    #[arg(long, requires = "fixed_load")]
+    ozzy_only_rate: Vec<u64>,
     /// Explicit single-case backlog failures, annotated without latency values.
     #[arg(long, requires = "fixed_load")]
     failed_run_id: Vec<String>,
@@ -60,6 +67,23 @@ fn main() -> Result<()> {
         )?
     };
     records::retain_modes(&mut data, &args.modes)?;
+    for id in &args.replace_run_id {
+        let mut replacement = if args.fixed_load {
+            records::select_fixed_load(&automation::cache(), std::slice::from_ref(id))?
+        } else {
+            records::select(&automation::cache(), std::slice::from_ref(id), None)?
+        };
+        records::retain_modes(&mut replacement, &args.modes)?;
+        chart::replacement::apply(&mut data, &replacement)?;
+    }
+    if !args.ozzy_only_rate.is_empty() {
+        data["ozzy_only_rates"] = json!(args.ozzy_only_rate);
+    }
+    // Failed offered rates also need comparison coverage.
+    if !args.failed_run_id.is_empty() {
+        records::include_failed_loads(&automation::cache(), &mut data, &args.failed_run_id)?;
+        records::retain_modes(&mut data, &args.modes)?;
+    }
     let (references, implementations): (_, &[_]) = if args.external_reference_run_id.is_empty() {
         (&args.iggy_reference_run_id, &["iggy"])
     } else {
@@ -69,29 +93,27 @@ fn main() -> Result<()> {
         if !args.fixed_load && references.len() != 1 {
             return Err("saturation charts require one external reference run".into());
         }
-        records::include_references(
+        records::include_references_with_ozzy_only_rates(
             &automation::cache(),
             &mut data,
             references,
             implementations,
             args.fixed_load,
+            &args.ozzy_only_rate,
         )?;
     }
     if !args.redpanda_reference_run_id.is_empty() {
         if !args.fixed_load && args.redpanda_reference_run_id.len() != 1 {
             return Err("saturation charts require one Redpanda reference run".into());
         }
-        records::include_references(
+        records::include_references_with_ozzy_only_rates(
             &automation::cache(),
             &mut data,
             &args.redpanda_reference_run_id,
             &["redpanda"],
             args.fixed_load,
+            &args.ozzy_only_rate,
         )?;
-    }
-    if !args.failed_run_id.is_empty() {
-        records::include_failed_loads(&automation::cache(), &mut data, &args.failed_run_id)?;
-        records::retain_modes(&mut data, &args.modes)?;
     }
     let output = args
         .output_dir

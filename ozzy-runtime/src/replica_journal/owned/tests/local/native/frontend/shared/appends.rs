@@ -1,11 +1,11 @@
 use super::*;
-use crate::replicated::{PartitionTarget, RecordInput, RetryPolicy, Writer, WriterConfig};
+use crate::replicated::{RecordInput, RetryPolicy, Writer, WriterConfig};
 use ozzy_proto::MessageId;
 
 pub(super) fn writer_config(producer: u8, next_sequence: u64) -> WriterConfig {
     WriterConfig {
         policy: Policy::LocalDurable,
-        partition: PartitionTarget::Group(partition()),
+        partition: partition(),
         owner_epoch: 1,
         producer_id: ProducerId::from_bytes([producer; 16]),
         producer_epoch: 1,
@@ -50,7 +50,7 @@ async fn lost_predecessor_remains_retryable_when_later_append_arrives_first() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn credit_refusal_keeps_earlier_confirmation_correlated() {
+async fn admission_refusal_keeps_earlier_confirmation_correlated() {
     tokio::time::timeout(Duration::from_secs(10), refused_successor())
         .await
         .unwrap();
@@ -62,6 +62,9 @@ async fn refused_successor() {
     let routes = links.routes(topic).unwrap();
     let mut config = writer_config(40, 0);
     config.inflight_appends = 2;
+    // Each record fills its batch, so the second APPEND pipelines behind the
+    // first instead of waiting for its confirmation.
+    config.batch_target_bytes = 1;
     let mut writer = Writer::open_shared(&routes, 0, config, retry())
         .await
         .unwrap();
@@ -138,6 +141,9 @@ async fn predecessor() {
     let routes = links.routes(topic).unwrap();
     let mut config = writer_config(40, 0);
     config.inflight_appends = 2;
+    // Each record fills its batch, so the second APPEND pipelines behind the
+    // first instead of waiting for its confirmation.
+    config.batch_target_bytes = 1;
     let mut writer = Writer::open_shared(&routes, 0, config, retry())
         .await
         .unwrap();
@@ -319,12 +325,9 @@ async fn replacement() {
     assert_eq!(receipt.offset, 0);
     assert_eq!(receipt.policy, Policy::LocalDurable);
     assert_eq!(links.session(authority.primary), Some(current));
-    assert_eq!(links.socket_count(), 3);
+    assert_eq!(links.socket_count(), 2);
     assert_eq!(harness.openings.len(), openings);
-    assert!(
-        harness.grant_demands > 0,
-        "fresh session bypassed shard credit demand"
-    );
+
     let attempts = harness
         .appends
         .iter()
@@ -379,7 +382,7 @@ async fn scenario() {
     let mut b = Writer::connect_shared(&routes, 0, writer_config(30, second), retry())
         .await
         .unwrap();
-    assert_eq!(links.socket_count(), 3);
+    assert_eq!(links.socket_count(), 2);
     assert!(
         harness.watch.is_none(),
         "idle writer registered a partition"
@@ -484,7 +487,7 @@ async fn scenario() {
     assert!(a.stats().records > 2);
     assert_eq!(b.stats().records, 2);
     assert_eq!(links.session(authority.primary), Some(session));
-    assert_eq!(links.socket_count(), 3);
+    assert_eq!(links.socket_count(), 2);
     for (producer, sequence, ids, _, frame_session) in &harness.appends {
         assert_eq!(*frame_session, session);
         let (start, base) = if *producer == ProducerId::from_bytes([40; 16]) {

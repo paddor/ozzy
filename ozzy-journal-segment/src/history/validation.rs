@@ -1,10 +1,8 @@
 //! Incremental physical and canonical validation under explicit work budgets.
 
-use super::{HistoryError, JournalGeneration, JournalHistory, LogPosition, OpenGroupJournal};
+use super::{HistoryError, JournalGeneration, LogPosition};
 use crate::codec::SegmentDigestBuilder;
 use crate::{ChainPosition, CodecError, CurrentReference, SEGMENT_HEADER_BYTES, SegmentHeader};
-use std::fs::{self, File};
-use std::io::Read;
 use std::time::{Duration, Instant};
 
 /// Maximum encoded bytes read and cooperative processing time per step.
@@ -13,7 +11,9 @@ use std::time::{Duration, Instant};
 /// limits are checked between those units; they are not hard latency guarantees.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StorageValidationBudget {
+    /// Maximum physical bytes read in this maintenance step.
     pub max_read_bytes: usize,
+    /// Cooperative elapsed-time bound between complete decoding or scan units.
     pub max_work: Duration,
 }
 
@@ -27,18 +27,10 @@ impl Default for StorageValidationBudget {
 }
 
 impl StorageValidationBudget {
+    /// Whether the byte and cooperative time bounds permit a validation step.
     pub const fn is_valid(self) -> bool {
         self.max_read_bytes > 0 && !self.max_work.is_zero()
     }
-}
-
-/// Private captured source and cursor. No vote or repair authority.
-#[derive(Debug)]
-pub struct StorageValidation {
-    history: JournalHistory,
-    current: CurrentReference,
-    next: usize,
-    active: Option<SegmentWork<File>>,
 }
 
 #[derive(Debug)]
@@ -57,9 +49,13 @@ pub(super) struct SegmentWork<F> {
 /// Exact source and work completed by one successful validation step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StorageValidationStep {
+    /// Exact captured manifest-selection reference.
     pub current: CurrentReference,
+    /// Owning journal generation fencing obsolete physical completions.
     pub generation: JournalGeneration,
+    /// Exact inclusive canonical operation prefix captured by this work.
     pub through: LogPosition,
+    /// Physical segment identity.
     pub segment_id: u64,
     /// Encoded segment bytes read this step, excluding authority metadata.
     pub checked_bytes: u64,
@@ -67,126 +63,6 @@ pub struct StorageValidationStep {
     pub segment_complete: bool,
     /// Includes the current segment until its final digest is verified.
     pub remaining_segments: usize,
-}
-
-impl OpenGroupJournal {
-    /// Capture stable storage with one bounded segment arena and metadata list.
-    pub fn begin_storage_validation(
-        &self,
-        max_segment_bytes: usize,
-    ) -> Result<StorageValidation, HistoryError> {
-        self.validate_authority_files()?;
-        Ok(StorageValidation {
-            history: self.freeze_history(max_segment_bytes)?,
-            current: self.directory().current(),
-            next: 0,
-            active: None,
-        })
-    }
-
-    /// Inspect completed buffered writes without claiming crash durability.
-    pub fn begin_written_storage_validation(
-        &self,
-        max_segment_bytes: usize,
-    ) -> Result<StorageValidation, HistoryError> {
-        self.validate_authority_files()?;
-        Ok(StorageValidation {
-            history: self.freeze_written_history(max_segment_bytes)?,
-            current: self.directory().current(),
-            next: 0,
-            active: None,
-        })
-    }
-}
-
-impl StorageValidation {
-    pub const fn generation(&self) -> JournalGeneration {
-        self.history.generation()
-    }
-
-    /// Validate one complete captured segment without yielding within it.
-    pub fn validate_next(&mut self) -> Result<Option<StorageValidationStep>, HistoryError> {
-        self.validate_next_with_budget(StorageValidationBudget {
-            max_read_bytes: usize::MAX,
-            max_work: Duration::MAX,
-        })
-    }
-
-    /// Read at most the byte budget and yield between complete decoding units.
-    ///
-    /// Every successful incomplete step advances either bytes read or validation.
-    /// Errors leave the cycle unusable: callers must fence the source, never skip
-    /// a damaged group. A fresh cycle rereads bytes; cached history cannot satisfy it.
-    pub fn validate_next_with_budget(
-        &mut self,
-        budget: StorageValidationBudget,
-    ) -> Result<Option<StorageValidationStep>, HistoryError> {
-        if !budget.is_valid() {
-            return Err(HistoryError::Capacity);
-        }
-        let started = Instant::now();
-        let Some(reference) = self.history.state.pin.references().get(self.next).copied() else {
-            return Ok(None);
-        };
-        if self.active.is_none() {
-            self.open_segment()?;
-        }
-        let active = self.active.as_mut().unwrap();
-        let read = budget
-            .max_read_bytes
-            .min(active.length - self.history.state.bytes.len());
-        if read > 0 {
-            let start = self.history.state.bytes.len();
-            self.history.state.bytes.resize(start + read, 0);
-            active
-                .file
-                .read_exact(&mut self.history.state.bytes[start..])?;
-        }
-        let complete = active.advance(&self.history.state, self.next, budget, started, read > 0)?;
-        if complete {
-            self.active = None;
-            self.next += 1;
-        }
-        Ok(Some(StorageValidationStep {
-            current: self.current,
-            generation: self.history.generation(),
-            through: self.history.through(),
-            segment_id: reference.segment_id,
-            checked_bytes: read as u64,
-            segment_complete: complete,
-            remaining_segments: self.history.state.pin.references().len() - self.next,
-        }))
-    }
-
-    fn open_segment(&mut self) -> Result<(), HistoryError> {
-        let reference = self.history.state.pin.references()[self.next];
-        let seal = self.history.state.seal(self.next);
-        let length = usize::try_from(seal.valid_bytes).map_err(|_| HistoryError::Capacity)?;
-        if length > self.history.state.bytes.capacity() || length < SEGMENT_HEADER_BYTES {
-            return Err(HistoryError::Source);
-        }
-        let path = self
-            .history
-            .state
-            .pin
-            .segment_path(reference.segment_id)
-            .ok_or(HistoryError::Source)?;
-        if !fs::symlink_metadata(&path)?.file_type().is_file() {
-            return Err(HistoryError::Source);
-        }
-        let file = File::open(path)?;
-        let metadata = file.metadata()?;
-        if !metadata.file_type().is_file()
-            || metadata.len() < seal.valid_bytes
-            || metadata.len() > reference.capacity
-        {
-            return Err(HistoryError::Source);
-        }
-        self.history.state.bytes.clear();
-        self.history.state.loaded = None;
-        self.active = Some(SegmentWork::new(file, length, reference));
-        Ok(())
-    }
 }
 
 impl<F> SegmentWork<F> {

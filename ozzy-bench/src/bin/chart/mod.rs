@@ -1,5 +1,7 @@
 mod coverage;
 mod fixed;
+mod hardware;
+pub(super) mod replacement;
 mod style;
 pub(super) use fixed::render as render_fixed_load;
 
@@ -7,6 +9,7 @@ use ozzy_bench::automation::{Result, finite};
 use plotters::{
     coord::{Shift, types::RangedCoordf64},
     prelude::*,
+    style::text_anchor::{HPos, Pos, VPos},
 };
 use serde_json::Value;
 use std::{collections::BTreeMap, fmt::Write, path::Path};
@@ -52,9 +55,9 @@ impl XAxis {
     }
 }
 const FOOTER_HEIGHT: u32 = 144;
-const LATENCY_MAX_MS: f64 = 300.0;
+const LATENCY_MAX_MS: f64 = 400.0;
 #[derive(Clone, Copy)]
-struct Metric {
+pub(super) struct Metric {
     key: &'static str,
     p50: Option<&'static str>,
     p999: Option<&'static str>,
@@ -98,14 +101,14 @@ const LATENCIES: [Metric; 2] = [
         key: "ack_p99_us",
         p50: Some("ack_p50_us"),
         p999: Some("ack_p999_us"),
-        title: "Writer confirmation (ms, 0-300)",
+        title: "Writer confirmation (ms, 0-400)",
         scale: 0.001,
     },
     Metric {
         key: "delivery_p99_us",
         p50: Some("delivery_p50_us"),
         p999: Some("delivery_p999_us"),
-        title: "Verified reader (ms, 0-300)",
+        title: "Verified reader (ms, 0-400)",
         scale: 0.001,
     },
 ];
@@ -161,11 +164,6 @@ fn percentile_key(area: &DrawingArea<SVGBackend<'_>, Shift>, p999: bool) -> Resu
         },
         &("sans-serif", 10).into_font().color(&TEXT),
         (96, 5),
-    )?;
-    area.draw_text(
-        ">300 ms: triangle",
-        &("sans-serif", 9).into_font().color(&TEXT),
-        (270, 5),
     )?;
     Ok(())
 }
@@ -291,6 +289,7 @@ fn panel(
             series,
         )?;
     }
+    clipped_latency_labels(chart.plotting_area(), rows, &sizes, &[(metric, false)])?;
     Ok(())
 }
 
@@ -340,7 +339,10 @@ fn draw_series(
     for row in ordered {
         if row.get("failure").is_some() {
             // Failed cells create gaps, never invented latency values.
-            lines.push(vec![]);
+            // A separate failed repeat annotates the completed measurement.
+            if row["repeat"] != true {
+                lines.push(vec![]);
+            }
             continue;
         }
         let x = x.1.position(
@@ -372,13 +374,6 @@ fn draw_series(
                     + PathElement::new(vec![(-3, 0), (3, 0)], whisker)),
             )?;
         }
-        if metric.p50.is_some() && upper.unwrap_or(mid) > LATENCY_MAX_MS {
-            area.draw(&TriangleMarker::new(
-                (x, LATENCY_MAX_MS - 1.0),
-                5,
-                color.filled(),
-            ))?;
-        }
     }
     for points in &lines {
         if is_record_rate(metric.key) {
@@ -393,6 +388,109 @@ fn draw_series(
     }
     for point in lines.into_iter().flatten() {
         area.draw(&Circle::new(point, 2, color.filled()))?;
+    }
+    Ok(())
+}
+
+/// Place every clipped percentile beside its own marker. Labels at nearby X
+/// positions take separate rows so they remain readable at the fixed scale.
+pub(super) fn clipped_latency_labels(
+    area: &PlotArea<'_>,
+    rows: &[&Value],
+    values: &[u64],
+    metrics: &[(Metric, bool)],
+) -> Result<()> {
+    let bounds = area.get_pixel_range().0;
+    let axis = if rows
+        .first()
+        .is_some_and(|row| row["case"]["rate"].is_null())
+    {
+        XAxis::Size
+    } else {
+        XAxis::Rate
+    };
+    let mut occupied: Vec<Vec<(i32, i32)>> = Vec::new();
+    for &(metric, reader) in metrics {
+        for series in SERIES {
+            let color = if reader {
+                fixed::reader_color(series.color)
+            } else {
+                series.color
+            };
+            let mut matching: Vec<_> = rows
+                .iter()
+                .copied()
+                .filter(|row| id(row) == series.id && row.get("failure").is_none())
+                .collect();
+            matching.sort_by_key(|row| row["case"][axis.key()].as_u64());
+            for row in matching {
+                let value = row["case"][axis.key()]
+                    .as_u64()
+                    .ok_or("invalid chart x value")?;
+                let x = axis.position(values, value);
+                let (_, p99, _) = measurement_range(row, metric.key, metric.scale)?;
+                let (_, p999) = latency_span(row, metric, p99)?;
+                let median_clipped = p99 > LATENCY_MAX_MS;
+                let upper_clipped = p999.filter(|value| *value > LATENCY_MAX_MS);
+                if !median_clipped && upper_clipped.is_none() {
+                    continue;
+                }
+                let label = match (median_clipped, upper_clipped) {
+                    (true, Some(p999)) => format!("P99 {p99:.0} / P99.9 {p999:.0} ms"),
+                    (true, None) => format!("P99 {p99:.0} ms"),
+                    (false, Some(p999)) => format!("P99.9 {p999:.0} ms"),
+                    (false, None) => unreachable!(),
+                };
+                let point_x = area.map_coordinate(&(x, LATENCY_MAX_MS)).0;
+                let width = i32::try_from(label.len())? * 6 + 8;
+                let left = (point_x - width / 2).clamp(
+                    bounds.start + 2,
+                    (bounds.end - width - 2).max(bounds.start + 2),
+                );
+                let right = left + width;
+                let lane = occupied
+                    .iter()
+                    .position(|intervals| {
+                        intervals
+                            .iter()
+                            .all(|&(start, end)| right + 6 < start || left > end + 6)
+                    })
+                    .unwrap_or_else(|| {
+                        occupied.push(Vec::new());
+                        occupied.len() - 1
+                    });
+                occupied[lane].push((left, right));
+                let marker_offsets: &[i32] = if median_clipped && upper_clipped.is_some() {
+                    &[-5, 5]
+                } else {
+                    &[0]
+                };
+                for &offset in marker_offsets {
+                    area.draw(
+                        &(EmptyElement::at((x, LATENCY_MAX_MS))
+                            + TriangleMarker::new((offset, 7), 5, color.filled())),
+                    )?;
+                }
+                let dx = left - point_x;
+                let dy = 18 + i32::try_from(lane)? * 16;
+                area.draw(
+                    &(EmptyElement::at((x, LATENCY_MAX_MS))
+                        + PathElement::new(
+                            vec![(0, 13), (dx + width / 2, dy)],
+                            color.mix(0.65).stroke_width(1),
+                        )
+                        + Rectangle::new([(dx, dy), (dx + width, dy + 14)], BACKGROUND.filled())
+                        + Text::new(
+                            label,
+                            (dx + 4, dy + 2),
+                            ("sans-serif", 9)
+                                .into_font()
+                                .color(&color)
+                                .pos(Pos::new(HPos::Left, VPos::Top)),
+                        )),
+                )?;
+            }
+        }
     }
     Ok(())
 }
@@ -429,11 +527,14 @@ fn legend(
         area.draw_text(&label, &text, (label_x, y))?;
     }
     if fixed {
-        area.draw_text(
-            "Writer confirmation: full color; verified reader: lighter shade",
-            &dim,
-            (78, 4 + i32::try_from(present.len())? * 16),
-        )?;
+        let mut note = "Writer confirmation: full color; verified reader: lighter shade".to_owned();
+        if let Some(rates) = data["ozzy_only_rates"].as_array() {
+            for rate in rates {
+                let rate = rate.as_u64().ok_or("invalid Ozzy-only rate")?;
+                write!(note, "; {} Ozzy only", XAxis::Rate.label(rate))?;
+            }
+        }
+        area.draw_text(&note, &dim, (78, 4 + i32::try_from(present.len())? * 16))?;
     }
     let mut config = data["compatibility"]["configuration"].clone();
     if let Some(records) = data["batch_records"]["ozzy"].as_u64() {
@@ -442,6 +543,7 @@ fn legend(
     if data["payload_compression"].is_string() {
         config["payload_compression"] = data["payload_compression"].clone();
     }
+    config["observed_batch_payload_cap"] = data["writer_payload_caps"][mode].clone();
     let mut topology = format!(
         "{} partitions",
         config["partitions"]
@@ -523,7 +625,9 @@ fn batch_labels(
             "SDK batches"
         };
         let mut label = format!("Ozzy: per record; {sdk} up to {records} records");
-        if let Some(bytes) = config["native_batch_target_bytes"].as_u64() {
+        if let Some(bytes) = config["observed_batch_payload_cap"].as_u64() {
+            write!(label, "; <= {} KiB payload", bytes / 1024).unwrap();
+        } else if let Some(bytes) = config["native_batch_target_bytes"].as_u64() {
             write!(label, "; {} MiB target", bytes / (1024 * 1024)).unwrap();
         }
         if let Some(requests) = config["writer_inflight_appends"].as_u64() {
@@ -656,7 +760,14 @@ fn render_mode(
     )?;
     root.present()?;
     drop(root);
-    style::finish(&path, height, mode_title(mode), "Saturation", &titles, rows)?;
+    style::finish(
+        &path,
+        height,
+        &format!("{} at saturation", mode_title(mode)),
+        hardware::subtitle(data).as_deref().unwrap_or(""),
+        &titles,
+        rows,
+    )?;
     println!("{}", path.display());
     Ok(())
 }
@@ -703,6 +814,19 @@ mod tests {
     use super::*;
     use serde_json::json;
     #[test]
+    fn worker_payload_cap_replaces_requested_target_in_caption() {
+        let labels = batch_labels(
+            &json!({"request_records":2048,"native_batch_target_bytes":4 * 1024 * 1024,
+                "observed_batch_payload_cap":832 * 1024}),
+            &Value::Null,
+            &SERIES,
+            false,
+        );
+        assert!(labels[0].contains("<= 832 KiB payload"));
+        assert!(!labels[0].contains("4 MiB target"));
+    }
+
+    #[test]
     fn individual_record_lane_does_not_claim_sdk_batching() {
         let labels = batch_labels(
             &json!({"request_records":4096}),
@@ -742,9 +866,9 @@ mod tests {
         let svg =
             std::fs::read_to_string(temp.path().join("cluster/replicated-persisting.svg")).unwrap();
         assert!(!svg.contains("Iggy"));
-        assert!(svg.contains(">Saturation</text>"));
+        assert!(svg.contains("confirmation at saturation</text>"));
         assert_eq!(svg.matches("higher is better").count(), 2);
-        assert_eq!(svg.matches("(ms, 0-300)").count(), 2);
+        assert_eq!(svg.matches("(ms, 0-400)").count(), 2);
         assert!(svg.contains("viewBox=\"0 0 840"));
         assert!(!svg.contains("<svg width="));
         assert!(svg.contains("r=\"2.5\""));
@@ -786,6 +910,17 @@ mod tests {
         assert!(svg.contains("SDK batches up to 8192 records"));
         assert!(svg.contains("Iggy: explicit batches up to 1024 records"));
         assert!(svg.contains("Three brokers: replicated-persisting confirmation"));
+
+        let mut partial = compared.clone();
+        partial["summary"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|row| row["case"]["size"] == 1024);
+        assert!(render(&partial, temp.path(), "").is_err());
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("cluster/replicated-persisting.svg")).unwrap(),
+            svg
+        );
 
         assert!(
             render(&data, temp.path(), "")
@@ -856,6 +991,32 @@ mod tests {
             13
         );
         assert_eq!(svg.matches("P99; P50-P99.9").count(), 1);
+    }
+
+    #[test]
+    fn clipped_latency_labels_leave_boundary_p99_visible() {
+        let rows = [json!({
+            "case":{"impl":"ozzy","codec":"raw","size":8192},
+            "measurements":{
+                "ack_p50_us":{"minimum":100_000,"median":100_000,"maximum":100_000},
+                "ack_p99_us":{"minimum":400_000,"median":400_000,"maximum":400_000},
+                "ack_p999_us":{"minimum":700_000,"median":700_000,"maximum":700_000}
+            }
+        })];
+        let mut svg = String::new();
+        {
+            let area = SVGBackend::with_string(&mut svg, (400, 280)).into_drawing_area();
+            panel(
+                &area,
+                &rows.iter().collect::<Vec<_>>(),
+                LATENCIES[0],
+                0.0..LATENCY_MAX_MS,
+            )
+            .unwrap();
+        }
+        assert!(svg.contains("P99.9 700 ms"));
+        assert!(!svg.contains("P99 400 /"));
+        assert!(!svg.contains("labeled triangle"));
     }
 
     #[test]

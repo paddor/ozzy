@@ -1,4 +1,4 @@
-//! One receipt/credit cursor serves both live sends and retained-history catch-up.
+//! One receipt cursor serves both live sends and retained-history catch-up.
 
 use ozzy_replication::PipelineLimits;
 use ozzy_replication::flow::{Channel, Repair, TransmitError};
@@ -22,7 +22,7 @@ pub(super) struct Blocked {
     required: usize,
 }
 
-impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
+impl ReplicaActor {
     fn replay_plan(&self, voter: usize) -> Option<Plan> {
         self.bindings[voter]?;
         let peer = self.work.flow.peers[voter].as_ref()?;
@@ -36,6 +36,9 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
             return None;
         }
         let repair = peer.repair(false);
+        if self.work.flow.publication_enabled && repair.is_none() && !peer.needs_catch_up() {
+            return None;
+        }
         let (after, mut limits) = if let Some(repair) = repair {
             let limits = sender
                 .outstanding()
@@ -55,6 +58,11 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
         } else {
             (sender.sent(), sender.available())
         };
+        if self.work.flow.publication_enabled && repair.is_none() {
+            limits.max_operations = limits
+                .max_operations
+                .min((peer.catch_up_through()?.0 - after.op.0) as usize);
+        }
         limits.max_operations = limits
             .max_operations
             .min(self.config.transfer.max_operations);

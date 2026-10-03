@@ -1,4 +1,4 @@
-//! Explicit nonvoting startup. Selection is checked before any worker or write.
+//! Explicit nonvoting startup. Whole-selection checks precede any mutation.
 
 use super::{JournalConfig, JournalPlan, PartitionJournal};
 use crate::{ActorSettings, StartupError};
@@ -31,8 +31,11 @@ pub enum RecoveryIntent {
 /// path, identity, or membership from the operator's topic text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoverySelection {
+    /// Configured topic name.
     pub topic: String,
+    /// Zero-based topic partition number.
     pub partition: u32,
+    /// Explicit intact restart or nonvoting repair selection.
     pub intent: RecoveryIntent,
 }
 
@@ -109,26 +112,56 @@ impl JournalPlan {
                     std::io::ErrorKind::InvalidInput.into(),
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// Each shard inspects its selected stores through its existing backend lane.
+    /// Serving waits for every shard before any selected store can be mutated.
+    pub(crate) async fn inspect_recovery_intents(
+        &self,
+        shard: u32,
+        io: ozzy_io::Local,
+    ) -> Result<(), StartupError> {
+        for plan in self
+            .partitions
+            .iter()
+            .filter(|plan| plan.placement.shard == shard)
+        {
+            let JournalConfig::Replicated(config) = &plan.config else {
+                continue;
+            };
+            let Some(&intent) = self.recovery.get(&config.identity.group_id) else {
+                continue;
+            };
+            if intent == RecoveryIntent::Replace {
+                continue;
+            }
             let configuration = config.configuration.encode();
             let inspected = if intent == RecoveryIntent::Quarantine {
-                ozzy_journal_segment::GroupDirectory::open_for_repair(
-                    &config.root,
+                ozzy_journal_segment::AsyncRecoveryDirectory::open_for_repair(
+                    config.root.clone(),
+                    io.clone(),
                     config.identity,
-                    config.limits.metadata,
                     &configuration,
+                    config.limits,
                 )
+                .await
             } else {
-                ozzy_journal_segment::GroupDirectory::inspect_recovering(
-                    &config.root,
+                ozzy_journal_segment::AsyncRecoveryDirectory::open_recovering(
+                    config.root.clone(),
+                    io.clone(),
                     config.identity,
-                    config.limits.metadata,
                     &configuration,
+                    config.limits,
                 )
+                .await
             };
-            inspected.map_err(|source| StartupError::Journal {
+            let error = |source| StartupError::Journal {
                 path: config.root.clone(),
-                source: source.into(),
-            })?;
+                source: ozzy_runtime::replica_journal::JournalError::from(source),
+            };
+            inspected.map_err(error)?.close().await.map_err(error)?;
         }
         Ok(())
     }

@@ -3,14 +3,15 @@
 use bytes::Bytes;
 use ozzy_journal::operation::{CanonicalOperation, Digest, OperationHeader};
 
-use super::{DirectoryError, OpenGroupJournal, PreencodedJournalGroup};
-
 /// An immutable body and its owner-computed digest. The caller must compute the
 /// digest over these exact bytes before handing ownership to the write pipeline.
 #[derive(Debug)]
 pub struct SharedJournalOperation {
+    /// Validated physical segment or canonical operation header.
     pub header: OperationHeader,
+    /// Immutable canonical operation-body backing.
     pub body: Bytes,
+    /// Integrity digest over the exact canonical operation body.
     pub body_digest: Digest,
 }
 
@@ -26,13 +27,4 @@ impl SharedJournalOperation {
             body: &self.body,
         }
     }
-}
-
-pub(super) fn preencode(
-    journal: &mut OpenGroupJournal,
-    operations: Vec<SharedJournalOperation>,
-) -> Result<PreencodedJournalGroup, DirectoryError> {
-    journal
-        .begin_group_encoding()?
-        .encode_shared_raw(operations)
 }

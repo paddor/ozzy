@@ -339,20 +339,7 @@ impl Actor {
             self.dropped_ack = true;
             return;
         }
-        send_control(
-            socket,
-            self.index,
-            self.other(),
-            Control::PrepareOk {
-                ack,
-                grant: Grant {
-                    revision: 1,
-                    record_limit: 1,
-                    byte_limit: 8192,
-                },
-            },
-        )
-        .await;
+        send_control(socket, self.index, self.other(), Control::PrepareOk { ack }).await;
     }
 }
 

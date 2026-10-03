@@ -26,24 +26,34 @@ use std::{
 };
 use tokio::sync::Notify;
 
+/// Fixed admission, handle, media-image, and trace limits for one simulated device.
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
+    /// Device admission shares, identical to production backends.
     pub limits: Limits,
+    /// Maximum open handles, divided across configured shards.
     pub handles: usize,
+    /// Independent bounds on dirty and durable simulated media.
     pub image: ImageLimits,
+    /// Maximum recorded schedule events; overflow refuses further schedule changes.
     pub trace_events: usize,
 }
 
+/// Physical job identity fenced by its simulated process incarnation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct JobId {
+    /// Device boot incarnation; old jobs cannot resolve after restart.
     pub boot: u64,
+    /// Monotonic submission number within this boot.
     pub number: u64,
 }
 
 /// An explicit physical outcome, separate from when its result is delivered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Effect {
+    /// Execute the complete physical operation normally.
     Normal,
+    /// Report failure without applying any physical side effect.
     FailBefore(io::ErrorKind),
     /// Execute normally, then report failure. Side effects are not rolled back.
     FailAfter(io::ErrorKind),
@@ -51,33 +61,51 @@ pub enum Effect {
     Short(usize),
     /// Write a prefix, then report failure. It has no implicit durability.
     WriteThenError {
+        /// Physical prefix length written before reporting failure.
         bytes: usize,
+        /// Reported failure after the physical prefix write.
         error: io::ErrorKind,
     },
 }
 
+/// Whether a job awaits physical execution or only result delivery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
+    /// Accepted operation whose physical effect has not run.
     Queued,
+    /// Physical effect has run; its result remains undelivered.
     Executed,
 }
 
+/// Recorded device schedule and crash events for deterministic replay.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
+    /// Apply one job with an explicit physical effect.
     Execute {
+        /// Accepted job selected for physical execution.
         job: JobId,
+        /// Normal, partial, or failing physical outcome.
         effect: Effect,
     },
+    /// Expose one previously executed result to its observer.
     Deliver(JobId),
+    /// Persist selected dirty bytes without an implied file barrier.
     PersistRange {
+        /// File path whose simulated media is selected.
         path: std::path::PathBuf,
+        /// Byte range selected to reach simulated media.
         range: Range<usize>,
     },
+    /// Persist the current logical file length independently of its bytes.
     PersistLength {
+        /// File path whose simulated media is selected.
         path: std::path::PathBuf,
     },
+    /// Fence new admissions and begin draining accepted physical work.
     Shutdown,
+    /// Drop the process and handles while retaining dirty cached media.
     ProcessCrash,
+    /// Drop the process and restore only durable bytes and namespace.
     PowerLoss,
 }
 
@@ -104,6 +132,7 @@ struct Job {
     reply: Reply,
 }
 
+/// One shard-owned submission lane into the controlled device schedule.
 pub struct Client {
     sender: mpsc::Sender<Job, Coordinated>,
     shared: Arc<Shared>,
@@ -138,6 +167,7 @@ pub struct Controller {
     image: Image,
     config: Config,
     trace: Vec<Event>,
+    reclaim_needed: bool,
 }
 
 impl fmt::Debug for Controller {
@@ -155,6 +185,7 @@ impl fmt::Debug for Controller {
 pub struct Drain(Arc<Shared>);
 
 impl Drain {
+    /// Wait for physical shutdown drain while the harness continues scheduling jobs.
     pub async fn wait(self) {
         loop {
             let notified = self.0.changed.notified();
@@ -175,6 +206,7 @@ impl Drain {
 }
 
 impl Controller {
+    /// Start one device incarnation and return exactly one submission client per shard.
     pub fn new(config: Config, mut image: Image) -> io::Result<(Self, Vec<Client>)> {
         config.limits.validate()?;
         config.image.validate()?;
@@ -234,6 +266,7 @@ impl Controller {
                 image,
                 config,
                 trace: Vec::new(),
+                reclaim_needed: true,
             },
             clients,
         ))
@@ -244,9 +277,15 @@ impl Controller {
             assert!(self.pending.insert(job.id, Pending::Queued(job)).is_none());
         }
         self.files.reclaim();
-        self.image.reclaim(self.files.inodes());
+        // Reads, writes, and idle polls cannot change namespace reachability.
+        // Dropped handles and namespace/barrier jobs can retire inode images.
+        if self.files.take_closed() || self.reclaim_needed {
+            self.image.reclaim(self.files.inodes());
+            self.reclaim_needed = false;
+        }
     }
 
+    /// Collect accepted submissions and list their current execution stages.
     pub fn jobs(&mut self) -> Vec<(JobId, Stage)> {
         self.collect();
         self.pending
@@ -263,6 +302,7 @@ impl Controller {
             .collect()
     }
 
+    /// Borrow a queued operation for schedule decisions; executed jobs return none.
     pub fn operation(&mut self, id: JobId) -> Option<&Operation> {
         self.collect();
         match self.pending.get(&id)? {
@@ -283,6 +323,13 @@ impl Controller {
         let Pending::Queued(job) = self.pending.remove(&id).expect("queued job") else {
             unreachable!()
         };
+        self.reclaim_needed |= matches!(
+            job.operation.unprotected(),
+            Operation::Sync { .. }
+                | Operation::Rename { .. }
+                | Operation::RemoveFile { .. }
+                | Operation::RemoveDirectory { .. }
+        );
         let result = self.files.execute(
             &mut self.image,
             self.config.image,
@@ -306,6 +353,7 @@ impl Controller {
         Ok(())
     }
 
+    /// Deliver one executed result without changing its prior physical side effects.
     pub fn deliver(&mut self, id: JobId) -> io::Result<()> {
         if !matches!(self.pending.get(&id), Some(Pending::Executed { .. })) {
             return Err(io::ErrorKind::InvalidInput.into());
@@ -338,16 +386,20 @@ impl Controller {
         self.image.persist_length(path, self.config.image)
     }
 
+    /// Inspect dirty and durable media independently of actor observations.
     pub fn image(&self) -> &Image {
         &self.image
     }
+    /// Recorded schedule events in application order.
     pub fn trace(&self) -> &[Event] {
         &self.trace
     }
+    /// Production admission counters and wakeups backing these simulated lanes.
     pub fn admission(&self) -> &Admission {
         &self.shared.admission
     }
 
+    /// Fence new submissions and return a drain observer; the harness executes remaining jobs.
     pub fn begin_shutdown(&mut self) -> io::Result<Drain> {
         self.record(Event::Shutdown)?;
         self.stop();

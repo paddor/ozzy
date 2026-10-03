@@ -31,7 +31,7 @@ fn scheduler() -> ProbeScheduler {
 fn lost_probes_retry_one_frozen_small_request_with_a_bounded_backoff() {
     let mut scheduler = scheduler();
     let first = scheduler
-        .poll(scope(), Prefix::GENESIS, OpNumber(0), 1, Duration::ZERO)
+        .poll(scope(), Prefix::GENESIS, OpNumber(0), Duration::ZERO)
         .unwrap()
         .unwrap();
     for (due, next) in [(10, 30), (30, 70), (70, 150), (150, 230), (230, 310)] {
@@ -41,7 +41,6 @@ fn lost_probes_retry_one_frozen_small_request_with_a_bounded_backoff() {
                     scope(),
                     Prefix::GENESIS,
                     OpNumber(0),
-                    1,
                     Duration::from_millis(due - 1)
                 )
                 .unwrap(),
@@ -57,7 +56,6 @@ fn lost_probes_retry_one_frozen_small_request_with_a_bounded_backoff() {
                     scope(),
                     later_tail,
                     later_tail.op,
-                    1,
                     Duration::from_millis(due)
                 )
                 .unwrap(),
@@ -70,7 +68,6 @@ fn lost_probes_retry_one_frozen_small_request_with_a_bounded_backoff() {
                     scope(),
                     later_tail,
                     later_tail.op,
-                    1,
                     Duration::from_millis(next - 1)
                 )
                 .unwrap(),
@@ -83,7 +80,7 @@ fn lost_probes_retry_one_frozen_small_request_with_a_bounded_backoff() {
 fn stale_responses_do_not_postpone_retry_or_complete_a_replacement_probe() {
     let mut scheduler = scheduler();
     let first = scheduler
-        .poll(scope(), Prefix::GENESIS, OpNumber(0), 1, Duration::ZERO)
+        .poll(scope(), Prefix::GENESIS, OpNumber(0), Duration::ZERO)
         .unwrap()
         .unwrap();
     let wrong = RequestId::from_bytes([99; 16]);
@@ -98,7 +95,6 @@ fn stale_responses_do_not_postpone_retry_or_complete_a_replacement_probe() {
                 scope(),
                 Prefix::GENESIS,
                 OpNumber(0),
-                1,
                 Duration::from_millis(10)
             )
             .unwrap(),
@@ -115,7 +111,6 @@ fn stale_responses_do_not_postpone_retry_or_complete_a_replacement_probe() {
                 scope(),
                 Prefix::GENESIS,
                 OpNumber(0),
-                1,
                 Duration::from_millis(20)
             )
             .unwrap(),
@@ -126,7 +121,6 @@ fn stale_responses_do_not_postpone_retry_or_complete_a_replacement_probe() {
             scope(),
             Prefix::GENESIS,
             OpNumber(0),
-            1,
             Duration::from_millis(21),
         )
         .unwrap()
@@ -144,7 +138,7 @@ fn stale_responses_do_not_postpone_retry_or_complete_a_replacement_probe() {
 fn scope_invalidation_discards_old_correlation_without_reusing_ids() {
     let mut scheduler = scheduler();
     let first = scheduler
-        .poll(scope(), Prefix::GENESIS, OpNumber(0), 1, Duration::ZERO)
+        .poll(scope(), Prefix::GENESIS, OpNumber(0), Duration::ZERO)
         .unwrap()
         .unwrap();
     let later = Scope { view: 1, ..scope() };
@@ -153,7 +147,6 @@ fn scope_invalidation_discards_old_correlation_without_reusing_ids() {
             later,
             Prefix::GENESIS,
             OpNumber(0),
-            1,
             Duration::from_millis(10)
         ),
         Err(ProbeError::Scope)
@@ -164,7 +157,6 @@ fn scope_invalidation_discards_old_correlation_without_reusing_ids() {
             later,
             Prefix::GENESIS,
             OpNumber(0),
-            1,
             Duration::from_millis(10),
         )
         .unwrap()
@@ -186,13 +178,12 @@ fn clock_regression_and_overflow_leave_live_request_intact() {
             scope(),
             Prefix::GENESIS,
             OpNumber(0),
-            1,
             Duration::from_millis(10),
         )
         .unwrap()
         .unwrap();
     assert_eq!(
-        scheduler.poll(scope(), Prefix::GENESIS, OpNumber(0), 1, Duration::ZERO),
+        scheduler.poll(scope(), Prefix::GENESIS, OpNumber(0), Duration::ZERO),
         Err(ProbeError::Clock)
     );
     assert_eq!(
@@ -201,7 +192,7 @@ fn clock_regression_and_overflow_leave_live_request_intact() {
     );
     assert_eq!(scheduler.invalidate(Duration::ZERO), Err(ProbeError::Clock));
     assert_eq!(
-        scheduler.poll(scope(), Prefix::GENESIS, OpNumber(0), 1, Duration::MAX),
+        scheduler.poll(scope(), Prefix::GENESIS, OpNumber(0), Duration::MAX),
         Err(ProbeError::TimeExhausted)
     );
     assert_eq!(
@@ -225,7 +216,7 @@ fn exhausted_request_ids_do_not_wrap_or_revive_retired_requests() {
     )
     .unwrap();
     let last = scheduler
-        .poll(scope(), Prefix::GENESIS, OpNumber(0), 1, Duration::ZERO)
+        .poll(scope(), Prefix::GENESIS, OpNumber(0), Duration::ZERO)
         .unwrap()
         .unwrap();
     scheduler
@@ -236,7 +227,6 @@ fn exhausted_request_ids_do_not_wrap_or_revive_retired_requests() {
             scope(),
             Prefix::GENESIS,
             OpNumber(0),
-            1,
             Duration::from_millis(10)
         ),
         Err(ProbeError::IdsExhausted)

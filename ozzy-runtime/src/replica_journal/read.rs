@@ -8,7 +8,7 @@ use ozzy_replication::driver::ValidationTicket;
 use ozzy_replication::{JournalGeneration, Prefix, Scope};
 
 use super::commands::Action;
-use super::{JournalCompletion, Rejected, ReplicaJournal, SubmitError};
+use super::{JournalCompletion, Rejected, ReplicaJournal};
 
 mod buffer;
 pub(crate) mod delivery;
@@ -163,52 +163,28 @@ impl ReadPartition {
     }
 }
 
-impl<E> ReplicaJournal<E> {
-    /// Resolve a starting offset against applied state on the disk executor.
-    /// Retains no subscriber slot or snapshot after the command completes.
+impl ReplicaJournal {
+    /// Resolve a cursor directly against the owner's applied state, without I/O.
+    /// `None` selects the applied end. Returns `Ok(None)` while the owner is busy;
+    /// opening retains no subscriber slot, snapshot, or command completion.
     pub fn open_reader(
-        &mut self,
-        ticket: ValidationTicket,
-        partition: PartitionIncarnation,
-        from: Offset,
-    ) -> Result<JournalCompletion<PartitionReadCursor>, SubmitError> {
-        self.open_reader_from(ticket, partition, Some(from))
-    }
-
-    /// Resolve the applied end as the start: only later records are read.
-    pub(crate) fn open_reader_at_end(
-        &mut self,
-        ticket: ValidationTicket,
-        partition: PartitionIncarnation,
-    ) -> Result<JournalCompletion<PartitionReadCursor>, SubmitError> {
-        self.open_reader_from(ticket, partition, None)
-    }
-
-    fn open_reader_from(
-        &mut self,
+        &self,
         ticket: ValidationTicket,
         partition: PartitionIncarnation,
         from: Option<Offset>,
-    ) -> Result<JournalCompletion<PartitionReadCursor>, SubmitError> {
-        self.submit(
-            (ticket, partition, from),
-            |(ticket, partition, from), done| Action::OpenReader {
-                ticket,
-                partition,
-                from,
-                done,
-            },
-            |action| match action {
-                Action::OpenReader {
-                    ticket,
-                    partition,
-                    from,
-                    ..
-                } => (ticket, partition, from),
-                _ => unreachable!("submission preserves command kind"),
-            },
-        )
-        .map_err(|rejected| rejected.reason)
+    ) -> Result<Option<PartitionReadCursor>, super::JournalError> {
+        if self.execution.is_closed() {
+            return Err(super::JournalError::Stopped);
+        }
+        if self.available_command_slots() == 0 {
+            return Ok(None);
+        }
+        match &self.execution {
+            super::execution::Execution::Normal(owner) => {
+                owner.open_reader(ticket, partition, from).map(Some)
+            }
+            super::execution::Execution::Recovery(_) => Err(PartitionReadError::Unavailable.into()),
+        }
     }
 
     /// Read available confirmed records into an empty worker-owned arena.

@@ -2,10 +2,10 @@
 //!
 //! Same five event kinds, field values, and byte-exact truncation as that
 //! benchmark's `json_payload`. Its generator always starts at event zero; here a
-//! record number selects a disjoint event range, so records never repeat.
-//! Values come from one multiplicative hash per event. No filler text exists,
-//! so payloads compress like the log events they model. No OS randomness or
-//! corpus reuse enters the timed path.
+//! record number selects disjoint ranges within the bounded corpus. Values
+//! come from one multiplicative hash per event, with no filler text. Timed
+//! comparisons copy from lane-local pools larger than an APPEND and the LZ4
+//! history window. Pool reuse does not repeat a body inside either window.
 
 const LEVELS: &[&str] = &["DEBUG", "INFO", "WARN", "ERROR"];
 const SERVICES: &[&str] = &[
@@ -313,15 +313,39 @@ mod tests {
     }
 
     #[test]
-    fn a_batch_of_records_compresses_like_log_events_not_like_filler() {
-        let mut batch = Vec::new();
-        for number in 0..2048 {
-            append_json_record(&mut batch, 1016, number);
+    fn distinct_json_batches_have_bounded_compressibility() {
+        for size in [128_usize, 1024, 8192] {
+            let records = 2048.min(2 * 1024 * 1024 / size);
+            let mut batch = Vec::new();
+            let mut bodies = std::collections::BTreeSet::new();
+            let mut events = std::collections::BTreeSet::new();
+            for number in 0..records as u64 {
+                let mut record = vec![0; 8];
+                append_json_record(&mut record, size - 8, number);
+                assert!(bodies.insert(record.clone()), "repeated record at {size} B");
+                let text = std::str::from_utf8(&record[8..]).unwrap();
+                for event in text.split_inclusive('\n').filter(|e| e.ends_with('\n')) {
+                    assert!(
+                        events.insert(event.to_owned()),
+                        "repeated event at {size} B"
+                    );
+                }
+                batch.extend(record);
+            }
+            let mut compressed = vec![0; lz4rip::get_maximum_output_size(batch.len())];
+            let bytes = lz4rip::block::Compressor::new()
+                .compress_into(&batch, &mut compressed)
+                .unwrap();
+            // Zero clocks make this stricter than measured timestamped records.
+            // Shared keys are useful; a collapse toward filler is not this workload.
+            assert!(
+                bytes * 5 > batch.len(),
+                "over-compressible {size} B: {bytes}"
+            );
+            assert!(
+                bytes * 2 < batch.len(),
+                "lost JSON structure at {size} B: {bytes}"
+            );
         }
-        let mut compressed = vec![0; lz4rip::get_maximum_output_size(batch.len())];
-        let bytes = lz4rip::block::Compressor::new()
-            .compress_into(&batch, &mut compressed)
-            .unwrap();
-        assert!(bytes * 2 < batch.len(), "{bytes}");
     }
 }

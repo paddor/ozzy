@@ -279,6 +279,10 @@ impl Writeback {
 }
 
 impl OwnedJournal {
+    pub(crate) fn writes_settled(&self) -> bool {
+        self.writeback.require_idle().is_ok()
+    }
+
     /// Check exact retained-body capacity before the driver admits a validated
     /// group. Freezing preserves immutable backing through later arena reuse.
     pub fn can_admit(&self, validated: &mut ValidatedAppend) -> bool {

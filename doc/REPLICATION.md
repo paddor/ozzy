@@ -8,11 +8,11 @@ This is a crash-failure protocol, not Byzantine consensus or arbitrary disk
 corruption repair. [Protocol](PROTOCOL.md) owns wire schemas;
 [storage](STORAGE.md) owns durable publication.
 
-The implemented core is fixed at three members. The selected development
-deployment adds an explicit one-broker configuration using the same native
+The implemented core is fixed at three members. The selected single-broker
+deployment uses an explicit one-broker configuration using the same native
 protocol and segment path. Its confirmation is local durability, not a
-three-broker quorum. Bootstrap/runtime integration remains separate from the
-single-broker state machine described below.
+three-broker quorum. Both configurations run through the selected broker
+frontend, partition actors, and asynchronous storage backends.
 
 ## Configuration and authority
 
@@ -59,32 +59,10 @@ not interchangeable generations.
 
 ## Future six-broker groups
 
-Keep a path to six copies of each partition, with two brokers in each of three
-sites. This is one six-member group, not two independent three-member groups.
-It is not implemented and does not change today's three-member voting rules.
-
-[TigerBeetle's flexible quorums](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/internals/vsr.md)
-use three replicas for replication and four for leader change at size six.
-Those sets must overlap because `3 + 4 > 6`. Intersection is a necessary
-condition, not a complete recovery or consensus proof. Do not merely replace
-the current quorum constant. Durable promises, history selection, lost-store
-recovery, and RAM-confirmation restart rules all need qualification.
-
-With two brokers per site, losing one site leaves four. Confirmation must cross
-a site boundary. Geographic distance therefore affects write latency.
-[TigerBeetle recommends nearby sites](https://docs.tigerbeetle.com/operating/cluster/).
-
-Design boundaries to preserve now:
-
-- Membership, site placement, and quorum policy belong to authoritative group
-  configuration. Keep confirmation, election, and recovery thresholds distinct.
-- SDKs route by partition/group and leader. Future discovery uses a bounded
-  member list, not public `follower_1` and `follower_2` fields.
-- Fanout, catch-up, and retained buffers need per-member and aggregate bounds.
-  Additional brokers must not create unbounded queues or per-partition sockets.
-- Keep fixed-three validation in existing codecs until larger groups are
-  implemented. Do not add arbitrary quorum settings or claim online membership
-changes. Single-broker development is explicit, never an automatic fallback.
+Not implemented. Larger groups need authoritative membership plus separately
+qualified confirmation, election, and recovery thresholds. Keep today's fixed
+three-member codecs and two-of-three rules. Single-broker mode stays explicit;
+a failed cluster never becomes a local broker.
 
 ## Single-broker authority
 
@@ -102,14 +80,77 @@ the restart prefix and a fresh journal generation before local admission resumes
 
 ## Normal operation and confirmation
 
-Thread sequence: [RAM confirmation with background persistence](RUNTIME.md#replicated-confirmation-with-background-persistence).
+Both followers receive the same normal PUB traffic. These sequences show the
+leader and one follower: their eligible copies suffice for confirmation. The
+other follower can repair independently. Control and bulk data use separate PEER
+endpoints.
+
+### Disk quorum
+
+```mermaid
+sequenceDiagram
+    participant P as Producer SDK
+    participant L as Leader shard
+    participant LD as Leader storage
+    participant F as Follower shard
+    participant FD as Follower storage
+    P->>L: APPEND (data PEER)
+    L->>L: Validate and freeze canonical operation
+    par Local persistence
+        L->>LD: Append exact prefix (async backend)
+        LD-->>L: Durable completion and prefix evidence
+    and Replication
+        L->>F: PREPARE_PUB (PUB/SUB)
+        F->>F: Validate contiguous operation
+        F->>FD: Append exact prefix (async backend)
+        FD-->>F: Durable completion and prefix evidence
+        F-->>L: PREPARE_OK (control PEER)
+    end
+    L->>L: Commit and apply two durable copies
+    L-->>P: APPENDED exact sequence/offset range (control PEER)
+    L->>F: COMMIT (control PEER)
+```
+
+### Replicated-persisting
+
+```mermaid
+sequenceDiagram
+    participant P as Producer SDK
+    participant L as Leader shard
+    participant LD as Leader storage
+    participant F as Follower shard
+    participant FD as Follower storage
+    P->>L: APPEND (data PEER)
+    L->>L: Validate and retain canonical bytes
+    L->>F: PREPARE_PUB (PUB/SUB)
+    F->>F: Validate and retain contiguous bytes
+    par Quorum confirmation
+        F-->>L: PREPARE_OK (control PEER, retained RAM)
+        L->>L: Commit and apply two retained copies
+        L-->>P: APPENDED exact sequence/offset range (control PEER)
+        L->>F: COMMIT (control PEER)
+    and Leader persistence
+        L->>LD: Bounded buffered write jobs
+        LD-->>L: Matching written completions
+    and Follower persistence
+        F->>FD: Bounded buffered write jobs
+        FD-->>F: Matching written completions
+    end
+    Note over L,F: Full retained backlog pressures further APPENDs
+```
+
+[Runtime](RUNTIME.md#replicated-confirmation-with-background-persistence) owns
+thread and queue placement. The shared operation pipeline is:
 
 1. Validate the request against committed plus pending state. Reserve count,
    byte, and result capacity; assign offsets and freeze canonical bytes.
 2. Register the operation/digest before starting asynchronous work. Leader
    journal append and follower PREPARE transmission may overlap.
 3. Followers validate scope, leader/view, predecessor/digest, schema, application
-   transition, and limits before accepting the complete operation.
+   transition, and limits before accepting the complete operation. For a live
+   PREPARE from the authenticated leader, followers reuse its whole-payload LZ4
+   syntax check. They still hash the received bytes and check APPEND descriptors,
+   decoded lengths, and limits. Recovery reads validate payloads locally.
 4. For disk quorum, a follower votes only after its exact contiguous prefix is
    synchronized. The leader requires its own durable completion and one distinct
    matching follower vote. For replicated-persisting, both must retain
@@ -134,7 +175,26 @@ Local client-success flags are not the distributed proof. Don't add a mandatory
 second sync for every reply merely to persist that flag; reconstruct results
 from the selected canonical history. Exact retained retries return that result.
 
-## Receipt, credit, and repair
+## Receipt and repair
+
+Normal replication stays on PUB/SUB. A gap or quiet tail starts bounded repair:
+
+```mermaid
+sequenceDiagram
+    participant L as Leader shard
+    participant F as Follower shard
+    L--xF: PREPARE_PUB k lost (PUB/SUB)
+    L->>F: PREPARE_PUB k+1 (PUB/SUB)
+    F->>F: Keep contiguous prefix, detect gap
+    Note over L,F: A quiet-tail probe also finds a lost final publication
+    L->>F: REPLICA_OPEN with accepted tail (control PEER)
+    F-->>L: REPLICA_STATE prefix and receive epoch (control PEER)
+    L->>F: PREPARE_FLOW missing range (data PEER)
+    F->>F: Validate, retain and advance contiguous prefix
+    F-->>L: REPLICA_RECEIPT (control PEER, scheduling only)
+    F-->>L: PREPARE_OK when policy evidence is ready (control PEER)
+    Note over L,F: Full repair source pauses, independent control keeps progressing
+```
 
 The journal-backed core also supports votes from retained RAM while buffered
 writes proceed. Its live window is reclaimed after application and completed
@@ -152,8 +212,8 @@ writes without waiting for a full segment.
 
 Ordered completions install written progress, never stable-storage evidence.
 Confirmation and application advance independently. Application and writing
-permit receive credit to return; a full backlog backpressures writers. Shared
-shards additionally reserve aggregate capacity before advertising another grant.
+release local retained capacity; a full backlog backpressures writers.
+All partition allocations share the shard owner budget.
 
 Interrupted writes retry; short writes resume at the unwritten offset. Other
 write, writeback, or sync errors fence the journal, including when idle.
@@ -183,39 +243,30 @@ RAM confirmations and transport probes cannot hide a stalled disk. A stalled
 leader stops heartbeats and requests a leader change; the healthy pair can proceed.
 
 Each receiver owns a fresh nonzero receive epoch. Resetting staged state,
-changing writer/view, or restarting fences old PEER payloads/reports before capacity
-is reused. Socket reconnection alone does not reset durability or grant credit.
-Let S be cumulative unique sends, A cumulative releases after application,
-and C fixed capacity. Background-persisting groups also require completed writes
-before releasing capacity. Automatic per-partition windows use G = A + C.
-Shared-shard receivers start with G = 0 and require explicit reservations.
-Their retained work plus unused grants cannot exceed C. Both operation and byte
-checks must satisfy S + batch <= G. Retransmission retains its original charge;
-receipt alone does not enlarge G. Counters/revisions never wrap.
+changing view, or restarting fences old PEER payloads and reports. Reconnection
+alone preserves retained work. Reports carry the exact retained prefix and
+cumulative canonical bytes, with no operation or byte allowances. Releasing
+applied and physically written bodies changes local capacity only.
 
-A replacement epoch starts from an exact applied base with all retained
-accepted suffix bytes already charged. No within-epoch retraction. Reopening
-requires a correlated probe and verified local history; repeated/stale reports
-cannot multiply credit or erase outstanding charges. Bound both sender metadata
-and receiver storage independently.
-An authenticated notification of another receive epoch advances the next probe
-to the current turn. Duplicate hints do not advance it again. The hint installs
-no credit and preserves any live probe and pending history check.
-Shared-shard receivers discard unused credit on epoch replacement and await new
-reservations. Retained accepted history stays charged. Protocol counters do not
-replace [dispatch and buffer-lifetime accounting](RUNTIME.md).
-Probes carry a separate available-operation hint so zero-credit followers can
-request capacity for unsent work. The outstanding tail still bounds correlated
-repair. Neither field proves confirmation; both stay frozen across probe retries.
-New work after a completed exchange advertises availability immediately instead
-of waiting for the unchanged-status probe delay.
+The receiver bounds queued, validating, and accepted bodies together. The shard
+allocator bounds all partition actors together. The sender separately bounds
+outstanding PEER repair metadata and bytes. Receipt can release sender metadata
+without releasing receiver bodies. Neither event proves confirmation.
 
-Packet limits and total live capacity are separate. Sending a smaller packet
-must not shrink the whole window. A lost packet uses bounded correlated repair;
-send credits advance only when the bounded outgoing slot owns the frame. After
-application, a slow third broker catches up from retained history/journal, not indefinitely pinned
-writer arenas. Missing history or quota exhaustion is explicit, never silent
-truncation of confirmed work.
+Opening a receive epoch requires a correlated probe and independently verified
+base and receipt history. Same-epoch updates cannot retract history or counters.
+Revisions and cumulative counters never wrap. A PUB receipt beyond the PEER
+send ledger also requires exact local-history verification.
+
+Probes capture the leader's accepted tail, including unconfirmed work. This
+repairs a lost final publication when no subsequent write arrives. Retrying a
+probe preserves its correlation and captured tail. Only an answered probe
+starts repair; timers alone never retransmit payloads.
+
+Packet limits and total live capacity are separate. Repair reuses its original
+retry metadata. A slow third broker catches up from the bounded recent cache or
+journal without indefinitely pinning writer arenas. Missing history or capacity
+is explicit, never silent truncation of confirmed work.
 
 `ActorConfig::replay_cache` independently bounds applied packets retained in RAM
 by operation count and body bytes. It covers at least one live window; matching
@@ -229,9 +280,9 @@ checks leader scope, journal generation, and follower cursor before sending.
 Shutdown joins the read; leader changes discard stale replies.
 See the [catch-up data flow](RUNTIME.md#follower-catch-up).
 
-If remaining byte credit cannot fit the next retained operation, the journal
+If local repair capacity cannot fit the next retained operation, the journal
 returns its verified required size without advancing the replay cursor. The
-actor waits for sufficient credit rather than failing the journal or repeatedly
+actor waits for local space rather than failing the journal or repeatedly
 reading the same bytes. That wait is bound to the broker channel, scope, writer
 generation, and exact predecessor; replacement history cannot reuse it.
 
@@ -240,25 +291,44 @@ generation, and exact predecessor; replacement history cannot reuse it.
 Journal-backed actors publish each live group once on a common group topic.
 One SUB per configured remote broker preserves publisher identity. No recipient
 masks or follower credit checks restrict fan-out.
+Continuously ready publishers share receive turns. Cancelling a receive to
+serve control preserves the remaining publishers' readiness.
+Local publication handoff retains one prepared frame per actor until the shared
+dispatcher slot returns. Only PUB socket or receive-queue pressure causes loss.
+Follower and reader PUB sockets have independent local publication slots. Each
+shard reserves both inside its original outgoing data budget.
 
-A follower holds one shared publication when a gap or capacity limit prevents
-admission, then pauses SUB reads. Further messages remain in bounded OMQ queues.
-PEER repairs only through the held publication's predecessor. Controls and
-journal completions continue. The held message consumes
-no admission credit, so its missing predecessors can still arrive. Resume after
-repair/release; ignore duplicates. HWM losses trigger another repair.
+The dispatcher offers PUB frames to the bounded shard follower queue without
+waiting. Up to 128 queue slots absorb short storage-completion bursts within
+the existing retained-byte reservation. Shards drain batches of up to 16 frames
+per data class. A full queue or missing predecessor drops the publication. A busy actor
+holds one contiguous frame in the shard's existing bounded pending slot.
+Probes suppress repair while that frame waits for local capacity. Otherwise,
+the initial probe delay bounds silence before repairing a missing final frame.
+Later PUB frames remain subject to the same contiguous-history checks. A gap
+cannot skip canonical operations or change confirmation evidence.
 
-PEER carries confirmations, elections, status, and bounded repair. A PUB
-receipt beyond PEER reservations needs independent leader-history validation
-before it advances the repair cursor.
+PEER carries confirmations, elections, status, and bounded repair. Repair uses
+one independently identified connection per destination shard at the separately bound
+broker data endpoint. Its alias binds sender, receiver, and destination shard. Every
+repair also carries the current independently established broker session and
+receive epoch. Repair connections never establish or replace control sessions.
 
-Live receipt pauses speculative repair. Known gaps repair immediately; a
-missing final publication repairs after `flow_probe.maximum` without progress.
-Duplicates do not extend the wait. Outstanding PEER chunks also retry only
-after receipts stop advancing. `ozzy-core::live::LiveProgress` owns this rule.
+The dispatcher returns a repair frame to its exact OMQ receive source when the
+shard queue is full. The shard holds at most one dequeued repair when its actor
+needs space. Pressure pauses that source, while control and other shards keep
+progressing. One slow follower cannot gate confirmation by the healthy pair.
+If both followers stall, the leader's unconfirmed window fills and writer intake
+backpressures. Replicated-persisting additionally retains its physical write
+backlog until application and completed writes release it.
 
-New views, generations, and receive resets clear held state. Queued bodies
-still face current authority, chain, and admission checks.
+Live receipt suppresses speculative repair while publications advance. A dropped
+publication supplies a repair bound immediately. After receipt stops advancing,
+correlated probes repair the accepted tail, including an idle final loss.
+Duplicates do not extend the wait. `ozzy-core::live::LiveProgress` owns this rule.
+Blocked PEER repair waits for storage, memory, control, or timer progress. It
+cannot repeatedly wake its shard without changing state.
+Scope, generation, session, and receive-epoch checks fence stale repair work.
 
 ## Leader change
 
@@ -324,6 +394,29 @@ privately validate application history, then atomically publish/synchronize the
 real configuration. Only a live matching recovery core may hand off through
 fenced intact restart. Local marker bytes never authorize voting by themselves.
 
+```mermaid
+sequenceDiagram
+    participant R as Recovering broker (nonvoting)
+    participant P as Current primary
+    participant F as Other normal broker
+    participant D as Recovery storage
+    R->>P: RECOVERY fresh attempt nonce (control PEER)
+    R->>F: RECOVERY same nonce (control PEER)
+    P->>P: Capture and pin full accepted tail
+    P-->>R: RECOVERY_STATE frozen source and tail (control PEER)
+    F-->>R: RECOVERY_STATE current normal authority (control PEER)
+    R->>R: Require both responses and matching highest-view primary
+    loop Bounded chunks from one frozen source
+        R->>P: FETCH_OPS (control PEER)
+        P-->>R: OPS exact canonical range (data PEER)
+        R->>D: Validate and stage replacement
+    end
+    R->>D: Synchronize and privately replay selected history
+    D-->>R: Exact replacement publication evidence
+    R->>R: Enter fenced restart and election
+    Note over R,F: Recovery alone never restores same-view voting
+```
+
 Physical sealed-file repair uses the same fresh two-broker authority and pinned
 donor, but requests only missing canonical ranges. Intact local operations may
 be reused after independent checksum validation; exact original manifest boundary
@@ -359,7 +452,8 @@ subscription confirmed, and repair every gap by replay. See
 [RUNTIME.md](RUNTIME.md#live-reader-publication).
 
 Checkpoint-based transfer, online membership, partition movement, arbitrary
-corruption repair, and public replicated Node-mode integration are separate work.
+corruption repair, and legacy `Node` replicated integration are separate work.
+The selected `Broker` already runs both cluster modes.
 Storage checkpoint primitives and reserved wire opcodes do not
 enable these services. Movement must fence the source before destination
 activation; a directory update alone cannot transfer ownership.

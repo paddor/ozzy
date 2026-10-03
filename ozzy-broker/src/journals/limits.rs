@@ -10,8 +10,7 @@ use ozzy_journal_segment::{
 use ozzy_replication::PipelineLimits;
 use ozzy_runtime::replica_journal::OwnedConfig;
 
-/// Finite journal work bounds. Shared shard admission remains responsible for
-/// aggregate live requests; these limits do not grant any additional credit.
+/// Finite journal work bounds. Shared shard admission bounds aggregate live requests.
 pub(super) struct Settings {
     limits: AsyncJournalLimits,
     recovery: CanonicalRecoveryLimits,
@@ -37,6 +36,8 @@ impl Settings {
             lane,
             direct,
             operations,
+            resident_operations,
+            resident_bytes,
         } = execution(checked, placement)?;
         let data = backend.share(lane, ozzy_io::Class::Data).bytes;
         let progress = backend.share(lane, ozzy_io::Class::Progress).bytes;
@@ -117,12 +118,7 @@ impl Settings {
             limits,
             recovery,
             pipeline,
-            reads: AsyncPartitionReadLimits {
-                index,
-                cached_index_bytes: 0,
-                cached_indexes: 0,
-                concurrent_reads: 2,
-            },
+            reads: reader_limits(index, resident_operations, resident_bytes),
         })
     }
 
@@ -138,7 +134,9 @@ impl Settings {
             configuration,
             limits: self.limits,
             recovery: self.recovery,
-            append_buffers: 128,
+            // Native intake arenas, plus the actor's own receive, transfer,
+            // and bootstrap leases.
+            append_buffers: crate::serving::NATIVE_ARENAS + 32,
             append_limits: self.pipeline,
             writeback: self.pipeline,
             write_group_bytes: self.pipeline.max_body_bytes,
@@ -147,11 +145,34 @@ impl Settings {
     }
 }
 
+// Three in-flight APPENDs can move writeback ahead of PUB. Keep recent
+// written operations in RAM for live reader publication. Share the existing
+// read allowance with compact sealed indexes so repair pages avoid rescans.
+fn reader_limits(
+    index: IndexBuildLimits,
+    max_resident_operations: usize,
+    max_resident_bytes: usize,
+) -> AsyncPartitionReadLimits {
+    let cached_index_bytes = (max_resident_bytes / 2).min(2 * 1024 * 1024);
+    AsyncPartitionReadLimits {
+        index: IndexBuildLimits {
+            max_resident_bytes: max_resident_bytes - cached_index_bytes,
+            ..index
+        },
+        max_resident_operations,
+        cached_index_bytes,
+        cached_indexes: 4,
+        concurrent_reads: 2,
+    }
+}
+
 struct Execution {
     backend: ozzy_io::Limits,
     lane: usize,
     direct: bool,
     operations: usize,
+    resident_operations: usize,
+    resident_bytes: usize,
 }
 
 fn execution(
@@ -195,12 +216,40 @@ fn execution(
     }
     .validate()
     .map_err(|_| error("invalid shared backend budget"))?;
+    let partitions = checked
+        .plan
+        .partitions
+        .iter()
+        .filter(|partition| partition.shard == shard.id)
+        .count()
+        .max(1);
     Ok(Execution {
         backend,
         lane,
         direct: controller.workers.backend == IoBackend::Aio,
         operations: shard.budget.append_slots.min(256),
+        // Bound retained operations by the shard's physical buffer slots,
+        // including when each operation carries only one small record.
+        resident_operations: (shard.budget.append_slots / partitions / 8).clamp(1, 128),
+        // Cached records retain the original charged APPEND arenas. Reserve
+        // room for live proposals and follower replay across all partitions.
+        resident_bytes: reader_budget(
+            native(checked.deployment.deployment().topics[&placement.topic].max_append_bytes)?,
+            native(shard.budget.resident_bytes)?,
+            partitions,
+        ),
     })
+}
+
+fn reader_budget(append: usize, shard_bytes: usize, partitions: usize) -> usize {
+    // Keep two complete APPEND arenas plus selector/growth headroom. Compact
+    // sealed indexes use at most 2 MiB; all partition readers share at most a
+    // third of shard admission. Payload aliases still retain their original charge.
+    let desired = append
+        .saturating_mul(3)
+        .saturating_add(2 * 1024 * 1024)
+        .max(4 * 1024 * 1024);
+    (shard_bytes / partitions / 3).min(desired)
 }
 
 fn check_write(
@@ -229,4 +278,22 @@ fn check_write(
         return Err("APPEND framing and backend staging exceed the device or segment budget");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn large_appends_keep_two_complete_backings_within_shared_read_allowance() {
+        let append = 8 * 1024 * 1024;
+        let share = 512 * 1024 * 1024 / 8 / 3;
+        let limits = reader_limits(
+            IndexBuildLimits::default(),
+            128,
+            reader_budget(append, 512 * 1024 * 1024, 8),
+        );
+        assert!(limits.index.max_resident_bytes >= 2 * append + 512 * 1024);
+        assert!(limits.index.max_resident_bytes + limits.cached_index_bytes <= share);
+    }
 }

@@ -1,6 +1,6 @@
 //! Partition routing on shared physical broker links. No per-partition sockets.
 
-use super::{Authority, Error, Failure, Link, RetryPolicy, Session};
+use super::{Authority, Error, Failure, RetryPolicy, Session, SessionBinding};
 use crate::replicated::{TopicRoutes, broker_links::append};
 use std::sync::atomic::Ordering;
 
@@ -147,15 +147,16 @@ async fn attempt(
             view: route.view,
         };
         opening.confirm(routes, route, &shared.config).await?;
-        let link = Link(connection);
-        Session::new(shared, remote, link.clock())
+        Session::new(shared, remote, connection.clock())
             .run(
                 shared,
-                link,
-                remote,
-                routes.links().local(),
-                Some(authority),
-                retry,
+                SessionBinding {
+                    connection,
+                    remote,
+                    local: routes.links().local(),
+                    authority: Some(authority),
+                    retry,
+                },
             )
             .await
     };

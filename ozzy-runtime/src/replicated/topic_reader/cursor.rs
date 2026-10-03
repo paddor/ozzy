@@ -29,16 +29,11 @@ pub(super) struct Cursor {
     selected: Option<Selected>,
     accepted: Option<Selected>,
     opening: Option<Opening>,
-    returning: Option<Returning>,
     canceling: Option<Returning>,
-    sent_credit: (u64, u64),
     pending: Option<Batch>,
     pending_live: bool,
     held: Option<FrameRecords>,
     ready: Option<Batch>,
-    released: Option<(u64, u64)>,
-    records: u64,
-    bytes: u64,
     refresh: Duration,
     due: Duration,
     decode: bytes::BytesMut,
@@ -58,7 +53,6 @@ impl Cursor {
         from: u64,
         refresh: Duration,
     ) -> Result<Self, BrokerLinkError> {
-        links.reader_window()?;
         let mut prefix = [0; 32];
         prefix[..16].copy_from_slice(partition.group.as_bytes());
         prefix[16..].copy_from_slice(partition.incarnation.as_bytes());
@@ -69,16 +63,11 @@ impl Cursor {
             selected: None,
             accepted: None,
             opening: None,
-            returning: None,
             canceling: None,
-            sent_credit: (0, 0),
             pending: None,
             pending_live: false,
             held: None,
             ready: None,
-            released: None,
-            records: 0,
-            bytes: 0,
             refresh,
             due: Duration::ZERO,
             decode: bytes::BytesMut::new(),
@@ -108,14 +97,13 @@ impl Cursor {
     }
 
     fn waiting_for_input(&self, input: (u64, RouteGeneration), now: Duration) -> bool {
-        // A quiet partition cannot gain records, credit, or a new source
+        // A quiet partition cannot gain records or a new source
         // without input, a pending future, or its existing repair timer.
         // Buffered records and observer futures remain independently runnable.
         self.observed_input == Some(input)
             && self.pending.is_none()
             && self.ready.is_none()
             && self.opening.is_none()
-            && self.returning.is_none()
             && self.canceling.is_none()
             && self.deadline().is_none_or(|deadline| now < deadline)
     }
@@ -174,7 +162,7 @@ impl Cursor {
                 self.due = now;
             }
         }
-        self.poll_returns(links, routes, cx)?;
+        self.poll_returns(routes, cx)?;
         self.poll_opening(links, routes, now, cx)?;
         if accepted.is_some() && self.accepted == accepted {
             self.verified_source = Some(input.1);
@@ -182,7 +170,7 @@ impl Cursor {
         if let Some(record) = self.deliver(links, routes, decoder)? {
             return Poll::Ready(Ok(record));
         }
-        self.release(links, cx)?;
+        self.pending = None;
         if let Some(ready) = self.ready.take() {
             self.pending = Some(ready);
             self.pending_live = true;
@@ -195,18 +183,13 @@ impl Cursor {
                 self.publication(links, &message, now)?;
                 cx.waker().wake_by_ref();
             }
-            if self.pending.is_none() && self.live.replay().is_some() && self.selected.is_some() {
-                match self.inbox.pop() {
-                    Ok(Some(message)) => {
-                        self.replay(links, &message, now, cx)?;
-                        cx.waker().wake_by_ref();
-                    }
-                    Err(_) => {
-                        self.reset();
-                        routes.refresh(self.number)?;
-                    }
-                    Ok(None) => {}
-                }
+            if self.pending.is_none()
+                && self.live.replay().is_some()
+                && self.selected.is_some()
+                && let Some(message) = self.inbox.pop()
+            {
+                self.replay(links, &message, now, cx)?;
+                cx.waker().wake_by_ref();
             }
         }
         self.retire(links);
@@ -230,39 +213,13 @@ impl Cursor {
         Poll::Pending
     }
 
-    fn release(
-        &mut self,
-        links: &BrokerLinks,
-        cx: &mut Context<'_>,
-    ) -> Result<(), BrokerLinkError> {
-        if self.pending.take().is_some()
-            && let Some((records, bytes)) = self.released.take()
-        {
-            self.records = self
-                .records
-                .checked_add(records)
-                .ok_or(BrokerLinkError::Response)?;
-            self.bytes = self
-                .bytes
-                .checked_add(bytes)
-                .ok_or(BrokerLinkError::Response)?;
-            if self.selected.is_some() {
-                self.credit(links)?;
-            }
-            cx.waker().wake_by_ref();
-        }
-        Ok(())
-    }
-
     fn reset(&mut self) {
         self.verified_source = None;
         self.opening = None;
-        self.returning = None;
         self.canceling = None;
         self.pending = None;
         self.held = None;
         self.ready = None;
-        self.released = None;
         self.selected = None;
         self.accepted = None;
         self.inbox.reset_delivery();
@@ -285,7 +242,7 @@ fn retryable(error: &BrokerLinkError) -> bool {
             | BrokerLinkError::Session
             | BrokerLinkError::Rejected {
                 retry: ozzy_proto::nack::RetryClass::AfterAuthorityRefresh
-                    | ozzy_proto::nack::RetryClass::AfterCredit
+                    | ozzy_proto::nack::RetryClass::AfterBackoff
                     | ozzy_proto::nack::RetryClass::UnknownOutcome,
                 ..
             }

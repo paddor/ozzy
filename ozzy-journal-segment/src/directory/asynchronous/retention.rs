@@ -11,7 +11,9 @@ use std::{collections::HashSet, path::PathBuf};
 /// application actors must still budget CPU turns for decoding and hashing.
 #[derive(Debug, Clone, Copy)]
 pub struct RetirementBudget {
+    /// Maximum selected or scanned physical segments.
     pub max_segments: usize,
+    /// Maximum physical bytes read in this maintenance step.
     pub max_read_bytes: usize,
 }
 
@@ -55,6 +57,7 @@ impl SegmentFiles {
         .await
     }
 
+    /// Exact protected segment references in caller selection order.
     pub fn references(&self) -> &[SegmentReference] {
         &self.references
     }

@@ -1,8 +1,8 @@
 # Ozzy protocol
 
 Ozzy commands are ordinary OMQ multipart messages after the ZMTP handshake.
-Routing identity is OMQ metadata, not a Ozzy field. SDK-batched APPENDs, control,
-and confirmations use PEER. SDKs have no PUSH sockets. Live reading retains
+Routing identity is OMQ metadata, not an Ozzy field. SDK-batched APPENDs, control,
+and confirmations use separate data/control PEER sockets. Live reading retains
 broker PUB and SDK SUB sockets, with PEER for subscription, replay, and repair.
 Payload bytes stay opaque.
 Never extend ZMTP for Ozzy features. Transport receipt is not application confirmation.
@@ -14,7 +14,7 @@ partition count does not increase SDK connection count.
 ## Protocol
 
 The native writer frontend implements HELLO/WELCOME, APPEND/APPENDED, and typed
-NACKs for preprovisioned producer sessions on group broker endpoints.
+NACKs on group broker endpoints. OPEN_PRODUCER opens and fences producer sessions.
 `BrokerLinks` shares established broker sessions. `SharedTopicWriter` selects
 partitions, pipelines individual records, follows partition authority, and
 receives per-writer confirmation ranges.
@@ -27,11 +27,12 @@ receipts keep exact offsets independently of later replies or batch boundaries.
 Replica codecs live in `ozzy-replication::wire`. Embedded broker tests use
 the same envelope, handshake, reader codecs, and packed record table. Wire
 version 1 is the only version; there is no compatibility decoder. Readers
-subscribe at an offset and receive confirmed records within explicit credit.
+subscribe at an offset and receive confirmed records through bounded transport.
 Local targeting never fabricates group authority.
 
-Remote producer opening, directory commands, and dynamic broker provisioning
-remain integration work. An allocated opcode does not imply implementation.
+Topic lookup, producer opening, routing interests, and explicit partition recovery
+are implemented. Online topic creation, broker discovery, checkpoint transfer,
+and consumer-group coordination are not. Reserved opcodes imply no service.
 
 ### Selected topic and session contract
 
@@ -69,22 +70,22 @@ the application includes them in its record.
 
 HELLO/WELCOME establishes a broker link, not an exclusive partition attachment.
 Logical writer opening binds a partition, producer identity/epoch, policy, and
-bounded credit within that link. Many writers may target one partition; one link
+bounded local admission within that link. Many writers may target one partition; one link
 may carry multiple topics and partitions. Request correlation is unambiguous
 across the whole link. Confirmation ranges remain scoped to group, partition,
 writer, and current session; a reply for one writer cannot complete another.
 
-Writer credit reserves APPEND slots and byte/record budgets at the destination
-and the dispatcher-to-shard lane. Grants bind the current link/writer
-generation; unused grants remain charged. Queue-slot credit and retained-payload
-credit return at their respective release boundaries, not automatically together
-at confirmation. The exact grant wire schema and remote writer opening remain
-implementation work; local SDK windows alone do not establish broker capacity.
+Writer admission bounds APPEND slots and bytes at the SDK, OMQ, shard data
+queue, and partition actor. Full reliable intake pauses only that physical
+receive source; it emits no credit grant or ordinary queue-pressure refusal.
+Queue slots return on dequeue, while retained bytes return at physical release.
+Local SDK windows do not establish broker capacity. Broker and SDK bounds are
+independent.
 
 The frontend routes using clear metadata. The destination owner validates group
 authority and partition membership before admission; metadata routing is not
 authorization. Wrong-leader replies identify the affected group. No transparent
-broker-to-broker forwarding of SDK APPENDs. Credit and dispatch must preserve
+broker-to-broker forwarding of SDK APPENDs. Backpressure and dispatch must preserve
 [destination isolation](RUNTIME.md#backpressure-isolation).
 
 Wire authority: [native codecs](../ozzy-proto/src/envelope.rs) and fixed-byte tests;
@@ -101,15 +102,14 @@ Full commands use three Ozzy frames after OMQ routing metadata:
 [64-byte envelope] [typed metadata bytes] [packed payload bytes]
 ```
 
-Routine replica receipt/credit updates use one 45-byte `REPLICA_CREDIT` frame:
-`opcode:u8, handle:u32, revision:u64, received_op:u64, received_bytes:u64,
-operation_limit:u64, byte_limit:u64`. The full `REPLICA_STATE` binds the handle
+Routine replica receipt updates use one 29-byte `REPLICA_RECEIPT` frame:
+`opcode:u8, handle:u32, revision:u64, received_op:u64, received_bytes:u64`. The full `REPLICA_STATE` binds the handle
 to its peer session, group, configuration, view, receive epoch and base prefix.
 Handles are nonzero, never reused within a process, and retired with the session.
 Opening and repair responses keep full history hashes and correlation. Compact
 reports never vote or confirm persistence. The leader restores a receipt hash
 only from its own bounded outstanding-operation ledger; unknown history waits
-for a full report. Stale handles cannot acquire new credit. PEER identity routing
+for a full report. Stale handles cannot advance receipt or authorize repair. PEER identity routing
 uses OMQ's checked `IdentitySocket` view and explicit destination identities.
 
 Metadata or payload can be empty but their frames are present. Bound all
@@ -170,14 +170,12 @@ These target properties are required unless stated otherwise:
 | `max-record-bytes` | `u32`, total payload across one record's parts |
 | `max-batch-records` | `u32` |
 | `max-payload-parts` | `u32` |
-| `max-inflight-records` | `u64` |
-| `max-inflight-bytes` | `u64` |
 | `roles` | `u32` bit set: producer, consumer, owner, replica, directory |
 
 Capability IDs initially reserve 1 owner append, 2 confirmed progress, 3
 durable inbox, 4 durable VSR, 6 snapshot transfer, 7 directory state,
-8 groups, 9 replica receipt/credit flow, 10 owner authority routing, 11 reader
-delivery/credit and volatile processing observations, 13 streaming owner
+8 groups, 9 replica receipt flow, 10 owner authority routing, 11 reader
+delivery and volatile processing observations, 13 streaming owner
 append. Capabilities 5, 12, and 14 are unassigned in the selected contract.
 Capability 13 (`OWNER_STREAM`) requires capability 1 and selects record-based
 retry and range confirmation semantics. The configured policy remains explicit.
@@ -186,13 +184,13 @@ ignored; unknown required capabilities fail negotiation.
 
 Receive limits are directional and retain the receiver's advertised values.
 WELCOME must also advertise responder limits, not ambiguously replace both
-directions with one window. Credit starts only after operation-specific open.
+directions with one window. Outstanding-work limits remain owner-local.
 
 Link states are `Disconnected -> Negotiating -> Established -> Closing`.
 Application commands in Negotiating fail with a bounded protocol error.
-On transport/session replacement, invalidate old correlation/credit state,
+On transport/session replacement, invalidate old correlation state,
 repeat HELLO, reinstall desired subscriptions, and exchange durable progress.
-Stable append identities survive; link request IDs and grants do not.
+Stable append identities survive; link request IDs do not.
 
 Writer sessions use an initiator/listener profile. `frontend::LinkSessions`
 supports simultaneous initiation and multiplexed broker/client profiles through
@@ -201,7 +199,7 @@ random; simulations inject distinct startup namespaces. The connection owner
 checks configured identities and roles before negotiation. Negotiation supplies
 link fences, never partition authority or destination credit. Disconnect retains
 bounded peer metadata and rejects a delayed duplicate HELLO from that attempt.
-The adapter must also fence old dispatcher grants and queued replies.
+The adapter must also fence old queued replies.
 
 Metadata starts with the two 16-byte IDs, followed by properties until
 frame end, without an outer property count. Counted major lists use `u32`
@@ -275,12 +273,11 @@ credentials.
 `Authority = (group_id: u128, config_epoch: u64, view: u64)`.
 `Partition = (incarnation: u128)` is the compact immutable handle resolved by
 topic metadata. In the selected model it identifies a shared topic partition,
-not a producer-owned log. Moving a partition preserves incarnation. Current
-creation/state codecs still include producer-local identity and need correction.
+not a producer-owned log. Moving a partition preserves incarnation. Producer
+identity belongs to the producer session and retry key, not partition identity.
 
 `AppendKey = (producer_id: u128, producer_epoch: u64, first_sequence: u64)`.
-`Position = optional<u64>`. `Grant = (revision: u64, record_limit: u64,
-byte_limit: u64)` contains cumulative absolute allowances for this session.
+`Position = optional<u64>`. There is no wire capacity grant.
 `OpPosition = (op: u64, digest: digest)`. Group ops start at 1; op 0 and a
 fixed zero digest denote the configured genesis prefix. Partition offsets
 still start at zero. `Policy: u8` assigns 1 volatile, 2 buffered, 3 local
@@ -325,7 +322,7 @@ exact encoded block.
 | --- | --- |
 | `01..03` | HELLO, WELCOME, ERROR |
 | `10..17` | APPEND, APPENDED, LOOKUP_APPEND, APPEND_STATE, OPEN_PRODUCER, PRODUCER_OPENED, ACK_RESULTS, RESULTS_ACKED |
-| `20..29` | SUBSCRIBE, SUBSCRIBED, RECORDS, ACK, PROGRESS_COMMIT, PROGRESS_COMMITTED, unassigned, UNSUBSCRIBE, UNSUBSCRIBED, CREDIT |
+| `20..28` | SUBSCRIBE, SUBSCRIBED, RECORDS, ACK, PROGRESS_COMMIT, PROGRESS_COMMITTED, unassigned, UNSUBSCRIBE, UNSUBSCRIBED |
 | `30..3f` | REPLICA_OPEN, REPLICA_STATE, PREPARE, PREPARE_OK, COMMIT, START_VIEW_CHANGE, DO_VIEW_CHANGE, START_VIEW, RECOVERY, RECOVERY_STATE, FETCH_OPS, OPS, SNAPSHOT_BEGIN, SNAPSHOT_CHUNK, SNAPSHOT_END, SNAPSHOT_INSTALLED |
 | `40..43` | STATE_SNAPSHOT_REQUEST, STATE_SNAPSHOT, STATE_UPDATE, STATE_RESYNC |
 | `50..53` | EXIT_VIEW, PREPARE_FLOW, PREPARE_PUB, RECORDS_PUB |
@@ -343,7 +340,7 @@ entries `u16`. The correlated response has persistent topic ID `16`, the name,
 hash algorithm `u8=1` (XXH3-64 modulo the fixed partition count in numeric
 order), seed `u64`, total count `u32`, first partition `u32`, confirmation
 policy `u8`, and broker count `u8`. Each broker entry has node ID `16` and
-three `u16`-length UTF-8 endpoints: shared PEER, reader PUB, and optional
+three `u16`-length UTF-8 endpoints: control PEER, reader PUB, and optional
 follower PUB (zero length means absent). A page ends with entry count `u16` and
 contiguous entries of number `u32`, group ID `16`, configuration epoch `u64`,
 incarnation `16`, ordered member count `u8`, and member IDs `16` each.
@@ -351,7 +348,8 @@ incarnation `16`, ordered member count `u8`, and member IDs `16` each.
 The broker shrinks a requested page to fit its control reply and negotiated
 metadata limit. Clients advance by the returned entry count and compare all
 repeated topic fields across pages. The broker never exposes local shard
-placement. Payload frames are empty.
+placement. Payload frames are empty. The data PEER endpoint is configured
+separately in `BrokerLinksConfig`; this page format does not advertise it.
 
 ### Routing interests
 
@@ -436,11 +434,22 @@ APPENDED packet alone establishes no commit, session, or request authority.
 The implemented capability 13 profile reuses APPEND's envelope, metadata, and
 multipart encoding, with one to the negotiated maximum records per request
 (bounded by negotiated request and in-flight limits). The SDK additionally caps
-one APPEND at 2,048 records. Sequence numbers advance
+one APPEND at 2,048 records. Record count and uncompressed payload target are
+independent: collection stops at whichever bound is reached first, also honoring
+negotiated payload, metadata, and part limits. A permitted record larger than the
+collection target goes alone. Ready sparse traffic sends without a collection
+delay when no earlier APPEND is outstanding. Local intake charges both payload
+bytes and multipart length tables, including empty parts. Its byte window covers
+one payload target plus one permitted lookahead record and both part tables.
+Lookahead lets a batch pipeline when the next record would exceed its target;
+APPEND limits still apply independently. Request storage remains reserved
+separately through confirmation and final transport release.
+Sequence numbers advance
 per record. The writer may fill the advertised in-flight record/byte windows
 without waiting for a reply. OMQ batches transport work; the broker groups
-ready records across writers and partitions for replication without waiting
-for a batch to fill. Neither grouping determines retry identity.
+ready records within one partition for replication without waiting for a batch
+to fill. Canonical operations never span partitions. Grouping does not determine
+retry identity.
 
 Group streaming APPENDED has 106 metadata bytes and an empty payload frame:
 
@@ -486,13 +495,20 @@ unverified records elsewhere in the broker's confirmed history.
 
 ### Writer transport
 
-SDK writers send APPENDs over the same PEER connection as HELLO/WELCOME,
-control, NACKs, and APPENDED confirmations. There is no separate data endpoint,
-cookie, or PUSH fallback. Sparse traffic sends single-record APPENDs on this
-same path. Adaptive LZ4 and APPEND metadata are independent of socket type.
+Each SDK owner has two PEER sockets connected to all configured brokers:
+
+| Socket | Messages |
+| --- | --- |
+| Data PEER | APPEND to brokers; RECORDS replay to consumer SDKs |
+| Control PEER | HELLO/WELCOME, topic lookup, producer opening, APPENDED/NACK, subscription control and ACK |
+
+Both sockets use the established broker session and identity routing. Data
+pressure cannot consume control-socket capacity. Sparse traffic sends promptly;
+OMQ supplies per-source pressure and fairness. There are no wire credits or grants.
+Adaptive LZ4 and APPEND metadata are independent of socket type.
 
 Routing identity, sender, session, opcode, and request correlation must match.
-Producer access, destination, policy, record/byte credit, and retry identity
+Producer access, destination, policy, local count/byte bounds, and retry identity
 retain their ordinary APPEND checks. Each request occupies its slot until its
 last record is confirmed. Flush waits for its captured confirmed sequence end;
 socket ordering or transport admission never substitutes for confirmation.
@@ -519,13 +535,12 @@ partial confirmations; its correlation remains live until its last record is
 confirmed. Packet boundaries never determine retry identity.
 
 ### Reader exchange
-Capability 11 implements exact-offset subscriptions, pushed records, cumulative
-credit, cancellation, and volatile receive/processing observations. It does not
+Capability 11 implements exact-offset subscriptions, pushed records, transport backpressure, cancellation, and volatile receive/processing observations. It does not
 advertise durable inbox, durable progress, or consumer groups.
 
 `Subscription = (id:u128, generation:u128)`; both are nonzero. Generation is
 opaque. Every replacement uses a fresh generation. Link session, subscription
-generation, and source fence every delivery, credit grant, and observation.
+generation, and source fence every delivery and observation.
 
 `Target` selects the requested partition:
 
@@ -542,7 +557,6 @@ registered log. Local storage never invents a group or replication evidence.
 | SUBSCRIBE | Subscription, Target, exact start:u64 |
 | SUBSCRIBED | Subscription, Source |
 | RECORDS | Subscription, Source, first offset:u64, payload codec:u8, decoded payload bytes:u32, Records |
-| CREDIT | Subscription, Source, cumulative records:u64, cumulative bytes:u64 |
 | ACK | Subscription, Source, received:optional<u64>, processed:optional<u64> |
 | UNSUBSCRIBE / UNSUBSCRIBED | Subscription, Source |
 
@@ -553,28 +567,28 @@ A reader starting at zero receives an explicit gap if zero has expired.
 
 RECORDS uses APPEND's outer raw/LZ4 payload codec and validated record
 descriptors. A leader forwards a stored producer LZ4 block unchanged, one block
-per RECORDS message, and waits for credit rather than split that batch. It sends
-raw records only when a read starts inside a batch or the negotiated window can
-never hold the whole batch.
+per RECORDS message. It sends raw records when a read starts inside a batch or
+the directional packet limit cannot hold that batch.
 
 Native push deliveries are uncorrelated notifications: no request ID or
 response flag.
 Each message contains whole, nonempty, contiguous records, never beyond applied
 confirmation. The initial seek is indexed; one persistent cursor continues
 through both existing history and new appends. At the end it parks until a
-confirmed append, source change, credit grant, or buffer release wakes it.
-There is no FETCH command, repeated history polling, or replay/live handoff.
+confirmed append, source change, or buffer release wakes it.
+There is no reader FETCH command or repeated history polling. The optional
+PUB/SUB live profile below adds a replay/live handoff to this persistent cursor.
 
-Credit grants are cumulative record and payload-byte totals for one generation.
-The shared broker path echoes accepted CREDIT in a correlated CREDIT response.
-The SDK retries refusals until this response, then stops retrying that grant.
-The response proves only subscription-capacity acceptance. It never confirms
-records, durability, or application processing.
-Only released receiving capacity permits a larger grant. Duplicate/stale grants
-cannot add capacity. Both outstanding records and bytes stay within negotiated
-windows. A record must fit wholly; zero byte credit admits only empty payloads.
-A retained transport clone keeps its output arena unavailable until actual drop.
-This is distinct from reader credit, writer confirmation, and processing ACKs.
+Replay is bounded by broker output arenas, OMQ data-socket capacity, and the SDK's
+local inbox. A full inbox pauses its exact PEER source and retains the original
+message. Capacity resumes after application release. Retained transport clones
+keep their backing charged until final drop. Control has separate socket capacity.
+There are no CREDIT requests or cumulative grants.
+
+A missing or reordered PEER replay frame requires a fresh SUBSCRIBE generation
+from the next undelivered offset. Data routing may become ready after control;
+an offset gap is repairable without coupling the sockets' handshakes. Malformed
+records and expired history remain explicit failures.
 
 ACK positions are inclusive; processed cannot exceed received. Notifications
 have no request ID or response flag. Observation never grants capacity, confirms
@@ -610,11 +624,14 @@ path for history, gap repair, and control.
 | 0 | Topic: group ID (16 bytes), then partition incarnation (16 bytes) |
 | 1 | `RECORDS_PUB` (`0x53`) envelope, no link session or request ID |
 | 2 | Source, first offset:u64, payload codec:u8, decoded payload bytes:u32, record descriptors |
-| 3 | Packed raw payload or one exact producer LZ4 block, shared where possible |
+| 3 | Packed raw payload or one exact producer LZ4 block |
 
 Frames 2 and 3 equal RECORDS without its Subscription. A reader that subscribes
 to the bare group ID receives every partition of that group. Only group sources
-are published; local logs have no live stream.
+are published. The selected single-broker durable mode uses group-bound
+partitions and supports this stream. Legacy tag-0 local sources are not published.
+PUB output copies encoded backing into its own bounded reservation, so a slow
+publication cannot retain a producer request arena.
 
 Publish only confirmed and applied records, in offset order. PUB never waits: a
 slow reader loses messages and never delays writers or other readers. Queue
@@ -628,15 +645,15 @@ of two states:
 
 | State | Delivers | Replay subscription |
 | --- | --- | --- |
-| Replay | SUBSCRIBE at the next offset, under credit | Open |
+| Replay | SUBSCRIBE at the next offset, bounded replay | Open |
 | Live | Publications only | Canceled with UNSUBSCRIBE |
 
 - A publication that starts at or before the next offset ends replay, even if
   all of its records were delivered before: the live stream now covers the
   cursor. Covered records are dropped.
 - A publication that starts later is held, and live reads pause. Replay runs
-  from the next offset with its record credit capped at the held first offset,
-  then the held publication is delivered. Further loss shows as the next gap.
+  from the next offset. Overlapping replay records are merged by offset before
+  the held publication is delivered. Further loss shows as the next gap.
 - After a quiet interval without live progress the reader returns to replay.
   This finds a lost final publication and a changed leader. It stays in replay
   until a publication arrives without a gap.
@@ -656,11 +673,11 @@ Essential remaining metadata:
 | Command | Fields after common replica prefix |
 | --- | --- |
 | REPLICA_OPEN | Outstanding tail `OpPosition`, available operation `u64`; nonzero request ID in envelope |
-| REPLICA_STATE | Receive epoch `u128`, revision `u64`, base/received `OpPosition`, received body bytes `u64`, absolute operation/body limits `u64` each, repair limit `u64` |
+| REPLICA_STATE | Receive epoch `u128`, revision `u64`, base/received `OpPosition`, received body bytes `u64`, repair limit `u64`, compact handle `u32` |
 | PREPARE | First op, predecessor digest, commit position, list of canonical operation descriptors |
 | PREPARE_FLOW | Receive epoch `u128`, then the same fields as PREPARE |
 | OPS | Source descriptor, predecessor op position, list of canonical operation descriptors |
-| PREPARE_OK | Contiguous op position, evidence `u8` (2 durable, 3 retained RAM with background persistence; 1 is unassigned), grant |
+| PREPARE_OK | Contiguous op position, evidence `u8` (2 durable, 3 retained RAM with background persistence; 1 is unassigned) |
 | COMMIT | Committed op position |
 | EXIT_VIEW | View to leave in Authority: the sender's current view, or an older view it left, answering a peer's request; volatile timeout suspicion, no additional fields |
 | START_VIEW_CHANGE | Proposed view in Authority; no additional fields |
@@ -680,7 +697,7 @@ padding, physical group numbers, or consumer subscription envelopes.
 
 PREPARE, PREPARE_OK, COMMIT, EXIT_VIEW, and the three election messages are uncorrelated notifications:
 response flag clear, request ID absent. ACKs are cumulative, not one response
-per prepare. Their payload frame is empty except PREPARE. ACK metadata is 145
+per prepare. Their payload frame is empty except PREPARE. ACK metadata is 121
 bytes; COMMIT is 120. The journal-backed codec checks evidence against the
 immutable group policy; retained RAM evidence cannot count as a disk vote.
 
@@ -698,9 +715,9 @@ journal bodies already depend on `ozzy-proto`; reversing that edge would cycle.
 
 #### Live replica publication
 
-Journal-backed groups can send live operations over PUB/SUB. Each SUB socket is
-bound to an independently configured broker endpoint. PEER retains confirmations,
-flow probes, elections, and targeted repair.
+Journal-backed groups send normal live operations over PUB/SUB. One SUB socket
+connects to each configured remote broker publication endpoint. Control PEER
+carries votes, flow probes and elections; data PEER carries targeted repair.
 
 | Frame | Contents |
 | --- | --- |
@@ -713,50 +730,39 @@ Publish each fresh group once, without recipient masks or follower credit checks
 Check the bound publisher, current leader/view, group, and configuration before
 hashing bodies. Followers admit only a contiguous, capacity-bounded suffix.
 
-On a gap or full admission window, hold one shared publication and pause SUB
-reads. PEER repair and journal work continue. Resume after predecessors or space
-arrive; discard duplicates. Scope/generation changes and receive resets discard
-held state. Same-view queued bodies can be revalidated after a reset; they carry
-no receive-epoch credit or confirmation authority.
+PUB admission is lossy. A full shard queue drops the frame. A busy actor retains
+one contiguous frame in the bounded shard pending slot. Gaps leave
+the contiguous receipt unchanged and are repaired over PEER. A PUB receipt
+beyond PEER reservations requires independent local-history verification before
+advancing its cursor. Publication and volatile receipt never supply a quorum vote.
 
-PEER repair keeps epoch-bound credits. A PUB receipt beyond PEER reservations
-requires independent local-history verification before advancing its cursor.
-Periodic correlated probes detect loss of the final publication too. Neither
-publication nor volatile receipt is a quorum vote.
+Repair uses an independently identified data PEER connection per destination
+shard at the broker data endpoint. Its configured transport alias binds sender, destination, and shard.
+The current broker control session still scopes every packet. An alias cannot
+negotiate or replace that session. Full shard queues pause only the repair source;
+elections and confirmations remain on the independent control connection.
 
-#### Receipt and credit flow
+#### Receipt and repair flow
 
-A held SUB publication bounds PEER repair at its predecessor. While live receipt
-advances, the receiver instead caps repair at its received prefix. After live
-progress stops for the configured quiet interval, tail repair is unrestricted.
-The optional operation-number limit occupies bytes 208..216 of REPLICA_STATE; `u64::MAX`
-means unrestricted. Only a correlated response can set the repair bound.
-It neither grants credit nor confirms history.
+Capability 9 selects the [receipt contract](REPLICATION.md#receipt-and-repair),
+independently of vote evidence. REPLICA_OPEN is a correlated, empty-payload
+request. Its accepted-tail position at byte 80 detects loss even when no later
+publication arrives. The available-operation number at byte 120 is a scheduling
+hint, never confirmation or permission to retain payloads.
 
-Capability 9 selects the [receipt/credit contract](REPLICATION.md#receipt-credit-and-repair), independently
-of durable vote evidence. REPLICA_OPEN is a correlated, empty-payload request;
-its metadata is 128 bytes. The outstanding tail at byte 80 exposes a lost last
-payload even when no later PREPARE arrives. The available-operation number at
-byte 120 includes unsent work awaiting credit. It cannot extend the repair tail
-or prove confirmation. Only an activated normal receiver may advertise credits;
-an opening request cannot bypass VSR recovery.
+REPLICA_STATE has 204 metadata bytes and an empty payload. It echoes the probe's
+request ID with response set, or carries an unsolicited same-epoch receipt with
+both absent. After the common 80-byte prefix: receive epoch at 80, revision at
+96, fixed base at 104, received prefix at 144, cumulative canonical body bytes
+at 184, optional repair ceiling at 192, and compact handle at 200. Epoch,
+revision, and handle are nonzero. `u64::MAX` means no repair ceiling. A ceiling
+can narrow only a correlated repair range. It grants no capacity or history.
+There are no remotely advertised operation or byte allowances.
 
-REPLICA_STATE has 216 metadata bytes and an empty payload. It either echoes a
-probe's nonzero request ID with the response flag set, or is an unsolicited
-same-epoch update with both absent. Fields after the 80-byte common prefix:
-receive epoch at 80, revision at 96, fixed epoch base at 104, received prefix at
-144, cumulative received body bytes at 184, operation limit at 192, byte limit
-at 200. Epoch/revision are nonzero. Counters count unique canonical operations
-and uncompressed canonical body bytes after the fixed base, not records or
-compressed wire bytes. This is not the existing record-based `Grant` type.
-Receipt carries no durability or application evidence.
-
-An epoch change requires a response matching the live probe's scope/request ID,
-authenticated peer/session, and verified local history. Shape decoding alone
-does not authorize it. Same-epoch revisions and exact prefix/byte checks belong
-to the bounded flow ledger. A credit window can exceed one wire payload; codecs
-check structural fields without mistaking frame bounds for negotiated credit
-capacity. The sender applies its independent ledger bounds before admission.
+A new epoch requires the current probe, authenticated broker/session, and
+independently verified local history. Same-epoch revisions and exact prefix/byte
+checks belong to the bounded retry ledger. Local sender and receiver limits
+remain independent. Receipt carries no durability or application evidence.
 
 PREPARE_FLOW uses opcode `0x51`, `180 + 86 * operation_count` metadata bytes,
 and the same canonical payload/descriptors as PREPARE. Its only additional
@@ -767,12 +773,9 @@ A binding without an epoch rejects PREPARE_FLOW. Epochs are not learned from
 incoming payload fields. COMMIT, PREPARE_OK, and installation transfer retain
 their own unchanged authority checks and layouts.
 
-The distinct opcode avoids silently extending the existing PREPARE layout.
-Credit-aware actors must require the complete flow family; no silent fallback
-to unlimited-grant legacy sends. The trusted-static actor uses finite credits
-from REPLICA_STATE and leaves the legacy PREPARE_OK record grants at zero.
-Negotiated capability/session support remains a
-separate integration gate; merely recognizing these opcodes does not supply it.
+Normal repair requires the complete receipt family and the locally issued
+receive epoch. Confirmations contain only policy-specific vote evidence.
+Control/session negotiation remains independently validated.
 
 Election metadata is fixed-size: START_VIEW_CHANGE 80 bytes, DO_VIEW_CHANGE
 184, START_VIEW 176. These schemas require complete retained WAL history; they
@@ -841,37 +844,20 @@ recapture a moving accepted tail to answer a retry or wait for all later writes
 to become quiescent. Fetch its history through the source-bound OPS protocol.
 
 Complete canonical validation, crash-safe replacement publication, and fenced
-election handoff are separate gates. Codec support alone advertises no recovery
-capability; the runtime must not respond until those adapters exist.
+election handoff are separate gates. The selected broker wires these gates into
+explicit partition recovery. Codec support alone grants no voting authority.
 
-`TransferDescriptor = (transfer_id:u128, base:OpPosition, end:OpPosition,
-bytes:u64, digest, chunk_bytes:u32)`. Checkpoint descriptors add immutable
-manifest ID and retained-range metadata digest. Missing chunks cannot be
-interpreted as an empty suffix. Normal acceptance waits for a complete
-validated view installation.
-
-Snapshot commands share replica prefix and transfer ID. BEGIN carries the
-descriptor and required disk bytes. CHUNK carries file ID `u64`, byte offset
-`u64`, uncompressed length `u32`, codec `u8`, and digest; bytes are payload.
-END carries manifest digest. INSTALLED carries installed checkpoint/op and
-generation. Canonical manifest encodes file IDs, sizes/digests, group/config,
-checkpoint, and retained partition ranges; receivers generate local paths.
-
-Use no compression initially (`codec = 0`). Future compression must bound
-uncompressed bytes before decoding and verify canonical digests afterward.
-Logical op hashes do not depend on a negotiated transport compression choice.
+Checkpoint/snapshot-transfer opcodes are reserved. Full-history FETCH_OPS/OPS
+recovery above is implemented; checkpoint manifests and chunk transfer are not.
 
 ### Directory exchange and errors
 
-Directory messages carry directory incarnation, request/snapshot ID, and
-revision. Snapshot request includes an optional cached revision; snapshot
-response uses the bounded transfer descriptor. Update includes previous and
-new revision plus counted typed map changes. Resync supplies the current
-incarnation/revision. Exact directory value schemas are frozen with its
-implementation, under the directory capability; no opaque JSON assumption.
+The bounded topic lookup profile is implemented. General directory revision
+exchange and online membership updates remain reserved; no opaque JSON schema
+or dynamic discovery is implied.
 
 ERROR/NACK metadata is `(code:u16, retry_class:u8, detail:blob, diagnostic:text)`.
-Retry classes: permanent, after-credit, after-reconnect, after-authority-refresh,
+Retry classes: permanent, after-backoff, after-reconnect, after-authority-refresh,
 unknown-outcome. Codes distinguish malformed encoding, unsupported capability,
 identity rejection, stale session, stale view/owner/producer epoch, sequence
 gap/conflict, retention gap, result expired, quota exhaustion, storage failure,
@@ -892,7 +878,7 @@ initial codes, extended by reader commands, with empty diagnostics:
 | 7 | Sequence gap | permanent |
 | 8 | Retry identity conflicts with retained records | permanent |
 | 9 | Retry history expired | permanent |
-| 10 | Capacity unavailable or earlier writer sequences missing | after-credit |
+| 10 | Capacity unavailable or earlier writer sequences missing | after-backoff |
 | 11 | Storage/validation uncertainty | unknown-outcome |
 | 12 | Writer not admitted by current primary, or reader broker unavailable | after-authority-refresh |
 | 13 | Authority changed after admission | unknown-outcome |
@@ -932,9 +918,11 @@ committed operation.
 
 ### Limits and compatibility gate
 
-Starting data limits are 64 KiB metadata, 16 MiB packet payload, 1 MiB per record,
-1,000 records per batch,
-and 64 KiB bulk-transfer chunks. They are configuration candidates to measure.
+`DataLimits::default()` permits 64 KiB metadata, 16 MiB packet payload,
+1 MiB per record, 1,000 records per APPEND, and 4,000 parts. Limits are
+configurable and negotiated. The SDK also caps APPENDs at 2,048 records; the
+smaller negotiated ceiling wins. `SharedTopicWriterConfig::new` starts with a
+64 KiB payload target and one outstanding APPEND, independently of wire maxima.
 The admitted record/operation size must fit every required replica's negotiated
 limits including descriptors; minimum-limit membership cannot be bypassed by
 fragmenting an atomic application operation invisibly.

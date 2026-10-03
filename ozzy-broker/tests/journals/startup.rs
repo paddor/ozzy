@@ -29,9 +29,9 @@ async fn native_journals_format_and_recover_on_symmetric_shards_with_shared_devi
                                 let io = context.io.clone();
                                 starting.push(async move {
                                     if format {
-                                        plan.format(io, JournalGeneration(1)).await
+                                        Box::pin(plan.format(io, JournalGeneration(1))).await
                                     } else {
-                                        plan.open(io, JournalGeneration(2)).await
+                                        Box::pin(plan.open(io, JournalGeneration(2))).await
                                     }
                                 });
                             }

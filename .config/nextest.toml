@@ -1,8 +1,16 @@
 [test-groups.broker-lifecycle]
 # Each case starts several real brokers, SDK runtimes, and shared disk pools.
-# Keep lifecycle qualification isolated from other broker lifecycle cases.
+# Keep lifecycle qualification isolated from other CPU-heavy test work.
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'package(ozzy-broker) & (test(journals::serving::) | test(process::))'
+filter = 'package(ozzy-broker) & (test(journals::serving::) | test(journals::actors::frontend::) | test(process::))'
 test-group = 'broker-lifecycle'
+threads-required = 8
+
+[[profile.default.overrides]]
+# Timed cases launch whole broker/writer/reader cohorts. Concurrent cohorts
+# compete for the same CPUs and invalidate their wall-clock deadlines.
+filter = 'package(ozzy-bench) & (binary(ozzy_timed) | binary(ozzy_native))'
+test-group = 'broker-lifecycle'
+threads-required = 8

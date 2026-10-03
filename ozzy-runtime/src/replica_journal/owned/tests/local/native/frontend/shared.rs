@@ -6,12 +6,7 @@ use crate::{
     },
 };
 use ozzy_proto::{TopicId, directory};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    future::Future,
-    pin::pin,
-    task::Poll,
-};
+use std::{collections::BTreeSet, future::Future, pin::pin, task::Poll};
 
 mod appends;
 mod multiple;
@@ -26,9 +21,10 @@ const SETTLE: Duration = Duration::from_secs(8);
 
 #[derive(Default)]
 struct ReaderTraffic {
-    /// Answer this many SUBSCRIBE requests with a retryable credit refusal.
+    /// Answer this many SUBSCRIBE requests with a retryable admission refusal.
     refuse_subscribes: usize,
     hold_records: bool,
+    unroutable_records: usize,
     records: std::collections::VecDeque<Message>,
     drop_subscribed: bool,
     requests: Vec<(Opcode, ozzy_proto::reader::Subscription)>,
@@ -39,10 +35,11 @@ struct ReaderTraffic {
 struct Harness {
     local: NodeId,
     service: Service,
-    input: dispatch::Receiver<Message>,
-    waiting: Option<dispatch::Received<Message>>,
-    client: Option<(Client, LinkSessionId)>,
+    input: TestInput,
+    waiting: Option<DataInput>,
+    session: Option<LinkSessionId>,
     server: Socket,
+    data_server: Socket,
     publisher: Socket,
     wire: DataLimits,
     readers: ReaderTraffic,
@@ -54,10 +51,6 @@ struct Harness {
     group: GroupId,
     groups: Vec<GroupId>,
     held_io: BTreeSet<ozzy_io::simulation::JobId>,
-    control_credit: Option<dispatch::GrantKey>,
-    data_credit: BTreeMap<(GroupId, ProducerId), dispatch::GrantKey>,
-    requests: crate::frontend::GrantRequests,
-    grant_demands: usize,
     watch: Option<RequestId>,
     drop_snapshots: bool,
     snapshots: usize,
@@ -80,41 +73,13 @@ struct Harness {
 }
 
 impl Harness {
-    fn grant_ready(&mut self) {
-        for _ in 0..2 * self.groups.len() {
-            let Some(request) = self.requests.next_request() else {
-                break;
-            };
-            assert_eq!(request.route.class, Class::Data);
-            assert_eq!(
-                self.service
-                    .links()
-                    .get(request.binding.peer)
-                    .unwrap()
-                    .binding,
-                request.binding,
-            );
-            multiple::grant_writer(
-                &mut self.input,
-                &self.client.as_ref().unwrap().0,
-                &mut self.service,
-                &mut self.data_credit,
-                request.route.placement.group,
-                request.route.writer.unwrap(),
-            );
-            self.requests.dismiss(request);
-            self.grant_demands += 1;
-        }
-    }
-
     fn dispatch_ready(&mut self) {
         while let Some(received) = self
             .waiting
             .take()
             .or_else(|| self.input.try_recv().unwrap())
         {
-            let bytes = received.retention.bytes();
-            let decoded = packet(&received.value);
+            let decoded = packet(&received.message);
             let group = match decoded.envelope.opcode {
                 Opcode::OpenProducer => {
                     producer::decode_open(decoded, limits().envelope)
@@ -128,7 +93,7 @@ impl Harness {
                         .authority
                         .group_id
                 }
-                Opcode::Subscribe | Opcode::Credit | Opcode::Ack | Opcode::Unsubscribe => {
+                Opcode::Subscribe | Opcode::Ack | Opcode::Unsubscribe => {
                     let ozzy_proto::reader::Source::Group { authority, .. } =
                         ozzy_proto::reader::route(decoded, self.wire.envelope).unwrap()
                     else {
@@ -143,10 +108,10 @@ impl Harness {
                     // The production shard answers this way until its
                     // partition finished local initialization.
                     self.actors
-                        .defer_client(group, &received.value, Duration::ZERO)
+                        .defer_client(group, &received.message, Duration::ZERO)
                 } else {
                     self.actors
-                        .receive_client(group, &received.value, Duration::ZERO)
+                        .receive_client(group, &received.message, Duration::ZERO)
                 };
             match delivered.unwrap() {
                 NativeReceive::Busy => {
@@ -155,29 +120,12 @@ impl Harness {
                 }
                 result => assert_eq!(result, NativeReceive::Accepted),
             }
-            let key = if received.class == Class::Control {
-                self.control_credit.as_ref().unwrap()
-            } else {
-                let writer = append::route(decoded, limits().envelope)
-                    .unwrap()
-                    .key
-                    .producer_id;
-                self.data_credit.get(&(group, writer)).unwrap()
-            }
-            .clone();
-            // Native preparation copies into its independently reserved arena.
-            // Return this queue/frame credit after the source frame is released.
             drop(received);
-            self.input
-                .credits()
-                .extend(&key, Quota { messages: 1, bytes })
-                .unwrap();
         }
     }
 
     fn pump(&mut self, settle: bool) {
         self.receive_ready();
-        self.grant_ready();
         self.dispatch_ready();
         let _ = self.actors.poll_progress(
             &mut Context::from_waker(Waker::noop()),
@@ -209,21 +157,10 @@ impl Harness {
                             return Err(TrySendError::Full(message));
                         }
                     }
-                    if nack.code == 10 && nack.retry == ozzy_proto::nack::RetryClass::AfterCredit {
+                    if nack.code == 10 && nack.retry == ozzy_proto::nack::RetryClass::AfterBackoff {
                         self.capacity_replies
                             .insert(decoded.envelope.request_id.unwrap());
                     }
-                }
-                if decoded.envelope.opcode == Opcode::ProducerOpened {
-                    let opened = producer::decode_opened(decoded, limits().envelope).unwrap();
-                    multiple::grant_writer(
-                        &mut self.input,
-                        &self.client.as_ref().unwrap().0,
-                        &mut self.service,
-                        &mut self.data_credit,
-                        opened.authority.group_id,
-                        opened.producer,
-                    );
                 }
                 self.service
                     .try_reply(
@@ -259,6 +196,11 @@ impl Harness {
                 let decoded = packet(&message);
                 if decoded.envelope.opcode == Opcode::Subscribed && self.readers.drop_subscribed {
                     return Ok(());
+                }
+                if decoded.envelope.opcode == Opcode::Records && self.readers.unroutable_records > 0
+                {
+                    self.readers.unroutable_records -= 1;
+                    return Err(TrySendError::Error(omq_tokio::Error::Unroutable));
                 }
                 if decoded.envelope.opcode == Opcode::Records && self.readers.hold_records {
                     assert!(self.readers.records.len() < 16);
@@ -309,7 +251,12 @@ impl Harness {
                         return Ok(());
                     }
                 }
-                self.server.try_send(message)
+                (if decoded.envelope.opcode == Opcode::Records {
+                    &self.data_server
+                } else {
+                    &self.server
+                })
+                .try_send(message)
             })
             .unwrap();
     }
@@ -325,7 +272,7 @@ impl Harness {
             },
             ozzy_proto::nack::Nack {
                 code: 10,
-                retry: ozzy_proto::nack::RetryClass::AfterCredit,
+                retry: ozzy_proto::nack::RetryClass::AfterBackoff,
                 detail: &[],
                 diagnostic: "",
             },
@@ -343,9 +290,17 @@ impl Harness {
             .unwrap();
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "fixture decodes and replies to each native command in one turn"
+    )]
     fn receive_ready(&mut self) {
         for _ in 0..16 {
-            let message = match self.server.try_recv() {
+            let message = match self
+                .server
+                .try_recv()
+                .or_else(|_| self.data_server.try_recv())
+            {
                 Ok(message) => message,
                 Err(omq_tokio::Error::WouldBlock) => break,
                 Err(error) => panic!("broker receive: {error:?}"),
@@ -427,17 +382,21 @@ impl Harness {
             }
             if let Err(error) = self.service.receive(message, 4096) {
                 assert!(
-                    matches!(error, ReceiveError::Dispatch(Rejection::NoGrant))
-                        || (stale_session
-                            && matches!(error, ReceiveError::Watch(WatchError::Session))),
+                    matches!(
+                        error,
+                        ReceiveError::Dispatch(Rejection::Data(
+                            crate::frontend::DataPressure::Full { .. }
+                        ))
+                    ) || (stale_session
+                        && matches!(error, ReceiveError::Watch(WatchError::Session))),
                     "unexpected frontend refusal: {error:?}"
                 );
             }
             if let Some(link) = self.service.links().get(link(70, 80).binding.peer)
                 && self
-                    .client
+                    .session
                     .as_ref()
-                    .is_none_or(|(_, session)| *session != link.binding.session)
+                    .is_none_or(|session| *session != link.binding.session)
             {
                 self.install_client(link);
             }
@@ -445,29 +404,7 @@ impl Harness {
     }
 
     fn install_client(&mut self, link: Link) {
-        let client = self
-            .input
-            .credits()
-            .client(link.binding.session, multiple::budgets(self.groups.len()))
-            .unwrap();
-        let grant = self
-            .input
-            .credits()
-            .grant(
-                &client,
-                Class::Control,
-                Quota {
-                    messages: 4,
-                    bytes: 16 * 1024,
-                },
-            )
-            .unwrap();
-        self.control_credit = Some(grant.key());
-        self.service
-            .install(link.binding.peer, GrantTarget::Control(7), grant)
-            .unwrap();
-        self.data_credit.clear();
-        self.client = Some((client, link.binding.session));
+        self.session = Some(link.binding.session);
     }
 
     async fn shutdown(mut self) {
@@ -493,6 +430,7 @@ impl Harness {
             tokio::task::yield_now().await;
         }
         self.server.close().await.unwrap();
+        self.data_server.close().await.unwrap();
         self.publisher.close().await.unwrap();
     }
 
@@ -506,7 +444,8 @@ impl Harness {
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "shared broker control did not settle"
+                "shared broker control did not settle: {}",
+                std::any::type_name::<F>()
             );
             tokio::task::yield_now().await;
         }
@@ -672,8 +611,16 @@ async fn setup_shared_profile(
     let authority = partitions[0].authority_hint();
     let group = groups[0];
     let (mut service, input) = multiple::service(authority.primary, &groups, &data, &control, wire);
-    let requests = service.grant_requests(7, 2 * count).unwrap();
     let server = runtime.context().socket(
+        SocketType::Peer,
+        Options::default()
+            .identity(Bytes::copy_from_slice(authority.primary.as_bytes()))
+            .router_mandatory(true)
+            .send_hwm(16)
+            .recv_hwm(16)
+            .max_message_size(8192),
+    );
+    let data_server = runtime.context().socket(
         SocketType::Peer,
         Options::default()
             .identity(Bytes::copy_from_slice(authority.primary.as_bytes()))
@@ -685,6 +632,14 @@ async fn setup_shared_profile(
     let endpoint = server
         .bind(
             format!("inproc://shared-native-{}", RequestId::new())
+                .parse()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let data_endpoint = data_server
+        .bind(
+            format!("inproc://shared-native-data-{}", RequestId::new())
                 .parse()
                 .unwrap(),
         )
@@ -734,10 +689,17 @@ async fn setup_shared_profile(
     let mut addresses = vec![BrokerAddress {
         node: authority.primary,
         endpoint,
+        data_endpoint,
     }];
     for index in 0..2 {
         addresses.push(BrokerAddress {
             node: NodeId::from_bytes([index as u8 + 2; 16]),
+            data_endpoint: format!(
+                "inproc://shared-unavailable-data-{}-{index}",
+                RequestId::new()
+            )
+            .parse()
+            .unwrap(),
             endpoint: format!("inproc://shared-unavailable-{}-{index}", RequestId::new())
                 .parse()
                 .unwrap(),
@@ -745,15 +707,25 @@ async fn setup_shared_profile(
     }
     let clock = SdkClock::manual();
     let mut options = config(link(70, 80).binding.peer, addresses, clock.clone());
-    options.append.as_mut().unwrap().bytes *= count;
-    if let Some((records, bytes, subscriptions)) = reader_window {
-        options.parameters = handshake::Parameters::streaming(
-            wire,
-            handshake::PRODUCER | handshake::CONSUMER,
-            records,
-            bytes,
-        )
+    // Four logical owners must fit even when each allows two caller handles.
+    // Test the owner bound, independently of the queue representation's size.
+    let writer = crate::replicated::SharedTopicWriterConfig {
+        limits: limits(),
+        compress_payloads: true,
+        batch_target_bytes: 1024,
+        max_producers: 2,
+        inflight_appends: 1,
+    };
+    let reservation = writer
+        .link_reservation(options.parameters.receive.envelope.max_metadata_bytes)
         .unwrap();
+    let append = options.append.as_mut().unwrap();
+    append.bytes =
+        append.writers * reservation.idle_bytes + (append.requests + 1) * reservation.request_bytes;
+    if let Some((_records, _bytes, subscriptions)) = reader_window {
+        options.parameters =
+            handshake::Parameters::streaming(wire, handshake::PRODUCER | handshake::CONSUMER)
+                .unwrap();
         options.parameters.capabilities |= handshake::OWNER_ROUTING | handshake::OWNER_READ;
         options.reader = Some(crate::replicated::ReaderLinkLimits {
             subscriptions,
@@ -771,15 +743,16 @@ async fn setup_shared_profile(
     .unwrap();
     assert_eq!(
         links.socket_count(),
-        if reader_window.is_some() { 6 } else { 3 }
+        if reader_window.is_some() { 5 } else { 2 }
     );
     let harness = Harness {
         local: authority.primary,
         service,
         input,
         waiting: None,
-        client: None,
+        session: None,
         server,
+        data_server,
         publisher,
         wire,
         readers: ReaderTraffic::default(),
@@ -791,10 +764,6 @@ async fn setup_shared_profile(
         group,
         groups,
         held_io: BTreeSet::new(),
-        control_credit: None,
-        data_credit: BTreeMap::new(),
-        requests,
-        grant_demands: 0,
         watch: None,
         drop_snapshots: false,
         snapshots: 0,
@@ -895,7 +864,7 @@ async fn scenario() {
         .await;
     assert_eq!((fenced.unwrap().epoch, unchanged.unwrap().epoch), (2, 1));
     assert_eq!(links.session(authority.primary), Some(session));
-    assert_eq!(links.socket_count(), 3);
+    assert_eq!(links.socket_count(), 2);
     // Admission and negotiation deadlines use the same injected clock.
     let mut missing = pin!(links.open_producer(
         NodeId::from_bytes([2; 16]),

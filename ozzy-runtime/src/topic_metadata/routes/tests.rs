@@ -34,6 +34,61 @@ fn cache() -> RouteCache {
 }
 
 #[test]
+fn physical_session_filter_fences_hints_before_owner_cleanup_and_preserves_replacement() {
+    let mut cache = cache();
+    let group = route(0, None).group;
+    for (broker, epoch, view) in [(1, 4, 99), (2, 5, 7)] {
+        cache.bind(peer(broker), session(epoch)).unwrap();
+        cache
+            .register(peer(broker), session(epoch), watch(broker), &[group])
+            .unwrap();
+        cache
+            .snapshot(
+                peer(broker),
+                session(epoch),
+                Snapshot {
+                    watch: watch(broker),
+                    routes: vec![route(view, Some(peer(broker)))],
+                },
+            )
+            .unwrap();
+    }
+    let current = |broker, epoch| broker == peer(2) && epoch == session(5);
+    assert_eq!(
+        cache.route_matching(group, current).unwrap().unwrap().view,
+        7
+    );
+    // Session publication precedes owner cleanup. Filtering must not edit cache.
+    assert_eq!(cache.route(group).unwrap().unwrap().view, 99);
+    let replaced = |broker, epoch| {
+        broker == peer(1) && epoch == session(6) || broker == peer(2) && epoch == session(5)
+    };
+    assert_eq!(
+        cache.route_matching(group, replaced).unwrap().unwrap().view,
+        7
+    );
+    cache.bind(peer(1), session(6)).unwrap();
+    cache
+        .register(peer(1), session(6), watch(6), &[group])
+        .unwrap();
+    cache
+        .snapshot(
+            peer(1),
+            session(6),
+            Snapshot {
+                watch: watch(6),
+                routes: vec![route(100, Some(peer(3)))],
+            },
+        )
+        .unwrap();
+    assert!(!cache.disconnect(peer(1), session(4)));
+    assert_eq!(
+        cache.route_matching(group, replaced).unwrap().unwrap().view,
+        100
+    );
+}
+
+#[test]
 fn delayed_snapshot_preserves_newer_update_and_reconnect_fences_old_watch() {
     let mut cache = cache();
     let group = route(0, None).group;

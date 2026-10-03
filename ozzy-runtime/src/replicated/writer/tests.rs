@@ -14,7 +14,7 @@ fn config(records: usize, bytes: usize) -> WriterConfig {
         compress_payloads: true,
         batch_target_bytes: 4 * 1024 * 1024,
         policy: Policy::QuorumReplicatedPersisting,
-        partition: PartitionTarget::Group(PartitionIncarnation::from_bytes([1; 16])),
+        partition: PartitionIncarnation::from_bytes([1; 16]),
         owner_epoch: 1,
         producer_id: ProducerId::from_bytes([2; 16]),
         producer_epoch: 1,
@@ -121,6 +121,10 @@ fn startup_rejects_invalid_identity_bounds_and_sequence_exhaustion() {
             ..valid.clone()
         },
         WriterConfig {
+            batch_target_bytes: usize::MAX,
+            ..valid.clone()
+        },
+        WriterConfig {
             owner_epoch: 0,
             ..valid.clone()
         },
@@ -129,7 +133,7 @@ fn startup_rejects_invalid_identity_bounds_and_sequence_exhaustion() {
             ..valid.clone()
         },
         WriterConfig {
-            partition: PartitionTarget::Group(PartitionIncarnation::from_bytes([0; 16])),
+            partition: PartitionIncarnation::from_bytes([0; 16]),
             ..valid.clone()
         },
         WriterConfig {

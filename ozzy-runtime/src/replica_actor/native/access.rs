@@ -204,6 +204,15 @@ impl Writers {
         Some(self.rejection_slot(peer, stride))
     }
 
+    /// Writers currently assigned to this client. Assigns nothing.
+    pub(super) fn assigned_to(&self, node: NodeId) -> impl Iterator<Item = usize> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(move |(_, entry)| entry.is_some_and(|entry| entry.client.node == node))
+            .map(|(writer, _)| writer)
+    }
+
     pub(super) fn producer(&self, writer: usize) -> Option<ProducerId> {
         self.entries.get(writer)?.map(|entry| entry.client.producer)
     }

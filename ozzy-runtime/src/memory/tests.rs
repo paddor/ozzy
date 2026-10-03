@@ -1,5 +1,4 @@
 use super::{Domain, Limits};
-mod capacity;
 use std::{
     io,
     sync::{

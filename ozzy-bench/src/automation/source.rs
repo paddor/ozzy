@@ -6,6 +6,7 @@ use std::{
     collections::BTreeSet, fs, io::Read, os::unix::fs::MetadataExt, path::Path, process::Command,
 };
 
+/// Compute the SHA-256 fingerprint of one artifact file.
 pub fn sha256(path: &Path) -> Result<String> {
     let mut hash = Sha256::new();
     let mut file = fs::File::open(path)?;
@@ -24,6 +25,7 @@ fn git(root: &Path, args: &[&str]) -> Result<String> {
     capture(Command::new("git").args(args).current_dir(root))
 }
 
+/// Capture source revision, worktree changes, and checkout identity.
 pub fn checkout(directory: &Path) -> Result<Value> {
     checkout_filtered(directory, |_| true)
 }
@@ -106,6 +108,7 @@ pub fn worker_checkout(directory: &Path) -> Result<Value> {
     Ok(value)
 }
 
+/// Fingerprint the checkout-specific benchmark worker executable.
 pub fn worker_identity(root: &Path) -> Result<Value> {
     let mut value = identity(root)?;
     for checkout in value["checkouts"].as_array_mut().unwrap() {
@@ -118,6 +121,7 @@ pub fn worker_identity(root: &Path) -> Result<Value> {
     Ok(value)
 }
 
+/// Capture source and worker identity, including sibling transport dependencies.
 pub fn identity(root: &Path) -> Result<Value> {
     let compiler = capture(Command::new("rustc").arg("-vV"))?;
     let host = compiler
@@ -172,6 +176,7 @@ pub fn identity(root: &Path) -> Result<Value> {
     )
 }
 
+/// Reject source or executable changes since the supplied provenance capture.
 pub fn require_unchanged(root: &Path, expected: &Value) -> Result<()> {
     if identity(root)? != *expected {
         return Err(
@@ -181,6 +186,7 @@ pub fn require_unchanged(root: &Path, expected: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Fingerprint workload generators and adapter sources used by this checkout.
 pub fn workload_fingerprint(root: &Path) -> Result<String> {
     fn visit(path: &Path, paths: &mut BTreeSet<std::path::PathBuf>) -> Result<()> {
         for entry in fs::read_dir(path)? {

@@ -33,7 +33,7 @@ fn link() -> Link {
             kind: Kind::Client,
         },
         send: limits(),
-        remote: handshake::Parameters::streaming(limits(), handshake::PRODUCER, 4, 4096).unwrap(),
+        remote: handshake::Parameters::streaming(limits(), handshake::PRODUCER).unwrap(),
     }
 }
 
@@ -51,7 +51,7 @@ fn partition() -> PartitionIncarnation {
     PartitionIncarnation::from_bytes([11; 16])
 }
 
-fn create(actor: &ReplicaActor<ShardJournal>) -> crate::replica_journal::ProposalBuffer {
+fn create(actor: &ReplicaActor) -> crate::replica_journal::ProposalBuffer {
     let mut buffer = actor.lease_proposal_buffer().unwrap();
     let body = OperationBody::CreatePartition(CreatePartition {
         partition: partition(),
@@ -76,6 +76,15 @@ fn cluster(
     io: &Local,
     policy: QuorumPolicy,
 ) -> (Vec<Scheduled>, NativeIntake, PendingProposal) {
+    cluster_with_window(controller, io, policy, 1)
+}
+
+fn cluster_with_window(
+    controller: &mut Controller,
+    io: &Local,
+    policy: QuorumPolicy,
+    window: usize,
+) -> (Vec<Scheduled>, NativeIntake, PendingProposal) {
     let mut actors = Vec::new();
     let mut intake = None;
     let mut creation = None;
@@ -84,7 +93,7 @@ fn cluster(
         if broker == 0 {
             let mut submitter = actor.take_submitter().unwrap();
             creation = Some(submitter.try_submit(create(&actor)).unwrap());
-            let buffers = (0..2)
+            let buffers = (0..=window)
                 .map(|_| actor.lease_proposal_buffer().unwrap())
                 .collect();
             intake = Some(
@@ -102,8 +111,8 @@ fn cluster(
                             producer: ProducerId::from_bytes([40; 16]),
                         }]),
                         limits: limits(),
-                        requests_per_writer: 1,
-                        turn_slots: 1,
+                        requests_per_writer: window,
+                        turn_slots: window,
                     },
                     submitter,
                     buffers,
@@ -260,6 +269,79 @@ fn native_producer_open_and_append_require_group_confirmation_under_both_policie
     }
 }
 
+#[test]
+fn three_pipelined_appends_settle_in_sequence() {
+    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
+        let (mut controller, io) = setup();
+        let (mut actors, mut intake, creation) =
+            cluster_with_window(&mut controller, &io, policy, 3);
+        let mut creation = Box::pin(creation);
+        let mut output = Vec::new();
+        let mut created = false;
+        for _ in 0..10000 {
+            progress(&mut actors, &mut intake, &mut output, None);
+            settle(&mut controller, &[]);
+            if let Poll::Ready(reply) = poll(creation.as_mut()) {
+                assert!(matches!(
+                    reply.unwrap().outcome,
+                    ProposalOutcome::Committed { .. }
+                ));
+                created = true;
+                break;
+            }
+        }
+        assert!(created);
+        assert_eq!(
+            intake
+                .receive(
+                    &producer_open(&actors[0]),
+                    link(),
+                    actors[0].authority_hint()
+                )
+                .unwrap(),
+            NativeReceive::Accepted
+        );
+        drain(&mut controller, &mut actors, &mut intake, &mut output);
+        output.clear();
+        let append_policy = match policy {
+            QuorumPolicy::Durable => append::Policy::QuorumDurable,
+            QuorumPolicy::Replicated => append::Policy::QuorumReplicatedPersisting,
+        };
+        for sequence in 0..3 {
+            assert_eq!(
+                intake
+                    .receive(
+                        &append_request_at(&actors[0], append_policy, sequence),
+                        link(),
+                        actors[0].authority_hint(),
+                    )
+                    .unwrap(),
+                NativeReceive::Accepted
+            );
+        }
+        drain(&mut controller, &mut actors, &mut intake, &mut output);
+        let mut confirmed = output
+            .iter()
+            .map(|message| {
+                let frames =
+                    std::array::from_fn::<_, 3, _>(|index| message.part_slice(index + 1).unwrap());
+                append::stream::decode_confirmed(
+                    decode_packet(&frames, limits().envelope).unwrap(),
+                    limits().envelope,
+                )
+                .unwrap()
+                .key
+                .first_sequence
+            })
+            .collect::<Vec<_>>();
+        confirmed.sort_unstable();
+        assert_eq!(confirmed, [0, 1, 2]);
+        for actor in actors {
+            drive(&mut controller, actor.shutdown()).unwrap();
+        }
+    }
+}
+
 fn drain(
     controller: &mut Controller,
     actors: &mut [Scheduled],
@@ -277,10 +359,17 @@ fn drain(
 }
 
 fn append_request(actor: &Scheduled, policy: append::Policy) -> Message {
+    append_request_at(actor, policy, 0)
+}
+
+fn append_request_at(actor: &Scheduled, policy: append::Policy, sequence: u8) -> Message {
     let mut metadata = Vec::with_capacity(1024);
     let mut payload = Vec::with_capacity(1024);
     let header = append::encode_append(
-        envelope(Opcode::Append),
+        Envelope {
+            request_id: Some(RequestId::from_bytes([sequence + 1; 16])),
+            ..envelope(Opcode::Append)
+        },
         append::Append {
             authority: actor.authority_hint().authority,
             partition: partition(),
@@ -288,12 +377,12 @@ fn append_request(actor: &Scheduled, policy: append::Policy) -> Message {
             key: append::AppendKey {
                 producer_id: ProducerId::from_bytes([40; 16]),
                 producer_epoch: 1,
-                first_sequence: 0,
+                first_sequence: u64::from(sequence),
             },
             policy,
             records: &[append::Record {
                 encoding: ozzy_proto::data::Encoding::Raw,
-                message_id: ozzy_proto::MessageId::from_bytes([45; 16]),
+                message_id: ozzy_proto::MessageId::from_bytes([45 + sequence; 16]),
                 parts: &[b"opaque"],
             }],
         },
@@ -308,4 +397,161 @@ fn append_request(actor: &Scheduled, policy: append::Policy) -> Message {
         &metadata,
         Bytes::from(payload),
     )
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one controlled PUB and held-write regression across both quorum policies"
+)]
+fn validated_follower_batch_waits_for_physical_write_capacity() {
+    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
+        let (mut controller, io) = setup();
+        let (mut actors, mut intake, creation) =
+            cluster_with_window(&mut controller, &io, policy, 3);
+        let mut creation = Box::pin(creation);
+        let mut output = Vec::new();
+        let mut created = false;
+        for _ in 0..10000 {
+            progress(&mut actors, &mut intake, &mut output, None);
+            settle(&mut controller, &[]);
+            if let Poll::Ready(reply) = poll(creation.as_mut()) {
+                assert!(matches!(
+                    reply.unwrap().outcome,
+                    ProposalOutcome::Committed { .. }
+                ));
+                created = true;
+                break;
+            }
+        }
+        assert!(created);
+        assert_eq!(
+            intake
+                .receive(
+                    &producer_open(&actors[0]),
+                    link(),
+                    actors[0].authority_hint()
+                )
+                .unwrap(),
+            NativeReceive::Accepted
+        );
+        drain(&mut controller, &mut actors, &mut intake, &mut output);
+        output.clear();
+        let memory = payload_owner(32768);
+        // Small received bodies reuse large backing blocks, as under real load.
+        let cached = [
+            memory.try_lease(8192).unwrap(),
+            memory.try_lease(8192).unwrap(),
+        ];
+        drop(cached);
+        actors[1].bind_receive_owner(&memory).unwrap();
+        for actor in &mut actors {
+            actor.enable_publication();
+        }
+        let (mut publications, mut repairs) = (0, 0);
+        let mut network =
+            |actors: &mut [Scheduled], intake: &mut NativeIntake, output: &mut Vec<Message>| {
+                super::publications::step(
+                    actors,
+                    Duration::ZERO,
+                    false,
+                    &[],
+                    &mut publications,
+                    &mut repairs,
+                );
+                intake
+                    .poll_progress(
+                        &mut Context::from_waker(Waker::noop()),
+                        actors[0].authority_hint(),
+                        |_| Some(link()),
+                        |_, message| {
+                            output.push(message);
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+            };
+        let append_policy = match policy {
+            QuorumPolicy::Durable => append::Policy::QuorumDurable,
+            QuorumPolicy::Replicated => append::Policy::QuorumReplicatedPersisting,
+        };
+        assert_eq!(
+            intake
+                .receive(
+                    &append_request_at(&actors[0], append_policy, 0),
+                    link(),
+                    actors[0].authority_hint()
+                )
+                .unwrap(),
+            NativeReceive::Accepted
+        );
+        let mut writes = Vec::new();
+        for _ in 0..10000 {
+            network(&mut actors, &mut intake, &mut output);
+            for (id, _) in controller.jobs() {
+                if matches!(controller.operation(id).unwrap().unprotected(), Operation::Write { offset, .. } if *offset >= 4096)
+                {
+                    if !writes.contains(&id) {
+                        writes.push(id);
+                    }
+                } else {
+                    controller.execute(id, Effect::Normal).unwrap();
+                    controller.deliver(id).unwrap();
+                }
+            }
+            if writes.len() == 3 {
+                break;
+            }
+        }
+        assert_eq!(writes.len(), 3);
+        assert_eq!(
+            intake
+                .receive(
+                    &append_request_at(&actors[0], append_policy, 1),
+                    link(),
+                    actors[0].authority_hint()
+                )
+                .unwrap(),
+            NativeReceive::Accepted
+        );
+        for _ in 0..100 {
+            network(&mut actors, &mut intake, &mut output);
+            settle(&mut controller, &writes);
+        }
+        assert!(writes.iter().all(|id| controller.operation(*id).is_some()));
+        let mut confirmed = false;
+        for _ in 0..10000 {
+            network(&mut actors, &mut intake, &mut output);
+            settle(&mut controller, &[]);
+            if output.len() == 2
+                && actors.iter().all(|actor| {
+                    actor.status().normal.is_some_and(|state| {
+                        state.accepted.op.0 == 4 && state.applied == state.accepted
+                    })
+                })
+            {
+                confirmed = true;
+                break;
+            }
+        }
+        assert!(confirmed);
+        let mut offsets = output
+            .iter()
+            .map(|message| {
+                let frames = std::array::from_fn::<_, 3, _>(|i| message.part_slice(i + 1).unwrap());
+                let confirmed = append::stream::decode_confirmed(
+                    decode_packet(&frames, limits().envelope).unwrap(),
+                    limits().envelope,
+                )
+                .unwrap();
+                assert_eq!(confirmed.key.first_sequence, confirmed.first_offset);
+                confirmed.first_offset
+            })
+            .collect::<Vec<_>>();
+        offsets.sort_unstable();
+        assert_eq!(offsets, [0, 1]);
+        for actor in actors {
+            drive(&mut controller, actor.shutdown()).unwrap();
+        }
+    }
 }

@@ -9,6 +9,64 @@ fn schema() -> Digest {
     Digest::from_bytes([0x98; 32])
 }
 
+#[test]
+fn metadata_cleanup_refuses_damaged_authority_before_releasing_abandoned_source() {
+    let (mut controller, io) = setup(baseline());
+    let mut journal = drive(&mut controller, open(io, 2)).unwrap();
+    drive(&mut controller, commit(&mut journal));
+    let built = drive(
+        &mut controller,
+        journal.build_checkpoint(id(12), schema(), 8, b"abandoned state"),
+    )
+    .unwrap();
+    let source = built.manifest().source_manifest_generation;
+    let source_path = journal.root().join(format!("MANIFEST.{source}"));
+    let mut next = journal.next_manifest().unwrap();
+    next.promised_view += 1;
+    drive(&mut controller, journal.install_metadata(next)).unwrap();
+    assert!(
+        !drive(&mut controller, journal.reclaim_unreferenced_metadata(128))
+            .unwrap()
+            .removed_manifest_generations
+            .contains(&source)
+    );
+    drop(built);
+    let current_path = journal.root().join("CURRENT");
+    let current = controller
+        .image()
+        .bytes(&current_path, false)
+        .unwrap()
+        .to_vec();
+    let file = drive(
+        &mut controller,
+        journal
+            .access
+            .open(current_path, ozzy_io::OpenMode::ReadWrite, false, false),
+    )
+    .unwrap();
+    drive(&mut controller, journal.access.write_all(&file, 0, &[255])).unwrap();
+    assert!(drive(&mut controller, journal.reclaim_unreferenced_metadata(128)).is_err());
+    assert!(controller.image().exists(&source_path, false));
+    drive(
+        &mut controller,
+        journal.access.write_all(&file, 0, &current),
+    )
+    .unwrap();
+    drive(&mut controller, journal.access.sync(&file)).unwrap();
+    drive(
+        &mut controller,
+        journal.access.done(Operation::Close { handle: file }),
+    )
+    .unwrap();
+    assert!(
+        drive(&mut controller, journal.reclaim_unreferenced_metadata(128))
+            .unwrap()
+            .removed_manifest_generations
+            .contains(&source)
+    );
+    drive(&mut controller, journal.close()).unwrap();
+}
+
 async fn commit(journal: &mut Journal) {
     let mut next = journal.next_manifest().unwrap();
     next.accepted = journal.accepted_position().unwrap();

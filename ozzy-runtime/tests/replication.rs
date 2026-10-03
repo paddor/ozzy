@@ -24,7 +24,7 @@ use ozzy_proto::{
     VolumeId,
 };
 use ozzy_replication::wire::{
-    Control, FetchOps, Grant, Operation, PeerBinding, Prepare, ReplicaMessage, WireLimits, decode,
+    Control, FetchOps, Operation, PeerBinding, Prepare, ReplicaMessage, WireLimits, decode,
     encode_control, encode_fetch, encode_ops, encode_prepare,
 };
 use ozzy_replication::{
@@ -533,11 +533,6 @@ async fn send_ack(socket: &Socket, index: u8, core: &NormalReplica) {
         0,
         Control::PrepareOk {
             ack: core.acknowledgment().unwrap(),
-            grant: Grant {
-                revision: 1,
-                record_limit: 8,
-                byte_limit: 8192,
-            },
         },
     )
     .await;

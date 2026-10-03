@@ -124,7 +124,7 @@ impl ReceiveBuffers {
 
     /// Charge to reserve for a writer whose refused frame had this charge.
     /// Frames of one allocation class differ only in their metadata, and a
-    /// retry that carries more records has more of it. Credit for the exact
+    /// retry that carries more records has more of it. Capacity for the exact
     /// refused frame would refuse every larger retry again.
     pub fn class_retained_bytes(&self, observed: usize) -> usize {
         let small = DESCRIPTORS
@@ -161,6 +161,14 @@ impl ReceiveBuffers {
     /// Return the message and its conservative full retained-byte charge for
     /// `Service::receive`. Session and routing checks still belong to Service.
     pub fn prepare(&self, message: Message) -> Result<(Message, usize), BufferError> {
+        let prepared = self.prepare_borrowed(&message);
+        drop(message);
+        prepared
+    }
+
+    /// Normalize a received frame without consuming it. The caller can return
+    /// the original frame to its source lane if destination admission is full.
+    pub fn prepare_borrowed(&self, message: &Message) -> Result<(Message, usize), BufferError> {
         if message.len() == 2 && message.part_slice(0).is_some_and(|id| id.len() == 16) {
             ozzy_replication::wire::CompactState::decode(message.part_slice(1).unwrap_or_default())
                 .map_err(|_| BufferError::Frames)?;
@@ -202,7 +210,21 @@ impl ReceiveBuffers {
         }
         // Small stream frames can share an entire read chunk. Large frames can
         // reuse a larger pool slot. Charge the backing, not the visible slice.
-        let backing = self.payload_backing(payload_bytes);
+        let mut backing = self.payload_backing(payload_bytes);
+        // OMQ's large stream read owns its buffer and reports its capacity.
+        // Preserve that evidence instead of charging every frame as the
+        // largest reusable pool slot. Opaque read chunks retain the fallback.
+        if payload_bytes >= 128 * 1024 {
+            let mut parts = message.clone();
+            for _ in 0..3 {
+                parts.pop_front_payload();
+            }
+            if let Some(retained) = parts.retained_size() {
+                // The configured profile also proves an upper bound. Its
+                // descriptor allowance covers OMQ's accounted-owner overhead.
+                backing = backing.min(retained);
+            }
+        }
         // Discard even an empty Bytes owner: empty application frames must not
         // smuggle an unrelated allocation through the zero-payload charge.
         let payload = if payload_bytes == 0 {
@@ -217,11 +239,10 @@ impl ReceiveBuffers {
             + if payload_bytes == 0 { 0 } else { backing };
         let normalized = Message::multipart_payloads([
             Payload::from_slice(message.part_slice(0).unwrap()),
-            Payload::from_bytes(Bytes::copy_from_slice(frames[0])),
-            Payload::from_bytes(Bytes::copy_from_slice(frames[1])),
-            Payload::from_bytes(payload),
+            Payload::from_slice(frames[0]),
+            Payload::from_slice(frames[1]),
+            Payload::from_bytes_with_retained_size(payload, backing),
         ]);
-        drop(message);
         Ok((normalized, retained))
     }
 }

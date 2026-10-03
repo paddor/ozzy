@@ -7,9 +7,13 @@ use thiserror::Error;
 
 use crate::{SEGMENT_HEADER_BYTES, WRITE_GROUP_ALIGNMENT};
 
+/// Exact encoded persistent group/store identity length.
 pub const GROUP_IDENTITY_BYTES: usize = 4 * 1024;
+/// Exact encoded manifest-selection reference length.
 pub const CURRENT_BYTES: usize = 128;
+/// Exact encoded selected-manifest header length.
 pub const MANIFEST_HEADER_BYTES: usize = 384;
+/// Exact encoded manifest segment-reference length.
 pub const SEGMENT_REFERENCE_BYTES: usize = 120;
 
 const METADATA_VERSION: u16 = 2;
@@ -39,15 +43,20 @@ pub enum CommitMode {
 /// Immutable group replica identity stored below one volume root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GroupIdentity {
+    /// Persistent partition replication-group identity.
     pub group_id: GroupId,
+    /// Persistent broker routing identity owning this store.
     pub replica_node_id: NodeId,
+    /// Persistent containing physical volume identity.
     pub volume_id: VolumeId,
+    /// Persistent local journal-store identity.
     pub store_id: StoreId,
     /// Local relocation/configuration fence. Independent of manifest generation.
     pub store_generation: u64,
 }
 
 impl GroupIdentity {
+    /// Check structural identity or prefix invariants and return the unchanged value.
     pub fn validate(self) -> Result<Self, MetadataError> {
         for (kind, bytes) in [
             ("group", self.group_id.as_bytes()),
@@ -67,16 +76,20 @@ impl GroupIdentity {
 /// Logical operation position and its canonical digest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LogPosition {
+    /// Partition-local canonical operation number.
     pub op_number: u64,
+    /// Integrity digest bound to this exact object or canonical prefix.
     pub digest: Digest,
 }
 
 impl LogPosition {
+    /// Empty canonical operation prefix with the zero digest.
     pub const GENESIS: Self = Self {
         op_number: 0,
         digest: Digest::ZERO,
     };
 
+    /// Check structural identity or prefix invariants and return the unchanged value.
     pub fn validate(self) -> Result<Self, MetadataError> {
         if self.op_number != u64::MAX && (self.op_number == 0) == (self.digest == Digest::ZERO) {
             Ok(self)
@@ -89,26 +102,35 @@ impl LogPosition {
 /// Immutable checkpoint generation selected by one manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CheckpointReference {
+    /// Exact checkpoint artifact identity.
     pub checkpoint_id: CheckpointId,
+    /// Canonical operation number and digest represented by this checkpoint.
     pub position: LogPosition,
+    /// Integrity digest binding the selected manifest bytes.
     pub manifest_digest: Digest,
 }
 
 /// Final byte boundary and digest of an immutable segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SealedSegment {
+    /// Physical bytes covered by the exact validated segment prefix.
     pub valid_bytes: u64,
+    /// Integrity digest bound to this exact object or canonical prefix.
     pub digest: Digest,
 }
 
 /// Manifest reference needed to scan one physical segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentReference {
+    /// Physical segment identity.
     pub segment_id: u64,
     /// Physical replacement incarnation. Zero selects the original file.
     pub file_generation: u64,
+    /// First expected physical write-group number in this segment.
     pub first_group_number: u64,
+    /// Exact canonical operation chain at this segment start.
     pub first_chain: ChainPosition,
+    /// Configured physical segment capacity in bytes.
     pub capacity: u64,
     /// None identifies the one active final segment.
     pub sealed: Option<SealedSegment>,
@@ -127,34 +149,51 @@ impl SegmentReference {
 /// One immutable metadata generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
+    /// Exact metadata-manifest generation.
     pub generation: u64,
+    /// Exact predecessor manifest generation.
     pub parent_generation: u64,
+    /// Exact group, node, volume, store, and store-generation binding.
     pub identity: GroupIdentity,
+    /// Selected membership/configuration epoch.
     pub configuration_epoch: u64,
+    /// Explicit journal durability and metadata-acceptance mode.
     pub commit_mode: CommitMode,
     /// A fixed durable accepted-history record is mandatory for recovery.
     pub durable_evidence: bool,
+    /// Promised election view constraining retained history and authority.
     pub promised_view: u64,
+    /// Last installed normal election view.
     pub last_normal_view: u64,
+    /// Exact canonical operation prefix accepted by the selected metadata.
     pub accepted: LogPosition,
+    /// Exact confirmed canonical operation prefix.
     pub committed: LogPosition,
+    /// Optional exact checkpoint selected as a recovery source.
     pub checkpoint: Option<CheckpointReference>,
+    /// Selected physical segment chain in journal order.
     pub segments: Vec<SegmentReference>,
 }
 
 /// Small replaceable pointer to one immutable manifest generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CurrentReference {
+    /// Persistent partition replication-group identity.
     pub group_id: GroupId,
+    /// Persistent local journal-store identity.
     pub store_id: StoreId,
+    /// Exact metadata-manifest generation.
     pub generation: u64,
+    /// Integrity digest binding the selected manifest bytes.
     pub manifest_digest: Digest,
 }
 
 /// Bounds enforced before allocating manifest references.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetadataLimits {
+    /// Maximum encoded manifest bytes, including its header.
     pub max_manifest_bytes: usize,
+    /// Maximum selected or scanned physical segments.
     pub max_segments: usize,
 }
 
@@ -171,51 +210,76 @@ impl Default for MetadataLimits {
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum MetadataError {
     #[error("truncated {object}: need {needed} bytes, have {available}")]
+    /// Input bytes end before a complete encoded object.
     Truncated {
+        /// Named physical or encoded object that failed validation.
         object: &'static str,
+        /// Required bytes for a complete encoded field.
         needed: usize,
+        /// Available bytes, capacity, or canonical prefix at failure.
         available: usize,
     },
     #[error("wrong {0} magic")]
+    /// The named object has an incorrect format magic.
     WrongMagic(&'static str),
     #[error("unsupported metadata version {0}")]
+    /// The encoded format version is unsupported.
     UnsupportedVersion(u16),
     #[error("unsupported nonzero flags or reserved bytes in {0}")]
+    /// Unsupported nonzero flags or reserved bytes in.
     UnsupportedFields(&'static str),
     #[error("{0} digest mismatch")]
+    /// The named object does not match its expected integrity digest.
     DigestMismatch(&'static str),
     #[error("{0} identity is zero")]
+    /// A required persistent identity is zero.
     ZeroIdentity(&'static str),
     #[error("store generation is zero")]
+    /// Store generation is zero.
     InvalidStoreGeneration,
     #[error("manifest generation or parent is invalid")]
+    /// Manifest generation or parent is invalid.
     InvalidGeneration,
     #[error("operation position and digest do not agree")]
+    /// Operation position and digest do not agree.
     InvalidLogPosition,
     #[error("manifest accepted position precedes committed position")]
+    /// Manifest accepted position precedes committed position.
     CommitBeyondAccepted,
     #[error("last installed normal view exceeds promised view")]
+    /// Last installed normal view exceeds promised view.
     InvalidView,
     #[error("checkpoint reference is invalid")]
+    /// Checkpoint reference is invalid.
     InvalidCheckpoint,
     #[error("segment reference or ordering is invalid")]
+    /// Segment reference or ordering is invalid.
     InvalidSegmentReference,
     #[error("manifest requires exactly one final active segment")]
+    /// Manifest requires exactly one final active segment.
     InvalidActiveSegment,
     #[error("CURRENT reference is invalid")]
+    /// CURRENT reference is invalid.
     InvalidCurrent,
     #[error("integer or length arithmetic overflow")]
+    /// Integer or byte-count arithmetic overflows the supported range.
     LengthOverflow,
     #[error("{kind} limit exceeded: {actual} > {limit}")]
+    /// The named resource exceeds its configured bound.
     LimitExceeded {
+        /// Resource bound that rejected the operation.
         kind: &'static str,
+        /// Observed size, count, or fenced field value.
         actual: usize,
+        /// Configured maximum for the reported resource.
         limit: usize,
     },
     #[error("metadata file has {0} trailing bytes")]
+    /// Metadata file has trailing bytes.
     TrailingBytes(usize),
 }
 
+/// Validate and encode the fixed-size persistent group/store binding.
 pub fn encode_group_identity(
     identity: GroupIdentity,
 ) -> Result<[u8; GROUP_IDENTITY_BYTES], MetadataError> {
@@ -234,6 +298,7 @@ pub fn encode_group_identity(
     Ok(output)
 }
 
+/// Validate and decode the fixed-size persistent group/store binding.
 pub fn decode_group_identity(input: &[u8]) -> Result<GroupIdentity, MetadataError> {
     require_len(input, GROUP_IDENTITY_BYTES, "group identity")?;
     if input.len() != GROUP_IDENTITY_BYTES {
@@ -267,6 +332,7 @@ pub fn decode_group_identity(input: &[u8]) -> Result<GroupIdentity, MetadataErro
     .validate()
 }
 
+/// Validate and encode an exact manifest-selection reference.
 pub fn encode_current(current: CurrentReference) -> Result<[u8; CURRENT_BYTES], MetadataError> {
     validate_current(current)?;
     let mut output = [0_u8; CURRENT_BYTES];
@@ -282,6 +348,7 @@ pub fn encode_current(current: CurrentReference) -> Result<[u8; CURRENT_BYTES], 
     Ok(output)
 }
 
+/// Validate and decode an exact manifest-selection reference.
 pub fn decode_current(input: &[u8]) -> Result<CurrentReference, MetadataError> {
     require_len(input, CURRENT_BYTES, "CURRENT")?;
     if input.len() != CURRENT_BYTES {
@@ -308,6 +375,7 @@ pub fn decode_current(input: &[u8]) -> Result<CurrentReference, MetadataError> {
     Ok(current)
 }
 
+/// Validate and encode selected journal metadata with its integrity fields.
 pub fn encode_manifest(manifest: &Manifest) -> Result<Vec<u8>, MetadataError> {
     encode_manifest_with_limits(manifest, MetadataLimits::default())
 }
@@ -374,6 +442,7 @@ pub fn encode_manifest_with_limits(
     Ok(output)
 }
 
+/// Validate and decode bounded selected journal metadata.
 pub fn decode_manifest(input: &[u8], limits: MetadataLimits) -> Result<Manifest, MetadataError> {
     require_len(input, MANIFEST_HEADER_BYTES, "manifest header")?;
     enforce_limit("manifest bytes", input.len(), limits.max_manifest_bytes)?;

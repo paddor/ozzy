@@ -13,13 +13,13 @@ pub struct ValidatedStorage {
     pub step: ozzy_journal_segment::StorageValidationStep,
 }
 
-impl<E> ReplicaJournal<E> {
+impl ReplicaJournal {
     /// Reclaim bounded unselected artifacts on the device executor. Live history remains protected.
     pub fn cleanup_orphans(
         &mut self,
         ticket: ValidationTicket,
         budget: ozzy_journal_segment::MaintenanceBudget,
-    ) -> Result<JournalCompletion<ozzy_journal_segment::OrphanCleanupStep>, SubmitError> {
+    ) -> Result<JournalCompletion<crate::replica_journal::OwnedCleanedStorage>, SubmitError> {
         self.submit(
             ticket,
             |ticket, done| Action::CleanupOrphans {
@@ -40,7 +40,7 @@ impl<E> ReplicaJournal<E> {
         &mut self,
         ticket: ValidationTicket,
         budget: ozzy_journal_segment::MaintenanceBudget,
-    ) -> Result<JournalCompletion<ozzy_journal_segment::MetadataCleanupStep>, SubmitError> {
+    ) -> Result<JournalCompletion<crate::replica_journal::OwnedCleanedStorage>, SubmitError> {
         self.submit(
             ticket,
             |ticket, done| Action::CleanupMetadata {

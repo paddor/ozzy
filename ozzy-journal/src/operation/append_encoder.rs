@@ -1,11 +1,15 @@
 //! Canonical encoding directly from caller-owned record iterators.
 
+use ozzy_proto::{
+    MessageId, Offset, OwnerEpoch, PartitionIncarnation, ProducerEpoch, ProducerId,
+    ProducerSequence,
+};
+use std::ops::Range;
+
 use super::{
-    AppendBatch, AppendBatchSummary, AppendBatchView, AppendTotals, Encoder, MessageId, Offset,
-    OperationCodecError, OperationLimits, OperationOutput, OwnerEpoch, PREPARED_PAYLOAD,
-    PartitionIncarnation, ProducerEpoch, ProducerId, ProducerSequence, Range, TINY_RECORDS,
-    encode_append_records, enforce_limit, records_are_tiny, validate_limits,
-    validate_position_count,
+    AppendBatch, AppendBatchSummary, AppendBatchView, AppendTotals, Encoder, OperationCodecError,
+    OperationLimits, OperationOutput, PREPARED_PAYLOAD, TINY_RECORDS, encode_append_records,
+    enforce_limit, records_are_tiny, validate_limits, validate_position_count,
 };
 
 /// Proof that one canonical one-batch APPEND was constructed from a validated
@@ -17,19 +21,52 @@ pub struct ValidatedWireAppend {
     decoded_bytes: u32,
     encoded_bytes: u32,
     record_count: u32,
+    part_count: u32,
+    uniform_part_bytes: Option<u32>,
     nonzero_message_ids: bool,
 }
 
 impl ValidatedWireAppend {
+    pub(super) const fn uniform_part_bytes(self) -> Option<usize> {
+        match self.uniform_part_bytes {
+            Some(bytes) => Some(bytes as usize),
+            None => None,
+        }
+    }
     /// Recover state metadata from fixed fields while retaining descriptor and
     /// codec validation performed before canonical construction.
     pub fn summary(self, body: &[u8]) -> Result<AppendBatchSummary, OperationCodecError> {
-        self.batch(body).map(|batch| batch.summary)
+        super::view::validated_wire_batch(body, self).map(|batch| batch.summary)
     }
 
-    /// Borrow the trusted body layout without walking descriptors or LZ4 again.
-    pub fn batch(self, body: &[u8]) -> Result<AppendBatchView<'_>, OperationCodecError> {
-        super::view::validated_wire_batch(body, self)
+    /// Check the destination's limits and patched positions without walking
+    /// validated descriptors or LZ4 again. The proof must belong to this body.
+    pub fn batch(
+        self,
+        body: &[u8],
+        limits: OperationLimits,
+    ) -> Result<AppendBatchView<'_>, OperationCodecError> {
+        validate_limits(limits)?;
+        enforce_limit("operation body bytes", body.len(), limits.max_body_bytes)?;
+        enforce_limit(
+            "append record count",
+            self.record_count(),
+            limits.max_records,
+        )?;
+        enforce_limit(
+            "append part count",
+            self.part_count as usize,
+            limits.max_parts,
+        )?;
+        enforce_limit(
+            "append payload bytes",
+            self.decoded_bytes(),
+            limits.max_payload_bytes,
+        )?;
+        let batch = super::view::validated_wire_batch(body, self)?;
+        validate_position_count(batch.summary.first_sequence.get(), self.record_count())?;
+        validate_position_count(batch.summary.first_offset.get(), self.record_count())?;
+        Ok(batch)
     }
 
     pub(super) const fn descriptor_bytes(self) -> usize {
@@ -71,12 +108,19 @@ impl ValidatedWireAppend {
 /// Partition metadata shared by every record in a canonical append batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppendHeader {
+    /// Exact partition record incarnation.
     pub partition: PartitionIncarnation,
+    /// Expected partition ownership fence.
     pub owner_epoch: OwnerEpoch,
+    /// Producer identity scoped to this partition.
     pub producer_id: ProducerId,
+    /// Expected producer-session fence.
     pub producer_epoch: ProducerEpoch,
+    /// First contiguous producer-local sequence.
     pub first_sequence: ProducerSequence,
+    /// First assigned partition-global record offset.
     pub first_offset: Offset,
+    /// Primary-resolved Unix timestamp in milliseconds.
     pub append_timestamp_millis: u64,
 }
 
@@ -306,6 +350,9 @@ pub fn append_wire_record_batch(
         },
         record_count: u32::try_from(records.len())
             .map_err(|_| OperationCodecError::LengthOverflow)?,
+        part_count: u32::try_from(records.parts())
+            .map_err(|_| OperationCodecError::LengthOverflow)?,
+        uniform_part_bytes: records.uniform_part_bytes(),
         nonzero_message_ids: records.nonzero_message_ids(),
     };
     let start = output.len();

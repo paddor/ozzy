@@ -22,19 +22,28 @@ use ozzy_journal::progress::JournalGeneration;
 /// A manifest-authenticated logical range, independent of donor file boundaries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RepairRange {
+    /// Physical segment identity.
     pub segment_id: u64,
+    /// Exact canonical prefix immediately before this repair range.
     pub after: LogPosition,
+    /// Exact inclusive canonical operation prefix captured by this work.
     pub through: LogPosition,
 }
 
 /// Explicit memory, transfer, and replacement-file bounds.
 #[derive(Debug, Clone, Copy)]
 pub struct SealedRepairLimits {
+    /// Maximum physical segment bytes.
     pub max_segment_bytes: u64,
+    /// Maximum canonical operations per repair chunk.
     pub max_chunk_operations: usize,
+    /// Maximum combined canonical body bytes per repair chunk.
     pub max_chunk_body_bytes: usize,
+    /// Maximum retained physical repair bytes.
     pub max_staged_bytes: u64,
+    /// Maximum conflicting unselected physical names probed during repair.
     pub max_orphan_probes: usize,
+    /// Physical body compression policy; canonical bytes remain unchanged.
     pub body_encoding: BodyEncoding,
 }
 

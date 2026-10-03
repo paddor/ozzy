@@ -1,8 +1,8 @@
 # Storage and recovery
 
-This page describes the append-only segment engine, the selected product's
-only storage backend. Both the one-broker development deployment and replicated production
-deployment use segment journals.
+Ozzy stores records only in append-only segment journals. Single-broker durable,
+disk quorum, and replicated-persisting share this engine. Linux AIO and the
+bounded worker pool are physical I/O backends, not separate storage formats.
 
 ## Selected topic and writer ownership
 
@@ -15,11 +15,18 @@ recovery state. There is no interleaved topic-wide journal.
 Selected I/O contract: every filesystem operation executes behind a backend-neutral
 future, including metadata, reads, recovery, and shutdown. The segment engine
 owns format and durability ordering. Backend crates own handles and execution:
-Linux AIO, a bounded pool, and a possible future opt-in io_uring implementation.
+Linux AIO and a bounded pool. No io_uring.
 The async journal uses these backends without file syscalls or kernel completion
 handling on its caller's shard. Partition actors own the journal state; the
 dedicated journal-owner threads have been removed.
-See [runtime ownership](RUNTIME.md#async-storage-target).
+See [runtime ownership](RUNTIME.md#async-storage).
+
+`SegmentState` holds positions, encoding scratch, and completion fences without
+file ownership. Both the asynchronous writer and remaining blocking fixtures use
+this state. Detached segment rolls and incremental storage validation execute
+only through the asynchronous Backend path. Memory tests cover publication
+failure, frozen validation tails, byte budgets, corruption, and failed barriers;
+real-backend tests retain descriptor and filesystem evidence.
 
 A partition belongs to its topic and accepts multiple writers. Keep one global
 offset sequence per partition and separate bounded producer epoch, sequence,
@@ -147,7 +154,11 @@ partial reads decode it lazily. Segment LZ4 remains an independent option.
 Multipart boundaries and exact retry IDs survive either representation.
 
 The SDK constructs APPEND record descriptors; the broker validates them before
-canonical encoding. [Writer transport](PROTOCOL.md#writer-transport) does not
+canonical encoding. Its body proof keeps the record, part, and decoded-byte
+totals. Admission checks the journal's own limits and patched positions without
+walking those descriptors or LZ4 again. Immutable admitted bodies skip the
+storage encoder's duplicate schema walk; recovery still validates disk bytes.
+[Writer transport](PROTOCOL.md#writer-transport) does not
 change record identity or the canonical disk layout.
 
 Exact encoding: [canonical body codec](../ozzy-journal/src/operation.rs).
@@ -200,7 +211,9 @@ validation. Exact layout: [segment codec](../ozzy-journal-segment/src/codec.rs).
   policy.
 
 A cold read locates the containing operation/shared block through an index,
-decodes that extent, and selects the record. Live readers use decoded RAM data.
+decodes that extent, and selects the record. Recent reads retain encoded
+canonical backing. Whole producer LZ4 blocks pass through unchanged; partial
+reads decode only the selected extent. PUB output has its own encoded backing.
 Records are never truncated or split: above the default 1 MiB record limit,
 record, operation and segment limits must all permit the larger record.
 
@@ -219,6 +232,46 @@ record, operation and segment limits must all permit the larger record.
    Failed or ambiguous I/O fences the writer; stale completions change nothing.
 5. **Confirm:** satisfy the configured local/replicated policy. Disk quorum also
    requires the recovery evidence described below.
+
+The async path keeps shard work separate from physical execution:
+
+```mermaid
+sequenceDiagram
+    participant J as Partition journal owner
+    participant B as Storage backend
+    participant A as AIO device owner
+    participant H as Fixed file helpers
+    J->>B: Owned append job, placement and generation
+    B->>A: Bounded aligned data write
+    A-->>B: Physical completion
+    B-->>J: Matching completion ticket
+    J->>J: Install ordered written prefix
+    opt Durable evidence required
+        J->>B: Publish captured durable prefix
+        B->>H: Required file/metadata barriers
+        H-->>B: Barrier completion
+        B-->>J: Exact durable-prefix evidence
+    end
+    J->>J: Advance only the selected policy's eligible prefix
+    Note over J,H: Cancellation retains buffers and handles until physical completion
+```
+
+The pool backend executes the same jobs on fixed blocking workers. AIO uses one
+device owner plus fixed file helpers; neither creates a thread per partition.
+`O_DSYNC` data completion may itself provide the data barrier. Replication can
+still require another broker's evidence after local durable publication.
+
+### Persistent handles
+
+| Handle | Lifetime |
+| --- | --- |
+| Active segment write handles | Open across appends; replaced at roll or closed at shutdown |
+| Recent read handles | Four-entry journal LRU keyed by exact path and source identity |
+| Running read/write job | Owns its handle lease and buffers through physical completion |
+
+Evicting a read handle drops only the cache lease. Running jobs keep their own
+leases. Reads also protect their selected physical files across roll and repair.
+Handles and filesystem calls belong to the backend, never the application shard.
 
 Segment files use `fallocate` to reserve **full capacity and final file size**
 before use. Appends advance a logical valid prefix; they do not grow EOF.
@@ -241,13 +294,6 @@ Replicated-persisting selects buffered writes. Written progress permits live
 replay but is never stable-storage evidence. Segment sealing, election promises,
 and clean shutdown still synchronize their required prefixes.
 
-On Linux, completed 4 MiB ranges trigger `sync_file_range(WRITE)` writeback hints.
-For replicated persistence, the device's maintenance thread runs these calls off
-the writer; hints retain only the file and range, not payloads. Local buffered
-appends issue them on the shard owner after each write, so a roll's barrier does
-not flush a whole segment. A failed hint faults the writer.
-They do not flush device caches or advance durable progress. Final barriers remain.
-
 `O_DSYNC` uses the page cache and does not make multiple writes atomic. Metadata,
 initialization, recovery and directory publication retain their sync barriers.
 Completion covers only its captured prefix and writer generation.
@@ -266,9 +312,10 @@ Completion covers only its captured prefix and writer generation.
 - Manifests select exact incarnations. Successor headers bind predecessor ID and
   canonical digest, so repairing compression/layout need not rewrite successors.
 - Pending reads retain their original bytes and generation through roll.
-- Background rolls transfer physical work to the writer. The owner keeps the
-  predecessor readable; only the matching successful completion installs the
-  successor. No successor writes occur before publication.
+- Background rolls transfer physical work to the backend. The owner keeps the
+  predecessor readable and fences each installation by its completion generation.
+  A prepared successor can accept writes while final roll publication settles;
+  the next roll, synchronization, and shutdown must settle that publication.
 
 Thread ownership and queue bounds: [disk workers](RUNTIME.md#disk-workers),
 [local pipeline](RUNTIME.md#local-durable-pipeline),
@@ -308,18 +355,17 @@ Opening fails if the file system rejects 4 KiB direct I/O. `O_DIRECT` alone
 supplies no durability. These flags never remove metadata or recovery barriers
 or turn RAM confirmation into disk confirmation.
 
-In current code, `io_backend = Aio` (requires `direct_io`, default on Linux) lets the journal
-owner submit those writes itself through Linux kernel AIO, with 1 to 64 batches
-in flight per shard (`aio_depth`, default 1), and reap them when an eventfd in
-its runtime turns readable. More writes in flight can reach the disk out of
-order. After a power loss, recovery keeps the prefix through the recorded
-durable position, then discards from the first damaged group onward.
+`io_backend = Aio` requires `direct_io`. One backend-owned thread per device
+owns the Linux AIO context, submits direct writes, and reaps completions using
+its eventfd. Configured depth bounds aggregate ordinary writes across that
+backend; one additional slot is reserved for progress work. Fixed blocking
+helpers execute metadata, buffered reads, barriers, and descriptor operations.
+Shards submit asynchronous jobs and install matching ordered results.
 
-For RAM-confirmed leaders and followers, synchronous background writes are a
-candidate for reducing individual write/roll stalls, not a requirement for
-confirmation. Compare them against buffered writes including segment barriers.
-Do not assume a faster single-file probe implies better broker throughput or
-that a role-specific setting survives promotion without qualification.
+Physical writes can complete out of order. After power loss, recovery preserves
+the prefix through recorded durable progress, then discards the first damaged
+group and its suffix. Buffered writes and AIO receipt do not advance that
+boundary without the required barriers and evidence.
 
 Procedure and commands: [disk calibration](../ozzy-bench/README.md#disk-calibration).
 
@@ -476,7 +522,8 @@ within the budget; preexisting sealed history remains cold until later rolls.
   retained operation may keep its whole APPEND arena alive; bound reads for that.
 - Older reads binary-search validated indexes and verify selected operations.
   Missing/stale indexes rebuild from exact protected sources. A cold lookup may
-  search several segments and synchronously build indexes.
+  search several segments. Blocking inspection APIs may build indexes
+  synchronously; the shard path below uses backend futures.
 - Native subscriptions seek by offset. Journal message-ID lookup exists;
   timestamp lookup and native ID/time seek do not.
 - Index exhaustion requests roll or backpressure; never discard retry state.
@@ -487,6 +534,17 @@ and visit borrowed record spans. Missing sealed indexes derive a disposable
 in-memory index from validated segment bytes; corrupt indexes are refused.
 Captured-read count, compact-cache bytes/slots, and payload residency have
 separate bounds. Known shared backing is charged in full, not by slice length.
+Validation identifies general tables of equal-size, single-part raw records.
+Their selectors retain a count, two base positions and a stride, including for
+whole-APPEND compressed payloads. Other general tables retain one position pair
+per record and an end checkpoint. IDs, encodings and multipart lengths stay in
+the immutable body. Selection and batch totals need no additional record scan.
+The broker splits its per-partition read allowance between recent payloads and
+up to four compact sealed indexes. Its payload allowance follows configured APPEND
+size, accounting for complete backing allocations even when compressed bodies
+are small. Cold repair checks those indexes against the
+captured source identity before searching files. Repeated pages reuse the selected
+index; payload reads still validate each selected operation.
 
 ### Checkpoints and deletion
 
@@ -508,12 +566,13 @@ do not enable local sealed-prefix retirement for disk groups.
 | Work | API / scheduling |
 | --- | --- |
 | Scrub selected storage | `with_storage_validation`; default step budget 256 KiB / 2 ms |
-| Delete obsolete metadata | `with_metadata_cleanup`; default 32 entries / 2 ms |
+| Delete obsolete metadata | `with_metadata_cleanup`; default 32 objects per turn |
 | Remove unselected files | `with_orphan_cleanup`; bounded scans, recheck selection/protection before deletion |
 
 Maintenance uses the existing device queue. Overdue work gets a turn after
-admitted writes settle, then foreground work gets a turn. Time budgets are
-cooperative, not syscall deadlines. Validation captures a finite segment list;
+admitted writes settle, then foreground work gets a turn. Cleanup bounds removed
+objects and directory listings; each physical job yields through the backend.
+Validation's CPU time budget is cooperative, not a syscall deadline. It captures a finite segment list;
 new writes enter later cycles. Authority changes invalidate old work; corruption
 fences the worker.
 

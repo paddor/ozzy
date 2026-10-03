@@ -41,13 +41,9 @@ impl Client {
             max_parts: 4,
             max_record_bytes: 1024,
         };
-        let mut parameters = handshake::Parameters::streaming(
-            limits,
-            handshake::PRODUCER | handshake::CONSUMER,
-            64,
-            64 * 1024,
-        )
-        .unwrap();
+        let mut parameters =
+            handshake::Parameters::streaming(limits, handshake::PRODUCER | handshake::CONSUMER)
+                .unwrap();
         parameters.capabilities |= handshake::OWNER_ROUTING | handshake::OWNER_READ;
         let runtime = WriterRuntime::new().unwrap();
         let links = BrokerLinks::connect(
@@ -63,6 +59,11 @@ impl Client {
                         endpoint: checked.deployment.deployment().brokers[name]
                             .endpoints
                             .peer
+                            .parse()
+                            .unwrap(),
+                        data_endpoint: checked.deployment.deployment().brokers[name]
+                            .endpoints
+                            .data_peer
                             .parse()
                             .unwrap(),
                     })

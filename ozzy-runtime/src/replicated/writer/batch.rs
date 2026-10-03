@@ -6,7 +6,7 @@ use ozzy_proto::append::{self, Append, Authority, DataLimits, PayloadEncoding, R
 use smallvec::SmallVec;
 use tokio::time::Instant;
 
-use super::{AppendKey, Error, PartitionTarget, Shared};
+use super::{AppendKey, Error, Shared};
 
 mod payload;
 mod selection;
@@ -45,7 +45,7 @@ pub(super) struct PayloadView<'a> {
 }
 
 impl Batch {
-    pub(super) fn new(_records: usize) -> Self {
+    pub(super) fn new() -> Self {
         Self {
             records: SelectedRecords { start: 0, count: 0 },
             bytes: 0,
@@ -55,12 +55,15 @@ impl Batch {
         }
     }
 
+    /// Select the next APPEND. While an earlier APPEND of this writer is
+    /// unconfirmed (`in_flight`), a partial batch keeps collecting until that
+    /// confirmation arrives. Full batches and flushes still pipeline. With
+    /// nothing in flight, a single ready record is sent at once.
     pub(super) fn select(
         &mut self,
         next: u64,
         limits: DataLimits,
-        record_credit: usize,
-        byte_credit: usize,
+        in_flight: bool,
         shared: &mut super::state::Driver,
     ) -> Result<bool, Error> {
         self.records.clear();
@@ -68,15 +71,12 @@ impl Batch {
         self.bytes = 0;
         self.deadline = None;
         self.waiting_for_payload = false;
-        if record_credit == 0 {
-            return Ok(false);
-        }
         shared.drain();
         let force_through = shared
             .flush_through
             .load(std::sync::atomic::Ordering::Acquire);
         let sealed = shared.sealed();
-        let fixed = shared.config.partition.metadata_bytes() + 10;
+        let fixed = append::IDENTITY_METADATA_BYTES + 10;
         let target_bytes = shared.config.batch_target_bytes;
         let linger = shared.config.linger;
         let admission = &mut shared.admission;
@@ -88,10 +88,7 @@ impl Batch {
             return Ok(false);
         };
         let force = next < force_through || sealed;
-        let mut cap = limits
-            .max_records
-            .min(record_credit)
-            .min(super::MAX_APPEND_RECORDS);
+        let mut cap = limits.max_records.min(super::MAX_APPEND_RECORDS);
         if next < force_through {
             cap = cap.min((force_through - next) as usize);
         }
@@ -103,7 +100,6 @@ impl Batch {
             limits,
             target_bytes,
             cap,
-            byte_credit,
             fixed,
         )?;
         let count = selection.records;
@@ -111,6 +107,9 @@ impl Batch {
             return Ok(false);
         }
         self.bytes = selection.bytes;
+        if !force && !selection.full && in_flight {
+            return Ok(false);
+        }
         if !force
             && !selection.full
             && let Some(deadline) = oldest.linger_deadline(linger)
@@ -190,23 +189,21 @@ impl Batch {
                 .expect("nonempty selected batch")
                 .sequence,
         };
-        Ok(match &shared.config.partition {
-            PartitionTarget::Group(partition) => append::encode_prepared_append_metadata(
-                envelope,
-                Append {
-                    authority: authority.expect("group route"),
-                    partition: *partition,
-                    owner_epoch: shared.config.owner_epoch,
-                    key,
-                    policy: shared.config.policy,
-                    records: &records,
-                },
-                metadata,
-                payload.encoding,
-                payload.encoded_bytes,
-                limits,
-            ),
-        }?)
+        Ok(append::encode_prepared_append_metadata(
+            envelope,
+            Append {
+                authority: authority.expect("group route"),
+                partition: shared.config.partition,
+                owner_epoch: shared.config.owner_epoch,
+                key,
+                policy: shared.config.policy,
+                records: &records,
+            },
+            metadata,
+            payload.encoding,
+            payload.encoded_bytes,
+            limits,
+        )?)
     }
 
     fn selected<'a>(

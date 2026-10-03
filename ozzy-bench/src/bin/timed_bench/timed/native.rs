@@ -29,7 +29,7 @@ pub(super) fn writer_settings(config: &Config) -> SharedTopicWriterConfig {
         limits: config.writer_limits(),
         compress_payloads: config.args.payload_compression
             == crate::bench::PayloadCompression::Adaptive,
-        batch_target_bytes: super::config::sdk_batch_target(config.args.record_bytes)
+        batch_target_bytes: super::config::sdk_batch_target(&config.args)
             .min(config.writer_limits().envelope.max_payload_bytes),
         max_producers: 1,
         inflight_appends: config.args.writer_inflight_appends,
@@ -54,6 +54,7 @@ impl Setup {
                         *uuid::Uuid::parse_str(text(broker, "node")?)?.as_bytes(),
                     ),
                     endpoint: text(broker, "endpoint")?.parse()?,
+                    data_endpoint: text(broker, "data_endpoint")?.parse()?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -96,12 +97,7 @@ impl Setup {
             .envelope
             .max_metadata_bytes
             .max(DIRECTORY_METADATA_BYTES);
-        let mut parameters = handshake::Parameters::streaming(
-            limits,
-            handshake::PRODUCER,
-            u64::try_from(append.records)?,
-            u64::try_from(append.bytes)?,
-        )?;
+        let mut parameters = handshake::Parameters::streaming(limits, handshake::PRODUCER)?;
         parameters.capabilities |= handshake::OWNER_ROUTING;
         let mut links = self.links_config(parameters)?;
         links.append = Some(append);
@@ -130,11 +126,7 @@ impl Setup {
         reader: ReaderLinkLimits,
     ) -> Result<BrokerLinksConfig> {
         let limits = Self::reader_limits(config);
-        let mut parameters = handshake::Parameters::reader_window(
-            limits,
-            handshake::CONSUMER,
-            reader.subscriptions,
-        )?;
+        let mut parameters = handshake::Parameters::reader(limits, handshake::CONSUMER)?;
         parameters.capabilities |= handshake::OWNER_ROUTING;
         let mut links = self.links_config(parameters)?;
         links.reader = Some(reader);
@@ -212,6 +204,7 @@ mod tests {
             (0..3).map(|index| json!({
                 "node": uuid::Uuid::from_bytes([index + 1; 16]).to_string(),
                 "endpoint": format!("tcp://127.0.0.1:{}", 100 + u16::from(index)),
+                "data_endpoint": format!("tcp://127.0.0.1:{}", 200 + u16::from(index)),
             })).collect::<Vec<_>>()
         });
         let setup = Setup::parse(&config, &value).unwrap();

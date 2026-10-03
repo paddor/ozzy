@@ -146,7 +146,9 @@ async fn read_topic_records(
     .await
     .unwrap();
     for (offset, (id, body)) in expected.iter().enumerate() {
-        let record = live(broker, reader.next()).await.unwrap();
+        let record = live(broker, reader.next())
+            .await
+            .unwrap_or_else(|error| panic!("{topic} replay at offset {offset}: {error:?}"));
         assert_eq!(record.partition, 0);
         assert_eq!(record.offset.get(), offset as u64);
         assert_eq!(record.message_id, *id);

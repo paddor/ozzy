@@ -19,6 +19,7 @@ pub(super) struct Files {
     pub(super) lock: Handle,
     evidence: Option<Handle>,
     pub(super) limits: Limits,
+    pub(super) readers: crate::async_files::ReadHandles,
 }
 
 impl Files {
@@ -90,7 +91,25 @@ impl Files {
             lock,
             evidence: None,
             limits,
+            readers: std::rc::Rc::default(),
         })
+    }
+
+    pub(super) async fn close_all(self) -> Result<(), DirectoryError> {
+        drop(self.readers);
+        let mut result = Ok(());
+        for handle in self.evidence.into_iter().chain([self.directory, self.lock]) {
+            let closed = self
+                .io
+                .execute(Class::Progress, Operation::Close { handle })
+                .await
+                .map_err(DirectoryError::from)
+                .and_then(done);
+            if result.is_ok() {
+                result = closed;
+            }
+        }
+        result
     }
 
     pub(super) async fn read(

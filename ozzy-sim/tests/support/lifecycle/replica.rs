@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use ozzy_proto::RequestId;
 use ozzy_replication::driver::{Action, ReplicaDriver};
-use ozzy_replication::wire::{Control, FetchOps, Grant, ReplicaMessage};
+use ozzy_replication::wire::{Control, FetchOps, ReplicaMessage};
 use ozzy_replication::{Admission, Commit, JournalGeneration, NormalReplica, StartView};
 
 use super::disk::{DiskImage, PendingDisk};
@@ -604,19 +604,12 @@ impl Replica {
         };
         let snapshot = normal.snapshot();
         if self.configuration.primary(snapshot.scope.view) != node(self.id) {
-            let grant = Grant {
-                revision: 1,
-                record_limit: 0,
-                byte_limit: 0,
-            };
             let ack = match self.configuration.policy() {
                 QuorumPolicy::Durable => Control::PrepareOk {
                     ack: normal.acknowledgment().unwrap(),
-                    grant,
                 },
                 QuorumPolicy::Replicated => Control::PrepareRetained {
                     ack: normal.retained_acknowledgment().unwrap(),
-                    grant,
                 },
             };
             output.push(Packet::control(

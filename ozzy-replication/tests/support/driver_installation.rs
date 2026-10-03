@@ -101,11 +101,6 @@ fn previously_committed_tail_still_requires_new_view_backup_before_primary_activ
                     scope: primary.scope(),
                     durable: operation().prefix(),
                 },
-                grant: Grant {
-                    revision: 1,
-                    record_limit: 1,
-                    byte_limit: 1024,
-                },
             },
             now,
         )
@@ -134,11 +129,6 @@ fn activation_ticket_requires_new_view_quorum_and_rejects_late_completion() {
                 ack: ozzy_replication::PrepareOk {
                     scope: primary.scope(),
                     durable: operation().prefix(),
-                },
-                grant: Grant {
-                    revision: 1,
-                    record_limit: 1,
-                    byte_limit: 1024,
                 },
             },
             now,
@@ -265,18 +255,7 @@ fn lost_start_view_retries_then_installed_quorum_releases_fresh_admission() {
     assert_eq!(ack.scope.view, 1);
     assert_eq!(ack.durable, operation().prefix());
     primary
-        .receive(
-            node(2),
-            Control::PrepareOk {
-                ack,
-                grant: Grant {
-                    revision: 1,
-                    record_limit: 1,
-                    byte_limit: 1024,
-                },
-            },
-            now,
-        )
+        .receive(node(2), Control::PrepareOk { ack }, now)
         .unwrap();
     assert_eq!(
         primary.normal().unwrap().snapshot().committed,
@@ -410,11 +389,6 @@ fn selected_tail_activation_uses_recovery_deadline_not_steady_state_timeout() {
             node(2),
             Control::PrepareOk {
                 ack: backup.normal().unwrap().acknowledgment().unwrap(),
-                grant: Grant {
-                    revision: 1,
-                    record_limit: 1,
-                    byte_limit: 1024,
-                },
             },
             later,
         )

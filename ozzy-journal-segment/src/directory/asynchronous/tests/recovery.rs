@@ -191,6 +191,7 @@ fn async_recovery_never_bypasses_authority_or_checkpoint_validation() {
         let access = Access {
             io: io.clone(),
             protection: None,
+            readers: std::rc::Rc::default(),
         };
         let handle = drive(
             &mut controller,

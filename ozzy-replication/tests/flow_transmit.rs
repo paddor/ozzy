@@ -24,20 +24,11 @@ fn ms(value: u64) -> Duration {
 }
 
 fn pair() -> (Transmitter, Receiver) {
-    pair_with_credit(false)
-}
-
-fn pair_with_credit(reserved: bool) -> (Transmitter, Receiver) {
     let limits = PipelineLimits {
         max_operations: 4,
         max_body_bytes: 100,
     };
-    let receiver = if reserved {
-        Receiver::new_reserved(channel(1), Prefix::GENESIS, limits)
-    } else {
-        Receiver::new(channel(1), Prefix::GENESIS, limits)
-    }
-    .unwrap();
+    let receiver = Receiver::new(channel(1), Prefix::GENESIS, limits).unwrap();
     let mut sender = Transmitter::new(
         channel(1).scope,
         limits,
@@ -50,7 +41,7 @@ fn pair_with_credit(reserved: bool) -> (Transmitter, Receiver) {
     )
     .unwrap();
     let probe = sender
-        .poll_probe(Prefix::GENESIS, 1, false, ms(0))
+        .poll_probe(Prefix::GENESIS, false, ms(0))
         .unwrap()
         .unwrap();
     let StatusOutcome::Verify = sender
@@ -85,38 +76,35 @@ fn operations() -> [Operation; 4] {
 }
 
 #[test]
-fn renewed_credit_starts_a_probe_without_waiting_or_trusting_the_hint() {
-    let (mut sender, mut receiver) = pair_with_credit(true);
+fn fresh_receipt_epoch_starts_a_correlated_probe_without_trusting_the_hint() {
+    let (mut sender, mut receiver) = pair();
     let ops = operations();
-    receiver.grant(channel(1), 4, 100).unwrap();
     sender.observe(receiver.report(), None, ms(1)).unwrap();
     sender.record_send(&ops).unwrap();
     receiver.retain(channel(1), &ops).unwrap();
     sender.observe(receiver.report(), None, ms(2)).unwrap();
     receiver.release(ops[3].prefix).unwrap();
-    receiver.revoke_unused(channel(2).epoch).unwrap();
-    receiver.grant(channel(2), 4, 100).unwrap();
+    receiver
+        .retract(channel(2).epoch, receiver.report().received)
+        .unwrap();
 
     assert_eq!(
         sender.observe(receiver.report(), None, ms(3)).unwrap(),
         StatusOutcome::Ignored
     );
     assert_eq!(sender.sender().unwrap().channel(), channel(1));
-    assert_eq!(sender.sender().unwrap().available().max_operations, 0);
+    assert_eq!(sender.sender().unwrap().available().max_operations, 4);
     assert!(sender.candidate().is_none());
-    assert_eq!(
-        sender.poll_probe(ops[3].prefix, 1, true, ms(3)).unwrap(),
-        None
-    );
+    assert_eq!(sender.poll_probe(ops[3].prefix, true, ms(3)).unwrap(), None);
     let probe = sender
-        .poll_probe(ops[3].prefix, 1, false, ms(3))
+        .poll_probe(ops[3].prefix, false, ms(3))
         .unwrap()
         .expect("renewed credit must not wait for the periodic probe timer");
 
     sender.observe(receiver.report(), None, ms(4)).unwrap();
     assert_eq!(sender.pending_probe(), Some(probe));
     assert_eq!(
-        sender.poll_probe(ops[3].prefix, 1, false, ms(4)).unwrap(),
+        sender.poll_probe(ops[3].prefix, false, ms(4)).unwrap(),
         None
     );
     assert_eq!(
@@ -142,18 +130,18 @@ fn renewed_credit_starts_a_probe_without_waiting_or_trusting_the_hint() {
 
 #[test]
 fn replacement_hint_retries_live_probe_once_and_preserves_history_check() {
-    let (mut sender, mut receiver) = pair_with_credit(true);
+    let (mut sender, mut receiver) = pair();
     let probe = sender
-        .poll_probe(Prefix::GENESIS, 1, false, ms(10))
+        .poll_probe(Prefix::GENESIS, false, ms(10))
         .unwrap()
         .unwrap();
-    receiver.revoke_unused(channel(2).epoch).unwrap();
+    receiver
+        .retract(channel(2).epoch, receiver.report().received)
+        .unwrap();
     sender.observe(receiver.report(), None, ms(11)).unwrap();
     assert_eq!(sender.pending_probe(), Some(probe));
     assert_eq!(
-        sender
-            .poll_probe(Prefix::GENESIS, 1, false, ms(11))
-            .unwrap(),
+        sender.poll_probe(Prefix::GENESIS, false, ms(11)).unwrap(),
         Some(probe)
     );
     sender
@@ -164,9 +152,7 @@ fn replacement_hint_retries_live_probe_once_and_preserves_history_check() {
     assert_eq!(sender.candidate(), Some(candidate));
     assert_eq!(sender.pending_probe(), Some(probe));
     assert_eq!(
-        sender
-            .poll_probe(Prefix::GENESIS, 1, false, ms(13))
-            .unwrap(),
+        sender.poll_probe(Prefix::GENESIS, false, ms(13)).unwrap(),
         None
     );
     assert!(
@@ -178,57 +164,26 @@ fn replacement_hint_retries_live_probe_once_and_preserves_history_check() {
 
 #[test]
 fn new_unsent_work_advertises_receive_demand_without_timer_delay_or_repair() {
-    let (mut sender, mut receiver) = pair_with_credit(true);
+    let (mut sender, mut receiver) = pair();
     let ops = operations();
     let probe = sender
-        .poll_probe(ops[0].prefix, 1, false, ms(1))
+        .poll_probe(ops[0].prefix, false, ms(1))
         .unwrap()
         .expect("new work must advertise demand before the idle probe deadline");
     assert_eq!(probe.tail, Prefix::GENESIS);
     assert_eq!(probe.available, ops[0].prefix.op);
-    assert_eq!(receiver.report().operation_limit, 0);
     sender
         .observe(receiver.report(), Some(probe.request_id), ms(1))
         .unwrap();
     assert_eq!(
-        sender.poll_probe(ops[0].prefix, 1, false, ms(2)).unwrap(),
+        sender.poll_probe(ops[0].prefix, false, ms(2)).unwrap(),
         None
     );
     assert!(sender.repair(false).is_none());
-    assert_eq!(sender.record_send(&ops[..1]), Err(FlowError::Capacity));
-    receiver.grant(channel(1), 1, 25).unwrap();
     sender.observe(receiver.report(), None, ms(2)).unwrap();
     sender.record_send(&ops[..1]).unwrap();
     receiver.retain(channel(1), &ops[..1]).unwrap();
     assert_eq!(receiver.report().received, ops[0].prefix);
-}
-
-#[test]
-fn free_receive_capacity_preserves_retained_bodies_across_credit_revocation() {
-    let (_, mut receiver) = pair_with_credit(true);
-    let ops = operations();
-    assert_eq!(receiver.available().max_operations, 4);
-    assert_eq!(receiver.available().max_body_bytes, 100);
-    receiver.grant(channel(1), 4, 100).unwrap();
-    assert_eq!(receiver.available().max_operations, 0);
-    receiver.retain(channel(1), &ops[..1]).unwrap();
-    let report = receiver
-        .revoke_unused(ReceiveEpoch::new(2).unwrap())
-        .unwrap();
-    let available = receiver.available();
-    assert_eq!(available.max_operations, 3);
-    assert_eq!(available.max_body_bytes, 75);
-    receiver.grant(report.channel, 4, 100).unwrap_err();
-    receiver
-        .grant(
-            report.channel,
-            available.max_operations as u64,
-            available.max_body_bytes as u64,
-        )
-        .unwrap();
-    receiver.release(ops[0].prefix).unwrap();
-    assert_eq!(receiver.available().max_operations, 1);
-    assert_eq!(receiver.available().max_body_bytes, 25);
 }
 
 #[test]
@@ -237,7 +192,7 @@ fn availability_hint_cannot_extend_repair_into_work_sent_after_the_probe() {
     let ops = operations();
     sender.record_send(&ops[..1]).unwrap();
     let probe = sender
-        .poll_probe(ops[3].prefix, 1, false, ms(10))
+        .poll_probe(ops[3].prefix, false, ms(10))
         .unwrap()
         .unwrap();
     assert_eq!(probe.tail, ops[0].prefix);
@@ -256,7 +211,7 @@ fn replacing_session_preserves_spent_credit_and_fences_pending_history_verificat
     let ops = operations();
     sender.record_send(&ops).unwrap();
     let old = sender
-        .poll_probe(ops[3].prefix, 1, false, ms(10))
+        .poll_probe(ops[3].prefix, false, ms(10))
         .unwrap()
         .unwrap();
     let replacement = Receiver::new(
@@ -287,7 +242,7 @@ fn replacing_session_preserves_spent_credit_and_fences_pending_history_verificat
             .unwrap()
     );
     let current = sender
-        .poll_probe(ops[3].prefix, 1, false, ms(11))
+        .poll_probe(ops[3].prefix, false, ms(11))
         .unwrap()
         .unwrap();
     assert_ne!(current.request_id, old.request_id);
@@ -318,7 +273,7 @@ fn delayed_disk_after_receipt_never_schedules_payload_repair() {
     sender.observe(receiver.report(), None, ms(0)).unwrap();
     for instant in (10..=1_000).step_by(10) {
         let probe = sender
-            .poll_probe(ops[3].prefix, 1, false, ms(instant))
+            .poll_probe(ops[3].prefix, false, ms(instant))
             .unwrap()
             .unwrap();
         sender
@@ -327,8 +282,6 @@ fn delayed_disk_after_receipt_never_schedules_payload_repair() {
         assert_eq!(sender.repair(false), None);
         assert_eq!(sender.sender().unwrap().outstanding().count(), 0);
         // No application release and no durable vote have occurred.
-        assert_eq!(receiver.report().operation_limit, 4);
-        assert_eq!(receiver.report().byte_limit, 100);
     }
 }
 
@@ -341,12 +294,12 @@ fn lost_tail_and_lost_repair_retry_only_after_correlated_gap_reports() {
     sender.observe(receiver.report(), None, ms(1)).unwrap();
     assert_eq!(sender.repair(false), None); // Partial receipt alone is not loss evidence.
     let probe = sender
-        .poll_probe(ops[3].prefix, 1, false, ms(10))
+        .poll_probe(ops[3].prefix, false, ms(10))
         .unwrap()
         .unwrap();
     assert_eq!(sender.repair(false), None); // Timer emits no payload action.
     let retry = sender
-        .poll_probe(ops[3].prefix, 1, false, ms(20))
+        .poll_probe(ops[3].prefix, false, ms(20))
         .unwrap()
         .unwrap();
     assert_eq!(retry, probe); // First response was lost.
@@ -358,7 +311,7 @@ fn lost_tail_and_lost_repair_retry_only_after_correlated_gap_reports() {
     assert_eq!(repair.through, ops[3].prefix);
     assert_eq!(sender.repair(true), None); // Locally queued data cannot be duplicated.
     assert_eq!(
-        sender.poll_probe(ops[3].prefix, 1, false, ms(100)).unwrap(),
+        sender.poll_probe(ops[3].prefix, false, ms(100)).unwrap(),
         None
     );
     sender.record_repair(repair, ops[1].prefix).unwrap();
@@ -369,7 +322,7 @@ fn lost_tail_and_lost_repair_retry_only_after_correlated_gap_reports() {
     sender.record_repair(remaining, ops[3].prefix).unwrap(); // Lost retry packet.
     assert_eq!(sender.sender().unwrap().outstanding().count(), 2);
     let probe = sender
-        .poll_probe(ops[3].prefix, 1, false, ms(102))
+        .poll_probe(ops[3].prefix, false, ms(102))
         .unwrap()
         .unwrap();
     sender
@@ -386,13 +339,13 @@ fn lost_tail_and_lost_repair_retry_only_after_correlated_gap_reports() {
 }
 
 #[test]
-fn lost_receipt_and_lost_credit_updates_recover_without_payload_copies() {
+fn lost_receipt_recovers_without_retransmitting_retained_bodies() {
     let (mut sender, mut receiver) = pair();
     let ops = operations();
     sender.record_send(&ops).unwrap();
     receiver.retain(channel(1), &ops).unwrap(); // Lost unsolicited receipt.
     let probe = sender
-        .poll_probe(ops[3].prefix, 1, false, ms(10))
+        .poll_probe(ops[3].prefix, false, ms(10))
         .unwrap()
         .unwrap();
     sender
@@ -407,18 +360,14 @@ fn lost_receipt_and_lost_credit_updates_recover_without_payload_copies() {
         previous_digest: ops[3].prefix.digest,
         body_bytes: 25,
     };
-    assert_eq!(sender.record_send(&[next]), Err(FlowError::Capacity));
-    receiver.release(ops[0].prefix).unwrap(); // Lost credit update.
-    assert_eq!(sender.record_send(&[next]), Err(FlowError::Capacity));
-    let probe = sender
-        .poll_probe(next.prefix, 1, false, ms(20))
-        .unwrap()
-        .unwrap();
-    sender
-        .observe(receiver.report(), Some(probe.request_id), ms(20))
-        .unwrap();
-    assert_eq!(sender.repair(false), None);
     sender.record_send(&[next]).unwrap();
+    assert_eq!(
+        receiver.retain(channel(1), &[next]),
+        Err(FlowError::Capacity)
+    );
+    let receipt = receiver.report();
+    receiver.release(ops[0].prefix).unwrap();
+    assert_eq!(receiver.report(), receipt); // No remote capacity update exists.
     receiver.retain(channel(1), &[next]).unwrap();
 }
 
@@ -436,7 +385,7 @@ fn replacement_epoch_needs_current_correlation_and_both_history_boundaries() {
     );
     assert_eq!(sender.sender().unwrap().channel(), channel(1));
     let probe = sender
-        .poll_probe(ops[1].prefix, 1, false, ms(10))
+        .poll_probe(ops[1].prefix, false, ms(10))
         .unwrap()
         .unwrap();
     let StatusOutcome::Verify = sender
@@ -493,11 +442,11 @@ fn local_backpressure_and_new_views_fence_probe_and_repair_ownership() {
     let ops = operations();
     sender.record_send(&ops).unwrap();
     assert_eq!(
-        sender.poll_probe(ops[3].prefix, 1, true, ms(10)).unwrap(),
+        sender.poll_probe(ops[3].prefix, true, ms(10)).unwrap(),
         None
     );
     let probe = sender
-        .poll_probe(ops[3].prefix, 1, false, ms(20))
+        .poll_probe(ops[3].prefix, false, ms(20))
         .unwrap()
         .unwrap();
     sender
@@ -527,7 +476,7 @@ fn local_backpressure_and_new_views_fence_probe_and_repair_ownership() {
     );
     assert_eq!(sender.record_send(&ops), Err(FlowError::Channel));
     let next = sender
-        .poll_probe(Prefix::GENESIS, 1, false, ms(23))
+        .poll_probe(Prefix::GENESIS, false, ms(23))
         .unwrap()
         .unwrap();
     assert_ne!(next.request_id, probe.request_id);
@@ -557,7 +506,7 @@ fn broadcast_progress_requires_history_but_no_send_reservations() {
     );
     assert_eq!(sender.sender().unwrap().received(), ops[1].prefix);
     assert_eq!(sender.sender().unwrap().outstanding().count(), 0);
-    assert_eq!(sender.sender().unwrap().available().max_body_bytes, 50);
+    assert_eq!(sender.sender().unwrap().available().max_body_bytes, 100);
     assert_eq!(
         sender.observe(receiver.report(), None, ms(2)).unwrap(),
         StatusOutcome::Ignored
@@ -571,7 +520,7 @@ fn lost_unreserved_publication_opens_bounded_peer_repair() {
     sender.enable_broadcast();
     let ops = operations();
     let probe = sender
-        .poll_probe(ops[3].prefix, 1, false, ms(10))
+        .poll_probe(ops[3].prefix, false, ms(10))
         .unwrap()
         .unwrap();
     assert_eq!(probe.tail, ops[3].prefix);
@@ -582,12 +531,12 @@ fn lost_unreserved_publication_opens_bounded_peer_repair() {
     sender.record_send(&ops[..2]).unwrap();
     receiver.retain(channel(1), &ops[..2]).unwrap();
     sender.observe(receiver.report(), None, ms(11)).unwrap();
-    assert_eq!(sender.sender().unwrap().available().max_operations, 2);
+    assert_eq!(sender.sender().unwrap().available().max_operations, 4);
     sender.record_send(&ops[2..]).unwrap();
     assert!(!sender.needs_catch_up());
     // The PEER repair packet was lost too. Retry after receipt has been quiet.
     let probe = sender
-        .poll_probe(ops[3].prefix, 1, false, ms(91))
+        .poll_probe(ops[3].prefix, false, ms(91))
         .unwrap()
         .unwrap();
     sender
@@ -599,7 +548,7 @@ fn lost_unreserved_publication_opens_bounded_peer_repair() {
     receiver.retain(channel(1), &ops[2..]).unwrap();
     sender.observe(receiver.report(), None, ms(92)).unwrap();
     assert_eq!(sender.repair(false), None);
-    assert_eq!(sender.sender().unwrap().available().max_body_bytes, 0);
+    assert_eq!(sender.sender().unwrap().available().max_body_bytes, 100);
 }
 
 #[test]
@@ -619,7 +568,7 @@ fn broadcast_overtaking_peer_repair_retires_only_verified_reservations() {
         .open_verified(request, Prefix::GENESIS, ops[3].prefix, ms(1))
         .unwrap();
     assert_eq!(sender.sender().unwrap().outstanding().count(), 0);
-    assert_eq!(sender.sender().unwrap().available().max_operations, 0);
+    assert_eq!(sender.sender().unwrap().available().max_operations, 4);
     let mut invalid = receiver.report();
     invalid.revision += 1;
     invalid.received_bytes -= 1;
@@ -665,7 +614,7 @@ fn broadcast_receiver_epoch_and_scope_still_require_fences() {
         StatusOutcome::Ignored
     );
     let probe = sender
-        .poll_probe(ops[0].prefix, 1, false, ms(10))
+        .poll_probe(ops[0].prefix, false, ms(10))
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -699,7 +648,7 @@ fn delayed_publication_verification_cannot_erase_newer_peer_reservations() {
     );
     assert_eq!(sender.sender().unwrap().received(), ops[1].prefix);
     assert_eq!(sender.sender().unwrap().outstanding().count(), 2);
-    assert_eq!(sender.sender().unwrap().available().max_body_bytes, 0);
+    assert_eq!(sender.sender().unwrap().available().max_body_bytes, 50);
 }
 
 #[test]
@@ -708,7 +657,7 @@ fn held_publication_bounds_correlated_repair_before_its_predecessor() {
     sender.enable_broadcast();
     let ops = operations();
     let probe = sender
-        .poll_probe(ops[3].prefix, 1, false, ms(10))
+        .poll_probe(ops[3].prefix, false, ms(10))
         .unwrap()
         .unwrap();
     sender
@@ -725,7 +674,7 @@ fn held_publication_bounds_correlated_repair_before_its_predecessor() {
     assert!(!sender.needs_catch_up());
     // PUB has operations 2..4 buffered. Repair must stop after operation 1.
     let probe = sender
-        .poll_probe(ops[3].prefix, 1, false, ms(80))
+        .poll_probe(ops[3].prefix, false, ms(80))
         .unwrap()
         .unwrap();
     sender
@@ -751,7 +700,7 @@ fn capacity_blocked_publication_requests_no_missing_data() {
         .open_verified(candidate, Prefix::GENESIS, ops[0].prefix, ms(1))
         .unwrap();
     let probe = sender
-        .poll_probe(ops[3].prefix, 1, false, ms(10))
+        .poll_probe(ops[3].prefix, false, ms(10))
         .unwrap()
         .unwrap();
     sender
@@ -777,7 +726,7 @@ fn advancing_peer_catch_up_is_not_retransmitted_by_a_probe() {
         receiver.retain(channel(1), &ops[index..=index]).unwrap();
         sender.observe(receiver.report(), None, ms(at - 1)).unwrap();
         let probe = sender
-            .poll_probe(ops[3].prefix, 1, false, ms(at))
+            .poll_probe(ops[3].prefix, false, ms(at))
             .unwrap()
             .unwrap();
         sender
@@ -787,7 +736,7 @@ fn advancing_peer_catch_up_is_not_retransmitted_by_a_probe() {
     }
     // A genuinely missing final PEER chunk still retries after receipt stops.
     let probe = sender
-        .poll_probe(ops[3].prefix, 1, false, ms(110))
+        .poll_probe(ops[3].prefix, false, ms(110))
         .unwrap()
         .unwrap();
     sender

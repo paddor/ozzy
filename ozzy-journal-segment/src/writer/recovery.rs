@@ -2,7 +2,7 @@
 
 use super::{
     BodyEncodeScratch, ChainPosition, DecodeLimits, JournalGeneration, RecoveryValidation,
-    SegmentDigestBuilder, SegmentWriter, TailState, WriterError, WriterPosition, damaged_tail_end,
+    SegmentDigestBuilder, SegmentState, TailState, WriterError, WriterPosition, damaged_tail_end,
     scan_segment,
 };
 use crate::{DecodedOperation, SegmentScan, cooperative::Budget};
@@ -12,21 +12,20 @@ use std::ops::Range;
 #[cfg(test)]
 mod tests;
 
-pub(super) struct Recovery<I> {
-    pub(super) writer: SegmentWriter<I>,
+pub(super) struct Recovery {
+    pub(super) writer: SegmentState,
     pub(super) truncate: Option<u64>,
     pub(super) zero: Range<u64>,
 }
 
-pub(super) fn prepare<I>(
-    io: I,
+pub(super) fn prepare(
     image: &[u8],
     generation: JournalGeneration,
     first_group_number: u64,
     initial_chain: ChainPosition,
     limits: DecodeLimits,
     validation: RecoveryValidation,
-) -> Result<Recovery<I>, WriterError> {
+) -> Result<Recovery, WriterError> {
     let scan = if validation.discard_damaged_tail {
         crate::codec::scan_segment_prefix(image, first_group_number, initial_chain, limits)?
     } else {
@@ -47,7 +46,7 @@ pub(super) fn prepare<I>(
     } else {
         0..0
     };
-    Ok(finish(io, scan, generation, segment_digest, truncate, zero))
+    Ok(finish(scan, generation, segment_digest, truncate, zero))
 }
 
 pub(super) async fn prepare_async(
@@ -57,7 +56,7 @@ pub(super) async fn prepare_async(
     initial_chain: ChainPosition,
     limits: DecodeLimits,
     validation: RecoveryValidation,
-) -> Result<Recovery<()>, WriterError> {
+) -> Result<Recovery, WriterError> {
     let scan = if validation.discard_damaged_tail {
         crate::codec::scan_segment_prefix_async(image, first_group_number, initial_chain, limits)
             .await?
@@ -92,7 +91,7 @@ pub(super) async fn prepare_async(
     } else {
         0..0
     };
-    Ok(finish((), scan, generation, segment_digest, truncate, zero))
+    Ok(finish(scan, generation, segment_digest, truncate, zero))
 }
 
 /// Both execution paths consume the same canonical and protected-history checks.
@@ -161,14 +160,13 @@ impl Checks {
     }
 }
 
-fn finish<I>(
-    io: I,
+fn finish(
     scan: SegmentScan<'_>,
     generation: JournalGeneration,
     segment_digest: SegmentDigestBuilder,
     truncate: Option<u64>,
     zero: Range<u64>,
-) -> Recovery<I> {
+) -> Recovery {
     let position = WriterPosition {
         generation,
         segment_id: scan.header.segment_id(),
@@ -178,8 +176,7 @@ fn finish<I>(
         next_chain: scan.next_chain,
     };
     Recovery {
-        writer: SegmentWriter {
-            io,
+        writer: SegmentState {
             generation,
             header: scan.header,
             written: position,
@@ -189,7 +186,6 @@ fn finish<I>(
             encode_buffer: Vec::new(),
             body_encode_scratch: Some(BodyEncodeScratch::default()),
             data_sync: false,
-            direct: None,
             faulted: false,
         },
         truncate,

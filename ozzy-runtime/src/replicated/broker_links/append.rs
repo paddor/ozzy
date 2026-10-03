@@ -16,7 +16,7 @@ use super::{BrokerLinkError, BrokerLinks, StateSignal};
 use tokio::sync::mpsc;
 
 mod budget;
-use budget::{Budget, Cost, Lease, PeerLimit};
+use budget::{Budget, Cost, Lease};
 
 /// Fixed APPEND transport bounds for one SDK owner, shared across its brokers.
 /// Requests and record windows remain reserved through actual buffer release.
@@ -159,7 +159,7 @@ impl Registry {
 
 #[derive(Clone, Copy, Debug)]
 enum Blocked {
-    Budget(Cost, PeerLimit),
+    Budget(Cost),
     Socket,
 }
 
@@ -202,15 +202,12 @@ impl Connection {
             .shared
             .appends
             .budget
-            .acquire(
-                Cost {
-                    writers: 1,
-                    bytes,
-                    progress_bytes,
-                    ..Cost::default()
-                },
-                None,
-            )
+            .acquire(Cost {
+                writers: 1,
+                bytes,
+                progress_bytes,
+                ..Cost::default()
+            })
             .ok_or(BrokerLinkError::Configuration)?;
         let id = links.next_request()?;
         let (sender, incoming) = mpsc::channel(reply_slots);
@@ -367,14 +364,12 @@ impl Connection {
         id: RequestId,
         end: u64,
         records: usize,
-        decoded_bytes: usize,
         retained_bytes: usize,
     ) -> Result<(), TrySendError> {
         if !self.live() {
             return Err(TrySendError::Closed);
         }
         let broker = self.broker.expect("selected broker");
-        let parameters = self.parameters.expect("negotiated APPEND parameters");
         let replies = records.checked_add(1);
         let bytes = Self::request_bytes(&self.links, records, retained_bytes);
         let Some(bytes) = bytes.filter(|_| records != 0) else {
@@ -386,23 +381,16 @@ impl Connection {
             requests: 1,
             records,
             bytes,
-            peer_bytes: decoded_bytes,
             ..Cost::default()
         };
-        let peer = PeerLimit {
-            node: broker,
-            records: parameters.inflight_records,
-            bytes: parameters.inflight_bytes,
-        };
         let registry = &self.links.0.shared.appends;
-        if !registry.budget.possible(cost, Some(peer)) {
+        if !registry.budget.possible(cost) {
             return Err(TrySendError::Error(omq_tokio::Error::Config(
                 "shared APPEND exceeds aggregate capacity".into(),
             )));
         }
-        let Some(lease) = registry.budget.acquire(cost, Some(peer)) else {
-            *self.blocked.lock().expect("SDK APPEND send poisoned") =
-                Some(Blocked::Budget(cost, peer));
+        let Some(lease) = registry.budget.acquire(cost) else {
+            *self.blocked.lock().expect("SDK APPEND send poisoned") = Some(Blocked::Budget(cost));
             return Err(TrySendError::Full(message));
         };
         let tracked = track(&message, &lease, Some(&self.stream.memory), false);
@@ -428,7 +416,7 @@ impl Connection {
             },
         );
         drop(requests);
-        match crate::transport::try_send_peer(&self.links.0.peers[&broker].socket, tracked) {
+        match crate::transport::try_send_peer(&self.links.0.peers[&broker].data, tracked) {
             Ok(()) => {
                 *self.blocked.lock().expect("SDK APPEND send poisoned") = None;
                 Ok(())
@@ -530,8 +518,8 @@ impl Connection {
                 return;
             }
             let blocked = *self.blocked.lock().expect("SDK APPEND send poisoned");
-            if let Some(Blocked::Budget(cost, peer)) = blocked {
-                if registry.budget.available(cost, Some(peer)) {
+            if let Some(Blocked::Budget(cost)) = blocked {
+                if registry.budget.available(cost) {
                     return;
                 }
                 tokio::select! {
@@ -542,7 +530,7 @@ impl Connection {
             } else {
                 let broker = self.broker.expect("selected broker");
                 tokio::select! {
-                    () = self.links.0.peers[&broker].socket.wait_send_progress_for(message) => {},
+                    () = self.links.0.peers[&broker].data.wait_send_progress_for(message) => {},
                     () = self.links.0.shared.changed.changed_after(links) => {},
                     () = self.links.0.shared.stop.closed() => {},
                 }

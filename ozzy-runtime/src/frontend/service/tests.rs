@@ -1,8 +1,9 @@
 use super::*;
-use crate::dispatch::{self, Budget, Budgets, Quota, Receiver};
-use crate::frontend::{Placement, Subject, dispatch::tests::fixture, test_support};
-use ozzy_proto::{Envelope, LinkSessionId, ProducerId, RequestId, directory};
-use std::{num::NonZeroU64, time::Duration};
+use crate::frontend::{
+    DataPressure, Placement, Rejection, data_channel, dispatch::tests::fixture, test_support,
+};
+use ozzy_proto::{Envelope, RequestId, directory};
+use std::num::NonZeroU64;
 
 fn topic_catalog() -> TopicCatalog {
     let node = NodeId::from_bytes([9; 16]);
@@ -36,6 +37,150 @@ fn topic_catalog() -> TopicCatalog {
         2,
     )
     .unwrap()
+}
+
+#[test]
+fn full_backpressured_append_sends_no_admission_refusal() {
+    let (mut service, _legacy_lanes, placements) = setup();
+    let (sender, mut receiver) = data_channel(
+        &omq_tokio::Context::new(),
+        0,
+        Kind::Client,
+        crate::dispatch::Class::Data,
+        1,
+        4096,
+        8192,
+    )
+    .unwrap();
+    service.dispatcher.install_data_lane(0, sender).unwrap();
+    let peer = NodeId::from_bytes([1; 16]);
+    let client = remote(1, handshake::PRODUCER);
+    let (binding, _) = begin(&mut service, &client, peer);
+    assert!(
+        service
+            .receive(test_support::append(placements[0], binding), 4096)
+            .unwrap()
+            .is_some()
+    );
+    assert!(matches!(
+        service.receive(test_support::append(placements[0], binding), 4096),
+        Err(ReceiveError::Dispatch(Rejection::Data(
+            DataPressure::Full { shard: 0, .. }
+        )))
+    ));
+    assert!(!service.dispatcher.has_replies());
+    assert!(receiver.try_recv().unwrap().is_some());
+    assert!(
+        service
+            .receive(test_support::append(placements[0], binding), 4096)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn publications_require_configured_source_and_group_but_no_dispatch_grant() {
+    let (mut service, _legacy_lanes, placements) = setup();
+    let (sender, mut receiver) = data_channel(
+        &omq_tokio::Context::new(),
+        0,
+        Kind::Broker,
+        crate::dispatch::Class::Data,
+        1,
+        4096,
+        8192,
+    )
+    .unwrap();
+    service.dispatcher.install_data_lane(0, sender).unwrap();
+    let (writer_lane, _writer_queue) = data_channel(
+        &omq_tokio::Context::new(),
+        0,
+        Kind::Client,
+        crate::dispatch::Class::Data,
+        1,
+        4096,
+        8192,
+    )
+    .unwrap();
+    service
+        .dispatcher
+        .install_data_lane(0, writer_lane)
+        .unwrap();
+    let client = NodeId::from_bytes([1; 16]);
+    let (writer, _) = begin(&mut service, &remote(1, handshake::PRODUCER), client);
+    service
+        .receive(test_support::append(placements[0], writer), 4096)
+        .unwrap();
+    let publisher = NodeId::from_bytes([8; 16]);
+    let (binding, _) = begin(&mut service, &remote(8, handshake::OWNER | 8), publisher);
+    let original = test_support::control(
+        placements[0],
+        Binding {
+            peer: NodeId::from_bytes([1; 16]),
+            ..binding
+        },
+    );
+    // Routing checks clear scope only. The partition actor owns canonical
+    // payload validation, leader checks, and local retained-body accounting.
+    let envelope = Envelope {
+        opcode: Opcode::PreparePub,
+        response: false,
+        request_id: None,
+        sender: publisher,
+        session: None,
+    };
+    let mut metadata = original.part_bytes(2).unwrap().to_vec();
+    metadata[32..48].copy_from_slice(publisher.as_bytes());
+    let header = envelope
+        .encode_header(metadata.len(), 0, service.envelope_limits())
+        .unwrap();
+    let message = Message::multipart([
+        Bytes::copy_from_slice(placements[0].group.as_bytes()),
+        Bytes::copy_from_slice(&header),
+        Bytes::from(metadata),
+        Bytes::new(),
+    ]);
+    assert!(
+        service
+            .receive_publication(NodeId::from_bytes([1; 16]), &message, 4096)
+            .is_err()
+    );
+    let mut wrong_topic = message.clone();
+    wrong_topic.pop_front_payload();
+    wrong_topic = Message::with_prefix(
+        Bytes::copy_from_slice(placements[1].group.as_bytes()),
+        wrong_topic,
+    );
+    assert!(
+        service
+            .receive_publication(publisher, &wrong_topic, 4096)
+            .is_err()
+    );
+    assert!(
+        service
+            .receive_publication(publisher, &message, 4096)
+            .unwrap()
+            .is_some()
+    );
+    assert!(matches!(
+        service.receive_publication(publisher, &message, 4096),
+        Err(ReceiveError::Dispatch(Rejection::Data(
+            DataPressure::Full { shard: 0, .. }
+        )))
+    ));
+    let queued = receiver.try_recv().unwrap().unwrap();
+    assert_eq!(queued.binding, binding);
+    assert_eq!(queued.route.placement, placements[0]);
+    assert!(
+        service.receive(queued.message, 4096).is_err(),
+        "ordinary PEER must refuse PUB framing"
+    );
+    service.disconnect(binding);
+    assert!(
+        service
+            .receive_publication(publisher, &message, 4096)
+            .is_err()
+    );
 }
 
 fn watch_request(
@@ -116,7 +261,7 @@ fn watch_rejections_are_correlated_and_leave_the_link_usable() {
             12,
             4,
             placements[0].group,
-            Some((10, nack::RetryClass::AfterCredit)),
+            Some((10, nack::RetryClass::AfterBackoff)),
         ),
         (
             13,
@@ -246,8 +391,7 @@ fn ids(seed: u64) -> LinkIds {
 }
 
 fn profile(roles: u32) -> handshake::Parameters {
-    let mut parameters =
-        handshake::Parameters::streaming(DataLimits::default(), roles, 65536, 1 << 30).unwrap();
+    let mut parameters = handshake::Parameters::streaming(DataLimits::default(), roles).unwrap();
     parameters.capabilities |= handshake::OWNER_READ | (1 << 3) | (1 << 8);
     parameters.required_capabilities = 0;
     parameters
@@ -395,7 +539,8 @@ fn trusted_clients_keep_membership_capacity_and_disconnect_fences_separate() {
     );
 }
 
-pub(in crate::frontend) fn setup() -> (Service, [Receiver<Message>; 2], [Placement; 2]) {
+pub(in crate::frontend) fn setup() -> (Service, [crate::frontend::DataReceiver; 2], [Placement; 2])
+{
     let (mut dispatcher, lanes, placements, binding) = fixture();
     dispatcher.disconnect(binding.peer);
     let access = [
@@ -455,121 +600,6 @@ pub(in crate::frontend) fn reply(binding: Binding, opcode: Opcode) -> Message {
         Bytes::new(),
         Bytes::new(),
     ])
-}
-
-fn budgets() -> Budgets {
-    Budgets {
-        data: Budget {
-            queue_slots: 2,
-            retained_messages: 4,
-            bytes: 8192,
-        },
-        control: Budget {
-            queue_slots: 1,
-            retained_messages: 2,
-            bytes: 4096,
-        },
-    }
-}
-
-#[tokio::test]
-async fn negotiated_reconnect_fences_grants_replies_and_queued_input_without_losing_wakeup() {
-    let (mut service, mut lanes, placements) = setup();
-    let client = remote(1, handshake::PRODUCER);
-    let peer = NodeId::from_bytes([1; 16]);
-    let links = service.links();
-    let generation = links.generation();
-    let (old, hello) = begin(&mut service, &client, peer);
-    tokio::time::timeout(Duration::from_secs(1), links.changed_after(generation))
-        .await
-        .unwrap();
-    let mut owner = lanes[0].credits().client(old.session, budgets()).unwrap();
-    let grant = lanes[0]
-        .credits()
-        .grant(
-            &owner,
-            Class::Data,
-            Quota {
-                messages: 2,
-                bytes: 8192,
-            },
-        )
-        .unwrap();
-    let key = grant.key();
-    let subject = Subject {
-        group: placements[0].group,
-        writer: Some(ProducerId::from_bytes([4; 16])),
-    };
-    service.install(peer, subject, grant).unwrap();
-    service
-        .receive(test_support::append(placements[0], old), 4096)
-        .unwrap();
-    service
-        .try_reply(Class::Control, reply(old, Opcode::Commit))
-        .unwrap();
-    // An exact HELLO duplicate cannot reset unused grants or pending replies.
-    let unchanged = links.generation();
-    service.receive(hello.clone(), 4096).unwrap();
-    assert_eq!(links.generation(), unchanged);
-    assert_eq!(owner.usage(Class::Data).bytes, 8192);
-    // Complete negotiation so the client can create a fresh attempt.
-    let mut welcome = None;
-    service
-        .flush(|message| {
-            if message.part_slice(1).unwrap()[5] == Opcode::Welcome as u8 {
-                welcome = Some(message);
-                Ok(())
-            } else {
-                Err(TrySendError::Full(message))
-            }
-        })
-        .unwrap();
-    let welcome = welcome.unwrap();
-    let frames = std::array::from_fn::<_, 3, _>(|i| welcome.part_slice(i + 1).unwrap());
-    client
-        .receive(
-            service.dispatcher.local,
-            decode_packet(&frames, DataLimits::default().envelope).unwrap(),
-        )
-        .unwrap();
-    let (new, _) = begin(&mut service, &client, peer);
-    assert_ne!(old.session, new.session);
-    assert_eq!(owner.usage(Class::Data).bytes, 4096);
-    assert_eq!(
-        lanes[0].credits().extend(
-            &key,
-            Quota {
-                messages: 1,
-                bytes: 4096
-            }
-        ),
-        Err(dispatch::Error::Revoked)
-    );
-    assert!(!service.dispatcher.has_replies());
-    assert_eq!(
-        service
-            .try_reply(Class::Control, reply(old, Opcode::Commit))
-            .unwrap_err()
-            .0,
-        ReplyError::Session
-    );
-    assert!(!service.disconnect(old));
-    let queued = lanes[0].try_recv().unwrap().unwrap();
-    assert_eq!(queued.session, old.session);
-    assert_ne!(queued.session, links.get(peer).unwrap().binding.session);
-    let held = queued.into_retained_message().part_bytes(3).unwrap();
-    owner.replace_session(new.session).unwrap();
-    assert_eq!(owner.usage(Class::Data).bytes, 4096);
-    drop(held);
-    assert_eq!(owner.usage(Class::Data), Budget::default());
-    service.receive(hello, 4096).unwrap();
-    assert_eq!(links.get(peer).unwrap().binding, new);
-    let before_drop = links.generation();
-    drop(service);
-    assert!(links.get(peer).is_none());
-    tokio::time::timeout(Duration::from_secs(1), links.changed_after(before_drop))
-        .await
-        .unwrap();
 }
 
 #[test]
@@ -635,64 +665,6 @@ fn stalled_handshake_and_recurring_hello_leave_other_links_and_data_runnable() {
     assert!(service.links.get(stalled).is_none());
     service.retry(binding.peer).unwrap();
     assert_eq!(service.links.get(binding.peer).unwrap().binding, binding);
-}
-
-#[test]
-fn revoked_dispatch_token_can_be_replaced_without_changing_network_session() {
-    let (mut service, mut lanes, placements) = setup();
-    let remote = remote(8, 8);
-    let (binding, _) = begin(&mut service, &remote, NodeId::from_bytes([8; 16]));
-    let owner = lanes[0]
-        .credits()
-        .client(binding.session, budgets())
-        .unwrap();
-    let subject = crate::frontend::GrantSpec::replica(
-        ozzy_replication::wire::ReceiveFence::Normal(ozzy_replication::flow::Channel {
-            scope: ozzy_replication::Scope {
-                group_id: placements[0].group,
-                configuration_epoch: 1,
-                configuration_digest: ozzy_replication::Digest::from_bytes([6; 32]),
-                view: 0,
-            },
-            epoch: ozzy_replication::flow::ReceiveEpoch::new(1).unwrap(),
-        }),
-    );
-    let grant = lanes[0]
-        .credits()
-        .grant(
-            &owner,
-            Class::Data,
-            Quota {
-                messages: 1,
-                bytes: 4096,
-            },
-        )
-        .unwrap();
-    let key = grant.key();
-    service.install(binding.peer, subject, grant).unwrap();
-    lanes[0].credits().revoke_key(&key).unwrap();
-    let replacement = lanes[0]
-        .credits()
-        .grant(
-            &owner,
-            Class::Data,
-            Quota {
-                messages: 1,
-                bytes: 4096,
-            },
-        )
-        .unwrap();
-    service.install(binding.peer, subject, replacement).unwrap();
-    assert_eq!(
-        lanes[0].credits().revoke_key(&key),
-        Err(dispatch::Error::Revoked)
-    );
-    assert_eq!(owner.usage(Class::Data).bytes, 4096);
-    assert_eq!(
-        service.links.get(binding.peer).unwrap().binding.session,
-        binding.session
-    );
-    assert_ne!(binding.session, LinkSessionId::from_bytes([0; 16]));
 }
 
 #[test]

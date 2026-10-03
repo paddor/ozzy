@@ -12,14 +12,19 @@ use tokio::sync::oneshot;
 use crate::shards::lifecycle::{Registration, State};
 use crate::{Shutdown, StartupError};
 
+mod followers;
 mod serving;
+pub use followers::FollowerRoutes;
 
 /// Directional OMQ queue/frame bounds. These transport limits do not replace
-/// destination grants or accounting for retained backing allocations.
+/// owner-local accounting for retained backing allocations.
 #[derive(Clone, Copy, Debug)]
 pub struct TransportLimits {
+    /// Maximum queued messages per outbound OMQ connection.
     pub send_messages: u32,
+    /// Maximum queued messages per inbound OMQ connection.
     pub receive_messages: u32,
+    /// Maximum accepted native message bytes.
     pub message_bytes: usize,
     /// Positive finite drain interval. OMQ zero-linger close detaches its socket
     /// task; a positive interval also waits for endpoint destruction.
@@ -38,18 +43,32 @@ pub struct Frontend {
 /// factory owns bounded session/routing work here, never partition actors.
 #[derive(Debug)]
 pub struct FrontendContext {
+    /// Persistent local broker routing identity.
     pub local: NodeId,
+    /// Shared addressed control socket for SDKs and broker peers.
     pub peer: IdentitySocket,
+    /// Shared addressed bulk socket for APPENDs and replay.
+    pub data: IdentitySocket,
+    /// PUB socket for confirmed live consumer records.
     pub reader_pub: Socket,
+    /// Optional PUB socket for live canonical follower replication.
     pub follower_pub: Option<Socket>,
+    /// Shared shutdown request and observation handle.
     pub shutdown: Shutdown,
+    context: Context,
     monitor: omq_tokio::MonitorStream,
+    data_monitor: omq_tokio::MonitorStream,
     endpoint: Endpoint,
     limits: TransportLimits,
     ready: Option<oneshot::Sender<()>>,
 }
 
 impl FrontendContext {
+    /// Existing broker-owned OMQ context for local shard command sockets.
+    pub fn omq_context(&self) -> &Context {
+        &self.context
+    }
+
     /// Publish readiness after route/session queues are installed. The factory
     /// must observe shutdown during startup and while serving. It may use !Send
     /// futures on this current-thread runtime and `LocalSet`.
@@ -162,11 +181,17 @@ impl Frontend {
                         let serving = AssertUnwindSafe(async {
                             factory(FrontendContext {
                                 local,
+                                context: context.clone(),
                                 peer: sockets.peer.clone(),
+                                data: sockets.data.clone(),
                                 reader_pub: sockets.reader.clone(),
                                 follower_pub: sockets.follower.clone(),
                                 shutdown: worker.stop.clone(),
                                 monitor: sockets.monitor.take().expect("one frontend monitor"),
+                                data_monitor: sockets
+                                    .data_monitor
+                                    .take()
+                                    .expect("one data monitor"),
                                 endpoint,
                                 limits,
                                 ready: Some(ready),
@@ -213,9 +238,11 @@ impl Frontend {
         Ok(owner)
     }
 
+    /// Number of broker-owned dispatcher threads.
     pub fn dispatcher_threads(&self) -> usize {
         self.state.threads
     }
+    /// Number of OMQ-owned transport threads.
     pub fn io_threads(&self) -> usize {
         self.io_threads
     }
@@ -245,13 +272,17 @@ impl Drop for Frontend {
 
 struct Bindings {
     peer: Endpoint,
+    data: Endpoint,
     reader: Endpoint,
     follower: Option<Endpoint>,
 }
 
 impl Bindings {
     fn parse(endpoints: &Endpoints) -> Result<Self, StartupError> {
-        if endpoints.peer == endpoints.reader_pub
+        if endpoints.data_peer == endpoints.peer
+            || endpoints.data_peer == endpoints.reader_pub
+            || endpoints.follower_pub.as_ref() == Some(&endpoints.data_peer)
+            || endpoints.peer == endpoints.reader_pub
             || endpoints.follower_pub.as_ref().is_some_and(|endpoint| {
                 endpoint == &endpoints.peer || endpoint == &endpoints.reader_pub
             })
@@ -265,6 +296,7 @@ impl Bindings {
         };
         Ok(Self {
             peer: parse(&endpoints.peer)?,
+            data: parse(&endpoints.data_peer)?,
             reader: parse(&endpoints.reader_pub)?,
             follower: endpoints.follower_pub.as_deref().map(parse).transpose()?,
         })
@@ -273,9 +305,11 @@ impl Bindings {
 
 struct Sockets {
     peer: IdentitySocket,
+    data: IdentitySocket,
     reader: Socket,
     follower: Option<Socket>,
     monitor: Option<omq_tokio::MonitorStream>,
+    data_monitor: Option<omq_tokio::MonitorStream>,
 }
 
 impl Sockets {
@@ -297,7 +331,14 @@ impl Sockets {
             .identity_routing()
             .map_err(|reason| error(reason.to_string()))?;
         let monitor = Some(peer.monitor());
+        let data = context
+            .socket(SocketType::Peer, options.clone())
+            .identity_routing()
+            .map_err(|reason| error(reason.to_string()))?;
+        let data_monitor = Some(data.monitor());
         let sockets = Self {
+            data,
+            data_monitor,
             peer,
             monitor,
             reader: context.socket(SocketType::Pub, options.clone()),
@@ -308,6 +349,7 @@ impl Sockets {
         };
         let result = async {
             sockets.peer.bind(bindings.peer).await?;
+            sockets.data.bind(bindings.data).await?;
             sockets.reader.bind(bindings.reader).await?;
             if let (Some(socket), Some(endpoint)) = (&sockets.follower, bindings.follower) {
                 socket.bind(endpoint).await?;
@@ -324,12 +366,14 @@ impl Sockets {
 
     async fn close(self) -> Result<(), StartupError> {
         let peer = self.peer.into_inner().close().await;
+        let data = self.data.into_inner().close().await;
         let reader = self.reader.close().await;
         let follower = match self.follower {
             Some(socket) => socket.close().await,
             None => Ok(()),
         };
-        peer.and(reader)
+        peer.and(data)
+            .and(reader)
             .and(follower)
             .map_err(|failure| error(failure.to_string()))
     }

@@ -116,7 +116,7 @@ async fn scenario(policy: Confirmation) {
     processes
         .observe("verify recovered and neighboring history", client.replay())
         .await;
-    assert_eq!(client.links.socket_count(), 6);
+    assert_eq!(client.links.socket_count(), 5);
     processes
         .observe("close donor-restart SDK", client.close())
         .await;

@@ -12,6 +12,7 @@ fn read_config(resident: usize) -> ReadConfig {
             max_resident_bytes: resident,
             ..indexes::build_limits()
         },
+        max_resident_operations: 128,
         cached_index_bytes: 1024,
         cached_indexes: 2,
         concurrent_reads: 1,
@@ -132,6 +133,51 @@ fn async_incremental_reads_capture_exact_prefix_without_file_work() {
 }
 
 #[test]
+fn async_incremental_retry_read_selects_exact_offsets_and_positions() {
+    let (mut controller, journal) = empty_journal();
+    let mut index = drive(&mut controller, Index::open(&journal, read_config(0))).unwrap();
+    let mut journal = append(&mut controller, journal, &mut index, 0, 0);
+    journal = append(&mut controller, journal, &mut index, 1, 0);
+    journal = append(&mut controller, journal, &mut index, 2, 0);
+    let limits = ReadLimits {
+        max_records: 3,
+        max_bytes: 8192,
+    };
+    let selected = drive(
+        &mut controller,
+        index.read_offsets_with_positions(
+            &journal,
+            indexes::partition(),
+            &[Offset::new(0), Offset::new(2)],
+            limits,
+        ),
+    )
+    .unwrap()
+    .expect("active offsets");
+    assert_eq!(
+        selected
+            .iter()
+            .map(|(record, position)| (record.offset.get(), position.op_number))
+            .collect::<Vec<_>>(),
+        [(0, 1), (2, 3)]
+    );
+    assert!(
+        drive(
+            &mut controller,
+            index.read_offsets_with_positions(
+                &journal,
+                indexes::partition(),
+                &[Offset::new(0), Offset::new(3)],
+                limits,
+            ),
+        )
+        .unwrap()
+        .is_none()
+    );
+    drive(&mut controller, journal.close()).unwrap();
+}
+
+#[test]
 fn async_resident_delivery_releases_file_protection_and_keeps_bounded_selection() {
     let (mut controller, journal) = empty_journal();
     let mut index = drive(&mut controller, Index::open(&journal, read_config(0))).unwrap();
@@ -179,6 +225,43 @@ fn async_read_cache_charges_whole_backing_and_evicted_reads_still_work() {
 }
 
 #[test]
+fn two_complete_backings_serve_prior_operations_without_file_jobs() {
+    let (mut controller, journal) = empty_journal();
+    let mut index = drive(
+        &mut controller,
+        Index::open(&journal, read_config(9 * 1024)),
+    )
+    .unwrap();
+    let journal = append(&mut controller, journal, &mut index, 0, 4096);
+    let journal = append(&mut controller, journal, &mut index, 1, 4096);
+    let held = capture(&index, &journal, 0, 1, 2).into_resident().unwrap();
+    assert_eq!(
+        read(&mut controller, capture(&index, &journal, 0, 2, 2)),
+        (vec![0, 1], 0)
+    );
+
+    let journal = append(&mut controller, journal, &mut index, 2, 4096);
+    assert_eq!(
+        read(&mut controller, capture(&index, &journal, 1, 3, 3)),
+        (vec![1, 2], 0)
+    );
+    let mut offsets = Vec::new();
+    held.visit_spans(|span| {
+        offsets.extend(span.records().map(|record| record.offset().get()));
+        span.len()
+    })
+    .unwrap();
+    assert_eq!(offsets, [0]);
+    let (offsets, jobs) = read(&mut controller, capture(&index, &journal, 0, 1, 3));
+    assert_eq!(offsets, [0]);
+    assert!(
+        jobs > 0,
+        "oldest backing should be evicted, while its held alias survives"
+    );
+    drive(&mut controller, journal.close()).unwrap();
+}
+
+#[test]
 fn async_reader_predecessors_survive_rolls_and_cold_cache_misses() {
     let (mut controller, mut journal) = empty_journal();
     let mut config = read_config(0);
@@ -200,6 +283,37 @@ fn async_reader_predecessors_survive_rolls_and_cold_cache_misses() {
     let reopened = drive(&mut controller, Index::open(&journal, config)).unwrap();
     let captured = capture(&reopened, &journal, 3, 4, 4);
     assert_eq!(read(&mut controller, captured).0, [3]);
+    drive(&mut controller, journal.close()).unwrap();
+}
+
+#[test]
+fn async_cold_repair_reuses_selected_index_after_cache_eviction() {
+    let (mut controller, mut journal) = empty_journal();
+    let mut config = read_config(0);
+    config.cached_index_bytes = 8192;
+    let mut index = drive(&mut controller, Index::open(&journal, config)).unwrap();
+    journal = append(&mut controller, journal, &mut index, 0, 0);
+    for number in 1..=6 {
+        drive(&mut controller, journal.roll_active(32768, 4)).unwrap();
+        index.rolled(&journal).unwrap();
+        journal = append(&mut controller, journal, &mut index, number, 0);
+    }
+    let (previous, payload_jobs) = read(&mut controller, capture(&index, &journal, 5, 6, 7));
+    assert_eq!(previous, [5]);
+    let (oldest, cold_jobs) = read(&mut controller, capture(&index, &journal, 0, 1, 7));
+    assert_eq!(oldest, [0]);
+    assert!(
+        cold_jobs > payload_jobs,
+        "first cold repair must build its index"
+    );
+    for _ in 0..4 {
+        let (oldest, jobs) = read(&mut controller, capture(&index, &journal, 0, 1, 7));
+        assert_eq!(oldest, [0]);
+        assert!(
+            jobs > 0 && jobs <= payload_jobs,
+            "repair must read only selected payload"
+        );
+    }
     drive(&mut controller, journal.close()).unwrap();
 }
 

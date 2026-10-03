@@ -11,13 +11,16 @@ pub const JSON_EVENT_CORPUS: &str =
 mod binary;
 pub use binary::{BINARY_EVENT_CORPUS, binary_event};
 
+/// Result-row label for the deterministic structured payload corpus.
 pub const NAME: &str = "structured-v1";
+/// Reusable payload batches generated outside the measured throughput window.
 pub const THROUGHPUT_CORPUS_BATCHES: usize = 8;
 
 const DATA: &[u8] =
     b"sku=AX42;region=eu-central-1;channel=web;campaign=autumn;warehouse=zh-3;priority=normal;";
 const STATUSES: [&str; 4] = ["paid", "packed", "shipped", "returned"];
 
+/// Allocate one deterministic structured record of the requested byte length.
 pub fn record(size: usize, sequence: u64) -> Bytes {
     let mut record = Vec::with_capacity(size);
     write_record(&mut record, size, sequence);
@@ -73,6 +76,7 @@ fn append_header(record: &mut Vec<u8>, sequence: u64) {
     record.extend_from_slice(b"\",\"data\":\"");
 }
 
+/// Allocate consecutive deterministic records in one contiguous payload buffer.
 pub fn packed_batch(size: usize, count: usize, first_sequence: u64) -> Bytes {
     let mut packed = Vec::with_capacity(size.saturating_mul(count));
     for index in 0..count {
@@ -101,6 +105,7 @@ pub struct VerifiedBatches {
 }
 
 impl VerifiedBatches {
+    /// Bound delivery verification by record size, batch count, and one unique sequence range.
     pub fn new(size: usize, batch: usize, capacity: usize, base: u64) -> BenchResult<Self> {
         if size < 8 || batch == 0 || capacity == 0 {
             return Err(bench_error(
@@ -126,6 +131,7 @@ impl VerifiedBatches {
         })
     }
 
+    /// Verify one delivered record byte-for-byte and track its batch identity and order.
     pub fn record(&mut self, payload: &[u8]) -> BenchResult<()> {
         if self.ids.len() == self.capacity || payload.len() != self.size {
             return Err(bench_error(

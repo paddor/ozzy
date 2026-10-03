@@ -9,6 +9,20 @@ use std::{
     },
 };
 
+/// Device lifetime owned by a broker. Called once on the drain thread after
+/// application and frontend owners stop. Wait for physical jobs and workers.
+pub trait StorageOwner: std::fmt::Debug + Send + Sync + 'static {
+    /// Wait for accepted physical work and stop backend workers after owners exit.
+    fn drain(&self);
+}
+
+impl StorageOwner for DevicePools {
+    fn drain(&self) {
+        futures::executor::block_on(self.shutdown());
+        self.join();
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct DeviceDrain(pub(super) Arc<Drain>);
 
@@ -16,18 +30,22 @@ pub(super) struct DeviceDrain(pub(super) Arc<Drain>);
 pub(super) struct Drain {
     pub(super) application: Arc<State>,
     pub(super) frontend: Arc<State>,
-    pools: DevicePools,
+    pools: Box<dyn StorageOwner>,
     started: AtomicBool,
     finished: Shutdown,
     error: OnceLock<String>,
 }
 
 impl DeviceDrain {
-    pub(super) fn new(pools: DevicePools, application: Arc<State>, frontend: Arc<State>) -> Self {
+    pub(super) fn new(
+        pools: impl StorageOwner,
+        application: Arc<State>,
+        frontend: Arc<State>,
+    ) -> Self {
         Self(Arc::new(Drain {
             application,
             frontend,
-            pools,
+            pools: Box::new(pools),
             started: AtomicBool::new(false),
             finished: Shutdown::default(),
             error: OnceLock::new(),
@@ -51,13 +69,12 @@ impl Drain {
                                 drain.frontend.finished.requested(),
                             )
                             .await;
-                            drain.pools.shutdown().await;
                         });
                         // Each owner reported completion as its last action.
                         // Completion here means its threads have exited.
                         drain.application.join();
                         drain.frontend.join();
-                        drain.pools.join();
+                        drain.pools.drain();
                     }));
                     if result.is_err() {
                         let _ = drain.error.set("broker drain worker panicked".into());

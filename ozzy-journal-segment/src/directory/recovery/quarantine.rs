@@ -130,9 +130,6 @@ impl GroupDirectory {
                     crate::SegmentWriteMode::DataSync,
                 )?;
             }
-            if self.direct {
-                writer.set_direct(&self.segment_path(segment_id)?, true)?;
-            }
             let evidence = super::super::evidence::Evidence::open(&self.root, &self.manifest)?;
             return Ok(OpenGroupJournal {
                 directory: self,

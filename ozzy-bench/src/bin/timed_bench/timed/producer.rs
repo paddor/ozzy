@@ -16,6 +16,11 @@ use client::{PendingRecord, ReceiptCheck, Writer};
 /// Records sharing one clock reading in unpaced lanes.
 pub(super) const CLOCK_QUANTUM: u64 = 64;
 
+/// Bound immediately ready caller work by both count and payload bytes.
+fn turn_records(config: &Config) -> u64 {
+    (2 * 1024 * 1024 / config.args.record_bytes.max(1)).clamp(1, 256) as u64
+}
+
 /// Distinct body bytes per lane before bodies repeat. Real traffic differs
 /// from record to record. The pool exceeds every codec window and request the
 /// benchmark uses, so neither a compressor nor a branch predictor finds an
@@ -213,7 +218,7 @@ async fn run_lane(
         VecDeque::with_capacity(config.args.request_records);
     // Admission can stay immediately ready with the SDK on its own runtime.
     // Bound caller work so all timed writer lanes get polled before the deadline.
-    let turn_records = (2 * 1024 * 1024 / config.args.record_bytes.max(1)).clamp(1, 256) as u64;
+    let turn_records = turn_records(config);
     let mut sequence = 0;
     let mut stage = "admission";
     let mut start = 0;

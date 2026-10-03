@@ -26,21 +26,32 @@ use crate::{
 /// Consensus authorization and resulting hard state for one suffix install.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SuffixReplacement {
+    /// Exact CURRENT selection required before suffix installation.
     pub expected_current: CurrentReference,
+    /// Confirmed canonical prefix that replacement must preserve.
     pub protected_committed: LogPosition,
+    /// Promised election view constraining retained history and authority.
     pub promised_view: u64,
+    /// Last installed normal election view.
     pub last_normal_view: u64,
+    /// Exact confirmed canonical operation prefix.
     pub committed: LogPosition,
+    /// New journal-owner generation fencing old physical completions.
     pub writer_generation: JournalGeneration,
+    /// Physical byte capacity of replacement segments.
     pub segment_capacity: u64,
+    /// Physical body compression policy; canonical bytes remain unchanged.
     pub body_encoding: BodyEncoding,
 }
 
 /// Explicit memory, operation, and output bounds for suffix replacement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SuffixReplacementLimits {
+    /// Maximum retained canonical operations during suffix installation.
     pub max_operations: usize,
+    /// Maximum retained canonical body bytes during suffix installation.
     pub max_body_bytes: usize,
+    /// Maximum physical segment bytes.
     pub max_segment_bytes: u64,
 }
 
@@ -266,9 +277,6 @@ impl OpenGroupJournal {
                 &directory.segment_path(next_segment_id)?,
                 crate::SegmentWriteMode::DataSync,
             )?;
-        }
-        if directory.direct {
-            writer.set_direct(&directory.segment_path(next_segment_id)?, true)?;
         }
         Ok(Self {
             directory,
@@ -686,59 +694,93 @@ impl FollowingChain for LogPosition {
 #[derive(Debug, Error)]
 pub enum SuffixReplacementError {
     #[error(transparent)]
+    /// A physical file operation failed.
     Io(#[from] io::Error),
     #[error(transparent)]
+    /// Journal directory validation or publication failed.
     Directory(#[from] DirectoryError),
     #[error(transparent)]
+    /// Physical segment framing or integrity validation failed.
     Codec(#[from] CodecError),
     #[error(transparent)]
+    /// The segment writer rejected this transition.
     Writer(#[from] WriterError),
     #[error(transparent)]
+    /// Canonical operation-body validation failed.
     Operation(#[from] ozzy_journal::operation::OperationCodecError),
     #[error("suffix replacement limits are invalid")]
+    /// Suffix replacement limits are invalid.
     InvalidLimits,
     #[error("suffix replacement is not valid for a local-durable journal")]
+    /// Suffix replacement is not valid for a local-durable journal.
     LocalDurableJournal,
     #[error("suffix replacement does not name the selected manifest generation")]
+    /// Suffix replacement does not name the selected manifest generation.
     CurrentMismatch,
     #[error("suffix replacement does not preserve the exact committed prefix")]
+    /// Suffix replacement does not preserve the exact committed prefix.
     ProtectedCommitMismatch,
     #[error("suffix replacement source has unsynchronized or faulted writes")]
+    /// Suffix replacement source has unsynchronized or faulted writes.
     SourceNotDurable,
     #[error("suffix replacement view state regresses or is inconsistent")]
+    /// Suffix replacement view state regresses or is inconsistent.
     InvalidView,
     #[error("selected suffix does not continue the protected journal chain")]
+    /// Selected suffix does not continue the protected journal chain.
     SelectedSuffixMismatch,
     #[error("new commit position is not present in the selected suffix")]
+    /// New commit position is not present in the selected suffix.
     CommitNotSelected,
     #[error("replacement source segment does not match selected storage")]
+    /// Replacement source segment does not match selected storage.
     SourceMismatch,
     #[error("replacement segment ID space is exhausted")]
+    /// Replacement segment ID space is exhausted.
     SegmentIdExhausted,
     #[error("replacement manifest generation is exhausted")]
+    /// Replacement manifest generation is exhausted.
     ManifestGeneration,
     #[error("replacement position is invalid")]
+    /// Replacement position is invalid.
     InvalidPosition,
     #[error("replacement segment conflicts with an interrupted prior attempt")]
+    /// Replacement segment conflicts with an interrupted prior attempt.
     ReplacementSegmentConflict,
     #[error("physical segment allocation is unsupported on this platform")]
+    /// Physical segment allocation is unsupported on this platform.
     AllocationUnsupported,
     #[error("suffix replacement length arithmetic overflow")]
+    /// Integer or byte-count arithmetic overflows the supported range.
     LengthOverflow,
     #[error("suffix installer faulted; reopen the selected journal")]
+    /// Suffix installer faulted; reopen the selected journal.
     StagingFaulted,
     #[error("selected suffix has not reached its exact accepted and committed anchors")]
+    /// Selected suffix has not reached its exact accepted and committed anchors.
     IncompleteSuffix,
     #[error("suffix installation reused the source writer generation")]
+    /// Suffix installation reused the source writer generation.
     ReusedWriterGeneration,
     #[error("suffix staging allocation failed")]
+    /// Suffix staging allocation failed.
     Allocation,
     #[error("suffix staging disk quota exceeded: {actual} > {limit}")]
-    StagingQuota { actual: u64, limit: u64 },
+    /// Suffix staging disk quota exceeded.
+    StagingQuota {
+        #[doc = "Observed size, count, or fenced field value."]
+        actual: u64,
+        #[doc = "Configured maximum for the reported resource."]
+        limit: u64,
+    },
     #[error("{kind} limit exceeded: {actual} > {limit}")]
+    /// The named resource exceeds its configured bound.
     LimitExceeded {
+        /// Resource bound that rejected the operation.
         kind: &'static str,
+        /// Observed size, count, or fenced field value.
         actual: usize,
+        /// Configured maximum for the reported resource.
         limit: usize,
     },
 }

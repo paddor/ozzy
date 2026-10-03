@@ -16,18 +16,27 @@ use std::{
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
+/// Pinned Iggy release label used in comparison provenance.
 pub const RELEASE: &str = "0.9.0";
+/// Source tag corresponding to the pinned Iggy release.
 pub const RELEASE_TAG: &str = "server-0.9.0";
+/// Exact pinned Iggy source revision.
 pub const REVISION: &str = "71f29618ba04917fded0ef5cd085c206fef0ee49";
 
 #[derive(Debug, Clone, Copy)]
+/// Borrowed liveness and diagnostic checks for one external server.
 pub enum Monitor<'a> {
+    /// Iggy processes running on the configured broker placements.
     Distributed(&'a distributed::Iggy),
+    /// Locally managed Iggy server processes.
     Native(&'a Iggy),
+    /// Locally managed Redpanda server processes.
     Redpanda(&'a redpanda::Redpanda),
+    /// Externally managed container with a retained log path.
     Container(&'a str, &'a Path),
 }
 impl Monitor<'_> {
+    /// Reject exited servers and fatal server diagnostics.
     pub fn check(self) -> Result<()> {
         match self {
             Self::Distributed(server) => server.check(),
@@ -57,8 +66,11 @@ struct Broker {
     endpoint: String,
 }
 #[derive(Debug)]
+/// Owned local Iggy processes and their isolated storage directory.
 pub struct Iggy {
+    /// Fresh server storage and diagnostic artifact directory.
     pub root: PathBuf,
+    /// Client endpoint for the selected Iggy deployment.
     pub endpoint: String,
     brokers: Vec<Broker>,
     /// One CPU list per broker.
@@ -68,6 +80,7 @@ pub struct Iggy {
 }
 
 impl Iggy {
+    /// Create fresh storage and start pinned Iggy with the requested persistence and CPU placement.
     pub fn start(root: &Path, mode: &str, cpus: &[Vec<usize>], log_filter: &str) -> Result<Self> {
         fs::create_dir_all(root)?;
         let mut server = Self {
@@ -219,9 +232,11 @@ impl Iggy {
         self.affinity(false)?;
         Ok(())
     }
+    /// Process IDs of every server owned by this deployment.
     pub fn pids(&self) -> Vec<u32> {
         self.brokers.iter().map(|b| b.child.id()).collect()
     }
+    /// Reject exited servers and fatal server diagnostics.
     pub fn check(&self) -> Result<()> {
         for broker in &self.brokers {
             let path = broker.root.join("server.log");
@@ -233,6 +248,7 @@ impl Iggy {
         }
         Ok(())
     }
+    /// Capture allowed CPUs for all server processes.
     pub fn affinity(&self, _install: bool) -> Result<Value> {
         let mut observed = BTreeMap::new();
         for (broker, budget) in self.brokers.iter().zip(&self.cpus) {
@@ -262,6 +278,7 @@ impl Iggy {
         }
         Ok(json!(observed))
     }
+    /// Report the pinned server revision and executable identity.
     pub fn identity(&self) -> Result<Value> {
         if self.build != build::verified_identity()? {
             return Err("Iggy binary changed during case".into());
@@ -269,6 +286,7 @@ impl Iggy {
         let configs = self.brokers.iter().map(|b| -> Result<_> {Ok(json!({"pid":b.child.id(),"config":fs::read_to_string(b.root.join("config.toml"))?,"effective_config":fs::read_to_string(b.root.join("effective-config.toml"))?}))}).collect::<Result<Vec<_>>>()?;
         Ok(json!({"release":RELEASE,"build":self.build,"brokers":configs,"cpu_budget":self.cpus}))
     }
+    /// Stop owned server processes and reap their exits.
     pub fn stop(&mut self) -> Result<()> {
         if self.stopped {
             return Ok(());

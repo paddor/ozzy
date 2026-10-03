@@ -155,6 +155,60 @@ fn independent_references(fixed_load: bool) {
 }
 
 #[test]
+fn fixed_load_reference_keeps_explicit_ozzy_only_rate() {
+    let temp = tempfile::tempdir().unwrap();
+    let row = |implementation, run_id, rate| {
+        let mut row = saved(implementation, run_id);
+        row["case"]["rate"] = json!(rate);
+        row["configuration"]["records_per_second"] = json!(rate);
+        row["measurements"] = json!({
+            "scheduled_samples":rate * 10,
+            "scheduled_ack_p50_us":1,"scheduled_ack_p99_us":2,
+            "scheduled_delivery_p50_us":1,"scheduled_delivery_p99_us":2
+        });
+        row["source"]["revision"] = json!(implementation);
+        row
+    };
+    save(temp.path(), &row("ozzy", "low", 100), true);
+    save(temp.path(), &row("ozzy", "high", 1_000_000), true);
+    save(temp.path(), &row("iggy", "reference", 100), true);
+    let ids = &["low".into(), "high".into()];
+    let mut data = records::select_fixed_load(temp.path(), ids).unwrap();
+    assert!(
+        records::include_references(
+            temp.path(),
+            &mut data.clone(),
+            &["reference".into()],
+            &["iggy"],
+            true
+        )
+        .is_err()
+    );
+    assert!(
+        records::include_references_with_ozzy_only_rates(
+            temp.path(),
+            &mut data.clone(),
+            &["reference".into()],
+            &["iggy"],
+            true,
+            &[100],
+        )
+        .is_err()
+    );
+    records::include_references_with_ozzy_only_rates(
+        temp.path(),
+        &mut data,
+        &["reference".into()],
+        &["iggy"],
+        true,
+        &[1_000_000],
+    )
+    .unwrap();
+    assert_eq!(data["summary"].as_array().unwrap().len(), 3);
+    assert_eq!(data["fixed_load_windows"]["1000000"]["duration"], 10.0);
+}
+
+#[test]
 fn mode_selection_retains_overloads_even_when_no_numeric_case_survives() {
     let mut data = json!({
         "summary": [{"case":{"mode":"durable"}}],
@@ -356,7 +410,8 @@ fn fixed_load_reuses_external_runs_without_replacing_current_ozzy() {
                 .unwrap()
                 .remove("broker_omq_on_shard");
             old["source"]["revision"] = json!(format!("old-{implementation}"));
-            old["workload_sha256"] = json!("old-workload");
+            old["workload_sha256"] = json!(format!("workload-{rate}"));
+            old["environment"]["dependencies"] = json!([format!("OMQ-{rate}")]);
             if rate == 10_000 && implementation == "redpanda" {
                 old["failure"] = json!("scheduled backlog exceeded");
             }
@@ -371,10 +426,40 @@ fn fixed_load_reuses_external_runs_without_replacing_current_ozzy() {
     assert_eq!(data["summary"].as_array().unwrap().len(), 5);
     assert_eq!(data["incomplete"][0]["case"]["impl"], "redpanda");
     assert_eq!(data["references"]["iggy"]["run_ids"], json!(reference));
+    for implementation in ["iggy", "redpanda"] {
+        let provenance = &data["references"][implementation]["compatibility_by_run"];
+        assert_eq!(provenance["old-100"]["workload"], "workload-100");
+        assert_eq!(provenance["old-10000"]["workload"], "workload-10000");
+        assert_eq!(
+            provenance["old-10000"]["environment"]["dependencies"],
+            json!(["OMQ-10000"])
+        );
+    }
     assert_eq!(
         data["compatibility"]["configuration"]["broker_omq_on_shard"],
         true
     );
+}
+#[test]
+fn mixed_reference_revisions_keep_host_and_per_run_workload_checks() {
+    for mismatch in ["host", "within-run-workload"] {
+        let temp = tempfile::tempdir().unwrap();
+        save(temp.path(), &saved("ozzy", "native"), true);
+        for size in [128, 1024] {
+            let mut row = saved("iggy", "external");
+            row["case"]["size"] = json!(size);
+            if mismatch == "host" {
+                row["environment"]["cpu"] = json!("different CPU");
+            } else if size == 1024 {
+                row["workload_sha256"] = json!("different workload in same run");
+            }
+            save(temp.path(), &row, true);
+        }
+        let error =
+            records::select_with_iggy_reference(temp.path(), &["native".into()], "external")
+                .unwrap_err();
+        assert!(error.to_string().contains("incompatible"), "{error}");
+    }
 }
 #[test]
 fn ramp_stages_select_as_rates_and_overloaded_stages_as_annotations() {
@@ -574,12 +659,37 @@ fn fresh_comparisons_keep_each_implementations_batch_ceiling() {
 }
 
 #[test]
+fn chart_selection_keeps_effective_worker_payload_caps_per_mode() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut row = saved("ozzy", "native");
+    row["configuration"]["native_batch_target_bytes"] = json!(4 * 1024 * 1024);
+    for (mode, size, bytes) in [
+        ("durable", 128, 256 * 1024),
+        ("durable", 8192, 832 * 1024),
+        ("disk-quorum", 128, 128 * 1024),
+    ] {
+        row["case"]["mode"] = json!(mode);
+        row["case"]["size"] = json!(size);
+        row["raw"]["writer_batch_payload_bytes_max"] = json!(bytes);
+        save(temp.path(), &row, true);
+    }
+    let selected = records::select(temp.path(), &["native".into()], None).unwrap();
+    assert_eq!(
+        selected["writer_payload_caps"],
+        json!({
+            "durable":832 * 1024,"disk-quorum":128 * 1024,
+        })
+    );
+}
+
+#[test]
 fn cached_reference_keeps_its_controls_and_requires_matching_measurement_conditions() {
     let temp = tempfile::tempdir().unwrap();
     let mut native = saved("ozzy", "new");
     native["configuration"]["request_records"] = json!(8192);
     native["configuration"]["payload_compression_threshold"] = json!(1024);
     native["configuration"]["writer_inflight_appends"] = json!(1);
+    native["configuration"]["native_batch_target_bytes"] = json!(2 * 1024 * 1024);
     native["configuration"]["disk_aio_depth"] = json!(8);
     native["configuration"]["disk_io_backend"] = json!("aio");
     native["configuration"]["disk_direct_io"] = json!(true);
@@ -588,6 +698,7 @@ fn cached_reference_keeps_its_controls_and_requires_matching_measurement_conditi
     reference["configuration"]["request_records"] = json!(1024);
     reference["configuration"]["payload_compression_threshold"] = json!(4096);
     reference["configuration"]["writer_inflight_appends"] = json!(3);
+    reference["configuration"]["native_batch_target_bytes"] = json!(4 * 1024 * 1024);
     reference["workload_sha256"] = json!("older-workload");
     save(temp.path(), &native, true);
     save(temp.path(), &reference, true);
@@ -622,6 +733,26 @@ fn cached_reference_keeps_its_controls_and_requires_matching_measurement_conditi
     assert_eq!(
         data["references"]["iggy"]["compatibility"]["configuration"]["writer_inflight_appends"],
         3
+    );
+    assert_eq!(
+        data["compatibility"]["configuration"]["native_batch_target_bytes"],
+        2 * 1024 * 1024
+    );
+    assert_eq!(
+        data["references"]["iggy"]["compatibility"]["configuration"]["native_batch_target_bytes"],
+        4 * 1024 * 1024
+    );
+    let mut different_native = native.clone();
+    different_native["run_id"] = json!("different-native-target");
+    different_native["configuration"]["native_batch_target_bytes"] = json!(4 * 1024 * 1024);
+    save(temp.path(), &different_native, true);
+    assert!(
+        records::select(
+            temp.path(),
+            &["new".into(), "different-native-target".into()],
+            None
+        )
+        .is_err()
     );
     for (field, value) in [("duration", json!(20)), ("warmup", json!(17))] {
         let mut bad = reference.clone();
@@ -853,6 +984,7 @@ fn raw() -> Value {
     row["payload_compression_threshold"] =
         json!(ozzy_runtime::replicated::PAYLOAD_COMPRESSION_THRESHOLD);
     row["writer_protocol"] = json!("peer-appends");
+    row["writer_batch_target_bytes"] = json!(832 * 1024);
     row["writer_batch_configuration_applies"] = json!(true);
     row["native_reader_api"] = json!("decoded-records");
     row["max_record_bytes"] = json!(1024 * 1024);
@@ -1406,22 +1538,43 @@ fn archived_storage_targets_remain_verified_without_live_overrides() {
 
 #[test]
 fn append_window_override_is_native_only_and_nonzero() {
-    let args = compare::Args::parse_from(["compare", "--writer-inflight-appends", "3"]);
+    let args = compare::Args::parse_from([
+        "compare",
+        "--writer-inflight-appends",
+        "3",
+        "--shard-resident-mib",
+        "1024",
+        "--writer-batch-target-kib",
+        "4096",
+    ]);
     args.validate().unwrap();
     assert_eq!(args.configuration()["writer_inflight_appends"], 3);
+    assert_eq!(args.configuration()["shard_resident_mib"], 1024);
+    assert_eq!(
+        args.configuration()["native_batch_target_bytes"],
+        4 * 1024 * 1024
+    );
     for case in args.cases() {
         let command = args
             .command(Path::new("bench"), &case, Some("localhost:1234"))
             .unwrap();
         if case["impl"] == "ozzy" {
             assert_eq!(option(&command, "--writer-inflight-appends"), "3");
+            assert_eq!(option(&command, "--shard-resident-mib"), "1024");
+            assert_eq!(option(&command, "--writer-batch-target-kib"), "4096");
         } else {
             assert!(!command.iter().any(|arg| arg == "--writer-inflight-appends"));
+            assert!(!command.iter().any(|arg| arg == "--shard-resident-mib"));
+            assert!(!command.iter().any(|arg| arg == "--writer-batch-target-kib"));
         }
     }
     let mut invalid = args;
     invalid.writer_inflight_appends = 0;
     assert!(invalid.validate().is_err());
+    assert!(compare::Args::try_parse_from(["compare", "--writer-batch-target-kib", "0"]).is_err());
+    assert!(
+        compare::Args::try_parse_from(["compare", "--writer-batch-target-kib", "16385"]).is_err()
+    );
 }
 #[test]
 fn offered_load_reaches_every_selected_implementation_without_native_queue_overrides() {

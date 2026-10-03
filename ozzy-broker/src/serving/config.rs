@@ -4,31 +4,68 @@ use omq_tokio::Endpoint;
 use ozzy_proto::{NodeId, data::DataLimits, handshake};
 use ozzy_runtime::{
     dispatch::{Budget, Budgets},
-    frontend::{self, Access, Kind, ReceiveBuffers, ReceiveStorage, Service},
+    frontend::{self, Access, DataSender, Kind, ReceiveBuffers, ReceiveStorage, Service},
     replica_transport::QueueLimits,
 };
 use std::{collections::BTreeMap, time::Duration};
 
 pub(super) const CLIENTS: usize = 32;
 pub(super) const WRITERS: usize = 32;
+/// APPENDs one writer may have in flight on one partition. The partition
+/// actor owns these request slots; OMQ and the shard queue backpressure intake.
+pub(super) const WRITER_WINDOW: usize = 3;
+/// Proposal arenas of one partition's native intake: per writer, one open
+/// slot and its APPEND slots, plus one rejection slot per client.
+pub(crate) const NATIVE_ARENAS: usize = WRITERS * (WRITER_WINDOW + 1) + CLIENTS;
 type Handoffs = Vec<(u32, tokio::sync::oneshot::Sender<super::Binding>)>;
 
 pub(super) struct Config {
+    pub omq: omq_tokio::Context,
     pub local: NodeId,
     pub limits: DataLimits,
     pub envelope: ozzy_proto::EnvelopeLimits,
     pub buffers: ReceiveBuffers,
     pub transport: TransportLimits,
     pub brokers: BTreeMap<NodeId, Endpoint>,
+    pub followers: crate::FollowerRoutes,
     pub peers: usize,
-    pub grants: usize,
     pub budgets: BTreeMap<u32, Budgets>,
     pub catalog: Vec<ozzy_proto::directory::TopicPage>,
     pub maximum_partitions: usize,
 }
 
 impl Config {
-    pub(super) fn new(checked: &CheckedConfig) -> Result<Self, StartupError> {
+    /// Bound writer and follower queues separately from canonical actor arenas.
+    /// Each queue reserves one further frame while its actor is busy.
+    pub(super) fn data_lane(
+        &self,
+        shard: u32,
+        kind: Kind,
+    ) -> Result<(usize, usize, usize), StartupError> {
+        let maximum = self.buffers.maximum_retained_bytes();
+        let minimum = maximum
+            .checked_mul(4)
+            .ok_or_else(|| failure("data frame budget overflow"))?;
+        let budget = self.budgets[&shard]
+            .data
+            .bytes
+            .min(128 * 1024 * 1024)
+            .max(minimum)
+            / 2;
+        // Lossy publication needs room for storage-completion bursts. The
+        // weighted byte bound still includes the separately reserved pending frame.
+        let maximum_slots = if kind == Kind::Broker { 128 } else { 16 };
+        let available = self.budgets[&shard].data.queue_slots.min(maximum_slots);
+        if available == 0 {
+            return Err(failure("data shard has no queue capacity"));
+        }
+        Ok((available, maximum, budget))
+    }
+
+    pub(super) fn new(
+        checked: &CheckedConfig,
+        omq: omq_tokio::Context,
+    ) -> Result<Self, StartupError> {
         let deployment = checked.deployment.deployment();
         let local = NodeId::from_bytes(*checked.identity.brokers[&checked.plan.name].as_bytes());
         let limits = native_limits(checked)?;
@@ -51,6 +88,16 @@ impl Config {
             message_bytes,
             close_linger: Duration::from_millis(100),
         };
+        if checked.identity.brokers.len() == 3
+            && deployment
+                .brokers
+                .values()
+                .any(|broker| broker.endpoints.follower_pub.is_none())
+        {
+            return Err(failure(
+                "replicated brokers require explicit follower PUB endpoints",
+            ));
+        }
         let endpoints = &deployment.brokers[&checked.plan.name].endpoints;
         let inproc = endpoints.peer.starts_with("inproc://");
         let buffers = ReceiveBuffers::new(
@@ -80,6 +127,7 @@ impl Config {
                 ))
             })
             .collect::<Result<BTreeMap<_, _>, StartupError>>()?;
+        let followers = follower_routes(checked, local, &brokers)?;
         let mut budgets = BTreeMap::new();
         for shard in &checked.plan.shards {
             budgets.insert(
@@ -100,6 +148,7 @@ impl Config {
         }
         let catalog = catalog(checked)?;
         Ok(Self {
+            omq,
             local,
             limits,
             envelope,
@@ -107,12 +156,7 @@ impl Config {
             transport,
             peers: CLIENTS + brokers.len(),
             brokers,
-            grants: checked
-                .plan
-                .partitions
-                .len()
-                .saturating_mul(4)
-                .clamp(4, 65_536),
+            followers,
             budgets,
             catalog,
             maximum_partitions: checked.plan.partitions.len(),
@@ -128,21 +172,20 @@ impl Config {
             let budgets = &self.budgets;
             let port = service
                 .port_with_publications(
+                    &self.omq,
                     id,
                     budgets[&id],
                     ozzy_runtime::dispatch::Budget {
-                        queue_slots: 1,
-                        retained_messages: 1,
-                        bytes: self.transport.message_bytes + 4096,
+                        queue_slots: 2,
+                        retained_messages: 2,
+                        bytes: (self.transport.message_bytes + 4096) * 2,
                     },
                 )
                 .map_err(failure)?;
-            let requests = service.grant_requests(id, self.grants).map_err(failure)?;
             handoff
                 .send(Binding {
                     links: service.links(),
                     port,
-                    requests,
                 })
                 .map_err(|_| failure("shard handoff observer disappeared"))?;
         }
@@ -172,10 +215,14 @@ impl Config {
             frontend::RoutingTable::new(&ids, &placements, self.maximum_partitions, self.envelope)
                 .map_err(failure)?;
         let mut handoffs = Vec::with_capacity(shards.len());
+        let mut data_lanes = Vec::with_capacity(shards.len());
         let lanes = shards
             .into_iter()
             .map(|shard| {
                 handoffs.push((shard.id, shard.handoff));
+                data_lanes.push((shard.id, shard.data));
+                data_lanes.push((shard.id, shard.replica));
+                data_lanes.push((shard.id, shard.broker_control));
                 (shard.id, shard.sender)
             })
             .collect();
@@ -189,17 +236,17 @@ impl Config {
             bytes: self.transport.message_bytes * 4,
             message_bytes: self.transport.message_bytes,
         };
-        let dispatcher = frontend::Dispatcher::new(
+        let mut dispatcher = frontend::Dispatcher::new(
             self.local,
             routes,
             lanes,
             frontend::DispatcherLimits {
                 peers: self.peers,
-                grants_per_class: self.grants,
                 replies: frontend::ReplyLimits { data, control },
             },
         )
         .map_err(failure)?;
+        install_data_lanes(&mut dispatcher, data_lanes)?;
         let access = self
             .brokers
             .keys()
@@ -250,22 +297,87 @@ impl Config {
     }
 
     fn handshake_parameters(&self) -> Result<handshake::Parameters, StartupError> {
-        let mut parameters = handshake::Parameters::streaming(
-            self.limits,
-            handshake::OWNER | (1 << 3),
-            65_536,
-            self.budgets
-                .values()
-                .map(|budget| budget.data.bytes as u64)
-                .sum(),
-        )
-        .map_err(failure)?;
+        let mut parameters =
+            handshake::Parameters::streaming(self.limits, handshake::OWNER | (1 << 3))
+                .map_err(failure)?;
         parameters.capabilities |= handshake::OWNER_ROUTING | handshake::OWNER_READ;
         // Readers and writers share this endpoint and negotiate independent
         // command families. SDK profiles require their own capabilities.
         parameters.required_capabilities = 0;
         Ok(parameters)
     }
+}
+
+fn follower_routes(
+    checked: &CheckedConfig,
+    local: NodeId,
+    brokers: &BTreeMap<NodeId, Endpoint>,
+) -> Result<crate::FollowerRoutes, StartupError> {
+    let deployment = checked.deployment.deployment();
+    let mut followers = crate::FollowerRoutes::default();
+    for placement in &checked.plan.partitions {
+        let partition =
+            &checked.identity.topics[&placement.topic].partitions[placement.partition as usize];
+        followers.local.insert(
+            ozzy_proto::GroupId::from_bytes(*partition.group.as_bytes()),
+            placement.shard,
+        );
+    }
+    for (name, id) in &checked.identity.brokers {
+        let broker = NodeId::from_bytes(*id.as_bytes());
+        if broker != local {
+            followers.repairs.insert(
+                broker,
+                deployment.brokers[name]
+                    .endpoints
+                    .data_peer
+                    .parse()
+                    .map_err(failure)?,
+            );
+        }
+        if broker == local {
+            continue;
+        }
+        if let Some(endpoint) = &deployment.brokers[name].endpoints.follower_pub {
+            followers
+                .publications
+                .insert(broker, endpoint.parse().map_err(failure)?);
+        }
+        for placement in checked.deployment.partition_placements(name) {
+            let partition =
+                &checked.identity.topics[&placement.topic].partitions[placement.partition as usize];
+            followers.destinations.insert(
+                (
+                    broker,
+                    ozzy_proto::GroupId::from_bytes(*partition.group.as_bytes()),
+                ),
+                placement.shard,
+            );
+        }
+        for shard in &checked.plan.shards {
+            let alias = crate::FollowerRoutes::identity(broker, local, shard.id);
+            if alias == local
+                || brokers.contains_key(&alias)
+                || followers
+                    .incoming
+                    .insert(alias, (broker, shard.id))
+                    .is_some()
+            {
+                return Err(failure("repair identity collision"));
+            }
+        }
+    }
+    Ok(followers)
+}
+
+fn install_data_lanes(
+    dispatcher: &mut frontend::Dispatcher,
+    lanes: Vec<(u32, DataSender)>,
+) -> Result<(), StartupError> {
+    for (shard, lane) in lanes {
+        dispatcher.install_data_lane(shard, lane).map_err(failure)?;
+    }
+    Ok(())
 }
 
 fn catalog(checked: &CheckedConfig) -> Result<Vec<ozzy_proto::directory::TopicPage>, StartupError> {

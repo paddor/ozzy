@@ -1,13 +1,40 @@
-//! Refuse to replace an existing comparison with fewer measured series.
+//! Refuse to remove implementations, sizes, or offered rates from a chart.
 use super::{SERIES, id};
 use ozzy_bench::automation::Result;
 use serde_json::Value;
 use std::{collections::BTreeSet, fs, path::Path};
 
 const ATTRIBUTE: &str = "data-ozzy-series=\"";
+const CASES: &str = "data-ozzy-cases=\"";
 
 fn selected(rows: &[&Value]) -> BTreeSet<String> {
     rows.iter().map(|row| id(row)).collect()
+}
+
+fn cases(rows: &[&Value]) -> BTreeSet<String> {
+    rows.iter()
+        .map(|row| {
+            format!(
+                "{}/{}/{}",
+                id(row),
+                row["case"]["size"].as_u64().unwrap_or(0),
+                row["case"]["rate"].as_u64().unwrap_or(0)
+            )
+        })
+        .collect()
+}
+
+fn metadata(svg: &str, attribute: &str) -> Result<Option<BTreeSet<String>>> {
+    let Some((_, value)) = svg.split_once(attribute) else {
+        return Ok(None);
+    };
+    let (value, _) = value
+        .split_once('"')
+        .ok_or("invalid chart coverage metadata")?;
+    if value.is_empty() {
+        return Err("empty chart coverage metadata".into());
+    }
+    Ok(Some(value.split(',').map(str::to_owned).collect()))
 }
 
 fn previous(svg: &str) -> Result<BTreeSet<String>> {
@@ -60,13 +87,35 @@ pub(super) fn check(path: &Path, rows: &[&Value]) -> Result<()> {
             missing.join(", "), path.display()
         ).into());
     }
+    if let Some(existing) = metadata(&svg, CASES)? {
+        let selected = cases(rows);
+        let missing: Vec<_> = existing.difference(&selected).map(String::as_str).collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "refusing to remove chart cases {} from {}; retain other sizes/rates or use --suffix",
+                missing.join(", "), path.display()
+            ).into());
+        }
+    } else {
+        // Earlier SVGs have size ticks or panel titles, but no case metadata.
+        for size in [128, 1024, 8192] {
+            let label = super::style::size(size);
+            if (svg.contains(&format!(">\n{label}\n</text>"))
+                || svg.contains(&format!("{label} records (ms,")))
+                && !rows.iter().any(|row| row["case"]["size"] == size)
+            {
+                return Err(format!("refusing to remove {label} from {}", path.display()).into());
+            }
+        }
+    }
     Ok(())
 }
 
 pub(super) fn stamp(svg: &mut String, rows: &[&Value]) -> Result<()> {
     let start = svg.find("<svg ").ok_or("missing SVG root")? + 5;
     let ids = selected(rows).into_iter().collect::<Vec<_>>().join(",");
-    svg.insert_str(start, &format!("{ATTRIBUTE}{ids}\" "));
+    let cases = cases(rows).into_iter().collect::<Vec<_>>().join(",");
+    svg.insert_str(start, &format!("{ATTRIBUTE}{ids}\" {CASES}{cases}\" "));
     Ok(())
 }
 

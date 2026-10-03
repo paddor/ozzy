@@ -21,8 +21,11 @@ pub struct DevicePools {
 /// All partitions on that thread share this one submission lane.
 #[derive(Debug)]
 pub struct ShardIo<B = Client> {
+    /// Broker-local application owner ID.
     pub shard: u32,
+    /// Configured shared physical backend owner name.
     pub controller: String,
+    /// Backend submission adapter with this shard lane admission.
     pub client: B,
 }
 
@@ -93,6 +96,7 @@ impl DevicePools {
         Ok((Self { pools }, lanes))
     }
 
+    /// Observe shared physical-job admission for a named controller.
     pub fn admission(&self, controller: &str) -> Option<&Admission> {
         self.pools.get(controller).map(|backend| match backend {
             Backend::Pool(pool) => pool.admission(),

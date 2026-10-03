@@ -20,6 +20,7 @@ use crate::{ActorSettings, CheckedConfig, StartupError};
 /// Fully checked construction inputs. No files, worker threads or runtime state.
 #[derive(Debug, Clone)]
 pub struct JournalPlan {
+    /// Broker-local partitions in the validated construction plan.
     pub partitions: Vec<PartitionJournal>,
     pub(crate) recovery: BTreeMap<GroupId, RecoveryIntent>,
 }
@@ -29,16 +30,22 @@ pub struct JournalPlan {
 pub struct PartitionJournal {
     /// Persistent cluster namespace used by the canonical partition address.
     pub cluster: Uuid,
+    /// Exact local journal directory and application owner.
     pub placement: PartitionPlacement,
+    /// Partition record namespace, independent of election view.
     pub incarnation: PartitionIncarnation,
+    /// Explicit local-durable or replicated journal configuration.
     pub config: JournalConfig,
+    /// Partition actor timing, confirmation, and work bounds.
     pub actors: ActorSettings,
 }
 
 /// Explicit mode. A failed replicated open never tries the local variant.
 #[derive(Debug, Clone)]
 pub enum JournalConfig {
+    /// Explicit single-broker locally durable journal.
     Local(OwnedConfig<local::Configuration>),
+    /// Explicit fixed-three quorum journal configuration.
     Replicated(OwnedConfig),
 }
 
@@ -46,17 +53,26 @@ pub enum JournalConfig {
 /// requires election; an opened journal is not permission to serve APPENDs.
 #[derive(Debug)]
 pub enum PartitionAuthority {
+    /// Recovered locally durable driver; no election or failover.
     Local(local::Driver),
+    /// Recovered replicated startup; election is required before leadership.
     Replicated(JournalStartup),
 }
 
 #[derive(Debug)]
+/// Opened journal and exact recovered authority awaiting actor construction.
 pub struct OpenedPartition {
+    /// Persistent cluster namespace.
     pub cluster: Uuid,
+    /// Exact local journal directory and application owner.
     pub placement: PartitionPlacement,
+    /// Partition record namespace, independent of election view.
     pub incarnation: PartitionIncarnation,
+    /// Exclusive application-shard journal state.
     pub journal: OwnedJournal,
+    /// Recovered local driver or fenced replicated startup evidence.
     pub authority: PartitionAuthority,
+    /// Partition actor timing, confirmation, and work bounds.
     pub actors: ActorSettings,
 }
 

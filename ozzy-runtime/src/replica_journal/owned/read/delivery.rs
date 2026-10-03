@@ -17,7 +17,7 @@ pub struct CompletedDelivery {
 }
 
 /// Owner-checked records retaining the subscriber's output admission. Encoding
-/// shares whole resident SDK batches when credit permits, including LZ4 bytes.
+/// shares whole resident SDK batches when message capacity permits, including LZ4 bytes.
 #[derive(Debug)]
 pub struct PartitionDelivery {
     read: ReadDelivery,
@@ -30,8 +30,8 @@ impl PartitionDelivery {
     }
 
     /// Encode through the existing reader contract. `maximum` is the reader's
-    /// whole credit window; a fitting compressed batch waits for enough credit
-    /// instead of being decompressed merely because current credit is smaller.
+    /// whole message bound; a fitting compressed batch waits for enough room
+    /// instead of being decompressed merely because remaining message capacity is smaller.
     /// The encoder's remaining capacity must fit the captured read limits.
     pub fn encode(
         self,

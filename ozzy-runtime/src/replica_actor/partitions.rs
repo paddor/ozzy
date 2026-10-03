@@ -50,7 +50,7 @@ impl PartitionActor {
         &mut self,
     ) -> Option<(
         Option<ozzy_replication::driver::ValidationTicket>,
-        &mut crate::replica_journal::ReplicaJournal<crate::replica_journal::ShardJournal>,
+        &mut crate::replica_journal::ReplicaJournal,
     )> {
         match self {
             Self::Local(actor) => Some(actor.read_access()),
@@ -80,17 +80,23 @@ impl PartitionActor {
         }
     }
 
-    /// Followers allocate only against their destination's shard-issued capacity.
-    pub fn bind_receive_capacity(
-        &mut self,
-        capacity: &crate::memory::Capacity,
-    ) -> Result<(), ActorError> {
+    /// Use shared shard memory for normal follower data, without receive grants.
+    /// Nonvoting recovery retains its separately fenced transfer allowance.
+    pub fn bind_receive_owner(&mut self, owner: &crate::memory::Owner) -> Result<(), ActorError> {
         match self {
+            Self::Replicated(actor) => actor.bind_receive_owner(owner),
+            Self::Recovering(actor) => actor.bind_receive_owner(owner),
             Self::Local(_) => Ok(()),
-            Self::Replicated(actor) => actor.bind_receive_capacity(capacity),
-            Self::Recovering(actor) => actor.bind_receive_capacity(capacity),
         }
     }
+
+    /// Select the shared frontend's follower publication transport.
+    pub fn enable_publication(&mut self) {
+        if let Self::Replicated(actor) = self {
+            actor.enable_publication();
+        }
+    }
+
     /// Immutable group identity, independent of current role.
     pub fn group(&self) -> GroupId {
         match self {
@@ -401,22 +407,45 @@ impl PartitionActors {
             .ok_or(PartitionError::NativeConfiguration)
     }
 
-    /// Whether one client's writer still owns native proposals or replies on
-    /// this partition. Other writers do not count. Unknown groups or missing
-    /// native adapters fail closed.
-    pub fn native_writer_has_work(
+    /// Commands of one client other than APPENDs that still own a native slot
+    /// or the shared reader reply slot on this partition. Other clients do
+    /// not count. Unknown groups or missing native adapters fail closed.
+    pub fn native_client_work(
+        &self,
+        group: GroupId,
+        node: NodeId,
+    ) -> Result<usize, PartitionError> {
+        let slot = *self.index.get(&group).ok_or(PartitionError::Unknown)?;
+        if matches!(self.actors[slot], PartitionActor::Recovering(_)) {
+            return Ok(0);
+        }
+        let native = self.native[slot]
+            .as_ref()
+            .ok_or(PartitionError::NativeConfiguration)?
+            .intake
+            .client_work(node);
+        let readers = self.readers[slot]
+            .as_ref()
+            .map_or(0, |readers| readers.client_work(node));
+        Ok(native + readers)
+    }
+
+    /// Requests of one client's writer that still own native proposals or
+    /// replies on this partition. Other writers do not count. Unknown groups
+    /// or missing native adapters fail closed.
+    pub fn native_writer_work(
         &self,
         group: GroupId,
         node: NodeId,
         producer: ozzy_proto::ProducerId,
-    ) -> Result<bool, PartitionError> {
+    ) -> Result<usize, PartitionError> {
         let slot = *self.index.get(&group).ok_or(PartitionError::Unknown)?;
         if matches!(self.actors[slot], PartitionActor::Recovering(_)) {
-            return Ok(false);
+            return Ok(0);
         }
         self.native[slot]
             .as_ref()
-            .map(|native| native.intake.writer_has_work(node, producer))
+            .map(|native| native.intake.writer_work(node, producer))
             .ok_or(PartitionError::NativeConfiguration)
     }
 
@@ -494,7 +523,7 @@ impl PartitionActors {
 
     /// Observe a ready follower's exact receive epoch for shard admission.
     /// Local partitions and replicated leaders have no follower receive window.
-    pub fn receive_credit(
+    pub fn receive_receipt(
         &self,
         group: GroupId,
     ) -> Option<(NodeId, ozzy_replication::flow::Report)> {
@@ -503,7 +532,7 @@ impl PartitionActors {
         }
         match &self.actors[*self.index.get(&group)?] {
             PartitionActor::Local(_) | PartitionActor::Recovering(_) => None,
-            PartitionActor::Replicated(actor) => actor.receive_credit(),
+            PartitionActor::Replicated(actor) => actor.receive_receipt(),
         }
     }
 
@@ -519,8 +548,8 @@ impl PartitionActors {
         }
     }
 
-    /// Free follower capacity includes previously retained operations and unused
-    /// grants. Shard-wide backing still needs separate admission.
+    /// Local follower room after retained operations. Actual shard memory
+    /// backing remains independently bounded.
     pub fn receive_capacity(&self, group: GroupId) -> Option<ozzy_replication::PipelineLimits> {
         if self.stopped {
             return None;
@@ -528,29 +557,6 @@ impl PartitionActors {
         match &self.actors[*self.index.get(&group)?] {
             PartitionActor::Local(_) | PartitionActor::Recovering(_) => None,
             PartitionActor::Replicated(actor) => actor.receive_capacity(),
-        }
-    }
-
-    /// Observe current leader demand without assigning buffers to idle followers.
-    /// This is an admission scheduling hint, never verified history or authority.
-    pub fn receive_target(&self, group: GroupId) -> Option<ozzy_replication::OpNumber> {
-        if self.stopped {
-            return None;
-        }
-        match &self.actors[*self.index.get(&group)?] {
-            PartitionActor::Local(_) | PartitionActor::Recovering(_) => None,
-            PartitionActor::Replicated(actor) => actor.receive_target(),
-        }
-    }
-
-    /// Next-packet allocation hint. This supplies no replication authority.
-    pub fn receive_body_bytes(&self, group: GroupId) -> Option<usize> {
-        if self.stopped {
-            return None;
-        }
-        match &self.actors[*self.index.get(&group)?] {
-            PartitionActor::Local(_) | PartitionActor::Recovering(_) => None,
-            PartitionActor::Replicated(actor) => actor.receive_body_bytes(),
         }
     }
 
@@ -577,52 +583,6 @@ impl PartitionActors {
         })
     }
 
-    /// Advertise already reserved shard capacity to one exact partition epoch.
-    /// This does not allocate memory or dispatch slots. The caller must acquire
-    /// those reservations first and retain them until unused credit is fenced
-    /// or its admitted buffers are actually released.
-    pub fn grant_receive(
-        &mut self,
-        channel: ozzy_replication::flow::Channel,
-        operations: u64,
-        bytes: u64,
-    ) -> Result<(), ozzy_replication::flow::FlowError> {
-        use ozzy_replication::flow::FlowError;
-        if self.stopped {
-            return Err(FlowError::Channel);
-        }
-        let slot = *self
-            .index
-            .get(&channel.scope.group_id)
-            .ok_or(FlowError::Channel)?;
-        self.touch(slot);
-        match &mut self.actors[slot] {
-            PartitionActor::Local(_) | PartitionActor::Recovering(_) => Err(FlowError::Channel),
-            PartitionActor::Replicated(actor) => actor.grant_receive(channel, operations, bytes),
-        }
-    }
-
-    /// Revoke only unused follower credit before reallocating shard capacity.
-    /// The returned fresh epoch retains every previously received body charge.
-    /// Old dispatcher tokens must also be revoked before issuing replacements.
-    pub fn revoke_receive(
-        &mut self,
-        channel: ozzy_replication::flow::Channel,
-    ) -> Result<ozzy_replication::flow::Report, PartitionError> {
-        if self.stopped {
-            return Err(PartitionError::Stopped);
-        }
-        let group = channel.scope.group_id;
-        let slot = *self.index.get(&group).ok_or(PartitionError::Unknown)?;
-        self.touch(slot);
-        match &mut self.actors[slot] {
-            PartitionActor::Local(_) | PartitionActor::Recovering(_) => Err(PartitionError::Mode),
-            PartitionActor::Replicated(actor) => actor
-                .revoke_receive(channel)
-                .map_err(|source| PartitionError::Replica { group, source }),
-        }
-    }
-
     /// Synchronous bounded delivery after shared frontend admission. The actor
     /// validates the complete protocol command and its own current link session.
     /// Local partitions have no broker replication commands.
@@ -644,6 +604,34 @@ impl PartitionActors {
                 .receive(message, now)
                 .map_err(|source| PartitionError::Replica { group, source }),
         }
+    }
+
+    /// Bounded follower delivery; false leaves one PEER repair with its shard.
+    pub fn receive_data(
+        &mut self,
+        group: GroupId,
+        message: &Message,
+        now: Duration,
+    ) -> Result<bool, PartitionError> {
+        let slot = *self.index.get(&group).ok_or(PartitionError::Unknown)?;
+        self.observe(now)?;
+        let (consumed, changed) = match &mut self.actors[slot] {
+            PartitionActor::Replicated(actor) => {
+                let committed = actor.status().normal.map(|normal| normal.committed);
+                let consumed = actor
+                    .receive_data(message, now)
+                    .map_err(|source| PartitionError::Replica { group, source })?;
+                (
+                    consumed,
+                    committed != actor.status().normal.map(|normal| normal.committed),
+                )
+            }
+            PartitionActor::Local(_) | PartitionActor::Recovering(_) => (true, false),
+        };
+        if consumed || changed {
+            self.touch(slot);
+        }
+        Ok(consumed)
     }
 
     /// Apply one independently established link fence to its partition actor.

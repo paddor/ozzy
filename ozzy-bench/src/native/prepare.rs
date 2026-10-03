@@ -16,6 +16,7 @@ pub struct PreparedBroker {
 }
 
 impl PreparedBroker {
+    /// Reserve disk-backed storage and fixed TCP endpoints for one of one or three brokers.
     pub fn new(parent: &Path, index: usize, bind: IpAddr, brokers: usize) -> BenchResult<Self> {
         if ![1, 3].contains(&brokers)
             || index >= brokers
@@ -38,6 +39,7 @@ impl PreparedBroker {
         };
         let endpoints = Endpoints {
             peer: endpoint()?,
+            data_peer: endpoint()?,
             reader_pub: endpoint()?,
             follower_pub: (brokers == 3).then(&mut endpoint).transpose()?,
         };
@@ -49,14 +51,17 @@ impl PreparedBroker {
         })
     }
 
+    /// Worker-owned temporary directory retained through the benchmark deployment.
     pub fn directory(&self) -> &Path {
         self.directory.path()
     }
 
+    /// Device storage root selected for this named broker.
     pub fn root(&self) -> PathBuf {
         self.directory().join(&self.broker)
     }
 
+    /// Fixed endpoint reservations to install into the shared deployment document.
     pub fn endpoints(&self) -> &Endpoints {
         &self.endpoints
     }
@@ -89,6 +94,7 @@ impl PreparedBroker {
         })
     }
 
+    /// Release bound TCP reservations immediately before production sockets bind.
     pub fn release_endpoints(&mut self) {
         self.reservations.clear();
     }

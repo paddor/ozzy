@@ -76,7 +76,7 @@ pub struct TopicReaderStats {
 }
 
 /// Bounded topic reader sharing the SDK's broker connections with other readers
-/// and writers. Cancellation retains subscription, credit, and delivery state.
+/// and writers. Cancellation retains subscription, source, and delivery state.
 pub struct TopicReader {
     links: BrokerLinks,
     routes: TopicRoutes,
@@ -102,6 +102,11 @@ impl std::fmt::Debug for TopicReader {
 }
 
 impl TopicReader {
+    /// Next owner deadline, including a refused subscription's backoff.
+    pub(crate) fn deadline(&self) -> Option<Duration> {
+        self.cursors.iter().filter_map(Cursor::deadline).min()
+    }
+
     /// Look up the topic and register all selected interests without waiting for
     /// every broker. `next` establishes independent partition subscriptions.
     pub async fn open(
@@ -190,7 +195,7 @@ impl TopicReader {
                 }
                 return result;
             }
-            let deadline = self.cursors.iter().filter_map(Cursor::deadline).min();
+            let deadline = self.deadline();
             let links = self.links.clone();
             let routes = self.routes.clone();
             let clock = self.clock.clone();

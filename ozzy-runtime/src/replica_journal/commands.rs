@@ -4,7 +4,7 @@ use super::ReadyJournalSync;
 use super::recovery::RecoveryAction;
 use super::{
     AppendBuffer, JournalCompletion, JournalError, OwnedSemaphorePermit, PromiseTicket,
-    ReplicaJournal, SubmitError, ValidatedAppend, completion, mpsc,
+    ReplicaJournal, SubmitError, ValidatedAppend, completion,
 };
 use super::{
     FetchedHistory, HistoryPosition, ProposalBuffer, ProposalValidation, ReplicationPositions,
@@ -36,24 +36,17 @@ pub(super) enum Action {
     CleanupOrphans {
         ticket: ValidationTicket,
         budget: ozzy_journal_segment::MaintenanceBudget,
-        done: completion::Sender<Result<ozzy_journal_segment::OrphanCleanupStep, JournalError>>,
+        done: completion::Sender<Result<crate::replica_journal::OwnedCleanedStorage, JournalError>>,
     },
     CleanupMetadata {
         ticket: ValidationTicket,
         budget: ozzy_journal_segment::MaintenanceBudget,
-        done: completion::Sender<Result<ozzy_journal_segment::MetadataCleanupStep, JournalError>>,
+        done: completion::Sender<Result<crate::replica_journal::OwnedCleanedStorage, JournalError>>,
     },
     ValidateStorage {
         ticket: ValidationTicket,
         budget: ozzy_journal_segment::StorageValidationBudget,
         done: completion::Sender<Result<super::ValidatedStorage, JournalError>>,
-    },
-    OpenReader {
-        ticket: ValidationTicket,
-        partition: ozzy_proto::PartitionIncarnation,
-        /// None selects the applied end.
-        from: Option<ozzy_proto::Offset>,
-        done: completion::Sender<Result<super::PartitionReadCursor, JournalError>>,
     },
     ReadPartition {
         read_permit: OwnedSemaphorePermit,
@@ -203,7 +196,7 @@ pub(super) fn finish<T>(
     faulted
 }
 
-impl<E> ReplicaJournal<E> {
+impl ReplicaJournal {
     /// Install validated acceptance and queue its physical write on the dedicated
     /// writer. The returned write completion covers the exact write ticket; the
     /// group policy decides whether it counts before or after confirmation.
@@ -285,11 +278,7 @@ impl<E> ReplicaJournal<E> {
         assert!(
             limits.max_body_bytes > 0 && limits.max_body_bytes <= self.append_limits.max_body_bytes
         );
-        if self
-            .sender
-            .as_ref()
-            .is_none_or(mpsc::NotifiedSender::is_disconnected)
-        {
+        if self.execution.is_closed() {
             return Err(SubmitError::Stopped);
         }
         let lease = self
@@ -418,16 +407,12 @@ impl<E> ReplicaJournal<E> {
         make: impl FnOnce(T, completion::Sender<Result<R, JournalError>>) -> Action,
         recover: impl FnOnce(Action) -> T,
     ) -> Result<JournalCompletion<R>, Rejected<T>> {
-        let Some(sender) = self
-            .sender
-            .as_mut()
-            .filter(|sender| !sender.is_disconnected())
-        else {
+        if self.execution.is_closed() {
             return Err(Rejected {
                 reason: SubmitError::Stopped,
                 value,
             });
-        };
+        }
         let Ok(permit) = self.capacity.clone().try_acquire_owned() else {
             return Err(Rejected {
                 reason: SubmitError::Full,
@@ -439,11 +424,7 @@ impl<E> ReplicaJournal<E> {
             action: make(value, done),
             _permit: permit,
         };
-        if let Err(error) = sender.try_send(command) {
-            let (reason, command) = match error {
-                mpsc::TrySendError::Full(command) => (SubmitError::Full, command),
-                mpsc::TrySendError::Disconnected(command) => (SubmitError::Stopped, command),
-            };
+        if let Err((reason, command)) = self.execution.submit(command) {
             return Err(Rejected {
                 reason,
                 value: recover(command.action),

@@ -85,7 +85,6 @@ impl SharedReaders {
                 };
                 self.subscribe(peer, packet.envelope, link, &subscribe, source)
             }
-            Opcode::Credit => self.credit(peer, packet, link),
             Opcode::Ack => self.ack(peer, packet, link),
             Opcode::Unsubscribe => {
                 let selected =
@@ -124,40 +123,6 @@ impl SharedReaders {
             }
             _ => Err(Failure::new(2)),
         }
-    }
-
-    fn credit(&mut self, peer: NodeId, packet: Packet<'_>, link: Link) -> Result<(), Failure> {
-        let limits = self.config.limits.envelope;
-        if self.rejection.is_some() {
-            return Err(Failure::new(10));
-        }
-        let credit = reader::decode_credit(packet, limits).map_err(|_| Failure::new(1))?;
-        let slot = self
-            .find(peer, credit.subscription)
-            .filter(|slot| slot.delivery.source == credit.source)
-            .ok_or_else(|| Failure::new(12))?;
-        slot.delivery.credit(
-            credit,
-            (link.remote.inflight_records, link.remote.inflight_bytes),
-        )?;
-        let header = reader::encode_credit(
-            Envelope {
-                response: true,
-                sender: self.local,
-                ..packet.envelope
-            },
-            credit,
-            &mut self.metadata,
-            link.send.envelope,
-        )
-        .map_err(|_| Failure::new(1))?;
-        self.rejection = Some(crate::native_frames::message(
-            peer.as_bytes(),
-            header,
-            &self.metadata,
-            Bytes::new(),
-        ));
-        Ok(())
     }
 
     fn ack(&mut self, peer: NodeId, packet: Packet<'_>, link: Link) -> Result<(), Failure> {

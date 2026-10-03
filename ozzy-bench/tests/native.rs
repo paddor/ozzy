@@ -141,6 +141,7 @@ fn shared_deployment_install_preserves_exact_records_and_prepared_resources() {
     let mut config = source.parse::<toml::Value>().unwrap();
     let broker = &mut config["brokers"]["broker-0"];
     broker["endpoints"]["peer"] = toml::Value::String(resources.endpoints().peer.clone());
+    broker["endpoints"]["data_peer"] = toml::Value::String(resources.endpoints().data_peer.clone());
     broker["endpoints"]["reader_pub"] =
         toml::Value::String(resources.endpoints().reader_pub.clone());
     broker["devices"]["ssd"]["root"] =
@@ -164,7 +165,7 @@ fn shared_deployment_install_preserves_exact_records_and_prepared_resources() {
 
 fn document(root: &Path, policy: &str) -> (String, Vec<TcpListener>) {
     let brokers = if policy == "local-durable" { 1 } else { 3 };
-    let reservations = (0..brokers * 2)
+    let reservations = (0..brokers * 4)
         .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
         .collect::<Vec<_>>();
     let mut source = format!(
@@ -174,8 +175,15 @@ fn document(root: &Path, policy: &str) -> (String, Vec<TcpListener>) {
         if brokers == 1 { "single" } else { "three" }
     );
     for index in 0..brokers {
-        let peer = reservations[index * 2].local_addr().unwrap().port();
-        let readers = reservations[index * 2 + 1].local_addr().unwrap().port();
+        let peer = reservations[index * 4].local_addr().unwrap().port();
+        let readers = reservations[index * 4 + 1].local_addr().unwrap().port();
+        let followers = reservations[index * 4 + 2].local_addr().unwrap().port();
+        let data = reservations[index * 4 + 3].local_addr().unwrap().port();
+        let follower_endpoint = if brokers == 3 {
+            format!("follower_pub = \"tcp://127.0.0.1:{followers}\"\n")
+        } else {
+            String::new()
+        };
         let storage = toml::Value::String(
             root.join(format!("broker-{index}"))
                 .to_str()
@@ -185,8 +193,8 @@ fn document(root: &Path, policy: &str) -> (String, Vec<TcpListener>) {
         write!(
             source,
             "[brokers.broker-{index}.endpoints]\n\
-             peer = \"tcp://127.0.0.1:{peer}\"\nreader_pub = \"tcp://127.0.0.1:{readers}\"\n\
-             [brokers.broker-{index}.devices.ssd]\nroot = {storage}\ncontroller = \"ssd\"\n\
+             peer = \"tcp://127.0.0.1:{peer}\"\ndata_peer = \"tcp://127.0.0.1:{data}\"\nreader_pub = \"tcp://127.0.0.1:{readers}\"\n\
+             {follower_endpoint}[brokers.broker-{index}.devices.ssd]\nroot = {storage}\ncontroller = \"ssd\"\n\
              [brokers.broker-{index}.devices.ssd.workers]\nbackend = \"pool\"\n\
              write_threads = 1\nmax_inflight = 8\nqueued_jobs = 32\nqueued_bytes = 8388608\n\
              progress_jobs = 8\nprogress_bytes = 1048576\nopen_handles = 256\n"

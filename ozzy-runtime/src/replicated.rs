@@ -32,9 +32,9 @@ pub use topic_writer::{
     TopicWriterError,
 };
 pub use writer::{
-    MAX_APPEND_RECORDS, MAX_SEQUENCE, PAYLOAD_COMPRESSION_THRESHOLD, PartitionTarget,
-    PendingRecord, RecordInput, RecordReceipt, SharedWriterReservation, Writer, WriterConfig,
-    WriterError, WriterRuntime, WriterStats,
+    MAX_APPEND_RECORDS, MAX_SEQUENCE, PAYLOAD_COMPRESSION_THRESHOLD, PendingRecord, RecordInput,
+    RecordReceipt, SharedWriterReservation, Writer, WriterConfig, WriterError, WriterRuntime,
+    WriterStats,
 };
 
 /// Explicit application access for one trusted or independently authenticated node.

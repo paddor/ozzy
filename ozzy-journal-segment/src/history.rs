@@ -4,7 +4,7 @@ pub(crate) mod asynchronous;
 #[cfg(test)]
 mod tests;
 mod validation;
-pub use validation::{StorageValidation, StorageValidationBudget, StorageValidationStep};
+pub use validation::{StorageValidationBudget, StorageValidationStep};
 
 use std::fs::{self, File};
 use std::io::Read;
@@ -12,11 +12,12 @@ use std::io::Read;
 use ozzy_journal::operation::validate_operation_body;
 use ozzy_journal::progress::JournalGeneration;
 
+use crate::codec::SegmentDigestBuilder;
 use crate::{
     CanonicalOperation, ChainPosition, CodecError, DecodeLimits, DecodedOperation, DirectoryError,
     ENTRY_HEADER_BYTES, GroupIdentity, LogPosition, OpenGroupJournal, OperationLimits,
-    SealedSegment, SegmentHeader, SegmentPin, SegmentScan, TailState, decode_indexed_operation,
-    scan_segment,
+    SealedSegment, SegmentHeader, SegmentPin, SegmentScan, TailState, decode_group,
+    decode_indexed_operation, scan_segment,
 };
 
 /// Pinned source with an exact stable tail and independently captured physical anchors.
@@ -70,6 +71,12 @@ struct HistoryState<S> {
 struct LoadedSegment {
     index: usize,
     header: SegmentHeader,
+    valid_bytes: u64,
+    next_group_number: u64,
+    next_chain: ChainPosition,
+    digest: SegmentDigestBuilder,
+    groups: usize,
+    decoded_body_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -300,10 +307,7 @@ impl JournalHistory {
         let mut entries = std::mem::take(&mut self.state.entries);
         let result = self.state.index_segment(index, &mut entries);
         self.state.entries = entries;
-        self.state.loaded = Some(LoadedSegment {
-            index,
-            header: result?,
-        });
+        self.state.loaded = Some(result?);
         Ok(())
     }
 }
@@ -461,8 +465,12 @@ impl<S: Source> HistoryState<S> {
         &self,
         index: usize,
         entries: &mut Vec<IndexedOperation>,
-    ) -> Result<SegmentHeader, HistoryError> {
+    ) -> Result<LoadedSegment, HistoryError> {
         let scan = self.checked_scan(index)?;
+        let mut digest = SegmentDigestBuilder::new(&scan.header);
+        for group in &scan.groups {
+            digest.push(group.digest);
+        }
         for operation in scan.groups.iter().flat_map(|group| &group.operations) {
             if entries.len() == self.entry_limit {
                 return Err(HistoryError::Capacity);
@@ -479,7 +487,100 @@ impl<S: Source> HistoryState<S> {
                 body_bytes: operation.body.len(),
             });
         }
-        Ok(scan.header)
+        Ok(LoadedSegment {
+            index,
+            header: scan.header,
+            valid_bytes: scan.valid_bytes,
+            next_group_number: scan.next_group_number,
+            next_chain: scan.next_chain,
+            digest,
+            groups: scan.groups.len(),
+            decoded_body_bytes: scan.decoded_body_bytes,
+        })
+    }
+
+    /// Extend a previously checked, immutable prefix from a newer captured
+    /// suffix. The old bytes and group digest state remain the trust anchor;
+    /// every new group still gets physical and canonical validation.
+    fn extend_loaded(&mut self, index: usize) -> Result<(), HistoryError> {
+        let mut loaded = self.loaded.take().ok_or(HistoryError::Source)?;
+        if loaded.index != index || loaded.valid_bytes as usize > self.bytes.len() {
+            return Err(HistoryError::Source);
+        }
+        let mut offset = loaded.valid_bytes as usize;
+        while offset < self.bytes.len() {
+            if loaded.groups == self.decode.max_groups {
+                return Err(CodecError::LimitExceeded {
+                    kind: "physical group count",
+                    actual: loaded.groups + 1,
+                    limit: self.decode.max_groups,
+                }
+                .into());
+            }
+            let group = decode_group(
+                &loaded.header,
+                loaded.next_group_number,
+                offset as u64,
+                loaded.next_chain,
+                &self.bytes[offset..],
+                self.decode,
+            )?;
+            for operation in &group.operations {
+                if operation.configuration_epoch != self.configuration_epoch
+                    || operation.original_view > self.promised_view
+                {
+                    return Err(HistoryError::Source);
+                }
+                validate_operation_body(operation.kind, operation.body.as_ref(), self.operations)?;
+                loaded.decoded_body_bytes = loaded
+                    .decoded_body_bytes
+                    .checked_add(operation.body.len())
+                    .ok_or(HistoryError::Capacity)?;
+                if loaded.decoded_body_bytes > self.decode.max_segment_decoded_body_bytes {
+                    return Err(CodecError::SegmentDecodedBodyLimit {
+                        actual: loaded.decoded_body_bytes,
+                        limit: self.decode.max_segment_decoded_body_bytes,
+                    }
+                    .into());
+                }
+                if self.entries.len() == self.entry_limit {
+                    return Err(HistoryError::Capacity);
+                }
+                self.entries.push(IndexedOperation {
+                    offset: usize::try_from(operation.entry_offset)
+                        .map_err(|_| HistoryError::Capacity)?,
+                    bytes: usize::try_from(operation.entry_bytes)
+                        .map_err(|_| HistoryError::Capacity)?,
+                    position: LogPosition {
+                        op_number: operation.op_number,
+                        digest: operation.digest,
+                    },
+                    body_bytes: operation.body.len(),
+                });
+            }
+            offset = usize::try_from(group.end_offset).map_err(|_| HistoryError::Capacity)?;
+            loaded.next_group_number = loaded
+                .next_group_number
+                .checked_add(1)
+                .ok_or(CodecError::InvalidGroupNumber)?;
+            loaded.next_chain = group.next_chain;
+            loaded.digest.push(group.digest);
+            loaded.groups += 1;
+        }
+        let expected = self
+            .pin
+            .references()
+            .get(index + 1)
+            .map_or(self.physical_through, |next| before(next.first_chain));
+        if offset as u64 != self.seal(index).valid_bytes
+            || loaded.digest.finish() != self.seal(index).digest
+            || before(loaded.next_chain) != expected
+        {
+            return Err(HistoryError::Source);
+        }
+        loaded.valid_bytes = offset as u64;
+        self.loaded = Some(loaded);
+        Ok(())
     }
 
     fn read_entry(&self, entry: &IndexedOperation) -> Result<DecodedOperation<'_>, HistoryError> {
@@ -620,7 +721,12 @@ pub enum HistoryError {
     /// The verified next operation needs more bytes than this request allows.
     /// The source remains valid; a caller may retry when byte credit increases.
     #[error("history operation needs {required} body bytes, request permits {available}")]
-    BodyBudget { required: usize, available: usize },
+    BodyBudget {
+        #[doc = "Capacity required by this captured history."]
+        required: usize,
+        #[doc = "Available bytes, capacity, or canonical prefix at failure."]
+        available: usize,
+    },
     /// Source read failed. No claim of nonexistence is justified.
     #[error(transparent)]
     Io(#[from] std::io::Error),

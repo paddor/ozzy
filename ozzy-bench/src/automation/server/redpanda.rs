@@ -22,8 +22,11 @@ struct Node {
 }
 
 #[derive(Debug)]
+/// Owned local Redpanda process and its fresh storage directory.
 pub struct Redpanda {
+    /// Fresh server storage and diagnostic artifact directory.
     pub root: PathBuf,
+    /// Kafka-protocol client endpoint of this Redpanda deployment.
     pub endpoint: String,
     nodes: Vec<Node>,
     /// One CPU list per node.
@@ -34,6 +37,7 @@ pub struct Redpanda {
 }
 
 impl Redpanda {
+    /// Start fresh Redpanda with the requested persistence policy and CPU placement.
     pub fn start(root: &Path, mode: &str, cpus: &[Vec<usize>]) -> Result<Self> {
         let replicas = if crate::automation::cluster_mode(mode) {
             3
@@ -244,10 +248,12 @@ impl Redpanda {
         Ok(())
     }
 
+    /// Process IDs owned by this deployment.
     pub fn pids(&self) -> Vec<u32> {
         self.nodes.iter().map(|node| node.child.id()).collect()
     }
 
+    /// Reject an exited process or fatal server diagnostics.
     pub fn check(&self) -> Result<()> {
         for node in &self.nodes {
             let path = node.root.join("server.log");
@@ -260,6 +266,7 @@ impl Redpanda {
         Ok(())
     }
 
+    /// Capture allowed CPUs of the running Redpanda server.
     pub fn affinity(&self) -> Result<Value> {
         let mut threads = BTreeMap::new();
         for (pid, budget) in self.pids().into_iter().zip(&self.cpus) {
@@ -294,6 +301,7 @@ impl Redpanda {
         Ok(json!(threads))
     }
 
+    /// Collect pinned source, package, and executable identity.
     pub fn identity(&self) -> Result<Value> {
         if self.build != build::verified_identity()? {
             return Err("Redpanda binary changed during case".into());
@@ -317,6 +325,7 @@ impl Redpanda {
         )
     }
 
+    /// Stop the server and reap its process.
     pub fn stop(&mut self) -> Result<()> {
         if self.stopped {
             return Ok(());

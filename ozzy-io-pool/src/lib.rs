@@ -3,6 +3,7 @@
 //! threads are used. Dropping the pool requests a detached drain; `shutdown`
 //! additionally waits for every admitted operation and file close. `join`
 //! then blocks until the worker threads have exited.
+#![warn(missing_docs)]
 #![forbid(unsafe_code)]
 
 pub mod direct;
@@ -18,9 +19,12 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::task::{Wake, Waker};
-use std::time::Duration;
 
 use fanring::{mpmc, teardown::Coordinated};
+use futures::{
+    FutureExt,
+    future::{BoxFuture, Shared as SharedFuture},
+};
 use ozzy_io::{
     Admission, Backend, Class, Completion, HandleOwner, Lane, Limits, Operation, Rejected, Reply,
     completion,
@@ -29,9 +33,11 @@ use tokio::sync::Notify;
 
 pub use startup::{Initializer, Worker};
 
+type ThreadJoin = SharedFuture<BoxFuture<'static, ()>>;
 type Sender = mpmc::Sender<Job, Coordinated>;
 type Receiver = mpmc::Receiver<Job, Coordinated>;
 
+/// Fixed worker, physical-job, handle, and admission bounds for one device.
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     /// Ordinary execution threads. Up to two more serve progress jobs.
@@ -41,6 +47,7 @@ pub struct Config {
     pub max_inflight: usize,
     /// Aggregate open handles, divided fairly across application shards.
     pub handles: usize,
+    /// Aggregate shard admission limits with reserved progress capacity.
     pub limits: Limits,
 }
 
@@ -49,15 +56,17 @@ pub struct Config {
 pub struct Pool {
     shared: Arc<Shared>,
     next_thread: AtomicUsize,
-    threads: Vec<OnceLock<std::thread::JoinHandle<()>>>,
+    threads: Vec<OnceLock<ThreadJoin>>,
 }
 
+/// One shard-owned submission lane into the fixed backend worker pool.
 pub struct Client {
     data: Sender,
     progress: Sender,
     shared: Arc<Shared>,
     shard: usize,
     admission: Lane,
+    direct: Option<direct::Senders>,
 }
 
 impl fmt::Debug for Client {
@@ -139,6 +148,7 @@ impl Pool {
         Self::with_direct_worker_and_initializer(config, worker, Arc::new(|_| Ok(())))
     }
 
+    /// Install a direct-write worker and initialize placement before execution.
     pub fn with_direct_worker_and_initializer(
         config: Config,
         worker: impl direct::Worker,
@@ -169,11 +179,6 @@ impl Pool {
         } else {
             (None, None, None)
         };
-        // Register every helper lane before the direct worker can fail and
-        // disconnect its receiver during startup.
-        let mut forwarders = (0..config.threads + config.threads.min(2))
-            .map(|_| direct_senders(forward.as_ref()))
-            .collect::<io::Result<Vec<_>>>()?;
         let maximum_threads =
             config.threads + config.threads.min(2) + usize::from(direct.is_some());
         let handles = HandleOwner::default();
@@ -201,8 +206,11 @@ impl Pool {
             gate: Mutex::new(None),
         });
         let queue = |class| {
-            mpmc::try_channel_with_policy(limits.share(0, class).operations)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))
+            mpmc::try_channel_with_policy(match class {
+                Class::Data => limits.data.operations,
+                Class::Progress => limits.progress.operations,
+            })
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))
         };
         let (data, data_rx) = queue(Class::Data)?;
         let (progress, progress_rx) = queue(Class::Progress)?;
@@ -214,6 +222,7 @@ impl Pool {
                 shared: shared.clone(),
                 shard,
                 admission: shared.admission.lane(shard)?,
+                direct: direct_senders(forward.as_ref())?,
             });
         }
         clients.insert(
@@ -224,6 +233,7 @@ impl Pool {
                 shared: shared.clone(),
                 shard: 0,
                 admission: shared.admission.lane(0)?,
+                direct: direct_senders(forward.as_ref())?,
             },
         );
         let pool = Self {
@@ -243,13 +253,7 @@ impl Pool {
             let thread = direct::spawn(worker, receivers, &pool.shared, initialize.clone())?;
             pool.own(thread);
         }
-        pool.start_helpers(
-            config.threads,
-            &data_rx,
-            &progress_rx,
-            &initialize,
-            &mut forwarders,
-        )?;
+        pool.start_helpers(config.threads, &data_rx, &progress_rx, &initialize)?;
         drop(forward);
         drop(initialize);
         drop(startup);
@@ -262,16 +266,13 @@ impl Pool {
         data_rx: &Receiver,
         progress_rx: &Receiver,
         initialize: &Initializer,
-        forwarders: &mut Vec<Option<direct::Senders>>,
     ) -> io::Result<()> {
-        let mut forwarders = forwarders.drain(..);
         for index in 0..threads {
             self.spawn(
                 index,
                 (*data_rx).clone(),
                 Worker::Data(index),
                 initialize.clone(),
-                forwarders.next().expect("one direct lane per helper"),
             )?;
         }
         // Partitions submit independent metadata barriers. Progress workers
@@ -282,7 +283,6 @@ impl Pool {
                 (*progress_rx).clone(),
                 Worker::Progress,
                 initialize.clone(),
-                forwarders.next().expect("one direct lane per helper"),
             )?;
         }
         Ok(())
@@ -295,7 +295,6 @@ impl Pool {
         receiver: Receiver,
         role: Worker,
         initialize: Initializer,
-        forward: Option<direct::Senders>,
     ) -> io::Result<()> {
         let shared = self.shared.clone();
         let (started, ready) = std::sync::mpsc::sync_channel(1);
@@ -307,7 +306,7 @@ impl Pool {
                     .set(std::thread::current())
                     .expect("worker registered once");
                 if startup::initialize(&initialize, role, &started) {
-                    run(receiver, &shared, role, forward);
+                    run(receiver, &shared, role);
                 } else {
                     shared.fail();
                     shared.worker_finished();
@@ -350,19 +349,24 @@ impl Pool {
     /// never from an application shard or a worker.
     pub fn join(&self) {
         for thread in self.threads.iter().filter_map(OnceLock::get) {
-            while !thread.is_finished() {
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            futures::executor::block_on(thread.clone());
         }
     }
 
     fn own(&self, thread: std::thread::JoinHandle<()>) {
         let slot = self.next_thread.fetch_add(1, Ordering::Relaxed);
         self.threads[slot]
-            .set(thread)
+            .set(
+                async move {
+                    let _ = thread.join();
+                }
+                .boxed()
+                .shared(),
+            )
             .expect("worker handle published more than once");
     }
 
+    /// Device-wide admission observations and capacity wakeups.
     pub fn admission(&self) -> &Admission {
         &self.shared.admission
     }
@@ -399,15 +403,28 @@ impl Backend for Client {
             executing: false,
         };
         let index = usize::from(class == Class::Progress);
-        self.shared.queued[index].fetch_add(1, Ordering::AcqRel);
-        let sender = match class {
-            Class::Data => &mut self.data,
-            Class::Progress => &mut self.progress,
+        let direct_write = self.direct.is_some()
+            && matches!(
+                job.operation
+                    .as_ref()
+                    .expect("unrun operation")
+                    .unprotected(),
+                Operation::Write { handle, data, .. } if handle.is_direct() && !data.is_empty()
+            );
+        let result = if direct_write {
+            self.direct.as_mut().expect("direct sender")[index].try_send(job)
+        } else {
+            self.shared.queued[index].fetch_add(1, Ordering::AcqRel);
+            let sender = match class {
+                Class::Data => &mut self.data,
+                Class::Progress => &mut self.progress,
+            };
+            let result = sender.try_send(job);
+            if result.is_err() {
+                self.shared.queued[index].fetch_sub(1, Ordering::AcqRel);
+            }
+            result
         };
-        let result = sender.try_send(job);
-        if result.is_err() {
-            self.shared.queued[index].fetch_sub(1, Ordering::AcqRel);
-        }
         self.shared.notify();
         match result {
             Ok(()) => Ok(completion),
@@ -553,17 +570,7 @@ impl Drop for Startup {
     }
 }
 
-enum Executed {
-    Done(ozzy_io::Outcome),
-    Direct(Arc<direct::OwnedFile>),
-}
-
-fn run(
-    mut receiver: Receiver,
-    shared: &Arc<Shared>,
-    role: Worker,
-    mut forward: Option<direct::Senders>,
-) {
+fn run(mut receiver: Receiver, shared: &Arc<Shared>, role: Worker) {
     let class = usize::from(role == Worker::Progress);
     loop {
         if shared.reclaim.swap(false, Ordering::AcqRel) {
@@ -587,6 +594,11 @@ fn run(
         let Some(mut job) = next_job else {
             if execution_slot {
                 shared.executing.fetch_sub(1, Ordering::AcqRel);
+                // A direct writer may have observed this temporary reservation.
+                // Wake it after releasing room, even when this queue was empty.
+                if let Some(direct) = &shared.direct {
+                    direct.wake.wake();
+                }
             }
             // A producer may have reserved its queue count immediately before
             // publication. Do not park until that entry becomes visible.
@@ -617,44 +629,19 @@ fn run(
                     gate.enter(job.operation.as_ref().expect("unrun operation"));
                 }
             }
-            if shared.direct.is_some()
-                && let Some(file) =
-                    files::direct_file(job.operation.as_ref().expect("unrun operation"), shared)?
-            {
-                return Ok(Executed::Direct(file));
-            }
             files::execute(
                 job.operation.take().expect("one execution"),
                 shared,
                 job.shard,
             )
-            .map(Executed::Done)
         })) {
             result
         } else {
             shared.fail();
             Err(io::Error::other("file worker panicked"))
         };
-        match result {
-            Ok(Executed::Direct(file)) => {
-                shared.direct.as_ref().expect("direct worker").send(
-                    forward.as_mut().expect("direct sender"),
-                    direct::Write { file, job },
-                );
-            }
-            result => {
-                drop(job.operation.take());
-                job.reply
-                    .take()
-                    .expect("one reply")
-                    .finish(result.map(|result| {
-                        let Executed::Done(outcome) = result else {
-                            unreachable!()
-                        };
-                        outcome
-                    }));
-            }
-        }
+        drop(job.operation.take());
+        job.reply.take().expect("one reply").finish(result);
     }
 }
 

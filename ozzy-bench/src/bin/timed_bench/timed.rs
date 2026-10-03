@@ -285,8 +285,17 @@ async fn receive_all(children: &mut [Process], event: &str) -> Result<Vec<Value>
     try_join_all(children.iter_mut().map(|child| child.receive(event))).await
 }
 async fn command(input: &mut mpsc::Receiver<Result<Value>>, expected: &str) -> Result<Value> {
-    let value = tokio::time::timeout(Duration::from_secs(60), input.recv())
-        .await?
+    command_with_timeout(input, expected, Duration::from_secs(60)).await
+}
+
+async fn command_with_timeout(
+    input: &mut mpsc::Receiver<Result<Value>>,
+    expected: &str,
+    timeout: Duration,
+) -> Result<Value> {
+    let value = tokio::time::timeout(timeout, input.recv())
+        .await
+        .map_err(|cause| error(format!("waiting for {expected} command: {cause}")))?
         .ok_or_else(|| error("coordinator closed control"))??;
     if value["command"] != expected {
         return Err(error(format!("expected {expected} command")));

@@ -14,10 +14,10 @@ use ozzy_proto::{
 };
 
 use super::{
-    Binding, CatalogError, Dispatcher, GrantSpec, Kind, LinkIds, LinkSessions, ReplyError,
-    RouteState, Routed, SetupError, TopicCatalog, WatchRegistry,
+    Binding, CatalogError, Dispatcher, Kind, LinkIds, LinkSessions, ReplyError, RouteState, Routed,
+    SetupError, TopicCatalog, WatchRegistry,
 };
-use crate::dispatch::{Class, Grant};
+use crate::dispatch::Class;
 use crate::replica_transport::SendAttempt;
 use crate::signal::StateSignal;
 
@@ -36,20 +36,20 @@ pub struct Access {
     pub kind: Kind,
 }
 
-/// Established link observation, with directional limits negotiated separately
-/// from shard-owned admission credit. This grants no partition authority.
+/// Established link observation, with negotiated directional codec limits.
+/// This grants no partition authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Link {
     /// Current peer, role, and session fence.
     pub binding: Binding,
     /// Common outbound codec bounds.
     pub send: DataLimits,
-    /// Selected capabilities and remote receive windows.
+    /// Selected capabilities and remote codec limits.
     pub remote: handshake::Parameters,
 }
 
 /// Read-only coalesced link state for application shards. Replacement first
-/// fences dispatcher grants/replies, then publishes this observation. A shard
+/// fences dispatcher replies, then publishes this observation. A shard
 /// checks the current session before delivering already queued work to actors.
 #[derive(Clone, Debug)]
 pub struct Links(Arc<LinkState>);
@@ -102,10 +102,10 @@ pub struct Service {
     handshake_turn: Option<NodeId>,
     handshake_first: bool,
     trusted_maximum: usize,
-    pub(super) requests: BTreeMap<u32, super::demand::Requests>,
     pub(super) ports: BTreeMap<u32, super::port::Mailbox>,
     pub(super) port_turn: Option<u32>,
-    pub(super) publication: Option<(u32, Message)>,
+    pub(super) publications: [Option<(u32, Message)>; 2],
+    pub(super) publication_next: usize,
 }
 
 impl Service {
@@ -121,8 +121,8 @@ impl Service {
     }
 
     /// Advertise canonical transfer bounds to independently configured brokers.
-    /// Clients retain the default native record profile. Neither profile grants
-    /// admission credit, broker authorization, or partition authority.
+    /// Clients retain the default native record profile. Record bounds carry
+    /// neither broker authorization nor partition authority.
     pub fn new_with_broker_limits(
         dispatcher: Dispatcher,
         parameters: handshake::Parameters,
@@ -182,10 +182,10 @@ impl Service {
             handshake_turn: None,
             handshake_first: true,
             trusted_maximum: 0,
-            requests: BTreeMap::new(),
             ports: BTreeMap::new(),
             port_turn: None,
-            publication: None,
+            publications: [None, None],
+            publication_next: 0,
         })
     }
 
@@ -260,7 +260,7 @@ impl Service {
     }
 
     /// Begin a fresh attempt, or retry an unfinished one. Starting after a live
-    /// session fences its grants, replies, and shard observation immediately.
+    /// session fences its replies and shard observation immediately.
     /// No connection to another broker is required to finish this negotiation.
     pub fn start(&mut self, peer: NodeId) -> Result<(), ServiceError> {
         if !self.peers.contains_key(&peer) {
@@ -270,7 +270,6 @@ impl Service {
             watches.disconnect(peer, link.binding.session);
         }
         let frames = self.sessions.start(peer)?;
-        self.fence_requests(peer);
         self.dispatcher.disconnect(peer);
         self.set_link(peer, None);
         let state = self.peers.get_mut(&peer).expect("authorized peer");
@@ -297,7 +296,6 @@ impl Service {
         if self.links.get(binding.peer).map(|link| link.binding) != Some(binding) {
             return false;
         }
-        self.fence_requests(binding.peer);
         self.dispatcher.disconnect(binding.peer);
         if let Some(watches) = &mut self.watches {
             watches.disconnect(binding.peer, binding.session);
@@ -311,9 +309,77 @@ impl Service {
         true
     }
 
-    /// One ordinary PEER receive. `retained_bytes` comes from the transport's
-    /// conservative allocation bound, not visible payload length. Handshakes
-    /// retain only freshly encoded bounded metadata. Refused input is dropped.
+    /// Broker-local maximum native framing, independent of remote negotiation.
+    pub fn envelope_limits(&self) -> ozzy_proto::EnvelopeLimits {
+        self.dispatcher.routes.limits
+    }
+
+    /// Lossy group publication from an independently configured SUB connection.
+    /// Full shard capacity discards this attempt; accepted-tail probes repair it.
+    pub fn receive_publication(
+        &mut self,
+        publisher: NodeId,
+        message: &Message,
+        retained_bytes: usize,
+    ) -> Result<Option<Routed>, ReceiveError> {
+        if message.len() != 4
+            || self
+                .links
+                .get(publisher)
+                .is_none_or(|link| link.binding.kind != Kind::Broker)
+        {
+            return Err(ReceiveError::Peer);
+        }
+        let frames =
+            std::array::from_fn::<_, 3, _>(|i| message.part_slice(i + 1).expect("four frames"));
+        let packet = decode_packet(&frames, self.dispatcher.routes.limits)?;
+        let scope = ozzy_replication::wire::route(packet, self.dispatcher.routes.limits).map_err(
+            |error| {
+                ReceiveError::Dispatch(super::Rejection::Routing(super::RoutingError::Broker(
+                    error,
+                )))
+            },
+        )?;
+        if packet.envelope.opcode != Opcode::PreparePub
+            || message.part_slice(0) != Some(scope.group_id.as_bytes().as_slice())
+            || packet.envelope.sender != publisher
+        {
+            return Err(ReceiveError::Peer);
+        }
+        let normalized = Message::multipart(
+            std::iter::once(Bytes::copy_from_slice(publisher.as_bytes()))
+                .chain((1..4).map(|i| message.part_bytes(i).expect("four frames"))),
+        );
+        self.dispatcher
+            .dispatch_data(publisher, normalized, retained_bytes)
+            .map(Some)
+            .map_err(|rejected| {
+                if matches!(
+                    rejected.reason,
+                    super::Rejection::Data(super::DataPressure::Full { .. })
+                ) {
+                    crate::profiling::event(crate::profiling::Event::ReplicaPublicationQueueDrop);
+                }
+                ReceiveError::Dispatch(rejected.reason)
+            })
+    }
+
+    /// Observe producer queue space after a failed enqueue without holding
+    /// the service across the wait.
+    pub fn data_space_changed_after(
+        &self,
+        shard: u32,
+        kind: Kind,
+        class: Class,
+        generation: u64,
+    ) -> Option<impl std::future::Future<Output = ()> + use<>> {
+        self.dispatcher
+            .data_space_changed_after(shard, kind, class, generation)
+    }
+
+    /// Receive one PEER frame. Full admission returns pressure without a refusal.
+    /// The transport owner restores its original frame to the same receive source.
+    /// Retained bytes cover backing storage, not just visible payload length.
     pub fn receive(
         &mut self,
         message: Message,
@@ -339,63 +405,15 @@ impl Service {
             std::array::from_fn::<_, 3, _>(|i| message.part_slice(i + 1).expect("four frames"));
         let envelope = self.sessions.receive_limits(peer).envelope;
         let packet = decode_packet(&frames, envelope)?;
+        if packet.envelope.opcode == Opcode::PreparePub {
+            return Err(ReceiveError::Peer);
+        }
         let access = match access {
             Some(access) => access,
             None => self.admit_trusted_client(peer, packet)?,
         };
         if matches!(packet.envelope.opcode, Opcode::Hello | Opcode::Welcome) {
-            let hello = handshake::decode(packet, envelope)?;
-            // These bits constrain the authorized profile. They do not authorize
-            // a routing identity or establish replication membership.
-            admission::validate_roles(access.kind, hello.parameters.roles)?;
-            let handled = self.sessions.receive(peer, packet)?;
-            if handled.replaced {
-                self.fence_requests(peer);
-                let binding = Binding {
-                    peer,
-                    kind: access.kind,
-                    session: self.sessions.session(peer).expect("established handshake"),
-                };
-                if let Err(error) = self.dispatcher.bind(binding) {
-                    self.dispatcher.disconnect(peer);
-                    self.sessions.disconnect(peer);
-                    self.set_link(peer, None);
-                    self.peers
-                        .get_mut(&peer)
-                        .expect("authorized peer")
-                        .handshake = None;
-                    return Err(error.into());
-                }
-                if access.kind == Kind::Client
-                    && let Some(watches) = &mut self.watches
-                    && let Err(error) = watches.bind(peer, binding.session)
-                {
-                    self.dispatcher.disconnect(peer);
-                    self.sessions.disconnect(peer);
-                    self.set_link(peer, None);
-                    return Err(ReceiveError::Watch(error));
-                }
-                self.set_link(
-                    peer,
-                    Some(Link {
-                        binding,
-                        send: self.sessions.send_limits(peer)?,
-                        remote: self
-                            .sessions
-                            .remote_parameters(peer)
-                            .expect("established handshake"),
-                    }),
-                );
-                let state = self.peers.get_mut(&peer).expect("authorized peer");
-                state.handshake = None;
-                state.awaiting_welcome = handled.reply.is_some();
-            }
-            if let Some(reply) = handled.reply {
-                self.peers
-                    .get_mut(&peer)
-                    .expect("authorized peer")
-                    .handshake = Some(routed(peer, reply));
-            }
+            self.receive_handshake(peer, access.kind, packet, envelope)?;
             Ok(None)
         } else if packet.envelope.opcode == Opcode::StateSnapshotRequest {
             match packet.metadata.first() {
@@ -415,8 +433,10 @@ impl Service {
             if packet.envelope.opcode == Opcode::ReplicaState {
                 self.bind_incoming_channel(peer, packet, envelope)?;
             }
-            let request = packet.envelope;
-            self.receive_partition(peer, request, message, retained_bytes)
+            self.dispatcher
+                .dispatch_data(peer, message, retained_bytes)
+                .map(Some)
+                .map_err(|rejected| ReceiveError::Dispatch(rejected.reason))
         }
     }
 
@@ -566,7 +586,7 @@ impl Service {
                     peer,
                     packet.envelope,
                     10,
-                    nack::RetryClass::AfterCredit,
+                    nack::RetryClass::AfterBackoff,
                 );
             }
             Err(super::WatchError::Unknown) => {
@@ -700,27 +720,6 @@ impl Service {
             Err((ReplyError::Full, _)) => Ok(false),
             Err(_) => Err(ServiceError::Watch),
         }
-    }
-
-    /// Install only after the destination reserves lane and retained capacity.
-    /// Revoked tokens can be replaced; a live token must be replenished
-    /// through its shard-held key. Failure returns the owning reservation.
-    pub fn install(
-        &mut self,
-        peer: NodeId,
-        spec: impl Into<GrantSpec>,
-        grant: Grant,
-    ) -> Result<(), (SetupError, Grant)> {
-        let spec = spec.into();
-        let target = spec.target();
-        let class = grant.class();
-        self.dispatcher.install(peer, spec, grant)?;
-        if let Some(shard) = target.shard(&self.dispatcher.routes)
-            && let Some(requests) = self.requests.get_mut(&shard)
-        {
-            requests.installed(peer, target, class);
-        }
-        Ok(())
     }
 
     /// Nonblocking per-peer reply admission under negotiated directional limits.
@@ -865,7 +864,7 @@ pub enum ServiceError {
     Session(#[from] crate::Error),
 }
 
-/// Unaccepted input. A malformed or over-credit peer need not stop healthy
+/// Unaccepted input. A malformed peer or full queue need not stop healthy
 /// destinations. Setup failures and dispatch accounting invariants are fatal.
 #[derive(Debug, thiserror::Error)]
 pub enum ReceiveError {
@@ -902,7 +901,7 @@ pub enum ReceiveError {
     /// Fatal failure installing newly negotiated routing state.
     #[error(transparent)]
     Setup(#[from] SetupError),
-    /// Routing or shard-credit admission refused the packet.
+    /// Routing or bounded shard admission refused the packet.
     #[error(transparent)]
     Dispatch(super::Rejection),
 }

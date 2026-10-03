@@ -54,6 +54,8 @@ pub(in crate::replicated::broker_links) struct Watcher {
     capacity_wait: bool,
     timers: BTreeSet<(Duration, GroupId)>,
     limits: ozzy_proto::EnvelopeLimits,
+    cleanup: Option<GroupId>,
+    cleanup_remaining: usize,
 }
 
 impl Watcher {
@@ -82,12 +84,16 @@ impl Watcher {
             capacity_wait: false,
             timers: BTreeSet::new(),
             limits: config.parameters.receive.envelope,
+            cleanup: None,
+            cleanup_remaining: 0,
         }
     }
 
     pub(in crate::replicated::broker_links) fn fence(&mut self) {
         self.pending = None;
         self.capacity_wait = false;
+        self.cleanup = None;
+        self.cleanup_remaining = self.entries.len();
         self.remaining = self
             .shared
             .routing
@@ -101,6 +107,43 @@ impl Watcher {
         &mut self,
         now: Duration,
     ) -> Result<bool, BrokerLinkError> {
+        let cleanup = self.prune();
+        self.progress_routes(now).map(|routes| routes || cleanup)
+    }
+
+    fn prune(&mut self) -> bool {
+        if self.cleanup_remaining == 0 {
+            return false;
+        }
+        let current = self.shared.sessions.session(self.remote);
+        for _ in 0..TURN {
+            if self.cleanup_remaining == 0 {
+                break;
+            }
+            self.cleanup_remaining -= 1;
+            let entry = self
+                .cleanup
+                .and_then(|last| self.entries.range((Excluded(last), Unbounded)).next())
+                .or_else(|| self.entries.first_key_value());
+            let Some((&group, entry)) = entry else {
+                break;
+            };
+            self.cleanup = Some(group);
+            if current != Some(entry.session)
+                && entry
+                    .state
+                    .cache
+                    .lock()
+                    .expect("SDK route cache poisoned")
+                    .disconnect(self.remote, entry.session)
+            {
+                entry.state.changed.notify_changed();
+            }
+        }
+        self.cleanup_remaining != 0
+    }
+
+    fn progress_routes(&mut self, now: Duration) -> Result<bool, BrokerLinkError> {
         let generation = self.shared.changed.generation();
         if self.generation != generation
             || self.capacity_wait && self.frames.available_permits() != 0

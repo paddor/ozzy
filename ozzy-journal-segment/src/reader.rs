@@ -35,18 +35,28 @@ pub use cache::{
 pub struct IndexedRecord {
     /// Payload representation.
     pub encoding: ozzy_proto::data::Encoding,
+    /// Exact partition record incarnation.
     pub partition: PartitionIncarnation,
+    /// Partition ownership fence at canonical admission.
     pub owner_epoch: OwnerEpoch,
+    /// Producer identity scoped to this partition.
     pub producer_id: ProducerId,
+    /// Producer-session fence at canonical admission.
     pub producer_epoch: ProducerEpoch,
+    /// Producer-local record sequence.
     pub producer_sequence: ProducerSequence,
+    /// Partition-global record offset.
     pub offset: Offset,
+    /// Primary-resolved Unix timestamp in milliseconds.
     pub append_timestamp_millis: u64,
+    /// Application record identity preserved through retry and replay.
     pub message_id: MessageId,
+    /// Reference-counted opaque payload parts in record order.
     pub parts: SmallVec<[Bytes; 2]>,
 }
 
 impl IndexedRecord {
+    /// Combined payload bytes in this selected record or span.
     pub fn payload_bytes(&self) -> usize {
         self.parts.iter().map(Bytes::len).sum()
     }
@@ -365,23 +375,33 @@ pub fn read_indexed_message(
 #[derive(Debug, Error)]
 pub enum IndexedReadError {
     #[error(transparent)]
+    /// A physical file operation failed.
     Io(#[from] io::Error),
     #[error(transparent)]
+    /// Physical segment framing or integrity validation failed.
     Codec(#[from] CodecError),
     #[error(transparent)]
+    /// Canonical operation-body validation failed.
     Operation(#[from] OperationCodecError),
     #[error("segment path is not a regular file")]
+    /// The named artifact is not a regular file.
     NotRegularFile,
     #[error("segment header or length does not match index source")]
+    /// Segment header or length does not match index source.
     SourceMismatch,
     #[error("indexed physical location is outside source or configured limits")]
+    /// Indexed physical location is outside source or configured limits.
     InvalidLocation,
     #[error("decoded operation identity does not match index location")]
+    /// Decoded operation identity does not match index location.
     LocationMismatch,
     #[error("record index points to a non-Append operation")]
+    /// Record index points to a non-Append operation.
     NotAppend,
     #[error("record selector is outside indexed Append operation")]
+    /// Record selector is outside indexed Append operation.
     InvalidSelector,
     #[error("record identity or coordinates disagree with index")]
+    /// Record identity or coordinates disagree with index.
     RecordMismatch,
 }

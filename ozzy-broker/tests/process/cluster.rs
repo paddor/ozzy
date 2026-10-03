@@ -24,7 +24,7 @@ impl Cluster {
         let directory = tempfile::tempdir().unwrap();
         let config = directory.path().join("deployment.toml");
         // Reserve all endpoints together, then persist explicit ports for every restart.
-        let sockets: [TcpListener; 6] =
+        let sockets: [TcpListener; 12] =
             std::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").unwrap());
         let roots = std::array::from_fn(|index| directory.path().join(format!("broker-{index}")));
         let mut source = format!(
@@ -33,14 +33,18 @@ impl Cluster {
              segment_bytes = 1048576\nmax_append_bytes = 65536\n"
         );
         for index in 0..3 {
-            let peer = sockets[index * 2].local_addr().unwrap().port();
-            let readers = sockets[index * 2 + 1].local_addr().unwrap().port();
+            let peer = sockets[index * 4].local_addr().unwrap().port();
+            let data = sockets[index * 4 + 3].local_addr().unwrap().port();
+            let readers = sockets[index * 4 + 1].local_addr().unwrap().port();
+            let followers = sockets[index * 4 + 2].local_addr().unwrap().port();
             let root = roots[index].display();
             write!(
                 source,
                 "[brokers.broker-{index}.endpoints]\n\
                  peer = \"tcp://127.0.0.1:{peer}\"\n\
+                 data_peer = \"tcp://127.0.0.1:{data}\"\n\
                  reader_pub = \"tcp://127.0.0.1:{readers}\"\n\
+                 follower_pub = \"tcp://127.0.0.1:{followers}\"\n\
                  [brokers.broker-{index}.devices.ssd]\nroot = \"{root}\"\n\
                  controller = \"ssd\"\n\
                  [brokers.broker-{index}.devices.ssd.workers]\n\
@@ -215,8 +219,8 @@ pub(super) async fn orderly_restart(policy: Confirmation) {
         .await;
     assert_eq!(
         client.links.socket_count(),
-        6,
-        "three PEER and three SUB sockets"
+        5,
+        "two PEER and three SUB sockets"
     );
     let pending = client.queue(0).await;
     processes
@@ -242,7 +246,7 @@ pub(super) async fn orderly_restart(policy: Confirmation) {
         )
         .await;
     assert_ne!(client.links.session(first_id), Some(initial_session));
-    assert_eq!(client.links.socket_count(), 6);
+    assert_eq!(client.links.socket_count(), 5);
     processes
         .observe("replay all exact records", client.replay())
         .await;

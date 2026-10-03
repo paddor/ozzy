@@ -112,6 +112,7 @@ impl RoutePublisher {
         actors: &PartitionActors,
         port: &mut Port,
     ) -> Poll<Result<(), RoutePublicationError>> {
+        port.poll_progress(cx)?;
         if let Some(wait) = &mut self.capacity
             && wait.as_mut().poll(cx).is_ready()
         {

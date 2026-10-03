@@ -42,6 +42,7 @@ pub struct Segment {
 }
 
 #[derive(Debug)]
+/// Captured successor identity and bounded physical preparation inputs.
 pub struct Pending {
     journal: Journal,
     key: Arc<()>,
@@ -49,6 +50,7 @@ pub struct Pending {
 
 #[derive(Debug)]
 #[must_use = "publish and install the exact roll completion"]
+/// Prepared successor and selected metadata awaiting asynchronous publication.
 pub struct Prepared {
     key: Arc<()>,
     directory: async_metadata::Directory,
@@ -69,6 +71,7 @@ enum Successor {
 
 #[derive(Debug)]
 #[must_use = "install on the originating pending owner"]
+/// Physical roll publication result awaiting matching owner installation.
 pub struct Completed {
     key: Arc<()>,
     result: Result<Rolled, DirectoryError>,
@@ -83,6 +86,7 @@ struct Rolled {
 }
 
 impl Journal {
+    /// Capture successor preparation inputs without performing file work.
     pub fn prepare_next_segment(
         &self,
         capacity: u64,
@@ -207,6 +211,7 @@ impl Preparation {
 }
 
 impl Segment {
+    /// Configured physical segment capacity in bytes.
     pub const fn capacity(&self) -> u64 {
         self.scope.capacity
     }
@@ -232,6 +237,7 @@ impl Segment {
 }
 
 impl Prepared {
+    /// Execute the prepared metadata publication and return its fenced completion.
     pub async fn publish(self) -> Completed {
         let key = self.key.clone();
         Completed {
@@ -311,12 +317,14 @@ impl Prepared {
 }
 
 impl Completed {
+    /// Whether physical execution completed successfully; owner installation remains separate.
     pub fn succeeded(&self) -> bool {
         self.result.is_ok()
     }
 }
 
 impl Pending {
+    /// Borrow the exact journal owner associated with this work.
     pub const fn journal(&self) -> &Journal {
         &self.journal
     }

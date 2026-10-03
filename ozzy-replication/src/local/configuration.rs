@@ -2,6 +2,7 @@ use super::Error;
 use crate::{Digest, Scope};
 use ozzy_proto::{GroupId, NodeId};
 
+/// Exact encoded single-broker configuration length.
 pub const CONFIGURATION_BYTES: usize = 128;
 const DIGEST_START: usize = 88;
 
@@ -15,6 +16,7 @@ pub struct Configuration {
 }
 
 impl Configuration {
+    /// Validate nonzero identity, epoch, and principal; bind them in a checksummed scope.
     pub fn new(
         group: GroupId,
         epoch: u64,
@@ -42,12 +44,15 @@ impl Configuration {
         Ok(configuration)
     }
 
+    /// Persistent local scope; its view is always zero.
     pub const fn scope(self) -> Scope {
         self.scope
     }
+    /// The sole configured broker identity.
     pub const fn broker(self) -> NodeId {
         self.broker
     }
+    /// Persistent principal binding; it does not authenticate a connection.
     pub const fn principal(self) -> Digest {
         self.principal
     }

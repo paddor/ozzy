@@ -44,7 +44,7 @@ impl PendingSync {
     }
 }
 
-impl<E: crate::replica_journal::JournalExecution> super::ReplicaActor<E> {
+impl super::ReplicaActor {
     pub(super) fn complete_sync_event(
         &mut self,
         event: SyncEvent,
@@ -64,22 +64,6 @@ impl<E: crate::replica_journal::JournalExecution> super::ReplicaActor<E> {
     }
 }
 
-/// Worker image change of a running journal command that a received suffix
-/// may validate behind. The command installs only suffixes the core already
-/// admitted, and applies through `applying`'s commit boundary if set, so the
-/// actor knows the image it leaves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Behind {
-    pub applying: Option<ValidationTicket>,
-}
-
-/// Validation of a received suffix queued behind the running command. The
-/// worker runs it after that command, in submission order.
-#[derive(Debug)]
-pub(super) struct FollowOn {
-    pub completion: JournalCompletion<Box<crate::replica_journal::TurnResult>>,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub(super) enum FetchPurpose {
     Recovery(NodeId, ozzy_proto::RequestId),
@@ -89,8 +73,8 @@ pub(super) enum FetchPurpose {
 
 #[derive(Debug)]
 pub(super) enum PendingIo {
-    OrphanCleanup(JournalCompletion<ozzy_journal_segment::OrphanCleanupStep>),
-    MetadataCleanup(JournalCompletion<ozzy_journal_segment::MetadataCleanupStep>),
+    OrphanCleanup(JournalCompletion<crate::replica_journal::OwnedCleanedStorage>),
+    MetadataCleanup(JournalCompletion<crate::replica_journal::OwnedCleanedStorage>),
     StorageValidation(JournalCompletion<crate::replica_journal::ValidatedStorage>),
     RecoveryPin(JournalCompletion<PinnedRecovery>),
     RecoveryRelease(JournalCompletion<PinnedRecovery>),
@@ -105,11 +89,8 @@ pub(super) enum PendingIo {
     Abort(JournalCompletion<InstallTicket>),
     Activate(JournalCompletion<ActivationTicket>),
     Sync(JournalCompletion<SyncTicket>),
-    Apply(JournalCompletion<ValidationTicket>, ValidationTicket),
-    Turn(
-        JournalCompletion<Box<crate::replica_journal::TurnResult>>,
-        Option<Behind>,
-    ),
+    Apply(JournalCompletion<ValidationTicket>),
+    Turn(JournalCompletion<Box<crate::replica_journal::TurnResult>>),
     FlowPositions(
         JournalCompletion<ReplicationPositions>,
         usize,
@@ -119,8 +100,8 @@ pub(super) enum PendingIo {
 
 #[derive(Debug)]
 pub(super) enum Completed {
-    OrphanCleanup(ozzy_journal_segment::OrphanCleanupStep),
-    MetadataCleanup(ozzy_journal_segment::MetadataCleanupStep),
+    OrphanCleanup(crate::replica_journal::OwnedCleanedStorage),
+    MetadataCleanup(crate::replica_journal::OwnedCleanedStorage),
     StorageValidation(crate::replica_journal::ValidatedStorage),
     RecoveryPin(PinnedRecovery),
     RecoveryRelease(PinnedRecovery),
@@ -164,8 +145,8 @@ impl PendingIo {
             Self::Abort(future) => Completed::Abort(future.await?),
             Self::Activate(future) => Completed::Activate(future.await?),
             Self::Sync(future) => Completed::Sync(future.await?),
-            Self::Apply(future, _) => Completed::Apply(future.await?),
-            Self::Turn(future, _) => Completed::Turn(future.await?),
+            Self::Apply(future) => Completed::Apply(future.await?),
+            Self::Turn(future) => Completed::Turn(future.await?),
             Self::FlowPositions(future, voter, request) => {
                 Completed::FlowPositions(future.await?, *voter, *request)
             }

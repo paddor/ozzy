@@ -31,7 +31,7 @@ use std::{
 pub struct SharedReaderConfig {
     /// Checked partition incarnation on this actor.
     pub partition: PartitionIncarnation,
-    /// Maximum one delivery; credit is independently negotiated per link.
+    /// Maximum one delivery, narrowed by the link's codec limits.
     pub limits: DataLimits,
     /// Aggregate subscriptions on this partition, including idle readers.
     pub subscriptions: usize,
@@ -122,7 +122,7 @@ impl SharedReaders {
         envelope(message).is_some_and(|e| {
             matches!(
                 e.opcode,
-                Opcode::Subscribe | Opcode::Credit | Opcode::Ack | Opcode::Unsubscribe
+                Opcode::Subscribe | Opcode::Ack | Opcode::Unsubscribe
             )
         })
     }
@@ -134,6 +134,16 @@ impl SharedReaders {
                 && envelope.sender == peer
                 && link.remote.roles & ozzy_proto::handshake::CONSUMER != 0
         })
+    }
+
+    /// Whether this client's refusal or acknowledgment still waits in the
+    /// shared reply slot. Its next command must wait for that reply.
+    pub(super) fn client_work(&self, node: NodeId) -> usize {
+        usize::from(
+            self.rejection
+                .as_ref()
+                .is_some_and(|message| message.part_slice(0) == Some(node.as_bytes().as_slice())),
+        )
     }
 
     fn discard_stale(&mut self) {

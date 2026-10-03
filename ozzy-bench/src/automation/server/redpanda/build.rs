@@ -46,6 +46,7 @@ pub(super) fn verified_identity() -> Result<Value> {
     Ok(actual)
 }
 
+/// Check or prepare the pinned Redpanda executable for comparisons.
 pub fn prepare(no_build: bool) -> Result<()> {
     if no_build {
         return verified_identity().map(|_| ());

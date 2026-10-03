@@ -1,6 +1,6 @@
 //! Contiguous selected records keep their encoded descriptors and payload span.
 
-use super::{Bytes, CachedBatch, CachedRecords, DecodedCell, Range, RecordView};
+use super::{Bytes, CachedBatch, DecodedCell, Range, RecordView};
 use ozzy_proto::Offset;
 
 /// Descriptor table, decoded byte count, and exact producer block within one body.
@@ -57,41 +57,15 @@ impl<'a> RecordSpan<'a> {
             },
             |prepared| prepared.decoded_bytes,
         );
-        let parts = (0..records)
-            .map(|index| {
-                self.batch
-                    .records
-                    .get(index)
-                    .expect("batch record")
-                    .parts
-                    .iter()
-                    .len()
-            })
-            .sum();
-        (records, bytes, parts)
+        (records, bytes, self.batch.records.parts())
     }
 
+    /// Combined payload bytes in this selected record or span.
     pub fn payload_bytes(&self) -> usize {
         if self.is_empty() {
             return 0;
         }
-        match &self.batch.records {
-            CachedRecords::General(records) => {
-                records[self.range.end - 1]
-                    .parts
-                    .last()
-                    .expect("nonempty parts")
-                    .end
-                    - records[self.range.start]
-                        .parts
-                        .first()
-                        .expect("nonempty parts")
-                        .start
-            }
-            CachedRecords::Packed { offsets, .. } => {
-                offsets[self.range.end] - offsets[self.range.start]
-            }
-        }
+        self.batch.records.payload_range(self.range.clone()).len()
     }
 
     pub(crate) fn limit(mut self, records: usize, bytes: usize) -> Self {
@@ -119,25 +93,33 @@ impl<'a> RecordSpan<'a> {
         self
     }
 
+    /// Number of selected records.
     pub fn len(&self) -> usize {
         self.range.len()
     }
 
+    /// Whether no selected records remain.
     pub fn is_empty(&self) -> bool {
         self.range.is_empty()
     }
 
+    /// First partition-global offset in this selected record span.
     pub fn first_offset(&self) -> Offset {
         Offset::new(self.batch.summary.first_offset.get() + self.range.start as u64)
     }
 
+    /// Iterate borrowed selected records in offset order.
     pub fn records(&self) -> impl ExactSizeIterator<Item = RecordView<'a>> + '_ {
         self.range.clone().map(|index| RecordView {
             body: self.body,
             shared_backing_bytes: self.shared_backing_bytes,
             batch: self.batch,
             decoded: self.decoded,
-            record: self.batch.records.get(index).expect("bounded record range"),
+            record: self
+                .batch
+                .records
+                .get(index, self.body)
+                .expect("bounded record range"),
             index: index as u64,
         })
     }
@@ -149,20 +131,11 @@ impl<'a> RecordSpan<'a> {
         {
             return None;
         }
-        let CachedRecords::General(records) = &self.batch.records else {
-            return None;
-        };
-        let first = &records[self.range.start];
-        let last = &records[self.range.end - 1];
-        let end = records
-            .get(self.range.end)
-            .map_or(self.batch.descriptors_end?, |record| {
-                record.descriptor_start
-            });
+        let descriptors = self.batch.records.descriptor_range(self.range.clone())?;
         Some((
-            &self.body[first.descriptor_start..end],
+            &self.body[descriptors],
             self.body,
-            first.parts.first()?.start..last.parts.last()?.end,
+            self.batch.records.payload_range(self.range.clone()),
         ))
     }
 }
@@ -331,6 +304,35 @@ mod tests {
             ..full
         };
         assert!(partial.prepared_backing(body.len()).is_none());
+    }
+
+    #[test]
+    fn prepared_record_cache_retains_positions_and_borrows_descriptors() {
+        let (body, payload, _, batch) = prepared_batch();
+        assert!(batch.records.retained_bytes() <= 1025 * 2 * size_of::<usize>());
+        let decoded = DecodedCell::default();
+        let span = RecordSpan {
+            body: &body,
+            shared_backing_bytes: Some(body.len()),
+            batch: &batch,
+            decoded: &decoded,
+            range: 0..1024,
+        };
+        assert!(body.is_unique(), "selectors must borrow the operation body");
+        assert_eq!(span.batch_totals(), (1024, payload.len(), 1024));
+        for (index, record) in span.records().enumerate() {
+            assert_eq!(record.offset(), Offset::new(8 + index as u64));
+            assert_eq!(
+                record.message_id(),
+                MessageId::from_bytes(((index + 1) as u128).to_be_bytes())
+            );
+            assert_eq!(record.encoding(), Encoding::Raw);
+            assert_eq!(record.payload_bytes(), 128);
+            assert_eq!(
+                record.parts().collect::<Vec<_>>(),
+                [&payload[index * 128..(index + 1) * 128]]
+            );
+        }
     }
 
     fn prepared_batch() -> (Bytes, Vec<u8>, Vec<u8>, CachedBatch) {

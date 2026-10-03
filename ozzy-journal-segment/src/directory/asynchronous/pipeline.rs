@@ -85,17 +85,21 @@ impl Journal {
 }
 
 impl Pipeline {
+    /// Borrow the exact journal owner associated with this work.
     pub const fn journal(&self) -> &Journal {
         &self.journal
     }
+    /// Prepared physical writes still awaiting owner installation.
     pub const fn pending(&self) -> usize {
         self.pending
     }
 
+    /// Whether a physical barrier is awaiting owner installation.
     pub const fn sync_pending(&self) -> bool {
         self.sync.is_some()
     }
 
+    /// Whether failure or canceled mutation fences further use.
     pub fn is_faulted(&self) -> bool {
         self.faulted || self.journal.is_faulted()
     }
@@ -130,6 +134,7 @@ impl Pipeline {
         }
     }
 
+    /// Acquire one bounded physical-group encoding plan from this journal owner.
     pub fn begin_group_encoding(&mut self) -> Result<JournalGroupEncoding, DirectoryError> {
         self.healthy()?;
         self.journal.begin_group_encoding()
@@ -283,6 +288,7 @@ impl Pipeline {
 }
 
 impl Prepared {
+    /// Physical bytes retained by this prepared write.
     pub fn physical_bytes(&self) -> u64 {
         self.plan.after.end_offset() - self.plan.before.end_offset()
     }
@@ -337,6 +343,7 @@ impl Prepared {
 }
 
 impl Completed {
+    /// Whether physical execution completed successfully; owner installation remains separate.
     pub fn succeeded(&self) -> bool {
         self.result.is_ok()
     }

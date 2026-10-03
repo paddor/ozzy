@@ -41,7 +41,7 @@ pub struct Binding {
     pub kind: Kind,
 }
 
-/// Metadata-only dispatch result. It neither consumes credit nor accepts work.
+/// Metadata-only dispatch result. It neither reserves storage nor accepts work.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Routed {
     /// Configured destination of this partition on the receiving broker.
@@ -129,18 +129,25 @@ impl RoutingTable {
         });
         let packet = decode_packet(&frames, self.limits)?;
         if packet.envelope.sender != binding.peer
-            || packet.envelope.session != Some(binding.session)
+            || if packet.envelope.opcode == Opcode::PreparePub && binding.kind == Kind::Broker {
+                packet.envelope.session.is_some()
+            } else {
+                packet.envelope.session != Some(binding.session)
+            }
         {
             return Err(RoutingError::Session);
         }
         let (group, partition, class, writer) = match binding.kind {
             Kind::Broker => {
-                // Credited prepares replace the old, uncredited PREPARE path.
+                // Normal replication uses PUB; addressed repair uses PrepareFlow.
                 if packet.envelope.opcode == Opcode::Prepare {
                     return Err(RoutingError::Command);
                 }
                 let scope = wire::route(packet, self.limits)?;
-                let class = if matches!(packet.envelope.opcode, Opcode::PrepareFlow | Opcode::Ops) {
+                let class = if matches!(
+                    packet.envelope.opcode,
+                    Opcode::PrepareFlow | Opcode::PreparePub | Opcode::Ops
+                ) {
                     Class::Data
                 } else {
                     Class::Control
@@ -169,7 +176,7 @@ impl RoutingTable {
                 if packet.envelope.response
                     || !matches!(
                         packet.envelope.opcode,
-                        Opcode::Subscribe | Opcode::Credit | Opcode::Ack | Opcode::Unsubscribe
+                        Opcode::Subscribe | Opcode::Ack | Opcode::Unsubscribe
                     )
                 {
                     return Err(RoutingError::Command);
@@ -197,7 +204,7 @@ impl RoutingTable {
     }
 }
 
-/// Routing rejected before consuming a grant or reaching an application actor.
+/// Routing rejected before reaching an application actor.
 #[derive(Debug, thiserror::Error)]
 pub enum RoutingError {
     /// Invalid deployment route table or configured framing limits.

@@ -276,6 +276,7 @@ fn native_index_open_drives_cooperative_validation_after_owned_file_reads() {
     let access = Access {
         io: Local::new(clients.remove(0)),
         protection: None,
+        readers: std::rc::Rc::default(),
     };
     let handle = drive(
         &mut controller,

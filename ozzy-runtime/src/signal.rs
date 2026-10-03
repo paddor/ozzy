@@ -3,9 +3,12 @@
 //! Notifications only schedule another poll. The atomics below own readiness;
 //! registering before checking them closes the observation-to-wait race.
 
+#[cfg(all(test, ozzy_loom))]
+use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 use std::future::Future;
 use std::pin::{Pin, pin};
 use std::sync::Arc;
+#[cfg(not(all(test, ozzy_loom)))]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 use std::task::{Context, Poll};
 
@@ -172,5 +175,6 @@ impl Future for Closed {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(ozzy_loom)))]
+#[path = "signal/tests.rs"]
 mod tests;

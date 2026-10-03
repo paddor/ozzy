@@ -18,10 +18,11 @@ use crate::{
 pub(crate) mod asynchronous;
 #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 mod data_sync_tests;
-pub(crate) mod direct;
 pub(crate) mod extents;
 pub(crate) mod prepared;
 mod recovery;
+mod state;
+pub use state::SegmentState;
 
 /// Active-segment write completion policy, independent of record confirmation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -38,8 +39,11 @@ pub enum SegmentWriteMode {
 /// Implementations are exclusively owned by a dedicated journal worker. They
 /// must not run on an OMQ or asynchronous executor thread.
 pub trait SegmentIo: std::fmt::Debug + Send {
+    /// Read the physical file byte length.
     fn file_len(&mut self) -> io::Result<u64>;
+    /// Read the physical file bytes; the caller enforces its decoding bounds.
     fn read_all(&mut self) -> io::Result<Vec<u8>>;
+    /// Write bytes at the exact physical offset and return the completed byte count.
     fn write_at(&mut self, offset: u64, bytes: &[u8]) -> io::Result<usize>;
     /// Write an ordered prefix of the supplied slices at an explicit position.
     /// The default preserves portable backends; file-backed Linux uses pwritev.
@@ -49,13 +53,10 @@ pub trait SegmentIo: std::fmt::Debug + Send {
             None => Ok(0),
         }
     }
+    /// Set the physical file byte length.
     fn set_len(&mut self, len: u64) -> io::Result<()>;
+    /// Complete the file data barrier required by the selected durability mode.
     fn sync_data(&mut self) -> io::Result<()>;
-    /// Start writeback of written bytes without waiting. This establishes no
-    /// durability; backends without such a hint ignore it.
-    fn start_writeback(&mut self, _range: std::ops::Range<u64>) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 impl SegmentIo for File {
@@ -85,10 +86,6 @@ impl SegmentIo for File {
 
     fn sync_data(&mut self) -> io::Result<()> {
         File::sync_data(self)
-    }
-
-    fn start_writeback(&mut self, range: std::ops::Range<u64>) -> io::Result<()> {
-        crate::directory::start_writeback_range(self, range)
     }
 }
 
@@ -122,10 +119,6 @@ impl SegmentIo for std::sync::Arc<File> {
 
     fn sync_data(&mut self) -> io::Result<()> {
         File::sync_data(self)
-    }
-
-    fn start_writeback(&mut self, range: std::ops::Range<u64>) -> io::Result<()> {
-        crate::directory::start_writeback_range(self, range)
     }
 }
 
@@ -169,9 +162,13 @@ pub struct WriterPosition {
 /// Semantic checks required while reopening one active segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CanonicalRecoveryRequirements {
+    /// Canonical operation decoding and resource bounds.
     pub operation_limits: OperationLimits,
+    /// Exact prefixes whose integrity must survive recovery.
     pub protected: [Option<ChainPosition>; 2],
+    /// Selected membership/configuration epoch.
     pub configuration_epoch: Option<u64>,
+    /// Promised election view constraining retained history and authority.
     pub promised_view: Option<u64>,
     /// End the log at the first group that fails to decode and zero the rest,
     /// provided the valid prefix holds every protected position. Only for
@@ -191,51 +188,70 @@ struct RecoveryValidation {
 }
 
 impl WriterPosition {
+    /// Journal-owner generation fencing these captured bytes or completions.
     pub const fn generation(self) -> JournalGeneration {
         self.generation
     }
 
+    /// Physical segment identity.
     pub const fn segment_id(self) -> u64 {
         self.segment_id
     }
 
+    /// Consecutive physical write-group number.
     pub const fn group_number(self) -> u64 {
         self.group_number
     }
 
+    /// Exclusive physical byte offset after this write group.
     pub const fn end_offset(self) -> u64 {
         self.end_offset
     }
 
+    /// Combined canonical body bytes after physical decoding.
     pub const fn decoded_body_bytes(self) -> usize {
         self.decoded_body_bytes
     }
 
+    /// Next canonical operation number and predecessor digest.
     pub const fn next_chain(self) -> ChainPosition {
         self.next_chain
     }
 }
 
-/// Single-owner writer for one initialized physical segment.
+/// Blocking file executor retained for existing offline/fault fixtures.
 #[derive(Debug)]
 pub struct SegmentWriter<I> {
     io: I,
-    generation: JournalGeneration,
-    header: SegmentHeader,
-    written: WriterPosition,
-    durable: WriterPosition,
-    next_group_number: u64,
-    segment_digest: SegmentDigestBuilder,
-    encode_buffer: Vec<u8>,
-    body_encode_scratch: Option<BodyEncodeScratch>,
-    data_sync: bool,
-    /// Separate `O_DIRECT` descriptor for write jobs. Headers, zeroing and
-    /// recovery keep using `io`.
-    direct: Option<Arc<File>>,
-    faulted: bool,
+    pub(crate) state: SegmentState,
+}
+
+impl<I> std::ops::Deref for SegmentWriter<I> {
+    type Target = SegmentState;
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+impl<I> std::ops::DerefMut for SegmentWriter<I> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
 }
 
 impl<I> SegmentWriter<I> {
+    fn empty(
+        io: I,
+        header: SegmentHeader,
+        generation: JournalGeneration,
+        next_group_number: u64,
+        next_chain: ChainPosition,
+    ) -> Self {
+        Self {
+            io,
+            state: SegmentState::empty(header, generation, next_group_number, next_chain),
+        }
+    }
+
     /// Initialize an empty, exclusively owned target and synchronize its header.
     ///
     /// Directory-entry synchronization and physical allocation are responsibilities
@@ -445,7 +461,6 @@ impl<I> SegmentWriter<I> {
         }
         let image = io.read_all()?;
         let recovery = recovery::prepare(
-            io,
             &image,
             generation,
             first_group_number,
@@ -453,7 +468,10 @@ impl<I> SegmentWriter<I> {
             limits,
             validation,
         )?;
-        let mut writer = recovery.writer;
+        let mut writer = Self {
+            io,
+            state: recovery.writer,
+        };
         if let Some(length) = recovery.truncate {
             writer.io.set_len(length)?;
         }
@@ -509,28 +527,6 @@ impl<I> SegmentWriter<I> {
         self.append_prepared_with_digests(operations, body_digests, prepared)
     }
 
-    pub(crate) fn prepare_group_bodies<'a>(
-        &mut self,
-        bodies: impl Iterator<Item = &'a [u8]> + Clone,
-        encoding: BodyEncoding,
-    ) -> Result<PreparedGroupBodies, WriterError> {
-        self.require_healthy()?;
-        if encoding == BodyEncoding::Raw {
-            return Ok(prepare_raw_group_extents(
-                bodies,
-                std::mem::take(&mut self.encode_buffer),
-            )?);
-        }
-        Ok(prepare_group_bodies(
-            bodies,
-            encoding,
-            std::mem::take(&mut self.encode_buffer),
-            self.body_encode_scratch
-                .as_mut()
-                .ok_or(WriterError::InvalidSyncPosition)?,
-        )?)
-    }
-
     pub(crate) fn append_prepared_with_digests(
         &mut self,
         operations: &[CanonicalOperation<'_>],
@@ -542,10 +538,10 @@ impl<I> SegmentWriter<I> {
     {
         self.require_healthy()?;
         let finalized = finalize_group_bodies(
-            &self.header,
-            self.next_group_number,
-            self.written.end_offset,
-            self.written.next_chain,
+            &self.state.header,
+            self.state.next_group_number,
+            self.state.written.end_offset,
+            self.state.written.next_chain,
             operations,
             body_digests,
             &mut prepared,
@@ -560,11 +556,6 @@ impl<I> SegmentWriter<I> {
         let result = self.append_extents(operations, &prepared, finalized);
         self.restore_encode_buffer(prepared);
         result
-    }
-
-    fn restore_encode_buffer(&mut self, encoded: PreparedGroupBodies) {
-        self.encode_buffer = encoded.into_bytes();
-        self.encode_buffer.clear();
     }
 
     fn append_extents(
@@ -601,32 +592,29 @@ impl<I> SegmentWriter<I> {
             .decoded_body_bytes
             .checked_add(additional_body_bytes)
             .ok_or(WriterError::Codec(CodecError::LengthOverflow))?;
-        if let Err(error) = extents::write_extents(&mut self.io, self.written.end_offset, slices) {
-            self.faulted = true;
+        if let Err(error) =
+            extents::write_extents(&mut self.io, self.state.written.end_offset, slices)
+        {
+            self.state.faulted = true;
             return Err(error.into());
         }
-        self.segment_digest.push(finalized.digest);
+        self.state.segment_digest.push(finalized.digest);
         #[cfg(feature = "storage-metrics")]
         crate::write_metrics::ENCODED_GROUP_BYTES.fetch_add(
-            finalized.end_offset - self.written.end_offset,
+            finalized.end_offset - self.state.written.end_offset,
             std::sync::atomic::Ordering::Relaxed,
         );
         let position = WriterPosition {
-            generation: self.generation,
-            segment_id: self.header.segment_id(),
-            group_number: self.next_group_number,
+            generation: self.state.generation,
+            segment_id: self.state.header.segment_id(),
+            group_number: self.state.next_group_number,
             end_offset: finalized.end_offset,
             decoded_body_bytes,
             next_chain: finalized.next_chain,
         };
-        self.next_group_number = following_group_number;
-        self.written = position;
+        self.state.next_group_number = following_group_number;
+        self.state.written = position;
         Ok(position)
-    }
-
-    /// Freeze the exact currently complete prefix for a later barrier.
-    pub const fn begin_sync(&self) -> WriterPosition {
-        self.written
     }
 
     /// Synchronize storage, but return evidence only through the frozen position.
@@ -635,10 +623,10 @@ impl<I> SegmentWriter<I> {
         I: SegmentIo,
     {
         self.validate_sync_position(position)?;
-        if position.group_number <= self.durable.group_number {
+        if position.group_number <= self.state.durable.group_number {
             return Ok(position);
         }
-        let result = if self.data_sync {
+        let result = if self.state.data_sync {
             Ok(())
         } else {
             self.io.sync_data()
@@ -646,132 +634,9 @@ impl<I> SegmentWriter<I> {
         self.complete_sync_result(position, result)
     }
 
-    pub(crate) fn validate_sync_position(
-        &self,
-        position: WriterPosition,
-    ) -> Result<(), WriterError> {
-        self.require_healthy()?;
-        if position.generation != self.generation
-            || position.segment_id != self.header.segment_id()
-            || position.group_number > self.written.group_number
-            || position.end_offset > self.written.end_offset
-        {
-            return Err(WriterError::InvalidSyncPosition);
-        }
-        Ok(())
-    }
-
-    // Only the storage drivers may install physical evidence. A public caller
-    // cannot manufacture successful storage evidence.
-    pub(crate) fn complete_sync_result(
-        &mut self,
-        position: WriterPosition,
-        result: io::Result<()>,
-    ) -> Result<WriterPosition, WriterError> {
-        self.validate_sync_position(position)?;
-        if let Err(error) = result {
-            self.faulted = true;
-            return Err(error.into());
-        }
-        if position.group_number > self.durable.group_number {
-            self.durable = position;
-        }
-        Ok(position)
-    }
-
-    pub const fn header(&self) -> &SegmentHeader {
-        &self.header
-    }
-
-    pub const fn written_position(&self) -> WriterPosition {
-        self.written
-    }
-
-    pub const fn durable_position(&self) -> WriterPosition {
-        self.durable
-    }
-
-    pub(crate) fn structural_digest(&self) -> Digest {
-        self.segment_digest.finish()
-    }
-
-    pub(crate) fn transfer_encode_buffers_to(&mut self, successor: &mut Self) {
-        successor.encode_buffer = std::mem::take(&mut self.encode_buffer);
-        successor.body_encode_scratch = std::mem::take(&mut self.body_encode_scratch);
-    }
-
-    pub const fn is_faulted(&self) -> bool {
-        self.faulted
-    }
-
-    pub(crate) fn fence(&mut self) {
-        self.faulted = true;
-    }
-
-    /// Reserve physical output and codec scratch before serving appends.
-    ///
-    /// `capacity` covers raw bodies, entry headers, seal, and write alignment.
-    /// Both public and internal append paths reuse these buffers across groups
-    /// and segment rolls. Descriptor scratch stays inline through 64 operations;
-    /// larger groups may allocate.
-    pub fn reserve_encode_buffer(
-        &mut self,
-        capacity: usize,
-        encoding: BodyEncoding,
-    ) -> Result<(), WriterError> {
-        let additional = capacity.saturating_sub(self.encode_buffer.len());
-        self.encode_buffer
-            .try_reserve_exact(additional)
-            .map_err(|_| WriterError::EncodeBufferAllocation)?;
-        self.body_encode_scratch
-            .as_mut()
-            .ok_or(WriterError::InvalidSyncPosition)?
-            .reserve(capacity, encoding)?;
-        Ok(())
-    }
-
     /// Consume the writer, including after a fault, for shutdown or recovery.
     pub fn into_inner(self) -> I {
         self.io
-    }
-
-    fn empty(
-        io: I,
-        header: SegmentHeader,
-        generation: JournalGeneration,
-        next_group_number: u64,
-        next_chain: ChainPosition,
-    ) -> Self {
-        let position = WriterPosition {
-            generation,
-            segment_id: header.segment_id(),
-            group_number: next_group_number - 1,
-            end_offset: SEGMENT_HEADER_BYTES as u64,
-            decoded_body_bytes: 0,
-            next_chain,
-        };
-        Self {
-            segment_digest: SegmentDigestBuilder::new(&header),
-            io,
-            generation,
-            header,
-            written: position,
-            durable: position,
-            next_group_number,
-            encode_buffer: Vec::new(),
-            body_encode_scratch: Some(BodyEncodeScratch::default()),
-            data_sync: false,
-            direct: None,
-            faulted: false,
-        }
-    }
-
-    fn require_healthy(&self) -> Result<(), WriterError> {
-        if self.faulted {
-            Err(WriterError::Faulted)
-        } else {
-            Ok(())
-        }
     }
 }
 
@@ -784,11 +649,11 @@ impl SegmentWriter<Arc<File>> {
         mode: SegmentWriteMode,
     ) -> io::Result<()> {
         let enabled = mode == SegmentWriteMode::DataSync;
-        if enabled == self.data_sync {
+        if enabled == self.state.data_sync {
             return Ok(());
         }
         let result = self.reopen_write_mode(path, enabled);
-        self.faulted |= result.is_err();
+        self.state.faulted |= result.is_err();
         result
     }
 
@@ -806,14 +671,11 @@ impl SegmentWriter<Arc<File>> {
                 .open(path)?;
             // Cover earlier buffered groups before enabling the shortcut.
             // Initialization/recovery already synchronized their own prefix.
-            if enabled && self.written != self.durable {
+            if enabled && self.state.written != self.state.durable {
                 self.io.sync_data()?;
             }
             self.io = Arc::new(file);
-            self.data_sync = enabled;
-            if self.direct.is_some() {
-                self.direct = Some(direct::open(path, enabled)?);
-            }
+            self.state.data_sync = enabled;
             Ok(())
         }
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -826,42 +688,6 @@ impl SegmentWriter<Arc<File>> {
         }
     }
 
-    pub const fn data_sync(&self) -> bool {
-        self.data_sync
-    }
-
-    /// Route write jobs through a separate `O_DIRECT` descriptor on `path`, or
-    /// back through `io`. It follows later `set_write_mode` changes. A failure
-    /// fences the writer.
-    pub(crate) fn set_direct(&mut self, path: &std::path::Path, enabled: bool) -> io::Result<()> {
-        let result = if enabled {
-            direct::open(path, self.data_sync).map(Some)
-        } else {
-            Ok(None)
-        };
-        match result {
-            Ok(handle) => {
-                self.direct = handle;
-                Ok(())
-            }
-            Err(error) => {
-                self.faulted = true;
-                Err(error)
-            }
-        }
-    }
-
-    /// Whether write jobs use `O_DIRECT`.
-    pub const fn is_direct(&self) -> bool {
-        self.direct.is_some()
-    }
-
-    /// The descriptor headers, zeroing and recovery use.
-    #[cfg(test)]
-    pub(crate) fn buffered_io(&self) -> &File {
-        &self.io
-    }
-
     /// Overwrite the unused remainder after the durable end with `zeros`, one
     /// chunk at a time, and synchronize it. Later synchronized writes then land
     /// on written blocks and skip the filesystem's unwritten-extent conversion.
@@ -870,11 +696,11 @@ impl SegmentWriter<Arc<File>> {
     pub fn zero_remainder(&mut self, zeros: &[u8]) -> Result<(), WriterError> {
         self.require_healthy()?;
         debug_assert!(zeros.iter().all(|&byte| byte == 0));
-        if self.written != self.durable || zeros.is_empty() {
+        if self.state.written != self.state.durable || zeros.is_empty() {
             return Err(WriterError::InvalidSyncPosition);
         }
-        let capacity = self.header.capacity();
-        let mut offset = self.durable.end_offset;
+        let capacity = self.state.header.capacity();
+        let mut offset = self.state.durable.end_offset;
         while offset < capacity {
             let length = usize::try_from(capacity - offset)
                 .map_or(zeros.len(), |rest| rest.min(zeros.len()));
@@ -899,35 +725,58 @@ impl SegmentWriter<Arc<File>> {
 #[derive(Debug, Error)]
 pub enum WriterError {
     #[error(transparent)]
+    /// Physical segment framing or integrity validation failed.
     Codec(#[from] CodecError),
     #[error(transparent)]
+    /// Canonical operation-body validation failed.
     Operation(#[from] OperationCodecError),
     #[error(transparent)]
+    /// A physical file operation failed.
     Io(#[from] io::Error),
     #[error("segment writer is faulted")]
+    /// Segment writer is faulted.
     Faulted,
     #[error("new segment target contains {0} bytes")]
+    /// New segment target contains bytes.
     NonemptyTarget(u64),
     #[error("segment recovery image is {actual} bytes; limit is {limit}")]
-    RecoveryLimit { actual: u64, limit: u64 },
+    /// Segment recovery image is bytes; limit is.
+    RecoveryLimit {
+        #[doc = "Observed size, count, or fenced field value."]
+        actual: u64,
+        #[doc = "Configured maximum for the reported resource."]
+        limit: u64,
+    },
     #[error("sync position does not belong to the complete writer prefix")]
+    /// Sync position does not belong to the complete writer prefix.
     InvalidSyncPosition,
     #[error("physical group number space exhausted")]
+    /// Physical group number space exhausted.
     GroupNumberExhausted,
     #[error("physical group encode buffer allocation failed")]
+    /// Physical group encode buffer allocation failed.
     EncodeBufferAllocation,
     #[error("recovered journal does not contain protected operation prefix {0}")]
+    /// Recovered journal does not contain protected operation prefix.
     ProtectedPrefixMismatch(u64),
     #[error("operation {op_number} has configuration epoch {actual}; expected {expected}")]
+    /// Operation has configuration epoch; expected.
     ConfigurationMismatch {
+        /// Partition-local canonical operation number.
         op_number: u64,
+        /// Observed size, count, or fenced field value.
         actual: u64,
+        /// Expected size, count, or fenced field value.
         expected: u64,
     },
     #[error("operation {op_number} has view {actual} beyond promise {promised}")]
+    /// Operation has view beyond promise.
     ViewBeyondPromise {
+        /// Partition-local canonical operation number.
         op_number: u64,
+        /// Observed size, count, or fenced field value.
         actual: u64,
+        /// Promised upper election-view fence.
         promised: u64,
     },
 }

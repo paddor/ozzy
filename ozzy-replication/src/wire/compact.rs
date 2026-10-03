@@ -1,4 +1,4 @@
-//! Same-channel receipt/credit counters. Opening still verifies full history.
+//! Same-channel receipt counters. Opening still verifies full history.
 
 use ozzy_proto::Opcode;
 
@@ -10,9 +10,9 @@ use crate::{
 use super::WireError;
 
 /// One single-part message, small enough for OMQ's routed inline storage.
-pub const COMPACT_STATE_BYTES: usize = 45;
+pub const COMPACT_STATE_BYTES: usize = 29;
 
-/// An authenticated channel handle plus cumulative receive and grant counters.
+/// An authenticated channel handle plus cumulative receive counters.
 /// Handles bind peer, link session, configuration, view, receive epoch and base
 /// at full channel opening. They must never be recycled within a link session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,10 +25,6 @@ pub struct CompactState {
     pub received: OpNumber,
     /// Cumulative canonical bytes retained within this channel.
     pub received_bytes: u64,
-    /// Cumulative upper bound on unique operation sends.
-    pub operation_limit: u64,
-    /// Cumulative upper bound on unique canonical byte sends.
-    pub byte_limit: u64,
 }
 
 impl CompactState {
@@ -40,19 +36,13 @@ impl CompactState {
             revision: report.revision,
             received: report.received.op,
             received_bytes: report.received_bytes,
-            operation_limit: report.operation_limit,
-            byte_limit: report.byte_limit,
         };
         state.validate()?;
         Ok(state)
     }
 
     fn validate(self) -> Result<(), WireError> {
-        if self.handle == 0
-            || self.revision == 0
-            || self.received.0 == u64::MAX
-            || self.received_bytes > self.byte_limit
-        {
+        if self.handle == 0 || self.revision == 0 || self.received.0 == u64::MAX {
             return Err(FlowError::Report.into());
         }
         Ok(())
@@ -62,14 +52,12 @@ impl CompactState {
     pub fn encode(self) -> Result<[u8; COMPACT_STATE_BYTES], WireError> {
         self.validate()?;
         let mut bytes = [0; COMPACT_STATE_BYTES];
-        bytes[0] = Opcode::ReplicaCredit as u8;
+        bytes[0] = Opcode::ReplicaReceipt as u8;
         bytes[1..5].copy_from_slice(&self.handle.to_be_bytes());
         for (chunk, value) in bytes[5..].as_chunks_mut::<8>().0.iter_mut().zip([
             self.revision,
             self.received.0,
             self.received_bytes,
-            self.operation_limit,
-            self.byte_limit,
         ]) {
             chunk.copy_from_slice(&value.to_be_bytes());
         }
@@ -81,7 +69,7 @@ impl CompactState {
         if bytes.len() != COMPACT_STATE_BYTES {
             return Err(WireError::Length);
         }
-        if bytes[0] != Opcode::ReplicaCredit as u8 {
+        if bytes[0] != Opcode::ReplicaReceipt as u8 {
             return Err(WireError::UnsupportedCommand);
         }
         let read = |offset| u64::from_be_bytes(bytes[offset..offset + 8].try_into().unwrap());
@@ -90,8 +78,6 @@ impl CompactState {
             revision: read(5),
             received: OpNumber(read(13)),
             received_bytes: read(21),
-            operation_limit: read(29),
-            byte_limit: read(37),
         };
         state.validate()?;
         Ok(state)
@@ -109,8 +95,7 @@ impl CompactState {
             revision: self.revision,
             received,
             received_bytes: self.received_bytes,
-            operation_limit: self.operation_limit,
-            byte_limit: self.byte_limit,
+
             ..bound
         };
         report.validate_shape()?;

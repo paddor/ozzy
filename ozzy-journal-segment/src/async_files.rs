@@ -3,15 +3,66 @@ use crate::WriterError;
 use ozzy_io::{
     Class, Completed, Handle, Local, OpenMode, Operation, Outcome, SyncMode, WriteBuffer,
 };
-use std::{io, ops::Range, path::PathBuf};
+use std::{cell::RefCell, collections::VecDeque, io, ops::Range, path::PathBuf, rc::Rc};
 
 #[derive(Debug, Clone)]
 pub(crate) struct Access {
     pub(crate) io: Local,
     pub(crate) protection: Option<Handle>,
+    pub(crate) readers: ReadHandles,
 }
 
+pub(crate) type ReadHandles = Rc<RefCell<VecDeque<(PathBuf, crate::IndexSource, Handle)>>>;
+
 impl Access {
+    pub(crate) fn new(io: Local, protection: Option<Handle>) -> Self {
+        Self {
+            io,
+            protection,
+            readers: ReadHandles::default(),
+        }
+    }
+
+    /// Four exact indexed sources. Handles are opaque backend leases; eviction
+    /// drops only this cache's lease, never closes a concurrent physical read.
+    pub(crate) async fn read_handle(
+        &self,
+        path: PathBuf,
+        source: crate::IndexSource,
+    ) -> io::Result<Handle> {
+        {
+            let mut cache = self.readers.borrow_mut();
+            if let Some(index) = cache
+                .iter()
+                .position(|(old, selected, _)| old == &path && *selected == source)
+            {
+                let entry = cache.remove(index).expect("known read handle");
+                let handle = entry.2.clone();
+                cache.push_back(entry);
+                return Ok(handle);
+            }
+            if cache.len() == 4 {
+                cache.pop_front();
+            }
+        }
+        let handle = self
+            .open(path.clone(), OpenMode::Read, false, false)
+            .await?;
+        let mut cache = self.readers.borrow_mut();
+        // Another local read may have opened the same source while we awaited.
+        if let Some((_, _, old)) = cache
+            .iter()
+            .find(|(old, selected, _)| old == &path && *selected == source)
+        {
+            return Ok(old.clone());
+        }
+        if cache.len() == 4 {
+            cache.pop_front();
+        }
+        cache.push_back((path, source, handle.clone()));
+        Ok(handle)
+    }
+
     fn protect(&self, operation: Operation) -> Operation {
         match &self.protection {
             Some(handle) => Operation::Protected {

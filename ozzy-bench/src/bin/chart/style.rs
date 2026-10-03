@@ -108,11 +108,13 @@ pub(super) fn finish(
         "\n<text x=\"400\" y=\"17\" text-anchor=\"middle\" font-family=\"sans-serif\" font-size=\"14\" font-weight=\"bold\" fill=\"#F9FAFB\">{}</text>",
         escape(title)
     );
-    write!(
-        header,
-        "\n<text x=\"400\" y=\"31\" text-anchor=\"middle\" font-family=\"sans-serif\" font-size=\"10\" fill=\"#9CA3AF\">{}</text>",
-        escape(subtitle)
-    )?;
+    if !subtitle.is_empty() {
+        write!(
+            header,
+            "\n<text x=\"400\" y=\"31\" text-anchor=\"middle\" font-family=\"sans-serif\" font-size=\"10\" fill=\"#9CA3AF\">{}</text>",
+            escape(subtitle)
+        )?;
+    }
     let start = svg.find("<rect").ok_or("missing SVG background")?;
     let end = start + svg[start..].find("/>").ok_or("invalid SVG background")? + 2;
     svg.insert_str(end, &header);

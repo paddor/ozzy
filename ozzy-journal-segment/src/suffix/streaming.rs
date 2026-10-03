@@ -465,10 +465,6 @@ impl SuffixInstaller {
             self.journal
                 .set_write_mode(crate::SegmentWriteMode::DataSync)?;
         }
-        if self.journal.directory.direct {
-            let path = self.journal.active_segment_path();
-            self.journal.writer.set_direct(&path, true)?;
-        }
         Ok(self.journal)
     }
 

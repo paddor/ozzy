@@ -1,12 +1,14 @@
+pub(super) use super::completion::Completion;
 use super::{
-    AppendKey, PartitionTarget, PendingRecord, Policy, ProducerId, RecordInput, RecordReceipt,
-    Writer, WriterConfig, WriterError,
+    AppendKey, PendingRecord, Policy, ProducerId, RecordInput, RecordReceipt, Writer, WriterConfig,
+    WriterError,
 };
 use super::{WriterRuntime, pipe};
 use super::{inbox::Inbox, payload::Body};
 use crate::signal::{CloseSignal, DataSignal, StateSignal};
 use omq_tokio::message::Payload;
 use ozzy_proto::MessageId;
+use ozzy_proto::PartitionIncarnation;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -89,9 +91,9 @@ impl std::ops::Deref for Driver {
 pub(super) struct Admission {
     pub(super) records: VecDeque<Queued>,
 }
-/// One admitted record on its way to the driver. It fits one 128-byte queue
-/// slot: the transport payload keeps up to 62 bytes inline, a single part
-/// spans the whole body, and only multipart records carry a length table.
+/// One admitted record on its way to the driver. Inline caller bytes remain
+/// inline until grouped or sent alone; only multipart records need a length
+/// table. Queue and table reservations cover the larger admission entry.
 #[derive(Debug)]
 pub(super) struct Queued {
     pub(super) encoding: ozzy_proto::data::Encoding,
@@ -99,20 +101,36 @@ pub(super) struct Queued {
     /// needs it.
     pub(super) admitted_at: Option<tokio::time::Instant>,
     pub(super) sequence: u64,
-    pub(super) completion: Arc<RecordCompletion>,
+    pub(super) completion: Completion,
     /// Part lengths of a multipart record; `None` is one part of `body.len()`.
     pub(super) lengths: Option<Box<[u32]>>,
     pub(super) body: Body,
 }
-const _: () = assert!(size_of::<Queued>() <= 128);
+pub(super) const QUEUED_SLOT_BYTES: usize = 256;
+const _: () = assert!(size_of::<Queued>() <= QUEUED_SLOT_BYTES);
+
+/// Owned record storage beyond the fixed queue entry. Validated multipart
+/// lengths stay charged even when every payload part is empty.
+pub(super) fn admission_bytes(payload_bytes: usize, parts: usize) -> usize {
+    payload_bytes
+        + if parts > 1 {
+            parts * size_of::<u32>()
+        } else {
+            0
+        }
+}
 
 impl Queued {
     pub(super) fn message_id(&self) -> MessageId {
-        self.completion.message_id
+        self.completion.message_id()
     }
     /// Number of parts, including empty parts.
     pub(super) fn parts(&self) -> usize {
         self.lengths.as_ref().map_or(1, |lengths| lengths.len())
+    }
+
+    fn admission_bytes(&self) -> usize {
+        admission_bytes(self.body.len(), self.parts())
     }
 
     /// Part lengths in order.
@@ -167,20 +185,11 @@ pub(super) struct Progress {
     // with confirmation publication so observations never change afterward.
     transition: Mutex<Option<u64>>,
     changed: StateSignal,
-    partition: PartitionTarget,
+    partition: PartitionIncarnation,
     owner_epoch: u64,
     producer_id: ProducerId,
     producer_epoch: u64,
     policy: Policy,
-}
-
-/// Retained by one pending observation and the admitted record, never globally.
-/// An exact offset remains available after later writers interleave or the
-/// network driver releases its payload. Dropping observations cannot lose data.
-#[derive(Debug)]
-pub(super) struct RecordCompletion {
-    pub(super) message_id: MessageId,
-    pub(super) offset: OnceLock<u64>,
 }
 
 impl Progress {
@@ -191,7 +200,7 @@ impl Progress {
         offset: u64,
     ) -> RecordReceipt {
         RecordReceipt {
-            partition: self.partition.clone(),
+            partition: self.partition,
             owner_epoch: self.owner_epoch,
             key: AppendKey {
                 producer_id: self.producer_id,
@@ -317,7 +326,7 @@ impl Shared {
                 failure: OnceLock::new(),
                 transition: Mutex::new(None),
                 changed: StateSignal::default(),
-                partition: config.partition.clone(),
+                partition: config.partition,
                 owner_epoch: config.owner_epoch,
                 producer_id: config.producer_id,
                 producer_epoch: config.producer_epoch,
@@ -364,7 +373,7 @@ impl Shared {
         let (parts, bytes) = record.shape();
         let metadata = parts
             .checked_mul(4)
-            .and_then(|n| n.checked_add(self.config.partition.metadata_bytes() + 30));
+            .and_then(|n| n.checked_add(ozzy_proto::append::IDENTITY_METADATA_BYTES + 30));
         if record.message_id.as_bytes() == &[0; 16]
             || parts == 0
             || parts > limits.max_parts
@@ -405,7 +414,9 @@ impl Shared {
         if self.sealed() {
             return Some(Err(WriterError::Closed));
         }
-        let reservation = self.inbox.reserve(bytes)?;
+        let reservation = self
+            .inbox
+            .reserve(admission_bytes(bytes, record.parts().len()))?;
         // Normalize caller-owned slices before assigning a sequence. No await
         // or caller destructor interrupts the ticket-to-publication interval,
         // so a flush that captures `next` after the seal covers every ticket.
@@ -439,10 +450,7 @@ impl Shared {
                 WriterError::Configuration
             }));
         };
-        let completion = Arc::new(RecordCompletion {
-            message_id: record.message_id,
-            offset: OnceLock::new(),
-        });
+        let completion = sender.direct.completion(record.message_id);
         let queued = Queued {
             encoding: ozzy_proto::data::Encoding::Raw,
             admitted_at,
@@ -569,12 +577,12 @@ impl Driver {
             .admission
             .records
             .range(range)
-            .map(|record| record.body.len())
+            .map(Queued::admission_bytes)
             .sum();
         self.inbox.release((end - previous) as usize, bytes);
     }
 
-    /// Remote confirmation returns broker credit and drops original payloads.
+    /// Remote confirmation releases local retry state and drops original payloads.
     /// Every confirmed record was selected from the admission queue, so no
     /// intake drain is needed to cover `end`.
     pub(super) fn confirm(
@@ -594,9 +602,7 @@ impl Driver {
                 .map(|record| {
                     record
                         .completion
-                        .offset
-                        .set(first_offset + (record.sequence - first))
-                        .expect("record confirmed once");
+                        .publish(first_offset + (record.sequence - first));
                     record.body.len()
                 })
                 .sum()

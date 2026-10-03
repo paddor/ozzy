@@ -2,10 +2,11 @@
 
 use super::{Config, Result, error, lanes};
 use bytes::Bytes;
+use ozzy_proto::PartitionIncarnation;
 use ozzy_proto::TopicId;
 use ozzy_runtime::replicated::{
-    BrokerLinks, PartitionTarget, RecordInput, RecordReceipt, RetryPolicy,
-    SharedTopicPendingRecord, SharedTopicWriter, WriterRuntime, WriterStats,
+    BrokerLinks, RecordInput, RecordReceipt, RetryPolicy, SharedTopicPendingRecord,
+    SharedTopicWriter, WriterRuntime, WriterStats,
 };
 use serde_json::Value;
 use std::ops::Range;
@@ -27,7 +28,7 @@ pub(super) struct PendingRecord {
 }
 
 pub(super) struct ReceiptCheck {
-    pub(super) partition: PartitionTarget,
+    pub(super) partition: PartitionIncarnation,
     first: Option<u64>,
     previous: Option<u64>,
 }
@@ -59,13 +60,12 @@ impl Writer {
 
     pub(super) fn receipt_check(&self) -> ReceiptCheck {
         ReceiptCheck {
-            partition: PartitionTarget::Group(
-                self.sdk
-                    .metadata()
-                    .partition(self.number)
-                    .expect("checked numeric partition")
-                    .incarnation,
-            ),
+            partition: self
+                .sdk
+                .metadata()
+                .partition(self.number)
+                .expect("checked numeric partition")
+                .incarnation,
             first: None,
             previous: None,
         }

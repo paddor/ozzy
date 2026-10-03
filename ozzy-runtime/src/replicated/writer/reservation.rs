@@ -86,13 +86,16 @@ impl Bounds {
         let queue = records
             .checked_next_power_of_two()?
             .checked_mul(self.max_producers)?
-            .checked_mul(256)?;
-        let tables = self
-            .limits
-            .max_parts
-            .checked_mul(4)?
-            .checked_add(1024)?
-            .checked_mul(records)?;
+            .checked_mul(2 * super::state::QUEUED_SLOT_BYTES)?;
+        // Intake charges payloads and part tables to one byte window. Prepared
+        // requests retain at most one negotiated part table each until ACK.
+        let table = self.limits.max_parts.checked_mul(size_of::<u32>())?;
+        let intake = intake_bytes(self.limits, self.batch_target_bytes)?;
+        let tables = table
+            .checked_mul(self.inflight_appends)?
+            .checked_add(intake)?
+            .checked_mul(self.max_producers)?
+            .checked_add(records.checked_mul(1024)?)?;
         let bodies = self
             .batch_target_bytes
             .max(self.limits.max_record_bytes)
@@ -111,6 +114,14 @@ impl Bounds {
     }
 }
 
+/// One batch plus the next record whose shape can close it. Part tables of
+/// both the selected batch and lookahead share the same intake byte window.
+pub(super) fn intake_bytes(limits: DataLimits, target: usize) -> Option<usize> {
+    target
+        .checked_add(limits.max_record_bytes)?
+        .checked_add(limits.max_parts.checked_mul(2 * size_of::<u32>())?)
+}
+
 pub(super) fn transport_backing_bytes(limits: DataLimits) -> usize {
     lz4rip::get_maximum_output_size(limits.envelope.max_payload_bytes)
         .saturating_mul(2)
@@ -123,10 +134,33 @@ mod tests {
     use crate::replicated::SharedTopicWriterConfig;
 
     #[test]
+    fn part_table_reservation_scales_with_requests_instead_of_records_squared() {
+        let limits = DataLimits {
+            max_records: 2048,
+            max_parts: 1,
+            envelope: ozzy_proto::EnvelopeLimits {
+                max_payload_bytes: 4 * 1024 * 1024,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut config = SharedTopicWriterConfig::new(limits);
+        config.batch_target_bytes = 4 * 1024 * 1024;
+        config.inflight_appends = 3;
+        let small = config.link_reservation(64 * 1024).unwrap();
+        config.limits.max_parts = 2048;
+        let large = config.link_reservation(64 * 1024).unwrap();
+        assert_eq!(large.writer_bytes - small.writer_bytes, (2048 - 1) * 4 * 5);
+    }
+
+    #[test]
     fn reservation_refuses_empty_windows_and_overflow_without_allocating() {
         let mut config = SharedTopicWriterConfig::new(DataLimits::default());
         assert!(config.link_reservation(64 * 1024).is_some());
         assert!(config.link_reservation(usize::MAX).is_none());
+        config.batch_target_bytes = usize::MAX;
+        assert!(config.link_reservation(64 * 1024).is_none());
+        config.batch_target_bytes = 64 * 1024;
         config.limits.envelope.max_payload_bytes = usize::MAX;
         assert!(config.link_reservation(64 * 1024).is_none());
         config.limits = DataLimits::default();

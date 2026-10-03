@@ -14,6 +14,7 @@ mod donors;
 mod election;
 mod history;
 mod ids;
+mod maintenance;
 pub use ids::ActorIds;
 mod ingress;
 mod io;
@@ -53,7 +54,7 @@ use bytes::Bytes;
 use omq_tokio::Message;
 use ozzy_proto::{LinkSessionId, NodeId};
 use ozzy_replication::driver::{Action, DriverError, ReplicaDriver, Timing};
-use ozzy_replication::wire::{self, Control, Grant, PeerBinding, ReplicaMessage, WireLimits};
+use ozzy_replication::wire::{self, Control, PeerBinding, ReplicaMessage, WireLimits};
 use ozzy_replication::{
     Configuration, JournalGeneration, LogSource, NormalReplica, PipelineLimits, Prefix,
     PromiseTicket, ReplicaSnapshot, Scope, StartView,
@@ -103,7 +104,7 @@ pub struct ActorConfig {
     pub sessions: [LinkSessionId; 3],
     /// Protocol timeouts; storage startup happens before the actor clock starts.
     pub timing: Timing,
-    /// Small receipt/credit probe pacing, independent of durable/election deadlines.
+    /// Small receipt probe pacing, independent of durable/election deadlines.
     pub flow_probe: ozzy_replication::flow::ProbeTiming,
     /// Live core operation/body limits, including staged and validating receives.
     /// Background persistence may span multiple bounded journal commands.
@@ -144,18 +145,10 @@ pub struct ActorConfig {
 
 impl ActorConfig {
     fn wire_limits(self) -> Result<WireLimits, ActorError> {
-        // OPS uses 196 fixed metadata bytes plus 86 per operation; FETCH_OPS
-        // uses 200. Reserve a bounded 208-byte fixed region for both.
-        let metadata_bytes = self
-            .transfer
-            .max_operations
-            .checked_mul(86)
-            .and_then(|bytes| bytes.checked_add(208))
-            .ok_or(ActorError::Limits)?;
-        let message_bytes = metadata_bytes
-            .checked_add(self.transfer.max_body_bytes)
-            .and_then(|bytes| bytes.checked_add(80))
-            .ok_or(ActorError::Limits)?;
+        let limits =
+            WireLimits::for_transfer(self.transfer.max_operations, self.transfer.max_body_bytes)
+                .ok_or(ActorError::Limits)?;
+        let message_bytes = limits.message_bytes().ok_or(ActorError::Limits)?;
         if self.pipeline.max_operations == 0
             || self.replay_cache.max_operations < self.pipeline.max_operations
             || self.replay_cache.max_operations > 65536
@@ -184,13 +177,7 @@ impl ActorConfig {
         {
             return Err(ActorError::Limits);
         }
-        Ok(WireLimits {
-            envelope: ozzy_proto::EnvelopeLimits {
-                max_metadata_bytes: metadata_bytes,
-                max_payload_bytes: self.transfer.max_body_bytes,
-            },
-            max_operations: self.transfer.max_operations,
-        })
+        Ok(limits)
     }
 }
 
@@ -246,7 +233,7 @@ pub struct ActorStatus {
 
 /// One mutable protocol owner with journal futures polled on its shard.
 #[derive(Debug)]
-pub struct ReplicaActor<E = crate::replica_journal::ShardJournal> {
+pub struct ReplicaActor {
     maintenance_status: MaintenanceStatus,
     foreground_turn_due: bool,
     orphan_cleanup: Option<(Duration, Duration, ozzy_journal_segment::MaintenanceBudget)>,
@@ -264,7 +251,7 @@ pub struct ReplicaActor<E = crate::replica_journal::ShardJournal> {
     incoming: VecDeque<Message>,
     driver: ReplicaDriver,
     ids: ActorIds,
-    journal: ReplicaJournal<E>,
+    journal: ReplicaJournal,
     outbox: ReplicaOutbox,
     bindings: [Option<PeerBinding>; 3],
     wire_limits: WireLimits,
@@ -279,8 +266,6 @@ pub struct ReplicaActor<E = crate::replica_journal::ShardJournal> {
     pending: Option<PendingIo>,
     // At most one received-suffix validation queued behind `pending`; set only
     // while `pending` is set. Needs a third journal command slot.
-    follow_on: Option<io::FollowOn>,
-    follow_on_enabled: bool,
     pending_replay: Option<io::PendingReplay>,
     pending_sync: Option<PendingSync>,
     pending_persistence:
@@ -301,13 +286,13 @@ pub struct ReplicaActor<E = crate::replica_journal::ShardJournal> {
     work: normal::Work,
 }
 
-impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
+impl ReplicaActor {
     /// Consume storage-validated startup and reserve actor buffers before serving.
     /// The journal must have two available append-buffer leases at these bounds:
     /// one for journal/transfer work and one for contiguous backup receive staging.
     /// At least two command slots must be available for write/sync overlap.
     pub fn new(
-        journal: ReplicaJournal<E>,
+        journal: ReplicaJournal,
         startup: JournalStartup,
         config: ActorConfig,
     ) -> Result<Self, ActorError> {
@@ -317,25 +302,12 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
     /// Construct with an explicit protocol ID source. The simulator must give
     /// each actor incarnation its own namespace, including after restart.
     pub fn new_with_ids(
-        journal: ReplicaJournal<E>,
+        journal: ReplicaJournal,
         startup: JournalStartup,
         config: ActorConfig,
         ids: ActorIds,
     ) -> Result<Self, ActorError> {
-        Self::construct(journal, startup, &config, ids, false)
-    }
-
-    /// Construct for shared-shard intake. Followers advertise zero initial
-    /// receive capacity and never refill it automatically. The shard reserves
-    /// aggregate memory and dispatch capacity before granting receive credit
-    /// through `ScheduledReplica`. Existing accepted history stays charged.
-    pub fn new_with_reserved_credit(
-        journal: ReplicaJournal<E>,
-        startup: JournalStartup,
-        config: ActorConfig,
-        ids: ActorIds,
-    ) -> Result<Self, ActorError> {
-        Self::construct(journal, startup, &config, ids, true)
+        Self::construct(journal, startup, &config, ids)
     }
 
     #[expect(
@@ -343,11 +315,10 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
         reason = "explicit bounded actor state initialization"
     )]
     fn construct(
-        journal: ReplicaJournal<E>,
+        journal: ReplicaJournal,
         startup: JournalStartup,
         config: &ActorConfig,
         mut ids: ActorIds,
-        reserved_credit: bool,
     ) -> Result<Self, ActorError> {
         let configuration = startup.configuration();
         let local = startup.local();
@@ -366,11 +337,10 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
             .is_none()
             .then_some((journal_scope, startup.generation()));
         let wire_limits = config.wire_limits()?;
-        if journal.available_command_slots() < 2 {
+        if journal.command_capacity() < 2 {
             return Err(ActorError::Limits);
         }
-        let follow_on_enabled = journal.command_capacity() >= 3;
-        let backlog = journal.write_pipeline().backlog;
+        let backlog = journal.backlog();
         if config.pipeline.max_operations > backlog.max_operations
             || config.pipeline.max_body_bytes > backlog.max_body_bytes
         {
@@ -414,7 +384,6 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
             config.pipeline,
             config.replay_cache,
             flow,
-            reserved_credit,
         )?;
         let outbox = ReplicaOutbox::new(configuration, local, config.control, config.data)?;
         let mut bindings = [None; 3];
@@ -460,8 +429,6 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
             history_receive_allocator: None,
             spare: None,
             pending: None,
-            follow_on: None,
-            follow_on_enabled,
             pending_replay: None,
             pending_sync: None,
             pending_persistence: VecDeque::with_capacity(config.pipeline.max_operations),
@@ -485,34 +452,6 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
     /// Subscribe to bounded, coalesced state observations. Intermediate states may coalesce.
     pub fn subscribe(&self) -> watch::Receiver<ActorStatus> {
         self.status.subscribe()
-    }
-
-    /// Enable periodic byte-bounded storage checks between foreground disk actions.
-    ///
-    /// Overdue checks drain admitted writes before allowing another write group.
-    /// Default steps read at most 256 KiB and yield between decoding units after
-    /// 2 ms. A filesystem call or group decode can overrun that cooperative target.
-    /// Corruption stops the actor through its ordinary journal-failure path.
-    /// Disabled by default; this does not enable automatic quarantine or repair.
-    pub fn with_storage_validation(self, interval: Duration) -> Result<Self, ActorError> {
-        self.with_storage_validation_budget(
-            interval,
-            ozzy_journal_segment::StorageValidationBudget::default(),
-        )
-    }
-
-    /// Reserve an overdue maintenance turn after current writes synchronize.
-    /// Byte limits apply to segment reads; time limits yield between decoding units.
-    pub fn with_storage_validation_budget(
-        mut self,
-        interval: Duration,
-        budget: ozzy_journal_segment::StorageValidationBudget,
-    ) -> Result<Self, ActorError> {
-        if interval.is_zero() || !budget.is_valid() {
-            return Err(ActorError::Limits);
-        }
-        self.storage_validation = Some((interval, interval, budget));
-        Ok(self)
     }
 
     /// Take one startup-allocated submission lane. Call before moving into `run`.
@@ -574,8 +513,6 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
         self.normal_round(now)?;
         self.donor_round()?;
         self.schedule(now)?;
-        self.queue_received_behind(now)?;
-        debug_assert!(self.follow_on.is_none() || self.pending.is_some());
         self.retry_transfer(now)?;
         self.ack(now)?;
         if !self.incoming.is_empty() {
@@ -583,108 +520,6 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
         }
         self.publish_status(true);
         Ok(())
-    }
-
-    /// Reserve periodic device turns to reclaim unselected artifacts. Default: disabled.
-    pub fn with_orphan_cleanup(
-        mut self,
-        interval: Duration,
-        budget: ozzy_journal_segment::MaintenanceBudget,
-    ) -> Result<Self, ActorError> {
-        if interval.is_zero() || budget.max_entries == 0 || budget.max_work.is_zero() {
-            return Err(ActorError::Limits);
-        }
-        self.orphan_cleanup = Some((interval, interval, budget));
-        Ok(self)
-    }
-
-    fn orphan_cleanup_round(&mut self, now: Duration) -> Result<(), ActorError> {
-        let Some((interval, next, budget)) = self.orphan_cleanup else {
-            return Ok(());
-        };
-        if now < next
-            || self.pending.is_some()
-            || self.pending_sync.is_some()
-            || !self.pending_persistence.is_empty()
-            || self.work.needs_sync
-            || !self.application_ready()
-            || self.journal.available_command_slots() == 0
-        {
-            return Ok(());
-        }
-        let ticket = self.driver.begin_validation()?;
-        self.pending = Some(PendingIo::OrphanCleanup(
-            self.journal.cleanup_orphans(ticket, budget)?,
-        ));
-        self.orphan_cleanup = Some((interval, now.saturating_add(interval), budget));
-        Ok(())
-    }
-
-    /// Reserve periodic device turns to reclaim old manifests. Default: disabled.
-    pub fn with_metadata_cleanup(
-        mut self,
-        interval: Duration,
-        budget: ozzy_journal_segment::MaintenanceBudget,
-    ) -> Result<Self, ActorError> {
-        if interval.is_zero() || budget.max_entries == 0 || budget.max_work.is_zero() {
-            return Err(ActorError::Limits);
-        }
-        self.metadata_cleanup = Some((interval, interval, budget));
-        Ok(self)
-    }
-
-    fn metadata_cleanup_round(&mut self, now: Duration) -> Result<(), ActorError> {
-        let Some((interval, next, budget)) = self.metadata_cleanup else {
-            return Ok(());
-        };
-        if now < next
-            || self.pending.is_some()
-            || self.pending_sync.is_some()
-            || !self.pending_persistence.is_empty()
-            || self.work.needs_sync
-            || !self.application_ready()
-            || self.journal.available_command_slots() == 0
-        {
-            return Ok(());
-        }
-        let ticket = self.driver.begin_validation()?;
-        self.pending = Some(PendingIo::MetadataCleanup(
-            self.journal.cleanup_metadata(ticket, budget)?,
-        ));
-        self.metadata_cleanup = Some((interval, now.saturating_add(interval), budget));
-        Ok(())
-    }
-
-    fn storage_validation_round(&mut self, now: Duration) -> Result<(), ActorError> {
-        let Some((interval, next, budget)) = self.storage_validation else {
-            return Ok(());
-        };
-        if now < next
-            || self.pending.is_some()
-            || self.pending_sync.is_some()
-            || !self.pending_persistence.is_empty()
-            || self.work.needs_sync
-            || !self.application_ready()
-            || self.journal.available_command_slots() == 0
-        {
-            return Ok(());
-        }
-        let ticket = self.driver.begin_validation()?;
-        self.pending = Some(PendingIo::StorageValidation(
-            self.journal.validate_storage_with_budget(ticket, budget)?,
-        ));
-        self.storage_validation = Some((interval, now.saturating_add(interval), budget));
-        Ok(())
-    }
-
-    /// Retire the completed journal command. A queued follow-on validation
-    /// becomes the running command.
-    fn retire_pending(&mut self) {
-        self.pending = None;
-        let Some(follow_on) = self.follow_on.take() else {
-            return;
-        };
-        self.pending = Some(PendingIo::Turn(follow_on.completion, None));
     }
 
     fn drain_incoming(&mut self, now: Duration) -> Result<(), ActorError> {
@@ -879,6 +714,82 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
         Ok(())
     }
 
+    fn receive_data(&mut self, message: &Message, now: Duration) -> Result<bool, ActorError> {
+        if message.len() != 4 {
+            return Ok(true);
+        }
+        let Some(voter) = self
+            .configuration
+            .voters()
+            .iter()
+            .position(|peer| message.part_slice(0) == Some(peer.as_bytes().as_slice()))
+        else {
+            return Ok(true);
+        };
+        let Some(binding) = self.bindings[voter] else {
+            return Ok(true);
+        };
+        let frames: [&[u8]; 3] =
+            std::array::from_fn(|i| message.part_slice(i + 1).expect("four frames"));
+        let Ok(packet) = ozzy_proto::decode_packet(&frames, self.wire_limits.envelope) else {
+            return Ok(true);
+        };
+        let scope = self.driver.scope();
+        let (batch, publication) = if packet.envelope.opcode == ozzy_proto::Opcode::PreparePub {
+            let published = [
+                scope.group_id.as_bytes().as_slice(),
+                frames[0],
+                frames[1],
+                frames[2],
+            ];
+            let Ok(batch) =
+                wire::decode_publication(&published, binding, self.local, scope, self.wire_limits)
+            else {
+                return Ok(true);
+            };
+            crate::profiling::event(crate::profiling::Event::ReplicaPublicationReceived);
+            (batch, true)
+        } else {
+            let Ok(ReplicaMessage::Flow(wire::FlowMessage::Prepare { batch, .. })) =
+                wire::decode(&frames, binding, self.wire_limits)
+            else {
+                return Ok(true);
+            };
+            (batch, false)
+        };
+        // A missing predecessor cannot be supplied by waiting on this frame.
+        // Drop the gap and let the next correlated probe request the prefix.
+        if batch.predecessor().op > self.work.receive_report().received.op {
+            if publication {
+                crate::profiling::event(crate::profiling::Event::ReplicaPublicationGap);
+                self.work.flow.observe_receipt(
+                    self.work.receive_report().received.op,
+                    Some(batch.end().op),
+                    true,
+                    now,
+                );
+            }
+            return Ok(true);
+        }
+        let end = batch.end().op;
+        let consumed = self.receive_prepare(self.configuration.voters()[voter], batch, now)?;
+        if publication && !consumed {
+            self.work.flow.pending_publication = Some(end);
+        }
+        self.work.flow.observe_receipt(
+            self.work.receive_report().received.op,
+            None,
+            publication,
+            now,
+        );
+        // PUB receipt can advance beyond PEER reservations. Keep its full digest
+        // report so the leader verifies exact history instead of trusting a counter.
+        if publication {
+            self.work.flow.clear_compact_receipt();
+        }
+        Ok(consumed)
+    }
+
     fn ack(&mut self, now: Duration) -> Result<(), ActorError> {
         if now < self.ack_at {
             return Ok(());
@@ -891,25 +802,18 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
         let Some(normal) = self.driver.normal() else {
             return Ok(());
         };
-        let grant = Grant {
-            revision: 1,
-            // This actor grants only epoch-bound operation/body credits
-            // through REPLICA_STATE. Legacy record credit stays closed.
-            record_limit: 0,
-            byte_limit: 0,
-        };
         let control = match self.configuration.policy() {
             ozzy_replication::QuorumPolicy::Durable => {
                 let Ok(ack) = normal.acknowledgment() else {
                     return Ok(());
                 };
-                Control::PrepareOk { ack, grant }
+                Control::PrepareOk { ack }
             }
             ozzy_replication::QuorumPolicy::Replicated => {
                 let Ok(ack) = normal.retained_acknowledgment() else {
                     return Ok(());
                 };
-                Control::PrepareRetained { ack, grant }
+                Control::PrepareRetained { ack }
             }
         };
         self.control(primary, control)
@@ -925,7 +829,7 @@ pub enum ActorError {
     /// Nonvoting recovery rejected authority or history evidence.
     #[error(transparent)]
     Recovery(#[from] ozzy_replication::recovery::RecoveryError),
-    /// Volatile receipt/credit policy failed; never interpreted as a disk vote.
+    /// Volatile receipt/repair policy failed; never interpreted as a disk vote.
     #[error(transparent)]
     Flow(#[from] ozzy_replication::flow::TransmitError),
     /// Storage-validated startup belongs to another worker incarnation.

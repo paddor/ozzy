@@ -20,6 +20,7 @@ pub struct JournalIdentityIndex {
 }
 
 impl JournalIdentityIndex {
+    /// Bind an exact captured journal index to a bounded in-memory identity overlay.
     pub fn new(snapshot: JournalIndexSnapshot, overlay_capacity: usize) -> Self {
         Self {
             snapshot: Rc::new(snapshot),
@@ -27,10 +28,12 @@ impl JournalIdentityIndex {
         }
     }
 
+    /// Borrow the exact captured journal-index source.
     pub fn snapshot(&self) -> &JournalIndexSnapshot {
         &self.snapshot
     }
 
+    /// Borrow bounded identity claims not yet represented by the captured disk index.
     pub const fn overlay(&self) -> &MemoryIdentityIndex {
         &self.overlay
     }
@@ -145,11 +148,15 @@ impl JournalIndexSnapshot {
 #[derive(Debug, Error)]
 pub enum JournalIdentityHandoffError {
     #[error(transparent)]
+    /// Exact identity lookup or overlay reservation failed.
     Lookup(#[from] JournalIndexError),
     #[error("replacement persistent index is missing an overlay identity")]
+    /// Replacement persistent index is missing an overlay identity.
     ClaimMissing,
     #[error("replacement persistent index disagrees with an overlay identity")]
+    /// Replacement persistent index disagrees with an overlay identity.
     ClaimMismatch,
     #[error("replacement persistent index does not extend the same store lineage")]
+    /// Replacement persistent index does not extend the same store lineage.
     SnapshotMismatch,
 }

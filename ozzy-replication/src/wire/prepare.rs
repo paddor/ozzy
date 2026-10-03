@@ -13,8 +13,8 @@ use super::{COMMON_BYTES, Reader, WireError, WireLimits, Writer, validate_prefix
 use crate::flow::ReceiveEpoch;
 use crate::{Digest, OpNumber, Prefix, Scope};
 
-const DESCRIPTOR_BYTES: usize = 86;
-const BATCH_BYTES: usize = COMMON_BYTES + 8 + 32 + 40 + 4;
+pub(super) const DESCRIPTOR_BYTES: usize = 86;
+pub(super) const BATCH_BYTES: usize = COMMON_BYTES + 8 + 32 + 40 + 4;
 
 /// Immutable canonical bytes and their already computed body/envelope digests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,7 +174,7 @@ pub fn encode_prepare_metadata(
     .map(bound_encoding)
 }
 
-/// Encode credited normal data with a mandatory receiver-issued epoch.
+/// Encode epoch-bound normal data with a mandatory receiver-issued epoch.
 ///
 /// Distinct `PREPARE_FLOW` bytes prevent silent mixing with legacy PREPARE schemas.
 /// Adds exactly 16 metadata bytes per batch. Canonical identities/body digests

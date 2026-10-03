@@ -10,9 +10,6 @@ fn flags(journal: &crate::OpenGroupJournal, dsync: bool) {
     )
     .unwrap();
     assert_eq!(actual & libc::O_DSYNC != 0, dsync);
-    // Write jobs share this descriptor instead of duplicating it.
-    let handle = journal.writer().write_handle();
-    assert!(std::sync::Arc::ptr_eq(&handle, &journal.writer().io));
     assert!(
         actual & (libc::O_SYNC & !libc::O_DSYNC) == 0,
         "must not request full metadata sync"

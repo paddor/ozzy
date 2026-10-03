@@ -90,6 +90,7 @@ fn config(root: &str, id: u8, policy: QuorumPolicy) -> OwnedConfig {
         write_group_bytes: 8192,
         reads: ozzy_journal_segment::AsyncPartitionReadLimits {
             index: ozzy_journal_segment::IndexBuildLimits::default(),
+            max_resident_operations: 128,
             cached_index_bytes: 8192,
             cached_indexes: 2,
             concurrent_reads: 2,

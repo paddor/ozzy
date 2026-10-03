@@ -233,6 +233,7 @@ impl Settings {
                     )
                     .max(1024),
             )?
+            .min(ozzy_config::MAX_APPEND_BYTES)
             .min(segment_bytes / 2),
             io_threads: args
                 .broker_io_threads
@@ -292,8 +293,9 @@ impl Settings {
             .map(|index| Broker {
                 name: format!("broker-{index}"),
                 endpoints: Endpoints {
-                    peer: format!("tcp://127.0.0.1:{}", 20000 + index * 2),
-                    reader_pub: format!("tcp://127.0.0.1:{}", 20001 + index * 2),
+                    peer: format!("tcp://127.0.0.1:{}", 20000 + index * 3),
+                    reader_pub: format!("tcp://127.0.0.1:{}", 20001 + index * 3),
+                    data_peer: format!("tcp://127.0.0.1:{}", 20002 + index * 3),
                     follower_pub: None,
                 },
                 root: PathBuf::from(format!("/native-preflight/broker-{index}")),
@@ -353,10 +355,7 @@ impl Settings {
 
     pub(in crate::bench::timed) fn append_payload_bytes(&self) -> usize {
         let body = usize::try_from(self.append_bytes).expect("validated native APPEND bound");
-        let records = ozzy_runtime::replicated::MAX_APPEND_RECORDS
-            .min(body.saturating_sub(89) / 25)
-            .max(1);
-        body - 89 - 24 * records
+        ozzy_bench::native::peer_payload_capacity(body)
     }
 
     pub(super) fn document(&self, brokers: &[Broker]) -> Result<String> {
@@ -374,8 +373,7 @@ impl Settings {
             if deployment["brokers"].get(&broker.name).is_some() {
                 return Err(error("duplicate native benchmark broker name"));
             }
-            let mut endpoints =
-                json!({"peer": broker.endpoints.peer, "reader_pub": broker.endpoints.reader_pub});
+            let mut endpoints = json!({"peer": broker.endpoints.peer, "data_peer": broker.endpoints.data_peer, "reader_pub": broker.endpoints.reader_pub});
             if let Some(follower) = &broker.endpoints.follower_pub {
                 endpoints["follower_pub"] = json!(follower);
             }

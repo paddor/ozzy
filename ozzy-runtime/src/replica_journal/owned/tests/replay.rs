@@ -35,6 +35,34 @@ pub(super) fn persist(controller: &mut Controller, replica: &mut Replica) -> Pre
 }
 
 #[test]
+fn owned_replay_refresh_reads_only_the_new_segment_suffix() {
+    let (mut controller, io) = setup();
+    let mut replica = replica(&mut controller, io, 0, QuorumPolicy::Durable, 8192);
+    let first = persist(&mut controller, &mut replica);
+    let initial = capture(&mut replica, Prefix::GENESIS, 8192);
+    let done = drive(&mut controller, initial.read());
+    let result = replica.journal.complete_replay(done).unwrap();
+    assert_eq!(result.end(), first);
+    drop(result);
+
+    let second = persist(&mut controller, &mut replica);
+    let refresh = capture(&mut replica, first, 8192);
+    let mut reads = Vec::new();
+    let done = drive_except(&mut controller, refresh.read(), None, |operation| {
+        if let Operation::Read { offset, .. } = operation {
+            reads.push(*offset);
+        }
+        Effect::Normal
+    });
+    let result = replica.journal.complete_replay(done).unwrap();
+    assert_eq!(result.end(), second);
+    assert!(!reads.is_empty());
+    assert!(reads.iter().all(|offset| *offset > 0), "{reads:?}");
+    drop(result);
+    drive(&mut controller, replica.journal.shutdown()).unwrap();
+}
+
+#[test]
 fn owned_detached_replay_preserves_election_source_and_never_replaces_newer_cache() {
     let (mut controller, io) = setup();
     let mut replica = replica(&mut controller, io, 0, QuorumPolicy::Durable, 8192);
@@ -149,9 +177,7 @@ fn owned_replay_reserves_whole_chunk_and_waits_for_shared_capacity() {
         persist(&mut controller, &mut replica);
         let end = persist(&mut controller, &mut replica);
         let work = capture(&mut replica, Prefix::GENESIS, 32);
-        let Some(crate::memory::AllocationSource::Shared(memory)) =
-            replica.journal.append_memory.clone()
-        else {
+        let Some(memory) = replica.journal.append_memory.clone() else {
             panic!("fixture binds a shared payload owner")
         };
         memory.trim_cache();

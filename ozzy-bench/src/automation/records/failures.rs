@@ -3,6 +3,7 @@ use super::{Result, controls, finite};
 use serde_json::{Value, json};
 use std::{fs, path::Path};
 
+/// Include failed offered-load cases as explicit failures in the selected chart data.
 pub fn include_failed_loads(directory: &Path, data: &mut Value, ids: &[String]) -> Result<()> {
     let mut failures = vec![];
     for id in ids {
@@ -41,31 +42,21 @@ pub fn include_failed_loads(directory: &Path, data: &mut Value, ids: &[String]) 
             .filter(|r| *r > 0)
             .ok_or("missing offered load")?;
         let summaries = data["summary"].as_array().ok_or("missing summaries")?;
+        let repeat = summaries.iter().any(|row| row["case"] == case);
         let matches_series = |row: &&Value| {
             ["impl", "mode", "codec", "size", "pattern"]
                 .iter()
                 .all(|key| row["case"][key] == case[key])
         };
         if !summaries.iter().any(|row| matches_series(&row))
-            || summaries.iter().any(|row| row["case"] == case)
-            || failures.iter().any(|row: &Value| row["case"] == case)
+            || failures
+                .iter()
+                .chain(data["incomplete"].as_array().into_iter().flatten())
+                .any(|row: &Value| row["case"] == case)
         {
-            return Err("failed case is uncovered, duplicated, or already measured".into());
+            return Err("failed case is uncovered or duplicated".into());
         }
-        if !data["sources"]
-            .as_object()
-            .ok_or("missing sources")?
-            .values()
-            .any(|source| *source == manifest["source"])
-            || manifest["executable_sha256"].as_str().is_none()
-            || !data["executables"]
-                .as_object()
-                .ok_or("missing executable fingerprints")?
-                .values()
-                .any(|hash| *hash == manifest["executable_sha256"])
-        {
-            return Err("failed run used a different benchmark build".into());
-        }
+        require_matching_build(data, &manifest)?;
         manifest["configuration"] = config.clone();
         let mut control = controls(&manifest)?;
         let settings = control["configuration"].as_object_mut().unwrap();
@@ -95,13 +86,31 @@ pub fn include_failed_loads(directory: &Path, data: &mut Value, ids: &[String]) 
         data["fixed_load_windows"][rate.to_string()] = window;
         failures.push(
             json!({"run_id":id,"case":case,"failure":"scheduled backlog limit exceeded",
-            "reason":reason,"evidence":evidence}),
+            "reason":reason,"evidence":evidence,"repeat":repeat}),
         );
     }
     // Keep overloaded ramp stages already selected with the measurements.
     let mut incomplete = data["incomplete"].as_array().cloned().unwrap_or_default();
     incomplete.extend(failures);
     data["incomplete"] = json!(incomplete);
+    Ok(())
+}
+
+fn require_matching_build(data: &Value, manifest: &Value) -> Result<()> {
+    if manifest["executable_sha256"].as_str().is_none() {
+        return Err("missing executable fingerprint".into());
+    }
+    for (field, evidence) in [("sources", "source"), ("executables", "executable_sha256")] {
+        if manifest[evidence].is_null()
+            || !data[field]
+                .as_object()
+                .ok_or("missing build provenance")?
+                .values()
+                .any(|value| *value == manifest[evidence])
+        {
+            return Err("failed run used a different benchmark build".into());
+        }
+    }
     Ok(())
 }
 
@@ -212,6 +221,12 @@ mod tests {
             annotated["incomplete"][0]["evidence"],
             evidence.to_str().unwrap()
         );
+        let mut repeated = data.clone();
+        repeated["summary"][0]["case"]["rate"] = json!(1_000_000);
+        let measured = repeated["summary"].clone();
+        include_failed_loads(temp.path(), &mut repeated, &["failed".into()]).unwrap();
+        assert_eq!(repeated["summary"], measured);
+        assert_eq!(repeated["incomplete"][0]["repeat"], true);
         for pointer in [
             "/source/revision",
             "/executable_sha256",

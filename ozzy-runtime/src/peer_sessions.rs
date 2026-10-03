@@ -230,21 +230,7 @@ impl Sessions {
             .ok_or(Error::NotConnected)?
             .remote
             .receive;
-        Ok(DataLimits {
-            max_record_bytes: local.max_record_bytes.min(remote.max_record_bytes),
-            max_records: local.max_records.min(remote.max_records),
-            max_parts: local.max_parts.min(remote.max_parts),
-            envelope: ozzy_proto::EnvelopeLimits {
-                max_metadata_bytes: local
-                    .envelope
-                    .max_metadata_bytes
-                    .min(remote.envelope.max_metadata_bytes),
-                max_payload_bytes: local
-                    .envelope
-                    .max_payload_bytes
-                    .min(remote.envelope.max_payload_bytes),
-            },
-        })
+        Ok(local.intersection(remote))
     }
 
     /// Process one bounded handshake. `remote` comes from an independently

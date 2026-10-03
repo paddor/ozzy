@@ -19,11 +19,17 @@ use std::collections::VecDeque;
 /// Independent observation of acceptance, persistence, and applied visibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Snapshot {
+    /// Exact local written and durable journal progress.
     pub journal: JournalSnapshot,
+    /// Last admitted canonical operation prefix.
     pub accepted: Prefix,
+    /// Contiguous locally durable confirmation prefix.
     pub committed: Prefix,
+    /// Last prefix installed in application state.
     pub applied: Prefix,
+    /// Accepted operations still awaiting application.
     pub pending_operations: usize,
+    /// Canonical body bytes retained by those operations.
     pub pending_body_bytes: usize,
 }
 
@@ -82,6 +88,7 @@ impl Driver {
         })
     }
 
+    /// Observe local progress without changing authority.
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             journal: self.journal.snapshot(),
@@ -157,6 +164,7 @@ impl Driver {
         Ok(self.journal.complete_write(ticket)?)
     }
 
+    /// Capture a generation-fenced durability ticket for the written prefix.
     pub fn begin_sync(&self) -> Result<SyncTicket, Error> {
         Ok(self.journal.begin_sync()?)
     }
@@ -212,21 +220,30 @@ impl Driver {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+/// Rejected local authority, capacity, lineage, or journal progress.
 pub enum Error {
     #[error("invalid single-broker configuration")]
+    /// Identity, principal, or configuration epoch is invalid.
     Configuration,
     #[error("invalid single-broker configuration encoding or checksum")]
+    /// Persistent configuration bytes or checksum are invalid.
     Encoding,
     #[error("invalid local partition pipeline limits")]
+    /// Pipeline operation or body bounds are invalid.
     Limits,
     #[error("local partition capacity exhausted")]
+    /// Local pending operation or byte capacity is full.
     Capacity,
     #[error("local partition history mismatch")]
+    /// Canonical history does not extend the accepted prefix.
     Lineage,
     #[error("stale local partition validation")]
+    /// Validation belongs to obsolete local authority or history.
     StaleValidation,
     #[error("local application exceeds its durable prefix")]
+    /// Application would advance beyond synchronized history.
     ApplyBeyondDurable,
     #[error(transparent)]
+    /// The journal progress contract rejected the transition.
     Journal(#[from] ProgressError),
 }

@@ -12,19 +12,28 @@ use crate::{
 pub struct HostResources {
     /// Allowed OS CPU IDs and each CPU's NUMA node, if known.
     pub cpus: BTreeMap<u32, Option<u32>>,
+    /// NUMA nodes available to this process.
     pub memory_nodes: BTreeSet<u32>,
+    /// Whether this host supports the required Linux AIO backend.
     pub linux_aio: bool,
 }
 
 /// Validated local placement. Constructed before starting runtime workers.
 #[derive(Debug, Clone)]
 pub struct BrokerPlan {
+    /// Selected configured broker name.
     pub name: String,
+    /// Validated OMQ transport worker count.
     pub omq_io_threads: usize,
+    /// Validated transport-owner affinity.
     pub dispatcher: Affinity,
+    /// Application owners and their local budgets.
     pub shards: Vec<ShardPlan>,
+    /// Shared physical backend owners.
     pub controllers: Vec<ControllerPlan>,
+    /// Validated NUMA allocation domains.
     pub memory_pools: Vec<crate::MemoryPool>,
+    /// Local journal directories and application owners.
     pub partitions: Vec<PartitionPlacement>,
 }
 
@@ -32,26 +41,39 @@ pub struct BrokerPlan {
 /// sparse application shard IDs are not backend lane indexes.
 #[derive(Debug, Clone)]
 pub struct ControllerPlan {
+    /// Controller name shared by its local devices.
     pub name: String,
+    /// Application owner IDs in backend lane order.
     pub shards: Vec<u32>,
+    /// Shared physical execution and retention bounds.
     pub workers: StorageWorkers,
 }
 
 #[derive(Debug, Clone)]
+/// Validated application-owner placement and admission bounds.
 pub struct ShardPlan {
+    /// Broker-local application owner ID.
     pub id: u32,
+    /// Validated application thread affinity.
     pub affinity: Affinity,
+    /// Configured storage device name.
     pub device: String,
+    /// Independent data and control admission bounds.
     pub budget: QueueBudget,
 }
 
 /// Local directory and execution owner; never advertised as SDK routing metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartitionPlacement {
+    /// Configured topic name.
     pub topic: String,
+    /// Zero-based topic partition number.
     pub partition: u32,
+    /// Local application owner ID.
     pub shard: u32,
+    /// Configured storage device name.
     pub device: String,
+    /// Exact broker-local journal directory.
     pub directory: PathBuf,
 }
 
@@ -124,7 +146,9 @@ impl ValidatedDeployment {
         })
     }
 
-    pub(crate) fn partition_placements(&self, name: &str) -> Vec<PartitionPlacement> {
+    /// Deterministic partition placement for a configured broker.
+    /// The caller must select a name present in `deployment().brokers`.
+    pub fn partition_placements(&self, name: &str) -> Vec<PartitionPlacement> {
         let broker = &self.deployment.brokers[name];
         let shards = &self.shards[name];
         let overrides: BTreeMap<_, _> = broker

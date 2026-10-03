@@ -12,6 +12,7 @@ use ozzy_core::state::{
 use ozzy_proto::CheckpointId;
 
 impl Journal {
+    /// Encode canonical application state and build a bounded checkpoint from its exact source.
     pub async fn build_canonical_checkpoint(
         &mut self,
         id: CheckpointId,
@@ -34,6 +35,7 @@ impl Journal {
             .await?)
     }
 
+    /// Validate and publish a canonical checkpoint as the selected recovery source.
     pub async fn install_canonical_checkpoint(
         &mut self,
         id: CheckpointId,
@@ -48,6 +50,7 @@ impl Journal {
         Ok(self.select_checkpoint(checkpoint).await?)
     }
 
+    /// Load and validate the exact canonical checkpoint selected by the manifest.
     pub async fn selected_canonical_checkpoint(
         &self,
         state_limits: StateLimits,

@@ -8,8 +8,7 @@ mod subscription;
 pub use encoder::RecordsEncoder;
 
 pub use subscription::{
-    Credit, Target, decode_credit, decode_unsubscribe, decode_unsubscribed, encode_credit,
-    encode_unsubscribe, encode_unsubscribed,
+    Target, decode_unsubscribe, decode_unsubscribed, encode_unsubscribe, encode_unsubscribed,
 };
 
 use crate::data::{
@@ -155,7 +154,7 @@ pub fn route_subscription(
     let response = match packet.envelope.opcode {
         Opcode::Subscribed | Opcode::Unsubscribed => true,
         Opcode::Subscribe | Opcode::Records | Opcode::Unsubscribe => false,
-        Opcode::Ack | Opcode::Credit => packet.envelope.response,
+        Opcode::Ack => packet.envelope.response,
         _ => return Err(CodecError::Command),
     };
     command(packet.envelope, packet.envelope.opcode, response)?;

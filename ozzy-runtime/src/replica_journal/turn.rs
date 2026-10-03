@@ -1,5 +1,5 @@
-//! One worker command per actor turn. Each part keeps its own contract; the
-//! turn only removes the round trips between them.
+//! One worker command per actor turn when validation stays in memory. A
+//! validation that reads storage follows admission in a separate command.
 
 use ozzy_replication::WriteTicket;
 use ozzy_replication::driver::ValidationTicket;
@@ -16,7 +16,9 @@ use super::{
 ///
 /// Capture the proposal ticket after the core admitted `admit`, so it names
 /// the accepted end the worker holds when validation runs. Application runs
-/// last, so it cannot move the image under that validation.
+/// last, so it cannot move the image under that validation. A slow validation
+/// is returned to the actor for a later command without holding the admitted
+/// write's completion.
 #[derive(Debug, Default)]
 pub struct Turn {
     /// Install and write queueing of operations the core already admitted.
@@ -51,9 +53,11 @@ pub struct TurnResult {
     pub validated: Option<Result<ValidatedAppend, JournalError>>,
     /// Applied ticket, when the turn carried one.
     pub applied: Option<ValidationTicket>,
+    /// Slow validation returned for a following command after admission.
+    pub deferred: Option<Box<Turn>>,
 }
 
-impl<E> ReplicaJournal<E> {
+impl ReplicaJournal {
     /// Submit one actor turn. Backpressure returns every part unchanged.
     pub fn turn(
         &mut self,

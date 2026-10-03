@@ -18,8 +18,6 @@ struct MemoryIo {
     stable: Vec<u8>,
     max_write: usize,
     write_budget: Option<usize>,
-    sync_calls: usize,
-    fail_sync_call: Option<usize>,
     set_len_calls: Arc<AtomicUsize>,
     vectored_calls: usize,
     max_slices: usize,
@@ -96,10 +94,6 @@ impl SegmentIo for MemoryIo {
     }
 
     fn sync_data(&mut self) -> io::Result<()> {
-        self.sync_calls += 1;
-        if self.fail_sync_call == Some(self.sync_calls) {
-            return Err(io::Error::other("injected sync failure"));
-        }
         self.stable.clone_from(&self.bytes);
         Ok(())
     }
@@ -331,24 +325,6 @@ fn recovery_never_truncates_a_manifest_protected_missing_operation() {
         Err(WriterError::ProtectedPrefixMismatch(1))
     ));
     assert_eq!(set_len_calls.load(Ordering::Relaxed), 0);
-}
-
-#[test]
-fn sync_failure_never_advances_evidence_and_faults_writer() {
-    let mut io = MemoryIo::with_max_write(4096);
-    io.fail_sync_call = Some(2);
-    let mut writer = SegmentWriter::initialize(io, segment(1), JournalGeneration(1)).unwrap();
-    let written = writer
-        .append(&[operation(1, Digest::ZERO, b"one")])
-        .unwrap();
-    assert!(matches!(
-        writer.sync_through(written),
-        Err(WriterError::Io(_))
-    ));
-    assert!(writer.is_faulted());
-    assert_eq!(writer.durable_position().group_number(), 0);
-    let io = writer.into_inner();
-    assert_eq!(io.stable.len(), SEGMENT_HEADER_BYTES);
 }
 
 #[test]

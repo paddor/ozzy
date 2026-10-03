@@ -1,16 +1,14 @@
 //! Shared broker frontend components. Routing owns no partition authority.
 //!
 //! A live link supplies the independently established peer/session binding.
-//! Ordinary OMQ receive feeds metadata routing; bounded destination grants and
-//! fanrings govern admission. Partition actors still validate complete commands.
+//! OMQ inproc lanes carry bounded shard commands and native data. Partition
+//! actors validate complete commands; transport pressure bounds admission.
 
 mod routing;
 pub use routing::{Binding, Kind, Placement, Routed, RoutingError, RoutingTable};
 
 mod dispatch;
-pub use dispatch::{
-    Dispatcher, DispatcherLimits, GrantSpec, GrantTarget, Rejected, Rejection, SetupError, Subject,
-};
+pub use dispatch::{DataPressure, Dispatcher, DispatcherLimits, Rejected, Rejection, SetupError};
 
 mod flow;
 mod replies;
@@ -21,15 +19,9 @@ pub use crate::peer_sessions::{Handled as Negotiated, LinkIds, Sessions as LinkS
 mod service;
 pub use service::{Access, Link, Links, ReceiveError, Service, ServiceError};
 
-mod demand;
-pub use demand::{GrantRequest, GrantRequests};
-
-mod intake;
-pub use intake::{Destination, IntakeError, IntakeMessage, ReceiveSize, ShardIntake};
-
 mod port;
 pub use port::{
-    InstallResult, Pending, Port, PortError, ProgressError, ReplyResult, RouteError, RouteResult,
+    Pending, Port, PortError, PortSetupError, ProgressError, ReplyResult, RouteError, RouteResult,
 };
 
 mod publication;
@@ -37,6 +29,12 @@ pub use publication::{PublicationError, PublicationResult};
 
 mod buffers;
 pub use buffers::{BufferError, ReceiveBuffers, ReceiveStorage};
+
+mod data_lane;
+mod inproc;
+pub use data_lane::{
+    DataInput, DataLaneError, DataReceiver, DataSendError, DataSender, data_channel,
+};
 
 mod watch;
 pub use watch::{RouteState, WatchError, WatchLimits, WatchNotice, WatchRegistry, WatchUpdates};

@@ -131,11 +131,6 @@ fn commit_progress_preserves_validation_but_application_changes_its_image() {
             node(1),
             Control::PrepareOk {
                 ack: backup.acknowledgment().unwrap(),
-                grant: Grant {
-                    revision: 1,
-                    record_limit: 8,
-                    byte_limit: 1024,
-                },
             },
             Duration::ZERO,
         )
@@ -187,11 +182,6 @@ fn validation_behind_an_apply_names_the_prefix_the_worker_will_have_applied() {
             node(1),
             Control::PrepareOk {
                 ack: backup.acknowledgment().unwrap(),
-                grant: Grant {
-                    revision: 1,
-                    record_limit: 8,
-                    byte_limit: 1024,
-                },
             },
             Duration::ZERO,
         )

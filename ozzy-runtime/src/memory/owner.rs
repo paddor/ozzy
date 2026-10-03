@@ -1,17 +1,13 @@
 use super::{Limits, Reservation};
-mod capacity;
 use crate::signal::StateSignal;
 use bytes::Bytes;
-use capacity::Reserved;
-pub(crate) use capacity::external::{Allowance, Charge};
-pub use capacity::{Capacity, Quota};
 use std::{
     cell::RefCell,
     fmt, io,
     ops::{Deref, DerefMut},
     rc::{Rc, Weak as LocalWeak},
     sync::{
-        Arc, Weak,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     },
     thread::{self, ThreadId},
@@ -31,7 +27,6 @@ pub(crate) struct Allocator {
     local: LocalWeak<RefCell<Local>>,
     thread: ThreadId,
     maximum: usize,
-    reserved: Option<Weak<Reserved>>,
 }
 
 #[derive(Debug)]
@@ -52,12 +47,8 @@ struct Return {
 #[derive(Debug)]
 struct Usage {
     _reservation: Reservation,
-    claimed_bytes: AtomicUsize,
-    claimed_buffers: AtomicUsize,
     bytes: AtomicUsize,
     buffers: AtomicUsize,
-    reserved_bytes: AtomicUsize,
-    reserved_buffers: AtomicUsize,
     changed: StateSignal,
 }
 
@@ -94,12 +85,8 @@ impl Owner {
                 sender,
                 usage: Arc::new(Usage {
                     _reservation: reservation,
-                    claimed_bytes: AtomicUsize::new(0),
-                    claimed_buffers: AtomicUsize::new(0),
                     bytes: AtomicUsize::new(0),
                     buffers: AtomicUsize::new(0),
-                    reserved_bytes: AtomicUsize::new(0),
-                    reserved_buffers: AtomicUsize::new(0),
                     changed: StateSignal::default(),
                 }),
             }),
@@ -112,7 +99,7 @@ impl Owner {
     /// Reuse or allocate a zeroed payload on this owner. Exhaustion never spills
     /// into an uncharged allocation. At most `limits.buffers` returns are drained.
     pub fn try_lease(&self, length: usize) -> io::Result<Buffer> {
-        self.0.borrow_mut().try_lease(length, usize::MAX, None)
+        self.0.borrow_mut().try_lease(length, usize::MAX)
     }
 
     pub(crate) fn allocator(&self) -> Allocator {
@@ -120,7 +107,6 @@ impl Owner {
             local: Rc::downgrade(&self.0),
             thread: thread::current().id(),
             maximum: usize::MAX,
-            reserved: None,
         }
     }
 
@@ -145,12 +131,6 @@ impl Owner {
         self.0.borrow().shared.usage.bytes.load(Ordering::Acquire)
     }
 
-    /// Physical buffers, foreign backing, and unused reservations all count.
-    /// Concurrent releases can make this two-field snapshot conservative.
-    pub fn claimed_capacity(&self) -> Quota {
-        self.0.borrow().shared.usage.claimed()
-    }
-
     /// Capture before checking allocation or intake capacity.
     pub fn generation(&self) -> u64 {
         self.0.borrow().shared.usage.changed.generation()
@@ -160,10 +140,6 @@ impl Owner {
     pub fn changed_after(&self, generation: u64) -> impl Future<Output = ()> + use<> {
         let usage = self.0.borrow().shared.usage.clone();
         async move { usage.changed.changed_after(generation).await }
-    }
-
-    pub(crate) fn same_owner(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.0, &other.0)
     }
 
     /// Drop cached and already-returned allocations on the owner thread. Live
@@ -177,12 +153,7 @@ impl Owner {
 }
 
 impl Local {
-    fn try_lease(
-        &mut self,
-        length: usize,
-        maximum: usize,
-        reserved: Option<&Arc<Reserved>>,
-    ) -> io::Result<Buffer> {
+    fn try_lease(&mut self, length: usize, maximum: usize) -> io::Result<Buffer> {
         let local = self;
         if length == 0 || length > local.limits.bytes || length > maximum {
             return Err(io::ErrorKind::InvalidInput.into());
@@ -192,15 +163,9 @@ impl Local {
             .cache
             .iter()
             .enumerate()
-            .filter(|(_, block)| {
-                (length..=maximum).contains(&block.capacity)
-                    && reserved.is_none_or(|grant| grant.fits(block.capacity))
-            })
+            .filter(|(_, block)| (length..=maximum).contains(&block.capacity))
             .min_by_key(|(_, block)| block.capacity)
             .map(|(index, _)| index);
-        let spent = reserved
-            .map(|grant| grant.spend(cached.map_or(length, |index| local.cache[index].capacity)))
-            .transpose()?;
         let mut block = if let Some(index) = cached {
             let block = local.cache.swap_remove(index);
             local.cache_bytes -= block.capacity;
@@ -219,9 +184,6 @@ impl Local {
         };
         block.bytes.resize(block.capacity, 0);
         block.bytes[..length].fill(0);
-        if let Some(spent) = spent {
-            spent.commit();
-        }
         Ok(Buffer {
             block: Some(block),
             length,
@@ -241,10 +203,9 @@ impl Local {
         }
     }
     fn can_allocate(&self, bytes: usize) -> bool {
-        self.shared
-            .usage
-            .claimed()
-            .fits(Quota { bytes, buffers: 1 }, self.limits)
+        bytes <= self.limits.bytes
+            && self.shared.usage.bytes.load(Ordering::Acquire) <= self.limits.bytes - bytes
+            && self.shared.usage.buffers.load(Ordering::Acquire) < self.limits.buffers
     }
 }
 
@@ -259,22 +220,7 @@ impl Allocator {
             return Err(io::Error::other("journal allocation left its owner thread"));
         }
         let local = self.local.upgrade().ok_or(io::ErrorKind::BrokenPipe)?;
-        let reserved = self
-            .reserved
-            .as_ref()
-            .map(|grant| grant.upgrade().ok_or(io::ErrorKind::BrokenPipe))
-            .transpose()?;
-        let mut buffer = local.borrow_mut().try_lease(
-            capacity,
-            // A byte allowance may back multiple bodies. An oversized cache
-            // entry must not consume the bytes reserved for their replacements.
-            self.maximum.min(if reserved.is_some() {
-                capacity
-            } else {
-                usize::MAX
-            }),
-            reserved.as_ref(),
-        )?;
+        let mut buffer = local.borrow_mut().try_lease(capacity, self.maximum)?;
         buffer.block.as_mut().expect("live buffer").bytes.clear();
         Ok(Arena(buffer))
     }
@@ -350,10 +296,6 @@ impl Drop for Arena {
 
 impl Block {
     fn new(usage: Arc<Usage>, capacity: usize) -> io::Result<Self> {
-        usage.claim(Quota {
-            bytes: capacity,
-            buffers: 1,
-        });
         usage.bytes.fetch_add(capacity, Ordering::AcqRel);
         usage.buffers.fetch_add(1, Ordering::AcqRel);
         let mut block = Self {
@@ -379,50 +321,7 @@ impl Drop for Block {
         drop(std::mem::take(&mut self.bytes));
         self.usage.bytes.fetch_sub(self.capacity, Ordering::AcqRel);
         self.usage.buffers.fetch_sub(1, Ordering::AcqRel);
-        self.usage.release(Quota {
-            bytes: self.capacity,
-            buffers: 1,
-        });
         self.usage.changed.notify_changed();
-    }
-}
-
-impl Usage {
-    fn claimed(&self) -> Quota {
-        Quota {
-            bytes: self.claimed_bytes.load(Ordering::Acquire),
-            buffers: self.claimed_buffers.load(Ordering::Acquire),
-        }
-    }
-
-    fn claim(&self, quota: Quota) {
-        // Only the allocation owner creates claims. Remote final drops can
-        // release either counter, but cannot create competing claims.
-        let bytes = self.claimed_bytes.fetch_add(quota.bytes, Ordering::AcqRel);
-        assert!(
-            bytes.checked_add(quota.bytes).is_some(),
-            "bounded memory bytes"
-        );
-        let buffers = self
-            .claimed_buffers
-            .fetch_add(quota.buffers, Ordering::AcqRel);
-        assert!(
-            buffers.checked_add(quota.buffers).is_some(),
-            "bounded memory buffers"
-        );
-    }
-
-    fn release(&self, quota: Quota) {
-        self.claimed_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |bytes| {
-                bytes.checked_sub(quota.bytes)
-            })
-            .expect("claimed memory bytes");
-        self.claimed_buffers
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |buffers| {
-                buffers.checked_sub(quota.buffers)
-            })
-            .expect("claimed memory buffers");
     }
 }
 

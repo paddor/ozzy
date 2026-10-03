@@ -1,6 +1,9 @@
 # ozzy
 
-Native writer and reader SDK for Ozzy brokers over OMQ.
+Producer SDK and consumer SDK for Ozzy brokers over OMQ. They share session
+code while retaining separate role state. `BrokerLinks` owns one data PEER and
+one control PEER connected to all configured brokers. Live consumers add one
+SUB per broker; partition count does not add PEER sockets.
 
 `SharedTopicWriter` opens a named topic through an existing
 `BrokerLinks` owner. Records take an optional key. Confirmation includes the
@@ -28,7 +31,9 @@ async fn write(links: &BrokerLinks, limits: DataLimits) -> Result<(), Box<dyn st
 ```
 
 See [runtime contracts](../doc/RUNTIME.md#sdk-protocol-batching) for admission,
-resource bounds, and cancellation.
+resource bounds, and cancellation. The default payload target is 64 KiB with
+one outstanding APPEND. Collection is bounded by bytes, negotiated limits, and
+a hard 2,048-record ceiling; sparse sends have no artificial collection wait.
 
 `TopicReader` opens every partition of a named topic and returns
 individual records. Its checkpoint names the next received offset per partition.

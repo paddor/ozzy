@@ -134,7 +134,7 @@ async fn scenario(fixture: Fixture) {
     let broker_id = ozzy_proto::NodeId::from_bytes(*checked.identity.brokers["laptop"].as_bytes());
     let mut broker = fixture.start(0);
     let mut client = broker.observe("open SDK", Client::open(&checked)).await;
-    assert_eq!(client.links.socket_count(), 2);
+    assert_eq!(client.links.socket_count(), 3);
     let pending = client.queue(0).await;
     broker
         .observe("confirm before crash", client.confirm(pending))
@@ -163,7 +163,7 @@ async fn scenario(fixture: Fixture) {
         .observe("confirm queued retry after crash", client.confirm(pending))
         .await;
     assert_ne!(client.links.session(broker_id), Some(old_session));
-    assert_eq!(client.links.socket_count(), 2);
+    assert_eq!(client.links.socket_count(), 3);
     broker
         .observe(
             "repair reader after process death",

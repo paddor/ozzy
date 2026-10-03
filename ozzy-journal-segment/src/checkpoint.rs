@@ -14,7 +14,9 @@ use thiserror::Error;
 use crate::retention::CheckpointLease;
 use crate::{Digest, LogPosition};
 
+/// Exact encoded checkpoint manifest header length.
 pub const CHECKPOINT_HEADER_BYTES: usize = 4096;
+/// Exact encoded checkpoint chunk descriptor length.
 pub const CHECKPOINT_CHUNK_ENTRY_BYTES: usize = 64;
 
 const CHECKPOINT_MAGIC: &[u8; 8] = b"OZYCHK01";
@@ -31,9 +33,13 @@ static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Bounds for checkpoint metadata, chunks, and optional materialization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CheckpointLimits {
+    /// Maximum encoded manifest bytes, including its header.
     pub max_manifest_bytes: usize,
+    /// Maximum state chunks described by one checkpoint.
     pub max_chunks: usize,
+    /// Maximum bytes in one checkpoint chunk.
     pub max_chunk_bytes: usize,
+    /// Maximum total checkpoint state bytes.
     pub max_state_bytes: u64,
 }
 
@@ -51,12 +57,19 @@ impl Default for CheckpointLimits {
 /// Caller-frozen identity and lineage for one checkpoint build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CheckpointSpec {
+    /// Persistent partition replication-group identity.
     pub group_id: GroupId,
+    /// Persistent local journal-store identity.
     pub store_id: StoreId,
+    /// Exact checkpoint artifact identity.
     pub checkpoint_id: CheckpointId,
+    /// Canonical operation number and digest represented by this checkpoint.
     pub position: LogPosition,
+    /// Selected membership/configuration epoch.
     pub configuration_epoch: u64,
+    /// Exact manifest generation captured for checkpoint construction.
     pub source_manifest_generation: u64,
+    /// Integrity digest of the exact captured source manifest.
     pub source_manifest_digest: Digest,
     /// Digest identifying the canonical state schema, not the state bytes.
     pub state_schema_digest: Digest,
@@ -88,6 +101,7 @@ impl CheckpointPlan {
         }
     }
 
+    /// Exact checkpoint construction inputs.
     pub const fn spec(&self) -> CheckpointSpec {
         self.spec
     }
@@ -113,26 +127,42 @@ impl CheckpointPlan {
 /// One exact state chunk named by ordinal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CheckpointChunk {
+    /// Zero-based chunk position in canonical state order.
     pub ordinal: u32,
+    /// First byte offset within the logical checkpoint state.
     pub logical_offset: u64,
+    /// Physical byte count of this chunk or unvalidated tail.
     pub bytes: u64,
+    /// Integrity digest bound to this exact object or canonical prefix.
     pub digest: Digest,
 }
 
 /// Complete immutable checkpoint manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointManifest {
+    /// Persistent partition replication-group identity.
     pub group_id: GroupId,
+    /// Persistent local journal-store identity.
     pub store_id: StoreId,
+    /// Exact checkpoint artifact identity.
     pub checkpoint_id: CheckpointId,
+    /// Canonical operation number and digest represented by this checkpoint.
     pub position: LogPosition,
+    /// Selected membership/configuration epoch.
     pub configuration_epoch: u64,
+    /// Exact manifest generation captured for checkpoint construction.
     pub source_manifest_generation: u64,
+    /// Integrity digest of the exact captured source manifest.
     pub source_manifest_digest: Digest,
+    /// Exact application-state schema binding.
     pub state_schema_digest: Digest,
+    /// Combined logical state bytes across all chunks.
     pub state_bytes: u64,
+    /// Maximum logical bytes per checkpoint chunk.
     pub chunk_bytes: u32,
+    /// Integrity digest over the complete logical state.
     pub state_digest: Digest,
+    /// Chunk descriptors in logical state order.
     pub chunks: Vec<CheckpointChunk>,
 }
 
@@ -156,14 +186,17 @@ impl PartialEq for CheckpointImage {
 impl Eq for CheckpointImage {}
 
 impl CheckpointImage {
+    /// Filesystem directory bound to this owner.
     pub fn root(&self) -> &Path {
         &self.root
     }
 
+    /// Exact validated metadata manifest held by this object.
     pub const fn manifest(&self) -> &CheckpointManifest {
         &self.manifest
     }
 
+    /// Integrity digest binding the encoded checkpoint manifest.
     pub const fn manifest_digest(&self) -> Digest {
         self.manifest_digest
     }
@@ -325,6 +358,7 @@ pub(crate) fn read_checkpoint_manifest(
     Ok((manifest, digest))
 }
 
+/// Validate and encode bounded checkpoint metadata with its integrity fields.
 pub fn encode_checkpoint_manifest(
     manifest: &CheckpointManifest,
     limits: CheckpointLimits,
@@ -378,6 +412,7 @@ pub fn encode_checkpoint_manifest(
     Ok(output)
 }
 
+/// Validate checkpoint framing, fields, and bounds without reading its chunks.
 pub fn decode_checkpoint_manifest(
     input: &[u8],
     limits: CheckpointLimits,
@@ -449,6 +484,7 @@ pub fn decode_checkpoint_manifest(
     Ok(manifest)
 }
 
+/// Validate encoded checkpoint metadata and compute its integrity digest.
 pub fn checkpoint_manifest_digest(
     input: &[u8],
     limits: CheckpointLimits,
@@ -457,6 +493,7 @@ pub fn checkpoint_manifest_digest(
     Ok(digest_at(input, CHECKPOINT_DIGEST_START))
 }
 
+/// Canonical hexadecimal directory name for an exact checkpoint identity.
 pub fn checkpoint_name(checkpoint_id: CheckpointId) -> String {
     id_name(checkpoint_id.as_bytes())
 }
@@ -926,53 +963,79 @@ fn read_u64(input: &[u8], offset: usize) -> u64 {
 #[derive(Debug, Error)]
 pub enum CheckpointError {
     #[error(transparent)]
+    /// A physical file operation failed.
     Io(#[from] io::Error),
     #[error("wrong checkpoint manifest magic")]
+    /// The named object has an incorrect format magic.
     WrongMagic,
     #[error("unsupported checkpoint version {0}")]
+    /// The encoded format version is unsupported.
     UnsupportedVersion(u16),
     #[error("unsupported checkpoint flags, widths, or reserved fields")]
+    /// Unsupported checkpoint flags, widths, or reserved fields.
     UnsupportedFields,
     #[error("checkpoint metadata is truncated")]
+    /// Input bytes end before a complete encoded object.
     Truncated,
     #[error("checkpoint lengths do not agree")]
+    /// Checkpoint lengths do not agree.
     LengthMismatch,
     #[error("{0} identity is zero")]
+    /// A required persistent identity is zero.
     ZeroIdentity(&'static str),
     #[error("checkpoint operation position is invalid")]
+    /// Checkpoint operation position is invalid.
     InvalidPosition,
     #[error("checkpoint specification is invalid")]
+    /// Checkpoint specification is invalid.
     InvalidSpec,
     #[error("checkpoint state is empty")]
+    /// Checkpoint state is empty.
     EmptyState,
     #[error("checkpoint chunk size is invalid")]
+    /// Checkpoint chunk size is invalid.
     InvalidChunkBytes,
     #[error("checkpoint resource limits are invalid")]
+    /// Checkpoint resource limits are invalid.
     InvalidLimits,
     #[error("checkpoint chunk sequence or fields are invalid")]
+    /// Checkpoint chunk sequence or fields are invalid.
     InvalidChunk,
     #[error("{0} digest mismatch")]
+    /// The named object does not match its expected integrity digest.
     DigestMismatch(&'static str),
     #[error("checkpoint belongs to another group or store")]
+    /// Checkpoint belongs to another group or store.
     IdentityMismatch,
     #[error("checkpoint is missing a required chunk")]
+    /// Checkpoint is missing a required chunk.
     MissingChunk,
     #[error("checkpoint directory contains an unexpected file")]
+    /// Checkpoint directory contains an unexpected file.
     UnexpectedFile,
     #[error("checkpoint staging namespace is exhausted")]
+    /// Checkpoint staging namespace is exhausted.
     StagingConflict,
     #[error("immutable checkpoint path contains different content")]
+    /// Immutable checkpoint path contains different content.
     ImmutableConflict,
     #[error("{0} is not a regular file")]
+    /// The named artifact is not a regular file.
     NotRegularFile(&'static str),
     #[error("{0} is not a directory")]
+    /// The named artifact is not a directory.
     NotDirectory(&'static str),
     #[error("checkpoint integer or length arithmetic overflow")]
+    /// Integer or byte-count arithmetic overflows the supported range.
     LengthOverflow,
     #[error("{kind} limit exceeded: {actual} > {limit}")]
+    /// The named resource exceeds its configured bound.
     LimitExceeded {
+        /// Resource bound that rejected the operation.
         kind: &'static str,
+        /// Observed size, count, or fenced field value.
         actual: u64,
+        /// Configured maximum for the reported resource.
         limit: u64,
     },
 }

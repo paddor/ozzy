@@ -24,6 +24,9 @@ struct Descriptor {
     body: Range<usize>,
     /// Body digest already verified against these bytes by wire decoding.
     digest: Option<Digest>,
+    /// Live PREPARE from the authenticated primary. Its APPEND payload was
+    /// validated before canonical construction on that primary.
+    primary_payload_validated: bool,
     /// Application-thread proof for one producer wire APPEND body.
     proof: Option<ValidatedWireAppend>,
 }
@@ -63,16 +66,20 @@ impl RetainedAppend {
     pub(super) fn proofs(&self) -> impl ExactSizeIterator<Item = Option<ValidatedWireAppend>> {
         self.entries.iter().map(|(entry, _)| entry.proof)
     }
-    /// Whether every operation in `range` carries a proof, and whether all of
-    /// their payloads are producer-prepared.
+    /// Whether every operation in `range` has a validated payload, and whether
+    /// all of their payloads are producer-prepared.
     pub(super) fn validated_payloads_prepared(&self, range: Range<usize>) -> Option<bool> {
         let mut prepared = true;
         for (entry, _) in self.entries.get(range)? {
-            prepared &= entry.proof?.payload_is_prepared();
+            prepared &= match entry.proof {
+                Some(proof) => proof.payload_is_prepared(),
+                None if entry.primary_payload_validated => false,
+                None => return None,
+            };
         }
         Some(prepared)
     }
-    /// Whether the journal owner decoded every body with its own limits.
+    /// Whether every immutable body passed the journal owner's limits.
     pub(super) const fn validated(&self) -> bool {
         self.validated
     }
@@ -190,13 +197,21 @@ impl AppendBuffer {
         self.bodies.freeze()
     }
 
-    pub(super) fn retained_bytes(&self) -> usize {
+    pub(crate) fn retained_bytes(&self) -> usize {
         self.bodies.retained_bytes()
     }
 
     /// Producer proofs in operation order; `None` for operations without one.
     pub(super) fn proofs(&self) -> impl ExactSizeIterator<Item = Option<ValidatedWireAppend>> {
         self.entries.iter().map(|entry| entry.proof)
+    }
+
+    /// Only live primary PREPARE bodies may reuse the primary's LZ4 check.
+    /// Ordinary canonical pushes and recovered history still validate locally.
+    pub(super) fn primary_payloads_validated(&self) -> bool {
+        self.entries
+            .iter()
+            .all(|entry| entry.primary_payload_validated)
     }
 
     /// Record that every body was just decoded completely with the journal's
@@ -244,22 +259,23 @@ impl AppendBuffer {
     /// Copy an encoded body and envelope within the declared body/count bounds.
     /// Syntax, hash-chain, and application validation happen on the worker.
     pub fn push(&mut self, operation: CanonicalOperation<'_>) -> Result<(), JournalError> {
-        self.push_entry(operation, None)
+        self.push_entry(operation, None, false)
     }
 
-    /// Like `push`, keeping the body digest that wire decoding verified for
-    /// these exact bytes, so the worker does not hash the body again.
-    pub(crate) fn push_verified(
+    /// Called only after the live PREPARE sender was checked against the current
+    /// primary. Keep the wire-verified digest and primary payload provenance.
+    pub(crate) fn push_primary_verified(
         &mut self,
         operation: ozzy_replication::wire::VerifiedOperation<'_>,
     ) -> Result<(), JournalError> {
-        self.push_entry(operation.canonical(), Some(operation.body_digest()))
+        self.push_entry(operation.canonical(), Some(operation.body_digest()), true)
     }
 
     fn push_entry(
         &mut self,
         operation: CanonicalOperation<'_>,
         digest: Option<Digest>,
+        primary_payload_validated: bool,
     ) -> Result<(), JournalError> {
         self.validated = false;
         if self.entries.len() == self.limits.max_operations
@@ -276,6 +292,7 @@ impl AppendBuffer {
             },
             body: start..self.bodies.len(),
             digest,
+            primary_payload_validated,
             proof: None,
         });
         Ok(())
@@ -295,13 +312,6 @@ impl AppendBuffer {
         self.bodies.clear();
         self.prepared.clear();
         self.body_digests.clear();
-    }
-
-    pub(crate) fn bind_capacity(
-        &mut self,
-        capacity: &crate::memory::Capacity,
-    ) -> Result<(), JournalError> {
-        self.bind_allocator(&capacity.allocator())
     }
 
     pub(crate) fn allocator(&self) -> Option<crate::memory::Allocator> {
@@ -551,6 +561,7 @@ impl AppendBuffer {
             },
             body: range,
             digest: None,
+            primary_payload_validated: false,
             proof: None,
         });
         Ok(())
@@ -612,6 +623,7 @@ impl AppendBuffer {
             },
             body: range,
             digest: None,
+            primary_payload_validated: false,
             proof: Some(proof),
         });
         self.request_kind = RequestKind::Producer;

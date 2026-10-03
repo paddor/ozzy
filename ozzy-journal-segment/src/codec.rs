@@ -24,17 +24,26 @@ pub(crate) use shared::prepare_shared_group_bodies;
 #[cfg(test)]
 mod tests;
 
+/// Exact encoded physical segment header length.
 pub const SEGMENT_HEADER_BYTES: usize = 4 * 1024;
+/// Exact encoded canonical operation entry header length.
 pub const ENTRY_HEADER_BYTES: usize = 192;
+/// Exact encoded physical write-group seal length.
 pub const GROUP_SEAL_BYTES: usize = 96;
+/// Required byte alignment of physical write groups.
 pub const WRITE_GROUP_ALIGNMENT: usize = 4 * 1024;
 
 /// Body representation selected by one storage writer. Deferred writes collect
 /// operation bodies into one shared block; synchronous writes encode separately.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyEncoding {
+    /// Store canonical operation bodies without physical compression.
     Raw,
-    Lz4 { min_savings_bytes: usize },
+    /// Use physical LZ4 only when its encoded representation meets the savings bound.
+    Lz4 {
+        #[doc = "Minimum encoded byte savings required before physical compression is used."]
+        min_savings_bytes: usize,
+    },
 }
 
 impl BodyEncoding {
@@ -103,10 +112,12 @@ impl SegmentHeader {
         })
     }
 
+    /// Persistent replication-group identity.
     pub const fn group_id(&self) -> GroupId {
         self.group_id
     }
 
+    /// Physical segment identity.
     pub const fn segment_id(&self) -> u64 {
         self.segment_id
     }
@@ -121,6 +132,7 @@ impl SegmentHeader {
         self
     }
 
+    /// Previous physical segment ID, or none at genesis.
     pub const fn predecessor_segment_id(&self) -> Option<u64> {
         self.predecessor_segment_id
     }
@@ -131,6 +143,7 @@ impl SegmentHeader {
         self.predecessor_digest
     }
 
+    /// Configured physical segment capacity in bytes.
     pub const fn capacity(&self) -> u64 {
         self.capacity
     }
@@ -148,11 +161,17 @@ pub(crate) fn validate_segment_capacity(capacity: u64) -> Result<(), CodecError>
 /// Bounds enforced before accepting declared entry lengths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeLimits {
+    /// Maximum physical write groups decoded in one segment.
     pub max_groups: usize,
+    /// Maximum canonical operation entries decoded in one segment.
     pub max_entries: usize,
+    /// Maximum encoded bytes per physical operation entry.
     pub max_entry_bytes: usize,
+    /// Maximum decoded canonical bytes per operation body.
     pub max_decoded_body_bytes: usize,
+    /// Maximum combined decoded canonical bytes per physical group.
     pub max_group_decoded_body_bytes: usize,
+    /// Maximum combined decoded canonical bytes per segment.
     pub max_segment_decoded_body_bytes: usize,
 }
 
@@ -336,38 +355,47 @@ impl PreparedGroupBodies {
 }
 
 impl EncodedGroup {
+    /// Borrow the exact encoded physical representation.
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
 
+    /// Take ownership of the exact encoded physical representation.
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
     }
 
+    /// Combined canonical body bytes after physical decoding.
     pub const fn decoded_body_bytes(&self) -> usize {
         self.decoded_body_bytes
     }
 
+    /// Integrity digest of this exact encoded or selected object.
     pub const fn digest(&self) -> Digest {
         self.digest
     }
 
+    /// Consecutive physical write-group number.
     pub const fn group_number(&self) -> u64 {
         self.group_number
     }
 
+    /// First physical byte offset of this write group.
     pub const fn start_offset(&self) -> u64 {
         self.start_offset
     }
 
+    /// Exclusive physical byte offset after this write group.
     pub const fn end_offset(&self) -> u64 {
         self.end_offset
     }
 
+    /// Number of canonical operation entries in this physical group.
     pub const fn entry_count(&self) -> u64 {
         self.entry_count
     }
 
+    /// Next canonical operation number and predecessor digest.
     pub const fn next_chain(&self) -> ChainPosition {
         self.next_chain
     }
@@ -380,31 +408,45 @@ pub struct DecodedOperation<'a> {
     pub entry_offset: u64,
     /// Complete aligned extent length, excluding physical-group padding/seal.
     pub entry_bytes: u64,
+    /// Persistent partition replication-group identity.
     pub group_id: GroupId,
+    /// Selected membership/configuration epoch.
     pub configuration_epoch: u64,
+    /// Original canonical admission view, preserved during repair.
     pub original_view: u64,
+    /// Partition-local canonical operation number.
     pub op_number: u64,
+    /// Canonical chain digest immediately before this operation.
     pub previous_digest: Digest,
+    /// Integrity digest bound to this exact object or canonical prefix.
     pub digest: Digest,
     /// Body digest checked during decoding. Mutating `body` invalidates it.
     pub body_digest: Digest,
+    /// Canonical operation discriminator.
     pub kind: OperationKind,
+    /// Canonical body backing, borrowed or owned after physical decoding.
     pub body: Cow<'a, [u8]>,
 }
 
 /// One complete, physically and logically validated group.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedGroup<'a> {
+    /// Consecutive physical write-group number.
     pub group_number: u64,
+    /// First physical byte offset of this group.
     pub start_offset: u64,
+    /// Exclusive physical byte offset after this group.
     pub end_offset: u64,
     /// Structural digest derived from the validated logical operation digests.
     pub digest: Digest,
+    /// Validated canonical operation entries in group order.
     pub operations: Vec<DecodedOperation<'a>>,
+    /// Next canonical operation number and predecessor digest.
     pub next_chain: ChainPosition,
 }
 
 impl DecodedGroup<'_> {
+    /// Physical bytes occupied by the validated complete group prefix.
     pub fn consumed_bytes(&self) -> usize {
         usize::try_from(self.end_offset - self.start_offset)
             .expect("validated physical group length fits usize")
@@ -414,13 +456,21 @@ impl DecodedGroup<'_> {
 /// Complete groups and the first unusable byte found during segment recovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentScan<'a> {
+    /// Validated physical segment or canonical operation header.
     pub header: SegmentHeader,
+    /// Integrity digest bound to this exact object or canonical prefix.
     pub digest: Digest,
+    /// Validated complete physical groups in segment order.
     pub groups: Vec<DecodedGroup<'a>>,
+    /// Combined canonical body bytes after physical decoding.
     pub decoded_body_bytes: usize,
+    /// Physical bytes covered by the exact validated segment prefix.
     pub valid_bytes: u64,
+    /// Next consecutive physical write-group number.
     pub next_group_number: u64,
+    /// Next canonical operation number and predecessor digest.
     pub next_chain: ChainPosition,
+    /// Classification of bytes after the validated physical prefix.
     pub tail: TailState,
 }
 
@@ -430,86 +480,144 @@ pub enum TailState {
     /// File ends exactly at a complete group boundary.
     Clean,
     /// Preallocated or otherwise unused zero bytes follow the valid prefix.
-    ZeroFilled { bytes: usize },
+    ZeroFilled {
+        #[doc = "Physical bytes in the unvalidated segment tail."]
+        bytes: usize,
+    },
     /// A sequential append ended before its complete seal was present.
-    Truncated { bytes: usize, cause: CodecError },
+    Truncated {
+        #[doc = "Physical bytes in the unvalidated segment tail."]
+        bytes: usize,
+        #[doc = "Physical format or integrity error classifying this tail."]
+        cause: CodecError,
+    },
     /// Only from recovery of an active segment: a group after the valid prefix
     /// failed to decode. `bytes` runs to the end of the input.
-    Damaged { bytes: usize, cause: CodecError },
+    Damaged {
+        #[doc = "Physical bytes in the unvalidated segment tail."]
+        bytes: usize,
+        #[doc = "Physical format or integrity error classifying this tail."]
+        cause: CodecError,
+    },
 }
 
 /// Physical format validation failure.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CodecError {
     #[error("segment ID zero is reserved")]
+    /// Segment ID zero is reserved.
     InvalidSegmentId,
     #[error("invalid predecessor segment identity")]
+    /// Invalid predecessor segment identity.
     InvalidPredecessor,
     #[error("invalid aligned segment capacity {0}")]
+    /// Invalid aligned segment capacity.
     InvalidSegmentCapacity(u64),
     #[error("truncated {object}: need {needed} bytes, have {available}")]
+    /// Input bytes end before a complete encoded object.
     Truncated {
+        /// Named physical or encoded object that failed validation.
         object: &'static str,
+        /// Required bytes for a complete encoded field.
         needed: usize,
+        /// Available bytes, capacity, or canonical prefix at failure.
         available: usize,
     },
     #[error("wrong {0} magic")]
+    /// The named object has an incorrect format magic.
     WrongMagic(&'static str),
     #[error("unsupported disk format version {0}")]
+    /// The encoded format version is unsupported.
     UnsupportedVersion(u16),
     #[error("unsupported operation kind {0}")]
+    /// The canonical operation discriminator is unsupported.
     UnsupportedOperationKind(u16),
     #[error("unsupported entry codec {0}")]
+    /// The physical body codec is unsupported.
     UnsupportedCodec(u16),
     #[error("{0} body compression failed")]
+    /// Canonical body compression failed.
     CompressionFailed(&'static str),
     #[error("{0} compression scratch allocation failed")]
+    /// Bounded compression scratch storage could not grow.
     CompressionScratchAllocation(&'static str),
     #[error("{0} body decompression failed")]
+    /// The compressed body is malformed or has the wrong decoded size.
     DecompressionFailed(&'static str),
     #[error("unsupported nonzero flags in {0}")]
+    /// A field contains unsupported nonzero flags.
     UnsupportedFlags(&'static str),
     #[error("nonzero reserved bytes in {0}")]
+    /// Reserved bytes are nonzero.
     NonZeroReserved(&'static str),
     #[error("{0} digest mismatch")]
+    /// The named object does not match its expected integrity digest.
     DigestMismatch(&'static str),
     #[error("integer or length arithmetic overflow")]
+    /// Integer or byte-count arithmetic overflows the supported range.
     LengthOverflow,
     #[error("physical group must contain at least one operation")]
+    /// Physical group must contain at least one operation.
     EmptyGroup,
     #[error("canonical body digest count does not match operation count")]
+    /// Canonical body digest count does not match operation count.
     BodyDigestCountMismatch,
     #[error("prepared bodies do not match canonical operations")]
+    /// Prepared bodies do not match canonical operations.
     PreparedBodyMismatch,
     #[error("physical group number zero is reserved")]
+    /// Physical group number zero is reserved.
     InvalidGroupNumber,
     #[error("physical group offset {0} is not valid or aligned")]
+    /// Physical group offset is not valid or aligned.
     InvalidGroupOffset(u64),
     #[error("operation entry offset {0} is not valid or aligned")]
+    /// Operation entry offset is not valid or aligned.
     InvalidEntryOffset(u64),
     #[error("operation belongs to another group")]
+    /// Operation belongs to another group.
     WrongGroup,
     #[error("operation chain expected op {expected_op}")]
-    ChainMismatch { expected_op: u64 },
+    /// Canonical operation numbers or predecessor digests are not consecutive.
+    ChainMismatch {
+        #[doc = "Next required canonical operation number."]
+        expected_op: u64,
+    },
     #[error("operation number space exhausted")]
+    /// Operation number space exhausted.
     OperationNumberExhausted,
     #[error("entry has invalid length fields")]
+    /// Entry has invalid length fields.
     InvalidEntryLength,
     #[error("{kind} limit exceeded: {actual} > {limit}")]
+    /// The named resource exceeds its configured bound.
     LimitExceeded {
+        /// Resource bound that rejected the operation.
         kind: &'static str,
+        /// Observed size, count, or fenced field value.
         actual: usize,
+        /// Configured maximum for the reported resource.
         limit: usize,
     },
     #[error("physical group exceeds segment capacity")]
+    /// Physical group exceeds segment capacity.
     GroupExceedsSegment,
     #[error("segment decoded body bytes exceed limit: {actual} > {limit}")]
-    SegmentDecodedBodyLimit { actual: usize, limit: usize },
+    /// Segment decoded body bytes exceed limit.
+    SegmentDecodedBodyLimit {
+        #[doc = "Observed size, count, or fenced field value."]
+        actual: usize,
+        #[doc = "Configured maximum for the reported resource."]
+        limit: usize,
+    },
     #[error("segment file length exceeds configured capacity")]
+    /// Segment file length exceeds configured capacity.
     SegmentExceedsCapacity,
     #[error("nonzero entry or physical-group padding")]
+    /// Nonzero entry or physical-group padding.
     NonZeroPadding,
     #[error("physical seal metadata does not match scanned group")]
+    /// Physical seal metadata does not match scanned group.
     SealMismatch,
 }
 
@@ -536,6 +644,7 @@ struct ParsedGroup {
     digest: Digest,
 }
 
+/// Encode the fixed-size physical segment header and integrity fields.
 pub fn encode_segment_header(header: &SegmentHeader) -> [u8; SEGMENT_HEADER_BYTES] {
     let mut output = [0_u8; SEGMENT_HEADER_BYTES];
     output[0..8].copy_from_slice(SEGMENT_MAGIC);
@@ -557,6 +666,7 @@ pub fn encode_segment_header(header: &SegmentHeader) -> [u8; SEGMENT_HEADER_BYTE
     output
 }
 
+/// Validate and decode the fixed-size physical segment header.
 pub fn decode_segment_header(input: &[u8]) -> Result<SegmentHeader, CodecError> {
     require_len(input, SEGMENT_HEADER_BYTES, "segment header")?;
     let input = &input[..SEGMENT_HEADER_BYTES];
@@ -593,6 +703,7 @@ pub fn decode_segment_header(input: &[u8]) -> Result<SegmentHeader, CodecError> 
     .map(|header| header.with_file_generation(read_u64(input, 120)))
 }
 
+/// Encode consecutive canonical operations as one aligned physical write group.
 pub fn encode_group(
     segment: &SegmentHeader,
     group_number: u64,
@@ -880,6 +991,7 @@ pub(crate) fn finalize_group_descriptors(
     })
 }
 
+/// Validate one complete physical group against exact segment and chain evidence.
 pub fn decode_group<'a>(
     segment: &SegmentHeader,
     group_number: u64,
@@ -925,7 +1037,7 @@ pub fn decode_group<'a>(
 ///
 /// Caller still needs a validated index/source binding. This verifies entry
 /// header, canonical body, logical digest, group identity, and physical bounds.
-pub fn decode_standalone_operation<'a>(
+fn decode_standalone_operation<'a>(
     segment: &SegmentHeader,
     entry_offset: u64,
     input: &'a [u8],
@@ -961,7 +1073,7 @@ pub fn decode_standalone_operation<'a>(
 
 /// Decode an exact indexed operation. Shared LZ4 extents also require the
 /// operation number, since several independent operations share the same bytes.
-pub fn decode_indexed_operation<'a>(
+pub(crate) fn decode_indexed_operation<'a>(
     segment: &SegmentHeader,
     entry_offset: u64,
     input: &'a [u8],

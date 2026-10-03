@@ -4,7 +4,7 @@ use super::*;
 use crate::replicated::TopicCheckpoint;
 
 #[tokio::test(flavor = "current_thread")]
-async fn retained_payloads_park_replay_without_blocking_another_reader() {
+async fn retained_payloads_pause_shared_data_without_blocking_control() {
     tokio::time::timeout(Duration::from_secs(10), pressure())
         .await
         .unwrap();
@@ -80,13 +80,24 @@ async fn pressure() {
         )
         .await
         .unwrap();
+    // Replay shares the broker data connection. Its paused source can hold a
+    // second subscription's data, while the control open above still completes.
+    {
+        let mut next = pin!(healthy.next());
+        for _ in 0..64 {
+            harness.pump(true);
+            assert!(futures::poll!(next.as_mut()).is_pending());
+            tokio::task::yield_now().await;
+        }
+    }
+    // Releasing backing resumes the exact source without a clock or wire grant.
+    drop(retained.pop());
     let record = harness.drive(healthy.next(), true).await.unwrap();
     assert_eq!(record.offset, Offset::new(7));
     assert_eq!(record.message_id, MessageId::from_bytes([57; 16]));
     drop(record);
     harness.drive(healthy.close(), true).await.unwrap();
-    // No clock advancement is required: releasing an alias wakes replay.
-    drop(retained.pop());
+    // The resumed connection retained the slow reader's original frame.
     let record = harness.drive(slow.next(), true).await.unwrap();
     assert_eq!(record.offset, Offset::new(7));
     assert_eq!(record.message_id, MessageId::from_bytes([57; 16]));

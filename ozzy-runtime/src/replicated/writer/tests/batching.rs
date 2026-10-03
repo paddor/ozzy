@@ -4,6 +4,83 @@ use futures::FutureExt;
 use tokio::time::Instant;
 
 #[tokio::test]
+async fn intake_keeps_lookahead_for_full_batches_behind_an_unconfirmed_append() {
+    let mut settings = config(3, 20);
+    settings.batch_target_bytes = 20;
+    settings.limits.max_record_bytes = 9;
+    settings.limits.max_records = 8;
+    settings.limits.max_parts = 8;
+    for parts in [
+        vec![Bytes::from_static(b"abcdefghi")],
+        vec![Bytes::from_static(b"abcd"), Bytes::from_static(b"efghi")],
+    ] {
+        let (mut writer, mut driver) =
+            Shared::channel_with_capacity(settings.clone(), settings.lane_records());
+        for id in 1..=3 {
+            assert!(
+                writer
+                    .send(RecordInput::multipart(
+                        MessageId::from_bytes([id; 16]),
+                        parts.clone(),
+                    ))
+                    .now_or_never()
+                    .expect("intake must admit one batch and its lookahead")
+                    .is_ok()
+            );
+        }
+        let mut batch = Batch::new();
+        assert!(batch.select(0, settings.limits, true, &mut driver).unwrap());
+        assert_eq!((batch.records.len(), batch.bytes), (2, 18));
+        assert_eq!(
+            batch.take_payload().unwrap().as_slice(),
+            b"abcdefghiabcdefghi"
+        );
+        assert!(batch.deadline.is_none());
+        driver.stage(2);
+        assert_eq!(driver.progress.confirmed(), 0);
+        assert!(!batch.select(2, settings.limits, true, &mut driver).unwrap());
+    }
+}
+
+#[tokio::test]
+async fn record_and_byte_caps_select_independently_without_collection_delay() {
+    const TARGET: usize = 4 * 1024 * 1024;
+    for size in [128, 1024, 8192] {
+        let mut settings = config(3, TARGET);
+        settings.limits.max_records = MAX_APPEND_RECORDS;
+        settings.limits.max_parts = MAX_APPEND_RECORDS;
+        settings.limits.max_record_bytes = size;
+        settings.limits.envelope.max_metadata_bytes = 64 * 1024;
+        let (mut writer, mut driver) =
+            Shared::channel_with_capacity(settings.clone(), settings.lane_records());
+        let count = MAX_APPEND_RECORDS.min(TARGET / size);
+        let body = vec![7; size];
+        for _ in 0..count {
+            writer
+                .send(RecordInput::copy_from_slice(MessageId::new(), &body))
+                .await
+                .unwrap();
+        }
+        let lookahead = writer
+            .send(RecordInput::copy_from_slice(MessageId::new(), &body))
+            .now_or_never();
+        assert_eq!(lookahead.is_none(), count == MAX_APPEND_RECORDS);
+        driver.settle();
+        let mut batch = Batch::new();
+        assert!(batch.select(0, settings.limits, true, &mut driver).unwrap());
+        assert_eq!((batch.records.len(), batch.bytes), (count, count * size));
+        assert_eq!(batch.take_payload().unwrap().len(), count * size);
+        assert!(batch.deadline.is_none());
+        driver.stage(count as u64);
+        assert_eq!(driver.progress.confirmed(), 0);
+        writer
+            .send(RecordInput::copy_from_slice(MessageId::new(), &body))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
 async fn one_k_group_cap_drains_without_waiting_for_confirmation() {
     const RECORDS: usize = 1024;
     let mut settings = config(3, RECORDS * 16);
@@ -39,6 +116,31 @@ async fn one_k_group_cap_drains_without_waiting_for_confirmation() {
 }
 
 #[tokio::test]
+async fn partial_batch_waits_for_an_unconfirmed_append_and_full_batch_pipelines() {
+    let mut settings = config(4, 64);
+    settings.batch_target_bytes = 4;
+    settings.limits.max_records = 4;
+    let (mut writer, mut shared) = channel(settings);
+    writer.send(input(1, b"ab")).await.unwrap();
+    let limits = shared.config.limits;
+    let mut batch = Batch::new();
+    shared.settle();
+    // An earlier APPEND is unconfirmed, so one ready record keeps collecting
+    // until its confirmation arrives. No timer is armed.
+    assert!(!batch.select(0, limits, true, &mut shared).unwrap());
+    assert!(batch.deadline.is_none());
+    // With nothing in flight the same record goes at once.
+    assert!(batch.select(0, limits, false, &mut shared).unwrap());
+    assert_eq!(batch.take_payload().unwrap().as_slice(), b"ab");
+    // A full batch pipelines behind the unconfirmed APPEND.
+    writer.send(input(2, b"cd")).await.unwrap();
+    writer.send(input(3, b"ef")).await.unwrap();
+    shared.settle();
+    assert!(batch.select(1, limits, true, &mut shared).unwrap());
+    assert_eq!(batch.take_payload().unwrap().as_slice(), b"cdef");
+}
+
+#[tokio::test]
 async fn renegotiated_record_ceiling_checks_every_record_in_a_request() {
     let mut settings = config(4, 64);
     settings.limits.max_records = 4;
@@ -49,11 +151,11 @@ async fn renegotiated_record_ceiling_checks_every_record_in_a_request() {
         max_record_bytes: 2,
         ..shared.config.limits
     };
-    let mut batch = Batch::new(4);
-    assert!(batch.select_ready(0, limits, 4, 64, &mut shared).unwrap());
+    let mut batch = Batch::new();
+    assert!(batch.select_ready(0, limits, &mut shared).unwrap());
     assert_eq!(batch.records.len(), 1);
     assert!(matches!(
-        batch.select_ready(1, limits, 4, 64, &mut shared),
+        batch.select_ready(1, limits, &mut shared),
         Err(Error::Configuration)
     ));
 }
@@ -74,11 +176,11 @@ async fn four_mib_target_sends_ready_records_and_oversized_singleton_whole() {
             .await
             .unwrap();
     }
-    let mut batch = Batch::new(8);
+    let mut batch = Batch::new();
     for (sequence, bytes) in [(0, 3 * MIB), (1, 2 * MIB), (2, 5 * MIB), (3, 1)] {
         assert!(
             batch
-                .select_ready(sequence, shared.config.limits, 8, 16 * MIB, &mut shared)
+                .select_ready(sequence, shared.config.limits, &mut shared)
                 .unwrap()
         );
         assert_eq!((batch.records.len(), batch.bytes), (1, bytes));
@@ -105,10 +207,10 @@ async fn transport_views_and_retries_cannot_reuse_live_packing_slots() {
     let pointer = first.as_slice().as_ptr();
     let view = first.as_bytes();
     let retry = packed(&mut shared, 0, 2);
-    let mut batch = Batch::new(2);
+    let mut batch = Batch::new();
     assert!(
         !batch
-            .select_ready(2, shared.config.limits, 2, 32, &mut shared)
+            .select_ready(2, shared.config.limits, &mut shared)
             .unwrap()
     );
     confirm(&mut shared, 4, 0).unwrap();
@@ -118,7 +220,7 @@ async fn transport_views_and_retries_cannot_reuse_live_packing_slots() {
     writer.send(input(8, b"xyz")).await.unwrap();
     assert!(
         !batch
-            .select_ready(4, shared.config.limits, 2, 32, &mut shared)
+            .select_ready(4, shared.config.limits, &mut shared)
             .unwrap()
     );
     assert_eq!(view.as_ref(), b"abcabc");
@@ -135,10 +237,17 @@ async fn transport_views_and_retries_cannot_reuse_live_packing_slots() {
 }
 
 fn packed(shared: &mut state::Driver, next: u64, count: usize) -> omq_tokio::message::Payload {
-    let mut batch = Batch::new(count);
+    let mut batch = Batch::new();
     assert!(
         batch
-            .select_ready(next, shared.config.limits, count, usize::MAX, shared)
+            .select_ready(
+                next,
+                DataLimits {
+                    max_records: count.min(shared.config.limits.max_records),
+                    ..shared.config.limits
+                },
+                shared
+            )
             .unwrap()
     );
     batch.take_payload().unwrap()
@@ -165,12 +274,12 @@ async fn broker_packing_slots_remain_bounded_across_session_refreshes() {
     for id in 5..7 {
         writer.send(input(id, b"xyz")).await.unwrap();
     }
-    let mut batch = Batch::new(2);
+    let mut batch = Batch::new();
     for route in [0, 1, 2, 0, 1, 2] {
         shared.batches.select_route(route, &settings, &work);
         assert!(
             !batch
-                .select_ready(2, shared.config.limits, 2, 32, &mut shared)
+                .select_ready(2, shared.config.limits, &mut shared)
                 .unwrap()
         );
         assert!(batch.waiting_for_payload);
@@ -223,9 +332,9 @@ async fn zero_linger_sends_sparse_records_and_caps_whole_records_by_every_limit(
     writer.send(input(4, b"def")).await.unwrap();
     assert!(shared.record(0).unwrap().linger_deadline.is_none());
     assert!(shared.record(1).unwrap().linger_deadline.is_none());
-    let mut batch = Batch::new(8);
+    let mut batch = Batch::new();
     let limits = shared.config.limits;
-    assert!(batch.select_ready(0, limits, 8, 32, &mut shared).unwrap());
+    assert!(batch.select_ready(0, limits, &mut shared).unwrap());
     assert_eq!((batch.records.len(), batch.bytes), (2, 6));
     assert!(batch.deadline.is_none());
     for bounded in [
@@ -252,12 +361,10 @@ async fn zero_linger_sends_sparse_records_and_caps_whole_records_by_every_limit(
             ..limits
         },
     ] {
-        assert!(batch.select_ready(0, bounded, 8, 32, &mut shared).unwrap());
+        assert!(batch.select_ready(0, bounded, &mut shared).unwrap());
         assert_eq!(batch.records.len(), 1);
     }
-    assert!(!batch.select_ready(0, limits, 0, 32, &mut shared).unwrap());
-    assert!(!batch.select_ready(0, limits, 8, 2, &mut shared).unwrap());
-    assert!(batch.select_ready(1, limits, 8, 32, &mut shared).unwrap());
+    assert!(batch.select_ready(1, limits, &mut shared).unwrap());
     assert_eq!(batch.records.len(), 1);
 }
 
@@ -269,10 +376,10 @@ async fn linger_deadline_does_not_move_and_flush_captures_only_its_prefix() {
     settings.linger = Duration::from_secs(1);
     let (mut writer, mut shared) = channel(settings);
     writer.send(input(3, b"a")).await.unwrap();
-    let mut batch = Batch::new(8);
+    let mut batch = Batch::new();
     assert!(
         !batch
-            .select_ready(0, shared.config.limits, 8, 64, &mut shared)
+            .select_ready(0, shared.config.limits, &mut shared)
             .unwrap()
     );
     let deadline = batch.deadline.unwrap();
@@ -281,7 +388,7 @@ async fn linger_deadline_does_not_move_and_flush_captures_only_its_prefix() {
     writer.send(input(4, b"b")).await.unwrap();
     assert!(
         !batch
-            .select_ready(0, shared.config.limits, 8, 64, &mut shared)
+            .select_ready(0, shared.config.limits, &mut shared)
             .unwrap()
     );
     assert_eq!(batch.deadline, Some(deadline));
@@ -289,13 +396,13 @@ async fn linger_deadline_does_not_move_and_flush_captures_only_its_prefix() {
     writer.send(input(5, b"c")).await.unwrap();
     assert!(
         batch
-            .select_ready(0, shared.config.limits, 8, 64, &mut shared)
+            .select_ready(0, shared.config.limits, &mut shared)
             .unwrap()
     );
     assert_eq!(batch.records.len(), 2);
     assert!(
         !batch
-            .select_ready(2, shared.config.limits, 8, 64, &mut shared)
+            .select_ready(2, shared.config.limits, &mut shared)
             .unwrap()
     );
     assert_eq!(
@@ -305,7 +412,7 @@ async fn linger_deadline_does_not_move_and_flush_captures_only_its_prefix() {
     tokio::time::advance(Duration::from_secs(1)).await;
     assert!(
         batch
-            .select_ready(2, shared.config.limits, 8, 64, &mut shared)
+            .select_ready(2, shared.config.limits, &mut shared)
             .unwrap()
     );
     batch.records.clear();
@@ -316,13 +423,13 @@ async fn linger_deadline_does_not_move_and_flush_captures_only_its_prefix() {
 #[tokio::test]
 async fn simultaneous_transport_releases_return_a_packing_slot_exactly_once() {
     let (mut shared, mut writer) = setup(2, 32);
-    let mut batch = Batch::new(2);
+    let mut batch = Batch::new();
     for sequence in (0..64).step_by(2) {
         writer.send(input(3, b"abc")).await.unwrap();
         writer.send(input(4, b"def")).await.unwrap();
         assert!(
             batch
-                .select_ready(sequence, shared.config.limits, 2, 32, &mut shared)
+                .select_ready(sequence, shared.config.limits, &mut shared)
                 .unwrap()
         );
         let first = batch.take_payload().unwrap();
@@ -344,7 +451,7 @@ async fn simultaneous_transport_releases_return_a_packing_slot_exactly_once() {
 }
 
 #[tokio::test]
-async fn large_records_obey_credit_and_hard_limit_without_truncation() {
+async fn large_records_obey_hard_limit_without_truncation() {
     const TARGET: usize = 1024 * 1024;
     let mut settings = config(8, 4 * TARGET);
     settings.limits.max_records = 8;
@@ -364,27 +471,22 @@ async fn large_records_obey_credit_and_hard_limit_without_truncation() {
         .unwrap();
     writer.send(input(3, b"")).await.unwrap();
     writer.send(input(4, b"after")).await.unwrap();
-    let mut batch = Batch::new(8);
+    let mut batch = Batch::new();
     assert!(
         batch
-            .select_ready(0, shared.config.limits, 8, 4 * TARGET, &mut shared)
+            .select_ready(0, shared.config.limits, &mut shared)
             .unwrap()
     );
     assert_eq!((batch.records.len(), batch.bytes), (1, 6));
     assert!(
-        !batch
-            .select_ready(1, shared.config.limits, 8, 2 * TARGET - 1, &mut shared)
-            .unwrap()
-    );
-    assert!(
         batch
-            .select_ready(1, shared.config.limits, 8, 2 * TARGET, &mut shared)
+            .select_ready(1, shared.config.limits, &mut shared)
             .unwrap()
     );
     assert_eq!((batch.records.len(), batch.bytes), (2, 2 * TARGET));
     assert!(
         batch
-            .select_ready(2, shared.config.limits, 8, 2 * TARGET, &mut shared)
+            .select_ready(2, shared.config.limits, &mut shared)
             .unwrap()
     );
     assert_eq!((batch.records.len(), batch.bytes), (2, 5));
@@ -403,11 +505,9 @@ impl Batch {
         &mut self,
         next: u64,
         limits: DataLimits,
-        records: usize,
-        bytes: usize,
         driver: &mut state::Driver,
     ) -> Result<bool, Error> {
         driver.settle();
-        self.select(next, limits, records, bytes, driver)
+        self.select(next, limits, false, driver)
     }
 }

@@ -9,7 +9,7 @@ use super::{
 };
 use crate::replica_journal::{
     AdmittedAppend, AppendBuffer, JournalCompletion, OwnedJournal, ProposalBuffer,
-    ProposalValidation, ReplicaJournal, ShardJournal, ShardJournalConfig, SubmitError,
+    ProposalValidation, ReplicaJournal, ShardJournalConfig, SubmitError, ValidatedAppend,
 };
 use ozzy_replication::{
     Prefix, WriteTicket,
@@ -49,6 +49,7 @@ impl Default for LocalActorConfig {
 
 #[derive(Debug)]
 enum Pending {
+    Ready(Box<(WriteTicket, ValidatedAppend)>),
     Propose(JournalCompletion<ProposalValidation>),
     Admit(JournalCompletion<AdmittedAppend>),
     Apply(JournalCompletion<ValidationTicket>),
@@ -66,7 +67,7 @@ struct Live {
 /// partition's pending I/O never blocks another. Intake is count/byte bounded.
 #[derive(Debug)]
 pub struct LocalActor {
-    journal: ReplicaJournal<ShardJournal>,
+    journal: ReplicaJournal,
     driver: Driver,
     config: LocalActorConfig,
     ingress: Ingress,
@@ -87,9 +88,7 @@ pub struct LocalActor {
 }
 
 impl LocalActor {
-    pub(super) fn read_access(
-        &mut self,
-    ) -> (Option<ValidationTicket>, &mut ReplicaJournal<ShardJournal>) {
+    pub(super) fn read_access(&mut self) -> (Option<ValidationTicket>, &mut ReplicaJournal) {
         let ticket = (!self.closing && !self.faulted)
             .then(|| self.driver.begin_validation().ok())
             .flatten();
@@ -164,7 +163,7 @@ impl LocalActor {
         }
         let journal = owner.into_shard_journal(config.journal, timestamp)?;
         let limits = driver.limits();
-        let backlog = journal.write_pipeline().backlog;
+        let backlog = journal.backlog();
         if limits.max_operations > backlog.max_operations
             || limits.max_body_bytes > backlog.max_body_bytes
         {
@@ -294,6 +293,16 @@ impl LocalActor {
     }
 
     fn schedule(&mut self) -> Result<bool, ActorError> {
+        if self.journal.available_command_slots() == 0 {
+            return Ok(false);
+        }
+        if matches!(self.pending, Some(Pending::Ready(_))) {
+            let Some(Pending::Ready(ready)) = self.pending.take() else {
+                unreachable!("ready admission");
+            };
+            let (ticket, validated) = *ready;
+            return self.admit_ready(ticket, validated);
+        }
         let state = self.driver.snapshot();
         let mut changed = false;
         if self.sync.is_none() && state.journal.written > state.journal.durable {
@@ -304,7 +313,7 @@ impl LocalActor {
             self.sync_started_at = crate::profiling::start();
             changed = true;
         }
-        if self.pending.is_some() {
+        if self.pending.is_some() || self.journal.available_command_slots() == 0 {
             return Ok(changed);
         }
         if state.applied != state.committed {

@@ -78,14 +78,10 @@ pub enum AppendAdmissionError {
 pub struct ProposalBuffer(pub(crate) AppendBuffer);
 
 impl ProposalBuffer {
-    /// Bind an empty startup arena to destination-owned allocation credit.
-    /// Its fixed body limit remains unchanged. Journal/background arenas can
-    /// use a separate allowance on the same physical memory owner.
-    pub fn bind_capacity(
-        &mut self,
-        capacity: &crate::memory::Capacity,
-    ) -> Result<(), JournalError> {
-        self.0.bind_capacity(capacity)
+    /// Bind an empty startup arena to a shard-owned bounded memory pool.
+    /// Direct producer backpressure controls admission before allocation.
+    pub fn bind_owner(&mut self, owner: &crate::memory::Owner) -> Result<(), JournalError> {
+        self.0.bind_allocator(&owner.allocator())
     }
 
     /// Open or resume one broker-owned writer through canonical proposal rules.

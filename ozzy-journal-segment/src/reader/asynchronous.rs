@@ -4,8 +4,10 @@ use super::{
     select_indexed_record, validate_location, validate_operation_location, validate_source_header,
 };
 use crate::async_files::Access;
-use crate::{DecodedOperation, OperationIndexEntry, decode_indexed_operation};
-use ozzy_io::{OpenMode, Operation};
+use crate::{
+    DecodedOperation, OperationIndexEntry, OperationLocation, SegmentHeader,
+    decode_indexed_operation,
+};
 use ozzy_journal::operation::decode_operation_body;
 use std::path::PathBuf;
 
@@ -21,19 +23,7 @@ pub(crate) async fn read_control(
     chunk: usize,
 ) -> Result<DecodedOperation<'static>, IndexedReadError> {
     let location = validate_operation_location(source, entry.location, decode)?;
-    let file = access.open(path, OpenMode::Read, false, false).await?;
-    let length = access.length(&file).await?;
-    let header_bytes = access
-        .read_range(&file, 0, SEGMENT_HEADER_BYTES, chunk)
-        .await?;
-    let header = decode_segment_header(&header_bytes)?;
-    validate_source_header(&header, source, length)?;
-    let count =
-        usize::try_from(location.entry_bytes).map_err(|_| IndexedReadError::InvalidLocation)?;
-    let bytes = access
-        .read_range(&file, location.entry_offset, count, chunk)
-        .await?;
-    access.done(Operation::Close { handle: file }).await?;
+    let (header, bytes) = extent(access, path, source, location, chunk).await?;
     let operation = decode_indexed_operation(
         &header,
         location.entry_offset,
@@ -66,19 +56,7 @@ pub(crate) async fn load(
     chunk: usize,
 ) -> Result<super::CachedOperation, IndexedReadError> {
     let location = validate_location(source, entry, decode)?;
-    let file = access.open(path, OpenMode::Read, false, false).await?;
-    let length = access.length(&file).await?;
-    let header_bytes = access
-        .read_range(&file, 0, SEGMENT_HEADER_BYTES, chunk)
-        .await?;
-    let header = decode_segment_header(&header_bytes)?;
-    validate_source_header(&header, source, length)?;
-    let count =
-        usize::try_from(location.entry_bytes).map_err(|_| IndexedReadError::InvalidLocation)?;
-    let bytes = access
-        .read_range(&file, location.entry_offset, count, chunk)
-        .await?;
-    access.done(Operation::Close { handle: file }).await?;
+    let (header, bytes) = extent(access, path, source, location, chunk).await?;
     let body = decode_body(&header, location, &Bytes::from(bytes), decode)?;
     super::CachedOperation::from_body(entry, body, operations)
 }
@@ -118,19 +96,7 @@ pub(crate) async fn read_records(
         return Err(IndexedReadError::InvalidLocation);
     }
     let location = validate_location(source, entry, decode)?;
-    let file = access.open(path, OpenMode::Read, false, false).await?;
-    let length = access.length(&file).await?;
-    let header_bytes = access
-        .read_range(&file, 0, SEGMENT_HEADER_BYTES, chunk)
-        .await?;
-    let header = decode_segment_header(&header_bytes)?;
-    validate_source_header(&header, source, length)?;
-    let count =
-        usize::try_from(location.entry_bytes).map_err(|_| IndexedReadError::InvalidLocation)?;
-    let bytes = access
-        .read_range(&file, location.entry_offset, count, chunk)
-        .await?;
-    access.done(Operation::Close { handle: file }).await?;
+    let (header, bytes) = extent(access, path, source, location, chunk).await?;
     let body = decode_body(&header, location, &Bytes::from(bytes), decode)?;
     let mut records: Vec<IndexedRecord> =
         inspect_append_body(&body, operations, |append, body, prepared| {
@@ -145,4 +111,27 @@ pub(crate) async fn read_records(
         }
     }
     Ok(records)
+}
+
+/// Load one exact indexed extent after its caller validated the location.
+async fn extent(
+    access: &Access,
+    path: PathBuf,
+    source: IndexSource,
+    location: OperationLocation,
+    chunk: usize,
+) -> Result<(SegmentHeader, Vec<u8>), IndexedReadError> {
+    let file = access.read_handle(path, source).await?;
+    let length = access.length(&file).await?;
+    let header_bytes = access
+        .read_range(&file, 0, SEGMENT_HEADER_BYTES, chunk)
+        .await?;
+    let header = decode_segment_header(&header_bytes)?;
+    validate_source_header(&header, source, length)?;
+    let count =
+        usize::try_from(location.entry_bytes).map_err(|_| IndexedReadError::InvalidLocation)?;
+    let bytes = access
+        .read_range(&file, location.entry_offset, count, chunk)
+        .await?;
+    Ok((header, bytes))
 }

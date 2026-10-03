@@ -11,12 +11,16 @@ use crate::{ConfigError, Confirmation, DeploymentMode, ValidatedDeployment};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeploymentIdentity {
+    /// Persistent cluster namespace.
     pub cluster: Uuid,
+    /// Provisioned single-broker or fixed-three mode.
     pub mode: DeploymentMode,
+    /// Persistent broker IDs by configured name.
     pub brokers: BTreeMap<String, Uuid>,
     /// Independently generated persistent bindings for a trusted broker domain.
     /// These identify principals, but do not authenticate transport connections.
     pub principals: BTreeMap<String, [u8; 32]>,
+    /// Persistent topic and partition identities by name.
     pub topics: BTreeMap<String, TopicIdentity>,
 }
 
@@ -24,9 +28,13 @@ pub struct DeploymentIdentity {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TopicIdentity {
+    /// Persistent topic ID.
     pub id: Uuid,
+    /// Fixed keyed partition algorithm name.
     pub partitioner: String,
+    /// Persistent seed used by SDK keyed routing.
     pub partitioner_seed: u64,
+    /// Persistent topic confirmation policy.
     pub confirmation: Confirmation,
     /// Numeric partition order, never sorted by random group IDs.
     pub partitions: Vec<PartitionIdentity>,
@@ -36,10 +44,13 @@ pub struct TopicIdentity {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PartitionIdentity {
+    /// Zero-based topic partition number.
     pub partition: u32,
+    /// Persistent partition replication-group ID.
     pub group: Uuid,
     /// Provisioned configuration epoch. Online membership changes are absent.
     pub config_epoch: u64,
+    /// Partition record namespace, independent of election view.
     pub incarnation: Uuid,
     /// Initial leader is first. Later leaders follow the election state machine.
     pub members: Vec<Uuid>,

@@ -1,5 +1,6 @@
 //! Fixed-size binary events for measuring tiny individual records.
 
+/// Result-row label describing the exact sixteen-byte binary event representation.
 pub const BINARY_EVENT_CORPUS: &str = "16-byte binary event: u64 submission clock, u8 kind, u8 flags, u8 writer, u8 status, u32 value; integers big-endian";
 
 /// The high byte of `number` identifies the writer; lower 56 bits are its sequence.

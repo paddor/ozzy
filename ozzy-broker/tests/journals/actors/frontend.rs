@@ -5,16 +5,16 @@ use super::*;
 use ozzy_broker::{Frontend, TransportLimits};
 use ozzy_proto::{EnvelopeLimits, Opcode, data::DataLimits, handshake};
 use ozzy_runtime::{
-    dispatch::{self, Budget, Budgets, Class, Client, Grant, GrantKey, Quota},
+    dispatch::{self, Budget, Budgets, Class},
     frontend::{
-        Access, Dispatcher, DispatcherLimits, GrantSpec, GrantTarget, Kind, Links, Pending,
-        Placement, Port, PortError, ReceiveBuffers, ReceiveStorage, ReplyError, ReplyLimits,
-        ReplyResult, RoutingTable, Service, Subject, WatchLimits, WatchRegistry,
+        Access, Dispatcher, DispatcherLimits, Kind, Links, Pending, Placement, Port, PortError,
+        ReceiveBuffers, ReceiveStorage, ReplyError, ReplyLimits, ReplyResult, RoutingTable,
+        Service, WatchLimits, WatchRegistry,
     },
     replica_actor::{RoutePublicationError, RoutePublisher},
     replica_transport::QueueLimits,
 };
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use tokio::sync::oneshot;
 
 // The inproc fixture transmits only one small canonical creation per partition.
@@ -29,37 +29,6 @@ fn backing(class: Class) -> usize {
     match class {
         Class::Control => 128 * 1024,
         Class::Data => BACKING,
-    }
-}
-
-fn data_target(group: GroupId) -> GrantTarget {
-    Subject {
-        group,
-        writer: None,
-    }
-    .into()
-}
-
-fn grant_spec(reservation: &Reserved, actors: &PartitionActors) -> Option<GrantSpec> {
-    match reservation.target {
-        GrantTarget::Control(_) => Some(GrantSpec::Target(reservation.target)),
-        GrantTarget::Partition(subject) => actors
-            .ops_receive_demand(subject.group)
-            .filter(|request| request.source.voter == reservation.peer)
-            .map(|request| {
-                GrantSpec::replica(ozzy_replication::wire::ReceiveFence::History(request))
-            })
-            .or_else(|| {
-                actors
-                    .receive_credit(subject.group)
-                    .and_then(|(peer, report)| {
-                        (peer == reservation.peer).then(|| {
-                            GrantSpec::replica(ozzy_replication::wire::ReceiveFence::Normal(
-                                report.channel,
-                            ))
-                        })
-                    })
-            }),
     }
 }
 
@@ -79,48 +48,33 @@ fn budgets() -> Budgets {
 }
 
 fn parameters() -> handshake::Parameters {
-    let mut profile = handshake::Parameters::streaming(
-        DataLimits::default(),
-        handshake::OWNER | 8,
-        65536,
-        1 << 30,
-    )
-    .unwrap();
+    let mut profile =
+        handshake::Parameters::streaming(DataLimits::default(), handshake::OWNER | 8).unwrap();
     profile.capabilities |= handshake::OWNER_READ | (1 << 3) | (1 << 8);
     profile.required_capabilities = 0;
     profile
 }
 
-type PortSetup = (Links, Port);
-type LaneSetup = (u32, dispatch::Sender<Message>, oneshot::Sender<PortSetup>);
-
-struct Reserved {
-    peer: NodeId,
-    session: LinkSessionId,
-    target: GrantTarget,
-    class: Class,
-    key: GrantKey,
-    pending: Option<Pending<ozzy_runtime::frontend::InstallResult>>,
-    unsent: Option<Grant>,
-    installed: bool,
-}
+type PortSetup = (Links, Port, oneshot::Receiver<()>);
+type LaneSetup = (
+    u32,
+    [ozzy_runtime::frontend::DataSender; 2],
+    oneshot::Sender<PortSetup>,
+);
 
 struct Network {
     local: NodeId,
-    shard: u32,
     links: Links,
     port: Port,
-    input: dispatch::Receiver<Message>,
-    peers: BTreeMap<NodeId, (LinkSessionId, Option<Client>)>,
-    grants: Vec<Reserved>,
+    input: [ozzy_runtime::frontend::DataReceiver; 2],
+    peers: BTreeMap<NodeId, LinkSessionId>,
     replies: FuturesUnordered<Pending<ReplyResult>>,
     retries: VecDeque<Message>,
-    revoked_windows: BTreeSet<GroupId>,
 }
 
 impl Network {
     fn refresh(&mut self, actors: &mut PartitionActors, creations: &[Creation], now: Duration) {
-        for (&peer, (previous, client)) in &mut self.peers {
+        for (&peer, previous) in &mut self.peers {
             let current = self
                 .links
                 .get(peer)
@@ -141,160 +95,7 @@ impl Network {
                         .unwrap();
                 }
             }
-            self.grants.retain(|grant| grant.peer != peer);
-            if current.as_bytes() == &[0; 16] {
-                // Dropping the local client fences every old token while admitted
-                // aliases continue to count against the destination owner.
-                *client = None;
-            } else {
-                if let Some(client) = client {
-                    client.replace_session(current).unwrap();
-                } else {
-                    *client = Some(self.input.credits().client(current, budgets()).unwrap());
-                }
-                let targets = std::iter::once((GrantTarget::Control(self.shard), Class::Control))
-                    .chain(
-                        creations
-                            .iter()
-                            .map(|creation| (data_target(creation.group), Class::Data)),
-                    );
-                for (target, class) in targets {
-                    let grant = self
-                        .input
-                        .credits()
-                        .grant(
-                            client.as_ref().unwrap(),
-                            class,
-                            Quota {
-                                messages: 2,
-                                bytes: backing(class) * 2,
-                            },
-                        )
-                        .unwrap();
-                    self.grants.push(Reserved {
-                        peer,
-                        session: current,
-                        target,
-                        class,
-                        key: grant.key(),
-                        pending: None,
-                        unsent: Some(grant),
-                        installed: false,
-                    });
-                }
-            }
             *previous = current;
-        }
-    }
-
-    fn poll_grants(
-        &mut self,
-        cx: &mut Context<'_>,
-        actors: &mut PartitionActors,
-        creations: &[Creation],
-    ) {
-        for reservation in &mut self.grants {
-            if let Some(pending) = &mut reservation.pending
-                && let Poll::Ready(result) = Pin::new(pending).poll(cx)
-            {
-                match result.unwrap() {
-                    Ok(()) => reservation.installed = true,
-                    Err((ozzy_runtime::frontend::SetupError::Binding, grant)) => {
-                        // Dispatcher session installation can trail the link
-                        // observer. Retry the same reserved grant.
-                        reservation.unsent = Some(grant);
-                    }
-                    Err(error) => panic!("dispatch grant installation failed: {error:?}"),
-                }
-                reservation.pending = None;
-            }
-            let spec = grant_spec(reservation, actors);
-            if let Some(spec) = spec
-                && let Some(grant) = reservation.unsent.take()
-            {
-                match self.port.try_install(reservation.peer, spec, grant) {
-                    Ok(pending) => {
-                        reservation.pending = Some(pending);
-                        cx.waker().wake_by_ref();
-                    }
-                    Err((
-                        PortError::Admission(dispatch::SendFailure::Admission(
-                            dispatch::Error::Full,
-                        )),
-                        grant,
-                    )) => reservation.unsent = Some(grant),
-                    Err(error) => panic!("grant port failed: {error:?}"),
-                }
-            }
-            if reservation.installed {
-                let unused = self.input.credits().remaining(&reservation.key).unwrap();
-                let quota = Quota {
-                    messages: 2 - unused.messages,
-                    bytes: backing(reservation.class) * 2 - unused.bytes,
-                };
-                if quota != Quota::default() {
-                    match self.input.credits().extend(&reservation.key, quota) {
-                        Ok(()) | Err(dispatch::Error::Full) => {}
-                        Err(error) => panic!("grant refill failed: {error:?}"),
-                    }
-                }
-            }
-        }
-        for creation in creations {
-            if let Some((peer, report)) = actors.receive_credit(creation.group)
-                && report.operation_limit > 0
-                && self.revoked_windows.insert(creation.group)
-            {
-                // Reallocate a granted window once. Old wire frames and port
-                // commands may still be in flight; both admission fences must
-                // move before the same unused resources can be granted again.
-                actors.revoke_receive(report.channel).unwrap();
-                let reservation = self
-                    .grants
-                    .iter_mut()
-                    .find(|grant| {
-                        grant.peer == peer
-                            && grant.target == data_target(creation.group)
-                            && grant.class == Class::Data
-                    })
-                    .unwrap();
-                self.input.credits().revoke_key(&reservation.key).unwrap();
-                let client = self.peers[&peer].1.as_ref().unwrap();
-                let grant = self
-                    .input
-                    .credits()
-                    .grant(
-                        client,
-                        Class::Data,
-                        Quota {
-                            messages: 2,
-                            bytes: BACKING * 2,
-                        },
-                    )
-                    .unwrap();
-                reservation.key = grant.key();
-                reservation.installed = false;
-                reservation.pending = None;
-                reservation.unsent = Some(grant);
-            }
-            if let Some((peer, report)) = actors.receive_credit(creation.group)
-                && report.operation_limit == 0
-                && actors.receive_target(creation.group).is_some()
-                && self.grants.iter().any(|grant| {
-                    grant.peer == peer
-                        && grant.target == data_target(creation.group)
-                        && grant.class == Class::Data
-                        && grant.installed
-                        && self
-                            .links
-                            .get(peer)
-                            .is_some_and(|link| link.binding.session == grant.session)
-                })
-            {
-                // The fixture's one operation has both native memory and an
-                // installed dispatcher token before its wire credit is visible.
-                actors.grant_receive(report.channel, 1, 512).unwrap();
-            }
         }
     }
 
@@ -327,15 +128,25 @@ impl Network {
                 PortError::Admission(dispatch::SendFailure::Admission(dispatch::Error::Full)),
                 message,
             )) => Err(TrySendError::Full(message)),
+            Err((
+                PortError::Closed
+                | PortError::Admission(
+                    dispatch::SendFailure::Closed
+                    | dispatch::SendFailure::Admission(dispatch::Error::Closed),
+                ),
+                _,
+            )) => Err(TrySendError::Closed),
             Err(error) => panic!("actor reply submission failed: {error:?}"),
         }
     }
 
-    fn receive(&mut self, actors: &mut PartitionActors, now: Duration) {
-        let Some(work) = self.input.try_recv().unwrap() else {
-            return;
-        };
-        let message = work.into_retained_message();
+    fn receive(
+        &mut self,
+        actors: &mut PartitionActors,
+        now: Duration,
+        work: ozzy_runtime::frontend::DataInput,
+    ) {
+        let message = work.message;
         let peer = NodeId::from_bytes(message.part_slice(0).unwrap().try_into().unwrap());
         let group = if message.len() == 3 {
             ozzy_replication::wire::CompactState::decode(message.part_slice(2).unwrap()).unwrap();
@@ -374,9 +185,9 @@ async fn open(
         let io = context.io.clone();
         opening.push(async move {
             if format {
-                plan.format(io, JournalGeneration(1)).await
+                Box::pin(plan.format(io, JournalGeneration(1))).await
             } else {
-                plan.open(io, JournalGeneration(2)).await
+                Box::pin(plan.open(io, JournalGeneration(2))).await
             }
         });
     }
@@ -409,7 +220,7 @@ async fn open(
 
 enum ShardEvent {
     Stop,
-    Input,
+    Input(ozzy_runtime::frontend::DataInput),
     Links,
     Tick,
     Reply(Result<ReplyResult, PortError>),
@@ -425,37 +236,48 @@ async fn serve(mut context: ShardContext, run: ShardRun) -> Result<(), StartupEr
     use ShardEvent as Event;
     let (mut actors, mut creations, mut publisher) =
         open(&context, run.plans, run.format, run.local).await?;
-    let (sender, input) = dispatch::channel(dispatch::Limits {
-        capacity: budgets(),
-        clients: 2,
-        grants: 32,
-    })
+    let (data, data_rx) = ozzy_runtime::frontend::data_channel(
+        &omq_tokio::Context::new(),
+        context.plan.id,
+        Kind::Broker,
+        Class::Data,
+        32,
+        BACKING,
+        budgets().data.bytes,
+    )
+    .unwrap();
+    let (control, control_rx) = ozzy_runtime::frontend::data_channel(
+        &omq_tokio::Context::new(),
+        context.plan.id,
+        Kind::Broker,
+        Class::Control,
+        8,
+        128 * 1024,
+        budgets().control.bytes,
+    )
     .unwrap();
     let (configured, configuration) = oneshot::channel();
     run.setup
-        .send((context.plan.id, sender, configured))
+        .send((context.plan.id, [data, control], configured))
         .await
         .unwrap();
     context.ready()?;
-    let (links, port) = tokio::select! {
+    let (links, port, frontend_finished) = tokio::select! {
         result = configuration => result.unwrap(),
         () = context.shutdown.requested() => return actors.shutdown().await.map_err(failure),
     };
     let mut network = Network {
         local: run.local,
-        shard: context.plan.id,
         links,
         port,
-        input,
+        input: [data_rx, control_rx],
         peers: run
             .peers
             .into_iter()
-            .map(|peer| (peer, (LinkSessionId::from_bytes([0; 16]), None)))
+            .map(|peer| (peer, LinkSessionId::from_bytes([0; 16])))
             .collect(),
-        grants: Vec::new(),
         replies: FuturesUnordered::new(),
         retries: VecDeque::new(),
-        revoked_windows: BTreeSet::new(),
     };
     let clock = std::time::Instant::now();
     let mut now = Duration::ZERO;
@@ -469,9 +291,6 @@ async fn serve(mut context: ShardContext, run: ShardRun) -> Result<(), StartupEr
             && creations.iter().all(|creation| {
                 let state = actors.status(creation.group).unwrap();
                 (!creation.leader(network.local, &state) || creation.confirmed)
-                    && (!run.format
-                        || creation.leader(network.local, &state)
-                        || network.revoked_windows.contains(&creation.group))
                     && match state {
                         PartitionStatus::Local(status) => status.applied.op.0 == 1,
                         PartitionStatus::Replicated(status) => {
@@ -490,16 +309,25 @@ async fn serve(mut context: ShardContext, run: ShardRun) -> Result<(), StartupEr
         // The fixture retries rejected outbox submissions on an explicit timer.
         // Other partitions and destinations continue while a peer remains full.
         let links = network.links.clone();
-        let input_ready = network.input.ready();
+        let data_ready = network.input[0].ready();
+        let control_ready = network.input[1].ready();
         let event = tokio::select! {
             () = context.shutdown.requested() => Event::Stop,
-            () = input_ready => Event::Input,
+            input = data_ready => match input {
+                Ok(input) => Event::Input(input),
+                Err(ozzy_runtime::frontend::DataLaneError::Closed) => Event::Stop,
+                Err(error) => panic!("fixture data queue failed: {error}"),
+            },
+            input = control_ready => match input {
+                Ok(input) => Event::Input(input),
+                Err(ozzy_runtime::frontend::DataLaneError::Closed) => Event::Stop,
+                Err(error) => panic!("fixture control queue failed: {error}"),
+            },
             () = links.changed_after(generation) => Event::Links,
             event = std::future::poll_fn(|cx| {
                 if let Poll::Ready(Some(reply)) = network.replies.poll_next_unpin(cx) {
                     return Poll::Ready(Event::Reply(reply));
                 }
-                network.poll_grants(cx, &mut actors, &creations);
                 for creation in &mut creations { creation.poll(cx, run.local, &actors.status(creation.group).unwrap()); }
                 match actors.poll_progress(cx, now, |_, message| network.send(message)) {
                     Poll::Ready(Err(error)) => Poll::Ready(Event::Failed(error)),
@@ -511,14 +339,19 @@ async fn serve(mut context: ShardContext, run: ShardRun) -> Result<(), StartupEr
             }) => event,
             _ = tick.tick() => Event::Tick,
         };
+        // As in production, a pending turn may observe transport closure while
+        // another owner requests shutdown. Drain accepted journal work below.
+        if context.shutdown.is_requested() {
+            break;
+        }
         match event {
             Event::Stop => break,
             Event::Failed(error) => return Err(failure(error)),
             Event::RouteFailed(error) => return Err(failure(error)),
             Event::Links => {}
-            Event::Input => {
+            Event::Input(input) => {
                 network.refresh(&mut actors, &creations, now);
-                network.receive(&mut actors, now);
+                network.receive(&mut actors, now, input);
             }
             Event::Reply(result) => match result.unwrap() {
                 Ok(()) | Err((ReplyError::Peer | ReplyError::Session, _)) => {}
@@ -531,12 +364,15 @@ async fn serve(mut context: ShardContext, run: ShardRun) -> Result<(), StartupEr
                     match network.send(message) {
                         Ok(()) => {}
                         Err(TrySendError::Full(message)) => network.retries.push_back(message),
+                        Err(TrySendError::Closed) => break,
                         Err(error) => panic!("retry failed: {error:?}"),
                     }
                 }
             }
         }
     }
+    // Keep ingress alive until its transport owner has stopped dispatching.
+    frontend_finished.await.map_err(failure)?;
     actors.shutdown().await.map_err(failure)
 }
 
@@ -544,7 +380,7 @@ struct FrontRun {
     peers: Vec<NodeId>,
     remote: BTreeMap<NodeId, ozzy_config::Endpoints>,
     routes: RoutingTable,
-    senders: Vec<(u32, dispatch::Sender<Message>)>,
+    senders: Vec<(u32, ozzy_runtime::frontend::DataSender)>,
     ports: Vec<(u32, oneshot::Sender<PortSetup>)>,
     storage: ReceiveStorage,
     watches: Vec<ozzy_proto::directory::RouteState>,
@@ -575,7 +411,7 @@ async fn run_frontend(
         senders,
         DispatcherLimits {
             peers: 2,
-            grants_per_class: 64,
+
             replies: ReplyLimits {
                 control: queue,
                 data: queue,
@@ -613,17 +449,37 @@ async fn run_frontend(
         )
         .unwrap();
     let buffers = ReceiveBuffers::new(EnvelopeLimits::default(), storage).unwrap();
+    for peer in &peers {
+        context
+            .data
+            .connect(remote[peer].data_peer.parse().unwrap())
+            .await
+            .unwrap();
+    }
+    let mut finished = Vec::new();
     for (id, configured) in ports {
-        let port = service.port(id, budgets()).unwrap();
-        configured.send((service.links(), port)).unwrap();
+        let port = service.port(context.omq_context(), id, budgets()).unwrap();
+        let (stopped, stopping) = oneshot::channel();
+        finished.push(stopped);
+        configured.send((service.links(), port, stopping)).unwrap();
     }
     let brokers = peers
         .into_iter()
         .map(|peer| (peer, remote[&peer].peer.parse().unwrap()))
         .collect();
-    context
-        .serve(service, brokers, buffers, Duration::from_millis(25))
-        .await
+    let result = context
+        .serve(
+            service,
+            brokers,
+            ozzy_broker::FollowerRoutes::default(),
+            buffers,
+            Duration::from_millis(25),
+        )
+        .await;
+    for stopped in finished {
+        let _ = stopped.send(());
+    }
+    result
 }
 
 #[expect(
@@ -642,11 +498,12 @@ async fn start(brokers: &[(CheckedConfig, BrokerIdentity, JournalPlan)], format:
         .map(|id| {
             let peer = NodeId::from_bytes(*id.as_bytes());
             let endpoints = if tcp {
-                let sockets: Vec<_> = (0..2)
+                let sockets: Vec<_> = (0..3)
                     .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
                     .collect();
                 let endpoints = ozzy_config::Endpoints {
                     peer: format!("tcp://{}", sockets[0].local_addr().unwrap()),
+                    data_peer: format!("tcp://{}", sockets[2].local_addr().unwrap()),
                     reader_pub: format!("tcp://{}", sockets[1].local_addr().unwrap()),
                     follower_pub: None,
                 };
@@ -655,6 +512,7 @@ async fn start(brokers: &[(CheckedConfig, BrokerIdentity, JournalPlan)], format:
             } else {
                 ozzy_config::Endpoints {
                     peer: format!("inproc://actors-{namespace}-{peer}"),
+                    data_peer: format!("inproc://actors-data-{namespace}-{peer}"),
                     reader_pub: format!("inproc://actors-reader-{namespace}-{peer}"),
                     follower_pub: None,
                 }
@@ -700,7 +558,9 @@ async fn start(brokers: &[(CheckedConfig, BrokerIdentity, JournalPlan)], format:
         let mut ports = Vec::new();
         for _ in 0..shards.thread_count() {
             let (id, sender, configured) = setups.recv().await.unwrap();
-            senders.push((id, sender));
+            for lane in sender {
+                senders.push((id, lane));
+            }
             ports.push((id, configured));
         }
         let placements: Vec<_> = journals
@@ -798,9 +658,15 @@ async fn start(brokers: &[(CheckedConfig, BrokerIdentity, JournalPlan)], format:
         }
     }
     drop((closed, transport));
-    stop(running).await;
-    for frontend in frontends {
-        frontend.shutdown().await.unwrap();
+    let stopping = stop(running);
+    tokio::pin!(stopping);
+    // Exercise shard-first shutdown with transport owners still serving.
+    assert!(futures::FutureExt::now_or_never(stopping.as_mut()).is_none());
+    tokio::task::yield_now().await;
+    let closing = futures::future::join_all(frontends.iter().map(Frontend::shutdown));
+    let ((), results) = futures::join!(stopping, closing);
+    for result in results {
+        result.unwrap();
     }
 }
 

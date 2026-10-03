@@ -11,6 +11,7 @@ use super::{AppendKey, DataLimits, Error, Policy, RetryPolicy};
 use state::Shared;
 
 mod batch;
+mod completion;
 mod compression;
 mod driver;
 mod inbox;
@@ -35,28 +36,13 @@ pub const MAX_SEQUENCE: u64 = state::SEALED - 2;
 /// Built-in raw payload threshold for adaptive whole-APPEND LZ4.
 pub const PAYLOAD_COMPRESSION_THRESHOLD: usize = ozzy_proto::append::ADAPTIVE_LZ4_THRESHOLD;
 
-/// Explicit registered destination, without fabricated group identities.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PartitionTarget {
-    /// Immutable partition in a configured three-broker group.
-    Group(PartitionIncarnation),
-}
-
-impl PartitionTarget {
-    fn metadata_bytes(&self) -> usize {
-        match self {
-            Self::Group(_) => 89,
-        }
-    }
-}
-
 /// One preprovisioned producer and its bounded outstanding window.
 #[derive(Debug, Clone)]
 pub struct WriterConfig {
     /// Required confirmation boundary. Must match the broker's configured policy.
     pub policy: Policy,
-    /// Preprovisioned group partition or registered local topic/partition.
-    pub partition: PartitionTarget,
+    /// Exact registered partition incarnation, shared by all confirmation modes.
+    pub partition: PartitionIncarnation,
     /// Existing nonzero partition ownership fence.
     pub owner_epoch: u64,
     /// Existing authorized producer identity.
@@ -66,14 +52,15 @@ pub struct WriterConfig {
     /// First sequence to submit, at most `MAX_SEQUENCE`. Recovered callers must
     /// preserve unresolved IDs.
     pub next_sequence: u64,
-    /// Hard protocol request limits, further restricted by broker receive credit.
+    /// Hard protocol request limits, bounded by directional broker packet limits.
     pub limits: DataLimits,
     /// Compress eligible APPEND payloads with adaptive LZ4 before sending.
     /// Turn it off when the transport compresses, such as `lz4+tcp://`;
     /// brokers then receive, replicate, and store plain payload bytes.
     pub compress_payloads: bool,
     /// Uncompressed APPEND payload target. A larger permitted record goes alone.
-    /// This is not a record-size limit or an intentional collection delay.
+    /// This is not a record-size limit. A batch that reaches it may pipeline
+    /// behind unconfirmed APPENDs; a partial batch waits for their confirmation.
     pub batch_target_bytes: usize,
     /// Maximum intentional collection delay. Use `Duration::ZERO` by default.
     /// Full batches and explicit flushes do not wait for this timer.
@@ -81,7 +68,8 @@ pub struct WriterConfig {
     /// Maximum concurrent producer handles. All handles share bounded admission.
     pub max_producers: usize,
     /// Maximum APPEND requests awaiting full confirmation across all handles.
-    /// Nonzero. Partial confirmations keep their request slot occupied.
+    /// Nonzero. Partial confirmations keep their request slot occupied. Only
+    /// full batches and flushes use more than one slot.
     /// Separate from finite producer inboxes and OMQ transport queues.
     pub inflight_appends: usize,
 }
@@ -98,22 +86,19 @@ impl WriterConfig {
         self.limits.max_records.max(1024)
     }
 
-    /// Payload bytes one producer handle may admit before request packing.
-    /// One ready request, allowing an intact oversized record.
+    /// Payload and multipart-table bytes one handle may admit before packing.
+    /// One ready request plus an intact lookahead record and their part tables.
     pub(super) fn lane_bytes(&self) -> usize {
-        self.batch_target_bytes.max(self.limits.max_record_bytes)
+        reservation::intake_bytes(self.limits, self.batch_target_bytes)
+            .expect("validated writer intake bounds")
     }
 
     fn parameters_with_local_group(&self, local_group: bool) -> Result<Parameters, WriterError> {
-        let target_valid = match &self.partition {
-            PartitionTarget::Group(partition) => {
-                partition.as_bytes() != &[0; 16]
-                    && (matches!(
-                        self.policy,
-                        Policy::QuorumDurable | Policy::QuorumReplicatedPersisting
-                    ) || local_group && self.policy == Policy::LocalDurable)
-            }
-        };
+        let target_valid = self.partition.as_bytes() != &[0; 16]
+            && (matches!(
+                self.policy,
+                Policy::QuorumDurable | Policy::QuorumReplicatedPersisting
+            ) || local_group && self.policy == Policy::LocalDurable);
         if !target_valid
             || self.producer_id.as_bytes() == &[0; 16]
             || self.owner_epoch == 0
@@ -121,6 +106,9 @@ impl WriterConfig {
             || self.next_sequence > MAX_SEQUENCE
             || self.limits.max_records == 0
             || self.batch_target_bytes == 0
+            || reservation::intake_bytes(self.limits, self.batch_target_bytes)
+                .and_then(|bytes| bytes.checked_mul(self.max_producers))
+                .is_none()
             || tokio::time::Instant::now()
                 .checked_add(self.linger)
                 .is_none()
@@ -137,17 +125,10 @@ impl WriterConfig {
         {
             return Err(WriterError::Configuration);
         }
-        let mut parameters = Parameters::streaming(
-            self.limits,
-            handshake::PRODUCER,
-            self.limits.max_records as u64,
-            self.limits.envelope.max_payload_bytes as u64,
-        )
-        .map_err(|_| WriterError::Configuration)?;
-        if matches!(self.partition, PartitionTarget::Group(_)) {
-            parameters.capabilities |= handshake::OWNER_ROUTING;
-            parameters.required_capabilities |= handshake::OWNER_ROUTING;
-        }
+        let mut parameters = Parameters::streaming(self.limits, handshake::PRODUCER)
+            .map_err(|_| WriterError::Configuration)?;
+        parameters.capabilities |= handshake::OWNER_ROUTING;
+        parameters.required_capabilities |= handshake::OWNER_ROUTING;
         Ok(parameters)
     }
 }
@@ -155,8 +136,8 @@ impl WriterConfig {
 /// A record confirmed under its exact configured owner policy, not processing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordReceipt {
-    /// Original group partition or local topic/partition.
-    pub partition: PartitionTarget,
+    /// Exact partition incarnation selected before record admission.
+    pub partition: PartitionIncarnation,
     /// Original owner fence.
     pub owner_epoch: u64,
     /// Stable producer identity; `first_sequence` identifies this one record.
@@ -210,7 +191,7 @@ impl From<Error> for WriterError {
 #[derive(Debug)]
 pub struct PendingRecord {
     progress: Arc<state::Progress>,
-    completion: Arc<state::RecordCompletion>,
+    completion: state::Completion,
     sequence: u64,
 }
 
@@ -234,13 +215,11 @@ impl PendingRecord {
     }
 
     fn receipt(&self) -> RecordReceipt {
-        let offset = *self
-            .completion
-            .offset
-            .get()
-            .expect("confirmed record has exact offset");
-        self.progress
-            .receipt(self.sequence, self.completion.message_id, offset)
+        self.progress.receipt(
+            self.sequence,
+            self.completion.message_id(),
+            self.completion.offset(),
+        )
     }
 }
 
@@ -300,7 +279,7 @@ impl Writer {
             .ok_or(WriterError::Configuration)?;
         let local = partition.members.len() == 1;
         config.parameters_with_local_group(local)?;
-        if config.partition != PartitionTarget::Group(partition.incarnation)
+        if config.partition != partition.incarnation
             || config.policy != routes.metadata().policy()
             || !matches!(partition.members.len(), 1 | 3)
             || !config.linger.is_zero()
@@ -398,14 +377,15 @@ impl Writer {
     /// observation. Waiting immediately on each handle deliberately serializes work.
     pub async fn send(&mut self, mut record: RecordInput) -> Result<PendingRecord, WriterError> {
         let size = self.shared.validate(&record)?;
+        let retained = state::admission_bytes(size, record.parts().len());
         loop {
             if let Some(result) = self.shared.admit(&mut self.sender, &mut record, size) {
                 return result;
             }
             // Capture after rolling back any temporary reservation, then recheck
-            // availability. Otherwise our own credit notification could spin.
+            // availability. Otherwise our own capacity notification could spin.
             let seen = self.shared.capacity.generation();
-            if self.shared.sealed() || self.shared.inbox.available() {
+            if self.shared.sealed() || self.shared.inbox.available(retained) {
                 continue;
             }
             self.shared.capacity.changed_after(seen).await;

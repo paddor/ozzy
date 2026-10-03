@@ -411,7 +411,7 @@ fn owned_cold_batch_retry_verifies_records_without_per_record_file_jobs() {
         };
         assert_eq!(through, accepted);
         assert_eq!(coordinates(&buffer.0), [(0, 0, 777, 64)]);
-        assert!(jobs <= 64, "cold batch retry issued {jobs} file jobs");
+        assert!(jobs <= 8, "cold batch retry issued {jobs} file jobs");
         let mut changed = request(12, 0, 64);
         changed.records[31].parts = vec![b"conflicting later record".as_slice()].into();
         let buffer = proposal(&replica, [changed]);

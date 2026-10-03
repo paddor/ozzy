@@ -63,7 +63,7 @@ fn failure(error: BrokerLinkError) -> Failure {
             Failure::Retry(None)
         }
         BrokerLinkError::Rejected {
-            retry: RetryClass::AfterCredit,
+            retry: RetryClass::AfterBackoff,
             ..
         } => Failure::Later,
         BrokerLinkError::Rejected { retry, hint, .. } if retry != RetryClass::Permanent => {

@@ -15,8 +15,11 @@ use std::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+/// Build and correctness checks required before comparison runs.
 pub enum Checks {
+    /// Run the complete qualification checks before measuring.
     Full,
+    /// Run formatting and worker build checks for a focused development loop.
     Focused,
 }
 
@@ -28,34 +31,44 @@ const PARTITIONS_PER_WRITER_PROCESS: u64 = 2;
     clippy::struct_excessive_bools,
     reason = "independent command-line switches"
 )]
+/// Serial comparison cases, placement, resource limits, and build policy.
 pub struct Args {
     /// Three placements: all-local, or two local and one remote broker.
     #[arg(long)]
     pub placements: Option<PathBuf>,
     #[arg(long)]
+    /// Reachable TCP control bind for distributed worker orchestration.
     pub control_bind: Option<String>,
     #[arg(long="impl",default_value="all",value_parser=["all","ozzy","iggy","redpanda"])]
+    /// Selected implementation, or all implementations in the comparison set.
     pub implementation: String,
     #[arg(long, value_delimiter = ',', default_value = "128,1024,8192")]
+    /// Payload byte sizes included in the case matrix.
     pub sizes: Vec<u64>,
     #[arg(
         long,
         value_delimiter = ',',
         default_value = "durable,replicated-persisting"
     )]
+    /// Confirmation and persistence modes included in the case matrix.
     pub modes: Vec<String>,
     /// Events use binary fields at 16 B and OMQ's JSON event stream at larger sizes.
     #[arg(long, value_delimiter = ',', default_value = "events")]
     pub patterns: Vec<String>,
     #[arg(long, default_value_t = 1)]
+    /// Independent fresh-server repetitions per case.
     pub repetitions: u64,
     #[arg(long, default_value_t = 10.0)]
+    /// Measured submission window in seconds.
     pub duration: f64,
     #[arg(long, default_value_t = 5.0)]
+    /// Unmeasured warmup window in seconds.
     pub warmup: f64,
     #[arg(long, default_value_t = 32768)]
+    /// Retained disk history capacity per run in MiB.
     pub disk_history_mib: u64,
     #[arg(long, default_value_t = 8)]
+    /// Total shared partitions distributed across broker leaders.
     pub partitions: u64,
     /// Native Ozzy readers subscribed to each partition; each verifies every record.
     #[arg(long, default_value_t = 1)]
@@ -87,11 +100,19 @@ pub struct Args {
     /// Native APPEND requests awaiting full confirmation per writer connection.
     #[arg(long, default_value_t = 1)]
     pub writer_inflight_appends: u64,
+    /// Native SDK APPEND collection ceiling in KiB; record limits still apply.
+    #[arg(long, default_value_t = (crate::native::DEFAULT_SDK_BATCH_TARGET_BYTES / 1024) as u32,
+        value_parser = clap::value_parser!(u32).range(1..=16384))]
+    pub writer_batch_target_kib: u32,
+    /// Native retained APPEND byte budget per application shard, in MiB.
+    #[arg(long)]
+    pub shard_resident_mib: Option<u64>,
     /// One CPU list shared by all brokers, or one list per broker separated
     /// by `/`. The default gives each broker one physical core.
     #[arg(long, default_value = "0/1/2", value_parser = BrokerCpus::parse)]
     pub broker_cpus: BrokerCpus,
     #[arg(long, value_delimiter = ',', default_value = "3,4,5")]
+    /// CPU IDs reserved for benchmark client processes.
     pub client_cpus: Vec<usize>,
     /// Ozzy disk groups write segment groups with `O_DIRECT`.
     #[arg(long)]
@@ -106,19 +127,23 @@ pub struct Args {
     #[arg(long)]
     pub segment_mib: Option<u64>,
     #[arg(long)]
+    /// Total offered record rate; none selects completion-paced saturation.
     pub records_per_second: Option<u64>,
     /// Continuous offered-load ramp, `RATE:SECONDS,...`; `--duration` must
     /// equal its total. Each stage becomes one result row.
     #[arg(long, conflicts_with = "records_per_second")]
     pub ramp: Option<crate::schedule::Ramp>,
     #[arg(long)]
+    /// Reuse existing checked worker and external-server binaries.
     pub no_build: bool,
-    /// Development loop: fmt, worker-only clippy/build; run focused correctness tests separately.
+    /// Development loop: fmt and worker build; run affected tests separately.
     #[arg(long, value_enum, default_value = "full")]
     pub checks: Checks,
     #[arg(long)]
+    /// Run qualification checks without launching measured cases.
     pub check_only: bool,
     #[arg(long)]
+    /// Emit case configuration without starting servers or workloads.
     pub dry_run: bool,
 }
 
@@ -250,6 +275,7 @@ impl Args {
         Ok(())
     }
 
+    /// Reject unsupported cases, conflicting options, and invalid placement or capacity.
     pub fn validate(&self) -> Result<()> {
         self.validate_shards()?;
         self.validate_placements()?;
@@ -276,6 +302,10 @@ impl Args {
             || !(1..=65536).contains(&self.reader_records)
             || !(1..=128).contains(&self.reader_payload_mib)
             || !(1..=65536).contains(&self.writer_inflight_appends)
+            || self.shard_resident_mib.is_some_and(|mib| {
+                !(1..=16384).contains(&mib)
+                    || matches!(self.implementation.as_str(), "iggy" | "redpanda")
+            })
             || !(0.05..=120.0).contains(&self.duration)
             || !(0.0..=10.0).contains(&self.warmup)
             || !(4..=65536).contains(&self.disk_history_mib)
@@ -318,6 +348,7 @@ impl Args {
         }
         Ok(())
     }
+    /// Serialize the complete comparison configuration for result provenance.
     pub fn configuration(&self) -> Value {
         let mut config = json!({"impl":self.implementation,"sizes":self.sizes,"modes":self.modes,"codecs":["raw"],"patterns":self.patterns,"repetitions":self.repetitions,"duration":self.duration,"warmup":self.warmup,"disk_history_mib":self.disk_history_mib,"partitions":self.partitions,"request_records":self.request_records,"reader_records":self.reader_records,"reader_payload_mib":self.reader_payload_mib,"writer_inflight_appends":self.writer_inflight_appends,"compression_workers":0,"broker_cpus":self.broker_cpus.pool(),"broker_cpu_sets":self.broker_cpus.sets(),"client_cpus":self.client_cpus,"durable_segment_io":"odsync","segment_mib":self.segment_mib,"records_per_second":self.records_per_second,"ramp":self.ramp.as_ref().map(ToString::to_string),"no_build":self.no_build,"check_only":self.check_only});
         if self.payload_compression == "off" {
@@ -345,7 +376,7 @@ impl Args {
         if let Some(shards) = self.shards {
             config["native_shards"] = json!(shards);
         }
-        config["native_batch_target_bytes"] = json!(4 * 1024 * 1024);
+        config["native_batch_target_bytes"] = json!(u64::from(self.writer_batch_target_kib) * 1024);
         config["writer_batching"] = json!(true);
         config["writer_protocol"] = json!("peer-appends");
         if self.readers_per_partition != 1 {
@@ -366,6 +397,9 @@ impl Args {
         }
         if let Some(depth) = self.aio_depth {
             config["disk_aio_depth"] = json!(depth);
+        }
+        if let Some(mib) = self.shard_resident_mib {
+            config["shard_resident_mib"] = json!(mib);
         }
         config
     }
@@ -391,6 +425,7 @@ impl Args {
         }
         case
     }
+    /// Expand modes, sizes, payload patterns, and repetitions into serial cases.
     pub fn cases(&self) -> Vec<Value> {
         let mut cases = vec![];
         for mode in &self.modes {
@@ -415,6 +450,7 @@ impl Args {
         clippy::too_many_lines,
         reason = "One auditable table of benchmark arguments"
     )]
+    /// Build the worker command for one case with its storage and endpoint bindings.
     pub fn command(
         &self,
         binary: &Path,
@@ -523,6 +559,13 @@ impl Args {
                 "--writer-inflight-appends",
                 self.writer_inflight_appends.to_string(),
             );
+            add(
+                "--writer-batch-target-kib",
+                self.writer_batch_target_kib.to_string(),
+            );
+            if let Some(mib) = self.shard_resident_mib {
+                add("--shard-resident-mib", mib.to_string());
+            }
             if let Some(direct) = self.direct_io {
                 add("--direct-io", direct.to_string());
             }
@@ -625,8 +668,7 @@ fn build(args: &Args, directory: &Path) -> Result<PathBuf> {
         ],
     ];
     if args.checks == Checks::Focused {
-        commands[1].splice(6..7, ["--bin", "ozy_timed_bench"]);
-        commands.remove(2);
+        commands.drain(1..3);
     }
     for (index, args) in commands.iter().enumerate() {
         check_canceled()?;
@@ -942,6 +984,7 @@ async fn matrix(
     Ok(rows)
 }
 
+/// Qualify binaries, run fresh isolated servers serially, and append verified result rows.
 pub async fn run(mut args: Args) -> Result<()> {
     install_signals()?;
     args.validate()?;

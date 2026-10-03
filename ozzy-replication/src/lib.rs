@@ -11,6 +11,7 @@
 //! Payload validation, persistence, transport, and deterministic application are
 //! separate adapters. Normal metadata storage is preallocated and byte-bounded.
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 mod configuration_record;
 pub mod driver;

@@ -14,7 +14,7 @@ pub(super) struct Entry {
     pub predecessor: Prefix,
     pub end: Prefix,
     pub operations: usize,
-    pub body_bytes: usize,
+    pub retained_bytes: usize,
     pub packets: [Option<Message>; 3],
 }
 
@@ -23,7 +23,7 @@ pub(super) struct Recent {
     entries: VecDeque<Entry>,
     limits: PipelineLimits,
     operations: usize,
-    body_bytes: usize,
+    retained_bytes: usize,
 }
 
 impl Recent {
@@ -32,20 +32,25 @@ impl Recent {
             entries: VecDeque::with_capacity(limits.max_operations),
             limits,
             operations: 0,
-            body_bytes: 0,
+            retained_bytes: 0,
         }
     }
 
     pub(super) fn clear(&mut self) {
         self.entries.clear();
         self.operations = 0;
-        self.body_bytes = 0;
+        self.retained_bytes = 0;
     }
 
     /// Only the actor's same-image, applied live retirement may populate this cache.
     pub(super) fn retain(&mut self, entry: Entry) {
         assert!(entry.operations > 0 && entry.operations <= self.limits.max_operations);
-        assert!(entry.body_bytes <= self.limits.max_body_bytes);
+        // Transport slabs can exceed the visible payload. Cache admission must
+        // charge the backing once, and let oversized packets fall back to disk.
+        if entry.retained_bytes > self.limits.max_body_bytes {
+            self.clear();
+            return;
+        }
         if self.entries.back().is_some_and(|last| {
             last.scope != entry.scope
                 || last.generation != entry.generation
@@ -55,14 +60,14 @@ impl Recent {
             self.clear();
         }
         while entry.operations > self.limits.max_operations - self.operations
-            || entry.body_bytes > self.limits.max_body_bytes - self.body_bytes
+            || entry.retained_bytes > self.limits.max_body_bytes - self.retained_bytes
         {
             let oldest = self.entries.pop_front().expect("nonempty overfull cache");
             self.operations -= oldest.operations;
-            self.body_bytes -= oldest.body_bytes;
+            self.retained_bytes -= oldest.retained_bytes;
         }
         self.operations += entry.operations;
-        self.body_bytes += entry.body_bytes;
+        self.retained_bytes += entry.retained_bytes;
         self.entries.push_back(entry);
     }
 
@@ -107,7 +112,7 @@ impl Recent {
     }
 }
 
-impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
+impl ReplicaActor {
     pub(super) fn replay_recent(
         &mut self,
         voter: usize,
@@ -121,7 +126,7 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
         else {
             return Ok(false);
         };
-        // The cache bounds count/body work. New credit and repairs share
+        // The cache bounds count/body work. New sends and repairs share
         // the same sender; refreshed piggyback commits release each bounded chunk.
         for index in first..self.work.recent.entries.len() {
             let entry = &mut self.work.recent.entries[index];

@@ -80,7 +80,7 @@ pub struct OwnedJournal {
     recovery: CanonicalRecoveryLimits,
     buffer_generation: JournalGeneration,
     buffers: Arc<Semaphore>,
-    append_memory: Option<crate::memory::AllocationSource>,
+    append_memory: Option<crate::memory::Owner>,
     append_leased: std::cell::Cell<bool>,
     append_limits: PipelineLimits,
     faulted: bool,
@@ -94,7 +94,7 @@ impl OwnedJournal {
         self,
         config: super::ShardJournalConfig,
         timestamp: impl Fn() -> u64 + 'static,
-    ) -> Result<super::ReplicaJournal<super::ShardJournal>, JournalError> {
+    ) -> Result<super::ReplicaJournal, JournalError> {
         self.healthy()?;
         self.writeback.require_idle()?;
         self.journal.ready()?;
@@ -109,14 +109,9 @@ impl OwnedJournal {
         {
             return Err(JournalError::Configuration);
         }
-        let (sender, receiver) = super::mpsc::notified_channel(config.commands);
-        let mut write_pipeline = super::WritePipelineConfig::for_backlog(self.writeback.limits);
-        write_pipeline.write_group_target_bytes = self.writeback.group_bytes;
-        write_pipeline.aio_depth = config.write_depth;
         let journal = super::ReplicaJournal {
-            write_pipeline,
+            backlog: self.writeback.limits,
             replicated: self.configuration.memory_voting(),
-            sender: Some(sender),
             capacity: Arc::new(Semaphore::new(config.commands)),
             command_capacity: config.commands,
             read_capacity: Arc::new(Semaphore::new(self.read_limits.concurrent_reads)),
@@ -124,11 +119,13 @@ impl OwnedJournal {
             append_memory: self
                 .append_memory
                 .as_ref()
-                .map(crate::memory::AllocationSource::allocator),
+                .map(crate::memory::Owner::allocator),
             append_limits: self.append_limits,
             operations: self.limits.operations,
             buffer_generation: self.buffer_generation,
-            execution: super::ShardJournal::new(self, receiver, config, timestamp),
+            execution: super::execution::Execution::Normal(super::ShardJournal::new(
+                self, config, timestamp,
+            )),
         };
         Ok(journal)
     }
@@ -314,7 +311,7 @@ impl OwnedJournal {
             lease,
             self.append_memory
                 .as_ref()
-                .map(crate::memory::AllocationSource::allocator),
+                .map(crate::memory::Owner::allocator),
         ))
     }
 
@@ -324,22 +321,12 @@ impl OwnedJournal {
         &mut self,
         memory: &crate::memory::Owner,
     ) -> Result<(), JournalError> {
-        self.bind_append_source(crate::memory::AllocationSource::Shared(memory.clone()))
-    }
-
-    /// Use only allocation capacity explicitly reserved by the shared shard
-    /// owner. The allowance survives recovery and is initially permitted to be
-    /// empty. Reserve enough physical allocations before advertising intake.
-    pub fn bind_append_capacity(
-        &mut self,
-        capacity: &crate::memory::Capacity,
-    ) -> Result<(), JournalError> {
-        self.bind_append_source(crate::memory::AllocationSource::Reserved(capacity.clone()))
+        self.bind_append_source(memory.clone())
     }
 
     pub(in crate::replica_journal) fn bind_append_source(
         &mut self,
-        memory: crate::memory::AllocationSource,
+        memory: crate::memory::Owner,
     ) -> Result<(), JournalError> {
         if self.append_memory.is_some() || self.append_leased.get() {
             return Err(JournalError::Configuration);

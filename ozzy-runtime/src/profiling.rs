@@ -23,264 +23,169 @@ thread_local! {
     static LOCAL: RefCell<Option<Box<Local>>> = const { RefCell::new(None) };
 }
 
-/// Measured local stages; transport transit between processes is excluded.
-#[derive(Clone, Copy, Debug)]
-#[repr(usize)]
-pub enum Stage {
-    /// SDK admission to request packing, per record transmission attempt.
-    SdkQueue,
-    /// Received confirmation decoding and SDK prefix publication, per reply.
-    ConfirmationApply,
-    /// OMQ admission to complete APPEND confirmation, per request.
-    RequestRoundtrip,
-    /// Proposal submission to the replication actor starting validation.
-    ReplicaQueue,
-    /// Leader-local admission completion to the successful proposal reply.
-    /// Includes waiting for another broker and applying the confirmed prefix.
-    ReplicaConfirmation,
-    /// Local actor proposal submission through validation completion.
-    LocalPropose,
-    /// Local actor admission submission through its journal completion.
-    LocalAdmit,
-    /// Local actor admission through observed physical write completion.
-    LocalWrite,
-    /// Local actor barrier submission through durable evidence publication.
-    LocalSyncPublish,
-    /// Durable evidence publication through local driver installation.
-    LocalSyncInstall,
-    /// Local actor apply submission through journal completion.
-    LocalApply,
-    /// Physical data-write future, excluding journal scheduling and installation.
-    JournalPhysicalWrite,
-    /// Detached data barrier and durability evidence publication future.
-    JournalPhysicalSync,
-    /// Reader request admission through observed journal completion, before encoding.
-    ReaderJournal,
-    /// Resident or historical delivery encoded into one reader reply.
-    ReaderEncode,
-    /// SDK materializes one buffered live or replayed record, excluding socket wait.
-    ReaderMaterialize,
-    /// Whole-APPEND LZ4 attempt in SDK preparation runtime.
-    SdkCompression,
-    /// Broker shard output enqueue through dispatcher reply admission.
-    ShardReplyQueue,
+// Variant indices and published labels come from one ordered declaration.
+macro_rules! counters {
+    (
+        $(#[$kind_doc:meta])* $kind:ident, $names:ident {
+            $($(#[$variant_doc:meta])* $variant:ident => $label:literal),* $(,)?
+        }
+    ) => {
+        $(#[$kind_doc])*
+        #[derive(Clone, Copy, Debug)]
+        #[repr(usize)]
+        pub enum $kind {
+            $($(#[$variant_doc])* $variant),*
+        }
+        const $names: [&str; [$($label),*].len()] = [$($label),*];
+    };
 }
 
-const NAMES: [&str; 18] = [
-    "sdk_queue",
-    "confirmation_apply",
-    "request_roundtrip",
-    "replica_proposal_queue",
-    "replica_confirmation",
-    "local_propose",
-    "local_admit",
-    "local_write",
-    "local_sync_publish",
-    "local_sync_install",
-    "local_apply",
-    "journal_physical_write",
-    "journal_physical_sync",
-    "reader_journal",
-    "reader_encode",
-    "reader_materialize",
-    "sdk_compression",
-    "shard_reply_queue",
-];
-
-/// Opt-in replication events. Counts describe transport policy, never votes.
-#[derive(Clone, Copy, Debug)]
-#[repr(usize)]
-pub enum Event {
-    /// Fresh data packet reserved and queued to one follower.
-    ReplicaSend,
-    /// Data packet queued using an existing repair reservation.
-    ReplicaRepair,
-    /// Validated packet reached the follower's normal receive policy.
-    ReplicaReceive,
-    /// Packet skipped because its predecessor is ahead of the retained prefix.
-    ReplicaReceiveGap,
-    /// Packet skipped because its complete suffix exceeds remaining capacity.
-    ReplicaReceiveCapacity,
-    /// Packet was already present in the retained receive prefix.
-    ReplicaReceiveDuplicate,
-    /// Correlated status query queued to one peer, including retries.
-    ReplicaProbe,
-    /// Worker result rejected because its application/authority ticket changed.
-    ReplicaStaleValidation,
-    /// Recent replay lookup has no entries in this authority generation.
-    ReplayCacheEmpty,
-    /// Applied packets no longer form a contiguous history in the same image.
-    ReplayCacheReset,
-    /// Requested predecessor has fallen out of the bounded packet cache.
-    ReplayCacheEvicted,
-    /// Requested predecessor is inside a retained multi-operation packet.
-    ReplayCacheInterior,
-    /// Requested predecessor is beyond the retained packet range.
-    ReplayCacheAhead,
-    /// Recent packet found, but send range or flow metadata cannot serve it.
-    ReplayPacketMiss,
-    /// Recent packets served replay without reserving journal work.
-    ReplayCacheHit,
-    /// Cold replay waits for pending persistence to settle, per actor turn.
-    ReplayPersistenceWait,
-    /// Cold replication fetch submitted to the journal owner.
-    ReplayDiskFetch,
-    /// One live publication queued for the group.
-    ReplicaPublication,
-    /// Publication passed leader/scope/integrity checks.
-    ReplicaPublicationReceived,
-    /// Canonical bytes submitted to PUB once, before transport fan-out.
-    PublicationBytes,
-    /// Canonical bytes submitted for targeted PEER replication, including retries.
-    ReplicaPayloadBytes,
-    /// Canonical bytes inspected by receive staging, including held-message retries.
-    ReceiveBytes,
-    /// Canonical bytes in packets wholly covered by the receive cursor.
-    DuplicateBytes,
-    /// Canonical bytes newly retained by receive staging.
-    RetainedBytes,
-    /// One publication of confirmed records queued for every live reader.
-    ReaderPublication,
-    /// SDK whole-APPEND LZ4 attempts.
-    SdkCompressionAttempt,
-    /// SDK attempts retained as LZ4.
-    SdkCompressionWin,
-    /// SDK attempts retained raw.
-    SdkCompressionRaw,
-    /// Raw bytes presented to SDK LZ4 attempts.
-    SdkCompressionInputBytes,
-    /// Candidate bytes produced by SDK LZ4 attempts.
-    SdkCompressionOutputBytes,
-    /// Journal-owner whole-APPEND LZ4 attempts.
-    BrokerCompressionAttempt,
-    /// Journal-owner attempts retained as LZ4.
-    BrokerCompressionWin,
-    /// Journal-owner attempts retained raw.
-    BrokerCompressionRaw,
-    /// Raw bytes presented to journal-owner LZ4 attempts.
-    BrokerCompressionInputBytes,
-    /// Candidate bytes produced by journal-owner LZ4 attempts.
-    BrokerCompressionOutputBytes,
-    /// Streaming proposals submitted by a leader, grouped or alone.
-    StreamingProposal,
-    /// Writer APPENDs carried by those proposals.
-    StreamingProposalAppend,
-    /// Follower validations queued behind a running install turn.
-    ReplicaFollowOnValidation,
-    /// Peak, not a count: live operations awaiting application or persistence.
-    LiveWindowPeakOperations,
-    /// Peak, not a count: live body bytes awaiting application or persistence.
-    LiveWindowPeakBytes,
-    /// Leader proposals held back until the live window had room.
-    LiveWindowFull,
-    /// SDK APPEND refused until broker credit becomes available.
-    SdkCreditRefusal,
-    /// SDK APPEND sent with a reduced one-request window after credit refusal.
-    SdkSingleFlightAppend,
-    /// Dispatcher refused client data before shard admission.
-    DispatcherCreditRefusal,
-    /// Dispatcher had no installed grant for the client writer scope.
-    DispatcherMissingGrant,
-    /// An installed client writer grant lacked count or byte credit.
-    DispatcherGrantExhausted,
-    /// Native APPEND proposal lane refused an otherwise prepared request.
-    NativeProposalRefusal,
-    /// Dispatcher reply queue refused a shard-owned frame.
-    ShardReplyRefusal,
-    /// Local command lane refused a shard-owned reply.
-    ShardPortRefusal,
-    /// Follower's unused receive credit was fenced with a new epoch.
-    ReplicaCreditRevocation,
-    /// Dispatcher refused a broker data frame before shard admission.
-    DispatcherBrokerRefusal,
-    /// Broker data arrived without an installed destination grant.
-    DispatcherBrokerNoGrant,
-    /// Broker data exceeded an installed destination grant.
-    DispatcherBrokerGrantFull,
-    /// Broker data found no remaining message slot in its grant.
-    DispatcherBrokerMessageFull,
-    /// Broker data exceeded the remaining byte allowance in its grant.
-    DispatcherBrokerByteFull,
-    /// Grant appears sufficient after failure; backing memory or refill race.
-    DispatcherBrokerOtherFull,
-    /// Broker data used a revoked destination grant.
-    DispatcherBrokerGrantRevoked,
-    /// Shard could not install an intake token within its dispatch bounds.
-    IntakeGrantFull,
-    /// Shard could not back an intake promise with canonical memory.
-    IntakeCanonicalFull,
-    /// Replica data rejected before spending a fresh actor-backed reservation.
-    DispatcherReplicaFenceRejected,
-    /// Same-channel 45-byte receipt/credit report queued to PEER.
-    CompactCredit,
-    /// Full history/session binding or correlated probe response.
-    FullCredit,
+counters! {
+    /// Measured local stages; transport transit between processes is excluded.
+    Stage, NAMES {
+        /// SDK admission to request packing, per record transmission attempt.
+        SdkQueue => "sdk_queue",
+        /// Received confirmation decoding and SDK prefix publication, per reply.
+        ConfirmationApply => "confirmation_apply",
+        /// OMQ admission to complete APPEND confirmation, per request.
+        RequestRoundtrip => "request_roundtrip",
+        /// Proposal submission to the replication actor starting validation.
+        ReplicaQueue => "replica_proposal_queue",
+        /// Leader-local admission completion to the successful proposal reply.
+        /// Includes waiting for another broker and applying the confirmed prefix.
+        ReplicaConfirmation => "replica_confirmation",
+        /// Local actor proposal submission through validation completion.
+        LocalPropose => "local_propose",
+        /// Local actor admission submission through its journal completion.
+        LocalAdmit => "local_admit",
+        /// Local actor admission through observed physical write completion.
+        LocalWrite => "local_write",
+        /// Local actor barrier submission through durable evidence publication.
+        LocalSyncPublish => "local_sync_publish",
+        /// Durable evidence publication through local driver installation.
+        LocalSyncInstall => "local_sync_install",
+        /// Local actor apply submission through journal completion.
+        LocalApply => "local_apply",
+        /// Physical data-write future, excluding journal scheduling and installation.
+        JournalPhysicalWrite => "journal_physical_write",
+        /// Detached data barrier and durability evidence publication future.
+        JournalPhysicalSync => "journal_physical_sync",
+        /// Reader request admission through observed journal completion, before encoding.
+        ReaderJournal => "reader_journal",
+        /// Resident or historical delivery encoded into one reader reply.
+        ReaderEncode => "reader_encode",
+        /// SDK materializes one buffered live or replayed record, excluding socket wait.
+        ReaderMaterialize => "reader_materialize",
+        /// Whole-APPEND LZ4 attempt in SDK preparation runtime.
+        SdkCompression => "sdk_compression",
+        /// Broker shard output enqueue through dispatcher reply admission.
+        ShardReplyQueue => "shard_reply_queue",
+    }
 }
 
-const EVENT_NAMES: [&str; 62] = [
-    "replica_send",
-    "replica_repair",
-    "replica_receive",
-    "replica_receive_gap",
-    "replica_receive_capacity",
-    "replica_receive_duplicate",
-    "replica_probe",
-    "replica_stale_validation",
-    "replay_cache_empty",
-    "replay_cache_reset",
-    "replay_cache_evicted",
-    "replay_cache_interior",
-    "replay_cache_ahead",
-    "replay_packet_miss",
-    "replay_cache_hit",
-    "replay_persistence_wait",
-    "replay_disk_fetch",
-    "replica_publication",
-    "replica_publication_received",
-    "publication_bytes",
-    "replica_payload_bytes",
-    "receive_bytes",
-    "duplicate_bytes",
-    "retained_bytes",
-    "reader_publication",
-    "sdk_compression_attempt",
-    "sdk_compression_win",
-    "sdk_compression_raw",
-    "sdk_compression_input_bytes",
-    "sdk_compression_output_bytes",
-    "broker_compression_attempt",
-    "broker_compression_win",
-    "broker_compression_raw",
-    "broker_compression_input_bytes",
-    "broker_compression_output_bytes",
-    "streaming_proposal",
-    "streaming_proposal_append",
-    "replica_follow_on_validation",
-    "live_window_peak_operations",
-    "live_window_peak_bytes",
-    "live_window_full",
-    "sdk_credit_refusal",
-    "sdk_single_flight_append",
-    "dispatcher_credit_refusal",
-    "dispatcher_missing_grant",
-    "dispatcher_grant_exhausted",
-    "native_proposal_refusal",
-    "shard_reply_refusal",
-    "shard_port_refusal",
-    "replica_credit_revocation",
-    "dispatcher_broker_refusal",
-    "dispatcher_broker_no_grant",
-    "dispatcher_broker_grant_full",
-    "dispatcher_broker_message_full",
-    "dispatcher_broker_byte_full",
-    "dispatcher_broker_other_full",
-    "dispatcher_broker_grant_revoked",
-    "intake_grant_full",
-    "intake_canonical_full",
-    "dispatcher_replica_fence_rejected",
-    "compact_credit",
-    "full_credit",
-];
+counters! {
+    /// Opt-in replication events. Counts describe transport policy, never votes.
+    Event, EVENT_NAMES {
+        /// Fresh data packet reserved and queued to one follower.
+        ReplicaSend => "replica_send",
+        /// Data packet queued using an existing repair reservation.
+        ReplicaRepair => "replica_repair",
+        /// Validated packet reached the follower's normal receive policy.
+        ReplicaReceive => "replica_receive",
+        /// Packet skipped because its predecessor is ahead of the retained prefix.
+        ReplicaReceiveGap => "replica_receive_gap",
+        /// Packet skipped because its complete suffix exceeds remaining capacity.
+        ReplicaReceiveCapacity => "replica_receive_capacity",
+        /// Packet was already present in the retained receive prefix.
+        ReplicaReceiveDuplicate => "replica_receive_duplicate",
+        /// Correlated status query queued to one peer, including retries.
+        ReplicaProbe => "replica_probe",
+        /// Worker result rejected because its application/authority ticket changed.
+        ReplicaStaleValidation => "replica_stale_validation",
+        /// Recent replay lookup has no entries in this authority generation.
+        ReplayCacheEmpty => "replay_cache_empty",
+        /// Applied packets no longer form a contiguous history in the same image.
+        ReplayCacheReset => "replay_cache_reset",
+        /// Requested predecessor has fallen out of the bounded packet cache.
+        ReplayCacheEvicted => "replay_cache_evicted",
+        /// Requested predecessor is inside a retained multi-operation packet.
+        ReplayCacheInterior => "replay_cache_interior",
+        /// Requested predecessor is beyond the retained packet range.
+        ReplayCacheAhead => "replay_cache_ahead",
+        /// Recent packet found, but send range or flow metadata cannot serve it.
+        ReplayPacketMiss => "replay_packet_miss",
+        /// Recent packets served replay without reserving journal work.
+        ReplayCacheHit => "replay_cache_hit",
+        /// Cold replay waits for pending persistence to settle, per actor turn.
+        ReplayPersistenceWait => "replay_persistence_wait",
+        /// Cold replication fetch submitted to the journal owner.
+        ReplayDiskFetch => "replay_disk_fetch",
+        /// One live publication queued for the group.
+        ReplicaPublication => "replica_publication",
+        /// Publication passed leader/scope/integrity checks.
+        ReplicaPublicationReceived => "replica_publication_received",
+        /// Canonical bytes submitted for targeted PEER replication, including retries.
+        ReplicaPayloadBytes => "replica_payload_bytes",
+        /// Canonical bytes inspected by receive staging, including held-message retries.
+        ReceiveBytes => "receive_bytes",
+        /// Canonical bytes in packets wholly covered by the receive cursor.
+        DuplicateBytes => "duplicate_bytes",
+        /// Canonical bytes newly retained by receive staging.
+        RetainedBytes => "retained_bytes",
+        /// One publication of confirmed records queued for every live reader.
+        ReaderPublication => "reader_publication",
+        /// SDK whole-APPEND LZ4 attempts.
+        SdkCompressionAttempt => "sdk_compression_attempt",
+        /// SDK attempts retained as LZ4.
+        SdkCompressionWin => "sdk_compression_win",
+        /// SDK attempts retained raw.
+        SdkCompressionRaw => "sdk_compression_raw",
+        /// Raw bytes presented to SDK LZ4 attempts.
+        SdkCompressionInputBytes => "sdk_compression_input_bytes",
+        /// Candidate bytes produced by SDK LZ4 attempts.
+        SdkCompressionOutputBytes => "sdk_compression_output_bytes",
+        /// Journal-owner whole-APPEND LZ4 attempts.
+        BrokerCompressionAttempt => "broker_compression_attempt",
+        /// Journal-owner attempts retained as LZ4.
+        BrokerCompressionWin => "broker_compression_win",
+        /// Journal-owner attempts retained raw.
+        BrokerCompressionRaw => "broker_compression_raw",
+        /// Raw bytes presented to journal-owner LZ4 attempts.
+        BrokerCompressionInputBytes => "broker_compression_input_bytes",
+        /// Candidate bytes produced by journal-owner LZ4 attempts.
+        BrokerCompressionOutputBytes => "broker_compression_output_bytes",
+        /// Peak, not a count: live operations awaiting application or persistence.
+        LiveWindowPeakOperations => "live_window_peak_operations",
+        /// Peak, not a count: live body bytes awaiting application or persistence.
+        LiveWindowPeakBytes => "live_window_peak_bytes",
+        /// Leader proposals held back until the live window had room.
+        LiveWindowFull => "live_window_full",
+        /// SDK APPEND refused until broker admission capacity becomes available.
+        SdkAdmissionRefusal => "sdk_admission_refusal",
+        /// Native APPEND proposal lane refused an otherwise prepared request.
+        NativeProposalRefusal => "native_proposal_refusal",
+        /// Dispatcher reply queue refused a shard-owned frame.
+        ShardReplyRefusal => "shard_reply_refusal",
+        /// Local command lane refused a shard-owned reply.
+        ShardPortRefusal => "shard_port_refusal",
+        /// Same-channel 29-byte receipt report queued to PEER.
+        CompactReceipt => "compact_receipt",
+        /// Full history/session binding or correlated probe response.
+        FullReceipt => "full_receipt",
+        /// Partition actor answered a writer request with an admission refusal.
+        NativeAdmissionRefusal => "native_admission_refusal",
+        /// Dequeued client input discarded without a reply: stale or ignored.
+        ShardInputDiscarded => "shard_input_discarded",
+        /// One shard scheduler poll (a wakeup of the shard thread).
+        ShardTurn => "shard_turn",
+        /// Lossy follower PUB socket could not accept a frame.
+        ReplicaPublicationSendDrop => "replica_publication_send_drop",
+        /// Follower PUB frame could not enter its bounded shard queue.
+        ReplicaPublicationQueueDrop => "replica_publication_queue_drop",
+        /// Follower PUB frame arrived beyond the contiguous retained prefix.
+        ReplicaPublicationGap => "replica_publication_gap",
+    }
+}
 
 struct Local {
     events: [u64; EVENT_NAMES.len()],
@@ -357,7 +262,7 @@ impl Local {
             "pid":std::process::id(),"thread":self.thread,
             "thread_name":self.thread_name,"sequence":self.sequence,
             "elapsed_ms":self.started.elapsed().as_millis(),
-            "events":events,"stages":stages
+            "events":events,"stages":stages,
         });
         if let Ok(bytes) = serde_json::to_vec(&row) {
             let _ = socket.try_send(Message::from(bytes));

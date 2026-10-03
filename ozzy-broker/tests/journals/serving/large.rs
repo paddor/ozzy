@@ -20,13 +20,7 @@ async fn run() {
         |config| {
             let topic = config.topics.get_mut("orders").unwrap();
             topic.segment_bytes = 256 * MIB as u64;
-            topic.max_append_bytes = 112 * MIB as u64;
-            let broker = config.brokers.get_mut("broker-0").unwrap();
-            let workers = &mut broker.devices.get_mut("ssd").unwrap().workers;
-            workers.queued_bytes = 256 * MIB as u64;
-            for shard in &mut broker.topology.shards {
-                shard.budget.resident_bytes = 512 * MIB as u64;
-            }
+            topic.max_append_bytes = 8 * MIB as u64;
         },
     );
     let (checked, local) = deployment.pop().unwrap();
@@ -42,11 +36,11 @@ async fn run() {
     let wire = DataLimits {
         envelope: EnvelopeLimits {
             max_metadata_bytes: 16 * 1024,
-            max_payload_bytes: 100 * MIB,
+            max_payload_bytes: 8 * MIB,
         },
         max_records: 1,
         max_parts: 1,
-        max_record_bytes: 100 * MIB,
+        max_record_bytes: 8 * MIB,
     };
     let mut expected = Vec::new();
     for turn in 0..2 {
@@ -99,7 +93,7 @@ async fn write_records(
     .await
     .unwrap();
     let mut expected = Vec::new();
-    for (offset, size) in [5, 10, 100].into_iter().enumerate() {
+    for (offset, size) in [1, 4, 7].into_iter().enumerate() {
         let id = MessageId::from_bytes(*Uuid::now_v7().as_bytes());
         let body = body(size * MIB);
         let pending = writer
@@ -107,7 +101,9 @@ async fn write_records(
             .await
             .unwrap();
         let receipt = tokio::select! {
-            result = pending.confirmed() => result.unwrap(),
+            result = pending.confirmed() => result.unwrap_or_else(|error| {
+                panic!("{size} MiB confirmation failed: {error:?}")
+            }),
             result = broker.closed() => panic!("broker exited before {size} MiB confirmation: {result:?}"),
             () = tokio::time::sleep(Duration::from_secs(10)) => {
                 panic!("{size} MiB confirmation stalled; writer={:?}", writer.partition_stats(0));

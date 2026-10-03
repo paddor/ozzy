@@ -1,6 +1,7 @@
 //! Segment state stays on its caller's shard. Every physical effect, including
 //! opening and dropping descriptors, belongs to the shared I/O backend.
 
+use super::SegmentState;
 use crate::async_files as files;
 #[cfg(test)]
 mod tests;
@@ -8,8 +9,8 @@ mod tests;
 use super::{RecoveryValidation, prepared::WriteBytes, recovery};
 use crate::{
     BodyEncoding, CanonicalOperation, CanonicalRecoveryRequirements, ChainPosition, CodecError,
-    DecodeLimits, SEGMENT_HEADER_BYTES, SegmentHeader, SegmentWriteMode, SegmentWriter,
-    WRITE_GROUP_ALIGNMENT, WriterError, WriterPosition, encode_segment_header,
+    DecodeLimits, SEGMENT_HEADER_BYTES, SegmentHeader, SegmentWriteMode, WRITE_GROUP_ALIGNMENT,
+    WriterError, WriterPosition, encode_segment_header,
 };
 use ozzy_io::{Class, Handle, Local, OpenMode, Operation, WriteBuffer};
 use ozzy_journal::{operation::canonical_body_digest, progress::JournalGeneration};
@@ -18,8 +19,11 @@ use std::{io, path::PathBuf};
 /// Chain position at this segment's start, not a declaration of durability.
 #[derive(Debug, Clone, Copy)]
 pub struct Start {
+    /// Owning journal generation fencing obsolete physical completions.
     pub generation: JournalGeneration,
+    /// First expected physical write-group number in this segment.
     pub first_group_number: u64,
+    /// Expected canonical operation number and predecessor digest at open.
     pub initial_chain: ChainPosition,
 }
 
@@ -27,9 +31,13 @@ pub struct Start {
 /// Prepared append bytes must also fit the shard's backend data-byte share.
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
+    /// Maximum physical segment bytes.
     pub max_segment_bytes: u64,
+    /// Maximum physical bytes submitted in one transfer.
     pub chunk_bytes: usize,
+    /// Request direct I/O with backend-owned aligned staging.
     pub direct: bool,
+    /// Explicit physical durability mode for successful writes.
     pub write_mode: SegmentWriteMode,
 }
 
@@ -76,7 +84,7 @@ impl Options {
 /// installed positions remain memory-only. No OS file lives in this object.
 #[derive(Debug)]
 pub struct Writer {
-    state: SegmentWriter<()>,
+    state: SegmentState,
     access: files::Access,
     buffered: Handle,
     output: Handle,
@@ -85,7 +93,7 @@ pub struct Writer {
 }
 
 impl Writer {
-    pub(crate) const fn state(&self) -> &SegmentWriter<()> {
+    pub(crate) const fn state(&self) -> &SegmentState {
         &self.state
     }
 
@@ -124,8 +132,7 @@ impl Writer {
             .write_all(&buffered, 0, &encode_segment_header(&header))
             .await?;
         access.sync(&buffered).await?;
-        let state = SegmentWriter::empty(
-            (),
+        let state = SegmentState::empty(
             header,
             start.generation,
             start.first_group_number,
@@ -197,7 +204,7 @@ impl Writer {
                 limit: options.max_segment_bytes,
             });
         }
-        let access = files::Access { io, protection };
+        let access = files::Access::new(io, protection);
         let buffered = access
             .open(path.clone(), OpenMode::CreateNew, false, false)
             .await?;
@@ -212,8 +219,7 @@ impl Writer {
             .write_all(&buffered, 0, &encode_segment_header(&header))
             .await?;
         access.sync(&buffered).await?;
-        let state = SegmentWriter::empty(
-            (),
+        let state = SegmentState::empty(
             header,
             start.generation,
             start.first_group_number,
@@ -235,7 +241,7 @@ impl Writer {
         requirements: Option<CanonicalRecoveryRequirements>,
     ) -> Result<Self, WriterError> {
         options.validate(&io)?;
-        let access = files::Access { io, protection };
+        let access = files::Access::new(io, protection);
         let buffered = access
             .open(path.clone(), OpenMode::ReadWrite, false, false)
             .await?;
@@ -289,7 +295,7 @@ impl Writer {
 
     async fn finish_open(
         path: PathBuf,
-        mut state: SegmentWriter<()>,
+        mut state: SegmentState,
         access: files::Access,
         buffered: Handle,
         options: Options,
@@ -313,15 +319,19 @@ impl Writer {
         })
     }
 
+    /// Validated physical segment header.
     pub const fn header(&self) -> &SegmentHeader {
         self.state.header()
     }
+    /// Exact written canonical prefix; this does not prove durability.
     pub const fn written_position(&self) -> WriterPosition {
         self.state.written_position()
     }
+    /// Exact matching written prefix covered by a successful data barrier.
     pub const fn durable_position(&self) -> WriterPosition {
         self.state.durable_position()
     }
+    /// Whether failure or canceled mutation fences further use.
     pub const fn is_faulted(&self) -> bool {
         self.interrupted || self.state.is_faulted()
     }
@@ -384,9 +394,7 @@ impl Writer {
         let (plan, bytes) = self
             .state
             .prepare_owned_encoded(operations, digests, prepared)?;
-        let WriteBytes::Contiguous(bytes) = bytes else {
-            unreachable!("owned encoding is contiguous")
-        };
+        let WriteBytes::Contiguous(bytes) = bytes;
         let expected = bytes.len();
         let retained = bytes.capacity();
         let bytes = bytes::Bytes::from(bytes);

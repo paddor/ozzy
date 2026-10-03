@@ -164,7 +164,6 @@ impl ActiveReadIndex {
             .and_then(|run| run.end_offset())
     }
 
-    #[cfg(test)]
     pub(crate) fn entry(
         &self,
         partition: PartitionIncarnation,

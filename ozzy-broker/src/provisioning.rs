@@ -17,8 +17,11 @@ const MAX_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 /// Validated metadata and local topology, not an opened/recovered partition store.
 #[derive(Debug)]
 pub struct CheckedConfig {
+    /// Validated shared deployment settings.
     pub deployment: ValidatedDeployment,
+    /// Exact persistent cluster and broker bindings.
     pub identity: DeploymentIdentity,
+    /// Validated broker-local resources and partition placement.
     pub plan: BrokerPlan,
 }
 

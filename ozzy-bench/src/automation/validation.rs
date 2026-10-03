@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 // Archived local-owner rows used two device writer threads.
 const LEGACY_WRITE_THREADS: u64 = 2;
 
+/// Validate worker counts, throughput, latency, and verification evidence for one case.
 pub fn measurements(case: &Value, row: &Value) -> Result<Value> {
     let profile = case["profile"].as_str().ok_or("missing profile")?;
     let external = profile.starts_with("iggy-")
@@ -146,6 +147,7 @@ fn broker_omq_ownership(row: &Value, config: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Validate comparison policy and resource contracts against the recorded run configuration.
 pub fn comparison(case: &Value, row: &Value, config: &Value) -> Result<Value> {
     if row["profiled"] == true || row["allocation_counted"] == true {
         return Err("instrumented timings cannot enter comparison results".into());
@@ -287,6 +289,7 @@ fn production_comparison(case: &Value, row: &Value, config: &Value, mode: &str) 
     production_cpu_placement(row, config)?;
     payload_encoding(true, row, config)?;
     broker_omq_ownership(row, config)?;
+    production_append_bounds(case, row, config)?;
     let (brokers, copies, policy, confirmation) = match mode {
         "durable" => (1, 1, "local_durable", "local-durable"),
         "disk-quorum" => (3, 2, "quorum_durable", "disk-quorum"),
@@ -367,6 +370,45 @@ fn production_comparison(case: &Value, row: &Value, config: &Value, mode: &str) 
         json!(finite(&result["delivered_s"])? / finite(&result["confirmed_s"])?);
     scheduled_measurements(case, row, config, &mut result)?;
     Ok(result)
+}
+
+fn production_append_bounds(case: &Value, row: &Value, config: &Value) -> Result<()> {
+    let size = case["size"].as_u64().ok_or("missing record size")?;
+    let segment = config["segment_mib"]
+        .as_u64()
+        .unwrap_or_else(|| super::compare::default_segment_mib(size))
+        * 1024
+        * 1024;
+    let expected = crate::native::AppendBudget {
+        writers: usize::try_from(config["partitions"].as_u64().ok_or("missing partitions")?)?,
+        records: usize::try_from(
+            config["request_records"]
+                .as_u64()
+                .ok_or("missing request bound")?,
+        )?,
+        record_bytes: usize::try_from(size)?,
+        target_bytes: usize::try_from(
+            config["native_batch_target_bytes"]
+                .as_u64()
+                .ok_or("missing SDK batch-byte target")?,
+        )?,
+    }
+    .effective_payload(usize::try_from(segment)?, 64 * 1024 * 1024)?;
+    if row["writer_batch_payload_bytes_max"] != expected
+        || row["writer_batch_target_bytes"] != expected
+    {
+        return Err("production SDK byte cap differs from requested configuration".into());
+    }
+    if row["reader_queue_messages"]
+        != crate::native::reader_queue_messages(usize::try_from(
+            row["reader_payload_bytes_max"]
+                .as_u64()
+                .ok_or("missing reader byte cap")?,
+        )?)
+    {
+        return Err("production reader queue exceeds its comparison byte window".into());
+    }
+    Ok(())
 }
 
 fn production_topology(row: &Value, config: &Value, partitions: u64, brokers: u64) -> Result<()> {
@@ -818,14 +860,12 @@ fn decoded_segment_bytes(config: &Value, record_bytes: u64) -> u64 {
         * 1024
 }
 
-fn request_bounds(implementation: &str, mode: &str, row: &Value, config: &Value) -> Result<()> {
-    let native = implementation == "ozzy";
-    payload_encoding(native, row, config)?;
-    if native && let Some(protocol) = config["writer_protocol"].as_str() {
+fn native_writer_controls(row: &Value, config: &Value) -> Result<()> {
+    if let Some(protocol) = config["writer_protocol"].as_str() {
         if row["writer_protocol"] != protocol || row["writer_batch_configuration_applies"] != true {
             return Err("native writer protocol differs from requested configuration".into());
         }
-    } else if native && let Some(batching) = config["writer_batching"].as_bool() {
+    } else if let Some(batching) = config["writer_batching"].as_bool() {
         let expected = if batching {
             "peer-appends"
         } else {
@@ -837,26 +877,37 @@ fn request_bounds(implementation: &str, mode: &str, row: &Value, config: &Value)
             return Err("native writer protocol differs from requested configuration".into());
         }
     }
-    if native && let Some(target) = config["native_batch_target_bytes"].as_u64() {
+    if let Some(target) = config["native_batch_target_bytes"].as_u64() {
         for field in [
             "writer_batch_target_bytes",
             "operation_target_bytes",
             "local_write_group_target_bytes",
         ] {
             let expected = match field {
-                "operation_target_bytes" => config["native_operation_target_bytes"].as_u64(),
-                "local_write_group_target_bytes" => {
-                    config["native_write_group_target_bytes"].as_u64()
-                }
-                _ => None,
+                "operation_target_bytes" => config["native_operation_target_bytes"]
+                    .as_u64()
+                    .unwrap_or(4 * 1024 * 1024),
+                "local_write_group_target_bytes" => config["native_write_group_target_bytes"]
+                    .as_u64()
+                    .unwrap_or(4 * 1024 * 1024),
+                _ => target,
             };
-            if row[field] != expected.unwrap_or(target) {
+            if row[field] != expected {
                 return Err(format!("unexpected {field}").into());
             }
         }
         if row["max_record_bytes"] != config["native_max_record_bytes"] {
             return Err("unexpected hard record bound".into());
         }
+    }
+    Ok(())
+}
+
+fn request_bounds(implementation: &str, mode: &str, row: &Value, config: &Value) -> Result<()> {
+    let native = implementation == "ozzy";
+    payload_encoding(native, row, config)?;
+    if native {
+        native_writer_controls(row, config)?;
     }
     if implementation == "redpanda" {
         if row["write_caching"] != matches!(mode, "buffered" | "replicated-persisting")
@@ -972,6 +1023,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn production_append_caps_require_effective_requested_geometry() {
+        for (size, target, expected) in [
+            (128, 4 * 1024 * 1024, 256 * 1024),
+            (8192, 832 * 1024, 832 * 1024),
+            (8192, 4 * 1024 * 1024, 4 * 1024 * 1024),
+        ] {
+            let case = json!({"size": size});
+            let config = json!({"partitions":8,"request_records":2048,
+                "segment_mib":1024,"native_batch_target_bytes":target});
+            let mut row = json!({"writer_batch_payload_bytes_max":expected,
+                "writer_batch_target_bytes":expected,"reader_payload_bytes_max":expected,
+                "reader_queue_messages":crate::native::reader_queue_messages(expected)});
+            production_append_bounds(&case, &row, &config).unwrap();
+            row["writer_batch_payload_bytes_max"] = json!(expected - 1);
+            assert!(production_append_bounds(&case, &row, &config).is_err());
+        }
+    }
+
+    #[test]
     fn broker_omq_ownership_matches_requested_mode() {
         let dedicated = json!({"broker_omq_mode":"dedicated-io","broker_omq_io_threads":1});
         let borrowed = json!({"broker_omq_mode":"application-shard","broker_omq_io_threads":0});
@@ -997,7 +1067,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_reader_credit_is_bounded_by_its_arena_for_both_adapters() {
+    fn cluster_reader_capacity_is_bounded_by_its_arena_for_both_adapters() {
         let config = json!({
             "reader_records":16384,"reader_payload_mib":128,"request_records":8192
         });

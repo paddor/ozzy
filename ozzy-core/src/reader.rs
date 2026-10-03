@@ -1,7 +1,7 @@
 //! Deterministic scheduling for one subscription's owned read operation.
 //!
-//! Events are serialized by the owner. I/O can finish after a newer source or
-//! credit event, so a completion may describe an obsolete reason to wait.
+//! Events are serialized by the owner. I/O can finish after a newer
+//! source event, so a completion may describe an obsolete reason to wait.
 //! Transport/session validation and the single pending future stay with the
 //! adapter. Replacing a subscription must discard both its future and scheduler.
 
@@ -12,8 +12,6 @@ pub enum ReadOutcome {
     CaughtUp,
     /// More bounded work is available immediately.
     More,
-    /// The next record did not fit captured credit. Wait for more credit.
-    Credit,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -22,10 +20,8 @@ enum Phase {
     Runnable,
     Reading {
         source_changed: bool,
-        credit_changed: bool,
     },
     WaitingForSource,
-    WaitingForCredit,
 }
 
 /// Read readiness without clocks, callbacks, queues, or I/O.
@@ -45,25 +41,15 @@ impl ReadScheduler {
         }
     }
 
-    /// Readiness is necessary but does not reserve credit or an output buffer.
+    /// Readiness is necessary but does not reserve an output buffer.
     pub const fn is_runnable(self) -> bool {
         matches!(self.phase, Phase::Runnable | Phase::Reading { .. })
     }
 
     /// A commit, retention, or authority change requires another source check.
-    /// Even a credit-blocked reader must observe retention or authority errors.
     pub fn source_changed(&mut self) {
         match &mut self.phase {
             Phase::Reading { source_changed, .. } => *source_changed = true,
-            _ => self.phase = Phase::Runnable,
-        }
-    }
-
-    /// Publish a strictly advancing, validated cumulative credit grant.
-    /// Duplicate or stale credit is not an event and must be filtered by the owner.
-    pub fn credit_advanced(&mut self) {
-        match &mut self.phase {
-            Phase::Reading { credit_changed, .. } => *credit_changed = true,
             _ => self.phase = Phase::Runnable,
         }
     }
@@ -75,31 +61,24 @@ impl ReadScheduler {
             Phase::Runnable => {
                 self.phase = Phase::Reading {
                     source_changed: false,
-                    credit_changed: false,
                 };
                 true
             }
             Phase::Reading { .. } => true,
-            Phase::WaitingForSource | Phase::WaitingForCredit => false,
+            Phase::WaitingForSource => false,
         }
     }
 
     /// Consume the pending read's outcome. True requests another bounded turn.
     /// A completion without a pending read is rejected without changing state.
     pub fn complete(&mut self, outcome: ReadOutcome) -> Result<bool, NoPendingRead> {
-        let Phase::Reading {
-            source_changed,
-            credit_changed,
-        } = self.phase
-        else {
+        let Phase::Reading { source_changed } = self.phase else {
             return Err(NoPendingRead);
         };
         self.phase = match outcome {
             ReadOutcome::More => Phase::Runnable,
             ReadOutcome::CaughtUp if source_changed => Phase::Runnable,
-            ReadOutcome::Credit if credit_changed => Phase::Runnable,
             ReadOutcome::CaughtUp => Phase::WaitingForSource,
-            ReadOutcome::Credit => Phase::WaitingForCredit,
         };
         Ok(self.is_runnable())
     }
@@ -115,68 +94,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn credit_return_cannot_be_lost_before_or_after_an_old_credit_completion() {
+    fn source_change_survives_pending_repolls_and_caught_up_completion() {
         for before_completion in [false, true] {
             let mut scheduler = ReadScheduler::new();
             assert!(scheduler.begin_poll());
             if before_completion {
-                scheduler.credit_advanced();
+                scheduler.source_changed();
+            }
+            for _ in 0..8 {
+                assert!(scheduler.begin_poll());
             }
             assert_eq!(
-                scheduler.complete(ReadOutcome::Credit),
+                scheduler.complete(ReadOutcome::CaughtUp),
                 Ok(before_completion)
             );
             if !before_completion {
-                scheduler.credit_advanced();
+                scheduler.source_changed();
             }
-            assert!(
-                scheduler.begin_poll(),
-                "credit must make the next read runnable"
-            );
-            assert_eq!(scheduler.complete(ReadOutcome::Credit), Ok(false));
-            assert!(!scheduler.begin_poll(), "unchanged credit must park again");
-        }
-    }
-
-    #[test]
-    fn pending_repolls_preserve_both_events_in_either_order() {
-        for source_first in [false, true] {
-            for outcome in [ReadOutcome::CaughtUp, ReadOutcome::Credit] {
-                let mut scheduler = ReadScheduler::new();
-                assert!(scheduler.begin_poll());
-                if source_first {
-                    scheduler.source_changed();
-                } else {
-                    scheduler.credit_advanced();
-                }
-                for _ in 0..8 {
-                    assert!(scheduler.begin_poll());
-                }
-                if source_first {
-                    scheduler.credit_advanced();
-                } else {
-                    scheduler.source_changed();
-                }
-                assert_eq!(scheduler.complete(outcome), Ok(true));
-                assert!(scheduler.begin_poll());
-                assert_eq!(scheduler.complete(outcome), Ok(false));
-            }
-        }
-    }
-
-    #[test]
-    fn only_the_relevant_change_retries_a_completed_wait() {
-        for outcome in [ReadOutcome::CaughtUp, ReadOutcome::Credit] {
-            let mut scheduler = ReadScheduler::new();
             assert!(scheduler.begin_poll());
-            match outcome {
-                ReadOutcome::CaughtUp => scheduler.credit_advanced(),
-                ReadOutcome::Credit => scheduler.source_changed(),
-                ReadOutcome::More => unreachable!(),
-            }
-            assert_eq!(scheduler.complete(outcome), Ok(false));
+            assert_eq!(scheduler.complete(ReadOutcome::CaughtUp), Ok(false));
             assert!(!scheduler.begin_poll());
-            scheduler.source_changed(); // Retention/authority must also wake credit waits.
+            scheduler.source_changed();
             assert!(scheduler.begin_poll());
             assert_eq!(scheduler.complete(ReadOutcome::More), Ok(true));
         }

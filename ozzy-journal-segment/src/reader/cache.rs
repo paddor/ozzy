@@ -91,7 +91,6 @@ struct CachedBatch {
     summary: AppendBatchSummary,
     timestamp_millis: u64,
     records: CachedRecords,
-    descriptors_end: Option<usize>,
     prepared: Option<CachedPrepared>,
 }
 
@@ -150,14 +149,6 @@ impl DecodedBatches {
     }
 }
 
-#[derive(Debug)]
-struct CachedRecord {
-    descriptor_start: usize,
-    encoding: ozzy_proto::data::Encoding,
-    message_id: MessageId,
-    parts: SmallVec<[Range<usize>; 2]>,
-}
-
 /// One validated batch borrowed for consecutive indexed records. Keeping this
 /// view avoids repeating source checks and cache lookup for every record.
 #[derive(Debug)]
@@ -207,7 +198,7 @@ impl SelectedBatch<'_> {
         let record = self
             .batch
             .records
-            .get(entry.location.record_index as usize)
+            .get(entry.location.record_index as usize, self.body)
             .ok_or(IndexedReadError::InvalidSelector)?;
         let index = u64::from(entry.location.record_index);
         if self.batch.summary.partition != entry.partition
@@ -284,7 +275,7 @@ impl RecordView<'_> {
     /// Opaque bytes in this record, excluding descriptors.
     #[inline]
     pub fn payload_bytes(&self) -> usize {
-        self.record.parts.iter().map(|range| range.len()).sum()
+        self.record.parts.bytes()
     }
 
     /// Create owning output slices only when a record is actually delivered.
@@ -292,6 +283,7 @@ impl RecordView<'_> {
         self.materialize_reusing(&mut SmallVec::new())
     }
 
+    /// Partition-global offset of this selected record.
     pub fn offset(&self) -> Offset {
         Offset::new(self.batch.summary.first_offset.get() + self.index)
     }
@@ -355,7 +347,6 @@ fn cache_batch(body: &Bytes, batch: &AppendBatchView<'_>) -> Result<CachedBatch,
         return Ok(CachedBatch {
             summary,
             timestamp_millis: batch.append_timestamp_millis,
-            descriptors_end: None,
             records: CachedRecords::Packed {
                 ids: ids
                     .as_chunks::<16>()
@@ -369,30 +360,16 @@ fn cache_batch(body: &Bytes, batch: &AppendBatchView<'_>) -> Result<CachedBatch,
             prepared: None,
         });
     }
-    let remaining = decoded.remaining_bytes();
-    let descriptor_range = shared_range(body, remaining.0)?;
-    let mut records = Vec::with_capacity(summary.record_count);
-    let mut descriptor_start = descriptor_range.start;
-    for record in decoded {
-        let mut parts = SmallVec::new();
-        for part in record.parts {
-            parts.push(shared_range(body, part)?);
-        }
-        records.push(CachedRecord {
-            descriptor_start,
-            encoding: record.encoding,
-            message_id: record.message_id,
-            parts,
-        });
-        descriptor_start += 20
-            + record.encoding.metadata_bytes()
-            + records.last().expect("inserted record").parts.len() * 4;
-    }
+    let (descriptors, payload) = decoded.remaining_bytes();
+    let records = CachedRecords::general(
+        batch,
+        shared_range(body, descriptors)?.start,
+        shared_range(body, payload)?.start,
+    )?;
     Ok(CachedBatch {
         summary,
         timestamp_millis: batch.append_timestamp_millis,
-        records: CachedRecords::General(records),
-        descriptors_end: Some(descriptor_start),
+        records,
         prepared: None,
     })
 }
@@ -407,36 +384,14 @@ fn cache_prepared_batch(
         return Err(IndexedReadError::InvalidSelector);
     }
     let descriptor_range = shared_range(body, descriptors)?;
-    let mut records = Vec::with_capacity(batch.summary.record_count);
-    let mut descriptor_start = descriptor_range.start;
-    let mut payload_start = 0_usize;
-    for record in batch.descriptors() {
-        let mut parts = SmallVec::new();
-        for length in record.part_lengths {
-            let end = payload_start
-                .checked_add(length)
-                .ok_or(IndexedReadError::InvalidSelector)?;
-            parts.push(payload_start..end);
-            payload_start = end;
-        }
-        records.push(CachedRecord {
-            descriptor_start,
-            encoding: record.encoding,
-            message_id: record.message_id,
-            parts,
-        });
-        descriptor_start += 20
-            + record.encoding.metadata_bytes()
-            + records.last().expect("inserted record").parts.len() * 4;
-    }
-    if payload_start != prepared.decoded_bytes {
+    let records = CachedRecords::general(batch, descriptor_range.start, 0)?;
+    if records.payload_range(0..records.len()).len() != prepared.decoded_bytes {
         return Err(IndexedReadError::InvalidSelector);
     }
     Ok(CachedBatch {
         summary: batch.summary,
         timestamp_millis: batch.append_timestamp_millis,
-        records: CachedRecords::General(records),
-        descriptors_end: Some(descriptor_start),
+        records,
         prepared: Some(CachedPrepared {
             descriptors: descriptor_range,
             encoded_payload: shared_range(body, prepared.encoded)?,
@@ -490,13 +445,13 @@ mod tests {
             body.is_unique(),
             "descriptors must borrow ranges, not clone Bytes"
         );
-        assert!(std::mem::size_of::<CachedRecord>() < std::mem::size_of::<IndexedRecord>());
+        assert!(std::mem::size_of::<records::RecordStart>() < std::mem::size_of::<IndexedRecord>());
         let view = RecordView {
             body: &body,
             shared_backing_bytes: None,
             batch: &cached,
             decoded: &DecodedCell::default(),
-            record: cached.records.get(1).unwrap(),
+            record: cached.records.get(1, &body).unwrap(),
             index: 1,
         };
         let materialized = view.materialize();
@@ -515,20 +470,38 @@ mod tests {
 
     #[test]
     fn wide_materialization_reuses_descriptor_capacity_without_pinning_payloads() {
-        let body = body(20, 30);
+        let parts = [b"".as_slice(), b"a", b"", b"b"];
+        let body = Bytes::from(
+            encode_operation_body(
+                &OperationBody::Append(Append {
+                    batches: vec![AppendBatch {
+                        partition: PartitionIncarnation::from_bytes([3; 16]),
+                        owner_epoch: OwnerEpoch::INITIAL,
+                        producer_id: ProducerId::new(),
+                        producer_epoch: ProducerEpoch::INITIAL,
+                        first_sequence: ProducerSequence::new(30),
+                        first_offset: Offset::new(20),
+                        append_timestamp_millis: 77,
+                        records: vec![AppendRecord {
+                            encoding: ozzy_proto::data::Encoding::Raw,
+                            message_id: MessageId::new(),
+                            parts: parts.into_iter().collect(),
+                        }]
+                        .into(),
+                    }],
+                }),
+                OperationLimits::default(),
+            )
+            .unwrap(),
+        );
         let append = decode_append_view(&body, OperationLimits::default()).unwrap();
-        let mut cached = cache_batch(&body, &append.batches().next().unwrap()).unwrap();
-        // Four valid empty/nonempty ranges exercise the heap descriptor path.
-        let CachedRecords::General(records) = &mut cached.records else {
-            panic!("multipart")
-        };
-        records[0].parts = [0..0, 0..1, 1..1, 1..2].into_iter().collect();
+        let cached = cache_batch(&body, &append.batches().next().unwrap()).unwrap();
         let view = RecordView {
             body: &body,
             shared_backing_bytes: None,
             batch: &cached,
             decoded: &DecodedCell::default(),
-            record: cached.records.get(0).unwrap(),
+            record: cached.records.get(0, &body).unwrap(),
             index: 0,
         };
         let mut scratch = SmallVec::with_capacity(4);
@@ -566,3 +539,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod uniform_tests;

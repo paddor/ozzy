@@ -96,6 +96,49 @@ fn async_detached_roll_keeps_written_predecessor_readable_until_exact_installati
 }
 
 #[test]
+fn async_roll_preserves_data_sync_and_an_occupied_successor_cannot_publish() {
+    for occupied in [false, true] {
+        let (mut controller, mut journal) = empty_journal();
+        drive(&mut controller, append_confirmed(&mut journal));
+        let selected = journal.current();
+        if occupied {
+            drive(
+                &mut controller,
+                journal.access.done(Operation::CreateDirectory {
+                    path: journal.root().join("segments/2.log"),
+                }),
+            )
+            .unwrap();
+        }
+        let (pending, work) = journal.begin_owned_roll(32768, 1).unwrap();
+        let mut data_sync = false;
+        let completed = drive_with(&mut controller, work.publish(), |op| {
+            if let Operation::Open {
+                path,
+                data_sync: flag,
+                ..
+            } = op
+                && path.ends_with("segments/2.log")
+            {
+                data_sync |= *flag;
+            }
+            Effect::Normal
+        });
+        assert_eq!(pending.journal().current(), selected);
+        if occupied {
+            assert!(!completed.succeeded());
+            assert!(pending.complete(completed).is_err());
+        } else {
+            assert!(completed.succeeded());
+            let journal = pending.complete(completed).unwrap();
+            assert_eq!(journal.writer.header().segment_id(), 2);
+            assert!(data_sync, "successor descriptor must preserve DataSync");
+            assert!(journal.writer.state().data_sync());
+        }
+    }
+}
+
+#[test]
 fn async_prepared_files_are_pinned_and_failed_or_canceled_zeroing_is_never_selected() {
     for cancel in [false, true] {
         let (mut controller, mut journal) = empty_journal();

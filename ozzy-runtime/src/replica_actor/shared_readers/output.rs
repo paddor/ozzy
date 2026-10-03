@@ -2,7 +2,7 @@ use super::{
     ActorError, Context, DataLimits, Envelope, Failure, Message, NodeId, Opcode, PartitionActor,
     Poll, SharedReaders, Slot, TrySendError, reader_frame, wait,
 };
-use crate::replica_journal::{ReplicaJournal, ShardJournal};
+use crate::replica_journal::ReplicaJournal;
 use ozzy_proto::reader::{RecordHeader, RecordsEncoder};
 use ozzy_replication::driver::ValidationTicket;
 
@@ -38,7 +38,7 @@ impl SharedReaders {
             }
         }
         let mut progress = flush(&mut self.rejection, cx, send)?;
-        for _ in 0..self.slots.len().min(16) {
+        for _ in 0..16 {
             let index = self.next;
             self.next = (index + 1) % self.slots.len();
             if self.slots[index].is_none() {
@@ -57,8 +57,7 @@ impl SharedReaders {
             match output(
                 slot,
                 self.local,
-                self.config.limits,
-                link.send,
+                self.config.limits.intersection(link.send),
                 &mut self.metadata,
                 ticket,
                 journal,
@@ -101,22 +100,17 @@ pub(super) fn flush(
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one bounded encoding turn borrows actor-owned I/O and caller-owned output"
-)]
 fn output(
     slot: &mut Slot,
     local: NodeId,
-    configured: DataLimits,
-    send: DataLimits,
+    limits: DataLimits,
     metadata: &mut Vec<u8>,
     ticket: Option<ValidationTicket>,
-    journal: &mut ReplicaJournal<ShardJournal>,
+    journal: &mut ReplicaJournal,
     cx: &mut Context<'_>,
 ) -> Result<bool, Failure> {
     let delivery = &mut slot.delivery;
-    if !delivery.schedule.is_runnable() || delivery.grant_records == delivery.sent_records {
+    if !delivery.schedule.is_runnable() {
         return Ok(false);
     }
     let Some(ticket) = ticket else {
@@ -125,27 +119,6 @@ fn output(
     let Some(mut payload) = slot.payload.try_take() else {
         return Ok(false);
     };
-    let mut maximum = configured;
-    maximum.envelope.max_metadata_bytes = maximum
-        .envelope
-        .max_metadata_bytes
-        .min(send.envelope.max_metadata_bytes);
-    maximum.envelope.max_payload_bytes = maximum
-        .envelope
-        .max_payload_bytes
-        .min(send.envelope.max_payload_bytes);
-    maximum.max_records = maximum.max_records.min(send.max_records);
-    maximum.max_parts = maximum.max_parts.min(send.max_parts);
-    maximum.max_record_bytes = maximum.max_record_bytes.min(send.max_record_bytes);
-    let maximum = delivery.full_window(maximum);
-    let mut limits = maximum;
-    limits.max_records = limits
-        .max_records
-        .min((delivery.grant_records - delivery.sent_records) as usize);
-    limits.envelope.max_payload_bytes = limits
-        .envelope
-        .max_payload_bytes
-        .min((delivery.grant_bytes - delivery.sent_bytes) as usize);
     let envelope = Envelope {
         opcode: Opcode::Records,
         response: false,
@@ -167,35 +140,25 @@ fn output(
     .map_err(|_| Failure::new(1))?;
     output.allow_shared_payload();
     assert!(delivery.schedule.begin_poll());
-    let more =
-        match delivery
-            .cursor
-            .poll(delivery.source, ticket, journal, &mut output, maximum, cx)
-        {
-            Poll::Ready(Ok(state)) => delivery
-                .schedule
-                .complete(state)
-                .map_err(|_| Failure::new(11))?,
-            Poll::Ready(Err(error)) => return Err(error),
-            Poll::Pending => false,
-        };
+    let more = match delivery
+        .cursor
+        .poll(delivery.source, ticket, journal, &mut output, limits, cx)
+    {
+        Poll::Ready(Ok(state)) => delivery
+            .schedule
+            .complete(state)
+            .map_err(|_| Failure::new(11))?,
+        Poll::Ready(Err(error)) => return Err(error),
+        Poll::Pending => false,
+    };
     if output.is_empty() {
         return Ok(more);
     }
     let records = output.len() as u64;
-    let bytes = output.decoded_payload_bytes() as u64;
     let (header, shared) = output.finish_with_payload().map_err(|_| Failure::new(1))?;
     delivery.next = delivery
         .next
         .checked_add(records)
-        .ok_or_else(|| Failure::new(11))?;
-    delivery.sent_records = delivery
-        .sent_records
-        .checked_add(records)
-        .ok_or_else(|| Failure::new(11))?;
-    delivery.sent_bytes = delivery
-        .sent_bytes
-        .checked_add(bytes)
         .ok_or_else(|| Failure::new(11))?;
     slot.pending = Some(crate::native_frames::message(
         slot.peer.as_bytes(),

@@ -102,9 +102,11 @@ impl Journal {
 }
 
 impl Candidate {
+    /// Canonical application images through the selected committed prefix.
     pub const fn committed_images(&self) -> &CanonicalImages<AsyncJournalIdentityIndex> {
         &self.committed
     }
+    /// Canonical prefix accepted under this journal mode.
     pub fn accepted_position(&self) -> LogPosition {
         self.identities.snapshot().through()
     }

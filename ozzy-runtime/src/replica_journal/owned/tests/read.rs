@@ -159,9 +159,7 @@ fn owned_read_capacity_exhaustion_is_retryable_without_fencing_the_journal() {
         synchronize(&mut controller, voter);
     }
     confirm(&mut primary, &backup, QuorumPolicy::Durable);
-    let Some(crate::memory::AllocationSource::Shared(memory)) =
-        primary.journal.append_memory.clone()
-    else {
+    let Some(memory) = primary.journal.append_memory.clone() else {
         panic!("fixture binds a shared payload owner")
     };
     let captured = capture(&primary, 0, bounds());
@@ -225,9 +223,7 @@ fn owned_read_leases_one_payload_arena_for_a_stored_group() {
         synchronize(&mut controller, voter);
     }
     confirm(&mut primary, &backup, QuorumPolicy::Durable);
-    let Some(crate::memory::AllocationSource::Shared(memory)) =
-        primary.journal.append_memory.clone()
-    else {
+    let Some(memory) = primary.journal.append_memory.clone() else {
         panic!("fixture binds a shared payload owner")
     };
     let limits = PartitionReadLimits {

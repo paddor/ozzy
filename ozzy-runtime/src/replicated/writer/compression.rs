@@ -87,6 +87,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mixed_groups_keep_retry_backing_until_all_aliases_retire() {
+        let mut compressor = Compressor::new(1);
+        let bodies: Vec<Vec<u8>> = (0..4)
+            .map(|seed| {
+                (0..8192)
+                    .map(|index| ((index / 128 + seed * 17) % 251) as u8)
+                    .collect()
+            })
+            .collect();
+        let held = compressor.prepare(&bodies[0]).unwrap().unwrap();
+        let retry = held.clone();
+        let pointer = held.as_slice().as_ptr();
+        for body in &bodies[1..] {
+            let encoded = compressor.prepare(body).unwrap().unwrap();
+            assert_ne!(encoded.as_slice().as_ptr(), pointer);
+            assert_eq!(
+                lz4rip::block::decompress(encoded.as_slice(), body.len()).unwrap(),
+                *body
+            );
+        }
+        drop(held);
+        assert_eq!(
+            lz4rip::block::decompress(retry.as_slice(), bodies[0].len()).unwrap(),
+            bodies[0]
+        );
+        drop(retry);
+        let reused = compressor.prepare(&bodies[1]).unwrap().unwrap();
+        assert_eq!(reused.as_slice().as_ptr(), pointer);
+    }
+
+    #[test]
     fn threshold_and_incompressible_groups_fall_back_to_raw() {
         let mut compressor = Compressor::new(2);
         let threshold = ozzy_proto::append::ADAPTIVE_LZ4_THRESHOLD;

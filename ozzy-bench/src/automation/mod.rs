@@ -21,7 +21,9 @@ use std::{
     process::Command,
 };
 
+/// Failure returned by benchmark automation and its supervised subprocesses.
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
+/// Disk-backed root for disposable build, profile, and benchmark artifacts.
 pub const SSD: &str = "/mnt/ssd/tmp";
 
 /// Exactly three brokers, regardless of confirmation or persistence policy.
@@ -32,6 +34,7 @@ pub fn cluster_mode(mode: &str) -> bool {
 static CANCELED: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
     std::sync::OnceLock::new();
 
+/// Register cancellation on SIGINT and SIGTERM for this automation process.
 pub fn install_signals() -> Result<()> {
     let flag =
         CANCELED.get_or_init(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
@@ -41,6 +44,7 @@ pub fn install_signals() -> Result<()> {
     Ok(())
 }
 
+/// Fail if a registered termination signal canceled the run.
 pub fn check_canceled() -> Result<()> {
     if CANCELED
         .get()
@@ -51,6 +55,7 @@ pub fn check_canceled() -> Result<()> {
     Ok(())
 }
 
+/// Source checkout containing this benchmark automation crate.
 pub fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -67,10 +72,12 @@ pub fn build_target(checkout: &Path) -> PathBuf {
         .join(format!("{key:x}"))
 }
 
+/// Checkout-specific release worker executable on the artifact disk.
 pub fn worker_binary() -> PathBuf {
     build_target(&root()).join("release/ozy_timed_bench")
 }
 
+/// Append-only benchmark result ledger directory under the user cache.
 pub fn cache() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").expect("HOME is required")).join(".cache/ozzy")
 }
@@ -80,6 +87,7 @@ pub fn artifacts() -> PathBuf {
     PathBuf::from(SSD).join("ozzy-artifacts")
 }
 
+/// Run a command to completion; return UTF-8 stdout or its failed status and diagnostics.
 pub fn capture(command: &mut Command) -> Result<String> {
     let output = command.output()?;
     if !output.status.success() {
@@ -93,6 +101,7 @@ pub fn capture(command: &mut Command) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
+/// Write one formatted JSON artifact, replacing its existing contents.
 pub fn json_file(path: &Path, value: &Value) -> Result<()> {
     let mut file = fs::File::create(path)?;
     serde_json::to_writer_pretty(&mut file, value)?;
@@ -100,10 +109,12 @@ pub fn json_file(path: &Path, value: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Read and decode one JSON artifact.
 pub fn read_json(path: &Path) -> Result<Value> {
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
 
+/// Generate a timestamped unique benchmark run identifier.
 pub fn run_id() -> Result<String> {
     Ok(format!(
         "{}-{}",
@@ -112,6 +123,7 @@ pub fn run_id() -> Result<String> {
     ))
 }
 
+/// Decode a finite JSON number, rejecting missing or non-finite measurements.
 pub fn finite(value: &Value) -> Result<f64> {
     value
         .as_f64()

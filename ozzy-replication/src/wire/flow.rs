@@ -12,16 +12,13 @@ use crate::{OpNumber, Scope};
 
 pub use crate::flow::Probe as FlowProbe;
 
-const PROBE_BYTES: usize = COMMON_BYTES + 40 + 8 + 8;
-const STATE_BYTES: usize = COMMON_BYTES + 16 + 8 + 40 + 40 + 8 + 8 + 8 + 8 + 4;
+const PROBE_BYTES: usize = COMMON_BYTES + 40 + 8;
+const STATE_BYTES: usize = COMMON_BYTES + 16 + 8 + 40 + 40 + 8 + 8 + 4;
 
 fn validate_probe(probe: FlowProbe) -> Result<(), WireError> {
     validate_scope(probe.scope)?;
     validate_prefix(probe.tail)?;
-    if probe.available < probe.tail.op
-        || probe.available.0 == u64::MAX
-        || probe.minimum_body_bytes == 0
-    {
+    if probe.available < probe.tail.op || probe.available.0 == u64::MAX {
         return Err(WireError::Prefix);
     }
     if probe.request_id.as_bytes() == &[0; 16] {
@@ -30,7 +27,7 @@ fn validate_probe(probe: FlowProbe) -> Result<(), WireError> {
     Ok(())
 }
 
-/// Correlated status response or coalesced same-epoch receipt/credit notification.
+/// Correlated status response or coalesced same-epoch receipt notification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlowState {
     /// Session-bound compact routing handle. Never reused during this process.
@@ -64,7 +61,7 @@ impl FlowState {
     /// Match the currently outstanding probe before considering an epoch change.
     ///
     /// The adapter authenticates peer/session, invalidates retired probes, verifies
-    /// reported history, and applies its negotiated credit bounds separately. This
+    /// reported history, and applies its local retention bounds separately. This
     /// comparison alone never supplies a vote, disk evidence, or recovery authority.
     pub fn validate_response(self, probe: FlowProbe) -> Result<(), WireError> {
         self.validate()?;
@@ -79,9 +76,9 @@ impl FlowState {
 /// Separately typed nonvoting flow family, sharing the ordinary replica envelope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlowMessage<'a> {
-    /// Correlated request for receipt/credit state.
+    /// Correlated request for receipt state.
     Probe(FlowProbe),
-    /// Volatile retention and absolute credits, not durability.
+    /// Volatile contiguous receipt, not durability.
     State(FlowState),
     /// Hash-validated normal data in the locally required receive epoch.
     Prepare {
@@ -116,7 +113,6 @@ pub fn encode_flow_probe(
     writer.scope(probe.scope, sender);
     writer.prefix(probe.tail);
     writer.u64(probe.available.0);
-    writer.u64(probe.minimum_body_bytes);
     Ok(ControlEncoding {
         header,
         metadata_bytes: PROBE_BYTES,
@@ -124,7 +120,7 @@ pub fn encode_flow_probe(
 }
 
 /// Encode a `REPLICA_STATE` response/notification without allocating or granting authority.
-/// The advertised credit window is independent of the maximum size of one wire frame.
+/// Local retention bounds are independent of the maximum size of one wire frame.
 pub fn encode_flow_state(
     sender: NodeId,
     session: LinkSessionId,
@@ -152,8 +148,6 @@ pub fn encode_flow_state(
     writer.prefix(report.base);
     writer.prefix(report.received);
     writer.u64(report.received_bytes);
-    writer.u64(report.operation_limit);
-    writer.u64(report.byte_limit);
     writer.u64(state.repair_limit.map_or(u64::MAX, |op| op.0));
     writer.bytes(&state.handle.to_be_bytes());
     Ok(ControlEncoding {
@@ -179,7 +173,6 @@ pub(super) fn decode_probe(
         request_id: envelope.request_id.ok_or(WireError::Correlation)?,
         tail: reader.prefix()?,
         available: OpNumber(reader.u64()?),
-        minimum_body_bytes: reader.u64()?,
     };
     reader.finish()?;
     validate_probe(probe)?;
@@ -208,8 +201,6 @@ pub(super) fn decode_state(
             base: reader.prefix()?,
             received: reader.prefix()?,
             received_bytes: reader.u64()?,
-            operation_limit: reader.u64()?,
-            byte_limit: reader.u64()?,
         },
         repair_limit: match reader.u64()? {
             u64::MAX => None,

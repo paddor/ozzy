@@ -16,9 +16,11 @@ pub struct CheckpointFiles {
 }
 
 impl CheckpointFiles {
+    /// Exact validated metadata manifest held by this object.
     pub const fn manifest(&self) -> &crate::CheckpointManifest {
         &self.checkpoint.manifest
     }
+    /// Exact checkpoint identity, position, and manifest digest.
     pub const fn reference(&self) -> CheckpointReference {
         CheckpointReference {
             checkpoint_id: self.checkpoint.manifest.checkpoint_id,
@@ -26,10 +28,12 @@ impl CheckpointFiles {
             manifest_digest: self.checkpoint.digest,
         }
     }
+    /// Read and validate the captured checkpoint state bytes.
     pub async fn read_state(&self) -> Result<Vec<u8>, crate::CheckpointError> {
         self.checkpoint.read_state(self.limits).await
     }
 
+    /// Validate and reconstruct canonical state from the captured checkpoint.
     pub async fn decode_canonical_state(
         &self,
         state: ozzy_core::state::StateLimits,

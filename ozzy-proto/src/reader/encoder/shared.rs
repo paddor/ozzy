@@ -48,13 +48,14 @@ impl RecordsEncoder<'_> {
             encoded_payload.len(),
             self.limits.envelope.max_payload_bytes,
         )?;
-        let (parts, _, _) = data::validate_raw_record_entries(
+        let parts = data::validate_raw_record_entries(
             descriptors,
             count,
             decoded_bytes,
             self.first_offset,
             self.remaining(),
-        )?;
+        )?
+        .parts;
         self.metadata.extend_from_slice(descriptors);
         self.shared = Some(Payload {
             body: body.clone(),
@@ -72,7 +73,7 @@ impl RecordsEncoder<'_> {
     }
 
     /// Append an entire general descriptor table and share its contiguous payload.
-    /// Validate all input and remaining credit before changing output. Returns
+    /// Validate all input and remaining output capacity before changing output. Returns
     /// false when sharing would require copying a previous or nonadjacent span.
     pub fn extend_shared_packed(
         &mut self,

@@ -1,8 +1,11 @@
-//! Unbatched inbox bounded by records and payload bytes. Credit returns at
+//! Unbatched inbox bounded by records and owned body/table bytes. Capacity returns at
 //! request preparation, never ACK.
 
 use crate::signal::StateSignal;
+#[cfg(all(test, ozzy_loom))]
+use loom::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+#[cfg(not(all(test, ozzy_loom)))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Debug)]
@@ -51,9 +54,13 @@ impl Inbox {
         })
     }
 
-    pub(super) fn available(&self) -> bool {
+    pub(super) fn available(&self, bytes: usize) -> bool {
+        let queued_bytes = self.queued_bytes.load(Ordering::Acquire);
         self.queued.load(Ordering::Acquire) < self.capacity
-            && self.queued_bytes.load(Ordering::Acquire) < self.capacity_bytes
+            && (queued_bytes == 0
+                || queued_bytes
+                    .checked_add(bytes)
+                    .is_some_and(|total| total <= self.capacity_bytes))
     }
 
     pub(super) fn release(&self, count: usize, bytes: usize) {

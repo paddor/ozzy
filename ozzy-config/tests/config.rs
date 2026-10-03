@@ -22,6 +22,7 @@ fn three() -> Deployment {
     for name in ["a", "b", "c"] {
         let mut broker = broker.clone();
         broker.endpoints.peer = format!("inproc://{name}-peer");
+        broker.endpoints.data_peer = format!("inproc://{name}-data");
         broker.endpoints.reader_pub = format!("inproc://{name}-pub");
         config.brokers.insert(name.to_owned(), broker);
     }
@@ -125,6 +126,14 @@ fn shard_budget_covers_receive_and_preparation_for_one_maximum_append() {
         .budget
         .resident_bytes = body * 4;
     assert!(config.validate().is_ok());
+}
+
+#[test]
+fn topic_append_body_cannot_exceed_eight_mib() {
+    let mut config = single();
+    assert!(config.clone().validate().is_ok());
+    config.topics.get_mut("orders").unwrap().max_append_bytes += 1;
+    assert!(config.validate().is_err());
 }
 
 #[test]
@@ -485,7 +494,7 @@ fn explicit_numa_placement_requires_local_cpu_memory_and_sufficient_pool() {
     topology.shards.push(local);
     topology.memory_pools.push(MemoryPool {
         numa_node: 1,
-        bytes: 128 * 1024 * 1024,
+        bytes: 512 * 1024 * 1024,
     });
     let validated = config.clone().validate().unwrap();
     validated.broker_plan("laptop", &host()).unwrap();

@@ -80,6 +80,16 @@ impl OwnedJournal {
         })
     }
 
+    fn refreshed_history(&mut self, scope: Scope) -> Result<AsyncJournalHistory, JournalError> {
+        let mut history = self.normal_history()?;
+        if let Some((old_scope, mut old)) = self.replay.cached.take()
+            && old_scope == scope
+        {
+            history.reuse_checked_prefix(&mut old)?;
+        }
+        Ok(history)
+    }
+
     fn primary_history(&self, ticket: ValidationTicket) -> Result<(), JournalError> {
         self.healthy()?;
         self.validate_image(ticket)?;
@@ -127,8 +137,7 @@ impl OwnedJournal {
         let history = if reusable {
             self.replay.cached.take().expect("checked source").1
         } else {
-            self.replay.clear();
-            self.normal_history()?
+            self.refreshed_history(ticket.scope())?
         };
         let request = FetchOps {
             scope: ticket.scope(),
@@ -187,7 +196,7 @@ impl OwnedJournal {
                 })
         });
         if !reusable {
-            self.replay.cached = Some((ticket.scope(), self.normal_history()?));
+            self.replay.cached = Some((ticket.scope(), self.refreshed_history(ticket.scope())?));
         }
         let result = async {
             let (_, history) = self.replay.cached.as_mut().expect("captured source");

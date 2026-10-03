@@ -61,14 +61,17 @@ impl JournalIndexSnapshot {
         }
     }
 
+    /// Exact upper canonical operation prefix visible through this capture.
     pub const fn through(&self) -> LogPosition {
         self.through
     }
 
+    /// Exact group, node, volume, store, and store-generation binding.
     pub const fn identity(&self) -> crate::GroupIdentity {
         self.identity
     }
 
+    /// Exact segment references protected by this captured journal view.
     pub fn segment_references(&self) -> &[crate::SegmentReference] {
         self.pin.references()
     }
@@ -391,37 +394,64 @@ impl JournalIndexSnapshot {
 #[derive(Debug, Error)]
 pub enum JournalIndexError {
     #[error(transparent)]
+    /// A physical file operation failed.
     Io(#[from] io::Error),
     #[error(transparent)]
+    /// Physical segment framing or integrity validation failed.
     Codec(#[from] crate::CodecError),
     #[error(transparent)]
+    /// Canonical operation-body validation failed.
     Operation(#[from] ozzy_journal::operation::OperationCodecError),
     #[error(transparent)]
+    /// Journal directory validation or publication failed.
     Directory(#[from] crate::DirectoryError),
     #[error(transparent)]
+    /// The active-segment index rejected this prefix.
     Active(#[from] crate::ActiveIndexError),
     #[error(transparent)]
+    /// The captured index catalog rejected its source or selection.
     Catalog(#[from] crate::IndexCatalogError),
     #[error(transparent)]
+    /// Indexed record reading or validation failed.
     Read(#[from] IndexedReadError),
     #[error("segment {0} was not pinned by this index snapshot")]
+    /// Segment was not pinned by this index snapshot.
     UnpinnedSegment(u64),
     #[error("segment {0} cannot prove the requested index lineage")]
+    /// Segment cannot prove the requested index lineage.
     LineageSegmentMismatch(u64),
     #[error("index boundary {requested} exceeds snapshot boundary {available}")]
-    BoundaryBeyondSnapshot { requested: u64, available: u64 },
+    /// Index boundary exceeds snapshot boundary.
+    BoundaryBeyondSnapshot {
+        #[doc = "Requested canonical operation number."]
+        requested: u64,
+        #[doc = "Available bytes, capacity, or canonical prefix at failure."]
+        available: u64,
+    },
     #[error("active message index has no matching offset entry")]
+    /// Active message index has no matching offset entry.
     InconsistentActiveIndex,
     #[error("active read index exceeds configured entry or file-size limits")]
+    /// Active read index exceeds configured entry or file-size limits.
     ReadIndexCapacity,
     #[error("sealed index catalog no longer matches the selected manifest")]
+    /// Sealed index catalog no longer matches the selected manifest.
     StaleCatalog,
     #[error("indexed read limits must be nonzero")]
+    /// Indexed read limits must be nonzero.
     InvalidReadLimits,
     #[error("record payload is {actual} bytes; read limit is {limit}")]
-    RecordExceedsReadLimit { actual: usize, limit: usize },
+    /// Record payload is bytes; read limit is.
+    RecordExceedsReadLimit {
+        #[doc = "Observed size, count, or fenced field value."]
+        actual: usize,
+        #[doc = "Configured maximum for the reported resource."]
+        limit: usize,
+    },
     #[error("committed range is missing offset {0:?}")]
+    /// Committed range is missing offset.
     MissingOffset(Offset),
     #[error("partition offset space exhausted during range read")]
+    /// Partition offset space exhausted during range read.
     OffsetExhausted,
 }

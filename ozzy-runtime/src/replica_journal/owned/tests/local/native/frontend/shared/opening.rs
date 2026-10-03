@@ -106,9 +106,9 @@ async fn scenario(lose_reply: bool) {
     }
     assert_eq!(
         links.session(authority.primary),
-        Some(harness.client.as_ref().unwrap().1)
+        Some(harness.session.unwrap())
     );
-    assert_eq!(links.socket_count(), 3);
+    assert_eq!(links.socket_count(), 2);
     harness.drive(a.close(), true).await.unwrap();
     harness.drive(b.close(), true).await.unwrap();
     harness.drive(links.shutdown(), true).await.unwrap();

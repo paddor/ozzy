@@ -311,7 +311,7 @@ async fn finish_resume(
     processes
         .observe("verify complete resumed history", client.replay())
         .await;
-    assert_eq!(client.links.socket_count(), 6);
+    assert_eq!(client.links.socket_count(), 5);
     processes
         .observe("close recovery SDK", client.close())
         .await;

@@ -15,7 +15,9 @@ to all three processes; select each process with `--broker broker-0`,
 With the sample paths, provision from the repository root:
 
 ```sh
-bin=/mnt/ssd/tmp/cargo-target/debug/ozy_broker
+source scripts/ozzy_tools.sh
+scripts/ozzy_cargo build -p ozzy-broker --bin ozy_broker
+bin="$CARGO_TARGET_DIR/debug/ozy_broker"
 config=ozzy-broker/three.toml
 root=/mnt/ssd/tmp/ozzy-three
 mkdir -p "$root"/broker-{0,1,2}
@@ -157,7 +159,8 @@ persistent bind mount.
 ```sh
 cargo build --release -p ozzy-broker --bin ozy_broker
 mkdir -p /mnt/ssd/tmp/ozzy-image /mnt/ssd/tmp/ozzy-dev/data
-cp /mnt/ssd/tmp/cargo-target/release/ozy_broker /mnt/ssd/tmp/ozzy-image/
+source scripts/ozzy_tools.sh
+cp "$CARGO_TARGET_DIR/release/ozy_broker" /mnt/ssd/tmp/ozzy-image/
 container() {
   podman --root /mnt/ssd/tmp/ozzy-container-storage \
     --runroot "${XDG_RUNTIME_DIR}/ozzy-container-dev" "$@"

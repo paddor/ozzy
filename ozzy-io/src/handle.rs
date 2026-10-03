@@ -15,9 +15,17 @@ pub struct Handle(Arc<Lease>);
 struct Lease {
     owner: Arc<()>,
     key: u64,
+    direct_io: bool,
     wake: Waker,
     resource: OnceLock<Weak<dyn Any + Send + Sync>>,
     live: AtomicBool,
+}
+
+impl Handle {
+    /// Whether the backend opened this handle for direct I/O. No descriptor is exposed.
+    pub fn is_direct(&self) -> bool {
+        self.0.direct_io
+    }
 }
 
 impl Drop for Lease {
@@ -33,9 +41,20 @@ pub struct HandleOwner(Arc<()>);
 impl HandleOwner {
     /// Keys must never be reused by this owner, even after closing a file.
     pub fn create(&self, key: u64, wake: Waker) -> (Handle, HandleToken) {
+        self.create_with_direct_io(key, wake, false)
+    }
+
+    /// Immutable routing hint. The backend still validates the handle and write.
+    pub fn create_with_direct_io(
+        &self,
+        key: u64,
+        wake: Waker,
+        direct_io: bool,
+    ) -> (Handle, HandleToken) {
         let lease = Arc::new(Lease {
             owner: Arc::clone(&self.0),
             key,
+            direct_io,
             wake,
             resource: OnceLock::new(),
             live: AtomicBool::new(true),
@@ -44,6 +63,7 @@ impl HandleOwner {
         (Handle(lease), token)
     }
 
+    /// Return a handle key only when this backend owns it.
     pub fn key(&self, handle: &Handle) -> Option<u64> {
         Arc::ptr_eq(&self.0, &handle.0.owner).then_some(handle.0.key)
     }
@@ -83,6 +103,7 @@ impl HandleOwner {
 pub struct HandleToken(Weak<Lease>);
 
 impl HandleToken {
+    /// Whether an application, queued job, or running job still retains the handle.
     pub fn is_alive(&self) -> bool {
         self.0.strong_count() != 0
     }

@@ -10,16 +10,22 @@ use super::StateError;
 /// when both coordinate ranges are contiguous; another writer may occupy gaps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProducerResultSpan {
+    /// First producer-local sequence in this span.
     pub first_sequence: ProducerSequence,
+    /// Partition-global offset assigned to that sequence.
     pub first_offset: Offset,
+    /// Number of consecutive sequence and offset coordinates.
     pub records: u64,
 }
 
 /// Independent session and retained retry metadata for one writer in a partition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalProducer {
+    /// Current producer-session fence.
     pub producer_epoch: ProducerEpoch,
+    /// Next admissible producer-local sequence.
     pub next_producer_sequence: ProducerSequence,
+    /// Earliest sequence whose original retry result remains retained.
     pub producer_result_floor: ProducerSequence,
     pub(super) results: VecDeque<ProducerResultSpan>,
 }

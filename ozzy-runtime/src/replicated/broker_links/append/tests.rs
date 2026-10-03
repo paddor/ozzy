@@ -15,37 +15,28 @@ fn cost() -> Cost {
         requests: 1,
         records: 2,
         bytes: 8192,
-        peer_bytes: 16,
         ..Cost::default()
-    }
-}
-
-fn peer(node: u8) -> PeerLimit {
-    PeerLimit {
-        node: NodeId::from_bytes([node; 16]),
-        records: 4,
-        bytes: 32,
     }
 }
 
 #[test]
 fn aggregate_windows_do_not_multiply_with_brokers_or_release_on_confirmation() {
     let budget = Arc::new(Budget::new(Some(limits())));
-    let first = budget.acquire(cost(), Some(peer(1))).unwrap();
-    let second = budget.acquire(cost(), Some(peer(2))).unwrap();
-    assert!(!budget.available(cost(), Some(peer(3))));
+    let first = budget.acquire(cost()).unwrap();
+    let second = budget.acquire(cost()).unwrap();
+    assert!(!budget.available(cost()));
     let transport = first.clone();
     drop(first);
-    assert!(!budget.available(cost(), Some(peer(3))));
+    assert!(!budget.available(cost()));
     drop(transport);
-    let third = budget.acquire(cost(), Some(peer(3))).unwrap();
-    assert!(!budget.available(cost(), Some(peer(1))));
+    let third = budget.acquire(cost()).unwrap();
+    assert!(!budget.available(cost()));
     drop((second, third));
-    assert!(budget.available(cost(), Some(peer(1))));
+    assert!(budget.available(cost()));
 }
 
 #[test]
-fn concurrent_alias_release_never_overbooks_peer_or_aggregate_credit() {
+fn concurrent_alias_release_never_overbooks_local_backing() {
     let budget = Arc::new(Budget::new(Some(AppendLinkLimits {
         writers: 1,
         requests: 4,
@@ -61,20 +52,12 @@ fn concurrent_alias_release_never_overbooks_peer_or_aggregate_credit() {
         let finish = finish.clone();
         workers.push(std::thread::spawn(move || {
             start.wait();
-            let lease = budget.acquire(
-                Cost {
-                    requests: 1,
-                    records: 1,
-                    bytes: 1024,
-                    peer_bytes: 1,
-                    ..Cost::default()
-                },
-                Some(PeerLimit {
-                    records: 4,
-                    bytes: 4,
-                    ..peer(1)
-                }),
-            );
+            let lease = budget.acquire(Cost {
+                requests: 1,
+                records: 1,
+                bytes: 1024,
+                ..Cost::default()
+            });
             finish.wait();
             lease
         }));
@@ -88,107 +71,72 @@ fn concurrent_alias_release_never_overbooks_peer_or_aggregate_credit() {
     assert!(!leases.is_empty());
     assert!(leases.len() <= 4);
     drop(leases);
-    assert!(budget.available(
-        Cost {
-            requests: 4,
-            records: 4,
-            bytes: 4096,
-            peer_bytes: 4,
-            ..Cost::default()
-        },
-        Some(PeerLimit {
-            records: 4,
-            bytes: 4,
-            ..peer(1)
-        })
-    ));
+    assert!(budget.available(Cost {
+        requests: 4,
+        records: 4,
+        bytes: 4096,
+        ..Cost::default()
+    }));
 }
 
 #[test]
-fn shared_peer_window_is_directional_and_unused_writer_lanes_count() {
+fn unused_writer_lanes_count_toward_local_backing() {
     let budget = Arc::new(Budget::new(Some(limits())));
-    let held = budget.acquire(cost(), Some(peer(1))).unwrap();
-    let small = PeerLimit {
-        records: 2,
-        ..peer(1)
-    };
-    assert!(!budget.available(cost(), Some(small)));
-    assert!(budget.available(cost(), Some(peer(2))));
+    let held = budget.acquire(cost()).unwrap();
     let idle = budget
-        .acquire(
-            Cost {
-                writers: 4,
-                bytes: 57344,
-                ..Cost::default()
-            },
-            None,
-        )
-        .unwrap();
-    assert!(!budget.available(
-        Cost {
-            writers: 1,
+        .acquire(Cost {
+            writers: 4,
+            bytes: 57344,
             ..Cost::default()
-        },
-        None
-    ));
-    assert!(!budget.available(cost(), Some(peer(2))));
+        })
+        .unwrap();
+    assert!(!budget.available(Cost {
+        writers: 1,
+        ..Cost::default()
+    }));
+    assert!(!budget.available(cost()));
     drop((held, idle));
-    assert!(budget.available(cost(), Some(peer(1))));
+    assert!(budget.available(cost()));
 }
 
 #[test]
 fn unused_writer_capacity_cannot_consume_the_largest_progress_reservation() {
     let budget = Arc::new(Budget::new(Some(limits())));
     let owner = budget
-        .acquire(
-            Cost {
-                writers: 1,
-                bytes: 40960,
-                progress_bytes: 24576,
-                ..Cost::default()
-            },
-            None,
-        )
+        .acquire(Cost {
+            writers: 1,
+            bytes: 40960,
+            progress_bytes: 24576,
+            ..Cost::default()
+        })
         .unwrap();
     assert!(
         budget
-            .acquire(
-                Cost {
-                    writers: 1,
-                    bytes: 1,
-                    ..Cost::default()
-                },
-                None
-            )
+            .acquire(Cost {
+                writers: 1,
+                bytes: 1,
+                ..Cost::default()
+            })
             .is_none()
     );
-    let request = budget.acquire(cost(), Some(peer(1))).unwrap();
-    assert!(!budget.available(
-        Cost {
-            writers: 1,
-            bytes: 1,
-            ..Cost::default()
-        },
-        None
-    ));
+    let request = budget.acquire(cost()).unwrap();
+    assert!(!budget.available(Cost {
+        writers: 1,
+        bytes: 1,
+        ..Cost::default()
+    }));
     drop(request);
-    assert!(!budget.available(
-        Cost {
-            writers: 1,
-            bytes: 1,
-            ..Cost::default()
-        },
-        None
-    ));
+    assert!(!budget.available(Cost {
+        writers: 1,
+        bytes: 1,
+        ..Cost::default()
+    }));
     drop(owner);
-    assert!(budget.available(
-        Cost {
-            writers: 1,
-            bytes: 1,
-            ..Cost::default()
-        },
-        None
-    ));
+    assert!(budget.available(Cost {
+        writers: 1,
+        bytes: 1,
+        ..Cost::default()
+    }));
 }
 
 #[test]
@@ -197,7 +145,7 @@ fn encoded_payload_is_shared_and_independent_frame_aliases_hold_the_budget() {
         requests: 1,
         ..limits()
     })));
-    let lease = budget.acquire(cost(), Some(peer(1))).unwrap();
+    let lease = budget.acquire(cost()).unwrap();
     let payload = Bytes::from(vec![7; 4096]);
     let pointer = payload.as_ptr();
     let original = Message::multipart([
@@ -211,25 +159,22 @@ fn encoded_payload_is_shared_and_independent_frame_aliases_hold_the_budget() {
     let metadata = tracked.part_bytes(2).unwrap();
     let body = tracked.part_bytes(3).unwrap();
     drop((original, tracked, lease));
-    assert!(!budget.available(cost(), Some(peer(1))));
+    assert!(!budget.available(cost()));
     drop(body);
-    assert!(!budget.available(cost(), Some(peer(1))));
+    assert!(!budget.available(cost()));
     assert_eq!(metadata.as_ref(), &[3; 106]);
     drop(metadata);
-    assert!(budget.available(cost(), Some(peer(1))));
+    assert!(budget.available(cost()));
 }
 
 fn stream(registry: &Registry, writer: u8) -> (Arc<Stream>, mpsc::Receiver<Message>) {
     let memory = registry
         .budget
-        .acquire(
-            Cost {
-                writers: 1,
-                bytes: 128,
-                ..Cost::default()
-            },
-            None,
-        )
+        .acquire(Cost {
+            writers: 1,
+            bytes: 128,
+            ..Cost::default()
+        })
         .unwrap();
     let (sender, incoming) = mpsc::channel(8);
     (
@@ -245,13 +190,13 @@ fn stream(registry: &Registry, writer: u8) -> (Arc<Stream>, mpsc::Receiver<Messa
 }
 
 fn admit(registry: &Registry, stream: &Arc<Stream>, node: u8, id: u8, end: u64) {
-    let lease = registry.budget.acquire(cost(), Some(peer(node))).unwrap();
+    let lease = registry.budget.acquire(cost()).unwrap();
     registry.requests.lock().unwrap().insert(
         RequestId::from_bytes([id; 16]),
         Request {
             stream: Arc::downgrade(stream),
             writer: stream.id,
-            broker: peer(node).node,
+            broker: NodeId::from_bytes([node; 16]),
             session: LinkSessionId::from_bytes([node; 16]),
             end,
             remaining_replies: 3,
@@ -265,7 +210,7 @@ fn reply(node: u8, id: u8) -> (Message, Envelope) {
         opcode: Opcode::Appended,
         response: true,
         request_id: Some(RequestId::from_bytes([id; 16])),
-        sender: peer(node).node,
+        sender: NodeId::from_bytes([node; 16]),
         session: Some(LinkSessionId::from_bytes([node; 16])),
     };
     let header = envelope
@@ -280,7 +225,7 @@ fn reply(node: u8, id: u8) -> (Message, Envelope) {
         .unwrap();
     (
         Message::multipart([
-            Bytes::copy_from_slice(peer(node).node.as_bytes()),
+            Bytes::copy_from_slice(NodeId::from_bytes([node; 16]).as_bytes()),
             Bytes::copy_from_slice(&header),
             Bytes::from(vec![5; 106]),
             Bytes::new(),
@@ -292,7 +237,7 @@ fn reply(node: u8, id: u8) -> (Message, Envelope) {
 fn deliver(registry: &Registry, node: u8, id: u8) -> bool {
     let (message, envelope) = reply(node, id);
     registry.receive(
-        peer(node).node,
+        NodeId::from_bytes([node; 16]),
         &message,
         Packet {
             envelope,
@@ -324,9 +269,9 @@ fn partial_confirmation_and_local_retry_do_not_fence_other_writers() {
     assert!(deliver(&registry, 1, 21));
     assert!(b.try_recv().is_ok());
     assert!(!second.failed.load(Ordering::Acquire));
-    assert!(!registry.budget.available(cost(), Some(peer(2))));
+    assert!(!registry.budget.available(cost()));
     drop(frame);
-    assert!(registry.budget.available(cost(), Some(peer(2))));
+    assert!(registry.budget.available(cost()));
 }
 
 #[test]
@@ -341,7 +286,7 @@ fn excessive_replies_fence_one_writer_and_physical_disconnect_fences_one_broker(
     }
     assert!(first.failed.load(Ordering::Acquire));
     assert!(!second.failed.load(Ordering::Acquire));
-    registry.fence(peer(1).node);
+    registry.fence(NodeId::from_bytes([1; 16]));
     assert!(!deliver(&registry, 1, 11));
     assert!(deliver(&registry, 2, 21));
     assert!(b.try_recv().is_ok());

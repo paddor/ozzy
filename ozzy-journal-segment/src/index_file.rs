@@ -21,9 +21,13 @@ pub(crate) const INDEX_HASH_CONTEXT: &str = "ozzy segment index file v1";
 pub(crate) const INDEX_DIGEST_START: usize = 256;
 pub(crate) const INDEX_DIGEST_END: usize = 288;
 
+/// Exact encoded derived-index header length.
 pub const INDEX_HEADER_BYTES: usize = 4096;
+/// Exact encoded record-offset selector length.
 pub const OFFSET_INDEX_ENTRY_BYTES: usize = 96;
+/// Exact encoded message-identity selector length.
 pub const MESSAGE_INDEX_ENTRY_BYTES: usize = 80;
+/// Exact encoded canonical operation selector length.
 pub const OPERATION_INDEX_ENTRY_BYTES: usize = 80;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,21 +47,32 @@ pub(crate) struct IndexLayout {
 /// Exact immutable segment prefix represented by one index file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexSource {
+    /// Persistent partition replication-group identity.
     pub group_id: GroupId,
+    /// Physical segment identity.
     pub segment_id: u64,
+    /// Physical bytes covered by the exact validated segment prefix.
     pub valid_bytes: u64,
+    /// Integrity digest binding the exact valid physical segment prefix.
     pub segment_digest: Digest,
+    /// First canonical operation number in this source.
     pub first_op_number: u64,
+    /// Last canonical operation number covered by this exact source.
     pub last_op_number: u64,
+    /// Canonical chain digest at the last covered operation.
     pub last_operation_digest: Digest,
 }
 
 /// Resource limits checked before index allocation or section traversal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexLimits {
+    /// Maximum encoded derived-index bytes, including its header.
     pub max_file_bytes: usize,
+    /// Maximum record-offset selectors per derived index.
     pub max_offset_entries: usize,
+    /// Maximum message-identity selectors per derived index.
     pub max_message_entries: usize,
+    /// Maximum canonical operation selectors per derived index.
     pub max_operation_entries: usize,
 }
 
@@ -83,6 +98,7 @@ pub struct SegmentIndexImage {
 }
 
 impl SegmentIndexImage {
+    /// Validate and retain canonical selectors for one exact segment source.
     pub fn new(
         source: IndexSource,
         build_memory_limit: u64,
@@ -104,22 +120,27 @@ impl SegmentIndexImage {
         Ok(image)
     }
 
+    /// Exact immutable segment prefix from which this index was derived.
     pub const fn source(&self) -> IndexSource {
         self.source
     }
 
+    /// Encoded build-time memory allowance recorded in the index header.
     pub const fn build_memory_limit(&self) -> u64 {
         self.build_memory_limit
     }
 
+    /// Record-offset selectors in canonical sorted order.
     pub fn offsets(&self) -> &[OffsetIndexEntry] {
         &self.offsets
     }
 
+    /// Message-identity selectors in canonical sorted order.
     pub fn messages(&self) -> &[MessageIndexEntry] {
         &self.messages
     }
 
+    /// Canonical operation-identity selectors in sorted order.
     pub fn operations(&self) -> &[OperationIndexEntry] {
         &self.operations
     }
@@ -136,26 +157,32 @@ pub struct SegmentIndexView<'a> {
 }
 
 impl SegmentIndexView<'_> {
+    /// Exact immutable segment prefix from which this index was derived.
     pub const fn source(&self) -> IndexSource {
         self.source
     }
 
+    /// Encoded build-time memory allowance recorded in the index header.
     pub const fn build_memory_limit(&self) -> u64 {
         self.build_memory_limit
     }
 
+    /// Number of record-offset selectors.
     pub fn offset_count(&self) -> usize {
         self.offsets.len() / OFFSET_INDEX_ENTRY_BYTES
     }
 
+    /// Number of message-identity selectors.
     pub fn message_count(&self) -> usize {
         self.messages.len() / MESSAGE_INDEX_ENTRY_BYTES
     }
 
+    /// Number of canonical operation-identity selectors.
     pub fn operation_count(&self) -> usize {
         self.operations.len() / OPERATION_INDEX_ENTRY_BYTES
     }
 
+    /// Look up an exact partition incarnation and global record offset.
     pub fn find_offset(
         &self,
         partition: PartitionIncarnation,
@@ -167,6 +194,7 @@ impl SegmentIndexView<'_> {
         .map(|entry| decode_offset_entry(entry, self.source.segment_id))
     }
 
+    /// Look up an exact partition incarnation and record identity.
     pub fn find_message(
         &self,
         partition: PartitionIncarnation,
@@ -179,6 +207,7 @@ impl SegmentIndexView<'_> {
         .map(decode_message_entry)
     }
 
+    /// Look up an exact canonical control-operation identity.
     pub fn find_operation(&self, operation_id: OperationId) -> Option<OperationIndexEntry> {
         binary_search_section(self.operations, OPERATION_INDEX_ENTRY_BYTES, |entry| {
             entry[..16].cmp(operation_id.as_bytes())
@@ -965,43 +994,74 @@ fn read_u64(input: &[u8], offset: usize) -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum IndexFileError {
     #[error("index file is truncated: need {needed} bytes, have {available}")]
-    Truncated { needed: usize, available: usize },
+    /// Input bytes end before a complete encoded object.
+    Truncated {
+        #[doc = "Required bytes for a complete encoded field."]
+        needed: usize,
+        #[doc = "Available bytes, capacity, or canonical prefix at failure."]
+        available: usize,
+    },
     #[error("wrong segment index magic")]
+    /// The named object has an incorrect format magic.
     WrongMagic,
     #[error("unsupported segment index version {0}")]
+    /// The encoded format version is unsupported.
     UnsupportedVersion(u16),
     #[error("invalid segment index header")]
+    /// Invalid segment index header.
     InvalidHeader,
     #[error("unsupported segment index flags")]
+    /// A field contains unsupported nonzero flags.
     UnsupportedFlags,
     #[error("unsupported segment index entry width")]
+    /// Unsupported segment index entry width.
     UnsupportedEntryWidth,
     #[error("nonzero reserved segment index bytes")]
+    /// Reserved bytes are nonzero.
     NonZeroReserved,
     #[error("segment index file length is {actual}; expected {expected}")]
-    FileLengthMismatch { expected: usize, actual: usize },
+    /// Segment index file length is; expected.
+    FileLengthMismatch {
+        #[doc = "Expected size, count, or fenced field value."]
+        expected: usize,
+        #[doc = "Observed size, count, or fenced field value."]
+        actual: usize,
+    },
     #[error("segment index digest mismatch")]
+    /// The named object does not match its expected integrity digest.
     DigestMismatch,
     #[error("invalid segment index source identity")]
+    /// Invalid segment index source identity.
     InvalidSource,
     #[error("invalid segment index section layout")]
+    /// Invalid segment index section layout.
     InvalidSectionLayout,
     #[error("offset and message index counts differ")]
+    /// Offset and message index counts differ.
     RecordIndexCountMismatch,
     #[error("{0} index keys are unsorted or duplicated")]
+    /// The named object index keys are unsorted or duplicated.
     UnsortedOrDuplicate(&'static str),
     #[error("derived index operation location is invalid")]
+    /// Derived index operation location is invalid.
     InvalidLocation,
     #[error("message index entry has no corresponding offset entry")]
+    /// Message index entry has no corresponding offset entry.
     MissingOffsetEntry,
     #[error("invalid segment index resource limits")]
+    /// Invalid segment index resource limits.
     InvalidLimits,
     #[error("integer or length arithmetic overflow")]
+    /// Integer or byte-count arithmetic overflows the supported range.
     LengthOverflow,
     #[error("{kind} limit exceeded: {actual} > {limit}")]
+    /// The named resource exceeds its configured bound.
     LimitExceeded {
+        /// Resource bound that rejected the operation.
         kind: &'static str,
+        /// Observed size, count, or fenced field value.
         actual: usize,
+        /// Configured maximum for the reported resource.
         limit: usize,
     },
 }

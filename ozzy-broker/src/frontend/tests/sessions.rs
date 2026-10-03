@@ -12,8 +12,7 @@ const REPLICA: u32 = 8;
 const REPLICATION: u16 = (1 << 3) | (1 << 8);
 
 fn profile(roles: u32) -> Parameters {
-    let mut parameters =
-        Parameters::streaming(DataLimits::default(), roles, 65_536, 1 << 30).unwrap();
+    let mut parameters = Parameters::streaming(DataLimits::default(), roles).unwrap();
     parameters.capabilities |= handshake::OWNER_READ | REPLICATION;
     parameters.required_capabilities = 0;
     parameters
@@ -159,27 +158,22 @@ fn serving_service(
     trusted: bool,
 ) -> (
     ozzy_runtime::frontend::Service,
-    Vec<ozzy_runtime::dispatch::Receiver<Message>>,
+    Vec<ozzy_runtime::frontend::DataReceiver>,
 ) {
     use ozzy_runtime::{dispatch, frontend, replica_transport::QueueLimits};
-    let budget = dispatch::Budget {
-        queue_slots: 2,
-        retained_messages: 4,
-        bytes: 8192,
-    };
-    let capacity = dispatch::Budgets {
-        control: budget,
-        data: budget,
-    };
     let mut receivers = Vec::new();
     let lanes = [0, 7]
         .into_iter()
         .map(|shard| {
-            let (sender, receiver) = dispatch::channel(dispatch::Limits {
-                capacity,
-                clients: 1,
-                grants: 4,
-            })
+            let (sender, receiver) = frontend::data_channel(
+                &omq_tokio::Context::new(),
+                shard,
+                frontend::Kind::Client,
+                dispatch::Class::Control,
+                2,
+                4096,
+                8192,
+            )
             .unwrap();
             receivers.push(receiver);
             (shard, sender)
@@ -198,7 +192,7 @@ fn serving_service(
         lanes,
         frontend::DispatcherLimits {
             peers: 1,
-            grants_per_class: 4,
+
             replies: frontend::ReplyLimits {
                 control: queue,
                 data: queue,
@@ -261,6 +255,7 @@ async fn serving_lifecycle(trusted: bool) {
                     .serve(
                         service,
                         std::collections::BTreeMap::new(),
+                        crate::FollowerRoutes::default(),
                         buffers,
                         Duration::from_millis(10),
                     )
@@ -313,4 +308,100 @@ async fn serving_lifecycle(trusted: bool) {
     })
     .await
     .expect("serving session lifecycle stalled");
+}
+
+#[tokio::test]
+async fn paused_repair_source_preserves_control_other_shards_and_reconnect() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let context = Context::new();
+        let endpoint: omq_tokio::Endpoint = endpoints(false).peer.parse().unwrap();
+        let bound = context
+            .socket(
+                SocketType::Peer,
+                omq_tokio::Options::default().identity(Bytes::copy_from_slice(local().as_bytes())),
+            )
+            .identity_routing()
+            .unwrap();
+        bound.bind(endpoint.clone()).await.unwrap();
+        let broker = NodeId::from_bytes([1; 16]);
+        let identities = [
+            broker,
+            crate::FollowerRoutes::identity(broker, local(), 0),
+            crate::FollowerRoutes::identity(broker, local(), 7),
+        ];
+        let mut sockets = Vec::new();
+        for identity in identities {
+            let socket = context
+                .socket(
+                    SocketType::Peer,
+                    omq_tokio::Options::default()
+                        .identity(Bytes::copy_from_slice(identity.as_bytes()))
+                        .router_mandatory(true),
+                )
+                .identity_routing()
+                .unwrap();
+            socket.connect(endpoint.clone()).await.unwrap();
+            socket
+                .wait_connected(1, Duration::from_secs(5))
+                .await
+                .unwrap();
+            sockets.push(socket);
+        }
+        sockets[1]
+            .send_to(local().as_bytes(), Message::single("held repair"))
+            .await
+            .unwrap();
+        let (receipt, body) = bound.recv_from_source(None).await.unwrap();
+        assert_eq!(
+            receipt.identity_bytes().as_deref(),
+            Some(identities[1].as_bytes().as_slice())
+        );
+        let old_source = receipt.source().unwrap().clone();
+        bound.unshift(receipt, body).unwrap();
+        // An unshifted repair lane must not intercept either eligible source.
+        for index in [0, 2] {
+            sockets[index]
+                .send_to(local().as_bytes(), Message::single("progress"))
+                .await
+                .unwrap();
+            let (receipt, _) = bound.recv_from_source(None).await.unwrap();
+            assert_eq!(
+                receipt.identity_bytes().as_deref(),
+                Some(identities[index].as_bytes().as_slice())
+            );
+        }
+        sockets[1].clone().into_inner().close().await.unwrap();
+        let replacement = context
+            .socket(
+                SocketType::Peer,
+                omq_tokio::Options::default()
+                    .identity(Bytes::copy_from_slice(identities[1].as_bytes()))
+                    .router_mandatory(true),
+            )
+            .identity_routing()
+            .unwrap();
+        replacement.connect(endpoint).await.unwrap();
+        replacement
+            .wait_connected(1, Duration::from_secs(5))
+            .await
+            .unwrap();
+        replacement
+            .send_to(local().as_bytes(), Message::single("replacement"))
+            .await
+            .unwrap();
+        let (receipt, body) = bound.recv_from_source(None).await.unwrap();
+        assert_eq!(body.part_slice(0), Some(b"replacement".as_slice()));
+        assert_ne!(receipt.source().unwrap(), &old_source);
+        assert!(matches!(
+            bound.try_recv_from_source(Some(&old_source)),
+            Err(omq_tokio::Error::Closed)
+        ));
+        replacement.into_inner().close().await.unwrap();
+        for socket in sockets {
+            socket.into_inner().close().await.unwrap();
+        }
+        bound.into_inner().close().await.unwrap();
+    })
+    .await
+    .expect("isolated follower repair stalled");
 }

@@ -11,9 +11,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Quote a value as one POSIX shell argument.
 pub fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
+/// Construct local or SSH execution for the requested broker placement.
 pub fn command(placement: &Placement, script: &str) -> Command {
     if let Some((host, _)) = &placement.remote {
         let mut command = Command::new("ssh");
@@ -38,9 +40,11 @@ pub fn command(placement: &Placement, script: &str) -> Command {
         command
     }
 }
+/// Execute a placement command and return checked UTF-8 stdout.
 pub fn run(placement: &Placement, script: &str) -> Result<String> {
     capture(&mut command(placement, script))
 }
+/// Resolve the configured source checkout on a remote broker host.
 pub fn remote_root(placement: &Placement) -> Result<PathBuf> {
     Ok(placement
         .remote
@@ -51,6 +55,7 @@ pub fn remote_root(placement: &Placement) -> Result<PathBuf> {
         .ok_or("missing executable parent")?
         .into())
 }
+/// Copy a local artifact to its placement destination, creating parent directories.
 pub fn copy(placement: &Placement, local: &Path, destination: &Path) -> Result<()> {
     let bytes = fs::read(local)?;
     let mut child = command(
@@ -72,6 +77,7 @@ pub fn copy(placement: &Placement, local: &Path, destination: &Path) -> Result<(
     }
     Ok(())
 }
+/// Capture host, storage, process, and optional process-affinity evidence.
 pub fn inspect(placement: &Placement, pid: Option<u32>) -> Result<Value> {
     let binary = if placement.remote.is_some() {
         remote_root(placement)?.join("ozy_host")
@@ -94,6 +100,7 @@ pub fn inspect(placement: &Placement, pid: Option<u32>) -> Result<Value> {
     }
     Ok(serde_json::from_str(&run(placement, &script)?)?)
 }
+/// Require every placement to be free of competing benchmark servers.
 pub fn idle(placements: &[Placement; 3]) -> Result<Value> {
     let mut observations = vec![];
     for placement in placements.iter().filter(|p| p.remote.is_some()) {
@@ -110,6 +117,7 @@ pub fn idle(placements: &[Placement; 3]) -> Result<Value> {
     }
     Ok(json!(observations))
 }
+/// Install the native worker and optional Iggy binary on remote placements.
 pub fn deploy(placements: &[Placement; 3], native: &Path, iggy: bool) -> Result<()> {
     let helper = super::build_target(&super::root()).join("release/ozy_host");
     for p in placements.iter().filter(|p| p.remote.is_some()) {
@@ -155,6 +163,7 @@ pub fn deploy(placements: &[Placement; 3], native: &Path, iggy: bool) -> Result<
 }
 
 #[derive(Debug)]
+/// Periodic remote process isolation checks retained for one measured run.
 pub struct Audit {
     placement: Placement,
     directory: PathBuf,
@@ -164,6 +173,7 @@ pub struct Audit {
     finished: bool,
 }
 impl Audit {
+    /// Start remote isolation monitors and retain their evidence under the artifact directory.
     pub fn start(p: &Placement, implementation: &str, artifacts: &Path) -> Result<Self> {
         let directory = p
             .storage_dir
@@ -211,6 +221,7 @@ impl Audit {
         }
         Ok(audit)
     }
+    /// Fail when a remote isolation monitor reports interference or exits unexpectedly.
     pub fn check(&mut self) -> Result<()> {
         let log = fs::read_to_string(&self.log)?;
         if !log.is_empty() {
@@ -221,6 +232,7 @@ impl Audit {
         }
         Ok(())
     }
+    /// Stop remote monitors and collect their final isolation evidence.
     pub fn finish(mut self) -> Result<Value> {
         self.check()?;
         run(
@@ -271,6 +283,7 @@ impl Drop for Audit {
     }
 }
 
+/// Copy a source artifact into the run directory for immutable provenance.
 pub fn freeze(path: &Path, directory: &Path) -> Result<PathBuf> {
     let placements = Placement::load(Some(path))?;
     let rows = placements
@@ -289,6 +302,7 @@ pub fn freeze(path: &Path, directory: &Path) -> Result<PathBuf> {
     Ok(destination)
 }
 
+/// Collect host and device evidence for all three placements.
 pub fn environment(placements: &[Placement; 3]) -> Result<Value> {
     let mut devices = std::collections::BTreeSet::new();
     let distributed = placements.iter().any(|p| p.remote.is_some());

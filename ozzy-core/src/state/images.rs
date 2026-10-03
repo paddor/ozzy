@@ -45,6 +45,7 @@ pub struct CanonicalRecovery {
 }
 
 impl CanonicalImages {
+    /// Create an empty bounded committed/speculative pair.
     pub fn new(
         state_limits: StateLimits,
         identity_capacity: usize,
@@ -112,18 +113,22 @@ where
         })
     }
 
+    /// Application state through the confirmed canonical prefix.
     pub const fn committed(&self) -> &CanonicalState {
         &self.committed
     }
 
+    /// Application state through accepted, possibly unconfirmed operations.
     pub const fn speculative(&self) -> &CanonicalState {
         &self.speculative
     }
 
+    /// Identity index associated with confirmed application state.
     pub const fn committed_identities(&self) -> &I {
         &self.committed_identities
     }
 
+    /// Identity index associated with accepted application state.
     pub const fn speculative_identities(&self) -> &I {
         match &self.speculative_identities {
             Some(identities) => identities,
@@ -131,6 +136,7 @@ where
         }
     }
 
+    /// Accepted transitions still awaiting commitment.
     pub fn pending_len(&self) -> usize {
         self.pending.len()
     }
@@ -451,6 +457,7 @@ impl<I: IdentityIndex> IdentityIndex for StagedIdentityIndex<'_, I> {
 }
 
 impl CanonicalRecovery {
+    /// Create a bounded fail-closed candidate for canonical history replay.
     pub fn new(
         state_limits: StateLimits,
         identity_capacity: usize,
@@ -521,21 +528,30 @@ impl CanonicalRecovery {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum CanonicalImagesError {
     #[error(transparent)]
+    /// A canonical application-state transition was rejected.
     State(#[from] StateError),
     #[error("accepted transition capacity exhausted")]
+    /// Accepted transition retention is full.
     PendingCapacity,
     #[error("commit position regressed")]
+    /// Commitment would move backward.
     CommitRegression,
     #[error("commit position exceeds accepted state")]
+    /// Commitment would pass accepted history.
     CommitBeyondAccepted,
     #[error("accepted transition prefix is incomplete")]
+    /// A canonical transition required by the prefix is missing.
     MissingTransition,
     #[error("committed replay operation follows an accepted-only operation")]
+    /// Recovery presents committed history after an accepted-only suffix.
     CommittedAfterAccepted,
     #[error("canonical recovery candidate is faulted")]
+    /// An earlier recovery failure fenced this candidate.
     RecoveryFaulted,
     #[error("recovered state, identities, and pending plans do not share one boundary")]
+    /// Recovered application state does not match its claimed prefix.
     RecoveredStateMismatch,
     #[error("prepared canonical group no longer matches the live image")]
+    /// The prepared group belongs to obsolete canonical state.
     StalePreparedGroup,
 }

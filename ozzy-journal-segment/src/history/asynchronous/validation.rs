@@ -29,6 +29,7 @@ impl Validation {
         }
     }
 
+    /// Journal-owner generation fencing these captured bytes or completions.
     pub const fn generation(&self) -> JournalGeneration {
         self.history.generation()
     }
@@ -43,6 +44,7 @@ impl Validation {
         .await
     }
 
+    /// Scrub a bounded part of one captured segment; errors or cancellation fence the cursor.
     pub async fn validate_next_with_budget(
         &mut self,
         budget: StorageValidationBudget,

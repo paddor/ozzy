@@ -1,5 +1,6 @@
 //! Linux AIO data writes with shared bounded blocking helpers. All kernel
 //! context, eventfd and descriptor work stays on backend-owned threads.
+#![warn(missing_docs)]
 #![cfg(target_os = "linux")]
 #![deny(unsafe_code)]
 
@@ -9,14 +10,17 @@ mod worker;
 pub use ozzy_io_pool::{Client, Config as PoolConfig};
 use std::io;
 
+/// Fixed helper-pool limits and direct-write kernel depth for one device.
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
+    /// Shared helper, handle, and per-shard admission bounds.
     pub pool: PoolConfig,
     /// Aggregate ordinary direct writes in flight, 1..=64. Default policy is
     /// one. One additional slot is reserved for progress-class direct writes.
     pub depth: usize,
 }
 
+/// Backend owner combining one kernel-write worker with fixed blocking helpers.
 #[derive(Debug)]
 pub struct Aio {
     pool: ozzy_io_pool::Pool,
@@ -51,6 +55,7 @@ impl Aio {
         Ok((Self { pool }, clients))
     }
 
+    /// Shared device admission observations and capacity wakeups.
     pub fn admission(&self) -> &ozzy_io::Admission {
         self.pool.admission()
     }

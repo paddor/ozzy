@@ -14,14 +14,18 @@ use ozzy_runtime::{
 };
 use std::{collections::BTreeMap, time::Duration};
 
-/// Native per-partition work bounds. These do not advertise shard credit or
-/// replace aggregate memory admission. Replicated session entries are filled
+/// Native per-partition work bounds. Shared shard memory admission bounds
+/// aggregate live work. Replicated session entries are filled
 /// from independently established broker links when the actor is constructed.
 #[derive(Debug, Clone)]
 pub enum ActorSettings {
+    /// Single-broker actor settings with a local durability boundary.
     Local(LocalActorConfig),
+    /// Fixed-three actor settings preserving their configured quorum policy.
     Replicated {
+        /// Exclusive application-shard journal state.
         journal: ShardJournalConfig,
+        /// Per-partition replication authority, timing, and work bounds.
         actor: Box<ActorConfig>,
     },
 }
@@ -30,11 +34,17 @@ pub enum ActorSettings {
 /// Construction starts no task, socket, journal worker, or device worker.
 #[derive(Debug)]
 pub struct StartedPartition {
+    /// Persistent cluster namespace.
     pub cluster: uuid::Uuid,
+    /// Exact local journal directory and application owner.
     pub placement: PartitionPlacement,
+    /// Partition record namespace, independent of election view.
     pub incarnation: PartitionIncarnation,
+    /// Shard-owned partition actor and its policy state.
     pub actor: PartitionActor,
+    /// Startup-registered proposal submission lane.
     pub proposal: ProposalSubmitter,
+    /// Bounded reusable proposal arena owned by this partition service.
     pub buffer: ProposalBuffer,
 }
 
@@ -116,11 +126,12 @@ impl ActorSettings {
             max_operations: operations,
             max_body_bytes: pipeline.max_body_bytes,
         };
-        let message_bytes = operations
-            .checked_mul(86)
-            .and_then(|bytes| bytes.checked_add(288))
-            .and_then(|bytes| bytes.checked_add(transfer.max_body_bytes))
-            .ok_or_else(|| StartupError::Runtime("replica packet bound overflow".into()))?;
+        let message_bytes = ozzy_replication::wire::WireLimits::for_transfer(
+            transfer.max_operations,
+            transfer.max_body_bytes,
+        )
+        .and_then(ozzy_replication::wire::WireLimits::message_bytes)
+        .ok_or_else(|| StartupError::Runtime("replica packet bound overflow".into()))?;
         let queue_bytes = message_bytes
             .checked_mul(4)
             .ok_or_else(|| StartupError::Runtime("replica queue bound overflow".into()))?;
@@ -193,10 +204,11 @@ fn replay_cache_limits(
             "partition has no shard placement".into(),
         ));
     }
-    let cache_share = usize::try_from(shard.budget.resident_bytes / 2 / partitions_on_shard as u64)
+    let cache_share = usize::try_from(shard.budget.resident_bytes / 8 / partitions_on_shard as u64)
         .unwrap_or(usize::MAX);
     // The existing pipeline bound stays intact. Extra replay capacity uses at
-    // most half of the shard's resident budget across its partitions.
+    // most one eighth of the shard's resident budget across its partitions,
+    // leaving data-owner capacity for intake, persistence, and reader repair.
     let body_bytes = pipeline
         .max_body_bytes
         .saturating_mul(8)
@@ -215,8 +227,8 @@ impl OpenedPartition {
     /// Recovered replicated journals still elect a leader before serving writes.
     /// Memory is the shard's shared data owner; empty leases reserve no payload.
     /// Deterministic harnesses inject both IDs and record timestamps.
-    /// Replicated followers start with zero receive credit. The shard must back
-    /// grants with shared memory and dispatch reservations before advertising.
+    /// Normal followers retain within their local bounds. The shard binds
+    /// their payload allocator before serving and provides bounded PUB/PEER intake.
     pub fn into_actor(
         mut self,
         memory: &ozzy_runtime::memory::Owner,
@@ -226,25 +238,6 @@ impl OpenedPartition {
     ) -> Result<StartedPartition, StartupError> {
         self.journal
             .bind_append_memory(memory)
-            .map_err(|source| StartupError::Journal {
-                path: self.placement.directory.clone(),
-                source,
-            })?;
-        self.start_actor(sessions, ids, timestamp)
-    }
-
-    /// Construct with an allocation allowance issued by the shard memory owner.
-    /// The journal can allocate only against that allowance. Unused reservations
-    /// and actual backing buffers share the owner's physical byte/count bounds.
-    pub fn into_reserved_actor(
-        mut self,
-        capacity: &ozzy_runtime::memory::Capacity,
-        sessions: &BTreeMap<NodeId, LinkSessionId>,
-        ids: ActorIds,
-        timestamp: impl Fn() -> u64 + 'static,
-    ) -> Result<StartedPartition, StartupError> {
-        self.journal
-            .bind_append_capacity(capacity)
             .map_err(|source| StartupError::Journal {
                 path: self.placement.directory.clone(),
                 source,
@@ -295,9 +288,8 @@ impl OpenedPartition {
                     .journal
                     .into_shard_journal(journal, timestamp)
                     .map_err(|failure| error(failure.to_string()))?;
-                let mut actor =
-                    ReplicaActor::new_with_reserved_credit(journal, startup, *actor, ids)
-                        .map_err(|failure| error(failure.to_string()))?;
+                let mut actor = ReplicaActor::new_with_ids(journal, startup, *actor, ids)
+                    .map_err(|failure| error(failure.to_string()))?;
                 actor.enable_recovery();
                 let buffer = actor
                     .lease_proposal_buffer()

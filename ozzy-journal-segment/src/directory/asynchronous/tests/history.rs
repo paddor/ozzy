@@ -40,6 +40,103 @@ async fn group(
 }
 
 #[test]
+fn async_validation_bounds_reads_and_preserves_frozen_tail_with_tiny_time_budget() {
+    for encoding in [
+        BodyEncoding::Raw,
+        BodyEncoding::Lz4 {
+            min_savings_bytes: 0,
+        },
+    ]
+    .into_iter()
+    .filter(|encoding| encoding.is_supported())
+    {
+        for max_read_bytes in [257, 1024, 8192] {
+            let (mut controller, mut journal) = empty_journal();
+            drive(&mut controller, group(&mut journal, &[[1; 16]], encoding));
+            drive(&mut controller, group(&mut journal, &[[2; 16]], encoding));
+            drive(&mut controller, journal.roll_active(32768, 4)).unwrap();
+            let positions = drive(
+                &mut controller,
+                group(&mut journal, &[[3; 16], [4; 16]], encoding),
+            );
+            let mut validation =
+                drive(&mut controller, journal.begin_storage_validation(32768)).unwrap();
+            drive(&mut controller, group(&mut journal, &[[5; 16]], encoding));
+            let bounds = StorageValidationBudget {
+                max_read_bytes,
+                max_work: Duration::from_nanos(1),
+            };
+            let mut total = 0;
+            let mut complete = 0;
+            for _ in 0..200 {
+                let Some(step) = drive(
+                    &mut controller,
+                    validation.validate_next_with_budget(bounds),
+                )
+                .unwrap() else {
+                    break;
+                };
+                assert!(step.checked_bytes <= max_read_bytes as u64);
+                assert_eq!(step.through, positions[1]);
+                total += step.checked_bytes;
+                complete += usize::from(step.segment_complete);
+            }
+            assert!(
+                drive(&mut controller, validation.validate_next())
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(total, 20 * 1024);
+            assert_eq!(complete, 2);
+        }
+    }
+}
+
+#[test]
+fn async_validation_detects_body_damage_after_reading_its_header() {
+    let (mut controller, mut journal) = empty_journal();
+    drive(
+        &mut controller,
+        group(&mut journal, &[[1; 16], [2; 16]], BodyEncoding::Raw),
+    );
+    let mut validation = drive(&mut controller, journal.begin_storage_validation(32768)).unwrap();
+    let first = drive(
+        &mut controller,
+        validation.validate_next_with_budget(budget(4096)),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(!first.segment_complete);
+    assert_eq!(first.remaining_segments, 1);
+    let file = drive(
+        &mut controller,
+        journal.access.open(
+            journal.root().join("segments/1.log"),
+            ozzy_io::OpenMode::ReadWrite,
+            false,
+            false,
+        ),
+    )
+    .unwrap();
+    drive(
+        &mut controller,
+        journal.access.write_all(
+            &file,
+            crate::SEGMENT_HEADER_BYTES as u64 + crate::ENTRY_HEADER_BYTES as u64,
+            &[99],
+        ),
+    )
+    .unwrap();
+    assert!(
+        drive(
+            &mut controller,
+            validation.validate_next_with_budget(budget(4096))
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn async_history_caches_exact_frozen_segments_and_exports_bounded_groups() {
     for encoding in [
         BodyEncoding::Raw,
@@ -140,6 +237,66 @@ fn async_history_caches_exact_frozen_segments_and_exports_bounded_groups() {
             Err(HistoryError::Capacity)
         ));
     }
+}
+
+#[test]
+fn refreshed_history_checks_only_new_groups_and_rejects_damaged_suffix() {
+    let (mut controller, mut journal) = empty_journal();
+    let first = drive(
+        &mut controller,
+        group(&mut journal, &[[1; 16], [2; 16]], BodyEncoding::Raw),
+    );
+    let mut old = journal.freeze_history(32768).unwrap();
+    assert_eq!(
+        drive(&mut controller, old.position(first[1].op_number)).unwrap(),
+        Some(first[1])
+    );
+    let old_end = journal.writer.written_position().end_offset();
+    let second = drive(
+        &mut controller,
+        group(&mut journal, &[[3; 16], [4; 16]], BodyEncoding::Raw),
+    );
+    let mut refreshed = journal.freeze_history(32768).unwrap();
+    assert!(refreshed.reuse_checked_prefix(&mut old).unwrap());
+    let mut read_offsets = Vec::new();
+    let chunk = drive_with(
+        &mut controller,
+        refreshed.read_after(first[1], 2, 32),
+        |operation| {
+            if let Operation::Read { offset, .. } = operation {
+                read_offsets.push(*offset);
+            }
+            Effect::Normal
+        },
+    )
+    .unwrap();
+    assert_eq!(chunk.end(), second[1]);
+    assert!(!read_offsets.is_empty());
+    assert!(read_offsets.iter().all(|offset| *offset >= old_end));
+
+    let second_end = journal.writer.written_position().end_offset();
+    drive(
+        &mut controller,
+        group(&mut journal, &[[5; 16]], BodyEncoding::Raw),
+    );
+    let mut damaged = journal.freeze_history(32768).unwrap();
+    assert!(damaged.reuse_checked_prefix(&mut refreshed).unwrap());
+    let file = drive(
+        &mut controller,
+        journal.access.open(
+            journal.root().join("segments/1.log"),
+            ozzy_io::OpenMode::ReadWrite,
+            false,
+            false,
+        ),
+    )
+    .unwrap();
+    drive(
+        &mut controller,
+        journal.access.write_all(&file, second_end, &[99; 8]),
+    )
+    .unwrap();
+    assert!(drive(&mut controller, damaged.read_after(second[1], 1, 16)).is_err());
 }
 
 #[test]

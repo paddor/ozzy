@@ -14,6 +14,7 @@ pub struct Local {
 }
 
 impl Local {
+    /// Install one backend submission lane on its owning application shard.
     pub fn new(backend: impl Backend + 'static) -> Self {
         Self {
             admission: backend.admission().clone(),
@@ -22,13 +23,16 @@ impl Local {
         }
     }
 
+    /// Try admission without waiting; rejection returns the original operation.
     pub fn submit(&self, class: Class, operation: Operation) -> Result<Completion, Rejected> {
         self.backend.borrow_mut().submit(class, operation)
     }
 
+    /// Capacity observations shared by this lane and its backend.
     pub fn admission(&self) -> &Admission {
         &self.admission
     }
+    /// Configured shard whose fixed share backs this lane.
     pub const fn shard(&self) -> usize {
         self.shard
     }

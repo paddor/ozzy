@@ -7,12 +7,7 @@ use ozzy_replication::flow::{Operation, Receiver};
 use ozzy_replication::wire::PrepareBatch;
 use ozzy_replication::{PipelineLimits, ReplicaSnapshot};
 
-use ozzy_replication::NormalReplica;
-
-use super::super::io::{Behind, FollowOn};
-use super::{
-    ActorError, AppendBuffer, Duration, MAX_PROPOSAL_TURNS, PendingIo, Prefix, ReplicaActor,
-};
+use super::{ActorError, AppendBuffer, Prefix, ReplicaActor};
 
 #[derive(Debug, Clone, Copy)]
 struct Flight {
@@ -22,13 +17,13 @@ struct Flight {
 }
 
 #[derive(Debug)]
-pub(super) struct Receive {
-    queued: AppendBuffer,
+pub(in crate::replica_actor) struct Receive {
+    pub(in crate::replica_actor) queued: AppendBuffer,
     end: Option<Prefix>,
     flight: Option<Flight>,
     pub(super) ledger: Receiver,
     operations: Vec<Operation>,
-    allocator: Option<crate::memory::Allocator>,
+    pub(in crate::replica_actor) allocator: Option<crate::memory::Allocator>,
 }
 
 impl Receive {
@@ -46,14 +41,9 @@ impl Receive {
         queued: AppendBuffer,
         channel: ozzy_replication::flow::Channel,
         limits: PipelineLimits,
-        reserved_credit: bool,
     ) -> Result<Self, ActorError> {
-        let ledger = if reserved_credit {
-            Receiver::new_reserved(channel, Prefix::GENESIS, limits)
-        } else {
-            Receiver::new(channel, Prefix::GENESIS, limits)
-        }
-        .map_err(ozzy_replication::flow::TransmitError::from)?;
+        let ledger = Receiver::new(channel, Prefix::GENESIS, limits)
+            .map_err(ozzy_replication::flow::TransmitError::from)?;
         Ok(Self {
             queued,
             end: None,
@@ -62,15 +52,6 @@ impl Receive {
             operations: Vec::with_capacity(limits.max_operations),
             allocator: None,
         })
-    }
-
-    pub(super) fn bind_capacity(
-        &mut self,
-        capacity: &crate::memory::Capacity,
-    ) -> Result<(), ActorError> {
-        self.queued.bind_capacity(capacity)?;
-        self.allocator = Some(capacity.allocator());
-        Ok(())
     }
 
     pub(super) fn reset(&mut self) {
@@ -152,7 +133,10 @@ impl Receive {
         let used_bytes = snapshot.pending_body_bytes
             + self.queued.body_bytes()
             + validating.map_or(0, |flight| flight.bytes);
-        if count > limits.max_operations.saturating_sub(used_ops)
+        let local = self.ledger.available();
+        if count > local.max_operations
+            || bytes > local.max_body_bytes
+            || count > limits.max_operations.saturating_sub(used_ops)
             || bytes > limits.max_body_bytes.saturating_sub(used_bytes)
             || count > self.queued.limits().max_operations - self.queued.len()
             || bytes > self.queued.limits().max_body_bytes - self.queued.body_bytes()
@@ -170,7 +154,7 @@ impl Receive {
             .verified_operations()
             .filter(|op| op.prefix().op > predecessor.op)
         {
-            self.queued.push_verified(operation)?;
+            self.queued.push_primary_verified(operation)?;
         }
         self.operations.clear();
         self.operations.extend(
@@ -188,7 +172,7 @@ impl Receive {
     }
 }
 
-impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
+impl ReplicaActor {
     pub(super) fn schedule_received(&mut self) -> Result<bool, ActorError> {
         if self.work.receive.queued.is_empty() || !self.received_has_capacity() {
             return Ok(false);
@@ -220,73 +204,10 @@ impl<E: crate::replica_journal::JournalExecution> ReplicaActor<E> {
         Ok(self.swap_received().map(|buffer| (ticket, buffer)))
     }
 
-    /// Queue validation of the staged suffix behind a running install or
-    /// apply instead of after its completion. The worker runs commands in
-    /// submission order, so validation sees the image that command leaves:
-    /// the core's accepted image, applied through the command's boundary.
-    pub(in crate::replica_actor) fn queue_received_behind(
-        &mut self,
-        now: Duration,
-    ) -> Result<(), ActorError> {
-        let behind = match self.pending {
-            Some(PendingIo::Turn(_, Some(behind))) => behind,
-            Some(PendingIo::Apply(_, ticket)) => Behind {
-                applying: Some(ticket),
-            },
-            _ => return Ok(()),
-        };
-        if !self.follow_on_enabled || self.follow_on.is_some() {
-            return Ok(());
-        }
-        let Some(snapshot) = self.driver.normal().map(NormalReplica::snapshot) else {
-            return Ok(());
-        };
-        // The running turn, a barrier, and this validation: one slot must stay
-        // free for a barrier, which cannot wait for a full command queue.
-        let own = 1
-            + usize::from(self.pending_sync.is_some())
-            + usize::from(self.pending_replay.is_some());
-        if self.configuration.primary(snapshot.scope.view) == self.local
-            || !self.application_ready()
-            || self.work.ready.is_some()
-            || self.work.receive.flight.is_some()
-            || self.work.receive.queued.is_empty()
-            || !self.received_has_capacity()
-            || self.work.proposal_turns >= MAX_PROPOSAL_TURNS
-            || self.sync_due(false, now)
-            || self.coalescing_received()
-            || self.journal.command_capacity().saturating_sub(own) < 2
-            || self.journal.available_command_slots() < 2
-        {
-            return Ok(());
-        }
-        let ticket = match behind.applying {
-            None => self.driver.begin_validation(),
-            Some(applying) => self.driver.begin_validation_after_apply(applying),
-        };
-        let Ok(ticket) = ticket else {
-            return Ok(());
-        };
-        let Some(buffer) = self.swap_received() else {
-            return Ok(());
-        };
-        let completion = self
-            .journal
-            .turn(Box::new(crate::replica_journal::Turn {
-                validate: Some((ticket, buffer)),
-                ..Default::default()
-            }))
-            .map_err(|rejected| rejected.reason)?;
-        self.follow_on = Some(FollowOn { completion });
-        self.work.proposal_turns += 1;
-        crate::profiling::event(crate::profiling::Event::ReplicaFollowOnValidation);
-        Ok(())
-    }
-
     /// The next barrier cannot start until the previous one finishes. Coalesce
     /// the queued suffix up to the existing count/byte target, or dispatch the
     /// partial group as soon as that barrier completes. Staging keeps its
-    /// receive credits; it supplies no durable evidence.
+    /// local receive capacity; it supplies no durable evidence.
     fn coalescing_received(&self) -> bool {
         let queued = &self.work.receive.queued;
         let target = self.config.sync_batch_target;

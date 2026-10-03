@@ -26,10 +26,15 @@ pub struct ApplicationShards {
 /// partition actors here, after placement, using this shared local I/O lane.
 #[derive(Debug)]
 pub struct ShardContext {
+    /// Validated broker-local resources and partition placement.
     pub plan: ShardPlan,
+    /// Broker-local partitions in the validated construction plan.
     pub partitions: Vec<PartitionPlacement>,
+    /// Shard-local asynchronous submission access to the shared backend.
     pub io: Local,
+    /// Shard-owned data and control allocation domains.
     pub memory: ShardMemory,
+    /// Shared shutdown request and observation handle.
     pub shutdown: Shutdown,
     ready: Option<oneshot::Sender<()>>,
 }
@@ -67,7 +72,7 @@ impl ApplicationShards {
         Fut: Future<Output = Result<(), StartupError>> + 'static,
     {
         let startup = Registration::new(Arc::new(State::new(plan.shards.len())));
-        Self::start_registered(plan, lanes, factory, startup).await
+        Self::start_registered(plan, lanes, factory, startup, false).await
     }
 
     pub(crate) async fn start_registered<B, F, Fut>(
@@ -75,6 +80,7 @@ impl ApplicationShards {
         lanes: Vec<ShardIo<B>>,
         factory: F,
         startup: Registration,
+        follower_progress: bool,
     ) -> Result<Self, StartupError>
     where
         B: Backend + 'static,
@@ -91,7 +97,7 @@ impl ApplicationShards {
         // Prevent early worker completion from closing the whole startup group.
         let mut readiness = FuturesUnordered::new();
         for shard in &plan.shards {
-            let memory = domains.plan(shard)?;
+            let memory = domains.plan(shard, follower_progress)?;
             let lane = lanes.remove(&shard.id).expect("validated shard lane");
             let placements = plan
                 .partitions
@@ -177,6 +183,7 @@ impl ApplicationShards {
         Ok(owner)
     }
 
+    /// Number of application-shard owner threads.
     pub fn thread_count(&self) -> usize {
         self.state.threads
     }

@@ -75,7 +75,7 @@ impl FetchedHistory {
     }
 }
 
-impl<E> ReplicaJournal<E> {
+impl ReplicaJournal {
     /// Verify base/receipt hints on the disk worker, independent of election pins.
     /// Requires synchronized normal history and reuses its bounded frozen reader.
     /// The actor must recheck generation and live flow correlation after completion.

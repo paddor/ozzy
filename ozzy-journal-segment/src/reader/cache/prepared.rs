@@ -80,6 +80,7 @@ impl PreparedOperationRecords {
             })
     }
 
+    /// Validate an immutable canonical APPEND and capture its record descriptors.
     pub fn new(
         header: OperationHeader,
         body: Bytes,
@@ -119,16 +120,18 @@ impl PreparedOperationRecords {
 
     /// Build selectors directly from the proof emitted while canonicalizing a
     /// validated producer request. Descriptor iteration happens only in the
-    /// selector builder; the codec and schema are not walked again.
+    /// selector builder; the codec and schema are not walked again. Check the
+    /// destination's limits and patched positions before building selectors.
     pub fn new_validated_wire_append(
         header: OperationHeader,
         body: Bytes,
         proof: ValidatedWireAppend,
+        limits: OperationLimits,
     ) -> Result<(AppendSummary, Self), IndexedReadError> {
         if header.kind != OperationKind::Append {
             return Err(IndexedReadError::NotAppend);
         }
-        let batch = proof.batch(&body)?;
+        let batch = proof.batch(&body, limits)?;
         let summary = AppendSummary::single(batch.summary);
         let cached = cache_batch(&body, &batch)?;
         Ok((
@@ -206,6 +209,7 @@ impl PreparedOperationRecords {
         })
     }
 
+    /// First partition-global offset in this selected record span.
     pub fn first_offset(&self, partition: PartitionIncarnation) -> Option<Offset> {
         self.batches
             .iter()
@@ -218,6 +222,7 @@ impl PreparedOperationRecords {
         !self.batches.is_empty() && self.batches.iter().all(|batch| batch.prepared.is_some())
     }
 
+    /// Borrow one exact record from validated canonical operation backing.
     pub fn record<'a>(
         &'a self,
         partition: PartitionIncarnation,
@@ -232,7 +237,9 @@ impl PreparedOperationRecords {
                     return None;
                 }
                 let index = offset.get().checked_sub(batch.summary.first_offset.get())?;
-                let record = batch.records.get(usize::try_from(index).ok()?)?;
+                let record = batch
+                    .records
+                    .get(usize::try_from(index).ok()?, &self.body)?;
                 Some(RecordView {
                     body: &self.body,
                     shared_backing_bytes: self.shared_backing_bytes,
@@ -273,7 +280,10 @@ impl PreparedOperationRecords {
                     shared_backing_bytes: self.shared_backing_bytes,
                     batch,
                     decoded: cell,
-                    record: batch.records.get(index).expect("bounded record range"),
+                    record: batch
+                        .records
+                        .get(index, &self.body)
+                        .expect("bounded record range"),
                     index: index as u64,
                 })
             })

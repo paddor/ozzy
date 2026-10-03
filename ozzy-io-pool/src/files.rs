@@ -256,7 +256,10 @@ fn open(
     let mut files = shared.files();
     match result {
         Ok(file) => {
-            let (handle, token) = files.owner.create(key, handle_waker(shared));
+            let (handle, token) =
+                files
+                    .owner
+                    .create_with_direct_io(key, handle_waker(shared), direct);
             let opened = Arc::new(Opened {
                 file: Arc::new(OwnedFile::new(file, reservation)),
                 token,

@@ -136,18 +136,7 @@ fn start_actor(
     from: NodeId,
     sessions: &BTreeMap<NodeId, LinkSessionId>,
 ) -> Result<ozzy_broker::StartedPartition, StartupError> {
-    let capacity = memory.capacity();
-    memory
-        .reserve(
-            &capacity,
-            ozzy_runtime::memory::Quota {
-                bytes: 4096,
-                buffers: 4,
-            },
-        )
-        .map_err(failure)?;
-    let mut started =
-        opened.into_reserved_actor(&capacity, &BTreeMap::new(), ActorIds::random(), || 123)?;
+    let mut started = opened.into_actor(memory, &BTreeMap::new(), ActorIds::random(), || 123)?;
     if let ozzy_runtime::replica_actor::PartitionActor::Replicated(actor) = &mut started.actor {
         for (&peer, &session) in sessions {
             if peer != from {
@@ -172,9 +161,9 @@ async fn serve(mut context: ShardContext, mut run: Run) -> Result<(), StartupErr
         let format = run.format;
         opening.push(async move {
             if format {
-                plan.format(io, JournalGeneration(1)).await
+                Box::pin(plan.format(io, JournalGeneration(1))).await
             } else {
-                plan.open(io, JournalGeneration(2)).await
+                Box::pin(plan.open(io, JournalGeneration(2))).await
             }
         });
     }
@@ -247,7 +236,6 @@ async fn serve(mut context: ShardContext, mut run: Run) -> Result<(), StartupErr
             Some((group, message)) = run.incoming.recv() => actors.receive(group, &message, now).map_err(failure)?,
             result = std::future::poll_fn(|cx| {
                 for creation in &mut creations {
-                    grant_creation(&mut actors, creation.group);
                     creation.poll(cx, run.from, &actors.status(creation.group).unwrap());
                 }
                 actors.poll_progress(cx, now, |_, message| {
@@ -264,16 +252,6 @@ async fn serve(mut context: ShardContext, mut run: Run) -> Result<(), StartupErr
     actors.shutdown().await.map_err(failure)?;
     drop(creations);
     Ok(())
-}
-
-fn grant_creation(actors: &mut PartitionActors, group: GroupId) {
-    if let Some((_, report)) = actors.receive_credit(group)
-        && report.operation_limit == 0
-    {
-        actors
-            .grant_receive(report.channel, 1, 512)
-            .expect("fixture reserved one bounded creation packet");
-    }
 }
 
 async fn start(brokers: &[(CheckedConfig, BrokerIdentity, JournalPlan)], format: bool) {

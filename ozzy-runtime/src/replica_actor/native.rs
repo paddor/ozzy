@@ -11,10 +11,10 @@ use ozzy_proto::{
     producer,
 };
 
-use super::{PendingProposal, ProposalOutcome, ProposalSubmitter};
+use super::{PendingProposal, ProposalOutcome, ProposalSubmitError, ProposalSubmitter};
 use crate::{
     frontend::{Kind, Link},
-    replica_journal::ProposalBuffer,
+    replica_journal::{JournalError, ProposalBuffer},
 };
 
 mod access;
@@ -96,6 +96,26 @@ struct Request {
 enum Command {
     Open,
     Append(append::stream::Confirmed),
+}
+
+enum PrepareFailure {
+    Busy,
+    Reject(u16, RetryClass),
+}
+
+impl From<(u16, RetryClass)> for PrepareFailure {
+    fn from((code, retry): (u16, RetryClass)) -> Self {
+        Self::Reject(code, retry)
+    }
+}
+
+fn prepare_failure(error: &JournalError) -> PrepareFailure {
+    match error {
+        JournalError::Io(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
+            PrepareFailure::Busy
+        }
+        _ => PrepareFailure::from(super::response::rejection(error)),
+    }
 }
 
 #[derive(Debug)]
@@ -188,6 +208,9 @@ impl NativeIntake {
         let selected = self.select_writer(packet, link, hint);
         let writer = match selected {
             Ok(Some(writer)) => writer,
+            Ok(None) if packet.envelope.opcode == Opcode::Append => {
+                return Ok(NativeReceive::Busy);
+            }
             result => {
                 let slot = self
                     .writers
@@ -197,7 +220,7 @@ impl NativeIntake {
                 }
                 let (code, retry) = match result {
                     Err(rejection) => rejection,
-                    Ok(None) => (10, RetryClass::AfterCredit),
+                    Ok(None) => (10, RetryClass::AfterBackoff),
                     Ok(Some(_)) => unreachable!(),
                 };
                 self.reject(slot, request, code, retry, hint)?;
@@ -226,12 +249,23 @@ impl NativeIntake {
                     }
                     Err(rejected) => {
                         crate::profiling::event(crate::profiling::Event::NativeProposalRefusal);
+                        let full = rejected.reason == ProposalSubmitError::Full;
                         self.slots[slot].buffer = Some(rejected.buffer);
-                        self.reject(slot, request, 10, RetryClass::AfterCredit, hint)?;
+                        if full {
+                            // Keep the unchanged request on the shard. A later
+                            // actor turn releases proposal capacity and retries it.
+                            return Ok(NativeReceive::Busy);
+                        }
+                        self.reject(slot, request, 10, RetryClass::AfterBackoff, hint)?;
                     }
                 }
             }
-            Err((code, retry)) => self.reject(slot, request, code, retry, hint)?,
+            Err(PrepareFailure::Busy) => {
+                return Ok(NativeReceive::Busy);
+            }
+            Err(PrepareFailure::Reject(code, retry)) => {
+                self.reject(slot, request, code, retry, hint)?;
+            }
         }
         Ok(NativeReceive::Accepted)
     }
@@ -258,7 +292,7 @@ impl NativeIntake {
             send: link.send,
             command: Command::Open,
         };
-        self.reject(slot, request, 10, RetryClass::AfterCredit, hint)?;
+        self.reject(slot, request, 10, RetryClass::AfterBackoff, hint)?;
         self.remaining = self.slots.len();
         Ok(NativeReceive::Accepted)
     }
@@ -349,42 +383,42 @@ impl NativeIntake {
         packet: Packet<'_>,
         link: Link,
         hint: AuthorityHint,
-    ) -> Result<Command, (u16, RetryClass)> {
+    ) -> Result<Command, PrepareFailure> {
         let buffer = self.slots[slot].buffer.as_mut().expect("free arena");
         buffer.clear();
         let authorized = self.writers.producer(peer).expect("assigned writer");
         if hint.authority.group_id != self.config.group || hint.primary != self.config.local {
-            return Err((5, RetryClass::AfterAuthorityRefresh));
+            return Err((5, RetryClass::AfterAuthorityRefresh).into());
         }
         if packet.envelope.opcode == Opcode::OpenProducer {
             let open = producer::decode_open(packet, self.config.limits.envelope)
                 .map_err(|_| (1, RetryClass::Permanent))?;
             if open.producer != authorized || open.partition != self.config.partition {
-                return Err((3, RetryClass::Permanent));
+                return Err((3, RetryClass::Permanent).into());
             }
             if open.authority != hint.authority {
-                return Err((5, RetryClass::AfterAuthorityRefresh));
+                return Err((5, RetryClass::AfterAuthorityRefresh).into());
             }
             buffer
                 .prepare_producer_open(open, self.config.policy)
-                .map_err(|error| super::response::rejection(&error))?;
+                .map_err(|error| prepare_failure(&error))?;
             Ok(Command::Open)
         } else {
             let append = append::validate_append(packet, self.config.limits)
                 .map_err(|_| (1, RetryClass::Permanent))?;
             if !append.records.nonzero_message_ids() {
-                return Err((1, RetryClass::Permanent));
+                return Err((1, RetryClass::Permanent).into());
             }
             if link.remote.capabilities & handshake::OWNER_STREAM == 0
                 || append.policy != self.config.policy
             {
-                return Err((2, RetryClass::Permanent));
+                return Err((2, RetryClass::Permanent).into());
             }
             if append.key.producer_id != authorized || append.partition != self.config.partition {
-                return Err((3, RetryClass::Permanent));
+                return Err((3, RetryClass::Permanent).into());
             }
             if append.authority != hint.authority {
-                return Err((5, RetryClass::AfterAuthorityRefresh));
+                return Err((5, RetryClass::AfterAuthorityRefresh).into());
             }
             let end_sequence = append
                 .key
@@ -402,7 +436,7 @@ impl NativeIntake {
             };
             buffer
                 .prepare_stream_wire_append(append)
-                .map_err(|error| super::response::rejection(&error))?;
+                .map_err(|error| prepare_failure(&error))?;
             Ok(Command::Append(confirmed))
         }
     }
@@ -449,20 +483,40 @@ impl NativeIntake {
         Ok(changed)
     }
 
-    /// Whether this client's writer still owns a proposal or a reply,
+    /// Requests of this client's writer that still own a proposal or a reply,
     /// including a refusal in the client's rejection slot. Other writers on
     /// the partition do not count.
-    pub fn writer_has_work(&self, node: NodeId, producer: ozzy_proto::ProducerId) -> bool {
+    pub fn writer_work(&self, node: NodeId, producer: ozzy_proto::ProducerId) -> usize {
         let stride = self.config.requests_per_writer + 1;
         let busy = |slot: &Slot| slot.pending.is_some() || slot.reply.is_some();
-        self.writers.assigned(node, producer).is_some_and(|writer| {
+        let requests = self.writers.assigned(node, producer).map_or(0, |writer| {
             self.slots[writer * stride..(writer + 1) * stride]
                 .iter()
-                .any(busy)
-        }) || self
+                .filter(|slot| busy(slot))
+                .count()
+        });
+        let rejection = self
             .writers
             .assigned_rejection(node, stride)
-            .is_some_and(|slot| self.slots.get(slot).is_some_and(busy))
+            .is_some_and(|slot| self.slots.get(slot).is_some_and(busy));
+        requests + usize::from(rejection)
+    }
+
+    /// Writer opens and refusals of this client that still own a slot.
+    /// APPENDs count against their writer instead.
+    pub fn client_work(&self, node: NodeId) -> usize {
+        let stride = self.config.requests_per_writer + 1;
+        let busy = |slot: &Slot| slot.pending.is_some() || slot.reply.is_some();
+        let opens = self
+            .writers
+            .assigned_to(node)
+            .filter(|&writer| busy(&self.slots[writer * stride]))
+            .count();
+        let rejection = self
+            .writers
+            .assigned_rejection(node, stride)
+            .is_some_and(|slot| self.slots.get(slot).is_some_and(busy));
+        opens + usize::from(rejection)
     }
 
     /// Pending proposals and replies remain bounded by startup slots.

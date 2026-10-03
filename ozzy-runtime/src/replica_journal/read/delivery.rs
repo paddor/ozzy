@@ -59,7 +59,7 @@ pub(in crate::replica_journal) enum ResidentSource {
 
 impl ReadDelivery {
     /// Encode one reader message. `maximum` is the reader's full window: a
-    /// compressed producer batch that fits it waits for credit instead of
+    /// compressed producer batch that fits it waits for room instead of
     /// being split.
     pub(crate) fn encode(
         self,
@@ -97,7 +97,7 @@ impl ReadDelivery {
 }
 
 /// A message carries one producer LZ4 block. Forward whole compressed batches
-/// unchanged: end the message before one (`Err(None)`), and wait for credit
+/// unchanged: end the message before one (`Err(None)`), and wait for room
 /// (`Err(Some(_))`) rather than decompress a batch the reader's window can hold.
 fn whole_compressed_batch(
     span: &ozzy_journal_segment::RecordSpan<'_>,

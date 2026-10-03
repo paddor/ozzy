@@ -1,3 +1,6 @@
+//! Local raw-ring exception: caller records contain owned Rust payload and receipt
+//! values. A byte-wire replacement needs explicit ownership, not pointer tokens.
+//!
 //! Typed bounded intake from application handles to the SDK owner thread.
 //!
 //! Lanes use fanring's default deferred teardown: a push is a ring write plus
@@ -11,12 +14,13 @@ use std::sync::Arc;
 use crate::command_channel::TryRecvError;
 use crate::signal::DataSignal;
 
-use super::{WriterError, state::Queued};
+use super::{WriterError, completion, state::Queued};
 
 #[derive(Debug)]
 pub(super) struct Sender {
     queue: fanring::mpsc::Sender<Queued>,
     work: Arc<DataSignal>,
+    completions: completion::Pool,
 }
 
 #[derive(Debug)]
@@ -26,7 +30,14 @@ pub(super) struct Receiver {
 
 pub(super) fn channel(capacity: usize, work: Arc<DataSignal>) -> (Sender, Receiver) {
     let (queue, incoming) = fanring::mpsc::channel(capacity);
-    (Sender { queue, work }, Receiver { queue: incoming })
+    (
+        Sender {
+            queue,
+            work,
+            completions: completion::Pool::default(),
+        },
+        Receiver { queue: incoming },
+    )
 }
 
 impl Sender {
@@ -34,7 +45,15 @@ impl Sender {
         Some(Self {
             queue: self.queue.try_clone()?,
             work: self.work.clone(),
+            completions: completion::Pool::default(),
         })
+    }
+
+    pub(super) fn completion(
+        &mut self,
+        message_id: ozzy_proto::MessageId,
+    ) -> completion::Completion {
+        self.completions.allocate(message_id)
     }
 
     /// The lane is not marked ready: the driver scans every lane on each
@@ -69,10 +88,9 @@ mod tests {
             encoding: Encoding::Raw,
             admitted_at: None,
             sequence,
-            completion: Arc::new(crate::replicated::writer::state::RecordCompletion {
-                message_id: MessageId::from_bytes([3; 16]),
-                offset: std::sync::OnceLock::new(),
-            }),
+            completion: crate::replicated::writer::state::Completion::new(MessageId::from_bytes(
+                [3; 16],
+            )),
             lengths: None,
             body: Body::from_vec(body),
         }

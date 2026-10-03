@@ -26,6 +26,7 @@ fn ready<T>(future: impl std::future::Future<Output = T>) -> T {
     }
 }
 
+/// Exact encoded canonical-state snapshot header length.
 pub const STATE_SNAPSHOT_HEADER_BYTES: usize = 256;
 
 const SNAPSHOT_MAGIC: &[u8; 8] = b"OZYSTA01";
@@ -56,7 +57,9 @@ struct SnapshotShape {
 /// Allocation and input bounds independent of live-state count limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StateSnapshotLimits {
+    /// Maximum encoded snapshot bytes, including its header.
     pub max_snapshot_bytes: usize,
+    /// Maximum UTF-8 bytes per encoded stream or topic name.
     pub max_name_bytes: usize,
 }
 
@@ -549,45 +552,67 @@ fn read_u64(input: &[u8], offset: usize) -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum StateSnapshotError {
     #[error("wrong canonical state snapshot magic")]
+    /// Snapshot bytes do not identify the canonical state format.
     WrongMagic,
     #[error("unsupported canonical state snapshot version {0}")]
+    /// The snapshot format version is unsupported.
     UnsupportedVersion(u16),
     #[error("unsupported canonical state snapshot fields")]
+    /// Reserved or unsupported snapshot fields are present.
     UnsupportedFields,
     #[error("canonical state snapshot is truncated")]
+    /// Snapshot bytes end before a complete field.
     Truncated,
     #[error("canonical state snapshot lengths do not agree")]
+    /// Encoded lengths disagree with available snapshot bytes.
     LengthMismatch,
     #[error("canonical state snapshot digest mismatch")]
+    /// Snapshot integrity does not match its checksum.
     DigestMismatch,
     #[error("canonical state snapshot resource limits are invalid")]
+    /// Snapshot decoding bounds are invalid.
     InvalidLimits,
     #[error("canonical state partition is invalid")]
+    /// A decoded partition entry violates its state contract.
     InvalidPartition,
     #[error("canonical state progress entry is invalid")]
+    /// A decoded progress entry violates its state contract.
     InvalidProgress,
     #[error("canonical state assignment entry is invalid")]
+    /// A decoded assignment entry violates its state contract.
     InvalidAssignment,
     #[error("canonical state retention policy is invalid")]
+    /// A decoded retention policy is invalid.
     InvalidRetention,
     #[error("canonical state entries are unsorted or duplicated")]
+    /// Canonical entries are out of order or repeat a key.
     UnsortedOrDuplicate,
     #[error("canonical state entry references an unknown partition")]
+    /// The referenced partition incarnation does not exist.
     UnknownPartition,
     #[error("canonical progress lies beyond partition state")]
+    /// Decoded progress passes the available partition state.
     ProgressBeyondState,
     #[error("canonical state name is empty")]
+    /// A stream or topic name is empty.
     EmptyName,
     #[error("canonical state name is not UTF-8")]
+    /// A stream or topic name is not valid UTF-8.
     InvalidUtf8,
     #[error("canonical state {0} identity is zero")]
+    /// A required persistent identity is zero.
     ZeroIdentity(&'static str),
     #[error("canonical state snapshot integer or length overflow")]
+    /// Encoded byte or entry counts overflow the supported range.
     LengthOverflow,
     #[error("{kind} limit exceeded: {actual} > {limit}")]
+    /// The operation or snapshot exceeds a configured resource bound.
     LimitExceeded {
+        /// Resource bound that rejected the snapshot.
         kind: &'static str,
+        /// Observed size or count.
         actual: usize,
+        /// Configured maximum size or count.
         limit: usize,
     },
 }

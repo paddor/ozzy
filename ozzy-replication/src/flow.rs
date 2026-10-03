@@ -1,4 +1,4 @@
-//! Bounded receipt/credit accounting, independent of consensus and durability.
+//! Bounded local retention and receipt accounting, independent of consensus and durability.
 //!
 //! Adapters authenticate peers, fence epochs on every packet, retain payloads,
 //! verify canonical history, and supply release events only after application.
@@ -20,7 +20,7 @@ use std::collections::VecDeque;
 
 use crate::{Digest, PipelineLimits, Prefix, Scope};
 
-/// Receiver-issued incarnation of volatile retention and credit state.
+/// Receiver-issued incarnation of volatile retention state.
 ///
 /// Supply a fresh unpredictable value on restart, scope change, or retraction.
 /// Never reuse an epoch for reset state. It is not a durable journal generation.
@@ -65,7 +65,7 @@ pub struct Operation {
     pub body_bytes: u64,
 }
 
-/// Cumulative volatile receipt and absolute credit ceilings in one receive epoch.
+/// Exact cumulative receipt in one receive epoch.
 ///
 /// No field is quorum, durable, or application evidence. The adapter authenticates
 /// and correlates reports before opening an epoch; same-epoch updates are monotonic.
@@ -73,7 +73,7 @@ pub struct Operation {
 pub struct Report {
     /// Scope/incarnation fence, in addition to the external peer/session binding.
     pub channel: Channel,
-    /// Strictly increasing on retention/release changes, unchanged on retransmission.
+    /// Strictly increasing on retention changes, unchanged on retransmission.
     pub revision: u64,
     /// Fixed applied prefix at epoch initialization; cumulative counters start here.
     pub base: Prefix,
@@ -81,10 +81,6 @@ pub struct Report {
     pub received: Prefix,
     /// Cumulative canonical body bytes after `base` through `received`.
     pub received_bytes: u64,
-    /// Maximum cumulative unique operations after `base` that sender may reserve.
-    pub operation_limit: u64,
-    /// Maximum cumulative unique canonical body bytes sender may reserve.
-    pub byte_limit: u64,
 }
 
 /// Rejected accounting transition. Every failure leaves existing state unchanged.
@@ -96,7 +92,7 @@ pub enum FlowError {
     /// Scope or receiver incarnation differs; a fresh correlated open is required.
     #[error("replica flow channel mismatch")]
     Channel,
-    /// Count or body credit is exhausted; retain/backpressure, never over-admit.
+    /// Local count or body capacity is exhausted; retain/backpressure, never over-admit.
     #[error("replica flow capacity exhausted")]
     Capacity,
     /// Prefix/digest/byte accounting does not match the retained contiguous history.
@@ -160,24 +156,18 @@ fn batch(operations: &[Operation], previous: Prefix) -> Result<(Prefix, u64), Fl
 }
 
 impl Report {
-    /// Validate against a known receiver window, not the sender's local capacity.
+    /// Validate receipt shape and the caller's local retention configuration.
     /// Does not authenticate or verify history; heterogeneous peers may differ.
     pub fn validate(self, limits: PipelineLimits) -> Result<(), FlowError> {
-        let (count, bytes) = capacities(limits)?;
-        self.validate_shape()?;
-        let received = self.received.op.0 - self.base.op.0;
-        if self.operation_limit - received > count || self.byte_limit - self.received_bytes > bytes
-        {
-            return Err(FlowError::Report);
-        }
-        Ok(())
+        capacities(limits)?;
+        self.validate_shape()
     }
 
     /// Validate fixed metadata without applying a negotiated receive-window bound.
     ///
-    /// A credit window can exceed one wire frame. Codecs use this allocation-free
+    /// A local retention window can exceed one wire frame. Codecs use this allocation-free
     /// check. Senders separately enforce their own outstanding metadata/body
-    /// bounds and the advertised remote credits on every reservation.
+    /// bounds on every reservation.
     pub fn validate_shape(self) -> Result<(), FlowError> {
         if self.channel.scope.group_id.as_bytes() == &[0; 16]
             || self.channel.scope.configuration_digest == Digest::ZERO
@@ -196,8 +186,6 @@ impl Report {
         if (received == 0 && self.received != self.base)
             || (received == 0) != (self.received_bytes == 0)
             || self.received_bytes < received
-            || self.operation_limit < received
-            || self.byte_limit < self.received_bytes
         {
             return Err(FlowError::Report);
         }

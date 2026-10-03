@@ -26,14 +26,12 @@ async fn explicit_formatter_initializes_symmetric_shards_and_restart_keeps_elect
                 .map(|lane| (lane.shard, Local::new(lane.client)))
                 .collect();
             for partition in &journals.partitions {
-                let opened = partition
-                    .clone()
-                    .open(
-                        lanes[&partition.placement.shard].clone(),
-                        JournalGeneration(2),
-                    )
-                    .await
-                    .unwrap();
+                let opened = Box::pin(partition.clone().open(
+                    lanes[&partition.placement.shard].clone(),
+                    JournalGeneration(2),
+                ))
+                .await
+                .unwrap();
                 match opened.authority {
                     PartitionAuthority::Local(driver) => {
                         assert_eq!(driver.snapshot().applied.op.0, 0);

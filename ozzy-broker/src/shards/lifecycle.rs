@@ -1,10 +1,15 @@
 use crate::StartupError;
+use futures::{
+    FutureExt,
+    future::{BoxFuture, Shared},
+};
 use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
-use std::time::Duration;
 use tokio::sync::Notify;
+
+type ThreadJoin = Shared<BoxFuture<'static, ()>>;
 
 /// Coalesced shutdown signal, independent of the startup caller's executor.
 #[derive(Clone, Debug, Default)]
@@ -17,6 +22,7 @@ struct Signal {
 }
 
 impl Shutdown {
+    /// Whether this owner has received a shutdown request.
     pub fn is_requested(&self) -> bool {
         self.0.requested.load(Ordering::Acquire)
     }
@@ -24,6 +30,7 @@ impl Shutdown {
         self.0.requested.store(true, Ordering::Release);
         self.0.changed.notify_waiters();
     }
+    /// Wait for shutdown; cancellation does not clear the request.
     pub async fn requested(&self) {
         loop {
             let changed = self.0.changed.notified();
@@ -45,7 +52,7 @@ pub(crate) struct State {
     active: AtomicUsize,
     error: OnceLock<Failure>,
     next_thread: AtomicUsize,
-    owned: Vec<OnceLock<std::thread::JoinHandle<()>>>,
+    owned: Vec<OnceLock<ThreadJoin>>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,7 +77,13 @@ impl State {
     pub(crate) fn own(&self, thread: std::thread::JoinHandle<()>) {
         let slot = self.next_thread.fetch_add(1, Ordering::Relaxed);
         self.owned[slot]
-            .set(thread)
+            .set(
+                async move {
+                    let _ = thread.join();
+                }
+                .boxed()
+                .shared(),
+            )
             .expect("thread handle published more than once");
     }
     /// Block until every owned thread has exited. A thread reports `finished`
@@ -78,9 +91,7 @@ impl State {
     /// from a thread that may block and is not owned here.
     pub(crate) fn join(&self) {
         for thread in self.owned.iter().filter_map(OnceLock::get) {
-            while !thread.is_finished() {
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            futures::executor::block_on(thread.clone());
         }
     }
     pub(crate) fn fail(&self, error: StartupError) {

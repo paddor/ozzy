@@ -1,5 +1,7 @@
 //! Backend extension for direct writes. Only execution workers see descriptors;
 //! application clients keep the same opaque handles and owned operations.
+//! Local raw-ring exception: physical jobs retain buffers/handles through canceled
+//! observation. Replacing this channel must preserve that exact ownership.
 
 use fanring::{mpmc, teardown::Coordinated};
 use futures::task::AtomicWaker;
@@ -15,8 +17,8 @@ use std::{
 
 pub use crate::files::handles::OwnedFile;
 
-type Sender = mpmc::Sender<Write, Coordinated>;
-type Receiver = mpmc::Receiver<Write, Coordinated>;
+type Sender = mpmc::Sender<crate::Job, Coordinated>;
+type Receiver = mpmc::Receiver<crate::Job, Coordinated>;
 pub(crate) type Senders = [Sender; 2];
 pub(crate) type Receivers = [Receiver; 2];
 
@@ -24,6 +26,7 @@ pub(crate) type Receivers = [Receiver; 2];
 /// Finish accepted writes only after the kernel releases their buffers. On
 /// failure, settle all kernel work before returning or unwinding.
 pub trait Worker: Send + 'static {
+    /// Own the worker event loop until admitted writes and shutdown have settled.
     fn run(self: Box<Self>, queue: &mut Queue) -> io::Result<()>;
 }
 
@@ -35,13 +38,6 @@ pub(crate) struct Shared {
 impl fmt::Debug for Shared {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DirectShared").finish_non_exhaustive()
-    }
-}
-
-fn index(class: Class) -> usize {
-    match class {
-        Class::Data => 0,
-        Class::Progress => 1,
     }
 }
 
@@ -62,24 +58,6 @@ impl Shared {
             [data, progress],
         ))
     }
-
-    pub(crate) fn send(&self, senders: &mut Senders, write: Write) {
-        let result = if self.closed.load(Ordering::Acquire) {
-            Err(write)
-        } else {
-            senders[index(write.class())]
-                .try_send(write)
-                .map_err(|error| match error {
-                    mpmc::TrySendError::Full(write) | mpmc::TrySendError::Disconnected(write) => {
-                        write
-                    }
-                })
-        };
-        if let Err(write) = result {
-            write.finish(Err(io::ErrorKind::BrokenPipe.into()));
-        }
-        self.wake.wake();
-    }
 }
 
 /// Owns the admitted operation, its descriptor reservation and completion.
@@ -98,12 +76,15 @@ impl fmt::Debug for Write {
 }
 
 impl Write {
+    /// Retain the backend-owned descriptor for physical submission.
     pub fn file(&self) -> Arc<OwnedFile> {
         self.file.clone()
     }
+    /// Independent data or reserved-progress admission class.
     pub fn class(&self) -> Class {
         self.job.class
     }
+    /// Explicit starting byte offset of this physical write.
     pub fn offset(&self) -> u64 {
         let Operation::Write { offset, .. } = self
             .job
@@ -116,6 +97,7 @@ impl Write {
         };
         *offset
     }
+    /// Borrow owned scatter/gather payload while the write remains admitted.
     pub fn data(&self) -> &WriteBuffer {
         let Operation::Write { data, .. } = self
             .job
@@ -144,6 +126,7 @@ impl Write {
 /// Data and progress queues share the parent pool's budgets and drain fence.
 pub struct Queue {
     receivers: Receivers,
+    pending: Option<crate::Job>,
     shared: Arc<crate::Shared>,
 }
 
@@ -164,9 +147,54 @@ impl Queue {
             .wake
             .register(waker);
     }
+    /// Take one eligible write without waiting; execution limits may return none.
     pub fn try_recv(&mut self, class: Class) -> Option<Write> {
-        self.receivers[index(class)].try_recv().ok()
+        loop {
+            let job = if class == Class::Data {
+                self.pending
+                    .take()
+                    .or_else(|| self.receivers[0].try_recv().ok())
+            } else {
+                self.receivers[1].try_recv().ok()
+            };
+            let mut job = job?;
+            let executing = class == Class::Data && !self.shared.failed.load(Ordering::Acquire);
+            if executing
+                && self
+                    .shared
+                    .executing
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                        (used < self.shared.max_inflight).then_some(used + 1)
+                    })
+                    .is_err()
+            {
+                self.pending = Some(job);
+                return None;
+            }
+            job.executing = executing;
+            let file = if self.shared.failed.load(Ordering::Acquire) {
+                Err(io::ErrorKind::BrokenPipe.into())
+            } else {
+                crate::files::direct_file(
+                    job.operation.as_ref().expect("unrun write"),
+                    &self.shared,
+                )
+            };
+            match file {
+                Ok(Some(file)) => return Some(Write { file, job }),
+                Ok(None) => {
+                    job.reply
+                        .take()
+                        .expect("one reply")
+                        .finish(Err(io::ErrorKind::InvalidInput.into()));
+                }
+                Err(error) => {
+                    job.reply.take().expect("one reply").finish(Err(error));
+                }
+            }
+        }
     }
+    /// Whether admission is fenced and all queued/running jobs have settled.
     pub fn drained(&self) -> bool {
         self.shared.drained()
     }
@@ -191,6 +219,7 @@ pub(crate) fn spawn(
             }
             let mut queue = Queue {
                 receivers,
+                pending: None,
                 shared: owner.clone(),
             };
             let result =
@@ -198,9 +227,8 @@ pub(crate) fn spawn(
             if !matches!(result, Ok(Ok(()))) || !queue.drained() {
                 owner.fail();
             }
-            // A helper may have read the open flag before this fence. Its job
-            // stays active until it forwards or rejects the write, so drain
-            // until no such producer can publish behind the final receive.
+            // Client publication is fenced by the shared active reservation.
+            // Drain every accepted write before releasing the backend owner.
             owner
                 .direct
                 .as_ref()

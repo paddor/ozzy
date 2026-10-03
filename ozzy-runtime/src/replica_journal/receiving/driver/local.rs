@@ -2,10 +2,10 @@
 
 use super::RecoveryStorage;
 use crate::replica_journal::{
-    AppendBuffer, InstallationConfig, JournalCompletion, JournalError, JournalExecution,
-    JournalStartup, OwnedConfig, OwnedJournal, OwnedRecoveringJournal, OwnedRecoveryGenerations,
-    OwnedRecoveryOpen, PublishedRecovery, ReceivedChunk, RecoveryPlan, RecoveryStartup, Rejected,
-    ReplicaJournal, ShardJournal, ShardJournalConfig, SubmitError, WritePipelineConfig,
+    AppendBuffer, InstallationConfig, JournalCompletion, JournalError, JournalStartup, OwnedConfig,
+    OwnedJournal, OwnedRecoveringJournal, OwnedRecoveryGenerations, OwnedRecoveryOpen,
+    PublishedRecovery, ReceivedChunk, RecoveryPlan, RecoveryStartup, Rejected, ReplicaJournal,
+    ShardJournalConfig, SubmitError,
     commands::{Action, Command, finish},
     receiving::ReceiveAction,
 };
@@ -15,41 +15,96 @@ use ozzy_replication::{
     recovery::{Recovery, RecoveryTicket},
 };
 use std::{
-    cell::Cell,
     rc::Rc,
     sync::Arc,
     task::{Context, Poll},
 };
 use tokio::sync::Semaphore;
 
-type Returned = Result<Option<OwnedRecoveringJournal>, JournalError>;
-
-struct Execution {
-    running: Option<LocalBoxFuture<'static, Returned>>,
-    retain: Rc<Cell<bool>>,
-    owner: Option<OwnedRecoveringJournal>,
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "recovery retention and independent shutdown observations"
+)]
+pub(in crate::replica_journal) struct Execution {
+    running: Option<LocalBoxFuture<'static, (Box<OwnedRecoveringJournal>, bool)>>,
+    pub(in crate::replica_journal) retain: bool,
+    pub(in crate::replica_journal) owner: Option<Box<OwnedRecoveringJournal>>,
     failed: bool,
+    closing: bool,
+    finished: bool,
+    shutdown: Option<LocalBoxFuture<'static, Result<(), JournalError>>>,
 }
-
 impl std::fmt::Debug for Execution {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ShardRecoveryExecution")
+        f.debug_struct("ShardRecoveryOwner")
             .field("running", &self.running.is_some())
             .field("failed", &self.failed)
             .finish_non_exhaustive()
     }
 }
-
-impl JournalExecution for Execution {
-    fn poll_finished(&mut self, cx: &mut Context<'_>) -> Poll<bool> {
-        if let Some(running) = &mut self.running {
-            let result = std::task::ready!(running.as_mut().poll(cx));
-            self.running = None;
-            match result {
-                Ok(owner) => self.owner = owner,
-                Err(_) => self.failed = true,
-            }
+impl Execution {
+    pub(in crate::replica_journal) fn available(&self) -> usize {
+        usize::from(!self.is_closed() && self.owner.is_some())
+    }
+    pub(in crate::replica_journal) fn is_closed(&self) -> bool {
+        self.failed || self.closing || self.finished
+    }
+    pub(in crate::replica_journal) fn close(&mut self) {
+        self.closing = true;
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "refusal returns the original recovery action"
+    )]
+    pub(in crate::replica_journal) fn submit(&mut self, command: Command) -> Result<(), Command> {
+        if self.available() == 0 {
+            return Err(command);
         }
+        self.running = Some(
+            run(
+                self.owner.take().expect("available recovery owner"),
+                command,
+            )
+            .boxed_local(),
+        );
+        let _ = self.poll_work(&mut Context::from_waker(std::task::Waker::noop()));
+        Ok(())
+    }
+    fn poll_work(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if let Some(running) = &mut self.running {
+            let (owner, failed) = std::task::ready!(running.as_mut().poll(cx));
+            self.running = None;
+            self.owner = Some(owner);
+            self.failed |= failed;
+        }
+        Poll::Ready(())
+    }
+    pub(in crate::replica_journal) fn poll_finished(&mut self, cx: &mut Context<'_>) -> Poll<bool> {
+        if self.finished {
+            return Poll::Ready(self.failed);
+        }
+        std::task::ready!(self.poll_work(cx));
+        if !self.is_closed() {
+            return Poll::Pending;
+        }
+        if self.retain && !self.failed {
+            self.finished = true;
+            return Poll::Ready(false);
+        }
+        if self.shutdown.is_none() {
+            let owner = self.owner.take().expect("settled recovery owner");
+            self.shutdown = Some(async move { owner.shutdown().await }.boxed_local());
+        }
+        self.failed |= std::task::ready!(
+            self.shutdown
+                .as_mut()
+                .expect("closing owner")
+                .as_mut()
+                .poll(cx)
+        )
+        .is_err();
+        self.shutdown = None;
+        self.finished = true;
         Poll::Ready(self.failed)
     }
 }
@@ -57,10 +112,10 @@ impl JournalExecution for Execution {
 /// Recovery-only command handle whose execution stays inside its actor. Retry
 /// and adoption retain the same shared backend and injected timestamp source.
 pub struct ShardRecoveringJournal {
-    journal: ReplicaJournal<Execution>,
+    journal: ReplicaJournal,
     config: OwnedConfig,
     io: ozzy_io::Local,
-    memory: Option<crate::memory::AllocationSource>,
+    memory: Option<crate::memory::Owner>,
     scheduler: ShardJournalConfig,
     timestamp: Rc<dyn Fn() -> u64>,
 }
@@ -102,29 +157,27 @@ impl ShardRecoveringJournal {
         }
         let (config, io, generations, buffers) = owner.shard_parts()?;
         let memory = owner.append_memory.clone();
-        let (sender, receiver) = crate::command_channel::notified_channel(scheduler.commands);
-        let retain = Rc::new(Cell::new(false));
         let journal = ReplicaJournal {
-            write_pipeline: WritePipelineConfig::for_backlog(config.writeback),
+            backlog: config.writeback,
             replicated: config.configuration.configuration().policy()
                 == ozzy_replication::QuorumPolicy::Replicated,
-            sender: Some(sender),
             capacity: Arc::new(Semaphore::new(scheduler.commands)),
             command_capacity: scheduler.commands,
             read_capacity: Arc::new(Semaphore::new(0)),
             buffers,
-            append_memory: memory
-                .as_ref()
-                .map(crate::memory::AllocationSource::allocator),
+            append_memory: memory.as_ref().map(crate::memory::Owner::allocator),
             append_limits: config.append_limits,
             operations: config.limits.operations,
             buffer_generation: generations.attempt,
-            execution: Execution {
-                running: Some(run(owner, receiver, retain.clone()).boxed_local()),
-                retain,
-                owner: None,
+            execution: crate::replica_journal::execution::Execution::Recovery(Execution {
+                running: None,
+                retain: false,
+                owner: Some(Box::new(owner)),
                 failed: false,
-            },
+                closing: false,
+                finished: false,
+                shutdown: None,
+            }),
         };
         Ok(Self {
             journal,
@@ -137,62 +190,52 @@ impl ShardRecoveringJournal {
     }
 
     async fn take_owner(&mut self) -> Result<OwnedRecoveringJournal, JournalError> {
-        self.journal.execution.retain.set(true);
+        self.journal.execution.recovery().retain = true;
         self.journal.shutdown().await?;
         self.journal
             .execution
+            .recovery()
             .owner
             .take()
+            .map(|owner| *owner)
             .ok_or(JournalError::Faulted)
     }
 }
 
 async fn run(
-    mut owner: OwnedRecoveringJournal,
-    mut receiver: crate::command_channel::NotifiedReceiver<Command>,
-    retain: Rc<Cell<bool>>,
-) -> Returned {
-    while let Ok(Command {
+    mut owner: Box<OwnedRecoveringJournal>,
+    command: Command,
+) -> (Box<OwnedRecoveringJournal>, bool) {
+    let Command {
         action,
         _permit: permit,
-    }) = receiver.recv_async().await
-    {
-        let Action::Receiving(action) = action else {
-            return Err(JournalError::Configuration);
-        };
-        let failed = match action {
-            ReceiveAction::Begin {
-                ticket,
-                config,
-                done,
-            } => finish(done, owner.begin_recovery(ticket, config).await, permit),
-            ReceiveAction::Chunk {
-                ticket,
-                buffer,
-                done,
-            } => finish(done, owner.receive_chunk(ticket, buffer).await, permit),
-            ReceiveAction::Finish { ticket, done } => {
-                finish(done, owner.finish_recovery(ticket).await, permit)
-            }
-            ReceiveAction::Abort { ticket, done } => {
-                finish(done, owner.abort_recovery(ticket).await, permit)
-            }
-        };
-        if failed || owner.is_faulted() {
-            return Err(JournalError::Faulted);
+    } = command;
+    let Action::Receiving(action) = action else {
+        unreachable!("recovery admits only transfer work");
+    };
+    let failed = match action {
+        ReceiveAction::Begin {
+            ticket,
+            config,
+            done,
+        } => finish(done, owner.begin_recovery(ticket, config).await, permit),
+        ReceiveAction::Chunk {
+            ticket,
+            buffer,
+            done,
+        } => finish(done, owner.receive_chunk(ticket, buffer).await, permit),
+        ReceiveAction::Finish { ticket, done } => {
+            finish(done, owner.finish_recovery(ticket).await, permit)
         }
-        crate::replica_journal::shard::yield_turn().await;
-    }
-    if retain.get() {
-        Ok(Some(owner))
-    } else {
-        owner.shutdown().await?;
-        Ok(None)
-    }
+        ReceiveAction::Abort { ticket, done } => {
+            finish(done, owner.abort_recovery(ticket).await, permit)
+        }
+    };
+    let failed = failed || owner.is_faulted();
+    (owner, failed)
 }
 
 impl RecoveryStorage for ShardRecoveringJournal {
-    type Normal = ShardJournal;
     fn lease_append_buffer(&self) -> Result<AppendBuffer, SubmitError> {
         self.journal.lease_append_buffer()
     }
@@ -298,7 +341,7 @@ impl RecoveryStorage for ShardRecoveringJournal {
         publication: PublishedRecovery,
         abandoned: bool,
         generation: JournalGeneration,
-    ) -> Result<(ReplicaJournal<Self::Normal>, JournalStartup), JournalError> {
+    ) -> Result<(ReplicaJournal, JournalStartup), JournalError> {
         let owner = self.take_owner().await?;
         let (owner, startup) = if abandoned {
             owner.shutdown().await?;

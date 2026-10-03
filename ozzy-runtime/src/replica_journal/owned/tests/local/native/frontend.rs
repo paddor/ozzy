@@ -1,10 +1,10 @@
 use super::*;
 use crate::{
-    dispatch::{self, Budget, Budgets, Class, Client, Quota},
+    dispatch::{Budget, Budgets, Class},
     frontend::{
-        Access, Destination, Dispatcher, DispatcherLimits, GrantRequest, GrantTarget, LinkIds,
-        LinkSessions, Placement, Port, ReceiveBuffers, ReceiveStorage, ReplyError, ReplyLimits,
-        Routed, RoutingTable, Service, ShardIntake, Subject,
+        Access, DataInput, DataReceiver, Dispatcher, DispatcherLimits, Kind, LinkIds, LinkSessions,
+        Placement, Port, ReceiveBuffers, ReceiveStorage, ReplyError, ReplyLimits, RoutingTable,
+        Service, data_channel,
     },
     replica_actor::{PartitionActor, PartitionActors},
     replica_transport::QueueLimits,
@@ -16,11 +16,9 @@ mod shared;
 
 struct Frontend {
     service: Service,
-    input: ShardIntake,
-    destinations: [Destination; 2],
+    input: TestInput,
     routes: RoutingTable,
-    port: Port,
-    client: Client,
+    _port: Port,
     server: Socket,
     sdk: Socket,
     link: Link,
@@ -40,57 +38,39 @@ fn budgets() -> Budgets {
     }
 }
 
-fn service(local: NodeId, group: GroupId) -> (Service, ShardIntake, [Destination; 2]) {
-    let domain = crate::memory::Domain::new(None, 256 * 1024).unwrap();
-    let memory_limits = crate::memory::Limits {
-        bytes: 128 * 1024,
-        buffers: 32,
-        cache_bytes: 128 * 1024,
-    };
-    let data = domain.owner(memory_limits).unwrap();
-    let control = domain.owner(memory_limits).unwrap();
-    let (sender, mut receiver) = ShardIntake::new(
-        data,
-        &control,
-        dispatch::Limits {
-            capacity: budgets(),
-            clients: 2,
-            grants: 3,
-        },
-        2,
-        1,
+struct TestInput([DataReceiver; 2]);
+impl TestInput {
+    fn try_recv(&mut self) -> Result<Option<DataInput>, crate::frontend::DataLaneError> {
+        for lane in [1, 0] {
+            if let Some(input) = self.0[lane].try_recv()? {
+                return Ok(Some(input));
+            }
+        }
+        Ok(None)
+    }
+}
+
+fn service(local: NodeId, group: GroupId) -> (Service, TestInput) {
+    let (data, data_rx) = data_channel(
+        &omq_tokio::Context::new(),
+        7,
+        Kind::Client,
+        Class::Data,
+        4,
+        8192,
+        65536,
     )
     .unwrap();
-    let canonical = crate::replicated::ClientConfig {
-        peers: Vec::new(),
-        limits: limits(),
-    }
-    .prepared_canonical_body_bytes()
+    let (control, control_rx) = data_channel(
+        &omq_tokio::Context::new(),
+        7,
+        Kind::Client,
+        Class::Control,
+        4,
+        8192,
+        65536,
+    )
     .unwrap();
-    let destinations = [
-        receiver
-            .destination(
-                group,
-                Kind::Client,
-                Class::Control,
-                crate::memory::Quota {
-                    bytes: 65,
-                    buffers: 1,
-                },
-            )
-            .unwrap(),
-        receiver
-            .destination(
-                group,
-                Kind::Client,
-                Class::Data,
-                crate::memory::Quota {
-                    bytes: canonical * 2,
-                    buffers: 2,
-                },
-            )
-            .unwrap(),
-    ];
     let routes = crate::frontend::RoutingTable::new(
         &[7],
         &[Placement {
@@ -110,10 +90,10 @@ fn service(local: NodeId, group: GroupId) -> (Service, ShardIntake, [Destination
     let dispatcher = Dispatcher::new(
         local,
         routes,
-        vec![(7, sender)],
+        vec![(7, data), (7, control)],
         DispatcherLimits {
             peers: 2,
-            grants_per_class: 2,
+
             replies: ReplyLimits {
                 data: queue,
                 control: queue,
@@ -121,7 +101,7 @@ fn service(local: NodeId, group: GroupId) -> (Service, ShardIntake, [Destination
         },
     )
     .unwrap();
-    let parameters = handshake::Parameters::streaming(limits(), handshake::OWNER, 4, 4096).unwrap();
+    let parameters = handshake::Parameters::streaming(limits(), handshake::OWNER).unwrap();
     let service = Service::new(
         dispatcher,
         parameters,
@@ -132,12 +112,12 @@ fn service(local: NodeId, group: GroupId) -> (Service, ShardIntake, [Destination
         LinkIds::deterministic(NonZeroU64::new(99).unwrap()),
     )
     .unwrap();
-    (service, receiver, destinations)
+    (service, TestInput([data_rx, control_rx]))
 }
 
 impl Frontend {
     async fn new(local: NodeId, group: GroupId) -> Self {
-        let (mut service, mut input, destinations) = service(local, group);
+        let (mut service, input) = service(local, group);
         let context = OmqContext::new();
         let options = |node: NodeId| {
             Options::default()
@@ -183,8 +163,7 @@ impl Frontend {
         remote.receive(local, packet(&welcome)).unwrap();
         let link = service.links().get(link(70, 80).binding.peer).unwrap();
         assert_eq!(remote.session(local), Some(link.binding.session));
-        let client = input.client(link.binding.session, budgets()).unwrap();
-        let port = service.port(7, budgets()).unwrap();
+        let port = service.port(&context, 7, budgets()).unwrap();
         let routes = RoutingTable::new(
             &[7],
             &[Placement {
@@ -199,10 +178,8 @@ impl Frontend {
         Self {
             service,
             input,
-            destinations,
             routes,
-            port,
-            client,
+            _port: port,
             server,
             sdk,
             link,
@@ -212,45 +189,6 @@ impl Frontend {
     }
 
     async fn deliver(&mut self, actors: &mut PartitionActors, group: GroupId, message: Message) {
-        let class = if packet(&message).envelope.opcode == Opcode::Append {
-            Class::Data
-        } else {
-            Class::Control
-        };
-        let request = GrantRequest {
-            binding: self.link.binding,
-            route: Routed {
-                placement: Placement {
-                    group,
-                    partition: partition(),
-                    shard: 7,
-                },
-                class,
-                writer: (class == Class::Data).then_some(ProducerId::from_bytes([40; 16])),
-            },
-        };
-        self.input
-            .install(
-                &mut self.port,
-                &self.service.links(),
-                request,
-                None,
-                &self.client,
-                8192,
-            )
-            .unwrap();
-        assert!(self.service.poll_command().unwrap());
-        let mut installed = false;
-        self.input
-            .poll_installations(
-                &mut Context::from_waker(Waker::noop()),
-                &self.service.links(),
-                0,
-                6,
-                |_, _| installed = true,
-            )
-            .unwrap();
-        assert!(installed);
         let outgoing = Message::multipart(
             std::iter::once(Bytes::copy_from_slice(self.local.as_bytes()))
                 .chain((1..4).map(|index| message.part_bytes(index).unwrap())),
@@ -268,12 +206,21 @@ impl Frontend {
         let routed = self.service.receive(incoming, retained).unwrap().unwrap();
         assert_eq!(routed.placement.shard, 7);
         assert_eq!(routed.placement.group, group);
-        let received = self
-            .input
-            .receive(&self.service.links(), &self.routes)
-            .unwrap()
-            .unwrap();
-        assert!(received.current);
+        let received = self.input.try_recv().unwrap().unwrap();
+        assert_eq!(
+            self.service
+                .links()
+                .get(received.binding.peer)
+                .unwrap()
+                .binding,
+            received.binding
+        );
+        assert_eq!(
+            self.routes
+                .route(&received.message, received.binding)
+                .unwrap(),
+            received.route
+        );
         assert_eq!(
             actors
                 .receive_client(group, &received.message, Duration::ZERO)
@@ -302,14 +249,6 @@ impl Frontend {
         self.service
             .flush(|message| self.server.try_send(message))
             .unwrap();
-        if !actors
-            .native_has_work(self.destinations[0].group())
-            .unwrap()
-        {
-            for destination in &self.destinations {
-                self.input.settle(destination, |_| Ok(())).unwrap();
-            }
-        }
     }
 
     async fn reply(
@@ -354,10 +293,7 @@ async fn scenario() {
             producer: ProducerId::from_bytes([40; 16]),
         }]),
         partition(),
-        Some((
-            front.destinations[0].capacity(),
-            front.destinations[1].capacity(),
-        )),
+        None,
     );
     let mut actors =
         PartitionActors::new(vec![PartitionActor::Local(Box::new(actor))], 1, 1).unwrap();
