@@ -14,7 +14,7 @@ production SDKs, broker owners, and controlled `ozzy-io` backend. Execution and
 result delivery are separate events, with file/directory persistence modeled
 without journal filesystem I/O. The smaller core suites control protocol
 schedules; threaded OMQ runs do not claim exact deterministic execution from a
-seed alone. See [validation](../doc/VALIDATION.md).
+seed alone. See [test layers](../DEVELOPMENT.md#test-layers).
 
 Run `scripts/test.sh simulation` for both layers, or `scripts/test.sh inproc`
 for the full broker and SDK gates.

@@ -13,7 +13,7 @@ Embedded tests use the real broker runtime with injected transport and file I/O.
 | [Runtime](doc/RUNTIME.md) | Owners, queues, batching, pressure, readers |
 | [Storage](doc/STORAGE.md) | Canonical bytes, segments, barriers, caches, recovery |
 | [Replication](doc/REPLICATION.md) | Fixed-three authority, confirmation, election, repair |
-| [Validation](doc/VALIDATION.md) | IO-free integration, simulation, Loom, process checks |
+| [Development](DEVELOPMENT.md) | Contributor checks, test layers, simulation, and soaks |
 
 Codecs and independent fixtures own exact layouts. READMEs describe usage.
 [BENCHMARKS.md](BENCHMARKS.md) owns measured charts; raw results stay outside

@@ -35,7 +35,7 @@ publication and the existing election handoff complete.
 The selected broker composes these cores with partition-owned async journals.
 Legacy `Node` replication, checkpoint transfer, membership changes and partition
 movement remain separate work. See [replication](../doc/REPLICATION.md),
-[protocol](../doc/PROTOCOL.md) and [validation](../doc/VALIDATION.md).
+[protocol](../doc/PROTOCOL.md) and [test layers](../DEVELOPMENT.md#test-layers).
 
 ```sh
 scripts/test.sh core

@@ -23,7 +23,7 @@ ozzy = "0.1.0"
 ## Start here
 
 - [Rust API and example](ozzy/README.md)
-- [Plain-language overview](doc/OVERVIEW.md)
+- [Technical overview](doc/OVERVIEW.md)
 - [Producer record flow](doc/OVERVIEW.md#producer-to-broker)
 - [Consumer record flow](doc/OVERVIEW.md#broker-to-consumer)
 - [Architecture and reference docs](DESIGN.md)

@@ -1,119 +1,43 @@
 # Storage and recovery
 
-Ozzy stores records only in append-only segment journals. Single-broker durable,
-disk quorum, and replicated-persisting share this engine. Linux AIO and the
-bounded worker pool are physical I/O backends, not separate storage formats.
-
-## Selected topic and writer ownership
-
-Each replicated partition has one independent group journal on each of the
-three brokers. Its operations cover only that partition. The partition actor
-owns journal state on its application shard. Journals share asynchronous storage
-backends and device budgets, never operation numbers, confirmation evidence, or
-recovery state. There is no interleaved topic-wide journal.
-
-Selected I/O contract: every filesystem operation executes behind a backend-neutral
-future, including metadata, reads, recovery, and shutdown. The segment engine
-owns format and durability ordering. Backend crates own handles and execution:
-Linux AIO and a bounded pool. No io_uring.
-The async journal uses these backends without file syscalls or kernel completion
-handling on its caller's shard. Partition actors own the journal state; the
-dedicated journal-owner threads have been removed.
-See [runtime ownership](RUNTIME.md#async-storage).
-
-`SegmentState` holds positions, encoding scratch, and completion fences without
-file ownership. Both the asynchronous writer and remaining blocking fixtures use
-this state. Detached segment rolls and incremental storage validation execute
-only through the asynchronous Backend path. Memory tests cover publication
-failure, frozen validation tails, byte budgets, corruption, and failed barriers;
-real-backend tests retain descriptor and filesystem evidence.
-
-A partition belongs to its topic and accepts multiple writers. Keep one global
-offset sequence per partition and separate bounded producer epoch, sequence,
-retry-result state per `(partition, producer)`. Record retention belongs to the
-partition; retry evidence has its own bounds. Opening or fencing one writer
-must not fence another writer or reset partition offsets.
-
-Interleaved writers mean producer sequence cannot imply partition offset. Retain
-the original sequence-to-offset/result association for exact retry replies,
-including restart and leader change. Expired retry evidence must fail explicitly,
-not infer an offset or append an uncertain duplicate.
-
-Canonical addresses contain topic and partition identity, not a writer ID.
-Each partition keeps independent writer sessions and exact retry ranges.
-Ranges merge only when both sequences and offsets are adjacent. Checkpoints
-preserve these mappings. Aggregate writer/range limits bound memory; an explicit
-result-floor operation releases retry evidence. Retention protects every writer's
-remaining results.
-
-Streaming retries return separate confirmation ranges across offset gaps. Each
-SDK receipt retains its exact original offset. A mixed retry verifies retained
-records and stores only the fresh suffix. Partial LZ4 retries rebuild that suffix;
-fresh whole blocks remain byte-exact. Stale validation of a trimmed request returns
-to the SDK's intact retry bytes, never reproposes an incomplete request.
-
-Topic discovery and shared broker connections use the selected frontend.
+All three confirmation modes use independent append-only segment journals per
+partition. Actors own journal state; asynchronous backends own file handles,
+physical jobs, and fixed device workers. No filesystem calls run on shards.
 
 ## Partition directory layout
 
-Selected deployment root: `<broker-root>/topics/<topic>/partitions/<partition>/`.
-For example, `data/topics/orders/partitions/0/` contains one group directory,
-including its `segments/`,
-`indexes/`, `checkpoints/`, `staging/`, lock, identity, configuration, manifests,
-`CURRENT`, and durability/restart evidence. The
-[overview tree](OVERVIEW.md#segment-files-and-disk-reads) shows the layout.
-The files below retain their single-group contracts. Explicit broker formatting
-creates this topic/partition hierarchy; normal startup only opens it.
+`<broker-root>/topics/<topic>/partitions/<partition>/` contains one store.
+Shard numbers and producer IDs are absent from paths/storage identity. Persisted
+incarnations prevent name reuse from adopting an older partition.
 
-Topic components must be validated or reversibly escaped: never interpret a
-topic name as an arbitrary path. Names and partition numbers aid humans; persisted
-identities bind the exact topic/partition incarnation and group. Reusing a name
-must not silently adopt an old partition's data. Shard numbers never appear in
-the storage identity or directory hierarchy.
+| File / directory | Contract |
+| --- | --- |
+| Lock, identity, `CONFIGURATION` | Exclusive ownership, store/group/policy binding |
+| `MANIFEST.<generation>`, `CURRENT` | Immutable selection of exact physical incarnations |
+| `DURABLE` | Synchronized accepted-prefix evidence for disk groups |
+| `MEMORY_VOTING` | Running/clean-stop evidence for RP |
+| `segments/` | Canonical metadata operations and payloads |
+| `indexes/` | Rebuildable record lookup |
+| `checkpoints/` | Canonical state and original chain anchor |
+| `staging/` | Unselected replacement work |
 
-`DURABLE` records a synchronized prefix of this partition's selected history.
-It is not a sidecar per segment and does not prove durability of neighboring
-partitions. `CURRENT` selects the manifest; the manifest names exact segment
-incarnations. Segment seals check integrity but are not durability evidence.
-Replica restart authority remains a separate requirement.
+Formatting is explicit; missing/corrupt files never trigger reformatting.
+Partition histories, operations, and recovery stay independent despite shared
+devices. Device failure and bandwidth remain shared failure/resource domains.
 
-Partition failover, suffix repair, roll, and retention change only that
-partition's journal. No shared physical prefix can make one partition's tail
-damage discard another's confirmed history. This does not isolate SSD failure,
-filesystem errors, or device bandwidth. Schedule bounded, fair work across all
-partition journals on the shared executor; do not allocate threads per partition.
-Separate files still require their own barriers and evidence publication.
+## Record identity
 
-The cost is more active files, preallocated capacity, metadata, and durability
-operations. Bound these resources and size segments accordingly. Share physical
-worker pools, not histories, to reduce overhead without coupling recovery.
-
-## Record fields: who supplies what?
-
-**Producers supply record identity and payload. Brokers assign log positions
-and build storage framing.** The disk format is not the producer wire format;
-see [Protocol](PROTOCOL.md) for current messages.
-
-| Scope | Fields | Source |
-| --- | --- | --- |
-| Record | Message ID, encoding, part lengths, payload bytes | Producer |
-| Producer batch | Partition, owner epoch, producer ID/epoch, first sequence | Producer context, validated by broker |
-| Producer batch | First partition offset, append timestamp, record count | Broker assigns positions/time and counts collected records |
-| Operation | Group/configuration/view, operation number, previous digest, body digest | Broker |
-| Physical entry/group | Codec, encoded lengths, checksums, padding, seal | Journal |
+Producers supply message IDs, multipart boundaries, and bytes. Brokers assign
+partition offsets, append timestamps, canonical operation numbers, and digests.
+Producer sequences/epochs are independent per partition; interleaved producers
+share offsets. Exact sequence-to-offset retry ranges survive checkpoints and
+leader changes. Ranges merge only when both sequences and offsets are adjacent.
+Expired results fail explicitly; message ID alone is no deduplication key.
 
 ### Canonical APPEND body
 
-Integers are big-endian. Each batch belongs to one producer within one partition.
-Descriptors precede payloads **within each batch**.
-
-```text
-batch count: u32
-repeat for each batch:
-    batch header: 76 bytes
-    record descriptors
-    concatenated record payloads
-```
+All integers are big-endian. A body starts with batch count `u32`, followed by
+complete batches: 76-byte header, descriptors, then payloads.
 
 | Batch header field, in order | Bytes |
 | --- | ---: |
@@ -123,117 +47,67 @@ repeat for each batch:
 | Producer epoch | 8 |
 | First sequence | 8 |
 | First partition offset | 8 |
-| Broker append timestamp, Unix milliseconds | 8 |
-| Record count; high bit selects compact lengths; next bit marks an encoded payload | 4 |
+| Append timestamp, Unix milliseconds | 8 |
+| Record count; high bit compact lengths, next bit encoded payload | 4 |
 
-Raw single-part batches whose payloads are all at most 255 bytes use:
+Raw single-part payloads of at most 255 bytes use contiguous message IDs
+(`16*N` bytes), lengths (`N` bytes), then payloads. Zero length means one empty
+part. General descriptors use:
 
-```text
-16-byte message IDs [N] | 1-byte payload lengths [N] | concatenated payloads
-```
-
-A 16-byte record occupies **33 bytes**, plus shared batch/operation framing.
-Zero length means one empty part. Other batches use general descriptors:
-
-| General record descriptor | Bytes |
+| Field | Bytes |
 | --- | ---: |
 | Message ID | 16 |
-| Tagged part count: high byte codec 0/raw or 1/LZ4 | 4 |
-| LZ4 only: original payload byte count | 4 |
-| Length of each part | 4 per part |
+| Tagged part count; high byte codec 0/raw or 1/LZ4 | 4 |
+| LZ4 only: original payload bytes | 4 |
+| Part lengths | 4/part |
 
-Record sequence and offset derive from the batch's first values plus index.
+Sequence/offset equals the batch's first value plus record index. Producer LZ4
+batches use clear general descriptors, codec `u8`, decoded/encoded lengths
+(`u32` each), and the exact producer block. They retain no decoded copy.
+Partial reads/retries decode lazily; fresh suffixes are rebuilt without changing
+retained identities. Stale validation returns to intact SDK retry bytes.
 
-For a producer LZ4 APPEND, clear general record descriptors are followed by codec
-`u8`, decoded length `u32`, encoded length `u32`, and the exact producer block.
-The canonical body contains no decoded payload copy. Brokers validate the block
-without materializing it. Consensus, repair, and segment storage preserve those
-canonical bytes unchanged. Full-group reader delivery forwards the same block;
-partial reads decode it lazily. Segment LZ4 remains an independent option.
-
-Multipart boundaries and exact retry IDs survive either representation.
-
-The SDK constructs APPEND record descriptors; the broker validates them before
-canonical encoding. Its body proof keeps the record, part, and decoded-byte
-totals. Admission checks the journal's own limits and patched positions without
-walking those descriptors or LZ4 again. Immutable admitted bodies skip the
-storage encoder's duplicate schema walk; recovery still validates disk bytes.
-[Writer transport](PROTOCOL.md#writer-transport) does not
-change record identity or the canonical disk layout.
-
-Exact encoding: [canonical body codec](../ozzy-journal/src/operation.rs).
+Validated body proofs retain record/part/decoded-byte totals. Live admission and
+storage reuse those immutable proofs; recovery validates physical bytes anew.
+Exact schema: [operation codec](../ozzy-journal/src/operation.rs).
 
 ## Segment layout
 
-```text
-segment header: 4096 bytes
-physical write group
-physical write group
-...
-unused preallocated capacity
-```
+A 4096-byte header precedes physical write groups and unused preallocated capacity.
+Each group ends with padding and a 96-byte seal; total size is a multiple of 4096.
+A group can contain several canonical operations.
 
-Each physical group ends with padding and a 96-byte checksum seal, bringing its
-total size to a multiple of 4096 bytes. An operation is not a physical group:
-a group can contain several operations.
-
-Local collection reserves raw header, descriptor, and padding space before
-combining admitted requests. The payload target alone does not establish that
-a group fits an empty segment, even when compression is enabled.
-
-| Encoding | Group contents before final padding and seal |
+| Codec | Group contents before final padding/seal |
 | --- | --- |
-| Raw / per-operation LZ4 | Repeated: 192-byte entry header, encoded body, padding to 8 bytes |
-| Shared LZ4 | 64-byte shared header, all 192-byte entry headers, one compressed block of operation bodies, padding to 8 bytes |
+| 0 raw / 1 per-operation LZ4 | Repeated 192-byte entry header, encoded body, 8-byte alignment |
+| 2 shared LZ4 | 64-byte shared header, entry headers, one compressed body block, 8-byte alignment |
 
-Entry headers retain operation identity, chain/body digests, encoded/decoded
-lengths and codec. Headers and seals stay uncompressed. Codec IDs are `0` raw,
-`1` per-operation LZ4, `2` shared LZ4. Unknown IDs and nonzero reserved fields fail
-validation. Exact layout: [segment codec](../ozzy-journal-segment/src/codec.rs).
+Headers retain operation identity, chain/body digests, lengths, and codec and
+remain uncompressed. Unknown codecs/reserved fields fail validation. Raw header,
+descriptor, and padding space is reserved before collecting operations.
+Exact layout: [segment codec](../ozzy-journal-segment/src/codec.rs).
 
 ### Compression
 
-- Local LZ4 writes encode independent operation bodies. Background persistence
-  collects whole operation bodies into shared LZ4 blocks.
-- Canonical APPEND packing is earlier and independent. Producer LZ4 stays
-  byte-exact; the partition actor adaptively packs a fresh raw APPEND before its
-  canonical digest. When every operation in a physical group already contains
-  prepared payloads, physical encoding stays raw instead of compressing blocks
-  again.
-- The partition actor compresses with reusable lz4rip scratch; the device writer
-  receives finalized bytes. Preparation overlaps earlier writes.
-- Keep raw bytes when compression misses the minimum saving. Skip compression
-  when even perfect savings cannot reduce the 4096-byte physical group size.
-- Raw is default. LZ4 requires `lz4` in the segment crate, or `lz4-storage` in
-  runtime/facade, and `BodyEncoding::Lz4` configuration.
-- Canonical APPEND, physical segment, and OMQ transport compression are
-  independent. None changes retry identity, record boundaries, or confirmation
-  policy.
+Actors prepare/compress bytes with reusable scratch while previous writes run.
+Raw is default; LZ4 needs the segment `lz4` or facade/runtime `lz4-storage`
+feature and `BodyEncoding::Lz4`. Compression is skipped without sufficient
+saving or when it cannot reduce aligned physical size. Groups of prepared
+producer blocks remain raw to avoid recompression.
 
-A cold read locates the containing operation/shared block through an index,
-decodes that extent, and selects the record. Recent reads retain encoded
-canonical backing. Whole producer LZ4 blocks pass through unchanged; partial
-reads decode only the selected extent. PUB output has its own encoded backing.
-Records are never truncated or split: above the default 1 MiB record limit,
-record, operation and segment limits must all permit the larger record.
+APPEND, segment, and OMQ transport compression are independent. All preserve
+record boundaries, retry identity, and confirmation policy. Whole producer
+blocks can pass through reads; partial reads decode the selected extent.
+Record/operation/segment limits must all permit an oversized record.
 
 ## Append, synchronization, and roll
 
-1. **Validate:** check producer authority, sequence, payload and resource limits.
-   Keep accepted and confirmed state separate; an accepted retry is not success.
-2. **Prepare:** encode/compress on the partition actor. The device writer receives
-   owned bytes and fixed placement through bounded queues. A body the owner
-   already decoded with the journal's limits is not decoded again; envelope and
-   storage bounds stay checked. Followers reuse the body digests verified by
-   PREPARE decoding.
-3. **Write:** handle interrupted and short writes until the complete group is
-   written. `pwritev` may need multiple calls at the 1024-slice limit.
-4. **Publish:** install only the matching, ordered completion and read index.
-   Failed or ambiguous I/O fences the writer; stale completions change nothing.
-5. **Confirm:** satisfy the configured local/replicated policy. Disk quorum also
-   requires the recovery evidence described below.
-
-The async path keeps shard work separate from physical execution:
+1. Validate authority/retry/limits; assign offsets and freeze canonical bytes.
+2. Prepare physical groups on the actor and submit owned bounded backend jobs.
+3. Resume interrupted/short writes until complete; vectored calls honor slice limits.
+4. Install ordered generation-matching completions and indexes; ambiguous failure
+   fences the writer.
+5. Publish required durable evidence, satisfy policy, then apply/reply.
 
 ```mermaid
 sequenceDiagram
@@ -256,394 +130,188 @@ sequenceDiagram
     Note over J,H: Cancellation retains buffers and handles until physical completion
 ```
 
-The pool backend executes the same jobs on fixed blocking workers. AIO uses one
-device owner plus fixed file helpers; neither creates a thread per partition.
-`O_DSYNC` data completion may itself provide the data barrier. Replication can
-still require another broker's evidence after local durable publication.
-
-### Persistent handles
-
-| Handle | Lifetime |
+| Write mode | Boundary |
 | --- | --- |
-| Active segment write handles | Open across appends; replaced at roll or closed at shutdown |
-| Recent read handles | Four-entry journal LRU keyed by exact path and source identity |
-| Running read/write job | Owns its handle lease and buffers through physical completion |
+| `O_DSYNC` default | Complete writes supply data-integrity barriers; disk groups still publish durable evidence |
+| Buffered (RP) | Written progress only; flush, roll, promises, shutdown retain required barriers |
+| Linux direct I/O | Aligned replicated data writes through `O_DIRECT`; headers/metadata/reads remain buffered |
 
-Evicting a read handle drops only the cache lease. Running jobs keep their own
-leases. Reads also protect their selected physical files across roll and repair.
-Handles and filesystem calls belong to the backend, never the application shard.
+Preallocation reserves full capacity/final EOF; appends advance a logical prefix.
+`O_DSYNC` is not multi-write atomicity. AIO submission/completion alone is no
+barrier. Metadata and directories require their own synchronization.
 
-Segment files use `fallocate` to reserve **full capacity and final file size**
-before use. Appends advance a logical valid prefix; they do not grow EOF.
-Successors and replacements follow the same rule.
-
-`fallocate` leaves unwritten extents. The first `O_DSYNC` write into each one
-also commits an extent conversion. Disk-quorum groups can zero the next
-segment ahead of its roll (`zero_ahead`, off by default) in synced 4 MiB jobs.
-This doubles device writes and helps only when write count limits throughput.
-
-The roll can use a partly zeroed successor; its unwritten remainder stays valid
-allocated space. A successor left by shutdown is an unreferenced orphan.
-
-| Write mode | Guarantee |
-| --- | --- |
-| Default `O_DSYNC` | Successful writes provide data-integrity durability; no separate data `fdatasync` per append |
-| `SegmentWriteMode::Buffered` | Ordinary writes; explicit flush/shutdown still synchronizes |
-
-Replicated-persisting selects buffered writes. Written progress permits live
-replay but is never stable-storage evidence. Segment sealing, election promises,
-and clean shutdown still synchronize their required prefixes.
-
-`O_DSYNC` uses the page cache and does not make multiple writes atomic. Metadata,
-initialization, recovery and directory publication retain their sync barriers.
-Completion covers only its captured prefix and writer generation.
+Write handles remain open through roll/shutdown. A four-entry read-handle LRU
+caches exact path/source identities; jobs retain independent leases and file pins.
+Cancellation releases observation, not physical buffers/handles/admission.
 
 ### Segment roll
 
-- Preallocate (or take the zeroed successor) and initialize it; synchronize required files and directories
-  before publishing its manifest and `CURRENT`.
-- Preparation synchronizes the successor's allocation. Buffered roll
-  publication synchronizes the predecessor, then the successor header by a
-  range-limited `O_DSYNC` write (`RWF_DSYNC`), then the directory, manifest and
-  `CURRENT`. It may overlap appends to the successor and never waits for them.
-  Settle it before another roll, synchronization or shutdown.
-- Never overwrite a selected file. Normal roll uses a new segment ID; repair
-  keeps the ID but uses a fresh physical incarnation: `<id>.<incarnation>.log`.
-- Manifests select exact incarnations. Successor headers bind predecessor ID and
-  canonical digest, so repairing compression/layout need not rewrite successors.
-- Pending reads retain their original bytes and generation through roll.
-- Background rolls transfer physical work to the backend. The owner keeps the
-  predecessor readable and fences each installation by its completion generation.
-  A prepared successor can accept writes while final roll publication settles;
-  the next roll, synchronization, and shutdown must settle that publication.
+Prepare/synchronize a new successor, then publish its manifest and `CURRENT`.
+Buffered roll synchronizes the predecessor, successor header with range-limited
+`RWF_DSYNC`, directory, manifest, and selection. Successor appends may overlap;
+another roll, sync, or shutdown must settle publication first.
 
-Thread ownership and queue bounds: [disk workers](RUNTIME.md#disk-workers),
-[local pipeline](RUNTIME.md#local-durable-pipeline),
-[background persistence](RUNTIME.md#replicated-confirmation-with-background-persistence).
+Selected files are immutable. Normal rolls use new IDs; replacement uses a fresh
+`<id>.<incarnation>.log`. Manifests name exact incarnations; successor headers
+bind predecessor ID/digest. Reads retain their original generation.
+
+Optional `zero_ahead` prezeros disk-quorum successors in synchronized 4 MiB jobs.
+It is off by default, doubles device writes, and can leave unselected successors.
 
 ### Operator tuning
 
-Tune these independently on the production filesystem and storage stack:
-
-| Control | Main tradeoff |
+| Bound | Tradeoff |
 | --- | --- |
-| Encoding chunk | Compression ratio/CPU versus preparation and cold-read latency |
-| Physical write batch | Disk throughput versus time occupying the writer; may contain many chunks |
-| Physical/decoded segment limits | Roll frequency versus synchronization stalls, retained memory, and recovery work |
-| Background backlog | Burst/stall tolerance versus RAM; cannot fix a sustained disk deficit |
+| Encoding chunk | Compression CPU/ratio versus preparation/cold-read latency |
+| Ready physical batch | Throughput versus writer occupancy; no fill delay |
+| Physical/decoded segment size | Roll frequency versus sync stalls, RAM, recovery work |
+| RP backlog | Burst/stall tolerance versus RAM; no remedy for sustained disk deficit |
+| Device depth | Aggregate ordinary jobs plus reserved progress capacity |
 
-Persisted confirmation waits for disk: choose the smallest ready batch meeting
-throughput requirements within the confirmation-latency budget. Background
-persistence confirms from RAM: choose enough disk capacity to sustain incoming
-encoded traffic with headroom, then qualify backlog peaks and follower repair.
-Sum all brokers' physical traffic sharing a device, including repair and reads.
-Leaders and followers may have different contention; measure both. Never wait
-to fill a batch when the writer is idle.
-
-Estimate roll interval from the smaller of physical capacity / encoded byte
-rate and decoded capacity / canonical byte rate; group-count limits may roll
-earlier. Backlog headroom must cover incoming canonical bytes during measured
-write/roll stalls, plus accepted work already queued. Kernel dirty pages and
-transport/reader references require additional RAM accounting.
-
-`WritePipelineConfig::direct_io` (on by default on Linux) writes replicated
-segment data through a second `O_DIRECT` descriptor. Disk quorum also uses
-`O_DSYNC`. Groups start and end on 4 KiB boundaries and copy into aligned
-staging. Headers, zeroing, recovery, and reads keep buffered I/O.
-
-Opening fails if the file system rejects 4 KiB direct I/O. `O_DIRECT` alone
-supplies no durability. These flags never remove metadata or recovery barriers
-or turn RAM confirmation into disk confirmation.
-
-`io_backend = Aio` requires `direct_io`. One backend-owned thread per device
-owns the Linux AIO context, submits direct writes, and reaps completions using
-its eventfd. Configured depth bounds aggregate ordinary writes across that
-backend; one additional slot is reserved for progress work. Fixed blocking
-helpers execute metadata, buffered reads, barriers, and descriptor operations.
-Shards submit asynchronous jobs and install matching ordered results.
-
-Physical writes can complete out of order. After power loss, recovery preserves
-the prefix through recorded durable progress, then discards the first damaged
-group and its suffix. Buffered writes and AIO receipt do not advance that
-boundary without the required barriers and evidence.
-
-Procedure and commands: [disk calibration](../ozzy-bench/README.md#disk-calibration).
+Roll frequency follows physical/encoded or decoded/canonical rate, whichever
+limit arrives first. Backlog must cover write/roll stalls and already accepted
+work. Transport aliases, reads, descriptors, and dirty pages require additional
+RAM. [Calibration commands](../ozzy-bench/README.md#disk-calibration).
 
 ## Files and exclusive ownership
 
-| File / directory | Purpose |
-| --- | --- |
-| Lock, identity, optional `CONFIGURATION` | Exclusive ownership and store/group identity |
-| `MANIFEST.<generation>`, `CURRENT` | Immutable file selection, atomically published |
-| `DURABLE` | Required synchronized-history evidence for disk groups |
-| `MEMORY_VOTING` | Clean-stop evidence for replicated-persisting groups |
-| `segments/` | Record and metadata operations |
-| `indexes/` | Rebuildable lookup files |
-| `checkpoints/` | Canonical state and its original chain anchor |
-| `staging/` | Unselected replacement/build work |
+`OZZY_VOLUME` checksummed markers bind cluster, broker, and volume IDs in existing
+device roots. Startup checks local identity before journal open. Missing/mismatched
+volumes fail closed; initialization never creates roots or replaces markers.
+A directory lock cannot fence copies elsewhere; persisted placement selects the
+writable store.
 
-Metadata reaches a hidden temporary first, then its final name. An interrupted
-attempt can leave that temporary empty, partial, or with other bytes. It
-selects nothing. A retry removes the name and creates a new file. It never
-writes into the old file. An existing final name must match exactly.
-
-Formatting is explicit. Missing/corrupt files never authorize reformatting.
-The shared deployment identity persists each partition's configuration epoch.
-Initial configurations use epoch 1. Journal startup and SDK metadata use that
-same checked epoch; changing it at restart fails validation.
-An OS lock protects one directory, not copies elsewhere; store/volume IDs and
-placement select the writable copy. A missing volume must not create a new
-store on the root filesystem.
-
-Explicit volume initialization writes a checksummed `OZZY_VOLUME` marker into
-each existing device root. It binds cluster, broker and volume IDs. Startup
-checks these markers against the broker-local identity before opening journals.
-Missing or mismatched markers fail closed. Initializing volumes does not create
-device roots or partition journals, and never replaces an existing marker.
-
-Offline relocation stops the owner, copies/verifies history, synchronizes the
-new location, publishes placement, then retires the source. Online movement is
-not implemented.
+Metadata is written to a new temporary file, synchronized, then published.
+Interrupted temporaries select nothing; retry removes/recreates them. Existing
+final names must match exactly. Offline relocation stops the owner, verifies/syncs
+the copy, publishes placement, then retires the source. Online movement is absent.
 
 ## Integrity and formats
 
-- Canonical digests identify operation history independently of compression.
-  Physical checksums detect damaged headers, bodies and seals.
-- Integrity uses domain-separated XXH3-128. The seed is XXH3-64 of the domain's
-  UTF-8 bytes. A 32-byte digest slot stores the big-endian 16-byte result plus
-  16 zeros; those zeros add no strength.
-- Bound encoded and decoded sizes before allocation. Successful decompression
-  is insufficient: verify framing, canonical body digest and operation chain.
-- Checksums are not authentication, replication evidence or rollback detection.
-- Unreleased formats evolve in place. Decoders reject unsupported fields;
-  no legacy migration contract exists.
+Domain-separated XXH3-128 checks physical/canonical integrity. The seed is
+XXH3-64 of the domain's UTF-8 bytes; 32-byte slots contain the big-endian 16-byte
+result plus 16 zeros. The zeros add no strength. Length/decoded bounds precede
+allocation; framing, body digest, and chain must all validate. Checksums provide
+neither authentication, authority, nor rollback protection.
 
 ### Durable recovery evidence
 
-Disk groups publish the exact synchronized **accepted** prefix before it can
-count toward confirmation, even if no commit announcement arrives.
+Disk groups publish the synchronized **accepted** prefix before voting, including
+operations without a commit announcement. `DURABLE` stores two 192-byte records
+64 KiB apart, each within one 512-byte sector. Publications overwrite both copies
+and synchronize data without rename; sector writes are assumed atomic.
 
-`DURABLE` holds two copies of a 192-byte checksummed record, 64 KiB apart.
-Each has a publication sequence and fits one 512-byte sector. Format creates
-the whole file; later publications overwrite both copies and sync data. Its
-size and directory entry do not change, so no rename or directory sync is
-needed. Sector writes are assumed atomic.
-After a crash, each copy holds either the new record or the last completed
-publication.
+Recovery selects the newest intact in-scope publication and repairs the other
+copy before writes. Two damaged copies fail startup. Evidence binds store,
+group, broker, volume, configuration/metadata generation, segment, and accepted
+position. A changed selected manifest fences asynchronous publication. Required
+publication survives observer cancellation. Recovery never falls back to an
+older manifest or temporary. Authorized new-active-ID replacement supersedes
+older evidence under protected-history rules.
 
-Recovery selects the newest intact copy and rewrites the other before opening
-for writes. One damaged copy is tolerated; two refuse startup. The record
-binds store, group, broker, volume, configuration and metadata generations,
-active segment, and accepted position.
-
-The partition actor captures `DURABLE` for an installed `O_DSYNC` prefix. The
-device writer pool publishes it while later writes continue; only the owner
-installs the result. A manifest selected meanwhile fences the writer.
-Abandoned notifications do not remove this obligation.
-
-Missing evidence or no intact in-scope copy refuses startup. Recovery never
-falls back to a temporary or older manifest. Evidence stays binding across
-metadata changes on the same active segment. An authorized roll or replacement
-with a new active ID supersedes it under selected-history protection.
-
-For replicated-persisting groups, persist `MEMORY_VOTING` running state before
-voting. Publish drained state only after admission stops and all accepted writes
-finish. Missing, stale, corrupt or running evidence requires nonvoting recovery.
+RP publishes running `MEMORY_VOTING` state before voting and drained state only
+after closed admission and settled writes. Missing/stale/corrupt/running evidence
+requires nonvoting recovery.
 
 ## Recovery and suffix installation
 
 | Condition | Action |
 | --- | --- |
-| Normal open | Validate identity, authority, selected files, seals, operation chains and accepted/committed anchors |
-| Entirely zero-filled suffix | Treat as unused preallocated capacity |
-| Damaged active group after the durable position | End the log there, zero it and all later bytes, then restore full allocation if needed |
-| Damaged group at or before the durable position | Refuse recovery without changing segment bytes |
-| Damaged sealed segment or installed copy | Fail strict validation; a sealed segment may undergo authorized repair, never tail discard |
+| Normal open | Verify identities, authority, selected files, seals, chain, and anchors |
+| Zero suffix | Unused preallocated capacity |
+| Active damage after durable prefix | Discard/zero damaged group and later suffix; restore allocation |
+| Damage at/before durable prefix | Refuse without changing bytes |
+| Sealed/installed damage | Refuse strict open; authorized sealed repair may be possible |
 | Corrupt index | Rebuild from validated segment bytes |
-| Corrupt selected authority metadata | Refuse startup |
-| Lost store / unclean replicated-persisting restart | Stay nonvoting until authorized recovery completes |
+| Corrupt authority / lost store / unclean RP | Fail closed or remain nonvoting for recovery |
 
-**Never shorten confirmed history to make recovery succeed.** Replicated
-accepted history may also be needed by the next leader. Retry identity is
-producer ID/epoch/sequence plus exact records, not message ID or batch grouping.
-
-The replication core authorizes suffix replacement. Preserve the committed
-fragment even inside a physical group. Stage and validate replacements privately,
-sync files/directories, then publish the manifest and `CURRENT`. Until then,
-old selected history remains authoritative. Staging and outstanding reads count
-against storage limits; retry never overwrites conflicting temporary names.
-Orderly shutdown aborts an unfinished, unpublished replacement through the async
-backend. It preserves old protected history and persisted election promises.
-Discarding staging files neither activates the replacement nor confirms records.
+Replication authorizes suffix replacement. Protected committed fragments survive
+physical regrouping. New files are staged, validated, synchronized, and selected
+atomically; old selection remains authoritative until publication. Shutdown aborts
+unpublished replacement without lowering durable promises. Staging/reads remain
+bounded.
 
 ### Repairing sealed segments
 
-1. Explicitly quarantine the damaged store as nonvoting. Identity, configuration,
-   selected metadata and durability evidence must remain valid.
-2. Obtain fresh authority from both other brokers. Inventory one bounded file
-   at a time; reuse independently validated local operations.
-3. Fetch missing operation ranges from the current leader. Header/seal-only
-   damage may need no payload transfer. Ambiguous fragments require the full
-   segment range; match both selected canonical boundaries.
-4. Rewrite only damaged files under fresh incarnations. Sync and publish them,
-   replay privately, then restore configuration and perform fenced restart.
-
-Keep healthy files and damaged originals until safe cleanup. Repair cannot lower
-an existing durable promise. Active-file damage or unavailable donor ranges
-requires full recovery; invalid authority, missing data or exhausted bounds may
-require refusal. Interrupted repair stays nonvoting. This does **not** remove the
-`DURABLE` barrier or implement redundant header storage/checkpoint transfer.
-
-Details: [repair implementation](../ozzy-journal-segment/src/directory/recovery/repair.rs),
-[replication recovery](REPLICATION.md#restart-and-recovery).
+Quarantine retains valid identity/configuration/selection/durability evidence.
+Fresh authority from both other brokers permits bounded inventory and missing
+range fetches from one frozen donor. Validated local operations may be reused;
+replacement preserves original canonical boundaries. New physical incarnations
+are synchronized, selected, and privately replayed before fenced restart/election.
+Healthy files and damaged originals remain until safe cleanup. Active damage or
+unavailable ranges requires full recovery or refusal.
 
 ## Indexes, checkpoints, and retention
 
 ### Finding and reading records
 
-| Data | Storage / bound |
+| Cache | Default bound |
 | --- | --- |
-| Active segment + predecessor | Compact offset indexes, plus recent operations in RAM up to `IndexBuildLimits::max_resident_bytes` (default 512 MiB of stored bodies and record selectors); oldest evicted first |
-| Older offset indexes | At most 64 cached indexes / 8 MiB by default; `set_cold_index_cache_bytes` adjusts bytes |
-| Cold decoded operations | Separate reader/retry caches: 16 operations / 4 MiB each; one larger decoder-bounded operation replaces the others |
-| Segment-metadata list | Shared immutable file descriptions; no payloads |
+| Active/predecessor operation backing/selectors | 512 MiB, oldest eviction |
+| Cold offset indexes | 64 entries / 8 MiB |
+| Cold decoded operations, reader and retry separately | 16 entries / 4 MiB; one decoder-bounded larger operation replaces others |
+| Recent read handles | Four exact sources |
 
-**Resident operations keep stored bytes only.** Producer LZ4 blocks stay
-compressed; a read that needs decompressed records owns them and drops them
-when it finishes. A read of an evicted operation loads it from the pinned
-segment file on the reader worker. Startup loads the newest active operations
-within the budget; preexisting sealed history remains cold until later rolls.
+Recent caches retain stored encoded backing, not a permanent decoded copy.
+Cold reads capture exact segment identity/range and verify indexed operations.
+Capture does no file work; asynchronous readers execute through backends.
+Missing derived indexes can be rebuilt from protected sources. Compact selectors
+use stride/base/count for equal-size raw single-part records; other records retain
+position pairs. IDs and multipart descriptors remain in immutable bodies.
+Whole allocations, captured reads, cache metadata, and scratch have separate bounds.
 
-- Visibility still follows confirmation policy; having bytes in RAM is not
-  permission to deliver them. Reads capture exact ranges and operation bounds.
-- Captured reads survive roll and temporarily protect required files from
-  deletion. Subscription cursors and cached metadata alone do not protect files.
-- Background persistence shares admitted canonical bytes/record tables. A
-  retained operation may keep its whole APPEND arena alive; bound reads for that.
-- Older reads binary-search validated indexes and verify selected operations.
-  Missing/stale indexes rebuild from exact protected sources. A cold lookup may
-  search several segments. Blocking inspection APIs may build indexes
-  synchronously; the shard path below uses backend futures.
-- Producer retries reuse the active, predecessor, and bounded cached offset
-  selectors before building a journal snapshot. They still read and verify the
-  selected operation bytes against the exact segment source.
-- Native subscriptions resolve earliest/latest, offsets, broker append time, or
-  record ID. A sparse timestamp is stored at each APPEND head. ID lookup searches
-  every retained segment; duplicates require an explicit selection policy.
-- Index exhaustion requests roll or backpressure; never discard retry state.
-
-The shard-owned async path uses `AsyncJournalPartitionIndex`. Capture does no
-file work. Writes extend compact indexes; bounded cold reads use file futures
-and visit borrowed record spans. Missing sealed indexes derive a disposable
-in-memory index from validated segment bytes; corrupt indexes are refused.
-Captured-read count, compact-cache bytes/slots, and payload residency have
-separate bounds. Known shared backing is charged in full, not by slice length.
-Validation identifies general tables of equal-size, single-part raw records.
-Their selectors retain a count, two base positions and a stride, including for
-whole-APPEND compressed payloads. Other general tables retain one position pair
-per record and an end checkpoint. IDs, encodings and multipart lengths stay in
-the immutable body. Selection and batch totals need no additional record scan.
-The broker splits its per-partition read allowance between recent payloads and
-up to four compact sealed indexes. Its payload allowance follows configured APPEND
-size, accounting for complete backing allocations even when compressed bodies
-are small. Cold repair checks those indexes against the
-captured source identity before searching files. Repeated pages reuse the selected
-index; payload reads still validate each selected operation.
-
-An addressed history fetch can select an older durable boundary while later
-writes remain unsynchronized. Capture checks that boundary against the durable
-watermark and verifies its exact operation digest inside the complete physical
-source. Later operations remain outside the reply. This read grants no new
-durability evidence; capturing the whole stable tail still requires synchronization.
+Time seeks use APPEND-head timestamps; ID seeks search retained segments and
+require explicit duplicate policy. An older durable source can be read while
+later writes remain unsynchronized, without exposing those later operations or
+advancing durable evidence. Captured reads/donor snapshots delay file deletion;
+subscription cursors alone do not.
 
 ### Checkpoints and deletion
 
-On coordinated restart, a changed configured retention policy becomes a
-canonical `PartitionPolicy` operation. Repeated initialization waits for that
-policy to be applied before confirming it; an existing partition alone does
-not confirm an accepted policy change. Other partition identity changes fail.
+Configured retention changes become canonical `PartitionPolicy` operations.
+Confirmation waits for application. Checkpoints contain state, producer
+coordinates, retry floors, and original committed op/digest, never payloads.
+Segments preserve required replay and exact retry results.
 
-A checkpoint stores canonical state, producer epochs/sequences, retry floors,
-and the original committed operation/digest. It contains no record payloads.
-The selected segments keep every record still needed for replay or exact retries.
+Retention confirms retry floors, then record trim; synchronizes/selects a
+checkpoint before unreferencing the oldest sealed prefix. Repeated bounded passes
+may reuse only the exact settled checkpoint position/digest, revalidating authority,
+files, and protected floors. Surviving predecessor digests are never renumbered.
+Expired readers receive explicit gaps.
 
-Retention confirms producer retry floors before confirming the record trim.
-It then syncs and selects a checkpoint before unreferencing an oldest sealed
-prefix. Bounded retirement may need several passes without a new operation.
-Those passes reuse the selected checkpoint only when its operation number and
-digest exactly match the settled confirmed image. They still revalidate selected
-authority, checkpoint files, segment bodies, and committed floors; a new
-checkpoint must advance its position. The surviving segment keeps its original
-predecessor digest. No chain is renumbered or rehashed; XXH3 is an integrity
-checksum, not cryptographic proof.
-Captured reads and donor snapshots delay physical deletion. Readers below the
-confirmed floor receive a retention gap.
+Age uses maximum segment append time; backward clocks cannot prematurely expire
+newer records. An aged active segment rolls first. Byte targets include active
+and sealed capacities per partition/broker. Each settled turn also reclaims up
+to eight unselected objects/class, even below retention limits. Cleanup changes
+no record/retry floors and preserves selection/pins.
 
-Age uses the maximum broker append time in each segment, so a backward clock
-cannot make newer records expire early. An aged active segment rolls first.
-Byte targets include active and sealed capacities, independently per partition
-and broker. Maintenance visits bounded prefixes between settled write batches.
-Each settled retention turn also reclaims up to eight unselected objects in
-each class: segments, checkpoints, indexes, and metadata. This runs while the
-selected log remains below its retention limit. Selection and capture pins still
-protect required files; cleanup advances no record or producer retry floor.
-
-Recovery transfers checkpoint state, required retained operations, and the full
-accepted suffix over PEER. State bytes, schema, original anchor, operation chain,
-and destination-local publication all validate before voting resumes. Interrupted
-publication leaves the old selection or a complete nonvoting replacement.
-Full quarantine recovery starts a fresh empty private generation with no selected
-checkpoint. It preserves the old checkpoint and segment files for inspection;
-fresh recovery authority must supply replacement state and retained history.
-After normal service resumes, enabled retention maintenance may reclaim those
-unselected files under the same selection and capture-pin checks.
+Recovery transfers checkpoint state, required retained operations, and full
+accepted suffix. Schema/digest/anchor/chain and destination publication all
+validate before voting. Quarantine builds fresh private state; old files remain
+for inspection until normal bounded cleanup.
 
 ### Bounded maintenance
 
-Retention summary and floor validation read one physical group at a time, then
-fold append metadata and discard the encoded and decoded bodies. They check the
-selected seal, canonical chain and bodies, segment identity, and physical zero
-tail. Scratch depends on configured group/operation limits and the read chunk,
-not segment capacity. The group footprint admits raw and beneficial LZ4 output
-from product writeback; an oversized declared footprint fails before allocation.
-The broker bounds per-group entries by its writeback operation count.
+Streaming validation reads one physical group at a time and releases its bodies.
+Scratch follows group/operation/read bounds, not segment capacity. Shared shard
+admission reserves scratch before file jobs; pressure defers maintenance.
+Canceled backend jobs retain physical ownership until completion.
 
-Runtime scans reserve this scratch in the shared shard payload owner before
-issuing file jobs. Cached payloads may be evicted; live payloads retain their
-charges. Temporary exhaustion defers maintenance without waiting on another
-partition. Cancellation releases private scratch, while backend jobs retain their
-own handles, buffers and physical admission until completion. The same reader
-streams position validation, canonical replay, sealed-index
-construction, and active identity snapshots. Index construction validates the
-source before reusing or repairing derived files and validates the streamed
-build before publication. Partial replay or staging is discarded on error.
-Retirement prunes removed reader entries and keeps the installed active reader.
-Index metadata and canonical checkpoint/state images retain their separate
-configured limits; the group reservation accounts for encoded/decoded payload
-scratch rather than those longer-lived metadata images.
-
-
-| Work | API / scheduling |
+| Work | Scheduling |
 | --- | --- |
-| Scrub selected storage | `with_storage_validation`; default step budget 256 KiB / 2 ms |
-| Delete obsolete metadata | `with_metadata_cleanup`; default 32 objects per turn |
-| Remove unselected files | `with_orphan_cleanup`; bounded scans, recheck selection/protection before deletion |
+| Storage validation | `with_storage_validation`; 256 KiB / 2 ms cooperative steps |
+| Metadata cleanup | `with_metadata_cleanup`; 32 objects/turn |
+| Orphan cleanup | `with_orphan_cleanup`; bounded scan and selection/pin recheck |
 
-Maintenance uses the existing device queue. Overdue work gets a turn after
-admitted writes settle, then foreground work gets a turn. Cleanup bounds removed
-objects and directory listings; each physical job yields through the backend.
-Validation's CPU time budget is cooperative, not a syscall deadline. It captures a finite segment list;
-new writes enter later cycles. Authority changes invalidate old work; corruption
-fences the worker.
-
-Cleanup preserves selected manifests/checkpoints, sources required by active
-builds, and protected files. Metadata cleanup deletes no payloads. Orphan cleanup
-advances no retention floor and excludes active staging workspaces.
+Maintenance shares the device queue and alternates with settled foreground work.
+Finite captured source lists fence new history; authority changes invalidate old
+work, corruption fences it. Metadata cleanup deletes no payloads; orphan cleanup
+advances no retention floor and excludes active staging.
 
 ## Supported failure model
 
-The filesystem path targets Linux/Android local filesystems and process crashes.
-Sync relies on filesystem/device honesty; SIGKILL does not simulate power loss.
-Corruption is detected/refused or repaired under surviving authority. Valid
-rollback of authority metadata or an entire store remains outside the supported
-model. See [Validation](VALIDATION.md).
+Linux/Android local filesystems and process crashes are supported. Barriers rely
+on filesystem/device honesty and stated atomic-sector assumptions. SIGKILL retains
+OS page cache; it does not model power loss. Surviving group authority can permit
+selected repairs. Valid rollback of authority metadata or an entire store is
+outside the supported model.

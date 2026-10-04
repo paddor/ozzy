@@ -69,7 +69,7 @@ construct must fail verification. Do not suppress checks to obtain success.
 Run `scripts/test.sh loom`. Production SDK counters and receipt slots use Loom
 atomics to explore admission/cancellation/release, persistent readiness, capacity
 observation and exact offset publication. Tokio/OMQ internals and disk/message
-orders remain outside these models; see [validation](../doc/VALIDATION.md#loom).
+orders remain outside these models; see [Loom scope](../DEVELOPMENT.md#loom).
 
 ## Rust simulation
 
