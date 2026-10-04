@@ -3,8 +3,11 @@
 Ozzy requires Rust 1.93 or newer.
 
 CI checks out published OMQ and fanring revisions as sibling directories and
-uses the same workspace check scripts. It checks MSRV separately and builds the
-registry crates through a publishing dry run. CI uses generic x86_64 codegen.
+uses the same workspace check scripts. Formatting and Clippy must pass before
+tests, the MSRV check, or the crates.io publishing dry run start. The dry run
+packages and builds the twelve release crates without uploading them. CI runs
+once per PR update and on pushes to main, cancels superseded PR runs, and uses
+generic x86_64 codegen.
 
 ## Local check
 
@@ -15,6 +18,8 @@ registry crates through a publishing dry run. CI uses generic x86_64 codegen.
 The script checks formatting, runs Clippy with warnings denied, runs workspace
 tests through Nextest with eight threads, runs doctests separately, and builds
 strict public API documentation.
+Use `scripts/test-all.sh lint` or `scripts/test-all.sh tests` to run only one
+phase; CI runs them in separate jobs.
 
 Executables use the `ozy_` prefix (15 characters fit the kernel process name);
 integration tests use `ozzy_`.
