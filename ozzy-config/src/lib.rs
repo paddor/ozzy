@@ -19,7 +19,7 @@ pub use placement::{BrokerPlan, ControllerPlan, HostResources, PartitionPlacemen
 pub use schema::{
     Affinity, Broker, Cluster, Confirmation, Deployment, DeploymentMode, Device, Endpoints,
     IoBackend, MAX_APPEND_BYTES, MemoryPool, Omq, PartitionOverride, QueueBudget, ResourceLimits,
-    Shard, StorageWorkers, Topic, Topology,
+    Shard, StorageWorkers, Topic, TopicRetention, Topology,
 };
 pub use validate::ValidatedDeployment;
 

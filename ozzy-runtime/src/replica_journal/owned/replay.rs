@@ -205,6 +205,7 @@ impl OwnedJournal {
                 history.position(requested[1].0).await?.map(super::prefix),
             ];
             Ok(ReplicationPositions {
+                retained_predecessor: super::prefix(history.predecessor()),
                 ticket,
                 requested,
                 positions,

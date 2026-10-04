@@ -137,13 +137,24 @@ impl Image {
             .values()
             .map(|n| n.dirty.bytes() + n.durable.bytes())
             .sum();
-        if added > limits.file_bytes
-            || total
-                .checked_sub(removed)
-                .and_then(|n| n.checked_add(added))
-                .is_none_or(|n| n > limits.total_bytes)
+        if added > limits.file_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                format!("simulation file bytes {added} exceed {}", limits.file_bytes),
+            ));
+        }
+        if total
+            .checked_sub(removed)
+            .and_then(|n| n.checked_add(added))
+            .is_none_or(|n| n > limits.total_bytes)
         {
-            return Err(io::ErrorKind::StorageFull.into());
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                format!(
+                    "simulation total bytes {total} - {removed} + {added} exceed {}",
+                    limits.total_bytes
+                ),
+            ));
         }
         Ok(())
     }
@@ -159,7 +170,13 @@ impl Image {
             .and_then(|n| n.checked_add(added))
             .is_none_or(|n| n > limits.directory_entries)
         {
-            return Err(io::ErrorKind::StorageFull.into());
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                format!(
+                    "simulation directory entries {total} - {removed} + {added} exceed {}",
+                    limits.directory_entries
+                ),
+            ));
         }
         Ok(())
     }
@@ -246,7 +263,14 @@ impl Image {
             return Err(io::ErrorKind::AlreadyExists.into());
         }
         if self.nodes.len() == limits.nodes {
-            return Err(io::ErrorKind::StorageFull.into());
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                format!(
+                    "simulation inode count reached {} creating {}",
+                    limits.nodes,
+                    path.display()
+                ),
+            ));
         }
         self.entry_capacity(0, 1, limits)?;
         let inode = self.next_inode;

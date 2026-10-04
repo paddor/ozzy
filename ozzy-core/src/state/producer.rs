@@ -2,9 +2,18 @@
 
 use std::collections::VecDeque;
 
-use ozzy_proto::{Offset, ProducerEpoch, ProducerSequence};
+use ozzy_proto::{Offset, OperationId, ProducerEpoch, ProducerSequence};
 
 use super::StateError;
+
+/// Current open/fence identity survives retirement of its canonical operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProducerTransition {
+    /// Exact idempotence identity of the latest session transition.
+    pub operation_id: OperationId,
+    /// Original conditional fence, absent for the first session.
+    pub expected_epoch: Option<ProducerEpoch>,
+}
 
 /// One contiguous sequence/offset mapping. Adjacent assignments coalesce only
 /// when both coordinate ranges are contiguous; another writer may occupy gaps.
@@ -27,6 +36,7 @@ pub struct CanonicalProducer {
     pub next_producer_sequence: ProducerSequence,
     /// Earliest sequence whose original retry result remains retained.
     pub producer_result_floor: ProducerSequence,
+    pub(super) transition: Option<ProducerTransition>,
     pub(super) results: VecDeque<ProducerResultSpan>,
 }
 
@@ -37,8 +47,14 @@ impl CanonicalProducer {
             producer_epoch,
             next_producer_sequence: ProducerSequence::ZERO,
             producer_result_floor: ProducerSequence::ZERO,
+            transition: None,
             results: VecDeque::new(),
         }
+    }
+
+    /// Latest confirmed or speculative transition in this state image.
+    pub fn transition(&self) -> Option<ProducerTransition> {
+        self.transition
     }
 
     /// Exact original offset, independent of current SDK grouping boundaries.
@@ -61,6 +77,18 @@ impl CanonicalProducer {
     /// Earliest retained retry result. Empty writers do not block partition trim.
     pub fn result_offset_floor(&self) -> Option<Offset> {
         self.results.front().map(|span| span.first_offset)
+    }
+
+    /// Expire exactly the retry coordinates whose assigned offsets precede a
+    /// partition trim. Other producers may occupy gaps between this one's spans.
+    pub fn result_floor_for_offset(&self, floor: Offset) -> ProducerSequence {
+        for span in &self.results {
+            let expired = floor.get().saturating_sub(span.first_offset.get());
+            if expired < span.records {
+                return ProducerSequence::new(span.first_sequence.get() + expired);
+            }
+        }
+        self.next_producer_sequence
     }
 
     /// Whether this fresh assignment needs another bounded mapping entry.

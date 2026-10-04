@@ -7,7 +7,10 @@ use crate::replica_journal::{
     FetchedHistory, PinnedRecovery, authority::position, commands::read_fault,
 };
 use ozzy_proto::NodeId;
-use ozzy_replication::{recovery::RecoveryResponse, wire::FetchOps};
+use ozzy_replication::{
+    recovery::RecoveryResponse,
+    wire::{CheckpointRequest, FetchOps},
+};
 use std::{cell::Cell, rc::Rc};
 
 #[derive(Debug)]
@@ -16,6 +19,7 @@ pub(super) struct Source {
     metadata: ozzy_journal_segment::AsyncJournalHistoryMetadata,
     cached: Option<AsyncJournalHistory>,
     busy: Rc<Cell<bool>>,
+    checkpoint: Option<Rc<ozzy_journal_segment::AsyncCheckpointFiles>>,
 }
 
 #[derive(Debug)]
@@ -115,8 +119,12 @@ impl OwnedJournal {
             donor,
         };
         if let Some(existing) = &self.donors[at] {
-            return if existing.pin == pin {
-                Ok(pin)
+            let mut original = existing.pin;
+            if let Some(log) = original.response.primary.as_mut() {
+                log.checkpoint = None;
+            }
+            return if existing.pin == pin || original == pin {
+                Ok(existing.pin)
             } else {
                 Err(JournalError::HistorySourceMismatch)
             };
@@ -129,13 +137,16 @@ impl OwnedJournal {
         // A canceled barrier or validation leaves this owner fenced, even if
         // its backend-held file work completes after the observer disappears.
         self.faulted = true;
-        let result = self.capture_donor(pin).await;
+        let result = self.capture_donor(&pin).await;
         self.faulted = result.as_ref().err().is_some_and(read_fault);
-        self.donors[at] = Some(result?);
+        let source = result?;
+        let pin = source.pin;
+        self.donors[at] = Some(source);
         Ok(pin)
     }
 
-    async fn capture_donor(&mut self, pin: PinnedRecovery) -> Result<Source, JournalError> {
+    async fn capture_donor(&mut self, pin: &PinnedRecovery) -> Result<Source, JournalError> {
+        let mut pin = *pin;
         match &mut self.journal {
             JournalOwner::Ready(journal) => {
                 journal
@@ -159,8 +170,31 @@ impl OwnedJournal {
         if history.position(log.committed.op.0).await? != Some(position(log.committed)) {
             return Err(JournalError::HistorySourceMismatch);
         }
+        let journal = self.journal.readable()?;
+        let checkpoint = if journal.manifest().checkpoint.is_some() {
+            let files = Rc::new(journal.capture_checkpoint()?);
+            let manifest = files.manifest();
+            let anchor = ozzy_replication::recovery::CheckpointAnchor {
+                predecessor: prefix(history.predecessor()),
+                position: prefix(manifest.position),
+                schema: manifest.state_schema_digest,
+                state_digest: manifest.state_digest,
+                state_bytes: manifest.state_bytes,
+                chunk_bytes: manifest.chunk_bytes,
+            };
+            anchor.validate(log.committed)?;
+            pin.response
+                .primary
+                .as_mut()
+                .expect("primary donor")
+                .checkpoint = Some(anchor);
+            Some(files)
+        } else {
+            None
+        };
         Ok(Source {
             pin,
+            checkpoint,
             metadata: history.metadata(),
             cached: Some(history),
             busy: Rc::new(Cell::new(false)),
@@ -249,5 +283,112 @@ impl OwnedJournal {
             source.cached = Some(done.history);
         }
         done.result
+    }
+}
+
+/// One detached, bounded immutable checkpoint chunk read.
+#[derive(Debug)]
+pub struct PreparedCheckpointRead {
+    key: Rc<()>,
+    pin: PinnedRecovery,
+    request: CheckpointRequest,
+    files: Rc<ozzy_journal_segment::AsyncCheckpointFiles>,
+    slot: Slot,
+}
+
+/// Checkpoint bytes still requiring exact owner/pin observation.
+#[derive(Debug)]
+pub struct CompletedCheckpointRead {
+    key: Rc<()>,
+    pin: PinnedRecovery,
+    request: CheckpointRequest,
+    result: Result<bytes::Bytes, JournalError>,
+    slot: Slot,
+}
+
+impl PreparedCheckpointRead {
+    /// Execute file work without borrowing the journal owner.
+    pub async fn read(self) -> CompletedCheckpointRead {
+        let result = self
+            .files
+            .read_range(self.request.offset, self.request.max_bytes as usize)
+            .await
+            .map(bytes::Bytes::from)
+            .map_err(JournalError::from);
+        CompletedCheckpointRead {
+            key: self.key,
+            pin: self.pin,
+            request: self.request,
+            result,
+            slot: self.slot,
+        }
+    }
+}
+
+impl OwnedJournal {
+    /// Capture at most one detached read per nonce-bound recovery donor.
+    pub fn prepare_checkpoint_read(
+        &mut self,
+        pin: PinnedRecovery,
+        request: CheckpointRequest,
+    ) -> Result<PreparedCheckpointRead, JournalError> {
+        self.healthy()?;
+        let anchor = pin
+            .response
+            .primary
+            .and_then(|log| log.checkpoint)
+            .ok_or(JournalError::HistorySourceMismatch)?;
+        if request.scope != self.scope
+            || request.scope != pin.response.scope
+            || request.source != pin.source()
+            || request.nonce != pin.response.nonce
+            || request.max_bytes == 0
+            || request.max_bytes as usize > self.append_limits.max_body_bytes
+            || request.offset >= anchor.state_bytes
+        {
+            return Err(JournalError::HistorySourceMismatch);
+        }
+        let at = self.donor_slot(pin.requester)?;
+        let source = self.donors[at]
+            .as_ref()
+            .filter(|source| source.pin == pin)
+            .ok_or(JournalError::HistorySourceMismatch)?;
+        if source.busy.get() {
+            return Err(JournalError::AppendCapacity);
+        }
+        let files = source
+            .checkpoint
+            .clone()
+            .ok_or(JournalError::HistorySourceMismatch)?;
+        source.busy.set(true);
+        Ok(PreparedCheckpointRead {
+            key: self.read_key.clone(),
+            pin,
+            request,
+            files,
+            slot: Slot(source.busy.clone()),
+        })
+    }
+
+    /// Observe only matching nonce/view/source bytes; stale reads grant no authority.
+    pub fn complete_checkpoint_read(
+        &mut self,
+        done: CompletedCheckpointRead,
+    ) -> Result<super::super::recovery::RecoveryCheckpointRead, JournalError> {
+        self.healthy()?;
+        let at = self.donor_slot(done.pin.requester)?;
+        if !Rc::ptr_eq(&done.key, &self.read_key)
+            || done.pin.response.scope != self.scope
+            || !self.donors[at].as_ref().is_some_and(|source| {
+                source.pin == done.pin && Rc::ptr_eq(&source.busy, &done.slot.0)
+            })
+        {
+            return Err(JournalError::HistorySourceMismatch);
+        }
+        self.faulted |= done.result.as_ref().err().is_some_and(read_fault);
+        Ok(super::super::recovery::RecoveryCheckpointRead {
+            request: done.request,
+            bytes: done.result?,
+        })
     }
 }

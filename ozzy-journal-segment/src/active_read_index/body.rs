@@ -7,6 +7,7 @@ pub(crate) struct ReadBatch {
     pub(crate) partition: PartitionIncarnation,
     pub(crate) first_offset: Offset,
     pub(crate) records: usize,
+    pub(crate) append_timestamp_millis: u64,
 }
 
 pub(crate) trait ReadIndexBody {
@@ -31,6 +32,7 @@ impl ReadIndexBody for OperationBody<'_> {
                 partition: batch.partition,
                 first_offset: batch.first_offset,
                 records: batch.records.len(),
+                append_timestamp_millis: batch.append_timestamp_millis,
             })
     }
 }

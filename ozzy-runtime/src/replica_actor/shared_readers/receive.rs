@@ -2,7 +2,7 @@ use super::{
     ActorError, AuthorityHint, Bytes, Cursor, Delivery, Envelope, Failure, Link, Message,
     NativeReceive, NodeId, Opcode, Payload, SharedReaders, Slot, decode_packet, reader,
 };
-use ozzy_proto::{Offset, Packet};
+use ozzy_proto::Packet;
 
 impl SharedReaders {
     pub(in crate::replica_actor) fn receive(
@@ -83,7 +83,7 @@ impl SharedReaders {
                     target: subscribe.target,
                     start: subscribe.start,
                 };
-                self.subscribe(peer, packet.envelope, link, &subscribe, source)
+                self.subscribe(peer, packet.envelope, &subscribe, source)
             }
             Opcode::Ack => self.ack(peer, packet, link),
             Opcode::Unsubscribe => {
@@ -169,7 +169,6 @@ impl SharedReaders {
         &mut self,
         peer: NodeId,
         envelope: Envelope,
-        link: Link,
         subscribe: &reader::Subscribe,
         source: reader::Source,
     ) -> Result<(), Failure> {
@@ -202,35 +201,16 @@ impl SharedReaders {
                     envelope,
                     subscribe.clone(),
                     source,
-                    Cursor::new(self.pool.clone(), Some(Offset::new(subscribe.start))),
+                    Cursor::select(self.pool.clone(), subscribe.start),
                 ),
                 pending: None,
+                resolved_offset: None,
+                reply_due: true,
             });
         }
-        let header = reader::encode_subscribed(
-            Envelope {
-                opcode: Opcode::Subscribed,
-                response: true,
-                sender: self.local,
-                ..envelope
-            },
-            reader::Subscribed {
-                subscription: subscribe.subscription,
-                source,
-            },
-            &mut self.metadata,
-            link.send.envelope,
-        )
-        .map_err(|_| Failure::new(1))?;
-        self.slots[index]
-            .as_mut()
-            .expect("installed subscription")
-            .pending = Some(crate::native_frames::message(
-            peer.as_bytes(),
-            header,
-            &self.metadata,
-            Bytes::new(),
-        ));
+        let slot = self.slots[index].as_mut().expect("installed subscription");
+        slot.delivery.request = envelope;
+        slot.reply_due = true;
         Ok(())
     }
 

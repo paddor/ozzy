@@ -175,6 +175,22 @@ fn validate_topics(config: &Deployment, ids: &mut BTreeSet<Uuid>) -> Result<(), 
             &path,
             "segment must be aligned and leave framing space beyond max_append_bytes",
         )?;
+        require(
+            topic
+                .retention
+                .max_age_secs
+                .is_none_or(|age| age > 0 && age.checked_mul(1000).is_some()),
+            &format!("{path}.retention.max_age_secs"),
+            "age must be positive and fit milliseconds",
+        )?;
+        require(
+            topic
+                .retention
+                .max_bytes
+                .is_none_or(|bytes| bytes >= topic.segment_bytes),
+            &format!("{path}.retention.max_bytes"),
+            "byte target must fit at least one segment",
+        )?;
     }
     Ok(())
 }

@@ -60,8 +60,8 @@ impl FrontendContext {
         let mut publications = followers.publications();
         let result = async {
             self.ready()?;
-            let mut control = Ingress::new(&self.peer, self.monitor, false);
-            let mut data = Ingress::new(&self.data, self.data_monitor, true);
+            let mut control = Ingress::new(&self.peer, self.monitor, false, &self.shutdown);
+            let mut data = Ingress::new(&self.data, self.data_monitor, true, &self.shutdown);
             let mut tick = tokio::time::interval(retry);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -131,6 +131,7 @@ fn outbound_socket<'a>(
                 ozzy_proto::Opcode::Records as u8,
                 ozzy_proto::Opcode::PrepareFlow as u8,
                 ozzy_proto::Opcode::Ops as u8,
+                ozzy_proto::Opcode::SnapshotChunk as u8,
             ]
             .contains(opcode)
         })

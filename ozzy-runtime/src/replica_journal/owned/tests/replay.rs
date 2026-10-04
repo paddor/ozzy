@@ -35,6 +35,71 @@ pub(super) fn persist(controller: &mut Controller, replica: &mut Replica) -> Pre
 }
 
 #[test]
+fn owned_history_fetch_preserves_a_durable_source_beside_later_unsynchronized_writes() {
+    let (mut controller, io) = setup();
+    let mut replica = replica(&mut controller, io, 0, QuorumPolicy::Replicated, 8192);
+    let first = persist(&mut controller, &mut replica);
+    let source = LogSource {
+        voter: replica.config.identity.replica_node_id,
+        generation: replica
+            .driver
+            .normal()
+            .unwrap()
+            .snapshot()
+            .journal
+            .generation,
+        accepted: first,
+    };
+    let (_, _, receipt) = admit(&mut controller, &mut replica, 1);
+    let work = prepare(&mut replica);
+    finish(&mut controller, &mut replica, work);
+    settle(&mut replica, receipt);
+    let snapshot = replica.driver.normal().unwrap().snapshot();
+    assert_eq!(snapshot.journal.durable, first.op);
+    assert_eq!(snapshot.journal.written, OpNumber(2));
+    let request = ozzy_replication::wire::FetchOps {
+        scope: replica.driver.scope(),
+        request_id: RequestId::from_bytes([42; 16]),
+        source,
+        predecessor: Prefix::GENESIS,
+        max_operations: 8,
+        max_body_bytes: 8192,
+    };
+    for _ in 0..2 {
+        let buffer = replica.journal.lease_append_buffer().unwrap();
+        let fetched = drive(
+            &mut controller,
+            replica.journal.fetch_history(request, buffer),
+        )
+        .expect("later unsynchronized writes must not hide the older durable source");
+        assert_eq!(fetched.request(), request);
+        assert_eq!(fetched.end(), first);
+        assert_eq!(fetched.buffer().len(), 1);
+        let operation = fetched.buffer().operations().next().unwrap();
+        assert_eq!(operation.op_number, first.op.0);
+        assert_eq!(operation.body, &[1; 16]);
+    }
+    let buffer = replica.journal.lease_append_buffer().unwrap();
+    let unproven = ozzy_replication::wire::FetchOps {
+        source: LogSource {
+            accepted: snapshot.accepted,
+            ..source
+        },
+        ..request
+    };
+    assert!(
+        drive(
+            &mut controller,
+            replica.journal.fetch_history(unproven, buffer)
+        )
+        .is_err()
+    );
+    assert!(!replica.journal.is_faulted());
+    assert_eq!(replica.driver.normal().unwrap().snapshot(), snapshot);
+    drive(&mut controller, replica.journal.shutdown()).unwrap();
+}
+
+#[test]
 fn owned_replay_refresh_reads_only_the_new_segment_suffix() {
     let (mut controller, io) = setup();
     let mut replica = replica(&mut controller, io, 0, QuorumPolicy::Durable, 8192);

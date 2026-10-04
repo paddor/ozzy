@@ -9,9 +9,317 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+mod churn;
+mod resume;
+mod retention;
+
 mod tests {
     use super::*;
     use futures::FutureExt;
+
+    #[tokio::test(flavor = "current_thread")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one SDK seek schedule across all confirmation policies"
+    )]
+    async fn history_seek_resolves_id_policy_and_timestamp_over_inproc_without_disk_io() {
+        use ozzy_runtime::replicated::{IdPolicy, ReaderStart, TopicReaderError};
+        for policy in [
+            Confirmation::LocalDurable,
+            Confirmation::DiskQuorum,
+            Confirmation::ReplicatedPersisting,
+        ] {
+            let runtime = WriterRuntime::new().unwrap();
+            let deployment = fixture(policy);
+            let producer = role_links_with_config(
+                &runtime,
+                &deployment[0].0,
+                handshake::PRODUCER,
+                limits(),
+                |config| {
+                    let mut node = [61; 16];
+                    node[0] = 0;
+                    config.local = NodeId::from_bytes(node);
+                },
+            )
+            .await;
+            let consumer = role_links(&runtime, &deployment[0].0, handshake::CONSUMER).await;
+            let (brokers, _) = Box::pin(start_controlled(&runtime, deployment, true)).await;
+            let mut writer = live_many(
+                &brokers,
+                "open seek fixture",
+                SharedTopicWriter::open(
+                    &producer,
+                    "orders",
+                    SharedTopicWriterConfig::new(limits()),
+                    RetryPolicy::default(),
+                ),
+            )
+            .await
+            .unwrap();
+            let duplicate = MessageId::from_bytes([37; 16]);
+            for id in [duplicate, MessageId::from_bytes([38; 16]), duplicate] {
+                let pending = writer
+                    .send(
+                        RecordInput::single(id, bytes::Bytes::from_static(b"seek fixture")),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                live_many(&brokers, "confirm seek fixture", pending.confirmed())
+                    .await
+                    .unwrap();
+            }
+            for (start, expected) in [
+                (ReaderStart::Timestamp(0), 0),
+                (
+                    ReaderStart::RecordId {
+                        partition: 0,
+                        id: duplicate,
+                        policy: IdPolicy::FirstRetained,
+                    },
+                    0,
+                ),
+                (
+                    ReaderStart::RecordId {
+                        partition: 0,
+                        id: duplicate,
+                        policy: IdPolicy::LastRetained,
+                    },
+                    2,
+                ),
+                (
+                    ReaderStart::record_id(0, MessageId::from_bytes([38; 16])),
+                    1,
+                ),
+            ] {
+                let mut reader = live_many(
+                    &brokers,
+                    "open history seek",
+                    TopicReader::open(
+                        consumer.clone(),
+                        "orders",
+                        TopicReaderConfig {
+                            start,
+                            ..Default::default()
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+                let record = live_many(&brokers, "resolve and read history seek", reader.next())
+                    .await
+                    .unwrap();
+                assert_eq!(record.offset, ozzy_proto::Offset::new(expected));
+                live_many(&brokers, "close history seek", reader.close())
+                    .await
+                    .unwrap();
+            }
+            for id in [duplicate, MessageId::from_bytes([39; 16])] {
+                let mut reader = live_many(
+                    &brokers,
+                    "open rejected ID seek",
+                    TopicReader::open(
+                        consumer.clone(),
+                        "orders",
+                        TopicReaderConfig {
+                            start: ReaderStart::record_id(0, id),
+                            ..Default::default()
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+                let error = live_many(&brokers, "reject ambiguous or missing ID", reader.next())
+                    .await
+                    .unwrap_err();
+                if id == duplicate {
+                    assert!(
+                        matches!(error, TopicReaderError::AmbiguousRecordId { first, last, .. }
+                        if first.get() == 0 && last.get() == 2),
+                        "{error:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(error, TopicReaderError::RecordNotFound { .. }),
+                        "{error:?}"
+                    );
+                }
+                live_many(&brokers, "close rejected ID seek", reader.close())
+                    .await
+                    .unwrap();
+            }
+            live_many(&brokers, "close seek writer", writer.close())
+                .await
+                .unwrap();
+            producer.shutdown().await.unwrap();
+            consumer.shutdown().await.unwrap();
+            for broker in brokers {
+                broker.shutdown().await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn identity_resume_and_takeover_use_real_inproc_brokers_without_disk_io() {
+        for policy in [
+            Confirmation::LocalDurable,
+            Confirmation::DiskQuorum,
+            Confirmation::ReplicatedPersisting,
+        ] {
+            let runtime = WriterRuntime::new().unwrap();
+            let deployment = fixture(policy);
+            let producer = role_links(&runtime, &deployment[0].0, handshake::PRODUCER).await;
+            let (brokers, _) = Box::pin(start_controlled(&runtime, deployment, true)).await;
+            let config = SharedTopicWriterConfig::new(limits());
+            let retry = RetryPolicy::default();
+            let mut first = live_many(
+                &brokers,
+                "fresh producer",
+                SharedTopicWriter::open(&producer, "orders", config.clone(), retry),
+            )
+            .await
+            .unwrap();
+            let identity = first.identity();
+            let send = |n| {
+                RecordInput::single(
+                    MessageId::from_bytes([n; 16]),
+                    bytes::Bytes::from_static(b"resume record"),
+                )
+            };
+            let pending = first.send(send(31), None).await.unwrap();
+            let receipt = live_many(&brokers, "first record", pending.confirmed())
+                .await
+                .unwrap();
+            assert_eq!(receipt.record.key.first_sequence, 0);
+            live_many(&brokers, "close original", first.close())
+                .await
+                .unwrap();
+            let mut resumed = live_many(
+                &brokers,
+                "resume identity",
+                SharedTopicWriter::resume(&producer, "orders", identity, config.clone(), retry),
+            )
+            .await
+            .unwrap();
+            assert_eq!(resumed.identity(), identity);
+            let pending = resumed.send(send(32), None).await.unwrap();
+            let receipt = live_many(&brokers, "resumed record", pending.confirmed())
+                .await
+                .unwrap();
+            assert_eq!(receipt.record.key.first_sequence, 1);
+            let mut takeover = live_many(
+                &brokers,
+                "take over live writer",
+                SharedTopicWriter::takeover(&producer, "orders", identity, config, retry),
+            )
+            .await
+            .unwrap();
+            let pending = resumed.send(send(33), None).await.unwrap();
+            assert!(
+                live_many(&brokers, "old writer fenced", pending.confirmed())
+                    .await
+                    .is_err()
+            );
+            let pending = takeover.send(send(34), None).await.unwrap();
+            let receipt = live_many(&brokers, "new epoch record", pending.confirmed())
+                .await
+                .unwrap();
+            assert_eq!(receipt.record.key.first_sequence, 0);
+            assert_eq!(receipt.record.key.producer_epoch, 2);
+            live_many(&brokers, "close takeover", takeover.close())
+                .await
+                .unwrap();
+            drop(resumed);
+            producer.shutdown().await.unwrap();
+            for broker in brokers {
+                broker.shutdown().await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn producer_owner_crash_resumes_confirmed_prefix_without_a_local_outbox() {
+        for policy in [
+            Confirmation::LocalDurable,
+            Confirmation::DiskQuorum,
+            Confirmation::ReplicatedPersisting,
+        ] {
+            let transport = WriterRuntime::new().unwrap();
+            let original = WriterRuntime::with_context(transport.context().clone()).unwrap();
+            let deployment = fixture(policy);
+            let first_links = role_links(&original, &deployment[0].0, handshake::PRODUCER).await;
+            let replacement = WriterRuntime::with_context(transport.context().clone()).unwrap();
+            let links = role_links(&replacement, &deployment[0].0, handshake::PRODUCER).await;
+            let (brokers, _) = Box::pin(start_controlled(&transport, deployment, true)).await;
+            let config = SharedTopicWriterConfig::new(limits());
+            let mut writer = live_many(
+                &brokers,
+                "open before crash",
+                SharedTopicWriter::open(
+                    &first_links,
+                    "orders",
+                    config.clone(),
+                    RetryPolicy::default(),
+                ),
+            )
+            .await
+            .unwrap();
+            let identity = writer.identity();
+            let pending = writer
+                .send(
+                    RecordInput::single(
+                        MessageId::from_bytes([35; 16]),
+                        bytes::Bytes::from_static(b"confirmed before owner crash"),
+                    ),
+                    None,
+                )
+                .await
+                .unwrap();
+            live_many(&brokers, "confirm before crash", pending.confirmed())
+                .await
+                .unwrap();
+            original.abort_owner();
+            drop(writer);
+            drop(first_links);
+            drop(original);
+            let mut writer = live_many(
+                &brokers,
+                "resume after owner crash",
+                SharedTopicWriter::resume(
+                    &links,
+                    "orders",
+                    identity,
+                    config,
+                    RetryPolicy::default(),
+                ),
+            )
+            .await
+            .unwrap();
+            let pending = writer
+                .send(
+                    RecordInput::single(
+                        MessageId::from_bytes([36; 16]),
+                        bytes::Bytes::from_static(b"new record after owner crash"),
+                    ),
+                    None,
+                )
+                .await
+                .unwrap();
+            let receipt = live_many(&brokers, "confirm after owner crash", pending.confirmed())
+                .await
+                .unwrap();
+            assert_eq!(receipt.record.key.first_sequence, 1);
+            assert_eq!(receipt.record.offset, 1);
+            live_many(&brokers, "close replacement", writer.close())
+                .await
+                .unwrap();
+            links.shutdown().await.unwrap();
+            for broker in brokers {
+                broker.shutdown().await.unwrap();
+            }
+        }
+    }
 
     #[tokio::test(flavor = "current_thread")]
     #[expect(
@@ -173,6 +481,138 @@ mod tests {
         producer.shutdown().await.unwrap();
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one SDK retention and resume schedule across all policies"
+    )]
+    async fn configured_retention_advances_sdk_earliest_and_keeps_producer_identity() {
+        use ozzy_config::TopicRetention;
+        use ozzy_runtime::replicated::ReaderStart;
+        for policy in [
+            Confirmation::LocalDurable,
+            Confirmation::DiskQuorum,
+            Confirmation::ReplicatedPersisting,
+        ] {
+            let runtime = WriterRuntime::new().unwrap();
+            let root = std::path::PathBuf::from(format!("/ozzy-retention-{}", Uuid::now_v7()));
+            let deployment = deployment_with(
+                &root,
+                if policy == Confirmation::LocalDurable {
+                    DeploymentMode::Single
+                } else {
+                    DeploymentMode::Three
+                },
+                policy,
+                1,
+                |config| {
+                    let topic = config.topics.get_mut("orders").unwrap();
+                    topic.segment_bytes = 1024 * 1024;
+                    topic.max_append_bytes = 64 * 1024;
+                    topic.retention = TopicRetention {
+                        max_age_secs: None,
+                        max_bytes: Some(1024 * 1024),
+                    };
+                },
+            );
+            let producer = role_links(&runtime, &deployment[0].0, handshake::PRODUCER).await;
+            let consumer = role_links(&runtime, &deployment[0].0, handshake::CONSUMER).await;
+            let (brokers, _) = Box::pin(start_controlled(&runtime, deployment, true)).await;
+            let config = SharedTopicWriterConfig::new(limits());
+            let mut writer = live_many(
+                &brokers,
+                "open retained writer",
+                SharedTopicWriter::open(
+                    &producer,
+                    "orders",
+                    config.clone(),
+                    RetryPolicy::default(),
+                ),
+            )
+            .await
+            .unwrap();
+            let identity = writer.identity();
+            for index in 0..600u128 {
+                let pending = writer
+                    .send(
+                        RecordInput::single(
+                            MessageId::from_bytes((index + 1).to_be_bytes()),
+                            bytes::Bytes::from(vec![index as u8; 512]),
+                        ),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                live_many(&brokers, "confirm retained record", pending.confirmed())
+                    .await
+                    .unwrap();
+            }
+            live_many(&brokers, "close retained writer", writer.close())
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            let mut reader = live_many(
+                &brokers,
+                "open retained earliest",
+                TopicReader::open(
+                    consumer.clone(),
+                    "orders",
+                    TopicReaderConfig {
+                        start: ReaderStart::Earliest,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+            let record = live_many(&brokers, "read retained earliest", reader.next())
+                .await
+                .unwrap();
+            assert!(
+                record.offset.get() > 0,
+                "retention did not run for {policy:?}"
+            );
+            live_many(&brokers, "close retained reader", reader.close())
+                .await
+                .unwrap();
+            let mut resumed = live_many(
+                &brokers,
+                "resume retained producer",
+                SharedTopicWriter::resume(
+                    &producer,
+                    "orders",
+                    identity,
+                    config,
+                    RetryPolicy::default(),
+                ),
+            )
+            .await
+            .unwrap();
+            let pending = resumed
+                .send(
+                    RecordInput::single(
+                        MessageId::from_bytes([101; 16]),
+                        bytes::Bytes::from_static(b"after retention"),
+                    ),
+                    None,
+                )
+                .await
+                .unwrap();
+            let receipt = live_many(&brokers, "confirm retained resume", pending.confirmed())
+                .await
+                .unwrap();
+            assert_eq!(receipt.record.offset, 600);
+            live_many(&brokers, "close retained resume", resumed.close())
+                .await
+                .unwrap();
+            for broker in brokers {
+                broker.shutdown().await.unwrap();
+            }
+            producer.shutdown().await.unwrap();
+            consumer.shutdown().await.unwrap();
+        }
+    }
+
     fn fixture(policy: Confirmation) -> Vec<(CheckedConfig, BrokerIdentity)> {
         let root = std::path::PathBuf::from(format!("/ozzy-simulation-{}", Uuid::now_v7()));
         deployment(
@@ -198,11 +638,19 @@ struct Storage {
 pub(super) struct Control {
     hold_writes: AtomicBool,
     fail_write: AtomicBool,
+    short_write: std::sync::atomic::AtomicUsize,
     held: std::sync::atomic::AtomicUsize,
     failed: std::sync::atomic::AtomicUsize,
+    snapshot: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Image>>>,
 }
 
 impl Control {
+    async fn image(&self) -> Image {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        assert!(self.snapshot.lock().unwrap().replace(send).is_none());
+        receive.await.unwrap()
+    }
+
     pub(super) fn hold_record_writes(&self, hold: bool) {
         self.hold_writes.store(hold, Ordering::Release);
     }
@@ -214,6 +662,11 @@ impl Control {
     }
     pub(super) fn failures(&self) -> usize {
         self.failed.load(Ordering::Acquire)
+    }
+
+    fn short_next_record_write(&self, bytes: usize) {
+        assert!(bytes > 0);
+        self.short_write.store(bytes, Ordering::Release);
     }
 }
 
@@ -252,6 +705,9 @@ fn pump(
             if stop.load(Ordering::Acquire) && drain.is_none() {
                 drain = Some(Box::pin(device.begin_shutdown().unwrap().wait()));
             }
+            if let Some(reply) = scheduling.snapshot.lock().unwrap().take() {
+                let _ = reply.send(device.image().clone());
+            }
             let mut jobs = device.jobs();
             if reverse {
                 jobs.reverse();
@@ -261,6 +717,7 @@ fn pump(
                 match stage {
                     Stage::Queued => {
                         let record = device.operation(job).is_some_and(|op| matches!(op.unprotected(), Operation::Write { offset, .. } if *offset >= 4096));
+                        let entry = device.operation(job).is_some_and(|op| matches!(op.unprotected(), Operation::Write { offset, data, .. } if *offset >= 4096 && data.parts().first().is_some_and(|bytes| bytes.starts_with(b"OZJE"))));
                         if record && scheduling.hold_writes.load(Ordering::Acquire) {
                             held += 1;
                             continue;
@@ -269,6 +726,11 @@ fn pump(
                             if record && scheduling.fail_write.swap(false, Ordering::AcqRel) {
                                 scheduling.failed.fetch_add(1, Ordering::Release);
                                 Effect::FailBefore(std::io::ErrorKind::Other)
+                            } else if entry {
+                                match scheduling.short_write.swap(0, Ordering::AcqRel) {
+                                    0 => Effect::Normal,
+                                    bytes => Effect::Short(bytes),
+                                }
                             } else {
                                 Effect::Normal
                             };
@@ -376,8 +838,22 @@ pub(super) async fn start_controlled(
     deployment: Vec<(CheckedConfig, BrokerIdentity)>,
     reverse: bool,
 ) -> (Vec<Broker>, Vec<Arc<Control>>) {
+    let (brokers, controls, _) = start_images(runtime, deployment, reverse).await;
+    (brokers, controls)
+}
+
+async fn start_images(
+    runtime: &WriterRuntime,
+    deployment: Vec<(CheckedConfig, BrokerIdentity)>,
+    reverse: bool,
+) -> (
+    Vec<Broker>,
+    Vec<Arc<Control>>,
+    Vec<tokio::task::JoinHandle<Image>>,
+) {
     let mut brokers = Vec::new();
     let mut controls = Vec::new();
+    let mut images = Vec::new();
     for (checked, local) in deployment {
         let name = checked.plan.name.clone();
         let image = tokio::time::timeout(
@@ -386,35 +862,59 @@ pub(super) async fn start_controlled(
         )
         .await
         .unwrap_or_else(|_| panic!("virtual provision stalled: {name}"));
-        let (controller, clients) = device(&checked, checked.plan.shards.len(), image);
-        let lanes = checked
-            .plan
-            .shards
-            .iter()
-            .zip(clients)
-            .map(|(shard, client)| ShardIo {
-                shard: shard.id,
-                controller: checked.plan.controllers[0].name.clone(),
-                client,
-            })
-            .collect();
-        let (storage, control, _task) = pump(controller, reverse);
+        let (broker, control, task) = start_image(runtime, checked, local, reverse, image).await;
+        brokers.push(broker);
         controls.push(control);
-        brokers.push(
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                Broker::start_trusted_with_storage(
-                    checked,
-                    local,
-                    runtime.context().clone(),
-                    lanes,
-                    storage,
-                ),
-            )
-            .await
-            .unwrap_or_else(|_| panic!("virtual startup stalled: {name}"))
-            .unwrap(),
-        );
+        images.push(task);
     }
-    (brokers, controls)
+    (brokers, controls, images)
+}
+
+async fn start_image(
+    runtime: &WriterRuntime,
+    checked: CheckedConfig,
+    local: BrokerIdentity,
+    reverse: bool,
+    image: Image,
+) -> (Broker, Arc<Control>, tokio::task::JoinHandle<Image>) {
+    start_image_selected(runtime, checked, local, reverse, image, &[]).await
+}
+
+async fn start_image_selected(
+    runtime: &WriterRuntime,
+    checked: CheckedConfig,
+    local: BrokerIdentity,
+    reverse: bool,
+    image: Image,
+    selections: &[ozzy_broker::RecoverySelection],
+) -> (Broker, Arc<Control>, tokio::task::JoinHandle<Image>) {
+    let name = checked.plan.name.clone();
+    let (controller, clients) = device(&checked, checked.plan.shards.len(), image);
+    let lanes = checked
+        .plan
+        .shards
+        .iter()
+        .zip(clients)
+        .map(|(shard, client)| ShardIo {
+            shard: shard.id,
+            controller: checked.plan.controllers[0].name.clone(),
+            client,
+        })
+        .collect();
+    let (storage, control, task) = pump(controller, reverse);
+    let broker = tokio::time::timeout(
+        Duration::from_secs(5),
+        Broker::start_trusted_with_storage(
+            checked,
+            local,
+            selections,
+            runtime.context().clone(),
+            lanes,
+            storage,
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("virtual startup stalled: {name}"))
+    .unwrap();
+    (broker, control, task)
 }

@@ -97,7 +97,7 @@ impl Publication {
         let Some(ticket) = ticket else {
             return Ok(advanced);
         };
-        let position = match self.cursor.poll_open(config.partition, ticket, journal) {
+        let position = match self.cursor.poll_open(config.partition, ticket, journal, cx) {
             Poll::Pending => return Ok(advanced),
             Poll::Ready(Err(_)) => {
                 self.reset(false);

@@ -2,6 +2,7 @@
 
 use std::{future::Future, panic::AssertUnwindSafe, sync::Arc, time::Duration};
 
+#[cfg(test)]
 use bytes::Bytes;
 use futures::FutureExt;
 use omq_tokio::{Context, ContextConfig, Endpoint, IdentitySocket, Socket, SocketType};
@@ -320,7 +321,7 @@ impl Sockets {
         limits: TransportLimits,
     ) -> Result<Self, StartupError> {
         let options = ozzy_runtime::transport::socket_options()
-            .identity(Bytes::copy_from_slice(local.as_bytes()))
+            .identity(ozzy_runtime::transport::peer_identity(local))
             .router_mandatory(true)
             .send_hwm(limits.send_messages)
             .recv_hwm(limits.receive_messages)

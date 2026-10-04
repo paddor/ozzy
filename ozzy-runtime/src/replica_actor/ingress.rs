@@ -55,6 +55,15 @@ pin_project! {
         reply: oneshot::Receiver<ProposalReply>,
         #[pin]
         closed: Closed,
+        admission: CloseSignal,
+    }
+}
+
+impl PendingProposal {
+    /// Fence this attachment's work before core admission. Already admitted
+    /// operations and physical jobs retain their normal completion obligations.
+    pub(crate) fn fence_unadmitted(&self) {
+        self.admission.close();
     }
 }
 
@@ -135,15 +144,17 @@ impl ProposalSubmitter {
             });
         };
         let (done, pending) = oneshot::channel();
+        let admission = CloseSignal::default();
         self.untaken.fetch_add(1, Ordering::Relaxed);
         let submission = Submission {
             buffer,
             reply: Reply {
                 done,
-                _permit: permit,
+                _permit: Some(permit),
                 untaken: Untaken(Some(self.untaken.clone())),
                 queued_at: crate::profiling::start(),
                 admitted_at: None,
+                admission: admission.clone(),
             },
         };
         if let Err(error) = self.sender.try_send(submission) {
@@ -159,6 +170,7 @@ impl ProposalSubmitter {
         Ok(PendingProposal {
             reply: pending,
             closed: self.closed.closed(),
+            admission,
         })
     }
 }
@@ -184,13 +196,31 @@ impl Drop for Untaken {
 #[derive(Debug)]
 pub(super) struct Reply {
     done: oneshot::Sender<ProposalReply>,
-    _permit: OwnedSemaphorePermit,
+    _permit: Option<OwnedSemaphorePermit>,
     untaken: Untaken,
     queued_at: Option<std::time::Instant>,
     admitted_at: Option<std::time::Instant>,
+    admission: CloseSignal,
 }
 
 impl Reply {
+    /// One owner-local maintenance proposal. Its caller observes journal state.
+    pub(super) fn maintenance() -> Self {
+        let (done, observer) = oneshot::channel();
+        drop(observer);
+        Self {
+            done,
+            _permit: None,
+            untaken: Untaken(None),
+            queued_at: None,
+            admitted_at: None,
+            admission: CloseSignal::default(),
+        }
+    }
+
+    pub(super) fn fenced(&self) -> bool {
+        self.admission.is_closed()
+    }
     pub(super) fn scheduled(&mut self) {
         self.untaken.taken();
         crate::profiling::finish(crate::profiling::Stage::ReplicaQueue, self.queued_at.take());

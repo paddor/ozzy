@@ -21,7 +21,7 @@ pub use identity::{
 mod producer;
 mod snapshot;
 
-pub use producer::{CanonicalProducer, ProducerResultSpan};
+pub use producer::{CanonicalProducer, ProducerResultSpan, ProducerTransition};
 
 pub use images::{
     CanonicalImages, CanonicalImagesError, CanonicalRecovery, PreparedCanonicalGroup,
@@ -172,6 +172,7 @@ enum Mutation {
         partition: PartitionIncarnation,
         producer: ProducerId,
         new_epoch: ProducerEpoch,
+        transition: ProducerTransition,
     },
     Append(SmallVec<[AppendCursor; 4]>),
     Progress {

@@ -16,6 +16,12 @@ use ozzy_replication::{
     reason = "bounded command slots retain the arena inline without another per-chunk allocation"
 )]
 pub(super) enum ReceiveAction {
+    Checkpoint {
+        ticket: RecoveryTicket,
+        offset: u64,
+        bytes: bytes::Bytes,
+        done: completion::Sender<Result<CheckpointProgress, JournalError>>,
+    },
     Begin {
         ticket: RecoveryTicket,
         config: InstallationConfig,
@@ -136,4 +142,13 @@ impl RecoveryStartup {
             limits,
         )
     }
+}
+
+/// Private checkpoint byte progress, granting no voting or publication authority.
+#[derive(Debug, Clone, Copy)]
+pub struct CheckpointProgress {
+    /// Next expected logical state byte.
+    pub through: u64,
+    /// Exact canonical revision, only after complete validation.
+    pub revision: Option<u64>,
 }

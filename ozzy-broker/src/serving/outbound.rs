@@ -92,7 +92,9 @@ impl Outbound {
             .ok()
             .map(|packet| packet.envelope.opcode)
         {
-            Some(Opcode::PrepareFlow | Opcode::Ops | Opcode::Records) => Class::Data,
+            Some(Opcode::PrepareFlow | Opcode::Ops | Opcode::SnapshotChunk | Opcode::Records) => {
+                Class::Data
+            }
             _ => Class::Control,
         };
         let index = usize::from(class != Class::Data);

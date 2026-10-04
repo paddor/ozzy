@@ -38,6 +38,15 @@ pub trait RecoveryStorage: std::fmt::Debug + Sized {
         ticket: RecoveryTicket,
         buffer: AppendBuffer,
     ) -> Result<JournalCompletion<ReceivedChunk>, Rejected<AppendBuffer>>;
+    /// Copy and validate a bounded checkpoint range on the nonvoting owner.
+    fn receive_checkpoint(
+        &mut self,
+        _ticket: RecoveryTicket,
+        _offset: u64,
+        _bytes: bytes::Bytes,
+    ) -> Result<JournalCompletion<super::CheckpointProgress>, SubmitError> {
+        Err(SubmitError::Stopped)
+    }
     /// Validate and publish the complete selected history.
     fn finish_recovery(
         &mut self,

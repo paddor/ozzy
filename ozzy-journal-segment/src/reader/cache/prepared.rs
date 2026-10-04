@@ -24,6 +24,53 @@ pub struct PreparedOperationRecords {
 }
 
 impl PreparedOperationRecords {
+    /// Resolve retained ID/time metadata without decoding or copying payloads.
+    pub async fn observe_seek(
+        &self,
+        query: crate::SeekQuery,
+        result: &mut ozzy_core::reader::seek::Selection,
+    ) {
+        if self.header.op_number > query.through {
+            return;
+        }
+        let mut budget = crate::cooperative::Budget::default();
+        for batch in self
+            .batches
+            .iter()
+            .filter(|batch| batch.summary.partition == query.partition)
+        {
+            let first = batch
+                .summary
+                .first_offset
+                .get()
+                .max(query.retained_from.get());
+            let end = (batch.summary.first_offset.get() + batch.summary.record_count as u64)
+                .min(query.confirmed_end.get());
+            match query.start {
+                ozzy_proto::reader::Start::Timestamp(timestamp)
+                    if batch.timestamp_millis >= timestamp && first < end =>
+                {
+                    result.observe_match(Offset::new(first));
+                }
+                ozzy_proto::reader::Start::RecordId { id, .. } => {
+                    for offset in first..end {
+                        let index = (offset - batch.summary.first_offset.get()) as usize;
+                        if batch
+                            .records
+                            .get(index, &self.body)
+                            .is_some_and(|record| record.message_id == id)
+                        {
+                            result.observe_match(Offset::new(offset));
+                        }
+                        budget.charge(64).await;
+                    }
+                }
+                _ => {}
+            }
+            budget.charge(64).await;
+        }
+    }
+
     pub(crate) fn matches_location(
         &self,
         group: ozzy_proto::GroupId,
@@ -302,6 +349,7 @@ impl crate::active_read_index::ReadIndexBody for &PreparedOperationRecords {
                 partition: batch.summary.partition,
                 first_offset: batch.summary.first_offset,
                 records: batch.summary.record_count,
+                append_timestamp_millis: batch.timestamp_millis,
             })
     }
 }

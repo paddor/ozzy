@@ -25,6 +25,8 @@ use std::{
 /// Per-actor scheduling bounds. Device workers and admission remain shared.
 #[derive(Debug, Clone, Copy)]
 pub struct LocalActorConfig {
+    /// Periodic bounded retention turns; absent for unlimited topic policies.
+    pub retention_interval: Option<std::time::Duration>,
     /// Bounded commands and physical write progress on this shard.
     pub journal: ShardJournalConfig,
     /// Startup-registered submission lanes sharing one request budget.
@@ -39,6 +41,7 @@ pub struct LocalActorConfig {
 impl Default for LocalActorConfig {
     fn default() -> Self {
         Self {
+            retention_interval: None,
             journal: ShardJournalConfig::default(),
             proposal_lanes: 1,
             proposal_capacity: 64,
@@ -53,6 +56,7 @@ enum Pending {
     Propose(JournalCompletion<ProposalValidation>),
     Admit(JournalCompletion<AdmittedAppend>),
     Apply(JournalCompletion<ValidationTicket>),
+    Retention(JournalCompletion<crate::replica_journal::RetentionTurn>),
 }
 
 #[derive(Debug)]
@@ -68,6 +72,8 @@ struct Live {
 #[derive(Debug)]
 pub struct LocalActor {
     journal: ReplicaJournal,
+    now: std::time::Duration,
+    retention_at: Option<std::time::Duration>,
     driver: Driver,
     config: LocalActorConfig,
     ingress: Ingress,
@@ -151,7 +157,10 @@ impl LocalActor {
         timestamp: impl Fn() -> u64 + 'static,
     ) -> Result<Self, ActorError> {
         owner.check_local_driver(&driver)?;
-        if config.proposal_lanes == 0
+        if config
+            .retention_interval
+            .is_some_and(|interval| interval.is_zero())
+            || config.proposal_lanes == 0
             || config.proposal_lanes > 65536
             || config.proposal_capacity == 0
             || config.proposal_capacity > 65536
@@ -177,6 +186,8 @@ impl LocalActor {
         );
         Ok(Self {
             journal,
+            now: std::time::Duration::ZERO,
+            retention_at: config.retention_interval,
             driver,
             config,
             ingress,
@@ -333,12 +344,38 @@ impl LocalActor {
             }
             return Ok(changed);
         }
+        if self.retention_at.is_some_and(|at| self.now >= at) && self.waiting.is_none() {
+            if !self.persistence.is_empty()
+                || self.sync.is_some()
+                || !self.live.is_empty()
+                || state.accepted != state.applied
+            {
+                return Ok(changed);
+            }
+            self.pending = Some(Pending::Retention(self.journal.retention_turn(
+                self.driver.begin_validation()?,
+                ozzy_proto::OperationId::from_bytes(*ozzy_proto::RequestId::new().as_bytes()),
+                true,
+            )?));
+            self.retention_at = self
+                .config
+                .retention_interval
+                .map(|interval| self.now.saturating_add(interval));
+            return Ok(true);
+        }
         if self.waiting.is_none() {
             self.waiting = self.ingress.pop();
         }
         let Some(waiting) = &self.waiting else {
             return Ok(changed);
         };
+        if waiting.reply.fenced() {
+            let waiting = self.waiting.take().expect("waiting request");
+            waiting
+                .reply
+                .finish(waiting.buffer, ProposalOutcome::NotAdmitted);
+            return Ok(true);
+        }
         let limits = self.driver.limits();
         if waiting.buffer.len() > limits.max_operations - state.pending_operations
             || waiting.buffer.body_bytes() > limits.max_body_bytes - state.pending_body_bytes
@@ -358,5 +395,11 @@ impl LocalActor {
         self.propose_started_at = crate::profiling::start();
         self.validating = Some(waiting.reply);
         Ok(true)
+    }
+}
+
+impl LocalActor {
+    pub(super) fn observe_time(&mut self, now: std::time::Duration) {
+        self.now = now;
     }
 }

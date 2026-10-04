@@ -20,6 +20,7 @@ mod faults;
 mod native;
 mod partition;
 mod producer_session;
+mod retention;
 
 fn local_config() -> OwnedConfig<Configuration> {
     let base = config("/local", 7, QuorumPolicy::Durable);

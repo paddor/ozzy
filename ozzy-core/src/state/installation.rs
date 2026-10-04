@@ -45,8 +45,9 @@ impl CanonicalState {
                 partition,
                 producer,
                 new_epoch,
+                transition,
             } => {
-                self.install_producer(partition, producer, new_epoch);
+                self.install_producer(partition, producer, new_epoch, transition);
             }
             Mutation::Append(cursors) => {
                 self.install_append(cursors);
@@ -91,12 +92,12 @@ impl CanonicalState {
         partition: PartitionIncarnation,
         producer: ProducerId,
         new_epoch: ProducerEpoch,
+        transition: super::ProducerTransition,
     ) {
         let state = self.partitions.get_mut(&partition).expect("validated plan");
-        if let Some(previous) = state
-            .producers
-            .insert(producer, CanonicalProducer::new(new_epoch))
-        {
+        let mut opened = CanonicalProducer::new(new_epoch);
+        opened.transition = Some(transition);
+        if let Some(previous) = state.producers.insert(producer, opened) {
             self.retry_span_count -= previous.result_spans().len();
         } else {
             self.producer_count += 1;

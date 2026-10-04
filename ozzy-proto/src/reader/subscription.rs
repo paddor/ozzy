@@ -115,12 +115,13 @@ fn encode_close(
         envelope,
         opcode,
         response,
-        32 + subscription.source.size(),
+        40 + subscription.source.size(),
         output,
         limits,
     )?;
     subscription.subscription.encode(output);
     subscription.source.encode(output);
+    output.extend_from_slice(&subscription.resolved_offset.to_be_bytes());
     Ok(header)
 }
 
@@ -138,6 +139,7 @@ fn decode_close(
     let subscription = Subscribed {
         subscription: Subscription::decode(&mut cursor)?,
         source: Source::decode(&mut cursor)?,
+        resolved_offset: cursor.u64()?,
     };
     end(cursor)?;
     Ok(subscription)

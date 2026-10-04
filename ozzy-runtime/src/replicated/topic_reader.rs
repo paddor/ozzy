@@ -28,11 +28,47 @@ pub struct TopicCheckpoint {
     pub positions: Vec<(u32, Offset)>,
 }
 
-/// Topic reader configuration. Default subscribes every topic partition at zero.
+/// Initial history selection. Reconnects use delivered offsets, never repeat a seek.
+#[derive(Debug, Clone, Default)]
+pub enum ReaderStart {
+    /// First retained record in each selected partition.
+    #[default]
+    Earliest,
+    /// Current confirmed ends, followed by new records.
+    Latest,
+    /// Application-saved per-partition next offsets.
+    Checkpoint(TopicCheckpoint),
+    /// First retained offset whose broker append time is at least Unix milliseconds.
+    Timestamp(u64),
+    /// Select exactly one partition by application record ID.
+    RecordId {
+        /// Numeric topic partition.
+        partition: u32,
+        /// Application record identity, independent of producer retry identity.
+        id: MessageId,
+        /// Explicit duplicate selection; [`Self::record_id`] requires uniqueness.
+        policy: ozzy_proto::reader::IdPolicy,
+    },
+}
+
+impl ReaderStart {
+    /// Select one partition by ID, rejecting multiple retained matches by default.
+    pub const fn record_id(partition: u32, id: MessageId) -> Self {
+        Self::RecordId {
+            partition,
+            id,
+            policy: ozzy_proto::reader::IdPolicy::RequireUnique,
+        }
+    }
+}
+
+pub use ozzy_proto::reader::IdPolicy;
+
+/// Topic reader configuration. Default starts at each partition's retained floor.
 #[derive(Debug, Clone)]
 pub struct TopicReaderConfig {
-    /// Resume positions produced by this API. Every selected partition is required.
-    pub checkpoint: Option<TopicCheckpoint>,
+    /// Initial selector. Checkpoints require every selected partition.
+    pub start: ReaderStart,
     /// Optional numeric partition filter. Routing remains automatic.
     pub partitions: Option<Vec<u32>>,
     /// Refresh after silence or an unavailable leader. Uses the SDK clock.
@@ -42,7 +78,7 @@ pub struct TopicReaderConfig {
 impl Default for TopicReaderConfig {
     fn default() -> Self {
         Self {
-            checkpoint: None,
+            start: ReaderStart::Earliest,
             partitions: None,
             refresh: Duration::from_millis(100),
         }
@@ -121,7 +157,15 @@ impl TopicReader {
         let selected = config
             .partitions
             .clone()
-            .unwrap_or_else(|| (0..metadata.partition_count() as u32).collect());
+            .unwrap_or_else(|| match config.start {
+                ReaderStart::RecordId { partition, .. } => vec![partition],
+                _ => (0..metadata.partition_count() as u32).collect(),
+            });
+        if let ReaderStart::RecordId { partition, .. } = config.start
+            && selected != [partition]
+        {
+            return Err(TopicReaderError::Configuration);
+        }
         let unique: BTreeSet<_> = selected.iter().copied().collect();
         if selected.is_empty()
             || unique.len() != selected.len()
@@ -129,7 +173,11 @@ impl TopicReader {
         {
             return Err(TopicReaderError::Configuration);
         }
-        if let Some(checkpoint) = &config.checkpoint
+        let checkpoint = match &config.start {
+            ReaderStart::Checkpoint(checkpoint) => Some(checkpoint),
+            _ => None,
+        };
+        if let Some(checkpoint) = checkpoint
             && (checkpoint.topic != metadata.id()
                 || checkpoint.positions.len() != selected.len()
                 || checkpoint
@@ -147,11 +195,26 @@ impl TopicReader {
         let mut cursors = Vec::with_capacity(selected.len());
         for number in selected {
             routes.interest(number)?;
-            let from = config
-                .checkpoint
-                .as_ref()
-                .and_then(|checkpoint| checkpoint.positions.iter().find(|&&(n, _)| n == number))
-                .map_or(0, |&(_, offset)| offset.get());
+            let from = match &config.start {
+                ReaderStart::Earliest => ozzy_proto::reader::Start::Earliest,
+                ReaderStart::Latest => ozzy_proto::reader::Start::Latest,
+                ReaderStart::Timestamp(timestamp) => {
+                    ozzy_proto::reader::Start::Timestamp(*timestamp)
+                }
+                ReaderStart::RecordId { id, policy, .. } => ozzy_proto::reader::Start::RecordId {
+                    id: *id,
+                    policy: *policy,
+                },
+                ReaderStart::Checkpoint(checkpoint) => ozzy_proto::reader::Start::Offset(
+                    checkpoint
+                        .positions
+                        .iter()
+                        .find(|&&(n, _)| n == number)
+                        .expect("checked checkpoint")
+                        .1
+                        .get(),
+                ),
+            };
             cursors.push(Cursor::new(
                 &links,
                 routes
@@ -332,6 +395,24 @@ impl Drop for TopicReader {
 /// Topic lookup, source validation, or reader delivery failed.
 #[derive(Debug, thiserror::Error)]
 pub enum TopicReaderError {
+    /// No match survives retention, or the ID was never present.
+    #[error("partition {partition}: record ID not found in retained history")]
+    RecordNotFound {
+        /// Numeric topic partition.
+        partition: u32,
+        /// Earliest currently retained offset.
+        earliest: Offset,
+    },
+    /// Multiple retained records carry the ID; choose a duplicate policy explicitly.
+    #[error("partition {partition}: ambiguous record ID at offsets {first:?}..{last:?}")]
+    AmbiguousRecordId {
+        /// Numeric topic partition.
+        partition: u32,
+        /// Oldest retained match.
+        first: Offset,
+        /// Newest retained match.
+        last: Offset,
+    },
     /// Invalid filter, checkpoint, or bounds.
     #[error("invalid topic reader configuration")]
     Configuration,

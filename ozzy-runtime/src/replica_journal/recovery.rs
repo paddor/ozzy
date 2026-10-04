@@ -3,7 +3,7 @@
 use ozzy_proto::NodeId;
 use ozzy_replication::LogSource;
 use ozzy_replication::recovery::RecoveryResponse;
-use ozzy_replication::wire::FetchOps;
+use ozzy_replication::wire::{CheckpointRequest, FetchOps};
 
 use super::commands::Action;
 use super::{
@@ -17,6 +17,11 @@ use super::{
     reason = "bounded command slots retain leased arenas inline without per-command boxes"
 )]
 pub(super) enum RecoveryAction {
+    Checkpoint {
+        pin: PinnedRecovery,
+        request: CheckpointRequest,
+        done: completion::Sender<Result<RecoveryCheckpointRead, JournalError>>,
+    },
     Pin {
         requester: NodeId,
         response: RecoveryResponse,
@@ -149,5 +154,35 @@ impl ReplicaJournal {
                 _ => unreachable!("submission preserves command kind"),
             },
         )
+    }
+}
+
+/// One bounded, source-bound checkpoint chunk supplied by a retained donor.
+#[derive(Debug)]
+pub struct RecoveryCheckpointRead {
+    /// Exact request echoed to the receiver.
+    pub request: CheckpointRequest,
+    /// Verified immutable state bytes, bounded by the request.
+    pub bytes: bytes::Bytes,
+}
+
+impl ReplicaJournal {
+    /// Queue one detached chunk read from an exact recovery checkpoint pin.
+    pub fn fetch_checkpoint(
+        &mut self,
+        pin: PinnedRecovery,
+        request: CheckpointRequest,
+    ) -> Result<JournalCompletion<RecoveryCheckpointRead>, SubmitError> {
+        self.submit(
+            (pin, request),
+            |(pin, request), done| {
+                Action::Recovery(RecoveryAction::Checkpoint { pin, request, done })
+            },
+            |action| match action {
+                Action::Recovery(RecoveryAction::Checkpoint { pin, request, .. }) => (pin, request),
+                _ => unreachable!("submission preserves command kind"),
+            },
+        )
+        .map_err(|rejected| rejected.reason)
     }
 }

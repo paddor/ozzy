@@ -286,7 +286,7 @@ pub(super) fn decode_fetch(
     Ok(request)
 }
 
-fn validate_source(source: LogSource) -> Result<(), WireError> {
+pub(super) fn validate_source(source: LogSource) -> Result<(), WireError> {
     validate_prefix(source.accepted)?;
     if source.generation.0 == 0 || source.voter.as_bytes() == &[0; 16] {
         return Err(WireError::History);
@@ -294,13 +294,13 @@ fn validate_source(source: LogSource) -> Result<(), WireError> {
     Ok(())
 }
 
-fn write_source(writer: &mut Writer<'_>, source: LogSource) {
+pub(super) fn write_source(writer: &mut Writer<'_>, source: LogSource) {
     writer.bytes(source.voter.as_bytes());
     writer.bytes(&source.generation.0.to_be_bytes());
     writer.prefix(source.accepted);
 }
 
-fn read_source(reader: &mut Reader<'_>) -> Result<LogSource, WireError> {
+pub(super) fn read_source(reader: &mut Reader<'_>) -> Result<LogSource, WireError> {
     let source = LogSource {
         voter: NodeId::from_bytes(reader.bytes()?),
         generation: JournalGeneration(u128::from_be_bytes(reader.bytes()?)),

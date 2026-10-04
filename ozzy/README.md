@@ -30,6 +30,25 @@ async fn write(links: &BrokerLinks, limits: DataLimits) -> Result<(), Box<dyn st
 }
 ```
 
+Save `writer.identity().to_bytes()` once in application config. Resume needs
+only this 32-byte topic/producer token; brokers supply each partition's current
+epoch and next sequence. Use `SharedTopicWriter::resume` after the old process
+has stopped, or `takeover` to fence it explicitly. Both resolve every partition
+before returning. A failed takeover may already have fenced some partitions.
+The SDK stores no durable outbox. A crash may lose unconfirmed records; application
+resubmission may repeat records. Record IDs do not deduplicate application work.
+
+```rust,no_run
+use ozzy::{BrokerLinks, DataLimits, ProducerIdentity, RetryPolicy,
+    SharedTopicWriter, SharedTopicWriterConfig};
+
+async fn resume(links: &BrokerLinks, limits: DataLimits, saved: [u8; 32])
+    -> Result<SharedTopicWriter, Box<dyn std::error::Error>> {
+    Ok(SharedTopicWriter::resume(links, "orders", ProducerIdentity::from_bytes(saved)?,
+        SharedTopicWriterConfig::new(limits), RetryPolicy::default()).await?)
+}
+```
+
 See [runtime contracts](../doc/RUNTIME.md#sdk-protocol-batching) for admission,
 resource bounds, and cancellation. The default payload target is 64 KiB with
 one outstanding APPEND. Collection is bounded by bytes, negotiated limits, and
@@ -37,7 +56,13 @@ a hard 2,048-record ceiling; sparse sends have no artificial collection wait.
 
 `TopicReader` opens every partition of a named topic and returns
 individual records. Its checkpoint names the next received offset per partition.
-Save it after application processing, then pass it when reopening the reader.
+Save it after application processing, then reopen with
+`TopicReaderConfig { start: ReaderStart::Checkpoint(saved), ..Default::default() }`.
+Default start is earliest retained. `ReaderStart::Latest` starts at the current end;
+`Timestamp(unix_millis)` seeks by broker append time. `ReaderStart::record_id(partition,
+id)` requires one unique retained match. Choose `IdPolicy::FirstRetained` or
+`LastRetained` explicitly when duplicate IDs are expected. Seeks use confirmed
+history; reconnect continues from the next delivered offset.
 
 ```rust,no_run
 use ozzy::{BrokerLinks, TopicReader, TopicReaderConfig};

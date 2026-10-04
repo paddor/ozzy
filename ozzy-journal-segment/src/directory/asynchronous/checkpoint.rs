@@ -16,6 +16,17 @@ pub struct CheckpointFiles {
 }
 
 impl CheckpointFiles {
+    /// Read a bounded range from one immutable, checksum-validated chunk.
+    pub async fn read_range(
+        &self,
+        offset: u64,
+        maximum: usize,
+    ) -> Result<Vec<u8>, crate::CheckpointError> {
+        self.checkpoint
+            .read_range(offset, maximum, self.limits)
+            .await
+    }
+
     /// Exact validated metadata manifest held by this object.
     pub const fn manifest(&self) -> &crate::CheckpointManifest {
         &self.checkpoint.manifest

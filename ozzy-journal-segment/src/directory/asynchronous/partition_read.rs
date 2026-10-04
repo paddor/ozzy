@@ -235,6 +235,11 @@ impl Journal {
 }
 
 impl Index {
+    /// Newest append time in the installed active segment, without file access.
+    pub fn newest_active_append_millis(&self, partition: PartitionIncarnation) -> Option<u64> {
+        self.active.as_ref()?.newest_append_millis(partition)
+    }
+
     /// Scan active history once at owner activation. Subsequent write deltas and
     /// read captures are memory-only. Sealed indexes load lazily on read misses.
     pub async fn open(journal: &Journal, limits: Limits) -> Result<Self, Error> {

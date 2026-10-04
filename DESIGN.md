@@ -83,8 +83,7 @@ nonvoting recovery when clean-stop evidence cannot be proven.
 Known broker endpoints are provisioned. Topic metadata lookup, route watches,
 producer open/fence, APPEND confirmation, reader replay/live delivery, leader
 change, and explicit partition recovery are implemented. Broker-stored consumer
-offsets, consumer groups, online topic creation, discovery, checkpoint transfer,
-partition movement, and online membership are not.
+offsets, consumer groups, online topic creation, discovery, partition movement, and online membership are not.
 
 ## Partition placement and leadership
 

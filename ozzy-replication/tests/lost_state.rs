@@ -64,6 +64,74 @@ fn operation(scope: Scope, previous: Prefix, value: u8) -> PreparedOperation {
 }
 
 #[test]
+fn checkpoint_recovery_keeps_retained_chain_and_requires_private_state_validation() {
+    use ozzy_replication::recovery::CheckpointAnchor;
+    let scope = configuration().scope();
+    let first = operation(scope, Prefix::GENESIS, 51);
+    let second = operation(scope, first.prefix(), 52);
+    let third = operation(scope, second.prefix(), 53);
+    let anchor = CheckpointAnchor {
+        predecessor: first.prefix(),
+        position: second.prefix(),
+        schema: Digest::from_bytes([61; 32]),
+        state_digest: Digest::from_bytes([62; 32]),
+        state_bytes: 4096,
+        chunk_bytes: 1024,
+    };
+    let nonce = RequestId::from_bytes([63; 16]);
+    let mut recovering = Recovery::new(
+        configuration(),
+        node(1),
+        JournalGeneration(100),
+        nonce,
+        limits(),
+    )
+    .unwrap();
+    recovering
+        .receive(
+            node(0),
+            RecoveryResponse {
+                scope,
+                nonce,
+                primary: Some(RecoveryLog {
+                    generation: JournalGeneration(1),
+                    accepted: third.prefix(),
+                    committed: second.prefix(),
+                    checkpoint: Some(anchor),
+                }),
+            },
+        )
+        .unwrap();
+    recovering
+        .receive(
+            node(2),
+            RecoveryResponse {
+                scope,
+                nonce,
+                primary: None,
+            },
+        )
+        .unwrap();
+    let ticket = recovering.begin_transfer().unwrap();
+    assert_eq!(ticket.checkpoint(), Some(anchor));
+    assert_eq!(
+        recovering.validate_chunk(ticket, &[second, third]),
+        Err(RecoveryError::ApplicationPending)
+    );
+    assert_eq!(
+        recovering.complete_checkpoint(ticket, anchor, 1),
+        Err(RecoveryError::ApplicationPending)
+    );
+    recovering.complete_checkpoint(ticket, anchor, 2).unwrap();
+    recovering.validate_chunk(ticket, &[second, third]).unwrap();
+    let recovered = recovering
+        .complete(ticket, third.prefix(), second.prefix())
+        .unwrap();
+    assert_eq!(recovered.log.accepted, third.prefix());
+    assert_eq!(recovered.log.committed, second.prefix());
+}
+
+#[test]
 fn recovery_selects_full_accepted_history_before_a_precrash_ack_can_commit_it() {
     let mut primary = normal(0);
     let mut lost = normal(1);
@@ -353,6 +421,7 @@ fn fresh_quorum_requires_the_highest_view_primary_not_an_older_primary() {
                 },
                 nonce,
                 primary: Some(RecoveryLog {
+                    checkpoint: None,
                     generation: JournalGeneration(3),
                     accepted: Prefix::GENESIS,
                     committed: Prefix::GENESIS,
@@ -381,6 +450,7 @@ fn conflicting_frozen_response_cannot_leave_the_old_transfer_eligible() {
         scope: ticket.scope(),
         nonce: ticket.nonce(),
         primary: Some(RecoveryLog {
+            checkpoint: None,
             generation: ticket.source().generation,
             accepted: ticket.source().accepted,
             committed: ticket.source().accepted,
@@ -597,7 +667,7 @@ fn malformed_or_unready_responders_never_supply_recovery_evidence() {
         primary.recovery_response(nonce),
         Err(RecoveryError::NotReady)
     );
-    for bad in malformed_logs(valid.primary.unwrap()) {
+    for bad in malformed_logs(&valid.primary.unwrap()) {
         let mut recovery = Recovery::new(
             configuration(),
             node(1),
@@ -662,7 +732,7 @@ fn malformed_or_unready_responders_never_supply_recovery_evidence() {
     }
 }
 
-fn malformed_logs(log: RecoveryLog) -> [RecoveryLog; 5] {
+fn malformed_logs(log: &RecoveryLog) -> [RecoveryLog; 5] {
     use ozzy_replication::OpNumber;
     let nonzero = Prefix {
         op: OpNumber(1),
@@ -670,34 +740,39 @@ fn malformed_logs(log: RecoveryLog) -> [RecoveryLog; 5] {
     };
     [
         RecoveryLog {
+            checkpoint: None,
             generation: JournalGeneration(0),
-            ..log
+            ..*log
         },
         RecoveryLog {
+            checkpoint: None,
             accepted: Prefix {
                 op: OpNumber(0),
                 ..nonzero
             },
-            ..log
+            ..*log
         },
         RecoveryLog {
+            checkpoint: None,
             accepted: Prefix {
                 op: OpNumber(u64::MAX),
                 ..nonzero
             },
-            ..log
+            ..*log
         },
         RecoveryLog {
+            checkpoint: None,
             committed: nonzero,
-            ..log
+            ..*log
         },
         RecoveryLog {
+            checkpoint: None,
             accepted: nonzero,
             committed: Prefix {
                 digest: Digest::from_bytes([2; 32]),
                 ..nonzero
             },
-            ..log
+            ..*log
         },
     ]
 }

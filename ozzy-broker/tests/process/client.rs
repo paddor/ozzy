@@ -12,19 +12,30 @@ use ozzy_runtime::replicated::{
 };
 use std::time::Duration;
 
-pub(super) struct Client {
+mod workload;
+
+pub(crate) struct Client {
     pub(super) links: BrokerLinks,
     writer: SharedTopicWriter,
     keys: Vec<[u8; 4]>,
-    history: Vec<Vec<(MessageId, Bytes)>>,
+    history: Vec<Vec<(MessageId, Vec<Bytes>)>>,
+    bases: Vec<usize>,
     next_sequences: Vec<u64>,
     policy: Policy,
 }
 
-pub(super) type Pending = (SharedTopicPendingRecord, MessageId, Bytes);
+pub(super) type Pending = (SharedTopicPendingRecord, MessageId, Vec<Bytes>);
 
 impl Client {
-    pub(super) async fn open(checked: &CheckedConfig) -> Self {
+    pub(crate) async fn open(checked: &CheckedConfig) -> Self {
+        let runtime = WriterRuntime::new().unwrap();
+        Self::open_with_runtime(checked, &runtime).await
+    }
+
+    pub(crate) async fn open_with_runtime(
+        checked: &CheckedConfig,
+        runtime: &WriterRuntime,
+    ) -> Self {
         let topic = &checked.deployment.deployment().topics["orders"];
         let partitions = topic.partitions as usize;
         let policy = match topic.confirmation {
@@ -45,9 +56,8 @@ impl Client {
             handshake::Parameters::streaming(limits, handshake::PRODUCER | handshake::CONSUMER)
                 .unwrap();
         parameters.capabilities |= handshake::OWNER_ROUTING | handshake::OWNER_READ;
-        let runtime = WriterRuntime::new().unwrap();
         let links = BrokerLinks::connect(
-            &runtime,
+            runtime,
             BrokerLinksConfig {
                 local: NodeId::from_bytes(*uuid::Uuid::now_v7().as_bytes()),
                 brokers: checked
@@ -112,6 +122,7 @@ impl Client {
             writer,
             keys,
             history: vec![Vec::new(); partitions],
+            bases: vec![0; partitions],
             next_sequences: vec![0; partitions],
             policy,
         }
@@ -121,13 +132,72 @@ impl Client {
         self.queue_selected(wave, None).await
     }
 
+    pub(crate) async fn reopen_producer(self, takeover: bool) -> Self {
+        let trace = std::env::var("OZZY_SOAK_TRACE").is_ok_and(|value| value == "1");
+        if trace {
+            println!("producer close started, takeover={takeover}");
+        }
+        let identity = self.writer.identity();
+        self.writer.close().await.unwrap();
+        if trace {
+            println!("producer close finished, attachment started");
+        }
+        let limits = DataLimits {
+            envelope: EnvelopeLimits {
+                max_metadata_bytes: 16 * 1024,
+                max_payload_bytes: 4096,
+            },
+            max_records: 4,
+            max_parts: 4,
+            max_record_bytes: 1024,
+        };
+        let config = SharedTopicWriterConfig::new(limits);
+        let writer = if takeover {
+            SharedTopicWriter::takeover(
+                &self.links,
+                "orders",
+                identity,
+                config,
+                RetryPolicy::default(),
+            )
+            .await
+        } else {
+            SharedTopicWriter::resume(
+                &self.links,
+                "orders",
+                identity,
+                config,
+                RetryPolicy::default(),
+            )
+            .await
+        }
+        .unwrap();
+        if trace {
+            println!("producer attachment finished");
+        }
+        assert_eq!(writer.producer(), identity.producer);
+        Self {
+            next_sequences: if takeover {
+                vec![0; self.keys.len()]
+            } else {
+                self.next_sequences
+            },
+            writer,
+            links: self.links,
+            keys: self.keys,
+            history: self.history,
+            bases: self.bases,
+            policy: self.policy,
+        }
+    }
+
     pub(super) async fn queue_except(&mut self, wave: usize, partition: usize) -> Vec<Pending> {
         self.queue_selected(wave, Some(partition)).await
     }
 
     async fn queue_selected(&mut self, wave: usize, excluded: Option<usize>) -> Vec<Pending> {
         let mut pending = Vec::new();
-        for (partition, key) in self.keys.iter().enumerate() {
+        for partition in 0..self.keys.len() {
             if excluded == Some(partition) {
                 continue;
             }
@@ -137,15 +207,7 @@ impl Client {
                 );
                 let body =
                     Bytes::from(format!("wave-{wave}-partition-{partition}-record-{record}"));
-                let admitted = self
-                    .writer
-                    .send(RecordInput::copy_from_slice(id, &body), Some(key))
-                    .await
-                    .unwrap();
-                assert_eq!(admitted.partition(), partition as u32);
-                assert_eq!(admitted.sequence(), self.next_sequences[partition]);
-                self.next_sequences[partition] += 1;
-                pending.push((admitted, id, body));
+                pending.push(self.admit(partition, id, vec![body]).await);
             }
         }
         pending
@@ -165,47 +227,76 @@ impl Client {
                 block.copy_from_slice(&state.to_be_bytes());
             }
             let body = Bytes::copy_from_slice(&body);
-            let admitted = self
-                .writer
-                .send(RecordInput::copy_from_slice(id, &body), Some(&self.keys[0]))
-                .await
-                .unwrap();
-            assert_eq!(admitted.partition(), 0);
-            assert_eq!(admitted.sequence(), self.next_sequences[0]);
-            self.next_sequences[0] += 1;
-            pending.push((admitted, id, body));
+            pending.push(self.admit(0, id, vec![body]).await);
         }
         pending
     }
 
-    pub(super) async fn confirm(&mut self, pending: Vec<Pending>) {
+    pub(crate) async fn confirm(&mut self, pending: Vec<Pending>) {
         for (pending, id, body) in pending {
-            let receipt = pending.confirmed().await.unwrap();
+            let receipt = self.confirm_record(&pending).await;
             assert_eq!(receipt.record.policy, self.policy);
             assert_eq!(receipt.partition, pending.partition());
             assert_eq!(receipt.record.message_id, id);
             assert_eq!(receipt.record.key.producer_id, self.writer.producer());
             assert_eq!(receipt.record.key.first_sequence, pending.sequence());
             let history = &mut self.history[receipt.partition as usize];
-            assert_eq!(receipt.record.offset, history.len() as u64);
+            assert_eq!(
+                receipt.record.offset,
+                (self.bases[receipt.partition as usize] + history.len()) as u64
+            );
             history.push((id, body));
         }
     }
 
-    pub(super) async fn reader(&self, at_end: bool) -> TopicReader {
+    async fn confirm_record(
+        &self,
+        pending: &SharedTopicPendingRecord,
+    ) -> ozzy_runtime::replicated::SharedTopicReceipt {
+        let routes = self.links.routes(self.writer.metadata().clone()).unwrap();
+        let mut confirmation = std::pin::pin!(pending.confirmed());
+        loop {
+            tokio::select! {
+                result = &mut confirmation => return result.unwrap(),
+                () = tokio::time::sleep(Duration::from_secs(5)) => {
+                    eprintln!(
+                        "waiting for partition {} sequence {}: route={:?}, stats={:?}",
+                        pending.partition(), pending.sequence(),
+                        routes.route(pending.partition()),
+                        self.writer.partition_stats(pending.partition()),
+                    );
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn reader(&self, at_end: bool) -> TopicReader {
         TopicReader::open(
             self.links.clone(),
             "orders",
             TopicReaderConfig {
-                checkpoint: at_end.then(|| TopicCheckpoint {
-                    topic: self.writer.metadata().id(),
-                    positions: self
-                        .history
-                        .iter()
-                        .enumerate()
-                        .map(|(n, history)| (n as u32, Offset::new(history.len() as u64)))
-                        .collect(),
-                }),
+                start: if at_end || self.bases.iter().any(|&base| base > 0) {
+                    ozzy_runtime::replicated::ReaderStart::Checkpoint(TopicCheckpoint {
+                        topic: self.writer.metadata().id(),
+                        positions: self
+                            .history
+                            .iter()
+                            .enumerate()
+                            .map(|(n, history)| {
+                                (
+                                    n as u32,
+                                    Offset::new(if at_end {
+                                        self.bases[n] + history.len()
+                                    } else {
+                                        self.bases[n]
+                                    } as u64),
+                                )
+                            })
+                            .collect(),
+                    })
+                } else {
+                    ozzy_runtime::replicated::ReaderStart::Earliest
+                },
                 ..TopicReaderConfig::default()
             },
         )
@@ -213,25 +304,70 @@ impl Client {
         .unwrap()
     }
 
-    pub(super) fn positions(&self) -> Vec<usize> {
-        self.history.iter().map(Vec::len).collect()
+    pub(crate) fn positions(&self) -> Vec<usize> {
+        self.history
+            .iter()
+            .zip(&self.bases)
+            .map(|(history, base)| base + history.len())
+            .collect()
     }
 
-    pub(super) async fn read(&self, reader: &mut TopicReader, mut positions: Vec<usize>) {
+    pub(super) fn leader(&self, partition: u32) -> NodeId {
+        self.links
+            .routes(self.writer.metadata().clone())
+            .unwrap()
+            .route(partition)
+            .unwrap()
+            .unwrap()
+            .leader
+            .unwrap()
+    }
+
+    pub(super) async fn retained_floor(&self) -> Offset {
+        let mut reader = TopicReader::open(
+            self.links.clone(),
+            "orders",
+            TopicReaderConfig {
+                partitions: Some(vec![0]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let floor = match reader.next().await {
+            Ok(record) => {
+                assert_eq!(record.partition, 0);
+                record.offset
+            }
+            Err(ozzy_runtime::replicated::TopicReaderError::RetentionGap {
+                partition,
+                earliest,
+            }) => {
+                assert_eq!(partition, 0);
+                earliest
+            }
+            Err(error) => panic!("retained floor lookup: {error:?}"),
+        };
+        reader.close().await.unwrap();
+        floor
+    }
+
+    pub(crate) async fn read(&self, reader: &mut TopicReader, mut positions: Vec<usize>) {
         let wanted = self
             .history
             .iter()
             .zip(&positions)
-            .map(|(history, &next)| history.len() - next)
+            .zip(&self.bases)
+            .map(|((history, &next), &base)| base + history.len() - next)
             .sum::<usize>();
         for _ in 0..wanted {
             let record = reader.next().await.unwrap();
             let partition = record.partition as usize;
             let next = positions[partition];
             assert_eq!(record.offset, Offset::new(next as u64));
-            let (id, body) = &self.history[partition][next];
+            let (id, body) = &self.history[partition][next - self.bases[partition]];
             assert_eq!(&record.message_id, id);
-            assert_eq!(record.payload.as_slice(), std::slice::from_ref(body));
+            assert_eq!(record.payload.as_slice(), body.as_slice());
             positions[partition] += 1;
         }
         assert_eq!(positions, self.positions());
@@ -240,14 +376,21 @@ impl Client {
         }
     }
 
-    pub(super) async fn close(self) {
+    pub(crate) async fn close(self) {
         self.writer.close().await.unwrap();
         self.links.shutdown().await.unwrap();
     }
 
-    pub(super) async fn replay(&self) {
+    pub(crate) async fn replay(&self) {
         let mut reader = self.reader(false).await;
-        self.read(&mut reader, vec![0; self.history.len()]).await;
+        self.read(&mut reader, self.bases.clone()).await;
         reader.close().await.unwrap();
+    }
+
+    pub(crate) fn discard_verified(&mut self) {
+        for (history, base) in self.history.iter_mut().zip(&mut self.bases) {
+            *base += history.len();
+            history.clear();
+        }
     }
 }

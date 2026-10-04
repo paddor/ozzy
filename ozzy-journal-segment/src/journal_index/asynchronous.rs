@@ -35,6 +35,21 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Scan metadata across every captured source, independent of hot-cache order.
+    /// Caller-held deletion pins preserve exact files throughout this lookup.
+    pub async fn seek(
+        &self,
+        mut query: crate::SeekQuery,
+        result: &mut ozzy_core::reader::seek::Selection,
+    ) -> Result<(), Error> {
+        query.through = query.through.min(self.through.op_number);
+        self.sealed.seek(query, result).await?;
+        if let Some(active) = &self.active {
+            active.seek(query, result);
+        }
+        Ok(())
+    }
+
     /// Exact group, node, volume, store, and store-generation binding.
     pub const fn identity(&self) -> GroupIdentity {
         self.identity

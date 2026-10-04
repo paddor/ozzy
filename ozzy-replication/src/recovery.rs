@@ -23,6 +23,46 @@ pub struct RecoveryLog {
     pub accepted: Prefix,
     /// Known commit floor in this snapshot, not a truncation boundary.
     pub committed: Prefix,
+    /// Canonical state and retained-chain anchor when older operations expired.
+    pub checkpoint: Option<CheckpointAnchor>,
+}
+
+/// Exact pinned checkpoint and the predecessor of required retained operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointAnchor {
+    /// Hash anchor before the first retained operation, possibly before state.
+    pub predecessor: Prefix,
+    /// Original confirmed operation prefix represented by canonical state.
+    pub position: Prefix,
+    /// Exact canonical state schema digest.
+    pub schema: crate::Digest,
+    /// Integrity digest over all checkpoint state bytes.
+    pub state_digest: crate::Digest,
+    /// Bounded logical state size, independently checked by the storage adapter.
+    pub state_bytes: u64,
+    /// Maximum bytes in each immutable source chunk.
+    pub chunk_bytes: u32,
+}
+
+impl CheckpointAnchor {
+    /// Validate coordinates; bytes and canonical state require separate checks.
+    pub fn validate(self, committed: Prefix) -> Result<(), RecoveryError> {
+        if !crate::view_change::valid_prefix(self.predecessor)
+            || !crate::view_change::valid_prefix(self.position)
+            || self.position.op.0 == 0
+            || self.predecessor.op > self.position.op
+            || self.position.op > committed.op
+            || (self.predecessor.op == self.position.op && self.predecessor != self.position)
+            || (self.position.op == committed.op && self.position != committed)
+            || self.schema == crate::Digest::ZERO
+            || self.state_digest == crate::Digest::ZERO
+            || self.state_bytes == 0
+            || self.chunk_bytes == 0
+        {
+            return Err(RecoveryError::InvalidResponse);
+        }
+        Ok(())
+    }
 }
 
 /// Fresh response from an authenticated normal replica, not a durable vote.
@@ -60,6 +100,7 @@ impl NormalReplica {
                 generation: snapshot.journal.generation,
                 accepted: snapshot.accepted,
                 committed: snapshot.committed,
+                checkpoint: None,
             }),
         })
     }
@@ -68,6 +109,7 @@ impl NormalReplica {
 /// Quorum-authorized full-history transfer. No voting or storage-completion proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecoveryTicket {
+    checkpoint: Option<CheckpointAnchor>,
     local: NodeId,
     generation: JournalGeneration,
     nonce: RequestId,
@@ -78,6 +120,11 @@ pub struct RecoveryTicket {
 }
 
 impl RecoveryTicket {
+    /// Pinned state/retained-chain source authorized by the recovery quorum.
+    pub const fn checkpoint(self) -> Option<CheckpointAnchor> {
+        self.checkpoint
+    }
+
     /// Existing fixed voter being recovered, never a new membership entry.
     pub const fn local(self) -> NodeId {
         self.local
@@ -127,6 +174,7 @@ pub struct Recovery {
 struct Transfer {
     ticket: RecoveryTicket,
     through: Prefix,
+    checkpoint_ready: bool,
 }
 
 impl Recovery {
@@ -195,6 +243,9 @@ impl Recovery {
         {
             return Err(RecoveryError::InvalidResponse);
         }
+        if let Some(anchor) = response.primary.and_then(|log| log.checkpoint) {
+            anchor.validate(response.primary.expect("checkpoint primary").committed)?;
+        }
         if let Some(previous) = self.responses[voter] {
             if response.scope.view < previous.scope.view {
                 return Ok(());
@@ -256,6 +307,7 @@ impl Recovery {
             return Err(RecoveryError::InvalidIdentity);
         }
         let ticket = RecoveryTicket {
+            checkpoint: log.checkpoint,
             local: self.configuration.voters()[self.local],
             generation: self.generation,
             nonce: self.nonce,
@@ -270,7 +322,10 @@ impl Recovery {
         };
         self.pending = Some(Transfer {
             ticket,
-            through: Prefix::GENESIS,
+            through: log
+                .checkpoint
+                .map_or(Prefix::GENESIS, |anchor| anchor.predecessor),
+            checkpoint_ready: log.checkpoint.is_none(),
         });
         Ok(ticket)
     }

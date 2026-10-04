@@ -37,14 +37,18 @@ impl Journal {
         )
     }
 
-    /// Validate an exact earlier boundary without exposing later operations in
-    /// its enclosing physical group. The whole captured group is still checked.
+    /// Validate an exact durable boundary while later writes remain unsynchronized.
+    /// Later operations stay outside the response; their physical source group
+    /// is still checked. Capture does not advance durability evidence.
     pub async fn freeze_history_through(
         &self,
         through: LogPosition,
         max_segment_bytes: usize,
     ) -> Result<AsyncJournalHistory, HistoryError> {
-        self.freeze_history(max_segment_bytes)?
+        if through.op_number >= self.writer.durable_position().next_chain().next_op_number() {
+            return Err(HistoryError::Unsettled);
+        }
+        self.freeze_written_history(max_segment_bytes)?
             .restrict(through)
             .await
     }

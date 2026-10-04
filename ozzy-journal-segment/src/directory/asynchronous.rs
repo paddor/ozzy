@@ -31,7 +31,7 @@ mod roll;
 mod snapshot;
 mod suffix;
 pub use retention::{RetirementBudget, SegmentFiles};
-pub use suffix::Installer;
+pub use suffix::{CanonicalCheckpointImport, CheckpointRecovery, Installer};
 #[cfg(test)]
 mod tests;
 
@@ -104,6 +104,11 @@ impl Journal {
     pub fn root(&self) -> &Path {
         self.directory.root()
     }
+    /// Clone the existing backend lane for an explicitly fenced owner transition.
+    pub fn backend(&self) -> ozzy_io::Local {
+        self.access.io.clone()
+    }
+
     /// Exact validated metadata manifest held by this object.
     pub const fn manifest(&self) -> &Manifest {
         &self.manifest

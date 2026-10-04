@@ -1,5 +1,6 @@
 use super::*;
 mod bounds;
+mod checkpoint_transfer;
 mod crashes;
 use crate::{
     SuffixReplacement, SuffixReplacementError as Error, SuffixStreamLimits,
@@ -96,7 +97,7 @@ pub(super) async fn check_real_suffix(journal: Journal) -> Journal {
         .await
         .unwrap();
     installer.append_chunk(&[selected]).await.unwrap();
-    let journal = installer.finish().await.unwrap();
+    let journal = Box::pin(installer.finish()).await.unwrap();
     assert_eq!(journal.accepted_position().unwrap(), accepted);
     assert_eq!(journal.committed_position().unwrap(), protected);
     assert_eq!(journal.manifest.last_normal_view, 2);

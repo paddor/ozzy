@@ -22,6 +22,26 @@ pub(crate) struct Catalog {
 }
 
 impl Catalog {
+    pub(crate) async fn seek(
+        &self,
+        query: crate::SeekQuery,
+        result: &mut ozzy_core::reader::seek::Selection,
+    ) -> Result<(), Error> {
+        let mut budget = crate::cooperative::Budget::default();
+        for source in self.sources.iter() {
+            if source.first_op_number > query.through {
+                continue;
+            }
+            self.with_source(*source, |index| {
+                query.observe_index(index.view(), result);
+                Ok(Some(()))
+            })
+            .await?;
+            budget.charge(4096).await;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn open(
         access: Access,
         directory: PathBuf,

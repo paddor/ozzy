@@ -14,12 +14,14 @@ mod history;
 mod install;
 mod owned;
 pub use owned::{
-    CleanedStorage as OwnedCleanedStorage, CompletedDelivery as OwnedCompletedDelivery,
-    CompletedRead as OwnedCompletedRead, CompletedRecoveryRead as OwnedCompletedRecoveryRead,
-    CompletedReplay as OwnedCompletedReplay, CompletedRoll as OwnedCompletedRoll,
+    CleanedStorage as OwnedCleanedStorage, CompletedCheckpointRead as OwnedCompletedCheckpointRead,
+    CompletedDelivery as OwnedCompletedDelivery, CompletedRead as OwnedCompletedRead,
+    CompletedRecoveryRead as OwnedCompletedRecoveryRead, CompletedReplay as OwnedCompletedReplay,
+    CompletedRoll as OwnedCompletedRoll,
     CompletedStorageValidation as OwnedCompletedStorageValidation,
     CompletedSync as OwnedCompletedSync, CompletedWrite as OwnedCompletedWrite, OwnedConfig,
-    OwnedJournal, PartitionDelivery as OwnedPartitionDelivery, PreparedRead as OwnedPreparedRead,
+    OwnedJournal, PartitionDelivery as OwnedPartitionDelivery,
+    PreparedCheckpointRead as OwnedPreparedCheckpointRead, PreparedRead as OwnedPreparedRead,
     PreparedRecoveryRead as OwnedPreparedRecoveryRead, PreparedReplay as OwnedPreparedReplay,
     PreparedRoll as OwnedPreparedRoll, PreparedStorageValidation as OwnedPreparedStorageValidation,
     PreparedSync as OwnedPreparedSync, PreparedWrite as OwnedPreparedWrite,
@@ -49,10 +51,10 @@ pub use read::{
     PartitionReadCursor, PartitionReadError, PartitionReadLease, PartitionReadLimits, ReadPartition,
 };
 pub use receiving::{
-    PublishedRecovery, ReceivedChunk, RecoveryPlan, RecoveryStartup, RecoveryStorage,
-    ShardRecoveringJournal,
+    CheckpointProgress, PublishedRecovery, ReceivedChunk, RecoveryPlan, RecoveryStartup,
+    RecoveryStorage, ShardRecoveringJournal,
 };
-pub use recovery::PinnedRecovery;
+pub use recovery::{PinnedRecovery, RecoveryCheckpointRead};
 pub use sync::ReadyJournalSync;
 pub use turn::{Turn, TurnResult};
 
@@ -326,12 +328,27 @@ pub enum SubmitError {
 /// Storage lifecycle/action failure. None permits replacement of an existing voter.
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
+    /// Retention summaries violate ordering or configured bounds.
+    #[error(transparent)]
+    RetentionPlan(#[from] ozzy_core::retention::PlanError),
+    /// Immutable checkpoint chunk validation failed.
+    #[error(transparent)]
+    CheckpointBytes(#[from] ozzy_journal_segment::CheckpointError),
+    /// Canonical checkpoint construction or decoding failed.
+    #[error(transparent)]
+    Checkpoint(#[from] ozzy_journal_segment::CanonicalCheckpointError),
+    /// Retained partition floors are invalid.
+    #[error(transparent)]
+    Retention(#[from] ozzy_journal_segment::RetentionError),
     /// Explicit single-broker authority rejected a storage transition.
     #[error(transparent)]
     Local(#[from] ozzy_replication::local::Error),
     /// A normal partition-read rejection, without changing the cursor or journal.
     #[error(transparent)]
     Read(#[from] PartitionReadError),
+    /// Missing or ambiguous application record ID in retained history.
+    #[error(transparent)]
+    Seek(#[from] ozzy_core::reader::seek::SeekError),
     /// Recovery admission, streamed validation, or fenced handoff rejected this evidence.
     #[error(transparent)]
     Recovery(#[from] ozzy_replication::recovery::RecoveryError),
@@ -344,8 +361,8 @@ pub enum JournalError {
     /// Configured group/voter or resource bounds are invalid.
     #[error("invalid replica journal configuration")]
     Configuration,
-    /// Wrong commit policy, missing full-WAL prefix, or unsupported checkpoint state.
-    #[error("journal is outside the supported full-WAL replica profile")]
+    /// Wrong storage policy or an unanchored retained history.
+    #[error("journal is outside the supported storage profile")]
     UnsupportedHistory,
     /// Promise does not name this exact writer, configuration, view, and frozen history.
     #[error("replica promise does not match the live journal")]
@@ -401,4 +418,40 @@ pub enum JournalError {
     /// Selected-history staging/publication failed. Reopen is required.
     #[error(transparent)]
     Installation(#[from] ozzy_journal_segment::SuffixReplacementError),
+}
+
+/// Bounded owner-local retention turn, using the mode's normal proposal path.
+#[derive(Debug)]
+pub struct RetentionTurn {
+    /// Obsolete normal/election source released before checkpoint publication.
+    pub released: Option<ozzy_replication::LogSource>,
+    /// False means the canonical partition policy has no retention limits.
+    pub enabled: bool,
+    /// Retry-floor and trim operations awaiting ordinary confirmation.
+    pub proposal: Option<ProposalBuffer>,
+}
+
+impl ReplicaJournal {
+    /// Plan one sealed segment or retire a previously confirmed prefix.
+    pub fn retention_turn(
+        &mut self,
+        ticket: ozzy_replication::driver::ValidationTicket,
+        seed: ozzy_proto::OperationId,
+        leader: bool,
+    ) -> Result<JournalCompletion<RetentionTurn>, SubmitError> {
+        self.submit(
+            ticket,
+            |ticket, done| commands::Action::Retention {
+                ticket,
+                seed,
+                leader,
+                done,
+            },
+            |action| match action {
+                commands::Action::Retention { ticket, .. } => ticket,
+                _ => unreachable!("preserved retention action"),
+            },
+        )
+        .map_err(|error| error.reason)
+    }
 }

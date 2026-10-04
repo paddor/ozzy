@@ -8,6 +8,7 @@ fn partition() -> PartitionIncarnation {
 
 fn run(first: u64, count: u32, operation: u64, batch: u32) -> ActiveReadRun {
     ActiveReadRun {
+        append_timestamp_millis: 0,
         first_offset: Offset::new(first),
         records: count,
         batch_index: batch,

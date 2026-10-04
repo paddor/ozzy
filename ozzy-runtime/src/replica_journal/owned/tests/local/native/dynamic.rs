@@ -74,6 +74,71 @@ fn trusted_clients_keep_writer_capacity_and_old_io_ownership_separate() {
 }
 
 #[test]
+fn resume_discards_old_unadmitted_frames_before_capturing_next_sequence() {
+    let (mut controller, io) = setup();
+    let mut actor = actor(&mut controller, io, 1);
+    let mut intake = intake_access(
+        &mut actor,
+        NativeAccess::Clients {
+            peers: vec![link(70, 80).binding.peer, link(71, 81).binding.peer],
+            writers: 2,
+        },
+        partition(),
+    );
+    let hint = actor.authority_hint();
+    let old = link(70, 80);
+    let replacement = link(71, 81);
+    let mut output = Vec::new();
+    assert_eq!(
+        intake
+            .receive(
+                &open(hint.authority, old, Mode::Create, None, 41),
+                old,
+                hint
+            )
+            .unwrap(),
+        NativeReceive::Accepted
+    );
+    settle(&mut controller, &mut actor, &mut intake, &mut output);
+    output.clear();
+    let before = actor.snapshot().accepted;
+    assert_eq!(
+        intake
+            .receive(&append(hint.authority, old, 40, 0, 1), old, hint)
+            .unwrap(),
+        NativeReceive::Accepted
+    );
+    assert_eq!(
+        intake
+            .receive(
+                &open(hint.authority, replacement, Mode::Resume, None, 42),
+                replacement,
+                hint
+            )
+            .unwrap(),
+        NativeReceive::Accepted
+    );
+    settle(&mut controller, &mut actor, &mut intake, &mut output);
+    assert_eq!(actor.snapshot().accepted, before);
+    let opened = output
+        .iter()
+        .find_map(|message| producer::decode_opened(packet(message), limits().envelope).ok())
+        .unwrap();
+    assert_eq!(opened.next_sequence, 0);
+    output.clear();
+    assert_eq!(
+        intake
+            .receive(&append(hint.authority, old, 40, 0, 1), old, hint)
+            .unwrap(),
+        NativeReceive::Accepted
+    );
+    settle(&mut controller, &mut actor, &mut intake, &mut output);
+    rejected(&mut output, 3, RetryClass::Permanent);
+    drop(intake);
+    close(&mut controller, actor);
+}
+
+#[test]
 fn full_proposal_queue_keeps_request_for_shard_retry() {
     let (mut controller, io) = setup();
     let mut actor = actor(&mut controller, io, 1);

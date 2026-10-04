@@ -288,25 +288,17 @@ impl Replica {
             Err(error) => panic!("unexpected wire rejection: {error:?}"),
         };
         match message {
+            ReplicaMessage::Checkpoint(_) | ReplicaMessage::HistoryRetired(_) => {
+                panic!("retained recovery is exercised by the real broker harness")
+            }
             ReplicaMessage::Recovery(message) => {
-                self.receive_recovery_request(packet.from, message);
+                self.receive_recovery_request(packet.from, &message);
             }
             ReplicaMessage::Flow(message) => {
                 self.receive_flow(packet.from, message, now, &mut output);
             }
             ReplicaMessage::Control(message) => {
-                let acknowledgment = match message {
-                    Control::PrepareOk { ack, .. } => Some((ack.scope, ack.durable)),
-                    Control::PrepareRetained { ack, .. } => Some((ack.scope, ack.retained)),
-                    _ => None,
-                };
-                if let Some((scope, retained)) = acknowledgment
-                    && self.snapshot().is_some_and(|s| s.scope == scope)
-                    && retained.op.0 as usize <= self.accepted.len()
-                    && prefix(&self.accepted, retained.op.0 as usize) == retained
-                {
-                    self.cursors[packet.from] = retained;
-                }
+                self.acknowledge_cursor(packet.from, &message);
                 self.receive_control(packet.from, message, now);
             }
             ReplicaMessage::Prepare(_) => unreachable!("epoch binding rejects legacy data"),
@@ -373,6 +365,21 @@ impl Replica {
             }
         }
         output
+    }
+
+    fn acknowledge_cursor(&mut self, from: usize, message: &Control) {
+        let acknowledgment = match message {
+            Control::PrepareOk { ack, .. } => Some((ack.scope, ack.durable)),
+            Control::PrepareRetained { ack, .. } => Some((ack.scope, ack.retained)),
+            _ => None,
+        };
+        if let Some((scope, retained)) = acknowledgment
+            && self.snapshot().is_some_and(|s| s.scope == scope)
+            && retained.op.0 as usize <= self.accepted.len()
+            && prefix(&self.accepted, retained.op.0 as usize) == retained
+        {
+            self.cursors[from] = retained;
+        }
     }
 
     pub(super) fn receive_control(&mut self, from: usize, message: Control, now: Duration) {

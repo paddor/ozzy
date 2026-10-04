@@ -23,6 +23,7 @@ const TURN_BYTES: usize = 2 * 1024 * 1024;
 
 pub(super) struct Ingress<'a> {
     pub(super) socket: &'a IdentitySocket,
+    shutdown: &'a crate::Shutdown,
     pub(super) monitor: MonitorStream,
     connections: Connections,
     pub(super) paused: PausedSources,
@@ -30,9 +31,15 @@ pub(super) struct Ingress<'a> {
 }
 
 impl<'a> Ingress<'a> {
-    pub(super) fn new(socket: &'a IdentitySocket, monitor: MonitorStream, bulk: bool) -> Self {
+    pub(super) fn new(
+        socket: &'a IdentitySocket,
+        monitor: MonitorStream,
+        bulk: bool,
+        shutdown: &'a crate::Shutdown,
+    ) -> Self {
         Self {
             socket,
+            shutdown,
             monitor,
             connections: Connections::new(!bulk),
             paused: PausedSources::default(),
@@ -74,6 +81,7 @@ impl<'a> Ingress<'a> {
         // Retain the original receive body for exact-source restoration on Full.
         let identity = receipt
             .identity_bytes()
+            .and_then(ozzy_runtime::transport::native_peer_identity)
             .ok_or_else(|| error("PEER receive lacks an identity"))?;
         let message = Message::with_prefix(identity, body.clone());
         if !self
@@ -112,6 +120,11 @@ impl<'a> Ingress<'a> {
                     Err(error) => Err(failure(error)),
                 }
             }
+            Err(ReceiveError::Dispatch(Rejection::Data(DataPressure::Closed)))
+                if self.shutdown.is_requested() =>
+            {
+                Ok(None)
+            }
             Err(error) if fatal(&error) => Err(failure(error)),
             _ => Ok(None),
         }
@@ -132,7 +145,10 @@ impl<'a> Ingress<'a> {
         let Ok(packet) = ozzy_proto::decode_packet(&frames, service.envelope_limits()) else {
             return Ok(None);
         };
-        let repair = matches!(packet.envelope.opcode, Opcode::PrepareFlow | Opcode::Ops);
+        let repair = matches!(
+            packet.envelope.opcode,
+            Opcode::PrepareFlow | Opcode::Ops | Opcode::SnapshotChunk
+        );
         if self.bulk != (repair || packet.envelope.opcode == Opcode::Append) {
             return Ok(None);
         }
@@ -304,8 +320,7 @@ impl Connections {
         let Some(peer) = info
             .peer_identity
             .as_ref()
-            .and_then(|identity| <[u8; 16]>::try_from(identity.as_ref()).ok())
-            .map(NodeId::from_bytes)
+            .and_then(|identity| ozzy_runtime::transport::decode_peer_identity(identity))
         else {
             return Ok(());
         };

@@ -2,7 +2,6 @@ use super::{
     AsyncGroupJournal, AsyncJournalFormat, CommitMode, Digest, JournalError, JournalGeneration,
     Local, Mode, OwnedConfig, OwnedJournal, SegmentHeader, prefix,
 };
-use ozzy_journal::operation::ChainPosition;
 use ozzy_journal_segment::SegmentWriteMode;
 use ozzy_replication::local::{Configuration, Driver};
 
@@ -74,21 +73,13 @@ impl OwnedJournal {
         )
         .await?;
         let manifest = opening.manifest();
-        if !manifest.durable_evidence
-            || manifest.commit_mode != CommitMode::LocalDurable
-            || manifest.configuration_epoch != config.configuration.scope().configuration_epoch
-            || manifest.promised_view != 0
-            || manifest.last_normal_view != 0
-            || manifest.checkpoint.is_some()
-            || manifest
-                .segments
-                .iter()
-                .any(|segment| segment.capacity > config.limits.io.max_segment_bytes)
-            || manifest
-                .segments
-                .first()
-                .is_none_or(|segment| segment.first_chain != ChainPosition::GENESIS)
-        {
+        super::super::authority::validate_storage_profile(
+            manifest,
+            CommitMode::LocalDurable,
+            config.configuration.scope().configuration_epoch,
+            config.limits.io.max_segment_bytes,
+        )?;
+        if manifest.promised_view != 0 || manifest.last_normal_view != 0 {
             return Err(JournalError::UnsupportedHistory);
         }
         let journal = opening.recover(generation).await?;

@@ -43,6 +43,8 @@ struct Slot {
     payload: Payload,
     delivery: Delivery<Cursor>,
     pending: Option<Message>,
+    resolved_offset: Option<u64>,
+    reply_due: bool,
 }
 
 pub(super) struct SharedReaders {

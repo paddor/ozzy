@@ -207,6 +207,65 @@ impl SegmentIndexView<'_> {
         .map(decode_message_entry)
     }
 
+    /// Oldest/newest matches inside one retained partition range. Binary search
+    /// includes the offset, so even millions of duplicate IDs keep bounded work.
+    pub fn message_offsets(
+        &self,
+        partition: PartitionIncarnation,
+        id: MessageId,
+        floor: Offset,
+        end: Offset,
+    ) -> Option<(Offset, Offset)> {
+        let rows = self.messages.as_chunks::<MESSAGE_INDEX_ENTRY_BYTES>().0;
+        let before = |row: &[u8], offset: Offset| {
+            compare_message_key(row, partition, id)
+                .then_with(|| read_u64(row, 32).cmp(&offset.get()))
+                .is_lt()
+        };
+        let first = rows.partition_point(|row| before(row, floor));
+        let after = rows.partition_point(|row| before(row, end));
+        let matching = rows.get(first..after)?.split_first()?;
+        if compare_message_key(matching.0, partition, id) != Ordering::Equal {
+            return None;
+        }
+        Some((
+            Offset::new(read_u64(matching.0, 32)),
+            Offset::new(read_u64(matching.1.last().unwrap_or(matching.0), 32)),
+        ))
+    }
+
+    /// Sparse APPEND timestamps live on batch-head offset rows. Payloads remain
+    /// unopened; nonmonotonic clocks are resolved in record-offset order.
+    pub fn timestamp_offset(
+        &self,
+        partition: PartitionIncarnation,
+        timestamp: u64,
+        floor: Offset,
+        end: Offset,
+        through: u64,
+    ) -> Option<Offset> {
+        let at_floor = self.find_offset(partition, floor);
+        self.offsets()
+            .filter(|entry| {
+                entry.partition == partition
+                    && entry.location.record_index == 0
+                    && entry.append_timestamp_millis >= timestamp
+                    && entry.location.operation.op_number <= through
+                    && entry.offset < end
+            })
+            .find_map(|head| {
+                if head.offset >= floor {
+                    return Some(head.offset);
+                }
+                at_floor
+                    .filter(|entry| {
+                        entry.location.operation == head.location.operation
+                            && entry.location.batch_index == head.location.batch_index
+                    })
+                    .map(|_| floor)
+            })
+    }
+
     /// Look up an exact canonical control-operation identity.
     pub fn find_operation(&self, operation_id: OperationId) -> Option<OperationIndexEntry> {
         binary_search_section(self.operations, OPERATION_INDEX_ENTRY_BYTES, |entry| {
@@ -452,6 +511,9 @@ fn image_checks(
             "operation",
         ))
         .chain(image.offsets.iter().map(|entry| {
+            if entry.location.record_index != 0 && entry.append_timestamp_millis != 0 {
+                return Err(IndexFileError::NonZeroReserved);
+            }
             validate_location(image.source, entry.location.operation)?;
             Ok(OFFSET_INDEX_ENTRY_BYTES)
         }))
@@ -518,7 +580,9 @@ fn section_checks(
                 .0
                 .iter()
                 .map(move |entry| {
-                    require_zero(entry, 88..96)?;
+                    if read_u32(entry, 84) != 0 {
+                        require_zero(entry, 88..96)?;
+                    }
                     validate_location(
                         source,
                         decode_offset_entry(entry, source.segment_id)
@@ -635,12 +699,14 @@ pub(crate) fn encode_offset_entry(entry: &OffsetIndexEntry, output: &mut [u8]) {
     encode_location(entry.location.operation, output, 24);
     put_u32(output, 80, entry.location.batch_index);
     put_u32(output, 84, entry.location.record_index);
+    put_u64(output, 88, entry.append_timestamp_millis);
 }
 
 fn decode_offset_entry(input: &[u8], segment_id: u64) -> OffsetIndexEntry {
     OffsetIndexEntry {
         partition: PartitionIncarnation::from_bytes(array_16_unchecked(input, 0)),
         offset: Offset::new(read_u64(input, 16)),
+        append_timestamp_millis: read_u64(input, 88),
         location: RecordLocation {
             operation: decode_location(input, 24, segment_id),
             batch_index: read_u32(input, 80),

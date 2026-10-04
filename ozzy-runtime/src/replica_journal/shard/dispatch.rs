@@ -17,6 +17,31 @@ pub(super) async fn run(
     } = command;
     let mut job = None;
     let failed = match action {
+        Action::Retention {
+            ticket,
+            seed,
+            leader,
+            done,
+        } => finish_read(
+            done,
+            state
+                .owner
+                .retention_turn(ticket, timestamp, seed, leader)
+                .await,
+            permit,
+        ),
+        Action::Seek {
+            ticket,
+            partition,
+            start,
+            done,
+        } => match state.owner.prepare_seek(ticket, partition, start).await {
+            Ok(prepared) => {
+                job = Some(super::jobs::seek(prepared, done, permit));
+                false
+            }
+            Err(error) => finish_read(done, Err(error), permit),
+        },
         Action::Promise { ticket, done } => {
             finish(done, state.owner.persist_promise(ticket).await, permit)
         }
@@ -180,6 +205,15 @@ pub(super) async fn run(
         Action::Recovery(action) => {
             use crate::replica_journal::recovery::RecoveryAction;
             match action {
+                RecoveryAction::Checkpoint { pin, request, done } => {
+                    match state.owner.prepare_checkpoint_read(pin, request) {
+                        Ok(work) => {
+                            job = Some(super::jobs::checkpoint(work, done, permit));
+                            false
+                        }
+                        Err(error) => finish_read(done, Err(error), permit),
+                    }
+                }
                 RecoveryAction::Pin {
                     requester,
                     response,

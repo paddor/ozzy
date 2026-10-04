@@ -5,6 +5,7 @@ use omq_tokio::proto::{
     frame,
 };
 use omq_tokio::{Frame, FrameFlags, SocketType, message::Payload};
+mod identity;
 
 fn ready(limit: usize) -> Connection {
     let mut connection = Connection::new(
@@ -95,7 +96,7 @@ fn configured_payload_and_metadata_fit_with_framing() {
     };
     let limit = message_size_limit(limits).unwrap();
     let message = omq_tokio::Message::multipart([
-        Bytes::from_static(&[1; 16]),
+        peer_identity(NodeId::from_bytes([0; 16])),
         Bytes::from_static(&[0; ozzy_proto::ENVELOPE_BYTES]),
         Bytes::from(vec![0; limits.max_metadata_bytes]),
         Bytes::from(vec![0; limits.max_payload_bytes]),

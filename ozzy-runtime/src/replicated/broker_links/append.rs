@@ -530,7 +530,7 @@ impl Connection {
             } else {
                 let broker = self.broker.expect("selected broker");
                 tokio::select! {
-                    () = self.links.0.peers[&broker].data.wait_send_progress_for(message) => {},
+                    () = crate::transport::wait_send_peer(&self.links.0.peers[&broker].data, message) => {},
                     () = self.links.0.shared.changed.changed_after(links) => {},
                     () = self.links.0.shared.stop.closed() => {},
                 }

@@ -23,6 +23,11 @@ pub(super) async fn build(
             .filter(|partition| partition.placement.shard == shard.plan.id)
         {
             let (policy, _, group) = profile(&plan.config);
+            if policy != ozzy_proto::append::Policy::LocalDurable {
+                // Normal copies can withdraw after falling below retained
+                // history. Keep their service recipe for every later rejoin.
+                recoveries.insert(group, plan.clone());
+            }
             if let Some(&intent) = journals.recovery.get(&group) {
                 let mut actor = open_recovery(shard, plan, intent).await?;
                 if let Err(error) = actor.bind_receive_owner(&shard.memory.replica) {
@@ -31,7 +36,6 @@ pub(super) async fn build(
                 }
                 identities.push((group, plan.incarnation));
                 bootstrap.push(None);
-                recoveries.insert(group, plan.clone());
                 actors.push(actor);
                 continue;
             }

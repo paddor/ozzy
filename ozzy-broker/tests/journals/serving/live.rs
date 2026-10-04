@@ -31,7 +31,7 @@ pub(super) async fn check(
             sdk.clone(),
             "orders",
             TopicReaderConfig {
-                checkpoint: Some(checkpoint.clone()),
+                start: ozzy_runtime::replicated::ReaderStart::Checkpoint(checkpoint.clone()),
                 ..TopicReaderConfig::default()
             },
         ),
@@ -428,7 +428,7 @@ async fn publication_stream(
             sdk.clone(),
             "orders",
             TopicReaderConfig {
-                checkpoint: Some(TopicCheckpoint {
+                start: ozzy_runtime::replicated::ReaderStart::Checkpoint(TopicCheckpoint {
                     topic: writer.metadata().id(),
                     positions: vec![(0, ozzy_proto::Offset::new(range.start))],
                 }),

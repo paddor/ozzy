@@ -358,6 +358,16 @@ impl NativeIntake {
         {
             return Err((5, RetryClass::AfterAuthorityRefresh));
         }
+        if packet.envelope.opcode == Opcode::OpenProducer {
+            self.writers.attach(
+                link,
+                writer,
+                &self.slots,
+                self.config.requests_per_writer + 1,
+            );
+        } else if self.writers.revoked(link.binding.peer, writer) {
+            return Err((3, RetryClass::Permanent));
+        }
         Ok(self.writers.select(
             link,
             writer,

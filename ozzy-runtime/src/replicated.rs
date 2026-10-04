@@ -15,8 +15,8 @@ pub(crate) mod payload;
 mod topic_reader;
 mod topic_writer;
 pub use topic_reader::{
-    ReaderError, TopicCheckpoint, TopicReader, TopicReaderConfig, TopicReaderError,
-    TopicReaderStats, TopicRecord,
+    IdPolicy, ReaderError, ReaderStart, TopicCheckpoint, TopicReader, TopicReaderConfig,
+    TopicReaderError, TopicReaderStats, TopicRecord,
 };
 mod writer;
 
@@ -28,8 +28,8 @@ use ozzy_proto::{NodeId, ProducerId};
 pub use ozzy_replication::Configuration;
 pub use retry::RetryPolicy;
 pub use topic_writer::{
-    SharedTopicPendingRecord, SharedTopicReceipt, SharedTopicWriter, SharedTopicWriterConfig,
-    TopicWriterError,
+    ProducerIdentity, SharedTopicPendingRecord, SharedTopicReceipt, SharedTopicWriter,
+    SharedTopicWriterConfig, TopicWriterError,
 };
 pub use writer::{
     MAX_APPEND_RECORDS, MAX_SEQUENCE, PAYLOAD_COMPRESSION_THRESHOLD, PendingRecord, RecordInput,

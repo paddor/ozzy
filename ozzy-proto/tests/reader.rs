@@ -1006,7 +1006,7 @@ fn subscribe_fixed_bytes_and_all_truncations() {
                 topic: topic.clone(),
                 partition: PartitionId::ZERO,
             },
-            start: 9,
+            start: ozzy_proto::reader::Start::Offset(9),
         },
         &mut bytes,
         limits,
@@ -1015,7 +1015,7 @@ fn subscribe_fixed_bytes_and_all_truncations() {
     let mut golden = vec![4; 16];
     golden.extend_from_slice(&5_u128.to_be_bytes());
     golden.push(0);
-    golden.extend_from_slice(b"\0\0\0\x01s\0\0\0\x01t\0\0\0\0\0\0\0\0\0\0\0\x09");
+    golden.extend_from_slice(b"\0\0\0\x01s\0\0\0\x01t\0\0\0\0\x02\0\0\0\0\0\0\0\x09");
     assert_eq!(bytes, golden);
     assert_eq!(header[4], 1);
     let decoded = reader::decode_subscribe(
@@ -1031,7 +1031,7 @@ fn subscribe_fixed_bytes_and_all_truncations() {
             partition: PartitionId::ZERO
         }
     );
-    assert_eq!(decoded.start, 9);
+    assert_eq!(decoded.start, ozzy_proto::reader::Start::Offset(9));
     for n in 0..bytes.len() {
         assert!(reader::decode_subscribe(packet(e, &bytes[..n]), limits).is_err());
     }
@@ -1064,19 +1064,20 @@ fn group_subscription_credit_and_cancellation_are_fenced_and_exact() {
             partition,
             owner_epoch,
         },
-        start: 42,
+        start: ozzy_proto::reader::Start::Offset(42),
     };
     let mut bytes = Vec::with_capacity(1024);
     let e = envelope(Opcode::Subscribe, false);
     reader::encode_subscribe(e, &request, &mut bytes, limits).unwrap();
-    assert_eq!(bytes.len(), 97);
+    assert_eq!(bytes.len(), 98);
     let decoded = reader::decode_subscribe(packet(e, &bytes), limits).unwrap();
     assert_eq!(decoded.target, request.target);
-    assert_eq!(decoded.start, 42);
+    assert_eq!(decoded.start, ozzy_proto::reader::Start::Offset(42));
     for n in 0..bytes.len() {
         assert!(reader::decode_subscribe(packet(e, &bytes[..n]), limits).is_err());
     }
     let selected = Subscribed {
+        resolved_offset: 0,
         subscription: subscription(),
         source,
     };
@@ -1101,6 +1102,7 @@ fn both_sources_and_independent_receipt_processing_positions_roundtrip() {
         let mut bytes = Vec::with_capacity(1024);
         let e = envelope(Opcode::Subscribed, true);
         let v = Subscribed {
+            resolved_offset: 0,
             subscription: subscription(),
             source,
         };

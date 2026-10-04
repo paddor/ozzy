@@ -414,7 +414,7 @@ impl ReplicaOutbox {
 
 async fn wait_for(socket: &IdentitySocket, message: Option<&Message>) {
     match message {
-        Some(message) => socket.wait_send_progress_for(message).await,
+        Some(message) => crate::transport::wait_send_peer(socket, message).await,
         None => pending().await,
     }
 }

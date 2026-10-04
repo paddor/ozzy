@@ -9,6 +9,7 @@ use ozzy_proto::{TopicId, directory};
 use std::{collections::BTreeSet, future::Future, pin::pin, task::Poll};
 
 mod appends;
+mod metadata;
 mod multiple;
 mod opening;
 mod readers;
@@ -27,6 +28,8 @@ struct ReaderTraffic {
     unroutable_records: usize,
     records: std::collections::VecDeque<Message>,
     drop_subscribed: bool,
+    drop_unsubscribed: usize,
+    unsubscribed: usize,
     requests: Vec<(Opcode, ozzy_proto::reader::Subscription)>,
     block_failures: bool,
     failures: BTreeSet<RequestId>,
@@ -53,6 +56,7 @@ struct Harness {
     held_io: BTreeSet<ozzy_io::simulation::JobId>,
     watch: Option<RequestId>,
     drop_snapshots: bool,
+    metadata: metadata::Traffic,
     snapshots: usize,
     drop_opened: Option<ProducerId>,
     defer_openings: bool,
@@ -125,6 +129,9 @@ impl Harness {
     }
 
     fn pump(&mut self, settle: bool) {
+        if let Some(peer) = &mut self.metadata.peer {
+            peer.pump();
+        }
         self.receive_ready();
         self.dispatch_ready();
         let _ = self.actors.poll_progress(
@@ -194,8 +201,26 @@ impl Harness {
         self.service
             .flush(|message| {
                 let decoded = packet(&message);
+                if decoded.envelope.opcode == Opcode::StateSnapshot
+                    && decoded.metadata.first() == Some(&0)
+                    && self.metadata.hold
+                {
+                    // Keep one late response; subsequent lost responses do
+                    // not accumulate backing outside the fixture's bound.
+                    if self.metadata.held.is_empty() {
+                        self.metadata.held.push(message);
+                    }
+                    return Ok(());
+                }
                 if decoded.envelope.opcode == Opcode::Subscribed && self.readers.drop_subscribed {
                     return Ok(());
+                }
+                if decoded.envelope.opcode == Opcode::Unsubscribed {
+                    self.readers.unsubscribed += 1;
+                    if self.readers.drop_unsubscribed != 0 {
+                        self.readers.drop_unsubscribed -= 1;
+                        return Ok(());
+                    }
                 }
                 if decoded.envelope.opcode == Opcode::Records && self.readers.unroutable_records > 0
                 {
@@ -432,6 +457,9 @@ impl Harness {
         self.server.close().await.unwrap();
         self.data_server.close().await.unwrap();
         self.publisher.close().await.unwrap();
+        if let Some(peer) = self.metadata.peer {
+            peer.server.close().await.unwrap();
+        }
     }
 
     async fn drive<F: Future>(&mut self, future: F, settle: bool) -> F::Output {
@@ -512,7 +540,7 @@ fn config(local: NodeId, addresses: Vec<BrokerAddress>, clock: SdkClock) -> Brok
 
 #[tokio::test(flavor = "current_thread")]
 async fn shared_broker_links_open_independent_writers_without_waiting_for_unavailable_brokers() {
-    tokio::time::timeout(Duration::from_secs(10), scenario())
+    tokio::time::timeout(Duration::from_secs(10), Box::pin(scenario()))
         .await
         .unwrap();
 }
@@ -550,11 +578,31 @@ async fn setup_shared_partitions(
     setup_shared_profile(writers, count, None).await
 }
 
-#[allow(clippy::too_many_lines)]
 async fn setup_shared_profile(
     writers: &[u8],
     count: usize,
     reader_window: Option<(u64, u64, usize)>,
+) -> (
+    Harness,
+    BrokerLinks,
+    SdkClock,
+    ozzy_proto::nack::AuthorityHint,
+) {
+    Box::pin(setup_shared_directory_profile(
+        writers,
+        count,
+        reader_window,
+        false,
+    ))
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn setup_shared_directory_profile(
+    writers: &[u8],
+    count: usize,
+    reader_window: Option<(u64, u64, usize)>,
+    alternate_metadata: bool,
 ) -> (
     Harness,
     BrokerLinks,
@@ -656,13 +704,13 @@ async fn setup_shared_profile(
         )
         .await
         .unwrap();
+    let catalog = multiple::catalog(authority, &groups, &endpoint, &publications);
     service
-        .install_catalog(multiple::catalog(
-            authority,
-            &groups,
-            &endpoint,
-            &publications,
-        ))
+        .install_catalog(if alternate_metadata {
+            metadata::paginate(&catalog, count)
+        } else {
+            catalog
+        })
         .unwrap();
     let mut actors = PartitionActors::new(partitions, count, 1).unwrap();
     for native in native {
@@ -705,6 +753,30 @@ async fn setup_shared_profile(
                 .unwrap(),
         });
     }
+    let metadata_peer = if alternate_metadata {
+        let address = &addresses[1];
+        let (mut service, input) = multiple::service(address.node, &groups, &data, &control, wire);
+        service
+            .install_catalog(metadata::paginate(
+                &multiple::catalog(authority, &groups, &addresses[0].endpoint, &publications),
+                count,
+            ))
+            .unwrap();
+        let server = runtime.context().socket(
+            SocketType::Peer,
+            Options::default()
+                .identity(Bytes::copy_from_slice(address.node.as_bytes()))
+                .router_mandatory(true)
+                .send_hwm(16)
+                .recv_hwm(16)
+                .max_message_size(8192),
+        );
+        let peer = Box::new(metadata::Peer::new(service, input, server));
+        peer.server.bind(address.endpoint.clone()).await.unwrap();
+        Some(peer)
+    } else {
+        None
+    };
     let clock = SdkClock::manual();
     let mut options = config(link(70, 80).binding.peer, addresses, clock.clone());
     // Four logical owners must fit even when each allows two caller handles.
@@ -766,6 +838,10 @@ async fn setup_shared_profile(
         held_io: BTreeSet::new(),
         watch: None,
         drop_snapshots: false,
+        metadata: metadata::Traffic {
+            peer: metadata_peer,
+            ..metadata::Traffic::default()
+        },
         snapshots: 0,
         drop_opened: None,
         defer_openings: false,

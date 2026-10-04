@@ -379,7 +379,7 @@ Procedure and commands: [disk calibration](../ozzy-bench/README.md#disk-calibrat
 | `MEMORY_VOTING` | Clean-stop evidence for replicated-persisting groups |
 | `segments/` | Record and metadata operations |
 | `indexes/` | Rebuildable lookup files |
-| `checkpoints/` | State plus required retained records |
+| `checkpoints/` | Canonical state and its original chain anchor |
 | `staging/` | Unselected replacement/build work |
 
 Metadata reaches a hidden temporary first, then its final name. An interrupted
@@ -524,8 +524,9 @@ within the budget; preexisting sealed history remains cold until later rolls.
   Missing/stale indexes rebuild from exact protected sources. A cold lookup may
   search several segments. Blocking inspection APIs may build indexes
   synchronously; the shard path below uses backend futures.
-- Native subscriptions seek by offset. Journal message-ID lookup exists;
-  timestamp lookup and native ID/time seek do not.
+- Native subscriptions resolve earliest/latest, offsets, broker append time, or
+  record ID. A sparse timestamp is stored at each APPEND head. ID lookup searches
+  every retained segment; duplicates require an explicit selection policy.
 - Index exhaustion requests roll or backpressure; never discard retry state.
 
 The shard-owned async path uses `AsyncJournalPartitionIndex`. Capture does no
@@ -546,20 +547,53 @@ are small. Cold repair checks those indexes against the
 captured source identity before searching files. Repeated pages reuse the selected
 index; payload reads still validate each selected operation.
 
+An addressed history fetch can select an older durable boundary while later
+writes remain unsynchronized. Capture checks that boundary against the durable
+watermark and verifies its exact operation digest inside the complete physical
+source. Later operations remain outside the reply. This read grants no new
+durability evidence; capturing the whole stable tail still requires synchronization.
+
 ### Checkpoints and deletion
 
-A checkpoint contains canonical state, producer/retry state, progress, trim
-floors, required records and an exact committed anchor. Sync before selecting it.
-Metadata alone cannot replace payloads still needed by readers or retries.
+On coordinated restart, a changed configured retention policy becomes a
+canonical `PartitionPolicy` operation. Repeated initialization waits for that
+policy to be applied before confirming it; an existing partition alone does
+not confirm an accepted policy change. Other partition identity changes fail.
 
-Logical trim comes before deletion. Delete only unselected files below all
-replay/retry/recovery floors after temporary deletion protection releases.
-Quota pressure stops admission; it never deletes the sole required copy.
-Readers below an expired retention floor receive an explicit gap.
+A checkpoint stores canonical state, producer epochs/sequences, retry floors,
+and the original committed operation/digest. It contains no record payloads.
+The selected segments keep every record still needed for replay or exact retries.
 
-Disk groups currently require full history and reject checkpoint-based restart.
-Checkpoint transfer and incremental checkpoint construction remain unfinished;
-do not enable local sealed-prefix retirement for disk groups.
+Retention confirms producer retry floors before confirming the record trim.
+It then syncs and selects a checkpoint before unreferencing an oldest sealed
+prefix. Bounded retirement may need several passes without a new operation.
+Those passes reuse the selected checkpoint only when its operation number and
+digest exactly match the settled confirmed image. They still revalidate selected
+authority, checkpoint files, segment bodies, and committed floors; a new
+checkpoint must advance its position. The surviving segment keeps its original
+predecessor digest. No chain is renumbered or rehashed; XXH3 is an integrity
+checksum, not cryptographic proof.
+Captured reads and donor snapshots delay physical deletion. Readers below the
+confirmed floor receive a retention gap.
+
+Age uses the maximum broker append time in each segment, so a backward clock
+cannot make newer records expire early. An aged active segment rolls first.
+Byte targets include active and sealed capacities, independently per partition
+and broker. Maintenance visits bounded prefixes between settled write batches.
+Each settled retention turn also reclaims up to eight unselected objects in
+each class: segments, checkpoints, indexes, and metadata. This runs while the
+selected log remains below its retention limit. Selection and capture pins still
+protect required files; cleanup advances no record or producer retry floor.
+
+Recovery transfers checkpoint state, required retained operations, and the full
+accepted suffix over PEER. State bytes, schema, original anchor, operation chain,
+and destination-local publication all validate before voting resumes. Interrupted
+publication leaves the old selection or a complete nonvoting replacement.
+Full quarantine recovery starts a fresh empty private generation with no selected
+checkpoint. It preserves the old checkpoint and segment files for inspection;
+fresh recovery authority must supply replacement state and retained history.
+After normal service resumes, enabled retention maintenance may reclaim those
+unselected files under the same selection and capture-pin checks.
 
 ### Bounded maintenance
 

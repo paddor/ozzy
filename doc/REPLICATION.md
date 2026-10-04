@@ -381,8 +381,8 @@ configuration, view, source incarnation/generation, full accepted tail, and
 committed anchor. Capture all accepted operations: a delayed pre-crash vote
 can still confirm work beyond the announced commit floor.
 
-Full replacement transfers from genesis in bounded correlated FETCH_OPS/OPS
-chunks. Verify request, donor, predecessor, count/bytes, canonical hashes/schema,
+Full replacement uses genesis or a validated checkpoint anchor, followed by
+bounded correlated FETCH_OPS/OPS chunks. Verify request, donor, predecessor, count/bytes, canonical hashes/schema,
 and application state before exposing anything. Freeze one exact snapshot per
 attempt; don't combine
 chunks from changing source generations. New authority supersedes the attempt,
@@ -451,14 +451,56 @@ proof of its sender's authority: readers accept only the source that their own
 subscription confirmed, and repair every gap by replay. See
 [RUNTIME.md](RUNTIME.md#live-reader-publication).
 
-Checkpoint-based transfer, online membership, partition movement, arbitrary
-corruption repair, and legacy `Node` replicated integration are separate work.
-The selected `Broker` already runs both cluster modes.
-Storage checkpoint primitives and reserved wire opcodes do not
-enable these services. Movement must fence the source before destination
+Online membership, partition movement, arbitrary corruption repair, and legacy
+`Node` replicated integration are separate work. The selected `Broker` runs both
+cluster modes, including checkpoint recovery after retention.
+Movement must fence the source before destination
 activation; a directory update alone cannot transfer ownership.
 
 Use [Validation](VALIDATION.md) for production-core schedules, process faults,
 and cross-host checks. Passing a finite simulation or happy-path test does not
 prove complete consensus safety, power-loss behavior, or arbitrary host-loss
 availability.
+
+### Retained history and restart
+
+A restarting retained topic briefly asks existing normal copies for their
+retained boundary before sending election reports. Two matching normal replies
+can show that its local accepted prefix has expired. It then persists a
+nonvoting marker and follows ordinary checkpoint recovery. The replies grant
+no authority. Without replies, the bounded probe ends and ordinary election
+continues.
+
+During a full-cluster restart, an ancient replica can report a protected prefix
+below another replica's retained boundary. Missing ancestry stays missing; it
+neither faults that intact donor nor withdraws a requester whose own accepted
+history still reaches the boundary. The ordinary election deadline advances
+without selecting that unverified history. When the ancient replica requests
+the newer lineage, its expired local tail withdraws into nonvoting recovery.
+Quorum membership and all protected-prefix checks remain unchanged.
+
+Checkpoint recovery verifies private state first, then every required retained
+operation and the complete accepted suffix. The original committed anchor
+stays distinct from that suffix. The destination publishes its own store-bound
+checkpoint and segments before rejoining through a fresh election fence.
+If the retained predecessor already equals the source's accepted tail, verified
+checkpoint state completes the transfer without requesting an empty OPS chunk.
+
+```mermaid
+sequenceDiagram
+    participant L as Leader shard
+    participant J as Journal owner
+    participant D as Disk backend
+    participant F as Lagging follower
+    L->>J: Confirm producer retry floors, then trim
+    J->>D: Sync checkpoint state and kept segments
+    J->>D: Select checkpoint; retire sealed prefix
+    F->>L: PEER control: RECOVERY, fresh nonce
+    L-->>F: PEER control: state descriptor and original anchor
+    F->>L: PEER control: bounded state range
+    L-->>F: PEER data: checkpoint bytes
+    F->>F: Validate private state
+    F->>L: PEER data: FETCH_OPS
+    L-->>F: PEER data: kept records and accepted tail
+    F->>F: Validate chain; publish locally; election fence
+```

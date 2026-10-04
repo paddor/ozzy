@@ -24,6 +24,7 @@ struct ActiveReadRun {
     operation: OperationLocation,
     batch_index: u32,
     first_record_index: u32,
+    append_timestamp_millis: u64,
 }
 
 impl ActiveReadRun {
@@ -45,6 +46,11 @@ impl ActiveReadRun {
         Some(OffsetIndexEntry {
             partition,
             offset,
+            append_timestamp_millis: if record_index == 0 {
+                self.append_timestamp_millis
+            } else {
+                0
+            },
             location: RecordLocation {
                 operation: self.operation,
                 batch_index: self.batch_index,
@@ -64,6 +70,14 @@ pub(crate) struct ActiveReadIndex {
 }
 
 impl ActiveReadIndex {
+    pub(crate) fn newest_append_millis(&self, partition: PartitionIncarnation) -> Option<u64> {
+        self.partitions
+            .get(&partition)?
+            .iter()
+            .map(|run| run.append_timestamp_millis)
+            .max()
+    }
+
     pub(crate) async fn from_persisted_async(
         persisted: &crate::SegmentIndex,
     ) -> Result<Self, ActiveReadIndexError> {
@@ -329,6 +343,7 @@ impl ActiveReadIndex {
                         operation: *location,
                         batch_index,
                         first_record_index: 0,
+                        append_timestamp_millis: batch.append_timestamp_millis,
                     },
                 )?;
             }
@@ -345,6 +360,7 @@ impl ActiveReadIndex {
             operation: entry.location.operation,
             batch_index: entry.location.batch_index,
             first_record_index: entry.location.record_index,
+            append_timestamp_millis: entry.append_timestamp_millis,
         };
         self.push_run(entry.partition, run)?;
         self.records = self

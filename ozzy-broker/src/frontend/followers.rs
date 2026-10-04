@@ -95,9 +95,11 @@ impl Followers {
                     .context
                     .socket(
                         SocketType::Peer,
-                        options.clone().identity(Bytes::copy_from_slice(
-                            FollowerRoutes::identity(frontend.local, broker, shard).as_bytes(),
-                        )),
+                        options
+                            .clone()
+                            .identity(ozzy_runtime::transport::peer_identity(
+                                FollowerRoutes::identity(frontend.local, broker, shard),
+                            )),
                     )
                     .identity_routing()?;
                 transport.repair.insert((broker, shard), socket.clone());
@@ -144,7 +146,10 @@ impl Followers {
             },
         )
         .ok()?;
-        if !matches!(packet.envelope.opcode, Opcode::PrepareFlow | Opcode::Ops) {
+        if !matches!(
+            packet.envelope.opcode,
+            Opcode::PrepareFlow | Opcode::Ops | Opcode::SnapshotChunk
+        ) {
             return None;
         }
         let peer = NodeId::from_bytes(message.part_slice(0)?.try_into().ok()?);
@@ -184,7 +189,7 @@ impl Followers {
             .and_then(|key| self.repair.get(&key))
             .unwrap_or(control)
             .clone();
-        Box::pin(async move { socket.wait_send_progress_for(&message).await })
+        Box::pin(async move { ozzy_runtime::transport::wait_send_peer(&socket, &message).await })
     }
 
     pub(super) fn publications(&self) -> Publications {

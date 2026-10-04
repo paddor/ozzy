@@ -1,6 +1,6 @@
 use ahash::AHashMap;
 use ozzy_proto::{
-    Offset, OwnerEpoch, PartitionId, PartitionIncarnation, ProducerEpoch, ProducerId,
+    Offset, OperationId, OwnerEpoch, PartitionId, PartitionIncarnation, ProducerEpoch, ProducerId,
     ProducerSequence,
 };
 
@@ -12,7 +12,7 @@ use super::{
 use crate::state::{CanonicalPartition, CanonicalProducer, PartitionAddress, ProducerResultSpan};
 
 const PARTITION_BYTES: usize = 96;
-const PRODUCER_BYTES: usize = 48;
+const PRODUCER_BYTES: usize = 72;
 const SPAN_BYTES: usize = 24;
 
 pub(super) async fn partition_bytes(
@@ -87,6 +87,15 @@ pub(super) async fn encode_partition(
         put_u64(fixed, 24, producer.next_producer_sequence.get());
         put_u64(fixed, 32, producer.producer_result_floor.get());
         put_u32(fixed, 40, usize_to_u32(producer.results.len())?);
+        if let Some(transition) = producer.transition {
+            put_u32(fixed, 44, 1);
+            fixed[48..64].copy_from_slice(transition.operation_id.as_bytes());
+            put_u64(
+                fixed,
+                64,
+                transition.expected_epoch.map_or(0, ProducerEpoch::get),
+            );
+        }
         cursor += PRODUCER_BYTES;
         step(PRODUCER_BYTES).await;
         for span in &producer.results {
@@ -198,14 +207,27 @@ async fn decode_producer(
     let fixed = input
         .get(start..cursor)
         .ok_or(StateSnapshotError::Truncated)?;
-    if read_u32(fixed, 44) != 0 {
-        return Err(StateSnapshotError::UnsupportedFields);
-    }
+    let transition = match read_u32(fixed, 44) {
+        0 if fixed[48..72] == [0; 24] => None,
+        1 => {
+            let operation_id = OperationId::from_bytes(array_16(fixed, 48));
+            require_nonzero("producer transition", operation_id.as_bytes())?;
+            let expected = read_u64(fixed, 64);
+            Some(crate::state::ProducerTransition {
+                operation_id,
+                expected_epoch: (expected != 0).then_some(ProducerEpoch::new(expected)),
+            })
+        }
+        _ => {
+            return Err(StateSnapshotError::UnsupportedFields);
+        }
+    };
     let id = ProducerId::from_bytes(array_16(fixed, 0));
     require_nonzero("producer", id.as_bytes())?;
     let mut producer = CanonicalProducer::new(ProducerEpoch::new(read_u64(fixed, 16)));
     producer.next_producer_sequence = ProducerSequence::new(read_u64(fixed, 24));
     producer.producer_result_floor = ProducerSequence::new(read_u64(fixed, 32));
+    producer.transition = transition;
     let count = read_u32(fixed, 40) as usize;
     enforce_limit("producer retry spans", count, remaining_spans)?;
     let bytes = count
@@ -265,6 +287,12 @@ async fn validate_producer(
 ) -> Result<(), StateSnapshotError> {
     if producer.producer_epoch.get() == 0
         || producer.producer_result_floor > producer.next_producer_sequence
+        || producer.transition.is_some_and(|transition| {
+            transition.operation_id.as_bytes() == &[0; 16]
+                || transition
+                    .expected_epoch
+                    .is_some_and(|epoch| epoch.get() == 0 || epoch >= producer.producer_epoch)
+        })
     {
         return Err(StateSnapshotError::InvalidPartition);
     }

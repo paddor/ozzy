@@ -65,6 +65,7 @@ impl OwnedJournal {
         op: OpNumber,
     ) -> Result<HistoryPosition, JournalError> {
         self.healthy()?;
+        let retained_predecessor = prefix(self.history(source)?.predecessor());
         let result = self
             .history(source)?
             .position(op.0)
@@ -77,6 +78,7 @@ impl OwnedJournal {
         Ok(HistoryPosition {
             source,
             op,
+            retained_predecessor,
             position: result?.map(prefix),
         })
     }
@@ -99,7 +101,27 @@ impl OwnedJournal {
         {
             return Err(JournalError::HistorySourceMismatch);
         }
-        let result = fetch(self.history(request.source)?, request, buffer, false).await;
+        let result = if self
+            .history
+            .as_ref()
+            .is_some_and(|history| source(history) == request.source)
+        {
+            fetch(self.history(request.source)?, request, buffer, false).await
+        } else {
+            let journal = self.journal.readable()?;
+            if request.source.voter != journal.manifest().identity.replica_node_id
+                || request.source.generation != journal.writer().written_position().generation()
+            {
+                return Err(JournalError::HistorySourceMismatch);
+            }
+            let mut history = journal
+                .freeze_history_through(
+                    position(request.source.accepted),
+                    self.limits.io.max_segment_bytes as usize,
+                )
+                .await?;
+            fetch(&mut history, request, buffer, false).await
+        };
         self.faulted |= result
             .as_ref()
             .err()
@@ -114,6 +136,15 @@ pub(super) async fn fetch(
     mut buffer: AppendBuffer,
     backpressure: bool,
 ) -> Result<FetchedHistory, JournalError> {
+    if request.predecessor.op.0 < history.predecessor().op_number {
+        return Ok(FetchedHistory {
+            request,
+            end: request.predecessor,
+            buffer,
+            minimum_body_bytes: None,
+            retired_predecessor: Some(prefix(history.predecessor())),
+        });
+    }
     let chunk = match history
         .read_after(
             position(request.predecessor),
@@ -129,9 +160,12 @@ pub(super) async fn fetch(
                 end: request.predecessor,
                 buffer,
                 minimum_body_bytes: Some(required),
+                retired_predecessor: None,
             });
         }
-        Err(error) => return Err(error.into()),
+        Err(error) => {
+            return Err(error.into());
+        }
     };
     let bytes = chunk
         .operations()
@@ -147,5 +181,6 @@ pub(super) async fn fetch(
         end: prefix(chunk.end()),
         buffer,
         minimum_body_bytes: None,
+        retired_predecessor: None,
     })
 }

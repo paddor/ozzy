@@ -9,6 +9,7 @@ mod async_metadata;
 mod canonical_checkpoint;
 mod canonical_recovery;
 mod checkpoint;
+pub use checkpoint::asynchronous::verify_checkpoint_state;
 mod codec;
 pub(crate) use codec::{decode_indexed_operation, scan_segment_async};
 mod cooperative;
@@ -51,7 +52,8 @@ pub use codec::{
     encode_group_with_body_encoding, encode_segment_header, scan_segment,
 };
 pub use directory::asynchronous::{
-    Candidate as AsyncCanonicalRecoveryCandidate, CheckpointFiles as AsyncCheckpointFiles,
+    Candidate as AsyncCanonicalRecoveryCandidate, CanonicalCheckpointImport,
+    CheckpointFiles as AsyncCheckpointFiles, CheckpointRecovery,
     Completed as AsyncCompletedJournalWrite, CompletedRoll as AsyncCompletedJournalRoll,
     CompletedSync as AsyncCompletedJournalSync, Format as AsyncJournalFormat,
     Installer as AsyncSuffixInstaller, Journal as AsyncGroupJournal, Limits as AsyncJournalLimits,
@@ -102,6 +104,7 @@ pub use index_file::{
     decode_segment_index, encode_segment_index,
 };
 pub use journal_index::asynchronous::Snapshot as AsyncJournalIndexSnapshot;
+pub use journal_index::seek::SeekQuery;
 pub use journal_index::{JournalIndexBoundary, JournalIndexError, JournalIndexSnapshot};
 pub use metadata::{
     CURRENT_BYTES, CheckpointReference, CommitMode, CurrentReference, GROUP_IDENTITY_BYTES,

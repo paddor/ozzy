@@ -12,10 +12,37 @@ pub(super) struct Cluster {
     shared: PathBuf,
     local: [PathBuf; 3],
     roots: [PathBuf; 3],
+    cpus: Option<[u32; 3]>,
 }
 
 impl Cluster {
+    pub(super) fn pin_brokers(mut self) -> Self {
+        let available: Vec<_> = host_resources().unwrap().cpus.into_keys().collect();
+        self.cpus = Some(std::array::from_fn(|index| {
+            available[index % available.len()]
+        }));
+        self
+    }
+
+    pub(super) fn retained(policy: Confirmation) -> Self {
+        let cluster = Self::new_with_shards(policy, true);
+        let source = fs::read_to_string(&cluster.config).unwrap();
+        fs::write(
+            &cluster.config,
+            source.replace(
+                "max_append_bytes = 65536\n",
+                "max_append_bytes = 65536\n[topics.orders.retention]\nmax_bytes = 2097152\n",
+            ),
+        )
+        .unwrap();
+        cluster
+    }
+
     pub(super) fn new(policy: Confirmation) -> Self {
+        Self::new_with_shards(policy, false)
+    }
+
+    fn new_with_shards(policy: Confirmation, single_shard: bool) -> Self {
         let policy = match policy {
             Confirmation::DiskQuorum => "disk-quorum",
             Confirmation::ReplicatedPersisting => "replicated-persisting",
@@ -51,7 +78,7 @@ impl Cluster {
                  backend = \"pool\"\nwrite_threads = 1\n"
             )
             .unwrap();
-            for shard in 0..=index {
+            for shard in 0..=if single_shard { 0 } else { index } {
                 write!(
                     source,
                     "[[brokers.broker-{index}.topology.shards]]\n\
@@ -70,6 +97,7 @@ impl Cluster {
             directory,
             config,
             roots,
+            cpus: None,
         }
     }
 
@@ -134,11 +162,19 @@ impl Cluster {
     }
 
     fn start_one(&self, index: usize, round: usize, selections: &[&str]) -> fixture::Running {
-        let command = if selections.is_empty() {
+        let mut command = if selections.is_empty() {
             self.serve(index)
         } else {
             self.recover(index, selections)
         };
+        if let Some(cpus) = self.cpus {
+            let mut pinned = Command::new("taskset");
+            pinned
+                .args(["-c", &cpus[index].to_string()])
+                .arg(command.get_program())
+                .args(command.get_args());
+            command = pinned;
+        }
         fixture::Running::spawn(
             command,
             self.directory

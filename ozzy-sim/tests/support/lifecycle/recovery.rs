@@ -147,8 +147,8 @@ impl Replica {
         });
     }
 
-    pub(super) fn receive_recovery_request(&mut self, from: usize, message: RecoveryMessage) {
-        let RecoveryMessage::Request(request) = message else {
+    pub(super) fn receive_recovery_request(&mut self, from: usize, message: &RecoveryMessage) {
+        let RecoveryMessage::Request(request) = *message else {
             return;
         };
         let Some(snapshot) = self
@@ -214,7 +214,7 @@ impl Replica {
                 output.push(Packet::recovery_state(
                     self.id,
                     requester,
-                    RecoveryState {
+                    &RecoveryState {
                         request_id: donor.request.request_id,
                         response: donor.response,
                     },

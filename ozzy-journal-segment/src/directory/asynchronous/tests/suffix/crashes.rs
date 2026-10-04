@@ -33,7 +33,7 @@ fn async_suffix_execution_observation_crash_cuts_select_only_complete_histories(
                     for chunk in ops.chunks(2) {
                         installer.append_chunk(chunk).await?;
                     }
-                    installer.finish().await
+                    Box::pin(installer.finish()).await
                 },
                 cut,
                 immediate,

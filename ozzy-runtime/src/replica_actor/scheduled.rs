@@ -16,10 +16,11 @@ pub struct ScheduledReplica {
     actor: Box<ReplicaActor>,
     now: Duration,
     active: bool,
+    pub(super) receive_owner: Option<crate::memory::Owner>,
 }
 
 impl ScheduledReplica {
-    pub(super) fn read_access(
+    pub(crate) fn read_access(
         &mut self,
     ) -> (
         Option<ozzy_replication::driver::ValidationTicket>,
@@ -60,6 +61,7 @@ impl ScheduledReplica {
             .bind_allocator(&owner.allocator())?;
         self.actor.work.receive.allocator = Some(owner.allocator());
         self.actor.history_receive_allocator = Some(owner.allocator());
+        self.receive_owner = Some(owner.clone());
         Ok(())
     }
 
@@ -97,6 +99,7 @@ impl ScheduledReplica {
             actor: Box::new(actor),
             now: Duration::ZERO,
             active: true,
+            receive_owner: None,
         })
     }
 
@@ -394,4 +397,13 @@ pub enum ScheduleError {
     /// Partition authority, storage or transport rejected the transition.
     #[error(transparent)]
     Actor(#[from] ActorError),
+}
+
+impl ScheduledReplica {
+    pub(super) fn needs_checkpoint_recovery(&self) -> bool {
+        self.actor.recovery_required
+    }
+    pub(super) fn into_actor(self) -> ReplicaActor {
+        *self.actor
+    }
 }

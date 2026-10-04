@@ -34,6 +34,7 @@ fn fixture(count: usize) -> (Vec<u8>, SegmentIndexImage) {
         };
         let id = (index as u128 + 1).to_be_bytes();
         offsets.push(OffsetIndexEntry {
+            append_timestamp_millis: 0,
             partition,
             offset: Offset::new(index as u64),
             location: RecordLocation {
@@ -164,6 +165,10 @@ fn cooperative_index_open_refuses_late_table_corruption_even_with_a_valid_checks
         repair_digest(&mut bytes);
         rejects(&bytes, &IndexFileError::UnsortedOrDuplicate(kind));
         let mut bytes = original.clone();
+        if kind == "offset" {
+            // Timestamp bytes belong only to batch heads.
+            bytes[last + 84..last + 88].copy_from_slice(&1u32.to_be_bytes());
+        }
         bytes[last + width - 1] = 1;
         repair_digest(&mut bytes);
         rejects(&bytes, &IndexFileError::NonZeroReserved);

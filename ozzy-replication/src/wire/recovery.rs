@@ -1,4 +1,4 @@
-//! Nonvoting, nonce-scoped recovery exchanges. Full WAL only, no checkpoints.
+//! Nonvoting, nonce-scoped recovery exchanges with optional checkpoint anchors.
 
 use ozzy_proto::{Envelope, Opcode};
 use ozzy_proto::{LinkSessionId, NodeId, RequestId};
@@ -7,12 +7,13 @@ use super::{
     COMMON_BYTES, ControlEncoding, PeerBinding, Reader, WireError, WireLimits, Writer,
     validate_prefix, validate_scope,
 };
-use crate::recovery::{RecoveryLog, RecoveryResponse};
+use crate::recovery::{CheckpointAnchor, RecoveryLog, RecoveryResponse};
 use crate::{JournalGeneration, Scope};
 
 const REQUEST_BYTES: usize = COMMON_BYTES + 16;
 const BACKUP_BYTES: usize = REQUEST_BYTES + 1;
-const PRIMARY_BYTES: usize = BACKUP_BYTES + 16 + 40 + 40;
+const PRIMARY_BYTES: usize = BACKUP_BYTES + 16 + 40 + 40 + 1;
+const ANCHOR_BYTES: usize = 40 + 40 + 32 + 32 + 8 + 4;
 
 /// Fresh recovery attempt carried by one independently correlated link exchange.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +76,11 @@ impl RecoveryState {
         }
         .validate()?;
         if let Some(log) = self.response.primary {
+            if let Some(anchor) = log.checkpoint {
+                anchor
+                    .validate(log.committed)
+                    .map_err(|_| WireError::History)?;
+            }
             validate_prefix(log.accepted)?;
             validate_prefix(log.committed)?;
             if log.generation.0 == 0
@@ -90,6 +96,10 @@ impl RecoveryState {
 
 /// Separate recovery family. These messages never supply normal durable votes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "bounded sans-I/O decoding returns inline evidence without allocation"
+)]
 pub enum RecoveryMessage {
     /// Ask activated normal voters for fresh evidence under an existing membership.
     Request(RecoveryRequest),
@@ -111,6 +121,12 @@ pub fn encode_recovery_state(
     state.validate()?;
     let metadata_bytes = if state.response.primary.is_some() {
         PRIMARY_BYTES
+            + usize::from(
+                state
+                    .response
+                    .primary
+                    .is_some_and(|log| log.checkpoint.is_some()),
+            ) * ANCHOR_BYTES
     } else {
         BACKUP_BYTES
     };
@@ -133,6 +149,10 @@ pub fn encode_recovery_state(
         writer.bytes(&log.generation.0.to_be_bytes());
         writer.prefix(log.accepted);
         writer.prefix(log.committed);
+        writer.bytes(&[u8::from(log.checkpoint.is_some())]);
+        if let Some(anchor) = log.checkpoint {
+            encode_anchor(&mut writer, anchor);
+        }
     }
     Ok(ControlEncoding {
         header,
@@ -208,11 +228,22 @@ pub(super) fn decode_state(
     let nonce = RequestId::from_bytes(reader.bytes()?);
     let primary = match reader.bytes::<1>()? {
         [0] => None,
-        [1] => Some(RecoveryLog {
-            generation: JournalGeneration(u128::from_be_bytes(reader.bytes()?)),
-            accepted: reader.prefix()?,
-            committed: reader.prefix()?,
-        }),
+        [1] => {
+            let generation = JournalGeneration(u128::from_be_bytes(reader.bytes()?));
+            let accepted = reader.prefix()?;
+            let committed = reader.prefix()?;
+            let checkpoint = match reader.bytes::<1>()? {
+                [0] => None,
+                [1] => Some(decode_anchor(&mut reader)?),
+                _ => return Err(WireError::History),
+            };
+            Some(RecoveryLog {
+                generation,
+                accepted,
+                committed,
+                checkpoint,
+            })
+        }
         _ => return Err(WireError::History),
     };
     reader.finish()?;
@@ -229,4 +260,24 @@ pub(super) fn decode_state(
     };
     state.validate()?;
     Ok(state)
+}
+
+fn encode_anchor(writer: &mut Writer<'_>, anchor: CheckpointAnchor) {
+    writer.prefix(anchor.predecessor);
+    writer.prefix(anchor.position);
+    writer.bytes(anchor.schema.as_bytes());
+    writer.bytes(anchor.state_digest.as_bytes());
+    writer.bytes(&anchor.state_bytes.to_be_bytes());
+    writer.bytes(&anchor.chunk_bytes.to_be_bytes());
+}
+
+fn decode_anchor(reader: &mut Reader<'_>) -> Result<CheckpointAnchor, WireError> {
+    Ok(CheckpointAnchor {
+        predecessor: reader.prefix()?,
+        position: reader.prefix()?,
+        schema: crate::Digest::from_bytes(reader.bytes()?),
+        state_digest: crate::Digest::from_bytes(reader.bytes()?),
+        state_bytes: u64::from_be_bytes(reader.bytes()?),
+        chunk_bytes: u32::from_be_bytes(reader.bytes()?),
+    })
 }

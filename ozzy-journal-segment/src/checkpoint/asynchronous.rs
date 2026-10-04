@@ -24,6 +24,48 @@ pub(crate) struct Checkpoint {
 }
 
 impl Checkpoint {
+    pub(crate) async fn read_range(
+        &self,
+        offset: u64,
+        maximum: usize,
+        limits: CheckpointLimits,
+    ) -> Result<Vec<u8>, CheckpointError> {
+        if maximum == 0 || offset >= self.manifest.state_bytes {
+            return Err(CheckpointError::LengthMismatch);
+        }
+        let index = self
+            .manifest
+            .chunks
+            .partition_point(|chunk| chunk.logical_offset <= offset)
+            .checked_sub(1)
+            .ok_or(CheckpointError::LengthMismatch)?;
+        let chunk = self.manifest.chunks[index];
+        let length = usize::try_from(chunk.bytes).map_err(|_| CheckpointError::LengthOverflow)?;
+        enforce_u64(
+            "checkpoint chunk bytes",
+            chunk.bytes,
+            limits.max_chunk_bytes as u64,
+        )?;
+        let mut bytes = self
+            .access
+            .read_file(
+                self.root.join(chunk_name(chunk.ordinal)),
+                length,
+                self.chunk_bytes,
+            )
+            .await?;
+        let mut hasher = Hasher::new(CHECKPOINT_CHUNK_HASH_CONTEXT);
+        hasher.update(&bytes);
+        if bytes.len() != length || hasher.finish() != chunk.digest {
+            return Err(CheckpointError::DigestMismatch("checkpoint chunk"));
+        }
+        let start = usize::try_from(offset - chunk.logical_offset)
+            .map_err(|_| CheckpointError::LengthOverflow)?;
+        bytes.drain(..start);
+        bytes.truncate(maximum);
+        Ok(bytes)
+    }
+
     pub(crate) async fn open(
         access: Access,
         root: PathBuf,
@@ -135,4 +177,22 @@ impl Checkpoint {
         self.validate_chunks(limits, Some(&mut state)).await?;
         Ok(state)
     }
+}
+
+/// Validate the descriptor digest of a bounded checkpoint assembled over PEER.
+/// The callback lets the owning shard yield between fixed hash chunks.
+pub async fn verify_checkpoint_state(
+    input: &[u8],
+    expected: Digest,
+    mut step: impl AsyncFnMut(usize),
+) -> Result<(), CheckpointError> {
+    let mut hasher = Hasher::new(CHECKPOINT_STATE_HASH_CONTEXT);
+    for chunk in input.chunks(64 * 1024) {
+        hasher.update(chunk);
+        step(chunk.len()).await;
+    }
+    if hasher.finish() != expected {
+        return Err(CheckpointError::DigestMismatch("checkpoint state"));
+    }
+    Ok(())
 }

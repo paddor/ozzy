@@ -5,7 +5,9 @@ use super::{
 };
 use ozzy_proto::PartitionIncarnation;
 
+mod identity;
 mod shared;
+pub use identity::ProducerIdentity;
 pub use shared::{
     SharedTopicPendingRecord, SharedTopicReceipt, SharedTopicWriter, SharedTopicWriterConfig,
 };

@@ -6,4 +6,5 @@
 
 pub mod live;
 pub mod reader;
+pub mod retention;
 pub mod state;

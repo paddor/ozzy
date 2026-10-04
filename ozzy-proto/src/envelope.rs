@@ -73,6 +73,7 @@ opcodes! {
     PreparePub = 0x52 => "`PREPARE_PUB`: publish canonical operations to followers.",
     RecordsPub = 0x53 => "`RECORDS_PUB`: publish confirmed records to every live reader.",
     ReplicaReceipt = 0x54 => "`REPLICA_RECEIPT`: compact same-channel volatile receipt.",
+    HistoryRetired = 0x55 => "`HISTORY_RETIRED`: require nonvoting checkpoint recovery below retained history.",
     Nack = 0x7f => "`NACK`: report a typed negative outcome.",
 }
 

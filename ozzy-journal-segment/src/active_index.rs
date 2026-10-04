@@ -22,6 +22,67 @@ pub(crate) struct ActiveSegmentIndex {
 }
 
 impl ActiveSegmentIndex {
+    pub(crate) fn seek(
+        &self,
+        query: crate::SeekQuery,
+        result: &mut ozzy_core::reader::seek::Selection,
+    ) {
+        // In-memory active rows use the same validated image order as disk.
+        match query.start {
+            ozzy_proto::reader::Start::RecordId { id, .. } => {
+                let messages = self.image.messages();
+                let key =
+                    |entry: &MessageIndexEntry| (entry.partition, entry.message_id, entry.offset);
+                let first = messages.partition_point(|entry| {
+                    key(entry) < (query.partition, id, query.retained_from)
+                });
+                let after = messages.partition_point(|entry| {
+                    key(entry) < (query.partition, id, query.confirmed_end)
+                });
+                if let Some(matching) = messages.get(first..after)
+                    && let (Some(first), Some(last)) = (matching.first(), matching.last())
+                {
+                    for entry in [first, last] {
+                        if entry.partition == query.partition
+                            && entry.message_id == id
+                            && self.find_offset(query.partition, entry.offset).is_some_and(
+                                |offset| offset.location.operation.op_number <= query.through,
+                            )
+                        {
+                            result.observe_match(entry.offset);
+                        }
+                    }
+                }
+            }
+            ozzy_proto::reader::Start::Timestamp(timestamp) => {
+                let at_floor = self.find_offset(query.partition, query.retained_from);
+                for head in self.image.offsets().iter().filter(|entry| {
+                    entry.partition == query.partition
+                        && entry.location.record_index == 0
+                        && entry.append_timestamp_millis >= timestamp
+                        && entry.location.operation.op_number <= query.through
+                        && entry.offset < query.confirmed_end
+                }) {
+                    let offset = if head.offset >= query.retained_from {
+                        Some(head.offset)
+                    } else {
+                        at_floor
+                            .filter(|entry| {
+                                entry.location.operation == head.location.operation
+                                    && entry.location.batch_index == head.location.batch_index
+                            })
+                            .map(|_| query.retained_from)
+                    };
+                    if let Some(offset) = offset {
+                        result.observe_match(offset);
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Build through one exact operation, ignoring later complete physical groups.
     pub(crate) fn build(
         scan: &SegmentScan<'_>,

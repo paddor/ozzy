@@ -52,7 +52,7 @@ impl StartedPartition {
     /// Prepare the configured partition in this service's empty proposal lease.
     /// Submit when local authority allows writes, then await the normal proposal
     /// result. Repeating after restart or an uncertain reply does not create a
-    /// second operation. Existing retention policy remains unchanged.
+    /// second operation. Changed retention policy becomes a confirmed policy operation.
     pub fn prepare_partition(&mut self) -> Result<(), StartupError> {
         prepare_partition(
             &mut self.buffer,
@@ -78,7 +78,17 @@ pub(crate) fn prepare_partition(
             topic: &placement.topic,
             partition_id: PartitionId::new(placement.partition),
             owner_epoch: OwnerEpoch::INITIAL,
-            retention: RetentionPolicy::default(),
+            retention: RetentionPolicy {
+                max_age_millis: placement
+                    .retention
+                    .max_age_secs
+                    .and_then(|seconds| seconds.checked_mul(1000))
+                    .and_then(std::num::NonZeroU64::new),
+                max_bytes: placement
+                    .retention
+                    .max_bytes
+                    .and_then(std::num::NonZeroU64::new),
+            },
         })
         .map_err(|source| StartupError::Journal {
             path: placement.directory.clone(),
@@ -93,11 +103,15 @@ impl ActorSettings {
         config: &JournalConfig,
     ) -> Result<Self, StartupError> {
         let journal = ShardJournalConfig::default();
+        let retention_interval = (placement.retention.max_age_secs.is_some()
+            || placement.retention.max_bytes.is_some())
+        .then_some(Duration::from_secs(1));
         let JournalConfig::Replicated(config) = config else {
             let JournalConfig::Local(config) = config else {
                 unreachable!()
             };
             return Ok(Self::Local(LocalActorConfig {
+                retention_interval,
                 journal,
                 proposal_lanes: 2,
                 proposal_capacity: config.append_limits.max_operations,
@@ -142,6 +156,7 @@ impl ActorSettings {
         Ok(Self::Replicated {
             journal,
             actor: Box::new(ActorConfig {
+                retention_interval,
                 sessions: [LinkSessionId::from_bytes([0; 16]); 3],
                 timing: Timing {
                     heartbeat: Duration::from_millis(100),

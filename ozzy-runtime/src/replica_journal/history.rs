@@ -13,6 +13,9 @@ pub struct HistoryPosition {
     pub source: LogSource,
     /// Requested operation number.
     pub op: OpNumber,
+    /// Exact predecessor of the frozen retained range. Missing older positions
+    /// supply no ancestry evidence and must not fault an intact requester.
+    pub retained_predecessor: Prefix,
     /// Exact position, or `None` only outside this captured retained range.
     pub position: Option<Prefix>,
 }
@@ -20,6 +23,8 @@ pub struct HistoryPosition {
 /// Two exact normal-history lookups, retaining the authority captured before I/O.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplicationPositions {
+    /// Physical retained-chain predecessor, not a claim of remote history.
+    pub retained_predecessor: Prefix,
     /// Scope, writer generation, and image against which this read was submitted.
     pub ticket: ozzy_replication::driver::ValidationTicket,
     /// Base and receipt positions requested by the protocol actor.
@@ -35,9 +40,14 @@ pub struct FetchedHistory {
     pub(super) end: Prefix,
     pub(super) buffer: AppendBuffer,
     pub(super) minimum_body_bytes: Option<usize>,
+    pub(super) retired_predecessor: Option<Prefix>,
 }
 
 impl FetchedHistory {
+    pub(crate) fn retired_predecessor(&self) -> Option<Prefix> {
+        self.retired_predecessor
+    }
+
     pub(crate) fn shared_bodies(&mut self) -> bytes::Bytes {
         self.buffer.shared_bodies()
     }

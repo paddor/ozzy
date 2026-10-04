@@ -7,6 +7,12 @@ broker PUB and SDK SUB sockets, with PEER for subscription, replay, and repair.
 Payload bytes stay opaque.
 Never extend ZMTP for Ozzy features. Transport receipt is not application confirmation.
 
+Native node IDs remain 16 bytes. OMQ reserves a leading zero in a socket identity:
+an ID starting with zero uses the 17-byte routing label `0x01 || node_id`; other
+IDs use their unchanged 16 bytes. Receivers accept only these canonical forms and
+restore the native ID before session, sender, or ancestry checks. This encoding
+also applies to repair aliases and destination backpressure waits.
+
 The runtime carries native writer traffic over shared PEER broker links.
 Each topic partition has its own writer state, leader, and retry identity;
 partition count does not increase SDK connection count.
@@ -31,7 +37,7 @@ subscribe at an offset and receive confirmed records through bounded transport.
 Local targeting never fabricates group authority.
 
 Topic lookup, producer opening, routing interests, and explicit partition recovery
-are implemented. Online topic creation, broker discovery, checkpoint transfer,
+are implemented. Online topic creation, broker discovery,
 and consumer-group coordination are not. Reserved opcodes imply no service.
 
 ### Selected topic and session contract
@@ -382,9 +388,12 @@ trusted topic metadata before comparing views or using a hint.
 ### Producer exchange
 
 - `OPEN_PRODUCER`: group tag `u8=1`, authority (group ID, configuration epoch,
-  view), partition incarnation, producer ID, mode `u8` (`0` resume/create,
-  `1` fence), expected epoch `u64` (zero means absent), operation ID `16`.
-  Fencing requires an expected epoch. Retries keep the operation ID.
+  view), partition incarnation, producer ID, mode `u8` (`0` resume,
+  `1` fence, `2` create), expected epoch `u64` (zero means absent), operation ID `16`.
+  Resume without an expected epoch returns the current session, or creates epoch
+  one for an unused partition. Create rejects existing identities. Fence requires
+  an expected epoch and advances it. Retries keep the operation ID; the latest
+  transition identity survives checkpoints and history retirement.
 - `PRODUCER_OPENED`: same tag, authority, partition and producer, confirmed
   epoch, next sequence, retained retry floor, configured policy. A new epoch
   is committed before reply.
@@ -554,16 +563,24 @@ registered log. Local storage never invents a group or replication evidence.
 
 | Command | Metadata fields |
 | --- | --- |
-| SUBSCRIBE | Subscription, Target, exact start:u64 |
-| SUBSCRIBED | Subscription, Source |
+| SUBSCRIBE | Subscription, Target, Start |
+| SUBSCRIBED | Subscription, Source, resolved offset:u64 |
 | RECORDS | Subscription, Source, first offset:u64, payload codec:u8, decoded payload bytes:u32, Records |
 | ACK | Subscription, Source, received:optional<u64>, processed:optional<u64> |
-| UNSUBSCRIBE / UNSUBSCRIBED | Subscription, Source |
+| UNSUBSCRIBE / UNSUBSCRIBED | Subscription, Source, resolved offset:u64 |
 
 SUBSCRIBE/SUBSCRIBED and UNSUBSCRIBE/UNSUBSCRIBED are correlated exchanges.
 An identical repeated SUBSCRIBE preserves its state; changed parameters require
 a new generation. Stream/topic names are nonempty UTF-8, at most 255 bytes each.
-A reader starting at zero receives an explicit gap if zero has expired.
+Start tags: `0` earliest retained, `1` current end, `2` exact offset:u64,
+`3` broker append time in Unix milliseconds:u64, `4` record ID:16 plus duplicate
+policy:u8 (`0` require unique, `1` first retained, `2` last retained).
+Timestamp seek chooses the lowest confirmed retained offset at or after the time;
+no match resolves to the current end. Record IDs are scoped to one partition.
+Missing IDs return NACK 19 with earliest retained offset:u64. Ambiguous IDs return
+NACK 20 with first/last matching offsets:u64 each. Exact expired offsets return
+NACK 14 with earliest retained offset:u64. Reconnect uses the next delivered
+offset, never the original selector. Future delivery follows ordinary offsets.
 
 RECORDS uses APPEND's outer raw/LZ4 payload codec and validated record
 descriptors. A leader forwards a stored producer LZ4 block unchanged, one block
@@ -778,8 +795,7 @@ receive epoch. Confirmations contain only policy-specific vote evidence.
 Control/session negotiation remains independently validated.
 
 Election metadata is fixed-size: START_VIEW_CHANGE 80 bytes, DO_VIEW_CHANGE
-184, START_VIEW 176. These schemas require complete retained WAL history; they
-do not negotiate checkpoint transfer. Generations are nonzero big-endian
+184, START_VIEW 176. Generations are nonzero big-endian
 `u128` writer incarnations, not local file offsets or commit evidence. Pin the
 reported generation and accepted tail until the report is invalidated. Fetch
 missing operations separately; never substitute missing bytes with an empty log.
@@ -795,11 +811,12 @@ Do not mix it with older unilateral-timeout drivers; compatible capability
 negotiation remains a runtime integration gate, not implied by opcode decoding.
 Decode establishes none of the required durable promise, publication, or
 new-view quorum boundaries. The production core still enforces those gates.
-Checkpoint-backed election descriptors need an explicitly negotiated schema
-before they can replace the full-WAL requirement.
+Retained-history lookup can restart at a source's original retained predecessor.
+Only reaching the advertised accepted digest validates the lookup; a boundary
+hint alone supplies no election evidence.
 
 `Source = (voter_id:u128, writer_generation:u128, accepted:OpPosition)` binds
-history requests and responses to a pinned full-WAL source. FETCH_OPS is a
+history requests and responses to a pinned retained source. FETCH_OPS is a
 correlated request (response flag clear); OPS echoes its nonzero request ID
 with the response flag set. Their common voter is the actual packet sender,
 not necessarily the source named in a request. An OPS sender must be that
@@ -828,10 +845,12 @@ from the hint. Both payload frames are empty.
 Only activated normal voters respond. Tag 0 at offset 96 identifies a backup,
 ending its metadata at 97 bytes. Tag 1 identifies the configured primary of the
 response view; generation at 97, accepted prefix at 113, and commit prefix at
-153 end its metadata at 193 bytes. Other tags or mismatched configured roles are
-invalid. Generation is nonzero. Commit cannot exceed accepted or differ at the
-same position. These full-WAL schemas contain no checkpoint descriptor and
-provide neither durable vote evidence nor authorization to resume voting.
+153 precede a checkpoint-presence byte at 193. A primary has 194 metadata
+bytes without a checkpoint, or 350 with one. Its descriptor contains the
+original retained predecessor and checkpoint position (40 bytes each), schema
+and state digests (32 each), state length (8), and chunk bound (4). Invalid roles,
+positions, lengths, or schema fail before state allocation. These replies
+provide neither durable vote evidence nor permission to resume voting.
 
 The nonce is globally fresh per logical recovery attempt and stable across
 reconnects; session/request IDs independently fence each outstanding exchange.
@@ -847,8 +866,8 @@ Complete canonical validation, crash-safe replacement publication, and fenced
 election handoff are separate gates. The selected broker wires these gates into
 explicit partition recovery. Codec support alone grants no voting authority.
 
-Checkpoint/snapshot-transfer opcodes are reserved. Full-history FETCH_OPS/OPS
-recovery above is implemented; checkpoint manifests and chunk transfer are not.
+Checkpoint state uses SNAPSHOT_BEGIN/SNAPSHOT_CHUNK as described below. Required
+retained operations and the accepted suffix use the same FETCH_OPS/OPS exchange.
 
 ### Directory exchange and errors
 
@@ -935,3 +954,59 @@ Exact wire layouts have fixed-byte tests, including malformed lengths,
 unsupported versions, source/correlation/session fences, and capacity failures.
 The removed 40-byte prototype envelope is rejected by shape. No transparent
 fallback or alternate protocol mode is supported.
+
+### Checkpoint state transfer
+
+SNAPSHOT_BEGIN requests a bounded byte range; SNAPSHOT_CHUNK echoes it with
+state bytes. Both have 180 metadata bytes: common scope, recovery nonce, exact
+source, offset, and byte bound. Their envelopes carry the request ID.
+Requests use PEER control; chunks
+use PEER data. Responses match the current session, request, source, nonce,
+and next offset. State is private until its digest, schema, and original
+checkpoint position validate. FETCH_OPS/OPS then transfer required retained
+records and every accepted operation beyond the checkpoint.
+
+HISTORY_RETIRED (`55`) has 137 metadata bytes and no payload: common scope,
+fence tag, 16-byte receive epoch or fetch ID, and 40-byte retained predecessor.
+A live receipt below that prefix withdraws into nonvoting recovery. An election
+lookup may restart at the boundary and verify through its exact source tail.
+If the requested protected prefix lies below that boundary, an intact candidate
+keeps the ancestry check pending until ordinary election progress replaces the
+unusable report. The candidate withdraws only when its own accepted history is
+expired. A boundary equal to the source tail requires no FETCH_OPS request.
+The hint establishes no commit, checkpoint installation, or voting authority.
+
+```mermaid
+sequenceDiagram
+    participant A as Application
+    participant P as Producer SDK
+    participant B as Broker shard
+    A->>P: Resume saved topic/producer identity
+    loop Every topic partition
+        P->>B: PEER control: OPEN_PRODUCER, stable operation ID
+        B->>B: Fence old queued attachment; confirm transition
+        B-->>P: Epoch, next sequence, retry floor
+    end
+    P-->>A: Resume complete
+    A->>P: Record
+    P->>B: PEER data: APPEND with resumed sequence
+    B-->>P: PEER data: policy confirmation
+    P-->>A: Confirmed receipt
+```
+
+```mermaid
+sequenceDiagram
+    participant A as Application
+    participant C as Consumer SDK
+    participant B as Broker shard
+    A->>C: Earliest/latest, offsets, timestamp, or record ID
+    C->>B: PEER control: SUBSCRIBE with selector
+    B->>B: Resolve against confirmed retained history
+    B-->>C: PEER control: SUBSCRIBED with resolved offset
+    C->>B: PEER data: READ from next offset
+    B-->>C: PEER data: retained records
+    B-->>C: PUB/SUB: live records
+    C-->>A: Ordered records per partition
+    C->>B: PEER data: repair a live gap
+    Note over C,B: Reconnect uses next delivered offset; selector does not run again
+```

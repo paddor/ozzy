@@ -271,7 +271,7 @@ impl Service {
             |message| crate::transport::try_send_peer(socket, message),
             |probe| {
                 let socket = socket.clone();
-                Box::pin(async move { socket.wait_send_progress_for(&probe).await })
+                Box::pin(async move { crate::transport::wait_send_peer(&socket, &probe).await })
             },
         )
         .await

@@ -22,7 +22,10 @@ pub(super) enum Body {
     Open(producer::Open),
     Subscribe(reader::Subscribe),
     Ack(reader::Ack),
-    Unsubscribe(reader::Subscribed),
+    Unsubscribe {
+        session: LinkSessionId,
+        selected: reader::Subscribed,
+    },
 }
 
 impl Body {
@@ -32,7 +35,7 @@ impl Body {
             Self::Open(_) => (Opcode::OpenProducer, Opcode::ProducerOpened),
             Self::Subscribe(_) => (Opcode::Subscribe, Opcode::Subscribed),
             Self::Ack(_) => (Opcode::Ack, Opcode::Ack),
-            Self::Unsubscribe(_) => (Opcode::Unsubscribe, Opcode::Unsubscribed),
+            Self::Unsubscribe { .. } => (Opcode::Unsubscribe, Opcode::Unsubscribed),
         }
     }
 
@@ -55,10 +58,29 @@ impl Body {
                 reader::encode_subscribe(envelope, subscribe, metadata, limits)?
             }
             Self::Ack(ack) => reader::encode_ack(envelope, *ack, metadata, limits)?,
-            Self::Unsubscribe(subscribed) => {
-                reader::encode_unsubscribe(envelope, *subscribed, metadata, limits)?
+            Self::Unsubscribe { selected, .. } => {
+                reader::encode_unsubscribe(envelope, *selected, metadata, limits)?
             }
         })
+    }
+
+    fn reply(
+        &self,
+        packet: Packet<'_>,
+        message: &Message,
+        lease: &Arc<Lease>,
+        limits: EnvelopeLimits,
+    ) -> Result<Reply, BrokerLinkError> {
+        match self {
+            Self::Subscribe(subscribe) => decode_subscription(packet, subscribe, limits),
+            Self::Unsubscribe { selected, .. } => {
+                if reader::decode_unsubscribed(packet, limits)? != *selected {
+                    return Err(BrokerLinkError::Response);
+                }
+                Ok(Reply::Unsubscribed)
+            }
+            _ => Ok(Reply::Message(track(message, lease, true))),
+        }
     }
 }
 
@@ -67,13 +89,31 @@ pub(super) struct Lease {
     pub(super) _permit: OwnedSemaphorePermit,
 }
 
+/// Reader cursors reserve their fixed-size completion in subscription storage.
+/// Decode here so an idle application does not retain control-frame admission.
+#[derive(Debug)]
+pub(super) enum Reply {
+    Message(Message),
+    Subscribed(reader::Subscribed),
+    Unsubscribed,
+}
+
+impl Reply {
+    pub(super) fn message(self) -> Result<Message, BrokerLinkError> {
+        match self {
+            Self::Message(message) => Ok(message),
+            _ => Err(BrokerLinkError::Response),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct Command {
     pub(super) body: Body,
     pub(super) id: RequestId,
     pub(super) deadline: Duration,
     pub(super) lease: Arc<Lease>,
-    pub(super) reply: oneshot::Sender<Result<Message, BrokerLinkError>>,
+    pub(super) reply: oneshot::Sender<Result<Reply, BrokerLinkError>>,
 }
 
 #[derive(Debug)]
@@ -198,11 +238,9 @@ impl LinkState {
     fn observe(&mut self, event: MonitorEvent) -> Result<(), BrokerLinkError> {
         match event {
             MonitorEvent::HandshakeSucceeded { peer, .. } => {
-                if peer
-                    .peer_identity
-                    .as_deref()
-                    .is_some_and(|peer| peer != self.remote.as_bytes())
-                {
+                if peer.peer_identity.as_deref().is_some_and(|peer| {
+                    crate::transport::decode_peer_identity(peer) != Some(self.remote)
+                }) {
                     return Err(BrokerLinkError::Response);
                 }
                 if self.connection.is_some_and(|id| id != peer.connection_id) {
@@ -306,7 +344,19 @@ impl LinkState {
             self.sending = None;
             return Ok(true);
         }
-        let Some(session) = self.shared.sessions.session(self.remote) else {
+        let session = self.shared.sessions.session(self.remote);
+        if let Body::Unsubscribe {
+            session: expected, ..
+        } = &waiting.command.body
+            && session != Some(*expected)
+        {
+            // The broker already fenced this subscription with its old link.
+            // A queued cancellation must never wait for or use another session.
+            let waiting = self.sending.take().unwrap();
+            let _ = waiting.command.reply.send(Err(BrokerLinkError::Session));
+            return Ok(true);
+        }
+        let Some(session) = session else {
             return Ok(false);
         };
         if waiting.frame.is_none() {
@@ -432,18 +482,18 @@ impl LinkState {
             } else {
                 None
             };
-            Some(BrokerLinkError::Rejected {
-                code: reply.code,
-                retry: reply.retry,
-                hint,
-            })
+            let reader_request = matches!(active.command.body, Body::Subscribe(_));
+            Some(reader_rejection(reply, reader_request, hint))
         } else {
             None
         };
         let active = self.active.remove(&id).unwrap();
         let result = match rejected {
             Some(error) => Err(error),
-            None => Ok(track(message, &active.command.lease, true)),
+            None => active
+                .command
+                .body
+                .reply(packet, message, &active.command.lease, self.limits),
         };
         let _ = active.command.reply.send(result);
         Ok(())
@@ -479,6 +529,21 @@ impl LinkState {
         }
         Ok(())
     }
+}
+
+fn decode_subscription(
+    packet: Packet<'_>,
+    subscribe: &reader::Subscribe,
+    limits: EnvelopeLimits,
+) -> Result<Reply, BrokerLinkError> {
+    let selected = reader::decode_subscribed(packet, limits)?;
+    if selected.subscription != subscribe.subscription
+        || Some(selected.source) != subscribe.target.group_source()
+        || matches!(subscribe.start, reader::Start::Offset(offset) if offset != selected.resolved_offset)
+    {
+        return Err(BrokerLinkError::Response);
+    }
+    Ok(Reply::Subscribed(selected))
 }
 
 enum Event {
@@ -549,8 +614,7 @@ impl Driver {
         let node = peer
             .peer_identity
             .as_deref()
-            .and_then(|id| <[u8; 16]>::try_from(id).ok())
-            .map(NodeId::from_bytes);
+            .and_then(crate::transport::decode_peer_identity);
         if let Some(link) = self
             .links
             .iter_mut()
@@ -562,6 +626,9 @@ impl Driver {
     }
 
     fn receive_control(&mut self, identity: Bytes, body: Message) -> Result<(), BrokerLinkError> {
+        let Some(identity) = crate::transport::native_peer_identity(identity) else {
+            return Ok(());
+        };
         let Some(remote) = <[u8; 16]>::try_from(identity.as_ref())
             .ok()
             .map(NodeId::from_bytes)
@@ -580,6 +647,9 @@ impl Driver {
         body: Message,
     ) -> Result<(), BrokerLinkError> {
         let Some(identity) = receipt.identity_bytes() else {
+            return Ok(());
+        };
+        let Some(identity) = crate::transport::native_peer_identity(identity) else {
             return Ok(());
         };
         let Some(remote) = <[u8; 16]>::try_from(identity.as_ref())
@@ -701,7 +771,7 @@ impl Driver {
                     let frame = link.frame().filter(|_| !link.missing_route).cloned();
                     waits.push(async move {
                         if let Some(frame) = frame {
-                            socket.wait_send_progress_for(&frame).await;
+                            crate::transport::wait_send_peer(&socket, &frame).await;
                         } else {
                             std::future::pending::<()>().await;
                         }
@@ -781,3 +851,40 @@ pub(super) fn track(message: &Message, lease: &Arc<Lease>, compact: bool) -> Mes
 
 #[cfg(test)]
 mod tests;
+
+fn reader_rejection(
+    reply: nack::Nack<'_>,
+    reader_request: bool,
+    hint: Option<nack::AuthorityHint>,
+) -> BrokerLinkError {
+    if reader_request && reply.code == 14 && reply.detail.len() == 8 {
+        BrokerLinkError::RetentionGap {
+            earliest: ozzy_proto::Offset::new(u64::from_be_bytes(
+                reply.detail.try_into().expect("retention floor"),
+            )),
+        }
+    } else if reader_request && reply.code == 19 && reply.detail.len() == 8 {
+        BrokerLinkError::Seek(ozzy_core::reader::seek::SeekError::NotFound {
+            earliest: ozzy_proto::Offset::new(u64::from_be_bytes(
+                reply.detail.try_into().expect("seek floor"),
+            )),
+        })
+    } else if reader_request && reply.code == 20 && reply.detail.len() == 16 {
+        BrokerLinkError::Seek(ozzy_core::reader::seek::SeekError::Ambiguous {
+            first: ozzy_proto::Offset::new(u64::from_be_bytes(
+                reply.detail[..8].try_into().expect("first match"),
+            )),
+            last: ozzy_proto::Offset::new(u64::from_be_bytes(
+                reply.detail[8..].try_into().expect("last match"),
+            )),
+        })
+    } else if reader_request && matches!(reply.code, 14 | 19 | 20) {
+        BrokerLinkError::Response
+    } else {
+        BrokerLinkError::Rejected {
+            code: reply.code,
+            retry: reply.retry,
+            hint,
+        }
+    }
+}

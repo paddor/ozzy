@@ -143,9 +143,22 @@ impl<J: RecoveryStorage + 'static> ScheduledRecovery<J> {
         .then_some(request)
     }
 
+    /// Exact checkpoint range requiring the same bounded data-plane reservations.
+    pub fn checkpoint_receive_demand(&self) -> Option<ozzy_replication::wire::CheckpointRequest> {
+        let Phase::Active(actor) = &self.phase else {
+            return None;
+        };
+        let request = actor.checkpoint_fetch?.0;
+        (self.active
+            && !actor.abandoning
+            && actor.pending.is_none()
+            && self.session(request.source.voter).is_some())
+        .then_some(request)
+    }
+
     /// Installing a chunk keeps its receive reservation until backing is freed.
     pub fn receive_has_work(&self) -> bool {
-        matches!(&self.phase, Phase::Active(actor) if matches!(actor.pending, Some(super::Pending::Chunk(_))))
+        matches!(&self.phase, Phase::Active(actor) if matches!(actor.pending, Some(super::Pending::Chunk(_) | super::Pending::Checkpoint(_))))
     }
 
     /// Session comes from the frontend's independently established link table.
@@ -412,6 +425,11 @@ fn set_session<J: RecoveryStorage>(
         actor.outbox.discard(peer, class);
     }
     actor.retries[slot].at = now;
+    if let Some((request, retry)) = &mut actor.checkpoint_fetch
+        && request.source.voter == peer
+    {
+        retry.at = now;
+    }
     if let Some((request, retry)) = &mut actor.fetch
         && request.source.voter == peer
     {
@@ -450,5 +468,55 @@ fn schedule_actor(error: ScheduleError) -> ActorError {
     match error {
         ScheduleError::Actor(error) => error,
         _ => ActorError::StartupMismatch,
+    }
+}
+
+impl ScheduledRecovery<ShardRecoveringJournal> {
+    pub(in crate::replica_actor) fn quarantine(normal: ScheduledReplica) -> Self {
+        let owner = normal.receive_owner.clone();
+        let super::ReplicaActor {
+            configuration,
+            local,
+            config,
+            journal,
+            mut ids,
+            status,
+            ..
+        } = normal.into_actor();
+        let sessions = config.sessions;
+        let observation = status.subscribe();
+        status.send_modify(|state| {
+            state.normal = None;
+            state.application_ready = false;
+            state.disk_pending = true;
+        });
+        let future = async move {
+            let generations = crate::replica_journal::OwnedRecoveryGenerations {
+                attempt: ids.generation()?,
+                temporary: ids.generation()?,
+            };
+            let (journal, startup) = Box::pin(journal.into_recovering(generations)).await?;
+            let mut actor = RecoveryActor::new_with_ids(
+                journal,
+                startup,
+                config,
+                super::RecoveryTiming::default(),
+                ids,
+            )?;
+            actor.status = status;
+            Ok(Transition::Retry(Box::new(actor)))
+        }
+        .boxed_local();
+        Self {
+            phase: Phase::Changing(future),
+            configuration,
+            local,
+            sessions,
+            status: observation,
+            owner,
+            now: Duration::ZERO,
+            origin: None,
+            active: true,
+        }
     }
 }

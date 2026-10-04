@@ -103,6 +103,7 @@ fn owned_partition_creation_rejects_changed_identity_without_changing_policy() {
     let before = driver.snapshot();
     for case in 0..5 {
         let mut changed = definition();
+        changed.retention.max_bytes = std::num::NonZeroU64::new(1234);
         match case {
             0 => changed.stream = "different",
             1 => changed.topic = "different",
@@ -122,10 +123,8 @@ fn owned_partition_creation_rejects_changed_identity_without_changing_policy() {
         );
         assert_eq!(driver.snapshot(), before);
     }
-    let mut existing = definition();
-    existing.retention.max_bytes = std::num::NonZeroU64::new(1234);
     let mut buffer = journal.lease_proposal_buffer().unwrap();
-    buffer.prepare_partition(existing).unwrap();
+    buffer.prepare_partition(definition()).unwrap();
     assert!(
         buffer
             .push(ozzy_journal::operation::OperationKind::Barrier, &[77; 16])
@@ -145,6 +144,75 @@ fn owned_partition_creation_rejects_changed_identity_without_changing_policy() {
             .retention,
         RetentionPolicy::default()
     );
+    drive(&mut controller, journal.shutdown()).unwrap();
+}
+
+fn policy_request(journal: &OwnedJournal) -> ProposalBuffer {
+    let mut existing = definition();
+    existing.retention.max_bytes = std::num::NonZeroU64::new(1234);
+    let mut buffer = journal.lease_proposal_buffer().unwrap();
+    buffer.prepare_partition(existing).unwrap();
+    buffer
+}
+
+#[test]
+fn owned_partition_policy_retry_waits_for_confirmation_and_survives_reopen() {
+    let (mut controller, io) = setup();
+    let config = local_config();
+    let (mut journal, mut driver) = drive(
+        &mut controller,
+        OwnedJournal::format_local(config.clone(), io.clone(), JournalGeneration(1), 32768),
+    )
+    .unwrap();
+    initialize(&mut controller, &mut journal, &mut driver);
+    let before = driver.snapshot().applied;
+    let buffer = policy_request(&journal);
+    let receipt = admit(&mut controller, &mut journal, &mut driver, buffer);
+    let accepted = driver.snapshot().accepted;
+    assert_eq!(accepted.op.0, before.op.0 + 1);
+    assert_eq!(
+        journal
+            .images()
+            .unwrap()
+            .committed()
+            .partition(partition())
+            .unwrap()
+            .retention,
+        RetentionPolicy::default()
+    );
+    let buffer = policy_request(&journal);
+    assert_eq!(
+        resolved(&mut controller, &mut journal, &driver, buffer),
+        accepted
+    );
+    assert_eq!(driver.snapshot().applied, before);
+    write(&mut controller, &mut journal, &mut driver, receipt);
+    sync_apply(&mut controller, &mut journal, &mut driver);
+    let buffer = policy_request(&journal);
+    assert_eq!(
+        resolved(&mut controller, &mut journal, &driver, buffer),
+        accepted
+    );
+    drive(&mut controller, journal.shutdown()).unwrap();
+    let (mut journal, driver) = drive(
+        &mut controller,
+        OwnedJournal::open_local(config, io, JournalGeneration(2)),
+    )
+    .unwrap();
+    let policy = journal
+        .images()
+        .unwrap()
+        .committed()
+        .partition(partition())
+        .unwrap();
+    assert_eq!(policy.policy_revision, 2);
+    assert_eq!(policy.retention.max_bytes.unwrap().get(), 1234);
+    let buffer = policy_request(&journal);
+    assert_eq!(
+        resolved(&mut controller, &mut journal, &driver, buffer),
+        accepted
+    );
+    assert_eq!(driver.snapshot().accepted, accepted);
     drive(&mut controller, journal.shutdown()).unwrap();
 }
 

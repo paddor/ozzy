@@ -37,6 +37,7 @@ fn image() -> SegmentIndexImage {
         64 * 1024,
         vec![
             OffsetIndexEntry {
+                append_timestamp_millis: 77,
                 partition: second_partition,
                 offset: Offset::new(8),
                 location: RecordLocation {
@@ -46,6 +47,7 @@ fn image() -> SegmentIndexImage {
                 },
             },
             OffsetIndexEntry {
+                append_timestamp_millis: 0,
                 partition: first_partition,
                 offset: Offset::new(4),
                 location: RecordLocation {

@@ -142,8 +142,8 @@ impl RecoveryDirectory {
     }
 
     /// Create a fresh private generation without reading damaged segment bytes.
-    /// This full-recovery path requires retained history to start at genesis;
-    /// checkpoint-based stores need a matching checkpoint/repair installation.
+    /// Old checkpoint and segment generations remain unselected and untouched.
+    /// Fresh external authority must provide state plus its required history.
     pub async fn recover_nonvoting(
         mut self,
         configuration: &[u8],
@@ -151,10 +151,7 @@ impl RecoveryDirectory {
         max_orphan_probes: usize,
     ) -> Result<Journal, DirectoryError> {
         let marker = recovery_marker(configuration)?;
-        if self.configuration != marker
-            || self.manifest.checkpoint.is_some()
-            || self.manifest.segments[0].first_chain != ChainPosition::GENESIS
-        {
+        if self.configuration != marker {
             return Err(DirectoryError::ConfigurationMismatch);
         }
         self.require_selected(&marker).await?;
@@ -207,6 +204,7 @@ impl RecoveryDirectory {
             next.parent_generation = self.manifest.generation;
             next.accepted = LogPosition::GENESIS;
             next.committed = LogPosition::GENESIS;
+            next.checkpoint = None;
             next.segments = vec![SegmentReference {
                 segment_id,
                 file_generation: 0,

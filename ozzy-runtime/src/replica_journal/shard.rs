@@ -59,6 +59,7 @@ pub struct ShardJournal {
     failed: bool,
     shutdown: Option<LocalBoxFuture<'static, bool>>,
     finished: bool,
+    retain: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -142,7 +143,8 @@ pub(super) async fn yield_turn() {
 fn needs_settled_writes(action: &Action, owner: &OwnedJournal) -> bool {
     matches!(
         action,
-        Action::Promise { .. }
+        Action::Retention { .. }
+            | Action::Promise { .. }
             | Action::Sync { .. }
             | Action::CaptureHistory { .. }
             | Action::BeginInstall { .. }
@@ -197,6 +199,7 @@ impl ShardJournal {
             failed: false,
             shutdown: None,
             finished: false,
+            retain: false,
         }
     }
     pub(super) fn is_closed(&self) -> bool {
@@ -399,6 +402,10 @@ impl ShardJournal {
                     && self.jobs.is_empty()
                     && self.writes.is_empty()
                 {
+                    if self.retain && !self.failed {
+                        self.finished = true;
+                        return Poll::Ready(false);
+                    }
                     let state = self.state.take().expect("settled owner");
                     self.shutdown =
                         Some(async move { state.owner.shutdown().await.is_err() }.boxed_local());
@@ -420,5 +427,48 @@ impl ShardJournal {
         }
         cx.waker().wake_by_ref();
         Poll::Pending
+    }
+}
+
+impl ShardJournal {
+    async fn take_recovering(
+        &mut self,
+        generations: super::OwnedRecoveryGenerations,
+    ) -> Result<(super::ShardRecoveringJournal, super::RecoveryStartup), JournalError> {
+        self.retain = true;
+        self.close();
+        if std::future::poll_fn(|cx| self.poll_finished(cx)).await {
+            return Err(JournalError::Faulted);
+        }
+        let owner = self.state.take().ok_or(JournalError::Faulted)?.owner;
+        let (config, io, memory) = owner.recovery_parts()?;
+        owner.shutdown().await?;
+        let (mut owner, startup) = super::OwnedRecoveringJournal::start(
+            config,
+            io,
+            generations,
+            super::OwnedRecoveryOpen::Quarantine,
+        )
+        .await?;
+        if let Some(memory) = memory {
+            owner.bind_append_source(memory)?;
+        }
+        let timestamp = std::mem::replace(&mut self.timestamp, Box::new(|| 0));
+        let journal = super::ShardRecoveringJournal::from_owned(owner, self.config, timestamp)?;
+        Ok((journal, startup))
+    }
+}
+
+impl super::ReplicaJournal {
+    pub(crate) async fn into_recovering(
+        mut self,
+        generations: super::OwnedRecoveryGenerations,
+    ) -> Result<(super::ShardRecoveringJournal, super::RecoveryStartup), JournalError> {
+        match &mut self.execution {
+            super::execution::Execution::Normal(owner) => {
+                Box::pin(owner.take_recovering(generations)).await
+            }
+            super::execution::Execution::Recovery(_) => Err(JournalError::Configuration),
+        }
     }
 }

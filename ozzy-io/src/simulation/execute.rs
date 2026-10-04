@@ -240,7 +240,13 @@ impl Files {
             .checked_add(length)
             .is_none_or(|end| end > limits.file_bytes as u64)
         {
-            return Err(io::ErrorKind::StorageFull.into());
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                format!(
+                    "simulation allocation {offset} + {length} exceeds {} file bytes",
+                    limits.file_bytes
+                ),
+            ));
         }
         // KEEP_SIZE changes no readable bytes. Allocation failure is also an
         // explicit fault event; this model does not emulate extent accounting.

@@ -477,12 +477,15 @@ impl AppendBuffer {
             return Err(JournalError::AppendMismatch);
         }
         let new_epoch = match (request.mode, request.expected_epoch) {
-            (ozzy_proto::producer::Mode::Resume, None) => 1,
+            (ozzy_proto::producer::Mode::Resume | ozzy_proto::producer::Mode::Create, None) => 1,
             (ozzy_proto::producer::Mode::Resume, Some(epoch)) => epoch,
             (ozzy_proto::producer::Mode::Fence, Some(epoch)) => {
                 epoch.checked_add(1).ok_or(JournalError::AppendMismatch)?
             }
-            (ozzy_proto::producer::Mode::Fence, None) => return Err(JournalError::AppendMismatch),
+            (ozzy_proto::producer::Mode::Fence, None)
+            | (ozzy_proto::producer::Mode::Create, Some(_)) => {
+                return Err(JournalError::AppendMismatch);
+            }
         };
         if new_epoch == 0
             || request.expected_epoch == Some(0)
@@ -512,7 +515,7 @@ impl AppendBuffer {
         Ok(())
     }
 
-    fn push_typed_body(
+    pub(super) fn push_typed_body(
         &mut self,
         body: &ozzy_journal::operation::OperationBody<'_>,
     ) -> Result<(), JournalError> {

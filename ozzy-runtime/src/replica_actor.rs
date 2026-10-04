@@ -31,6 +31,7 @@ mod shared_readers;
 pub use shared_readers::SharedReaderConfig;
 mod recovery;
 mod scheduled;
+mod startup;
 pub use scheduled::{ScheduleError, ScheduledReplica};
 mod partitions;
 pub use partitions::{PartitionActor, PartitionActors, PartitionError, PartitionStatus};
@@ -97,6 +98,8 @@ impl SyncBatchTarget {
 /// Initial sessions and hard work bounds for one replica actor.
 #[derive(Debug, Clone, Copy)]
 pub struct ActorConfig {
+    /// Periodic bounded retention turns; absent for unlimited topic policies.
+    pub retention_interval: Option<Duration>,
     /// Session with each voter in configuration order. The local entry is unused.
     /// Each remote entry must match that peer's binding for this connection.
     /// Zero means no established link. It permits startup, never wire admission.
@@ -149,7 +152,10 @@ impl ActorConfig {
             WireLimits::for_transfer(self.transfer.max_operations, self.transfer.max_body_bytes)
                 .ok_or(ActorError::Limits)?;
         let message_bytes = limits.message_bytes().ok_or(ActorError::Limits)?;
-        if self.pipeline.max_operations == 0
+        if self
+            .retention_interval
+            .is_some_and(|interval| interval.is_zero())
+            || self.pipeline.max_operations == 0
             || self.replay_cache.max_operations < self.pipeline.max_operations
             || self.replay_cache.max_operations > 65536
             || self.replay_cache.max_body_bytes < self.pipeline.max_body_bytes
@@ -243,6 +249,9 @@ pub struct ReplicaActor {
         Duration,
         ozzy_journal_segment::StorageValidationBudget,
     )>,
+    retention_at: Option<Duration>,
+    startup_probe: Option<startup::Probe>,
+    recovery_required: bool,
     donors: Option<Box<donors::Donors>>,
     configuration: Configuration,
     local: NodeId,
@@ -403,6 +412,21 @@ impl ReplicaActor {
             application_ready: false,
             running: false,
         });
+        let startup_probe = if config.retention_interval.is_some()
+            && source.accepted.op.0 > 0
+            && driver.normal().is_none()
+        {
+            Some(startup::Probe::new(
+                wire::RecoveryRequest {
+                    scope: driver.scope(),
+                    request_id: ids.request()?,
+                    nonce: ids.request()?,
+                },
+                source.accepted,
+            ))
+        } else {
+            None
+        };
         let wanted_pin = Some((driver.scope(), source));
         Ok(Self {
             maintenance_status: MaintenanceStatus::default(),
@@ -410,6 +434,9 @@ impl ReplicaActor {
             metadata_cleanup: None,
             orphan_cleanup: None,
             foreground_turn_due: false,
+            retention_at: config.retention_interval,
+            startup_probe,
+            recovery_required: false,
             donors: None,
             ready_work: std::sync::Arc::new(crate::signal::DataSignal::default()),
             incoming: VecDeque::with_capacity(1024),
@@ -502,6 +529,10 @@ impl ReplicaActor {
         self.ready_work.drain(|| ());
         self.drain_incoming(now)?;
         self.ingress.begin_round();
+        if self.startup_round(now)? {
+            self.publish_status(true);
+            return Ok(());
+        }
         // At most four fixed controls (eight destinations), one history chunk,
         // and one disk submission per iteration. Each chunk has byte/count bounds.
         for _ in 0..4 {
@@ -608,7 +639,7 @@ impl ReplicaActor {
             }),
             _ => None,
         };
-        if let Some(source) = source {
+        if let Some(source) = source.filter(|_| !self.application_ready()) {
             self.wanted_pin = Some((control.scope(), source));
             if self.pinned != Some(source) {
                 return Ok(());
@@ -696,6 +727,15 @@ impl ReplicaActor {
             return Ok(());
         };
         match decoded {
+            ReplicaMessage::Recovery(wire::RecoveryMessage::State(state))
+                if self.startup_probe.is_some() =>
+            {
+                self.startup_response(index, &state);
+            }
+            ReplicaMessage::HistoryRetired(notice) => self.receive_retired(from, notice, now)?,
+            ReplicaMessage::Checkpoint(wire::CheckpointMessage::Request(request)) => {
+                self.queue_recovery_checkpoint(from, request);
+            }
             ReplicaMessage::Flow(flow) => self.receive_flow(index, flow, now)?,
             ReplicaMessage::Control(control) => {
                 self.receive_control(from, control, now)?;
@@ -709,6 +749,7 @@ impl ReplicaActor {
                 self.receive_recovery(index, request)?;
             }
             ReplicaMessage::Recovery(wire::RecoveryMessage::State(_))
+            | ReplicaMessage::Checkpoint(wire::CheckpointMessage::Chunk { .. })
             | ReplicaMessage::Prepare(_) => {}
         }
         Ok(())

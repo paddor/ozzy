@@ -85,6 +85,22 @@ impl LocalActor {
             return Ok(false);
         };
         let changed = match &mut pending {
+            Pending::Retention(work) => match Pin::new(work).poll(cx) {
+                Poll::Pending => false,
+                Poll::Ready(result) => {
+                    let turn = result?;
+                    if !turn.enabled {
+                        self.retention_at = None;
+                    }
+                    if let Some(buffer) = turn.proposal {
+                        self.waiting = Some(super::Submission {
+                            buffer,
+                            reply: super::Reply::maintenance(),
+                        });
+                    }
+                    true
+                }
+            },
             Pending::Ready(_) => false,
             Pending::Propose(work) => match Pin::new(work).poll(cx) {
                 Poll::Pending => false,
@@ -152,7 +168,7 @@ impl LocalActor {
                 reply,
                 buffer: Some(buffer.0),
             }),
-            ProposalValidation::Ready(validated) if self.closing => {
+            ProposalValidation::Ready(validated) if self.closing || reply.fenced() => {
                 reply.finish(validated.into_buffer().into(), ProposalOutcome::NotAdmitted);
             }
             ProposalValidation::Ready(validated) => {

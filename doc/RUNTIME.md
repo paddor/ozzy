@@ -36,6 +36,15 @@ transport for both roles. Its two PEER sockets connect every configured broker;
 three brokers mean six TCP connections, not six PEER sockets. Live readers use
 one additional SUB per broker, shared across topics.
 
+Topic discovery attempts each configured broker under one request deadline and
+the existing per-broker control reservations. The first complete, validated
+catalog supplies metadata; pages from different brokers are never combined.
+Each attempt is bounded by `maximum_partitions`. Completing discovery cancels
+the other observers, and the transport owner reclaims their slots after noticing
+cancellation. Late responses retain their original request and session fences.
+Session replacement restarts that broker's catalog at page zero with fresh
+request IDs and the original deadline.
+
 ```mermaid
 flowchart TD
     CP[Control PEER]
@@ -91,6 +100,16 @@ Count/byte bounds include that backlog. A full backlog stops admission and
 propagates pressure to producers. Canceling a wait frees neither the running
 job's buffers nor its handles. Unclean restart follows nonvoting recovery;
 RAM-confirmed history is not a durable prefix.
+
+Recovery donors reserve a journal drain turn before pinning authoritative history.
+Outstanding writes and an independent sync barrier must settle and be observed
+before pin admission. The request remains queued during that wait; a busy journal
+does not terminate a healthy donor or supply recovery or quorum evidence.
+
+Addressed history reads also check journal admission before submitting work.
+An independent reader or lookup can hold the owner while the replica has no
+pending action. The requester retains and retries `FETCH_OPS` during that wait;
+the donor creates no extra queue and keeps the existing source and scope checks.
 
 ### Local durable pipeline
 
@@ -161,9 +180,19 @@ transport aliases release backing. Reservations cover unused lanes, packing
 slots, metadata, replies, and outstanding requests. Multipart-table reservation
 scales with requests/intake, not records multiplied by maximum parts per request.
 
+Producer resume and takeover resolve every partition before admitting records.
+Their stable transition identity survives response retries. Each attempt uses
+the producer retry timeout, so a dead leader cannot stall attachment for a longer
+shared-link request timeout. Topic routes and OMQ links handle reconnection.
+
+Recovery copies a correlated checkpoint chunk into bounded owner memory before
+queueing it. The charge survives cooperative validation and journal completion.
+Allocation pressure preserves the outstanding request for transport retry.
+
 ## Readers
 
-A reader subscribes at an exact offset with a fresh generation. The broker seeks
+A reader subscribes with a selector and fresh generation. The broker resolves
+the selector once, returns its offset, then seeks
 an indexed cursor and parks at the applied end. Confirmed appends, source changes,
 and buffer releases wake it. Capture checks applied metadata on the partition
 owner; only record retrieval creates an asynchronous file job/payload lease.
@@ -173,6 +202,21 @@ PEER RECORDS uses the data socket; SUBSCRIBE, SUBSCRIBED, ACK, cancellation,
 and NACK use control. A full SDK inbox retains the original frame and pauses
 its exact data source. Application release resumes it. Readers sharing one
 broker connection share pressure; another SDK connection remains independent.
+
+The SDK transport owner decodes SUBSCRIBED and UNSUBSCRIBED into fixed-size
+cursor completions before returning control-frame admission. An idle reader
+retains only its completion, covered by the subscription's metadata reservation;
+it cannot pin the raw control reply and block producer attachment. Request,
+session, source, subscription generation, and resolved-offset checks precede
+completion. Raw directory, producer, and ACK replies retain their frame charges
+until their observers release the backing.
+
+Reader cancellation carries its original link session through detached cleanup,
+control-slot admission, and the transport owner's send turn. A disconnected or
+replaced session completes that cleanup locally, even while another caller holds
+all control slots. Old cancellation never waits for reconnect or uses a new link
+session. A missing cancellation reply on the original live session still returns
+a timeout; source and response validation remain mandatory.
 
 An offset gap on PEER starts a fresh subscription generation at the next
 undelivered offset. Old-generation frames are discarded. Data readiness may
@@ -249,11 +293,18 @@ Serving and recovery preflight submit owned file jobs. The backend owns handles
 and execution; the actor owns journal state. Install results in submission order
 and only for the matching generation. Completion observers must notice the owner
 returning from suspended work without requiring another message or timer.
+Externally supplied backends accept explicit partition recovery selections through
+the same startup path. All selected stores pass backend preflight before any
+partition can publish replacement authority.
 
 One AIO thread per device submits/reaps direct writes. Fixed helpers handle
 open/read/sync/rename/close and reserved progress work. Pool backends use the same
 contract. Device-wide admission counts queued, running, and canceled-but-unsettled
-work. Shutdown drains journals, frontend/shards, and then backend workers.
+work. Frontend and application owners share one shutdown request, with separate
+completion and error state. Either owner observes a request before the other can
+close its lanes. Shutdown then drains journals, frontend/shards, and backend
+workers. A shard queue closing after that shared request is expected drainage;
+the same closure during service is fatal.
 
 Write handles stay open until roll/shutdown. A four-entry LRU holds read handles
 for exact path/source identities. Eviction drops only its lease; running reads

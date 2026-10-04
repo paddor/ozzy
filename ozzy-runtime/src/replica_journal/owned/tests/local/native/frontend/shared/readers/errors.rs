@@ -23,7 +23,7 @@ async fn scenario() {
                         links.clone(),
                         "orders",
                         TopicReaderConfig {
-                            checkpoint: Some(TopicCheckpoint {
+                            start: crate::replicated::ReaderStart::Checkpoint(TopicCheckpoint {
                                 topic: metadata.id(),
                                 positions: vec![(0, Offset::new(1))],
                             }),

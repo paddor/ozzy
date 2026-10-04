@@ -119,7 +119,7 @@ fn owned_storage_scan_old_scope_cannot_reinstall_after_promise() {
     drive(&mut controller, replica.journal.shutdown()).unwrap();
 }
 
-fn orphan(controller: &mut Controller, io: &Local, path: PathBuf) {
+pub(super) fn orphan(controller: &mut Controller, io: &Local, path: PathBuf) {
     drive(controller, async {
         let opened = io
             .execute(

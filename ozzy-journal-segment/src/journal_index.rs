@@ -1,6 +1,7 @@
 //! Stable indexed-read snapshot spanning sealed and active segments.
 
 pub(crate) mod asynchronous;
+pub(crate) mod seek;
 
 use std::fs::File;
 use std::io::{self, Read};

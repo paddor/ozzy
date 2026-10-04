@@ -22,7 +22,10 @@ impl<C> Delivery<C> {
     pub(crate) fn new(request: Envelope, subscribe: Subscribe, source: Source, cursor: C) -> Self {
         Self {
             request,
-            next: subscribe.start,
+            next: match subscribe.start {
+                reader::Start::Offset(offset) => offset,
+                _ => 0,
+            },
             subscribe,
             source,
             cursor,

@@ -80,6 +80,12 @@ impl Failure {
         failure.size = 16;
         failure
     }
+    pub(crate) fn ambiguous(first: u64, last: u64) -> Self {
+        let mut failure = Self::position(20, first);
+        failure.detail[8..].copy_from_slice(&last.to_be_bytes());
+        failure.size = 16;
+        failure
+    }
 }
 
 #[cfg(test)]

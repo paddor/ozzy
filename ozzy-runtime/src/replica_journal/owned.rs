@@ -9,7 +9,9 @@ use mode::Mode;
 mod donor;
 mod history;
 mod identities;
-pub use donor::{CompletedRecoveryRead, PreparedRecoveryRead};
+pub use donor::{
+    CompletedCheckpointRead, CompletedRecoveryRead, PreparedCheckpointRead, PreparedRecoveryRead,
+};
 mod install;
 mod maintenance;
 pub use maintenance::{
@@ -19,8 +21,10 @@ mod ownership;
 mod producer_session;
 mod proposal;
 mod read;
+pub(in crate::replica_journal) mod seek;
 pub use read::{CompletedDelivery, CompletedRead, PartitionDelivery, PreparedRead};
 mod replay;
+mod retention;
 pub use replay::{CompletedReplay, PreparedReplay};
 mod receiving;
 pub use receiving::{RecoveringJournal, RecoveryGenerations, RecoveryOpen};
@@ -61,6 +65,7 @@ use super::{
 /// poll these operations locally through its bounded command contract.
 #[derive(Debug)]
 pub struct OwnedJournal {
+    retention: retention::Retention,
     journal: JournalOwner,
     configuration: Mode,
     scope: Scope,
@@ -79,6 +84,7 @@ pub struct OwnedJournal {
     limits: AsyncJournalLimits,
     recovery: CanonicalRecoveryLimits,
     buffer_generation: JournalGeneration,
+    append_buffers: usize,
     buffers: Arc<Semaphore>,
     append_memory: Option<crate::memory::Owner>,
     append_leased: std::cell::Cell<bool>,
@@ -262,6 +268,7 @@ impl OwnedJournal {
         let applied = prefix(journal.committed_position()?);
         let generation = journal.writer().durable_position().generation();
         Ok(Self {
+            retention: retention::Retention::default(),
             journal: JournalOwner::Ready(Box::new(journal)),
             configuration,
             scope,
@@ -280,6 +287,7 @@ impl OwnedJournal {
             limits: config.limits,
             recovery: config.recovery,
             buffer_generation: generation,
+            append_buffers: config.append_buffers,
             buffers: Arc::new(Semaphore::new(config.append_buffers)),
             append_memory: None,
             append_leased: std::cell::Cell::new(false),

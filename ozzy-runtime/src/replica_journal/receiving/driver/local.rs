@@ -214,6 +214,16 @@ async fn run(
         unreachable!("recovery admits only transfer work");
     };
     let failed = match action {
+        ReceiveAction::Checkpoint {
+            ticket,
+            offset,
+            bytes,
+            done,
+        } => finish(
+            done,
+            owner.receive_checkpoint(ticket, offset, &bytes).await,
+            permit,
+        ),
         ReceiveAction::Begin {
             ticket,
             config,
@@ -225,7 +235,7 @@ async fn run(
             done,
         } => finish(done, owner.receive_chunk(ticket, buffer).await, permit),
         ReceiveAction::Finish { ticket, done } => {
-            finish(done, owner.finish_recovery(ticket).await, permit)
+            finish(done, Box::pin(owner.finish_recovery(ticket)).await, permit)
         }
         ReceiveAction::Abort { ticket, done } => {
             finish(done, owner.abort_recovery(ticket).await, permit)
@@ -280,6 +290,41 @@ impl RecoveryStorage for ShardRecoveringJournal {
                 _ => unreachable!("preserved action"),
             },
         )
+    }
+    fn receive_checkpoint(
+        &mut self,
+        ticket: RecoveryTicket,
+        offset: u64,
+        bytes: bytes::Bytes,
+    ) -> Result<JournalCompletion<crate::replica_journal::CheckpointProgress>, SubmitError> {
+        // Release transport backing before dequeue capacity can be reused.
+        // Cooperative validation may retain this command across many turns.
+        let bytes = if let Some(memory) = &self.memory {
+            let mut copy = memory
+                .try_lease(bytes.len())
+                .map_err(|_| SubmitError::Full)?;
+            copy.copy_from_slice(&bytes);
+            copy.freeze()
+        } else {
+            bytes
+        };
+        self.journal
+            .submit(
+                bytes,
+                |bytes, done| {
+                    Action::Receiving(ReceiveAction::Checkpoint {
+                        ticket,
+                        offset,
+                        bytes,
+                        done,
+                    })
+                },
+                |action| match action {
+                    Action::Receiving(ReceiveAction::Checkpoint { bytes, .. }) => bytes,
+                    _ => unreachable!("preserved action"),
+                },
+            )
+            .map_err(|rejected| rejected.reason)
     }
     fn finish_recovery(
         &mut self,

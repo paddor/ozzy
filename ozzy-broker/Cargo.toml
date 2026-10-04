@@ -33,7 +33,9 @@ rustix = { workspace = true, features = ["thread"] }
 ozzy-io-aio.workspace = true
 
 [dev-dependencies]
+loom = "0.7"
 ozzy-io = { workspace = true, features = ["simulation"] }
+ozzy-runtime = { workspace = true, features = ["simulation"] }
 
 [lints]
 workspace = true
@@ -45,3 +47,7 @@ path = "src/main.rs"
 [[test]]
 name = "ozzy_broker_config"
 path = "tests/config.rs"
+
+[[test]]
+name = "ozzy_broker_loom"
+path = "tests/loom.rs"

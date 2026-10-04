@@ -164,6 +164,29 @@ impl ReadPartition {
 }
 
 impl ReplicaJournal {
+    /// Resolve a confirmed history selector through detached bounded file jobs.
+    pub fn seek_reader(
+        &mut self,
+        ticket: ValidationTicket,
+        partition: PartitionIncarnation,
+        start: ozzy_proto::reader::Start,
+    ) -> Result<JournalCompletion<PartitionReadCursor>, super::SubmitError> {
+        self.submit(
+            start,
+            |start, done| Action::Seek {
+                ticket,
+                partition,
+                start,
+                done,
+            },
+            |action| match action {
+                Action::Seek { start, .. } => start,
+                _ => unreachable!("seek submission"),
+            },
+        )
+        .map_err(|rejected| rejected.reason)
+    }
+
     /// Resolve a cursor directly against the owner's applied state, without I/O.
     /// `None` selects the applied end. Returns `Ok(None)` while the owner is busy;
     /// opening retains no subscriber slot, snapshot, or command completion.

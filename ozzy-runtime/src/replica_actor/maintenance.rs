@@ -3,6 +3,34 @@
 use super::{ActorError, Duration, PendingIo, ReplicaActor};
 
 impl ReplicaActor {
+    pub(super) fn complete_retention(
+        &mut self,
+        turn: crate::replica_journal::RetentionTurn,
+    ) -> Result<(), ActorError> {
+        if let Some(source) = turn.released {
+            if self.pinned == Some(source) {
+                self.pinned = None;
+            }
+            if self.wanted_pin.is_some_and(|(_, wanted)| wanted == source) {
+                self.wanted_pin = None;
+            }
+        }
+        self.foreground_turn_due = true;
+        if !turn.enabled {
+            self.retention_at = None;
+        }
+        if let Some(buffer) = turn.proposal {
+            if self.work.waiting.is_some() {
+                return Err(ActorError::History);
+            }
+            self.work.waiting = Some(super::ingress::Submission {
+                buffer,
+                reply: super::ingress::Reply::maintenance(),
+            });
+        }
+        Ok(())
+    }
+
     /// Enable periodic byte-bounded storage checks between foreground disk actions.
     ///
     /// Overdue checks drain admitted writes before allowing another write group.
@@ -110,5 +138,36 @@ impl ReplicaActor {
             && !self.work.needs_sync
             && self.application_ready()
             && self.journal.available_command_slots() != 0
+    }
+}
+
+impl ReplicaActor {
+    pub(super) fn retention_round(&mut self, now: Duration) -> Result<(), ActorError> {
+        let snapshot = self.driver.normal().ok_or(ActorError::History)?.snapshot();
+        if snapshot.applied != snapshot.committed {
+            self.pending = Some(PendingIo::Apply(
+                self.journal
+                    .apply_committed(self.driver.begin_validation()?)?,
+            ));
+            return Ok(());
+        }
+        if self.work.waiting.is_some() {
+            self.foreground_turn_due = true;
+            return Ok(());
+        }
+        if snapshot.accepted != snapshot.applied || self.pending_replay.is_some() {
+            return Ok(());
+        }
+        let seed = ozzy_proto::OperationId::from_bytes(*self.ids.request()?.as_bytes());
+        self.pending = Some(PendingIo::Retention(self.journal.retention_turn(
+            self.driver.begin_validation()?,
+            seed,
+            self.configuration.primary(snapshot.scope.view) == self.local,
+        )?));
+        self.retention_at = self
+            .config
+            .retention_interval
+            .map(|interval| now.saturating_add(interval));
+        Ok(())
     }
 }

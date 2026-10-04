@@ -42,6 +42,9 @@ pub struct OffsetIndexEntry {
     pub partition: PartitionIncarnation,
     /// Partition-global record offset.
     pub offset: Offset,
+    /// Broker append time on the first record of a batch; zero on other rows.
+    /// Uses the offset table's existing eight reserved bytes.
+    pub append_timestamp_millis: u64,
     /// Exact physical operation and record coordinates.
     pub location: RecordLocation,
 }
@@ -132,6 +135,11 @@ pub fn derive_index_entries(
             offsets.push(OffsetIndexEntry {
                 partition: batch.partition,
                 offset,
+                append_timestamp_millis: if record_index == 0 {
+                    batch.append_timestamp_millis
+                } else {
+                    0
+                },
                 location: RecordLocation {
                     operation: location,
                     batch_index,

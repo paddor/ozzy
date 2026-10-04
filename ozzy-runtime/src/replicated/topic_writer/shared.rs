@@ -1,8 +1,8 @@
 //! Native topic writers over checked numeric metadata and shared broker links.
 
 use super::{
-    Partition, Partitions, PendingRecord, RecordInput, RecordReceipt, RetryPolicy, TopicSelection,
-    TopicWriterError, Writer, WriterConfig, WriterError,
+    Partition, Partitions, PendingRecord, ProducerIdentity, RecordInput, RecordReceipt,
+    RetryPolicy, TopicSelection, TopicWriterError, Writer, WriterConfig, WriterError,
 };
 use crate::{
     replicated::{BrokerLinks, DataLimits, TopicRoutes, WriterStats},
@@ -10,6 +10,9 @@ use crate::{
 };
 use ozzy_proto::{ProducerId, TopicId};
 use std::time::Duration;
+
+mod attachment;
+mod session;
 
 /// Protocol and admission bounds per logical partition writer. The broker-link
 /// owner's aggregate limits include all these unused queues and active frames.
@@ -28,6 +31,30 @@ pub struct SharedTopicWriterConfig {
 }
 
 impl SharedTopicWriterConfig {
+    fn writer(
+        &self,
+        partition: ozzy_proto::PartitionIncarnation,
+        producer_id: ProducerId,
+        producer_epoch: u64,
+        next_sequence: u64,
+        policy: ozzy_proto::append::Policy,
+    ) -> WriterConfig {
+        WriterConfig {
+            policy,
+            partition,
+            owner_epoch: 1,
+            producer_id,
+            producer_epoch,
+            next_sequence,
+            limits: self.limits,
+            compress_payloads: self.compress_payloads,
+            batch_target_bytes: self.batch_target_bytes,
+            linger: Duration::ZERO,
+            max_producers: self.max_producers,
+            inflight_appends: self.inflight_appends,
+        }
+    }
+
     /// Shared-link storage per partition writer, including unused capacity.
     /// `reply_metadata_bytes` is the SDK owner's advertised receive bound.
     /// Reserve every partition's `idle_bytes`, admitted requests separately,
@@ -173,20 +200,7 @@ impl SharedTopicWriter {
             let writer = Writer::open_shared(
                 &routes,
                 number,
-                WriterConfig {
-                    policy: routes.metadata().policy(),
-                    partition: target,
-                    owner_epoch: 1,
-                    producer_id: producer,
-                    producer_epoch: 1,
-                    next_sequence: 0,
-                    limits: config.limits,
-                    compress_payloads: config.compress_payloads,
-                    batch_target_bytes: config.batch_target_bytes,
-                    linger: Duration::ZERO,
-                    max_producers: config.max_producers,
-                    inflight_appends: config.inflight_appends,
-                },
+                config.writer(target, producer, 1, 0, routes.metadata().policy()),
                 retry,
             )
             .await?;
@@ -207,6 +221,13 @@ impl SharedTopicWriter {
     /// One logical identity shared by every partition-local writer session.
     pub fn producer(&self) -> ProducerId {
         self.producer
+    }
+    /// Save this token once for resume or explicit takeover after a crash.
+    pub fn identity(&self) -> ProducerIdentity {
+        ProducerIdentity {
+            topic: self.metadata().id(),
+            producer: self.producer,
+        }
     }
     /// Snapshot APPEND admissions for one numeric partition, including retries
     /// and unconfirmed transmissions. Clones share counters. Unknown partitions

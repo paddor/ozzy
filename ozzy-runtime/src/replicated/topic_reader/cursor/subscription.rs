@@ -36,7 +36,7 @@ impl Cursor {
                 partition: partition.incarnation,
                 owner_epoch: 1,
             },
-            start: self.next,
+            start: self.selector.unwrap_or(reader::Start::Offset(self.next)),
         };
         let links = links.clone();
         self.opening = Some(Opening {
@@ -79,20 +79,17 @@ impl Cursor {
         &mut self,
         links: &BrokerLinks,
     ) -> Option<Returning> {
-        let selected = self
-            .selected
-            .take()
-            .map(|(broker, _, selected)| (broker, selected))
-            .or_else(|| self.inbox.selected());
+        let selected = self.selected.take().or_else(|| self.inbox.selected());
         self.opening = None;
         self.pending = None;
         self.held = None;
         self.ready = None;
         self.inbox.clear();
         self.canceling.take().or_else(|| {
-            selected.map(|(broker, selected)| {
+            selected.map(|(broker, session, selected)| {
                 let links = links.clone();
-                Box::pin(async move { links.unsubscribe(broker, selected).await }) as Returning
+                Box::pin(async move { links.unsubscribe(broker, session, selected).await })
+                    as Returning
             })
         })
     }
@@ -107,12 +104,39 @@ impl Cursor {
         if let Some(opening) = &mut self.opening {
             match opening.request.as_mut().poll(cx) {
                 Poll::Ready(Ok(selected)) => {
+                    if self.selector.take().is_some() {
+                        self.next = selected.2.resolved_offset;
+                        self.live = ozzy_core::live::LiveCursor::new(self.next, self.refresh);
+                    }
                     self.opening = None;
                     self.selected = Some(selected);
                     self.accepted = Some(selected);
                 }
                 Poll::Ready(Err(error)) => {
                     self.opening = None;
+                    if let BrokerLinkError::RetentionGap { earliest } = error {
+                        return Err(TopicReaderError::RetentionGap {
+                            partition: self.number,
+                            earliest,
+                        });
+                    }
+                    if let BrokerLinkError::Seek(error) = error {
+                        return Err(match error {
+                            ozzy_core::reader::seek::SeekError::NotFound { earliest } => {
+                                TopicReaderError::RecordNotFound {
+                                    partition: self.number,
+                                    earliest,
+                                }
+                            }
+                            ozzy_core::reader::seek::SeekError::Ambiguous { first, last } => {
+                                TopicReaderError::AmbiguousRecordId {
+                                    partition: self.number,
+                                    first,
+                                    last,
+                                }
+                            }
+                        });
+                    }
                     if !super::retryable(&error) {
                         return Err(error.into());
                     }
@@ -171,12 +195,12 @@ impl Cursor {
 
     pub(super) fn retire(&mut self, links: &BrokerLinks) {
         if self.live.replay().is_none()
-            && let Some((broker, _, selected)) = self.selected.take()
+            && let Some((broker, session, selected)) = self.selected.take()
         {
             let links = links.clone();
             self.inbox.clear();
             self.canceling = Some(Box::pin(async move {
-                links.unsubscribe(broker, selected).await
+                links.unsubscribe(broker, session, selected).await
             }));
         }
     }

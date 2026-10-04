@@ -102,7 +102,7 @@ pub(super) fn reader(target: Placement, binding: Binding, opcode: Opcode) -> Mes
                     partition: target.partition,
                     owner_epoch: 1,
                 },
-                start: 0,
+                start: ozzy_proto::reader::Start::Offset(0),
             },
             &mut metadata,
             limits,
@@ -121,6 +121,7 @@ pub(super) fn reader(target: Placement, binding: Binding, opcode: Opcode) -> Mes
         Opcode::Unsubscribe => reader::encode_unsubscribe(
             envelope,
             reader::Subscribed {
+                resolved_offset: 0,
                 subscription,
                 source,
             },

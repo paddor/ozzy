@@ -5,6 +5,8 @@
 //! Transport/session validation and the single pending future stay with the
 //! adapter. Replacing a subscription must discard both its future and scheduler.
 
+pub mod seek;
+
 /// Result of one bounded read, including any records already selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadOutcome {

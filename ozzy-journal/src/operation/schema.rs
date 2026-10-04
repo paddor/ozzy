@@ -160,7 +160,7 @@ impl CanonicalOperation<'_> {
 pub struct RetentionPolicy {
     /// Optional maximum retained record age in milliseconds.
     pub max_age_millis: Option<NonZeroU64>,
-    /// Optional maximum retained record bytes.
+    /// Optional target for selected segment capacities, including active space.
     pub max_bytes: Option<NonZeroU64>,
 }
 

@@ -29,3 +29,11 @@ path = "tests/snapshot.rs"
 [[test]]
 name = "ozzy_state"
 path = "tests/state.rs"
+
+[[test]]
+name = "ozzy_retention"
+path = "tests/retention.rs"
+
+[[test]]
+name = "ozzy_seek"
+path = "tests/seek.rs"

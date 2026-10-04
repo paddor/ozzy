@@ -5,6 +5,54 @@ use ozzy_proto::{
     producer::{Mode, Open},
 };
 
+#[test]
+fn local_identity_resume_survives_selected_canonical_checkpoint() {
+    let (mut controller, io) = setup();
+    let config = local_config();
+    let (mut journal, mut driver) = drive(
+        &mut controller,
+        OwnedJournal::format_local(config.clone(), io.clone(), JournalGeneration(1), 32768),
+    )
+    .unwrap();
+    initialize(&mut controller, &mut journal, &mut driver);
+    let state = journal.images().unwrap().committed().clone();
+    let limits = config.recovery;
+    let id = ozzy_proto::CheckpointId::from_bytes([99; 16]);
+    drive(
+        &mut controller,
+        journal.journal.ready_mut().unwrap().publish_progress(),
+    )
+    .unwrap();
+    let files = drive(
+        &mut controller,
+        journal
+            .journal
+            .ready_mut()
+            .unwrap()
+            .build_canonical_checkpoint(id, 4096, &state, limits.snapshot),
+    )
+    .unwrap();
+    drive(
+        &mut controller,
+        journal
+            .journal
+            .ready_mut()
+            .unwrap()
+            .install_canonical_checkpoint(id, limits.state, limits.snapshot, limits.checkpoint),
+    )
+    .unwrap();
+    drop(files);
+    drive(&mut controller, journal.shutdown()).unwrap();
+    let (mut journal, driver) = drive(
+        &mut controller,
+        OwnedJournal::open_local(config, io, JournalGeneration(2)),
+    )
+    .unwrap();
+    let buffer = request_for(&journal, &driver, 12, Mode::Resume, None, 100);
+    resolved(&mut controller, &mut journal, &driver, buffer, 1);
+    drive(&mut controller, journal.shutdown()).unwrap();
+}
+
 fn request(
     journal: &OwnedJournal,
     driver: &Driver,
@@ -155,7 +203,7 @@ fn local_producer_resume_preserves_independent_next_sequences_after_restart() {
     )
     .unwrap();
     for (writer, sequence) in [(12, 2), (30, 1)] {
-        let buffer = request_for(&journal, &driver, writer, Mode::Resume, Some(1), 45);
+        let buffer = request_for(&journal, &driver, writer, Mode::Resume, None, 45);
         let result = drive(
             &mut controller,
             journal.propose_append(driver.begin_validation().unwrap(), buffer, 999),

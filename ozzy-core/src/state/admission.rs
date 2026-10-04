@@ -122,6 +122,10 @@ impl CanonicalState {
                 partition: value.partition,
                 producer: value.producer_id,
                 new_epoch: value.new_epoch,
+                transition: super::ProducerTransition {
+                    operation_id: value.operation_id,
+                    expected_epoch: value.expected_epoch,
+                },
             },
             claims,
         ))

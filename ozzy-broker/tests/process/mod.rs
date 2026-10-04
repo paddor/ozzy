@@ -4,8 +4,10 @@ mod client;
 mod cluster;
 mod fixture;
 mod recovery;
+mod soak;
+mod workloads;
 
-use client::Client;
+pub(crate) use client::Client;
 use fixture::Fixture;
 use std::{pin::pin, time::Duration};
 
@@ -116,6 +118,185 @@ async fn cli_tcp_three_brokers_restart_and_confirm_replicated_persisting() {
     )
     .await
     .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cli_tcp_saved_producer_resumes_and_takes_over_after_broker_kills() {
+    for policy in [
+        ozzy_config::Confirmation::DiskQuorum,
+        ozzy_config::Confirmation::ReplicatedPersisting,
+    ] {
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            saved_identity_after_crashes(policy),
+        )
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cli_tcp_retained_history_confirms_with_two_copies_after_active_leader_kill() {
+    for policy in [
+        ozzy_config::Confirmation::DiskQuorum,
+        ozzy_config::Confirmation::ReplicatedPersisting,
+    ] {
+        let fixture = cluster::Cluster::retained(policy).pin_brokers();
+        fixture.provision();
+        let checked = fixture.checked(0);
+        let mut brokers = fixture.start();
+        let mut client = brokers
+            .observe("open retained producer", Client::open(&checked))
+            .await;
+        for wave in 0..12 {
+            let pending = client.queue_large(wave, 256).await;
+            brokers
+                .observe("confirm retention load", client.confirm(pending))
+                .await;
+            brokers
+                .observe("verify retention load", client.replay())
+                .await;
+            client.discard_verified();
+            if wave % 4 == 3 {
+                client = brokers
+                    .observe("resume retention producer", client.reopen_producer(false))
+                    .await;
+            }
+        }
+        for wave in 100..356 {
+            let pending = client.queue(wave).await;
+            brokers
+                .observe("confirm reader churn", client.confirm(pending))
+                .await;
+            brokers
+                .observe("verify reader churn", client.replay())
+                .await;
+            client.discard_verified();
+            if wave % 64 == 0 {
+                client = brokers
+                    .observe("resume churn producer", client.reopen_producer(false))
+                    .await;
+            }
+        }
+        let floor = brokers
+            .observe("verify native retirement", client.retained_floor())
+            .await;
+        assert!(floor.get() > 0, "{policy:?}: no sealed history retired");
+        let leader = client.leader(0);
+        let index = (0..3)
+            .find(|index| {
+                ozzy_proto::NodeId::from_bytes(
+                    *checked.identity.brokers[&format!("broker-{index}")].as_bytes(),
+                ) == leader
+            })
+            .unwrap();
+        brokers.stop(index, "KILL").await;
+        let pending = client.queue(999).await;
+        brokers
+            .observe(
+                "confirm with retained leader absent",
+                client.confirm(pending),
+            )
+            .await;
+        brokers
+            .observe("verify after retained leader kill", client.replay())
+            .await;
+        client.discard_verified();
+        client = brokers
+            .observe(
+                "takeover after retained leader kill",
+                client.reopen_producer(true),
+            )
+            .await;
+        let pending = client.queue(1000).await;
+        brokers
+            .observe("confirm takeover after churn", client.confirm(pending))
+            .await;
+        brokers
+            .observe("verify takeover after churn", client.replay())
+            .await;
+        brokers
+            .observe("close retained producer", client.close())
+            .await;
+        brokers.shutdown().await;
+    }
+}
+
+async fn saved_identity_after_crashes(policy: ozzy_config::Confirmation) {
+    let fixture = cluster::Cluster::new(policy);
+    fixture.provision();
+    let checked = fixture.checked(0);
+    let mut brokers = fixture.start();
+    let mut client = brokers
+        .observe("open saved producer", Client::open(&checked))
+        .await;
+    let pending = client.queue(0).await;
+    brokers
+        .observe("confirm saved producer", client.confirm(pending))
+        .await;
+    brokers.stop(0, "KILL").await;
+    client = brokers
+        .observe("resume after broker kill", client.reopen_producer(false))
+        .await;
+    let pending = client.queue(1).await;
+    brokers
+        .observe("confirm resumed producer", client.confirm(pending))
+        .await;
+    if policy == ozzy_config::Confirmation::ReplicatedPersisting {
+        brokers.restart_recovering(
+            &fixture,
+            0,
+            1,
+            &[
+                "--quarantine",
+                "orders/0",
+                "--quarantine",
+                "orders/1",
+                "--quarantine",
+                "orders/2",
+                "--quarantine",
+                "orders/3",
+            ],
+        );
+        brokers
+            .observe("recover killed memory voter", async {
+                loop {
+                    if (0..4).all(|number| {
+                        std::fs::read(fixture.partition(0, number).join("CONFIGURATION")).is_ok_and(
+                            |bytes| ozzy_replication::ConfigurationRecord::decode(&bytes).is_ok(),
+                        )
+                    }) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+    } else {
+        brokers.restart(&fixture, 0, 1);
+    }
+    let pending = client.queue(2).await;
+    brokers
+        .observe("confirm after recovery handoff", client.confirm(pending))
+        .await;
+    // This TCP layer has real timers and independent process schedulers. Leave
+    // the restarted voter time to activate before removing another normal copy.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    brokers.stop(1, "KILL").await;
+    client = brokers
+        .observe("takeover after broker kill", client.reopen_producer(true))
+        .await;
+    let pending = client.queue(3).await;
+    brokers
+        .observe("confirm takeover", client.confirm(pending))
+        .await;
+    brokers
+        .observe("verify retained producer payloads", client.replay())
+        .await;
+    brokers
+        .observe("close saved producer", client.close())
+        .await;
+    brokers.shutdown().await;
 }
 
 #[tokio::test(flavor = "current_thread")]

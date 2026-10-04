@@ -5,7 +5,7 @@ mod drain;
 mod outbound;
 mod shard;
 
-use crate::shards::lifecycle::{Registration as StartupRegistration, State as Lifecycle};
+use crate::shards::lifecycle::startup_groups;
 use crate::{
     ApplicationShards, CheckedConfig, DevicePools, Frontend, JournalPlan, RecoverySelection,
     StartupError,
@@ -110,15 +110,19 @@ impl Broker {
     /// Serve using an externally owned file backend. The caller must provision
     /// and validate its volume bindings before this call. Partition identity and
     /// recovery preflight use the supplied backend and never format missing data.
+    /// Explicit selections use the same nonvoting recovery as ordinary startup.
     /// Storage remains owned through canceled startup and shutdown observations.
     pub async fn start_trusted_with_storage<B: ozzy_io::Backend + 'static>(
         checked: CheckedConfig,
         local: BrokerIdentity,
+        selections: &[RecoverySelection],
         context: Context,
         lanes: Vec<crate::ShardIo<B>>,
         storage: impl StorageOwner,
     ) -> Result<Self, StartupError> {
-        let journals = Arc::new(JournalPlan::from_trusted_deployment(&checked, &local)?);
+        let journals = Arc::new(
+            JournalPlan::from_trusted_deployment(&checked, &local)?.select_recovery(selections)?,
+        );
         Self::start_on_lanes(checked, journals, context, lanes, storage).await
     }
 
@@ -131,9 +135,7 @@ impl Broker {
     ) -> Result<Self, StartupError> {
         let config = Arc::new(config::Config::new(&checked, omq.clone())?);
         let checked = Arc::new(checked);
-        let application_start =
-            StartupRegistration::new(Arc::new(Lifecycle::new(checked.plan.shards.len())));
-        let frontend_start = StartupRegistration::new(Arc::new(Lifecycle::new(1)));
+        let (application_start, frontend_start) = startup_groups(checked.plan.shards.len());
         let devices = DeviceDrain::new(devices, application_start.state(), frontend_start.state());
         let (send, mut registrations) = mpsc::channel(checked.plan.shards.len());
         let preflight = Arc::new(tokio::sync::Barrier::new(checked.plan.shards.len()));
@@ -263,4 +265,31 @@ impl Broker {
 
 fn failure(error: impl std::fmt::Display) -> StartupError {
     StartupError::Runtime(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn either_broker_owner_requests_shutdown_before_the_other_can_observe_closed_queues() {
+        for frontend_first in [false, true] {
+            let (application, frontend) = startup_groups(2);
+            let application_state = application.state();
+            let frontend_state = frontend.state();
+            let stopped = if frontend_first {
+                &frontend_state
+            } else {
+                &application_state
+            };
+            stopped.stop.request();
+            assert!(application_state.stop.is_requested());
+            assert!(frontend_state.stop.is_requested());
+            drop(application);
+            assert!(application_state.finished.is_requested());
+            assert!(!frontend_state.finished.is_requested());
+            drop(frontend);
+            assert!(frontend_state.finished.is_requested());
+        }
+    }
 }

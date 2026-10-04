@@ -5,7 +5,7 @@ use crate::replica_journal::{
 use ozzy_replication::{Admission, driver::ReplicaDriver};
 
 #[cfg(feature = "simulation")]
-mod actors;
+pub(super) mod actors;
 
 type Adapter = ReplicaJournal;
 

@@ -55,8 +55,8 @@ impl DeviceDrain {
 
 impl Drain {
     pub(super) fn request(self: &Arc<Self>) {
-        self.application.stop.request();
         self.frontend.stop.request();
+        self.application.stop.request();
         if !self.started.swap(true, Ordering::AcqRel) {
             let drain = self.clone();
             let spawned = std::thread::Builder::new()

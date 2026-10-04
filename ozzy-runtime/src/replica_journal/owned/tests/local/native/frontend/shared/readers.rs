@@ -6,6 +6,7 @@ use crate::replicated::{
 };
 use ozzy_proto::{MessageId, Offset, reader};
 
+mod closing;
 mod errors;
 mod pressure;
 mod source;

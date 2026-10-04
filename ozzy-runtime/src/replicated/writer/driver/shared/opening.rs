@@ -38,7 +38,7 @@ impl Opening {
                     },
                     partition: route.partition,
                     producer: config.producer_id,
-                    mode: producer::Mode::Resume,
+                    mode: producer::Mode::Create,
                     expected_epoch: None,
                     operation: self.operation.expect("fresh producer operation"),
                 },

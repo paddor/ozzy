@@ -14,6 +14,7 @@ use crate::replica_journal::FetchedHistory;
 pub(super) struct Lookup {
     scope: Option<Scope>,
     entries: [Option<(LogSource, Prefix)>; 6],
+    unavailable: Option<(LogSource, OpNumber)>,
 }
 
 impl Lookup {
@@ -21,6 +22,7 @@ impl Lookup {
         if self.scope != Some(scope) {
             self.scope = Some(scope);
             self.entries.fill(None);
+            self.unavailable = None;
         }
     }
 
@@ -29,6 +31,14 @@ impl Lookup {
             .iter()
             .flatten()
             .find_map(|&(key, prefix)| (key == source && prefix.op == op).then_some(prefix.digest))
+    }
+
+    pub(super) fn unavailable(&self, source: LogSource, op: OpNumber) -> bool {
+        self.unavailable == Some((source, op))
+    }
+
+    pub(super) fn retire(&mut self, source: LogSource, op: OpNumber) {
+        self.unavailable = Some((source, op));
     }
 
     pub(super) fn insert(&mut self, source: LogSource, prefix: Prefix) -> Result<(), ActorError> {
@@ -69,6 +79,20 @@ pub(super) struct Transfer {
 }
 
 impl ReplicaActor {
+    pub(super) fn complete_position(
+        &mut self,
+        position: &crate::replica_journal::HistoryPosition,
+    ) -> Result<(), ActorError> {
+        if let Some(prefix) = position.position {
+            self.lookup.insert(position.source, prefix)?;
+        } else if position.op < position.retained_predecessor.op {
+            self.lookup.retire(position.source, position.op);
+        } else {
+            return Err(ActorError::History);
+        }
+        Ok(())
+    }
+
     pub(super) fn start_transfer(
         &mut self,
         scope: Scope,
@@ -146,6 +170,30 @@ impl ReplicaActor {
         if self.queue_recovery_fetch(from, request) {
             return Ok(());
         }
+        // Reader/lookup work can own the journal without an actor pending action.
+        // The requester retains this addressed request and retries after pressure.
+        if self.journal.available_command_slots() == 0 {
+            return Ok(());
+        }
+        if self.pinned.is_none()
+            && self.application_ready()
+            && self.configuration.primary(self.driver.scope().view) == self.local
+            && request.source.voter == self.local
+            && request.scope == self.driver.scope()
+            && self.pending.is_none()
+            && self.pending_sync.is_none()
+            && self.pending_persistence.is_empty()
+        {
+            self.pending = Some(PendingIo::RetiredLookup(
+                self.journal.replication_positions(
+                    self.driver.begin_validation()?,
+                    [request.predecessor.op; 2],
+                )?,
+                from,
+                request,
+            ));
+            return Ok(());
+        }
         if self.pending.is_some()
             || self.buffer.is_none()
             || self.promise.is_some()
@@ -171,6 +219,16 @@ impl ReplicaActor {
         to: NodeId,
         fetched: FetchedHistory,
     ) -> Result<(), ActorError> {
+        if let Some(before) = fetched.retired_predecessor() {
+            let request = fetched.request();
+            self.recycle(fetched.into_buffer());
+            return self.notify_retired(
+                to,
+                request.scope,
+                wire::HistoryFence::Fetch(request.request_id),
+                before,
+            );
+        }
         let Some(session) = self.session(to) else {
             self.recycle(fetched.into_buffer());
             return Ok(()); // Requester will retry after its new link is ready.
@@ -277,5 +335,169 @@ impl ReplicaActor {
             assert!(self.spare.is_none());
             self.spare = Some(buffer);
         }
+    }
+}
+
+impl ReplicaActor {
+    pub(super) fn complete_retired_lookup(
+        &mut self,
+        positions: &crate::replica_journal::ReplicationPositions,
+        to: NodeId,
+        request: FetchOps,
+    ) -> Result<(), ActorError> {
+        if !self.application_ready()
+            || positions.ticket.scope() != self.driver.scope()
+            || request.scope != self.driver.scope()
+            || self.configuration.primary(request.scope.view) != self.local
+        {
+            return Ok(());
+        }
+        if request.predecessor.op >= positions.retained_predecessor.op {
+            if positions.positions[0] != Some(request.predecessor) {
+                return Ok(());
+            }
+            let Some(buffer) = self.buffer.take() else {
+                return Ok(());
+            };
+            self.pending = Some(PendingIo::Fetch(
+                self.journal
+                    .fetch_history(request, buffer)
+                    .map_err(|rejected| rejected.reason)?,
+                FetchPurpose::Serve(to),
+            ));
+            return Ok(());
+        }
+        let Some(session) = self.session(to) else {
+            return Ok(());
+        };
+        let notice = wire::HistoryRetired {
+            scope: request.scope,
+            fence: wire::HistoryFence::Fetch(request.request_id),
+            before: positions.retained_predecessor,
+        };
+        let encoded = wire::encode_history_retired(
+            self.local,
+            session,
+            notice,
+            &mut self.metadata,
+            self.wire_limits,
+        )?;
+        self.enqueue(
+            to,
+            SendClass::Control,
+            Message::multipart([
+                Bytes::copy_from_slice(&encoded.header),
+                Bytes::copy_from_slice(&self.metadata[..encoded.metadata_bytes]),
+                Bytes::new(),
+            ]),
+        )?;
+        Ok(())
+    }
+}
+
+impl ReplicaActor {
+    pub(super) fn notify_retired(
+        &mut self,
+        to: NodeId,
+        scope: Scope,
+        fence: wire::HistoryFence,
+        before: Prefix,
+    ) -> Result<(), ActorError> {
+        let Some(session) = self.session(to) else {
+            return Ok(());
+        };
+        let encoded = wire::encode_history_retired(
+            self.local,
+            session,
+            wire::HistoryRetired {
+                scope,
+                fence,
+                before,
+            },
+            &mut self.metadata,
+            self.wire_limits,
+        )?;
+        self.enqueue(
+            to,
+            SendClass::Control,
+            Message::multipart([
+                Bytes::copy_from_slice(&encoded.header),
+                Bytes::copy_from_slice(&self.metadata[..encoded.metadata_bytes]),
+                Bytes::new(),
+            ]),
+        )
+    }
+
+    pub(super) fn receive_retired(
+        &mut self,
+        from: NodeId,
+        notice: wire::HistoryRetired,
+        now: Duration,
+    ) -> Result<(), ActorError> {
+        if notice.scope != self.driver.scope() {
+            return Ok(());
+        }
+        match notice.fence {
+            wire::HistoryFence::Receive(epoch) => {
+                if from == self.configuration.primary(notice.scope.view)
+                    && self.work.receive.ledger.report().channel.epoch == epoch
+                    && self
+                        .driver
+                        .normal()
+                        .is_some_and(|normal| normal.snapshot().accepted.op < notice.before.op)
+                {
+                    self.recovery_required = true;
+                    self.ingress.close();
+                }
+            }
+            wire::HistoryFence::Fetch(id) => {
+                let Some(transfer) = self.transfer.filter(|transfer| {
+                    transfer.request.request_id == id
+                        && transfer.request.scope == notice.scope
+                        && transfer.request.source.voter == from
+                        && transfer.request.predecessor.op < notice.before.op
+                        && notice.before.op <= transfer.request.source.accepted.op
+                }) else {
+                    return Ok(());
+                };
+                if let TransferPurpose::Lookup { op, .. } = transfer.purpose
+                    && op >= notice.before.op
+                {
+                    if notice.before.op == transfer.request.source.accepted.op {
+                        if notice.before == transfer.request.source.accepted {
+                            self.lookup.insert(transfer.request.source, notice.before)?;
+                            self.transfer = None;
+                        }
+                        return Ok(());
+                    }
+                    // The boundary is only a scan starting point. No digest
+                    // enters election evidence until the exact tail verifies.
+                    self.start_transfer(
+                        notice.scope,
+                        transfer.request.source,
+                        notice.before,
+                        TransferPurpose::Lookup {
+                            op,
+                            found: (op == notice.before.op).then_some(notice.before),
+                        },
+                        now,
+                    )?;
+                } else if let TransferPurpose::Lookup { op, .. } = transfer.purpose
+                    && self.pinned.is_some_and(|local| {
+                        local.voter == self.local && local.accepted.op >= notice.before.op
+                    })
+                {
+                    // A third report can protect a prefix the donor retired.
+                    // Keep every ancestry check pending and let the ordinary
+                    // election deadline advance; this requester is not expired.
+                    self.lookup.retire(transfer.request.source, op);
+                    self.transfer = None;
+                } else {
+                    self.recovery_required = true;
+                    self.ingress.close();
+                }
+            }
+        }
+        Ok(())
     }
 }

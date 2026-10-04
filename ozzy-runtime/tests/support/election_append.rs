@@ -257,7 +257,9 @@ impl Actor {
             ReplicaMessage::Ops(_) => {} // Delayed duplicate of completed installation.
             ReplicaMessage::FetchOps(_) => panic!("installation already complete"),
             ReplicaMessage::Flow(_) => panic!("fixture has not opened a credited flow"),
-            ReplicaMessage::Recovery(_) => panic!("fixture has no lost-state recovery"),
+            ReplicaMessage::Checkpoint(_)
+            | ReplicaMessage::HistoryRetired(_)
+            | ReplicaMessage::Recovery(_) => panic!("fixture has no lost-state recovery"),
         }
     }
 

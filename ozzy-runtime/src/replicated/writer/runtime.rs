@@ -27,10 +27,16 @@ struct Inner {
 impl WriterRuntime {
     /// Start one SDK thread and at least one separately owned OMQ I/O thread.
     pub fn new() -> std::io::Result<Self> {
-        let stop = CloseSignal::default();
         let mut config = ContextConfig::from_env();
         config.io_threads = config.io_threads.max(1);
         let context = Context::with_config_and_name(config, "ozy/omq");
+        Self::with_context(context)
+    }
+
+    /// Own a separate SDK thread using an existing OMQ context. Inproc brokers
+    /// and independent SDK owners can share transport without sharing role state.
+    pub fn with_context(context: Context) -> std::io::Result<Self> {
+        let stop = CloseSignal::default();
         let (sdk, thread) = start("ozy/sdk", stop.clone())?;
         Ok(Self(Arc::new(Inner {
             context,
@@ -48,6 +54,14 @@ impl WriterRuntime {
 
     pub(in crate::replicated) fn driver(&self) -> &Handle {
         &self.0.sdk
+    }
+
+    /// Stop the SDK executor immediately, without draining producers. Fault
+    /// tests retain the OMQ context and restart a distinct SDK owner.
+    #[cfg(feature = "simulation")]
+    #[doc(hidden)]
+    pub fn abort_owner(&self) {
+        self.0.stop.close();
     }
 }
 

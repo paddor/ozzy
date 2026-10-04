@@ -215,5 +215,13 @@ impl Drop for Worker {
             let _ = self.0.kill();
         }
         let _ = self.0.wait();
+        if let Some(stderr) = &mut self.0.stderr {
+            let mut diagnostic = String::new();
+            if std::io::Read::read_to_string(stderr, &mut diagnostic).is_ok()
+                && !diagnostic.is_empty()
+            {
+                eprintln!("worker stderr: {diagnostic}");
+            }
+        }
     }
 }

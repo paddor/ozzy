@@ -11,8 +11,8 @@ impl ProposalBuffer {
     /// Ensure this partition exists through the ordinary durable proposal path.
     /// Prepare in an empty lease. Matching accepted creation waits for application;
     /// matching applied creation resolves without another canonical operation.
-    /// Incarnation, address, and owner epoch must agree. Existing retention policy
-    /// stays unchanged, since policy updates are separate canonical operations.
+    /// Incarnation, address, and owner epoch must agree. A changed retention policy
+    /// becomes a separate confirmed policy operation on coordinated restart.
     /// This service request supplies no authority or confirmation by itself.
     pub fn prepare_partition(
         &mut self,
@@ -25,7 +25,7 @@ impl ProposalBuffer {
 /// Caller first validates the exact driver/image ticket and local proposal role.
 pub(in crate::replica_journal) fn partition_retry<I: IdentityIndex + Clone>(
     images: &CanonicalImages<I>,
-    buffer: &AppendBuffer,
+    buffer: &mut AppendBuffer,
     ticket: ValidationTicket,
     generation: JournalGeneration,
     limits: OperationLimits,
@@ -52,10 +52,29 @@ pub(in crate::replica_journal) fn partition_retry<I: IdentityIndex + Clone>(
     {
         return Err(JournalError::AppendMismatch);
     }
+    if existing.retention != request.retention {
+        let policy = ozzy_journal::operation::PartitionPolicy {
+            partition: request.partition,
+            expected_revision: existing.policy_revision,
+            new_revision: existing
+                .policy_revision
+                .checked_add(1)
+                .ok_or(JournalError::Configuration)?,
+            retention: request.retention,
+            operation_id: ozzy_proto::OperationId::new(),
+        };
+        buffer.clear();
+        buffer.push_typed_body(&OperationBody::PartitionPolicy(policy))?;
+        return Ok(None);
+    }
     // These image revisions were checked against the ticket. Waiting through
     // the accepted tail is conservative and never confirms accepted-only state.
     Ok(Some(
-        if images.committed().partition(request.partition).is_some() {
+        if images
+            .committed()
+            .partition(request.partition)
+            .is_some_and(|committed| committed.retention == request.retention)
+        {
             ticket.applied()
         } else {
             ticket.accepted()

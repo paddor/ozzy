@@ -4,6 +4,7 @@ use crate::replica_actor::{ScheduleError, ScheduledReplica};
 type Scheduled = ScheduledReplica;
 
 mod disconnected;
+mod history;
 mod native;
 mod publications;
 mod routes;
@@ -65,18 +66,30 @@ fn cluster(
     group: u8,
     policy: QuorumPolicy,
 ) -> (Vec<Scheduled>, PendingProposal) {
+    cluster_with_operation_count(controller, io, group, policy, 1)
+}
+
+fn cluster_with_operation_count(
+    controller: &mut Controller,
+    io: &Local,
+    group: u8,
+    policy: QuorumPolicy,
+    operations: u8,
+) -> (Vec<Scheduled>, PendingProposal) {
     let mut actors = Vec::new();
     let mut pending = None;
     for broker in 0..3 {
         let mut actor = unstarted_actor(controller, io, group, policy, broker, 64);
         if broker == group % 3 {
             let mut buffer = actor.lease_proposal_buffer().unwrap();
-            buffer
-                .push(
-                    ozzy_journal::operation::OperationKind::Barrier,
-                    &[group + 1; 16],
-                )
-                .unwrap();
+            for operation in 0..operations {
+                buffer
+                    .push(
+                        ozzy_journal::operation::OperationKind::Barrier,
+                        &[group + operation + 1; 16],
+                    )
+                    .unwrap();
+            }
             pending = Some(actor.take_submitter().unwrap().try_submit(buffer).unwrap());
         }
         actors.push(Scheduled::new(actor).unwrap());
@@ -85,8 +98,12 @@ fn cluster(
 }
 
 fn round(actors: &mut [Scheduled], blocked: bool) {
-    for (to, message) in collect(actors, Duration::ZERO, blocked) {
-        actors[to].receive(&message, Duration::ZERO).unwrap();
+    round_at(actors, Duration::ZERO, blocked);
+}
+
+fn round_at(actors: &mut [Scheduled], now: Duration, blocked: bool) {
+    for (to, message) in collect(actors, now, blocked) {
+        actors[to].receive(&message, now).unwrap();
     }
 }
 

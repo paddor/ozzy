@@ -191,6 +191,15 @@ impl ReplicaActor {
             return Ok(());
         }
         let plan = plan.expect("checked plan");
+        if let Some(before) = fetched.retired_predecessor() {
+            self.recycle(fetched.into_buffer());
+            return self.notify_retired(
+                to,
+                request.scope,
+                ozzy_replication::wire::HistoryFence::Receive(plan.channel.epoch),
+                before,
+            );
+        }
         if let Some(required) = fetched.minimum_body_bytes() {
             if required > self.config.transfer.max_body_bytes {
                 return Err(ActorError::Limits);

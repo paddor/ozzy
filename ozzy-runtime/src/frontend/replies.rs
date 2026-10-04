@@ -140,7 +140,7 @@ impl Dispatcher {
         }
         let data = matches!(
             packet.envelope.opcode,
-            Opcode::PrepareFlow | Opcode::Ops | Opcode::Records
+            Opcode::PrepareFlow | Opcode::Ops | Opcode::SnapshotChunk | Opcode::Records
         );
         if data != (class == Class::Data)
             || (!data && !packet.payload.is_empty())

@@ -14,8 +14,9 @@ mod scheduled;
 
 type Actor = ControlledReplica;
 
-fn actor_config() -> ActorConfig {
+pub(in crate::replica_journal::owned::tests) fn actor_config() -> ActorConfig {
     ActorConfig {
+        retention_interval: None,
         sessions: [LinkSessionId::from_bytes([61; 16]); 3],
         timing: timing(),
         flow_probe: ozzy_replication::flow::ProbeTiming {
@@ -101,6 +102,15 @@ fn round(actors: &mut [Actor], now: Duration) {
 }
 
 fn round_without(actors: &mut [Actor], now: Duration, missing: Option<usize>) {
+    round_with_observer(actors, now, missing, |_| {});
+}
+
+fn round_with_observer(
+    actors: &mut [Actor],
+    now: Duration,
+    missing: Option<usize>,
+    mut observe: impl FnMut(&Message),
+) {
     let mut messages = Vec::new();
     for (from, actor) in actors.iter_mut().enumerate() {
         if Some(from) == missing {
@@ -115,6 +125,7 @@ fn round_without(actors: &mut [Actor], now: Duration, missing: Option<usize>) {
         }
         actor
             .flush(|mut message| {
+                observe(&message);
                 let route = message.pop_front().unwrap();
                 let to = usize::from(route[0] - 1);
                 messages.push((

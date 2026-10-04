@@ -58,6 +58,7 @@ impl Retry {
 
 #[derive(Debug)]
 enum Pending {
+    Checkpoint(JournalCompletion<crate::replica_journal::CheckpointProgress>),
     Begin(JournalCompletion<RecoveryPlan>),
     Chunk(JournalCompletion<ReceivedChunk>),
     Finish(JournalCompletion<PublishedRecovery>),
@@ -66,6 +67,7 @@ enum Pending {
 
 #[derive(Debug)]
 enum Completed {
+    Checkpoint(crate::replica_journal::CheckpointProgress),
     Begin(RecoveryPlan),
     Chunk(Box<ReceivedChunk>),
     Finish(Box<PublishedRecovery>),
@@ -74,6 +76,7 @@ enum Completed {
 impl Pending {
     async fn wait(&mut self) -> Result<Completed, ActorError> {
         Ok(match self {
+            Self::Checkpoint(future) => Completed::Checkpoint(future.await?),
             Self::Begin(future) => Completed::Begin(future.await?),
             Self::Chunk(future) => Completed::Chunk(Box::new(future.await?)),
             Self::Finish(future) => Completed::Finish(Box::new(future.await?)),
@@ -123,6 +126,9 @@ pub struct RecoveryActor<J: RecoveryStorage = ShardRecoveringJournal> {
     staged: Option<Prefix>,
     plan: RecoveryPlan,
     fetch: Option<(FetchOps, Retry)>,
+    checkpoint_fetch: Option<(wire::CheckpointRequest, Retry)>,
+    checkpoint_through: u64,
+    checkpoint_ready: bool,
     pending: Option<Pending>,
     abandoning: bool,
     full_retry: bool,
@@ -219,6 +225,9 @@ impl<J: RecoveryStorage> RecoveryActor<J> {
             staged: None,
             plan: RecoveryPlan::Full,
             fetch: None,
+            checkpoint_fetch: None,
+            checkpoint_through: 0,
+            checkpoint_ready: false,
             pending: None,
             abandoning: false,
             full_retry: false,
@@ -293,6 +302,12 @@ impl<J: RecoveryStorage> RecoveryActor<J> {
             running,
         };
         self.status.send_if_modified(|old| {
+            let mut next = next;
+            // Recovery requests may start with a lower view hint. Routing must
+            // keep its last observed fence while this copy remains nonvoting.
+            if old.scope.view > next.scope.view {
+                next.scope = old.scope;
+            }
             if *old == next {
                 false
             } else {
@@ -357,6 +372,28 @@ impl<J: RecoveryStorage> RecoveryActor<J> {
             }
             self.request_quorum(now)?;
         } else if let (Some(ticket), Some(staged)) = (self.ticket, self.staged) {
+            if let Some(anchor) = ticket.checkpoint().filter(|_| !self.checkpoint_ready) {
+                if self.checkpoint_fetch.is_none() {
+                    self.checkpoint_fetch = Some((
+                        wire::CheckpointRequest {
+                            scope: ticket.scope(),
+                            request_id: self.ids.request()?,
+                            nonce: ticket.nonce(),
+                            source: ticket.source(),
+                            offset: self.checkpoint_through,
+                            max_bytes: self
+                                .config
+                                .transfer
+                                .max_body_bytes
+                                .min(anchor.chunk_bytes as usize)
+                                as u32,
+                        },
+                        Retry::new(self.timing),
+                    ));
+                }
+                self.request_checkpoint(now)?;
+                return Ok(None);
+            }
             if matches!(self.plan, RecoveryPlan::Repair(None))
                 || (self.plan == RecoveryPlan::Full && staged == ticket.source().accepted)
             {
@@ -509,6 +546,12 @@ impl<J: RecoveryStorage> RecoveryActor<J> {
                     self.observe(from, scope)?;
                 }
             }
+            ReplicaMessage::Checkpoint(wire::CheckpointMessage::Chunk { request, .. }) => {
+                self.receive_checkpoint(
+                    request,
+                    message.part_bytes(3).ok_or(ActorError::History)?,
+                )?;
+            }
             ReplicaMessage::Ops(batch) => {
                 let Some((request, _)) = self.fetch else {
                     return Ok(());
@@ -547,12 +590,56 @@ impl<J: RecoveryStorage> RecoveryActor<J> {
         Ok(())
     }
 
+    fn receive_checkpoint(
+        &mut self,
+        request: wire::CheckpointRequest,
+        payload: Bytes,
+    ) -> Result<(), ActorError> {
+        if self.abandoning
+            || self.pending.is_some()
+            || self
+                .checkpoint_fetch
+                .is_none_or(|(outstanding, _)| outstanding != request)
+        {
+            return Ok(());
+        }
+        let ticket = self.ticket.ok_or(ActorError::History)?;
+        let completion = match self
+            .journal
+            .as_mut()
+            .expect("owned journal")
+            .receive_checkpoint(ticket, request.offset, payload)
+        {
+            Ok(completion) => completion,
+            Err(crate::replica_journal::SubmitError::Full) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        self.pending = Some(Pending::Checkpoint(completion));
+        self.checkpoint_fetch = None;
+        Ok(())
+    }
+
     fn complete(
         &mut self,
         completed: Completed,
         now: Duration,
     ) -> Result<Option<Outcome>, ActorError> {
         match completed {
+            Completed::Checkpoint(progress) => {
+                let ticket = self.ticket.ok_or(ActorError::History)?;
+                self.checkpoint_through = progress.through;
+                if !self.abandoning
+                    && let Some(revision) = progress.revision
+                {
+                    self.recovery.complete_checkpoint(
+                        ticket,
+                        ticket.checkpoint().ok_or(ActorError::History)?,
+                        revision,
+                    )?;
+                    self.checkpoint_ready = true;
+                }
+                self.progress_at = now;
+            }
             Completed::Begin(plan) => {
                 self.plan = plan;
                 self.staged = Some(match plan {
@@ -560,7 +647,10 @@ impl<J: RecoveryStorage> RecoveryActor<J> {
                         op: ozzy_replication::OpNumber(range.after.op_number),
                         digest: range.after.digest,
                     },
-                    _ => Prefix::GENESIS,
+                    _ => self
+                        .ticket
+                        .and_then(RecoveryTicket::checkpoint)
+                        .map_or(Prefix::GENESIS, |anchor| anchor.predecessor),
                 });
             }
             Completed::Chunk(chunk) => {
@@ -590,5 +680,45 @@ impl<J: RecoveryStorage> RecoveryActor<J> {
             Completed::Abort => return Ok(Some(Outcome::Restart)),
         }
         Ok(None)
+    }
+}
+
+impl<J: RecoveryStorage> RecoveryActor<J> {
+    fn request_checkpoint(&mut self, now: Duration) -> Result<(), ActorError> {
+        let (request, retry) = self
+            .checkpoint_fetch
+            .as_mut()
+            .expect("pending checkpoint range");
+        if now < retry.at {
+            return Ok(());
+        }
+        let request = *request;
+        retry.sent(now, self.timing);
+        let index = self
+            .configuration
+            .voters()
+            .iter()
+            .position(|&voter| voter == request.source.voter)
+            .expect("configured donor");
+        if self.bindings[index].is_none() {
+            return Ok(());
+        }
+        let encoded = wire::encode_checkpoint(
+            self.local,
+            self.config.sessions[index],
+            wire::CheckpointMessage::Request(request),
+            &mut self.metadata,
+            self.wire_limits,
+        )?;
+        self.enqueue(
+            request.source.voter,
+            SendClass::Control,
+            Message::multipart([
+                Bytes::copy_from_slice(&encoded.header),
+                Bytes::copy_from_slice(&self.metadata[..encoded.metadata_bytes]),
+                Bytes::new(),
+            ]),
+        )?;
+        Ok(())
     }
 }

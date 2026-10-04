@@ -70,8 +70,12 @@ and consumer SDK roles; brokers own the journals.
 | Source snapshot / file pin | Immutable file metadata for a captured read / temporary deletion protection while that read runs. Not a backup or CPU affinity. |
 | Replay / gap repair | Read retained history from an offset / recover missing live records or replica operations. |
 | Retention floor | Earliest readable offset. Older requests fail explicitly instead of silently skipping records. |
+| Producer identity | Topic and producer IDs saved by the application. Socket identities and link sessions change on reconnect. |
+| Resume / takeover | Restore each partition's epoch and next sequence / raise epochs to fence an old producer. Neither replays an application outbox. |
+| Retry floor | First producer sequence whose exact result remains available. Older retries fail explicitly. |
+| History selector | Earliest, latest, saved offsets, broker append time, or a record ID in one partition. The broker resolves it once. |
 | Consumer checkpoint | Next received offset per partition. The application saves it after processing; the broker does not persist it. |
-| Storage checkpoint | Persisted canonical state and retained history. Different from a consumer checkpoint; checkpoint transfer is not implemented. |
+| Storage checkpoint | Persisted canonical state and its original chain anchor. Retained records remain in separate segments; PEER transfers both during recovery. |
 
 ## Writers and readers
 

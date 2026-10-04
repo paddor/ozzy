@@ -371,6 +371,13 @@ impl ReplicaActor {
         let Some(submission) = &self.work.waiting else {
             return Ok(None);
         };
+        if submission.reply.fenced() {
+            let submission = self.work.waiting.take().expect("waiting request");
+            submission
+                .reply
+                .finish(submission.buffer, ProposalOutcome::NotAdmitted);
+            return Ok(None);
+        }
         if !self
             .journal
             .validation_has_capacity(&submission.buffer.0, snapshot.accepted.op)

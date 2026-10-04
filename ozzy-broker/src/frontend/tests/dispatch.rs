@@ -54,7 +54,7 @@ fn message(binding: Binding, target: Placement, control: bool) -> Message {
                     partition: target.partition,
                     owner_epoch: 1,
                 },
-                start: 0,
+                start: ozzy_proto::reader::Start::Offset(0),
             },
             &mut metadata,
             EnvelopeLimits::default(),

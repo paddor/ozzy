@@ -204,7 +204,6 @@ impl State {
                 )
                 .map_err(failure)?;
             self.bootstrap[index] = Some(bootstrap);
-            self.recoveries.remove(&group);
         }
         Ok(())
     }

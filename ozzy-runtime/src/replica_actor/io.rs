@@ -73,9 +73,19 @@ pub(super) enum FetchPurpose {
 
 #[derive(Debug)]
 pub(super) enum PendingIo {
+    RetiredLookup(
+        JournalCompletion<ReplicationPositions>,
+        NodeId,
+        ozzy_replication::wire::FetchOps,
+    ),
+    Retention(JournalCompletion<crate::replica_journal::RetentionTurn>),
     OrphanCleanup(JournalCompletion<crate::replica_journal::OwnedCleanedStorage>),
     MetadataCleanup(JournalCompletion<crate::replica_journal::OwnedCleanedStorage>),
     StorageValidation(JournalCompletion<crate::replica_journal::ValidatedStorage>),
+    RecoveryCheckpoint(
+        JournalCompletion<crate::replica_journal::RecoveryCheckpointRead>,
+        NodeId,
+    ),
     RecoveryPin(JournalCompletion<PinnedRecovery>),
     RecoveryRelease(JournalCompletion<PinnedRecovery>),
     Promise(JournalCompletion<PromiseTicket>),
@@ -100,9 +110,16 @@ pub(super) enum PendingIo {
 
 #[derive(Debug)]
 pub(super) enum Completed {
+    RetiredLookup(
+        ReplicationPositions,
+        NodeId,
+        ozzy_replication::wire::FetchOps,
+    ),
+    Retention(crate::replica_journal::RetentionTurn),
     OrphanCleanup(crate::replica_journal::OwnedCleanedStorage),
     MetadataCleanup(crate::replica_journal::OwnedCleanedStorage),
     StorageValidation(crate::replica_journal::ValidatedStorage),
+    RecoveryCheckpoint(crate::replica_journal::RecoveryCheckpointRead, NodeId),
     RecoveryPin(PinnedRecovery),
     RecoveryRelease(PinnedRecovery),
     Promise(PromiseTicket),
@@ -129,9 +146,16 @@ pub(super) enum Completed {
 impl PendingIo {
     pub(super) async fn wait(&mut self) -> Result<Completed, JournalError> {
         Ok(match self {
+            Self::RetiredLookup(future, to, request) => {
+                Completed::RetiredLookup(future.await?, *to, *request)
+            }
+            Self::Retention(future) => Completed::Retention(future.await?),
             Self::OrphanCleanup(future) => Completed::OrphanCleanup(future.await?),
             Self::MetadataCleanup(future) => Completed::MetadataCleanup(future.await?),
             Self::StorageValidation(future) => Completed::StorageValidation(future.await?),
+            Self::RecoveryCheckpoint(future, to) => {
+                Completed::RecoveryCheckpoint(future.await?, *to)
+            }
             Self::RecoveryPin(future) => Completed::RecoveryPin(future.await?),
             Self::RecoveryRelease(future) => Completed::RecoveryRelease(future.await?),
             Self::Promise(future) => Completed::Promise(future.await?),

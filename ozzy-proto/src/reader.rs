@@ -3,7 +3,9 @@
 //! Decoding source metadata never proves ownership, persistence, or group confirmation.
 
 mod encoder;
+mod start;
 mod subscription;
+pub use start::{IdPolicy, Start};
 
 pub use encoder::RecordsEncoder;
 
@@ -57,8 +59,8 @@ pub struct Subscribe {
     pub subscription: Subscription,
     /// Validated logical stream and topic.
     pub target: Target,
-    /// Exact first desired offset.
-    pub start: u64,
+    /// Initial selector, resolved once to an exact retained offset.
+    pub start: Start,
 }
 
 /// Decoded exact-offset subscription.
@@ -68,8 +70,8 @@ pub struct DecodedSubscribe {
     pub subscription: Subscription,
     /// Validated logical stream and topic.
     pub target: Target,
-    /// Exact first desired offset.
-    pub start: u64,
+    /// Initial selector, resolved once to an exact retained offset.
+    pub start: Start,
 }
 
 /// Confirmed subscription source. Does not itself claim durable data.
@@ -79,6 +81,8 @@ pub struct Subscribed {
     pub subscription: Subscription,
     /// Source used unchanged by records and receipt observations.
     pub source: Source,
+    /// First resolved offset; reconnect resumes ordinary delivered offsets.
+    pub resolved_offset: u64,
 }
 
 /// Common identity and offset fields of one contiguous reader batch.
@@ -193,11 +197,12 @@ pub fn encode_subscribe(
 ) -> Result<[u8; ENVELOPE_BYTES], CodecError> {
     v.subscription.validate()?;
     v.target.validate()?;
-    let size = 40 + v.target.size();
+    v.start.validate()?;
+    let size = 32 + v.target.size() + v.start.size();
     let header = prepare(e, Opcode::Subscribe, false, size, out, limits)?;
     v.subscription.encode(out);
     v.target.encode(out);
-    out.extend_from_slice(&v.start.to_be_bytes());
+    v.start.encode(out);
     Ok(header)
 }
 
@@ -209,7 +214,7 @@ pub fn decode_subscribe(
     let mut c = control(p, Opcode::Subscribe, false, limits)?;
     let subscription = Subscription::decode(&mut c)?;
     let target = Target::decode(&mut c)?;
-    let start = c.u64()?;
+    let start = Start::decode(&mut c)?;
     end(c)?;
     Ok(DecodedSubscribe {
         subscription,
@@ -231,12 +236,13 @@ pub fn encode_subscribed(
         e,
         Opcode::Subscribed,
         true,
-        32 + v.source.size(),
+        40 + v.source.size(),
         out,
         limits,
     )?;
     v.subscription.encode(out);
     v.source.encode(out);
+    out.extend_from_slice(&v.resolved_offset.to_be_bytes());
     Ok(header)
 }
 
@@ -246,6 +252,7 @@ pub fn decode_subscribed(p: Packet<'_>, limits: EnvelopeLimits) -> Result<Subscr
     let v = Subscribed {
         subscription: Subscription::decode(&mut c)?,
         source: Source::decode(&mut c)?,
+        resolved_offset: c.u64()?,
     };
     end(c)?;
     Ok(v)

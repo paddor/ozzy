@@ -37,6 +37,69 @@ impl OwnedJournal {
         else {
             return Err(JournalError::AppendMismatch);
         };
+        let current_state = self
+            .images()?
+            .speculative()
+            .partition(request.partition)
+            .ok_or(AppendAdmissionError::UnknownPartition)?
+            .producer(request.producer);
+        let current = current_state.map(|state| {
+            (
+                state.producer_epoch.get(),
+                state.next_producer_sequence.get(),
+                state.producer_result_floor.get(),
+            )
+        });
+        // The latest transition belongs to canonical state, not a historical
+        // index. Retiring its segment must not turn an exact fence retry into
+        // another transition or force a read of deleted operation bytes.
+        if let Some(state) = current_state
+            && let Some(transition) = state.transition()
+            && transition.operation_id == request.operation
+        {
+            if transition.expected_epoch != expected.expected_epoch
+                || state.producer_epoch != expected.new_epoch
+            {
+                return Err(JournalError::AppendMismatch);
+            }
+            buffer
+                .producer_session
+                .as_mut()
+                .expect("open request")
+                .opened = Some(opened(
+                ticket,
+                request,
+                (
+                    state.producer_epoch.get(),
+                    state.next_producer_sequence.get(),
+                    state.producer_result_floor.get(),
+                ),
+                self.configuration.append_policy(),
+            ));
+            return Ok(Some(ticket.accepted()));
+        }
+        let (coordinates, resolved) = self
+            .resolve_producer_open(request, expected, current)
+            .await?;
+        buffer
+            .producer_session
+            .as_mut()
+            .expect("open request")
+            .opened = Some(opened(
+            ticket,
+            request,
+            coordinates,
+            self.configuration.append_policy(),
+        ));
+        Ok(resolved.then_some(ticket.accepted()))
+    }
+
+    async fn resolve_producer_open(
+        &mut self,
+        request: ozzy_proto::producer::Open,
+        expected: OpenProducer,
+        current: Option<(u64, u64, u64)>,
+    ) -> Result<((u64, u64, u64), bool), JournalError> {
         let key = IdentityKey::operation(request.operation);
         let claim = {
             let identities = self.images()?.speculative_identities();
@@ -49,35 +112,7 @@ impl OwnedJournal {
                 })?;
             identities.lookup(key).map_err(identity_error)?
         };
-        let current = self
-            .images()?
-            .speculative()
-            .partition(request.partition)
-            .ok_or(AppendAdmissionError::UnknownPartition)?
-            .producer(request.producer)
-            .map(|state| {
-                (
-                    state.producer_epoch.get(),
-                    state.next_producer_sequence.get(),
-                    state.producer_result_floor.get(),
-                )
-            });
-        let authority = Authority {
-            group_id: ticket.scope().group_id,
-            config_epoch: ticket.scope().configuration_epoch,
-            view: ticket.scope().view,
-        };
-        let policy = self.configuration.append_policy();
-        let result = |epoch, next_sequence, retry_floor| Opened {
-            authority,
-            partition: request.partition,
-            producer: request.producer,
-            epoch,
-            next_sequence,
-            retry_floor,
-            policy,
-        };
-        let (coordinates, resolved) = if let Some(claim) = claim {
+        if let Some(claim) = claim {
             let original = if let Some(open) = self.writeback.producer_open(
                 request.operation,
                 claim.op_number,
@@ -95,29 +130,24 @@ impl OwnedJournal {
             if epoch != original.new_epoch.get() {
                 return Err(AppendAdmissionError::Fenced.into());
             }
-            ((epoch, sequence, floor), true)
+            Ok(((epoch, sequence, floor), true))
         } else {
-            match (request.mode, request.expected_epoch, current) {
+            Ok(match (request.mode, request.expected_epoch, current) {
                 (Mode::Resume, Some(expected_epoch), Some((epoch, sequence, floor)))
                     if expected_epoch == epoch =>
                 {
                     ((epoch, sequence, floor), true)
                 }
-                (Mode::Resume, None, None) => ((1, 0, 0), false),
+                (Mode::Resume, None, Some(coordinates)) => (coordinates, true),
+                (Mode::Resume | Mode::Create, None, None) => ((1, 0, 0), false),
                 (Mode::Fence, Some(expected_epoch), Some((epoch, _, _)))
                     if expected_epoch == epoch =>
                 {
                     ((expected.new_epoch.get(), 0, 0), false)
                 }
                 _ => return Err(AppendAdmissionError::Fenced.into()),
-            }
-        };
-        buffer
-            .producer_session
-            .as_mut()
-            .expect("open request")
-            .opened = Some(result(coordinates.0, coordinates.1, coordinates.2));
-        Ok(resolved.then_some(ticket.accepted()))
+            })
+        }
     }
 
     async fn read_producer_open(
@@ -142,6 +172,27 @@ impl OwnedJournal {
             return Err(JournalError::AppendMismatch);
         };
         Ok(open)
+    }
+}
+
+fn opened(
+    ticket: ValidationTicket,
+    request: ozzy_proto::producer::Open,
+    (epoch, next_sequence, retry_floor): (u64, u64, u64),
+    policy: ozzy_proto::append::Policy,
+) -> Opened {
+    Opened {
+        authority: Authority {
+            group_id: ticket.scope().group_id,
+            config_epoch: ticket.scope().configuration_epoch,
+            view: ticket.scope().view,
+        },
+        partition: request.partition,
+        producer: request.producer,
+        epoch,
+        next_sequence,
+        retry_floor,
+        policy,
     }
 }
 

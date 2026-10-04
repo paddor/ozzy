@@ -77,6 +77,13 @@ atomics. Models cover admission/cancellation/release, capacity observation,
 persistent readiness racing a drain, and offset publication before confirmed-prefix
 observation. Admission uses a two-preemption exploration bound.
 
+Broker models compile the production lifecycle atomics and owner setup. They
+explore queue closure racing both shutdown request orders and either owner's
+failure, preserving separate completion tracking. A negative control with the old
+independent stop signals must find a queue closure before the receiving owner
+observes shutdown. Queue closure is modeled as release/acquire publication, not
+as OMQ queue internals.
+
 The receipt model checks relaxed offset stores followed by release publication
 and acquire observation. Ordinary tests cover 16-cell page reuse, alias lifetime,
 notification registration, cancellation and wakes. Loom does not control OMQ,
@@ -135,3 +142,150 @@ bounds and confirmation policy fixed. Preserve source/binary identities. Repeat
 comparisons and report medians, ranges, sample counts and measured boundaries.
 Writer confirmation and verified reader delivery are separate metrics. Warmup,
 scheduled arrival, setup, drain and persistence lag remain explicit.
+
+## SDK identity and history starts
+
+Producer tests use real SDK owners, OMQ inproc, real brokers and memory-only file
+jobs in all three modes. They cover fresh identity, resume, takeover, stale queued
+frames, and abrupt owner loss without an SDK outbox. Core snapshot fixtures check
+that producer transitions and retry coordinates survive a checkpoint.
+
+Directory tests run the production session/catalog owner and SDK over OMQ inproc.
+They withhold one broker's topic response while another responds, deliver late
+duplicate replies, and repeat discovery past the control-slot bound. With every
+response lost, the manual clock expires one shared deadline; later lookups regain
+admission. Replacing the directory session requires a fresh reply under the same
+deadline. A four-partition broker case repeats resume/takeover forty times with
+a live reader and verifies every payload again through checkpoint replay.
+
+A controlled SDK case admits four subscriptions on one broker, cancels the
+next-record observers, and leaves both two-partition readers idle. Producer
+attachment and confirmation must finish without polling those readers or
+advancing the clock; resuming the readers then verifies the original payload.
+The case repeats the pause with four unsubscribe completions and requires
+producer resume and a subsequent confirmation to finish under the same bounds.
+
+Reader-close cases disconnect the real OMQ control socket with either an
+unanswered opening or a completed subscription. Detached cleanup preserves the
+checkpoint and settles without advancing the manual clock. Four unread producer
+responses hold all control slots through disconnect or session replacement;
+closing the old reader still settles, and the surviving writer confirms another
+record after replacement. A lost cancellation reply on the original live session
+remains an explicit timeout.
+
+Retention cleanup runs even below the byte limit. A controlled journal case
+checks the eight-object removal bound, unchanged selected bytes, unknown-file
+preservation, and unchanged record floors. Real four-partition DQ/RP brokers
+repeat recovery, reclaim the prior segments, and replay the selected payloads
+after every restart. Existing cleanup crash cuts and capture-pin cases still
+protect selected checkpoint sources and retained backing.
+
+Controlled retirement cases remove successive sealed prefixes without an
+intervening append, preserving the exact selected checkpoint in all three modes.
+The normal retention command path stays healthy across repeated passes. Reopen
+preserves retained multipart payloads and producer retry floors; later operations
+permit a new checkpoint. A failed read of the reused checkpoint fences retirement
+before another segment is unreferenced.
+
+Controlled journal and live actor cases fetch an older durable source while a
+later RP write remains unsynchronized. Repeated correlated requests return only
+the original operations and preserve the durable watermark. An unsynchronized
+source remains unavailable. A four-partition inproc case replaces two voters
+with fresh memory stores, resumes producer identities, and verifies reader
+payloads while the original donor continues serving.
+
+Consumer tests resolve time/ID starts through the same memory-only brokers.
+Pure selector tests cover duplicate IDs, confirmed/retained bounds and backward
+clock changes. Wire fixtures cover selector tags and resolved offset replies.
+Retention file-model tests commit floors before deleting segments, restart from
+the selected checkpoint, and continue producer sequences and partition offsets.
+Interleaved producers retain independent retry floors. Retained payloads survive
+repeated follower recovery and full-cluster restart; time starts continue from
+their resolved offsets across reconnect, and ID/checkpoint starts read cold
+retained segments. Restart elections include an ancient replica below both
+healthy copies' retained boundaries. A checkpoint at the accepted tail needs
+only state bytes.
+
+Controlled checkpoint exchanges reject future ranges, repeated chunks and old
+link sessions without advancing the receive cursor or adding memory charges.
+Pending checkpoint bytes use the same bounded owner memory as transfer state;
+exhaustion leaves the correlated request available for retry. The small TCP
+suite resumes and takes over saved producer identities after SIGKILL in DQ/RP.
+An unclean RP copy uses explicit nonvoting recovery before another voter stops.
+
+### Three-host crash soak
+
+The ignored `process::soak::three_host_crash_soak` case uses si-dev, wu-dev and
+er-dev. Provision fresh isolated directories with the same broker binary,
+`deployment.toml` and `shared.identity`, plus each broker's `local.identity`.
+Use the CLI's ordinary volume initialization and format steps. The topic is
+`orders` with four partitions and bounded retention. Broker processes and their
+storage workers use core 0; run the SDK test on cores 4-5. Keep each host idle.
+
+Set `OZZY_SOAK_CONFIG` to the controller's deployment file, `OZZY_SOAK_DIRS` to
+the three comma-separated directories in host order, and `OZZY_SOAK_LOGS` to an
+SSD artifact directory. `OZZY_SOAK_RESULTS` names a JSONL file under
+`~/.cache/ozzy/`. `OZZY_SOAK_SECONDS` defaults to 3600; use a short gate before
+requiring a full hour of clean churn for each real-I/O placement and policy.
+`OZZY_SOAK_HOSTS` defaults to `si-dev,wu-dev,er-dev`. Set it to
+`si-dev,si-dev,si-dev` for three processes on one host, with distinct directories
+and configured endpoints. Repeated hosts use separate broker cores 0, 1 and 2;
+the SDK remains on cores 4-5.
+
+The test admits individual records, checks every confirmed offset, ID and
+payload, then releases the verified oracle entries. It resumes or takes over
+the saved producer identity, keeps a reader connected across leader changes,
+and repeats sparse traffic, bounded bursts, hot-partition traffic, mixed sizes
+and multipart payloads with empty parts. Slow readers exercise repair while
+periodic checkpoint replay independently checks retained payloads. It rotates
+SIGKILL and orderly shutdown across brokers, and explicitly
+quarantines an unclean RP copy for quorum recovery. A failed process or thirty
+seconds without completion fails the run. These process kills preserve the OS
+page cache and establish no power-loss claim.
+
+For cross-host memory-only runs, copy the same built broker integration test
+binary as `memory-broker` into every run directory and set `OZZY_SOAK_MEMORY=1`.
+The ignored `journals::serving::simulated::churn::host::memory_only_broker_process`
+case embeds the real broker with the controlled file backend and configured TCP
+endpoints. Every process restart loses its memory store and starts nonvoting
+recovery, including DQ. Both remaining copies must supply recovery authority.
+This is a test harness, with no production storage mode or durability claim.
+
+The ignored `process::soak::single::single_broker_varied_io_soak` case uses the
+same varied SDK oracle on one durable broker. It retains its SSD artifacts,
+rotates SIGKILL and orderly restart, and checks saved producer and live reader
+reconnects. Set `OZZY_SOAK_SECONDS` and `OZZY_SOAK_RESULTS` and run on cores 4-5.
+Set `OZZY_SOAK_BROKER_BINARY` to a copied CLI binary to keep all restarts on the
+validated build. Otherwise the CLI process tests use Cargo's broker executable.
+
+The ignored `journals::serving::simulated::churn::memory_only_varied_churn_soak`
+case runs real brokers and SDKs over inproc with no filesystem journal I/O.
+Set `OZZY_SOAK_POLICY` to `single`, `dq` or `rp`, plus seconds and results.
+Replicated cases inject short segment writes, observe broker fencing, confirm
+with the surviving quorum, and explicitly recover the failed copy. The regular
+gate covers all policies before long runs; single-broker cases delay storage
+and restart without claiming failover.
+Interrupted recovery restarts select full resume for exact nonvoting markers
+and quarantine for established configurations. A controlled case holds donor
+barriers across a second restart, then verifies records after release. Selection
+is per partition; production membership and marker checks remain strict.
+Fault rotation waits for configuration publication; the following fault's
+confirmation requires the recovered copy to supply quorum. A separate controlled
+DQ/RP case holds an independent history lookup across duplicate `FETCH_OPS`
+requests, then checks the retried response's correlation, chain, and exact bodies.
+
+The ignored simulator `churn::long_running_accelerated_fault_churn` repeats
+bounded seed schedules until `OZZY_CHURN_SECONDS` expires (default one hour).
+`OZZY_CHURN_SEED` chooses the first seed; `OZZY_CHURN_RESULTS` records progress.
+DQ schedules retain replayable event words and reduction on failure. RP schedules
+combine failed/torn background writes, compressed/raw operations, permanent
+corruption, repeated repair, dropped/duplicated/reordered messages, and a fresh
+quorum supplied by recovered copies. Virtual clock jumps up to thirty seconds
+exercise protocol timeouts without wall-clock waits. Simulator byte faults are
+controlled crash-image evidence; host SIGKILL is a separate process-crash layer.
+
+```sh
+source scripts/ozzy_tools.sh
+taskset -c 4,5 cargo test -p ozzy-broker --test ozzy_broker_config \
+  process::soak::three_host_crash_soak -- --ignored --exact --nocapture
+```

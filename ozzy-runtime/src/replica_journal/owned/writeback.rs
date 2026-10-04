@@ -41,6 +41,13 @@ struct Entry {
 }
 
 impl Writeback {
+    pub(super) fn seek_records(&self) -> Vec<PreparedOperationRecords> {
+        self.queue
+            .iter()
+            .flat_map(|entry| entry.records.iter().cloned())
+            .collect()
+    }
+
     /// Accepted control bodies remain here until physical installation. A RAM
     /// confirmation can precede the index snapshot that will later cover them.
     pub(super) fn producer_open(

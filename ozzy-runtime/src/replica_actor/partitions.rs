@@ -573,6 +573,20 @@ impl PartitionActors {
         }
     }
 
+    /// Requested checkpoint replies share the bounded repair data plane.
+    pub fn checkpoint_receive_demand(
+        &self,
+        group: GroupId,
+    ) -> Option<ozzy_replication::wire::CheckpointRequest> {
+        if self.stopped {
+            return None;
+        }
+        match &self.actors[*self.index.get(&group)?] {
+            PartitionActor::Recovering(actor) => actor.checkpoint_receive_demand(),
+            PartitionActor::Local(_) | PartitionActor::Replicated(_) => None,
+        }
+    }
+
     /// Staged, validating, or installing data keeps its reservation until settled.
     pub fn receive_has_work(&self, group: GroupId) -> Result<bool, PartitionError> {
         let slot = *self.index.get(&group).ok_or(PartitionError::Unknown)?;
@@ -803,6 +817,19 @@ impl PartitionActors {
         try_send: &mut impl FnMut(&mut Context<'_>, Message) -> Result<(), TrySendError>,
     ) -> Result<bool, PartitionError> {
         self.turns = self.turns.wrapping_add(1);
+        if matches!(&self.actors[slot], PartitionActor::Replicated(normal) if normal.needs_checkpoint_recovery())
+        {
+            let PartitionActor::Replicated(normal) = self.actors.swap_remove(slot) else {
+                unreachable!("checked replicated actor");
+            };
+            self.native[slot] = None;
+            self.readers[slot] = None;
+            self.actors.push(PartitionActor::Recovering(Box::new(
+                ScheduledRecovery::quarantine(normal),
+            )));
+            let last = self.actors.len() - 1;
+            self.actors.swap(slot, last);
+        }
         let recovering = matches!(self.actors[slot], PartitionActor::Recovering(_));
         let result =
             poll_actor(&mut self.actors[slot], cx, now, &mut *try_send).and_then(|mut changed| {
@@ -882,11 +909,14 @@ fn poll_actor(
 ) -> Result<bool, PartitionError> {
     let group = actor.group();
     match actor {
-        PartitionActor::Local(actor) => match actor.poll_progress(cx) {
-            Poll::Pending => Ok(false),
-            Poll::Ready(Ok(())) => Err(PartitionError::Stopped),
-            Poll::Ready(Err(source)) => Err(PartitionError::Actor { group, source }),
-        },
+        PartitionActor::Local(actor) => {
+            actor.observe_time(now);
+            match actor.poll_progress(cx) {
+                Poll::Pending => Ok(false),
+                Poll::Ready(Ok(())) => Err(PartitionError::Stopped),
+                Poll::Ready(Err(source)) => Err(PartitionError::Actor { group, source }),
+            }
+        }
         PartitionActor::Replicated(actor) => {
             let error = |source| PartitionError::Replica { group, source };
             actor.advance(now).map_err(error)?;

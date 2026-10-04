@@ -694,6 +694,9 @@ impl FollowingChain for LogPosition {
 #[derive(Debug, Error)]
 pub enum SuffixReplacementError {
     #[error(transparent)]
+    /// Imported canonical checkpoint state could not be encoded.
+    Snapshot(#[from] ozzy_core::state::StateSnapshotError),
+    #[error(transparent)]
     /// A physical file operation failed.
     Io(#[from] io::Error),
     #[error(transparent)]

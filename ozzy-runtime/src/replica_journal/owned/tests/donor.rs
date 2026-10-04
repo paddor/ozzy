@@ -5,7 +5,7 @@ use crate::replica_journal::PinnedRecovery;
 use ozzy_proto::RequestId;
 use ozzy_replication::{OpNumber, wire::FetchOps};
 
-fn request(pin: PinnedRecovery) -> FetchOps {
+fn request(pin: &PinnedRecovery) -> FetchOps {
     FetchOps {
         scope: pin.response().scope,
         request_id: RequestId::from_bytes([42; 16]),
@@ -15,11 +15,11 @@ fn request(pin: PinnedRecovery) -> FetchOps {
         max_body_bytes: 8192,
     }
 }
-fn read(replica: &mut Replica, pin: PinnedRecovery) -> super::super::PreparedRecoveryRead {
+fn read(replica: &mut Replica, pin: &PinnedRecovery) -> super::super::PreparedRecoveryRead {
     let buffer = replica.journal.lease_append_buffer().unwrap();
     replica
         .journal
-        .prepare_recovery_read(pin, request(pin), buffer)
+        .prepare_recovery_read(*pin, request(pin), buffer)
         .unwrap()
 }
 
@@ -49,7 +49,7 @@ fn owned_donor_canceled_reads_keep_exact_source_while_writes_and_other_donor_con
     )
     .unwrap();
     // Lose the cache but retain the independently held segment metadata.
-    drop(read(&mut replica, pin2));
+    drop(read(&mut replica, &pin2));
     assert_eq!(
         drive(
             &mut controller,
@@ -58,7 +58,7 @@ fn owned_donor_canceled_reads_keep_exact_source_while_writes_and_other_donor_con
         .unwrap(),
         pin2
     );
-    let mut reading = Box::pin(read(&mut replica, pin2).read());
+    let mut reading = Box::pin(read(&mut replica, &pin2).read());
     assert!(poll(reading.as_mut()).is_pending());
     let held = controller.jobs()[0].0;
     drop(reading);
@@ -69,7 +69,7 @@ fn owned_donor_canceled_reads_keep_exact_source_while_writes_and_other_donor_con
     });
     replica.journal.complete_write(done).unwrap();
     settle(&mut replica, receipt);
-    let other = read(&mut replica, pin3);
+    let other = read(&mut replica, &pin3);
     let done = drive_except(&mut controller, other.read(), Some(held), |_| {
         Effect::Normal
     });
@@ -79,7 +79,7 @@ fn owned_donor_canceled_reads_keep_exact_source_while_writes_and_other_donor_con
     );
     controller.execute(held, Effect::Normal).unwrap();
     controller.deliver(held).unwrap();
-    let retried = read(&mut replica, pin2);
+    let retried = read(&mut replica, &pin2);
     let done = drive(&mut controller, retried.read());
     let result = replica.journal.complete_recovery_read(done).unwrap();
     assert_eq!(result.end(), first);
@@ -111,7 +111,7 @@ fn owned_released_and_recreated_donor_rejects_old_completion_even_for_same_nonce
         replica.journal.pin_recovery(requester, response),
     )
     .unwrap();
-    let old = read(&mut replica, pin);
+    let old = read(&mut replica, &pin);
     replica.journal.release_recovery(pin).unwrap();
     let fresh = drive(
         &mut controller,
@@ -125,7 +125,7 @@ fn owned_released_and_recreated_donor_rejects_old_completion_even_for_same_nonce
         Err(JournalError::HistorySourceMismatch)
     ));
     assert!(!replica.journal.is_faulted());
-    let new = read(&mut replica, fresh);
+    let new = read(&mut replica, &fresh);
     let done = drive(&mut controller, new.read());
     assert!(replica.journal.complete_recovery_read(done).is_ok());
     replica.journal.release_recovery(fresh).unwrap();
@@ -164,8 +164,8 @@ fn owned_donor_requires_installed_bytes_and_preserves_truncated_logical_snapshot
         replica.journal.pin_recovery(requester, response),
     )
     .unwrap();
-    drop(read(&mut replica, pin));
-    let work = read(&mut replica, pin);
+    drop(read(&mut replica, &pin));
+    let work = read(&mut replica, &pin);
     let done = drive(&mut controller, work.read());
     let result = replica.journal.complete_recovery_read(done).unwrap();
     assert_eq!(result.end(), response.primary.unwrap().accepted);

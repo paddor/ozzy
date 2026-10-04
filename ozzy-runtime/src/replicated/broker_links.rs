@@ -8,9 +8,7 @@ use std::{
 
 use bytes::Bytes;
 use omq_tokio::{Endpoint, IdentitySocket, SocketType};
-use ozzy_proto::{
-    LinkSessionId, NodeId, RequestId, append::Policy, directory, handshake, producer,
-};
+use ozzy_proto::{LinkSessionId, NodeId, RequestId, append::Policy, handshake, producer};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
 use super::WriterRuntime;
@@ -25,6 +23,7 @@ pub use clock::{ClockError, SdkClock};
 pub(super) mod append;
 pub use append::AppendLinkLimits;
 mod driver;
+mod metadata;
 mod publications;
 pub(in crate::replicated) mod readers;
 pub use readers::ReaderLinkLimits;
@@ -51,7 +50,8 @@ pub struct BrokerLinksConfig {
     pub brokers: Vec<BrokerAddress>,
     /// Shared negotiation profile for writer and reader commands.
     pub parameters: handshake::Parameters,
-    /// Aggregate outstanding control slots, including unread reply aliases.
+    /// Aggregate control-frame slots, including unread raw reply aliases.
+    /// Decoded subscription completions use the reader reservation instead.
     pub requests: usize,
     /// Aggregate control storage, including unused slots and encoding scratch.
     pub control_bytes: usize,
@@ -63,7 +63,8 @@ pub struct BrokerLinksConfig {
     pub append: Option<AppendLinkLimits>,
     /// Bounded shared reader inboxes. Absent for writer-only owners.
     pub reader: Option<ReaderLinkLimits>,
-    /// Bound for complete topic metadata assembled by one lookup.
+    /// Per-broker partition bound for topic discovery. One lookup attempts
+    /// each of the one or three configured brokers within shared admission.
     pub maximum_partitions: usize,
     /// Includes link negotiation and waiting for local control admission.
     pub request_timeout: Duration,
@@ -120,7 +121,7 @@ struct Inner {
 }
 
 struct ReplyObserver<'a> {
-    received: Option<oneshot::Receiver<Result<omq_tokio::Message, BrokerLinkError>>>,
+    received: Option<oneshot::Receiver<Result<driver::Reply, BrokerLinkError>>>,
     changed: &'a StateSignal,
 }
 
@@ -194,7 +195,7 @@ impl BrokerLinks {
                         .ok_or(BrokerLinkError::Configuration)?;
                 let hwm = slots + config.append.map_or(0, |limits| limits.requests) + 4;
                 let options = crate::transport::socket_options()
-                    .identity(Bytes::copy_from_slice(config.local.as_bytes()))
+                    .identity(crate::transport::peer_identity(config.local))
                     .router_mandatory(true)
                     .send_hwm(hwm as u32)
                     .recv_hwm(hwm as u32)
@@ -276,6 +277,11 @@ impl BrokerLinks {
         self.0.shared.sessions.session(broker)
     }
 
+    #[cfg(test)]
+    pub(crate) fn control_capacity(&self, broker: NodeId) -> usize {
+        self.0.peers[&broker].slots.available_permits()
+    }
+
     /// Cache checked topic identity for lazy SDK routing interests. Other
     /// writers opening the same topic reuse its exact state and broker links.
     pub fn routes(&self, topic: TopicMetadata) -> Result<TopicRoutes, BrokerLinkError> {
@@ -328,85 +334,6 @@ impl BrokerLinks {
             .map_or(BrokerLinkError::Closed, BrokerLinkError::Failed)
     }
 
-    /// Fetch complete numeric partition metadata from any reachable broker.
-    pub async fn topic(&self, name: &str) -> Result<TopicMetadata, BrokerLinkError> {
-        if name.is_empty() || name.len() > 128 {
-            return Err(BrokerLinkError::Configuration);
-        }
-        let deadline = self
-            .0
-            .config
-            .clock
-            .now()
-            .saturating_add(self.0.config.request_timeout);
-        let broker = loop {
-            let seen = self.0.shared.changed.generation();
-            if let Some(broker) = self
-                .0
-                .peers
-                .keys()
-                .copied()
-                .find(|broker| self.session(*broker).is_some())
-            {
-                break broker;
-            }
-            if self.0.peers.values().all(|peer| peer.closed.is_closed()) {
-                return Err(self
-                    .0
-                    .shared
-                    .failure
-                    .get()
-                    .cloned()
-                    .map_or(BrokerLinkError::Closed, BrokerLinkError::Failed));
-            }
-            tokio::select! {
-                () = self.0.shared.changed.changed_after(seen) => {},
-                () = self.0.shared.stop.closed() => return Err(BrokerLinkError::Closed),
-                () = self.0.config.clock.until(deadline) => return Err(BrokerLinkError::Timeout),
-            }
-        };
-        let mut pages = Vec::new();
-        let mut first = 0;
-        loop {
-            let message = self
-                .request_until(
-                    broker,
-                    driver::Body::Topic(directory::TopicRequest {
-                        name: name.to_owned(),
-                        first,
-                        maximum: directory::Limits::default().partitions as u16,
-                    }),
-                    deadline,
-                )
-                .await?;
-            let packet =
-                driver::packet(&message, broker, self.0.config.parameters.receive.envelope)?;
-            let page = directory::decode_topic_page(
-                packet,
-                self.0.config.parameters.receive.envelope,
-                directory::Limits::default(),
-            )?;
-            if page.name != name
-                || page.first != first
-                || page.total as usize > self.0.config.maximum_partitions
-            {
-                return Err(BrokerLinkError::Response);
-            }
-            first = first
-                .checked_add(page.partitions.len() as u32)
-                .ok_or(BrokerLinkError::Response)?;
-            let total = page.total;
-            pages.push(page);
-            if first == total {
-                break;
-            }
-        }
-        Ok(TopicMetadata::from_pages(
-            pages,
-            self.0.config.maximum_partitions,
-        )?)
-    }
-
     /// Open or fence one logical writer on the selected partition leader. On
     /// uncertainty, retry the exact supplied operation ID and expected epoch.
     pub async fn open_producer(
@@ -416,13 +343,18 @@ impl BrokerLinks {
         policy: Policy,
     ) -> Result<producer::Opened, BrokerLinkError> {
         let expected = match open.mode {
-            producer::Mode::Resume => open.expected_epoch.unwrap_or(1),
-            producer::Mode::Fence => open
-                .expected_epoch
-                .and_then(|epoch| epoch.checked_add(1))
-                .ok_or(BrokerLinkError::Configuration)?,
+            producer::Mode::Resume => open.expected_epoch,
+            producer::Mode::Create => Some(1),
+            producer::Mode::Fence => Some(
+                open.expected_epoch
+                    .and_then(|epoch| epoch.checked_add(1))
+                    .ok_or(BrokerLinkError::Configuration)?,
+            ),
         };
-        let message = self.request(broker, driver::Body::Open(open)).await?;
+        let message = self
+            .request(broker, driver::Body::Open(open))
+            .await?
+            .message()?;
         let packet = driver::packet(&message, broker, self.0.config.parameters.receive.envelope)?;
         let opened = producer::decode_opened(packet, self.0.config.parameters.receive.envelope)?;
         if opened.authority.group_id != open.authority.group_id
@@ -431,7 +363,7 @@ impl BrokerLinks {
             || opened.partition != open.partition
             || opened.producer != open.producer
             || opened.policy != policy
-            || opened.epoch != expected
+            || expected.is_some_and(|epoch| opened.epoch != epoch)
         {
             return Err(BrokerLinkError::Response);
         }
@@ -442,7 +374,7 @@ impl BrokerLinks {
         &self,
         broker: NodeId,
         body: driver::Body,
-    ) -> Result<omq_tokio::Message, BrokerLinkError> {
+    ) -> Result<driver::Reply, BrokerLinkError> {
         let deadline = self
             .0
             .config
@@ -457,12 +389,16 @@ impl BrokerLinks {
         broker: NodeId,
         body: driver::Body,
         deadline: Duration,
-    ) -> Result<omq_tokio::Message, BrokerLinkError> {
+    ) -> Result<driver::Reply, BrokerLinkError> {
         let peer = self
             .0
             .peers
             .get(&broker)
             .ok_or(BrokerLinkError::Configuration)?;
+        let scope = match &body {
+            driver::Body::Unsubscribe { session, .. } => Some(*session),
+            _ => None,
+        };
         let work = async {
             let permit = peer
                 .slots
@@ -495,6 +431,18 @@ impl BrokerLinks {
         };
         tokio::select! {
             result = work => result,
+            () = async {
+                let Some(session) = scope else {
+                    return std::future::pending::<()>().await;
+                };
+                loop {
+                    let seen = self.0.shared.changed.generation();
+                    if self.session(broker) != Some(session) {
+                        return;
+                    }
+                    self.0.shared.changed.changed_after(seen).await;
+                }
+            } => Err(BrokerLinkError::Session),
             () = self.0.shared.stop.closed() => Err(self.closed_error()),
             () = peer.closed.closed() => Err(self.closed_error()),
             () = self.0.config.clock.until(deadline) => Err(BrokerLinkError::Timeout),
@@ -607,6 +555,15 @@ fn control_sizes(config: &BrokerLinksConfig) -> Option<(usize, usize)> {
 /// open does not authorize a fresh operation ID or weaker confirmation policy.
 #[derive(Debug, thiserror::Error)]
 pub enum BrokerLinkError {
+    /// Missing or ambiguous record ID in the broker's retained history.
+    #[error(transparent)]
+    Seek(#[from] ozzy_core::reader::seek::SeekError),
+    /// Requested offset predates the currently retained history.
+    #[error("records expired; earliest retained offset is {earliest:?}")]
+    RetentionGap {
+        /// First currently retained record offset.
+        earliest: ozzy_proto::Offset,
+    },
     /// Invalid identity, profile, address set, or aggregate bounds.
     #[error("invalid SDK broker link configuration")]
     Configuration,

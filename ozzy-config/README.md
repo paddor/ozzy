@@ -24,3 +24,18 @@ This crate does not initialize segment journals or start a broker. The
 [`ozzy-broker` startup commands](../ozzy-broker/README.md) own file publication
 and effective host discovery. Identity records have an integrity checksum;
 decoding alone is not sufficient deployment validation.
+
+## Retention
+
+```toml
+[topics.orders.retention]
+max_age_secs = 86400
+max_bytes = 1073741824
+```
+
+Either positive bound can be omitted; omitting both keeps unlimited history.
+Bytes count selected segment capacities, including the active segment, per
+partition on each broker. The byte target must fit at least one segment.
+Either bound expires whole oldest sealed segments. These are soft targets:
+active work and captured reads can delay physical deletion. A coordinated
+restart confirms changed policy through the ordinary partition log.

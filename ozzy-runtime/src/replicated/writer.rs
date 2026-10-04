@@ -75,6 +75,10 @@ pub struct WriterConfig {
 }
 
 impl WriterConfig {
+    pub(crate) fn validate_shared(&self) -> Result<(), WriterError> {
+        self.parameters_with_local_group(true).map(|_| ())
+    }
+
     fn transport_backing_bytes(&self) -> usize {
         reservation::transport_backing_bytes(self.limits)
     }

@@ -3,13 +3,24 @@ use futures::{
     FutureExt,
     future::{BoxFuture, Shared},
 };
-use std::sync::{
-    Arc, OnceLock,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
-};
+#[cfg(all(test, ozzy_loom))]
+use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(not(all(test, ozzy_loom)))]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use tokio::sync::Notify;
 
 type ThreadJoin = Shared<BoxFuture<'static, ()>>;
+
+pub(crate) fn startup_groups(shards: usize) -> (Registration, Registration) {
+    let application = State::new(shards);
+    let mut frontend = State::new(1);
+    frontend.stop = application.stop.clone();
+    (
+        Registration::new(Arc::new(application)),
+        Registration::new(Arc::new(frontend)),
+    )
+}
 
 /// Coalesced shutdown signal, independent of the startup caller's executor.
 #[derive(Clone, Debug, Default)]

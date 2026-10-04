@@ -14,7 +14,7 @@ use tokio::sync::OwnedSemaphorePermit;
 pub struct ReaderLinkLimits {
     /// Maximum partition subscriptions across all topic readers.
     pub subscriptions: usize,
-    /// Reserved inbox and decode storage across these subscriptions.
+    /// Reserved inbox, decode, and control-completion storage across subscriptions.
     pub bytes: usize,
     /// Frames per partition before replay resumes from delivered progress.
     pub queue_messages: usize,
@@ -57,7 +57,8 @@ impl ReaderLinkLimits {
             .checked_add(decode)?
             .checked_mul(frame_slots(self.queue_messages))?
             .checked_add(decode)?
-            .checked_add(receive.envelope.max_metadata_bytes.checked_add(256)?)?;
+            .checked_add(receive.envelope.max_metadata_bytes.checked_add(256)?)?
+            .checked_add(std::mem::size_of::<Result<driver::Reply, BrokerLinkError>>())?;
         let transport = message
             .checked_add(4096)?
             .checked_mul(self.queue_messages)?
@@ -335,6 +336,7 @@ impl Registry {
             session,
             request,
             subscribed: reader::Subscribed {
+                resolved_offset: 0,
                 subscription: subscribe.subscription,
                 source,
             },
@@ -363,11 +365,8 @@ impl Registry {
                         .is_some_and(|selected| {
                             selected.broker == broker
                                 && Some(selected.session) == packet.envelope.session
-                                && selected.subscribed
-                                    == reader::Subscribed {
-                                        subscription,
-                                        source,
-                                    }
+                                && selected.subscribed.subscription == subscription
+                                && selected.subscribed.source == source
                         });
                     current.then_some(inbox)
                 })
@@ -439,13 +438,15 @@ impl Inbox {
             .publications
             .pop_front()
     }
-    pub(in crate::replicated) fn selected(&self) -> Option<(NodeId, reader::Subscribed)> {
+    pub(in crate::replicated) fn selected(
+        &self,
+    ) -> Option<(NodeId, LinkSessionId, reader::Subscribed)> {
         self.state
             .lock()
             .expect("reader inbox poisoned")
             .selected
             .as_ref()
-            .map(|selected| (selected.broker, selected.subscribed))
+            .map(|selected| (selected.broker, selected.session, selected.subscribed))
     }
     pub(in crate::replicated) fn pop(&self) -> Option<Message> {
         let mut state = self.state.lock().expect("reader inbox poisoned");
@@ -539,18 +540,13 @@ impl BrokerLinks {
         broker: NodeId,
         subscribe: reader::Subscribe,
     ) -> Result<reader::Subscribed, BrokerLinkError> {
-        let message = self
-            .request(broker, driver::Body::Subscribe(subscribe.clone()))
-            .await?;
-        let packet = driver::packet(&message, broker, self.0.config.parameters.receive.envelope)?;
-        let selected =
-            reader::decode_subscribed(packet, self.0.config.parameters.receive.envelope)?;
-        if selected.subscription != subscribe.subscription
-            || Some(selected.source) != subscribe.target.group_source()
+        match self
+            .request(broker, driver::Body::Subscribe(subscribe))
+            .await?
         {
-            return Err(BrokerLinkError::Response);
+            driver::Reply::Subscribed(selected) => Ok(selected),
+            _ => Err(BrokerLinkError::Response),
         }
-        Ok(selected)
     }
     pub(in crate::replicated) async fn reader_ack(
         &self,
@@ -591,13 +587,14 @@ impl BrokerLinks {
                         )
                         .await;
                 }
-                result => return result,
+                result => return result.and_then(driver::Reply::message),
             }
         }
     }
     pub(in crate::replicated) async fn unsubscribe(
         &self,
         broker: NodeId,
+        session: LinkSessionId,
         selected: reader::Subscribed,
     ) -> Result<(), BrokerLinkError> {
         let deadline = self
@@ -606,12 +603,16 @@ impl BrokerLinks {
             .clock
             .now()
             .saturating_add(self.0.config.request_timeout);
-        let message = loop {
+        let reply = loop {
             match self
-                .request_until(broker, driver::Body::Unsubscribe(selected), deadline)
+                .request_until(
+                    broker,
+                    driver::Body::Unsubscribe { session, selected },
+                    deadline,
+                )
                 .await
             {
-                Ok(message) => break message,
+                Ok(reply) => break reply,
                 Err(BrokerLinkError::Rejected {
                     retry: ozzy_proto::nack::RetryClass::AfterBackoff,
                     ..
@@ -636,12 +637,9 @@ impl BrokerLinks {
                 Err(error) => return Err(error),
             }
         };
-        let packet = driver::packet(&message, broker, self.0.config.parameters.receive.envelope)?;
-        if reader::decode_unsubscribed(packet, self.0.config.parameters.receive.envelope)?
-            != selected
-        {
-            return Err(BrokerLinkError::Response);
+        match reply {
+            driver::Reply::Unsubscribed => Ok(()),
+            _ => Err(BrokerLinkError::Response),
         }
-        Ok(())
     }
 }

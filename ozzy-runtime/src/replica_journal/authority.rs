@@ -17,7 +17,7 @@ pub(super) fn recovery_ticket(
     configuration: ozzy_replication::Configuration,
     local: ozzy_proto::NodeId,
     generation: ozzy_replication::JournalGeneration,
-    ticket: ozzy_replication::recovery::RecoveryTicket,
+    ticket: &ozzy_replication::recovery::RecoveryTicket,
 ) -> Result<(), JournalError> {
     let others = configuration
         .voters()
@@ -47,9 +47,22 @@ pub(super) fn validate_manifest(
     configuration_epoch: u64,
     segment_bytes: u64,
 ) -> Result<(), JournalError> {
+    validate_storage_profile(
+        current,
+        CommitMode::External,
+        configuration_epoch,
+        segment_bytes,
+    )
+}
+
+pub(super) fn validate_storage_profile(
+    current: &Manifest,
+    mode: CommitMode,
+    configuration_epoch: u64,
+    segment_bytes: u64,
+) -> Result<(), JournalError> {
     if !current.durable_evidence
-        || current.commit_mode != CommitMode::External
-        || current.checkpoint.is_some()
+        || current.commit_mode != mode
         || current.configuration_epoch != configuration_epoch
         || current
             .segments
@@ -58,11 +71,26 @@ pub(super) fn validate_manifest(
         || current
             .segments
             .first()
-            .is_none_or(|segment| segment.first_chain != ChainPosition::GENESIS)
+            .is_none_or(|segment| !supported_anchor(current, segment.first_chain))
     {
         return Err(JournalError::UnsupportedHistory);
     }
     Ok(())
+}
+
+fn supported_anchor(manifest: &Manifest, first: ChainPosition) -> bool {
+    if first == ChainPosition::GENESIS {
+        return true;
+    }
+    let Some(checkpoint) = manifest.checkpoint else {
+        return false;
+    };
+    let Some(previous) = first.next_op_number().checked_sub(1) else {
+        return false;
+    };
+    previous < checkpoint.position.op_number
+        || (previous == checkpoint.position.op_number
+            && first.previous_digest() == checkpoint.position.digest)
 }
 
 pub(super) fn promise_manifest(

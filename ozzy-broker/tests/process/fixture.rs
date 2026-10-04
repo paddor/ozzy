@@ -23,6 +23,14 @@ pub(super) struct Fixture {
 }
 
 impl Fixture {
+    pub(super) fn keep_artifacts(mut self) -> Self {
+        self.directory.disable_cleanup(true);
+        eprintln!(
+            "single-broker soak artifacts: {}",
+            self.directory.path().display()
+        );
+        self
+    }
     pub(super) fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
         let config = directory.path().join("deployment.toml");
@@ -143,6 +151,10 @@ impl Fixture {
     }
 
     pub(super) fn start(&self, round: usize) -> Running {
+        self.start_on_cpu(round, None)
+    }
+
+    pub(super) fn start_on_cpu(&self, round: usize, cpu: Option<u32>) -> Running {
         let log = self.directory.path().join(format!("serve-{round}.log"));
         let name = self
             .image
@@ -150,6 +162,15 @@ impl Fixture {
             .map(|_| format!("ozzy-test-{}-{round}", uuid::Uuid::now_v7()));
         let mut command = self.broker_command("serve", name.as_deref());
         command.arg("--trusted-transport");
+        if let Some(cpu) = cpu {
+            assert!(self.image.is_none());
+            let mut pinned = Command::new("taskset");
+            pinned
+                .args(["-c", &cpu.to_string()])
+                .arg(command.get_program())
+                .args(command.get_args());
+            command = pinned;
+        }
         Running::spawn(command, log, name)
     }
 }

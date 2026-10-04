@@ -11,14 +11,17 @@ const GROUP_TAG: u8 = 1;
 const OPEN_BYTES: usize = 90;
 const OPENED_BYTES: usize = 90;
 
-/// First opening or conditional fencing of a partition-local writer.
+/// Create, resume, or conditionally fence a partition-local writer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum Mode {
-    /// Resume the expected session; create epoch one if no session exists.
+    /// Return the current session, optionally requiring its exact epoch.
+    /// An unused partition creates epoch one.
     Resume = 0,
     /// Commit a strictly newer epoch, fencing the expected old session.
     Fence = 1,
+    /// Create epoch one. An existing identity must be resumed explicitly.
+    Create = 2,
 }
 
 impl TryFrom<u8> for Mode {
@@ -28,6 +31,7 @@ impl TryFrom<u8> for Mode {
         match value {
             0 => Ok(Self::Resume),
             1 => Ok(Self::Fence),
+            2 => Ok(Self::Create),
             _ => Err(CodecError::Profile),
         }
     }
@@ -42,9 +46,9 @@ pub struct Open {
     pub partition: PartitionIncarnation,
     /// Stable logical writer identity, shared across its partition sessions.
     pub producer: ProducerId,
-    /// Resume or conditionally advance the writer fence.
+    /// Create, resume, or conditionally advance the writer fence.
     pub mode: Mode,
-    /// Exact old epoch, or absent only before the first open.
+    /// Optional expected epoch for resume; required for fence, absent for create.
     pub expected_epoch: Option<u64>,
     /// Idempotence identity for a new session transition.
     pub operation: OperationId,
@@ -234,6 +238,7 @@ fn validate_open(open: Open) -> Result<(), CodecError> {
     if open.operation.as_bytes() == &[0; 16]
         || open.expected_epoch == Some(0)
         || (open.mode == Mode::Fence && open.expected_epoch.is_none())
+        || (open.mode == Mode::Create && open.expected_epoch.is_some())
     {
         return Err(CodecError::Identity);
     }

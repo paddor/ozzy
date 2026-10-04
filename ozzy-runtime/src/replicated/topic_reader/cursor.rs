@@ -25,6 +25,7 @@ pub(super) type Returning = Pin<Box<dyn Future<Output = Result<(), BrokerLinkErr
 pub(super) struct Cursor {
     pub number: u32,
     pub next: u64,
+    selector: Option<reader::Start>,
     inbox: Arc<Inbox>,
     selected: Option<Selected>,
     accepted: Option<Selected>,
@@ -50,15 +51,20 @@ impl Cursor {
     pub(super) fn new(
         links: &BrokerLinks,
         partition: &ozzy_proto::directory::TopicPartition,
-        from: u64,
+        start: reader::Start,
         refresh: Duration,
     ) -> Result<Self, BrokerLinkError> {
+        let from = match start {
+            reader::Start::Offset(offset) => offset,
+            _ => 0,
+        };
         let mut prefix = [0; 32];
         prefix[..16].copy_from_slice(partition.group.as_bytes());
         prefix[16..].copy_from_slice(partition.incarnation.as_bytes());
         Ok(Self {
             number: partition.number,
             next: from,
+            selector: Some(start),
             inbox: links.reader_inbox(Bytes::copy_from_slice(&prefix))?,
             selected: None,
             accepted: None,

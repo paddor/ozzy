@@ -87,6 +87,7 @@ impl NativeAccess {
 struct Writer {
     client: ClientAccess,
     session: Option<LinkSessionId>,
+    revoked: bool,
 }
 
 /// Entries own no payload or authority. All arenas and slots are preallocated.
@@ -106,6 +107,7 @@ impl Writers {
                     Some(Writer {
                         client,
                         session: None,
+                        revoked: false,
                     })
                 })
                 .collect(),
@@ -178,6 +180,7 @@ impl Writers {
                         producer,
                     },
                     session: Some(link.binding.session),
+                    revoked: false,
                 });
                 Some(index)
             }
@@ -190,6 +193,44 @@ impl Writers {
             entry
                 .is_some_and(|entry| entry.client.node == node && entry.client.producer == producer)
         })
+    }
+
+    pub(super) fn revoked(&self, node: NodeId, producer: ProducerId) -> bool {
+        self.assigned(node, producer)
+            .is_some_and(|index| self.entries[index].unwrap().revoked)
+    }
+
+    /// Invalidate old physical attachments before capturing resume coordinates.
+    /// No accepted record or physical job is canceled.
+    pub(super) fn attach(
+        &mut self,
+        link: Link,
+        producer: ProducerId,
+        slots: &[Slot],
+        stride: usize,
+    ) {
+        for (index, entry) in self.entries.iter_mut().enumerate() {
+            let Some(entry) = entry else {
+                continue;
+            };
+            if entry.client.producer != producer {
+                continue;
+            }
+            let same_client = entry.client.node == link.binding.peer;
+            if same_client && entry.session == Some(link.binding.session) {
+                entry.revoked = false;
+                continue;
+            }
+            entry.revoked = !same_client;
+            for slot in &slots[index * stride..(index + 1) * stride] {
+                if let Some(pending) = &slot.pending {
+                    pending.proposal.fence_unadmitted();
+                }
+            }
+            if same_client {
+                entry.session = Some(link.binding.session);
+            }
+        }
     }
 
     /// Existing rejection slot of this client. Assigns nothing.

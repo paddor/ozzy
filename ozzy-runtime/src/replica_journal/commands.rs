@@ -33,6 +33,18 @@ pub(super) struct Command {
 
 #[derive(Debug)]
 pub(super) enum Action {
+    Retention {
+        ticket: ozzy_replication::driver::ValidationTicket,
+        seed: ozzy_proto::OperationId,
+        leader: bool,
+        done: completion::Sender<Result<super::RetentionTurn, JournalError>>,
+    },
+    Seek {
+        ticket: ValidationTicket,
+        partition: ozzy_proto::PartitionIncarnation,
+        start: ozzy_proto::reader::Start,
+        done: completion::Sender<Result<super::PartitionReadCursor, JournalError>>,
+    },
     CleanupOrphans {
         ticket: ValidationTicket,
         budget: ozzy_journal_segment::MaintenanceBudget,
@@ -167,7 +179,9 @@ pub(super) fn read_fault(error: &JournalError) -> bool {
     use ozzy_journal_segment::HistoryError;
     matches!(
         error,
-        JournalError::Directory(_)
+        JournalError::CheckpointBytes(_)
+            | JournalError::Checkpoint(_)
+            | JournalError::Directory(_)
             | JournalError::Index(_)
             | JournalError::IdentityHandoff(_)
             | JournalError::Faulted

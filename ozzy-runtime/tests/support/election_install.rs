@@ -249,7 +249,9 @@ impl Actor {
             }
             ReplicaMessage::Prepare(_) => panic!("fresh prepares wait for activation"),
             ReplicaMessage::Flow(_) => panic!("fixture has not opened a credited flow"),
-            ReplicaMessage::Recovery(_) => panic!("fixture has no lost-state recovery"),
+            ReplicaMessage::Checkpoint(_)
+            | ReplicaMessage::HistoryRetired(_)
+            | ReplicaMessage::Recovery(_) => panic!("fixture has no lost-state recovery"),
         }
     }
 

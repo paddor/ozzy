@@ -5,6 +5,29 @@ use crate::{FrozenLog, Prefix, PreparedOperation, RecoveredState, ReplicationErr
 use super::{Recovery, RecoveryError, RecoveryTicket, Transfer};
 
 impl Recovery {
+    /// Observe privately decoded canonical state at the pinned original anchor.
+    /// The adapter must verify schema, bytes, digest, and revision before calling.
+    /// This grants no vote or publication authority.
+    pub fn complete_checkpoint(
+        &mut self,
+        ticket: RecoveryTicket,
+        anchor: super::CheckpointAnchor,
+        state_revision: u64,
+    ) -> Result<(), RecoveryError> {
+        self.require_ticket(&ticket)?;
+        if ticket.checkpoint() != Some(anchor) {
+            return Err(RecoveryError::StaleTransfer);
+        }
+        if state_revision != anchor.position.op.0 {
+            return Err(RecoveryError::ApplicationPending);
+        }
+        self.pending
+            .as_mut()
+            .expect("checked transfer")
+            .checkpoint_ready = true;
+        Ok(())
+    }
+
     /// Validate one count/byte-bounded chunk starting at the current full-WAL cursor.
     ///
     /// No descriptors or payloads are retained. The adapter must independently
@@ -16,7 +39,10 @@ impl Recovery {
         ticket: RecoveryTicket,
         operations: &[PreparedOperation],
     ) -> Result<(), RecoveryError> {
-        let pending = self.require_ticket(ticket)?;
+        let pending = self.require_ticket(&ticket)?;
+        if !pending.checkpoint_ready {
+            return Err(RecoveryError::ApplicationPending);
+        }
         if operations.is_empty() {
             return Err(ReplicationError::HistoryGap.into());
         }
@@ -47,6 +73,9 @@ impl Recovery {
                     && operation.prefix != ticket.source.accepted)
                 || (operation.prefix.op == ticket.committed.op
                     && operation.prefix != ticket.committed)
+                || ticket.checkpoint.is_some_and(|anchor| {
+                    operation.prefix.op == anchor.position.op && operation.prefix != anchor.position
+                })
             {
                 return Err(ReplicationError::ConflictingHistory.into());
             }
@@ -76,7 +105,10 @@ impl Recovery {
         durable: Prefix,
         applied: Prefix,
     ) -> Result<RecoveredState, RecoveryError> {
-        let pending = self.require_ticket(ticket)?;
+        let pending = self.require_ticket(&ticket)?;
+        if !pending.checkpoint_ready {
+            return Err(RecoveryError::ApplicationPending);
+        }
         if pending.through != ticket.source.accepted {
             return Err(RecoveryError::HistoryMissing);
         }
@@ -102,7 +134,7 @@ impl Recovery {
     /// Dropping a waiter is not storage failure. Stale callbacks cannot fault a
     /// different recovery attempt; no faulted instance may return recovered state.
     pub fn fail(&mut self, ticket: RecoveryTicket) -> Result<(), RecoveryError> {
-        self.pending_ticket(ticket)?;
+        self.pending_ticket(&ticket)?;
         self.faulted = true;
         Ok(())
     }
@@ -116,7 +148,7 @@ impl Recovery {
         ticket: RecoveryTicket,
         repaired: RecoveredState,
     ) -> Result<RecoveredState, RecoveryError> {
-        self.require_ticket(ticket)?;
+        self.require_ticket(&ticket)?;
         if repaired.scope
             != (crate::Scope {
                 view: repaired.scope.view,
@@ -138,14 +170,14 @@ impl Recovery {
         Ok(repaired)
     }
 
-    fn pending_ticket(&self, ticket: RecoveryTicket) -> Result<Transfer, RecoveryError> {
+    fn pending_ticket(&self, ticket: &RecoveryTicket) -> Result<Transfer, RecoveryError> {
         self.require_active()?;
         self.pending
-            .filter(|pending| pending.ticket == ticket)
+            .filter(|pending| pending.ticket == *ticket)
             .ok_or(RecoveryError::StaleTransfer)
     }
 
-    fn require_ticket(&self, ticket: RecoveryTicket) -> Result<Transfer, RecoveryError> {
+    fn require_ticket(&self, ticket: &RecoveryTicket) -> Result<Transfer, RecoveryError> {
         let pending = self.pending_ticket(ticket)?;
         if self.view > ticket.scope.view {
             return Err(RecoveryError::StaleView);

@@ -6,6 +6,8 @@ use crate::{
 
 const CONFIG: &[u8] = b"test deployment";
 
+mod checkpoint_quarantine;
+
 pub(super) fn recovery_limits() -> CanonicalRecoveryLimits {
     CanonicalRecoveryLimits {
         index: super::indexes::build_limits(),

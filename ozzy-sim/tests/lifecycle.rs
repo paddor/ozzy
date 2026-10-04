@@ -21,6 +21,9 @@ mod persisting;
 #[path = "support/lifecycle/storage_repair.rs"]
 mod storage_repair;
 
+#[path = "support/lifecycle/churn.rs"]
+mod churn;
+
 use model::{Cluster, DiskAction};
 use ozzy_replication::wire::{Control, FlowMessage, ReplicaMessage};
 use ozzy_replication::{OpNumber, Prefix};

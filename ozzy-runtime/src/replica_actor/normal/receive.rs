@@ -21,7 +21,7 @@ pub(in crate::replica_actor) struct Receive {
     pub(in crate::replica_actor) queued: AppendBuffer,
     end: Option<Prefix>,
     flight: Option<Flight>,
-    pub(super) ledger: Receiver,
+    pub(in crate::replica_actor) ledger: Receiver,
     operations: Vec<Operation>,
     pub(in crate::replica_actor) allocator: Option<crate::memory::Allocator>,
 }

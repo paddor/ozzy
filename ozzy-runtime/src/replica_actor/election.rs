@@ -31,6 +31,7 @@ impl ReplicaActor {
             self.storage_validation.map(|(_, next, _)| next),
             self.metadata_cleanup.map(|(_, next, _)| next),
             self.orphan_cleanup.map(|(_, next, _)| next),
+            self.retention_at,
         ]
         .into_iter()
         .enumerate()
@@ -50,9 +51,10 @@ impl ReplicaActor {
                 0 => self.storage_validation_round(now)?,
                 1 => self.metadata_cleanup_round(now)?,
                 2 => self.orphan_cleanup_round(now)?,
+                3 => self.retention_round(now)?,
                 _ => unreachable!("three maintenance tasks"),
             }
-            if self.pending.is_some() {
+            if self.pending.is_some() || kind == 3 {
                 return Ok(());
             }
         }
@@ -175,6 +177,9 @@ impl ReplicaActor {
             }
             Err(DriverError::ViewChange(ViewChangeError::HistoryMissing)) => {
                 let (source, op) = missing.ok_or(ActorError::History)?;
+                if self.lookup.unavailable(source, op) {
+                    return Ok(());
+                }
                 if source.voter == self.local {
                     if self.pinned != Some(source) {
                         return Err(ActorError::History);
@@ -230,8 +235,15 @@ impl ReplicaActor {
                 // Diagnostic work has no authority to alter a newer actor view.
                 debug_assert_eq!(checked.step.generation, checked.ticket.generation());
             }
-            Completed::RecoveryPin(pin) => self.complete_recovery_pin(pin, false)?,
-            Completed::RecoveryRelease(pin) => self.complete_recovery_pin(pin, true)?,
+            Completed::RetiredLookup(positions, to, request) => {
+                self.complete_retired_lookup(&positions, to, request)?;
+            }
+            Completed::Retention(turn) => self.complete_retention(turn)?,
+            Completed::RecoveryCheckpoint(chunk, to) => {
+                self.complete_recovery_checkpoint(to, chunk)?;
+            }
+            Completed::RecoveryPin(pin) => self.complete_recovery_pin(&pin, false)?,
+            Completed::RecoveryRelease(pin) => self.complete_recovery_pin(&pin, true)?,
             Completed::Fetch(fetched, FetchPurpose::Recovery(to, nonce)) => {
                 self.complete_recovery_fetch(to, nonce, fetched)?;
             }
@@ -249,12 +261,7 @@ impl ReplicaActor {
                 }
                 self.pinned = None;
             }
-            Completed::Position(position) => {
-                self.lookup.insert(
-                    position.source,
-                    position.position.ok_or(ActorError::History)?,
-                )?;
-            }
+            Completed::Position(position) => self.complete_position(&position)?,
             Completed::Fetch(fetched, FetchPurpose::Serve(to)) => self.send_ops(to, fetched)?,
             Completed::Fetch(fetched, FetchPurpose::Install) => {
                 let ticket = self

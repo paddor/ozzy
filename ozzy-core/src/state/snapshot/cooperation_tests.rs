@@ -105,22 +105,22 @@ fn canonical_snapshot_encoding_bytes_fixture() {
             130,
             0,
             0,
-            6605,
-            0x073e_3551_2a3b_0136_fb1b_7ddb_6bfd_68a3_u128,
+            9725,
+            0xb727_a0ef_cc94_3eb3_6de4_dab8_f940_5ef6_u128,
         ),
         (
             2,
             130,
             130,
-            21261,
-            0x749a_1e5f_7a1d_b0b6_84b4_edc2_370c_36fb,
+            21309,
+            0xeb07_b5aa_f6c4_ec33_046f_41c7_e6d1_1c03_u128,
         ),
         (
             2,
             6000,
             130,
-            303_021,
-            0x67b6_ceae_7bf4_f7ec_8954_dedd_ebc8_3e96,
+            303_069,
+            0x4eba_546f_0d42_7452_23fa_323c_bf3d_91f0_u128,
         ),
     ] {
         let state = state(writers, spans, metadata);
@@ -298,13 +298,13 @@ fn cooperative_state_snapshot_refuses_late_semantic_errors_and_resource_limits()
     let names = usize::from(read_u16(&original, partition + 4))
         + usize::from(read_u16(&original, partition + 6));
     let first = partition + 96 + names;
-    let second = first + 48 + 130 * 24;
+    let second = first + 72 + 130 * 24;
     let progress = partition + read_u32(&original, partition) as usize;
     let assignments = progress + 130 * PROGRESS_BYTES;
     for (at, value, error) in [
-        (second + 48 + 8, 0, StateSnapshotError::InvalidPartition),
+        (second + 72 + 8, 0, StateSnapshotError::InvalidPartition),
         (
-            first + 48 + 129 * 24,
+            first + 72 + 129 * 24,
             999,
             StateSnapshotError::InvalidPartition,
         ),

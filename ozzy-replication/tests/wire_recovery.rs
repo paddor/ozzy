@@ -82,6 +82,7 @@ fn state() -> RecoveryState {
             scope: configuration().scope(),
             nonce: request().nonce,
             primary: Some(RecoveryLog {
+                checkpoint: None,
                 generation: JournalGeneration(14),
                 accepted: Prefix {
                     op: OpNumber(2),
@@ -97,6 +98,75 @@ fn state() -> RecoveryState {
 }
 
 #[test]
+fn checkpoint_anchor_roundtrips_and_rejects_every_partial_descriptor() {
+    let mut state = state();
+    let log = state.response.primary.as_mut().unwrap();
+    log.checkpoint = Some(ozzy_replication::recovery::CheckpointAnchor {
+        predecessor: Prefix::GENESIS,
+        position: log.committed,
+        schema: Digest::from_bytes([41; 32]),
+        state_digest: Digest::from_bytes([42; 32]),
+        state_bytes: 4096,
+        chunk_bytes: 1024,
+    });
+    let mut metadata = [0xff; 512];
+    let encoded = encode_recovery_state(
+        node(0),
+        session(),
+        state,
+        &mut metadata,
+        WireLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(encoded.metadata_bytes, 350);
+    assert_eq!(metadata[193], 1);
+    let binding = PeerBinding::new(configuration(), node(0), session()).unwrap();
+    assert_eq!(
+        decode(
+            &[&encoded.header, &metadata[..350], &[]],
+            binding,
+            WireLimits::default()
+        )
+        .unwrap(),
+        ReplicaMessage::Recovery(RecoveryMessage::State(state))
+    );
+    for length in 194..350 {
+        assert!(
+            decode(
+                &[&encoded.header, &metadata[..length], &[]],
+                binding,
+                WireLimits::default()
+            )
+            .is_err()
+        );
+    }
+    let anchor = state
+        .response
+        .primary
+        .as_mut()
+        .unwrap()
+        .checkpoint
+        .as_mut()
+        .unwrap();
+    anchor.position = Prefix {
+        op: OpNumber(3),
+        digest: Digest::from_bytes([43; 32]),
+    };
+    let untouched = metadata;
+    assert!(
+        encode_recovery_state(
+            node(0),
+            session(),
+            state,
+            &mut metadata,
+            WireLimits::default()
+        )
+        .is_err()
+    );
+    assert_eq!(metadata, untouched);
+}
+
+#[test]
 fn recovery_state_has_frozen_primary_and_backup_bytes_without_durable_vote_evidence() {
     for primary in [true, false] {
         let mut state = state();
@@ -108,7 +178,7 @@ fn recovery_state_has_frozen_primary_and_backup_bytes_without_durable_vote_evide
         let encoded =
             encode_recovery_state(from, session(), state, &mut metadata, WireLimits::default())
                 .unwrap();
-        let size = if primary { 193 } else { 97 };
+        let size = if primary { 194 } else { 97 };
         let mut header = [0; 64];
         header[..6].copy_from_slice(b"OZY\0\x01\x39");
         header[7] = 1;
@@ -116,7 +186,7 @@ fn recovery_state_has_frozen_primary_and_backup_bytes_without_durable_vote_evide
         header[24..40].copy_from_slice(from.as_bytes());
         header[40..56].fill(9);
         header[59] = size as u8;
-        let mut golden = [0; 193];
+        let mut golden = [0; 194];
         golden[..16].fill(7);
         golden[23] = 1;
         golden[32..48].copy_from_slice(from.as_bytes());
@@ -173,9 +243,9 @@ fn current_link_exchange_and_recovery_nonce_must_both_match_without_fixing_reply
     assert_eq!(state.validate_response(changed), Err(WireError::Scope));
 }
 
-fn packet(from: NodeId, message: RecoveryMessage) -> ([u8; 64], Vec<u8>) {
+fn packet(from: NodeId, message: &RecoveryMessage) -> ([u8; 64], Vec<u8>) {
     let mut metadata = [0xff; 208];
-    let encoded = match message {
+    let encoded = match *message {
         RecoveryMessage::Request(request) => encode_recovery(
             from,
             session(),
@@ -223,7 +293,7 @@ fn messages() -> [(NodeId, RecoveryMessage); 3] {
 #[test]
 fn recovery_encoders_preserve_caller_storage_on_capacity_and_limit_errors() {
     for (from, message) in messages() {
-        let (_, bytes) = packet(from, message);
+        let (_, bytes) = packet(from, &message);
         let encode = |output: &mut [u8], limits| match message {
             RecoveryMessage::Request(request) => {
                 encode_recovery(from, session(), request, output, limits)
@@ -261,12 +331,12 @@ fn recovery_encoders_preserve_caller_storage_on_capacity_and_limit_errors() {
     }
 }
 
-fn exchange(from: NodeId, response: RecoveryResponse) -> RecoveryResponse {
+fn exchange(from: NodeId, response: &RecoveryResponse) -> RecoveryResponse {
     let (header, metadata) = packet(
         from,
-        RecoveryMessage::State(RecoveryState {
+        &RecoveryMessage::State(RecoveryState {
             request_id: request().request_id,
-            response,
+            response: *response,
         }),
     );
     let ReplicaMessage::Recovery(RecoveryMessage::State(state)) =
@@ -330,14 +400,17 @@ fn decoded_quorum_and_history_still_require_publication_before_fenced_rejoin() {
         bounds,
     )
     .unwrap();
-    let response = exchange(node(0), primary.recovery_response(request().nonce).unwrap());
+    let response = exchange(
+        node(0),
+        &primary.recovery_response(request().nonce).unwrap(),
+    );
     recovery.receive(node(0), response).unwrap();
     recovery.receive(node(0), response).unwrap();
     assert_eq!(recovery.begin_transfer(), Err(RecoveryError::QuorumMissing));
     recovery
         .receive(
             node(2),
-            exchange(node(2), third.recovery_response(request().nonce).unwrap()),
+            exchange(node(2), &third.recovery_response(request().nonce).unwrap()),
         )
         .unwrap();
     let ticket = recovery.begin_transfer().unwrap();
@@ -347,7 +420,7 @@ fn decoded_quorum_and_history_still_require_publication_before_fenced_rejoin() {
         Err(RecoveryError::HistoryMissing)
     );
     recovery
-        .validate_chunk(ticket, &[transfer(ticket, operation)])
+        .validate_chunk(ticket, &[transfer(&ticket, operation)])
         .unwrap();
     assert_eq!(
         recovery.complete(ticket, Prefix::GENESIS, Prefix::GENESIS),
@@ -364,7 +437,7 @@ fn decoded_quorum_and_history_still_require_publication_before_fenced_rejoin() {
 }
 
 fn transfer(
-    ticket: ozzy_replication::recovery::RecoveryTicket,
+    ticket: &ozzy_replication::recovery::RecoveryTicket,
     operation: ozzy_replication::wire::Operation<'_>,
 ) -> ozzy_replication::PreparedOperation {
     use ozzy_replication::wire::{FetchOps, encode_fetch, encode_ops};
@@ -426,7 +499,7 @@ fn transfer(
 #[test]
 fn recovery_schemas_reject_every_truncation_trailing_metadata_and_payload() {
     for (from, message) in messages() {
-        let (header, mut metadata) = packet(from, message);
+        let (header, mut metadata) = packet(from, &message);
         for end in 0..metadata.len() {
             let truncated = lengths(header, end, 0);
             assert_eq!(
@@ -451,7 +524,7 @@ fn recovery_schemas_reject_every_truncation_trailing_metadata_and_payload() {
 #[test]
 fn recovery_rejects_stale_sessions_wrong_voters_foreign_scope_and_missing_correlation() {
     for (from, message) in messages() {
-        let (header, metadata) = packet(from, message);
+        let (header, metadata) = packet(from, &message);
         for offset in [24, 40] {
             let mut changed = header;
             changed[offset] ^= 1;
@@ -490,7 +563,7 @@ fn recovery_rejects_stale_sessions_wrong_voters_foreign_scope_and_missing_correl
 
 #[test]
 fn recovery_rejects_forged_primary_roles_and_inconsistent_history_descriptors() {
-    let (header, metadata) = packet(node(0), RecoveryMessage::State(state()));
+    let (header, metadata) = packet(node(0), &RecoveryMessage::State(state()));
     for (range, value, error) in [
         (96..97, 2, WireError::History),
         (97..113, 0, WireError::History),
@@ -515,19 +588,163 @@ fn recovery_rejects_forged_primary_roles_and_inconsistent_history_descriptors() 
     );
     let mut empty = state();
     empty.response.primary = None;
-    let (header, metadata) = packet(node(0), RecoveryMessage::State(empty));
+    let (header, metadata) = packet(node(0), &RecoveryMessage::State(empty));
     assert_eq!(
         decode_bytes(node(0), &header, &metadata, &[]),
         Err(WireError::History)
     );
     empty.response.primary = Some(RecoveryLog {
+        checkpoint: None,
         generation: JournalGeneration(14),
         accepted: Prefix::GENESIS,
         committed: Prefix::GENESIS,
     });
-    let (header, metadata) = packet(node(0), RecoveryMessage::State(empty));
+    let (header, metadata) = packet(node(0), &RecoveryMessage::State(empty));
     assert_eq!(
         decode_bytes(node(0), &header, &metadata, &[]).unwrap(),
         ReplicaMessage::Recovery(RecoveryMessage::State(empty)),
     );
+}
+
+#[test]
+fn checkpoint_chunks_bind_source_nonce_range_and_live_link_session() {
+    use ozzy_replication::{
+        LogSource,
+        wire::{CheckpointMessage, CheckpointRequest, encode_checkpoint},
+    };
+    let request = CheckpointRequest {
+        scope: configuration().scope(),
+        request_id: RequestId::from_bytes([51; 16]),
+        nonce: RequestId::from_bytes([52; 16]),
+        source: LogSource {
+            voter: node(0),
+            generation: JournalGeneration(5),
+            accepted: state().response.primary.unwrap().accepted,
+        },
+        offset: 4096,
+        max_bytes: 1024,
+    };
+    let mut metadata = [0xff; 256];
+    for (sender, message, payload) in [
+        (node(1), CheckpointMessage::Request(request), &[][..]),
+        (
+            node(0),
+            CheckpointMessage::Chunk {
+                request,
+                bytes: b"canonical-state",
+            },
+            &b"canonical-state"[..],
+        ),
+    ] {
+        let encoded = encode_checkpoint(
+            sender,
+            session(),
+            message,
+            &mut metadata,
+            WireLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(encoded.metadata_bytes, 180);
+        let binding = PeerBinding::new(configuration(), sender, session()).unwrap();
+        let frames = [&encoded.header[..], &metadata[..180], payload];
+        assert_eq!(
+            decode(&frames, binding, WireLimits::default()).unwrap(),
+            ReplicaMessage::Checkpoint(message)
+        );
+        let stale =
+            PeerBinding::new(configuration(), sender, LinkSessionId::from_bytes([53; 16])).unwrap();
+        assert!(decode(&frames, stale, WireLimits::default()).is_err());
+        for length in 0..180 {
+            assert!(
+                decode(
+                    &[&encoded.header, &metadata[..length], payload],
+                    binding,
+                    WireLimits::default()
+                )
+                .is_err()
+            );
+        }
+    }
+    let unchanged = metadata;
+    let oversized = [1; 1025];
+    assert!(
+        encode_checkpoint(
+            node(0),
+            session(),
+            CheckpointMessage::Chunk {
+                request,
+                bytes: &oversized
+            },
+            &mut metadata,
+            WireLimits::default()
+        )
+        .is_err()
+    );
+    assert_eq!(metadata, unchanged);
+    assert!(
+        encode_checkpoint(
+            node(1),
+            session(),
+            CheckpointMessage::Chunk {
+                request,
+                bytes: b"bad donor"
+            },
+            &mut metadata,
+            WireLimits::default()
+        )
+        .is_err()
+    );
+    assert_eq!(metadata, unchanged);
+}
+
+#[test]
+fn retired_history_notice_is_bound_to_scope_session_and_live_receive_or_fetch() {
+    use ozzy_replication::wire::{HistoryFence, HistoryRetired, encode_history_retired};
+    let mut output = [0xff; 160];
+    for fence in [
+        HistoryFence::Receive(ozzy_replication::flow::ReceiveEpoch::new(15).unwrap()),
+        HistoryFence::Fetch(RequestId::from_bytes([16; 16])),
+    ] {
+        let notice = HistoryRetired {
+            scope: configuration().scope(),
+            fence,
+            before: Prefix {
+                op: OpNumber(8),
+                digest: Digest::from_bytes([17; 32]),
+            },
+        };
+        let encoded = encode_history_retired(
+            node(0),
+            session(),
+            notice,
+            &mut output,
+            WireLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(encoded.metadata_bytes, 137);
+        assert_eq!(
+            decode_bytes(node(0), &encoded.header, &output[..137], &[]).unwrap(),
+            ReplicaMessage::HistoryRetired(notice)
+        );
+        for end in 0..137 {
+            assert!(decode_bytes(node(0), &encoded.header, &output[..end], &[]).is_err());
+        }
+        let mut stale = encoded.header;
+        stale[49] ^= 1;
+        assert!(decode_bytes(node(0), &stale, &output[..137], &[]).is_err());
+        let mut invalid = notice;
+        invalid.fence = HistoryFence::Fetch(RequestId::from_bytes([0; 16]));
+        let before = output;
+        assert!(
+            encode_history_retired(
+                node(0),
+                session(),
+                invalid,
+                &mut output,
+                WireLimits::default()
+            )
+            .is_err()
+        );
+        assert_eq!(output, before);
+    }
 }

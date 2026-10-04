@@ -82,6 +82,70 @@ impl SegmentFiles {
 }
 
 impl Journal {
+    /// Validate one selected sealed generation and summarize its append metadata.
+    /// The configured segment cap bounds the read; decoding yields between groups.
+    pub async fn retention_segment(
+        &self,
+        segment_id: u64,
+        partition: ozzy_proto::PartitionIncarnation,
+    ) -> Result<ozzy_core::retention::Segment, DirectoryError> {
+        self.healthy()?;
+        let reference = self
+            .manifest
+            .segments
+            .iter()
+            .find(|reference| reference.segment_id == segment_id && reference.sealed.is_some())
+            .ok_or(DirectoryError::SegmentNotSealed(segment_id))?;
+        let bytes = self.segment_image(*reference).await?;
+        let scan = scan_segment_async(
+            &bytes,
+            reference.first_group_number,
+            reference.first_chain,
+            self.limits.decode,
+        )
+        .await?;
+        validate_replay_scan(reference, &scan, self.writer.state())?;
+        validate_operation_bodies(
+            &scan,
+            self.limits.operations,
+            self.manifest.configuration_epoch,
+            self.manifest.promised_view,
+        )
+        .await?;
+        let mut result = ozzy_core::retention::Segment {
+            id: segment_id,
+            capacity: reference.capacity,
+            sealed: true,
+            last_operation: scan.next_chain.next_op_number() - 1,
+            record_end: ozzy_proto::Offset::ZERO,
+            newest_append_millis: None,
+        };
+        let mut budget = crate::cooperative::Budget::default();
+        for operation in scan.groups.iter().flat_map(|group| &group.operations) {
+            if operation.kind == ozzy_journal::operation::OperationKind::Append {
+                let (_, batches) = ozzy_journal::operation::decode_append_summary_and_batches(
+                    &operation.body,
+                    self.limits.operations,
+                )?;
+                for batch in batches
+                    .iter()
+                    .filter(|batch| batch.summary.partition == partition)
+                {
+                    let end = batch.summary.first_offset.get() + batch.summary.record_count as u64;
+                    result.record_end = result.record_end.max(ozzy_proto::Offset::new(end));
+                    result.newest_append_millis = Some(
+                        result
+                            .newest_append_millis
+                            .unwrap_or(0)
+                            .max(batch.append_timestamp_millis),
+                    );
+                }
+            }
+            budget.charge(operation.body.len()).await;
+        }
+        Ok(result)
+    }
+
     /// Protect selected sealed generations across later rolls and retirement.
     /// Active-segment capture requires a separate frozen-prefix read contract.
     pub fn capture_sealed_segments(&self, ids: &[u64]) -> Result<SegmentFiles, DirectoryError> {

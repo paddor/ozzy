@@ -75,6 +75,8 @@ pub struct PartitionPlacement {
     pub device: String,
     /// Exact broker-local journal directory.
     pub directory: PathBuf,
+    /// Current configured retention targets; canonical policy remains mutable.
+    pub retention: crate::TopicRetention,
 }
 
 impl ValidatedDeployment {
@@ -168,6 +170,7 @@ impl ValidatedDeployment {
                 placements.push(PartitionPlacement {
                     topic: topic_name.clone(),
                     partition,
+                    retention: topic.retention,
                     shard: shard.id,
                     device: shard.device.clone(),
                     directory: broker.devices[&shard.device]

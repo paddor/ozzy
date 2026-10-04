@@ -54,6 +54,20 @@ fn restore(state: &CanonicalState) -> CanonicalState {
 }
 
 #[test]
+fn latest_producer_transition_survives_snapshot_without_historical_indexes() {
+    let (state, _) = initialized(StateLimits::default());
+    let restored = restore(&state);
+    let producer = restored
+        .partition(partition())
+        .unwrap()
+        .producer(producer())
+        .unwrap();
+    let transition = producer.transition().unwrap();
+    assert_eq!(transition.operation_id, operation(0x30));
+    assert_eq!(transition.expected_epoch, None);
+}
+
+#[test]
 fn interleaved_writers_keep_exact_retry_offsets_after_snapshot_restore() {
     let (mut state, mut index) = initialized(StateLimits::default());
     for (writer, sequence) in [
@@ -104,9 +118,9 @@ fn checksum_valid_snapshots_reject_ambiguous_or_missing_writer_results() {
     let names = usize::from(u16::from_be_bytes(encoded[260..262].try_into().unwrap()))
         + usize::from(u16::from_be_bytes(encoded[262..264].try_into().unwrap()));
     let first_writer = 256 + 96 + names;
-    let first_span = first_writer + 48;
+    let first_span = first_writer + 72;
     let second_writer = first_span + 24;
-    let second_span = second_writer + 48;
+    let second_span = second_writer + 72;
     for (field, value) in [
         (first_span, 1),        // Missing sequence zero.
         (first_span + 16, 0),   // Empty range.

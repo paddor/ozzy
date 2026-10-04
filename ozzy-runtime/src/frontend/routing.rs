@@ -146,7 +146,7 @@ impl RoutingTable {
                 let scope = wire::route(packet, self.limits)?;
                 let class = if matches!(
                     packet.envelope.opcode,
-                    Opcode::PrepareFlow | Opcode::PreparePub | Opcode::Ops
+                    Opcode::PrepareFlow | Opcode::PreparePub | Opcode::Ops | Opcode::SnapshotChunk
                 ) {
                     Class::Data
                 } else {

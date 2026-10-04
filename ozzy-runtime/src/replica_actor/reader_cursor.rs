@@ -20,6 +20,8 @@ pub(super) struct Cursor {
     pool: PartitionReadBuffer,
     /// None starts at the applied end: only later records are read.
     from: Option<Offset>,
+    selector: Option<ozzy_proto::reader::Start>,
+    seeking: Option<JournalCompletion<PartitionReadCursor>>,
     position: Option<PartitionReadCursor>,
     reading: Option<JournalCompletion<ReadDelivery>>,
     read_started: Option<std::time::Instant>,
@@ -31,6 +33,8 @@ impl Cursor {
         Self {
             pool,
             from,
+            selector: None,
+            seeking: None,
             position: None,
             reading: None,
             read_started: None,
@@ -38,14 +42,36 @@ impl Cursor {
         }
     }
 
+    pub(super) fn select(pool: PartitionReadBuffer, selector: ozzy_proto::reader::Start) -> Self {
+        let mut cursor = Self::new(pool, None);
+        cursor.selector = Some(selector);
+        cursor
+    }
+
     /// Resolve the start once. The position names the next offset and owner epoch.
     pub(super) fn poll_open(
         &mut self,
         partition: ozzy_proto::PartitionIncarnation,
         ticket: ValidationTicket,
-        journal: &ReplicaJournal,
+        journal: &mut ReplicaJournal,
+        cx: &mut Context<'_>,
     ) -> Poll<Result<PartitionReadCursor, Failure>> {
         if let Some(position) = self.position {
+            return Poll::Ready(Ok(position));
+        }
+        if let Some(selector) = self.selector {
+            if self.seeking.is_none() {
+                match journal.seek_reader(ticket, partition, selector) {
+                    Ok(completion) => self.seeking = Some(completion),
+                    Err(SubmitError::Full) => return Poll::Pending,
+                    Err(_) => return Poll::Ready(Err(Failure::new(11))),
+                }
+            }
+            let result =
+                std::task::ready!(Pin::new(self.seeking.as_mut().expect("pending seek")).poll(cx));
+            self.seeking = None;
+            let position = result.map_err(|error| failure(&error))?;
+            self.position = Some(position);
             return Poll::Ready(Ok(position));
         }
         let Some(position) = journal
@@ -76,7 +102,7 @@ impl Cursor {
         else {
             return Poll::Ready(Err(Failure::new(2)));
         };
-        let cursor = std::task::ready!(self.poll_open(partition, ticket, journal))?;
+        let cursor = std::task::ready!(self.poll_open(partition, ticket, journal, cx))?;
         if cursor.scope() != ticket.scope()
             || cursor.generation() != ticket.generation()
             || cursor.owner_epoch().get() != owner_epoch
@@ -147,6 +173,15 @@ fn validate_source(source: Source, scope: Scope) -> Result<(), Failure> {
 
 fn failure(error: &JournalError) -> Failure {
     match error {
+        JournalError::Seek(ozzy_core::reader::seek::SeekError::NotFound { earliest }) => {
+            Failure::position(19, earliest.get())
+        }
+        JournalError::Seek(ozzy_core::reader::seek::SeekError::Ambiguous { first, last }) => {
+            Failure::ambiguous(first.get(), last.get())
+        }
+        JournalError::Io(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Failure::new(10)
+        }
         JournalError::Read(PartitionReadError::RetentionGap { earliest }) => {
             Failure::position(14, earliest.get())
         }

@@ -1,6 +1,7 @@
 //! Nonvoting recovery owned by the application shard. All file work uses the
 //! supplied backend; no normal append API or implicit formatting is available.
 
+mod checkpoint;
 mod transfer;
 
 use super::{
@@ -58,6 +59,7 @@ pub struct RecoveringJournal {
     io: Local,
     generations: RecoveryGenerations,
     state: State,
+    checkpoint: Option<checkpoint::ReceivingCheckpoint>,
     attempt: Option<RecoveryTicket>,
     published: Option<PublishedRecovery>,
     buffers: Arc<Semaphore>,
@@ -178,6 +180,7 @@ impl RecoveringJournal {
                 io,
                 generations,
                 state,
+                checkpoint: None,
                 attempt: None,
                 published: None,
                 buffers,
@@ -221,8 +224,8 @@ impl RecoveringJournal {
         std::mem::replace(&mut self.state, State::Fenced)
     }
 
-    fn require_ticket(&self, ticket: RecoveryTicket) -> Result<(), JournalError> {
-        if self.attempt != Some(ticket) {
+    fn require_ticket(&self, ticket: &RecoveryTicket) -> Result<(), JournalError> {
+        if self.attempt != Some(*ticket) {
             return Err(RecoveryError::StaleTransfer.into());
         }
         Ok(())
@@ -277,7 +280,7 @@ impl RecoveringJournal {
     ) -> Result<RecoveryTicket, JournalError> {
         self.healthy()?;
         self.faulted = true;
-        self.require_ticket(ticket)?;
+        self.require_ticket(&ticket)?;
         self.state = match self.take_state() {
             State::Repair(repair) => State::Directory(Box::new(repair.abort())),
             State::Installing(staging) => State::Journal(Box::new(staging.0.abort().await?)),
@@ -302,7 +305,7 @@ impl RecoveringJournal {
     {
         Box::pin(async move {
             self.healthy()?;
-            self.require_ticket(publication.ticket)?;
+            self.require_ticket(&publication.ticket)?;
             if self.published != Some(publication)
                 || generation.0 == 0
                 || generation == self.generations.attempt
@@ -351,5 +354,31 @@ impl RecoveringJournal {
             }
             Ok(())
         })
+    }
+}
+
+impl OwnedJournal {
+    pub(in crate::replica_journal) fn recovery_parts(
+        &self,
+    ) -> Result<(OwnedConfig, Local, Option<crate::memory::Owner>), JournalError> {
+        let journal = self.journal.readable()?;
+        let configuration = ozzy_replication::ConfigurationRecord::decode(
+            journal.configuration().ok_or(JournalError::Configuration)?,
+        )
+        .map_err(|_| JournalError::Configuration)?;
+        self.configuration.replicated()?;
+        let config = OwnedConfig {
+            root: journal.root().to_path_buf(),
+            identity: journal.manifest().identity,
+            configuration,
+            limits: self.limits,
+            recovery: self.recovery,
+            append_buffers: self.append_buffers,
+            append_limits: self.append_limits,
+            writeback: self.writeback.limits,
+            write_group_bytes: self.writeback.group_bytes,
+            reads: self.read_limits,
+        };
+        Ok((config, journal.backend(), self.append_memory.clone()))
     }
 }

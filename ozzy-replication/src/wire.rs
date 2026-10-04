@@ -17,7 +17,12 @@ pub use publication::{
     PUBLICATION_BYTES, PUBLICATION_TOPIC_BYTES, PublicationPart, decode_publication,
     encode_publication, encode_publication_group, publication_topic,
 };
+mod checkpoint;
 mod recovery;
+pub use checkpoint::{
+    CheckpointMessage, CheckpointRequest, HistoryFence, HistoryRetired, encode_checkpoint,
+    encode_history_retired,
+};
 mod transfer;
 
 pub use flow::{FlowMessage, FlowProbe, FlowState, encode_flow_probe, encode_flow_state};
@@ -194,6 +199,10 @@ impl Control {
 /// Decoded replica command, still subject to role/history checks in the core.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplicaMessage<'a> {
+    /// Receiver-fenced hint to enter nonvoting recovery, never new authority.
+    HistoryRetired(HistoryRetired),
+    /// Checkpoint state bytes for a separately authorized nonvoting recovery.
+    Checkpoint(CheckpointMessage<'a>),
     /// Fresh lost-state evidence, neither receipt credit nor a normal/election vote.
     Recovery(RecoveryMessage),
     /// Receipt/credit exchange or epoch-bound data; never durable quorum evidence.
@@ -314,12 +323,19 @@ pub fn route(packet: ozzy_proto::Packet<'_>, limits: EnvelopeLimits) -> Result<S
             | Opcode::RecoveryState
             | Opcode::FetchOps
             | Opcode::Ops
+            | Opcode::HistoryRetired
+            | Opcode::SnapshotBegin
+            | Opcode::SnapshotChunk
     ) {
         return Err(WireError::UnsupportedCommand);
     }
     if !matches!(
         packet.envelope.opcode,
-        Opcode::Prepare | Opcode::PrepareFlow | Opcode::PreparePub | Opcode::Ops
+        Opcode::Prepare
+            | Opcode::PrepareFlow
+            | Opcode::PreparePub
+            | Opcode::Ops
+            | Opcode::SnapshotChunk
     ) && !packet.payload.is_empty()
     {
         return Err(WireError::Payload);
@@ -343,6 +359,21 @@ pub fn decode<'a>(
     let mut reader = Reader::new(packet.metadata);
     let scope = reader.scope(binding)?;
     match packet.envelope.opcode {
+        Opcode::HistoryRetired => {
+            return checkpoint::decode_retired(scope, packet.envelope, reader, packet.payload)
+                .map(ReplicaMessage::HistoryRetired);
+        }
+        Opcode::SnapshotBegin | Opcode::SnapshotChunk => {
+            return checkpoint::decode(
+                scope,
+                packet.envelope,
+                reader,
+                packet.payload,
+                binding,
+                limits,
+            )
+            .map(ReplicaMessage::Checkpoint);
+        }
         Opcode::Recovery => {
             return recovery::decode_request(scope, packet.envelope, reader, packet.payload)
                 .map(|request| ReplicaMessage::Recovery(RecoveryMessage::Request(request)));
@@ -390,7 +421,16 @@ pub fn decode<'a>(
     if !packet.payload.is_empty() {
         return Err(WireError::Payload);
     }
-    let message = match packet.envelope.opcode {
+    decode_control(scope, packet.envelope.opcode, reader, binding).map(ReplicaMessage::Control)
+}
+
+fn decode_control(
+    scope: Scope,
+    opcode: Opcode,
+    mut reader: Reader<'_>,
+    binding: PeerBinding,
+) -> Result<Control, WireError> {
+    let message = match opcode {
         Opcode::PrepareOk => {
             let prefix = reader.prefix()?;
             let evidence = reader.bytes::<1>()?[0];
@@ -424,7 +464,7 @@ pub fn decode<'a>(
         _ => return Err(WireError::UnsupportedCommand),
     };
     reader.finish()?;
-    Ok(ReplicaMessage::Control(message))
+    Ok(message)
 }
 
 fn validate_scope(scope: Scope) -> Result<(), WireError> {

@@ -28,7 +28,7 @@ pub(super) async fn check(
             sdk.clone(),
             "orders",
             TopicReaderConfig {
-                checkpoint: Some(checkpoint),
+                start: ozzy_runtime::replicated::ReaderStart::Checkpoint(checkpoint),
                 ..TopicReaderConfig::default()
             },
         ),

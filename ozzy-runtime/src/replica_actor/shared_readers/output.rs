@@ -109,6 +109,9 @@ fn output(
     journal: &mut ReplicaJournal,
     cx: &mut Context<'_>,
 ) -> Result<bool, Failure> {
+    if slot.reply_due {
+        return open_reply(slot, local, limits, metadata, ticket, journal, cx);
+    }
     let delivery = &mut slot.delivery;
     if !delivery.schedule.is_runnable() {
         return Ok(false);
@@ -167,4 +170,67 @@ fn output(
         reader_frame(payload, shared),
     ));
     Ok(true)
+}
+
+fn open_reply(
+    slot: &mut Slot,
+    local: NodeId,
+    limits: DataLimits,
+    metadata: &mut Vec<u8>,
+    ticket: Option<ValidationTicket>,
+    journal: &mut ReplicaJournal,
+    cx: &mut Context<'_>,
+) -> Result<bool, Failure> {
+    let ticket = ticket.ok_or_else(|| Failure::new(12))?;
+    let delivery = &mut slot.delivery;
+    let resolved = match slot.resolved_offset {
+        Some(offset) => offset,
+        None => match delivery.cursor.poll_open(
+            journal_partition(delivery.source)?,
+            ticket,
+            journal,
+            cx,
+        ) {
+            Poll::Pending => return Ok(false),
+            Poll::Ready(result) => {
+                let offset = result?.next_offset().get();
+                slot.resolved_offset = Some(offset);
+                delivery.next = offset;
+                offset
+            }
+        },
+    };
+    let header = ozzy_proto::reader::encode_subscribed(
+        Envelope {
+            opcode: Opcode::Subscribed,
+            response: true,
+            sender: local,
+            ..delivery.request
+        },
+        ozzy_proto::reader::Subscribed {
+            subscription: delivery.subscribe.subscription,
+            source: delivery.source,
+            resolved_offset: resolved,
+        },
+        metadata,
+        limits.envelope,
+    )
+    .map_err(|_| Failure::new(1))?;
+    slot.pending = Some(crate::native_frames::message(
+        slot.peer.as_bytes(),
+        header,
+        metadata,
+        bytes::Bytes::new(),
+    ));
+    slot.reply_due = false;
+    Ok(true)
+}
+
+fn journal_partition(
+    source: ozzy_proto::reader::Source,
+) -> Result<ozzy_proto::PartitionIncarnation, Failure> {
+    match source {
+        ozzy_proto::reader::Source::Group { partition, .. } => Ok(partition),
+        ozzy_proto::reader::Source::Local { .. } => Err(Failure::new(2)),
+    }
 }

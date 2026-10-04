@@ -9,6 +9,20 @@ use futures::FutureExt;
 
 type Reply<T> = completion::Sender<Result<T, JournalError>>;
 
+pub(super) fn seek(
+    prepared: journal::owned::seek::PreparedSeek,
+    done: Reply<journal::PartitionReadCursor>,
+    permit: OwnedSemaphorePermit,
+) -> Job {
+    async move {
+        let result = prepared.execute().await;
+        Box::new(move |state: &mut State| {
+            finish_read(done, state.owner.complete_seek(result), permit)
+        }) as Install
+    }
+    .boxed_local()
+}
+
 pub(super) fn sync(
     state: &mut State,
     ticket: ozzy_replication::SyncTicket,
@@ -159,4 +173,18 @@ pub(super) async fn cleanup(
         .owner
         .cleanup_storage(ticket, kind, budget.max_entries)
         .await
+}
+
+pub(super) fn checkpoint(
+    work: journal::owned::PreparedCheckpointRead,
+    done: Reply<journal::recovery::RecoveryCheckpointRead>,
+    permit: OwnedSemaphorePermit,
+) -> Job {
+    async move {
+        let result = work.read().await;
+        Box::new(move |state: &mut State| {
+            finish_read(done, state.owner.complete_checkpoint_read(result), permit)
+        }) as Install
+    }
+    .boxed_local()
 }

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 const EVENTS: usize = 400;
 
-fn sequence(seed: u64) -> Vec<u64> {
+pub(super) fn sequence(seed: u64) -> Vec<u64> {
     let mut random = seed.max(1);
     (0..EVENTS)
         .map(|_| {
@@ -26,7 +26,7 @@ fn encode(events: &[u64]) -> String {
         .join(",")
 }
 
-fn run(seed: u64, events: &[u64]) {
+pub(super) fn run(seed: u64, events: &[u64]) {
     let mut sim = Cluster::with_storage(seed);
     let first = sim.propose(0, 1).unwrap();
     sim.until(100, |sim| (0..3).all(|id| sim.ready(id, 0, first.end())));
@@ -90,7 +90,7 @@ fn run(seed: u64, events: &[u64]) {
                     .tear_unsynced(argument % 4096);
                 sim.cut(id);
             }
-            11 => sim.now += Duration::from_millis(20),
+            11 => sim.now += Duration::from_millis([0, 20, 99, 100, 800, 30_000][argument % 6]),
             12 => sim.tick(),
             _ => {}
         }
@@ -159,17 +159,21 @@ pub(super) fn sweep(prefix: &str, run: fn(u64, &[u64])) {
     });
     for seed in first..first + if replay.is_some() { 1 } else { seeds } {
         let events = replay.clone().unwrap_or_else(|| sequence(seed));
-        if let Some(class) = failure(run, seed, &events) {
-            eprintln!("{prefix}_SEED={seed} {prefix}_TRACE={}", encode(&events));
-            let reduction = ozzy_sim::schedule::minimize(&events, 64, |candidate| {
-                failure(run, seed, candidate).as_ref() == Some(&class)
-            });
-            eprintln!(
-                "reduced in {} attempts: {prefix}_SEED={seed} {prefix}_TRACE={}",
-                reduction.attempts,
-                encode(&reduction.events)
-            );
-            panic!("storage schedule failure: {class}");
-        }
+        run_seed(prefix, run, seed, &events);
+    }
+}
+
+pub(super) fn run_seed(prefix: &str, run: fn(u64, &[u64]), seed: u64, events: &[u64]) {
+    if let Some(class) = failure(run, seed, events) {
+        eprintln!("{prefix}_SEED={seed} {prefix}_TRACE={}", encode(events));
+        let reduction = ozzy_sim::schedule::minimize(events, 64, |candidate| {
+            failure(run, seed, candidate).as_ref() == Some(&class)
+        });
+        eprintln!(
+            "reduced in {} attempts: {prefix}_SEED={seed} {prefix}_TRACE={}",
+            reduction.attempts,
+            encode(&reduction.events)
+        );
+        panic!("storage schedule failure: {class}");
     }
 }

@@ -155,7 +155,7 @@ impl OwnedJournal {
         done.result
     }
 
-    fn check_reader(&self, cursor: PartitionReadCursor) -> Result<(), JournalError> {
+    pub(super) fn check_reader(&self, cursor: PartitionReadCursor) -> Result<(), JournalError> {
         self.active_scope(cursor.scope, cursor.generation)
             .map_err(|_| PartitionReadError::Fenced)?;
         let state = self

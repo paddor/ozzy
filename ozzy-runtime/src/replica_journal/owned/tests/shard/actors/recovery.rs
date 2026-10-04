@@ -8,6 +8,7 @@ use crate::replica_journal::{
 };
 
 type Recovering = ControlledRecovery<ShardRecoveringJournal>;
+mod busy;
 mod scheduled;
 
 fn recovery(controller: &mut Controller, io: Local, policy: QuorumPolicy) -> Recovering {

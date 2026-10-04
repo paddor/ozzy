@@ -21,6 +21,8 @@ use std::io;
 /// final publication started. Reopen resolves any ambiguous final publication.
 #[derive(Debug)]
 pub struct Installer {
+    checkpoint_position: Option<LogPosition>,
+    checkpoint_seen: bool,
     journal: Journal,
     replacement: SuffixReplacement,
     accepted: LogPosition,
@@ -31,6 +33,34 @@ pub struct Installer {
     staged_bytes: u64,
     committed_seen: bool,
     faulted: bool,
+}
+
+/// Original checkpoint and predecessor of its required retained operations.
+#[derive(Debug, Clone, Copy)]
+pub struct CheckpointRecovery {
+    /// Original hash anchor before required retained operations.
+    pub predecessor: LogPosition,
+    /// Original confirmed prefix represented by canonical state.
+    pub position: LogPosition,
+}
+
+/// Privately decoded state to publish under destination-local store identity.
+#[derive(Debug)]
+pub struct CanonicalCheckpointImport<'a> {
+    /// Fresh destination-local checkpoint artifact identity.
+    pub id: ozzy_proto::CheckpointId,
+    /// Exact original history prefix, independently checked against retained bytes.
+    pub position: LogPosition,
+    /// Validated state at that prefix; contains no retained record payloads.
+    pub state: &'a ozzy_core::state::CanonicalState,
+    /// Bounds for cooperative state encoding.
+    pub limits: ozzy_core::state::StateSnapshotLimits,
+}
+
+struct EncodedCheckpoint {
+    id: ozzy_proto::CheckpointId,
+    position: LogPosition,
+    bytes: Vec<u8>,
 }
 
 #[derive(Clone, Copy)]
@@ -94,11 +124,79 @@ impl Journal {
     /// authority. Final selection leaves its marker intact. Private replay and
     /// configuration publication remain separate required gates.
     pub async fn begin_recovery_replacement(
+        self,
+        configuration: &[u8],
+        replacement: SuffixReplacement,
+        accepted: LogPosition,
+        limits: SuffixStreamLimits,
+    ) -> Result<Installer, Error> {
+        self.begin_anchored_recovery(
+            configuration,
+            replacement,
+            accepted,
+            limits,
+            ChainPosition::GENESIS,
+        )
+        .await
+    }
+
+    /// Stage retained operations from an externally authorized checkpoint's
+    /// original predecessor. The target remains nonvoting until checkpoint state,
+    /// complete retained chain and accepted suffix are privately validated.
+    pub async fn begin_checkpoint_replacement(
+        self,
+        configuration: &[u8],
+        replacement: SuffixReplacement,
+        accepted: LogPosition,
+        limits: SuffixStreamLimits,
+        anchor: CheckpointRecovery,
+    ) -> Result<Installer, Error> {
+        let predecessor = anchor.predecessor;
+        predecessor
+            .validate()
+            .map_err(crate::DirectoryError::from)?;
+        anchor
+            .position
+            .validate()
+            .map_err(crate::DirectoryError::from)?;
+        if predecessor.op_number > replacement.committed.op_number
+            || (predecessor.op_number == replacement.committed.op_number
+                && predecessor != replacement.committed)
+            || predecessor.op_number > anchor.position.op_number
+            || anchor.position.op_number == 0
+            || anchor.position.op_number > replacement.committed.op_number
+            || (anchor.position.op_number == predecessor.op_number
+                && anchor.position != predecessor)
+            || (anchor.position.op_number == replacement.committed.op_number
+                && anchor.position != replacement.committed)
+        {
+            return Err(Error::ProtectedCommitMismatch);
+        }
+        let next = predecessor
+            .op_number
+            .checked_add(1)
+            .ok_or(Error::LengthOverflow)?;
+        let mut installer = self
+            .begin_anchored_recovery(
+                configuration,
+                replacement,
+                accepted,
+                limits,
+                ChainPosition::new(next, predecessor.digest),
+            )
+            .await?;
+        installer.checkpoint_position = Some(anchor.position);
+        installer.checkpoint_seen = predecessor == anchor.position;
+        Ok(installer)
+    }
+
+    async fn begin_anchored_recovery(
         mut self,
         configuration: &[u8],
         replacement: SuffixReplacement,
         accepted: LogPosition,
         limits: SuffixStreamLimits,
+        first_chain: ChainPosition,
     ) -> Result<Installer, Error> {
         let marker = recovery_marker(configuration)?;
         if self.configuration.as_deref() != Some(marker.as_slice()) {
@@ -126,7 +224,7 @@ impl Journal {
         self.validate_authority_files().await?;
         let source = SegmentReference {
             first_group_number: 1,
-            first_chain: ChainPosition::GENESIS,
+            first_chain,
             ..self.manifest.segments[0]
         };
         Box::pin(self.start_suffix(replacement, accepted, limits, 0, source, &[])).await
@@ -189,6 +287,8 @@ impl Journal {
         writer.reserve_encode_buffer(reserve, replacement.body_encoding)?;
         segments.push(active_reference(&writer, start));
         let mut installer = Installer {
+            checkpoint_position: None,
+            checkpoint_seen: false,
             journal: self,
             replacement,
             accepted,
@@ -197,14 +297,16 @@ impl Journal {
             segments,
             body_digests,
             staged_bytes: replacement.segment_capacity,
-            committed_seen: replacement.committed == replacement.protected_committed,
+            committed_seen: replacement.committed == position_before(start.first_chain)?,
             faulted: false,
         };
         installer.copy_retained(retained).await?;
-        debug_assert_eq!(
-            position_before(installer.writer.written_position().next_chain())?,
-            replacement.protected_committed
-        );
+        if !retained.is_empty() || source.first_chain == ChainPosition::GENESIS {
+            debug_assert_eq!(
+                position_before(installer.writer.written_position().next_chain())?,
+                replacement.protected_committed
+            );
+        }
         Ok(installer)
     }
 }
@@ -261,9 +363,25 @@ impl Installer {
             &mut self.body_digests,
             operations,
         )?;
+        let checkpoint_seen = if let Some(position) = self.checkpoint_position {
+            if let Some(operation) = operations
+                .iter()
+                .find(|operation| operation.op_number == position.op_number)
+            {
+                if ozzy_journal::operation::logical_operation_digest(operation) != position.digest {
+                    return Err(Error::CommitNotSelected);
+                }
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         self.faulted = true;
         self.write_chunk(operations, bytes).await?;
         self.committed_seen |= committed_seen;
+        self.checkpoint_seen |= checkpoint_seen;
         self.faulted = false;
         Ok(())
     }
@@ -404,7 +522,43 @@ impl Installer {
 
     /// Sync all staged files, then publish the exact accepted/committed anchors
     /// and hard state together. This consumes ownership even on uncertain errors.
-    pub async fn finish(mut self) -> Result<Journal, Error> {
+    pub async fn finish(self) -> Result<Journal, Error> {
+        if self.checkpoint_position.is_some() {
+            return Err(Error::IncompleteSuffix);
+        }
+        self.finish_selection(None).await
+    }
+
+    /// Publish checkpoint state plus required retained operations in one final
+    /// selection. Its source metadata and chunk files remain unselected until
+    /// complete. Dropping this future leaves the original nonvoting store selected.
+    pub async fn finish_with_checkpoint(
+        self,
+        import: CanonicalCheckpointImport<'_>,
+    ) -> Result<Journal, Error> {
+        if !self.checkpoint_seen
+            || self.checkpoint_position != Some(import.position)
+            || import.state.revision() != import.position.op_number
+        {
+            return Err(Error::IncompleteSuffix);
+        }
+        let mut budget = crate::cooperative::Budget::default();
+        let bytes = import
+            .state
+            .encode_snapshot_cooperative(import.limits, async |bytes| budget.charge(bytes).await)
+            .await?;
+        self.finish_selection(Some(EncodedCheckpoint {
+            id: import.id,
+            position: import.position,
+            bytes,
+        }))
+        .await
+    }
+
+    async fn finish_selection(
+        mut self,
+        checkpoint: Option<EncodedCheckpoint>,
+    ) -> Result<Journal, Error> {
         self.healthy()?;
         if position_before(self.writer.written_position().next_chain())? != self.accepted
             || !self.committed_seen
@@ -424,11 +578,69 @@ impl Installer {
         next.last_normal_view = self.replacement.last_normal_view;
         next.accepted = self.accepted;
         next.committed = self.replacement.committed;
-        next.segments = self.segments;
+        next.segments = std::mem::take(&mut self.segments);
+        if let Some(checkpoint) = checkpoint {
+            next = self.publish_checkpoint_source(next, checkpoint).await?;
+        }
         self.journal.install_selected(next).await?;
         let old = std::mem::replace(&mut self.journal.writer, self.writer);
         old.close().await?;
         Ok(self.journal)
+    }
+
+    async fn publish_checkpoint_source(
+        &mut self,
+        mut source: crate::Manifest,
+        import: EncodedCheckpoint,
+    ) -> Result<crate::Manifest, Error> {
+        source.committed = import.position;
+        source.checkpoint = None;
+        self.journal.interrupted = true;
+        let (source, digest) = self
+            .journal
+            .directory
+            .publish_manifest(&self.journal.manifest, source, self.journal.limits.metadata)
+            .await?;
+        let spec = crate::CheckpointSpec {
+            group_id: source.identity.group_id,
+            store_id: source.identity.store_id,
+            checkpoint_id: import.id,
+            position: import.position,
+            configuration_epoch: source.configuration_epoch,
+            source_manifest_generation: source.generation,
+            source_manifest_digest: digest,
+            state_schema_digest: ozzy_core::state::canonical_state_schema_digest(),
+            chunk_bytes: self
+                .journal
+                .limits
+                .checkpoint
+                .max_chunk_bytes
+                .min(64 * 1024),
+        };
+        let checkpoint = crate::checkpoint::asynchronous::Checkpoint::build(
+            self.journal.access.clone(),
+            self.journal.root(),
+            spec,
+            &import.bytes,
+            self.journal.limits.checkpoint,
+            self.journal.limits.io.chunk_bytes,
+            (
+                self.journal.limits.directory_entries,
+                self.journal.limits.directory_name_bytes,
+            ),
+        )
+        .await
+        .map_err(crate::DirectoryError::from)?;
+        self.journal.manifest = source;
+        let mut selected = self.journal.next_manifest()?;
+        selected.committed = self.replacement.committed;
+        selected.checkpoint = Some(crate::CheckpointReference {
+            checkpoint_id: import.id,
+            position: import.position,
+            manifest_digest: checkpoint.digest,
+        });
+        self.journal.checkpoint = Some(checkpoint);
+        Ok(selected)
     }
 }
 

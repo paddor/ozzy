@@ -70,6 +70,27 @@ fn minimal_single_broker_has_production_defaults() {
 }
 
 #[test]
+fn retention_limits_are_optional_positive_and_fit_a_segment() {
+    let source =
+        format!("{SINGLE}\n[topics.orders.retention]\nmax_age_secs = 60\nmax_bytes = 536870912\n");
+    let config = Deployment::parse(&source).unwrap();
+    let retention = config.topics["orders"].retention;
+    assert_eq!(retention.max_age_secs, Some(60));
+    assert_eq!(retention.max_bytes, Some(536_870_912));
+    config.validate().unwrap();
+    for invalid in [
+        "max_age_secs = 0",
+        "max_bytes = 0",
+        "max_bytes = 4096",
+        "max_age_secs = 18446744073709552",
+    ] {
+        let source = format!("{SINGLE}\n[topics.orders.retention]\n{invalid}\n");
+        let result = Deployment::parse(&source).and_then(Deployment::validate);
+        assert!(result.is_err(), "accepted {invalid}");
+    }
+}
+
+#[test]
 fn shared_controller_plan_uses_one_lane_per_sparse_shard() {
     let mut config = single();
     let broker = config.brokers.get_mut("laptop").unwrap();

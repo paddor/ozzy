@@ -167,7 +167,7 @@ impl SegmentIndex {
         self.view().offsets()
     }
 
-    fn view(&self) -> SegmentIndexView<'_> {
+    pub(crate) fn view(&self) -> SegmentIndexView<'_> {
         SegmentIndexView::from_validated(
             &self.bytes,
             self.source,

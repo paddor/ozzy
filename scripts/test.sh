@@ -20,7 +20,8 @@ case "$scope" in
     simulation) args=(-p ozzy-sim -p ozzy-io --features ozzy-io/simulation) ;;
     loom)
         export RUSTFLAGS="${RUSTFLAGS:--C target-cpu=native} --cfg ozzy_loom"
-        exec cargo test -p ozzy-runtime --test ozzy_loom -- "$@" ;;
+        cargo test -p ozzy-runtime --test ozzy_loom -- "$@"
+        exec cargo test -p ozzy-broker --test ozzy_broker_loom -- "$@" ;;
     -h|--help)
         echo 'Usage: scripts/test.sh [unit|core|writer|local|inproc|storage|io|replication|simulation|loom] [test filters]'
         echo 'Default: unit. Example: writer.'

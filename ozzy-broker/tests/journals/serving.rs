@@ -508,7 +508,7 @@ async fn read_topic(
                     sdk.clone(),
                     "orders",
                     TopicReaderConfig {
-                        checkpoint: Some(checkpoint),
+                        start: ozzy_runtime::replicated::ReaderStart::Checkpoint(checkpoint),
                         ..TopicReaderConfig::default()
                     },
                 ),

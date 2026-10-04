@@ -19,6 +19,7 @@ struct Slot {
     response: Option<RecoveryResponse>,
     pin: Option<PinnedRecovery>,
     fetch: Option<FetchOps>,
+    checkpoint: Option<wire::CheckpointRequest>,
     reply_pending: bool,
 }
 
@@ -59,6 +60,7 @@ impl ReplicaActor {
                 .map_err(crate::replica_journal::JournalError::from)?;
             slot.response = Some(response);
             slot.fetch = None;
+            slot.checkpoint = None;
         }
         slot.request = Some(request);
         slot.reply_pending = true;
@@ -80,6 +82,7 @@ impl ReplicaActor {
                 slot.request = None;
                 slot.response = None;
                 slot.fetch = None;
+                slot.checkpoint = None;
                 slot.reply_pending = false;
                 continue;
             }
@@ -169,14 +172,23 @@ impl ReplicaActor {
                     .response
                     .filter(|response| response.primary.is_some() && slot.pin.is_none())
                 {
-                    if !self.pending_persistence.is_empty() {
-                        // Reserve a drain turn before capturing authoritative disk history.
+                    if !self.pending_persistence.is_empty()
+                        || self.pending_sync.is_some()
+                        || !self.journal.settled()
+                    {
+                        // Drain writes and their independent barrier before pinning
+                        // authoritative history; busy admission is backpressure.
                         return Ok(true);
                     }
                     Some(PendingIo::RecoveryPin(self.journal.pin_recovery(
                         self.configuration.voters()[index],
                         response,
                     )?))
+                } else if let (Some(pin), Some(request)) = (slot.pin, slot.checkpoint.take()) {
+                    Some(PendingIo::RecoveryCheckpoint(
+                        self.journal.fetch_checkpoint(pin, request)?,
+                        self.configuration.voters()[index],
+                    ))
                 } else if let (Some(pin), Some(request)) = (slot.pin, slot.fetch) {
                     let buffer = self.buffer.take().ok_or(ActorError::History)?;
                     slot.fetch = None;
@@ -204,7 +216,7 @@ impl ReplicaActor {
 
     pub(super) fn complete_recovery_pin(
         &mut self,
-        pin: PinnedRecovery,
+        pin: &PinnedRecovery,
         release: bool,
     ) -> Result<(), ActorError> {
         let index = self
@@ -215,7 +227,7 @@ impl ReplicaActor {
             .ok_or(ActorError::History)?;
         let slot = &mut self.donors.as_mut().ok_or(ActorError::History)?.slots[index];
         if release {
-            if slot.pin != Some(pin) {
+            if slot.pin != Some(*pin) {
                 return Err(ActorError::History);
             }
             slot.pin = None;
@@ -223,7 +235,13 @@ impl ReplicaActor {
             if slot.pin.is_some() {
                 return Err(ActorError::History);
             }
-            slot.pin = Some(pin);
+            if !slot.response.is_some_and(|response| {
+                response.scope == pin.response().scope && response.nonce == pin.response().nonce
+            }) {
+                return Err(ActorError::History);
+            }
+            slot.response = Some(pin.response());
+            slot.pin = Some(*pin);
         }
         Ok(())
     }
@@ -253,5 +271,90 @@ impl ReplicaActor {
             self.recycle(fetched.into_buffer());
             Ok(())
         }
+    }
+}
+
+impl ReplicaActor {
+    pub(super) fn queue_recovery_checkpoint(
+        &mut self,
+        from: NodeId,
+        request: wire::CheckpointRequest,
+    ) {
+        if !self.application_ready() {
+            return;
+        }
+        let Some(donors) = &mut self.donors else {
+            return;
+        };
+        let Some(index) = self
+            .configuration
+            .voters()
+            .iter()
+            .position(|&voter| voter == from)
+        else {
+            return;
+        };
+        let slot = &mut donors.slots[index];
+        if slot.pin.is_some_and(|pin| {
+            request.source == pin.source()
+                && request.nonce == pin.response().nonce
+                && request.scope == pin.response().scope
+                && slot.response == Some(pin.response())
+                && pin
+                    .response()
+                    .primary
+                    .and_then(|log| log.checkpoint)
+                    .is_some_and(|anchor| request.offset < anchor.state_bytes)
+        }) && request.max_bytes as usize <= self.config.transfer.max_body_bytes
+        {
+            slot.checkpoint = Some(request);
+        }
+    }
+
+    pub(super) fn complete_recovery_checkpoint(
+        &mut self,
+        to: NodeId,
+        chunk: crate::replica_journal::RecoveryCheckpointRead,
+    ) -> Result<(), ActorError> {
+        let Some(index) = self
+            .configuration
+            .voters()
+            .iter()
+            .position(|&voter| voter == to)
+        else {
+            return Ok(());
+        };
+        if !self.application_ready()
+            || !self.donors.as_ref().is_some_and(|donors| {
+                donors.slots[index].pin.is_some_and(|pin| {
+                    pin.response().scope == self.driver.scope()
+                        && chunk.request.scope == pin.response().scope
+                        && chunk.request.source == pin.source()
+                        && chunk.request.nonce == pin.response().nonce
+                })
+            })
+        {
+            return Ok(());
+        }
+        let Some(session) = self.session(to) else {
+            return Ok(());
+        };
+        let encoded = wire::encode_checkpoint(
+            self.local,
+            session,
+            wire::CheckpointMessage::Chunk {
+                request: chunk.request,
+                bytes: &chunk.bytes,
+            },
+            &mut self.metadata,
+            self.wire_limits,
+        )?;
+        let message = Message::multipart([
+            Bytes::copy_from_slice(&encoded.header),
+            Bytes::copy_from_slice(&self.metadata[..encoded.metadata_bytes]),
+            chunk.bytes,
+        ]);
+        self.enqueue(to, SendClass::Data, message)?;
+        Ok(())
     }
 }

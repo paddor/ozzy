@@ -108,6 +108,20 @@ pub struct Topic {
     /// Maximum canonical APPEND body, including descriptors and payload bytes.
     /// Deployment validation caps this at 8 MiB.
     pub max_append_bytes: u64,
+    /// Whole-segment retention targets per partition and per broker.
+    #[serde(default)]
+    pub retention: TopicRetention,
+}
+
+/// Optional age and stored segment capacity targets. Either limit expires the
+/// oldest sealed prefix; omitted limits keep history indefinitely.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TopicRetention {
+    /// Positive age in seconds, using broker append timestamps.
+    pub max_age_secs: Option<u64>,
+    /// Positive selected segment capacities, including the active segment.
+    pub max_bytes: Option<u64>,
 }
 
 /// Maximum configured broker APPEND message and canonical body size.

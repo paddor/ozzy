@@ -507,12 +507,7 @@ impl ReplicaActor {
             .normal()
             .expect("normal flow history")
             .snapshot();
-        for known in [
-            Prefix::GENESIS,
-            snapshot.applied,
-            snapshot.committed,
-            snapshot.accepted,
-        ] {
+        for known in [snapshot.applied, snapshot.committed, snapshot.accepted] {
             if known.op == wanted.op {
                 return if known == wanted {
                     Ok(Some(known))
@@ -680,6 +675,33 @@ impl ReplicaActor {
             return Ok(());
         }
         let [Some(base), Some(received)] = positions.positions else {
+            if request.report().base.op < positions.retained_predecessor.op {
+                let to = self.configuration.voters()[voter];
+                let Some(session) = self.session(to) else {
+                    return Ok(());
+                };
+                let notice = wire::HistoryRetired {
+                    scope: snapshot.scope,
+                    fence: wire::HistoryFence::Receive(request.report().channel.epoch),
+                    before: positions.retained_predecessor,
+                };
+                let encoded = wire::encode_history_retired(
+                    self.local,
+                    session,
+                    notice,
+                    &mut self.metadata,
+                    self.wire_limits,
+                )?;
+                return self.enqueue(
+                    to,
+                    SendClass::Control,
+                    Message::multipart([
+                        Bytes::copy_from_slice(&encoded.header),
+                        Bytes::copy_from_slice(&self.metadata[..encoded.metadata_bytes]),
+                        Bytes::new(),
+                    ]),
+                );
+            }
             return Err(ActorError::History);
         };
         self.adopt_flow(voter, request, base, received, now)?;

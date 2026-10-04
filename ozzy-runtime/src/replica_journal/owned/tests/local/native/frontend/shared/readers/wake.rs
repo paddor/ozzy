@@ -95,7 +95,7 @@ async fn quiet_partition_replay_wakes_after_canceled_read_without_clock_advance(
         .unwrap();
 }
 
-async fn open_writer(harness: &mut Harness, links: &BrokerLinks) -> SharedTopicWriter {
+pub(super) async fn open_writer(harness: &mut Harness, links: &BrokerLinks) -> SharedTopicWriter {
     harness
         .drive(
             SharedTopicWriter::open_with_producer(

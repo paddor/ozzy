@@ -52,11 +52,16 @@ impl Packet {
         }
     }
 
-    pub(super) fn recovery_state(from: usize, to: usize, state: RecoveryState) -> Self {
+    pub(super) fn recovery_state(from: usize, to: usize, state: &RecoveryState) -> Self {
         let mut metadata = [0; METADATA_BYTES];
-        let encoded =
-            wire::encode_recovery_state(node(from), session(), state, &mut metadata, wire_limits())
-                .unwrap();
+        let encoded = wire::encode_recovery_state(
+            node(from),
+            session(),
+            *state,
+            &mut metadata,
+            wire_limits(),
+        )
+        .unwrap();
         Self {
             from,
             to,
@@ -69,6 +74,9 @@ impl Packet {
 
     pub(super) fn summary(&self) -> String {
         match self.decode() {
+            ReplicaMessage::Checkpoint(_) | ReplicaMessage::HistoryRetired(_) => {
+                panic!("retained recovery is exercised by the real broker harness")
+            }
             ReplicaMessage::Recovery(message) => format!("recovery {message:?}"),
             ReplicaMessage::Flow(flow) => format!("flow {:?}", std::mem::discriminant(&flow)),
             ReplicaMessage::Control(control) => format!(

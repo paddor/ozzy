@@ -240,6 +240,10 @@ impl ReplicaActor {
                 return Ok(());
             }
         };
+        if reply.fenced() {
+            reply.finish(validated.into_buffer().into(), ProposalOutcome::NotAdmitted);
+            return Ok(());
+        }
         let validation = validated.validation();
         let ticket =
             match self
