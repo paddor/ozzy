@@ -10,6 +10,9 @@ repository.workspace = true
 description = "Sans-I/O application protocol and message types for Ozzy."
 readme = "README.md"
 publish = ["crates-io"]
+keywords = ["protocol", "codec", "sans-io", "event-streaming", "omq"]
+categories = ["network-programming", "parser-implementations"]
+include.workspace = true
 
 [dependencies]
 bytes.workspace = true
