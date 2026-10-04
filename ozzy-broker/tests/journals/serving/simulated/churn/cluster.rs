@@ -43,7 +43,7 @@ async fn repeated_recovery_reclaims_old_segments_and_preserves_selected_payloads
                         })
                 })
                 .collect::<Vec<_>>();
-            assert!(!old.is_empty());
+            assert_ne!(old.len(), 0);
             drop(image);
             cluster.restart(2).await;
             cluster.wait_recovered(2).await;

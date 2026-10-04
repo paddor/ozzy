@@ -133,7 +133,7 @@ fn owned_validation_rejects_foreign_arenas_before_file_work() {
         drive(&mut controller, journal.validate_append(ticket, buffer)),
         Err(JournalError::AppendMismatch)
     ));
-    assert!(controller.jobs().is_empty());
+    assert_eq!(controller.jobs().len(), 0);
     assert!(!journal.is_faulted());
     drive(&mut controller, journal.shutdown()).unwrap();
     drive(&mut controller, other.shutdown()).unwrap();
@@ -162,7 +162,7 @@ fn owned_validation_enforces_raw_capacity_before_decoding() {
         drive(&mut controller, journal.validate_append(ticket, buffer)),
         Err(JournalError::AppendCapacity)
     ));
-    assert!(controller.jobs().is_empty());
+    assert_eq!(controller.jobs().len(), 0);
     assert!(!journal.is_faulted());
     drive(&mut controller, journal.shutdown()).unwrap();
 }

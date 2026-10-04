@@ -450,6 +450,10 @@ impl Backend for Client {
 }
 
 impl Shared {
+    #[allow(
+        deprecated,
+        reason = "Atomic::try_update requires Rust 1.95; MSRV is 1.93"
+    )]
     fn reserve_job(&self) -> Result<(), ()> {
         self.active
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
@@ -570,6 +574,10 @@ impl Drop for Startup {
     }
 }
 
+#[allow(
+    deprecated,
+    reason = "Atomic::try_update requires Rust 1.95; MSRV is 1.93"
+)]
 fn run(mut receiver: Receiver, shared: &Arc<Shared>, role: Worker) {
     let class = usize::from(role == Worker::Progress);
     loop {

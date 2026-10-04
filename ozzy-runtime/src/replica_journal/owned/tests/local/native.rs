@@ -429,7 +429,7 @@ fn native_shared_partition_retry_returns_interleaved_offsets_and_slow_peer_stays
     for _ in 0..100 {
         progress(&mut actor, &mut intake, None, &mut output, true);
     }
-    assert!(output.is_empty());
+    assert_eq!(output.len(), 0);
     assert_eq!(
         intake
             .receive(

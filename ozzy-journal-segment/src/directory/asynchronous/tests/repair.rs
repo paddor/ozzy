@@ -194,11 +194,12 @@ fn async_sealed_repair_salvages_fragments_and_preserves_logical_history() {
                 .collect::<Vec<_>>()
         );
         let captured = journal.capture_sealed_segments(&[1, 3]).unwrap();
-        assert!(
+        assert_eq!(
             drive(&mut controller, journal.reclaim_unreferenced_segments(4))
                 .unwrap()
                 .removed_segment_ids
-                .is_empty()
+                .len(),
+            0
         );
         drop(captured);
         assert_eq!(

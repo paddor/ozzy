@@ -41,7 +41,7 @@ fn native_large_proposal_yields_before_admission_and_keeps_local_durability() {
         // behind them, so another partition can run between hashing slices.
         for _ in 0..2 {
             assert!(poll(proposal.as_mut()).is_pending());
-            assert!(controller.jobs().is_empty());
+            assert_eq!(controller.jobs().len(), 0);
             assert_eq!(driver.snapshot(), before);
         }
         let Poll::Ready(ProposalValidation::Ready(validated)) = poll(proposal.as_mut()) else {

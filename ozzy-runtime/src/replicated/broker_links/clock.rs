@@ -69,6 +69,10 @@ impl SdkClock {
 
     /// Advance a manual clock. Equal observations are harmless; backward time
     /// and advancing a real clock fail without modifying its current observation.
+    #[allow(
+        deprecated,
+        reason = "Atomic::try_update requires Rust 1.95; MSRV is 1.93"
+    )]
     pub fn advance(&self, now: Duration) -> Result<(), ClockError> {
         if !self.state.manual {
             return Err(ClockError);

@@ -546,6 +546,6 @@ fn async_pipeline_reuses_preencoded_group_after_roll_and_rejects_impossible_char
         .unwrap();
     assert!(pipeline.prepare(group, 4 * 1024 * 1024).is_err());
     assert_eq!(pipeline.pending(), 0);
-    assert!(controller.jobs().is_empty());
+    assert_eq!(controller.jobs().len(), 0);
     assert!(pipeline.finish().is_ok());
 }

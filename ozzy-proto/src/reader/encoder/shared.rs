@@ -254,7 +254,7 @@ impl RecordsEncoder<'_> {
     pub(super) fn materialize(&mut self) {
         debug_assert!(!self.has_encoded_payload());
         if let Some(shared) = self.shared.take() {
-            debug_assert!(self.payload.is_empty());
+            debug_assert_eq!(self.payload.len(), 0);
             debug_assert!(self.payload.capacity() >= shared.range.len());
             self.payload.extend_from_slice(&shared.body[shared.range]);
         }

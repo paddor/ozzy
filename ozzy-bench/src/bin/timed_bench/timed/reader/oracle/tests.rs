@@ -71,7 +71,7 @@ fn shared_oracle_verifies_interleaved_writers_and_idle_partitions() {
         offsets[partition] += 1;
     }
     assert!(oracle.complete(&[2, 1, 0, 2]).unwrap());
-    assert!(oracle.pending(Some(&[2, 1, 0, 2])).is_empty());
+    assert_eq!(oracle.pending(Some(&[2, 1, 0, 2])).len(), 0);
     assert_eq!(oracle.positions(), [(0, 4), (1, 1), (2, 0)]);
     let writers = vec![json!({"lanes": writers.into_iter().enumerate()
         .map(|(lane, counts)| counts.report(lane)).collect::<Vec<_>>()})];

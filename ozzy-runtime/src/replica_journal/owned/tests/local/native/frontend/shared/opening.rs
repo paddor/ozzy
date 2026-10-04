@@ -34,7 +34,7 @@ async fn scenario(lose_reply: bool) {
         harness.pump(false);
         tokio::task::yield_now().await;
     }
-    assert!(harness.openings.is_empty());
+    assert_eq!(harness.openings.len(), 0);
     assert!(harness.watch.is_none());
     if lose_reply {
         harness.drop_opened = Some(ProducerId::from_bytes([40; 16]));
@@ -61,7 +61,7 @@ async fn scenario(lose_reply: bool) {
         tokio::task::yield_now().await;
     }
     assert_eq!(harness.openings.len(), 2);
-    assert!(!harness.controller.jobs().is_empty());
+    assert_ne!(harness.controller.jobs().len(), 0);
     assert!(
         harness.appends.is_empty(),
         "APPEND preceded durable opening"

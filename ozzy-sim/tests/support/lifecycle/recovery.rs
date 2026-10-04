@@ -71,7 +71,7 @@ pub(super) fn perform(
         }
         RecoveryDisk::Stage { ticket, operations } => {
             assert!(!stable.admitted);
-            assert!(!operations.is_empty());
+            assert_ne!(operations.len(), 0);
             assert!(buffered.len() + operations.len() <= HISTORY_LIMIT);
             assert_eq!(operations[0].previous, tail(buffered).digest);
             assert_eq!(operations[0].number, tail(buffered).op.0 + 1);

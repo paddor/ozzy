@@ -24,6 +24,10 @@ impl LinkIds {
         }
     }
 
+    #[allow(
+        deprecated,
+        reason = "Atomic::try_update requires Rust 1.95; MSRV is 1.93"
+    )]
     pub(crate) fn next(&self) -> Result<u128> {
         if let Some((namespace, sequence)) = &self.sequence {
             let prior = sequence

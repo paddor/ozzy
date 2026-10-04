@@ -165,7 +165,7 @@ fn replacement_preserves_commit_inside_group_and_discards_old_suffix() {
     drop(source_snapshot);
     let cleanup = journal.reclaim_unreferenced_segments().unwrap();
     assert_eq!(cleanup.removed_segment_ids, [1]);
-    assert!(cleanup.pinned_segment_ids.is_empty());
+    assert_eq!(cleanup.pinned_segment_ids.len(), 0);
     assert!(cleanup.reclaimed_bytes > 0);
     assert!(!root.join("segments/1.log").exists());
 

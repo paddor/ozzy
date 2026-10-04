@@ -137,6 +137,10 @@ impl Sessions {
     /// Begin or retry one HELLO. Repeated calls preserve its exact request and
     /// nonce until negotiation finishes. Beginning a new attempt fences the old
     /// live session immediately; the caller must also fence its grants/replies.
+    #[allow(
+        deprecated,
+        reason = "Atomic::try_update requires Rust 1.95; MSRV is 1.93"
+    )]
     pub fn start(&self, remote: NodeId) -> Result<Vec<Bytes>> {
         if remote == self.local || remote.as_bytes() == &[0; 16] {
             return Err(Error::NotConnected);

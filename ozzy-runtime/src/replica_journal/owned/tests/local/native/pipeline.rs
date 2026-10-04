@@ -59,7 +59,7 @@ fn pipelined_confirmations_preserve_writer_sequence_after_blocked_output() {
                 controller.deliver(id).unwrap();
             }
         }
-        assert!(output.is_empty());
+        assert_eq!(output.len(), 0);
         settle(&mut controller, &mut actor, &mut intake, &mut output);
         let replies = confirmations(&output, hint.primary, link(70, 80).binding.peer);
         assert_eq!(

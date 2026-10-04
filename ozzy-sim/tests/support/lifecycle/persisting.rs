@@ -20,7 +20,7 @@ fn ram_confirmation_precedes_storage_and_bounds_the_persistence_pipeline() {
         "RAM application must not release unwritten capacity"
     );
     for replica in &sim.replicas {
-        assert!(replica.stable.operations.is_empty());
+        assert_eq!(replica.stable.operations.len(), 0);
         assert_eq!(replica.snapshot().unwrap().journal.durable, OpNumber(0));
     }
     sim.disk_paused = [false; 3];

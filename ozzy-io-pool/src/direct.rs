@@ -148,6 +148,10 @@ impl Queue {
             .register(waker);
     }
     /// Take one eligible write without waiting; execution limits may return none.
+    #[allow(
+        deprecated,
+        reason = "Atomic::try_update requires Rust 1.95; MSRV is 1.93"
+    )]
     pub fn try_recv(&mut self, class: Class) -> Option<Write> {
         loop {
             let job = if class == Class::Data {

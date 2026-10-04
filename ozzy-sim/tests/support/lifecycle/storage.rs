@@ -50,7 +50,7 @@ fn position(prefix: Prefix) -> LogPosition {
 
 impl Replica {
     pub(super) fn enable_storage(&mut self, seed: u64) {
-        assert!(self.accepted.is_empty());
+        assert_eq!(self.accepted.len(), 0);
         self.storage = Some(
             Journal::format(
                 GroupIdentity {

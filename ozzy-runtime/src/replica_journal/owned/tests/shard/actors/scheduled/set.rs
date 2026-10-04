@@ -50,7 +50,7 @@ fn bounded_actor_sets_preserve_healthy_groups_under_stalled_io_and_full_transpor
             settle(&mut controller, &[]);
         }
         let held: Vec<_> = controller.jobs().into_iter().map(|(id, _)| id).collect();
-        assert!(!held.is_empty());
+        assert_ne!(held.len(), 0);
         let mut assigned: [Vec<_>; 3] = std::array::from_fn(|_| Vec::new());
         for group in [stalled, middle, last] {
             for (broker, actor) in group.into_iter().enumerate() {

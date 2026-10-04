@@ -189,7 +189,7 @@ fn shared_descriptor_spans_match_record_encoding_and_reject_without_progress() {
         let (actual, shared) = output.finish_with_payload().unwrap();
         assert_eq!(actual, expected);
         assert_eq!(metadata, expected_metadata);
-        assert!(fallback.is_empty());
+        assert_eq!(fallback.len(), 0);
         let shared = shared.unwrap();
         assert_eq!(shared.as_ptr(), body.as_ptr());
         assert_eq!(shared.as_ref(), expected_payload);
@@ -277,7 +277,7 @@ fn publication_forwards_one_exact_prepared_lz4_group() {
     let payload = payload.unwrap();
     assert_eq!(payload.as_ptr(), backing[start..].as_ptr());
     assert_eq!(payload.as_ref(), encoded);
-    assert!(fallback.is_empty());
+    assert_eq!(fallback.len(), 0);
     let packet = decode_packet(&[&header, &metadata, &payload], limits.envelope).unwrap();
     assert!(reader::decode_publication(packet, limits).is_err());
     let metadata = Bytes::from(metadata);
@@ -396,7 +396,7 @@ fn shared_payload_preserves_wire_bytes_and_mixed_backings_fall_back_to_copying()
                 assert_eq!(payload, expected_payload);
             } else {
                 let shared = shared.unwrap();
-                assert!(payload.is_empty());
+                assert_eq!(payload.len(), 0);
                 assert_eq!(shared.as_ptr(), body.as_ptr());
                 assert_eq!(shared.as_ref(), expected_payload);
             }
@@ -492,7 +492,7 @@ fn shared_payload_rejection_preserves_credit_and_prefix() {
     assert_eq!(output.payload_bytes(), 2);
     let (_, shared) = output.finish_with_payload().unwrap();
     assert_eq!(shared.unwrap().as_ref(), b"bc");
-    assert!(payload.is_empty());
+    assert_eq!(payload.len(), 0);
 }
 
 #[test]

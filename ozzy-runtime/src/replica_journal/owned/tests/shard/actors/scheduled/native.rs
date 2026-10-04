@@ -214,7 +214,7 @@ fn native_producer_open_and_append_require_group_confirmation_under_both_policie
             progress(&mut actors, &mut intake, &mut output, Some(&mut held));
             settle(&mut controller, &[]);
         }
-        assert!(!held.is_empty());
+        assert_ne!(held.len(), 0);
         assert!(
             output.is_empty(),
             "leader storage alone confirmed producer open"

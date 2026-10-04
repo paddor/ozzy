@@ -37,7 +37,7 @@ fn async_detached_roll_keeps_written_predecessor_readable_until_exact_installati
     let (mut controller, mut journal) = buffered();
     let io = journal.access.io.clone();
     let preparation = journal.prepare_next_segment(32768, 4).unwrap();
-    assert!(controller.jobs().is_empty());
+    assert_eq!(controller.jobs().len(), 0);
     let mut segment = drive(&mut controller, preparation.prepare()).unwrap();
     assert_eq!(segment.capacity(), 32768);
     drive(&mut controller, segment.zero_range(0..32768)).unwrap();

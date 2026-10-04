@@ -77,7 +77,7 @@ fn canonical_state_checkpoint_matches_exact_journal_position() {
         )
         .unwrap();
     let cleanup = journal.reclaim_unreferenced_checkpoints().unwrap();
-    assert!(cleanup.removed_checkpoint_ids.is_empty());
+    assert_eq!(cleanup.removed_checkpoint_ids.len(), 0);
     assert_eq!(cleanup.pinned_checkpoint_ids, [checkpoint_id]);
     let journal = journal
         .install_canonical_checkpoint(

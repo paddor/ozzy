@@ -38,6 +38,10 @@ impl ActorIds {
     }
 
     /// Process-unique short aliases. Exhaustion fails instead of recycling one.
+    #[allow(
+        deprecated,
+        reason = "Atomic::try_update requires Rust 1.95; MSRV is 1.93"
+    )]
     pub(super) fn compact_handle() -> Result<u32, ActorError> {
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
         NEXT.fetch_update(

@@ -140,7 +140,7 @@ fn delayed_publication(handoff: bool) {
         }
         if handoff {
             assert_eq!(publications, 0);
-            assert!(!delayed.is_empty());
+            assert_ne!(delayed.len(), 0);
             let first = &delayed[0].1;
             for (from, message) in &delayed {
                 assert_eq!(*from, 0);

@@ -601,7 +601,7 @@ fn published(message: &Message, leader: NodeId, source: reader::Source) -> (u64,
 
 fn check_publication(expected: u64, first: u64, ids: &[MessageId]) -> u64 {
     assert_eq!(first, expected, "missing or duplicated publication");
-    assert!(!ids.is_empty());
+    assert_ne!(ids.len(), 0);
     for (offset, &id) in (first..).zip(ids) {
         assert_eq!(id, publication_id(offset));
     }

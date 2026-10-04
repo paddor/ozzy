@@ -121,7 +121,7 @@ fn owned_replay_refresh_reads_only_the_new_segment_suffix() {
     });
     let result = replica.journal.complete_replay(done).unwrap();
     assert_eq!(result.end(), second);
-    assert!(!reads.is_empty());
+    assert_ne!(reads.len(), 0);
     assert!(reads.iter().all(|offset| *offset > 0), "{reads:?}");
     drop(result);
     drive(&mut controller, replica.journal.shutdown()).unwrap();

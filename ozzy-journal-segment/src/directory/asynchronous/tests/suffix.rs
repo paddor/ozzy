@@ -189,11 +189,11 @@ fn async_suffix_preserves_exact_protected_fragment_and_old_captured_history() {
             .map(|op| (op.op_number, op.body.to_vec()))
             .collect::<Vec<_>>();
         assert_eq!(drive(&mut controller, replay(&journal)), expected);
-        assert!(
+        assert_eq!(
             drive(&mut controller, journal.reclaim_unreferenced_segments(8))
                 .unwrap()
-                .removed_segment_ids
-                .is_empty()
+                .removed_segment_ids,
+            []
         );
         drop(history);
         assert_eq!(

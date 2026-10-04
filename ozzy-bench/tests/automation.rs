@@ -1651,7 +1651,7 @@ fn all_and_native_only_preserve_workload_and_ssd_cpu_budgets() {
             .any(|case| case["impl"] != "ozzy" && case["mode"] == "durable")
     );
     let buffered = compare::Args::parse_from(["compare", "--impl", "ozzy", "--modes", "buffered"]);
-    assert!(buffered.cases().is_empty());
+    assert_eq!(buffered.cases().len(), 0);
     assert!(buffered.validate().is_err());
     assert!(
         buffered

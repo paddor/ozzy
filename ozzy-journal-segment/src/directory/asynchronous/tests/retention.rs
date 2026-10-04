@@ -55,7 +55,7 @@ fn captured_generations_stay_readable_after_retirement_and_delay_deletion() {
     assert_eq!(retired.unreferenced_segment_ids, [1, 2]);
     assert_eq!(retired.scanned_segments, 2);
     let cleaned = drive(&mut controller, journal.reclaim_unreferenced_segments(2)).unwrap();
-    assert!(cleaned.removed_segment_ids.is_empty());
+    assert_eq!(cleaned.removed_segment_ids.len(), 0);
     assert_eq!(cleaned.pinned_segment_ids, [1, 2]);
     let bytes = drive(&mut controller, captured.read_segment(1)).unwrap();
     let reference = captured.references()[1];

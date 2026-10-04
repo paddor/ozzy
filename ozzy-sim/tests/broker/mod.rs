@@ -174,11 +174,12 @@ async fn inproc_memory_failure_artifact_preserves_images_and_replays_its_fault_p
     );
     let evidence: serde_json::Value =
         serde_json::from_reader(std::fs::File::open(first.join("failure.json")).unwrap()).unwrap();
-    assert!(
-        !evidence["record_evidence"]["submitted"]
+    assert_ne!(
+        evidence["record_evidence"]["submitted"]
             .as_array()
             .unwrap()
-            .is_empty()
+            .len(),
+        0
     );
     let image: ozzy_io::simulation::Image =
         serde_json::from_reader(std::fs::File::open(first.join("image-0.json")).unwrap()).unwrap();

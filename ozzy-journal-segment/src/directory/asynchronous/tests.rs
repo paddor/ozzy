@@ -469,7 +469,7 @@ fn impossible_limits_reject_format_before_any_file_effect() {
             limits,
         ));
         assert!(matches!(poll(future.as_mut()), Poll::Ready(Err(_))));
-        assert!(controller.jobs().is_empty());
+        assert_eq!(controller.jobs().len(), 0);
         assert!(
             controller
                 .image()

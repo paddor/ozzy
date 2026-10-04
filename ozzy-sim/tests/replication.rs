@@ -185,7 +185,7 @@ fn prepare_gaps_duplicates_and_missing_commits_recover_by_bounded_retry() {
     sim.send_prepare(1, 0, 2).unwrap();
     sim.send_prepare(1, 2, 1).unwrap();
     assert!(sim.deliver(1).is_err());
-    assert!(sim.replicas[1].accepted.is_empty());
+    assert_eq!(sim.replicas[1].accepted.len(), 0);
     sim.duplicate(0).unwrap();
     sim.deliver(1).unwrap();
     sim.deliver(0).unwrap();
@@ -213,7 +213,7 @@ fn one_crashed_backup_does_not_block_the_healthy_quorum() {
         sim.heal();
     }
     assert_eq!(sim.replicas[0].core.snapshot().applied.op, OpNumber(20));
-    assert!(sim.replicas[2].stable.is_empty());
+    assert_eq!(sim.replicas[2].stable.len(), 0);
 }
 
 #[test]
@@ -233,7 +233,7 @@ fn lagging_backup_replays_more_than_pipeline_from_committed_journal() {
         sim.replicas[1].apply().unwrap();
         sim.check();
     }
-    assert!(sim.replicas[2].accepted.is_empty());
+    assert_eq!(sim.replicas[2].accepted.len(), 0);
     assert_eq!(sim.replicas[0].core.snapshot().pending_operations, 0);
     // Twenty-four operations cannot fit the eight-operation pipeline. Each
     // replay chunk carries a committed prefix sourced from the primary's log.
@@ -274,7 +274,7 @@ fn primary_crash_after_reply_before_commit_keeps_quorum_prepared_bytes() {
     sim.replicas[0].power_cut();
     assert_eq!(sim.replicas[1].stable, acknowledged);
     assert_eq!(sim.replicas[1].core.snapshot().committed.op, OpNumber(0));
-    assert!(sim.replicas[2].stable.is_empty());
+    assert_eq!(sim.replicas[2].stable.len(), 0);
     assert_eq!(sim.propose(&[append(1)]), Err(Error::Offline));
     sim.check();
     // This is preservation evidence, NOT failover. View selection must later

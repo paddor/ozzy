@@ -191,7 +191,7 @@ fn shard_adapter_stalled_partition_does_not_stop_another_on_same_thread() {
         pump(&mut blocked);
     }
     let held: Vec<_> = controller.jobs().into_iter().map(|(id, _)| id).collect();
-    assert!(!held.is_empty());
+    assert_ne!(held.len(), 0);
     // Validate/admit on the other owner without releasing held file work.
     let mut buffer = healthy.lease_proposal_buffer().unwrap();
     buffer

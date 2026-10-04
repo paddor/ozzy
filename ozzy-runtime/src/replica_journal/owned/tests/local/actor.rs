@@ -120,7 +120,7 @@ fn local_actor_keeps_other_partitions_running_while_one_write_is_stalled() {
         pump(&mut blocked);
     }
     let held: Vec<_> = controller.jobs().into_iter().map(|(id, _)| id).collect();
-    assert!(!held.is_empty());
+    assert_ne!(held.len(), 0);
     assert!(poll(abandoned.as_mut()).is_pending());
     assert_eq!(blocked.snapshot().applied.op.0, 3);
     assert_eq!(blocked.snapshot().accepted.op.0, 4);
@@ -312,7 +312,7 @@ fn local_actor_shutdown_drains_after_io_failure_and_closes_callers() {
         }
     }
     assert!(injected && finished);
-    assert!(controller.jobs().is_empty());
+    assert_eq!(controller.jobs().len(), 0);
     let Poll::Ready(result) = poll(pending.as_mut()) else {
         panic!("failed actor left caller waiting");
     };
@@ -360,7 +360,7 @@ fn local_actor_waits_for_retained_backing_before_installing_the_next_append() {
             break;
         }
     }
-    assert!(!held.is_empty());
+    assert_ne!(held.len(), 0);
     let mut second = Box::pin(lane.try_submit(second).unwrap());
     for _ in 0..32 {
         pump(&mut actor);

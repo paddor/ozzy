@@ -30,6 +30,10 @@ impl Inbox {
 
     /// Reserve one record of `bytes`. An empty inbox admits any permitted
     /// record, so a record larger than the byte bound still progresses.
+    #[allow(
+        deprecated,
+        reason = "Atomic::try_update requires Rust 1.95; MSRV is 1.93"
+    )]
     pub(super) fn reserve(&self, bytes: usize) -> Option<Reservation<'_>> {
         self.queued
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {

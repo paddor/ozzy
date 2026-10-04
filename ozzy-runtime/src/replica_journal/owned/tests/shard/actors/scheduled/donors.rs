@@ -34,7 +34,7 @@ fn replace_while_pinning(policy: QuorumPolicy, disconnect: bool) {
         round(&mut actors, false);
         settle(&mut controller, &[]);
     }
-    assert!(controller.jobs().is_empty());
+    assert_eq!(controller.jobs().len(), 0);
     let mut request = RecoveryRequest {
         scope: actors[0].status().scope,
         request_id: ozzy_proto::RequestId::from_bytes([42; 16]),
@@ -54,7 +54,7 @@ fn replace_while_pinning(policy: QuorumPolicy, disconnect: bool) {
     }
     assert!(actors[0].status().disk_pending);
     observe(&mut actors[0]);
-    assert!(!controller.jobs().is_empty());
+    assert_ne!(controller.jobs().len(), 0);
     let peer = NodeId::from_bytes([3; 16]);
     let expected = if disconnect {
         assert!(
@@ -110,7 +110,7 @@ fn replace_while_pinning(policy: QuorumPolicy, disconnect: bool) {
     for actor in actors {
         close(&mut controller, actor);
     }
-    assert!(controller.jobs().is_empty());
+    assert_eq!(controller.jobs().len(), 0);
 }
 
 fn observe(actor: &mut Scheduled) {

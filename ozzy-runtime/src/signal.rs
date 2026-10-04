@@ -86,6 +86,10 @@ impl StateSignal {
     }
 
     /// Publish the changed state before broadcasting. Generations never wrap.
+    #[allow(
+        deprecated,
+        reason = "Atomic::try_update requires Rust 1.95; MSRV is 1.93"
+    )]
     pub(crate) fn notify_changed(&self) {
         self.generation
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {

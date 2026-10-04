@@ -154,6 +154,6 @@ fn validated_operations_yield_exact_record_and_retry_entries() {
         operation.location.entry_offset,
         decoded.operations[1].entry_offset
     );
-    assert!(entries.offsets.is_empty());
-    assert!(entries.messages.is_empty());
+    assert_eq!(entries.offsets.len(), 0);
+    assert_eq!(entries.messages.len(), 0);
 }

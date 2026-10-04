@@ -181,7 +181,7 @@ fn async_canonical_recovery_preserves_committed_and_speculative_identities() {
     images.admit(5, &barrier(3)).unwrap();
     images.commit_through(5).unwrap();
     assert_eq!(images.committed().revision(), 5);
-    assert!(controller.jobs().is_empty());
+    assert_eq!(controller.jobs().len(), 0);
 }
 
 #[test]

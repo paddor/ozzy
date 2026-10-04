@@ -315,8 +315,8 @@ fn scenario(access: NativeAccess, trusted: bool) {
     for _ in 0..100 {
         progress(&mut actor, &mut intake, None, &mut output, false);
     }
-    assert!(output.is_empty());
-    assert!(!controller.jobs().is_empty());
+    assert_eq!(output.len(), 0);
+    assert_ne!(controller.jobs().len(), 0);
     let blocked_append = append(hint.authority, old, 50, 0, 1);
     assert_eq!(
         intake.receive(&blocked_append, old, hint).unwrap(),
@@ -443,7 +443,7 @@ fn intake_without_work_leaves_its_scheduler_asleep() {
         0,
         "an intake without requests asked for another turn"
     );
-    assert!(output.is_empty());
+    assert_eq!(output.len(), 0);
     // A request in the last writer slot is found by the next call.
     for writer in [50, 60] {
         let opening = request(

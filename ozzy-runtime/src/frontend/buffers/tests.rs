@@ -112,7 +112,7 @@ fn empty_control_payload_cannot_retain_hidden_capacity() {
     .unwrap();
     let (message, charge) = buffers.prepare(message).unwrap();
     assert_eq!(drops.load(Ordering::SeqCst), 4);
-    assert!(message.part_slice(3).unwrap().is_empty());
+    assert_eq!(message.part_slice(3).unwrap().len(), 0);
     assert!(charge < 4096);
 }
 

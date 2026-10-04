@@ -244,7 +244,7 @@ fn async_resident_delivery_releases_file_protection_and_keeps_bounded_selection(
         })
         .unwrap();
     assert_eq!(offsets, [0]);
-    assert!(controller.jobs().is_empty());
+    assert_eq!(controller.jobs().len(), 0);
     drive(&mut controller, journal.close()).unwrap();
 }
 
