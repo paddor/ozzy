@@ -247,9 +247,10 @@ impl NativeIntake {
                             proposal: Box::pin(proposal),
                         });
                     }
-                    Err(rejected) => {
+                    Err(mut rejected) => {
                         crate::profiling::event(crate::profiling::Event::NativeProposalRefusal);
                         let full = rejected.reason == ProposalSubmitError::Full;
+                        rejected.buffer.clear();
                         self.slots[slot].buffer = Some(rejected.buffer);
                         if full {
                             // Keep the unchanged request on the shard. A later
@@ -261,6 +262,11 @@ impl NativeIntake {
                 }
             }
             Err(PrepareFailure::Busy) => {
+                self.slots[slot]
+                    .buffer
+                    .as_mut()
+                    .expect("free arena")
+                    .clear();
                 return Ok(NativeReceive::Busy);
             }
             Err(PrepareFailure::Reject(code, retry)) => {

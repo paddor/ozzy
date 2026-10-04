@@ -1,6 +1,6 @@
 //! Reusable real-broker harness over OMQ and memory-only physical storage.
 
-use ozzy_broker::{Broker, CheckedConfig, JournalPlan, ShardIo, StorageOwner};
+use ozzy_broker::{Broker, CheckedConfig, JournalPlan, ServingContext, ShardIo, StorageOwner};
 use ozzy_config::BrokerIdentity;
 use ozzy_io::simulation::{Client, Config, Controller, Effect, Image, ImageLimits, Stage};
 use ozzy_io::{Class, Limits, Local, Operation, Quota};
@@ -29,6 +29,7 @@ pub struct Storage {
 /// External fault controls; protocol and journal authority remain broker-owned.
 #[derive(Debug, Default)]
 pub struct Control {
+    crash: std::sync::atomic::AtomicU8,
     hold_writes: AtomicBool,
     hold_completions: AtomicBool,
     fail_write: AtomicBool,
@@ -48,6 +49,35 @@ struct Snapshot {
 }
 
 impl Control {
+    /// Cut the memory device without draining old physical work. Process death
+    /// retains dirty bytes; power loss restores only explicit durable effects.
+    pub fn crash(&self, power_loss: bool) {
+        self.crash
+            .store(if power_loss { 2 } else { 1 }, Ordering::Release);
+    }
+
+    fn record(&self, events: Vec<ozzy_io::simulation::Event>) {
+        self.physical_events
+            .fetch_add(events.len() as u64, Ordering::Release);
+        let mut recent = self.recent_trace.lock().unwrap();
+        for event in events {
+            if recent.len() == 4096 {
+                recent.pop_front();
+            }
+            recent.push_back(event);
+        }
+    }
+
+    fn finish(&self, image: Image, done: &tokio::sync::Semaphore) -> Image {
+        let mut snapshot = self.snapshot.lock().unwrap();
+        snapshot.finished = Some(image.clone());
+        if let Some(reply) = snapshot.pending.take() {
+            let _ = reply.send(image.clone());
+        }
+        done.add_permits(1);
+        image
+    }
+
     /// Capture the current memory image between physical events.
     pub async fn image(&self) -> Image {
         let (send, receive) = tokio::sync::oneshot::channel();
@@ -133,6 +163,12 @@ pub fn pump(
     let task = tokio::spawn(async move {
         let mut drain = None;
         loop {
+            let crash = scheduling.crash.swap(0, Ordering::AcqRel);
+            if crash != 0 {
+                let (image, events) = device.crash(crash == 2).unwrap();
+                scheduling.record(events);
+                return scheduling.finish(image, &done);
+            }
             if stop.load(Ordering::Acquire) && drain.is_none() {
                 drain = Some(Box::pin(device.begin_shutdown().unwrap().wait()));
             }
@@ -185,17 +221,7 @@ pub fn pump(
                 .pending_completions
                 .store(completions, Ordering::Release);
             if !device.trace().is_empty() {
-                let events = device.take_trace();
-                scheduling
-                    .physical_events
-                    .fetch_add(events.len() as u64, Ordering::Release);
-                let mut recent = scheduling.recent_trace.lock().unwrap();
-                for event in events {
-                    if recent.len() == 4096 {
-                        recent.pop_front();
-                    }
-                    recent.push_back(event);
-                }
+                scheduling.record(device.take_trace());
             }
             let drained = if let Some(drain) = drain.as_mut() {
                 futures::poll!(drain.as_mut()).is_ready()
@@ -208,14 +234,9 @@ pub fn pump(
                     assert_eq!(stage, Stage::Executed);
                     device.deliver(job).unwrap();
                 }
-                let image = device.crash(false).unwrap().0;
-                let mut snapshot = scheduling.snapshot.lock().unwrap();
-                snapshot.finished = Some(image.clone());
-                if let Some(reply) = snapshot.pending.take() {
-                    let _ = reply.send(image.clone());
-                }
-                done.add_permits(1);
-                return image;
+                let (image, events) = device.crash(false).unwrap();
+                scheduling.record(events);
+                return scheduling.finish(image, &done);
             }
             tokio::task::yield_now().await;
         }
@@ -276,6 +297,7 @@ pub async fn provision(checked: &CheckedConfig, local: &BrokerIdentity, reverse:
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => panic!("virtual directory {}: {error}", path.display()),
             }
+            sync_directory(&io, path.parent().unwrap()).await;
         }
         let opened = Box::pin(partition.format(io.clone(), JournalGeneration(1)))
             .await
@@ -285,6 +307,35 @@ pub async fn provision(checked: &CheckedConfig, local: &BrokerIdentity, reverse:
     drop(io);
     storage.stop.store(true, Ordering::Release);
     task.await.unwrap()
+}
+
+async fn sync_directory(io: &Local, path: &std::path::Path) {
+    let opened = io
+        .execute(
+            Class::Progress,
+            Operation::OpenDirectory {
+                path: path.to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    let ozzy_io::Outcome::Opened(handle) = &*opened else {
+        panic!("directory open returned no handle");
+    };
+    let handle = handle.clone();
+    drop(opened);
+    io.execute(
+        Class::Progress,
+        Operation::Sync {
+            handle: handle.clone(),
+            mode: ozzy_io::SyncMode::All,
+        },
+    )
+    .await
+    .unwrap();
+    io.execute(Class::Progress, Operation::Close { handle })
+        .await
+        .unwrap();
 }
 
 /// Start the real brokers on the runtime context with controlled memory storage.
@@ -304,13 +355,13 @@ pub async fn start_controlled(
     deployment: Vec<(CheckedConfig, BrokerIdentity)>,
     reverse: bool,
 ) -> (Vec<Broker>, Vec<Arc<Control>>) {
-    let (brokers, controls, _) = start_images(runtime, deployment, reverse).await;
+    let (brokers, controls, _) = start_images(runtime.context().clone(), deployment, reverse).await;
     (brokers, controls)
 }
 
 /// Start brokers, fault controls, and tasks yielding their shutdown images.
 pub async fn start_images(
-    runtime: &WriterRuntime,
+    context: impl Into<ServingContext>,
     deployment: Vec<(CheckedConfig, BrokerIdentity)>,
     reverse: bool,
 ) -> (
@@ -318,6 +369,7 @@ pub async fn start_images(
     Vec<Arc<Control>>,
     Vec<tokio::task::JoinHandle<Image>>,
 ) {
+    let context = context.into();
     let mut brokers = Vec::new();
     let mut controls = Vec::new();
     let mut images = Vec::new();
@@ -329,7 +381,8 @@ pub async fn start_images(
         )
         .await
         .unwrap_or_else(|_| panic!("virtual provision stalled: {name}"));
-        let (broker, control, task) = start_image(runtime, checked, local, reverse, image).await;
+        let (broker, control, task) =
+            start_image(context.clone(), checked, local, reverse, image).await;
         brokers.push(broker);
         controls.push(control);
         images.push(task);
@@ -339,18 +392,18 @@ pub async fn start_images(
 
 /// Restart one broker from an image under ordinary startup selection.
 pub async fn start_image(
-    runtime: &WriterRuntime,
+    context: impl Into<ServingContext>,
     checked: CheckedConfig,
     local: BrokerIdentity,
     reverse: bool,
     image: Image,
 ) -> (Broker, Arc<Control>, tokio::task::JoinHandle<Image>) {
-    start_image_selected(runtime, checked, local, reverse, image, &[]).await
+    start_image_selected(context, checked, local, reverse, image, &[]).await
 }
 
 /// Restart one broker with explicit production recovery selections.
 pub async fn start_image_selected(
-    runtime: &WriterRuntime,
+    context: impl Into<ServingContext>,
     checked: CheckedConfig,
     local: BrokerIdentity,
     reverse: bool,
@@ -373,14 +426,7 @@ pub async fn start_image_selected(
     let (storage, control, task) = pump(controller, reverse);
     let broker = tokio::time::timeout(
         Duration::from_secs(5),
-        Broker::start_trusted_with_storage(
-            checked,
-            local,
-            selections,
-            runtime.context().clone(),
-            lanes,
-            storage,
-        ),
+        Broker::start_trusted_with_storage(checked, local, selections, context, lanes, storage),
     )
     .await
     .unwrap_or_else(|_| panic!("virtual startup stalled: {name}"))

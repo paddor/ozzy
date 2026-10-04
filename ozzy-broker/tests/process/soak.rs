@@ -1,4 +1,4 @@
-//! Opt-in three-host crash soak. Reuses the process suite's SDK record oracle.
+//! Opt-in cross-host crash soak. Reuses the process suite's SDK record oracle.
 
 use super::Client;
 
@@ -240,6 +240,16 @@ fn duration_secs() -> u64 {
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires a freshly provisioned OZZY_SOAK_CONFIG and OZZY_SOAK_DIRS on si-dev/wu-dev/er-dev"]
 async fn three_host_crash_soak() {
+    run_crash_soak().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires one provisioned durable broker and a remote SDK controller"]
+async fn cross_host_single_crash_soak() {
+    run_crash_soak().await;
+}
+
+async fn run_crash_soak() {
     let seconds = duration_secs();
     let mut fleet = Fleet::start().await;
     let policy = fleet.checked.deployment.deployment().topics["orders"].confirmation;

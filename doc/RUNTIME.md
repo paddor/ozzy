@@ -31,6 +31,14 @@ The broker defaults to one dispatcher and one OMQ I/O worker. Actors are tasks,
 not threads. Shard 0 has no extra duties. Partition actors call their journal
 owner directly; there is no same-thread journal command queue or journal runtime.
 
+Ordinary brokers observe elapsed monotonic time for protocol deadlines and Unix
+time for append/retention timestamps. With the `simulation` feature, an injected
+`ServingContext` can share the existing manual SDK clock. Shard startup resets
+its relative timer origin; append and retention time use one supplied epoch plus
+the shared clock across restarts. Advancing time neither executes physical I/O
+nor observes its completions. Transport and storage readiness still progress at
+their normal bounded scheduling points.
+
 Producer and consumer state is separate. `BrokerLinks` reuses sessions and
 transport for both roles. Its two PEER sockets connect every configured broker;
 three brokers mean six TCP connections, not six PEER sockets. Live readers use

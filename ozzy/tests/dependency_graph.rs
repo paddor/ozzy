@@ -77,7 +77,20 @@ const ALLOWED: &[(&str, &[&str])] = &[
         ],
     ),
     ("ozzy", &["omq-tokio", "ozzy-proto", "ozzy-runtime"]),
-    ("ozzy-sim", &["ozzy-core", "ozzy-journal"]),
+    (
+        "ozzy-sim",
+        &[
+            "ozzy-core",
+            "ozzy-journal",
+            "ozzy-broker",
+            "ozzy-config",
+            "ozzy-io",
+            "ozzy-proto",
+            "ozzy-replication",
+            "ozzy-runtime",
+            "tokio",
+        ],
+    ),
 ];
 
 fn workspace_metadata() -> Value {
@@ -162,6 +175,23 @@ fn normal_dependencies(package: &Value) -> BTreeSet<String> {
         .collect()
 }
 
+fn simulator_feature_boundary(package: &Value) {
+    let feature = package["features"]["broker"].as_array().unwrap();
+    for dependency in package["dependencies"].as_array().unwrap() {
+        let name = dependency["name"].as_str().unwrap();
+        if dependency["kind"].is_null()
+            && tracked(name)
+            && !["ozzy-core", "ozzy-journal"].contains(&name)
+        {
+            assert!(
+                dependency["optional"] == true
+                    && feature.contains(&Value::String(format!("dep:{name}"))),
+                "full-product simulator dependency must require its broker feature: {name}"
+            );
+        }
+    }
+}
+
 #[test]
 fn workspace_crates_only_depend_downward() {
     let metadata = workspace_metadata();
@@ -178,6 +208,9 @@ fn workspace_crates_only_depend_downward() {
             continue;
         };
         covered.insert(name.to_owned());
+        if name == "ozzy-sim" {
+            simulator_feature_boundary(package);
+        }
         for dependency in normal_dependencies(package) {
             if !allowed.contains(&dependency.as_str()) {
                 violations.push(format!("{name} -> {dependency}"));

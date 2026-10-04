@@ -34,7 +34,8 @@ async fn resume_partitions(policy: Confirmation) {
         .collect::<Vec<_>>();
     let producer = role_links(&runtime, &deployment[0].0, handshake::PRODUCER).await;
     let replacement = role_links(&runtime, &deployment[0].0, handshake::PRODUCER).await;
-    let (mut brokers, _, mut images) = start_images(&runtime, deployment, true).await;
+    let (mut brokers, _, mut images) =
+        start_images(runtime.context().clone(), deployment, true).await;
     let config = SharedTopicWriterConfig::new(limits());
     let retry = RetryPolicy::default();
     let mut writer = live_many(

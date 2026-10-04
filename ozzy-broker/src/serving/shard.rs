@@ -27,7 +27,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -165,7 +165,7 @@ async fn serve(
     state: &mut State,
     binding: &mut Binding,
 ) -> Result<(), StartupError> {
-    let start = Instant::now();
+    let start = state.config.time.start();
     let mut tick = tokio::time::interval(TIMER_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -209,13 +209,4 @@ async fn serve(
             _ = tick.tick() => {},
         }
     }
-}
-
-fn timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
 }

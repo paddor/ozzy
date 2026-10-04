@@ -9,6 +9,9 @@ repository.workspace = true
 description = "Ozzy broker deployment and startup integration."
 publish = false
 
+[features]
+simulation = []
+
 [dependencies]
 bytes.workspace = true
 clap.workspace = true

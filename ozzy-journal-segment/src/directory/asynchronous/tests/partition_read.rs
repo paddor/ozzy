@@ -178,6 +178,51 @@ fn async_incremental_retry_read_selects_exact_offsets_and_positions() {
 }
 
 #[test]
+fn async_retry_reads_reuse_predecessor_and_cached_sealed_selectors() {
+    let (mut controller, journal) = empty_journal();
+    let mut config = read_config(0);
+    config.cached_index_bytes = 8192;
+    let mut index = drive(&mut controller, Index::open(&journal, config)).unwrap();
+    let mut journal = append(&mut controller, journal, &mut index, 0, 0);
+    for number in 1..=2 {
+        drive(&mut controller, journal.roll_active(32768, 4)).unwrap();
+        index.rolled(&journal).unwrap();
+        journal = append(&mut controller, journal, &mut index, number, 0);
+        for offset in 0..number {
+            let mut jobs = 0;
+            let records = drive_with(
+                &mut controller,
+                index.read_offsets_with_positions(
+                    &journal,
+                    indexes::partition(),
+                    &[Offset::new(u64::from(offset))],
+                    ReadLimits {
+                        max_records: 1,
+                        max_bytes: 8192,
+                    },
+                ),
+                |_| {
+                    jobs += 1;
+                    Effect::Normal
+                },
+            )
+            .unwrap()
+            .expect("retained sealed selector");
+            assert_eq!(records.len(), 1);
+            let (record, position) = &records[0];
+            assert_eq!(record.offset.get(), u64::from(offset));
+            assert_eq!(
+                record.parts.as_slice(),
+                &[bytes::Bytes::from_static(b"payload")]
+            );
+            assert_eq!(position.op_number, u64::from(offset) + 1);
+            assert!(jobs <= 4, "retry must not rescan or publish indexes");
+        }
+    }
+    drive(&mut controller, journal.close()).unwrap();
+}
+
+#[test]
 fn async_resident_delivery_releases_file_protection_and_keeps_bounded_selection() {
     let (mut controller, journal) = empty_journal();
     let mut index = drive(&mut controller, Index::open(&journal, read_config(0))).unwrap();

@@ -309,9 +309,9 @@ impl Index {
         Ok(())
     }
 
-    /// Read exact written offsets from the incremental active index. A miss
-    /// leaves older sealed history to the snapshot path. This avoids scanning
-    /// the growing active segment for each producer retry.
+    /// Read exact written offsets from retained incremental selectors. A miss
+    /// leaves uncached sealed history to the snapshot path. Reuse the active,
+    /// predecessor, and bounded cold indexes without rescanning their segments.
     pub async fn read_offsets_with_positions(
         &self,
         journal: &Journal,
@@ -323,18 +323,44 @@ impl Index {
         if limits.max_records == 0 || limits.max_bytes == 0 {
             return Err(Error::InvalidReadLimits);
         }
-        let Some(active) = &self.active else {
+        let Some(&first) = offsets.first() else {
+            return Ok(Some(Vec::new()));
+        };
+        let retained = self
+            .active
+            .iter()
+            .chain(self.previous.iter())
+            .find(|index| index.entry(partition, first).is_ok());
+        let cached = retained
+            .is_none()
+            .then(|| {
+                self.cold
+                    .borrow()
+                    .hot
+                    .iter()
+                    .find(|index| index.entry(partition, first).is_ok())
+                    .cloned()
+            })
+            .flatten();
+        let Some(index) = retained.or(cached.as_deref()) else {
             return Ok(None);
         };
-        let Some(source) = journal.record_source()? else {
-            return Ok(None);
+        let source = if journal
+            .manifest
+            .segments
+            .last()
+            .is_some_and(|reference| reference.segment_id == index.source().segment_id)
+        {
+            journal.record_source()?.ok_or(Error::StaleCatalog)?
+        } else {
+            journal.sealed_record_source(index.source().segment_id)?
         };
-        if active.source() != source.index {
+        if index.source() != source.index {
             return Err(Error::StaleCatalog);
         }
         let mut entries = Vec::with_capacity(offsets.len().min(limits.max_records));
         for &offset in offsets.iter().take(limits.max_records) {
-            let Ok(entry) = active.entry(partition, offset) else {
+            let Ok(entry) = index.entry(partition, offset) else {
                 return Ok(None);
             };
             entries.push(entry);

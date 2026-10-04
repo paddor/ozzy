@@ -31,7 +31,7 @@ pub use provisioning::{
     CheckedConfig, check_config, initialize_broker_identity, initialize_identity,
     load_broker_identity, load_deployment,
 };
-pub use serving::{Broker, StorageOwner};
+pub use serving::{Broker, ServingContext, StorageOwner};
 pub use shards::{ApplicationShards, ShardContext, ShardMemory, Shutdown};
 pub use volumes::{check_volumes, initialize_volumes};
 

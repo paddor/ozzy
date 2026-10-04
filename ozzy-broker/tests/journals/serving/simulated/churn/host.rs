@@ -29,8 +29,15 @@ async fn memory_only_broker_process() {
     };
     let runtime = WriterRuntime::new().unwrap();
     let image = Box::pin(provision(&checked, &local, true)).await;
-    let (broker, _, image) =
-        start_image_selected(&runtime, checked, local, true, image, &selections).await;
+    let (broker, _, image) = start_image_selected(
+        runtime.context().clone(),
+        checked,
+        local,
+        true,
+        image,
+        &selections,
+    )
+    .await;
     println!("Serving broker {name} with test memory storage");
     let mut terminate =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();

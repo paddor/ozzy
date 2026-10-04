@@ -1,6 +1,8 @@
 //! Broker lifecycle assembled from the production shard, journal, and frontend owners.
 
 mod config;
+mod context;
+pub use context::ServingContext;
 mod drain;
 mod outbound;
 mod shard;
@@ -104,7 +106,7 @@ impl Broker {
             )
         });
         let (devices, lanes) = DevicePools::start(&checked.plan)?;
-        Self::start_on_lanes(checked, journals, omq, lanes, devices).await
+        Self::start_on_lanes(checked, journals, omq.into(), lanes, devices).await
     }
 
     /// Serve using an externally owned file backend. The caller must provision
@@ -116,24 +118,25 @@ impl Broker {
         checked: CheckedConfig,
         local: BrokerIdentity,
         selections: &[RecoverySelection],
-        context: Context,
+        context: impl Into<ServingContext>,
         lanes: Vec<crate::ShardIo<B>>,
         storage: impl StorageOwner,
     ) -> Result<Self, StartupError> {
         let journals = Arc::new(
             JournalPlan::from_trusted_deployment(&checked, &local)?.select_recovery(selections)?,
         );
-        Self::start_on_lanes(checked, journals, context, lanes, storage).await
+        Self::start_on_lanes(checked, journals, context.into(), lanes, storage).await
     }
 
     async fn start_on_lanes<B: ozzy_io::Backend + 'static>(
         checked: CheckedConfig,
         journals: Arc<JournalPlan>,
-        omq: Context,
+        context: ServingContext,
         lanes: Vec<crate::ShardIo<B>>,
         devices: impl StorageOwner,
     ) -> Result<Self, StartupError> {
-        let config = Arc::new(config::Config::new(&checked, omq.clone())?);
+        let omq = context.omq.clone();
+        let config = Arc::new(config::Config::new(&checked, context)?);
         let checked = Arc::new(checked);
         let (application_start, frontend_start) = startup_groups(checked.plan.shards.len());
         let devices = DeviceDrain::new(devices, application_start.state(), frontend_start.state());

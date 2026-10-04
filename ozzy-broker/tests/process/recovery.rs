@@ -220,7 +220,7 @@ async fn seed(cluster: &Cluster, processes: &mut Processes) -> (Client, bytes::B
     // Several transfer windows leave a physical prefix we can observe before
     // publication. Opaque distinct bodies avoid compressing this into one window.
     let pending = client.queue_large(10, 512).await;
-    let probe = pending[0].2[0].slice(..64);
+    let probe = pending[0].parts[0].slice(..64);
     processes
         .observe(
             "confirm multi-window recovery cohort",

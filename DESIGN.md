@@ -67,6 +67,10 @@ tracked docs. Reserved commands do not imply an implemented public service.
 | `ozzy-sim` | Controlled workloads, protocol schedules, shared real-broker memory/inproc harness and independent SDK record oracle |
 | `ozzy-bench` | Serial workloads, profiling, append-only result ledger, SVG charts |
 
+The simulator's base library depends only on the canonical core and journal.
+Its optional `broker` feature assembles the full product harness and `ozy_sim`
+runner. Product libraries never depend on this harness outside dev dependencies.
+
 ## Integration boundaries
 
 | Mode | Authority | Confirmation |

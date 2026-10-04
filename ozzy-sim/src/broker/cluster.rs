@@ -1,12 +1,13 @@
 //! Production cluster lifecycle and storage faults shared with the simulator.
 use super::{Control, deployment_with_resources, provision, start_image_selected, start_images};
 use crate::client::Client;
-use ozzy_broker::{Broker, CheckedConfig, RecoveryIntent, RecoverySelection};
+use ozzy_broker::{Broker, CheckedConfig, RecoveryIntent, RecoverySelection, ServingContext};
 use ozzy_config::{BrokerIdentity, Confirmation, DeploymentMode};
 use ozzy_io::simulation::Image;
-use ozzy_runtime::replicated::{TopicReader, WriterRuntime};
+use ozzy_runtime::replicated::{SdkClock, TopicReader, WriterRuntime};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use uuid::Uuid;
+mod quorum;
 
 /// Sustained real-broker cluster shared by integration tests and overnight runs.
 #[derive(Debug)]
@@ -22,6 +23,9 @@ pub struct Cluster {
     /// Tasks yielding memory images after physical drain.
     pub images: Vec<tokio::task::JoinHandle<Image>>,
     policy: Confirmation,
+    context: ServingContext,
+    retired_physical_events: u64,
+    stopped: std::collections::BTreeMap<usize, Arc<Control>>,
     /// Number of injected torn-write faults.
     pub faults: usize,
 }
@@ -29,7 +33,20 @@ pub struct Cluster {
 impl Cluster {
     /// Start a bounded four-partition cluster with rolling retention.
     pub async fn new(policy: Confirmation) -> Self {
+        Self::configured(policy, None, |_| {}).await
+    }
+
+    /// Configure the shared deployment and optionally step broker time manually.
+    pub async fn configured(
+        policy: Confirmation,
+        clock: Option<SdkClock>,
+        configure: impl FnOnce(&mut ozzy_config::Deployment),
+    ) -> Self {
         let runtime = WriterRuntime::new().unwrap();
+        let context = clock.map_or_else(
+            || ServingContext::from(runtime.context().clone()),
+            |clock| ServingContext::simulated(runtime.context().clone(), clock, 1_000_000),
+        );
         let root = PathBuf::from(format!("/ozzy-churn-{}", Uuid::now_v7()));
         let resources = ozzy_config::HostResources {
             cpus: std::collections::BTreeMap::from([(0, Some(0))]),
@@ -38,10 +55,11 @@ impl Cluster {
         };
         let deployment = deployment_with_resources(
             &root,
-            if policy == Confirmation::LocalDurable {
-                DeploymentMode::Single
-            } else {
-                DeploymentMode::Three
+            match policy {
+                Confirmation::LocalDurable => DeploymentMode::Single,
+                Confirmation::DiskQuorum | Confirmation::ReplicatedPersisting => {
+                    DeploymentMode::Three
+                }
             },
             policy,
             4,
@@ -51,10 +69,11 @@ impl Cluster {
                     max_age_secs: Some(120),
                     max_bytes: Some(2 * 1024 * 1024),
                 };
+                configure(config);
             },
         );
         let configs = deployment.clone();
-        let (brokers, controls, images) = start_images(&runtime, deployment, true).await;
+        let (brokers, controls, images) = start_images(context.clone(), deployment, true).await;
         Self {
             runtime,
             configs,
@@ -62,13 +81,16 @@ impl Cluster {
             controls,
             images,
             policy,
+            context,
+            retired_physical_events: 0,
+            stopped: std::collections::BTreeMap::new(),
             faults: 0,
         }
     }
 
     /// Restore one stopped broker from its explicitly supplied memory image.
     pub async fn restore(&mut self, index: usize, image: Image) {
-        let (checked, local) = self.configs[index].clone();
+        let (checked, _) = &self.configs[index];
         let selections: Vec<_> = if self.policy == Confirmation::LocalDurable {
             vec![]
         } else {
@@ -91,26 +113,66 @@ impl Cluster {
                 })
                 .collect()
         };
-        let (broker, control, task) =
-            start_image_selected(&self.runtime, checked, local, true, image, &selections).await;
+        self.install(index, image, &selections).await;
+    }
+
+    /// Restore an orderly stopped image through ordinary production startup.
+    /// Exact journal/configuration eligibility checks still apply.
+    pub async fn restore_clean(&mut self, index: usize, image: Image) {
+        self.install(index, image, &[]).await;
+    }
+
+    async fn install(&mut self, index: usize, image: Image, selections: &[RecoverySelection]) {
+        let (checked, local) = self.configs[index].clone();
+        let (broker, control, task) = start_image_selected(
+            self.context.clone(),
+            checked,
+            local,
+            true,
+            image,
+            selections,
+        )
+        .await;
         self.brokers.insert(index, broker);
         self.controls.insert(index, control);
         self.images.insert(index, task);
+        self.stopped.remove(&index);
     }
 
     /// Stop and restore one broker without discarding its dirty image.
     pub async fn restart(&mut self, index: usize) {
-        self.brokers.remove(index).shutdown().await.unwrap();
-        self.controls.remove(index);
-        let image = self.images.remove(index).await.unwrap();
+        let image = self.stop(index).await;
         self.restore(index, image).await;
+    }
+
+    /// Cut one live memory device, discard unobserved physical work, and restore
+    /// its explicit crash image through the production recovery selection.
+    pub async fn crash(&mut self, index: usize, power_loss: bool) {
+        self.controls[index].crash(power_loss);
+        // Device loss can first be observed during journal shutdown. It must
+        // not prevent socket and worker cleanup or reactivate an old source.
+        let _ = self.brokers.remove(index).shutdown().await;
+        let control = self.controls.remove(index);
+        let image = self.images.remove(index).await.unwrap();
+        self.retired_physical_events += control.physical_events();
+        self.stopped.insert(index, control);
+        self.restore(index, image).await;
+    }
+
+    /// Stop one owner and retain its image. Remove higher indexes first when
+    /// stopping several brokers, and restore them in increasing index order.
+    pub async fn stop(&mut self, index: usize) -> Image {
+        self.brokers.remove(index).shutdown().await.unwrap();
+        let control = self.controls.remove(index);
+        let image = self.images.remove(index).await.unwrap();
+        self.retired_physical_events += control.physical_events();
+        self.stopped.insert(index, control);
+        image
     }
 
     /// Replace one store with a newly formatted, nonvoting recovery target.
     pub async fn restart_fresh(&mut self, index: usize) {
-        self.brokers.remove(index).shutdown().await.unwrap();
-        self.controls.remove(index);
-        self.images.remove(index).await.unwrap();
+        self.stop(index).await;
         let (checked, local) = &self.configs[index];
         let image = Box::pin(provision(checked, local, true)).await;
         self.restore(index, image).await;
@@ -166,8 +228,10 @@ impl Cluster {
                 .is_err()
         );
         assert!(failed.shutdown().await.is_err());
-        self.controls.remove(index);
+        let control = self.controls.remove(index);
         let image = self.images.remove(index).await.unwrap();
+        self.retired_physical_events += control.physical_events();
+        self.stopped.insert(index, control);
         live_many(
             &self.brokers,
             "confirm with torn writer fenced",
@@ -236,6 +300,30 @@ impl Cluster {
         for image in self.images {
             image.await.unwrap();
         }
+    }
+
+    /// Physical events across current and previously stopped device owners.
+    pub fn physical_events(&self) -> u64 {
+        self.retired_physical_events
+            + self
+                .controls
+                .iter()
+                .map(|control| control.physical_events())
+                .sum::<u64>()
+    }
+
+    /// Current and stopped physical owners paired with their stable config index.
+    /// Stopped owners retain their final image if an interrupted fault loses progress.
+    pub fn storage_controls(&self) -> Vec<(usize, &Arc<Control>)> {
+        let mut live = self.controls.iter();
+        (0..self.configs.len())
+            .filter_map(|index| {
+                self.stopped
+                    .get(&index)
+                    .or_else(|| live.next())
+                    .map(|control| (index, control))
+            })
+            .collect()
     }
 }
 

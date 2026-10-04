@@ -18,7 +18,7 @@ broker = ["dep:bytes", "dep:clap", "dep:futures", "dep:ozzy-broker", "dep:ozzy-c
 bytes = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
-ozzy-broker = { workspace = true, optional = true }
+ozzy-broker = { workspace = true, features = ["simulation"], optional = true }
 ozzy-config = { workspace = true, optional = true }
 ozzy-io = { workspace = true, features = ["simulation"], optional = true }
 ozzy-proto = { workspace = true, optional = true }
@@ -47,13 +47,13 @@ tokio = { workspace = true, features = ["sync"] }
 workspace = true
 
 [[bin]]
-name = "ozzy-sim"
+name = "ozy_sim"
 path = "src/bin/ozzy_sim.rs"
 required-features = ["broker"]
 
 [[test]]
 name = "ozzy_broker_simulation"
-path = "tests/broker.rs"
+path = "tests/broker/mod.rs"
 required-features = ["broker"]
 
 [[test]]

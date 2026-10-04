@@ -1,6 +1,7 @@
 //! Bounded churn shares the process suite's SDK and independent payload oracle.
 
-use super::{Bytes, Client, MessageId, Pending, RecordInput};
+use super::{Bytes, Client, MessageId, Pending, RecordInput, Submitted};
+use ozzy_runtime::replicated::{RetryPolicy, SharedTopicWriter, SharedTopicWriterConfig};
 
 impl Client {
     pub(super) async fn admit(
@@ -20,9 +21,90 @@ impl Client {
         assert_eq!(admitted.partition(), partition as u32);
         assert_eq!(admitted.sequence(), self.next_sequences[partition]);
         self.next_sequences[partition] += 1;
-        self.submitted
-            .push((partition as u32, admitted.sequence(), id, parts.clone()));
-        (admitted, id, parts)
+        self.submitted.push(Submitted {
+            producer: self.writer.producer(),
+            partition: partition as u32,
+            sequence: admitted.sequence(),
+            id,
+            parts: parts.clone(),
+        });
+        Pending {
+            record: admitted,
+            producer: self.writer.producer(),
+            id,
+            parts,
+        }
+    }
+
+    /// A fresh producer shares every partition with the live producer. Both
+    /// submit before confirmation; receipts establish their global offset order.
+    pub async fn shared_producers(&mut self, wave: usize) -> usize {
+        let mut other = SharedTopicWriter::open(
+            &self.links,
+            "orders",
+            SharedTopicWriterConfig::new(self.links_config.parameters.receive),
+            RetryPolicy::default(),
+        )
+        .await
+        .unwrap();
+        let producer = other.producer();
+        assert_ne!(producer, self.writer.producer());
+        let keys = self.keys.clone();
+        let auxiliary = async {
+            let mut pending = Vec::new();
+            for (partition, key) in keys.iter().enumerate() {
+                for sequence in 0..2 {
+                    let value = (2_u128 << 120)
+                        | ((wave as u128) << 16)
+                        | ((partition as u128) << 8)
+                        | sequence;
+                    let id = MessageId::from_bytes(value.to_be_bytes());
+                    let parts = vec![Bytes::from(format!("shared-{wave}-{partition}-{sequence}"))];
+                    let record = other
+                        .send(RecordInput::multipart(id, parts.clone()), Some(key))
+                        .await
+                        .unwrap();
+                    assert_eq!(record.partition(), partition as u32);
+                    assert_eq!(record.sequence(), sequence as u64);
+                    pending.push(Pending {
+                        record,
+                        producer,
+                        id,
+                        parts,
+                    });
+                }
+            }
+            pending
+        };
+        let (mut pending, auxiliary) = futures::join!(self.queue(wave), auxiliary);
+        for item in &auxiliary {
+            self.submitted.push(Submitted {
+                producer,
+                partition: item.record.partition(),
+                sequence: item.record.sequence(),
+                id: item.id,
+                parts: item.parts.clone(),
+            });
+        }
+        pending.extend(auxiliary);
+        let count = pending.len();
+        self.confirm(pending).await;
+        other.close().await.unwrap();
+        count
+    }
+
+    pub(super) async fn assert_old_producer_fenced(&mut self) {
+        for key in &self.keys {
+            let record = RecordInput::single(
+                MessageId::from_bytes([254; 16]),
+                Bytes::from_static(b"superseded producer must be fenced"),
+            );
+            let pending = self.writer.send(record, Some(key)).await.unwrap();
+            assert!(
+                pending.confirmed().await.is_err(),
+                "superseded epoch confirmed a record"
+            );
+        }
     }
 
     /// Vary sparse, burst, hot-partition, mixed-size and multipart traffic.

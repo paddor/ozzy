@@ -4,7 +4,7 @@
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'package(ozzy-broker) & (test(journals::serving::) | test(journals::actors::frontend::) | test(process::))'
+filter = '(package(ozzy-broker) & (test(journals::serving::) | test(journals::actors::frontend::) | test(process::))) | (package(ozzy-sim) & binary(ozzy_broker_simulation))'
 test-group = 'broker-lifecycle'
 threads-required = 8
 

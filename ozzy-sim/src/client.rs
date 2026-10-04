@@ -3,7 +3,8 @@
 use bytes::Bytes;
 use ozzy_broker::CheckedConfig;
 use ozzy_proto::{
-    EnvelopeLimits, MessageId, NodeId, Offset, append::Policy, data::DataLimits, handshake,
+    EnvelopeLimits, MessageId, NodeId, Offset, ProducerId, append::Policy, data::DataLimits,
+    handshake,
 };
 use ozzy_runtime::replicated::{
     AppendLinkLimits, BrokerAddress, BrokerLinks, BrokerLinksConfig, ReaderLinkLimits, RecordInput,
@@ -12,24 +13,42 @@ use ozzy_runtime::replicated::{
 };
 use std::time::Duration;
 
+mod consumers;
 mod workload;
 
 /// Production SDK client with an independent bounded record and offset oracle.
 pub struct Client {
     /// Shared authenticated SDK links for controlled disconnect and reconnect schedules.
     pub links: BrokerLinks,
+    runtime: WriterRuntime,
     writer: SharedTopicWriter,
     links_config: BrokerLinksConfig,
     keys: Vec<[u8; 4]>,
     history: Vec<Vec<(MessageId, Vec<Bytes>)>>,
     bases: Vec<usize>,
     next_sequences: Vec<u64>,
-    submitted: Vec<(u32, u64, MessageId, Vec<Bytes>)>,
+    submitted: Vec<Submitted>,
     policy: Policy,
 }
 
 /// Admitted observation paired with independently retained record evidence.
-pub type Pending = (SharedTopicPendingRecord, MessageId, Vec<Bytes>);
+#[derive(Debug)]
+pub struct Pending {
+    /// Independent confirmation observation; dropping its future cannot retract admission.
+    pub record: SharedTopicPendingRecord,
+    producer: ProducerId,
+    id: MessageId,
+    /// Independently submitted payload parts for later consumer comparison.
+    pub parts: Vec<Bytes>,
+}
+
+struct Submitted {
+    producer: ProducerId,
+    partition: u32,
+    sequence: u64,
+    id: MessageId,
+    parts: Vec<Bytes>,
+}
 
 impl Client {
     /// Open producer and consumer access on a new real SDK runtime.
@@ -40,6 +59,15 @@ impl Client {
 
     /// Open access using the same OMQ context as the memory brokers.
     pub async fn open_with_runtime(checked: &CheckedConfig, runtime: &WriterRuntime) -> Self {
+        Self::open_with_clock(checked, runtime, SdkClock::default()).await
+    }
+
+    /// Share independently stepped protocol time with the memory brokers.
+    pub async fn open_with_clock(
+        checked: &CheckedConfig,
+        runtime: &WriterRuntime,
+        clock: SdkClock,
+    ) -> Self {
         let topic = &checked.deployment.deployment().topics["orders"];
         let partitions = topic.partitions as usize;
         let policy = match topic.confirmation {
@@ -98,7 +126,7 @@ impl Client {
             }),
             request_timeout: Duration::from_secs(5),
             retry_interval: Duration::from_millis(10),
-            clock: SdkClock::default(),
+            clock,
         };
         let links = BrokerLinks::connect(runtime, links_config.clone())
             .await
@@ -121,6 +149,7 @@ impl Client {
             .collect();
         Self {
             links,
+            runtime: runtime.clone(),
             links_config,
             writer,
             keys,
@@ -138,16 +167,12 @@ impl Client {
     }
 
     /// Resume or take over the saved identity, preserving oracle history.
-    pub async fn reopen_producer(self, takeover: bool) -> Self {
+    pub async fn reopen_producer(mut self, takeover: bool) -> Self {
         let trace = std::env::var("OZZY_SOAK_TRACE").is_ok_and(|value| value == "1");
         if trace {
             println!("producer close started, takeover={takeover}");
         }
         let identity = self.writer.identity();
-        self.writer.close().await.unwrap();
-        if trace {
-            println!("producer close finished, attachment started");
-        }
         let limits = DataLimits {
             envelope: EnvelopeLimits {
                 max_metadata_bytes: 16 * 1024,
@@ -159,7 +184,7 @@ impl Client {
         };
         let config = SharedTopicWriterConfig::new(limits);
         let writer = if takeover {
-            SharedTopicWriter::takeover(
+            let writer = SharedTopicWriter::takeover(
                 &self.links,
                 "orders",
                 identity,
@@ -167,7 +192,12 @@ impl Client {
                 RetryPolicy::default(),
             )
             .await
+            .unwrap();
+            self.assert_old_producer_fenced().await;
+            drop(self.writer);
+            writer
         } else {
+            self.writer.close().await.unwrap();
             SharedTopicWriter::resume(
                 &self.links,
                 "orders",
@@ -176,8 +206,8 @@ impl Client {
                 RetryPolicy::default(),
             )
             .await
-        }
-        .unwrap();
+            .unwrap()
+        };
         if trace {
             println!("producer attachment finished");
         }
@@ -190,6 +220,7 @@ impl Client {
             },
             writer,
             links: self.links,
+            runtime: self.runtime,
             links_config: self.links_config,
             keys: self.keys,
             history: self.history,
@@ -211,6 +242,7 @@ impl Client {
         self.links = BrokerLinks::connect(runtime, self.links_config.clone())
             .await
             .unwrap();
+        self.runtime = runtime.clone();
         self.writer = SharedTopicWriter::resume(
             &self.links,
             "orders",
@@ -268,22 +300,32 @@ impl Client {
 
     /// Verify confirmation identity, policy and offset before retaining evidence.
     pub async fn confirm(&mut self, pending: Vec<Pending>) {
-        for (pending, id, body) in pending {
-            let receipt = self.confirm_record(&pending).await;
+        let mut confirmed = Vec::with_capacity(pending.len());
+        for pending in pending {
+            let receipt = self.confirm_record(&pending.record).await;
             assert_eq!(receipt.record.policy, self.policy);
-            assert_eq!(receipt.partition, pending.partition());
-            assert_eq!(receipt.record.message_id, id);
-            assert_eq!(receipt.record.key.producer_id, self.writer.producer());
-            assert_eq!(receipt.record.key.first_sequence, pending.sequence());
-            let history = &mut self.history[receipt.partition as usize];
-            assert_eq!(
-                receipt.record.offset,
-                (self.bases[receipt.partition as usize] + history.len()) as u64
-            );
-            history.push((id, body));
-            self.submitted.retain(|(partition, sequence, _, _)| {
-                *partition != receipt.partition || *sequence != pending.sequence()
+            assert_eq!(receipt.topic, pending.record.topic());
+            assert_eq!(receipt.partition, pending.record.partition());
+            assert_eq!(receipt.record.message_id, pending.id);
+            assert_eq!(receipt.record.key.producer_id, pending.producer);
+            assert_eq!(receipt.record.key.first_sequence, pending.record.sequence());
+            self.submitted.retain(|submitted| {
+                submitted.producer != pending.producer
+                    || submitted.partition != receipt.partition
+                    || submitted.sequence != pending.record.sequence()
             });
+            confirmed.push((receipt.partition, receipt.record.offset, pending));
+        }
+        // Independent producers can confirm in a different order from admission.
+        // The broker assigns one dense offset order for their shared partition.
+        confirmed.sort_unstable_by_key(|(partition, offset, _)| (*partition, *offset));
+        for (partition, offset, pending) in confirmed {
+            let history = &mut self.history[partition as usize];
+            assert_eq!(
+                offset,
+                (self.bases[partition as usize] + history.len()) as u64
+            );
+            history.push((pending.id, pending.parts));
         }
     }
 
@@ -405,18 +447,26 @@ impl Client {
             .sum::<usize>();
         for _ in 0..wanted {
             let record = reader.next().await.unwrap();
-            let partition = record.partition as usize;
-            let next = positions[partition];
-            assert_eq!(record.offset, Offset::new(next as u64));
-            let (id, body) = &self.history[partition][next - self.bases[partition]];
-            assert_eq!(&record.message_id, id);
-            assert_eq!(record.payload.as_slice(), body.as_slice());
-            positions[partition] += 1;
+            self.verify_record(&record, &mut positions);
         }
         assert_eq!(positions, self.positions());
         for (number, next) in reader.checkpoint().positions {
             assert_eq!(next.get(), positions[number as usize] as u64);
         }
+    }
+
+    fn verify_record(
+        &self,
+        record: &ozzy_runtime::replicated::TopicRecord,
+        positions: &mut [usize],
+    ) {
+        let partition = record.partition as usize;
+        let next = positions[partition];
+        assert_eq!(record.offset, Offset::new(next as u64));
+        let (id, body) = &self.history[partition][next - self.bases[partition]];
+        assert_eq!(&record.message_id, id);
+        assert_eq!(record.payload.as_slice(), body.as_slice());
+        positions[partition] += 1;
     }
 
     /// Close producer admission and join the real SDK links.
@@ -453,8 +503,10 @@ impl Client {
             "bases": self.bases, "next_sequences": self.next_sequences,
             "confirmed": self.history.iter().map(|history| history.iter()
                 .map(|(id, parts)| records(id, parts)).collect::<Vec<_>>()).collect::<Vec<_>>(),
-            "submitted": self.submitted.iter().map(|(partition, sequence, id, parts)|
-                serde_json::json!({"partition":partition,"sequence":sequence,"record":records(id, parts)})).collect::<Vec<_>>()
+            "submitted": self.submitted.iter().map(|submitted|
+                serde_json::json!({"producer":submitted.producer.as_bytes(),
+                    "partition":submitted.partition,"sequence":submitted.sequence,
+                    "record":records(&submitted.id, &submitted.parts)})).collect::<Vec<_>>()
         })
     }
 }

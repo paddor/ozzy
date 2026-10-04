@@ -8,6 +8,8 @@ Benchmarks measure performance after correctness checks.
 
 `scripts/test.sh` selects a subsystem; extra arguments select tests. Nextest uses
 eight threads except for Loom. Expensive/process-global cases run separately.
+The shared full-product simulator target joins the broker lifecycle isolation
+group; its real owner and transport threads do not run beside other test cohorts.
 
 | Scope | Coverage |
 | --- | --- |
@@ -213,7 +215,7 @@ exhaustion leaves the correlated request available for retry. The small TCP
 suite resumes and takes over saved producer identities after SIGKILL in DQ/RP.
 An unclean RP copy uses explicit nonvoting recovery before another voter stops.
 
-### Three-host crash soak
+### Cross-host crash soak
 
 The ignored `process::soak::three_host_crash_soak` case uses si-dev, wu-dev and
 er-dev. Provision fresh isolated directories with the same broker binary,
@@ -231,6 +233,13 @@ requiring a full hour of clean churn for each real-I/O placement and policy.
 `si-dev,si-dev,si-dev` for three processes on one host, with distinct directories
 and configured endpoints. Repeated hosts use separate broker cores 0, 1 and 2;
 the SDK remains on cores 4-5.
+
+The ignored `process::soak::cross_host_single_crash_soak` case shares this workload
+for single durable. Provision one `si-dev` broker, set one host and directory,
+and run the SDK controller on another host. Set `OZZY_SOAK_IDENTITY` to the
+controller's copy of `shared.identity` when the first broker's directory is
+remote. The default identity path remains the first broker directory. The one
+broker restarts before awaiting SDK progress; single durable has no failover.
 
 The test admits individual records, checks every confirmed offset, ID and
 payload, then releases the verified oracle entries. It resumes or takes over
@@ -275,12 +284,31 @@ broker simulation subtree, including resume, retention, and churn, plus that
 simulator gate. `scripts/test.sh simulation` also includes the smaller protocol
 models. Those models provide controlled protocol schedules; full product runs
 provide owner, transport, admission, and storage lifecycle coverage.
-The `ozzy-sim` binary runs a sustained seeded cluster with independent execution
-and completion holds, producer resume/takeover, consumer checkpoint reopen,
+The shared harness accepts `ServingContext::simulated` with the existing manual
+SDK clock. Broker protocol deadlines and append timestamps follow that clock;
+storage execution and completion delivery remain independently held. Ordinary
+serving uses elapsed and Unix time. A full-stack case advances time through an
+age-retention deadline and checks timestamp seeks in each confirmation mode.
+The `ozzy-sim` binary accepts separate virtual-duration and wall-clock generation
+limits, bounded admission/retention settings, and a weighted fault mix. It runs
+a sustained seeded cluster with independent execution
+and completion holds, concurrent producers sharing partition offsets,
+producer resume and takeover with a live old producer, consumer checkpoint reopen,
 new SDK physical connections, rolling retention, broker restart and short-write
-recovery. Each wave releases verified oracle payloads. The fault schedule streams
-to disk, while only 128 recent workload events and 4096 physical events per
-device remain resident. Failure artifacts include independently submitted and
+recovery. Paused consumers have independent SDK owners, exercise PEER repair,
+and retain payload aliases across close. Quorum-loss schedules stop two copies,
+require unconfirmed admissions, cancel observations and restore exact clean images.
+Retention-lag schedules verify foreground cohorts, advance past an old saved
+checkpoint, and require its reopen to return an explicit retained-floor gap.
+Live device cuts discard unobserved physical completions. Process cuts retain
+dirty bytes; modeled power cuts restore only durable bytes and namespace effects.
+All three modes exercise cuts with held completions and retry the same records
+through production restart and recovery. This file-model evidence does not
+establish kernel or hardware power-loss safety.
+The runner can sustain one cluster or start successive fresh seeded scenarios.
+Each wave releases verified oracle payloads. The fault schedule streams
+to disk with clock observations, while only 128 recent workload events and
+4096 physical events per device remain resident. Failure artifacts include independently submitted and
 confirmed records, configuration, dirty/durable memory images and recent physical
 order. A stopped storage pump retains its final image for failure inspection.
 `--replay` and `--waves` reproduce a recorded fault prefix from fresh state.

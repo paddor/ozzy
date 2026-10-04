@@ -142,13 +142,22 @@ fn resume_discards_old_unadmitted_frames_before_capturing_next_sequence() {
 fn full_proposal_queue_keeps_request_for_shard_retry() {
     let (mut controller, io) = setup();
     let mut actor = actor(&mut controller, io, 1);
-    let mut intake = intake_access(
+    let memory = crate::memory::Domain::new(None, 1024)
+        .unwrap()
+        .owner(crate::memory::Limits {
+            bytes: 1024,
+            buffers: 16,
+            cache_bytes: 0,
+        })
+        .unwrap();
+    let mut intake = intake_access_reserved(
         &mut actor,
         NativeAccess::TrustedClients {
             clients: 1,
             writers: 5,
         },
         partition(),
+        Some((&memory, &memory)),
     );
     let link = link(70, 80);
     let hint = actor.authority_hint();
@@ -165,10 +174,13 @@ fn full_proposal_queue_keeps_request_for_shard_retry() {
         );
     }
     let held = request(link, hint.authority, 44, 44, partition());
+    let admitted_bytes = memory.allocated_bytes();
     assert_eq!(
         intake.receive(&held, link, hint).unwrap(),
         NativeReceive::Busy
     );
+    memory.trim_cache();
+    assert_eq!(memory.allocated_bytes(), admitted_bytes);
     let mut output = Vec::new();
     settle(&mut controller, &mut actor, &mut intake, &mut output);
     assert_eq!(output.len(), 4);

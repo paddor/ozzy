@@ -6,7 +6,7 @@ use ozzy_runtime::replicated::{
     RetryPolicy, SdkClock, SharedTopicWriter, SharedTopicWriterConfig, TopicReader,
     TopicReaderConfig, WriterRuntime,
 };
-use std::time::Duration;
+use std::{task::Poll, time::Duration};
 
 mod failover;
 mod large;
@@ -424,14 +424,18 @@ async fn read_topic(
     .await
     .unwrap();
     let mut canceled = Box::pin(reader.next());
-    assert!(futures::poll!(canceled.as_mut()).is_pending());
+    let mut first = match futures::poll!(canceled.as_mut()) {
+        Poll::Pending => None,
+        Poll::Ready(record) => Some(record.unwrap()),
+    };
     drop(canceled);
+    let first_partition = first.as_ref().map(|record| record.partition);
     assert!(
         reader
             .checkpoint()
             .positions
             .iter()
-            .all(|&(_, next)| next.get() == 0)
+            .all(|&(partition, next)| next.get() == u64::from(first_partition == Some(partition)))
     );
     let mut offsets = vec![0; expected.len()];
     let total = expected.iter().map(Vec::len).sum::<usize>();
@@ -458,13 +462,17 @@ async fn read_topic(
             .await
             .unwrap();
         }
-        let record = live_many(
-            brokers,
-            &format!("read confirmed record {index}, offsets {offsets:?}"),
-            reader.next(),
-        )
-        .await
-        .unwrap();
+        let record = if let Some(record) = first.take() {
+            record
+        } else {
+            live_many(
+                brokers,
+                &format!("read confirmed record {index}, offsets {offsets:?}"),
+                reader.next(),
+            )
+            .await
+            .unwrap()
+        };
         let partition = record.partition as usize;
         let offset = offsets[partition];
         assert_eq!(record.offset.get(), offset as u64);

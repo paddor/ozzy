@@ -335,7 +335,7 @@ async fn scenario(fixture: Fixture) {
     broker.exited(true).await;
     let pending = client.queue(1).await;
     {
-        let mut canceled = pin!(pending[0].0.confirmed());
+        let mut canceled = pin!(pending[0].record.confirmed());
         assert!(futures::poll!(canceled.as_mut()).is_pending());
     }
     broker = fixture.start(1);

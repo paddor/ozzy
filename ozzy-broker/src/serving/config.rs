@@ -20,6 +20,7 @@ pub(crate) const NATIVE_ARENAS: usize = WRITERS * (WRITER_WINDOW + 1) + CLIENTS;
 type Handoffs = Vec<(u32, tokio::sync::oneshot::Sender<super::Binding>)>;
 
 pub(super) struct Config {
+    pub time: super::context::Time,
     pub omq: omq_tokio::Context,
     pub local: NodeId,
     pub limits: DataLimits,
@@ -64,8 +65,9 @@ impl Config {
 
     pub(super) fn new(
         checked: &CheckedConfig,
-        omq: omq_tokio::Context,
+        context: super::ServingContext,
     ) -> Result<Self, StartupError> {
+        let super::ServingContext { omq, time } = context;
         let deployment = checked.deployment.deployment();
         let local = NodeId::from_bytes(*checked.identity.brokers[&checked.plan.name].as_bytes());
         let limits = native_limits(checked)?;
@@ -148,6 +150,7 @@ impl Config {
         }
         let catalog = catalog(checked)?;
         Ok(Self {
+            time,
             omq,
             local,
             limits,

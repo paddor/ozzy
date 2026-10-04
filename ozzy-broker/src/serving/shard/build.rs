@@ -2,7 +2,7 @@ use super::{
     ActorIds, Arc, BTreeMap, Bootstrap, CLIENTS, Config, DataReceiver, GroupId, JournalConfig,
     JournalGeneration, JournalPlan, NativeAccess, NativeIntake, NativeIntakeConfig, Outbound,
     PartitionActors, Policy, ShardContext, StartupError, State, WRITER_WINDOW, WRITERS, failure,
-    frontend, timestamp,
+    frontend,
 };
 
 pub(super) async fn build(
@@ -29,7 +29,7 @@ pub(super) async fn build(
                 recoveries.insert(group, plan.clone());
             }
             if let Some(&intent) = journals.recovery.get(&group) {
-                let mut actor = open_recovery(shard, plan, intent).await?;
+                let mut actor = open_recovery(shard, plan, intent, &config).await?;
                 if let Err(error) = actor.bind_receive_owner(&shard.memory.replica) {
                     actors.push(actor);
                     return Err(failure(error));
@@ -39,7 +39,7 @@ pub(super) async fn build(
                 actors.push(actor);
                 continue;
             }
-            let mut started = Box::pin(open_actor(shard, plan)).await?;
+            let mut started = Box::pin(open_actor(shard, plan, &config)).await?;
             let initialized = (|| {
                 started
                     .actor
@@ -167,16 +167,18 @@ fn profile(config: &JournalConfig) -> (Policy, usize, GroupId) {
 async fn open_actor(
     shard: &ShardContext,
     plan: &crate::PartitionJournal,
+    config: &Config,
 ) -> Result<crate::StartedPartition, StartupError> {
     let opened = tokio::select! {
         () = shard.shutdown.requested() => return Err(failure("partition startup stopped")),
         opened = plan.clone().open(shard.io.clone(), JournalGeneration(uuid::Uuid::now_v7().as_u128())) => opened?,
     };
+    let time = config.time.clone();
     opened.into_actor(
         &shard.memory.data,
         &BTreeMap::new(),
         ActorIds::random(),
-        timestamp,
+        move || time.timestamp(),
     )
 }
 
@@ -184,6 +186,7 @@ async fn open_recovery(
     shard: &ShardContext,
     plan: &crate::PartitionJournal,
     intent: crate::RecoveryIntent,
+    config: &Config,
 ) -> Result<ozzy_runtime::replica_actor::PartitionActor, StartupError> {
     let generations = ozzy_runtime::replica_journal::OwnedRecoveryGenerations {
         attempt: JournalGeneration(uuid::Uuid::now_v7().as_u128()),
@@ -193,11 +196,12 @@ async fn open_recovery(
         () = shard.shutdown.requested() => return Err(failure("partition recovery startup stopped")),
         opened = plan.clone().recover(shard.io.clone(), generations, intent) => opened?,
     };
+    let time = config.time.clone();
     opened.into_actor(
         &shard.memory.data,
         &BTreeMap::new(),
         ActorIds::random(),
-        timestamp,
+        move || time.timestamp(),
     )
 }
 

@@ -101,7 +101,7 @@ async fn lagging_follower_recovers_retained_checkpoint_then_supplies_the_require
         let producer = role_links(&runtime, &deployment[0].0, handshake::PRODUCER).await;
         let consumer = role_links(&runtime, &deployment[0].0, handshake::CONSUMER).await;
         let (mut brokers, mut controls, mut images) =
-            start_images(&runtime, deployment, true).await;
+            start_images(runtime.context().clone(), deployment, true).await;
         let mut writer = live_many(
             &brokers,
             "open retained recovery writer",
@@ -131,8 +131,14 @@ async fn lagging_follower_recovers_retained_checkpoint_then_supplies_the_require
         assert!(selected(&old_image, &directory).checkpoint.is_none());
         for round in 0..2 {
             let (checked, local) = restart.clone();
-            let (restarted, control, task) =
-                start_image(&runtime, checked, local, true, old_image.clone()).await;
+            let (restarted, control, task) = start_image(
+                runtime.context().clone(),
+                checked,
+                local,
+                true,
+                old_image.clone(),
+            )
+            .await;
             brokers.push(restarted);
             controls.push(control);
             images.push(task);
@@ -190,6 +196,7 @@ async fn replicated_persisting_cluster_restart_with_an_ancient_replica_preserves
 
 async fn restart_with_ancient_replica(policy: Confirmation) {
     let runtime = WriterRuntime::new().unwrap();
+    let context = runtime.context().clone();
     let root = PathBuf::from(format!("/ozzy-ancient-restart-{}", Uuid::now_v7()));
     let deployment = deployment_with(&root, DeploymentMode::Three, policy, 1, |config| {
         config.topics.get_mut("orders").unwrap().retention = TopicRetention {
@@ -199,7 +206,8 @@ async fn restart_with_ancient_replica(policy: Confirmation) {
     });
     let restart = deployment.clone();
     let producer = role_links(&runtime, &deployment[0].0, handshake::PRODUCER).await;
-    let (mut brokers, mut controls, mut images) = start_images(&runtime, deployment, true).await;
+    let (mut brokers, mut controls, mut images) =
+        start_images(context.clone(), deployment, true).await;
     let config = SharedTopicWriterConfig::new(limits());
     let mut writer = live_many(
         &brokers,
@@ -227,25 +235,7 @@ async fn restart_with_ancient_replica(policy: Confirmation) {
         stopped.push(image.await.unwrap());
     }
     stopped.insert(0, ancient);
-    let ancient_directory = &restart[0].0.plan.partitions[0].directory;
-    let (evidence, offset) = if policy == Confirmation::DiskQuorum {
-        ("DURABLE", 72)
-    } else {
-        ("MEMORY_VOTING", 88)
-    };
-    let ancient_tail = u64::from_be_bytes(
-        stopped[0]
-            .bytes(&ancient_directory.join(evidence), false)
-            .unwrap()[offset..offset + 8]
-            .try_into()
-            .unwrap(),
-    );
-    assert!(ancient_tail > 0);
-    for (image, (checked, _)) in stopped[1..].iter().zip(&restart[1..]) {
-        let manifest = selected(image, &checked.plan.partitions[0].directory);
-        assert!(manifest.checkpoint.is_some());
-        assert!(manifest.segments[0].first_chain.next_op_number() > ancient_tail + 1);
-    }
+    assert_ancient_history_retired(&stopped, &restart, policy);
     let mut brokers = Vec::new();
     let mut controls = Vec::new();
     let mut images = Vec::new();
@@ -258,7 +248,8 @@ async fn restart_with_ancient_replica(policy: Confirmation) {
     // candidate's quorum. Healthy history must remain eligible throughout.
     for index in [0, 2, 1] {
         let ((checked, local), image) = stopped[index].take().unwrap();
-        let (broker, control, image) = start_image(&runtime, checked, local, true, image).await;
+        let (broker, control, image) =
+            start_image(context.clone(), checked, local, true, image).await;
         brokers.push(broker);
         controls.push(control);
         images.push(image);
@@ -306,7 +297,8 @@ async fn retained_history_survives_complete_cluster_restart_and_producer_resume(
         let restart = deployment.clone();
         let producer = role_links(&runtime, &deployment[0].0, handshake::PRODUCER).await;
         let consumer = role_links(&runtime, &deployment[0].0, handshake::CONSUMER).await;
-        let (brokers, controls, images) = start_images(&runtime, deployment, true).await;
+        let (brokers, controls, images) =
+            start_images(runtime.context().clone(), deployment, true).await;
         let config = SharedTopicWriterConfig::new(limits());
         let mut writer = live_many(
             &brokers,
@@ -355,7 +347,8 @@ async fn retained_history_survives_complete_cluster_restart_and_producer_resume(
         let mut restarted_images = Vec::new();
         for ((checked, local), image) in restart.into_iter().zip(images) {
             let image = image.await.unwrap();
-            let (broker, _, image) = start_image(&runtime, checked, local, true, image).await;
+            let (broker, _, image) =
+                start_image(runtime.context().clone(), checked, local, true, image).await;
             restarted.push(broker);
             restarted_images.push(image);
         }
@@ -539,4 +532,30 @@ fn assert_recovered_leader(
         Some(recovered_node),
         "payload reads must come from the recovered replica"
     );
+}
+
+fn assert_ancient_history_retired(
+    stopped: &[Image],
+    restart: &[(CheckedConfig, BrokerIdentity)],
+    policy: Confirmation,
+) {
+    let ancient_directory = &restart[0].0.plan.partitions[0].directory;
+    let (evidence, offset) = if policy == Confirmation::DiskQuorum {
+        ("DURABLE", 72)
+    } else {
+        ("MEMORY_VOTING", 88)
+    };
+    let ancient_tail = u64::from_be_bytes(
+        stopped[0]
+            .bytes(&ancient_directory.join(evidence), false)
+            .unwrap()[offset..offset + 8]
+            .try_into()
+            .unwrap(),
+    );
+    assert!(ancient_tail > 0);
+    for (image, (checked, _)) in stopped[1..].iter().zip(&restart[1..]) {
+        let manifest = selected(image, &checked.plan.partitions[0].directory);
+        assert!(manifest.checkpoint.is_some());
+        assert!(manifest.segments[0].first_chain.next_op_number() > ancient_tail + 1);
+    }
 }

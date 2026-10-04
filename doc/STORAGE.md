@@ -524,6 +524,9 @@ within the budget; preexisting sealed history remains cold until later rolls.
   Missing/stale indexes rebuild from exact protected sources. A cold lookup may
   search several segments. Blocking inspection APIs may build indexes
   synchronously; the shard path below uses backend futures.
+- Producer retries reuse the active, predecessor, and bounded cached offset
+  selectors before building a journal snapshot. They still read and verify the
+  selected operation bytes against the exact segment source.
 - Native subscriptions resolve earliest/latest, offsets, broker append time, or
   record ID. A sparse timestamp is stored at each APPEND head. ID lookup searches
   every retained segment; duplicates require an explicit selection policy.

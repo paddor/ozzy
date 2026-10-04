@@ -70,22 +70,27 @@ impl Fleet {
             .split(',')
             .map(PathBuf::from)
             .collect();
-        assert_eq!(directories.len(), 3);
         let config = PathBuf::from(std::env::var("OZZY_SOAK_CONFIG").unwrap());
-        let checked = checked(&config, &directories[0].join("shared.identity"), NAMES[0]);
-        assert_ne!(
-            checked.deployment.deployment().topics["orders"].confirmation,
-            ozzy_config::Confirmation::LocalDurable
-        );
+        let identity = std::env::var_os("OZZY_SOAK_IDENTITY")
+            .map_or_else(|| directories[0].join("shared.identity"), PathBuf::from);
+        let checked = checked(&config, &identity, NAMES[0]);
+        let count = if checked.deployment.deployment().topics["orders"].confirmation
+            == ozzy_config::Confirmation::LocalDurable
+        {
+            1
+        } else {
+            3
+        };
+        assert_eq!(directories.len(), count);
         let logs = PathBuf::from(std::env::var("OZZY_SOAK_LOGS").unwrap());
         fs::create_dir_all(&logs).unwrap();
         let hosts: Vec<_> = std::env::var("OZZY_SOAK_HOSTS")
-            .unwrap_or_else(|_| NAMES.join(","))
+            .unwrap_or_else(|_| NAMES[..count].join(","))
             .split(',')
             .map(str::to_owned)
             .collect();
-        assert_eq!(hosts.len(), 3);
-        let cpus: Vec<_> = (0..3)
+        assert_eq!(hosts.len(), count);
+        let cpus: Vec<_> = (0..count)
             .map(|index| {
                 hosts[..index]
                     .iter()
@@ -106,7 +111,7 @@ impl Fleet {
             stopped: None,
             memory,
         };
-        for index in 0..3 {
+        for index in 0..count {
             fleet
                 .brokers
                 .push(Some(fleet.start_one(index, false).await));
@@ -148,7 +153,13 @@ impl Fleet {
                 self.hosts[index],
                 elapsed.as_secs()
             );
-            self.stopped = Some((index, elapsed + Duration::from_secs(10), unclean));
+            if policy == ozzy_config::Confirmation::LocalDurable {
+                // No alternate copy exists. Resume the one broker before
+                // awaiting SDK progress; its durable store is authoritative.
+                self.brokers[index] = Some(self.start_one(index, false).await);
+            } else {
+                self.stopped = Some((index, elapsed + Duration::from_secs(10), unclean));
+            }
             self.next_kill = elapsed + Duration::from_secs(90);
         }
     }

@@ -3,6 +3,9 @@ use ozzy_config::{Confirmation, DeploymentMode, HostResources};
 use ozzy_runtime::replicated::WriterRuntime;
 use ozzy_sim::{broker, client::Client};
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+mod clock;
+mod crash;
+mod runner;
 
 #[tokio::test(flavor = "current_thread")]
 async fn inproc_memory_all_modes_share_the_real_broker_and_sdk_harness() {
@@ -37,6 +40,15 @@ async fn inproc_memory_all_modes_share_the_real_broker_and_sdk_harness() {
                 client.confirm(pending).await;
                 client.read(&mut reader, positions).await;
             }
+            let positions = client.positions();
+            assert_eq!(client.shared_producers(6).await, 12);
+            client.read(&mut reader, positions).await;
+            client = client.reopen_producer(true).await;
+            client = client.reopen_producer(false).await;
+            let positions = client.positions();
+            let pending = client.queue(7).await;
+            client.confirm(pending).await;
+            client.read(&mut reader, positions).await;
             client.replay().await;
             reader.close().await.unwrap();
             client.close().await;
@@ -148,6 +160,9 @@ async fn inproc_memory_failure_artifact_preserves_images_and_replays_its_fault_p
         progress_timeout: Duration::from_secs(10),
         artifacts,
         replay: Some(replay),
+        time: ozzy_sim::soak::Time::default(),
+        resources: ozzy_sim::soak::Resources::default(),
+        actions: ozzy_sim::soak::default_actions(),
     };
     let first = root.path().join("first");
     let error = ozzy_sim::soak::run(&config(first.clone(), prefix))
