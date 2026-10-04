@@ -221,15 +221,20 @@ fn serving_service(
 
 #[tokio::test]
 async fn serving_rejects_bad_input_and_fences_disconnected_client_sessions() {
-    serving_lifecycle(false).await;
+    serving_lifecycle(false, false).await;
 }
 
 #[tokio::test]
 async fn serving_fences_dynamically_admitted_client_disconnects() {
-    serving_lifecycle(true).await;
+    serving_lifecycle(true, false).await;
 }
 
-async fn serving_lifecycle(trusted: bool) {
+#[tokio::test]
+async fn serving_reclaims_one_client_slot_across_forty_inproc_identities() {
+    serving_lifecycle(true, true).await;
+}
+
+async fn serving_lifecycle(trusted: bool, distinct: bool) {
     use ozzy_runtime::frontend::{ReceiveBuffers, ReceiveStorage};
     tokio::time::timeout(Duration::from_secs(10), async {
         let omq = Context::new();
@@ -265,10 +270,13 @@ async fn serving_lifecycle(trusted: bool) {
         .await
         .unwrap();
         let links = report.await.unwrap();
-        let remote = NodeId::from_bytes([1; 16]);
-        let sessions = source(1, handshake::PRODUCER);
+        let repeated = source(1, handshake::PRODUCER);
         let mut previous = None;
-        for _ in 0..2 {
+        for wave in 0..if distinct { 40 } else { 2 } {
+            let id = if distinct { wave + 32 } else { 1 };
+            let remote = NodeId::from_bytes([id; 16]);
+            let fresh = source(id, handshake::PRODUCER);
+            let sessions = if distinct { &fresh } else { &repeated };
             let socket = omq.socket(
                 SocketType::Peer,
                 omq_tokio::Options::default()
@@ -291,10 +299,20 @@ async fn serving_lifecycle(trusted: bool) {
                 ))
                 .await
                 .unwrap();
-            let current = negotiate(&socket, &sessions).await;
+            let hello = sessions.start(local()).unwrap();
+            let current = negotiate(&socket, sessions).await;
             assert_ne!(Some(current), previous);
             assert_eq!(links.get(remote).unwrap().binding.session, current);
             previous = Some(current);
+            // Leave an already accepted HELLO retry queued while this identity
+            // closes. Reclamation must not let it occupy the one slot again.
+            socket
+                .send(Message::with_prefix(
+                    Bytes::copy_from_slice(local().as_bytes()),
+                    Message::multipart(hello),
+                ))
+                .await
+                .unwrap();
             socket.close().await.unwrap();
             loop {
                 let generation = links.generation();

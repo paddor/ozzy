@@ -306,11 +306,13 @@ drops the attempt. Paused-source retries allow at most 16 receive attempts or
 sources reschedule; only a full destination waits for capacity.
 
 Queue dequeue returns slots; final payload release returns retained bytes.
-Dynamic SDK metadata slots bound concurrent retained clients. An exact current
-control disconnect reclaims the slot only after transport generation fencing;
-late disconnects cannot remove a replacement connection or session. The receive
-owner rechecks each receipt's OMQ source immediately before admission, including
-HELLO, so deleting disconnected client tombstones cannot revive queued old input.
+Dynamic SDK metadata slots bound concurrent retained clients. The receive owner
+processes bounded lifecycle events before dequeuing native input, then admits
+each received body synchronously before observing another lifecycle change.
+An exact current control disconnect can then reclaim the slot; late disconnects
+cannot remove a replacement connection or session. OMQ fences queued generations
+and restoration to retired sources. Ozzy does not query connection liveness to
+admit a received body. This ordering also covers HELLO after client-slot reuse.
 Producer retry identity remains in the broker-owned partition journal.
 
 Producer, follower, and control memory budgets span all partitions on a shard;

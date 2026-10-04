@@ -56,6 +56,15 @@ impl<'a> Ingress<'a> {
         self.connections.observe(event, service, followers)
     }
 
+    pub(super) fn prepare(
+        &mut self,
+        service: &mut Service,
+        followers: &FollowerRoutes,
+    ) -> Result<bool, StartupError> {
+        self.connections
+            .drain(&mut self.monitor, service, followers)
+    }
+
     pub(super) fn receive(
         &mut self,
         service: &mut Service,
@@ -84,12 +93,11 @@ impl<'a> Ingress<'a> {
             .and_then(ozzy_runtime::transport::native_peer_identity)
             .ok_or_else(|| error("PEER receive lacks an identity"))?;
         let message = Message::with_prefix(identity, body.clone());
-        if !self
-            .connections
-            .drain(&mut self.monitor, service, followers)?
-            || receipt.source().is_none_or(|source| !source.is_live())
-            || !self.connections.contains(&message)
-        {
+        // The owner processed lifecycle changes before receiving this body.
+        // Admission contains no await or lifecycle observation: an old body
+        // cannot cross client retirement into a reused slot. OMQ fences queued
+        // generations and rejects restoration to a retired source.
+        if receipt.source().is_none() || !self.connections.contains(&message) {
             return Ok(None);
         }
         let (message, retained) = match buffers.prepare_borrowed(&message) {

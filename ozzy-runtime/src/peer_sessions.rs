@@ -220,8 +220,8 @@ impl Sessions {
         self.changed.notify_changed();
     }
 
-    /// Reclaim metadata only after the transport owner has retired the exact
-    /// physical source and refuses all of its previously received frames.
+    /// Reclaim metadata after the transport owner completes dequeued input and
+    /// observes control retirement. OMQ fences remaining queued/restored input.
     pub(crate) fn retire(&self, remote: NodeId) {
         let mut peers = self.peers.lock().expect("session mutex poisoned");
         peers.remove(&remote);

@@ -206,10 +206,11 @@ checks configured identities and roles before negotiation. Negotiation supplies
 link fences, never partition authority or destination credit. Disconnect retains
 bounded peer metadata and rejects a delayed duplicate HELLO from that attempt.
 For dynamically admitted clients, an exact physical control disconnect may
-reclaim that metadata after the adapter fences the retired OMQ receive source.
-Before admitting any held receipt, the adapter checks `ReceiveSource::is_live`;
-a replacement with the same logical identity cannot revive an old physical
-generation. Data still requires the currently negotiated session. Configured
+reclaim that metadata. The adapter processes bounded lifecycle events before
+dequeue and admits the received body synchronously before observing another
+disconnect or replacement. OMQ fences queued generations and rejects restoration
+to retired receive sources, including replacement with the same logical identity.
+Data still requires the currently negotiated session. Configured
 clients and broker membership retain their metadata. The adapter also fences
 old queued replies.
 

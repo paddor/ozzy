@@ -65,6 +65,10 @@ impl FrontendContext {
             let mut tick = tokio::time::interval(retry);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
+                // Process lifecycle changes before dequeuing native input. Once
+                // received, admit synchronously before observing another cutover.
+                let control_ready = control.prepare(&mut service, &followers.routes)?;
+                let data_ready = data.prepare(&mut service, &followers.routes)?;
                 if let Some(message) = service.take_publication() {
                     publish(&self.reader_pub, self.follower_pub.as_ref(), &service, message)?;
                 }
@@ -73,14 +77,14 @@ impl FrontendContext {
                     event = control.monitor.recv() => {
                         control.observe(event.map_err(failure)?, &mut service, &followers.routes)?;
                     }
-                    message = control.socket.recv_from_source(None) => {
+                    message = control.socket.recv_from_source(None), if control_ready => {
                         let (receipt, body) = message.map_err(failure)?;
                         control.receive(&mut service, &buffers, &followers.routes, receipt, body)?;
                     }
                     event = data.monitor.recv() => {
                         data.observe(event.map_err(failure)?, &mut service, &followers.routes)?;
                     }
-                    message = data.socket.recv_from_source(None) => {
+                    message = data.socket.recv_from_source(None), if data_ready => {
                         let (receipt, body) = message.map_err(failure)?;
                         data.receive(&mut service, &buffers, &followers.routes, receipt, body)?;
                     }
@@ -94,10 +98,10 @@ impl FrontendContext {
                             return Err(failure(reason));
                         }
                     }
-                    Some(lane) = control.paused.writable() => {
+                    Some(lane) = control.paused.writable(), if control_ready => {
                         control.retry(lane, &mut service, &buffers, &followers.routes)?;
                     }
-                    Some(lane) = data.paused.writable() => {
+                    Some(lane) = data.paused.writable(), if data_ready => {
                         data.retry(lane, &mut service, &buffers, &followers.routes)?;
                     }
                     result = service.progress_with(|message| followers.send(outbound_socket(&self.peer, &self.data, &message), message), |probe| followers.wait(outbound_socket(&self.peer, &self.data, &probe), probe)) => {
