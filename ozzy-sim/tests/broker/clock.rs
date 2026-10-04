@@ -32,7 +32,7 @@ async fn inproc_memory_manual_broker_time_drives_timestamp_seeks_and_age_retenti
                 broker::deployment_with_resources(&root, mode, policy, 2, &resources, |config| {
                     config.topics.get_mut("orders").unwrap().retention =
                         ozzy_config::TopicRetention {
-                            max_age_secs: Some(1),
+                            max_age_secs: Some(10),
                             max_bytes: None,
                         };
                 });
@@ -48,9 +48,19 @@ async fn inproc_memory_manual_broker_time_drives_timestamp_seeks_and_age_retenti
             let positions = client.positions();
             verify_future_seek(&clock, &client, &positions).await;
             client.discard_verified();
-            let until = clock.now() + Duration::from_secs(5);
+            let until = clock.now() + Duration::from_secs(15);
             progress(&clock, async {
                 while clock.now() < until {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            progress(&clock, async {
+                loop {
+                    let floor = client.retained_floor().await;
+                    if floor.get() == positions[0] as u64 {
+                        break;
+                    }
                     tokio::task::yield_now().await;
                 }
             })
@@ -101,7 +111,7 @@ async fn verify_future_seek(clock: &SdkClock, client: &Client, positions: &[usiz
             client.links.clone(),
             "orders",
             TopicReaderConfig {
-                start: ReaderStart::Timestamp(1_010_000),
+                start: ReaderStart::Timestamp(1_100_000),
                 ..Default::default()
             },
         ),
