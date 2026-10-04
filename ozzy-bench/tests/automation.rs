@@ -6,6 +6,9 @@ use ozzy_bench::automation::{
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, fs, path::Path, process::Command, time::Duration};
 
+// Configuration fixtures describe CPUs independently of the executing host.
+const VALIDATION_CPUS: &[usize] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+
 #[test]
 fn separate_checkouts_cannot_share_benchmark_build_artifacts() {
     use ozzy_bench::automation::build_target;
@@ -838,7 +841,7 @@ fn chart_selection_preserves_push_append_transport() {
 #[test]
 fn dsync_is_default_and_cannot_mix_with_old_sync_chart_cohorts() {
     let args = compare::Args::parse_from(["compare", "--impl", "ozzy", "--modes", "durable"]);
-    args.validate().unwrap();
+    args.validate(VALIDATION_CPUS).unwrap();
     assert_eq!(args.configuration()["durable_segment_io"], "odsync");
     assert!(compare::Args::try_parse_from(["compare", "--direct-io"]).is_err());
     assert!(compare::Args::try_parse_from(["compare", "--write-padding", "512"]).is_err());
@@ -881,7 +884,7 @@ fn tiny_record_queues_keep_full_range_while_append_groups_cap_at_two_k() {
             "--request-records",
             &records.to_string(),
         ]);
-        args.validate().unwrap();
+        args.validate(VALIDATION_CPUS).unwrap();
         let command = args
             .command(Path::new("bench"), &args.cases()[0], None)
             .unwrap();
@@ -912,7 +915,7 @@ fn tiny_record_queues_keep_full_range_while_append_groups_cap_at_two_k() {
         "--request-records",
         "65537",
     ]);
-    assert!(args.validate().is_err());
+    assert!(args.validate(VALIDATION_CPUS).is_err());
 }
 #[test]
 fn charts_reject_incomplete_duplicate_and_unaudited_data() {
@@ -1114,7 +1117,7 @@ fn comparison_rejects_legacy_replication_storage_switches() {
         "--modes",
         "replicated-persisting",
     ]);
-    args.validate().unwrap();
+    args.validate(VALIDATION_CPUS).unwrap();
     let command = args
         .command(Path::new("bench"), &args.cases()[0], None)
         .unwrap();
@@ -1159,7 +1162,7 @@ fn shard_count_is_independent_of_cpu_count_and_audited() {
         "--partitions",
         "4",
     ]);
-    args.validate().unwrap();
+    args.validate(VALIDATION_CPUS).unwrap();
     let case = args.cases()[0].clone();
     let command = args.command(Path::new("bench"), &case, None).unwrap();
     assert_eq!(option(&command, "--app-threads"), "4");
@@ -1183,17 +1186,17 @@ fn shard_count_is_independent_of_cpu_count_and_audited() {
     }
     for shards in [0, 5] {
         args.shards = Some(shards);
-        assert!(args.validate().is_err());
+        assert!(args.validate(VALIDATION_CPUS).is_err());
         let mut wrong = config.clone();
         wrong["native_shards"] = json!(shards);
         assert!(validation::comparison(&archived, &four_shard_row(), &wrong).is_err());
     }
     args.shards = Some(4);
     args.implementation = "all".into();
-    assert!(args.validate().is_err());
+    assert!(args.validate(VALIDATION_CPUS).is_err());
     args.implementation = "ozzy".into();
     args.modes = vec!["disk-quorum".into()];
-    assert!(args.validate().is_err());
+    assert!(args.validate(VALIDATION_CPUS).is_err());
 }
 
 #[test]
@@ -1439,7 +1442,7 @@ fn comparison_commands_declare_the_same_topic_partitions_for_every_adapter() {
         "--partitions",
         "2",
     ]);
-    compare.validate().unwrap();
+    compare.validate(VALIDATION_CPUS).unwrap();
     for case in compare.cases() {
         let command = compare
             .command(Path::new("bench"), &case, Some("127.0.0.1:19092"))
@@ -1473,7 +1476,7 @@ fn comparison_commands_declare_the_same_topic_partitions_for_every_adapter() {
 #[test]
 fn archived_storage_group_bounds_remain_verified_without_a_live_override() {
     let args = compare::Args::parse_from(["compare", "--impl", "ozzy", "--modes", "durable"]);
-    args.validate().unwrap();
+    args.validate(VALIDATION_CPUS).unwrap();
     let command = args
         .command(Path::new("bench"), &args.cases()[0], None)
         .unwrap();
@@ -1547,7 +1550,7 @@ fn append_window_override_is_native_only_and_nonzero() {
         "--writer-batch-target-kib",
         "4096",
     ]);
-    args.validate().unwrap();
+    args.validate(VALIDATION_CPUS).unwrap();
     assert_eq!(args.configuration()["writer_inflight_appends"], 3);
     assert_eq!(args.configuration()["shard_resident_mib"], 1024);
     assert_eq!(
@@ -1570,7 +1573,7 @@ fn append_window_override_is_native_only_and_nonzero() {
     }
     let mut invalid = args;
     invalid.writer_inflight_appends = 0;
-    assert!(invalid.validate().is_err());
+    assert!(invalid.validate(VALIDATION_CPUS).is_err());
     assert!(compare::Args::try_parse_from(["compare", "--writer-batch-target-kib", "0"]).is_err());
     assert!(
         compare::Args::try_parse_from(["compare", "--writer-batch-target-kib", "16385"]).is_err()
@@ -1586,7 +1589,7 @@ fn offered_load_reaches_every_selected_implementation_without_native_queue_overr
             "--records-per-second",
             "1000",
         ]);
-        args.validate().unwrap();
+        args.validate(VALIDATION_CPUS).unwrap();
         for case in args.cases() {
             assert_eq!(case["rate"], 1000);
             let command = args
@@ -1599,7 +1602,7 @@ fn offered_load_reaches_every_selected_implementation_without_native_queue_overr
         }
         let mut bad = args;
         bad.records_per_second = Some(0);
-        assert!(bad.validate().is_err());
+        assert!(bad.validate(VALIDATION_CPUS).is_err());
     }
 }
 
@@ -1613,7 +1616,7 @@ fn mixed_runs_apply_one_request_ceiling_to_every_implementation() {
             "--modes",
             "replicated-persisting",
         ]);
-        args.validate().unwrap();
+        args.validate(VALIDATION_CPUS).unwrap();
         for case in args.cases() {
             let expected = requested;
             let command = args
@@ -1652,7 +1655,7 @@ fn all_and_native_only_preserve_workload_and_ssd_cpu_budgets() {
     );
     let buffered = compare::Args::parse_from(["compare", "--impl", "ozzy", "--modes", "buffered"]);
     assert_eq!(buffered.cases().len(), 0);
-    assert!(buffered.validate().is_err());
+    assert!(buffered.validate(VALIDATION_CPUS).is_err());
     assert!(
         buffered
             .command(
@@ -1730,10 +1733,10 @@ fn all_and_native_only_preserve_workload_and_ssd_cpu_budgets() {
 #[test]
 fn redpanda_runs_local_and_group_cases_through_its_own_external_adapter() {
     let mut args = compare::Args::parse_from(["compare", "--impl", "redpanda"]);
-    args.validate().unwrap();
+    args.validate(VALIDATION_CPUS).unwrap();
     assert_eq!(args.cases().len(), 6);
     args.modes = vec!["disk-quorum".into(), "replicated-persisting".into()];
-    args.validate().unwrap();
+    args.validate(VALIDATION_CPUS).unwrap();
     for case in args.cases() {
         assert_eq!(case["impl"], "redpanda");
         let command = args
@@ -2282,19 +2285,20 @@ fn all_local_comparison_checks_every_broker_cpu_and_labels_topology() {
         "--control-bind",
         "tcp://127.0.0.1:0",
     ]);
-    args.validate().unwrap();
+    args.validate(VALIDATION_CPUS).unwrap();
+    assert!(args.validate(&[0, 1, 2, 3]).is_err());
     assert_eq!(args.configuration()["deployment_kind"], "all-local");
     let isolated = args.configuration();
     for row in rows.as_array_mut().unwrap() {
         row["cpus"] = json!([0, 1, 2]);
     }
     fs::write(&path, rows.to_string()).unwrap();
-    args.validate().unwrap();
+    args.validate(VALIDATION_CPUS).unwrap();
     assert_ne!(args.configuration()["deployment"], isolated["deployment"]);
     for bad in [json!([0, 1]), json!([1, 2, 3]), json!([0, 1, 2, 6])] {
         rows[2]["cpus"] = bad;
         fs::write(&path, rows.to_string()).unwrap();
-        assert!(args.validate().is_err());
+        assert!(args.validate(VALIDATION_CPUS).is_err());
     }
     for (i, row) in rows.as_array_mut().unwrap().iter_mut().enumerate() {
         row["cpus"] = json!([i]);
@@ -2302,7 +2306,7 @@ fn all_local_comparison_checks_every_broker_cpu_and_labels_topology() {
     for bad in [0, 1, 3, 4, 5] {
         rows[2]["cpus"] = json!([bad]);
         fs::write(&path, rows.to_string()).unwrap();
-        assert!(args.validate().is_err());
+        assert!(args.validate(VALIDATION_CPUS).is_err());
     }
     if std::thread::available_parallelism().is_ok_and(|cores| cores.get() >= 9) {
         // Check sibling CPU masks only when the VM exposes those CPU IDs.
@@ -2314,16 +2318,16 @@ fn all_local_comparison_checks_every_broker_cpu_and_labels_topology() {
             row["cpus"] = json!([i, i + 6]);
         }
         fs::write(&path, rows.to_string()).unwrap();
-        args.validate().unwrap();
+        args.validate(VALIDATION_CPUS).unwrap();
         for bad in [json!([2, 7]), json!([2, 9]), json!([])] {
             rows[2]["cpus"] = bad;
             fs::write(&path, rows.to_string()).unwrap();
-            assert!(args.validate().is_err());
+            assert!(args.validate(VALIDATION_CPUS).is_err());
         }
         args.implementation = "iggy".into();
         rows[2]["cpus"] = json!([2, 8]);
         fs::write(&path, rows.to_string()).unwrap();
-        assert!(args.validate().is_err());
+        assert!(args.validate(VALIDATION_CPUS).is_err());
         args.implementation = "ozzy".into();
         args.broker_cpus = broker_cpus;
     }
@@ -2336,17 +2340,17 @@ fn all_local_comparison_checks_every_broker_cpu_and_labels_topology() {
         args.implementation = implementation.into();
         for mode in ["replicated-persisting", "disk-quorum"] {
             args.modes = vec![mode.into()];
-            args.validate().unwrap();
+            args.validate(VALIDATION_CPUS).unwrap();
         }
     }
     args.modes = vec!["durable".into()];
-    assert!(args.validate().is_err());
+    assert!(args.validate(VALIDATION_CPUS).is_err());
     args.modes = vec!["replicated-persisting".into()];
     args.implementation = "redpanda".into();
-    assert!(args.validate().is_err());
+    assert!(args.validate(VALIDATION_CPUS).is_err());
     args.implementation = "ozzy".into();
     args.control_bind = None;
-    assert!(args.validate().is_err());
+    assert!(args.validate(VALIDATION_CPUS).is_err());
 }
 
 #[test]
@@ -2376,7 +2380,7 @@ fn distributed_comparison_keeps_adapter_windows_and_freezes_topology() {
         "--request-records",
         "2048",
     ]);
-    args.validate().unwrap();
+    args.validate(VALIDATION_CPUS).unwrap();
     assert_eq!(args.configuration()["deployment"], rows);
     for case in args.cases() {
         let command = args
@@ -2400,7 +2404,7 @@ fn distributed_comparison_keeps_adapter_windows_and_freezes_topology() {
         serde_json::from_slice::<Value>(&fs::read(frozen).unwrap()).unwrap(),
         rows
     );
-    assert!(args.validate().is_err());
+    assert!(args.validate(VALIDATION_CPUS).is_err());
 }
 
 #[test]
@@ -2412,7 +2416,7 @@ fn default_segment_limits_follow_record_size_and_explicit_limits_override() {
         "--modes",
         "replicated-persisting",
     ]);
-    args.validate().unwrap();
+    args.validate(VALIDATION_CPUS).unwrap();
     for case in args.cases() {
         let expected = if case["size"].as_u64().unwrap() >= 1024 {
             "1024"
@@ -2426,7 +2430,7 @@ fn default_segment_limits_follow_record_size_and_explicit_limits_override() {
     assert!(args.configuration()["segment_mib"].is_null());
 
     args.segment_mib = Some(64);
-    args.validate().unwrap();
+    args.validate(VALIDATION_CPUS).unwrap();
     for case in args.cases() {
         let command = args.command(Path::new("bench"), &case, None).unwrap();
         assert_eq!(option(&command, "--segment-mib"), "64");
@@ -2434,7 +2438,7 @@ fn default_segment_limits_follow_record_size_and_explicit_limits_override() {
     }
     for invalid in [3, 1025] {
         args.segment_mib = Some(invalid);
-        assert!(args.validate().is_err());
+        assert!(args.validate(VALIDATION_CPUS).is_err());
     }
     for flag in [
         "--segment-decoded-mib",
@@ -2495,7 +2499,7 @@ fn several_readers_per_partition_run_as_separate_ozzy_reader_processes() {
         "--partitions",
         "2",
     ]);
-    args.validate().unwrap();
+    args.validate(VALIDATION_CPUS).unwrap();
     assert!(args.configuration().get("readers_per_partition").is_none());
     let case = args.cases().remove(0);
     let command = args.command(Path::new("bench"), &case, None).unwrap();
@@ -2503,7 +2507,7 @@ fn several_readers_per_partition_run_as_separate_ozzy_reader_processes() {
     assert_eq!(option(&command, "--readers-per-partition"), "1");
 
     args.readers_per_partition = 16;
-    args.validate().unwrap();
+    args.validate(VALIDATION_CPUS).unwrap();
     assert_eq!(args.configuration()["readers_per_partition"], 16);
     let command = args.command(Path::new("bench"), &case, None).unwrap();
     assert_eq!(option(&command, "--reader-workers"), "32");
@@ -2512,29 +2516,29 @@ fn several_readers_per_partition_run_as_separate_ozzy_reader_processes() {
     assert!(!command.iter().any(|arg| arg == "--broker-io-threads"));
     assert!(args.configuration().get("broker_io_threads").is_none());
     args.broker_io_threads = Some(2);
-    args.validate().unwrap();
+    args.validate(VALIDATION_CPUS).unwrap();
     assert_eq!(args.configuration()["broker_io_threads"], 2);
     let command = args.command(Path::new("bench"), &case, None).unwrap();
     assert_eq!(option(&command, "--broker-io-threads"), "2");
     args.broker_io_threads = Some(33);
-    assert!(args.validate().is_err());
+    assert!(args.validate(VALIDATION_CPUS).is_err());
     args.broker_io_threads = None;
 
     assert!(!command.iter().any(|arg| arg == "--live-readers"));
     assert!(args.configuration().get("live_readers").is_none());
     args.live_readers = true;
-    args.validate().unwrap();
+    args.validate(VALIDATION_CPUS).unwrap();
     assert_eq!(args.configuration()["live_readers"], true);
     let command = args.command(Path::new("bench"), &case, None).unwrap();
     assert!(command.iter().any(|arg| arg == "--live-readers"));
     args.modes = vec!["buffered".into()];
-    assert!(args.validate().is_err());
+    assert!(args.validate(VALIDATION_CPUS).is_err());
     args.modes = vec!["replicated-persisting".into()];
     args.live_readers = false;
 
     args.readers_per_partition = 17;
-    assert!(args.validate().is_err());
+    assert!(args.validate(VALIDATION_CPUS).is_err());
     args.readers_per_partition = 2;
     args.implementation = "all".into();
-    assert!(args.validate().is_err());
+    assert!(args.validate(VALIDATION_CPUS).is_err());
 }

@@ -275,11 +275,11 @@ impl Args {
         Ok(())
     }
 
-    /// Reject unsupported cases, conflicting options, and invalid placement or capacity.
-    pub fn validate(&self) -> Result<()> {
+    /// Reject unsupported cases, conflicting options, and invalid placement or
+    /// capacity against the caller's allowed CPU inventory.
+    pub fn validate(&self, allowed: &[usize]) -> Result<()> {
         self.validate_shards()?;
         self.validate_placements()?;
-        let allowed = isolation::cpus(None)?;
         if self.sizes.is_empty()
             || self
                 .sizes
@@ -987,7 +987,7 @@ async fn matrix(
 /// Qualify binaries, run fresh isolated servers serially, and append verified result rows.
 pub async fn run(mut args: Args) -> Result<()> {
     install_signals()?;
-    args.validate()?;
+    args.validate(&isolation::cpus(None)?)?;
     if args.dry_run {
         for case in args.cases() {
             println!(
