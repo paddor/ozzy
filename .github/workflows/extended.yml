@@ -1,14 +1,13 @@
-name: CI
+name: Extended
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
+  schedule:
+    - cron: '0 3 * * 0'
+  workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: extended
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -32,37 +31,27 @@ jobs:
       - uses: ./ozzy/.github/actions/setup
       - run: ./scripts/test-all.sh lint
 
-  test:
+  stress:
     needs: lint
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
         with:
           path: ozzy
       - uses: ./ozzy/.github/actions/setup
       - run: ./scripts/ozzy_cargo build --workspace --locked
-      - run: ./scripts/test-all.sh tests
-        env:
-          NEXTEST_PROFILE: ci
+      - run: >-
+          ./scripts/ozzy_cargo nextest run --workspace --profile extended
+          --test-threads 8 --status-level fail --final-status-level fail
 
-  msrv:
+  loom:
     needs: lint
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
         with:
           path: ozzy
       - uses: ./ozzy/.github/actions/setup
-        with:
-          toolchain: '1.93'
-      - run: ./scripts/ozzy_cargo check --workspace --all-targets --locked
-
-  publish-check:
-    needs: lint
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          path: ozzy
-      - uses: ./ozzy/.github/actions/setup
-      - run: ./scripts/ozzy_cargo publish --workspace --exclude ozzy-bench --exclude ozzy-sim --dry-run --locked
+      - run: ./scripts/test.sh loom

@@ -1,3 +1,10 @@
+[profile.ci]
+default-filter = 'not (test(::stress::) | (package(ozzy-bench) & (binary(ozzy_timed) | binary(ozzy_native))))'
+
+[profile.extended]
+default-filter = 'test(::stress::) | (package(ozzy-bench) & (binary(ozzy_timed) | binary(ozzy_native)))'
+fail-fast = false
+
 [test-groups.broker-lifecycle]
 # Each case starts several real brokers, SDK runtimes, and shared disk pools.
 # Keep lifecycle qualification isolated from other CPU-heavy test work.

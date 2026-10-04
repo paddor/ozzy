@@ -134,90 +134,94 @@ async fn cli_tcp_saved_producer_resumes_and_takes_over_after_broker_kills() {
     }
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn cli_tcp_retained_history_confirms_with_two_copies_after_active_leader_kill() {
-    for policy in [
-        ozzy_config::Confirmation::DiskQuorum,
-        ozzy_config::Confirmation::ReplicatedPersisting,
-    ] {
-        let fixture = cluster::Cluster::retained(policy).pin_brokers();
-        fixture.provision();
-        let checked = fixture.checked(0);
-        let mut brokers = fixture.start();
-        let mut client = brokers
-            .observe("open retained producer", Client::open(&checked))
-            .await;
-        for wave in 0..12 {
-            let pending = client.queue_large(wave, 256).await;
+mod stress {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cli_tcp_retained_history_confirms_with_two_copies_after_active_leader_kill() {
+        for policy in [
+            ozzy_config::Confirmation::DiskQuorum,
+            ozzy_config::Confirmation::ReplicatedPersisting,
+        ] {
+            let fixture = cluster::Cluster::retained(policy).pin_brokers();
+            fixture.provision();
+            let checked = fixture.checked(0);
+            let mut brokers = fixture.start();
+            let mut client = brokers
+                .observe("open retained producer", Client::open(&checked))
+                .await;
+            for wave in 0..12 {
+                let pending = client.queue_large(wave, 256).await;
+                brokers
+                    .observe("confirm retention load", client.confirm(pending))
+                    .await;
+                brokers
+                    .observe("verify retention load", client.replay())
+                    .await;
+                client.discard_verified();
+                if wave % 4 == 3 {
+                    client = brokers
+                        .observe("resume retention producer", client.reopen_producer(false))
+                        .await;
+                }
+            }
+            for wave in 100..356 {
+                let pending = client.queue(wave).await;
+                brokers
+                    .observe("confirm reader churn", client.confirm(pending))
+                    .await;
+                brokers
+                    .observe("verify reader churn", client.replay())
+                    .await;
+                client.discard_verified();
+                if wave % 64 == 0 {
+                    client = brokers
+                        .observe("resume churn producer", client.reopen_producer(false))
+                        .await;
+                }
+            }
+            let floor = brokers
+                .observe("verify native retirement", client.retained_floor())
+                .await;
+            assert!(floor.get() > 0, "{policy:?}: no sealed history retired");
+            let leader = client.leader(0);
+            let index = (0..3)
+                .find(|index| {
+                    ozzy_proto::NodeId::from_bytes(
+                        *checked.identity.brokers[&format!("broker-{index}")].as_bytes(),
+                    ) == leader
+                })
+                .unwrap();
+            brokers.stop(index, "KILL").await;
+            let pending = client.queue(999).await;
             brokers
-                .observe("confirm retention load", client.confirm(pending))
+                .observe(
+                    "confirm with retained leader absent",
+                    client.confirm(pending),
+                )
                 .await;
             brokers
-                .observe("verify retention load", client.replay())
+                .observe("verify after retained leader kill", client.replay())
                 .await;
             client.discard_verified();
-            if wave % 4 == 3 {
-                client = brokers
-                    .observe("resume retention producer", client.reopen_producer(false))
-                    .await;
-            }
-        }
-        for wave in 100..356 {
-            let pending = client.queue(wave).await;
+            client = brokers
+                .observe(
+                    "takeover after retained leader kill",
+                    client.reopen_producer(true),
+                )
+                .await;
+            let pending = client.queue(1000).await;
             brokers
-                .observe("confirm reader churn", client.confirm(pending))
+                .observe("confirm takeover after churn", client.confirm(pending))
                 .await;
             brokers
-                .observe("verify reader churn", client.replay())
+                .observe("verify takeover after churn", client.replay())
                 .await;
-            client.discard_verified();
-            if wave % 64 == 0 {
-                client = brokers
-                    .observe("resume churn producer", client.reopen_producer(false))
-                    .await;
-            }
+            brokers
+                .observe("close retained producer", client.close())
+                .await;
+            brokers.shutdown().await;
         }
-        let floor = brokers
-            .observe("verify native retirement", client.retained_floor())
-            .await;
-        assert!(floor.get() > 0, "{policy:?}: no sealed history retired");
-        let leader = client.leader(0);
-        let index = (0..3)
-            .find(|index| {
-                ozzy_proto::NodeId::from_bytes(
-                    *checked.identity.brokers[&format!("broker-{index}")].as_bytes(),
-                ) == leader
-            })
-            .unwrap();
-        brokers.stop(index, "KILL").await;
-        let pending = client.queue(999).await;
-        brokers
-            .observe(
-                "confirm with retained leader absent",
-                client.confirm(pending),
-            )
-            .await;
-        brokers
-            .observe("verify after retained leader kill", client.replay())
-            .await;
-        client.discard_verified();
-        client = brokers
-            .observe(
-                "takeover after retained leader kill",
-                client.reopen_producer(true),
-            )
-            .await;
-        let pending = client.queue(1000).await;
-        brokers
-            .observe("confirm takeover after churn", client.confirm(pending))
-            .await;
-        brokers
-            .observe("verify takeover after churn", client.replay())
-            .await;
-        brokers
-            .observe("close retained producer", client.close())
-            .await;
-        brokers.shutdown().await;
     }
 }
 

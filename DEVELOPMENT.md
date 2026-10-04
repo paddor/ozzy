@@ -9,6 +9,9 @@ packages and builds the twelve release crates without uploading them. CI runs
 once per PR update and on pushes to main, cancels superseded PR runs, and uses
 generic x86_64 codegen.
 
+PR/main use Nextest `ci`; weekly/manual `Extended` runs stress tests and Loom
+(Sunday 03:00 UTC).
+
 ## Local check
 
 ```sh
