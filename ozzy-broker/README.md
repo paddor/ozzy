@@ -1,5 +1,15 @@
 # Broker startup
 
+Install the server with Rust 1.93 or newer:
+
+```sh
+cargo install ozzy-broker --version 0.1.0 --locked --bin ozy_broker
+```
+
+The binary is `ozy_broker`. Supply a deployment TOML and existing writable device
+roots, then provision and serve as described below. Cargo installs the binary;
+deployment configuration and persistent data belong to the operator.
+
 Provisioning commands initialize persistent identity, volumes, and segment
 journals explicitly. `serve` opens established stores and binds configured
 endpoints.

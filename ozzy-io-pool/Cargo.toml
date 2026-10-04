@@ -5,7 +5,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish = false
+authors.workspace = true
+repository.workspace = true
+publish = ["crates-io"]
 description = "Explicit bounded file workers for Ozzy"
 
 [dependencies]
@@ -26,7 +28,8 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["time"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-ozzy-io-aio.workspace = true
+# Keep this test-only back edge out of the registry dependency graph.
+ozzy-io-aio = { path = "../ozzy-io-aio" }
 
 [lints]
 workspace = true

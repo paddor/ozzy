@@ -4,7 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish = false
+authors.workspace = true
+repository.workspace = true
+publish = ["crates-io"]
 description = "Owned asynchronous file operations and resource contracts for Ozzy"
 
 [features]

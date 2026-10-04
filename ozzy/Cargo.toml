@@ -9,7 +9,7 @@ authors.workspace = true
 repository.workspace = true
 description = "Native writer and reader SDK for Ozzy brokers over OMQ."
 readme = "README.md"
-publish = false
+publish = ["crates-io"]
 
 [features]
 default = []

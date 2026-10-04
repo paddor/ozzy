@@ -9,7 +9,7 @@ authors.workspace = true
 repository.workspace = true
 description = "Deterministic replication state for Ozzy."
 readme = "README.md"
-publish = false
+publish = ["crates-io"]
 
 [dependencies]
 bytes.workspace = true

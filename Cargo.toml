@@ -44,7 +44,7 @@ ahash = "0.8.12"
 arc-swap = "1.9.2"
 bytes = "1.12.1"
 clap = { version = "4.6.6", features = ["derive"] }
-fanring = { version = "0.3.8", features = ["async"] }
+fanring = { version = "0.3.9", features = ["async"] }
 futures = "0.3.34"
 lz4rip = { version = "0.11.7", default-features = false, features = ["std"] }
 omq-tokio = { path = "../omq.rs/omq-tokio", version = "0.25.0", default-features = false }
@@ -53,19 +53,19 @@ rustix = { version = "1.1.4", features = ["fs"] }
 smallvec = "1.15.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ozzy = { path = "ozzy" }
-ozzy-broker = { path = "ozzy-broker" }
-ozzy-core = { path = "ozzy-core" }
-ozzy-config = { path = "ozzy-config" }
-ozzy-io = { path = "ozzy-io" }
-ozzy-io-pool = { path = "ozzy-io-pool" }
-ozzy-io-aio = { path = "ozzy-io-aio" }
-ozzy-proto = { path = "ozzy-proto" }
-ozzy-replication = { path = "ozzy-replication" }
-ozzy-runtime = { path = "ozzy-runtime" }
+ozzy = { path = "ozzy", version = "0.1.0" }
+ozzy-broker = { path = "ozzy-broker", version = "0.1.0" }
+ozzy-core = { path = "ozzy-core", version = "0.1.0" }
+ozzy-config = { path = "ozzy-config", version = "0.1.0" }
+ozzy-io = { path = "ozzy-io", version = "0.1.0" }
+ozzy-io-pool = { path = "ozzy-io-pool", version = "0.1.0" }
+ozzy-io-aio = { path = "ozzy-io-aio", version = "0.1.0" }
+ozzy-proto = { path = "ozzy-proto", version = "0.1.0" }
+ozzy-replication = { path = "ozzy-replication", version = "0.1.0" }
+ozzy-runtime = { path = "ozzy-runtime", version = "0.1.0" }
 ozzy-sim = { path = "ozzy-sim" }
-ozzy-journal = { path = "ozzy-journal" }
-ozzy-journal-segment = { path = "ozzy-journal-segment" }
+ozzy-journal = { path = "ozzy-journal", version = "0.1.0" }
+ozzy-journal-segment = { path = "ozzy-journal-segment", version = "0.1.0" }
 tempfile = "3.27.0"
 thiserror = "2.0.20"
 tokio = { version = "1.52.0", features = ["macros", "rt-multi-thread", "signal"] }

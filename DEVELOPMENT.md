@@ -2,6 +2,10 @@
 
 Ozzy requires Rust 1.93 or newer.
 
+CI checks out published OMQ and fanring revisions as sibling directories and
+uses the same workspace check scripts. It checks MSRV separately and builds the
+registry crates through a publishing dry run. CI uses generic x86_64 codegen.
+
 ## Local check
 
 ```sh

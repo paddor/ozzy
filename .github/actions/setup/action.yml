@@ -1,0 +1,37 @@
+name: Set up Ozzy workspace
+description: Install Rust and check out the published OMQ and queue sources.
+inputs:
+  toolchain:
+    description: Rust toolchain to install
+    required: false
+    default: stable
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        sudo mkdir -p /mnt/ssd/tmp
+        sudo chown "$(id -u):$(id -g)" /mnt/ssd/tmp
+        printf '%s\n' 'TMPDIR=/mnt/ssd/tmp' >> "$GITHUB_ENV"
+    - uses: actions/checkout@v7
+      with:
+        repository: paddor/omq.rs
+        ref: 06208224d887265aed32a4c7a9dc6764011b53c1
+        path: omq.rs
+    - uses: actions/checkout@v7
+      with:
+        repository: paddor/fanring.rs
+        ref: 31a8c5c7592444ae147bda292b745bc7c9f7489c
+        path: fanring
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ inputs.toolchain }}
+        components: clippy,rustfmt
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-nextest
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: ozzy
+        cache-targets: false
+        cache-directories: /mnt/ssd/tmp/ozzy-ci-target

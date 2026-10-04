@@ -1,5 +1,15 @@
 # ozzy
 
+Add the SDK to an application's Cargo dependencies:
+
+```toml
+[dependencies]
+ozzy = "0.1.0"
+```
+
+Requires Rust 1.93 or newer. Run a provisioned Ozzy broker separately; install it
+with `cargo install ozzy-broker --version 0.1.0 --locked --bin ozy_broker`.
+
 Producer SDK and consumer SDK for Ozzy brokers over OMQ. They share session
 code while retaining separate role state. `BrokerLinks` owns one data PEER and
 one control PEER connected to all configured brokers. Live consumers add one
