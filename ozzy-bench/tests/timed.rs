@@ -354,6 +354,7 @@ fn disk_quorum_admits_replication_with_sixteen_readers() {
         .args([
             "--processes",
             "--network-ingress",
+            "--streaming",
             "--system",
             "disk-quorum",
             "--duration",
@@ -368,6 +369,10 @@ fn disk_quorum_admits_replication_with_sixteen_readers() {
             "1",
             "--record-bytes",
             "128",
+            "--request-records",
+            "256",
+            "--writer-batch-records",
+            "256",
             "--history-mib",
             "512",
             "--segment-mib",
