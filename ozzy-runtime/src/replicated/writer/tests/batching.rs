@@ -1,7 +1,6 @@
 use super::super::batch::Batch;
 use super::*;
 use futures::FutureExt;
-use tokio::time::Instant;
 
 #[tokio::test]
 async fn intake_keeps_lookahead_for_full_batches_behind_an_unconfirmed_append() {
@@ -35,7 +34,6 @@ async fn intake_keeps_lookahead_for_full_batches_behind_an_unconfirmed_append() 
             batch.take_payload().unwrap().as_slice(),
             b"abcdefghiabcdefghi"
         );
-        assert!(batch.deadline.is_none());
         driver.stage(2);
         assert_eq!(driver.progress.confirmed(), 0);
         assert!(!batch.select(2, settings.limits, true, &mut driver).unwrap());
@@ -70,7 +68,6 @@ async fn record_and_byte_caps_select_independently_without_collection_delay() {
         assert!(batch.select(0, settings.limits, true, &mut driver).unwrap());
         assert_eq!((batch.records.len(), batch.bytes), (count, count * size));
         assert_eq!(batch.take_payload().unwrap().len(), count * size);
-        assert!(batch.deadline.is_none());
         driver.stage(count as u64);
         assert_eq!(driver.progress.confirmed(), 0);
         writer
@@ -128,7 +125,6 @@ async fn partial_batch_waits_for_an_unconfirmed_append_and_full_batch_pipelines(
     // An earlier APPEND is unconfirmed, so one ready record keeps collecting
     // until its confirmation arrives. No timer is armed.
     assert!(!batch.select(0, limits, true, &mut shared).unwrap());
-    assert!(batch.deadline.is_none());
     // With nothing in flight the same record goes at once.
     assert!(batch.select(0, limits, false, &mut shared).unwrap());
     assert_eq!(batch.take_payload().unwrap().as_slice(), b"ab");
@@ -185,7 +181,6 @@ async fn four_mib_target_sends_ready_records_and_oversized_singleton_whole() {
         );
         assert_eq!((batch.records.len(), batch.bytes), (1, bytes));
         assert_eq!(batch.take_payload().unwrap().len(), bytes);
-        assert!(batch.deadline.is_none());
     }
 }
 
@@ -326,17 +321,14 @@ fn setup(records: usize, bytes: usize) -> (state::Driver, Writer) {
 }
 
 #[tokio::test(start_paused = true)]
-async fn zero_linger_sends_sparse_records_and_caps_whole_records_by_every_limit() {
+async fn sparse_records_send_without_time_advancement_and_obey_every_limit() {
     let (mut shared, mut writer) = setup(8, 32);
     writer.send(input(3, b"abc")).await.unwrap();
     writer.send(input(4, b"def")).await.unwrap();
-    assert!(shared.record(0).unwrap().linger_deadline.is_none());
-    assert!(shared.record(1).unwrap().linger_deadline.is_none());
     let mut batch = Batch::new();
     let limits = shared.config.limits;
     assert!(batch.select_ready(0, limits, &mut shared).unwrap());
     assert_eq!((batch.records.len(), batch.bytes), (2, 6));
-    assert!(batch.deadline.is_none());
     for bounded in [
         DataLimits {
             max_records: 1,
@@ -368,56 +360,48 @@ async fn zero_linger_sends_sparse_records_and_caps_whole_records_by_every_limit(
     assert_eq!(batch.records.len(), 1);
 }
 
-#[tokio::test(start_paused = true)]
-async fn linger_deadline_does_not_move_and_flush_captures_only_its_prefix() {
+#[tokio::test]
+async fn flush_captures_only_its_prefix_while_a_partial_successor_waits() {
     let mut settings = config(8, 64);
     settings.limits.max_records = 8;
     settings.limits.max_parts = 16;
-    settings.linger = Duration::from_secs(1);
     let (mut writer, mut shared) = channel(settings);
     writer.send(input(3, b"a")).await.unwrap();
     let mut batch = Batch::new();
     assert!(
         !batch
-            .select_ready(0, shared.config.limits, &mut shared)
+            .select(0, shared.config.limits, true, &mut shared)
             .unwrap()
     );
-    let deadline = batch.deadline.unwrap();
-    assert_eq!(shared.record(0).unwrap().linger_deadline, Some(deadline));
-    tokio::time::advance(Duration::from_millis(900)).await;
     writer.send(input(4, b"b")).await.unwrap();
     assert!(
         !batch
-            .select_ready(0, shared.config.limits, &mut shared)
+            .select(0, shared.config.limits, true, &mut shared)
             .unwrap()
     );
-    assert_eq!(batch.deadline, Some(deadline));
     let flush = writer.flush(); // Its effect does not require polling the future.
-    writer.send(input(5, b"c")).await.unwrap();
+    let later = writer.send(input(5, b"c")).await.unwrap();
     assert!(
         batch
-            .select_ready(0, shared.config.limits, &mut shared)
+            .select(0, shared.config.limits, true, &mut shared)
             .unwrap()
     );
     assert_eq!(batch.records.len(), 2);
     assert!(
         !batch
-            .select_ready(2, shared.config.limits, &mut shared)
-            .unwrap()
-    );
-    assert_eq!(
-        batch.deadline,
-        Some(Instant::now() + Duration::from_secs(1))
-    );
-    tokio::time::advance(Duration::from_secs(1)).await;
-    assert!(
-        batch
-            .select_ready(2, shared.config.limits, &mut shared)
+            .select(2, shared.config.limits, true, &mut shared)
             .unwrap()
     );
     batch.records.clear();
     confirm(&mut shared, 2, 90).unwrap();
     flush.await.unwrap();
+    assert!(later.try_confirmed().is_none());
+    assert!(
+        batch
+            .select_ready(2, shared.config.limits, &mut shared)
+            .unwrap()
+    );
+    assert_eq!(batch.records.len(), 1);
 }
 
 #[tokio::test]

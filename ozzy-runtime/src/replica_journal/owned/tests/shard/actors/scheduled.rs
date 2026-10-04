@@ -4,6 +4,7 @@ use crate::replica_actor::{ScheduleError, ScheduledReplica};
 type Scheduled = ScheduledReplica;
 
 mod disconnected;
+mod donors;
 mod history;
 mod native;
 mod publications;

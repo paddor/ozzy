@@ -2,6 +2,7 @@ use super::*;
 use bytes::Bytes;
 use ozzy_proto::{EnvelopeLimits, MessageId, PartitionIncarnation, ProducerId};
 use std::sync::Arc;
+use std::time::Duration;
 
 mod batching;
 mod payload;
@@ -19,7 +20,6 @@ fn config(records: usize, bytes: usize) -> WriterConfig {
         producer_id: ProducerId::from_bytes([2; 16]),
         producer_epoch: 1,
         next_sequence: 0,
-        linger: Duration::ZERO,
         limits: DataLimits {
             max_record_bytes: bytes,
             envelope: EnvelopeLimits {

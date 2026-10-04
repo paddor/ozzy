@@ -81,6 +81,7 @@ impl Links {
 #[derive(Debug)]
 struct Peer {
     access: Access,
+    trusted: bool,
     initiating: bool,
     handshake: Option<Message>,
     awaiting_welcome: bool,
@@ -142,6 +143,7 @@ impl Service {
                         access.peer,
                         Peer {
                             access,
+                            trusted: false,
                             initiating: false,
                             handshake: None,
                             awaiting_welcome: false,

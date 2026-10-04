@@ -10,7 +10,9 @@
 //! For trusted inproc/loopback development, callers may configure explicit static
 //! bindings. Routing IDs and the supplied session IDs do not authenticate anyone.
 
+mod diagnostics;
 mod donors;
+pub use diagnostics::{HistoryFailure, HistoryReason};
 mod election;
 mod history;
 mod ids;
@@ -880,8 +882,8 @@ pub enum ActorError {
     #[error("invalid replica actor limits")]
     Limits,
     /// A bounded actor invariant could not be fulfilled by verified history.
-    #[error("replica history does not satisfy selected authority")]
-    History,
+    #[error(transparent)]
+    History(Box<HistoryFailure>),
     /// Production protocol core rejected an authority or history transition.
     #[error(transparent)]
     Driver(#[from] DriverError),

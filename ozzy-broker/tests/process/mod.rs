@@ -1,14 +1,13 @@
 //! TCP framing, disconnect/retry, process death, and CLI shutdown use production owners.
 
-mod client;
 mod cluster;
 mod fixture;
 mod recovery;
 mod soak;
 mod workloads;
 
-pub(crate) use client::Client;
 use fixture::Fixture;
+pub(crate) use ozzy_sim::client::Client;
 use std::{pin::pin, time::Duration};
 
 #[test]

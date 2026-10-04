@@ -5,6 +5,7 @@ mod canonical;
 mod checkpoint;
 pub use canonical::Candidate;
 pub use checkpoint::CheckpointFiles;
+pub(crate) mod groups;
 mod history;
 mod index;
 mod memory_voting;
@@ -38,13 +39,13 @@ mod tests;
 use super::{
     DirectoryError, GroupIdentity, LogPosition, Manifest, OperationEnvelope, ReplayError,
     ReplayedOperation, SegmentReference, evidence, position_before, segment_reference_name,
-    validate_operation, validate_replay_scan,
+    validate_operation,
 };
 use crate::{
     AsyncSegmentOptions, AsyncSegmentWriter, BodyEncoding, CanonicalOperation, CheckpointLimits,
     CodecError, CommitMode, CurrentReference, DecodeLimits, MetadataLimits, OperationLimits,
     SegmentHeader, WriterError, WriterPosition, async_files::Access, async_metadata,
-    checkpoint::asynchronous::Checkpoint, scan_segment_async,
+    checkpoint::asynchronous::Checkpoint,
 };
 use std::path::Path;
 
@@ -304,7 +305,7 @@ impl Journal {
     }
 
     /// Replay after the selected checkpoint. Each callback sees one validated
-    /// operation borrowed from a bounded segment image, never a filesystem handle.
+    /// operation borrowed from one physical group, never a filesystem handle.
     pub async fn replay_accepted<E>(
         &self,
         mut visit: impl FnMut(ReplayedOperation<'_>) -> Result<(), E>,
@@ -317,7 +318,8 @@ impl Journal {
 
     /// Replay with asynchronous visitors, for example to resolve cold control
     /// identities before synchronous canonical-state validation. One bounded
-    /// segment image owns the borrowed operation across the visitor's awaits.
+    /// physical group owns the borrowed operation across the visitor's awaits.
+    /// The caller must discard partial results if final segment authority fails.
     pub async fn replay_accepted_async<E>(
         &self,
         mut visit: impl AsyncFnMut(ReplayedOperation<'_>) -> Result<(), E>,
@@ -335,48 +337,31 @@ impl Journal {
         let mut replayed = start;
         let mut budget = crate::cooperative::Budget::default();
         for reference in &self.manifest.segments {
-            let bytes = self
-                .segment_image(*reference)
+            let mut groups = self
+                .segment_groups(*reference)
                 .await
                 .map_err(ReplayError::Journal)?;
-            let scan = scan_segment_async(
-                &bytes,
-                reference.first_group_number,
-                reference.first_chain,
-                self.limits.decode,
-            )
-            .await
-            .map_err(DirectoryError::from)
-            .map_err(ReplayError::Journal)?;
-            validate_operation_bodies(
-                &scan,
-                self.limits.operations,
-                self.manifest.configuration_epoch,
-                self.manifest.promised_view,
-            )
-            .await
-            .map_err(ReplayError::Journal)?;
-            validate_replay_scan(reference, &scan, self.writer.state())
-                .map_err(ReplayError::Journal)?;
-            for operation in scan.groups.iter().flat_map(|group| &group.operations) {
-                budget.charge(operation.body.len()).await;
-                if operation.op_number <= start.op_number {
-                    continue;
+            while let Some(group) = groups.next().await.map_err(ReplayError::Journal)? {
+                for operation in &group.operations {
+                    budget.charge(operation.body.len()).await;
+                    if operation.op_number <= start.op_number
+                        || operation.op_number > accepted.op_number
+                    {
+                        continue;
+                    }
+                    visit(ReplayedOperation {
+                        operation,
+                        committed: operation.op_number <= committed.op_number,
+                    })
+                    .await
+                    .map_err(ReplayError::Visitor)?;
+                    replayed = LogPosition {
+                        op_number: operation.op_number,
+                        digest: operation.digest,
+                    };
                 }
-                if operation.op_number > accepted.op_number {
-                    break;
-                }
-                visit(ReplayedOperation {
-                    operation,
-                    committed: operation.op_number <= committed.op_number,
-                })
-                .await
-                .map_err(ReplayError::Visitor)?;
-                replayed = LogPosition {
-                    op_number: operation.op_number,
-                    digest: operation.digest,
-                };
             }
+            groups.finish().await.map_err(ReplayError::Journal)?;
         }
         if replayed != accepted {
             return Err(ReplayError::Journal(DirectoryError::PositionMismatch(

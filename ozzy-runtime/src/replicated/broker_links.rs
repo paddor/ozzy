@@ -554,6 +554,7 @@ fn control_sizes(config: &BrokerLinksConfig) -> Option<(usize, usize)> {
 /// Link, bounded control, or typed broker response failed. An uncertain writer
 /// open does not authorize a fresh operation ID or weaker confirmation policy.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum BrokerLinkError {
     /// Missing or ambiguous record ID in the broker's retained history.
     #[error(transparent)]

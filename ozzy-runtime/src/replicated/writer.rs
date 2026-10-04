@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 
 use ozzy_proto::handshake::{self, Parameters};
 use ozzy_proto::{MessageId, PartitionIncarnation, ProducerId};
@@ -62,9 +61,6 @@ pub struct WriterConfig {
     /// This is not a record-size limit. A batch that reaches it may pipeline
     /// behind unconfirmed APPENDs; a partial batch waits for their confirmation.
     pub batch_target_bytes: usize,
-    /// Maximum intentional collection delay. Use `Duration::ZERO` by default.
-    /// Full batches and explicit flushes do not wait for this timer.
-    pub linger: Duration,
     /// Maximum concurrent producer handles. All handles share bounded admission.
     pub max_producers: usize,
     /// Maximum APPEND requests awaiting full confirmation across all handles.
@@ -113,9 +109,6 @@ impl WriterConfig {
             || reservation::intake_bytes(self.limits, self.batch_target_bytes)
                 .and_then(|bytes| bytes.checked_mul(self.max_producers))
                 .is_none()
-            || tokio::time::Instant::now()
-                .checked_add(self.linger)
-                .is_none()
             || self.max_producers == 0
             || self.inflight_appends == 0
             || self.inflight_appends > u32::MAX as usize
@@ -156,6 +149,7 @@ pub struct RecordReceipt {
 
 /// Writer failure. An admitted but unconfirmed record may still have been stored.
 #[derive(Debug, Clone, thiserror::Error)]
+#[non_exhaustive]
 pub enum WriterError {
     /// Payload encoder failed before transmission.
     #[error("payload compression failed")]
@@ -286,7 +280,6 @@ impl Writer {
         if config.partition != partition.incarnation
             || config.policy != routes.metadata().policy()
             || !matches!(partition.members.len(), 1 | 3)
-            || !config.linger.is_zero()
         {
             return Err(WriterError::Configuration);
         }

@@ -4,7 +4,6 @@ use omq_tokio::message::Payload;
 use ozzy_proto::Envelope;
 use ozzy_proto::append::{self, Append, Authority, DataLimits, PayloadEncoding, Record};
 use smallvec::SmallVec;
-use tokio::time::Instant;
 
 use super::{AppendKey, Error, Shared};
 
@@ -15,7 +14,6 @@ pub(super) use payload::PayloadPool;
 pub(super) struct Batch {
     pub(super) records: SelectedRecords,
     pub(super) bytes: usize,
-    pub(super) deadline: Option<Instant>,
     pub(super) waiting_for_payload: bool,
     payload: Option<Payload>,
 }
@@ -49,7 +47,6 @@ impl Batch {
         Self {
             records: SelectedRecords { start: 0, count: 0 },
             bytes: 0,
-            deadline: None,
             waiting_for_payload: false,
             payload: None,
         }
@@ -69,7 +66,6 @@ impl Batch {
         self.records.clear();
         self.payload = None;
         self.bytes = 0;
-        self.deadline = None;
         self.waiting_for_payload = false;
         shared.drain();
         let force_through = shared
@@ -78,15 +74,14 @@ impl Batch {
         let sealed = shared.sealed();
         let fixed = append::IDENTITY_METADATA_BYTES + 10;
         let target_bytes = shared.config.batch_target_bytes;
-        let linger = shared.config.linger;
         let admission = &mut shared.admission;
         let Some(first) = admission.records.front() else {
             return Ok(false);
         };
         let index = usize::try_from(next - first.sequence).map_err(|_| Error::Response)?;
-        let Some(oldest) = admission.records.get(index) else {
+        if admission.records.get(index).is_none() {
             return Ok(false);
-        };
+        }
         let force = next < force_through || sealed;
         let mut cap = limits.max_records.min(super::MAX_APPEND_RECORDS);
         if next < force_through {
@@ -108,14 +103,6 @@ impl Batch {
         }
         self.bytes = selection.bytes;
         if !force && !selection.full && in_flight {
-            return Ok(false);
-        }
-        if !force
-            && !selection.full
-            && let Some(deadline) = oldest.linger_deadline(linger)
-            && Instant::now() < deadline
-        {
-            self.deadline = Some(deadline);
             return Ok(false);
         }
         let Some(payload) = shared.batches.pack(admission, index..index + count) else {

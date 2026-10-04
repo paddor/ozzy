@@ -15,6 +15,20 @@ pub(super) struct Retention {
 }
 
 impl OwnedJournal {
+    fn charge_retention(&self) -> Result<Option<crate::memory::Charge>, JournalError> {
+        let Some(owner) = &self.append_memory else {
+            return Ok(None);
+        };
+        let bytes = self.journal.ready()?.retention_scratch_bytes()?;
+        owner.try_charge(bytes).map(Some).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                JournalError::AppendCapacity
+            } else {
+                error.into()
+            }
+        })
+    }
+
     /// Read at most `maximum_segments` immutable summaries; cache each exact
     /// generation once. Selected capacities include unexamined and active space.
     pub async fn plan_retention(
@@ -37,6 +51,7 @@ impl OwnedJournal {
         if policy.max_age_millis.is_none() && policy.max_bytes.is_none() {
             return Ok(None);
         }
+        let _scratch = self.charge_retention()?;
         let journal = self.journal.ready()?;
         let references = journal.manifest().segments.clone();
         self.retention
@@ -181,6 +196,7 @@ impl OwnedJournal {
         {
             return Err(JournalError::CompletionMismatch);
         }
+        let _scratch = self.charge_retention()?;
         let state = self.images()?.committed().clone();
         let floors = RetentionFloors::from_canonical_state(&state)?;
         self.faulted = true;
@@ -228,10 +244,9 @@ impl OwnedJournal {
         };
         let retired = journal.retire_sealed_prefix(&floors, budget).await?;
         drop(files);
-        self.reader = Some(
-            ozzy_journal_segment::AsyncJournalPartitionIndex::open(journal, self.read_limits)
-                .await?,
-        );
+        if let Some(reader) = &mut self.reader {
+            reader.retired(journal, &retired.unreferenced_segment_ids)?;
+        }
         self.images = Some(journal.recover_canonical_images(self.recovery).await?);
         self.replay.clear();
         self.storage_validation.clear();
@@ -274,7 +289,11 @@ impl OwnedJournal {
                 released: None,
             });
         }
-        let Some((partition, plan)) = self.plan_retention(ticket, now_millis, 1).await? else {
+        let planned = match self.plan_retention(ticket, now_millis, 1).await {
+            Err(JournalError::AppendCapacity) => return Ok(deferred()),
+            result => result?,
+        };
+        let Some((partition, plan)) = planned else {
             return Ok(super::super::RetentionTurn {
                 enabled: false,
                 proposal: None,
@@ -299,7 +318,10 @@ impl OwnedJournal {
             .ok_or(JournalError::Configuration)?;
         if plan.record_floor > state.retained_from {
             let proposal = if leader {
-                self.retention_proposal(partition, plan.record_floor, seed)?
+                match self.retention_proposal(partition, plan.record_floor, seed) {
+                    Err(JournalError::AppendCapacity) => return Ok(deferred()),
+                    result => result?,
+                }
             } else {
                 None
             };
@@ -311,20 +333,24 @@ impl OwnedJournal {
         }
         let mut released = None;
         if !plan.retire.is_empty() {
-            released = self
-                .history
-                .take()
-                .map(|history| super::history::source(&history));
+            let previous = self.history.take();
+            released = previous.as_ref().map(super::history::source);
             let max_read_bytes = self.limits.io.max_segment_bytes as usize;
-            self.retire_confirmed_history(
-                ticket,
-                CheckpointId::from_bytes(*seed.as_bytes()),
-                AsyncRetirementBudget {
-                    max_segments: 1,
-                    max_read_bytes,
-                },
-            )
-            .await?;
+            let retirement = self
+                .retire_confirmed_history(
+                    ticket,
+                    CheckpointId::from_bytes(*seed.as_bytes()),
+                    AsyncRetirementBudget {
+                        max_segments: 1,
+                        max_read_bytes,
+                    },
+                )
+                .await;
+            if matches!(retirement, Err(JournalError::AppendCapacity)) {
+                self.history = previous;
+                return Ok(deferred());
+            }
+            retirement?;
         } else if leader && plan.roll_active {
             let work = self.begin_roll(16)?;
             let done = work.publish().await;
@@ -335,5 +361,13 @@ impl OwnedJournal {
             proposal: None,
             released,
         })
+    }
+}
+
+fn deferred() -> super::super::RetentionTurn {
+    super::super::RetentionTurn {
+        enabled: true,
+        proposal: None,
+        released: None,
     }
 }

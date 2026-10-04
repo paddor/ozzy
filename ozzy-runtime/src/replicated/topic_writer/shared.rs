@@ -9,7 +9,6 @@ use crate::{
     topic_metadata::TopicMetadata,
 };
 use ozzy_proto::{ProducerId, TopicId};
-use std::time::Duration;
 
 mod attachment;
 mod session;
@@ -49,7 +48,6 @@ impl SharedTopicWriterConfig {
             limits: self.limits,
             compress_payloads: self.compress_payloads,
             batch_target_bytes: self.batch_target_bytes,
-            linger: Duration::ZERO,
             max_producers: self.max_producers,
             inflight_appends: self.inflight_appends,
         }

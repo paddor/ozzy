@@ -1,6 +1,7 @@
 //! Nonvoting recovery on a shared shard, including owned retry and handoff.
 
 use super::{ActorError, ActorStatus, Outcome, RecoveryActor, RecoveryStorage, Transition};
+use crate::replica_actor::HistoryReason;
 use crate::{
     replica_actor::{ScheduleError, ScheduledReplica},
     replica_journal::ShardRecoveringJournal,
@@ -75,7 +76,7 @@ impl<J: RecoveryStorage + 'static> ScheduledRecovery<J> {
         actor
             .buffer
             .as_mut()
-            .ok_or(ActorError::History)?
+            .ok_or_else(|| ActorError::history(HistoryReason::Recovery))?
             .bind_allocator(&owner.allocator())?;
         self.owner = Some(owner.clone());
         Ok(())
@@ -322,7 +323,7 @@ impl<J: RecoveryStorage + 'static> ScheduledRecovery<J> {
                     actor
                         .buffer
                         .as_mut()
-                        .ok_or(ActorError::History)?
+                        .ok_or_else(|| ActorError::history(HistoryReason::Recovery))?
                         .bind_allocator(&owner.allocator())?;
                 }
                 self.origin = Some(now);

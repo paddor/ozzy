@@ -8,12 +8,13 @@ publish = false
 description = "Owned asynchronous file operations and resource contracts for Ozzy"
 
 [features]
-simulation = []
+simulation = ["dep:serde"]
 
 [dependencies]
 bytes.workspace = true
 fanring.workspace = true
 futures.workspace = true
+serde = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["sync"] }
 
 [lints]

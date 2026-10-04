@@ -220,6 +220,9 @@ impl ScheduledReplica {
     }
 
     fn discard_link(&mut self, voter: usize, now: Duration) {
+        if let Some(donors) = &mut self.actor.donors {
+            donors.disconnect(voter);
+        }
         let peer = self.actor.configuration.voters()[voter];
         for class in [
             SendClass::Control,
@@ -378,7 +381,7 @@ impl ScheduledReplica {
             self.actor.ingress.close();
         }
         self.actor.publish_status(self.active);
-        result.map_err(ScheduleError::Actor)
+        result.map_err(|error| ScheduleError::Actor(self.actor.diagnose(error)))
     }
 }
 

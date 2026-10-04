@@ -186,6 +186,10 @@ pub struct ReplicaJournal {
 }
 
 impl ReplicaJournal {
+    pub(crate) const fn generation(&self) -> JournalGeneration {
+        self.buffer_generation
+    }
+
     pub(crate) const fn backlog(&self) -> PipelineLimits {
         self.backlog
     }

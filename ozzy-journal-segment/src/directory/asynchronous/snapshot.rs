@@ -1,10 +1,8 @@
-use super::{Journal, validate_operation_bodies, validate_replay_scan};
+use super::Journal;
 use crate::{
     ActiveSegmentIndex, DirectoryError, IndexBuildLimits, IndexLimits, JournalIndexBoundary,
     JournalIndexError, index_catalog::asynchronous::Catalog, journal_index::asynchronous::Snapshot,
-    scan_segment_async,
 };
-use ozzy_io::{OpenMode, Operation};
 
 impl Journal {
     /// Capture a deletion-protected read view using already-published indexes.
@@ -42,44 +40,10 @@ impl Journal {
             .last()
             .expect("validated manifest has active segment");
         let active_bytes = self.writer.written_position().end_offset();
-        let handle = self
-            .access
-            .open(
-                self.root().join("segments").join(reference.file_name()),
-                OpenMode::Read,
-                false,
-                false,
-            )
-            .await?;
-        let length = self.access.length(&handle).await?;
-        if length > reference.capacity || length < active_bytes || active_bytes > reference.capacity
-        {
-            return Err(DirectoryError::SegmentMismatch(reference.segment_id).into());
-        }
-        let count = usize::try_from(active_bytes)
-            .map_err(|_| DirectoryError::SegmentMismatch(reference.segment_id))?;
-        let image = self
-            .access
-            .read_range(&handle, 0, count, self.limits.io.chunk_bytes)
-            .await?;
-        self.access.done(Operation::Close { handle }).await?;
-        let scan = scan_segment_async(
-            &image,
-            reference.first_group_number,
-            reference.first_chain,
-            self.limits.decode,
-        )
-        .await?;
-        validate_operation_bodies(
-            &scan,
-            self.limits.operations,
-            self.manifest.configuration_epoch,
-            self.manifest.promised_view,
-        )
-        .await?;
-        validate_replay_scan(reference, &scan, self.writer.state())?;
-        let active = ActiveSegmentIndex::build_async(
-            &scan,
+        let active_digest = self.writer.state().structural_digest();
+        let groups = self.segment_groups(*reference).await?;
+        let active = ActiveSegmentIndex::build_groups(
+            groups,
             through.op_number,
             self.limits.operations,
             limits,
@@ -100,7 +64,7 @@ impl Journal {
             sealed,
             active: active.map(std::rc::Rc::new),
             active_bytes,
-            active_digest: scan.digest,
+            active_digest,
             through,
             decode: self.limits.decode,
             operations: self.limits.operations,

@@ -11,7 +11,23 @@ description = "Deterministic workloads and fault simulation for Ozzy components.
 readme = "README.md"
 publish = false
 
+[features]
+broker = ["dep:bytes", "dep:clap", "dep:futures", "dep:ozzy-broker", "dep:ozzy-config", "dep:ozzy-io", "dep:ozzy-proto", "dep:ozzy-replication", "dep:ozzy-runtime", "dep:serde", "dep:serde_json", "dep:tokio", "dep:uuid"]
+
 [dependencies]
+bytes = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+ozzy-broker = { workspace = true, optional = true }
+ozzy-config = { workspace = true, optional = true }
+ozzy-io = { workspace = true, features = ["simulation"], optional = true }
+ozzy-proto = { workspace = true, optional = true }
+ozzy-replication = { workspace = true, optional = true }
+ozzy-runtime = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["sync", "time"], optional = true }
+uuid = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 ozzy-core.workspace = true
 ozzy-journal.workspace = true
 thiserror.workspace = true
@@ -29,6 +45,16 @@ tokio = { workspace = true, features = ["sync"] }
 
 [lints]
 workspace = true
+
+[[bin]]
+name = "ozzy-sim"
+path = "src/bin/ozzy_sim.rs"
+required-features = ["broker"]
+
+[[test]]
+name = "ozzy_broker_simulation"
+path = "tests/broker.rs"
+required-features = ["broker"]
 
 [[test]]
 name = "ozzy_canonical_state"

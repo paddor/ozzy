@@ -19,6 +19,25 @@ use tokio::sync::mpsc;
 #[derive(Clone, Debug)]
 pub struct Owner(Rc<RefCell<Local>>);
 
+/// Owner-local reservation for bounded maintenance scratch outside payload arenas.
+#[derive(Debug)]
+pub(crate) struct Charge {
+    owner: Owner,
+    bytes: usize,
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        let local = self.owner.0.borrow();
+        local
+            .shared
+            .usage
+            .bytes
+            .fetch_sub(self.bytes, Ordering::AcqRel);
+        local.shared.usage.changed.notify_changed();
+    }
+}
+
 /// Movable journal arenas may retain this weak capability. Allocation still
 /// requires the original owner thread and a live owner; backend observers may
 /// only retain or release the resulting bytes.
@@ -100,6 +119,28 @@ impl Owner {
     /// into an uncharged allocation. At most `limits.buffers` returns are drained.
     pub fn try_lease(&self, length: usize) -> io::Result<Buffer> {
         self.0.borrow_mut().try_lease(length, usize::MAX)
+    }
+
+    /// Reserve external scratch against the same aggregate owner budget. This
+    /// creates no payload allocation or return-queue entry and never waits.
+    pub(crate) fn try_charge(&self, bytes: usize) -> io::Result<Charge> {
+        let mut local = self.0.borrow_mut();
+        if bytes == 0 || bytes > local.limits.bytes {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        local.collect();
+        while local.shared.usage.bytes.load(Ordering::Acquire) > local.limits.bytes - bytes {
+            let Some(block) = local.cache.pop() else {
+                return Err(io::ErrorKind::WouldBlock.into());
+            };
+            local.cache_bytes -= block.capacity;
+            drop(block);
+        }
+        local.shared.usage.bytes.fetch_add(bytes, Ordering::AcqRel);
+        Ok(Charge {
+            owner: self.clone(),
+            bytes,
+        })
     }
 
     pub(crate) fn allocator(&self) -> Allocator {

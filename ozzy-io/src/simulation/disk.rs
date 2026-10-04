@@ -35,10 +35,29 @@ impl ImageLimits {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 enum Contents {
     File(Box<[u8]>),
-    Directory(BTreeMap<OsString, Inode>),
+    Directory(#[serde(with = "directory_entries")] BTreeMap<OsString, Inode>),
+}
+
+mod directory_entries {
+    use super::{BTreeMap, Inode, OsString};
+    use serde::{Deserialize, Serialize};
+
+    pub(super) fn serialize<S: serde::Serializer>(
+        entries: &BTreeMap<OsString, Inode>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        entries.iter().collect::<Vec<_>>().serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<OsString, Inode>, D::Error> {
+        Vec::<(OsString, Inode)>::deserialize(deserializer)
+            .map(|entries| entries.into_iter().collect())
+    }
 }
 
 impl Contents {
@@ -62,7 +81,7 @@ impl Contents {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct Node {
     dirty: Contents,
     durable: Contents,
@@ -71,7 +90,7 @@ struct Node {
 /// Byte and namespace state shared across simulated process incarnations.
 /// Directory entries reference inodes, so open handles survive rename/unlink
 /// and hard links share bytes. All model paths are absolute and reject `..`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Image {
     nodes: BTreeMap<Inode, Node>,
     next_inode: Inode,

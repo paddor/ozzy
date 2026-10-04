@@ -33,6 +33,7 @@ rustix = { workspace = true, features = ["thread"] }
 ozzy-io-aio.workspace = true
 
 [dev-dependencies]
+ozzy-sim = { workspace = true, features = ["broker"] }
 loom = "0.7"
 ozzy-io = { workspace = true, features = ["simulation"] }
 ozzy-runtime = { workspace = true, features = ["simulation"] }

@@ -21,6 +21,39 @@ fn repeated_retirement_preserves_both_quorum_policies_and_the_retained_chain() {
         }
         let ticket = primary.driver.begin_validation().unwrap();
         let before = primary.driver.normal().unwrap().snapshot();
+        let owner = primary.journal.append_memory.clone().unwrap();
+        owner.trim_cache();
+        let occupied = owner
+            .try_charge(1024 * 1024 - owner.allocated_bytes())
+            .unwrap();
+        assert!(matches!(
+            drive(
+                &mut controller,
+                primary.journal.retire_confirmed_history(
+                    ticket,
+                    CheckpointId::from_bytes([91; 16]),
+                    AsyncRetirementBudget {
+                        max_segments: 1,
+                        max_read_bytes: 32768
+                    },
+                )
+            ),
+            Err(JournalError::AppendCapacity)
+        ));
+        assert!(!primary.journal.is_faulted());
+        assert!(
+            primary
+                .journal
+                .journal
+                .ready()
+                .unwrap()
+                .manifest()
+                .checkpoint
+                .is_none()
+        );
+        assert_eq!(primary.driver.normal().unwrap().snapshot(), before);
+        drop(occupied);
+
         let selected = retire(&mut controller, &mut primary.journal, ticket, 92, &[1]);
         assert_eq!(
             retire(&mut controller, &mut primary.journal, ticket, 93, &[2]),

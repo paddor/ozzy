@@ -92,7 +92,7 @@ async fn lagging_follower_recovers_retained_checkpoint_then_supplies_the_require
                 max_bytes: Some(1024 * 1024),
             };
         });
-        let restart = copy_deployment(&deployment).remove(2);
+        let restart = deployment[2].clone();
         let directory = restart.0.plan.partitions[0].directory.clone();
         let recovered_node = ozzy_proto::NodeId::from_bytes(
             *restart.0.identity.brokers[&restart.0.plan.name].as_bytes(),
@@ -130,7 +130,7 @@ async fn lagging_follower_recovers_retained_checkpoint_then_supplies_the_require
         );
         assert!(selected(&old_image, &directory).checkpoint.is_none());
         for round in 0..2 {
-            let (checked, local) = copy_deployment(std::slice::from_ref(&restart)).remove(0);
+            let (checked, local) = restart.clone();
             let (restarted, control, task) =
                 start_image(&runtime, checked, local, true, old_image.clone()).await;
             brokers.push(restarted);
@@ -177,24 +177,6 @@ async fn lagging_follower_recovers_retained_checkpoint_then_supplies_the_require
     }
 }
 
-pub(super) fn copy_deployment(
-    deployment: &[(CheckedConfig, BrokerIdentity)],
-) -> Vec<(CheckedConfig, BrokerIdentity)> {
-    deployment
-        .iter()
-        .map(|(checked, local)| {
-            (
-                CheckedConfig {
-                    plan: checked.plan.clone(),
-                    deployment: checked.deployment.clone(),
-                    identity: checked.identity.clone(),
-                },
-                local.clone(),
-            )
-        })
-        .collect()
-}
-
 #[tokio::test(flavor = "current_thread")]
 async fn disk_quorum_cluster_restart_with_an_ancient_replica_preserves_retained_history() {
     restart_with_ancient_replica(Confirmation::DiskQuorum).await;
@@ -215,7 +197,7 @@ async fn restart_with_ancient_replica(policy: Confirmation) {
             max_bytes: Some(1024 * 1024),
         };
     });
-    let restart = copy_deployment(&deployment);
+    let restart = deployment.clone();
     let producer = role_links(&runtime, &deployment[0].0, handshake::PRODUCER).await;
     let (mut brokers, mut controls, mut images) = start_images(&runtime, deployment, true).await;
     let config = SharedTopicWriterConfig::new(limits());
@@ -321,10 +303,10 @@ async fn retained_history_survives_complete_cluster_restart_and_producer_resume(
                 max_bytes: Some(1024 * 1024),
             };
         });
-        let restart = copy_deployment(&deployment);
+        let restart = deployment.clone();
         let producer = role_links(&runtime, &deployment[0].0, handshake::PRODUCER).await;
         let consumer = role_links(&runtime, &deployment[0].0, handshake::CONSUMER).await;
-        let (brokers, _, images) = start_images(&runtime, deployment, true).await;
+        let (brokers, controls, images) = start_images(&runtime, deployment, true).await;
         let config = SharedTopicWriterConfig::new(limits());
         let mut writer = live_many(
             &brokers,
@@ -338,7 +320,7 @@ async fn retained_history_survives_complete_cluster_restart_and_producer_resume(
             append_one(&brokers, &mut writer, number).await;
         }
         writer.close().await.unwrap();
-        tokio::time::sleep(Duration::from_secs(4)).await;
+        let tail = retained_tail(&brokers, &controls, &restart).await;
         let mut reader = live_many(
             &brokers,
             "resolve time seek before disconnect",
@@ -353,9 +335,17 @@ async fn retained_history_survives_complete_cluster_restart_and_producer_resume(
         )
         .await
         .unwrap();
-        let first = live_many(&brokers, "read before disconnect", reader.next())
+        let mut first = live_many(&brokers, "read before disconnect", reader.next())
             .await
             .unwrap();
+        assert!(first.offset.get() > 0);
+        // Copies can roll at different operations. A future leader may advance
+        // the earliest retained floor, so continue from their common active tail.
+        while first.offset.get() < tail {
+            first = live_many(&brokers, "advance into retained tail", reader.next())
+                .await
+                .unwrap();
+        }
         let floor = first.offset.get();
         assert!(floor > 0 && floor + 5 < 600);
         for broker in brokers {
@@ -365,11 +355,6 @@ async fn retained_history_survives_complete_cluster_restart_and_producer_resume(
         let mut restarted_images = Vec::new();
         for ((checked, local), image) in restart.into_iter().zip(images) {
             let image = image.await.unwrap();
-            assert!(
-                selected(&image, &checked.plan.partitions[0].directory)
-                    .checkpoint
-                    .is_some()
-            );
             let (broker, _, image) = start_image(&runtime, checked, local, true, image).await;
             restarted.push(broker);
             restarted_images.push(image);
@@ -405,6 +390,45 @@ async fn retained_history_survives_complete_cluster_restart_and_producer_resume(
             image.await.unwrap();
         }
     }
+}
+
+async fn retained_tail(
+    brokers: &[Broker],
+    controls: &[std::sync::Arc<ozzy_sim::broker::Control>],
+    deployment: &[(CheckedConfig, ozzy_config::BrokerIdentity)],
+) -> u64 {
+    live_many(
+        brokers,
+        "checkpoint retained history on every copy",
+        async {
+            loop {
+                let mut tail = 0;
+                let mut ready = true;
+                for (control, (checked, _)) in controls.iter().zip(deployment) {
+                    let image = control.image().await;
+                    let manifest = selected(&image, &checked.plan.partitions[0].directory);
+                    ready &= manifest.checkpoint.is_some();
+                    // This fixture appends one record per operation. Control
+                    // operations only increase this conservative offset bound.
+                    tail = tail.max(
+                        manifest
+                            .segments
+                            .last()
+                            .unwrap()
+                            .first_chain
+                            .next_op_number()
+                            - 1,
+                    );
+                }
+                if ready {
+                    assert!(tail + 5 < 600);
+                    return tail;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
+    .await
 }
 
 async fn read_cold_seeks(

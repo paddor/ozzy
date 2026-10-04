@@ -11,13 +11,14 @@ case "$scope" in
     core) args=(-p ozzy-core -p ozzy-proto -p ozzy-journal -p ozzy-replication) ;;
     writer) args=(-p ozzy-runtime --lib 'replicated::writer::') ;;
     local) args=(-p ozzy-broker --test ozzy_broker_config) ;;
-    inproc) args=(-p ozzy-broker --test ozzy_broker_config -E
-        'test(inproc_memory_) or test(journals::serving::simulated::tests::)') ;;
+    inproc) args=(-p ozzy-broker -p ozzy-sim --features ozzy-sim/broker
+        --test ozzy_broker_config --test ozzy_broker_simulation -E
+        'test(inproc_memory_) or test(journals::serving::simulated::)') ;;
     storage) args=(-p ozzy-journal-segment --features lz4 --lib) ;;
     io) args=(-p ozzy-io -p ozzy-io-pool -p ozzy-io-aio --features ozzy-io/simulation) ;;
     replication) args=(-p ozzy-runtime --features lz4-storage,simulation
         --test ozzy_replica_transport --test ozzy_replication) ;;
-    simulation) args=(-p ozzy-sim -p ozzy-io --features ozzy-io/simulation) ;;
+    simulation) args=(-p ozzy-sim -p ozzy-io --features ozzy-io/simulation,ozzy-sim/broker) ;;
     loom)
         export RUSTFLAGS="${RUSTFLAGS:--C target-cpu=native} --cfg ozzy_loom"
         cargo test -p ozzy-runtime --test ozzy_loom -- "$@"

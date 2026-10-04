@@ -1,6 +1,6 @@
 //! Bounded churn shares the process suite's SDK and independent payload oracle.
 
-use super::*;
+use super::{Bytes, Client, MessageId, Pending, RecordInput};
 
 impl Client {
     pub(super) async fn admit(
@@ -20,10 +20,13 @@ impl Client {
         assert_eq!(admitted.partition(), partition as u32);
         assert_eq!(admitted.sequence(), self.next_sequences[partition]);
         self.next_sequences[partition] += 1;
+        self.submitted
+            .push((partition as u32, admitted.sequence(), id, parts.clone()));
         (admitted, id, parts)
     }
 
-    pub(crate) async fn queue_varied(&mut self, wave: usize) -> Vec<Pending> {
+    /// Vary sparse, burst, hot-partition, mixed-size and multipart traffic.
+    pub async fn queue_varied(&mut self, wave: usize) -> Vec<Pending> {
         let pattern = wave % 6;
         let records = [4, 1, 32, 64, 4, 1][pattern];
         let mut pending = Vec::new();

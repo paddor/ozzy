@@ -394,6 +394,12 @@ impl Controller {
     pub fn trace(&self) -> &[Event] {
         &self.trace
     }
+    /// Drain recorded evidence without changing pending jobs or their authority.
+    /// Long-running harnesses must retain or export the returned schedule before
+    /// allowing the next bounded trace window to fill.
+    pub fn take_trace(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.trace)
+    }
     /// Production admission counters and wakeups backing these simulated lanes.
     pub fn admission(&self) -> &Admission {
         &self.shared.admission

@@ -29,7 +29,7 @@ default-members = [
     "ozzy-journal",
     "ozzy-journal-segment",
 ]
-resolver = "2"
+resolver = "3"
 
 [workspace.package]
 version = "0.1.0"
@@ -63,6 +63,7 @@ ozzy-io-aio = { path = "ozzy-io-aio" }
 ozzy-proto = { path = "ozzy-proto" }
 ozzy-replication = { path = "ozzy-replication" }
 ozzy-runtime = { path = "ozzy-runtime" }
+ozzy-sim = { path = "ozzy-sim" }
 ozzy-journal = { path = "ozzy-journal" }
 ozzy-journal-segment = { path = "ozzy-journal-segment" }
 tempfile = "3.27.0"

@@ -93,9 +93,9 @@ impl Service {
     /// domain. This policy grants only client access. Broker access still comes
     /// from the configured authorization table. Node IDs are routing labels.
     ///
-    /// Configure before starting negotiation. Metadata slots remain reserved
-    /// across disconnects to retain old HELLO fences, so the limit covers all
-    /// distinct client identities observed during this broker lifetime.
+    /// Configure before starting negotiation. The transport owner may reclaim
+    /// a disconnected client only after fencing its exact physical source.
+    /// The limit bounds concurrently retained client metadata, not lifetime churn.
     pub fn with_trusted_clients(mut self, maximum: usize) -> Result<Self, ServiceError> {
         if maximum == 0
             || self.trusted_maximum != 0
@@ -142,6 +142,7 @@ impl Service {
             peer,
             Peer {
                 access,
+                trusted: true,
                 initiating: false,
                 handshake: None,
                 awaiting_welcome: false,
@@ -149,5 +150,28 @@ impl Service {
         );
         self.link_current.insert(peer, None);
         Ok(access)
+    }
+
+    /// Reclaim a dynamically admitted client after its physical control source
+    /// has been retired. The transport owner must reject every receipt from that
+    /// retired source before calling `receive`, including HELLO. Configured
+    /// clients and broker membership are never removed by this operation.
+    pub fn retire_transport_client(&mut self, peer: NodeId) -> bool {
+        if !self.peers.get(&peer).is_some_and(|state| state.trusted) {
+            return false;
+        }
+        if let Some(link) = self.links.get(peer) {
+            self.disconnect(link.binding);
+        }
+        self.dispatcher.disconnect(peer);
+        self.sessions.retire(peer);
+        self.peers.remove(&peer);
+        self.link_current.remove(&peer);
+        self.links
+            .0
+            .current
+            .store(std::sync::Arc::new(self.link_current.clone()));
+        self.links.0.changed.notify_changed();
+        true
     }
 }

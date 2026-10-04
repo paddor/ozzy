@@ -78,7 +78,7 @@ impl Settings {
             },
             decode: DecodeLimits {
                 max_groups: segment / WRITE_GROUP_ALIGNMENT,
-                max_entries: segment / ENTRY_HEADER_BYTES,
+                max_entries: operations,
                 max_entry_bytes: body + ENTRY_HEADER_BYTES + 7,
                 max_decoded_body_bytes: body,
                 max_group_decoded_body_bytes: body,
@@ -95,10 +95,11 @@ impl Settings {
                 max_segment_bytes: topic.segment_bytes,
                 chunk_bytes: chunk,
                 direct,
-                write_mode: if topic.confirmation == Confirmation::ReplicatedPersisting {
-                    SegmentWriteMode::Buffered
-                } else {
-                    SegmentWriteMode::DataSync
+                write_mode: match topic.confirmation {
+                    Confirmation::ReplicatedPersisting => SegmentWriteMode::Buffered,
+                    Confirmation::LocalDurable | Confirmation::DiskQuorum => {
+                        SegmentWriteMode::DataSync
+                    }
                 },
             },
             directory_entries: (progress / 256).min(1024),

@@ -1,11 +1,6 @@
-use super::{
-    DirectoryError, Journal, evidence, position_before, scan_contains_position,
-    validate_operation_bodies,
-};
-use crate::directory::{
-    position_regresses, validate_metadata_successor_fields, validate_replay_scan,
-};
-use crate::{CurrentReference, Manifest, scan_segment_async};
+use super::{DirectoryError, Journal, evidence, position_before};
+use crate::directory::{position_regresses, validate_metadata_successor_fields};
+use crate::{CurrentReference, Manifest};
 
 impl Journal {
     pub(super) fn next_manifest(&self) -> Result<Manifest, DirectoryError> {
@@ -113,30 +108,19 @@ impl Journal {
         }
         let mut seen = positions.map(|position| position == crate::LogPosition::GENESIS);
         for reference in &self.manifest.segments {
-            let bytes = self.segment_image(*reference).await?;
-            let scan = scan_segment_async(
-                &bytes,
-                reference.first_group_number,
-                reference.first_chain,
-                self.limits.decode,
-            )
-            .await?;
-            validate_operation_bodies(
-                &scan,
-                self.limits.operations,
-                self.manifest.configuration_epoch,
-                self.manifest.promised_view,
-            )
-            .await?;
-            validate_replay_scan(reference, &scan, self.writer.state())?;
             for (found, position) in seen.iter_mut().zip(positions) {
-                *found |= scan_contains_position(
-                    &scan,
-                    reference.first_chain,
-                    position.following_chain()?,
-                )
-                .await;
+                *found |= reference.first_chain == position.following_chain()?;
             }
+            let mut groups = self.segment_groups(*reference).await?;
+            while let Some(group) = groups.next().await? {
+                for operation in &group.operations {
+                    for (found, position) in seen.iter_mut().zip(positions) {
+                        *found |= operation.op_number == position.op_number
+                            && operation.digest == position.digest;
+                    }
+                }
+            }
+            groups.finish().await?;
         }
         for (position, found) in positions.into_iter().zip(seen) {
             if !found {

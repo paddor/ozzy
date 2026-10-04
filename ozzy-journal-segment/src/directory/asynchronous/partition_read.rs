@@ -271,6 +271,34 @@ impl Index {
         })
     }
 
+    /// Forget only the exact sealed prefix removed by this owner's retirement.
+    /// Active selectors and previously captured reads keep their own ownership.
+    pub fn retired(&mut self, journal: &Journal, segments: &[u64]) -> Result<(), Error> {
+        self.check_owner(journal)?;
+        if segments.iter().any(|id| {
+            journal
+                .manifest
+                .segments
+                .iter()
+                .any(|reference| reference.segment_id == *id)
+        }) {
+            return Err(Error::StaleCatalog);
+        }
+        if self
+            .previous
+            .as_ref()
+            .is_some_and(|index| segments.contains(&index.source().segment_id))
+        {
+            self.previous = None;
+        }
+        let mut cold = self.cold.borrow_mut();
+        cold.hot
+            .retain(|index| !segments.contains(&index.source().segment_id));
+        cold.bytes = cold.hot.iter().map(|index| index.retained_bytes()).sum();
+        self.resident.retired(self.identity.group_id, segments);
+        Ok(())
+    }
+
     fn check_owner(&self, journal: &Journal) -> Result<(), Error> {
         journal.healthy()?;
         if self.identity != journal.manifest.identity

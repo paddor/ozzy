@@ -1,5 +1,6 @@
 //! One bounded live window, independent of lagging peers' retained disk history.
 
+use crate::replica_actor::HistoryReason;
 mod append;
 mod flow;
 mod receive;
@@ -216,7 +217,7 @@ impl ReplicaActor {
             Ok(None) => {}
             Err(DriverError::Replication(ReplicationError::HistoryGap)) => {
                 let Control::Commit(commit) = control else {
-                    return Err(ActorError::History);
+                    return Err(ActorError::history(HistoryReason::ReceiveWindow));
                 };
                 if self.work.deferred_commit.is_none_or(|(_, old)| {
                     old.scope != commit.scope || old.committed.op < commit.committed.op

@@ -1,5 +1,5 @@
 use super::{
-    ActiveIndexError, IndexLimits, IndexSource, SegmentIndexImage, SegmentScan, enforce_footprint,
+    ActiveIndexError, IndexLimits, IndexSource, SegmentIndexImage, enforce_footprint,
     extend_bounded, validate_limits,
 };
 use crate::{
@@ -67,7 +67,9 @@ impl Entries {
 
     pub(super) fn source(
         &self,
-        scan: &SegmentScan<'_>,
+        header: &SegmentHeader,
+        valid_bytes: u64,
+        digest: Digest,
         through_op: u64,
     ) -> Result<Option<IndexSource>, ActiveIndexError> {
         let Some(first_op_number) = self.first else {
@@ -89,10 +91,10 @@ impl Entries {
             self.limits,
         )?;
         Ok(Some(IndexSource {
-            group_id: scan.header.group_id(),
-            segment_id: scan.header.segment_id(),
-            valid_bytes: scan.valid_bytes,
-            segment_digest: scan.digest,
+            group_id: header.group_id(),
+            segment_id: header.segment_id(),
+            valid_bytes,
+            segment_digest: digest,
             first_op_number,
             last_op_number,
             last_operation_digest: self.digest,

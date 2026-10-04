@@ -64,7 +64,7 @@ tracked docs. Reserved commands do not imply an implemented public service.
 | `ozzy-io` | Owned file jobs, opaque handles, admission, completion, file simulator |
 | `ozzy-io-pool` | Bounded blocking execution and shared handle registry |
 | `ozzy-io-aio` | One Linux AIO owner per device, with fixed blocking helpers |
-| `ozzy-sim` | Controlled workloads, message order, time, faults, independent oracle |
+| `ozzy-sim` | Controlled workloads, protocol schedules, shared real-broker memory/inproc harness and independent SDK record oracle |
 | `ozzy-bench` | Serial workloads, profiling, append-only result ledger, SVG charts |
 
 ## Integration boundaries

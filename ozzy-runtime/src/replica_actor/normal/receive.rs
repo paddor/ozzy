@@ -3,6 +3,7 @@
 //! Staged operations are unadmitted hints. Count/body limits include the core's
 //! accepted suffix, read-only validation in flight, and this queued suffix together.
 
+use crate::replica_actor::HistoryReason;
 use ozzy_replication::flow::{Operation, Receiver};
 use ozzy_replication::wire::PrepareBatch;
 use ozzy_replication::{PipelineLimits, ReplicaSnapshot};
@@ -98,7 +99,7 @@ impl Receive {
         .flatten()
         {
             if batch.end().op == known.op && batch.end() != known {
-                return Err(ActorError::History);
+                return Err(ActorError::history(HistoryReason::ReceiveWindow));
             }
         }
         if batch.end().op <= predecessor.op {
@@ -113,9 +114,9 @@ impl Receive {
         let first = batch
             .operations()
             .find(|operation| operation.prefix().op > predecessor.op)
-            .ok_or(ActorError::History)?;
+            .ok_or_else(|| ActorError::history(HistoryReason::ReceiveWindow))?;
         if first.canonical().previous_digest != predecessor.digest {
-            return Err(ActorError::History);
+            return Err(ActorError::history(HistoryReason::ReceiveWindow));
         }
         let (count, bytes) = batch
             .operations()

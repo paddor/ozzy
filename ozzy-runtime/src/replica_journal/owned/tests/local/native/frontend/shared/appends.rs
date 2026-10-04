@@ -13,7 +13,6 @@ pub(super) fn writer_config(producer: u8, next_sequence: u64) -> WriterConfig {
         limits: limits(),
         compress_payloads: true,
         batch_target_bytes: 1024,
-        linger: Duration::ZERO,
         max_producers: 1,
         inflight_appends: 1,
     }

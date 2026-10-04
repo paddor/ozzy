@@ -2,6 +2,7 @@
 
 use super::io::FetchPurpose;
 use super::{ActorError, Bytes, Message, NodeId, PendingIo, ReplicaActor, SendClass, wire};
+use crate::replica_actor::HistoryReason;
 use crate::replica_journal::{FetchedHistory, PinnedRecovery};
 use ozzy_replication::recovery::RecoveryResponse;
 use ozzy_replication::wire::{FetchOps, RecoveryRequest, RecoveryState};
@@ -17,13 +18,65 @@ pub(super) struct Donors {
 struct Slot {
     request: Option<RecoveryRequest>,
     response: Option<RecoveryResponse>,
-    pin: Option<PinnedRecovery>,
+    pin: Pin,
     fetch: Option<FetchOps>,
     checkpoint: Option<wire::CheckpointRequest>,
     reply_pending: bool,
 }
 
+/// Exact admitted work survives replacement of the request that wanted it.
+#[derive(Debug, Default, Clone, Copy)]
+enum Pin {
+    #[default]
+    Empty,
+    Pinning(RecoveryResponse),
+    Held(PinnedRecovery),
+    Releasing(PinnedRecovery),
+}
+
+impl Pin {
+    fn held(self) -> Option<PinnedRecovery> {
+        match self {
+            Self::Held(pin) => Some(pin),
+            Self::Empty | Self::Pinning(_) | Self::Releasing(_) => None,
+        }
+    }
+
+    fn response(self) -> Option<RecoveryResponse> {
+        match self {
+            Self::Pinning(response) => Some(response),
+            Self::Held(pin) => Some(pin.response()),
+            Self::Empty | Self::Releasing(_) => None,
+        }
+    }
+}
+
+impl Slot {
+    fn clear_request(&mut self) {
+        self.request = None;
+        self.fetch = None;
+        self.checkpoint = None;
+        self.reply_pending = false;
+    }
+}
+
 impl Donors {
+    pub(super) fn disconnect(&mut self, index: usize) {
+        // Keep the snapshot identity after releasing its backing. A same-nonce
+        // retry must wait for a fresh attempt rather than recapture a moving tail.
+        self.slots[index].clear_request();
+    }
+
+    pub(super) fn evidence(&self) -> ([Option<RecoveryResponse>; 3], [Option<PinnedRecovery>; 3]) {
+        (
+            self.slots.each_ref().map(|slot| slot.response),
+            self.slots.each_ref().map(|slot| match slot.pin {
+                Pin::Held(pin) | Pin::Releasing(pin) => Some(pin),
+                Pin::Empty | Pin::Pinning(_) => None,
+            }),
+        )
+    }
+
     pub(super) fn clear_pins(&mut self) {
         for slot in &mut self.slots {
             *slot = Slot::default();
@@ -49,15 +102,37 @@ impl ReplicaActor {
             return Ok(());
         }
         let slot = &mut self.donors.as_mut().expect("enabled donors").slots[index];
+        if let Some(response) = slot.response.filter(|response| {
+            response.scope == self.driver.scope()
+                && response.nonce == request.nonce
+                && response.primary.is_some()
+        }) {
+            let expired = match slot.pin {
+                Pin::Empty => slot.request.is_none(),
+                Pin::Releasing(pin) => {
+                    pin.response().scope == response.scope && pin.response().nonce == response.nonce
+                }
+                Pin::Pinning(_) | Pin::Held(_) => false,
+            };
+            if expired {
+                return Ok(());
+            }
+        }
         if slot.response.is_none_or(|response| {
             response.nonce != request.nonce || response.scope != self.driver.scope()
         }) {
-            let response = self
-                .driver
-                .normal()
-                .expect("ready normal")
-                .recovery_response(request.nonce)
-                .map_err(crate::replica_journal::JournalError::from)?;
+            let retained = slot.pin.response();
+            let response = if let Some(response) = retained.filter(|response| {
+                response.nonce == request.nonce && response.scope == self.driver.scope()
+            }) {
+                response
+            } else {
+                self.driver
+                    .normal()
+                    .expect("ready normal")
+                    .recovery_response(request.nonce)
+                    .map_err(crate::replica_journal::JournalError::from)?
+            };
             slot.response = Some(response);
             slot.fetch = None;
             slot.checkpoint = None;
@@ -79,17 +154,17 @@ impl ReplicaActor {
                     .response
                     .is_some_and(|response| response.scope != self.driver.scope())
             {
-                slot.request = None;
                 slot.response = None;
-                slot.fetch = None;
-                slot.checkpoint = None;
-                slot.reply_pending = false;
+                slot.clear_request();
                 continue;
             }
             if slot.reply_pending
                 && let (Some(request), Some(response)) = (slot.request, slot.response)
                 && (response.primary.is_none()
-                    || slot.pin.is_some_and(|pin| pin.response() == response))
+                    || slot
+                        .pin
+                        .held()
+                        .is_some_and(|pin| pin.response() == response))
             {
                 replies[index] = Some(RecoveryState {
                     request_id: request.request_id,
@@ -136,7 +211,7 @@ impl ReplicaActor {
             .position(|voter| *voter == from)
             .expect("configured sender");
         let slot = &mut donors.slots[index];
-        let Some(pin) = slot.pin.filter(|pin| pin.source() == request.source) else {
+        let Some(pin) = slot.pin.held().filter(|pin| pin.source() == request.source) else {
             return false;
         };
         if slot.response == Some(pin.response())
@@ -163,49 +238,75 @@ impl ReplicaActor {
         for delta in 0..3 {
             let index = (donors.cursor + delta) % 3;
             let slot = &mut donors.slots[index];
-            let action =
-                if let Some(pin) = slot.pin.filter(|pin| slot.response != Some(pin.response())) {
-                    Some(PendingIo::RecoveryRelease(
-                        self.journal.release_recovery(pin)?,
-                    ))
-                } else if let Some(response) = slot
-                    .response
-                    .filter(|response| response.primary.is_some() && slot.pin.is_none())
+            let action = if let Some(response) = slot.response.filter(|response| {
+                response.primary.is_some()
+                    && matches!(slot.pin, Pin::Empty)
+                    && slot.request.is_some()
+            }) {
+                if !self.pending_persistence.is_empty()
+                    || self.pending_sync.is_some()
+                    || !self.journal.settled()
                 {
-                    if !self.pending_persistence.is_empty()
-                        || self.pending_sync.is_some()
-                        || !self.journal.settled()
-                    {
-                        // Drain writes and their independent barrier before pinning
-                        // authoritative history; busy admission is backpressure.
-                        return Ok(true);
-                    }
-                    Some(PendingIo::RecoveryPin(self.journal.pin_recovery(
+                    // Drain writes and their independent barrier before pinning
+                    // authoritative history; busy admission is backpressure.
+                    return Ok(true);
+                }
+                let pending = self
+                    .journal
+                    .pin_recovery(self.configuration.voters()[index], response)?;
+                slot.pin = Pin::Pinning(response);
+                Some(PendingIo::RecoveryPin(pending))
+            } else if let (Some(pin), Some(request)) = (slot.pin.held(), slot.checkpoint.take()) {
+                Some(PendingIo::RecoveryCheckpoint(
+                    self.journal.fetch_checkpoint(pin, request)?,
+                    self.configuration.voters()[index],
+                ))
+            } else if let (Some(pin), Some(request)) = (slot.pin.held(), slot.fetch) {
+                let buffer = self
+                    .buffer
+                    .take()
+                    .ok_or_else(|| ActorError::history(HistoryReason::BufferUnavailable))?;
+                slot.fetch = None;
+                Some(PendingIo::Fetch(
+                    self.journal
+                        .fetch_recovery(pin, request, buffer)
+                        .map_err(|rejected| rejected.reason)?,
+                    FetchPurpose::Recovery(
                         self.configuration.voters()[index],
-                        response,
-                    )?))
-                } else if let (Some(pin), Some(request)) = (slot.pin, slot.checkpoint.take()) {
-                    Some(PendingIo::RecoveryCheckpoint(
-                        self.journal.fetch_checkpoint(pin, request)?,
-                        self.configuration.voters()[index],
-                    ))
-                } else if let (Some(pin), Some(request)) = (slot.pin, slot.fetch) {
-                    let buffer = self.buffer.take().ok_or(ActorError::History)?;
-                    slot.fetch = None;
-                    Some(PendingIo::Fetch(
-                        self.journal
-                            .fetch_recovery(pin, request, buffer)
-                            .map_err(|rejected| rejected.reason)?,
-                        FetchPurpose::Recovery(
-                            self.configuration.voters()[index],
-                            pin.response().nonce,
-                        ),
-                    ))
-                } else {
-                    None
-                };
+                        pin.response().nonce,
+                    ),
+                ))
+            } else {
+                None
+            };
             if let Some(action) = action {
                 self.pending = Some(action);
+                donors.yield_normal = true;
+                donors.cursor = (index + 1) % 3;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Release obsolete sources even while a view change prevents serving.
+    /// At most one exact release is admitted per bounded actor round.
+    pub(super) fn schedule_donor_release(&mut self) -> Result<bool, ActorError> {
+        let Some(donors) = &mut self.donors else {
+            return Ok(false);
+        };
+        for delta in 0..3 {
+            let index = (donors.cursor + delta) % 3;
+            let slot = &mut donors.slots[index];
+            if let Some(pin) = slot
+                .pin
+                .held()
+                .filter(|pin| slot.request.is_none() || slot.response != Some(pin.response()))
+            {
+                self.pending = Some(PendingIo::RecoveryRelease(
+                    self.journal.release_recovery(pin)?,
+                ));
+                slot.pin = Pin::Releasing(pin);
                 donors.yield_normal = true;
                 donors.cursor = (index + 1) % 3;
                 return Ok(true);
@@ -224,24 +325,33 @@ impl ReplicaActor {
             .voters()
             .iter()
             .position(|voter| *voter == pin.requester())
-            .ok_or(ActorError::History)?;
-        let slot = &mut self.donors.as_mut().ok_or(ActorError::History)?.slots[index];
+            .ok_or_else(|| ActorError::donor_pin(pin))?;
+        let slot = &mut self
+            .donors
+            .as_mut()
+            .ok_or_else(|| ActorError::donor_pin(pin))?
+            .slots[index];
         if release {
-            if slot.pin != Some(*pin) {
-                return Err(ActorError::History);
+            if !matches!(slot.pin, Pin::Releasing(expected) if expected == *pin) {
+                return Err(ActorError::donor_pin(pin));
             }
-            slot.pin = None;
+            slot.pin = Pin::Empty;
         } else {
-            if slot.pin.is_some() {
-                return Err(ActorError::History);
+            let Pin::Pinning(mut scheduled) = slot.pin else {
+                return Err(ActorError::donor_pin(pin));
+            };
+            // Capturing history may enrich the admitted response with its exact
+            // checkpoint. Every other authority field must match that work.
+            if let Some(log) = scheduled.primary.as_mut() {
+                log.checkpoint = pin.response().primary.and_then(|log| log.checkpoint);
             }
-            if !slot.response.is_some_and(|response| {
-                response.scope == pin.response().scope && response.nonce == pin.response().nonce
-            }) {
-                return Err(ActorError::History);
+            if scheduled != pin.response() {
+                return Err(ActorError::donor_pin(pin));
             }
-            slot.response = Some(pin.response());
-            slot.pin = Some(*pin);
+            if slot.response == slot.pin.response() {
+                slot.response = Some(pin.response());
+            }
+            slot.pin = Pin::Held(*pin);
         }
         Ok(())
     }
@@ -256,7 +366,7 @@ impl ReplicaActor {
             && self.donors.as_ref().is_some_and(|donors| {
                 donors.slots.iter().enumerate().any(|(index, slot)| {
                     self.configuration.voters()[index] == to
-                        && slot.pin.is_some_and(|pin| {
+                        && slot.pin.held().is_some_and(|pin| {
                             pin.response().nonce == nonce
                                 && pin.source() == fetched.request().source
                                 && pin.response().scope == fetched.request().scope
@@ -295,7 +405,7 @@ impl ReplicaActor {
             return;
         };
         let slot = &mut donors.slots[index];
-        if slot.pin.is_some_and(|pin| {
+        if slot.pin.held().is_some_and(|pin| {
             request.source == pin.source()
                 && request.nonce == pin.response().nonce
                 && request.scope == pin.response().scope
@@ -326,11 +436,12 @@ impl ReplicaActor {
         };
         if !self.application_ready()
             || !self.donors.as_ref().is_some_and(|donors| {
-                donors.slots[index].pin.is_some_and(|pin| {
+                donors.slots[index].pin.held().is_some_and(|pin| {
                     pin.response().scope == self.driver.scope()
                         && chunk.request.scope == pin.response().scope
                         && chunk.request.source == pin.source()
                         && chunk.request.nonce == pin.response().nonce
+                        && donors.slots[index].response == Some(pin.response())
                 })
             })
         {

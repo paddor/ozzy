@@ -317,10 +317,14 @@ Arrival rate is independent of confirmations and totals all four writers.
 
 ```sh
 ozy_compare --impl all --check-only
-ozy_compare --impl all --modes durable --sizes 128,1024,8192 \
+ozy_compare --impl all --modes durable --sizes 128,1024 \
   --partitions 8 --segment-mib 1024 --broker-cpus 0,1 \
   --client-cpus 2,3,4,5 --warmup 2 --duration 54 \
   --ramp 100:30,1000:8,10000:8,100000:8 --repetitions 1 --no-build
+ozy_compare --impl all --modes durable --sizes 8192 \
+  --partitions 8 --segment-mib 1024 --broker-cpus 0,1 \
+  --client-cpus 2,3,4,5 --warmup 2 --duration 46 \
+  --ramp 100:30,1000:8,10000:8 --repetitions 1 --no-build
 ```
 
 For cluster runs, use `--modes replicated-persisting` or
@@ -363,7 +367,10 @@ unadmitted 1 s after its due time fails the run. Never add or subtract percentil
 Partial reruns use `--replace-run-id ID` alongside the full `--run-id`.
 Only existing Ozzy cases from an identical worker binary and matching controls
 can replace measurements; other cases and both runs' provenance remain.
-Charts refuse to drop existing systems, record sizes, or offered rates.
+Charts refuse to drop existing systems, record sizes, or offered rates unless
+an explicit per-size `--max-rate SIZE:RATE` excludes those rates. The six release
+charts stop at 100k/s for 128 B and 1 KiB, and 10k/s for 8 KiB; higher loads belong
+in separate saturation experiments. Raw ledger measurements remain intact.
 
 Keep fixed-load results separate from saturation curves.
 
@@ -500,6 +507,8 @@ ozy_chart --fixed-load --run-id RATE_100_RUN --run-id RATE_1000_RUN \
 ozy_chart --fixed-load --run-id NEW_OZZY_RUN \
   --external-reference-run-id CACHED_RATE_100_RUN \
   --external-reference-run-id CACHED_OTHER_RATES_RUN
+ozy_chart --fixed-load --run-id EXISTING_RUN \
+  --max-rate 128:100000 --max-rate 1024:100000 --max-rate 8192:10000
 ```
 
 Finish benchmark work by refreshing the affected SVGs before committing.
@@ -568,6 +577,27 @@ failure. It adds an annotation and a gap when no completed attempt exists.
 A separate failed repeat keeps the completed attempt plotted and labels the
 repeat. Failures supply no latency samples. Build, settings, broker version,
 and failure artifacts must match the selected results.
+
+For a release regression check, select completed Ozzy baseline and candidate
+runs with at least two repetitions per cell. The same tool writes a JSON report
+instead of charts and exits unsuccessfully if any cell loses at least 5% of
+throughput or gains at least 5% of confirmation/delivery latency:
+
+```sh
+ozy_chart --run-id CANDIDATE_RUN --baseline-run-id BASELINE_RUN \
+  --modes durable --regression-output /mnt/ssd/tmp/ozzy-regression-durable.json
+ozy_chart --fixed-load --run-id CANDIDATE_SMALL_RUN --run-id CANDIDATE_LARGE_RUN \
+  --baseline-run-id BASELINE_SMALL_RUN --baseline-run-id BASELINE_LARGE_RUN \
+  --modes durable --max-rate 128:100000 --max-rate 1024:100000 \
+  --max-rate 8192:10000 --regression-output /mnt/ssd/tmp/ozzy-regression-durable-fixed.json
+```
+
+Repeat for both cluster modes. The report keeps percentile medians, repetition
+ranges, overlapping-range flags, and both validated provenances. Missing cells,
+metrics, or repetitions cannot pass. Changed workload, dependency, compiler,
+hardware, or runtime controls produce an incomparable report. Product source and
+binary changes are expected. Repeat matched measurements when ranges overlap;
+never average a regressed cell into improvements elsewhere.
 Timed reports retain merged histogram bins for later percentile extraction.
 
 ### Iggy logout diagnostic

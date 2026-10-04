@@ -1,6 +1,7 @@
-mod coverage;
+pub(super) mod coverage;
 mod fixed;
 mod hardware;
+pub(super) mod regression;
 pub(super) mod replacement;
 mod style;
 pub(super) use fixed::render as render_fixed_load;
@@ -684,7 +685,7 @@ pub(super) fn render(data: &Value, output: &Path, suffix: &str) -> Result<()> {
         return Err("empty summary".into());
     }
     for (mode, rows) in &modes {
-        coverage::check(&chart_path(output, mode, suffix), rows)?;
+        coverage::check(&chart_path(output, mode, suffix), rows, &BTreeMap::new())?;
     }
     for (mode, rows) in modes {
         render_mode(data, output, suffix, mode, &rows)?;

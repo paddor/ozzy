@@ -46,22 +46,6 @@ pub struct ClientAccess {
     pub producer: ProducerId,
 }
 
-/// Startup-bounded record intake on an owner's existing endpoint.
-#[derive(Debug, Clone)]
-pub struct StreamingConfig {
-    /// Trusted or independently authenticated writer identities; at most 32.
-    pub peers: Vec<ClientAccess>,
-    /// Per-request receive bounds, including SDK-generated record batches.
-    pub limits: DataLimits,
-    /// Per-writer queued plus unconfirmed record budget, 1 through 65,536.
-    pub inflight_records: usize,
-    /// Per-writer queued plus unconfirmed payload-byte budget.
-    pub inflight_bytes: usize,
-    /// Group proposals in flight per writer, at least one. Each leases one
-    /// journal append arena. Local owners ignore it.
-    pub proposals: usize,
-}
-
 /// Startup-bounded native ingress on the same endpoint as voter commands.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -95,6 +79,7 @@ impl ClientConfig {
 /// Native connection error. Cancellation, transport loss, and protocol errors
 /// after sending leave the append outcome unknown. Preserve its stable identity.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// Invalid local bounds or identity configuration.
     #[error("invalid native connection configuration")]

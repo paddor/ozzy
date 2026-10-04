@@ -220,6 +220,16 @@ impl Sessions {
         self.changed.notify_changed();
     }
 
+    /// Reclaim metadata only after the transport owner has retired the exact
+    /// physical source and refuses all of its previously received frames.
+    pub(crate) fn retire(&self, remote: NodeId) {
+        let mut peers = self.peers.lock().expect("session mutex poisoned");
+        peers.remove(&remote);
+        self.publish(&peers);
+        drop(peers);
+        self.changed.notify_changed();
+    }
+
     /// Common codec bounds within both configured endpoint profiles.
     pub fn send_limits(&self, remote: NodeId) -> Result<DataLimits> {
         let local = self.receive_limits(remote);

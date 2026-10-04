@@ -1,11 +1,66 @@
-//! Refuse to remove implementations, sizes, or offered rates from a chart.
+//! Preserve chart coverage except for explicitly excluded offered rates.
 use super::{SERIES, id};
 use ozzy_bench::automation::Result;
 use serde_json::Value;
-use std::{collections::BTreeSet, fs, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+};
 
 const ATTRIBUTE: &str = "data-ozzy-series=\"";
 const CASES: &str = "data-ozzy-cases=\"";
+
+pub(crate) fn limit_rates(data: &mut Value, limits: &[String]) -> Result<()> {
+    if limits.is_empty() {
+        return Ok(());
+    }
+    let mut parsed = BTreeMap::new();
+    for limit in limits {
+        let (size, rate) = limit.split_once(':').ok_or("expected SIZE:RATE")?;
+        let (size, rate) = (size.parse::<u64>()?, rate.parse::<u64>()?);
+        if size == 0 || rate == 0 || parsed.insert(size, rate).is_some() {
+            return Err("rate limits require distinct positive sizes and rates".into());
+        }
+    }
+    for key in ["summary", "incomplete"] {
+        if let Some(rows) = data[key].as_array_mut() {
+            rows.retain(|row| {
+                let size = row["case"]["size"].as_u64().unwrap_or(0);
+                let rate = row["case"]["rate"].as_u64().unwrap_or(0);
+                !excluded(size, rate, &parsed)
+            });
+        }
+    }
+    data["rate_limits"] = serde_json::to_value(parsed)?;
+    Ok(())
+}
+
+pub(super) fn rate_limits(data: &Value) -> Result<BTreeMap<u64, u64>> {
+    if data["rate_limits"].is_null() {
+        return Ok(BTreeMap::new());
+    }
+    let limits: BTreeMap<u64, u64> = serde_json::from_value(data["rate_limits"].clone())?;
+    if limits.iter().any(|(size, rate)| *size == 0 || *rate == 0) {
+        return Err("invalid chart rate limit".into());
+    }
+    Ok(limits)
+}
+
+fn excluded(size: u64, rate: u64, limits: &BTreeMap<u64, u64>) -> bool {
+    limits.get(&size).is_some_and(|limit| rate > *limit)
+}
+
+fn excluded_case(case: &str, limits: &BTreeMap<u64, u64>) -> bool {
+    let mut fields = case.rsplit('/');
+    match (fields.next(), fields.next()) {
+        (Some(rate), Some(size)) => match (size.parse(), rate.parse()) {
+            (Ok(size), Ok(rate)) => excluded(size, rate, limits),
+            _ => false,
+        },
+        _ => false,
+    }
+}
 
 fn selected(rows: &[&Value]) -> BTreeSet<String> {
     rows.iter().map(|row| id(row)).collect()
@@ -72,7 +127,7 @@ fn previous(svg: &str) -> Result<BTreeSet<String>> {
         .collect())
 }
 
-pub(super) fn check(path: &Path, rows: &[&Value]) -> Result<()> {
+pub(super) fn check(path: &Path, rows: &[&Value], rate_limits: &BTreeMap<u64, u64>) -> Result<()> {
     let svg = match fs::read_to_string(path) {
         Ok(svg) => svg,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -89,7 +144,11 @@ pub(super) fn check(path: &Path, rows: &[&Value]) -> Result<()> {
     }
     if let Some(existing) = metadata(&svg, CASES)? {
         let selected = cases(rows);
-        let missing: Vec<_> = existing.difference(&selected).map(String::as_str).collect();
+        let missing: Vec<_> = existing
+            .difference(&selected)
+            .filter(|case| !excluded_case(case, rate_limits))
+            .map(String::as_str)
+            .collect();
         if !missing.is_empty() {
             return Err(format!(
                 "refusing to remove chart cases {} from {}; retain other sizes/rates or use --suffix",
@@ -135,5 +194,30 @@ mod tests {
         assert_eq!(previous(&svg).unwrap(), BTreeSet::from(["ozzy/raw".into()]));
         assert!(previous("<svg data-ozzy-series=\"").is_err());
         assert!(previous("<svg data-ozzy-series=\"\">").is_err());
+    }
+
+    #[test]
+    fn explicit_rate_ceiling_preserves_other_cases_and_comparison_series() {
+        let mut data = json!({"summary":[
+            {"case":{"impl":"ozzy","codec":"raw","size":128,"rate":100_000}},
+            {"case":{"impl":"ozzy","codec":"raw","size":128,"rate":1_000_000}},
+            {"case":{"impl":"iggy","codec":"raw","size":128,"rate":100_000}},
+            {"case":{"impl":"iggy","codec":"raw","size":8192,"rate":10000}}
+        ]});
+        let original: Vec<_> = data["summary"].as_array().unwrap().iter().collect();
+        let mut svg = "<svg ></svg>".to_owned();
+        stamp(&mut svg, &original).unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(file.path(), svg).unwrap();
+        limit_rates(&mut data, &["128:100000".into()]).unwrap();
+        let limits = rate_limits(&data).unwrap();
+        let rows: Vec<_> = data["summary"].as_array().unwrap().iter().collect();
+        assert_eq!(rows.len(), 3);
+        assert!(check(file.path(), &rows, &limits).is_ok());
+        assert!(check(file.path(), &rows, &BTreeMap::new()).is_err());
+        assert!(check(file.path(), &rows[..2], &limits).is_err());
+        assert!(check(file.path(), &rows[..1], &limits).is_err());
+        assert!(limit_rates(&mut data, &["128:0".into()]).is_err());
+        assert!(limit_rates(&mut data, &["128:100".into(), "128:1000".into()]).is_err());
     }
 }

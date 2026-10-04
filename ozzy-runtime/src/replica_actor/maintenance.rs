@@ -1,6 +1,7 @@
 //! Bounded maintenance admission after foreground writes settle.
 
 use super::{ActorError, Duration, PendingIo, ReplicaActor};
+use crate::replica_actor::HistoryReason;
 
 impl ReplicaActor {
     pub(super) fn complete_retention(
@@ -21,7 +22,7 @@ impl ReplicaActor {
         }
         if let Some(buffer) = turn.proposal {
             if self.work.waiting.is_some() {
-                return Err(ActorError::History);
+                return Err(ActorError::history(HistoryReason::Retention));
             }
             self.work.waiting = Some(super::ingress::Submission {
                 buffer,
@@ -143,7 +144,11 @@ impl ReplicaActor {
 
 impl ReplicaActor {
     pub(super) fn retention_round(&mut self, now: Duration) -> Result<(), ActorError> {
-        let snapshot = self.driver.normal().ok_or(ActorError::History)?.snapshot();
+        let snapshot = self
+            .driver
+            .normal()
+            .ok_or_else(|| ActorError::history(HistoryReason::Retention))?
+            .snapshot();
         if snapshot.applied != snapshot.committed {
             self.pending = Some(PendingIo::Apply(
                 self.journal

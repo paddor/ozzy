@@ -7,8 +7,8 @@ mod workspace;
 use super::{
     INDEX_DIGEST_START, INDEX_HASH_CONTEXT, INDEX_HEADER_BYTES, IndexBuildError, IndexBuildLimits,
     IndexCounts, IndexFileError, IndexLimits, IndexSource, OperationLimits, PendingRuns, RunKind,
-    SegmentIndex, SegmentScan, calculate_index_layout, derive_index_entries, encode_index_header,
-    segment_index_name, validate_build_limits, validate_source_scan,
+    SegmentIndex, calculate_index_layout, derive_index_entries, encode_index_header,
+    segment_index_name, validate_build_limits,
 };
 use crate::async_files::Access;
 use ozzy_io::{OpenMode, Operation, SyncMode};
@@ -60,16 +60,15 @@ impl Builder {
     /// artifacts for recovery and the caller fences its journal.
     pub(crate) async fn build(
         &self,
-        scan: &SegmentScan<'_>,
+        mut groups: Box<crate::directory::asynchronous::groups::Groups>,
         source: IndexSource,
         operations: OperationLimits,
         limits: IndexBuildLimits,
         repair: bool,
-    ) -> Result<SegmentIndex, IndexBuildError> {
+    ) -> Result<SegmentIndex, crate::DirectoryError> {
         validate_build_limits(limits)?;
-        validate_source_scan(scan, source)?;
         if self.io.chunk_bytes < INDEX_HEADER_BYTES || self.io.directory_entries == 0 {
-            return Err(IndexBuildError::InvalidBuildLimits);
+            return Err(IndexBuildError::InvalidBuildLimits.into());
         }
         let final_path = self.root.join("indexes").join(segment_index_name(source));
         if let Some(index) = self
@@ -90,15 +89,20 @@ impl Builder {
             limits.max_run_files,
             limits.file,
         );
+        let header = groups.header().clone();
         let mut budget = crate::cooperative::Budget::default();
-        for operation in scan.groups.iter().flat_map(|group| &group.operations) {
-            let derived = derive_index_entries(&scan.header, operation, operations)?;
-            if pending.requires_flush(&derived)? {
-                pending.flush_async(&mut workspace).await?;
+        while let Some(group) = groups.next().await? {
+            for operation in &group.operations {
+                let derived = derive_index_entries(&header, operation, operations)
+                    .map_err(IndexBuildError::from)?;
+                if pending.requires_flush(&derived)? {
+                    pending.flush_async(&mut workspace).await?;
+                }
+                pending.buffer(derived)?;
+                budget.charge(operation.body.len()).await;
             }
-            pending.buffer(derived)?;
-            budget.charge(operation.body.len()).await;
         }
+        groups.finish().await?;
         pending.flush_async(&mut workspace).await?;
         let offsets = merge_all(
             pending.offset_runs,

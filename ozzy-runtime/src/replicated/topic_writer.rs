@@ -22,6 +22,7 @@ enum TopicSelection<'a> {
 
 /// Topic routing or underlying partition-writer failure.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum TopicWriterError {
     /// Invalid topic metadata or writer bounds.
     #[error("invalid topic writer configuration")]

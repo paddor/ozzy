@@ -37,7 +37,7 @@ struct Prepared {
 
 /// Fixed authenticated link and authority for one routed producer attempt.
 struct SessionBinding<'a> {
-    connection: &'a append::Connection,
+    connection: &'a mut append::Connection,
     remote: NodeId,
     local: NodeId,
     authority: Option<Authority>,
@@ -86,7 +86,7 @@ impl Session {
     async fn run(
         mut self,
         shared: &mut super::state::Driver,
-        binding: SessionBinding<'_>,
+        mut binding: SessionBinding<'_>,
     ) -> Result<(), Failure> {
         loop {
             if self.retry_at.is_some_and(|at| self.clock.now() >= at) && self.replay_ready() {
@@ -127,7 +127,7 @@ impl Session {
                 }
                 self.incoming = incoming;
                 self.incoming.clear();
-                let filled = self.send_ready(shared, &binding)?;
+                let filled = self.send_ready(shared, &mut binding)?;
                 Ok((filled, receive_full))
             };
             let (filled, receive_full) = if wants_records {
@@ -145,7 +145,6 @@ impl Session {
             let wants_records = self.can_prepare();
             let deadline = self.deadline;
             let retry_at = self.retry_at.filter(|_| self.replay_ready());
-            let linger = self.batch.deadline;
             tokio::select! {
                 message = binding.connection.recv() => {
                     let message = message.map_err(|_| Failure::Retry(None))?;
@@ -172,12 +171,6 @@ impl Session {
                         None => std::future::pending().await,
                     }
                 } => {},
-                () = async {
-                    match linger {
-                        Some(deadline) => tokio::time::sleep_until(deadline).await,
-                        None => std::future::pending().await,
-                    }
-                } => {}
             }
         }
     }
@@ -197,17 +190,15 @@ impl Session {
     fn send_ready(
         &mut self,
         shared: &mut super::state::Driver,
-        binding: &SessionBinding<'_>,
+        binding: &mut SessionBinding<'_>,
     ) -> Result<bool, Failure> {
         if self.retry_at.is_some() {
-            self.batch.deadline = None;
             return Ok(false);
         }
         let parameters = binding.connection.parameters().expect("negotiated session");
         let limits = shared.config.limits.intersection(parameters.receive);
         let mut sent_records = 0;
         let mut sent_bytes = 0;
-        self.batch.deadline = None;
         while sent_records < TURN_RECORDS {
             if self.pending.is_none() {
                 // A partially confirmed request still occupies one slot. A

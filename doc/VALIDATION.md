@@ -265,6 +265,30 @@ Replicated cases inject short segment writes, observe broker fencing, confirm
 with the surviving quorum, and explicitly recover the failed copy. The regular
 gate covers all policies before long runs; single-broker cases delay storage
 and restart without claiming failover.
+
+The reusable storage owner, deployment placement, and SDK record oracle live in
+`ozzy-sim` under its `broker` feature. Short broker integration tests and full
+product simulation use those same implementations. The simulator smoke gate
+runs every confirmation mode through production SDKs, brokers, OMQ inproc, and
+memory-only physical storage. `scripts/test.sh inproc` selects the entire real
+broker simulation subtree, including resume, retention, and churn, plus that
+simulator gate. `scripts/test.sh simulation` also includes the smaller protocol
+models. Those models provide controlled protocol schedules; full product runs
+provide owner, transport, admission, and storage lifecycle coverage.
+The `ozzy-sim` binary runs a sustained seeded cluster with independent execution
+and completion holds, producer resume/takeover, consumer checkpoint reopen,
+new SDK physical connections, rolling retention, broker restart and short-write
+recovery. Each wave releases verified oracle payloads. The fault schedule streams
+to disk, while only 128 recent workload events and 4096 physical events per
+device remain resident. Failure artifacts include independently submitted and
+confirmed records, configuration, dirty/durable memory images and recent physical
+order. A stopped storage pump retains its final image for failure inspection.
+`--replay` and `--waves` reproduce a recorded fault prefix from fresh state.
+They do not reproduce an exact threaded transport schedule or replace the core
+simulator's virtual-time schedule. Reported PEER/PUB counts come from the actual
+reader delivery paths. Runner commands and current resource bounds belong in
+the [simulator README](../ozzy-sim/README.md).
+
 Interrupted recovery restarts select full resume for exact nonvoting markers
 and quarantine for established configurations. A controlled case holds donor
 barriers across a second restart, then verifies records after release. Selection

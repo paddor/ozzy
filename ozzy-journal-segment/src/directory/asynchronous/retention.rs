@@ -1,10 +1,8 @@
-use super::{
-    DirectoryError, Journal, SegmentReference, validate_operation_bodies, validate_replay_scan,
-};
-use crate::retention::{PreparedSegmentLease, scan_is_below_floors};
-use crate::{
-    RetentionError, RetentionFloors, RetiredPrefix, async_files::Access, scan_segment_async,
-};
+use super::{DirectoryError, Journal, SegmentReference};
+
+mod scan;
+use crate::retention::PreparedSegmentLease;
+use crate::{RetentionError, RetentionFloors, RetiredPrefix, async_files::Access};
 use std::{collections::HashSet, path::PathBuf};
 
 /// Deterministic whole-segment scan limits. Async file jobs yield separately;
@@ -83,7 +81,7 @@ impl SegmentFiles {
 
 impl Journal {
     /// Validate one selected sealed generation and summarize its append metadata.
-    /// The configured segment cap bounds the read; decoding yields between groups.
+    /// Scratch retains one decoder-bounded group; physical reads and CPU work yield.
     pub async fn retention_segment(
         &self,
         segment_id: u64,
@@ -96,54 +94,10 @@ impl Journal {
             .iter()
             .find(|reference| reference.segment_id == segment_id && reference.sealed.is_some())
             .ok_or(DirectoryError::SegmentNotSealed(segment_id))?;
-        let bytes = self.segment_image(*reference).await?;
-        let scan = scan_segment_async(
-            &bytes,
-            reference.first_group_number,
-            reference.first_chain,
-            self.limits.decode,
-        )
-        .await?;
-        validate_replay_scan(reference, &scan, self.writer.state())?;
-        validate_operation_bodies(
-            &scan,
-            self.limits.operations,
-            self.manifest.configuration_epoch,
-            self.manifest.promised_view,
-        )
-        .await?;
-        let mut result = ozzy_core::retention::Segment {
-            id: segment_id,
-            capacity: reference.capacity,
-            sealed: true,
-            last_operation: scan.next_chain.next_op_number() - 1,
-            record_end: ozzy_proto::Offset::ZERO,
-            newest_append_millis: None,
-        };
-        let mut budget = crate::cooperative::Budget::default();
-        for operation in scan.groups.iter().flat_map(|group| &group.operations) {
-            if operation.kind == ozzy_journal::operation::OperationKind::Append {
-                let (_, batches) = ozzy_journal::operation::decode_append_summary_and_batches(
-                    &operation.body,
-                    self.limits.operations,
-                )?;
-                for batch in batches
-                    .iter()
-                    .filter(|batch| batch.summary.partition == partition)
-                {
-                    let end = batch.summary.first_offset.get() + batch.summary.record_count as u64;
-                    result.record_end = result.record_end.max(ozzy_proto::Offset::new(end));
-                    result.newest_append_millis = Some(
-                        result
-                            .newest_append_millis
-                            .unwrap_or(0)
-                            .max(batch.append_timestamp_millis),
-                    );
-                }
-            }
-            budget.charge(operation.body.len()).await;
-        }
-        Ok(result)
+        Ok(self
+            .scan_retention(*reference, Some(partition), None)
+            .await?
+            .segment)
     }
 
     /// Protect selected sealed generations across later rolls and retirement.
@@ -258,30 +212,16 @@ impl Journal {
                 }
                 break;
             }
-            let bytes = self.segment_image(reference).await?;
+            let scan = self
+                .scan_retention(
+                    reference,
+                    None,
+                    Some((floors, checkpoint.position.op_number)),
+                )
+                .await?;
             result.scanned_segments += 1;
-            result.scanned_bytes += bytes.len();
-            let scan = scan_segment_async(
-                &bytes,
-                reference.first_group_number,
-                reference.first_chain,
-                self.limits.decode,
-            )
-            .await?;
-            validate_operation_bodies(
-                &scan,
-                self.limits.operations,
-                self.manifest.configuration_epoch,
-                self.manifest.promised_view,
-            )
-            .await?;
-            validate_replay_scan(&reference, &scan, self.writer.state())?;
-            if !scan_is_below_floors(
-                &scan,
-                checkpoint.position.op_number,
-                floors,
-                self.limits.operations,
-            )? {
+            result.scanned_bytes += capacity;
+            if !scan.below_floors {
                 break;
             }
             result.unreferenced_segment_ids.push(reference.segment_id);

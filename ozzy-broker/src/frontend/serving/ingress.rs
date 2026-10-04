@@ -87,6 +87,7 @@ impl<'a> Ingress<'a> {
         if !self
             .connections
             .drain(&mut self.monitor, service, followers)?
+            || receipt.source().is_none_or(|source| !source.is_live())
             || !self.connections.contains(&message)
         {
             return Ok(None);
@@ -356,6 +357,9 @@ impl Connections {
         }
         if let Some(link) = service.links().get(peer) {
             service.disconnect(link.binding);
+        }
+        if !connected {
+            service.retire_transport_client(peer);
         }
         if service
             .access(peer)

@@ -1,6 +1,8 @@
 use super::*;
 use crate::{AsyncRetirementBudget, RetentionFloors};
 
+mod scan;
+
 fn budget() -> AsyncRetirementBudget {
     AsyncRetirementBudget {
         max_segments: 2,

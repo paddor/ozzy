@@ -1,5 +1,6 @@
 //! Source-anchored streaming: bounded selection cache, one transfer, one arena.
 
+use crate::replica_actor::HistoryReason;
 use ozzy_replication::wire::{FetchOps, OpsBatch};
 use ozzy_replication::{Digest, OpNumber};
 
@@ -51,14 +52,14 @@ impl Lookup {
             return if digest == prefix.digest {
                 Ok(())
             } else {
-                Err(ActorError::History)
+                Err(ActorError::history(HistoryReason::Lookup))
             };
         }
         let slot = self
             .entries
             .iter_mut()
             .find(|entry| entry.is_none())
-            .ok_or(ActorError::History)?;
+            .ok_or_else(|| ActorError::history(HistoryReason::Lookup))?;
         *slot = Some((source, prefix));
         Ok(())
     }
@@ -88,7 +89,7 @@ impl ReplicaActor {
         } else if position.op < position.retained_predecessor.op {
             self.lookup.retire(position.source, position.op);
         } else {
-            return Err(ActorError::History);
+            return Err(ActorError::history(HistoryReason::Lookup));
         }
         Ok(())
     }
@@ -136,7 +137,10 @@ impl ReplicaActor {
         }
         if request.source.voter == self.local {
             if self.pending.is_none() {
-                let buffer = self.buffer.take().ok_or(ActorError::History)?;
+                let buffer = self
+                    .buffer
+                    .take()
+                    .ok_or_else(|| ActorError::history(HistoryReason::BufferUnavailable))?;
                 self.pending = Some(PendingIo::Fetch(
                     self.journal
                         .fetch_history(request, buffer)
@@ -272,8 +276,10 @@ impl ReplicaActor {
                     }
                 }
                 if batch.end() == transfer.request.source.accepted {
-                    self.lookup
-                        .insert(batch.source(), found.ok_or(ActorError::History)?)?;
+                    self.lookup.insert(
+                        batch.source(),
+                        found.ok_or_else(|| ActorError::history(HistoryReason::Lookup))?,
+                    )?;
                     self.transfer = None;
                 } else {
                     transfer.request.predecessor = batch.end();
@@ -289,7 +295,7 @@ impl ReplicaActor {
                 let ticket = self
                     .driver
                     .installation_ticket()
-                    .ok_or(ActorError::History)?;
+                    .ok_or_else(|| ActorError::history(HistoryReason::Lookup))?;
                 let bytes = batch.operations().map(|op| op.canonical().body.len()).sum();
                 if let Some(allocator) = &self.history_receive_allocator {
                     self.buffer

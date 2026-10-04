@@ -205,7 +205,13 @@ random; simulations inject distinct startup namespaces. The connection owner
 checks configured identities and roles before negotiation. Negotiation supplies
 link fences, never partition authority or destination credit. Disconnect retains
 bounded peer metadata and rejects a delayed duplicate HELLO from that attempt.
-The adapter must also fence old queued replies.
+For dynamically admitted clients, an exact physical control disconnect may
+reclaim that metadata after the adapter fences the retired OMQ receive source.
+Before admitting any held receipt, the adapter checks `ReceiveSource::is_live`;
+a replacement with the same logical identity cannot revive an old physical
+generation. Data still requires the currently negotiated session. Configured
+clients and broker membership retain their metadata. The adapter also fences
+old queued replies.
 
 Metadata starts with the two 16-byte IDs, followed by properties until
 frame end, without an outer property count. Counted major lists use `u32`

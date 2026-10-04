@@ -266,3 +266,50 @@ async fn canceled_file_wait_keeps_payload_charged_until_physical_completion() {
     );
     device.begin_shutdown().unwrap().wait().await;
 }
+
+#[tokio::test]
+async fn maintenance_charges_share_payload_capacity_and_wake_waiting_allocations() {
+    let domain = Domain::new(None, 128).unwrap();
+    let owner = domain.owner(limits(128, 1)).unwrap();
+    let partition = owner.clone();
+    drop(owner.try_lease(64).unwrap());
+    let scratch = owner.try_charge(96).unwrap();
+    assert_eq!(
+        partition.allocated_bytes(),
+        96,
+        "evict unused payload cache first"
+    );
+    assert_eq!(
+        partition.try_charge(33).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    let other = partition.try_charge(32).unwrap();
+    assert_eq!(owner.allocated_bytes(), 128);
+    let mut payload = Box::pin(owner.lease(96));
+    assert!(futures::poll!(&mut payload).is_pending());
+    drop(scratch);
+    let payload = payload.await.unwrap();
+    assert_eq!(owner.allocated_bytes(), 128);
+    drop(other);
+    assert_eq!(owner.allocated_bytes(), 96);
+    drop(payload);
+    owner.trim_cache();
+    assert_eq!(owner.allocated_bytes(), 0);
+}
+
+#[test]
+fn canceled_maintenance_releases_only_its_scratch_and_keeps_shared_payloads_charged() {
+    let domain = Domain::new(None, 128).unwrap();
+    let owner = domain.owner(limits(128, 1)).unwrap();
+    let physical_job = owner.try_lease(64).unwrap().freeze();
+    let alias = physical_job.slice(..1);
+    let scratch = owner.try_charge(64).unwrap();
+    drop(physical_job);
+    assert_eq!(owner.allocated_bytes(), 128);
+    drop(scratch);
+    assert_eq!(owner.allocated_bytes(), 64);
+    drop(owner);
+    assert_eq!(domain.reserved_bytes(), 128);
+    drop(alias);
+    assert_eq!(domain.reserved_bytes(), 0);
+}

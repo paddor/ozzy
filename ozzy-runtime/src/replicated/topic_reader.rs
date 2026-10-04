@@ -30,6 +30,7 @@ pub struct TopicCheckpoint {
 
 /// Initial history selection. Reconnects use delivered offsets, never repeat a seek.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub enum ReaderStart {
     /// First retained record in each selected partition.
     #[default]
@@ -394,6 +395,7 @@ impl Drop for TopicReader {
 
 /// Topic lookup, source validation, or reader delivery failed.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum TopicReaderError {
     /// No match survives retention, or the ID was never present.
     #[error("partition {partition}: record ID not found in retained history")]

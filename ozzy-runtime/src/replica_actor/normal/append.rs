@@ -4,6 +4,7 @@ use super::{
     ActorError, Control, DriverError, Duration, Live, Message, NodeId, Prefix, ProposalOutcome,
     ReplicaActor, Scope, Submission,
 };
+use crate::replica_actor::HistoryReason;
 use crate::replica_actor::io::Completed;
 use crate::replica_actor::{Bytes, MAX_TRANSFER_OPERATIONS, wire};
 use crate::replica_journal::ProposalValidation;
@@ -214,7 +215,7 @@ impl ReplicaActor {
                 self.recycle(validated.into_buffer());
             }
             Err(error) => return Err(error.into()),
-            _ => return Err(ActorError::History),
+            _ => return Err(ActorError::history(HistoryReason::ProposalWindow)),
         }
         Ok(())
     }
@@ -278,7 +279,7 @@ impl ReplicaActor {
                     return Ok(());
                 }
                 Err(error) => return Err(error.into()),
-                _ => return Err(ActorError::History),
+                _ => return Err(ActorError::history(HistoryReason::ProposalWindow)),
             };
         self.work.sync_batch_started.get_or_insert(now);
         let payload = validated.shared_bodies();
@@ -381,7 +382,7 @@ impl ReplicaActor {
         )?;
         let metadata = Bytes::copy_from_slice(&self.metadata[..encoded.metadata_bytes]);
         if payload.len() != encoded.payload_bytes {
-            return Err(ActorError::History);
+            return Err(ActorError::history(HistoryReason::ProposalWindow));
         }
         let mut packets = [None, None, None];
         for (index, to) in self.configuration.voters().iter().enumerate() {

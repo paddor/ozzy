@@ -33,6 +33,15 @@ struct Args {
     /// Scheduled-arrival latency versus offered load, in separate SVGs.
     #[arg(long, conflicts_with = "iggy_run_id")]
     fixed_load: bool,
+    /// Explicit fixed-load ceiling per record size, `SIZE:RECORDS_PER_SECOND`.
+    #[arg(long, requires = "fixed_load")]
+    max_rate: Vec<String>,
+    /// Compare against completed Ozzy runs instead of rendering charts.
+    #[arg(long, requires = "regression_output", conflicts_with_all = ["iggy_run_id", "iggy_reference_run_id", "redpanda_reference_run_id", "external_reference_run_id", "replace_run_id", "failed_run_id", "output_dir"])]
+    baseline_run_id: Vec<String>,
+    /// Save the per-cell 5% regression gate and both validated provenances.
+    #[arg(long, requires = "baseline_run_id")]
+    regression_output: Option<PathBuf>,
     /// Explicit load with an Ozzy measurement but no external reference.
     #[arg(long, requires = "fixed_load")]
     ozzy_only_rate: Vec<u64>,
@@ -67,6 +76,9 @@ fn main() -> Result<()> {
         )?
     };
     records::retain_modes(&mut data, &args.modes)?;
+    if args.regression_output.is_some() {
+        return regression(&args, &mut data);
+    }
     for id in &args.replace_run_id {
         let mut replacement = if args.fixed_load {
             records::select_fixed_load(&automation::cache(), std::slice::from_ref(id))?
@@ -84,6 +96,7 @@ fn main() -> Result<()> {
         records::include_failed_loads(&automation::cache(), &mut data, &args.failed_run_id)?;
         records::retain_modes(&mut data, &args.modes)?;
     }
+    chart::coverage::limit_rates(&mut data, &args.max_rate)?;
     let (references, implementations): (_, &[_]) = if args.external_reference_run_id.is_empty() {
         (&args.iggy_reference_run_id, &["iggy"])
     } else {
@@ -138,4 +151,26 @@ fn main() -> Result<()> {
     } else {
         chart::render(&data, &output, &suffix)
     }
+}
+
+fn regression(args: &Args, data: &mut serde_json::Value) -> Result<()> {
+    if let Some(output) = &args.regression_output {
+        let mut baseline = if args.fixed_load {
+            records::select_fixed_load(&automation::cache(), &args.baseline_run_id)?
+        } else {
+            records::select(&automation::cache(), &args.baseline_run_id, None)?
+        };
+        records::retain_modes(&mut baseline, &args.modes)?;
+        chart::coverage::limit_rates(&mut baseline, &args.max_rate)?;
+        chart::coverage::limit_rates(data, &args.max_rate)?;
+        let report = chart::regression::compare(&baseline, data, args.fixed_load)?;
+        automation::json_file(output, &report)?;
+        println!("{}: {}", report["status"], output.display());
+        return if report["status"] == "pass" {
+            Ok(())
+        } else {
+            Err("performance gate did not pass; inspect the saved per-cell report".into())
+        };
+    }
+    unreachable!("regression output was selected")
 }

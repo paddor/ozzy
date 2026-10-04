@@ -67,7 +67,8 @@ fn operation_bound_evicts_without_growing_or_waiting_for_peers() {
     };
     assert!(matches!(
         cache.after(last.scope, last.generation, wrong),
-        Err(ActorError::History)
+        Err(ActorError::History(ref failure)) if failure.reason() == crate::replica_actor::HistoryReason::Lookup
+            && failure.site().file().ends_with("normal/recent.rs")
     ));
     cache.clear();
     assert_eq!((cache.operations, cache.retained_bytes), (0, 0));

@@ -22,6 +22,12 @@ pub(super) fn replica(
     config.recovery.accepted_transitions = 16;
     config.writeback.max_operations = 16;
     config.write_group_bytes = group_bytes;
+    // Match physical decode/scratch bounds to this fixture's admitted groups.
+    config.limits.decode.max_entries = config.writeback.max_operations;
+    config.limits.decode.max_decoded_body_bytes = config.writeback.max_body_bytes;
+    config.limits.decode.max_group_decoded_body_bytes = config.writeback.max_body_bytes;
+    config.limits.operations.max_payload_bytes = config.writeback.max_body_bytes;
+
     let (mut journal, startup) = drive(
         controller,
         OwnedJournal::format_new(

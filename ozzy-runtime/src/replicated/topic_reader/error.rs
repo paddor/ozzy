@@ -5,6 +5,7 @@ use ozzy_proto::{Offset, nack};
 
 /// Read failure. No variant silently skips expired or unavailable records.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ReaderError {
     /// Transport, negotiation, or local connection configuration failed.
     #[error(transparent)]

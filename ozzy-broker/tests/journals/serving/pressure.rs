@@ -124,7 +124,10 @@ async fn scenario(reverse: bool, policy: Confirmation, writers: usize) {
         },
     )
     .await;
-    let brokers = Box::pin(simulated::start_brokers(&runtime, deployment, reverse)).await;
+    let brokers = Box::pin(ozzy_sim::broker::start_brokers(
+        &runtime, deployment, reverse,
+    ))
+    .await;
     let mut reader = load_progress(
         &brokers,
         "open pressured reader",

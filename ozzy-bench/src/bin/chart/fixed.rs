@@ -42,6 +42,7 @@ pub(super) fn reader_color(color: RGBColor) -> RGBColor {
 }
 
 pub(crate) fn render(data: &Value, output: &Path, suffix: &str) -> Result<()> {
+    let rate_limits = super::coverage::rate_limits(data)?;
     let mut modes = BTreeMap::<&str, Vec<&Value>>::new();
     for row in data["summary"]
         .as_array()
@@ -76,6 +77,7 @@ pub(crate) fn render(data: &Value, output: &Path, suffix: &str) -> Result<()> {
         super::coverage::check(
             &super::chart_path(output, mode, &format!("-fixed-load{suffix}")),
             rows,
+            &rate_limits,
         )?;
         for size in sizes(rows)? {
             let rows = of_size(rows, size);

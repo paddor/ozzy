@@ -8,7 +8,7 @@ mod owner;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use owner::{Allocator, Arena};
+pub(crate) use owner::{Allocator, Arena, Charge};
 pub use owner::{Buffer, Owner};
 
 use std::{

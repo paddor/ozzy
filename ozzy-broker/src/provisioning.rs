@@ -15,7 +15,7 @@ use crate::{StartupError, io_error};
 const MAX_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Validated metadata and local topology, not an opened/recovered partition store.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CheckedConfig {
     /// Validated shared deployment settings.
     pub deployment: ValidatedDeployment,

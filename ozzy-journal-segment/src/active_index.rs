@@ -97,7 +97,9 @@ impl ActiveSegmentIndex {
             }
             entries.push(&scan.header, operation, operation_limits)?;
         }
-        let Some(source) = entries.source(scan, through_op)? else {
+        let Some(source) =
+            entries.source(&scan.header, scan.valid_bytes, scan.digest, through_op)?
+        else {
             return Ok(None);
         };
         Ok(Some(Self {
@@ -120,7 +122,36 @@ impl ActiveSegmentIndex {
             entries.push(&scan.header, operation, operation_limits)?;
             budget.charge(operation.body.len()).await;
         }
-        let Some(source) = entries.source(scan, through_op)? else {
+        let Some(source) =
+            entries.source(&scan.header, scan.valid_bytes, scan.digest, through_op)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            image: entries.finish_async(source).await?,
+        }))
+    }
+
+    pub(crate) async fn build_groups(
+        mut groups: Box<crate::directory::asynchronous::groups::Groups>,
+        through_op: u64,
+        operations: OperationLimits,
+        limits: IndexLimits,
+    ) -> Result<Option<Self>, crate::JournalIndexError> {
+        let header = groups.header().clone();
+        let (valid_bytes, digest) = groups.boundary();
+        let mut entries = Entries::new(limits)?;
+        let mut budget = crate::cooperative::Budget::default();
+        while let Some(group) = groups.next().await? {
+            for operation in &group.operations {
+                if operation.op_number <= through_op {
+                    entries.push(&header, operation, operations)?;
+                    budget.charge(operation.body.len()).await;
+                }
+            }
+        }
+        groups.finish().await?;
+        let Some(source) = entries.source(&header, valid_bytes, digest, through_op)? else {
             return Ok(None);
         };
         Ok(Some(Self {

@@ -7,7 +7,7 @@ use std::{fs::File, io::Write, path::PathBuf, time::Instant};
 
 mod cluster;
 mod host;
-use cluster::MemoryCluster;
+use ozzy_sim::broker::Cluster as MemoryCluster;
 
 #[tokio::test(flavor = "current_thread")]
 async fn varied_inproc_churn_preserves_payloads_across_short_writes_and_recovery() {

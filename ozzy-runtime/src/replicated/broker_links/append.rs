@@ -172,7 +172,7 @@ pub(in crate::replicated) struct Connection {
     broker: Option<NodeId>,
     session: Option<LinkSessionId>,
     parameters: Option<Parameters>,
-    blocked: Mutex<Option<Blocked>>,
+    blocked: Option<Blocked>,
 }
 
 impl Connection {
@@ -224,7 +224,7 @@ impl Connection {
             broker: None,
             session: None,
             parameters: None,
-            blocked: Mutex::new(None),
+            blocked: None,
         })
     }
 
@@ -311,7 +311,7 @@ impl Connection {
         self.stream.failed.store(false, Ordering::Release);
         self.session = None;
         self.parameters = None;
-        *self.blocked.lock().expect("SDK APPEND send poisoned") = None;
+        self.blocked = None;
     }
 
     pub(in crate::replicated) async fn refresh_session(
@@ -357,9 +357,8 @@ impl Connection {
 
     /// Register before actual socket admission on the same SDK thread. A full
     /// socket rolls back the registration and returns the original frame intact.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::replicated) fn try_send(
-        &self,
+        &mut self,
         message: Message,
         id: RequestId,
         end: u64,
@@ -390,7 +389,7 @@ impl Connection {
             )));
         }
         let Some(lease) = registry.budget.acquire(cost) else {
-            *self.blocked.lock().expect("SDK APPEND send poisoned") = Some(Blocked::Budget(cost));
+            self.blocked = Some(Blocked::Budget(cost));
             return Err(TrySendError::Full(message));
         };
         let tracked = track(&message, &lease, Some(&self.stream.memory), false);
@@ -418,7 +417,7 @@ impl Connection {
         drop(requests);
         match crate::transport::try_send_peer(&self.links.0.peers[&broker].data, tracked) {
             Ok(()) => {
-                *self.blocked.lock().expect("SDK APPEND send poisoned") = None;
+                self.blocked = None;
                 Ok(())
             }
             Err(error) => {
@@ -430,8 +429,7 @@ impl Connection {
                 match error {
                     TrySendError::Full(returned) => {
                         drop(returned);
-                        *self.blocked.lock().expect("SDK APPEND send poisoned") =
-                            Some(Blocked::Socket);
+                        self.blocked = Some(Blocked::Socket);
                         Err(TrySendError::Full(message))
                     }
                     error => Err(error),
@@ -450,9 +448,9 @@ impl Connection {
     }
 
     /// Retry outstanding records without replacing the negotiated link session.
-    pub(in crate::replicated) fn forget_requests(&self) {
+    pub(in crate::replicated) fn forget_requests(&mut self) {
         self.links.0.shared.appends.forget(self.stream.id, None);
-        *self.blocked.lock().expect("SDK APPEND send poisoned") = None;
+        self.blocked = None;
     }
 
     pub(in crate::replicated) fn try_recv_many_into(
@@ -517,7 +515,7 @@ impl Connection {
             if !self.live() {
                 return;
             }
-            let blocked = *self.blocked.lock().expect("SDK APPEND send poisoned");
+            let blocked = self.blocked;
             if let Some(Blocked::Budget(cost)) = blocked {
                 if registry.budget.available(cost) {
                     return;

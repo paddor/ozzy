@@ -1,5 +1,6 @@
 //! Nonvoting full-WAL recovery on a shared application shard.
 
+use crate::replica_actor::HistoryReason;
 mod scheduled;
 #[cfg(feature = "simulation")]
 pub(super) mod simulation;
@@ -549,7 +550,9 @@ impl<J: RecoveryStorage> RecoveryActor<J> {
             ReplicaMessage::Checkpoint(wire::CheckpointMessage::Chunk { request, .. }) => {
                 self.receive_checkpoint(
                     request,
-                    message.part_bytes(3).ok_or(ActorError::History)?,
+                    message
+                        .part_bytes(3)
+                        .ok_or_else(|| ActorError::history(HistoryReason::Recovery))?,
                 )?;
             }
             ReplicaMessage::Ops(batch) => {
@@ -562,17 +565,22 @@ impl<J: RecoveryStorage> RecoveryActor<J> {
                 {
                     return Ok(());
                 }
-                let ticket = self.ticket.ok_or(ActorError::History)?;
+                let ticket = self
+                    .ticket
+                    .ok_or_else(|| ActorError::history(HistoryReason::Recovery))?;
                 let bytes = batch.operations().map(|op| op.canonical().body.len()).sum();
                 if !self
                     .buffer
                     .as_mut()
-                    .ok_or(ActorError::History)?
+                    .ok_or_else(|| ActorError::history(HistoryReason::Recovery))?
                     .reserve_incoming(bytes)?
                 {
                     return Ok(()); // Preserve fetch correlation and retry without partial staging.
                 }
-                let mut buffer = self.buffer.take().ok_or(ActorError::History)?;
+                let mut buffer = self
+                    .buffer
+                    .take()
+                    .ok_or_else(|| ActorError::history(HistoryReason::BufferUnavailable))?;
                 for operation in batch.operations() {
                     buffer.push(operation.canonical())?;
                 }
@@ -603,7 +611,9 @@ impl<J: RecoveryStorage> RecoveryActor<J> {
         {
             return Ok(());
         }
-        let ticket = self.ticket.ok_or(ActorError::History)?;
+        let ticket = self
+            .ticket
+            .ok_or_else(|| ActorError::history(HistoryReason::Recovery))?;
         let completion = match self
             .journal
             .as_mut()
@@ -626,14 +636,18 @@ impl<J: RecoveryStorage> RecoveryActor<J> {
     ) -> Result<Option<Outcome>, ActorError> {
         match completed {
             Completed::Checkpoint(progress) => {
-                let ticket = self.ticket.ok_or(ActorError::History)?;
+                let ticket = self
+                    .ticket
+                    .ok_or_else(|| ActorError::history(HistoryReason::Recovery))?;
                 self.checkpoint_through = progress.through;
                 if !self.abandoning
                     && let Some(revision) = progress.revision
                 {
                     self.recovery.complete_checkpoint(
                         ticket,
-                        ticket.checkpoint().ok_or(ActorError::History)?,
+                        ticket
+                            .checkpoint()
+                            .ok_or_else(|| ActorError::history(HistoryReason::Recovery))?,
                         revision,
                     )?;
                     self.checkpoint_ready = true;

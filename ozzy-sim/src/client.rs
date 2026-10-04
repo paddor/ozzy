@@ -14,28 +14,32 @@ use std::time::Duration;
 
 mod workload;
 
-pub(crate) struct Client {
-    pub(super) links: BrokerLinks,
+/// Production SDK client with an independent bounded record and offset oracle.
+pub struct Client {
+    /// Shared authenticated SDK links for controlled disconnect and reconnect schedules.
+    pub links: BrokerLinks,
     writer: SharedTopicWriter,
+    links_config: BrokerLinksConfig,
     keys: Vec<[u8; 4]>,
     history: Vec<Vec<(MessageId, Vec<Bytes>)>>,
     bases: Vec<usize>,
     next_sequences: Vec<u64>,
+    submitted: Vec<(u32, u64, MessageId, Vec<Bytes>)>,
     policy: Policy,
 }
 
-pub(super) type Pending = (SharedTopicPendingRecord, MessageId, Vec<Bytes>);
+/// Admitted observation paired with independently retained record evidence.
+pub type Pending = (SharedTopicPendingRecord, MessageId, Vec<Bytes>);
 
 impl Client {
-    pub(crate) async fn open(checked: &CheckedConfig) -> Self {
+    /// Open producer and consumer access on a new real SDK runtime.
+    pub async fn open(checked: &CheckedConfig) -> Self {
         let runtime = WriterRuntime::new().unwrap();
         Self::open_with_runtime(checked, &runtime).await
     }
 
-    pub(crate) async fn open_with_runtime(
-        checked: &CheckedConfig,
-        runtime: &WriterRuntime,
-    ) -> Self {
+    /// Open access using the same OMQ context as the memory brokers.
+    pub async fn open_with_runtime(checked: &CheckedConfig, runtime: &WriterRuntime) -> Self {
         let topic = &checked.deployment.deployment().topics["orders"];
         let partitions = topic.partitions as usize;
         let policy = match topic.confirmation {
@@ -56,51 +60,49 @@ impl Client {
             handshake::Parameters::streaming(limits, handshake::PRODUCER | handshake::CONSUMER)
                 .unwrap();
         parameters.capabilities |= handshake::OWNER_ROUTING | handshake::OWNER_READ;
-        let links = BrokerLinks::connect(
-            runtime,
-            BrokerLinksConfig {
-                local: NodeId::from_bytes(*uuid::Uuid::now_v7().as_bytes()),
-                brokers: checked
-                    .identity
-                    .brokers
-                    .iter()
-                    .map(|(name, id)| BrokerAddress {
-                        node: NodeId::from_bytes(*id.as_bytes()),
-                        endpoint: checked.deployment.deployment().brokers[name]
-                            .endpoints
-                            .peer
-                            .parse()
-                            .unwrap(),
-                        data_endpoint: checked.deployment.deployment().brokers[name]
-                            .endpoints
-                            .data_peer
-                            .parse()
-                            .unwrap(),
-                    })
-                    .collect(),
-                parameters,
-                requests: 12,
-                control_bytes: 1024 * 1024,
-                routing_bytes: 1024 * 1024,
-                append: Some(AppendLinkLimits {
-                    writers: 32,
-                    requests: 32,
-                    records: 128,
-                    bytes: 256 * 1024 * 1024,
-                }),
-                maximum_partitions: partitions,
-                reader: Some(ReaderLinkLimits {
-                    subscriptions: 8,
-                    bytes: 16 * 1024 * 1024,
-                    queue_messages: 4,
-                }),
-                request_timeout: Duration::from_secs(5),
-                retry_interval: Duration::from_millis(10),
-                clock: SdkClock::default(),
-            },
-        )
-        .await
-        .unwrap();
+        let links_config = BrokerLinksConfig {
+            local: NodeId::from_bytes(*uuid::Uuid::now_v7().as_bytes()),
+            brokers: checked
+                .identity
+                .brokers
+                .iter()
+                .map(|(name, id)| BrokerAddress {
+                    node: NodeId::from_bytes(*id.as_bytes()),
+                    endpoint: checked.deployment.deployment().brokers[name]
+                        .endpoints
+                        .peer
+                        .parse()
+                        .unwrap(),
+                    data_endpoint: checked.deployment.deployment().brokers[name]
+                        .endpoints
+                        .data_peer
+                        .parse()
+                        .unwrap(),
+                })
+                .collect(),
+            parameters,
+            requests: 12,
+            control_bytes: 1024 * 1024,
+            routing_bytes: 1024 * 1024,
+            append: Some(AppendLinkLimits {
+                writers: 32,
+                requests: 32,
+                records: 128,
+                bytes: 256 * 1024 * 1024,
+            }),
+            maximum_partitions: partitions,
+            reader: Some(ReaderLinkLimits {
+                subscriptions: 8,
+                bytes: 16 * 1024 * 1024,
+                queue_messages: 4,
+            }),
+            request_timeout: Duration::from_secs(5),
+            retry_interval: Duration::from_millis(10),
+            clock: SdkClock::default(),
+        };
+        let links = BrokerLinks::connect(runtime, links_config.clone())
+            .await
+            .unwrap();
         let writer = SharedTopicWriter::open(
             &links,
             "orders",
@@ -119,20 +121,24 @@ impl Client {
             .collect();
         Self {
             links,
+            links_config,
             writer,
             keys,
             history: vec![Vec::new(); partitions],
             bases: vec![0; partitions],
             next_sequences: vec![0; partitions],
+            submitted: Vec::new(),
             policy,
         }
     }
 
-    pub(super) async fn queue(&mut self, wave: usize) -> Vec<Pending> {
+    /// Admit four distinct records per partition without waiting for confirmation.
+    pub async fn queue(&mut self, wave: usize) -> Vec<Pending> {
         self.queue_selected(wave, None).await
     }
 
-    pub(crate) async fn reopen_producer(self, takeover: bool) -> Self {
+    /// Resume or take over the saved identity, preserving oracle history.
+    pub async fn reopen_producer(self, takeover: bool) -> Self {
         let trace = std::env::var("OZZY_SOAK_TRACE").is_ok_and(|value| value == "1");
         if trace {
             println!("producer close started, takeover={takeover}");
@@ -184,14 +190,41 @@ impl Client {
             },
             writer,
             links: self.links,
+            links_config: self.links_config,
             keys: self.keys,
             history: self.history,
             bases: self.bases,
             policy: self.policy,
+            submitted: self.submitted,
         }
     }
 
-    pub(super) async fn queue_except(&mut self, wave: usize, partition: usize) -> Vec<Pending> {
+    /// Replace the actual OMQ connections and resume the producer's saved identity.
+    /// Callers must close readers and settle observations before replacing links.
+    pub async fn reconnect(mut self, runtime: &WriterRuntime, fresh_node: bool) -> Self {
+        let identity = self.writer.identity();
+        self.writer.close().await.unwrap();
+        self.links.shutdown().await.unwrap();
+        if fresh_node {
+            self.links_config.local = NodeId::from_bytes(*uuid::Uuid::now_v7().as_bytes());
+        }
+        self.links = BrokerLinks::connect(runtime, self.links_config.clone())
+            .await
+            .unwrap();
+        self.writer = SharedTopicWriter::resume(
+            &self.links,
+            "orders",
+            identity,
+            SharedTopicWriterConfig::new(self.links_config.parameters.receive),
+            RetryPolicy::default(),
+        )
+        .await
+        .unwrap();
+        self
+    }
+
+    /// Admit a wave excluding one unavailable partition.
+    pub async fn queue_except(&mut self, wave: usize, partition: usize) -> Vec<Pending> {
         self.queue_selected(wave, Some(partition)).await
     }
 
@@ -213,7 +246,8 @@ impl Client {
         pending
     }
 
-    pub(super) async fn queue_large(&mut self, wave: u32, records: u32) -> Vec<Pending> {
+    /// Admit bounded random 1 KiB payloads to partition zero.
+    pub async fn queue_large(&mut self, wave: u32, records: u32) -> Vec<Pending> {
         let mut pending = Vec::new();
         for record in 0..records {
             let value = (1_u128 << 96) | (u128::from(wave) << 32) | u128::from(record);
@@ -232,7 +266,8 @@ impl Client {
         pending
     }
 
-    pub(crate) async fn confirm(&mut self, pending: Vec<Pending>) {
+    /// Verify confirmation identity, policy and offset before retaining evidence.
+    pub async fn confirm(&mut self, pending: Vec<Pending>) {
         for (pending, id, body) in pending {
             let receipt = self.confirm_record(&pending).await;
             assert_eq!(receipt.record.policy, self.policy);
@@ -246,6 +281,9 @@ impl Client {
                 (self.bases[receipt.partition as usize] + history.len()) as u64
             );
             history.push((id, body));
+            self.submitted.retain(|(partition, sequence, _, _)| {
+                *partition != receipt.partition || *sequence != pending.sequence()
+            });
         }
     }
 
@@ -270,7 +308,8 @@ impl Client {
         }
     }
 
-    pub(crate) async fn reader(&self, at_end: bool) -> TopicReader {
+    /// Open at the retained oracle base or its observed end.
+    pub async fn reader(&self, at_end: bool) -> TopicReader {
         TopicReader::open(
             self.links.clone(),
             "orders",
@@ -304,7 +343,8 @@ impl Client {
         .unwrap()
     }
 
-    pub(crate) fn positions(&self) -> Vec<usize> {
+    /// Exclusive independently confirmed offsets by partition.
+    pub fn positions(&self) -> Vec<usize> {
         self.history
             .iter()
             .zip(&self.bases)
@@ -312,7 +352,8 @@ impl Client {
             .collect()
     }
 
-    pub(super) fn leader(&self, partition: u32) -> NodeId {
+    /// Observe current routing for a controlled broker fault.
+    pub fn leader(&self, partition: u32) -> NodeId {
         self.links
             .routes(self.writer.metadata().clone())
             .unwrap()
@@ -323,7 +364,8 @@ impl Client {
             .unwrap()
     }
 
-    pub(super) async fn retained_floor(&self) -> Offset {
+    /// Resolve the first retained offset through the real reader protocol.
+    pub async fn retained_floor(&self) -> Offset {
         let mut reader = TopicReader::open(
             self.links.clone(),
             "orders",
@@ -352,7 +394,8 @@ impl Client {
         floor
     }
 
-    pub(crate) async fn read(&self, reader: &mut TopicReader, mut positions: Vec<usize>) {
+    /// Check every received offset, identity, payload part and checkpoint.
+    pub async fn read(&self, reader: &mut TopicReader, mut positions: Vec<usize>) {
         let wanted = self
             .history
             .iter()
@@ -376,21 +419,51 @@ impl Client {
         }
     }
 
-    pub(crate) async fn close(self) {
+    /// Close producer admission and join the real SDK links.
+    pub async fn close(self) {
         self.writer.close().await.unwrap();
         self.links.shutdown().await.unwrap();
     }
 
-    pub(crate) async fn replay(&self) {
+    /// Verify retained oracle evidence through a fresh reader.
+    pub async fn replay(&self) {
         let mut reader = self.reader(false).await;
         self.read(&mut reader, self.bases.clone()).await;
         reader.close().await.unwrap();
     }
 
-    pub(crate) fn discard_verified(&mut self) {
+    /// Release verified payload evidence while retaining absolute offsets.
+    pub fn discard_verified(&mut self) {
         for (history, base) in self.history.iter_mut().zip(&mut self.bases) {
             *base += history.len();
             history.clear();
         }
+    }
+
+    /// Independently submitted and confirmed identities and opaque payload parts.
+    /// Outstanding submissions do not constitute confirmation evidence.
+    pub fn evidence(&self) -> serde_json::Value {
+        let records = |id: &MessageId, parts: &[Bytes]| {
+            serde_json::json!({
+                "id": id.as_bytes(), "parts": parts.iter().map(Bytes::as_ref).collect::<Vec<_>>()
+            })
+        };
+        serde_json::json!({
+            "producer": format!("{:?}", self.writer.identity()),
+            "bases": self.bases, "next_sequences": self.next_sequences,
+            "confirmed": self.history.iter().map(|history| history.iter()
+                .map(|(id, parts)| records(id, parts)).collect::<Vec<_>>()).collect::<Vec<_>>(),
+            "submitted": self.submitted.iter().map(|(partition, sequence, id, parts)|
+                serde_json::json!({"partition":partition,"sequence":sequence,"record":records(id, parts)})).collect::<Vec<_>>()
+        })
+    }
+}
+
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("writer", &self.writer)
+            .field("positions", &self.positions())
+            .finish_non_exhaustive()
     }
 }

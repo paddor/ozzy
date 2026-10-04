@@ -146,6 +146,26 @@ impl ResidentOperations {
         self.bytes -= released;
     }
 
+    pub(crate) fn retired(&mut self, group: ozzy_proto::GroupId, ids: &[u64]) {
+        for id in ids {
+            if self
+                .current
+                .as_ref()
+                .is_some_and(|segment| segment.group == group && segment.id == *id)
+            {
+                self.current = None;
+            }
+            if self
+                .previous
+                .as_ref()
+                .is_some_and(|segment| segment.group == group && segment.id == *id)
+            {
+                self.previous = None;
+            }
+            self.forget(group, *id);
+        }
+    }
+
     /// Bytes currently retained by resident operations.
     #[cfg(test)]
     pub(crate) fn retained_bytes(&self) -> usize {

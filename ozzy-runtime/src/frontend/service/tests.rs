@@ -537,6 +537,15 @@ fn trusted_clients_keep_membership_capacity_and_disconnect_fences_separate() {
         service.links.get(broker_binding.peer).unwrap().binding,
         broker_binding
     );
+    // Only an independently retired physical source authorizes tombstone removal.
+    assert!(!service.retire_transport_client(broker_binding.peer));
+    assert!(service.retire_transport_client(current.peer));
+    assert!(!service.retire_transport_client(current.peer));
+    assert!(service.accepts_transport_peer(NodeId::from_bytes([2; 16])));
+    let (replacement, _) = begin(&mut service, &extra, NodeId::from_bytes([2; 16]));
+    assert_eq!(replacement.kind, Kind::Client);
+    assert_eq!(service.peers.len(), 2);
+    assert_eq!(service.sessions.session(current.peer), None);
 }
 
 pub(in crate::frontend) fn setup() -> (Service, [crate::frontend::DataReceiver; 2], [Placement; 2])

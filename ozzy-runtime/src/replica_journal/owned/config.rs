@@ -37,10 +37,9 @@ pub struct OwnedConfig<C = ConfigurationRecord> {
 impl OwnedConfig {
     pub(super) fn validate(&self, generation: JournalGeneration) -> Result<(), JournalError> {
         let configuration = self.configuration.configuration();
-        let mode = if configuration.policy() == QuorumPolicy::Replicated {
-            SegmentWriteMode::Buffered
-        } else {
-            SegmentWriteMode::DataSync
+        let mode = match configuration.policy() {
+            QuorumPolicy::Replicated => SegmentWriteMode::Buffered,
+            QuorumPolicy::Durable => SegmentWriteMode::DataSync,
         };
         if self.identity.group_id != configuration.scope().group_id
             || !configuration

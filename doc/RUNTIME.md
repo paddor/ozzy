@@ -105,6 +105,16 @@ Recovery donors reserve a journal drain turn before pinning authoritative histor
 Outstanding writes and an independent sync barrier must settle and be observed
 before pin admission. The request remains queued during that wait; a busy journal
 does not terminate a healthy donor or supply recovery or quorum evidence.
+An admitted pin retains its exact response separately from the latest request.
+Nonce replacement, link loss, and a view change invalidate the request without
+canceling physical work. A matching late completion retains its exact source;
+obsolete sources are released through the bounded journal schedule before new
+pinning or view installation. They never overwrite the latest response. Repeated
+requests for the same nonce reuse the admitted snapshot while it remains pinned.
+After link loss releases that source, the nonce retains only its snapshot
+identity; retransmission waits for the requester's fresh attempt rather than
+recapturing a newer tail under the old nonce.
+Late fetch and checkpoint completions send nothing after request replacement.
 
 Addressed history reads also check journal admission before submitting work.
 An independent reader or lookup can hold the owner while the replica has no
@@ -126,6 +136,13 @@ Applications submit individual records. `send` observes local admission;
 Retry identity is producer/epoch/sequence within one partition. Request IDs,
 connection sessions, and batch boundaries may change; identity and bytes do not.
 
+History invariant failures retain a typed cause and source check. The replicated
+partition scheduler captures local identity, scope, journal generation, applied
+prefixes, active transfer, and donor response/pin evidence on that cold path.
+Donor completion failures also retain the exact completed pin, including its
+nonce and immutable source. Reporting an error still stops the partition and
+closes intake; diagnostics never grant recovery or confirmation authority.
+
 Route lookup filters obsolete physical sessions before comparing cached views.
 The dispatcher purges stale watches in bounded turns. A route hint grants no
 authority. Retryable NACKs use bounded backoff; reconnect and leader refresh
@@ -138,7 +155,7 @@ remain independent of transport receipt.
 | Records per APPEND | Minimum of negotiated limit and SDK cap of 2,048 |
 | Payload collection target | `SharedTopicWriterConfig::new`: 64 KiB, capped by packet capacity |
 | Outstanding APPENDs | Default one per partition writer; configurable |
-| Intentional delay | Zero by default; low-level `WriterConfig` supports bounded linger |
+| Intentional delay | None; collect only ready records without a timer |
 | Sparse / loaded traffic | Send a ready partial batch when idle; pipeline full batches or flushes |
 | Intake bytes | Payloads plus multipart length tables, including empty parts |
 | Lookahead | One permitted next record and part table beyond the collection target |
@@ -281,6 +298,13 @@ drops the attempt. Paused-source retries allow at most 16 receive attempts or
 sources reschedule; only a full destination waits for capacity.
 
 Queue dequeue returns slots; final payload release returns retained bytes.
+Dynamic SDK metadata slots bound concurrent retained clients. An exact current
+control disconnect reclaims the slot only after transport generation fencing;
+late disconnects cannot remove a replacement connection or session. The receive
+owner rechecks each receipt's OMQ source immediately before admission, including
+HELLO, so deleting disconnected client tombstones cannot revive queued old input.
+Producer retry identity remains in the broker-owned partition journal.
+
 Producer, follower, and control memory budgets span all partitions on a shard;
 adding I/O workers does not multiply them. Publication slots and output data/
 control queues also remain separately reserved and bounded.

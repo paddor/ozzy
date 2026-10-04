@@ -394,3 +394,53 @@ fn async_read_obeys_byte_limits_and_rejects_uninstalled_index_growth() {
     ));
     drive(&mut controller, journal.close()).unwrap();
 }
+
+#[test]
+fn retirement_prunes_live_reader_sources_and_preserves_already_captured_reads() {
+    let (mut controller, journal) = empty_journal();
+    let mut index = drive(&mut controller, Index::open(&journal, read_config(8192))).unwrap();
+    let mut journal = append(&mut controller, journal, &mut index, 0, 1024);
+    let held = capture(&index, &journal, 0, 1, 1);
+    drive(&mut controller, journal.roll_active(32768, 4)).unwrap();
+    index.rolled(&journal).unwrap();
+    journal = append(&mut controller, journal, &mut index, 1, 1024);
+    drive(
+        &mut controller,
+        journal.sync_through(journal.writer().written_position()),
+    )
+    .unwrap();
+    let mut next = journal.next_manifest().unwrap();
+    next.accepted = journal.written_position().unwrap();
+    next.committed = next.accepted;
+    drive(&mut controller, journal.install_metadata(next)).unwrap();
+    let id = ozzy_proto::CheckpointId::from_bytes([0x71; 16]);
+    drive(
+        &mut controller,
+        journal.build_checkpoint(id, Digest::from_bytes([0x72; 32]), 8, b"retained state"),
+    )
+    .unwrap();
+    drive(&mut controller, journal.install_checkpoint(id)).unwrap();
+    let retired = drive(
+        &mut controller,
+        journal.retire_sealed_prefix(
+            &crate::RetentionFloors::new(vec![(indexes::partition(), Offset::new(1))]).unwrap(),
+            crate::AsyncRetirementBudget {
+                max_segments: 1,
+                max_read_bytes: 32768,
+            },
+        ),
+    )
+    .unwrap();
+    assert_eq!(retired.unreferenced_segment_ids, [1]);
+    index
+        .retired(&journal, &retired.unreferenced_segment_ids)
+        .unwrap();
+    let cleanup = drive(&mut controller, journal.reclaim_unreferenced_segments(1)).unwrap();
+    assert_eq!(cleanup.pinned_segment_ids, [1]);
+    assert_eq!(read(&mut controller, held).0, [0]);
+    let current = capture(&index, &journal, 1, 2, 2);
+    assert_eq!(read(&mut controller, current), (vec![1], 0));
+    let cleanup = drive(&mut controller, journal.reclaim_unreferenced_segments(1)).unwrap();
+    assert_eq!(cleanup.removed_segment_ids, [1]);
+    drive(&mut controller, journal.close()).unwrap();
+}

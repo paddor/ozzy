@@ -97,8 +97,7 @@ pub(super) struct Admission {
 #[derive(Debug)]
 pub(super) struct Queued {
     pub(super) encoding: ozzy_proto::data::Encoding,
-    /// Admission time, kept only while a linger deadline or stage profiling
-    /// needs it.
+    /// Admission time, retained only when stage profiling needs it.
     pub(super) admitted_at: Option<tokio::time::Instant>,
     pub(super) sequence: u64,
     pub(super) completion: Completion,
@@ -141,17 +140,6 @@ impl Queued {
             .into_iter()
             .chain(multipart.iter().map(|&length| length as usize))
     }
-
-    /// When a lingering writer must send this record at the latest.
-    pub(super) fn linger_deadline(
-        &self,
-        linger: std::time::Duration,
-    ) -> Option<tokio::time::Instant> {
-        if linger.is_zero() {
-            return None;
-        }
-        self.admitted_at.map(|admitted| admitted + linger)
-    }
 }
 impl Admission {
     pub(super) fn profile_queue(&self, records: std::ops::Range<usize>) {
@@ -173,7 +161,6 @@ impl Admission {
 pub(super) struct TestRecord {
     pub(super) payload: Payload,
     pub(super) lengths: Vec<usize>,
-    pub(super) linger_deadline: Option<tokio::time::Instant>,
 }
 /// Completion state and immutable writer identity shared by pending handles.
 /// Contains no payloads or admission queues.
@@ -436,8 +423,7 @@ impl Shared {
             record.detach_shared();
         }
         let body = Body::take(record, bytes);
-        let admitted_at = (!self.config.linger.is_zero() || crate::profiling::enabled())
-            .then(tokio::time::Instant::now);
+        let admitted_at = crate::profiling::enabled().then(tokio::time::Instant::now);
         let Ok(sequence) = self
             .next
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
@@ -554,7 +540,6 @@ impl Driver {
         Some(TestRecord {
             payload,
             lengths: record.lengths().collect(),
-            linger_deadline: record.linger_deadline(self.config.linger),
         })
     }
     /// Transfer an admitted prefix into request ownership. Retries never return

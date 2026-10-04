@@ -2,6 +2,7 @@
 
 use super::{ActorError, JournalGeneration, Message, Prefix, ReplicaActor, Scope, VecDeque};
 use crate::profiling::{Event, event};
+use crate::replica_actor::HistoryReason;
 use ozzy_replication::PipelineLimits;
 
 #[cfg(test)]
@@ -92,11 +93,11 @@ impl Recent {
                 return if entry.predecessor == cursor {
                     Ok(Some(index))
                 } else {
-                    Err(ActorError::History)
+                    Err(ActorError::history(HistoryReason::Lookup))
                 };
             }
             if entry.end.op == cursor.op && entry.end != cursor {
-                return Err(ActorError::History);
+                return Err(ActorError::history(HistoryReason::Lookup));
             }
         }
         event(

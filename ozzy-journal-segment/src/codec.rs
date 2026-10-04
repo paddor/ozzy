@@ -163,7 +163,7 @@ pub(crate) fn validate_segment_capacity(capacity: u64) -> Result<(), CodecError>
 pub struct DecodeLimits {
     /// Maximum physical write groups decoded in one segment.
     pub max_groups: usize,
-    /// Maximum canonical operation entries decoded in one segment.
+    /// Maximum canonical operation entries decoded in one physical group.
     pub max_entries: usize,
     /// Maximum encoded bytes per physical operation entry.
     pub max_entry_bytes: usize,
@@ -189,6 +189,13 @@ impl Default for DecodeLimits {
 }
 
 impl DecodeLimits {
+    pub(crate) fn group_metadata_bytes(self) -> Option<usize> {
+        // Parsing grows a Vec geometrically; decoded operations coexist with
+        // its consuming iterator until the final entry has been checked.
+        self.max_entries
+            .checked_mul(2 * size_of::<ParsedEntry>() + size_of::<DecodedOperation<'_>>())
+    }
+
     /// Maximum indexed extent, including a shared compressed body and its
     /// uncompressed operation headers. Individual operations keep their limits.
     pub fn max_indexed_entry_bytes(self) -> usize {
@@ -1031,6 +1038,21 @@ pub fn decode_group<'a>(
         operations,
         next_chain,
     })
+}
+
+/// Probe physical framing without allocating decoded bodies. The caller then
+/// decodes exactly once after all encoded bytes are available.
+pub(crate) fn group_extent(
+    segment: &SegmentHeader,
+    group_number: u64,
+    start_offset: u64,
+    input: &[u8],
+    limits: DecodeLimits,
+) -> Result<u64, CodecError> {
+    validate_group_position(group_number, start_offset)?;
+    validate_decode_limits(limits)?;
+    scan_physical_group(segment, group_number, start_offset, input, limits)
+        .map(|parsed| parsed.end_offset)
 }
 
 /// Decode one exact indexed entry independently of physical-group framing.

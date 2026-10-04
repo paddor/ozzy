@@ -597,6 +597,29 @@ unselected files under the same selection and capture-pin checks.
 
 ### Bounded maintenance
 
+Retention summary and floor validation read one physical group at a time, then
+fold append metadata and discard the encoded and decoded bodies. They check the
+selected seal, canonical chain and bodies, segment identity, and physical zero
+tail. Scratch depends on configured group/operation limits and the read chunk,
+not segment capacity. The group footprint admits raw and beneficial LZ4 output
+from product writeback; an oversized declared footprint fails before allocation.
+The broker bounds per-group entries by its writeback operation count.
+
+Runtime scans reserve this scratch in the shared shard payload owner before
+issuing file jobs. Cached payloads may be evicted; live payloads retain their
+charges. Temporary exhaustion defers maintenance without waiting on another
+partition. Cancellation releases private scratch, while backend jobs retain their
+own handles, buffers and physical admission until completion. The same reader
+streams position validation, canonical replay, sealed-index
+construction, and active identity snapshots. Index construction validates the
+source before reusing or repairing derived files and validates the streamed
+build before publication. Partial replay or staging is discarded on error.
+Retirement prunes removed reader entries and keeps the installed active reader.
+Index metadata and canonical checkpoint/state images retain their separate
+configured limits; the group reservation accounts for encoded/decoded payload
+scratch rather than those longer-lived metadata images.
+
+
 | Work | API / scheduling |
 | --- | --- |
 | Scrub selected storage | `with_storage_validation`; default step budget 256 KiB / 2 ms |

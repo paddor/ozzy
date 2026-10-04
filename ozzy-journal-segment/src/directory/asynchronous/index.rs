@@ -1,11 +1,6 @@
-use super::{
-    DirectoryError, Journal, SegmentReference, validate_operation_bodies, validate_replay_scan,
-};
+use super::{DirectoryError, Journal, SegmentReference};
 use crate::index_builder::asynchronous::{self, Builder, Limits};
-use crate::{
-    IndexBuildLimits, IndexLimits, IndexSource, SegmentIndex, scan_segment_async,
-    segment_index_name,
-};
+use crate::{IndexBuildLimits, IndexLimits, IndexSource, SegmentIndex, segment_index_name};
 
 impl Journal {
     fn index_source(&self, id: u64) -> Result<(SegmentReference, IndexSource), DirectoryError> {
@@ -74,22 +69,11 @@ impl Journal {
     ) -> Result<SegmentIndex, DirectoryError> {
         self.healthy()?;
         let (reference, source) = self.index_source(segment)?;
-        let bytes = self.segment_image(reference).await?;
-        let scan = scan_segment_async(
-            &bytes,
-            reference.first_group_number,
-            reference.first_chain,
-            self.limits.decode,
-        )
-        .await?;
-        validate_operation_bodies(
-            &scan,
-            self.limits.operations,
-            self.manifest.configuration_epoch,
-            self.manifest.promised_view,
-        )
-        .await?;
-        validate_replay_scan(&reference, &scan, self.writer.state())?;
+        // Validate immutable authority before reuse or explicit index repair.
+        let mut validated = self.segment_groups(reference).await?;
+        while validated.next().await?.is_some() {}
+        validated.finish().await?;
+        let groups = self.segment_groups(reference).await?;
         self.interrupted = true;
         let index = Builder {
             access: self.access.clone(),
@@ -100,7 +84,7 @@ impl Journal {
                 directory_name_bytes: self.limits.directory_name_bytes,
             },
         }
-        .build(&scan, source, self.limits.operations, limits, repair)
+        .build(groups, source, self.limits.operations, limits, repair)
         .await?;
         self.interrupted = false;
         Ok(index)

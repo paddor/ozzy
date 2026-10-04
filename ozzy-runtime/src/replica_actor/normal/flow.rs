@@ -1,5 +1,6 @@
 //! Receipt and repair transport policy; durable votes remain in the replication driver.
 
+use crate::replica_actor::HistoryReason;
 use std::collections::VecDeque;
 
 use ozzy_proto::Opcode;
@@ -277,7 +278,7 @@ impl ReplicaActor {
         let key = (snapshot.scope, snapshot.journal.generation);
         if self.work.flow.key != Some(key) {
             if snapshot.pending_operations != 0 {
-                return Err(ActorError::History);
+                return Err(ActorError::history(HistoryReason::ReceiveWindow));
             }
             self.work
                 .receive
@@ -512,7 +513,7 @@ impl ReplicaActor {
                 return if known == wanted {
                     Ok(Some(known))
                 } else {
-                    Err(ActorError::History)
+                    Err(ActorError::history(HistoryReason::ReceiveWindow))
                 };
             }
         }
@@ -540,7 +541,7 @@ impl ReplicaActor {
         if known == wanted {
             Ok(Some(known))
         } else {
-            Err(ActorError::History)
+            Err(ActorError::history(HistoryReason::ReceiveWindow))
         }
     }
 
@@ -560,7 +561,7 @@ impl ReplicaActor {
         let base = if let Some(sender) = established {
             let base = sender.report().base;
             if base != report.base {
-                return Err(ActorError::History);
+                return Err(ActorError::history(HistoryReason::ReceiveWindow));
             }
             Some(base)
         } else {
@@ -702,7 +703,7 @@ impl ReplicaActor {
                     ]),
                 );
             }
-            return Err(ActorError::History);
+            return Err(ActorError::history(HistoryReason::ReceiveWindow));
         };
         self.adopt_flow(voter, request, base, received, now)?;
         Ok(())

@@ -1987,6 +1987,7 @@ dependencies = [
  "ozzy-proto",
  "ozzy-replication",
  "ozzy-runtime",
+ "ozzy-sim",
  "rustix",
  "tempfile",
  "thiserror",
@@ -2025,6 +2026,7 @@ dependencies = [
  "bytes",
  "fanring",
  "futures",
+ "serde",
  "tokio",
 ]
 
@@ -2144,17 +2146,24 @@ name = "ozzy-sim"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "clap",
  "futures",
  "omq-tokio",
+ "ozzy-broker",
+ "ozzy-config",
  "ozzy-core",
+ "ozzy-io",
  "ozzy-journal",
  "ozzy-journal-segment",
  "ozzy-proto",
  "ozzy-replication",
  "ozzy-runtime",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

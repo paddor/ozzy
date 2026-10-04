@@ -1,5 +1,7 @@
 //! Disk-gated election selection and generation installation.
 
+use crate::replica_actor::HistoryReason::ViewInstallation;
+use crate::replica_journal::FetchedHistory;
 use ozzy_replication::ViewChangeError;
 
 use super::history::TransferPurpose;
@@ -19,6 +21,9 @@ impl ReplicaActor {
         // later validation or election action changes the journal image.
         if self.work.ready.is_some() {
             return self.send_ready_turn(now);
+        }
+        if self.schedule_donor_release()? {
+            return Ok(());
         }
         // The captured read owns the transfer arena. Normal appends use their
         // own arenas; election/installation waits for its fenced return.
@@ -176,13 +181,13 @@ impl ReplicaActor {
                 ));
             }
             Err(DriverError::ViewChange(ViewChangeError::HistoryMissing)) => {
-                let (source, op) = missing.ok_or(ActorError::History)?;
+                let (source, op) = missing.ok_or_else(|| ActorError::history(ViewInstallation))?;
                 if self.lookup.unavailable(source, op) {
                     return Ok(());
                 }
                 if source.voter == self.local {
                     if self.pinned != Some(source) {
-                        return Err(ActorError::History);
+                        return Err(ActorError::history(ViewInstallation));
                     }
                     self.pending = Some(PendingIo::Position(
                         self.journal.history_position(source, op)?,
@@ -257,31 +262,14 @@ impl ReplicaActor {
             Completed::Capture(source) => self.pinned = Some(source),
             Completed::Release(source) => {
                 if self.pinned != Some(source) {
-                    return Err(ActorError::History);
+                    return Err(ActorError::history(ViewInstallation));
                 }
                 self.pinned = None;
             }
             Completed::Position(position) => self.complete_position(&position)?,
             Completed::Fetch(fetched, FetchPurpose::Serve(to)) => self.send_ops(to, fetched)?,
             Completed::Fetch(fetched, FetchPurpose::Install) => {
-                let ticket = self
-                    .driver
-                    .installation_ticket()
-                    .ok_or(ActorError::History)?;
-                let request = self.transfer.take().ok_or(ActorError::History)?.request;
-                if fetched.request() != request {
-                    return Err(ActorError::History);
-                }
-                let buffer = fetched.into_buffer();
-                if self.driver.scope().view > ticket.scope().view {
-                    self.recycle(buffer);
-                } else {
-                    self.pending = Some(PendingIo::Chunk(
-                        self.journal
-                            .install_chunk(ticket, buffer)
-                            .map_err(|rejected| rejected.reason)?,
-                    ));
-                }
+                self.complete_install_fetch(fetched)?;
             }
             Completed::Begin(ticket) => self.staged = Some(ticket.protected_committed()),
             Completed::Chunk(chunk) => {
@@ -313,6 +301,32 @@ impl ReplicaActor {
                 self.complete_flow_verification(&positions, voter, request, now)?;
             }
             completed => self.complete_normal(completed, now)?,
+        }
+        Ok(())
+    }
+
+    fn complete_install_fetch(&mut self, fetched: FetchedHistory) -> Result<(), ActorError> {
+        let ticket = self
+            .driver
+            .installation_ticket()
+            .ok_or_else(|| ActorError::history(ViewInstallation))?;
+        let request = self
+            .transfer
+            .take()
+            .ok_or_else(|| ActorError::history(ViewInstallation))?
+            .request;
+        if fetched.request() != request {
+            return Err(ActorError::history(ViewInstallation));
+        }
+        let buffer = fetched.into_buffer();
+        if self.driver.scope().view > ticket.scope().view {
+            self.recycle(buffer);
+        } else {
+            self.pending = Some(PendingIo::Chunk(
+                self.journal
+                    .install_chunk(ticket, buffer)
+                    .map_err(|rejected| rejected.reason)?,
+            ));
         }
         Ok(())
     }

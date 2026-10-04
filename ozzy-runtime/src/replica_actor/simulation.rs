@@ -110,7 +110,7 @@ impl ControlledReplica {
             self.actor.ingress.close();
         }
         self.actor.publish_status(self.active);
-        result.map_err(SimulationError::Actor)
+        result.map_err(|error| SimulationError::Actor(self.actor.diagnose(error)))
     }
 }
 
