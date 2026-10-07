@@ -1,6 +1,6 @@
 # Ozzy
 
-Messaging and replicated logs over OMQ.
+Durable message streaming over OMQ.
 
 ## Install
 
@@ -13,12 +13,7 @@ cargo install ozzy-broker --version 0.1.0 --locked --bin ozy_broker
 Provide a deployment TOML and explicitly initialize its identity, volumes, and
 segment stores before serving. See [broker startup](ozzy-broker/README.md).
 
-Applications use the native producer and consumer SDK:
-
-```toml
-[dependencies]
-ozzy = "0.1.0"
-```
+Applications use the [native Rust producer and consumer SDK](ozzy/README.md).
 
 ## Start here
 
