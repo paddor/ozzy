@@ -10,6 +10,9 @@ repository.workspace = true
 description = "Journal contracts and local durability evidence for Ozzy."
 readme = "README.md"
 publish = ["crates-io"]
+keywords = ["journal", "append-only", "durability", "storage", "ozzy"]
+categories = ["database-implementations"]
+include.workspace = true
 
 [dependencies]
 xxhash-rust.workspace = true

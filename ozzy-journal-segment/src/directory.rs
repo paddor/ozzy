@@ -2413,7 +2413,7 @@ fn parse_checkpoint_name(name: &OsStr) -> Option<CheckpointId> {
     }
     let mut bytes = [0_u8; 16];
     let (pairs, remainder) = name.as_bytes().as_chunks::<2>();
-    debug_assert!(remainder.is_empty());
+    debug_assert_eq!(remainder.len(), 0);
     for (output, pair) in bytes.iter_mut().zip(pairs) {
         *output = (hex_value(pair[0])? << 4) | hex_value(pair[1])?;
     }

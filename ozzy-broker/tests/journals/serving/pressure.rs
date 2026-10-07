@@ -9,29 +9,50 @@ const RECORDS: usize = 256;
 const PARTITIONS: usize = 3;
 
 #[tokio::test(flavor = "current_thread")]
-async fn inproc_memory_load_preserves_records_with_slow_readers() {
-    Box::pin(run(false, WRITERS)).await;
+async fn inproc_memory_bounded_sources_preserve_records_in_all_modes() {
+    for policy in [
+        Confirmation::LocalDurable,
+        Confirmation::DiskQuorum,
+        Confirmation::ReplicatedPersisting,
+    ] {
+        Box::pin(run_policy(false, policy, 20, 16)).await;
+    }
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn inproc_memory_load_preserves_records_with_reordered_disk_completions() {
-    Box::pin(run(true, WRITERS)).await;
-}
+mod stress {
+    use super::*;
 
-#[tokio::test(flavor = "current_thread")]
-async fn inproc_memory_load_preserves_records_with_many_producer_sources() {
-    // More sources than one paused-input turn, sharing the same shard lanes.
-    Box::pin(run_policy(false, Confirmation::LocalDurable, 20)).await;
-}
+    #[tokio::test(flavor = "current_thread")]
+    async fn inproc_memory_load_preserves_records_with_slow_readers() {
+        Box::pin(run(false, WRITERS)).await;
+    }
 
-#[tokio::test(flavor = "current_thread")]
-async fn inproc_memory_load_preserves_many_producer_sources_with_disk_quorum() {
-    Box::pin(run_policy(false, Confirmation::DiskQuorum, 20)).await;
-}
+    #[tokio::test(flavor = "current_thread")]
+    async fn inproc_memory_load_preserves_records_with_reordered_disk_completions() {
+        Box::pin(run(true, WRITERS)).await;
+    }
 
-#[tokio::test(flavor = "current_thread")]
-async fn inproc_memory_load_preserves_many_producer_sources_with_replicated_persisting() {
-    Box::pin(run_policy(false, Confirmation::ReplicatedPersisting, 20)).await;
+    #[tokio::test(flavor = "current_thread")]
+    async fn inproc_memory_load_preserves_records_with_many_producer_sources() {
+        // More sources than one paused-input turn, sharing the same shard lanes.
+        Box::pin(run_policy(false, Confirmation::LocalDurable, 20, RECORDS)).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn inproc_memory_load_preserves_many_producer_sources_with_disk_quorum() {
+        Box::pin(run_policy(false, Confirmation::DiskQuorum, 20, RECORDS)).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn inproc_memory_load_preserves_many_producer_sources_with_replicated_persisting() {
+        Box::pin(run_policy(
+            false,
+            Confirmation::ReplicatedPersisting,
+            20,
+            RECORDS,
+        ))
+        .await;
+    }
 }
 
 async fn run(reverse: bool, writers: usize) {
@@ -40,15 +61,15 @@ async fn run(reverse: bool, writers: usize) {
         Confirmation::DiskQuorum,
         Confirmation::ReplicatedPersisting,
     ] {
-        Box::pin(run_policy(reverse, policy, writers)).await;
+        Box::pin(run_policy(reverse, policy, writers, RECORDS)).await;
     }
 }
 
-async fn run_policy(reverse: bool, policy: Confirmation, writers: usize) {
+async fn run_policy(reverse: bool, policy: Confirmation, writers: usize, records: usize) {
     eprintln!("inproc memory pressure: reverse={reverse}/{policy:?}");
     tokio::time::timeout(
         Duration::from_secs(90),
-        Box::pin(scenario(reverse, policy, writers)),
+        Box::pin(scenario(reverse, policy, writers, records)),
     )
     .await
     .unwrap_or_else(|_| panic!("reverse={reverse}/{policy:?}: inproc load timed out"));
@@ -70,7 +91,7 @@ fn wire() -> DataLimits {
     clippy::too_many_lines,
     reason = "one end-to-end bounded load and repair scenario"
 )]
-async fn scenario(reverse: bool, policy: Confirmation, writers: usize) {
+async fn scenario(reverse: bool, policy: Confirmation, writers: usize, records: usize) {
     let root = std::path::PathBuf::from(format!("/ozzy-simulation-{}", Uuid::now_v7()));
     let runtime = WriterRuntime::new().unwrap();
     let mode = if policy == Confirmation::LocalDurable {
@@ -138,7 +159,7 @@ async fn scenario(reverse: bool, policy: Confirmation, writers: usize) {
     let mut opening = Box::pin(reader.next());
     assert!(futures::poll!(opening.as_mut()).is_pending());
     drop(opening);
-    let (tasks, mut progress) = start_writers(&brokers, &producers).await;
+    let (tasks, mut progress) = start_writers(&brokers, &producers, records).await;
     // Returned payload aliases stay charged while later traffic fills the SDK.
     let mut held = Vec::new();
     for _ in 0..4 {
@@ -148,7 +169,7 @@ async fn scenario(reverse: bool, policy: Confirmation, writers: usize) {
                 .unwrap(),
         );
     }
-    for completed in 0..writers * RECORDS {
+    for completed in 0..writers * records {
         assert!(
             load_progress(
                 &brokers,
@@ -168,7 +189,7 @@ async fn scenario(reverse: bool, policy: Confirmation, writers: usize) {
             assert!(expected.insert((row.partition, row.offset), row).is_none());
         }
     }
-    assert_eq!(expected.len(), writers * RECORDS);
+    assert_eq!(expected.len(), writers * records);
     let mut offsets = [0; PARTITIONS];
     for record in held {
         verify(&record, &mut expected, &mut offsets);
@@ -187,7 +208,7 @@ async fn scenario(reverse: bool, policy: Confirmation, writers: usize) {
     let stats = reader.stats();
     assert_eq!(
         stats.live_records + stats.replayed_records,
-        (writers * RECORDS) as u64
+        (writers * records) as u64
     );
     assert!(
         stats.replayed_records > 0,
@@ -195,7 +216,7 @@ async fn scenario(reverse: bool, policy: Confirmation, writers: usize) {
     );
     eprintln!(
         "inproc memory pressure verified reverse={reverse}/{policy:?}: {} records, {stats:?}",
-        writers * RECORDS
+        writers * records
     );
     load_progress(&brokers, "close pressured reader", reader.close())
         .await
@@ -212,11 +233,12 @@ async fn scenario(reverse: bool, policy: Confirmation, writers: usize) {
 async fn start_writers(
     brokers: &[Broker],
     sdks: &[BrokerLinks],
+    records: usize,
 ) -> (
     Vec<tokio::task::JoinHandle<Vec<Expected>>>,
     tokio::sync::mpsc::Receiver<()>,
 ) {
-    let (progress, received) = tokio::sync::mpsc::channel(sdks.len() * RECORDS);
+    let (progress, received) = tokio::sync::mpsc::channel(sdks.len() * records);
     let mut tasks = Vec::new();
     for (writer_number, sdk) in sdks.iter().enumerate() {
         let mut config = SharedTopicWriterConfig::new(wire());
@@ -229,7 +251,12 @@ async fn start_writers(
         )
         .await
         .unwrap();
-        tasks.push(tokio::spawn(write(writer, writer_number, progress.clone())));
+        tasks.push(tokio::spawn(write(
+            writer,
+            writer_number,
+            records,
+            progress.clone(),
+        )));
     }
     (tasks, received)
 }
@@ -246,6 +273,7 @@ struct Expected {
 async fn write(
     mut writer: SharedTopicWriter,
     number: usize,
+    records: usize,
     progress: tokio::sync::mpsc::Sender<()>,
 ) -> Vec<Expected> {
     let keys: Vec<_> = (0..PARTITIONS as u32)
@@ -258,11 +286,11 @@ async fn write(
         .collect();
     let mut pending = VecDeque::new();
     let mut confirmed = Vec::new();
-    for sequence in 0..RECORDS {
+    for sequence in 0..records {
         let id = MessageId::from_bytes(
             (((number + 1) as u128) << 64 | (sequence + 1) as u128).to_be_bytes(),
         );
-        let bytes = [32768, 128, 8192, 512][sequence / 64];
+        let bytes = [32768, 128, 8192, 512][sequence * 4 / records];
         let fill = ((number * 17 + sequence) % 251) as u8;
         let mut body = vec![fill; bytes];
         body[..16].copy_from_slice(id.as_bytes());

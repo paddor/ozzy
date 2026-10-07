@@ -51,7 +51,7 @@ async fn multiple() {
             > writer.metadata().partition(1).unwrap().incarnation,
         "test must distinguish numeric order from identity order"
     );
-    assert!(harness.openings.is_empty());
+    assert_eq!(harness.openings.len(), 0);
     let key = |number| {
         (0_u32..100)
             .map(u32::to_be_bytes)
@@ -196,7 +196,7 @@ async fn scenario() {
     let mut b = b.unwrap();
     assert_eq!(a.metadata(), b.metadata());
     assert_ne!(a.producer(), b.producer());
-    assert!(harness.openings.is_empty());
+    assert_eq!(harness.openings.len(), 0);
     assert!(harness.watch.is_none());
     let session = links.session(authority.primary).unwrap();
     let first = a

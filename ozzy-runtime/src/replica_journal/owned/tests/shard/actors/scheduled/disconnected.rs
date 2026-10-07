@@ -53,7 +53,7 @@ fn unbound_startup_and_disconnected_intake_never_fabricate_sessions_or_confirmat
         let (mut actors, pending, proposal) = unbound_cluster(&mut controller, &io, policy);
         let mut pending = Box::pin(pending);
         for _ in 0..1000 {
-            assert!(collect(&mut actors, Duration::ZERO, false).is_empty());
+            assert_eq!(collect(&mut actors, Duration::ZERO, false).len(), 0);
             settle(&mut controller, &[]);
         }
         assert_eq!(actors[0].status().normal.unwrap().accepted.op.0, 1);
@@ -107,7 +107,7 @@ fn unbound_startup_and_disconnected_intake_never_fabricate_sessions_or_confirmat
             );
         }
         for _ in 0..32 {
-            assert!(collect(&mut actors, Duration::ZERO, false).is_empty());
+            assert_eq!(collect(&mut actors, Duration::ZERO, false).len(), 0);
             settle(&mut controller, &[]);
         }
         assert!(poll(pending.as_mut()).is_pending());

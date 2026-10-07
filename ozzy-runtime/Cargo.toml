@@ -10,6 +10,9 @@ repository.workspace = true
 description = "Embedded Ozzy broker runtime and native SDK over OMQ."
 readme = "README.md"
 publish = ["crates-io"]
+keywords = ["event-streaming", "replication", "async", "storage", "omq"]
+categories = ["database-implementations", "asynchronous", "network-programming"]
+include.workspace = true
 
 [features]
 default = []

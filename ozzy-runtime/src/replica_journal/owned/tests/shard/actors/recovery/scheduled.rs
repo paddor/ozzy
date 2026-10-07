@@ -59,7 +59,7 @@ fn retry(policy: QuorumPolicy) {
     let mut actor = ScheduledRecovery::new(actor);
     actor.bind_receive_owner(&memory).unwrap();
     let origin = Duration::from_secs(3600);
-    assert!(turn(&mut actor, origin).is_empty());
+    assert_eq!(turn(&mut actor, origin).len(), 0);
     let peer = NodeId::from_bytes([1; 16]);
     let first = LinkSessionId::from_bytes([61; 16]);
     actor
@@ -84,7 +84,7 @@ fn retry(policy: QuorumPolicy) {
     actor.replace_session(peer, first, next, abandoned).unwrap();
     let reopened = origin + Duration::from_secs(600);
     for _ in 0..16 {
-        assert!(turn(&mut actor, reopened).is_empty());
+        assert_eq!(turn(&mut actor, reopened).len(), 0);
     }
     assert_eq!(
         controller.jobs(),
@@ -117,7 +117,7 @@ fn retry(policy: QuorumPolicy) {
     assert!(!actor.status().application_ready);
     assert!(actor.status().normal.is_none());
     let before_stall = reopened + Duration::from_secs(9);
-    assert!(!turn(&mut actor, before_stall).is_empty());
+    assert_ne!(turn(&mut actor, before_stall).len(), 0);
     assert!(
         controller.jobs().is_empty(),
         "fresh attempt abandoned before its deadline"
@@ -148,7 +148,7 @@ fn recovery_shutdown_settles_a_transition_with_canceled_observations() {
         assert!(actor.transition_pending());
         turn(&mut actor, abandoned);
         let held = controller.jobs();
-        assert!(!held.is_empty());
+        assert_ne!(held.len(), 0);
         let mut closing = Box::pin(actor.shutdown());
         for _ in 0..16 {
             assert!(poll(closing.as_mut()).is_pending());
@@ -198,7 +198,7 @@ fn rebuild(policy: QuorumPolicy) {
         .replace_session(peer, first, next, Duration::ZERO)
         .unwrap();
     for _ in 0..16 {
-        assert!(turn(&mut recovering, Duration::ZERO).is_empty());
+        assert_eq!(turn(&mut recovering, Duration::ZERO).len(), 0);
     }
     assert_eq!(controller.jobs(), held, "handoff duplicated I/O");
     recovering

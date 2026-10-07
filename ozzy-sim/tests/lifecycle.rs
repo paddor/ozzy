@@ -41,7 +41,7 @@ fn erased_store_reopens_nonvoting_and_recovers_before_supplying_a_new_quorum() {
     sim.lose_store(1);
     sim.reopen(1);
     assert!(sim.replicas[1].driver.is_none());
-    assert!(sim.replicas[1].stable.operations.is_empty());
+    assert_eq!(sim.replicas[1].stable.operations.len(), 0);
     assert!(!sim.replicas[1].stable.admitted);
     sim.links = [[true; 3]; 3];
     sim.until(5000, |sim| {
@@ -101,7 +101,7 @@ fn retained_payload_waits_for_disk_without_retransmission_or_false_commit() {
         assert_eq!(exchange(&mut sim), 0, "disk delay is not payload loss");
         assert!(!sim.acknowledge(&request));
         for replica in &sim.replicas {
-            assert!(replica.stable.operations.is_empty());
+            assert_eq!(replica.stable.operations.len(), 0);
             if let Some(snapshot) = replica.snapshot() {
                 assert_eq!(snapshot.committed, Prefix::GENESIS);
             }
@@ -157,7 +157,7 @@ fn acknowledged_before_commit_announcement_survives_election_and_old_primary_rej
     for _ in 0..4 {
         exchange(&mut sim);
     }
-    assert!(sim.replicas[0].stable.operations.is_empty());
+    assert_eq!(sim.replicas[0].stable.operations.len(), 0);
     for replica in [0, 2] {
         sim.perform_disk(replica);
         sim.notify_disk(replica);
@@ -176,7 +176,7 @@ fn acknowledged_before_commit_announcement_survives_election_and_old_primary_rej
     sim.deliver(ack);
     sim.replicas[0].apply_normal();
     assert!(sim.acknowledge(&request));
-    assert!(sim.replicas[1].stable.operations.is_empty());
+    assert_eq!(sim.replicas[1].stable.operations.len(), 0);
     for backup in 1..3 {
         assert_eq!(
             sim.replicas[backup].snapshot().unwrap().committed,

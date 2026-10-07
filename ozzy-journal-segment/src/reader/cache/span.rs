@@ -295,7 +295,7 @@ mod tests {
         };
         let (descriptors, decoded_bytes, backing, range) =
             full.prepared_backing(body.len()).unwrap();
-        assert!(!descriptors.is_empty());
+        assert_ne!(descriptors.len(), 0);
         assert_eq!(decoded_bytes, decoded.len());
         assert_eq!(&backing[range.clone()], encoded);
         forward_prepared(descriptors, decoded_bytes, backing, range, &full);

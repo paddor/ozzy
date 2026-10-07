@@ -135,8 +135,8 @@ fn cancelled_metadata_hash_installs_nothing_and_retry_rehashes_changed_bytes() {
                 .is_pending()
         );
     }
-    assert!(buffer.prepared.is_empty());
-    assert!(buffer.body_digests.is_empty());
+    assert_eq!(buffer.prepared.len(), 0);
+    assert_eq!(buffer.body_digests.len(), 0);
     assert_eq!(buffer.entries[0].envelope.op_number, 0);
     let before = canonical_body_digest(&buffer.bodies);
     buffer.bodies.mutable().unwrap()[0] ^= 1;

@@ -206,12 +206,13 @@ fn repairs_only_damaged_ranges_preserves_successors_and_reclaims_obsolete_incarn
     fixture.assert_unchanged();
     let pin = journal.pin_segments(&[1, 3]).unwrap();
     assert!(pin.segment_path(1).unwrap().ends_with("1.1.log"));
-    assert!(
+    assert_eq!(
         journal
             .reclaim_unreferenced_segments()
             .unwrap()
             .removed_segment_ids
-            .is_empty()
+            .len(),
+        0
     );
     drop(pin);
     assert_eq!(

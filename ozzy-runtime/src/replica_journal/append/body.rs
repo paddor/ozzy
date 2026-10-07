@@ -270,11 +270,11 @@ mod tests {
         let owner = owner(16, 1);
         let mut body = Body::charged(owner.allocator());
         assert!(body.freeze().is_empty());
-        assert!(body.mutable().unwrap().is_empty());
+        assert_eq!(body.mutable().unwrap().len(), 0);
         assert_eq!(owner.allocated_bytes(), 0);
         body.reserve(16).unwrap();
         let empty = body.freeze();
-        assert!(body.mutable().unwrap().is_empty());
+        assert_eq!(body.mutable().unwrap().len(), 0);
         assert_eq!(owner.allocated_bytes(), 16);
         assert!(body.extend_from_slice(&[42]).is_err());
         drop(empty);

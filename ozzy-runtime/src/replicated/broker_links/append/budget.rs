@@ -42,6 +42,10 @@ fn fits(held: usize, extra: usize, limit: usize) -> bool {
     held.checked_add(extra).is_some_and(|sum| sum <= limit)
 }
 
+#[allow(
+    deprecated,
+    reason = "Atomic::try_update requires Rust 1.95; MSRV is 1.93"
+)]
 fn reserve(counter: &AtomicUsize, extra: usize, limit: usize) -> bool {
     if extra == 0 {
         return true;

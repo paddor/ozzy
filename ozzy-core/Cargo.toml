@@ -10,6 +10,9 @@ repository.workspace = true
 description = "Deterministic owner state for Ozzy."
 readme = "README.md"
 publish = ["crates-io"]
+keywords = ["event-streaming", "state-machine", "log", "messaging", "ozzy"]
+categories = ["database-implementations"]
+include.workspace = true
 
 [dependencies]
 ahash.workspace = true

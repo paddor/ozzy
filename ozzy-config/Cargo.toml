@@ -9,6 +9,9 @@ repository.workspace = true
 description = "Validated deployment configuration and persistent identity for Ozzy."
 readme = "README.md"
 publish = ["crates-io"]
+keywords = ["configuration", "deployment", "validation", "toml", "ozzy"]
+categories = ["config"]
+include = ["/src/**/*.rs", "/README.md", "/LICENSE", "/tests/fixtures/single.toml"]
 
 [dependencies]
 serde.workspace = true

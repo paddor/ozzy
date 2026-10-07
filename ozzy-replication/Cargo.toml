@@ -10,6 +10,9 @@ repository.workspace = true
 description = "Deterministic replication state for Ozzy."
 readme = "README.md"
 publish = ["crates-io"]
+keywords = ["replication", "consensus", "recovery", "event-streaming", "sans-io"]
+categories = ["database-implementations", "network-programming"]
+include.workspace = true
 
 [dependencies]
 bytes.workspace = true

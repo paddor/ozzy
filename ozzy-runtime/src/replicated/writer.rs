@@ -341,6 +341,10 @@ impl Writer {
 
     /// Register a producer handle sharing bounded typed SDK intake.
     /// Move one handle to each producing task or thread.
+    #[allow(
+        deprecated,
+        reason = "Atomic::try_update requires Rust 1.95; MSRV is 1.93"
+    )]
     pub fn try_clone(&self) -> Result<Self, WriterError> {
         if self.shared.sealed() {
             return Err(WriterError::Closed);

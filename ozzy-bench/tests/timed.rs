@@ -188,7 +188,7 @@ fn excessive_scheduled_backlog_fails_instead_of_reducing_the_offered_rate() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("scheduled backlog exceeded"),
         "{}",
@@ -354,6 +354,7 @@ fn disk_quorum_admits_replication_with_sixteen_readers() {
         .args([
             "--processes",
             "--network-ingress",
+            "--streaming",
             "--system",
             "disk-quorum",
             "--duration",
@@ -368,6 +369,10 @@ fn disk_quorum_admits_replication_with_sixteen_readers() {
             "1",
             "--record-bytes",
             "128",
+            "--request-records",
+            "256",
+            "--writer-batch-records",
+            "256",
             "--history-mib",
             "512",
             "--segment-mib",
@@ -432,7 +437,7 @@ fn invalid_timed_arguments_fail_without_valid_output() {
             .output()
             .unwrap();
         assert!(!output.status.success());
-        assert!(output.stdout.is_empty());
+        assert_eq!(output.stdout.len(), 0);
     }
 }
 
@@ -711,7 +716,7 @@ exec sh -c "$1"
         .unwrap();
     if mode != "normal" {
         assert!(!output.status.success());
-        assert!(output.stdout.is_empty());
+        assert_eq!(output.stdout.len(), 0);
         let cause = if mode == "warning" {
             "warning: placement fixture"
         } else {
@@ -733,7 +738,7 @@ exec sh -c "$1"
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.stderr.is_empty());
+    assert_eq!(output.stderr.len(), 0);
     let row: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
         row["total_confirmed_records"],

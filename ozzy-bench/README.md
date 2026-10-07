@@ -759,7 +759,7 @@ client traffic. A leader plus local follower can confirm without crossing it.
 Writers/readers stay on the coordinator host, so latency uses one monotonic clock.
 Never subtract broker clocks. Stop all local/remote workers before another run;
 forced termination can leave scratch. Multiple brokers sharing a host/disk still
-share a failure domain. See [fault tests](../doc/VALIDATION.md#test-layers).
+share a failure domain. See [fault tests](../DEVELOPMENT.md#test-layers).
 
 ## Process control
 

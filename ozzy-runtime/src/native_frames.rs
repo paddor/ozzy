@@ -123,10 +123,10 @@ mod tests {
             metadata.fill(0);
             let frames: Vec<_> = packet.iter().collect();
             assert_eq!(frames.len(), 4);
-            assert!(frames[0].as_ref().is_empty());
+            assert_eq!(frames[0].as_ref().len(), 0);
             assert_eq!(frames[1].as_ref(), &[4; 64]);
             assert_eq!(frames[2].as_ref(), vec![9; size]);
-            assert!(frames[3].as_ref().is_empty());
+            assert_eq!(frames[3].as_ref().len(), 0);
         }
     }
 

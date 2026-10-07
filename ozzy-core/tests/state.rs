@@ -664,7 +664,7 @@ fn message_id_is_metadata_not_the_append_deduplication_key() {
     apply(&mut state, &mut index, 3, &append(0, 0x40));
 
     let next = state.prepare(4, &append(1, 0x40), &index, &state).unwrap();
-    assert!(next.identity_claims().is_empty());
+    assert_eq!(next.identity_claims().len(), 0);
 }
 
 #[test]

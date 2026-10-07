@@ -22,6 +22,10 @@ impl Budget {
         })
     }
 
+    #[allow(
+        deprecated,
+        reason = "Atomic::try_update requires Rust 1.95; MSRV is 1.93"
+    )]
     pub(super) fn reserve(self: &Arc<Self>, shard: usize) -> io::Result<Reservation> {
         let limit =
             self.limit / self.used.len() + usize::from(shard < self.limit % self.used.len());

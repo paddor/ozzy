@@ -517,7 +517,7 @@ fn retention_drops_manifest_prefix_first_and_respects_record_floors_and_pins() {
     let (journal, blocked) = journal.trim_sealed_prefix(&floors).unwrap();
     assert_eq!(blocked.blocked_by_pin, Some(1));
     assert_eq!(blocked.unreferenced_segment_ids, [1]);
-    assert!(blocked.removed_segment_ids.is_empty());
+    assert_eq!(blocked.removed_segment_ids.len(), 0);
     assert_eq!(journal.directory().manifest().segments[0].segment_id, 2);
     assert!(root.join("segments/1.log").exists());
     drop(pin);
@@ -533,7 +533,7 @@ fn retention_drops_manifest_prefix_first_and_respects_record_floors_and_pins() {
     fs::write(&index_path, &old_index).unwrap();
     let cleanup = journal.reclaim_unreferenced_segments().unwrap();
     assert_eq!(cleanup.removed_segment_ids, [1]);
-    assert!(cleanup.pinned_segment_ids.is_empty());
+    assert_eq!(cleanup.pinned_segment_ids.len(), 0);
     assert_eq!(
         cleanup.reclaimed_bytes,
         u64::try_from(old_segment.len() + old_index.len()).unwrap()

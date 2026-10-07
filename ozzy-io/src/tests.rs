@@ -214,7 +214,7 @@ async fn directory_transfer_keeps_charge_until_result_release() {
     let mut result = completion.await.unwrap();
     let entries = result.take_directory().unwrap();
     assert_eq!(entries[0].name, "segment");
-    assert!(result.take_directory().unwrap().is_empty());
+    assert_eq!(result.take_directory().unwrap().len(), 0);
     assert_eq!(admission.used(0, Class::Data).bytes, 50);
     drop(result);
     assert_eq!(admission.used(0, Class::Data), Quota::default());

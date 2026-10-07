@@ -2,7 +2,13 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
   pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -17,7 +23,17 @@ defaults:
     working-directory: ozzy
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: ozzy
+      - uses: ./ozzy/.github/actions/setup
+      - run: ./scripts/test-all.sh lint
+
   test:
+    needs: lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -25,9 +41,12 @@ jobs:
           path: ozzy
       - uses: ./ozzy/.github/actions/setup
       - run: ./scripts/ozzy_cargo build --workspace --locked
-      - run: ./scripts/test-all.sh
+      - run: ./scripts/test-all.sh tests
+        env:
+          NEXTEST_PROFILE: ci
 
   msrv:
+    needs: lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -39,6 +58,7 @@ jobs:
       - run: ./scripts/ozzy_cargo check --workspace --all-targets --locked
 
   publish-check:
+    needs: lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

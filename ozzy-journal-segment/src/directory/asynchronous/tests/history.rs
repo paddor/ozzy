@@ -271,7 +271,7 @@ fn refreshed_history_checks_only_new_groups_and_rejects_damaged_suffix() {
     )
     .unwrap();
     assert_eq!(chunk.end(), second[1]);
-    assert!(!read_offsets.is_empty());
+    assert_ne!(read_offsets.len(), 0);
     assert!(read_offsets.iter().all(|offset| *offset >= old_end));
 
     let second_end = journal.writer.written_position().end_offset();

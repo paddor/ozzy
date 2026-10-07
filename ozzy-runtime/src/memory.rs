@@ -58,6 +58,10 @@ impl Domain {
 
     /// Reserve an owner's full budget, including unused capacity. Returns a
     /// !Send owner; cloned owners share their local cache and reservation.
+    #[allow(
+        deprecated,
+        reason = "Atomic::try_update requires Rust 1.95; MSRV is 1.93"
+    )]
     pub fn owner(&self, limits: Limits) -> io::Result<Owner> {
         if limits.bytes == 0
             || limits.bytes > self.0.bytes

@@ -389,6 +389,10 @@ impl Shared {
         self.capacity.notify_changed();
         self.work.mark();
     }
+    #[allow(
+        deprecated,
+        reason = "Atomic::try_update requires Rust 1.95; MSRV is 1.93"
+    )]
     pub(super) fn admit(
         &self,
         sender: &mut Sender,

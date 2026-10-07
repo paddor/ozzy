@@ -9,6 +9,12 @@ if [[ "${OZZY_TEST_ALL_REEXEC:-}" != 1 ]]; then
     exec "$ozzy_tool_dir/ozzy_test_all" "$ozzy_repo_root/scripts/test-all.sh" "$@"
 fi
 
+phase=${1:-all}
+if [[ $# -gt 1 || ! "$phase" =~ ^(all|lint|tests)$ ]]; then
+    printf 'Usage: %s [all|lint|tests]\n' "$0" >&2
+    exit 2
+fi
+
 check_phase() {
     local phase=$1
     shift
@@ -16,8 +22,14 @@ check_phase() {
     time "$@"
 }
 
-check_phase format cargo fmt --all -- --check
-check_phase lint cargo clippy --workspace --all-targets -- -D warnings
+if [[ "$phase" != tests ]]; then
+    check_phase format cargo fmt --all -- --check
+    check_phase lint cargo clippy --workspace --all-targets -- -D warnings
+fi
+if [[ "$phase" == lint ]]; then
+    exit 0
+fi
+
 check_phase tests cargo nextest run --workspace --test-threads 8 \
     --status-level fail --final-status-level fail
 check_phase doctests cargo test --workspace --doc

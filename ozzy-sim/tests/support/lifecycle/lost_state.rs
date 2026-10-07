@@ -103,7 +103,7 @@ fn recovery_disk_cuts_before_and_after_physical_work_preserve_acknowledged_bytes
             // bytes; a fully published replacement instead reopens fenced.
             sim.cut(2);
             if !(publication && performed) {
-                assert!(sim.replicas[2].stable.operations.is_empty());
+                assert_eq!(sim.replicas[2].stable.operations.len(), 0);
             }
             sim.reopen(2);
             assert!(sim.replicas[2].snapshot().is_none());
@@ -150,7 +150,7 @@ fn one_responder_and_duplicate_replies_cannot_admit_empty_storage() {
             sim.deliver(0);
         }
         assert!(sim.replicas[2].driver.is_none());
-        assert!(sim.replicas[2].stable.operations.is_empty());
+        assert_eq!(sim.replicas[2].stable.operations.len(), 0);
         assert!(!sim.replicas[2].stable.admitted);
     }
     assert!(
@@ -196,7 +196,7 @@ fn delayed_pre_loss_ack_cannot_omit_the_primarys_unsynced_accepted_history() {
     for _ in 0..20 {
         sim.tick();
     }
-    assert!(sim.replicas[0].stable.operations.is_empty());
+    assert_eq!(sim.replicas[0].stable.operations.len(), 0);
     sim.network.push_front(old_ack);
     sim.deliver(0);
     assert_eq!(
@@ -237,7 +237,7 @@ fn delayed_pre_loss_ack_cannot_omit_the_primarys_unsynced_accepted_history() {
     assert!(full_snapshot);
     sim.until(100, |sim| sim.ready(0, 0, request.end()));
     assert!(sim.acknowledge(&request));
-    assert!(sim.replicas[2].stable.operations.is_empty());
+    assert_eq!(sim.replicas[2].stable.operations.len(), 0);
     finish_with_rebuilt_voter(&mut sim, 1);
 }
 

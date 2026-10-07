@@ -8,7 +8,11 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 publish = ["crates-io"]
+keywords = ["file-io", "storage", "thread-pool", "backpressure", "ozzy"]
+categories = ["filesystem", "concurrency", "asynchronous"]
+include.workspace = true
 description = "Explicit bounded file workers for Ozzy"
+readme = "README.md"
 
 [dependencies]
 fanring.workspace = true

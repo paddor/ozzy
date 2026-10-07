@@ -202,7 +202,7 @@ fn pending_donor(policy: QuorumPolicy) -> (Controller, Vec<Actor>, RecoveryReque
             break;
         }
     }
-    assert!(controller.jobs().is_empty());
+    assert_eq!(controller.jobs().len(), 0);
     assert!(!actors[0].status().disk_pending);
     assert!(
         actors[0].status().application_ready,
@@ -398,6 +398,6 @@ fn recovery_shutdown_with_an_unobserved_pin_drains_physical_work() {
         for actor in actors {
             close(&mut controller, actor);
         }
-        assert!(controller.jobs().is_empty());
+        assert_eq!(controller.jobs().len(), 0);
     }
 }

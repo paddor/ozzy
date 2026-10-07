@@ -6,9 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Ozzy broker deployment and startup integration."
+description = "Durable event-streaming broker with OMQ transport."
 readme = "README.md"
 publish = ["crates-io"]
+keywords = ["event-streaming", "message-broker", "replication", "persistence", "omq"]
+categories = ["database-implementations", "network-programming", "command-line-utilities"]
+include = ["/src/**/*.rs", "/README.md", "/LICENSE", "/three.toml", "/container.toml", "/Containerfile"]
 
 [features]
 simulation = []

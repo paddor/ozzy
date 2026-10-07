@@ -413,11 +413,17 @@ impl Client {
             "orders",
             TopicReaderConfig {
                 partitions: Some(vec![0]),
+                start: ozzy_runtime::replicated::ReaderStart::Checkpoint(TopicCheckpoint {
+                    topic: self.writer.metadata().id(),
+                    positions: vec![(0, Offset::ZERO)],
+                }),
                 ..Default::default()
             },
         )
         .await
         .unwrap();
+        // Offset zero reports a gap even when every record has retired; an
+        // Earliest subscription would park forever at the empty retained end.
         let floor = match reader.next().await {
             Ok(record) => {
                 assert_eq!(record.partition, 0);

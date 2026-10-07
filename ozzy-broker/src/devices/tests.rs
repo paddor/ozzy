@@ -193,7 +193,7 @@ async fn aio_pool_places_all_roles_before_execution() {
         .take(4)
         .map(|cpu| cpu as u32)
         .collect();
-    assert!(!cpus.is_empty());
+    assert_ne!(cpus.len(), 0);
     let mut plan = plan(16, IoBackend::Aio);
     let workers = &mut plan.controllers[0].workers;
     workers.cpus = vec![cpus[0], *cpus.get(1).unwrap_or(&cpus[0])];

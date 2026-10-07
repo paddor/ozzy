@@ -190,7 +190,7 @@ fn drive_except<T>(
 fn owned_driver_observes_cooperative_yields_without_storage_jobs() {
     let (mut controller, _) = setup();
     drive(&mut controller, crate::replica_journal::shard::yield_turn());
-    assert!(controller.jobs().is_empty());
+    assert_eq!(controller.jobs().len(), 0);
 }
 
 fn pipeline() -> PipelineLimits {
@@ -292,7 +292,7 @@ fn owned_promise_waits_for_observation_and_duplicate_needs_no_io() {
         drive(&mut controller, journal.persist_promise(ticket)).unwrap(),
         ticket
     );
-    assert!(controller.jobs().is_empty());
+    assert_eq!(controller.jobs().len(), 0);
     drop(journal);
     let (_, startup) = drive(
         &mut controller,
@@ -511,7 +511,7 @@ fn foreign_generation_promise_faults_without_submitting_io() {
         Err(JournalError::PromiseMismatch)
     ));
     assert!(journal.is_faulted());
-    assert!(controller.jobs().is_empty());
+    assert_eq!(controller.jobs().len(), 0);
     assert_eq!(journal.scope().view, 0);
 }
 

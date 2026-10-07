@@ -192,7 +192,7 @@ fn owned_recovery_conflicting_sealed_donor_requires_fresh_full_transfer() {
     drop(fetched);
     let chunk = drive(&mut controller, receiver.receive_chunk(ticket, arena)).unwrap();
     assert_eq!(chunk.plan(), RecoveryPlan::RetryFull);
-    assert!(chunk.prepared().is_empty());
+    assert_eq!(chunk.prepared().len(), 0);
     drop(chunk);
     drive(&mut controller, receiver.abort_recovery(ticket)).unwrap();
     drive(&mut controller, receiver.shutdown()).unwrap();

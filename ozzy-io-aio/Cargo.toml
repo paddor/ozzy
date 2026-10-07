@@ -8,7 +8,11 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 publish = ["crates-io"]
+keywords = ["linux", "aio", "file-io", "storage", "ozzy"]
+categories = ["filesystem", "asynchronous", "os::linux-apis"]
+include.workspace = true
 description = "Backend-owned Linux AIO execution for Ozzy"
+readme = "README.md"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
