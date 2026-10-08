@@ -1,0 +1,54 @@
+[workspace]
+release = false
+release_always = false
+changelog_update = false
+git_tag_name = "{{ package }}-v{{ version }}"
+git_release_body = "See [CHANGELOG.md](https://github.com/paddor/ozzy/blob/{{ package }}-v{{ version }}/CHANGELOG.md)."
+
+[[package]]
+name = "ozzy"
+release = true
+
+[[package]]
+name = "ozzy-broker"
+release = true
+
+[[package]]
+name = "ozzy-config"
+release = true
+
+[[package]]
+name = "ozzy-core"
+release = true
+
+[[package]]
+name = "ozzy-io"
+release = true
+
+[[package]]
+name = "ozzy-io-aio"
+release = true
+
+[[package]]
+name = "ozzy-io-pool"
+release = true
+
+[[package]]
+name = "ozzy-journal"
+release = true
+
+[[package]]
+name = "ozzy-journal-segment"
+release = true
+
+[[package]]
+name = "ozzy-proto"
+release = true
+
+[[package]]
+name = "ozzy-replication"
+release = true
+
+[[package]]
+name = "ozzy-runtime"
+release = true
