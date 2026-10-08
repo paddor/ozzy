@@ -64,11 +64,11 @@ pub(crate) fn apply(data: &mut Value, replacement: &Value) -> Result<()> {
             return Err("case replacement must match an existing Ozzy case".into());
         }
         let mode = row["case"]["mode"].as_str().ok_or("missing rerun mode")?;
-        for field in ["writer_protocols", "writer_payload_caps"] {
-            if data[field][mode] != replacement[field][mode] {
-                return Err(format!("case replacement has different {field}").into());
-            }
+        if data["writer_protocols"][mode] != replacement["writer_protocols"][mode] {
+            return Err("case replacement has different writer_protocols".into());
         }
+        // Payload-cap captions aggregate all selected sizes. A partial rerun can
+        // have a smaller maximum; identical binary and controls enforce its cap.
         if let Some(rate) = row["case"]["rate"].as_u64()
             && data["fixed_load_windows"][rate.to_string()]
                 != replacement["fixed_load_windows"][rate.to_string()]
@@ -129,7 +129,9 @@ mod tests {
     #[test]
     fn partial_rerun_keeps_other_sizes_and_both_sources() {
         let mut data = fixture("full", &[128, 1024, 8192]);
-        let mut rerun = fixture("rerun", &[1024]);
+        let mut rerun = fixture("rerun", &[128]);
+        data["writer_payload_caps"] = json!({"disk-quorum": 2_097_152});
+        rerun["writer_payload_caps"] = json!({"disk-quorum": 262_144});
         rerun["summary"][0]["measurements"]["ack_p99_us"]["median"] = json!(172);
         apply(&mut data, &rerun).unwrap();
         assert_eq!(data["summary"].as_array().unwrap().len(), 3);
@@ -141,6 +143,7 @@ mod tests {
         assert_eq!(data["sources"]["full"]["revision"], "full");
         assert_eq!(data["sources"]["rerun"]["revision"], "rerun");
         assert_eq!(data["case_replacements"][0]["run_ids"], json!(["rerun"]));
+        assert_eq!(data["writer_payload_caps"]["disk-quorum"], 2_097_152);
     }
 
     #[test]

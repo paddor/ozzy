@@ -229,6 +229,10 @@ fn comparable_reference(value: &Value) -> Value {
     if let Some(environment) = value["environment"].as_object_mut() {
         environment.remove("dependencies");
     }
+    // The selector may differ while the recorded compiler is identical.
+    if let Some(build_environment) = value["build_environment"].as_object_mut() {
+        build_environment.remove("RUSTUP_TOOLCHAIN");
+    }
     let config = value["configuration"].as_object_mut().unwrap();
     config.remove("request_records");
     // External adapters do not use native APPEND, disk, or reader controls.
@@ -932,8 +936,37 @@ fn writer_protocols(rows: &[Value]) -> Result<Value> {
 }
 
 #[cfg(test)]
-mod fixed_load_reference_tests {
+mod reference_tests {
     use super::*;
+
+    #[test]
+    fn reference_toolchain_selector_may_differ_but_compiler_and_flags_must_match() {
+        let measured = json!({"compatibility": {
+            "compiler": "rustc 1.98.0",
+            "build_environment": {"RUSTUP_TOOLCHAIN": "1.98.0", "RUSTFLAGS": "-C target-cpu=native"},
+            "configuration": {"broker_cpus": [0, 1]}
+        }});
+        let mut reference = measured.clone();
+        reference["compatibility"]["build_environment"]
+            .as_object_mut()
+            .unwrap()
+            .remove("RUSTUP_TOOLCHAIN");
+        assert_eq!(
+            comparable_reference(&measured),
+            comparable_reference(&reference)
+        );
+        reference["compatibility"]["compiler"] = json!("rustc 1.97.0");
+        assert_ne!(
+            comparable_reference(&measured),
+            comparable_reference(&reference)
+        );
+        reference["compatibility"]["compiler"] = measured["compatibility"]["compiler"].clone();
+        reference["compatibility"]["build_environment"]["RUSTFLAGS"] = json!("");
+        assert_ne!(
+            comparable_reference(&measured),
+            comparable_reference(&reference)
+        );
+    }
 
     #[test]
     fn reference_repetitions_may_differ_but_timing_must_match() {
