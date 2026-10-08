@@ -16,6 +16,7 @@ mod driver;
 mod inbox;
 mod payload;
 mod pipe;
+mod progress;
 mod record;
 pub(super) mod reservation;
 pub use reservation::SharedWriterReservation;

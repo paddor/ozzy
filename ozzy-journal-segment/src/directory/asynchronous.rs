@@ -98,6 +98,7 @@ pub struct Journal {
     limits: Limits,
     interrupted: bool,
     pins: std::sync::Arc<crate::retention::PinRegistry>,
+    validated_indexes: std::collections::BTreeMap<u64, crate::IndexSource>,
 }
 
 impl Journal {

@@ -1,7 +1,6 @@
 //! Seeded, bounded workloads over production SDKs, OMQ inproc and memory storage.
 
 use crate::{broker::Cluster, client::Client};
-use futures::FutureExt;
 use ozzy_config::Confirmation;
 use ozzy_runtime::replicated::SdkClock;
 use serde::{Deserialize, Serialize};
@@ -17,6 +16,7 @@ mod clock;
 pub use clock::Time;
 mod resources;
 pub use resources::Resources;
+mod watchdog;
 
 /// Generated boundaries that can be replayed as a fault-schedule prefix.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -98,6 +98,8 @@ pub struct Config {
 /// Coverage evidence for actions actually completed and independently verified.
 #[derive(Debug, Default, Serialize)]
 pub struct Report {
+    /// True only after all SDK and broker owners have shut down cleanly.
+    pub complete: bool,
     /// Verified generated waves.
     pub waves: usize,
     /// Independently confirmed and delivered records.
@@ -106,6 +108,10 @@ pub struct Report {
     pub consumers: usize,
     /// Producer resume or epoch changes.
     pub producers: usize,
+    /// Saved identities reopened without changing their producer epochs.
+    pub resumes: usize,
+    /// New epochs established while the previous producer was still alive.
+    pub takeovers: usize,
     /// Fresh producers confirmed concurrently in shared partitions.
     pub shared_producers: usize,
     /// Paused/slow consumer bursts verified through actual PEER repair.
@@ -138,6 +144,23 @@ pub struct Report {
     pub time_millis: u64,
     /// Real elapsed run time including startup and shutdown.
     pub elapsed_millis: u64,
+}
+
+impl Report {
+    fn print_progress(&self, config: &Config, elapsed: Duration) {
+        println!(
+            "{}",
+            serde_json::json!({
+                "event": "progress", "seed": config.seed,
+                "mode": format!("{:?}", config.policy),
+                "elapsed_secs": elapsed.as_secs(),
+                "waves": self.waves, "verified_records": self.records,
+                "resumes": self.resumes, "takeovers": self.takeovers,
+                "consumers": self.consumers, "retention_gaps": self.retention_gaps,
+                "restarts": self.restarts,
+            })
+        );
+    }
 }
 
 /// Run until a deadline or wave limit. Save the first failure and its bounded
@@ -183,6 +206,7 @@ async fn run_cluster(config: &Config, clock: &SdkClock) -> Result<Report, String
         Some(Client::open_with_clock(&cluster.configs[0].0, &cluster.runtime, clock.clone()).await);
     let mut reader = Some(client.as_ref().unwrap().reader(true).await);
     let mut report = Report::default();
+    let mut next_report = Duration::ZERO;
     let mut recent = VecDeque::with_capacity(128);
     let mut random = config.seed.max(1);
     'waves: for wave in 0..config.waves {
@@ -218,8 +242,9 @@ async fn run_cluster(config: &Config, clock: &SdkClock) -> Result<Report, String
             recent.pop_front();
         }
         recent.push_back(event);
+        let verified = client.as_ref().unwrap().verified_progress();
         let operation = boundary(&mut cluster, &mut client, &mut reader, event, &mut report);
-        let error = boundary_error(config.progress_timeout, event, operation).await;
+        let error = watchdog::run(config.progress_timeout, event, verified, operation).await;
         if let Some(error) = error {
             report.time_millis = millis(clock.now());
             report.elapsed_millis = millis(started.elapsed());
@@ -231,6 +256,10 @@ async fn run_cluster(config: &Config, clock: &SdkClock) -> Result<Report, String
             return Err(error);
         }
         report.waves += 1;
+        if started.elapsed() >= next_report {
+            report.print_progress(config, started.elapsed());
+            next_report = started.elapsed() + Duration::from_secs(60);
+        }
         tokio::time::sleep(config.interval).await;
     }
     reader
@@ -242,6 +271,7 @@ async fn run_cluster(config: &Config, clock: &SdkClock) -> Result<Report, String
     client.take().unwrap().close().await;
     report.physical_events = cluster.physical_events();
     cluster.shutdown().await;
+    report.complete = true;
     report.time_millis = millis(clock.now());
     report.elapsed_millis = millis(started.elapsed());
     serde_json::to_writer_pretty(
@@ -250,33 +280,6 @@ async fn run_cluster(config: &Config, clock: &SdkClock) -> Result<Report, String
     )
     .map_err(|error| error.to_string())?;
     Ok(report)
-}
-
-async fn boundary_error(
-    deadline: Duration,
-    event: Event,
-    operation: impl std::future::Future<Output = ()>,
-) -> Option<String> {
-    match tokio::time::timeout(
-        deadline,
-        std::panic::AssertUnwindSafe(operation).catch_unwind(),
-    )
-    .await
-    {
-        Ok(Ok(())) => None,
-        Ok(Err(panic)) => Some(
-            panic
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| {
-                    panic
-                        .downcast_ref::<&str>()
-                        .map(|value| (*value).to_owned())
-                })
-                .unwrap_or_else(|| "simulation panicked".into()),
-        ),
-        Err(_) => Some(format!("progress deadline at {event:?}")),
-    }
 }
 
 fn next_event(
@@ -384,6 +387,8 @@ async fn boundary(
                     .await,
             );
             report.producers += 1;
+            report.resumes += usize::from(matches!(event.action, Action::Resume));
+            report.takeovers += usize::from(matches!(event.action, Action::Takeover));
         }
         Action::Restart => {
             cluster.restart(event.wave % cluster.brokers.len()).await;

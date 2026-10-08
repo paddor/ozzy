@@ -16,6 +16,7 @@ pub(crate) fn startup_groups(shards: usize) -> (Registration, Registration) {
     let application = State::new(shards);
     let mut frontend = State::new(1);
     frontend.stop = application.stop.clone();
+    frontend.error = application.error.clone();
     (
         Registration::new(Arc::new(application)),
         Registration::new(Arc::new(frontend)),
@@ -61,7 +62,7 @@ pub(crate) struct State {
     pub(crate) finished: Shutdown,
     pub(crate) threads: usize,
     active: AtomicUsize,
-    error: OnceLock<Failure>,
+    error: Arc<OnceLock<Failure>>,
     next_thread: AtomicUsize,
     owned: Vec<OnceLock<ThreadJoin>>,
 }
@@ -80,7 +81,7 @@ impl State {
             finished: Shutdown::default(),
             threads,
             active: AtomicUsize::new(0),
-            error: OnceLock::new(),
+            error: Arc::new(OnceLock::new()),
             next_thread: AtomicUsize::new(0),
             owned: (0..threads).map(|_| OnceLock::new()).collect(),
         }

@@ -2,9 +2,15 @@
 
 use super::{JournalError, OwnedJournal};
 use crate::replica_journal::{ProposalBuffer, authority::position};
-use ozzy_core::retention::{Plan, Segment};
+use ozzy_core::{
+    retention::{Plan, Segment},
+    state::CanonicalImages,
+};
 use ozzy_journal::operation::{OperationBody, ProducerResultFloor, Trim, encode_operation_body};
-use ozzy_journal_segment::{AsyncRetirementBudget, RetentionFloors, RetiredPrefix};
+use ozzy_journal_segment::{
+    AsyncJournalIdentityIndex, AsyncRetirementBudget, JournalIndexBoundary, RetentionFloors,
+    RetiredPrefix,
+};
 use ozzy_proto::{CheckpointId, Offset, OperationId, PartitionIncarnation};
 use ozzy_replication::driver::ValidationTicket;
 use std::collections::BTreeMap;
@@ -247,7 +253,28 @@ impl OwnedJournal {
         if let Some(reader) = &mut self.reader {
             reader.retired(journal, &retired.unreferenced_segment_ids)?;
         }
-        self.images = Some(journal.recover_canonical_images(self.recovery).await?);
+        // Retirement changes selected storage, never this exact settled state.
+        // Refresh deletion-protected identity coverage without replaying every
+        // surviving segment after each bounded prefix retirement.
+        let snapshot = journal
+            .build_index_snapshot(JournalIndexBoundary::Written, self.recovery.index)
+            .await?;
+        if position(self.applied) != snapshot.through() {
+            return Err(JournalError::CompletionMismatch);
+        }
+        let identities = AsyncJournalIdentityIndex::new(
+            snapshot,
+            self.recovery.retained_identities,
+            self.recovery.retained_identities,
+        );
+        self.images = Some(CanonicalImages::from_recovered(
+            state.clone(),
+            state,
+            identities.clone(),
+            identities,
+            Vec::new(),
+            self.recovery.accepted_transitions,
+        )?);
         self.replay.clear();
         self.storage_validation.clear();
         self.retention
@@ -285,9 +312,15 @@ impl OwnedJournal {
         if ticket.accepted() != ticket.applied() || ticket.committed() != ticket.applied() {
             return Ok(super::super::RetentionTurn {
                 enabled: true,
+                more_work: false,
                 proposal: None,
                 released: None,
             });
+        }
+        // Bootstrap may activate the empty log before CreatePartition commits.
+        // No partition state has selected an unlimited retention policy yet.
+        if self.images()?.committed().partitions().next().is_none() {
+            return Ok(deferred());
         }
         let planned = match self.plan_retention(ticket, now_millis, 1).await {
             Err(JournalError::AppendCapacity) => return Ok(deferred()),
@@ -296,6 +329,7 @@ impl OwnedJournal {
         let Some((partition, plan)) = planned else {
             return Ok(super::super::RetentionTurn {
                 enabled: false,
+                more_work: false,
                 proposal: None,
                 released: None,
             });
@@ -327,11 +361,13 @@ impl OwnedJournal {
             };
             return Ok(super::super::RetentionTurn {
                 enabled: true,
+                more_work: proposal.is_some(),
                 proposal,
                 released: None,
             });
         }
         let mut released = None;
+        let mut more_work = false;
         if !plan.retire.is_empty() {
             let previous = self.history.take();
             released = previous.as_ref().map(super::history::source);
@@ -350,14 +386,16 @@ impl OwnedJournal {
                 self.history = previous;
                 return Ok(deferred());
             }
-            retirement?;
+            more_work = !retirement?.unreferenced_segment_ids.is_empty();
         } else if leader && plan.roll_active {
             let work = self.begin_roll(16)?;
             let done = work.publish().await;
             self.complete_roll(done)?;
+            more_work = true;
         }
         Ok(super::super::RetentionTurn {
             enabled: true,
+            more_work,
             proposal: None,
             released,
         })
@@ -367,6 +405,7 @@ impl OwnedJournal {
 fn deferred() -> super::super::RetentionTurn {
     super::super::RetentionTurn {
         enabled: true,
+        more_work: false,
         proposal: None,
         released: None,
     }

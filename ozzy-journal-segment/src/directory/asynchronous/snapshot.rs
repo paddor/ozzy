@@ -81,9 +81,29 @@ impl Journal {
         limits: IndexBuildLimits,
     ) -> Result<Snapshot, JournalIndexError> {
         self.healthy()?;
+        self.validated_indexes.retain(|id, _| {
+            self.manifest
+                .segments
+                .binary_search_by_key(id, |reference| reference.segment_id)
+                .is_ok()
+        });
         for at in 0..self.manifest.segments.len() - 1 {
             let id = self.manifest.segments[at].segment_id;
+            let (_, source) = self.index_source(id)?;
+            if self.validated_indexes.get(&id) == Some(&source) {
+                // This owner already validated the immutable physical source.
+                // Recheck the published index's checksum and complete source
+                // binding; explicit repair/scrub still validate physical bytes.
+                match self.open_sealed_index(id, limits.file).await {
+                    Ok(_) => continue,
+                    Err(DirectoryError::Index(crate::IndexBuildError::Io(error)))
+                        if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            self.validated_indexes.remove(&id);
             self.build_sealed_index(id, limits).await?;
+            self.validated_indexes.insert(id, source);
         }
         self.open_index_snapshot(boundary, limits.file).await
     }

@@ -7,6 +7,7 @@ impl ReplicaActor {
     pub(super) fn complete_retention(
         &mut self,
         turn: crate::replica_journal::RetentionTurn,
+        now: Duration,
     ) -> Result<(), ActorError> {
         if let Some(source) = turn.released {
             if self.pinned == Some(source) {
@@ -19,6 +20,8 @@ impl ReplicaActor {
         self.foreground_turn_due = true;
         if !turn.enabled {
             self.retention_at = None;
+        } else if turn.more_work {
+            self.retention_at = self.config.retention_interval.map(|_| now);
         }
         if let Some(buffer) = turn.proposal {
             if self.work.waiting.is_some() {

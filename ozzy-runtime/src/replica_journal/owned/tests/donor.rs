@@ -1,9 +1,84 @@
 use super::replay::persist;
-use super::writeback::{Replica, admit, finish, prepare, replica, settle};
+use super::writeback::{Replica, admit, confirm, finish, prepare, replica, settle};
 use super::*;
 use crate::replica_journal::PinnedRecovery;
 use ozzy_proto::RequestId;
 use ozzy_replication::{OpNumber, wire::FetchOps};
+
+#[test]
+fn unsent_donor_snapshot_before_retirement_cannot_describe_a_newer_checkpoint() {
+    let (mut controller, io) = setup();
+    let policy = QuorumPolicy::Durable;
+    let mut donor = replica(&mut controller, io.clone(), 0, policy, 8192);
+    let mut witness = replica(&mut controller, io, 1, policy, 8192);
+    let nonce = RequestId::from_bytes([97; 16]);
+    let mut candidate = None;
+    for number in 1..=3 {
+        persist(&mut controller, &mut donor);
+        persist(&mut controller, &mut witness);
+        if number == 3 {
+            candidate = Some(
+                donor
+                    .driver
+                    .normal()
+                    .unwrap()
+                    .recovery_response(nonce)
+                    .unwrap(),
+            );
+        }
+        confirm(&mut donor, &witness, policy);
+        if number < 3 {
+            let work = donor.journal.begin_roll(8).unwrap();
+            let done = drive(&mut controller, work.publish());
+            donor.journal.complete_roll(done).unwrap();
+        }
+    }
+    let candidate = candidate.unwrap();
+    assert_eq!(candidate.primary.unwrap().accepted.op.0, 3);
+    assert_eq!(candidate.primary.unwrap().committed.op.0, 2);
+    let retired = drive(
+        &mut controller,
+        donor.journal.retire_confirmed_history(
+            donor.driver.begin_validation().unwrap(),
+            ozzy_proto::CheckpointId::from_bytes([98; 16]),
+            ozzy_journal_segment::AsyncRetirementBudget {
+                max_segments: 2,
+                max_read_bytes: 2 * 32768,
+            },
+        ),
+    )
+    .unwrap();
+    assert_eq!(retired.unreferenced_segment_ids, [1, 2]);
+    let requester = NodeId::from_bytes([3; 16]);
+    assert!(matches!(
+        drive(
+            &mut controller,
+            donor.journal.pin_recovery(requester, candidate)
+        ),
+        Err(JournalError::Recovery(
+            ozzy_replication::recovery::RecoveryError::InvalidResponse
+        ))
+    ));
+    assert!(!donor.journal.is_faulted());
+    // Refresh only a candidate that has never been pinned or published.
+    let response = donor
+        .driver
+        .normal()
+        .unwrap()
+        .recovery_response(nonce)
+        .unwrap();
+    let pin = drive(
+        &mut controller,
+        donor.journal.pin_recovery(requester, response),
+    )
+    .unwrap();
+    let log = pin.response().primary.unwrap();
+    assert_eq!(log.committed.op.0, 3);
+    assert_eq!(log.checkpoint.unwrap().position, log.committed);
+    donor.journal.release_recovery(pin).unwrap();
+    drive(&mut controller, donor.journal.shutdown()).unwrap();
+    drive(&mut controller, witness.journal.shutdown()).unwrap();
+}
 
 fn request(pin: &PinnedRecovery) -> FetchOps {
     FetchOps {

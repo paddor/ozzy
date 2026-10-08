@@ -98,7 +98,9 @@ impl ReplicaActor {
                 } else if self.transfer.is_none() {
                     self.start_transfer(
                         ticket.scope(),
-                        ticket.source(),
+                        self.lookup
+                            .compatible_local(ticket.source(), self.pinned, staged)
+                            .unwrap_or(ticket.source()),
                         staged,
                         TransferPurpose::Install,
                         now,
@@ -142,6 +144,9 @@ impl ReplicaActor {
             return Ok(());
         }
         if self.transfer.is_some() {
+            return Ok(());
+        }
+        if self.schedule_bridge(now)? {
             return Ok(());
         }
         self.select_or_install(now)
@@ -243,7 +248,7 @@ impl ReplicaActor {
             Completed::RetiredLookup(positions, to, request) => {
                 self.complete_retired_lookup(&positions, to, request)?;
             }
-            Completed::Retention(turn) => self.complete_retention(turn)?,
+            Completed::Retention(turn) => self.complete_retention(turn, now)?,
             Completed::RecoveryCheckpoint(chunk, to) => {
                 self.complete_recovery_checkpoint(to, chunk)?;
             }

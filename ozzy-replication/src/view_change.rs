@@ -10,8 +10,8 @@ use crate::{
 /// One immutable, synchronized log description for a view-change report.
 ///
 /// The adapter must pin the corresponding canonical history until the report is
-/// invalidated. This initial descriptor requires complete WAL history; checkpoint
-/// transfer and nonvoting recovery are not implemented by this core.
+/// invalidated. Retired predecessors require independently verified overlapping
+/// lineage or checkpoint evidence from the adapter; the core performs no I/O.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrozenLog {
     /// Last durably installed normal view, not the highest entry's original view.
@@ -146,6 +146,18 @@ pub struct ViewChange {
 }
 
 impl ViewChange {
+    /// Frozen reported sources available for bounded, externally verified history repair.
+    /// A report alone supplies no ancestry or installation authority.
+    pub fn history_sources(&self) -> [Option<LogSource>; 3] {
+        std::array::from_fn(|index| {
+            self.reports[index].map(|report| LogSource {
+                voter: self.configuration.voters()[index],
+                generation: report.generation,
+                accepted: report.log.accepted,
+            })
+        })
+    }
+
     pub(crate) fn after_abandon(
         mut normal: NormalReplica,
         previous: PromiseTicket,

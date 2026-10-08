@@ -203,8 +203,17 @@ impl Frontend {
                         let result = serving
                             .await
                             .unwrap_or_else(|_| Err(error("dispatcher task panicked")));
+                        // Publish the cause and stop both owners before dropping
+                        // their serving queues or closing transport sockets.
+                        match result {
+                            Err(failure) => worker.fail(failure),
+                            Ok(()) if !worker.stop.is_requested() => {
+                                worker.fail(error("dispatcher exited before shutdown"));
+                            }
+                            Ok(()) => {}
+                        }
                         let closed = sockets.close().await;
-                        result.and(closed)
+                        worker.result().and(closed)
                     })
                 }))
                 .unwrap_or_else(|_| Err(error("dispatcher runtime panicked")));
@@ -229,7 +238,9 @@ impl Frontend {
             }
             result = readiness => {
                 if result.is_err() {
-                    state.stop.request();
+                    // The ready sender drops before its worker publishes the
+                    // failure. Do not replace that cause with a stop request.
+                    state.stop.requested().await;
                     owner.closed().await?;
                     return Err(error("dispatcher exited before readiness"));
                 }

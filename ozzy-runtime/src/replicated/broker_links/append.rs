@@ -168,7 +168,7 @@ enum Blocked {
 pub(in crate::replicated) struct Connection {
     links: BrokerLinks,
     stream: Arc<Stream>,
-    incoming: Mutex<mpsc::Receiver<Message>>,
+    incoming: mpsc::Receiver<Message>,
     broker: Option<NodeId>,
     session: Option<LinkSessionId>,
     parameters: Option<Parameters>,
@@ -220,7 +220,7 @@ impl Connection {
                 failed: AtomicBool::new(false),
                 memory,
             }),
-            incoming: Mutex::new(incoming),
+            incoming,
             broker: None,
             session: None,
             parameters: None,
@@ -301,13 +301,7 @@ impl Connection {
 
     pub(in crate::replicated) fn invalidate_session(&mut self) {
         self.links.0.shared.appends.forget(self.stream.id, None);
-        while self
-            .incoming
-            .lock()
-            .expect("SDK APPEND receiver poisoned")
-            .try_recv()
-            .is_ok()
-        {}
+        while self.incoming.try_recv().is_ok() {}
         self.stream.failed.store(false, Ordering::Release);
         self.session = None;
         self.parameters = None;
@@ -454,17 +448,16 @@ impl Connection {
     }
 
     pub(in crate::replicated) fn try_recv_many_into(
-        &self,
+        &mut self,
         maximum: usize,
         output: &mut Vec<Message>,
     ) -> Result<usize, omq_tokio::Error> {
         if !self.live() {
             return Err(omq_tokio::Error::Closed);
         }
-        let mut incoming = self.incoming.lock().expect("SDK APPEND receiver poisoned");
         let mut count = 0;
         while count < maximum {
-            match incoming.try_recv() {
+            match self.incoming.try_recv() {
                 Ok(message) => {
                     output.push(message);
                     count += 1;
@@ -478,7 +471,8 @@ impl Connection {
         Ok(count)
     }
 
-    pub(in crate::replicated) async fn recv(&self) -> Result<Message, omq_tokio::Error> {
+    /// Wait without consuming. Only the writer owner drains the reply lane.
+    pub(in crate::replicated) async fn recv_ready(&self) -> Result<(), omq_tokio::Error> {
         loop {
             let links = self.links.0.shared.changed.generation();
             let budget = self.links.0.shared.appends.budget.changed.generation();
@@ -486,17 +480,11 @@ impl Connection {
                 return Err(omq_tokio::Error::Closed);
             }
             let generation = self.stream.ready.generation();
-            match self
-                .incoming
-                .lock()
-                .expect("SDK APPEND receiver poisoned")
-                .try_recv()
-            {
-                Ok(message) => return Ok(message),
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    return Err(omq_tokio::Error::Closed);
-                }
-                Err(mpsc::error::TryRecvError::Empty) => {}
+            if !self.incoming.is_empty() {
+                return Ok(());
+            }
+            if self.incoming.is_closed() {
+                return Err(omq_tokio::Error::Closed);
             }
             tokio::select! {
                 () = self.stream.ready.changed_after(generation) => {},

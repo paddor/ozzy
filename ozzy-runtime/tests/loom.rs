@@ -9,12 +9,18 @@
 mod completion;
 #[path = "../src/replicated/writer/inbox.rs"]
 mod inbox;
+#[path = "../src/replicated/writer/progress.rs"]
+mod progress;
 #[path = "../src/signal.rs"]
 mod signal;
 
 use loom::sync::Arc;
-use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use loom::sync::atomic::{AtomicBool, Ordering};
 use loom::thread;
+use ozzy_proto::ProducerId;
+use ozzy_runtime::replicated::{
+    AppendKey, Error, Policy, RecordReceipt, WriterConfig, WriterError,
+};
 use std::future::Future;
 use std::pin::pin;
 use std::task::{Context, Poll};
@@ -23,7 +29,7 @@ use std::task::{Context, Poll};
 fn confirmed_prefix_publishes_exact_offsets_before_observation() {
     for offsets in [[0, u64::MAX], [7, 50]] {
         loom::model(move || {
-            let prefix = Arc::new(AtomicU64::new(0));
+            let progress = Arc::new(progress::Progress::new(&config()));
             let mut pool = completion::Pool::default();
             let records = Arc::new(offsets.map(|offset| {
                 pool.allocate(ozzy_proto::MessageId::from_bytes(
@@ -32,27 +38,123 @@ fn confirmed_prefix_publishes_exact_offsets_before_observation() {
             }));
             drop(pool);
             let publisher = {
-                let prefix = prefix.clone();
+                let progress = progress.clone();
                 let records = records.clone();
                 thread::spawn(move || {
                     for (index, offset) in offsets.into_iter().enumerate() {
-                        records[index].publish(offset);
-                        prefix.store(index as u64 + 1, Ordering::Release);
+                        progress
+                            .confirm(index as u64, index as u64 + 1, offset, 2, |count| {
+                                assert_eq!(count, 1);
+                                records[index].publish(offset);
+                            })
+                            .unwrap();
                         thread::yield_now();
                     }
                 })
             };
-            let confirmed = prefix.load(Ordering::Acquire);
+            let confirmed = progress.confirmed();
             for index in 0..confirmed as usize {
                 assert_eq!(records[index].offset(), offsets[index]);
             }
             publisher.join().unwrap();
-            assert_eq!(prefix.load(Ordering::Acquire), 2);
+            assert_eq!(progress.confirmed(), 2);
             for (record, offset) in records.iter().zip(offsets) {
                 assert_eq!(record.offset(), offset);
             }
         });
     }
+}
+
+fn config() -> WriterConfig {
+    WriterConfig {
+        policy: Policy::QuorumReplicatedPersisting,
+        partition: ozzy_proto::PartitionIncarnation::from_bytes([1; 16]),
+        owner_epoch: 1,
+        producer_id: ProducerId::from_bytes([2; 16]),
+        producer_epoch: 1,
+        next_sequence: 0,
+        limits: ozzy_runtime::replicated::DataLimits {
+            envelope: ozzy_proto::EnvelopeLimits {
+                max_metadata_bytes: 512,
+                max_payload_bytes: 128,
+            },
+            max_records: 2,
+            max_parts: 1,
+            max_record_bytes: 64,
+        },
+        compress_payloads: false,
+        batch_target_bytes: 128,
+        max_producers: 1,
+        inflight_appends: 2,
+    }
+}
+
+#[test]
+fn terminal_failure_racing_confirmation_seals_the_real_progress_prefix() {
+    let mut model = loom::model::Builder::new();
+    model.preemption_bound = Some(2);
+    model.check(|| {
+        let progress = Arc::new(progress::Progress::new(&config()));
+        let mut pool = completion::Pool::default();
+        let records = Arc::new([7_u64, 50].map(|offset| {
+            pool.allocate(ozzy_proto::MessageId::from_bytes(
+                u128::from(offset).to_be_bytes(),
+            ))
+        }));
+        let publisher = {
+            let progress = progress.clone();
+            let records = records.clone();
+            thread::spawn(move || {
+                for (index, offset) in [7, 50].into_iter().enumerate() {
+                    let result =
+                        progress.confirm(index as u64, index as u64 + 1, offset, 2, |count| {
+                            assert_eq!(count, 1);
+                            records[index].publish(offset);
+                        });
+                    if let Err(error) = result {
+                        assert!(matches!(error, WriterError::Closed));
+                        break;
+                    }
+                    thread::yield_now();
+                }
+            })
+        };
+        let failure = {
+            let progress = progress.clone();
+            thread::spawn(move || progress.fail(WriterError::Closed))
+        };
+        let observed = [progress.observe(1), progress.observe(2)];
+        for (index, result) in observed.iter().enumerate() {
+            if matches!(result, Some(Ok(()))) {
+                assert_eq!(records[index].offset(), [7, 50][index]);
+            }
+        }
+        publisher.join().unwrap();
+        failure.join().unwrap();
+        for (index, result) in observed.into_iter().enumerate() {
+            let final_result = progress.observe(index as u64 + 1);
+            match result {
+                Some(Ok(())) => assert!(matches!(final_result, Some(Ok(())))),
+                Some(Err(WriterError::Closed)) => {
+                    assert!(matches!(final_result, Some(Err(WriterError::Closed))));
+                }
+                None => assert!(final_result.is_some()),
+                other => panic!("unexpected observation: {other:?}"),
+            }
+        }
+        assert!(matches!(
+            progress.observe(3),
+            Some(Err(WriterError::Closed))
+        ));
+        let confirmed = progress.confirmed();
+        assert!(matches!(
+            progress.confirm(confirmed, confirmed + 1, 100, 3, |_| {
+                panic!("terminal failure published another receipt")
+            }),
+            Err(WriterError::Closed)
+        ));
+        assert_eq!(progress.confirmed(), confirmed);
+    });
 }
 
 #[test]

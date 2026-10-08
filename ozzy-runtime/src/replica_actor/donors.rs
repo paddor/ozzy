@@ -251,6 +251,17 @@ impl ReplicaActor {
                     // authoritative history; busy admission is backpressure.
                     return Ok(true);
                 }
+                // This candidate has not been pinned or published. Maintenance
+                // or commit may have advanced while it waited for the journal.
+                // Freeze current authority at pin admission, then keep that
+                // exact response across retries and asynchronous completion.
+                let response = self
+                    .driver
+                    .normal()
+                    .expect("ready normal")
+                    .recovery_response(response.nonce)
+                    .map_err(crate::replica_journal::JournalError::from)?;
+                slot.response = Some(response);
                 let pending = self
                     .journal
                     .pin_recovery(self.configuration.voters()[index], response)?;

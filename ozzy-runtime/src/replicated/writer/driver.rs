@@ -146,9 +146,8 @@ impl Session {
             let deadline = self.deadline;
             let retry_at = self.retry_at.filter(|_| self.replay_ready());
             tokio::select! {
-                message = binding.connection.recv() => {
-                    let message = message.map_err(|_| Failure::Retry(None))?;
-                    self.receive(shared, &binding, &message)?;
+                result = binding.connection.recv_ready() => {
+                    result.map_err(|_| Failure::Retry(None))?;
                 }
                 () = work.ready(), if wants_records => {}
                 () = async {

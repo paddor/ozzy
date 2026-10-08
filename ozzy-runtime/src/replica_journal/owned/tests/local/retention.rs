@@ -5,6 +5,48 @@ use std::num::NonZeroU64;
 
 mod repeated;
 
+#[test]
+fn retention_waits_for_partition_creation_before_disabling_an_unlimited_policy() {
+    let (mut controller, io) = setup();
+    let (mut journal, mut driver) = drive(
+        &mut controller,
+        OwnedJournal::format_local(local_config(), io, JournalGeneration(1), 32768),
+    )
+    .unwrap();
+    let turn = drive(
+        &mut controller,
+        journal.retention_turn(
+            driver.begin_validation().unwrap(),
+            999,
+            OperationId::from_bytes([93; 16]),
+            true,
+        ),
+    )
+    .unwrap();
+    assert!(
+        turn.enabled,
+        "partition creation has not selected a policy yet"
+    );
+    assert!(!turn.more_work);
+    assert!(turn.proposal.is_none());
+    initialize(&mut controller, &mut journal, &mut driver);
+    let turn = drive(
+        &mut controller,
+        journal.retention_turn(
+            driver.begin_validation().unwrap(),
+            999,
+            OperationId::from_bytes([94; 16]),
+            true,
+        ),
+    )
+    .unwrap();
+    assert!(
+        !turn.enabled,
+        "the confirmed unlimited policy disables retention"
+    );
+    drive(&mut controller, journal.shutdown()).unwrap();
+}
+
 fn append(
     controller: &mut Controller,
     journal: &mut OwnedJournal,

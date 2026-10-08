@@ -3,6 +3,7 @@ use ozzy_proto::RequestId;
 use ozzy_replication::{LogSource, OpNumber, wire};
 
 mod buffered;
+mod retirement;
 
 #[test]
 fn history_request_retries_while_an_independent_lookup_owns_the_journal() {

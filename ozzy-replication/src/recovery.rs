@@ -80,9 +80,9 @@ impl NormalReplica {
     /// Capture a recovery response without adding I/O to normal commit.
     ///
     /// The adapter pins this exact accepted prefix, including in-flight writes,
-    /// before offering its bytes. It must retain/retransmit the same response for
-    /// this nonce, not recapture a moving tail. Only a new recovery nonce starts
-    /// a new snapshot. A durable-prefix-only snapshot is unsafe: an earlier ACK
+    /// before offering its bytes. An unsent candidate may be refreshed before
+    /// pin admission. Once pinning starts, retain/retransmit that exact response
+    /// for this nonce. A durable-prefix-only snapshot is unsafe: an earlier ACK
     /// from the lost voter may still commit an unsynced accepted operation.
     pub fn recovery_response(&self, nonce: RequestId) -> Result<RecoveryResponse, RecoveryError> {
         let snapshot = self.snapshot();

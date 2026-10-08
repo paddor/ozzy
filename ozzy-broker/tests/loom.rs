@@ -42,6 +42,10 @@ fn failure_in_either_owner_requests_peer_shutdown_before_closing_its_queue() {
                 let closed = closed.clone();
                 thread::spawn(move || {
                     failed.fail(StartupError::Runtime("injected owner failure".into()));
+                    assert!(matches!(
+                        failed.result(),
+                        Err(StartupError::Runtime(reason)) if reason == "injected owner failure"
+                    ));
                     closed.store(true, Ordering::Release);
                 })
             };
@@ -50,7 +54,10 @@ fn failure_in_either_owner_requests_peer_shutdown_before_closing_its_queue() {
             }
             exit.join().unwrap();
             assert!(peer.stop.is_requested());
-            assert!(peer.result().is_ok());
+            assert!(matches!(
+                peer.result(),
+                Err(StartupError::Runtime(reason)) if reason == "injected owner failure"
+            ));
         });
     }
 }

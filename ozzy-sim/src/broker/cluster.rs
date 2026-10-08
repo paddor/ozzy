@@ -332,11 +332,13 @@ async fn live_many<T>(
     stage: &str,
     operation: impl std::future::Future<Output = T>,
 ) -> T {
+    // The enclosing verified-progress watchdog bounds the complete boundary.
+    // A separate stage deadline would reject bounded storage pauses and normal
+    // election backoff before that watchdog expires.
     tokio::select! {
         result = operation => result,
         (result, broker, _) = futures::future::select_all(brokers.iter().map(|broker| Box::pin(broker.closed()))) => {
             panic!("broker {broker} exited during {stage}: {result:?}")
         },
-        () = tokio::time::sleep(Duration::from_secs(5)) => panic!("no progress during {stage}"),
     }
 }

@@ -633,6 +633,14 @@ impl ReplicaDriver {
         Ok(self.changing()?.select(lookup)?)
     }
 
+    /// Frozen election sources; their bytes still require exact-tail verification.
+    pub fn history_sources(&self) -> [Option<LogSource>; 3] {
+        match self.role.as_ref().expect("owned role") {
+            Role::ViewChanging(changing) => changing.history_sources(),
+            Role::Normal(_) | Role::Installing(_) => [None; 3],
+        }
+    }
+
     fn changing(&mut self) -> Result<&mut ViewChange, DriverError> {
         match self.role.as_mut().expect("owned role") {
             Role::ViewChanging(changing) => Ok(changing),

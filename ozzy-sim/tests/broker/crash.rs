@@ -3,6 +3,38 @@ use super::*;
 use ozzy_runtime::replicated::SdkClock;
 
 #[tokio::test(flavor = "current_thread")]
+async fn inproc_memory_storage_pause_uses_the_verified_progress_deadline() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let mut cluster = broker::Cluster::new(Confirmation::LocalDurable).await;
+        let mut client = Client::open_with_runtime(&cluster.configs[0].0, &cluster.runtime).await;
+        let mut reader = client.reader(true).await;
+        let control = cluster.controls[0].clone();
+        control.hold_completions(true);
+        let release = tokio::spawn(async move {
+            while control.pending_completions() == 0 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            control.hold_completions(false);
+        });
+        let count = ozzy_sim::client::progress_timeout(
+            Duration::from_secs(10),
+            client.verified_progress(),
+            cluster.verify_wave(&mut client, &mut reader, 0),
+        )
+        .await
+        .expect("a bounded storage pause exceeded the verified-progress deadline");
+        assert_eq!(count, 16);
+        release.await.unwrap();
+        reader.close().await.unwrap();
+        client.close().await;
+        cluster.shutdown().await;
+    })
+    .await
+    .expect("storage pause prevented clean shutdown");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn inproc_memory_device_cuts_with_held_completions_preserve_retry_identity() {
     tokio::time::timeout(Duration::from_secs(120), async {
         for policy in [

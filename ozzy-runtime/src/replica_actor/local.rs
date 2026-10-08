@@ -74,6 +74,7 @@ pub struct LocalActor {
     journal: ReplicaJournal,
     now: std::time::Duration,
     retention_at: Option<std::time::Duration>,
+    foreground_turn_due: bool,
     driver: Driver,
     config: LocalActorConfig,
     ingress: Ingress,
@@ -188,6 +189,7 @@ impl LocalActor {
             journal,
             now: std::time::Duration::ZERO,
             retention_at: config.retention_interval,
+            foreground_turn_due: false,
             driver,
             config,
             ingress,
@@ -344,7 +346,11 @@ impl LocalActor {
             }
             return Ok(changed);
         }
-        if self.retention_at.is_some_and(|at| self.now >= at) && self.waiting.is_none() {
+        let foreground_turn = std::mem::take(&mut self.foreground_turn_due);
+        if !foreground_turn
+            && self.retention_at.is_some_and(|at| self.now >= at)
+            && self.waiting.is_none()
+        {
             if !self.persistence.is_empty()
                 || self.sync.is_some()
                 || !self.live.is_empty()
