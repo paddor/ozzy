@@ -1,3 +1,5 @@
+<img src="doc/ozzy-logo.webp" alt="Ozzy the ocelot" width="525" />
+
 # Ozzy
 
 Durable message streaming over OMQ.
