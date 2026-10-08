@@ -5,8 +5,8 @@ replay, retention, and producer resume. Run a single durable broker or a
 three-broker group in disk-quorum or replicated-persisting mode. OMQ handles
 message passing; Ozzy adds persistence, replication, and stream recovery.
 
-Requires Rust 1.93 or newer. Run a provisioned Ozzy broker separately; install it
-with `cargo install ozzy-broker --version 0.1.0 --locked --bin ozy_broker`.
+Requires Rust 1.93 or newer. Run a provisioned Ozzy broker separately;
+see [Getting started](../GETTING_STARTED.md).
 
 This crate provides the native Rust producer and consumer SDKs. They share session
 code while retaining separate role state. `BrokerLinks` owns one data PEER and

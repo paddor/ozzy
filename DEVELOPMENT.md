@@ -24,8 +24,8 @@ strict public API documentation.
 Use `scripts/test-all.sh lint` or `scripts/test-all.sh tests` to run only one
 phase; CI runs them in separate jobs.
 
-Executables use the `ozy_` prefix (15 characters fit the kernel process name);
-integration tests use `ozzy_`.
+Executables and integration tests use the `ozzy_` prefix. Linux truncates process
+names to 15 characters; benchmark isolation resolves the full executable path.
 The suite also names its Cargo, compiler, and rustdoc processes. Use
 `scripts/ozzy_cargo build --workspace` for the same naming and SSD build
 directory on individual commands. Clippy retains its own compiler wrapper.

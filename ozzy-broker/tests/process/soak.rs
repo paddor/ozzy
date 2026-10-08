@@ -68,7 +68,7 @@ impl Broker {
         let executable = directory.join(if memory {
             "memory-broker"
         } else {
-            "ozy_broker"
+            "ozzy_broker"
         });
         let invocation = if memory {
             format!(
@@ -80,7 +80,7 @@ impl Broker {
             )
         } else {
             format!(
-                "./ozy_broker --config deployment.toml {operation} --broker {} \
+                "./ozzy_broker --config deployment.toml {operation} --broker {} \
                 --identity shared.identity --local-identity local.identity \
                 --trusted-transport{selections}",
                 quoted(name)

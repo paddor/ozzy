@@ -41,7 +41,7 @@ fn comparison_topology(implementation: &str) {
         let mut external = (implementation != "ozzy").then(|| {
             server::External::start(implementation, &root, "durable", &[vec![cpu]]).unwrap()
         });
-        let mut command = Command::new(env!("CARGO_BIN_EXE_ozy_timed_bench"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ozzy_timed_bench"));
         command
             .args([
                 "--processes",
@@ -141,7 +141,7 @@ fn check_comparison(row: &Value, implementation: &str, partitions: u64, writers:
 fn production_runner_verifies_shared_writer_reader_cohorts_and_drains_each_policy() {
     let storage = super::support::storage("native-timed-production-");
     for system in ["single-durable", "disk-quorum", "replicated-persisting"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_ozy_timed_bench"))
+        let output = Command::new(env!("CARGO_BIN_EXE_ozzy_timed_bench"))
             .args([
                 "--processes",
                 "--network-ingress",
@@ -295,7 +295,7 @@ fn check_provenance(row: &Value) {
     let provenance = &row["provenance"];
     assert_eq!(
         provenance["executable_xxh3_128"],
-        ozzy_bench::provenance::digest(Path::new(env!("CARGO_BIN_EXE_ozy_timed_bench"))).unwrap()
+        ozzy_bench::provenance::digest(Path::new(env!("CARGO_BIN_EXE_ozzy_timed_bench"))).unwrap()
     );
     assert_eq!(
         provenance["cargo_lock_xxh3_128"],

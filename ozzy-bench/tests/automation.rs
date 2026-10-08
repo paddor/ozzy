@@ -278,7 +278,7 @@ fn saved(implementation: &str, id: &str) -> Value {
 #[test]
 fn dictionary_worker_has_its_own_isolation_class() {
     let worker = json!({"pid":123,"started":1,"group":99,
-        "executable":"ozy_lz4_dict_bench","arguments":["--worker"]});
+        "executable":"ozzy_lz4_dict_bench","arguments":["--worker"]});
     isolation::Guard::new("lz4-dictionary", None)
         .check_processes(99, vec![worker.clone()])
         .unwrap();
@@ -1884,7 +1884,7 @@ fn workloads_only_offer_live_native_profiles_and_controls() {
 fn guard_rejects_overlap_compilers_and_wrong_process_groups() {
     let server = process("iggy-server", 100, 100, json!([]));
     let client = process(
-        "ozy_timed_bench",
+        "ozzy_timed_bench",
         201,
         200,
         json!([
@@ -1915,7 +1915,7 @@ fn guard_rejects_overlap_compilers_and_wrong_process_groups() {
         "rustc",
         "cargo",
         "perf",
-        "ozy_timed_bench",
+        "ozzy_timed_bench",
     ] {
         assert!(
             isolation::Guard::new("ozzy", None)
@@ -2149,7 +2149,7 @@ fn cluster_guard_requires_exactly_all_three_external_brokers() {
     assert!(guard.check_processes(200, extra).is_err());
     let mut mixed = brokers.to_vec();
     mixed.push(process(
-        "ozy_timed_bench",
+        "ozzy_timed_bench",
         201,
         200,
         json!(["--worker-index", "0"]),
@@ -2360,7 +2360,7 @@ fn distributed_comparison_keeps_adapter_windows_and_freezes_topology() {
     let rows = json!([
         {"bind":"192.0.2.1","storage_dir":"/mnt/ssd/tmp","cpus":[0]},
         {"bind":"192.0.2.1","storage_dir":"/mnt/bench/tmp","cpus":[1]},
-        {"bind":"192.0.2.2","ssh":"remote","executable":"/mnt/bench/tmp/bin/ozy_timed_bench","storage_dir":"/mnt/bench/tmp","cpus":[0]}
+        {"bind":"192.0.2.2","ssh":"remote","executable":"/mnt/bench/tmp/bin/ozzy_timed_bench","storage_dir":"/mnt/bench/tmp","cpus":[0]}
     ]);
     fs::write(&path, rows.to_string()).unwrap();
     let args = compare::Args::parse_from([
@@ -2385,7 +2385,7 @@ fn distributed_comparison_keeps_adapter_windows_and_freezes_topology() {
     for case in args.cases() {
         let command = args
             .command(
-                Path::new("/bin/ozy_timed_bench"),
+                Path::new("/bin/ozzy_timed_bench"),
                 &case,
                 Some("192.0.2.1:9000"),
             )

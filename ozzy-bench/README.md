@@ -1,6 +1,6 @@
 # Ozzy benchmarks
 
-Rust runners and Plotters charts. Use `ozy_compare` for Ozzy/Iggy/Redpanda
+Rust runners and Plotters charts. Use `ozzy_compare` for Ozzy/Iggy/Redpanda
 comparisons; other binaries isolate particular paths.
 
 ## Setup and rules
@@ -9,8 +9,8 @@ comparisons; other binaries isolate particular paths.
 source scripts/ozzy_tools.sh
 export PATH="$CARGO_TARGET_DIR/release:$PATH"
 scripts/ozzy_cargo build --release -p ozzy-bench --features comparisons --bins
-ozy_compare --impl ozzy --check-only
-ozy_compare --impl ozzy --modes durable,replicated-persisting \
+ozzy_compare --impl ozzy --check-only
+ozzy_compare --impl ozzy --modes durable,replicated-persisting \
   --sizes 128,1024,8192 --partitions 8 --segment-mib 1024 \
   --broker-cpus 0/1/2 --client-cpus 3,4,5 \
   --aio-depth 8 --writer-inflight-appends 3 --request-records 2048 \
@@ -26,7 +26,7 @@ ozy_compare --impl ozzy --modes durable,replicated-persisting \
   `--storage-dir /mnt/ssd/tmp/ozzy-bench`; `TMPDIR` alone is insufficient.
 - Comparisons and profiles check the mount and run `sync -f /mnt/ssd/tmp`
   before warmup. Flush failures stop the run.
-- Before each comparison case, `ozy_compare` waits for 5 s without completed
+- Before each comparison case, `ozzy_compare` waits for 5 s without completed
   device writes, then requires three 1 MiB `O_DSYNC` probe writes of at most
   60 ms each. A device that does not settle within 300 s
   stops the run. Rows record the wait and probes as `device_settle`.
@@ -55,17 +55,17 @@ attributing it to code.
 ## Repeatable storage comparisons
 
 ```sh
-ozy_compare --impl all --broker-cpus 0,1 --client-cpus 2,3,4,5 --repetitions 2
-ozy_compare --impl ozzy --broker-cpus 0,1 --client-cpus 2,3,4,5 --repetitions 2
-ozy_compare --impl redpanda --broker-cpus 0,1 --client-cpus 2,3,4,5 --repetitions 2
-ozy_compare --impl ozzy --check-only
+ozzy_compare --impl all --broker-cpus 0,1 --client-cpus 2,3,4,5 --repetitions 2
+ozzy_compare --impl ozzy --broker-cpus 0,1 --client-cpus 2,3,4,5 --repetitions 2
+ozzy_compare --impl redpanda --broker-cpus 0,1 --client-cpus 2,3,4,5 --repetitions 2
+ozzy_compare --impl ozzy --check-only
 ```
 
 `--check-only` runs formatting, lint, tests and the release build.
 For tiny-record experiments, run focused correctness tests, then:
 
 ```sh
-ozy_compare --impl ozzy --modes buffered --sizes 16 \
+ozzy_compare --impl ozzy --modes buffered --sizes 16 \
   --broker-cpus 0,1 --client-cpus 2,3,4,5 --request-records 1024 \
   --warmup 1 --duration 3 --checks focused
 ```
@@ -108,7 +108,7 @@ requested segment size. All three adapters support three-broker comparisons.
 
 Comparisons create one logical topic in each system. Iggy contains that topic
 in one stream namespace. Every adapter receives the same explicit partition
-count and reports its effective topology. Direct `ozy_timed_bench` runs use
+count and reports its effective topology. Direct `ozzy_timed_bench` runs use
 `--window` for writer count and `--partitions` for partition count (default 16).
 Several writers may share a partition. Offsets remain global within that
 partition; writer order and full-byte digests are checked independently.
@@ -316,12 +316,12 @@ All three implementations use the same scheduled-arrival clock and record checks
 Arrival rate is independent of confirmations and totals all four writers.
 
 ```sh
-ozy_compare --impl all --check-only
-ozy_compare --impl all --modes durable --sizes 128,1024 \
+ozzy_compare --impl all --check-only
+ozzy_compare --impl all --modes durable --sizes 128,1024 \
   --partitions 8 --segment-mib 1024 --broker-cpus 0,1 \
   --client-cpus 2,3,4,5 --warmup 2 --duration 54 \
   --ramp 100:30,1000:8,10000:8,100000:8 --repetitions 1 --no-build
-ozy_compare --impl all --modes durable --sizes 8192 \
+ozzy_compare --impl all --modes durable --sizes 8192 \
   --partitions 8 --segment-mib 1024 --broker-cpus 0,1 \
   --client-cpus 2,3,4,5 --warmup 2 --duration 46 \
   --ramp 100:30,1000:8,10000:8 --repetitions 1 --no-build
@@ -342,7 +342,7 @@ the ramp stops: that stage and later ones become chart annotations,
 while earlier stages keep complete scheduled cohorts.
 
 To extend existing charts, run only missing rates, then pass both the existing
-and new completed run IDs to `ozy_chart --fixed-load`. Do not repeat covered
+and new completed run IDs to `ozzy_chart --fixed-load`. Do not repeat covered
 cells or replace historical result rows.
 
 Use `--impl ozzy`, `--impl iggy`, or `--impl redpanda` for one implementation. Iggy sends available
@@ -387,9 +387,9 @@ set -e
 storage=(--impl ozzy --modes durable --sizes 8192
   --broker-cpus 0,1,2 --client-cpus 3,4,5
   --warmup 5 --duration 10 --repetitions 2)
-ozy_compare "${storage[@]}" --check-only
+ozzy_compare "${storage[@]}" --check-only
 for shards in 1 2 3 4; do
-  ozy_compare "${storage[@]}" --shards "$shards" --no-build
+  ozzy_compare "${storage[@]}" --shards "$shards" --no-build
 done
 ```
 
@@ -399,17 +399,17 @@ profiles show actual write sizes.
 
 ### Disk calibration
 
-`ozy_disk_probe` compares buffered, `O_DSYNC`, and `O_DIRECT|O_DSYNC` writes on
+`ozzy_disk_probe` compares buffered, `O_DSYNC`, and `O_DIRECT|O_DSYNC` writes on
 Linux. It overwrites an explicitly named existing scratch file. It is a disk
 probe, not a broker benchmark: no record construction, replication, metadata
 roll, or confirmation latency. Results append to `~/.cache/ozzy/disk-probe.jsonl`.
 
 ```sh
-cargo build --release -p ozzy-bench --features comparisons --bin ozy_disk_probe
+cargo build --release -p ozzy-bench --features comparisons --bin ozzy_disk_probe
 scratch=/mnt/ssd/tmp/disk-scratch
 touch "$scratch"
 # Run built binary directly, with the VM otherwise idle.
-ozy_disk_probe --path "$scratch" --overwrite --mode direct-dsync \
+ozzy_disk_probe --path "$scratch" --overwrite --mode direct-dsync \
   --write-kib 4096 --segment-mib 256 --file-mib 8192
 ```
 
@@ -453,10 +453,10 @@ The probe's direct mode does not enable direct I/O in Ozzy. See
 Replay a verified native case, separately from comparison timings.
 
 ```sh
-ozy_profile --case-dir /mnt/ssd/tmp/ozzy-artifacts/runs/RUN/CASE --kind syscall
-ozy_profile --case-dir /mnt/ssd/tmp/ozzy-artifacts/runs/RUN/CASE --kind cpu
-ozy_profile --case-dir /mnt/ssd/tmp/ozzy-artifacts/runs/RUN/CASE --kind cpu-kernel
-ozy_profile --case-dir /mnt/ssd/tmp/ozzy-artifacts/runs/RUN/CASE --kind stages
+ozzy_profile --case-dir /mnt/ssd/tmp/ozzy-artifacts/runs/RUN/CASE --kind syscall
+ozzy_profile --case-dir /mnt/ssd/tmp/ozzy-artifacts/runs/RUN/CASE --kind cpu
+ozzy_profile --case-dir /mnt/ssd/tmp/ozzy-artifacts/runs/RUN/CASE --kind cpu-kernel
+ozzy_profile --case-dir /mnt/ssd/tmp/ozzy-artifacts/runs/RUN/CASE --kind stages
 ```
 
 Defaults: 2 s warmup, 5 s measurement; override with `--warmup` and `--duration`.
@@ -476,7 +476,7 @@ Profiles place the controller on saved client CPUs. Production broker placement
 comes from the case command; the old worker-affinity environment is not replayed.
 The same verification, source-stamp, and isolation gates apply. Profiles verify
 broker CPU masks and the production PUB/SUB reader path. Cold gap repair is allowed.
-After rebuilding with `ozy_compare --impl ozzy --check-only --checks focused`,
+After rebuilding with `ozzy_compare --impl ozzy --check-only --checks focused`,
 use `--current-build` to profile the saved workload with the new verified worker.
 The profile records both executable hashes and deploys the worker to remote hosts.
 CPU reports select the exact measurement window and separate brokers, writers
@@ -494,20 +494,20 @@ Profiling rows never enter comparison ledgers.
 ### SVG charts
 
 ```sh
-ozy_chart --run-id LOCAL_RUN --run-id CLUSTER_RUN
-ozy_chart --run-id NEW_OZZY_RUN --iggy-run-id COMPATIBLE_BASELINE_RUN
-ozy_chart --run-id NEW_OZZY_RUN --iggy-reference-run-id CACHED_IGGY_RUN
-ozy_chart --run-id NEW_OZZY_RUN --iggy-reference-run-id CACHED_IGGY_RUN \
+ozzy_chart --run-id LOCAL_RUN --run-id CLUSTER_RUN
+ozzy_chart --run-id NEW_OZZY_RUN --iggy-run-id COMPATIBLE_BASELINE_RUN
+ozzy_chart --run-id NEW_OZZY_RUN --iggy-reference-run-id CACHED_IGGY_RUN
+ozzy_chart --run-id NEW_OZZY_RUN --iggy-reference-run-id CACHED_IGGY_RUN \
   --redpanda-reference-run-id CACHED_REDPANDA_RUN
-ozy_chart --run-id BOTH_MODES_RUN --modes durable \
+ozzy_chart --run-id BOTH_MODES_RUN --modes durable \
   --iggy-reference-run-id CACHED_SINGLE_BROKER_RUN
-ozy_chart --run-id NEW_OZZY_RUN --external-reference-run-id CACHED_COMPARISON_RUN
-ozy_chart --fixed-load --run-id RATE_100_RUN --run-id RATE_1000_RUN \
+ozzy_chart --run-id NEW_OZZY_RUN --external-reference-run-id CACHED_COMPARISON_RUN
+ozzy_chart --fixed-load --run-id RATE_100_RUN --run-id RATE_1000_RUN \
   --run-id RATE_10000_RUN --run-id RATE_100000_RUN
-ozy_chart --fixed-load --run-id NEW_OZZY_RUN \
+ozzy_chart --fixed-load --run-id NEW_OZZY_RUN \
   --external-reference-run-id CACHED_RATE_100_RUN \
   --external-reference-run-id CACHED_OTHER_RATES_RUN
-ozy_chart --fixed-load --run-id EXISTING_RUN \
+ozzy_chart --fixed-load --run-id EXISTING_RUN \
   --max-rate 128:100000 --max-rate 1024:100000 --max-rate 8192:10000
 ```
 
@@ -584,9 +584,9 @@ instead of charts and exits unsuccessfully if any cell loses at least 5% of
 throughput or gains at least 5% of confirmation/delivery latency:
 
 ```sh
-ozy_chart --run-id CANDIDATE_RUN --baseline-run-id BASELINE_RUN \
+ozzy_chart --run-id CANDIDATE_RUN --baseline-run-id BASELINE_RUN \
   --modes durable --regression-output /mnt/ssd/tmp/ozzy-regression-durable.json
-ozy_chart --fixed-load --run-id CANDIDATE_SMALL_RUN --run-id CANDIDATE_LARGE_RUN \
+ozzy_chart --fixed-load --run-id CANDIDATE_SMALL_RUN --run-id CANDIDATE_LARGE_RUN \
   --baseline-run-id BASELINE_SMALL_RUN --baseline-run-id BASELINE_LARGE_RUN \
   --modes durable --max-rate 128:100000 --max-rate 1024:100000 \
   --max-rate 8192:10000 --regression-output /mnt/ssd/tmp/ozzy-regression-durable-fixed.json
@@ -603,7 +603,7 @@ Timed reports retain merged histogram bins for later percentile extraction.
 ### Iggy logout diagnostic
 
 ```sh
-ozy_compare --impl iggy --check-only
+ozzy_compare --impl iggy --check-only
 cargo build --locked --release -p ozzy-bench --features comparisons \
   --example ozzy_iggy_rc_logout
 "$CARGO_TARGET_DIR/release/examples/ozzy_iggy_rc_logout" \
@@ -620,7 +620,7 @@ contribute comparison timings.
 Tiny payload allocation check (run alone; process-wide allocator counters):
 
 ```sh
-cargo test -p ozzy-bench --features allocation-counting --bin ozy_timed_bench \
+cargo test -p ozzy-bench --features allocation-counting --bin ozzy_timed_bench \
   tiny_record_payload_and_message_allocate_nothing -- --ignored --test-threads=1 --nocapture
 ```
 
@@ -633,8 +633,8 @@ construction are outside this allocation bracket.
 ### LZ4 dictionary experiment
 
 ```sh
-cargo build --locked --release -p ozzy-bench --features comparisons --bin ozy_lz4_dict_bench
-ozy_lz4_dict_bench --cpu 0 --controller-cpu 2
+cargo build --locked --release -p ozzy-bench --features comparisons --bin ozzy_lz4_dict_bench
+ozzy_lz4_dict_bench --cpu 0 --controller-cpu 2
 ```
 
 Canonical Append bodies, held-out comparison JSON and random payloads, no/2 KiB/8 KiB
@@ -652,14 +652,14 @@ Use each binary's `--help` for the complete option list. Their boundaries differ
 
 | Binary | Measures |
 | --- | --- |
-| `ozy_segment_verify_bench` | In-memory production group decode/integrity, optionally LZ4 |
-| `ozy_workloads` | Serial persistent native policy/worker/size matrix |
-| `ozy_timed_bench` | Native timed workloads; persistent policies use the production broker |
+| `ozzy_segment_verify_bench` | In-memory production group decode/integrity, optionally LZ4 |
+| `ozzy_workloads` | Serial persistent native policy/worker/size matrix |
+| `ozzy_timed_bench` | Native timed workloads; persistent policies use the production broker |
 
 ```sh
-ozy_segment_verify_bench --codec lz4 --record-bytes 1024 \
+ozzy_segment_verify_bench --codec lz4 --record-bytes 1024 \
   --batch 1000 --corpus-batches 64 --seconds 5
-ozy_workloads --sizes 128 --workers 1,4 --connections 4 --request-records 1024
+ozzy_workloads --sizes 128 --workers 1,4 --connections 4 --request-records 1024
 ```
 
 Segment verification includes headers, digests, chain and group seal. Corpus
@@ -669,8 +669,8 @@ confirmation is measured. Never present this as broker throughput.
 ## Repeatable native workloads
 
 ```sh
-ozy_workloads --dry-run
-ozy_workloads --profiles single-durable,replicated-persisting \
+ozzy_workloads --dry-run
+ozzy_workloads --profiles single-durable,replicated-persisting \
   --workers 1 --sizes 1024 --segment-mib 64,256,1024
 ```
 
@@ -683,7 +683,7 @@ A short run without a segment roll cannot establish rollover performance.
 ## Native timed runner
 
 ```sh
-ozy_timed_bench --system replicated-persisting --processes --network-ingress --streaming \
+ozzy_timed_bench --system replicated-persisting --processes --network-ingress --streaming \
   --record-bytes 1024 --duration 3 --warmup 0.25 \
   --window 4 --partitions 16 --request-records 1024 \
   --producer-workers 4 --reader-workers 4 --storage-dir /mnt/ssd/tmp/ozzy-bench
@@ -702,7 +702,7 @@ Broker application work and OMQ I/O stay on separate threads. Results record
 
 ## Cross-host placement
 
-Native `ozy_timed_bench` uses `--placements` with three entries and a reachable
+Native `ozzy_timed_bench` uses `--placements` with three entries and a reachable
 TCP control endpoint.
 Native example with separate storage devices:
 
@@ -713,7 +713,7 @@ Native example with separate storage devices:
   {"bind": "192.168.11.155", "cpus": [1],
    "storage_dir": "/mnt/bench/tmp/ozzy-bench"},
   {"bind": "192.168.11.100", "ssh": "er-dev",
-   "executable": "/mnt/bench/tmp/ozzy-bin/ozy_timed_bench",
+   "executable": "/mnt/bench/tmp/ozzy-bin/ozzy_timed_bench",
    "cpus": [0], "storage_dir": "/mnt/bench/tmp/ozzy-bench"}
 ]
 ```
@@ -732,7 +732,7 @@ Native `storage_dir` overrides the global parent per broker. Optional `cpus`
 sets each broker's mask before its threads start; readiness and final results
 verify every thread's observed mask. Results include the storage device and
 filesystem type. Remote hosts also need `taskset` when CPU masks are supplied.
-`ozy_compare --placements <file> --control-bind tcp://<controller>:0` supports
+`ozzy_compare --placements <file> --control-bind tcp://<controller>:0` supports
 replicated-persisting and disk-quorum comparisons with three local brokers or
 two local brokers and one remote broker. Cross-host runs require three distinct
 XFS devices and one CPU per broker. The same placement

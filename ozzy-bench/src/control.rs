@@ -82,7 +82,7 @@ struct Worker {
 pub fn context() -> Context {
     CONTEXT
         .try_with(Clone::clone)
-        .unwrap_or_else(|_| Context::with_name("ozy/omq"))
+        .unwrap_or_else(|_| Context::with_name("ozzy/omq"))
 }
 
 /// Establish execution placement before entering any benchmark role.
@@ -94,7 +94,7 @@ pub async fn run<T>(
     if !(1..=32).contains(&io_threads) {
         return Err(bench_error("OMQ I/O threads must be between 1 and 32"));
     }
-    let context = Context::with_config_and_name(ContextConfig { io_threads }, "ozy/omq");
+    let context = Context::with_config_and_name(ContextConfig { io_threads }, "ozzy/omq");
     CONTEXT
         .scope(context.clone(), async {
             if args.control_endpoint.is_none() {

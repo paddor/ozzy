@@ -47,7 +47,7 @@ tokio = { workspace = true, features = ["sync"] }
 workspace = true
 
 [[bin]]
-name = "ozy_sim"
+name = "ozzy_sim"
 path = "src/bin/ozzy_sim.rs"
 required-features = ["broker"]
 

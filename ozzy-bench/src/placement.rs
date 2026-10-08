@@ -269,7 +269,7 @@ mod tests {
         json!([
             {"bind":"192.168.11.155", "storage_dir":"/mnt/ssd/tmp/ozzy-bench", "cpus":[0]},
             {"bind":"192.168.11.155", "storage_dir":"/mnt/bench/tmp/ozzy-bench", "cpus":[1]},
-            {"bind":"192.168.11.100", "ssh":"er-dev", "executable":"/mnt/bench/tmp/ozzy-bin/ozy_timed_bench", "storage_dir":"/mnt/bench/tmp/ozzy-bench", "cpus":[0]}
+            {"bind":"192.168.11.100", "ssh":"er-dev", "executable":"/mnt/bench/tmp/ozzy-bin/ozzy_timed_bench", "storage_dir":"/mnt/bench/tmp/ozzy-bench", "cpus":[0]}
         ])
     }
 

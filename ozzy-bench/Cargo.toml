@@ -17,36 +17,36 @@ allocation-counting = []
 comparisons = ["dep:iggy", "dep:rdkafka", "dep:tracing-subscriber", "ozzy-runtime/storage-metrics"]
 
 [[bin]]
-name = "ozy_timed_bench"
-path = "src/bin/ozy_timed_bench.rs"
+name = "ozzy_timed_bench"
+path = "src/bin/ozzy_timed_bench.rs"
 
 [[bin]]
-name = "ozy_segment_verify_bench"
-path = "src/bin/ozy_segment_verify_bench.rs"
+name = "ozzy_segment_verify_bench"
+path = "src/bin/ozzy_segment_verify_bench.rs"
 
 [[bin]]
-name = "ozy_chart"
-path = "src/bin/ozy_chart.rs"
+name = "ozzy_chart"
+path = "src/bin/ozzy_chart.rs"
 
 [[bin]]
-name = "ozy_compare"
-path = "src/bin/ozy_compare.rs"
+name = "ozzy_compare"
+path = "src/bin/ozzy_compare.rs"
 
 [[bin]]
-name = "ozy_workloads"
-path = "src/bin/ozy_workloads.rs"
+name = "ozzy_workloads"
+path = "src/bin/ozzy_workloads.rs"
 
 [[bin]]
-name = "ozy_profile"
-path = "src/bin/ozy_profile.rs"
+name = "ozzy_profile"
+path = "src/bin/ozzy_profile.rs"
 
 [[bin]]
-name = "ozy_disk_probe"
-path = "src/bin/ozy_disk_probe.rs"
+name = "ozzy_disk_probe"
+path = "src/bin/ozzy_disk_probe.rs"
 
 [[bin]]
-name = "ozy_lz4_dict_bench"
-path = "src/bin/ozy_lz4_dict_bench.rs"
+name = "ozzy_lz4_dict_bench"
+path = "src/bin/ozzy_lz4_dict_bench.rs"
 
 [dependencies]
 bytes.workspace = true

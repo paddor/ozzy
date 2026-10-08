@@ -74,7 +74,7 @@ pub fn build_target(checkout: &Path) -> PathBuf {
 
 /// Checkout-specific release worker executable on the artifact disk.
 pub fn worker_binary() -> PathBuf {
-    build_target(&root()).join("release/ozy_timed_bench")
+    build_target(&root()).join("release/ozzy_timed_bench")
 }
 
 /// Append-only benchmark result ledger directory under the user cache.
