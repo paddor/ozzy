@@ -14,7 +14,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_TARGET_DIR: /mnt/ssd/tmp/ozzy-ci-target
+  CARGO_TARGET_DIR: ${{ github.workspace }}/ozzy/target
   RUSTFLAGS: -C target-cpu=x86-64
 
 defaults:

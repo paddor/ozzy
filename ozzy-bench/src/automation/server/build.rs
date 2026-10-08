@@ -1,6 +1,6 @@
 //! Build the exact release before any measured process starts.
 use super::{RELEASE, RELEASE_TAG, REVISION, Result};
-use crate::automation::{SSD, cache, capture, json_file, read_json, source};
+use crate::automation::{artifact_root, cache, capture, json_file, read_json, source};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -9,14 +9,14 @@ use std::{
 };
 
 pub(super) fn checkout() -> PathBuf {
-    PathBuf::from(SSD).join("iggy-server-0.9.0-rc.1")
+    artifact_root().join("iggy-server-0.9.0-rc.1")
 }
 pub(crate) fn binary() -> PathBuf {
-    PathBuf::from(SSD).join("cargo-target/iggy-0.9.0-rc.1/release/iggy-server")
+    artifact_root().join("cargo-target/iggy-0.9.0-rc.1/release/iggy-server")
 }
 
 fn dependencies() -> PathBuf {
-    PathBuf::from(SSD).join("iggy-build-deps")
+    artifact_root().join("iggy-build-deps")
 }
 
 // A private Debian sysroot keeps the VM unchanged. Cargo only needs headers and
@@ -160,9 +160,9 @@ pub fn prepare(no_build: bool, logs: &Path) -> Result<()> {
         .current_dir(&directory)
         .env(
             "CARGO_TARGET_DIR",
-            format!("{SSD}/cargo-target/iggy-0.9.0-rc.1"),
+            artifact_root().join("cargo-target/iggy-0.9.0-rc.1"),
         )
-        .env("TMPDIR", SSD)
+        .env("TMPDIR", artifact_root())
         .env("PKG_CONFIG_PATH", library_path().join("pkgconfig"))
         .env("PKG_CONFIG_SYSROOT_DIR", dependencies())
         .output()?;

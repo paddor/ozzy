@@ -16,10 +16,10 @@ export PATH="$CARGO_TARGET_DIR/release:$PATH"
 
 ## Start a single durable broker
 
-The sample binds loopback ports and stores data under `/mnt/ssd/tmp/ozzy-single`.
+The sample binds loopback ports and stores data under `tmp/ozzy-single`.
 
 ```sh
-ozzy_dir=/mnt/ssd/tmp/ozzy-single
+ozzy_dir="$PWD/tmp/ozzy-single"
 mkdir -p "$ozzy_dir/data"
 sed "s|/ozzy/data|$ozzy_dir/data|" ozzy-broker/container.toml > "$ozzy_dir/deployment.toml"
 ozzy() { ozzy_broker --config "$ozzy_dir/deployment.toml" "$@"; }
@@ -57,17 +57,15 @@ Requires Podman. Build above with a Linux toolchain compatible with Debian 13.
 The image contains only the server; data lives in a persistent bind mount.
 
 ```sh
-mkdir -p /mnt/ssd/tmp/ozzy-image /mnt/ssd/tmp/ozzy-container/data
-cp "$CARGO_TARGET_DIR/release/ozzy_broker" /mnt/ssd/tmp/ozzy-image/
-cp ozzy-broker/container.toml /mnt/ssd/tmp/ozzy-container/deployment.toml
-container() {
-  podman --root /mnt/ssd/tmp/ozzy-container-storage \
-    --runroot "${XDG_RUNTIME_DIR}/ozzy-container-dev" "$@"
-}
-container build -f ozzy-broker/Containerfile -t localhost/ozzy:dev /mnt/ssd/tmp/ozzy-image
+ozzy_image="$PWD/tmp/ozzy-image"
+ozzy_container_dir="$PWD/tmp/ozzy-container"
+mkdir -p "$ozzy_image" "$ozzy_container_dir/data"
+cp "$CARGO_TARGET_DIR/release/ozzy_broker" "$ozzy_image/"
+cp ozzy-broker/container.toml "$ozzy_container_dir/deployment.toml"
+podman build -f ozzy-broker/Containerfile -t localhost/ozzy:dev "$ozzy_image"
 ozzy_container() {
-  container run --rm --network host --userns keep-id \
-    -v /mnt/ssd/tmp/ozzy-container:/ozzy localhost/ozzy:dev \
+  podman run --rm --network host --userns keep-id \
+    -v "$ozzy_container_dir:/ozzy" localhost/ozzy:dev \
     --config /ozzy/deployment.toml "$@"
 }
 
@@ -92,9 +90,10 @@ hosts. Use `replicated-persisting` confirmation for background persistence.
 Provision this local example once:
 
 ```sh
-ozzy_dir=/mnt/ssd/tmp/ozzy-three
+ozzy_dir="$PWD/tmp/ozzy-three"
 mkdir -p "$ozzy_dir"/broker-{0,1,2}
-ozzy_three() { ozzy_broker --config ozzy-broker/three.toml "$@"; }
+sed "s|/var/tmp/ozzy-three|$ozzy_dir|g" ozzy-broker/three.toml > "$ozzy_dir/deployment.toml"
+ozzy_three() { ozzy_broker --config "$ozzy_dir/deployment.toml" "$@"; }
 ozzy_three init --identity "$ozzy_dir/shared.identity"
 for n in 0 1 2; do
   for step in init-broker init-volumes format; do

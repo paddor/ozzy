@@ -22,8 +22,11 @@ phase; CI runs them in separate jobs.
 Executables and integration tests use the `ozzy_` prefix. Linux truncates process
 names to 15 characters; benchmark isolation resolves the full executable path.
 The suite also names its Cargo, compiler, and rustdoc processes. Use
-`scripts/ozzy_cargo build --workspace` for the same naming and SSD build
+`scripts/ozzy_cargo build --workspace` for the same naming and artifact
 directory on individual commands. Clippy retains its own compiler wrapper.
+`OZZY_ARTIFACT_ROOT` selects the artifact root; it defaults to the system
+temporary directory. Explicit `CARGO_TARGET_DIR` and `TMPDIR` take precedence
+for builds and temporary files.
 
 Individual commands:
 
@@ -125,7 +128,7 @@ sustained product runs. Virtual and wall-clock durations are separate.
 
 Product workloads cover concurrent producers, resume/takeover, consumer checkpoint
 reopen/pause, reconnect, retention, quorum loss, broker restart, short writes,
-and held completions. Fault logs stream to SSD; bounded recent events and dirty/
+and held completions. Fault logs stream to disk; bounded recent events and dirty/
 durable images support failure inspection. Process cuts retain dirty bytes;
 modeled device cuts restore only durable bytes/namespace effects. Seed replay
 reproduces the recorded fault prefix, not the complete threaded schedule.
@@ -143,7 +146,7 @@ through the CLI. Use topic `orders`, four partitions, bounded retention.
 | `OZZY_SOAK_CONFIG` | Controller deployment file |
 | `OZZY_SOAK_HOSTS` | Host order; default `si-dev,wu-dev,er-dev` |
 | `OZZY_SOAK_DIRS` | Comma-separated directories in host order |
-| `OZZY_SOAK_LOGS` | SSD artifact directory |
+| `OZZY_SOAK_LOGS` | Artifact directory |
 | `OZZY_SOAK_RESULTS` | JSONL under `~/.cache/ozzy/` |
 | `OZZY_SOAK_SECONDS` | Default 3600; use a short gate first |
 | `OZZY_SOAK_IDENTITY` | Controller's shared identity when first broker is remote |

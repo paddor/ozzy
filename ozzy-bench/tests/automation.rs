@@ -1,7 +1,7 @@
 //! Regression coverage for measurement validity, isolation, and cached baselines.
 use clap::Parser;
 use ozzy_bench::automation::{
-    compare, isolation, records, source, supervise, validation, workloads,
+    artifact_root, compare, isolation, records, source, supervise, validation, workloads,
 };
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, fs, path::Path, process::Command, time::Duration};
@@ -15,8 +15,55 @@ fn separate_checkouts_cannot_share_benchmark_build_artifacts() {
     let main = build_target(Path::new("/workspace/main/ozzy"));
     let experiment = build_target(Path::new("/workspace/experiment/ozzy"));
     assert_ne!(main, experiment);
-    assert!(main.starts_with("/mnt/ssd/tmp/cargo-target/checkouts"));
+    assert!(main.starts_with(artifact_root().join("cargo-target/checkouts")));
     assert_eq!(main, build_target(Path::new("/workspace/main/ozzy")));
+}
+
+#[test]
+fn launcher_creates_configured_artifacts_and_preserves_cargo_overrides() {
+    let directory = tempfile::tempdir().unwrap();
+    let checkout = ozzy_bench::automation::root();
+    let key = ozzy_bench::automation::build_target(&checkout);
+    for explicit_target in [false, true] {
+        let artifacts = directory.path().join(if explicit_target {
+            "explicit artifact root"
+        } else {
+            "artifact root"
+        });
+        let target = if explicit_target {
+            directory.path().join("explicit target")
+        } else {
+            artifacts
+                .join("cargo-target/checkouts")
+                .join(key.file_name().unwrap())
+        };
+        let mut command = Command::new("bash");
+        command
+            .args([
+                "--noprofile",
+                "--norc",
+                "-c",
+                "source \"$1\"; printf '%s\\n' \"$OZZY_ARTIFACT_ROOT\" \"$CARGO_TARGET_DIR\" \"$TMPDIR\"",
+                "ozzy-path-test",
+            ])
+            .arg(checkout.join("scripts/ozzy_tools.sh"))
+            .env("OZZY_ARTIFACT_ROOT", &artifacts)
+            .env_remove("CARGO_TARGET_DIR")
+            .env_remove("TMPDIR");
+        if explicit_target {
+            command.env("CARGO_TARGET_DIR", &target);
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let output = String::from_utf8(output.stdout).unwrap();
+        let paths: Vec<_> = output.lines().map(Path::new).collect();
+        assert_eq!(
+            paths,
+            [artifacts.as_path(), target.as_path(), artifacts.as_path()]
+        );
+        assert!(artifacts.is_dir());
+        assert!(target.join("ozzy-tools").is_dir());
+    }
 }
 
 #[test]
@@ -245,7 +292,7 @@ fn native_cases_apply_broker_masks_and_keep_clients_in_their_own_pool() {
             assert_eq!(placement.cpus.as_ref().unwrap(), &expected[index]);
             assert_eq!(
                 placement.storage_dir.as_deref(),
-                Some(Path::new("/mnt/ssd/tmp/ozzy-bench"))
+                Some(artifact_root().join("ozzy-bench").as_path())
             );
         }
         let brokers: Vec<_> = expected
@@ -1468,7 +1515,7 @@ fn comparison_commands_declare_the_same_topic_partitions_for_every_adapter() {
     ]);
     workloads.validate().unwrap();
     for case in workloads.cases() {
-        let command = workloads.command(&case, Path::new("/mnt/ssd/tmp/ozzy-bench"));
+        let command = workloads.command(&case, Path::new("/var/tmp/ozzy-bench"));
         assert_eq!(option(&command, "--partitions"), "2", "{}", case["profile"]);
     }
 }
@@ -1700,7 +1747,10 @@ fn all_and_native_only_preserve_workload_and_ssd_cpu_budgets() {
         assert_eq!(option(&cmd, "--window"), "8");
         assert_eq!(option(&cmd, "--producer-workers"), "4");
         assert_eq!(option(&cmd, "--reader-workers"), "8");
-        assert_eq!(option(&cmd, "--storage-dir"), "/mnt/ssd/tmp/ozzy-bench");
+        assert_eq!(
+            option(&cmd, "--storage-dir"),
+            artifact_root().join("ozzy-bench").to_str().unwrap()
+        );
         if case["impl"] == "ozzy" {
             assert_eq!(option(&cmd, "--writer-inflight-appends"), "1");
             assert_eq!(option(&cmd, "-c"), "3,4,5");
@@ -1803,7 +1853,7 @@ fn native_controls_never_leak_into_external_or_cluster_commands() {
     ]);
     args.validate().unwrap();
     for case in args.cases() {
-        let cmd = args.command(&case, Path::new("/mnt/ssd/tmp/ozzy-bench"));
+        let cmd = args.command(&case, Path::new("/var/tmp/ozzy-bench"));
         assert_eq!(option(&cmd, "--request-records"), "1024");
         assert_eq!(option(&cmd, "--reader-workers"), "4");
         if case["profile"] == "single-durable" {
@@ -2265,9 +2315,9 @@ fn all_local_comparison_checks_every_broker_cpu_and_labels_topology() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("placements.json");
     let mut rows = json!([
-        {"bind":"127.0.0.1","storage_dir":"/mnt/ssd/tmp","cpus":[0]},
+        {"bind":"127.0.0.1","storage_dir":"/var/tmp","cpus":[0]},
         {"bind":"127.0.0.1","storage_dir":"/mnt/bench/tmp","cpus":[1]},
-        {"bind":"127.0.0.1","storage_dir":"/mnt/ssd/tmp","cpus":[2]}
+        {"bind":"127.0.0.1","storage_dir":"/var/tmp","cpus":[2]}
     ]);
     fs::write(&path, rows.to_string()).unwrap();
     let mut args = compare::Args::parse_from([
@@ -2358,7 +2408,7 @@ fn distributed_comparison_keeps_adapter_windows_and_freezes_topology() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("placements.json");
     let rows = json!([
-        {"bind":"192.0.2.1","storage_dir":"/mnt/ssd/tmp","cpus":[0]},
+        {"bind":"192.0.2.1","storage_dir":"/var/tmp","cpus":[0]},
         {"bind":"192.0.2.1","storage_dir":"/mnt/bench/tmp","cpus":[1]},
         {"bind":"192.0.2.2","ssh":"remote","executable":"/mnt/bench/tmp/bin/ozzy_timed_bench","storage_dir":"/mnt/bench/tmp","cpus":[0]}
     ]);

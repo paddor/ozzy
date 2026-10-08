@@ -1,21 +1,20 @@
-# ozzy
+# Ozzy SDK
 
-Ozzy provides durable message streaming over OMQ, with partitioned topics,
-replay, retention, and producer resume. Run a single durable broker or a
-three-broker group in disk-quorum or replicated-persisting mode. OMQ handles
-message passing; Ozzy adds persistence, replication, and stream recovery.
+Ozzy is a Rust message streaming system for durable event logs, running as a
+single broker or a replicated cluster over OMQ. This crate provides its native
+Rust producer and consumer APIs.
 
-Requires Rust 1.93 or newer. Run a provisioned Ozzy broker separately;
-see [Getting started](https://github.com/paddor/ozzy/blob/main/GETTING_STARTED.md).
+## Setup
 
-This crate provides the native Rust producer and consumer SDKs. They share session
-code while retaining separate role state. `BrokerLinks` owns one data PEER and
-one control PEER connected to all configured brokers. Live consumers add one
-SUB per broker; partition count does not add PEER sockets.
+Requires Rust 1.93+. Run a broker using the
+[getting started guide](https://github.com/paddor/ozzy/blob/main/GETTING_STARTED.md).
+Create a `WriterRuntime`, then connect `BrokerLinks` to your broker endpoints.
+Share the link across topics; the examples below use an existing link.
 
-`SharedTopicWriter` opens a named topic through an existing
-`BrokerLinks` owner. Records take an optional key. Confirmation includes the
-topic identity, numeric partition, offset, and configured storage policy.
+## Produce
+
+`SharedTopicWriter` routes records by optional key. `send` admits locally;
+`confirmed()` returns the partition, offset, and achieved storage policy.
 
 ```rust,no_run
 use ozzy::{
@@ -38,39 +37,27 @@ async fn write(links: &BrokerLinks, limits: DataLimits) -> Result<(), Box<dyn st
 }
 ```
 
-Save `writer.identity().to_bytes()` once in application config. Resume needs
-only this 32-byte topic/producer token; brokers supply each partition's current
-epoch and next sequence. Use `SharedTopicWriter::resume` after the old process
-has stopped, or `takeover` to fence it explicitly. Both resolve every partition
-before returning. A failed takeover may already have fenced some partitions.
-The SDK stores no durable outbox. A crash may lose unconfirmed records; application
-resubmission may repeat records. Record IDs do not deduplicate application work.
+Keep several records in flight for throughput; waiting for each confirmation
+before sending the next record serializes writes.
 
-```rust,no_run
-use ozzy::{BrokerLinks, DataLimits, ProducerIdentity, RetryPolicy,
-    SharedTopicWriter, SharedTopicWriterConfig};
+## Resume a producer
 
-async fn resume(links: &BrokerLinks, limits: DataLimits, saved: [u8; 32])
-    -> Result<SharedTopicWriter, Box<dyn std::error::Error>> {
-    Ok(SharedTopicWriter::resume(links, "orders", ProducerIdentity::from_bytes(saved)?,
-        SharedTopicWriterConfig::new(limits), RetryPolicy::default()).await?)
-}
-```
+Save `writer.identity().to_bytes()` once: a 32-byte topic/producer token.
+Restore it with `ProducerIdentity::from_bytes(saved)`.
 
-See [runtime contracts](https://github.com/paddor/ozzy/blob/main/doc/RUNTIME.md#sdk-protocol-batching) for admission,
-resource bounds, and cancellation. The default payload target is 64 KiB with
-one outstanding APPEND. Collection is bounded by bytes, negotiated limits, and
-a hard 2,048-record ceiling; sparse sends have no artificial collection wait.
+| API | Use |
+| --- | --- |
+| `SharedTopicWriter::resume` | Continue after the old producer has stopped |
+| `SharedTopicWriter::takeover` | Fence the old producer explicitly |
 
-`TopicReader` opens every partition of a named topic and returns
-individual records. Its checkpoint names the next received offset per partition.
-Save it after application processing, then reopen with
-`TopicReaderConfig { start: ReaderStart::Checkpoint(saved), ..Default::default() }`.
-Default start is earliest retained. `ReaderStart::Latest` starts at the current end;
-`Timestamp(unix_millis)` seeks by broker append time. `ReaderStart::record_id(partition,
-id)` requires one unique retained match. Choose `IdPolicy::FirstRetained` or
-`LastRetained` explicitly when duplicate IDs are expected. Seeks use confirmed
-history; reconnect continues from the next delivered offset.
+Both resolve every partition before returning. A failed takeover may already
+have fenced some partitions. The SDK has no durable outbox; a crash can lose
+unconfirmed input, and application resubmission can repeat records.
+
+## Consume
+
+`TopicReader` reads individual records from every partition, starting at the
+earliest retained offset by default. It repairs live-stream gaps automatically.
 
 ```rust,no_run
 use ozzy::{BrokerLinks, TopicReader, TopicReaderConfig};
@@ -87,15 +74,13 @@ async fn read(links: BrokerLinks) -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Create a `WriterRuntime`, then connect `BrokerLinks` with broker endpoints,
-negotiation parameters, and bounded writer or reader capacity. The link is
-shared across topics and partitions. `handshake`, `EnvelopeLimits`, `DataLimits`,
-`AppendLinkLimits`, and `ReaderLinkLimits` are available from this crate for
-that configuration.
+Save checkpoints after successful application processing. Reopen with
+`TopicReaderConfig { start: ReaderStart::Checkpoint(saved), ..Default::default() }`.
+Other start positions include latest, broker timestamp, and retained record ID.
+Checkpoints do not make application side effects transactional.
 
-`send` admits a record locally. Only `confirmed()` establishes the configured
-broker storage policy. Reader checkpoints are volatile receive positions; save
-them only after application processing. A checkpoint does not make application
-side effects transactional. See [runtime contracts](https://github.com/paddor/ozzy/blob/main/doc/RUNTIME.md) for
-capacity and cancellation behavior and [design](https://github.com/paddor/ozzy/blob/main/DESIGN.md) for deployment
-boundaries.
+## Further reading
+
+- [Overview](https://github.com/paddor/ozzy/blob/main/doc/OVERVIEW.md): record flow and broker modes.
+- [Runtime contracts](https://github.com/paddor/ozzy/blob/main/doc/RUNTIME.md): admission, cancellation, batching, and resource bounds.
+- Rust API docs: `BrokerLinksConfig`, `SharedTopicWriterConfig`, `ReaderStart`, and `TopicReaderConfig`.

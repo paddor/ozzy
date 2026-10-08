@@ -1,12 +1,12 @@
 //! Pinned official relocatable distribution; no system install or JVM.
-use crate::automation::{Result, SSD, cache, capture, json_file, read_json, source};
+use crate::automation::{Result, artifact_root, cache, capture, json_file, read_json, source};
 use serde_json::{Value, json};
 use std::{fs, path::PathBuf, process::Command};
 
 const RELEASE: &str = "26.2.2";
 const ARCHIVE_SHA256: &str = "575fefbbc2cb929634e2b831acb87ecb0b23403b2ef8b356a34dbc0a00934aa5";
 pub(super) fn directory() -> PathBuf {
-    PathBuf::from(SSD).join(format!("redpanda-{RELEASE}"))
+    artifact_root().join(format!("redpanda-{RELEASE}"))
 }
 pub(super) fn binary() -> PathBuf {
     directory().join("libexec/redpanda")

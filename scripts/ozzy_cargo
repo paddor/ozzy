@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build entry point with SSD artifact paths: scripts/ozzy_cargo build/test/...
+# Build entry point with configurable artifact paths: scripts/ozzy_cargo build/test/...
 set -euo pipefail
 source "$(dirname "$0")/ozzy_tools.sh"
 cd "$ozzy_repo_root"

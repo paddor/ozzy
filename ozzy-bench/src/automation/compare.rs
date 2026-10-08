@@ -1,8 +1,8 @@
 //! Repeatable comparisons with a fresh, isolated server for every case.
 use super::cpus::BrokerCpus;
 use super::{
-    Result, SSD, cache, capture, check_canceled, install_signals, isolation, json_file, read_json,
-    records, root, run_id, server::External, source, supervise, validation,
+    Result, artifact_root, cache, capture, check_canceled, install_signals, isolation, json_file,
+    read_json, records, root, run_id, server::External, source, supervise, validation,
 };
 use clap::Parser;
 use serde_json::{Value, json};
@@ -518,7 +518,13 @@ impl Args {
                     .unwrap_or_else(|| default_segment_mib(size))
                     .to_string(),
             ),
-            ("--storage-dir", format!("{SSD}/ozzy-bench")),
+            (
+                "--storage-dir",
+                artifact_root()
+                    .join("ozzy-bench")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
         ] {
             add(flag, value);
         }
@@ -539,7 +545,13 @@ impl Args {
                     .ok_or("missing implementation")?
                     .into(),
             );
-            add("--external-storage-dir", format!("{SSD}/ozzy-bench"));
+            add(
+                "--external-storage-dir",
+                artifact_root()
+                    .join("ozzy-bench")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
             add(
                 "--external-endpoint",
                 endpoint.ok_or("missing external endpoint")?.into(),
@@ -677,7 +689,7 @@ fn build(args: &Args, directory: &Path) -> Result<PathBuf> {
             .args(args)
             .current_dir(root())
             .env("CARGO_TARGET_DIR", super::build_target(&root()))
-            .env("TMPDIR", SSD)
+            .env("TMPDIR", artifact_root())
             .output()?;
         let log = [output.stdout, output.stderr].concat();
         fs::write(directory.join(format!("build-{index}.log")), &log)?;
@@ -740,7 +752,7 @@ fn manifest(args: &Args, id: &str, binary: &Path) -> Result<Value> {
         })
         .collect::<Vec<_>>();
     Ok(
-        json!({"run_id":id,"source":source,"focused_checks":build.get("focused_checks").and_then(Value::as_bool).unwrap_or(false),"fixture_source":fixture_source,"executable":binary,"executable_sha256":source::sha256(binary)?,"host":host,"cpuinfo":cpu,"memory":memory,"filesystem":capture(Command::new("findmnt").args(["-T",SSD]))?,"arguments":args.configuration(),"workload_sha256":build["workload_sha256"],"environment":{"host":host,"cpu":cpu_lines,"memory":memory.lines().find(|l|l.starts_with("MemTotal:")).ok_or("missing MemTotal")?,"filesystem":capture(Command::new("findmnt").args(["-n","-o","SOURCE,FSTYPE,OPTIONS","-T",SSD]))?,"dependencies":dependencies}}),
+        json!({"run_id":id,"source":source,"focused_checks":build.get("focused_checks").and_then(Value::as_bool).unwrap_or(false),"fixture_source":fixture_source,"executable":binary,"executable_sha256":source::sha256(binary)?,"host":host,"cpuinfo":cpu,"memory":memory,"filesystem":capture(Command::new("findmnt").args(["-T"]).arg(artifact_root()))?,"arguments":args.configuration(),"workload_sha256":build["workload_sha256"],"environment":{"host":host,"cpu":cpu_lines,"memory":memory.lines().find(|l|l.starts_with("MemTotal:")).ok_or("missing MemTotal")?,"filesystem":capture(Command::new("findmnt").args(["-n","-o","SOURCE,FSTYPE,OPTIONS","-T"]).arg(artifact_root()))?,"dependencies":dependencies}}),
     )
 }
 
@@ -763,7 +775,7 @@ impl Args {
             let cpus = self.broker_cpus.brokers(brokers);
             let placements: Vec<_> = (0..3)
                 .map(|index| {
-                    json!({"bind":"127.0.0.1", "storage_dir":format!("{SSD}/ozzy-bench"),
+                    json!({"bind":"127.0.0.1", "storage_dir":artifact_root().join("ozzy-bench").to_string_lossy().into_owned(),
                     "cpus":cpus[index.min(brokers - 1)]})
                 })
                 .collect();
@@ -792,7 +804,7 @@ async fn case(
     let cmd = args.case_command(binary, case, directory, server.map(External::endpoint))?;
     json_file(&directory.join("command.json"), &json!(cmd))?;
     let pids = server.map_or_else(Vec::new, External::pids);
-    let storage = super::device::Snapshot::take(Path::new(SSD))?;
+    let storage = super::device::Snapshot::take(&artifact_root())?;
     let before = supervise::CpuSnapshot::take_servers(&pids)?;
     let mut guard = isolation::Guard::new(case["impl"].as_str().unwrap(), None).with_servers(&pids);
     if let Some(path) = &args.placements {
@@ -890,8 +902,8 @@ async fn matrix(
             if let Some(placements) = &placements {
                 super::distributed::idle(placements)?;
             }
-            capture(Command::new("sync").args(["-f", SSD]))?;
-            let settle = super::device::settle(Path::new(SSD)).await?;
+            capture(Command::new("sync").args(["-f"]).arg(artifact_root()))?;
+            let settle = super::device::settle(&artifact_root()).await?;
             let selected = &cases[case_index];
             let implementation = selected["impl"].as_str().unwrap();
             let name = format!(
@@ -917,7 +929,7 @@ async fn matrix(
                     &args.broker_cpus.brokers(brokers),
                 )?)
             };
-            capture(Command::new("sync").args(["-f", SSD]))?;
+            capture(Command::new("sync").args(["-f"]).arg(artifact_root()))?;
             if let Some(placements) = &placements {
                 for p in placements {
                     super::distributed::run(
@@ -1004,9 +1016,7 @@ pub async fn run(mut args: Args) -> Result<()> {
         .append(true)
         .open(super::artifacts().join("runner.lock"))?;
     lock.try_lock()?;
-    if capture(Command::new("findmnt").args(["-n", "-o", "TARGET", "-T", SSD]))? != "/mnt/ssd" {
-        return Err("external SSD is not mounted".into());
-    }
+    super::require_artifact_disk()?;
     isolation::require_idle()?;
     let id = run_id()?;
     let directory = super::artifacts().join("runs").join(&id);

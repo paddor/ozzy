@@ -10,8 +10,6 @@ on:
 permissions: {}
 
 env:
-  CARGO_TARGET_DIR: /mnt/ssd/tmp/ozzy-release-target
-  TMPDIR: /mnt/ssd/tmp
   RUSTFLAGS: -C target-cpu=x86-64
 
 jobs:
@@ -38,10 +36,10 @@ jobs:
           persist-credentials: false
           ref: main
       - uses: dtolnay/rust-toolchain@stable
-      - name: Prepare build directories
+      - name: Configure artifact paths
         run: |
-          sudo mkdir -p /mnt/ssd/tmp
-          sudo chown "$(id -u):$(id -g)" /mnt/ssd/tmp
+          printf 'CARGO_TARGET_DIR=%s/ozzy-release-target\nTMPDIR=%s\n' \
+            "$RUNNER_TEMP" "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Check tested revision
         id: revision
         env:

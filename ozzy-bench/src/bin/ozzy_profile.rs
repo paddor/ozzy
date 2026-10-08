@@ -332,7 +332,7 @@ fn workload(args: &Args, directory: &Path) -> Result<Vec<String>> {
         "--storage-dir",
         format!(
             "{}/ozzy-profile/{}",
-            automation::SSD,
+            automation::artifact_root().display(),
             directory.file_name().unwrap().to_string_lossy()
         ),
     )?;
@@ -743,16 +743,7 @@ async fn main() -> Result<()> {
     }
     automation::install_signals()?;
     isolation::require_idle()?;
-    if automation::capture(Command::new("findmnt").args([
-        "-n",
-        "-o",
-        "TARGET",
-        "-T",
-        automation::SSD,
-    ]))? != "/mnt/ssd"
-    {
-        return Err("external SSD is not mounted".into());
-    }
+    automation::require_artifact_disk()?;
     let case_manifest = automation::read_json(
         &args
             .case_dir
@@ -764,7 +755,7 @@ async fn main() -> Result<()> {
         serde_json::from_value(case_manifest["arguments"]["client_cpus"].clone())?;
     isolation::pin(None, &client_cpus)?;
     let id = format!("{}-{}", automation::run_id()?, args.kind);
-    let directory = Path::new(automation::SSD).join("ozzy-profiles").join(id);
+    let directory = automation::artifact_root().join("ozzy-profiles").join(id);
     fs::create_dir_all(directory.parent().unwrap())?;
     fs::create_dir(&directory)?;
     let identity = source::identity(&automation::root())?;
@@ -789,7 +780,11 @@ async fn main() -> Result<()> {
         "controller_cpus":isolation::cpus(None)?, "case_configuration":case_manifest["arguments"]}),
     )?;
     // Drain earlier filesystem writes before starting the profiled workload.
-    automation::capture(Command::new("sync").args(["-f", automation::SSD]))?;
+    automation::capture(
+        Command::new("sync")
+            .arg("-f")
+            .arg(automation::artifact_root()),
+    )?;
     let mut guard = isolation::Guard::new("ozzy", None).with_profiling(true)?;
     monitor_remote(&command, &directory, &mut guard)?;
     println!("PROFILE {}", directory.display());
