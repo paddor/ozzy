@@ -11,4 +11,4 @@ Shared identifiers and framing are exported at the crate root.
 
 Fixed-byte, malformed-input, capacity, and session tests protect these contracts.
 Decoding never establishes authentication, ownership, persistence, or group
-confirmation. See [protocol](../doc/PROTOCOL.md).
+confirmation. See [protocol](https://github.com/paddor/ozzy/blob/main/doc/PROTOCOL.md).

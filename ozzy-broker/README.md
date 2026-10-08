@@ -15,6 +15,6 @@ transport and storage workers.
 | Disk quorum | Persisted on two of three brokers |
 | Replicated-persisting | Retained on two of three brokers; persisted in the background |
 
-See [Getting started](../GETTING_STARTED.md) for building, provisioning,
-containers, and recovery. Applications use the [Rust SDK](../ozzy/README.md).
-The [design](../DESIGN.md) describes ownership and durability boundaries.
+See [Getting started](https://github.com/paddor/ozzy/blob/main/GETTING_STARTED.md) for building, provisioning,
+containers, and recovery. Applications use the [Rust SDK](https://github.com/paddor/ozzy/blob/main/ozzy/README.md).
+The [design](https://github.com/paddor/ozzy/blob/main/DESIGN.md) describes ownership and durability boundaries.

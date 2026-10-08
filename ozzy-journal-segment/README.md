@@ -6,7 +6,7 @@ Broker partition actors use `AsyncGroupJournal`, `AsyncRecoveryDirectory`,
 and the asynchronous partition reader. File operations run through shared
 device backends. The actor owns journal state and installs completed results;
 the backend owns handles, buffers, and physical I/O. See
-[storage](../doc/STORAGE.md) and [runtime](../doc/RUNTIME.md).
+[storage](https://github.com/paddor/ozzy/blob/main/doc/STORAGE.md) and [runtime](https://github.com/paddor/ozzy/blob/main/doc/RUNTIME.md).
 
 The segment engine checks physical framing, canonical operations, chain
 digests, manifests, checkpoints, and recovery evidence. Active writes use

@@ -6,4 +6,4 @@ Tokio, or file I/O is required. `ozzy-replication` owns three-broker authority;
 
 The same state transitions serve speculative and confirmed images. Writer
 identity and retry results are scoped within each partition. See
-[design](../DESIGN.md) and [storage](../doc/STORAGE.md).
+[design](https://github.com/paddor/ozzy/blob/main/DESIGN.md) and [storage](https://github.com/paddor/ozzy/blob/main/doc/STORAGE.md).

@@ -51,9 +51,10 @@ Single durable delays writes without claiming quorum failover. Retention rolls
 bounds protocol time; `--clock-tick-ms` and `--clock-step-ms` control its pace
 (defaults: 2 ms real time per 10 ms simulated time). SDK retries, broker deadlines
 and append timestamps share that clock, including across broker restart. Storage
-holds and threaded transport delivery remain independent. Each schedule boundary
-has its own wall-clock progress deadline; finishing it and shutdown can extend
-the generation limit.
+holds and threaded transport delivery remain independent. The progress deadline
+resets only after independent record verification; disk activity alone cannot
+extend it. It covers admission, recovery and verification for the whole fault
+boundary. Finishing a boundary and shutdown can extend the generation limit.
 
 `--interval-ms` controls load between bounded waves. `--actions` accepts a
 comma-separated fault mix, for example `traffic,shared-producers,consumer,reconnect`;
@@ -68,10 +69,11 @@ each wave retains at most 32 records per partition or 64 in one hot partition.
 Each wave verifies confirmation identity, partition-global offsets, payloads and
 consumer checkpoints. Verified payload evidence is discarded between waves.
 Storage keeps 4096 recent physical events per device and bounded media images;
-the report counts completed churn, recovery faults and actual PUB/PEER delivery.
+the terminal report has `complete: true` after clean shutdown and counts completed
+churn, recovery faults and actual PUB/PEER delivery. Progress is printed every minute.
 The selected controls are saved in `config.json`. The entire injected fault
 schedule, including clock observations, streams to `schedule.jsonl`. The first failure
-saves outstanding record evidence, configuration, recent physical order and
+saves outstanding record evidence, SDK routes and batching counters, configuration, recent physical order and
 dirty/durable memory images before stopping. Orderly stopped owners retain their
 final images until restoration, including when a fault boundary is interrupted.
 
