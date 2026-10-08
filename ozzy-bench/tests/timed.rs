@@ -19,7 +19,7 @@ fn disk_and_sdk_packing_preserve_native_confirmation_and_reader_verification() {
         ("replicated-persisting", "lz4", "1024", "128"),
         ("replicated-persisting", "raw", "1024", "128"),
     ] {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_ozy_timed_bench"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ozzy_timed_bench"));
         command
             .args([
                 "--processes",
@@ -83,7 +83,7 @@ fn disk_and_sdk_packing_preserve_native_confirmation_and_reader_verification() {
 #[test]
 fn sparse_scheduled_writers_confirm_without_filling_the_request_records() {
     let storage = support::storage("native-sparse-");
-    let output = Command::new(env!("CARGO_BIN_EXE_ozy_timed_bench"))
+    let output = Command::new(env!("CARGO_BIN_EXE_ozzy_timed_bench"))
         .args([
             "--processes",
             "--network-ingress",
@@ -157,7 +157,7 @@ fn sparse_scheduled_writers_confirm_without_filling_the_request_records() {
 #[test]
 fn excessive_scheduled_backlog_fails_instead_of_reducing_the_offered_rate() {
     let storage = support::storage("native-overload-");
-    let output = Command::new(env!("CARGO_BIN_EXE_ozy_timed_bench"))
+    let output = Command::new(env!("CARGO_BIN_EXE_ozzy_timed_bench"))
         .args([
             "--processes",
             "--network-ingress",
@@ -205,7 +205,7 @@ fn native_modes_have_live_verified_readers_and_exact_confirmation_boundaries() {
         ("replicated-persisting", 2, "quorum_replicated_persisting"),
     ] {
         for size in ["128", "1024"] {
-            let mut command = Command::new(env!("CARGO_BIN_EXE_ozy_timed_bench"));
+            let mut command = Command::new(env!("CARGO_BIN_EXE_ozzy_timed_bench"));
             command.args([
                 "--processes",
                 "--network-ingress",
@@ -350,7 +350,7 @@ fn check_protocol_requests(row: &serde_json::Value, size: u64) {
 #[test]
 fn disk_quorum_admits_replication_with_sixteen_readers() {
     let storage = support::storage("native-readers-");
-    let output = Command::new(env!("CARGO_BIN_EXE_ozy_timed_bench"))
+    let output = Command::new(env!("CARGO_BIN_EXE_ozzy_timed_bench"))
         .args([
             "--processes",
             "--network-ingress",
@@ -431,7 +431,7 @@ fn invalid_timed_arguments_fail_without_valid_output() {
         ],
         vec!["--streaming", "--duration", "5", "--codec", "lz4"],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_ozy_timed_bench"))
+        let output = Command::new(env!("CARGO_BIN_EXE_ozzy_timed_bench"))
             .args(["--processes", "--network-ingress"])
             .args(extra)
             .output()
@@ -444,7 +444,7 @@ fn invalid_timed_arguments_fail_without_valid_output() {
 #[test]
 fn single_durable_partitions_split_across_application_threads() {
     let storage = support::storage("native-shards-");
-    let output = Command::new(env!("CARGO_BIN_EXE_ozy_timed_bench"))
+    let output = Command::new(env!("CARGO_BIN_EXE_ozzy_timed_bench"))
         .args([
             "--processes",
             "--network-ingress",
@@ -517,7 +517,7 @@ fn payload_compression_is_decoded_and_verified_by_native_readers() {
         ("replicated-persisting", "4096", "--random-payload"),
         ("replicated-persisting", "8192", "--json-payload"),
     ] {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_ozy_timed_bench"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ozzy_timed_bench"));
         command
             .args([
                 "--processes",
@@ -652,7 +652,7 @@ exec sh -c "$1"
     std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
     let cpus = ozzy_bench::automation::isolation::cpus(None).unwrap();
     let masks: Vec<_> = (0..3).map(|i| vec![cpus[i % cpus.len()]]).collect();
-    let executable = env!("CARGO_BIN_EXE_ozy_timed_bench");
+    let executable = env!("CARGO_BIN_EXE_ozzy_timed_bench");
     let mut remote_executable = std::path::PathBuf::from(executable);
     if mode == "mismatch" {
         use std::io::Write;

@@ -43,7 +43,7 @@ fn cli_local_identity_provisioning_never_opens_or_creates_partition_storage() {
     )
     .unwrap();
     let run = |args: &[&std::ffi::OsStr]| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_ozy_broker"))
+        std::process::Command::new(env!("CARGO_BIN_EXE_ozzy_broker"))
             .arg("--config")
             .arg(&config)
             .args(args)

@@ -22,7 +22,7 @@ for the full broker and SDK gates.
 Run sustained workloads with the same production harness:
 
 ```sh
-scripts/ozzy_cargo run -p ozzy-sim --features broker --bin ozy_sim -- \
+scripts/ozzy_cargo run -p ozzy-sim --features broker --bin ozzy_sim -- \
   --mode replicated-persisting --seed 42 --duration 28800 \
   --interval-ms 10 --progress-timeout 30 \
   --artifacts /mnt/ssd/tmp/ozzy-sim-rp-42

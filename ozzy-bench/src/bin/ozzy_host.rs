@@ -82,7 +82,7 @@ fn watch(implementation: &str, directory: &std::path::Path) -> Result<()> {
     let mut seen = std::collections::BTreeMap::new();
     loop {
         for row in isolation::processes()? {
-            if row["executable"] == "ozy_host" {
+            if row["executable"] == "ozzy_host" {
                 continue;
             }
             let args = row["arguments"]
@@ -90,7 +90,7 @@ fn watch(implementation: &str, directory: &std::path::Path) -> Result<()> {
                 .ok_or("missing process arguments")?;
             let valid = match implementation {
                 "ozzy" => {
-                    row["executable"] == "ozy_timed_bench"
+                    row["executable"] == "ozzy_timed_bench"
                         && args.iter().any(|v| v == "--worker-index")
                 }
                 "iggy" => row["executable"] == "iggy-server",

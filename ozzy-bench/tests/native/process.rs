@@ -180,7 +180,7 @@ impl Worker {
         ];
         control.append(&mut arguments);
         Ok(Self(
-            std::process::Command::new(env!("CARGO_BIN_EXE_ozy_timed_bench"))
+            std::process::Command::new(env!("CARGO_BIN_EXE_ozzy_timed_bench"))
                 .args(arguments)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())

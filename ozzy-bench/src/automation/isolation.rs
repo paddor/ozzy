@@ -11,9 +11,9 @@ use std::{
 /// Result-row identifier for the required benchmark isolation contract.
 pub const CONTRACT: &str = "fresh-server-per-case; no-other-broker-resident; process-group-audit";
 const BENCHMARKS: &[&str] = &[
-    "ozy_timed_bench",
-    "ozy_segment_verify_bench",
-    "ozy_lz4_dict_bench",
+    "ozzy_timed_bench",
+    "ozzy_segment_verify_bench",
+    "ozzy_lz4_dict_bench",
 ];
 const COMPETITORS: &[&str] = &[
     "dd",
@@ -27,10 +27,10 @@ const COMPETITORS: &[&str] = &[
     "perf",
     "heaptrack",
     "strace",
-    "ozy_chart",
-    "ozy_compare",
-    "ozy_workloads",
-    "ozy_profile",
+    "ozzy_chart",
+    "ozzy_compare",
+    "ozzy_workloads",
+    "ozzy_profile",
 ];
 const SERVERS: &[&str] = &["iggy-server", "redpanda", "java"];
 
@@ -61,8 +61,7 @@ pub fn pin(pid: Option<u32>, cpus: &[usize]) -> Result<()> {
 fn inspect(path: &Path) -> Result<Option<Value>> {
     let comm = fs::read_to_string(path.join("comm"))?;
     let comm = comm.trim();
-    if !comm.starts_with("ozy_")
-        && !comm.starts_with("ozzy_")
+    if !comm.starts_with("ozzy_")
         && !comm.starts_with("ozzy-")
         && !comm.starts_with("omq_")
         && !BENCHMARKS
@@ -116,8 +115,7 @@ fn inspect(path: &Path) -> Result<Option<Value>> {
     } else {
         name.to_owned()
     };
-    if !name.starts_with("ozy_")
-        && !name.starts_with("ozzy_")
+    if !name.starts_with("ozzy_")
         && !name.starts_with("omq_")
         && !BENCHMARKS.contains(&name.as_str())
         && !COMPETITORS.contains(&name.as_str())
@@ -295,9 +293,9 @@ impl Guard {
             } else {
                 (name
                     == if self.implementation == "lz4-dictionary" {
-                        "ozy_lz4_dict_bench"
+                        "ozzy_lz4_dict_bench"
                     } else {
-                        "ozy_timed_bench"
+                        "ozzy_timed_bench"
                     }
                     || self.profiled && matches!(name, "perf" | "heaptrack" | "strace"))
                     && process["group"] == group
@@ -369,7 +367,7 @@ mod tests {
             ("rustc", "rustc", "rustc"),
             ("ozzy_test_all", "bash", "ozzy_test_all"),
             ("ozzy-timed-bench", "ozzy-timed-bench", "ozzy_timed_bench"),
-            ("ozy_timed_bench", "ozy_timed_bench", "ozy_timed_bench"),
+            ("ozzy_timed_benc", "ozzy_timed_bench", "ozzy_timed_bench"),
         ] {
             let root = tempfile::tempdir().unwrap();
             let process = root.path().join("123");

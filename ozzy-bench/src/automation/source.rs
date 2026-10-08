@@ -101,7 +101,7 @@ pub fn worker_checkout(directory: &Path) -> Result<Value> {
             && (!name.starts_with("ozzy-bench/src/automation/")
                 || name == "ozzy-bench/src/automation/mod.rs")
             && (!name.starts_with("ozzy-bench/src/bin/")
-                || name == "ozzy-bench/src/bin/ozy_timed_bench.rs"
+                || name == "ozzy-bench/src/bin/ozzy_timed_bench.rs"
                 || name.starts_with("ozzy-bench/src/bin/timed_bench/"))
     })?;
     value.as_object_mut().unwrap().remove("status");
@@ -194,7 +194,7 @@ pub fn workload_fingerprint(root: &Path) -> Result<String> {
             if path.is_dir() {
                 visit(&path, paths)?;
             } else if path.extension().is_some_and(|e| e == "rs")
-                && path.file_name().is_some_and(|n| n != "ozy_chart.rs")
+                && path.file_name().is_some_and(|n| n != "ozzy_chart.rs")
                 && !path.components().any(|c| c.as_os_str() == "chart")
             {
                 paths.insert(path);

@@ -206,8 +206,11 @@ fn ready(config: &Config, worker: &BrokerWorker, broker: &ozzy_broker::Broker) -
             "observed_threads": {
                 "application": count(|name| name.starts_with("ozzy_app-")),
                 "dispatcher": count(|name| name == "ozzy_dispatch"),
-                "omq_io": count(|name| name.starts_with("ozy/omq/IO/")),
-                "omq_control": count(|name| name == "ozy/omq/Control"),
+                // Published OMQ 0.25 shortens the prefix for multiple IO threads.
+                "omq_io": count(|name| name.starts_with("ozzy/omq/IO/")
+                    || name.starts_with("ozzy/om/IO/")),
+                "omq_control": count(|name| matches!(name,
+                    "ozzy/omq/Ctrl" | "ozzy/om/Control")),
                 "backend": count(|name| name.starts_with("ozzy_io-")),
                 "process_total": threads.len(),
             },

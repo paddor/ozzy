@@ -15,6 +15,6 @@ async fn main() -> bench::Result<()> {
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
-    eprintln!("ozy_timed_bench requires Linux CPU and peak-RSS accounting");
+    eprintln!("ozzy_timed_bench requires Linux CPU and peak-RSS accounting");
     std::process::exit(1);
 }

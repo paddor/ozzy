@@ -80,9 +80,9 @@ pub fn copy(placement: &Placement, local: &Path, destination: &Path) -> Result<(
 /// Capture host, storage, process, and optional process-affinity evidence.
 pub fn inspect(placement: &Placement, pid: Option<u32>) -> Result<Value> {
     let binary = if placement.remote.is_some() {
-        remote_root(placement)?.join("ozy_host")
+        remote_root(placement)?.join("ozzy_host")
     } else {
-        super::build_target(&super::root()).join("release/ozy_host")
+        super::build_target(&super::root()).join("release/ozzy_host")
     };
     let mut script = format!(
         "{} inspect --storage {}",
@@ -109,7 +109,7 @@ pub fn idle(placements: &[Placement; 3]) -> Result<Value> {
             .as_array()
             .ok_or("missing remote processes")?
             .iter()
-            .any(|p| p["executable"] != "ozy_host")
+            .any(|p| p["executable"] != "ozzy_host")
         {
             return Err(format!("remote processes still resident: {}", row["processes"]).into());
         }
@@ -119,13 +119,13 @@ pub fn idle(placements: &[Placement; 3]) -> Result<Value> {
 }
 /// Install the native worker and optional Iggy binary on remote placements.
 pub fn deploy(placements: &[Placement; 3], native: &Path, iggy: bool) -> Result<()> {
-    let helper = super::build_target(&super::root()).join("release/ozy_host");
+    let helper = super::build_target(&super::root()).join("release/ozzy_host");
     for p in placements.iter().filter(|p| p.remote.is_some()) {
         let root = remote_root(p)?;
         run(p, &format!("mkdir -p {}", quote(&root.to_string_lossy())))?;
         let mut files = vec![
             (native.to_path_buf(), p.remote.as_ref().unwrap().1.clone()),
-            (helper.clone(), root.join("ozy_host")),
+            (helper.clone(), root.join("ozzy_host")),
         ];
         if iggy {
             files.push((super::server::build::binary(), root.join("iggy-server")));
@@ -184,7 +184,7 @@ impl Audit {
         let log = artifacts.join("remote-audit.stderr");
         let script = format!(
             "exec taskset -c 5 {} watch --implementation {} --directory {}",
-            quote(&remote_root(p)?.join("ozy_host").to_string_lossy()),
+            quote(&remote_root(p)?.join("ozzy_host").to_string_lossy()),
             quote(implementation),
             quote(&directory.to_string_lossy())
         );

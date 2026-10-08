@@ -29,7 +29,7 @@ impl WriterRuntime {
     pub fn new() -> std::io::Result<Self> {
         let mut config = ContextConfig::from_env();
         config.io_threads = config.io_threads.max(1);
-        let context = Context::with_config_and_name(config, "ozy/omq");
+        let context = Context::with_config_and_name(config, "ozzy/omq");
         Self::with_context(context)
     }
 
@@ -37,7 +37,7 @@ impl WriterRuntime {
     /// and independent SDK owners can share transport without sharing role state.
     pub fn with_context(context: Context) -> std::io::Result<Self> {
         let stop = CloseSignal::default();
-        let (sdk, thread) = start("ozy/sdk", stop.clone())?;
+        let (sdk, thread) = start("ozzy/sdk", stop.clone())?;
         Ok(Self(Arc::new(Inner {
             context,
             sdk,

@@ -568,7 +568,7 @@ fn verify_build(
         saved["worker_inputs"] == *worker_inputs
     };
     if !inputs_match || saved["executable_sha256"] != executable {
-        return Err("profile build stamp differs; run ozy_compare --check-only first".into());
+        return Err("profile build stamp differs; run ozzy_compare --check-only first".into());
     }
     Ok(())
 }
@@ -853,7 +853,7 @@ mod tests {
             "taskset".into(),
             "-c".into(),
             "0,1".into(),
-            "/another/checkout/release/ozy_timed_bench".into(),
+            "/another/checkout/release/ozzy_timed_bench".into(),
             "--system".into(),
             "single-durable".into(),
             "--duration".into(),

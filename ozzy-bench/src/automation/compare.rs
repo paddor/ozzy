@@ -662,9 +662,9 @@ fn build(args: &Args, directory: &Path) -> Result<PathBuf> {
             "--features",
             "comparisons",
             "--bin",
-            "ozy_timed_bench",
+            "ozzy_timed_bench",
             "--bin",
-            "ozy_host",
+            "ozzy_host",
         ],
     ];
     if args.checks == Checks::Focused {

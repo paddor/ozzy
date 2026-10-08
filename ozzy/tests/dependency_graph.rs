@@ -125,15 +125,9 @@ fn executable_names_identify_ozzy_and_all_integration_tests_are_registered() {
     for package in metadata["packages"].as_array().unwrap() {
         let targets = package["targets"].as_array().unwrap();
         for target in targets {
-            // Binaries fit the 15-character kernel process name.
-            let prefix = if target["kind"] == serde_json::json!(["bin"]) {
-                "ozy_"
-            } else {
-                "ozzy_"
-            };
             if target["kind"] != serde_json::json!(["lib"]) {
                 assert!(
-                    target["name"].as_str().unwrap().starts_with(prefix),
+                    target["name"].as_str().unwrap().starts_with("ozzy_"),
                     "unprefixed executable: {target}"
                 );
             }

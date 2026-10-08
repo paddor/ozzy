@@ -1,27 +1,20 @@
+<p align="center">
+  <img src="doc/ozzy-logo.webp" alt="Ozzy the ocelot" width="256" />
+</p>
+
 # Ozzy
 
-Messaging and replicated logs over OMQ.
+Durable message streaming over OMQ.
 
-## Install
+Build and start a broker with the [getting started guide](GETTING_STARTED.md).
+It covers provisioning, containers, and three-broker deployments. Rust 1.93+
+is required.
 
-Install the broker with Rust 1.93 or newer:
-
-```sh
-cargo install ozzy-broker --version 0.1.0 --locked --bin ozy_broker
-```
-
-Provide a deployment TOML and explicitly initialize its identity, volumes, and
-segment stores before serving. See [broker startup](ozzy-broker/README.md).
-
-Applications use the native producer and consumer SDK:
-
-```toml
-[dependencies]
-ozzy = "0.1.0"
-```
+Applications use the [native Rust producer and consumer SDK](ozzy/README.md).
 
 ## Start here
 
+- [Getting started](GETTING_STARTED.md)
 - [Rust API and example](ozzy/README.md)
 - [Technical overview](doc/OVERVIEW.md)
 - [Producer record flow](doc/OVERVIEW.md#producer-to-broker)

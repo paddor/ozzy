@@ -49,7 +49,7 @@ ozzy-runtime = { workspace = true, features = ["simulation"] }
 workspace = true
 
 [[bin]]
-name = "ozy_broker"
+name = "ozzy_broker"
 path = "src/main.rs"
 
 [[test]]

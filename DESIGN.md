@@ -68,7 +68,7 @@ tracked docs. Reserved commands do not imply an implemented public service.
 | `ozzy-bench` | Serial workloads, profiling, append-only result ledger, SVG charts |
 
 The simulator's base library depends only on the canonical core and journal.
-Its optional `broker` feature assembles the full product harness and `ozy_sim`
+Its optional `broker` feature assembles the full product harness and `ozzy_sim`
 runner. Product libraries never depend on this harness outside dev dependencies.
 
 ## Integration boundaries
