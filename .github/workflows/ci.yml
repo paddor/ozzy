@@ -5,6 +5,7 @@ on:
     branches:
       - main
   pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
@@ -66,3 +67,6 @@ jobs:
           path: ozzy
       - uses: ./ozzy/.github/actions/setup
       - run: ./scripts/ozzy_cargo publish --workspace --exclude ozzy-bench --exclude ozzy-sim --dry-run --locked
+        env:
+          # Cargo caches staged registry dependencies as immutable at each version.
+          CARGO_TARGET_DIR: /mnt/ssd/tmp/ozzy-publish-${{ github.run_id }}-${{ github.run_attempt }}
