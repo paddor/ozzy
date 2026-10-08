@@ -100,6 +100,12 @@ impl Journal {
         positions: [crate::LogPosition; 2],
     ) -> Result<(), DirectoryError> {
         let durable = position_before(self.writer.durable_position().next_chain())?;
+        // The writer already validated and synchronized this exact boundary.
+        // Publishing its metadata is not another whole-history scrub. Cold
+        // positions still require the physical lineage validation below.
+        if positions.iter().all(|position| *position == durable) {
+            return Ok(());
+        }
         if let Some(position) = positions
             .iter()
             .find(|position| position.op_number > durable.op_number)

@@ -1,7 +1,7 @@
 # ozzy-config
 
 Typed deployment TOML and pure validation. No filesystem or runtime dependency.
-See [runtime configuration](../doc/RUNTIME.md#deployment-configuration).
+See [runtime configuration](https://github.com/paddor/ozzy/blob/main/doc/RUNTIME.md#deployment-configuration).
 
 - `Deployment::parse(...).validate()` checks names, membership, policies,
   roots, topology and resource budgets. Unknown fields fail, including
@@ -21,7 +21,7 @@ Topics default to 16 numeric partitions. Keyed placement uses
 Default single-broker fixture: [single.toml](tests/fixtures/single.toml).
 
 This crate does not initialize segment journals or start a broker. The
-[`ozzy-broker` startup commands](../ozzy-broker/README.md) own file publication
+[`ozzy-broker` startup commands](https://github.com/paddor/ozzy/blob/main/ozzy-broker/README.md) own file publication
 and effective host discovery. Identity records have an integrity checksum;
 decoding alone is not sufficient deployment validation.
 

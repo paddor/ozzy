@@ -1,5 +1,7 @@
 //! Source-anchored streaming: bounded selection cache, one transfer, one arena.
 
+mod bridge;
+
 use crate::replica_actor::HistoryReason;
 use ozzy_replication::wire::{FetchOps, OpsBatch};
 use ozzy_replication::{Digest, OpNumber};
@@ -16,6 +18,8 @@ pub(super) struct Lookup {
     scope: Option<Scope>,
     entries: [Option<(LogSource, Prefix)>; 6],
     unavailable: Option<(LogSource, OpNumber)>,
+    bridge: Option<bridge::Bridge>,
+    compatible: Option<(LogSource, LogSource)>,
 }
 
 impl Lookup {
@@ -24,6 +28,8 @@ impl Lookup {
             self.scope = Some(scope);
             self.entries.fill(None);
             self.unavailable = None;
+            self.bridge = None;
+            self.compatible = None;
         }
     }
 
@@ -85,9 +91,9 @@ impl ReplicaActor {
         position: &crate::replica_journal::HistoryPosition,
     ) -> Result<(), ActorError> {
         if let Some(prefix) = position.position {
-            self.lookup.insert(position.source, prefix)?;
+            self.lookup.verified(position.source, prefix)?;
         } else if position.op < position.retained_predecessor.op {
-            self.lookup.retire(position.source, position.op);
+            self.bridge_or_retire(position.source, position.op, position.retained_predecessor);
         } else {
             return Err(ActorError::history(HistoryReason::Lookup));
         }
@@ -276,7 +282,7 @@ impl ReplicaActor {
                     }
                 }
                 if batch.end() == transfer.request.source.accepted {
-                    self.lookup.insert(
+                    self.lookup.verified(
                         batch.source(),
                         found.ok_or_else(|| ActorError::history(HistoryReason::Lookup))?,
                     )?;
@@ -471,7 +477,8 @@ impl ReplicaActor {
                 {
                     if notice.before.op == transfer.request.source.accepted.op {
                         if notice.before == transfer.request.source.accepted {
-                            self.lookup.insert(transfer.request.source, notice.before)?;
+                            self.lookup
+                                .verified(transfer.request.source, notice.before)?;
                             self.transfer = None;
                         }
                         return Ok(());
@@ -493,10 +500,7 @@ impl ReplicaActor {
                         local.voter == self.local && local.accepted.op >= notice.before.op
                     })
                 {
-                    // A third report can protect a prefix the donor retired.
-                    // Keep every ancestry check pending and let the ordinary
-                    // election deadline advance; this requester is not expired.
-                    self.lookup.retire(transfer.request.source, op);
+                    self.bridge_or_retire(transfer.request.source, op, notice.before);
                     self.transfer = None;
                 } else {
                     self.recovery_required = true;

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Fix retention after broker restart and recovery across retired history.
+- Fence stale recovery donors and preserve the first broker failure on shutdown.
+- Remove the producer driver's shared reply-receiver lock; retain synchronized
+  confirmation and failure publication.
+- Extend the inproc simulator with churn, storage faults, and verified-progress
+  monitoring; allow bounded storage pauses throughout a workload boundary.
+- Automate release PRs and crates.io trusted publishing; shorten reference docs.
+
 ## 0.1.0 - 2026-10-07
 
 Initial release of the Ozzy broker and native Rust producer and consumer SDKs.

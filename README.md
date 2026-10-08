@@ -21,5 +21,6 @@ Applications use the [native Rust producer and consumer SDK](ozzy/README.md).
 - [Consumer record flow](doc/OVERVIEW.md#broker-to-consumer)
 - [Architecture and reference docs](DESIGN.md)
 - [Build, test, and contribute](DEVELOPMENT.md) (Rust 1.93+)
+- [Release process](RELEASING.md)
 - [Benchmark commands and measurement boundaries](ozzy-bench/README.md)
 - [Benchmark charts](BENCHMARKS.md)

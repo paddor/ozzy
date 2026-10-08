@@ -3,7 +3,10 @@ use crate::index_builder::asynchronous::{self, Builder, Limits};
 use crate::{IndexBuildLimits, IndexLimits, IndexSource, SegmentIndex, segment_index_name};
 
 impl Journal {
-    fn index_source(&self, id: u64) -> Result<(SegmentReference, IndexSource), DirectoryError> {
+    pub(super) fn index_source(
+        &self,
+        id: u64,
+    ) -> Result<(SegmentReference, IndexSource), DirectoryError> {
         let at = self
             .manifest
             .segments

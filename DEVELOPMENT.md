@@ -2,15 +2,10 @@
 
 Ozzy requires Rust 1.93 or newer.
 
-CI checks out published OMQ and fanring revisions as sibling directories and
-uses the same workspace check scripts. Formatting and Clippy must pass before
-tests, the MSRV check, or the crates.io publishing dry run start. The dry run
-packages and builds the twelve release crates without uploading them. CI runs
-once per PR update and on pushes to main, cancels superseded PR runs, and uses
-generic x86_64 codegen.
-
-PR/main use Nextest `ci`; weekly/manual `Extended` runs stress tests and Loom
-(Sunday 03:00 UTC).
+CI uses published OMQ/fanring revisions and generic x86_64 codegen. Formatting
+and Clippy gate tests, MSRV, and the twelve-crate publishing dry run. PR/main use
+Nextest `ci`; weekly/manual `Extended` runs stress tests and Loom (Sunday 03:00 UTC).
+See [RELEASING.md](RELEASING.md) for release PRs and trusted publishing.
 
 ## Local check
 
@@ -167,7 +162,8 @@ taskset -c 4,5 cargo test -p ozzy-broker --test ozzy_broker_config \
 
 The workload verifies every confirmed record/offset, releases verified oracle
 payloads, churns saved producer/consumer identities, repairs slow-reader gaps,
-and checks checkpoint replay. Sparse, burst, hot-partition, mixed-size, and empty
+and checks checkpoint replay and expired-checkpoint retention gaps. Sparse,
+burst, hot-partition, mixed-size, and empty
 multipart traffic rotate with SIGKILL/orderly restart. Unclean RP copies are
 quarantined for recovery. Process failure or 30 seconds without completion fails
 the run. These are process-crash tests, not power-loss tests.

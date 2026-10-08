@@ -11,10 +11,18 @@ use ozzy_runtime::replicated::{
     RetryPolicy, SdkClock, SharedTopicPendingRecord, SharedTopicWriter, SharedTopicWriterConfig,
     TopicCheckpoint, TopicReader, TopicReaderConfig, WriterRuntime,
 };
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 mod consumers;
+mod progress;
 mod workload;
+pub use progress::{ProgressTimeout, progress_timeout};
 
 /// Production SDK client with an independent bounded record and offset oracle.
 pub struct Client {
@@ -29,6 +37,7 @@ pub struct Client {
     next_sequences: Vec<u64>,
     submitted: Vec<Submitted>,
     policy: Policy,
+    verified: Arc<AtomicU64>,
 }
 
 /// Admitted observation paired with independently retained record evidence.
@@ -158,6 +167,7 @@ impl Client {
             next_sequences: vec![0; partitions],
             submitted: Vec::new(),
             policy,
+            verified: Arc::default(),
         }
     }
 
@@ -227,6 +237,7 @@ impl Client {
             bases: self.bases,
             policy: self.policy,
             submitted: self.submitted,
+            verified: self.verified,
         }
     }
 
@@ -473,6 +484,12 @@ impl Client {
         assert_eq!(&record.message_id, id);
         assert_eq!(record.payload.as_slice(), body.as_slice());
         positions[partition] += 1;
+        self.verified.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Independent delivery verification count, preserved across SDK churn.
+    pub fn verified_progress(&self) -> Arc<AtomicU64> {
+        self.verified.clone()
     }
 
     /// Close producer admission and join the real SDK links.
@@ -499,6 +516,7 @@ impl Client {
     /// Independently submitted and confirmed identities and opaque payload parts.
     /// Outstanding submissions do not constitute confirmation evidence.
     pub fn evidence(&self) -> serde_json::Value {
+        let routes = self.links.routes(self.writer.metadata().clone());
         let records = |id: &MessageId, parts: &[Bytes]| {
             serde_json::json!({
                 "id": id.as_bytes(), "parts": parts.iter().map(Bytes::as_ref).collect::<Vec<_>>()
@@ -507,12 +525,18 @@ impl Client {
         serde_json::json!({
             "producer": format!("{:?}", self.writer.identity()),
             "bases": self.bases, "next_sequences": self.next_sequences,
+            "sdk": (0..self.keys.len()).map(|partition| serde_json::json!({
+                "partition": partition,
+                "route": format!("{:?}", routes.as_ref().map(|routes| routes.route(partition as u32))),
+                "stats": format!("{:?}", self.writer.partition_stats(partition as u32)),
+            })).collect::<Vec<_>>(),
             "confirmed": self.history.iter().map(|history| history.iter()
                 .map(|(id, parts)| records(id, parts)).collect::<Vec<_>>()).collect::<Vec<_>>(),
             "submitted": self.submitted.iter().map(|submitted|
                 serde_json::json!({"producer":submitted.producer.as_bytes(),
                     "partition":submitted.partition,"sequence":submitted.sequence,
-                    "record":records(&submitted.id, &submitted.parts)})).collect::<Vec<_>>()
+                    "record":records(&submitted.id, &submitted.parts)})).collect::<Vec<_>>(),
+            "verified_deliveries": self.verified.load(Ordering::Relaxed)
         })
     }
 }

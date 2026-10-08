@@ -58,15 +58,16 @@ Four input lanes and separate data/control output ports have count/byte bounds.
 Completion IDs remain in a bounded owner table. Dropping observers does not
 cancel admitted work.
 
-`BrokerLinks` shares session/transport code between SDK roles. Two PEER sockets
-connect every configured broker; live readers add one SUB/broker. Discovery
-tries brokers under one deadline and returns the first complete validated
-catalog. Pages never mix donors. Replacement sessions restart paging at zero;
-late replies retain their request/session fences.
+`BrokerLinks` shares SDK session/transport code: two PEER sockets across all
+brokers, plus one SUB/broker for live readers. Discovery returns the first
+complete validated catalog under one deadline. Pages keep one donor; replacement
+sessions restart at page zero and fence late replies.
 
-Ordinary deadlines use monotonic time; append/retention timestamps use Unix time.
-Injected simulation clocks control both independently of storage execution and
-completion delivery.
+Each producer driver owns and drains its APPEND reply receiver. Readiness waits
+do not consume replies; retained frame leases still hold admission until release.
+
+Deadlines use monotonic time; append/retention timestamps use Unix time.
+Simulation clocks control both independently of storage execution/completion.
 
 ## Confirmation boundaries
 
@@ -78,9 +79,9 @@ completion delivery.
 
 ### Replicated confirmation with background persistence
 
-RP retains canonical backing until application and physical writing permit
-release. A full backlog backpressures admission. Unclean restart is nonvoting
-until recovery; RAM confirmation supplies no durable-prefix evidence.
+RP retains backing until application and physical writing permit release;
+a full backlog backpressures admission. Unclean restart stays nonvoting until
+recovery. RAM confirmation supplies no durable-prefix evidence.
 
 Donor pinning waits for captured writes and its independent barrier, then freezes
 one source per recovery nonce. Repeated requests reuse that snapshot. Link loss,
@@ -90,10 +91,10 @@ Busy history reads keep the original correlated request available for retry.
 
 ### Local durable pipeline
 
-Validation assigns offsets and freezes canonical operations. The journal
-prepares groups, installs ordered writes, publishes durable evidence, and applies
-confirmed records. A storage wait leaves other partitions runnable. A ready
-batch blocked on backing is installed before later work once capacity returns.
+Validation assigns offsets and freezes operations. The journal prepares groups,
+installs ordered writes, publishes durable evidence, then applies records.
+Storage waits leave other partitions runnable; a backing-blocked ready batch
+keeps its position when capacity returns.
 
 ## Writer API
 
@@ -144,20 +145,18 @@ transport aliases release backing. All remain separately charged.
 
 ## Readers
 
-SUBSCRIBE resolves a selector once and opens an indexed confirmed-history cursor.
-At the applied end it parks until append, source change, or buffer release.
-Reconnect uses the next undelivered offset. Readers do not extend retention.
+| Event | Behavior |
+| --- | --- |
+| SUBSCRIBE | Resolve selector once; open indexed confirmed-history cursor |
+| Applied end | Park until append, source change, or buffer release |
+| Reconnect / PEER gap | Resume next undelivered offset; gaps use a fresh subscription generation |
+| Full SDK inbox | Retain frame and pause exact source; connection-sharing readers share pressure |
+| SUBSCRIBED / UNSUBSCRIBED | Become bounded cursor completions before releasing raw control admission |
+| Detached cancellation | Keep original session; disconnect/replacement settles locally; a lost original-session reply times out |
 
 RECORDS uses data PEER; subscription, cancellation, ACK, and NACK use control.
-A full SDK inbox retains the frame and pauses its exact source. Readers sharing
-a connection share its pressure. SUBSCRIBED/UNSUBSCRIBED become bounded cursor
-completions before raw control-frame admission returns, so idle readers cannot
-pin producer control capacity.
-
-Detached cancellation keeps the original session. Disconnect/replacement settles
-cleanup locally without waiting for new capacity; a lost reply on the original
-session still times out. PEER gaps reopen with a fresh subscription generation.
-ACK is volatile observation, not capacity or durable processing progress.
+Idle readers cannot pin producer control capacity. Readers do not extend
+retention; ACK observes volatile delivery, not durable application processing.
 
 ### Live reader publication
 
@@ -212,13 +211,13 @@ receive sources. Ozzy admission does not query transport liveness.
 
 ### Async storage
 
-Backends own handles, buffers, physical admission, and execution. Shards install
-ordered generation-matching completions and execute no filesystem calls.
-Admission includes queued, running, and canceled-but-unsettled jobs. One AIO
-owner/device uses fixed helpers for open/read/sync/rename/close and reserved
-progress. Pool execution uses the same contract.
+Backends own handles, buffers, admission, and execution. Shards install ordered,
+generation-matching completions without filesystem calls. Queued, running, and
+canceled-but-unsettled jobs remain charged. One AIO owner/device uses fixed file
+helpers and reserved progress; the pool backend obeys the same contract.
 
-Frontend/shards share one shutdown request and separate completion/error state.
+Frontend/shards share one shutdown request and the first failure, with separate
+completion state. Failure is published before queues and sockets close.
 Both observe shutdown before lanes close; unexpected service-time closure is
 fatal. Shutdown drains journals, transport, and backend workers.
 

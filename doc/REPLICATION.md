@@ -17,11 +17,10 @@ All three brokers store every partition. Initial persisted membership order
 spreads leaders; shard placement is local. Hints, endpoint changes, and shard IDs
 grant no authority. Routing IDs require an independently trusted peer binding.
 
-Replicated `CONFIGURATION` is 256 bytes; local configuration is 128 bytes. Both
-bind identity, policy, protocol/schema, and integrity profile and reject each
-other's encoding. Formatting synchronizes immutable configuration under the
-store lock. Missing, altered, or malformed configuration fails closed. Roll,
-retention, and suffix replacement never change membership.
+Replicated/local `CONFIGURATION` is 256/128 bytes. Both bind identity, policy,
+protocol/schema, and integrity profile; cross-mode decoding fails. Formatting
+synchronizes configuration under the store lock. Missing or invalid configuration
+fails closed; roll, retention, and suffix replacement cannot change membership.
 
 ## Single-broker authority
 
@@ -143,18 +142,20 @@ followers. Older repair uses indexed journal reads from a captured generation
 and prefix. Capacity exhaustion preserves the cursor and required size; scope,
 source, and predecessor fences remain valid while waiting.
 
-RP retains backing until application and completed writes release it. Full
-backlogs backpressure producers. Written and durable progress differ. Interrupted
-writes retry; short writes resume. Other write/writeback/sync errors fence the
-journal, including while idle. RAM confirmation cannot hide a stalled disk:
-written progress resets RP's storage deadline, durable progress resets DQ's.
-A stalled leader stops heartbeats and requests leader change.
+RP retains backing through application and completed writes; a full backlog
+backpressures producers. Interrupted/short writes retry/resume. Other
+write/writeback/sync errors fence the journal, including while idle.
 
-Before promising a new RP view, accepted history is flushed. Graceful shutdown
-closes admission, drains it, and publishes exact `MEMORY_VOTING` evidence.
-Unclean startup requires quarantine and recovery from both other normal brokers;
-old disk prefixes cannot prove absence of later RAM votes. Loss of every volatile
-copy can lose the unpersisted tail. An entirely unclean cluster remains fenced.
+| Event | Required behavior |
+| --- | --- |
+| Storage progress | RP deadline resets on written progress; DQ on durable progress |
+| Stalled leader | Stop heartbeats and request leader change |
+| New RP view promise | Flush accepted history first |
+| Graceful RP shutdown | Close admission, drain writes, publish exact `MEMORY_VOTING` evidence |
+| Unclean RP startup | Quarantine; recover from both other normal brokers |
+
+An old disk prefix cannot exclude later RAM votes. Losing every volatile copy
+can lose the unpersisted tail; an entirely unclean cluster remains fenced.
 
 ## Live fan-out
 
@@ -195,15 +196,18 @@ No force promotion, lower quorum, or confirmed-history discard is supported.
 ## Restart and recovery
 
 Intact reopen validates configuration, history, durable promises, and installed
-normal-view lineage, then uses a fresh incarnation and fenced election. A promise
-without installation grants no normal authority. Bootstrap creates a new group;
-it is never a missing-store fallback.
+lineage, then enters fenced election with a fresh incarnation. A promise without
+installation grants no authority. Bootstrap creates a new group explicitly.
 
 Lost, rolled-back, or ambiguous stores stay nonvoting. Fresh nonce-scoped replies
 from both other normal brokers, including the highest-view primary, authorize
 one frozen source. Tickets bind configuration, view, generation, accepted tail,
 and committed anchor. Accepted-only operations remain necessary because delayed
 pre-crash votes can still confirm them.
+
+The donor freezes its response when source pinning starts, after pending writes
+and maintenance settle. Before that point an unpublished candidate may refresh.
+Pinned and published responses remain immutable for their nonce.
 
 ```mermaid
 sequenceDiagram
@@ -228,11 +232,10 @@ sequenceDiagram
     Note over R,F: Recovery alone never restores same-view voting
 ```
 
-CONFIGURATION retains a nonvoting recovery marker until selected bytes/view
-metadata are synchronized and privately replayed. Atomic configuration
-publication and a live matching recovery core permit only fenced restart.
-A marker or checksum alone cannot restore voting. New authority invalidates
-old transfer work; admitted physical jobs still settle.
+CONFIGURATION stays nonvoting until selected bytes/view metadata are synchronized
+and privately replayed. Atomic publication plus a matching live recovery core
+permit fenced restart; a marker or checksum alone cannot restore voting.
+New authority invalidates transfers; admitted physical jobs still settle.
 
 Sealed-file repair uses the same two-broker authority and frozen donor. Validated
 local operations may be reused; original manifest boundaries and full private
@@ -254,10 +257,12 @@ Two matching replies can show its local prefix expired; it persists a nonvoting
 marker and recovers. These replies grant no authority. A bounded unanswered probe
 falls through to ordinary election.
 
-An ancient election report below a donor's retained boundary remains unverified.
-It cannot fault an intact donor or select missing ancestry. Ordinary election
-progress replaces the report; a requester withdraws only if its own history has
-expired.
+An older report below the selected source's retained boundary requires an
+overlapping frozen donor. Verify the older prefix against that donor's exact
+tail, then verify the same tail within the selected lineage. Only this complete
+proof permits ancestry lookup and reuse of a compatible local installation
+prefix. Missing or divergent overlap stays unverified; it grants no authority.
+A requester withdraws only if its own history has expired.
 
 Checkpoint recovery verifies private state, required retained operations, and the
 accepted suffix. The original committed anchor stays distinct. A destination

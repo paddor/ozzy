@@ -6,7 +6,7 @@ three-broker group in disk-quorum or replicated-persisting mode. OMQ handles
 message passing; Ozzy adds persistence, replication, and stream recovery.
 
 Requires Rust 1.93 or newer. Run a provisioned Ozzy broker separately;
-see [Getting started](../GETTING_STARTED.md).
+see [Getting started](https://github.com/paddor/ozzy/blob/main/GETTING_STARTED.md).
 
 This crate provides the native Rust producer and consumer SDKs. They share session
 code while retaining separate role state. `BrokerLinks` owns one data PEER and
@@ -57,7 +57,7 @@ async fn resume(links: &BrokerLinks, limits: DataLimits, saved: [u8; 32])
 }
 ```
 
-See [runtime contracts](../doc/RUNTIME.md#sdk-protocol-batching) for admission,
+See [runtime contracts](https://github.com/paddor/ozzy/blob/main/doc/RUNTIME.md#sdk-protocol-batching) for admission,
 resource bounds, and cancellation. The default payload target is 64 KiB with
 one outstanding APPEND. Collection is bounded by bytes, negotiated limits, and
 a hard 2,048-record ceiling; sparse sends have no artificial collection wait.
@@ -96,6 +96,6 @@ that configuration.
 `send` admits a record locally. Only `confirmed()` establishes the configured
 broker storage policy. Reader checkpoints are volatile receive positions; save
 them only after application processing. A checkpoint does not make application
-side effects transactional. See [runtime contracts](../doc/RUNTIME.md) for
-capacity and cancellation behavior and [design](../DESIGN.md) for deployment
+side effects transactional. See [runtime contracts](https://github.com/paddor/ozzy/blob/main/doc/RUNTIME.md) for
+capacity and cancellation behavior and [design](https://github.com/paddor/ozzy/blob/main/DESIGN.md) for deployment
 boundaries.

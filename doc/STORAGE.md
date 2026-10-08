@@ -279,6 +279,14 @@ may reuse only the exact settled checkpoint position/digest, revalidating author
 files, and protected floors. Surviving predecessor digests are never renumbered.
 Expired readers receive explicit gaps.
 
+Eligible retention debt continues in bounded turns with a foreground turn between
+steps. The periodic interval applies after catching up, not between retirements.
+Maintenance waits for partition creation before deciding whether retention is disabled.
+
+Retirement preserves the exact settled application state and refreshes identity
+coverage. Each owner validates sealed index sources once; reuse checks the index
+checksum/source binding. Reopen, explicit repair and scrub validate physical bytes.
+
 Age uses maximum segment append time; backward clocks cannot prematurely expire
 newer records. An aged active segment rolls first. Byte targets include active
 and sealed capacities per partition/broker. Each settled turn also reclaims up

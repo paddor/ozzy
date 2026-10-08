@@ -101,7 +101,7 @@ async fn main() {
                 .join(format!("scenario-{scenario}-seed-{}", scenario_config.seed));
         }
         match soak::run(&scenario_config).await {
-            Ok(report) => println!("seed {}: {report:?}", scenario_config.seed),
+            Ok(report) => println!("{}", serde_json::to_string(&report).expect("soak report")),
             Err(error) => {
                 eprintln!("{error}");
                 std::process::exit(1);

@@ -275,6 +275,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn either_broker_owner_preserves_the_first_failure_for_both_observers() {
+        for frontend_first in [false, true] {
+            let (application, frontend) = startup_groups(2);
+            let application = application.state();
+            let frontend = frontend.state();
+            let (first, later) = if frontend_first {
+                (&frontend, &application)
+            } else {
+                (&application, &frontend)
+            };
+            first.fail(StartupError::Frontend("original startup failure".into()));
+            later.fail(StartupError::Runtime("secondary stopped observer".into()));
+            for state in [&application, &frontend] {
+                assert!(matches!(
+                    state.result(),
+                    Err(StartupError::Frontend(reason)) if reason == "original startup failure"
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn either_broker_owner_requests_shutdown_before_the_other_can_observe_closed_queues() {
         for frontend_first in [false, true] {
             let (application, frontend) = startup_groups(2);

@@ -6,6 +6,63 @@ mod adapter;
 mod replicated;
 
 #[test]
+fn retirement_does_not_reread_unaffected_sealed_bodies() {
+    let (mut controller, io) = setup();
+    let (mut journal, mut driver) = seed(&mut controller, io, local_config());
+    roll(&mut controller, &mut journal);
+    append(&mut controller, &mut journal, &mut driver, 12, 4, 1);
+    let limits = journal.recovery.index;
+    let snapshot = drive(
+        &mut controller,
+        journal
+            .journal
+            .ready_mut()
+            .unwrap()
+            .build_index_snapshot(ozzy_journal_segment::JournalIndexBoundary::Written, limits),
+    )
+    .unwrap();
+    drop(snapshot);
+    let before = journal.images().unwrap().committed().clone();
+    let mut reread = false;
+    let mut unaffected = false;
+    let result = drive_except(
+        &mut controller,
+        journal.retire_confirmed_history(
+            driver.begin_validation().unwrap(),
+            CheckpointId::from_bytes([92; 16]),
+            AsyncRetirementBudget {
+                max_segments: 1,
+                max_read_bytes: 32768,
+            },
+        ),
+        None,
+        |operation| {
+            match operation {
+                Operation::Open { path, .. } => unaffected = path.ends_with("segments/3.log"),
+                Operation::Close { .. } => unaffected = false,
+                Operation::Read { offset, .. }
+                    if unaffected
+                        && *offset >= ozzy_journal_segment::SEGMENT_HEADER_BYTES as u64 =>
+                {
+                    reread = true;
+                    return Effect::FailBefore(io::ErrorKind::Other);
+                }
+                _ => {}
+            }
+            Effect::Normal
+        },
+    );
+    assert!(
+        !reread,
+        "one-segment retirement reread an unaffected sealed body"
+    );
+    assert_eq!(result.unwrap().unreferenced_segment_ids, [1]);
+    assert_eq!(journal.images().unwrap().committed(), &before);
+    verify_retained(&mut controller, &mut journal, &driver);
+    drive(&mut controller, journal.shutdown()).unwrap();
+}
+
+#[test]
 fn repeated_retirement_reuses_the_exact_checkpoint_without_new_operations() {
     let (mut controller, io) = setup();
     let config = local_config();

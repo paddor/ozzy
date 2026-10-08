@@ -10,12 +10,9 @@ delivery. The broker provisions those actors and connects them to shared
 asynchronous storage backends. The fixed-three replication core and canonical
 journal state live in separate crates.
 
-Broker integration uses `ReplicaJournal<ShardJournal>`, shared topic SDKs,
-and the shared frontend. Dispatcher/shard work uses separate data/control OMQ
-inproc lanes with bounded turns. SDK caller lanes and backend jobs/completions
-still use local typed rings; storage sockets are not implemented. Partition
-actors own journals directly. Blocking segment APIs serve tests and offline work.
+Broker dispatch uses separate bounded data/control OMQ inproc lanes.
+Partition actors own journals directly; storage backends own physical I/O.
 
-See [design](../DESIGN.md) for ownership and confirmation boundaries,
-[runtime](../doc/RUNTIME.md) for scheduling and resource limits, and
-[protocol](../doc/PROTOCOL.md) for native messages.
+See [design](https://github.com/paddor/ozzy/blob/main/DESIGN.md) for ownership and confirmation boundaries,
+[runtime](https://github.com/paddor/ozzy/blob/main/doc/RUNTIME.md) for scheduling and resource limits, and
+[protocol](https://github.com/paddor/ozzy/blob/main/doc/PROTOCOL.md) for native messages.

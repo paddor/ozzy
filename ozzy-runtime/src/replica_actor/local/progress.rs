@@ -90,8 +90,11 @@ impl LocalActor {
                 Poll::Pending => false,
                 Poll::Ready(result) => {
                     let turn = result?;
+                    self.foreground_turn_due = true;
                     if !turn.enabled {
                         self.retention_at = None;
+                    } else if turn.more_work {
+                        self.retention_at = self.config.retention_interval.map(|_| self.now);
                     }
                     if let Some(buffer) = turn.proposal {
                         self.waiting = Some(super::Submission {

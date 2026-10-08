@@ -203,19 +203,36 @@ async fn observe<T>(
     label: &str,
     future: impl Future<Output = T>,
 ) -> T {
-    let mut future = std::pin::pin!(future);
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            tokio::select! {
-                result = &mut future => return result,
-                () = tokio::time::sleep(Duration::from_millis(50)) => {
-                    for broker in brokers.iter_mut().flatten() { broker.check(); }
+    observe_progress(brokers, label, std::sync::Arc::default(), future).await
+}
+
+async fn observe_progress<T>(
+    brokers: &mut [Option<Broker>],
+    label: &str,
+    progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    future: impl Future<Output = T>,
+) -> T {
+    let initial = progress.load(std::sync::atomic::Ordering::Relaxed);
+    let started = Instant::now();
+    let mut next_report = Duration::from_secs(60);
+    let mut future = std::pin::pin!(ozzy_sim::client::progress_timeout(
+        Duration::from_secs(30),
+        progress.clone(),
+        future
+    ));
+    loop {
+        tokio::select! {
+            result = &mut future => return result.unwrap_or_else(|error| panic!("{label}: {error}")),
+            () = tokio::time::sleep(Duration::from_millis(50)) => {
+                for broker in brokers.iter_mut().flatten() { broker.check(); }
+                if started.elapsed() >= next_report {
+                    let count = progress.load(std::sync::atomic::Ordering::Relaxed) - initial;
+                    println!("{{\"event\":\"boundary-progress\",\"operation\":\"{label}\",\"verified_records\":{count}}}");
+                    next_report = started.elapsed() + Duration::from_secs(60);
                 }
             }
         }
-    })
-    .await
-    .unwrap_or_else(|error| panic!("{label}: {error}"))
+    }
 }
 
 fn checked(config: &Path, identity: &Path, host: &str) -> CheckedConfig {
@@ -269,6 +286,8 @@ async fn run_crash_soak() {
     let start = Instant::now();
     let mut next_report = Duration::ZERO;
     let mut next_resume = Duration::from_secs(30);
+    let mut next_maintenance = Duration::from_secs(120);
+    let (mut resumes, mut takeovers) = (0, 0);
     let mut wave = 0;
     let mut verified = 0;
     while start.elapsed() < Duration::from_secs(seconds) {
@@ -283,10 +302,21 @@ async fn run_crash_soak() {
             client = observe(
                 &mut fleet.brokers,
                 "resume saved identity",
-                client.reopen_producer(fleet.kills % 2 == 1),
+                Box::pin(client.reopen_producer(fleet.kills % 2 == 1)),
             )
             .await;
+            if fleet.kills % 2 == 1 {
+                takeovers += 1;
+            } else {
+                resumes += 1;
+            }
             next_resume = elapsed + Duration::from_secs(30);
+        }
+        if elapsed >= next_maintenance
+            && let Some(records) = fleet.maintenance(&mut client, &mut reader, wave).await
+        {
+            verified += records;
+            next_maintenance = start.elapsed() + Duration::from_secs(300);
         }
         let (updated_reader, records) = fleet.verify_wave(&mut client, reader, wave).await;
         reader = updated_reader;
@@ -296,9 +326,13 @@ async fn run_crash_soak() {
         if elapsed >= next_report {
             let kills = fleet.kills;
             let record = format!(
-                "{{\"policy\":\"{policy:?}\",\"elapsed_secs\":{},\"verified_records\":{},\"kills\":{kills}}}",
+                "{{\"policy\":\"{policy:?}\",\"elapsed_secs\":{},\"verified_records\":{},\"kills\":{kills},\"resumes\":{resumes},\"takeovers\":{takeovers},\"consumers\":{},\"retention_gaps\":{},\"slow_consumers\":{},\"replayed_records\":{}}}",
                 elapsed.as_secs(),
-                verified
+                verified,
+                fleet.consumers,
+                fleet.retention_gaps,
+                fleet.slow_consumers,
+                fleet.replayed_records,
             );
             writeln!(ledger, "{record}").unwrap();
             ledger.flush().unwrap();
@@ -312,12 +346,16 @@ async fn run_crash_soak() {
         .unwrap();
     observe(&mut fleet.brokers, "close soak SDK", client.close()).await;
     let kills = fleet.kills;
+    let consumers = fleet.consumers;
+    let retention_gaps = fleet.retention_gaps;
+    let slow_consumers = fleet.slow_consumers;
+    let replayed_records = fleet.replayed_records;
     for broker in fleet.brokers.into_iter().flatten() {
         broker.stop("TERM").await;
     }
     writeln!(
         ledger,
-        "{{\"complete\":true,\"elapsed_secs\":{},\"verified_records\":{},\"kills\":{kills}}}",
+        "{{\"complete\":true,\"elapsed_secs\":{},\"verified_records\":{},\"kills\":{kills},\"resumes\":{resumes},\"takeovers\":{takeovers},\"consumers\":{consumers},\"retention_gaps\":{retention_gaps},\"slow_consumers\":{slow_consumers},\"replayed_records\":{replayed_records}}}",
         start.elapsed().as_secs(),
         verified
     )

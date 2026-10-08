@@ -69,8 +69,11 @@ async fn replay(retention: bool) {
                     panic!("{error}; artifacts: {}", root.keep().display())
                 });
                 assert_eq!(report.waves, actions.len());
+                assert!(report.complete);
                 assert_eq!(report.shared_producers, 1);
                 assert_eq!(report.producers, 2);
+                assert_eq!(report.resumes, 1);
+                assert_eq!(report.takeovers, 1);
                 assert_eq!(report.reconnects, 1);
                 assert_eq!(report.completion_holds, 1);
                 assert_eq!(

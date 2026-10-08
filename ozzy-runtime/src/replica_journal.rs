@@ -431,6 +431,8 @@ pub struct RetentionTurn {
     pub released: Option<ozzy_replication::LogSource>,
     /// False means the canonical partition policy has no retention limits.
     pub enabled: bool,
+    /// Progress exposed another eligible step; continue after a foreground turn.
+    pub more_work: bool,
     /// Retry-floor and trim operations awaiting ordinary confirmation.
     pub proposal: Option<ProposalBuffer>,
 }

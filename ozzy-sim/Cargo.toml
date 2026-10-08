@@ -41,7 +41,7 @@ ozzy-proto.workspace = true
 ozzy-replication.workspace = true
 ozzy-runtime = { workspace = true, features = ["simulation"] }
 tempfile.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "test-util"] }
 
 [lints]
 workspace = true

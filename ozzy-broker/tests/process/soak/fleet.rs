@@ -4,6 +4,10 @@ pub(super) struct Fleet {
     pub(super) checked: CheckedConfig,
     pub(super) brokers: Vec<Option<Broker>>,
     pub(super) kills: u64,
+    pub(super) consumers: u64,
+    pub(super) retention_gaps: u64,
+    pub(super) slow_consumers: u64,
+    pub(super) replayed_records: u64,
     hosts: Vec<String>,
     directories: Vec<PathBuf>,
     cpus: Vec<usize>,
@@ -23,6 +27,7 @@ impl Fleet {
         wave: usize,
     ) -> (ozzy_runtime::replicated::TopicReader, usize) {
         let positions = client.positions();
+        let before = reader.stats();
         let pending = observe(
             &mut self.brokers,
             "admit soak records",
@@ -45,6 +50,7 @@ impl Fleet {
             client.read(&mut reader, positions),
         )
         .await;
+        self.replayed_records += reader.stats().replayed_records - before.replayed_records;
         if wave.is_multiple_of(17) {
             observe(
                 &mut self.brokers,
@@ -52,6 +58,7 @@ impl Fleet {
                 client.replay(),
             )
             .await;
+            self.consumers += 1;
             observe(&mut self.brokers, "close live soak reader", reader.close())
                 .await
                 .unwrap();
@@ -103,6 +110,10 @@ impl Fleet {
             checked,
             brokers: vec![],
             kills: 0,
+            consumers: 0,
+            retention_gaps: 0,
+            slow_consumers: 0,
+            replayed_records: 0,
             hosts,
             directories,
             cpus,
@@ -130,6 +141,35 @@ impl Fleet {
             self.cpus[index],
         )
         .await
+    }
+
+    pub(super) async fn maintenance(
+        &mut self,
+        client: &mut Client,
+        reader: &mut ozzy_runtime::replicated::TopicReader,
+        wave: usize,
+    ) -> Option<usize> {
+        if self.stopped.is_some() {
+            return None;
+        }
+        let (slow, replayed, _) = observe(
+            &mut self.brokers,
+            "verify paused consumer repair",
+            client.slow_consumer(reader, wave),
+        )
+        .await;
+        self.slow_consumers += 1;
+        self.replayed_records += replayed;
+        let progress = client.verified_progress();
+        let retained = observe_progress(
+            &mut self.brokers,
+            "verify expired checkpoint retention gap",
+            progress,
+            client.retention_lag(reader, wave),
+        )
+        .await;
+        self.retention_gaps += 1;
+        Some(slow + retained)
     }
 
     pub(super) async fn churn(&mut self, elapsed: Duration) {

@@ -235,7 +235,7 @@ impl DataReceiver {
     /// Dequeue one frame. Its pending slot remains separately backed.
     pub fn try_recv(&mut self) -> Result<Option<DataInput>, DataLaneError> {
         match self.socket.try_recv() {
-            Ok(message) => decode(&self.socket, message).map(Some),
+            Ok(message) => decode(&self.socket, &self.closed, message).map(Some),
             Err(omq_tokio::Error::WouldBlock) if self.closed.is_closed() => {
                 Err(DataLaneError::Closed)
             }
@@ -252,7 +252,7 @@ impl DataReceiver {
         let closed = self.closed.clone();
         async move {
             tokio::select! {
-                message = socket.recv() => decode(&socket, message?),
+                message = socket.recv() => decode(&socket, &closed, message?),
                 () = closed.closed() => Err(DataLaneError::Closed),
             }
         }
@@ -300,7 +300,11 @@ fn encode(input: &DataInput, retained: usize) -> [u8; HEADER_BYTES] {
     bytes[87..95].copy_from_slice(&(retained as u64).to_be_bytes());
     bytes
 }
-fn decode(socket: &Socket, mut message: Message) -> Result<DataInput, DataLaneError> {
+fn decode(
+    socket: &Socket,
+    closed: &CloseSignal,
+    mut message: Message,
+) -> Result<DataInput, DataLaneError> {
     let identity = message
         .pop_front_payload()
         .ok_or(DataLaneError::Frame)?
@@ -344,14 +348,21 @@ fn decode(socket: &Socket, mut message: Message) -> Result<DataInput, DataLaneEr
         },
         message,
     };
+    // Local closure can race an already-ready receive. The sender signals it
+    // before dropping its socket; routing a receipt is no longer meaningful.
+    if closed.is_closed() {
+        return Err(DataLaneError::Closed);
+    }
     let reply = Message::with_prefix(
         identity,
         Message::single(Bytes::copy_from_slice(&bytes[87..95])),
     );
     match socket.try_send(reply) {
         Ok(()) => Ok(input),
+        Err(_) if closed.is_closed() => Err(DataLaneError::Closed),
         Err(TrySendError::Closed) => Err(DataLaneError::Closed),
-        Err(_) => Err(DataLaneError::Frame),
+        Err(TrySendError::Error(error)) => Err(DataLaneError::Transport(error)),
+        Err(TrySendError::Full(_)) => Err(DataLaneError::Frame),
     }
 }
 
@@ -374,6 +385,29 @@ mod tests {
             },
             message: test_support::append(placement, binding),
         }
+    }
+
+    #[tokio::test]
+    async fn received_input_observes_sender_close_before_its_dequeue_receipt() {
+        let (mut sender, receiver) = data_channel(
+            &omq_tokio::Context::new(),
+            0,
+            Kind::Client,
+            Class::Data,
+            1,
+            4096,
+            8192,
+        )
+        .unwrap();
+        sender.try_send(input(), 4096).unwrap();
+        let message = receiver.socket.recv().await.unwrap();
+        // Drop signals closure before destroying the sender's socket. Hold that
+        // exact interval so receipt routing cannot make this schedule flaky.
+        sender.closed.close();
+        assert!(matches!(
+            decode(&receiver.socket, &receiver.closed, message),
+            Err(DataLaneError::Closed)
+        ));
     }
 
     #[tokio::test]

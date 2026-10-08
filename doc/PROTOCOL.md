@@ -123,7 +123,7 @@ handshake/response deadlines are 1/2 seconds; exhausted voters back off from
 50 ms to 1 second. Cancellation stops observation, not admitted server work.
 `Connection::refresh_session` renegotiates independently of OMQ reconnect.
 
-Simultaneous Node HELLO uses the lower node ID's attempt. WELCOME may carry
+Simultaneous HELLO uses the lower node ID's attempt. WELCOME may carry
 `superseded-hello:u128`; HELLO cannot. Monotonic observed attempts reject delayed
 older HELLOs. Replacement closes old read queues/waits/subscriptions. Identical
 SUBSCRIBE preserves state; changed starts require a new generation.
@@ -334,10 +334,9 @@ retain original backing and pause data sources; control capacity is separate.
 Missing/reordered replay opens a fresh generation. Retention/oversize errors are
 explicit; records are never split or silently skipped.
 
-ACK positions are inclusive, processed <= received, and volatile. Native
-notifications are uncorrelated; shared SDK processing ACK uses a correlated echo.
-Legacy Node may accept correlated record receipts. Neither grants capacity,
-confirms writes, nor persists application progress. Reserved PROGRESS_COMMIT,
+ACK positions are inclusive, processed <= received, and volatile. Notifications
+are uncorrelated; shared SDK processing ACK uses a correlated echo. ACK grants
+no capacity, write confirmation, or durable processing progress. Reserved PROGRESS_COMMIT,
 PROGRESS_COMMITTED, capability 12, and opcode 0x26 provide no service.
 
 ### Live reader publication
@@ -537,7 +536,7 @@ Clients validate scope and configured primary selection; hints grant no activati
 | 17 | Payload bytes:u64, parts:u64 |
 | 20 | First/last matching offsets:u64 each |
 
-Other implemented details are empty; legacy Node errors may lack positions.
+Other implemented details are empty.
 Timeout/cancellation leaves outcome unknown, including an earlier successful
 attempt of the same record. Streaming record/byte bounds remain per writer.
 
