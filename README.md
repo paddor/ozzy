@@ -1,4 +1,6 @@
-<img src="doc/ozzy-logo.webp" alt="Ozzy the ocelot" width="525" />
+<p align="center">
+  <img src="doc/ozzy-logo.webp" alt="Ozzy the ocelot" width="256" />
+</p>
 
 # Ozzy
 
