@@ -1,7 +1,7 @@
 //! General native/externally managed workload sweeps, sharing strict supervision.
 use super::{
-    Result, SSD, cache, capture, check_canceled, install_signals, isolation, json_file, records,
-    root, run_id, source, supervise, validation,
+    Result, artifact_root, cache, capture, check_canceled, install_signals, isolation, json_file,
+    records, root, run_id, source, supervise, validation,
 };
 use clap::Parser;
 use serde_json::{Value, json};
@@ -361,9 +361,9 @@ async fn execute_matrix(
             }
             let case_dir = directory.join(format!("r{repetition}-{index}"));
             fs::create_dir(&case_dir)?;
-            let cmd = args.command(case, Path::new(&format!("{SSD}/ozzy-bench")));
+            let cmd = args.command(case, &artifact_root().join("ozzy-bench"));
             json_file(&case_dir.join("command.json"), &json!(cmd))?;
-            capture(Command::new("sync").args(["-f", SSD]))?;
+            capture(Command::new("sync").args(["-f"]).arg(artifact_root()))?;
             let before = supervise::CpuSnapshot::take(pid)?;
             let name = if pid.is_some() {
                 args.external(profile).1.map(|s| (s, case_dir.as_path()))
@@ -403,7 +403,7 @@ pub async fn run(mut args: Args) -> Result<()> {
         for case in args.cases() {
             println!(
                 "{}",
-                json!(args.command(&case, Path::new(&format!("{SSD}/ozzy-bench"))))
+                json!(args.command(&case, &artifact_root().join("ozzy-bench")))
             );
         }
         return Ok(());
@@ -415,9 +415,7 @@ pub async fn run(mut args: Args) -> Result<()> {
         .append(true)
         .open(super::artifacts().join("runner.lock"))?;
     lock.try_lock()?;
-    if capture(Command::new("findmnt").args(["-n", "-o", "TARGET", "-T", SSD]))? != "/mnt/ssd" {
-        return Err("SSD is not mounted".into());
-    }
+    super::require_artifact_disk()?;
     let id = run_id()?;
     let directory = super::artifacts().join("runs").join(&id);
     fs::create_dir_all(&directory)?;

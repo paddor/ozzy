@@ -3,7 +3,7 @@ pub(super) mod build;
 mod distributed;
 mod external;
 pub mod redpanda;
-use super::{Result, SSD, check_canceled, isolation, json_file};
+use super::{Result, artifact_root, check_canceled, isolation, json_file};
 pub use build::prepare;
 pub use external::External;
 use serde_json::{Value, json};
@@ -106,7 +106,7 @@ impl Iggy {
         for index in 0..count {
             let broker_root = root.join(index.to_string());
             fs::create_dir(&broker_root)?;
-            let data = PathBuf::from(SSD)
+            let data = artifact_root()
                 .join("ozzy-bench")
                 .join(root.file_name().ok_or("missing run name")?)
                 .join(index.to_string());
@@ -161,7 +161,7 @@ impl Iggy {
                 .env("IGGY_CONFIG_PATH", broker_root.join("config.toml"))
                 .env("IGGY_ROOT_USERNAME", "iggy")
                 .env("IGGY_ROOT_PASSWORD", "iggy")
-                .env("TMPDIR", SSD)
+                .env("TMPDIR", artifact_root())
                 .env("LD_LIBRARY_PATH", build::library_path())
                 .stdin(Stdio::null())
                 .stdout(log.try_clone()?)

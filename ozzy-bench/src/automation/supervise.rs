@@ -49,7 +49,7 @@ pub async fn execute(
         .args(&command[1..])
         .current_dir(super::root())
         .envs(environment)
-        .env("TMPDIR", super::SSD)
+        .env("TMPDIR", super::artifact_root())
         .env("XDG_CACHE_HOME", directory.join("cache"))
         .env_remove("OZZY_BENCH_AFFINITY")
         .stdout(Stdio::piped())

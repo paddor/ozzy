@@ -25,7 +25,7 @@ Run sustained workloads with the same production harness:
 scripts/ozzy_cargo run -p ozzy-sim --features broker --bin ozzy_sim -- \
   --mode replicated-persisting --seed 42 --duration 28800 \
   --interval-ms 10 --progress-timeout 30 \
-  --artifacts /mnt/ssd/tmp/ozzy-sim-rp-42
+  --artifacts tmp/ozzy-sim-rp-42
 ```
 
 Modes are `durable`, `disk-quorum`, and `replicated-persisting`. `--waves` limits

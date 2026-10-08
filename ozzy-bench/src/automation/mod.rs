@@ -23,8 +23,31 @@ use std::{
 
 /// Failure returned by benchmark automation and its supervised subprocesses.
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
-/// Disk-backed root for disposable build, profile, and benchmark artifacts.
-pub const SSD: &str = "/mnt/ssd/tmp";
+/// Configured artifact root, defaulting to the system temporary directory.
+pub fn artifact_root() -> PathBuf {
+    let directory = std::env::var_os("OZZY_ARTIFACT_ROOT")
+        .filter(|value| !value.is_empty())
+        .map_or_else(std::env::temp_dir, PathBuf::from);
+    if directory.is_absolute() {
+        directory
+    } else {
+        root().join(directory)
+    }
+}
+
+/// Require observable block-backed storage before measuring persistent workloads.
+pub fn require_artifact_disk() -> Result<()> {
+    let directory = artifact_root();
+    fs::create_dir_all(&directory)?;
+    device::Snapshot::take(&directory)
+        .map(drop)
+        .map_err(|error| {
+            format!(
+                "benchmark artifacts require block-backed storage; set OZZY_ARTIFACT_ROOT: {error}"
+            )
+            .into()
+        })
+}
 
 /// Exactly three brokers, regardless of confirmation or persistence policy.
 pub fn cluster_mode(mode: &str) -> bool {
@@ -67,7 +90,7 @@ pub fn root() -> PathBuf {
 pub fn build_target(checkout: &Path) -> PathBuf {
     use sha2::{Digest, Sha256};
     let key = Sha256::digest(checkout.as_os_str().as_encoded_bytes());
-    PathBuf::from(SSD)
+    artifact_root()
         .join("cargo-target/checkouts")
         .join(format!("{key:x}"))
 }
@@ -84,7 +107,7 @@ pub fn cache() -> PathBuf {
 
 /// Disposable run artifacts; the home cache holds append-only result ledgers.
 pub fn artifacts() -> PathBuf {
-    PathBuf::from(SSD).join("ozzy-artifacts")
+    artifact_root().join("ozzy-artifacts")
 }
 
 /// Run a command to completion; return UTF-8 stdout or its failed status and diagnostics.

@@ -131,7 +131,7 @@ fn main() -> Result<()> {
     let output = args
         .output_dir
         .unwrap_or_else(|| automation::root().join("doc/charts"));
-    let cache = std::path::Path::new(automation::SSD).join("ozzy-chart-inputs");
+    let cache = automation::artifact_root().join("ozzy-chart-inputs");
     std::fs::create_dir_all(&cache)?;
     let suffix = if args.suffix.is_empty() {
         String::new()

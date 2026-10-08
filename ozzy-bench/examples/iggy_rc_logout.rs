@@ -158,7 +158,11 @@ mod diagnostic {
         }
         println!("all writer and verified reader processes finished");
         if args.sync_before_logout {
-            automation::capture(Command::new("sync").args(["-f", automation::SSD]))?;
+            automation::capture(
+                Command::new("sync")
+                    .arg("-f")
+                    .arg(automation::artifact_root()),
+            )?;
         }
         tokio::time::sleep(Duration::from_millis(args.pause_ms)).await;
         println!("first writer process logout requested");
@@ -307,7 +311,11 @@ mod diagnostic {
             );
             tokio::try_join!(writes, reads)?;
             if args.sync_before_logout {
-                automation::capture(Command::new("sync").args(["-f", automation::SSD]))?;
+                automation::capture(
+                    Command::new("sync")
+                        .arg("-f")
+                        .arg(automation::artifact_root()),
+                )?;
             }
             tokio::time::sleep(Duration::from_millis(args.pause_ms)).await;
             println!("first writer logout requested; all readers finished");

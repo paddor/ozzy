@@ -10,9 +10,7 @@ runs:
   steps:
     - shell: bash
       run: |
-        sudo mkdir -p /mnt/ssd/tmp
-        sudo chown "$(id -u):$(id -g)" /mnt/ssd/tmp
-        printf '%s\n' 'TMPDIR=/mnt/ssd/tmp' >> "$GITHUB_ENV"
+        printf 'TMPDIR=%s\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
     - uses: dtolnay/rust-toolchain@master
       with:
         toolchain: ${{ inputs.toolchain }}
@@ -24,4 +22,4 @@ runs:
       with:
         workspaces: ozzy
         cache-targets: false
-        cache-directories: /mnt/ssd/tmp/ozzy-ci-target
+        cache-directories: ${{ env.CARGO_TARGET_DIR }}

@@ -2,7 +2,7 @@
 //! local modes, three sharing the broker CPU pool for group modes.
 mod build;
 mod warm;
-use crate::automation::{Result, SSD, capture, check_canceled, isolation, json_file};
+use crate::automation::{Result, artifact_root, capture, check_canceled, isolation, json_file};
 pub use build::prepare;
 use serde_json::{Value, json};
 use std::{
@@ -54,7 +54,7 @@ impl Redpanda {
         }
         let build = build::verified_identity()?;
         fs::create_dir_all(root)?;
-        let data = PathBuf::from(SSD)
+        let data = artifact_root()
             .join("ozzy-bench")
             .join(root.file_name().ok_or("missing run name")?);
         // Hold every selected port until all configurations have been written.
@@ -385,7 +385,7 @@ fn spawn(root: &Path, cpus: &[usize], smp: usize, memory: &str) -> Result<Child>
             "--unsafe-bypass-fsync=false",
             "--default-log-level=info",
         ])
-        .env("TMPDIR", SSD)
+        .env("TMPDIR", artifact_root())
         .current_dir(root)
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)

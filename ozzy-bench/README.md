@@ -5,7 +5,11 @@ comparisons; other binaries isolate particular paths.
 
 ## Setup and rules
 
+Set `OZZY_ARTIFACT_ROOT` to a directory on your benchmark disk. It defaults to
+the system temporary directory; persistent measurements require block-backed storage.
+
 ```bash
+export OZZY_ARTIFACT_ROOT=/path/to/benchmark-disk/ozzy
 source scripts/ozzy_tools.sh
 export PATH="$CARGO_TARGET_DIR/release:$PATH"
 scripts/ozzy_cargo build --release -p ozzy-bench --features comparisons --bins
@@ -22,9 +26,9 @@ ozzy_compare --impl ozzy --modes durable,replicated-persisting \
   Pin brokers and clients to disjoint CPU sets. Keep host scheduling and device
   settings fixed; repeat the baseline after changes. Clean obsolete artifacts
   and trim the idle SSD during daily sustained benchmark work.
-- Use the mounted SSD for storage. Native disk commands need
-  `--storage-dir /mnt/ssd/tmp/ozzy-bench`; `TMPDIR` alone is insufficient.
-- Comparisons and profiles check the mount and run `sync -f /mnt/ssd/tmp`
+- Use the same disk for every comparison. Native disk commands need
+  `--storage-dir "$OZZY_ARTIFACT_ROOT/ozzy-bench"`; `TMPDIR` alone is insufficient.
+- Comparisons and profiles check block backing and run `sync -f "$OZZY_ARTIFACT_ROOT"`
   before warmup. Flush failures stop the run.
 - Before each comparison case, `ozzy_compare` waits for 5 s without completed
   device writes, then requires three 1 MiB `O_DSYNC` probe writes of at most
@@ -82,7 +86,7 @@ Local dependencies, including dirty and untracked files, are fingerprinted.
 Fixture orchestration and charts have separate source provenance, so editing
 them does not force new measurements. All sources stay frozen during each run.
 Workers build in separate directories per checkout under
-`/mnt/ssd/tmp/cargo-target/checkouts/`. Comparison, profiling, and workload
+`$OZZY_ARTIFACT_ROOT/cargo-target/checkouts/`. Comparison, profiling, and workload
 runners select that checkout's worker. Never share a Cargo target directory
 between source worktrees when manually building benchmark binaries.
 
@@ -303,7 +307,7 @@ brokers ready within the shared CPU budget.
 | `ozzy.jsonl`, `iggy.jsonl` | Append-only measurements and run status |
 
 Commands, identities, diagnostics and raw output go under
-`/mnt/ssd/tmp/ozzy-artifacts/runs/RUN_ID/`.
+`$OZZY_ARTIFACT_ROOT/ozzy-artifacts/runs/RUN_ID/`.
 
 Only completed runs count. Failed/interrupted rows remain stored but are
 excluded. Summaries retain medians and repetition ranges. Ozzy-only runs leave
@@ -406,7 +410,7 @@ roll, or confirmation latency. Results append to `~/.cache/ozzy/disk-probe.jsonl
 
 ```sh
 cargo build --release -p ozzy-bench --features comparisons --bin ozzy_disk_probe
-scratch=/mnt/ssd/tmp/disk-scratch
+scratch="$OZZY_ARTIFACT_ROOT/disk-scratch"
 touch "$scratch"
 # Run built binary directly, with the VM otherwise idle.
 ozzy_disk_probe --path "$scratch" --overwrite --mode direct-dsync \
@@ -453,14 +457,14 @@ The probe's direct mode does not enable direct I/O in Ozzy. See
 Replay a verified native case, separately from comparison timings.
 
 ```sh
-ozzy_profile --case-dir /mnt/ssd/tmp/ozzy-artifacts/runs/RUN/CASE --kind syscall
-ozzy_profile --case-dir /mnt/ssd/tmp/ozzy-artifacts/runs/RUN/CASE --kind cpu
-ozzy_profile --case-dir /mnt/ssd/tmp/ozzy-artifacts/runs/RUN/CASE --kind cpu-kernel
-ozzy_profile --case-dir /mnt/ssd/tmp/ozzy-artifacts/runs/RUN/CASE --kind stages
+ozzy_profile --case-dir "$OZZY_ARTIFACT_ROOT/ozzy-artifacts/runs/RUN/CASE" --kind syscall
+ozzy_profile --case-dir "$OZZY_ARTIFACT_ROOT/ozzy-artifacts/runs/RUN/CASE" --kind cpu
+ozzy_profile --case-dir "$OZZY_ARTIFACT_ROOT/ozzy-artifacts/runs/RUN/CASE" --kind cpu-kernel
+ozzy_profile --case-dir "$OZZY_ARTIFACT_ROOT/ozzy-artifacts/runs/RUN/CASE" --kind stages
 ```
 
 Defaults: 2 s warmup, 5 s measurement; override with `--warmup` and `--duration`.
-Profiles go under `/mnt/ssd/tmp/ozzy-profiles/`. CPU sampling defaults to 99 Hz;
+Profiles go under `$OZZY_ARTIFACT_ROOT/ozzy-profiles/`. CPU sampling defaults to 99 Hz;
 use `--frequency 499` for more samples. Profile timings are not comparisons.
 Comparison builds report each broker's resident/historical delivery counts and
 shared/copied reader bytes under `usage.record_deliveries`. These counters cover
@@ -469,7 +473,7 @@ Stage profiles publish thread-owned counters over local OMQ PUB/SUB.
 The profiler binds abstract IPC, merges thread snapshots, and prints live
 repair and refusal alerts. Shards publish directly without a shared counter table.
 Add `--counter-trace` to a stage profile to retain timestamped SUB snapshots
-under `/mnt/ssd/tmp/ozzy-profiles/` for correlation after the run. Only the
+under `$OZZY_ARTIFACT_ROOT/ozzy-profiles/` for correlation after the run. Only the
 collector writes the artifact, after all workers stop.
 CPU profiles disable ASLR to avoid stale parent mappings in `perf`'s unwinder.
 Profiles place the controller on saved client CPUs. Production broker placement
@@ -558,7 +562,7 @@ overload annotations and original run provenance.
 - Throughput whiskers retain the min/max across repetitions.
 - Footer: series, writer count and explicit request ceiling. No journal-byte panel.
 - Generate charts only when explicitly requested. Refresh these six paths.
-  Chart-input artifacts go under `/mnt/ssd/tmp/ozzy-chart-inputs/`.
+  Chart-input artifacts go under `$OZZY_ARTIFACT_ROOT/ozzy-chart-inputs/`.
 
 Selection rejects incomplete repetitions, mixed Ozzy revisions, incompatible
 settings and missing audit evidence. No smoothing or extrapolation. Timing
@@ -585,11 +589,11 @@ throughput or gains at least 5% of confirmation/delivery latency:
 
 ```sh
 ozzy_chart --run-id CANDIDATE_RUN --baseline-run-id BASELINE_RUN \
-  --modes durable --regression-output /mnt/ssd/tmp/ozzy-regression-durable.json
+  --modes durable --regression-output "$OZZY_ARTIFACT_ROOT/ozzy-regression-durable.json"
 ozzy_chart --fixed-load --run-id CANDIDATE_SMALL_RUN --run-id CANDIDATE_LARGE_RUN \
   --baseline-run-id BASELINE_SMALL_RUN --baseline-run-id BASELINE_LARGE_RUN \
   --modes durable --max-rate 128:100000 --max-rate 1024:100000 \
-  --max-rate 8192:10000 --regression-output /mnt/ssd/tmp/ozzy-regression-durable-fixed.json
+  --max-rate 8192:10000 --regression-output "$OZZY_ARTIFACT_ROOT/ozzy-regression-durable-fixed.json"
 ```
 
 Repeat for both cluster modes. The report keeps percentile medians, repetition
@@ -686,7 +690,7 @@ A short run without a segment roll cannot establish rollover performance.
 ozzy_timed_bench --system replicated-persisting --processes --network-ingress --streaming \
   --record-bytes 1024 --duration 3 --warmup 0.25 \
   --window 4 --partitions 16 --request-records 1024 \
-  --producer-workers 4 --reader-workers 4 --storage-dir /mnt/ssd/tmp/ozzy-bench
+  --producer-workers 4 --reader-workers 4 --storage-dir "$OZZY_ARTIFACT_ROOT/ozzy-bench"
 ```
 
 `--window` counts logical writers. `--partitions` counts broker partitions
@@ -709,7 +713,7 @@ Native example with separate storage devices:
 ```json
 [
   {"bind": "192.168.11.155", "cpus": [0],
-   "storage_dir": "/mnt/ssd/tmp/ozzy-bench"},
+   "storage_dir": "/var/tmp/ozzy-bench"},
   {"bind": "192.168.11.155", "cpus": [1],
    "storage_dir": "/mnt/bench/tmp/ozzy-bench"},
   {"bind": "192.168.11.100", "ssh": "er-dev",
