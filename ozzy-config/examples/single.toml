@@ -1,0 +1,29 @@
+# One broker. The only allowed confirmation policy is "local-durable".
+[cluster]
+mode = "single" # Fixed values: "single" or "three".
+
+# "my_server" is your label, not a DNS name. Select it with --broker my_server.
+[brokers.my_server.endpoints]
+peer = "tcp://127.0.0.1:7100" # Control and confirmations.
+data_peer = "tcp://127.0.0.1:7103" # APPENDs and replay data.
+reader_pub = "tcp://127.0.0.1:7101" # Live consumer records.
+
+# "my_ssd" is your device label. The root is the actual local storage directory.
+[brokers.my_server.devices.my_ssd]
+root = "/var/lib/ozzy/data"
+# Arbitrary broker-local group name, not /dev/nvme0 or an OS hardware identifier.
+# Roots with the same controller share storage workers and I/O budgets.
+controller = "my_controller"
+
+# "orders" is your topic name. Omitting partitions defaults to 16.
+[topics.orders]
+# Confirm only after the broker synchronizes the record to disk.
+# "disk-quorum" and "replicated-persisting" require mode = "three".
+confirmation = "local-durable"
+
+# Defaults: one shard, Linux AIO on Linux, 256 MiB segments, unlimited retention.
+# Optional retention, per partition: uncomment to keep at most a day or 1 GiB.
+# These are soft targets; active/pinned segments can delay deletion.
+# [topics.orders.retention]
+# max_age_secs = 86400
+# max_bytes = 1073741824
