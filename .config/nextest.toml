@@ -1,8 +1,28 @@
 [profile.ci]
-default-filter = 'not (test(::stress::) | (package(ozzy-bench) & (binary(ozzy_timed) | binary(ozzy_native))))'
+default-filter = '''
+not (
+    test(::stress::)
+    | (package(ozzy-broker) & (test(journals::serving::) | test(journals::actors::frontend::) | test(process::)))
+    | (package(ozzy-sim) & binary(ozzy_broker_simulation))
+    | (package(ozzy-bench) & (binary(ozzy_timed) | binary(ozzy_native)))
+)
+| test(=inproc_memory_all_modes_share_the_real_broker_and_sdk_harness)
+| test(=journals::serving::pressure::inproc_memory_bounded_sources_preserve_records_in_all_modes)
+'''
 
 [profile.extended]
-default-filter = 'test(::stress::) | (package(ozzy-bench) & (binary(ozzy_timed) | binary(ozzy_native)))'
+default-filter = '''
+(
+    test(::stress::)
+    | (package(ozzy-broker) & (test(journals::serving::) | test(journals::actors::frontend::) | test(process::)))
+    | (package(ozzy-sim) & binary(ozzy_broker_simulation))
+    | (package(ozzy-bench) & (binary(ozzy_timed) | binary(ozzy_native)))
+)
+& not (
+    test(=inproc_memory_all_modes_share_the_real_broker_and_sdk_harness)
+    | test(=journals::serving::pressure::inproc_memory_bounded_sources_preserve_records_in_all_modes)
+)
+'''
 fail-fast = false
 
 [test-groups.broker-lifecycle]
