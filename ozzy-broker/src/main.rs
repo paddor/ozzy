@@ -13,7 +13,7 @@ use ozzy_broker::{
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "ozzy_broker",
+    name = "ozzy",
     about = "Ozzy broker serving and explicit deployment provisioning"
 )]
 struct Args {

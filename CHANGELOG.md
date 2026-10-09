@@ -1,14 +1,19 @@
 # Changelog
 
-## Unreleased
+## [Unreleased]
 
-- Fix retention after broker restart and recovery across retired history.
-- Fence stale recovery donors and preserve the first broker failure on shutdown.
-- Remove the producer driver's shared reply-receiver lock; retain synchronized
-  confirmation and failure publication.
-- Extend the inproc simulator with churn, storage faults, and verified-progress
-  monitoring; allow bounded storage pauses throughout a workload boundary.
-- Automate release PRs and crates.io trusted publishing; shorten reference docs.
+## [0.1.1] - 2026-10-09
+
+### Breaking
+
+- Rename the broker executable from `ozy_broker` to `ozzy`.
+
+### Fixed
+
+- Keep retention running after broker restart and repeated segment retirement.
+- Recover replicas safely when retention has removed different history prefixes.
+- Prevent incomplete or stale donor state from being used during recovery.
+- Report the first broker failure through shutdown instead of losing its cause.
 
 ## 0.1.0 - 2026-10-07
 

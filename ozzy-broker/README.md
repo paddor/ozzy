@@ -5,9 +5,11 @@ partitioned topics; consumers read live streams or replay retained history.
 Ozzy adds persistence, replication, retention, and producer resume to OMQ's
 message passing.
 
-This crate provides the `ozzy_broker` server and its embedded Rust API. Brokers
+This crate provides the `ozzy` server and its embedded Rust API. Brokers
 own the segment journals. Each partition runs on one owner thread, with shared
 transport and storage workers.
+
+Install with `cargo install ozzy-broker`; run `ozzy --help` for commands.
 
 | Mode | Confirmation |
 | --- | --- |

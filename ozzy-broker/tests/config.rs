@@ -207,7 +207,7 @@ fn final_symlinks_and_fifos_are_rejected_without_following_or_blocking() {
 
 fn command(config: &Path) -> Command {
     let executable = std::env::var_os("OZZY_SOAK_BROKER_BINARY")
-        .unwrap_or_else(|| env!("CARGO_BIN_EXE_ozzy_broker").into());
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_ozzy").into());
     let mut command = Command::new(executable);
     command.arg("--config").arg(config);
     command

@@ -65,11 +65,7 @@ impl Broker {
             .unwrap();
         assert!(reset.status.success());
         let memory = std::env::var("OZZY_SOAK_MEMORY").is_ok_and(|value| value == "1");
-        let executable = directory.join(if memory {
-            "memory-broker"
-        } else {
-            "ozzy_broker"
-        });
+        let executable = directory.join(if memory { "memory-broker" } else { "ozzy" });
         let invocation = if memory {
             format!(
                 "env OZZY_MEMORY_CONFIG=deployment.toml OZZY_MEMORY_BROKER={} \
@@ -80,7 +76,7 @@ impl Broker {
             )
         } else {
             format!(
-                "./ozzy_broker --config deployment.toml {operation} --broker {} \
+                "./ozzy --config deployment.toml {operation} --broker {} \
                 --identity shared.identity --local-identity local.identity \
                 --trusted-transport{selections}",
                 quoted(name)
