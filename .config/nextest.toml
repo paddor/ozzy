@@ -1,8 +1,32 @@
 [profile.ci]
-default-filter = 'not (test(::stress::) | (package(ozzy-bench) & (binary(ozzy_timed) | binary(ozzy_native))))'
+default-filter = '''
+not (
+    test(::stress::)
+    | (package(ozzy-broker) & (test(journals::serving::) | test(journals::actors::) | test(journals::startup::) | test(process::)))
+    | test(=journals::format::explicit_formatter_initializes_symmetric_shards_and_restart_keeps_election_fencing)
+    | (package(ozzy-sim) & (binary(ozzy_broker_simulation) | binary(ozzy_lifecycle)))
+    | test(crash_cuts) | test(every_execution_and_observation_cut) | test(sparse_gib_segment_scans)
+    | (package(ozzy-bench) & (binary(ozzy_timed) | binary(ozzy_native) | test(bench::timed::producer::client::tests::) | test(bench::timed::native::clients::tests::)))
+)
+| test(=inproc_memory_all_modes_share_the_real_broker_and_sdk_harness)
+| test(=journals::serving::pressure::inproc_memory_bounded_sources_preserve_records_in_all_modes)
+'''
 
 [profile.extended]
-default-filter = 'test(::stress::) | (package(ozzy-bench) & (binary(ozzy_timed) | binary(ozzy_native)))'
+default-filter = '''
+(
+    test(::stress::)
+    | (package(ozzy-broker) & (test(journals::serving::) | test(journals::actors::) | test(journals::startup::) | test(process::)))
+    | test(=journals::format::explicit_formatter_initializes_symmetric_shards_and_restart_keeps_election_fencing)
+    | (package(ozzy-sim) & (binary(ozzy_broker_simulation) | binary(ozzy_lifecycle)))
+    | test(crash_cuts) | test(every_execution_and_observation_cut) | test(sparse_gib_segment_scans)
+    | (package(ozzy-bench) & (binary(ozzy_timed) | binary(ozzy_native) | test(bench::timed::producer::client::tests::) | test(bench::timed::native::clients::tests::)))
+)
+& not (
+    test(=inproc_memory_all_modes_share_the_real_broker_and_sdk_harness)
+    | test(=journals::serving::pressure::inproc_memory_bounded_sources_preserve_records_in_all_modes)
+)
+'''
 fail-fast = false
 
 [test-groups.broker-lifecycle]
@@ -11,13 +35,13 @@ fail-fast = false
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = '(package(ozzy-broker) & (test(journals::serving::) | test(journals::actors::frontend::) | test(process::))) | (package(ozzy-sim) & binary(ozzy_broker_simulation))'
+filter = '(package(ozzy-broker) & (test(journals::serving::) | test(journals::actors::) | test(journals::startup::) | test(process::))) | test(=journals::format::explicit_formatter_initializes_symmetric_shards_and_restart_keeps_election_fencing) | (package(ozzy-sim) & binary(ozzy_broker_simulation))'
 test-group = 'broker-lifecycle'
 threads-required = 8
 
 [[profile.default.overrides]]
 # Timed cases launch whole broker/writer/reader cohorts. Concurrent cohorts
 # compete for the same CPUs and invalidate their wall-clock deadlines.
-filter = 'package(ozzy-bench) & (binary(ozzy_timed) | binary(ozzy_native))'
+filter = 'package(ozzy-bench) & (binary(ozzy_timed) | binary(ozzy_native) | test(bench::timed::producer::client::tests::) | test(bench::timed::native::clients::tests::))'
 test-group = 'broker-lifecycle'
 threads-required = 8

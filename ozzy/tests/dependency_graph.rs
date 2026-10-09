@@ -126,8 +126,12 @@ fn executable_names_identify_ozzy_and_all_integration_tests_are_registered() {
         let targets = package["targets"].as_array().unwrap();
         for target in targets {
             if target["kind"] != serde_json::json!(["lib"]) {
+                let name = target["name"].as_str().unwrap();
+                let broker_command = package["name"] == "ozzy-broker"
+                    && target["kind"] == serde_json::json!(["bin"])
+                    && name == "ozzy";
                 assert!(
-                    target["name"].as_str().unwrap().starts_with("ozzy_"),
+                    broker_command || name.starts_with("ozzy_"),
                     "unprefixed executable: {target}"
                 );
             }

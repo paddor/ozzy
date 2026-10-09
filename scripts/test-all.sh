@@ -31,7 +31,7 @@ if [[ "$phase" == lint ]]; then
 fi
 
 check_phase tests cargo nextest run --workspace --test-threads 8 \
-    --status-level fail --final-status-level fail
+    --status-level fail --final-status-level "${NEXTEST_FINAL_STATUS_LEVEL:-fail}"
 check_phase doctests cargo test --workspace --doc
 RUSTDOCFLAGS='-D warnings' check_phase docs cargo doc \
     -p ozzy \

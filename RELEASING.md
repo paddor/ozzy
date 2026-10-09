@@ -6,8 +6,9 @@ per-crate tags and GitHub releases. Failed or superseded main revisions do not
 publish. Bot-created release PRs dispatch the same required CI checks.
 
 1. Review the proposed versions and dependency updates.
-2. Replace `Unreleased` in [CHANGELOG.md](CHANGELOG.md) with the release version
-   and date; curate the changes before merging.
+2. Add a dated version section below `Unreleased` in
+   [CHANGELOG.md](CHANGELOG.md), with categorized changes. Preserve existing
+   version sections.
 3. Merge with all required checks green. Check the `Release-plz` workflow and
    crates.io results. Its manual dispatch can retry a failed release after
    successful main CI.

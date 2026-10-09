@@ -16,6 +16,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
   CARGO_TARGET_DIR: ${{ github.workspace }}/ozzy/target
   RUSTFLAGS: -C target-cpu=x86-64
 
@@ -45,6 +47,7 @@ jobs:
       - run: ./scripts/test-all.sh tests
         env:
           NEXTEST_PROFILE: ci
+          NEXTEST_FINAL_STATUS_LEVEL: pass
 
   msrv:
     needs: lint

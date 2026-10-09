@@ -4,7 +4,9 @@ Ozzy requires Rust 1.93 or newer.
 
 CI uses published OMQ/fanring revisions and generic x86_64 codegen. Formatting
 and Clippy gate tests, MSRV, and the twelve-crate publishing dry run. PR/main use
-Nextest `ci`; weekly/manual `Extended` runs stress tests and Loom (Sunday 03:00 UTC).
+Nextest `ci` with bounded all-mode smoke tests; weekly/manual `Extended` runs
+broker lifecycle, recovery, churn, load, exhaustive crash-cut tests, and Loom
+(Sunday 03:00 UTC).
 See [RELEASING.md](RELEASING.md) for release PRs and trusted publishing.
 
 ## Local check
@@ -19,8 +21,9 @@ strict public API documentation.
 Use `scripts/test-all.sh lint` or `scripts/test-all.sh tests` to run only one
 phase; CI runs them in separate jobs.
 
-Executables and integration tests use the `ozzy_` prefix. Linux truncates process
-names to 15 characters; benchmark isolation resolves the full executable path.
+Tools and integration tests use the `ozzy_` prefix; the broker command is `ozzy`.
+Linux truncates process names to 15 characters; benchmark isolation resolves the
+full executable path.
 The suite also names its Cargo, compiler, and rustdoc processes. Use
 `scripts/ozzy_cargo build --workspace` for the same naming and artifact
 directory on individual commands. Clippy retains its own compiler wrapper.

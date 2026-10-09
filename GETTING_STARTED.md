@@ -10,7 +10,7 @@ Requires Linux and Rust 1.93+. Run these commands from the repository root:
 
 ```sh
 source scripts/ozzy_tools.sh
-scripts/ozzy_cargo build --locked --release -p ozzy-broker --bin ozzy_broker
+scripts/ozzy_cargo build --locked --release -p ozzy-broker --bin ozzy
 export PATH="$CARGO_TARGET_DIR/release:$PATH"
 ```
 
@@ -22,7 +22,7 @@ The sample binds loopback ports and stores data under `tmp/ozzy-single`.
 ozzy_dir="$PWD/tmp/ozzy-single"
 mkdir -p "$ozzy_dir/data"
 sed "s|/ozzy/data|$ozzy_dir/data|" ozzy-broker/container.toml > "$ozzy_dir/deployment.toml"
-ozzy() { ozzy_broker --config "$ozzy_dir/deployment.toml" "$@"; }
+ozzy() { command ozzy --config "$ozzy_dir/deployment.toml" "$@"; }
 
 ozzy validate --broker laptop
 ozzy init --identity "$ozzy_dir/shared.identity"
@@ -60,7 +60,7 @@ The image contains only the server; data lives in a persistent bind mount.
 ozzy_image="$PWD/tmp/ozzy-image"
 ozzy_container_dir="$PWD/tmp/ozzy-container"
 mkdir -p "$ozzy_image" "$ozzy_container_dir/data"
-cp "$CARGO_TARGET_DIR/release/ozzy_broker" "$ozzy_image/"
+cp "$CARGO_TARGET_DIR/release/ozzy" "$ozzy_image/"
 cp ozzy-broker/container.toml "$ozzy_container_dir/deployment.toml"
 podman build -f ozzy-broker/Containerfile -t localhost/ozzy:dev "$ozzy_image"
 ozzy_container() {
@@ -93,7 +93,7 @@ Provision this local example once:
 ozzy_dir="$PWD/tmp/ozzy-three"
 mkdir -p "$ozzy_dir"/broker-{0,1,2}
 sed "s|/var/tmp/ozzy-three|$ozzy_dir|g" ozzy-broker/three.toml > "$ozzy_dir/deployment.toml"
-ozzy_three() { ozzy_broker --config "$ozzy_dir/deployment.toml" "$@"; }
+ozzy_three() { command ozzy --config "$ozzy_dir/deployment.toml" "$@"; }
 ozzy_three init --identity "$ozzy_dir/shared.identity"
 for n in 0 1 2; do
   for step in init-broker init-volumes format; do

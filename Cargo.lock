@@ -1933,7 +1933,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "ozzy"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "omq-tokio",
  "ozzy-proto",
@@ -1943,7 +1943,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-bench"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "clap",
@@ -1977,7 +1977,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-broker"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "clap",
@@ -2004,7 +2004,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-config"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "thiserror",
@@ -2015,7 +2015,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ahash",
  "bytes",
@@ -2027,7 +2027,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-io"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "fanring",
@@ -2038,7 +2038,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-io-aio"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "ozzy-io",
@@ -2050,7 +2050,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-io-pool"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "fanring",
@@ -2065,7 +2065,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-journal"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "lz4rip",
@@ -2077,7 +2077,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-journal-segment"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ahash",
  "bytes",
@@ -2098,7 +2098,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-proto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "lz4rip",
@@ -2109,7 +2109,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-replication"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "ozzy-core",
@@ -2120,7 +2120,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -2149,7 +2149,7 @@ dependencies = [
 
 [[package]]
 name = "ozzy-sim"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "clap",
