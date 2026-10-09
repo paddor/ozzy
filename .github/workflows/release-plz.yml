@@ -14,13 +14,25 @@ env:
   RUSTFLAGS: -C target-cpu=x86-64
 
 jobs:
+  dispatch:
+    if: >-
+      github.repository == 'paddor/ozzy' &&
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch trusted release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run release-plz.yml --repo "$GITHUB_REPOSITORY" --ref main
+
   release-plz:
     if: >-
       github.repository == 'paddor/ozzy' &&
-      ((github.event_name == 'workflow_run' &&
-        github.event.workflow_run.event == 'push' &&
-        github.event.workflow_run.conclusion == 'success') ||
-       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
+      github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     concurrency:
       group: release-plz
@@ -45,7 +57,7 @@ jobs:
         id: revision
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TESTED_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          TESTED_SHA: ${{ github.sha }}
         run: |
           tested="$TESTED_SHA"
           latest=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
