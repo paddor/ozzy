@@ -10,6 +10,7 @@ on:
 permissions: {}
 
 env:
+  CARGO_REGISTRIES_CRATES_IO_INDEX: sparse+https://index.crates.io/
   RUSTFLAGS: -C target-cpu=x86-64
 
 jobs:
