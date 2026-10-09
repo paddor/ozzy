@@ -5,7 +5,8 @@ Ozzy requires Rust 1.93 or newer.
 CI uses published OMQ/fanring revisions and generic x86_64 codegen. Formatting
 and Clippy gate tests, MSRV, and the twelve-crate publishing dry run. PR/main use
 Nextest `ci` with bounded all-mode smoke tests; weekly/manual `Extended` runs
-broker lifecycle, recovery, churn, load tests, and Loom (Sunday 03:00 UTC).
+broker lifecycle, recovery, churn, load, exhaustive crash-cut tests, and Loom
+(Sunday 03:00 UTC).
 See [RELEASING.md](RELEASING.md) for release PRs and trusted publishing.
 
 ## Local check
