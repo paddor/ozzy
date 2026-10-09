@@ -11,7 +11,7 @@ readme = "README.md"
 publish = ["crates-io"]
 keywords = ["configuration", "deployment", "validation", "toml", "ozzy"]
 categories = ["config"]
-include = ["/src/**/*.rs", "/README.md", "/LICENSE", "/tests/fixtures/single.toml"]
+include = ["/src/**/*.rs", "/README.md", "/LICENSE", "/examples/*.toml"]
 
 [dependencies]
 serde.workspace = true
