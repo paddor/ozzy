@@ -10,12 +10,15 @@ use ozzy_journal_segment::{
 use ozzy_replication::PipelineLimits;
 use ozzy_runtime::replica_journal::OwnedConfig;
 
+const CORE_CHECKPOINT_BYTES: usize = 32 * 1024 * 1024;
+
 /// Finite journal work bounds. Shared shard admission bounds aggregate live requests.
 pub(super) struct Settings {
     limits: AsyncJournalLimits,
     recovery: CanonicalRecoveryLimits,
     pipeline: PipelineLimits,
     reads: AsyncPartitionReadLimits,
+    clients: usize,
 }
 
 impl Settings {
@@ -59,12 +62,11 @@ impl Settings {
             max_operations: operations,
             max_body_bytes: body,
         };
-        let checkpoint = CheckpointLimits {
-            max_manifest_bytes: 64 * 1024,
-            max_chunks: 512,
-            max_chunk_bytes: chunk,
-            max_state_bytes: 32 * 1024 * 1024,
-        };
+        let listing = ((progress / 256).min(1024), (progress / 4).min(64 * 1024));
+        let mut snapshot = CanonicalRecoveryLimits::default().snapshot;
+        snapshot.max_snapshot_bytes = CORE_CHECKPOINT_BYTES;
+        let checkpoint =
+            checkpoint_limits(placement, listing).map_err(|failure| error(&failure.to_string()))?;
         let index = IndexBuildLimits {
             max_entry_buffer_bytes: chunk,
             max_merge_fan_in: 8,
@@ -102,17 +104,18 @@ impl Settings {
                     }
                 },
             },
-            directory_entries: (progress / 256).min(1024),
-            directory_name_bytes: (progress / 4).min(64 * 1024),
+            directory_entries: listing.0,
+            directory_name_bytes: listing.1,
         };
         limits
             .validate_backend(backend, lane, &placement.directory)
             .map_err(|failure| error(&failure.to_string()))?;
         let recovery = CanonicalRecoveryLimits {
             retained_identities: 4096,
-            accepted_transitions: operations,
+            accepted_transitions: pipeline.backup().max_operations,
             checkpoint,
             index,
+            snapshot,
             ..CanonicalRecoveryLimits::default()
         };
         Ok(Self {
@@ -120,6 +123,7 @@ impl Settings {
             recovery,
             pipeline,
             reads: reader_limits(index, resident_operations, resident_bytes),
+            clients: checked.deployment.deployment().limits.max_clients,
         })
     }
 
@@ -135,9 +139,18 @@ impl Settings {
             configuration,
             limits: self.limits,
             recovery: self.recovery,
+            deduplication: placement.deduplication.map(|policy| {
+                ozzy_runtime::replica_journal::dedup_limits(
+                    policy.window_millis,
+                    policy.max_entries as usize,
+                    policy.max_bytes as usize,
+                    self.limits.operations.max_records,
+                    self.pipeline,
+                )
+            }),
             // Native intake arenas, plus the actor's own receive, transfer,
             // and bootstrap leases.
-            append_buffers: crate::serving::NATIVE_ARENAS + 32,
+            append_buffers: crate::serving::native_arenas(self.clients) + 32,
             append_limits: self.pipeline,
             writeback: self.pipeline,
             write_group_bytes: self.pipeline.max_body_bytes,
@@ -279,6 +292,19 @@ fn check_write(
         return Err("APPEND framing and backend staging exceed the device or segment budget");
     }
     Ok(())
+}
+
+fn checkpoint_limits(
+    placement: &PartitionPlacement,
+    listing: (usize, usize),
+) -> Result<CheckpointLimits, ozzy_journal_segment::CheckpointError> {
+    CheckpointLimits::for_canonical_image(
+        CORE_CHECKPOINT_BYTES,
+        placement
+            .deduplication
+            .map_or(0, |policy| policy.max_entries),
+        listing,
+    )
 }
 
 #[cfg(test)]

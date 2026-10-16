@@ -70,6 +70,7 @@ struct Network {
     peers: BTreeMap<NodeId, LinkSessionId>,
     replies: FuturesUnordered<Pending<ReplyResult>>,
     retries: VecDeque<Message>,
+    sequence: u64,
 }
 
 impl Network {
@@ -119,7 +120,11 @@ impl Network {
                 Class::Control
             }
         };
-        match self.port.try_reply(class, message, backing(class)) {
+        self.sequence += 1;
+        match self
+            .port
+            .try_reply(class, message, backing(class), self.sequence)
+        {
             Ok(pending) => {
                 self.replies.push(pending);
                 Ok(())
@@ -278,6 +283,7 @@ async fn serve(mut context: ShardContext, run: ShardRun) -> Result<(), StartupEr
             .collect(),
         replies: FuturesUnordered::new(),
         retries: VecDeque::new(),
+        sequence: 0,
     };
     let clock = std::time::Instant::now();
     let mut now = Duration::ZERO;

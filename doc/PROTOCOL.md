@@ -18,9 +18,9 @@ PEER sockets connect every broker; partitions add no sockets. Replicated groups
 have exactly three members; local durability uses explicit one-broker authority.
 Wrong-leader replies are scoped hints; brokers do not forward SDK APPENDs.
 
-Topic lookup, producer opening, route watches, and explicit recovery exist.
-Online creation/expansion, discovery, membership, and consumer groups do not.
-Reserved opcodes/capabilities imply no service.
+Topic lookup, producer opening, route watches, consumer groups, and explicit
+recovery exist. Online creation/expansion, discovery, and broker membership do
+not. Reserved opcodes/capabilities imply no service.
 
 ## Envelope and primitive encoding
 
@@ -93,13 +93,14 @@ separately from initiator bounds. Outstanding-work capacity remains owner-local.
 | 4 | Durable VSR |
 | 6 | Snapshot transfer |
 | 7 | Directory state |
-| 8 | Groups |
+| 8 | Consumer-group membership and source activation; requires 12 |
 | 9 | Replica receipt flow |
 | 10 | Owner authority hints |
 | 11 | Reader delivery/volatile progress |
+| 12 | Durable consumer progress; requires 11 |
 | 13 | Streaming append; requires 1 |
 
-Capabilities 5, 12, and 14 are unassigned. Shared partition APPEND requires 13;
+Capabilities 5 and 14 are unassigned. Shared partition APPEND requires 13;
 group-aware writers also require 10. Reader-only negotiation need not require
 writer capabilities. Nonstreaming low-level clients have one outstanding APPEND.
 A streaming endpoint cannot silently downgrade the profile.
@@ -167,6 +168,7 @@ retries and replicated canonical bodies preserve their exact encoding.
 | `30..3f` | REPLICA_OPEN, REPLICA_STATE, PREPARE, PREPARE_OK, COMMIT, START_VIEW_CHANGE, DO_VIEW_CHANGE, START_VIEW, RECOVERY, RECOVERY_STATE, FETCH_OPS, OPS, SNAPSHOT_BEGIN, SNAPSHOT_CHUNK, SNAPSHOT_END, SNAPSHOT_INSTALLED |
 | `40..43` | STATE_SNAPSHOT_REQUEST, STATE_SNAPSHOT, STATE_UPDATE, STATE_RESYNC |
 | `50..53` | EXIT_VIEW, PREPARE_FLOW, PREPARE_PUB, RECORDS_PUB |
+| `60..67` | GROUP_JOIN, GROUP_JOINED, GROUP_ASSIGN, GROUP_ASSIGNED, GROUP_INSPECT, GROUP_INSPECTED, GROUP_DELETE, GROUP_DELETED |
 | `7f` | NACK |
 
 `0x55` is HISTORY_RETIRED. Only negotiated command families are usable; unknown
@@ -257,7 +259,7 @@ Capability 13 selects consecutive record-based APPEND and range confirmation.
 SDK cap is 2,048 records; negotiated metadata/payload/part/record bounds still
 apply. Routing precedes batching; packet/group boundaries imply no transaction.
 
-Group APPENDED has 106 metadata bytes and empty payload:
+Group APPENDED has 107 metadata bytes and empty payload:
 
 | Offset | Width | Field |
 | ---: | ---: | --- |
@@ -265,15 +267,19 @@ Group APPENDED has 106 metadata bytes and empty payload:
 | 1 | 88 | Authority, partition, owner epoch, append key |
 | 89 | 8 | Exclusive confirmed sequence end |
 | 97 | 8 | First confirmed partition offset |
-| 105 | 1 | Achieved policy |
+| 105 | 1 | Disposition: stored 0, duplicate 1 |
+| 106 | 1 | Achieved policy |
 
 Local streaming form replaces group scope with tag 0, stream:text, topic:text,
 local partition:u32; remaining fields are unchanged. Each nonempty range binds
-one producer/epoch/partition/owner/policy. It can partially confirm a request or
+one producer/epoch/partition/owner/policy/disposition. It can partially confirm a request or
 span requests and overlap an already confirmed prefix, never skip records.
-The request ID names a live APPEND; sender/session/authority/sent bounds and
-stable sequence-to-offset mapping validate before completion. Interleaved writers
-can require several ranges for a retry.
+The request ID names a live APPEND holding part of the range; sender, session,
+authority, sent bounds, and the stable sequence-to-offset mapping validate
+before completion. Interleaved writers
+can require several ranges for a retry. Duplicate attempts return original
+offsets, which may repeat or move backward across ranges. Their disposition
+and offset remain immutable for each confirmed producer sequence.
 
 DQ replies follow applied synchronized history; RP replies follow applied
 leader-plus-follower retained history. Reconnect discards correlation and retries
@@ -336,8 +342,99 @@ explicit; records are never split or silently skipped.
 
 ACK positions are inclusive, processed <= received, and volatile. Notifications
 are uncorrelated; shared SDK processing ACK uses a correlated echo. ACK grants
-no capacity, write confirmation, or durable processing progress. Reserved PROGRESS_COMMIT,
-PROGRESS_COMMITTED, capability 12, and opcode 0x26 provide no service.
+no capacity, write confirmation, or durable processing progress. Opcode 0x26
+remains reserved.
+
+### Durable consumer progress
+
+Capability 12 uses addressed control requests on the existing source link;
+consumer role and a current source assignment are required. Capability 8 adds
+the membership and activation commands below.
+
+| Command | Metadata after source tag `u8=1` | Payload |
+| --- | --- | --- |
+| PROGRESS_COMMIT | Authority, partition incarnation, consumer group ID, member ID, assignment epoch:u64, policy:u8, cursor tag:u8, cursor:u64 | Empty |
+| PROGRESS_COMMITTED | Same identity/policy fields, cursor:u64, retained floor:u64, confirmed end:u64 | Empty |
+
+All IDs and assignment epochs are nonzero. Queries use tag/value `0/0`; updates
+use tag `1` and an exclusive cursor, including zero. Metadata is 99/114 bytes.
+Member, epoch, authority and policy are fenced before admission. Updates cannot
+exceed the confirmed record end. Covered retries wait for their accepted prefix
+without appending; queries read confirmed state. A confirmation proves the
+source policy boundary, never exactly-once application processing.
+
+Resuming below retained history returns code 9 with the preserved cursor and
+floor (`u64, u64`). A covered update can confirm an older cursor below the floor;
+that confirmation does not claim retained history is available for replay.
+
+### Consumer groups
+
+A group is scoped to one topic. Its coordinator is partition
+`XXH3-64(name, topic seed) % count`; membership and plans live in that
+partition's journal. Members send `GROUP_JOIN` to the coordinator leader and
+relay each committed target to its source leader with `GROUP_ASSIGN`. The
+source allocates the assignment epoch, captures the resume cursor, and fences
+older plan revisions. All commands are correlated control requests with empty
+payloads; every ID is nonzero unless stated.
+
+| Command | Metadata after source tag `u8=1` |
+| --- | --- |
+| GROUP_JOIN | Authority, coordinator incarnation, name (`u8` length, UTF-8), member ID, join ID, group ID, mode `u8`, start selector, owned list |
+| GROUP_JOINED | Authority, coordinator incarnation, group ID, revision `u64`, status `u8`, target list |
+| GROUP_ASSIGN | Authority, source incarnation, group ID, member ID, plan revision `u64`, start selector, policy `u8` |
+| GROUP_ASSIGNED | Authority, source incarnation, group ID, member ID, epoch `u64`, plan revision `u64`, cursor `u64`, retained floor `u64`, confirmed end `u64`, policy `u8` |
+| GROUP_INSPECT | Authority, coordinator incarnation, name |
+| GROUP_INSPECTED | Authority, coordinator incarnation, group ID, revision `u64`, start selector, member list, target list |
+| GROUP_DELETE | Authority, coordinator incarnation, group ID, name |
+| GROUP_DELETED | Authority, coordinator incarnation, group ID, status `u8` |
+
+Modes are `0` heartbeat, `1` join, `2` leave. A join carries a fresh join ID;
+a later join of the same member ID fences the earlier instance. The start
+selector is nine bytes: tag `0` earliest, `1` latest, or `2` plus an exact
+offset `u64`; it applies only to a source without persisted progress and is
+immutable after the group is created. The owned list is `u32` count plus
+32-byte entries (partition incarnation, plan revision, epoch), at most 1,024.
+The join's group ID names the incarnation the instance first joined, or zero
+before it knows one; a coordinator whose committed image no longer holds that
+incarnation replies status `3` deleted instead of creating a new one. Fixed join
+metadata is 112 bytes plus the name and entries.
+
+Status `0` member lists the instance's targets; `1` joining, `2` unknown, and
+`3` deleted carry no targets, and a zero group ID appears only while the group
+is still being created or after its incarnation was deleted. Targets are 45 bytes each: partition incarnation, number `u32`,
+plan revision, activatable `u8`, prior member ID (zero when none). Fixed reply
+metadata is 78 bytes. A target becomes activatable when its prior instance
+released it, left, timed out, or exceeded the drain deadline.
+A new coordinator leader adopts the committed plan with unknown prior
+ownership. It waits for a matching instance's ownership report or a full
+drain deadline under its leadership; an absent report is not a release.
+
+GROUP_ASSIGN is 99 bytes and GROUP_ASSIGNED 122. A repeated plan revision
+returns the originally captured epoch and cursor; an older revision fails with
+code 6 and a different owner for the same revision with code 8. A creation
+offset outside confirmed retained history fails with code 7 and a 24-byte
+detail (`cursor, retained_from, end`). A fenced join fails with code 6.
+Replies follow the coordinator or source confirmation boundary. A zero member
+ID revokes the source: the reply names no member, and deletion revokes at plan
+revision `u64::MAX`, fencing every plan, epoch, and progress update of that
+incarnation on the source.
+`GroupReader` rejoins with a fresh join ID after a fenced or unknown instance.
+It discards the old instance's delivery tokens and resumes from
+source-confirmed cursors; late acknowledgments are fenced. A deleted status or
+a different incarnation stops the reader.
+
+GROUP_INSPECT reads the committed coordinator image; its fixed metadata is 50
+bytes plus the name. GROUP_INSPECTED carries a zero group ID, revision zero, and
+empty lists when no group has the name. Members are 48 bytes each (member,
+node, and join IDs) after a `u32` count; targets are 44 bytes each (partition
+incarnation, number `u32`, plan revision, member ID or zero) after a `u32`
+count. Fixed reply metadata is 90 bytes. GROUP_DELETE retires the named
+incarnation if the name still holds it; its fixed metadata is 66 bytes plus the
+name. GROUP_DELETED is 66 bytes; status `0` means this request retired the
+incarnation and `1` that it was already gone. Its reply follows the
+coordinator's confirmation of a `GroupDelete` operation. A plan or deletion in
+flight for the name fails with code 10. Clients revoke every source before
+deleting so no member keeps progressing.
 
 ### Live reader publication
 
@@ -503,15 +600,15 @@ Diagnostics never determine behavior; unknown codes preserve raw typed detail.
 
 | Code | Meaning | Retry class |
 | ---: | --- | --- |
-| 1 | Malformed or oversized command | permanent |
+| 1 | Malformed or oversized command, including an invalid dedup batch | permanent |
 | 2 | Unsupported command or policy | permanent |
 | 3 | Source/producer identity not authorized | permanent |
 | 5 | Stale/foreign group, configuration, or view | after-authority-refresh |
-| 6 | Unknown partition or fenced owner/producer | permanent |
-| 7 | Sequence gap | permanent |
+| 6 | Unknown partition or fenced owner/producer/consumer assignment | permanent |
+| 7 | Invalid sequence, processing cursor, or group start outside confirmed retained history | permanent |
 | 8 | Retry identity conflicts with retained records | permanent |
-| 9 | Retry history expired | permanent |
-| 10 | Capacity unavailable or earlier writer sequences missing | after-backoff |
+| 9 | Retry or processing history expired | permanent |
+| 10 | Capacity unavailable, including dedup identity capacity, or earlier writer sequences missing | after-backoff |
 | 11 | Storage/validation uncertainty | unknown-outcome |
 | 12 | Writer not admitted by current primary, or reader broker unavailable | after-authority-refresh |
 | 13 | Authority changed after admission | unknown-outcome |
@@ -533,6 +630,7 @@ Clients validate scope and configured primary selection; hints grant no activati
 | ---: | --- |
 | 14 / 19 | Earliest retained offset:u64 |
 | 16 | Confirmed end:u64 |
+| 7 (group start) | Cursor:u64, retained floor:u64, confirmed end:u64 |
 | 17 | Payload bytes:u64, parts:u64 |
 | 20 | First/last matching offsets:u64 each |
 

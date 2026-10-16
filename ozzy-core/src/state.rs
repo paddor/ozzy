@@ -11,6 +11,8 @@ use ozzy_proto::{
 use thiserror::Error;
 
 mod admission;
+mod groups;
+pub use groups::{CoordinatorGroup, group_targets};
 mod append;
 mod identity;
 mod images;
@@ -21,7 +23,10 @@ pub use identity::{
 mod producer;
 mod snapshot;
 
-pub use producer::{CanonicalProducer, ProducerResultSpan, ProducerTransition};
+use producer::PreparedProducerResults;
+pub use producer::{
+    CanonicalProducer, ProducerResultSource, ProducerResultSpan, ProducerTransition,
+};
 
 pub use images::{
     CanonicalImages, CanonicalImagesError, CanonicalRecovery, PreparedCanonicalGroup,
@@ -44,6 +49,12 @@ pub struct StateLimits {
     pub max_progress: usize,
     /// Maximum consumer-group partition assignments.
     pub max_assignments: usize,
+    /// Maximum durable coordinator group incarnations.
+    pub max_groups: usize,
+    /// Maximum members across coordinator groups.
+    pub max_group_members: usize,
+    /// Maximum source intents across coordinator groups.
+    pub max_group_partitions: usize,
 }
 
 impl Default for StateLimits {
@@ -54,6 +65,9 @@ impl Default for StateLimits {
             max_retry_spans: 1_048_576,
             max_progress: 1_048_576,
             max_assignments: 1_048_576,
+            max_groups: 65_536,
+            max_group_members: 1_048_576,
+            max_group_partitions: 1_048_576,
         }
     }
 }
@@ -85,6 +99,10 @@ pub struct CanonicalPartition {
     pub policy_revision: u64,
     /// Installed retention policy.
     pub retention: RetentionPolicy,
+    /// Immutable first-wins event window; absent means deduplication is disabled.
+    pub dedup_window_millis: Option<std::num::NonZeroU64>,
+    /// Confirmed or speculative replicated deduplication clock watermark.
+    pub dedup_time: u64,
 }
 
 impl CanonicalPartition {
@@ -115,6 +133,10 @@ impl CanonicalPartition {
 pub struct AssignmentState {
     /// Current assignment fence.
     pub epoch: u64,
+    /// Latest coordinator plan applied to this source partition.
+    pub plan_revision: u64,
+    /// Exclusive cursor captured with this assignment, unchanged by later progress.
+    pub resume_cursor: Offset,
     /// Assigned member, or no owner when revoked.
     pub member: Option<ConsumerMemberId>,
 }
@@ -149,6 +171,9 @@ pub struct CanonicalState {
     addresses: HashMap<PartitionAddress, PartitionIncarnation>,
     progress: HashMap<ProgressKey, Offset>,
     assignments: HashMap<AssignmentKey, AssignmentState>,
+    groups: HashMap<ConsumerGroupId, std::sync::Arc<CoordinatorGroup>>,
+    group_member_count: usize,
+    group_target_count: usize,
     producer_count: usize,
     retry_span_count: usize,
 }
@@ -164,6 +189,16 @@ struct AssignmentKey(ConsumerGroupId, PartitionIncarnation);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Mutation {
+    GroupPlan {
+        value: std::sync::Arc<CoordinatorGroup>,
+        members: usize,
+        sources: usize,
+    },
+    GroupDelete {
+        group: ConsumerGroupId,
+        members: usize,
+        sources: usize,
+    },
     Create {
         partition: PartitionIncarnation,
         state: CanonicalPartition,
@@ -175,6 +210,12 @@ enum Mutation {
         transition: ProducerTransition,
     },
     Append(SmallVec<[AppendCursor; 4]>),
+    ResolvedAppend {
+        partition: PartitionIncarnation,
+        producer: ProducerId,
+        results: PreparedProducerResults,
+        time: u64,
+    },
     Progress {
         key: ProgressKey,
         value: Offset,
@@ -196,6 +237,10 @@ enum Mutation {
         partition: PartitionIncarnation,
         producer: ProducerId,
         floor: ProducerSequence,
+    },
+    DedupTime {
+        partition: PartitionIncarnation,
+        time: u64,
     },
     Barrier,
 }
@@ -222,6 +267,9 @@ impl CanonicalState {
             addresses: HashMap::new(),
             progress: HashMap::new(),
             assignments: HashMap::new(),
+            groups: HashMap::new(),
+            group_member_count: 0,
+            group_target_count: 0,
             producer_count: 0,
             retry_span_count: 0,
         }
@@ -324,6 +372,15 @@ fn require_id(kind: &'static str, bytes: &[u8; 16]) -> Result<(), StateError> {
 /// Deterministic canonical application-state validation failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum StateError {
+    /// A coordinator image has invalid members, source epochs, or balance.
+    #[error("invalid consumer group plan")]
+    InvalidGroupPlan,
+    /// A membership transition no longer matches the coordinator revision.
+    #[error("consumer group revision mismatch")]
+    GroupRevisionMismatch,
+    /// A group name, incarnation, coordinator, or topology changed.
+    #[error("consumer group identity mismatch")]
+    GroupIdentityMismatch,
     #[error(transparent)]
     /// The exact identity index rejected lookup or reservation.
     IdentityIndex(#[from] IdentityIndexError),
@@ -387,18 +444,30 @@ pub enum StateError {
     #[error("consumer progress did not advance")]
     /// The declared progress does not advance.
     ProgressNotAdvanced,
-    #[error("consumer progress exceeds committed records")]
+    #[error("consumer progress exceeds the partition's records")]
     /// Consumer progress would pass confirmed application state.
-    ProgressBeyondCommit,
+    ProgressBeyondRecords,
     #[error("consumer-group assignment does not exist")]
     /// The consumer group has no assignment for this partition.
     MissingAssignment,
     #[error("consumer-group assignment epoch does not match")]
     /// The assignment fence differs from current state.
     AssignmentEpochMismatch,
+    #[error("consumer-group member does not own the assignment")]
+    /// The assignment is revoked or belongs to a different member.
+    AssignmentMemberMismatch,
     #[error("consumer-group assignment epoch did not advance by one")]
     /// The assignment transition does not advance its fence.
     AssignmentEpochNotAdvanced,
+    #[error("consumer-group assignment plan did not advance")]
+    /// A delayed coordinator plan cannot supersede a newer source assignment.
+    AssignmentPlanNotAdvanced,
+    #[error("consumer-group assignment cursor differs from existing progress")]
+    /// A handoff must preserve the exact accepted processing prefix.
+    AssignmentProgressMismatch,
+    #[error("initial consumer-group cursor is outside confirmed retained history")]
+    /// A first assignment cannot silently skip unavailable or unconfirmed history.
+    InvalidAssignmentCursor,
     #[error("trim floor expectation does not match")]
     /// The expected retention floor differs from current state.
     TrimFloorMismatch,
@@ -420,4 +489,7 @@ pub enum StateError {
     #[error("producer retry-result floor did not advance within the current session")]
     /// The proposed retry floor is outside the producer result range.
     InvalidProducerResultFloor,
+    #[error("deduplication logical time did not advance")]
+    /// An idle watermark must strictly advance the current logical time.
+    DedupTimeNotAdvanced,
 }

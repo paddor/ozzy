@@ -16,7 +16,7 @@ use crate::{
 };
 
 const INDEX_MAGIC: &[u8; 8] = b"OZYIDX01";
-const INDEX_VERSION: u16 = 2;
+const INDEX_VERSION: u16 = 3;
 pub(crate) const INDEX_HASH_CONTEXT: &str = "ozzy segment index file v1";
 pub(crate) const INDEX_DIGEST_START: usize = 256;
 pub(crate) const INDEX_DIGEST_END: usize = 288;
@@ -29,18 +29,22 @@ pub const OFFSET_INDEX_ENTRY_BYTES: usize = 96;
 pub const MESSAGE_INDEX_ENTRY_BYTES: usize = 80;
 /// Exact encoded canonical operation selector length.
 pub const OPERATION_INDEX_ENTRY_BYTES: usize = 80;
+/// Exact encoded numeric operation selector length.
+pub const OPERATION_LOCATION_BYTES: usize = 56;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct IndexCounts {
     pub offsets: usize,
     pub messages: usize,
     pub operations: usize,
+    pub locations: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct IndexLayout {
     pub message_start: usize,
     pub operation_start: usize,
+    pub location_start: usize,
     pub file_bytes: usize,
 }
 
@@ -95,6 +99,7 @@ pub struct SegmentIndexImage {
     offsets: Vec<OffsetIndexEntry>,
     messages: Vec<MessageIndexEntry>,
     operations: Vec<OperationIndexEntry>,
+    locations: Vec<OperationLocation>,
 }
 
 impl SegmentIndexImage {
@@ -105,16 +110,19 @@ impl SegmentIndexImage {
         mut offsets: Vec<OffsetIndexEntry>,
         mut messages: Vec<MessageIndexEntry>,
         mut operations: Vec<OperationIndexEntry>,
+        mut locations: Vec<OperationLocation>,
     ) -> Result<Self, IndexFileError> {
         offsets.sort_unstable_by(compare_offset_entries);
         messages.sort_unstable_by(compare_message_entries);
         operations.sort_unstable_by(compare_operation_entries);
+        locations.sort_unstable_by(compare_locations);
         let image = Self {
             source,
             build_memory_limit,
             offsets,
             messages,
             operations,
+            locations,
         };
         validate_image(&image)?;
         Ok(image)
@@ -144,6 +152,17 @@ impl SegmentIndexImage {
     pub fn operations(&self) -> &[OperationIndexEntry] {
         &self.operations
     }
+
+    /// Every canonical operation in numeric order, including appends.
+    pub fn locations(&self) -> &[OperationLocation] {
+        &self.locations
+    }
+
+    /// Exact operation in this validated dense numeric prefix.
+    pub fn find_operation_number(&self, number: u64) -> Option<OperationLocation> {
+        let at = usize::try_from(number.checked_sub(self.source.first_op_number)?).ok()?;
+        self.locations.get(at).copied()
+    }
 }
 
 /// Validated zero-copy view over one complete immutable index file.
@@ -154,6 +173,7 @@ pub struct SegmentIndexView<'a> {
     offsets: &'a [u8],
     messages: &'a [u8],
     operations: &'a [u8],
+    locations: &'a [u8],
 }
 
 impl SegmentIndexView<'_> {
@@ -180,6 +200,22 @@ impl SegmentIndexView<'_> {
     /// Number of canonical operation-identity selectors.
     pub fn operation_count(&self) -> usize {
         self.operations.len() / OPERATION_INDEX_ENTRY_BYTES
+    }
+
+    /// Number of numeric selectors, covering the complete source prefix.
+    pub fn location_count(&self) -> usize {
+        self.locations.len() / OPERATION_LOCATION_BYTES
+    }
+
+    /// Locate an exact canonical operation without scanning segment payloads.
+    pub fn find_operation_number(&self, number: u64) -> Option<OperationLocation> {
+        let at = usize::try_from(number.checked_sub(self.source.first_op_number)?).ok()?;
+        let entry = self
+            .locations
+            .as_chunks::<OPERATION_LOCATION_BYTES>()
+            .0
+            .get(at)?;
+        Some(decode_operation_location(entry, self.source.segment_id))
     }
 
     /// Look up an exact partition incarnation and global record offset.
@@ -296,7 +332,8 @@ impl<'a> SegmentIndexView<'a> {
             build_memory_limit,
             offsets: &bytes[INDEX_HEADER_BYTES..layout.message_start],
             messages: &bytes[layout.message_start..layout.operation_start],
-            operations: &bytes[layout.operation_start..],
+            operations: &bytes[layout.operation_start..layout.location_start],
+            locations: &bytes[layout.location_start..],
         }
     }
 }
@@ -328,6 +365,7 @@ pub fn encode_segment_index(
         offsets: image.offsets.len(),
         messages: image.messages.len(),
         operations: image.operations.len(),
+        locations: image.locations.len(),
     };
     let layout = calculate_index_layout(counts, limits)?;
 
@@ -353,11 +391,18 @@ pub fn encode_segment_index(
         encode_message_entry(entry, target);
     }
     for (entry, target) in image.operations.iter().zip(
-        output[layout.operation_start..]
+        output[layout.operation_start..layout.location_start]
             .as_chunks_mut::<OPERATION_INDEX_ENTRY_BYTES>()
             .0,
     ) {
         encode_operation_entry(entry, target);
+    }
+    for (entry, target) in image.locations.iter().zip(
+        output[layout.location_start..]
+            .as_chunks_mut::<OPERATION_LOCATION_BYTES>()
+            .0,
+    ) {
+        encode_operation_location(entry, target);
     }
     let digest = index_digest(&output);
     output[INDEX_DIGEST_START..INDEX_DIGEST_END].copy_from_slice(digest.as_bytes());
@@ -407,11 +452,12 @@ fn validate_header(input: &[u8], limits: IndexLimits) -> Result<(), IndexFileErr
     require_zero(header, 148..152)?;
     require_zero(header, 172..176)?;
     require_zero(header, 196..200)?;
-    require_zero(header, 216..256)?;
+    require_zero(header, 236..256)?;
     require_zero(header, 288..INDEX_HEADER_BYTES)?;
     if read_u32(header, 144) != OFFSET_INDEX_ENTRY_BYTES as u32
         || read_u32(header, 168) != MESSAGE_INDEX_ENTRY_BYTES as u32
         || read_u32(header, 192) != OPERATION_INDEX_ENTRY_BYTES as u32
+        || read_u32(header, 232) != OPERATION_LOCATION_BYTES as u32
     {
         return Err(IndexFileError::UnsupportedEntryWidth);
     }
@@ -445,24 +491,36 @@ fn decode_sections(
         limits.max_operation_entries,
         "operation entries",
     )?;
+    let location_count = count_from_header(
+        header,
+        216,
+        limits.max_operation_entries,
+        "operation locations",
+    )?;
     if offset_count != message_count {
         return Err(IndexFileError::RecordIndexCountMismatch);
     }
     let offset_start = usize_from_u64(read_u64(header, 136))?;
     let message_start = usize_from_u64(read_u64(header, 160))?;
     let operation_start = usize_from_u64(read_u64(header, 184))?;
+    let location_start = usize_from_u64(read_u64(header, 224))?;
     let expected_message_start = INDEX_HEADER_BYTES
         .checked_add(section_bytes(offset_count, OFFSET_INDEX_ENTRY_BYTES)?)
         .ok_or(IndexFileError::LengthOverflow)?;
     let expected_operation_start = expected_message_start
         .checked_add(section_bytes(message_count, MESSAGE_INDEX_ENTRY_BYTES)?)
         .ok_or(IndexFileError::LengthOverflow)?;
-    let expected_file_bytes = expected_operation_start
+    let expected_location_start = expected_operation_start
         .checked_add(section_bytes(operation_count, OPERATION_INDEX_ENTRY_BYTES)?)
         .ok_or(IndexFileError::LengthOverflow)?;
+    let expected_file_bytes = expected_location_start
+        .checked_add(section_bytes(location_count, OPERATION_LOCATION_BYTES)?)
+        .ok_or(IndexFileError::LengthOverflow)?;
+    validate_location_count(source, location_count)?;
     if offset_start != INDEX_HEADER_BYTES
         || message_start != expected_message_start
         || operation_start != expected_operation_start
+        || location_start != expected_location_start
         || file_bytes != expected_file_bytes
     {
         return Err(IndexFileError::InvalidSectionLayout);
@@ -470,13 +528,15 @@ fn decode_sections(
 
     let offsets = &input[offset_start..message_start];
     let messages = &input[message_start..operation_start];
-    let operations = &input[operation_start..];
+    let operations = &input[operation_start..location_start];
+    let locations = &input[location_start..];
     Ok(SegmentIndexView {
         source,
         build_memory_limit: read_u64(header, 208),
         offsets,
         messages,
         operations,
+        locations,
     })
 }
 
@@ -490,6 +550,7 @@ fn validate_image(image: &SegmentIndexImage) -> Result<(), IndexFileError> {
 
 fn validate_image_header(image: &SegmentIndexImage) -> Result<(), IndexFileError> {
     validate_source(image.source)?;
+    validate_location_count(image.source, image.locations.len())?;
     if image.offsets.len() != image.messages.len() {
         return Err(IndexFileError::RecordIndexCountMismatch);
     }
@@ -515,11 +576,24 @@ fn image_checks(
                 return Err(IndexFileError::NonZeroReserved);
             }
             validate_location(image.source, entry.location.operation)?;
+            validate_indexed_location(entry.location.operation, |number| {
+                image.find_operation_number(number)
+            })?;
             Ok(OFFSET_INDEX_ENTRY_BYTES)
         }))
         .chain(image.operations.iter().map(|entry| {
             validate_location(image.source, entry.location)?;
+            validate_indexed_location(entry.location, |number| {
+                image.find_operation_number(number)
+            })?;
             Ok(OPERATION_INDEX_ENTRY_BYTES)
+        }))
+        .chain(image.locations.iter().enumerate().map(|(at, &location)| {
+            validate_numeric_location(image.source, at, location)?;
+            if let Some(previous) = at.checked_sub(1).map(|at| image.locations[at]) {
+                validate_extent_order(previous, location)?;
+            }
+            Ok(OPERATION_LOCATION_BYTES)
         }))
         .chain(image.messages.iter().map(|message| {
             if image
@@ -589,6 +663,12 @@ fn section_checks(
                             .location
                             .operation,
                     )?;
+                    validate_indexed_location(
+                        decode_offset_entry(entry, source.segment_id)
+                            .location
+                            .operation,
+                        |number| view.find_operation_number(number),
+                    )?;
                     Ok(OFFSET_INDEX_ENTRY_BYTES)
                 }),
         )
@@ -621,9 +701,85 @@ fn section_checks(
                         source,
                         decode_operation_entry(entry, source.segment_id).location,
                     )?;
+                    validate_indexed_location(
+                        decode_operation_entry(entry, source.segment_id).location,
+                        |number| view.find_operation_number(number),
+                    )?;
                     Ok(OPERATION_INDEX_ENTRY_BYTES)
                 }),
         )
+        .chain(
+            view.locations
+                .as_chunks::<OPERATION_LOCATION_BYTES>()
+                .0
+                .iter()
+                .enumerate()
+                .map(move |(at, entry)| {
+                    validate_numeric_location(
+                        source,
+                        at,
+                        decode_operation_location(entry, source.segment_id),
+                    )?;
+                    if let Some(previous) = at.checked_sub(1) {
+                        let rows = view.locations.as_chunks::<OPERATION_LOCATION_BYTES>().0;
+                        validate_extent_order(
+                            decode_operation_location(&rows[previous], source.segment_id),
+                            decode_operation_location(entry, source.segment_id),
+                        )?;
+                    }
+                    Ok(OPERATION_LOCATION_BYTES)
+                }),
+        )
+}
+
+fn validate_location_count(source: IndexSource, count: usize) -> Result<(), IndexFileError> {
+    if u64::try_from(count).ok()
+        != source
+            .last_op_number
+            .checked_sub(source.first_op_number)
+            .and_then(|n| n.checked_add(1))
+    {
+        return Err(IndexFileError::InvalidLocation);
+    }
+    Ok(())
+}
+
+fn validate_numeric_location(
+    source: IndexSource,
+    at: usize,
+    location: OperationLocation,
+) -> Result<(), IndexFileError> {
+    if source.first_op_number.checked_add(at as u64) != Some(location.op_number) {
+        return Err(IndexFileError::InvalidLocation);
+    }
+    validate_location(source, location)
+}
+
+fn validate_indexed_location(
+    location: OperationLocation,
+    find: impl FnOnce(u64) -> Option<OperationLocation>,
+) -> Result<(), IndexFileError> {
+    if find(location.op_number) != Some(location) {
+        return Err(IndexFileError::InvalidLocation);
+    }
+    Ok(())
+}
+
+fn validate_extent_order(
+    previous: OperationLocation,
+    next: OperationLocation,
+) -> Result<(), IndexFileError> {
+    let shared =
+        previous.entry_offset == next.entry_offset && previous.entry_bytes == next.entry_bytes;
+    if !shared
+        && previous
+            .entry_offset
+            .checked_add(previous.entry_bytes)
+            .is_none_or(|end| end > next.entry_offset)
+    {
+        return Err(IndexFileError::InvalidLocation);
+    }
+    Ok(())
 }
 
 fn validate_location(
@@ -635,6 +791,7 @@ fn validate_location(
         .checked_add(location.entry_bytes)
         .ok_or(IndexFileError::LengthOverflow)?;
     if location.segment_id != source.segment_id
+        || location.operation_digest == Digest::ZERO
         || location.entry_offset < SEGMENT_HEADER_BYTES as u64
         || !location.entry_offset.is_multiple_of(8)
         || location.entry_bytes < ENTRY_HEADER_BYTES as u64
@@ -678,6 +835,9 @@ pub(crate) fn encode_index_header(
     put_u32(&mut header, 192, OPERATION_INDEX_ENTRY_BYTES as u32);
     put_u64(&mut header, 200, u64_from_usize(layout.file_bytes)?);
     put_u64(&mut header, 208, build_memory_limit);
+    put_u64(&mut header, 216, u64_from_usize(counts.locations)?);
+    put_u64(&mut header, 224, u64_from_usize(layout.location_start)?);
+    put_u32(&mut header, 232, OPERATION_LOCATION_BYTES as u32);
     Ok(header)
 }
 
@@ -737,6 +897,27 @@ pub(crate) fn encode_operation_entry(entry: &OperationIndexEntry, output: &mut [
     put_u64(output, 24, entry.location.entry_offset);
     put_u64(output, 32, entry.location.entry_bytes);
     output[40..72].copy_from_slice(entry.location.operation_digest.as_bytes());
+}
+
+pub(crate) fn encode_operation_location(location: &OperationLocation, output: &mut [u8]) {
+    put_u64(output, 0, location.op_number);
+    put_u64(output, 8, location.entry_offset);
+    put_u64(output, 16, location.entry_bytes);
+    output[24..56].copy_from_slice(location.operation_digest.as_bytes());
+}
+
+fn decode_operation_location(input: &[u8], segment_id: u64) -> OperationLocation {
+    OperationLocation {
+        segment_id,
+        op_number: read_u64(input, 0),
+        entry_offset: read_u64(input, 8),
+        entry_bytes: read_u64(input, 16),
+        operation_digest: digest_at(input, 24..56),
+    }
+}
+
+pub(crate) fn compare_locations(left: &OperationLocation, right: &OperationLocation) -> Ordering {
+    left.op_number.cmp(&right.op_number)
 }
 
 fn decode_operation_entry(input: &[u8], segment_id: u64) -> OperationIndexEntry {
@@ -949,22 +1130,31 @@ pub(crate) fn calculate_index_layout(
     if counts.offsets != counts.messages {
         return Err(IndexFileError::RecordIndexCountMismatch);
     }
+    enforce_count(
+        "operation locations",
+        counts.locations,
+        limits.max_operation_entries,
+    )?;
     let message_start = INDEX_HEADER_BYTES
         .checked_add(section_bytes(counts.offsets, OFFSET_INDEX_ENTRY_BYTES)?)
         .ok_or(IndexFileError::LengthOverflow)?;
     let operation_start = message_start
         .checked_add(section_bytes(counts.messages, MESSAGE_INDEX_ENTRY_BYTES)?)
         .ok_or(IndexFileError::LengthOverflow)?;
-    let file_bytes = operation_start
+    let location_start = operation_start
         .checked_add(section_bytes(
             counts.operations,
             OPERATION_INDEX_ENTRY_BYTES,
         )?)
         .ok_or(IndexFileError::LengthOverflow)?;
+    let file_bytes = location_start
+        .checked_add(section_bytes(counts.locations, OPERATION_LOCATION_BYTES)?)
+        .ok_or(IndexFileError::LengthOverflow)?;
     enforce_count("index file bytes", file_bytes, limits.max_file_bytes)?;
     Ok(IndexLayout {
         message_start,
         operation_start,
+        location_start,
         file_bytes,
     })
 }

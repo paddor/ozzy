@@ -92,15 +92,11 @@ impl SharedReaders {
                 if self.rejection.is_some() {
                     return Err(Failure::new(10));
                 }
-                for slot in &mut self.slots {
-                    if slot.as_ref().is_some_and(|slot| {
-                        slot.peer == peer
-                            && slot.delivery.subscribe.subscription == selected.subscription
-                            && slot.delivery.source == selected.source
-                    }) {
-                        *slot = None;
-                    }
-                }
+                self.slots.retain(|slot| {
+                    slot.peer != peer
+                        || slot.delivery.subscribe.subscription != selected.subscription
+                        || slot.delivery.source != selected.source
+                });
                 let header = reader::encode_unsubscribed(
                     Envelope {
                         opcode: Opcode::Unsubscribed,
@@ -161,7 +157,6 @@ impl SharedReaders {
     fn find(&mut self, peer: NodeId, subscription: reader::Subscription) -> Option<&mut Slot> {
         self.slots
             .iter_mut()
-            .flatten()
             .find(|slot| slot.peer == peer && slot.delivery.subscribe.subscription == subscription)
     }
 
@@ -173,25 +168,25 @@ impl SharedReaders {
         source: reader::Source,
     ) -> Result<(), Failure> {
         let old = self.slots.iter().position(|slot| {
-            slot.as_ref().is_some_and(|slot| {
-                slot.peer == peer
-                    && slot.delivery.subscribe.subscription.id == subscribe.subscription.id
-            })
+            slot.peer == peer
+                && slot.delivery.subscribe.subscription.id == subscribe.subscription.id
         });
-        let index = old
-            .or_else(|| self.slots.iter().position(Option::is_none))
-            .ok_or_else(|| Failure::new(10))?;
-        if let Some(slot) = &self.slots[index]
-            && slot.delivery.subscribe.subscription == subscribe.subscription
+        let index = if let Some(index) = old
+            && self.slots[index].delivery.subscribe.subscription == subscribe.subscription
         {
+            let slot = &self.slots[index];
             if &slot.delivery.subscribe != subscribe || slot.delivery.source != source {
                 return Err(Failure::new(15));
             }
             if slot.pending.is_some() {
                 return Ok(());
             }
+            index
         } else {
-            self.slots[index] = Some(Slot {
+            if old.is_none() && self.slots.len() == self.config.subscriptions {
+                return Err(Failure::new(10));
+            }
+            let slot = Slot {
                 peer,
                 payload: Payload::notifying(
                     self.config.limits.envelope.max_payload_bytes,
@@ -206,9 +201,16 @@ impl SharedReaders {
                 pending: None,
                 resolved_offset: None,
                 reply_due: true,
-            });
-        }
-        let slot = self.slots[index].as_mut().expect("installed subscription");
+            };
+            if let Some(index) = old {
+                self.slots[index] = slot;
+                index
+            } else {
+                self.slots.push(slot);
+                self.slots.len() - 1
+            }
+        };
+        let slot = &mut self.slots[index];
         slot.delivery.request = envelope;
         slot.reply_due = true;
         Ok(())

@@ -242,9 +242,11 @@ impl OwnedJournal {
             )
             .await?,
         );
+        self.abandon_retirement();
         self.images = Some(candidate.activate(self.journal.ready()?)?);
         self.applied = ticket.through();
         self.pending.clear();
+        self.restore_dedup().await?;
         self.faulted = false;
         Ok(ticket)
     }

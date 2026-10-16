@@ -38,6 +38,7 @@ fn either_limit_expires_only_a_sealed_prefix_using_newest_append_time() {
     let plan = Plan::select(&segments, policy, 1000, 12, 8).unwrap();
     assert_eq!(plan.retire, vec![1]);
     assert_eq!(plan.record_floor, Offset::new(2));
+    assert_eq!(plan.operation_floor, 5);
     assert!(plan.roll_active);
     let policy = RetentionPolicy {
         max_bytes: NonZeroU64::new(1024),
@@ -45,6 +46,7 @@ fn either_limit_expires_only_a_sealed_prefix_using_newest_append_time() {
     };
     let plan = Plan::select(&segments, policy, 1000, 12, 8).unwrap();
     assert_eq!(plan.retire, vec![1, 2]);
+    assert_eq!(plan.operation_floor, 9);
     assert_eq!(plan.selected_bytes, 1024);
     let plan = Plan::select(&segments, policy, 1000, 4, 8).unwrap();
     assert_eq!(

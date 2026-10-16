@@ -16,7 +16,8 @@ const BOUNDARY: &[&str] = &["fanring", "omq-tokio", "rustix", "tokio"];
 /// Allowed normal dependencies on workspace crates and boundary libraries.
 const ALLOWED: &[(&str, &[&str])] = &[
     ("ozzy-proto", &[]),
-    ("ozzy-config", &[]),
+    // Deployment validation applies the protocol's endpoint rules.
+    ("ozzy-config", &["ozzy-proto"]),
     // Deployment assembly selects storage backends, starts application shards,
     // and binds the shared frontend. Lower layers never depend on the broker.
     (
@@ -37,7 +38,11 @@ const ALLOWED: &[(&str, &[&str])] = &[
         ],
     ),
     ("ozzy-io", &["fanring", "tokio"]),
-    ("ozzy-io-pool", &["fanring", "rustix", "ozzy-io", "tokio"]),
+    ("ozzy-telemetry", &["omq-tokio"]),
+    (
+        "ozzy-io-pool",
+        &["fanring", "rustix", "ozzy-io", "ozzy-telemetry", "tokio"],
+    ),
     ("ozzy-io-aio", &["rustix", "ozzy-io", "ozzy-io-pool"]),
     ("ozzy-journal", &["ozzy-proto"]),
     ("ozzy-core", &["ozzy-journal", "ozzy-proto"]),
@@ -73,6 +78,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
             "ozzy-journal-segment",
             "ozzy-proto",
             "ozzy-replication",
+            "ozzy-telemetry",
             "tokio",
         ],
     ),

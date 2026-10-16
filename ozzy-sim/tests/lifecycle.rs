@@ -177,12 +177,9 @@ fn acknowledged_before_commit_announcement_survives_election_and_old_primary_rej
     sim.replicas[0].apply_normal();
     assert!(sim.acknowledge(&request));
     assert_eq!(sim.replicas[1].stable.operations.len(), 0);
-    for backup in 1..3 {
-        assert_eq!(
-            sim.replicas[backup].snapshot().unwrap().committed,
-            Prefix::GENESIS
-        );
-        assert_eq!(sim.replicas[backup].stable.committed, Prefix::GENESIS);
+    for backup in &sim.replicas[1..3] {
+        assert_eq!(backup.snapshot().unwrap().committed, Prefix::GENESIS);
+        assert_eq!(backup.stable.committed, Prefix::GENESIS);
     }
     sim.cut(0);
     sim.until(3000, |sim| {

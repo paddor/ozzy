@@ -111,6 +111,11 @@ impl MemoryIdentityIndex {
         self.claims.clear();
     }
 
+    /// Remove claims of operations before `op_number`, such as retired history.
+    pub fn retain_from(&mut self, op_number: u64) {
+        self.claims.retain(|_, claim| *claim >= op_number);
+    }
+
     /// Iterate retained claims in unspecified order.
     pub fn claims(&self) -> impl ExactSizeIterator<Item = IdentityClaim> + '_ {
         self.claims

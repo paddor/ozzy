@@ -1971,6 +1971,9 @@ pub enum DirectoryError {
     #[error("retention scan budget is zero or cannot hold one eligible segment")]
     /// Retention scan budget is zero or cannot hold one eligible segment.
     RetentionScanBudget,
+    #[error("scanned retirement prefix no longer leads the selected journal")]
+    /// Scanned retirement prefix no longer leads the selected journal.
+    RetentionPrefixMismatch,
     #[error("configuration changes require configuration installation")]
     /// Configuration changes require configuration installation.
     ConfigurationChangeRequiresInstall,

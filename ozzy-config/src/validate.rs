@@ -1,12 +1,12 @@
+use ozzy_proto::directory::EndpointScheme;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::Path;
-
 use uuid::Uuid;
 
 use crate::{
     Broker, ConfigError, Confirmation, Deployment, DeploymentMode, QueueBudget, Shard, invalid,
-    schema::MAX_APPEND_BYTES,
+    schema::{MAX_APPEND_BYTES, MAX_CLIENTS},
 };
 
 /// Structurally valid configuration. Host checks are performed for the selected
@@ -35,9 +35,11 @@ impl Deployment {
             "membership must match the explicit single or three mode",
         )?;
         require(
-            self.limits.max_topics > 0 && self.limits.max_partitions > 0,
+            self.limits.max_topics > 0
+                && self.limits.max_partitions > 0
+                && (1..=MAX_CLIENTS).contains(&self.limits.max_clients),
             "limits",
-            "resource limits must be positive",
+            "resource limits must be positive; max_clients at most 4096",
         )?;
         require(
             !self.topics.is_empty() && self.topics.len() <= self.limits.max_topics,
@@ -110,6 +112,18 @@ impl Deployment {
             }
             shards.insert(name.clone(), local);
         }
+        // Each broker receives every socket through one buffer profile.
+        let compressed = endpoints
+            .iter()
+            .filter(|endpoint| {
+                EndpointScheme::parse(endpoint).is_some_and(|(scheme, _)| scheme.compressed())
+            })
+            .count();
+        require(
+            compressed == 0 || compressed == endpoints.len(),
+            "brokers",
+            "compressed endpoints cannot mix with plain transports",
+        )?;
         Ok(ValidatedDeployment {
             deployment: self,
             shards,
@@ -191,8 +205,33 @@ fn validate_topics(config: &Deployment, ids: &mut BTreeSet<Uuid>) -> Result<(), 
             &format!("{path}.retention.max_bytes"),
             "byte target must fit at least one segment",
         )?;
+        if let Some(policy) = topic.deduplication {
+            validate_deduplication(policy, &path)?;
+        }
     }
     Ok(())
+}
+
+fn validate_deduplication(
+    policy: crate::TopicDeduplication,
+    path: &str,
+) -> Result<(), ConfigError> {
+    require(
+        policy.window_millis > 0,
+        &format!("{path}.deduplication.window_millis"),
+        "window must be positive",
+    )?;
+    require(
+        policy.max_entries > 0
+            && usize::try_from(policy.max_entries).is_ok()
+            && isize::try_from(policy.max_bytes).is_ok()
+            && policy
+                .max_entries
+                .checked_mul(32)
+                .is_some_and(|minimum| minimum <= policy.max_bytes),
+        &format!("{path}.deduplication"),
+        "positive entry and byte bounds must fit the native index and its encoded identity rows",
+    )
 }
 
 fn validate_devices(broker: &Broker, path: &str) -> Result<(), ConfigError> {
@@ -342,40 +381,40 @@ fn validate_endpoint(endpoint: &str, path: &str) -> Result<(), ConfigError> {
         path,
         "endpoint contains whitespace or control bytes",
     )?;
-    if let Some(address) = endpoint.strip_prefix("tcp://") {
-        if let Ok(address) = address.parse::<SocketAddr>() {
-            return require(
-                address.port() > 0
-                    && !address.ip().is_unspecified()
-                    && !address.ip().is_multicast(),
+    match EndpointScheme::parse(endpoint) {
+        Some((scheme, address)) if scheme.is_tcp() => {
+            if let Ok(address) = address.parse::<SocketAddr>() {
+                return require(
+                    address.port() > 0
+                        && !address.ip().is_unspecified()
+                        && !address.ip().is_multicast(),
+                    path,
+                    "TCP endpoint must be connectable and use a fixed nonzero port",
+                );
+            }
+            let (host, port) = address
+                .rsplit_once(':')
+                .ok_or_else(|| invalid(path, "TCP endpoint requires host:port"))?;
+            require(
+                !host.is_empty()
+                    && host
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+                    && port.parse::<u16>().is_ok_and(|port| port > 0),
                 path,
-                "TCP endpoint must be connectable and use a fixed nonzero port",
-            );
+                "invalid TCP host or port",
+            )
         }
-        let (host, port) = address
-            .rsplit_once(':')
-            .ok_or_else(|| invalid(path, "TCP endpoint requires host:port"))?;
-        return require(
-            !host.is_empty()
-                && host
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
-                && port.parse::<u16>().is_ok_and(|port| port > 0),
-            path,
-            "invalid TCP host or port",
-        );
-    }
-    if let Some(name) = endpoint.strip_prefix("inproc://") {
-        return require(!name.is_empty(), path, "empty inproc endpoint");
-    }
-    if let Some(name) = endpoint.strip_prefix("ipc://") {
-        return require(
+        Some((EndpointScheme::Inproc, name)) => {
+            require(!name.is_empty(), path, "empty inproc endpoint")
+        }
+        Some((EndpointScheme::Ipc, name)) => require(
             name.starts_with('/') || (name.starts_with('@') && name.len() > 1),
             path,
             "IPC endpoint requires an absolute path or abstract name",
-        );
+        ),
+        _ => Err(invalid(path, "unsupported endpoint transport")),
     }
-    Err(invalid(path, "unsupported endpoint transport"))
 }
 
 fn safe_root(root: &Path, path: &str) -> Result<(), ConfigError> {

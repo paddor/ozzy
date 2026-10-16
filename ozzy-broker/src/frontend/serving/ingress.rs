@@ -119,6 +119,9 @@ impl<'a> Ingress<'a> {
                     .source()
                     .cloned()
                     .ok_or_else(|| error("PEER receive lacks a source"))?;
+                ozzy_runtime::profiling::event(
+                    ozzy_runtime::profiling::Event::DispatcherInputPaused,
+                );
                 match self.socket.unshift(receipt, body) {
                     Ok(()) => Ok(Some(Pressure {
                         lane: (shard, kind, class),
@@ -135,7 +138,13 @@ impl<'a> Ingress<'a> {
                 Ok(None)
             }
             Err(error) if fatal(&error) => Err(failure(error)),
-            _ => Ok(None),
+            Err(_) => {
+                ozzy_runtime::profiling::event(
+                    ozzy_runtime::profiling::Event::DispatcherInputDropped,
+                );
+                Ok(None)
+            }
+            Ok(_) => Ok(None),
         }
     }
 
@@ -208,6 +217,7 @@ impl<'a> Ingress<'a> {
             let Some(source) = sources.pop_front() else {
                 return Ok(());
             };
+            ozzy_runtime::profiling::event(ozzy_runtime::profiling::Event::DispatcherInputRetry);
             let (receipt, body) = match self.socket.try_recv_from_source(Some(&source)) {
                 Ok(received) => received,
                 Err(omq_tokio::Error::Closed | omq_tokio::Error::WouldBlock) => continue,

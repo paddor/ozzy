@@ -332,9 +332,9 @@ impl Replica {
         }
         recovery.retry_at = now + RETRY;
         let mut packets = Vec::new();
-        for to in 0..3 {
+        for (to, &request) in recovery.requests.iter().enumerate() {
             if to != self.id {
-                packets.push(Packet::recovery(self.id, to, recovery.requests[to]));
+                packets.push(Packet::recovery(self.id, to, request));
             }
         }
         if let Some(fetch) = recovery.fetch {

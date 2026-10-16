@@ -19,6 +19,19 @@ use tokio::sync::mpsc;
 #[derive(Clone, Debug)]
 pub struct Owner(Rc<RefCell<Local>>);
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Capacity {
+    bytes: usize,
+    buffers: usize,
+}
+
+impl Capacity {
+    pub(crate) const EMPTY: Self = Self {
+        bytes: 0,
+        buffers: 0,
+    };
+}
+
 /// Owner-local reservation for bounded maintenance scratch outside payload arenas.
 #[derive(Debug)]
 pub(crate) struct Charge {
@@ -55,6 +68,7 @@ struct Local {
     cache: Vec<Block>,
     cache_bytes: usize,
     limits: Limits,
+    pressure: Option<(Capacity, Capacity)>,
 }
 
 #[derive(Debug)]
@@ -96,6 +110,32 @@ impl fmt::Debug for Buffer {
 }
 
 impl Owner {
+    pub(crate) fn begin_working_set(&self) -> Capacity {
+        let mut local = self.0.borrow_mut();
+        local.collect();
+        local.pressure = None;
+        local.live_capacity()
+    }
+
+    pub(crate) fn failed_working_set(&self, baseline: Capacity) -> io::Result<Capacity> {
+        let local = self.0.borrow();
+        let (live, requested) = local.pressure.ok_or(io::ErrorKind::WouldBlock)?;
+        let capacity = Capacity {
+            bytes: requested
+                .bytes
+                .checked_add(live.bytes.saturating_sub(baseline.bytes))
+                .ok_or(io::ErrorKind::InvalidInput)?,
+            buffers: requested
+                .buffers
+                .checked_add(live.buffers.saturating_sub(baseline.buffers))
+                .ok_or(io::ErrorKind::InvalidInput)?,
+        };
+        if capacity.bytes > local.limits.bytes || capacity.buffers > local.limits.buffers {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        Ok(capacity)
+    }
+
     pub(super) fn new(reservation: Reservation, limits: Limits) -> Self {
         let (sender, returns) = mpsc::channel(limits.buffers);
         Self(Rc::new(RefCell::new(Local {
@@ -112,6 +152,7 @@ impl Owner {
             cache: Vec::with_capacity(limits.buffers),
             cache_bytes: 0,
             limits,
+            pressure: None,
         })))
     }
 
@@ -131,6 +172,7 @@ impl Owner {
         local.collect();
         while local.shared.usage.bytes.load(Ordering::Acquire) > local.limits.bytes - bytes {
             let Some(block) = local.cache.pop() else {
+                local.record_pressure(Capacity { bytes, buffers: 0 });
                 return Err(io::ErrorKind::WouldBlock.into());
             };
             local.cache_bytes -= block.capacity;
@@ -141,6 +183,25 @@ impl Owner {
             owner: self.clone(),
             bytes,
         })
+    }
+
+    pub(crate) fn has_working_capacity(&self, capacity: Capacity) -> bool {
+        let mut local = self.0.borrow_mut();
+        if capacity.bytes > local.limits.bytes || capacity.buffers > local.limits.buffers {
+            return false;
+        }
+        local.collect();
+        while local.shared.usage.bytes.load(Ordering::Acquire) > local.limits.bytes - capacity.bytes
+            || local.shared.usage.buffers.load(Ordering::Acquire)
+                > local.limits.buffers - capacity.buffers
+        {
+            let Some(block) = local.cache.pop() else {
+                return false;
+            };
+            local.cache_bytes -= block.capacity;
+            drop(block);
+        }
+        true
     }
 
     pub(crate) fn allocator(&self) -> Allocator {
@@ -194,6 +255,17 @@ impl Owner {
 }
 
 impl Local {
+    fn live_capacity(&self) -> Capacity {
+        Capacity {
+            bytes: self.shared.usage.bytes.load(Ordering::Acquire) - self.cache_bytes,
+            buffers: self.shared.usage.buffers.load(Ordering::Acquire) - self.cache.len(),
+        }
+    }
+
+    fn record_pressure(&mut self, requested: Capacity) {
+        self.pressure = Some((self.live_capacity(), requested));
+    }
+
     fn try_lease(&mut self, length: usize, maximum: usize) -> io::Result<Buffer> {
         let local = self;
         if length == 0 || length > local.limits.bytes || length > maximum {
@@ -216,6 +288,10 @@ impl Local {
             // Eviction happens here on their allocation owner, never on a sender.
             while !local.can_allocate(length) {
                 let Some(block) = local.cache.pop() else {
+                    local.record_pressure(Capacity {
+                        bytes: length,
+                        buffers: 1,
+                    });
                     return Err(io::ErrorKind::WouldBlock.into());
                 };
                 local.cache_bytes -= block.capacity;

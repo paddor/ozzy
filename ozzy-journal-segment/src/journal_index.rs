@@ -14,8 +14,9 @@ use thiserror::Error;
 use crate::reader::read_indexed_records;
 use crate::{
     ActiveSegmentIndex, DecodeLimits, IndexedMessageLocation, IndexedOffsetLocation,
-    IndexedOperationLocation, IndexedReadError, IndexedRecord, LogPosition, SegmentIndexCatalog,
-    SegmentPin, TailState, read_indexed_message, read_indexed_record, scan_segment,
+    IndexedOperation, IndexedOperationLocation, IndexedReadError, IndexedRecord, LogPosition,
+    SegmentIndexCatalog, SegmentPin, TailState, read_indexed_message, read_indexed_record,
+    scan_segment,
 };
 
 /// Pinned exact lookup view through one captured journal position.
@@ -328,6 +329,27 @@ impl JournalIndexSnapshot {
         self.find_operation_through(operation_id, self.through.op_number)
     }
 
+    /// Resolve every canonical operation by number in this deletion-protected prefix.
+    pub fn find_operation_number(
+        &self,
+        number: u64,
+    ) -> Result<Option<IndexedOperation>, JournalIndexError> {
+        if number == 0 || number > self.through.op_number {
+            return Ok(None);
+        }
+        if let Some(active) = &self.active
+            && let Some(location) = active.find_operation_number(number)
+        {
+            return Ok(Some(IndexedOperation {
+                source: active.source(),
+                location,
+            }));
+        }
+        Ok(self
+            .sealed
+            .find_operation_number(number, self.through.op_number)?)
+    }
+
     pub(crate) fn find_operation_through(
         &self,
         operation_id: OperationId,
@@ -452,6 +474,9 @@ pub enum JournalIndexError {
     #[error("committed range is missing offset {0:?}")]
     /// Committed range is missing offset.
     MissingOffset(Offset),
+    #[error("retained retry evidence is missing operation {0}")]
+    /// A retained producer result has no authoritative operation selector.
+    MissingOperationNumber(u64),
     #[error("partition offset space exhausted during range read")]
     /// Partition offset space exhausted during range read.
     OffsetExhausted,

@@ -85,12 +85,7 @@ impl OpenGroupJournal {
                 if accepted_only_seen {
                     return Err(CanonicalImagesError::CommittedAfterAccepted.into());
                 }
-                let plan = committed.prepare(
-                    item.operation.op_number,
-                    &body,
-                    &committed_replay,
-                    &committed,
-                )?;
+                let plan = committed.prepare(item.operation.op_number, &body, &committed_replay)?;
                 committed.apply(plan.clone(), &mut committed_replay)?;
                 committed_replay.advance(item.operation.op_number);
                 speculative.apply(plan, &mut speculative_replay)?;
@@ -100,12 +95,8 @@ impl OpenGroupJournal {
                 if pending.len() >= limits.accepted_transitions {
                     return Err(CanonicalImagesError::PendingCapacity.into());
                 }
-                let plan = speculative.prepare(
-                    item.operation.op_number,
-                    &body,
-                    &speculative_replay,
-                    &committed,
-                )?;
+                let plan =
+                    speculative.prepare(item.operation.op_number, &body, &speculative_replay)?;
                 speculative.apply(plan.clone(), &mut speculative_replay)?;
                 speculative_replay.advance(item.operation.op_number);
                 pending.push(plan);

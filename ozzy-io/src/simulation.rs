@@ -302,6 +302,15 @@ impl Controller {
             .collect()
     }
 
+    /// Wait for the next accepted submission. After every client closes, this
+    /// never completes; harnesses also wait for their own schedule changes.
+    pub async fn submitted(&mut self) {
+        match self.receiver.recv_async().await {
+            Ok(job) => assert!(self.pending.insert(job.id, Pending::Queued(job)).is_none()),
+            Err(_) => std::future::pending().await,
+        }
+    }
+
     /// Borrow a queued operation for schedule decisions; executed jobs return none.
     pub fn operation(&mut self, id: JobId) -> Option<&Operation> {
         self.collect();

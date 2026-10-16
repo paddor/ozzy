@@ -40,6 +40,12 @@ impl Execution {
             Self::Recovery(_) => false,
         }
     }
+    pub(super) fn retiring(&self) -> bool {
+        match self {
+            Self::Normal(owner) => owner.retiring(),
+            Self::Recovery(_) => false,
+        }
+    }
     pub(super) fn validation_ready(&self, buffer: &super::AppendBuffer) -> bool {
         match self {
             Self::Normal(owner) => owner.validation_ready(buffer),

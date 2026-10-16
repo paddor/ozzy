@@ -3,6 +3,7 @@
 use super::*;
 use ozzy_config::TopicRetention;
 use ozzy_journal_segment::{Manifest, MetadataLimits, decode_current, decode_manifest};
+use ozzy_runtime::replicated::ReaderStart;
 use std::path::PathBuf;
 
 pub(super) fn selected(image: &Image, root: &Path) -> Manifest {
@@ -44,11 +45,18 @@ async fn append_one(brokers: &[Broker], writer: &mut SharedTopicWriter, number: 
     .unwrap();
 }
 
-async fn read_retained(brokers: &[Broker], consumer: &BrokerLinks, end: u64) {
+async fn read_retained(brokers: &[Broker], consumer: &BrokerLinks, end: u64, start: ReaderStart) {
     let mut reader = live_many(
         brokers,
         "open retained payload reader",
-        TopicReader::open(consumer.clone(), "orders", TopicReaderConfig::default()),
+        TopicReader::open(
+            consumer.clone(),
+            "orders",
+            TopicReaderConfig {
+                start,
+                ..Default::default()
+            },
+        ),
     )
     .await
     .unwrap();
@@ -56,7 +64,7 @@ async fn read_retained(brokers: &[Broker], consumer: &BrokerLinks, end: u64) {
     loop {
         let record = live_many(brokers, "read retained payload", reader.next())
             .await
-            .unwrap();
+            .unwrap_or_else(|error| panic!("read retained payload at {next:?}: {error:?}"));
         let offset = record.offset.get();
         if let Some(expected) = next {
             assert_eq!(offset, expected);
@@ -170,7 +178,7 @@ async fn lagging_follower_recovers_retained_checkpoint_then_supplies_the_require
         images.remove(1).await.unwrap();
         append_one(&brokers, &mut writer, 601).await;
         assert_recovered_leader(&producer, &writer, recovered_node);
-        read_retained(&brokers, &consumer, 601).await;
+        read_retained(&brokers, &consumer, 601, ReaderStart::Earliest).await;
         writer.close().await.unwrap();
         producer.shutdown().await.unwrap();
         consumer.shutdown().await.unwrap();
@@ -282,9 +290,13 @@ async fn restart_with_ancient_replica(policy: Confirmation) {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one complete retained-history restart and producer-resume scenario"
+)]
 async fn retained_history_survives_complete_cluster_restart_and_producer_resume() {
     use ozzy_proto::Offset;
-    use ozzy_runtime::replicated::ReaderStart;
+    use ozzy_runtime::replicated::TopicCheckpoint;
     for policy in [Confirmation::DiskQuorum, Confirmation::ReplicatedPersisting] {
         let runtime = WriterRuntime::new().unwrap();
         let root = PathBuf::from(format!("/ozzy-retained-restart-{}", Uuid::now_v7()));
@@ -344,12 +356,15 @@ async fn retained_history_survives_complete_cluster_restart_and_producer_resume(
             broker.shutdown().await.unwrap();
         }
         let mut restarted = Vec::new();
+        let mut restarted_controls = Vec::new();
         let mut restarted_images = Vec::new();
+        let recovered_deployment = restart.clone();
         for ((checked, local), image) in restart.into_iter().zip(images) {
             let image = image.await.unwrap();
-            let (broker, _, image) =
+            let (broker, control, image) =
                 start_image(runtime.context().clone(), checked, local, true, image).await;
             restarted.push(broker);
+            restarted_controls.push(control);
             restarted_images.push(image);
         }
         let mut writer = resumed_writer(&restarted, &producer, identity, config).await;
@@ -372,7 +387,19 @@ async fn retained_history_survives_complete_cluster_restart_and_producer_resume(
             .unwrap();
         assert_eq!(record.offset, Offset::new(600));
         latest.close().await.unwrap();
-        read_retained(&restarted, &consumer, 601).await;
+        // Earliest can resolve before another copy's retained floor wins after
+        // restart. Verify the common retained tail across that authority change.
+        let tail = retained_tail(&restarted, &restarted_controls, &recovered_deployment).await;
+        read_retained(
+            &restarted,
+            &consumer,
+            601,
+            ReaderStart::Checkpoint(TopicCheckpoint {
+                topic: identity.topic,
+                positions: vec![(0, Offset::new(tail))],
+            }),
+        )
+        .await;
         writer.close().await.unwrap();
         producer.shutdown().await.unwrap();
         consumer.shutdown().await.unwrap();

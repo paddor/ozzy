@@ -8,11 +8,12 @@ use super::{
 use crate::{
     dispatch::{self, Budget, Budgets, Class},
     frontend::{
-        Service, SetupError,
+        ReplyError, Service, SetupError,
         inproc::{self, Inbox},
     },
 };
 use omq_tokio::{Message, Options, TrySendError};
+use ozzy_proto::NodeId;
 use std::{
     future::Future,
     ops::Bound::{Excluded, Unbounded},
@@ -220,6 +221,7 @@ impl Service {
         else {
             return Ok(false);
         };
+        crate::profiling::event(crate::profiling::Event::DispatcherCommand);
         let status = self.apply_command(shard, incoming.action);
         let completion =
             Message::with_prefix(incoming.identity, wire::completion(incoming.key, status));
@@ -232,8 +234,8 @@ impl Service {
 
     fn apply_command(&mut self, shard: u32, action: wire::Action) -> wire::Status {
         match action {
-            wire::Action::Reply(class, message) => {
-                wire::Status::Reply(self.try_reply(class, message).map_err(|(error, _)| error))
+            wire::Action::Reply(class, message, sequence) => {
+                wire::Status::Reply(self.reply_in_order(shard, class, sequence, message))
             }
             wire::Action::Publication(message) => {
                 wire::Status::Publication(self.publish(shard, message).map_err(|(error, _)| error))
@@ -261,6 +263,58 @@ impl Service {
         }
     }
 
+    /// Admit one shard's replies to a destination class in sequence order. A
+    /// reply refused for capacity holds that destination's later sequences
+    /// until the shard re-submits it, so a retry is never overtaken by a reply
+    /// the shard produced after it.
+    fn reply_in_order(
+        &mut self,
+        shard: u32,
+        class: Class,
+        sequence: u64,
+        message: Message,
+    ) -> Result<(), ReplyError> {
+        let Some(peer) = message
+            .part_slice(0)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(NodeId::from_bytes)
+        else {
+            return self.try_reply(class, message).map_err(|(error, _)| error);
+        };
+        let key = (shard, peer, class);
+        if let Some(&refused) = self.refused_replies.get(&key)
+            && sequence > refused
+        {
+            if self.dispatcher.peers.contains_key(&peer) {
+                crate::profiling::event(crate::profiling::Event::DispatcherReplyHeld);
+                return Err(ReplyError::Full);
+            }
+            self.refused_replies.remove(&key);
+        }
+        match self.try_reply(class, message) {
+            Ok(()) => {
+                if self.refused_replies.get(&key) == Some(&sequence) {
+                    self.refused_replies.remove(&key);
+                }
+                Ok(())
+            }
+            Err((ReplyError::Full, _)) => {
+                self.refused_replies
+                    .entry(key)
+                    .and_modify(|refused| *refused = (*refused).min(sequence))
+                    .or_insert(sequence);
+                Err(ReplyError::Full)
+            }
+            Err((error, _)) => {
+                // The shard drops this reply, so nothing waits behind it.
+                if self.refused_replies.get(&key) == Some(&sequence) {
+                    self.refused_replies.remove(&key);
+                }
+                Err(error)
+            }
+        }
+    }
+
     /// Wait for shard commands or network socket progress. Canceling preserves
     /// accepted commands, registered inproc receives, and parked completions.
     pub async fn progress(
@@ -284,6 +338,14 @@ impl Service {
         send: impl FnMut(Message) -> Result<(), TrySendError>,
         wait: impl FnMut(Message) -> Pin<Box<dyn Future<Output = ()>>>,
     ) -> Result<(), ProgressError> {
+        let (mut send, mut wait) = (send, wait);
+        // Observe send progress for refused destinations, then transmit one
+        // queued frame before admitting another command. A command that
+        // finds its destination queue full is refused and retried, so
+        // admitting commands first starves the queues they wait on.
+        self.watch_blocked(&mut wait);
+        let woke = std::future::poll_fn(|cx| Poll::Ready(self.poll_blocked(cx, &mut send))).await?;
+        let flushed = (self.has_pending() && self.flush_turn(&mut send).await?) || woke;
         for index in 0..self.ports.len() {
             if self.poll_command()? {
                 return Ok(());
@@ -292,16 +354,13 @@ impl Service {
                 tokio::task::yield_now().await;
             }
         }
-        if self.poll_watch()? {
+        if flushed || self.poll_watch()? {
             return Ok(());
         }
-        let mut send = send;
-        if self.flush_turn(&mut send).await? {
-            return Ok(());
-        }
-        let mut replies = self.reply_progress(wait).await;
+        self.watch_blocked(&mut wait);
+        let mut replies = self.reply_progress(&mut wait).await;
         std::future::poll_fn(|cx| {
-            if let Poll::Ready(result) = replies.poll_ready(self, cx, &mut send) {
+            if let Poll::Ready(result) = replies.poll_ready(self, cx, &mut send, &mut wait) {
                 return Poll::Ready(result);
             }
             for mailbox in self.ports.values_mut() {

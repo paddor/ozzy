@@ -4,8 +4,8 @@ use std::{cell::RefCell, path::PathBuf, rc::Rc};
 
 use super::{
     HOT_INDEX_CAPACITY, IndexCache, IndexCatalogError as Error, IndexedMessageLocation,
-    IndexedOffsetLocation, IndexedOperationLocation, OFFSET_HINT_CAPACITY, OffsetHint,
-    message_location, validate_sources,
+    IndexedOffsetLocation, IndexedOperation, IndexedOperationLocation, OFFSET_HINT_CAPACITY,
+    OffsetHint, message_location, validate_sources,
 };
 use crate::{IndexLimits, IndexSource, SegmentIndex, async_files::Access, segment_index_name};
 use ozzy_proto::{MessageId, Offset, OperationId, PartitionIncarnation};
@@ -74,6 +74,31 @@ impl Catalog {
             chunk,
             cache: Rc::new(RefCell::new(cache)),
         })
+    }
+
+    /// Keep only sources of segments from `segment_id` on. Their cached
+    /// indexes move to the narrowed catalog; offset hints start over.
+    pub(crate) fn retain_from(&self, segment_id: u64) -> Self {
+        let sources: Rc<[IndexSource]> = self
+            .sources
+            .iter()
+            .filter(|source| source.segment_id >= segment_id)
+            .copied()
+            .collect();
+        let mut cache = IndexCache::new();
+        cache.hot.extend(
+            std::mem::take(&mut self.cache.borrow_mut().hot)
+                .into_iter()
+                .filter(|index| index.source().segment_id >= segment_id),
+        );
+        Self {
+            access: self.access.clone(),
+            directory: self.directory.clone(),
+            sources,
+            limits: self.limits,
+            chunk: self.chunk,
+            cache: Rc::new(RefCell::new(cache)),
+        }
     }
 
     pub(crate) async fn find_offset(
@@ -234,6 +259,32 @@ impl Catalog {
             }
         }
         Ok(None)
+    }
+
+    pub(crate) async fn find_operation_number(
+        &self,
+        number: u64,
+        through: u64,
+    ) -> Result<Option<IndexedOperation>, Error> {
+        if number == 0 || number > through {
+            return Ok(None);
+        }
+        let at = self
+            .sources
+            .partition_point(|source| source.last_op_number < number);
+        let Some(source) = self
+            .sources
+            .get(at)
+            .copied()
+            .filter(|source| source.first_op_number <= number)
+        else {
+            return Ok(None);
+        };
+        let location = self
+            .with_source(source, |index| Ok(index.find_operation_number(number)))
+            .await?
+            .ok_or(Error::InconsistentIndex)?;
+        Ok(Some(IndexedOperation { source, location }))
     }
 
     fn hot_sources(&self, through: u64) -> smallvec::SmallVec<[IndexSource; HOT_INDEX_CAPACITY]> {

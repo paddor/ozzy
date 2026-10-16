@@ -109,9 +109,36 @@ fn page_rejects_changed_identity_and_unbounded_fields() {
     current = page();
     current.brokers[0].peer = "tcp://127.0.0.1:0".to_owned();
     assert!(!current.valid(limits));
+    for scheme in ["lz4+tcp", "zstd+tcp"] {
+        current = page();
+        current.brokers[0].peer = format!("{scheme}://127.0.0.1:0");
+        assert!(!current.valid(limits));
+        current.brokers[0].peer = format!("{scheme}://127.0.0.1:7100");
+        assert!(current.valid(limits));
+    }
     current = page();
     current.policy = Policy::LocalDurable;
     assert!(!current.valid(limits));
+}
+
+#[test]
+fn endpoint_schemes_split_their_prefix_and_classify_compression() {
+    use super::EndpointScheme;
+    assert_eq!(
+        EndpointScheme::parse("zstd+tcp://host:1"),
+        Some((EndpointScheme::ZstdTcp, "host:1"))
+    );
+    assert_eq!(
+        EndpointScheme::parse("ipc://@name"),
+        Some((EndpointScheme::Ipc, "@name"))
+    );
+    assert_eq!(EndpointScheme::parse("tcp:/host:1"), None);
+    assert_eq!(EndpointScheme::parse("ws://host:1"), None);
+    assert!(EndpointScheme::Lz4Tcp.compressed() && EndpointScheme::Lz4Tcp.is_tcp());
+    assert!(EndpointScheme::ZstdTcp.compressed() && EndpointScheme::ZstdTcp.is_tcp());
+    assert!(EndpointScheme::Tcp.is_tcp() && !EndpointScheme::Tcp.compressed());
+    assert!(!EndpointScheme::Inproc.is_tcp() && !EndpointScheme::Inproc.compressed());
+    assert_eq!(EndpointScheme::ZstdTcp.as_str(), "zstd+tcp");
 }
 
 #[test]

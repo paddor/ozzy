@@ -240,6 +240,30 @@ impl Index {
         self.active.as_ref()?.newest_append_millis(partition)
     }
 
+    /// Record ends the newest sealed segment's retained read index holds,
+    /// bound to that segment's exact digest and operation range, without file
+    /// access. `None` when no sealed predecessor is retained.
+    pub fn sealed_retirement_proof(
+        &self,
+        journal: &Journal,
+    ) -> Result<Option<super::RetirementProof>, Error> {
+        self.check_owner(journal)?;
+        let Some(previous) = &self.previous else {
+            return Ok(None);
+        };
+        let source = journal.sealed_record_source(previous.source().segment_id)?;
+        if source.index != previous.source() {
+            return Err(Error::StaleCatalog);
+        }
+        let mut ends = previous.partition_ends().collect::<Vec<_>>();
+        ends.sort_unstable_by_key(|(partition, _, _)| *partition);
+        Ok(Some(super::RetirementProof {
+            source: source.index,
+            capacity: source.reference.capacity,
+            ends,
+        }))
+    }
+
     /// Scan active history once at owner activation. Subsequent write deltas and
     /// read captures are memory-only. Sealed indexes load lazily on read misses.
     pub async fn open(journal: &Journal, limits: Limits) -> Result<Self, Error> {

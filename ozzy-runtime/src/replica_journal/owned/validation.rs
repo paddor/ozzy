@@ -3,7 +3,7 @@
 use super::{AppendBuffer, JournalError, OwnedJournal};
 use crate::replica_journal::{ValidatedAppend, canonical, commands::read_fault};
 use ozzy_core::state::{CanonicalImagesError, IdentityKey, StateError};
-use ozzy_journal::operation::{OperationKind, decode_operation_body};
+use ozzy_journal::operation::decode_operation_body;
 use ozzy_journal_segment::AsyncIdentityResolveError;
 use ozzy_replication::{Scope, driver::ValidationTicket};
 
@@ -42,6 +42,19 @@ impl OwnedJournal {
         prefix == self.applied || self.pending.contains(&prefix)
     }
 
+    /// Maintenance that rewrites settled state needs every admitted write
+    /// persisted and the accepted, committed, and applied prefixes equal.
+    pub(super) fn require_settled(&self, ticket: ValidationTicket) -> Result<(), JournalError> {
+        self.writeback.require_idle()?;
+        if !self.pending.is_empty()
+            || ticket.accepted() != self.applied
+            || ticket.committed() != self.applied
+        {
+            return Err(JournalError::CompletionMismatch);
+        }
+        Ok(())
+    }
+
     pub(super) fn validate_image(&self, ticket: ValidationTicket) -> Result<(), JournalError> {
         self.active(ticket)?;
         let images = self.images()?;
@@ -64,18 +77,67 @@ impl OwnedJournal {
     pub async fn validate_append(
         &mut self,
         ticket: ValidationTicket,
-        mut buffer: AppendBuffer,
+        buffer: AppendBuffer,
     ) -> Result<ValidatedAppend, JournalError> {
-        self.healthy()?;
-        let result = self.prepare_append(ticket, &mut buffer, false).await;
+        match self.validate_received(ticket, buffer).await {
+            super::super::turn::ReceivedValidation::Ready(validated) => Ok(validated),
+            super::super::turn::ReceivedValidation::Deferred { .. } => {
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into())
+            }
+            super::super::turn::ReceivedValidation::Rejected(error) => Err(error),
+        }
+    }
+
+    pub(in crate::replica_journal) async fn validate_received(
+        &mut self,
+        ticket: ValidationTicket,
+        mut buffer: AppendBuffer,
+    ) -> super::super::turn::ReceivedValidation {
+        use super::super::turn::ReceivedValidation;
+        self.begin_validation_memory();
+        self.dedup.apply_wait.set(None);
+        let result = async {
+            self.healthy()?;
+            let (plan, records) = self.prepare_append(ticket, &mut buffer, false).await?;
+            let dedup = self.prepare_dedup(ticket, &buffer)?;
+            Ok::<_, JournalError>((plan, records, dedup))
+        }
+        .await;
         self.faulted |= result.as_ref().err().is_some_and(read_fault);
-        let (plan, records) = result?;
-        Ok(ValidatedAppend {
-            validation: ticket,
-            buffer,
-            plan,
-            records,
-        })
+        match result {
+            Ok((plan, records, dedup)) => ReceivedValidation::Ready(ValidatedAppend {
+                validation: ticket,
+                buffer,
+                plan,
+                records,
+                dedup,
+            }),
+            Err(JournalError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if let Err(error) = self.retain_validation_pressure() {
+                    return ReceivedValidation::Rejected(error);
+                }
+                ReceivedValidation::Deferred {
+                    validation: ticket,
+                    buffer,
+                }
+            }
+            // The leader admitted this suffix after a commit freed identity
+            // capacity. A follower that has not applied that commit, or not
+            // yet learned of it, still holds rows its expiry will drop. Retry
+            // once it applies more; with nothing left to apply, reject.
+            Err(JournalError::Dedup(
+                ozzy_core::dedup::Error::Capacity
+                | ozzy_core::dedup::Error::PendingCapacity
+                | ozzy_core::dedup::Error::SnapshotCapacity,
+            )) if !self.pending.is_empty() => {
+                self.dedup.apply_wait.set(Some(self.applied.op.0));
+                ReceivedValidation::Deferred {
+                    validation: ticket,
+                    buffer,
+                }
+            }
+            Err(error) => ReceivedValidation::Rejected(error),
+        }
     }
 
     pub(super) async fn prepare_append(
@@ -104,7 +166,8 @@ impl OwnedJournal {
         let images = self.images()?;
         let mut keys = smallvec::SmallVec::<[IdentityKey; 4]>::new();
         for operation in buffer.operations() {
-            if operation.kind != OperationKind::Append {
+            // Canonical preparation below validates the other kinds' bodies.
+            if operation.kind.has_operation_id() {
                 let body =
                     decode_operation_body(operation.kind, operation.body, self.limits.operations)?;
                 if let Some(id) = body.operation_id() {
@@ -133,7 +196,11 @@ impl OwnedJournal {
         )?;
         #[cfg(feature = "storage-metrics")]
         for operation in buffer.operations() {
-            if operation.kind == OperationKind::Append {
+            use ozzy_journal::operation::OperationKind;
+            if matches!(
+                operation.kind,
+                OperationKind::Append | OperationKind::ResolvedAppend
+            ) {
                 crate::storage_metrics::prepared_operation(operation.body.len());
             }
         }

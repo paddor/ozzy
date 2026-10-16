@@ -15,6 +15,7 @@ categories = ["database-implementations"]
 include.workspace = true
 
 [dependencies]
+blake3.workspace = true
 xxhash-rust.workspace = true
 bytes.workspace = true
 lz4rip.workspace = true

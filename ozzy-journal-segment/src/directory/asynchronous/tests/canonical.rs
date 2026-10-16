@@ -1,5 +1,7 @@
 use super::*;
 mod cooperation;
+mod resolved;
+mod streaming;
 use crate::{
     CanonicalCheckpointError, CanonicalRecoveryLimits, CanonicalStateRecoveryError as Error,
 };
@@ -38,6 +40,7 @@ fn create() -> OperationBody<'static> {
         topic: "topic",
         partition_id: PartitionId::ZERO,
         owner_epoch: OwnerEpoch::INITIAL,
+        dedup_window_millis: None,
         retention: RetentionPolicy::default(),
     })
 }
@@ -99,7 +102,7 @@ fn apply(
     body: &OperationBody<'_>,
 ) {
     let plan = state
-        .prepare(state.revision() + 1, body, identities, state)
+        .prepare(state.revision() + 1, body, identities)
         .unwrap();
     state.apply(plan, identities).unwrap();
 }
@@ -252,7 +255,7 @@ fn async_candidate_keeps_large_selected_tail_private_and_checks_activation() {
 
 #[test]
 fn async_private_replay_checks_progress_against_only_the_preceding_prefix() {
-    for progress_offset in [0, 1] {
+    for progress_offset in [0, 1, 2] {
         let (mut controller, mut journal) = empty_journal();
         for body in [create(), open_producer(1), append(1, 0, 0)] {
             drive(&mut controller, write(&mut journal, &body));
@@ -264,7 +267,7 @@ fn async_private_replay_checks_progress_against_only_the_preceding_prefix() {
             owner,
             expected_progress: None,
             new_progress: Offset::new(progress_offset),
-            assignment_epoch: None,
+            assignment: None,
             operation_id: OperationId::from_bytes([0x65; 16]),
         });
         drive(&mut controller, write(&mut journal, &progress));
@@ -272,11 +275,11 @@ fn async_private_replay_checks_progress_against_only_the_preceding_prefix() {
             &mut controller,
             journal.recover_canonical_candidate(recovery_limits()),
         );
-        if progress_offset == 1 {
+        if progress_offset == 2 {
             assert!(matches!(
                 result,
                 Err(Error::Images(CanonicalImagesError::State(
-                    StateError::ProgressBeyondCommit
+                    StateError::ProgressBeyondRecords
                 )))
             ));
         } else {
@@ -289,7 +292,7 @@ fn async_private_replay_checks_progress_against_only_the_preceding_prefix() {
                     .unwrap()
                     .committed()
                     .progress(owner, partition()),
-                Some(Offset::ZERO)
+                Some(Offset::new(progress_offset))
             );
         }
     }

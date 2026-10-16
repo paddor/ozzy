@@ -2,7 +2,9 @@
 //! No command lane, task, file descriptor or execution pool is created here.
 
 mod config;
-pub use config::OwnedConfig;
+pub use config::{DedupLimits, OwnedConfig, dedup_limits};
+pub(in crate::replica_journal) mod dedup;
+mod groups;
 mod local;
 mod mode;
 use mode::Mode;
@@ -17,8 +19,10 @@ mod maintenance;
 pub use maintenance::{
     CleanedStorage, CompletedStorageValidation, PreparedStorageValidation, StorageCleanup,
 };
+mod assignment;
 mod ownership;
 mod producer_session;
+mod progress;
 mod proposal;
 mod read;
 pub(in crate::replica_journal) mod seek;
@@ -70,6 +74,7 @@ pub struct OwnedJournal {
     configuration: Mode,
     scope: Scope,
     images: Option<CanonicalImages<AsyncJournalIdentityIndex>>,
+    dedup: dedup::State,
     selected: Option<AsyncCanonicalRecoveryCandidate>,
     history: Option<AsyncJournalHistory>,
     replay: replay::Replay,
@@ -117,7 +122,16 @@ impl OwnedJournal {
         }
         let journal = super::ReplicaJournal {
             backlog: self.writeback.limits,
+            unapplied: self
+                .dedup
+                .limits
+                .map_or(self.recovery.accepted_transitions, |limits| {
+                    limits
+                        .pending_operations
+                        .min(self.recovery.accepted_transitions)
+                }),
             replicated: self.configuration.memory_voting(),
+            dedup_window_millis: self.dedup.limits.map(|limits| limits.window_millis),
             capacity: Arc::new(Semaphore::new(config.commands)),
             command_capacity: config.commands,
             read_capacity: Arc::new(Semaphore::new(self.read_limits.concurrent_reads)),
@@ -242,16 +256,17 @@ impl OwnedJournal {
         } else {
             None
         };
-        Ok((
-            Self::from_open(
-                &config,
-                Mode::Replicated(configuration),
-                journal,
-                images,
-                reader,
-            )?,
-            startup,
-        ))
+        let mut owner = Self::from_open(
+            &config,
+            Mode::Replicated(configuration),
+            journal,
+            images,
+            reader,
+        )?;
+        if fresh {
+            owner.restore_dedup().await?;
+        }
+        Ok((owner, startup))
     }
 
     fn from_open<C>(
@@ -273,6 +288,7 @@ impl OwnedJournal {
             configuration,
             scope,
             images,
+            dedup: dedup::State::new(config.deduplication),
             selected: None,
             history: None,
             replay: replay::Replay::default(),
@@ -385,7 +401,9 @@ impl OwnedJournal {
             ticket,
         )?;
         if let Some(next) = next {
+            self.abandon_retirement();
             self.images = None;
+            self.dedup.clear();
             self.reader = None;
             self.replay.clear();
             self.storage_validation.clear();

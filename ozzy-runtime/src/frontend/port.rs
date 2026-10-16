@@ -80,6 +80,9 @@ enum Command {
     Reply {
         message: Message,
         reply: oneshot::Sender<Completion<ReplyResult>>,
+        /// The shard's per-destination send sequence; the dispatcher admits
+        /// one destination's replies in this order.
+        sequence: u64,
     },
     Publication {
         message: Message,
@@ -101,7 +104,7 @@ impl Command {
     }
     fn complete(self, status: Status, retention: Retention) {
         match (self, status) {
-            (Self::Reply { message, reply }, Status::Reply(result)) => {
+            (Self::Reply { message, reply, .. }, Status::Reply(result)) => {
                 let _ = reply.send(Completion {
                     result: result.map_err(|error| (error, message)),
                     _retention: retention,
@@ -171,11 +174,15 @@ impl Port {
     /// message with the caller. Success means only queued for the dispatcher;
     /// await the returned observation for per-peer outbox admission. A full peer
     /// returns the original message, allowing unrelated peers to keep progressing.
+    /// `sequence` orders this shard's replies to one destination: the
+    /// dispatcher refuses a later sequence while an earlier refused one
+    /// awaits re-admission, so a retried reply cannot be overtaken.
     pub fn try_reply(
         &mut self,
         class: Class,
         message: Message,
         retained_bytes: usize,
+        sequence: u64,
     ) -> Result<Pending<ReplyResult>, (PortError, Message)> {
         if message.len() != 4 && message.len() != 2 {
             return Err((PortError::Frames, message));
@@ -184,7 +191,15 @@ impl Port {
             return Err((PortError::Charge, message));
         };
         let (reply, receiver) = oneshot::channel();
-        match self.submit(class, bytes, Command::Reply { message, reply }) {
+        match self.submit(
+            class,
+            bytes,
+            Command::Reply {
+                message,
+                reply,
+                sequence,
+            },
+        ) {
             Ok(()) => Ok(self.pending(receiver)),
             Err((error, Command::Reply { message, .. })) => Err((error, message)),
             Err(_) => unreachable!("unchanged command"),

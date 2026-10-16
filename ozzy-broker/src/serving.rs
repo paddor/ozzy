@@ -12,7 +12,7 @@ use crate::{
     ApplicationShards, CheckedConfig, DevicePools, Frontend, JournalPlan, RecoverySelection,
     StartupError,
 };
-pub(crate) use config::NATIVE_ARENAS;
+pub(crate) use config::native_arenas;
 use drain::DeviceDrain;
 pub use drain::StorageOwner;
 use omq_tokio::Context;
@@ -28,10 +28,12 @@ pub struct Broker {
     application: ApplicationShards,
     frontend: Frontend,
     devices: DeviceDrain,
+    serving: Vec<tokio::sync::watch::Receiver<bool>>,
 }
 
 struct Registration {
     id: u32,
+    serving: tokio::sync::watch::Receiver<bool>,
     sender: DataSender,
     broker_control: DataSender,
     data: DataSender,
@@ -172,6 +174,10 @@ impl Broker {
                     return Err(failure("duplicate shard registration"));
                 }
             }
+            let serving = registered
+                .values()
+                .map(|registration| registration.serving.clone())
+                .collect::<Vec<_>>();
             let serving_config = config.clone();
             let factory = move |frontend: crate::FrontendContext| async move {
                 let (mut service, handoffs) =
@@ -198,15 +204,17 @@ impl Broker {
                 frontend_start,
             )
             .await
+            .map(|frontend| (frontend, serving))
         };
         // Keep both startup observations alive: neither owner publishes ready
         // until the bounded two-way shard/frontend handoff has completed.
         let result = futures::future::join(application, frontend).await;
         match result {
-            (Ok(application), Ok(frontend)) => Ok(Self {
+            (Ok(application), Ok((frontend, serving))) => Ok(Self {
                 application,
                 frontend,
                 devices,
+                serving,
             }),
             (application, frontend) => {
                 let error = match (application, frontend) {
@@ -215,7 +223,7 @@ impl Broker {
                         let _ = application.shutdown().await;
                         error
                     }
-                    (Err(error), Ok(frontend)) => {
+                    (Err(error), Ok((frontend, _))) => {
                         let _ = frontend.shutdown().await;
                         error
                     }
@@ -239,6 +247,25 @@ impl Broker {
     /// Number of OMQ-owned transport threads.
     pub fn io_threads(&self) -> usize {
         self.frontend.io_threads()
+    }
+
+    /// Resolve once every local partition can serve clients: it finished
+    /// recovery and either bootstrapped as leader or observed a remote leader.
+    /// Startup returns before that point. The observation is latched; later
+    /// leader changes use ordinary client retries.
+    pub fn ready(
+        &self,
+    ) -> impl std::future::Future<Output = Result<(), StartupError>> + Send + 'static + use<> {
+        let mut shards = self.serving.clone();
+        async move {
+            for shard in &mut shards {
+                shard
+                    .wait_for(|serving| *serving)
+                    .await
+                    .map_err(|_| failure("shard stopped before serving"))?;
+            }
+            Ok(())
+        }
     }
 
     /// Report an unexpected worker exit, then drain the remaining owners.

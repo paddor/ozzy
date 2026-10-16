@@ -4,6 +4,7 @@ use super::{AppendBuffer, JournalError, MAX_APPEND_OPERATIONS};
 use ozzy_core::state::{CanonicalImages, IdentityIndex, PreparedCanonicalGroup};
 use ozzy_journal::operation::{
     Barrier, OperationBody, OperationKind, OperationLimits, decode_operation_body,
+    decode_resolved_append, decode_resolved_append_with_validated_payload,
 };
 use ozzy_journal_segment::{DecodeLimits, PreparedOperationRecords};
 use ozzy_proto::OperationId;
@@ -70,6 +71,15 @@ pub(super) fn prepare<I: IdentityIndex + Clone>(
         buffer.set_validated(true);
         return Ok(validated);
     }
+    if buffer
+        .operations()
+        .all(|operation| operation.kind == OperationKind::ResolvedAppend)
+    {
+        let validated =
+            prepare_resolved_appends(images, buffer, limits, primary_payloads_validated)?;
+        buffer.set_validated(true);
+        return Ok(validated);
+    }
     // Synchronous bounded scratch, never retained across an await.
     let mut bodies: [_; MAX_APPEND_OPERATIONS] = std::array::from_fn(|_| {
         (
@@ -89,6 +99,35 @@ pub(super) fn prepare<I: IdentityIndex + Clone>(
     drop(bodies);
     buffer.set_validated(true);
     Ok((plan, Vec::new()))
+}
+
+fn prepare_resolved_appends<I: IdentityIndex + Clone>(
+    images: &CanonicalImages<I>,
+    buffer: &mut AppendBuffer,
+    limits: OperationLimits,
+    primary_payloads_validated: bool,
+) -> Result<(PreparedCanonicalGroup, Vec<PreparedOperationRecords>), JournalError> {
+    let mut summaries = smallvec::SmallVec::<[_; 4]>::new();
+    let bodies = buffer.shared_bodies();
+    let mut records = Vec::with_capacity(buffer.len());
+    for operation in buffer.operations() {
+        let view = if primary_payloads_validated {
+            decode_resolved_append_with_validated_payload(operation.body, limits)?
+        } else {
+            decode_resolved_append(operation.body, limits)?
+        };
+        summaries.push((operation.op_number, view.batch.summary, view.results));
+        records.push(
+            PreparedOperationRecords::new_resolved_append(
+                operation.header(),
+                bodies.slice_ref(operation.body),
+                &view,
+            )
+            .map_err(records_error)?
+            .with_shared_backing_bytes(buffer.retained_bytes()),
+        );
+    }
+    Ok((images.prepare_resolved_append_group(&summaries)?, records))
 }
 
 fn prepare_appends<I: IdentityIndex + Clone>(

@@ -3,12 +3,63 @@
 use super::{ActorError, Duration, PendingIo, ReplicaActor};
 use crate::replica_actor::HistoryReason;
 
+/// Periodic journal turns that run only between foreground writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Maintenance {
+    StorageValidation,
+    MetadataCleanup,
+    OrphanCleanup,
+    Retention,
+}
+
 impl ReplicaActor {
+    /// The oldest due maintenance turn.
+    pub(super) fn due_maintenance(&self, now: Duration) -> Option<Maintenance> {
+        [
+            (
+                Maintenance::StorageValidation,
+                self.storage_validation.map(|(_, next, _)| next),
+            ),
+            (
+                Maintenance::MetadataCleanup,
+                self.metadata_cleanup.map(|(_, next, _)| next),
+            ),
+            (
+                Maintenance::OrphanCleanup,
+                self.orphan_cleanup.map(|(_, next, _)| next),
+            ),
+            // A retirement's file work runs beside writes; the next turn
+            // waits for its installation instead of draining for nothing.
+            (
+                Maintenance::Retention,
+                self.retention_at.filter(|_| !self.journal.retiring()),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(kind, next)| next.filter(|next| now >= *next).map(|next| (kind, next)))
+        .min_by_key(|(_, next)| *next)
+        .map(|(kind, _)| kind)
+    }
+
+    /// Give one due turn to the journal once admitted writes are settled.
+    pub(super) fn maintenance_round(
+        &mut self,
+        kind: Maintenance,
+        now: Duration,
+    ) -> Result<(), ActorError> {
+        match kind {
+            Maintenance::StorageValidation => self.storage_validation_round(now),
+            Maintenance::MetadataCleanup => self.metadata_cleanup_round(now),
+            Maintenance::OrphanCleanup => self.orphan_cleanup_round(now),
+            Maintenance::Retention => self.retention_round(now),
+        }
+    }
+
     pub(super) fn complete_retention(
         &mut self,
         turn: crate::replica_journal::RetentionTurn,
         now: Duration,
-    ) -> Result<(), ActorError> {
+    ) {
         if let Some(source) = turn.released {
             if self.pinned == Some(source) {
                 self.pinned = None;
@@ -18,21 +69,38 @@ impl ReplicaActor {
             }
         }
         self.foreground_turn_due = true;
+        if turn.expired_identities != 0 {
+            self.work.proposals.release_capacity();
+        }
         if !turn.enabled {
             self.retention_at = None;
         } else if turn.more_work {
+            // Identity expiry continues without draining the core again;
+            // record retention repeats its settled turn.
+            self.identity_retention_due = turn.expired_identities != 0;
             self.retention_at = self.config.retention_interval.map(|_| now);
         }
         if let Some(buffer) = turn.proposal {
-            if self.work.waiting.is_some() {
-                return Err(ActorError::history(HistoryReason::Retention));
-            }
-            self.work.waiting = Some(super::ingress::Submission {
-                buffer,
-                reply: super::ingress::Reply::maintenance(),
-            });
+            self.work.proposals.set_maintenance(buffer);
         }
-        Ok(())
+    }
+
+    pub(super) fn complete_identity_retention(
+        &mut self,
+        turn: crate::replica_journal::IdentityRetention,
+        now: Duration,
+    ) {
+        self.foreground_turn_due = true;
+        if turn.expired != 0 {
+            self.work.proposals.release_capacity();
+        }
+        if turn.more_work {
+            self.identity_retention_due = true;
+            self.retention_at = self.config.retention_interval.map(|_| now);
+        }
+        if let Some(buffer) = turn.proposal {
+            self.work.proposals.set_maintenance(buffer);
+        }
     }
 
     /// Enable periodic byte-bounded storage checks between foreground disk actions.
@@ -147,6 +215,12 @@ impl ReplicaActor {
 
 impl ReplicaActor {
     pub(super) fn retention_round(&mut self, now: Duration) -> Result<(), ActorError> {
+        let Some(next) = self.retention_at else {
+            return Ok(());
+        };
+        if !self.maintenance_ready(now, next) {
+            return Ok(());
+        }
         let snapshot = self
             .driver
             .normal()
@@ -159,18 +233,36 @@ impl ReplicaActor {
             ));
             return Ok(());
         }
-        if self.work.waiting.is_some() {
+        if self.work.proposals.blocks_maintenance() {
             self.foreground_turn_due = true;
             return Ok(());
         }
+        let leader = self.configuration.primary(snapshot.scope.view) == self.local;
         if snapshot.accepted != snapshot.applied || self.pending_replay.is_some() {
+            // Identity expiry owed by the last turn runs now, between
+            // foreground turns, instead of draining the core for a full turn.
+            if self.identity_retention_due && self.pending_replay.is_none() {
+                self.identity_retention_due = false;
+                self.foreground_turn_due = true;
+                crate::profiling::event(crate::profiling::Event::IdentityRetention);
+                self.pending = Some(PendingIo::IdentityRetention(
+                    self.journal
+                        .retain_identities(self.driver.begin_validation()?, leader)?,
+                ));
+                self.retention_at = self
+                    .config
+                    .retention_interval
+                    .map(|interval| now.saturating_add(interval));
+            }
             return Ok(());
         }
         let seed = ozzy_proto::OperationId::from_bytes(*self.ids.request()?.as_bytes());
+        crate::profiling::event(crate::profiling::Event::RetentionTurn);
+        self.identity_retention_due = false;
         self.pending = Some(PendingIo::Retention(self.journal.retention_turn(
             self.driver.begin_validation()?,
             seed,
-            self.configuration.primary(snapshot.scope.view) == self.local,
+            leader,
         )?));
         self.retention_at = self
             .config

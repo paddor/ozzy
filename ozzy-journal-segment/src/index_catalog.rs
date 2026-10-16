@@ -13,7 +13,7 @@ use thiserror::Error;
 
 use crate::{
     IndexBuildError, IndexLimits, IndexSource, MessageIndexEntry, OffsetIndexEntry,
-    OperationIndexEntry, open_segment_index, segment_index_name,
+    OperationIndexEntry, OperationLocation, open_segment_index, segment_index_name,
 };
 
 const HOT_INDEX_CAPACITY: usize = 4;
@@ -46,6 +46,15 @@ pub struct IndexedOperationLocation {
     pub source: IndexSource,
     /// Validated record or operation selector bound to the exact source.
     pub entry: OperationIndexEntry,
+}
+
+/// Numeric operation result bound to its exact source segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexedOperation {
+    /// Exact immutable segment prefix binding this selector.
+    pub source: IndexSource,
+    /// Validated canonical operation, independent of any retry ID or payload.
+    pub location: OperationLocation,
 }
 
 /// Exact sealed-index set with an owner-local, bounded hot index set.
@@ -297,6 +306,32 @@ impl SegmentIndexCatalog {
             }
         }
         Ok(None)
+    }
+
+    /// Locate one numeric operation in its unique source, independent of cache order.
+    pub fn find_operation_number(
+        &self,
+        number: u64,
+        through_op: u64,
+    ) -> Result<Option<IndexedOperation>, IndexCatalogError> {
+        if number == 0 || number > through_op {
+            return Ok(None);
+        }
+        let at = self
+            .sources
+            .partition_point(|source| source.last_op_number < number);
+        let Some(source) = self
+            .sources
+            .get(at)
+            .copied()
+            .filter(|source| source.first_op_number <= number)
+        else {
+            return Ok(None);
+        };
+        let location = self
+            .with_source(source, |index| Ok(index.find_operation_number(number)))?
+            .ok_or(IndexCatalogError::InconsistentIndex)?;
+        Ok(Some(IndexedOperation { source, location }))
     }
 
     fn eligible_sources(&self, through_op: u64) -> impl Iterator<Item = &IndexSource> {

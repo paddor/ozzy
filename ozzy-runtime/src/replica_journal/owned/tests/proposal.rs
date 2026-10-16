@@ -14,6 +14,7 @@ use ozzy_proto::{
     ProducerSequence,
 };
 use ozzy_replication::{Admission, WriteTicket};
+pub(super) mod dedup;
 
 pub(super) fn request(writer: u8, first: u64, count: usize) -> ProducerAppend<'static> {
     ProducerAppend {
@@ -73,7 +74,10 @@ fn ready(result: ProposalValidation) -> ValidatedAppend {
     validated
 }
 
-fn accept(replica: &mut Replica, mut validated: ValidatedAppend) -> JournalCompletion<WriteTicket> {
+pub(super) fn accept(
+    replica: &mut Replica,
+    mut validated: ValidatedAppend,
+) -> JournalCompletion<WriteTicket> {
     assert!(replica.journal.can_admit(&mut validated));
     let Admission::Write { ticket, .. } = replica
         .driver

@@ -31,6 +31,9 @@ pub(super) struct Peer {
     pub(super) outgoing_channels: super::flow::Channels,
     pub(super) replies: [Queue; 2],
     pub(super) next_reply_class: usize,
+    /// Classes whose front frame OMQ refused. Flushing skips them until the
+    /// owner observes send progress for that frame.
+    pub(super) blocked: [bool; 2],
 }
 
 /// One dispatcher owns link routing and source pressure. It holds no pending
@@ -199,6 +202,7 @@ impl Dispatcher {
                 incoming_channels: super::flow::Channels::default(),
                 outgoing_channels: super::flow::Channels::default(),
                 next_reply_class: 0,
+                blocked: [false; 2],
                 replies: [
                     Queue::new(self.limits.replies.control).map_err(|_| SetupError::Allocation)?,
                     Queue::new(self.limits.replies.data).map_err(|_| SetupError::Allocation)?,

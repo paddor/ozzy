@@ -19,6 +19,7 @@ use ozzy_proto::{
 
 mod dynamic;
 mod frontend;
+mod group_progress;
 mod pipeline;
 
 fn limits() -> DataLimits {
@@ -106,7 +107,10 @@ fn intake_access_profile(
         policy: Policy::LocalDurable,
         access,
         limits: wire,
+        reserve_dedup_results: false,
         requests_per_writer: 1,
+        progress_requests: 0,
+        progress_batch: 1,
         turn_slots: 2,
     };
     let buffers = (0..config.access.required_buffers(1).unwrap())

@@ -2,10 +2,10 @@
 //! stores offsets before releasing that prefix; observers acquire it first.
 
 #[cfg(all(test, ozzy_loom))]
-use loom::sync::atomic::{AtomicU64, Ordering};
-use ozzy_proto::MessageId;
+use loom::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use ozzy_proto::{MessageId, append::AppendDisposition};
 #[cfg(not(all(test, ozzy_loom)))]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 /// One record's stable receipt, retained by its queue entry and pending handles.
@@ -14,6 +14,7 @@ use std::sync::{Arc, OnceLock};
 struct RecordCompletion {
     message_id: MessageId,
     offset: AtomicU64,
+    disposition: AtomicU8,
 }
 
 const PAGE_RECORDS: usize = 16;
@@ -44,13 +45,22 @@ impl Completion {
     }
 
     /// The driver must publish its confirmed prefix after storing this offset.
-    pub(super) fn publish(&self, offset: u64) {
+    pub(super) fn publish(&self, offset: u64, disposition: AppendDisposition) {
         self.record().offset.store(offset, Ordering::Relaxed);
+        self.record()
+            .disposition
+            .store(disposition as u8, Ordering::Relaxed);
     }
 
     /// The caller must first acquire a confirmed prefix covering this record.
     pub(super) fn offset(&self) -> u64 {
         self.record().offset.load(Ordering::Relaxed)
+    }
+
+    /// The caller must first acquire the same confirmed prefix as for the offset.
+    pub(super) fn disposition(&self) -> AppendDisposition {
+        AppendDisposition::try_from(self.record().disposition.load(Ordering::Relaxed))
+            .expect("driver published a valid disposition")
     }
 
     #[cfg(all(test, not(ozzy_loom)))]
@@ -78,6 +88,7 @@ impl Pool {
             .set(RecordCompletion {
                 message_id,
                 offset: AtomicU64::new(0),
+                disposition: AtomicU8::new(AppendDisposition::Stored as u8),
             })
             .expect("one caller owns each receipt slot");
         self.next += 1;
@@ -96,18 +107,19 @@ mod tests {
     fn retained_receipts_survive_rollover_and_pool_drop_without_identity_or_offset_changes() {
         let mut pool = Pool::default();
         let first = pool.allocate(MessageId::from_bytes([1; 16]));
-        first.publish(u64::MAX);
+        first.publish(u64::MAX, AppendDisposition::Duplicate);
         let alias = first.clone();
         let receipts: Vec<_> = (2..100)
             .map(|id| pool.allocate(MessageId::from_bytes([id; 16])))
             .collect();
         for (index, receipt) in receipts.iter().enumerate().rev() {
-            receipt.publish(index as u64 * 7);
+            receipt.publish(index as u64 * 7, AppendDisposition::Stored);
         }
         drop(pool);
         drop(first);
         assert_eq!(alias.message_id(), MessageId::from_bytes([1; 16]));
         assert_eq!(alias.offset(), u64::MAX);
+        assert_eq!(alias.disposition(), AppendDisposition::Duplicate);
         for (index, receipt) in receipts.iter().enumerate() {
             assert_eq!(
                 receipt.message_id(),

@@ -79,8 +79,37 @@ Save checkpoints after successful application processing. Reopen with
 Other start positions include latest, broker timestamp, and retained record ID.
 Checkpoints do not make application side effects transactional.
 
+## Consumer groups
+
+`GroupReader` divides a topic's partitions among the members of a named group.
+Connect its links with `handshake::Parameters::group`. Each partition resumes
+at the group's confirmed cursor; acknowledge records after processing them.
+
+```rust,no_run
+use ozzy::{BrokerLinks, ConsumerMemberId, GroupReader, GroupReaderConfig};
+
+async fn work(links: BrokerLinks, member: ConsumerMemberId) -> Result<(), Box<dyn std::error::Error>> {
+    let mut reader =
+        GroupReader::open(links, "orders", "billing", GroupReaderConfig::new(member)).await?;
+    let delivered = reader.next().await?;
+    // Process delivered.record, then acknowledge it.
+    let pending = reader.acknowledge(delivered.token)?;
+    pending.confirmed().await?;
+    reader.close().await?;
+    Ok(())
+}
+```
+
+Keep `member` stable across restarts of one worker. Unacknowledged records go to
+the partition's next owner, so processing is at least once.
+
+`BrokerLinks::inspect_group` shows a group's members and partition ownership.
+`BrokerLinks::delete_group` fences the group's members, drops its cursors, and
+frees the name; readers of the deleted group stop with
+`GroupReaderError::Deleted`.
+
 ## Further reading
 
 - [Overview](https://github.com/paddor/ozzy/blob/main/doc/OVERVIEW.md): record flow and broker modes.
 - [Runtime contracts](https://github.com/paddor/ozzy/blob/main/doc/RUNTIME.md): admission, cancellation, batching, and resource bounds.
-- Rust API docs: `BrokerLinksConfig`, `SharedTopicWriterConfig`, `ReaderStart`, and `TopicReaderConfig`.
+- Rust API docs: `BrokerLinksConfig`, `SharedTopicWriterConfig`, `ReaderStart`, `TopicReaderConfig`, and `GroupReaderConfig`.

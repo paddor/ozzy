@@ -210,6 +210,30 @@ impl ReplicaJournal {
         }
     }
 
+    /// Read one committed coordinator image directly from the owner's applied
+    /// state, without I/O or a command slot. A busy owner returns `WouldBlock`;
+    /// the caller retries on its next turn.
+    pub fn coordinator_group(
+        &self,
+        ticket: ValidationTicket,
+        coordinator: PartitionIncarnation,
+        name: &str,
+    ) -> Result<Option<std::sync::Arc<ozzy_core::state::CoordinatorGroup>>, super::JournalError>
+    {
+        if self.execution.is_closed() {
+            return Err(super::JournalError::Stopped);
+        }
+        if self.available_command_slots() == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into());
+        }
+        match &self.execution {
+            super::execution::Execution::Normal(owner) => {
+                owner.coordinator_group(ticket, coordinator, name)
+            }
+            super::execution::Execution::Recovery(_) => Err(PartitionReadError::Unavailable.into()),
+        }
+    }
+
     /// Read available confirmed records into an empty worker-owned arena.
     /// Backpressure returns that arena unchanged. Dropping an admitted completion
     /// does not cancel disk execution; it releases the finished output safely.

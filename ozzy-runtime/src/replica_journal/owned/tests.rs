@@ -1,9 +1,11 @@
 use super::*;
+mod dedup;
 mod donor;
 mod installation;
 mod local;
 mod maintenance;
 mod memory;
+mod progress;
 mod proposal;
 mod read;
 mod receiving;
@@ -81,10 +83,11 @@ fn config(root: &str, id: u8, policy: QuorumPolicy) -> OwnedConfig {
         },
         recovery: CanonicalRecoveryLimits {
             retained_identities: 64,
-            accepted_transitions: 8,
+            accepted_transitions: pipeline().backup().max_operations,
             ..CanonicalRecoveryLimits::default()
         },
         append_buffers: 4,
+        deduplication: None,
         append_limits: pipeline(),
         writeback: pipeline(),
         write_group_bytes: 8192,

@@ -16,7 +16,10 @@ fn pipelined_confirmations_preserve_writer_sequence_after_blocked_output() {
                 producer: ProducerId::from_bytes([40; 16]),
             }]),
             limits: limits(),
+            reserve_dedup_results: false,
             requests_per_writer: 3,
+            progress_requests: 0,
+            progress_batch: 1,
             turn_slots: 2,
         };
         let buffers = (0..4)

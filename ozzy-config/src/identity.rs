@@ -36,6 +36,8 @@ pub struct TopicIdentity {
     pub partitioner_seed: u64,
     /// Persistent topic confirmation policy.
     pub confirmation: Confirmation,
+    /// Fixed first-wins window; resource limits do not change event identity.
+    pub dedup_window_millis: Option<std::num::NonZeroU64>,
     /// Numeric partition order, never sorted by random group IDs.
     pub partitions: Vec<PartitionIdentity>,
 }
@@ -108,6 +110,9 @@ impl ValidatedDeployment {
                     partitioner: "xxh3-64".to_owned(),
                     partitioner_seed: topic.partitioner_seed,
                     confirmation: topic.confirmation,
+                    dedup_window_millis: topic
+                        .deduplication
+                        .and_then(|policy| std::num::NonZeroU64::new(policy.window_millis)),
                     partitions,
                 },
             );
@@ -177,6 +182,8 @@ impl ValidatedDeployment {
                     && stored.partitioner == "xxh3-64"
                     && stored.partitioner_seed == topic.partitioner_seed
                     && stored.confirmation == topic.confirmation
+                    && stored.dedup_window_millis.map(std::num::NonZeroU64::get)
+                        == topic.deduplication.map(|policy| policy.window_millis)
                     && stored.partitions.len() == topic.partitions as usize,
                 "identity.topics",
                 "topic identity, hash parameters, partition count or policy changed",

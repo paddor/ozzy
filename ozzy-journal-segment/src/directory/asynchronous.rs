@@ -4,7 +4,10 @@
 mod canonical;
 mod checkpoint;
 pub use canonical::Candidate;
-pub use checkpoint::CheckpointFiles;
+pub use checkpoint::{
+    CheckpointBuildPlan, CheckpointCursor, CheckpointFiles, CheckpointInbox, CheckpointInboxStream,
+    CheckpointSource, CheckpointStream, CheckpointWriter,
+};
 pub(crate) mod groups;
 mod history;
 mod index;
@@ -31,7 +34,9 @@ mod retention;
 mod roll;
 mod snapshot;
 mod suffix;
-pub use retention::{RetirementBudget, SegmentFiles};
+pub use retention::{
+    RetirementBudget, RetirementProof, RetirementScan, ScannedPrefix, SegmentFiles,
+};
 pub use suffix::{CanonicalCheckpointImport, CheckpointRecovery, Installer};
 #[cfg(test)]
 mod tests;
@@ -99,6 +104,8 @@ pub struct Journal {
     interrupted: bool,
     pins: std::sync::Arc<crate::retention::PinRegistry>,
     validated_indexes: std::collections::BTreeMap<u64, crate::IndexSource>,
+    /// Validated active-segment prefix reused by the next built snapshot.
+    active_prefix: Option<Box<crate::active_index::ActivePrefix>>,
 }
 
 impl Journal {
@@ -118,6 +125,26 @@ impl Journal {
     /// Validated reference selecting the current manifest generation.
     pub const fn current(&self) -> CurrentReference {
         self.current
+    }
+
+    /// Whether live deletion protection released any of these unselected
+    /// objects. Reads only the in-memory pin registry.
+    pub fn pins_released(
+        &self,
+        segments: &[u64],
+        checkpoints: &[ozzy_proto::CheckpointId],
+    ) -> Result<bool, DirectoryError> {
+        for &id in segments {
+            if !self.pins.is_pinned(id)? {
+                return Ok(true);
+            }
+        }
+        for &id in checkpoints {
+            if !self.pins.checkpoint_is_pinned(id)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
     /// Exact persisted adapter configuration bytes, when present.
     pub fn configuration(&self) -> Option<&[u8]> {

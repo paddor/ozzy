@@ -6,7 +6,7 @@ use ozzy_core::state::{
 };
 use ozzy_journal::operation::{
     Append, AppendBatch, AppendRecord, Assign, CreatePartition, OpenProducer, OperationBody,
-    ProducerResultFloor, Progress, ProgressOwner, RetentionPolicy, Trim,
+    ProducerResultFloor, Progress, ProgressAssignment, ProgressOwner, RetentionPolicy, Trim,
 };
 use ozzy_proto::{
     ConsumerGroupId, ConsumerMemberId, MessageId, Offset, OperationId, OwnerEpoch, PartitionId,
@@ -19,10 +19,7 @@ fn apply(
     body: &OperationBody<'_>,
 ) {
     let op_number = state.revision() + 1;
-    let committed = state.clone();
-    let plan = state
-        .prepare(op_number, body, identities, &committed)
-        .unwrap();
+    let plan = state.prepare(op_number, body, identities).unwrap();
     state.apply(plan, identities).unwrap();
 }
 
@@ -42,6 +39,7 @@ fn populated_state() -> CanonicalState {
             topic: "orders",
             partition_id: PartitionId::new(7),
             owner_epoch: OwnerEpoch::INITIAL,
+            dedup_window_millis: None,
             retention: RetentionPolicy {
                 max_age_millis: NonZeroU64::new(3_600_000),
                 max_bytes: NonZeroU64::new(1_000_000),
@@ -95,6 +93,8 @@ fn populated_state() -> CanonicalState {
             partition,
             expected_assignment_epoch: 0,
             new_assignment_epoch: 1,
+            plan_revision: 1,
+            resume_cursor: Offset::ZERO,
             new_member: Some(ConsumerMemberId::from_bytes([0x40; 16])),
             operation_id: OperationId::from_bytes([0x41; 16]),
         }),
@@ -105,7 +105,7 @@ fn populated_state() -> CanonicalState {
         &OperationBody::Progress(Progress {
             owner: ProgressOwner::Subscription(SubscriptionId::from_bytes([0x50; 16])),
             partition,
-            assignment_epoch: None,
+            assignment: None,
             expected_progress: None,
             new_progress: Offset::ZERO,
             operation_id: OperationId::from_bytes([0x51; 16]),
@@ -117,8 +117,11 @@ fn populated_state() -> CanonicalState {
         &OperationBody::Progress(Progress {
             owner: ProgressOwner::ConsumerGroup(consumer_group),
             partition,
-            assignment_epoch: Some(1),
-            expected_progress: None,
+            assignment: Some(ProgressAssignment {
+                epoch: 1,
+                member: ConsumerMemberId::from_bytes([0x40; 16]),
+            }),
+            expected_progress: Some(Offset::ZERO),
             new_progress: Offset::new(1),
             operation_id: OperationId::from_bytes([0x52; 16]),
         }),

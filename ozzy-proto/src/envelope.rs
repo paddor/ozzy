@@ -74,6 +74,14 @@ opcodes! {
     RecordsPub = 0x53 => "`RECORDS_PUB`: publish confirmed records to every live reader.",
     ReplicaReceipt = 0x54 => "`REPLICA_RECEIPT`: compact same-channel volatile receipt.",
     HistoryRetired = 0x55 => "`HISTORY_RETIRED`: require nonvoting checkpoint recovery below retained history.",
+    GroupJoin = 0x60 => "`GROUP_JOIN`: join, heartbeat, or leave a consumer group on its coordinator.",
+    GroupJoined = 0x61 => "`GROUP_JOINED`: describe the committed membership view of one instance.",
+    GroupAssign = 0x62 => "`GROUP_ASSIGN`: relay a committed plan revision to a source partition.",
+    GroupAssigned = 0x63 => "`GROUP_ASSIGNED`: confirm source activation coordinates.",
+    GroupInspect = 0x64 => "`GROUP_INSPECT`: read a group's committed coordinator image.",
+    GroupInspected = 0x65 => "`GROUP_INSPECTED`: describe a group's committed coordinator image.",
+    GroupDelete = 0x66 => "`GROUP_DELETE`: retire one group incarnation on its coordinator.",
+    GroupDeleted = 0x67 => "`GROUP_DELETED`: confirm a group incarnation is retired.",
     Nack = 0x7f => "`NACK`: report a typed negative outcome.",
 }
 

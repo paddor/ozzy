@@ -534,6 +534,93 @@ fn async_identity_handoff_checks_lineage_and_every_claim() {
 }
 
 #[test]
+fn async_identity_retirement_narrows_coverage_without_reading_files() {
+    let (mut controller, mut journal) = empty();
+    let retired = drive(&mut controller, barrier(&mut journal, 1));
+    drive(&mut controller, journal.roll_active(32768, 4)).unwrap();
+    let kept = drive(&mut controller, barrier(&mut journal, 2));
+    let snapshot = drive(
+        &mut controller,
+        journal.build_index_snapshot(Boundary::Accepted, build_limits()),
+    )
+    .unwrap();
+    let mut identities = AsyncJournalIdentityIndex::new(snapshot, 4, 4);
+    let overlay = drive(&mut controller, barrier(&mut journal, 3));
+    drive(&mut controller, identities.resolve(&[overlay.key()])).unwrap();
+    identities.reserve(&[overlay]).unwrap();
+    drive(&mut controller, journal.roll_active(32768, 4)).unwrap();
+    let mut next = journal.next_manifest().unwrap();
+    next.accepted = journal.accepted_position().unwrap();
+    next.committed = next.accepted;
+    drive(&mut controller, journal.install_metadata(next)).unwrap();
+    let id = ozzy_proto::CheckpointId::from_bytes([0x55; 16]);
+    drive(
+        &mut controller,
+        journal.build_checkpoint(id, Digest::from_bytes([0x56; 32]), 8, b"checkpoint"),
+    )
+    .unwrap();
+    drive(&mut controller, journal.install_checkpoint(id)).unwrap();
+    let floors = crate::RetentionFloors::new(vec![]).unwrap();
+    let one = crate::AsyncRetirementBudget {
+        max_segments: 1,
+        max_read_bytes: 65536,
+    };
+    drive(&mut controller, journal.retire_sealed_prefix(&floors, one)).unwrap();
+
+    let first = journal.manifest().segments[0];
+    assert_eq!(first.segment_id, 2);
+    let wrong = SegmentReference {
+        file_generation: 1,
+        ..first
+    };
+    assert!(matches!(
+        identities.retire_prefix(wrong),
+        Err(JournalIndexError::LineageSegmentMismatch(2))
+    ));
+    let narrowed = identities.retire_prefix(first).unwrap();
+    assert!(controller.jobs().is_empty(), "narrowing reads no files");
+    drop(identities);
+    assert!(journal.pins_released(&[1], &[]).unwrap());
+    assert!(!journal.pins_released(&[2], &[]).unwrap());
+    drive(
+        &mut controller,
+        narrowed.resolve(&[retired.key(), kept.key()]),
+    )
+    .unwrap();
+    assert_eq!(narrowed.lookup(retired.key()), Ok(None));
+    assert_eq!(narrowed.lookup(kept.key()), Ok(Some(kept)));
+    assert_eq!(narrowed.lookup(overlay.key()), Ok(Some(overlay)));
+
+    // Once every captured source retires, coverage re-anchors at the retained
+    // history's predecessor and still hands off to a rebuilt snapshot.
+    drive(&mut controller, journal.retire_sealed_prefix(&floors, one)).unwrap();
+    let first = journal.manifest().segments[0];
+    assert_eq!(first.segment_id, 3);
+    let mut anchored = narrowed.retire_prefix(first).unwrap();
+    drop(narrowed);
+    assert!(journal.pins_released(&[2], &[]).unwrap());
+    assert_eq!(anchored.snapshot().segment_references(), []);
+    assert_eq!(anchored.snapshot().through().op_number, overlay.op_number);
+    assert!(anchored.overlay().is_empty());
+    let latest = drive(&mut controller, barrier(&mut journal, 4));
+    drive(&mut controller, anchored.resolve(&[latest.key()])).unwrap();
+    anchored.reserve(&[latest]).unwrap();
+    let replacement = drive(
+        &mut controller,
+        journal.build_index_snapshot(Boundary::Accepted, build_limits()),
+    )
+    .unwrap();
+    let extended = drive(&mut controller, anchored.handoff(replacement)).unwrap();
+    drive(
+        &mut controller,
+        extended.resolve(&[overlay.key(), latest.key()]),
+    )
+    .unwrap();
+    assert_eq!(extended.lookup(overlay.key()), Ok(None));
+    assert_eq!(extended.lookup(latest.key()), Ok(Some(latest)));
+}
+
+#[test]
 fn async_catalog_cold_lookups_can_interleave_and_cancel_without_poisoning() {
     let (mut controller, mut journal) = empty();
     let mut claims = Vec::new();
@@ -610,4 +697,117 @@ fn async_catalog_cold_lookups_can_interleave_and_cancel_without_poisoning() {
     drive(&mut controller, index.resolve(&[unknown])).unwrap();
     assert_eq!(index.lookup(unknown), Ok(None));
     assert!(!journal.is_faulted());
+}
+
+#[test]
+fn async_written_snapshots_resume_with_the_same_entries_as_a_full_scan() {
+    let (mut controller, mut journal) = empty();
+    let mut positions = vec![drive(&mut controller, append(&mut journal, 6))];
+    drive(
+        &mut controller,
+        journal.build_index_snapshot(Boundary::Written, build_limits()),
+    )
+    .unwrap();
+    for offset in [7, 8] {
+        positions.push(drive(&mut controller, append(&mut journal, offset)));
+    }
+    let resumed = drive(
+        &mut controller,
+        journal.build_index_snapshot(Boundary::Written, build_limits()),
+    )
+    .unwrap();
+    let full = drive(
+        &mut controller,
+        journal.open_index_snapshot(Boundary::Written, build_limits().file),
+    )
+    .unwrap();
+    assert_eq!(resumed.through(), full.through());
+    for (position, offset) in positions.iter().zip(6..) {
+        assert!(drive(&mut controller, resumed.contains_position(*position)).unwrap());
+        assert_eq!(
+            format!(
+                "{:?}",
+                drive(
+                    &mut controller,
+                    resumed.read_offset(partition(), Offset::new(offset))
+                )
+                .unwrap()
+            ),
+            format!(
+                "{:?}",
+                drive(
+                    &mut controller,
+                    full.read_offset(partition(), Offset::new(offset))
+                )
+                .unwrap()
+            )
+        );
+    }
+    drive(&mut controller, journal.roll_active(32768, 4)).unwrap();
+    drive(&mut controller, append(&mut journal, 9));
+    let rolled = drive(
+        &mut controller,
+        journal.build_index_snapshot(Boundary::Written, build_limits()),
+    )
+    .unwrap();
+    for offset in 6..=9 {
+        assert!(
+            drive(
+                &mut controller,
+                rolled.read_offset(partition(), Offset::new(offset))
+            )
+            .unwrap()
+            .is_some(),
+            "{offset}"
+        );
+    }
+}
+
+#[test]
+fn async_written_snapshots_validate_each_active_group_once() {
+    let (mut controller, mut journal) = empty();
+    let first = drive(&mut controller, append(&mut journal, 6));
+    drive(
+        &mut controller,
+        journal.build_index_snapshot(Boundary::Written, build_limits()),
+    )
+    .unwrap();
+    let handle = drive(
+        &mut controller,
+        journal.access.open(
+            journal
+                .root()
+                .join("segments")
+                .join(journal.manifest.segments.last().unwrap().file_name()),
+            ozzy_io::OpenMode::ReadWrite,
+            false,
+            false,
+        ),
+    )
+    .unwrap();
+    // Damage inside the validated prefix is left to reopen, repair and scrub.
+    drive(
+        &mut controller,
+        journal
+            .access
+            .write_all(&handle, crate::SEGMENT_HEADER_BYTES as u64, &[0xff; 8]),
+    )
+    .unwrap();
+    let later = drive(&mut controller, append(&mut journal, 7));
+    let resumed = drive(
+        &mut controller,
+        journal.build_index_snapshot(Boundary::Written, build_limits()),
+    )
+    .unwrap();
+    assert!(drive(&mut controller, resumed.contains_position(later)).unwrap());
+    assert_eq!(resumed.through().op_number, later.op_number);
+    assert!(
+        drive(
+            &mut controller,
+            journal.open_index_snapshot(Boundary::Written, build_limits().file)
+        )
+        .is_err(),
+        "an uncached scan validates the damaged prefix"
+    );
+    assert!(drive(&mut controller, resumed.contains_position(first)).is_err());
 }

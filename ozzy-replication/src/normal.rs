@@ -54,6 +54,11 @@ pub struct ReplicaSnapshot {
     pub pending_operations: usize,
     /// Live canonical body bytes reserved in the external payload adapter.
     pub pending_body_bytes: usize,
+    /// Operations above this number occupy the primary's live window: the
+    /// commit it announced or the released prefix, whichever is later.
+    pub live_base: OpNumber,
+    /// Descriptor and body capacity this role retains beyond its released prefix.
+    pub retained_limits: PipelineLimits,
     /// Installed/recovered suffix retained only in the journal, not the live
     /// descriptor ring. Fresh work waits until this entire tail is applied.
     pub journal_tail: Option<Prefix>,
@@ -130,9 +135,16 @@ impl NormalReplica {
         {
             return Err(ReplicationError::InvalidLimits);
         }
+        // A later installed view can change the role; the ring then grows once.
+        let retained =
+            if configuration.primary(configuration.scope.view) == configuration.voters[local] {
+                limits
+            } else {
+                limits.backup()
+            };
         let mut operations = VecDeque::new();
         operations
-            .try_reserve_exact(limits.max_operations)
+            .try_reserve_exact(retained.max_operations)
             .map_err(|_| ReplicationError::Capacity)?;
         Ok(Self {
             configuration,
@@ -199,8 +211,29 @@ impl NormalReplica {
             applied: self.applied,
             pending_operations: self.operations.len(),
             pending_body_bytes: self.body_bytes,
+            live_base: self.live_base(),
+            retained_limits: self.retained_limits(),
             journal_tail: self.journal_tail,
             ready_for_appends: self.ready_for_appends(),
+        }
+    }
+
+    /// Operations above this number occupy the primary's live window.
+    fn live_base(&self) -> OpNumber {
+        self.known_commit.max(self.retained_base.op)
+    }
+
+    /// Descriptor and body capacity retained beyond the released prefix.
+    ///
+    /// The primary keeps one window in flight beyond its released prefix. A
+    /// backup releases only what the primary has announced committed, and its
+    /// own persistence can trail that announcement by a whole window while the
+    /// other backup confirms the primary's writes, so it retains two.
+    fn retained_limits(&self) -> PipelineLimits {
+        if self.is_primary() {
+            self.limits
+        } else {
+            self.limits.backup()
         }
     }
 
@@ -267,8 +300,21 @@ impl NormalReplica {
             return Err(ReplicationError::ActivationPending);
         }
         let new_count = operations.len() - first_new;
-        if new_count > self.limits.max_operations - self.operations.len()
-            || additional_bytes > self.limits.max_body_bytes - self.body_bytes
+        let retained = self.retained_limits();
+        if new_count
+            > retained
+                .max_operations
+                .saturating_sub(self.operations.len())
+            || additional_bytes > retained.max_body_bytes.saturating_sub(self.body_bytes)
+        {
+            return Err(ReplicationError::Capacity);
+        }
+        // A backup admits only what the primary can keep in flight beyond the
+        // commit it announced; the retained bound above covers its own release
+        // trailing that commit.
+        if !self.is_primary()
+            && predecessor.op.0.saturating_sub(self.live_base().0)
+                > self.limits.max_operations as u64
         {
             return Err(ReplicationError::Capacity);
         }
@@ -452,6 +498,8 @@ impl NormalReplica {
     /// Observe an authenticated primary's commit, including piggybacked commit.
     /// Visibility waits for this backup's configured local evidence. Missing
     /// payload returns `HistoryGap`; retry the announcement after catch-up.
+    /// An announcement past the accepted prefix still commits everything this
+    /// backup accepted in the view, so that much becomes visible at once.
     pub fn receive_commit(&mut self, from: NodeId, commit: Commit) -> Result<(), ReplicationError> {
         self.require_scope(commit.scope)?;
         self.require_primary(from)?;
@@ -460,6 +508,16 @@ impl NormalReplica {
         }
         if commit.committed.op < self.applied.op {
             return Ok(());
+        }
+        if commit.committed.op > self.accepted.op
+            && self.journal_tail.is_none()
+            && self.accepted.op > self.known_commit
+        {
+            // Otherwise a backup whose window is full behind a primary that
+            // already committed past it never learns a commit it can apply,
+            // and never releases the window the next suffix needs.
+            self.known_commit = self.accepted.op;
+            self.advance_commit();
         }
         if self.prefix_at(commit.committed.op)? != commit.committed {
             return Err(self.conflict());

@@ -39,6 +39,11 @@ pub(super) enum Action {
         leader: bool,
         done: completion::Sender<Result<super::RetentionTurn, JournalError>>,
     },
+    RetainIdentities {
+        ticket: ozzy_replication::driver::ValidationTicket,
+        leader: bool,
+        done: completion::Sender<Result<super::IdentityRetention, JournalError>>,
+    },
     Seek {
         ticket: ValidationTicket,
         partition: ozzy_proto::PartitionIncarnation,
@@ -168,11 +173,23 @@ pub(super) fn finish_read<T>(
     permit: OwnedSemaphorePermit,
 ) -> bool {
     let faulted = result.as_ref().err().is_some_and(read_fault);
+    if faulted && let Err(error) = &result {
+        fault_log(error);
+    }
     // Release command admission before waking the actor. Payload leases remain
     // charged until their completion/owner drops them.
     drop(permit);
     let _ = done.send(result);
     faulted
+}
+
+/// Name the error that fences this journal in the bounded diagnostic log,
+/// so a faulted worker reports its cause and not only the fence.
+pub(super) fn fault_log(error: &JournalError) {
+    crate::profiling::log(
+        crate::profiling::Level::Error,
+        &format!("replica journal fault: {error}"),
+    );
 }
 
 pub(super) fn read_fault(error: &JournalError) -> bool {
@@ -204,6 +221,9 @@ pub(super) fn finish<T>(
     permit: OwnedSemaphorePermit,
 ) -> bool {
     let faulted = result.is_err();
+    if let Err(error) = &result {
+        fault_log(error);
+    }
     drop(permit);
     // Caller cancellation does not cancel admitted effects or panic the worker.
     let _ = done.send(result);

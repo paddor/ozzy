@@ -9,7 +9,7 @@ pub mod frontend;
 pub mod memory;
 mod native_frames;
 mod peer_sessions;
-pub mod profiling;
+pub use ozzy_telemetry as profiling;
 mod reader_service;
 mod signal;
 #[cfg(feature = "storage-metrics")]

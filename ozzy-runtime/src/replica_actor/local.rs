@@ -4,7 +4,7 @@
 mod progress;
 use super::{
     ActorError, ProposalOutcome, ProposalSubmitter,
-    ingress::{Ingress, Reply, Submission},
+    ingress::{Ingress, NextProposal, ProposalWait, Proposals, Reply, Submission},
     io::PendingSync,
 };
 use crate::replica_journal::{
@@ -57,6 +57,7 @@ enum Pending {
     Admit(JournalCompletion<AdmittedAppend>),
     Apply(JournalCompletion<ValidationTicket>),
     Retention(JournalCompletion<crate::replica_journal::RetentionTurn>),
+    IdentityRetention(JournalCompletion<crate::replica_journal::IdentityRetention>),
 }
 
 #[derive(Debug)]
@@ -66,6 +67,15 @@ struct Live {
     buffer: Option<AppendBuffer>,
 }
 
+/// Pending retention work: the next settled retention turn, and whether
+/// identity expiry owes a bounded step that runs between foreground turns
+/// without waiting for a settled journal.
+#[derive(Debug, Clone, Copy)]
+struct RetentionDue {
+    at: Option<std::time::Duration>,
+    identities: bool,
+}
+
 /// One local-durable partition actor. It polls storage futures on its application
 /// shard and creates no thread or task. Callers poll actors independently so one
 /// partition's pending I/O never blocks another. Intake is count/byte bounded.
@@ -73,14 +83,13 @@ struct Live {
 pub struct LocalActor {
     journal: ReplicaJournal,
     now: std::time::Duration,
-    retention_at: Option<std::time::Duration>,
+    retention: RetentionDue,
     foreground_turn_due: bool,
     driver: Driver,
     config: LocalActorConfig,
     ingress: Ingress,
     submitters: Vec<ProposalSubmitter>,
-    waiting: Option<Submission>,
-    validating: Option<Reply>,
+    proposals: Proposals,
     live: VecDeque<Live>,
     pending: Option<Pending>,
     persistence: VecDeque<(JournalCompletion<WriteTicket>, Option<Instant>)>,
@@ -154,7 +163,7 @@ impl LocalActor {
     pub fn new(
         owner: OwnedJournal,
         driver: Driver,
-        config: LocalActorConfig,
+        mut config: LocalActorConfig,
         timestamp: impl Fn() -> u64 + 'static,
     ) -> Result<Self, ActorError> {
         owner.check_local_driver(&driver)?;
@@ -172,6 +181,7 @@ impl LocalActor {
             return Err(ActorError::Limits);
         }
         let journal = owner.into_shard_journal(config.journal, timestamp)?;
+        config.retention_interval = journal.retention_interval(config.retention_interval);
         let limits = driver.limits();
         let backlog = journal.backlog();
         if limits.max_operations > backlog.max_operations
@@ -188,14 +198,16 @@ impl LocalActor {
         Ok(Self {
             journal,
             now: std::time::Duration::ZERO,
-            retention_at: config.retention_interval,
+            retention: RetentionDue {
+                at: config.retention_interval,
+                identities: false,
+            },
             foreground_turn_due: false,
             driver,
             config,
             ingress,
             submitters,
-            waiting: None,
-            validating: None,
+            proposals: Proposals::default(),
             live: VecDeque::with_capacity(config.proposal_capacity),
             pending: None,
             persistence: VecDeque::with_capacity(limits.max_operations),
@@ -261,7 +273,7 @@ impl LocalActor {
                     return Poll::Ready(Err(error));
                 }
                 Ok(false) => {
-                    return if self.closing && self.drained() {
+                    return if self.closing && self.settled() {
                         Poll::Ready(Ok(()))
                     } else {
                         Poll::Pending
@@ -296,7 +308,9 @@ impl LocalActor {
         Ok(())
     }
 
-    fn drained(&self) -> bool {
+    /// No admitted write, barrier, live reply, or unapplied suffix remains.
+    /// Shutdown completes and maintenance may rewrite settled state.
+    fn settled(&self) -> bool {
         let state = self.driver.snapshot();
         self.pending.is_none()
             && self.persistence.is_empty()
@@ -338,7 +352,10 @@ impl LocalActor {
             return Ok(true);
         }
         if self.closing {
-            if let Some(waiting) = self.waiting.take().or_else(|| self.ingress.pop()) {
+            if self.proposals.reject_all() != 0 {
+                return Ok(true);
+            }
+            if let Some(waiting) = self.ingress.pop() {
                 waiting
                     .reply
                     .finish(waiting.buffer, ProposalOutcome::NotAdmitted);
@@ -348,40 +365,64 @@ impl LocalActor {
         }
         let foreground_turn = std::mem::take(&mut self.foreground_turn_due);
         if !foreground_turn
-            && self.retention_at.is_some_and(|at| self.now >= at)
-            && self.waiting.is_none()
+            && self.retention.at.is_some_and(|at| self.now >= at)
+            && !self.proposals.blocks_maintenance()
+            && !self.journal.retiring()
         {
-            if !self.persistence.is_empty()
-                || self.sync.is_some()
-                || !self.live.is_empty()
-                || state.accepted != state.applied
-            {
+            if !self.settled() {
+                if self.retention.identities {
+                    // Identity expiry owed by the last turn runs now instead
+                    // of waiting for the journal to drain for a full turn.
+                    self.retention.identities = false;
+                    self.foreground_turn_due = true;
+                    crate::profiling::event(crate::profiling::Event::IdentityRetention);
+                    self.pending = Some(Pending::IdentityRetention(
+                        self.journal
+                            .retain_identities(self.driver.begin_validation()?, true)?,
+                    ));
+                    self.retention.at = self
+                        .config
+                        .retention_interval
+                        .map(|interval| self.now.saturating_add(interval));
+                    return Ok(true);
+                }
                 return Ok(changed);
             }
+            self.retention.identities = false;
+            crate::profiling::event(crate::profiling::Event::RetentionTurn);
             self.pending = Some(Pending::Retention(self.journal.retention_turn(
                 self.driver.begin_validation()?,
                 ozzy_proto::OperationId::from_bytes(*ozzy_proto::RequestId::new().as_bytes()),
                 true,
             )?));
-            self.retention_at = self
+            self.retention.at = self
                 .config
                 .retention_interval
                 .map(|interval| self.now.saturating_add(interval));
             return Ok(true);
         }
-        if self.waiting.is_none() {
-            self.waiting = self.ingress.pop();
-        }
-        let Some(waiting) = &self.waiting else {
-            return Ok(changed);
-        };
-        if waiting.reply.fenced() {
-            let waiting = self.waiting.take().expect("waiting request");
-            waiting
-                .reply
-                .finish(waiting.buffer, ProposalOutcome::NotAdmitted);
+        Ok(self.schedule_proposal()? | changed)
+    }
+
+    fn schedule_proposal(&mut self) -> Result<bool, ActorError> {
+        let state = self.driver.snapshot();
+        if let Some(buffer) = self.proposals.start_maintenance() {
+            self.pending = Some(Pending::Propose(
+                self.journal
+                    .propose_append(self.driver.begin_validation()?, buffer)
+                    .map_err(|rejected| rejected.reason)?,
+            ));
             return Ok(true);
         }
+        let driver = &self.driver;
+        let waiting = match self
+            .proposals
+            .next(&mut self.ingress, || driver.begin_validation())?
+        {
+            NextProposal::Idle | NextProposal::Blocked => return Ok(false),
+            NextProposal::Finished => return Ok(true),
+            NextProposal::Ready(waiting) => waiting,
+        };
         let limits = self.driver.limits();
         if waiting.buffer.len() > limits.max_operations - state.pending_operations
             || waiting.buffer.body_bytes() > limits.max_body_bytes - state.pending_body_bytes
@@ -389,17 +430,15 @@ impl LocalActor {
                 .journal
                 .validation_has_capacity(&waiting.buffer.0, state.accepted.op)
         {
-            return Ok(changed);
+            return Ok(false);
         }
-        let mut waiting = self.waiting.take().expect("waiting request");
-        waiting.reply.scheduled();
+        let buffer = self.proposals.start();
         self.pending = Some(Pending::Propose(
             self.journal
-                .propose_append(self.driver.begin_validation()?, waiting.buffer)
+                .propose_append(self.driver.begin_validation()?, buffer)
                 .map_err(|rejected| rejected.reason)?,
         ));
         self.propose_started_at = crate::profiling::start();
-        self.validating = Some(waiting.reply);
         Ok(true)
     }
 }

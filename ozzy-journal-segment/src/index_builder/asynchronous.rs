@@ -126,12 +126,19 @@ impl Builder {
         )
         .await?;
         let temporary = workspace.reserve("complete.idx".into())?;
+        let locations = merge_all(
+            pending.location_runs,
+            RunKind::Location,
+            limits.max_merge_fan_in,
+            &mut workspace,
+        )
+        .await?;
         self.write_complete(
             temporary.clone(),
             source,
             limits,
             pending.counts,
-            [offsets, messages, operations],
+            [offsets, messages, operations, locations],
         )
         .await?;
         let index = open(
@@ -201,7 +208,7 @@ impl Builder {
         source: IndexSource,
         limits: IndexBuildLimits,
         counts: IndexCounts,
-        runs: [Option<PathBuf>; 3],
+        runs: [Option<PathBuf>; 4],
     ) -> Result<(), IndexBuildError> {
         let layout = calculate_index_layout(counts, limits.file)?;
         let file = self
@@ -217,7 +224,8 @@ impl Builder {
         for (run, bytes) in runs.into_iter().zip([
             layout.message_start - INDEX_HEADER_BYTES,
             layout.operation_start - layout.message_start,
-            layout.file_bytes - layout.operation_start,
+            layout.location_start - layout.operation_start,
+            layout.file_bytes - layout.location_start,
         ]) {
             self.copy_run(run, bytes, &mut writer, &mut hasher).await?;
         }

@@ -17,6 +17,7 @@ include.workspace = true
 [features]
 default = []
 lz4-transport = ["omq-tokio/lz4"]
+zstd-transport = ["omq-tokio/zstd"]
 lz4-storage = ["ozzy-journal-segment/lz4"]
 simulation = []
 # Batch-level read-cache counters for measurement builds.
@@ -37,6 +38,7 @@ ozzy-proto.workspace = true
 ozzy-replication.workspace = true
 ozzy-journal.workspace = true
 ozzy-io.workspace = true
+ozzy-telemetry.workspace = true
 ozzy-journal-segment.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "sync", "time"] }

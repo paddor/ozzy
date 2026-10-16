@@ -117,8 +117,8 @@ fn missing_evidence_barrier_negative_control_reaches_independent_receipt_oracle(
     // Third broker never receives this confirmed prefix.
     sim.links[0][2] = false;
     sim.links[1][2] = false;
-    for id in 0..2 {
-        sim.replicas[id]
+    for replica in &mut sim.replicas[..2] {
+        replica
             .storage
             .as_mut()
             .unwrap()

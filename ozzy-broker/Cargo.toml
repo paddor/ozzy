@@ -15,6 +15,10 @@ include = ["/src/**/*.rs", "/README.md", "/LICENSE", "/three.toml", "/container.
 
 [features]
 simulation = []
+# Serve `lz4+tcp://` endpoints.
+lz4-transport = ["omq-tokio/lz4", "ozzy-runtime/lz4-transport"]
+# Serve `zstd+tcp://` endpoints.
+zstd-transport = ["omq-tokio/zstd", "ozzy-runtime/zstd-transport"]
 
 [dependencies]
 bytes.workspace = true

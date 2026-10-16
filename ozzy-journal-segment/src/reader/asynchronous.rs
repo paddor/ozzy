@@ -1,7 +1,7 @@
 use super::{
     Bytes, DecodeLimits, IndexSource, IndexedReadError, IndexedRecord, OffsetIndexEntry,
-    OperationLimits, SEGMENT_HEADER_BYTES, decode_body, decode_segment_header, inspect_append_body,
-    select_indexed_record, validate_location, validate_operation_location, validate_source_header,
+    OperationLimits, SEGMENT_HEADER_BYTES, decode_body, decode_segment_header, validate_location,
+    validate_operation_location, validate_source_header,
 };
 use crate::async_files::Access;
 use crate::{
@@ -22,7 +22,26 @@ pub(crate) async fn read_control(
     operations: OperationLimits,
     chunk: usize,
 ) -> Result<DecodedOperation<'static>, IndexedReadError> {
-    let location = validate_operation_location(source, entry.location, decode)?;
+    let operation = read_operation(access, path, source, entry.location, decode, chunk).await?;
+    if decode_operation_body(operation.kind, operation.body.as_ref(), operations)?.operation_id()
+        != Some(entry.operation_id)
+    {
+        return Err(IndexedReadError::LocationMismatch);
+    }
+    Ok(operation)
+}
+
+/// Verify one numeric selector against authoritative framing and logical digest.
+/// The caller validates the returned operation body for its own purpose.
+pub(crate) async fn read_operation(
+    access: &Access,
+    path: PathBuf,
+    source: IndexSource,
+    location: OperationLocation,
+    decode: DecodeLimits,
+    chunk: usize,
+) -> Result<DecodedOperation<'static>, IndexedReadError> {
+    let location = validate_operation_location(source, location, decode)?;
     let (header, bytes) = extent(access, path, source, location, chunk).await?;
     let operation = decode_indexed_operation(
         &header,
@@ -34,9 +53,6 @@ pub(crate) async fn read_control(
     if operation.entry_bytes != location.entry_bytes
         || operation.op_number != location.op_number
         || operation.digest != location.operation_digest
-        || decode_operation_body(operation.kind, operation.body.as_ref(), operations)?
-            .operation_id()
-            != Some(entry.operation_id)
     {
         return Err(IndexedReadError::LocationMismatch);
     }
@@ -57,8 +73,8 @@ pub(crate) async fn load(
 ) -> Result<super::CachedOperation, IndexedReadError> {
     let location = validate_location(source, entry, decode)?;
     let (header, bytes) = extent(access, path, source, location, chunk).await?;
-    let body = decode_body(&header, location, &Bytes::from(bytes), decode)?;
-    super::CachedOperation::from_body(entry, body, operations)
+    let (kind, body) = decode_body(&header, location, &Bytes::from(bytes), decode)?;
+    super::CachedOperation::from_body(entry, kind, body, operations)
 }
 
 pub(crate) async fn read_record(
@@ -97,20 +113,8 @@ pub(crate) async fn read_records(
     }
     let location = validate_location(source, entry, decode)?;
     let (header, bytes) = extent(access, path, source, location, chunk).await?;
-    let body = decode_body(&header, location, &Bytes::from(bytes), decode)?;
-    let mut records: Vec<IndexedRecord> =
-        inspect_append_body(&body, operations, |append, body, prepared| {
-            entries
-                .iter()
-                .map(|entry| select_indexed_record(append, body, prepared, *entry))
-                .collect()
-        })?;
-    for record in &mut records {
-        for part in &mut record.parts {
-            *part = Bytes::copy_from_slice(part);
-        }
-    }
-    Ok(records)
+    let (kind, body) = decode_body(&header, location, &Bytes::from(bytes), decode)?;
+    super::CachedOperation::from_body(entry, kind, body, operations)?.materialize(entries, true)
 }
 
 /// Load one exact indexed extent after its caller validated the location.

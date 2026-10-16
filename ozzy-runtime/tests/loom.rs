@@ -9,6 +9,8 @@
 mod completion;
 #[path = "../src/replicated/writer/inbox.rs"]
 mod inbox;
+#[path = "../src/replicated/processing/progress.rs"]
+mod processing_progress;
 #[path = "../src/replicated/writer/progress.rs"]
 mod progress;
 #[path = "../src/signal.rs"]
@@ -17,13 +19,17 @@ mod signal;
 use loom::sync::Arc;
 use loom::sync::atomic::{AtomicBool, Ordering};
 use loom::thread;
-use ozzy_proto::ProducerId;
+use ozzy_proto::{ProducerId, append::AppendDisposition};
 use ozzy_runtime::replicated::{
-    AppendKey, Error, Policy, RecordReceipt, WriterConfig, WriterError,
+    AppendKey, Error, Policy, ProcessingIdentity, ProgressError, RecordReceipt, WriterConfig,
+    WriterError,
 };
 use std::future::Future;
 use std::pin::pin;
 use std::task::{Context, Poll};
+
+#[path = "loom/processing.rs"]
+mod processing;
 
 #[test]
 fn confirmed_prefix_publishes_exact_offsets_before_observation() {
@@ -43,9 +49,9 @@ fn confirmed_prefix_publishes_exact_offsets_before_observation() {
                 thread::spawn(move || {
                     for (index, offset) in offsets.into_iter().enumerate() {
                         progress
-                            .confirm(index as u64, index as u64 + 1, offset, 2, |count| {
+                            .confirm(index as u64, index as u64 + 1, 2, |count| {
                                 assert_eq!(count, 1);
-                                records[index].publish(offset);
+                                records[index].publish(offset, AppendDisposition::Duplicate);
                             })
                             .unwrap();
                         thread::yield_now();
@@ -55,6 +61,7 @@ fn confirmed_prefix_publishes_exact_offsets_before_observation() {
             let confirmed = progress.confirmed();
             for index in 0..confirmed as usize {
                 assert_eq!(records[index].offset(), offsets[index]);
+                assert_eq!(records[index].disposition(), AppendDisposition::Duplicate);
             }
             publisher.join().unwrap();
             assert_eq!(progress.confirmed(), 2);
@@ -106,11 +113,10 @@ fn terminal_failure_racing_confirmation_seals_the_real_progress_prefix() {
             let records = records.clone();
             thread::spawn(move || {
                 for (index, offset) in [7, 50].into_iter().enumerate() {
-                    let result =
-                        progress.confirm(index as u64, index as u64 + 1, offset, 2, |count| {
-                            assert_eq!(count, 1);
-                            records[index].publish(offset);
-                        });
+                    let result = progress.confirm(index as u64, index as u64 + 1, 2, |count| {
+                        assert_eq!(count, 1);
+                        records[index].publish(offset, AppendDisposition::Duplicate);
+                    });
                     if let Err(error) = result {
                         assert!(matches!(error, WriterError::Closed));
                         break;
@@ -148,7 +154,7 @@ fn terminal_failure_racing_confirmation_seals_the_real_progress_prefix() {
         ));
         let confirmed = progress.confirmed();
         assert!(matches!(
-            progress.confirm(confirmed, confirmed + 1, 100, 3, |_| {
+            progress.confirm(confirmed, confirmed + 1, 3, |_| {
                 panic!("terminal failure published another receipt")
             }),
             Err(WriterError::Closed)

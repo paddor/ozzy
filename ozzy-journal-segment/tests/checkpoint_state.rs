@@ -60,7 +60,7 @@ fn canonical_state_checkpoint_matches_exact_journal_position() {
 
     let mut state = CanonicalState::new(StateLimits::default());
     let mut identities = MemoryIdentityIndex::new(8);
-    let plan = state.prepare(1, &body, &identities, &state).unwrap();
+    let plan = state.prepare(1, &body, &identities).unwrap();
     state.apply(plan, &mut identities).unwrap();
     assert_eq!(
         state.revision(),
@@ -125,12 +125,13 @@ fn canonical_state_checkpoint_matches_exact_journal_position() {
         checkpoint.manifest().state_schema_digest,
         canonical_state_schema_digest()
     );
-    let restored = CanonicalState::decode_snapshot(
-        &checkpoint.read_state(CheckpointLimits::default()).unwrap(),
-        StateLimits::default(),
-        StateSnapshotLimits::default(),
-    )
-    .unwrap();
+    let restored = checkpoint
+        .decode_canonical_state(
+            StateLimits::default(),
+            StateSnapshotLimits::default(),
+            CheckpointLimits::default(),
+        )
+        .unwrap();
     assert_eq!(restored, state);
     assert_eq!(restored.revision(), reference.position.op_number);
     assert!(

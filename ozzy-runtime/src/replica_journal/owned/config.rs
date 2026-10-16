@@ -6,6 +6,30 @@ use ozzy_replication::{ConfigurationRecord, JournalGeneration, PipelineLimits, Q
 use std::path::PathBuf;
 use tokio::sync::Semaphore;
 
+pub use ozzy_core::dedup::Limits as DedupLimits;
+
+/// Size a partition's identity reservation for its live pipeline. Pending
+/// identities stay charged until application, and a backup can hold its
+/// whole retained capacity accepted but not yet applied.
+pub fn dedup_limits(
+    window_millis: u64,
+    entries: usize,
+    bytes: usize,
+    max_records: usize,
+    pipeline: PipelineLimits,
+) -> DedupLimits {
+    let operations = pipeline.backup().max_operations;
+    let batch_records = max_records.min(entries);
+    DedupLimits {
+        window_millis,
+        entries,
+        batch_records,
+        pending_records: entries.min(batch_records.saturating_mul(operations)),
+        pending_operations: operations,
+        bytes,
+    }
+}
+
 /// Storage policy for one local or replicated partition. Backend execution and admission
 /// belong to the supplied shard lane, shared with its other partition actors.
 #[derive(Debug, Clone)]
@@ -18,8 +42,12 @@ pub struct OwnedConfig<C = ConfigurationRecord> {
     pub configuration: C,
     /// Bounded metadata, segment, transfer and directory work.
     pub limits: AsyncJournalLimits,
-    /// Canonical replay, identity cache and pending-transition bounds.
+    /// Canonical replay, identity cache and pending-transition bounds. A
+    /// replicated owner admits a backup's retained window unapplied.
     pub recovery: CanonicalRecoveryLimits,
+    /// Optional partition-local identity reservation, separate from core clones.
+    /// Its window must exactly match the immutable canonical topic policy.
+    pub deduplication: Option<DedupLimits>,
     /// Maximum simultaneously leased APPEND/history arenas for this owner.
     pub append_buffers: usize,
     /// Count/body bounds for each arena, separate from the shared device budget.
@@ -58,6 +86,12 @@ impl<C> OwnedConfig<C> {
         generation: JournalGeneration,
         mode: SegmentWriteMode,
     ) -> Result<(), JournalError> {
+        if let Some(limits) = self.deduplication {
+            limits.validate()?;
+            if limits.pending_operations < self.writeback.max_operations {
+                return Err(JournalError::Configuration);
+            }
+        }
         if self.limits.io.write_mode != mode
             || generation.0 == 0
             || self.append_buffers == 0

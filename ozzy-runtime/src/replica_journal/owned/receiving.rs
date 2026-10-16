@@ -345,6 +345,9 @@ impl RecoveringJournal {
     pub fn shutdown(mut self) -> impl std::future::Future<Output = Result<(), JournalError>> {
         Box::pin(async move {
             self.healthy()?;
+            if let Some(checkpoint) = self.checkpoint.take() {
+                checkpoint.inbox.discard().await?;
+            }
             match self.take_state() {
                 State::Journal(journal) => journal.close().await?,
                 State::Installing(staging) => staging.0.abort().await?.close().await?,
@@ -358,9 +361,15 @@ impl RecoveringJournal {
 }
 
 impl OwnedJournal {
-    pub(in crate::replica_journal) fn recovery_parts(
-        &self,
+    pub(in crate::replica_journal) async fn recovery_parts(
+        &mut self,
     ) -> Result<(OwnedConfig, Local, Option<crate::memory::Owner>), JournalError> {
+        self.healthy()?;
+        // Retired history can interrupt an unpublished view installation.
+        // Return to its old selection before opening nonvoting recovery.
+        if let super::JournalOwner::Installing(installation) = &self.journal {
+            Box::pin(self.abort_installation(installation.ticket)).await?;
+        }
         let journal = self.journal.readable()?;
         let configuration = ozzy_replication::ConfigurationRecord::decode(
             journal.configuration().ok_or(JournalError::Configuration)?,
@@ -373,6 +382,7 @@ impl OwnedJournal {
             configuration,
             limits: self.limits,
             recovery: self.recovery,
+            deduplication: self.dedup.limits,
             append_buffers: self.append_buffers,
             append_limits: self.append_limits,
             writeback: self.writeback.limits,

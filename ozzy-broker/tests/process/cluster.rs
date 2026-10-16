@@ -25,7 +25,7 @@ impl Cluster {
     }
 
     pub(super) fn retained(policy: Confirmation) -> Self {
-        let cluster = Self::new_with_shards(policy, true);
+        let cluster = Self::new_with_shards(policy, true, "tcp");
         let source = fs::read_to_string(&cluster.config).unwrap();
         fs::write(
             &cluster.config,
@@ -39,10 +39,22 @@ impl Cluster {
     }
 
     pub(super) fn new(policy: Confirmation) -> Self {
-        Self::new_with_shards(policy, false)
+        Self::new_with_shards(policy, false, "tcp")
     }
 
-    fn new_with_shards(policy: Confirmation, single_shard: bool) -> Self {
+    /// Every endpoint uses `lz4+tcp://`, including broker-to-broker links.
+    #[cfg(feature = "lz4-transport")]
+    pub(super) fn lz4(policy: Confirmation) -> Self {
+        Self::new_with_shards(policy, false, "lz4+tcp")
+    }
+
+    /// Every endpoint uses `zstd+tcp://`, including broker-to-broker links.
+    #[cfg(feature = "zstd-transport")]
+    pub(super) fn zstd(policy: Confirmation) -> Self {
+        Self::new_with_shards(policy, false, "zstd+tcp")
+    }
+
+    fn new_with_shards(policy: Confirmation, single_shard: bool, scheme: &str) -> Self {
         let policy = match policy {
             Confirmation::DiskQuorum => "disk-quorum",
             Confirmation::ReplicatedPersisting => "replicated-persisting",
@@ -68,10 +80,10 @@ impl Cluster {
             write!(
                 source,
                 "[brokers.broker-{index}.endpoints]\n\
-                 peer = \"tcp://127.0.0.1:{peer}\"\n\
-                 data_peer = \"tcp://127.0.0.1:{data}\"\n\
-                 reader_pub = \"tcp://127.0.0.1:{readers}\"\n\
-                 follower_pub = \"tcp://127.0.0.1:{followers}\"\n\
+                 peer = \"{scheme}://127.0.0.1:{peer}\"\n\
+                 data_peer = \"{scheme}://127.0.0.1:{data}\"\n\
+                 reader_pub = \"{scheme}://127.0.0.1:{readers}\"\n\
+                 follower_pub = \"{scheme}://127.0.0.1:{followers}\"\n\
                  [brokers.broker-{index}.devices.ssd]\nroot = \"{root}\"\n\
                  controller = \"ssd\"\n\
                  [brokers.broker-{index}.devices.ssd.workers]\n\
@@ -245,7 +257,10 @@ impl Processes {
 }
 
 pub(super) async fn orderly_restart(policy: Confirmation) {
-    let cluster = Cluster::new(policy);
+    orderly_restart_in(Cluster::new(policy)).await;
+}
+
+pub(super) async fn orderly_restart_in(cluster: Cluster) {
     cluster.provision();
     let checked = cluster.checked(0);
     let first_id = ozzy_proto::NodeId::from_bytes(*checked.identity.brokers["broker-0"].as_bytes());

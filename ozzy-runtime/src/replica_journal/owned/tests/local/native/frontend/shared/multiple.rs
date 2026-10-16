@@ -24,6 +24,7 @@ pub(super) fn service(
     _data: &crate::memory::Owner,
     _control: &crate::memory::Owner,
     wire: DataLimits,
+    processing: bool,
 ) -> (Service, TestInput) {
     let capacity = budgets(groups.len());
     let (data, data_rx) = data_channel(
@@ -76,7 +77,12 @@ pub(super) fn service(
         },
     )
     .unwrap();
-    let parameters = handshake::Parameters::streaming(wire, handshake::OWNER).unwrap();
+    let mut parameters = handshake::Parameters::streaming(wire, handshake::OWNER).unwrap();
+    if processing {
+        parameters.capabilities |=
+            handshake::OWNER_READ | handshake::OWNER_PROGRESS | handshake::OWNER_GROUPS;
+        parameters.required_capabilities = 0;
+    }
     (
         Service::new(
             dispatcher,

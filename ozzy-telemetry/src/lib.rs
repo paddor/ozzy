@@ -4,21 +4,28 @@
 //! each thread's lifetime, use bounded storage, and measure different work units:
 //! record queues, write groups, and confirmation replies. Their percentiles
 //! must not be added. No payload bytes or record identities are retained.
+#![warn(missing_docs)]
+#![forbid(unsafe_code)]
 
 use std::{
     cell::{Cell, RefCell},
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
-use omq_tokio::{Context, Message, Options, SocketType, blocking};
+use omq_tokio::{Context, ContextConfig, Message, Options, SocketType, blocking};
 use serde_json::json;
 
 const BINS: usize = 512;
 const PUBLISH_INTERVAL: Duration = Duration::from_millis(20);
+/// Recorded operations between clock reads for the publication interval.
+const PUBLISH_CHECK_OPERATIONS: u32 = 64;
+static TRANSPORT: OnceLock<Context> = OnceLock::new();
 
 thread_local! {
     static ENABLED: Cell<bool> = Cell::new(
         std::env::var("OZZY_BENCH_PROFILE").as_deref() == Ok("stages")
+            || std::env::var_os("OZZY_TELEMETRY_ENDPOINT").is_some()
     );
     static LOCAL: RefCell<Option<Box<Local>>> = const { RefCell::new(None) };
 }
@@ -49,6 +56,14 @@ counters! {
         ConfirmationApply => "confirmation_apply",
         /// OMQ admission to complete APPEND confirmation, per request.
         RequestRoundtrip => "request_roundtrip",
+        /// Source progress RPC attempt through its response, including failures.
+        ProcessingRoundtrip => "processing_roundtrip",
+        /// Native proposal admission through observed completion, including failures.
+        NativeProposal => "native_proposal",
+        /// Storage admission through execution start on its backend worker.
+        IoQueue => "io_queue",
+        /// Backend worker execution through physical completion, including failures.
+        IoExecution => "io_execution",
         /// Proposal submission to the replication actor starting validation.
         ReplicaQueue => "replica_proposal_queue",
         /// Leader-local admission completion to the successful proposal reply.
@@ -86,6 +101,56 @@ counters! {
 counters! {
     /// Opt-in replication events. Counts describe transport policy, never votes.
     Event, EVENT_NAMES {
+        /// Cumulative processing intent observed by its SDK owner.
+        ProcessingReady => "processing_ready",
+        /// Source progress RPC started by its SDK owner.
+        ProcessingRequest => "processing_request",
+        /// Source progress response observed by its SDK owner.
+        ProcessingConfirmed => "processing_confirmed",
+        /// Source progress request or leader selection needs another attempt.
+        ProcessingRetry => "processing_retry",
+        /// Source progress RPC decoded by the broker intake.
+        ProcessingReceived => "processing_received",
+        /// Progress input held because all consumer request slots are occupied.
+        ProcessingSlotRefusal => "processing_slot_refusal",
+        /// Progress preparation held because charged control backing is exhausted.
+        ProcessingArenaRefusal => "processing_arena_refusal",
+        /// Group activation input held because consumer request slots are occupied.
+        AssignmentSlotRefusal => "assignment_slot_refusal",
+        /// Group activation preparation held because charged control backing is exhausted.
+        AssignmentArenaRefusal => "assignment_arena_refusal",
+        /// Writer input held because its request slots are occupied.
+        NativeSlotRefusal => "native_slot_refusal",
+        /// Writer preparation held because charged arena backing is exhausted.
+        NativeArenaRefusal => "native_arena_refusal",
+        /// Native proposal successfully entered its existing actor lane.
+        NativeProposalSubmitted => "native_proposal_submitted",
+        /// Native proposal completed at its configured confirmation boundary.
+        NativeProposalCommitted => "native_proposal_committed",
+        /// Native proposal completed without confirmed admission.
+        NativeProposalUnconfirmed => "native_proposal_unconfirmed",
+        /// Native proposal completion observed; distinguish source progress from APPEND.
+        ProcessingCompleted => "processing_completed",
+        /// Group activation proposal completion observed.
+        AssignmentCompleted => "assignment_completed",
+        /// Storage job began executing on its backend worker.
+        IoStarted => "io_started",
+        /// Storage job began on reserved progress-class execution capacity.
+        IoProgressStarted => "io_progress_started",
+        /// Worker began a physical read operation.
+        IoRead => "io_read",
+        /// Worker began a physical write operation.
+        IoWrite => "io_write",
+        /// Worker began a file or directory durability barrier.
+        IoSync => "io_sync",
+        /// Backend execution completed successfully; canceled observation still counts.
+        IoCompleted => "io_completed",
+        /// Backend execution completed with an error.
+        IoFailed => "io_failed",
+        /// Successful physical write bytes, counted by the execution worker.
+        IoWriteBytes => "io_write_bytes",
+        /// Successful physical read bytes, counted by the execution worker.
+        IoReadBytes => "io_read_bytes",
         /// Fresh data packet reserved and queued to one follower.
         ReplicaSend => "replica_send",
         /// Data packet queued using an existing repair reservation.
@@ -94,8 +159,14 @@ counters! {
         ReplicaReceive => "replica_receive",
         /// Packet skipped because its predecessor is ahead of the retained prefix.
         ReplicaReceiveGap => "replica_receive_gap",
-        /// Packet skipped because its complete suffix exceeds remaining capacity.
-        ReplicaReceiveCapacity => "replica_receive_capacity",
+        /// Packet skipped because retained, unreleased bodies fill the receive ledger.
+        ReplicaReceiveLedgerFull => "replica_receive_ledger_full",
+        /// Packet skipped because accepted, validating, and queued suffixes fill the
+        /// follower's two live windows, or it lies beyond the leader's window above
+        /// the announced commit.
+        ReplicaReceiveWindowFull => "replica_receive_window_full",
+        /// Packet skipped because the queued arena or its payload memory cannot hold it.
+        ReplicaReceiveArenaFull => "replica_receive_arena_full",
         /// Packet was already present in the retained receive prefix.
         ReplicaReceiveDuplicate => "replica_receive_duplicate",
         /// Correlated status query queued to one peer, including retries.
@@ -116,6 +187,12 @@ counters! {
         ReplayPacketMiss => "replay_packet_miss",
         /// Recent packets served replay without reserving journal work.
         ReplayCacheHit => "replay_cache_hit",
+        /// Applied control packet bypassed the optional replay cache.
+        ReplayCacheControlBypass => "replay_cache_control_bypass",
+        /// Oversized backing bypassed the optional replay cache.
+        ReplayCacheOversizedBypass => "replay_cache_oversized_bypass",
+        /// Cached packet removed to satisfy the operation or backing-byte bound.
+        ReplayCacheCapacityEviction => "replay_cache_capacity_eviction",
         /// Cold replay waits for pending persistence to settle, per actor turn.
         ReplayPersistenceWait => "replay_persistence_wait",
         /// Cold replication fetch submitted to the journal owner.
@@ -184,6 +261,66 @@ counters! {
         ReplicaPublicationQueueDrop => "replica_publication_queue_drop",
         /// Follower PUB frame arrived beyond the contiguous retained prefix.
         ReplicaPublicationGap => "replica_publication_gap",
+        /// Leader validation check found its journal owner running a command,
+        /// rolling, or holding unobserved completions. Counted per check.
+        ValidationOwnerWait => "validation_owner_wait",
+        /// Leader validation check waited for payload memory. Counted per check.
+        ValidationMemoryWait => "validation_memory_wait",
+        /// Leader validation that may read files waited for earlier writes to
+        /// settle. Counted per check.
+        ValidationSettleWait => "validation_settle_wait",
+        /// Follower validation waited for application to advance: its staged
+        /// suffix needs deduplication capacity that the leader freed at a
+        /// commit this replica has not applied yet. Counted per check.
+        ValidationApplyWait => "validation_apply_wait",
+        /// Validation check refused because the control-identity overlay is
+        /// full until a settled index refresh. Counted per check.
+        ValidationIdentityWait => "validation_identity_wait",
+        /// Journal command held until writes settle because the writeback
+        /// backlog had no room. Counted per submission attempt.
+        JournalCapacityWait => "journal_capacity_wait",
+        /// Journal command that needs settled writes held behind physical
+        /// work. Counted per submission attempt.
+        JournalSettleWait => "journal_settle_wait",
+        /// Leader proposal deferred until its duplicate's accepted-only
+        /// original is applied. Later proposals queue behind it.
+        OriginalWait => "original_wait",
+        /// Bounded retention turn given to the journal once foreground writes
+        /// settled: record retention, identity expiry, or checkpoint work.
+        RetentionTurn => "retention_turn",
+        /// Bounded identity-expiry step run between foreground turns without
+        /// waiting for a settled journal.
+        IdentityRetention => "identity_retention",
+        /// Leader proposal deferred for identity or payload-memory capacity.
+        CapacityDeferral => "capacity_deferral",
+        /// Shard command applied by the dispatcher: a reply, publication, or
+        /// route update.
+        DispatcherCommand => "dispatcher_command",
+        /// Queued dispatcher reply handed to its OMQ destination socket.
+        DispatcherReplySent => "dispatcher_reply_sent",
+        /// Queued dispatcher reply refused by a full OMQ client socket.
+        DispatcherReplyBlocked => "dispatcher_reply_blocked",
+        /// Queued dispatcher frame refused by a full OMQ broker socket.
+        DispatcherBrokerBlocked => "dispatcher_broker_blocked",
+        /// Dispatcher queue for a client refused a shard frame.
+        DispatcherReplyFull => "dispatcher_reply_full",
+        /// Shard reply refused because an earlier reply to the same
+        /// destination was refused and is not yet re-admitted.
+        DispatcherReplyHeld => "dispatcher_reply_held",
+        /// Dispatcher queue for a broker refused a shard frame.
+        DispatcherBrokerFull => "dispatcher_broker_full",
+        /// Received frame the dispatcher rejected without retaining it.
+        DispatcherInputDropped => "dispatcher_input_dropped",
+        /// Received frame returned to its socket because its shard lane was full.
+        DispatcherInputPaused => "dispatcher_input_paused",
+        /// Paused source retried after its shard lane reported space.
+        DispatcherInputRetry => "dispatcher_input_retry",
+        /// Send-progress wait completed for a refused destination.
+        DispatcherSendWake => "dispatcher_send_wake",
+        /// SDK writer saw no APPEND response before its deadline and retries.
+        SdkResponseTimeout => "sdk_response_timeout",
+        /// HELLO dropped because the broker already admits `limits.max_clients`.
+        ClientLimitRefusal => "client_limit_refusal",
     }
 }
 
@@ -195,19 +332,24 @@ struct Local {
     thread_name: Option<String>,
     started: Instant,
     published: Instant,
+    unchecked: u32,
     sequence: u64,
+    logs: std::collections::VecDeque<serde_json::Value>,
+    log_sequence: u64,
 }
 
 impl Local {
     fn new() -> Self {
-        let socket = std::env::var("OZZY_BENCH_COUNTERS_ENDPOINT")
+        let socket = std::env::var("OZZY_TELEMETRY_ENDPOINT")
             .ok()
             .and_then(|endpoint| {
                 let address = endpoint.parse().ok()?;
-                let context = Context::new();
+                let context = TRANSPORT.get_or_init(|| {
+                    Context::with_config_and_name(ContextConfig { io_threads: 1 }, "ozzy/tele")
+                });
                 let socket = context.blocking_socket(
                     SocketType::Pub,
-                    Options::default().send_hwm(512).linger(Duration::ZERO),
+                    Options::default().send_hwm(8).linger(Duration::ZERO),
                 );
                 socket.connect(address).ok()?;
                 Some(socket)
@@ -222,11 +364,25 @@ impl Local {
             thread_name: thread.name().map(str::to_owned),
             started,
             published: started,
+            unchecked: 0,
             sequence: 0,
+            logs: std::collections::VecDeque::with_capacity(16),
+            log_sequence: 0,
         }
     }
 
+    /// Busy threads read the clock once per batch of operations instead of
+    /// on every counter update. A thread recording fewer operations than one
+    /// batch per interval publishes less often.
     fn publish_if_due(&mut self) {
+        self.unchecked += 1;
+        if self.unchecked >= PUBLISH_CHECK_OPERATIONS {
+            self.publish_if_elapsed();
+        }
+    }
+
+    fn publish_if_elapsed(&mut self) {
+        self.unchecked = 0;
         if self.published.elapsed() >= PUBLISH_INTERVAL {
             self.publish();
         }
@@ -263,6 +419,7 @@ impl Local {
             "thread_name":self.thread_name,"sequence":self.sequence,
             "elapsed_ms":self.started.elapsed().as_millis(),
             "events":events,"stages":stages,
+            "logs":self.logs,
         });
         if let Ok(bytes) = serde_json::to_vec(&row) {
             let _ = socket.try_send(Message::from(bytes));
@@ -284,6 +441,42 @@ fn with_local(f: impl FnOnce(&mut Local)) {
             f(local);
         });
     }
+}
+
+/// Severity of a bounded diagnostic entry, independent of application logging.
+#[derive(Clone, Copy, Debug)]
+pub enum Level {
+    /// A notable state transition.
+    Info,
+    /// Recoverable pressure or degraded execution.
+    Warn,
+    /// Execution failure.
+    Error,
+}
+
+/// Publish a diagnostic on this thread's existing PUB socket. At most sixteen
+/// entries of 256 UTF-8 bytes are retained per thread. Do not pass payloads,
+/// record identities, credentials, or unbounded application details.
+pub fn log(level: Level, message: &str) {
+    with_local(|local| {
+        let mut length = message.len().min(256);
+        while !message.is_char_boundary(length) {
+            length -= 1;
+        }
+        let level = match level {
+            Level::Info => "info",
+            Level::Warn => "warn",
+            Level::Error => "error",
+        };
+        if local.logs.len() == 16 {
+            local.logs.pop_front();
+        }
+        local.log_sequence += 1;
+        local.logs.push_back(json!({"sequence":local.log_sequence,
+            "elapsed_ms":local.started.elapsed().as_millis(),
+            "level":level,"message":&message[..length]}));
+        local.publish_if_elapsed();
+    });
 }
 
 /// Adaptive compression decision location.
@@ -319,7 +512,7 @@ pub fn compression(site: CompressionSite, packed: bool, input: usize, output: us
     count(output_bytes, output as u64);
 }
 
-/// Record one event only while diagnostics are enabled. Does not read a clock.
+/// Record one event only while diagnostics are enabled, publishing due snapshots.
 pub fn event(event: Event) {
     count(event, 1);
 }
@@ -499,6 +692,52 @@ impl Metric {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counters_read_the_publication_clock_once_per_batch() {
+        let mut local = Local::new();
+        let due = Instant::now().checked_sub(PUBLISH_INTERVAL).unwrap();
+        local.published = due;
+        for _ in 1..PUBLISH_CHECK_OPERATIONS {
+            local.publish_if_due();
+        }
+        assert_eq!(local.published, due);
+        local.publish_if_due();
+        assert!(local.published > due);
+    }
+
+    #[test]
+    fn disabled_diagnostics_allocate_no_local_state() {
+        std::thread::spawn(|| {
+            ENABLED.with(|enabled| enabled.set(false));
+            event(Event::IoStarted);
+            log(Level::Info, "unused");
+            assert!(start().is_none());
+            LOCAL.with(|local| assert!(local.borrow().is_none()));
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn diagnostic_logs_bound_entries_and_preserve_utf8() {
+        std::thread::spawn(|| {
+            enable();
+            for _ in 0..32 {
+                log(Level::Warn, &"\u{20ac}".repeat(256));
+            }
+            LOCAL.with(|local| {
+                let local = local.borrow();
+                let logs = &local.as_ref().unwrap().logs;
+                assert_eq!(logs.len(), 16);
+                assert_eq!(logs[0]["sequence"], 17);
+                assert_eq!(logs[15]["sequence"], 32);
+                assert_eq!(logs[15]["message"].as_str().unwrap().len(), 255);
+            });
+        })
+        .join()
+        .unwrap();
+    }
 
     #[test]
     fn event_counts_stay_with_the_emitting_thread() {

@@ -51,16 +51,12 @@ pub struct CanonicalCheckpointImport<'a> {
     pub id: ozzy_proto::CheckpointId,
     /// Exact original history prefix, independently checked against retained bytes.
     pub position: LogPosition,
-    /// Validated state at that prefix; contains no retained record payloads.
-    pub state: &'a ozzy_core::state::CanonicalState,
-    /// Bounds for cooperative state encoding.
-    pub limits: ozzy_core::state::StateSnapshotLimits,
-}
-
-struct EncodedCheckpoint {
-    id: ozzy_proto::CheckpointId,
-    position: LogPosition,
-    bytes: Vec<u8>,
+    /// Complete original image, including its independent identity section.
+    pub image: &'a super::CheckpointInbox,
+    /// Live canonical metadata bounds for private validation.
+    pub state_limits: ozzy_core::state::StateLimits,
+    /// Independent byte and name bounds for the core snapshot section.
+    pub snapshot_limits: ozzy_core::state::StateSnapshotLimits,
 }
 
 #[derive(Clone, Copy)]
@@ -526,7 +522,7 @@ impl Installer {
         if self.checkpoint_position.is_some() {
             return Err(Error::IncompleteSuffix);
         }
-        self.finish_selection(None).await
+        Box::pin(self.finish_selection(None)).await
     }
 
     /// Publish checkpoint state plus required retained operations in one final
@@ -536,28 +532,45 @@ impl Installer {
         self,
         import: CanonicalCheckpointImport<'_>,
     ) -> Result<Journal, Error> {
-        if !self.checkpoint_seen
-            || self.checkpoint_position != Some(import.position)
-            || import.state.revision() != import.position.op_number
-        {
+        if !self.checkpoint_seen || self.checkpoint_position != Some(import.position) {
             return Err(Error::IncompleteSuffix);
         }
+        import
+            .image
+            .require_owner(self.journal.root(), self.journal.manifest.identity)?;
         let mut budget = crate::cooperative::Budget::default();
-        let bytes = import
-            .state
-            .encode_snapshot_cooperative(import.limits, async |bytes| budget.charge(bytes).await)
-            .await?;
-        self.finish_selection(Some(EncodedCheckpoint {
-            id: import.id,
-            position: import.position,
-            bytes,
-        }))
-        .await
+        let mut decoder = ozzy_core::checkpoint::Decoder::new(
+            import.image.state_bytes(),
+            import.snapshot_limits.max_snapshot_bytes,
+        );
+        let mut reader = import.image.stream()?;
+        while let Some(bytes) = reader.next(64 * 1024).await? {
+            decoder.push(&bytes, |_| Ok(()), |_, _| Ok(()))?;
+            budget.charge(bytes.len()).await;
+        }
+        if !reader.is_verified() {
+            return Err(Error::IncompleteSuffix);
+        }
+        let (layout, bytes) = decoder.finish()?;
+        let state = ozzy_core::state::CanonicalState::decode_snapshot_cooperative(
+            &bytes,
+            import.state_limits,
+            import.snapshot_limits,
+            async |bytes| budget.charge(bytes).await,
+        )
+        .await?;
+        layout.validate_state(&state)?;
+        if state.revision() != import.position.op_number {
+            return Err(Error::IncompleteSuffix);
+        }
+        drop(state);
+        drop(bytes);
+        Box::pin(self.finish_selection(Some(import))).await
     }
 
     async fn finish_selection(
         mut self,
-        checkpoint: Option<EncodedCheckpoint>,
+        checkpoint: Option<CanonicalCheckpointImport<'_>>,
     ) -> Result<Journal, Error> {
         self.healthy()?;
         if position_before(self.writer.written_position().next_chain())? != self.accepted
@@ -591,7 +604,7 @@ impl Installer {
     async fn publish_checkpoint_source(
         &mut self,
         mut source: crate::Manifest,
-        import: EncodedCheckpoint,
+        import: CanonicalCheckpointImport<'_>,
     ) -> Result<crate::Manifest, Error> {
         source.committed = import.position;
         source.checkpoint = None;
@@ -610,27 +623,34 @@ impl Installer {
             source_manifest_generation: source.generation,
             source_manifest_digest: digest,
             state_schema_digest: ozzy_core::state::canonical_state_schema_digest(),
-            chunk_bytes: self
-                .journal
-                .limits
-                .checkpoint
-                .max_chunk_bytes
-                .min(64 * 1024),
+            chunk_bytes: self.journal.limits.checkpoint.max_chunk_bytes,
         };
-        let checkpoint = crate::checkpoint::asynchronous::Checkpoint::build(
-            self.journal.access.clone(),
-            self.journal.root(),
-            spec,
-            &import.bytes,
-            self.journal.limits.checkpoint,
-            self.journal.limits.io.chunk_bytes,
-            (
-                self.journal.limits.directory_entries,
-                self.journal.limits.directory_name_bytes,
-            ),
-        )
-        .await
-        .map_err(crate::DirectoryError::from)?;
+        let prepared = crate::checkpoint::asynchronous::PreparedBuild::new(
+            crate::checkpoint::asynchronous::BuildConfig {
+                access: self.journal.access.clone(),
+                root: self.journal.root().to_owned(),
+                spec,
+                limits: self.journal.limits.checkpoint,
+                io_bytes: self.journal.limits.io.chunk_bytes,
+                listing: (
+                    self.journal.limits.directory_entries,
+                    self.journal.limits.directory_name_bytes,
+                ),
+            },
+            import.image.state_bytes(),
+        )?;
+        let mut builder = prepared.start().await?;
+        let mut reader = import.image.stream()?;
+        while let Some(bytes) = reader.next(builder.fragment_bytes()).await? {
+            builder.push(&bytes).await?;
+        }
+        if !reader.is_verified() {
+            return Err(Error::IncompleteSuffix);
+        }
+        let checkpoint = builder.finish().await?;
+        if checkpoint.manifest.state_digest != import.image.digest() {
+            return Err(Error::IncompleteSuffix);
+        }
         self.journal.manifest = source;
         let mut selected = self.journal.next_manifest()?;
         selected.committed = self.replacement.committed;

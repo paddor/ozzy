@@ -22,13 +22,22 @@ pub use cluster::Cluster;
 /// Backend owner joining admitted memory-file work during broker shutdown.
 #[derive(Debug)]
 pub struct Storage {
-    stop: Arc<AtomicBool>,
+    control: Arc<Control>,
     done: Arc<tokio::sync::Semaphore>,
+}
+
+impl Storage {
+    fn stop(&self) {
+        self.control.stop.store(true, Ordering::Release);
+        self.control.wake.notify_one();
+    }
 }
 
 /// External fault controls; protocol and journal authority remain broker-owned.
 #[derive(Debug, Default)]
 pub struct Control {
+    stop: AtomicBool,
+    wake: tokio::sync::Notify,
     crash: std::sync::atomic::AtomicU8,
     hold_writes: AtomicBool,
     hold_completions: AtomicBool,
@@ -54,6 +63,7 @@ impl Control {
     pub fn crash(&self, power_loss: bool) {
         self.crash
             .store(if power_loss { 2 } else { 1 }, Ordering::Release);
+        self.wake.notify_one();
     }
 
     fn record(&self, events: Vec<ozzy_io::simulation::Event>) {
@@ -88,12 +98,14 @@ impl Control {
             }
             assert!(snapshot.pending.replace(send).is_none());
         }
+        self.wake.notify_one();
         receive.await.unwrap()
     }
 
     /// Hold segment data execution until released; metadata can progress.
     pub fn hold_record_writes(&self, hold: bool) {
         self.hold_writes.store(hold, Ordering::Release);
+        self.wake.notify_one();
     }
     /// Number of segment writes currently held by the pump.
     pub fn held_writes(&self) -> usize {
@@ -102,6 +114,7 @@ impl Control {
     /// Hold result delivery independently of physical execution.
     pub fn hold_completions(&self, hold: bool) {
         self.hold_completions.store(hold, Ordering::Release);
+        self.wake.notify_one();
     }
     /// Physically finished jobs whose result has not reached its observer.
     pub fn pending_completions(&self) -> usize {
@@ -118,6 +131,7 @@ impl Control {
     /// Fail the next admitted segment write before changing its bytes.
     pub fn fail_next_record_write(&self) {
         self.fail_write.store(true, Ordering::Release);
+        self.wake.notify_one();
     }
     /// Number of injected write failures observed by the pump.
     pub fn failures(&self) -> usize {
@@ -128,12 +142,13 @@ impl Control {
     pub fn short_next_record_write(&self, bytes: usize) {
         assert!(bytes > 0);
         self.short_write.store(bytes, Ordering::Release);
+        self.wake.notify_one();
     }
 }
 
 impl StorageOwner for Storage {
     fn drain(&self) {
-        self.stop.store(true, Ordering::Release);
+        self.stop();
         futures::executor::block_on(self.done.acquire())
             .unwrap()
             .forget();
@@ -142,23 +157,23 @@ impl StorageOwner for Storage {
 
 impl Drop for Storage {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        self.stop();
     }
 }
 
 /// Execution and delivery alternate. Reversed schedules deliver newer jobs
 /// first; awaiting one partition cannot prevent another from submitting work.
+/// An idle pump waits for a submission or an external control change.
 pub fn pump(
     mut device: Controller,
     reverse: bool,
 ) -> (Storage, Arc<Control>, tokio::task::JoinHandle<Image>) {
+    let control = Arc::new(Control::default());
     let storage = Storage {
-        stop: Arc::new(AtomicBool::new(false)),
+        control: control.clone(),
         done: Arc::new(tokio::sync::Semaphore::new(0)),
     };
-    let stop = storage.stop.clone();
     let done = storage.done.clone();
-    let control = Arc::new(Control::default());
     let scheduling = control.clone();
     let task = tokio::spawn(async move {
         let mut drain = None;
@@ -169,7 +184,7 @@ pub fn pump(
                 scheduling.record(events);
                 return scheduling.finish(image, &done);
             }
-            if stop.load(Ordering::Acquire) && drain.is_none() {
+            if scheduling.stop.load(Ordering::Acquire) && drain.is_none() {
                 drain = Some(Box::pin(device.begin_shutdown().unwrap().wait()));
             }
             if let Some(reply) = scheduling.snapshot.lock().unwrap().pending.take() {
@@ -181,6 +196,7 @@ pub fn pump(
             }
             let mut held = 0;
             let mut completions = 0;
+            let mut progressed = false;
             for (job, stage) in jobs {
                 match stage {
                     Stage::Queued => {
@@ -206,12 +222,14 @@ pub fn pump(
                                 Effect::Normal
                             };
                         device.execute(job, effect).unwrap();
+                        progressed = true;
                     }
                     Stage::Executed => {
                         if drain.is_none() && scheduling.hold_completions.load(Ordering::Acquire) {
                             completions += 1;
                         } else {
                             device.deliver(job).unwrap();
+                            progressed = true;
                         }
                     }
                 }
@@ -238,14 +256,35 @@ pub fn pump(
                 scheduling.record(events);
                 return scheduling.finish(image, &done);
             }
-            tokio::task::yield_now().await;
+            if progressed {
+                tokio::task::yield_now().await;
+            } else {
+                // Physical drain only advances through this pump's execution.
+                tokio::select! {
+                    () = device.submitted() => {}
+                    () = scheduling.wake.notified() => {}
+                }
+            }
         }
     });
     (storage, control, task)
 }
 
+/// Default media bounds for short integration and simulator schedules.
+pub const IMAGE_LIMITS: ImageLimits = ImageLimits {
+    nodes: 4096,
+    directory_entries: 16384,
+    file_bytes: 16 * 1024 * 1024,
+    total_bytes: 256 * 1024 * 1024,
+};
+
 /// One bounded production file controller with an explicitly supplied image.
-pub fn device(checked: &CheckedConfig, shards: usize, image: Image) -> (Controller, Vec<Client>) {
+pub fn device(
+    checked: &CheckedConfig,
+    shards: usize,
+    image: Image,
+    limits: ImageLimits,
+) -> (Controller, Vec<Client>) {
     assert_eq!(checked.plan.controllers.len(), 1);
     let workers = &checked.plan.controllers[0].workers;
     Controller::new(
@@ -262,12 +301,7 @@ pub fn device(checked: &CheckedConfig, shards: usize, image: Image) -> (Controll
                 },
             },
             handles: workers.open_handles,
-            image: ImageLimits {
-                nodes: 4096,
-                directory_entries: 16384,
-                file_bytes: 16 * 1024 * 1024,
-                total_bytes: 256 * 1024 * 1024,
-            },
+            image: limits,
             trace_events: 2_000_000,
         },
         image,
@@ -277,8 +311,18 @@ pub fn device(checked: &CheckedConfig, shards: usize, image: Image) -> (Controll
 
 /// Format broker partitions in the memory image through production journal jobs.
 pub async fn provision(checked: &CheckedConfig, local: &BrokerIdentity, reverse: bool) -> Image {
+    Box::pin(provision_sized(checked, local, reverse, IMAGE_LIMITS)).await
+}
+
+/// Format partitions in a memory image with explicit media bounds.
+pub async fn provision_sized(
+    checked: &CheckedConfig,
+    local: &BrokerIdentity,
+    reverse: bool,
+    limits: ImageLimits,
+) -> Image {
     let plan = JournalPlan::from_trusted_deployment(checked, local).unwrap();
-    let (controller, mut clients) = device(checked, 1, Image::default());
+    let (controller, mut clients) = device(checked, 1, Image::default(), limits);
     let (storage, _, task) = pump(controller, reverse);
     let io = Local::new(clients.pop().unwrap());
     for partition in plan.partitions {
@@ -305,7 +349,7 @@ pub async fn provision(checked: &CheckedConfig, local: &BrokerIdentity, reverse:
         opened.journal.shutdown().await.unwrap();
     }
     drop(io);
-    storage.stop.store(true, Ordering::Release);
+    storage.stop();
     task.await.unwrap()
 }
 
@@ -411,7 +455,34 @@ pub async fn start_image_selected(
     selections: &[ozzy_broker::RecoverySelection],
 ) -> (Broker, Arc<Control>, tokio::task::JoinHandle<Image>) {
     let name = checked.plan.name.clone();
-    let (controller, clients) = device(&checked, checked.plan.shards.len(), image);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        Box::pin(start_image_sized(
+            context,
+            checked,
+            local,
+            reverse,
+            image,
+            selections,
+            IMAGE_LIMITS,
+        )),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("virtual startup stalled: {name}"))
+    .unwrap()
+}
+
+/// Start one broker over a memory image with explicit media bounds.
+pub async fn start_image_sized(
+    context: impl Into<ServingContext>,
+    checked: CheckedConfig,
+    local: BrokerIdentity,
+    reverse: bool,
+    image: Image,
+    selections: &[ozzy_broker::RecoverySelection],
+    limits: ImageLimits,
+) -> Result<(Broker, Arc<Control>, tokio::task::JoinHandle<Image>), ozzy_broker::StartupError> {
+    let (controller, clients) = device(&checked, checked.plan.shards.len(), image, limits);
     let lanes = checked
         .plan
         .shards
@@ -424,12 +495,8 @@ pub async fn start_image_selected(
         })
         .collect();
     let (storage, control, task) = pump(controller, reverse);
-    let broker = tokio::time::timeout(
-        Duration::from_secs(5),
-        Broker::start_trusted_with_storage(checked, local, selections, context, lanes, storage),
-    )
-    .await
-    .unwrap_or_else(|_| panic!("virtual startup stalled: {name}"))
-    .unwrap();
-    (broker, control, task)
+    let broker =
+        Broker::start_trusted_with_storage(checked, local, selections, context, lanes, storage)
+            .await?;
+    Ok((broker, control, task))
 }

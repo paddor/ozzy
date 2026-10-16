@@ -21,18 +21,16 @@ impl ReadIndexBody for OperationBody<'_> {
     }
 
     fn batches(&self) -> impl Iterator<Item = ReadBatch> {
-        let append = match self {
-            Self::Append(append) => Some(append),
-            _ => None,
+        let batches = match self {
+            Self::Append(append) => append.batches.as_slice(),
+            Self::ResolvedAppend(append) => std::slice::from_ref(&append.batch),
+            _ => &[],
         };
-        append
-            .into_iter()
-            .flat_map(|append| &append.batches)
-            .map(|batch| ReadBatch {
-                partition: batch.partition,
-                first_offset: batch.first_offset,
-                records: batch.records.len(),
-                append_timestamp_millis: batch.append_timestamp_millis,
-            })
+        batches.iter().map(|batch| ReadBatch {
+            partition: batch.partition,
+            first_offset: batch.first_offset,
+            records: batch.records.len(),
+            append_timestamp_millis: batch.append_timestamp_millis,
+        })
     }
 }

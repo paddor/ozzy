@@ -220,6 +220,7 @@ fn bodies() -> Vec<(OperationKind, Vec<u8>)> {
             topic: "orders",
             partition_id: PartitionId::new(0),
             owner_epoch: OwnerEpoch::new(1),
+            dedup_window_millis: None,
             retention: RetentionPolicy::default(),
         }),
         OperationBody::OpenProducer(OpenProducer {

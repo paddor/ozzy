@@ -55,8 +55,9 @@ pub struct WriterConfig {
     /// Hard protocol request limits, bounded by directional broker packet limits.
     pub limits: DataLimits,
     /// Compress eligible APPEND payloads with adaptive LZ4 before sending.
-    /// Turn it off when the transport compresses, such as `lz4+tcp://`;
-    /// brokers then receive, replicate, and store plain payload bytes.
+    /// Turn it off when the transport compresses, as `lz4+tcp://` and
+    /// `zstd+tcp://` do; brokers then receive, replicate, and store plain
+    /// payload bytes.
     pub compress_payloads: bool,
     /// Uncompressed APPEND payload target. A larger permitted record goes alone.
     /// This is not a record-size limit. A batch that reaches it may pipeline
@@ -144,6 +145,8 @@ pub struct RecordReceipt {
     pub message_id: MessageId,
     /// Stable partition offset.
     pub offset: u64,
+    /// Whether this attempt stored a record or reused its original offset.
+    pub disposition: ozzy_proto::append::AppendDisposition,
     /// Exact confirmation boundary requested by this writer.
     pub policy: Policy,
 }
@@ -218,6 +221,7 @@ impl PendingRecord {
             self.sequence,
             self.completion.message_id(),
             self.completion.offset(),
+            self.completion.disposition(),
         )
     }
 }
@@ -318,7 +322,7 @@ impl Writer {
                     capacity,
                     Some(connection.reservation()),
                 );
-                tokio::spawn(driver::run_shared(
+                runtime::spawn_local(driver::run_shared(
                     shared, connection, routes, number, retry, operation,
                 ));
                 Ok(writer)

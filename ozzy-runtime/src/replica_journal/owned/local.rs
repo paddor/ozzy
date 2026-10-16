@@ -101,9 +101,8 @@ impl OwnedJournal {
             ozzy_journal_segment::AsyncJournalPartitionIndex::open(&journal, config.reads).await?;
         let driver = Driver::recover(config.configuration, generation, applied, config.writeback)?;
         let mode = Mode::Local(config.configuration);
-        Ok((
-            Self::from_open(&config, mode, journal, Some(images), Some(reader))?,
-            driver,
-        ))
+        let mut owner = Self::from_open(&config, mode, journal, Some(images), Some(reader))?;
+        owner.restore_dedup().await?;
+        Ok((owner, driver))
     }
 }

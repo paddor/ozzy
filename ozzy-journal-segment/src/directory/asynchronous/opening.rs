@@ -194,6 +194,7 @@ impl Journal {
             interrupted: false,
             pins: std::sync::Arc::default(),
             validated_indexes: std::collections::BTreeMap::new(),
+            active_prefix: None,
         })
     }
 
@@ -304,6 +305,7 @@ impl Journal {
             interrupted: false,
             pins: std::sync::Arc::default(),
             validated_indexes: std::collections::BTreeMap::new(),
+            active_prefix: None,
         };
         let committed = if journal.manifest.commit_mode == CommitMode::LocalDurable {
             recovered

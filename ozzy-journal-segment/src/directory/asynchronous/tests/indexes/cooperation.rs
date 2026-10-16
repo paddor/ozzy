@@ -26,7 +26,7 @@ fn drive_counted<T>(controller: &mut Controller, future: impl Future<Output = T>
 
 #[test]
 fn native_index_build_yields_during_sort_and_merge_without_changing_control_locations() {
-    for max_entry_buffer_bytes in [1280, 16384] {
+    for max_entry_buffer_bytes in [2048, 32768] {
         let (mut controller, mut journal) = empty_journal();
         let bodies: Vec<_> = (1u128..=130).rev().map(u128::to_be_bytes).collect();
         let mut chain = ChainPosition::GENESIS;
@@ -68,9 +68,14 @@ fn native_index_build_yields_during_sort_and_merge_without_changing_control_loca
         );
         assert_eq!(index.source().last_op_number, 130);
         assert_eq!(index.operation_count(), 130);
+        assert_eq!(index.location_count(), 130);
         for number in 1..=130 {
             let id = OperationId::from_bytes(u128::from(131u64 - number).to_be_bytes());
             assert_eq!(index.find_operation(id).unwrap().location.op_number, number);
+            assert_eq!(
+                index.find_operation_number(number).unwrap().op_number,
+                number
+            );
         }
         assert_eq!(
             drive(&mut controller, journal.open_sealed_index(1, limits.file))

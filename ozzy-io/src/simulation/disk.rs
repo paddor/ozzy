@@ -37,7 +37,7 @@ impl ImageLimits {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 enum Contents {
-    File(Box<[u8]>),
+    File(Vec<u8>),
     Directory(#[serde(with = "directory_entries")] BTreeMap<OsString, Inode>),
 }
 
@@ -297,7 +297,7 @@ impl Image {
         let empty = if directory {
             Contents::Directory(BTreeMap::new())
         } else {
-            Contents::File(Box::default())
+            Contents::File(Vec::new())
         };
         self.nodes.insert(
             inode,
@@ -319,15 +319,16 @@ impl Image {
     ) -> io::Result<()> {
         let old = self.file(inode, durable)?;
         self.byte_capacity(old.len(), length, limits)?;
-        let mut resized = vec![0; length].into_boxed_slice();
-        let keep = old.len().min(length);
-        resized[..keep].copy_from_slice(&old[..keep]);
         let node = self.nodes.get_mut(&inode).expect("existing file");
-        *if durable {
+        // Appends grow in place with amortized capacity, not one copy per write.
+        let Contents::File(file) = (if durable {
             &mut node.durable
         } else {
             &mut node.dirty
-        } = Contents::File(resized);
+        }) else {
+            unreachable!()
+        };
+        file.resize(length, 0);
         Ok(())
     }
 

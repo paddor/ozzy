@@ -139,6 +139,7 @@ async fn append_records(actor: &mut LocalActor, incarnation: ozzy_proto::Partiti
             topic: "orders",
             partition_id: PartitionId::ZERO,
             owner_epoch: OwnerEpoch::INITIAL,
+            dedup_window_millis: None,
             retention: RetentionPolicy::default(),
         }),
         OperationBody::OpenProducer(OpenProducer {

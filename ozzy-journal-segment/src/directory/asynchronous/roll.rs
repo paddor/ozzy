@@ -60,6 +60,7 @@ impl Journal {
             self.writer.transfer_buffers_to(&mut writer);
             self.install_selected(next).await?;
             self.writer = writer;
+            self.active_prefix = None;
             self.interrupted = false;
             return Ok(());
         }

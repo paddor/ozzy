@@ -59,6 +59,7 @@ fn create(actor: &ReplicaActor) -> crate::replica_journal::ProposalBuffer {
         topic: "orders",
         partition_id: PartitionId::ZERO,
         owner_epoch: OwnerEpoch::INITIAL,
+        dedup_window_millis: None,
         retention: RetentionPolicy::default(),
     });
     buffer
@@ -111,7 +112,10 @@ fn cluster_with_window(
                             producer: ProducerId::from_bytes([40; 16]),
                         }]),
                         limits: limits(),
+                        reserve_dedup_results: false,
                         requests_per_writer: window,
+                        progress_requests: 0,
+                        progress_batch: 1,
                         turn_slots: window,
                     },
                     submitter,

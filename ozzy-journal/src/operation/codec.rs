@@ -9,8 +9,9 @@ use ozzy_proto::OperationId;
 use smallvec::SmallVec;
 use std::ops::Range;
 
-mod append;
+pub(super) mod append;
 mod control;
+mod group;
 mod primitives;
 pub(super) use append::{
     AppendTotals, decode_append_batch, encode_append_records, records_are_tiny,
@@ -18,10 +19,10 @@ pub(super) use append::{
 };
 use append::{decode_append, encode_append};
 use control::{
-    decode_assign, decode_create, decode_open_producer, decode_policy,
+    decode_assign, decode_create, decode_dedup_watermark, decode_open_producer, decode_policy,
     decode_producer_result_floor, decode_progress, decode_trim, encode_assign, encode_create,
-    encode_open_producer, encode_policy, encode_producer_result_floor, encode_progress,
-    encode_trim,
+    encode_dedup_watermark, encode_open_producer, encode_policy, encode_producer_result_floor,
+    encode_progress, encode_trim,
 };
 pub(super) use primitives::{
     Decoder, Encoder, enforce_limit, validate_limits, validate_position_count,
@@ -65,6 +66,9 @@ pub fn append_operation_body_to(
             OperationBody::CreatePartition(value) => encode_create(value, limits, &mut encoder)?,
             OperationBody::OpenProducer(value) => encode_open_producer(*value, &mut encoder)?,
             OperationBody::Append(value) => encode_append(value, limits, &mut encoder)?,
+            OperationBody::ResolvedAppend(value) => {
+                super::resolved::encode_resolved_append(value, limits, &mut encoder)?;
+            }
             OperationBody::Progress(value) => encode_progress(*value, &mut encoder)?,
             OperationBody::Assign(value) => encode_assign(*value, &mut encoder)?,
             OperationBody::Trim(value) => encode_trim(*value, &mut encoder)?,
@@ -73,6 +77,9 @@ pub fn append_operation_body_to(
             OperationBody::ProducerResultFloor(value) => {
                 encode_producer_result_floor(*value, &mut encoder)?;
             }
+            OperationBody::DedupWatermark(value) => encode_dedup_watermark(*value, &mut encoder)?,
+            OperationBody::GroupPlan(value) => group::encode(value, limits, &mut encoder)?,
+            OperationBody::GroupDelete(value) => group::encode_delete(*value, &mut encoder)?,
         }
         Ok(())
     })();
@@ -151,7 +158,7 @@ pub fn decode_append_summary_and_view(
     let mut totals = AppendTotals::default();
     for _ in 0..count {
         let (_, view) =
-            decode_append_batch::<false, true>(&mut decoder, limits, &mut totals, None)?;
+            decode_append_batch::<false, true, false>(&mut decoder, limits, &mut totals, None)?;
         batches.push(view.summary);
     }
     decoder.finish()?;
@@ -225,6 +232,14 @@ fn decode_body<const MATERIALIZE: bool, const VALIDATE_PREPARED: bool>(
             MATERIALIZE,
             VALIDATE_PREPARED,
         >(&mut decoder, limits)?),
+        OperationKind::ResolvedAppend => OperationBody::ResolvedAppend(
+            super::resolved::read_resolved_append::<MATERIALIZE, VALIDATE_PREPARED>(
+                &mut decoder,
+                limits,
+                None,
+            )?
+            .0,
+        ),
         OperationKind::Progress => OperationBody::Progress(decode_progress(&mut decoder)?),
         OperationKind::Assign => OperationBody::Assign(decode_assign(&mut decoder)?),
         OperationKind::Trim => OperationBody::Trim(decode_trim(&mut decoder)?),
@@ -236,6 +251,15 @@ fn decode_body<const MATERIALIZE: bool, const VALIDATE_PREPARED: bool>(
         }),
         OperationKind::ProducerResultFloor => {
             OperationBody::ProducerResultFloor(decode_producer_result_floor(&mut decoder)?)
+        }
+        OperationKind::DedupWatermark => {
+            OperationBody::DedupWatermark(decode_dedup_watermark(&mut decoder)?)
+        }
+        OperationKind::GroupPlan => {
+            OperationBody::GroupPlan(group::decode::<MATERIALIZE>(&mut decoder, limits)?)
+        }
+        OperationKind::GroupDelete => {
+            OperationBody::GroupDelete(group::decode_delete(&mut decoder)?)
         }
     };
     decoder.finish()?;

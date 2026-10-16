@@ -41,6 +41,21 @@ struct Entry {
 }
 
 impl Writeback {
+    /// Accepted immutable bytes remain authoritative while physical work runs.
+    pub(super) fn operation(
+        &self,
+        number: u64,
+    ) -> Option<(
+        ozzy_journal::operation::CanonicalOperation<'_>,
+        ozzy_replication::Prefix,
+    )> {
+        self.queue
+            .iter()
+            .flat_map(|entry| entry.append.operations().zip(&entry.append.prepared))
+            .find(|(operation, _)| operation.op_number == number)
+            .map(|(operation, prepared)| (operation, prepared.prefix()))
+    }
+
     pub(super) fn seek_records(&self) -> Vec<PreparedOperationRecords> {
         self.queue
             .iter()
@@ -344,6 +359,7 @@ impl OwnedJournal {
             mut buffer,
             plan,
             mut records,
+            dedup,
             ..
         } = validated;
         let append = Arc::new(buffer.retain());
@@ -355,6 +371,7 @@ impl OwnedJournal {
             .as_mut()
             .ok_or(JournalError::AppendMismatch)?
             .install_prepared_group(plan)?;
+        self.dedup.install(dedup)?;
         self.pending
             .extend(append.prepared.iter().map(|op| op.prefix()));
         self.writeback.operations += append.prepared.len();
@@ -652,6 +669,7 @@ impl OwnedJournal {
             .as_mut()
             .ok_or(JournalError::AppendMismatch)?
             .commit_through(through.op.0)?;
+        self.dedup.commit_through(through.op.0)?;
         while self
             .pending
             .front()
@@ -697,10 +715,24 @@ impl OwnedJournal {
         }
         self.journal =
             JournalOwner::Ready(Box::new(self.journal.take_rolling()?.complete(completed)?));
-        self.reader
-            .as_mut()
-            .ok_or(JournalError::AppendMismatch)?
-            .rolled(self.journal.readable()?)?;
+        let reader = self.reader.as_mut().ok_or(JournalError::AppendMismatch)?;
+        reader.rolled(self.journal.readable()?)?;
+        // The sealed segment's read index already holds its record ends, so
+        // neither retention planning nor retirement need scan the segment.
+        let partition = self.images.as_ref().and_then(|images| {
+            images
+                .speculative()
+                .partitions()
+                .next()
+                .map(|(partition, _)| partition)
+        });
+        if let Some(proof) = reader.sealed_retirement_proof(self.journal.readable()?)? {
+            if let Some(partition) = partition {
+                let summary = proof.retention_segment(partition);
+                self.retention.sealed.insert(summary.id, summary);
+            }
+            self.retention.proofs.push(proof);
+        }
         observed.armed = false;
         self.faulted = false;
         Ok(())

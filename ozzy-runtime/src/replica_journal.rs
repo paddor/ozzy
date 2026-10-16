@@ -9,6 +9,7 @@ mod canonical;
 mod commands;
 mod execution;
 mod shard;
+pub use owned::dedup::IdentityRetention;
 pub use shard::{ShardJournal, ShardJournalConfig};
 mod history;
 mod install;
@@ -19,17 +20,21 @@ pub use owned::{
     CompletedRecoveryRead as OwnedCompletedRecoveryRead, CompletedReplay as OwnedCompletedReplay,
     CompletedRoll as OwnedCompletedRoll,
     CompletedStorageValidation as OwnedCompletedStorageValidation,
-    CompletedSync as OwnedCompletedSync, CompletedWrite as OwnedCompletedWrite, OwnedConfig,
-    OwnedJournal, PartitionDelivery as OwnedPartitionDelivery,
+    CompletedSync as OwnedCompletedSync, CompletedWrite as OwnedCompletedWrite, DedupLimits,
+    OwnedConfig, OwnedJournal, PartitionDelivery as OwnedPartitionDelivery,
     PreparedCheckpointRead as OwnedPreparedCheckpointRead, PreparedRead as OwnedPreparedRead,
     PreparedRecoveryRead as OwnedPreparedRecoveryRead, PreparedReplay as OwnedPreparedReplay,
     PreparedRoll as OwnedPreparedRoll, PreparedStorageValidation as OwnedPreparedStorageValidation,
     PreparedSync as OwnedPreparedSync, PreparedWrite as OwnedPreparedWrite,
     RecoveringJournal as OwnedRecoveringJournal, RecoveryGenerations as OwnedRecoveryGenerations,
     RecoveryOpen as OwnedRecoveryOpen, StorageCleanup as OwnedStorageCleanup,
-    WriteStep as OwnedWriteStep, WrittenRecords as OwnedWrittenRecords,
+    WriteStep as OwnedWriteStep, WrittenRecords as OwnedWrittenRecords, dedup_limits,
 };
+mod assignment;
 mod producer;
+pub use assignment::{GroupAssignError, GroupAssignRequest, GroupAssignState};
+mod progress;
+pub use progress::{GroupAssignment, GroupProgressError, GroupProgressRequest, GroupProgressState};
 mod proposal;
 mod read;
 mod receiving;
@@ -44,7 +49,9 @@ pub use append::{AdmittedAppend, AppendBuffer, MAX_APPEND_OPERATIONS, ValidatedA
 pub use commands::Rejected;
 pub use history::{FetchedHistory, HistoryPosition, ReplicationPositions};
 pub use install::{InstallationConfig, InstalledChunk, InstalledJournal};
-pub use proposal::{AppendAdmissionError, ProducerAppend, ProposalBuffer, ProposalValidation};
+pub use proposal::{
+    AppendAdmissionError, ProducerAppend, ProposalBuffer, ProposalDeferral, ProposalValidation,
+};
 pub(crate) use read::PartitionReadBuffer;
 pub(crate) use read::delivery::ReadDelivery;
 pub use read::{
@@ -56,7 +63,7 @@ pub use receiving::{
 };
 pub use recovery::{PinnedRecovery, RecoveryCheckpointRead};
 pub use sync::ReadyJournalSync;
-pub use turn::{Turn, TurnResult};
+pub use turn::{ReceivedValidation, Turn, TurnResult};
 
 use std::future::Future;
 use std::pin::Pin;
@@ -173,7 +180,9 @@ impl<T> Future for JournalCompletion<T> {
 #[derive(Debug)]
 pub struct ReplicaJournal {
     backlog: PipelineLimits,
+    unapplied: usize,
     replicated: bool,
+    dedup_window_millis: Option<u64>,
     capacity: Arc<Semaphore>,
     command_capacity: usize,
     read_capacity: Arc<Semaphore>,
@@ -186,12 +195,35 @@ pub struct ReplicaJournal {
 }
 
 impl ReplicaJournal {
+    pub(crate) const fn deduplication_enabled(&self) -> bool {
+        self.dedup_window_millis.is_some()
+    }
+
+    pub(crate) fn retention_interval(
+        &self,
+        configured: Option<std::time::Duration>,
+    ) -> Option<std::time::Duration> {
+        let identity = self
+            .dedup_window_millis
+            .map(|window| std::time::Duration::from_millis(window.min(1000)));
+        match (configured, identity) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
     pub(crate) const fn generation(&self) -> JournalGeneration {
         self.buffer_generation
     }
 
     pub(crate) const fn backlog(&self) -> PipelineLimits {
         self.backlog
+    }
+
+    /// Operations the canonical images and dedup index can hold accepted but
+    /// not yet applied.
+    pub(crate) const fn unapplied_operations(&self) -> usize {
+        self.unapplied
     }
 
     /// Replicated-persisting policy: confirmation precedes persistence.
@@ -212,6 +244,12 @@ impl ReplicaJournal {
 
     pub(crate) fn settled(&self) -> bool {
         self.execution.settled()
+    }
+
+    /// Whether a retirement's checkpoint write, prefix scan, or installation
+    /// is still outstanding. Its writes continue; the next retention turn waits.
+    pub(crate) fn retiring(&self) -> bool {
+        self.execution.retiring()
     }
 
     /// Configured outstanding command bound, including executing work.
@@ -254,13 +292,14 @@ impl ReplicaJournal {
         let available = self.execution.control_capacity(accepted);
         // An exhausted overlay drains all intake so continuous APPEND traffic
         // cannot prevent the fully applied boundary needed by index refresh.
-        available != 0
-            && self.execution.validation_ready(buffer)
+        if available == 0 {
+            crate::profiling::event(crate::profiling::Event::ValidationIdentityWait);
+            return false;
+        }
+        self.execution.validation_ready(buffer)
             && buffer
                 .operations()
-                .filter(|operation| {
-                    operation.kind != ozzy_journal::operation::OperationKind::Append
-                })
+                .filter(|operation| operation.kind.has_operation_id())
                 .count()
                 <= available
     }
@@ -332,6 +371,9 @@ pub enum SubmitError {
 /// Storage lifecycle/action failure. None permits replacement of an existing voter.
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
+    /// Bounded owner-local identity classification or installation failed.
+    #[error(transparent)]
+    Dedup(#[from] ozzy_core::dedup::Error),
     /// Retention summaries violate ordering or configured bounds.
     #[error(transparent)]
     RetentionPlan(#[from] ozzy_core::retention::PlanError),
@@ -362,6 +404,12 @@ pub enum JournalError {
     /// Producer identity, session, sequence, or retained retry validation failed.
     #[error(transparent)]
     ProducerAppend(#[from] AppendAdmissionError),
+    /// Group assignment, confirmed cursor, or retained history rejected a request.
+    #[error(transparent)]
+    GroupProgress(#[from] GroupProgressError),
+    /// Source ownership or coordinator plan validation failed.
+    #[error(transparent)]
+    GroupAssign(#[from] GroupAssignError),
     /// Configured group/voter or resource bounds are invalid.
     #[error("invalid replica journal configuration")]
     Configuration,
@@ -429,8 +477,10 @@ pub enum JournalError {
 pub struct RetentionTurn {
     /// Obsolete normal/election source released before checkpoint publication.
     pub released: Option<ozzy_replication::LogSource>,
-    /// False means the canonical partition policy has no retention limits.
+    /// False means neither record nor identity retention needs periodic turns.
     pub enabled: bool,
+    /// Confirmed identities physically released by this bounded turn.
+    pub expired_identities: usize,
     /// Progress exposed another eligible step; continue after a foreground turn.
     pub more_work: bool,
     /// Retry-floor and trim operations awaiting ordinary confirmation.
@@ -438,6 +488,28 @@ pub struct RetentionTurn {
 }
 
 impl ReplicaJournal {
+    /// Expire confirmed identities between foreground turns. Unlike a
+    /// retention turn, this waits for no settled accepted or committed work.
+    pub fn retain_identities(
+        &mut self,
+        ticket: ozzy_replication::driver::ValidationTicket,
+        leader: bool,
+    ) -> Result<JournalCompletion<IdentityRetention>, SubmitError> {
+        self.submit(
+            ticket,
+            |ticket, done| commands::Action::RetainIdentities {
+                ticket,
+                leader,
+                done,
+            },
+            |action| match action {
+                commands::Action::RetainIdentities { ticket, .. } => ticket,
+                _ => unreachable!("preserved identity retention action"),
+            },
+        )
+        .map_err(|error| error.reason)
+    }
+
     /// Plan one sealed segment or retire a previously confirmed prefix.
     pub fn retention_turn(
         &mut self,

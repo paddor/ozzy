@@ -170,6 +170,24 @@ pub struct PipelineLimits {
     pub max_body_bytes: usize,
 }
 
+/// Live windows a backup retains beyond its released prefix: the primary's
+/// window beyond the commit it announced, plus the window that release can
+/// trail that commit by while the other backup confirms the primary's writes.
+const BACKUP_WINDOWS: usize = 2;
+
+impl PipelineLimits {
+    /// Capacity a backup retains beyond its released prefix for a primary
+    /// with this live window. Everything a backup holds accepted but not yet
+    /// applied, in any owner, must fit this bound.
+    #[must_use]
+    pub const fn backup(self) -> Self {
+        Self {
+            max_operations: self.max_operations.saturating_mul(BACKUP_WINDOWS),
+            max_body_bytes: self.max_body_bytes.saturating_mul(BACKUP_WINDOWS),
+        }
+    }
+}
+
 /// Metadata for one already validated canonical operation.
 ///
 /// This value is not payload storage or proof of validation. The caller must

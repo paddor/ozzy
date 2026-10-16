@@ -1887,6 +1887,7 @@ dependencies = [
  "smallvec",
  "socket2",
  "thiserror",
+ "zrip",
 ]
 
 [[package]]
@@ -1956,11 +1957,13 @@ dependencies = [
  "ozzy",
  "ozzy-broker",
  "ozzy-config",
+ "ozzy-io",
  "ozzy-journal",
  "ozzy-journal-segment",
  "ozzy-proto",
  "ozzy-replication",
  "ozzy-runtime",
+ "ozzy-sim",
  "plotters",
  "rdkafka",
  "regex",
@@ -2006,6 +2009,7 @@ dependencies = [
 name = "ozzy-config"
 version = "0.1.1"
 dependencies = [
+ "ozzy-proto",
  "serde",
  "thiserror",
  "toml",
@@ -2019,6 +2023,7 @@ version = "0.1.1"
 dependencies = [
  "ahash",
  "bytes",
+ "hashbrown 0.17.1",
  "ozzy-journal",
  "ozzy-proto",
  "smallvec",
@@ -2058,6 +2063,7 @@ dependencies = [
  "libc",
  "ozzy-io",
  "ozzy-io-aio",
+ "ozzy-telemetry",
  "rustix",
  "tempfile",
  "tokio",
@@ -2067,6 +2073,7 @@ dependencies = [
 name = "ozzy-journal"
 version = "0.1.1"
 dependencies = [
+ "blake3",
  "bytes",
  "lz4rip",
  "ozzy-proto",
@@ -2137,6 +2144,7 @@ dependencies = [
  "ozzy-journal-segment",
  "ozzy-proto",
  "ozzy-replication",
+ "ozzy-telemetry",
  "pin-project-lite",
  "serde_json",
  "smallvec",
@@ -2170,6 +2178,15 @@ dependencies = [
  "thiserror",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "ozzy-telemetry"
+version = "0.1.1"
+dependencies = [
+ "omq-tokio",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -4217,3 +4234,38 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[package]]
+name = "zrip"
+version = "0.8.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e85bd0b02784d8753fe5cc435dfb65043be505cb621643a3ac4a0c43eb49e4a"
+dependencies = [
+ "zrip-core",
+ "zrip-decode",
+ "zrip-encode",
+]
+
+[[package]]
+name = "zrip-core"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6dec95be8c75252532ba0ef5e738d9da26a6f51ad52cb45f4ed90c89979727c1"
+
+[[package]]
+name = "zrip-decode"
+version = "0.8.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aca029cf83b6a6e282008a9aa1079e13f216b28bac670eb1fb0769c1d256cb0e"
+dependencies = [
+ "zrip-core",
+]
+
+[[package]]
+name = "zrip-encode"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b657fa83287fe6799596e53540a7b1f179ca34ffd8589d5c576a5b8a1bcc4260"
+dependencies = [
+ "zrip-core",
+]

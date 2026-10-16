@@ -9,6 +9,7 @@ use ozzy_runtime::replicated::{
 use std::{task::Poll, time::Duration};
 
 mod failover;
+mod groups;
 mod large;
 mod live;
 #[cfg(target_os = "linux")]

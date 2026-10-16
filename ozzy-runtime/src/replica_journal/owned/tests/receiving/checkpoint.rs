@@ -2,7 +2,12 @@ use super::*;
 use crate::replica_journal::{RecoveryStorage, ShardJournalConfig, ShardRecoveringJournal};
 
 #[cfg(feature = "simulation")]
+mod dedup;
+
+#[cfg(feature = "simulation")]
 mod messages;
+
+mod donor;
 
 #[test]
 fn checkpoint_receive_charges_pending_chunks_and_refuses_exhausted_memory() {

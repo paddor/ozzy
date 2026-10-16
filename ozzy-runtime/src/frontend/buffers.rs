@@ -28,10 +28,11 @@ pub enum ReceiveStorage {
         /// Socket-local message size ceiling, including frame descriptors.
         message_bytes: usize,
     },
-    /// OMQ LZ4-over-TCP. Decoded frames have exact owned allocations; plaintext
-    /// passthrough can retain the stream backing plus its four-byte sentinel.
-    #[cfg(feature = "lz4-transport")]
-    Lz4Stream {
+    /// OMQ compressed TCP, `lz4+tcp://` or `zstd+tcp://`. Decoded frames have exact
+    /// owned allocations; plaintext passthrough can retain the stream backing plus
+    /// the four-byte sentinel every OMQ compression transport shares.
+    #[cfg(any(feature = "lz4-transport", feature = "zstd-transport"))]
+    Compressed {
         /// Socket-local decoded message ceiling, including descriptors.
         message_bytes: usize,
     },
@@ -61,8 +62,8 @@ impl ReceiveBuffers {
                 ReceiveStorage::Stream { message_bytes } => {
                     !(1024..=isize::MAX as usize / 2).contains(&message_bytes)
                 }
-                #[cfg(feature = "lz4-transport")]
-                ReceiveStorage::Lz4Stream { message_bytes } => {
+                #[cfg(any(feature = "lz4-transport", feature = "zstd-transport"))]
+                ReceiveStorage::Compressed { message_bytes } => {
                     !(1024..=isize::MAX as usize / 2).contains(&message_bytes)
                 }
                 ReceiveStorage::Inproc {
@@ -92,10 +93,17 @@ impl ReceiveBuffers {
             ) if bound == message_bytes => Ok(()),
             #[cfg(feature = "lz4-transport")]
             (
-                ReceiveStorage::Lz4Stream {
+                ReceiveStorage::Compressed {
                     message_bytes: bound,
                 },
                 Endpoint::Lz4Tcp { .. },
+            ) if bound == message_bytes => Ok(()),
+            #[cfg(feature = "zstd-transport")]
+            (
+                ReceiveStorage::Compressed {
+                    message_bytes: bound,
+                },
+                Endpoint::ZstdTcp { .. },
             ) if bound == message_bytes => Ok(()),
             (ReceiveStorage::Inproc { .. }, Endpoint::Inproc { .. }) => Ok(()),
             _ => Err(BufferError::Transport),
@@ -147,8 +155,8 @@ impl ReceiveBuffers {
             ReceiveStorage::Stream { message_bytes } => {
                 stream_backing(payload_bytes, message_bytes)
             }
-            #[cfg(feature = "lz4-transport")]
-            ReceiveStorage::Lz4Stream { message_bytes } => {
+            #[cfg(any(feature = "lz4-transport", feature = "zstd-transport"))]
+            ReceiveStorage::Compressed { message_bytes } => {
                 stream_backing(payload_bytes.saturating_add(4), message_bytes).max(payload_bytes)
             }
             ReceiveStorage::Inproc {
@@ -194,8 +202,8 @@ impl ReceiveBuffers {
                     return Err(BufferError::Frames);
                 }
             }
-            #[cfg(feature = "lz4-transport")]
-            ReceiveStorage::Lz4Stream { message_bytes } => {
+            #[cfg(any(feature = "lz4-transport", feature = "zstd-transport"))]
+            ReceiveStorage::Compressed { message_bytes } => {
                 if message.max_message_size_len() > message_bytes {
                     return Err(BufferError::Frames);
                 }

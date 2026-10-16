@@ -1,5 +1,6 @@
 //! Startup-registered fanring lanes with a global outstanding-request bound.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -13,6 +14,293 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use crate::command_channel as mpsc;
 use crate::replica_journal::{JournalError, ProposalBuffer};
 use crate::signal::{CloseSignal, Closed};
+
+/// Owner-local wait for confirmation or identity capacity. The existing
+/// submission permit and arena stay held; no shared state is added.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ProposalWait {
+    pub(super) validation: ozzy_replication::driver::ValidationTicket,
+    pub(super) reason: crate::replica_journal::ProposalDeferral,
+}
+
+impl ProposalWait {
+    pub(super) fn current(self, ticket: ozzy_replication::driver::ValidationTicket) -> bool {
+        self.validation.scope() == ticket.scope()
+            && self.validation.generation() == ticket.generation()
+    }
+
+    pub(super) fn ready(self, ticket: ozzy_replication::driver::ValidationTicket) -> bool {
+        self.current(ticket)
+            && match self.reason {
+                crate::replica_journal::ProposalDeferral::Original(operation) => {
+                    ticket.applied().op >= operation
+                }
+                crate::replica_journal::ProposalDeferral::IdentityCapacity => {
+                    ticket.applied().op > self.validation.applied().op
+                }
+                crate::replica_journal::ProposalDeferral::MemoryCapacity => true,
+            }
+    }
+
+    pub(super) fn capacity(self) -> bool {
+        self.reason == crate::replica_journal::ProposalDeferral::IdentityCapacity
+    }
+}
+
+/// Owner-local proposal admission shared by the local and replicated actors:
+/// the one waiting submission with its deferral, producers parked behind an
+/// unconfirmed original, the proposal in validation, and a pending
+/// journal-built maintenance proposal. Each actor keeps its own window and
+/// journal capacity checks between `next` and `start`.
+#[derive(Debug, Default)]
+pub(super) struct Proposals {
+    waiting: Option<Submission>,
+    wait: Option<ProposalWait>,
+    parked: VecDeque<ParkedProducer>,
+    maintenance: Option<ProposalBuffer>,
+    validating: Option<Reply>,
+}
+
+/// One producer's proposals deferred behind its unconfirmed original. Other
+/// producers keep admitting meanwhile. Its later proposals queue behind the
+/// parked one, so its sequences reach validation in arrival order. Entries
+/// keep their submission permits; ingress capacity bounds them.
+#[derive(Debug)]
+struct ParkedProducer {
+    producer: ozzy_proto::ProducerId,
+    /// The front's deferral; `None` lets the front validate now.
+    wait: Option<ProposalWait>,
+    queue: VecDeque<Submission>,
+}
+
+/// What the waiting slot offers this scheduling round.
+#[derive(Debug)]
+pub(super) enum NextProposal<'a> {
+    /// Nothing waits or is queued.
+    Idle,
+    /// A fenced or stale proposal finished unadmitted.
+    Finished,
+    /// The waiting proposal's deferral has not cleared.
+    Blocked,
+    /// Validate when capacity allows, then `start` it.
+    Ready(&'a Submission),
+}
+
+impl Proposals {
+    /// Move the next queued submission into an empty waiting slot, behind
+    /// nothing. Parked producers are not consulted; callers that cannot
+    /// validate reject every held proposal afterwards.
+    pub(super) fn fill(&mut self, ingress: &mut Ingress) {
+        if self.waiting.is_none() {
+            self.waiting = ingress.pop();
+        }
+    }
+
+    /// Fill the slot from the oldest ready parked producer, else from ingress,
+    /// finish a fenced or stale proposal, and check a deferral. The ticket is
+    /// requested only while a parked or deferred proposal compares images.
+    pub(super) fn next<E>(
+        &mut self,
+        ingress: &mut Ingress,
+        ticket: impl Fn() -> Result<ozzy_replication::driver::ValidationTicket, E>,
+    ) -> Result<NextProposal<'_>, E> {
+        if self.waiting.is_none() && !self.parked.is_empty() && self.unpark(ticket()?) {
+            return Ok(NextProposal::Finished);
+        }
+        if self.waiting.is_none() {
+            self.pull(ingress);
+        }
+        let Some(waiting) = &self.waiting else {
+            return Ok(NextProposal::Idle);
+        };
+        if waiting.reply.fenced() {
+            self.reject_waiting();
+            return Ok(NextProposal::Finished);
+        }
+        if let Some(wait) = self.wait {
+            let ticket = ticket()?;
+            if !wait.current(ticket) {
+                self.reject_waiting();
+                return Ok(NextProposal::Finished);
+            }
+            if !wait.ready(ticket) {
+                return Ok(NextProposal::Blocked);
+            }
+            self.wait = None;
+        }
+        Ok(NextProposal::Ready(
+            self.waiting.as_ref().expect("waiting proposal"),
+        ))
+    }
+
+    /// Move the oldest ready parked front into the empty waiting slot. A
+    /// fenced or stale front finishes unadmitted instead; true reports that.
+    fn unpark(&mut self, ticket: ozzy_replication::driver::ValidationTicket) -> bool {
+        let mut index = 0;
+        while let Some(parked) = self.parked.get_mut(index) {
+            let front = parked.queue.front().expect("nonempty parked queue");
+            let stale = parked.wait.is_some_and(|wait| !wait.current(ticket));
+            let ready = parked.wait.is_none_or(|wait| wait.ready(ticket));
+            if !(stale || ready || front.reply.fenced()) {
+                index += 1;
+                continue;
+            }
+            parked.wait = None;
+            let submission = parked.queue.pop_front().expect("checked front");
+            if parked.queue.is_empty() {
+                self.parked.remove(index);
+            }
+            if stale || submission.reply.fenced() {
+                submission
+                    .reply
+                    .finish(submission.buffer, ProposalOutcome::NotAdmitted);
+                return true;
+            }
+            self.waiting = Some(submission);
+            return false;
+        }
+        false
+    }
+
+    /// Take the next ingress submission whose producer has nothing parked;
+    /// one that does queues behind its producer's parked proposals.
+    fn pull(&mut self, ingress: &mut Ingress) {
+        while let Some(submission) = ingress.pop() {
+            let producer = submission.buffer.producer();
+            if let Some(parked) = self
+                .parked
+                .iter_mut()
+                .find(|parked| Some(parked.producer) == producer)
+            {
+                parked.queue.push_back(submission);
+            } else {
+                self.waiting = Some(submission);
+                return;
+            }
+        }
+    }
+
+    /// Take the ready waiting proposal into validation and return its arena.
+    pub(super) fn start(&mut self) -> ProposalBuffer {
+        assert!(self.wait.is_none());
+        let mut submission = self.waiting.take().expect("ready proposal");
+        submission.reply.scheduled();
+        assert!(self.validating.replace(submission.reply).is_none());
+        submission.buffer
+    }
+
+    /// Take the pending maintenance proposal into validation, if any.
+    pub(super) fn start_maintenance(&mut self) -> Option<ProposalBuffer> {
+        let buffer = self.maintenance.take()?;
+        assert!(self.validating.replace(Reply::maintenance()).is_none());
+        Some(buffer)
+    }
+
+    /// The reply of the proposal whose validation just completed.
+    pub(super) fn validated(&mut self) -> Option<Reply> {
+        self.validating.take()
+    }
+
+    /// Hold a validated proposal until its deferral clears. A wait for one
+    /// producer's unconfirmed original parks that producer, ahead of its
+    /// queued proposals; a capacity wait holds the partition's slot.
+    pub(super) fn defer(&mut self, submission: Submission, wait: ProposalWait) {
+        assert!(self.waiting.is_none());
+        let original = matches!(
+            wait.reason,
+            crate::replica_journal::ProposalDeferral::Original(_)
+        );
+        let Some(producer) = submission.buffer.producer().filter(|_| original) else {
+            self.waiting = Some(submission);
+            self.wait = Some(wait);
+            return;
+        };
+        if let Some(parked) = self
+            .parked
+            .iter_mut()
+            .find(|parked| parked.producer == producer)
+        {
+            parked.queue.push_front(submission);
+            parked.wait = Some(wait);
+        } else {
+            self.parked.push_back(ParkedProducer {
+                producer,
+                wait: Some(wait),
+                queue: VecDeque::from([submission]),
+            });
+        }
+    }
+
+    /// Hold a proposal whose validation went stale for the next image.
+    pub(super) fn requeue(&mut self, submission: Submission) {
+        assert!(self.wait.is_none());
+        assert!(self.waiting.replace(submission).is_none());
+    }
+
+    /// Queue a journal-built proposal ahead of the waiting slot.
+    pub(super) fn set_maintenance(&mut self, buffer: ProposalBuffer) {
+        assert!(self.maintenance.replace(buffer).is_none());
+    }
+
+    /// Finish the waiting and parked proposals unadmitted and drop maintenance
+    /// work. Returns how many proposals finished.
+    pub(super) fn reject_all(&mut self) -> usize {
+        self.maintenance = None;
+        usize::from(self.reject_waiting()) + self.reject_parked()
+    }
+
+    /// After an authority change: drop maintenance work and finish deferred
+    /// proposals, whose waits name the old image. An undeferred waiting
+    /// proposal validates again under the new authority.
+    pub(super) fn reject_deferred(&mut self) {
+        self.maintenance = None;
+        if self.wait.is_some() {
+            self.reject_waiting();
+        }
+        self.reject_parked();
+    }
+
+    fn reject_parked(&mut self) -> usize {
+        let mut finished = 0;
+        for submission in self.parked.drain(..).flat_map(|parked| parked.queue) {
+            submission
+                .reply
+                .finish(submission.buffer, ProposalOutcome::NotAdmitted);
+            finished += 1;
+        }
+        finished
+    }
+
+    fn reject_waiting(&mut self) -> bool {
+        self.wait = None;
+        let Some(waiting) = self.waiting.take() else {
+            return false;
+        };
+        waiting
+            .reply
+            .finish(waiting.buffer, ProposalOutcome::NotAdmitted);
+        true
+    }
+
+    /// Expired identities made room: an identity-capacity wait retries.
+    pub(super) fn release_capacity(&mut self) {
+        if self.wait.is_some_and(ProposalWait::capacity) {
+            self.wait = None;
+        }
+    }
+
+    /// A waiting proposal defers maintenance, unless it waits for identity
+    /// capacity that only maintenance creates. Parked proposals wait for
+    /// application, which maintenance never delays.
+    pub(super) fn blocks_maintenance(&self) -> bool {
+        self.waiting.is_some() && !self.wait.is_some_and(ProposalWait::capacity)
+    }
+
+    /// The slot is empty, so ingress may deliver the next submission.
+    pub(super) fn is_idle(&self) -> bool {
+        self.waiting.is_none()
+    }
+}
 
 /// Completion of this proposal, not a consumer's external processing transaction.
 #[derive(Debug)]
@@ -150,7 +438,7 @@ impl ProposalSubmitter {
             buffer,
             reply: Reply {
                 done,
-                _permit: Some(permit),
+                permit: Some(permit),
                 untaken: Untaken(Some(self.untaken.clone())),
                 queued_at: crate::profiling::start(),
                 admitted_at: None,
@@ -196,7 +484,7 @@ impl Drop for Untaken {
 #[derive(Debug)]
 pub(super) struct Reply {
     done: oneshot::Sender<ProposalReply>,
-    _permit: Option<OwnedSemaphorePermit>,
+    permit: Option<OwnedSemaphorePermit>,
     untaken: Untaken,
     queued_at: Option<std::time::Instant>,
     admitted_at: Option<std::time::Instant>,
@@ -210,7 +498,7 @@ impl Reply {
         drop(observer);
         Self {
             done,
-            _permit: None,
+            permit: None,
             untaken: Untaken(None),
             queued_at: None,
             admitted_at: None,
@@ -220,6 +508,9 @@ impl Reply {
 
     pub(super) fn fenced(&self) -> bool {
         self.admission.is_closed()
+    }
+    pub(super) fn is_maintenance(&self) -> bool {
+        self.permit.is_none()
     }
     pub(super) fn scheduled(&mut self) {
         self.untaken.taken();
@@ -233,7 +524,7 @@ impl Reply {
     pub(super) fn finish(self, buffer: ProposalBuffer, outcome: ProposalOutcome) {
         let Self {
             done,
-            _permit: permit,
+            permit,
             untaken,
             admitted_at,
             ..

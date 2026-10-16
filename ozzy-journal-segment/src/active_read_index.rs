@@ -10,8 +10,8 @@ use thiserror::Error;
 
 use crate::{
     ActiveSegmentIndex, INDEX_HEADER_BYTES, IndexLimits, IndexSource, MESSAGE_INDEX_ENTRY_BYTES,
-    OFFSET_INDEX_ENTRY_BYTES, OPERATION_INDEX_ENTRY_BYTES, OffsetIndexEntry, OperationLocation,
-    RecordLocation,
+    OFFSET_INDEX_ENTRY_BYTES, OPERATION_INDEX_ENTRY_BYTES, OPERATION_LOCATION_BYTES,
+    OffsetIndexEntry, OperationLocation, RecordLocation,
 };
 
 mod capture;
@@ -67,9 +67,23 @@ pub(crate) struct ActiveReadIndex {
     partitions: HashMap<PartitionIncarnation, Vec<ActiveReadRun>>,
     records: usize,
     operations: usize,
+    locations: usize,
 }
 
 impl ActiveReadIndex {
+    /// Record end and newest append time of every partition with records.
+    pub(crate) fn partition_ends(
+        &self,
+    ) -> impl Iterator<Item = (PartitionIncarnation, Offset, u64)> {
+        self.partitions.iter().filter_map(|(partition, runs)| {
+            Some((
+                *partition,
+                runs.last()?.end_offset()?,
+                runs.iter().map(|run| run.append_timestamp_millis).max()?,
+            ))
+        })
+    }
+
     pub(crate) fn newest_append_millis(&self, partition: PartitionIncarnation) -> Option<u64> {
         self.partitions
             .get(&partition)?
@@ -86,6 +100,7 @@ impl ActiveReadIndex {
             partitions: HashMap::new(),
             records: 0,
             operations: persisted.operation_count(),
+            locations: persisted.location_count(),
         };
         let mut budget = crate::cooperative::Budget::default();
         for entry in persisted.offsets() {
@@ -116,6 +131,7 @@ impl ActiveReadIndex {
             partitions: HashMap::new(),
             records: 0,
             operations: active.operation_count(),
+            locations: active.location_count(),
         };
         let mut budget = crate::cooperative::Budget::default();
         for entry in active.offsets() {
@@ -136,6 +152,7 @@ impl ActiveReadIndex {
             partitions: HashMap::new(),
             records: 0,
             operations: 0,
+            locations: 0,
         };
         Self::validate_group_locations(None, source, locations, bodies)?;
         index.extend_bodies(locations, bodies, limits)?;
@@ -272,7 +289,7 @@ impl ActiveReadIndex {
         previous: Option<&Self>,
         bodies: &[impl ReadIndexBody],
         limits: IndexLimits,
-    ) -> Result<(usize, usize), ActiveReadIndexError> {
+    ) -> Result<(usize, usize, usize), ActiveReadIndexError> {
         let additional = bodies.iter().try_fold(0_usize, |count, body| {
             body.batches()
                 .try_fold(count, |count, batch| count.checked_add(batch.records))
@@ -290,13 +307,19 @@ impl ActiveReadIndex {
             .filter(|body| {
                 !matches!(
                     body.kind(),
-                    OperationKind::CreatePartition | OperationKind::Append
+                    OperationKind::CreatePartition
+                        | OperationKind::Append
+                        | OperationKind::ResolvedAppend
                 )
             })
             .count();
         let operations = previous
             .map_or(0, |index| index.operations)
             .checked_add(additional_operations)
+            .ok_or(ActiveReadIndexError::PositionOverflow)?;
+        let locations = previous
+            .map_or(0, |index| index.locations)
+            .checked_add(bodies.len())
             .ok_or(ActiveReadIndexError::PositionOverflow)?;
         let footprint = actual
             .checked_mul(OFFSET_INDEX_ENTRY_BYTES)
@@ -310,16 +333,22 @@ impl ActiveReadIndex {
                     .checked_mul(OPERATION_INDEX_ENTRY_BYTES)
                     .and_then(|section| bytes.checked_add(section))
             })
+            .and_then(|bytes| {
+                locations
+                    .checked_mul(OPERATION_LOCATION_BYTES)
+                    .and_then(|section| bytes.checked_add(section))
+            })
             .and_then(|bytes| bytes.checked_add(INDEX_HEADER_BYTES))
             .ok_or(ActiveReadIndexError::PositionOverflow)?;
         if actual > limits.max_offset_entries
             || actual > limits.max_message_entries
             || operations > limits.max_operation_entries
+            || locations > limits.max_operation_entries
             || footprint > limits.max_file_bytes
         {
             return Err(ActiveReadIndexError::LimitExceeded);
         }
-        Ok((actual, operations))
+        Ok((actual, operations, locations))
     }
 
     fn extend_bodies(
@@ -328,7 +357,8 @@ impl ActiveReadIndex {
         bodies: &[impl ReadIndexBody],
         limits: IndexLimits,
     ) -> Result<(), ActiveReadIndexError> {
-        let (actual, operations) = Self::capacity_after(Some(self), bodies, limits)?;
+        let (actual, operations, operation_count) =
+            Self::capacity_after(Some(self), bodies, limits)?;
         for (location, body) in locations.iter().zip(bodies) {
             for (batch_index, batch) in body.batches().enumerate() {
                 let records = u32::try_from(batch.records)
@@ -350,6 +380,7 @@ impl ActiveReadIndex {
         }
         self.records = actual;
         self.operations = operations;
+        self.locations = operation_count;
         Ok(())
     }
 

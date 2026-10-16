@@ -86,7 +86,7 @@ pub enum StorageCleanup {
 }
 
 /// Exact completed cleanup diagnostics, never replication or deletion authority.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CleanedStorage {
     /// Driver image that authorized the maintenance turn.
     pub ticket: ValidationTicket,
@@ -96,6 +96,11 @@ pub struct CleanedStorage {
     pub removed_objects: usize,
     /// All physical bytes removed, including derived child files.
     pub reclaimed_bytes: u64,
+    /// Unselected segments kept by live deletion protection, excluding a
+    /// prepared successor. A later turn retries them.
+    pub pinned_segment_ids: Vec<u64>,
+    /// Unselected checkpoints kept by live build or read protection.
+    pub pinned_checkpoint_ids: Vec<ozzy_proto::CheckpointId>,
 }
 
 impl OwnedJournal {
@@ -193,6 +198,7 @@ impl OwnedJournal {
         self.journal.ready()?;
         self.faulted = true;
         let journal = self.journal.ready_mut()?;
+        let (mut pinned_segment_ids, mut pinned_checkpoint_ids) = (Vec::new(), Vec::new());
         let (removed_objects, reclaimed_bytes) = match kind {
             StorageCleanup::Indexes => {
                 let result = journal.reclaim_unreferenced_indexes(max_objects).await?;
@@ -200,12 +206,21 @@ impl OwnedJournal {
             }
             StorageCleanup::Segments => {
                 let result = journal.reclaim_unreferenced_segments(max_objects).await?;
+                // A prepared successor stays pinned until its roll selects it.
+                let active = journal
+                    .manifest()
+                    .segments
+                    .last()
+                    .map_or(0, |reference| reference.segment_id);
+                pinned_segment_ids = result.pinned_segment_ids;
+                pinned_segment_ids.retain(|id| *id < active);
                 (result.removed_segment_ids.len(), result.reclaimed_bytes)
             }
             StorageCleanup::Checkpoints => {
                 let result = journal
                     .reclaim_unreferenced_checkpoints(max_objects)
                     .await?;
+                pinned_checkpoint_ids = result.pinned_checkpoint_ids;
                 (result.removed_checkpoint_ids.len(), result.reclaimed_bytes)
             }
             StorageCleanup::Metadata => {
@@ -223,6 +238,8 @@ impl OwnedJournal {
             kind,
             removed_objects,
             reclaimed_bytes,
+            pinned_segment_ids,
+            pinned_checkpoint_ids,
         })
     }
 }

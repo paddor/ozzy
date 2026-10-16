@@ -47,6 +47,24 @@ pub struct RouteCache {
     max_interests: usize,
 }
 
+/// Immutable hints published per partition; sessions remain caller checks.
+#[derive(Debug, Default)]
+pub(crate) struct RouteObservations(Vec<(NodeId, LinkSessionId, RouteState)>);
+
+impl RouteObservations {
+    pub(crate) fn matching(
+        &self,
+        mut current: impl FnMut(NodeId, LinkSessionId) -> bool,
+    ) -> Result<Option<RouteState>, RouteCacheError> {
+        select_route(
+            self.0
+                .iter()
+                .filter(|(peer, session, _)| current(*peer, *session))
+                .map(|(_, _, route)| route),
+        )
+    }
+}
+
 impl RouteCache {
     /// Bound live registrations and groups per watch, independent of traffic.
     pub fn new(
@@ -278,40 +296,39 @@ impl RouteCache {
         if self.topic.partition_by_group(group).is_none() {
             return Err(RouteCacheError::Invalid);
         }
-        let mut best: Option<&RouteState> = None;
-        let mut conflict = false;
-        for key in self.by_group.get(&group).into_iter().flatten() {
-            let registration = self.registrations.get(key).expect("indexed registration");
-            if !registration.snapshot
-                || registration.resync
-                || !current(key.0, registration.session)
-            {
-                continue;
-            }
-            let Some(route) = registration.routes.get(&group) else {
-                continue;
-            };
-            match best {
-                None => best = Some(route),
-                Some(current) if route.view > current.view => {
-                    best = Some(route);
-                    conflict = false;
+        select_route(
+            self.observations(group)
+                .filter(|(peer, session, _)| current(*peer, *session))
+                .map(|(_, _, route)| route),
+        )
+    }
+
+    pub(crate) fn published_observations(&self, group: GroupId) -> RouteObservations {
+        RouteObservations(
+            self.observations(group)
+                .map(|(peer, session, route)| (peer, session, route.clone()))
+                .collect(),
+        )
+    }
+
+    fn observations(
+        &self,
+        group: GroupId,
+    ) -> impl Iterator<Item = (NodeId, LinkSessionId, &RouteState)> {
+        self.by_group
+            .get(&group)
+            .into_iter()
+            .flatten()
+            .filter_map(move |key| {
+                let registration = self.registrations.get(key).expect("indexed registration");
+                if !registration.snapshot || registration.resync {
+                    return None;
                 }
-                Some(current) if route.view == current.view && route.leader != current.leader => {
-                    if current.leader.is_none() {
-                        best = Some(route);
-                    } else if route.leader.is_some() {
-                        conflict = true;
-                    }
-                }
-                _ => {}
-            }
-        }
-        if conflict {
-            Err(RouteCacheError::Conflict)
-        } else {
-            Ok(best.cloned())
-        }
+                registration
+                    .routes
+                    .get(&group)
+                    .map(|route| (key.0, registration.session, route))
+            })
     }
 
     fn remove_peer(&mut self, peer: NodeId) {
@@ -351,6 +368,35 @@ impl RouteCache {
             return Err(RouteCacheError::Invalid);
         }
         Ok(())
+    }
+}
+
+fn select_route<'a>(
+    routes: impl Iterator<Item = &'a RouteState>,
+) -> Result<Option<RouteState>, RouteCacheError> {
+    let mut best: Option<&RouteState> = None;
+    let mut conflict = false;
+    for route in routes {
+        match best {
+            None => best = Some(route),
+            Some(current) if route.view > current.view => {
+                best = Some(route);
+                conflict = false;
+            }
+            Some(current) if route.view == current.view && route.leader != current.leader => {
+                if current.leader.is_none() {
+                    best = Some(route);
+                } else if route.leader.is_some() {
+                    conflict = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    if conflict {
+        Err(RouteCacheError::Conflict)
+    } else {
+        Ok(best.cloned())
     }
 }
 

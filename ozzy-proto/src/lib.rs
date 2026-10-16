@@ -6,9 +6,11 @@ pub mod append;
 pub mod data;
 pub mod directory;
 mod envelope;
+pub mod group;
 pub mod handshake;
 pub mod nack;
 pub mod producer;
+pub mod progress;
 pub mod reader;
 mod types;
 

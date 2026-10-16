@@ -118,6 +118,7 @@ pub struct TopicReader {
     links: BrokerLinks,
     routes: TopicRoutes,
     clock: SdkClock,
+    refresh: Duration,
     cursors: Vec<Cursor>,
     next: usize,
     remaining: usize,
@@ -140,8 +141,96 @@ impl std::fmt::Debug for TopicReader {
 
 impl TopicReader {
     /// Next owner deadline, including a refused subscription's backoff.
+    #[cfg(test)]
     pub(crate) fn deadline(&self) -> Option<Duration> {
-        self.cursors.iter().filter_map(Cursor::deadline).min()
+        self.gated_deadline(&|_| true)
+    }
+
+    fn gated_deadline(&self, gate: &impl Fn(u32) -> bool) -> Option<Duration> {
+        self.cursors
+            .iter()
+            .filter(|cursor| gate(cursor.number))
+            .filter_map(Cursor::deadline)
+            .min()
+    }
+
+    /// Empty reader whose sources an owner attaches at exact cursors.
+    pub(in crate::replicated) fn sources(
+        routes: TopicRoutes,
+        refresh: Duration,
+    ) -> Result<Self, TopicReaderError> {
+        if refresh < Duration::from_millis(1) || refresh > Duration::from_hours(24) {
+            return Err(TopicReaderError::Configuration);
+        }
+        let links = routes.links().clone();
+        links.reader_publications(routes.metadata())?;
+        Ok(Self {
+            clock: links.clock(),
+            links,
+            routes,
+            refresh,
+            cursors: Vec::new(),
+            next: 0,
+            remaining: 0,
+            decoder: Decoder::default(),
+            failed: false,
+            closed: false,
+            closing: None,
+            closed_checkpoint: None,
+            closed_stats: None,
+        })
+    }
+
+    pub(in crate::replicated) fn routes(&self) -> &TopicRoutes {
+        &self.routes
+    }
+
+    pub(in crate::replicated) fn policy(&self) -> ozzy_proto::append::Policy {
+        self.routes.metadata().policy()
+    }
+
+    /// Start delivering one partition at an exact exclusive cursor.
+    pub(in crate::replicated) fn attach(
+        &mut self,
+        number: u32,
+        from: Offset,
+    ) -> Result<(), TopicReaderError> {
+        let partition = self
+            .routes
+            .metadata()
+            .partition(number)
+            .ok_or(TopicReaderError::Configuration)?;
+        if self.closed || self.cursors.iter().any(|cursor| cursor.number == number) {
+            return Err(TopicReaderError::Configuration);
+        }
+        self.routes.interest(number)?;
+        self.cursors.push(Cursor::new(
+            &self.links,
+            partition,
+            ozzy_proto::reader::Start::Offset(from.get()),
+            self.refresh,
+        )?);
+        self.remaining = 0;
+        Ok(())
+    }
+
+    /// Stop delivering one partition. Its subscription closes in the background.
+    pub(in crate::replicated) fn detach(&mut self, number: u32) {
+        let Some(index) = self
+            .cursors
+            .iter()
+            .position(|cursor| cursor.number == number)
+        else {
+            return;
+        };
+        let cursor = self.cursors.swap_remove(index);
+        self.next = if self.cursors.is_empty() {
+            0
+        } else {
+            self.next % self.cursors.len()
+        };
+        self.remaining = 0;
+        drop(Closing::start(&self.links, vec![cursor]));
     }
 
     /// Look up the topic and register all selected interests without waiting for
@@ -230,6 +319,7 @@ impl TopicReader {
             links,
             routes,
             clock,
+            refresh: config.refresh,
             cursors,
             next: 0,
             remaining: 0,
@@ -245,31 +335,49 @@ impl TopicReader {
     /// Wait for one individual record. A slow or unreachable partition leaves
     /// other partitions runnable. Cancellation never advances a checkpoint.
     pub async fn next(&mut self) -> Result<TopicRecord, TopicReaderError> {
+        self.next_or(|_| true, std::future::pending())
+            .await
+            .expect("uninterrupted reader")
+    }
+
+    /// Deliver only from partitions the gate admits, or return `None` once
+    /// `interrupt` completes. Gated partitions keep their received records.
+    pub(in crate::replicated) async fn next_or(
+        &mut self,
+        gate: impl Fn(u32) -> bool,
+        interrupt: impl std::future::Future<Output = ()>,
+    ) -> Option<Result<TopicRecord, TopicReaderError>> {
         if self.failed || self.closed {
-            return Err(TopicReaderError::Closed);
+            return Some(Err(TopicReaderError::Closed));
         }
+        let mut interrupt = std::pin::pin!(interrupt);
         loop {
             let seen = self.links.reader_generation();
             let routes_seen = self.routes.generation();
             // Received records still pass through the cursor's source fences.
             // Capture generations first so an empty poll cannot lose a wakeup.
-            if let Poll::Ready(result) = poll_fn(|cx| Poll::Ready(self.poll(cx))).await {
+            if let Poll::Ready(result) = poll_fn(|cx| Poll::Ready(self.poll(&gate, cx))).await {
                 if result.is_err() {
                     self.failed = true;
                 }
-                return result;
+                return Some(result);
             }
-            let deadline = self.deadline();
+            let deadline = self.gated_deadline(&gate);
             let links = self.links.clone();
             let routes = self.routes.clone();
             let clock = self.clock.clone();
             tokio::select! {
-                result = poll_fn(|cx| self.poll(cx)) => {
+                result = poll_fn(|cx| self.poll(&gate, cx)) => {
                     if result.is_err() { self.failed = true; }
-                    return result;
+                    return Some(result);
                 }
+                () = interrupt.as_mut() => return None,
                 () = links.reader_changed_after(seen) => {},
-                result = routes.changed_after(routes_seen) => result?,
+                result = routes.changed_after(routes_seen) => {
+                    if let Err(error) = result {
+                        return Some(Err(error.into()));
+                    }
+                }
                 () = async {
                     match deadline {
                         Some(deadline) => clock.until(deadline).await,
@@ -278,13 +386,20 @@ impl TopicReader {
                         None => std::future::pending().await,
                     }
                 } => {},
-                () = links.closed() => return Err(links.closed_error().into()),
+                () = links.closed() => return Some(Err(links.closed_error().into())),
             }
         }
     }
 
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<TopicRecord, TopicReaderError>> {
+    fn poll(
+        &mut self,
+        gate: &impl Fn(u32) -> bool,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<TopicRecord, TopicReaderError>> {
         let count = self.cursors.len();
+        if count == 0 {
+            return Poll::Pending;
+        }
         let input = (self.links.reader_generation(), self.routes.generation());
         if self.remaining == 0 {
             self.remaining = count;
@@ -293,6 +408,9 @@ impl TopicReader {
             let index = self.next;
             self.next = (index + 1) % count;
             self.remaining -= 1;
+            if !gate(self.cursors[index].number) {
+                continue;
+            }
             match self.cursors[index].poll(
                 &self.links,
                 &self.routes,

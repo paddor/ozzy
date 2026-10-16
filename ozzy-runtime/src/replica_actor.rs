@@ -14,6 +14,8 @@ mod diagnostics;
 mod donors;
 pub use diagnostics::{HistoryFailure, HistoryReason};
 mod election;
+mod groups;
+pub use groups::{GroupCoordinator, GroupCoordinatorConfig, TopicTopology};
 mod history;
 mod ids;
 mod maintenance;
@@ -252,6 +254,9 @@ pub struct ReplicaActor {
         ozzy_journal_segment::StorageValidationBudget,
     )>,
     retention_at: Option<Duration>,
+    /// Identity expiry owes another bounded step; it runs between foreground
+    /// turns without waiting for a settled core.
+    identity_retention_due: bool,
     startup_probe: Option<startup::Probe>,
     recovery_required: bool,
     donors: Option<Box<donors::Donors>>,
@@ -331,6 +336,9 @@ impl ReplicaActor {
         config: &ActorConfig,
         mut ids: ActorIds,
     ) -> Result<Self, ActorError> {
+        let mut config = *config;
+        config.retention_interval = journal.retention_interval(config.retention_interval);
+        let config = &config;
         let configuration = startup.configuration();
         let local = startup.local();
         let journal_scope = startup
@@ -352,8 +360,10 @@ impl ReplicaActor {
             return Err(ActorError::Limits);
         }
         let backlog = journal.backlog();
+        // A backup can hold its whole retained window accepted but unapplied.
         if config.pipeline.max_operations > backlog.max_operations
             || config.pipeline.max_body_bytes > backlog.max_body_bytes
+            || config.pipeline.backup().max_operations > journal.unapplied_operations()
         {
             return Err(ActorError::Limits);
         }
@@ -437,6 +447,7 @@ impl ReplicaActor {
             orphan_cleanup: None,
             foreground_turn_due: false,
             retention_at: config.retention_interval,
+            identity_retention_due: false,
             startup_probe,
             recovery_required: false,
             donors: None,

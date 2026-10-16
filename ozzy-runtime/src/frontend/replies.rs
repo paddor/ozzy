@@ -126,6 +126,7 @@ impl Dispatcher {
             if queue.messages.len() == queue.limits.messages
                 || bytes > queue.limits.bytes - queue.bytes
             {
+                crate::profiling::event(crate::profiling::Event::DispatcherBrokerFull);
                 return Err(ReplyError::Full);
             }
             return Ok((to, bytes));
@@ -146,7 +147,15 @@ impl Dispatcher {
             || (!data && !packet.payload.is_empty())
             || matches!(
                 packet.envelope.opcode,
-                Opcode::Prepare | Opcode::Append | Opcode::Subscribe | Opcode::Unsubscribe
+                Opcode::Prepare
+                    | Opcode::Append
+                    | Opcode::Subscribe
+                    | Opcode::Unsubscribe
+                    | Opcode::ProgressCommit
+                    | Opcode::GroupJoin
+                    | Opcode::GroupAssign
+                    | Opcode::GroupInspect
+                    | Opcode::GroupDelete
             )
         {
             return Err(ReplyError::Class);
@@ -155,6 +164,11 @@ impl Dispatcher {
             || bytes > queue.limits.bytes - queue.bytes)
             && !(class == Class::Control && queue.contains(message, 0))
         {
+            crate::profiling::event(if peer.binding.kind == super::Kind::Broker {
+                crate::profiling::Event::DispatcherBrokerFull
+            } else {
+                crate::profiling::Event::DispatcherReplyFull
+            });
             return Err(ReplyError::Full);
         }
         Ok((to, bytes))
@@ -183,7 +197,11 @@ impl Dispatcher {
             self.replied = Some(next);
             let peer = self.peers.get_mut(&next).expect("selected peer");
             for class in [peer.next_reply_class, 1 - peer.next_reply_class] {
-                let attempt = peer.replies[class].flush(&mut try_send)?;
+                let attempt = if peer.blocked[class] {
+                    SendAttempt::Idle
+                } else {
+                    flush_class(peer, class, &mut try_send)?
+                };
                 if class == 0 {
                     progress.control = attempt;
                 } else {
@@ -195,6 +213,46 @@ impl Dispatcher {
             }
         }
         Ok(progress)
+    }
+
+    /// Front frames of classes OMQ refused, for registering send-progress
+    /// waits. Retrying them before that progress only spends the dispatcher's
+    /// core.
+    pub(super) fn blocked(&self) -> impl Iterator<Item = (NodeId, usize, &Message)> {
+        self.peers.iter().flat_map(|(&node, peer)| {
+            (0..2).filter_map(move |class| {
+                peer.blocked[class]
+                    .then(|| peer.replies[class].messages.front())
+                    .flatten()
+                    .map(|(message, _)| (node, class, message))
+            })
+        })
+    }
+
+    pub(super) fn is_blocked(&self, peer: NodeId, class: usize) -> bool {
+        self.peers
+            .get(&peer)
+            .is_some_and(|peer| peer.blocked[class])
+    }
+
+    /// Make a refused class eligible for flushing again.
+    pub(super) fn unblock(&mut self, peer: NodeId, class: usize) {
+        if let Some(peer) = self.peers.get_mut(&peer) {
+            peer.blocked[class] = false;
+        }
+    }
+
+    /// Attempt one class of one peer, outside the round-robin rotation.
+    pub(super) fn flush_peer_class(
+        &mut self,
+        peer: NodeId,
+        class: usize,
+        mut try_send: impl FnMut(Message) -> Result<(), TrySendError>,
+    ) -> Result<SendAttempt, omq_tokio::Error> {
+        match self.peers.get_mut(&peer) {
+            Some(peer) => flush_class(peer, class, &mut try_send),
+            None => Ok(SendAttempt::Idle),
+        }
     }
 
     /// Whether bounded outgoing PEER queues contain unsent messages.
@@ -209,6 +267,29 @@ impl Dispatcher {
         let queue = &self.peers.get(&peer)?.replies[index(class)];
         Some((queue.messages.len(), queue.bytes))
     }
+}
+
+fn flush_class(
+    peer: &mut super::dispatch::Peer,
+    class: usize,
+    try_send: &mut impl FnMut(Message) -> Result<(), TrySendError>,
+) -> Result<SendAttempt, omq_tokio::Error> {
+    let attempt = peer.replies[class].flush(try_send)?;
+    match attempt {
+        SendAttempt::Submitted => {
+            crate::profiling::event(crate::profiling::Event::DispatcherReplySent);
+        }
+        SendAttempt::Blocked => {
+            peer.blocked[class] = true;
+            crate::profiling::event(if peer.binding.kind == super::Kind::Broker {
+                crate::profiling::Event::DispatcherBrokerBlocked
+            } else {
+                crate::profiling::Event::DispatcherReplyBlocked
+            });
+        }
+        SendAttempt::Idle | SendAttempt::Unroutable => {}
+    }
+    Ok(attempt)
 }
 
 const fn index(class: Class) -> usize {

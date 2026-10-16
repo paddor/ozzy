@@ -6,6 +6,7 @@ pub use selected::Candidate;
 
 use super::{CheckpointFiles, Journal};
 use crate::{CanonicalCheckpointError as CheckpointError, CheckpointLimits};
+use ozzy_core::checkpoint::Layout;
 use ozzy_core::state::{
     CanonicalState, StateLimits, StateSnapshotLimits, canonical_state_schema_digest,
 };
@@ -30,9 +31,24 @@ impl Journal {
                 budget.charge(bytes).await;
             })
             .await?;
-        Ok(self
-            .build_checkpoint(id, canonical_state_schema_digest(), chunk_bytes, &bytes)
-            .await?)
+        let layout = Layout::new(bytes.len() as u64, None)?;
+        let plan = self.prepare_checkpoint(
+            id,
+            canonical_state_schema_digest(),
+            chunk_bytes,
+            layout.encoded_bytes()?,
+        )?;
+        self.interrupted = true;
+        let mut writer = plan.start().await?;
+        for fragment in layout.encode().chunks(writer.fragment_bytes()) {
+            writer.push(fragment).await?;
+        }
+        for fragment in bytes.chunks(writer.fragment_bytes()) {
+            writer.push(fragment).await?;
+        }
+        let files = writer.finish().await?;
+        self.interrupted = false;
+        Ok(files)
     }
 
     /// Validate and publish a canonical checkpoint as the selected recovery source.

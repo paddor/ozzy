@@ -11,7 +11,7 @@ const CODEC_METADATA_BYTES: usize = 9;
 /// Reusable bounded state for one journal owner.
 #[derive(Debug)]
 pub struct AppendPackScratch {
-    compressor: lz4rip::block::Compressor,
+    compressor: lz4rip::block::CompressorN<2048>,
     encoded: Vec<u8>,
     tiny_lengths: Vec<u8>,
     max_payload_bytes: usize,
@@ -21,11 +21,19 @@ impl AppendPackScratch {
     /// Construct lazy scratch bounded by canonical payload limits.
     pub fn new(max_payload_bytes: usize) -> Self {
         Self {
-            compressor: lz4rip::block::Compressor::new(),
+            compressor: lz4rip::block::CompressorN::new(),
             encoded: Vec::new(),
             tiny_lengths: Vec::new(),
             max_payload_bytes,
         }
+    }
+
+    /// Physical reusable scratch, including the explicitly sized LZ4 table.
+    pub fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+            + 2048 * size_of::<u32>()
+            + self.encoded.capacity()
+            + self.tiny_lengths.capacity()
     }
 
     fn reserve_encoded(&mut self, bytes: usize) -> Result<(), OperationCodecError> {

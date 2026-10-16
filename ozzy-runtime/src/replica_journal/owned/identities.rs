@@ -21,19 +21,24 @@ impl OwnedJournal {
     ) -> Result<ValidationTicket, JournalError> {
         self.healthy()?;
         self.validate_image(ticket)?;
-        self.writeback.require_idle()?;
+        self.require_settled(ticket)?;
         let journal = self.journal.ready()?;
-        if !self.pending.is_empty()
-            || prefix(journal.written_position()?) != self.applied
-            || ticket.accepted() != self.applied
-            || ticket.committed() != self.applied
-        {
+        if prefix(journal.written_position()?) != self.applied {
             return Err(JournalError::CompletionMismatch);
         }
         if self.identity_capacity()?.0 != 0 {
             self.refresh_settled_identities().await?;
         }
         Ok(ticket)
+    }
+
+    /// A refresh rescans the active segment while this partition admits nothing,
+    /// so its stop grows with history. Background turns wait until the overlay
+    /// is half full; an exhausted overlay drains intake so the refresh can run.
+    pub(in crate::replica_journal) fn identity_refresh_due(&self) -> bool {
+        self.identity_capacity()
+            .is_ok_and(|(used, capacity)| used >= capacity.div_ceil(2))
+            && self.identity_refresh_ready()
     }
 
     pub(in crate::replica_journal) fn identity_refresh_ready(&self) -> bool {

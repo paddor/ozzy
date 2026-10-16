@@ -96,7 +96,9 @@ sequenceDiagram
 3. DQ requires synchronized exact prefixes on leader and one follower. RP requires
    validated retained bytes on both; writes continue independently.
 4. Commit/apply in order, reply from applied state, and announce COMMIT. Follower
-   application also requires its policy's local evidence.
+   application also requires its policy's local evidence. A COMMIT past a
+   follower's accepted prefix applies everything it accepted in the view; the
+   exact announced prefix is verified once accepted.
 
 New accepted/applied state or authority invalidates a validation plan. Mere
 confirmation on the unchanged history does not. Cumulative votes cannot skip
@@ -135,12 +137,24 @@ Same-epoch counters/revisions cannot retract or wrap.
 Probes capture the accepted tail, including unconfirmed work and an idle final
 PUB loss. Retries keep that correlation/tail. Only an answered probe starts
 payload repair. Sender ledgers and receiver capacity are independently bounded.
-A receipt releases sender metadata, never required receiver bodies.
+A receiver's ledger and core each hold two live windows: its released prefix
+trails the leader's commit announcement, and the leader fills one window beyond
+that. A follower admits a suffix only within the leader's window above the
+commit it announced. Every owner that holds accepted but unapplied state, such
+as pending canonical transitions and pending dedup identities, has the same
+two-window bound, because a follower whose barriers lag can apply that far
+behind what it accepted. A receipt releases sender metadata, never required
+receiver bodies.
 
 Recent replay caches are bounded by operations/bytes and do not wait for slow
 followers. Older repair uses indexed journal reads from a captured generation
 and prefix. Capacity exhaustion preserves the cursor and required size; scope,
 source, and predecessor fences remain valid while waiting.
+
+Applied packets containing control operations bypass the recent replay cache and
+evict its older prefix, preserving contiguous cache ranges. Replay caching cannot
+pin the shard's independent control arenas after producers stop, including when
+only one arena is configured. Evicted repair uses the same indexed journal path.
 
 RP retains backing through application and completed writes; a full backlog
 backpressures producers. Interrupted/short writes retry/resume. Other
@@ -263,6 +277,9 @@ tail, then verify the same tail within the selected lineage. Only this complete
 proof permits ancestry lookup and reuse of a compatible local installation
 prefix. Missing or divergent overlap stays unverified; it grants no authority.
 A requester withdraws only if its own history has expired.
+
+Withdrawal aborts any unpublished view installation before persisting the
+nonvoting marker. The old selected history and durable promise remain intact.
 
 Checkpoint recovery verifies private state, required retained operations, and the
 accepted suffix. The original committed anchor stays distinct. A destination

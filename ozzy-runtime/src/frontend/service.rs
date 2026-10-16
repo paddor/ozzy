@@ -107,6 +107,12 @@ pub struct Service {
     pub(super) port_turn: Option<u32>,
     pub(super) publications: [Option<(u32, Message)>; 2],
     pub(super) publication_next: usize,
+    /// One send-progress wait per refused destination class, kept across
+    /// progress calls. Building OMQ waits is too costly to repeat each turn.
+    pub(super) reply_waits: progress::ReplyWaits,
+    /// Per shard and destination class, the lowest reply sequence refused for
+    /// capacity and not yet re-admitted. Later sequences wait behind it.
+    pub(super) refused_replies: BTreeMap<(u32, NodeId, Class), u64>,
 }
 
 impl Service {
@@ -186,6 +192,8 @@ impl Service {
             trusted_maximum: 0,
             ports: BTreeMap::new(),
             port_turn: None,
+            reply_waits: progress::ReplyWaits::default(),
+            refused_replies: BTreeMap::new(),
             publications: [None, None],
             publication_next: 0,
         })
@@ -820,6 +828,10 @@ impl Service {
                 match send(message) {
                     Ok(()) => {
                         state.awaiting_welcome = false;
+                        // Replies refused while the handshake was unsent were
+                        // not refused by OMQ.
+                        self.dispatcher.unblock(next, 0);
+                        self.dispatcher.unblock(next, 1);
                         advanced = true;
                     }
                     Err(TrySendError::Error(omq_tokio::Error::Unroutable)) => advanced = true,

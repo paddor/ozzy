@@ -1,6 +1,7 @@
 //! One bounded APPEND walker for validation, materialization, and views.
 
 use super::primitives::{Decoder, Encoder, enforce_limit, validate_position_count};
+use crate::operation::append_encoder::BatchLayout;
 use crate::operation::{
     Append, AppendBatch, AppendBatchSummary, AppendBatchView, AppendHeader, AppendRecord,
     AppendRecordDescriptors, AppendRecordList, AppendRecords, OperationCodecError, OperationLimits,
@@ -44,8 +45,7 @@ pub(in crate::operation) fn encode_append_batch(
     if batch.records.is_packed() {
         AppendHeader::from(batch).encode(
             batch.records.len(),
-            true,
-            false,
+            BatchLayout::Compact,
             limits,
             totals,
             encoder,
@@ -70,7 +70,13 @@ pub(in crate::operation) fn encode_append_batch(
         .iter()
         .map(|r| (r.message_id, r.encoding, r.parts.iter()));
     let tiny = records_are_tiny(records.clone());
-    AppendHeader::from(batch).encode(batch.records.len(), tiny, false, limits, totals, encoder)?;
+    AppendHeader::from(batch).encode(
+        batch.records.len(),
+        BatchLayout::records(tiny),
+        limits,
+        totals,
+        encoder,
+    )?;
     if !tiny && let Some(chunks) = batch.records.encoded_slices() {
         // Native and canonical general descriptors have identical bytes.
         // Frames are immutable and validated; enforce this operation's possibly
@@ -181,7 +187,7 @@ pub(in crate::operation) fn decode_append<
     };
     let mut totals = AppendTotals::default();
     for _ in 0..batch_count {
-        let (batch, _) = decode_append_batch::<MATERIALIZE, VALIDATE_PREPARED>(
+        let (batch, _) = decode_append_batch::<MATERIALIZE, VALIDATE_PREPARED, false>(
             decoder,
             limits,
             &mut totals,
@@ -198,6 +204,7 @@ pub(in crate::operation) fn decode_append_batch<
     'a,
     const MATERIALIZE: bool,
     const VALIDATE_PREPARED: bool,
+    const ALLOW_EMPTY: bool,
 >(
     decoder: &mut Decoder<'a>,
     limits: OperationLimits,
@@ -219,12 +226,14 @@ pub(in crate::operation) fn decode_append_batch<
     }
     let record_count = (count_and_layout & RECORD_COUNT_MASK) as usize;
     enforce_limit("append record count", record_count, limits.max_records)?;
-    if record_count == 0 {
+    if record_count == 0 && (!ALLOW_EMPTY || tiny || prepared) {
         return Err(OperationCodecError::EmptyAppend);
     }
     totals.add_records(record_count, limits)?;
-    validate_position_count(first_sequence.get(), record_count)?;
-    validate_position_count(first_offset.get(), record_count)?;
+    if record_count != 0 {
+        validate_position_count(first_sequence.get(), record_count)?;
+        validate_position_count(first_offset.get(), record_count)?;
+    }
 
     let descriptors =
         decode_record_descriptors(decoder, record_count, tiny, limits, totals, positions)?;
@@ -319,7 +328,7 @@ fn decode_record_descriptors<'a>(
     })
 }
 
-fn materialize_batch<'a, const MATERIALIZE: bool>(
+pub(in crate::operation) fn materialize_batch<'a, const MATERIALIZE: bool>(
     view: &AppendBatchView<'a>,
 ) -> Result<AppendBatch<'a>, OperationCodecError> {
     let records = if MATERIALIZE {

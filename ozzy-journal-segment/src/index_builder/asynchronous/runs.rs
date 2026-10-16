@@ -1,7 +1,7 @@
 use super::{Access, IndexBuildError, IndexFileError, PendingRuns, RunKind, Workspace};
 use crate::index_file::{
-    compare_message_entries, compare_offset_entries, compare_operation_entries,
-    encode_message_entry, encode_offset_entry, encode_operation_entry,
+    compare_locations, compare_message_entries, compare_offset_entries, compare_operation_entries,
+    encode_message_entry, encode_offset_entry, encode_operation_entry, encode_operation_location,
 };
 use ozzy_io::{Handle, OpenMode, Operation};
 use std::{cmp::Ordering, path::PathBuf};
@@ -86,6 +86,16 @@ impl PendingRuns {
             self.max_runs,
             compare_operation_entries,
             encode_operation_entry,
+        )
+        .await?;
+        write_typed_run(
+            &mut self.locations,
+            RunKind::Location,
+            workspace,
+            &mut self.location_runs,
+            self.max_runs,
+            compare_locations,
+            encode_operation_location,
         )
         .await?;
         self.buffered_bytes = 0;

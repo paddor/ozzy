@@ -178,7 +178,8 @@ fn lz4_passthrough_sentinel_crossing_pool_threshold_retains_full_backing_charge(
     let limits = EnvelopeLimits::default();
     let envelope = ozzy_proto::decode_packet(&frames, limits).unwrap().envelope;
     let message_bytes = crate::transport::message_size_limit(limits).unwrap();
-    let buffers = ReceiveBuffers::new(limits, ReceiveStorage::Lz4Stream { message_bytes }).unwrap();
+    let buffers =
+        ReceiveBuffers::new(limits, ReceiveStorage::Compressed { message_bytes }).unwrap();
     buffers
         .check_transport(&"lz4+tcp://127.0.0.1:7000".parse().unwrap(), message_bytes)
         .unwrap();

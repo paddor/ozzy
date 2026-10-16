@@ -54,7 +54,7 @@ impl Journal {
                 // Historical progress can refer to the preceding private prefix,
                 // never future operations. This does not make that prefix visible.
                 let plan = selected
-                    .prepare(op.op_number, &body, &replay, &selected)
+                    .prepare(op.op_number, &body, &replay)
                     .map_err(CanonicalImagesError::from)?;
                 selected
                     .apply(plan, &mut replay)

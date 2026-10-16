@@ -4,6 +4,82 @@ use bytes::Bytes;
 use ozzy_proto::{Envelope, RequestId};
 
 #[test]
+fn group_progress_uses_source_partition_control_and_rejects_obsolete_bindings() {
+    let target = placement(0, 7);
+    let table = RoutingTable::new(&[7], &[target], 1, EnvelopeLimits::default()).unwrap();
+    let binding = binding(Kind::Client);
+    let request = progress::Request {
+        authority: authority(target),
+        assignment: progress::Assignment {
+            group: ozzy_proto::ConsumerGroupId::from_bytes([5; 16]),
+            partition: target.partition,
+            member: ozzy_proto::ConsumerMemberId::from_bytes([6; 16]),
+            epoch: 1,
+        },
+        policy: append::Policy::QuorumDurable,
+        cursor: None,
+    };
+    let message = |request| {
+        let mut metadata = Vec::with_capacity(progress::REQUEST_BYTES);
+        let header = progress::encode_request(
+            envelope(Opcode::ProgressCommit, binding),
+            request,
+            &mut metadata,
+            EnvelopeLimits::default(),
+        )
+        .unwrap();
+        Message::multipart([
+            Bytes::copy_from_slice(binding.peer.as_bytes()),
+            Bytes::copy_from_slice(&header),
+            Bytes::from(metadata),
+            Bytes::new(),
+        ])
+    };
+    let query = message(request);
+    assert_eq!(
+        table.route(&query, binding).unwrap(),
+        Routed {
+            placement: target,
+            class: Class::Control,
+            writer: None,
+        }
+    );
+    assert!(matches!(
+        table.route(
+            &query,
+            Binding {
+                session: LinkSessionId::from_bytes([99; 16]),
+                ..binding
+            }
+        ),
+        Err(RoutingError::Session)
+    ));
+    assert!(
+        table
+            .route(
+                &query,
+                Binding {
+                    kind: Kind::Broker,
+                    ..binding
+                }
+            )
+            .is_err()
+    );
+    let mut foreign = request;
+    foreign.assignment.partition = PartitionIncarnation::from_bytes([99; 16]);
+    assert!(matches!(
+        table.route(&message(foreign), binding),
+        Err(RoutingError::Partition)
+    ));
+    foreign = request;
+    foreign.authority.group_id = GroupId::from_bytes([99; 16]);
+    assert!(matches!(
+        table.route(&message(foreign), binding),
+        Err(RoutingError::Partition)
+    ));
+}
+
+#[test]
 fn one_link_routes_multiple_partitions_to_independent_local_placements() {
     let routes = [placement(0, 0), placement(1, 17), placement(2, 17)];
     let first = RoutingTable::new(&[0, 17], &routes, 3, EnvelopeLimits::default()).unwrap();

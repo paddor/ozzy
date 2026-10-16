@@ -4,7 +4,7 @@ use std::{borrow::Cow, collections::VecDeque};
 
 use ahash::AHashSet as HashSet;
 
-use ozzy_journal::operation::{AppendSummary, OperationBody};
+use ozzy_journal::operation::{AppendBatchSummary, AppendResults, AppendSummary, OperationBody};
 use thiserror::Error;
 
 use super::{
@@ -161,6 +161,27 @@ where
         Ok(())
     }
 
+    /// Replace the committed and any speculative identity index with ones
+    /// derived from them, such as coverage narrowed to retained history. Both
+    /// change or neither does. The caller must keep every claim a later lookup
+    /// can reach; this supplies no storage or replication authority.
+    pub fn map_identity_indexes<E>(
+        &mut self,
+        mut map: impl FnMut(&I) -> Result<I, E>,
+    ) -> Result<(), E> {
+        let committed = map(&self.committed_identities)?;
+        let speculative = self
+            .speculative_identities
+            .as_ref()
+            .map(&mut map)
+            .transpose()?;
+        self.committed_identities = committed;
+        if speculative.is_some() {
+            self.speculative_identities = speculative;
+        }
+        Ok(())
+    }
+
     /// Validate a group without cloning retained identity history.
     ///
     /// The returned plans remain valid only while this image stays unchanged.
@@ -173,7 +194,7 @@ where
     ) -> Result<PreparedCanonicalGroup, CanonicalImagesError> {
         self.prepare_group_with(operations.len(), |index, candidate, identities| {
             let (number, body) = &operations[index];
-            candidate.prepare(*number, body, identities, &self.committed)
+            candidate.prepare(*number, body, identities)
         })
     }
 
@@ -189,6 +210,18 @@ where
         })
     }
 
+    /// Validate resolved attempt metadata without materializing stored payloads.
+    /// The caller must validate every summary and result against its exact body.
+    pub fn prepare_resolved_append_group(
+        &self,
+        bodies: &[(u64, AppendBatchSummary, AppendResults<'_>)],
+    ) -> Result<PreparedCanonicalGroup, CanonicalImagesError> {
+        self.prepare_group_with(bodies.len(), |index, candidate, _identities| {
+            let (number, batch, results) = bodies[index];
+            candidate.prepare_resolved_append_summary(number, batch, results)
+        })
+    }
+
     /// Validate consecutive typed bodies without an encode/decode round trip.
     pub fn prepare_consecutive_group(
         &self,
@@ -200,7 +233,7 @@ where
             let number = first_op_number
                 .checked_add(delta)
                 .ok_or(StateError::RevisionExhausted)?;
-            candidate.prepare(number, &bodies[index], identities, &self.committed)
+            candidate.prepare(number, &bodies[index], identities)
         })
     }
 
@@ -305,12 +338,9 @@ where
         if self.pending.len() >= self.pending_capacity {
             return Err(CanonicalImagesError::PendingCapacity);
         }
-        let plan = self.speculative.prepare(
-            op_number,
-            body,
-            self.speculative_identities(),
-            &self.committed,
-        )?;
+        let plan = self
+            .speculative
+            .prepare(op_number, body, self.speculative_identities())?;
         self.admit_plan(plan)
     }
 

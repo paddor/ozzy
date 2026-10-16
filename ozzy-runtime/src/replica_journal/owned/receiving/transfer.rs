@@ -33,7 +33,6 @@ impl RecoveringJournal {
         {
             return Err(JournalError::Configuration);
         }
-        self.prepare_checkpoint(&ticket)?;
         if ticket.checkpoint().is_some() && matches!(self.state, State::Directory(_)) {
             let State::Directory(directory) = self.take_state() else {
                 unreachable!("checked directory");
@@ -48,6 +47,7 @@ impl RecoveringJournal {
                     .await?,
             ));
         }
+        self.prepare_checkpoint(&ticket).await?;
         if matches!(self.state, State::Directory(_))
             && let Some(plan) = self.begin_repair(&ticket, physical).await?
         {
@@ -290,19 +290,22 @@ impl RecoveringJournal {
                         .checkpoint
                         .take()
                         .ok_or(JournalError::HistorySourceMismatch)?;
-                    let state = checkpoint
+                    checkpoint
                         .state
                         .as_ref()
                         .ok_or(JournalError::HistorySourceMismatch)?;
-                    Box::pin(staging.0.finish_with_checkpoint(
+                    let journal = Box::pin(staging.0.finish_with_checkpoint(
                         ozzy_journal_segment::CanonicalCheckpointImport {
                             id: ozzy_proto::CheckpointId::from_bytes(*ticket.nonce().as_bytes()),
                             position: position(anchor.position),
-                            state,
-                            limits: self.config.recovery.snapshot,
+                            image: &checkpoint.inbox,
+                            state_limits: self.config.recovery.state,
+                            snapshot_limits: self.config.recovery.snapshot,
                         },
                     ))
-                    .await?
+                    .await?;
+                    checkpoint.inbox.discard().await?;
+                    journal
                 } else {
                     Box::pin(staging.0.finish()).await?
                 };

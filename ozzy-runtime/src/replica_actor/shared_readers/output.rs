@@ -29,46 +29,53 @@ impl SharedReaders {
                         != Some((scope, generation))
                 });
             if fenced {
-                self.slots.iter_mut().for_each(|slot| *slot = None);
+                self.slots.clear();
             }
             self.observed = observed;
             self.publication.changed(fenced, ticket.is_some());
-            for slot in self.slots.iter_mut().flatten() {
+            for slot in &mut self.slots {
                 slot.delivery.schedule.source_changed();
             }
         }
         let mut progress = flush(&mut self.rejection, cx, send)?;
-        for _ in 0..16 {
-            let index = self.next;
-            self.next = (index + 1) % self.slots.len();
-            if self.slots[index].is_none() {
-                continue;
-            }
-            let slot = self.slots[index].as_mut().expect("selected slot");
-            progress |= flush(&mut slot.pending, cx, send)?;
+        // At most 16 subscriptions make progress per poll. Idle ones cost no
+        // budget, so a poll that ends without progress has checked every
+        // subscription and needs no further wake.
+        let mut budget = 16;
+        let mut visits = self.slots.len();
+        while budget > 0 && visits > 0 && !self.slots.is_empty() {
+            visits -= 1;
+            let index = self.next % self.slots.len();
+            self.next = index + 1;
+            let slot = &mut self.slots[index];
+            let mut served = flush(&mut slot.pending, cx, send)?;
             // Keep subscriptions until there is room for their possible
             // failure reply. A blocked reply must not erase another cursor.
-            if slot.pending.is_some() || self.rejection.is_some() {
-                continue;
-            }
-            let Some(link) = self.links.get(slot.peer) else {
-                continue;
-            };
-            match output(
-                slot,
-                self.local,
-                self.config.limits.intersection(link.send),
-                &mut self.metadata,
-                ticket,
-                journal,
-                cx,
-            ) {
-                Ok(changed) => progress |= changed,
-                Err(error) => {
-                    let slot = self.slots[index].take().expect("failed subscription");
-                    self.reject(slot.peer, slot.delivery.request, link, error, hint)?;
-                    progress = true;
+            if slot.pending.is_none()
+                && self.rejection.is_none()
+                && let Some(link) = self.links.get(slot.peer)
+            {
+                match output(
+                    slot,
+                    self.local,
+                    self.config.limits.intersection(link.send),
+                    &mut self.metadata,
+                    ticket,
+                    journal,
+                    cx,
+                ) {
+                    Ok(changed) => served |= changed,
+                    Err(error) => {
+                        let slot = self.slots.remove(index);
+                        self.next = index;
+                        self.reject(slot.peer, slot.delivery.request, link, error, hint)?;
+                        served = true;
+                    }
                 }
+            }
+            if served {
+                progress = true;
+                budget -= 1;
             }
         }
         progress |= self

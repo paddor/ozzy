@@ -159,6 +159,15 @@ impl ShardRecoveringJournal {
         let memory = owner.append_memory.clone();
         let journal = ReplicaJournal {
             backlog: config.writeback,
+            unapplied: config.deduplication.map_or(
+                config.recovery.accepted_transitions,
+                |limits| {
+                    limits
+                        .pending_operations
+                        .min(config.recovery.accepted_transitions)
+                },
+            ),
+            dedup_window_millis: config.deduplication.map(|limits| limits.window_millis),
             replicated: config.configuration.configuration().policy()
                 == ozzy_replication::QuorumPolicy::Replicated,
             capacity: Arc::new(Semaphore::new(scheduler.commands)),

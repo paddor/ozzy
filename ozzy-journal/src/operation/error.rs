@@ -5,6 +5,15 @@ use thiserror::Error;
 /// Canonical operation body codec failure.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum OperationCodecError {
+    /// Unsupported coordinator intent format.
+    #[error("invalid consumer group plan format")]
+    InvalidGroupPlan,
+    /// The assignment body format is unsupported.
+    #[error("unsupported consumer assignment format {0}")]
+    UnsupportedAssignmentFormat(u8),
+    /// Attempt counts, outcome mappings, or duplicate retry proofs disagree.
+    #[error("invalid append results")]
+    InvalidAppendResults,
     #[error("unsupported operation kind {0}")]
     /// The canonical operation discriminator is unsupported.
     UnsupportedOperationKind(u16),
@@ -49,12 +58,12 @@ pub enum OperationCodecError {
     #[error("append sequence or offset range overflows")]
     /// A producer sequence or record offset range overflows.
     AppendPositionOverflow,
-    #[error("consumer-group progress requires an assignment epoch")]
+    #[error("consumer-group progress requires a member and assignment epoch")]
     /// Consumer-group progress lacks an assignment fence.
-    MissingAssignmentEpoch,
-    #[error("standalone subscription progress cannot carry an assignment epoch")]
+    MissingProgressAssignment,
+    #[error("standalone subscription progress cannot carry an assignment")]
     /// Standalone subscription progress carries an assignment fence.
-    UnexpectedAssignmentEpoch,
+    UnexpectedProgressAssignment,
     #[error("integer or length arithmetic overflow")]
     /// Encoded integer or byte-count arithmetic overflows.
     LengthOverflow,

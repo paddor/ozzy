@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use omq_tokio::Message;
 use ozzy_proto::{
     EnvelopeLimits, GroupId, LinkSessionId, NodeId, Opcode, PartitionIncarnation, ProducerId,
-    append, decode_packet, producer, reader,
+    append, decode_packet, group, producer, progress, reader,
 };
 use ozzy_replication::wire;
 
@@ -103,23 +103,8 @@ impl RoutingTable {
     /// copying or scanning record payloads. Link negotiation runs before this
     /// established-session path. The original message remains with its caller.
     pub fn route(&self, message: &Message, binding: Binding) -> Result<Routed, RoutingError> {
-        if message.len() == 3
-            && binding.kind == Kind::Broker
-            && message.part_slice(0) == Some(binding.peer.as_bytes().as_slice())
-        {
-            let group = GroupId::from_bytes(
-                message
-                    .part_slice(1)
-                    .and_then(|p| p.try_into().ok())
-                    .ok_or(RoutingError::Partition)?,
-            );
-            wire::CompactState::decode(message.part_slice(2).unwrap_or_default())?;
-            let placement = *self.partitions.get(&group).ok_or(RoutingError::Partition)?;
-            return Ok(Routed {
-                placement,
-                class: Class::Control,
-                writer: None,
-            });
+        if let Some(route) = self.compact(message, binding)? {
+            return Ok(route);
         }
         if message.len() != 4 || message.part_slice(0) != Some(binding.peer.as_bytes().as_slice()) {
             return Err(RoutingError::Peer);
@@ -137,7 +122,31 @@ impl RoutingTable {
         {
             return Err(RoutingError::Session);
         }
-        let (group, partition, class, writer) = match binding.kind {
+        let (group, partition, class, writer) = self.target(packet, binding.kind)?;
+        let placement = *self.partitions.get(&group).ok_or(RoutingError::Partition)?;
+        if partition.is_some_and(|id| id != placement.partition) {
+            return Err(RoutingError::Partition);
+        }
+        Ok(Routed {
+            placement,
+            class,
+            writer,
+        })
+    }
+    fn target(
+        &self,
+        packet: ozzy_proto::Packet<'_>,
+        kind: Kind,
+    ) -> Result<
+        (
+            GroupId,
+            Option<PartitionIncarnation>,
+            Class,
+            Option<ProducerId>,
+        ),
+        RoutingError,
+    > {
+        Ok(match kind {
             Kind::Broker => {
                 // Normal replication uses PUB; addressed repair uses PrepareFlow.
                 if packet.envelope.opcode == Opcode::Prepare {
@@ -172,6 +181,51 @@ impl RoutingTable {
                     None,
                 )
             }
+            Kind::Client if packet.envelope.opcode == Opcode::ProgressCommit => {
+                let target = progress::decode_request(packet, self.limits)?;
+                (
+                    target.authority.group_id,
+                    Some(target.assignment.partition),
+                    Class::Control,
+                    None,
+                )
+            }
+            Kind::Client if packet.envelope.opcode == Opcode::GroupAssign => {
+                let target = group::decode_assign(packet, self.limits)?;
+                (
+                    target.authority.group_id,
+                    Some(target.partition),
+                    Class::Control,
+                    None,
+                )
+            }
+            Kind::Client if packet.envelope.opcode == Opcode::GroupJoin => {
+                let target = group::decode_join(packet, self.limits)?;
+                (
+                    target.authority.group_id,
+                    Some(target.coordinator),
+                    Class::Control,
+                    None,
+                )
+            }
+            Kind::Client if packet.envelope.opcode == Opcode::GroupInspect => {
+                let target = group::decode_inspect(packet, self.limits)?;
+                (
+                    target.authority.group_id,
+                    Some(target.coordinator),
+                    Class::Control,
+                    None,
+                )
+            }
+            Kind::Client if packet.envelope.opcode == Opcode::GroupDelete => {
+                let target = group::decode_delete(packet, self.limits)?;
+                (
+                    target.authority.group_id,
+                    Some(target.coordinator),
+                    Class::Control,
+                    None,
+                )
+            }
             Kind::Client => {
                 if packet.envelope.response
                     || !matches!(
@@ -191,16 +245,29 @@ impl RoutingTable {
                 };
                 (authority.group_id, Some(partition), Class::Control, None)
             }
-        };
-        let placement = *self.partitions.get(&group).ok_or(RoutingError::Partition)?;
-        if partition.is_some_and(|id| id != placement.partition) {
-            return Err(RoutingError::Partition);
-        }
-        Ok(Routed {
-            placement,
-            class,
-            writer,
         })
+    }
+
+    fn compact(&self, message: &Message, binding: Binding) -> Result<Option<Routed>, RoutingError> {
+        if message.len() == 3
+            && binding.kind == Kind::Broker
+            && message.part_slice(0) == Some(binding.peer.as_bytes().as_slice())
+        {
+            let group = GroupId::from_bytes(
+                message
+                    .part_slice(1)
+                    .and_then(|p| p.try_into().ok())
+                    .ok_or(RoutingError::Partition)?,
+            );
+            wire::CompactState::decode(message.part_slice(2).unwrap_or_default())?;
+            let placement = *self.partitions.get(&group).ok_or(RoutingError::Partition)?;
+            return Ok(Some(Routed {
+                placement,
+                class: Class::Control,
+                writer: None,
+            }));
+        }
+        Ok(None)
     }
 }
 

@@ -77,6 +77,8 @@ pub struct PartitionPlacement {
     pub directory: PathBuf,
     /// Current configured retention targets; canonical policy remains mutable.
     pub retention: crate::TopicRetention,
+    /// Optional per-partition deduplication policy and index resource bounds.
+    pub deduplication: Option<crate::TopicDeduplication>,
 }
 
 impl ValidatedDeployment {
@@ -171,6 +173,7 @@ impl ValidatedDeployment {
                     topic: topic_name.clone(),
                     partition,
                     retention: topic.retention,
+                    deduplication: topic.deduplication,
                     shard: shard.id,
                     device: shard.device.clone(),
                     directory: broker.devices[&shard.device]

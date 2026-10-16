@@ -38,6 +38,147 @@ async fn progress_retries_network_send_after_registering_capacity_wait() {
 }
 
 #[tokio::test]
+async fn refused_destinations_keep_one_wait_and_retry_only_after_send_progress() {
+    let (mut service, _lanes, _) = setup();
+    let client = remote(1, handshake::PRODUCER);
+    let (binding, _) = begin(&mut service, &client, NodeId::from_bytes([1; 16]));
+    while service.flush(|_| Ok(())).unwrap() {}
+    service
+        .try_reply(Class::Data, reply(binding, Opcode::Records))
+        .unwrap();
+    let space = std::rc::Rc::new(std::cell::Cell::new(false));
+    let (attempts, waits) = (std::cell::Cell::new(0), std::cell::Cell::new(0));
+    let send = |message| {
+        attempts.set(attempts.get() + 1);
+        if space.get() {
+            Ok(())
+        } else {
+            Err(omq_tokio::TrySendError::Full(message))
+        }
+    };
+    let wait = |_| -> Pin<Box<dyn Future<Output = ()>>> {
+        waits.set(waits.get() + 1);
+        let space = space.clone();
+        Box::pin(std::future::poll_fn(move |_| {
+            if space.get() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }))
+    };
+    // Each serving turn builds a new progress future.
+    for _ in 0..4 {
+        let mut progress = Box::pin(service.progress_with(send, wait));
+        assert!(futures::poll!(progress.as_mut()).is_pending());
+    }
+    // The first turn's attempt, then one retry once the wait was registered.
+    assert_eq!((attempts.get(), waits.get()), (2, 1));
+    space.set(true);
+    let mut progress = Box::pin(service.progress_with(send, wait));
+    assert!(futures::poll!(progress.as_mut()).is_ready());
+    drop(progress);
+    assert_eq!((attempts.get(), waits.get()), (3, 1));
+    assert!(!service.has_pending());
+}
+
+#[tokio::test(start_paused = true)]
+async fn send_waits_that_complete_without_usable_space_back_off() {
+    let (mut service, _lanes, _) = setup();
+    let client = remote(1, handshake::PRODUCER);
+    let (binding, _) = begin(&mut service, &client, NodeId::from_bytes([1; 16]));
+    while service.flush(|_| Ok(())).unwrap() {}
+    service
+        .try_reply(Class::Data, reply(binding, Opcode::Records))
+        .unwrap();
+    let space = std::cell::Cell::new(false);
+    let (attempts, waits) = (std::cell::Cell::new(0), std::cell::Cell::new(0));
+    let send = |message| {
+        attempts.set(attempts.get() + 1);
+        if space.get() {
+            Ok(())
+        } else {
+            Err(omq_tokio::TrySendError::Full(message))
+        }
+    };
+    // OMQ can report send progress that a retry still cannot use.
+    let wait = |_| -> Pin<Box<dyn Future<Output = ()>>> {
+        waits.set(waits.get() + 1);
+        Box::pin(std::future::ready(()))
+    };
+    let turn = async |service: &mut Service| {
+        let mut progress = Box::pin(service.progress_with(send, wait));
+        futures::poll!(progress.as_mut()).is_ready()
+    };
+    // The rotation's attempt, then one retry for the wasted wake. The next
+    // wait is delayed instead of retrying again at once.
+    assert!(!turn(&mut service).await);
+    assert_eq!((attempts.get(), waits.get()), (2, 2));
+    for _ in 0..3 {
+        assert!(!turn(&mut service).await);
+    }
+    assert_eq!(attempts.get(), 2);
+    // Each further wasted wake doubles the delay.
+    for (advance, expected) in [(1, 3), (1, 3), (1, 4), (3, 4), (1, 5)] {
+        tokio::time::advance(std::time::Duration::from_millis(advance)).await;
+        assert!(!turn(&mut service).await);
+        assert_eq!(attempts.get(), expected);
+    }
+    space.set(true);
+    tokio::time::advance(std::time::Duration::from_millis(8)).await;
+    assert!(turn(&mut service).await);
+    assert_eq!(attempts.get(), 6);
+    assert!(!service.has_pending());
+}
+
+#[tokio::test]
+async fn completed_send_waits_are_observed_while_commands_keep_arriving() {
+    let context = omq_tokio::Context::new();
+    let (mut service, _lanes, _) = setup();
+    let client = remote(1, handshake::PRODUCER);
+    let (binding, _) = begin(&mut service, &client, NodeId::from_bytes([1; 16]));
+    while service.flush(|_| Ok(())).unwrap() {}
+    service
+        .try_reply(Class::Data, reply(binding, Opcode::Records))
+        .unwrap();
+    let space = std::rc::Rc::new(std::cell::Cell::new(false));
+    let records = std::cell::Cell::new(0);
+    let send = |message: Message| {
+        if !space.get() {
+            return Err(omq_tokio::TrySendError::Full(message));
+        }
+        if message.part_slice(1).unwrap()[5] == Opcode::Records as u8 {
+            records.set(records.get() + 1);
+        }
+        Ok(())
+    };
+    let wait = |_| -> Pin<Box<dyn Future<Output = ()>>> {
+        let space = space.clone();
+        Box::pin(std::future::poll_fn(move |_| {
+            if space.get() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }))
+    };
+    let mut progress = Box::pin(service.progress_with(send, wait));
+    assert!(futures::poll!(progress.as_mut()).is_pending());
+    drop(progress);
+    space.set(true);
+    let mut port = service.port(&context, 0, capacity()).unwrap();
+    let pending = port
+        .try_reply(Class::Control, reply(binding, Opcode::Appended), 2048, 0)
+        .unwrap();
+    let mut progress = Box::pin(service.progress_with(send, wait));
+    assert!(futures::poll!(progress.as_mut()).is_ready());
+    drop(progress);
+    // The refused reply went out in the same turn that admitted the command.
+    assert_eq!(records.get(), 1);
+    observe(&mut port, pending).await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn reply_capacity_follows_transport_aliases_and_unobserved_completions() {
     let context = omq_tokio::Context::new();
     let (mut service, _lanes, _) = setup();
@@ -45,7 +186,9 @@ async fn reply_capacity_follows_transport_aliases_and_unobserved_completions() {
     let (binding, _) = begin(&mut service, &client, NodeId::from_bytes([1; 16]));
     let mut port = service.port(&context, 0, capacity()).unwrap();
     let packet = reply(binding, Opcode::Records);
-    let pending = port.try_reply(Class::Data, packet.clone(), 2048).unwrap();
+    let pending = port
+        .try_reply(Class::Data, packet.clone(), 2048, 0)
+        .unwrap();
     assert!(service.poll_command().unwrap());
     let mut transmitted = Vec::new();
     service
@@ -56,7 +199,7 @@ async fn reply_capacity_follows_transport_aliases_and_unobserved_completions() {
         .unwrap();
     service.poll_command().unwrap();
     assert!(matches!(
-        port.try_reply(Class::Data, packet.clone(), 2048),
+        port.try_reply(Class::Data, packet.clone(), 2048, 0),
         Err((
             PortError::Admission(SendFailure::Admission(dispatch::Error::Full)),
             _
@@ -65,14 +208,17 @@ async fn reply_capacity_follows_transport_aliases_and_unobserved_completions() {
     drop(transmitted);
     service.poll_command().unwrap();
     // The reply observer itself is bounded until it consumes the outcome.
-    assert!(port.try_reply(Class::Data, packet.clone(), 2048).is_err());
+    assert!(
+        port.try_reply(Class::Data, packet.clone(), 2048, 0)
+            .is_err()
+    );
     let generation = port.generation();
     observe(&mut port, pending).await.unwrap().unwrap();
     let ready = port.changed_after(generation);
     tokio::time::timeout(std::time::Duration::from_secs(1), ready)
         .await
         .unwrap();
-    let pending = port.try_reply(Class::Data, packet, 2048).unwrap();
+    let pending = port.try_reply(Class::Data, packet, 2048, 0).unwrap();
     assert!(service.poll_command().unwrap());
     observe(&mut port, pending).await.unwrap().unwrap();
     let mut backing = None;
@@ -84,13 +230,13 @@ async fn reply_capacity_follows_transport_aliases_and_unobserved_completions() {
         .unwrap();
     service.poll_command().unwrap();
     assert!(
-        port.try_reply(Class::Data, reply(binding, Opcode::Records), 2048)
+        port.try_reply(Class::Data, reply(binding, Opcode::Records), 2048, 0)
             .is_err()
     );
     drop(backing);
     service.poll_command().unwrap();
     assert!(
-        port.try_reply(Class::Data, reply(binding, Opcode::Records), 2048)
+        port.try_reply(Class::Data, reply(binding, Opcode::Records), 2048, 0)
             .is_ok()
     );
 }
@@ -103,7 +249,9 @@ async fn full_port_wakes_when_dispatcher_exits() {
     let (binding, _) = begin(&mut service, &client, NodeId::from_bytes([1; 16]));
     let mut port = service.port(&context, 0, capacity()).unwrap();
     let packet = reply(binding, Opcode::Records);
-    let pending = port.try_reply(Class::Data, packet.clone(), 2048).unwrap();
+    let pending = port
+        .try_reply(Class::Data, packet.clone(), 2048, 0)
+        .unwrap();
     let generation = port.generation();
     drop(service);
     tokio::time::timeout(
@@ -113,10 +261,42 @@ async fn full_port_wakes_when_dispatcher_exits() {
     .await
     .unwrap();
     assert!(matches!(
-        port.try_reply(Class::Data, packet, 2048),
+        port.try_reply(Class::Data, packet, 2048, 0),
         Err((PortError::Admission(SendFailure::Closed), _))
     ));
     assert_eq!(observe(&mut port, pending).await, Err(PortError::Closed));
+}
+
+#[tokio::test]
+async fn queued_replies_transmit_before_more_shard_commands_are_admitted() {
+    let context = omq_tokio::Context::new();
+    let (mut service, _lanes, _) = setup();
+    let client = remote(1, handshake::PRODUCER);
+    let (binding, _) = begin(&mut service, &client, NodeId::from_bytes([1; 16]));
+    while service.flush(|_| Ok(())).unwrap() {}
+    for _ in 0..2 {
+        service
+            .try_reply(Class::Data, reply(binding, Opcode::Records))
+            .unwrap();
+    }
+    let mut port = service.port(&context, 0, capacity()).unwrap();
+    let pending = port
+        .try_reply(Class::Data, reply(binding, Opcode::Records), 2048, 0)
+        .unwrap();
+    let sent = std::cell::Cell::new(0);
+    let mut progress = Box::pin(service.progress_with(
+        |_| {
+            sent.set(sent.get() + 1);
+            Ok(())
+        },
+        |_| Box::pin(std::future::pending()),
+    ));
+    assert!(futures::poll!(progress.as_mut()).is_ready());
+    drop(progress);
+    // A full queue would refuse the command and the shard would retry it
+    // while the dispatcher kept admitting commands instead of sending.
+    assert_eq!(sent.get(), 1);
+    assert!(observe(&mut port, pending).await.unwrap().is_ok());
 }
 
 #[tokio::test]
@@ -132,14 +312,14 @@ async fn full_peer_returns_original_message_and_cannot_deadlock_its_own_retry_cr
     }
     let mut port = service.port(&context, 0, capacity()).unwrap();
     let pending = port
-        .try_reply(Class::Data, reply(binding, Opcode::Records), 2048)
+        .try_reply(Class::Data, reply(binding, Opcode::Records), 2048, 0)
         .unwrap();
     service.poll_command().unwrap();
     let (error, message) = observe(&mut port, pending).await.unwrap().unwrap_err();
     assert_eq!(error, ReplyError::Full);
     service.poll_command().unwrap();
     // Keep returned bytes alive while reusing the released queue reservation.
-    let again = port.try_reply(Class::Data, message, 2048).unwrap();
+    let again = port.try_reply(Class::Data, message, 2048, 0).unwrap();
     service.flush(|_| Ok(())).unwrap();
     service.poll_command().unwrap();
     observe(&mut port, again).await.unwrap().unwrap();
@@ -309,7 +489,7 @@ async fn reader_publications_fence_sources_and_charge_transport_aliases() {
     let client = remote(1, handshake::PRODUCER);
     let (binding, _) = begin(&mut service, &client, NodeId::from_bytes([1; 16]));
     let reply = right
-        .try_reply(Class::Data, reply(binding, Opcode::Records), 2048)
+        .try_reply(Class::Data, reply(binding, Opcode::Records), 2048, 0)
         .unwrap();
     for _ in 0..2 {
         service.poll_command().unwrap();

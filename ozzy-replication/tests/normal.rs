@@ -620,3 +620,108 @@ fn repeated_pipeline_reuse_preserves_cumulative_votes_and_prefixes() {
     }
     assert_eq!(primary.snapshot().applied.op, OpNumber(2000));
 }
+
+#[test]
+fn backup_retains_two_live_windows_behind_the_announced_commit() {
+    // The primary keeps one window in flight beyond its released prefix. A
+    // backup releases only announced commits, so it retains that window on
+    // top of the primary's live one, and never more than the primary can
+    // have in flight beyond the commit it announced.
+    let scope = config().scope();
+    let mut backup = replica(1, 2, 64);
+    let first = operation(scope, Prefix::GENESIS, 1);
+    let second = operation(scope, first.prefix(), 2);
+    let third = operation(scope, second.prefix(), 3);
+    let fourth = operation(scope, third.prefix(), 4);
+    let fifth = operation(scope, fourth.prefix(), 5);
+    let old = prepare(&mut backup, &[first, second]);
+    let before = backup.snapshot();
+    assert_eq!(
+        backup.prepare(node(0), scope, &[third]),
+        Err(ReplicationError::Capacity)
+    );
+    assert_eq!(backup.snapshot(), before);
+    let commit = |committed: Prefix| Commit { scope, committed };
+    backup
+        .receive_commit(node(0), commit(second.prefix()))
+        .unwrap();
+    let ticket = prepare(&mut backup, &[third, fourth]);
+    assert_eq!(backup.snapshot().pending_operations, 4);
+    backup
+        .receive_commit(node(0), commit(fourth.prefix()))
+        .unwrap();
+    assert_eq!(
+        backup.prepare(node(0), scope, &[fifth]),
+        Err(ReplicationError::Capacity)
+    );
+    backup.complete_durable_write(old).unwrap();
+    backup.apply_through(second.prefix()).unwrap();
+    assert_eq!(backup.snapshot().pending_operations, 2);
+    prepare(&mut backup, &[fifth]);
+    assert_eq!(backup.snapshot().pending_operations, 3);
+    backup.complete_durable_write(ticket).unwrap();
+}
+
+#[test]
+fn backup_body_bytes_stop_at_two_live_windows() {
+    let scope = config().scope();
+    let mut backup = replica(1, 4, 32);
+    let first = operation(scope, Prefix::GENESIS, 1);
+    let second = operation(scope, first.prefix(), 2);
+    let third = operation(scope, second.prefix(), 3);
+    let fourth = operation(scope, third.prefix(), 4);
+    let fifth = operation(scope, fourth.prefix(), 5);
+    prepare(&mut backup, &[first, second, third, fourth]);
+    assert_eq!(backup.snapshot().pending_body_bytes, 64);
+    backup
+        .receive_commit(
+            node(0),
+            Commit {
+                scope,
+                committed: fourth.prefix(),
+            },
+        )
+        .unwrap();
+    let before = backup.snapshot();
+    assert_eq!(
+        backup.prepare(node(0), scope, &[fifth]),
+        Err(ReplicationError::Capacity)
+    );
+    assert_eq!(backup.snapshot(), before);
+}
+
+#[test]
+fn commit_past_the_accepted_prefix_releases_a_full_backup_window() {
+    // The primary committed through the other backup and announces a prefix
+    // this backup has not accepted. Everything accepted here is committed by
+    // that announcement, so the backup applies it and frees its window
+    // instead of waiting for an announcement it can never accept.
+    let scope = config().scope();
+    let mut backup = replica(1, 2, 64);
+    let first = operation(scope, Prefix::GENESIS, 1);
+    let second = operation(scope, first.prefix(), 2);
+    let third = operation(scope, second.prefix(), 3);
+    let ticket = prepare(&mut backup, &[first, second]);
+    backup.complete_durable_write(ticket).unwrap();
+    let ahead = Commit {
+        scope,
+        committed: Prefix {
+            op: OpNumber(4),
+            digest: Digest::from_bytes([9; 32]),
+        },
+    };
+    assert_eq!(
+        backup.receive_commit(node(0), ahead),
+        Err(ReplicationError::HistoryGap)
+    );
+    assert_eq!(backup.snapshot().committed, second.prefix());
+    backup.apply_through(second.prefix()).unwrap();
+    assert_eq!(backup.snapshot().pending_operations, 0);
+    // The exact announced prefix is still verified once it is accepted.
+    prepare(&mut backup, &[third]);
+    assert_eq!(
+        backup.receive_commit(node(0), ahead),
+        Err(ReplicationError::HistoryGap)
+    );
+    assert_eq!(backup.snapshot().committed, second.prefix());
+}

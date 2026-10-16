@@ -2,8 +2,9 @@
 
 use super::primitives::{Decoder, Encoder, validate_name};
 use crate::operation::{
-    Assign, CreatePartition, OpenProducer, OperationCodecError, OperationLimits, OperationOutput,
-    PartitionPolicy, ProducerResultFloor, Progress, ProgressOwner, RetentionPolicy, Trim,
+    Assign, CreatePartition, DedupWatermark, OpenProducer, OperationCodecError, OperationLimits,
+    OperationOutput, PartitionPolicy, ProducerResultFloor, Progress, ProgressAssignment,
+    ProgressOwner, RetentionPolicy, Trim,
 };
 use ozzy_proto::{
     ConsumerGroupId, ConsumerMemberId, Offset, OperationId, OwnerEpoch, PartitionId,
@@ -15,6 +16,25 @@ const RETENTION_VERSION: u8 = 1;
 const RETENTION_MAX_AGE: u8 = 1 << 0;
 const RETENTION_MAX_BYTES: u8 = 1 << 1;
 const RETENTION_KNOWN_FLAGS: u8 = RETENTION_MAX_AGE | RETENTION_MAX_BYTES;
+
+pub(super) fn encode_dedup_watermark(
+    value: DedupWatermark,
+    encoder: &mut Encoder<'_, impl OperationOutput>,
+) -> Result<(), OperationCodecError> {
+    encoder.id(value.partition.as_bytes())?;
+    encoder.u64(value.owner_epoch.get())?;
+    encoder.u64(value.logical_time)
+}
+
+pub(super) fn decode_dedup_watermark(
+    decoder: &mut Decoder<'_>,
+) -> Result<DedupWatermark, OperationCodecError> {
+    Ok(DedupWatermark {
+        partition: PartitionIncarnation::from_bytes(decoder.id()?),
+        owner_epoch: OwnerEpoch::new(decoder.u64()?),
+        logical_time: decoder.u64()?,
+    })
+}
 
 pub(super) fn encode_create(
     value: &CreatePartition<'_>,
@@ -28,6 +48,7 @@ pub(super) fn encode_create(
     encoder.text(value.topic)?;
     encoder.u32(value.partition_id.get())?;
     encoder.u64(value.owner_epoch.get())?;
+    encoder.u64(value.dedup_window_millis.map_or(0, NonZeroU64::get))?;
     encode_retention(value.retention, encoder)
 }
 
@@ -44,6 +65,7 @@ pub(super) fn decode_create<'a>(
         topic,
         partition_id: PartitionId::new(decoder.u32()?),
         owner_epoch: OwnerEpoch::new(decoder.u64()?),
+        dedup_window_millis: NonZeroU64::new(decoder.u64()?),
         retention: decode_retention(decoder)?,
     })
 }
@@ -77,22 +99,30 @@ pub(super) fn encode_progress(
 ) -> Result<(), OperationCodecError> {
     match value.owner {
         ProgressOwner::Subscription(id) => {
-            if value.assignment_epoch.is_some() {
-                return Err(OperationCodecError::UnexpectedAssignmentEpoch);
+            if value.assignment.is_some() {
+                return Err(OperationCodecError::UnexpectedProgressAssignment);
             }
             encoder.u8(1)?;
             encoder.id(id.as_bytes())?;
         }
         ProgressOwner::ConsumerGroup(id) => {
-            if value.assignment_epoch.is_none() {
-                return Err(OperationCodecError::MissingAssignmentEpoch);
+            if value.assignment.is_none() {
+                return Err(OperationCodecError::MissingProgressAssignment);
             }
             encoder.u8(2)?;
             encoder.id(id.as_bytes())?;
         }
     }
     encoder.id(value.partition.as_bytes())?;
-    encoder.optional_u64(value.assignment_epoch)?;
+    match value.assignment {
+        None => encoder.u8(0)?,
+        Some(assignment) => {
+            // Tag 1 was the incomplete epoch-only fence and is unsupported.
+            encoder.u8(2)?;
+            encoder.u64(assignment.epoch)?;
+            encoder.id(assignment.member.as_bytes())?;
+        }
+    }
     encoder.optional_u64(value.expected_progress.map(Offset::get))?;
     encoder.u64(value.new_progress.get())?;
     encoder.id(value.operation_id.as_bytes())
@@ -105,20 +135,27 @@ pub(super) fn decode_progress(decoder: &mut Decoder<'_>) -> Result<Progress, Ope
         tag => return Err(OperationCodecError::InvalidProgressOwnerTag(tag)),
     };
     let partition = PartitionIncarnation::from_bytes(decoder.id()?);
-    let assignment_epoch = decoder.optional_u64()?;
+    let assignment = match decoder.u8()? {
+        0 => None,
+        2 => Some(ProgressAssignment {
+            epoch: decoder.u64()?,
+            member: ConsumerMemberId::from_bytes(decoder.id()?),
+        }),
+        tag => return Err(OperationCodecError::InvalidOptionTag(tag)),
+    };
     match owner {
-        ProgressOwner::Subscription(_) if assignment_epoch.is_some() => {
-            return Err(OperationCodecError::UnexpectedAssignmentEpoch);
+        ProgressOwner::Subscription(_) if assignment.is_some() => {
+            return Err(OperationCodecError::UnexpectedProgressAssignment);
         }
-        ProgressOwner::ConsumerGroup(_) if assignment_epoch.is_none() => {
-            return Err(OperationCodecError::MissingAssignmentEpoch);
+        ProgressOwner::ConsumerGroup(_) if assignment.is_none() => {
+            return Err(OperationCodecError::MissingProgressAssignment);
         }
         _ => {}
     }
     Ok(Progress {
         owner,
         partition,
-        assignment_epoch,
+        assignment,
         expected_progress: decoder.optional_u64()?.map(Offset::new),
         new_progress: Offset::new(decoder.u64()?),
         operation_id: OperationId::from_bytes(decoder.id()?),
@@ -129,20 +166,29 @@ pub(super) fn encode_assign(
     value: Assign,
     encoder: &mut Encoder<'_, impl OperationOutput>,
 ) -> Result<(), OperationCodecError> {
+    encoder.u8(2)?;
     encoder.id(value.consumer_group_id.as_bytes())?;
     encoder.id(value.partition.as_bytes())?;
     encoder.u64(value.expected_assignment_epoch)?;
     encoder.u64(value.new_assignment_epoch)?;
+    encoder.u64(value.plan_revision)?;
+    encoder.u64(value.resume_cursor.get())?;
     encoder.optional_id(value.new_member.map(|id| *id.as_bytes()))?;
     encoder.id(value.operation_id.as_bytes())
 }
 
 pub(super) fn decode_assign(decoder: &mut Decoder<'_>) -> Result<Assign, OperationCodecError> {
+    let format = decoder.u8()?;
+    if format != 2 {
+        return Err(OperationCodecError::UnsupportedAssignmentFormat(format));
+    }
     Ok(Assign {
         consumer_group_id: ConsumerGroupId::from_bytes(decoder.id()?),
         partition: PartitionIncarnation::from_bytes(decoder.id()?),
         expected_assignment_epoch: decoder.u64()?,
         new_assignment_epoch: decoder.u64()?,
+        plan_revision: decoder.u64()?,
+        resume_cursor: Offset::new(decoder.u64()?),
         new_member: decoder.optional_id()?.map(ConsumerMemberId::from_bytes),
         operation_id: OperationId::from_bytes(decoder.id()?),
     })

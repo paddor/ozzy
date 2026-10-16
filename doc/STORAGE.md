@@ -32,7 +32,76 @@ partition offsets, append timestamps, canonical operation numbers, and digests.
 Producer sequences/epochs are independent per partition; interleaved producers
 share offsets. Exact sequence-to-offset retry ranges survive checkpoints and
 leader changes. Ranges merge only when both sequences and offsets are adjacent.
-Expired results fail explicitly; message ID alone is no deduplication key.
+Expired results fail explicitly. Producer retries use epochs and sequences;
+optional topic deduplication uses nonzero message IDs within its fixed window.
+
+Resolved attempts keep stored/duplicate dispositions separately from record
+offsets. Duplicate retries reference their fingerprint operation; checkpoints
+preserve that reference and logical acceptance time. Retention confirms producer
+result floors before deleting either payload bytes or duplicate proof operations.
+
+All-unique proposals preserve the SDK's compressed block; mixed proposals decode
+once, retain survivors, and adaptively repack them. All-duplicate proposals store
+only outcomes and retry fingerprints. An accepted-only original defers the bounded
+request until application proves its confirmation; the owner then reclassifies it.
+Other producers keep admitting meanwhile. That producer's later requests queue
+behind the deferred one, so its sequences still validate in arrival order.
+Unadmitted validation retains the complete input, including overlapping retry
+prefixes, so cancellation or a stale image cannot consume identities or sequences.
+
+`DedupWatermark` (kind 11) advances idle logical time without records: partition
+incarnation (16 bytes), owner epoch, and logical milliseconds. Integers are
+big-endian `u64`. Internal watermarks use their canonical operation number and
+strictly increasing time, with no client retry identity or control-index claim.
+The owner fence must match and time
+must advance. Only canonical commitment makes expiry eligible; discarded
+accepted watermarks change no confirmed dedup state.
+
+A full identity index holds unique requests in their existing bounded arenas.
+Idle maintenance continues while those requests wait, proposing a watermark only
+when the oldest confirmed identity reaches its window. Once a retention turn
+finds expirable identities, further bounded expiry steps run between foreground
+turns without waiting for a settled journal; record retention and checkpoint
+retirement still wait for one. A settled turn runs one expiry step, then record
+retention, so continuous expiry cannot starve it. Bounded cleanup and
+confirmation progress trigger reclassification; live identities are never evicted.
+Followers apply confirmed logical time before admitting replacement identities.
+A follower that runs out of identity capacity while it still holds accepted,
+unapplied operations defers validating its staged suffix until it applies more:
+the leader freed that capacity at a commit the follower has not applied or not
+yet learned of. With nothing left to apply, the error still fails the partition.
+
+Canonical `Progress` stores the exclusive next processing offset. It may equal
+the end, including zero for an empty partition. Every replica validates it, and
+an initial `Assign` cursor, against the records ordered before it, never against
+its own commit watermark; a commit covering the operation covers those records.
+Leaders admit only cursors over confirmed records. Checkpoints preserve
+assignment fences.
+Group progress carries both the source assignment epoch and its member ID;
+revoked assignments and mismatched members cannot advance the cursor.
+`Assign` persists the initial cursor before any acknowledgment. Handoffs capture
+the exact accepted progress and advance both the source epoch and coordinator
+plan revision. The source allocates the epoch and fills the expected fence and
+captured cursor from its accepted image; clients supply only the plan revision,
+member, and the group's creation selector. Later progress leaves the captured
+start unchanged. Retention never replaces an existing group's cursor, even before
+its first acknowledgment. Covered updates wait for that prefix to confirm; queries
+expose only confirmed progress. An expired resume cursor returns
+`HistoryExpired`, with no reset to retention.
+
+`GroupPlan` (kind 12) persists one coordinator image on the group's coordinator
+partition: coordinator and group incarnations, name, expected and new revision,
+creation selector, members sorted by ID (member, node, join identity), and one
+target per topic partition in numeric order (partition, last changing revision,
+desired member, prior member). A revision supersedes the previous image whether
+or not every source confirmed it; sources fence older revisions themselves.
+Checkpoints carry each image as its canonical body, prefixed by a `u32` length.
+`GroupDelete` (kind 13) retires one image: format `u8=1`, coordinator and group
+incarnations, the committed revision it retires, and an operation ID. It applies
+only at exactly that revision, removes the image and its member and source
+counts, and frees the name; a later plan with that name has a new incarnation.
+Sources are revoked first with an `Assign` naming no member at plan revision
+`u64::MAX`, so the retired incarnation keeps one fenced assignment per source.
 
 ### Canonical APPEND body
 
@@ -70,6 +139,12 @@ retained identities. Stale validation returns to intact SDK retry bytes.
 Validated body proofs retain record/part/decoded-byte totals. Live admission and
 storage reuse those immutable proofs; recovery validates physical bytes anew.
 Exact schema: [operation codec](../ozzy-journal/src/operation.rs).
+
+`ResolvedAppend` (kind 10) contains exactly one batch, then logical time `u64`,
+attempt count `u32`, run count `u32`, 13-byte outcome runs, and one 32-byte
+BLAKE3 fingerprint per duplicate. Stored outcomes consume offsets; every attempt
+consumes a producer sequence. An all-duplicate batch has a zero record count and
+no descriptors or payload. Ordinary APPEND still requires nonempty batches.
 
 ## Segment layout
 
@@ -268,6 +343,67 @@ subscription cursors alone do not.
 
 ### Checkpoints and deletion
 
+Streaming builds pin a published committed source and accept bounded fragments
+through backend jobs, keeping one chunk open. Journal intake can continue between
+fragments. Failed or canceled builders cannot select themselves. Installation
+checks the captured position and source lineage before selecting the artifact.
+Sequential reads retain one handle and hash bounded fragments. Decoded recovery
+state stays private until every chunk and the complete state digest match.
+
+Canonical checkpoint images start with a 104-byte `OZYCIMG\0` header: version
+`u16` (1), six zero bytes, core snapshot length `u64`, partition incarnation
+(16 bytes), and an identity header (64 bytes). The last 80 bytes are zero when
+there is no identity section. Bounded core metadata follows, then identity rows;
+decoding retains no second identity byte image. Bare snapshots are rejected.
+
+Dedup index images stream separately from canonical metadata. Their 64-byte
+header contains `OZYDIDX\0`, version `u16`, six zero bytes, then six `u64` values:
+canonical operation, logical time, window, first live offset, exclusive record
+end, and row count. Each 32-byte row contains message ID, offset, and logical
+acceptance time. Integers are big-endian; enclosing checkpoint chunks supply
+integrity and partition authority.
+
+Capture includes only live confirmed identities. Encoding freezes expiry, with
+bounded new-identity capacity, without copying the index. Restore checks policy,
+offset order, unique IDs, and the time window before exposing the complete image.
+An invalid or incomplete image supplies no admission state.
+
+Partition creation fixes the optional dedup window in log milliseconds; zero in
+the encoded `u64` disables deduplication. Deployment identity and canonical
+snapshot format 6 retain that window and the coordinator group images. A changed window requires a new incarnation;
+index capacity changes do not change it. Earlier snapshot formats are rejected.
+
+The identity index belongs to the journal owner, outside cloned core images.
+Validation reserves nothing; canonical acceptance installs stored identities and
+confirmation advances their boundary. Duplicate attempts never refresh IDs.
+Recovery must restore the matching identity image before admission; canonical
+state alone cannot authorize an empty index or retirement of its source history.
+All three modes preserve live IDs after payload retirement. Cluster checkpoint
+transfer adopts the identity section before ordinary new-view activation.
+Verified checkpoint ranges hash the whole physical chunk with bounded I/O scratch
+and retain only the requested bytes, including when those bytes are near a chunk edge.
+Sequential cluster transfer retains one chunk handle and reads each byte once.
+Prefix fragments stay private until the receiver verifies the complete image.
+Broker checkpoint capacity includes every configured dedup entry. Physical chunk
+size grows to fit bounded directory metadata; I/O fragments remain at most 64 KiB.
+
+Runtime checkpoint retirement starts in a settled turn, with accepted,
+committed, and applied prefixes equal. That turn publishes the committed
+position, captures the confirmed state, copies every live confirmed identity
+row, and captures the sealed prefix to retire. A job then encodes, writes, and
+reads back the checkpoint, revalidates a reused selection, and checks the prefix
+against the committed floors while the partition keeps admitting. A segment
+this owner rolled is checked from the record ends its read index held at roll,
+bound to the segment's exact digest and operation range. Only segments sealed
+before the owner opened are read and validated. Between writes, one owner
+step revalidates authority files and publishes the checkpoint selection and
+prefix retirement in one manifest. A view change abandons unfinished work; its
+files become unselected leftovers. Selecting a position the current manifest
+already publishes as committed needs no lineage rescan: installation validated
+it, and no later change truncates a committed prefix. After a crash, a retry
+whose confirmation was lost while the job ran resolves to its original offset
+from the checkpoint plus the replayed suffix.
+
 Configured retention changes become canonical `PartitionPolicy` operations.
 Confirmation waits for application. Checkpoints contain state, producer
 coordinates, retry floors, and original committed op/digest, never payloads.
@@ -279,24 +415,52 @@ may reuse only the exact settled checkpoint position/digest, revalidating author
 files, and protected floors. Surviving predecessor digests are never renumbered.
 Expired readers receive explicit gaps.
 
+Planning uses each sealed segment's record end and newest append time. A roll
+takes them from the segment's read index; only segments sealed before the owner
+opened are scanned, one per turn. Both count only batches that stored records,
+as the active segment's read index does.
+
 Eligible retention debt continues in bounded turns with a foreground turn between
 steps. The periodic interval applies after catching up, not between retirements.
 Maintenance waits for partition creation before deciding whether retention is disabled.
 
-Retirement preserves the exact settled application state and refreshes identity
-coverage. Each owner validates sealed index sources once; reuse checks the index
-checksum/source binding. Reopen, explicit repair and scrub validate physical bytes.
+Retirement never changes application state. Its installation narrows the
+committed and any speculative identity coverage to the retained history without
+reading files: retired sources, their deletion protection, and overlay claims
+before the first retained segment leave.
+When every captured source retired, coverage re-anchors at the predecessor that
+the first retained segment binds; lineage checks accept that anchor. New control
+identities wait in a bounded overlay. Validation reserves
+overlay capacity only for operation kinds that claim an identity; record
+batches, partition creation, durable progress, and dedup watermarks claim none.
+Progress retries resolve by their cumulative cursor and assignment fence. The settled
+refresh stops admission while it indexes the active segment, so background
+refresh waits until the overlay is half full. A full overlay drains intake until that refresh
+runs. Each owner validates sealed index sources once; reuse checks the index
+checksum/source binding. Built snapshots of the active segment resume after the
+last validated group and sort and merge only appended entries. Reopen, explicit
+repair and scrub validate physical bytes.
+Index format 3 includes a dense 56-byte selector for every canonical operation,
+including payload-free duplicate results. Numeric lookup selects one source and
+revalidates the operation's physical framing and logical digest before use.
 
 Age uses maximum segment append time; backward clocks cannot prematurely expire
 newer records. An aged active segment rolls first. Byte targets include active
-and sealed capacities per partition/broker. Each settled turn also reclaims up
-to eight unselected objects/class, even below retention limits. Cleanup changes
-no record/retry floors and preserves selection/pins.
+and sealed capacities per partition/broker. Settled turns also reclaim up to
+eight unselected objects/class, even below retention limits, after each manifest
+publication, while removable objects remain, or once a pinned one is released.
+Cleanup changes no record/retry floors and preserves selection/pins.
 
 Recovery transfers checkpoint state, required retained operations, and full
 accepted suffix. Schema/digest/anchor/chain and destination publication all
 validate before voting. Quarantine builds fresh private state; old files remain
 for inspection until normal bounded cleanup.
+
+Checkpoint reception writes bounded fragments into a private staging file.
+Metadata and identity limits apply before allocation; canceled writes fence the
+attempt. Adoption preserves the original image and rechecks its digest while
+streaming into destination checkpoint chunks. Unselected input authorizes neither
+voting nor admission; reopen cleans abandoned staging after physical jobs finish.
 
 ### Bounded maintenance
 

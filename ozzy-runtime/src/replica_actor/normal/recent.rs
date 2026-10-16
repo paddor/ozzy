@@ -16,6 +16,7 @@ pub(super) struct Entry {
     pub end: Prefix,
     pub operations: usize,
     pub retained_bytes: usize,
+    pub control: bool,
     pub packets: [Option<Message>; 3],
 }
 
@@ -49,6 +50,16 @@ impl Recent {
         // Transport slabs can exceed the visible payload. Cache admission must
         // charge the backing once, and let oversized packets fall back to disk.
         if entry.retained_bytes > self.limits.max_body_bytes {
+            event(Event::ReplayCacheOversizedBypass);
+            self.clear();
+            return;
+        }
+        // Control arenas are independently bounded and shared by all shard
+        // partitions. Control-bearing packets must not stay in this optional
+        // cache, even when only one arena is configured. Clear the older prefix
+        // as well: cached repair ranges must remain contiguous.
+        if entry.control {
+            event(Event::ReplayCacheControlBypass);
             self.clear();
             return;
         }
@@ -64,6 +75,7 @@ impl Recent {
             || entry.retained_bytes > self.limits.max_body_bytes - self.retained_bytes
         {
             let oldest = self.entries.pop_front().expect("nonempty overfull cache");
+            event(Event::ReplayCacheCapacityEviction);
             self.operations -= oldest.operations;
             self.retained_bytes -= oldest.retained_bytes;
         }

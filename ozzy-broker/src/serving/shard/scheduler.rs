@@ -182,7 +182,7 @@ impl State {
                 .bind_receive_owner(&self.replica_memory)
                 .map_err(failure)?;
             actor.enable_publication();
-            let (bootstrap, native) = super::build::recovered_services(
+            let (bootstrap, native, coordinator) = super::build::recovered_services(
                 actor,
                 plan,
                 &self.config,
@@ -193,12 +193,15 @@ impl State {
                 .install_native(native, binding.links.clone())
                 .map_err(failure)?;
             self.actors
+                .install_coordinator(coordinator, binding.links.clone())
+                .map_err(failure)?;
+            self.actors
                 .install_readers(
                     group,
                     ozzy_runtime::replica_actor::SharedReaderConfig {
                         partition: plan.incarnation,
                         limits: self.config.limits,
-                        subscriptions: super::CLIENTS,
+                        subscriptions: self.config.clients,
                     },
                     binding.links.clone(),
                 )
@@ -206,6 +209,13 @@ impl State {
             self.bootstrap[index] = Some(bootstrap);
         }
         Ok(())
+    }
+
+    /// Every local partition accepts client work here or knows its remote leader.
+    pub(super) fn serving(&self) -> bool {
+        self.identities
+            .iter()
+            .all(|&(group, partition)| self.client_ready(group, partition))
     }
 
     fn client_ready(&self, group: GroupId, partition: ozzy_proto::PartitionIncarnation) -> bool {

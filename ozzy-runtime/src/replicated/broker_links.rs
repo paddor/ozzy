@@ -8,7 +8,9 @@ use std::{
 
 use bytes::Bytes;
 use omq_tokio::{Endpoint, IdentitySocket, SocketType};
-use ozzy_proto::{LinkSessionId, NodeId, RequestId, append::Policy, handshake, producer};
+use ozzy_proto::{
+    LinkSessionId, NodeId, RequestId, append::Policy, group, handshake, producer, progress,
+};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
 use super::WriterRuntime;
@@ -51,7 +53,7 @@ pub struct BrokerLinksConfig {
     /// Shared negotiation profile for writer and reader commands.
     pub parameters: handshake::Parameters,
     /// Aggregate control-frame slots, including unread raw reply aliases.
-    /// Decoded subscription completions use the reader reservation instead.
+    /// Decoded reader/processing completions use their owner reservation instead.
     pub requests: usize,
     /// Aggregate control storage, including unused slots and encoding scratch.
     pub control_bytes: usize,
@@ -164,8 +166,7 @@ impl BrokerLinks {
         config.clock.bind_owner(runtime.driver().clone());
         let sdk = runtime.clone();
         runtime
-            .driver()
-            .spawn(async move {
+            .on_owner(move || async move {
                 let shared = Arc::new(Shared {
                     local: config.local,
                     sessions: LinkSessions::with_ids(
@@ -252,7 +253,7 @@ impl BrokerLinks {
                     shared,
                     runtime: sdk,
                 }));
-                tokio::spawn(driver.run());
+                tokio::task::spawn_local(driver.run());
                 for driver in publication_drivers {
                     tokio::spawn(driver.run());
                 }
@@ -368,6 +369,147 @@ impl BrokerLinks {
             return Err(BrokerLinkError::Response);
         }
         Ok(opened)
+    }
+
+    /// Query or advance one assigned source's durable processing cursor. The
+    /// source validates the member/epoch and its configured confirmation policy.
+    /// Retry uncertain updates cumulatively; transport receipt confirms nothing.
+    pub async fn group_progress(
+        &self,
+        broker: NodeId,
+        request: progress::Request,
+    ) -> Result<progress::Confirmed, BrokerLinkError> {
+        let deadline = self
+            .clock()
+            .now()
+            .saturating_add(self.0.config.request_timeout);
+        self.group_progress_until(broker, request, deadline).await
+    }
+
+    pub(in crate::replicated) fn require_progress(&self) -> Result<(), BrokerLinkError> {
+        if self.0.config.parameters.roles & handshake::CONSUMER == 0
+            || self.0.config.parameters.required_capabilities & handshake::OWNER_PROGRESS == 0
+        {
+            return Err(BrokerLinkError::Configuration);
+        }
+        Ok(())
+    }
+
+    pub(in crate::replicated) async fn group_progress_until(
+        &self,
+        broker: NodeId,
+        request: progress::Request,
+        deadline: Duration,
+    ) -> Result<progress::Confirmed, BrokerLinkError> {
+        self.require_progress()?;
+        match self
+            .request_until(broker, driver::Body::Progress(request), deadline)
+            .await?
+        {
+            driver::Reply::Progress(confirmed) => Ok(confirmed),
+            _ => Err(BrokerLinkError::Response),
+        }
+    }
+
+    pub(in crate::replicated) fn require_groups(&self) -> Result<(), BrokerLinkError> {
+        self.require_progress()?;
+        if self.0.config.parameters.required_capabilities & handshake::OWNER_GROUPS == 0 {
+            return Err(BrokerLinkError::Configuration);
+        }
+        Ok(())
+    }
+
+    /// Relay one committed coordinator target to its source leader. The source
+    /// allocates the epoch and captures the resume cursor; a repeated plan
+    /// revision returns the original activation.
+    pub async fn group_assign(
+        &self,
+        broker: NodeId,
+        request: group::AssignRequest,
+    ) -> Result<group::AssignReply, BrokerLinkError> {
+        let deadline = self
+            .clock()
+            .now()
+            .saturating_add(self.0.config.request_timeout);
+        self.group_assign_until(broker, request, deadline).await
+    }
+
+    pub(in crate::replicated) async fn group_assign_until(
+        &self,
+        broker: NodeId,
+        request: group::AssignRequest,
+        deadline: Duration,
+    ) -> Result<group::AssignReply, BrokerLinkError> {
+        self.require_groups()?;
+        match self
+            .request_until(broker, driver::Body::Assign(request), deadline)
+            .await?
+        {
+            driver::Reply::Assigned(reply) => Ok(reply),
+            _ => Err(BrokerLinkError::Response),
+        }
+    }
+
+    /// Join, heartbeat, or leave on the group's coordinator leader. The reply
+    /// describes committed intent; sources confirm activation separately.
+    pub async fn group_join(
+        &self,
+        broker: NodeId,
+        request: group::JoinRequest,
+    ) -> Result<group::JoinReply, BrokerLinkError> {
+        let deadline = self
+            .clock()
+            .now()
+            .saturating_add(self.0.config.request_timeout);
+        self.group_join_until(broker, request, deadline).await
+    }
+
+    pub(in crate::replicated) async fn group_join_until(
+        &self,
+        broker: NodeId,
+        request: group::JoinRequest,
+        deadline: Duration,
+    ) -> Result<group::JoinReply, BrokerLinkError> {
+        self.require_groups()?;
+        match self
+            .request_until(broker, driver::Body::Join(Box::new(request)), deadline)
+            .await?
+        {
+            driver::Reply::Joined(reply) => Ok(reply),
+            _ => Err(BrokerLinkError::Response),
+        }
+    }
+
+    pub(in crate::replicated) async fn group_inspect_until(
+        &self,
+        broker: NodeId,
+        request: group::InspectRequest,
+        deadline: Duration,
+    ) -> Result<group::Inspection, BrokerLinkError> {
+        self.require_groups()?;
+        match self
+            .request_until(broker, driver::Body::Inspect(Box::new(request)), deadline)
+            .await?
+        {
+            driver::Reply::Inspected(reply) => Ok(*reply),
+            _ => Err(BrokerLinkError::Response),
+        }
+    }
+
+    pub(in crate::replicated) async fn group_delete_until(
+        &self,
+        broker: NodeId,
+        request: group::DeleteRequest,
+        deadline: Duration,
+    ) -> Result<group::DeleteReply, BrokerLinkError> {
+        self.require_groups()?;
+        match self
+            .request_until(broker, driver::Body::Delete(Box::new(request)), deadline)
+            .await?
+        {
+            driver::Reply::Deleted(reply) => Ok(reply),
+            _ => Err(BrokerLinkError::Response),
+        }
     }
 
     async fn request(
@@ -518,21 +660,26 @@ fn validate(config: &BrokerLinksConfig) -> Result<usize, BrokerLinkError> {
             broker.node == config.local
                 || broker.node.as_bytes() == &[0; 16]
                 || !unique.insert(broker.node)
-                || !matches!(
-                    broker.endpoint,
-                    Endpoint::Tcp { .. } | Endpoint::Ipc(_) | Endpoint::Inproc { .. }
-                )
+                || !supported(&broker.endpoint)
                 || broker.data_endpoint == broker.endpoint
-                || !matches!(
-                    broker.data_endpoint,
-                    Endpoint::Tcp { .. } | Endpoint::Ipc(_) | Endpoint::Inproc { .. }
-                )
+                || !supported(&broker.data_endpoint)
         })
     {
         return Err(BrokerLinkError::Configuration);
     }
     readers::Registry::capacity(config)?;
     Ok(slots)
+}
+
+fn supported(endpoint: &Endpoint) -> bool {
+    match endpoint {
+        Endpoint::Tcp { .. } | Endpoint::Ipc(_) | Endpoint::Inproc { .. } => true,
+        #[cfg(feature = "lz4-transport")]
+        Endpoint::Lz4Tcp { .. } => true,
+        #[cfg(feature = "zstd-transport")]
+        Endpoint::ZstdTcp { .. } => true,
+        _ => false,
+    }
 }
 
 fn control_sizes(config: &BrokerLinksConfig) -> Option<(usize, usize)> {
@@ -556,6 +703,9 @@ fn control_sizes(config: &BrokerLinksConfig) -> Option<(usize, usize)> {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum BrokerLinkError {
+    /// Durable processing assignment was fenced or its resume history expired.
+    #[error(transparent)]
+    Progress(#[from] super::ProgressError),
     /// Missing or ambiguous record ID in the broker's retained history.
     #[error(transparent)]
     Seek(#[from] ozzy_core::reader::seek::SeekError),
@@ -565,6 +715,9 @@ pub enum BrokerLinkError {
         /// First currently retained record offset.
         earliest: ozzy_proto::Offset,
     },
+    /// A group creation offset lies outside the source's confirmed retained history.
+    #[error("group start {0:?} is outside confirmed retained history")]
+    InitialPosition(group::InitialPosition),
     /// Invalid identity, profile, address set, or aggregate bounds.
     #[error("invalid SDK broker link configuration")]
     Configuration,

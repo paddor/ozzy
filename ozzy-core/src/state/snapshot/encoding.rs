@@ -33,15 +33,19 @@ pub(super) async fn encode(
         step,
     )
     .await;
-
-    let mut partition_bytes = 0_usize;
-    for (_, value) in &partitions {
-        validate_name(&value.address.stream, limits)?;
-        validate_name(&value.address.topic, limits)?;
-        partition_bytes = partition_bytes
-            .checked_add(partition::partition_bytes(value, step).await?)
+    let groups = sorted(
+        state.groups.iter(),
+        |(left, _), (right, _)| left.cmp(right),
+        step,
+    )
+    .await;
+    let mut group_bytes = 0usize;
+    for (_, group) in &groups {
+        group_bytes = group_bytes
+            .checked_add(super::groups::size_cooperative(group, limits, step).await?)
             .ok_or(StateSnapshotError::LengthOverflow)?;
     }
+    let partition_bytes = partition_size(state, limits, step).await?;
     let progress_bytes = progress
         .len()
         .checked_mul(PROGRESS_BYTES)
@@ -53,6 +57,7 @@ pub(super) async fn encode(
     let body_bytes = partition_bytes
         .checked_add(progress_bytes)
         .and_then(|value| value.checked_add(assignment_bytes))
+        .and_then(|value| value.checked_add(group_bytes))
         .ok_or(StateSnapshotError::LengthOverflow)?;
     let total_bytes = STATE_SNAPSHOT_HEADER_BYTES
         .checked_add(body_bytes)
@@ -63,27 +68,30 @@ pub(super) async fn encode(
         limits.max_snapshot_bytes,
     )?;
 
-    let mut output = Vec::with_capacity(total_bytes);
-    while output.len() < total_bytes {
-        let bytes = (total_bytes - output.len()).min(64 * 1024);
-        output.resize(output.len() + bytes, 0);
-        step(bytes).await;
-    }
-    output[..8].copy_from_slice(SNAPSHOT_MAGIC);
-    put_u16(&mut output, 8, SNAPSHOT_VERSION);
-    put_u16(&mut output, 10, STATE_SNAPSHOT_HEADER_BYTES as u16);
-    put_u64(&mut output, 16, usize_to_u64(total_bytes)?);
-    put_u64(&mut output, 24, state.revision);
-    put_u32(&mut output, 32, usize_to_u32(partitions.len())?);
-    put_u32(&mut output, 36, usize_to_u32(progress.len())?);
-    put_u32(&mut output, 40, usize_to_u32(assignments.len())?);
-    put_u64(&mut output, 48, usize_to_u64(body_bytes)?);
-    put_u64(&mut output, 88, usize_to_u64(state.producer_count)?);
-    put_u64(&mut output, 96, usize_to_u64(state.retry_span_count)?);
+    let mut output = zeroed(total_bytes, step).await;
+    header(
+        &mut output,
+        state,
+        [
+            partitions.len(),
+            progress.len(),
+            assignments.len(),
+            groups.len(),
+        ],
+        body_bytes,
+    )?;
 
     let mut cursor = STATE_SNAPSHOT_HEADER_BYTES;
     for (partition, value) in partitions {
-        cursor = partition::encode_partition(&mut output, cursor, *partition, value, step).await?;
+        cursor = partition::encode_partition(
+            &mut output,
+            cursor,
+            *partition,
+            value,
+            state.revision,
+            step,
+        )
+        .await?;
     }
     for (key, offset) in progress {
         encode_progress(&mut output[cursor..cursor + PROGRESS_BYTES], key, *offset);
@@ -94,6 +102,9 @@ pub(super) async fn encode(
         encode_assignment(&mut output[cursor..cursor + ASSIGNMENT_BYTES], *key, *value);
         cursor += ASSIGNMENT_BYTES;
         step(ASSIGNMENT_BYTES).await;
+    }
+    for (_, group) in groups {
+        cursor = super::groups::encode(&mut output, cursor, group, limits, step).await?;
     }
     debug_assert_eq!(cursor, output.len());
     let digest = snapshot_digest_cooperative(&output, step).await;
@@ -113,4 +124,54 @@ pub(super) async fn sorted<T>(
     }
     ozzy_journal::work::sort_by(&mut entries, compare, step).await;
     entries
+}
+
+async fn zeroed(bytes: usize, step: &mut impl AsyncFnMut(usize)) -> Vec<u8> {
+    let mut output = Vec::with_capacity(bytes);
+    while output.len() < bytes {
+        let chunk = (bytes - output.len()).min(64 * 1024);
+        output.resize(output.len() + chunk, 0);
+        step(chunk).await;
+    }
+    output
+}
+
+fn header(
+    output: &mut [u8],
+    state: &CanonicalState,
+    counts: [usize; 4],
+    body_bytes: usize,
+) -> Result<(), StateSnapshotError> {
+    output[..8].copy_from_slice(SNAPSHOT_MAGIC);
+    put_u16(output, 8, SNAPSHOT_VERSION);
+    put_u16(output, 10, STATE_SNAPSHOT_HEADER_BYTES as u16);
+    put_u64(output, 16, usize_to_u64(output.len())?);
+    put_u64(output, 24, state.revision);
+    put_u32(output, 32, usize_to_u32(counts[0])?);
+    put_u32(output, 36, usize_to_u32(counts[1])?);
+    put_u32(output, 40, usize_to_u32(counts[2])?);
+    put_u64(output, 48, usize_to_u64(body_bytes)?);
+    put_u64(output, 88, usize_to_u64(state.producer_count)?);
+    put_u64(output, 96, usize_to_u64(state.retry_span_count)?);
+    put_u32(output, 104, usize_to_u32(counts[3])?);
+    put_u64(output, 108, usize_to_u64(state.group_member_count)?);
+    put_u64(output, 116, usize_to_u64(state.group_target_count)?);
+
+    Ok(())
+}
+
+async fn partition_size(
+    state: &CanonicalState,
+    limits: StateSnapshotLimits,
+    step: &mut impl AsyncFnMut(usize),
+) -> Result<usize, StateSnapshotError> {
+    let mut partition_bytes = 0_usize;
+    for value in state.partitions.values() {
+        validate_name(&value.address.stream, limits)?;
+        validate_name(&value.address.topic, limits)?;
+        partition_bytes = partition_bytes
+            .checked_add(partition::partition_bytes(value, step).await?)
+            .ok_or(StateSnapshotError::LengthOverflow)?;
+    }
+    Ok(partition_bytes)
 }

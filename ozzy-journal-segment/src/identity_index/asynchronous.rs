@@ -8,7 +8,9 @@ use ozzy_core::state::{
 };
 use thiserror::Error;
 
-use crate::{AsyncJournalIndexSnapshot, JournalIdentityHandoffError, JournalIndexError};
+use crate::{
+    AsyncJournalIndexSnapshot, JournalIdentityHandoffError, JournalIndexError, SegmentReference,
+};
 
 /// One immutable persistent prefix, bounded resolved lookups, and bounded new
 /// claims. Clones share immutable files, not overlays or resolved-key sets.
@@ -70,6 +72,22 @@ impl Index {
         }
         *self.resolved.borrow_mut() = resolved;
         Ok(())
+    }
+
+    /// Drop coverage of history that retirement unreferenced, without reading
+    /// files. `first` is the first segment the journal still selects. Sources,
+    /// their deletion protection, and overlay claims before it leave, so the
+    /// result covers what a snapshot rebuilt over the retained history would.
+    pub fn retire_prefix(&self, first: SegmentReference) -> Result<Self, JournalIndexError> {
+        let snapshot = self.snapshot.retain_from(first)?;
+        let mut overlay = self.overlay.clone();
+        overlay.retain_from(first.first_chain.next_op_number());
+        Ok(Self {
+            snapshot: Rc::new(snapshot),
+            overlay,
+            resolved: RefCell::new(HashMap::new()),
+            lookup_capacity: self.lookup_capacity,
+        })
     }
 
     /// Replace persistent coverage only after exact lineage and every overlay

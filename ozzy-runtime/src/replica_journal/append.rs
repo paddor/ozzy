@@ -1,7 +1,11 @@
 //! Owned, bounded buffers crossing the protocol/storage boundary.
 
+mod assignment;
 mod body;
+pub(in crate::replica_journal) mod dedup;
 mod metadata;
+mod progress;
+pub(in crate::replica_journal) use progress::JoinedProgress;
 mod trim;
 
 use std::ops::Range;
@@ -102,10 +106,19 @@ pub struct AppendBuffer {
     /// Exact results for a single streaming retry, including a fresh suffix.
     /// At most one range per admitted record. Fresh-only proposals use headers.
     pub(super) retry_results: Option<Box<ProducerRetryResults>>,
+    dedup_original: Option<Box<dedup::Original>>,
+    dedup_charge: Option<crate::memory::Charge>,
     validated: bool,
     pub(super) proposal_policy: Option<ozzy_proto::append::Policy>,
     pub(super) proposal_authority: Option<ozzy_proto::append::Authority>,
     pub(super) producer_session: Option<Box<ProducerSession>>,
+    /// The producer of every APPEND entry; none for zero or several producers.
+    producer: Option<ozzy_proto::ProducerId>,
+    pub(super) group_progress: Option<Box<super::progress::Session>>,
+    /// Progress updates joined into this proposal after the first, one per
+    /// later operation.
+    pub(super) progress_riders: Vec<super::progress::Session>,
+    pub(super) group_assignment: Option<Box<super::assignment::Session>>,
     owner_generation: JournalGeneration,
     limits: PipelineLimits,
     entries: Vec<Descriptor>,
@@ -178,6 +191,8 @@ impl AppendBuffer {
     }
 
     pub(super) fn retain(&mut self) -> RetainedAppend {
+        // Canonical acceptance ends the reversible proposal's lifetime.
+        self.dedup_original = None;
         assert_eq!(self.entries.len(), self.body_digests.len());
         let bodies = self.bodies.freeze();
         RetainedAppend {
@@ -238,11 +253,17 @@ impl AppendBuffer {
         Self {
             request_kind: RequestKind::Canonical,
             producer_stream: false,
+            dedup_original: None,
+            dedup_charge: None,
             retry_results: None,
             validated: false,
             proposal_authority: None,
             proposal_policy: None,
             producer_session: None,
+            producer: None,
+            group_progress: None,
+            progress_riders: Vec::new(),
+            group_assignment: None,
             owner_generation,
             limits,
             entries: Vec::with_capacity(limits.max_operations),
@@ -301,6 +322,8 @@ impl AppendBuffer {
     /// Release contents and retain the journal lease. Charged allocations return
     /// to their shared owner cache after the final immutable observer releases them.
     pub fn clear(&mut self) {
+        self.dedup_original = None;
+        self.dedup_charge = None;
         self.request_kind = RequestKind::Canonical;
         self.producer_stream = false;
         self.retry_results = None;
@@ -308,6 +331,10 @@ impl AppendBuffer {
         self.proposal_authority = None;
         self.proposal_policy = None;
         self.producer_session = None;
+        self.producer = None;
+        self.group_progress = None;
+        self.progress_riders.clear();
+        self.group_assignment = None;
         self.entries.clear();
         self.bodies.clear();
         self.prepared.clear();
@@ -446,12 +473,28 @@ impl AppendBuffer {
     ) -> Result<(), JournalError> {
         use ozzy_journal::operation::{Append, OperationBody};
         self.check_producer_entry()?;
+        let producer = batch.producer_id;
         let body = OperationBody::Append(Append {
             batches: vec![batch],
         });
         self.push_typed_body(&body)?;
         self.request_kind = RequestKind::Producer;
+        self.note_producer(producer);
         Ok(())
+    }
+
+    /// Key the buffer by producer after pushing one APPEND entry.
+    fn note_producer(&mut self, producer: ozzy_proto::ProducerId) {
+        self.producer =
+            (self.entries.len() == 1 || self.producer == Some(producer)).then_some(producer);
+    }
+
+    /// The one producer whose open or APPENDs this buffer holds.
+    pub(super) fn producer(&self) -> Option<ozzy_proto::ProducerId> {
+        self.producer_session
+            .as_ref()
+            .map(|session| session.request.producer)
+            .or(self.producer)
     }
 
     pub(super) fn prepare_partition(
@@ -630,6 +673,7 @@ impl AppendBuffer {
             proof: Some(proof),
         });
         self.request_kind = RequestKind::Producer;
+        self.note_producer(request.key.producer_id);
         Ok(())
     }
 
@@ -737,6 +781,7 @@ pub struct ValidatedAppend {
     pub(super) buffer: AppendBuffer,
     pub(super) plan: PreparedCanonicalGroup,
     pub(super) records: Vec<ozzy_journal_segment::PreparedOperationRecords>,
+    pub(super) dedup: Option<Box<super::owned::dedup::Prepared>>,
 }
 
 impl ValidatedAppend {
@@ -767,7 +812,8 @@ impl ValidatedAppend {
     }
 
     /// Discard unadmitted plans and recover the reusable payload arena.
-    pub fn into_buffer(self) -> AppendBuffer {
+    pub fn into_buffer(mut self) -> AppendBuffer {
+        self.buffer.restore_dedup_original();
         self.buffer
     }
 }

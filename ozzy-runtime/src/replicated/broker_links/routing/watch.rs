@@ -132,10 +132,7 @@ impl Watcher {
             if current != Some(entry.session)
                 && entry
                     .state
-                    .cache
-                    .lock()
-                    .expect("SDK route cache poisoned")
-                    .disconnect(self.remote, entry.session)
+                    .update_cache(group, |cache| cache.disconnect(self.remote, entry.session))
             {
                 entry.state.changed.notify_changed();
             }
@@ -262,11 +259,11 @@ impl Watcher {
                 self.timers.remove(&(old.retry_at, group));
             }
             let watch = self.shared.next_request()?;
-            {
-                let mut cache = state.cache.lock().expect("SDK route cache poisoned");
+            state.update_cache(group, |cache| -> Result<(), BrokerLinkError> {
                 cache.bind(self.remote, session)?;
                 cache.register(self.remote, session, watch, &[group])?;
-            }
+                Ok(())
+            })?;
             self.ids.insert(watch, group);
             self.entries.insert(
                 group,
@@ -351,16 +348,13 @@ impl Watcher {
             .entries
             .get_mut(&pending.group)
             .expect("registered watch");
-        entry
-            .state
-            .cache
-            .lock()
-            .expect("SDK route cache poisoned")
-            .resync(
+        entry.state.update_cache(pending.group, |cache| {
+            cache.resync(
                 self.remote,
                 entry.session,
                 directory::Resync { watch: entry.watch },
-            )?;
+            )
+        })?;
         self.timers.remove(&(entry.retry_at, pending.group));
         entry.retry_at = now.saturating_add(self.retry);
         self.timers.insert((entry.retry_at, pending.group));
@@ -416,25 +410,28 @@ impl Watcher {
         if packet.envelope.session != Some(entry.session) {
             return Ok(true);
         }
-        let mut cache = entry.state.cache.lock().expect("SDK route cache poisoned");
-        match packet.envelope.opcode {
-            Opcode::StateUpdate => {
-                cache.update(
-                    self.remote,
-                    entry.session,
-                    directory::decode_update(packet, limits, directory::Limits::default())?,
-                )?;
-            }
-            Opcode::StateResync => {
-                cache.resync(
-                    self.remote,
-                    entry.session,
-                    directory::decode_resync(packet, limits)?,
-                )?;
-            }
-            _ => unreachable!(),
-        }
-        drop(cache);
+        entry
+            .state
+            .update_cache(group, |cache| -> Result<(), BrokerLinkError> {
+                match packet.envelope.opcode {
+                    Opcode::StateUpdate => {
+                        cache.update(
+                            self.remote,
+                            entry.session,
+                            directory::decode_update(packet, limits, directory::Limits::default())?,
+                        )?;
+                    }
+                    Opcode::StateResync => {
+                        cache.resync(
+                            self.remote,
+                            entry.session,
+                            directory::decode_resync(packet, limits)?,
+                        )?;
+                    }
+                    _ => unreachable!(),
+                }
+                Ok(())
+            })?;
         entry.state.changed.notify_changed();
         self.remaining = self
             .shared
@@ -492,12 +489,9 @@ impl Watcher {
         if snapshot.watch != entry.watch {
             return Ok(true);
         }
-        entry
-            .state
-            .cache
-            .lock()
-            .expect("SDK route cache poisoned")
-            .snapshot(self.remote, entry.session, snapshot)?;
+        entry.state.update_cache(pending.group, |cache| {
+            cache.snapshot(self.remote, entry.session, snapshot)
+        })?;
         entry
             .state
             .rejections

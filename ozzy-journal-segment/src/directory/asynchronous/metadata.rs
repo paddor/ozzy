@@ -103,7 +103,12 @@ impl Journal {
         // The writer already validated and synchronized this exact boundary.
         // Publishing its metadata is not another whole-history scrub. Cold
         // positions still require the physical lineage validation below.
-        if positions.iter().all(|position| *position == durable) {
+        // The selected committed position was validated when its manifest
+        // was installed, and no later change truncates a committed prefix.
+        if positions
+            .iter()
+            .all(|position| *position == durable || *position == self.manifest.committed)
+        {
             return Ok(());
         }
         if let Some(position) = positions

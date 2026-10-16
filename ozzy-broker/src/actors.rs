@@ -78,6 +78,9 @@ pub(crate) fn prepare_partition(
             topic: &placement.topic,
             partition_id: PartitionId::new(placement.partition),
             owner_epoch: OwnerEpoch::INITIAL,
+            dedup_window_millis: placement
+                .deduplication
+                .and_then(|policy| std::num::NonZeroU64::new(policy.window_millis)),
             retention: RetentionPolicy {
                 max_age_millis: placement
                     .retention
@@ -113,7 +116,7 @@ impl ActorSettings {
             return Ok(Self::Local(LocalActorConfig {
                 retention_interval,
                 journal,
-                proposal_lanes: 2,
+                proposal_lanes: 3,
                 proposal_capacity: config.append_limits.max_operations,
                 turn_steps: 16,
             }));
@@ -174,7 +177,7 @@ impl ActorSettings {
                 transfer,
                 sync_batch_target: SyncBatchTarget::half_window(pipeline),
                 sync_batch_max_age: Duration::from_millis(1),
-                proposal_lanes: 2,
+                proposal_lanes: 3,
                 proposal_capacity: pipeline.max_operations,
                 control: QueueLimits {
                     messages: 8,

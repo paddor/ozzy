@@ -47,6 +47,7 @@ fn create() -> OperationBody<'static> {
         topic: "topic",
         partition_id: PartitionId::ZERO,
         owner_epoch: OwnerEpoch::INITIAL,
+        dedup_window_millis: None,
         retention: RetentionPolicy::default(),
     })
 }
@@ -108,7 +109,7 @@ fn apply_body(
     body: &OperationBody<'_>,
 ) {
     let plan = state
-        .prepare(state.revision() + 1, body, identities, state)
+        .prepare(state.revision() + 1, body, identities)
         .unwrap();
     state.apply(plan, identities).unwrap();
 }
@@ -246,7 +247,7 @@ fn candidate_activation_requires_published_whole_tail_and_unchanged_view() {
 
 #[test]
 fn private_replay_handles_lagging_commit_marker_but_rejects_progress_beyond_prefix() {
-    for progress_offset in [0, 1] {
+    for progress_offset in [0, 1, 2] {
         let temporary = tempfile::Builder::new()
             .prefix(".canonical-recovery-")
             .tempdir_in(env!("CARGO_MANIFEST_DIR"))
@@ -263,7 +264,7 @@ fn private_replay_handles_lagging_commit_marker_but_rejects_progress_beyond_pref
             owner,
             expected_progress: None,
             new_progress: Offset::new(progress_offset),
-            assignment_epoch: None,
+            assignment: None,
             operation_id: OperationId::from_bytes([0x65; 16]),
         });
         chain = append_body(&mut journal, chain, &body);
@@ -272,11 +273,11 @@ fn private_replay_handles_lagging_commit_marker_but_rejects_progress_beyond_pref
             retained_identities: 1,
             ..CanonicalRecoveryLimits::default()
         });
-        if progress_offset == 1 {
+        if progress_offset == 2 {
             assert!(matches!(
                 recovered,
                 Err(CanonicalStateRecoveryError::Images(
-                    CanonicalImagesError::State(StateError::ProgressBeyondCommit)
+                    CanonicalImagesError::State(StateError::ProgressBeyondRecords)
                 ))
             ));
             assert_eq!(journal.committed_position().unwrap(), LogPosition::GENESIS);
@@ -293,7 +294,7 @@ fn private_replay_handles_lagging_commit_marker_but_rejects_progress_beyond_pref
             let images = candidate.activate(&journal).unwrap();
             assert_eq!(
                 images.committed().progress(owner, partition()),
-                Some(Offset::ZERO)
+                Some(Offset::new(progress_offset))
             );
         }
     }

@@ -44,6 +44,7 @@ fn async_suffix_splits_only_at_operation_boundaries_and_obeys_decoded_segment_li
                         topic: &name,
                         partition_id: PartitionId::new(u32::from(id)),
                         owner_epoch: OwnerEpoch::INITIAL,
+                        dedup_window_millis: None,
                         retention: RetentionPolicy::default(),
                     }),
                     bounds.operations,

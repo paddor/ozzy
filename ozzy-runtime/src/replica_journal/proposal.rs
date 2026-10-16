@@ -201,6 +201,8 @@ impl ProposalBuffer {
         if self.0.is_producer()
             || self.0.is_partition_creation()
             || self.0.producer_session.is_some()
+            || self.0.group_progress.is_some()
+            || self.0.group_assignment.is_some()
         {
             return Err(JournalError::AppendMismatch);
         }
@@ -255,6 +257,11 @@ impl ProposalBuffer {
             .map_or(&[], |results| results.ranges.as_slice())
     }
 
+    /// The one producer this proposal opens or appends for, if any.
+    pub(crate) fn producer(&self) -> Option<ozzy_proto::ProducerId> {
+        self.0.producer()
+    }
+
     pub(crate) fn has_trimmed_retry(&self) -> bool {
         self.0
             .retry_results
@@ -287,11 +294,33 @@ impl From<AppendBuffer> for ProposalBuffer {
     }
 }
 
-/// Read-only proposal validation result. Neither variant admits or persists work.
+/// Owner progress required before an unadmitted proposal can be reclassified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProposalDeferral {
+    /// An accepted original must reach the configured confirmation boundary.
+    Original(ozzy_replication::OpNumber),
+    /// Identity, pending, or checkpoint capacity awaits bounded owner progress.
+    IdentityCapacity,
+    /// Preparation scratch awaits release of charged transport or storage aliases.
+    MemoryCapacity,
+}
+
+/// Read-only proposal validation result. No variant admits or persists work.
 #[derive(Debug)]
 pub enum ProposalValidation {
     /// Recheck the ticket with the driver before sending PREPARE or submitting a write.
     Ready(ValidatedAppend),
+    /// Retain the bounded request until original confirmation or identity
+    /// capacity progresses. Authority changes fence this wait; no outcome
+    /// is confirmed and no record identity is reserved by this classification.
+    Deferred {
+        /// Exact authority observed while classifying the unadmitted request.
+        validation: ozzy_replication::driver::ValidationTicket,
+        /// Confirmation or identity retention that must make progress first.
+        reason: ProposalDeferral,
+        /// Original request, with no identities reserved by this classification.
+        buffer: ProposalBuffer,
+    },
     /// Exact producer bytes, a writer session, or partition creation already exist.
     /// No new operation was proposed.
     /// Recheck this image and await quorum/application through the returned prefix.

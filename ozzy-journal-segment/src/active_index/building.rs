@@ -4,7 +4,7 @@ use super::{
 };
 use crate::{
     DecodedOperation, Digest, MessageIndexEntry, OffsetIndexEntry, OperationIndexEntry,
-    SegmentHeader, derive_index_entries,
+    OperationLocation, SegmentHeader, derive_index_entries,
 };
 use ozzy_journal::operation::OperationLimits;
 
@@ -12,6 +12,7 @@ pub(super) struct Entries {
     offsets: Vec<OffsetIndexEntry>,
     messages: Vec<MessageIndexEntry>,
     operations: Vec<OperationIndexEntry>,
+    locations: Vec<OperationLocation>,
     first: Option<u64>,
     last: Option<u64>,
     digest: Digest,
@@ -25,6 +26,7 @@ impl Entries {
             offsets: Vec::new(),
             messages: Vec::new(),
             operations: Vec::new(),
+            locations: Vec::new(),
             first: None,
             last: None,
             digest: Digest::ZERO,
@@ -40,6 +42,12 @@ impl Entries {
     ) -> Result<(), ActiveIndexError> {
         self.first.get_or_insert(operation.op_number);
         let derived = derive_index_entries(header, operation, limits)?;
+        extend_bounded(
+            &mut self.locations,
+            [derived.location],
+            self.limits.max_operation_entries,
+            "active operation locations",
+        )?;
         extend_bounded(
             &mut self.offsets,
             derived.offsets,
@@ -65,29 +73,41 @@ impl Entries {
         Ok(())
     }
 
+    /// Source of these entries appended to an optional validated `base`.
     pub(super) fn source(
         &self,
         header: &SegmentHeader,
         valid_bytes: u64,
         digest: Digest,
         through_op: u64,
+        base: Option<&SegmentIndexImage>,
     ) -> Result<Option<IndexSource>, ActiveIndexError> {
-        let Some(first_op_number) = self.first else {
+        let Some(first_op_number) = base
+            .map(|base| base.source().first_op_number)
+            .or(self.first)
+        else {
             return Ok(None);
         };
-        let last_op_number = self
-            .last
-            .expect("first operation establishes last operation");
+        let (last_op_number, last_operation_digest) = match (self.last, base) {
+            (Some(last), _) => (last, self.digest),
+            (None, Some(base)) => (
+                base.source().last_op_number,
+                base.source().last_operation_digest,
+            ),
+            (None, None) => unreachable!("a first operation has a last operation"),
+        };
         if last_op_number != through_op {
             return Err(ActiveIndexError::PositionNotCovered {
                 requested: through_op,
                 last: last_op_number,
             });
         }
+        let base_len = |len: fn(&SegmentIndexImage) -> usize| base.map_or(0, len);
         enforce_footprint(
-            self.offsets.len(),
-            self.messages.len(),
-            self.operations.len(),
+            self.offsets.len() + base_len(|base| base.offsets().len()),
+            self.messages.len() + base_len(|base| base.messages().len()),
+            self.operations.len() + base_len(|base| base.operations().len()),
+            self.locations.len() + base_len(|base| base.locations().len()),
             self.limits,
         )?;
         Ok(Some(IndexSource {
@@ -97,8 +117,28 @@ impl Entries {
             segment_digest: digest,
             first_op_number,
             last_op_number,
-            last_operation_digest: self.digest,
+            last_operation_digest,
         }))
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.last.is_none()
+    }
+
+    pub(super) async fn extend_async(
+        self,
+        base: &SegmentIndexImage,
+        source: IndexSource,
+    ) -> Result<SegmentIndexImage, ActiveIndexError> {
+        Ok(base
+            .extend_async(
+                source,
+                self.offsets,
+                self.messages,
+                self.operations,
+                self.locations,
+            )
+            .await?)
     }
 
     pub(super) fn finish(self, source: IndexSource) -> Result<SegmentIndexImage, ActiveIndexError> {
@@ -108,6 +148,7 @@ impl Entries {
             self.offsets,
             self.messages,
             self.operations,
+            self.locations,
         )?)
     }
 
@@ -115,9 +156,14 @@ impl Entries {
         self,
         source: IndexSource,
     ) -> Result<SegmentIndexImage, ActiveIndexError> {
-        Ok(
-            SegmentIndexImage::new_async(source, 0, self.offsets, self.messages, self.operations)
-                .await?,
+        Ok(SegmentIndexImage::new_async(
+            source,
+            0,
+            self.offsets,
+            self.messages,
+            self.operations,
+            self.locations,
         )
+        .await?)
     }
 }

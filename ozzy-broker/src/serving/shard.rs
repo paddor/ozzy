@@ -4,7 +4,7 @@ use build::build;
 
 use super::{
     Binding, Registration,
-    config::{CLIENTS, Config, WRITER_WINDOW, WRITERS},
+    config::{COORDINATOR_PLANS, Config, WRITER_WINDOW, WRITERS},
     failure,
     outbound::Outbound,
 };
@@ -16,8 +16,9 @@ use ozzy_runtime::{
     frontend::{self, DataInput, DataReceiver, Kind},
     memory::Owner,
     replica_actor::{
-        ActorIds, NativeAccess, NativeIntake, NativeIntakeConfig, NativeReceive, PartitionActors,
-        PartitionStatus, PendingProposal, ProposalOutcome, ProposalSubmitter, RoutePublisher,
+        ActorIds, GroupCoordinator, GroupCoordinatorConfig, NativeAccess, NativeIntake,
+        NativeIntakeConfig, NativeReceive, PartitionActors, PartitionStatus, PendingProposal,
+        ProposalOutcome, ProposalSubmitter, RoutePublisher, TopicTopology,
     },
     replica_journal::ProposalBuffer,
 };
@@ -44,6 +45,7 @@ struct Bootstrap {
 struct State {
     actors: PartitionActors,
     natives: Vec<NativeIntake>,
+    coordinators: Vec<GroupCoordinator>,
     identities: Vec<(GroupId, ozzy_proto::PartitionIncarnation)>,
     bootstrap: Vec<Option<Bootstrap>>,
     recoveries: BTreeMap<GroupId, crate::PartitionJournal>,
@@ -125,11 +127,12 @@ pub(super) async fn run(
                 .expect("known partition")
         })
         .collect();
+    let (serving, observed) = tokio::sync::watch::channel(false);
     let result = async {
         let (handoff, binding) = oneshot::channel();
         tokio::select! {
             () = shard.shutdown.requested() => return Ok(()),
-            result = registrations.send(Registration { id: shard.plan.id, sender, broker_control, data: data_sender, replica: replica_sender, routes, handoff }) => result.map_err(failure)?,
+            result = registrations.send(Registration { id: shard.plan.id, serving: observed, sender, broker_control, data: data_sender, replica: replica_sender, routes, handoff }) => result.map_err(failure)?,
         }
         let mut binding = tokio::select! {
             () = shard.shutdown.requested() => return Ok(()),
@@ -138,6 +141,9 @@ pub(super) async fn run(
         for native in state.natives.drain(..) {
             state.actors.install_native(native, binding.links.clone()).map_err(failure)?;
         }
+        for coordinator in state.coordinators.drain(..) {
+            state.actors.install_coordinator(coordinator, binding.links.clone()).map_err(failure)?;
+        }
         for (index, &(group, partition)) in state.identities.iter().enumerate() {
             if state.bootstrap[index].is_none() {
                 continue;
@@ -145,15 +151,16 @@ pub(super) async fn run(
             state.actors.install_readers(group, ozzy_runtime::replica_actor::SharedReaderConfig {
                 partition,
                 limits: state.config.limits,
-                subscriptions: CLIENTS,
+                subscriptions: state.config.clients,
             }, binding.links.clone()).map_err(failure)?;
         }
         state.publisher =
             Some(RoutePublisher::new(&state.actors, &state.identities, 16).map_err(failure)?);
         shard.ready()?;
-        serve(&shard, &mut state, &mut binding).await
+        serve(&shard, &mut state, &mut binding, &serving).await
     }.await;
     drop(state.natives);
+    drop(state.coordinators);
     drop(state.bootstrap);
     drop(state.outbound);
     let drained = state.actors.shutdown().await.map_err(failure);
@@ -164,6 +171,7 @@ async fn serve(
     shard: &ShardContext,
     state: &mut State,
     binding: &mut Binding,
+    serving: &tokio::sync::watch::Sender<bool>,
 ) -> Result<(), StartupError> {
     let start = state.config.time.start();
     let mut tick = tokio::time::interval(TIMER_INTERVAL);
@@ -176,6 +184,9 @@ async fn serve(
         tokio::pin!(data, replica, control, replica_control);
         let port = binding.port.changed_after(port_generation);
         let links = binding.links.clone();
+        if !*serving.borrow() && state.serving() {
+            serving.send_replace(true);
+        }
         tokio::select! {
             biased;
             () = shard.shutdown.requested() => return Ok(()),

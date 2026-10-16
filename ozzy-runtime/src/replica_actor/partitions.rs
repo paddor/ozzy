@@ -16,8 +16,8 @@ use std::{
 
 use super::shared_readers::{SharedReaderConfig, SharedReaders};
 use super::{
-    ActorError, ActorStatus, LocalActor, NativeIntake, NativeIntakeError, NativeReceive,
-    ScheduleError, ScheduledRecovery, ScheduledReplica,
+    ActorError, ActorStatus, GroupCoordinator, LocalActor, NativeIntake, NativeIntakeError,
+    NativeReceive, ScheduleError, ScheduledRecovery, ScheduledReplica,
 };
 use crate::frontend::Links;
 
@@ -170,6 +170,7 @@ impl PartitionActor {
 pub struct PartitionActors {
     actors: Vec<PartitionActor>,
     native: Vec<Option<NativeService>>,
+    coordinators: Vec<Option<NativeCoordinator>>,
     readers: Vec<Option<SharedReaders>>,
     recovered: VecDeque<GroupId>,
     index: BTreeMap<GroupId, usize>,
@@ -185,6 +186,12 @@ pub struct PartitionActors {
 #[derive(Debug)]
 struct NativeService {
     intake: NativeIntake,
+    links: Links,
+}
+
+#[derive(Debug)]
+struct NativeCoordinator {
+    coordinator: GroupCoordinator,
     links: Links,
 }
 
@@ -240,6 +247,7 @@ impl PartitionActors {
         Ok(Self {
             recovered: VecDeque::with_capacity(actors.len()),
             native: actors.iter().map(|_| None).collect(),
+            coordinators: actors.iter().map(|_| None).collect(),
             readers: actors.iter().map(|_| None).collect(),
             actors,
             index,
@@ -318,13 +326,37 @@ impl PartitionActors {
         group: GroupId,
     ) -> Result<Option<&mut PartitionActor>, PartitionError> {
         let slot = *self.index.get(&group).ok_or(PartitionError::Unknown)?;
-        if self.stopped || self.native[slot].is_some() || self.readers[slot].is_some() {
+        if self.stopped
+            || self.native[slot].is_some()
+            || self.coordinators[slot].is_some()
+            || self.readers[slot].is_some()
+        {
             return Err(PartitionError::NativeConfiguration);
         }
         if matches!(self.actors[slot], PartitionActor::Recovering(_)) {
             return Ok(None);
         }
         Ok(Some(&mut self.actors[slot]))
+    }
+
+    /// Attach the consumer-group coordinator of this partition. It uses the
+    /// actor's proposal lane and the frontend's shared client links.
+    pub fn install_coordinator(
+        &mut self,
+        coordinator: GroupCoordinator,
+        links: Links,
+    ) -> Result<(), PartitionError> {
+        let (group, local) = coordinator.identity();
+        let slot = *self.index.get(&group).ok_or(PartitionError::Unknown)?;
+        if self.stopped
+            || self.coordinators[slot].is_some()
+            || self.actors[slot].native_identity().1 != local
+        {
+            return Err(PartitionError::NativeConfiguration);
+        }
+        self.coordinators[slot] = Some(NativeCoordinator { coordinator, links });
+        self.touch(slot);
+        Ok(())
     }
 
     /// Inspect one known partition's current state.
@@ -427,7 +459,10 @@ impl PartitionActors {
         let readers = self.readers[slot]
             .as_ref()
             .map_or(0, |readers| readers.client_work(node));
-        Ok(native + readers)
+        let coordinator = self.coordinators[slot]
+            .as_ref()
+            .map_or(0, |service| service.coordinator.client_work(node));
+        Ok(native + readers + coordinator)
     }
 
     /// Requests of one client's writer that still own native proposals or
@@ -502,6 +537,20 @@ impl PartitionActors {
         // when the new request targets an earlier point in the current scan.
         self.remaining = self.actors.len();
         let hint = self.actors[slot].authority_hint();
+        if GroupCoordinator::supports(message)
+            && let Some(service) = &mut self.coordinators[slot]
+        {
+            if deferred {
+                return Ok(NativeReceive::Busy);
+            }
+            let Some(link) = service.links.get(peer) else {
+                return Ok(NativeReceive::Ignored);
+            };
+            return service
+                .coordinator
+                .receive(message, link, hint, &mut self.actors[slot], now)
+                .map_err(|source| PartitionError::Native { group, source });
+        }
         if SharedReaders::supports(message)
             && let Some(readers) = &mut self.readers[slot]
         {
@@ -823,6 +872,7 @@ impl PartitionActors {
                 unreachable!("checked replicated actor");
             };
             self.native[slot] = None;
+            self.coordinators[slot] = None;
             self.readers[slot] = None;
             self.actors.push(PartitionActor::Recovering(Box::new(
                 ScheduledRecovery::quarantine(normal),
@@ -839,10 +889,22 @@ impl PartitionActors {
                         .poll(&mut self.actors[slot], cx, &mut *try_send)
                         .map_err(|source| PartitionError::Actor { group, source })?;
                 }
+                let group = self.actors[slot].group();
+                if let Some(service) = &mut self.coordinators[slot] {
+                    changed |= service
+                        .coordinator
+                        .poll_progress(
+                            cx,
+                            now,
+                            &mut self.actors[slot],
+                            |peer| service.links.get(peer),
+                            &mut *try_send,
+                        )
+                        .map_err(|source| PartitionError::Native { group, source })?;
+                }
                 let Some(native) = &mut self.native[slot] else {
                     return Ok(changed);
                 };
-                let group = self.actors[slot].group();
                 native
                     .intake
                     .poll_progress(
@@ -869,6 +931,7 @@ impl PartitionActors {
         // Drop protocol observers and unused proposal arenas before draining.
         // Already admitted work stays owned by the partition actors.
         drop(self.native);
+        drop(self.coordinators);
         drop(self.readers);
         let mut drains = FuturesUnordered::new();
         for actor in self.actors {

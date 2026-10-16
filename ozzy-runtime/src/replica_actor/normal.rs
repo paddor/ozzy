@@ -13,7 +13,7 @@ use std::collections::VecDeque;
 
 use ozzy_replication::{Commit, NormalReplica, ReplicationError};
 
-use super::ingress::{Reply, Submission};
+use super::ingress::{NextProposal, ProposalWait, Proposals, Reply, Submission};
 use super::{
     ActorError, AppendBuffer, Control, DriverError, Duration, JournalGeneration, Message, NodeId,
     PendingIo, Prefix, ProposalOutcome, ReplicaActor, Scope, SendClass,
@@ -36,8 +36,7 @@ pub(super) struct Live {
 pub(super) struct Work {
     scope: Scope,
     pub(super) live: VecDeque<Live>,
-    pub(super) waiting: Option<Submission>,
-    validating: Option<Reply>,
+    pub(super) proposals: Proposals,
     // Core-admitted proposal waiting for physical journal capacity.
     pub(super) ready: Option<(
         ozzy_replication::WriteTicket,
@@ -80,8 +79,7 @@ impl Work {
         Ok(Self {
             scope: channel.scope,
             live: VecDeque::with_capacity(capacity),
-            waiting: None,
-            validating: None,
+            proposals: Proposals::default(),
             ready: None,
             window_full: false,
             needs_sync: false,
@@ -122,6 +120,7 @@ impl Work {
 impl ReplicaActor {
     pub(super) fn normal_round(&mut self, now: Duration) -> Result<(), ActorError> {
         if self.work.scope != self.driver.scope() {
+            self.work.proposals.reject_deferred();
             self.work.scope = self.driver.scope();
             self.work.cursors = [None; 3];
             self.work.announced = None;
@@ -156,6 +155,13 @@ impl ReplicaActor {
                         end: live.end,
                         operations: buffer.len(),
                         retained_bytes: buffer.retained_bytes(),
+                        control: buffer.operations().any(|operation| {
+                            !matches!(
+                                operation.kind,
+                                ozzy_journal::operation::OperationKind::Append
+                                    | ozzy_journal::operation::OperationKind::ResolvedAppend
+                            )
+                        }),
                         packets: live.packets,
                     });
                 }
@@ -277,7 +283,12 @@ impl ReplicaActor {
         if snapshot.applied != snapshot.committed {
             let ticket = self.driver.begin_validation()?;
             // A staged suffix validates in the same turn, before the apply.
-            let validate = if !primary && !self.sync_due(primary, now) {
+            // Confirmed identity time must be applied before bounded expiry can
+            // make room for a following canonical batch on a full follower.
+            let validate = if !primary
+                && !self.sync_due(primary, now)
+                && !self.journal.deduplication_enabled()
+            {
                 self.take_received()?
             } else {
                 None
@@ -313,22 +324,15 @@ impl ReplicaActor {
         if primary && self.schedule_replay(now)? {
             return Ok(());
         }
-        if self.work.waiting.is_none() {
-            self.work.waiting = self.ingress.pop();
-        }
-        if self.work.waiting.is_some() {
-            if !primary {
-                let submission = self.work.waiting.take().expect("waiting request");
-                submission
-                    .reply
-                    .finish(submission.buffer, ProposalOutcome::NotAdmitted);
-            } else if let Some(propose) = self.take_proposal(&snapshot)? {
-                self.submit_turn(crate::replica_journal::Turn {
-                    propose: Some(propose),
-                    ..Default::default()
-                })?;
-                return Ok(());
-            }
+        if !primary {
+            self.work.proposals.fill(&mut self.ingress);
+            self.work.proposals.reject_all();
+        } else if let Some(propose) = self.take_proposal(&snapshot)? {
+            self.submit_turn(crate::replica_journal::Turn {
+                propose: Some(propose),
+                ..Default::default()
+            })?;
+            return Ok(());
         }
         if self.work.needs_sync {
             if self.pending_sync.is_none() {
@@ -337,7 +341,7 @@ impl ReplicaActor {
         } else {
             self.schedule_donor(true)?;
         }
-        if self.work.waiting.is_none() {
+        if self.work.proposals.is_idle() {
             self.ingress.resume();
         }
         Ok(())
@@ -366,19 +370,20 @@ impl ReplicaActor {
         )>,
         ActorError,
     > {
-        if self.work.waiting.is_none() {
-            self.work.waiting = self.ingress.pop();
+        if let Some(buffer) = self.work.proposals.start_maintenance() {
+            return Ok(Some((self.driver.begin_validation()?, buffer)));
         }
-        let Some(submission) = &self.work.waiting else {
-            return Ok(None);
+        let driver = &self.driver;
+        let submission = match self
+            .work
+            .proposals
+            .next(&mut self.ingress, || driver.begin_validation())?
+        {
+            NextProposal::Idle | NextProposal::Finished | NextProposal::Blocked => {
+                return Ok(None);
+            }
+            NextProposal::Ready(submission) => submission,
         };
-        if submission.reply.fenced() {
-            let submission = self.work.waiting.take().expect("waiting request");
-            submission
-                .reply
-                .finish(submission.buffer, ProposalOutcome::NotAdmitted);
-            return Ok(None);
-        }
         if !self
             .journal
             .validation_has_capacity(&submission.buffer.0, snapshot.accepted.op)
@@ -396,15 +401,13 @@ impl ReplicaActor {
             return Ok(None);
         }
         self.work.window_full = false;
-        let mut submission = self.work.waiting.take().expect("waiting request");
+        let buffer = self.work.proposals.start();
         let ticket = self.driver.begin_validation()?;
-        submission.reply.scheduled();
         if !self.work.needs_sync {
             self.work.sync_batch_attempts = 0;
         }
         self.work.sync_batch_attempts += 1;
-        assert!(self.work.validating.replace(submission.reply).is_none());
-        Ok(Some((ticket, submission.buffer)))
+        Ok(Some((ticket, buffer)))
     }
 
     /// Install the accepted batch directly. The next validation observes its

@@ -117,10 +117,10 @@ fn checksum_valid_snapshots_reject_ambiguous_or_missing_writer_results() {
         .unwrap();
     let names = usize::from(u16::from_be_bytes(encoded[260..262].try_into().unwrap()))
         + usize::from(u16::from_be_bytes(encoded[262..264].try_into().unwrap()));
-    let first_writer = 256 + 96 + names;
-    let first_span = first_writer + 72;
-    let second_writer = first_span + 24;
-    let second_span = second_writer + 72;
+    let first_writer = 256 + 104 + names;
+    let first_span = first_writer + 80;
+    let second_writer = first_span + 40;
+    let second_span = second_writer + 80;
     for (field, value) in [
         (first_span, 1),        // Missing sequence zero.
         (first_span + 16, 0),   // Empty range.
@@ -185,7 +185,7 @@ fn fencing_one_writer_preserves_other_sessions_and_partition_offset() {
         None
     );
     assert_eq!(
-        state.prepare(7, &assigned(producer(), 3, 1, 2), &index, &state),
+        state.prepare(7, &assigned(producer(), 3, 1, 2), &index),
         Err(StateError::ProducerEpochMismatch)
     );
     apply(&mut state, &mut index, 7, &assigned(producer(), 4, 0, 2));
@@ -233,7 +233,7 @@ fn retention_cannot_destroy_another_writers_retry_evidence() {
         operation_id: operation(0x54),
     });
     assert_eq!(
-        state.prepare(9, &trim, &index, &state),
+        state.prepare(9, &trim, &index),
         Err(StateError::TrimBeyondProducerResults)
     );
     apply(
@@ -269,7 +269,7 @@ fn retry_index_budget_is_aggregate_and_failure_is_atomic() {
     let before = state.clone();
     let next = assigned(producer(), 3, 2, 3);
     assert_eq!(
-        state.prepare(7, &next, &index, &state),
+        state.prepare(7, &next, &index),
         Err(StateError::LimitExceeded("producer retry spans"))
     );
     assert_eq!(state, before);
@@ -278,7 +278,7 @@ fn retry_index_budget_is_aggregate_and_failure_is_atomic() {
     };
     third.producer_id = ProducerId::from_bytes([0x66; 16]);
     assert_eq!(
-        state.prepare(7, &OperationBody::OpenProducer(third), &index, &state),
+        state.prepare(7, &OperationBody::OpenProducer(third), &index),
         Err(StateError::LimitExceeded("producers"))
     );
     apply(&mut state, &mut index, 7, &floor(producer(), 0, 2, 0x56));
@@ -302,12 +302,7 @@ fn another_writer_cannot_create_an_alias_for_the_same_topic_partition() {
     };
     duplicate.partition = another_partition();
     assert_eq!(
-        state.prepare(
-            4,
-            &OperationBody::CreatePartition(duplicate),
-            &index,
-            &state
-        ),
+        state.prepare(4, &OperationBody::CreatePartition(duplicate), &index),
         Err(StateError::PartitionAddressExists)
     );
 }

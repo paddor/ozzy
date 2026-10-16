@@ -34,6 +34,8 @@ pub(in crate::operation) fn validate_limits(
         ("append record count", limits.max_records),
         ("append part count", limits.max_parts),
         ("append payload bytes", limits.max_payload_bytes),
+        ("group members", limits.max_group_members),
+        ("group source partitions", limits.max_group_partitions),
     ] {
         if value == 0 {
             return Err(OperationCodecError::LimitExceeded {

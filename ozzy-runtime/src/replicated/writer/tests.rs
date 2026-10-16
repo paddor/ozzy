@@ -101,6 +101,7 @@ async fn compact_pending_handles_preserve_writer_identity_after_owner_drop() {
         },
         message_id: MessageId::from_bytes([9; 16]),
         offset: 191,
+        disposition: ozzy_proto::append::AppendDisposition::Stored,
         policy: settings.policy,
     };
     assert_eq!(pending.confirmed().await.unwrap(), expected);

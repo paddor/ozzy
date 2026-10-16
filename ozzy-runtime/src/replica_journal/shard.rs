@@ -49,6 +49,7 @@ impl Default for ShardJournalConfig {
 pub struct ShardJournal {
     state: Option<Box<State>>,
     active: Option<CommandWork>,
+    capacity_wait: Option<LocalBoxFuture<'static, ()>>,
     jobs: FuturesUnordered<Job>,
     writes: FuturesOrdered<LocalBoxFuture<'static, super::OwnedCompletedWrite>>,
     completed: VecDeque<Completed>,
@@ -189,6 +190,7 @@ impl ShardJournal {
                 cleanup_class: 0,
             })),
             active: None,
+            capacity_wait: None,
             jobs: FuturesUnordered::new(),
             writes: FuturesOrdered::new(),
             completed: VecDeque::with_capacity(config.commands + config.write_depth),
@@ -216,6 +218,18 @@ impl ShardJournal {
             .expect("available journal owner")
             .owner
             .open_reader(ticket, partition, from)
+    }
+    pub(super) fn coordinator_group(
+        &self,
+        ticket: ozzy_replication::driver::ValidationTicket,
+        coordinator: ozzy_proto::PartitionIncarnation,
+        name: &str,
+    ) -> Result<Option<std::sync::Arc<ozzy_core::state::CoordinatorGroup>>, JournalError> {
+        self.state
+            .as_ref()
+            .expect("available journal owner")
+            .owner
+            .coordinator_group(ticket, coordinator, name)
     }
     pub(super) fn available(&self) -> usize {
         usize::from(
@@ -246,12 +260,32 @@ impl ShardJournal {
                 && !state.rolling
         })
     }
+    /// Whether a retirement still runs its job or awaits installation. A
+    /// command holding the owner counts as busy.
+    pub(super) fn retiring(&self) -> bool {
+        self.state
+            .as_ref()
+            .is_none_or(|state| state.owner.retiring())
+    }
     pub(super) fn validation_ready(&self, buffer: &super::AppendBuffer) -> bool {
-        self.available() != 0
-            && self
-                .state
-                .as_ref()
-                .is_some_and(|state| !state.owner.validation_may_read(buffer) || self.settled())
+        use crate::profiling::{Event, event};
+        let Some(state) = self.state.as_ref().filter(|_| self.available() != 0) else {
+            event(Event::ValidationOwnerWait);
+            return false;
+        };
+        if !state.owner.validation_memory_ready() {
+            event(Event::ValidationMemoryWait);
+            return false;
+        }
+        if !state.owner.validation_apply_ready() {
+            event(Event::ValidationApplyWait);
+            return false;
+        }
+        if state.owner.validation_may_read(buffer) && !self.settled() {
+            event(Event::ValidationSettleWait);
+            return false;
+        }
+        true
     }
     #[expect(
         clippy::result_large_err,
@@ -261,11 +295,8 @@ impl ShardJournal {
         if self.available() == 0 {
             return Err(command);
         }
+        let settled = self.settled();
         let state = self.state.as_mut().expect("available owner");
-        let settled = state.owner.writes_settled()
-            && self.writes.is_empty()
-            && !state.sync_busy
-            && !state.rolling;
         let capacity = match &mut command.action {
             Action::Admit { validated, .. } => state.owner.can_admit(validated),
             Action::Turn { turn, .. } => turn
@@ -277,6 +308,13 @@ impl ShardJournal {
         if (!capacity || needs_settled_writes(&command.action, &state.owner)) && !settled
             || (matches!(command.action, Action::BeginPipelinedSync { .. }) && state.rolling)
         {
+            if !settled {
+                crate::profiling::event(if capacity {
+                    crate::profiling::Event::JournalSettleWait
+                } else {
+                    crate::profiling::Event::JournalCapacityWait
+                });
+            }
             return Err(command);
         }
         self.idle = false;
@@ -328,14 +366,54 @@ impl ShardJournal {
             if let Some(state) = &mut self.state {
                 if let Some(done) = self.completed.pop_front() {
                     self.failed |= match done {
-                        Completed::Write(done) => state.owner.complete_write(done).is_err(),
+                        Completed::Write(done) => match state.owner.complete_write(done) {
+                            Ok(_) => false,
+                            Err(error) => {
+                                super::commands::fault_log(&error);
+                                true
+                            }
+                        },
                         Completed::Job(install) => install(state),
                     };
                     self.failed |= state.owner.is_faulted();
                     continue;
                 }
+                if let Some(work) = state.owner.take_retirement_work() {
+                    self.jobs.push(
+                        async move {
+                            let done = Box::pin(work.run()).await;
+                            Box::new(move |state: &mut State| {
+                                state.owner.complete_retirement(done);
+                                false
+                            }) as Install
+                        }
+                        .boxed_local(),
+                    );
+                    continue;
+                }
                 self.idle = self.failed;
-                if !self.failed && self.writes.len() < self.config.write_depth {
+                // Retirement installs with one manifest publication between
+                // writes, like a roll: no new write starts until in-flight
+                // writes drain. Its file work already ran as a job.
+                let retiring = !self.failed && state.owner.retirement_ready();
+                if retiring && self.writes.is_empty() && !state.sync_busy && !state.rolling {
+                    let mut state = self.state.take().expect("available owner");
+                    self.active = Some(
+                        async move {
+                            let failed = match state.owner.finish_retirement().await {
+                                Ok(_) => false,
+                                Err(error) => {
+                                    super::commands::fault_log(&error);
+                                    true
+                                }
+                            };
+                            (state, None, failed)
+                        }
+                        .boxed_local(),
+                    );
+                    continue;
+                }
+                if !self.failed && !retiring && self.writes.len() < self.config.write_depth {
                     match state.owner.prepare_write() {
                         Ok(OwnedWriteStep::Idle) => self.idle = true,
                         Ok(OwnedWriteStep::Write(work)) => {
@@ -385,7 +463,7 @@ impl ShardJournal {
                 if !self.failed
                     && !state.sync_busy
                     && self.writes.is_empty()
-                    && state.owner.identity_refresh_ready()
+                    && state.owner.identity_refresh_due()
                 {
                     let mut state = self.state.take().expect("available owner");
                     self.active = Some(
@@ -422,6 +500,24 @@ impl ShardJournal {
                 progressed = true;
             }
             if !progressed {
+                if self.capacity_wait.is_none() {
+                    self.capacity_wait = self
+                        .state
+                        .as_ref()
+                        .and_then(|state| state.owner.validation_memory_wait())
+                        .map(FutureExt::boxed_local);
+                }
+                if self
+                    .capacity_wait
+                    .as_mut()
+                    .is_some_and(|wait| wait.as_mut().poll(cx).is_ready())
+                {
+                    self.capacity_wait = None;
+                    if let Some(state) = &self.state {
+                        state.owner.clear_validation_memory_wait();
+                    }
+                    cx.waker().wake_by_ref();
+                }
                 return Poll::Pending;
             }
         }
@@ -440,8 +536,8 @@ impl ShardJournal {
         if std::future::poll_fn(|cx| self.poll_finished(cx)).await {
             return Err(JournalError::Faulted);
         }
-        let owner = self.state.take().ok_or(JournalError::Faulted)?.owner;
-        let (config, io, memory) = owner.recovery_parts()?;
+        let mut owner = self.state.take().ok_or(JournalError::Faulted)?.owner;
+        let (config, io, memory) = Box::pin(owner.recovery_parts()).await?;
         owner.shutdown().await?;
         let (mut owner, startup) = super::OwnedRecoveringJournal::start(
             config,

@@ -14,7 +14,7 @@ const ROUTE_BASE: usize = 65;
 
 mod topic;
 pub use topic::{
-    BrokerEndpoint, TopicPage, TopicPartition, TopicRequest, decode_topic_page,
+    BrokerEndpoint, EndpointScheme, TopicPage, TopicPartition, TopicRequest, decode_topic_page,
     decode_topic_request, encode_topic_page, encode_topic_request,
 };
 

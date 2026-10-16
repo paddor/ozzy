@@ -53,15 +53,20 @@ pub use codec::{
 };
 pub use directory::asynchronous::{
     Candidate as AsyncCanonicalRecoveryCandidate, CanonicalCheckpointImport,
-    CheckpointFiles as AsyncCheckpointFiles, CheckpointRecovery,
-    Completed as AsyncCompletedJournalWrite, CompletedRoll as AsyncCompletedJournalRoll,
-    CompletedSync as AsyncCompletedJournalSync, Format as AsyncJournalFormat,
-    Installer as AsyncSuffixInstaller, Journal as AsyncGroupJournal, Limits as AsyncJournalLimits,
-    Opening as AsyncJournalOpening, PendingRoll as AsyncPendingJournalRoll,
-    Pipeline as AsyncJournalWritePipeline, Prepared as AsyncPreparedJournalWrite,
-    PreparedRoll as AsyncPreparedJournalRoll, PreparedSegment as AsyncPreparedSegment,
-    PreparedSync as AsyncPreparedJournalSync, RecoveryDirectory as AsyncRecoveryDirectory,
-    Repair as AsyncSealedRepair, RetirementBudget as AsyncRetirementBudget,
+    CheckpointBuildPlan as AsyncCheckpointBuildPlan, CheckpointCursor as AsyncCheckpointCursor,
+    CheckpointFiles as AsyncCheckpointFiles, CheckpointInbox as AsyncCheckpointInbox,
+    CheckpointInboxStream as AsyncCheckpointInboxStream, CheckpointRecovery,
+    CheckpointSource as AsyncCheckpointSource, CheckpointStream as AsyncCheckpointStream,
+    CheckpointWriter as AsyncCheckpointWriter, Completed as AsyncCompletedJournalWrite,
+    CompletedRoll as AsyncCompletedJournalRoll, CompletedSync as AsyncCompletedJournalSync,
+    Format as AsyncJournalFormat, Installer as AsyncSuffixInstaller, Journal as AsyncGroupJournal,
+    Limits as AsyncJournalLimits, Opening as AsyncJournalOpening,
+    PendingRoll as AsyncPendingJournalRoll, Pipeline as AsyncJournalWritePipeline,
+    Prepared as AsyncPreparedJournalWrite, PreparedRoll as AsyncPreparedJournalRoll,
+    PreparedSegment as AsyncPreparedSegment, PreparedSync as AsyncPreparedJournalSync,
+    RecoveryDirectory as AsyncRecoveryDirectory, Repair as AsyncSealedRepair,
+    RetirementBudget as AsyncRetirementBudget, RetirementProof as AsyncRetirementProof,
+    RetirementScan as AsyncRetirementScan, ScannedPrefix as AsyncScannedPrefix,
     SegmentFiles as AsyncSegmentFiles, SegmentPreparation as AsyncSegmentPreparation,
 };
 pub use directory::asynchronous::{
@@ -95,13 +100,13 @@ pub use index_builder::{
     segment_index_name,
 };
 pub use index_catalog::{
-    IndexCatalogError, IndexedMessageLocation, IndexedOffsetLocation, IndexedOperationLocation,
-    SegmentIndexCatalog,
+    IndexCatalogError, IndexedMessageLocation, IndexedOffsetLocation, IndexedOperation,
+    IndexedOperationLocation, SegmentIndexCatalog,
 };
 pub use index_file::{
     INDEX_HEADER_BYTES, IndexFileError, IndexLimits, IndexSource, MESSAGE_INDEX_ENTRY_BYTES,
-    OFFSET_INDEX_ENTRY_BYTES, OPERATION_INDEX_ENTRY_BYTES, SegmentIndexImage, SegmentIndexView,
-    decode_segment_index, encode_segment_index,
+    OFFSET_INDEX_ENTRY_BYTES, OPERATION_INDEX_ENTRY_BYTES, OPERATION_LOCATION_BYTES,
+    SegmentIndexImage, SegmentIndexView, decode_segment_index, encode_segment_index,
 };
 pub use journal_index::asynchronous::Snapshot as AsyncJournalIndexSnapshot;
 pub use journal_index::seek::SeekQuery;

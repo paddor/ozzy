@@ -14,15 +14,17 @@ use ozzy_proto::{MessageId, Offset, OperationId, PartitionIncarnation};
 use thiserror::Error;
 
 use crate::index_file::{
-    INDEX_DIGEST_START, INDEX_HASH_CONTEXT, IndexCounts, calculate_index_layout,
+    INDEX_DIGEST_START, INDEX_HASH_CONTEXT, IndexCounts, calculate_index_layout, compare_locations,
     compare_message_entries, compare_offset_entries, compare_operation_entries,
     encode_index_header, encode_message_entry, encode_offset_entry, encode_operation_entry,
+    encode_operation_location,
 };
 use crate::{
     INDEX_HEADER_BYTES, IndexError, IndexFileError, IndexLimits, IndexSource,
     MESSAGE_INDEX_ENTRY_BYTES, MessageIndexEntry, OFFSET_INDEX_ENTRY_BYTES,
-    OPERATION_INDEX_ENTRY_BYTES, OffsetIndexEntry, OperationIndexEntry, SegmentIndexView,
-    SegmentScan, TailState, decode_segment_index, derive_index_entries,
+    OPERATION_INDEX_ENTRY_BYTES, OPERATION_LOCATION_BYTES, OffsetIndexEntry, OperationIndexEntry,
+    OperationLocation, SegmentIndexView, SegmentScan, TailState, decode_segment_index,
+    derive_index_entries,
 };
 
 static WORKSPACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -108,6 +110,7 @@ impl SegmentIndex {
             offsets: view.offset_count(),
             messages: view.message_count(),
             operations: view.operation_count(),
+            locations: view.location_count(),
         };
         Ok((
             view.build_memory_limit(),
@@ -133,6 +136,16 @@ impl SegmentIndex {
     /// Number of canonical operation-identity selectors.
     pub fn operation_count(&self) -> usize {
         self.view().operation_count()
+    }
+
+    /// Number of numeric selectors, including data and payload-free appends.
+    pub fn location_count(&self) -> usize {
+        self.view().location_count()
+    }
+
+    /// Locate one canonical operation in constant table work.
+    pub fn find_operation_number(&self, number: u64) -> Option<OperationLocation> {
+        self.view().find_operation_number(number)
     }
 
     /// Look up an exact partition incarnation and global record offset.
@@ -348,6 +361,12 @@ impl IndexPublication {
             &mut workspace,
         )?;
         let temporary = workspace.path.join("complete.idx");
+        let location_run = merge_all(
+            pending.location_runs,
+            RunKind::Location,
+            limits.max_merge_fan_in,
+            &mut workspace,
+        )?;
         write_complete_index(
             &temporary,
             source,
@@ -355,7 +374,7 @@ impl IndexPublication {
                 .map_err(|_| IndexFileError::LengthOverflow)?,
             counts,
             limits.file,
-            [offset_run, message_run, operation_run],
+            [offset_run, message_run, operation_run, location_run],
         )?;
         let built = open_segment_index(&temporary, source, limits.file)?;
         publish_index(&temporary, &final_path, source, limits.file)?;
@@ -387,9 +406,11 @@ struct PendingRuns {
     offsets: Vec<OffsetIndexEntry>,
     messages: Vec<MessageIndexEntry>,
     operations: Vec<OperationIndexEntry>,
+    locations: Vec<OperationLocation>,
     offset_runs: Vec<PathBuf>,
     message_runs: Vec<PathBuf>,
     operation_runs: Vec<PathBuf>,
+    location_runs: Vec<PathBuf>,
 }
 
 impl PendingRuns {
@@ -403,13 +424,16 @@ impl PendingRuns {
                 offsets: 0,
                 messages: 0,
                 operations: 0,
+                locations: 0,
             },
             offsets: Vec::new(),
             messages: Vec::new(),
             operations: Vec::new(),
+            locations: Vec::new(),
             offset_runs: Vec::new(),
             message_runs: Vec::new(),
             operation_runs: Vec::new(),
+            location_runs: Vec::new(),
         }
     }
 
@@ -448,6 +472,7 @@ impl PendingRuns {
             return Err(IndexBuildError::InvalidBuildLimits);
         }
         let next_counts = IndexCounts {
+            locations: checked_add(self.counts.locations, 1)?,
             offsets: checked_add(self.counts.offsets, derived.offsets.len())?,
             messages: checked_add(self.counts.messages, derived.messages.len())?,
             operations: checked_add(
@@ -464,6 +489,7 @@ impl PendingRuns {
         self.offsets.extend(derived.offsets);
         self.messages.extend(derived.messages);
         self.operations.extend(derived.operation);
+        self.locations.push(derived.location);
         Ok(())
     }
 
@@ -495,6 +521,15 @@ impl PendingRuns {
             compare_operation_entries,
             encode_operation_entry,
         )?;
+        write_typed_run(
+            &mut self.locations,
+            RunKind::Location,
+            workspace,
+            &mut self.location_runs,
+            self.max_runs,
+            compare_locations,
+            encode_operation_location,
+        )?;
         self.buffered_bytes = 0;
         Ok(())
     }
@@ -505,6 +540,7 @@ enum RunKind {
     Offset,
     Message,
     Operation,
+    Location,
 }
 
 impl RunKind {
@@ -513,6 +549,7 @@ impl RunKind {
             Self::Offset => OFFSET_INDEX_ENTRY_BYTES,
             Self::Message => MESSAGE_INDEX_ENTRY_BYTES,
             Self::Operation => OPERATION_INDEX_ENTRY_BYTES,
+            Self::Location => OPERATION_LOCATION_BYTES,
         }
     }
 
@@ -521,6 +558,7 @@ impl RunKind {
             Self::Offset => 24,
             Self::Message => 40,
             Self::Operation => 16,
+            Self::Location => 8,
         }
     }
 
@@ -529,6 +567,7 @@ impl RunKind {
             Self::Offset => "offset",
             Self::Message => "message",
             Self::Operation => "operation",
+            Self::Location => "location",
         }
     }
 }
@@ -550,6 +589,7 @@ fn derived_entry_bytes(entries: &crate::DerivedIndexEntries) -> Result<usize, In
                 usize::from(entries.operation.is_some()) * size_of::<OperationIndexEntry>(),
             )
         })
+        .and_then(|total| total.checked_add(size_of::<OperationLocation>()))
         .ok_or_else(|| IndexFileError::LengthOverflow.into())
 }
 
@@ -699,7 +739,7 @@ fn write_complete_index(
     build_memory_limit: u64,
     counts: IndexCounts,
     limits: IndexLimits,
-    runs: [Option<PathBuf>; 3],
+    runs: [Option<PathBuf>; 4],
 ) -> Result<(), IndexBuildError> {
     let layout = calculate_index_layout(counts, limits)?;
     let file = OpenOptions::new()
@@ -717,7 +757,8 @@ fn write_complete_index(
     for (run, expected_bytes) in runs.into_iter().zip([
         layout.message_start - INDEX_HEADER_BYTES,
         layout.operation_start - layout.message_start,
-        layout.file_bytes - layout.operation_start,
+        layout.location_start - layout.operation_start,
+        layout.file_bytes - layout.location_start,
     ]) {
         copy_run(run.as_deref(), expected_bytes, &mut writer)?;
     }
@@ -830,7 +871,9 @@ fn validate_source_scan(
 }
 
 fn validate_build_limits(limits: IndexBuildLimits) -> Result<(), IndexBuildError> {
-    let minimum = size_of::<OffsetIndexEntry>() + size_of::<MessageIndexEntry>();
+    let minimum = size_of::<OffsetIndexEntry>()
+        + size_of::<MessageIndexEntry>()
+        + size_of::<OperationLocation>();
     if limits.max_entry_buffer_bytes < minimum
         || limits.max_merge_fan_in < 2
         || limits.max_run_files == 0
@@ -842,6 +885,7 @@ fn validate_build_limits(limits: IndexBuildLimits) -> Result<(), IndexBuildError
             offsets: 0,
             messages: 0,
             operations: 0,
+            locations: 0,
         },
         limits.file,
     )?;

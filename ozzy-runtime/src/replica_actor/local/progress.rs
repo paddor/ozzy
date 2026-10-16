@@ -74,7 +74,7 @@ impl LocalActor {
             changed = true;
         }
         changed |= self.schedule()?;
-        if !self.closing && self.pending.is_none() && self.waiting.is_none() {
+        if !self.closing && self.pending.is_none() && self.proposals.is_idle() {
             self.ingress.resume();
             changed |= std::pin::pin!(self.ingress.ready()).poll(cx).is_ready();
         }
@@ -91,16 +91,37 @@ impl LocalActor {
                 Poll::Ready(result) => {
                     let turn = result?;
                     self.foreground_turn_due = true;
+                    if turn.expired_identities != 0 {
+                        self.proposals.release_capacity();
+                    }
                     if !turn.enabled {
-                        self.retention_at = None;
+                        self.retention.at = None;
                     } else if turn.more_work {
-                        self.retention_at = self.config.retention_interval.map(|_| self.now);
+                        // Identity expiry continues without draining the
+                        // journal again; record retention repeats its turn.
+                        self.retention.identities = turn.expired_identities != 0;
+                        self.retention.at = self.config.retention_interval.map(|_| self.now);
                     }
                     if let Some(buffer) = turn.proposal {
-                        self.waiting = Some(super::Submission {
-                            buffer,
-                            reply: super::Reply::maintenance(),
-                        });
+                        self.proposals.set_maintenance(buffer);
+                    }
+                    true
+                }
+            },
+            Pending::IdentityRetention(work) => match Pin::new(work).poll(cx) {
+                Poll::Pending => false,
+                Poll::Ready(result) => {
+                    let turn = result?;
+                    self.foreground_turn_due = true;
+                    if turn.expired != 0 {
+                        self.proposals.release_capacity();
+                    }
+                    if turn.more_work {
+                        self.retention.identities = true;
+                        self.retention.at = self.config.retention_interval.map(|_| self.now);
+                    }
+                    if let Some(buffer) = turn.proposal {
+                        self.proposals.set_maintenance(buffer);
                     }
                     true
                 }
@@ -164,20 +185,57 @@ impl LocalActor {
 
     fn complete_proposal(&mut self, proposal: ProposalValidation) -> Result<(), ActorError> {
         let reply = self
-            .validating
-            .take()
+            .proposals
+            .validated()
             .ok_or_else(|| ActorError::history(HistoryReason::ProposalWindow))?;
         match proposal {
+            ProposalValidation::Deferred {
+                validation,
+                reason,
+                buffer,
+            } => {
+                if self.closing || reply.fenced() {
+                    reply.finish(buffer, ProposalOutcome::NotAdmitted);
+                } else {
+                    self.proposals.defer(
+                        super::Submission { buffer, reply },
+                        super::ProposalWait { validation, reason },
+                    );
+                }
+            }
             ProposalValidation::Rejected { reason, buffer } => {
                 reply.finish(buffer, ProposalOutcome::Invalid(reason));
             }
             ProposalValidation::Resolved {
-                through, buffer, ..
-            } => self.live.push_back(Live {
+                validation,
                 through,
-                reply,
-                buffer: Some(buffer.0),
-            }),
+                buffer,
+            } => {
+                let current = self.driver.begin_validation()?;
+                if current != validation {
+                    if self.closing || reply.fenced() {
+                        reply.finish(buffer, ProposalOutcome::NotAdmitted);
+                    } else {
+                        self.proposals.requeue(super::Submission { buffer, reply });
+                    }
+                } else if through.op <= current.applied().op {
+                    // A confirmed query or retry must not wait behind a newer
+                    // live append whose storage work is still pending.
+                    reply.finish(
+                        buffer,
+                        ProposalOutcome::Committed {
+                            scope: current.scope(),
+                            through,
+                        },
+                    );
+                } else {
+                    self.live.push_back(Live {
+                        through,
+                        reply,
+                        buffer: Some(buffer.0),
+                    });
+                }
+            }
             ProposalValidation::Ready(validated) if self.closing || reply.fenced() => {
                 reply.finish(validated.into_buffer().into(), ProposalOutcome::NotAdmitted);
             }

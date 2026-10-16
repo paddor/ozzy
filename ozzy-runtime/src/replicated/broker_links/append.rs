@@ -1,9 +1,11 @@
 //! Logical APPEND reply lanes on the existing physical broker sockets.
 
 use std::{
+    cell::RefCell,
     collections::BTreeMap,
+    rc::Rc,
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Weak,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -72,7 +74,23 @@ struct Request {
 #[derive(Debug)]
 pub(super) struct Registry {
     budget: Arc<Budget>,
-    requests: Mutex<BTreeMap<RequestId, Request>>,
+    thread: std::thread::ThreadId,
+}
+
+/// Correlations never leave the SDK executor. Public handles retain only budgets.
+#[derive(Clone, Debug)]
+pub(super) struct Owner {
+    budget: Arc<Budget>,
+    requests: Rc<Requests>,
+}
+
+type Requests = RefCell<BTreeMap<RequestId, Request>>;
+type LocalOwners = BTreeMap<usize, std::rc::Weak<Requests>>;
+
+thread_local! {
+    // Cold bootstrap lookup only. Drivers retain their owner directly afterward.
+    // Weak entries retain no requests, leases, sockets, or SDK runtime.
+    static OWNERS: RefCell<LocalOwners> = const { RefCell::new(BTreeMap::new()) };
 }
 
 /// Keeps declared SDK allocation capacity reserved through owner and alias
@@ -86,32 +104,52 @@ impl Registry {
     pub(super) fn new(limits: Option<AppendLinkLimits>) -> Self {
         Self {
             budget: Arc::new(Budget::new(limits)),
-            requests: Mutex::new(BTreeMap::new()),
+            thread: std::thread::current().id(),
         }
     }
 
+    pub(super) fn owner(&self) -> Owner {
+        assert_eq!(
+            self.thread,
+            std::thread::current().id(),
+            "APPEND state left its SDK owner"
+        );
+        let key = Arc::as_ptr(&self.budget) as usize;
+        let requests = OWNERS.with(|owners| {
+            let mut owners = owners.borrow_mut();
+            owners.retain(|_, owner| owner.strong_count() != 0);
+            if let Some(owner) = owners.get(&key).and_then(std::rc::Weak::upgrade) {
+                owner
+            } else {
+                let owner = Rc::new(RefCell::new(BTreeMap::new()));
+                owners.insert(key, Rc::downgrade(&owner));
+                owner
+            }
+        });
+        Owner {
+            budget: self.budget.clone(),
+            requests,
+        }
+    }
+}
+
+impl Owner {
     pub(super) fn fence(&self, broker: NodeId) {
-        self.requests
-            .lock()
-            .expect("SDK APPEND correlations poisoned")
-            .retain(|_, request| {
-                if request.broker != broker {
-                    return true;
-                }
-                if let Some(stream) = request.stream.upgrade() {
-                    stream.failed.store(true, Ordering::Release);
-                }
-                false
-            });
+        self.requests.borrow_mut().retain(|_, request| {
+            if request.broker != broker {
+                return true;
+            }
+            if let Some(stream) = request.stream.upgrade() {
+                stream.failed.store(true, Ordering::Release);
+            }
+            false
+        });
     }
 
     fn forget(&self, writer: RequestId, confirmed: Option<u64>) {
-        self.requests
-            .lock()
-            .expect("SDK APPEND correlations poisoned")
-            .retain(|_, request| {
-                request.writer != writer || confirmed.is_some_and(|end| request.end > end)
-            });
+        self.requests.borrow_mut().retain(|_, request| {
+            request.writer != writer || confirmed.is_some_and(|end| request.end > end)
+        });
     }
 
     /// Single physical receiver never waits for one logical writer's queue.
@@ -120,10 +158,7 @@ impl Registry {
         let Some(id) = packet.envelope.request_id else {
             return false;
         };
-        let mut requests = self
-            .requests
-            .lock()
-            .expect("SDK APPEND correlations poisoned");
+        let mut requests = self.requests.borrow_mut();
         let Some(request) = requests.get_mut(&id) else {
             return false;
         };
@@ -167,6 +202,7 @@ enum Blocked {
 #[derive(Debug)]
 pub(in crate::replicated) struct Connection {
     links: BrokerLinks,
+    registry: Owner,
     stream: Arc<Stream>,
     incoming: mpsc::Receiver<Message>,
     broker: Option<NodeId>,
@@ -212,6 +248,7 @@ impl Connection {
         let id = links.next_request()?;
         let (sender, incoming) = mpsc::channel(reply_slots);
         Ok(Self {
+            registry: links.0.shared.appends.owner(),
             links,
             stream: Arc::new(Stream {
                 id,
@@ -300,7 +337,7 @@ impl Connection {
     }
 
     pub(in crate::replicated) fn invalidate_session(&mut self) {
-        self.links.0.shared.appends.forget(self.stream.id, None);
+        self.registry.forget(self.stream.id, None);
         while self.incoming.try_recv().is_ok() {}
         self.stream.failed.store(false, Ordering::Release);
         self.session = None;
@@ -376,7 +413,7 @@ impl Connection {
             bytes,
             ..Cost::default()
         };
-        let registry = &self.links.0.shared.appends;
+        let registry = &self.registry;
         if !registry.budget.possible(cost) {
             return Err(TrySendError::Error(omq_tokio::Error::Config(
                 "shared APPEND exceeds aggregate capacity".into(),
@@ -387,10 +424,7 @@ impl Connection {
             return Err(TrySendError::Full(message));
         };
         let tracked = track(&message, &lease, Some(&self.stream.memory), false);
-        let mut requests = registry
-            .requests
-            .lock()
-            .expect("SDK APPEND correlations poisoned");
+        let mut requests = registry.requests.borrow_mut();
         if requests.contains_key(&id) {
             return Err(TrySendError::Error(omq_tokio::Error::Config(
                 "duplicate shared APPEND request ID".into(),
@@ -415,11 +449,7 @@ impl Connection {
                 Ok(())
             }
             Err(error) => {
-                registry
-                    .requests
-                    .lock()
-                    .expect("SDK APPEND correlations poisoned")
-                    .remove(&id);
+                registry.requests.borrow_mut().remove(&id);
                 match error {
                     TrySendError::Full(returned) => {
                         drop(returned);
@@ -434,16 +464,12 @@ impl Connection {
 
     /// Only the writer's validated confirmed prefix retires correlations.
     pub(in crate::replicated) fn confirm(&self, end: u64) {
-        self.links
-            .0
-            .shared
-            .appends
-            .forget(self.stream.id, Some(end));
+        self.registry.forget(self.stream.id, Some(end));
     }
 
     /// Retry outstanding records without replacing the negotiated link session.
     pub(in crate::replicated) fn forget_requests(&mut self) {
-        self.links.0.shared.appends.forget(self.stream.id, None);
+        self.registry.forget(self.stream.id, None);
         self.blocked = None;
     }
 
@@ -528,7 +554,7 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        self.links.0.shared.appends.forget(self.stream.id, None);
+        self.registry.forget(self.stream.id, None);
     }
 }
 

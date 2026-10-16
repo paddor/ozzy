@@ -392,6 +392,7 @@ fn bodies() -> Vec<OperationBody<'static>> {
             topic: "orders",
             partition_id: PartitionId::ZERO,
             owner_epoch: OwnerEpoch::INITIAL,
+            dedup_window_millis: None,
             retention: RetentionPolicy::default(),
         }),
         OperationBody::OpenProducer(OpenProducer {

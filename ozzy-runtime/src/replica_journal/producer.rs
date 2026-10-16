@@ -1,6 +1,8 @@
 //! Storage-independent writer assignment and exact retry policy.
 
-use ozzy_core::state::{CanonicalProducer, CanonicalState, ProducerResultSpan};
+use ozzy_core::state::{
+    CanonicalProducer, CanonicalState, ProducerResultSource, ProducerResultSpan,
+};
 use ozzy_journal::operation::{
     AppendBatchSummary, OperationKind, OperationLimits, RecordRef, decode_append_batches,
 };
@@ -10,6 +12,8 @@ use ozzy_replication::{JournalGeneration, Prefix};
 use smallvec::SmallVec;
 
 use super::{AppendAdmissionError, AppendBuffer, JournalError};
+mod duplicate;
+pub(super) use duplicate::DuplicateProof;
 
 pub(super) struct Assignment {
     pub position: [u8; 16],
@@ -44,15 +48,32 @@ pub(super) struct Retry {
 }
 
 impl Retry {
-    pub(super) fn offset(&self, index: usize) -> Result<Offset, JournalError> {
+    fn span(&self, index: usize) -> Result<&ProducerResultSpan, JournalError> {
+        if index >= self.retained {
+            return Err(JournalError::AppendMismatch);
+        }
         let sequence = self.batch.first_sequence.get() + index as u64;
+        let at = self
+            .results
+            .partition_point(|span| span.first_sequence.get() <= sequence);
         self.results
-            .iter()
-            .find_map(|span| {
-                let delta = sequence.checked_sub(span.first_sequence.get())?;
-                (delta < span.records).then(|| Offset::new(span.first_offset.get() + delta))
-            })
+            .get(
+                at.checked_sub(1)
+                    .ok_or(AppendAdmissionError::RetryHistoryExpired)?,
+            )
+            .filter(|span| sequence - span.first_sequence.get() < span.records)
             .ok_or_else(|| AppendAdmissionError::RetryHistoryExpired.into())
+    }
+
+    pub(super) fn source(&self, index: usize) -> Result<ProducerResultSource, JournalError> {
+        Ok(self.span(index)?.source)
+    }
+
+    pub(super) fn offset(&self, index: usize) -> Result<Offset, JournalError> {
+        let span = self.span(index)?;
+        let sequence = self.batch.first_sequence.get() + index as u64;
+        let delta = sequence - span.first_sequence.get();
+        Ok(Offset::new(span.first_offset.get() + delta))
     }
 
     pub(super) fn finish(mut self, timestamp: u64, through: Prefix, now: u64) -> Assignment {
@@ -72,6 +93,7 @@ impl Retry {
                 ),
                 first_offset: self.next_offset,
                 records: (self.batch.record_count - self.retained) as u64,
+                source: ProducerResultSource::Stored,
             },
         );
         Assignment {
@@ -158,17 +180,16 @@ pub(super) fn plan(
     if end > producer.next_producer_sequence.get() && !buffer.producer_stream {
         return Err(AppendAdmissionError::Sequence.into());
     }
-    let offset = producer
-        .result_offset(batch.first_sequence)
-        .ok_or(AppendAdmissionError::RetryHistoryExpired)?;
-    if offset < state.retained_from {
-        return Err(AppendAdmissionError::RetryHistoryExpired.into());
-    }
     let retained =
         usize::try_from(producer.next_producer_sequence.get() - batch.first_sequence.get())
             .unwrap_or(usize::MAX)
             .min(batch.record_count);
     let results = retained_results(producer, batch.first_sequence, retained)?;
+    if results.iter().any(|span| {
+        span.source == ProducerResultSource::Stored && span.first_offset < state.retained_from
+    }) {
+        return Err(AppendAdmissionError::RetryHistoryExpired.into());
+    }
     if retained == batch.record_count && !buffer.producer_stream && results.len() != 1 {
         return Err(AppendAdmissionError::Sequence.into());
     }
@@ -233,25 +254,37 @@ fn retained_results(
     records: usize,
 ) -> Result<SmallVec<[ProducerResultSpan; 2]>, JournalError> {
     let mut results = SmallVec::new();
-    for index in 0..records {
-        let sequence = ProducerSequence::new(first.get() + index as u64);
-        let offset = producer
-            .result_offset(sequence)
+    let end = first
+        .get()
+        .checked_add(records as u64)
+        .ok_or(AppendAdmissionError::Sequence)?;
+    let mut sequence = first.get();
+    while sequence < end {
+        let span = producer
+            .result_span(ProducerSequence::new(sequence))
             .ok_or(AppendAdmissionError::RetryHistoryExpired)?;
+        let delta = sequence - span.first_sequence.get();
+        let records = (span.records - delta).min(end - sequence);
         push_result(
             &mut results,
             ProducerResultSpan {
-                first_sequence: sequence,
-                first_offset: offset,
-                records: 1,
+                first_sequence: ProducerSequence::new(sequence),
+                first_offset: Offset::new(span.first_offset.get() + delta),
+                records,
+                source: span.source,
             },
         );
+        sequence += records;
     }
     Ok(results)
 }
 
-fn push_result(results: &mut SmallVec<[ProducerResultSpan; 2]>, next: ProducerResultSpan) {
+pub(in crate::replica_journal) fn push_result(
+    results: &mut SmallVec<[ProducerResultSpan; 2]>,
+    next: ProducerResultSpan,
+) {
     if let Some(last) = results.last_mut()
+        && last.source == next.source
         && last.first_sequence.get().checked_add(last.records) == Some(next.first_sequence.get())
         && last.first_offset.get().checked_add(last.records) == Some(next.first_offset.get())
     {

@@ -67,7 +67,7 @@ impl OpenGroupJournal {
                 operation.body.as_ref(),
                 self.operation_limits(),
             )?;
-            let plan = selected.prepare(operation.op_number, &body, &replay, &selected)?;
+            let plan = selected.prepare(operation.op_number, &body, &replay)?;
             selected.apply(plan, &mut replay)?;
             replay.advance(operation.op_number);
             if operation.op_number == committed_position.op_number {

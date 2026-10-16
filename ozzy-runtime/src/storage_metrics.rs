@@ -10,12 +10,33 @@ pub(crate) static DIRECT_RESIDENT_READS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HISTORICAL_READ_DELIVERIES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SHARED_READER_BYTES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static COPIED_READER_BYTES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PROGRESS_UPDATES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PROGRESS_QUERIES: AtomicU64 = AtomicU64::new(0);
+static DEDUP_INDEX_IMAGES: AtomicU64 = AtomicU64::new(0);
+static DEDUP_INDEX_BYTES: AtomicU64 = AtomicU64::new(0);
+static DEDUP_INDEX_ENTRIES: AtomicU64 = AtomicU64::new(0);
+static DEDUP_LIVE_BYTES: AtomicU64 = AtomicU64::new(0);
+static DEDUP_LIVE_ENTRIES: AtomicU64 = AtomicU64::new(0);
 static PREPARED_OPERATIONS: AtomicU64 = AtomicU64::new(0);
 static PREPARED_PAYLOAD_BYTES_MAX: AtomicU64 = AtomicU64::new(0);
 
 /// Cumulative counters plus a process-lifetime operation-size maximum.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Snapshot {
+    /// Installed dedup index images, including recovery rebuilds.
+    pub dedup_index_images: u64,
+    /// Sum of installed images' physical table/queue/scratch reservations.
+    pub dedup_index_bytes: u64,
+    /// Sum of installed images' configured identity capacities.
+    pub dedup_index_entries: u64,
+    /// Current reservations belonging to live installed identity images.
+    pub dedup_live_bytes: u64,
+    /// Configured identity capacity belonging to those live images.
+    pub dedup_live_entries: u64,
+    /// Decoded source progress update requests, including retries and refusals.
+    pub progress_updates: u64,
+    /// Decoded source progress queries, including retries and refusals.
+    pub progress_queries: u64,
     /// Records copied into replies through the journal's resident or stored path.
     pub journal_records: u64,
     /// Reply batches selected from the accepted background-persistence backlog.
@@ -37,6 +58,13 @@ pub struct Snapshot {
 /// Read counters and maxima without stopping journal workers.
 pub fn snapshot() -> Snapshot {
     Snapshot {
+        dedup_index_images: DEDUP_INDEX_IMAGES.load(Ordering::Relaxed),
+        dedup_index_bytes: DEDUP_INDEX_BYTES.load(Ordering::Relaxed),
+        dedup_index_entries: DEDUP_INDEX_ENTRIES.load(Ordering::Relaxed),
+        dedup_live_bytes: DEDUP_LIVE_BYTES.load(Ordering::Relaxed),
+        dedup_live_entries: DEDUP_LIVE_ENTRIES.load(Ordering::Relaxed),
+        progress_updates: PROGRESS_UPDATES.load(Ordering::Relaxed),
+        progress_queries: PROGRESS_QUERIES.load(Ordering::Relaxed),
         journal_records: JOURNAL_RECORDS.load(Ordering::Relaxed),
         background_resident_reads: BACKGROUND_RESIDENT_READS.load(Ordering::Relaxed),
         direct_resident_reads: DIRECT_RESIDENT_READS.load(Ordering::Relaxed),
@@ -55,4 +83,29 @@ pub(crate) fn prepared_operation(payload_bytes: usize) {
 
 pub(crate) fn add(counter: &AtomicU64, records: usize) {
     counter.fetch_add(records as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn dedup_image(bytes: usize, entries: usize) -> DedupReservation {
+    DEDUP_INDEX_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    DEDUP_INDEX_ENTRIES.fetch_add(entries as u64, Ordering::Relaxed);
+    DEDUP_INDEX_IMAGES.fetch_add(1, Ordering::Relaxed);
+    DEDUP_LIVE_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    DEDUP_LIVE_ENTRIES.fetch_add(entries as u64, Ordering::Relaxed);
+    DedupReservation {
+        bytes: bytes as u64,
+        entries: entries as u64,
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct DedupReservation {
+    bytes: u64,
+    entries: u64,
+}
+
+impl Drop for DedupReservation {
+    fn drop(&mut self) {
+        DEDUP_LIVE_BYTES.fetch_sub(self.bytes, Ordering::Relaxed);
+        DEDUP_LIVE_ENTRIES.fetch_sub(self.entries, Ordering::Relaxed);
+    }
 }

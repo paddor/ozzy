@@ -74,6 +74,8 @@ pub struct OperationIndexEntry {
 /// Entries derived from one canonical operation without retaining its payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DerivedIndexEntries {
+    /// Numeric selector for every operation, including payload-free appends.
+    pub location: OperationLocation,
     /// Record-offset selectors in canonical sorted order.
     pub offsets: Vec<OffsetIndexEntry>,
     /// Message-identity selectors in canonical sorted order.
@@ -103,16 +105,20 @@ pub fn derive_index_entries(
         operation_id,
         location,
     });
-    let OperationBody::Append(append) = body else {
-        return Ok(DerivedIndexEntries {
-            offsets: Vec::new(),
-            messages: Vec::new(),
-            operation: operation_entry,
-        });
+    let batches = match &body {
+        OperationBody::Append(append) => append.batches.as_slice(),
+        OperationBody::ResolvedAppend(append) => std::slice::from_ref(&append.batch),
+        _ => {
+            return Ok(DerivedIndexEntries {
+                location,
+                offsets: Vec::new(),
+                messages: Vec::new(),
+                operation: operation_entry,
+            });
+        }
     };
 
-    let record_count = append
-        .batches
+    let record_count = batches
         .iter()
         .try_fold(0_usize, |count, batch| {
             count.checked_add(batch.records.len())
@@ -120,7 +126,7 @@ pub fn derive_index_entries(
         .ok_or(IndexError::PositionOverflow)?;
     let mut offsets = Vec::with_capacity(record_count);
     let mut messages = Vec::with_capacity(record_count);
-    for (batch_index, batch) in append.batches.iter().enumerate() {
+    for (batch_index, batch) in batches.iter().enumerate() {
         let batch_index = u32::try_from(batch_index).map_err(|_| IndexError::PositionOverflow)?;
         for (record_index, record) in batch.records.iter().enumerate() {
             let delta = u64::try_from(record_index).map_err(|_| IndexError::PositionOverflow)?;
@@ -155,6 +161,7 @@ pub fn derive_index_entries(
         }
     }
     Ok(DerivedIndexEntries {
+        location,
         offsets,
         messages,
         operation: None,

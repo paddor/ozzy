@@ -37,11 +37,14 @@ fn recurring_control_replies_do_not_starve_data_with_one_send_slot() {
                     .unwrap();
             }
         }
+        // Each flush follows observed send progress, as a completed wait would.
         for _ in 0..round % 3 {
+            unblock(&mut dispatcher, peer.peer);
             dispatcher
                 .flush_replies(|message| Err(TrySendError::Full(message)))
                 .unwrap();
         }
+        unblock(&mut dispatcher, peer.peer);
         let mut available = true;
         dispatcher
             .flush_replies(|message| {
@@ -55,6 +58,39 @@ fn recurring_control_replies_do_not_starve_data_with_one_send_slot() {
             .unwrap();
     }
     assert_eq!(sent, [4, 4]);
+}
+
+fn unblock(dispatcher: &mut Dispatcher, peer: NodeId) {
+    dispatcher.unblock(peer, 0);
+    dispatcher.unblock(peer, 1);
+}
+
+#[test]
+fn refused_classes_wait_for_send_progress_before_another_attempt() {
+    let (mut dispatcher, _lanes, _, peer) = fixture();
+    dispatcher
+        .try_reply(Class::Control, message(peer, Opcode::Commit, b""))
+        .unwrap();
+    let mut attempts = 0;
+    for _ in 0..3 {
+        dispatcher
+            .flush_replies(|message| {
+                attempts += 1;
+                Err(TrySendError::Full(message))
+            })
+            .unwrap();
+    }
+    assert_eq!(attempts, 1);
+    assert!(dispatcher.is_blocked(peer.peer, 0));
+    let probes: Vec<_> = dispatcher
+        .blocked()
+        .map(|(node, class, _)| (node, class))
+        .collect();
+    assert_eq!(probes, [(peer.peer, 0)]);
+    dispatcher.unblock(peer.peer, 0);
+    let progress = dispatcher.flush_replies(|_| Ok(())).unwrap();
+    assert_eq!(progress.control, SendAttempt::Submitted);
+    assert!(!dispatcher.has_replies());
 }
 
 #[test]

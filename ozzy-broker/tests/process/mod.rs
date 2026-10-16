@@ -119,6 +119,30 @@ async fn cli_tcp_three_brokers_restart_and_confirm_replicated_persisting() {
     .unwrap();
 }
 
+#[cfg(feature = "lz4-transport")]
+#[tokio::test(flavor = "current_thread")]
+async fn cli_lz4_tcp_three_brokers_restart_and_confirm_disk_quorum() {
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        cluster::orderly_restart_in(cluster::Cluster::lz4(ozzy_config::Confirmation::DiskQuorum)),
+    )
+    .await
+    .unwrap();
+}
+
+#[cfg(feature = "zstd-transport")]
+#[tokio::test(flavor = "current_thread")]
+async fn cli_zstd_tcp_three_brokers_restart_and_confirm_disk_quorum() {
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        cluster::orderly_restart_in(cluster::Cluster::zstd(
+            ozzy_config::Confirmation::DiskQuorum,
+        )),
+    )
+    .await
+    .unwrap();
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn cli_tcp_saved_producer_resumes_and_takes_over_after_broker_kills() {
     for policy in [

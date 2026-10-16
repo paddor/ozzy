@@ -8,6 +8,24 @@ use tokio::runtime::Handle;
 
 use crate::signal::CloseSignal;
 
+thread_local! {
+    // Bootstrap factories run through Tokio's Send handle on this same thread.
+    // LocalSet::spawn_local also works outside a currently polled local task.
+    static EXECUTOR: std::cell::RefCell<std::rc::Weak<tokio::task::LocalSet>> = const { std::cell::RefCell::new(std::rc::Weak::new()) };
+}
+
+pub(in crate::replicated) fn spawn_local<F: Future + 'static>(
+    future: F,
+) -> tokio::task::JoinHandle<F::Output> {
+    EXECUTOR.with(|executor| {
+        executor
+            .borrow()
+            .upgrade()
+            .expect("SDK local executor")
+            .spawn_local(future)
+    })
+}
+
 /// Background execution shared by native writer clients. Callers may use any
 /// executor, or poll writer futures with a plain-thread executor.
 ///
@@ -56,6 +74,21 @@ impl WriterRuntime {
         &self.0.sdk
     }
 
+    /// Create local owner state only after entering the SDK executor.
+    pub(in crate::replicated) async fn on_owner<F, Fut, T>(
+        &self,
+        start: F,
+    ) -> Result<T, tokio::task::JoinError>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = T> + 'static,
+        T: Send + 'static,
+    {
+        self.driver()
+            .spawn(async move { spawn_local(start()).await })
+            .await?
+    }
+
     /// Stop the SDK executor immediately, without draining producers. Fault
     /// tests retain the OMQ context and restart a distinct SDK owner.
     #[cfg(feature = "simulation")]
@@ -75,11 +108,16 @@ fn start(name: &str, stop: CloseSignal) -> std::io::Result<(Handle, JoinHandle<(
                 .enable_all()
                 .build();
             match runtime {
-                Ok(runtime) => runtime.block_on(async move {
-                    if ready.send(Ok(Handle::current())).is_ok() {
-                        stop.closed().await;
-                    }
-                }),
+                Ok(runtime) => {
+                    let executor = std::rc::Rc::new(tokio::task::LocalSet::new());
+                    EXECUTOR
+                        .with(|current| *current.borrow_mut() = std::rc::Rc::downgrade(&executor));
+                    runtime.block_on(executor.run_until(async move {
+                        if ready.send(Ok(Handle::current())).is_ok() {
+                            stop.closed().await;
+                        }
+                    }));
+                }
                 Err(error) => {
                     let _ = ready.send(Err(error));
                 }

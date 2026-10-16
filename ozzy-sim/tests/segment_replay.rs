@@ -41,6 +41,7 @@ fn bodies() -> [OperationBody<'static>; 3] {
             topic: "topic",
             partition_id: PartitionId::new(7),
             owner_epoch: OwnerEpoch::new(9),
+            dedup_window_millis: None,
             retention: RetentionPolicy::default(),
         }),
         OperationBody::OpenProducer(OpenProducer {

@@ -2,6 +2,9 @@ use super::*;
 use crate::{CheckpointError, CheckpointReference, checkpoint_name, open_checkpoint};
 use ozzy_proto::CheckpointId;
 
+mod inbox;
+mod ranges;
+
 fn id() -> CheckpointId {
     CheckpointId::from_bytes([0x77; 16])
 }

@@ -1,9 +1,10 @@
 use super::{
-    ActorIds, Arc, BTreeMap, Bootstrap, CLIENTS, Config, DataReceiver, GroupId, JournalConfig,
-    JournalGeneration, JournalPlan, NativeAccess, NativeIntake, NativeIntakeConfig, Outbound,
-    PartitionActors, Policy, ShardContext, StartupError, State, WRITER_WINDOW, WRITERS, failure,
-    frontend,
+    ActorIds, Arc, BTreeMap, Bootstrap, COORDINATOR_PLANS, Config, DataReceiver, GroupCoordinator,
+    GroupCoordinatorConfig, GroupId, JournalConfig, JournalGeneration, JournalPlan, NativeAccess,
+    NativeIntake, NativeIntakeConfig, Outbound, PartitionActors, Policy, ShardContext,
+    StartupError, State, TopicTopology, WRITER_WINDOW, WRITERS, failure, frontend,
 };
+use std::time::Duration;
 
 pub(super) async fn build(
     shard: &ShardContext,
@@ -13,6 +14,8 @@ pub(super) async fn build(
 ) -> Result<State, StartupError> {
     let mut actors = Vec::new();
     let mut natives = Vec::new();
+    let mut coordinators = Vec::new();
+    let topologies = topologies(&config)?;
     let mut bootstrap = Vec::new();
     let mut recoveries = BTreeMap::new();
     let mut identities = Vec::new();
@@ -40,23 +43,12 @@ pub(super) async fn build(
                 continue;
             }
             let mut started = Box::pin(open_actor(shard, plan, &config)).await?;
-            let initialized = (|| {
-                started
-                    .actor
-                    .bind_receive_owner(&shard.memory.replica)
-                    .map_err(failure)?;
-                started.actor.enable_publication();
-                started.prepare_partition()?;
-                let native = native_config(&config, group, plan.incarnation, policy);
-                native_intake(
-                    &mut started.actor,
-                    native,
-                    &shard.memory.data,
-                    &shard.memory.control,
-                )
-            })();
+            let initialized = initialize_started(&mut started, shard, &config, plan, &topologies);
             match initialized {
-                Ok(native) => natives.push(native),
+                Ok((native, coordinator)) => {
+                    natives.push(native);
+                    coordinators.push(coordinator);
+                }
                 Err(error) => {
                     actors.push(started.actor);
                     return Err(error);
@@ -77,6 +69,7 @@ pub(super) async fn build(
     .await;
     if let Err(error) = initialized {
         drop(natives);
+        drop(coordinators);
         drop(bootstrap);
         for actor in actors {
             let _ = actor.shutdown().await;
@@ -93,6 +86,7 @@ pub(super) async fn build(
     Ok(State {
         actors,
         natives,
+        coordinators,
         identities,
         bootstrap,
         recoveries,
@@ -111,6 +105,38 @@ pub(super) async fn build(
         group_cursor: 0,
         config,
     })
+}
+
+fn initialize_started(
+    started: &mut crate::StartedPartition,
+    shard: &ShardContext,
+    config: &Config,
+    plan: &crate::PartitionJournal,
+    topologies: &BTreeMap<String, Arc<TopicTopology>>,
+) -> Result<(NativeIntake, GroupCoordinator), StartupError> {
+    let (policy, _, group) = profile(&plan.config);
+    started
+        .actor
+        .bind_receive_owner(&shard.memory.replica)
+        .map_err(failure)?;
+    started.actor.enable_publication();
+    started.prepare_partition()?;
+    let native = native_config(config, plan, group, policy);
+    let native = native_intake(
+        &mut started.actor,
+        native,
+        &shard.memory.data,
+        &shard.memory.control,
+    )?;
+    let coordinator = coordinator_service(
+        &mut started.actor,
+        config,
+        plan,
+        group,
+        topologies,
+        &shard.memory.control,
+    )?;
+    Ok((native, coordinator))
 }
 
 fn scheduled(
@@ -211,7 +237,7 @@ pub(super) fn recovered_services(
     config: &Config,
     data_memory: &ozzy_runtime::memory::Owner,
     control: &ozzy_runtime::memory::Owner,
-) -> Result<(Bootstrap, NativeIntake), StartupError> {
+) -> Result<(Bootstrap, NativeIntake, GroupCoordinator), StartupError> {
     let (policy, _, group) = profile(&plan.config);
     let crate::ActorSettings::Replicated {
         actor: settings, ..
@@ -229,10 +255,12 @@ pub(super) fn recovered_services(
         .ok_or_else(|| failure("missing recovered bootstrap lane"))?;
     let native = native_intake(
         actor,
-        native_config(config, group, plan.incarnation, policy),
+        native_config(config, plan, group, policy),
         data_memory,
         control,
     )?;
+    let coordinator =
+        coordinator_service(actor, config, plan, group, &topologies(config)?, control)?;
     Ok((
         Bootstrap {
             group,
@@ -242,7 +270,84 @@ pub(super) fn recovered_services(
             done: false,
         },
         native,
+        coordinator,
     ))
+}
+
+/// Immutable topic shapes shared by every coordinator of a topic.
+fn topologies(config: &Config) -> Result<BTreeMap<String, Arc<TopicTopology>>, StartupError> {
+    let mut topologies: BTreeMap<String, (u64, Vec<(u32, ozzy_proto::PartitionIncarnation)>)> =
+        BTreeMap::new();
+    for page in &config.catalog {
+        let entry = topologies
+            .entry(page.name.clone())
+            .or_insert_with(|| (page.partitioner_seed, Vec::new()));
+        if entry.0 != page.partitioner_seed {
+            return Err(failure("topic pages disagree on the partitioner seed"));
+        }
+        entry.1.extend(
+            page.partitions
+                .iter()
+                .map(|partition| (partition.number, partition.incarnation)),
+        );
+    }
+    Ok(topologies
+        .into_iter()
+        .map(|(name, (seed, mut partitions))| {
+            partitions.sort_by_key(|(number, _)| *number);
+            (name, Arc::new(TopicTopology { seed, partitions }))
+        })
+        .collect())
+}
+
+fn coordinator_service(
+    actor: &mut ozzy_runtime::replica_actor::PartitionActor,
+    config: &Config,
+    plan: &crate::PartitionJournal,
+    group: GroupId,
+    topologies: &BTreeMap<String, Arc<TopicTopology>>,
+    control: &ozzy_runtime::memory::Owner,
+) -> Result<GroupCoordinator, StartupError> {
+    let (_, body_bytes, _) = profile(&plan.config);
+    let topology = topologies
+        .get(&plan.placement.topic)
+        .ok_or_else(|| failure("partition topic is missing from the catalog"))?
+        .clone();
+    let fixed = 341 + 122 * topology.partitions.len();
+    let max_members = body_bytes
+        .saturating_sub(fixed)
+        .checked_div(48)
+        .unwrap_or(0)
+        .clamp(1, ozzy_proto::group::MAX_MEMBERS);
+    let coordinator = GroupCoordinatorConfig {
+        local: config.local,
+        group,
+        partition: plan.incarnation,
+        number: plan.placement.partition,
+        topology,
+        limits: config.envelope,
+        requests: config.clients,
+        plans: COORDINATOR_PLANS,
+        max_members,
+        membership_timeout: Duration::from_secs(10),
+        drain_deadline: Duration::from_secs(5),
+    };
+    let arenas = (0..COORDINATOR_PLANS)
+        .map(|_| {
+            let mut arena = actor
+                .lease_proposal_buffer_with_limits(ozzy_replication::PipelineLimits {
+                    max_operations: 1,
+                    max_body_bytes: coordinator.plan_bytes(),
+                })
+                .map_err(failure)?;
+            arena.bind_owner(control).map_err(failure)?;
+            Ok(arena)
+        })
+        .collect::<Result<Vec<_>, StartupError>>()?;
+    let submitter = actor
+        .take_submitter()
+        .ok_or_else(|| failure("missing coordinator proposal lane"))?;
+    GroupCoordinator::new(coordinator, submitter, arenas).map_err(failure)
 }
 
 fn native_intake(
@@ -252,8 +357,7 @@ fn native_intake(
     control: &ozzy_runtime::memory::Owner,
 ) -> Result<NativeIntake, StartupError> {
     let count = native
-        .access
-        .required_buffers(native.requests_per_writer)
+        .required_buffers()
         .ok_or_else(|| failure("native arena overflow"))?;
     // Each writer's slots start with its writer-open arena.
     let stride = native.requests_per_writer + 1;
@@ -264,7 +368,7 @@ fn native_intake(
                     native.buffer_limits(index).expect("fixed native slot"),
                 )
                 .map_err(failure)?;
-            if index < WRITERS * stride && index.is_multiple_of(stride) {
+            if index >= WRITERS * stride || index.is_multiple_of(stride) {
                 buffer.bind_owner(control).map_err(failure)?;
             } else {
                 buffer.bind_owner(data_memory).map_err(failure)?;
@@ -278,23 +382,42 @@ fn native_intake(
     NativeIntake::new(native, submitter, buffers).map_err(failure)
 }
 
+/// Consumer progress updates one partition proposal carries at most.
+const PROGRESS_BATCH: usize = 16;
+
+/// A batch must fit the actor's live window and, replicated, one packet.
+fn progress_batch(plan: &crate::PartitionJournal) -> usize {
+    let window = match &plan.config {
+        JournalConfig::Local(config) => config.append_limits.max_operations,
+        JournalConfig::Replicated(config) => config.append_limits.max_operations,
+    };
+    let packet = match &plan.actors {
+        crate::ActorSettings::Replicated { actor, .. } => actor.transfer.max_operations,
+        crate::ActorSettings::Local(_) => window,
+    };
+    PROGRESS_BATCH.min(window).min(packet)
+}
+
 fn native_config(
     config: &Config,
+    plan: &crate::PartitionJournal,
     group: GroupId,
-    partition: ozzy_proto::PartitionIncarnation,
     policy: Policy,
 ) -> NativeIntakeConfig {
     NativeIntakeConfig {
         local: config.local,
         group,
-        partition,
+        partition: plan.incarnation,
         policy,
         access: NativeAccess::TrustedClients {
-            clients: CLIENTS,
+            clients: config.clients,
             writers: WRITERS,
         },
         limits: config.limits,
+        reserve_dedup_results: plan.placement.deduplication.is_some(),
         requests_per_writer: WRITER_WINDOW,
+        progress_requests: config.clients,
+        progress_batch: progress_batch(plan),
         turn_slots: 16,
     }
 }

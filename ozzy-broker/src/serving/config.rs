@@ -1,7 +1,7 @@
 use super::{Binding, Registration, failure};
 use crate::{CheckedConfig, StartupError, TransportLimits};
 use omq_tokio::Endpoint;
-use ozzy_proto::{NodeId, data::DataLimits, handshake};
+use ozzy_proto::{NodeId, data::DataLimits, directory::EndpointScheme, handshake};
 use ozzy_runtime::{
     dispatch::{Budget, Budgets},
     frontend::{self, Access, DataSender, Kind, ReceiveBuffers, ReceiveStorage, Service},
@@ -9,20 +9,26 @@ use ozzy_runtime::{
 };
 use std::{collections::BTreeMap, time::Duration};
 
-pub(super) const CLIENTS: usize = 32;
 pub(super) const WRITERS: usize = 32;
 /// APPENDs one writer may have in flight on one partition. The partition
 /// actor owns these request slots; OMQ and the shard queue backpressure intake.
 pub(super) const WRITER_WINDOW: usize = 3;
-/// Proposal arenas of one partition's native intake: per writer, one open
-/// slot and its APPEND slots, plus one rejection slot per client.
-pub(crate) const NATIVE_ARENAS: usize = WRITERS * (WRITER_WINDOW + 1) + CLIENTS;
+/// Coordinator plan proposals one partition may have in flight.
+pub(super) const COORDINATOR_PLANS: usize = 2;
+/// Proposal arenas of one partition's native services: per writer, one open
+/// slot and its APPEND slots, client rejection and consumer control slots,
+/// plus the coordinator's plan arenas.
+pub(crate) const fn native_arenas(clients: usize) -> usize {
+    WRITERS * (WRITER_WINDOW + 1) + 2 * clients + COORDINATOR_PLANS
+}
 type Handoffs = Vec<(u32, tokio::sync::oneshot::Sender<super::Binding>)>;
 
 pub(super) struct Config {
     pub time: super::context::Time,
     pub omq: omq_tokio::Context,
     pub local: NodeId,
+    /// SDK link owners admitted at once (`limits.max_clients`).
+    pub clients: usize,
     pub limits: DataLimits,
     pub envelope: ozzy_proto::EnvelopeLimits,
     pub buffers: ReceiveBuffers,
@@ -70,6 +76,7 @@ impl Config {
         let super::ServingContext { omq, time } = context;
         let deployment = checked.deployment.deployment();
         let local = NodeId::from_bytes(*checked.identity.brokers[&checked.plan.name].as_bytes());
+        let clients = deployment.limits.max_clients;
         let limits = native_limits(checked)?;
         let body = deployment
             .topics
@@ -101,18 +108,14 @@ impl Config {
             ));
         }
         let endpoints = &deployment.brokers[&checked.plan.name].endpoints;
-        let inproc = endpoints.peer.starts_with("inproc://");
-        let buffers = ReceiveBuffers::new(
-            envelope,
-            if inproc {
-                ReceiveStorage::Inproc {
-                    payload_backing_bytes: body,
-                }
-            } else {
-                ReceiveStorage::Stream { message_bytes }
+        let storage = match EndpointScheme::parse(&endpoints.peer) {
+            Some((EndpointScheme::Inproc, _)) => ReceiveStorage::Inproc {
+                payload_backing_bytes: body,
             },
-        )
-        .map_err(failure)?;
+            Some((scheme, _)) if scheme.compressed() => compressed_storage(message_bytes)?,
+            _ => ReceiveStorage::Stream { message_bytes },
+        };
+        let buffers = ReceiveBuffers::new(envelope, storage).map_err(failure)?;
         let brokers = checked
             .identity
             .brokers
@@ -153,11 +156,12 @@ impl Config {
             time,
             omq,
             local,
+            clients,
             limits,
             envelope,
             buffers,
             transport,
-            peers: CLIENTS + brokers.len(),
+            peers: clients + brokers.len(),
             brokers,
             followers,
             budgets,
@@ -269,7 +273,7 @@ impl Config {
             frontend::LinkIds::random(),
         )
         .map_err(failure)?
-        .with_trusted_clients(CLIENTS)
+        .with_trusted_clients(self.clients)
         .map_err(failure)?;
         service
             .install_catalog(
@@ -286,8 +290,8 @@ impl Config {
                 frontend::WatchRegistry::new(
                     frontend::WatchLimits {
                         partitions: self.maximum_partitions,
-                        peers: CLIENTS,
-                        registrations: CLIENTS * 1024,
+                        peers: self.clients,
+                        registrations: self.clients * 1024,
                         interests_per_registration: 256,
                         pending_per_registration: 256,
                     },
@@ -303,7 +307,10 @@ impl Config {
         let mut parameters =
             handshake::Parameters::streaming(self.limits, handshake::OWNER | (1 << 3))
                 .map_err(failure)?;
-        parameters.capabilities |= handshake::OWNER_ROUTING | handshake::OWNER_READ;
+        parameters.capabilities |= handshake::OWNER_ROUTING
+            | handshake::OWNER_READ
+            | handshake::OWNER_PROGRESS
+            | handshake::OWNER_GROUPS;
         // Readers and writers share this endpoint and negotiate independent
         // command families. SDK profiles require their own capabilities.
         parameters.required_capabilities = 0;
@@ -408,17 +415,34 @@ fn catalog(checked: &CheckedConfig) -> Result<Vec<ozzy_proto::directory::TopicPa
 
 fn native_limits(checked: &CheckedConfig) -> Result<DataLimits, StartupError> {
     let deployment = checked.deployment.deployment();
-    let native_body = deployment
-        .topics
-        .values()
-        .map(|topic| topic.max_append_bytes)
+    let mut profiles = deployment.topics.values().map(|topic| {
+        let resolved = topic.deduplication.is_some();
+        let header =
+            ozzy_journal::operation::append_metadata_bound(1, 0, resolved).expect("fixed header");
+        let row = ozzy_journal::operation::append_metadata_bound(1, 1, resolved)
+            .expect("fixed row")
+            - header;
+        (
+            topic.max_append_bytes as usize,
+            header,
+            row,
+            topic
+                .deduplication
+                .map_or(2048, |policy| (policy.max_entries as usize).min(2048)),
+        )
+    });
+    let records = profiles
+        .clone()
+        .map(|(body, header, row, count)| count.min(body.saturating_sub(header) / (row + 1)))
         .min()
-        .ok_or_else(|| failure("no topics"))? as usize;
-    let records = 2048.min(native_body.saturating_sub(89) / 25).max(1);
-    let payload = native_body
-        .checked_sub(89 + 24 * records)
-        .filter(|bytes| *bytes > 0)
-        .ok_or_else(|| failure("native request bound too small"))?;
+        .ok_or_else(|| failure("no topics"))?
+        .max(1);
+    let payload = profiles.try_fold(usize::MAX, |minimum, (body, header, row, _)| {
+        body.checked_sub(header + row * records)
+            .filter(|bytes| *bytes > 0)
+            .map(|bytes| minimum.min(bytes))
+            .ok_or_else(|| failure("native request bound too small"))
+    })?;
     Ok(DataLimits {
         envelope: ozzy_proto::EnvelopeLimits {
             max_metadata_bytes: 64 * 1024,
@@ -428,4 +452,17 @@ fn native_limits(checked: &CheckedConfig) -> Result<DataLimits, StartupError> {
         max_parts: records,
         max_record_bytes: payload,
     })
+}
+
+#[cfg(any(feature = "lz4-transport", feature = "zstd-transport"))]
+#[expect(clippy::unnecessary_wraps, reason = "matches the featureless refusal")]
+fn compressed_storage(message_bytes: usize) -> Result<ReceiveStorage, StartupError> {
+    Ok(ReceiveStorage::Compressed { message_bytes })
+}
+
+#[cfg(not(any(feature = "lz4-transport", feature = "zstd-transport")))]
+fn compressed_storage(_: usize) -> Result<ReceiveStorage, StartupError> {
+    Err(failure(
+        "compressed endpoints need the lz4-transport or zstd-transport feature",
+    ))
 }

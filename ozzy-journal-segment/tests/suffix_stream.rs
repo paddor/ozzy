@@ -77,6 +77,7 @@ fn partition_bodies(count: u8, name: &str, operation_limits: OperationLimits) ->
                     topic: name,
                     partition_id: PartitionId::new(u32::from(id)),
                     owner_epoch: OwnerEpoch::new(1),
+                    dedup_window_millis: None,
                     retention: RetentionPolicy::default(),
                 }),
                 operation_limits,

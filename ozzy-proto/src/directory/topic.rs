@@ -358,6 +358,68 @@ fn name_valid(name: &str) -> bool {
         })
 }
 
+/// Transport scheme of a broker endpoint. Compressed schemes transform each
+/// connection on its OMQ I/O thread. A broker receives every socket through
+/// one buffer profile, so a deployment compresses every endpoint or none.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EndpointScheme {
+    /// Plain `tcp://host:port`.
+    Tcp,
+    /// `lz4+tcp://host:port`.
+    Lz4Tcp,
+    /// `zstd+tcp://host:port`.
+    ZstdTcp,
+    /// `ipc://` filesystem or abstract socket path.
+    Ipc,
+    /// `inproc://` name within one OMQ context.
+    Inproc,
+}
+
+impl EndpointScheme {
+    const ALL: [Self; 5] = [
+        Self::Tcp,
+        Self::Lz4Tcp,
+        Self::ZstdTcp,
+        Self::Ipc,
+        Self::Inproc,
+    ];
+
+    /// Split an endpoint into its scheme and the address after `://`.
+    #[must_use]
+    pub fn parse(endpoint: &str) -> Option<(Self, &str)> {
+        Self::ALL.into_iter().find_map(|scheme| {
+            endpoint
+                .strip_prefix(scheme.as_str())
+                .and_then(|rest| rest.strip_prefix("://"))
+                .map(|address| (scheme, address))
+        })
+    }
+
+    /// The scheme without `://`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Lz4Tcp => "lz4+tcp",
+            Self::ZstdTcp => "zstd+tcp",
+            Self::Ipc => "ipc",
+            Self::Inproc => "inproc",
+        }
+    }
+
+    /// TCP, with or without a per-connection transform.
+    #[must_use]
+    pub const fn is_tcp(self) -> bool {
+        matches!(self, Self::Tcp | Self::Lz4Tcp | Self::ZstdTcp)
+    }
+
+    /// Connections are compressed on the OMQ I/O thread.
+    #[must_use]
+    pub const fn compressed(self) -> bool {
+        matches!(self, Self::Lz4Tcp | Self::ZstdTcp)
+    }
+}
+
 fn endpoint_valid(endpoint: &str) -> bool {
     if !(1..=MAX_ENDPOINT).contains(&endpoint.len())
         || endpoint
@@ -366,26 +428,27 @@ fn endpoint_valid(endpoint: &str) -> bool {
     {
         return false;
     }
-    if let Some(address) = endpoint.strip_prefix("tcp://") {
-        if let Ok(address) = address.parse::<SocketAddr>() {
-            return address.port() > 0
-                && !address.ip().is_unspecified()
-                && !address.ip().is_multicast();
+    match EndpointScheme::parse(endpoint) {
+        Some((scheme, address)) if scheme.is_tcp() => {
+            if let Ok(address) = address.parse::<SocketAddr>() {
+                return address.port() > 0
+                    && !address.ip().is_unspecified()
+                    && !address.ip().is_multicast();
+            }
+            address.rsplit_once(':').is_some_and(|(host, port)| {
+                !host.is_empty()
+                    && host
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+                    && port.parse::<u16>().is_ok_and(|port| port > 0)
+            })
         }
-        return address.rsplit_once(':').is_some_and(|(host, port)| {
-            !host.is_empty()
-                && host
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
-                && port.parse::<u16>().is_ok_and(|port| port > 0)
-        });
+        Some((EndpointScheme::Ipc, name)) => {
+            name.starts_with('/') || (name.starts_with('@') && name.len() > 1)
+        }
+        Some((EndpointScheme::Inproc, name)) => !name.is_empty(),
+        _ => false,
     }
-    if let Some(name) = endpoint.strip_prefix("ipc://") {
-        return name.starts_with('/') || (name.starts_with('@') && name.len() > 1);
-    }
-    endpoint
-        .strip_prefix("inproc://")
-        .is_some_and(|name| !name.is_empty())
 }
 
 fn write_name(out: &mut Vec<u8>, name: &str) {

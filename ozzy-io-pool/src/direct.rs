@@ -116,10 +116,9 @@ impl Write {
         let Self { file, mut job } = self;
         drop(file);
         drop(job.operation.take());
-        job.reply
-            .take()
-            .expect("one reply")
-            .finish(result.map(Outcome::Written));
+        let result = result.map(Outcome::Written);
+        job.observe_finish(&result);
+        job.reply.take().expect("one reply").finish(result);
     }
 }
 
@@ -176,6 +175,7 @@ impl Queue {
                 return None;
             }
             job.executing = executing;
+            job.observe_start();
             let file = if self.shared.failed.load(Ordering::Acquire) {
                 Err(io::ErrorKind::BrokenPipe.into())
             } else {
@@ -187,13 +187,14 @@ impl Queue {
             match file {
                 Ok(Some(file)) => return Some(Write { file, job }),
                 Ok(None) => {
-                    job.reply
-                        .take()
-                        .expect("one reply")
-                        .finish(Err(io::ErrorKind::InvalidInput.into()));
+                    let result = Err(io::ErrorKind::InvalidInput.into());
+                    job.observe_finish(&result);
+                    job.reply.take().expect("one reply").finish(result);
                 }
                 Err(error) => {
-                    job.reply.take().expect("one reply").finish(Err(error));
+                    let result = Err(error);
+                    job.observe_finish(&result);
+                    job.reply.take().expect("one reply").finish(result);
                 }
             }
         }

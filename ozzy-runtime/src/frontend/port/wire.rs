@@ -8,7 +8,7 @@ use bytes::Bytes;
 use omq_tokio::{Message, message::Payload};
 use ozzy_proto::{Envelope, EnvelopeLimits, LinkSessionId, Opcode, RequestId, directory};
 
-const HEADER_BYTES: usize = 26;
+const HEADER_BYTES: usize = 34;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct Key {
@@ -42,7 +42,8 @@ impl Status {
 }
 
 pub(super) enum Action {
-    Reply(Class, Message),
+    /// A reply with its shard's per-destination send sequence.
+    Reply(Class, Message, u64),
     Publication(Message),
     Route(RouteState),
 }
@@ -74,6 +75,9 @@ pub(super) fn command(
     header[16..24].copy_from_slice(&key.id.to_be_bytes());
     header[24] = command.kind();
     header[25] = u8::from(class == Class::Control);
+    if let Command::Reply { sequence, .. } = command {
+        header[26..34].copy_from_slice(&sequence.to_be_bytes());
+    }
     let mut body = match command {
         Command::Reply { message, .. } | Command::Publication { message, .. } => {
             retention.message(message.clone())
@@ -121,7 +125,11 @@ pub(super) fn decode(
         return Err(PortError::Frames);
     }
     let action = match bytes[24] {
-        0 if matches!(message.len(), 2 | 4) => Action::Reply(class, message),
+        0 if matches!(message.len(), 2 | 4) => Action::Reply(
+            class,
+            message,
+            u64::from_be_bytes(bytes[26..34].try_into().unwrap()),
+        ),
         1 if message.len() == 4 => Action::Publication(message),
         2 => Action::Route(decode_route(&message)?),
         _ => return Err(PortError::Frames),

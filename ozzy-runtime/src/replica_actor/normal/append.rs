@@ -72,7 +72,28 @@ impl ReplicaActor {
                     self.complete_proposal(proposal, now)?;
                 }
                 if let Some(validated) = turn.validated {
-                    self.complete_received(validated?, now)?;
+                    match validated {
+                        crate::replica_journal::ReceivedValidation::Ready(validated) => {
+                            self.complete_received(validated, now)?;
+                        }
+                        crate::replica_journal::ReceivedValidation::Deferred {
+                            validation,
+                            buffer,
+                        } => {
+                            if self.driver.normal().is_some_and(|normal| {
+                                let state = normal.snapshot();
+                                state.scope == validation.scope()
+                                    && state.journal.generation == validation.generation()
+                            }) {
+                                self.work.receive.defer(buffer);
+                            } else {
+                                self.recycle(buffer);
+                            }
+                        }
+                        crate::replica_journal::ReceivedValidation::Rejected(error) => {
+                            return Err(error.into());
+                        }
+                    }
                 }
                 if let Some(ticket) = turn.applied {
                     self.complete_applied(ticket)?;
@@ -225,8 +246,23 @@ impl ReplicaActor {
         result: ProposalValidation,
         now: Duration,
     ) -> Result<(), ActorError> {
-        let reply = self.work.validating.take().expect("owned proposal reply");
-        let mut validated = match result {
+        let reply = self
+            .work
+            .proposals
+            .validated()
+            .expect("owned proposal reply");
+        let validated = match result {
+            ProposalValidation::Deferred {
+                validation,
+                reason,
+                buffer,
+            } => {
+                self.defer_proposal(
+                    super::ProposalWait { validation, reason },
+                    Submission { buffer, reply },
+                );
+                return Ok(());
+            }
             ProposalValidation::Ready(validated) => validated,
             ProposalValidation::Resolved {
                 validation,
@@ -241,6 +277,15 @@ impl ReplicaActor {
                 return Ok(());
             }
         };
+        self.admit_proposal(validated, reply, now)
+    }
+
+    fn admit_proposal(
+        &mut self,
+        mut validated: crate::replica_journal::ValidatedAppend,
+        reply: super::Reply,
+        now: Duration,
+    ) -> Result<(), ActorError> {
         if reply.fenced() {
             reply.finish(validated.into_buffer().into(), ProposalOutcome::NotAdmitted);
             return Ok(());
@@ -259,16 +304,12 @@ impl ReplicaActor {
                     crate::profiling::event(crate::profiling::Event::ReplicaStaleValidation);
                     let buffer =
                         crate::replica_journal::ProposalBuffer::from(validated.into_buffer());
-                    if !buffer.has_trimmed_retry()
+                    if !reply.is_maintenance()
+                        && !buffer.has_trimmed_retry()
                         && self.application_ready()
                         && self.driver.scope() == validation.scope()
                     {
-                        assert!(
-                            self.work
-                                .waiting
-                                .replace(Submission { buffer, reply })
-                                .is_none()
-                        );
+                        self.work.proposals.requeue(Submission { buffer, reply });
                     } else {
                         reply.finish(buffer, ProposalOutcome::NotAdmitted);
                     }
@@ -320,6 +361,25 @@ impl ReplicaActor {
         Ok(())
     }
 
+    fn defer_proposal(&mut self, original: super::ProposalWait, submission: Submission) {
+        crate::profiling::event(match original.reason {
+            crate::replica_journal::ProposalDeferral::Original(_) => {
+                crate::profiling::Event::OriginalWait
+            }
+            _ => crate::profiling::Event::CapacityDeferral,
+        });
+        if !submission.reply.fenced()
+            && self.application_ready()
+            && self.driver.scope() == original.validation.scope()
+        {
+            self.work.proposals.defer(submission, original);
+        } else {
+            submission
+                .reply
+                .finish(submission.buffer, ProposalOutcome::NotAdmitted);
+        }
+    }
+
     fn complete_retry(
         &mut self,
         validation: ozzy_replication::driver::ValidationTicket,
@@ -328,12 +388,7 @@ impl ReplicaActor {
     ) {
         if self.driver.begin_validation().ok() != Some(validation) {
             if self.application_ready() && self.driver.scope() == validation.scope() {
-                assert!(
-                    self.work
-                        .waiting
-                        .replace(Submission { buffer, reply })
-                        .is_none()
-                );
+                self.work.proposals.requeue(Submission { buffer, reply });
             } else {
                 reply.finish(buffer, ProposalOutcome::NotAdmitted);
             }

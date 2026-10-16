@@ -5,6 +5,7 @@ type Scheduled = ScheduledReplica;
 
 mod disconnected;
 mod donors;
+mod groups;
 mod history;
 mod native;
 mod publications;
@@ -98,11 +99,11 @@ fn cluster_with_operation_count(
     (actors, pending.unwrap())
 }
 
-fn round(actors: &mut [Scheduled], blocked: bool) {
+pub(super) fn round(actors: &mut [Scheduled], blocked: bool) {
     round_at(actors, Duration::ZERO, blocked);
 }
 
-fn round_at(actors: &mut [Scheduled], now: Duration, blocked: bool) {
+pub(super) fn round_at(actors: &mut [Scheduled], now: Duration, blocked: bool) {
     for (to, message) in collect(actors, now, blocked) {
         actors[to].receive(&message, now).unwrap();
     }
@@ -257,7 +258,10 @@ fn opcode(message: &Message) -> ozzy_proto::Opcode {
     }
 }
 
-fn settle(controller: &mut Controller, held: &[JobId]) {
+pub(in crate::replica_journal::owned::tests) fn settle(
+    controller: &mut Controller,
+    held: &[JobId],
+) {
     for (id, _) in controller.jobs() {
         if !held.contains(&id) {
             controller.execute(id, Effect::Normal).unwrap();
@@ -266,7 +270,7 @@ fn settle(controller: &mut Controller, held: &[JobId]) {
     }
 }
 
-fn close(controller: &mut Controller, actor: Scheduled) {
+pub(super) fn close(controller: &mut Controller, actor: Scheduled) {
     let mut closing = std::pin::pin!(actor.shutdown());
     for _ in 0..10000 {
         if let Poll::Ready(result) = poll(closing.as_mut()) {

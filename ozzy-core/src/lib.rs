@@ -4,6 +4,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod checkpoint;
+pub mod dedup;
 pub mod live;
 pub mod reader;
 pub mod retention;

@@ -1,6 +1,9 @@
 //! Immutable, chunked checkpoint artifacts.
 
 pub(crate) mod asynchronous;
+mod manifest_builder;
+mod stream;
+pub(crate) use manifest_builder::ManifestBuilder;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -24,7 +27,7 @@ const CHECKPOINT_VERSION: u16 = 2;
 const CHECKPOINT_MANIFEST_FILE: &str = "manifest";
 const CHECKPOINT_MANIFEST_HASH_CONTEXT: &str = "ozzy journal checkpoint manifest v1";
 const CHECKPOINT_CHUNK_HASH_CONTEXT: &str = "ozzy journal checkpoint chunk v1";
-const CHECKPOINT_STATE_HASH_CONTEXT: &str = "ozzy journal checkpoint state v1";
+pub(crate) const CHECKPOINT_STATE_HASH_CONTEXT: &str = "ozzy journal checkpoint state v1";
 const CHECKPOINT_DIGEST_START: usize = 256;
 const CHECKPOINT_DIGEST_END: usize = 288;
 
@@ -217,14 +220,10 @@ impl CheckpointImage {
         let capacity = usize::try_from(self.manifest.state_bytes)
             .map_err(|_| CheckpointError::LengthOverflow)?;
         let mut state = Vec::with_capacity(capacity);
-        for chunk in &self.manifest.chunks {
-            let bytes =
-                read_exact_chunk(&self.root.join(chunk_name(chunk.ordinal)), *chunk, limits)?;
-            state.extend_from_slice(&bytes);
-        }
-        if state_digest(&state) != self.manifest.state_digest {
-            return Err(CheckpointError::DigestMismatch("checkpoint state"));
-        }
+        self.visit_state(limits, |bytes| {
+            state.extend_from_slice(bytes);
+            Ok::<_, CheckpointError>(())
+        })?;
         Ok(state)
     }
 }
@@ -503,60 +502,11 @@ fn manifest_for_state(
     state: &[u8],
     limits: CheckpointLimits,
 ) -> Result<CheckpointManifest, CheckpointError> {
-    validate_spec(spec, limits)?;
-    let state_bytes = usize_to_u64(state.len())?;
-    enforce_u64(
-        "checkpoint state bytes",
-        state_bytes,
-        limits.max_state_bytes,
-    )?;
-    if state.is_empty() {
-        return Err(CheckpointError::EmptyState);
+    let mut builder = ManifestBuilder::new(spec, usize_to_u64(state.len())?, limits)?;
+    for bytes in state.chunks(spec.chunk_bytes) {
+        builder.append(bytes)?;
     }
-    let count = state.len().div_ceil(spec.chunk_bytes);
-    enforce_usize("checkpoint chunk count", count, limits.max_chunks)?;
-    let manifest_bytes = count
-        .checked_mul(CHECKPOINT_CHUNK_ENTRY_BYTES)
-        .and_then(|bytes| bytes.checked_add(CHECKPOINT_HEADER_BYTES))
-        .ok_or(CheckpointError::LengthOverflow)?;
-    enforce_usize(
-        "checkpoint manifest bytes",
-        manifest_bytes,
-        limits.max_manifest_bytes,
-    )?;
-    let chunks = state
-        .chunks(spec.chunk_bytes)
-        .enumerate()
-        .map(|(ordinal, bytes)| {
-            let ordinal = u32::try_from(ordinal).map_err(|_| CheckpointError::LengthOverflow)?;
-            let logical_offset = u64::from(ordinal)
-                .checked_mul(usize_to_u64(spec.chunk_bytes)?)
-                .ok_or(CheckpointError::LengthOverflow)?;
-            Ok(CheckpointChunk {
-                ordinal,
-                logical_offset,
-                bytes: usize_to_u64(bytes.len())?,
-                digest: chunk_digest(bytes),
-            })
-        })
-        .collect::<Result<Vec<_>, CheckpointError>>()?;
-    let manifest = CheckpointManifest {
-        group_id: spec.group_id,
-        store_id: spec.store_id,
-        checkpoint_id: spec.checkpoint_id,
-        position: spec.position,
-        configuration_epoch: spec.configuration_epoch,
-        source_manifest_generation: spec.source_manifest_generation,
-        source_manifest_digest: spec.source_manifest_digest,
-        state_schema_digest: spec.state_schema_digest,
-        state_bytes,
-        chunk_bytes: u32::try_from(spec.chunk_bytes)
-            .map_err(|_| CheckpointError::LengthOverflow)?,
-        state_digest: state_digest(state),
-        chunks,
-    };
-    validate_manifest(&manifest, limits)?;
-    Ok(manifest)
+    builder.finish()
 }
 
 fn validate_spec(spec: CheckpointSpec, limits: CheckpointLimits) -> Result<(), CheckpointError> {
@@ -697,30 +647,6 @@ fn validate_chunk_file(
     Ok(())
 }
 
-fn read_exact_chunk(
-    path: &Path,
-    chunk: CheckpointChunk,
-    limits: CheckpointLimits,
-) -> Result<Vec<u8>, CheckpointError> {
-    require_regular_file(path, "checkpoint chunk")?;
-    enforce_u64(
-        "checkpoint chunk bytes",
-        chunk.bytes,
-        limits.max_chunk_bytes as u64,
-    )?;
-    let length = usize::try_from(chunk.bytes).map_err(|_| CheckpointError::LengthOverflow)?;
-    let mut bytes = vec![0_u8; length];
-    let mut file = File::open(path)?;
-    if file.metadata()?.len() != chunk.bytes {
-        return Err(CheckpointError::LengthMismatch);
-    }
-    file.read_exact(&mut bytes)?;
-    if chunk_digest(&bytes) != chunk.digest {
-        return Err(CheckpointError::DigestMismatch("checkpoint chunk"));
-    }
-    Ok(bytes)
-}
-
 fn encode_chunk(chunk: CheckpointChunk, output: &mut [u8; CHECKPOINT_CHUNK_ENTRY_BYTES]) {
     put_u32(output, 0, chunk.ordinal);
     put_u64(output, 8, chunk.logical_offset);
@@ -749,18 +675,6 @@ fn manifest_digest(input: &[u8]) -> Digest {
         CHECKPOINT_DIGEST_START,
         CHECKPOINT_DIGEST_END,
     )
-}
-
-fn chunk_digest(input: &[u8]) -> Digest {
-    let mut hasher = Hasher::new(CHECKPOINT_CHUNK_HASH_CONTEXT);
-    hasher.update(input);
-    hasher.finish()
-}
-
-fn state_digest(input: &[u8]) -> Digest {
-    let mut hasher = Hasher::new(CHECKPOINT_STATE_HASH_CONTEXT);
-    hasher.update(input);
-    hasher.finish()
 }
 
 fn hash_zeroed(context: &str, input: &[u8], start: usize, end: usize) -> Digest {
@@ -881,7 +795,11 @@ fn enforce_usize(kind: &'static str, actual: usize, limit: usize) -> Result<(), 
     }
 }
 
-fn enforce_u64(kind: &'static str, actual: u64, limit: u64) -> Result<(), CheckpointError> {
+pub(crate) fn enforce_u64(
+    kind: &'static str,
+    actual: u64,
+    limit: u64,
+) -> Result<(), CheckpointError> {
     if actual > limit {
         Err(CheckpointError::LimitExceeded {
             kind,

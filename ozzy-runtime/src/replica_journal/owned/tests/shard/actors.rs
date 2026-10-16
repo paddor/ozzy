@@ -7,10 +7,11 @@ use crate::replica_journal::InstallationConfig;
 use crate::replica_transport::QueueLimits;
 use omq_tokio::Message;
 use ozzy_proto::LinkSessionId;
+mod dedup;
 mod identities;
 mod maintenance;
 mod recovery;
-mod scheduled;
+pub(in crate::replica_journal::owned::tests) mod scheduled;
 
 type Actor = ControlledReplica;
 
@@ -258,25 +259,48 @@ fn unstarted_actor(
     broker: u8,
     identities: usize,
 ) -> ReplicaActor {
-    unstarted_actor_with_sessions(
+    configured_actor(
         controller,
         io,
         group,
         policy,
         broker,
-        identities,
-        actor_config().sessions,
+        ActorSettings {
+            identities,
+            ..Default::default()
+        },
     )
 }
 
-fn unstarted_actor_with_sessions(
+thread_local! {
+    /// Leader logical clock for actors this thread configures.
+    static CLOCK: std::cell::Cell<u64> = const { std::cell::Cell::new(123) };
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActorSettings {
+    identities: usize,
+    sessions: [LinkSessionId; 3],
+    deduplication: Option<ozzy_core::dedup::Limits>,
+}
+
+impl Default for ActorSettings {
+    fn default() -> Self {
+        Self {
+            identities: 64,
+            sessions: actor_config().sessions,
+            deduplication: None,
+        }
+    }
+}
+
+fn configured_actor(
     controller: &mut Controller,
     io: &Local,
     group: u8,
     policy: QuorumPolicy,
     broker: u8,
-    identities: usize,
-    sessions: [LinkSessionId; 3],
+    settings: ActorSettings,
 ) -> ReplicaActor {
     let leader = group % 3;
     let mut config = config(&format!("/g{group}-b{broker}"), group + 4, policy);
@@ -294,7 +318,12 @@ fn unstarted_actor_with_sessions(
     .unwrap();
     config.identity.replica_node_id = NodeId::from_bytes([broker + 1; 16]);
     config.append_buffers = 12;
-    config.recovery.retained_identities = if broker == leader { identities } else { 8 };
+    config.deduplication = settings.deduplication;
+    config.recovery.retained_identities = if broker == leader {
+        settings.identities
+    } else {
+        8
+    };
     let (owner, startup) = drive(
         controller,
         OwnedJournal::format_new(
@@ -311,7 +340,7 @@ fn unstarted_actor_with_sessions(
                 turn_steps: 4,
                 ..Default::default()
             },
-            || 123,
+            || CLOCK.with(std::cell::Cell::get),
         )
         .unwrap();
     let ids = crate::replica_actor::ActorIds::deterministic(
@@ -321,7 +350,7 @@ fn unstarted_actor_with_sessions(
         journal,
         startup,
         ActorConfig {
-            sessions,
+            sessions: settings.sessions,
             ..actor_config()
         },
         ids,

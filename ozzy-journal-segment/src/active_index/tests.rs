@@ -126,7 +126,15 @@ fn cooperative_active_index_cancellation_limits_and_duplicate_keys_keep_scan_unc
         crate::DecodeLimits::default(),
     )
     .unwrap();
-    for cut in [1, 2, 3, 10] {
+    let (_, polls) = run(ActiveSegmentIndex::build_async(
+        &scan,
+        130,
+        OperationLimits::default(),
+        IndexLimits::default(),
+    ));
+    let pending = polls - 1;
+    assert!(pending >= 2);
+    for cut in [1, 2, pending / 2, pending] {
         let mut future = Box::pin(ActiveSegmentIndex::build_async(
             &scan,
             130,

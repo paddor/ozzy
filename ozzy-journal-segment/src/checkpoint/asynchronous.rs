@@ -2,6 +2,9 @@
 //! manifest codec, names and chunk/state digests. No filesystem calls here.
 
 mod build;
+mod read;
+pub(crate) use build::{Builder, Config as BuildConfig, Prepared as PreparedBuild};
+pub(crate) use read::Reader;
 
 use super::{
     CHECKPOINT_CHUNK_HASH_CONTEXT, CHECKPOINT_MANIFEST_FILE, CHECKPOINT_STATE_HASH_CONTEXT,
@@ -24,6 +27,10 @@ pub(crate) struct Checkpoint {
 }
 
 impl Checkpoint {
+    pub(crate) const fn fragment_bytes(&self) -> usize {
+        self.chunk_bytes
+    }
+
     pub(crate) async fn read_range(
         &self,
         offset: u64,
@@ -46,23 +53,64 @@ impl Checkpoint {
             chunk.bytes,
             limits.max_chunk_bytes as u64,
         )?;
-        let mut bytes = self
-            .access
-            .read_file(
-                self.root.join(chunk_name(chunk.ordinal)),
-                length,
-                self.chunk_bytes,
-            )
-            .await?;
-        let mut hasher = Hasher::new(CHECKPOINT_CHUNK_HASH_CONTEXT);
-        hasher.update(&bytes);
-        if bytes.len() != length || hasher.finish() != chunk.digest {
-            return Err(CheckpointError::DigestMismatch("checkpoint chunk"));
-        }
         let start = usize::try_from(offset - chunk.logical_offset)
             .map_err(|_| CheckpointError::LengthOverflow)?;
-        bytes.drain(..start);
-        bytes.truncate(maximum);
+        let count = maximum.min(
+            length
+                .checked_sub(start)
+                .ok_or(CheckpointError::LengthMismatch)?,
+        );
+        let file = self
+            .access
+            .open(
+                self.root.join(chunk_name(chunk.ordinal)),
+                OpenMode::Read,
+                false,
+                false,
+            )
+            .await?;
+        let result = async {
+            if self.access.length(&file).await? != chunk.bytes {
+                return Err(CheckpointError::LengthMismatch);
+            }
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(count)
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
+            let mut scratch = Vec::new();
+            let mut hasher = Hasher::new(CHECKPOINT_CHUNK_HASH_CONTEXT);
+            let mut through = 0;
+            while through < length {
+                scratch.clear();
+                self.access
+                    .read_append(
+                        &file,
+                        through as u64,
+                        self.chunk_bytes.min(length - through),
+                        self.chunk_bytes,
+                        &mut scratch,
+                    )
+                    .await?;
+                hasher.update(&scratch);
+                let from = start.max(through);
+                let end = (start + count).min(through + scratch.len());
+                if from < end {
+                    bytes.extend_from_slice(&scratch[from - through..end - through]);
+                }
+                through += scratch.len();
+            }
+            if self.access.length(&file).await? != chunk.bytes {
+                return Err(CheckpointError::LengthMismatch);
+            }
+            if hasher.finish() != chunk.digest {
+                return Err(CheckpointError::DigestMismatch("checkpoint chunk"));
+            }
+            Ok(bytes)
+        }
+        .await;
+        let closed = self.access.done(Operation::Close { handle: file }).await;
+        let bytes = result?;
+        closed?;
         Ok(bytes)
     }
 
@@ -110,47 +158,11 @@ impl Checkpoint {
         limits: CheckpointLimits,
         mut state: Option<&mut Vec<u8>>,
     ) -> Result<(), CheckpointError> {
-        let mut state_hasher = Hasher::new(CHECKPOINT_STATE_HASH_CONTEXT);
-        for chunk in &self.manifest.chunks {
-            enforce_u64(
-                "checkpoint chunk bytes",
-                chunk.bytes,
-                limits.max_chunk_bytes as u64,
-            )?;
-            let file = self
-                .access
-                .open(
-                    self.root.join(chunk_name(chunk.ordinal)),
-                    OpenMode::Read,
-                    false,
-                    false,
-                )
-                .await?;
-            if self.access.length(&file).await? != chunk.bytes {
-                return Err(CheckpointError::LengthMismatch);
+        let mut reader = Reader::new(self, limits);
+        while let Some(bytes) = reader.next(self.chunk_bytes).await? {
+            if let Some(state) = &mut state {
+                state.extend_from_slice(&bytes);
             }
-            let mut hasher = Hasher::new(CHECKPOINT_CHUNK_HASH_CONTEXT);
-            let mut offset = 0;
-            while offset < chunk.bytes {
-                let wanted = (chunk.bytes - offset).min(self.chunk_bytes as u64) as usize;
-                let bytes = self
-                    .access
-                    .read_range(&file, offset, wanted, self.chunk_bytes)
-                    .await?;
-                hasher.update(&bytes);
-                state_hasher.update(&bytes);
-                if let Some(state) = &mut state {
-                    state.extend_from_slice(&bytes);
-                }
-                offset += wanted as u64;
-            }
-            self.access.done(Operation::Close { handle: file }).await?;
-            if hasher.finish() != chunk.digest {
-                return Err(CheckpointError::DigestMismatch("checkpoint chunk"));
-            }
-        }
-        if state_hasher.finish() != self.manifest.state_digest {
-            return Err(CheckpointError::DigestMismatch("checkpoint state"));
         }
         Ok(())
     }

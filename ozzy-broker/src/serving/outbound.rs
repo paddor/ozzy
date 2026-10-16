@@ -9,7 +9,7 @@ use ozzy_runtime::{
     frontend::{Pending, Port, PublicationError, PublicationResult, ReplyError, ReplyResult},
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     future::Future,
     pin::Pin,
     task::{Context, Poll},
@@ -32,13 +32,23 @@ struct Entry {
     state: State,
     retry: Duration,
     queued: Option<Instant>,
+    /// Send order across this shard's replies. One destination class receives
+    /// its replies in this order; the dispatcher refuses a later sequence
+    /// while an earlier refused one awaits re-admission.
+    sequence: u64,
 }
 
 pub(super) struct Outbound {
     slots: Vec<Option<Entry>>,
+    /// Free data and control slots. Data slots come first in `slots`.
+    free: [Vec<usize>; 2],
     usage: BTreeMap<(NodeId, Class), (usize, usize)>,
     limits: [usize; 2],
-    next: usize,
+    sequence: u64,
+    /// Occupied slots in send order, oldest first. A turn visits only these.
+    order: VecDeque<(u64, usize)>,
+    /// Destination classes whose oldest unsent reply stayed unsent this turn.
+    held: Vec<(NodeId, Class)>,
     publications: [Option<Publication>; 2],
     publication_bytes: usize,
     envelope: EnvelopeLimits,
@@ -46,11 +56,17 @@ pub(super) struct Outbound {
 
 impl Outbound {
     pub(super) fn new(peers: usize, message_bytes: usize, envelope: EnvelopeLimits) -> Self {
+        let slots = peers * 12;
+        let data = slots / 3;
         Self {
-            slots: (0..peers * 12).map(|_| None).collect(),
+            slots: (0..slots).map(|_| None).collect(),
+            // Popped from the back, so the lowest index is reused first.
+            free: [(0..data).rev().collect(), (data..slots).rev().collect()],
             usage: BTreeMap::new(),
             limits: [message_bytes * 4, 1024 * 1024],
-            next: 0,
+            sequence: 0,
+            order: VecDeque::with_capacity(slots),
+            held: Vec::with_capacity(8),
             publications: [None, None],
             publication_bytes: message_bytes + 2048,
             envelope,
@@ -105,24 +121,21 @@ impl Outbound {
         {
             return Err(TrySendError::Full(message));
         }
-        let data_slots = self.slots.len() / 3;
-        let slots = if class == Class::Data {
-            &mut self.slots[..data_slots]
-        } else {
-            &mut self.slots[data_slots..]
-        };
-        let Some(slot) = slots.iter_mut().find(|slot| slot.is_none()) else {
+        let Some(slot) = self.free[usize::from(class != Class::Data)].pop() else {
             return Err(TrySendError::Full(message));
         };
         self.usage
             .insert((peer, class), (usage.0 + 1, usage.1 + bytes));
-        *slot = Some(Entry {
+        self.sequence += 1;
+        self.order.push_back((self.sequence, slot));
+        self.slots[slot] = Some(Entry {
             peer,
             class,
             bytes,
             state: State::Ready(message),
             retry: Duration::ZERO,
             queued: ozzy_runtime::profiling::start(),
+            sequence: self.sequence,
         });
         Ok(())
     }
@@ -137,25 +150,16 @@ impl Outbound {
         for slot in 0..2 {
             self.poll_publication(cx, port, slot)?;
         }
-        // Bound the turn by occupied entries. New entries take the first free
-        // slot of their class, so a window over all slots reaches them once
-        // per complete pass and holds per-peer capacity for many turns.
-        let mut occupied = self
-            .usage
-            .values()
-            .map(|usage| usage.0)
-            .sum::<usize>()
-            .min(64);
-        for _ in 0..self.slots.len() {
-            if occupied == 0 {
-                break;
-            }
-            let index = self.next;
-            self.next = (index + 1) % self.slots.len();
+        // Visit the oldest entries first, at most 64 per turn. One destination
+        // class is handed over in send order: once its oldest unsent reply
+        // stays unsent, its later replies wait for a following turn.
+        self.held.clear();
+        let mut released = false;
+        for position in 0..self.order.len().min(64) {
+            let index = self.order[position].1;
             let Some(mut entry) = self.slots[index].take() else {
                 continue;
             };
-            occupied -= 1;
             if let State::Pending(pending) = &mut entry.state {
                 match Pin::new(pending).poll(cx) {
                     Poll::Pending => {
@@ -176,6 +180,8 @@ impl Outbound {
                         if usage.0 == 0 {
                             self.usage.remove(&(entry.peer, entry.class));
                         }
+                        self.free[usize::from(entry.class != Class::Data)].push(index);
+                        released = true;
                         cx.waker().wake_by_ref();
                         continue;
                     }
@@ -190,25 +196,35 @@ impl Outbound {
                     Poll::Ready(Err(error)) => return Err(failure(error)),
                 }
             }
+            let destination = (entry.peer, entry.class);
             if now >= entry.retry
+                && !self.held.contains(&destination)
                 && let State::Ready(message) = entry.state
             {
-                entry.state = match port.try_reply(entry.class, message, entry.bytes) {
-                    Ok(pending) => State::Pending(pending),
-                    Err((ozzy_runtime::frontend::PortError::Admission(_), message)) => {
-                        ozzy_runtime::profiling::event(
-                            ozzy_runtime::profiling::Event::ShardPortRefusal,
-                        );
-                        entry.retry = now + Duration::from_millis(10);
-                        State::Ready(message)
-                    }
-                    Err((error, _)) => return Err(failure(error)),
-                };
+                entry.state =
+                    match port.try_reply(entry.class, message, entry.bytes, entry.sequence) {
+                        Ok(pending) => State::Pending(pending),
+                        Err((ozzy_runtime::frontend::PortError::Admission(_), message)) => {
+                            ozzy_runtime::profiling::event(
+                                ozzy_runtime::profiling::Event::ShardPortRefusal,
+                            );
+                            entry.retry = now + Duration::from_millis(10);
+                            State::Ready(message)
+                        }
+                        Err((error, _)) => return Err(failure(error)),
+                    };
                 if matches!(entry.state, State::Pending(_)) {
                     cx.waker().wake_by_ref();
                 }
             }
+            if matches!(entry.state, State::Ready(_)) && !self.held.contains(&destination) {
+                self.held.push(destination);
+            }
             self.slots[index] = Some(entry);
+        }
+        if released {
+            let slots = &self.slots;
+            self.order.retain(|&(_, index)| slots[index].is_some());
         }
         Ok(())
     }
@@ -271,10 +287,14 @@ mod tests {
     }
 
     fn frame(opcode: Opcode, bytes: usize) -> Message {
+        frame_id(opcode, bytes, 1)
+    }
+
+    fn frame_id(opcode: Opcode, bytes: usize, id: u8) -> Message {
         let envelope = Envelope {
             opcode,
             response: false,
-            request_id: (opcode != Opcode::PreparePub).then_some(RequestId::from_bytes([1; 16])),
+            request_id: (opcode != Opcode::PreparePub).then_some(RequestId::from_bytes([id; 16])),
             sender: NodeId::from_bytes([2; 16]),
             session: (opcode != Opcode::PreparePub).then_some(LinkSessionId::from_bytes([3; 16])),
         };
@@ -301,6 +321,187 @@ mod tests {
                 1
             );
         }
+    }
+
+    /// A dispatcher thread with one broker peer, as production sizes it, whose
+    /// per-peer reply queues hold `queued` messages.
+    fn dispatcher(
+        queued: usize,
+    ) -> (
+        ozzy_runtime::frontend::Service,
+        Port,
+        ozzy_runtime::frontend::DataReceiver,
+    ) {
+        use ozzy_proto::{GroupId, PartitionIncarnation, data::DataLimits, handshake};
+        use ozzy_runtime::{
+            dispatch::{Budget, Budgets},
+            frontend::{
+                Access, Dispatcher, DispatcherLimits, Kind, LinkIds, Placement, ReplyLimits,
+                RoutingTable, Service,
+            },
+            replica_transport::QueueLimits,
+        };
+        let budgets = Budgets {
+            data: Budget {
+                queue_slots: 8,
+                retained_messages: 8,
+                bytes: 1024 * 1024,
+            },
+            control: Budget {
+                queue_slots: 16,
+                retained_messages: 16,
+                bytes: 1024 * 1024,
+            },
+        };
+        let (sender, shard) = ozzy_runtime::frontend::data_channel(
+            &omq_tokio::Context::new(),
+            0,
+            Kind::Client,
+            Class::Control,
+            8,
+            128 * 1024,
+            1024 * 1024,
+        )
+        .unwrap();
+        let routes = RoutingTable::new(
+            &[0],
+            &[Placement {
+                shard: 0,
+                group: GroupId::from_bytes([10; 16]),
+                partition: PartitionIncarnation::from_bytes([20; 16]),
+            }],
+            1,
+            limits(),
+        )
+        .unwrap();
+        let queue = QueueLimits {
+            messages: queued,
+            bytes: 1024 * 1024,
+            message_bytes: 128 * 1024,
+        };
+        let dispatcher = Dispatcher::new(
+            NodeId::from_bytes([9; 16]),
+            routes,
+            vec![(0, sender)],
+            DispatcherLimits {
+                peers: 2,
+                replies: ReplyLimits {
+                    control: queue,
+                    data: queue,
+                },
+            },
+        )
+        .unwrap();
+        let mut parameters =
+            handshake::Parameters::streaming(DataLimits::default(), handshake::OWNER | 8).unwrap();
+        parameters.capabilities |= handshake::OWNER_READ | (1 << 3) | (1 << 8);
+        parameters.required_capabilities = 0;
+        let mut service = Service::new(
+            dispatcher,
+            parameters,
+            &[Access {
+                peer: NodeId::from_bytes([4; 16]),
+                kind: Kind::Broker,
+            }],
+            LinkIds::random(),
+        )
+        .unwrap();
+        let port = service
+            .port(&omq_tokio::Context::new(), 0, budgets)
+            .unwrap();
+        (service, port, shard)
+    }
+
+    /// Bind peer 4 as a broker link and return its binding.
+    fn bind(service: &mut ozzy_runtime::frontend::Service) -> ozzy_runtime::frontend::Binding {
+        use ozzy_proto::{data::DataLimits, handshake};
+        use ozzy_runtime::frontend::{LinkIds, LinkSessions};
+        let peer = NodeId::from_bytes([4; 16]);
+        let mut parameters =
+            handshake::Parameters::streaming(DataLimits::default(), handshake::OWNER | 8).unwrap();
+        parameters.capabilities |= handshake::OWNER_READ | (1 << 3) | (1 << 8);
+        parameters.required_capabilities = 0;
+        let remote =
+            LinkSessions::with_ids(peer, parameters, handshake::OWNER, 1, LinkIds::random())
+                .unwrap();
+        let hello = Message::with_prefix(
+            Bytes::copy_from_slice(peer.as_bytes()),
+            Message::multipart(remote.start(NodeId::from_bytes([9; 16])).unwrap()),
+        );
+        service.receive(hello, 4096).unwrap();
+        service.links().get(peer).unwrap().binding
+    }
+
+    /// A Commit reply to the bound peer, correlated by `id`.
+    fn bound_frame(binding: ozzy_runtime::frontend::Binding, id: u8) -> Message {
+        let envelope = Envelope {
+            opcode: Opcode::Commit,
+            response: true,
+            request_id: Some(RequestId::from_bytes([id; 16])),
+            sender: NodeId::from_bytes([9; 16]),
+            session: Some(binding.session),
+        };
+        let header = envelope.encode_header(0, 0, limits()).unwrap();
+        Message::with_prefix(
+            Bytes::copy_from_slice(binding.peer.as_bytes()),
+            Message::multipart([Bytes::copy_from_slice(&header), Bytes::new(), Bytes::new()]),
+        )
+    }
+
+    fn commit_id(message: &Message) -> Option<u8> {
+        if message.len() != 4 {
+            return None;
+        }
+        let frames = std::array::from_fn::<_, 3, _>(|i| message.part_slice(i + 1).unwrap());
+        let packet = ozzy_proto::decode_packet(&frames, limits()).ok()?;
+        (packet.envelope.opcode == Opcode::Commit)
+            .then(|| packet.envelope.request_id.map(|id| id.as_bytes()[0]))
+            .flatten()
+    }
+
+    #[test]
+    fn one_destination_receives_replies_in_send_order_across_a_refusal() {
+        let (mut service, mut port, _shard) = dispatcher(1);
+        let binding = bind(&mut service);
+        // Production sizing: 32 clients and the two other brokers.
+        let mut outbound = Outbound::new(34, 128 * 1024, limits());
+        let mut sent = Vec::new();
+        let flush = |service: &mut ozzy_runtime::frontend::Service, sent: &mut Vec<u8>| {
+            while service
+                .flush(|message| {
+                    sent.extend(commit_id(&message));
+                    Ok(())
+                })
+                .unwrap()
+            {}
+        };
+        flush(&mut service, &mut sent);
+        // The dispatcher's queue for this peer is full before the shard sends.
+        service
+            .try_reply(Class::Control, bound_frame(binding, 9))
+            .unwrap();
+        outbound.send(bound_frame(binding, 1)).unwrap();
+        outbound.send(bound_frame(binding, 2)).unwrap();
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let mut now = Duration::from_millis(1);
+        // Reply 1 is refused for capacity. The queued frame then leaves, so
+        // reply 2 would fit, but it must wait behind reply 1's retry.
+        outbound.poll(&mut cx, &mut port, now).unwrap();
+        assert!(service.poll_command().unwrap());
+        flush(&mut service, &mut sent);
+        assert_eq!(sent, [9]);
+        assert!(service.poll_command().unwrap());
+        for _ in 0..64 {
+            now += Duration::from_millis(5);
+            outbound.poll(&mut cx, &mut port, now).unwrap();
+            while service.poll_command().unwrap() {}
+            flush(&mut service, &mut sent);
+            if outbound.usage.is_empty() {
+                break;
+            }
+        }
+        assert!(outbound.usage.is_empty(), "replies still queued: {sent:?}");
+        assert_eq!(sent, [9, 1, 2]);
     }
 
     #[test]

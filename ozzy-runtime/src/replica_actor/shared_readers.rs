@@ -51,7 +51,8 @@ pub(super) struct SharedReaders {
     local: NodeId,
     config: SharedReaderConfig,
     links: Links,
-    slots: Vec<Option<Slot>>,
+    /// Installed subscriptions, at most `config.subscriptions`, preallocated.
+    slots: Vec<Slot>,
     pool: PartitionReadBuffer,
     metadata: Vec<u8>,
     rejection: Option<Message>,
@@ -108,7 +109,7 @@ impl SharedReaders {
             local,
             config,
             links,
-            slots: (0..config.subscriptions).map(|_| None).collect(),
+            slots: Vec::with_capacity(config.subscriptions),
             pool,
             metadata: Vec::with_capacity(config.limits.envelope.max_metadata_bytes),
             rejection: None,
@@ -149,15 +150,12 @@ impl SharedReaders {
     }
 
     fn discard_stale(&mut self) {
-        for slot in &mut self.slots {
-            if slot.as_ref().is_some_and(|slot| {
-                self.links
-                    .get(slot.peer)
-                    .is_none_or(|link| Some(link.binding.session) != slot.delivery.request.session)
-            }) {
-                *slot = None;
-            }
-        }
+        let links = &self.links;
+        self.slots.retain(|slot| {
+            links
+                .get(slot.peer)
+                .is_some_and(|link| Some(link.binding.session) == slot.delivery.request.session)
+        });
         if self.rejection.as_ref().is_some_and(|message| {
             let Some(peer) = message
                 .part_slice(0)

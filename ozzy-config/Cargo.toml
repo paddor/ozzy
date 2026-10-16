@@ -14,6 +14,7 @@ categories = ["config"]
 include = ["/src/**/*.rs", "/README.md", "/LICENSE", "/examples/*.toml"]
 
 [dependencies]
+ozzy-proto.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 toml.workspace = true
@@ -26,3 +27,7 @@ workspace = true
 [[test]]
 name = "ozzy_config"
 path = "tests/config.rs"
+
+[[test]]
+name = "ozzy_dedup_config"
+path = "tests/dedup.rs"

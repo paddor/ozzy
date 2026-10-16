@@ -41,7 +41,7 @@ impl Journal {
                         return Err(CanonicalImagesError::CommittedAfterAccepted.into());
                     }
                     let plan = committed
-                        .prepare(item.operation.op_number, &body, &replay, &committed)
+                        .prepare(item.operation.op_number, &body, &replay)
                         .map_err(CanonicalImagesError::from)?;
                     committed
                         .apply(plan.clone(), &mut replay)
@@ -55,7 +55,7 @@ impl Journal {
                         return Err(CanonicalImagesError::PendingCapacity.into());
                     }
                     let plan = speculative
-                        .prepare(item.operation.op_number, &body, &replay, &committed)
+                        .prepare(item.operation.op_number, &body, &replay)
                         .map_err(CanonicalImagesError::from)?;
                     speculative
                         .apply(plan.clone(), &mut replay)

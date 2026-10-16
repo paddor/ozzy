@@ -193,7 +193,7 @@ fn async_suffix_preserves_exact_protected_fragment_and_old_captured_history() {
             drive(&mut controller, journal.reclaim_unreferenced_segments(8))
                 .unwrap()
                 .removed_segment_ids,
-            []
+            [] as [u64; 0]
         );
         drop(history);
         assert_eq!(

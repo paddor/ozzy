@@ -16,7 +16,6 @@ pub(in crate::replicated::writer) async fn run_shared(
     operation: Option<ozzy_proto::OperationId>,
 ) {
     let stop = shared.stop.clone();
-    let clock = routes.links().clock();
     let links = routes.links().clone();
     let mut opening = Opening::new(operation);
     let work = async {
@@ -30,15 +29,7 @@ pub(in crate::replicated::writer) async fn run_shared(
         routes.interest(number)?;
         let mut backoff = retry.initial_backoff;
         loop {
-            let generation = routes.generation();
-            let route = routes.route(number)?;
-            let Some(route) = route.filter(|route| route.leader.is_some()) else {
-                tokio::select! {
-                    result = routes.changed_after(generation) => result?,
-                    () = clock.until(clock.now().saturating_add(retry.response_timeout)) => routes.refresh(number)?,
-                }
-                continue;
-            };
+            let route = routes.leader(number, retry.response_timeout).await?;
             let remote = route.leader.expect("known route leader");
             let index = routes
                 .metadata()
@@ -68,13 +59,7 @@ pub(in crate::replicated::writer) async fn run_shared(
                 Err(Failure::Fatal(error)) => return Err(error),
                 Err(Failure::Later) => true,
                 Err(Failure::Retry(hint)) => {
-                    if hint.is_some_and(|hint| {
-                        hint.authority.group_id != route.group
-                            || hint.authority.config_epoch != route.config_epoch
-                            || !route.members.contains(&hint.primary)
-                    }) {
-                        return Err(Error::Response);
-                    }
+                    TopicRoutes::validate_hint(hint, &route).map_err(|_| Error::Response)?;
                     false
                 }
             };
@@ -87,20 +72,7 @@ pub(in crate::replicated::writer) async fn run_shared(
             if later {
                 backoff = retry.initial_backoff;
             }
-            let deadline = clock.now().saturating_add(backoff);
-            let moved = loop {
-                let generation = routes.generation();
-                if routes.route(number)?.is_some_and(|current| {
-                    current.leader.is_some()
-                        && (current.view != route.view || current.leader != route.leader)
-                }) {
-                    break true;
-                }
-                tokio::select! {
-                    result = routes.changed_after(generation) => result?,
-                    () = clock.until(deadline) => break false,
-                }
-            };
+            let moved = routes.wait_retry(number, &route, backoff).await?;
             backoff = if moved || later {
                 retry.initial_backoff
             } else {
@@ -126,14 +98,6 @@ async fn attempt(
     retry: RetryPolicy,
     opening: &mut Opening,
 ) -> Result<(), Failure> {
-    let generation = routes.generation();
-    if routes
-        .route(number)
-        .map_err(|error| Failure::Fatal(error.into()))?
-        .is_none_or(|current| current.view != route.view || current.leader != route.leader)
-    {
-        return Err(Failure::Retry(None));
-    }
     let clock = routes.links().clock();
     let remote = route.leader.expect("selected leader");
     let work = async {
@@ -160,29 +124,9 @@ async fn attempt(
             )
             .await
     };
-    while_route(routes, number, route, generation, work).await
-}
-
-async fn while_route(
-    routes: &TopicRoutes,
-    number: u32,
-    route: &ozzy_proto::directory::RouteState,
-    mut generation: crate::replicated::RouteGeneration,
-    work: impl std::future::Future<Output = Result<(), Failure>>,
-) -> Result<(), Failure> {
-    let mut running = std::pin::pin!(work);
-    loop {
-        tokio::select! {
-            result = running.as_mut() => return result,
-            result = routes.changed_after(generation) => {
-                result.map_err(|error| Failure::Fatal(error.into()))?;
-                generation = routes.generation();
-                if routes.route(number).map_err(|error| Failure::Fatal(error.into()))?
-                    .is_none_or(|current| current.view != route.view || current.leader != route.leader)
-                {
-                    return Err(Failure::Retry(None));
-                }
-            }
-        }
+    match routes.while_current(number, route, work).await {
+        Ok(result) => result,
+        Err(crate::replicated::BrokerLinkError::Session) => Err(Failure::Retry(None)),
+        Err(error) => Err(Failure::Fatal(error.into())),
     }
 }

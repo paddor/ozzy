@@ -5,7 +5,9 @@ use super::{
     ProducerSequence, StateError, TransitionPlan, require_id,
 };
 use ahash::AHashSet as HashSet;
-use ozzy_journal::operation::{Append, AppendBatchSummary, AppendSummary};
+use ozzy_journal::operation::{
+    Append, AppendBatchSummary, AppendResults, AppendSummary, ResolvedAppend,
+};
 use smallvec::SmallVec;
 
 // Four or fewer partition cursors stay inline. Larger grouped appends switch
@@ -25,6 +27,35 @@ fn insert_append_partition(
 }
 
 impl CanonicalState {
+    pub(super) fn prepare_resolved_append(
+        &self,
+        op_number: u64,
+        value: &ResolvedAppend<'_>,
+    ) -> Result<TransitionPlan, StateError> {
+        for record in &value.batch.records {
+            require_id("message", record.message_id.as_bytes())?;
+            if record.parts.is_empty() {
+                return Err(StateError::MalformedBody(
+                    "append record must contain at least one part",
+                ));
+            }
+        }
+        self.prepare_resolved_append_summary(
+            op_number,
+            AppendBatchSummary {
+                partition: value.batch.partition,
+                owner_epoch: value.batch.owner_epoch,
+                producer_id: value.batch.producer_id,
+                producer_epoch: value.batch.producer_epoch,
+                first_sequence: value.batch.first_sequence,
+                first_offset: value.batch.first_offset,
+                record_count: value.batch.records.len(),
+                nonzero_message_ids: true,
+            },
+            value.results,
+        )
+    }
+
     pub(super) fn prepare_append(
         &self,
         value: &Append<'_>,
@@ -97,6 +128,54 @@ impl CanonicalState {
     }
 
     fn append_cursor(&self, batch: AppendBatchSummary) -> Result<AppendCursor, StateError> {
+        self.append_coordinates(batch, batch.record_count)
+    }
+
+    /// Validate schema-checked attempt outcomes against this exact state image.
+    /// Sequence results remain distinct from partition-global stored offsets.
+    pub fn prepare_resolved_append_summary(
+        &self,
+        op_number: u64,
+        batch: AppendBatchSummary,
+        results: AppendResults<'_>,
+    ) -> Result<TransitionPlan, StateError> {
+        self.require_next_operation(op_number)?;
+        let _cursor = self.append_coordinates(batch, results.attempts() as usize)?;
+        if batch.record_count != results.stored() as usize {
+            return Err(StateError::MalformedBody(
+                "stored outcomes do not match records",
+            ));
+        }
+        let partition = self.require_partition(batch.partition)?;
+        if results.logical_time() < partition.dedup_time {
+            return Err(StateError::MalformedBody("deduplication time regressed"));
+        }
+        let prepared = partition
+            .producer(batch.producer_id)
+            .expect("validated producer")
+            .prepare_results(batch.first_sequence, batch.first_offset, results, op_number)?;
+        self.check_retry_span_capacity(prepared.additional)?;
+        Ok(TransitionPlan {
+            expected_revision: self.revision,
+            op_number,
+            mutation: Mutation::ResolvedAppend {
+                partition: batch.partition,
+                producer: batch.producer_id,
+                results: prepared,
+                time: results.logical_time(),
+            },
+            claims: Vec::new(),
+        })
+    }
+
+    fn append_coordinates(
+        &self,
+        batch: AppendBatchSummary,
+        attempts: usize,
+    ) -> Result<AppendCursor, StateError> {
+        if attempts == 0 {
+            return Err(StateError::MalformedBody("empty producer assignment"));
+        }
         let partition = self.require_partition(batch.partition)?;
         if batch.owner_epoch != partition.owner_epoch {
             return Err(StateError::OwnerEpochMismatch);
@@ -114,10 +193,11 @@ impl CanonicalState {
             return Err(StateError::OffsetMismatch);
         }
         let count = u64::try_from(batch.record_count).map_err(|_| StateError::PositionExhausted)?;
+        let attempts = u64::try_from(attempts).map_err(|_| StateError::PositionExhausted)?;
         let next_sequence = batch
             .first_sequence
             .get()
-            .checked_add(count)
+            .checked_add(attempts)
             .map(ProducerSequence::new)
             .ok_or(StateError::PositionExhausted)?;
         let next_offset = batch
@@ -143,6 +223,10 @@ impl CanonicalState {
 
     fn check_retry_span_budget(&self, cursors: &[AppendCursor]) -> Result<(), StateError> {
         let additional = cursors.iter().filter(|cursor| cursor.new_span).count();
+        self.check_retry_span_capacity(additional)
+    }
+
+    fn check_retry_span_capacity(&self, additional: usize) -> Result<(), StateError> {
         if self
             .retry_span_count
             .checked_add(additional)

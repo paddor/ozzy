@@ -24,8 +24,35 @@ fn entry(first: u8, count: u8, bytes: usize) -> Entry {
         end: prefix(first + count - 1),
         operations: usize::from(count),
         retained_bytes: bytes,
+        control: false,
         packets: [None, None, None],
     }
+}
+
+#[test]
+fn control_retirement_releases_cached_arenas_without_another_data_append() {
+    let owner = crate::memory::Domain::new(None, 32)
+        .unwrap()
+        .owner(crate::memory::Limits {
+            bytes: 32,
+            buffers: 1,
+            cache_bytes: 32,
+        })
+        .unwrap();
+    let mut cache = Recent::new(PipelineLimits {
+        max_operations: 64,
+        max_body_bytes: 4096,
+    });
+    for first in 1..=32 {
+        let backing = bytes::Bytes::from_owner(owner.try_lease(32).unwrap());
+        let mut packet = entry(first, 1, 32);
+        packet.control = true;
+        packet.packets[1] = Some(Message::multipart([backing]));
+        cache.retain(packet);
+        assert_eq!(cache.operations, 0);
+        assert!(cache.entries.is_empty());
+    }
+    assert!(owner.allocated_bytes() <= 32);
 }
 
 #[test]

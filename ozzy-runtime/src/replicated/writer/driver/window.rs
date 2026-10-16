@@ -67,20 +67,28 @@ impl Window {
         matches!((position(left), position(right)), (Some(left), Some(right)) if left < right)
     }
 
-    fn contains(&self, id: RequestId, first: u64, end: u64) -> bool {
+    /// Sent requests are contiguous from the oldest unconfirmed one through
+    /// `next`. A range is covered when it lies within them and `id` names a
+    /// live request holding part of it, so one reply may span requests.
+    fn covers(&self, id: RequestId, first: u64, end: u64) -> bool {
         self.sent
-            .iter()
-            .any(|sent| sent.id == id && first >= sent.start && end <= sent.end)
+            .front()
+            .is_some_and(|oldest| first >= oldest.start)
+            && end <= self.next
+            && self
+                .sent
+                .iter()
+                .any(|sent| sent.id == id && first < sent.end && end > sent.start)
     }
 
     pub(super) fn accepts(&self, id: RequestId, first: u64, end: u64, confirmed: u64) -> bool {
-        first >= self.first && first <= confirmed && self.contains(id, first, end)
+        first >= self.first && first <= confirmed && self.covers(id, first, end)
     }
 
     /// A sent range that starts after the confirmed prefix. The records
     /// between them stay unconfirmed until their own confirmation arrives.
     pub(super) fn skips(&self, id: RequestId, first: u64, end: u64, confirmed: u64) -> bool {
-        first > confirmed && first < end && self.contains(id, first, end)
+        first > confirmed && first < end && self.covers(id, first, end)
     }
 
     /// Payload retirement supplies the exact newly confirmed byte count.
@@ -172,15 +180,25 @@ mod tests {
     }
 
     #[test]
-    fn one_request_cannot_confirm_another_requests_range() {
+    fn one_reply_can_span_consecutive_requests_it_names() {
         let mut window = Window::new(10, 2);
         window.sent(sent(1, 10, 11, 10));
         window.sent(sent(2, 11, 12, 10));
         let first = RequestId::from_bytes([1; 16]);
         let second = RequestId::from_bytes([2; 16]);
+        // The named request must hold part of the range.
         assert!(!window.accepts(second, 10, 11, 10));
-        assert!(!window.accepts(first, 10, 12, 10));
         assert!(!window.skips(first, 11, 12, 10));
         assert!(window.accepts(first, 10, 11, 10));
+        assert!(window.accepts(first, 10, 12, 10));
+        assert!(window.accepts(second, 10, 12, 10));
+        assert!(window.skips(second, 11, 12, 10));
+        // Never past the sent end or before the oldest unconfirmed request.
+        assert!(!window.accepts(first, 10, 13, 10));
+        window.confirm(11, 10);
+        assert!(!window.accepts(second, 10, 12, 11));
+        assert!(window.accepts(second, 11, 12, 11));
+        window.confirm(12, 10);
+        assert!(window.is_empty());
     }
 }

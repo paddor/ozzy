@@ -16,6 +16,7 @@ fn state(writers: usize, spans: usize, metadata: usize) -> CanonicalState {
         partition_id: PartitionId::new(0),
     };
     let mut partition = CanonicalPartition {
+        dedup_time: 0,
         address: address.clone(),
         owner_epoch: OwnerEpoch::INITIAL,
         producers: ahash::AHashMap::new(),
@@ -23,6 +24,7 @@ fn state(writers: usize, spans: usize, metadata: usize) -> CanonicalState {
         retained_from: Offset::ZERO,
         policy_revision: 1,
         retention: RetentionPolicy::default(),
+        dedup_window_millis: None,
     };
     for writer in 0..writers {
         let mut producer = CanonicalProducer::new(ProducerEpoch::INITIAL);
@@ -45,8 +47,8 @@ fn state(writers: usize, spans: usize, metadata: usize) -> CanonicalState {
     state.producer_count = writers;
     for number in 1..=metadata {
         state.progress.insert(
-            ProgressKey::Subscription(
-                SubscriptionId::from_bytes((number as u128).to_be_bytes()),
+            ProgressKey::ConsumerGroup(
+                ConsumerGroupId::from_bytes((number as u128).to_be_bytes()),
                 id,
             ),
             Offset::ZERO,
@@ -58,6 +60,8 @@ fn state(writers: usize, spans: usize, metadata: usize) -> CanonicalState {
             ),
             AssignmentState {
                 epoch: 1,
+                plan_revision: 1,
+                resume_cursor: Offset::ZERO,
                 member: None,
             },
         );
@@ -105,22 +109,22 @@ fn canonical_snapshot_encoding_bytes_fixture() {
             130,
             0,
             0,
-            9725,
-            0xb727_a0ef_cc94_3eb3_6de4_dab8_f940_5ef6_u128,
+            10773,
+            0x1ada_1786_19db_3292_4992_2026_adea_a60b_u128,
         ),
         (
             2,
             130,
             130,
-            21309,
-            0xeb07_b5aa_f6c4_ec33_046f_41c7_e6d1_1c03_u128,
+            27573,
+            0x9e1a_338c_057f_6ffa_1cc2_14c0_69c6_f3ad_u128,
         ),
         (
             2,
             6000,
             130,
-            303_069,
-            0x4eba_546f_0d42_7452_23fa_323c_bf3d_91f0_u128,
+            497_173,
+            0x47bf_5d68_a0bb_aa64_eb38_867b_f037_5afc_u128,
         ),
     ] {
         let state = state(writers, spans, metadata);
@@ -297,26 +301,36 @@ fn cooperative_state_snapshot_refuses_late_semantic_errors_and_resource_limits()
     let partition = STATE_SNAPSHOT_HEADER_BYTES;
     let names = usize::from(read_u16(&original, partition + 4))
         + usize::from(read_u16(&original, partition + 6));
-    let first = partition + 96 + names;
-    let second = first + 72 + 130 * 24;
+    let first = partition + 104 + names;
+    let second = first + 80 + 130 * 40;
     let progress = partition + read_u32(&original, partition) as usize;
     let assignments = progress + 130 * PROGRESS_BYTES;
     for (at, value, error) in [
-        (second + 72 + 8, 0, StateSnapshotError::InvalidPartition),
+        (second + 80 + 8, 0, StateSnapshotError::InvalidPartition),
         (
-            first + 72 + 129 * 24,
+            first + 80 + 129 * 40,
             999,
             StateSnapshotError::InvalidPartition,
         ),
         (
             progress + 129 * PROGRESS_BYTES + 40,
-            260,
+            261,
             StateSnapshotError::ProgressBeyondState,
         ),
         (
             assignments + 129 * ASSIGNMENT_BYTES + 16,
             99,
             StateSnapshotError::UnknownPartition,
+        ),
+        (
+            assignments + 129 * ASSIGNMENT_BYTES + 64,
+            0,
+            StateSnapshotError::InvalidAssignment,
+        ),
+        (
+            assignments + 129 * ASSIGNMENT_BYTES + 72,
+            1,
+            StateSnapshotError::InvalidAssignment,
         ),
         (88, 3, StateSnapshotError::LengthMismatch),
         (96, 261, StateSnapshotError::LengthMismatch),
@@ -332,7 +346,12 @@ fn cooperative_state_snapshot_refuses_late_semantic_errors_and_resource_limits()
             yield_step,
         ));
         assert!(polls > 1);
-        assert_eq!(result.unwrap_err(), error);
+        assert_eq!(
+            result
+                .map(|_| ())
+                .expect_err("invalid snapshot was accepted"),
+            error
+        );
     }
     let (result, _) = run(CanonicalState::decode_snapshot_cooperative(
         &original,

@@ -5,9 +5,9 @@ use std::{path::PathBuf, rc::Rc};
 
 use super::{
     ActiveSegmentIndex, DecodeLimits, IndexedMessageLocation, IndexedOffsetLocation,
-    IndexedOperationLocation, IndexedReadError, IndexedRecord, JournalIndexError as Error,
-    LogPosition, MessageId, Offset, OperationId, OperationLimits, PartitionIncarnation, ReadLimits,
-    TailState, scan_segment,
+    IndexedOperation, IndexedOperationLocation, IndexedReadError, IndexedRecord,
+    JournalIndexError as Error, LogPosition, MessageId, Offset, OperationId, OperationLimits,
+    PartitionIncarnation, ReadLimits, TailState, scan_segment,
 };
 use crate::{
     GroupIdentity, SegmentReference, async_files::Access, index_catalog::asynchronous::Catalog,
@@ -31,7 +31,7 @@ pub struct Snapshot {
     pub(crate) decode: DecodeLimits,
     pub(crate) operations: OperationLimits,
     pub(crate) chunk: usize,
-    pub(crate) _leases: Rc<[PreparedSegmentLease]>,
+    pub(crate) leases: Rc<[PreparedSegmentLease]>,
 }
 
 impl Snapshot {
@@ -75,6 +75,14 @@ impl Snapshot {
         }
         if position.op_number == self.through.op_number {
             return Ok(position.digest == self.through.digest);
+        }
+        // The selected first segment binds its predecessor, like genesis.
+        if self
+            .references
+            .first()
+            .is_some_and(|first| anchor(first.first_chain) == Some(position))
+        {
+            return Ok(true);
         }
         let Some(reference) = self
             .references
@@ -130,6 +138,50 @@ impl Snapshot {
             .flat_map(|group| &group.operations)
             .find(|operation| operation.op_number == position.op_number)
             .is_some_and(|operation| operation.digest == position.digest))
+    }
+
+    /// Drop sources before `first`, the first segment the same journal still
+    /// selects after retirement, and release their deletion protection. Reads
+    /// no files. When every captured source retired, the view re-anchors at
+    /// the predecessor position `first` binds.
+    pub(crate) fn retain_from(&self, first: SegmentReference) -> Result<Self, Error> {
+        let mismatch = Error::LineageSegmentMismatch(first.segment_id);
+        let at = self
+            .references
+            .partition_point(|reference| reference.segment_id < first.segment_id);
+        let mut retained = match self.references.get(at) {
+            Some(kept)
+                if kept.segment_id != first.segment_id
+                    || kept.file_generation != first.file_generation
+                    || kept.first_chain != first.first_chain =>
+            {
+                return Err(mismatch);
+            }
+            Some(_) if at == 0 => return Ok(self.clone()),
+            Some(_) => self.clone(),
+            None => {
+                let anchor = anchor(first.first_chain)
+                    .filter(|anchor| anchor.op_number >= self.through.op_number)
+                    .ok_or(mismatch)?;
+                Self {
+                    active: None,
+                    active_bytes: 0,
+                    through: anchor,
+                    ..self.clone()
+                }
+            }
+        };
+        retained.references.drain(..at);
+        retained.sealed = self.sealed.retain_from(first.segment_id);
+        retained.leases = self
+            .leases
+            .iter()
+            .filter(|lease| lease.segment_id() >= first.segment_id)
+            .map(PreparedSegmentLease::duplicate)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(crate::DirectoryError::from)?
+            .into();
+        Ok(retained)
     }
 
     /// Read and validate one record at an exact partition-global offset.
@@ -356,6 +408,51 @@ impl Snapshot {
             .await
     }
 
+    /// Resolve any operation number in this pinned prefix, including an append
+    /// containing only duplicates. Later physical writes stay invisible.
+    pub async fn find_operation_number(
+        &self,
+        number: u64,
+    ) -> Result<Option<IndexedOperation>, Error> {
+        if number == 0 || number > self.through.op_number {
+            return Ok(None);
+        }
+        if let Some(active) = &self.active
+            && let Some(location) = active.find_operation_number(number)
+        {
+            return Ok(Some(IndexedOperation {
+                source: active.source(),
+                location,
+            }));
+        }
+        Ok(self
+            .sealed
+            .find_operation_number(number, self.through.op_number)
+            .await?)
+    }
+
+    /// Read authoritative operation bytes with framing and digest validation.
+    /// The captured source remains deletion-protected throughout this file job.
+    pub async fn read_operation_number(
+        &self,
+        number: u64,
+    ) -> Result<Option<crate::DecodedOperation<'static>>, Error> {
+        let Some(indexed) = self.find_operation_number(number).await? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            crate::reader::asynchronous::read_operation(
+                &self.access,
+                self.segment_path(indexed.source.segment_id)?,
+                indexed.source,
+                indexed.location,
+                self.decode,
+                self.chunk,
+            )
+            .await?,
+        ))
+    }
+
     /// Read an exact control operation by retry ID, verifying its canonical
     /// digest and operation identity against the captured index. The snapshot
     /// keeps each referenced segment protected until this read settles.
@@ -443,4 +540,11 @@ impl Snapshot {
         )
         .await?)
     }
+}
+
+fn anchor(chain: ozzy_journal::operation::ChainPosition) -> Option<LogPosition> {
+    Some(LogPosition {
+        op_number: chain.next_op_number().checked_sub(1)?,
+        digest: chain.previous_digest(),
+    })
 }

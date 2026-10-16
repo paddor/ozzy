@@ -14,6 +14,7 @@ brokers own journals, replication, and confirmation. The
 | Partition actor | Its journal, replication state, and reader state on one shard |
 | Transport owner | Shared public sockets, sessions, routing, source admission |
 | Storage backend | File handles, physical jobs, buffers, fixed workers per device |
+| Telemetry | Opt-in thread-owned diagnostics shared by shards, SDKs, and disk workers |
 | Producer / consumer SDK | Separate role state using common session/transport code |
 
 Each shard owns its mutable state on one thread. OMQ inproc connects transport
@@ -30,6 +31,11 @@ Ready work batches within count/byte bounds without a collection delay. Control
 has separate capacity from bulk data. Dequeue releases slots; final aliases
 release backing memory. Cancellation retains accepted jobs and their buffers
 until physical completion. Shards perform no filesystem calls; no io_uring.
+
+`ozzy-telemetry` owns the common diagnostics implementation. Runtime profiling
+reexports it; storage backends use it directly without depending on the runtime.
+Each emitting thread owns its PUB socket. An external SUB collector owns
+aggregation; telemetry never participates in confirmation or admission.
 
 ## Reference map
 

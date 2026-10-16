@@ -11,7 +11,15 @@ pub use broker_links::{
     AppendLinkLimits, BrokerAddress, BrokerLinkError, BrokerLinks, BrokerLinksConfig, ClockError,
     ReaderLinkLimits, RouteGeneration, SdkClock, TopicRoutes,
 };
+mod group_admin;
+pub use group_admin::GroupInspection;
+mod group_reader;
+pub use group_reader::{GroupReader, GroupReaderConfig, GroupReaderError, GroupRecord, GroupStart};
 pub(crate) mod payload;
+pub(crate) mod processing;
+pub use processing::{
+    PendingProgress, ProcessingIdentity, ProcessingToken, ProgressError, ProgressReceipt,
+};
 mod topic_reader;
 mod topic_writer;
 pub use topic_reader::{
@@ -20,7 +28,9 @@ pub use topic_reader::{
 };
 mod writer;
 
-pub use ozzy_proto::append::{Append, AppendKey, Authority, DataLimits, Policy, Record};
+pub use ozzy_proto::append::{
+    Append, AppendDisposition, AppendKey, Authority, DataLimits, Policy, Record,
+};
 pub use ozzy_proto::nack::AuthorityHint;
 use ozzy_proto::nack::RetryClass;
 pub use ozzy_proto::reader::{Source, Target};
@@ -58,21 +68,12 @@ pub struct ClientConfig {
 }
 
 impl ClientConfig {
-    /// Conservative size of one canonical append under the advertised bounds.
-    /// RAM and disk frontends must account for the same fixed fields, record
-    /// descriptors, and part lengths in addition to the wire payload.
-    pub(crate) fn canonical_body_bytes(&self) -> Option<usize> {
-        self.limits
-            .max_records
-            .checked_mul(20)?
-            .checked_add(self.limits.max_parts.checked_mul(4)?)?
-            .checked_add(80)?
-            .checked_add(self.limits.envelope.max_payload_bytes)
-    }
-
     /// Disk groups store codec metadata before the exact raw or LZ4 payload.
-    pub(crate) fn prepared_canonical_body_bytes(&self) -> Option<usize> {
-        self.canonical_body_bytes()?.checked_add(9)
+    pub(crate) fn prepared_canonical_body_bytes(&self, deduplication: bool) -> Option<usize> {
+        ozzy_journal::operation::append_metadata_bound(1, self.limits.max_records, deduplication)?
+            .checked_sub(self.limits.max_records.checked_mul(4)?)?
+            .checked_add(self.limits.max_parts.checked_mul(4)?)?
+            .checked_add(self.limits.envelope.max_payload_bytes)
     }
 }
 

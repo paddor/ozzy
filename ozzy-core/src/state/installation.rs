@@ -37,6 +37,24 @@ impl CanonicalState {
 
     fn apply_mutation(&mut self, mutation: Mutation) {
         match mutation {
+            Mutation::GroupPlan {
+                value,
+                members,
+                sources,
+            } => {
+                self.groups.insert(value.group, value);
+                self.group_member_count = members;
+                self.group_target_count = sources;
+            }
+            Mutation::GroupDelete {
+                group,
+                members,
+                sources,
+            } => {
+                self.groups.remove(&group);
+                self.group_member_count = members;
+                self.group_target_count = sources;
+            }
             Mutation::Create { partition, state } => {
                 self.addresses.insert(state.address.clone(), partition);
                 self.partitions.insert(partition, state);
@@ -52,10 +70,33 @@ impl CanonicalState {
             Mutation::Append(cursors) => {
                 self.install_append(cursors);
             }
+            Mutation::ResolvedAppend {
+                partition,
+                producer,
+                results,
+                time,
+            } => {
+                let state = self
+                    .partitions
+                    .get_mut(&partition)
+                    .expect("validated partition");
+                state.next_offset = results.next_offset;
+                state.dedup_time = time;
+                self.retry_span_count += results.additional;
+                state
+                    .producers
+                    .get_mut(&producer)
+                    .expect("validated producer")
+                    .install_results(results);
+            }
             Mutation::Progress { key, value } => {
                 self.progress.insert(key, value);
             }
             Mutation::Assign { key, value } => {
+                self.progress.insert(
+                    super::ProgressKey::ConsumerGroup(key.0, key.1),
+                    value.resume_cursor,
+                );
                 self.assignments.insert(key, value);
             }
             Mutation::Trim {
@@ -82,6 +123,12 @@ impl CanonicalState {
                 floor,
             } => {
                 self.expire_producer_results(partition, producer, floor);
+            }
+            Mutation::DedupTime { partition, time } => {
+                self.partitions
+                    .get_mut(&partition)
+                    .expect("validated partition")
+                    .dedup_time = time;
             }
             Mutation::Barrier => {}
         }

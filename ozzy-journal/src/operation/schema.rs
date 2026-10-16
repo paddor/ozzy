@@ -1,6 +1,6 @@
 //! Canonical identities, operation bodies, and admission metadata.
 
-use super::{AppendRecordList, OperationCodecError};
+use super::{AppendRecordList, AppendResults, OperationCodecError};
 use ozzy_proto::{
     ConsumerGroupId, ConsumerMemberId, GroupId, MessageId, Offset, OperationId, OwnerEpoch,
     PartitionId, PartitionIncarnation, ProducerEpoch, ProducerId, ProducerSequence, SubscriptionId,
@@ -51,6 +51,14 @@ pub enum OperationKind {
     Barrier = 8,
     /// Advance the retained producer retry-result floor.
     ProducerResultFloor = 9,
+    /// Resolve producer attempts independently of newly stored records.
+    ResolvedAppend = 10,
+    /// Advance replicated logical time while no unique records are arriving.
+    DedupWatermark = 11,
+    /// Persist coordinator membership and a source ownership plan.
+    GroupPlan = 12,
+    /// Retire one coordinator group incarnation and free its name.
+    GroupDelete = 13,
 }
 
 impl TryFrom<u16> for OperationKind {
@@ -67,8 +75,29 @@ impl TryFrom<u16> for OperationKind {
             7 => Ok(Self::PartitionPolicy),
             8 => Ok(Self::Barrier),
             9 => Ok(Self::ProducerResultFloor),
+            10 => Ok(Self::ResolvedAppend),
+            11 => Ok(Self::DedupWatermark),
+            12 => Ok(Self::GroupPlan),
+            13 => Ok(Self::GroupDelete),
             other => Err(OperationCodecError::UnsupportedOperationKind(other)),
         }
+    }
+}
+
+impl OperationKind {
+    /// Whether every valid body of this kind returns an explicit control
+    /// identity from `OperationBody::operation_id`. Admission uses it to skip
+    /// decoding APPEND-like bodies that canonical validation decodes anyway,
+    /// and reserves identity capacity only for these kinds.
+    pub const fn has_operation_id(self) -> bool {
+        !matches!(
+            self,
+            Self::CreatePartition
+                | Self::Append
+                | Self::Progress
+                | Self::ResolvedAppend
+                | Self::DedupWatermark
+        )
     }
 }
 
@@ -177,6 +206,9 @@ pub struct CreatePartition<'a> {
     pub partition_id: PartitionId,
     /// Expected partition ownership fence.
     pub owner_epoch: OwnerEpoch,
+    /// Immutable first-wins deduplication window in replicated log milliseconds.
+    /// Absent disables event deduplication for this partition incarnation.
+    pub dedup_window_millis: Option<NonZeroU64>,
     /// Retention policy stored in canonical state.
     pub retention: RetentionPolicy,
 }
@@ -235,6 +267,15 @@ pub struct Append<'a> {
     pub batches: Vec<AppendBatch<'a>>,
 }
 
+/// One partition's stored records and outcomes of every producer attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAppend<'a> {
+    /// New records in consecutive partition-offset order; may be empty.
+    pub batch: AppendBatch<'a>,
+    /// Attempt order, logical time, and exact discarded-payload fingerprints.
+    pub results: AppendResults<'a>,
+}
+
 /// Metadata needed to validate one append's state transition, without records.
 /// This is not a hash proof or authorization to skip canonical body validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,7 +292,8 @@ pub struct AppendBatchSummary {
     pub first_sequence: ProducerSequence,
     /// First assigned partition offset in this batch.
     pub first_offset: Offset,
-    /// Nonzero record count checked against schema bounds.
+    /// Stored record count checked against schema bounds. A resolved append
+    /// containing only duplicate attempts has zero stored records.
     pub record_count: usize,
     /// Whether every descriptor contains a nonzero message identity.
     /// State admission must reject false; syntax validation alone permits it.
@@ -303,6 +345,15 @@ pub enum ProgressOwner {
     ConsumerGroup(ConsumerGroupId),
 }
 
+/// Source-partition ownership required to declare consumer-group progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgressAssignment {
+    /// Exact nonzero source-partition assignment epoch.
+    pub epoch: u64,
+    /// Member whose confirmed assignment permits processing progress.
+    pub member: ConsumerMemberId,
+}
+
 /// Durable contiguous consumer-processing progress transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Progress {
@@ -310,8 +361,8 @@ pub struct Progress {
     pub owner: ProgressOwner,
     /// Exact partition record incarnation.
     pub partition: PartitionIncarnation,
-    /// Assignment fence required for consumer-group progress.
-    pub assignment_epoch: Option<u64>,
+    /// Member and assignment fence required for consumer-group progress.
+    pub assignment: Option<ProgressAssignment>,
     /// Expected prior exclusive offset; none requires no progress entry.
     pub expected_progress: Option<Offset>,
     /// New exclusive progress offset within confirmed record state.
@@ -331,6 +382,10 @@ pub struct Assign {
     pub expected_assignment_epoch: u64,
     /// New assignment fence, strictly newer than the current one.
     pub new_assignment_epoch: u64,
+    /// Committed coordinator plan that authorizes this transition.
+    pub plan_revision: u64,
+    /// Initial group cursor, or the exact existing progress captured at handoff.
+    pub resume_cursor: Offset,
     /// New assigned member; none revokes ownership.
     pub new_member: Option<ConsumerMemberId>,
     /// Exact control-operation retry identity.
@@ -389,6 +444,17 @@ pub struct ProducerResultFloor {
     pub operation_id: OperationId,
 }
 
+/// Primary-resolved monotonic deduplication time, independent of wall clocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DedupWatermark {
+    /// Exact partition record incarnation.
+    pub partition: PartitionIncarnation,
+    /// Expected partition ownership fence.
+    pub owner_epoch: OwnerEpoch,
+    /// Replicated logical time in milliseconds, strictly newer than current time.
+    pub logical_time: u64,
+}
+
 /// One typed canonical operation body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperationBody<'a> {
@@ -398,6 +464,8 @@ pub enum OperationBody<'a> {
     OpenProducer(OpenProducer),
     /// Assign consecutive records to producer sequences and partition offsets.
     Append(Append<'a>),
+    /// Resolve producer attempts independently of newly stored records.
+    ResolvedAppend(ResolvedAppend<'a>),
     /// Declare exclusive individual or consumer-group progress.
     Progress(Progress),
     /// Install or revoke a fenced consumer-group partition assignment.
@@ -410,21 +478,34 @@ pub enum OperationBody<'a> {
     Barrier(Barrier),
     /// Advance the retained producer retry-result floor.
     ProducerResultFloor(ProducerResultFloor),
+    /// Advance replicated logical time without changing record coordinates.
+    DedupWatermark(DedupWatermark),
+    /// Persist coordinator membership before changing source ownership.
+    GroupPlan(super::GroupPlan<'a>),
+    /// Retire one coordinator group incarnation and free its name.
+    GroupDelete(super::GroupDelete),
 }
 
 impl OperationBody<'_> {
     /// Explicit retry identity for control operations. APPEND identity belongs
     /// to its producer sequences; partition creation uses its incarnation.
+    /// Progress retries resolve by their cumulative cursor, so its request ID
+    /// is not an identity.
     pub const fn operation_id(&self) -> Option<OperationId> {
         match self {
-            Self::CreatePartition(_) | Self::Append(_) => None,
+            Self::CreatePartition(_)
+            | Self::Append(_)
+            | Self::Progress(_)
+            | Self::ResolvedAppend(_)
+            | Self::DedupWatermark(_) => None,
             Self::OpenProducer(value) => Some(value.operation_id),
-            Self::Progress(value) => Some(value.operation_id),
             Self::Assign(value) => Some(value.operation_id),
             Self::Trim(value) => Some(value.operation_id),
             Self::PartitionPolicy(value) => Some(value.operation_id),
             Self::Barrier(value) => Some(value.operation_id),
             Self::ProducerResultFloor(value) => Some(value.operation_id),
+            Self::GroupPlan(value) => Some(value.operation_id),
+            Self::GroupDelete(value) => Some(value.operation_id),
         }
     }
 
@@ -434,12 +515,16 @@ impl OperationBody<'_> {
             Self::CreatePartition(_) => OperationKind::CreatePartition,
             Self::OpenProducer(_) => OperationKind::OpenProducer,
             Self::Append(_) => OperationKind::Append,
+            Self::ResolvedAppend(_) => OperationKind::ResolvedAppend,
             Self::Progress(_) => OperationKind::Progress,
             Self::Assign(_) => OperationKind::Assign,
             Self::Trim(_) => OperationKind::Trim,
             Self::PartitionPolicy(_) => OperationKind::PartitionPolicy,
             Self::Barrier(_) => OperationKind::Barrier,
             Self::ProducerResultFloor(_) => OperationKind::ProducerResultFloor,
+            Self::DedupWatermark(_) => OperationKind::DedupWatermark,
+            Self::GroupPlan(_) => OperationKind::GroupPlan,
+            Self::GroupDelete(_) => OperationKind::GroupDelete,
         }
     }
 }
@@ -459,6 +544,10 @@ pub struct OperationLimits {
     pub max_parts: usize,
     /// Maximum combined APPEND payload bytes.
     pub max_payload_bytes: usize,
+    /// Maximum members in one coordinator intent.
+    pub max_group_members: usize,
+    /// Maximum source partitions in one coordinator intent.
+    pub max_group_partitions: usize,
 }
 
 impl Default for OperationLimits {
@@ -470,6 +559,8 @@ impl Default for OperationLimits {
             max_records: 1_024,
             max_parts: 65_536,
             max_payload_bytes: 64 * 1024 * 1024,
+            max_group_members: 256,
+            max_group_partitions: 1024,
         }
     }
 }

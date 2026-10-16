@@ -30,8 +30,17 @@ fn unbound_cluster(
     let mut pending = None;
     let mut proposal = None;
     for broker in 0..3 {
-        let mut actor =
-            unstarted_actor_with_sessions(controller, io, 0, policy, broker, 64, [UNBOUND; 3]);
+        let mut actor = configured_actor(
+            controller,
+            io,
+            0,
+            policy,
+            broker,
+            ActorSettings {
+                sessions: [UNBOUND; 3],
+                ..Default::default()
+            },
+        );
         if broker == 0 {
             let mut buffer = actor.lease_proposal_buffer().unwrap();
             buffer

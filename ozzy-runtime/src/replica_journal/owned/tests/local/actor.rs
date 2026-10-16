@@ -46,7 +46,7 @@ pub(super) fn actor_with_partition_memory(
     )
     .unwrap();
     config.recovery.retained_identities = 8;
-    config.append_buffers = 12;
+    config.append_buffers = 16;
     let (mut journal, mut driver) = drive(
         controller,
         OwnedJournal::format_local(config, io, JournalGeneration(u128::from(id)), 32768),
@@ -72,6 +72,7 @@ pub(super) fn actor_with_partition_memory(
         journal,
         driver,
         LocalActorConfig {
+            proposal_lanes: 3,
             proposal_capacity: 4,
             turn_steps: 4,
             journal: crate::replica_journal::ShardJournalConfig {

@@ -72,7 +72,7 @@ impl NativeAccess {
                         .all(|(index, &node)| valid_node(node) && !peers[..index].contains(&node))
             }
             Self::TrustedClients { clients, writers } => {
-                (1..=32).contains(clients) && (1..=32).contains(writers)
+                (1..=4096).contains(clients) && (1..=32).contains(writers)
             }
         };
         if valid {

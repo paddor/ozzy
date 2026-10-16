@@ -1,4 +1,4 @@
-//! Validate control operations against current fences and committed visibility.
+//! Validate control operations against current fences, in operation order.
 
 use super::{
     AssignmentKey, AssignmentState, CanonicalPartition, CanonicalState, IdentityClaim,
@@ -7,7 +7,7 @@ use super::{
 };
 use ahash::AHashMap as HashMap;
 use ozzy_journal::operation::{
-    Assign, Barrier, CreatePartition, OpenProducer, OperationBody, PartitionPolicy,
+    Assign, Barrier, CreatePartition, DedupWatermark, OpenProducer, OperationBody, PartitionPolicy,
     ProducerResultFloor, Progress, ProgressOwner, Trim,
 };
 use ozzy_proto::Offset;
@@ -15,14 +15,14 @@ use ozzy_proto::Offset;
 impl CanonicalState {
     /// Validate one decoded operation and freeze its deterministic mutation.
     ///
-    /// `committed` supplies the visibility bound for consumer progress. It may
-    /// equal `self` when preparing a committed transition.
+    /// Every replica validates against the same ordered prefix. Consumer
+    /// progress may cover records accepted before it: it commits only after
+    /// them. The leader separately admits only cursors over confirmed records.
     pub fn prepare(
         &self,
         op_number: u64,
         body: &OperationBody<'_>,
         identities: &impl IdentityIndex,
-        committed: &Self,
     ) -> Result<TransitionPlan, StateError> {
         self.require_next_operation(op_number)?;
         let (mutation, claims) = match body {
@@ -31,9 +31,10 @@ impl CanonicalState {
                 self.prepare_open(*value, op_number, identities)?
             }
             OperationBody::Append(value) => self.prepare_append(value)?,
-            OperationBody::Progress(value) => {
-                self.prepare_progress(*value, op_number, identities, committed)?
+            OperationBody::ResolvedAppend(value) => {
+                return self.prepare_resolved_append(op_number, value);
             }
+            OperationBody::Progress(value) => self.prepare_progress(*value)?,
             OperationBody::Assign(value) => self.prepare_assign(*value, op_number, identities)?,
             OperationBody::Trim(value) => self.prepare_trim(*value, op_number, identities)?,
             OperationBody::PartitionPolicy(value) => {
@@ -42,6 +43,13 @@ impl CanonicalState {
             OperationBody::Barrier(value) => Self::prepare_barrier(*value, op_number, identities)?,
             OperationBody::ProducerResultFloor(value) => {
                 self.prepare_producer_result_floor(*value, op_number, identities)?
+            }
+            OperationBody::DedupWatermark(value) => self.prepare_dedup_watermark(*value)?,
+            OperationBody::GroupPlan(value) => {
+                self.prepare_group_plan(value, op_number, identities)?
+            }
+            OperationBody::GroupDelete(value) => {
+                self.prepare_group_delete(*value, op_number, identities)?
             }
         };
         Ok(TransitionPlan {
@@ -90,7 +98,29 @@ impl CanonicalState {
                     retained_from: Offset::ZERO,
                     policy_revision: 1,
                     retention: value.retention,
+                    dedup_window_millis: value.dedup_window_millis,
+                    dedup_time: 0,
                 },
+            },
+            Vec::new(),
+        ))
+    }
+
+    fn prepare_dedup_watermark(
+        &self,
+        value: DedupWatermark,
+    ) -> Result<(Mutation, Vec<IdentityClaim>), StateError> {
+        let partition = self.require_partition(value.partition)?;
+        if value.owner_epoch != partition.owner_epoch {
+            return Err(StateError::OwnerEpochMismatch);
+        }
+        if value.logical_time <= partition.dedup_time {
+            return Err(StateError::DedupTimeNotAdvanced);
+        }
+        Ok((
+            Mutation::DedupTime {
+                partition: value.partition,
+                time: value.logical_time,
             },
             Vec::new(),
         ))
@@ -131,18 +161,29 @@ impl CanonicalState {
         ))
     }
 
+    /// Progress claims no control identity. A retry either finds its cursor
+    /// already covered or fails the expected-progress and assignment fences.
     fn prepare_progress(
         &self,
         value: Progress,
-        op_number: u64,
-        identities: &impl IdentityIndex,
-        committed: &Self,
     ) -> Result<(Mutation, Vec<IdentityClaim>), StateError> {
-        self.require_partition(value.partition)?;
+        let partition = self.require_partition(value.partition)?;
         let key = progress_key(value.owner, value.partition);
         require_progress_owner(value.owner)?;
-        match (value.owner, value.assignment_epoch) {
-            (ProgressOwner::Subscription(_), None) | (ProgressOwner::ConsumerGroup(_), Some(_)) => {
+        match (value.owner, value.assignment) {
+            (ProgressOwner::Subscription(_), None) => {}
+            (ProgressOwner::ConsumerGroup(group), Some(fence)) => {
+                require_id("consumer member", fence.member.as_bytes())?;
+                let assignment = self
+                    .assignments
+                    .get(&AssignmentKey(group, value.partition))
+                    .ok_or(StateError::MissingAssignment)?;
+                if fence.epoch != assignment.epoch {
+                    return Err(StateError::AssignmentEpochMismatch);
+                }
+                if assignment.member != Some(fence.member) {
+                    return Err(StateError::AssignmentMemberMismatch);
+                }
             }
             (ProgressOwner::Subscription(_), Some(_)) => {
                 return Err(StateError::MalformedBody(
@@ -151,7 +192,7 @@ impl CanonicalState {
             }
             (ProgressOwner::ConsumerGroup(_), None) => {
                 return Err(StateError::MalformedBody(
-                    "consumer-group progress requires an assignment epoch",
+                    "consumer-group progress requires a member and assignment epoch",
                 ));
             }
         }
@@ -162,29 +203,18 @@ impl CanonicalState {
         if current.is_some_and(|offset| value.new_progress <= offset) {
             return Err(StateError::ProgressNotAdvanced);
         }
-        let committed_partition = committed.require_partition(value.partition)?;
-        if value.new_progress >= committed_partition.next_offset {
-            return Err(StateError::ProgressBeyondCommit);
-        }
-        if let ProgressOwner::ConsumerGroup(group) = value.owner {
-            let assignment = self
-                .assignments
-                .get(&AssignmentKey(group, value.partition))
-                .ok_or(StateError::MissingAssignment)?;
-            if value.assignment_epoch != Some(assignment.epoch) {
-                return Err(StateError::AssignmentEpochMismatch);
-            }
+        if value.new_progress > partition.next_offset {
+            return Err(StateError::ProgressBeyondRecords);
         }
         if current.is_none() && self.progress.len() >= self.limits.max_progress {
             return Err(StateError::LimitExceeded("progress owners"));
         }
-        let claims = operation_claim(value.operation_id, op_number, identities)?;
         Ok((
             Mutation::Progress {
                 key,
                 value: value.new_progress,
             },
-            claims,
+            Vec::new(),
         ))
     }
 
@@ -194,7 +224,7 @@ impl CanonicalState {
         op_number: u64,
         identities: &impl IdentityIndex,
     ) -> Result<(Mutation, Vec<IdentityClaim>), StateError> {
-        self.require_partition(value.partition)?;
+        let partition = self.require_partition(value.partition)?;
         require_id("consumer group", value.consumer_group_id.as_bytes())?;
         if let Some(member) = value.new_member {
             require_id("consumer member", member.as_bytes())?;
@@ -206,6 +236,8 @@ impl CanonicalState {
             .copied()
             .unwrap_or(AssignmentState {
                 epoch: 0,
+                plan_revision: 0,
+                resume_cursor: Offset::ZERO,
                 member: None,
             });
         if value.expected_assignment_epoch != current.epoch {
@@ -213,6 +245,27 @@ impl CanonicalState {
         }
         if value.expected_assignment_epoch.checked_add(1) != Some(value.new_assignment_epoch) {
             return Err(StateError::AssignmentEpochNotAdvanced);
+        }
+        if value.plan_revision <= current.plan_revision {
+            return Err(StateError::AssignmentPlanNotAdvanced);
+        }
+        let progress = progress_key(
+            ProgressOwner::ConsumerGroup(value.consumer_group_id),
+            value.partition,
+        );
+        if let Some(prior) = self.progress.get(&progress) {
+            if value.resume_cursor != *prior {
+                return Err(StateError::AssignmentProgressMismatch);
+            }
+        } else {
+            if value.resume_cursor < partition.retained_from
+                || value.resume_cursor > partition.next_offset
+            {
+                return Err(StateError::InvalidAssignmentCursor);
+            }
+            if self.progress.len() >= self.limits.max_progress {
+                return Err(StateError::LimitExceeded("progress owners"));
+            }
         }
         if !self.assignments.contains_key(&key)
             && self.assignments.len() >= self.limits.max_assignments
@@ -225,6 +278,8 @@ impl CanonicalState {
                 key,
                 value: AssignmentState {
                     epoch: value.new_assignment_epoch,
+                    plan_revision: value.plan_revision,
+                    resume_cursor: value.resume_cursor,
                     member: value.new_member,
                 },
             },

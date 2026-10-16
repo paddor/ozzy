@@ -6,16 +6,28 @@ use ozzy_core::state::{
 };
 use ozzy_journal::operation::{
     Append, AppendBatch, AppendRecord, Assign, Barrier, CreatePartition, OpenProducer,
-    OperationBody, PartitionPolicy, ProducerResultFloor, Progress, ProgressOwner, RetentionPolicy,
-    Trim,
+    OperationBody, PartitionPolicy, ProducerResultFloor, Progress, ProgressAssignment,
+    ProgressOwner, RetentionPolicy, Trim,
 };
 use ozzy_proto::{
     ConsumerGroupId, ConsumerMemberId, MessageId, Offset, OperationId, OwnerEpoch, PartitionId,
     PartitionIncarnation, ProducerEpoch, ProducerId, ProducerSequence, SubscriptionId,
 };
 
+#[path = "state/assignment.rs"]
+mod assignment;
+#[path = "state/dedup_policy.rs"]
+mod dedup_policy;
+#[path = "state/group.rs"]
+mod group;
+#[path = "state/progress.rs"]
+mod progress;
+#[path = "state/resolved.rs"]
+mod resolved;
 #[path = "state/shared.rs"]
 mod shared;
+#[path = "state/watermark.rs"]
+mod watermark;
 
 fn partition() -> PartitionIncarnation {
     PartitionIncarnation::from_bytes([0x10; 16])
@@ -44,6 +56,7 @@ fn create() -> OperationBody<'static> {
         topic: "topic",
         partition_id: PartitionId::new(7),
         owner_epoch: OwnerEpoch::new(9),
+        dedup_window_millis: None,
         retention: RetentionPolicy::default(),
     })
 }
@@ -65,6 +78,7 @@ fn create_another() -> OperationBody<'static> {
         topic: "topic",
         partition_id: PartitionId::new(8),
         owner_epoch: OwnerEpoch::new(10),
+        dedup_window_millis: None,
         retention: RetentionPolicy::default(),
     })
 }
@@ -194,7 +208,7 @@ fn compact_many_partition_append_preserves_set_based_duplicate_checks() {
         let body = OperationBody::Append(Append { batches });
         let bytes = encode_operation_body(&body, OperationLimits::default()).unwrap();
         let summary = decode_append_summary(&bytes, OperationLimits::default()).unwrap();
-        let result = state.prepare(13, &body, &identities, &state);
+        let result = state.prepare(13, &body, &identities);
         assert_eq!(state.prepare_append_summary(13, &summary), result);
         if duplicate {
             assert_eq!(result, Err(StateError::DuplicateAppendPartition));
@@ -210,8 +224,7 @@ fn apply(
     op_number: u64,
     body: &OperationBody<'_>,
 ) {
-    let committed = state.clone();
-    let plan = state.prepare(op_number, body, index, &committed).unwrap();
+    let plan = state.prepare(op_number, body, index).unwrap();
     state.apply(plan, index).unwrap();
 }
 
@@ -242,6 +255,8 @@ fn apply_control_operations(
             partition: partition(),
             expected_assignment_epoch: 0,
             new_assignment_epoch: 1,
+            plan_revision: 1,
+            resume_cursor: Offset::ZERO,
             new_member: Some(ConsumerMemberId::from_bytes([0x60; 16])),
             operation_id: operation(0x31),
         }),
@@ -253,8 +268,11 @@ fn apply_control_operations(
         &OperationBody::Progress(Progress {
             owner: ProgressOwner::ConsumerGroup(group),
             partition: partition(),
-            assignment_epoch: Some(1),
-            expected_progress: None,
+            assignment: Some(ProgressAssignment {
+                epoch: 1,
+                member: ConsumerMemberId::from_bytes([0x60; 16]),
+            }),
+            expected_progress: Some(Offset::ZERO),
             new_progress: Offset::new(1),
             operation_id: operation(0x32),
         }),
@@ -355,7 +373,8 @@ fn all_canonical_operations_apply_deterministically() {
         Some(Offset::new(1))
     );
     assert_eq!(state.revision(), 9);
-    assert_eq!(index.len(), 7);
+    // Progress resolves retries by cursor and claims no control identity.
+    assert_eq!(index.len(), 6);
 }
 
 #[test]
@@ -368,7 +387,7 @@ fn validation_and_identity_capacity_fail_atomically() {
     let before = state.clone();
     let index_before = index.clone();
     assert!(matches!(
-        state.prepare(3, &append(1, 0x40), &index, &before),
+        state.prepare(3, &append(1, 0x40), &index),
         Err(StateError::ProducerSequenceMismatch)
     ));
     assert_eq!(state, before);
@@ -381,7 +400,6 @@ fn validation_and_identity_capacity_fail_atomically() {
                 operation_id: operation(0x60),
             }),
             &index,
-            &before,
         )
         .unwrap();
     assert!(matches!(
@@ -407,7 +425,7 @@ fn producer_result_floor_gates_trim_and_resets_at_session_fence() {
         operation_id: operation(0x38),
     });
     assert_eq!(
-        state.prepare(4, &trim, &index, &state).unwrap_err(),
+        state.prepare(4, &trim, &index).unwrap_err(),
         StateError::TrimBeyondProducerResults
     );
     apply(
@@ -453,10 +471,7 @@ fn stale_plan_and_duplicate_identity_never_mutate_state() {
     let mut index = MemoryIdentityIndex::new(16);
     apply(&mut state, &mut index, 1, &create());
     apply(&mut state, &mut index, 2, &open());
-    let committed = state.clone();
-    let stale_plan = state
-        .prepare(3, &append(0, 0x40), &index, &committed)
-        .unwrap();
+    let stale_plan = state.prepare(3, &append(0, 0x40), &index).unwrap();
     apply(
         &mut state,
         &mut index,
@@ -480,8 +495,7 @@ fn stale_plan_and_duplicate_identity_never_mutate_state() {
             &OperationBody::Barrier(Barrier {
                 operation_id: operation(0x31),
             }),
-            &index,
-            &before,
+            &index
         ),
         Err(StateError::IdentityConflict)
     ));
@@ -497,7 +511,7 @@ fn one_plan_advances_speculative_then_committed_state() {
     let mut speculative_index = committed_index.clone();
 
     let plan = speculative
-        .prepare(3, &append(0, 0x40), &speculative_index, &committed)
+        .prepare(3, &append(0, 0x40), &speculative_index)
         .unwrap();
     speculative
         .apply(plan.clone(), &mut speculative_index)
@@ -663,7 +677,7 @@ fn message_id_is_metadata_not_the_append_deduplication_key() {
     apply(&mut state, &mut index, 2, &open());
     apply(&mut state, &mut index, 3, &append(0, 0x40));
 
-    let next = state.prepare(4, &append(1, 0x40), &index, &state).unwrap();
+    let next = state.prepare(4, &append(1, 0x40), &index).unwrap();
     assert_eq!(next.identity_claims().len(), 0);
 }
 
@@ -761,7 +775,7 @@ fn multi_partition_append_is_atomic_and_message_ids_are_partition_scoped() {
     });
     let before = state.clone();
     assert_eq!(
-        state.prepare(5, &invalid, &index, &state).unwrap_err(),
+        state.prepare(5, &invalid, &index).unwrap_err(),
         StateError::OwnerEpochMismatch
     );
     assert_eq!(state, before);
@@ -787,7 +801,7 @@ fn operation_numbers_and_typed_body_shape_are_enforced() {
     let mut state = CanonicalState::new(StateLimits::default());
     let mut index = MemoryIdentityIndex::new(16);
     assert_eq!(
-        state.prepare(2, &create(), &index, &state).unwrap_err(),
+        state.prepare(2, &create(), &index).unwrap_err(),
         StateError::OperationNumberMismatch
     );
 
@@ -797,10 +811,11 @@ fn operation_numbers_and_typed_body_shape_are_enforced() {
         topic: "topic",
         partition_id: PartitionId::new(7),
         owner_epoch: OwnerEpoch::new(9),
+        dedup_window_millis: None,
         retention: RetentionPolicy::default(),
     });
     assert!(matches!(
-        state.prepare(1, &malformed_create, &index, &state),
+        state.prepare(1, &malformed_create, &index),
         Err(StateError::MalformedBody(_))
     ));
 
@@ -812,19 +827,22 @@ fn operation_numbers_and_typed_body_shape_are_enforced() {
         batches: Vec::new(),
     });
     assert!(matches!(
-        state.prepare(3, &malformed_append, &index, &state),
+        state.prepare(3, &malformed_append, &index),
         Err(StateError::MalformedBody(_))
     ));
     let malformed_progress = OperationBody::Progress(Progress {
         owner: ProgressOwner::Subscription(SubscriptionId::from_bytes([0x70; 16])),
         partition: partition(),
-        assignment_epoch: Some(1),
+        assignment: Some(ProgressAssignment {
+            epoch: 1,
+            member: ConsumerMemberId::from_bytes([0x60; 16]),
+        }),
         expected_progress: None,
         new_progress: Offset::ZERO,
         operation_id: operation(0x31),
     });
     assert!(matches!(
-        state.prepare(3, &malformed_progress, &index, &state),
+        state.prepare(3, &malformed_progress, &index),
         Err(StateError::MalformedBody(_))
     ));
     assert_eq!(state, before);

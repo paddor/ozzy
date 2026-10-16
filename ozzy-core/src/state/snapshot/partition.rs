@@ -9,11 +9,14 @@ use super::{
     enforce_limit, put_u16, put_u32, put_u64, read_u16, read_u32, read_u64, require_nonzero,
     usize_to_u16, usize_to_u32, validate_name,
 };
-use crate::state::{CanonicalPartition, CanonicalProducer, PartitionAddress, ProducerResultSpan};
+use crate::state::{
+    CanonicalPartition, CanonicalProducer, PartitionAddress, ProducerResultSource,
+    ProducerResultSpan,
+};
 
-const PARTITION_BYTES: usize = 96;
-const PRODUCER_BYTES: usize = 72;
-const SPAN_BYTES: usize = 24;
+const PARTITION_BYTES: usize = 104;
+const PRODUCER_BYTES: usize = 80;
+const SPAN_BYTES: usize = 40;
 
 pub(super) async fn partition_bytes(
     value: &CanonicalPartition,
@@ -45,9 +48,10 @@ pub(super) async fn encode_partition(
     start: usize,
     partition: PartitionIncarnation,
     value: &CanonicalPartition,
+    revision: u64,
     step: &mut impl AsyncFnMut(usize),
 ) -> Result<usize, StateSnapshotError> {
-    validate_partition_cooperative(partition, value, step).await?;
+    validate_partition_cooperative(partition, value, revision, step).await?;
     let entry_bytes = partition_bytes(value, step).await?;
     let end = start
         .checked_add(entry_bytes)
@@ -69,6 +73,14 @@ pub(super) async fn encode_partition(
     put_u32(target, 64, flags);
     put_u64(target, 72, age);
     put_u64(target, 80, bytes);
+    put_u64(target, 88, value.dedup_time);
+    put_u64(
+        target,
+        96,
+        value
+            .dedup_window_millis
+            .map_or(0, std::num::NonZeroU64::get),
+    );
     let stream_end = PARTITION_BYTES + value.address.stream.len();
     let mut cursor = stream_end + value.address.topic.len();
     target[PARTITION_BYTES..stream_end].copy_from_slice(value.address.stream.as_bytes());
@@ -87,6 +99,7 @@ pub(super) async fn encode_partition(
         put_u64(fixed, 24, producer.next_producer_sequence.get());
         put_u64(fixed, 32, producer.producer_result_floor.get());
         put_u32(fixed, 40, usize_to_u32(producer.results.len())?);
+        put_u64(fixed, 72, producer.last_stored_end.get());
         if let Some(transition) = producer.transition {
             put_u32(fixed, 44, 1);
             fixed[48..64].copy_from_slice(transition.operation_id.as_bytes());
@@ -102,6 +115,10 @@ pub(super) async fn encode_partition(
             put_u64(target, cursor, span.first_sequence.get());
             put_u64(target, cursor + 8, span.first_offset.get());
             put_u64(target, cursor + 16, span.records);
+            if let ProducerResultSource::Duplicate { operation } = span.source {
+                target[cursor + 24] = 1;
+                put_u64(target, cursor + 32, operation);
+            }
             cursor += SPAN_BYTES;
             step(SPAN_BYTES).await;
         }
@@ -116,6 +133,7 @@ pub(super) async fn decode_partition(
     limits: StateSnapshotLimits,
     remaining_producers: usize,
     remaining_spans: usize,
+    revision: u64,
     step: &mut impl AsyncFnMut(usize),
 ) -> Result<(PartitionIncarnation, CanonicalPartition, usize, usize), StateSnapshotError> {
     let fixed_end = start
@@ -124,7 +142,7 @@ pub(super) async fn decode_partition(
     let fixed = input
         .get(start..fixed_end)
         .ok_or(StateSnapshotError::Truncated)?;
-    if read_u32(fixed, 68) != 0 || read_u64(fixed, 88) != 0 {
+    if read_u32(fixed, 68) != 0 {
         return Err(StateSnapshotError::UnsupportedFields);
     }
     let entry_bytes = read_u32(fixed, 0) as usize;
@@ -190,8 +208,10 @@ pub(super) async fn decode_partition(
             read_u64(fixed, 72),
             read_u64(fixed, 80),
         )?,
+        dedup_time: read_u64(fixed, 88),
+        dedup_window_millis: std::num::NonZeroU64::new(read_u64(fixed, 96)),
     };
-    validate_partition_cooperative(partition, &value, step).await?;
+    validate_partition_cooperative(partition, &value, revision, step).await?;
     Ok((partition, value, end, spans))
 }
 
@@ -228,6 +248,7 @@ async fn decode_producer(
     producer.next_producer_sequence = ProducerSequence::new(read_u64(fixed, 24));
     producer.producer_result_floor = ProducerSequence::new(read_u64(fixed, 32));
     producer.transition = transition;
+    producer.last_stored_end = Offset::new(read_u64(fixed, 72));
     let count = read_u32(fixed, 40) as usize;
     enforce_limit("producer retry spans", count, remaining_spans)?;
     let bytes = count
@@ -238,10 +259,19 @@ async fn decode_producer(
         return Err(StateSnapshotError::Truncated);
     }
     for _ in 0..count {
+        let source = match (input[cursor + 24], read_u64(input, cursor + 32)) {
+            (0, 0) => ProducerResultSource::Stored,
+            (1, operation) if operation != 0 => ProducerResultSource::Duplicate { operation },
+            _ => return Err(StateSnapshotError::InvalidPartition),
+        };
+        if input[cursor + 25..cursor + 32] != [0; 7] {
+            return Err(StateSnapshotError::UnsupportedFields);
+        }
         producer.results.push_back(ProducerResultSpan {
             first_sequence: ProducerSequence::new(read_u64(input, cursor)),
             first_offset: Offset::new(read_u64(input, cursor + 8)),
             records: read_u64(input, cursor + 16),
+            source,
         });
         cursor += SPAN_BYTES;
         step(SPAN_BYTES).await;
@@ -253,6 +283,7 @@ async fn decode_producer(
 async fn validate_partition_cooperative(
     partition: PartitionIncarnation,
     value: &CanonicalPartition,
+    revision: u64,
     step: &mut impl AsyncFnMut(usize),
 ) -> Result<(), StateSnapshotError> {
     require_nonzero("partition", partition.as_bytes())?;
@@ -266,7 +297,7 @@ async fn validate_partition_cooperative(
     let mut occupied = Vec::new();
     for (id, producer) in &value.producers {
         require_nonzero("producer", id.as_bytes())?;
-        validate_producer(producer, value, &mut occupied, step).await?;
+        validate_producer(producer, value, revision, &mut occupied, step).await?;
     }
     ozzy_journal::work::sort_by(&mut occupied, <(u64, u64)>::cmp, step).await;
     for pair in occupied.windows(2) {
@@ -282,6 +313,7 @@ async fn validate_partition_cooperative(
 async fn validate_producer(
     producer: &CanonicalProducer,
     partition: &CanonicalPartition,
+    revision: u64,
     occupied: &mut Vec<(u64, u64)>,
     step: &mut impl AsyncFnMut(usize),
 ) -> Result<(), StateSnapshotError> {
@@ -297,7 +329,8 @@ async fn validate_producer(
         return Err(StateSnapshotError::InvalidPartition);
     }
     let mut sequence = producer.producer_result_floor.get();
-    let mut previous_end = None;
+    let mut previous_stored_end = None;
+    let mut previous: Option<ProducerResultSpan> = None;
     for span in &producer.results {
         let end = span
             .first_offset
@@ -306,20 +339,42 @@ async fn validate_producer(
             .ok_or(StateSnapshotError::InvalidPartition)?;
         if span.records == 0
             || span.first_sequence.get() != sequence
-            || span.first_offset < partition.retained_from
             || end > partition.next_offset.get()
-            || previous_end.is_some_and(|previous| previous >= span.first_offset.get())
+            || previous.is_some_and(|previous| previous.can_extend(*span))
         {
             return Err(StateSnapshotError::InvalidPartition);
         }
         sequence = sequence
             .checked_add(span.records)
             .ok_or(StateSnapshotError::InvalidPartition)?;
-        previous_end = Some(end);
-        occupied.push((span.first_offset.get(), end));
+        match span.source {
+            ProducerResultSource::Stored => {
+                if span.first_offset < partition.retained_from
+                    || previous_stored_end
+                        .is_some_and(|previous| previous > span.first_offset.get())
+                    || end > producer.last_stored_end.get()
+                {
+                    return Err(StateSnapshotError::InvalidPartition);
+                }
+                previous_stored_end = Some(end);
+                occupied.push((span.first_offset.get(), end));
+            }
+            ProducerResultSource::Duplicate { operation } => {
+                if operation == 0 || operation > revision {
+                    return Err(StateSnapshotError::InvalidPartition);
+                }
+            }
+        }
+        previous = Some(*span);
         step(SPAN_BYTES).await;
     }
-    if sequence != producer.next_producer_sequence.get() {
+    if sequence != producer.next_producer_sequence.get()
+        || producer.last_stored_end > partition.next_offset
+        || previous_stored_end.is_some_and(|end| end != producer.last_stored_end.get())
+        || (producer.producer_result_floor == ProducerSequence::ZERO
+            && previous_stored_end.is_none()
+            && producer.last_stored_end != Offset::ZERO)
+    {
         return Err(StateSnapshotError::InvalidPartition);
     }
     step(PRODUCER_BYTES).await;

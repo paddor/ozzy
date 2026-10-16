@@ -49,18 +49,10 @@ fn populate(controller: &mut Controller, journal: &mut Journal) -> CanonicalStat
 fn native_checkpoint_decode_yields_and_cancellation_preserves_selected_history() {
     let (mut controller, mut journal) = empty_journal();
     let state = populate(&mut controller, &mut journal);
-    let snapshot = state
-        .encode_snapshot(StateSnapshotLimits::default())
-        .unwrap();
     let id = CheckpointId::from_bytes([9; 16]);
     let files = drive(
         &mut controller,
-        journal.build_checkpoint(
-            id,
-            ozzy_core::state::canonical_state_schema_digest(),
-            4096,
-            &snapshot,
-        ),
+        journal.build_canonical_checkpoint(id, 4096, &state, StateSnapshotLimits::default()),
     )
     .unwrap();
     let before = journal.current;
@@ -155,10 +147,12 @@ fn native_checkpoint_encoding_yields_before_io_and_cancellation_allows_retry() {
     )
     .unwrap();
     assert_eq!(
-        drive(&mut controller, files.read_state()).unwrap(),
+        drive(
+            &mut controller,
+            files.decode_canonical_state(StateLimits::default(), StateSnapshotLimits::default())
+        )
+        .unwrap(),
         state
-            .encode_snapshot(StateSnapshotLimits::default())
-            .unwrap()
     );
     assert_eq!(journal.current, before);
     drive(&mut controller, journal.install_checkpoint(id)).unwrap();

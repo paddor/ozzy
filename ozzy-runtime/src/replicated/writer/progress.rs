@@ -4,14 +4,11 @@ use crate::signal::StateSignal;
 use ozzy_proto::{MessageId, PartitionIncarnation};
 
 #[cfg(all(test, ozzy_loom))]
-use loom::sync::{
-    Mutex,
-    atomic::{AtomicU64, Ordering},
-};
+use loom::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 #[cfg(not(all(test, ozzy_loom)))]
 use std::sync::{
-    Mutex, OnceLock,
-    atomic::{AtomicU64, Ordering},
+    OnceLock,
+    atomic::{AtomicU8, AtomicU64, Ordering},
 };
 #[cfg(all(test, ozzy_loom))]
 #[path = "progress/once_lock.rs"]
@@ -25,9 +22,9 @@ use once_lock::OnceLock;
 pub(super) struct Progress {
     confirmed: AtomicU64,
     pub(super) failure: OnceLock<WriterError>,
-    // Failure seals the confirmed prefix. Serialize that terminal transition
-    // with confirmation publication so observations never change afterward.
-    transition: Mutex<Option<u64>>,
+    // One owner publishes confirmations. Failure may seal from another thread;
+    // an active publisher finishes before observers can see the terminal seal.
+    transition: AtomicU8,
     pub(super) changed: StateSignal,
     partition: PartitionIncarnation,
     owner_epoch: u64,
@@ -41,7 +38,7 @@ impl Progress {
         Self {
             confirmed: AtomicU64::new(config.next_sequence),
             failure: OnceLock::new(),
-            transition: Mutex::new(None),
+            transition: AtomicU8::new(0),
             changed: StateSignal::default(),
             partition: config.partition,
             owner_epoch: config.owner_epoch,
@@ -56,6 +53,7 @@ impl Progress {
         sequence: u64,
         message_id: MessageId,
         offset: u64,
+        disposition: ozzy_proto::append::AppendDisposition,
     ) -> RecordReceipt {
         RecordReceipt {
             partition: self.partition,
@@ -67,6 +65,7 @@ impl Progress {
             },
             message_id,
             offset,
+            disposition,
             policy: self.policy,
         }
     }
@@ -79,9 +78,11 @@ impl Progress {
         if target <= self.confirmed() {
             return Some(Ok(()));
         }
-        let failure = self.failure.get()?;
-        // Progress serializes confirmation and terminal failure publication.
-        // Reload after acquiring failure so a racing earlier confirmation wins.
+        if self.transition.load(Ordering::Acquire) != SEALED {
+            return None;
+        }
+        let failure = self.failure.get().expect("failure precedes terminal seal");
+        // The terminal seal follows any publisher that won admission before it.
         if target <= self.confirmed() {
             Some(Ok(()))
         } else {
@@ -94,50 +95,45 @@ impl Progress {
     }
 
     pub(super) fn fail(&self, error: WriterError) {
-        let _transition = self
-            .transition
-            .lock()
-            .expect("writer progress transition poisoned");
         self.failure.get_or_init(|| error);
+        self.transition.fetch_or(SEALED, Ordering::AcqRel);
+        self.changed.notify_changed();
     }
 
     pub(super) fn confirm<T>(
         &self,
         first: u64,
         end: u64,
-        first_offset: u64,
         ready_next: u64,
         retire: impl FnOnce(usize) -> T,
     ) -> Result<T, WriterError> {
-        let mut transition = self
-            .transition
-            .lock()
-            .expect("writer progress transition poisoned");
-        if let Some(error) = self.failure.get() {
-            return Err(error.clone());
-        }
         let confirmed = self.confirmed();
         if first > confirmed || first >= end || end > ready_next || end < confirmed {
             return Err(super::Error::Response.into());
         }
         let count = usize::try_from(end - confirmed).map_err(|_| super::Error::Response)?;
-        let last_offset = first_offset
-            .checked_add(end - first - 1)
-            .ok_or(super::Error::Response)?;
-        if transition.is_some_and(|last| {
-            if first < confirmed {
-                first_offset.checked_add(confirmed - first - 1) != Some(last)
-            } else {
-                first_offset <= last
-            }
-        }) {
-            return Err(super::Error::Response.into());
-        }
+        self.transition
+            .compare_exchange(0, PUBLISHING, Ordering::Acquire, Ordering::Acquire)
+            .map_err(|state| {
+                assert_ne!(state & SEALED, 0, "one confirmation publisher");
+                self.failure.get().expect("failure precedes seal").clone()
+            })?;
+        let publication = Publication(self);
         let retired = retire(count);
-        *transition = Some(last_offset);
         self.confirmed.store(end, Ordering::Release);
-        drop(transition);
-        self.changed.notify_changed();
+        drop(publication);
         Ok(retired)
+    }
+}
+
+const PUBLISHING: u8 = 1;
+const SEALED: u8 = 2;
+
+struct Publication<'a>(&'a Progress);
+
+impl Drop for Publication<'_> {
+    fn drop(&mut self) {
+        self.0.transition.fetch_and(!PUBLISHING, Ordering::Release);
+        self.0.changed.notify_changed();
     }
 }

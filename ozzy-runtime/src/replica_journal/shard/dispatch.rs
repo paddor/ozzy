@@ -1,5 +1,5 @@
 use super::{Action, Command, Job, State};
-use crate::replica_journal::commands::{finish, finish_read, read_fault};
+use crate::replica_journal::commands::{fault_log, finish, finish_read, read_fault};
 use crate::replica_journal::{JournalError, ProposalValidation, Turn, TurnResult};
 
 #[expect(
@@ -28,6 +28,15 @@ pub(super) async fn run(
                 .owner
                 .retention_turn(ticket, timestamp, seed, leader)
                 .await,
+            permit,
+        ),
+        Action::RetainIdentities {
+            ticket,
+            leader,
+            done,
+        } => finish_read(
+            done,
+            state.owner.retain_identities_turn(ticket, leader),
             permit,
         ),
         Action::Seek {
@@ -61,6 +70,9 @@ pub(super) async fn run(
         } => {
             let result = state.owner.propose_append(ticket, buffer, timestamp).await;
             let failed = matches!(&result, ProposalValidation::Rejected { reason, .. } if read_fault(reason));
+            if failed && let ProposalValidation::Rejected { reason, .. } = &result {
+                fault_log(reason);
+            }
             drop(permit);
             let _ = done.send(Ok(result));
             failed
@@ -75,7 +87,11 @@ pub(super) async fn run(
             let result = Box::pin(turn_work(&mut state, *turn, timestamp))
                 .await
                 .map(Box::new);
-            let failed = crate::replica_journal::turn::faulted(&result);
+            let fault = crate::replica_journal::turn::fault(&result);
+            if let Some(error) = fault {
+                fault_log(error);
+            }
+            let failed = fault.is_some();
             drop(permit);
             let _ = done.send(result);
             failed
@@ -300,7 +316,7 @@ async fn turn_work(
         None => None,
     };
     let validated = match turn.validate {
-        Some((ticket, buffer)) => Some(state.owner.validate_append(ticket, buffer).await),
+        Some((ticket, buffer)) => Some(state.owner.validate_received(ticket, buffer).await),
         None => None,
     };
     let applied = turn

@@ -223,6 +223,53 @@ fn async_retry_reads_reuse_predecessor_and_cached_sealed_selectors() {
 }
 
 #[test]
+fn a_rolled_read_index_proves_what_a_retention_scan_finds() {
+    let (mut controller, journal) = empty_journal();
+    let mut index = drive(&mut controller, Index::open(&journal, read_config(0))).unwrap();
+    let partition = indexes::partition();
+    assert_eq!(index.sealed_retirement_proof(&journal).unwrap(), None);
+    let journal = append(&mut controller, journal, &mut index, 0, 0);
+    let mut journal = append(&mut controller, journal, &mut index, 1, 0);
+    drive(&mut controller, journal.roll_active(32768, 4)).unwrap();
+    index.rolled(&journal).unwrap();
+    let proof = index.sealed_retirement_proof(&journal).unwrap().unwrap();
+    assert_eq!(controller.jobs().len(), 0);
+    let summary = proof.retention_segment(partition);
+    assert_eq!(summary.record_end, Offset::new(2));
+    assert_eq!(
+        summary,
+        drive(&mut controller, journal.retention_segment(1, partition)).unwrap()
+    );
+    let position = journal.written_position().unwrap();
+    let budget = crate::AsyncRetirementBudget {
+        max_segments: 1,
+        max_read_bytes: 1,
+    };
+    // A proven segment needs no read budget; one above the floors stops the prefix.
+    let below = crate::RetentionFloors::new(vec![(partition, Offset::new(2))]).unwrap();
+    let scan = journal
+        .prepare_retirement_scan(below, position, budget, std::slice::from_ref(&proof))
+        .unwrap();
+    let mut read = false;
+    let prefix = crate::test_io::drive_with(&mut controller, scan.scan(), |operation| {
+        read |= matches!(operation, ozzy_io::Operation::Open { .. });
+        ozzy_io::simulation::Effect::Normal
+    })
+    .unwrap();
+    assert_eq!(prefix.references().len(), 1);
+    assert!(!read, "a proven segment was read");
+    let above = crate::RetentionFloors::new(vec![(partition, Offset::new(1))]).unwrap();
+    let scan = journal
+        .prepare_retirement_scan(above, position, budget, &[proof])
+        .unwrap();
+    assert_eq!(
+        drive(&mut controller, scan.scan()).unwrap().references(),
+        []
+    );
+    drive(&mut controller, journal.close()).unwrap();
+}
+
+#[test]
 fn async_resident_delivery_releases_file_protection_and_keeps_bounded_selection() {
     let (mut controller, journal) = empty_journal();
     let mut index = drive(&mut controller, Index::open(&journal, read_config(0))).unwrap();

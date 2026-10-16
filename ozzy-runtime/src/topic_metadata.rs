@@ -134,9 +134,22 @@ impl TopicMetadata {
         let hash = xxhash_rust::xxh3::xxh3_64_with_seed(key, self.seed);
         &self.partitions[(hash % self.partitions.len() as u64) as usize]
     }
+
+    /// Deterministic coordinator of one consumer group, selected by name with
+    /// the topic's own partitioner so every SDK and broker agrees.
+    pub fn coordinator(&self, group: &str) -> &TopicPartition {
+        &self.partitions[coordinator_number(group, self.seed, self.partitions.len()) as usize]
+    }
+}
+
+/// Numeric coordinator partition of a group name within a topic.
+pub fn coordinator_number(group: &str, seed: u64, partitions: usize) -> u32 {
+    let hash = xxhash_rust::xxh3::xxh3_64_with_seed(group.as_bytes(), seed);
+    (hash % partitions.max(1) as u64) as u32
 }
 
 mod routes;
+pub(crate) use routes::RouteObservations;
 pub use routes::{RouteCache, RouteCacheError};
 
 #[cfg(test)]

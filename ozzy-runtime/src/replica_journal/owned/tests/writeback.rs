@@ -224,6 +224,10 @@ pub(super) fn initialize_writer(
             topic: "orders",
             partition_id: PartitionId::ZERO,
             owner_epoch: OwnerEpoch::INITIAL,
+            dedup_window_millis: replica
+                .config
+                .deduplication
+                .and_then(|limits| std::num::NonZeroU64::new(limits.window_millis)),
             retention: RetentionPolicy::default(),
         }),
         OperationBody::OpenProducer(OpenProducer {
@@ -244,7 +248,10 @@ pub(super) fn initialize_writer(
     receipt
 }
 
-fn packed_append_body(limits: ozzy_journal::operation::OperationLimits, payload: &[u8]) -> Vec<u8> {
+pub(super) fn packed_append_body(
+    limits: ozzy_journal::operation::OperationLimits,
+    payload: &[u8],
+) -> Vec<u8> {
     use ozzy_journal::operation::{
         Append, AppendBatch, AppendPackResult, AppendPackScratch, AppendRecord, OperationBody,
         encode_operation_body, pack_append_payload,

@@ -380,6 +380,7 @@ fn assert_compressed_history(encoding: BodyEncoding) {
                     topic: &name,
                     partition_id: PartitionId::new(u32::from(id)),
                     owner_epoch: OwnerEpoch::INITIAL,
+                    dedup_window_millis: None,
                     retention: RetentionPolicy::default(),
                 }),
                 OperationLimits::default(),

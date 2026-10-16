@@ -99,7 +99,7 @@ impl Cursor {
         self.live.replay().is_some()
             && self.selected.is_none()
             && self.opening.is_none()
-            && !self.inbox.has_capacity()
+            && !self.inbox.can_subscribe()
     }
 
     fn waiting_for_input(&self, input: (u64, RouteGeneration), now: Duration) -> bool {

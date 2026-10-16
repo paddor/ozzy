@@ -5,10 +5,14 @@ use super::{ENVELOPE_BYTES, Envelope, EnvelopeError, EnvelopeLimits, Opcode, Pac
 
 /// Owner-append capability, including exact retry reconciliation.
 pub const OWNER_APPEND: u16 = 1;
+/// Consumer-group membership and source activation; requires durable progress.
+pub const OWNER_GROUPS: u16 = 1 << 7;
 /// Typed authority hints for fixed-group owner discovery and unchanged retries.
 pub const OWNER_ROUTING: u16 = 1 << 9;
 /// Single-partition reader delivery and receipt/processing observations.
 pub const OWNER_READ: u16 = 1 << 10;
+/// Durable group processing progress, with exact member/assignment fencing.
+pub const OWNER_PROGRESS: u16 = 1 << 11;
 /// Pipelined owner append with record-based retries and per-writer range replies.
 pub const OWNER_STREAM: u16 = 1 << 12;
 /// Reader role, not independent authorization.
@@ -17,8 +21,8 @@ pub const CONSUMER: u32 = 2;
 pub const PRODUCER: u32 = 1;
 /// Log-owner role. Serving authority still comes from the active group.
 pub const OWNER: u32 = 4;
-// Capabilities 12 and 14 are unassigned. Required use must fail, never imply delivery.
-const KNOWN_CAPABILITIES: u16 = 0x17ff;
+// Capability 14 is unassigned. Required use must fail, never imply delivery.
+const KNOWN_CAPABILITIES: u16 = 0x1fff;
 const MAX_PROPERTIES: usize = 32;
 const NAMES: [&[u8]; 10] = [
     b"versions",
@@ -66,6 +70,24 @@ impl Parameters {
         parameters.required_capabilities = OWNER_READ;
         Ok(parameters)
     }
+
+    /// Reader profile requiring durable progress in addition to record delivery.
+    pub fn processing(receive: DataLimits, roles: u32) -> Result<Self, HandshakeError> {
+        let mut parameters = Self::reader(receive, roles)?;
+        parameters.capabilities |= OWNER_PROGRESS;
+        parameters.required_capabilities |= OWNER_PROGRESS;
+        parameters.validate()?;
+        Ok(parameters)
+    }
+
+    /// Processing profile that also requires automatic group membership.
+    pub fn group(receive: DataLimits, roles: u32) -> Result<Self, HandshakeError> {
+        let mut parameters = Self::processing(receive, roles)?;
+        parameters.capabilities |= OWNER_GROUPS;
+        parameters.required_capabilities |= OWNER_GROUPS;
+        parameters.validate()?;
+        Ok(parameters)
+    }
     /// Single-request append profile; other command families remain unadvertised.
     pub fn append(receive: DataLimits, roles: u32) -> Result<Self, HandshakeError> {
         let parameters = Self {
@@ -91,6 +113,8 @@ impl Parameters {
             || self.receive.envelope.max_metadata_bytes < 512
             || self.capabilities & !KNOWN_CAPABILITIES != 0
             || (self.capabilities & OWNER_STREAM != 0 && self.capabilities & OWNER_APPEND == 0)
+            || (self.capabilities & OWNER_PROGRESS != 0 && self.capabilities & OWNER_READ == 0)
+            || (self.capabilities & OWNER_GROUPS != 0 && self.capabilities & OWNER_PROGRESS == 0)
             || self.required_capabilities & !self.capabilities != 0
             || self.roles == 0
             || self.roles & !31 != 0

@@ -1,7 +1,7 @@
 use super::*;
 use crate::replica_journal::owned::tests::{
     replay::persist,
-    writeback::{confirm, replica},
+    writeback::{Replica, confirm, replica},
 };
 
 #[test]
@@ -92,4 +92,59 @@ fn repeated_retirement_preserves_both_quorum_policies_and_the_retained_chain() {
         drive(&mut controller, primary.journal.shutdown()).unwrap();
         drive(&mut controller, backup.journal.shutdown()).unwrap();
     }
+}
+
+#[test]
+fn a_promise_abandons_an_unfinished_retirement_without_fencing() {
+    let policy = QuorumPolicy::Durable;
+    let (mut controller, io) = setup();
+    let mut primary = replica(&mut controller, io.clone(), 0, policy, 8192);
+    let mut backup = replica(&mut controller, io, 2, policy, 8192);
+    for at in 0..2 {
+        persist(&mut controller, &mut primary);
+        persist(&mut controller, &mut backup);
+        confirm(&mut primary, &backup, policy);
+        if at == 0 {
+            roll(&mut controller, &mut primary.journal);
+        }
+    }
+    let ticket = primary.driver.begin_validation().unwrap();
+    drive(
+        &mut controller,
+        primary.journal.begin_retirement(
+            ticket,
+            CheckpointId::from_bytes([91; 16]),
+            AsyncRetirementBudget {
+                max_segments: 1,
+                max_read_bytes: 32768,
+            },
+        ),
+    )
+    .unwrap();
+    let Replica {
+        mut journal,
+        driver,
+        ..
+    } = primary;
+    let work = journal.take_retirement_work().unwrap();
+    let done = drive(&mut controller, Box::pin(work.run()));
+    // A view change replaces the owner's images before the work completes.
+    let ozzy_replication::driver::Role::Normal(normal) = driver.into_role() else {
+        panic!("normal primary");
+    };
+    let promise = normal.into_view_change(1).unwrap().begin_promise().unwrap();
+    drive(&mut controller, journal.persist_promise(promise)).unwrap();
+    assert!(!journal.retiring());
+    journal.complete_retirement(done);
+    assert!(!journal.retiring());
+    assert!(
+        drive(&mut controller, journal.finish_retirement())
+            .unwrap()
+            .is_none()
+    );
+    assert!(!journal.is_faulted());
+    let manifest = journal.journal.ready().unwrap().manifest();
+    assert!(manifest.checkpoint.is_none());
+    assert_eq!(manifest.segments[0].segment_id, 1);
+    drive(&mut controller, journal.shutdown()).unwrap();
 }

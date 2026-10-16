@@ -89,6 +89,12 @@ impl Session {
         mut binding: SessionBinding<'_>,
     ) -> Result<(), Failure> {
         loop {
+            // A failed or closed writer leaves here. Failing marks its work, so
+            // without this check every turn would find work again and never
+            // yield the SDK thread to the stop or to other writers.
+            if shared.stop.is_closed() {
+                return Ok(());
+            }
             if self.retry_at.is_some_and(|at| self.clock.now() >= at) && self.replay_ready() {
                 // Preserve the physical session and drain earlier confirmations
                 // before replaying the remaining prefix. Old request IDs cannot
@@ -105,6 +111,7 @@ impl Session {
                 .deadline
                 .is_some_and(|deadline| self.clock.now() >= deadline)
             {
+                crate::profiling::event(crate::profiling::Event::SdkResponseTimeout);
                 return Err(Failure::Retry(None));
             }
             let work = shared.work.clone();
@@ -162,6 +169,7 @@ impl Session {
                         None => std::future::pending().await,
                     }
                 } => {
+                    crate::profiling::event(crate::profiling::Event::SdkResponseTimeout);
                     return Err(Failure::Retry(None));
                 },
                 () = async {
@@ -402,19 +410,13 @@ impl Session {
         {
             return Err(Failure::Fatal(Error::Response));
         }
-        let stream::Confirmed {
-            owner_epoch,
-            key,
-            policy,
-            end_sequence,
-            first_offset,
-            ..
-        } = reply;
+        let key = reply.key;
+        let end_sequence = reply.end_sequence;
         let confirmed = shared.progress.confirmed();
-        if owner_epoch != shared.config.owner_epoch
+        if reply.owner_epoch != shared.config.owner_epoch
             || key.producer_id != shared.config.producer_id
             || key.producer_epoch != shared.config.producer_epoch
-            || policy != shared.config.policy
+            || reply.policy != shared.config.policy
         {
             return Err(Failure::Fatal(Error::Response));
         }
@@ -443,7 +445,12 @@ impl Session {
             return Ok(());
         }
         let confirmed_bytes = shared
-            .confirm(key.first_sequence, end_sequence, first_offset)
+            .confirm_outcomes(
+                key.first_sequence,
+                reply
+                    .outcomes()
+                    .map_err(|error| Failure::Fatal(error.into()))?,
+            )
             .map_err(|_| Failure::Fatal(Error::Response))?;
         self.window.confirm(end_sequence, confirmed_bytes);
         binding.connection.confirm(end_sequence);

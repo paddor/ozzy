@@ -1,5 +1,5 @@
 use ozzy_proto::append::stream::{self, Confirmed};
-use ozzy_proto::append::{AppendKey, Authority, CodecError, Policy};
+use ozzy_proto::append::{AppendDisposition, AppendKey, Authority, CodecError, Policy};
 use ozzy_proto::{
     Envelope, EnvelopeLimits, GroupId, LinkSessionId, NodeId, Opcode, Packet, PartitionIncarnation,
     ProducerId, RequestId, decode_packet,
@@ -31,6 +31,7 @@ fn confirmed() -> Confirmed {
         },
         end_sequence: 2008,
         first_offset: 10,
+        disposition: AppendDisposition::Stored,
         policy: Policy::QuorumReplicatedPersisting,
     }
 }
@@ -39,7 +40,7 @@ fn confirmed() -> Confirmed {
 fn confirmed_range_has_fixed_bytes_independent_of_append_boundaries() {
     let receipt = confirmed();
     let limits = EnvelopeLimits::default();
-    let mut metadata = Vec::with_capacity(106);
+    let mut metadata = Vec::with_capacity(107);
     let header = stream::encode_confirmed(envelope(), receipt, &mut metadata, limits).unwrap();
     let mut golden = vec![1];
     golden.extend([1; 16]);
@@ -52,18 +53,39 @@ fn confirmed_range_has_fixed_bytes_independent_of_append_boundaries() {
     golden.extend(8_u64.to_be_bytes());
     golden.extend(2008_u64.to_be_bytes());
     golden.extend(10_u64.to_be_bytes());
+    golden.push(0);
     golden.push(6);
     assert_eq!(metadata, golden);
-    assert_eq!(metadata.len(), 106);
+    assert_eq!(metadata.len(), 107);
     let packet = decode_packet(&[&header, &golden, &[]], limits).unwrap();
     assert_eq!(stream::decode_confirmed(packet, limits).unwrap(), receipt);
+}
+
+#[test]
+fn duplicate_confirmation_preserves_its_original_offset_and_rejects_unknown_dispositions() {
+    let limits = EnvelopeLimits::default();
+    let receipt = Confirmed {
+        disposition: AppendDisposition::Duplicate,
+        first_offset: 0,
+        ..confirmed()
+    };
+    let mut metadata = Vec::with_capacity(107);
+    let header = stream::encode_confirmed(envelope(), receipt, &mut metadata, limits).unwrap();
+    assert_eq!(metadata[105], 1);
+    let packet = decode_packet(&[&header, &metadata, &[]], limits).unwrap();
+    assert_eq!(stream::decode_confirmed(packet, limits).unwrap(), receipt);
+    for disposition in [2, 3, 255] {
+        metadata[105] = disposition;
+        let packet = decode_packet(&[&header, &metadata, &[]], limits).unwrap();
+        assert!(stream::decode_confirmed(packet, limits).is_err());
+    }
 }
 
 #[test]
 fn invalid_confirmation_ranges_are_rejected_before_replacing_metadata() {
     let limits = EnvelopeLimits::default();
     let valid = confirmed();
-    let mut metadata = Vec::with_capacity(106);
+    let mut metadata = Vec::with_capacity(107);
     stream::encode_confirmed(envelope(), valid, &mut metadata, limits).unwrap();
     let original = metadata.clone();
     let pointer = metadata.as_ptr();
@@ -118,7 +140,7 @@ fn invalid_confirmation_ranges_are_rejected_before_replacing_metadata() {
 #[test]
 fn malformed_confirmations_reject_truncation_trailing_bytes_payload_and_policy() {
     let limits = EnvelopeLimits::default();
-    let mut metadata = Vec::with_capacity(106);
+    let mut metadata = Vec::with_capacity(107);
     stream::encode_confirmed(envelope(), confirmed(), &mut metadata, limits).unwrap();
     for end in 0..metadata.len() {
         assert!(
@@ -136,7 +158,7 @@ fn malformed_confirmations_reject_truncation_trailing_bytes_payload_and_policy()
     }
     for policy in [0, 4, 7, 255] {
         let mut invalid = metadata.clone();
-        invalid[105] = policy;
+        invalid[106] = policy;
         assert_eq!(
             stream::decode_confirmed(
                 Packet {
@@ -172,7 +194,7 @@ fn malformed_confirmations_reject_truncation_trailing_bytes_payload_and_policy()
 fn confirmations_require_nonzero_identities_and_correlated_response_sessions() {
     let limits = EnvelopeLimits::default();
     let valid = confirmed();
-    let mut metadata = Vec::with_capacity(106);
+    let mut metadata = Vec::with_capacity(107);
     stream::encode_confirmed(envelope(), valid, &mut metadata, limits).unwrap();
     let original = metadata.clone();
     let mut invalid = [valid; 6];

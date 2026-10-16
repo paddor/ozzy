@@ -1,3 +1,4 @@
+use super::super::group_progress::History as ProgressHistory;
 use super::*;
 use crate::{
     frontend::{ReceiveError, Rejection, TopicCatalog, WatchError},
@@ -9,9 +10,12 @@ use ozzy_proto::{TopicId, directory};
 use std::{collections::BTreeSet, future::Future, pin::pin, task::Poll};
 
 mod appends;
+mod group_reader;
+mod groups;
 mod metadata;
 mod multiple;
 mod opening;
+mod progress;
 mod readers;
 mod routes;
 mod topic;
@@ -35,6 +39,10 @@ struct ReaderTraffic {
     failures: BTreeSet<RequestId>,
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent fault switches control the test schedule"
+)]
 struct Harness {
     local: NodeId,
     service: Service,
@@ -74,6 +82,12 @@ struct Harness {
         RequestId,
         LinkSessionId,
     )>,
+    drop_progress: bool,
+    drop_progress_request: bool,
+    refuse_assign: usize,
+    assignment_attempts: usize,
+    assignment_service: Option<(crate::replica_actor::ProposalSubmitter, ProposalBuffer)>,
+    now: Duration,
 }
 
 impl Harness {
@@ -97,6 +111,24 @@ impl Harness {
                         .authority
                         .group_id
                 }
+                Opcode::ProgressCommit => {
+                    ozzy_proto::progress::decode_request(decoded, self.wire.envelope)
+                        .unwrap()
+                        .authority
+                        .group_id
+                }
+                Opcode::GroupAssign => {
+                    ozzy_proto::group::decode_assign(decoded, self.wire.envelope)
+                        .unwrap()
+                        .authority
+                        .group_id
+                }
+                Opcode::GroupJoin => {
+                    ozzy_proto::group::decode_join(decoded, self.wire.envelope)
+                        .unwrap()
+                        .authority
+                        .group_id
+                }
                 Opcode::Subscribe | Opcode::Ack | Opcode::Unsubscribe => {
                     let ozzy_proto::reader::Source::Group { authority, .. } =
                         ozzy_proto::reader::route(decoded, self.wire.envelope).unwrap()
@@ -111,11 +143,10 @@ impl Harness {
                 if self.defer_openings && decoded.envelope.opcode == Opcode::OpenProducer {
                     // The production shard answers this way until its
                     // partition finished local initialization.
-                    self.actors
-                        .defer_client(group, &received.message, Duration::ZERO)
+                    self.actors.defer_client(group, &received.message, self.now)
                 } else {
                     self.actors
-                        .receive_client(group, &received.message, Duration::ZERO)
+                        .receive_client(group, &received.message, self.now)
                 };
             match delivered.unwrap() {
                 NativeReceive::Busy => {
@@ -136,7 +167,7 @@ impl Harness {
         self.dispatch_ready();
         let _ = self.actors.poll_progress(
             &mut Context::from_waker(Waker::noop()),
-            Duration::ZERO,
+            self.now,
             |_, message| {
                 if message
                     .part_slice(0)
@@ -154,6 +185,10 @@ impl Harness {
                     return Ok(());
                 }
                 let decoded = packet(&message);
+                if decoded.envelope.opcode == Opcode::ProgressCommitted && self.drop_progress {
+                    self.drop_progress = false;
+                    return Ok(());
+                }
                 if decoded.envelope.opcode == Opcode::Nack {
                     let nack = ozzy_proto::nack::decode(decoded, limits().envelope).unwrap();
                     if nack.code == 16 {
@@ -336,6 +371,18 @@ impl Harness {
                 .links()
                 .get(decoded.envelope.sender)
                 .is_none_or(|link| decoded.envelope.session != Some(link.binding.session));
+            if decoded.envelope.opcode == Opcode::ProgressCommit && self.drop_progress_request {
+                self.drop_progress_request = false;
+                continue;
+            }
+            if decoded.envelope.opcode == Opcode::GroupAssign {
+                self.assignment_attempts += 1;
+                if self.refuse_assign != 0 && !stale_session {
+                    self.refuse_assign -= 1;
+                    self.refuse_for_credit(decoded.envelope);
+                    continue;
+                }
+            }
             match decoded.envelope.opcode {
                 Opcode::Subscribe => self.readers.requests.push((
                     Opcode::Subscribe,
@@ -433,6 +480,7 @@ impl Harness {
     }
 
     async fn shutdown(mut self) {
+        self.assignment_service.take();
         self.publications.clear();
         self.readers.records.clear();
         let mut closing = pin!(self.actors.shutdown());
@@ -593,6 +641,7 @@ async fn setup_shared_profile(
         count,
         reader_window,
         false,
+        None,
     ))
     .await
 }
@@ -603,6 +652,7 @@ async fn setup_shared_directory_profile(
     count: usize,
     reader_window: Option<(u64, u64, usize)>,
     alternate_metadata: bool,
+    progress_history: Option<ProgressHistory>,
 ) -> (
     Harness,
     BrokerLinks,
@@ -632,7 +682,60 @@ async fn setup_shared_directory_profile(
     let mut native = Vec::new();
     let mut partitions = Vec::new();
     let mut groups = Vec::new();
+    let mut assignment_service = None;
+    let mut coordinators = Vec::new();
+    let topology = std::sync::Arc::new(crate::replica_actor::TopicTopology {
+        seed: 7,
+        partitions: (0..count)
+            .map(|number| (number as u32, multiple::incarnation(number)))
+            .collect(),
+    });
+    let coordinate = |actor: &mut crate::replica_actor::LocalActor, number: usize| {
+        let config = crate::replica_actor::GroupCoordinatorConfig {
+            local: actor.authority_hint().primary,
+            group: actor.group(),
+            partition: multiple::incarnation(number),
+            number: number as u32,
+            topology: topology.clone(),
+            limits: wire.envelope,
+            requests: 4,
+            plans: 1,
+            max_members: 8,
+            membership_timeout: Duration::from_secs(10),
+            drain_deadline: Duration::from_secs(5),
+        };
+        let arena = actor
+            .lease_proposal_buffer_with_limits(ozzy_replication::PipelineLimits {
+                max_operations: 1,
+                max_body_bytes: config.plan_bytes(),
+            })
+            .unwrap();
+        crate::replica_actor::GroupCoordinator::new(
+            config,
+            actor.take_submitter().unwrap(),
+            vec![arena],
+        )
+        .unwrap()
+    };
     for number in 0..count {
+        if let Some(history) = progress_history
+            && number == 0
+        {
+            let (mut actor, intake) =
+                super::super::group_progress::fixture(&mut controller, io.clone(), history);
+            let buffer = actor
+                .lease_proposal_buffer_with_limits(ozzy_replication::PipelineLimits {
+                    max_operations: 1,
+                    max_body_bytes: 98,
+                })
+                .unwrap();
+            assignment_service = Some((actor.take_submitter().unwrap(), buffer));
+            coordinators.push(coordinate(&mut actor, number));
+            groups.push(actor.group());
+            native.push(intake);
+            partitions.push(PartitionActor::Local(Box::new(actor)));
+            continue;
+        }
         let incarnation = multiple::incarnation(number);
         let mut actor = actor_with_partition_memory(
             &mut controller,
@@ -654,11 +757,19 @@ async fn setup_shared_directory_profile(
             None,
             wire,
         ));
+        coordinators.push(coordinate(&mut actor, number));
         partitions.push(PartitionActor::Local(Box::new(actor)));
     }
     let authority = partitions[0].authority_hint();
     let group = groups[0];
-    let (mut service, input) = multiple::service(authority.primary, &groups, &data, &control, wire);
+    let (mut service, input) = multiple::service(
+        authority.primary,
+        &groups,
+        &data,
+        &control,
+        wire,
+        progress_history.is_some(),
+    );
     let server = runtime.context().socket(
         SocketType::Peer,
         Options::default()
@@ -716,6 +827,11 @@ async fn setup_shared_directory_profile(
     for native in native {
         actors.install_native(native, service.links()).unwrap();
     }
+    for coordinator in coordinators {
+        actors
+            .install_coordinator(coordinator, service.links())
+            .unwrap();
+    }
     if reader_window.is_some() {
         for (number, &group) in groups.iter().enumerate() {
             actors
@@ -755,7 +871,8 @@ async fn setup_shared_directory_profile(
     }
     let metadata_peer = if alternate_metadata {
         let address = &addresses[1];
-        let (mut service, input) = multiple::service(address.node, &groups, &data, &control, wire);
+        let (mut service, input) =
+            multiple::service(address.node, &groups, &data, &control, wire, false);
         service
             .install_catalog(metadata::paginate(
                 &multiple::catalog(authority, &groups, &addresses[0].endpoint, &publications),
@@ -805,6 +922,11 @@ async fn setup_shared_directory_profile(
             queue_messages: 1,
         });
     }
+    if progress_history.is_some() {
+        options.parameters = handshake::Parameters::group(wire, handshake::CONSUMER).unwrap();
+        options.parameters.capabilities |= handshake::OWNER_ROUTING;
+        options.append = None;
+    }
     let links = BrokerLinks::connect_with_ids(
         &runtime,
         options,
@@ -853,6 +975,12 @@ async fn setup_shared_directory_profile(
         refuse_append: None,
         capacity_replies: BTreeSet::new(),
         appends: Vec::new(),
+        drop_progress: false,
+        drop_progress_request: false,
+        refuse_assign: 0,
+        assignment_attempts: 0,
+        assignment_service,
+        now: Duration::ZERO,
     };
     (harness, links, clock, authority)
 }

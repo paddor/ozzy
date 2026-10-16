@@ -6,6 +6,7 @@ use ozzy_replication::ViewChangeError;
 
 use super::history::TransferPurpose;
 use super::io::{Completed, FetchPurpose};
+use super::maintenance::Maintenance;
 use super::{ActorError, DriverError, Duration, PendingIo, Prefix, ReplicaActor};
 
 impl ReplicaActor {
@@ -32,18 +33,10 @@ impl ReplicaActor {
         }
         // A slow maintenance step must not repeatedly win over queued writers.
         let foreground_turn = std::mem::take(&mut self.foreground_turn_due);
-        let due = [
-            self.storage_validation.map(|(_, next, _)| next),
-            self.metadata_cleanup.map(|(_, next, _)| next),
-            self.orphan_cleanup.map(|(_, next, _)| next),
-            self.retention_at,
-        ]
-        .into_iter()
-        .enumerate()
-        .filter_map(|(kind, next)| next.filter(|next| now >= *next).map(|next| (kind, next)))
-        .min_by_key(|(_, next)| *next)
-        .map(|(kind, _)| kind);
-        if let Some(kind) = due.filter(|_| !foreground_turn && self.application_ready()) {
+        if let Some(kind) = self
+            .due_maintenance(now)
+            .filter(|_| !foreground_turn && self.application_ready())
+        {
             // Drain admitted writes, then give the oldest due maintenance task a turn.
             if self.pending_sync.is_some() || !self.pending_persistence.is_empty() {
                 return Ok(());
@@ -52,14 +45,8 @@ impl ReplicaActor {
                 self.schedule_sync()?;
                 return Ok(());
             }
-            match kind {
-                0 => self.storage_validation_round(now)?,
-                1 => self.metadata_cleanup_round(now)?,
-                2 => self.orphan_cleanup_round(now)?,
-                3 => self.retention_round(now)?,
-                _ => unreachable!("three maintenance tasks"),
-            }
-            if self.pending.is_some() || kind == 3 {
+            self.maintenance_round(kind, now)?;
+            if self.pending.is_some() || kind == Maintenance::Retention {
                 return Ok(());
             }
         }
@@ -248,7 +235,8 @@ impl ReplicaActor {
             Completed::RetiredLookup(positions, to, request) => {
                 self.complete_retired_lookup(&positions, to, request)?;
             }
-            Completed::Retention(turn) => self.complete_retention(turn, now)?,
+            Completed::Retention(turn) => self.complete_retention(turn, now),
+            Completed::IdentityRetention(turn) => self.complete_identity_retention(turn, now),
             Completed::RecoveryCheckpoint(chunk, to) => {
                 self.complete_recovery_checkpoint(to, chunk)?;
             }

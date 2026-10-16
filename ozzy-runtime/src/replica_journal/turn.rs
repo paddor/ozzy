@@ -50,11 +50,27 @@ pub struct TurnResult {
     /// Proposal validation, when the turn carried one.
     pub proposal: Option<ProposalValidation>,
     /// Received-suffix validation, when the turn carried one.
-    pub validated: Option<Result<ValidatedAppend, JournalError>>,
+    pub validated: Option<ReceivedValidation>,
     /// Applied ticket, when the turn carried one.
     pub applied: Option<ValidationTicket>,
     /// Slow validation returned for a following command after admission.
     pub deferred: Option<Box<Turn>>,
+}
+
+/// Received suffix validation retains its bounded arena under memory pressure.
+#[derive(Debug)]
+pub enum ReceivedValidation {
+    /// Recheck the authority ticket before admitting these operations.
+    Ready(ValidatedAppend),
+    /// No operations were admitted. Retry after charged backing is released.
+    Deferred {
+        /// Authority that owned the staged suffix before preparation stopped.
+        validation: ValidationTicket,
+        /// Unadmitted canonical bytes, still within the original receive window.
+        buffer: AppendBuffer,
+    },
+    /// Invalid input or a storage failure; no arena remains in flight.
+    Rejected(JournalError),
 }
 
 impl ReplicaJournal {
@@ -76,19 +92,19 @@ impl ReplicaJournal {
 }
 
 /// A turn faults the worker when admission or application failed, or when
-/// its proposal failed on storage rather than on validation.
-pub(super) fn faulted(result: &Result<Box<TurnResult>, JournalError>) -> bool {
+/// its proposal failed on storage rather than on validation. Returns the
+/// error that fences the worker.
+pub(super) fn fault(result: &Result<Box<TurnResult>, JournalError>) -> Option<&JournalError> {
     match result {
-        Err(_) => true,
-        Ok(result) => {
-            matches!(
-                &result.proposal,
-                Some(ProposalValidation::Rejected { reason, .. })
-                    if super::commands::read_fault(reason)
-            ) || matches!(
-                &result.validated,
-                Some(Err(reason)) if super::commands::read_fault(reason)
-            )
-        }
+        Err(error) => Some(error),
+        Ok(result) => match (&result.proposal, &result.validated) {
+            (Some(ProposalValidation::Rejected { reason, .. }), _)
+            | (_, Some(ReceivedValidation::Rejected(reason)))
+                if super::commands::read_fault(reason) =>
+            {
+                Some(reason)
+            }
+            _ => None,
+        },
     }
 }

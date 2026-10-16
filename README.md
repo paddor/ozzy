@@ -46,6 +46,7 @@ applications using the [Rust SDK](ozzy/README.md). Requires Linux and Rust 1.93.
 | [`ozzy-io`](ozzy-io/) | File jobs, handles, completion, and controlled memory storage |
 | [`ozzy-io-pool`](ozzy-io-pool/) | Bounded blocking storage workers |
 | [`ozzy-io-aio`](ozzy-io-aio/) | Linux AIO storage backend |
+| [`ozzy-telemetry`](ozzy-telemetry/) | Optional thread-owned IPC telemetry and bounded diagnostic logs |
 | [`ozzy-sim`](ozzy-sim/) | Controlled simulation and full-product workload/fault runs |
 | [`ozzy-bench`](ozzy-bench/) | Benchmarks, comparisons, profiles, and SVG charts |
 

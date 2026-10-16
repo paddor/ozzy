@@ -5,7 +5,10 @@ use super::{WriterRuntime, pipe};
 use super::{inbox::Inbox, payload::Body};
 use crate::signal::{CloseSignal, DataSignal, StateSignal};
 use omq_tokio::message::Payload;
-use ozzy_proto::MessageId;
+use ozzy_proto::{
+    MessageId,
+    append::{AppendDisposition, AppendOutcome, OutcomeRun},
+};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -61,6 +64,8 @@ pub(super) struct Driver {
     reorder: Vec<Option<Queued>>,
     reordered: usize,
     ready_next: u64,
+    last_outcome: Option<AppendOutcome>,
+    last_stored_offset: Option<u64>,
     pub(super) admission: Admission,
     pub(super) batches: super::batch::PayloadPool,
     _resources: Option<crate::replicated::broker_links::append::Reservation>,
@@ -227,6 +232,8 @@ impl Shared {
                 reorder,
                 reordered: 0,
                 ready_next: next,
+                last_outcome: None,
+                last_stored_offset: None,
                 admission: Admission { records },
                 batches,
                 _resources: resources,
@@ -452,28 +459,83 @@ impl Driver {
     /// Remote confirmation releases local retry state and drops original payloads.
     /// Every confirmed record was selected from the admission queue, so no
     /// intake drain is needed to cover `end`.
+    #[cfg(test)]
     pub(super) fn confirm(
         &mut self,
         first: u64,
         end: u64,
         first_offset: u64,
     ) -> Result<usize, WriterError> {
+        let records = end
+            .checked_sub(first)
+            .and_then(|count| u32::try_from(count).ok())
+            .ok_or(super::Error::Response)?;
+        self.confirm_outcomes(
+            first,
+            OutcomeRun {
+                disposition: AppendDisposition::Stored,
+                first_offset: ozzy_proto::Offset::new(first_offset),
+                records,
+            },
+        )
+    }
+
+    pub(super) fn confirm_outcomes(
+        &mut self,
+        first: u64,
+        outcomes: OutcomeRun,
+    ) -> Result<usize, WriterError> {
+        let end = first
+            .checked_add(u64::from(outcomes.records))
+            .ok_or(super::Error::Response)?;
+        let confirmed = self.shared.progress.confirmed();
+        let last = outcomes
+            .outcome(
+                outcomes
+                    .records
+                    .checked_sub(1)
+                    .ok_or(super::Error::Response)?,
+            )
+            .ok_or(super::Error::Response)?;
+        if last.offset.get() == u64::MAX {
+            return Err(super::Error::Response.into());
+        }
+        if first < confirmed {
+            let boundary = confirmed
+                .checked_sub(first + 1)
+                .and_then(|delta| u32::try_from(delta).ok())
+                .and_then(|delta| outcomes.outcome(delta));
+            if boundary != self.last_outcome {
+                return Err(super::Error::Response.into());
+            }
+        } else if outcomes.disposition == AppendDisposition::Stored
+            && self
+                .last_stored_offset
+                .is_some_and(|last| outcomes.first_offset.get() <= last)
+        {
+            return Err(super::Error::Response.into());
+        }
         // Confirmed records were sent, so they left the inbox; releasing here
         // keeps the byte count exact whatever order a caller uses.
         self.stage(end.min(self.ready_next));
         let progress = &self.shared.progress;
         let records = &mut self.admission.records;
-        let bytes = progress.confirm(first, end, first_offset, self.ready_next, |count| {
+        let bytes = progress.confirm(first, end, self.ready_next, |count| {
             records
                 .drain(..count)
                 .map(|record| {
-                    record
-                        .completion
-                        .publish(first_offset + (record.sequence - first));
+                    record.completion.publish(
+                        outcomes.first_offset.get() + (record.sequence - first),
+                        outcomes.disposition,
+                    );
                     record.body.len()
                 })
                 .sum()
         })?;
+        self.last_outcome = Some(last);
+        if outcomes.disposition == AppendDisposition::Stored {
+            self.last_stored_offset = Some(last.offset.get());
+        }
         self.work.mark();
         Ok(bytes)
     }

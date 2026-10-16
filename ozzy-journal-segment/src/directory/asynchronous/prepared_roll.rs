@@ -354,6 +354,7 @@ impl Pending {
         let mut rolled = completed.result?;
         self.journal.writer.transfer_buffers_to(&mut rolled.writer);
         self.journal.writer = rolled.writer;
+        self.journal.active_prefix = None;
         self.journal.directory = rolled.directory;
         self.journal.manifest = rolled.manifest;
         self.journal.current = rolled.current;

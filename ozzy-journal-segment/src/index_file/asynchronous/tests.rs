@@ -54,7 +54,9 @@ fn fixture(count: usize) -> (Vec<u8>, SegmentIndexImage) {
             location,
         });
     }
-    let image = SegmentIndexImage::new(source, 64 * 1024, offsets, messages, operations).unwrap();
+    let locations = operations.iter().map(|entry| entry.location).collect();
+    let image = SegmentIndexImage::new(source, 64 * 1024, offsets, messages, operations, locations)
+        .unwrap();
     (
         encode_segment_index(&image, IndexLimits::default()).unwrap(),
         image,
@@ -189,6 +191,30 @@ fn cooperative_index_open_refuses_late_table_corruption_even_with_a_valid_checks
 }
 
 #[test]
+fn numeric_operation_table_refuses_gaps_and_conflicting_coordinates() {
+    let count = 130;
+    let (original, _) = fixture(count);
+    let start = INDEX_HEADER_BYTES
+        + count
+            * (OFFSET_INDEX_ENTRY_BYTES + MESSAGE_INDEX_ENTRY_BYTES + OPERATION_INDEX_ENTRY_BYTES);
+    for (field, value) in [(0, 17u64), (8, 4096u64), (16, 200u64)] {
+        let mut bytes = original.clone();
+        let at = start + 64 * super::super::OPERATION_LOCATION_BYTES + field;
+        bytes[at..at + 8].copy_from_slice(&value.to_be_bytes());
+        repair_digest(&mut bytes);
+        rejects(&bytes, &IndexFileError::InvalidLocation);
+    }
+    let mut bytes = original.clone();
+    bytes[start + 64 * super::super::OPERATION_LOCATION_BYTES + 24] ^= 1;
+    repair_digest(&mut bytes);
+    rejects(&bytes, &IndexFileError::InvalidLocation);
+    let mut bytes = original;
+    bytes[216..224].copy_from_slice(&129u64.to_be_bytes());
+    repair_digest(&mut bytes);
+    rejects(&bytes, &IndexFileError::InvalidLocation);
+}
+
+#[test]
 fn cooperative_index_open_cancellation_and_limits_never_expose_partial_tables() {
     let (bytes, _) = fixture(3000);
     let before = bytes.clone();
@@ -317,6 +343,7 @@ fn cooperative_index_construction_sorts_all_tables_and_builds_identical_read_run
         image.offsets().iter().rev().copied().collect(),
         image.messages().iter().rev().copied().collect(),
         image.operations().iter().rev().copied().collect(),
+        image.locations().iter().rev().copied().collect(),
     ));
     assert!(polls > 10);
     assert_eq!(actual.unwrap(), image);
@@ -328,6 +355,7 @@ fn cooperative_index_construction_sorts_all_tables_and_builds_identical_read_run
         image.offsets().to_vec(),
         messages,
         image.operations().to_vec(),
+        image.locations().to_vec(),
     ));
     assert!(polls > 1);
     assert_eq!(invalid.unwrap_err(), IndexFileError::MissingOffsetEntry);

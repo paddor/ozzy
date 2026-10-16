@@ -55,6 +55,10 @@ fn physical_session_filter_fences_hints_before_owner_cleanup_and_preserves_repla
     }
     let current = |broker, epoch| broker == peer(2) && epoch == session(5);
     assert_eq!(
+        cache.published_observations(group).matching(current),
+        cache.route_matching(group, current)
+    );
+    assert_eq!(
         cache.route_matching(group, current).unwrap().unwrap().view,
         7
     );
@@ -63,6 +67,10 @@ fn physical_session_filter_fences_hints_before_owner_cleanup_and_preserves_repla
     let replaced = |broker, epoch| {
         broker == peer(1) && epoch == session(6) || broker == peer(2) && epoch == session(5)
     };
+    assert_eq!(
+        cache.published_observations(group).matching(replaced),
+        cache.route_matching(group, replaced)
+    );
     assert_eq!(
         cache.route_matching(group, replaced).unwrap().unwrap().view,
         7
@@ -82,6 +90,10 @@ fn physical_session_filter_fences_hints_before_owner_cleanup_and_preserves_repla
         )
         .unwrap();
     assert!(!cache.disconnect(peer(1), session(4)));
+    assert_eq!(
+        cache.published_observations(group).matching(replaced),
+        cache.route_matching(group, replaced)
+    );
     assert_eq!(
         cache.route_matching(group, replaced).unwrap().unwrap().view,
         100

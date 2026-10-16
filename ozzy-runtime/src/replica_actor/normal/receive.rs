@@ -22,6 +22,7 @@ pub(in crate::replica_actor) struct Receive {
     pub(in crate::replica_actor) queued: AppendBuffer,
     end: Option<Prefix>,
     flight: Option<Flight>,
+    retry: Option<AppendBuffer>,
     pub(in crate::replica_actor) ledger: Receiver,
     operations: Vec<Operation>,
     pub(in crate::replica_actor) allocator: Option<crate::memory::Allocator>,
@@ -43,12 +44,17 @@ impl Receive {
         channel: ozzy_replication::flow::Channel,
         limits: PipelineLimits,
     ) -> Result<Self, ActorError> {
-        let ledger = Receiver::new(channel, Prefix::GENESIS, limits)
+        // The ledger counts bodies from this replica's released prefix, which
+        // trails the leader's commit announcement, while the leader fills a
+        // whole live window beyond that. Like the core, it holds a backup's
+        // retained capacity so a full pipeline is not refused and repaired.
+        let ledger = Receiver::new(channel, Prefix::GENESIS, limits.backup())
             .map_err(ozzy_replication::flow::TransmitError::from)?;
         Ok(Self {
             queued,
             end: None,
             flight: None,
+            retry: None,
             ledger,
             operations: Vec::with_capacity(limits.max_operations),
             allocator: None,
@@ -59,6 +65,12 @@ impl Receive {
         self.queued.clear();
         self.end = None;
         self.flight = None;
+        self.retry = None;
+    }
+
+    pub(super) fn defer(&mut self, buffer: AppendBuffer) {
+        assert!(self.flight.is_some());
+        assert!(self.retry.replace(buffer).is_none());
     }
 
     /// The core admitted the suffix in flight and now charges it.
@@ -134,21 +146,30 @@ impl Receive {
         let used_bytes = snapshot.pending_body_bytes
             + self.queued.body_bytes()
             + validating.map_or(0, |flight| flight.bytes);
+        // Three limits refuse a suffix; each counts separately so a stall names
+        // its cause. Receipt stays unchanged; the sender retries after a drain.
         let local = self.ledger.available();
-        if count > local.max_operations
-            || bytes > local.max_body_bytes
-            || count > limits.max_operations.saturating_sub(used_ops)
-            || bytes > limits.max_body_bytes.saturating_sub(used_bytes)
-            || count > self.queued.limits().max_operations - self.queued.len()
-            || bytes > self.queued.limits().max_body_bytes - self.queued.body_bytes()
-        {
-            // The total backlog may exceed this reusable command arena. Leave
-            // receipt unchanged; the sender retries after this queued suffix drains.
-            event(Event::ReplicaReceiveCapacity);
+        if count > local.max_operations || bytes > local.max_body_bytes {
+            event(Event::ReplicaReceiveLedgerFull);
             return Ok(false);
         }
-        if !self.queued.reserve_incoming(bytes)? {
-            event(Event::ReplicaReceiveCapacity);
+        // The core retains two live windows here and admits only what the
+        // leader keeps in flight beyond the commit it announced. Staged
+        // suffixes count now so the core never refuses a validated one.
+        let retained = snapshot.retained_limits;
+        if count > retained.max_operations.saturating_sub(used_ops)
+            || bytes > retained.max_body_bytes.saturating_sub(used_bytes)
+            || batch.end().op.0.saturating_sub(snapshot.live_base.0) > limits.max_operations as u64
+        {
+            event(Event::ReplicaReceiveWindowFull);
+            return Ok(false);
+        }
+        // The total backlog may exceed this reusable command arena.
+        if count > self.queued.limits().max_operations - self.queued.len()
+            || bytes > self.queued.limits().max_body_bytes - self.queued.body_bytes()
+            || !self.queued.reserve_incoming(bytes)?
+        {
+            event(Event::ReplicaReceiveArenaFull);
             return Ok(false);
         }
         for operation in batch
@@ -175,7 +196,9 @@ impl Receive {
 
 impl ReplicaActor {
     pub(super) fn schedule_received(&mut self) -> Result<bool, ActorError> {
-        if self.work.receive.queued.is_empty() || !self.received_has_capacity() {
+        if self.work.receive.retry.is_none() && self.work.receive.queued.is_empty()
+            || !self.received_has_capacity()
+        {
             return Ok(false);
         }
         if let Some(validate) = self.take_received()? {
@@ -194,8 +217,13 @@ impl ReplicaActor {
         &mut self,
     ) -> Result<Option<(ozzy_replication::driver::ValidationTicket, AppendBuffer)>, ActorError>
     {
-        if self.work.receive.queued.is_empty() || !self.received_has_capacity() {
+        if self.work.receive.retry.is_none() && self.work.receive.queued.is_empty()
+            || !self.received_has_capacity()
+        {
             return Ok(None);
+        }
+        if let Some(buffer) = self.work.receive.retry.take() {
+            return Ok(Some((self.driver.begin_validation()?, buffer)));
         }
         assert!(self.work.receive.flight.is_none());
         if self.coalescing_received() {
@@ -225,8 +253,14 @@ impl ReplicaActor {
 
     fn received_has_capacity(&self) -> bool {
         self.driver.normal().is_some_and(|normal| {
-            self.journal
-                .validation_has_capacity(&self.work.receive.queued, normal.snapshot().accepted.op)
+            self.journal.validation_has_capacity(
+                self.work
+                    .receive
+                    .retry
+                    .as_ref()
+                    .unwrap_or(&self.work.receive.queued),
+                normal.snapshot().accepted.op,
+            )
         })
     }
 

@@ -45,6 +45,7 @@ fn index() -> ActiveReadIndex {
         )]),
         records: 17,
         operations: 3,
+        locations: 3,
     }
 }
 

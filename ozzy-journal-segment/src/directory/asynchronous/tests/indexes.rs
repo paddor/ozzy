@@ -14,7 +14,7 @@ use ozzy_proto::{
 
 pub(super) fn build_limits() -> IndexBuildLimits {
     IndexBuildLimits {
-        max_entry_buffer_bytes: 200,
+        max_entry_buffer_bytes: 256,
         max_merge_fan_in: 2,
         max_run_files: 16,
         file: IndexLimits {
@@ -76,6 +76,13 @@ fn check_index(index: &SegmentIndex) {
     assert_eq!(index.offset_count(), 6);
     assert_eq!(index.message_count(), 6);
     assert_eq!(index.operation_count(), 1);
+    assert_eq!(index.location_count(), 7);
+    for number in 1..=7 {
+        assert_eq!(
+            index.find_operation_number(number).unwrap().op_number,
+            number
+        );
+    }
     for number in 0..6 {
         let entry = index.find_offset(partition(), Offset::new(number)).unwrap();
         assert_eq!(entry.location.operation.op_number, number + 1);

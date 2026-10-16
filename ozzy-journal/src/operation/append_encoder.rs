@@ -142,18 +142,19 @@ impl AppendHeader {
     pub(super) fn encode(
         self,
         records: usize,
-        tiny: bool,
-        prepared: bool,
+        layout: BatchLayout,
         limits: OperationLimits,
         totals: &mut AppendTotals,
         encoder: &mut Encoder<'_, impl OperationOutput>,
     ) -> Result<(), OperationCodecError> {
-        if records == 0 {
+        if (records == 0) != (layout == BatchLayout::Empty) {
             return Err(OperationCodecError::EmptyAppend);
         }
         totals.add_records(records, limits)?;
-        validate_position_count(self.first_sequence.get(), records)?;
-        validate_position_count(self.first_offset.get(), records)?;
+        if records != 0 {
+            validate_position_count(self.first_sequence.get(), records)?;
+            validate_position_count(self.first_offset.get(), records)?;
+        }
         encoder.id(self.partition.as_bytes())?;
         encoder.u64(self.owner_epoch.get())?;
         encoder.id(self.producer_id.as_bytes())?;
@@ -162,14 +163,31 @@ impl AppendHeader {
         encoder.u64(self.first_offset.get())?;
         encoder.u64(self.append_timestamp_millis)?;
         let count = u32::try_from(records).map_err(|_| OperationCodecError::LengthOverflow)?;
-        if count & TINY_RECORDS != 0 {
+        if count & (TINY_RECORDS | PREPARED_PAYLOAD) != 0 {
             return Err(OperationCodecError::LengthOverflow);
         }
         encoder.u32(
             count
-                | if tiny { TINY_RECORDS } else { 0 }
-                | if prepared { PREPARED_PAYLOAD } else { 0 },
+                | match layout {
+                    BatchLayout::Compact => TINY_RECORDS,
+                    BatchLayout::Prepared => PREPARED_PAYLOAD,
+                    BatchLayout::General | BatchLayout::Empty => 0,
+                },
         )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BatchLayout {
+    General,
+    Compact,
+    Prepared,
+    Empty,
+}
+
+impl BatchLayout {
+    pub(super) const fn records(tiny: bool) -> Self {
+        if tiny { Self::Compact } else { Self::General }
     }
 }
 
@@ -236,7 +254,7 @@ impl<'a, O: OperationOutput> AppendBodyEncoder<'a, O> {
         chunks: impl Iterator<Item = (&'b [u8], &'b [u8])> + Clone,
     ) -> Result<(), OperationCodecError> {
         self.batch(|encoder, totals, limits| {
-            header.encode(records, false, false, limits, totals, encoder)?;
+            header.encode(records, BatchLayout::General, limits, totals, encoder)?;
             enforce_limit("append part count", parts, limits.max_parts)?;
             totals.add_parts(parts, limits)?;
             for (descriptors, _) in chunks.clone() {
@@ -266,7 +284,13 @@ impl<'a, O: OperationOutput> AppendBodyEncoder<'a, O> {
             let records = records
                 .map(|(id, encoding, parts)| (id, encoding, parts.iter().map(AsRef::as_ref)));
             let tiny = layout == DescriptorLayout::Compact && records_are_tiny(records.clone());
-            header.encode(records.len(), tiny, false, limits, totals, encoder)?;
+            header.encode(
+                records.len(),
+                BatchLayout::records(tiny),
+                limits,
+                totals,
+                encoder,
+            )?;
             encode_append_records(records, tiny, limits, totals, encoder)
         })
     }
@@ -362,8 +386,10 @@ pub fn append_wire_record_batch(
         let mut totals = AppendTotals::default();
         header.encode(
             records.len(),
-            false,
-            payload_encoding == ozzy_proto::append::PayloadEncoding::Lz4,
+            match payload_encoding {
+                ozzy_proto::append::PayloadEncoding::Raw => BatchLayout::General,
+                ozzy_proto::append::PayloadEncoding::Lz4 => BatchLayout::Prepared,
+            },
             limits,
             &mut totals,
             &mut encoder,
@@ -420,8 +446,7 @@ where
         let mut totals = AppendTotals::default();
         header.encode(
             records.len(),
-            false,
-            true,
+            BatchLayout::Prepared,
             limits,
             &mut totals,
             &mut encoder,

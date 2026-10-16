@@ -176,7 +176,7 @@ fn decode_append_batches_inner<'a, const VALIDATE_PREPARED: bool>(
     let mut batches = SmallVec::new();
     let mut totals = AppendTotals::default();
     for _ in 0..count {
-        let (_, view) = decode_append_batch::<false, VALIDATE_PREPARED>(
+        let (_, view) = decode_append_batch::<false, VALIDATE_PREPARED, false>(
             &mut decoder,
             limits,
             &mut totals,
@@ -224,7 +224,7 @@ impl<'a> Iterator for AppendBatches<'a> {
             return None;
         }
         // The view was validated when built, including any LZ4 block.
-        let (_, view) = decode_append_batch::<false, false>(
+        let (_, view) = decode_append_batch::<false, false, false>(
             &mut self.decoder,
             self.limits,
             &mut self.totals,
@@ -270,6 +270,11 @@ pub struct PreparedAppendPayload<'a> {
 }
 
 impl<'a> AppendBatchView<'a> {
+    /// Materialize this validated batch, decoding a whole-payload block once.
+    /// Raw multipart bytes remain borrowed; decoded blocks have owned backing.
+    pub fn materialize(&self) -> Result<super::AppendBatch<'a>, OperationCodecError> {
+        super::codec::append::materialize_batch::<true>(self)
+    }
     /// Part length for a general descriptor table containing only single-part
     /// raw records of that length. Packed tables and mixed shapes return `None`.
     /// The validating walk establishes this property without a second scan.

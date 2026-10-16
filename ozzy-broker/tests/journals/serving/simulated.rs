@@ -7,6 +7,9 @@ use ozzy_sim::broker::{
 };
 
 mod churn;
+mod dedup;
+mod groups;
+mod progress;
 mod resume;
 mod retention;
 
@@ -607,6 +610,60 @@ mod tests {
             }
             producer.shutdown().await.unwrap();
             consumer.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn broker_ready_follows_partition_bootstrap_in_all_modes() {
+        for policy in [
+            Confirmation::LocalDurable,
+            Confirmation::DiskQuorum,
+            Confirmation::ReplicatedPersisting,
+        ] {
+            let runtime = WriterRuntime::new().unwrap();
+            let deployment = fixture(policy);
+            let producer = role_links(&runtime, &deployment[0].0, handshake::PRODUCER).await;
+            let (brokers, _) = Box::pin(start_controlled(&runtime, deployment, true)).await;
+            live_many(
+                &brokers,
+                "observe serving partitions",
+                futures::future::try_join_all(brokers.iter().map(ozzy_broker::Broker::ready)),
+            )
+            .await
+            .unwrap();
+            let mut writer = live_many(
+                &brokers,
+                "open writer after readiness",
+                SharedTopicWriter::open(
+                    &producer,
+                    "orders",
+                    SharedTopicWriterConfig::new(limits()),
+                    RetryPolicy::default(),
+                ),
+            )
+            .await
+            .unwrap();
+            let pending = writer
+                .send(
+                    RecordInput::single(
+                        MessageId::from_bytes([5; 16]),
+                        bytes::Bytes::from_static(b"ready"),
+                    ),
+                    None,
+                )
+                .await
+                .unwrap();
+            let receipt = live_many(&brokers, "confirm after readiness", pending.confirmed())
+                .await
+                .unwrap();
+            assert_eq!(receipt.record.offset, 0, "{policy:?}");
+            live_many(&brokers, "close ready writer", writer.close())
+                .await
+                .unwrap();
+            producer.shutdown().await.unwrap();
+            for broker in brokers {
+                broker.shutdown().await.unwrap();
+            }
         }
     }
 

@@ -121,6 +121,9 @@ struct Job {
     shard: usize,
     class: Class,
     executing: bool,
+    enqueued: Option<std::time::Instant>,
+    started: Option<std::time::Instant>,
+    diagnostic_operation: &'static str,
 }
 
 impl Pool {
@@ -401,6 +404,9 @@ impl Backend for Client {
             shard: self.shard,
             class,
             executing: false,
+            enqueued: ozzy_telemetry::start(),
+            started: None,
+            diagnostic_operation: "unstarted",
         };
         let index = usize::from(class == Class::Progress);
         let direct_write = self.direct.is_some()
@@ -626,6 +632,7 @@ fn run(mut receiver: Receiver, shared: &Arc<Shared>, role: Worker) {
         };
         shared.queued[class].fetch_sub(1, Ordering::AcqRel);
         job.executing = execution_slot;
+        job.observe_start();
         let failed = shared.failed.load(Ordering::Acquire);
         let result = if failed {
             Err(io::ErrorKind::BrokenPipe.into())
@@ -649,7 +656,88 @@ fn run(mut receiver: Receiver, shared: &Arc<Shared>, role: Worker) {
             Err(io::Error::other("file worker panicked"))
         };
         drop(job.operation.take());
+        job.observe_finish(&result);
         job.reply.take().expect("one reply").finish(result);
+    }
+}
+
+impl Job {
+    fn observe_start(&mut self) {
+        if !ozzy_telemetry::enabled() {
+            return;
+        }
+        ozzy_telemetry::finish(ozzy_telemetry::Stage::IoQueue, self.enqueued.take());
+        self.started = ozzy_telemetry::start();
+        ozzy_telemetry::event(ozzy_telemetry::Event::IoStarted);
+        if self.class == Class::Progress {
+            ozzy_telemetry::event(ozzy_telemetry::Event::IoProgressStarted);
+        }
+        let operation = self
+            .operation
+            .as_ref()
+            .expect("unrun operation")
+            .unprotected();
+        self.diagnostic_operation = match operation {
+            Operation::Open { .. } | Operation::OpenDirectory { .. } => "open",
+            Operation::Metadata { .. } => "metadata",
+            Operation::Read { .. } => "read",
+            Operation::Write { .. } => "write",
+            Operation::Sync { .. } => "sync",
+            Operation::RemoveFile { .. } | Operation::RemoveDirectory { .. } => "remove",
+            Operation::CreateDirectory { .. } => "create_directory",
+            _ => "other",
+        };
+        match operation {
+            Operation::Read { .. } => ozzy_telemetry::event(ozzy_telemetry::Event::IoRead),
+            Operation::Write { .. } => ozzy_telemetry::event(ozzy_telemetry::Event::IoWrite),
+            Operation::Sync { .. } => ozzy_telemetry::event(ozzy_telemetry::Event::IoSync),
+            _ => {}
+        }
+    }
+
+    fn observe_finish(&mut self, result: &io::Result<ozzy_io::Outcome>) {
+        if !ozzy_telemetry::enabled() {
+            return;
+        }
+        ozzy_telemetry::finish(ozzy_telemetry::Stage::IoExecution, self.started.take());
+        match result {
+            Ok(outcome) => {
+                ozzy_telemetry::event(ozzy_telemetry::Event::IoCompleted);
+                if let ozzy_io::Outcome::Written(bytes) = outcome {
+                    ozzy_telemetry::count(ozzy_telemetry::Event::IoWriteBytes, *bytes as u64);
+                }
+                if let ozzy_io::Outcome::Read(bytes) = outcome {
+                    ozzy_telemetry::count(
+                        ozzy_telemetry::Event::IoReadBytes,
+                        bytes.as_slice().len() as u64,
+                    );
+                }
+            }
+            Err(error) => {
+                ozzy_telemetry::event(ozzy_telemetry::Event::IoFailed);
+                if ozzy_telemetry::enabled() {
+                    let expected = matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::AlreadyExists
+                    ) && matches!(
+                        self.diagnostic_operation,
+                        "open" | "metadata" | "remove" | "create_directory"
+                    );
+                    ozzy_telemetry::log(
+                        if expected {
+                            ozzy_telemetry::Level::Info
+                        } else {
+                            ozzy_telemetry::Level::Error
+                        },
+                        &format!(
+                            "storage {} returned {:?}",
+                            self.diagnostic_operation,
+                            error.kind()
+                        ),
+                    );
+                }
+            }
+        }
     }
 }
 

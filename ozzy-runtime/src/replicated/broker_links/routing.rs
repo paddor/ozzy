@@ -1,7 +1,7 @@
 use super::{BrokerLinkError, BrokerLinks};
 use crate::{
     signal::StateSignal,
-    topic_metadata::{RouteCache, TopicMetadata},
+    topic_metadata::{RouteCache, RouteObservations, TopicMetadata},
 };
 use ozzy_proto::{
     GroupId, LinkSessionId, NodeId, TopicId, directory::RouteState, nack::RetryClass,
@@ -11,6 +11,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+mod waiting;
 mod watch;
 pub(super) use watch::Watcher;
 
@@ -18,6 +19,7 @@ pub(super) use watch::Watcher;
 pub(super) struct State {
     topic: Arc<TopicMetadata>,
     cache: Mutex<RouteCache>,
+    observations: Vec<arc_swap::ArcSwap<RouteObservations>>,
     interests: Mutex<BTreeMap<GroupId, u64>>,
     changed: StateSignal,
     rejections: Mutex<BTreeMap<(GroupId, NodeId), Rejection>>,
@@ -28,6 +30,20 @@ struct Rejection {
     session: LinkSessionId,
     code: u16,
     retry: RetryClass,
+}
+
+impl State {
+    fn update_cache<R>(&self, group: GroupId, update: impl FnOnce(&mut RouteCache) -> R) -> R {
+        let mut cache = self.cache.lock().expect("SDK route cache poisoned");
+        let result = update(&mut cache);
+        let partition = self
+            .topic
+            .partition_by_group(group)
+            .expect("registered group");
+        self.observations[partition.number as usize]
+            .store(Arc::new(cache.published_observations(group)));
+        result
+    }
 }
 
 #[derive(Debug)]
@@ -80,6 +96,9 @@ impl Registry {
             .ok_or(BrokerLinkError::Configuration)?;
         let topic = Arc::new(topic);
         let state = Arc::new(State {
+            observations: (0..topic.partition_count())
+                .map(|_| arc_swap::ArcSwap::from_pointee(RouteObservations::default()))
+                .collect(),
             cache: Mutex::new(RouteCache::shared(topic.clone(), registrations, 1)?),
             topic,
             interests: Mutex::new(BTreeMap::new()),
@@ -186,14 +205,9 @@ impl TopicRoutes {
             return Err(BrokerLinkError::Closed);
         }
         let group = self.group(number)?;
-        let result = self
-            .state
-            .cache
-            .lock()
-            .expect("SDK route cache poisoned")
-            .route_matching(group, |peer, session| {
-                self.links.session(peer) == Some(session)
-            })?;
+        let result = self.state.observations[number as usize]
+            .load()
+            .matching(|peer, session| self.links.session(peer) == Some(session))?;
         if result.is_none() {
             let rejected = self
                 .state

@@ -694,6 +694,12 @@ impl FollowingChain for LogPosition {
 #[derive(Debug, Error)]
 pub enum SuffixReplacementError {
     #[error(transparent)]
+    /// Private checkpoint receive or immutable artifact verification failed.
+    CheckpointBytes(#[from] crate::CheckpointError),
+    #[error(transparent)]
+    /// Canonical checkpoint metadata or identity section validation failed.
+    CheckpointSections(#[from] ozzy_core::checkpoint::Error),
+    #[error(transparent)]
     /// Imported canonical checkpoint state could not be encoded.
     Snapshot(#[from] ozzy_core::state::StateSnapshotError),
     #[error(transparent)]

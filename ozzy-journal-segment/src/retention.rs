@@ -15,6 +15,7 @@ use crate::{SegmentReference, SegmentScan};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetentionFloors {
     entries: Vec<(PartitionIncarnation, Offset)>,
+    protected_operation: Option<u64>,
 }
 
 impl RetentionFloors {
@@ -30,7 +31,10 @@ impl RetentionFloors {
         if entries.windows(2).any(|pair| pair[0].0 == pair[1].0) {
             return Err(RetentionError::DuplicatePartition);
         }
-        Ok(Self { entries })
+        Ok(Self {
+            entries,
+            protected_operation: None,
+        })
     }
 
     /// Look up the declared retention floor for an exact partition incarnation.
@@ -56,16 +60,28 @@ impl RetentionFloors {
         self.entries.is_empty()
     }
 
+    /// Earliest operation carrying retained duplicate retry fingerprints.
+    /// A checkpoint of coordinates alone cannot replace these proofs.
+    pub const fn protected_operation(&self) -> Option<u64> {
+        self.protected_operation
+    }
+
     /// Derive every committed partition floor from one canonical state image.
     pub fn from_canonical_state(
         state: &ozzy_core::state::CanonicalState,
     ) -> Result<Self, RetentionError> {
-        Self::new(
+        let mut floors = Self::new(
             state
                 .partitions()
                 .map(|(partition, value)| (partition, value.retained_from))
                 .collect(),
-        )
+        )?;
+        floors.protected_operation = state
+            .partitions()
+            .flat_map(|(_, partition)| partition.producers())
+            .filter_map(|(_, producer)| producer.result_operation_floor())
+            .min();
+        Ok(floors)
     }
 }
 
@@ -195,6 +211,17 @@ pub(crate) struct PinRegistry {
 pub(crate) struct PreparedSegmentLease {
     segment_id: u64,
     registry: Arc<PinRegistry>,
+}
+
+impl PreparedSegmentLease {
+    pub(crate) const fn segment_id(&self) -> u64 {
+        self.segment_id
+    }
+
+    /// Protect the same segment with an independent lease.
+    pub(crate) fn duplicate(&self) -> Result<Self, RetentionError> {
+        self.registry.protect_prepared_segment(self.segment_id)
+    }
 }
 
 impl Drop for PreparedSegmentLease {
@@ -366,15 +393,23 @@ pub(crate) fn scan_is_below_floors(
     limits: OperationLimits,
 ) -> Result<bool, RetentionError> {
     for operation in scan.groups.iter().flat_map(|group| &group.operations) {
-        if operation.op_number > through_op {
+        if operation.op_number > through_op
+            || floors
+                .protected_operation()
+                .is_some_and(|floor| operation.op_number >= floor)
+        {
             return Ok(false);
         }
-        let OperationBody::Append(append) =
-            decode_operation_body(operation.kind, operation.body.as_ref(), limits)?
-        else {
-            continue;
+        let body = decode_operation_body(operation.kind, operation.body.as_ref(), limits)?;
+        let batches = match &body {
+            OperationBody::Append(append) => append.batches.as_slice(),
+            OperationBody::ResolvedAppend(append) => std::slice::from_ref(&append.batch),
+            _ => continue,
         };
-        for batch in append.batches {
+        for batch in batches {
+            if batch.records.is_empty() {
+                continue;
+            }
             let Some(floor) = floors.get(batch.partition) else {
                 return Ok(false);
             };
@@ -422,4 +457,62 @@ pub enum RetentionError {
     #[error("retention integer or length overflow")]
     /// Integer or byte-count arithmetic overflows the supported range.
     LengthOverflow,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RetentionFloors, scan_is_below_floors};
+    use crate::{
+        CanonicalOperation, ChainPosition, DecodeLimits, Digest, OperationKind, OperationLimits,
+        SEGMENT_HEADER_BYTES, SegmentHeader, encode_group, encode_segment_header, scan_segment,
+    };
+    use ozzy_journal::operation::logical_operation_digest;
+    use ozzy_proto::GroupId;
+
+    #[test]
+    fn coordinates_checkpoint_cannot_retire_a_still_referenced_proof_operation() {
+        let header = SegmentHeader::new(
+            GroupId::from_bytes([1; 16]),
+            1,
+            None,
+            Digest::ZERO,
+            64 * 1024,
+        )
+        .unwrap();
+        let first = CanonicalOperation {
+            group_id: header.group_id(),
+            configuration_epoch: 1,
+            original_view: 0,
+            op_number: 1,
+            previous_digest: Digest::ZERO,
+            kind: OperationKind::Barrier,
+            body: &[1; 16],
+        };
+        let second = CanonicalOperation {
+            op_number: 2,
+            previous_digest: logical_operation_digest(&first),
+            body: &[2; 16],
+            ..first
+        };
+        let group = encode_group(
+            &header,
+            1,
+            SEGMENT_HEADER_BYTES as u64,
+            ChainPosition::GENESIS,
+            &[first, second],
+        )
+        .unwrap();
+        let mut bytes = encode_segment_header(&header).to_vec();
+        bytes.extend_from_slice(group.as_bytes());
+        bytes.resize(64 * 1024, 0);
+        let scan =
+            scan_segment(&bytes, 1, ChainPosition::GENESIS, DecodeLimits::default()).unwrap();
+        let mut floors = RetentionFloors::new(Vec::new()).unwrap();
+        assert!(scan_is_below_floors(&scan, 2, &floors, OperationLimits::default()).unwrap());
+        floors.protected_operation = Some(2);
+        assert!(!scan_is_below_floors(&scan, 2, &floors, OperationLimits::default()).unwrap());
+        floors.protected_operation = Some(3);
+        assert!(scan_is_below_floors(&scan, 2, &floors, OperationLimits::default()).unwrap());
+        assert!(!scan_is_below_floors(&scan, 1, &floors, OperationLimits::default()).unwrap());
+    }
 }

@@ -2,7 +2,7 @@ use super::{Command, NativeIntake, NativeIntakeError, Reply, Request};
 use crate::{
     frontend::{Kind, Link},
     replica_actor::{ProposalOutcome, ProposalReply},
-    replica_journal::ProposalBuffer,
+    replica_journal::{GroupAssignError, GroupProgressError, JournalError, ProposalBuffer},
 };
 use bytes::Bytes;
 use omq_tokio::{Message, TrySendError};
@@ -10,8 +10,9 @@ use ozzy_journal::operation::{OperationKind, OperationLimits, decode_append_summ
 use ozzy_proto::{
     Envelope, NodeId, Opcode, append,
     data::DataLimits,
+    group,
     nack::{self, AuthorityHint, RetryClass},
-    producer,
+    producer, progress,
 };
 use std::{
     future::Future,
@@ -28,6 +29,19 @@ impl NativeIntake {
         try_send: &mut impl FnMut(&mut Context<'_>, Message) -> Result<(), TrySendError>,
     ) -> Result<bool, NativeIntakeError> {
         let mut changed = false;
+        // A progress proposal that carries other clients' updates outlives
+        // its own client's link; the shared result still completes them.
+        let carries = self.progress_flight == Some(index) && self.progress_riders != 0;
+        if let Some(pending) = &self.slots[index].pending
+            && !carries
+            && !current(pending.request.envelope.sender).is_some_and(|link| {
+                link.binding.kind == Kind::Client
+                    && Some(link.binding.session) == pending.request.envelope.session
+                    && link.binding.peer == pending.request.envelope.sender
+            })
+        {
+            pending.proposal.fence_unadmitted();
+        }
         if let Some(pending) = &mut self.slots[index].pending
             && let Poll::Ready(result) = pending.proposal.as_mut().poll(cx)
         {
@@ -35,7 +49,36 @@ impl NativeIntake {
                 .pending
                 .take()
                 .expect("completed proposal");
+            crate::profiling::finish(crate::profiling::Stage::NativeProposal, pending.started);
             let ProposalReply { outcome, buffer } = result?;
+            let (outcome, buffer) = if self.progress_flight == Some(index) {
+                match self.complete_progress(index, &pending, outcome, buffer)? {
+                    Some(completed) => completed,
+                    None => return Ok(true),
+                }
+            } else {
+                (outcome, buffer)
+            };
+            if matches!(outcome, ProposalOutcome::Unknown) {
+                crate::profiling::log(
+                    crate::profiling::Level::Warn,
+                    "native proposal completed with an unknown outcome",
+                );
+            }
+            crate::profiling::event(if matches!(outcome, ProposalOutcome::Committed { .. }) {
+                crate::profiling::Event::NativeProposalCommitted
+            } else {
+                crate::profiling::Event::NativeProposalUnconfirmed
+            });
+            match pending.request.command {
+                Command::Progress => {
+                    crate::profiling::event(crate::profiling::Event::ProcessingCompleted);
+                }
+                Command::Assign => {
+                    crate::profiling::event(crate::profiling::Event::AssignmentCompleted);
+                }
+                Command::Open | Command::Append(_) => {}
+            }
             self.slots[index].buffer = Some(buffer);
             self.slots[index].reply = Some(Reply {
                 request: pending.request,
@@ -112,7 +155,7 @@ impl NativeIntake {
         retry: RetryClass,
         hint: AuthorityHint,
     ) -> Result<(), NativeIntakeError> {
-        let frame = self.nack_frame(request, code, retry, hint)?;
+        let frame = self.nack_frame(request, code, retry, hint, None)?;
         if self.slots[index].pending.is_none() && self.slots[index].reply.is_none() {
             self.busy += 1;
         }
@@ -122,6 +165,7 @@ impl NativeIntake {
             next: 0,
             frame: Some(frame),
         });
+        self.track(index);
         Ok(())
     }
 
@@ -131,6 +175,7 @@ impl NativeIntake {
         code: u16,
         retry: RetryClass,
         hint: AuthorityHint,
+        typed: Option<TypedDetail>,
     ) -> Result<Message, NativeIntakeError> {
         if retry == RetryClass::AfterBackoff {
             crate::profiling::event(crate::profiling::Event::NativeAdmissionRefusal);
@@ -140,6 +185,7 @@ impl NativeIntake {
         } else {
             None
         };
+        let typed = typed.map(TypedDetail::encode).transpose()?;
         let header = nack::encode(
             Envelope {
                 opcode: Opcode::Nack,
@@ -150,7 +196,11 @@ impl NativeIntake {
             nack::Nack {
                 code,
                 retry,
-                detail: detail.as_ref().map_or(&[], |bytes| bytes.as_slice()),
+                detail: detail
+                    .as_ref()
+                    .map(<[u8; 48]>::as_slice)
+                    .or(typed.as_deref())
+                    .unwrap_or_default(),
                 diagnostic: "",
             },
             &mut self.metadata,
@@ -190,7 +240,30 @@ impl NativeIntake {
                 ProposalOutcome::Invalid(error) => super::super::response::rejection(error),
                 ProposalOutcome::Committed { .. } => unreachable!(),
             };
-            let frame = self.nack_frame(request, code, retry, hint)?;
+            let typed = match &reply.outcome {
+                ProposalOutcome::Invalid(JournalError::GroupProgress(
+                    GroupProgressError::HistoryExpired {
+                        cursor,
+                        retained_from,
+                    },
+                )) => Some(TypedDetail::Expired(progress::HistoryExpired {
+                    cursor: *cursor,
+                    retained_from: *retained_from,
+                })),
+                ProposalOutcome::Invalid(JournalError::GroupAssign(
+                    GroupAssignError::InitialPosition {
+                        cursor,
+                        retained_from,
+                        end,
+                    },
+                )) => Some(TypedDetail::Start(group::InitialPosition {
+                    cursor: *cursor,
+                    retained_from: *retained_from,
+                    end: *end,
+                })),
+                _ => None,
+            };
+            let frame = self.nack_frame(request, code, retry, hint, typed)?;
             self.slots[index].reply.as_mut().unwrap().frame = Some(frame);
         }
         Ok(())
@@ -210,13 +283,13 @@ impl NativeIntake {
             sender: self.config.local,
             ..request.envelope
         };
+        if reply.next != 0 && !matches!(request.command, Command::Append(_)) {
+            finish(slot);
+            self.busy -= 1;
+            return Ok(());
+        }
         let header = match request.command {
             Command::Open => {
-                if reply.next != 0 {
-                    finish(slot);
-                    self.busy -= 1;
-                    return Ok(());
-                }
                 let opened = buffer.producer_opened().ok_or(NativeIntakeError::History)?;
                 if opened.partition != self.config.partition
                     || opened.policy != self.config.policy
@@ -244,11 +317,13 @@ impl NativeIntake {
             }
             Command::Append(mut confirmed) => {
                 let range = result_range(buffer, reply.next, self.config.limits)?;
-                let Some((sequence, offset, count)) = range else {
+                let Some(range) = range else {
                     finish(slot);
                     self.busy -= 1;
                     return Ok(());
                 };
+                let sequence = range.first_sequence.get();
+                let count = range.records;
                 if sequence < confirmed.key.first_sequence
                     || sequence
                         .checked_add(count)
@@ -259,7 +334,8 @@ impl NativeIntake {
                 confirmed.authority = authority;
                 confirmed.key.first_sequence = sequence;
                 confirmed.end_sequence = sequence + count;
-                confirmed.first_offset = offset;
+                confirmed.first_offset = range.first_offset.get();
+                confirmed.disposition = range.disposition();
                 append::stream::encode_confirmed(
                     Envelope {
                         opcode: Opcode::Appended,
@@ -270,6 +346,22 @@ impl NativeIntake {
                     request.send.envelope,
                 )?
             }
+            Command::Assign => assignment_header(
+                buffer,
+                &self.config,
+                envelope,
+                authority,
+                request.send.envelope,
+                &mut self.metadata,
+            )?,
+            Command::Progress => progress_header(
+                buffer,
+                &self.config,
+                envelope,
+                authority,
+                request.send.envelope,
+                &mut self.metadata,
+            )?,
         };
         reply.frame = Some(crate::native_frames::message(
             request.envelope.sender.as_bytes(),
@@ -292,16 +384,10 @@ fn result_range(
     buffer: &ProposalBuffer,
     index: usize,
     limits: DataLimits,
-) -> Result<Option<(u64, u64, u64)>, NativeIntakeError> {
+) -> Result<Option<ozzy_core::state::ProducerResultSpan>, NativeIntakeError> {
     let retained = buffer.producer_retry_results();
     if !retained.is_empty() {
-        return Ok(retained.get(index).map(|range| {
-            (
-                range.first_sequence.get(),
-                range.first_offset.get(),
-                range.records,
-            )
-        }));
+        return Ok(retained.get(index).copied());
     }
     if index != 0 {
         return Ok(None);
@@ -329,9 +415,94 @@ fn result_range(
         };
         *batch
     };
-    Ok(Some((
-        batch.first_sequence.get(),
-        batch.first_offset.get(),
-        batch.record_count as u64,
-    )))
+    Ok(Some(ozzy_core::state::ProducerResultSpan {
+        first_sequence: batch.first_sequence,
+        first_offset: batch.first_offset,
+        records: batch.record_count as u64,
+        source: ozzy_core::state::ProducerResultSource::Stored,
+    }))
+}
+
+/// Code-specific NACK details carried beside authority hints.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum TypedDetail {
+    Expired(progress::HistoryExpired),
+    Start(group::InitialPosition),
+}
+
+impl TypedDetail {
+    fn encode(self) -> Result<Vec<u8>, NativeIntakeError> {
+        Ok(match self {
+            Self::Expired(expired) => expired.encode()?.to_vec(),
+            Self::Start(start) => start.encode()?.to_vec(),
+        })
+    }
+}
+
+fn assignment_header(
+    buffer: &ProposalBuffer,
+    config: &super::NativeIntakeConfig,
+    envelope: Envelope,
+    authority: append::Authority,
+    send: ozzy_proto::EnvelopeLimits,
+    metadata: &mut Vec<u8>,
+) -> Result<[u8; ozzy_proto::ENVELOPE_BYTES], NativeIntakeError> {
+    let state = buffer
+        .group_assignment_state()
+        .ok_or(NativeIntakeError::History)?;
+    if state.partition != config.partition || state.policy != config.policy {
+        return Err(NativeIntakeError::History);
+    }
+    Ok(group::encode_assigned(
+        Envelope {
+            opcode: Opcode::GroupAssigned,
+            ..envelope
+        },
+        group::AssignReply {
+            authority,
+            partition: state.partition,
+            group: state.group,
+            member: state.member,
+            epoch: state.epoch,
+            plan_revision: state.plan_revision,
+            cursor: state.cursor,
+            retained_from: state.retained_from,
+            end: state.end,
+            policy: state.policy,
+        },
+        metadata,
+        send,
+    )?)
+}
+
+fn progress_header(
+    buffer: &ProposalBuffer,
+    config: &super::NativeIntakeConfig,
+    envelope: Envelope,
+    authority: append::Authority,
+    send: ozzy_proto::EnvelopeLimits,
+    metadata: &mut Vec<u8>,
+) -> Result<[u8; ozzy_proto::ENVELOPE_BYTES], NativeIntakeError> {
+    let state = buffer
+        .group_progress_state()
+        .ok_or(NativeIntakeError::History)?;
+    if state.assignment.partition != config.partition || state.policy != config.policy {
+        return Err(NativeIntakeError::History);
+    }
+    Ok(progress::encode_confirmed(
+        Envelope {
+            opcode: Opcode::ProgressCommitted,
+            ..envelope
+        },
+        progress::Confirmed {
+            authority,
+            assignment: state.assignment,
+            policy: state.policy,
+            cursor: state.cursor,
+            retained_from: state.retained_from,
+            end: state.end,
+        },
+        metadata,
+        send,
+    )?)
 }

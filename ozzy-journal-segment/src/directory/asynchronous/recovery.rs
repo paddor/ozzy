@@ -238,6 +238,7 @@ impl RecoveryDirectory {
                 interrupted: false,
                 pins: std::sync::Arc::default(),
                 validated_indexes: std::collections::BTreeMap::new(),
+                active_prefix: None,
             });
         }
         Err(DirectoryError::RollProbeLimit {

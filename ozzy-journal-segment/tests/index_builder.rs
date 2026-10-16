@@ -131,7 +131,7 @@ fn bounded_multi_run_build_publishes_and_reuses_exact_index() {
     let segment_path = temporary.path().join("segment.log");
     fs::write(&segment_path, &bytes).unwrap();
     let limits = IndexBuildLimits {
-        max_entry_buffer_bytes: 200,
+        max_entry_buffer_bytes: 256,
         max_merge_fan_in: 2,
         ..IndexBuildLimits::default()
     };
@@ -222,7 +222,7 @@ fn repeated_message_ids_are_ordered_by_offset_across_staging_runs() {
         &staging,
         OperationLimits::default(),
         IndexBuildLimits {
-            max_entry_buffer_bytes: 200,
+            max_entry_buffer_bytes: 256,
             max_merge_fan_in: 2,
             ..IndexBuildLimits::default()
         },
@@ -288,7 +288,7 @@ fn staging_run_count_is_bounded() {
             &staging,
             OperationLimits::default(),
             IndexBuildLimits {
-                max_entry_buffer_bytes: 200,
+                max_entry_buffer_bytes: 256,
                 max_run_files: 1,
                 ..IndexBuildLimits::default()
             },

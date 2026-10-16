@@ -8,6 +8,7 @@ use thiserror::Error;
 use super::{AssignmentKey, AssignmentState, CanonicalState, ProgressKey, StateLimits};
 
 mod encoding;
+mod groups;
 mod partition;
 use partition::decode_partition;
 #[cfg(test)]
@@ -30,15 +31,15 @@ fn ready<T>(future: impl std::future::Future<Output = T>) -> T {
 pub const STATE_SNAPSHOT_HEADER_BYTES: usize = 256;
 
 const SNAPSHOT_MAGIC: &[u8; 8] = b"OZYSTA01";
-const SNAPSHOT_VERSION: u16 = 2;
+const SNAPSHOT_VERSION: u16 = 6;
 const PROGRESS_BYTES: usize = 48;
-const ASSIGNMENT_BYTES: usize = 64;
+const ASSIGNMENT_BYTES: usize = 80;
 const SNAPSHOT_DIGEST_START: usize = 56;
 const SNAPSHOT_DIGEST_END: usize = 88;
 const SNAPSHOT_HASH_CONTEXT: &str = "ozzy canonical state snapshot v1";
 const SNAPSHOT_SCHEMA_CONTEXT: &str = "ozzy canonical state snapshot schema";
 const SNAPSHOT_SCHEMA: &[u8] =
-    b"OZYSTA01:256:partition96+names+producer72+retry-span24:progress48:assignment64:network-order";
+    b"OZYSTA01:256:partition104-dedup-time-and-window+names+producer80+retry-span40-stored-or-proof-op:progress48:assignment80-plan-and-resume:coordinator-group-plan-v2:network-order";
 const RETENTION_MAX_AGE: u32 = 1 << 0;
 const RETENTION_MAX_BYTES: u32 = 1 << 1;
 
@@ -52,6 +53,9 @@ struct SnapshotShape {
     assignment_count: usize,
     producer_count: usize,
     retry_span_count: usize,
+    group_count: usize,
+    group_member_count: usize,
+    group_target_count: usize,
 }
 
 /// Allocation and input bounds independent of live-state count limits.
@@ -76,6 +80,8 @@ impl Default for StateSnapshotLimits {
 pub fn canonical_state_schema_digest() -> Digest {
     let mut hasher = Hasher::new(SNAPSHOT_SCHEMA_CONTEXT);
     hasher.update(SNAPSHOT_SCHEMA);
+    hasher.update(b"OZYCIMG-v1:104:core+optional-partition-OZYDIDX-v1-header64+rows32");
+    hasher.update(b"progress-assignment-v2:epoch8+member16");
     hasher.finish()
 }
 
@@ -137,6 +143,7 @@ impl CanonicalState {
                 limits,
                 state_limits.max_producers - state.producer_count,
                 state_limits.max_retry_spans - state.retry_span_count,
+                state.revision,
                 &mut step,
             )
             .await?;
@@ -167,11 +174,11 @@ impl CanonicalState {
             .assignment_count
             .checked_mul(ASSIGNMENT_BYTES)
             .ok_or(StateSnapshotError::LengthOverflow)?;
-        if cursor
+        let fixed_end = cursor
             .checked_add(progress_bytes)
             .and_then(|value| value.checked_add(assignment_bytes))
-            != Some(input.len())
-        {
+            .ok_or(StateSnapshotError::LengthOverflow)?;
+        if fixed_end > input.len() {
             return Err(StateSnapshotError::LengthMismatch);
         }
 
@@ -192,7 +199,7 @@ impl CanonicalState {
                 .partitions
                 .get(&partition_id)
                 .ok_or(StateSnapshotError::UnknownPartition)?;
-            if value >= partition.next_offset {
+            if value > partition.next_offset {
                 return Err(StateSnapshotError::ProgressBeyondState);
             }
             previous_progress = Some(sort_key);
@@ -200,26 +207,59 @@ impl CanonicalState {
             step(PROGRESS_BYTES).await;
         }
 
-        let mut previous_assignment: Option<([u8; 16], [u8; 16])> = None;
-        for _ in 0..shape.assignment_count {
-            let (key, value) = decode_assignment(&input[cursor..cursor + ASSIGNMENT_BYTES])?;
-            let sort_key = (*key.0.as_bytes(), *key.1.as_bytes());
-            if previous_assignment.is_some_and(|previous| previous >= sort_key) {
-                return Err(StateSnapshotError::UnsortedOrDuplicate);
-            }
-            if !state.partitions.contains_key(&key.1) {
-                return Err(StateSnapshotError::UnknownPartition);
-            }
-            if state.assignments.insert(key, value).is_some() {
-                return Err(StateSnapshotError::UnsortedOrDuplicate);
-            }
-            previous_assignment = Some(sort_key);
-            cursor += ASSIGNMENT_BYTES;
-            step(ASSIGNMENT_BYTES).await;
+        cursor = decode_assignments(&mut state, input, cursor, shape.assignment_count, &mut step)
+            .await?;
+        cursor = groups::decode(
+            &mut state,
+            input,
+            cursor,
+            shape.group_count,
+            limits,
+            &mut step,
+        )
+        .await?;
+        if cursor != input.len()
+            || state.group_member_count != shape.group_member_count
+            || state.group_target_count != shape.group_target_count
+        {
+            return Err(StateSnapshotError::LengthMismatch);
         }
-        debug_assert_eq!(cursor, input.len());
         Ok(state)
     }
+}
+
+async fn decode_assignments(
+    state: &mut CanonicalState,
+    input: &[u8],
+    mut cursor: usize,
+    count: usize,
+    step: &mut impl AsyncFnMut(usize),
+) -> Result<usize, StateSnapshotError> {
+    let mut previous_assignment: Option<([u8; 16], [u8; 16])> = None;
+    for _ in 0..count {
+        let (key, value) = decode_assignment(&input[cursor..cursor + ASSIGNMENT_BYTES])?;
+        let sort_key = (*key.0.as_bytes(), *key.1.as_bytes());
+        if previous_assignment.is_some_and(|previous| previous >= sort_key) {
+            return Err(StateSnapshotError::UnsortedOrDuplicate);
+        }
+        if !state.partitions.contains_key(&key.1) {
+            return Err(StateSnapshotError::UnknownPartition);
+        }
+        if state
+            .progress
+            .get(&ProgressKey::ConsumerGroup(key.0, key.1))
+            .is_none_or(|cursor| *cursor < value.resume_cursor)
+        {
+            return Err(StateSnapshotError::InvalidAssignment);
+        }
+        if state.assignments.insert(key, value).is_some() {
+            return Err(StateSnapshotError::UnsortedOrDuplicate);
+        }
+        previous_assignment = Some(sort_key);
+        cursor += ASSIGNMENT_BYTES;
+        step(ASSIGNMENT_BYTES).await;
+    }
+    Ok(cursor)
 }
 
 async fn decode_snapshot_shape(
@@ -247,7 +287,7 @@ async fn decode_snapshot_shape(
     if read_u16(input, 10) != STATE_SNAPSHOT_HEADER_BYTES as u16
         || read_u32(input, 12) != 0
         || read_u32(input, 44) != 0
-        || input[104..STATE_SNAPSHOT_HEADER_BYTES]
+        || input[124..STATE_SNAPSHOT_HEADER_BYTES]
             .iter()
             .any(|byte| *byte != 0)
     {
@@ -272,11 +312,29 @@ async fn decode_snapshot_shape(
         assignment_count: read_u32(input, 40) as usize,
         producer_count: u64_to_usize(read_u64(input, 88))?,
         retry_span_count: u64_to_usize(read_u64(input, 96))?,
+        group_count: read_u32(input, 104) as usize,
+        group_member_count: u64_to_usize(read_u64(input, 108))?,
+        group_target_count: u64_to_usize(read_u64(input, 116))?,
     };
     enforce_limit(
         "partitions",
         shape.partition_count,
         state_limits.max_partitions,
+    )?;
+    enforce_limit(
+        "consumer groups",
+        shape.group_count,
+        state_limits.max_groups,
+    )?;
+    enforce_limit(
+        "group members",
+        shape.group_member_count,
+        state_limits.max_group_members,
+    )?;
+    enforce_limit(
+        "group source partitions",
+        shape.group_target_count,
+        state_limits.max_group_partitions,
     )?;
     enforce_limit(
         "progress owners",
@@ -338,6 +396,8 @@ fn encode_assignment(output: &mut [u8], key: AssignmentKey, value: AssignmentSta
     output[..16].copy_from_slice(key.0.as_bytes());
     output[16..32].copy_from_slice(key.1.as_bytes());
     put_u64(output, 32, value.epoch);
+    put_u64(output, 64, value.plan_revision);
+    put_u64(output, 72, value.resume_cursor.get());
     if let Some(member) = value.member {
         output[40] = 1;
         output[48..64].copy_from_slice(member.as_bytes());
@@ -362,12 +422,18 @@ fn decode_assignment(input: &[u8]) -> Result<(AssignmentKey, AssignmentState), S
         _ => return Err(StateSnapshotError::InvalidAssignment),
     };
     let epoch = read_u64(input, 32);
-    if epoch == 0 {
+    let plan_revision = read_u64(input, 64);
+    if epoch == 0 || plan_revision < epoch {
         return Err(StateSnapshotError::InvalidAssignment);
     }
     Ok((
         AssignmentKey(group, partition),
-        AssignmentState { epoch, member },
+        AssignmentState {
+            epoch,
+            member,
+            plan_revision,
+            resume_cursor: Offset::new(read_u64(input, 72)),
+        },
     ))
 }
 
@@ -581,6 +647,9 @@ pub enum StateSnapshotError {
     #[error("canonical state assignment entry is invalid")]
     /// A decoded assignment entry violates its state contract.
     InvalidAssignment,
+    #[error("canonical coordinator group is invalid")]
+    /// A coordinator image violates its membership or source intent contract.
+    InvalidGroup,
     #[error("canonical state retention policy is invalid")]
     /// A decoded retention policy is invalid.
     InvalidRetention,

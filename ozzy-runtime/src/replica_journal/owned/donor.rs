@@ -20,6 +20,27 @@ pub(super) struct Source {
     cached: Option<AsyncJournalHistory>,
     busy: Rc<Cell<bool>>,
     checkpoint: Option<Rc<ozzy_journal_segment::AsyncCheckpointFiles>>,
+    checkpoint_cursor: Option<CheckpointCursor>,
+}
+
+#[derive(Debug)]
+struct CheckpointCursor {
+    cursor: Box<ozzy_journal_segment::AsyncCheckpointCursor>,
+    _charge: Option<crate::memory::Charge>,
+}
+
+#[derive(Debug)]
+struct CheckpointBuffer {
+    output: crate::memory::Buffer,
+    _scratch: crate::memory::Charge,
+}
+
+fn memory_error(error: std::io::Error) -> JournalError {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        JournalError::AppendCapacity
+    } else {
+        error.into()
+    }
 }
 
 #[derive(Debug)]
@@ -195,6 +216,7 @@ impl OwnedJournal {
         Ok(Source {
             pin,
             checkpoint,
+            checkpoint_cursor: None,
             metadata: history.metadata(),
             cached: Some(history),
             busy: Rc::new(Cell::new(false)),
@@ -292,7 +314,8 @@ pub struct PreparedCheckpointRead {
     key: Rc<()>,
     pin: PinnedRecovery,
     request: CheckpointRequest,
-    files: Rc<ozzy_journal_segment::AsyncCheckpointFiles>,
+    cursor: CheckpointCursor,
+    buffer: Option<CheckpointBuffer>,
     slot: Slot,
 }
 
@@ -303,24 +326,42 @@ pub struct CompletedCheckpointRead {
     pin: PinnedRecovery,
     request: CheckpointRequest,
     result: Result<bytes::Bytes, JournalError>,
+    cursor: CheckpointCursor,
     slot: Slot,
 }
 
 impl PreparedCheckpointRead {
     /// Execute file work without borrowing the journal owner.
     pub async fn read(self) -> CompletedCheckpointRead {
-        let result = self
-            .files
-            .read_range(self.request.offset, self.request.max_bytes as usize)
+        let Self {
+            key,
+            pin,
+            request,
+            mut cursor,
+            buffer,
+            slot,
+        } = self;
+        let result = cursor
+            .cursor
+            .read(request.offset, request.max_bytes as usize)
             .await
-            .map(bytes::Bytes::from)
+            .and_then(|bytes| {
+                if let Some(mut buffer) = buffer {
+                    buffer.output.resize(bytes.len())?;
+                    buffer.output.copy_from_slice(&bytes);
+                    Ok(buffer.output.freeze())
+                } else {
+                    Ok(bytes::Bytes::from(bytes))
+                }
+            })
             .map_err(JournalError::from);
         CompletedCheckpointRead {
-            key: self.key,
-            pin: self.pin,
-            request: self.request,
+            key,
+            pin,
+            request,
             result,
-            slot: self.slot,
+            cursor,
+            slot,
         }
     }
 }
@@ -350,7 +391,7 @@ impl OwnedJournal {
         }
         let at = self.donor_slot(pin.requester)?;
         let source = self.donors[at]
-            .as_ref()
+            .as_mut()
             .filter(|source| source.pin == pin)
             .ok_or(JournalError::HistorySourceMismatch)?;
         if source.busy.get() {
@@ -360,12 +401,48 @@ impl OwnedJournal {
             .checkpoint
             .clone()
             .ok_or(JournalError::HistorySourceMismatch)?;
+        let maximum = (request.max_bytes as usize).min(files.fragment_bytes());
+        let buffer = self
+            .append_memory
+            .as_ref()
+            .map(|memory| {
+                // Replay ranges retain an output plus one I/O scratch fragment;
+                // both are separate from the backend's accepted physical jobs.
+                let scratch_bytes = maximum
+                    .checked_add(files.fragment_bytes())
+                    .ok_or(JournalError::AppendCapacity)?;
+                let scratch = memory.try_charge(scratch_bytes).map_err(memory_error)?;
+                let output = memory.try_lease(maximum).map_err(memory_error)?;
+                Ok::<_, JournalError>(CheckpointBuffer {
+                    output,
+                    _scratch: scratch,
+                })
+            })
+            .transpose()?;
+        let cursor = if let Some(cursor) = source.checkpoint_cursor.take() {
+            cursor
+        } else {
+            let charge = self
+                .append_memory
+                .as_ref()
+                .map(|memory| {
+                    memory
+                        .try_charge(ozzy_journal_segment::AsyncCheckpointCursor::retained_bytes())
+                        .map_err(memory_error)
+                })
+                .transpose()?;
+            CheckpointCursor {
+                cursor: Box::new(files.cursor()),
+                _charge: charge,
+            }
+        };
         source.busy.set(true);
         Ok(PreparedCheckpointRead {
             key: self.read_key.clone(),
             pin,
             request,
-            files,
+            cursor,
+            buffer,
             slot: Slot(source.busy.clone()),
         })
     }
@@ -377,15 +454,17 @@ impl OwnedJournal {
     ) -> Result<super::super::recovery::RecoveryCheckpointRead, JournalError> {
         self.healthy()?;
         let at = self.donor_slot(done.pin.requester)?;
-        if !Rc::ptr_eq(&done.key, &self.read_key)
-            || done.pin.response.scope != self.scope
-            || !self.donors[at].as_ref().is_some_and(|source| {
-                source.pin == done.pin && Rc::ptr_eq(&source.busy, &done.slot.0)
-            })
-        {
+        if !Rc::ptr_eq(&done.key, &self.read_key) || done.pin.response.scope != self.scope {
             return Err(JournalError::HistorySourceMismatch);
         }
+        let source = self.donors[at]
+            .as_mut()
+            .filter(|source| source.pin == done.pin && Rc::ptr_eq(&source.busy, &done.slot.0))
+            .ok_or(JournalError::HistorySourceMismatch)?;
         self.faulted |= done.result.as_ref().err().is_some_and(read_fault);
+        if !self.faulted {
+            source.checkpoint_cursor = Some(done.cursor);
+        }
         Ok(super::super::recovery::RecoveryCheckpointRead {
             request: done.request,
             bytes: done.result?,

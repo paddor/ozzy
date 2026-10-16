@@ -585,6 +585,10 @@ fn endpoint_collisions_and_non_connectable_addresses_are_rejected() {
         "ipc://relative",
         "tcp://host:99999",
         "tcp://host: 1",
+        "lz4+tcp://127.0.0.1:0",
+        "zstd+tcp://127.0.0.1:0",
+        "lz4+tcp://*:7100",
+        "zstd+tcp://*:7100",
     ] {
         let mut config = single();
         config.brokers.get_mut("laptop").unwrap().endpoints.peer = endpoint.to_owned();
@@ -594,6 +598,28 @@ fn endpoint_collisions_and_non_connectable_addresses_are_rejected() {
     let peer = config.brokers["a"].endpoints.peer.clone();
     config.brokers.get_mut("b").unwrap().endpoints.peer = peer;
     assert!(config.validate().is_err());
+}
+
+#[test]
+fn compressed_endpoints_validate_like_tcp_and_cannot_mix_with_plain_transports() {
+    for scheme in ["lz4+tcp", "zstd+tcp"] {
+        let mut config = three();
+        for (index, broker) in config.brokers.values_mut().enumerate() {
+            let endpoints = &mut broker.endpoints;
+            let port = 7200 + 10 * index;
+            endpoints.peer = format!("{scheme}://127.0.0.1:{port}");
+            endpoints.data_peer = format!("{scheme}://127.0.0.1:{}", port + 1);
+            endpoints.reader_pub = format!("{scheme}://127.0.0.1:{}", port + 2);
+            endpoints.follower_pub = Some(format!("{scheme}://127.0.0.1:{}", port + 3));
+        }
+        let mut mixed = config.clone();
+        config.validate().unwrap();
+        let endpoints = &mut mixed.brokers.get_mut("a").unwrap().endpoints;
+        endpoints.reader_pub = endpoints
+            .reader_pub
+            .replacen(&format!("{scheme}://"), "tcp://", 1);
+        assert!(mixed.validate().is_err());
+    }
 }
 
 #[test]

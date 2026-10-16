@@ -79,7 +79,7 @@ impl Peer {
 #[tokio::test(flavor = "current_thread")]
 async fn topic_discovery_uses_another_broker_when_the_first_response_is_lost() {
     let (mut harness, links, clock, authority) =
-        setup_shared_directory_profile(&[], 2, None, true).await;
+        setup_shared_directory_profile(&[], 2, None, true, None).await;
     harness
         .until(false, "both directory sessions established", |_| {
             links.session(authority.primary).is_some()
@@ -131,7 +131,7 @@ async fn topic_discovery_uses_another_broker_when_the_first_response_is_lost() {
 #[tokio::test(flavor = "current_thread")]
 async fn lost_topic_responses_share_one_deadline_and_release_admission_after_timeout() {
     let (mut harness, links, clock, authority) =
-        setup_shared_directory_profile(&[], 2, None, true).await;
+        setup_shared_directory_profile(&[], 2, None, true, None).await;
     harness
         .until(false, "both directory sessions established", |_| {
             links.session(authority.primary).is_some()

@@ -12,7 +12,9 @@ use super::data::{Cursor, add, capacity, command, count, record_count};
 use super::{ENVELOPE_BYTES, Envelope, Opcode, Packet};
 use crate::{GroupId, MessageId, PartitionIncarnation, ProducerId};
 
+mod outcome;
 mod receipt;
+pub use outcome::{AppendDisposition, AppendOutcome, OUTCOME_RUN_BYTES, OutcomeRun, OutcomeRuns};
 pub mod stream;
 pub use receipt::{
     Appended, DecodedAppended, MessageIds, OpPosition, decode_appended, encode_appended,

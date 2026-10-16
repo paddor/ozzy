@@ -184,7 +184,7 @@ fn rejected_role_or_unsolicited_welcome_consumes_no_peer_capacity() {
 #[test]
 fn bounded_handshake_encoding_covers_every_known_capability() {
     let mut parameters = profile(31);
-    parameters.capabilities = 0x17ff;
+    parameters.capabilities = 0x1fff;
     parameters.required_capabilities = parameters.capabilities;
     let h = Handshake {
         superseded_hello: Some(1),

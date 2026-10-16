@@ -10,6 +10,7 @@ use crate::{
 use ozzy_io::{Handle, OpenMode, Operation};
 
 pub(crate) struct Groups {
+    resumed: bool,
     access: Access,
     handle: Handle,
     header: SegmentHeader,
@@ -27,7 +28,7 @@ pub(crate) struct Groups {
     work: crate::cooperative::Budget,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct End {
     offset: u64,
     digest: Digest,
@@ -41,28 +42,58 @@ struct Cursor {
     group_number: u64,
 }
 
+/// Validated reader state at the end of an active-segment scan. A later scan of
+/// the same active segment resumes here and validates only appended groups.
+#[derive(Clone)]
+pub(crate) struct Resume {
+    reference: SegmentReference,
+    offset: u64,
+    chain: ChainPosition,
+    group_number: u64,
+    digest: SegmentDigestBuilder,
+    decoded: usize,
+}
+
+/// Validation inputs for one segment's groups, captured from the owner so the
+/// scan itself borrows no journal. Deletion protection belongs to the caller.
+#[derive(Debug, Clone)]
+pub(crate) struct GroupScope {
+    access: Access,
+    path: std::path::PathBuf,
+    reference: SegmentReference,
+    expected: End,
+    active_header: Option<SegmentHeader>,
+    group_id: ozzy_proto::GroupId,
+    limits: Limits,
+    configuration_epoch: u64,
+    promised_view: u64,
+}
+
 impl Journal {
     pub(crate) async fn segment_groups(
         &self,
         reference: SegmentReference,
     ) -> Result<Box<Groups>, DirectoryError> {
+        self.segment_groups_from(reference, None).await
+    }
+
+    /// Resume only within the same active segment and its written prefix;
+    /// otherwise scan from the header. `Groups::resumed` reports the choice.
+    pub(crate) async fn segment_groups_from(
+        &self,
+        reference: SegmentReference,
+        resume: Option<Resume>,
+    ) -> Result<Box<Groups>, DirectoryError> {
+        self.group_scope(reference)?.open(resume).await
+    }
+
+    /// Capture a selected segment's expected end without file access.
+    pub(crate) fn group_scope(
+        &self,
+        reference: SegmentReference,
+    ) -> Result<GroupScope, DirectoryError> {
         self.healthy()?;
-        let handle = self
-            .access
-            .open(
-                self.root().join(super::segment_reference_name(reference)),
-                OpenMode::Read,
-                false,
-                false,
-            )
-            .await?;
-        let length = self.access.length(&handle).await?;
-        let bytes = self
-            .access
-            .read_range(&handle, 0, SEGMENT_HEADER_BYTES, self.limits.io.chunk_bytes)
-            .await?;
-        let header = crate::decode_segment_header(&bytes)?;
-        let expected = if let Some(sealed) = reference.sealed {
+        let (expected, active_header) = if let Some(sealed) = reference.sealed {
             let at = self
                 .manifest
                 .segments
@@ -74,18 +105,16 @@ impl Journal {
                 .segments
                 .get(at + 1)
                 .ok_or(DirectoryError::SegmentMismatch(reference.segment_id))?;
-            End {
+            let expected = End {
                 offset: sealed.valid_bytes,
                 digest: sealed.digest,
                 chain: next.first_chain,
                 group_number: next.first_group_number,
-            }
+            };
+            (expected, None)
         } else {
             let position = self.writer.written_position();
-            if header != *self.writer.state().header() {
-                return Err(DirectoryError::SegmentMismatch(reference.segment_id));
-            }
-            End {
+            let expected = End {
                 offset: position.end_offset(),
                 digest: self.writer.state().structural_digest(),
                 chain: position.next_chain(),
@@ -93,43 +122,116 @@ impl Journal {
                     .group_number()
                     .checked_add(1)
                     .ok_or(CodecError::InvalidGroupNumber)?,
-            }
+            };
+            (expected, Some(self.writer.state().header().clone()))
         };
-        if length > reference.capacity
+        Ok(GroupScope {
+            access: self.access.clone(),
+            path: self.root().join(super::segment_reference_name(reference)),
+            reference,
+            expected,
+            active_header,
+            group_id: self.manifest.identity.group_id,
+            limits: self.limits,
+            configuration_epoch: self.manifest.configuration_epoch,
+            promised_view: self.manifest.promised_view,
+        })
+    }
+
+    pub(crate) fn group_scan_bytes(&self) -> Result<usize, DirectoryError> {
+        group_bytes(self.limits)
+    }
+}
+
+impl GroupScope {
+    pub(crate) const fn reference(&self) -> SegmentReference {
+        self.reference
+    }
+
+    pub(crate) const fn limits(&self) -> Limits {
+        self.limits
+    }
+
+    pub(crate) async fn open(self, resume: Option<Resume>) -> Result<Box<Groups>, DirectoryError> {
+        let Self {
+            access,
+            path,
+            reference,
+            expected,
+            active_header,
+            group_id,
+            limits,
+            configuration_epoch,
+            promised_view,
+        } = self;
+        let handle = access.open(path, OpenMode::Read, false, false).await?;
+        let length = access.length(&handle).await?;
+        let bytes = access
+            .read_range(&handle, 0, SEGMENT_HEADER_BYTES, limits.io.chunk_bytes)
+            .await?;
+        let header = crate::decode_segment_header(&bytes)?;
+        if active_header.is_some_and(|active| header != active)
+            || length > reference.capacity
             || length < expected.offset
-            || length > self.limits.io.max_segment_bytes
-            || header.group_id() != self.manifest.identity.group_id
+            || length > limits.io.max_segment_bytes
+            || header.group_id() != group_id
             || header.segment_id() != reference.segment_id
             || header.capacity() != reference.capacity
         {
             return Err(DirectoryError::SegmentMismatch(reference.segment_id));
         }
-        let digest = SegmentDigestBuilder::new(&header);
+        let resume = resume.filter(|resume| {
+            reference.sealed.is_none()
+                && resume.reference == reference
+                && resume.offset <= expected.offset
+        });
+        let resumed = resume.is_some();
+        let (cursor, digest, decoded) = start(resume, reference, &header);
         Ok(Box::new(Groups {
-            access: self.access.clone(),
+            resumed,
+            access,
             handle,
             header,
             reference,
-            limits: self.limits,
+            limits,
             length,
             expected,
             digest,
-            decoded: 0,
-            cursor: Cursor {
-                offset: SEGMENT_HEADER_BYTES as u64,
-                chain: reference.first_chain,
-                group_number: reference.first_group_number,
-            },
+            decoded,
+            cursor,
             bytes: Vec::new(),
-            configuration_epoch: self.manifest.configuration_epoch,
-            promised_view: self.manifest.promised_view,
+            configuration_epoch,
+            promised_view,
             ended: false,
             work: crate::cooperative::Budget::default(),
         }))
     }
+}
 
-    pub(crate) fn group_scan_bytes(&self) -> Result<usize, DirectoryError> {
-        group_bytes(self.limits)
+fn start(
+    resume: Option<Resume>,
+    reference: SegmentReference,
+    header: &SegmentHeader,
+) -> (Cursor, SegmentDigestBuilder, usize) {
+    match resume {
+        Some(resume) => (
+            Cursor {
+                offset: resume.offset,
+                chain: resume.chain,
+                group_number: resume.group_number,
+            },
+            resume.digest,
+            resume.decoded,
+        ),
+        None => (
+            Cursor {
+                offset: SEGMENT_HEADER_BYTES as u64,
+                chain: reference.first_chain,
+                group_number: reference.first_group_number,
+            },
+            SegmentDigestBuilder::new(header),
+            0,
+        ),
     }
 }
 
@@ -150,6 +252,23 @@ impl Groups {
 
     pub(crate) fn boundary(&self) -> (u64, Digest) {
         (self.expected.offset, self.expected.digest)
+    }
+
+    /// Whether this reader started after a previously validated prefix.
+    pub(crate) const fn resumed(&self) -> bool {
+        self.resumed
+    }
+
+    /// Validated end state, available once the reader reached its end.
+    pub(crate) fn resume(&self) -> Option<Resume> {
+        self.ended.then(|| Resume {
+            reference: self.reference,
+            offset: self.cursor.offset,
+            chain: self.cursor.chain,
+            group_number: self.cursor.group_number,
+            digest: self.digest.clone(),
+            decoded: self.decoded,
+        })
     }
 
     /// Each yielded group has canonical metadata, payload and chain validation.

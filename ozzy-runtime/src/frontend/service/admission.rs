@@ -127,8 +127,16 @@ impl Service {
             || packet.envelope.sender != peer
             || peer == self.dispatcher.local
             || peer.as_bytes() == &[0; 16]
-            || self.peers.len() >= self.trusted_maximum
         {
+            return Err(ReceiveError::Peer);
+        }
+        if self.peers.len() >= self.trusted_maximum {
+            // No reply route exists before admission; the client times out.
+            crate::profiling::event(crate::profiling::Event::ClientLimitRefusal);
+            crate::profiling::log(
+                crate::profiling::Level::Warn,
+                "client limit reached; dropped HELLO",
+            );
             return Err(ReceiveError::Peer);
         }
         let hello = handshake::decode(packet, self.parameters.receive.envelope)?;

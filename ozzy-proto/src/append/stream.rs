@@ -5,8 +5,9 @@
 //! runtime obligations; this codec establishes the structure only.
 
 use super::{
-    AppendKey, Authority, CodecError, Cursor, ENVELOPE_BYTES, Envelope, Opcode, Packet,
-    PartitionIncarnation, Policy, capacity, command, decode_common, encode_common, identities,
+    AppendDisposition, AppendKey, Authority, CodecError, Cursor, ENVELOPE_BYTES, Envelope, Opcode,
+    Packet, PartitionIncarnation, Policy, capacity, command, decode_common, encode_common,
+    identities,
 };
 use crate::EnvelopeLimits;
 
@@ -25,8 +26,28 @@ pub struct Confirmed {
     pub end_sequence: u64,
     /// Offset assigned to the first confirmed sequence.
     pub first_offset: u64,
+    /// Whether these attempts stored records or reused original offsets.
+    pub disposition: AppendDisposition,
     /// Exact achieved policy, requiring comparison with the writer's request.
     pub policy: Policy,
+}
+
+impl Confirmed {
+    /// Shared outcome representation for this consecutive producer sequence run.
+    pub fn outcomes(self) -> Result<super::OutcomeRun, CodecError> {
+        let records = self
+            .end_sequence
+            .checked_sub(self.key.first_sequence)
+            .and_then(|count| u32::try_from(count).ok())
+            .ok_or(CodecError::Length)?;
+        let run = super::OutcomeRun {
+            disposition: self.disposition,
+            first_offset: crate::Offset::new(self.first_offset),
+            records,
+        };
+        run.encode()?;
+        Ok(run)
+    }
 }
 
 /// Encode a fixed-size range into reserved metadata. Payload must be empty.
@@ -45,8 +66,8 @@ pub fn encode_confirmed(
         confirmed.key,
     )?;
     range(confirmed)?;
-    let header = envelope.encode_header(106, 0, limits)?;
-    capacity(metadata, 106)?;
+    let header = envelope.encode_header(107, 0, limits)?;
+    capacity(metadata, 107)?;
     metadata.clear();
     encode_common(
         metadata,
@@ -57,6 +78,7 @@ pub fn encode_confirmed(
     );
     metadata.extend_from_slice(&confirmed.end_sequence.to_be_bytes());
     metadata.extend_from_slice(&confirmed.first_offset.to_be_bytes());
+    metadata.push(confirmed.disposition as u8);
     metadata.push(confirmed.policy as u8);
     Ok(header)
 }
@@ -70,7 +92,7 @@ pub fn decode_confirmed(
     packet
         .envelope
         .validate_frames(packet.metadata.len(), packet.payload.len(), limits)?;
-    if !packet.payload.is_empty() || packet.metadata.len() != 106 {
+    if !packet.payload.is_empty() || packet.metadata.len() != 107 {
         return Err(CodecError::Length);
     }
     let mut cursor = Cursor(packet.metadata);
@@ -82,6 +104,7 @@ pub fn decode_confirmed(
         key,
         end_sequence: cursor.u64()?,
         first_offset: cursor.u64()?,
+        disposition: AppendDisposition::try_from(cursor.byte()?)?,
         policy: Policy::try_from(cursor.byte()?)?,
     };
     range(confirmed)?;
@@ -89,14 +112,5 @@ pub fn decode_confirmed(
 }
 
 fn range(confirmed: Confirmed) -> Result<(), CodecError> {
-    let count = confirmed
-        .end_sequence
-        .checked_sub(confirmed.key.first_sequence)
-        .filter(|&count| count != 0)
-        .ok_or(CodecError::Length)?;
-    confirmed
-        .first_offset
-        .checked_add(count)
-        .ok_or(CodecError::Length)?;
-    Ok(())
+    confirmed.outcomes().map(|_| ())
 }
