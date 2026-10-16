@@ -173,6 +173,17 @@ impl Driver {
     /// complete. Later writes cannot extend this captured confirmation boundary.
     pub fn complete_sync(&mut self, ticket: SyncTicket) -> Result<(), Error> {
         self.journal.complete_sync(ticket)?;
+        self.confirm_durable()
+    }
+
+    /// Install a write that its `O_DSYNC` completion made durable, and confirm
+    /// through it. Durable-prefix evidence is published separately.
+    pub fn complete_durable_write(&mut self, ticket: WriteTicket) -> Result<(), Error> {
+        self.journal.complete_durable_write(ticket)?;
+        self.confirm_durable()
+    }
+
+    fn confirm_durable(&mut self) -> Result<(), Error> {
         let through = self.journal.snapshot().durable;
         if through > self.committed.op {
             self.committed = self

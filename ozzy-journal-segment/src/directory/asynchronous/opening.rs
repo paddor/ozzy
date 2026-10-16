@@ -506,9 +506,10 @@ async fn validate_sealed(
             .sealed
             .ok_or(DirectoryError::SegmentMismatch(reference.segment_id))?;
         let bytes = access
-            .read_file(
+            .read_prefix(
                 root.join(segment_reference_name(reference)),
-                reference.capacity as usize,
+                sealed.valid_bytes,
+                reference.capacity,
                 limits.io.chunk_bytes,
             )
             .await?;

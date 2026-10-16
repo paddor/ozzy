@@ -502,3 +502,98 @@ fn probe_follower(
         .unwrap();
     response.expect("follower must answer control probes")
 }
+
+/// In one instant each timer fires at most once, so a COMMIT or vote that
+/// repeats the previous one on its stream came from an event, not a timer.
+fn assert_no_repeats(sent: &[(usize, usize, Opcode, Bytes)], opcodes: &[Opcode]) {
+    let mut last = std::collections::BTreeMap::new();
+    for (from, to, command, metadata) in sent {
+        if opcodes.contains(command) {
+            let previous = last.insert((from, to, *command as u8), metadata);
+            assert_ne!(previous, Some(metadata), "{command:?} from {from} to {to}");
+        }
+    }
+    for command in opcodes {
+        assert!(
+            last.keys().any(|key| key.2 == *command as u8),
+            "no {command:?} seen"
+        );
+    }
+}
+
+#[test]
+fn settled_publication_repeats_no_commit_or_vote_within_an_instant() {
+    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
+        let (mut controller, io) = setup();
+        let (mut actors, pending) = cluster(&mut controller, &io, 0, policy);
+        for actor in &mut actors {
+            actor.enable_publication();
+        }
+        let mut pending = Box::pin(pending);
+        let now = Duration::from_millis(1);
+        let mut sent = Vec::new();
+        let mut confirmed = None;
+        for turn in 0..1000 {
+            let mut deliveries = Vec::new();
+            for (from, actor) in actors.iter_mut().enumerate() {
+                actor.advance(now).unwrap();
+                {
+                    let mut event = std::pin::pin!(actor.changed(now));
+                    if let Poll::Ready(result) = poll(event.as_mut()) {
+                        result.unwrap();
+                    }
+                }
+                actor
+                    .flush(|mut message| {
+                        let command = opcode(&message);
+                        let route = message.pop_front().unwrap();
+                        let source = Bytes::from(vec![from as u8 + 1; 16]);
+                        if command == Opcode::PreparePub {
+                            for to in (0..3).filter(|to| *to != from) {
+                                let message = Message::with_prefix(source.clone(), message.clone());
+                                deliveries.push((to, message, true));
+                            }
+                            return Ok(());
+                        }
+                        let to = usize::from(route[0] - 1);
+                        if message.len() == 3 {
+                            let metadata = Bytes::copy_from_slice(message.part_slice(1).unwrap());
+                            sent.push((from, to, command, metadata));
+                        }
+                        let data = command == Opcode::PrepareFlow;
+                        deliveries.push((to, Message::with_prefix(source, message), data));
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            for (to, message, data) in deliveries {
+                if data {
+                    assert!(actors[to].receive_data(&message, now).unwrap());
+                } else {
+                    actors[to].receive(&message, now).unwrap();
+                }
+            }
+            settle(&mut controller, &[]);
+            if confirmed.is_none()
+                && let Poll::Ready(result) = poll(pending.as_mut())
+            {
+                assert!(matches!(
+                    result.unwrap().outcome,
+                    ProposalOutcome::Committed { .. }
+                ));
+                confirmed = Some(turn);
+            }
+            if confirmed.is_some_and(|at| turn > at + 30) {
+                break;
+            }
+        }
+        assert!(
+            confirmed.is_some(),
+            "publication must confirm under {policy:?}"
+        );
+        assert_no_repeats(&sent, &[Opcode::Commit, Opcode::PrepareOk]);
+        for actor in actors {
+            close(&mut controller, actor);
+        }
+    }
+}

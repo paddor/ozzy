@@ -29,12 +29,22 @@ fn peer_options(
         .and_then(|count| count.checked_add(4))
         .and_then(|count| u32::try_from(count).ok())
         .ok_or(BrokerLinkError::Configuration)?;
+    // OMQ charges received backing to its connection until it drops. Readers
+    // keep frames under their own reservation, which must bind first.
+    let retained = config
+        .reader
+        .map_or(Some(0), |limits| {
+            limits.reservation_bytes(config.parameters.receive, config.brokers.len())
+        })
+        .and_then(|bytes| bytes.checked_add(message_bytes))
+        .ok_or(BrokerLinkError::Configuration)?;
     Ok(crate::transport::socket_options()
         .identity(crate::transport::peer_identity(config.local))
         .router_mandatory(true)
         .send_hwm(hwm)
         .recv_hwm(hwm)
         .max_message_size(message_bytes)
+        .peer_recv_max_bytes(retained.max(omq_tokio::options::DEFAULT_PEER_MAX_BYTES))
         .linger(Duration::from_millis(5)))
 }
 

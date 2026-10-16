@@ -27,6 +27,8 @@ pub struct Repair {
 }
 
 impl RecoveryDirectory {
+    /// Read a segment for inspection: a sealed one up to its sealed length,
+    /// the active one whole. A short file reads short.
     async fn read_segment(&self, reference: SegmentReference) -> Result<Vec<u8>, DirectoryError> {
         let capacity = usize::try_from(reference.capacity)
             .map_err(|_| DirectoryError::SegmentMismatch(reference.segment_id))?;
@@ -48,9 +50,12 @@ impl RecoveryDirectory {
                     limit: capacity,
                 });
             }
+            let count = reference
+                .sealed
+                .map_or(length, |sealed| length.min(sealed.valid_bytes));
             Ok(self
                 .access
-                .read_range(&handle, 0, length as usize, self.limits.io.chunk_bytes)
+                .read_range(&handle, 0, count as usize, self.limits.io.chunk_bytes)
                 .await?)
         }
         .await;

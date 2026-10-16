@@ -10,7 +10,7 @@ use super::{
     enforce_limit,
     entry::{encode_entry_header, encoded_entry_len},
     group_end_offset,
-    seal::{GroupDigestBuilder, GroupSeal, encode_seal},
+    seal::{GroupDigestBuilder, GroupSeal, SealRecord, encode_seal},
     shared,
 };
 use ozzy_journal::operation::{CanonicalOperation, ChainPosition, Digest, canonical_body_digest};
@@ -209,6 +209,7 @@ impl EncodedGroup {
 }
 
 /// Encode consecutive canonical operations as one aligned physical write group.
+/// Its seal marks every earlier group durable.
 pub fn encode_group(
     segment: &SegmentHeader,
     start: GroupStart,
@@ -218,6 +219,8 @@ pub fn encode_group(
 }
 
 /// Encode one physical group using independently decodable operation bodies.
+/// Its seal marks every earlier group durable, as for a file written whole
+/// and synchronized before use.
 pub fn encode_group_with_body_encoding(
     segment: &SegmentHeader,
     start: GroupStart,
@@ -234,8 +237,12 @@ pub fn encode_group_with_body_encoding(
         Vec::new(),
         &mut BodyEncodeScratch::default(),
     )?;
+    let write = GroupWrite {
+        start,
+        durable_through: start.group_number.saturating_sub(1),
+    };
     let finalized =
-        finalize_group_bodies(segment, start, operations, &body_digests, &mut prepared)?;
+        finalize_group_bodies(segment, write, operations, &body_digests, &mut prepared)?;
     Ok(prepared.finish(finalized))
 }
 
@@ -325,9 +332,17 @@ pub(super) fn aligned_group_bytes(entry_bytes: usize) -> Result<usize, CodecErro
     )
 }
 
+/// Where a group being written starts, and the highest group number already
+/// durable, which its seal records. That group must precede this one.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GroupWrite {
+    pub(crate) start: GroupStart,
+    pub(crate) durable_through: u64,
+}
+
 pub(crate) fn finalize_group_bodies(
     segment: &SegmentHeader,
-    start: GroupStart,
+    write: GroupWrite,
     operations: &[CanonicalOperation<'_>],
     body_digests: &[Digest],
     prepared: &mut PreparedGroupBodies,
@@ -337,7 +352,7 @@ pub(crate) fn finalize_group_bodies(
     }
     finalize_group_descriptors(
         segment,
-        start,
+        write,
         operations
             .iter()
             .zip(body_digests)
@@ -352,10 +367,14 @@ pub(crate) fn finalize_group_bodies(
 
 pub(crate) fn finalize_group_descriptors(
     segment: &SegmentHeader,
-    start: GroupStart,
+    write: GroupWrite,
     operations: impl ExactSizeIterator<Item = PackedOperation>,
     prepared: &mut PreparedGroupBodies,
 ) -> Result<FinalizedGroup, CodecError> {
+    let GroupWrite {
+        start,
+        durable_through,
+    } = write;
     validate_group_position(start.group_number, start.start_offset)?;
     let count = operations.len();
     if count == 0 {
@@ -396,8 +415,12 @@ pub(crate) fn finalize_group_descriptors(
         end_offset,
         entry_count: u64::try_from(count).map_err(|_| CodecError::LengthOverflow)?,
     };
-    let digest = group_digest.finish(end_offset);
-    encode_seal(&mut prepared.bytes, seal_offset, seal, digest)?;
+    let digest = group_digest.finish(end_offset, durable_through);
+    let record = SealRecord {
+        digest,
+        durable_through,
+    };
+    encode_seal(&mut prepared.bytes, seal_offset, seal, record)?;
 
     Ok(FinalizedGroup {
         digest,

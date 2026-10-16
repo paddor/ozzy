@@ -40,6 +40,23 @@ impl Turns {
         }
     }
 
+    /// Whether any maintenance turn is due at `now`.
+    pub(super) fn due(&self, now: Duration) -> bool {
+        self.retention.due(now)
+            || self
+                .storage_validation
+                .as_ref()
+                .is_some_and(|turn| now >= turn.next())
+            || self
+                .metadata_cleanup
+                .as_ref()
+                .is_some_and(|turn| now >= turn.next())
+            || self
+                .orphan_cleanup
+                .as_ref()
+                .is_some_and(|turn| now >= turn.next())
+    }
+
     pub(super) fn complete_orphan_cleanup(&mut self, reclaimed_bytes: u64) {
         self.foreground_due = true;
         self.status.orphan_steps = self.status.orphan_steps.saturating_add(1);

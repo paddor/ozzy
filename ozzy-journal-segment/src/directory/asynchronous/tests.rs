@@ -16,6 +16,7 @@ mod recovery;
 mod repair;
 mod retention;
 mod snapshots;
+mod spare;
 mod suffix;
 mod unselected;
 mod validation;

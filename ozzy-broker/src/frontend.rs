@@ -22,15 +22,48 @@ pub use serving::RemoteBrokers;
 /// owner-local accounting for retained backing allocations.
 #[derive(Clone, Copy, Debug)]
 pub struct TransportLimits {
-    /// Maximum queued messages per outbound OMQ connection.
+    /// Maximum queued messages per outbound PEER connection and per sending
+    /// handle. OMQ caps the queued bytes of each connection at 16 MiB or
+    /// `message_bytes`, whichever is larger.
     pub send_messages: u32,
-    /// Maximum queued messages per inbound OMQ connection.
+    /// Maximum queued and retained messages per inbound PEER connection,
+    /// under the same byte cap.
     pub receive_messages: u32,
+    /// Maximum connections sending into one PEER socket. OMQ counts a
+    /// replaced connection until its queue drains and refuses new ones while
+    /// full.
+    pub peers: usize,
+    /// Maximum queued messages per PUB subscriber or SUB source. SUB has no
+    /// byte cap, so this count bounds its memory.
+    pub publication_messages: u32,
     /// Maximum accepted native message bytes.
     pub message_bytes: usize,
     /// Positive finite drain interval. OMQ zero-linger close detaches its socket
     /// task; a positive interval also waits for endpoint destruction.
     pub close_linger: Duration,
+}
+
+impl TransportLimits {
+    /// PEER options with these queue, frame, and close bounds.
+    fn peer(self) -> omq_tokio::Options {
+        ozzy_runtime::transport::socket_options()
+            .router_mandatory(true)
+            .send_hwm(self.send_messages)
+            .peer_send_queue_capacity(self.send_messages as usize)
+            .recv_hwm(self.receive_messages)
+            .peer_recv_max_messages(self.receive_messages as usize)
+            .peer_max_peers(self.peers)
+            .max_message_size(self.message_bytes)
+            .linger(self.close_linger)
+    }
+
+    /// PEER `options` with the PUB/SUB queue bound.
+    fn publications(self, options: &omq_tokio::Options) -> omq_tokio::Options {
+        options
+            .clone()
+            .send_hwm(self.publication_messages)
+            .recv_hwm(self.publication_messages)
+    }
 }
 
 /// Owned dispatcher thread. OMQ owns its separate transport workers. Drop only
@@ -270,13 +303,10 @@ struct Monitors {
 impl Sockets {
     async fn bind(context: &Context, bindings: Bindings) -> Result<(Self, Monitors), StartupError> {
         let limits = bindings.limits;
-        let options = ozzy_runtime::transport::socket_options()
-            .identity(ozzy_runtime::transport::peer_identity(bindings.local))
-            .router_mandatory(true)
-            .send_hwm(limits.send_messages)
-            .recv_hwm(limits.receive_messages)
-            .max_message_size(limits.message_bytes)
-            .linger(limits.close_linger);
+        let options = limits
+            .peer()
+            .identity(ozzy_runtime::transport::peer_identity(bindings.local));
+        let publications = limits.publications(&options);
         let peer = context
             .socket(SocketType::Peer, options.clone())
             .identity_routing()
@@ -292,11 +322,11 @@ impl Sockets {
         let sockets = Self {
             data,
             peer,
-            reader: context.socket(SocketType::Pub, options.clone()),
+            reader: context.socket(SocketType::Pub, publications.clone()),
             follower: bindings
                 .follower
                 .as_ref()
-                .map(|_| context.socket(SocketType::Pub, options)),
+                .map(|_| context.socket(SocketType::Pub, publications)),
         };
         let result = async {
             sockets.peer.bind(bindings.peer).await?;
@@ -434,6 +464,8 @@ fn validate(plan: FrontendPlan<'_>) -> Result<(), StartupError> {
         || plan.local.as_bytes() == &[0; 16]
         || limits.send_messages == 0
         || limits.receive_messages == 0
+        || limits.peers == 0
+        || limits.publication_messages == 0
         || limits.message_bytes < 1024
         || limits.close_linger.is_zero()
     {

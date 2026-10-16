@@ -136,6 +136,11 @@ impl SharedReaders {
         })
     }
 
+    /// Whether a framed publication still waits for the dispatcher.
+    pub(super) fn publishing(&self) -> bool {
+        self.publication.waiting()
+    }
+
     pub(super) fn supports(message: &Message) -> bool {
         envelope(message).is_some_and(|e| {
             matches!(

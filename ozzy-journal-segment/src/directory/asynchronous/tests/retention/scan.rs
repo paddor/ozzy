@@ -39,7 +39,7 @@ fn retention_scratch_depends_on_group_limits_instead_of_segment_capacity() {
 }
 
 #[test]
-fn retention_checks_all_groups_and_zero_tail_after_canceled_reads() {
+fn retention_checks_all_groups_after_canceled_reads_and_ignores_the_tail() {
     let (mut controller, journal) = empty_journal();
     let journal = sealed(&mut controller, journal, BodyEncoding::Raw);
     let before = journal.current;
@@ -85,9 +85,28 @@ fn retention_checks_all_groups_and_zero_tail_after_canceled_reads() {
         ),
     )
     .unwrap();
+    // Bytes past the sealed end are unused capacity, as after reuse.
     drive(
         &mut controller,
         journal.access.write_all(&handle, 32767, &[1]),
+    )
+    .unwrap();
+    drive(
+        &mut controller,
+        journal.retention_segment(1, indexes::partition()),
+    )
+    .unwrap();
+    // Damage inside the sealed bytes still fails the scan.
+    let body = crate::SEGMENT_HEADER_BYTES as u64 + crate::ENTRY_HEADER_BYTES as u64;
+    let mut byte = drive(
+        &mut controller,
+        journal.access.read_range(&handle, body, 1, 1),
+    )
+    .unwrap();
+    byte[0] ^= 1;
+    drive(
+        &mut controller,
+        journal.access.write_all(&handle, body, &byte),
     )
     .unwrap();
     assert!(

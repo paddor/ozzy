@@ -55,7 +55,7 @@ impl AdminClient {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(from, self.broker);
+        assert_eq!(from.as_ref(), self.broker.as_ref());
         let (answered, reply) = admin::decode_reply(&reply.iter().next().unwrap()).unwrap();
         assert_eq!(answered, id);
         reply

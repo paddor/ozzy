@@ -20,6 +20,17 @@ async fn explicit_formatter_initializes_symmetric_shards_and_restart_keeps_elect
             }
             initialize_volumes(&checked, &local).unwrap();
             format_partition_journals(&checked, &local).await.unwrap();
+            // A local store appends to segment 1 first; a replicated one
+            // installs its log into the spare at its first election.
+            let zeroed = if mode == DeploymentMode::Single {
+                "segments/1.log"
+            } else {
+                "segments/spare.log"
+            };
+            for partition in &journals.partitions {
+                let path = partition.placement.directory.join(zeroed);
+                assert_eq!(std::fs::metadata(path).unwrap().len(), 1024 * 1024);
+            }
             let (devices, lanes) = DevicePools::start(&checked.plan).unwrap();
             let lanes: BTreeMap<_, _> = lanes
                 .into_iter()

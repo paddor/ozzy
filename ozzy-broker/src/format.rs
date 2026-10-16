@@ -9,6 +9,11 @@ use crate::{
     io_error,
 };
 
+/// Zeros written where each partition's first appends land. More would only
+/// lengthen format: later segments start on unwritten extents anyway, until
+/// retention recycles them.
+const FIRST_APPEND_ZEROS: u64 = 128 << 20;
+
 /// Format every broker-local partition once. Run offline, before starting a
 /// frontend. Volume bindings must already exist. Established or partial stores
 /// are refused. File execution and destruction run on shared device workers;
@@ -52,11 +57,15 @@ pub async fn format_partition_journals(
                         initialize_directory(&context.io, &directory).await?;
                     }
                 }
-                let opened = tokio::select! {
+                let mut opened = tokio::select! {
                     () = context.shutdown.closed() => return Ok(()),
                     result = partition.clone().format(context.io.clone(), JournalGeneration(uuid::Uuid::now_v7().as_u128())) => result?,
                 };
-                opened.journal.shutdown().await.map_err(|source| StartupError::Journal { path, source })?;
+                let journal_error = |source| StartupError::Journal { path: path.clone(), source };
+                // A new partition's first appends skip the slow writes into
+                // unwritten extents.
+                opened.journal.zero_first_segment(FIRST_APPEND_ZEROS).await.map_err(journal_error)?;
+                opened.journal.shutdown().await.map_err(journal_error)?;
             }
             context.ready()?;
             context.shutdown.closed().await;

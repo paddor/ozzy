@@ -305,27 +305,36 @@ pub fn enable() {
 }
 
 /// Whether this thread enabled stage diagnostics.
+#[inline]
 pub fn enabled() -> bool {
     ENABLED.with(Cell::get)
 }
 
 /// Capture a stage boundary only when explicitly enabled.
+// Inlined with `finish`: per-record SDK paths call both with diagnostics off.
+#[inline]
 pub fn start() -> Option<Instant> {
     enabled().then(Instant::now)
 }
 
 /// Record elapsed nanoseconds. Stage profiles also enqueue due PUB snapshots.
+#[inline]
 pub fn finish(stage: Stage, start: Option<Instant>) {
     if let Some(start) = start {
-        let elapsed = start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-        with_local(|local| {
-            if local.metrics.is_empty() {
-                local.metrics = vec![Metric::new(); STAGE_NAMES.len()];
-            }
-            local.metrics[stage as usize].observe(elapsed);
-            local.publish_if_due();
-        });
+        observe_stage(stage, start);
     }
+}
+
+#[inline(never)]
+fn observe_stage(stage: Stage, start: Instant) {
+    let elapsed = start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+    with_local(|local| {
+        if local.metrics.is_empty() {
+            local.metrics = vec![Metric::new(); STAGE_NAMES.len()];
+        }
+        local.metrics[stage as usize].observe(elapsed);
+        local.publish_if_due();
+    });
 }
 
 /// This thread's stage snapshot. Cross-thread aggregation belongs to SUB.

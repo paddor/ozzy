@@ -80,12 +80,7 @@ impl Followers {
             subscribers: BTreeMap::new(),
             routes,
         };
-        let options = ozzy_runtime::transport::socket_options()
-            .router_mandatory(true)
-            .send_hwm(frontend.limits.send_messages)
-            .recv_hwm(frontend.limits.receive_messages)
-            .max_message_size(frontend.limits.message_bytes)
-            .linger(frontend.limits.close_linger);
+        let options = frontend.limits.peer();
         let result = async {
             for (&(broker, _), &shard) in &transport.routes.destinations {
                 if transport.repair.contains_key(&(broker, shard)) {
@@ -116,8 +111,11 @@ impl Followers {
                     )
                     .await?;
             }
+            let publications = frontend.limits.publications(&options);
             for (&broker, endpoint) in &transport.routes.publications {
-                let socket = frontend.context.socket(SocketType::Sub, options.clone());
+                let socket = frontend
+                    .context
+                    .socket(SocketType::Sub, publications.clone());
                 transport.subscribers.insert(broker, socket.clone());
                 socket.subscribe(Bytes::new()).await?;
                 socket.connect(endpoint.clone()).await?;

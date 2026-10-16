@@ -762,6 +762,7 @@ async fn sdk_activation_over_shared_links_allocates_epochs_and_reports_typed_rej
         initial: Start::Earliest,
         policy: Policy::LocalDurable,
     };
+    harness.quiesce().await;
     let before = accepted(&harness);
     let mut pending = pin!(links.group_assign(hint.primary, request));
     assert!(futures::poll!(pending.as_mut()).is_pending());

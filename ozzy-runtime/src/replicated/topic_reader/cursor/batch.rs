@@ -2,7 +2,10 @@
 
 use super::Decoder;
 use bytes::Bytes;
-use ozzy_proto::data::{DataLimits, OwnedRecord, OwnedRecordIter, OwnedRecords};
+use ozzy_proto::{
+    append::PayloadEncoding,
+    data::{DataLimits, Encoding, OwnedRecord, OwnedRecordIter, OwnedRecords},
+};
 
 pub(super) struct FrameRecords {
     records: OwnedRecords,
@@ -16,7 +19,14 @@ pub(super) struct Batch {
 
 impl FrameRecords {
     /// Records decoded from a delivery, kept alive with its header frame.
-    pub(super) fn new(records: OwnedRecords, owner: Bytes) -> Self {
+    /// Every received frame carries the same input reservation: raw payloads
+    /// alias the payload frame, and a decompressed delivery shares one owner.
+    pub(super) fn new(records: OwnedRecords, encoding: PayloadEncoding, owner: Bytes) -> Self {
+        let records = if encoding == PayloadEncoding::Raw {
+            records
+        } else {
+            records.with_payload_owner(|bytes| retained(bytes, owner.clone()))
+        };
         Self { records, owner }
     }
 
@@ -35,6 +45,7 @@ impl FrameRecords {
 }
 
 impl Batch {
+    #[inline]
     pub(super) fn next(
         &mut self,
         decoder: &mut Decoder,
@@ -43,15 +54,25 @@ impl Batch {
         let Some(record) = self.records.next() else {
             return Ok(None);
         };
+        // Only a compressed record decodes into new storage. A raw record
+        // skips the decoder so it is not moved through another call.
+        if record.encoding == Encoding::Raw {
+            return Ok(Some(record));
+        }
         let mut record = decoder.decode(record, limits)?;
         for bytes in &mut record.payload {
-            *bytes = Bytes::from_owner(RecordFrame {
-                bytes: std::mem::take(bytes),
-                _owner: self.owner.clone(),
-            });
+            *bytes = retained(std::mem::take(bytes), self.owner.clone());
         }
         Ok(Some(record))
     }
+}
+
+/// `bytes` that also keep the header frame, and with it the reservation.
+fn retained(bytes: Bytes, owner: Bytes) -> Bytes {
+    Bytes::from_owner(RecordFrame {
+        bytes,
+        _owner: owner,
+    })
 }
 
 struct RecordFrame {

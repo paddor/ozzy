@@ -365,12 +365,12 @@ async fn paused_repair_source_preserves_control_other_shards_and_reconnect() {
             .send_to(local().as_bytes(), Message::single("held repair"))
             .await
             .unwrap();
-        let (receipt, body) = bound.recv_from_source(None).await.unwrap();
+        let (receipt, body) = bound.recv_with_receipt(None).await.unwrap();
         assert_eq!(
             receipt.identity_bytes().as_deref(),
             Some(identities[1].as_bytes().as_slice())
         );
-        let old_source = receipt.source().unwrap().clone();
+        let old_source = receipt.lane().unwrap().clone();
         bound.unshift(receipt, body).unwrap();
         // An unshifted repair lane must not intercept either eligible source.
         for index in [0, 2] {
@@ -378,7 +378,7 @@ async fn paused_repair_source_preserves_control_other_shards_and_reconnect() {
                 .send_to(local().as_bytes(), Message::single("progress"))
                 .await
                 .unwrap();
-            let (receipt, _) = bound.recv_from_source(None).await.unwrap();
+            let (receipt, _) = bound.recv_with_receipt(None).await.unwrap();
             assert_eq!(
                 receipt.identity_bytes().as_deref(),
                 Some(identities[index].as_bytes().as_slice())
@@ -403,11 +403,11 @@ async fn paused_repair_source_preserves_control_other_shards_and_reconnect() {
             .send_to(local().as_bytes(), Message::single("replacement"))
             .await
             .unwrap();
-        let (receipt, body) = bound.recv_from_source(None).await.unwrap();
+        let (receipt, body) = bound.recv_with_receipt(None).await.unwrap();
         assert_eq!(body.part_slice(0), Some(b"replacement".as_slice()));
-        assert_ne!(receipt.source().unwrap(), &old_source);
+        assert_ne!(receipt.lane().unwrap(), &old_source);
         assert!(matches!(
-            bound.try_recv_from_source(Some(&old_source)),
+            bound.try_recv_with_receipt(Some(&old_source)),
             Err(omq_tokio::Error::Closed)
         ));
         replacement.into_inner().close().await.unwrap();

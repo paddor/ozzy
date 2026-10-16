@@ -228,6 +228,9 @@ impl PartitionActors {
                 .receive(message, hint, ready)
                 .map_err(|source| PartitionError::Actor { group, source });
         }
+        if !deferred && publishing(self.readers[slot].as_ref(), &mut self.actors[slot]) {
+            return Ok(NativeReceive::Busy);
+        }
         let received = if deferred {
             native.intake.defer(message, link, hint)
         } else {
@@ -235,4 +238,12 @@ impl PartitionActors {
         };
         received.map_err(|source| PartitionError::Native { group, source })
     }
+}
+
+/// A leader hands its framed publication to the dispatcher before it admits
+/// more writes, so intake cannot starve the reader path. Slow SUBs retain
+/// only sent frames and never hold writers back.
+fn publishing(readers: Option<&SharedReaders>, actor: &mut PartitionActor) -> bool {
+    readers.is_some_and(SharedReaders::publishing)
+        && actor.read_access().is_some_and(|access| access.0.is_some())
 }

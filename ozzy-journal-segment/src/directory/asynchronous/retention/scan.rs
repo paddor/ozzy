@@ -1,4 +1,5 @@
-//! One physical group at a time; sealed authority and zero tails remain checked.
+//! One physical group at a time; sealed authority remains checked. Bytes
+//! past the sealed end are unused capacity.
 
 use super::super::{DirectoryError, Journal, SegmentReference, groups::GroupScope};
 use crate::{CodecError, DecodedOperation, RetentionFloors};

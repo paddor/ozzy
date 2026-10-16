@@ -47,6 +47,19 @@ fn submit(
         "{:?}",
         reply.outcome
     );
+    // Durable evidence trails the commit. Let it finish, so steps that later
+    // hold I/O start from a quiet partition.
+    drive(
+        controller,
+        std::future::poll_fn(|cx| {
+            assert!(actor.poll_progress(cx).is_pending());
+            if actor.storage_idle() {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        }),
+    );
 }
 
 pub(super) fn fixture(

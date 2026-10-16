@@ -128,6 +128,8 @@ pub struct ReplicaActor {
     journal_scope: Scope,
     activated: Option<(Scope, JournalGeneration)>,
     ack_at: Duration,
+    // Last vote queued for the primary, and when.
+    acked: Option<(Control, Duration)>,
     status: SharedStatus,
     ingress: ingress::Ingress,
     submitters: Vec<ProposalSubmitter>,
@@ -243,6 +245,13 @@ impl ReplicaActor {
                     },
                 ));
                 self.promise = Some(ticket);
+            }
+            Action::Broadcast(Control::Commit(commit)) => {
+                for voter in 0..3 {
+                    if self.configuration.voters()[voter] != self.local {
+                        self.announce(voter, commit, true)?;
+                    }
+                }
             }
             Action::Broadcast(control) => {
                 for to in *self.configuration.voters() {
@@ -436,7 +445,8 @@ impl ReplicaActor {
         if now < self.ack_at {
             return Ok(());
         }
-        self.ack_at = now.saturating_add(self.config.timing.retransmit);
+        let retransmit = self.config.timing.retransmit;
+        self.ack_at = now.saturating_add(retransmit);
         let primary = self.configuration.primary(self.driver.scope().view);
         if primary == self.local {
             return Ok(());
@@ -458,7 +468,22 @@ impl ReplicaActor {
                 Control::PrepareRetained { ack }
             }
         };
-        self.control(primary, control)
+        // An event asks for the current vote. An unchanged one waits for the
+        // retransmit timer, which also covers a lost packet.
+        if let Some((vote, at)) = self.acked
+            && vote == control
+            && now < at.saturating_add(retransmit)
+        {
+            self.ack_at = at.saturating_add(retransmit);
+            return Ok(());
+        }
+        // A missing session or a full queue drops it; the next call retries.
+        let before = self.outbox.queued(primary, SendClass::Control);
+        self.control(primary, control)?;
+        if self.outbox.queued(primary, SendClass::Control) != before {
+            self.acked = Some((control, now));
+        }
+        Ok(())
     }
 }
 

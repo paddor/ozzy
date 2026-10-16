@@ -46,13 +46,15 @@ impl Wake for Wakes {
     }
 }
 
-fn hold_sync(controller: &mut Controller, actor: &mut LocalActor) {
+/// Deliver every job except writes. An `O_DSYNC` write is the durability
+/// boundary, so held writes keep their operations unconfirmed.
+fn hold_writes(controller: &mut Controller, actor: &mut LocalActor) {
     for _ in 0..1000 {
         super::super::actor::pump(actor);
         for (id, _) in controller.jobs() {
             if !matches!(
                 controller.operation(id).unwrap().unprotected(),
-                Operation::Sync { .. }
+                Operation::Write { .. }
             ) {
                 controller.execute(id, Effect::Normal).unwrap();
                 controller.deliver(id).unwrap();
@@ -63,7 +65,7 @@ fn hold_sync(controller: &mut Controller, actor: &mut LocalActor) {
 }
 
 #[test]
-fn redundant_producer_waits_for_original_sync_without_spinning_or_confirming_early() {
+fn redundant_producer_waits_for_original_write_without_spinning_or_confirming_early() {
     let (mut controller, io) = setup();
     let mut actor = actor(&mut controller, io);
     let mut lane = actor.take_submitter().unwrap();
@@ -84,9 +86,9 @@ fn redundant_producer_waits_for_original_sync_without_spinning_or_confirming_ear
             .all(|work| poll(work.as_mut()).is_pending())
     );
 
-    // Deliver writes and metadata jobs, but never a sync. Transport receipt and
-    // write completion still do not establish the original's confirmation.
-    hold_sync(&mut controller, &mut actor);
+    // Deliver every job except writes. Admission and transport receipt still
+    // do not establish the original's confirmation.
+    hold_writes(&mut controller, &mut actor);
     assert_eq!(actor.snapshot().accepted.op.0, 4);
     assert_eq!(actor.snapshot().applied.op.0, 3);
     assert!(
@@ -172,7 +174,7 @@ fn fencing_a_deferred_producer_never_admits_its_duplicate_results() {
         super::super::actor::pump(&mut actor);
     }
     assert!(poll(second.as_mut()).is_pending());
-    hold_sync(&mut controller, &mut actor);
+    hold_writes(&mut controller, &mut actor);
     second.fence_unadmitted();
     for _ in 0..100 {
         super::super::actor::pump(&mut actor);
@@ -202,7 +204,7 @@ fn other_producers_proceed_while_a_duplicate_waits_for_its_original() {
         buffer.prepare_append(request(writer, first, 1)).unwrap();
         pending.push(Box::pin(lane.try_submit(buffer).unwrap()));
     }
-    hold_sync(&mut controller, &mut actor);
+    hold_writes(&mut controller, &mut actor);
     assert_eq!(
         actor.snapshot().accepted.op.0,
         5,
@@ -259,7 +261,7 @@ fn fencing_a_parked_duplicate_releases_the_producers_queued_appends() {
     let (mut controller, io) = setup();
     let mut actor = actor(&mut controller, io);
     let mut lane = actor.take_submitter().unwrap();
-    // Writer 12's original stays accepted-only under held syncs. Writer 30's
+    // Writer 12's original stays accepted-only under held writes. Writer 30's
     // duplicate parks behind it and its fresh record queues behind that.
     let mut pending = Vec::new();
     for (writer, first) in [(12, 0), (30, 0), (30, 1)] {
@@ -267,7 +269,7 @@ fn fencing_a_parked_duplicate_releases_the_producers_queued_appends() {
         buffer.prepare_append(request(writer, first, 1)).unwrap();
         pending.push(Box::pin(lane.try_submit(buffer).unwrap()));
     }
-    hold_sync(&mut controller, &mut actor);
+    hold_writes(&mut controller, &mut actor);
     assert_eq!(actor.snapshot().accepted.op.0, 4);
     assert_eq!(actor.snapshot().applied.op.0, 3);
     assert!(
@@ -276,7 +278,7 @@ fn fencing_a_parked_duplicate_releases_the_producers_queued_appends() {
             .all(|work| poll(work.as_mut()).is_pending())
     );
     pending[1].fence_unadmitted();
-    hold_sync(&mut controller, &mut actor);
+    hold_writes(&mut controller, &mut actor);
     let Poll::Ready(fenced) = poll(pending[1].as_mut()) else {
         panic!("fenced parked proposal must finish");
     };

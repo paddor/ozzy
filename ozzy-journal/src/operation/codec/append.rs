@@ -384,7 +384,7 @@ fn materialize_prepared_records<'a>(
         if descriptor.encoding != ozzy_proto::data::Encoding::Raw {
             return Err(OperationCodecError::InvalidPreparedPayload);
         }
-        let mut parts = SmallVec::new();
+        let mut parts = SmallVec::<[Bytes; 2]>::new();
         for length in descriptor.part_lengths {
             let end = offset
                 .checked_add(length)
@@ -396,7 +396,7 @@ fn materialize_prepared_records<'a>(
         records.push(ozzy_proto::data::OwnedRecord {
             encoding: descriptor.encoding,
             message_id: descriptor.message_id,
-            payload: parts,
+            payload: parts.into_iter().collect(),
         });
     }
     if offset != payload.len() {

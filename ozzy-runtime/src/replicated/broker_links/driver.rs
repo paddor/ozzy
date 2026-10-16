@@ -3,7 +3,9 @@ use std::{collections::BTreeMap, rc::Rc, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use futures::StreamExt;
-use omq_tokio::{IdentitySocket, Message, MonitorEvent, MonitorStream, MonitorTryRecvError};
+use omq_tokio::{
+    Identity, IdentitySocket, Message, MonitorEvent, MonitorStream, MonitorTryRecvError,
+};
 use ozzy_proto::{EnvelopeLimits, NodeId, Opcode, Packet, RequestId, decode_packet};
 use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
 
@@ -54,7 +56,7 @@ pub(super) enum Registration {
 enum Event {
     Registration(Registration),
     Inbox(readers::Registration),
-    Control((Bytes, Message)),
+    Control((Identity, Message)),
     Data((omq_tokio::ReceiveReceipt, Message)),
     Monitor(MonitorEvent),
     Wake,
@@ -91,7 +93,7 @@ pub(super) struct Driver {
     local: Local,
     shared: Arc<Shared>,
     cursor: usize,
-    paused: BTreeMap<NodeId, omq_tokio::ReceiveSource>,
+    paused: BTreeMap<NodeId, omq_tokio::ReceiveLane>,
 }
 
 impl Driver {
@@ -194,8 +196,12 @@ impl Driver {
         tokio::task::spawn_local(readers::initialize(inbox, self.shared.clone()));
     }
 
-    fn receive_control(&mut self, identity: Bytes, body: Message) -> Result<(), BrokerLinkError> {
-        let Some(identity) = crate::transport::native_peer_identity(identity) else {
+    fn receive_control(
+        &mut self,
+        identity: &Identity,
+        body: Message,
+    ) -> Result<(), BrokerLinkError> {
+        let Some(identity) = crate::transport::native_peer_identity(identity.to_bytes()) else {
             return Ok(());
         };
         let Some(remote) = <[u8; 16]>::try_from(identity.as_ref())
@@ -247,7 +253,7 @@ impl Driver {
             .readers
             .receive(remote, &message, packet, self.links[0].limits)
             .is_err()
-            && let Some(source) = receipt.source().cloned()
+            && let Some(source) = receipt.lane().cloned()
         {
             match self.data.unshift(receipt, body) {
                 Ok(()) => {
@@ -277,7 +283,7 @@ impl Driver {
             match event {
                 Event::Registration(registration) => self.register(registration),
                 Event::Inbox(registration) => self.install(registration),
-                Event::Control((identity, body)) => self.receive_control(identity, body)?,
+                Event::Control((identity, body)) => self.receive_control(&identity, body)?,
                 Event::Data((receipt, body)) => self.receive_data(receipt, body)?,
                 Event::Monitor(event) => self.observe(event)?,
                 Event::Wake => {}
@@ -314,13 +320,13 @@ impl Driver {
         full |= drained(|| match self.control.try_recv_from() {
             Ok((identity, body)) => {
                 let bytes = body.byte_len();
-                self.receive_control(identity, body).map(|()| Some(bytes))
+                self.receive_control(&identity, body).map(|()| Some(bytes))
             }
             Err(omq_tokio::Error::WouldBlock) => Ok(None),
             Err(error) => Err(error.into()),
         })?;
         self.retry_paused()?;
-        full |= drained(|| match self.data.try_recv_from_source(None) {
+        full |= drained(|| match self.data.try_recv_with_receipt(None) {
             Ok((receipt, body)) => {
                 let bytes = body.byte_len();
                 self.receive_data(receipt, body).map(|()| Some(bytes))
@@ -341,7 +347,7 @@ impl Driver {
     /// broker connections runnable while retained reader backing is full.
     fn retry_paused(&mut self) -> Result<(), BrokerLinkError> {
         for (remote, source) in std::mem::take(&mut self.paused) {
-            match self.data.try_recv_from_source(Some(&source)) {
+            match self.data.try_recv_with_receipt(Some(&source)) {
                 Ok((receipt, body)) => self.receive_data(receipt, body)?,
                 Err(omq_tokio::Error::WouldBlock) => {
                     self.paused.insert(remote, source);
@@ -395,7 +401,7 @@ impl Driver {
             _ = waits.next() => Event::Wake,
             _ = ready.next() => Event::Wake,
             received = self.control.recv_from() => Event::Control(received?),
-            received = self.data.recv_from_source(None) => Event::Data(received?),
+            received = self.data.recv_with_receipt(None) => Event::Data(received?),
             event = self.monitor.recv() => Event::Monitor(event.map_err(|_| {
                 BrokerLinkError::Failed("SDK transport monitor lost events".into())
             })?),

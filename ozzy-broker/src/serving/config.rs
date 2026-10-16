@@ -101,12 +101,15 @@ impl Config {
             max_metadata_bytes: 64 * 1024,
             max_payload_bytes: body,
         };
-        let transport = transport_limits(body)?;
         require_follower_pub_endpoints(checked)?;
-        let storage = receive_storage(checked, body, transport.message_bytes)?;
-        let buffers = ReceiveBuffers::new(envelope, storage).map_err(failure)?;
         let brokers = peer_endpoints(checked, local)?;
         let followers = follower_routes(checked, local, &brokers)?;
+        // SDK links, broker links, and repair links from each remote shard,
+        // each with room for a replaced connection that still drains.
+        let senders = clients + brokers.len() + followers.incoming.len();
+        let transport = transport_limits(body, 2 * senders)?;
+        let storage = receive_storage(checked, body, transport.message_bytes)?;
+        let buffers = ReceiveBuffers::new(envelope, storage).map_err(failure)?;
         let budgets = shard_budgets(checked);
         let catalog = catalog(checked)?;
         Ok(Self {
@@ -314,13 +317,15 @@ impl Config {
 }
 
 /// Bounds of the broker transport around the largest topic append body.
-fn transport_limits(body: usize) -> Result<TransportLimits, StartupError> {
+fn transport_limits(body: usize, peers: usize) -> Result<TransportLimits, StartupError> {
     let message_bytes = body
         .checked_add(64 * 1024 + 4096)
         .ok_or_else(|| failure("transport size overflow"))?;
     Ok(TransportLimits {
-        send_messages: 64,
-        receive_messages: 64,
+        send_messages: 1024,
+        receive_messages: 1024,
+        peers,
+        publication_messages: 64,
         message_bytes,
         close_linger: Duration::from_millis(100),
     })

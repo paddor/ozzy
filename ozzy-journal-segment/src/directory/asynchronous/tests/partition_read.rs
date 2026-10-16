@@ -580,6 +580,22 @@ fn retirement_drops_cached_read_handles_so_cleanup_frees_the_segment() {
     let path = std::path::Path::new("/group/segments/1.log");
     let segment = controller.image().bytes(path, false).unwrap().len()
         + controller.image().bytes(path, true).unwrap().len();
+    // With a spare already kept, cleanup unlinks the segment.
+    let spare = drive(
+        &mut controller,
+        journal.access.open(
+            "/group/segments/spare.log".into(),
+            ozzy_io::OpenMode::CreateNew,
+            false,
+            false,
+        ),
+    )
+    .unwrap();
+    drive(
+        &mut controller,
+        journal.access.done(Operation::Close { handle: spare }),
+    )
+    .unwrap();
     let before = controller.image().stored_bytes();
     let cleanup = drive(&mut controller, journal.reclaim_unreferenced_segments(1)).unwrap();
     assert_eq!(cleanup.removed_segment_ids, [1]);

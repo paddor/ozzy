@@ -143,10 +143,12 @@ impl ReplicaActor {
         if self.replicated() {
             self.driver.complete_buffered_write(ticket, now)?;
         } else {
-            // O_DSYNC data is on disk; the vote also needs DURABLE evidence.
-            // The written group joins the next barrier batch, which a due
-            // batch starts now instead of after the running turn.
-            self.driver.complete_write(ticket)?;
+            // `O_DSYNC` made the write durable, and later seals mark it, so
+            // the vote goes now. The group still joins the next `DURABLE`
+            // publication, which a due batch starts now.
+            self.driver.complete_durable_write(ticket, now)?;
+            self.ack_at = now;
+            self.work.last_persisted = Some(now);
             self.work.needs_sync = true;
             // A write ticket spans at most one pipeline of operations.
             self.work.sync_batch_operations += (ticket.through().0 - ticket.first().0 + 1) as usize;

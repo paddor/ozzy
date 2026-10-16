@@ -250,14 +250,16 @@ fn settle(
     intake: &mut NativeIntake,
     output: &mut Vec<Message>,
 ) {
+    // A round without I/O jobs also finishes trailing durable evidence.
     for _ in 0..10000 {
         progress(actor, intake, None, output, false);
-        for (id, _) in controller.jobs() {
+        let jobs = controller.jobs();
+        if jobs.is_empty() && !intake.has_work() && actor.storage_idle() {
+            return;
+        }
+        for (id, _) in jobs {
             controller.execute(id, Effect::Normal).unwrap();
             controller.deliver(id).unwrap();
-        }
-        if !intake.has_work() {
-            return;
         }
     }
     panic!("native partition intake did not settle");

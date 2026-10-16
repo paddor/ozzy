@@ -4,7 +4,7 @@
 use crate::directory::{DirectoryError, validate_operation_bodies};
 use crate::{
     BodyEncoding, CanonicalOperation, DecodeLimits, Digest, JournalLimits, LogPosition, Manifest,
-    OperationLimits, SegmentHeader, SegmentReference, TailState, scan_segment,
+    OperationLimits, SegmentHeader, SegmentReference, TailState,
 };
 use ozzy_journal::operation::{logical_operation_digest, validate_operation_body};
 
@@ -279,11 +279,14 @@ pub(crate) fn validate_image(
     journal: JournalLimits,
 ) -> Result<(), DirectoryError> {
     let reference = manifest.segments[index];
-    let scan = scan_segment(
+    // The active segment ends at its first invalid group; bytes after it
+    // are unused capacity.
+    let scan = crate::codec::scan(
         image,
         reference.first_group_number,
         reference.first_chain,
         journal.decode,
+        reference.sealed.is_none(),
     )?;
     if scan.header.group_id() != manifest.identity.group_id
         || scan.header.segment_id() != reference.segment_id

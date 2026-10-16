@@ -1,7 +1,6 @@
 //! Owned frame cursor over validated immutable record descriptors.
 
 use bytes::{Buf, Bytes};
-use smallvec::SmallVec;
 
 use super::{RecordIter, Records};
 use crate::{MessageId, layout::Fixed};
@@ -14,7 +13,7 @@ pub struct OwnedRecord {
     /// Stable application identity.
     pub message_id: MessageId,
     /// Opaque payload parts, including empty parts.
-    pub payload: SmallVec<[Bytes; 2]>,
+    pub payload: super::RecordPayload,
 }
 
 /// Validated records with ownership of their exact metadata/payload frame slices.
@@ -78,6 +77,16 @@ impl OwnedRecords {
         records.payload.len()
     }
 
+    /// Retain the payload through one owner instead of one per record.
+    /// `owner` must return the same bytes, such as a wrapper of its input.
+    #[must_use]
+    pub fn with_payload_owner(self, owner: impl FnOnce(Bytes) -> Bytes) -> Self {
+        let (start, len) = (self.payload.as_ptr(), self.payload.len());
+        let payload = owner(self.payload);
+        debug_assert!(payload.as_ptr() == start && payload.len() == len);
+        Self { payload, ..self }
+    }
+
     /// Consume the batch into a lazy cursor; no payload copy or record table.
     pub fn into_records(self) -> OwnedRecordIter {
         OwnedRecordIter(self)
@@ -95,6 +104,9 @@ pub struct OwnedRecordIter(OwnedRecords);
 impl Iterator for OwnedRecordIter {
     type Item = OwnedRecord;
 
+    // Inlined into readers in other crates: the raw single-part path runs
+    // once per delivered record.
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         let count = self.0.count.checked_sub(1)?;
         if let Some(entry) = self.0.descriptors.first_chunk::<24>()
@@ -113,9 +125,20 @@ impl Iterator for OwnedRecordIter {
             return Some(OwnedRecord {
                 encoding: super::Encoding::Raw,
                 message_id,
-                payload: smallvec::smallvec![payload],
+                payload: payload.into(),
             });
         }
+        self.next_general()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.0.count, Some(self.0.count))
+    }
+}
+
+impl OwnedRecordIter {
+    /// Encoded or multipart records, through the general descriptor cursor.
+    fn next_general(&mut self) -> Option<OwnedRecord> {
         let mut cursor = self.0.borrowed();
         let record = cursor.next()?;
         let record = OwnedRecord {
@@ -138,14 +161,11 @@ impl Iterator for OwnedRecordIter {
         self.0.count = remaining.2;
         Some(record)
     }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.0.count, Some(self.0.count))
-    }
 }
 
 impl ExactSizeIterator for OwnedRecordIter {}
 
+#[inline]
 fn retain_tail(bytes: &mut Bytes, remaining: usize) {
     if remaining == 0 {
         // clear()/advance(len) can retain backing storage. Match slice_ref's

@@ -63,9 +63,8 @@ fn donor_during_sync(policy: QuorumPolicy) {
         actors.iter().map(Actor::status).collect::<Vec<_>>(),
         controller.jobs()
     );
-    if policy == QuorumPolicy::Durable {
-        assert!(poll(pending.as_mut()).is_pending());
-    }
+    // Completed `O_DSYNC` writes confirm the proposal; the held sync only
+    // publishes durable evidence, which the donor must still wait for.
     let (request, message) = recovery_request(actors[0].status().scope);
     actors[0].receive(&message, now).unwrap();
     for _ in 0..20 {
@@ -73,7 +72,6 @@ fn donor_during_sync(policy: QuorumPolicy) {
         finish_jobs(&mut controller, true);
     }
     assert!(actors[0].status().application_ready);
-    assert!(poll(pending.as_mut()).is_pending());
     let mut confirmed = false;
     let mut replied = false;
     for _ in 0..10000 {

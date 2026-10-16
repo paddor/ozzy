@@ -76,7 +76,7 @@ mod tests {
                 decoded_bytes: claimed,
             },
             message_id: MessageId::new(),
-            payload: smallvec::smallvec![Bytes::from(payload)],
+            payload: Bytes::from(payload).into(),
         }
     }
 

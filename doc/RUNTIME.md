@@ -156,6 +156,10 @@ On the broker:
   keep flowing. The transport carries the pause back to the sender.
 - A full lane for follower PUB input drops the frame. The follower repairs
   over PEER.
+- A full PUB socket keeps its refused frame until OMQ reports space. That
+  socket takes no other frame meanwhile, so the shards behind it hold
+  intake. Inside OMQ a slow subscriber still loses frames and repairs over
+  PEER.
 - A reply to a full destination waits for that destination's send progress.
   Later replies to it keep their order. Other destinations continue.
 - Dequeue frees a queue slot. Bytes return when the last payload alias drops.
@@ -174,6 +178,11 @@ On the SDK:
 
 - Each partition wakes on its own events: storage completions, proposals,
   returned buffers, delivered input, and its next timer.
+- A shard turn delivers input first, then visits the marked partitions.
+  A visit repeats, up to four rounds, while the partition makes progress or
+  wakes itself, instead of waiting for later turns.
+- Freed reply slots and returned port capacity wake the shard only after a
+  send was refused.
 - A periodic safety sweep visits every partition. Work that only the sweep
   finds counts as `partition_sweep_progress`; a nonzero value means a missed
   wakeup.

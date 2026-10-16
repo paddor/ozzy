@@ -114,8 +114,10 @@ impl Transmitter {
     }
 
     /// Enable loss-tolerant PUB delivery. PEER reservations cover repair only.
+    /// Receivers report PUB receipt unasked, so new work waits for the probe delay.
     pub fn enable_broadcast(&mut self) {
         self.broadcast = true;
+        self.probes.pace_new_work();
     }
 
     /// A correlated probe found missing publications beyond existing reservations.

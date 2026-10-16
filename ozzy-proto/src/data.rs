@@ -15,6 +15,7 @@ mod buffer;
 pub use batch::{BatchIter, BatchRecord, PayloadRef, RecordBatch, TinyRecords};
 mod indexed;
 mod owned;
+mod payload;
 pub use buffer::RecordBuffer;
 pub(super) use descriptors::validate_raw_record_entries;
 pub use descriptors::{
@@ -22,6 +23,7 @@ pub use descriptors::{
 };
 pub use indexed::{EncodedParts, IndexedRecords};
 pub use owned::{OwnedRecord, OwnedRecordIter, OwnedRecords};
+pub use payload::RecordPayload;
 pub(super) use records::validate_record_entries;
 pub use records::{DecodedRecord, Parts, RecordIter, Records, decode_records};
 

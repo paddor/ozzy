@@ -169,7 +169,7 @@ async fn real_backends_exchange_segments() {
             .unwrap();
         assert_eq!(writer.durable_position().group_number(), 0);
         assert_eq!(writer.sync_through(first).await.unwrap(), first);
-        writer.zero_remainder().await.unwrap();
+        writer.zero_ahead(u64::MAX).await.unwrap();
         writer.close().await.unwrap();
         // The next configuration continues the same file in strict recovery.
         let (other, other_io, exchanged) = real(index + 1);

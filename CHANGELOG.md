@@ -6,8 +6,21 @@
 
 - `BrokerLinks::routes` is async. The SDK owner thread registers the topic,
   so routing state needs no lock shared with application threads.
-- The re-exported `Context` and `Endpoint` come from omq-tokio 0.26 instead
+- The re-exported `Context` and `Endpoint` come from omq-tokio 0.29 instead
   of 0.25.
+- Segment group seals record a durable mark: the highest group already durable
+  when the group was prepared. Segments written by earlier builds no longer
+  validate; format stores again.
+- `TransportLimits` has a `publication_messages` field that bounds PUB and
+  SUB queues; `send_messages` and `receive_messages` bound PEER only.
+- `TransportLimits` has a `peers` field: the most connections one PEER socket
+  admits. Brokers set twice their clients, brokers, and repair aliases.
+- Telemetry event `replica_publication_send_drop` is now
+  `replica_publication_send_wait`: a full follower PUB socket keeps the frame
+  and sends it once it has space.
+- `TopicRecord::payload` is a `RecordPayload` instead of a `SmallVec`. It
+  holds one part directly and more parts in one boxed slice, 32 bytes instead
+  of 72, and derefs to `[Bytes]`.
 
 ### Added
 
@@ -16,6 +29,8 @@
   broker confirmations.
 - `GroupReader` for automatic consumer groups: membership, sticky partition
   assignment, cooperative handoff, and resume from persisted cursors.
+- `TopicReader::try_next` returns a record that is ready without waiting, so
+  an application drains buffered records without an await per record.
 - Optional shard and disk-worker telemetry with thread-owned OMQ PUB sockets,
   a shared IPC SUB collector, and bounded diagnostic logs.
 - `Broker::ready` resolves once every local partition has recovered and either
@@ -55,9 +70,45 @@
   and commit rates; replication progress and follower lag; consumer groups
   with members and cursor lag; event counters per thread with rates. Keys
   and mouse clicks pick screens, panes, and rows.
+- Telemetry counts reader publications that waited for space in the
+  broker's full PUB socket (`reader_publication_send_wait`), as it does for
+  followers.
+- `TopicReaderStats::live_gaps` counts live publications that arrived past a
+  gap and moved the reader to replay.
 
 ### Changed
 
+- A new segment, from a roll or from the log a new view installs, takes the
+  partition's spare (`segments/spare.log`) when there is one. Cleanup keeps
+  one unselected segment file as the spare instead of unlinking it. Appends
+  then overwrite written blocks instead of converting unwritten extents,
+  which costs a metadata commit per `O_DSYNC` write on XFS. A byte-limited
+  partition can use one segment more than `max_bytes` on disk.
+- `format` writes zeros once where a store's first appends land: segment 1
+  of a local store, or a spare in a replicated store, whose first election
+  installs its log into a new segment. That is up to 128 MiB per partition.
+  Fixed-load p50 for 128 B records: disk quorum 4.6 to 3.3-3.5 ms at 100
+  records/s, 9-10 to 5.1-5.5 ms at 1k/s, and 12.6 to 10.5 ms at 10k/s;
+  single durable 2.9 to 2.1 ms, 2.1 to 1.2 ms, and 5.4 to 2.9 ms.
+- Recovery ends an active segment's log at its first invalid group and
+  accepts any bytes after it, such as groups from an earlier use of the
+  file. It overwrites the seals of later groups of this use instead of
+  zeroing the rest of the file. Sealed segments are read only up to their
+  sealed length, and opening reads the whole active segment file, up to
+  `segment_bytes`.
+- Partitions publish `DURABLE` after 20 ms with no write in flight or after
+  half a window of writes, instead of after every write, where it competed with
+  writes for the disk. Fixed-load p50 for 128 B records: disk quorum 16 to
+  9-10 ms at 1k records/s and 15.7 to 12.6 ms at 10k/s; single durable 2.6 to
+  2.1 ms and 6.6 to 5.4 ms.
+- Disk-quorum votes and single-durable confirmations leave when the `O_DSYNC`
+  write completes instead of after the separate `DURABLE` publication, which
+  now follows off that path. Fixed-load p50 for 128 B records: single durable
+  3.7 to 2.7 ms at 100 records/s and 8.0 to 6.6 ms at 10k/s; disk quorum 5.6
+  to 4.7 ms and 17.6 to 15.7 ms.
+- Recovery refuses a damaged active-segment group that a later valid group
+  marks durable, since that write had completed. A damaged group no later
+  group marks still ends the log, as an unfinished write.
 - Broker threads have slash names: `ozzy/dispatch`, `ozzy/shard/N`,
   `ozzy/disk/N`, `ozzy/disk/pN`, `ozzy/disk/aio`, `ozzy/admin`, `ozzy/drain`,
   and OMQ's `ozzy/omq/IO/N`, matching the SDK's `ozzy/sdk` and `ozzy/omq`.
@@ -129,6 +180,41 @@
   timing and PUB snapshots stay opt-in. Journal read, write, delivery,
   progress, and dedup counters are telemetry events; the `storage-metrics`
   feature and its process-wide counters are gone.
+- A partition takes no new appends while its framed reader publication waits
+  for the broker's publication slot, so intake cannot run ahead of live
+  delivery on a busy core. Single-broker saturation delivery p99 for 128 B to
+  8 KiB records fell from 68-99 ms to 48-63 ms.
+- SDK readers keep raw payloads as slices of the received frame and give a
+  decompressed delivery one shared owner, instead of allocating an owner per
+  record. At disk-quorum saturation, reader allocations fell from about 211k
+  to 5k per second.
+- Broker PEER sockets queue up to 1024 messages per connection instead of 64,
+  capped by OMQ at 16 MiB or one maximum message, whichever is larger. Reader
+  and follower PUB/SUB queues stay at 64 messages, since SUB has no byte limit.
+- Leaders send fewer replication packets per append. Followers report PUB
+  receipt unasked, so new work no longer triggers an immediate probe, and a
+  COMMIT or vote that repeats the last one sent waits for the heartbeat or
+  retransmit timer. At disk quorum and 1k records/s, replication packets per
+  append fell from 15.6 to 8.7, broker allocations by 22%, and broker CPU by
+  about 7%.
+- Broker shards take fewer turns per append. A turn takes queued input before
+  it visits partitions, a partition visit repeats up to four rounds while it
+  progresses or wakes itself, and freed reply slots or returned port capacity
+  wake the shard only after a refused send. At disk quorum and 1k records/s,
+  shard turns per append fell from about 36 to 20 and broker CPU from
+  0.81-0.90 to 0.74-0.78 cores.
+- A full reader or follower PUB socket on the broker keeps the frame it
+  refused and sends it once OMQ reports space, instead of dropping it for
+  PEER repair. That socket takes no other frame meanwhile, so the shards
+  behind it hold intake.
+- SDK PEER sockets accept up to 16 MiB per connection or one maximum message
+  plus the reader reservation, whichever is larger. OMQ charges received
+  frames to their connection until the reader drops them, so a large record
+  no longer stalls the link.
+- `TopicReader` spends less CPU per record. A buffered delivery reads no
+  clock, raw records skip the decoder, the partition round-robin needs no
+  division, and the per-record accessors and disabled stage diagnostics
+  inline across crates.
 
 ### Fixed
 
@@ -216,6 +302,10 @@
 - Release a closed store's group lock even while a child process that the
   application is starting still holds inherited descriptors. Reopening the store
   in the same process failed as locked until the child ran exec.
+- Follower shards hand the leader's `PREPARE_PUB` copies to the data path.
+  The control path dropped them for lacking a link session, so every append
+  reached followers only through a probe, a state reply, and a catch-up
+  `PREPARE_FLOW`.
 
 ## [0.1.1] - 2026-10-09
 

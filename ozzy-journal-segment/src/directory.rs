@@ -13,10 +13,11 @@ mod validate;
 
 pub use error::{DirectoryError, ReplayError, ReplayedOperation};
 pub(crate) use layout::{
-    CONFIGURATION_FILE, CURRENT_FILE, DATA_DIRECTORIES, IDENTITY_FILE, LOCK_FILE, hex,
-    index_name_segment_id, is_checkpoint_staging_name, is_index_staging_name, manifest_name,
+    CONFIGURATION_FILE, CURRENT_FILE, DATA_DIRECTORIES, IDENTITY_FILE, LOCK_FILE, SPARE_SEGMENT,
+    hex, index_name_segment_id, is_checkpoint_staging_name, is_index_staging_name, manifest_name,
     parse_checkpoint_name, parse_current_temporary_name, parse_manifest_name,
     parse_manifest_temporary_name, parse_segment_name, segment_name, segment_reference_name,
+    spare_segment_name,
 };
 pub use maintenance::MaintenanceBudget;
 pub use orphans::OrphanCleanupStep;

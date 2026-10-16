@@ -543,6 +543,25 @@ impl Harness {
         }
     }
 
+    /// Complete every outstanding I/O job, such as trailing durable evidence,
+    /// before a step that freezes I/O.
+    async fn quiesce(&mut self) {
+        let deadline = std::time::Instant::now() + SETTLE;
+        loop {
+            self.pump(true);
+            if self.controller.jobs().is_empty()
+                && self
+                    .groups
+                    .iter()
+                    .all(|&group| self.actors.storage_idle(group) == Some(true))
+            {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "I/O did not quiesce");
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// Pump until `done` holds for state that SDK threads change.
     async fn until(&mut self, settle: bool, what: &str, mut done: impl FnMut(&Self) -> bool) {
         let deadline = std::time::Instant::now() + SETTLE;

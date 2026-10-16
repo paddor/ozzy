@@ -186,10 +186,9 @@ impl<'a> Scan<'a> {
                     cause,
                 });
             }
-            Err(
-                cause @ (CodecError::LimitExceeded { .. }
-                | CodecError::CompressionScratchAllocation(_)),
-            ) => return Err(cause),
+            Err(cause @ CodecError::CompressionScratchAllocation(_)) => return Err(cause),
+            // Bytes after the log may hold anything, such as groups from an
+            // earlier use of a reused file.
             Err(cause) if self.damaged_tail => {
                 self.tail = Some(TailState::Damaged {
                     bytes: remaining.len(),
@@ -291,7 +290,8 @@ pub enum TailState {
         cause: CodecError,
     },
     /// Only from recovery of an active segment: a group after the valid prefix
-    /// failed to decode. `bytes` runs to the end of the input.
+    /// failed to decode, such as an unfinished write or bytes from an earlier
+    /// use of the file. `bytes` runs to the end of the input.
     Damaged {
         #[doc = "Physical bytes in the unvalidated segment tail."]
         bytes: usize,

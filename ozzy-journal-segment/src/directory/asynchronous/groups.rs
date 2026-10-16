@@ -16,7 +16,6 @@ pub(crate) struct Groups {
     header: SegmentHeader,
     reference: SegmentReference,
     limits: Limits,
-    length: u64,
     expected: End,
     cursor: Cursor,
     digest: SegmentDigestBuilder,
@@ -194,7 +193,6 @@ impl GroupScope {
             header,
             reference,
             limits,
-            length,
             expected,
             digest,
             decoded,
@@ -276,13 +274,14 @@ impl Groups {
     }
 
     /// Each yielded group has canonical metadata, payload and chain validation.
-    /// End authority and the remaining zero tail are checked before returning None.
+    /// End authority is checked before returning None; later bytes are unused
+    /// capacity.
     pub(crate) async fn next(&mut self) -> Result<Option<DecodedGroup<'_>>, DirectoryError> {
         if self.ended {
             return Ok(None);
         }
         if self.cursor.offset == self.expected.offset {
-            self.reach_end().await?;
+            self.reach_end()?;
             return Ok(None);
         }
         if self.cursor.offset > self.expected.offset || self.group_budget_spent() {
@@ -337,9 +336,8 @@ impl Groups {
         Ok(Some(group))
     }
 
-    /// At the expected end: the zero tail and end authority must match.
-    async fn reach_end(&mut self) -> Result<(), DirectoryError> {
-        self.zero_tail().await?;
+    /// At the expected end, what was read must match the end authority.
+    fn reach_end(&mut self) -> Result<(), DirectoryError> {
         if !self.matches_end() {
             return Err(DirectoryError::SegmentMismatch(self.reference.segment_id));
         }
@@ -416,27 +414,6 @@ impl Groups {
                 Err(error) => return Err(error.into()),
             }
         }
-    }
-
-    async fn zero_tail(&mut self) -> Result<(), DirectoryError> {
-        let mut offset = self.expected.offset;
-        while offset < self.length {
-            let bytes = self
-                .access
-                .read_range(
-                    &self.handle,
-                    offset,
-                    ((self.length - offset) as usize).min(self.limits.io.chunk_bytes),
-                    self.limits.io.chunk_bytes,
-                )
-                .await?;
-            if bytes.iter().any(|byte| *byte != 0) {
-                return Err(CodecError::NonZeroPadding.into());
-            }
-            offset += bytes.len() as u64;
-            self.work.charge(bytes.len()).await;
-        }
-        Ok(())
     }
 
     pub(crate) async fn finish(self: Box<Self>) -> Result<(), DirectoryError> {

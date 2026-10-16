@@ -388,6 +388,7 @@ impl BrokerLinks {
     pub(in crate::replicated) fn reader_parameters(&self) -> handshake::Parameters {
         self.0.config.parameters
     }
+    #[inline]
     pub(in crate::replicated) fn reader_generation(&self) -> u64 {
         self.0.shared.readers.changed.generation()
     }

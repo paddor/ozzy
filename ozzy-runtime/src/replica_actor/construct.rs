@@ -97,6 +97,7 @@ impl ReplicaActor {
             journal_scope,
             activated,
             ack_at: Duration::ZERO,
+            acked: None,
             ingress,
             submitters,
             work,

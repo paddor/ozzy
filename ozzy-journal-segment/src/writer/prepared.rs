@@ -102,11 +102,14 @@ impl SegmentState {
         self.require_healthy()?;
         let result = finalize_group_bodies(
             &self.header,
-            crate::GroupStart::new(
-                self.next_group_number,
-                self.written.end_offset,
-                self.written.next_chain,
-            ),
+            crate::codec::GroupWrite {
+                start: crate::GroupStart::new(
+                    self.next_group_number,
+                    self.written.end_offset,
+                    self.written.next_chain,
+                ),
+                durable_through: self.durable.group_number,
+            },
             operations,
             digests,
             &mut prepared,

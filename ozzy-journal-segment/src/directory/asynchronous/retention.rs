@@ -61,7 +61,7 @@ impl SegmentFiles {
         &self.references
     }
 
-    /// Read bounded raw bytes from one captured generation. The caller still
+    /// Read the sealed bytes of one captured generation. The caller still
     /// validates the relevant segment/index checksums before using payloads.
     pub async fn read_segment(&self, segment_id: u64) -> Result<Vec<u8>, DirectoryError> {
         let reference = self
@@ -69,11 +69,15 @@ impl SegmentFiles {
             .iter()
             .find(|reference| reference.segment_id == segment_id)
             .ok_or(DirectoryError::SegmentMismatch(segment_id))?;
+        let sealed = reference
+            .sealed
+            .ok_or(DirectoryError::SegmentNotSealed(segment_id))?;
         Ok(self
             .access
-            .read_file(
+            .read_prefix(
                 self.root.join(reference.file_name()),
-                reference.capacity as usize,
+                sealed.valid_bytes,
+                reference.capacity,
                 self.chunk_bytes,
             )
             .await?)

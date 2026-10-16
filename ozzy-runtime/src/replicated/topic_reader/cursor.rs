@@ -1,4 +1,4 @@
-use super::super::broker_links::readers::Inbox;
+use super::super::broker_links::{OwnerClock, readers::Inbox};
 use super::{
     BrokerLinkError, BrokerLinks, Bytes, Context, Decoder, Duration, Offset, Poll, RouteGeneration,
     TopicReaderError, TopicRecord, TopicRoutes,
@@ -14,11 +14,11 @@ mod subscription;
 use batch::{Batch, FrameRecords};
 
 /// Reader and route generations a reader poll captured before visiting any
-/// cursor, and the owner time of this visit.
+/// cursor, and the owner clock of this visit.
 #[derive(Clone, Copy)]
-pub(super) struct Observed {
+pub(super) struct Observed<'a> {
     pub(super) input: (u64, RouteGeneration),
-    pub(super) now: Duration,
+    pub(super) clock: &'a OwnerClock,
 }
 
 type Selected = (NodeId, LinkSessionId, reader::Subscribed);
@@ -57,6 +57,7 @@ pub(super) struct Cursor {
     leader: Option<(u64, NodeId)>,
     pub live_records: u64,
     pub replayed_records: u64,
+    pub live_gaps: u64,
 }
 
 impl Cursor {
@@ -96,6 +97,7 @@ impl Cursor {
             leader: None,
             live_records: 0,
             replayed_records: 0,
+            live_gaps: 0,
         })
     }
 
@@ -115,38 +117,38 @@ impl Cursor {
             && !self.inbox.can_subscribe()
     }
 
-    fn waiting_for_input(&self, observed: Observed) -> bool {
+    fn waiting_for_input(&self, input: (u64, RouteGeneration), now: Duration) -> bool {
         // A quiet partition cannot gain records or a new source
         // without input, a pending future, or its existing repair timer.
         // Buffered records and observer futures remain independently runnable.
-        self.observed_input == Some(observed.input)
+        self.observed_input == Some(input)
             && self.pending.is_none()
             && self.ready.is_none()
             && self.opening.is_none()
             && self.canceling.is_none()
-            && self
-                .deadline()
-                .is_none_or(|deadline| observed.now < deadline)
+            && self.deadline().is_none_or(|deadline| now < deadline)
     }
 
     pub(super) fn poll(
         &mut self,
         routes: &TopicRoutes,
         decoder: &mut Decoder,
-        observed: Observed,
+        observed: Observed<'_>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<TopicRecord, TopicReaderError>> {
-        let (links, now, input) = (routes.links(), observed.now, observed.input);
-        if self.waiting_for_input(observed) {
-            return Poll::Pending;
-        }
+        let (links, input) = (routes.links(), observed.input);
         // Buffered records already passed the source check. Route and physical
         // session changes invalidate this generation before the next delivery.
+        // This per-record path reads no clock.
         if self.pending.is_some()
             && self.verified_source == Some(input.1)
             && let Some(record) = self.deliver(links, routes, decoder)?
         {
             return Poll::Ready(Ok(record));
+        }
+        let now = observed.clock.now();
+        if self.waiting_for_input(input, now) {
+            return Poll::Pending;
         }
         self.verified_source = None;
         self.observed_input = Some(input);

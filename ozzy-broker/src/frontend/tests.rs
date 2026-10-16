@@ -55,6 +55,8 @@ fn limits() -> TransportLimits {
     TransportLimits {
         send_messages: 8,
         receive_messages: 8,
+        peers: 8,
+        publication_messages: 8,
         message_bytes: 4096,
         close_linger: Duration::from_millis(5),
     }

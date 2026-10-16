@@ -274,8 +274,8 @@ fn fencing_a_parked_duplicate_releases_the_producers_queued_appends() {
 }
 
 #[test]
-fn a_follower_behind_on_its_own_barriers_validates_two_windows_of_identities() {
-    // Each broker owns its device, so only the third broker's barriers stall.
+fn a_follower_behind_on_its_own_writes_validates_two_windows_of_identities() {
+    // Each broker owns its device, so only the third broker's writes stall.
     // It keeps staging what the leader commits through the second broker,
     // then validates that suffix before it applies the stalled window.
     let mut devices: Vec<_> = (0..3).map(|_| setup()).collect();
@@ -297,7 +297,7 @@ fn a_follower_behind_on_its_own_barriers_validates_two_windows_of_identities() {
                         controller
                             .operation(id)
                             .map(ozzy_io::Operation::unprotected),
-                        Some(ozzy_io::Operation::Sync { .. })
+                        Some(ozzy_io::Operation::Write { .. })
                     ) {
                         held.push(id);
                     }
@@ -350,15 +350,12 @@ fn a_follower_behind_on_its_own_barriers_validates_two_windows_of_identities() {
         "the leader commits through the other follower"
     );
     let follower = actors[2].status().normal.unwrap();
-    assert_eq!(
-        follower.applied.op.0, released,
-        "stalled barriers hold apply"
-    );
+    assert_eq!(follower.applied.op.0, released, "stalled writes hold apply");
     assert!(
         follower.accepted.op.0 > released,
         "the follower accepted part of the leader's history"
     );
-    // Released barriers let the follower validate, apply, and catch up. The
+    // Released writes let the follower validate, apply, and catch up. The
     // idle leader announces its commit on its heartbeat.
     let leader = actors[0].status().normal.unwrap().applied;
     for step in 0..20000 {
@@ -379,9 +376,9 @@ fn a_follower_behind_on_its_own_barriers_validates_two_windows_of_identities() {
     clippy::too_many_lines,
     reason = "one controlled expiry schedule with a stalled follower"
 )]
-fn a_follower_behind_on_its_barriers_waits_to_reuse_identity_capacity() {
+fn a_follower_behind_on_its_writes_waits_to_reuse_identity_capacity() {
     // The leader frees identity capacity at a commit the third broker cannot
-    // apply while its barriers stall. That broker must wait to validate the
+    // apply while its writes stall. That broker must wait to validate the
     // replacement identities instead of failing its partition.
     let mut devices: Vec<_> = (0..3).map(|_| setup()).collect();
     let pipeline = actor_config().pipeline;
@@ -402,7 +399,7 @@ fn a_follower_behind_on_its_barriers_waits_to_reuse_identity_capacity() {
                         controller
                             .operation(id)
                             .map(ozzy_io::Operation::unprotected),
-                        Some(ozzy_io::Operation::Sync { .. })
+                        Some(ozzy_io::Operation::Write { .. })
                     ) {
                         held.push(id);
                     }
@@ -491,8 +488,8 @@ fn a_follower_behind_on_its_barriers_waits_to_reuse_identity_capacity() {
         );
     }
     let follower = actors[2].status().normal.unwrap();
-    assert_eq!(follower.applied, released, "stalled barriers hold apply");
-    // Released barriers let the follower apply, expire, and validate.
+    assert_eq!(follower.applied, released, "stalled writes hold apply");
+    // Released writes let the follower apply, expire, and validate.
     let leader = actors[0].status().normal.unwrap().applied;
     for step in 0..20000 {
         scheduled::round_at(&mut actors, Duration::from_millis(step), false);

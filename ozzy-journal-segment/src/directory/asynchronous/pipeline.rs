@@ -203,11 +203,14 @@ impl Pipeline {
         let locations = group.locations(&layout.header, layout.before.end_offset())?;
         let finalized = crate::codec::finalize_group_descriptors(
             &layout.header,
-            crate::GroupStart::new(
-                layout.group_number,
-                layout.before.end_offset(),
-                layout.before.next_chain(),
-            ),
+            crate::codec::GroupWrite {
+                start: crate::GroupStart::new(
+                    layout.group_number,
+                    layout.before.end_offset(),
+                    layout.before.next_chain(),
+                ),
+                durable_through: self.journal.writer.durable_position().group_number(),
+            },
             group.operations.iter().copied(),
             &mut group.bodies,
         )?;

@@ -55,10 +55,13 @@ pub(super) struct Work {
     // Starts at admission, not completion: slow writes/rolls consume this age.
     // Retained across a view fence until the old admitted I/O is synchronized.
     sync_batch_started: Option<Duration>,
+    // When the last disk-quorum write completed.
+    last_persisted: Option<Duration>,
     // Body bytes of each queued write, in the order of `pending_persistence`.
     pub(super) persisting_bytes: VecDeque<usize>,
     cursors: [Option<Prefix>; 3],
-    announced: Option<Prefix>,
+    // Last COMMIT sent to each backup. A repeat waits for the core heartbeat.
+    pub(super) announced: [Option<Commit>; 3],
     deferred_commit: Option<(NodeId, Commit)>,
     replay_peer: usize,
     replay_plan: Option<replay::Plan>,
@@ -94,9 +97,10 @@ impl Work {
             sync_batch_operations: 0,
             sync_batch_body_bytes: 0,
             sync_batch_started: None,
+            last_persisted: None,
             persisting_bytes: VecDeque::with_capacity(capacity),
             cursors: [None; 3],
-            announced: None,
+            announced: [None; 3],
             deferred_commit: None,
             replay_peer: 0,
             replay_plan: None,
@@ -112,7 +116,7 @@ impl Work {
         self.proposals.reject_deferred();
         self.scope = scope;
         self.cursors = [None; 3];
-        self.announced = None;
+        self.announced = [None; 3];
         self.sync_batch_attempts = 0;
         self.deferred_commit = None;
         self.receive.reset();
@@ -208,21 +212,40 @@ impl ReplicaActor {
             return Ok(());
         }
         let committed = require_normal(&self.driver)?.snapshot().committed;
-        if self.work.announced != Some(committed) {
-            for to in *self.configuration.voters() {
-                if to != self.local {
-                    self.control(
-                        to,
-                        Control::Commit(Commit {
-                            scope: snapshot.scope,
-                            committed,
-                        }),
-                    )?;
-                }
+        for voter in 0..3 {
+            if self.configuration.voters()[voter] != self.local {
+                self.announce(
+                    voter,
+                    Commit {
+                        scope: snapshot.scope,
+                        committed,
+                    },
+                    false,
+                )?;
             }
-            self.work.announced = Some(committed);
         }
         self.send_live()?;
+        Ok(())
+    }
+
+    /// Send one backup a COMMIT unless it repeats the last one queued there.
+    /// The core heartbeat passes `repeat` and covers a lost packet.
+    pub(super) fn announce(
+        &mut self,
+        voter: usize,
+        commit: Commit,
+        repeat: bool,
+    ) -> Result<(), ActorError> {
+        let to = self.configuration.voters()[voter];
+        if !repeat && self.work.announced[voter] == Some(commit) {
+            return Ok(());
+        }
+        // A missing session or a full queue drops it; the next call retries.
+        let before = self.outbox.queued(to, SendClass::Control);
+        self.control(to, Control::Commit(commit))?;
+        if self.outbox.queued(to, SendClass::Control) != before {
+            self.work.announced[voter] = Some(commit);
+        }
         Ok(())
     }
 
@@ -331,7 +354,9 @@ impl ReplicaActor {
             return Ok(());
         }
         if self.work.needs_sync {
-            if self.pending_sync.is_none() {
+            // An idle replicated-persisting queue syncs at once. Disk quorum
+            // publishes evidence only through `sync_due`.
+            if self.replicated() && self.pending_sync.is_none() {
                 self.schedule_sync()?;
             }
         } else {
@@ -367,14 +392,35 @@ impl ReplicaActor {
     }
 
     fn sync_due(&self, primary: bool, now: Duration) -> bool {
+        let target = self.config.sync_batch_target;
+        let full = self.work.sync_batch_operations >= target.operations
+            || self.work.sync_batch_body_bytes >= target.body_bytes;
+        if !self.replicated() {
+            // `DURABLE` is recovery evidence, never a vote. It waits for a
+            // quiet moment, a filled batch, or due maintenance.
+            let idle = self.pending_persistence.is_empty();
+            return self.work.needs_sync
+                && (full
+                    || self.evidence_deadline().is_some_and(|at| now >= at)
+                    || (idle && self.maintenance.due(now)));
+        }
         self.work.needs_sync
-            && ((primary
-                && self.work.sync_batch_attempts >= self.config.sync_batch_target.operations)
-                || self.work.sync_batch_operations >= self.config.sync_batch_target.operations
-                || self.work.sync_batch_body_bytes >= self.config.sync_batch_target.body_bytes
+            && (full
+                || (primary && self.work.sync_batch_attempts >= target.operations)
                 || self.work.sync_batch_started.is_some_and(|started| {
                     now.saturating_sub(started) >= self.config.sync_batch_max_age
                 }))
+    }
+
+    /// When disk-quorum `DURABLE` evidence comes due with no write in flight.
+    pub(super) fn evidence_deadline(&self) -> Option<Duration> {
+        (!self.replicated() && self.work.needs_sync && self.pending_persistence.is_empty()).then(
+            || {
+                self.work.last_persisted.map_or(Duration::ZERO, |at| {
+                    at.saturating_add(self.config.evidence_quiet)
+                })
+            },
+        )
     }
 
     /// Take the waiting or next queued proposal when the live window has room,

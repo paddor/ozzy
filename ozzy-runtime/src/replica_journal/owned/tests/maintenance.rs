@@ -175,7 +175,8 @@ fn owned_cleanup_obeys_removal_bound_and_canceled_mutation_requires_reopen() {
         .unwrap()
         .to_vec();
     let ticket = replica.driver.begin_validation().unwrap();
-    for _ in 0..2 {
+    // The first file becomes the spare; the second is unlinked.
+    for reclaimed in [0, 16] {
         let result = drive(
             &mut controller,
             replica
@@ -185,8 +186,13 @@ fn owned_cleanup_obeys_removal_bound_and_canceled_mutation_requires_reopen() {
         .unwrap();
         assert_eq!(result.ticket, ticket);
         assert_eq!(result.removed_objects, 1);
-        assert_eq!(result.reclaimed_bytes, 16);
+        assert_eq!(result.reclaimed_bytes, reclaimed);
     }
+    assert!(
+        controller
+            .image()
+            .exists(&replica.config.root.join("segments/spare.log"), false)
+    );
     assert_eq!(
         controller
             .image()

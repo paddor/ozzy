@@ -58,6 +58,12 @@ impl Publication {
         })
     }
 
+    /// A framed publication still waits for the shard's dispatcher slot.
+    /// A sent frame that a slow SUB retains does not count.
+    pub(super) fn waiting(&self) -> bool {
+        self.pending.is_some()
+    }
+
     pub(super) fn changed(&mut self, fenced: bool, active: bool) {
         if fenced {
             self.reset(active);

@@ -628,6 +628,8 @@ async fn start(brokers: &[(CheckedConfig, BrokerIdentity, JournalPlan)], format:
                 limits: TransportLimits {
                     send_messages: 8,
                     receive_messages: 8,
+                    peers: 8,
+                    publication_messages: 8,
                     message_bytes: 256 * 1024,
                     close_linger: Duration::from_millis(5),
                 },

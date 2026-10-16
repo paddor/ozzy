@@ -10,8 +10,10 @@ use ozzy_proto::layout::{self, Fixed};
 use std::ops::Range;
 
 const SEAL_MAGIC: &[u8; 8] = b"OZYSEAL\0";
-const GROUP_HASH_CONTEXT: &str = "ozzy journal structural group v2";
+const GROUP_HASH_CONTEXT: &str = "ozzy journal structural group v3";
 const SEAL_DIGEST_RANGE: Range<usize> = 40..72;
+/// Seal bytes after the durable mark stay zero.
+const SEAL_RESERVED: usize = 80;
 
 /// Physical identity a group seal records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,19 +24,32 @@ pub(super) struct GroupSeal {
     pub(super) entry_count: u64,
 }
 
+/// What a seal adds to its group's physical identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SealRecord {
+    pub(super) digest: Digest,
+    /// Highest group number durable when this group was prepared. Recovery
+    /// refuses a damaged group that a later valid group marks durable.
+    pub(super) durable_through: u64,
+}
+
 pub(super) fn encode_seal(
     group: &mut [u8],
     seal_offset: usize,
     fields: GroupSeal,
-    digest: Digest,
+    record: SealRecord,
 ) -> Result<(), CodecError> {
+    if record.durable_through >= fields.group_number {
+        return Err(CodecError::SealMismatch);
+    }
     let seal: &mut [u8; GROUP_SEAL_BYTES] = layout::record_mut(group, seal_offset)?;
     seal[0..8].copy_from_slice(SEAL_MAGIC);
     seal.put_u64::<8>(fields.group_number);
     seal.put_u64::<16>(fields.start_offset);
     seal.put_u64::<24>(fields.end_offset);
     seal.put_u64::<32>(fields.entry_count);
-    seal[SEAL_DIGEST_RANGE].copy_from_slice(digest.as_bytes());
+    seal[SEAL_DIGEST_RANGE].copy_from_slice(record.digest.as_bytes());
+    seal.put_u64::<72>(record.durable_through);
     Ok(())
 }
 
@@ -42,26 +57,36 @@ pub(super) fn validate_seal(
     group: &[u8],
     seal_offset: usize,
     expected: GroupSeal,
-) -> Result<Digest, CodecError> {
+) -> Result<SealRecord, CodecError> {
     let seal: &[u8; GROUP_SEAL_BYTES] = layout::record(group, seal_offset)?;
-    if seal.array::<0, 8>() != *SEAL_MAGIC {
-        return Err(CodecError::WrongMagic("physical group seal"));
+    if read_seal(seal) != Some(expected) {
+        return Err(if seal.array::<0, 8>() == *SEAL_MAGIC {
+            CodecError::SealMismatch
+        } else {
+            CodecError::WrongMagic("physical group seal")
+        });
     }
-    if !all_zero(seal.slice::<72, { GROUP_SEAL_BYTES - 72 }>()) {
+    if !all_zero(seal.slice::<SEAL_RESERVED, { GROUP_SEAL_BYTES - SEAL_RESERVED }>()) {
         return Err(CodecError::NonZeroReserved("physical group seal"));
     }
-    let recorded = GroupSeal {
+    let durable_through = seal.u64_at::<72>();
+    if durable_through >= expected.group_number {
+        return Err(CodecError::SealMismatch);
+    }
+    Ok(SealRecord {
+        digest: Digest::from_bytes(seal.array::<{ SEAL_DIGEST_RANGE.start }, 32>()),
+        durable_through,
+    })
+}
+
+/// The identity a seal records, or `None` without the seal magic.
+pub(super) fn read_seal(seal: &[u8; GROUP_SEAL_BYTES]) -> Option<GroupSeal> {
+    (seal.array::<0, 8>() == *SEAL_MAGIC).then(|| GroupSeal {
         group_number: seal.u64_at::<8>(),
         start_offset: seal.u64_at::<16>(),
         end_offset: seal.u64_at::<24>(),
         entry_count: seal.u64_at::<32>(),
-    };
-    if recorded != expected {
-        return Err(CodecError::SealMismatch);
-    }
-    Ok(Digest::from_bytes(
-        seal.array::<{ SEAL_DIGEST_RANGE.start }, 32>(),
-    ))
+    })
 }
 
 pub(super) struct GroupDigestBuilder {
@@ -91,8 +116,9 @@ impl GroupDigestBuilder {
         self.hasher.update(operation_digest.as_bytes());
     }
 
-    pub(super) fn finish(mut self, end_offset: u64) -> Digest {
+    pub(super) fn finish(mut self, end_offset: u64, durable_through: u64) -> Digest {
         self.hasher.update(&end_offset.to_be_bytes());
+        self.hasher.update(&durable_through.to_be_bytes());
         self.hasher.finish()
     }
 }

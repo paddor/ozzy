@@ -30,6 +30,7 @@ pub(in crate::replica_journal::owned::tests) fn actor_config() -> ActorConfig {
         transfer: pipeline(),
         sync_batch_target: SyncBatchTarget::half_window(pipeline()),
         sync_batch_max_age: Duration::from_millis(100),
+        evidence_quiet: Duration::ZERO,
         proposal_lanes: 1,
         proposal_capacity: 4,
         control: QueueLimits {

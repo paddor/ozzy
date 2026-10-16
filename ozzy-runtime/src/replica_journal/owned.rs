@@ -392,6 +392,22 @@ impl OwnedJournal {
         Ok(ticket)
     }
 
+    /// Write up to `bytes` zeros where a freshly formatted store's first
+    /// appends land, so they overwrite written blocks: a local store's active
+    /// segment, or the spare that a replicated store's first election installs
+    /// its log into.
+    pub async fn zero_first_segment(&mut self, bytes: u64) -> Result<(), JournalError> {
+        self.healthy()?;
+        let local = matches!(self.configuration, Mode::Local(_));
+        let journal = self.journal.ready_mut()?;
+        if local {
+            journal.zero_ahead(bytes).await?;
+        } else {
+            journal.zero_spare(bytes).await?;
+        }
+        Ok(())
+    }
+
     /// After the actor stops voting and admission, synchronize its installed
     /// history and close asynchronously. The shared backend remains available
     /// to other partitions. Dropping this future supplies no shutdown evidence.

@@ -123,6 +123,9 @@ async fn read(
 }
 ```
 
+`try_next` returns a record that is ready without waiting, or `None`. Drain
+ready records with it and await `next` once it returns `None`.
+
 Save a checkpoint only after processing succeeds; it does not make side effects
 transactional. Other starts: `Latest`, `Timestamp` (broker append time, Unix
 ms), and `ReaderStart::record_id`.

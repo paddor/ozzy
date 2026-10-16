@@ -45,8 +45,8 @@ ozzy serve --broker laptop --identity "$ozzy_dir/shared.identity" \
   identity files.
 - Ctrl-C (SIGINT) or SIGTERM drains journals, sockets, and storage workers,
   then exits.
-- `format` preallocates one segment (`segment_bytes`) per partition, so the
-  samples reserve several GiB.
+- `format` writes zeros over one segment file (`segment_bytes`) per
+  partition, so the samples write several GiB once.
 
 ## Commands
 

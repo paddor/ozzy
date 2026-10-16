@@ -113,6 +113,7 @@ pub struct StateSignal {
 
 impl StateSignal {
     /// Capture this before checking the state whose change a caller awaits.
+    #[inline]
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }

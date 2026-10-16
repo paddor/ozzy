@@ -37,6 +37,10 @@ pub struct LocalActorConfig {
     pub proposal_capacity: usize,
     /// Ready actor steps before yielding to other partition actors.
     pub turn_steps: usize,
+    /// Publish `DURABLE` once no write is in flight and none completed for this
+    /// long. Half a window of unpublished writes, due retention, or close
+    /// publishes sooner. Zero publishes as soon as no write is in flight.
+    pub evidence_quiet: std::time::Duration,
 }
 
 impl Default for LocalActorConfig {
@@ -47,6 +51,7 @@ impl Default for LocalActorConfig {
             proposal_lanes: 1,
             proposal_capacity: 64,
             turn_steps: 16,
+            evidence_quiet: std::time::Duration::ZERO,
         }
     }
 }
@@ -86,6 +91,10 @@ pub struct LocalActor {
     pending: Option<Pending>,
     persistence: VecDeque<(JournalCompletion<WriteTicket>, Option<Instant>)>,
     sync: Option<PendingSync>,
+    /// Durable prefix the last durable evidence publication captured.
+    evidence_through: ozzy_replication::OpNumber,
+    /// When the last write completed.
+    last_persisted: Option<std::time::Duration>,
     propose_started_at: Option<Instant>,
     admit_started_at: Option<Instant>,
     apply_started_at: Option<Instant>,
@@ -183,6 +192,7 @@ impl LocalActor {
         let journal = owner.into_shard_journal(config.journal, timestamp)?;
         config.retention_interval = journal.retention_interval(config.retention_interval);
         let limits = driver.limits();
+        let evidence_through = driver.snapshot().journal.durable;
         let backlog = journal.backlog();
         if limits.max_operations > backlog.max_operations
             || limits.max_body_bytes > backlog.max_body_bytes
@@ -209,6 +219,8 @@ impl LocalActor {
             pending: None,
             persistence: VecDeque::with_capacity(limits.max_operations),
             sync: None,
+            evidence_through,
+            last_persisted: None,
             propose_started_at: None,
             admit_started_at: None,
             apply_started_at: None,
@@ -312,29 +324,51 @@ impl LocalActor {
         self.pending.is_none()
             && self.persistence.is_empty()
             && self.sync.is_none()
+            && state.journal.durable == self.evidence_through
             && self.live.is_empty()
             && state.accepted == state.applied
+    }
+
+    /// No write or durable evidence is outstanding.
+    #[cfg(test)]
+    pub(crate) fn storage_idle(&self) -> bool {
+        self.persistence.is_empty()
+            && self.sync.is_none()
+            && self.driver.snapshot().journal.durable == self.evidence_through
     }
 
     fn schedule(&mut self) -> Result<bool, ActorError> {
         if self.journal.available_command_slots() == 0 {
             return Ok(false);
         }
+        // Durable evidence is never a confirmation, so it waits for a quiet
+        // moment, half a window of writes, due retention, or close. It starts
+        // in the turn that made it due.
+        let state = self.driver.snapshot();
+        let mut changed = false;
+        let lag = state.journal.durable.0 - self.evidence_through.0;
+        let half_window = self.driver.limits().max_operations.div_ceil(2) as u64;
+        let idle = self.persistence.is_empty();
+        if self.sync.is_none()
+            && lag > 0
+            && (self.evidence_deadline().is_some_and(|at| self.now >= at)
+                || lag >= half_window
+                || (idle && self.retention.due(self.now))
+                || self.closing)
+        {
+            let ticket = self.driver.begin_sync()?;
+            self.evidence_through = ticket.through();
+            self.sync = Some(PendingSync::Barrier(
+                self.journal.begin_pipelined_sync(ticket)?,
+            ));
+            self.sync_started_at = crate::profiling::start();
+            changed = true;
+        }
         if let Some(Pending::Ready(_)) = self.pending
             && let Some(Pending::Ready(ready)) = self.pending.take()
         {
             let (ticket, validated) = *ready;
-            return self.admit_ready(ticket, validated);
-        }
-        let state = self.driver.snapshot();
-        let mut changed = false;
-        if self.sync.is_none() && state.journal.written > state.journal.durable {
-            self.sync = Some(PendingSync::Barrier(
-                self.journal
-                    .begin_pipelined_sync(self.driver.begin_sync()?)?,
-            ));
-            self.sync_started_at = crate::profiling::start();
-            changed = true;
+            return Ok(self.admit_ready(ticket, validated)? | changed);
         }
         if self.pending.is_some() || self.journal.available_command_slots() == 0 {
             return Ok(changed);
@@ -447,10 +481,21 @@ impl LocalActor {
         self.now = now;
     }
 
-    /// The next retention turn, its only timer.
+    /// The next retention turn or durable evidence publication.
     pub(super) fn next_deadline(&self, now: std::time::Duration) -> Option<std::time::Duration> {
         super::deadline::Earliest::after(now)
             .at(self.retention.at())
+            .at(self.evidence_deadline())
             .get()
+    }
+
+    /// When unpublished durable evidence comes due with no write in flight.
+    fn evidence_deadline(&self) -> Option<std::time::Duration> {
+        let behind = self.driver.snapshot().journal.durable > self.evidence_through;
+        (behind && self.sync.is_none() && self.persistence.is_empty()).then(|| {
+            self.last_persisted.map_or(std::time::Duration::ZERO, |at| {
+                at.saturating_add(self.config.evidence_quiet)
+            })
+        })
     }
 }

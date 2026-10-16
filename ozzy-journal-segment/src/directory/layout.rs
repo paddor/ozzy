@@ -12,6 +12,8 @@ pub(crate) const IDENTITY_FILE: &str = "identity";
 pub(crate) const CONFIGURATION_FILE: &str = "CONFIGURATION";
 pub(crate) const LOCK_FILE: &str = "group.lock";
 pub(crate) const DATA_DIRECTORIES: [&str; 4] = ["segments", "checkpoints", "indexes", "staging"];
+/// A retired segment file kept in `segments/` for the next roll.
+pub(crate) const SPARE_SEGMENT: &str = "spare.log";
 
 pub(crate) fn is_index_staging_name(name: &OsStr) -> bool {
     let Some(name) = name.to_str().and_then(|name| name.strip_prefix("index-")) else {
@@ -118,6 +120,10 @@ fn is_lower_hex(text: &str) -> bool {
 
 pub(crate) fn segment_name(segment_id: u64) -> PathBuf {
     PathBuf::from("segments").join(format!("{segment_id}.log"))
+}
+
+pub(crate) fn spare_segment_name() -> PathBuf {
+    PathBuf::from("segments").join(SPARE_SEGMENT)
 }
 
 pub(crate) fn segment_reference_name(

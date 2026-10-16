@@ -3,7 +3,7 @@
 use super::{FollowerRoutes, Serving, StartupError, error, failure, fatal};
 use futures::{StreamExt, stream::FuturesUnordered};
 use omq_tokio::{
-    IdentitySocket, Message, MonitorEvent, MonitorStream, ReceiveReceipt, ReceiveSource,
+    IdentitySocket, Message, MonitorEvent, MonitorStream, ReceiveLane, ReceiveReceipt,
 };
 use ozzy_proto::{NodeId, Opcode};
 use ozzy_runtime::transport::Frames;
@@ -97,7 +97,7 @@ impl<'a> Ingress<'a> {
         // Admission contains no await or lifecycle observation: an old body
         // cannot cross client retirement into a reused slot. OMQ fences queued
         // generations and rejects restoration to a retired source.
-        if receipt.source().is_none() || !self.connections.contains(&message) {
+        if receipt.lane().is_none() || !self.connections.contains(&message) {
             return Ok(None);
         }
         let (message, retained) = match self.serving.buffers.prepare_borrowed(&message) {
@@ -116,7 +116,7 @@ impl<'a> Ingress<'a> {
                 generation,
             }))) => {
                 let source = receipt
-                    .source()
+                    .lane()
                     .cloned()
                     .ok_or_else(|| error("PEER receive lacks a source"))?;
                 ozzy_runtime::profiling::event(
@@ -210,7 +210,7 @@ impl<'a> Ingress<'a> {
                 return Ok(());
             };
             ozzy_runtime::profiling::event(ozzy_runtime::profiling::Event::DispatcherInputRetry);
-            let (receipt, body) = match self.socket.try_recv_from_source(Some(&source)) {
+            let (receipt, body) = match self.socket.try_recv_with_receipt(Some(&source)) {
                 Ok(received) => received,
                 Err(omq_tokio::Error::Closed | omq_tokio::Error::WouldBlock) => continue,
                 Err(error) => return Err(failure(error)),
@@ -238,12 +238,12 @@ impl<'a> Ingress<'a> {
 struct Pressure {
     lane: Lane,
     generation: u64,
-    source: ReceiveSource,
+    source: ReceiveLane,
 }
 
 #[derive(Default)]
 pub(super) struct PausedSources {
-    sources: BTreeMap<Lane, VecDeque<ReceiveSource>>,
+    sources: BTreeMap<Lane, VecDeque<ReceiveLane>>,
     waiting: BTreeSet<Lane>,
     wakes: FuturesUnordered<LaneWake>,
 }

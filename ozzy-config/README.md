@@ -101,7 +101,8 @@ max_bytes = 1073741824
 
 - Either limit expires the oldest sealed segments; both can be omitted.
 - `max_bytes` counts segment capacities per partition per broker, including the
-  active segment. It must fit at least one segment.
+  active segment. It must fit at least one segment. A retired file kept for
+  the next new segment adds one segment on disk.
 - Active work and captured reads can delay deletion.
 
 ## Deduplication

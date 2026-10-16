@@ -123,6 +123,15 @@ impl PartitionActor {
         }
     }
 
+    /// Whether a local partition has no write or durable evidence outstanding.
+    #[cfg(test)]
+    pub(crate) fn storage_idle(&self) -> Option<bool> {
+        match self {
+            Self::Local(actor) => Some(actor.storage_idle()),
+            Self::Replicated(_) | Self::Recovering(_) => None,
+        }
+    }
+
     /// Current leader hint. It neither activates authority nor confirms history.
     pub fn authority_hint(&self) -> ozzy_proto::nack::AuthorityHint {
         match self {

@@ -216,6 +216,16 @@ impl State {
         Ok(())
     }
 
+    /// Answer one received admin query. A stopped admin owner stops the
+    /// listening.
+    fn observe_admin(&mut self, query: &Result<Option<u64>, omq_tokio::Error>) {
+        match query {
+            Ok(Some(sequence)) => self.answer_admin(*sequence),
+            Ok(None) => {}
+            Err(_) => self.admin = None,
+        }
+    }
+
     /// Answer admin query `sequence` with every partition's status.
     fn answer_admin(&self, sequence: u64) {
         let Some(admin) = &self.admin else {
@@ -254,8 +264,8 @@ async fn serve(
         let [data, replica, control, replica_control] =
             std::array::from_fn(|index| state.incoming[index].ready());
         let admin = state.admin.as_ref().map(crate::admin::ShardLane::query);
-        tokio::pin!(data, replica, control, replica_control, admin);
         let port = binding.port.changed_after(port_generation);
+        tokio::pin!(data, replica, control, replica_control, admin, port);
         let links = binding.links.clone();
         if !*serving.borrow() && state.serving() {
             serving.send_replace(true);
@@ -268,19 +278,16 @@ async fn serve(
                 if let Poll::Ready(result) = state.poll(cx, binding, now) {
                     return Poll::Ready(result);
                 }
-                // Wake for the earliest timer the turn left.
-                if alarm.poll_at(cx, state.next_deadline(now)).is_ready() {
+                // Wake for the next timer, and for port capacity after a refusal.
+                if alarm.poll_at(cx, state.next_deadline(now)).is_ready()
+                    || state.outbound.port_refused() && port.as_mut().poll(cx).is_ready()
+                {
                     return Poll::Ready(Ok(()));
                 }
                 if let Some(query) = admin.as_mut().as_pin_mut()
                     && let Poll::Ready(query) = query.poll(cx)
                 {
-                    match query {
-                        Ok(Some(sequence)) => state.answer_admin(sequence),
-                        Ok(None) => {}
-                        // The admin owner stopped; stop listening.
-                        Err(_) => state.admin = None,
-                    }
+                    state.observe_admin(&query);
                     return Poll::Ready(Ok(()));
                 }
                 // Progress can fill a deferred slot. Check it at each poll,
@@ -304,7 +311,6 @@ async fn serve(
                     result?;
                 }
             },
-            () = port => {},
             () = links.changed_after(link_generation) => {},
         }
     }

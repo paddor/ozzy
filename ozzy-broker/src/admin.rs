@@ -284,7 +284,7 @@ impl ShardLane {
     ) -> impl Future<Output = Result<Option<u64>, omq_tokio::Error>> + use<> {
         let socket = self.0.clone_shared();
         async move {
-            let (_, query) = socket.recv_from(None).await?;
+            let (_, query) = socket.recv_with_receipt(None).await?;
             Ok(query
                 .iter()
                 .next()

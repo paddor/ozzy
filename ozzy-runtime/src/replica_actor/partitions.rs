@@ -119,6 +119,14 @@ impl PartitionActors {
             .map(|&slot| self.actors[slot].status())
     }
 
+    /// Whether a known local partition has no write or durable evidence outstanding.
+    #[cfg(test)]
+    pub(crate) fn storage_idle(&self, group: GroupId) -> Option<bool> {
+        self.index
+            .get(&group)
+            .and_then(|&slot| self.actors[slot].storage_idle())
+    }
+
     /// Committed facts of one known partition, for diagnostics.
     pub fn facts(
         &self,

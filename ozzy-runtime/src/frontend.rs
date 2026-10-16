@@ -25,7 +25,7 @@ pub use port::{
 };
 
 mod publication;
-pub use publication::{PublicationError, PublicationResult};
+pub use publication::{PublicationError, PublicationResult, PublicationSocket};
 
 mod buffers;
 pub use buffers::{BufferError, ReceiveBuffers, ReceiveStorage};

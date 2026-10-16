@@ -23,8 +23,8 @@ pub use processing::{
 mod topic_reader;
 mod topic_writer;
 pub use topic_reader::{
-    IdPolicy, ReaderError, ReaderStart, TopicCheckpoint, TopicReader, TopicReaderConfig,
-    TopicReaderError, TopicReaderStats, TopicRecord,
+    IdPolicy, ReaderError, ReaderStart, RecordPayload, TopicCheckpoint, TopicReader,
+    TopicReaderConfig, TopicReaderError, TopicReaderStats, TopicRecord,
 };
 mod writer;
 

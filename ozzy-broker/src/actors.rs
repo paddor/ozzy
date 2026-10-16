@@ -14,6 +14,10 @@ use ozzy_runtime::{
 };
 use std::{collections::BTreeMap, time::Duration};
 
+/// Quiet time before a partition with no write in flight publishes `DURABLE`.
+/// Votes and confirmations never wait for it.
+const EVIDENCE_QUIET: Duration = Duration::from_millis(20);
+
 /// Native per-partition work bounds. Shared shard memory admission bounds
 /// aggregate live work. Replicated session entries are filled
 /// from independently established broker links when the actor is constructed.
@@ -118,6 +122,7 @@ impl ActorSettings {
                     proposal_lanes: 3,
                     proposal_capacity: config.append_limits.max_operations,
                     turn_steps: 16,
+                    evidence_quiet: EVIDENCE_QUIET,
                 }));
             }
         };
@@ -147,6 +152,7 @@ impl ActorSettings {
                 transfer,
                 sync_batch_target: SyncBatchTarget::half_window(pipeline),
                 sync_batch_max_age: Duration::from_millis(1),
+                evidence_quiet: EVIDENCE_QUIET,
                 proposal_lanes: 3,
                 proposal_capacity: pipeline.max_operations,
                 control: QueueLimits {

@@ -272,6 +272,7 @@ impl TopicRoutes {
     }
 
     /// Capture before reading the current route to close the read/wait race.
+    #[inline]
     pub fn generation(&self) -> RouteGeneration {
         RouteGeneration {
             routes: self.state.changed.generation(),

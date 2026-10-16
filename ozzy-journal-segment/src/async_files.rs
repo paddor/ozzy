@@ -275,16 +275,50 @@ impl Access {
         limit: usize,
         chunk: usize,
     ) -> io::Result<Vec<u8>> {
+        self.read_leading(path, chunk, |length| {
+            if length > limit as u64 {
+                return Err(too_long());
+            }
+            Ok(length)
+        })
+        .await
+    }
+
+    /// The first `prefix` bytes of a segment file no longer than `capacity`.
+    /// Later bytes are unused capacity, possibly left by an earlier use of
+    /// the file, and are not read.
+    pub(crate) async fn read_prefix(
+        &self,
+        path: PathBuf,
+        prefix: u64,
+        capacity: u64,
+        chunk: usize,
+    ) -> io::Result<Vec<u8>> {
+        self.read_leading(path, chunk, |length| {
+            if length > capacity {
+                return Err(too_long());
+            }
+            if length < prefix {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            Ok(prefix)
+        })
+        .await
+    }
+
+    /// Read the leading bytes of the file at `path`; `count` picks how many
+    /// from the file length.
+    async fn read_leading(
+        &self,
+        path: PathBuf,
+        chunk: usize,
+        count: impl FnOnce(u64) -> io::Result<u64>,
+    ) -> io::Result<Vec<u8>> {
         let handle = self.open(path, OpenMode::Read, false, false).await?;
         let result = async {
             let length = self.length(&handle).await?;
-            if length > limit as u64 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "file exceeds read limit",
-                ));
-            }
-            self.read_range(&handle, 0, length as usize, chunk).await
+            let count = usize::try_from(count(length)?).map_err(|_| too_long())?;
+            self.read_range(&handle, 0, count, chunk).await
         }
         .await;
         let closed = self.done(Operation::Close { handle }).await;
@@ -431,6 +465,10 @@ impl Access {
         }
         Ok(())
     }
+}
+
+fn too_long() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "file exceeds read limit")
 }
 
 fn unexpected() -> io::Error {

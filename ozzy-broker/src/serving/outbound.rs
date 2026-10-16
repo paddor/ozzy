@@ -52,6 +52,12 @@ pub(super) struct Outbound {
     publications: [Option<Publication>; 2],
     publication_bytes: usize,
     envelope: EnvelopeLimits,
+    /// A send was refused as full. The next freed slot wakes the shard so
+    /// the refused partition retries; other releases wake nobody.
+    refused: bool,
+    /// The port refused a reply or publication in the last poll. Only then
+    /// does returning port capacity need to wake the shard.
+    port_refused: bool,
 }
 
 impl Outbound {
@@ -81,7 +87,14 @@ impl Outbound {
             publications: [None, None],
             publication_bytes: message_bytes.saturating_add(2048),
             envelope,
+            refused: false,
+            port_refused: false,
         }
+    }
+
+    /// Whether returning port capacity should wake the shard.
+    pub(super) fn port_refused(&self) -> bool {
+        self.port_refused
     }
 
     pub(super) fn send(&mut self, message: Message) -> Result<(), TrySendError> {
@@ -99,6 +112,7 @@ impl Outbound {
             // is available. Publication never consumes reply/control slots.
             let slot = usize::from(opcode != Some(Opcode::PreparePub));
             if self.publications[slot].is_some() {
+                self.refused = true;
                 return Err(TrySendError::Full(message));
             }
             self.publications[slot] = Some(Publication::Ready(message));
@@ -133,9 +147,11 @@ impl Outbound {
             .checked_add(bytes)
             .filter(|&total| count < count_limit && total <= self.limits[index]);
         let (Some(charged), Some(sequence)) = (charged, self.sequence.checked_add(1)) else {
+            self.refused = true;
             return Err(TrySendError::Full(message));
         };
         let Some(slot) = self.free[index].pop() else {
+            self.refused = true;
             return Err(TrySendError::Full(message));
         };
         // The count limit above keeps this far from overflow.
@@ -162,6 +178,7 @@ impl Outbound {
         now: Duration,
     ) -> Result<(), StartupError> {
         port.poll_progress(cx).map_err(failure)?;
+        self.port_refused = false;
         for slot in 0..2 {
             self.poll_publication(cx, port, slot)?;
         }
@@ -172,19 +189,18 @@ impl Outbound {
         let mut released = false;
         for position in 0..self.order.len().min(64) {
             let index = self.order[position].1;
-            let Some(mut entry) = self.slots[index].take() else {
+            let Some(entry) = self.slots[index].take() else {
                 continue;
             };
+            // A reply handed over now is polled at once, which registers
+            // this turn's waker for its result.
+            let mut entry = self.offer(entry, port, now)?;
             if let State::Pending(pending) = &mut entry.state {
                 match Pin::new(pending).poll(cx) {
-                    Poll::Pending => {
-                        self.slots[index] = Some(entry);
-                        continue;
-                    }
+                    Poll::Pending => {}
                     Poll::Ready(Ok(Ok(()) | Err((ReplyError::Peer | ReplyError::Session, _)))) => {
                         self.release(index, &entry);
                         released = true;
-                        cx.waker().wake_by_ref();
                         continue;
                     }
                     Poll::Ready(Ok(Err((ReplyError::Full, message)))) => {
@@ -198,13 +214,25 @@ impl Outbound {
                     Poll::Ready(Err(error)) => return Err(failure(error)),
                 }
             }
-            self.slots[index] = Some(self.offer(entry, cx, port, now)?);
+            let destination = (entry.peer, entry.class);
+            if matches!(entry.state, State::Ready(_)) && !self.held.contains(&destination) {
+                self.held.push(destination);
+            }
+            self.slots[index] = Some(entry);
         }
         if released {
             let slots = &self.slots;
             self.order.retain(|&(_, index)| slots[index].is_some());
+            self.wake_refused(cx);
         }
         Ok(())
+    }
+
+    /// Wake the shard for a partition whose send was refused as full.
+    fn wake_refused(&mut self, cx: &Context<'_>) {
+        if std::mem::take(&mut self.refused) {
+            cx.waker().wake_by_ref();
+        }
     }
 
     /// Free a delivered reply's slot and its destination class charge.
@@ -230,7 +258,6 @@ impl Outbound {
     fn offer(
         &mut self,
         mut entry: Entry,
-        cx: &mut Context<'_>,
         port: &mut Port,
         now: Duration,
     ) -> Result<Entry, StartupError> {
@@ -246,16 +273,11 @@ impl Outbound {
                         ozzy_runtime::profiling::Event::ShardPortRefusal,
                     );
                     entry.retry = now.saturating_add(Duration::from_millis(10));
+                    self.port_refused = true;
                     State::Ready(message)
                 }
                 Err((error, _)) => return Err(failure(error)),
             };
-            if matches!(entry.state, State::Pending(_)) {
-                cx.waker().wake_by_ref();
-            }
-        }
-        if matches!(entry.state, State::Ready(_)) && !self.held.contains(&destination) {
-            self.held.push(destination);
         }
         Ok(entry)
     }
@@ -266,33 +288,31 @@ impl Outbound {
         port: &mut Port,
         slot: usize,
     ) -> Result<(), StartupError> {
-        let message = match self.publications[slot].take() {
+        let mut pending = match self.publications[slot].take() {
             None => return Ok(()),
-            Some(Publication::Ready(message)) => message,
-            Some(Publication::Pending(mut pending)) => {
-                match Pin::new(&mut pending).poll(cx) {
-                    Poll::Pending => {
-                        self.publications[slot] = Some(Publication::Pending(pending));
-                    }
-                    Poll::Ready(Ok(Err((PublicationError::Full, message)))) => {
+            Some(Publication::Pending(pending)) => pending,
+            // A publication handed over now is polled at once, which
+            // registers this turn's waker for its result.
+            Some(Publication::Ready(message)) => {
+                match port.try_publish(message, self.publication_bytes) {
+                    Ok(pending) => pending,
+                    Err((ozzy_runtime::frontend::PortError::Admission(_), message)) => {
                         self.publications[slot] = Some(Publication::Ready(message));
-                        cx.waker().wake_by_ref();
+                        self.port_refused = true;
+                        return Ok(());
                     }
-                    Poll::Ready(Ok(_)) => cx.waker().wake_by_ref(),
-                    Poll::Ready(Err(error)) => return Err(failure(error)),
+                    Err((error, _)) => return Err(failure(error)),
                 }
-                return Ok(());
             }
         };
-        match port.try_publish(message, self.publication_bytes) {
-            Ok(pending) => {
-                self.publications[slot] = Some(Publication::Pending(pending));
+        match Pin::new(&mut pending).poll(cx) {
+            Poll::Pending => self.publications[slot] = Some(Publication::Pending(pending)),
+            Poll::Ready(Ok(Err((PublicationError::Full, message)))) => {
+                self.publications[slot] = Some(Publication::Ready(message));
                 cx.waker().wake_by_ref();
             }
-            Err((ozzy_runtime::frontend::PortError::Admission(_), message)) => {
-                self.publications[slot] = Some(Publication::Ready(message));
-            }
-            Err((error, _)) => return Err(failure(error)),
+            Poll::Ready(Ok(_)) => self.wake_refused(cx),
+            Poll::Ready(Err(error)) => return Err(failure(error)),
         }
         Ok(())
     }

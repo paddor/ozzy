@@ -139,6 +139,8 @@ fn physical_group_matches_frozen_layout_and_round_trips() {
     assert_eq!(&encoded.as_bytes()[0..4], b"OZJE");
     assert_eq!(&encoded.as_bytes()[200..204], b"OZJE");
     assert_eq!(&encoded.as_bytes()[4000..4008], b"OZYSEAL\0");
+    // The durable mark: no group precedes group 1.
+    assert_eq!(&encoded.as_bytes()[4072..4080], &0_u64.to_be_bytes());
     assert_eq!(encoded.end_offset(), 8192);
     assert_eq!(encoded.entry_count(), 2);
 
@@ -154,6 +156,7 @@ fn physical_group_matches_frozen_layout_and_round_trips() {
     assert_eq!(decoded.operations[0].body.as_ref(), b"alpha");
     assert_eq!(decoded.operations[1].body.as_ref(), b"beta payload");
     assert_eq!(decoded.next_chain, encoded.next_chain());
+    assert_eq!(decoded.durable_through, 0);
 
     assert_eq!(
         logical_operation_digest(&operations[0]).as_bytes(),
@@ -166,8 +169,8 @@ fn physical_group_matches_frozen_layout_and_round_trips() {
         ozzy_journal::integrity::hash("ozzy segment golden fixture v1", encoded.as_bytes())
             .as_bytes(),
         &[
-            44, 236, 122, 7, 216, 5, 114, 52, 93, 136, 242, 182, 183, 155, 191, 201, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            143, 48, 11, 189, 108, 191, 92, 3, 34, 59, 11, 148, 217, 93, 138, 43, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ]
     );
 }
@@ -494,4 +497,26 @@ fn compressed_body_roundtrip(encoding: BodyEncoding) {
         decoded.operations[0].digest,
         logical_operation_digest(&operation)
     );
+}
+
+#[test]
+fn durable_mark_is_bound_by_the_group_digest() {
+    let segment = segment();
+    let start = GroupStart::new(2, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS);
+    let encoded = encode_group(&segment, start, &two_operations()).unwrap();
+    let limits = DecodeLimits::default();
+    let decoded = decode_group(&segment, start, encoded.as_bytes(), limits).unwrap();
+    assert_eq!(decoded.durable_through, 1);
+    let mut bytes = encoded.as_bytes().to_vec();
+    bytes[4072..4080].copy_from_slice(&0_u64.to_be_bytes());
+    assert!(matches!(
+        decode_group(&segment, start, &bytes, limits),
+        Err(CodecError::DigestMismatch(_))
+    ));
+    // A group can only mark groups before it.
+    bytes[4072..4080].copy_from_slice(&2_u64.to_be_bytes());
+    assert!(matches!(
+        decode_group(&segment, start, &bytes, limits),
+        Err(CodecError::SealMismatch)
+    ));
 }

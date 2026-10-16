@@ -290,8 +290,10 @@ events! {
         ShardTurn => "shard_turn",
         /// A safety-sweep visit found work no wakeup or timer announced.
         PartitionSweepProgress => "partition_sweep_progress",
-        /// Lossy follower PUB socket could not accept a frame.
-        ReplicaPublicationSendDrop => "replica_publication_send_drop",
+        /// Follower PUB socket was full; the frame waits for space.
+        ReplicaPublicationSendWait => "replica_publication_send_wait",
+        /// Reader PUB socket was full; the frame waits for space.
+        ReaderPublicationSendWait => "reader_publication_send_wait",
         /// Follower PUB frame could not enter its bounded shard queue.
         ReplicaPublicationQueueDrop => "replica_publication_queue_drop",
         /// Follower PUB frame arrived beyond the contiguous retained prefix.

@@ -25,7 +25,11 @@ impl State {
         binding: &mut Binding,
         now: Duration,
     ) -> Result<(), StartupError> {
+        // Deliver input before the visits, so a partition handles it in
+        // this turn. Input then marks its partition without a wakeup.
+        self.actors.defer_wakes();
         self.sync_sessions(cx, binding, now)?;
+        self.receive_inputs(cx, binding, now)?;
         self.outbound.poll(cx, &mut binding.port, now)?;
         let _ = self
             .actors
@@ -41,7 +45,6 @@ impl State {
                 .poll_progress(cx, &self.actors, &mut binding.port)
                 .map_err(failure)?;
         }
-        self.receive_inputs(cx, binding, now)?;
         self.group_cursor = (self.group_cursor + 16) % self.identities.len().max(1);
         Ok(())
     }
@@ -344,11 +347,14 @@ impl State {
         now: Duration,
     ) -> Result<NativeReceive, StartupError> {
         let group = input.route.placement.group;
-        let normal = input
-            .message
-            .part_slice(1)
-            .is_some_and(|header| header.get(5) == Some(&(ozzy_proto::Opcode::PrepareFlow as u8)));
-        if !normal {
+        // PEER flow PREPAREs and their lossy PUB copies are follower data.
+        let data = input.message.part_slice(1).is_some_and(|header| {
+            header.get(5).is_some_and(|&opcode| {
+                opcode == ozzy_proto::Opcode::PrepareFlow as u8
+                    || opcode == ozzy_proto::Opcode::PreparePub as u8
+            })
+        });
+        if !data {
             self.sync_group(group, binding, now)?;
             self.actors
                 .receive(group, &input.message, now)

@@ -3,7 +3,7 @@ use super::*;
 use crate::dispatch::{Budget, Budgets, SendFailure};
 use crate::frontend::Service;
 use crate::frontend::service::tests::{begin, remote, reply, setup};
-use crate::frontend::{WatchLimits, WatchRegistry};
+use crate::frontend::{PublicationSocket, WatchLimits, WatchRegistry};
 use bytes::Bytes;
 use ozzy_proto::{NodeId, Opcode, directory, handshake};
 
@@ -477,8 +477,8 @@ async fn reader_publications_fence_sources_and_charge_transport_aliases() {
         service.poll_command().unwrap();
     }
     observe(&mut right, pending).await.unwrap().unwrap();
-    let transmitted = service
-        .take_publication()
+    let (_, transmitted) = service
+        .take_publication(|_| true)
         .expect("current source publication");
     let alias = transmitted.part_bytes(3).unwrap();
     drop(transmitted);
@@ -532,7 +532,7 @@ async fn reader_publications_fence_sources_and_charge_transport_aliases() {
     route.leader = None;
     service.publish_route(&route).unwrap();
     assert!(
-        service.take_publication().is_none(),
+        service.take_publication(|_| true).is_none(),
         "queued old source is fenced before PUB"
     );
 }
@@ -603,22 +603,22 @@ fn follower_and_reader_publications_have_independent_fair_slots() {
         Err((super::super::PublicationError::Full, _))
     ));
     service.publish(0, reader).unwrap();
+    // A socket that is not ready keeps its slot while the other goes on.
+    let (socket, message) = service
+        .take_publication(|socket| socket == PublicationSocket::Reader)
+        .unwrap();
+    assert_eq!(socket, PublicationSocket::Reader);
+    assert_eq!(message.part_slice(0).unwrap().len(), 32);
+    assert!(service.take_publication(|_| false).is_none());
+    let (socket, message) = service.take_publication(|_| true).unwrap();
+    assert_eq!(socket, PublicationSocket::Follower);
     assert_eq!(
-        service.take_publication().unwrap().part_slice(0),
+        message.part_slice(0),
         Some(placement.group.as_bytes().as_slice())
     );
     service.publish(0, follower).unwrap();
     assert_eq!(
-        service
-            .take_publication()
-            .unwrap()
-            .part_slice(0)
-            .unwrap()
-            .len(),
-        32
-    );
-    assert_eq!(
-        service.take_publication().unwrap().part_slice(0),
+        service.take_publication(|_| true).unwrap().1.part_slice(0),
         Some(placement.group.as_bytes().as_slice())
     );
 }

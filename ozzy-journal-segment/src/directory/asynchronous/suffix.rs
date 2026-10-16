@@ -2,6 +2,7 @@
 //! authority stay outside this physical installer.
 
 use super::Journal;
+use crate::directory::segment_name;
 use crate::suffix::{OwnedOperation, enforce_limit, streaming};
 use crate::{
     CanonicalOperation, ChainPosition, CodecError, Digest, LogPosition, SEGMENT_HEADER_BYTES,
@@ -458,26 +459,34 @@ async fn create_segment(
             start.predecessor_digest,
             replacement.segment_capacity,
         )?;
-        let writer = SegmentWriter::create(
-            journal
-                .access
-                .segment_file(journal.root().join(format!("segments/{id}.log"))),
-            header,
-            SegmentStart {
-                generation: replacement.writer_generation,
-                first_group_number: start.first_group,
-                initial_chain: start.first_chain,
-            },
-            journal.limits.io,
+        let created = super::spare::create_segment_file(
+            &journal.access,
+            journal.root(),
+            id,
+            replacement.segment_capacity,
         )
         .await;
-        match writer {
-            Ok(writer) => return Ok(writer),
-            Err(WriterError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {
+        let file = match created {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 id = id.checked_add(1).ok_or(Error::SegmentIdExhausted)?;
+                continue;
             }
             Err(error) => return Err(error.into()),
-        }
+        };
+        let opened = crate::writer::asynchronous::Opened {
+            path: journal.root().join(segment_name(id)),
+            access: journal.access.clone(),
+            buffered: file,
+        };
+        let start = SegmentStart {
+            generation: replacement.writer_generation,
+            first_group_number: start.first_group,
+            initial_chain: start.first_chain,
+        };
+        return Ok(
+            SegmentWriter::initialize_prepared(opened, header, start, journal.limits.io).await?,
+        );
     }
     Err(Error::ReplacementSegmentConflict)
 }

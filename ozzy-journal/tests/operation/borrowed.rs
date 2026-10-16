@@ -124,7 +124,7 @@ fn prepared_lz4_is_exact_and_replaces_raw_canonical_payload() {
     let records = [OwnedRecord {
         encoding: ozzy_proto::data::Encoding::Raw,
         message_id: MessageId::from_bytes([0x41; 16]),
-        payload: smallvec::smallvec![Bytes::copy_from_slice(&raw)],
+        payload: Bytes::copy_from_slice(&raw).into(),
     }];
     let encoded = lz4rip::block::compress(&raw);
     let mut body = Vec::new();
@@ -175,16 +175,17 @@ fn borrowed_batches_match_frozen_bytes_and_logical_content() {
         OwnedRecord {
             encoding: ozzy_proto::data::Encoding::Raw,
             message_id: MessageId::from_bytes([0x41; 16]),
-            payload: smallvec::smallvec![
+            payload: vec![
                 Bytes::from_static(b"ab"),
                 Bytes::new(),
                 Bytes::from_static(b"c"),
-            ],
+            ]
+            .into(),
         },
         OwnedRecord {
             encoding: ozzy_proto::data::Encoding::Raw,
             message_id: MessageId::from_bytes([0x42; 16]),
-            payload: smallvec::smallvec![Bytes::from_static(b"xyz")],
+            payload: Bytes::from_static(b"xyz").into(),
         },
     ];
     let bytes = unhex(FIXTURES[2]);
@@ -276,7 +277,7 @@ fn borrowed_ranges_reject_counter_overflow_and_empty_records() {
     let record = OwnedRecord {
         encoding: ozzy_proto::data::Encoding::Raw,
         message_id: MessageId::from_bytes([1; 16]),
-        payload: smallvec::smallvec![Bytes::new()],
+        payload: Bytes::new().into(),
     };
     let records = [record.clone(), record];
     for sequence in [false, true] {

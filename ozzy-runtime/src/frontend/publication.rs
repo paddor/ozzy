@@ -25,16 +25,37 @@ pub enum PublicationError {
     Full,
 }
 
+/// The broker PUB socket a publication leaves on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublicationSocket {
+    /// Live canonical replication to followers.
+    Follower,
+    /// Live confirmed records to readers.
+    Reader,
+}
+
+impl PublicationSocket {
+    const ALL: [Self; 2] = [Self::Follower, Self::Reader];
+
+    /// Reader topics are 32 bytes; follower topics are a 16-byte group.
+    fn of(message: &Message) -> Self {
+        if message
+            .part_slice(0)
+            .is_some_and(|prefix| prefix.len() == 32)
+        {
+            Self::Reader
+        } else {
+            Self::Follower
+        }
+    }
+}
+
 impl Service {
     pub(super) fn publish(&mut self, shard: u32, message: Message) -> PublicationResult {
         if let Err(error) = self.check_publication(shard, &message) {
             return Err((error, message));
         }
-        let slot = usize::from(
-            message
-                .part_slice(0)
-                .is_some_and(|prefix| prefix.len() == 32),
-        );
+        let slot = PublicationSocket::of(&message) as usize;
         if self.publications[slot].is_some() {
             return Err((PublicationError::Full, message));
         }
@@ -42,17 +63,24 @@ impl Service {
         Ok(())
     }
 
-    /// Take at most one validated publication for nonblocking PUB admission.
-    /// A full socket may drop it. Its retained-byte ownership follows every
-    /// transmitted alias until physical release; PEER repairs any loss.
-    pub fn take_publication(&mut self) -> Option<Message> {
+    /// Take at most one validated publication for a socket `ready` accepts,
+    /// alternating between sockets. A socket that is not ready keeps its
+    /// slot full, which holds back its source shards. Retained-byte ownership
+    /// follows every transmitted alias until physical release; PEER repairs
+    /// any loss.
+    pub fn take_publication(
+        &mut self,
+        ready: impl Fn(PublicationSocket) -> bool,
+    ) -> Option<(PublicationSocket, Message)> {
         let slot = (0..2)
             .map(|offset| (self.publication_next + offset) % 2)
-            .find(|&slot| self.publications[slot].is_some())?;
+            .find(|&slot| {
+                self.publications[slot].is_some() && ready(PublicationSocket::ALL[slot])
+            })?;
         let (shard, message) = self.publications[slot].take()?;
         self.publication_next = (slot + 1) % 2;
         self.check_publication(shard, &message).ok()?;
-        Some(message)
+        Some((PublicationSocket::ALL[slot], message))
     }
 
     fn check_publication(&self, shard: u32, message: &Message) -> Result<(), PublicationError> {

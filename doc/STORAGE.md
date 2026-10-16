@@ -23,6 +23,7 @@ Each partition store lives in
 | `DURABLE` | Synchronized accepted-prefix evidence |
 | `MEMORY_VOTING` | Replicated-persisting running/drained evidence |
 | `segments/<id>.log`, `segments/<id>.<generation>.log` | Operations and payloads; the second form is a replacement |
+| `segments/spare.log` | A retired segment file kept for the next new segment |
 | `indexes/<segment-id>-<segment-digest-hex>.idx` | Derived, rebuildable lookup |
 | `checkpoints/<id-hex>/` | `manifest` plus `CHUNK.<8-hex-ordinal>` files |
 | `staging/` | Unselected work (`index-*`, `.checkpoint-*.tmp`) |
@@ -74,9 +75,9 @@ Metadata temporaries are `.MANIFEST.<generation>.tmp`,
 ## Segment layout
 
 A segment is a 4096-byte header (`OZYSEG\0\0`, version 3), then physical write
-groups, then unused preallocated capacity. Each group ends with padding and a
-96-byte seal (`OZYSEAL\0`); its size is a multiple of 4096. A group can hold
-several canonical operations.
+groups, then unused capacity. Each group ends with padding and a 96-byte seal
+(`OZYSEAL\0`); its size is a multiple of 4096. A group can hold several
+canonical operations.
 
 | Codec | Group contents before padding and seal |
 | --- | --- |
@@ -88,9 +89,13 @@ several canonical operations.
   original file).
 - Entry headers stay uncompressed. They carry kind, operation identity, chain
   and body digests, lengths, and codec.
-- A seal records group number, start and end offsets, entry count, and a group
-  digest.
+- A seal records group number, start and end offsets, entry count, a durable
+  mark, and a group digest. The mark is the highest group number already
+  durable when this group was prepared; the digest covers it.
 - Unknown versions, codecs, flags, or nonzero reserved bytes fail validation.
+- Unused capacity holds zeros, preallocated space, or groups from an earlier
+  use of the file, which never validate against the new header. Readers of a
+  sealed segment read only its sealed bytes.
 
 Exact layout: [segment codec](../ozzy-journal-segment/src/codec.rs).
 
@@ -218,11 +223,12 @@ Commands are in [the protocol](PROTOCOL.md). Stored state:
 2. Write physical groups; resume short or interrupted writes until complete.
 3. Install completions in order for the matching generation. An ambiguous
    failure fences the writer.
-4. Publish required durable evidence, satisfy the policy, then apply and reply.
+4. Satisfy the policy, then apply and reply. `DURABLE` evidence follows on its
+   own; no vote or confirmation waits for it.
 
 | Topic `confirmation` | Segment writes | Boundary |
 | --- | --- | --- |
-| `local-durable`, `disk-quorum` | `O_DSYNC` | Each completed write is durable; `DURABLE` still publishes the prefix |
+| `local-durable`, `disk-quorum` | `O_DSYNC` | Each completed write is durable and confirms or votes at once |
 | `replicated-persisting` | Buffered | Written progress only; flush, roll, promises, and shutdown add barriers |
 
 With the `aio` backend (the Linux default), segment data writes use a separate
@@ -230,6 +236,13 @@ With the `aio` backend (the Linux default), segment data writes use a separate
 
 - A write group takes the ready operations; there is no fill delay.
 - Preallocation reserves the full capacity; appends advance a logical prefix.
+- The first write into an unwritten extent costs a metadata commit; on XFS a
+  4 KiB `O_DSYNC` write took 1.6 ms there and 0.65 ms into written blocks. So
+  every new segment, from a roll or from a log a new view installs, takes the
+  spare when there is one.
+- `format` writes up to 128 MiB of zeros once where a new store's first
+  appends land: the first segment of a local store, or a spare in a
+  replicated store, whose first election installs its log into a new segment.
 - `O_DSYNC` is not multi-write atomicity. AIO completion alone is no barrier.
   Metadata files and directories need their own syncs.
 - Cancellation releases observation only. Buffers, handles, and admission stay
@@ -237,7 +250,8 @@ With the `aio` backend (the Linux default), segment data writes use a separate
 
 ### Segment roll
 
-1. Create the successor with a new ID, preallocate it, and sync it.
+1. Create the successor with a new ID, move the spare over it if there is one,
+   preallocate it, and sync it.
 2. Write and sync its header, which binds the predecessor ID and the chain
    digest before the successor.
 3. Sync the predecessor and the `segments/` directory.
@@ -250,8 +264,12 @@ generation.
 ## Durable recovery evidence
 
 - Every store has `DURABLE`. It holds the synchronized accepted prefix,
-  including operations without a commit announcement. Disk-quorum brokers
-  publish it before voting.
+  including operations without a commit announcement. It is published after
+  the writes it covers, off the confirmation path; until then, later group
+  seals mark those writes durable.
+- A partition publishes it after 20 ms with no write in flight, after half a
+  window of writes, when maintenance is due, and before elections and
+  shutdown. Under load it no longer competes with every write for the disk.
 - Each copy sits in one 512-byte sector. A publication rewrites both in place,
   older first, under one data barrier and without rename. Sector writes are
   assumed atomic.
@@ -272,13 +290,17 @@ generation.
 | Condition | Action |
 | --- | --- |
 | Normal open | Verify identities, authority, selected files, seals, chain, and anchors |
-| Zero suffix | Unused preallocated capacity |
-| Active damage after durable prefix | Discard/zero damaged group and later suffix; restore allocation |
-| Damage at/before durable prefix | Refuse without changing bytes |
+| Zero or stale suffix | Unused capacity |
+| Active damage after durable prefix | End the log at the damaged group; later groups of this use lose their seals; restore allocation |
+| Damage at/before durable prefix, or marked durable by a later valid group | Refuse without changing bytes |
 | Sealed/installed damage | Refuse strict open; authorized sealed repair may apply |
 | Corrupt or missing index | Rebuild from validated segment bytes |
 | Corrupt authority / lost store / unclean RP | Fail closed or stay nonvoting for recovery |
 
+- Writes in flight can complete out of order. A valid group after a damaged
+  one that does not mark it durable followed an unfinished write; recovery
+  discards both. Overwriting the later group's seal stops a byte-identical
+  rewrite of the damaged group from chaining into it again.
 - Replication authorizes suffix replacement; see [replication](REPLICATION.md).
   Protected committed fragments survive physical regrouping.
 - Replacements are staged, validated, synchronized, and selected atomically.
@@ -380,6 +402,9 @@ Topics set `retention.max_age_secs` and `retention.max_bytes`; see
   and changes no record or retry floor. A background job removes only objects
   older than its captured selection, and only while `CURRENT` names that
   generation or a newer one. A failed cleanup job fences the owner.
+- Cleanup renames one unselected segment file to `segments/spare.log` instead
+  of unlinking it, unless a spare exists. So a byte-limited partition can use
+  one segment more than `max_bytes` on disk.
 - Opening a store removes recognized `staging/` leftovers.
 
 ## Operator tuning

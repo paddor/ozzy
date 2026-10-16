@@ -9,7 +9,7 @@ use crate::{
     CurrentReference, DirectoryError, GroupIdentity, JournalGroupEncoding, Manifest, SegmentWriter,
     WriterError, async_files::Access, async_metadata, encode_manifest_with_limits,
 };
-use ozzy_io::{Handle, OpenMode, Operation};
+use ozzy_io::Handle;
 use ozzy_journal::progress::JournalGeneration;
 use std::{io, ops::Range, path::PathBuf, rc::Rc, sync::Arc};
 
@@ -164,7 +164,8 @@ impl Journal {
 }
 
 impl Preparation {
-    /// Exclusive-create, allocate and sync without selecting or writing a header.
+    /// Exclusive-create, take the spare if there is one, allocate and sync
+    /// without selecting or writing a header.
     pub async fn prepare(self) -> Result<Segment, DirectoryError> {
         let mut id = self.predecessor;
         for _ in 0..self.max_probes {
@@ -172,27 +173,14 @@ impl Preparation {
                 .checked_add(1)
                 .ok_or(DirectoryError::SegmentIdExhausted)?;
             let lease = self.pins.protect_prepared_segment(id)?;
-            let file = match self
-                .access
-                .open(
-                    self.root.join(segment_name(id)),
-                    OpenMode::CreateNew,
-                    false,
-                    false,
-                )
-                .await
-            {
+            let created =
+                super::spare::create_segment_file(&self.access, &self.root, id, self.capacity)
+                    .await;
+            let file = match created {
                 Ok(file) => file,
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error.into()),
             };
-            self.access
-                .done(Operation::Allocate {
-                    handle: file.clone(),
-                    offset: 0,
-                    length: self.capacity,
-                })
-                .await?;
             self.access.sync(&file).await?;
             return Ok(Segment {
                 scope: self,

@@ -1,7 +1,6 @@
 //! Group-owned records. Tiny single-part payloads need no per-record owners.
 
 use bytes::Bytes;
-use smallvec::SmallVec;
 
 use super::OwnedRecord;
 use crate::{MessageId, layout::Fixed};
@@ -173,10 +172,10 @@ impl<'a> PayloadRef<'a> {
         }
     }
     /// Materialize at an API that requires independently owned records.
-    pub fn to_owned(self) -> SmallVec<[Bytes; 2]> {
+    pub fn to_owned(self) -> super::RecordPayload {
         match self {
             Self::Parts(p) => p.iter().cloned().collect(),
-            Self::Single(p) => smallvec::smallvec![Bytes::copy_from_slice(p)],
+            Self::Single(p) => Bytes::copy_from_slice(p).into(),
             Self::Encoded(p) => p.iter().map(Bytes::copy_from_slice).collect(),
         }
     }
@@ -434,7 +433,7 @@ mod tests {
             general.push(OwnedRecord {
                 encoding: crate::data::Encoding::Raw,
                 message_id: id,
-                payload: smallvec::smallvec![Bytes::from(payload)],
+                payload: Bytes::from(payload).into(),
             });
         }
         let before = packed.clone();

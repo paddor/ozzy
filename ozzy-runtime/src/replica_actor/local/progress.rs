@@ -21,7 +21,10 @@ impl LocalActor {
             && let Some((_, started_at)) = self.persistence.pop_front()
         {
             crate::profiling::finish(crate::profiling::Stage::LocalWrite, started_at);
-            self.driver.complete_write(result?)?;
+            // `O_DSYNC` made the write durable, and later seals mark it. It
+            // confirms now; durable evidence follows off this path.
+            self.driver.complete_durable_write(result?)?;
+            self.last_persisted = Some(self.now);
             changed = true;
         }
         changed |= self.poll_sync(cx)?;

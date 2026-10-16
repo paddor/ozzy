@@ -25,9 +25,10 @@ pub use ozzy_runtime::replicated::{
     BrokerLinksConfig, ClockError, DataLimits, GroupInspection, GroupReader, GroupReaderConfig,
     GroupReaderError, GroupRecord, GroupStart, IdPolicy, PendingProgress, Policy,
     ProcessingIdentity, ProcessingToken, ProducerIdentity, ProgressError, ProgressReceipt,
-    ReaderLinkLimits, ReaderStart, RecordInput, RecordReceipt, RetryPolicy, SdkClock,
-    SharedTopicPendingRecord, SharedTopicReceipt, SharedTopicWriter, SharedTopicWriterConfig,
-    SharedWriterReservation, TopicCheckpoint, TopicReader, TopicReaderConfig, TopicReaderError,
-    TopicReaderStats, TopicRecord, TopicWriterError, WriterError, WriterRuntime,
+    ReaderLinkLimits, ReaderStart, RecordInput, RecordPayload, RecordReceipt, RetryPolicy,
+    SdkClock, SharedTopicPendingRecord, SharedTopicReceipt, SharedTopicWriter,
+    SharedTopicWriterConfig, SharedWriterReservation, TopicCheckpoint, TopicReader,
+    TopicReaderConfig, TopicReaderError, TopicReaderStats, TopicRecord, TopicWriterError,
+    WriterError, WriterRuntime,
 };
 pub use ozzy_runtime::{Error, Result};

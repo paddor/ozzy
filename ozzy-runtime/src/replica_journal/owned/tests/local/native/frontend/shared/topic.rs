@@ -67,6 +67,9 @@ async fn multiple() {
     assert_eq!(healthy.record.offset, 0);
     assert_eq!(healthy.record.key.first_sequence, 0);
     assert_eq!(harness.openings.len(), 1, "sparse partition opened early");
+    // Partition 1 publishes its durable evidence after the confirmation;
+    // that write must not be the I/O held for partition 0 below.
+    harness.quiesce().await;
     let blocked = writer.send(record(51), Some(&first_key)).await.unwrap();
     assert_eq!(blocked.partition(), 0);
     for _ in 0..10000 {

@@ -33,6 +33,7 @@ pub use recovery::{RecoveryDirectory, Repair};
 mod retention;
 mod roll;
 mod snapshot;
+mod spare;
 mod suffix;
 pub use retention::{
     RetirementBudget, RetirementProof, RetirementScan, ScannedPrefix, SegmentFiles,
@@ -159,6 +160,13 @@ impl Journal {
     /// Borrow the active physical segment writer.
     pub const fn writer(&self) -> &SegmentWriter {
         &self.writer
+    }
+    /// Write zeros over up to `bytes` of the active segment's unused capacity,
+    /// so appends there overwrite written blocks instead of converting
+    /// unwritten extents. The broker does this once when it formats a store.
+    pub async fn zero_ahead(&mut self, bytes: u64) -> Result<(), DirectoryError> {
+        self.healthy()?;
+        Ok(self.writer.zero_ahead(bytes).await?)
     }
     /// Whether failure or canceled mutation fences further use.
     pub fn is_faulted(&self) -> bool {
@@ -324,15 +332,22 @@ impl Journal {
         }
     }
 
+    /// The valid prefix of a selected segment: its sealed bytes, or what the
+    /// writer has written.
     async fn segment_image(&self, reference: SegmentReference) -> Result<Vec<u8>, DirectoryError> {
         if reference.capacity > self.limits.io.max_segment_bytes {
             return Err(DirectoryError::SegmentMismatch(reference.segment_id));
         }
+        let valid_bytes = reference.sealed.map_or_else(
+            || self.writer.written_position().end_offset(),
+            |sealed| sealed.valid_bytes,
+        );
         Ok(self
             .access
-            .read_file(
+            .read_prefix(
                 self.root().join(segment_reference_name(reference)),
-                reference.capacity as usize,
+                valid_bytes,
+                reference.capacity,
                 self.limits.io.chunk_bytes,
             )
             .await?)

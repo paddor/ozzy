@@ -9,6 +9,8 @@ use ozzy_core::live::CursorError;
 use ozzy_proto::Opcode;
 
 impl Cursor {
+    // Inlined into `poll`: runs once per delivered record.
+    #[inline]
     pub(super) fn deliver(
         &mut self,
         links: &BrokerLinks,
@@ -92,7 +94,14 @@ impl Cursor {
         if decision == Replayed::Ignore {
             return Ok(());
         }
-        self.pending = Some(FrameRecords::new(delivery.records, frames[0].clone()).into_batch(0));
+        self.pending = Some(
+            FrameRecords::new(
+                delivery.records,
+                delivery.payload_encoding,
+                frames[0].clone(),
+            )
+            .into_batch(0),
+        );
         self.pending_live = false;
         if let Replayed::DeliverThenHeld { skip } = decision
             && let Some(held) = self.held.take()
@@ -170,6 +179,7 @@ impl Cursor {
         ) else {
             return Ok(());
         };
+        let live = self.live.replay().is_none();
         match self
             .live
             .publication(
@@ -181,13 +191,24 @@ impl Cursor {
         {
             Publication::Drop => {}
             Publication::Hold => {
-                self.held = Some(FrameRecords::new(delivery.records, frames[0].clone()));
+                self.live_gaps += u64::from(live);
+                self.held = Some(FrameRecords::new(
+                    delivery.records,
+                    delivery.payload_encoding,
+                    frames[0].clone(),
+                ));
                 // A known gap needs repair now, independent of quiet refresh.
                 self.due = now;
             }
             Publication::Deliver { skip } => {
-                self.pending =
-                    Some(FrameRecords::new(delivery.records, frames[0].clone()).into_batch(skip));
+                self.pending = Some(
+                    FrameRecords::new(
+                        delivery.records,
+                        delivery.payload_encoding,
+                        frames[0].clone(),
+                    )
+                    .into_batch(skip),
+                );
                 self.pending_live = true;
             }
         }

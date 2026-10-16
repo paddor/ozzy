@@ -33,7 +33,7 @@ terms.
 
 | Rule | Disk quorum | Replicated-persisting |
 | --- | --- | --- |
-| Vote evidence | Durable prefix behind a completed disk barrier | Validated bytes retained in RAM |
+| Vote evidence | Durable prefix of completed `O_DSYNC` writes | Validated bytes retained in RAM |
 | Leader commits through | Own durable prefix and one matching follower vote | Own retained prefix and one matching follower vote |
 | Follower applies through | Announced commit, capped by its durable prefix | Announced commit, capped by its retained prefix |
 | Storage deadline resets on | Durable progress | Written progress |
@@ -65,8 +65,9 @@ RP persistence:
 
 - The leader publishes each PREPARE once on PUB to both followers. There are no
   recipient masks or follower credits.
-- Full queues and gaps drop publications; PEER repair fills them. Follower and
-  reader publications use separate backing.
+- A full leader PUB socket delays publications. Full subscriber queues and
+  gaps drop them; PEER repair fills them. Follower and reader publications
+  use separate backing.
 - Repair uses one data PEER connection per destination shard. A full shard
   pauses only that source; control and healthy copies continue.
 - If both followers stall, the unconfirmed window fills and producers see
@@ -87,6 +88,9 @@ sequenceDiagram
 
 - Followers keep only a contiguous prefix. Leader probes find gaps, including
   a lost final publication.
+- Followers report PUB receipt unasked, so new work does not hurry a probe.
+  COMMIT and votes go out when they change. The heartbeat and retransmit
+  timers repeat them, which covers a lost packet.
 - Only an answered probe starts payload repair. Repaired operations get the
   same validation as live ones.
 - A receipt reports a retained prefix and cumulative bytes. It grants no vote,

@@ -240,6 +240,9 @@ impl ScheduledReplica {
         ] {
             self.actor.outbox.discard(peer, class);
         }
+        // A discarded COMMIT or vote is no longer the last one the peer saw.
+        self.actor.work.announced[voter] = None;
+        self.actor.acked = None;
         self.actor.ack_at = now;
         self.actor.more_work = true;
     }

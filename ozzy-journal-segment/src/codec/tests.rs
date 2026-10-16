@@ -149,7 +149,14 @@ fn raw_extents_match_contiguous_encoding_without_copying_bodies() {
         let layouts = prepared.entry_layouts(SEGMENT_HEADER_BYTES as u64).unwrap();
         let finalized = finalize_group_bodies(
             &segment,
-            crate::GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS),
+            crate::codec::GroupWrite {
+                start: crate::GroupStart::new(
+                    1,
+                    SEGMENT_HEADER_BYTES as u64,
+                    ChainPosition::GENESIS,
+                ),
+                durable_through: 0,
+            },
             &operations,
             &digests,
             &mut prepared,
@@ -216,7 +223,14 @@ fn lz4_requires_matching_canonical_body_digest() {
         // accepted under the original canonical body/operation/structural seal.
         let finalized = finalize_group_bodies(
             &segment,
-            crate::GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS),
+            crate::codec::GroupWrite {
+                start: crate::GroupStart::new(
+                    1,
+                    SEGMENT_HEADER_BYTES as u64,
+                    ChainPosition::GENESIS,
+                ),
+                durable_through: 0,
+            },
             &[operation],
             &[body_digest],
             &mut prepared,

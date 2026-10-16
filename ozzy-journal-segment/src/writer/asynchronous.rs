@@ -307,9 +307,9 @@ impl Writer {
                 })
                 .await?;
         }
-        access
-            .zero(&buffered, recovered.zero, options.chunk_bytes)
-            .await?;
+        for range in recovered.invalidate {
+            access.zero(&buffered, range, options.chunk_bytes).await?;
+        }
         access.sync(&buffered).await?;
         let opened = Opened {
             path,
@@ -489,21 +489,20 @@ impl Writer {
         self.state.complete_sync_result(position, Ok(()))
     }
 
-    /// Prepare unused extents without changing history. Only legal when every
-    /// installed group is already synchronized.
-    pub async fn zero_remainder(&mut self) -> Result<(), WriterError> {
+    /// Zero up to `bytes` of unused capacity after the written prefix, without
+    /// changing history. Only legal when every installed group is already
+    /// synchronized.
+    pub async fn zero_ahead(&mut self, bytes: u64) -> Result<(), WriterError> {
         self.healthy()?;
         if self.written_position() != self.durable_position() {
             return Err(WriterError::InvalidSyncPosition);
         }
+        let start = self.written_position().end_offset();
+        let end = start.saturating_add(bytes).min(self.header().capacity());
         self.interrupted = true;
         let result = async {
             self.access
-                .zero(
-                    &self.buffered,
-                    self.written_position().end_offset()..self.header().capacity(),
-                    self.options.chunk_bytes,
-                )
+                .zero(&self.buffered, start..end, self.options.chunk_bytes)
                 .await?;
             self.access.sync(&self.buffered).await
         }

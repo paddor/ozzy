@@ -23,11 +23,11 @@ mod tests;
 pub(crate) use body::BodyEncodeScratch;
 pub use body::BodyEncoding;
 pub use decode::{DecodedGroup, DecodedOperation, decode_group};
-pub(crate) use decode::{decode_indexed_operation, group_extent};
+pub(crate) use decode::{decode_indexed_operation, durable_mark_ending_at, group_extent};
 pub use encode::{EncodedGroup, encode_group, encode_group_with_body_encoding};
 pub(crate) use encode::{
-    FinalizedGroup, PreparedGroupBodies, finalize_group_bodies, finalize_group_descriptors,
-    prepare_group_bodies,
+    FinalizedGroup, GroupWrite, PreparedGroupBodies, finalize_group_bodies,
+    finalize_group_descriptors, prepare_group_bodies,
 };
 pub use error::CodecError;
 pub(crate) use extents::prepare_raw_group_extents;
@@ -36,10 +36,8 @@ pub use header::{SegmentHeader, decode_segment_header, encode_segment_header};
 pub use limits::DecodeLimits;
 pub(crate) use limits::validate_decode_limits;
 pub(crate) use packed::PackedOperation;
-#[cfg(test)]
-pub(crate) use scanning::scan;
 pub(crate) use scanning::{
-    SegmentDigestBuilder, salvage_entries, scan_segment_async, scan_segment_prefix_async,
+    SegmentDigestBuilder, salvage_entries, scan, scan_segment_async, scan_segment_prefix_async,
 };
 pub use scanning::{SegmentScan, TailState, scan_segment};
 pub(crate) use shared::prepare_shared_group_bodies;

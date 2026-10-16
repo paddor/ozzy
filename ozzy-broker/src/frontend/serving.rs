@@ -1,17 +1,18 @@
 //! Ordinary receive and transport lifecycle. Partition work stays on shards.
 
-use omq_tokio::{Endpoint, TrySendError};
+use omq_tokio::Endpoint;
 use ozzy_proto::NodeId;
 use ozzy_runtime::frontend::{
     DataPressure, Kind, ReceiveBuffers, ReceiveError, Rejection, Service,
 };
-use ozzy_runtime::transport::Frames;
 use std::{collections::BTreeMap, time::Duration};
 
 use super::{FollowerRoutes, FrontendContext, StartupError, error, followers::Followers};
 
 mod ingress;
+mod publishers;
 use ingress::Ingress;
+use publishers::Publishers;
 
 /// Remote brokers a frontend serves: control endpoints and follower routes.
 #[derive(Clone, Debug, Default)]
@@ -115,6 +116,7 @@ impl FrontendContext {
         self.ready()?;
         let mut control = Ingress::new(&self.peer, self.monitor, false, &self.shutdown, serving);
         let mut data = Ingress::new(&self.data, self.data_monitor, true, &self.shutdown, serving);
+        let mut publishers = Publishers::new(self.follower_pub.as_ref(), &self.reader_pub);
         let mut tick = tokio::time::interval(serving.retry);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -122,33 +124,27 @@ impl FrontendContext {
             // received, admit synchronously before observing another cutover.
             let control_ready = control.prepare(service)?;
             let data_ready = data.prepare(service)?;
-            if let Some(message) = service.take_publication() {
-                publish(
-                    &self.reader_pub,
-                    self.follower_pub.as_ref(),
-                    service,
-                    message,
-                )?;
-            }
+            publishers.publish(service)?;
             tokio::select! {
                 () = self.shutdown.closed() => return Ok(()),
                 event = control.monitor.recv() => {
                     control.observe(event.map_err(failure)?, service)?;
                 }
-                message = control.socket.recv_from_source(None), if control_ready => {
+                message = control.socket.recv_with_receipt(None), if control_ready => {
                     let (receipt, body) = message.map_err(failure)?;
                     control.receive(service, receipt, body)?;
                 }
                 event = data.monitor.recv() => {
                     data.observe(event.map_err(failure)?, service)?;
                 }
-                message = data.socket.recv_from_source(None), if data_ready => {
+                message = data.socket.recv_with_receipt(None), if data_ready => {
                     let (receipt, body) = message.map_err(failure)?;
                     data.receive(service, receipt, body)?;
                 }
                 (publisher, received) = publications.receive() => {
                     receive_publication(service, serving.buffers, publisher, received)?;
                 }
+                socket = publishers.ready() => publishers.retry(socket)?,
                 Some(lane) = control.paused.writable(), if control_ready => {
                     control.retry(lane, service)?;
                 }
@@ -257,38 +253,6 @@ fn check_followers(
         return Err(error("follower PUB missing"));
     }
     Ok(())
-}
-
-fn publish(
-    reader: &omq_tokio::Socket,
-    followers: Option<&omq_tokio::Socket>,
-    service: &Service,
-    message: omq_tokio::Message,
-) -> Result<(), StartupError> {
-    let (_, frames) = message
-        .routed_packet()
-        .ok_or_else(|| error("publication is not one routed packet"))?;
-    let publication =
-        ozzy_proto::decode_packet(&frames, service.envelope_limits()).map_err(failure)?;
-    let follower = publication.envelope.opcode == ozzy_proto::Opcode::PreparePub;
-    let socket = if follower {
-        followers.ok_or_else(|| error("follower PUB missing"))?
-    } else {
-        reader
-    };
-    match socket.try_send(message) {
-        Ok(()) => Ok(()),
-        Err(TrySendError::Full(_)) => {
-            if follower {
-                ozzy_runtime::profiling::event(
-                    ozzy_runtime::profiling::Event::ReplicaPublicationSendDrop,
-                );
-            }
-            Ok(())
-        }
-        Err(TrySendError::Closed) => Err(error("publication socket closed")),
-        Err(TrySendError::Error(error)) => Err(failure(error)),
-    }
 }
 
 fn fatal(error: &ReceiveError) -> bool {

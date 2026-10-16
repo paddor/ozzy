@@ -9,7 +9,7 @@ use super::{
     enforce_limit,
     entry::{ParsedEntry, parse_entry},
     group_end_offset, require_len,
-    seal::{GroupDigestBuilder, GroupSeal, validate_seal},
+    seal::{GroupDigestBuilder, GroupSeal, SealRecord, read_seal, validate_seal},
     shared, span, validate_decode_limits,
 };
 use ozzy_journal::operation::{
@@ -56,6 +56,8 @@ pub struct DecodedGroup<'a> {
     pub end_offset: u64,
     /// Structural digest derived from the validated logical operation digests.
     pub digest: Digest,
+    /// Highest group number durable when this group was prepared.
+    pub durable_through: u64,
     /// Validated canonical operation entries in group order.
     pub operations: Vec<DecodedOperation<'a>>,
     /// Next canonical operation number and predecessor digest.
@@ -75,7 +77,7 @@ struct ParsedGroup {
     entries: Vec<ParsedEntry>,
     shared: Option<shared::Body>,
     end_offset: u64,
-    digest: Digest,
+    seal: SealRecord,
 }
 
 /// Parsed entries of one physical extent and the bytes they index.
@@ -145,37 +147,107 @@ pub fn decode_group<'a>(
     input: &'a [u8],
     limits: DecodeLimits,
 ) -> Result<DecodedGroup<'a>, CodecError> {
-    let GroupStart {
-        group_number,
-        start_offset,
-        chain,
-    } = start;
+    validate_group_position(start.group_number, start.start_offset)?;
+    validate_decode_limits(limits)?;
+    let parsed = scan_physical_group(
+        segment,
+        start.group_number,
+        start.start_offset,
+        input,
+        limits,
+    )?;
+    decode_parsed(segment, start, input, parsed, limits)
+}
+
+/// The durable mark of a valid group that ends at `end`, follows `damaged`,
+/// the group that failed to decode at `from`, and starts at or after it.
+/// `None` when no such group ends there. Groups from an earlier use of the
+/// file have lower numbers and never validate against this header.
+pub(crate) fn durable_mark_ending_at(
+    segment: &SegmentHeader,
+    image: &[u8],
+    (damaged, from): (u64, u64),
+    end: usize,
+    limits: DecodeLimits,
+) -> Option<u64> {
+    let seal = image.get(end.checked_sub(GROUP_SEAL_BYTES)?..end)?;
+    let recorded = read_seal(seal.try_into().ok()?)?;
+    if recorded.end_offset != u64::try_from(end).ok()?
+        || recorded.start_offset < from
+        || recorded.group_number <= damaged
+    {
+        return None;
+    }
+    let input = image.get(usize::try_from(recorded.start_offset).ok()?..end)?;
+    probe_durable_mark(
+        segment,
+        recorded.group_number,
+        recorded.start_offset,
+        input,
+        limits,
+    )
+    .ok()
+}
+
+/// Validate a group whose predecessor is unknown: its chain starts at its
+/// first entry, and framing, bodies, the chain within it, and the digest must
+/// all hold.
+fn probe_durable_mark(
+    segment: &SegmentHeader,
+    group_number: u64,
+    start_offset: u64,
+    input: &[u8],
+    limits: DecodeLimits,
+) -> Result<u64, CodecError> {
     validate_group_position(group_number, start_offset)?;
     validate_decode_limits(limits)?;
     let parsed = scan_physical_group(segment, group_number, start_offset, input, limits)?;
-    let expected_group_digest = parsed.digest;
+    let first = parsed.entries.first().ok_or(CodecError::EmptyGroup)?;
+    let chain = ChainPosition::new(first.op_number, first.previous_digest);
+    let start = GroupStart::new(group_number, start_offset, chain);
+    decode_parsed(segment, start, input, parsed, limits).map(|group| group.durable_through)
+}
+
+fn decode_parsed<'a>(
+    segment: &SegmentHeader,
+    start: GroupStart,
+    input: &'a [u8],
+    parsed: ParsedGroup,
+    limits: DecodeLimits,
+) -> Result<DecodedGroup<'a>, CodecError> {
+    let ParsedGroup {
+        entries,
+        shared,
+        end_offset,
+        seal,
+    } = parsed;
     let extent = ParsedExtent {
         input,
-        start_offset,
-        entries: parsed.entries,
-        shared: parsed.shared.as_ref(),
+        start_offset: start.start_offset,
+        entries,
+        shared: shared.as_ref(),
     };
-    let (operations, next_chain) = decode_operations(segment, chain, &extent, limits)?;
-    let mut group_digest =
-        GroupDigestBuilder::new(segment, group_number, start_offset, operations.len())?;
+    let (operations, next_chain) = decode_operations(segment, start.chain, &extent, limits)?;
+    let mut group_digest = GroupDigestBuilder::new(
+        segment,
+        start.group_number,
+        start.start_offset,
+        operations.len(),
+    )?;
     for operation in &operations {
         group_digest.push(operation.digest);
     }
-    let digest = group_digest.finish(parsed.end_offset);
-    if digest != expected_group_digest {
+    let digest = group_digest.finish(end_offset, seal.durable_through);
+    if digest != seal.digest {
         return Err(CodecError::DigestMismatch("physical group seal"));
     }
 
     Ok(DecodedGroup {
-        group_number,
-        start_offset,
-        end_offset: parsed.end_offset,
+        group_number: start.group_number,
+        start_offset: start.start_offset,
+        end_offset,
         digest,
+        durable_through: seal.durable_through,
         operations,
         next_chain,
     })
@@ -298,7 +370,7 @@ fn scan_physical_group(
         end_offset,
         entry_count: u64::try_from(entries.len()).map_err(|_| CodecError::LengthOverflow)?,
     };
-    let digest = validate_seal(
+    let seal = validate_seal(
         span(input, 0..group_bytes, "physical group")?,
         seal_offset,
         seal,
@@ -308,7 +380,7 @@ fn scan_physical_group(
         entries,
         shared,
         end_offset,
-        digest,
+        seal,
     })
 }
 

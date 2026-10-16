@@ -15,7 +15,8 @@ mod tests;
 pub(super) struct Recovery {
     pub(super) writer: SegmentState,
     pub(super) truncate: Option<u64>,
-    pub(super) zero: Range<u64>,
+    /// Seal blocks of later groups of this use, past the end of the log.
+    pub(super) invalidate: Vec<Range<u64>>,
 }
 
 pub(super) async fn prepare_async(
@@ -46,24 +47,60 @@ pub(super) async fn prepare_async(
         segment_digest.push(group.digest);
     }
     checks.finish(scan.next_chain)?;
-    let truncate = matches!(scan.tail, TailState::Truncated { .. }).then_some(scan.valid_bytes);
-    let zero = if matches!(scan.tail, TailState::Damaged { .. }) {
-        let start = scan.valid_bytes as usize;
-        let mut end = image.len();
-        while end > start {
-            let block = ((end - 1) / crate::WRITE_GROUP_ALIGNMENT * crate::WRITE_GROUP_ALIGNMENT)
-                .max(start);
-            if image[block..end].iter().any(|byte| *byte != 0) {
-                break;
-            }
-            budget.charge(end - block).await;
-            end = block;
+    let later = match scan.tail {
+        TailState::Truncated { .. } | TailState::Damaged { .. } => {
+            unmarked_later_groups(image, &scan, limits, &mut budget).await?
         }
-        scan.valid_bytes..end as u64
-    } else {
-        0..0
+        TailState::Clean | TailState::ZeroFilled { .. } => Vec::new(),
     };
-    Ok(finish(scan, generation, segment_digest, truncate, zero))
+    let truncate = matches!(scan.tail, TailState::Truncated { .. }).then_some(scan.valid_bytes);
+    // Truncation removes later groups. Otherwise each loses its seal, so a
+    // rewrite of the damaged group cannot chain into it again.
+    let invalidate = if truncate.is_some() {
+        Vec::new()
+    } else {
+        let block = crate::WRITE_GROUP_ALIGNMENT as u64;
+        later.into_iter().map(|end| end - block..end).collect()
+    };
+    Ok(finish(
+        scan,
+        generation,
+        segment_digest,
+        truncate,
+        invalidate,
+    ))
+}
+
+/// End offsets of the valid groups of this use after the first group that
+/// failed to decode. The log may end at that group only if none of them marks
+/// it durable. Earlier groups mark only their predecessors.
+async fn unmarked_later_groups(
+    image: &[u8],
+    scan: &SegmentScan<'_>,
+    limits: DecodeLimits,
+    budget: &mut Budget,
+) -> Result<Vec<u64>, WriterError> {
+    let damaged = scan.next_group_number;
+    let start = usize::try_from(scan.valid_bytes).map_err(|_| crate::CodecError::LengthOverflow)?;
+    let alignment = crate::WRITE_GROUP_ALIGNMENT;
+    let mut later = Vec::new();
+    for end in (start + alignment..=image.len()).step_by(alignment) {
+        budget.charge(alignment).await;
+        let Some(mark) = crate::codec::durable_mark_ending_at(
+            &scan.header,
+            image,
+            (damaged, scan.valid_bytes),
+            end,
+            limits,
+        ) else {
+            continue;
+        };
+        if mark >= damaged {
+            return Err(WriterError::DurableGroupDamaged(damaged));
+        }
+        later.push(end as u64);
+    }
+    Ok(later)
 }
 
 /// Both execution paths consume the same canonical and protected-history checks.
@@ -137,7 +174,7 @@ fn finish(
     generation: JournalGeneration,
     segment_digest: SegmentDigestBuilder,
     truncate: Option<u64>,
-    zero: Range<u64>,
+    invalidate: Vec<Range<u64>>,
 ) -> Recovery {
     let position = WriterPosition {
         generation,
@@ -161,6 +198,6 @@ fn finish(
             faulted: false,
         },
         truncate,
-        zero,
+        invalidate,
     }
 }

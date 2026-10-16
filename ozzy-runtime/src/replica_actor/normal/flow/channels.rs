@@ -8,7 +8,6 @@ use crate::replica_actor::{
 use crate::replica_journal::ReplicationPositions;
 use ozzy_replication::Commit;
 use ozzy_replication::flow::{OpenRequest, Transmitter};
-use ozzy_replication::wire::Control;
 use std::time::Duration;
 
 impl ReplicaActor {
@@ -117,12 +116,13 @@ impl ReplicaActor {
         } else {
             snapshot.committed
         };
-        self.control(
-            self.configuration.voters()[voter],
-            Control::Commit(Commit {
+        self.announce(
+            voter,
+            Commit {
                 scope: snapshot.scope,
                 committed,
-            }),
+            },
+            false,
         )
     }
 

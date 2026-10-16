@@ -132,6 +132,60 @@ async fn compressed(window: (u64, u64, usize)) {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn try_next_drains_buffered_records_without_waiting() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (mut harness, links, _, _) = setup_shared_profile(&[], 1, Some((32, 8192, 8))).await;
+        harness.publish = false;
+        let mut writer = wake::open_writer(&mut harness, &links).await;
+        let mut pending = Vec::new();
+        for n in 0..4 {
+            pending.push(
+                writer
+                    .send(
+                        RecordInput::copy_from_slice(MessageId::from_bytes([50 + n; 16]), &[n; 8]),
+                        None,
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        for pending in pending {
+            harness.drive(pending.confirmed(), true).await.unwrap();
+        }
+        let mut reader = harness
+            .drive(
+                TopicReader::open(links.clone(), "orders", TopicReaderConfig::default()),
+                true,
+            )
+            .await
+            .unwrap();
+        // Nothing arrived yet: no record, and no wait.
+        assert!(reader.try_next().unwrap().is_none());
+        let first = harness.drive(reader.next(), true).await.unwrap();
+        assert_eq!(first.offset, Offset::ZERO);
+        // The rest of the replayed frame is buffered.
+        for n in 1..4 {
+            let record = reader.try_next().unwrap().expect("buffered record");
+            assert_eq!(record.offset, Offset::new(u64::from(n)));
+            assert_eq!(record.message_id, MessageId::from_bytes([50 + n; 16]));
+            assert_eq!(record.payload[0].as_ref(), &[n; 8]);
+        }
+        assert!(reader.try_next().unwrap().is_none());
+        assert_eq!(reader.checkpoint().positions, vec![(0, Offset::new(4))]);
+        harness.drive(reader.close(), true).await.unwrap();
+        assert!(matches!(
+            reader.try_next(),
+            Err(crate::replicated::TopicReaderError::Closed)
+        ));
+        harness.drive(writer.close(), true).await.unwrap();
+        harness.drive(links.shutdown(), true).await.unwrap();
+        harness.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn shared_topic_reader_fences_sources_repairs_overlaps_and_keeps_checkpoints() {
     tokio::time::timeout(Duration::from_secs(10), overlap())
         .await

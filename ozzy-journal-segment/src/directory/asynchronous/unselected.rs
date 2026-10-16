@@ -5,10 +5,12 @@
 //! removes objects older than that capture, so nothing the owner creates or
 //! publishes afterwards can match.
 
+mod captured;
+
 use super::{DirectoryError, Journal, Limits};
 use crate::async_files::Access;
 use crate::directory::{
-    CURRENT_FILE, index_name_segment_id, manifest_name, parse_checkpoint_name,
+    SPARE_SEGMENT, index_name_segment_id, manifest_name, parse_checkpoint_name,
     parse_current_temporary_name, parse_manifest_name, parse_manifest_temporary_name,
     parse_segment_name, validate_checkpoint_source,
 };
@@ -19,11 +21,11 @@ use crate::{
 };
 use ozzy_io::{FileKind, OpenMode, Operation};
 use std::{
-    cell::Cell,
     collections::HashSet,
     path::{Path, PathBuf},
-    rc::Rc,
 };
+
+pub use captured::UnselectedFiles;
 
 /// What a pass may remove besides the selection's own objects.
 #[derive(Clone, Copy, Debug)]
@@ -142,9 +144,10 @@ impl Reclaim<'_> {
         Ok(result)
     }
 
-    /// Delete at most `max_segments` unselected physical segment generations.
-    /// Directory visits and each segment's derived indexes are bounded by the
-    /// journal's listing limits. Selected generations and captured readers win.
+    /// Delete at most `max_segments` unselected physical segment generations,
+    /// keeping one regular file as the spare when there is none. Directory
+    /// visits and each segment's derived indexes are bounded by the journal's
+    /// listing limits. Selected generations and captured readers win.
     async fn segments(
         &mut self,
         max_segments: usize,
@@ -162,6 +165,7 @@ impl Reclaim<'_> {
             pinned_segment_ids: Vec::new(),
             reclaimed_bytes: 0,
         };
+        let mut spare = entries.iter().any(|entry| entry.name == SPARE_SEGMENT);
         for entry in entries {
             if result.removed_segment_ids.len() == max_segments {
                 break;
@@ -182,7 +186,10 @@ impl Reclaim<'_> {
                 continue;
             }
             *self.interrupted = true;
-            self.remove_segment(id, &entry, &index_entries, &mut result.reclaimed_bytes)
+            self.remove_indexes(id, &index_entries, &mut result.reclaimed_bytes)
+                .await?;
+            spare = self
+                .remove_or_keep(&entry, spare, &mut result.reclaimed_bytes)
                 .await?;
             result.removed_segment_ids.push(id);
             *self.interrupted = false;
@@ -194,17 +201,42 @@ impl Reclaim<'_> {
         Ok(result)
     }
 
-    /// Remove one unselected segment generation. Its derived indexes go
-    /// first unless a selected generation shares its ID, and each directory
-    /// is synced before the next removal step.
-    async fn remove_segment(
+    /// Unlink one unselected segment file, or rename it to the spare when
+    /// there is no `spare` yet and it is a regular file. The next roll then
+    /// overwrites its written blocks. Returns whether a spare exists.
+    async fn remove_or_keep(
+        &mut self,
+        segment: &ozzy_io::Entry,
+        spare: bool,
+        reclaimed_bytes: &mut u64,
+    ) -> Result<bool, DirectoryError> {
+        let directory = self.root.join("segments");
+        let path = directory.join(&segment.name);
+        let keep = !spare && segment.kind == FileKind::File;
+        if keep {
+            let destination = directory.join(SPARE_SEGMENT);
+            self.access
+                .done(Operation::Rename {
+                    source: path,
+                    destination,
+                })
+                .await?;
+        } else {
+            self.remove(path, reclaimed_bytes).await?;
+        }
+        self.access.sync_directory(directory).await?;
+        Ok(spare || keep)
+    }
+
+    /// Remove the derived indexes of an unselected segment generation, unless
+    /// a selected generation shares its ID, and sync their directory before
+    /// the segment file goes.
+    async fn remove_indexes(
         &mut self,
         id: u64,
-        segment: &ozzy_io::Entry,
         index_entries: &[ozzy_io::Entry],
         reclaimed_bytes: &mut u64,
     ) -> Result<(), DirectoryError> {
-        let directory = self.root.join("segments");
         let indexes = self.root.join("indexes");
         let live_id = self
             .manifest
@@ -222,9 +254,6 @@ impl Reclaim<'_> {
             // every index: make that deletion durable before payload removal.
             self.access.sync_directory(indexes).await?;
         }
-        self.remove(directory.join(&segment.name), reclaimed_bytes)
-            .await?;
-        self.access.sync_directory(directory).await?;
         Ok(())
     }
 
@@ -448,152 +477,5 @@ impl Journal {
         let mut reclaim = self.reclaim();
         let source = reclaim.checkpoint_source().await?;
         reclaim.metadata(max_files, source).await
-    }
-
-    /// Capture the selection for one cleanup pass that runs beside later
-    /// writes. One capture lives at a time, and no checkpoint is selected
-    /// while it does. Take it in a settled turn: with no roll or sync
-    /// publication in flight, every later publication is newer than it.
-    pub fn capture_unselected(&self) -> Result<UnselectedFiles, DirectoryError> {
-        self.healthy()?;
-        if self.cleaning.replace(true) {
-            return Err(DirectoryError::CleanupBusy);
-        }
-        let slot = CleanupSlot(self.cleaning.clone());
-        let active = self
-            .manifest
-            .segments
-            .last()
-            .map_or(0, |reference| reference.segment_id);
-        Ok(UnselectedFiles {
-            access: self.access.clone(),
-            root: self.root().to_path_buf(),
-            limits: self.limits,
-            pins: self.pins.clone(),
-            manifest: self.manifest.clone(),
-            current: self.current,
-            active,
-            source: None,
-            _slot: slot,
-        })
-    }
-
-    /// Refuse a new checkpoint selection while a cleanup capture lives.
-    pub(super) fn require_no_cleanup(&self) -> Result<(), DirectoryError> {
-        if self.cleaning.get() {
-            return Err(DirectoryError::CleanupBusy);
-        }
-        Ok(())
-    }
-}
-
-/// Releases the journal's cleanup slot when the capture drops.
-#[derive(Debug)]
-struct CleanupSlot(Rc<Cell<bool>>);
-
-impl Drop for CleanupSlot {
-    fn drop(&mut self) {
-        self.0.set(false);
-    }
-}
-
-/// A captured selection whose unselected, older objects one pass removes
-/// beside later writes. It holds no journal borrow; a failed pass must
-/// fence its owner.
-#[derive(Debug)]
-pub struct UnselectedFiles {
-    access: Access,
-    root: PathBuf,
-    limits: Limits,
-    pins: Rc<PinRegistry>,
-    manifest: Manifest,
-    current: CurrentReference,
-    active: u64,
-    source: Option<u64>,
-    _slot: CleanupSlot,
-}
-
-impl UnselectedFiles {
-    fn reclaim<'a>(&'a self, interrupted: &'a mut bool) -> Reclaim<'a> {
-        Reclaim {
-            access: &self.access,
-            root: &self.root,
-            limits: self.limits,
-            pins: &self.pins,
-            manifest: &self.manifest,
-            current: self.current,
-            bounds: Bounds::Concurrent {
-                active: self.active,
-            },
-            interrupted,
-        }
-    }
-
-    /// Check once per pass that this directory still selects the captured
-    /// generation or a newer one, and resolve the selected checkpoint's
-    /// source manifest.
-    pub async fn validate(&mut self) -> Result<(), DirectoryError> {
-        let bytes = self
-            .access
-            .read_file(
-                self.root.join(CURRENT_FILE),
-                crate::CURRENT_BYTES,
-                self.limits.io.chunk_bytes,
-            )
-            .await?;
-        let current = crate::decode_current(&bytes)?;
-        let identity = self.manifest.identity;
-        if current.group_id != identity.group_id
-            || current.store_id != identity.store_id
-            || current.generation < self.current.generation
-            || (current.generation == self.current.generation && current != self.current)
-        {
-            return Err(DirectoryError::CurrentMismatch);
-        }
-        let mut interrupted = false;
-        self.source = self.reclaim(&mut interrupted).checkpoint_source().await?;
-        Ok(())
-    }
-
-    /// Remove unselected indexes older than the capture.
-    pub async fn reclaim_indexes(
-        &self,
-        max_files: usize,
-    ) -> Result<OrphanCleanupStep, DirectoryError> {
-        let mut interrupted = false;
-        self.reclaim(&mut interrupted).indexes(max_files).await
-    }
-
-    /// Remove unselected segments older than the capture, with their indexes.
-    pub async fn reclaim_segments(
-        &self,
-        max_segments: usize,
-    ) -> Result<UnreferencedSegmentCleanup, DirectoryError> {
-        let mut interrupted = false;
-        self.reclaim(&mut interrupted).segments(max_segments).await
-    }
-
-    /// Remove unselected, unpinned checkpoints.
-    pub async fn reclaim_checkpoints(
-        &self,
-        max_checkpoints: usize,
-    ) -> Result<UnreferencedCheckpointCleanup, DirectoryError> {
-        let mut interrupted = false;
-        self.reclaim(&mut interrupted)
-            .checkpoints(max_checkpoints)
-            .await
-    }
-
-    /// Remove manifests older than the capture and earlier temporaries. Call
-    /// [`Self::validate`] first; it resolves the protected checkpoint source.
-    pub async fn reclaim_metadata(
-        &self,
-        max_files: usize,
-    ) -> Result<UnreferencedMetadataCleanup, DirectoryError> {
-        let mut interrupted = false;
-        let source = self.source;
-        self.reclaim(&mut interrupted)
-            .metadata(max_files, source)
-            .await
     }
 }

@@ -50,7 +50,11 @@ impl ReplicaActor {
             .at(self.maintenance.metadata_cleanup.map(|turn| turn.next()))
             .at(self.maintenance.orphan_cleanup.map(|turn| turn.next()))
             .at(self.maintenance.retention.at())
-            .at(self.work.sync_deadline(self.config.sync_batch_max_age));
+            .at(self
+                .work
+                .sync_deadline(self.config.sync_batch_max_age)
+                .filter(|_| self.replicated()))
+            .at(self.evidence_deadline());
         let next = match &self.startup_probe {
             Some(probe) => probe.deadlines(next),
             None => next,

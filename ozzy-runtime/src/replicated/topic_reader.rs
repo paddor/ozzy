@@ -10,11 +10,12 @@ use bytes::Bytes;
 use closing::Closing;
 use cursor::{Cursor, Observed};
 use decoder::Decoder;
+pub use ozzy_proto::data::RecordPayload;
 use ozzy_proto::{MessageId, Offset, PartitionIncarnation, TopicId};
 use std::{
     collections::BTreeSet,
     future::poll_fn,
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
     time::Duration,
 };
 
@@ -162,7 +163,7 @@ pub struct TopicRecord {
     /// Original writer identity, independent of batching.
     pub message_id: MessageId,
     /// Original multipart bytes, decoded at this application boundary.
-    pub payload: smallvec::SmallVec<[Bytes; 2]>,
+    pub payload: RecordPayload,
 }
 
 /// Actual delivery paths of individual records returned by this reader.
@@ -172,6 +173,8 @@ pub struct TopicReaderStats {
     pub live_records: u64,
     /// Records delivered through authoritative PEER replay.
     pub replayed_records: u64,
+    /// Live publications that arrived past a gap and switched to replay.
+    pub live_gaps: u64,
 }
 
 /// Bounded topic reader sharing the SDK's broker connections with other readers
@@ -349,6 +352,24 @@ impl TopicReader {
         result
     }
 
+    /// One individual record that is ready without waiting, or `None`. Drain
+    /// ready records this way, then await [`Self::next`] once none is ready.
+    pub fn try_next(&mut self) -> Result<Option<TopicRecord>, TopicReaderError> {
+        if self.failed || self.closed {
+            return Err(TopicReaderError::Closed);
+        }
+        // `next` polls again with its task's waker before it waits, so no
+        // wakeup depends on this poll.
+        match self.poll(&|_| true, &mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(record)) => Ok(Some(record)),
+            Poll::Ready(Err(error)) => {
+                self.failed = true;
+                Err(error)
+            }
+            Poll::Pending => Ok(None),
+        }
+    }
+
     /// Deliver only from partitions the gate admits, or return the output of
     /// `interrupt` once it completes. Gated partitions keep their received
     /// records.
@@ -411,14 +432,15 @@ impl TopicReader {
         }
         for _ in 0..self.remaining.min(16) {
             let index = self.next;
-            self.next = (index + 1) % count;
+            // A compare, not `%`: a division per record is measurable.
+            self.next = if index + 1 == count { 0 } else { index + 1 };
             self.remaining -= 1;
             if !gate(self.cursors[index].number) {
                 continue;
             }
             let observed = Observed {
                 input,
-                now: self.clock.now(),
+                clock: &self.clock,
             };
             match self.cursors[index].poll(&self.routes, &mut self.decoder, observed, cx) {
                 Poll::Ready(Ok(record)) => {
@@ -463,6 +485,7 @@ impl TopicReader {
             .fold(TopicReaderStats::default(), |mut stats, cursor| {
                 stats.live_records += cursor.live_records;
                 stats.replayed_records += cursor.replayed_records;
+                stats.live_gaps += cursor.live_gaps;
                 stats
             })
     }

@@ -67,11 +67,11 @@ pub struct CanonicalRecoveryRequirements {
     pub configuration_epoch: Option<u64>,
     /// Promised election view constraining retained history and authority.
     pub promised_view: Option<u64>,
-    /// End the log at the first group that fails to decode and zero the rest,
-    /// provided the valid prefix holds every protected position. Only for
-    /// stores whose protected positions cover every durably confirmed
-    /// operation, and whose segments begin with no protected position when a
-    /// sealed predecessor already holds them all.
+    /// End the log at the first group that fails to decode and invalidate
+    /// later groups of this use, provided the valid prefix holds every
+    /// protected position. Only for stores whose protected positions cover
+    /// every durably confirmed operation, and whose segments begin with no
+    /// protected position when a sealed predecessor already holds them all.
     pub discard_damaged_tail: bool,
 }
 
@@ -154,6 +154,10 @@ pub enum WriterError {
     #[error("recovered journal does not contain protected operation prefix {0}")]
     /// Recovered journal does not contain protected operation prefix.
     ProtectedPrefixMismatch(u64),
+    #[error("physical group {0} is damaged, but a later group marks it durable")]
+    /// A later valid group marks this damaged group durable: its write
+    /// completed, so the damage is a fault, not an unfinished write.
+    DurableGroupDamaged(u64),
     #[error("operation {op_number} has configuration epoch {actual}; expected {expected}")]
     /// Operation has configuration epoch; expected.
     ConfigurationMismatch {

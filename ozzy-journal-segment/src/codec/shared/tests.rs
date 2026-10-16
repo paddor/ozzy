@@ -47,7 +47,10 @@ fn fixture() -> (SegmentHeader, EncodedGroup, Vec<Vec<u8>>) {
     assert!(layouts.windows(2).all(|pair| pair[0] == pair[1]));
     let finalized = finalize_group_bodies(
         &header,
-        crate::GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS),
+        crate::codec::GroupWrite {
+            start: crate::GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS),
+            durable_through: 0,
+        },
         &operations,
         &operations
             .iter()
