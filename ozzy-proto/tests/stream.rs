@@ -42,7 +42,7 @@ fn confirmed() -> Confirmed {
         end_sequence: 2008,
         first_offset: 10,
         disposition: AppendDisposition::Stored,
-        policy: Policy::QuorumReplicatedPersisting,
+        policy: Policy::QuorumDurable,
     }
 }
 
@@ -64,7 +64,7 @@ fn confirmed_range_has_fixed_bytes_independent_of_append_boundaries() {
     golden.extend(2008_u64.to_be_bytes());
     golden.extend(10_u64.to_be_bytes());
     golden.push(0);
-    golden.push(6);
+    golden.push(2);
     assert_eq!(metadata, golden);
     assert_eq!(metadata.len(), 107);
     let packet = decode_packet(&[&header, &golden, &[]], limits).unwrap();
@@ -166,7 +166,7 @@ fn malformed_confirmations_reject_truncation_trailing_bytes_payload_and_policy()
             "truncation {end}"
         );
     }
-    for policy in [0, 4, 7, 255] {
+    for policy in [0, 4, 6, 7, 255] {
         let mut invalid = metadata.clone();
         invalid[106] = policy;
         assert_eq!(

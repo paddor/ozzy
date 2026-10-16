@@ -18,6 +18,16 @@
 - Telemetry event `replica_publication_send_drop` is now
   `replica_publication_send_wait`: a full follower PUB socket keeps the frame
   and sends it once it has space.
+- Replicated-persisting mode is removed; three-broker clusters confirm by
+  disk quorum. `MEMORY_VOTING` files, `QuorumPolicy`, and
+  `ConfigurationRecord::with_policy` are gone.
+- Topics no longer take `confirmation`: `cluster.mode` fixes it (`single`
+  confirms local durable, `three` by disk quorum). `ozzy_config::Confirmation`
+  and `TopicIdentity::confirmation` are removed, so provision identities
+  again. `DeploymentMode::policy` gives a mode's wire policy.
+- Policy IDs are 1 (local durable) and 2 (disk quorum). `PREPARE_OK` has no
+  evidence byte, and the replicated `CONFIGURATION` record has no policy
+  byte; format stores again.
 - `TopicRecord::payload` is a `RecordPayload` instead of a `SmallVec`. It
   holds one part directly and more parts in one boxed slice, 32 bytes instead
   of 72, and derefs to `[Bytes]`.

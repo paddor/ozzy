@@ -221,10 +221,8 @@ fn finish(
 
 #[test]
 fn coordinator_join_pending_plan_and_source_activation_survive_both_quorum_failovers() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        for phase in [Phase::Join, Phase::Plan, Phase::Assign] {
-            failover(policy, phase);
-        }
+    for phase in [Phase::Join, Phase::Plan, Phase::Assign] {
+        failover(phase);
     }
 }
 
@@ -232,7 +230,7 @@ fn coordinator_join_pending_plan_and_source_activation_survive_both_quorum_failo
     clippy::too_many_lines,
     reason = "keep the exact missing-receipt and election schedule together"
 )]
-fn failover(policy: QuorumPolicy, phase: Phase) {
+fn failover(phase: Phase) {
     let (mut controller, io) = setup();
     let mut now = Duration::ZERO;
     let mut actors = Vec::new();
@@ -240,7 +238,7 @@ fn failover(policy: QuorumPolicy, phase: Phase) {
     let mut buffers = Vec::new();
     let mut bootstrap = None;
     for broker in 0..3 {
-        let mut actor = unstarted_actor(&mut controller, &io, 0, policy, broker, 64);
+        let mut actor = unstarted_actor(&mut controller, &io, 0, broker, 64);
         let mut lane = actor.take_submitter().unwrap();
         if broker == 0 {
             let mut buffer = actor.lease_proposal_buffer().unwrap();
@@ -281,7 +279,7 @@ fn failover(policy: QuorumPolicy, phase: Phase) {
         for (to, message) in collect(&mut actors, now, false) {
             let from = usize::from(message.part_slice(0).unwrap()[0] - 1);
             // One surviving copy gets the proposal. No follower receipt reaches
-            // the leader, under either RAM or disk quorum confirmation.
+            // the leader.
             if to == 0 || (to == 2 && opcode(&message) == ozzy_proto::Opcode::PrepareFlow) {
                 continue;
             }
@@ -303,10 +301,7 @@ fn failover(policy: QuorumPolicy, phase: Phase) {
             break;
         }
     }
-    assert!(
-        copied,
-        "{policy:?}/{phase:?}: proposal did not reach surviving copy"
-    );
+    assert!(copied, "{phase:?}: proposal did not reach surviving copy");
     let mut leader = None;
     now += Duration::from_secs(3);
     for step in 0..20000 {
@@ -376,11 +371,7 @@ fn failover(policy: QuorumPolicy, phase: Phase) {
                 cursor: None,
                 operation: OperationId::from_bytes([99; 16]),
             },
-            if policy == QuorumPolicy::Durable {
-                ozzy_proto::append::Policy::QuorumDurable
-            } else {
-                ozzy_proto::append::Policy::QuorumReplicatedPersisting
-            },
+            ozzy_proto::append::Policy::QuorumDurable,
         )
         .unwrap();
     let reply = finish(

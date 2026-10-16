@@ -39,8 +39,8 @@ Size `control_bytes` with `control_reservation_bytes()` and `reader.bytes` with
 ## Produce
 
 `send` picks a partition by optional key and returns after local admission.
-`confirmed()` waits for the topic's confirmation policy, never transport
-receipt.
+`confirmed()` waits for the cluster mode's confirmation policy, never
+transport receipt.
 
 ```rust,no_run
 use ozzy::{

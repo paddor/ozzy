@@ -452,9 +452,6 @@ fn validate_report(report: DoViewChange) -> Result<(), ViewChangeError> {
 /// Rejected election event. Missing history/quorums wait; conflicts fault.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ViewChangeError {
-    /// A disk prefix cannot prove that all earlier retained-memory votes survived.
-    #[error("retained-memory voter restart requires fresh recovery or drained-state evidence")]
-    VolatileRestart,
     /// Existing journal/normal scope, role, or membership check failed.
     #[error(transparent)]
     Replication(#[from] ReplicationError),

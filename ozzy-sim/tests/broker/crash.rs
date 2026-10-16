@@ -5,7 +5,7 @@ use ozzy_runtime::replicated::SdkClock;
 #[tokio::test(flavor = "current_thread")]
 async fn inproc_memory_storage_pause_uses_the_verified_progress_deadline() {
     tokio::time::timeout(Duration::from_secs(20), async {
-        let mut cluster = broker::Cluster::new(Confirmation::LocalDurable).await;
+        let mut cluster = broker::Cluster::new(DeploymentMode::Single).await;
         let mut client = Client::open_with_runtime(&cluster.configs[0].0, &cluster.runtime).await;
         let mut reader = client.reader(true).await;
         let control = cluster.controls[0].clone();
@@ -37,16 +37,12 @@ async fn inproc_memory_storage_pause_uses_the_verified_progress_deadline() {
 #[tokio::test(flavor = "current_thread")]
 async fn inproc_memory_device_cuts_with_held_completions_preserve_retry_identity() {
     tokio::time::timeout(Duration::from_secs(120), async {
-        for policy in [
-            Confirmation::LocalDurable,
-            Confirmation::DiskQuorum,
-            Confirmation::ReplicatedPersisting,
-        ] {
+        for mode in [DeploymentMode::Single, DeploymentMode::Three] {
             for power_loss in [false, true] {
                 let clock = SdkClock::manual();
                 let mut cluster = progress(
                     &clock,
-                    broker::Cluster::configured(policy, Some(clock.clone()), |_| {}),
+                    broker::Cluster::configured(mode, Some(clock.clone()), |_| {}),
                 )
                 .await;
                 let mut client = progress(

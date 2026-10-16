@@ -19,8 +19,8 @@ pub(crate) const FILE_BYTES: usize = 2 * COPY_STRIDE;
 const MAGIC: &[u8; 8] = b"OZYDUR\0\0";
 const CONTEXT: &str = "ozzy durable accepted evidence v1";
 
-/// Scope and position fields shared with `MEMORY_VOTING`; sequence zero.
-pub(crate) fn encode(
+/// Scope and position fields; sequence zero.
+fn encode(
     manifest: &Manifest,
     accepted: LogPosition,
 ) -> Result<[u8; RECORD_BYTES], DirectoryError> {

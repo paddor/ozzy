@@ -91,19 +91,13 @@ async fn read_retained(brokers: &[Broker], consumer: &BrokerLinks, end: u64, sta
 #[tokio::test(flavor = "current_thread")]
 async fn disk_quorum_lagging_follower_recovers_retained_checkpoint_then_supplies_the_required_quorum()
  {
-    lagging_follower(Confirmation::DiskQuorum).await;
+    lagging_follower().await;
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn replicated_persisting_lagging_follower_recovers_retained_checkpoint_then_supplies_the_required_quorum()
- {
-    lagging_follower(Confirmation::ReplicatedPersisting).await;
-}
-
-async fn lagging_follower(policy: Confirmation) {
+async fn lagging_follower() {
     let runtime = WriterRuntime::new().unwrap();
     let root = PathBuf::from(format!("/ozzy-retained-recovery-{}", Uuid::now_v7()));
-    let deployment = deployment_with(&root, DeploymentMode::Three, policy, 1, |config| {
+    let deployment = deployment_with(&root, DeploymentMode::Three, 1, |config| {
         let topic = config.topics.get_mut("orders").unwrap();
         topic.retention = TopicRetention {
             max_age_secs: None,
@@ -144,7 +138,7 @@ async fn lagging_follower(policy: Confirmation) {
     }
     // The restart probe sees expiry only in the primary's retained floor, and
     // either copy may lead.
-    let tail = stopped_tail(&old_image, &directory, policy);
+    let tail = stopped_tail(&old_image, &directory);
     retired(&brokers, &controls, &directories[..2], tail).await;
     assert!(selected(&old_image, &directory).checkpoint.is_none());
     for round in 0..2 {
@@ -262,20 +256,14 @@ async fn joined(
 
 #[tokio::test(flavor = "current_thread")]
 async fn disk_quorum_cluster_restart_with_an_ancient_replica_preserves_retained_history() {
-    restart_with_ancient_replica(Confirmation::DiskQuorum).await;
+    restart_with_ancient_replica().await;
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn replicated_persisting_cluster_restart_with_an_ancient_replica_preserves_retained_history()
-{
-    restart_with_ancient_replica(Confirmation::ReplicatedPersisting).await;
-}
-
-async fn restart_with_ancient_replica(policy: Confirmation) {
+async fn restart_with_ancient_replica() {
     let runtime = WriterRuntime::new().unwrap();
     let context = runtime.context().clone();
     let root = PathBuf::from(format!("/ozzy-ancient-restart-{}", Uuid::now_v7()));
-    let deployment = deployment_with(&root, DeploymentMode::Three, policy, 1, |config| {
+    let deployment = deployment_with(&root, DeploymentMode::Three, 1, |config| {
         config.topics.get_mut("orders").unwrap().retention = TopicRetention {
             max_age_secs: None,
             max_bytes: Some(1024 * 1024),
@@ -304,7 +292,7 @@ async fn restart_with_ancient_replica(policy: Confirmation) {
     }
     writer.close().await.unwrap();
     let ancient_directory = &restart[0].0.plan.partitions[0].directory;
-    let tail = stopped_tail(&ancient, ancient_directory, policy);
+    let tail = stopped_tail(&ancient, ancient_directory);
     let directories = restart[1..]
         .iter()
         .map(|(checked, _)| checked.plan.partitions[0].directory.clone())
@@ -318,7 +306,7 @@ async fn restart_with_ancient_replica(policy: Confirmation) {
         stopped.push(image.await.unwrap());
     }
     stopped.insert(0, ancient);
-    assert_ancient_history_retired(&stopped, &restart, policy);
+    assert_ancient_history_retired(&stopped, &restart);
     let mut brokers = Vec::new();
     let mut controls = Vec::new();
     let mut images = Vec::new();
@@ -366,25 +354,19 @@ async fn restart_with_ancient_replica(policy: Confirmation) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn disk_quorum_retained_history_survives_complete_cluster_restart_and_producer_resume() {
-    complete_cluster_restart(Confirmation::DiskQuorum).await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn replicated_persisting_retained_history_survives_complete_cluster_restart_and_producer_resume()
- {
-    complete_cluster_restart(Confirmation::ReplicatedPersisting).await;
+    complete_cluster_restart().await;
 }
 
 #[expect(
     clippy::too_many_lines,
     reason = "one complete retained-history restart and producer-resume scenario"
 )]
-async fn complete_cluster_restart(policy: Confirmation) {
+async fn complete_cluster_restart() {
     use ozzy_proto::Offset;
     use ozzy_runtime::replicated::TopicCheckpoint;
     let runtime = WriterRuntime::new().unwrap();
     let root = PathBuf::from(format!("/ozzy-retained-restart-{}", Uuid::now_v7()));
-    let deployment = deployment_with(&root, DeploymentMode::Three, policy, 1, |config| {
+    let deployment = deployment_with(&root, DeploymentMode::Three, 1, |config| {
         config.topics.get_mut("orders").unwrap().retention = TopicRetention {
             max_age_secs: None,
             max_bytes: Some(1024 * 1024),
@@ -651,14 +633,9 @@ async fn assert_recovered_leader(
 }
 
 /// The last accepted operation in a stopped copy's evidence.
-fn stopped_tail(image: &Image, directory: &Path, policy: Confirmation) -> u64 {
-    let (evidence, offset) = if policy == Confirmation::DiskQuorum {
-        ("DURABLE", 72)
-    } else {
-        ("MEMORY_VOTING", 88)
-    };
+fn stopped_tail(image: &Image, directory: &Path) -> u64 {
     u64::from_be_bytes(
-        image.bytes(&directory.join(evidence), false).unwrap()[offset..offset + 8]
+        image.bytes(&directory.join("DURABLE"), false).unwrap()[72..80]
             .try_into()
             .unwrap(),
     )
@@ -670,16 +647,8 @@ fn retired_past(image: &Image, directory: &Path, tail: u64) -> bool {
     manifest.checkpoint.is_some() && manifest.segments[0].first_chain.next_op_number() > tail + 1
 }
 
-fn assert_ancient_history_retired(
-    stopped: &[Image],
-    restart: &[(CheckedConfig, BrokerIdentity)],
-    policy: Confirmation,
-) {
-    let tail = stopped_tail(
-        &stopped[0],
-        &restart[0].0.plan.partitions[0].directory,
-        policy,
-    );
+fn assert_ancient_history_retired(stopped: &[Image], restart: &[(CheckedConfig, BrokerIdentity)]) {
+    let tail = stopped_tail(&stopped[0], &restart[0].0.plan.partitions[0].directory);
     assert!(tail > 0);
     for (image, (checked, _)) in stopped[1..].iter().zip(&restart[1..]) {
         assert!(retired_past(

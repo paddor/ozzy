@@ -13,7 +13,7 @@ fn budget() -> StorageValidationBudget {
 #[test]
 fn owned_detached_storage_scan_keeps_original_prefix_while_append_and_roll_continue() {
     let (mut controller, io) = setup();
-    let mut replica = replica(&mut controller, io, 0, QuorumPolicy::Durable, 8192);
+    let mut replica = replica(&mut controller, io, 0, 8192);
     let first = persist(&mut controller, &mut replica);
     let ticket = replica.driver.begin_validation().unwrap();
     let work = drive(
@@ -65,7 +65,7 @@ fn owned_detached_storage_scan_keeps_original_prefix_while_append_and_roll_conti
 #[test]
 fn owned_storage_scan_cancellation_releases_capacity_and_observed_failure_fences_owner() {
     let (mut controller, io) = setup();
-    let mut replica = replica(&mut controller, io, 0, QuorumPolicy::Durable, 8192);
+    let mut replica = replica(&mut controller, io, 0, 8192);
     persist(&mut controller, &mut replica);
     let ticket = replica.driver.begin_validation().unwrap();
     let work = drive(
@@ -104,7 +104,7 @@ fn owned_storage_scan_cancellation_releases_capacity_and_observed_failure_fences
 #[test]
 fn owned_storage_scan_old_scope_cannot_reinstall_after_promise() {
     let (mut controller, io) = setup();
-    let mut replica = replica(&mut controller, io, 0, QuorumPolicy::Durable, 8192);
+    let mut replica = replica(&mut controller, io, 0, 8192);
     let ticket = replica.driver.begin_validation().unwrap();
     let work = drive(
         &mut controller,
@@ -160,7 +160,7 @@ pub(super) fn orphan(controller: &mut Controller, io: &Local, path: PathBuf) {
 #[test]
 fn owned_cleanup_obeys_removal_bound_and_canceled_mutation_requires_reopen() {
     let (mut controller, io) = setup();
-    let mut replica = replica(&mut controller, io.clone(), 0, QuorumPolicy::Durable, 8192);
+    let mut replica = replica(&mut controller, io.clone(), 0, 8192);
     persist(&mut controller, &mut replica);
     for file in ["999.log", "1000.log", "unknown"] {
         orphan(
@@ -241,7 +241,7 @@ fn owned_cleanup_obeys_removal_bound_and_canceled_mutation_requires_reopen() {
 fn owned_identity_refresh_frees_bounded_overlay_without_forgetting_old_controls() {
     use ozzy_journal::operation::{CanonicalOperation, OperationKind};
     let (mut controller, io) = setup();
-    let mut config = config("/primary", 7, QuorumPolicy::Durable);
+    let mut config = config("/primary", 7);
     config.recovery.retained_identities = 1;
     let (journal, startup) = drive(
         &mut controller,
@@ -256,14 +256,14 @@ fn owned_identity_refresh_frees_bounded_overlay_without_forgetting_old_controls(
         driver,
         config,
     };
-    let mut backup = replica(&mut controller, io, 2, QuorumPolicy::Durable, 8192);
+    let mut backup = replica(&mut controller, io, 2, 8192);
     for number in 1..=4 {
         persist(&mut controller, &mut primary);
         persist(&mut controller, &mut backup);
         let pending = primary.driver.begin_validation().unwrap();
         assert!(drive(&mut controller, primary.journal.refresh_identities(pending)).is_err());
         assert!(!primary.journal.is_faulted());
-        confirm(&mut primary, &backup, QuorumPolicy::Durable);
+        confirm(&mut primary, &backup);
         assert_eq!(primary.journal.identity_capacity().unwrap(), (1, 1));
         let ticket = primary.driver.begin_validation().unwrap();
         assert_eq!(

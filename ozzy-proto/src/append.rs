@@ -78,11 +78,9 @@ pub fn route(packet: Packet<'_>, limits: crate::EnvelopeLimits) -> Result<Route,
 #[repr(u8)]
 pub enum Policy {
     /// Synchronized local journal.
-    LocalDurable = 3,
+    LocalDurable = 1,
     /// Matching synchronized prefix on the configured disk quorum.
-    QuorumDurable = 5,
-    /// Retained RAM copies on the group; bounded disk persistence runs independently.
-    QuorumReplicatedPersisting = 6,
+    QuorumDurable = 2,
 }
 
 impl TryFrom<u8> for Policy {
@@ -90,9 +88,8 @@ impl TryFrom<u8> for Policy {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            3 => Ok(Self::LocalDurable),
-            5 => Ok(Self::QuorumDurable),
-            6 => Ok(Self::QuorumReplicatedPersisting),
+            1 => Ok(Self::LocalDurable),
+            2 => Ok(Self::QuorumDurable),
             _ => Err(CodecError::Policy),
         }
     }

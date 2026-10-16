@@ -6,7 +6,6 @@ mod evidence;
 mod history;
 mod indexes;
 mod lifecycle;
-mod memory_voting;
 mod metadata_cleanup;
 mod orphans;
 mod partition_read;

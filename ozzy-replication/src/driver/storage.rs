@@ -3,8 +3,8 @@
 
 use super::{DriverError, ReplicaDriver, Role};
 use crate::{
-    JournalGeneration, NormalReplica, Prefix, PromiseTicket, ReplicationError, SyncTicket,
-    ViewChangeError, WriteTicket,
+    JournalGeneration, Prefix, PromiseTicket, ReplicationError, SyncTicket, ViewChangeError,
+    WriteTicket,
 };
 use std::time::Duration;
 
@@ -33,28 +33,7 @@ impl ReplicaDriver {
         Ok(())
     }
 
-    /// Observe buffered background I/O without asserting stable-storage evidence.
-    /// Only RAM-confirmed groups may release capacity at this boundary.
-    pub fn complete_buffered_write(
-        &mut self,
-        ticket: WriteTicket,
-        now: Duration,
-    ) -> Result<(), DriverError> {
-        if self.configuration.policy() != crate::QuorumPolicy::Replicated {
-            return Err(ReplicationError::PolicyMismatch.into());
-        }
-        self.observe_time(now)?;
-        let previous = self.normal().map(NormalReplica::snapshot);
-        self.complete_write(ticket)?;
-        if let Some(previous) = previous
-            && let Some(current) = self.normal().map(NormalReplica::snapshot)
-        {
-            self.observe_normal_progress(&previous, &current, now);
-        }
-        Ok(())
-    }
-
-    /// Install exact `O_DSYNC` completion independently of the group's confirmation policy.
+    /// Install an exact `O_DSYNC` completion. The write is durable at once.
     pub fn complete_durable_write(
         &mut self,
         ticket: WriteTicket,

@@ -30,7 +30,7 @@ use ozzy_proto::{GroupId, NodeId};
 use ozzy_replication::driver::{DriverError, Timing};
 use ozzy_replication::{
     Configuration, Digest, LogSource, OpNumber, PipelineLimits, Prefix, PreparedOperation,
-    QuorumPolicy, ReplicationError, Scope, ViewChangeError,
+    ReplicationError, Scope, ViewChangeError,
 };
 
 pub(crate) use cluster::Cluster;
@@ -53,15 +53,14 @@ fn index(node_id: NodeId) -> usize {
     (0..3).find(|&n| node(n) == node_id).unwrap()
 }
 
-fn configuration_record_with_policy(policy: QuorumPolicy) -> ozzy_replication::ConfigurationRecord {
-    ozzy_replication::ConfigurationRecord::with_policy(
+fn configuration_record() -> ozzy_replication::ConfigurationRecord {
+    ozzy_replication::ConfigurationRecord::new(
         GroupId::from_bytes([7; 16]),
         1,
         std::array::from_fn(|id| ozzy_replication::ConfiguredVoter {
             node_id: node(id),
             principal: Digest::from_bytes([id as u8 + 1; 32]),
         }),
-        policy,
     )
     .unwrap()
 }

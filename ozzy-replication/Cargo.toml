@@ -56,10 +56,6 @@ name = "ozzy_normal"
 path = "tests/normal.rs"
 
 [[test]]
-name = "ozzy_persisting"
-path = "tests/persisting.rs"
-
-[[test]]
 name = "ozzy_view_change"
 path = "tests/view_change.rs"
 

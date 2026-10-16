@@ -50,11 +50,7 @@ pub(crate) struct Replica {
 
 impl Replica {
     pub(crate) fn new(id: usize) -> Self {
-        Self::with_policy(id, QuorumPolicy::Durable)
-    }
-
-    pub(super) fn with_policy(id: usize, policy: QuorumPolicy) -> Self {
-        let configuration = configuration_record_with_policy(policy).configuration();
+        let configuration = configuration_record().configuration();
         let generation = JournalGeneration(((id as u128 + 1) << 64) | 1);
         let driver = ReplicaDriver::from_normal(
             NormalReplica::bootstrap(configuration, node(id), generation, limits()).unwrap(),
@@ -151,12 +147,7 @@ impl Replica {
         self.buffered.clone_from(&self.stable.operations);
         self.observed_sync = self.stable.operations.len();
         self.candidate = Some(private_replay(&self.stable.operations));
-        let recover = if self.configuration.policy() == QuorumPolicy::Replicated {
-            ozzy_replication::ViewChange::recover_drained
-        } else {
-            ozzy_replication::ViewChange::recover_intact
-        };
-        let changing = recover(
+        let changing = ozzy_replication::ViewChange::recover_intact(
             self.configuration,
             node(self.id),
             self.generation,
@@ -370,7 +361,6 @@ impl Replica {
     fn acknowledge_cursor(&mut self, from: usize, message: &Control) {
         let acknowledgment = match message {
             Control::PrepareOk { ack, .. } => Some((ack.scope, ack.durable)),
-            Control::PrepareRetained { ack, .. } => Some((ack.scope, ack.retained)),
             _ => None,
         };
         if let Some((scope, retained)) = acknowledgment
@@ -611,13 +601,8 @@ impl Replica {
         };
         let snapshot = normal.snapshot();
         if self.configuration.primary(snapshot.scope.view) != node(self.id) {
-            let ack = match self.configuration.policy() {
-                QuorumPolicy::Durable => Control::PrepareOk {
-                    ack: normal.acknowledgment().unwrap(),
-                },
-                QuorumPolicy::Replicated => Control::PrepareRetained {
-                    ack: normal.retained_acknowledgment().unwrap(),
-                },
+            let ack = Control::PrepareOk {
+                ack: normal.acknowledgment().unwrap(),
             };
             output.push(Packet::control(
                 self.id,

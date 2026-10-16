@@ -10,13 +10,13 @@ struct Attempt {
 }
 
 fn attempt(controller: &mut Controller, io: Local) -> Attempt {
-    let mut primary = replica(controller, io.clone(), 0, QuorumPolicy::Durable, 8192);
-    let backup = replica(controller, io.clone(), 2, QuorumPolicy::Durable, 8192);
+    let mut primary = replica(controller, io.clone(), 0, 8192);
+    let backup = replica(controller, io.clone(), 2, 8192);
     persist(controller, &mut primary);
     let (mut receiver, startup) = drive(
         controller,
         RecoveringJournal::start(
-            receiver_config(QuorumPolicy::Durable),
+            receiver_config(),
             io,
             generations(50),
             RecoveryOpen::FormatNew {
@@ -88,22 +88,13 @@ fn owned_recovery_publication_failure_never_supplies_restart_evidence() {
         assert!(
             drive(
                 &mut controller,
-                OwnedJournal::open(
-                    receiver_config(QuorumPolicy::Durable),
-                    io.clone(),
-                    JournalGeneration(70)
-                )
+                OwnedJournal::open(receiver_config(), io.clone(), JournalGeneration(70))
             )
             .is_err()
         );
         let (receiver, _) = drive(
             &mut controller,
-            RecoveringJournal::start(
-                receiver_config(QuorumPolicy::Durable),
-                io,
-                generations(80),
-                RecoveryOpen::Resume,
-            ),
+            RecoveringJournal::start(receiver_config(), io, generations(80), RecoveryOpen::Resume),
         )
         .unwrap();
         drive(&mut controller, receiver.shutdown()).unwrap();
@@ -159,11 +150,7 @@ fn owned_recovery_newer_view_rejects_even_a_completed_old_publication() {
     // Disk publication exists, but reopening supplies only election authority.
     let (journal, startup) = drive(
         &mut controller,
-        OwnedJournal::open(
-            receiver_config(QuorumPolicy::Durable),
-            io,
-            JournalGeneration(80),
-        ),
+        OwnedJournal::open(receiver_config(), io, JournalGeneration(80)),
     )
     .unwrap();
     assert!(journal.images().is_err());

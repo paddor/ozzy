@@ -2,7 +2,6 @@ use super::{
     CommitMode, Digest, GroupJournal, JournalError, JournalFormat, JournalGeneration, Local, Mode,
     OwnedConfig, OwnedJournal, SegmentHeader, prefix,
 };
-use ozzy_journal_segment::SegmentWriteMode;
 use ozzy_replication::local::{Configuration, Driver};
 
 impl OwnedConfig<Configuration> {
@@ -12,7 +11,7 @@ impl OwnedConfig<Configuration> {
         {
             return Err(JournalError::Configuration);
         }
-        self.validate_storage(generation, SegmentWriteMode::DataSync)
+        self.validate_storage(generation)
     }
 }
 

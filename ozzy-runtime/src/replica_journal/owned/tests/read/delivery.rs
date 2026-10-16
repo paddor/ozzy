@@ -126,75 +126,61 @@ fn compressed(
 }
 
 #[test]
-fn owned_delivery_preserves_sdk_lz4_in_pending_and_installed_records() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        let (mut controller, io) = setup();
-        let mut primary = replica(&mut controller, io.clone(), 0, policy, 8192);
-        let mut backup = replica(&mut controller, io, 1, policy, 8192);
-        let initial1 = initialize_writer(&mut controller, &mut primary);
-        let initial2 = initialize_writer(&mut controller, &mut backup);
-        let (receipt1, expected) = compressed(&mut controller, &mut primary);
-        let (receipt2, _) = compressed(&mut controller, &mut backup);
-        if policy == QuorumPolicy::Durable {
-            for voter in [&mut primary, &mut backup] {
-                let work = prepare(voter);
-                finish(&mut controller, voter, work);
-            }
-            settle(&mut primary, initial1);
-            settle(&mut primary, receipt1);
-            settle(&mut backup, initial2);
-            settle(&mut backup, receipt2);
-            synchronize(&mut controller, &mut primary);
-            synchronize(&mut controller, &mut backup);
-        } else {
-            drop((initial1, initial2, receipt1, receipt2));
-        }
-        confirm(&mut primary, &backup, policy);
-        for installed in [false, true] {
-            if installed && policy == QuorumPolicy::Replicated {
-                for voter in [&mut primary, &mut backup] {
-                    let work = prepare(voter);
-                    finish(&mut controller, voter, work);
-                }
-            }
-            let mut limits = bounds();
-            limits.max_payload_bytes = 4096;
-            let work = capture(&primary, 0, limits);
-            let done = drive(&mut controller, work.read_delivery());
-            let delivery = primary.journal.complete_delivery(done).unwrap();
-            assert!(matches!(
-                encode(delivery, 8192),
-                Err(JournalError::Read(PartitionReadError::Limits))
-            ));
-            for credit in [2048, 8192] {
-                let work = capture(&primary, 0, bounds());
-                let mut jobs = 0;
-                let done = drive_except(&mut controller, work.read_delivery(), None, |_| {
-                    jobs += 1;
-                    Effect::Normal
-                });
-                assert_eq!(jobs, 0);
-                let delivery = primary.journal.complete_delivery(done).unwrap();
-                let result = encode(delivery, credit);
-                if credit == 2048 {
-                    assert!(matches!(
-                        result,
-                        Err(JournalError::Read(
-                            PartitionReadError::RecordTooLarge { .. }
-                        ))
-                    ));
-                } else {
-                    let (payload, encoding) = result.unwrap();
-                    assert_eq!(encoding, ozzy_proto::append::PayloadEncoding::Lz4);
-                    assert_eq!(payload.as_ref(), expected);
-                }
-            }
-        }
-        let work = capture(&primary, 0, bounds());
-        let done = drive(&mut controller, work.read_delivery());
-        assert!(backup.journal.complete_delivery(done).is_err());
-        assert!(!backup.journal.is_faulted());
-        drive(&mut controller, primary.journal.shutdown()).unwrap();
-        drive(&mut controller, backup.journal.shutdown()).unwrap();
+fn owned_delivery_preserves_sdk_lz4_in_installed_records() {
+    let (mut controller, io) = setup();
+    let mut primary = replica(&mut controller, io.clone(), 0, 8192);
+    let mut backup = replica(&mut controller, io, 1, 8192);
+    let initial1 = initialize_writer(&mut controller, &mut primary);
+    let initial2 = initialize_writer(&mut controller, &mut backup);
+    let (receipt1, expected) = compressed(&mut controller, &mut primary);
+    let (receipt2, _) = compressed(&mut controller, &mut backup);
+    for voter in [&mut primary, &mut backup] {
+        let work = prepare(voter);
+        finish(&mut controller, voter, work);
     }
+    settle(&mut primary, initial1);
+    settle(&mut primary, receipt1);
+    settle(&mut backup, initial2);
+    settle(&mut backup, receipt2);
+    synchronize(&mut controller, &mut primary);
+    synchronize(&mut controller, &mut backup);
+    confirm(&mut primary, &backup);
+    let mut limits = bounds();
+    limits.max_payload_bytes = 4096;
+    let work = capture(&primary, 0, limits);
+    let done = drive(&mut controller, work.read_delivery());
+    let delivery = primary.journal.complete_delivery(done).unwrap();
+    assert!(matches!(
+        encode(delivery, 8192),
+        Err(JournalError::Read(PartitionReadError::Limits))
+    ));
+    for credit in [2048, 8192] {
+        let work = capture(&primary, 0, bounds());
+        let mut jobs = 0;
+        let done = drive_except(&mut controller, work.read_delivery(), None, |_| {
+            jobs += 1;
+            Effect::Normal
+        });
+        assert_eq!(jobs, 0);
+        let delivery = primary.journal.complete_delivery(done).unwrap();
+        let result = encode(delivery, credit);
+        if credit == 2048 {
+            assert!(matches!(
+                result,
+                Err(JournalError::Read(
+                    PartitionReadError::RecordTooLarge { .. }
+                ))
+            ));
+        } else {
+            let (payload, encoding) = result.unwrap();
+            assert_eq!(encoding, ozzy_proto::append::PayloadEncoding::Lz4);
+            assert_eq!(payload.as_ref(), expected);
+        }
+    }
+    let work = capture(&primary, 0, bounds());
+    let done = drive(&mut controller, work.read_delivery());
+    assert!(backup.journal.complete_delivery(done).is_err());
+    assert!(!backup.journal.is_faulted());
+    drive(&mut controller, primary.journal.shutdown()).unwrap();
+    drive(&mut controller, backup.journal.shutdown()).unwrap();
 }

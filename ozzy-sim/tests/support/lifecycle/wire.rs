@@ -106,16 +106,8 @@ impl Packet {
     pub(crate) fn decode(&self) -> ReplicaMessage<'_> {
         // Trace inspection has no authority. Actual receive binds the receiver's
         // own configuration and epoch through decode_for, never this fallback.
-        [QuorumPolicy::Durable, QuorumPolicy::Replicated]
-            .into_iter()
-            .find_map(|policy| {
-                self.decode_with(
-                    configuration_record_with_policy(policy).configuration(),
-                    self.epoch,
-                )
-                .ok()
-            })
-            .expect("fixture packet decodes under its configured policy")
+        self.decode_with(configuration_record().configuration(), self.epoch)
+            .expect("fixture packet decodes under its configuration")
     }
 
     pub(super) fn decode_for(

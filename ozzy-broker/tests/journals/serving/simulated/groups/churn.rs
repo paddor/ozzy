@@ -10,20 +10,15 @@ const RECORDS: u128 = 16;
 
 #[tokio::test(flavor = "current_thread")]
 async fn disk_quorum_redundant_producers_and_a_group_reader_survive_copy_crashes() {
-    churn(Confirmation::DiskQuorum).await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn replicated_persisting_redundant_producers_and_a_group_reader_survive_copy_crashes() {
-    churn(Confirmation::ReplicatedPersisting).await;
+    churn().await;
 }
 
 #[expect(
     clippy::too_many_lines,
     reason = "keep the crash schedule, receipts, and delivery checks together"
 )]
-async fn churn(policy: Confirmation) {
-    let mut cluster = Cluster::configured(policy, None, |deployment| {
+async fn churn() {
+    let mut cluster = Cluster::configured(DeploymentMode::Three, None, |deployment| {
         deployment.topics.get_mut("orders").unwrap().deduplication =
             Some(ozzy_config::TopicDeduplication {
                 window_millis: 300_000,
@@ -112,12 +107,12 @@ async fn churn(policy: Confirmation) {
         }
         for (id, records) in copies {
             let [first, second] = records.as_slice() else {
-                panic!("{policy:?}: {id:?} has {} receipts", records.len());
+                panic!("{id:?} has {} receipts", records.len());
             };
             assert_eq!(
                 (first.partition, first.offset),
                 (second.partition, second.offset),
-                "{policy:?}: both copies of {id:?} confirm the first-wins offset"
+                "both copies of {id:?} confirm the first-wins offset"
             );
             assert!(
                 records
@@ -125,7 +120,7 @@ async fn churn(policy: Confirmation) {
                     .filter(|record| record.disposition == AppendDisposition::Stored)
                     .count()
                     <= 1,
-                "{policy:?}: {id:?} stored twice"
+                "{id:?} stored twice"
             );
             assert!(stored.insert(id, (first.partition, first.offset)).is_none());
         }
@@ -143,7 +138,7 @@ async fn churn(policy: Confirmation) {
                 (incarnation, offset)
             );
             let expected = next.entry(record.partition).or_default();
-            assert_eq!(record.offset.get(), *expected, "{policy:?}: group order");
+            assert_eq!(record.offset.get(), *expected, "group order");
             *expected += 1;
             let acknowledged = reader.acknowledge(delivered.token).unwrap();
             let receipt = live_many(
@@ -183,7 +178,7 @@ async fn churn(policy: Confirmation) {
     let resumed = live_many(&cluster.brokers, "read after reopen", reader.next())
         .await
         .unwrap();
-    assert_eq!(resumed.record.message_id, id, "{policy:?}: no redelivery");
+    assert_eq!(resumed.record.message_id, id, "no redelivery");
     let expected = next.entry(resumed.record.partition).or_default();
     assert_eq!(resumed.record.offset.get(), *expected);
     let acknowledged = reader.acknowledge(resumed.token).unwrap();

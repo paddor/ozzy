@@ -323,7 +323,7 @@ impl ReplicaDriver {
         if current.committed != previous.committed {
             self.progress_deadline = now.saturating_add(self.progress_timeout());
         }
-        if self.storage_progress(current) > self.storage_progress(previous) {
+        if current.journal.durable > previous.journal.durable {
             self.persistence_deadline = now.saturating_add(self.timing.primary_timeout);
         }
     }
@@ -333,15 +333,8 @@ impl ReplicaDriver {
         let outstanding = snapshot.accepted != snapshot.committed || !snapshot.ready_for_appends;
         (!primary && self.now >= self.contact_deadline)
             || (outstanding && self.now >= self.progress_deadline)
-            || (snapshot.accepted.op > self.storage_progress(snapshot)
+            || (snapshot.accepted.op > snapshot.journal.durable
                 && self.now >= self.persistence_deadline)
-    }
-
-    fn storage_progress(&self, snapshot: &ReplicaSnapshot) -> OpNumber {
-        match self.configuration.policy() {
-            crate::QuorumPolicy::Durable => snapshot.journal.durable,
-            crate::QuorumPolicy::Replicated => snapshot.journal.written,
-        }
     }
 
     fn next_view(&mut self) -> Result<(), DriverError> {

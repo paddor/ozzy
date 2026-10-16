@@ -28,16 +28,16 @@ scripts/test.sh inproc       # inproc broker and SDK gates
 
 ```sh
 scripts/ozzy_cargo run -p ozzy-sim --features broker --bin ozzy_sim -- \
-  --mode replicated-persisting --seed 42 --duration 28800 \
+  --mode disk-quorum --seed 42 --duration 28800 \
   --interval-ms 10 --progress-timeout 30 \
-  --artifacts tmp/ozzy-sim-rp-42
+  --artifacts tmp/ozzy-sim-dq-42
 ```
 
 Pass `--help` to `ozzy_sim` for every flag and its default.
 
 | Flag | Meaning |
 | --- | --- |
-| `--mode` | `durable`, `disk-quorum`, or `replicated-persisting` |
+| `--mode` | `durable` or `disk-quorum` (default) |
 | `--seed` | Workload and fault seed |
 | `--scenarios N` | Run N fresh clusters with successive seeds, each in `scenario-<i>-seed-<seed>/` |
 | `--artifacts` | Output directory (required) |
@@ -99,8 +99,8 @@ Progress prints every minute.
 
 ```sh
 scripts/ozzy_cargo run -p ozzy-sim --features broker --bin ozzy_sim -- \
-  --replay tmp/ozzy-sim-rp-42/schedule.jsonl --waves 100 \
-  --artifacts tmp/ozzy-sim-rp-42-replay
+  --replay tmp/ozzy-sim-dq-42/schedule.jsonl --waves 100 \
+  --artifacts tmp/ozzy-sim-dq-42-replay
 ```
 
 - Use a new artifact directory.

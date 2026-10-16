@@ -25,25 +25,18 @@ mod simulated;
 fn deployment(
     root: &Path,
     mode: DeploymentMode,
-    policy: Confirmation,
     partitions: u32,
 ) -> Vec<(CheckedConfig, BrokerIdentity)> {
-    deployment_with(root, mode, policy, partitions, |_| {})
+    deployment_with(root, mode, partitions, |_| {})
 }
 
 fn deployment_with(
     root: &Path,
     mode: DeploymentMode,
-    policy: Confirmation,
     partitions: u32,
     configure: impl FnOnce(&mut Deployment),
 ) -> Vec<(CheckedConfig, BrokerIdentity)> {
-    let shape = Shape {
-        mode,
-        policy,
-        partitions,
-    };
-    deployment_with_resources(root, shape, &host(), configure)
+    deployment_with_resources(root, Shape { mode, partitions }, &host(), configure)
 }
 
 use ozzy_sim::broker::{Shape, deployment_with_resources};
@@ -151,12 +144,7 @@ async fn production_single_broker_startup_confirms_topic_writes_and_restarts() {
 async fn single() {
     let root = tempfile::tempdir().unwrap();
     let runtime = WriterRuntime::new().unwrap();
-    let mut deployment = deployment(
-        root.path(),
-        DeploymentMode::Single,
-        Confirmation::LocalDurable,
-        4,
-    );
+    let mut deployment = deployment(root.path(), DeploymentMode::Single, 4);
     let (checked, local) = deployment.pop().unwrap();
     for device in checked.deployment.deployment().brokers[&checked.plan.name]
         .devices
@@ -258,42 +246,22 @@ async fn close_broker(broker: Broker, turn: usize) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn production_three_brokers_use_asymmetric_shards_and_confirm_disk_quorum() {
-    tokio::time::timeout(
-        Duration::from_secs(30),
-        replicated(Confirmation::DiskQuorum),
-    )
-    .await
-    .unwrap();
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn production_three_brokers_confirm_replicated_persisting() {
-    tokio::time::timeout(
-        Duration::from_secs(30),
-        replicated(Confirmation::ReplicatedPersisting),
-    )
-    .await
-    .unwrap();
-}
-
-async fn replicated(policy: Confirmation) {
-    replicated_partitions(policy, 6).await;
+    tokio::time::timeout(Duration::from_secs(30), replicated_partitions(6))
+        .await
+        .unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn production_shard_turns_reach_every_partition_beyond_the_first_sixteen() {
-    tokio::time::timeout(
-        Duration::from_secs(30),
-        replicated_partitions(Confirmation::DiskQuorum, 20),
-    )
-    .await
-    .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), replicated_partitions(20))
+        .await
+        .unwrap();
 }
 
-async fn replicated_partitions(policy: Confirmation, partitions: u32) {
+async fn replicated_partitions(partitions: u32) {
     let root = tempfile::tempdir().unwrap();
     let runtime = WriterRuntime::new().unwrap();
-    let deployment = deployment(root.path(), DeploymentMode::Three, policy, partitions);
+    let deployment = deployment(root.path(), DeploymentMode::Three, partitions);
     let restart = (
         CheckedConfig {
             deployment: deployment[0].0.deployment.clone(),
@@ -352,11 +320,7 @@ async fn replicated_partitions(policy: Confirmation, partitions: u32) {
         .unwrap();
         assert_eq!(
             receipt.record.policy,
-            if policy == Confirmation::DiskQuorum {
-                ozzy_proto::append::Policy::QuorumDurable
-            } else {
-                ozzy_proto::append::Policy::QuorumReplicatedPersisting
-            }
+            ozzy_proto::append::Policy::QuorumDurable
         );
         assert_eq!(receipt.record.offset, next[receipt.partition as usize]);
         next[receipt.partition as usize] += 1;
@@ -538,14 +502,9 @@ async fn production_failed_frontend_bind_drains_shards_before_retry() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let root = tempfile::tempdir().unwrap();
         let runtime = WriterRuntime::new().unwrap();
-        let (checked, local) = deployment(
-            root.path(),
-            DeploymentMode::Single,
-            Confirmation::LocalDurable,
-            4,
-        )
-        .pop()
-        .unwrap();
+        let (checked, local) = deployment(root.path(), DeploymentMode::Single, 4)
+            .pop()
+            .unwrap();
         for device in checked.deployment.deployment().brokers[&checked.plan.name]
             .devices
             .values()
@@ -590,14 +549,9 @@ async fn production_startup_refuses_missing_history_and_drains_before_explicit_f
     tokio::time::timeout(Duration::from_secs(10), async {
         let root = tempfile::tempdir().unwrap();
         let runtime = WriterRuntime::new().unwrap();
-        let (checked, local) = deployment(
-            root.path(),
-            DeploymentMode::Single,
-            Confirmation::LocalDurable,
-            4,
-        )
-        .pop()
-        .unwrap();
+        let (checked, local) = deployment(root.path(), DeploymentMode::Single, 4)
+            .pop()
+            .unwrap();
         for device in checked.deployment.deployment().brokers[&checked.plan.name]
             .devices
             .values()

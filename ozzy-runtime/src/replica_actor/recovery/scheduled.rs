@@ -97,7 +97,7 @@ impl<J: RecoveryStorage + 'static> ScheduledRecovery<J> {
     }
 
     pub(in crate::replica_actor) fn native_identity(&self) -> (NodeId, ozzy_proto::append::Policy) {
-        (self.local, self.configuration.append_policy())
+        (self.local, ozzy_proto::append::Policy::QuorumDurable)
     }
 
     pub(in crate::replica_actor) fn authority_hint(&self) -> ozzy_proto::nack::AuthorityHint {

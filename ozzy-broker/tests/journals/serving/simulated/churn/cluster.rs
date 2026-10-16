@@ -6,17 +6,11 @@ use ozzy_sim::broker::Cluster as MemoryCluster;
 
 #[tokio::test(flavor = "current_thread")]
 async fn disk_quorum_repeated_recovery_reclaims_old_segments_and_preserves_selected_payloads() {
-    repeated_recovery(Confirmation::DiskQuorum).await;
+    repeated_recovery().await;
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn replicated_persisting_repeated_recovery_reclaims_old_segments_and_preserves_selected_payloads()
- {
-    repeated_recovery(Confirmation::ReplicatedPersisting).await;
-}
-
-async fn repeated_recovery(policy: Confirmation) {
-    let mut cluster = MemoryCluster::new(policy).await;
+async fn repeated_recovery() {
+    let mut cluster = MemoryCluster::new(DeploymentMode::Three).await;
     let mut client = SdkClient::open_with_runtime(&cluster.configs[0].0, &cluster.runtime).await;
     for wave in 0..4 {
         let pending = live_many(
@@ -87,7 +81,7 @@ async fn repeated_recovery(policy: Confirmation) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn repeated_multipartition_attachments_reuse_sdk_capacity_with_a_live_reader() {
-    let cluster = MemoryCluster::new(Confirmation::ReplicatedPersisting).await;
+    let cluster = MemoryCluster::new(DeploymentMode::Three).await;
     let mut client = SdkClient::open_with_runtime(&cluster.configs[0].0, &cluster.runtime).await;
     let mut reader = live_many(
         &cluster.brokers,
@@ -137,7 +131,7 @@ async fn repeated_multipartition_attachments_reuse_sdk_capacity_with_a_live_read
 
 #[tokio::test(flavor = "current_thread")]
 async fn restart_during_unfinished_recovery_resumes_the_nonvoting_store() {
-    let mut cluster = MemoryCluster::new(Confirmation::ReplicatedPersisting).await;
+    let mut cluster = MemoryCluster::new(DeploymentMode::Three).await;
     let mut client = SdkClient::open_with_runtime(&cluster.configs[0].0, &cluster.runtime).await;
     let pending = live_many(
         &cluster.brokers,

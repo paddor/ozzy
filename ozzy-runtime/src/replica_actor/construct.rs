@@ -125,12 +125,7 @@ fn lease_checked_buffer(
     config: &ActorConfig,
 ) -> Result<AppendBuffer, ActorError> {
     check_journal_limits(journal, config)?;
-    let required = if journal.replicated() {
-        config.transfer
-    } else {
-        config.pipeline
-    };
-    checked_arena(journal.lease_append_buffer()?, generation, required)
+    checked_arena(journal.lease_append_buffer()?, generation, config.pipeline)
 }
 
 /// A leased arena of this worker generation that holds `required`.

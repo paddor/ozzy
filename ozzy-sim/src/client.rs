@@ -105,7 +105,7 @@ impl Client {
             bases: vec![0; partitions],
             next_sequences: vec![0; partitions],
             submitted: Vec::new(),
-            policy: policy(topic.confirmation),
+            policy: checked.identity.mode.policy(),
             verified: Arc::default(),
         }
     }
@@ -482,15 +482,6 @@ const DATA_LIMITS: DataLimits = DataLimits {
     max_parts: 4,
     max_record_bytes: 1024,
 };
-
-/// The SDK confirmation policy for a configured topic confirmation.
-fn policy(confirmation: ozzy_config::Confirmation) -> Policy {
-    match confirmation {
-        ozzy_config::Confirmation::LocalDurable => Policy::LocalDurable,
-        ozzy_config::Confirmation::DiskQuorum => Policy::QuorumDurable,
-        ozzy_config::Confirmation::ReplicatedPersisting => Policy::QuorumReplicatedPersisting,
-    }
-}
 
 /// Producer and consumer links to every configured broker under a fresh node id.
 fn links_config(checked: &CheckedConfig, partitions: usize, clock: SdkClock) -> BrokerLinksConfig {

@@ -6,7 +6,7 @@ mod transfer;
 
 use super::{
     AppendBuffer, GroupJournal, JournalError, JournalGeneration, JournalStartup, Local,
-    OwnedConfig, OwnedJournal, QuorumPolicy, SubmitError,
+    OwnedConfig, OwnedJournal, SubmitError,
 };
 use crate::replica_journal::{PublishedRecovery, RecoveryStartup, receiving::RecoveryPlan};
 use ozzy_journal_segment::{RecoveryDirectory, SealedRepair, SuffixInstaller, SuffixStreamLimits};
@@ -175,7 +175,6 @@ impl RecoveringJournal {
         };
         config.validate_manifest(directory.manifest())?;
         let repair = mode != RecoveryOpen::ResumeFull
-            && config.configuration.configuration().policy() == QuorumPolicy::Durable
             && directory
                 .sealed_damage(config.limits.io.max_segment_bytes)
                 .await?

@@ -31,76 +31,72 @@ fn step(
 
 #[test]
 fn bounded_actor_sets_preserve_healthy_groups_under_stalled_io_and_full_transport() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        let (mut controller, io) = setup();
-        let (mut stalled, first) = cluster(&mut controller, &io, 0, policy);
-        let (middle, second) = cluster(&mut controller, &io, 1, policy);
-        let (last, third) = cluster(&mut controller, &io, 2, policy);
-        let blocked = stalled[0].status().scope.group_id;
-        for _ in 0..1000 {
-            round(&mut stalled, false);
-            if controller.jobs().iter().any(|(id, _)| {
-                matches!(
-                    controller.operation(*id).unwrap().unprotected(),
-                    Operation::Write { .. }
-                )
-            }) {
-                break;
-            }
-            settle(&mut controller, &[]);
+    let (mut controller, io) = setup();
+    let (mut stalled, first) = cluster(&mut controller, &io, 0);
+    let (middle, second) = cluster(&mut controller, &io, 1);
+    let (last, third) = cluster(&mut controller, &io, 2);
+    let blocked = stalled[0].status().scope.group_id;
+    for _ in 0..1000 {
+        round(&mut stalled, false);
+        if controller.jobs().iter().any(|(id, _)| {
+            matches!(
+                controller.operation(*id).unwrap().unprotected(),
+                Operation::Write { .. }
+            )
+        }) {
+            break;
         }
-        let held: Vec<_> = controller.jobs().into_iter().map(|(id, _)| id).collect();
-        assert_ne!(held.len(), 0);
-        let mut assigned: [Vec<_>; 3] = std::array::from_fn(|_| Vec::new());
-        for group in [stalled, middle, last] {
-            for (broker, actor) in group.into_iter().enumerate() {
-                assigned[broker].push(PartitionActor::Replicated(actor));
-            }
+        settle(&mut controller, &[]);
+    }
+    let held: Vec<_> = controller.jobs().into_iter().map(|(id, _)| id).collect();
+    assert_ne!(held.len(), 0);
+    let mut assigned: [Vec<_>; 3] = std::array::from_fn(|_| Vec::new());
+    for group in [stalled, middle, last] {
+        for (broker, actor) in group.into_iter().enumerate() {
+            assigned[broker].push(PartitionActor::Replicated(actor));
         }
-        // One actor turn per poll forces a fair scan over three distinct roles.
-        let mut shards = assigned.map(|actors| PartitionActors::new(actors, 3, 1).unwrap());
-        let mut routes = StepRoutes::with_prior_group(blocked);
-        let mut replies = [Box::pin(second), Box::pin(third)];
-        let mut done = [false; 2];
-        let mut first = Box::pin(first);
-        for _ in 0..10000 {
-            step(&mut shards, &mut routes, Some(blocked));
-            settle(&mut controller, &held);
-            for (reply, done) in replies.iter_mut().zip(&mut done) {
-                if !*done && let Poll::Ready(result) = poll(reply.as_mut()) {
-                    assert!(matches!(
-                        result.unwrap().outcome,
-                        ProposalOutcome::Committed { .. }
-                    ));
-                    *done = true;
-                }
-            }
-            if done == [true; 2] {
-                break;
-            }
-        }
-        assert_eq!(done, [true; 2]);
-        assert!(held.iter().all(|id| controller.operation(*id).is_some()));
-        if policy == QuorumPolicy::Durable {
-            assert!(poll(first.as_mut()).is_pending());
-        }
-        let mut done = false;
-        for _ in 0..10000 {
-            step(&mut shards, &mut routes, None);
-            settle(&mut controller, &[]);
-            if let Poll::Ready(result) = poll(first.as_mut()) {
+    }
+    // One actor turn per poll forces a fair scan over three distinct roles.
+    let mut shards = assigned.map(|actors| PartitionActors::new(actors, 3, 1).unwrap());
+    let mut routes = StepRoutes::with_prior_group(blocked);
+    let mut replies = [Box::pin(second), Box::pin(third)];
+    let mut done = [false; 2];
+    let mut first = Box::pin(first);
+    for _ in 0..10000 {
+        step(&mut shards, &mut routes, Some(blocked));
+        settle(&mut controller, &held);
+        for (reply, done) in replies.iter_mut().zip(&mut done) {
+            if !*done && let Poll::Ready(result) = poll(reply.as_mut()) {
                 assert!(matches!(
                     result.unwrap().outcome,
                     ProposalOutcome::Committed { .. }
                 ));
-                done = true;
-                break;
+                *done = true;
             }
         }
-        assert!(done);
-        for shard in shards {
-            close_set(&mut controller, shard);
+        if done == [true; 2] {
+            break;
         }
+    }
+    assert_eq!(done, [true; 2]);
+    assert!(held.iter().all(|id| controller.operation(*id).is_some()));
+    assert!(poll(first.as_mut()).is_pending());
+    let mut done = false;
+    for _ in 0..10000 {
+        step(&mut shards, &mut routes, None);
+        settle(&mut controller, &[]);
+        if let Poll::Ready(result) = poll(first.as_mut()) {
+            assert!(matches!(
+                result.unwrap().outcome,
+                ProposalOutcome::Committed { .. }
+            ));
+            done = true;
+            break;
+        }
+    }
+    assert!(done);
+    for shard in shards {
+        close_set(&mut controller, shard);
     }
 }
 
@@ -120,15 +116,7 @@ fn actor_turn_bound_survives_observer_cancellation_and_preserves_idle_sleep() {
     let actors: Vec<_> = (0..3)
         .map(|group| {
             PartitionActor::Replicated(
-                Scheduled::new(unstarted_actor(
-                    &mut controller,
-                    &io,
-                    group,
-                    QuorumPolicy::Durable,
-                    0,
-                    64,
-                ))
-                .unwrap(),
+                Scheduled::new(unstarted_actor(&mut controller, &io, group, 0, 64)).unwrap(),
             )
         })
         .collect();
@@ -214,7 +202,7 @@ fn shared_transport_budget_reaches_every_partition_under_steady_control_traffic(
     let mut replies = Vec::new();
     let mut groups = Vec::new();
     for group in 0..3 {
-        let (actors, pending) = cluster(&mut controller, &io, group, QuorumPolicy::Durable);
+        let (actors, pending) = cluster(&mut controller, &io, group);
         groups.push(actors[0].status().scope);
         replies.push(Box::pin(pending));
         for (broker, actor) in actors.into_iter().enumerate() {
@@ -264,68 +252,66 @@ fn shared_transport_budget_reaches_every_partition_under_steady_control_traffic(
 
 #[test]
 fn replaced_sessions_stop_waking_quiet_partition_actors() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        let (mut controller, io) = setup();
-        let (actors, pending) = cluster(&mut controller, &io, 0, policy);
-        let mut pending = Box::pin(pending);
-        let mut shards = Vec::new();
-        let mut routes = StepRoutes::default();
-        for (broker, mut actor) in actors.into_iter().enumerate() {
-            for remote in 0..3 {
-                if remote != broker {
-                    actor
-                        .replace_session(
-                            NodeId::from_bytes([remote as u8 + 1; 16]),
-                            LinkSessionId::from_bytes([61; 16]),
-                            LinkSessionId::from_bytes([99; 16]),
-                            Duration::ZERO,
-                        )
-                        .unwrap();
-                }
-            }
-            shards.push(
-                PartitionActors::new(vec![PartitionActor::Replicated(actor)], 1, 1)
-                    .unwrap()
-                    .with_safety_sweep(Duration::from_millis(10))
-                    .unwrap(),
-            );
-        }
-        let mut confirmed = false;
-        for _ in 0..1000 {
-            step(&mut shards, &mut routes, None);
-            settle(&mut controller, &[]);
-            if let Poll::Ready(result) = poll(pending.as_mut()) {
-                assert!(matches!(
-                    result.unwrap().outcome,
-                    ProposalOutcome::Committed { .. }
-                ));
-                confirmed = true;
-                break;
+    let (mut controller, io) = setup();
+    let (actors, pending) = cluster(&mut controller, &io, 0);
+    let mut pending = Box::pin(pending);
+    let mut shards = Vec::new();
+    let mut routes = StepRoutes::default();
+    for (broker, mut actor) in actors.into_iter().enumerate() {
+        for remote in 0..3 {
+            if remote != broker {
+                actor
+                    .replace_session(
+                        NodeId::from_bytes([remote as u8 + 1; 16]),
+                        LinkSessionId::from_bytes([61; 16]),
+                        LinkSessionId::from_bytes([99; 16]),
+                        Duration::ZERO,
+                    )
+                    .unwrap();
             }
         }
-        assert!(
-            confirmed,
-            "new broker sessions never confirmed the proposal"
+        shards.push(
+            PartitionActors::new(vec![PartitionActor::Replicated(actor)], 1, 1)
+                .unwrap()
+                .with_safety_sweep(Duration::from_millis(10))
+                .unwrap(),
         );
-        for _ in 0..100 {
-            step(&mut shards, &mut routes, None);
-            settle(&mut controller, &[]);
+    }
+    let mut confirmed = false;
+    for _ in 0..1000 {
+        step(&mut shards, &mut routes, None);
+        settle(&mut controller, &[]);
+        if let Poll::Ready(result) = poll(pending.as_mut()) {
+            assert!(matches!(
+                result.unwrap().outcome,
+                ProposalOutcome::Committed { .. }
+            ));
+            confirmed = true;
+            break;
         }
-        let quiet: Vec<_> = shards.iter().map(PartitionActors::turns).collect();
-        for _ in 0..50 {
-            step(&mut shards, &mut routes, None);
-        }
-        assert_eq!(
-            shards
-                .iter()
-                .map(PartitionActors::turns)
-                .collect::<Vec<_>>(),
-            quiet,
-            "settled session changes keep idle actors runnable"
-        );
-        for shard in shards {
-            close_set(&mut controller, shard);
-        }
+    }
+    assert!(
+        confirmed,
+        "new broker sessions never confirmed the proposal"
+    );
+    for _ in 0..100 {
+        step(&mut shards, &mut routes, None);
+        settle(&mut controller, &[]);
+    }
+    let quiet: Vec<_> = shards.iter().map(PartitionActors::turns).collect();
+    for _ in 0..50 {
+        step(&mut shards, &mut routes, None);
+    }
+    assert_eq!(
+        shards
+            .iter()
+            .map(PartitionActors::turns)
+            .collect::<Vec<_>>(),
+        quiet,
+        "settled session changes keep idle actors runnable"
+    );
+    for shard in shards {
+        close_set(&mut controller, shard);
     }
 }
 
@@ -336,7 +322,7 @@ fn woken_partitions_progress_and_quiet_partitions_wait_for_their_timer_visit() {
     let mut replies = Vec::new();
     let mut groups = Vec::new();
     for group in 0..3 {
-        let (actors, pending) = cluster(&mut controller, &io, group, QuorumPolicy::Durable);
+        let (actors, pending) = cluster(&mut controller, &io, group);
         groups.push(actors[0].status().scope);
         replies.push(Box::pin(pending));
         for (broker, actor) in actors.into_iter().enumerate() {
@@ -413,7 +399,7 @@ fn woken_partitions_progress_and_quiet_partitions_wait_for_their_timer_visit() {
 #[test]
 fn quiet_partitions_are_visited_at_their_own_timers_between_sweeps() {
     let (mut controller, io) = setup();
-    let (actors, pending) = cluster(&mut controller, &io, 0, QuorumPolicy::Durable);
+    let (actors, pending) = cluster(&mut controller, &io, 0);
     let mut reply = Box::pin(pending);
     let sweep = Duration::from_secs(1);
     let mut shards: Vec<_> = actors

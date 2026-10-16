@@ -20,13 +20,8 @@ pub(super) fn limits() -> Limits {
     }
 }
 
-pub(super) fn replica(
-    controller: &mut Controller,
-    io: Local,
-    id: u8,
-    policy: QuorumPolicy,
-) -> Replica {
-    let mut config = config(&format!("/dedup-{id}"), 7, policy);
+pub(super) fn replica(controller: &mut Controller, io: Local, id: u8) -> Replica {
+    let mut config = config(&format!("/dedup-{id}"), 7);
     config.identity.replica_node_id = NodeId::from_bytes([id + 1; 16]);
     config.deduplication = Some(limits());
     config.limits.decode.max_entries = config.writeback.max_operations;
@@ -89,88 +84,84 @@ fn found(replica: &Replica, id: u8) -> Option<Match> {
 }
 
 #[test]
-fn both_quorum_policies_install_ids_at_acceptance_and_confirm_only_verified_prefixes() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        let (mut controller, io) = setup();
-        let mut primary = replica(&mut controller, io.clone(), 0, policy);
-        let mut backup = replica(&mut controller, io, 1, policy);
-        let mut primary_receipts = vec![initialize_writer(&mut controller, &mut primary)];
-        let mut backup_receipts = vec![initialize_writer(&mut controller, &mut backup)];
-        let first = resolved(&request(12, 0, 1), Offset::ZERO, &[None], 0);
-        let validated = validate(&mut controller, &mut primary, &first).unwrap();
-        assert_eq!(found(&primary, 1), None);
-        drop(validated);
-        assert_eq!(
-            found(&primary, 1),
-            None,
-            "discarded preparation admits no ID"
-        );
-        let (write, _, receipt) = admit_encoded(&mut controller, &mut primary, [first.clone()]);
-        primary_receipts.push(receipt);
-        backup_receipts.push(admit_encoded(&mut controller, &mut backup, [first]).2);
-        assert_eq!(
-            found(&primary, 1),
-            Some(Match::Pending {
-                offset: Offset::ZERO,
-                operation: write.through().0,
-            })
-        );
-        // Claiming a live ID as newly stored must fail without changing authority.
-        let mut repeated = request(12, 1, 1);
-        repeated.records[0].message_id = MessageId::from_bytes([1; 16]);
-        let invalid = resolved(&repeated, Offset::new(1), &[None], 0);
-        assert!(matches!(
-            validate(&mut controller, &mut primary, &invalid),
-            Err(JournalError::Dedup(Error::Batch))
-        ));
-        assert!(!primary.journal.is_faulted());
-        let next = resolved(&request(12, 1, 1), Offset::new(1), &[None], 0);
-        let mut prepared = validate(&mut controller, &mut primary, &next).unwrap();
-        for replica in [&mut primary, &mut backup] {
-            let work = prepare(replica);
-            finish(&mut controller, replica, work);
-        }
-        for receipt in primary_receipts {
-            settle(&mut primary, receipt);
-        }
-        for receipt in backup_receipts {
-            settle(&mut backup, receipt);
-        }
-        if policy == QuorumPolicy::Durable {
-            synchronize(&mut controller, &mut primary);
-            synchronize(&mut controller, &mut backup);
-        }
-        confirm(&mut primary, &backup, policy);
-        assert_eq!(found(&primary, 1), Some(Match::Committed(Offset::ZERO)));
-        assert_eq!(found(&primary, 2), None);
-        // Apply can progress between validation and storage installation.
-        assert!(primary.journal.can_admit(&mut prepared));
-        let Admission::Write { ticket, .. } = primary
-            .driver
-            .prepare_validated(
-                primary.config.identity.replica_node_id,
-                primary.driver.begin_validation().unwrap(),
-                prepared.prepared(),
-                Duration::ZERO,
-            )
-            .unwrap()
-        else {
-            panic!("write ticket")
-        };
-        primary.journal.admit_append(ticket, prepared).unwrap();
-        assert_eq!(
-            found(&primary, 2),
-            Some(Match::Pending {
-                offset: Offset::new(1),
-                operation: ticket.through().0,
-            })
-        );
-        assert_eq!(found(&primary, 1), Some(Match::Committed(Offset::ZERO)));
-        assert!(
-            controller.jobs().is_empty(),
-            "logical ID installation performs no I/O"
-        );
+fn disk_quorum_installs_ids_at_acceptance_and_confirms_only_verified_prefixes() {
+    let (mut controller, io) = setup();
+    let mut primary = replica(&mut controller, io.clone(), 0);
+    let mut backup = replica(&mut controller, io, 1);
+    let mut primary_receipts = vec![initialize_writer(&mut controller, &mut primary)];
+    let mut backup_receipts = vec![initialize_writer(&mut controller, &mut backup)];
+    let first = resolved(&request(12, 0, 1), Offset::ZERO, &[None], 0);
+    let validated = validate(&mut controller, &mut primary, &first).unwrap();
+    assert_eq!(found(&primary, 1), None);
+    drop(validated);
+    assert_eq!(
+        found(&primary, 1),
+        None,
+        "discarded preparation admits no ID"
+    );
+    let (write, _, receipt) = admit_encoded(&mut controller, &mut primary, [first.clone()]);
+    primary_receipts.push(receipt);
+    backup_receipts.push(admit_encoded(&mut controller, &mut backup, [first]).2);
+    assert_eq!(
+        found(&primary, 1),
+        Some(Match::Pending {
+            offset: Offset::ZERO,
+            operation: write.through().0,
+        })
+    );
+    // Claiming a live ID as newly stored must fail without changing authority.
+    let mut repeated = request(12, 1, 1);
+    repeated.records[0].message_id = MessageId::from_bytes([1; 16]);
+    let invalid = resolved(&repeated, Offset::new(1), &[None], 0);
+    assert!(matches!(
+        validate(&mut controller, &mut primary, &invalid),
+        Err(JournalError::Dedup(Error::Batch))
+    ));
+    assert!(!primary.journal.is_faulted());
+    let next = resolved(&request(12, 1, 1), Offset::new(1), &[None], 0);
+    let mut prepared = validate(&mut controller, &mut primary, &next).unwrap();
+    for replica in [&mut primary, &mut backup] {
+        let work = prepare(replica);
+        finish(&mut controller, replica, work);
     }
+    for receipt in primary_receipts {
+        settle(&mut primary, receipt);
+    }
+    for receipt in backup_receipts {
+        settle(&mut backup, receipt);
+    }
+    synchronize(&mut controller, &mut primary);
+    synchronize(&mut controller, &mut backup);
+    confirm(&mut primary, &backup);
+    assert_eq!(found(&primary, 1), Some(Match::Committed(Offset::ZERO)));
+    assert_eq!(found(&primary, 2), None);
+    // Apply can progress between validation and storage installation.
+    assert!(primary.journal.can_admit(&mut prepared));
+    let Admission::Write { ticket, .. } = primary
+        .driver
+        .prepare_validated(
+            primary.config.identity.replica_node_id,
+            primary.driver.begin_validation().unwrap(),
+            prepared.prepared(),
+            Duration::ZERO,
+        )
+        .unwrap()
+    else {
+        panic!("write ticket")
+    };
+    primary.journal.admit_append(ticket, prepared).unwrap();
+    assert_eq!(
+        found(&primary, 2),
+        Some(Match::Pending {
+            offset: Offset::new(1),
+            operation: ticket.through().0,
+        })
+    );
+    assert_eq!(found(&primary, 1), Some(Match::Committed(Offset::ZERO)));
+    assert!(
+        controller.jobs().is_empty(),
+        "logical ID installation performs no I/O"
+    );
 }
 
 #[test]
@@ -180,8 +171,7 @@ fn enabled_policy_without_an_identity_image_is_rejected_before_admission() {
     };
     use ozzy_proto::{OwnerEpoch, PartitionId, PartitionIncarnation};
     let (mut controller, io) = setup();
-    let mut replica =
-        super::writeback::replica(&mut controller, io, 0, QuorumPolicy::Durable, 8192);
+    let mut replica = super::writeback::replica(&mut controller, io, 0, 8192);
     let body = OperationBody::CreatePartition(CreatePartition {
         partition: PartitionIncarnation::from_bytes([11; 16]),
         stream: "stream",

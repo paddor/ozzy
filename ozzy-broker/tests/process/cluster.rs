@@ -4,7 +4,6 @@ use super::{Client, fixture};
 use crate::admin_client::AdminClient;
 use crate::command;
 use ozzy_broker::{CheckedConfig, check_config, host_resources, load_deployment};
-use ozzy_config::Confirmation;
 use ozzy_proto::admin::{Reply, Request};
 use std::{
     collections::BTreeMap, fmt::Write, fs, future::Future, net::TcpListener, path::PathBuf,
@@ -29,8 +28,8 @@ impl Cluster {
         self
     }
 
-    pub(super) fn retained(policy: Confirmation) -> Self {
-        let cluster = Self::new_with_shards(policy, true, "tcp");
+    pub(super) fn retained() -> Self {
+        let cluster = Self::new_with_shards(true, "tcp");
         let source = fs::read_to_string(&cluster.config).unwrap();
         fs::write(
             &cluster.config,
@@ -43,28 +42,23 @@ impl Cluster {
         cluster
     }
 
-    pub(super) fn new(policy: Confirmation) -> Self {
-        Self::new_with_shards(policy, false, "tcp")
+    pub(super) fn new() -> Self {
+        Self::new_with_shards(false, "tcp")
     }
 
     /// Every endpoint uses `lz4+tcp://`, including broker-to-broker links.
     #[cfg(feature = "lz4-transport")]
-    pub(super) fn lz4(policy: Confirmation) -> Self {
-        Self::new_with_shards(policy, false, "lz4+tcp")
+    pub(super) fn lz4() -> Self {
+        Self::new_with_shards(false, "lz4+tcp")
     }
 
     /// Every endpoint uses `zstd+tcp://`, including broker-to-broker links.
     #[cfg(feature = "zstd-transport")]
-    pub(super) fn zstd(policy: Confirmation) -> Self {
-        Self::new_with_shards(policy, false, "zstd+tcp")
+    pub(super) fn zstd() -> Self {
+        Self::new_with_shards(false, "zstd+tcp")
     }
 
-    fn new_with_shards(policy: Confirmation, single_shard: bool, scheme: &str) -> Self {
-        let policy = match policy {
-            Confirmation::DiskQuorum => "disk-quorum",
-            Confirmation::ReplicatedPersisting => "replicated-persisting",
-            Confirmation::LocalDurable => panic!("cluster fixture requires three brokers"),
-        };
+    fn new_with_shards(single_shard: bool, scheme: &str) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let config = directory.path().join("deployment.toml");
         // Reserve all endpoints together, then persist explicit ports for every restart.
@@ -72,10 +66,10 @@ impl Cluster {
             std::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").unwrap());
         let roots = std::array::from_fn(|index| directory.path().join(format!("broker-{index}")));
         let admin = admin_prefix(&directory);
-        let mut source = format!(
+        let mut source = String::from(
             "[cluster]\nmode = \"three\"\n\
-             [topics.orders]\nconfirmation = \"{policy}\"\npartitions = 4\n\
-             segment_bytes = 1048576\nmax_append_bytes = 65536\n"
+             [topics.orders]\npartitions = 4\n\
+             segment_bytes = 1048576\nmax_append_bytes = 65536\n",
         );
         for index in 0..3 {
             let peer = sockets[index * 4].local_addr().unwrap().port();
@@ -303,8 +297,8 @@ impl Processes {
     }
 }
 
-pub(super) async fn orderly_restart(policy: Confirmation) {
-    orderly_restart_in(Cluster::new(policy)).await;
+pub(super) async fn orderly_restart() {
+    orderly_restart_in(Cluster::new()).await;
 }
 
 pub(super) async fn orderly_restart_in(cluster: Cluster) {

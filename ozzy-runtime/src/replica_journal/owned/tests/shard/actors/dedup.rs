@@ -12,7 +12,6 @@ use ozzy_proto::{
 fn cluster(
     controller: &mut Controller,
     io: &Local,
-    policy: QuorumPolicy,
 ) -> (
     Vec<ScheduledReplica>,
     PendingProposal,
@@ -23,13 +22,12 @@ fn cluster(
         window_millis: 300_000,
         ..super::super::super::dedup::limits()
     };
-    cluster_on(&mut [(controller, io)], policy, limits)
+    cluster_on(&mut [(controller, io)], limits)
 }
 
 /// Broker `n` formats and runs on `devices[n % devices.len()]`.
 pub(super) fn cluster_on(
     devices: &mut [(&mut Controller, &Local)],
-    policy: QuorumPolicy,
     limits: ozzy_core::dedup::Limits,
 ) -> (
     Vec<ScheduledReplica>,
@@ -46,7 +44,6 @@ pub(super) fn cluster_on(
             controller,
             io,
             0,
-            policy,
             broker,
             ActorSettings {
                 deduplication: Some(limits),
@@ -117,159 +114,153 @@ fn finish(
 
 #[test]
 fn both_quorum_actors_defer_redundant_producers_until_the_original_is_applied() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        let (mut controller, io) = setup();
-        let (mut actors, bootstrap, mut lane, buffers) = cluster(&mut controller, &io, policy);
-        drop(finish(&mut controller, &mut actors, Box::pin(bootstrap)));
-        let mut pending = Vec::new();
-        for (mut buffer, writer) in buffers.into_iter().take(2).zip([12, 30]) {
-            buffer
-                .prepare_append(super::super::super::proposal::request(writer, 0, 1))
-                .unwrap();
-            pending.push(Box::pin(lane.try_submit(buffer).unwrap()));
-        }
-        for _ in 0..1000 {
-            scheduled::round(&mut actors, true);
-            scheduled::settle(&mut controller, &[]);
-        }
-        let status = actors[0].status().normal.unwrap();
-        assert_eq!(
-            status.accepted.op.0, 4,
-            "duplicate results must remain unadmitted"
-        );
-        assert_eq!(status.applied.op.0, 3);
-        for work in &mut pending {
-            assert!(poll(work.as_mut()).is_pending());
-        }
-        let first = finish(&mut controller, &mut actors, pending.remove(0));
-        let second = finish(&mut controller, &mut actors, pending.remove(0));
-        let first = decode_resolved_append(
-            first.buffer.bodies().next().unwrap().1,
-            OperationLimits::default(),
-        )
-        .unwrap();
-        assert_eq!(first.results.stored(), 1);
-        let second = decode_resolved_append(
-            second.buffer.bodies().next().unwrap().1,
-            OperationLimits::default(),
-        )
-        .unwrap();
-        assert_eq!(second.results.stored(), 0);
-        assert_eq!(second.results.attempts(), 1);
-        assert_eq!(second.results.runs().next().unwrap().first_offset.get(), 0);
-        for actor in actors {
-            scheduled::close(&mut controller, actor);
-        }
+    let (mut controller, io) = setup();
+    let (mut actors, bootstrap, mut lane, buffers) = cluster(&mut controller, &io);
+    drop(finish(&mut controller, &mut actors, Box::pin(bootstrap)));
+    let mut pending = Vec::new();
+    for (mut buffer, writer) in buffers.into_iter().take(2).zip([12, 30]) {
+        buffer
+            .prepare_append(super::super::super::proposal::request(writer, 0, 1))
+            .unwrap();
+        pending.push(Box::pin(lane.try_submit(buffer).unwrap()));
+    }
+    for _ in 0..1000 {
+        scheduled::round(&mut actors, true);
+        scheduled::settle(&mut controller, &[]);
+    }
+    let status = actors[0].status().normal.unwrap();
+    assert_eq!(
+        status.accepted.op.0, 4,
+        "duplicate results must remain unadmitted"
+    );
+    assert_eq!(status.applied.op.0, 3);
+    for work in &mut pending {
+        assert!(poll(work.as_mut()).is_pending());
+    }
+    let first = finish(&mut controller, &mut actors, pending.remove(0));
+    let second = finish(&mut controller, &mut actors, pending.remove(0));
+    let first = decode_resolved_append(
+        first.buffer.bodies().next().unwrap().1,
+        OperationLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(first.results.stored(), 1);
+    let second = decode_resolved_append(
+        second.buffer.bodies().next().unwrap().1,
+        OperationLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(second.results.stored(), 0);
+    assert_eq!(second.results.attempts(), 1);
+    assert_eq!(second.results.runs().next().unwrap().first_offset.get(), 0);
+    for actor in actors {
+        scheduled::close(&mut controller, actor);
     }
 }
 
 #[test]
 fn other_producers_proceed_while_a_duplicate_waits_for_its_original() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        let (mut controller, io) = setup();
-        let (mut actors, bootstrap, mut lane, buffers) = cluster(&mut controller, &io, policy);
-        drop(finish(&mut controller, &mut actors, Box::pin(bootstrap)));
-        // Writer 30 repeats writer 12's records; its second APPEND arrives
-        // while its first still waits and must stay behind it.
-        let mut pending = Vec::new();
-        for (mut buffer, (writer, first)) in
-            buffers
-                .into_iter()
-                .zip([(12, 0), (30, 0), (12, 1), (30, 1)])
-        {
-            buffer
-                .prepare_append(super::super::super::proposal::request(writer, first, 1))
-                .unwrap();
-            pending.push(Box::pin(lane.try_submit(buffer).unwrap()));
-        }
-        for _ in 0..1000 {
-            scheduled::round(&mut actors, true);
-            scheduled::settle(&mut controller, &[]);
-        }
-        let status = actors[0].status().normal.unwrap();
-        assert_eq!(
-            status.accepted.op.0, 5,
-            "writer 12 keeps admitting while writer 30 waits"
-        );
-        assert_eq!(status.applied.op.0, 3);
-        for work in &mut pending {
-            assert!(poll(work.as_mut()).is_pending());
-        }
-        for (work, expected) in pending.into_iter().zip([(1, 0), (0, 0), (1, 1), (0, 1)]) {
-            let reply = finish(&mut controller, &mut actors, work);
-            let resolved = decode_resolved_append(
-                reply.buffer.bodies().next().unwrap().1,
-                OperationLimits::default(),
-            )
+    let (mut controller, io) = setup();
+    let (mut actors, bootstrap, mut lane, buffers) = cluster(&mut controller, &io);
+    drop(finish(&mut controller, &mut actors, Box::pin(bootstrap)));
+    // Writer 30 repeats writer 12's records; its second APPEND arrives
+    // while its first still waits and must stay behind it.
+    let mut pending = Vec::new();
+    for (mut buffer, (writer, first)) in
+        buffers
+            .into_iter()
+            .zip([(12, 0), (30, 0), (12, 1), (30, 1)])
+    {
+        buffer
+            .prepare_append(super::super::super::proposal::request(writer, first, 1))
             .unwrap();
-            let first = resolved.results.runs().next().unwrap().first_offset.get();
-            assert_eq!((resolved.results.stored(), first), expected);
-            assert_eq!(resolved.results.attempts(), 1);
-        }
-        for actor in actors {
-            scheduled::close(&mut controller, actor);
-        }
+        pending.push(Box::pin(lane.try_submit(buffer).unwrap()));
+    }
+    for _ in 0..1000 {
+        scheduled::round(&mut actors, true);
+        scheduled::settle(&mut controller, &[]);
+    }
+    let status = actors[0].status().normal.unwrap();
+    assert_eq!(
+        status.accepted.op.0, 5,
+        "writer 12 keeps admitting while writer 30 waits"
+    );
+    assert_eq!(status.applied.op.0, 3);
+    for work in &mut pending {
+        assert!(poll(work.as_mut()).is_pending());
+    }
+    for (work, expected) in pending.into_iter().zip([(1, 0), (0, 0), (1, 1), (0, 1)]) {
+        let reply = finish(&mut controller, &mut actors, work);
+        let resolved = decode_resolved_append(
+            reply.buffer.bodies().next().unwrap().1,
+            OperationLimits::default(),
+        )
+        .unwrap();
+        let first = resolved.results.runs().next().unwrap().first_offset.get();
+        assert_eq!((resolved.results.stored(), first), expected);
+        assert_eq!(resolved.results.attempts(), 1);
+    }
+    for actor in actors {
+        scheduled::close(&mut controller, actor);
     }
 }
 
 #[test]
 fn fencing_a_parked_duplicate_releases_the_producers_queued_appends() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        let (mut controller, io) = setup();
-        let (mut actors, bootstrap, mut lane, buffers) = cluster(&mut controller, &io, policy);
-        drop(finish(&mut controller, &mut actors, Box::pin(bootstrap)));
-        // Writer 12's original stays accepted-only under blocked transport.
-        // Writer 30's duplicate parks behind it and its fresh record queues
-        // behind that.
-        let mut pending = Vec::new();
-        for (mut buffer, (writer, first)) in
-            buffers.into_iter().take(3).zip([(12, 0), (30, 0), (30, 1)])
-        {
-            buffer
-                .prepare_append(super::super::super::proposal::request(writer, first, 1))
-                .unwrap();
-            pending.push(Box::pin(lane.try_submit(buffer).unwrap()));
-        }
-        for _ in 0..1000 {
-            scheduled::round(&mut actors, true);
-            scheduled::settle(&mut controller, &[]);
-        }
-        let status = actors[0].status().normal.unwrap();
-        assert_eq!(status.accepted.op.0, 4);
-        assert_eq!(status.applied.op.0, 3);
-        for work in &mut pending {
-            assert!(poll(work.as_mut()).is_pending());
-        }
-        pending[1].fence_unadmitted();
-        for _ in 0..1000 {
-            scheduled::round(&mut actors, true);
-            scheduled::settle(&mut controller, &[]);
-        }
-        let Poll::Ready(fenced) = poll(pending[1].as_mut()) else {
-            panic!("fenced parked proposal must finish");
-        };
-        assert!(matches!(
-            fenced.unwrap().outcome,
-            ProposalOutcome::NotAdmitted
-        ));
-        // The queued request validates next and fails its sequence check, so
-        // the writer replays from its confirmed prefix instead of waiting.
-        let Poll::Ready(follow) = poll(pending[2].as_mut()) else {
-            panic!("the producer's queued request must validate after the fence");
-        };
-        assert!(matches!(
-            follow.unwrap().outcome,
-            ProposalOutcome::Invalid(crate::replica_journal::JournalError::ProducerAppend(
-                crate::replica_journal::AppendAdmissionError::SequenceGap
-            ))
-        ));
-        assert_eq!(actors[0].status().normal.unwrap().accepted.op.0, 4);
-        let original = pending.remove(0);
-        drop(finish(&mut controller, &mut actors, original));
-        assert_eq!(actors[0].status().normal.unwrap().applied.op.0, 4);
-        for actor in actors {
-            scheduled::close(&mut controller, actor);
-        }
+    let (mut controller, io) = setup();
+    let (mut actors, bootstrap, mut lane, buffers) = cluster(&mut controller, &io);
+    drop(finish(&mut controller, &mut actors, Box::pin(bootstrap)));
+    // Writer 12's original stays accepted-only under blocked transport.
+    // Writer 30's duplicate parks behind it and its fresh record queues
+    // behind that.
+    let mut pending = Vec::new();
+    for (mut buffer, (writer, first)) in
+        buffers.into_iter().take(3).zip([(12, 0), (30, 0), (30, 1)])
+    {
+        buffer
+            .prepare_append(super::super::super::proposal::request(writer, first, 1))
+            .unwrap();
+        pending.push(Box::pin(lane.try_submit(buffer).unwrap()));
+    }
+    for _ in 0..1000 {
+        scheduled::round(&mut actors, true);
+        scheduled::settle(&mut controller, &[]);
+    }
+    let status = actors[0].status().normal.unwrap();
+    assert_eq!(status.accepted.op.0, 4);
+    assert_eq!(status.applied.op.0, 3);
+    for work in &mut pending {
+        assert!(poll(work.as_mut()).is_pending());
+    }
+    pending[1].fence_unadmitted();
+    for _ in 0..1000 {
+        scheduled::round(&mut actors, true);
+        scheduled::settle(&mut controller, &[]);
+    }
+    let Poll::Ready(fenced) = poll(pending[1].as_mut()) else {
+        panic!("fenced parked proposal must finish");
+    };
+    assert!(matches!(
+        fenced.unwrap().outcome,
+        ProposalOutcome::NotAdmitted
+    ));
+    // The queued request validates next and fails its sequence check, so
+    // the writer replays from its confirmed prefix instead of waiting.
+    let Poll::Ready(follow) = poll(pending[2].as_mut()) else {
+        panic!("the producer's queued request must validate after the fence");
+    };
+    assert!(matches!(
+        follow.unwrap().outcome,
+        ProposalOutcome::Invalid(crate::replica_journal::JournalError::ProducerAppend(
+            crate::replica_journal::AppendAdmissionError::SequenceGap
+        ))
+    ));
+    assert_eq!(actors[0].status().normal.unwrap().accepted.op.0, 4);
+    let original = pending.remove(0);
+    drop(finish(&mut controller, &mut actors, original));
+    assert_eq!(actors[0].status().normal.unwrap().applied.op.0, 4);
+    for actor in actors {
+        scheduled::close(&mut controller, actor);
     }
 }
 
@@ -286,7 +277,7 @@ fn a_follower_behind_on_its_own_writes_validates_two_windows_of_identities() {
             .iter_mut()
             .map(|(controller, io)| (controller, &*io))
             .collect();
-        cluster_on(&mut borrowed, QuorumPolicy::Durable, limits)
+        cluster_on(&mut borrowed, limits)
     };
     let settle = |devices: &mut [(Controller, Local)], stalled: bool| {
         for (index, (controller, _)) in devices.iter_mut().enumerate() {
@@ -388,7 +379,7 @@ fn a_follower_behind_on_its_writes_waits_to_reuse_identity_capacity() {
             .iter_mut()
             .map(|(controller, io)| (controller, &*io))
             .collect();
-        cluster_on(&mut borrowed, QuorumPolicy::Durable, limits)
+        cluster_on(&mut borrowed, limits)
     };
     let settle = |devices: &mut [(Controller, Local)], stalled: bool| {
         for (index, (controller, _)) in devices.iter_mut().enumerate() {

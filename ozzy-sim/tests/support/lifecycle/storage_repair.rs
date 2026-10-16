@@ -3,8 +3,8 @@
 use super::model::{Cluster, DiskAction, RecoveryDisk};
 use ozzy_journal_segment::simulation::Damage;
 
-pub(super) fn replacement(policy: ozzy_replication::QuorumPolicy) -> Cluster {
-    let mut sim = Cluster::with_storage_policy(3000, policy);
+pub(super) fn replacement() -> Cluster {
+    let mut sim = Cluster::with_storage(3000);
     for id in 1..=8 {
         let request = sim.propose(0, id).unwrap();
         sim.until(100, |sim| {
@@ -78,7 +78,7 @@ pub(super) fn io_cuts(actions: usize, stride: usize) -> impl Iterator<Item = usi
 
 fn repair_io_cuts(stride: usize) {
     for publication in [false, true] {
-        let mut baseline = replacement(ozzy_replication::QuorumPolicy::Durable);
+        let mut baseline = replacement();
         until_action(&mut baseline, publication);
         let before = baseline.replicas[2]
             .storage
@@ -94,7 +94,7 @@ fn repair_io_cuts(stride: usize) {
             - before;
         assert!(actions > 0);
         for cut in io_cuts(actions, stride) {
-            let mut sim = replacement(ozzy_replication::QuorumPolicy::Durable);
+            let mut sim = replacement();
             until_action(&mut sim, publication);
             sim.replicas[2].storage.as_mut().unwrap().fail_after(cut);
             sim.perform_disk(2);

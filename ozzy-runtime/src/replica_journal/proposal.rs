@@ -156,14 +156,6 @@ impl ProposalBuffer {
         &mut self,
         request: ozzy_proto::append::ValidatedAppend<'_>,
     ) -> Result<(), JournalError> {
-        if !matches!(
-            request.policy,
-            ozzy_proto::append::Policy::LocalDurable
-                | ozzy_proto::append::Policy::QuorumDurable
-                | ozzy_proto::append::Policy::QuorumReplicatedPersisting
-        ) {
-            return Err(AppendAdmissionError::Policy.into());
-        }
         if !self.is_empty()
             && (!self.0.is_producer() || self.0.proposal_authority != Some(request.authority))
         {

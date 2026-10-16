@@ -251,7 +251,7 @@ fn profile(config: &JournalConfig) -> (Policy, usize, GroupId) {
             config.identity.group_id,
         ),
         JournalConfig::Replicated(config) => (
-            config.configuration.configuration().append_policy(),
+            Policy::QuorumDurable,
             config.append_limits.max_body_bytes,
             config.identity.group_id,
         ),

@@ -149,11 +149,7 @@ impl OwnedJournal {
         }
         let journal = self.journal.ready_mut()?;
         let bytes = self.limits.io.max_segment_bytes as usize;
-        Ok(if self.configuration.memory_voting() {
-            journal.begin_written_storage_validation(bytes).await?
-        } else {
-            journal.begin_storage_validation(bytes).await?
-        })
+        Ok(journal.begin_storage_validation(bytes).await?)
     }
 
     /// Install only this owner/scope/generation's diagnostics. Normal growth or

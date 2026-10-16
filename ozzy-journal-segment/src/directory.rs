@@ -3,7 +3,6 @@ mod error;
 pub(crate) mod evidence;
 mod layout;
 mod maintenance;
-pub(crate) mod memory_voting;
 mod orphans;
 mod owned_write;
 pub(crate) mod publication;

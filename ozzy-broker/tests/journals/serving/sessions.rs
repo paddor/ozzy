@@ -5,27 +5,18 @@ use super::*;
 #[tokio::test(flavor = "current_thread")]
 async fn production_reader_only_sdk_negotiates_and_replays_every_policy() {
     tokio::time::timeout(Duration::from_secs(30), async {
-        for policy in [
-            Confirmation::LocalDurable,
-            Confirmation::DiskQuorum,
-            Confirmation::ReplicatedPersisting,
-        ] {
-            reader_only(policy).await;
+        for mode in [DeploymentMode::Single, DeploymentMode::Three] {
+            reader_only(mode).await;
         }
     })
     .await
     .unwrap();
 }
 
-async fn reader_only(policy: Confirmation) {
+async fn reader_only(mode: DeploymentMode) {
     let root = tempfile::tempdir().unwrap();
     let runtime = WriterRuntime::new().unwrap();
-    let mode = if policy == Confirmation::LocalDurable {
-        DeploymentMode::Single
-    } else {
-        DeploymentMode::Three
-    };
-    let deployment = deployment(root.path(), mode, policy, 2);
+    let deployment = deployment(root.path(), mode, 2);
     let checked = &deployment[0].0;
     let sdk = links(&runtime, checked).await;
     let reading = role_links(&runtime, checked, handshake::CONSUMER).await;

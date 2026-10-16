@@ -1,5 +1,5 @@
 use crate::{CheckedConfig, StartupError};
-use ozzy_config::{BrokerPlan, Confirmation, ControllerPlan, IoBackend, PartitionPlacement, Topic};
+use ozzy_config::{BrokerPlan, ControllerPlan, IoBackend, PartitionPlacement, Topic};
 use ozzy_journal::operation::OperationLimits;
 use ozzy_journal_segment::{
     CanonicalRecoveryLimits, CheckpointLimits, DecodeLimits, ENTRY_HEADER_BYTES, GROUP_SEAL_BYTES,
@@ -176,12 +176,7 @@ impl Sizes {
                 max_segment_bytes: topic.segment_bytes,
                 chunk_bytes: self.chunk,
                 direct,
-                write_mode: match topic.confirmation {
-                    Confirmation::ReplicatedPersisting => SegmentWriteMode::Buffered,
-                    Confirmation::LocalDurable | Confirmation::DiskQuorum => {
-                        SegmentWriteMode::DataSync
-                    }
-                },
+                write_mode: SegmentWriteMode::DataSync,
             },
             directory_entries: self.directory_entries,
             directory_name_bytes: self.directory_name_bytes,

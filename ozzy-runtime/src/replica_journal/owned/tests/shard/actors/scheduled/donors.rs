@@ -5,114 +5,106 @@ use ozzy_replication::wire::{self, RecoveryRequest, WireLimits};
 
 #[test]
 fn recovery_freezes_an_unsent_candidate_after_intervening_commit() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        let (mut controller, io) = setup();
-        let mut actors = (0..3)
-            .map(|broker| {
-                Scheduled::new(unstarted_actor(&mut controller, &io, 0, policy, broker, 64))
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        for _ in 0..100 {
-            round(&mut actors, false);
-            settle(&mut controller, &[]);
-        }
-        assert!(actors.iter().all(|actor| actor.status().application_ready));
-        let mut buffer = actors[0]
-            .lease_proposal_buffer_with_limits(actor_config().pipeline)
-            .unwrap();
-        buffer
-            .push(ozzy_journal::operation::OperationKind::Barrier, &[31; 16])
-            .unwrap();
-        let mut pending = Box::pin(
-            actors[0]
-                .take_submitter()
-                .unwrap()
-                .try_submit(buffer)
-                .unwrap(),
-        );
-        let mut held = Vec::new();
-        for _ in 0..10000 {
-            for (to, message) in collect(&mut actors, Duration::ZERO, false) {
-                if to == 0 {
-                    held.push(message);
-                } else {
-                    actors[to].receive(&message, Duration::ZERO).unwrap();
-                }
-            }
-            settle(&mut controller, &[]);
-            if actors
-                .iter()
-                .all(|actor| actor.status().normal.unwrap().journal.written.0 == 1)
-                && !held.is_empty()
-            {
-                break;
-            }
-        }
-        assert_eq!(
-            actors[0].status().normal.unwrap().committed,
-            Prefix::GENESIS
-        );
-        assert!(
-            actors
-                .iter()
-                .all(|actor| actor.status().normal.unwrap().journal.written.0 == 1)
-        );
-        let now = Duration::from_millis(100);
-        for _ in 0..32 {
-            for (to, message) in collect(&mut actors, now, false) {
-                if to == 0 {
-                    held.push(message);
-                } else {
-                    actors[to].receive(&message, now).unwrap();
-                }
-            }
-            settle(&mut controller, &[]);
-        }
-        let request = RecoveryRequest {
-            scope: actors[0].status().scope,
-            request_id: ozzy_proto::RequestId::from_bytes([95; 16]),
-            nonce: ozzy_proto::RequestId::from_bytes([96; 16]),
-        };
+    let (mut controller, io) = setup();
+    let mut actors = (0..3)
+        .map(|broker| Scheduled::new(unstarted_actor(&mut controller, &io, 0, broker, 64)).unwrap())
+        .collect::<Vec<_>>();
+    for _ in 0..100 {
+        round(&mut actors, false);
+        settle(&mut controller, &[]);
+    }
+    assert!(actors.iter().all(|actor| actor.status().application_ready));
+    let mut buffer = actors[0]
+        .lease_proposal_buffer_with_limits(actor_config().pipeline)
+        .unwrap();
+    buffer
+        .push(ozzy_journal::operation::OperationKind::Barrier, &[31; 16])
+        .unwrap();
+    let mut pending = Box::pin(
         actors[0]
-            .receive(&request_message(request, actor_config().sessions[2]), now)
-            .unwrap();
-        for message in held {
-            actors[0].receive(&message, now).unwrap();
+            .take_submitter()
+            .unwrap()
+            .try_submit(buffer)
+            .unwrap(),
+    );
+    let mut held = Vec::new();
+    for _ in 0..10000 {
+        for (to, message) in collect(&mut actors, Duration::ZERO, false) {
+            if to == 0 {
+                held.push(message);
+            } else {
+                actors[to].receive(&message, Duration::ZERO).unwrap();
+            }
         }
-        assert_eq!(actors[0].status().normal.unwrap().committed.op.0, 1);
-        let response = expect_response(
-            &mut controller,
-            &mut actors[0],
-            policy,
-            request,
-            actor_config().sessions[2],
-            now,
-        );
-        assert_eq!(
-            response.primary.unwrap().committed.op.0,
-            1,
-            "unpublished donor candidate retained its obsolete commit floor"
-        );
-        assert!(matches!(poll(pending.as_mut()), Poll::Ready(Ok(_))));
-        for actor in actors {
-            close(&mut controller, actor);
+        settle(&mut controller, &[]);
+        if actors
+            .iter()
+            .all(|actor| actor.status().normal.unwrap().journal.written.0 == 1)
+            && !held.is_empty()
+        {
+            break;
         }
+    }
+    assert_eq!(
+        actors[0].status().normal.unwrap().committed,
+        Prefix::GENESIS
+    );
+    assert!(
+        actors
+            .iter()
+            .all(|actor| actor.status().normal.unwrap().journal.written.0 == 1)
+    );
+    let now = Duration::from_millis(100);
+    for _ in 0..32 {
+        for (to, message) in collect(&mut actors, now, false) {
+            if to == 0 {
+                held.push(message);
+            } else {
+                actors[to].receive(&message, now).unwrap();
+            }
+        }
+        settle(&mut controller, &[]);
+    }
+    let request = RecoveryRequest {
+        scope: actors[0].status().scope,
+        request_id: ozzy_proto::RequestId::from_bytes([95; 16]),
+        nonce: ozzy_proto::RequestId::from_bytes([96; 16]),
+    };
+    actors[0]
+        .receive(&request_message(request, actor_config().sessions[2]), now)
+        .unwrap();
+    for message in held {
+        actors[0].receive(&message, now).unwrap();
+    }
+    assert_eq!(actors[0].status().normal.unwrap().committed.op.0, 1);
+    let response = expect_response(
+        &mut controller,
+        &mut actors[0],
+        request,
+        actor_config().sessions[2],
+        now,
+    );
+    assert_eq!(
+        response.primary.unwrap().committed.op.0,
+        1,
+        "unpublished donor candidate retained its obsolete commit floor"
+    );
+    assert!(matches!(poll(pending.as_mut()), Poll::Ready(Ok(_))));
+    for actor in actors {
+        close(&mut controller, actor);
     }
 }
 
 #[test]
 fn disconnected_and_replaced_recovery_requesters_release_pending_pins() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        for disconnect in [false, true] {
-            replace_while_pinning(policy, disconnect);
-        }
+    for disconnect in [false, true] {
+        replace_while_pinning(disconnect);
     }
 }
 
-fn replace_while_pinning(policy: QuorumPolicy, disconnect: bool) {
+fn replace_while_pinning(disconnect: bool) {
     let (mut controller, io) = setup();
-    let (mut actors, pending) = cluster(&mut controller, &io, 0, policy);
+    let (mut actors, pending) = cluster(&mut controller, &io, 0);
     let mut pending = Box::pin(pending);
     let mut confirmed = false;
     for _ in 0..10000 {
@@ -191,7 +183,6 @@ fn replace_while_pinning(policy: QuorumPolicy, disconnect: bool) {
     expect_response(
         &mut controller,
         &mut actors[0],
-        policy,
         request,
         new,
         Duration::ZERO,
@@ -242,13 +233,12 @@ fn request_message(request: RecoveryRequest, session: LinkSessionId) -> Message 
 fn expect_response(
     controller: &mut Controller,
     actor: &mut Scheduled,
-    policy: QuorumPolicy,
     request: RecoveryRequest,
     session: LinkSessionId,
     now: Duration,
 ) -> ozzy_replication::recovery::RecoveryResponse {
     let binding = wire::PeerBinding::new(
-        config("/unused", 4, policy).configuration.configuration(),
+        config("/unused", 4).configuration.configuration(),
         NodeId::from_bytes([1; 16]),
         session,
     )

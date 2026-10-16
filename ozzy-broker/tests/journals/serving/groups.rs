@@ -18,8 +18,8 @@ type Seen = Arc<Mutex<Vec<(u8, u32, u64)>>>;
 #[tokio::test(flavor = "current_thread")]
 async fn production_group_readers_divide_partitions_and_resume_persisted_cursors() {
     tokio::time::timeout(Duration::from_secs(60), async {
-        for policy in [Confirmation::LocalDurable, Confirmation::DiskQuorum] {
-            scenario(policy).await;
+        for mode in [DeploymentMode::Single, DeploymentMode::Three] {
+            scenario(mode).await;
         }
     })
     .await
@@ -133,16 +133,11 @@ async fn until_seen(
     clippy::too_many_lines,
     reason = "one membership and resume schedule across real brokers"
 )]
-async fn scenario(policy: Confirmation) {
+async fn scenario(mode: DeploymentMode) {
     let root = tempfile::tempdir().unwrap();
     let runtime = WriterRuntime::new().unwrap();
-    let mode = if policy == Confirmation::LocalDurable {
-        DeploymentMode::Single
-    } else {
-        DeploymentMode::Three
-    };
     let admin = format!("inproc://groups-admin-{}", Uuid::now_v7());
-    let deployment = deployment_with(root.path(), mode, policy, 2, |config| {
+    let deployment = deployment_with(root.path(), mode, 2, |config| {
         for (name, broker) in &mut config.brokers {
             broker.endpoints.admin = Some(format!("{admin}-{name}"));
         }
@@ -231,8 +226,8 @@ async fn scenario(policy: Confirmation) {
             .iter()
             .map(|&(_, partition, offset)| (partition, offset))
             .collect();
-        assert_eq!(unique.len(), seen.len(), "{policy:?}: repeated delivery");
-        assert_eq!(unique.len(), 2 * written, "{policy:?}");
+        assert_eq!(unique.len(), seen.len(), "{mode:?}: repeated delivery");
+        assert_eq!(unique.len(), 2 * written, "{mode:?}");
         // Each partition's latest record went to its final, distinct owner.
         let last = |number| {
             seen.iter()
@@ -241,7 +236,7 @@ async fn scenario(policy: Confirmation) {
                 .unwrap()
                 .0
         };
-        assert_ne!(last(0), last(1), "{policy:?}: one owner per partition");
+        assert_ne!(last(0), last(1), "{mode:?}: one owner per partition");
     }
 
     // A new member resumes at the persisted cursors, not the creation selector.
@@ -268,7 +263,7 @@ async fn scenario(policy: Confirmation) {
     let mut resumed = resumed.lock().unwrap().clone();
     resumed.sort_unstable();
     let end = written as u64;
-    assert_eq!(resumed, [(3, 0, end), (3, 1, end)], "{policy:?}");
+    assert_eq!(resumed, [(3, 0, end), (3, 1, end)], "{mode:?}");
 
     live_many(&brokers, "close writer", writer.close())
         .await

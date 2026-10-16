@@ -111,67 +111,136 @@ fn assert_duplicate(result: ProposalValidation, through: Prefix, count: usize) {
 }
 
 #[test]
-fn duplicate_retries_use_queued_and_cold_proofs_under_both_group_policies() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        for count in [64, 128] {
-            let (mut controller, io) = setup();
-            let mut replica = replica(&mut controller, io, 0, policy, 8192);
-            let initial = initialize_writer(&mut controller, &mut replica);
-            let second = open_second(&mut controller, &mut replica);
-            let buffer = proposal(&replica, [request(12, 0, 1)]);
-            let validated = ready(validate(&mut controller, &mut replica, buffer, 777));
-            let original = accept(&mut replica, validated);
-            let attempted = redundant(count);
-            let (_, _, duplicate) = admit_encoded(
-                &mut controller,
-                &mut replica,
-                [resolved(
-                    &attempted,
-                    Offset::new(1),
-                    &vec![Some(Offset::ZERO); count],
-                    100,
-                )],
-            );
-            let through = replica.driver.begin_validation().unwrap().accepted();
-            let buffer = proposal(&replica, [copy(&attempted)]);
-            assert_duplicate(
-                validate(&mut controller, &mut replica, buffer, 999),
-                through,
-                count,
-            );
-            assert!(
-                controller.jobs().is_empty(),
-                "queued proof requires no physical read"
-            );
-            assert!(
-                replica.driver.begin_validation().unwrap().committed().op < through.op,
-                "retry evidence does not confirm the original operation"
-            );
+fn duplicate_retries_use_queued_and_cold_proofs() {
+    for count in [64, 128] {
+        let (mut controller, io) = setup();
+        let mut replica = replica(&mut controller, io, 0, 8192);
+        let initial = initialize_writer(&mut controller, &mut replica);
+        let second = open_second(&mut controller, &mut replica);
+        let buffer = proposal(&replica, [request(12, 0, 1)]);
+        let validated = ready(validate(&mut controller, &mut replica, buffer, 777));
+        let original = accept(&mut replica, validated);
+        let attempted = redundant(count);
+        let (_, _, duplicate) = admit_encoded(
+            &mut controller,
+            &mut replica,
+            [resolved(
+                &attempted,
+                Offset::new(1),
+                &vec![Some(Offset::ZERO); count],
+                100,
+            )],
+        );
+        let through = replica.driver.begin_validation().unwrap().accepted();
+        let buffer = proposal(&replica, [copy(&attempted)]);
+        assert_duplicate(
+            validate(&mut controller, &mut replica, buffer, 999),
+            through,
+            count,
+        );
+        assert!(
+            controller.jobs().is_empty(),
+            "queued proof requires no physical read"
+        );
+        assert!(
+            replica.driver.begin_validation().unwrap().committed().op < through.op,
+            "retry evidence does not confirm the original operation"
+        );
+        let work = prepare(&mut replica);
+        finish(&mut controller, &mut replica, work);
+        for receipt in [initial, second, original, duplicate] {
+            settle(&mut replica, receipt);
+        }
+        let buffer = proposal(&replica, [copy(&attempted)]);
+        let ticket = replica.driver.begin_validation().unwrap();
+        let mut jobs = 0;
+        let result = drive_except(
+            &mut controller,
+            replica.journal.propose_append(ticket, buffer, 999),
+            None,
+            |_| {
+                jobs += 1;
+                Effect::Normal
+            },
+        );
+        assert_duplicate(result, through, count);
+        assert!(
+            jobs <= 24,
+            "one cold proof operation issued {jobs} jobs for {count} attempts"
+        );
+        let mut changed = copy(&attempted);
+        changed.records[count / 2].parts =
+            vec![b"redu".as_slice(), b"ndant feed".as_slice()].into();
+        let buffer = proposal(&replica, [changed]);
+        assert!(matches!(
+            validate(&mut controller, &mut replica, buffer, 999),
+            ProposalValidation::Rejected {
+                reason: JournalError::ProducerAppend(AppendAdmissionError::RetryConflict),
+                ..
+            }
+        ));
+        assert_eq!(
+            replica.driver.begin_validation().unwrap().accepted(),
+            through
+        );
+        assert!(!replica.journal.is_faulted());
+        drive(&mut controller, replica.journal.shutdown()).unwrap();
+    }
+}
+
+#[test]
+fn mixed_retry_verifies_duplicate_proofs_and_sparse_stored_sequences() {
+    let (mut controller, io) = setup();
+    let mut replica = replica(&mut controller, io, 0, 8192);
+    let initial = initialize_writer(&mut controller, &mut replica);
+    let second = open_second(&mut controller, &mut replica);
+    let buffer = proposal(&replica, [request(12, 0, 1)]);
+    let validated = ready(validate(&mut controller, &mut replica, buffer, 777));
+    let original = accept(&mut replica, validated);
+    let mut attempted = request(30, 0, 6);
+    for index in [0, 2, 4] {
+        attempted.records[index].message_id = MessageId::from_bytes([1; 16]);
+    }
+    let duplicates = [
+        Some(Offset::ZERO),
+        None,
+        Some(Offset::ZERO),
+        None,
+        Some(Offset::ZERO),
+        None,
+    ];
+    let (_, _, mixed) = admit_encoded(
+        &mut controller,
+        &mut replica,
+        [resolved(&attempted, Offset::new(1), &duplicates, 101)],
+    );
+    let through = replica.driver.begin_validation().unwrap().accepted();
+    for cold in [false, true] {
+        if cold {
             let work = prepare(&mut replica);
             finish(&mut controller, &mut replica, work);
-            for receipt in [initial, second, original, duplicate] {
-                settle(&mut replica, receipt);
-            }
-            let buffer = proposal(&replica, [copy(&attempted)]);
-            let ticket = replica.driver.begin_validation().unwrap();
-            let mut jobs = 0;
-            let result = drive_except(
-                &mut controller,
-                replica.journal.propose_append(ticket, buffer, 999),
-                None,
-                |_| {
-                    jobs += 1;
-                    Effect::Normal
-                },
-            );
-            assert_duplicate(result, through, count);
-            assert!(
-                jobs <= 24,
-                "one cold proof operation issued {jobs} jobs for {count} attempts"
-            );
+        }
+        let buffer = proposal(&replica, [copy(&attempted)]);
+        let ProposalValidation::Resolved {
+            through: actual,
+            buffer,
+            ..
+        } = validate(&mut controller, &mut replica, buffer, 999)
+        else {
+            panic!("mixed retry");
+        };
+        assert_eq!(actual, through);
+        let ranges = &buffer.0.retry_results.as_ref().unwrap().ranges;
+        assert_eq!(
+            ranges
+                .iter()
+                .map(|span| span.first_offset.get())
+                .collect::<Vec<_>>(),
+            [0, 1, 0, 2, 0, 3]
+        );
+        for index in [1, 2] {
             let mut changed = copy(&attempted);
-            changed.records[count / 2].parts =
-                vec![b"redu".as_slice(), b"ndant feed".as_slice()].into();
+            changed.records[index].parts = vec![b"changed".as_slice()].into();
             let buffer = proposal(&replica, [changed]);
             assert!(matches!(
                 validate(&mut controller, &mut replica, buffer, 999),
@@ -180,81 +249,85 @@ fn duplicate_retries_use_queued_and_cold_proofs_under_both_group_policies() {
                     ..
                 }
             ));
-            assert_eq!(
-                replica.driver.begin_validation().unwrap().accepted(),
-                through
-            );
-            assert!(!replica.journal.is_faulted());
-            drive(&mut controller, replica.journal.shutdown()).unwrap();
         }
     }
+    for receipt in [initial, second, original, mixed] {
+        settle(&mut replica, receipt);
+    }
+    drive(&mut controller, replica.journal.shutdown()).unwrap();
 }
 
 #[test]
-fn mixed_retry_verifies_duplicate_proofs_and_sparse_stored_sequences() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
+fn duplicate_subrange_retry_verifies_clipped_proof_and_assigns_only_fresh_suffix() {
+    for cold in [false, true] {
         let (mut controller, io) = setup();
-        let mut replica = replica(&mut controller, io, 0, policy, 8192);
+        let mut replica = replica(&mut controller, io, 0, 8192);
         let initial = initialize_writer(&mut controller, &mut replica);
         let second = open_second(&mut controller, &mut replica);
         let buffer = proposal(&replica, [request(12, 0, 1)]);
         let validated = ready(validate(&mut controller, &mut replica, buffer, 777));
         let original = accept(&mut replica, validated);
-        let mut attempted = request(30, 0, 6);
-        for index in [0, 2, 4] {
-            attempted.records[index].message_id = MessageId::from_bytes([1; 16]);
-        }
-        let duplicates = [
-            Some(Offset::ZERO),
-            None,
-            Some(Offset::ZERO),
-            None,
-            Some(Offset::ZERO),
-            None,
-        ];
-        let (_, _, mixed) = admit_encoded(
+        let attempted = redundant(64);
+        let (_, _, duplicate) = admit_encoded(
             &mut controller,
             &mut replica,
-            [resolved(&attempted, Offset::new(1), &duplicates, 101)],
+            [resolved(
+                &attempted,
+                Offset::new(1),
+                &[Some(Offset::ZERO); 64],
+                101,
+            )],
         );
         let through = replica.driver.begin_validation().unwrap().accepted();
-        for cold in [false, true] {
-            if cold {
-                let work = prepare(&mut replica);
-                finish(&mut controller, &mut replica, work);
-            }
-            let buffer = proposal(&replica, [copy(&attempted)]);
-            let ProposalValidation::Resolved {
-                through: actual,
-                buffer,
-                ..
-            } = validate(&mut controller, &mut replica, buffer, 999)
-            else {
-                panic!("mixed retry");
-            };
-            assert_eq!(actual, through);
-            let ranges = &buffer.0.retry_results.as_ref().unwrap().ranges;
-            assert_eq!(
-                ranges
-                    .iter()
-                    .map(|span| span.first_offset.get())
-                    .collect::<Vec<_>>(),
-                [0, 1, 0, 2, 0, 3]
-            );
-            for index in [1, 2] {
-                let mut changed = copy(&attempted);
-                changed.records[index].parts = vec![b"changed".as_slice()].into();
-                let buffer = proposal(&replica, [changed]);
-                assert!(matches!(
-                    validate(&mut controller, &mut replica, buffer, 999),
-                    ProposalValidation::Rejected {
-                        reason: JournalError::ProducerAppend(AppendAdmissionError::RetryConflict),
-                        ..
-                    }
-                ));
-            }
+        if cold {
+            let work = prepare(&mut replica);
+            finish(&mut controller, &mut replica, work);
         }
-        for receipt in [initial, second, original, mixed] {
+        let mut partial = copy(&attempted);
+        partial.first_sequence = ProducerSequence::new(16);
+        partial.records = attempted.records[16..48].to_vec();
+        let buffer = proposal(&replica, [partial]);
+        let ProposalValidation::Resolved {
+            through: actual,
+            buffer,
+            ..
+        } = validate(&mut controller, &mut replica, buffer, 999)
+        else {
+            panic!("duplicate subrange retry");
+        };
+        assert_eq!(actual, through);
+        assert_eq!(coordinates(&buffer.0), [(16, 0, 777, 32)]);
+        let mut extended = copy(&attempted);
+        extended.first_sequence = ProducerSequence::new(16);
+        extended.records = attempted.records[16..].to_vec();
+        extended.records.extend(request(30, 64, 2).records);
+        let buffer = proposal(&replica, [extended]);
+        let validated = ready(validate(&mut controller, &mut replica, buffer, 999));
+        assert_eq!(coordinates(&validated.buffer), [(64, 1, 999, 2)]);
+        let results = &validated.buffer.retry_results.as_ref().unwrap().ranges;
+        assert_eq!(results.len(), 49);
+        assert_eq!(results[0].first_sequence, ProducerSequence::new(16));
+        assert!(results[..48].iter().all(|span| {
+            span.first_offset == Offset::ZERO
+                && span.records == 1
+                && span.source
+                    == ProducerResultSource::Duplicate {
+                        operation: through.op.0,
+                    }
+        }));
+        assert_eq!(
+            results[48],
+            ozzy_core::state::ProducerResultSpan {
+                first_sequence: ProducerSequence::new(64),
+                first_offset: Offset::new(1),
+                records: 2,
+                source: ProducerResultSource::Stored,
+            }
+        );
+        let suffix = accept(&mut replica, validated);
+        let work = prepare(&mut replica);
+        finish(&mut controller, &mut replica, work);
+        for receipt in [initial, second, original, duplicate, suffix] {
             settle(&mut replica, receipt);
         }
         drive(&mut controller, replica.journal.shutdown()).unwrap();
@@ -262,88 +335,9 @@ fn mixed_retry_verifies_duplicate_proofs_and_sparse_stored_sequences() {
 }
 
 #[test]
-fn duplicate_subrange_retry_verifies_clipped_proof_and_assigns_only_fresh_suffix() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        for cold in [false, true] {
-            let (mut controller, io) = setup();
-            let mut replica = replica(&mut controller, io, 0, policy, 8192);
-            let initial = initialize_writer(&mut controller, &mut replica);
-            let second = open_second(&mut controller, &mut replica);
-            let buffer = proposal(&replica, [request(12, 0, 1)]);
-            let validated = ready(validate(&mut controller, &mut replica, buffer, 777));
-            let original = accept(&mut replica, validated);
-            let attempted = redundant(64);
-            let (_, _, duplicate) = admit_encoded(
-                &mut controller,
-                &mut replica,
-                [resolved(
-                    &attempted,
-                    Offset::new(1),
-                    &[Some(Offset::ZERO); 64],
-                    101,
-                )],
-            );
-            let through = replica.driver.begin_validation().unwrap().accepted();
-            if cold {
-                let work = prepare(&mut replica);
-                finish(&mut controller, &mut replica, work);
-            }
-            let mut partial = copy(&attempted);
-            partial.first_sequence = ProducerSequence::new(16);
-            partial.records = attempted.records[16..48].to_vec();
-            let buffer = proposal(&replica, [partial]);
-            let ProposalValidation::Resolved {
-                through: actual,
-                buffer,
-                ..
-            } = validate(&mut controller, &mut replica, buffer, 999)
-            else {
-                panic!("duplicate subrange retry");
-            };
-            assert_eq!(actual, through);
-            assert_eq!(coordinates(&buffer.0), [(16, 0, 777, 32)]);
-            let mut extended = copy(&attempted);
-            extended.first_sequence = ProducerSequence::new(16);
-            extended.records = attempted.records[16..].to_vec();
-            extended.records.extend(request(30, 64, 2).records);
-            let buffer = proposal(&replica, [extended]);
-            let validated = ready(validate(&mut controller, &mut replica, buffer, 999));
-            assert_eq!(coordinates(&validated.buffer), [(64, 1, 999, 2)]);
-            let results = &validated.buffer.retry_results.as_ref().unwrap().ranges;
-            assert_eq!(results.len(), 49);
-            assert_eq!(results[0].first_sequence, ProducerSequence::new(16));
-            assert!(results[..48].iter().all(|span| {
-                span.first_offset == Offset::ZERO
-                    && span.records == 1
-                    && span.source
-                        == ProducerResultSource::Duplicate {
-                            operation: through.op.0,
-                        }
-            }));
-            assert_eq!(
-                results[48],
-                ozzy_core::state::ProducerResultSpan {
-                    first_sequence: ProducerSequence::new(64),
-                    first_offset: Offset::new(1),
-                    records: 2,
-                    source: ProducerResultSource::Stored,
-                }
-            );
-            let suffix = accept(&mut replica, validated);
-            let work = prepare(&mut replica);
-            finish(&mut controller, &mut replica, work);
-            for receipt in [initial, second, original, duplicate, suffix] {
-                settle(&mut replica, receipt);
-            }
-            drive(&mut controller, replica.journal.shutdown()).unwrap();
-        }
-    }
-}
-
-#[test]
 fn failed_cold_duplicate_proof_read_fences_owner_without_advancing_accepted_prefix() {
     let (mut controller, io) = setup();
-    let mut replica = replica(&mut controller, io, 0, QuorumPolicy::Durable, 8192);
+    let mut replica = replica(&mut controller, io, 0, 8192);
     let initial = initialize_writer(&mut controller, &mut replica);
     let second = open_second(&mut controller, &mut replica);
     let buffer = proposal(&replica, [request(12, 0, 1)]);

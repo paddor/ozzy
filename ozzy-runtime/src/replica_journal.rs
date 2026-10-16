@@ -134,23 +134,13 @@ impl JournalStartup {
                 timing,
             ),
             Some(recovered) => ReplicaDriver::from_view_change(
-                if self.configuration.policy() == ozzy_replication::QuorumPolicy::Replicated {
-                    ViewChange::recover_drained(
-                        self.configuration,
-                        self.local,
-                        self.generation,
-                        recovered,
-                        limits,
-                    )?
-                } else {
-                    ViewChange::recover_intact(
-                        self.configuration,
-                        self.local,
-                        self.generation,
-                        recovered,
-                        limits,
-                    )?
-                },
+                ViewChange::recover_intact(
+                    self.configuration,
+                    self.local,
+                    self.generation,
+                    recovered,
+                    limits,
+                )?,
                 now,
                 timing,
             ),
@@ -182,7 +172,6 @@ impl<T> Future for JournalCompletion<T> {
 pub struct ReplicaJournal {
     backlog: PipelineLimits,
     unapplied: usize,
-    replicated: bool,
     dedup_window_millis: Option<u64>,
     capacity: Arc<Semaphore>,
     command_capacity: usize,
@@ -227,10 +216,6 @@ impl ReplicaJournal {
         self.unapplied
     }
 
-    /// Replicated-persisting policy: confirmation precedes persistence.
-    pub(crate) const fn replicated(&self) -> bool {
-        self.replicated
-    }
     pub(crate) const fn operation_limits(&self) -> OperationLimits {
         self.operations
     }

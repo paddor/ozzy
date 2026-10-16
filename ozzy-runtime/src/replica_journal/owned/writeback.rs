@@ -342,7 +342,7 @@ impl OwnedJournal {
     }
 
     /// Synchronize only the installed prefix and publish its restart evidence.
-    /// Later reservations or logical RAM acceptance are never included implicitly.
+    /// Later reservations are never included implicitly.
     pub async fn sync(&mut self, ticket: SyncTicket) -> Result<SyncTicket, JournalError> {
         self.healthy()?;
         let journal = self.journal.readable()?;
@@ -369,22 +369,21 @@ impl OwnedJournal {
         Ok(ticket)
     }
 
-    /// Apply only the exact driver-confirmed prefix. RAM confirmation may
-    /// precede its buffered write, but never bypasses canonical admission.
+    /// Apply only the exact driver-confirmed, synchronized prefix through
+    /// canonical admission.
     pub fn apply(&mut self, ticket: ValidationTicket) -> Result<ValidationTicket, JournalError> {
         self.healthy()?;
         self.validate_image(ticket)?;
         let through = ticket.committed();
-        if !self.configuration.memory_voting()
-            && through.op.0
-                > self
-                    .journal
-                    .readable()?
-                    .writer()
-                    .durable_position()
-                    .next_chain()
-                    .next_op_number()
-                    - 1
+        if through.op.0
+            > self
+                .journal
+                .readable()?
+                .writer()
+                .durable_position()
+                .next_chain()
+                .next_op_number()
+                - 1
         {
             return Err(JournalError::CompletionMismatch);
         }

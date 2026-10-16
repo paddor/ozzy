@@ -24,13 +24,9 @@ mod tests {
     )]
     async fn history_seek_resolves_id_policy_and_timestamp_over_inproc_without_disk_io() {
         use ozzy_runtime::replicated::{IdPolicy, ReaderStart, TopicReaderError};
-        for policy in [
-            Confirmation::LocalDurable,
-            Confirmation::DiskQuorum,
-            Confirmation::ReplicatedPersisting,
-        ] {
+        for mode in [DeploymentMode::Single, DeploymentMode::Three] {
             let runtime = WriterRuntime::new().unwrap();
-            let deployment = fixture(policy);
+            let deployment = fixture(mode);
             let producer = role_links_with_config(
                 &runtime,
                 &deployment[0].0,
@@ -162,13 +158,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn identity_resume_and_takeover_use_real_inproc_brokers_without_disk_io() {
-        for policy in [
-            Confirmation::LocalDurable,
-            Confirmation::DiskQuorum,
-            Confirmation::ReplicatedPersisting,
-        ] {
+        for mode in [DeploymentMode::Single, DeploymentMode::Three] {
             let runtime = WriterRuntime::new().unwrap();
-            let deployment = fixture(policy);
+            let deployment = fixture(mode);
             let producer = role_links(&runtime, &deployment[0].0, handshake::PRODUCER).await;
             let (brokers, _) = Box::pin(start_controlled(&runtime, deployment, true)).await;
             let config = SharedTopicWriterConfig::new(limits());
@@ -240,14 +232,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn producer_owner_crash_resumes_confirmed_prefix_without_a_local_outbox() {
-        for policy in [
-            Confirmation::LocalDurable,
-            Confirmation::DiskQuorum,
-            Confirmation::ReplicatedPersisting,
-        ] {
+        for mode in [DeploymentMode::Single, DeploymentMode::Three] {
             let transport = WriterRuntime::new().unwrap();
             let original = WriterRuntime::with_context(transport.context().clone()).unwrap();
-            let deployment = fixture(policy);
+            let deployment = fixture(mode);
             let first_links = role_links(&original, &deployment[0].0, handshake::PRODUCER).await;
             let replacement = WriterRuntime::with_context(transport.context().clone()).unwrap();
             let links = role_links(&replacement, &deployment[0].0, handshake::PRODUCER).await;
@@ -327,13 +315,9 @@ mod tests {
         reason = "one held-I/O scenario checks all confirmation policies"
     )]
     async fn held_record_io_keeps_control_live_and_respects_confirmation_policy() {
-        for policy in [
-            Confirmation::LocalDurable,
-            Confirmation::DiskQuorum,
-            Confirmation::ReplicatedPersisting,
-        ] {
+        for mode in [DeploymentMode::Single, DeploymentMode::Three] {
             let runtime = WriterRuntime::new().unwrap();
-            let deployment = fixture(policy);
+            let deployment = fixture(mode);
             let producer = role_links(&runtime, &deployment[0].0, handshake::PRODUCER).await;
             let consumer = role_links(&runtime, &deployment[0].0, handshake::CONSUMER).await;
             let (brokers, controls) = Box::pin(start_controlled(&runtime, deployment, true)).await;
@@ -383,17 +367,7 @@ mod tests {
                 }
             })
             .await;
-            if policy == Confirmation::ReplicatedPersisting {
-                live_many(
-                    &brokers,
-                    "two RAM copies confirm RP while disk is held",
-                    pending.confirmed(),
-                )
-                .await
-                .unwrap();
-            } else {
-                assert!(pending.confirmed().now_or_never().is_none());
-            }
+            assert!(pending.confirmed().now_or_never().is_none());
             let mut reader = live_many(
                 &brokers,
                 "metadata over separate control socket while disk is held",
@@ -401,9 +375,7 @@ mod tests {
             )
             .await
             .unwrap();
-            if policy != Confirmation::ReplicatedPersisting {
-                assert!(pending.confirmed().now_or_never().is_none());
-            }
+            assert!(pending.confirmed().now_or_never().is_none());
             for device in &controls {
                 device.hold_record_writes(false);
             }
@@ -438,7 +410,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn failed_physical_record_write_stops_the_real_broker_without_confirmation() {
         let runtime = WriterRuntime::new().unwrap();
-        let deployment = fixture(Confirmation::LocalDurable);
+        let deployment = fixture(DeploymentMode::Single);
         let producer = role_links(&runtime, &deployment[0].0, handshake::PRODUCER).await;
         let (brokers, controls) = Box::pin(start_controlled(&runtime, deployment, false)).await;
         let mut writer = live_many(
@@ -484,48 +456,32 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn single_durable_configured_retention_advances_sdk_earliest_and_keeps_producer_identity()
     {
-        configured_retention(Confirmation::LocalDurable).await;
+        configured_retention(DeploymentMode::Single).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn disk_quorum_configured_retention_advances_sdk_earliest_and_keeps_producer_identity() {
-        configured_retention(Confirmation::DiskQuorum).await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn replicated_persisting_configured_retention_advances_sdk_earliest_and_keeps_producer_identity()
-     {
-        configured_retention(Confirmation::ReplicatedPersisting).await;
+        configured_retention(DeploymentMode::Three).await;
     }
 
     #[expect(
         clippy::too_many_lines,
         reason = "one SDK retention and resume schedule"
     )]
-    async fn configured_retention(policy: Confirmation) {
+    async fn configured_retention(mode: DeploymentMode) {
         use ozzy_config::TopicRetention;
         use ozzy_runtime::replicated::ReaderStart;
         let runtime = WriterRuntime::new().unwrap();
         let root = std::path::PathBuf::from(format!("/ozzy-retention-{}", Uuid::now_v7()));
-        let deployment = deployment_with(
-            &root,
-            if policy == Confirmation::LocalDurable {
-                DeploymentMode::Single
-            } else {
-                DeploymentMode::Three
-            },
-            policy,
-            1,
-            |config| {
-                let topic = config.topics.get_mut("orders").unwrap();
-                topic.segment_bytes = 1024 * 1024;
-                topic.max_append_bytes = 64 * 1024;
-                topic.retention = TopicRetention {
-                    max_age_secs: None,
-                    max_bytes: Some(1024 * 1024),
-                };
-            },
-        );
+        let deployment = deployment_with(&root, mode, 1, |config| {
+            let topic = config.topics.get_mut("orders").unwrap();
+            topic.segment_bytes = 1024 * 1024;
+            topic.max_append_bytes = 64 * 1024;
+            topic.retention = TopicRetention {
+                max_age_secs: None,
+                max_bytes: Some(1024 * 1024),
+            };
+        });
         let producer = role_links(&runtime, &deployment[0].0, handshake::PRODUCER).await;
         let consumer = role_links(&runtime, &deployment[0].0, handshake::CONSUMER).await;
         let (brokers, _) = Box::pin(start_controlled(&runtime, deployment, true)).await;
@@ -623,13 +579,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn broker_ready_follows_partition_bootstrap_in_all_modes() {
-        for policy in [
-            Confirmation::LocalDurable,
-            Confirmation::DiskQuorum,
-            Confirmation::ReplicatedPersisting,
-        ] {
+        for mode in [DeploymentMode::Single, DeploymentMode::Three] {
             let runtime = WriterRuntime::new().unwrap();
-            let deployment = fixture(policy);
+            let deployment = fixture(mode);
             let producer = role_links(&runtime, &deployment[0].0, handshake::PRODUCER).await;
             let (brokers, _) = Box::pin(start_controlled(&runtime, deployment, true)).await;
             live_many(
@@ -664,7 +616,7 @@ mod tests {
             let receipt = live_many(&brokers, "confirm after readiness", pending.confirmed())
                 .await
                 .unwrap();
-            assert_eq!(receipt.record.offset, 0, "{policy:?}");
+            assert_eq!(receipt.record.offset, 0, "{mode:?}");
             live_many(&brokers, "close ready writer", writer.close())
                 .await
                 .unwrap();
@@ -675,17 +627,8 @@ mod tests {
         }
     }
 
-    fn fixture(policy: Confirmation) -> Vec<(CheckedConfig, BrokerIdentity)> {
+    fn fixture(mode: DeploymentMode) -> Vec<(CheckedConfig, BrokerIdentity)> {
         let root = std::path::PathBuf::from(format!("/ozzy-simulation-{}", Uuid::now_v7()));
-        deployment(
-            &root,
-            if policy == Confirmation::LocalDurable {
-                DeploymentMode::Single
-            } else {
-                DeploymentMode::Three
-            },
-            policy,
-            1,
-        )
+        deployment(&root, mode, 1)
     }
 }

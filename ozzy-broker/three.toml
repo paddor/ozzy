@@ -3,7 +3,6 @@ mode = "three"
 
 [topics.orders]
 partitions = 6
-confirmation = "disk-quorum"
 
 [brokers.broker-0.endpoints]
 peer = "tcp://127.0.0.1:7200"

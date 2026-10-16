@@ -1,7 +1,7 @@
 //! The console against a real broker on inproc and memory storage.
 #![allow(clippy::unwrap_used, clippy::panic, reason = "test code")]
 
-use ozzy_config::{Confirmation, HostResources};
+use ozzy_config::{DeploymentMode, HostResources};
 use ozzy_proto::ConsumerMemberId;
 use ozzy_runtime::replicated::{GroupReader, GroupReaderConfig, WriterRuntime};
 use ozzy_sim::broker::{Shape, deployment_with_resources, start_brokers};
@@ -96,7 +96,10 @@ async fn console_shows_a_serving_broker() {
         let root = PathBuf::from(format!("/ozzy-simulation-{}", Uuid::now_v7()));
         let endpoint = format!("inproc://ozzy-ui-{}", Uuid::now_v7());
         let runtime = WriterRuntime::new().unwrap();
-        let shape = Shape::for_policy(Confirmation::LocalDurable, 3);
+        let shape = Shape {
+            mode: DeploymentMode::Single,
+            partitions: 3,
+        };
         let deployment = deployment_with_resources(&root, shape, &host(), |config| {
             for broker in config.brokers.values_mut() {
                 broker.endpoints.admin = Some(endpoint.clone());

@@ -39,20 +39,15 @@ flowchart LR
 
 ## Confirmation boundaries
 
-The topic's `confirmation` value fixes when a writer gets its receipt.
+`cluster.mode` fixes when a writer gets its receipt.
 
-| `confirmation` | Evidence before apply and reply |
+| `cluster.mode` | Evidence before apply and reply |
 | --- | --- |
-| `local-durable` | Local durable prefix on the sole broker |
-| `disk-quorum` | Matching durable history on the leader and one follower |
-| `replicated-persisting` | Matching validated retained bytes on the leader and one follower |
+| `single` | Local durable prefix on the sole broker |
+| `three` | Matching durable history on the leader and one follower |
 
 - A partition applies records only after the mode's evidence exists. A
   storage wait on one partition leaves the others on the shard runnable.
-- Replicated-persisting keeps record backing until it is applied and
-  written. A full backlog makes APPEND admission wait.
-- Replicated-persisting confirmation in RAM is not durable evidence. An
-  unclean restart stays nonvoting until [recovery](REPLICATION.md).
 - Group progress updates wait for the same boundary. Updates that arrive
   while a partition's progress proposal is in flight share the next one.
 

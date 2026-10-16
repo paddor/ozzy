@@ -7,8 +7,8 @@ execution live outside this crate. Applications use the
 
 ## Owns
 
-- Fixed three-broker groups for disk quorum and replicated-persisting:
-  ordered operations, digest chains, votes, commit, and application.
+- Fixed three-broker disk-quorum groups: ordered operations, digest chains,
+  votes, commit, and application.
 - Elections: contact deadlines, durable promises, and view installation.
 - Bounded retention, volatile receipts, probes, and gap repair.
 - Recovery of a broker that lost its store, from two other brokers.
@@ -25,7 +25,7 @@ execution live outside this crate. Applications use the
 | `recovery::Recovery` | Lost-store recovery admission |
 | `local::Driver` | Single durable authority |
 | `wire` | Replica message codecs |
-| `Configuration`, `QuorumPolicy` | Group membership and confirmation policy |
+| `Configuration`, `ConfigurationRecord` | Group membership and its canonical record |
 
 The broker adapter in `ozzy-runtime` (`replica_actor`) owns the sockets and
 partition journals.

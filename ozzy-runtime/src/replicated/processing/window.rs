@@ -4,7 +4,7 @@ use super::{
     PendingProgress, ProcessingIdentity, ProcessingToken, ProgressError,
     progress::{Observer, Publisher, RESERVATION_BYTES, Submission},
 };
-use ozzy_proto::{Offset, append::Policy};
+use ozzy_proto::Offset;
 use std::{collections::VecDeque, sync::Arc};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -42,10 +42,6 @@ impl Window {
             || identity.partition.as_bytes() == &[0; 16]
             || identity.member.as_bytes() == &[0; 16]
             || identity.assignment_epoch == 0
-            || !matches!(
-                identity.policy,
-                Policy::LocalDurable | Policy::QuorumDurable | Policy::QuorumReplicatedPersisting
-            )
             || records == 0
             || records > u32::MAX as usize
         {

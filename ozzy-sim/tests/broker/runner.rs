@@ -20,11 +20,7 @@ async fn replay(retention: bool) {
     tokio::time::timeout(
         Duration::from_secs(if retention { 900 } else { 120 }),
         async {
-            for policy in [
-                Confirmation::LocalDurable,
-                Confirmation::DiskQuorum,
-                Confirmation::ReplicatedPersisting,
-            ] {
+            for mode in [DeploymentMode::Single, DeploymentMode::Three] {
                 let root = tempfile::tempdir().unwrap();
                 let prefix = root.path().join("prefix.jsonl");
                 let schedule = actions
@@ -43,7 +39,7 @@ async fn replay(retention: bool) {
                     .join("\n");
                 std::fs::write(&prefix, format!("{schedule}\n")).unwrap();
                 let result = soak::run(&Config {
-                    policy,
+                    mode,
                     seed: 1,
                     duration: Duration::from_secs(if retention { 300 } else { 90 }),
                     waves: actions.len(),
@@ -78,7 +74,7 @@ async fn replay(retention: bool) {
                 assert_eq!(report.completion_holds, 1);
                 assert_eq!(
                     report.restarts,
-                    3 + 2 * usize::from(policy != Confirmation::LocalDurable)
+                    3 + 2 * usize::from(mode != DeploymentMode::Single)
                 );
                 assert_eq!(report.slow_consumers, 1);
                 assert_eq!(report.retention_gaps, usize::from(retention));
@@ -86,19 +82,15 @@ async fn replay(retention: bool) {
                 assert_eq!(report.power_losses, 1);
                 assert_eq!(
                     report.quorum_losses,
-                    usize::from(policy != Confirmation::LocalDurable)
+                    usize::from(mode != DeploymentMode::Single)
                 );
                 assert_eq!(
                     report.canceled_observations,
-                    if policy == Confirmation::LocalDurable {
-                        0
-                    } else {
-                        8
-                    }
+                    if mode == DeploymentMode::Single { 0 } else { 8 }
                 );
                 assert_eq!(
                     report.torn_writes,
-                    usize::from(policy != Confirmation::LocalDurable)
+                    usize::from(mode != DeploymentMode::Single)
                 );
                 assert!(report.records > 0 && report.physical_events > 0 && report.time_millis > 0);
             }

@@ -4,23 +4,10 @@ use ozzy_runtime::replicated::{BrokerLinkError, ProgressError};
 
 #[tokio::test(flavor = "current_thread")]
 async fn production_progress_negotiates_and_fences_unassigned_consumers_in_all_modes() {
-    for policy in [
-        Confirmation::LocalDurable,
-        Confirmation::DiskQuorum,
-        Confirmation::ReplicatedPersisting,
-    ] {
+    for mode in [DeploymentMode::Single, DeploymentMode::Three] {
         let runtime = WriterRuntime::new().unwrap();
         let root = std::path::PathBuf::from(format!("/ozzy-progress-{}", Uuid::now_v7()));
-        let deployment = deployment(
-            &root,
-            if policy == Confirmation::LocalDurable {
-                DeploymentMode::Single
-            } else {
-                DeploymentMode::Three
-            },
-            policy,
-            1,
-        );
+        let deployment = deployment(&root, mode, 1);
         let consumer = role_links_with_config(
             &runtime,
             &deployment[0].0,
@@ -96,7 +83,7 @@ async fn production_progress_negotiates_and_fences_unassigned_consumers_in_all_m
                 result,
                 Err(BrokerLinkError::Progress(ProgressError::Fenced))
             ),
-            "{policy:?}: {result:?}"
+            "{mode:?}: {result:?}"
         );
         assert_eq!(consumer.socket_count(), 2);
         consumer.shutdown().await.unwrap();

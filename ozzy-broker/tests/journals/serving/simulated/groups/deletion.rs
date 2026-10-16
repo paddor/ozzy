@@ -3,12 +3,8 @@ use ozzy_runtime::replicated::{GroupReader, GroupReaderConfig, GroupReaderError}
 
 #[tokio::test(flavor = "current_thread")]
 async fn deleted_groups_fence_members_and_free_the_name_for_a_new_incarnation() {
-    for policy in [
-        Confirmation::LocalDurable,
-        Confirmation::DiskQuorum,
-        Confirmation::ReplicatedPersisting,
-    ] {
-        deleted(policy).await;
+    for mode in [DeploymentMode::Single, DeploymentMode::Three] {
+        deleted(mode).await;
     }
 }
 
@@ -16,8 +12,8 @@ async fn deleted_groups_fence_members_and_free_the_name_for_a_new_incarnation() 
     clippy::too_many_lines,
     reason = "keep deletion, fencing, and recreation evidence in one schedule"
 )]
-async fn deleted(policy: Confirmation) {
-    let cluster = Cluster::new(policy).await;
+async fn deleted(mode: DeploymentMode) {
+    let cluster = Cluster::new(mode).await;
     let links = role_links_with_config(
         &cluster.runtime,
         &cluster.configs[0].0,

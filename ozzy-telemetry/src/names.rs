@@ -380,7 +380,7 @@ events! {
         /// Operation batch selected from resident active or predecessor journal
         /// data for a reply.
         ResidentSelection => "resident_selection",
-        /// Reply batch selected from the accepted background-persistence backlog.
+        /// Reply batch selected from accepted records still in the writeback queue.
         BackgroundResidentRead => "background_resident_read",
         /// Native group reply encoded directly from shared RAM selections.
         DirectResidentRead => "direct_resident_read",

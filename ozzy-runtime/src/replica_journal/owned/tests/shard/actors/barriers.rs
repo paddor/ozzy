@@ -15,7 +15,7 @@ fn durable_commit_waits_for_the_leaders_own_barrier_after_follower_acks() {
             .iter_mut()
             .map(|(controller, io)| (controller, &*io))
             .collect();
-        cluster_on(&mut borrowed, QuorumPolicy::Durable, limits)
+        cluster_on(&mut borrowed, limits)
     };
     let settle = |devices: &mut [(Controller, Local)], stalled: bool| {
         for (index, (controller, _)) in devices.iter_mut().enumerate() {

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::validate::{optional_id, require};
-use crate::{ConfigError, Confirmation, DeploymentMode, ValidatedDeployment};
+use crate::{ConfigError, DeploymentMode, ValidatedDeployment};
 
 /// Shared provisioning output. Persist exactly once and distribute unchanged to
 /// all brokers. Decoding alone does not validate it against a deployment.
@@ -34,8 +34,6 @@ pub struct TopicIdentity {
     pub partitioner: String,
     /// Persistent seed used by SDK keyed routing.
     pub partitioner_seed: u64,
-    /// Persistent topic confirmation policy.
-    pub confirmation: Confirmation,
     /// Fixed first-wins window; resource limits do not change event identity.
     pub dedup_window_millis: Option<std::num::NonZeroU64>,
     /// Numeric partition order, never sorted by random group IDs.
@@ -109,7 +107,6 @@ impl ValidatedDeployment {
                     id,
                     partitioner: "xxh3-64".to_owned(),
                     partitioner_seed: topic.partitioner_seed,
-                    confirmation: topic.confirmation,
                     dedup_window_millis: topic
                         .deduplication
                         .and_then(|policy| std::num::NonZeroU64::new(policy.window_millis)),
@@ -200,12 +197,11 @@ impl ValidatedDeployment {
                 topic.id.is_none_or(|id| id == stored.id)
                     && stored.partitioner == "xxh3-64"
                     && stored.partitioner_seed == topic.partitioner_seed
-                    && stored.confirmation == topic.confirmation
                     && stored.dedup_window_millis.map(std::num::NonZeroU64::get)
                         == topic.deduplication.map(|policy| policy.window_millis)
                     && stored.partitions.len() == topic.partitions as usize,
                 "identity.topics",
-                "topic identity, hash parameters, partition count or policy changed",
+                "topic identity, hash parameters, partition count or window changed",
             )?;
             for (index, partition) in stored.partitions.iter().enumerate() {
                 let mut ordered = members.clone();

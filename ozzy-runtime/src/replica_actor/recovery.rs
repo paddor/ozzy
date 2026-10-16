@@ -422,9 +422,7 @@ impl<J: RecoveryStorage> RecoveryActor<J> {
             // Volatile suspicion cannot supersede a recovery attempt.
             Control::ExitView(_) => false,
             Control::Commit(_) | Control::StartView(_) => from == primary,
-            Control::PrepareOk { .. }
-            | Control::PrepareRetained { .. }
-            | Control::DoViewChange(_) => self.local == primary,
+            Control::PrepareOk { .. } | Control::DoViewChange(_) => self.local == primary,
             Control::StartViewChange(_) => true,
         }
     }

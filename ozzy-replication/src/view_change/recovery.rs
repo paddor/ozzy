@@ -42,39 +42,6 @@ impl ViewChange {
         recovered: RecoveredState,
         limits: PipelineLimits,
     ) -> Result<Self, ViewChangeError> {
-        if configuration.policy() == crate::QuorumPolicy::Replicated {
-            return Err(ViewChangeError::VolatileRestart);
-        }
-        Self::recover_verified(configuration, local, generation, recovered, limits)
-    }
-
-    /// Restart a memory-voting broker from independently proven drained history.
-    ///
-    /// The adapter must verify a durable shutdown marker bound to the exact
-    /// configuration, store, selected manifest, and accepted prefix, or a fresh
-    /// completed group recovery. Before returning any driver it must replace
-    /// that marker durably with running state. Intact bytes alone are insufficient:
-    /// they cannot prove that an unpersisted RAM vote never existed.
-    pub fn recover_drained(
-        configuration: Configuration,
-        local: NodeId,
-        generation: JournalGeneration,
-        recovered: RecoveredState,
-        limits: PipelineLimits,
-    ) -> Result<Self, ViewChangeError> {
-        if configuration.policy() != crate::QuorumPolicy::Replicated {
-            return Err(ReplicationError::PolicyMismatch.into());
-        }
-        Self::recover_verified(configuration, local, generation, recovered, limits)
-    }
-
-    fn recover_verified(
-        configuration: Configuration,
-        local: NodeId,
-        generation: JournalGeneration,
-        recovered: RecoveredState,
-        limits: PipelineLimits,
-    ) -> Result<Self, ViewChangeError> {
         if recovered.scope
             != (Scope {
                 view: recovered.scope.view,

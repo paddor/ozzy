@@ -1,39 +1,20 @@
 //! Shared deployment placement for short integration and sustained simulation.
 use ozzy_broker::CheckedConfig;
 use ozzy_config::{
-    Affinity, Broker, BrokerIdentity, Confirmation, Deployment, DeploymentMode, IoBackend,
-    QueueBudget, Shard,
+    Affinity, Broker, BrokerIdentity, Deployment, DeploymentMode, IoBackend, QueueBudget, Shard,
 };
 use std::path::Path;
 use uuid::Uuid;
 
 const SINGLE: &str = include_str!("../../../ozzy-config/tests/fixtures/single.toml");
 
-/// The cluster mode and the one topic's confirmation and partition count.
+/// The cluster mode and the one topic's partition count.
 #[derive(Clone, Copy, Debug)]
 pub struct Shape {
     /// Single broker or a three-broker group.
     pub mode: DeploymentMode,
-    /// Topic confirmation boundary.
-    pub policy: Confirmation,
     /// Topic partition count.
     pub partitions: u32,
-}
-
-impl Shape {
-    /// The smallest cluster that serves `policy`: one broker for local
-    /// durability, three for the replicated policies.
-    pub fn for_policy(policy: Confirmation, partitions: u32) -> Self {
-        let mode = match policy {
-            Confirmation::LocalDurable => DeploymentMode::Single,
-            Confirmation::DiskQuorum | Confirmation::ReplicatedPersisting => DeploymentMode::Three,
-        };
-        Self {
-            mode,
-            policy,
-            partitions,
-        }
-    }
 }
 
 /// Build trusted inproc endpoints and bounded shards without opening journal files.
@@ -43,16 +24,11 @@ pub fn deployment_with_resources(
     resources: &ozzy_config::HostResources,
     configure: impl FnOnce(&mut Deployment),
 ) -> Vec<(CheckedConfig, BrokerIdentity)> {
-    let Shape {
-        mode,
-        policy,
-        partitions,
-    } = shape;
+    let Shape { mode, partitions } = shape;
     let mut config = Deployment::parse(SINGLE).unwrap();
     config.cluster.mode = mode;
     let topic = config.topics.get_mut("orders").unwrap();
     topic.partitions = partitions;
-    topic.confirmation = policy;
     topic.segment_bytes = 1024 * 1024;
     topic.max_append_bytes = 64 * 1024;
     let template = config.brokers.remove("laptop").unwrap();

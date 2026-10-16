@@ -1,6 +1,6 @@
 use super::JournalError;
 use ozzy_proto::{NodeId, append::Policy};
-use ozzy_replication::{Configuration, QuorumPolicy, Scope, local};
+use ozzy_replication::{Configuration, Scope, local};
 
 /// Storage's immutable confirmation and identity binding. Local durability
 /// never supplies group membership, a vote, or election authority.
@@ -27,13 +27,9 @@ impl Mode {
 
     pub(super) fn append_policy(self) -> Policy {
         match self {
-            Self::Replicated(group) => group.append_policy(),
+            Self::Replicated(_) => Policy::QuorumDurable,
             Self::Local(_) => Policy::LocalDurable,
         }
-    }
-
-    pub(super) fn memory_voting(self) -> bool {
-        matches!(self, Self::Replicated(group) if group.policy() == QuorumPolicy::Replicated)
     }
 
     pub(super) fn replicated(self) -> Result<Configuration, JournalError> {

@@ -11,17 +11,16 @@ type Recovering = ControlledRecovery<ShardRecoveringJournal>;
 mod busy;
 mod scheduled;
 
-fn recovery(controller: &mut Controller, io: Local, policy: QuorumPolicy) -> Recovering {
-    ControlledRecovery::new(recovery_actor(controller, io, policy, actor_config().sessions).0)
+fn recovery(controller: &mut Controller, io: Local) -> Recovering {
+    ControlledRecovery::new(recovery_actor(controller, io, actor_config().sessions).0)
 }
 
 fn recovery_actor(
     controller: &mut Controller,
     io: Local,
-    policy: QuorumPolicy,
     sessions: [LinkSessionId; 3],
 ) -> (RecoveryActor<ShardRecoveringJournal>, crate::memory::Owner) {
-    let mut config = config("/replacement", 4, policy);
+    let mut config = config("/replacement", 4);
     config.identity.replica_node_id = NodeId::from_bytes([3; 16]);
     config.append_buffers = 12;
     let (mut owner, startup) = drive(
@@ -114,14 +113,12 @@ fn round_recovery(actors: &mut [Actor], recovering: &mut Recovering, now: Durati
 
 #[test]
 fn shard_owned_recovery_actor_publishes_and_rejoins_without_journal_workers() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        rebuild(policy);
-    }
+    rebuild();
 }
 
-fn rebuild(policy: QuorumPolicy) {
+fn rebuild() {
     let (mut controller, io) = setup();
-    let (mut actors, pending) = cluster(&mut controller, &io, 0, policy);
+    let (mut actors, pending) = cluster(&mut controller, &io, 0);
     let mut pending = Box::pin(pending);
     let mut confirmed = false;
     for _ in 0..10000 {
@@ -139,7 +136,7 @@ fn rebuild(policy: QuorumPolicy) {
         }
     }
     assert!(confirmed);
-    let mut recovering = recovery(&mut controller, io, policy);
+    let mut recovering = recovery(&mut controller, io);
     let mut finished = false;
     for _ in 0..10000 {
         round_recovery(&mut actors, &mut recovering, Duration::ZERO);

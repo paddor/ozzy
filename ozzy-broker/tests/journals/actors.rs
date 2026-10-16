@@ -362,38 +362,34 @@ async fn stop(running: Vec<(ApplicationShards, DevicePools)>) {
 
 #[tokio::test]
 async fn configured_native_actors_share_symmetric_shards_and_recover_with_required_elections() {
-    for (mode, policy) in [
-        (DeploymentMode::Single, Confirmation::LocalDurable),
-        (DeploymentMode::Three, Confirmation::DiskQuorum),
-        (DeploymentMode::Three, Confirmation::ReplicatedPersisting),
-    ] {
+    for mode in [DeploymentMode::Single, DeploymentMode::Three] {
         let temporary = tempfile::tempdir().unwrap();
-        let brokers = fixture(temporary.path(), mode, policy, 6);
+        let brokers = fixture(temporary.path(), mode, 6);
         for (checked, local, _) in &brokers {
             storage(checked, local);
         }
         for format in [true, false] {
             tokio::time::timeout(Duration::from_secs(20), start(&brokers, format))
                 .await
-                .unwrap_or_else(|_| panic!("native actor shard integration stalled: {mode:?}, {policy:?}, format={format}"));
+                .unwrap_or_else(|_| {
+                    panic!("native actor shard integration stalled: {mode:?}, format={format}")
+                });
         }
     }
 }
 
 #[tokio::test]
 async fn configured_startup_and_restart_confirm_with_one_broker_unavailable() {
-    for policy in [Confirmation::DiskQuorum, Confirmation::ReplicatedPersisting] {
-        let temporary = tempfile::tempdir().unwrap();
-        let brokers = fixture(temporary.path(), DeploymentMode::Three, policy, 2);
-        // Persistent membership still has three brokers. Both initial partition
-        // leaders are on this available pair; restart must elect again normally.
-        for (checked, local, _) in &brokers[..2] {
-            storage(checked, local);
-        }
-        for format in [true, false] {
-            tokio::time::timeout(Duration::from_secs(20), start(&brokers[..2], format))
-                .await
-                .expect("available quorum failed to start without the third link");
-        }
+    let temporary = tempfile::tempdir().unwrap();
+    let brokers = fixture(temporary.path(), DeploymentMode::Three, 2);
+    // Persistent membership still has three brokers. Both initial partition
+    // leaders are on this available pair; restart must elect again normally.
+    for (checked, local, _) in &brokers[..2] {
+        storage(checked, local);
+    }
+    for format in [true, false] {
+        tokio::time::timeout(Duration::from_secs(20), start(&brokers[..2], format))
+            .await
+            .expect("available quorum failed to start without the third link");
     }
 }

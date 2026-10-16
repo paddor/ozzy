@@ -12,97 +12,90 @@ fn config(member: u8) -> GroupReaderConfig {
 
 #[tokio::test(flavor = "current_thread")]
 async fn processing_continues_after_the_writer_stops_with_bounded_control_memory() {
-    for policy in [Confirmation::DiskQuorum, Confirmation::ReplicatedPersisting] {
-        let cluster = Cluster::new(policy).await;
-        let links = role_links_with_config(
-            &cluster.runtime,
-            &cluster.configs[0].0,
-            handshake::PRODUCER | handshake::CONSUMER,
-            limits(),
-            |config| {
-                config.parameters.capabilities |=
-                    handshake::OWNER_GROUPS | handshake::OWNER_PROGRESS;
-                config.parameters.required_capabilities |=
-                    handshake::OWNER_GROUPS | handshake::OWNER_PROGRESS;
-            },
-        )
-        .await;
-        let mut writer = live_many(
-            &cluster.brokers,
-            "seed idle progress sources",
-            SharedTopicWriter::open(
-                &links,
-                "orders",
-                SharedTopicWriterConfig::new(limits()),
-                RetryPolicy::default(),
-            ),
-        )
-        .await
+    let cluster = Cluster::new(DeploymentMode::Three).await;
+    let links = role_links_with_config(
+        &cluster.runtime,
+        &cluster.configs[0].0,
+        handshake::PRODUCER | handshake::CONSUMER,
+        limits(),
+        |config| {
+            config.parameters.capabilities |= handshake::OWNER_GROUPS | handshake::OWNER_PROGRESS;
+            config.parameters.required_capabilities |=
+                handshake::OWNER_GROUPS | handshake::OWNER_PROGRESS;
+        },
+    )
+    .await;
+    let mut writer = live_many(
+        &cluster.brokers,
+        "seed idle progress sources",
+        SharedTopicWriter::open(
+            &links,
+            "orders",
+            SharedTopicWriterConfig::new(limits()),
+            RetryPolicy::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    let key = (0_u32..1000)
+        .map(u32::to_be_bytes)
+        .find(|key| writer.metadata().keyed_partition(key).number == 0)
         .unwrap();
-        let key = (0_u32..1000)
-            .map(u32::to_be_bytes)
-            .find(|key| writer.metadata().keyed_partition(key).number == 0)
-            .unwrap();
-        for sequence in 1_u128..=128 {
-            let pending = writer
-                .send(
-                    RecordInput::copy_from_slice(
-                        MessageId::from_bytes(sequence.to_be_bytes()),
-                        b"idle processing",
-                    ),
-                    Some(&key),
-                )
-                .await
-                .unwrap();
-            live_many(
-                &cluster.brokers,
-                "confirm idle progress fixture",
-                pending.confirmed(),
+    for sequence in 1_u128..=128 {
+        let pending = writer
+            .send(
+                RecordInput::copy_from_slice(
+                    MessageId::from_bytes(sequence.to_be_bytes()),
+                    b"idle processing",
+                ),
+                Some(&key),
             )
             .await
             .unwrap();
-        }
         live_many(
             &cluster.brokers,
-            "stop idle progress writer",
-            writer.close(),
+            "confirm idle progress fixture",
+            pending.confirmed(),
         )
         .await
         .unwrap();
-        let mut reader = GroupReader::open(links.clone(), "orders", "idle-workers", config(3))
-            .await
-            .unwrap();
-        for offset in 0..128 {
-            let record = live_many(&cluster.brokers, "read idle progress source", reader.next())
-                .await
-                .unwrap();
-            assert_eq!(record.record.partition, 0);
-            assert_eq!(record.record.offset.get(), offset);
-            assert_eq!(record.record.payload[0].as_ref(), b"idle processing");
-            let pending = reader.acknowledge(record.token).unwrap();
-            let receipt = live_many(
-                &cluster.brokers,
-                "confirm idle processing",
-                pending.confirmed(),
-            )
-            .await
-            .unwrap();
-            assert_eq!(receipt.cursor.get(), offset + 1);
-        }
-        reader.close().await.unwrap();
-        links.shutdown().await.unwrap();
-        cluster.shutdown().await;
     }
+    live_many(
+        &cluster.brokers,
+        "stop idle progress writer",
+        writer.close(),
+    )
+    .await
+    .unwrap();
+    let mut reader = GroupReader::open(links.clone(), "orders", "idle-workers", config(3))
+        .await
+        .unwrap();
+    for offset in 0..128 {
+        let record = live_many(&cluster.brokers, "read idle progress source", reader.next())
+            .await
+            .unwrap();
+        assert_eq!(record.record.partition, 0);
+        assert_eq!(record.record.offset.get(), offset);
+        assert_eq!(record.record.payload[0].as_ref(), b"idle processing");
+        let pending = reader.acknowledge(record.token).unwrap();
+        let receipt = live_many(
+            &cluster.brokers,
+            "confirm idle processing",
+            pending.confirmed(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt.cursor.get(), offset + 1);
+    }
+    reader.close().await.unwrap();
+    links.shutdown().await.unwrap();
+    cluster.shutdown().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn stalled_application_releases_revoked_sources_before_the_broker_deadline() {
-    for policy in [
-        Confirmation::LocalDurable,
-        Confirmation::DiskQuorum,
-        Confirmation::ReplicatedPersisting,
-    ] {
-        stalled(policy).await;
+    for mode in [DeploymentMode::Single, DeploymentMode::Three] {
+        stalled(mode).await;
     }
 }
 
@@ -110,8 +103,8 @@ async fn stalled_application_releases_revoked_sources_before_the_broker_deadline
     clippy::too_many_lines,
     reason = "keep the stalled application and handoff evidence in one schedule"
 )]
-async fn stalled(policy: Confirmation) {
-    let cluster = Cluster::new(policy).await;
+async fn stalled(mode: DeploymentMode) {
+    let cluster = Cluster::new(mode).await;
     let links = role_links_with_config(
         &cluster.runtime,
         &cluster.configs[0].0,

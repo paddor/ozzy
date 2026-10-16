@@ -138,7 +138,7 @@ impl Receiver {
         Ok(())
     }
 
-    /// Release after application and policy-specific physical persistence.
+    /// Release after application and durable persistence.
     /// This changes local room only. It emits no receipt or admission grant.
     pub fn release(&mut self, through: Prefix) -> Result<(), FlowError> {
         if through == self.released {

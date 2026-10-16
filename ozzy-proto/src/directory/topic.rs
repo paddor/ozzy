@@ -94,11 +94,7 @@ impl TopicPage {
                 .is_none_or(|end| end > self.total)
             || !matches!(
                 (self.brokers.len(), self.policy),
-                (1, Policy::LocalDurable)
-                    | (
-                        3,
-                        Policy::QuorumDurable | Policy::QuorumReplicatedPersisting
-                    )
+                (1, Policy::LocalDurable) | (3, Policy::QuorumDurable)
             )
         {
             return false;

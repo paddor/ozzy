@@ -2,16 +2,13 @@
 //! receipt, and the installed view the primary repeats.
 
 use super::NormalReplica;
-use crate::{Commit, Prefix, PrepareOk, QuorumPolicy, ReplicationError, RetainedPrepareOk, Scope};
+use crate::{Commit, Prefix, PrepareOk, ReplicationError};
 use ozzy_proto::NodeId;
 
 impl NormalReplica {
     /// Construct a backup's cumulative durable vote, never a transport receipt.
     pub fn acknowledgment(&self) -> Result<PrepareOk, ReplicationError> {
         self.require_normal()?;
-        if self.configuration.policy() != QuorumPolicy::Durable {
-            return Err(ReplicationError::PolicyMismatch);
-        }
         if self.is_primary() {
             return Err(ReplicationError::WrongRole);
         }
@@ -24,46 +21,7 @@ impl NormalReplica {
     /// Count one authenticated backup's cumulative matching durable prefix.
     /// Duplicate deliveries/reconnections do not create extra voters.
     pub fn receive_ack(&mut self, from: NodeId, ack: PrepareOk) -> Result<(), ReplicationError> {
-        if self.configuration.policy() != QuorumPolicy::Durable {
-            return Err(ReplicationError::PolicyMismatch);
-        }
-        self.receive_prefix(from, ack.scope, ack.durable)
-    }
-
-    /// Vote for the complete validated prefix retained by the payload adapter.
-    /// Physical writes are independent and cannot reclaim this prefix early.
-    pub fn retained_acknowledgment(&self) -> Result<RetainedPrepareOk, ReplicationError> {
-        self.require_normal()?;
-        if self.configuration.policy() != QuorumPolicy::Replicated {
-            return Err(ReplicationError::PolicyMismatch);
-        }
-        if self.is_primary() {
-            return Err(ReplicationError::WrongRole);
-        }
-        Ok(RetainedPrepareOk {
-            scope: self.configuration.scope(),
-            retained: self.accepted,
-        })
-    }
-
-    /// Count one distinct backup's exact retained-memory prefix.
-    pub fn receive_retained_ack(
-        &mut self,
-        from: NodeId,
-        ack: RetainedPrepareOk,
-    ) -> Result<(), ReplicationError> {
-        if self.configuration.policy() != QuorumPolicy::Replicated {
-            return Err(ReplicationError::PolicyMismatch);
-        }
-        self.receive_prefix(from, ack.scope, ack.retained)
-    }
-
-    fn receive_prefix(
-        &mut self,
-        from: NodeId,
-        scope: Scope,
-        prefix: Prefix,
-    ) -> Result<(), ReplicationError> {
+        let (scope, prefix) = (ack.scope, ack.durable);
         self.require_scope(scope)?;
         let voter = self.configuration.voter_index(from)?;
         if !self.is_primary() || voter == self.local {

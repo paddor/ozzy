@@ -30,7 +30,7 @@ impl ReplicaDriver {
                 let primary = VoterIndex::primary(snapshot.scope.view) == self.local;
                 let outstanding =
                     snapshot.accepted != snapshot.committed || !snapshot.ready_for_appends;
-                let unpersisted = snapshot.accepted.op > self.storage_progress(&snapshot);
+                let unpersisted = snapshot.accepted.op > snapshot.journal.durable;
                 [
                     primary.then_some(self.retry_at),
                     (!primary).then_some(self.contact_deadline),

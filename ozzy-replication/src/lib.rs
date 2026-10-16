@@ -89,23 +89,12 @@ pub struct Scope {
     pub view: u64,
 }
 
-/// Confirmation boundary for a group whose history is persisted to a journal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum QuorumPolicy {
-    /// Confirmation requires synchronized history on the leader and one backup.
-    Durable = 1,
-    /// Confirmation requires retained history on the leader and one backup.
-    /// Journal writes proceed independently; restart needs separate recovery evidence.
-    Replicated = 2,
-}
-
-/// Three ordered, distinct voters with an immutable confirmation policy.
+/// Three ordered, distinct voters. Confirmation needs synchronized history on
+/// the leader and one backup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Configuration {
     scope: Scope,
     voters: Voters<NodeId>,
-    policy: QuorumPolicy,
 }
 
 impl Configuration {
@@ -138,21 +127,7 @@ impl Configuration {
                 view: 0,
             },
             voters: Voters(voters),
-            policy: QuorumPolicy::Durable,
         })
-    }
-
-    /// Confirmation boundary bound into the canonical configuration digest.
-    pub const fn policy(self) -> QuorumPolicy {
-        self.policy
-    }
-
-    /// Native writer policy bound to this immutable group configuration.
-    pub const fn append_policy(self) -> ozzy_proto::append::Policy {
-        match self.policy {
-            QuorumPolicy::Durable => ozzy_proto::append::Policy::QuorumDurable,
-            QuorumPolicy::Replicated => ozzy_proto::append::Policy::QuorumReplicatedPersisting,
-        }
     }
 
     /// Initial configuration scope. Later views require the view-change protocol.
@@ -277,16 +252,6 @@ pub struct PrepareOk {
     pub durable: Prefix,
 }
 
-/// Cumulative retained-memory vote for a background-persisting group.
-/// This type cannot be passed to the disk-quorum acknowledgment entry point.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RetainedPrepareOk {
-    /// Exact group, immutable policy/configuration, and current view.
-    pub scope: Scope,
-    /// Complete validated prefix whose payload remains owned by this broker.
-    pub retained: Prefix,
-}
-
 /// Primary's cumulative commit announcement, also usable as an idle heartbeat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Commit {
@@ -300,9 +265,6 @@ pub struct Commit {
 /// conflicting current lineage faults the normal core.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ReplicationError {
-    /// A vote's evidence does not match the group's immutable confirmation policy.
-    #[error("replication confirmation policy mismatch")]
-    PolicyMismatch,
     /// Configuration needs nonzero group/voter IDs, distinct voters, and a digest.
     #[error("invalid fixed replication configuration")]
     InvalidConfiguration,

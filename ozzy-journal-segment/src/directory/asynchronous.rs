@@ -12,7 +12,6 @@ pub use checkpoint::{
 pub(crate) mod groups;
 mod history;
 mod index;
-mod memory_voting;
 mod metadata;
 mod opening;
 pub use opening::Opening;

@@ -58,18 +58,16 @@ fn chunk(
 
 #[test]
 fn checkpoint_chunks_ignore_reordered_duplicates_and_old_link_sessions() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        exercise(policy);
-    }
+    exercise();
 }
 
-fn exercise(policy: QuorumPolicy) {
+fn exercise() {
     let (mut controller, io) = setup();
-    let (mut primary, mut backup) = donors(&mut controller, &io, policy);
+    let (mut primary, mut backup) = donors(&mut controller, &io);
     let (mut receiver, startup) = drive(
         &mut controller,
         RecoveringJournal::start(
-            receiver_config(policy),
+            receiver_config(),
             io,
             generations(820),
             RecoveryOpen::FormatNew {

@@ -20,8 +20,8 @@ use ozzy_replication::wire::Control;
 
 mod faults;
 
-fn confirm_pair(primary: &mut Replica, backup: &mut Replica, policy: QuorumPolicy) {
-    confirm(primary, backup, policy);
+fn confirm_pair(primary: &mut Replica, backup: &mut Replica) {
+    confirm(primary, backup);
     backup
         .driver
         .receive(
@@ -35,9 +35,9 @@ fn confirm_pair(primary: &mut Replica, backup: &mut Replica, policy: QuorumPolic
     backup.driver.apply_through(ticket.committed()).unwrap();
 }
 
-fn donors(controller: &mut Controller, io: &Local, policy: QuorumPolicy) -> (Replica, Replica) {
-    let mut primary = replica(controller, io.clone(), 0, policy);
-    let mut backup = replica(controller, io.clone(), 2, policy);
+fn donors(controller: &mut Controller, io: &Local) -> (Replica, Replica) {
+    let mut primary = replica(controller, io.clone(), 0);
+    let mut backup = replica(controller, io.clone(), 2);
     let mut receipts = Vec::new();
     for replica in [&mut primary, &mut backup] {
         let init = initialize_writer(controller, replica);
@@ -54,7 +54,7 @@ fn donors(controller: &mut Controller, io: &Local, policy: QuorumPolicy) -> (Rep
         }
         synchronize(controller, replica);
     }
-    confirm_pair(&mut primary, &mut backup, policy);
+    confirm_pair(&mut primary, &mut backup);
     let roll = primary.journal.begin_roll(8).unwrap();
     let done = drive(controller, roll.publish());
     primary.journal.complete_roll(done).unwrap();
@@ -83,7 +83,7 @@ fn donors(controller: &mut Controller, io: &Local, policy: QuorumPolicy) -> (Rep
     for replica in [&mut primary, &mut backup] {
         synchronize(controller, replica);
     }
-    confirm_pair(&mut primary, &mut backup, policy);
+    confirm_pair(&mut primary, &mut backup);
     let retired = drive(
         controller,
         primary.journal.retire_confirmed_history(
@@ -178,7 +178,6 @@ fn complete(
     reason = "keep the controlled fault schedule and its assertions together"
 )]
 fn recovered_cluster(
-    policy: QuorumPolicy,
     unconfirmed_tail: bool,
 ) -> (
     Controller,
@@ -187,7 +186,7 @@ fn recovered_cluster(
     crate::memory::Owner,
 ) {
     let (mut controller, io) = setup();
-    let (mut primary, backup) = donors(&mut controller, &io, policy);
+    let (mut primary, backup) = donors(&mut controller, &io);
     if unconfirmed_tail {
         let stored = resolved(&request(12, 4, 1), Offset::new(4), &[None], 0);
         let receipt = admit_encoded(&mut controller, &mut primary, [stored]).2;
@@ -200,7 +199,7 @@ fn recovered_cluster(
         assert_eq!(snapshot.committed.op.0, 5);
         assert_eq!(backup.driver.normal().unwrap().snapshot().accepted.op.0, 5);
     }
-    let mut config = receiver_config(policy);
+    let mut config = receiver_config();
     config.deduplication = Some(limits());
     let (mut receiver, startup) = drive(
         &mut controller,
@@ -320,26 +319,21 @@ fn recovered_cluster(
 
 #[tokio::test(start_paused = true)]
 async fn cluster_checkpoint_preserves_dedup_after_payload_deletion_and_new_view_activation() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        // Manual storage/actor polling needs paused time without Tokio's task budget.
-        tokio::task::coop::unconstrained(async { exercise_cluster(policy, false) }).await;
-    }
+    // Manual storage/actor polling needs paused time without Tokio's task budget.
+    tokio::task::coop::unconstrained(async { exercise_cluster(false) }).await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn accepted_only_dedup_tail_survives_checkpoint_recovery_and_new_view_confirmation() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        tokio::task::coop::unconstrained(async { exercise_cluster(policy, true) }).await;
-    }
+    tokio::task::coop::unconstrained(async { exercise_cluster(true) }).await;
 }
 
 #[expect(
     clippy::too_many_lines,
     reason = "keep the controlled fault schedule and its assertions together"
 )]
-fn exercise_cluster(policy: QuorumPolicy, unconfirmed_tail: bool) {
-    let (mut controller, mut actors, config, actor_memory) =
-        recovered_cluster(policy, unconfirmed_tail);
+fn exercise_cluster(unconfirmed_tail: bool) {
+    let (mut controller, mut actors, config, actor_memory) = recovered_cluster(unconfirmed_tail);
     let mut now = Duration::ZERO;
     for step in 0..20000 {
         // Finish bounded storage and actor turns at each clock instant.

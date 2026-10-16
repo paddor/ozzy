@@ -141,8 +141,6 @@ ozzy_three serve --broker broker-0 --identity "$ozzy_dir/shared.identity" \
 - All brokers share one `shared.identity`. Each keeps its own local identity
   and stores.
 - Writes confirm while two of the three brokers are up.
-- For background persistence on disks with slow flushes, set
-  `confirmation = "replicated-persisting"` on the topic.
 
 ## Watch a broker
 
@@ -160,8 +158,7 @@ Keys and screens: [ozzy-ui](ozzy-ui/README.md).
 ## Recover a partition
 
 In three-broker mode, start a broker with `recover` instead of `serve` when one
-of its partition stores is lost or must stop voting. An unclean stop of a
-replicated-persisting partition needs this even when its files look intact.
+of its partition stores is lost or must stop voting.
 
 ```bash
 ozzy_three recover --broker broker-0 --identity "$ozzy_dir/shared.identity" \
@@ -172,7 +169,7 @@ ozzy_three recover --broker broker-0 --identity "$ozzy_dir/shared.identity" \
 | Flag | Use when |
 | --- | --- |
 | `--replace TOPIC/PARTITION` | The partition directory is absent, for example after a lost disk |
-| `--quarantine TOPIC/PARTITION` | The store exists but must lose its vote, for example after an unclean replicated-persisting stop |
+| `--quarantine TOPIC/PARTITION` | The store exists but must lose its vote, for example after storage damage |
 | `--resume TOPIC/PARTITION` | An earlier recovery did not finish; allows sealed-file repair |
 | `--resume-full TOPIC/PARTITION` | An earlier recovery did not finish; forces a full history transfer |
 

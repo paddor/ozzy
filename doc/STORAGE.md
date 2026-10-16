@@ -4,7 +4,7 @@ This page owns Ozzy's on-disk formats, write barriers, retention, recovery, and
 the supported failure model. Terms are defined in
 [the overview](OVERVIEW.md#terms).
 
-All three confirmation modes use one append-only segment journal per partition
+Both confirmation modes use one append-only segment journal per partition
 per broker. Storage backends own file handles and physical jobs; no filesystem
 call runs on a shard.
 
@@ -21,7 +21,6 @@ Each partition store lives in
 | `MANIFEST.<generation>` | Immutable selection of exact segment and checkpoint incarnations |
 | `CURRENT` | Selects one manifest by generation and digest |
 | `DURABLE` | Synchronized accepted-prefix evidence |
-| `MEMORY_VOTING` | Replicated-persisting running/drained evidence |
 | `segments/<id>.log`, `segments/<id>.<generation>.log` | Operations and payloads; the second form is a replacement |
 | `segments/spare.log` | A retired segment file kept for the next new segment |
 | `indexes/<segment-id>-<segment-digest-hex>.idx` | Derived, rebuildable lookup |
@@ -29,7 +28,7 @@ Each partition store lives in
 | `staging/` | Unselected work (`index-*`, `.checkpoint-*.tmp`) |
 
 Metadata temporaries are `.MANIFEST.<generation>.tmp`,
-`.CURRENT.<generation>.tmp`, `.MEMORY_VOTING.tmp`, and `.DURABLE.tmp`.
+`.CURRENT.<generation>.tmp`, and `.DURABLE.tmp`.
 
 | File | Magic | Bytes |
 | --- | --- | --- |
@@ -37,7 +36,6 @@ Metadata temporaries are `.MANIFEST.<generation>.tmp`,
 | `CURRENT` | `OZYCUR\0\0` | 128 |
 | `MANIFEST.<generation>` | `OZYMAN\0\0` | 384 plus 120 per segment |
 | `DURABLE` | `OZYDUR\0\0` | Two 192-byte records, 64 KiB apart |
-| `MEMORY_VOTING` | `OZYMEM\0\0` | 256 |
 | Recovery marker in `CONFIGURATION` | `OZYRECOV` | 64 |
 
 `identity`, `CURRENT`, and manifests use metadata version 2.
@@ -197,7 +195,7 @@ part. General descriptors use:
   identities are never evicted.
 - Expiry follows committed logical time only. A discarded `DedupWatermark`
   changes nothing. Followers apply confirmed time before admitting new IDs.
-- All three modes keep live IDs after their payloads retire.
+- Both modes keep live IDs after their payloads retire.
 
 ## Consumer progress and groups
 
@@ -226,10 +224,8 @@ Commands are in [the protocol](PROTOCOL.md). Stored state:
 4. Satisfy the policy, then apply and reply. `DURABLE` evidence follows on its
    own; no vote or confirmation waits for it.
 
-| Topic `confirmation` | Segment writes | Boundary |
-| --- | --- | --- |
-| `local-durable`, `disk-quorum` | `O_DSYNC` | Each completed write is durable and confirms or votes at once |
-| `replicated-persisting` | Buffered | Written progress only; flush, roll, promises, and shutdown add barriers |
+Segment writes use `O_DSYNC` in both modes. Each completed write is durable
+and confirms or votes at once.
 
 With the `aio` backend (the Linux default), segment data writes use a separate
 `O_DIRECT` handle. Headers, metadata, and reads stay buffered.
@@ -281,9 +277,6 @@ generation.
   falls back to an older manifest or temporary.
 - Authorized replacement with a new active segment ID supersedes older evidence
   under protected-history rules.
-- Replicated-persisting brokers publish `MEMORY_VOTING` running before voting
-  and drained only after admission closes and writes settle. Missing, stale,
-  corrupt, or running evidence requires nonvoting recovery.
 
 ## Recovery
 
@@ -295,7 +288,7 @@ generation.
 | Damage at/before durable prefix, or marked durable by a later valid group | Refuse without changing bytes |
 | Sealed/installed damage | Refuse strict open; authorized sealed repair may apply |
 | Corrupt or missing index | Rebuild from validated segment bytes |
-| Corrupt authority / lost store / unclean RP | Fail closed or stay nonvoting for recovery |
+| Corrupt authority / lost store | Fail closed or stay nonvoting for recovery |
 
 - Writes in flight can complete out of order. A valid group after a damaged
   one that does not mark it durable followed an unfinished write; recovery

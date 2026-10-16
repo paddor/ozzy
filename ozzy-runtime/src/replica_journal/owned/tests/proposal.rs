@@ -138,78 +138,76 @@ fn open_second(
 }
 
 #[test]
-fn owned_producer_open_retry_keeps_one_operation_under_both_group_policies() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        let (mut controller, io) = setup();
-        let mut replica = replica(&mut controller, io, 0, policy, 8192);
-        let initial = initialize_writer(&mut controller, &mut replica);
-        let scope = replica.driver.scope();
-        let request = ozzy_proto::producer::Open {
-            authority: ozzy_proto::append::Authority {
-                group_id: scope.group_id,
-                config_epoch: scope.configuration_epoch,
-                view: scope.view,
-            },
-            partition: PartitionIncarnation::from_bytes([11; 16]),
-            producer: ProducerId::from_bytes([40; 16]),
-            mode: ozzy_proto::producer::Mode::Resume,
-            expected_epoch: None,
-            operation: OperationId::from_bytes([41; 16]),
-        };
-        let expected_policy = replica.config.configuration.configuration().append_policy();
+fn owned_producer_open_retry_keeps_one_operation() {
+    let (mut controller, io) = setup();
+    let mut replica = replica(&mut controller, io, 0, 8192);
+    let initial = initialize_writer(&mut controller, &mut replica);
+    let scope = replica.driver.scope();
+    let request = ozzy_proto::producer::Open {
+        authority: ozzy_proto::append::Authority {
+            group_id: scope.group_id,
+            config_epoch: scope.configuration_epoch,
+            view: scope.view,
+        },
+        partition: PartitionIncarnation::from_bytes([11; 16]),
+        producer: ProducerId::from_bytes([40; 16]),
+        mode: ozzy_proto::producer::Mode::Resume,
+        expected_epoch: None,
+        operation: OperationId::from_bytes([41; 16]),
+    };
+    let expected_policy = ozzy_proto::append::Policy::QuorumDurable;
+    let mut buffer = replica.journal.lease_proposal_buffer().unwrap();
+    buffer
+        .prepare_producer_open(request, expected_policy)
+        .unwrap();
+    let validated = ready(validate(&mut controller, &mut replica, buffer, 777));
+    assert_eq!(
+        validated
+            .buffer
+            .producer_session
+            .as_ref()
+            .unwrap()
+            .opened
+            .unwrap()
+            .epoch,
+        1
+    );
+    let receipt = accept(&mut replica, validated);
+    let accepted = replica.driver.normal().unwrap().snapshot().accepted;
+    for written in [false, true] {
         let mut buffer = replica.journal.lease_proposal_buffer().unwrap();
         buffer
             .prepare_producer_open(request, expected_policy)
             .unwrap();
-        let validated = ready(validate(&mut controller, &mut replica, buffer, 777));
+        let ProposalValidation::Resolved {
+            through, buffer, ..
+        } = validate(&mut controller, &mut replica, buffer, 888)
+        else {
+            panic!("same producer open must resolve");
+        };
+        assert_eq!(through, accepted);
+        let opened = buffer.producer_opened().unwrap();
+        assert_eq!(opened.epoch, 1);
+        assert_eq!(opened.policy, expected_policy);
         assert_eq!(
-            validated
-                .buffer
-                .producer_session
-                .as_ref()
-                .unwrap()
-                .opened
-                .unwrap()
-                .epoch,
-            1
+            replica.driver.normal().unwrap().snapshot().accepted,
+            accepted
         );
-        let receipt = accept(&mut replica, validated);
-        let accepted = replica.driver.normal().unwrap().snapshot().accepted;
-        for written in [false, true] {
-            let mut buffer = replica.journal.lease_proposal_buffer().unwrap();
-            buffer
-                .prepare_producer_open(request, expected_policy)
-                .unwrap();
-            let ProposalValidation::Resolved {
-                through, buffer, ..
-            } = validate(&mut controller, &mut replica, buffer, 888)
-            else {
-                panic!("same producer open must resolve");
-            };
-            assert_eq!(through, accepted);
-            let opened = buffer.producer_opened().unwrap();
-            assert_eq!(opened.epoch, 1);
-            assert_eq!(opened.policy, expected_policy);
-            assert_eq!(
-                replica.driver.normal().unwrap().snapshot().accepted,
-                accepted
-            );
-            drop(buffer);
-            if !written {
-                let work = prepare(&mut replica);
-                finish(&mut controller, &mut replica, work);
-            }
+        drop(buffer);
+        if !written {
+            let work = prepare(&mut replica);
+            finish(&mut controller, &mut replica, work);
         }
-        settle(&mut replica, initial);
-        settle(&mut replica, receipt);
-        drive(&mut controller, replica.journal.shutdown()).unwrap();
     }
+    settle(&mut replica, initial);
+    settle(&mut replica, receipt);
+    drive(&mut controller, replica.journal.shutdown()).unwrap();
 }
 
 #[test]
 fn owned_writers_share_offsets_and_retry_exactly_before_and_after_disk() {
     let (mut controller, io) = setup();
-    let mut replica = replica(&mut controller, io, 0, QuorumPolicy::Durable, 8192);
+    let mut replica = replica(&mut controller, io, 0, 8192);
     let initial = initialize_writer(&mut controller, &mut replica);
     let second = open_second(&mut controller, &mut replica);
     let buffer = proposal(
@@ -261,7 +259,7 @@ fn owned_writers_share_offsets_and_retry_exactly_before_and_after_disk() {
 #[test]
 fn owned_rebatched_retry_keeps_gaps_and_assigns_only_fresh_suffix() {
     let (mut controller, io) = setup();
-    let mut replica = replica(&mut controller, io, 0, QuorumPolicy::Durable, 8192);
+    let mut replica = replica(&mut controller, io, 0, 8192);
     let initial = initialize_writer(&mut controller, &mut replica);
     let second = open_second(&mut controller, &mut replica);
     let buffer = proposal(
@@ -297,7 +295,7 @@ fn owned_rebatched_retry_keeps_gaps_and_assigns_only_fresh_suffix() {
 #[test]
 fn owned_conflicting_retry_and_grouped_bad_sequence_leave_image_and_input_unchanged() {
     let (mut controller, io) = setup();
-    let mut replica = replica(&mut controller, io, 0, QuorumPolicy::Durable, 8192);
+    let mut replica = replica(&mut controller, io, 0, 8192);
     let initial = initialize_writer(&mut controller, &mut replica);
     let buffer = proposal(&replica, [request(12, 0, 1)]);
     let validated = ready(validate(&mut controller, &mut replica, buffer, 777));
@@ -345,7 +343,7 @@ fn owned_conflicting_retry_and_grouped_bad_sequence_leave_image_and_input_unchan
 #[test]
 fn owned_cold_retry_remains_valid_during_writes_and_detached_roll() {
     let (mut controller, io) = setup();
-    let mut replica = replica(&mut controller, io, 0, QuorumPolicy::Durable, 8192);
+    let mut replica = replica(&mut controller, io, 0, 8192);
     let initial = initialize_writer(&mut controller, &mut replica);
     let buffer = proposal(&replica, [request(12, 0, 1)]);
     let validated = ready(validate(&mut controller, &mut replica, buffer, 777));
@@ -383,53 +381,51 @@ fn owned_cold_retry_remains_valid_during_writes_and_detached_roll() {
 
 #[test]
 fn owned_cold_batch_retry_verifies_records_without_per_record_file_jobs() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        let (mut controller, io) = setup();
-        let mut replica = replica(&mut controller, io, 0, policy, 8192);
-        let initial = initialize_writer(&mut controller, &mut replica);
-        let buffer = proposal(&replica, [request(12, 0, 64)]);
-        let validated = ready(validate(&mut controller, &mut replica, buffer, 777));
-        let receipt = accept(&mut replica, validated);
-        let work = prepare(&mut replica);
-        finish(&mut controller, &mut replica, work);
-        settle(&mut replica, initial);
-        settle(&mut replica, receipt);
-        let accepted = replica.driver.normal().unwrap().snapshot().accepted;
-        let buffer = proposal(&replica, [request(12, 0, 64)]);
-        let ticket = replica.driver.begin_validation().unwrap();
-        let mut jobs = 0;
-        let result = drive_except(
-            &mut controller,
-            replica.journal.propose_append(ticket, buffer, 999),
-            None,
-            |_| {
-                jobs += 1;
-                Effect::Normal
-            },
-        );
-        let ProposalValidation::Resolved {
-            through, buffer, ..
-        } = result
-        else {
-            panic!("cold batch retry must resolve");
-        };
-        assert_eq!(through, accepted);
-        assert_eq!(coordinates(&buffer.0), [(0, 0, 777, 64)]);
-        assert!(jobs <= 8, "cold batch retry issued {jobs} file jobs");
-        let mut changed = request(12, 0, 64);
-        changed.records[31].parts = vec![b"conflicting later record".as_slice()].into();
-        let buffer = proposal(&replica, [changed]);
-        assert!(matches!(
-            validate(&mut controller, &mut replica, buffer, 999),
-            ProposalValidation::Rejected {
-                reason: JournalError::ProducerAppend(AppendAdmissionError::RetryConflict),
-                ..
-            }
-        ));
-        assert_eq!(
-            replica.driver.normal().unwrap().snapshot().accepted,
-            accepted
-        );
-        drive(&mut controller, replica.journal.shutdown()).unwrap();
-    }
+    let (mut controller, io) = setup();
+    let mut replica = replica(&mut controller, io, 0, 8192);
+    let initial = initialize_writer(&mut controller, &mut replica);
+    let buffer = proposal(&replica, [request(12, 0, 64)]);
+    let validated = ready(validate(&mut controller, &mut replica, buffer, 777));
+    let receipt = accept(&mut replica, validated);
+    let work = prepare(&mut replica);
+    finish(&mut controller, &mut replica, work);
+    settle(&mut replica, initial);
+    settle(&mut replica, receipt);
+    let accepted = replica.driver.normal().unwrap().snapshot().accepted;
+    let buffer = proposal(&replica, [request(12, 0, 64)]);
+    let ticket = replica.driver.begin_validation().unwrap();
+    let mut jobs = 0;
+    let result = drive_except(
+        &mut controller,
+        replica.journal.propose_append(ticket, buffer, 999),
+        None,
+        |_| {
+            jobs += 1;
+            Effect::Normal
+        },
+    );
+    let ProposalValidation::Resolved {
+        through, buffer, ..
+    } = result
+    else {
+        panic!("cold batch retry must resolve");
+    };
+    assert_eq!(through, accepted);
+    assert_eq!(coordinates(&buffer.0), [(0, 0, 777, 64)]);
+    assert!(jobs <= 8, "cold batch retry issued {jobs} file jobs");
+    let mut changed = request(12, 0, 64);
+    changed.records[31].parts = vec![b"conflicting later record".as_slice()].into();
+    let buffer = proposal(&replica, [changed]);
+    assert!(matches!(
+        validate(&mut controller, &mut replica, buffer, 999),
+        ProposalValidation::Rejected {
+            reason: JournalError::ProducerAppend(AppendAdmissionError::RetryConflict),
+            ..
+        }
+    ));
+    assert_eq!(
+        replica.driver.normal().unwrap().snapshot().accepted,
+        accepted
+    );
+    drive(&mut controller, replica.journal.shutdown()).unwrap();
 }

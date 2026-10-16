@@ -80,7 +80,7 @@ fn progress_request_has_independent_frozen_bytes_and_distinguishes_query_from_ze
         "05050505050505050505050505050505",
         "06060606060606060606060606060606",
         "0000000000000007",
-        "05",
+        "02",
         "01",
         "0000000000000009"
     );

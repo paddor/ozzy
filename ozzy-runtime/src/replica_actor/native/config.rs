@@ -97,12 +97,6 @@ pub(super) fn validate(
         || count != Some(buffers.len())
         || buffers.len() > 1024
         || !(1..=1024).contains(&config.turn_slots)
-        || !matches!(
-            config.policy,
-            append::Policy::LocalDurable
-                | append::Policy::QuorumDurable
-                | append::Policy::QuorumReplicatedPersisting
-        )
         || config.limits.max_records == 0
         || config.limits.max_parts == 0
         || config.limits.envelope.max_metadata_bytes < 107

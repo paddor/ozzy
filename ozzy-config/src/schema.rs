@@ -39,6 +39,17 @@ pub enum DeploymentMode {
     Three,
 }
 
+impl DeploymentMode {
+    /// The confirmation policy this mode fixes for every topic: local durable
+    /// for one broker, disk quorum for three.
+    pub const fn policy(self) -> ozzy_proto::append::Policy {
+        match self {
+            Self::Single => ozzy_proto::append::Policy::LocalDurable,
+            Self::Three => ozzy_proto::append::Policy::QuorumDurable,
+        }
+    }
+}
+
 /// Explicit bounds checked before allocating per-partition state.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -108,8 +119,6 @@ pub struct Topic {
     #[serde(default)]
     /// Seed shared by SDK keyed partition routing.
     pub partitioner_seed: u64,
-    /// Fixed record confirmation policy.
-    pub confirmation: Confirmation,
     #[serde(default = "default_segment_bytes")]
     /// Maximum physical bytes per segment file.
     pub segment_bytes: u64,
@@ -170,18 +179,6 @@ const fn default_segment_bytes() -> u64 {
 
 const fn default_append_bytes() -> u64 {
     MAX_APPEND_BYTES
-}
-
-/// Exact confirmation boundary, never selected per request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Confirmation {
-    /// Confirm after the sole broker synchronizes its journal.
-    LocalDurable,
-    /// Confirm after leader and one follower synchronize matching history.
-    DiskQuorum,
-    /// Confirm after leader and one follower retain records; persistence proceeds independently.
-    ReplicatedPersisting,
 }
 
 /// Ozzy-owned CPU affinity. OS identifiers, not hwloc logical indexes.

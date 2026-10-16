@@ -154,8 +154,8 @@ A change keeps or adds cases for each area it touches:
 
 - **Identity and order:** exact bytes, parts, and message IDs; shared offsets;
   independent producer epochs; unchanged retries.
-- **Confirmation:** local durability; two durable disk quorum copies; two
-  retained replicated-persisting copies; reply-before-COMMIT failover.
+- **Confirmation:** local durability; two durable disk quorum copies;
+  reply-before-COMMIT failover.
 - **Authority:** configuration, view, session, incarnation, and receive-epoch
   fencing; stale work after replacement.
 - **Pressure:** full-backing charges through aliases and cancellation;
@@ -192,8 +192,8 @@ hosts. `OZZY_SOAK_TRACE=1` prints producer reopen steps in any soak.
 
 ```sh
 scripts/ozzy_cargo run -p ozzy-sim --features broker --bin ozzy_sim -- \
-  --mode replicated-persisting --seed 42 --duration 28800 \
-  --artifacts tmp/ozzy-sim-rp-42
+  --mode disk-quorum --seed 42 --duration 28800 \
+  --artifacts tmp/ozzy-sim-dq-42
 ```
 
 Flags, actions, artifacts, and replay: [ozzy-sim/README.md](ozzy-sim/README.md).
@@ -201,11 +201,11 @@ Flags, actions, artifacts, and replay: [ozzy-sim/README.md](ozzy-sim/README.md).
 ### Memory-only broker churn
 
 Real inproc brokers and SDKs over the memory backend.
-`OZZY_SOAK_POLICY` is `single`, `dq`, or `rp`.
+`OZZY_SOAK_POLICY` is `single` or `dq`.
 
 ```sh
-OZZY_SOAK_POLICY=rp OZZY_SOAK_SECONDS=3600 \
-OZZY_SOAK_RESULTS=$HOME/.cache/ozzy/churn-rp.jsonl \
+OZZY_SOAK_POLICY=dq OZZY_SOAK_SECONDS=3600 \
+OZZY_SOAK_RESULTS=$HOME/.cache/ozzy/churn-dq.jsonl \
   scripts/ozzy_cargo test -p ozzy-broker --test ozzy_broker_config \
   journals::serving::simulated::churn::memory_only_varied_churn_soak \
   -- --ignored --exact --nocapture
@@ -237,7 +237,7 @@ OZZY_SOAK_SECONDS=3600 OZZY_SOAK_RESULTS=$HOME/.cache/ozzy/single.jsonl \
 
 ### Cross-host crash soak
 
-Broker processes on three hosts (disk quorum or replicated-persisting) or one
+Broker processes on three hosts (disk quorum) or one
 host (single durable), with SIGKILL and orderly restarts. These are
 process-crash tests, not power-loss tests.
 

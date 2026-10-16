@@ -46,8 +46,8 @@ use ozzy_proto::{LinkSessionId, NodeId};
 
 use crate::flow::{FlowError, ReceiveEpoch};
 use crate::{
-    Commit, Configuration, DoViewChange, Prefix, PrepareOk, QuorumPolicy, ReplicationError,
-    RetainedPrepareOk, Scope, StartView, StartViewChange,
+    Commit, Configuration, DoViewChange, Prefix, PrepareOk, ReplicationError, Scope, StartView,
+    StartViewChange,
 };
 
 const COMMON_BYTES: usize = 80;
@@ -160,11 +160,6 @@ pub enum Control {
         /// Matching contiguous prefix after successful disk synchronization.
         ack: PrepareOk,
     },
-    /// Cumulative retained-memory evidence with independent background persistence.
-    PrepareRetained {
-        /// Validated bytes retained until application and persistence complete.
-        ack: RetainedPrepareOk,
-    },
     /// Primary's cumulative commit announcement or idle heartbeat.
     Commit(Commit),
     /// Volatile suspicion about this current view, not a durable promise or vote.
@@ -182,7 +177,6 @@ impl Control {
     pub const fn acknowledged(self) -> Option<Prefix> {
         match self {
             Self::PrepareOk { ack, .. } => Some(ack.durable),
-            Self::PrepareRetained { ack, .. } => Some(ack.retained),
             _ => None,
         }
     }
@@ -191,7 +185,6 @@ impl Control {
     pub const fn scope(self) -> Scope {
         match self {
             Self::PrepareOk { ack, .. } => ack.scope,
-            Self::PrepareRetained { ack, .. } => ack.scope,
             Self::Commit(message) => message.scope,
             Self::ExitView(scope) => scope,
             Self::StartViewChange(message) => message.scope,
@@ -202,7 +195,7 @@ impl Control {
 
     fn opcode(self) -> Opcode {
         match self {
-            Self::PrepareOk { .. } | Self::PrepareRetained { .. } => Opcode::PrepareOk,
+            Self::PrepareOk { .. } => Opcode::PrepareOk,
             Self::Commit(_) => Opcode::Commit,
             Self::ExitView(_) => Opcode::ExitView,
             Self::StartViewChange(_) => Opcode::StartViewChange,
@@ -257,11 +250,7 @@ pub fn encode_control(
     let metadata_bytes = match message {
         Control::PrepareOk { ack, .. } => {
             validate_prefix(ack.durable)?;
-            COMMON_BYTES + 40 + 1
-        }
-        Control::PrepareRetained { ack, .. } => {
-            validate_prefix(ack.retained)?;
-            COMMON_BYTES + 40 + 1
+            COMMON_BYTES + 40
         }
         Control::Commit(message) => {
             validate_prefix(message.committed)?;
@@ -295,14 +284,7 @@ pub fn encode_control(
     let mut writer = Writer::with_len(output, metadata_bytes)?;
     writer.scope(scope, sender)?;
     match message {
-        Control::PrepareOk { ack } => {
-            writer.prefix(ack.durable)?;
-            writer.bytes(&[2])?;
-        }
-        Control::PrepareRetained { ack } => {
-            writer.prefix(ack.retained)?;
-            writer.bytes(&[3])?;
-        }
+        Control::PrepareOk { ack } => writer.prefix(ack.durable)?,
         Control::Commit(message) => writer.prefix(message.committed)?,
         Control::StartViewChange(_) | Control::ExitView(_) => {}
         Control::DoViewChange(message) => election::write_report(&mut writer, message)?,
@@ -438,7 +420,7 @@ fn decode_uncorrelated(
             prepare::decode_prepare(scope, reader, payload, limits).map(ReplicaMessage::Prepare)
         }
         _ if !payload.is_empty() => Err(WireError::Payload),
-        opcode => decode_control(scope, opcode, reader, binding).map(ReplicaMessage::Control),
+        opcode => decode_control(scope, opcode, reader).map(ReplicaMessage::Control),
     }
 }
 
@@ -446,28 +428,14 @@ fn decode_control(
     scope: Scope,
     opcode: Opcode,
     mut reader: Reader<'_>,
-    binding: PeerBinding,
 ) -> Result<Control, WireError> {
     let message = match opcode {
-        Opcode::PrepareOk => {
-            let prefix = reader.prefix()?;
-            let evidence = reader.u8()?;
-            match (binding.configuration.policy(), evidence) {
-                (QuorumPolicy::Durable, 2) => Control::PrepareOk {
-                    ack: PrepareOk {
-                        scope,
-                        durable: prefix,
-                    },
-                },
-                (QuorumPolicy::Replicated, 3) => Control::PrepareRetained {
-                    ack: RetainedPrepareOk {
-                        scope,
-                        retained: prefix,
-                    },
-                },
-                _ => return Err(WireError::Evidence),
-            }
-        }
+        Opcode::PrepareOk => Control::PrepareOk {
+            ack: PrepareOk {
+                scope,
+                durable: reader.prefix()?,
+            },
+        },
         Opcode::Commit => Control::Commit(Commit {
             scope,
             committed: reader.prefix()?,
@@ -509,9 +477,6 @@ pub enum WireError {
     /// Body or envelope digest does not match the received canonical bytes.
     #[error("replica canonical operation digest mismatch")]
     Digest,
-    /// The ACK's evidence kind does not match the selected RAM/disk codec.
-    #[error("replica ACK does not carry the configured evidence")]
-    Evidence,
     /// Invalid native envelope or directional frame bound.
     #[error(transparent)]
     Envelope(#[from] EnvelopeError),

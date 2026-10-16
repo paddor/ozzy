@@ -4,13 +4,11 @@ mod limits;
 mod recovery;
 pub use recovery::{RecoveryIntent, RecoverySelection};
 
-use ozzy_config::{BrokerIdentity, Confirmation, PartitionIdentity, PartitionPlacement};
+use ozzy_config::{BrokerIdentity, DeploymentMode, PartitionIdentity, PartitionPlacement};
 use ozzy_io::Local;
 use ozzy_journal_segment::GroupIdentity;
 use ozzy_proto::{GroupId, NodeId, PartitionIncarnation, StoreId, VolumeId};
-use ozzy_replication::{
-    ConfigurationRecord, ConfiguredVoter, Digest, JournalGeneration, QuorumPolicy, local,
-};
+use ozzy_replication::{ConfigurationRecord, ConfiguredVoter, Digest, JournalGeneration, local};
 use ozzy_runtime::replica_journal::{JournalStartup, OwnedConfig, OwnedJournal};
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -175,8 +173,8 @@ impl PartitionSetup<'_> {
             store_generation: store.generation,
         };
         let settings = limits::Settings::new(checked, placement)?;
-        let config = match checked.identity.topic(&placement.topic)?.confirmation {
-            Confirmation::LocalDurable => {
+        let config = match checked.identity.mode {
+            DeploymentMode::Single => {
                 let configuration = local::Configuration::new(
                     identity.group_id,
                     partition.config_epoch,
@@ -186,8 +184,8 @@ impl PartitionSetup<'_> {
                 .map_err(|failure| self.error(&failure.to_string()))?;
                 JournalConfig::Local(settings.config(placement, identity, configuration))
             }
-            policy => {
-                let configuration = self.replicated(identity.group_id, partition, policy)?;
+            DeploymentMode::Three => {
+                let configuration = self.replicated(identity.group_id, partition)?;
                 JournalConfig::Replicated(settings.config(placement, identity, configuration))
             }
         };
@@ -200,12 +198,11 @@ impl PartitionSetup<'_> {
         })
     }
 
-    /// The fixed-three voter configuration under the topic's quorum policy.
+    /// The fixed-three voter configuration.
     fn replicated(
         &self,
         group: GroupId,
         partition: &PartitionIdentity,
-        policy: Confirmation,
     ) -> Result<ConfigurationRecord, StartupError> {
         let members: [Uuid; 3] = partition
             .members
@@ -218,17 +215,8 @@ impl PartitionSetup<'_> {
                 principal,
             })
         });
-        ConfigurationRecord::with_policy(
-            group,
-            partition.config_epoch,
-            [first?, second?, third?],
-            if policy == Confirmation::DiskQuorum {
-                QuorumPolicy::Durable
-            } else {
-                QuorumPolicy::Replicated
-            },
-        )
-        .map_err(|failure| self.error(&failure.to_string()))
+        ConfigurationRecord::new(group, partition.config_epoch, [first?, second?, third?])
+            .map_err(|failure| self.error(&failure.to_string()))
     }
 
     fn principal(&self, id: &Uuid) -> Result<Digest, StartupError> {

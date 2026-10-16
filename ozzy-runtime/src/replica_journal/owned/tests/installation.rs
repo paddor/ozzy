@@ -16,14 +16,8 @@ struct Voter {
     source: LogSource,
 }
 
-fn voter(
-    controller: &mut Controller,
-    io: Local,
-    index: u8,
-    count: u8,
-    policy: QuorumPolicy,
-) -> Voter {
-    let mut config = config(&format!("/broker-{index}"), 7, policy);
+fn voter(controller: &mut Controller, io: Local, index: u8, count: u8) -> Voter {
+    let mut config = config(&format!("/broker-{index}"), 7);
     config.identity.replica_node_id = NodeId::from_bytes([index + 1; 16]);
     let (mut journal, _) = drive(
         controller,
@@ -110,9 +104,9 @@ fn voter(
     }
 }
 
-fn selected(controller: &mut Controller, io: Local, policy: QuorumPolicy) -> (Voter, Voter) {
-    let mut primary = voter(controller, io.clone(), 1, 3, policy);
-    let mut backup = voter(controller, io, 2, 2, policy);
+fn selected(controller: &mut Controller, io: Local) -> (Voter, Voter) {
+    let mut primary = voter(controller, io.clone(), 1, 3);
+    let mut backup = voter(controller, io, 2, 2);
     let Some(Action::Broadcast(left)) = primary.driver.poll(Duration::ZERO).unwrap() else {
         panic!("start")
     };
@@ -227,8 +221,8 @@ fn finish(controller: &mut Controller, voter: &mut Voter, ticket: InstallTicket)
         .unwrap();
 }
 
-fn installed_pair(controller: &mut Controller, io: Local, mode: QuorumPolicy) -> (Voter, Voter) {
-    let (mut primary, mut backup) = selected(controller, io, mode);
+fn installed_pair(controller: &mut Controller, io: Local) -> (Voter, Voter) {
+    let (mut primary, mut backup) = selected(controller, io);
     let ticket = stage_local(controller, &mut primary);
     finish(controller, &mut primary, ticket);
     assert!(primary.driver.begin_activation().is_err());
@@ -309,13 +303,8 @@ fn installed_pair(controller: &mut Controller, io: Local, mode: QuorumPolicy) ->
     }
     finish(controller, &mut backup, ticket);
     let normal = backup.driver.normal().unwrap();
-    let confirmation = match mode {
-        QuorumPolicy::Durable => Control::PrepareOk {
-            ack: normal.acknowledgment().unwrap(),
-        },
-        QuorumPolicy::Replicated => Control::PrepareRetained {
-            ack: normal.retained_acknowledgment().unwrap(),
-        },
+    let confirmation = Control::PrepareOk {
+        ack: normal.acknowledgment().unwrap(),
     };
     primary
         .driver
@@ -326,56 +315,54 @@ fn installed_pair(controller: &mut Controller, io: Local, mode: QuorumPolicy) ->
 
 #[test]
 fn owned_selected_history_requires_new_view_agreement_and_exact_activation() {
-    for mode in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        let (mut controller, io) = setup();
-        let (mut primary, mut backup) = installed_pair(&mut controller, io.clone(), mode);
-        let ticket = primary.driver.begin_activation().unwrap();
-        let completed = drive(&mut controller, primary.journal.activate_installed(ticket)).unwrap();
-        primary.driver.complete_activation(completed).unwrap();
-        assert!(
-            primary
-                .driver
-                .normal()
-                .unwrap()
-                .snapshot()
-                .ready_for_appends
-        );
-        assert_eq!(primary.journal.images().unwrap().committed().revision(), 3);
-        let commit = primary.driver.normal().unwrap().announcement().unwrap();
-        backup
+    let (mut controller, io) = setup();
+    let (mut primary, mut backup) = installed_pair(&mut controller, io.clone());
+    let ticket = primary.driver.begin_activation().unwrap();
+    let completed = drive(&mut controller, primary.journal.activate_installed(ticket)).unwrap();
+    primary.driver.complete_activation(completed).unwrap();
+    assert!(
+        primary
             .driver
-            .receive(
-                primary.source.voter,
-                Control::Commit(commit),
-                Duration::ZERO,
-            )
-            .unwrap();
-        let ticket = backup.driver.begin_activation().unwrap();
-        backup
-            .driver
-            .complete_activation(
-                drive(&mut controller, backup.journal.activate_installed(ticket)).unwrap(),
-            )
-            .unwrap();
-        assert_eq!(backup.journal.images().unwrap().committed().revision(), 3);
-        for voter in std::iter::once(primary).chain(std::iter::once(backup)) {
-            drive(&mut controller, voter.journal.shutdown()).unwrap();
-            let (journal, startup) = drive(
-                &mut controller,
-                OwnedJournal::open(voter.config, io.clone(), JournalGeneration(200)),
-            )
-            .unwrap();
-            assert_eq!(startup.recovered().unwrap().log.committed, commit.committed);
-            assert!(journal.images().is_err());
-            drive(&mut controller, journal.shutdown()).unwrap();
-        }
+            .normal()
+            .unwrap()
+            .snapshot()
+            .ready_for_appends
+    );
+    assert_eq!(primary.journal.images().unwrap().committed().revision(), 3);
+    let commit = primary.driver.normal().unwrap().announcement().unwrap();
+    backup
+        .driver
+        .receive(
+            primary.source.voter,
+            Control::Commit(commit),
+            Duration::ZERO,
+        )
+        .unwrap();
+    let ticket = backup.driver.begin_activation().unwrap();
+    backup
+        .driver
+        .complete_activation(
+            drive(&mut controller, backup.journal.activate_installed(ticket)).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(backup.journal.images().unwrap().committed().revision(), 3);
+    for voter in std::iter::once(primary).chain(std::iter::once(backup)) {
+        drive(&mut controller, voter.journal.shutdown()).unwrap();
+        let (journal, startup) = drive(
+            &mut controller,
+            OwnedJournal::open(voter.config, io.clone(), JournalGeneration(200)),
+        )
+        .unwrap();
+        assert_eq!(startup.recovered().unwrap().log.committed, commit.committed);
+        assert!(journal.images().is_err());
+        drive(&mut controller, journal.shutdown()).unwrap();
     }
 }
 
 #[test]
 fn owned_aborted_installation_keeps_old_promise_history_and_arena() {
     let (mut controller, io) = setup();
-    let (mut voter, _) = selected(&mut controller, io, QuorumPolicy::Durable);
+    let (mut voter, _) = selected(&mut controller, io);
     let ticket = stage_local(&mut controller, &mut voter);
     assert_eq!(
         drive(&mut controller, voter.journal.abort_installation(ticket)).unwrap(),
@@ -414,140 +401,107 @@ fn owned_aborted_installation_keeps_old_promise_history_and_arena() {
 
 #[test]
 fn owned_shutdown_aborts_unpublished_selected_history_without_activation() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        let (mut controller, io) = setup();
-        let (mut voter, _) = selected(&mut controller, io.clone(), policy);
-        let ticket = stage_local(&mut controller, &mut voter);
-        let old = voter.source;
-        drive(&mut controller, voter.journal.shutdown()).unwrap();
-        let (journal, startup) = drive(
-            &mut controller,
-            OwnedJournal::open(voter.config, io, JournalGeneration(201)),
-        )
-        .unwrap();
-        let recovered = startup.recovered().unwrap();
-        assert_eq!(recovered.scope, ticket.scope());
-        assert_eq!(recovered.log.accepted, old.accepted);
-        assert_eq!(recovered.log.last_normal_view, 0);
-        assert!(journal.images().is_err());
-        drive(&mut controller, journal.shutdown()).unwrap();
-    }
+    let (mut controller, io) = setup();
+    let (mut voter, _) = selected(&mut controller, io.clone());
+    let ticket = stage_local(&mut controller, &mut voter);
+    let old = voter.source;
+    drive(&mut controller, voter.journal.shutdown()).unwrap();
+    let (journal, startup) = drive(
+        &mut controller,
+        OwnedJournal::open(voter.config, io, JournalGeneration(201)),
+    )
+    .unwrap();
+    let recovered = startup.recovered().unwrap();
+    assert_eq!(recovered.scope, ticket.scope());
+    assert_eq!(recovered.log.accepted, old.accepted);
+    assert_eq!(recovered.log.last_normal_view, 0);
+    assert!(journal.images().is_err());
+    drive(&mut controller, journal.shutdown()).unwrap();
 }
 
 #[test]
 fn owned_recovery_parts_abort_unpublished_installation_before_reading_authority() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
+    let (mut controller, io) = setup();
+    let (mut voter, _) = selected(&mut controller, io.clone());
+    let ticket = stage_local(&mut controller, &mut voter);
+    let old = voter.source;
+    let (config, _, memory) = drive(&mut controller, voter.journal.recovery_parts()).unwrap();
+    assert_eq!(config.identity, voter.config.identity);
+    assert_eq!(config.configuration, voter.config.configuration);
+    assert!(memory.is_none());
+    assert!(!voter.journal.is_faulted());
+    let journal = voter.journal.journal.ready().unwrap();
+    assert_eq!(journal.manifest().promised_view, ticket.scope().view);
+    assert_eq!(prefix(journal.accepted_position().unwrap()), old.accepted);
+    assert_eq!(
+        journal.writer().written_position().generation(),
+        old.generation
+    );
+    assert!(voter.journal.images().is_err());
+    drive(&mut controller, voter.journal.shutdown()).unwrap();
+    let (journal, startup) = drive(
+        &mut controller,
+        OwnedJournal::open(config, io, JournalGeneration(205)),
+    )
+    .unwrap();
+    let recovered = startup.recovered().unwrap();
+    assert_eq!(recovered.scope, ticket.scope());
+    assert_eq!(recovered.log.accepted, old.accepted);
+    assert_eq!(recovered.log.last_normal_view, 0);
+    assert!(journal.images().is_err());
+    drive(&mut controller, journal.shutdown()).unwrap();
+}
+
+#[test]
+fn owned_canceled_recovery_parts_never_expose_the_unpublished_installation() {
+    for physical_completion in [false, true] {
         let (mut controller, io) = setup();
-        let (mut voter, _) = selected(&mut controller, io.clone(), policy);
+        let (mut voter, _) = selected(&mut controller, io.clone());
         let ticket = stage_local(&mut controller, &mut voter);
         let old = voter.source;
-        let (config, _, memory) = drive(&mut controller, voter.journal.recovery_parts()).unwrap();
-        assert_eq!(config.identity, voter.config.identity);
-        assert_eq!(config.configuration, voter.config.configuration);
-        assert!(memory.is_none());
-        assert!(!voter.journal.is_faulted());
-        let journal = voter.journal.journal.ready().unwrap();
-        assert_eq!(journal.manifest().promised_view, ticket.scope().view);
-        assert_eq!(prefix(journal.accepted_position().unwrap()), old.accepted);
-        assert_eq!(
-            journal.writer().written_position().generation(),
-            old.generation
-        );
+        let held = {
+            let mut work = Box::pin(voter.journal.recovery_parts());
+            assert!(poll(work.as_mut()).is_pending());
+            let held = controller.jobs()[0].0;
+            if physical_completion {
+                controller.execute(held, Effect::Normal).unwrap();
+            }
+            held
+        };
+        assert!(voter.journal.is_faulted());
         assert!(voter.journal.images().is_err());
-        drive(&mut controller, voter.journal.shutdown()).unwrap();
-        let (journal, startup) = drive(
+        assert!(matches!(
+            drive_except(
+                &mut controller,
+                voter.journal.recovery_parts(),
+                Some(held),
+                |_| Effect::Normal,
+            ),
+            Err(JournalError::Faulted)
+        ));
+        drop(voter.journal);
+        if !physical_completion {
+            controller.execute(held, Effect::Normal).unwrap();
+        }
+        controller.deliver(held).unwrap();
+        let reopened = drive(
             &mut controller,
-            OwnedJournal::open(config, io, JournalGeneration(205)),
-        )
-        .unwrap();
+            OwnedJournal::open(voter.config.clone(), io.clone(), JournalGeneration(206)),
+        );
+        let (journal, startup) = reopened.unwrap();
         let recovered = startup.recovered().unwrap();
         assert_eq!(recovered.scope, ticket.scope());
         assert_eq!(recovered.log.accepted, old.accepted);
         assert_eq!(recovered.log.last_normal_view, 0);
         assert!(journal.images().is_err());
         drive(&mut controller, journal.shutdown()).unwrap();
-    }
-}
-
-#[test]
-fn owned_canceled_recovery_parts_never_expose_the_unpublished_installation() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        for physical_completion in [false, true] {
-            let (mut controller, io) = setup();
-            let (mut voter, _) = selected(&mut controller, io.clone(), policy);
-            let ticket = stage_local(&mut controller, &mut voter);
-            let old = voter.source;
-            let held = {
-                let mut work = Box::pin(voter.journal.recovery_parts());
-                assert!(poll(work.as_mut()).is_pending());
-                let held = controller.jobs()[0].0;
-                if physical_completion {
-                    controller.execute(held, Effect::Normal).unwrap();
-                }
-                held
-            };
-            assert!(voter.journal.is_faulted());
-            assert!(voter.journal.images().is_err());
-            assert!(matches!(
-                drive_except(
-                    &mut controller,
-                    voter.journal.recovery_parts(),
-                    Some(held),
-                    |_| Effect::Normal,
-                ),
-                Err(JournalError::Faulted)
-            ));
-            drop(voter.journal);
-            if !physical_completion {
-                controller.execute(held, Effect::Normal).unwrap();
-            }
-            controller.deliver(held).unwrap();
-            let reopened = drive(
-                &mut controller,
-                OwnedJournal::open(voter.config.clone(), io.clone(), JournalGeneration(206)),
-            );
-            if policy == QuorumPolicy::Replicated {
-                // Cancellation cannot publish the clean memory-history marker.
-                assert!(matches!(
-                    reopened,
-                    Err(JournalError::Directory(
-                        ozzy_journal_segment::DirectoryError::MemoryHistoryUnproven
-                    ))
-                ));
-                let bytes = voter.config.configuration.encode();
-                let opening = drive(
-                    &mut controller,
-                    GroupJournal::prepare_open(
-                        voter.config.root,
-                        io,
-                        ozzy_journal_segment::ExpectedStore {
-                            identity: voter.config.identity,
-                            configuration: Some(&bytes),
-                        },
-                        voter.config.limits,
-                    ),
-                )
-                .unwrap();
-                assert_eq!(opening.manifest().promised_view, ticket.scope().view);
-                assert_eq!(prefix(opening.manifest().accepted), old.accepted);
-                assert_eq!(opening.manifest().last_normal_view, 0);
-                continue;
-            }
-            let (journal, startup) = reopened.unwrap();
-            let recovered = startup.recovered().unwrap();
-            assert_eq!(recovered.scope, ticket.scope());
-            assert_eq!(recovered.log.accepted, old.accepted);
-            assert_eq!(recovered.log.last_normal_view, 0);
-            assert!(journal.images().is_err());
-            drive(&mut controller, journal.shutdown()).unwrap();
-        }
     }
 }
 
 #[test]
 fn owned_canceled_installation_is_fenced_until_reopen() {
     let (mut controller, io) = setup();
-    let (mut voter, _) = selected(&mut controller, io.clone(), QuorumPolicy::Durable);
+    let (mut voter, _) = selected(&mut controller, io.clone());
     let ticket = voter
         .driver
         .begin_primary_install(JournalGeneration(101))
@@ -586,7 +540,7 @@ fn owned_canceled_installation_is_fenced_until_reopen() {
 #[test]
 fn owned_failed_selected_publication_never_exposes_canonical_images() {
     let (mut controller, io) = setup();
-    let (mut voter, _) = selected(&mut controller, io.clone(), QuorumPolicy::Durable);
+    let (mut voter, _) = selected(&mut controller, io.clone());
     let ticket = stage_local(&mut controller, &mut voter);
     let mut injected = false;
     let result = drive_except(
@@ -621,7 +575,7 @@ fn owned_failed_selected_publication_never_exposes_canonical_images() {
 #[test]
 fn owned_history_request_errors_preserve_source_and_bounded_leases() {
     let (mut controller, io) = setup();
-    let mut voter = voter(&mut controller, io, 1, 3, QuorumPolicy::Durable);
+    let mut voter = voter(&mut controller, io, 1, 3);
     let leased: Vec<_> = (0..voter.config.append_buffers)
         .map(|_| voter.journal.lease_append_buffer().unwrap())
         .collect();
@@ -673,7 +627,7 @@ fn owned_history_request_errors_preserve_source_and_bounded_leases() {
 #[test]
 fn owned_canceled_activation_does_not_grant_readiness_after_late_io() {
     let (mut controller, io) = setup();
-    let (mut primary, backup) = installed_pair(&mut controller, io.clone(), QuorumPolicy::Durable);
+    let (mut primary, backup) = installed_pair(&mut controller, io.clone());
     let ticket = primary.driver.begin_activation().unwrap();
     let held = {
         let mut future = std::pin::pin!(primary.journal.activate_installed(ticket));

@@ -690,31 +690,24 @@ async fn start(brokers: &[(CheckedConfig, BrokerIdentity, JournalPlan)], format:
 
 #[tokio::test]
 async fn shared_peer_frontend_drives_native_partition_actors_and_restart_elections() {
-    for policy in [Confirmation::DiskQuorum, Confirmation::ReplicatedPersisting] {
-        let directory = tempfile::tempdir().unwrap();
-        let brokers = fixture(directory.path(), DeploymentMode::Three, policy, 6);
-        for (checked, local, _) in &brokers {
-            storage(checked, local);
-        }
-        for format in [true, false] {
-            tokio::time::timeout(Duration::from_secs(30), start(&brokers, format, false))
-                .await
-                .unwrap_or_else(|_| {
-                    panic!("shared frontend actor integration stalled: {policy:?}, format={format}")
-                });
-        }
+    let directory = tempfile::tempdir().unwrap();
+    let brokers = fixture(directory.path(), DeploymentMode::Three, 6);
+    for (checked, local, _) in &brokers {
+        storage(checked, local);
+    }
+    for format in [true, false] {
+        tokio::time::timeout(Duration::from_secs(30), start(&brokers, format, false))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("shared frontend actor integration stalled: format={format}")
+            });
     }
 }
 
 #[tokio::test]
 async fn tcp_shared_frontend_runs_native_shards_and_restart_elections() {
     let directory = tempfile::tempdir().unwrap();
-    let brokers = fixture(
-        directory.path(),
-        DeploymentMode::Three,
-        Confirmation::DiskQuorum,
-        6,
-    );
+    let brokers = fixture(directory.path(), DeploymentMode::Three, 6);
     for (checked, local, _) in &brokers {
         storage(checked, local);
     }
@@ -728,12 +721,7 @@ async fn tcp_shared_frontend_runs_native_shards_and_restart_elections() {
 #[tokio::test]
 async fn shared_peer_startup_does_not_wait_for_unavailable_third_broker() {
     let directory = tempfile::tempdir().unwrap();
-    let brokers = fixture(
-        directory.path(),
-        DeploymentMode::Three,
-        Confirmation::DiskQuorum,
-        2,
-    );
+    let brokers = fixture(directory.path(), DeploymentMode::Three, 2);
     for (checked, local, _) in &brokers[..2] {
         storage(checked, local);
     }

@@ -3,13 +3,10 @@
 # Each host needs its own data directory; the same path on different hosts is OK.
 [cluster]
 mode = "three" # Exactly three brokers; no automatic fallback to single.
+# A record confirms once the leader and one follower sync it to disk.
 
 [topics.orders]
 partitions = 16 # Every broker stores every partition; initial leaders rotate.
-# Confirm after the leader and one follower synchronize records to disk.
-confirmation = "disk-quorum"
-# Alternative: "replicated-persisting" confirms two retained copies before disk
-# sync. Losing every volatile copy can lose the confirmed, unpersisted tail.
 
 # All broker/device/controller labels below are user-chosen.
 # Start this entry with --broker my_server_1.

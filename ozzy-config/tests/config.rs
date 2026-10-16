@@ -11,8 +11,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ozzy_config::{
-    Affinity, Confirmation, Deployment, DeploymentIdentity, DeploymentMode, HostResources,
-    IoBackend, MemoryPool, PartitionOverride, QueueBudget, Shard,
+    Affinity, Deployment, DeploymentIdentity, DeploymentMode, HostResources, IoBackend, MemoryPool,
+    PartitionOverride, QueueBudget, Shard,
 };
 use uuid::Uuid;
 
@@ -27,7 +27,6 @@ fn single() -> Deployment {
 fn three() -> Deployment {
     let mut config = single();
     config.cluster.mode = DeploymentMode::Three;
-    config.topics.get_mut("orders").unwrap().confirmation = Confirmation::DiskQuorum;
     let broker = config.brokers.remove("laptop").unwrap();
     for name in ["a", "b", "c"] {
         let mut broker = broker.clone();
@@ -332,18 +331,14 @@ fn explicit_ids_are_constraints_and_generation_must_be_unique_nonzero() {
 #[test]
 fn restart_rejects_changed_immutable_metadata_but_not_worker_settings() {
     let original = three().validate().unwrap().initialize(ids()).unwrap();
-    for change in 0..6 {
+    for change in 0..5 {
         let mut config = three();
         match change {
             0 => config.cluster.id = Some(Uuid::from_u128(9999)),
             1 => config.topics.get_mut("orders").unwrap().partitions = 17,
             2 => config.topics.get_mut("orders").unwrap().partitioner_seed = 99,
-            3 => {
-                config.topics.get_mut("orders").unwrap().confirmation =
-                    Confirmation::ReplicatedPersisting;
-            }
-            4 => config.brokers.get_mut("b").unwrap().id = Some(Uuid::from_u128(9999)),
-            5 => config.topics.get_mut("orders").unwrap().id = Some(Uuid::from_u128(9999)),
+            3 => config.brokers.get_mut("b").unwrap().id = Some(Uuid::from_u128(9999)),
+            4 => config.topics.get_mut("orders").unwrap().id = Some(Uuid::from_u128(9999)),
             _ => unreachable!(),
         }
         assert!(
@@ -417,18 +412,17 @@ fn parse_rejects_unknown_fields_including_unsupported_omq_affinity() {
 }
 
 #[test]
-fn membership_and_confirmation_policy_are_explicit() {
+fn membership_must_match_the_cluster_mode() {
     let mut config = single();
     config.cluster.mode = DeploymentMode::Three;
     assert!(config.validate().is_err());
-    for policy in [Confirmation::DiskQuorum, Confirmation::ReplicatedPersisting] {
-        let mut config = single();
-        config.topics.get_mut("orders").unwrap().confirmation = policy;
-        assert!(config.validate().is_err());
-    }
     let mut config = three();
-    config.topics.get_mut("orders").unwrap().confirmation = Confirmation::LocalDurable;
+    config.cluster.mode = DeploymentMode::Single;
     assert!(config.validate().is_err());
+    assert!(
+        Deployment::parse(&format!("{SINGLE}confirmation = \"local-durable\"\n")).is_err(),
+        "topics no longer take a confirmation key"
+    );
 }
 
 #[test]

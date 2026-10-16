@@ -333,7 +333,7 @@ impl ScheduledReplica {
     }
 
     pub(super) fn native_identity(&self) -> (NodeId, ozzy_proto::append::Policy) {
-        (self.actor.local, self.actor.configuration.append_policy())
+        (self.actor.local, ozzy_proto::append::Policy::QuorumDurable)
     }
 
     /// Current follower receive window and its leader. This is an observation,

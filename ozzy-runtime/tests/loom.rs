@@ -90,7 +90,7 @@ fn confirmed_prefix_publishes_exact_offsets_before_observation() {
 
 fn config() -> WriterConfig {
     WriterConfig {
-        policy: Policy::QuorumReplicatedPersisting,
+        policy: Policy::QuorumDurable,
         partition: ozzy_proto::PartitionIncarnation::from_bytes([1; 16]),
         owner_epoch: 1,
         producer_id: ProducerId::from_bytes([2; 16]),

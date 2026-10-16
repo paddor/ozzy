@@ -87,68 +87,54 @@ fn check(read: &ReadPartition, first: u64, count: usize) {
 
 #[test]
 fn owned_read_visibility_follows_confirmation_not_memory_or_disk_receipt() {
-    for mode in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        let (mut controller, io) = setup();
-        let mut primary = replica(&mut controller, io.clone(), 0, mode, 8192);
-        let mut backup = replica(&mut controller, io, 1, mode, 8192);
-        let initial1 = initialize_writer(&mut controller, &mut primary);
-        let initial2 = initialize_writer(&mut controller, &mut backup);
-        let receipt1 = data(&mut controller, &mut primary, 0);
-        let receipt2 = data(&mut controller, &mut backup, 0);
-        let ticket = primary.driver.begin_validation().unwrap();
-        assert!(
-            primary
-                .journal
-                .open_reader(ticket, partition(), Some(Offset::ZERO))
-                .is_err()
-        );
-        if mode == QuorumPolicy::Durable {
-            for voter in [&mut primary, &mut backup] {
-                let work = prepare(voter);
-                finish(&mut controller, voter, work);
-            }
-            settle(&mut primary, initial1);
-            settle(&mut primary, receipt1);
-            settle(&mut backup, initial2);
-            settle(&mut backup, receipt2);
-            synchronize(&mut controller, &mut primary);
-            synchronize(&mut controller, &mut backup);
-        } else {
-            drop((initial1, receipt1, initial2, receipt2));
-        }
-        confirm(&mut primary, &backup, mode);
-        let captured = capture(&primary, 0, bounds());
-        if mode == QuorumPolicy::Replicated {
-            // The read keeps admitted RAM records while writes install and
-            // the original pending entries are released.
-            for voter in [&mut primary, &mut backup] {
-                let work = prepare(voter);
-                finish(&mut controller, voter, work);
-            }
-        }
-        let mut jobs = 0;
-        let done = drive_except(&mut controller, captured.read(), None, |_| {
-            jobs += 1;
-            Effect::Normal
-        });
-        check(&primary.journal.complete_read(done).unwrap(), 0, 1);
-        assert_eq!(jobs, 0);
-        let stored = capture(&primary, 0, bounds());
-        let done = drive(&mut controller, stored.read());
-        check(&primary.journal.complete_read(done).unwrap(), 0, 1);
-        let caught_up = capture(&primary, 1, bounds());
-        let done = drive(&mut controller, caught_up.read());
-        check(&primary.journal.complete_read(done).unwrap(), 1, 0);
-        drive(&mut controller, primary.journal.shutdown()).unwrap();
-        drive(&mut controller, backup.journal.shutdown()).unwrap();
+    let (mut controller, io) = setup();
+    let mut primary = replica(&mut controller, io.clone(), 0, 8192);
+    let mut backup = replica(&mut controller, io, 1, 8192);
+    let initial1 = initialize_writer(&mut controller, &mut primary);
+    let initial2 = initialize_writer(&mut controller, &mut backup);
+    let receipt1 = data(&mut controller, &mut primary, 0);
+    let receipt2 = data(&mut controller, &mut backup, 0);
+    let ticket = primary.driver.begin_validation().unwrap();
+    assert!(
+        primary
+            .journal
+            .open_reader(ticket, partition(), Some(Offset::ZERO))
+            .is_err()
+    );
+    for voter in [&mut primary, &mut backup] {
+        let work = prepare(voter);
+        finish(&mut controller, voter, work);
     }
+    settle(&mut primary, initial1);
+    settle(&mut primary, receipt1);
+    settle(&mut backup, initial2);
+    settle(&mut backup, receipt2);
+    synchronize(&mut controller, &mut primary);
+    synchronize(&mut controller, &mut backup);
+    confirm(&mut primary, &backup);
+    let captured = capture(&primary, 0, bounds());
+    let mut jobs = 0;
+    let done = drive_except(&mut controller, captured.read(), None, |_| {
+        jobs += 1;
+        Effect::Normal
+    });
+    check(&primary.journal.complete_read(done).unwrap(), 0, 1);
+    assert_eq!(jobs, 0);
+    let stored = capture(&primary, 0, bounds());
+    let done = drive(&mut controller, stored.read());
+    check(&primary.journal.complete_read(done).unwrap(), 0, 1);
+    let caught_up = capture(&primary, 1, bounds());
+    let done = drive(&mut controller, caught_up.read());
+    check(&primary.journal.complete_read(done).unwrap(), 1, 0);
+    drive(&mut controller, primary.journal.shutdown()).unwrap();
+    drive(&mut controller, backup.journal.shutdown()).unwrap();
 }
 
 #[test]
 fn owned_read_capacity_exhaustion_is_retryable_without_fencing_the_journal() {
     let (mut controller, io) = setup();
-    let mut primary = replica(&mut controller, io.clone(), 0, QuorumPolicy::Durable, 8192);
-    let mut backup = replica(&mut controller, io, 1, QuorumPolicy::Durable, 8192);
+    let mut primary = replica(&mut controller, io.clone(), 0, 8192);
+    let mut backup = replica(&mut controller, io, 1, 8192);
     for voter in [&mut primary, &mut backup] {
         let initial = initialize_writer(&mut controller, voter);
         let receipt = data(&mut controller, voter, 0);
@@ -158,7 +144,7 @@ fn owned_read_capacity_exhaustion_is_retryable_without_fencing_the_journal() {
         settle(voter, receipt);
         synchronize(&mut controller, voter);
     }
-    confirm(&mut primary, &backup, QuorumPolicy::Durable);
+    confirm(&mut primary, &backup);
     let Some(memory) = primary.journal.append_memory.clone() else {
         panic!("fixture binds a shared payload owner")
     };
@@ -186,8 +172,8 @@ fn owned_read_leases_one_payload_arena_for_a_stored_group() {
     const RECORDS: usize = 32;
     const BYTES: usize = 64;
     let (mut controller, io) = setup();
-    let mut primary = replica(&mut controller, io.clone(), 0, QuorumPolicy::Durable, 8192);
-    let mut backup = replica(&mut controller, io, 1, QuorumPolicy::Durable, 8192);
+    let mut primary = replica(&mut controller, io.clone(), 0, 8192);
+    let mut backup = replica(&mut controller, io, 1, 8192);
     let payload = [7; BYTES];
     let body = OperationBody::Append(Append {
         batches: vec![AppendBatch {
@@ -222,7 +208,7 @@ fn owned_read_leases_one_payload_arena_for_a_stored_group() {
         settle(voter, receipt);
         synchronize(&mut controller, voter);
     }
-    confirm(&mut primary, &backup, QuorumPolicy::Durable);
+    confirm(&mut primary, &backup);
     let Some(memory) = primary.journal.append_memory.clone() else {
         panic!("fixture binds a shared payload owner")
     };
@@ -251,21 +237,18 @@ fn owned_read_leases_one_payload_arena_for_a_stored_group() {
 #[test]
 fn owned_detached_read_survives_roll_and_enforces_output_bounds() {
     let (mut controller, io) = setup();
-    let mut primary = replica(
-        &mut controller,
-        io.clone(),
-        0,
-        QuorumPolicy::Replicated,
-        8192,
-    );
-    let mut backup = replica(&mut controller, io, 1, QuorumPolicy::Replicated, 8192);
+    let mut primary = replica(&mut controller, io.clone(), 0, 8192);
+    let mut backup = replica(&mut controller, io, 1, 8192);
     for voter in [&mut primary, &mut backup] {
-        drop(initialize_writer(&mut controller, voter));
-        drop(data(&mut controller, voter, 0));
+        let initial = initialize_writer(&mut controller, voter);
+        let receipt = data(&mut controller, voter, 0);
         let work = prepare(voter);
         finish(&mut controller, voter, work);
+        settle(voter, initial);
+        settle(voter, receipt);
+        synchronize(&mut controller, voter);
     }
-    confirm(&mut primary, &backup, QuorumPolicy::Replicated);
+    confirm(&mut primary, &backup);
     let captured = capture(&primary, 0, bounds());
     let roll = primary.journal.begin_roll(16).unwrap();
     let roll = drive(&mut controller, roll.publish());

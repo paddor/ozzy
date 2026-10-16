@@ -235,13 +235,7 @@ fn validate_open(open: Open) -> Result<(), CodecError> {
 
 fn validate_opened(opened: Opened) -> Result<(), CodecError> {
     validate_common(opened.authority, opened.partition, opened.producer)?;
-    if opened.epoch == 0
-        || opened.retry_floor > opened.next_sequence
-        || !matches!(
-            opened.policy,
-            Policy::LocalDurable | Policy::QuorumDurable | Policy::QuorumReplicatedPersisting
-        )
-    {
+    if opened.epoch == 0 || opened.retry_floor > opened.next_sequence {
         return Err(CodecError::Profile);
     }
     Ok(())

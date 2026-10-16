@@ -66,7 +66,7 @@ fn appended_wire_identifies_exact_offsets_policy_and_log_position() {
     assert_eq!(metadata.len(), 178);
     assert_eq!(&metadata[89..97], &9_u64.to_be_bytes());
     assert_eq!(&metadata[97..101], &2_u32.to_be_bytes());
-    assert_eq!(metadata[101], 5);
+    assert_eq!(metadata[101], 2);
     assert_eq!(&metadata[102..110], &11_u64.to_be_bytes());
     assert_eq!(&metadata[110..142], &[12; 32]);
     assert_eq!(&metadata[142..146], &2_u32.to_be_bytes());
@@ -128,7 +128,7 @@ fn append_wire_preserves_multipart_identity_without_assigned_offsets() {
     expected.extend_from_slice(&[6; 16]);
     expected.extend_from_slice(&4_u64.to_be_bytes());
     expected.extend_from_slice(&5_u64.to_be_bytes());
-    expected.push(5);
+    expected.push(2);
     expected.push(0);
     expected.extend_from_slice(&4_u32.to_be_bytes());
     expected.extend_from_slice(&1_u32.to_be_bytes());
@@ -177,7 +177,7 @@ fn append_metadata_reuses_owned_payload_without_changing_wire_or_capacity() {
             producer_epoch: 4,
             first_sequence: 5,
         },
-        policy: Policy::QuorumReplicatedPersisting,
+        policy: Policy::QuorumDurable,
         records: &records,
     };
     let limits = DataLimits::default();

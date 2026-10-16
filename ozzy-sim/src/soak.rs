@@ -1,7 +1,7 @@
 //! Seeded, bounded workloads over production SDKs, OMQ inproc and memory storage.
 
 use crate::{broker::Cluster, client::Client};
-use ozzy_config::Confirmation;
+use ozzy_config::DeploymentMode;
 use ozzy_runtime::replicated::{SdkClock, TopicReader};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -71,8 +71,8 @@ pub enum Action {
 /// Controls for a sustained cluster, including an overnight wall-clock duration.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Explicit confirmation boundary.
-    pub policy: Confirmation,
+    /// Single durable broker or disk-quorum group.
+    pub mode: DeploymentMode,
     /// Workload and fault generator seed.
     pub seed: u64,
     /// Stop generating work after this wall-clock duration.
@@ -158,7 +158,7 @@ impl Report {
             "{}",
             serde_json::json!({
                 "event": "progress", "seed": config.seed,
-                "mode": format!("{:?}", config.policy),
+                "mode": format!("{:?}", config.mode),
                 "elapsed_secs": elapsed.as_secs(),
                 "waves": self.waves, "verified_records": self.records,
                 "resumes": self.resumes, "takeovers": self.takeovers,
@@ -247,7 +247,7 @@ impl<'a> Run<'a> {
             .transpose()
             .map_err(|error| error.to_string())?;
         let cluster = Cluster::configured(
-            config.policy,
+            config.mode,
             config.time.duration.map(|_| clock.clone()),
             |deployment| config.resources.configure(deployment),
         )
@@ -384,7 +384,7 @@ impl<'a> Run<'a> {
         let config = self.config;
         let cluster = &self.cluster;
         let evidence = serde_json::json!({
-            "seed": config.seed, "mode": format!("{:?}", config.policy),
+            "seed": config.seed, "mode": format!("{:?}", config.mode),
             "error": error, "events": self.recent, "coverage": self.report,
             "time": config.time, "resources": config.resources, "fault_mix": config.actions,
             "record_evidence": self.client.as_ref().map(Client::evidence),
@@ -425,7 +425,7 @@ fn draw(random: &mut u64) -> u64 {
 
 fn save_config(config: &Config) -> Result<(), String> {
     let evidence = serde_json::json!({
-        "seed": config.seed, "mode": format!("{:?}", config.policy),
+        "seed": config.seed, "mode": format!("{:?}", config.mode),
         "wall_duration": config.duration, "waves": config.waves,
         "interval": config.interval, "progress_timeout": config.progress_timeout,
         "replay": config.replay, "time": config.time, "resources": config.resources,

@@ -71,8 +71,8 @@ impl OwnedJournal {
         })
     }
 
-    /// Capture committed records without file access. Accepted RAM-only records
-    /// are readable only after the configured group policy has confirmed them.
+    /// Capture committed records without file access. Accepted records are
+    /// readable only after the configured group policy has confirmed them.
     pub fn prepare_read(
         &self,
         mut cursor: PartitionReadCursor,

@@ -48,13 +48,8 @@ pub(super) struct Work {
     // Written work not yet captured by a submitted barrier. An older captured
     // barrier may still be executing independently of this next batch.
     pub(super) needs_sync: bool,
-    // Bound rejected/stale validations too: they do not fill accepted capacity.
-    sync_batch_attempts: usize,
     sync_batch_operations: usize,
     sync_batch_body_bytes: usize,
-    // Starts at admission, not completion: slow writes/rolls consume this age.
-    // Retained across a view fence until the old admitted I/O is synchronized.
-    sync_batch_started: Option<Duration>,
     // When the last disk-quorum write completed.
     last_persisted: Option<Duration>,
     // Body bytes of each queued write, in the order of `pending_persistence`.
@@ -72,13 +67,6 @@ pub(super) struct Work {
 }
 
 impl Work {
-    /// When an unsynced batch reaches its maximum age.
-    pub(super) fn sync_deadline(&self, max_age: Duration) -> Option<Duration> {
-        self.sync_batch_started
-            .filter(|_| self.needs_sync)
-            .map(|started| started.saturating_add(max_age))
-    }
-
     pub(super) fn new(
         config: &ActorConfig,
         channel: ozzy_replication::flow::Channel,
@@ -93,10 +81,8 @@ impl Work {
             ready: None,
             window_full: false,
             needs_sync: false,
-            sync_batch_attempts: 0,
             sync_batch_operations: 0,
             sync_batch_body_bytes: 0,
-            sync_batch_started: None,
             last_persisted: None,
             persisting_bytes: VecDeque::with_capacity(capacity),
             cursors: [None; 3],
@@ -117,7 +103,6 @@ impl Work {
         self.scope = scope;
         self.cursors = [None; 3];
         self.announced = [None; 3];
-        self.sync_batch_attempts = 0;
         self.deferred_commit = None;
         self.receive.reset();
         self.recent.clear();
@@ -308,10 +293,8 @@ impl ReplicaActor {
             self.pending = Some(PendingIo::Sync(self.journal.sync(ticket)?));
         }
         self.work.needs_sync = false;
-        self.work.sync_batch_attempts = 0;
         self.work.sync_batch_operations = 0;
         self.work.sync_batch_body_bytes = 0;
-        self.work.sync_batch_started = None;
         Ok(())
     }
 
@@ -322,7 +305,7 @@ impl ReplicaActor {
         if snapshot.applied != snapshot.committed {
             return self.schedule_apply(primary, now);
         }
-        if self.sync_due(primary, now) {
+        if self.sync_due(now) {
             if self.pending_sync.is_none() {
                 self.schedule_sync()?;
                 // The captured group can sync while another group fills. Keep
@@ -353,13 +336,8 @@ impl ReplicaActor {
             })?;
             return Ok(());
         }
-        if self.work.needs_sync {
-            // An idle replicated-persisting queue syncs at once. Disk quorum
-            // publishes evidence only through `sync_due`.
-            if self.replicated() && self.pending_sync.is_none() {
-                self.schedule_sync()?;
-            }
-        } else {
+        // Pending `DURABLE` evidence publishes only through `sync_due`.
+        if !self.work.needs_sync {
             self.schedule_donor(true)?;
         }
         if self.work.proposals.is_idle() {
@@ -374,12 +352,11 @@ impl ReplicaActor {
         let ticket = self.driver.begin_validation()?;
         // Confirmed identity time must be applied before bounded expiry can
         // make room for a following canonical batch on a full follower.
-        let validate =
-            if !primary && !self.sync_due(primary, now) && !self.journal.deduplication_enabled() {
-                self.take_received()?
-            } else {
-                None
-            };
+        let validate = if !primary && !self.sync_due(now) && !self.journal.deduplication_enabled() {
+            self.take_received()?
+        } else {
+            None
+        };
         if validate.is_some() {
             return self.submit_turn(crate::replica_journal::Turn {
                 validate,
@@ -391,36 +368,26 @@ impl ReplicaActor {
         Ok(())
     }
 
-    fn sync_due(&self, primary: bool, now: Duration) -> bool {
+    fn sync_due(&self, now: Duration) -> bool {
         let target = self.config.sync_batch_target;
         let full = self.work.sync_batch_operations >= target.operations
             || self.work.sync_batch_body_bytes >= target.body_bytes;
-        if !self.replicated() {
-            // `DURABLE` is recovery evidence, never a vote. It waits for a
-            // quiet moment, a filled batch, or due maintenance.
-            let idle = self.pending_persistence.is_empty();
-            return self.work.needs_sync
-                && (full
-                    || self.evidence_deadline().is_some_and(|at| now >= at)
-                    || (idle && self.maintenance.due(now)));
-        }
+        // `DURABLE` is recovery evidence, never a vote. It waits for a quiet
+        // moment, a filled batch, or due maintenance.
+        let idle = self.pending_persistence.is_empty();
         self.work.needs_sync
             && (full
-                || (primary && self.work.sync_batch_attempts >= target.operations)
-                || self.work.sync_batch_started.is_some_and(|started| {
-                    now.saturating_sub(started) >= self.config.sync_batch_max_age
-                }))
+                || self.evidence_deadline().is_some_and(|at| now >= at)
+                || (idle && self.maintenance.due(now)))
     }
 
     /// When disk-quorum `DURABLE` evidence comes due with no write in flight.
     pub(super) fn evidence_deadline(&self) -> Option<Duration> {
-        (!self.replicated() && self.work.needs_sync && self.pending_persistence.is_empty()).then(
-            || {
-                self.work.last_persisted.map_or(Duration::ZERO, |at| {
-                    at.saturating_add(self.config.evidence_quiet)
-                })
-            },
-        )
+        (self.work.needs_sync && self.pending_persistence.is_empty()).then(|| {
+            self.work.last_persisted.map_or(Duration::ZERO, |at| {
+                at.saturating_add(self.config.evidence_quiet)
+            })
+        })
     }
 
     /// Take the waiting or next queued proposal when the live window has room,
@@ -470,10 +437,6 @@ impl ReplicaActor {
             return Ok(None);
         };
         let ticket = self.driver.begin_validation()?;
-        if !self.work.needs_sync {
-            self.work.sync_batch_attempts = 0;
-        }
-        self.work.sync_batch_attempts += 1;
         Ok(Some((ticket, buffer)))
     }
 

@@ -66,22 +66,20 @@ fn cluster(
     controller: &mut Controller,
     io: &Local,
     group: u8,
-    policy: QuorumPolicy,
 ) -> (Vec<Scheduled>, PendingProposal) {
-    cluster_with_operation_count(controller, io, group, policy, 1)
+    cluster_with_operation_count(controller, io, group, 1)
 }
 
 fn cluster_with_operation_count(
     controller: &mut Controller,
     io: &Local,
     group: u8,
-    policy: QuorumPolicy,
     operations: u8,
 ) -> (Vec<Scheduled>, PendingProposal) {
     let mut actors = Vec::new();
     let mut pending = None;
     for broker in 0..3 {
-        let mut actor = unstarted_actor(controller, io, group, policy, broker, 64);
+        let mut actor = unstarted_actor(controller, io, group, broker, 64);
         if broker == group % 3 {
             let mut buffer = actor.lease_proposal_buffer().unwrap();
             for operation in 0..operations {
@@ -140,93 +138,91 @@ fn collect(actors: &mut [Scheduled], now: Duration, blocked: bool) -> Vec<(usize
 
 #[test]
 fn session_replacement_fences_stale_frames_and_repairs_outstanding_proposals() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        let (mut controller, io) = setup();
-        let (mut actors, pending) = cluster(&mut controller, &io, 0, policy);
-        let mut pending = Box::pin(pending);
-        let mut stale = None;
-        for _ in 0..1000 {
-            for (to, message) in collect(&mut actors, Duration::ZERO, false) {
-                if opcode(&message) == ozzy_proto::Opcode::PrepareFlow {
-                    if to == 1 {
-                        stale = Some(message);
-                    }
-                } else {
-                    actors[to].receive(&message, Duration::ZERO).unwrap();
+    let (mut controller, io) = setup();
+    let (mut actors, pending) = cluster(&mut controller, &io, 0);
+    let mut pending = Box::pin(pending);
+    let mut stale = None;
+    for _ in 0..1000 {
+        for (to, message) in collect(&mut actors, Duration::ZERO, false) {
+            if opcode(&message) == ozzy_proto::Opcode::PrepareFlow {
+                if to == 1 {
+                    stale = Some(message);
                 }
-            }
-            settle(&mut controller, &[]);
-            if stale.is_some() {
-                break;
-            }
-        }
-        let stale = stale.expect("proposal must reach transport before reconnect");
-        assert!(poll(pending.as_mut()).is_pending());
-        let old = LinkSessionId::from_bytes([61; 16]);
-        let new = LinkSessionId::from_bytes([99; 16]);
-        let before = actors[0].status();
-        for (actor, peer) in [(0, 1), (1, 0)] {
-            let peer = NodeId::from_bytes([peer + 1; 16]);
-            assert!(
-                actors[actor]
-                    .replace_session(peer, old, new, Duration::ZERO)
-                    .unwrap()
-            );
-            assert!(
-                !actors[actor]
-                    .replace_session(peer, old, new, Duration::ZERO)
-                    .unwrap()
-            );
-            assert!(matches!(
-                actors[actor].replace_session(peer, old, old, Duration::ZERO),
-                Err(ScheduleError::Binding)
-            ));
-        }
-        assert_eq!(actors[0].status().scope, before.scope);
-        assert_eq!(actors[0].status().normal, before.normal);
-        actors[1].receive(&stale, Duration::ZERO).unwrap();
-        drain_stale(&mut controller, &mut actors[1]);
-        assert_eq!(actors[1].status().normal.unwrap().accepted, Prefix::GENESIS);
-        let mut repaired = false;
-        let mut confirmed = false;
-        for _ in 0..10000 {
-            for (to, message) in collect(&mut actors, Duration::ZERO, false) {
-                let from = usize::from(message.part_slice(0).unwrap()[0] - 1);
-                let expected = if (from, to) == (0, 1) || (from, to) == (1, 0) {
-                    new
-                } else {
-                    old
-                };
-                if message.len() == 4 {
-                    assert_eq!(envelope(&message).session, Some(expected));
-                }
-                if opcode(&message) == ozzy_proto::Opcode::PrepareFlow {
-                    if to == 2 {
-                        continue;
-                    } // No copy through the other follower.
-                    assert_eq!(envelope(&message).session, Some(new));
-                    repaired = true;
-                }
+            } else {
                 actors[to].receive(&message, Duration::ZERO).unwrap();
             }
-            settle(&mut controller, &[]);
-            if let Poll::Ready(result) = poll(pending.as_mut()) {
-                assert!(matches!(
-                    result.unwrap().outcome,
-                    ProposalOutcome::Committed { .. }
-                ));
-                confirmed = true;
-                break;
-            }
         }
+        settle(&mut controller, &[]);
+        if stale.is_some() {
+            break;
+        }
+    }
+    let stale = stale.expect("proposal must reach transport before reconnect");
+    assert!(poll(pending.as_mut()).is_pending());
+    let old = LinkSessionId::from_bytes([61; 16]);
+    let new = LinkSessionId::from_bytes([99; 16]);
+    let before = actors[0].status();
+    for (actor, peer) in [(0, 1), (1, 0)] {
+        let peer = NodeId::from_bytes([peer + 1; 16]);
         assert!(
-            repaired && confirmed,
-            "new session failed to repair and confirm"
+            actors[actor]
+                .replace_session(peer, old, new, Duration::ZERO)
+                .unwrap()
         );
-        assert_eq!(actors[0].status().scope, before.scope);
-        for actor in actors {
-            close(&mut controller, actor);
+        assert!(
+            !actors[actor]
+                .replace_session(peer, old, new, Duration::ZERO)
+                .unwrap()
+        );
+        assert!(matches!(
+            actors[actor].replace_session(peer, old, old, Duration::ZERO),
+            Err(ScheduleError::Binding)
+        ));
+    }
+    assert_eq!(actors[0].status().scope, before.scope);
+    assert_eq!(actors[0].status().normal, before.normal);
+    actors[1].receive(&stale, Duration::ZERO).unwrap();
+    drain_stale(&mut controller, &mut actors[1]);
+    assert_eq!(actors[1].status().normal.unwrap().accepted, Prefix::GENESIS);
+    let mut repaired = false;
+    let mut confirmed = false;
+    for _ in 0..10000 {
+        for (to, message) in collect(&mut actors, Duration::ZERO, false) {
+            let from = usize::from(message.part_slice(0).unwrap()[0] - 1);
+            let expected = if (from, to) == (0, 1) || (from, to) == (1, 0) {
+                new
+            } else {
+                old
+            };
+            if message.len() == 4 {
+                assert_eq!(envelope(&message).session, Some(expected));
+            }
+            if opcode(&message) == ozzy_proto::Opcode::PrepareFlow {
+                if to == 2 {
+                    continue;
+                } // No copy through the other follower.
+                assert_eq!(envelope(&message).session, Some(new));
+                repaired = true;
+            }
+            actors[to].receive(&message, Duration::ZERO).unwrap();
         }
+        settle(&mut controller, &[]);
+        if let Poll::Ready(result) = poll(pending.as_mut()) {
+            assert!(matches!(
+                result.unwrap().outcome,
+                ProposalOutcome::Committed { .. }
+            ));
+            confirmed = true;
+            break;
+        }
+    }
+    assert!(
+        repaired && confirmed,
+        "new session failed to repair and confirm"
+    );
+    assert_eq!(actors[0].status().scope, before.scope);
+    for actor in actors {
+        close(&mut controller, actor);
     }
 }
 
@@ -284,78 +280,74 @@ pub(super) fn close(controller: &mut Controller, actor: Scheduled) {
 
 #[test]
 fn shared_scheduler_preserves_other_groups_under_stalled_storage_and_full_transport() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        let (mut controller, io) = setup();
-        let (mut blocked, first) = cluster(&mut controller, &io, 0, policy);
-        let (mut middle, second) = cluster(&mut controller, &io, 1, policy);
-        let (mut last, third) = cluster(&mut controller, &io, 2, policy);
-        let mut first = Box::pin(first);
-        let mut second = Box::pin(second);
-        let mut third = Box::pin(third);
-        // Reach a real write for the first partition before holding its jobs.
-        for _ in 0..1000 {
-            round(&mut blocked, false);
-            if controller.jobs().iter().any(|(id, _)| {
-                matches!(
-                    controller.operation(*id).unwrap().unprotected(),
-                    Operation::Write { .. }
-                )
-            }) {
-                break;
-            }
-            settle(&mut controller, &[]);
+    let (mut controller, io) = setup();
+    let (mut blocked, first) = cluster(&mut controller, &io, 0);
+    let (mut middle, second) = cluster(&mut controller, &io, 1);
+    let (mut last, third) = cluster(&mut controller, &io, 2);
+    let mut first = Box::pin(first);
+    let mut second = Box::pin(second);
+    let mut third = Box::pin(third);
+    // Reach a real write for the first partition before holding its jobs.
+    for _ in 0..1000 {
+        round(&mut blocked, false);
+        if controller.jobs().iter().any(|(id, _)| {
+            matches!(
+                controller.operation(*id).unwrap().unprotected(),
+                Operation::Write { .. }
+            )
+        }) {
+            break;
         }
-        let held: Vec<_> = controller.jobs().into_iter().map(|(id, _)| id).collect();
-        assert!(!held.is_empty(), "stalled partition must own file work");
-        let mut confirmed = [false; 2];
-        for _ in 0..10000 {
-            round(&mut blocked, true);
-            round(&mut middle, false);
-            round(&mut last, false);
-            settle(&mut controller, &held);
-            for (done, reply) in confirmed.iter_mut().zip([&mut second, &mut third]) {
-                if !*done && let Poll::Ready(result) = poll(reply.as_mut()) {
-                    assert!(matches!(
-                        result.unwrap().outcome,
-                        ProposalOutcome::Committed { .. }
-                    ));
-                    *done = true;
-                }
-            }
-            if confirmed == [true; 2] {
-                break;
-            }
-        }
-        assert_eq!(confirmed, [true; 2], "unrelated partition lost progress");
-        assert!(held.iter().all(|id| controller.operation(*id).is_some()));
-        if policy == QuorumPolicy::Durable {
-            assert!(poll(first.as_mut()).is_pending());
-        }
-        // Release both forms of backpressure and finish the original request.
-        let mut confirmed = false;
-        for _ in 0..10000 {
-            round(&mut blocked, false);
-            settle(&mut controller, &[]);
-            if let Poll::Ready(result) = poll(first.as_mut()) {
+        settle(&mut controller, &[]);
+    }
+    let held: Vec<_> = controller.jobs().into_iter().map(|(id, _)| id).collect();
+    assert!(!held.is_empty(), "stalled partition must own file work");
+    let mut confirmed = [false; 2];
+    for _ in 0..10000 {
+        round(&mut blocked, true);
+        round(&mut middle, false);
+        round(&mut last, false);
+        settle(&mut controller, &held);
+        for (done, reply) in confirmed.iter_mut().zip([&mut second, &mut third]) {
+            if !*done && let Poll::Ready(result) = poll(reply.as_mut()) {
                 assert!(matches!(
                     result.unwrap().outcome,
                     ProposalOutcome::Committed { .. }
                 ));
-                confirmed = true;
-                break;
+                *done = true;
             }
         }
-        assert!(confirmed);
-        for actor in blocked.into_iter().chain(middle).chain(last) {
-            close(&mut controller, actor);
+        if confirmed == [true; 2] {
+            break;
         }
+    }
+    assert_eq!(confirmed, [true; 2], "unrelated partition lost progress");
+    assert!(held.iter().all(|id| controller.operation(*id).is_some()));
+    assert!(poll(first.as_mut()).is_pending());
+    // Release both forms of backpressure and finish the original request.
+    let mut confirmed = false;
+    for _ in 0..10000 {
+        round(&mut blocked, false);
+        settle(&mut controller, &[]);
+        if let Poll::Ready(result) = poll(first.as_mut()) {
+            assert!(matches!(
+                result.unwrap().outcome,
+                ProposalOutcome::Committed { .. }
+            ));
+            confirmed = true;
+            break;
+        }
+    }
+    assert!(confirmed);
+    for actor in blocked.into_iter().chain(middle).chain(last) {
+        close(&mut controller, actor);
     }
 }
 
 #[test]
 fn external_scheduler_rejects_reversed_time_without_changing_observed_authority() {
     let (mut controller, io) = setup();
-    let actor = unstarted_actor(&mut controller, &io, 1, QuorumPolicy::Durable, 0, 64);
+    let actor = unstarted_actor(&mut controller, &io, 1, 0, 64);
     let mut actor = Scheduled::new(actor).unwrap();
     let now = Duration::from_millis(5);
     actor.advance(now).unwrap();
@@ -383,7 +375,7 @@ fn scheduled_idle_wait_wakes_for_intake_and_cancellation_cannot_lose_it() {
     }
     for cancel in [false, true] {
         let (mut controller, io) = setup();
-        let mut actor = unstarted_actor(&mut controller, &io, 0, QuorumPolicy::Durable, 0, 64);
+        let mut actor = unstarted_actor(&mut controller, &io, 0, 0, 64);
         let mut lane = actor.take_submitter().unwrap();
         let mut buffer = actor.lease_proposal_buffer().unwrap();
         buffer

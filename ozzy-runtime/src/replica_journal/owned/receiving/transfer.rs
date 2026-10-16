@@ -1,7 +1,7 @@
 use super::{
-    AppendBuffer, GroupJournal, JournalError, PublishedRecovery, QuorumPolicy, RecoveringJournal,
-    RecoveryError, RecoveryPlan, RecoveryTicket, SealedRepair, State, SuffixInstaller,
-    SuffixStreamLimits, recover_nonvoting,
+    AppendBuffer, GroupJournal, JournalError, PublishedRecovery, RecoveringJournal, RecoveryError,
+    RecoveryPlan, RecoveryTicket, SealedRepair, State, SuffixInstaller, SuffixStreamLimits,
+    recover_nonvoting,
 };
 use crate::replica_journal::owned::{install::stage_chunks, prefix};
 use crate::replica_journal::{InstallationConfig, ReceivedChunk, authority, authority::position};
@@ -214,14 +214,11 @@ impl RecoveringJournal {
             self.faulted = false;
             return Ok(published);
         }
-        let (mut journal, published) = match self.take_state() {
+        let (journal, published) = match self.take_state() {
             State::Repair(repair) => self.finish_repair(repair, &ticket).await?,
             State::Installing(staging) => Box::pin(self.finish_transfer(staging, &ticket)).await?,
             _ => return Err(RecoveryError::StaleTransfer.into()),
         };
-        if self.config.configuration.configuration().policy() == QuorumPolicy::Replicated {
-            journal.publish_drained_memory_history().await?;
-        }
         self.state = State::Journal(Box::new(journal));
         self.published = Some(published);
         self.faulted = false;

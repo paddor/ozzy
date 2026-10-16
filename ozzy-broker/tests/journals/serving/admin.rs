@@ -96,17 +96,11 @@ async fn admin_endpoint_reports_broker_counters_partitions_and_links() {
     tokio::time::timeout(Duration::from_secs(30), async {
         let root = std::path::PathBuf::from(format!("/ozzy-simulation-{}", Uuid::now_v7()));
         let runtime = WriterRuntime::new().unwrap();
-        let deployment = deployment_with(
-            &root,
-            DeploymentMode::Three,
-            Confirmation::DiskQuorum,
-            4,
-            |config| {
-                for (name, broker) in &mut config.brokers {
-                    broker.endpoints.admin = Some(format!("inproc://admin-test-{name}"));
-                }
-            },
-        );
+        let deployment = deployment_with(&root, DeploymentMode::Three, 4, |config| {
+            for (name, broker) in &mut config.brokers {
+                broker.endpoints.admin = Some(format!("inproc://admin-test-{name}"));
+            }
+        });
         let shards = deployment
             .iter()
             .map(|(checked, _)| (checked.plan.name.clone(), checked.plan.shards.len() as u32))

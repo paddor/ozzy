@@ -13,7 +13,7 @@ pub(super) struct Fleet {
     cpus: Vec<usize>,
     logs: PathBuf,
     next_kill: Duration,
-    stopped: Option<(usize, Duration, bool)>,
+    stopped: Option<(usize, Duration)>,
     memory: bool,
 }
 
@@ -81,8 +81,8 @@ impl Fleet {
         let identity = std::env::var_os("OZZY_SOAK_IDENTITY")
             .map_or_else(|| directories[0].join("shared.identity"), PathBuf::from);
         let checked = checked(&config, &identity, NAMES[0]);
-        let count = if checked.deployment.deployment().topics["orders"].confirmation
-            == ozzy_config::Confirmation::LocalDurable
+        let count = if checked.deployment.deployment().cluster.mode
+            == ozzy_config::DeploymentMode::Single
         {
             1
         } else {
@@ -173,12 +173,10 @@ impl Fleet {
     }
 
     pub(super) async fn churn(&mut self, elapsed: Duration) {
-        let policy = self.checked.deployment.deployment().topics["orders"].confirmation;
-        if let Some((index, deadline, unclean)) = self.stopped {
+        let mode = self.checked.deployment.deployment().cluster.mode;
+        if let Some((index, deadline)) = self.stopped {
             if elapsed >= deadline {
-                let recovering = self.memory
-                    || (unclean && policy == ozzy_config::Confirmation::ReplicatedPersisting);
-                self.brokers[index] = Some(self.start_one(index, recovering).await);
+                self.brokers[index] = Some(self.start_one(index, self.memory).await);
                 self.stopped = None;
             }
         } else if elapsed >= self.next_kill {
@@ -193,12 +191,12 @@ impl Fleet {
                 self.hosts[index],
                 elapsed.as_secs()
             );
-            if policy == ozzy_config::Confirmation::LocalDurable {
+            if mode == ozzy_config::DeploymentMode::Single {
                 // No alternate copy exists. Resume the one broker before
                 // awaiting SDK progress; its durable store is authoritative.
                 self.brokers[index] = Some(self.start_one(index, false).await);
             } else {
-                self.stopped = Some((index, elapsed + Duration::from_secs(10), unclean));
+                self.stopped = Some((index, elapsed + Duration::from_secs(10)));
             }
             self.next_kill = elapsed + Duration::from_secs(90);
         }

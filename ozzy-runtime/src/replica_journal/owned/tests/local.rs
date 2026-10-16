@@ -27,7 +27,7 @@ mod progress;
 mod retention;
 
 fn local_config() -> OwnedConfig<Configuration> {
-    let base = config("/local", 7, QuorumPolicy::Durable);
+    let base = config("/local", 7);
     OwnedConfig {
         configuration: Configuration::new(
             base.identity.group_id,
@@ -296,7 +296,7 @@ fn local_power_loss_restart_preserves_shared_writer_offsets_and_exact_retries() 
 #[test]
 fn local_open_rejects_group_configuration_and_changed_identity() {
     let (mut controller, io) = setup();
-    let base = config("/local", 7, QuorumPolicy::Durable);
+    let base = config("/local", 7);
     let (journal, _) = drive(
         &mut controller,
         OwnedJournal::format_new(base, io.clone(), JournalGeneration(1), 32768),

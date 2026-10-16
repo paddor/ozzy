@@ -9,7 +9,7 @@ use ozzy_proto::NodeId;
 
 use crate::{
     Configuration, JournalGeneration, OpNumber, PipelineLimits, Prefix, PreparedOperation,
-    QuorumPolicy, ReplicationError, Scope, SyncTicket, VoterIndex, Voters, WriteTicket,
+    ReplicationError, Scope, SyncTicket, VoterIndex, Voters, WriteTicket,
 };
 
 /// Whether the normal protocol may emit votes, commit, or apply.
@@ -256,14 +256,10 @@ impl NormalReplica {
         self.reclaim()
     }
 
-    /// Local prefix available for replay and releasing applied live capacity.
-    /// RAM-confirmed groups may use completed page-cache writes; disk groups
-    /// require synchronized writes. Neither boundary alone establishes a quorum.
+    /// Local synchronized prefix available for replay and releasing applied
+    /// live capacity. It alone never establishes a quorum.
     pub fn stored_through(&self) -> OpNumber {
-        match self.configuration.policy() {
-            QuorumPolicy::Durable => self.journal.snapshot().durable,
-            QuorumPolicy::Replicated => self.journal.snapshot().written,
-        }
+        self.journal.snapshot().durable
     }
 
     /// Capture the complete written prefix before submitting a disk barrier.
@@ -423,10 +419,7 @@ impl NormalReplica {
         if self.status != Status::Normal {
             return Ok(());
         }
-        let available = match self.configuration.policy() {
-            QuorumPolicy::Durable => self.journal.snapshot().durable,
-            QuorumPolicy::Replicated => self.accepted.op,
-        };
+        let available = self.journal.snapshot().durable;
         let eligible = if self.is_primary() {
             // Own matching evidence AND either distinct backup's matching evidence.
             available.min(self.backup_acknowledged())

@@ -397,8 +397,7 @@ fn canceled_publication_fences_owner_and_keeps_group_locked_until_physical_work_
     )
     .unwrap();
     let pending = {
-        let mut future =
-            std::pin::pin!(directory.replace("MEMORY_VOTING", ".MEMORY_VOTING.tmp", b"state"));
+        let mut future = std::pin::pin!(directory.replace("STATE", ".STATE.tmp", b"state"));
         assert!(poll(future.as_mut()).is_pending());
         controller.jobs()[0].0
     };

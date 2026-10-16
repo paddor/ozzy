@@ -84,7 +84,7 @@ impl ReplicaActor {
         {
             return Ok(true);
         }
-        // Buffered normal writes are not durable election evidence. After the
+        // Unsynchronized writes are not durable election evidence. After the
         // background lane drains, synchronize the old view before its promise.
         if (self.driver.election_needs_sync() && self.pending_sync.is_none())
             || (self.work.needs_sync && self.driver.normal().is_none())

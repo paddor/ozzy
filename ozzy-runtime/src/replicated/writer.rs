@@ -97,10 +97,8 @@ impl WriterConfig {
 
     fn parameters_with_local_group(&self, local_group: bool) -> Result<Parameters, WriterError> {
         let target_valid = self.partition.as_bytes() != &[0; 16]
-            && (matches!(
-                self.policy,
-                Policy::QuorumDurable | Policy::QuorumReplicatedPersisting
-            ) || local_group && self.policy == Policy::LocalDurable);
+            && (self.policy == Policy::QuorumDurable
+                || local_group && self.policy == Policy::LocalDurable);
         if !target_valid
             || self.producer_id.as_bytes() == &[0; 16]
             || self.owner_epoch == 0

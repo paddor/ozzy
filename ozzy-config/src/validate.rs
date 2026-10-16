@@ -5,7 +5,7 @@ use std::path::Path;
 use uuid::Uuid;
 
 use crate::{
-    Broker, ConfigError, Confirmation, Deployment, DeploymentMode, QueueBudget, Shard, invalid,
+    Broker, ConfigError, Deployment, DeploymentMode, QueueBudget, Shard, invalid,
     schema::{MAX_APPEND_BYTES, MAX_CLIENTS},
 };
 
@@ -216,18 +216,6 @@ fn validate_topics(config: &Deployment, ids: &mut BTreeSet<Uuid>) -> Result<(), 
             topic.partitions > 0 && partitions <= config.limits.max_partitions,
             &path,
             "partition count must be nonzero and fit aggregate max_partitions",
-        )?;
-        require(
-            matches!(
-                (config.cluster.mode, topic.confirmation),
-                (DeploymentMode::Single, Confirmation::LocalDurable)
-                    | (
-                        DeploymentMode::Three,
-                        Confirmation::DiskQuorum | Confirmation::ReplicatedPersisting
-                    )
-            ),
-            &path,
-            "confirmation policy is incompatible with deployment mode",
         )?;
         require(
             topic.max_append_bytes > 0 && topic.max_append_bytes <= MAX_APPEND_BYTES,

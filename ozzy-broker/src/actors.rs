@@ -151,7 +151,6 @@ impl ActorSettings {
                 replay_cache,
                 transfer,
                 sync_batch_target: SyncBatchTarget::half_window(pipeline),
-                sync_batch_max_age: Duration::from_millis(1),
                 evidence_quiet: EVIDENCE_QUIET,
                 proposal_lanes: 3,
                 proposal_capacity: pipeline.max_operations,

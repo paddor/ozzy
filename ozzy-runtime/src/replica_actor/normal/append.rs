@@ -67,7 +67,7 @@ impl ReplicaActor {
                 // image it leaves. Application last: the proposal's ticket
                 // still names the applied prefix it saw.
                 if let Some(admitted) = turn.admitted {
-                    self.complete_admitted(admitted, now)?;
+                    self.complete_admitted(admitted)?;
                 }
                 if let Some(proposal) = turn.proposal {
                     self.complete_proposal(proposal, now)?;
@@ -112,19 +112,15 @@ impl ReplicaActor {
         Ok(())
     }
 
-    /// The write is queued on the dedicated writer. Replicated-persisting
-    /// votes now; disk quorum votes after the write and its evidence persist.
+    /// The write is queued on the dedicated writer. The vote waits for its
+    /// `O_DSYNC` completion.
     fn complete_admitted(
         &mut self,
         admitted: crate::replica_journal::AdmittedAppend,
-        now: Duration,
     ) -> Result<(), ActorError> {
         let (ticket, buffer, persisted) = admitted.into_parts();
         assert!(self.pending_persistence.len() < self.config.pipeline.max_operations);
         self.pending_persistence.push_back(persisted);
-        if self.replicated() {
-            self.ack_at = now;
-        }
         self.work.persisting_bytes.push_back(buffer.body_bytes());
         self.return_admitted(ticket, buffer)
     }
@@ -140,38 +136,26 @@ impl ReplicaActor {
             .persisting_bytes
             .pop_front()
             .ok_or(JournalError::CompletionMismatch)?;
-        if self.replicated() {
-            self.driver.complete_buffered_write(ticket, now)?;
-        } else {
-            // `O_DSYNC` made the write durable, and later seals mark it, so
-            // the vote goes now. The group still joins the next `DURABLE`
-            // publication, which a due batch starts now.
-            self.driver.complete_durable_write(ticket, now)?;
-            self.ack_at = now;
-            self.work.last_persisted = Some(now);
-            self.work.needs_sync = true;
-            // A write ticket spans at most one pipeline of operations.
-            self.work.sync_batch_operations += (ticket.through().0 - ticket.first().0 + 1) as usize;
-            self.work.sync_batch_body_bytes += body_bytes;
-            self.work.sync_batch_started.get_or_insert(now);
-            if self.pending_sync.is_none()
-                && self.journal.available_command_slots() != 0
-                && let Some(normal) = self.driver.normal()
-            {
-                let primary =
-                    self.configuration.primary(normal.snapshot().scope.view) == self.local;
-                if self.sync_due(primary, now) {
-                    self.schedule_sync()?;
-                    // As in scheduling: the captured group syncs while the next fills.
-                    self.ingress.resume();
-                }
-            }
+        // `O_DSYNC` made the write durable, and later seals mark it, so the
+        // vote goes now. The group still joins the next `DURABLE` publication,
+        // which a due batch starts now.
+        self.driver.complete_durable_write(ticket, now)?;
+        self.ack_at = now;
+        self.work.last_persisted = Some(now);
+        self.work.needs_sync = true;
+        // A write ticket spans at most one pipeline of operations.
+        self.work.sync_batch_operations += (ticket.through().0 - ticket.first().0 + 1) as usize;
+        self.work.sync_batch_body_bytes += body_bytes;
+        if self.pending_sync.is_none()
+            && self.journal.available_command_slots() != 0
+            && self.driver.normal().is_some()
+            && self.sync_due(now)
+        {
+            self.schedule_sync()?;
+            // As in scheduling: the captured group syncs while the next fills.
+            self.ingress.resume();
         }
         Ok(())
-    }
-
-    pub(in crate::replica_actor) fn replicated(&self) -> bool {
-        self.configuration.policy() == ozzy_replication::QuorumPolicy::Replicated
     }
 
     fn return_admitted(
@@ -223,14 +207,7 @@ impl ReplicaActor {
                 ticket,
                 first_new: 0,
             }) => {
-                self.work.sync_batch_started.get_or_insert(now);
                 self.work.receive.admitted();
-                if self.configuration.policy() == ozzy_replication::QuorumPolicy::Replicated {
-                    // The retained vote is the core's accepted prefix. The
-                    // validated bytes are held here until their install turn,
-                    // which runs before any election command can capture history.
-                    self.ack_at = now;
-                }
                 assert!(self.work.ready.replace((ticket, validated)).is_none());
                 self.observe_window();
             }
@@ -326,7 +303,6 @@ impl ReplicaActor {
                 Err(error) => return Err(error.into()),
                 _ => return Err(ActorError::history(HistoryReason::ProposalWindow)),
             };
-        self.work.sync_batch_started.get_or_insert(now);
         self.enter_live(ticket, validated, reply)
     }
 

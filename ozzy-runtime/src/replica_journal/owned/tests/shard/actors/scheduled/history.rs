@@ -2,114 +2,107 @@ use super::*;
 use ozzy_proto::RequestId;
 use ozzy_replication::{LogSource, OpNumber, wire};
 
-mod buffered;
 mod retirement;
 
 #[test]
 fn history_request_retries_while_an_independent_lookup_owns_the_journal() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        let (mut controller, io) = setup();
-        let (mut actors, now) = history_fixture(&mut controller, &io, policy);
-        let status = actors[1].status();
-        let snapshot = status.normal.unwrap();
-        let request = wire::FetchOps {
-            scope: status.scope,
-            request_id: RequestId::from_bytes([93; 16]),
-            source: LogSource {
-                voter: NodeId::from_bytes([2; 16]),
-                generation: snapshot.journal.generation,
-                accepted: snapshot.accepted,
-            },
-            predecessor: Prefix::GENESIS,
-            max_operations: actor_config().transfer.max_operations as u32,
-            max_body_bytes: actor_config().transfer.max_body_bytes as u32,
-        };
-        let message = fetch_message(request);
-        // Shared reader services use this same owner access independently of
-        // the replica's pending action. Hold an actual history read there.
-        let (ticket, journal) = actors[1].read_access();
-        let mut lookup = Box::pin(
-            journal
-                .replication_positions(ticket.unwrap(), [OpNumber(1); 2])
-                .unwrap(),
-        );
-        assert!(poll(lookup.as_mut()).is_pending());
-        for _ in 0..1000 {
-            if controller.jobs().iter().any(|(id, _)| {
-                matches!(
-                    controller.operation(*id).unwrap().unprotected(),
-                    Operation::Read { .. }
-                )
-            }) {
-                break;
-            }
-            settle(&mut controller, &[]);
+    let (mut controller, io) = setup();
+    let (mut actors, now) = history_fixture(&mut controller, &io);
+    let status = actors[1].status();
+    let snapshot = status.normal.unwrap();
+    let request = wire::FetchOps {
+        scope: status.scope,
+        request_id: RequestId::from_bytes([93; 16]),
+        source: LogSource {
+            voter: NodeId::from_bytes([2; 16]),
+            generation: snapshot.journal.generation,
+            accepted: snapshot.accepted,
+        },
+        predecessor: Prefix::GENESIS,
+        max_operations: actor_config().transfer.max_operations as u32,
+        max_body_bytes: actor_config().transfer.max_body_bytes as u32,
+    };
+    let message = fetch_message(request);
+    // Shared reader services use this same owner access independently of
+    // the replica's pending action. Hold an actual history read there.
+    let (ticket, journal) = actors[1].read_access();
+    let mut lookup = Box::pin(
+        journal
+            .replication_positions(ticket.unwrap(), [OpNumber(1); 2])
+            .unwrap(),
+    );
+    assert!(poll(lookup.as_mut()).is_pending());
+    for _ in 0..1000 {
+        if controller.jobs().iter().any(|(id, _)| {
+            matches!(
+                controller.operation(*id).unwrap().unprotected(),
+                Operation::Read { .. }
+            )
+        }) {
+            break;
+        }
+        settle(&mut controller, &[]);
+        let mut event = std::pin::pin!(actors[1].changed(now));
+        if let Poll::Ready(result) = poll(event.as_mut()) {
+            result.unwrap();
+        }
+    }
+    let held = controller.jobs();
+    assert!(held.iter().any(|(id, _)| matches!(
+        controller.operation(*id).unwrap().unprotected(),
+        Operation::Read { .. }
+    )));
+    assert_eq!(actors[1].read_access().1.available_command_slots(), 0);
+    for _ in 0..3 {
+        actors[1].receive(&message, now).unwrap();
+    }
+    assert_eq!(controller.jobs(), held, "busy requests must submit no I/O");
+    assert!(actors[1].status().application_ready);
+    let mut looked_up = None;
+    for _ in 0..10000 {
+        round_at(&mut actors, now, false);
+        settle(&mut controller, &[]);
+        if let Poll::Ready(result) = poll(lookup.as_mut()) {
+            let positions = result.unwrap().positions;
+            assert_eq!(positions[0], positions[1]);
+            assert_eq!(positions[0].unwrap().op, OpNumber(1));
+            looked_up = positions[0];
+            break;
+        }
+    }
+    let looked_up = looked_up.expect("independent lookup must complete");
+    actors[1].receive(&message, now).unwrap();
+    let mut replied = false;
+    for _ in 0..10000 {
+        actors[1].advance(now).unwrap();
+        {
             let mut event = std::pin::pin!(actors[1].changed(now));
             if let Poll::Ready(result) = poll(event.as_mut()) {
                 result.unwrap();
             }
         }
-        let held = controller.jobs();
-        assert!(held.iter().any(|(id, _)| matches!(
-            controller.operation(*id).unwrap().unprotected(),
-            Operation::Read { .. }
-        )));
-        assert_eq!(actors[1].read_access().1.available_command_slots(), 0);
-        for _ in 0..3 {
-            actors[1].receive(&message, now).unwrap();
-        }
-        assert_eq!(controller.jobs(), held, "busy requests must submit no I/O");
-        assert!(actors[1].status().application_ready);
-        let mut looked_up = None;
-        for _ in 0..10000 {
-            round_at(&mut actors, now, false);
-            settle(&mut controller, &[]);
-            if let Poll::Ready(result) = poll(lookup.as_mut()) {
-                let positions = result.unwrap().positions;
-                assert_eq!(positions[0], positions[1]);
-                assert_eq!(positions[0].unwrap().op, OpNumber(1));
-                looked_up = positions[0];
-                break;
-            }
-        }
-        let looked_up = looked_up.expect("independent lookup must complete");
-        actors[1].receive(&message, now).unwrap();
-        let mut replied = false;
-        for _ in 0..10000 {
-            actors[1].advance(now).unwrap();
-            {
-                let mut event = std::pin::pin!(actors[1].changed(now));
-                if let Poll::Ready(result) = poll(event.as_mut()) {
-                    result.unwrap();
+        actors[1]
+            .flush(|message| {
+                if opcode(&message) == ozzy_proto::Opcode::Ops {
+                    verify_response(&message, request, looked_up);
+                    replied = true;
                 }
-            }
-            actors[1]
-                .flush(|message| {
-                    if opcode(&message) == ozzy_proto::Opcode::Ops {
-                        verify_response(&message, request, looked_up, policy);
-                        replied = true;
-                    }
-                    Ok(())
-                })
-                .unwrap();
-            settle(&mut controller, &[]);
-            if replied {
-                break;
-            }
+                Ok(())
+            })
+            .unwrap();
+        settle(&mut controller, &[]);
+        if replied {
+            break;
         }
-        assert!(replied, "retry must receive the exact retained operation");
-        for actor in actors {
-            close(&mut controller, actor);
-        }
+    }
+    assert!(replied, "retry must receive the exact retained operation");
+    for actor in actors {
+        close(&mut controller, actor);
     }
 }
 
-fn history_fixture(
-    controller: &mut Controller,
-    io: &Local,
-    policy: QuorumPolicy,
-) -> (Vec<Scheduled>, Duration) {
-    let (mut actors, pending) = cluster_with_operation_count(controller, io, 0, policy, 2);
+fn history_fixture(controller: &mut Controller, io: &Local) -> (Vec<Scheduled>, Duration) {
+    let (mut actors, pending) = cluster_with_operation_count(controller, io, 0, 2);
     let mut pending = Box::pin(pending);
     let mut confirmed = false;
     for _ in 0..10000 {
@@ -176,15 +169,10 @@ fn fetch_message(request: wire::FetchOps) -> Message {
     ])
 }
 
-fn verify_response(
-    message: &Message,
-    request: wire::FetchOps,
-    looked_up: Prefix,
-    policy: QuorumPolicy,
-) {
+fn verify_response(message: &Message, request: wire::FetchOps, looked_up: Prefix) {
     let frames = std::array::from_fn::<_, 3, _>(|i| message.part_slice(i + 1).unwrap());
     let binding = wire::PeerBinding::new(
-        config("/g0-b0", 4, policy).configuration.configuration(),
+        config("/g0-b0", 4).configuration.configuration(),
         NodeId::from_bytes([2; 16]),
         actor_config().sessions[2],
     )

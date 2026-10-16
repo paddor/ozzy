@@ -203,15 +203,12 @@ fn close(controller: &mut Controller, actors: PartitionActors) {
 
 #[test]
 fn surviving_broker_notifies_watch_after_full_port_without_dead_leader() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        scenario(policy);
-    }
+    scenario();
 }
 
 fn actor_sets(
     controller: &mut Controller,
     io: &Local,
-    policy: QuorumPolicy,
 ) -> (
     [PartitionActors; 3],
     Vec<(GroupId, ozzy_proto::PartitionIncarnation)>,
@@ -220,7 +217,7 @@ fn actor_sets(
     let mut assigned: [Vec<_>; 3] = std::array::from_fn(|_| Vec::new());
     let mut identities = Vec::new();
     for group in 0..2 {
-        let (actors, pending) = cluster(controller, io, group, policy);
+        let (actors, pending) = cluster(controller, io, group);
         identities.push((
             actors[0].status().scope.group_id,
             ozzy_proto::PartitionIncarnation::from_bytes([91 + group; 16]),
@@ -267,9 +264,9 @@ fn updates(output: &[Message]) -> Vec<directory::RouteState> {
         .collect()
 }
 
-fn scenario(policy: QuorumPolicy) {
+fn scenario() {
     let (mut controller, io) = setup();
-    let (mut shards, identities, mut routes) = actor_sets(&mut controller, &io, policy);
+    let (mut shards, identities, mut routes) = actor_sets(&mut controller, &io);
     let initial_routes = identities
         .iter()
         .map(|&(group, partition)| shards[1].route_state(group, partition).unwrap())

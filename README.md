@@ -28,10 +28,9 @@ Requires Linux and Rust 1.93. Start a broker with the
 | --- | --- | --- |
 | Single durable | It is persisted locally | One; no failover |
 | Disk quorum | It is persisted on the leader and one follower | Three; two eligible copies required |
-| Replicated-persisting | It is retained on the leader and one follower; persistence follows in the background | Three; two eligible copies required |
 
-Replicated-persisting is mostly for disks with slow flushes. The
-[overview](doc/OVERVIEW.md#modes) defines each boundary and its config value.
+The [overview](doc/OVERVIEW.md#modes) defines each boundary and its config
+value.
 
 ## Features
 
@@ -86,7 +85,7 @@ and are not published.
 | [Storage](doc/STORAGE.md) | Segments, integrity, retention, restart |
 | [Replication](doc/REPLICATION.md) | Authority, confirmation, elections, repair |
 | [Development](DEVELOPMENT.md), [contributing](CONTRIBUTING.md) | Checks and test layers |
-| [Benchmarks](BENCHMARKS.md) | The six charts and their measurement conditions |
+| [Benchmarks](BENCHMARKS.md) | The four charts and their measurement conditions |
 
 ## License
 

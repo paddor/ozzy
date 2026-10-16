@@ -139,7 +139,7 @@ fn progress_reply_checks_every_source_fence_policy_and_cumulative_cursor() {
         assert!(decode(request, wrong).is_err());
     }
     wrong = confirmed;
-    wrong.policy = ozzy_proto::append::Policy::QuorumReplicatedPersisting;
+    wrong.policy = ozzy_proto::append::Policy::LocalDurable;
     assert!(decode(request, wrong).is_err());
     wrong = confirmed;
     wrong.cursor = ozzy_proto::Offset::new(1);

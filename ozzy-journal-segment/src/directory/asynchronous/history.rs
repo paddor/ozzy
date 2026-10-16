@@ -13,7 +13,7 @@ impl Journal {
 
     /// Capture only installed complete writes. Unsynchronized bytes grant no
     /// restart, election or durability authority.
-    pub fn freeze_written_history(
+    pub(crate) fn freeze_written_history(
         &self,
         max_segment_bytes: usize,
     ) -> Result<JournalHistory, HistoryError> {
@@ -60,18 +60,6 @@ impl Journal {
         self.validate_authority_files().await?;
         Ok(StorageValidation::new(
             self.freeze_history(max_segment_bytes)?,
-            self.current,
-        ))
-    }
-
-    /// Capture the exact written prefix for a fresh bounded scrub.
-    pub async fn begin_written_storage_validation(
-        &mut self,
-        max_segment_bytes: usize,
-    ) -> Result<StorageValidation, HistoryError> {
-        self.validate_authority_files().await?;
-        Ok(StorageValidation::new(
-            self.freeze_written_history(max_segment_bytes)?,
             self.current,
         ))
     }

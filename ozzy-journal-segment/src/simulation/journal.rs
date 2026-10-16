@@ -47,7 +47,6 @@ pub struct Journal {
     configuration: Vec<u8>,
     manifest: Manifest,
     positions: BTreeMap<u64, WriterPosition>,
-    memory_voting: bool,
     body_encoding: BodyEncoding,
 }
 
@@ -93,31 +92,8 @@ impl Journal {
             identity,
             configuration,
             positions: BTreeMap::new(),
-            memory_voting: false,
             body_encoding: BodyEncoding::Raw,
         })
-    }
-
-    /// Fresh bootstrap only: publish the production running marker before RAM votes.
-    /// Subsequent opens require drained evidence or explicit nonvoting recovery.
-    pub fn enable_memory_voting(&mut self) -> Result<(), DirectoryError> {
-        let journal = self.store.as_mut().expect("opened journal");
-        if self.memory_voting || journal.written_position()? != LogPosition::GENESIS {
-            return Err(DirectoryError::MemoryHistoryUnproven);
-        }
-        self.memory_voting = true;
-        self.device.run(journal.mark_memory_voting_running())
-    }
-
-    /// Shutdown after the adapter has stopped voting and drained all accepted work.
-    pub fn drain_memory_voting(&mut self) -> Result<(), DirectoryError> {
-        if !self.memory_voting {
-            return Err(DirectoryError::ConfigurationMismatch);
-        }
-        let journal = self.store.as_mut().expect("opened journal");
-        let result = self.device.run(journal.publish_drained_memory_history());
-        self.manifest = journal.manifest().clone();
-        result
     }
 
     /// Select the production per-operation encoder, including raw fallback.
@@ -290,9 +266,6 @@ impl Journal {
             ))
             .map_err(other)?;
         drop(candidate);
-        if self.memory_voting {
-            self.device.run(journal.publish_drained_memory_history())?;
-        }
         self.manifest = journal.manifest().clone();
         Ok(())
     }
@@ -327,7 +300,7 @@ impl Journal {
             generation,
             limits(),
         ));
-        let mut journal = match opened {
+        let journal = match opened {
             Ok(journal) => journal,
             Err(DirectoryError::ConfigurationMismatch) => {
                 self.device.settle();
@@ -345,12 +318,6 @@ impl Journal {
             Err(error) => return Err(error),
         };
         self.manifest = journal.manifest().clone();
-        if self.memory_voting {
-            self.device
-                .run(journal.require_drained_memory_history())
-                .map_err(|_| DirectoryError::MemoryHistoryUnproven)?;
-            self.device.run(journal.mark_memory_voting_running())?;
-        }
         self.store = Some(journal);
         self.snapshot()
     }

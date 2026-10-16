@@ -3,10 +3,9 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 
 use ozzy_config::{
-    BrokerIdentity, BrokerPlan, Confirmation, Deployment, DeploymentIdentity, HostResources,
-    ValidatedDeployment,
+    BrokerIdentity, BrokerPlan, Deployment, DeploymentIdentity, HostResources, ValidatedDeployment,
 };
-use ozzy_proto::{GroupId, NodeId, PartitionIncarnation, TopicId, append::Policy, directory};
+use ozzy_proto::{GroupId, NodeId, PartitionIncarnation, TopicId, directory};
 use ozzy_runtime::frontend::TopicCatalog;
 use uuid::Uuid;
 
@@ -50,12 +49,8 @@ impl CheckedConfig {
             })
             .collect::<Result<_, StartupError>>()?;
         let mut pages = Vec::new();
+        let policy = self.identity.mode.policy();
         for (name, topic) in &self.identity.topics {
-            let policy = match topic.confirmation {
-                Confirmation::LocalDurable => Policy::LocalDurable,
-                Confirmation::DiskQuorum => Policy::QuorumDurable,
-                Confirmation::ReplicatedPersisting => Policy::QuorumReplicatedPersisting,
-            };
             for chunk in topic
                 .partitions
                 .chunks(directory::Limits::default().partitions)

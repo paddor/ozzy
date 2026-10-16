@@ -3,9 +3,7 @@ use ozzy_journal_segment::{
     CanonicalRecoveryLimits, CommitMode, GroupIdentity, JournalFormat, JournalLimits, Manifest,
     SegmentHeader, SegmentWriteMode,
 };
-use ozzy_replication::{
-    ConfigurationRecord, Digest, JournalGeneration, PipelineLimits, QuorumPolicy,
-};
+use ozzy_replication::{ConfigurationRecord, Digest, JournalGeneration, PipelineLimits};
 use std::path::PathBuf;
 use tokio::sync::Semaphore;
 
@@ -68,10 +66,6 @@ pub struct OwnedConfig<C = ConfigurationRecord> {
 impl OwnedConfig {
     pub(super) fn validate(&self, generation: JournalGeneration) -> Result<(), JournalError> {
         let configuration = self.configuration.configuration();
-        let mode = match configuration.policy() {
-            QuorumPolicy::Replicated => SegmentWriteMode::Buffered,
-            QuorumPolicy::Durable => SegmentWriteMode::DataSync,
-        };
         if self.identity.group_id != configuration.scope().group_id
             || !configuration
                 .voters()
@@ -79,7 +73,7 @@ impl OwnedConfig {
         {
             return Err(JournalError::Configuration);
         }
-        self.validate_storage(generation, mode)
+        self.validate_storage(generation)
     }
 
     /// Reject a stored manifest outside this configuration's supported profile.
@@ -117,7 +111,6 @@ impl<C> OwnedConfig<C> {
     pub(super) fn validate_storage(
         &self,
         generation: JournalGeneration,
-        mode: SegmentWriteMode,
     ) -> Result<(), JournalError> {
         if let Some(limits) = self.deduplication {
             limits.validate()?;
@@ -125,7 +118,7 @@ impl<C> OwnedConfig<C> {
                 return Err(JournalError::Configuration);
             }
         }
-        if self.limits.io.write_mode != mode
+        if self.limits.io.write_mode != SegmentWriteMode::DataSync
             || generation.0 == 0
             || self.append_buffers == 0
             || self.append_buffers > Semaphore::MAX_PERMITS

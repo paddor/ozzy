@@ -9,7 +9,7 @@
     reason = "simulation test support"
 )]
 use clap::{Parser, ValueEnum};
-use ozzy_config::Confirmation;
+use ozzy_config::DeploymentMode;
 use ozzy_sim::soak::{self, Action, Config, Resources, Time};
 use std::{path::PathBuf, time::Duration};
 
@@ -17,13 +17,12 @@ use std::{path::PathBuf, time::Duration};
 enum Mode {
     Durable,
     DiskQuorum,
-    ReplicatedPersisting,
 }
 
 #[derive(Debug, Parser)]
 #[command(about = "Run production SDKs and brokers over OMQ inproc and bounded memory storage")]
 struct Args {
-    #[arg(long, value_enum, default_value = "replicated-persisting")]
+    #[arg(long, value_enum, default_value = "disk-quorum")]
     mode: Mode,
     #[arg(long, default_value_t = 1)]
     seed: u64,
@@ -70,10 +69,9 @@ struct Args {
 async fn main() {
     let args = Args::parse();
     let config = Config {
-        policy: match args.mode {
-            Mode::Durable => Confirmation::LocalDurable,
-            Mode::DiskQuorum => Confirmation::DiskQuorum,
-            Mode::ReplicatedPersisting => Confirmation::ReplicatedPersisting,
+        mode: match args.mode {
+            Mode::Durable => DeploymentMode::Single,
+            Mode::DiskQuorum => DeploymentMode::Three,
         },
         seed: args.seed,
         duration: Duration::from_secs(args.duration),

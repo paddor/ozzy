@@ -175,8 +175,6 @@ impl ShardRecoveringJournal {
                 },
             ),
             dedup_window_millis: config.deduplication.map(|limits| limits.window_millis),
-            replicated: config.configuration.configuration().policy()
-                == ozzy_replication::QuorumPolicy::Replicated,
             capacity: Arc::new(Semaphore::new(scheduler.commands)),
             command_capacity: scheduler.commands,
             read_capacity: Arc::new(Semaphore::new(0)),

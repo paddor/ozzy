@@ -70,10 +70,7 @@ impl ReplicaDriver {
                 Control::StartViewChange(start) => changing.receive_start(from, start)?,
                 Control::DoViewChange(report) => changing.receive_report(from, report)?,
                 Control::StartView(start) => return Ok(Some(start)),
-                Control::Commit(_)
-                | Control::PrepareOk { .. }
-                | Control::PrepareRetained { .. }
-                | Control::ExitView(_) => {}
+                Control::Commit(_) | Control::PrepareOk { .. } | Control::ExitView(_) => {}
             },
             Role::Installing(installing) => installing.observe_view(from, scope)?,
             Role::Fenced(_) => return Err(ViewChangeError::Faulted.into()),
@@ -89,11 +86,7 @@ impl ReplicaDriver {
             Control::Commit(_) | Control::StartView(_) if voter != primary => {
                 Err(ReplicationError::WrongRole.into())
             }
-            Control::PrepareOk { .. }
-            | Control::PrepareRetained { .. }
-            | Control::DoViewChange(_)
-                if self.local != primary =>
-            {
+            Control::PrepareOk { .. } | Control::DoViewChange(_) if self.local != primary => {
                 Err(ReplicationError::WrongRole.into())
             }
             _ => Ok(()),
@@ -119,9 +112,6 @@ impl ReplicaDriver {
                 self.contact_deadline = now.saturating_add(self.timing.primary_timeout);
             }
             Control::PrepareOk { ack, .. } => normal.receive_ack(from, ack)?,
-            Control::PrepareRetained { ack, .. } => {
-                normal.receive_retained_ack(from, ack)?;
-            }
             Control::StartView(start) => {
                 normal.observe_installed_start(from, start)?;
                 self.contact_deadline = now.saturating_add(self.timing.primary_timeout);
@@ -181,7 +171,7 @@ impl ReplicaDriver {
             self.progress_deadline = now.saturating_add(self.timing.primary_timeout);
         }
         if normal.snapshot().accepted != previous.accepted
-            && previous.accepted.op == self.storage_progress(&previous)
+            && previous.accepted.op == previous.journal.durable
         {
             self.persistence_deadline = now.saturating_add(self.timing.primary_timeout);
         }

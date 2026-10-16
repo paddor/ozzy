@@ -11,27 +11,21 @@ use ozzy_sim::broker::Cluster as MemoryCluster;
 
 #[tokio::test(flavor = "current_thread")]
 async fn single_durable_varied_churn_preserves_payloads_across_short_writes_and_recovery() {
-    churn(Confirmation::LocalDurable, None, None).await;
+    churn(DeploymentMode::Single, None, None).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn disk_quorum_varied_churn_preserves_payloads_across_short_writes_and_recovery() {
-    churn(Confirmation::DiskQuorum, None, None).await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn replicated_persisting_varied_churn_preserves_payloads_across_short_writes_and_recovery() {
-    churn(Confirmation::ReplicatedPersisting, None, None).await;
+    churn(DeploymentMode::Three, None, None).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "long memory-only real-broker soak; OZZY_SOAK_POLICY, SECONDS and RESULTS select the run"]
 async fn memory_only_varied_churn_soak() {
-    let policy = match std::env::var("OZZY_SOAK_POLICY").unwrap().as_str() {
-        "single" => Confirmation::LocalDurable,
-        "dq" => Confirmation::DiskQuorum,
-        "rp" => Confirmation::ReplicatedPersisting,
-        value => panic!("unknown soak policy {value}"),
+    let mode = match std::env::var("OZZY_SOAK_POLICY").unwrap().as_str() {
+        "single" => DeploymentMode::Single,
+        "dq" => DeploymentMode::Three,
+        value => panic!("unknown soak mode {value}"),
     };
     let seconds: u64 = std::env::var("OZZY_SOAK_SECONDS")
         .unwrap_or_else(|_| "3600".into())
@@ -39,11 +33,11 @@ async fn memory_only_varied_churn_soak() {
         .unwrap();
     assert!(seconds > 0);
     let ledger = File::create(std::env::var("OZZY_SOAK_RESULTS").unwrap()).unwrap();
-    churn(policy, Some(Duration::from_secs(seconds)), Some(ledger)).await;
+    churn(mode, Some(Duration::from_secs(seconds)), Some(ledger)).await;
 }
 
-async fn churn(policy: Confirmation, duration: Option<Duration>, mut ledger: Option<File>) {
-    let mut cluster = MemoryCluster::new(policy).await;
+async fn churn(mode: DeploymentMode, duration: Option<Duration>, mut ledger: Option<File>) {
+    let mut cluster = MemoryCluster::new(mode).await;
     let mut client = SdkClient::open_with_runtime(&cluster.configs[0].0, &cluster.runtime).await;
     let mut reader = live_many(&cluster.brokers, "open churn reader", client.reader(false)).await;
     let start = Instant::now();
@@ -71,7 +65,7 @@ async fn churn(policy: Confirmation, duration: Option<Duration>, mut ledger: Opt
         if start.elapsed() >= next_report {
             report(
                 &mut ledger,
-                policy,
+                mode,
                 start.elapsed(),
                 verified,
                 restarts,
@@ -93,7 +87,7 @@ async fn churn(policy: Confirmation, duration: Option<Duration>, mut ledger: Opt
     cluster.shutdown().await;
     report(
         &mut ledger,
-        policy,
+        mode,
         start.elapsed(),
         verified,
         restarts,
@@ -104,7 +98,7 @@ async fn churn(policy: Confirmation, duration: Option<Duration>, mut ledger: Opt
 
 fn report(
     ledger: &mut Option<File>,
-    policy: Confirmation,
+    mode: DeploymentMode,
     elapsed: Duration,
     verified: usize,
     restarts: usize,
@@ -113,7 +107,7 @@ fn report(
 ) {
     if let Some(ledger) = ledger {
         let record = format!(
-            "{{\"policy\":\"{policy:?}\",\"elapsed_secs\":{},\"verified_records\":{verified},\"scheduled_restarts\":{restarts},\"short_write_recoveries\":{faults},\"complete\":{complete}}}",
+            "{{\"mode\":\"{mode:?}\",\"elapsed_secs\":{},\"verified_records\":{verified},\"scheduled_restarts\":{restarts},\"short_write_recoveries\":{faults},\"complete\":{complete}}}",
             elapsed.as_secs()
         );
         writeln!(ledger, "{record}").unwrap();

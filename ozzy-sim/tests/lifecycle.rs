@@ -24,9 +24,6 @@ mod storage_faults;
 #[path = "support/lifecycle/storage_schedule.rs"]
 mod storage_schedule;
 
-#[path = "support/lifecycle/persisting.rs"]
-mod persisting;
-
 #[path = "support/lifecycle/storage_repair.rs"]
 mod storage_repair;
 

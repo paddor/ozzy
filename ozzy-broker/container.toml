@@ -15,4 +15,3 @@ controller = "development"
 write_threads = 1
 
 [topics.orders]
-confirmation = "local-durable"

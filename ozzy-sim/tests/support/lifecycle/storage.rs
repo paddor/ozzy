@@ -60,21 +60,12 @@ impl Replica {
                     store_id: StoreId::from_bytes([self.id as u8 + 31; 16]),
                     store_generation: 1,
                 },
-                configuration_record_with_policy(self.configuration.policy())
-                    .encode()
-                    .to_vec(),
+                configuration_record().encode().to_vec(),
                 1,
                 self.generation,
             )
             .unwrap(),
         );
-        if self.configuration.policy() == QuorumPolicy::Replicated {
-            self.storage
-                .as_mut()
-                .unwrap()
-                .enable_memory_voting()
-                .unwrap();
-        }
     }
 
     pub(super) fn perform_storage(&mut self, action: &DiskAction) -> Result<(), DirectoryError> {

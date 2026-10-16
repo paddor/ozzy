@@ -147,9 +147,8 @@ Link rules:
 
 - Operations start at 1; genesis is op 0 with zero digest. Partition offsets
   start at 0. `u64::MAX` is not an admissible operation position.
-- Policy IDs: 3 local durable, 5 disk quorum, 6 replicated-persisting. Other
-  values fail. Group configuration fixes the policy; requests cannot weaken
-  it.
+- Policy IDs: 1 local durable, 2 disk quorum. Other values fail. Group
+  configuration fixes the policy; requests cannot weaken it.
 
 `Records = count:u32 + descriptors`. Descriptor:
 `message_id:u128, tagged_part_count:u32, decoded_bytes:u32 (LZ4 only), lengths:u32[]`.
@@ -197,7 +196,7 @@ first partition `u32`, maximum entries `u16` (nonzero). Response, in order:
 
 - Topic names are 1..128 bytes of `a-z`, `0-9`, `-`, `_`, `.`, starting with a
   letter or digit. An unknown topic fails with code 18.
-- One broker requires policy 3; three brokers require 5 or 6. Each partition
+- One broker requires policy 1; three brokers require 2. Each partition
   lists every page broker once, initial leader first.
 - Endpoints use `tcp`, `lz4+tcp`, `zstd+tcp`, `ipc`, or `inproc` and are at
   most 1,024 bytes.
@@ -296,8 +295,7 @@ Negotiated bounds apply. Packet boundaries imply no transaction. APPENDED has
   sender, session, authority, sent bounds, and the sequence-to-offset mapping.
 - Duplicates return original offsets, which may repeat or move backward
   across ranges. Disposition and offset never change for a confirmed sequence.
-- Disk quorum replies follow applied synchronized history; replicated-
-  persisting replies follow applied leader-plus-follower retained history.
+- Disk quorum replies follow applied synchronized history.
 - Reconnect discards correlation; unresolved records retry unchanged.
   [Runtime](RUNTIME.md#sdk-protocol-batching) owns SDK batching defaults.
 
@@ -496,7 +494,7 @@ voter, session, and configuration must match. Decoding grants no trust.
 | PREPARE | 164 + 86*N | First op, predecessor digest, commit position, list of canonical operation descriptors |
 | PREPARE_FLOW | 180 + 86*N | Receive epoch `u128`, then the same fields as PREPARE |
 | OPS | 196 + 86*N | Source descriptor, predecessor op position, list of canonical operation descriptors |
-| PREPARE_OK | 121 | Contiguous op position, evidence `u8` (2 durable, 3 retained RAM with background persistence; 1 is unassigned) |
+| PREPARE_OK | 120 | Contiguous durable op position |
 | COMMIT | 120 | Committed op position |
 | EXIT_VIEW | 80 | View to leave in Authority: the sender's current view, or an older view it left, answering a peer's request; volatile timeout suspicion, no additional fields |
 | START_VIEW_CHANGE | 80 | Proposed view in Authority; no additional fields |
@@ -515,8 +513,7 @@ bodies; all other replica payloads are empty. Descriptor (86 bytes):
 - The receiver's operation limit bounds each PREPARE or OPS, independent of
   record count.
 - PREPARE variants, PREPARE_OK, COMMIT, EXIT_VIEW, and election commands are
-  uncorrelated. PREPARE_OK is cumulative: evidence 2 for disk quorum, 3 for
-  replicated-persisting.
+  uncorrelated. PREPARE_OK is cumulative.
 - Election generations are nonzero `u128` incarnations. Proposed views exceed
   the last normal view; commits never pass or conflict with accepted history.
 - [Replication](REPLICATION.md) owns voting, election, and

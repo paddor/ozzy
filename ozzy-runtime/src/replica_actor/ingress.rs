@@ -22,7 +22,7 @@ pub(super) use admission::{NextProposal, ProposalWait, Proposals};
 #[derive(Debug)]
 pub enum ProposalOutcome {
     /// Every operation through this exact prefix satisfies the configured group
-    /// confirmation policy and is applied. RAM confirmation is not disk durability.
+    /// confirmation policy and is applied.
     Committed {
         /// Group, configuration, and view that authorized this reply.
         scope: Scope,

@@ -9,18 +9,18 @@ terms.
 
 - Single durable confirms its applied local durable prefix. It has no votes,
   elections, or failover.
-- Disk quorum (DQ) and replicated-persisting (RP) use three fixed brokers.
-  Confirmation needs two of three eligible copies.
+- Disk quorum (DQ) uses three fixed brokers. Confirmation needs two of three
+  eligible copies.
 - A failed replicated group never becomes a single-broker group.
 - Each replicated partition is its own Viewstamped Replication group, with its
-  own journal, view, and policy. All three brokers store it.
+  own journal and view. All three brokers store it.
 - The leader of view `v` is `brokers[v % 3]` in the persisted member order.
   Only an election activates it. `init` rotates the order per partition to
   spread leaders.
 - One remaining broker never confirms. There is no forced promotion, lower
   quorum, or discard of confirmed history.
 - `CONFIGURATION` (256 bytes replicated, 128 bytes single durable) binds group
-  identity, members and principals, policy, versions, and integrity profile.
+  identity, members and principals, versions, and integrity profile.
   One mode's record never decodes as the other's.
 - Missing or invalid configuration fails closed. Roll, retention, and suffix
   replacement never change membership.
@@ -31,35 +31,19 @@ terms.
 
 ## Confirmation
 
-| Rule | Disk quorum | Replicated-persisting |
-| --- | --- | --- |
-| Vote evidence | Durable prefix of completed `O_DSYNC` writes | Validated bytes retained in RAM |
-| Leader commits through | Own durable prefix and one matching follower vote | Own retained prefix and one matching follower vote |
-| Follower applies through | Announced commit, capped by its durable prefix | Announced commit, capped by its retained prefix |
-| Storage deadline resets on | Durable progress | Written progress |
-
+- A vote reports the durable prefix of completed `O_DSYNC` writes.
+- The leader commits through its own durable prefix and one matching
+  follower vote. A follower applies through the announced commit, capped by
+  its durable prefix.
+- The storage deadline resets on durable progress.
 - The leader freezes offsets, canonical bytes, and digest before any
   asynchronous work. Followers check authority, chain, schema, application
   transition, and bounds before accepting.
 - Votes are cumulative and cannot skip a predecessor or change a digest.
 - Transport receipt, queued I/O, and page-cache completion are not disk votes.
-  An RP vote never counts in DQ.
 - The leader replies from applied state, possibly before it announces COMMIT.
   Elections preserve that history. A retry after a leader change gets its
   original result, rebuilt from canonical records.
-
-RP persistence:
-
-- Backing stays held through application and completed writes. A full
-  backlog backpressures producers.
-- Short or interrupted writes resume. Any other write, writeback, or sync
-  error fences the journal, even while idle.
-- A broker publishes running `MEMORY_VOTING` evidence before it votes. A clean
-  shutdown closes admission, drains writes, and publishes drained evidence.
-- A disk prefix cannot exclude later RAM votes. Without drained evidence a copy
-  cannot vote from its disk.
-- Losing every volatile copy can lose the unpersisted tail. If all three
-  brokers stop uncleanly, the group stays fenced.
 
 ## Live replication
 
@@ -83,7 +67,7 @@ sequenceDiagram
     L->>F: REPLICA_OPEN with accepted tail (control PEER)
     F-->>L: REPLICA_STATE with prefix and epoch (control PEER)
     L->>F: PREPARE_FLOW for the gap (data PEER)
-    F-->>L: Receipt, then PREPARE_OK on policy evidence
+    F-->>L: Receipt, then PREPARE_OK after O_DSYNC
 ```
 
 - Followers keep only a contiguous prefix. Leader probes find gaps, including
@@ -147,8 +131,6 @@ stateDiagram-v2
   lineage, then enters election with a fresh writer incarnation.
 - A restart never resumes old leader authority. It requests the next view or
   resumes an uninstalled promise. A promise alone grants no authority.
-- An RP store needs exact drained `MEMORY_VOTING` evidence. Otherwise `serve`
-  fails; recover the partition with `--quarantine`.
 - Lost, rolled-back, or ambiguous stores stay nonvoting. Damage found while
   serving fails closed and never triggers automatic repair.
 
@@ -179,9 +161,8 @@ The `recover` subcommand serves with selected partitions nonvoting. See
 
 Sealed-file repair:
 
-- Applies only to DQ stores with damage confined to sealed segments.
-  `--quarantine` and `--resume` allow it; `--resume-full` and RP stores use
-  full transfer.
+- Applies only to damage confined to sealed segments. `--quarantine` and
+  `--resume` allow it; `--resume-full` uses full transfer.
 - Uses the same authority and donor. It reuses validated local operations but
   keeps original manifest boundaries and full private replay.
 - Active-segment damage, a disagreeing donor, or a stall falls back to full
@@ -231,5 +212,5 @@ across the gap.
   `view_change/`), recovery (`recovery/`), repair (`flow/`), single durable
   (`local.rs`).
 - `ozzy-runtime/src/replica_actor/` and `replica_journal/`: actors, startup
-  probe, donors, promises, installation, RP writeback.
+  probe, donors, promises, installation, writeback.
 - `ozzy-broker/src/journals/recovery.rs`: `recover` intents.

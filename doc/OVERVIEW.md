@@ -1,6 +1,6 @@
 # Overview
 
-This page defines Ozzy's terms, its three modes, and how records flow from
+This page defines Ozzy's terms, its two modes, and how records flow from
 producers through brokers to consumers. Other docs link here for definitions.
 
 Ozzy is a broker-owned, partitioned record log over OMQ. Brokers own storage,
@@ -17,8 +17,8 @@ framing, reconnects, fairness, and transport backpressure.
 | Authority | The fences a request or job must match: group, configuration, view, partition, owner |
 | Broker | One server process, named under `[brokers.NAME]`. Owns its journals, replication state, and confirmations |
 | Canonical operation | One validated history entry, with a partition-local operation number and digest |
-| Committed | History that met the topic's confirmation policy |
-| Confirmation | The broker's statement that records met the topic's `confirmation` policy. The writer turns it into receipts |
+| Committed | History that met the cluster mode's confirmation policy |
+| Confirmation | The broker's statement that records met the cluster mode's confirmation policy. The writer turns it into receipts |
 | Consumer checkpoint | Next offset per partition, saved by the application (`TopicCheckpoint`) |
 | Consumer group | Named set of `GroupReader` members on one topic. Brokers assign its partitions and store its progress |
 | Coordinator | The partition, chosen by group name, whose journal stores a consumer group's membership and plans |
@@ -33,7 +33,7 @@ framing, reconnects, fairness, and transport backpressure.
 | Journal | One partition's append-only history on one broker, stored as segments |
 | Leader | The broker that admits writes for a partition in the current view |
 | Message ID | Nonzero 16-byte ID the producer gives each record (`MessageId`). Deduplication keys on it |
-| Mode | Single durable, disk quorum, or replicated-persisting; see [modes](#modes) |
+| Mode | Single durable or disk quorum; see [modes](#modes) |
 | Offset | A record's position in its partition, from zero, shared by all producers |
 | Partition | Ordered log within a topic, shared by producers. Each broker runs one actor and one journal per partition |
 | Partition actor | Task on a shard that owns one partition's journal, replication state, readers, and dedup index |
@@ -51,28 +51,22 @@ framing, reconnects, fairness, and transport backpressure.
 | Session | Fence for one link attempt. Does not replace durable authority |
 | Shard | Broker-local thread that hosts many partition actors. Shard IDs never reach SDKs or storage |
 | Storage checkpoint | Saved canonical state and original chain anchor. Payloads stay in segments |
-| Topic | Named, immutable set of partitions with one partitioner seed and one confirmation policy. No order across partitions |
+| Topic | Named, immutable set of partitions with one partitioner seed. No order across partitions |
 | View | Replication term of a partition's three-broker group. A view change elects a new leader |
-| Vote | Mode-specific evidence that a copy counts toward confirmation |
+| Vote | A follower's durable-prefix evidence that its copy counts toward confirmation |
 | Writer | Producer SDK handle (`SharedTopicWriter`) that routes, batches, and retries records for one topic |
 
 ## Modes
 
 `cluster.mode` is `single` or `three`; it is set explicitly, never inferred.
-Each topic sets `confirmation`. Single mode accepts only `local-durable`; three
-mode accepts `disk-quorum` or `replicated-persisting` per topic.
+It fixes the confirmation policy of every topic.
 
-| Mode | `confirmation` | A confirmation means | Availability |
+| Mode | `cluster.mode` | A confirmation means | Availability |
 | --- | --- | --- | --- |
-| Single durable | `local-durable` | The sole broker applied its synchronized local prefix | No failover |
-| Disk quorum (DQ) | `disk-quorum` | Leader and one follower applied matching synchronized history | Two of three brokers |
-| Replicated-persisting (RP) | `replicated-persisting` | Leader and one follower applied matching retained bytes; persistence continues in the background | Two of three brokers |
+| Single durable | `single` | The sole broker applied its synchronized local prefix | No failover |
+| Disk quorum (DQ) | `three` | Leader and one follower applied matching synchronized history | Two of three brokers |
 
 - Transport receipt and buffered write completion never prove durability.
-- RP can lose an unpersisted tail if every in-memory copy is lost.
-- RP is mostly for disks with slow flushes, such as consumer SSDs and hard
-  disks. Where flushes are cheap, DQ costs little more and keeps every
-  confirmation on disk.
 - Single durable has no elections or failover.
 - A failed three-broker group never becomes a single broker.
 - [Replication](REPLICATION.md) owns voting and elections;
@@ -107,7 +101,7 @@ flowchart LR
 ```
 
 - `send` admits a record locally. `confirmed()` and `flush` wait for the
-  topic's confirmation.
+  mode's confirmation.
 - A timeout leaves the outcome unknown. Retry the same identity and bytes; a
   confirmed retry returns the original offset.
 - Resume restores producer epochs and sequences; takeover fences the old

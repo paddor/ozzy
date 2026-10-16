@@ -75,9 +75,6 @@ pub enum DirectoryError {
     /// Expected immutable adapter configuration is missing or differs from disk.
     #[error("configured consensus membership does not match stored configuration")]
     ConfigurationMismatch,
-    /// A prior memory-voting session did not publish exact drained history.
-    #[error("memory-voting history is unproven; nonvoting group recovery is required")]
-    MemoryHistoryUnproven,
     /// Immutable configuration must be nonempty and fit its fixed storage bound.
     #[error("invalid group configuration length")]
     ConfigurationLength,

@@ -151,17 +151,15 @@ async fn activate(
 
 #[tokio::test(flavor = "current_thread")]
 async fn coordinator_failover_preserves_drains_epochs_and_confirmed_source_cursors() {
-    for policy in [Confirmation::DiskQuorum, Confirmation::ReplicatedPersisting] {
-        failover_during_drain(policy).await;
-    }
+    failover_during_drain().await;
 }
 
 #[expect(
     clippy::too_many_lines,
     reason = "keep the broker failover schedule and independent cursor checks together"
 )]
-async fn failover_during_drain(policy: Confirmation) {
-    let mut cluster = Cluster::new(policy).await;
+async fn failover_during_drain() {
+    let mut cluster = Cluster::new(DeploymentMode::Three).await;
     let links = role_links_with_config(
         &cluster.runtime,
         &cluster.configs[0].0,

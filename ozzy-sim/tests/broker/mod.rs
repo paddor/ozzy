@@ -9,7 +9,7 @@
     reason = "simulation test support"
 )]
 use clock::progress;
-use ozzy_config::{Confirmation, HostResources};
+use ozzy_config::{DeploymentMode, HostResources};
 use ozzy_runtime::replicated::{SdkClock, WriterRuntime};
 use ozzy_sim::{broker, client::Client};
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
@@ -20,11 +20,7 @@ mod runner;
 #[tokio::test(flavor = "current_thread")]
 async fn inproc_memory_all_modes_share_the_real_broker_and_sdk_harness() {
     tokio::time::timeout(Duration::from_secs(60), async {
-        for policy in [
-            Confirmation::LocalDurable,
-            Confirmation::DiskQuorum,
-            Confirmation::ReplicatedPersisting,
-        ] {
+        for mode in [DeploymentMode::Single, DeploymentMode::Three] {
             let runtime = WriterRuntime::new().unwrap();
             let root = PathBuf::from(format!("/ozzy-full-stack-{}", uuid::Uuid::now_v7()));
             let resources = HostResources {
@@ -34,7 +30,10 @@ async fn inproc_memory_all_modes_share_the_real_broker_and_sdk_harness() {
             };
             let configs = broker::deployment_with_resources(
                 &root,
-                broker::Shape::for_policy(policy, 2),
+                broker::Shape {
+                    mode,
+                    partitions: 2,
+                },
                 &resources,
                 |_| {},
             );
@@ -72,12 +71,8 @@ async fn inproc_memory_all_modes_share_the_real_broker_and_sdk_harness() {
 #[tokio::test(flavor = "current_thread")]
 async fn inproc_memory_sequential_sdk_identities_reclaim_client_slots_in_every_mode() {
     tokio::time::timeout(Duration::from_secs(120), async {
-        for policy in [
-            Confirmation::LocalDurable,
-            Confirmation::DiskQuorum,
-            Confirmation::ReplicatedPersisting,
-        ] {
-            let cluster = broker::Cluster::new(policy).await;
+        for mode in [DeploymentMode::Single, DeploymentMode::Three] {
+            let cluster = broker::Cluster::new(mode).await;
             let mut client =
                 Client::open_with_runtime(&cluster.configs[0].0, &cluster.runtime).await;
             for wave in 0..40 {
@@ -98,66 +93,64 @@ async fn inproc_memory_sequential_sdk_identities_reclaim_client_slots_in_every_m
 #[tokio::test(flavor = "current_thread")]
 async fn inproc_memory_recovery_retries_while_a_donor_completion_is_held() {
     tokio::time::timeout(Duration::from_secs(90), async {
-        for policy in [Confirmation::DiskQuorum, Confirmation::ReplicatedPersisting] {
-            // Manual broker time crosses the recovery stall deadline quickly.
-            let clock = SdkClock::manual();
-            let mut cluster = progress(
-                &clock,
-                broker::Cluster::configured(policy, Some(clock.clone()), |_| {}),
-            )
-            .await;
-            let mut client = progress(
-                &clock,
-                Client::open_with_clock(&cluster.configs[0].0, &cluster.runtime, clock.clone()),
-            )
-            .await;
-            let pending = progress(&clock, client.queue(0)).await;
-            progress(&clock, client.confirm(pending)).await;
-            let primary = client.leader(0);
-            let donor = cluster
-                .configs
-                .iter()
-                .position(|(config, _)| {
-                    ozzy_proto::NodeId::from_bytes(
-                        *config.identity.brokers[&config.plan.name].as_bytes(),
-                    ) == primary
-                })
-                .unwrap();
-            let requester = (donor + 1) % 3;
-            let control = cluster.controls[donor].clone();
-            control.hold_completions(true);
-            progress(&clock, cluster.restart_fresh(requester)).await;
-            let held = async {
-                tokio::time::timeout(Duration::from_secs(5), async {
-                    while control.pending_completions() == 0 {
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await
-                .expect("recovery never submitted physical donor work");
-                // The production recovery actor abandons an attempt after ten
-                // seconds of broker time without progress and sends a fresh
-                // nonce on reopen.
-                let until = clock.now() + Duration::from_secs(12);
-                while clock.now() < until {
+        // Manual broker time crosses the recovery stall deadline quickly.
+        let clock = SdkClock::manual();
+        let mut cluster = progress(
+            &clock,
+            broker::Cluster::configured(DeploymentMode::Three, Some(clock.clone()), |_| {}),
+        )
+        .await;
+        let mut client = progress(
+            &clock,
+            Client::open_with_clock(&cluster.configs[0].0, &cluster.runtime, clock.clone()),
+        )
+        .await;
+        let pending = progress(&clock, client.queue(0)).await;
+        progress(&clock, client.confirm(pending)).await;
+        let primary = client.leader(0);
+        let donor = cluster
+            .configs
+            .iter()
+            .position(|(config, _)| {
+                ozzy_proto::NodeId::from_bytes(
+                    *config.identity.brokers[&config.plan.name].as_bytes(),
+                ) == primary
+            })
+            .unwrap();
+        let requester = (donor + 1) % 3;
+        let control = cluster.controls[donor].clone();
+        control.hold_completions(true);
+        progress(&clock, cluster.restart_fresh(requester)).await;
+        let held = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while control.pending_completions() == 0 {
                     tokio::task::yield_now().await;
                 }
-            };
-            tokio::select! {
-                () = progress(&clock, held) => {},
-                (result, index, _) = futures::future::select_all(
-                    cluster.brokers.iter().map(|broker| Box::pin(broker.closed()))
-                ) => panic!("broker {index} failed during delayed donor pin: {result:?}"),
+            })
+            .await
+            .expect("recovery never submitted physical donor work");
+            // The production recovery actor abandons an attempt after ten
+            // seconds of broker time without progress and sends a fresh
+            // nonce on reopen.
+            let until = clock.now() + Duration::from_secs(12);
+            while clock.now() < until {
+                tokio::task::yield_now().await;
             }
-            control.hold_completions(false);
-            progress(&clock, cluster.wait_recovered(requester)).await;
-            progress(&clock, client.replay()).await;
-            let pending = progress(&clock, client.queue(1)).await;
-            progress(&clock, client.confirm(pending)).await;
-            progress(&clock, client.replay()).await;
-            progress(&clock, client.close()).await;
-            progress(&clock, cluster.shutdown()).await;
+        };
+        tokio::select! {
+            () = progress(&clock, held) => {},
+            (result, index, _) = futures::future::select_all(
+                cluster.brokers.iter().map(|broker| Box::pin(broker.closed()))
+            ) => panic!("broker {index} failed during delayed donor pin: {result:?}"),
         }
+        control.hold_completions(false);
+        progress(&clock, cluster.wait_recovered(requester)).await;
+        progress(&clock, client.replay()).await;
+        let pending = progress(&clock, client.queue(1)).await;
+        progress(&clock, client.confirm(pending)).await;
+        progress(&clock, client.replay()).await;
+        progress(&clock, client.close()).await;
+        progress(&clock, cluster.shutdown()).await;
     })
     .await
     .expect("delayed donor recovery did not regain bounded progress");
@@ -173,7 +166,7 @@ async fn inproc_memory_failure_artifact_preserves_images_and_replays_its_fault_p
     )
     .unwrap();
     let config = |artifacts, replay| ozzy_sim::soak::Config {
-        policy: Confirmation::LocalDurable,
+        mode: DeploymentMode::Single,
         seed: 1,
         duration: Duration::from_secs(30),
         waves: 1,

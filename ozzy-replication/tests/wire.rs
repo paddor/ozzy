@@ -187,9 +187,8 @@ fn decoded_durable_ack_still_waits_for_the_primary_disk_boundary() {
     let message = Control::PrepareOk {
         ack: backup.acknowledgment().unwrap(),
     };
-    let mut metadata = [0; 121];
+    let mut metadata = [0; 120];
     let encoded = encode_control(node(1), session(), message, &mut metadata).unwrap();
-    assert_eq!(metadata[120], 2); // Durable evidence, not RAM or socket receipt.
     let binding = PeerBinding::new(configuration(), node(1), session()).unwrap();
     let ReplicaMessage::Control(Control::PrepareOk { ack }) = decode(
         &[&encoded.header, &metadata, &[]],
@@ -459,7 +458,7 @@ fn prepare_rejects_malformed_counts_chains_digests_and_trailing_bytes() {
 }
 
 #[test]
-fn peer_session_configuration_and_weaker_votes_cannot_reach_the_core() {
+fn peer_session_and_configuration_mismatches_cannot_reach_the_core() {
     use ozzy_replication::wire::WireError;
     let limits = WireLimits::default();
     let binding = PeerBinding::new(configuration(), node(1), session()).unwrap();
@@ -469,16 +468,8 @@ fn peer_session_configuration_and_weaker_votes_cannot_reach_the_core() {
             durable: Prefix::GENESIS,
         },
     };
-    let mut metadata = [0; 121];
+    let mut metadata = [0; 120];
     let encoded = encode_control(node(1), session(), message, &mut metadata).unwrap();
-    for evidence in [0, 1, 3, 255] {
-        let mut bad = metadata;
-        bad[120] = evidence;
-        assert_eq!(
-            decode(&[&encoded.header, &bad, &[]], binding, limits),
-            Err(WireError::Evidence)
-        );
-    }
     for offset in [24, 40] {
         let mut bad = encoded.header;
         bad[offset] ^= 1;

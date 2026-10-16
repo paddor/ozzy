@@ -454,20 +454,10 @@ impl ReplicaActor {
         let Some(normal) = self.driver.normal() else {
             return Ok(());
         };
-        let control = match self.configuration.policy() {
-            ozzy_replication::QuorumPolicy::Durable => {
-                let Ok(ack) = normal.acknowledgment() else {
-                    return Ok(());
-                };
-                Control::PrepareOk { ack }
-            }
-            ozzy_replication::QuorumPolicy::Replicated => {
-                let Ok(ack) = normal.retained_acknowledgment() else {
-                    return Ok(());
-                };
-                Control::PrepareRetained { ack }
-            }
+        let Ok(ack) = normal.acknowledgment() else {
+            return Ok(());
         };
+        let control = Control::PrepareOk { ack };
         // An event asks for the current vote. An unchanged one waits for the
         // retransmit timer, which also covers a lost packet.
         if let Some((vote, at)) = self.acked

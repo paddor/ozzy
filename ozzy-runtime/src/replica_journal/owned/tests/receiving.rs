@@ -19,8 +19,8 @@ fn generations(attempt: u128) -> RecoveryGenerations {
     }
 }
 
-fn receiver_config(policy: QuorumPolicy) -> OwnedConfig {
-    let mut config = config("/replacement", 7, policy);
+fn receiver_config() -> OwnedConfig {
+    let mut config = config("/replacement", 7);
     config.identity.replica_node_id = NodeId::from_bytes([2; 16]);
     config
 }
@@ -154,89 +154,87 @@ fn transfer(
 }
 
 #[test]
-fn owned_recovery_full_transfer_both_policies_preserve_unconfirmed_tail_and_fence_restart() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        let (mut controller, io) = setup();
-        let mut primary = replica(&mut controller, io.clone(), 0, policy, 8192);
-        let mut backup = replica(&mut controller, io.clone(), 2, policy, 8192);
-        let committed = persist(&mut controller, &mut primary);
-        persist(&mut controller, &mut backup);
-        confirm(&mut primary, &backup, policy);
-        let accepted = persist(&mut controller, &mut primary);
-        let config = receiver_config(policy);
-        let (mut receiver, startup) = drive(
-            &mut controller,
-            RecoveringJournal::start(
-                config.clone(),
-                io.clone(),
-                generations(50),
-                RecoveryOpen::FormatNew {
-                    segment_capacity: 32768,
-                },
-            ),
-        )
-        .unwrap();
-        let memory = payload_owner(32 * 1024);
-        receiver.bind_append_memory(&memory).unwrap();
-        let (mut recovery, ticket, pin) =
-            authorize(&mut controller, &mut primary, &backup, startup, 62);
-        let plan = drive(&mut controller, receiver.begin_recovery(ticket, physical())).unwrap();
-        assert_eq!(plan, RecoveryPlan::Full);
-        transfer(
-            &mut controller,
-            &mut primary,
-            &mut receiver,
-            &mut recovery,
-            ticket,
-            pin,
-            plan,
-        );
-        let publication = drive(&mut controller, receiver.finish_recovery(ticket)).unwrap();
-        assert_eq!(publication.applied(), committed);
-        assert_eq!(
-            drive(&mut controller, receiver.finish_recovery(ticket)).unwrap(),
-            publication
-        );
-        let (journal, startup) = drive(
-            &mut controller,
-            receiver.into_journal(&mut recovery, publication, JournalGeneration(70)),
-        )
-        .unwrap();
-        let restored = startup.recovered().unwrap();
-        memory.trim_cache();
-        assert_eq!(memory.allocated_bytes(), 0);
-        let mut buffer = journal.lease_append_buffer().unwrap();
-        buffer.push_read_part(&[7; 128]).unwrap();
-        assert_eq!(
-            memory.allocated_bytes(),
-            128,
-            "adoption preserved the same budget"
-        );
-        drop(buffer);
-        assert_eq!(restored.log.accepted, accepted);
-        assert_eq!(restored.log.committed, committed);
-        assert!(journal.images().is_err());
-        assert!(
-            startup
-                .into_driver(Duration::ZERO, timing(), pipeline())
-                .unwrap()
-                .normal()
-                .is_none()
-        );
-        drive(&mut controller, journal.shutdown()).unwrap();
-        primary.journal.release_recovery(pin).unwrap();
-        drive(&mut controller, primary.journal.shutdown()).unwrap();
-        drive(&mut controller, backup.journal.shutdown()).unwrap();
-    }
+fn owned_recovery_full_transfer_preserves_unconfirmed_tail_and_fences_restart() {
+    let (mut controller, io) = setup();
+    let mut primary = replica(&mut controller, io.clone(), 0, 8192);
+    let mut backup = replica(&mut controller, io.clone(), 2, 8192);
+    let committed = persist(&mut controller, &mut primary);
+    persist(&mut controller, &mut backup);
+    confirm(&mut primary, &backup);
+    let accepted = persist(&mut controller, &mut primary);
+    let config = receiver_config();
+    let (mut receiver, startup) = drive(
+        &mut controller,
+        RecoveringJournal::start(
+            config.clone(),
+            io.clone(),
+            generations(50),
+            RecoveryOpen::FormatNew {
+                segment_capacity: 32768,
+            },
+        ),
+    )
+    .unwrap();
+    let memory = payload_owner(32 * 1024);
+    receiver.bind_append_memory(&memory).unwrap();
+    let (mut recovery, ticket, pin) =
+        authorize(&mut controller, &mut primary, &backup, startup, 62);
+    let plan = drive(&mut controller, receiver.begin_recovery(ticket, physical())).unwrap();
+    assert_eq!(plan, RecoveryPlan::Full);
+    transfer(
+        &mut controller,
+        &mut primary,
+        &mut receiver,
+        &mut recovery,
+        ticket,
+        pin,
+        plan,
+    );
+    let publication = drive(&mut controller, receiver.finish_recovery(ticket)).unwrap();
+    assert_eq!(publication.applied(), committed);
+    assert_eq!(
+        drive(&mut controller, receiver.finish_recovery(ticket)).unwrap(),
+        publication
+    );
+    let (journal, startup) = drive(
+        &mut controller,
+        receiver.into_journal(&mut recovery, publication, JournalGeneration(70)),
+    )
+    .unwrap();
+    let restored = startup.recovered().unwrap();
+    memory.trim_cache();
+    assert_eq!(memory.allocated_bytes(), 0);
+    let mut buffer = journal.lease_append_buffer().unwrap();
+    buffer.push_read_part(&[7; 128]).unwrap();
+    assert_eq!(
+        memory.allocated_bytes(),
+        128,
+        "adoption preserved the same budget"
+    );
+    drop(buffer);
+    assert_eq!(restored.log.accepted, accepted);
+    assert_eq!(restored.log.committed, committed);
+    assert!(journal.images().is_err());
+    assert!(
+        startup
+            .into_driver(Duration::ZERO, timing(), pipeline())
+            .unwrap()
+            .normal()
+            .is_none()
+    );
+    drive(&mut controller, journal.shutdown()).unwrap();
+    primary.journal.release_recovery(pin).unwrap();
+    drive(&mut controller, primary.journal.shutdown()).unwrap();
+    drive(&mut controller, backup.journal.shutdown()).unwrap();
 }
 
 #[test]
 fn owned_recovery_canceled_begin_stays_nonvoting_and_does_not_stop_other_partitions() {
     let (mut controller, io) = setup();
-    let mut primary = replica(&mut controller, io.clone(), 0, QuorumPolicy::Durable, 8192);
-    let backup = replica(&mut controller, io.clone(), 2, QuorumPolicy::Durable, 8192);
+    let mut primary = replica(&mut controller, io.clone(), 0, 8192);
+    let backup = replica(&mut controller, io.clone(), 2, 8192);
     persist(&mut controller, &mut primary);
-    let config = receiver_config(QuorumPolicy::Durable);
+    let config = receiver_config();
     let (mut receiver, startup) = drive(
         &mut controller,
         RecoveringJournal::start(
@@ -296,7 +294,7 @@ fn owned_recovery_canceled_begin_stays_nonvoting_and_does_not_stop_other_partiti
 #[test]
 fn owned_recovery_quarantine_rejects_unsupported_profile_before_marker_publication() {
     let (mut controller, io) = setup();
-    let config = receiver_config(QuorumPolicy::Durable);
+    let config = receiver_config();
     let (journal, _) = drive(
         &mut controller,
         OwnedJournal::format_new(config.clone(), io.clone(), JournalGeneration(1), 32768),
@@ -335,171 +333,167 @@ fn owned_recovery_quarantine_rejects_unsupported_profile_before_marker_publicati
 
 #[test]
 fn owned_checkpoint_recovery_after_retirement_preserves_confirmed_anchor_and_accepted_tail() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        let (mut controller, io) = setup();
-        let mut primary = replica(&mut controller, io.clone(), 0, policy, 8192);
-        let mut backup = replica(&mut controller, io.clone(), 2, policy, 8192);
-        let old = persist(&mut controller, &mut primary);
-        persist(&mut controller, &mut backup);
-        confirm(&mut primary, &backup, policy);
-        let roll = primary.journal.begin_roll(8).unwrap();
-        let done = drive(&mut controller, roll.publish());
-        primary.journal.complete_roll(done).unwrap();
-        let committed = persist(&mut controller, &mut primary);
-        persist(&mut controller, &mut backup);
-        confirm(&mut primary, &backup, policy);
-        let ticket = primary.driver.begin_validation().unwrap();
-        let retired = drive(
-            &mut controller,
-            primary.journal.retire_confirmed_history(
-                ticket,
-                ozzy_proto::CheckpointId::from_bytes([95; 16]),
-                ozzy_journal_segment::RetirementBudget {
-                    max_segments: 1,
-                    max_read_bytes: 32768,
-                },
-            ),
-        )
-        .unwrap();
-        assert_eq!(retired.unreferenced_segment_ids, [1]);
-        let accepted = persist(&mut controller, &mut primary);
-        let (mut receiver, startup) = drive(
-            &mut controller,
-            RecoveringJournal::start(
-                receiver_config(policy),
-                io.clone(),
-                generations(150),
-                RecoveryOpen::FormatNew {
-                    segment_capacity: 32768,
-                },
-            ),
-        )
-        .unwrap();
-        let memory = payload_owner(1024 * 1024);
-        receiver.bind_append_memory(&memory).unwrap();
-        let (mut recovery, ticket, pin) =
-            authorize(&mut controller, &mut primary, &backup, startup, 96);
-        let anchor = ticket
-            .checkpoint()
-            .expect("selected checkpoint required after retirement");
-        assert_eq!(anchor.predecessor, old);
-        assert_eq!(anchor.position, committed);
-        assert_eq!(ticket.source().accepted, accepted);
-        let plan = drive(&mut controller, receiver.begin_recovery(ticket, physical())).unwrap();
-        transfer(
-            &mut controller,
-            &mut primary,
-            &mut receiver,
-            &mut recovery,
+    let (mut controller, io) = setup();
+    let mut primary = replica(&mut controller, io.clone(), 0, 8192);
+    let mut backup = replica(&mut controller, io.clone(), 2, 8192);
+    let old = persist(&mut controller, &mut primary);
+    persist(&mut controller, &mut backup);
+    confirm(&mut primary, &backup);
+    let roll = primary.journal.begin_roll(8).unwrap();
+    let done = drive(&mut controller, roll.publish());
+    primary.journal.complete_roll(done).unwrap();
+    let committed = persist(&mut controller, &mut primary);
+    persist(&mut controller, &mut backup);
+    confirm(&mut primary, &backup);
+    let ticket = primary.driver.begin_validation().unwrap();
+    let retired = drive(
+        &mut controller,
+        primary.journal.retire_confirmed_history(
             ticket,
-            pin,
-            plan,
-        );
-        let publication = drive(&mut controller, receiver.finish_recovery(ticket)).unwrap();
-        let (journal, startup) = drive(
-            &mut controller,
-            receiver.into_journal(&mut recovery, publication, JournalGeneration(170)),
-        )
-        .unwrap();
-        let restored = startup.recovered().unwrap();
-        assert_eq!(restored.log.accepted, accepted);
-        assert_eq!(restored.log.committed, committed);
-        assert!(
-            startup
-                .into_driver(Duration::ZERO, timing(), pipeline())
-                .unwrap()
-                .normal()
-                .is_none()
-        );
-        let files = journal
-            .journal
-            .readable()
+            ozzy_proto::CheckpointId::from_bytes([95; 16]),
+            ozzy_journal_segment::RetirementBudget {
+                max_segments: 1,
+                max_read_bytes: 32768,
+            },
+        ),
+    )
+    .unwrap();
+    assert_eq!(retired.unreferenced_segment_ids, [1]);
+    let accepted = persist(&mut controller, &mut primary);
+    let (mut receiver, startup) = drive(
+        &mut controller,
+        RecoveringJournal::start(
+            receiver_config(),
+            io.clone(),
+            generations(150),
+            RecoveryOpen::FormatNew {
+                segment_capacity: 32768,
+            },
+        ),
+    )
+    .unwrap();
+    let memory = payload_owner(1024 * 1024);
+    receiver.bind_append_memory(&memory).unwrap();
+    let (mut recovery, ticket, pin) =
+        authorize(&mut controller, &mut primary, &backup, startup, 96);
+    let anchor = ticket
+        .checkpoint()
+        .expect("selected checkpoint required after retirement");
+    assert_eq!(anchor.predecessor, old);
+    assert_eq!(anchor.position, committed);
+    assert_eq!(ticket.source().accepted, accepted);
+    let plan = drive(&mut controller, receiver.begin_recovery(ticket, physical())).unwrap();
+    transfer(
+        &mut controller,
+        &mut primary,
+        &mut receiver,
+        &mut recovery,
+        ticket,
+        pin,
+        plan,
+    );
+    let publication = drive(&mut controller, receiver.finish_recovery(ticket)).unwrap();
+    let (journal, startup) = drive(
+        &mut controller,
+        receiver.into_journal(&mut recovery, publication, JournalGeneration(170)),
+    )
+    .unwrap();
+    let restored = startup.recovered().unwrap();
+    assert_eq!(restored.log.accepted, accepted);
+    assert_eq!(restored.log.committed, committed);
+    assert!(
+        startup
+            .into_driver(Duration::ZERO, timing(), pipeline())
             .unwrap()
-            .capture_checkpoint()
-            .unwrap();
-        assert_eq!(
-            files.manifest().store_id,
-            receiver_config(policy).identity.store_id
-        );
-        assert_eq!(
-            files.manifest().position,
-            crate::replica_journal::authority::position(committed)
-        );
-        drop(files);
-        drive(&mut controller, journal.shutdown()).unwrap();
-        primary.journal.release_recovery(pin).unwrap();
-        drive(&mut controller, primary.journal.shutdown()).unwrap();
-        drive(&mut controller, backup.journal.shutdown()).unwrap();
-    }
+            .normal()
+            .is_none()
+    );
+    let files = journal
+        .journal
+        .readable()
+        .unwrap()
+        .capture_checkpoint()
+        .unwrap();
+    assert_eq!(
+        files.manifest().store_id,
+        receiver_config().identity.store_id
+    );
+    assert_eq!(
+        files.manifest().position,
+        crate::replica_journal::authority::position(committed)
+    );
+    drop(files);
+    drive(&mut controller, journal.shutdown()).unwrap();
+    primary.journal.release_recovery(pin).unwrap();
+    drive(&mut controller, primary.journal.shutdown()).unwrap();
+    drive(&mut controller, backup.journal.shutdown()).unwrap();
 }
 
 #[test]
 fn owned_checkpoint_recovery_at_the_accepted_tail_needs_no_operations() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        let (mut controller, io) = setup();
-        let mut primary = replica(&mut controller, io.clone(), 0, policy, 8192);
-        let mut backup = replica(&mut controller, io.clone(), 2, policy, 8192);
-        let accepted = persist(&mut controller, &mut primary);
-        persist(&mut controller, &mut backup);
-        confirm(&mut primary, &backup, policy);
-        let roll = primary.journal.begin_roll(8).unwrap();
-        let done = drive(&mut controller, roll.publish());
-        primary.journal.complete_roll(done).unwrap();
-        let retired = drive(
-            &mut controller,
-            primary.journal.retire_confirmed_history(
-                primary.driver.begin_validation().unwrap(),
-                ozzy_proto::CheckpointId::from_bytes([97; 16]),
-                ozzy_journal_segment::RetirementBudget {
-                    max_segments: 1,
-                    max_read_bytes: 32768,
-                },
-            ),
-        )
-        .unwrap();
-        assert_eq!(retired.unreferenced_segment_ids, [1]);
-        let (mut receiver, startup) = drive(
-            &mut controller,
-            RecoveringJournal::start(
-                receiver_config(policy),
-                io.clone(),
-                generations(180),
-                RecoveryOpen::FormatNew {
-                    segment_capacity: 32768,
-                },
-            ),
-        )
-        .unwrap();
-        let memory = payload_owner(1024 * 1024);
-        receiver.bind_append_memory(&memory).unwrap();
-        let (mut recovery, ticket, pin) =
-            authorize(&mut controller, &mut primary, &backup, startup, 98);
-        let anchor = ticket.checkpoint().unwrap();
-        assert_eq!(anchor.predecessor, accepted);
-        assert_eq!(anchor.position, accepted);
-        let plan = drive(&mut controller, receiver.begin_recovery(ticket, physical())).unwrap();
-        transfer(
-            &mut controller,
-            &mut primary,
-            &mut receiver,
-            &mut recovery,
-            ticket,
-            pin,
-            plan,
-        );
-        let publication = drive(&mut controller, receiver.finish_recovery(ticket)).unwrap();
-        let (journal, startup) = drive(
-            &mut controller,
-            receiver.into_journal(&mut recovery, publication, JournalGeneration(190)),
-        )
-        .unwrap();
-        assert_eq!(startup.recovered().unwrap().log.accepted, accepted);
-        assert_eq!(startup.recovered().unwrap().log.committed, accepted);
-        memory.trim_cache();
-        assert_eq!(memory.allocated_bytes(), 0);
-        drive(&mut controller, journal.shutdown()).unwrap();
-        primary.journal.release_recovery(pin).unwrap();
-        drive(&mut controller, primary.journal.shutdown()).unwrap();
-        drive(&mut controller, backup.journal.shutdown()).unwrap();
-    }
+    let (mut controller, io) = setup();
+    let mut primary = replica(&mut controller, io.clone(), 0, 8192);
+    let mut backup = replica(&mut controller, io.clone(), 2, 8192);
+    let accepted = persist(&mut controller, &mut primary);
+    persist(&mut controller, &mut backup);
+    confirm(&mut primary, &backup);
+    let roll = primary.journal.begin_roll(8).unwrap();
+    let done = drive(&mut controller, roll.publish());
+    primary.journal.complete_roll(done).unwrap();
+    let retired = drive(
+        &mut controller,
+        primary.journal.retire_confirmed_history(
+            primary.driver.begin_validation().unwrap(),
+            ozzy_proto::CheckpointId::from_bytes([97; 16]),
+            ozzy_journal_segment::RetirementBudget {
+                max_segments: 1,
+                max_read_bytes: 32768,
+            },
+        ),
+    )
+    .unwrap();
+    assert_eq!(retired.unreferenced_segment_ids, [1]);
+    let (mut receiver, startup) = drive(
+        &mut controller,
+        RecoveringJournal::start(
+            receiver_config(),
+            io.clone(),
+            generations(180),
+            RecoveryOpen::FormatNew {
+                segment_capacity: 32768,
+            },
+        ),
+    )
+    .unwrap();
+    let memory = payload_owner(1024 * 1024);
+    receiver.bind_append_memory(&memory).unwrap();
+    let (mut recovery, ticket, pin) =
+        authorize(&mut controller, &mut primary, &backup, startup, 98);
+    let anchor = ticket.checkpoint().unwrap();
+    assert_eq!(anchor.predecessor, accepted);
+    assert_eq!(anchor.position, accepted);
+    let plan = drive(&mut controller, receiver.begin_recovery(ticket, physical())).unwrap();
+    transfer(
+        &mut controller,
+        &mut primary,
+        &mut receiver,
+        &mut recovery,
+        ticket,
+        pin,
+        plan,
+    );
+    let publication = drive(&mut controller, receiver.finish_recovery(ticket)).unwrap();
+    let (journal, startup) = drive(
+        &mut controller,
+        receiver.into_journal(&mut recovery, publication, JournalGeneration(190)),
+    )
+    .unwrap();
+    assert_eq!(startup.recovered().unwrap().log.accepted, accepted);
+    assert_eq!(startup.recovered().unwrap().log.committed, accepted);
+    memory.trim_cache();
+    assert_eq!(memory.allocated_bytes(), 0);
+    drive(&mut controller, journal.shutdown()).unwrap();
+    primary.journal.release_recovery(pin).unwrap();
+    drive(&mut controller, primary.journal.shutdown()).unwrap();
+    drive(&mut controller, backup.journal.shutdown()).unwrap();
 }

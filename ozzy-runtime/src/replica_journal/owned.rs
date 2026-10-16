@@ -52,8 +52,8 @@ use ozzy_journal_segment::{
     JournalHistory, JournalIdentityIndex, JournalLimits, SegmentHeader,
 };
 use ozzy_replication::{
-    Digest, FrozenLog, JournalGeneration, PipelineLimits, Prefix, PromiseTicket, QuorumPolicy,
-    RecoveredState, Scope,
+    Digest, FrozenLog, JournalGeneration, PipelineLimits, Prefix, PromiseTicket, RecoveredState,
+    Scope,
 };
 use tokio::sync::Semaphore;
 
@@ -131,7 +131,6 @@ impl OwnedJournal {
                         .pending_operations
                         .min(self.recovery.accepted_transitions)
                 }),
-            replicated: self.configuration.memory_voting(),
             dedup_window_millis: self.dedup.limits.map(|limits| limits.window_millis),
             capacity: Arc::new(Semaphore::new(config.commands)),
             command_capacity: config.commands,
@@ -204,12 +203,6 @@ impl OwnedJournal {
         let configuration = config.configuration.configuration();
         let candidate = journal.recover_canonical_candidate(config.recovery).await?;
         let accepted = prefix(journal.accepted_position()?);
-        if configuration.policy() == QuorumPolicy::Replicated {
-            if !fresh {
-                journal.require_drained_memory_history().await?;
-            }
-            journal.mark_memory_voting_running().await?;
-        }
         let images = if fresh {
             Some(candidate.activate(&journal)?)
         } else {
@@ -429,11 +422,7 @@ impl OwnedJournal {
             self.donors = std::array::from_fn(|_| None);
             self.images = None;
             self.selected = None;
-            let mut journal = self.journal.take_ready()?;
-            if self.configuration.memory_voting() {
-                journal.publish_drained_memory_history().await?;
-            }
-            journal.close().await?;
+            self.journal.take_ready()?.close().await?;
             Ok(())
         })
     }

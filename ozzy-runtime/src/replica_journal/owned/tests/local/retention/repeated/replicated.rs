@@ -5,105 +5,102 @@ use crate::replica_journal::owned::tests::{
 };
 
 #[test]
-fn repeated_retirement_preserves_both_quorum_policies_and_the_retained_chain() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        let (mut controller, io) = setup();
-        let mut primary = replica(&mut controller, io.clone(), 0, policy, 8192);
-        let mut backup = replica(&mut controller, io, 2, policy, 8192);
-        let mut prefixes = Vec::new();
-        for at in 0..3 {
-            prefixes.push(persist(&mut controller, &mut primary));
-            persist(&mut controller, &mut backup);
-            confirm(&mut primary, &backup, policy);
-            if at != 2 {
-                roll(&mut controller, &mut primary.journal);
-            }
+fn repeated_retirement_preserves_disk_quorum_and_the_retained_chain() {
+    let (mut controller, io) = setup();
+    let mut primary = replica(&mut controller, io.clone(), 0, 8192);
+    let mut backup = replica(&mut controller, io, 2, 8192);
+    let mut prefixes = Vec::new();
+    for at in 0..3 {
+        prefixes.push(persist(&mut controller, &mut primary));
+        persist(&mut controller, &mut backup);
+        confirm(&mut primary, &backup);
+        if at != 2 {
+            roll(&mut controller, &mut primary.journal);
         }
-        let ticket = primary.driver.begin_validation().unwrap();
-        let before = primary.driver.normal().unwrap().snapshot();
-        let owner = primary.journal.append_memory.clone().unwrap();
-        owner.trim_cache();
-        let occupied = owner
-            .try_charge(1024 * 1024 - owner.allocated_bytes())
-            .unwrap();
-        assert!(matches!(
-            drive(
-                &mut controller,
-                primary.journal.retire_confirmed_history(
-                    ticket,
-                    CheckpointId::from_bytes([91; 16]),
-                    RetirementBudget {
-                        max_segments: 1,
-                        max_read_bytes: 32768
-                    },
-                )
-            ),
-            Err(JournalError::AppendCapacity)
-        ));
-        assert!(!primary.journal.is_faulted());
-        assert!(
-            primary
-                .journal
-                .journal
-                .ready()
-                .unwrap()
-                .manifest()
-                .checkpoint
-                .is_none()
-        );
-        assert_eq!(primary.driver.normal().unwrap().snapshot(), before);
-        drop(occupied);
-
-        let selected = retire(&mut controller, &mut primary.journal, ticket, 92, &[1]);
-        assert_eq!(
-            retire(&mut controller, &mut primary.journal, ticket, 93, &[2]),
-            selected
-        );
-        assert_eq!(
-            retire(&mut controller, &mut primary.journal, ticket, 94, &[]),
-            selected
-        );
-        assert_eq!(primary.driver.normal().unwrap().snapshot(), before);
-        assert!(!primary.journal.is_faulted());
-        let request = ozzy_replication::wire::FetchOps {
-            scope: ticket.scope(),
-            request_id: ozzy_proto::RequestId::from_bytes([95; 16]),
-            source: ozzy_replication::LogSource {
-                voter: primary.config.identity.replica_node_id,
-                generation: ticket.generation(),
-                accepted: ticket.accepted(),
-            },
-            predecessor: prefixes[1],
-            max_operations: 4,
-            max_body_bytes: 8192,
-        };
-        let buffer = primary.journal.lease_append_buffer().unwrap();
-        let fetched = drive(
-            &mut controller,
-            primary.journal.fetch_history(request, buffer),
-        )
-        .unwrap();
-        assert_eq!(fetched.end(), prefixes[2]);
-        let operations = fetched.buffer().operations().collect::<Vec<_>>();
-        assert_eq!(operations.len(), 1);
-        assert_eq!(operations[0].previous_digest, prefixes[1].digest);
-        assert_eq!(operations[0].body, &[3; 16]);
-        drop(fetched);
-        drive(&mut controller, primary.journal.shutdown()).unwrap();
-        drive(&mut controller, backup.journal.shutdown()).unwrap();
     }
+    let ticket = primary.driver.begin_validation().unwrap();
+    let before = primary.driver.normal().unwrap().snapshot();
+    let owner = primary.journal.append_memory.clone().unwrap();
+    owner.trim_cache();
+    let occupied = owner
+        .try_charge(1024 * 1024 - owner.allocated_bytes())
+        .unwrap();
+    assert!(matches!(
+        drive(
+            &mut controller,
+            primary.journal.retire_confirmed_history(
+                ticket,
+                CheckpointId::from_bytes([91; 16]),
+                RetirementBudget {
+                    max_segments: 1,
+                    max_read_bytes: 32768
+                },
+            )
+        ),
+        Err(JournalError::AppendCapacity)
+    ));
+    assert!(!primary.journal.is_faulted());
+    assert!(
+        primary
+            .journal
+            .journal
+            .ready()
+            .unwrap()
+            .manifest()
+            .checkpoint
+            .is_none()
+    );
+    assert_eq!(primary.driver.normal().unwrap().snapshot(), before);
+    drop(occupied);
+
+    let selected = retire(&mut controller, &mut primary.journal, ticket, 92, &[1]);
+    assert_eq!(
+        retire(&mut controller, &mut primary.journal, ticket, 93, &[2]),
+        selected
+    );
+    assert_eq!(
+        retire(&mut controller, &mut primary.journal, ticket, 94, &[]),
+        selected
+    );
+    assert_eq!(primary.driver.normal().unwrap().snapshot(), before);
+    assert!(!primary.journal.is_faulted());
+    let request = ozzy_replication::wire::FetchOps {
+        scope: ticket.scope(),
+        request_id: ozzy_proto::RequestId::from_bytes([95; 16]),
+        source: ozzy_replication::LogSource {
+            voter: primary.config.identity.replica_node_id,
+            generation: ticket.generation(),
+            accepted: ticket.accepted(),
+        },
+        predecessor: prefixes[1],
+        max_operations: 4,
+        max_body_bytes: 8192,
+    };
+    let buffer = primary.journal.lease_append_buffer().unwrap();
+    let fetched = drive(
+        &mut controller,
+        primary.journal.fetch_history(request, buffer),
+    )
+    .unwrap();
+    assert_eq!(fetched.end(), prefixes[2]);
+    let operations = fetched.buffer().operations().collect::<Vec<_>>();
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0].previous_digest, prefixes[1].digest);
+    assert_eq!(operations[0].body, &[3; 16]);
+    drop(fetched);
+    drive(&mut controller, primary.journal.shutdown()).unwrap();
+    drive(&mut controller, backup.journal.shutdown()).unwrap();
 }
 
 #[test]
 fn a_promise_abandons_an_unfinished_retirement_without_fencing() {
-    let policy = QuorumPolicy::Durable;
     let (mut controller, io) = setup();
-    let mut primary = replica(&mut controller, io.clone(), 0, policy, 8192);
-    let mut backup = replica(&mut controller, io, 2, policy, 8192);
+    let mut primary = replica(&mut controller, io.clone(), 0, 8192);
+    let mut backup = replica(&mut controller, io, 2, 8192);
     for at in 0..2 {
         persist(&mut controller, &mut primary);
         persist(&mut controller, &mut backup);
-        confirm(&mut primary, &backup, policy);
+        confirm(&mut primary, &backup);
         if at == 0 {
             roll(&mut controller, &mut primary.journal);
         }

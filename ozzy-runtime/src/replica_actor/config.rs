@@ -62,13 +62,6 @@ pub struct ActorConfig {
     /// Backups coalesce staged work up to these targets while an older barrier
     /// runs. Its completion also releases partial groups without a new timer.
     pub sync_batch_target: SyncBatchTarget,
-    /// Replicated-persisting only: maximum collection age from the first
-    /// admitted write in a sync batch. Must be nonzero. Checked between journal
-    /// actions on every voter; an expired batch syncs before accepting more
-    /// queued work. An empty queue syncs immediately. Disk quorum publishes
-    /// `DURABLE` once no write is in flight or a batch target fills. This is not a linger delay or an I/O timeout: an
-    /// executing write/barrier cannot be interrupted and may exceed this age.
-    pub sync_batch_max_age: Duration,
     /// Disk quorum only: publish `DURABLE` once no write is in flight and none
     /// completed for this long. A filled batch, due maintenance, or an election
     /// publishes sooner. Zero publishes as soon as no write is in flight.
@@ -109,7 +102,6 @@ impl ActorConfig {
             || self.sync_batch_target.operations > self.pipeline.max_operations
             || self.sync_batch_target.body_bytes == 0
             || self.sync_batch_target.body_bytes > self.pipeline.max_body_bytes
-            || self.sync_batch_max_age.is_zero()
             || self.pipeline.max_body_bytes == 0
             || u32::try_from(self.pipeline.max_body_bytes).is_err()
             || self.pipeline.max_body_bytes > isize::MAX as usize

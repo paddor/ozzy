@@ -4,28 +4,15 @@ use super::*;
 
 #[tokio::test(flavor = "current_thread")]
 async fn resume_and_takeover_preserve_independent_partition_sequences_after_leader_loss() {
-    for policy in [
-        Confirmation::LocalDurable,
-        Confirmation::DiskQuorum,
-        Confirmation::ReplicatedPersisting,
-    ] {
-        resume_partitions(policy).await;
+    for mode in [DeploymentMode::Single, DeploymentMode::Three] {
+        resume_partitions(mode).await;
     }
 }
 
-async fn resume_partitions(policy: Confirmation) {
+async fn resume_partitions(mode: DeploymentMode) {
     let runtime = WriterRuntime::new().unwrap();
     let root = std::path::PathBuf::from(format!("/ozzy-resume-partitions-{}", Uuid::now_v7()));
-    let deployment = deployment(
-        &root,
-        if policy == Confirmation::LocalDurable {
-            DeploymentMode::Single
-        } else {
-            DeploymentMode::Three
-        },
-        policy,
-        4,
-    );
+    let deployment = deployment(&root, mode, 4);
     let nodes = deployment
         .iter()
         .map(|(checked, _)| {
@@ -64,7 +51,7 @@ async fn resume_partitions(policy: Confirmation) {
     live_many(&brokers, "close partitioned producer", writer.close())
         .await
         .unwrap();
-    if policy != Confirmation::LocalDurable {
+    if mode != DeploymentMode::Single {
         let leader = nodes
             .iter()
             .position(|&node| Some(node) == old_route.leader)
@@ -80,7 +67,7 @@ async fn resume_partitions(policy: Confirmation) {
     .await
     .unwrap();
     partition_wave(&brokers, &mut resumed, &keys, &mut next, 1).await;
-    if policy != Confirmation::LocalDurable {
+    if mode != DeploymentMode::Single {
         let current = routes.route(0).unwrap().unwrap();
         assert_ne!(current.leader, old_route.leader);
         assert!(current.view > old_route.view);

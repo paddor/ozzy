@@ -2,49 +2,35 @@ use super::*;
 use ozzy_proto::append::AppendDisposition::{Duplicate, Stored};
 
 fn dedup_deployment(
-    policy: Confirmation,
+    mode: DeploymentMode,
     entries: u64,
     window_millis: u64,
 ) -> Vec<(CheckedConfig, BrokerIdentity)> {
-    dedup_partitions(policy, entries, window_millis, 1)
+    dedup_partitions(mode, entries, window_millis, 1)
 }
 
 fn dedup_partitions(
-    policy: Confirmation,
+    mode: DeploymentMode,
     entries: u64,
     window_millis: u64,
     partitions: u32,
 ) -> Vec<(CheckedConfig, BrokerIdentity)> {
     let root = std::path::PathBuf::from(format!("/ozzy-dedup-{}", Uuid::now_v7()));
-    deployment_with(
-        &root,
-        if policy == Confirmation::LocalDurable {
-            DeploymentMode::Single
-        } else {
-            DeploymentMode::Three
-        },
-        policy,
-        partitions,
-        |deployment| {
-            deployment.topics.get_mut("orders").unwrap().deduplication =
-                Some(ozzy_config::TopicDeduplication {
-                    window_millis,
-                    max_entries: entries,
-                    max_bytes: 4 * 1024 * 1024,
-                });
-        },
-    )
+    deployment_with(&root, mode, partitions, |deployment| {
+        deployment.topics.get_mut("orders").unwrap().deduplication =
+            Some(ozzy_config::TopicDeduplication {
+                window_millis,
+                max_entries: entries,
+                max_bytes: 4 * 1024 * 1024,
+            });
+    })
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn redundant_sdk_producers_confirm_original_offsets_in_all_modes() {
-    for policy in [
-        Confirmation::LocalDurable,
-        Confirmation::DiskQuorum,
-        Confirmation::ReplicatedPersisting,
-    ] {
+    for mode in [DeploymentMode::Single, DeploymentMode::Three] {
         let runtime = WriterRuntime::new().unwrap();
-        let deployment = dedup_deployment(policy, 64, 300_000);
+        let deployment = dedup_deployment(mode, 64, 300_000);
         let producer = role_links(&runtime, &deployment[0].0, handshake::PRODUCER).await;
         let redundant = role_links(&runtime, &deployment[0].0, handshake::PRODUCER).await;
         let consumer = role_links(&runtime, &deployment[0].0, handshake::CONSUMER).await;
@@ -92,8 +78,8 @@ async fn redundant_sdk_producers_confirm_original_offsets_in_all_modes() {
             )
             .await
             .unwrap();
-            assert_eq!(receipt.record.offset, offset, "{policy:?}");
-            assert_eq!(receipt.record.disposition, disposition, "{policy:?}");
+            assert_eq!(receipt.record.offset, offset, "{mode:?}");
+            assert_eq!(receipt.record.disposition, disposition, "{mode:?}");
         }
         let mut reader = live_many(
             &brokers,
@@ -134,13 +120,9 @@ async fn redundant_sdk_producers_confirm_original_offsets_in_all_modes() {
 #[tokio::test(flavor = "current_thread")]
 async fn full_dedup_index_resumes_sdk_producers_after_idle_expiry_in_all_modes() {
     use futures::FutureExt;
-    for policy in [
-        Confirmation::LocalDurable,
-        Confirmation::DiskQuorum,
-        Confirmation::ReplicatedPersisting,
-    ] {
+    for mode in [DeploymentMode::Single, DeploymentMode::Three] {
         let runtime = WriterRuntime::new().unwrap();
-        let deployment = dedup_deployment(policy, 2, 1000);
+        let deployment = dedup_deployment(mode, 2, 1000);
         let wire = DataLimits {
             max_records: 2,
             max_parts: 2,
@@ -189,7 +171,7 @@ async fn full_dedup_index_resumes_sdk_producers_after_idle_expiry_in_all_modes()
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(pending.confirmed().now_or_never().is_none(), "{policy:?}");
+        assert!(pending.confirmed().now_or_never().is_none(), "{mode:?}");
         let receipt = live_many(
             &brokers,
             "resume after confirmed idle watermark",
@@ -232,13 +214,9 @@ async fn full_dedup_index_resumes_sdk_producers_after_idle_expiry_in_all_modes()
 
 #[tokio::test(flavor = "current_thread")]
 async fn keyed_takeover_keeps_first_wins_offsets_across_producer_epochs() {
-    for policy in [
-        Confirmation::LocalDurable,
-        Confirmation::DiskQuorum,
-        Confirmation::ReplicatedPersisting,
-    ] {
+    for mode in [DeploymentMode::Single, DeploymentMode::Three] {
         let runtime = WriterRuntime::new().unwrap();
-        let deployment = dedup_partitions(policy, 64, 300_000, 4);
+        let deployment = dedup_partitions(mode, 64, 300_000, 4);
         let producer = role_links(&runtime, &deployment[0].0, handshake::PRODUCER).await;
         let redundant = role_links(&runtime, &deployment[0].0, handshake::PRODUCER).await;
         let replacement = role_links(&runtime, &deployment[0].0, handshake::PRODUCER).await;
@@ -283,9 +261,9 @@ async fn keyed_takeover_keeps_first_wins_offsets_across_producer_epochs() {
         };
         for (id, key, offset) in [(7, 0, 0), (8, 1, 0), (9, 0, 1)] {
             let stored = send(&mut writer, id, key).await.unwrap();
-            assert_eq!(stored, (offset, Stored), "{policy:?}");
+            assert_eq!(stored, (offset, Stored), "{mode:?}");
             let duplicate = send(&mut copy, id, key).await.unwrap();
-            assert_eq!(duplicate, (offset, Duplicate), "{policy:?}");
+            assert_eq!(duplicate, (offset, Duplicate), "{mode:?}");
         }
         let identity = writer.identity();
         let mut takeover = live_many(
@@ -302,17 +280,17 @@ async fn keyed_takeover_keeps_first_wins_offsets_across_producer_epochs() {
         .await
         .unwrap();
         // The old epoch is fenced; identities outlive it.
-        assert!(send(&mut writer, 10, 0).await.is_err(), "{policy:?}");
+        assert!(send(&mut writer, 10, 0).await.is_err(), "{mode:?}");
         for (id, key, expected) in [
             (7, 0, (0, Duplicate)),
             (8, 1, (0, Duplicate)),
             (11, 1, (1, Stored)),
         ] {
             let outcome = send(&mut takeover, id, key).await.unwrap();
-            assert_eq!(outcome, expected, "{policy:?}");
+            assert_eq!(outcome, expected, "{mode:?}");
         }
         let outcome = send(&mut copy, 11, 1).await.unwrap();
-        assert_eq!(outcome, (1, Duplicate), "{policy:?}");
+        assert_eq!(outcome, (1, Duplicate), "{mode:?}");
         // Dropping the fenced writer first must not stall the SDK thread the
         // takeover shares with it.
         drop(writer);

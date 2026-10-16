@@ -10,12 +10,8 @@ const PARTITIONS: usize = 3;
 
 #[tokio::test(flavor = "current_thread")]
 async fn inproc_memory_bounded_sources_preserve_records_in_all_modes() {
-    for policy in [
-        Confirmation::LocalDurable,
-        Confirmation::DiskQuorum,
-        Confirmation::ReplicatedPersisting,
-    ] {
-        Box::pin(run_policy(false, policy, 20, 16)).await;
+    for mode in [DeploymentMode::Single, DeploymentMode::Three] {
+        Box::pin(run_mode(false, mode, 20, 16)).await;
     }
 }
 
@@ -35,44 +31,29 @@ mod stress {
     #[tokio::test(flavor = "current_thread")]
     async fn inproc_memory_load_preserves_records_with_many_producer_sources() {
         // More sources than one paused-input turn, sharing the same shard lanes.
-        Box::pin(run_policy(false, Confirmation::LocalDurable, 20, RECORDS)).await;
+        Box::pin(run_mode(false, DeploymentMode::Single, 20, RECORDS)).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn inproc_memory_load_preserves_many_producer_sources_with_disk_quorum() {
-        Box::pin(run_policy(false, Confirmation::DiskQuorum, 20, RECORDS)).await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn inproc_memory_load_preserves_many_producer_sources_with_replicated_persisting() {
-        Box::pin(run_policy(
-            false,
-            Confirmation::ReplicatedPersisting,
-            20,
-            RECORDS,
-        ))
-        .await;
+        Box::pin(run_mode(false, DeploymentMode::Three, 20, RECORDS)).await;
     }
 }
 
 async fn run(reverse: bool, writers: usize) {
-    for policy in [
-        Confirmation::LocalDurable,
-        Confirmation::DiskQuorum,
-        Confirmation::ReplicatedPersisting,
-    ] {
-        Box::pin(run_policy(reverse, policy, writers, RECORDS)).await;
+    for mode in [DeploymentMode::Single, DeploymentMode::Three] {
+        Box::pin(run_mode(reverse, mode, writers, RECORDS)).await;
     }
 }
 
-async fn run_policy(reverse: bool, policy: Confirmation, writers: usize, records: usize) {
-    eprintln!("inproc memory pressure: reverse={reverse}/{policy:?}");
+async fn run_mode(reverse: bool, mode: DeploymentMode, writers: usize, records: usize) {
+    eprintln!("inproc memory pressure: reverse={reverse}/{mode:?}");
     tokio::time::timeout(
         Duration::from_secs(90),
-        Box::pin(scenario(reverse, policy, writers, records)),
+        Box::pin(scenario(reverse, mode, writers, records)),
     )
     .await
-    .unwrap_or_else(|_| panic!("reverse={reverse}/{policy:?}: inproc load timed out"));
+    .unwrap_or_else(|_| panic!("reverse={reverse}/{mode:?}: inproc load timed out"));
 }
 
 fn wire() -> DataLimits {
@@ -91,15 +72,10 @@ fn wire() -> DataLimits {
     clippy::too_many_lines,
     reason = "one end-to-end bounded load and repair scenario"
 )]
-async fn scenario(reverse: bool, policy: Confirmation, writers: usize, records: usize) {
+async fn scenario(reverse: bool, mode: DeploymentMode, writers: usize, records: usize) {
     let root = std::path::PathBuf::from(format!("/ozzy-simulation-{}", Uuid::now_v7()));
     let runtime = WriterRuntime::new().unwrap();
-    let mode = if policy == Confirmation::LocalDurable {
-        DeploymentMode::Single
-    } else {
-        DeploymentMode::Three
-    };
-    let deployment = deployment_with(&root, mode, policy, PARTITIONS as u32, |config| {
+    let deployment = deployment_with(&root, mode, PARTITIONS as u32, |config| {
         config.topics.get_mut("orders").unwrap().max_append_bytes = 128 * 1024;
         for broker in config.brokers.values_mut() {
             for shard in &mut broker.topology.shards {
@@ -215,7 +191,7 @@ async fn scenario(reverse: bool, policy: Confirmation, writers: usize, records: 
         "paused reader did not exercise PEER replay"
     );
     eprintln!(
-        "inproc memory pressure verified reverse={reverse}/{policy:?}: {} records, {stats:?}",
+        "inproc memory pressure verified reverse={reverse}/{mode:?}: {} records, {stats:?}",
         writers * records
     );
     load_progress(&brokers, "close pressured reader", reader.close())

@@ -85,11 +85,7 @@ impl PreparedReplay {
 impl OwnedJournal {
     fn normal_history(&self) -> Result<JournalHistory, JournalError> {
         let journal = self.journal.readable()?;
-        Ok(if self.configuration.memory_voting() {
-            journal.freeze_written_history(self.limits.io.max_segment_bytes as usize)?
-        } else {
-            journal.freeze_history(self.limits.io.max_segment_bytes as usize)?
-        })
+        Ok(journal.freeze_history(self.limits.io.max_segment_bytes as usize)?)
     }
 
     fn refreshed_history(&mut self, scope: Scope) -> Result<JournalHistory, JournalError> {

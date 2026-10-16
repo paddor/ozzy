@@ -14,7 +14,7 @@ fn config(records: usize, bytes: usize) -> WriterConfig {
     WriterConfig {
         compress_payloads: true,
         batch_target_bytes: 4 * 1024 * 1024,
-        policy: Policy::QuorumReplicatedPersisting,
+        policy: Policy::QuorumDurable,
         partition: PartitionIncarnation::from_bytes([1; 16]),
         owner_epoch: 1,
         producer_id: ProducerId::from_bytes([2; 16]),
