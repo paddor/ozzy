@@ -14,10 +14,12 @@ over OMQ. Install with `cargo install ozzy-broker`.
 
 ## Commands
 
-Every command takes `--config FILE`. `ozzy --help` lists all flags.
+Every command but `quickstart` takes `--config FILE`. `ozzy --help` lists all
+flags.
 
 | Command | Does |
 | --- | --- |
+| `quickstart DIR` | Provision one loopback broker in `DIR` once, then serve it; later runs serve it again |
 | `validate` | Check the deployment and this host's placement; writes nothing |
 | `init` | Create the shared deployment identity once |
 | `init-broker` | Create this broker's local store bindings once |

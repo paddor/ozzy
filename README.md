@@ -8,9 +8,9 @@ Ozzy is a message streaming system in Rust for durable event logs. Brokers own
 the log; [OMQ](https://github.com/paddor/omq.rs) carries the messages. Run one
 broker or a three-broker cluster.
 
-Requires Linux and Rust 1.93. Start a broker with the
-[getting started guide](GETTING_STARTED.md), then connect applications with the
-[Rust SDK](ozzy/README.md).
+Requires Linux and Rust 1.93. [Try it](GETTING_STARTED.md#try-it) in three
+commands: a broker, the admin console, and a demo writer and reader. Then
+connect applications with the [Rust SDK](ozzy/README.md).
 
 ## Goals
 

@@ -93,6 +93,9 @@
   followers.
 - `TopicReaderStats::live_gaps` counts live publications that arrived past a
   gap and moved the reader to replay.
+- `ozzy quickstart DIR` provisions one single-mode broker on loopback in a
+  new directory and serves it. Later runs on the same directory serve its
+  stores again and never format them. `--config` is optional for it only.
 
 ### Changed
 

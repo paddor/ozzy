@@ -135,6 +135,53 @@ async fn cli_tcp_saved_producer_resumes_and_takes_over_after_broker_kills() {
         .unwrap();
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn cli_quickstart_provisions_once_and_restarts_the_same_stores() {
+    tokio::time::timeout(Duration::from_secs(60), quickstart())
+        .await
+        .unwrap();
+}
+
+async fn quickstart() {
+    let parent = tempfile::tempdir().unwrap();
+    let directory = parent.path().join("try");
+    let start = |round: usize| {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_ozzy"));
+        command.arg("quickstart").arg(&directory);
+        let log = parent.path().join(format!("quickstart-{round}.log"));
+        fixture::Running::spawn(command, log, None)
+    };
+    let mut broker = start(0);
+    broker.ready().await;
+    let checked = ozzy_broker::check_config(
+        ozzy_broker::load_deployment(&directory.join("deployment.toml")).unwrap(),
+        &directory.join("shared.identity"),
+        "local",
+        &ozzy_broker::host_resources().unwrap(),
+    )
+    .unwrap();
+    let mut client = broker.observe("open SDK", Client::open(&checked)).await;
+    let pending = client.queue(0).await;
+    broker.observe("confirm", client.confirm(pending)).await;
+    broker.signal("INT");
+    broker.exited(false).await;
+
+    let mut broker = start(1);
+    broker.ready().await;
+    let restart = std::fs::read_to_string(parent.path().join("quickstart-1.log")).unwrap();
+    assert!(!restart.contains("Provisioned"), "{restart}");
+    let pending = client.queue(1).await;
+    broker
+        .observe("confirm after restart", client.confirm(pending))
+        .await;
+    broker
+        .observe("read history across restart", client.replay())
+        .await;
+    broker.observe("close SDK", client.close()).await;
+    broker.signal("INT");
+    broker.exited(false).await;
+}
+
 mod stress {
     use super::*;
 

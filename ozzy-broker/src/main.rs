@@ -12,12 +12,13 @@
     )
 )]
 
+mod quickstart;
 mod recovery;
 mod serve;
 
 use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
 use ozzy_broker::{
     CheckedConfig, StartupError, check_config, format_partition_journals, host_resources,
     initialize_broker_identity, initialize_identity, initialize_volumes, load_broker_identity,
@@ -31,14 +32,25 @@ use ozzy_config::{BrokerIdentity, ValidatedDeployment};
     about = "Ozzy broker serving and explicit deployment provisioning"
 )]
 struct Args {
+    /// Deployment config. Every command but `quickstart` needs it.
     #[arg(long)]
-    config: PathBuf,
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Provision one loopback broker in DIRECTORY once, then serve it. Later runs
+    /// serve the same stores. For trying Ozzy; writes its own config.
+    Quickstart { directory: PathBuf },
+    #[command(flatten)]
+    Deployment(DeploymentCommand),
+}
+
+// Commands on an explicit `--config`.
+#[derive(Debug, Subcommand)]
+enum DeploymentCommand {
     /// Serve established segment journals. Never creates missing identity or history.
     Serve(ServingArgs),
     /// Serve with explicitly selected nonvoting partition recovery.
@@ -122,18 +134,37 @@ impl ServingArgs {
 }
 
 fn run(args: Args) -> Result<(), StartupError> {
-    let deployment = load_deployment(&args.config)?;
-    match args.command {
-        Command::Serve(serving) => serving.run(deployment, &[]),
-        Command::Recover { serving, recovery } => {
+    match (args.command, args.config) {
+        (Command::Quickstart { directory }, None) => quickstart::run(&directory),
+        (Command::Quickstart { .. }, Some(_)) => Args::command()
+            .error(
+                ErrorKind::ArgumentConflict,
+                "quickstart writes its own config; omit --config",
+            )
+            .exit(),
+        (Command::Deployment(command), Some(config)) => run_deployment(command, &config),
+        (Command::Deployment(_), None) => Args::command()
+            .error(
+                ErrorKind::MissingRequiredArgument,
+                "--config FILE is required",
+            )
+            .exit(),
+    }
+}
+
+fn run_deployment(command: DeploymentCommand, config: &Path) -> Result<(), StartupError> {
+    let deployment = load_deployment(config)?;
+    match command {
+        DeploymentCommand::Serve(serving) => serving.run(deployment, &[]),
+        DeploymentCommand::Recover { serving, recovery } => {
             serving.run(deployment, &recovery.into_selections())
         }
-        Command::Validate { broker } => validate(&deployment, &broker),
-        Command::Init { identity } => init(&deployment, &identity),
-        Command::InitBroker(broker) => init_broker(deployment, &broker),
-        Command::InitVolumes(broker) => init_volumes(deployment, &broker),
-        Command::Format(broker) => format_journals(deployment, &broker),
-        Command::Check {
+        DeploymentCommand::Validate { broker } => validate(&deployment, &broker),
+        DeploymentCommand::Init { identity } => init(&deployment, &identity),
+        DeploymentCommand::InitBroker(broker) => init_broker(deployment, &broker),
+        DeploymentCommand::InitVolumes(broker) => init_volumes(deployment, &broker),
+        DeploymentCommand::Format(broker) => format_journals(deployment, &broker),
+        DeploymentCommand::Check {
             broker,
             identity,
             local_identity,
