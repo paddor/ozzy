@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-16
+
 ### Breaking
 
 - `BrokerLinks::routes` is async. The SDK owner thread registers the topic,
