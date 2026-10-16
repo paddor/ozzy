@@ -133,6 +133,12 @@ pub(super) fn create(limits: Limits, first_offset: Offset, time: u64) -> Result<
 }
 
 impl Limits {
+    /// The smallest `bytes` budget that fits these counts, or `None` when it
+    /// overflows. The index reserves all of it up front.
+    pub fn required_bytes(self) -> Option<usize> {
+        upper_bound(self)
+    }
+
     /// Check every bound before formatting storage or allocating an index.
     pub fn validate(self) -> Result<(), Error> {
         let limits = self;

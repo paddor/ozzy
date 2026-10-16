@@ -93,6 +93,9 @@
   followers.
 - `TopicReaderStats::live_gaps` counts live publications that arrived past a
   gap and moved the reader to replay.
+- `ozzy_broker::check_partition_limits` derives each local partition's
+  journal bounds as startup does. `validate`, `check`, and every provisioning
+  command run it.
 - `ozzy quickstart DIR` provisions one single-mode broker on loopback in a
   new directory and serves it. Later runs on the same directory serve its
   stores again and never format them. `--config` is optional for it only.
@@ -327,6 +330,9 @@
   The control path dropped them for lacking a link session, so every append
   reached followers only through a probe, a state reply, and a catch-up
   `PREPARE_FLOW`.
+- Deduplication limits too small for a partition's identity index fail
+  `validate` and provisioning with the bytes needed. `format` used to reject
+  them after the identities existed.
 
 ## [0.1.1] - 2026-10-09
 

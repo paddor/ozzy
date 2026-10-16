@@ -20,9 +20,9 @@ use std::path::{Path, PathBuf};
 
 use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
 use ozzy_broker::{
-    CheckedConfig, StartupError, check_config, format_partition_journals, host_resources,
-    initialize_broker_identity, initialize_identity, initialize_volumes, load_broker_identity,
-    load_deployment,
+    CheckedConfig, StartupError, check_config, check_partition_limits, format_partition_journals,
+    host_resources, initialize_broker_identity, initialize_identity, initialize_volumes,
+    load_broker_identity, load_deployment,
 };
 use ozzy_config::{BrokerIdentity, ValidatedDeployment};
 
@@ -174,6 +174,7 @@ fn run_deployment(command: DeploymentCommand, config: &Path) -> Result<(), Start
 
 fn validate(deployment: &ValidatedDeployment, broker: &str) -> Result<(), StartupError> {
     let plan = deployment.broker_plan(broker, &host_resources()?)?;
+    check_partition_limits(deployment, &plan)?;
     println!(
         "Valid: {} partitions, {} shards, {} OMQ I/O workers; broker {}",
         plan.partitions.len(),
