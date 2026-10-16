@@ -94,6 +94,12 @@ const ALLOWED: &[(&str, &[&str])] = &[
         ],
     ),
     ("ozzy", &["omq-tokio", "ozzy-proto", "ozzy-runtime"]),
+    // The console core uses only the admin codec. Its terminal frontend adds
+    // the OMQ client and reads the deployment config for the endpoint.
+    (
+        "ozzy-ui",
+        &["omq-tokio", "ozzy-config", "ozzy-proto", "tokio"],
+    ),
     (
         "ozzy-sim",
         &[
@@ -132,6 +138,11 @@ fn workspace_metadata() -> Value {
     serde_json::from_slice(&output.stdout).expect("cargo metadata JSON")
 }
 
+/// User commands as (package, binary). Every other executable, tests
+/// included, starts with `ozzy_`, so a process list shows its repository.
+/// `ozzy-<command>` binaries leave room for a git-style `ozzy <command>`.
+const COMMANDS: &[(&str, &str)] = &[("ozzy-broker", "ozzy"), ("ozzy-ui", "ozzy-tui")];
+
 fn tracked(name: &str) -> bool {
     name.starts_with("ozzy") || BOUNDARY.contains(&name)
 }
@@ -144,11 +155,10 @@ fn executable_names_identify_ozzy_and_all_integration_tests_are_registered() {
         for target in targets {
             if target["kind"] != serde_json::json!(["lib"]) {
                 let name = target["name"].as_str().unwrap();
-                let broker_command = package["name"] == "ozzy-broker"
-                    && target["kind"] == serde_json::json!(["bin"])
-                    && name == "ozzy";
+                let command = target["kind"] == serde_json::json!(["bin"])
+                    && COMMANDS.contains(&(package["name"].as_str().unwrap(), name));
                 assert!(
-                    broker_command || name.starts_with("ozzy_"),
+                    command || name.starts_with("ozzy_"),
                     "unprefixed executable: {target}"
                 );
             }

@@ -69,6 +69,28 @@ impl CoordinatorGroup {
 }
 
 impl CanonicalState {
+    /// Every coordinator image in unspecified order, for diagnostics.
+    pub fn coordinator_groups(&self) -> impl ExactSizeIterator<Item = &Arc<CoordinatorGroup>> {
+        self.groups.values()
+    }
+
+    /// Consumer groups with an assignment or progress on `partition`, for
+    /// diagnostics.
+    pub fn source_groups(&self, partition: PartitionIncarnation) -> BTreeSet<ConsumerGroupId> {
+        let assigned = self
+            .assignments
+            .keys()
+            .filter(|key| key.1 == partition)
+            .map(|key| key.0);
+        let progressed = self.progress.keys().filter_map(|key| match key {
+            super::ProgressKey::ConsumerGroup(group, source) if *source == partition => {
+                Some(*group)
+            }
+            _ => None,
+        });
+        assigned.chain(progressed).collect()
+    }
+
     /// Inspect one group incarnation on its coordinator.
     pub fn coordinator_group(&self, group: ConsumerGroupId) -> Option<&Arc<CoordinatorGroup>> {
         self.groups.get(&group)

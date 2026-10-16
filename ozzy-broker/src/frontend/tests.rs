@@ -47,6 +47,7 @@ fn endpoints(follower: bool) -> Endpoints {
         data_peer: format!("inproc://{name}-data"),
         reader_pub: format!("inproc://{name}-reader"),
         follower_pub: follower.then(|| format!("inproc://{name}-follower")),
+        admin: None,
     }
 }
 
@@ -97,7 +98,7 @@ async fn owned_dispatcher_runs_non_send_state_and_closes_all_shared_sockets() {
         context.clone(),
         move |mut context| {
             assert_ne!(std::thread::current().id(), main);
-            assert_eq!(std::thread::current().name(), Some("ozzy_dispatch"));
+            assert_eq!(std::thread::current().name(), Some("ozzy/dispatch"));
             assert_eq!(
                 tokio::runtime::Handle::current().runtime_flavor(),
                 tokio::runtime::RuntimeFlavor::CurrentThread
@@ -133,7 +134,7 @@ async fn owned_dispatcher_runs_non_send_state_and_closes_all_shared_sockets() {
     assert!(peer.recv().await.is_err());
     for socket in [reader, follower] {
         assert!(matches!(
-            socket.bind("inproc://closed-clone".parse().unwrap()).await,
+            socket.bind("inproc://closed-clone").await,
             Err(omq_tokio::Error::Closed)
         ));
     }
@@ -151,7 +152,7 @@ async fn failed_bind_closes_previously_bound_endpoints_before_returning() {
         } else {
             &endpoints.reader_pub
         };
-        blocker.bind(endpoint.parse().unwrap()).await.unwrap();
+        blocker.bind(endpoint).await.unwrap();
         let result = Frontend::start_with_context(
             frontend_plan(&plan(), &endpoints),
             context.clone(),

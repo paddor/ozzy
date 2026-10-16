@@ -188,7 +188,7 @@ impl Pool {
         let startup = Startup(pool.shared.clone());
         if let (Some(worker), Some(direct), Some(receivers)) = (direct_worker, direct, receivers) {
             pool.spawn(
-                "ozzy_io-direct".into(),
+                "ozzy/disk/aio".into(),
                 Worker::Direct,
                 initialize.clone(),
                 move |shared| direct::run(worker, (direct, receivers), shared),
@@ -212,7 +212,7 @@ impl Pool {
             let receiver = (*data_rx).clone();
             let (role, seat) = (Worker::Data(index), Seat::new(DATA, index));
             self.spawn(
-                format!("ozzy_io-{index}"),
+                format!("ozzy/disk/{index}"),
                 role,
                 initialize.clone(),
                 move |shared| run(receiver, shared, role, seat),
@@ -224,7 +224,7 @@ impl Pool {
             let receiver = (*progress_rx).clone();
             let seat = Seat::new(PROGRESS, index);
             self.spawn(
-                format!("ozzy_io-{}", threads + index),
+                format!("ozzy/disk/p{index}"),
                 Worker::Progress,
                 initialize.clone(),
                 move |shared| run(receiver, shared, Worker::Progress, seat),
@@ -434,10 +434,9 @@ impl Slot {
         reply.finish(result);
     }
 
+    /// Counters always count; stage timing and the diagnostic name only when
+    /// this thread enabled stage diagnostics.
     fn observe_start(&mut self, operation: &Operation) {
-        if !ozzy_telemetry::enabled() {
-            return;
-        }
         ozzy_telemetry::finish(ozzy_telemetry::Stage::IoQueue, self.enqueued.take());
         self.started = ozzy_telemetry::start();
         ozzy_telemetry::event(ozzy_telemetry::Event::IoStarted);
@@ -445,28 +444,27 @@ impl Slot {
             ozzy_telemetry::event(ozzy_telemetry::Event::IoProgressStarted);
         }
         let operation = operation.unprotected();
-        self.diagnostic_operation = match operation {
-            Operation::Open { .. } | Operation::OpenDirectory { .. } => "open",
-            Operation::Metadata { .. } => "metadata",
-            Operation::Read { .. } => "read",
-            Operation::Write { .. } => "write",
-            Operation::Sync { .. } => "sync",
-            Operation::RemoveFile { .. } | Operation::RemoveDirectory { .. } => "remove",
-            Operation::CreateDirectory { .. } => "create_directory",
-            _ => "other",
-        };
         match operation {
             Operation::Read { .. } => ozzy_telemetry::event(ozzy_telemetry::Event::IoRead),
             Operation::Write { .. } => ozzy_telemetry::event(ozzy_telemetry::Event::IoWrite),
             Operation::Sync { .. } => ozzy_telemetry::event(ozzy_telemetry::Event::IoSync),
             _ => {}
         }
+        if ozzy_telemetry::enabled() {
+            self.diagnostic_operation = match operation {
+                Operation::Open { .. } | Operation::OpenDirectory { .. } => "open",
+                Operation::Metadata { .. } => "metadata",
+                Operation::Read { .. } => "read",
+                Operation::Write { .. } => "write",
+                Operation::Sync { .. } => "sync",
+                Operation::RemoveFile { .. } | Operation::RemoveDirectory { .. } => "remove",
+                Operation::CreateDirectory { .. } => "create_directory",
+                _ => "other",
+            };
+        }
     }
 
     fn observe_finish(&mut self, result: &io::Result<Outcome>) {
-        if !ozzy_telemetry::enabled() {
-            return;
-        }
         ozzy_telemetry::finish(ozzy_telemetry::Stage::IoExecution, self.started.take());
         match result {
             Ok(outcome) => {

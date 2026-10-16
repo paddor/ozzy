@@ -15,6 +15,7 @@ Ozzy frames. Transport receipt is never record confirmation.
 | Data PEER | APPEND, RECORDS replay, PREPARE_FLOW, OPS, SNAPSHOT_CHUNK |
 | Reader PUB | RECORDS_PUB |
 | Follower PUB | PREPARE_PUB |
+| Admin PEER | [Admin console](#admin-console) requests and replies, outside the envelope |
 
 - An SDK opens one control and one data PEER socket per broker; partitions add
   no sockets. Both share one broker identity and session, with separate
@@ -598,6 +599,50 @@ under the responder's normal view. Only active normal voters answer.
   receiver to withdraw into recovery and grants no authority. See
   [retained history](REPLICATION.md#retained-history).
 
+## Admin console
+
+The optional `admin` endpoint is a PEER that announces the broker's peer
+identity, as the control PEER does. A client PEER learns it from the
+handshake, sends one request to it, and waits for the reply with the same ID.
+Replies are observations, never authority. There is no authentication yet:
+any client that connects is an admin. `ozzy-tui` from the `ozzy-ui` crate is the
+terminal client.
+
+Each message is one frame: kind `u8`, ID `u64`, body. Integers are big-endian,
+IDs 16 bytes. A string is a `u16` length plus UTF-8; a list is a `u32` count
+plus items.
+
+| Kind | Request | Reply body |
+| --- | --- | --- |
+| 1 | Broker | name, ID, pid `u32`, uptime ms `u64`, `max_clients` `u32`, shards `u32`, brokers (name, ID), partitions (group, topic, partition `u32`, shard `u32`) |
+| 2 | Counters | uptime ms `u64`, events (name, kind `u8`: 0 count, 1 peak, 2 gauge), totals (`u64` per event), threads (name, `u64` per event) |
+| 3 | Partitions | uptime ms `u64`, missing shards `u32`, rows |
+| 4 | Connections | other brokers (ID, link up `u8`), connected clients `u32` |
+| 255 | none | error message |
+
+A partition row:
+
+| Field | Encoding |
+| --- | --- |
+| group | ID |
+| state | `u8`: 0 local, 1 normal, 2 electing |
+| flags | `u8`: 1 ready, 2 disk pending, 4 leader known, 8 log follows |
+| view, leader | `u64`, ID (zero when unknown) |
+| positions | `u64` each: accepted, committed, applied, pending operations, pending body bytes, validation cycles, reclaimed bytes, written, durable, leader commit |
+| followers | list of (ID, acknowledged `u64`); a leader lists both followers, others none |
+| log | only with flag 8: first offset `u64`, next offset `u64`, producers `u32`, groups, cursors |
+
+- Positions are operation numbers. Only the log has record offsets.
+- Groups are the consumer groups this partition coordinates: group ID, name,
+  plan revision `u64`, members (member ID, client ID).
+- Cursors are the groups reading this partition: group ID, flags `u8`
+  (1 member, 2 offset), then the active member's ID and the exclusive
+  committed offset `u64` when flagged.
+- A partition whose journal is busy answers without its log; ask again.
+- An unknown kind gets an error reply with the request's ID.
+- A reply the client cannot take is dropped; the client times out.
+- The last thread in a counters reply, `exited`, combines ended threads.
+
 ## Errors
 
 Typed NACK is a correlated response with no payload. Metadata:
@@ -666,6 +711,7 @@ records/APPEND, 4,000 parts. Negotiation and configuration may lower these.
   commands.
 - `ozzy-proto/src/reader/`, `progress.rs`, `group/`: reader, progress, groups.
 - `ozzy-proto/src/directory/`: topic lookup and routing watches.
+- `ozzy-proto/src/admin.rs`: admin console.
 - `ozzy-replication/src/wire/`: replica commands.
 - `ozzy-runtime/src/peer_sessions.rs`, `transport.rs`: link negotiation and
   OMQ routing labels.

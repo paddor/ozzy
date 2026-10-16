@@ -210,6 +210,12 @@ impl ShardJournal {
         self.idle_owner()?
             .coordinator_group(ticket, coordinator, name)
     }
+    pub(super) fn facts(
+        &self,
+        partition: ozzy_proto::PartitionIncarnation,
+    ) -> Result<Option<super::PartitionFacts>, JournalError> {
+        self.idle_owner()?.facts(partition)
+    }
     /// The owner, unless a command holds it. A held owner is busy; the caller
     /// retries on its next turn.
     fn idle_owner(&self) -> Result<&OwnedJournal, JournalError> {

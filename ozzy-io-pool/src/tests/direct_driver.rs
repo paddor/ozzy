@@ -159,7 +159,7 @@ async fn direct_handoff_retains_canceled_buffers_and_physical_handle_capacity() 
     shutdown.await;
     assert_eq!(pool.admission().used(0, Class::Data), Quota::default());
     std::fs::File::open(path).unwrap().try_lock().unwrap();
-    assert_eq!(gate.state.lock().unwrap().threads, ["ozzy_io-direct"]);
+    assert_eq!(gate.state.lock().unwrap().threads, ["ozzy/disk/aio"]);
 }
 
 #[tokio::test]

@@ -110,6 +110,19 @@ impl PartitionActor {
         }
     }
 
+    /// Committed facts of `partition` for diagnostics. `None` while the
+    /// journal is busy or recovering.
+    pub fn facts(
+        &self,
+        partition: PartitionIncarnation,
+    ) -> Option<crate::replica_journal::PartitionFacts> {
+        match self {
+            Self::Local(actor) => actor.facts(partition),
+            Self::Replicated(actor) => actor.facts(partition),
+            Self::Recovering(_) => None,
+        }
+    }
+
     /// Current leader hint. It neither activates authority nor confirms history.
     pub fn authority_hint(&self) -> ozzy_proto::nack::AuthorityHint {
         match self {

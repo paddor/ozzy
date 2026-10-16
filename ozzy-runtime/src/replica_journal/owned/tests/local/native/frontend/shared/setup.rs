@@ -247,30 +247,18 @@ pub(super) async fn setup_shared_directory_profile(
             .max_message_size(8192),
     );
     let endpoint = server
-        .bind(
-            format!("inproc://shared-native-{}", RequestId::new())
-                .parse()
-                .unwrap(),
-        )
+        .bind(format!("inproc://shared-native-{}", RequestId::new()))
         .await
         .unwrap();
     let data_endpoint = data_server
-        .bind(
-            format!("inproc://shared-native-data-{}", RequestId::new())
-                .parse()
-                .unwrap(),
-        )
+        .bind(format!("inproc://shared-native-data-{}", RequestId::new()))
         .await
         .unwrap();
     let publisher = runtime
         .context()
         .socket(SocketType::Pub, Options::default().send_hwm(4));
     let publications = publisher
-        .bind(
-            format!("inproc://shared-readers-{}", RequestId::new())
-                .parse()
-                .unwrap(),
-        )
+        .bind(format!("inproc://shared-readers-{}", RequestId::new()))
         .await
         .unwrap();
     let catalog = multiple::catalog(authority, &groups, &endpoint, &publications);

@@ -464,11 +464,7 @@ async fn run_frontend(
         .unwrap();
     let buffers = ReceiveBuffers::new(EnvelopeLimits::default(), storage).unwrap();
     for peer in &peers {
-        context
-            .data
-            .connect(remote[peer].data_peer.parse().unwrap())
-            .await
-            .unwrap();
+        context.data.connect(&remote[peer].data_peer).await.unwrap();
     }
     let mut finished = Vec::new();
     for (id, configured) in ports {
@@ -522,6 +518,7 @@ async fn start(brokers: &[(CheckedConfig, BrokerIdentity, JournalPlan)], format:
                     data_peer: format!("tcp://{}", sockets[2].local_addr().unwrap()),
                     reader_pub: format!("tcp://{}", sockets[1].local_addr().unwrap()),
                     follower_pub: None,
+                    admin: None,
                 };
                 listeners.insert(peer, sockets);
                 endpoints
@@ -531,6 +528,7 @@ async fn start(brokers: &[(CheckedConfig, BrokerIdentity, JournalPlan)], format:
                     data_peer: format!("inproc://actors-data-{namespace}-{peer}"),
                     reader_pub: format!("inproc://actors-reader-{namespace}-{peer}"),
                     follower_pub: None,
+                    admin: None,
                 }
             };
             (peer, endpoints)

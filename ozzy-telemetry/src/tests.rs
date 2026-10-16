@@ -15,13 +15,23 @@ fn counters_read_the_publication_clock_once_per_batch() {
 }
 
 #[test]
-fn disabled_diagnostics_allocate_no_local_state() {
+fn disabled_stage_diagnostics_still_count_events_but_keep_no_timing_or_logs() {
     std::thread::spawn(|| {
         ENABLED.with(|enabled| enabled.set(false));
         event(Event::IoStarted);
         log(Level::Info, "unused");
         assert!(start().is_none());
-        LOCAL.with(|local| assert!(local.borrow().is_none()));
+        LOCAL.with(|local| {
+            let local = local.borrow();
+            let local = local.as_ref().unwrap();
+            assert!(local.metrics.is_empty());
+            assert!(local.logs.is_empty());
+        });
+        let started = events()
+            .into_iter()
+            .find(|(name, _)| *name == "io_started")
+            .unwrap();
+        assert_eq!(started.1, 1);
     })
     .join()
     .unwrap();
@@ -52,12 +62,12 @@ fn event_counts_stay_with_the_emitting_thread() {
     let first = std::thread::spawn(|| {
         enable();
         count(Event::ReplicaRepair, 7);
-        events().unwrap()
+        events()
     });
     let second = std::thread::spawn(|| {
         enable();
         count(Event::ReplicaRepair, 11);
-        events().unwrap()
+        events()
     });
     let repair = |rows: Vec<(&str, u64)>| {
         rows.into_iter()
@@ -163,4 +173,48 @@ fn published_names_map_to_their_kind() {
     assert_eq!(Kind::of("live_window_peak_bytes"), Some(Kind::Peak));
     assert_eq!(Kind::of("dedup_live_bytes"), Some(Kind::Gauge));
     assert_eq!(Kind::of("unknown"), None);
+}
+
+#[test]
+fn threads_list_live_values_by_name_and_fold_exited_ones() {
+    let before = threads();
+    std::thread::Builder::new()
+        .name("counted-exited".into())
+        .spawn(|| count(Event::IoRead, 3))
+        .unwrap()
+        .join()
+        .unwrap();
+    let (counted, release) = (std::sync::Barrier::new(2), std::sync::Barrier::new(2));
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("counted-live".into())
+            .spawn_scoped(scope, || {
+                count(Event::IoRead, 5);
+                counted.wait();
+                release.wait();
+            })
+            .unwrap();
+        counted.wait();
+        let now = threads();
+        release.wait();
+        let live = now
+            .live
+            .iter()
+            .find(|(name, _)| name == "counted-live")
+            .unwrap();
+        assert_eq!(live.1.get(Event::IoRead), 5);
+        assert!(!now.live.iter().any(|(name, _)| name == "counted-exited"));
+        let exited = |threads: &Threads| threads.exited.get(Event::IoRead);
+        assert!(exited(&now) >= exited(&before) + 3);
+        let summed = now.live.iter().fold(exited(&now), |sum, (_, values)| {
+            sum + values.get(Event::IoRead)
+        });
+        assert_eq!(now.totals.get(Event::IoRead), summed);
+        let row = now
+            .totals
+            .rows()
+            .find(|(name, ..)| *name == "io_read")
+            .unwrap();
+        assert_eq!(row, ("io_read", Kind::Count, now.totals.get(Event::IoRead)));
+    });
 }

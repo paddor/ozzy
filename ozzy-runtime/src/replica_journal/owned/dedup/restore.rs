@@ -52,7 +52,10 @@ impl OwnedJournal {
             }
         }
         self.validate_dedup_image(&image, accepted, limits)?;
-        image.reservation = Installed::count(image.index.reserved_bytes(), limits.entries);
+        image.reservation = Some(Installed::count(
+            image.index.reserved_bytes(),
+            limits.entries,
+        ));
         self.dedup.image = Some(image);
         Ok(())
     }

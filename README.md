@@ -30,8 +30,8 @@ Requires Linux and Rust 1.93. Start a broker with the
 | Disk quorum | It is persisted on the leader and one follower | Three; two eligible copies required |
 | Replicated-persisting | It is retained on the leader and one follower; persistence follows in the background | Three; two eligible copies required |
 
-The [overview](doc/OVERVIEW.md#modes) defines each boundary and its config
-value.
+Replicated-persisting is mostly for disks with slow flushes. The
+[overview](doc/OVERVIEW.md#modes) defines each boundary and its config value.
 
 ## Features
 
@@ -65,6 +65,7 @@ value.
 | [`ozzy-io-pool`](ozzy-io-pool/) | Bounded blocking storage workers |
 | [`ozzy-io-aio`](ozzy-io-aio/) | Linux AIO storage backend |
 | [`ozzy-telemetry`](ozzy-telemetry/) | Optional thread-owned IPC telemetry and bounded diagnostic logs |
+| [`ozzy-ui`](ozzy-ui/) | Terminal admin console of one broker |
 | [`ozzy-sim`](ozzy-sim/) | Controlled simulation and full-product workload/fault runs |
 | [`ozzy-bench`](ozzy-bench/) | Benchmarks, comparisons, profiles, and SVG charts |
 | [`ozzy-test-alloc`](ozzy-test-alloc/) | Allocation counting for allocation budget tests |

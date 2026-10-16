@@ -1,10 +1,15 @@
 //! One persisted TCP deployment. Every broker process uses its own volume/shards.
 
 use super::{Client, fixture};
+use crate::admin_client::AdminClient;
 use crate::command;
 use ozzy_broker::{CheckedConfig, check_config, host_resources, load_deployment};
 use ozzy_config::Confirmation;
-use std::{fmt::Write, fs, future::Future, net::TcpListener, path::PathBuf, process::Command};
+use ozzy_proto::admin::{Reply, Request};
+use std::{
+    collections::BTreeMap, fmt::Write, fs, future::Future, net::TcpListener, path::PathBuf,
+    process::Command, time::Duration,
+};
 
 pub(super) struct Cluster {
     directory: tempfile::TempDir,
@@ -66,6 +71,7 @@ impl Cluster {
         let sockets: [TcpListener; 12] =
             std::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").unwrap());
         let roots = std::array::from_fn(|index| directory.path().join(format!("broker-{index}")));
+        let admin = admin_prefix(&directory);
         let mut source = format!(
             "[cluster]\nmode = \"three\"\n\
              [topics.orders]\nconfirmation = \"{policy}\"\npartitions = 4\n\
@@ -84,6 +90,7 @@ impl Cluster {
                  data_peer = \"{scheme}://127.0.0.1:{data}\"\n\
                  reader_pub = \"{scheme}://127.0.0.1:{readers}\"\n\
                  follower_pub = \"{scheme}://127.0.0.1:{followers}\"\n\
+                 admin = \"{admin}-{index}\"\n\
                  [brokers.broker-{index}.devices.ssd]\nroot = \"{root}\"\n\
                  controller = \"ssd\"\n\
                  [brokers.broker-{index}.devices.ssd.workers]\n\
@@ -138,6 +145,46 @@ impl Cluster {
             fs::create_dir(root).unwrap();
             fixture::success(&mut self.command(index, "init-volumes"));
             fixture::success(&mut self.command(index, "format"));
+        }
+    }
+
+    /// Ask broker `index` over its abstract-namespace IPC admin endpoint.
+    pub(super) async fn admin(&self, index: usize, request: Request) -> Reply {
+        let context = omq_tokio::Context::new();
+        let endpoint = format!("{}-{index}", admin_prefix(&self.directory));
+        let mut client = AdminClient::connect(&context, &endpoint).await;
+        let reply = client.ask(request).await;
+        client.close().await;
+        reply
+    }
+
+    /// Wait until each running broker in `brokers` reports a leader for every
+    /// partition and all agree.
+    pub(super) async fn agreed_leaders(&self, brokers: &[usize]) {
+        loop {
+            let mut views = Vec::new();
+            for &index in brokers {
+                let Reply::Partitions(partitions) = self.admin(index, Request::Partitions).await
+                else {
+                    panic!("partitions reply expected");
+                };
+                assert_eq!(partitions.missing_shards, 0);
+                assert_eq!(partitions.rows.len(), 4);
+                views.push(
+                    partitions
+                        .rows
+                        .iter()
+                        .map(|row| (row.group, row.leader))
+                        .collect::<BTreeMap<_, _>>(),
+                );
+            }
+            if views
+                .iter()
+                .all(|view| view == &views[0] && view.values().all(Option::is_some))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
@@ -280,6 +327,12 @@ pub(super) async fn orderly_restart_in(cluster: Cluster) {
     processes
         .observe("replay initial records", client.replay())
         .await;
+    processes
+        .observe(
+            "agree on leaders over IPC admin",
+            cluster.agreed_leaders(&[0, 1, 2]),
+        )
+        .await;
     let initial_session = client.links.session(first_id).unwrap();
 
     processes.stop(0, "TERM").await;
@@ -302,5 +355,19 @@ pub(super) async fn orderly_restart_in(cluster: Cluster) {
         .observe("replay all exact records", client.replay())
         .await;
     processes.observe("close cluster SDK", client.close()).await;
+    // The restarted broker binds its abstract admin name again.
+    let reply = processes
+        .observe(
+            "restarted admin endpoint",
+            cluster.admin(0, Request::Broker),
+        )
+        .await;
+    assert!(matches!(reply, Reply::Broker(broker) if broker.name == "broker-0"));
     processes.shutdown().await;
+}
+
+/// Abstract-namespace admin endpoint prefix, unique per fixture directory.
+fn admin_prefix(directory: &tempfile::TempDir) -> String {
+    let name = directory.path().file_name().unwrap().to_string_lossy();
+    format!("ipc://@ozzy-test-admin{name}")
 }

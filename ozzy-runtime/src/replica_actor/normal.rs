@@ -466,9 +466,7 @@ impl ReplicaActor {
 
     /// Record live-window occupancy after a core admission.
     pub(super) fn observe_window(&self) {
-        if crate::profiling::enabled()
-            && let Some(normal) = self.driver.normal()
-        {
+        if let Some(normal) = self.driver.normal() {
             let snapshot = normal.snapshot();
             crate::profiling::peak(
                 crate::profiling::Event::LiveWindowPeakOperations,

@@ -65,6 +65,10 @@ pub struct ReplicaSnapshot {
     /// Installed/recovered suffix retained only in the journal, not the live
     /// descriptor ring. Fresh work waits until this entire tail is applied.
     pub journal_tail: Option<Prefix>,
+    /// Primary only: the highest operation each backup acknowledged.
+    pub backups: Option<[(NodeId, OpNumber); 2]>,
+    /// Highest commit the primary announced, as this replica knows it.
+    pub known_commit: OpNumber,
     /// Whether new operations may be admitted. Duplicates can still be retried
     /// while an installed primary reestablishes its selected-tail quorum. Entries
     /// inside a disk-backed tail require journal lookup, not descriptor retries.
@@ -217,6 +221,12 @@ impl NormalReplica {
             live_base: self.live_base(),
             retained_limits: self.retained_limits(),
             journal_tail: self.journal_tail,
+            backups: self.is_primary().then(|| {
+                self.local
+                    .others()
+                    .map(|voter| (self.configuration.voter(voter), self.acknowledged[voter]))
+            }),
+            known_commit: self.known_commit,
             ready_for_appends: self.ready_for_appends(),
         }
     }

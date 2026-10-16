@@ -250,6 +250,18 @@ impl ReplicaJournal {
         }
     }
 
+    /// Summarize committed partition state for diagnostics, without I/O.
+    /// `None` while a command holds the owner, during recovery, or after a
+    /// fault; the caller asks again later.
+    pub fn facts(&self, partition: PartitionIncarnation) -> Option<super::PartitionFacts> {
+        match &self.execution {
+            super::execution::Execution::Normal(owner) if !self.execution.is_closed() => {
+                owner.facts(partition).ok().flatten()
+            }
+            _ => None,
+        }
+    }
+
     /// Read available confirmed records into an empty worker-owned arena.
     /// Backpressure returns that arena unchanged. Dropping an admitted completion
     /// does not cancel disk execution; it releases the finished output safely.

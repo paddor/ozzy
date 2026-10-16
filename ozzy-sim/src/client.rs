@@ -283,6 +283,17 @@ impl Client {
         }
     }
 
+    /// Links for one consumer-group member, as a separate client of the
+    /// same brokers.
+    pub async fn group_links(&self) -> BrokerLinks {
+        let mut config = self.links_config.clone();
+        config.local = NodeId::from_bytes(*uuid::Uuid::now_v7().as_bytes());
+        config.parameters = handshake::Parameters::group(DATA_LIMITS, handshake::CONSUMER).unwrap();
+        config.parameters.capabilities |= handshake::OWNER_ROUTING;
+        config.append = None;
+        BrokerLinks::connect(&self.runtime, config).await.unwrap()
+    }
+
     /// Open at the retained oracle base or its observed end.
     pub async fn reader(&self, at_end: bool) -> TopicReader {
         TopicReader::open(

@@ -141,8 +141,21 @@ ozzy_three serve --broker broker-0 --identity "$ozzy_dir/shared.identity" \
 - All brokers share one `shared.identity`. Each keeps its own local identity
   and stores.
 - Writes confirm while two of the three brokers are up.
-- For background persistence, set `confirmation = "replicated-persisting"` on
-  the topic.
+- For background persistence on disks with slow flushes, set
+  `confirmation = "replicated-persisting"` on the topic.
+
+## Watch a broker
+
+`ozzy-tui` shows one broker's status and counters in the terminal. The samples
+give each broker an `admin` endpoint in the local IPC namespace, so run it on
+the broker's host:
+
+```bash
+scripts/ozzy_cargo build --locked --release -p ozzy-ui
+ozzy-tui --config "$ozzy_dir/deployment.toml" --broker broker-0
+```
+
+Keys and screens: [ozzy-ui](ozzy-ui/README.md).
 
 ## Recover a partition
 

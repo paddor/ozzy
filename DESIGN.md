@@ -22,7 +22,9 @@ brokers own journals, replication, and confirmation.
 | Group coordinator | Membership and plans of the consumer groups whose names map to its partition | `ozzy-core`, `ozzy-runtime` |
 | Journal | Canonical history, segment encoding, reads, recovery | `ozzy-journal`, `ozzy-journal-segment` |
 | Storage backend | File handles, physical jobs, buffers, fixed workers per device | `ozzy-io`, `ozzy-io-pool`, `ozzy-io-aio` |
-| Telemetry | Opt-in diagnostics; never part of confirmation or admission | `ozzy-telemetry` |
+| Telemetry | Always-on thread-owned counters; opt-in stage timing and PUB snapshots; never part of confirmation or admission | `ozzy-telemetry` |
+| Admin owner | Admin endpoint, status queries to shards, counter snapshots; read-only | `ozzy-broker`, `ozzy-proto` |
+| Admin console | Console state and screens without I/O; terminal frontend and admin client | `ozzy-ui` |
 | Producer and consumer SDKs | Separate role state over shared session and transport code | `ozzy`, `ozzy-runtime` |
 
 ## Rules

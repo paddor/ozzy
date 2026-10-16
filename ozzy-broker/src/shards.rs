@@ -237,7 +237,7 @@ where
     let worker = state.clone();
     let id = assignment.plan.id;
     let factory = factory.clone();
-    let spawned = ozzy_io::spawn_ready(format!("ozzy_app-{id}"), move |ready| {
+    let spawned = ozzy_io::spawn_ready(format!("ozzy/shard/{id}"), move |ready| {
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
             run(assignment, ready, &worker.stop, &*factory)
         }))

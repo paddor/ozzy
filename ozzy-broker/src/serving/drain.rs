@@ -31,6 +31,9 @@ pub(super) struct Drain {
     pub(super) application: Arc<State>,
     pub(super) frontend: Arc<State>,
     pools: Box<dyn StorageOwner>,
+    /// The admin owner thread, when the broker serves an admin endpoint. It
+    /// stops with the application owners.
+    admin: ozzy_io::OwnedThreads,
     started: AtomicBool,
     finished: CloseSignal,
     error: OnceLock<String>,
@@ -46,10 +49,32 @@ impl DeviceDrain {
             application,
             frontend,
             pools: Box::new(pools),
+            admin: ozzy_io::OwnedThreads::new(1),
             started: AtomicBool::new(false),
             finished: CloseSignal::default(),
             error: OnceLock::new(),
         }))
+    }
+
+    /// Serve `admin` until the application owners stop, and join it before
+    /// draining devices. A failed start drains them now.
+    pub(super) async fn start_admin(
+        &self,
+        admin: Option<crate::admin::Admin>,
+    ) -> Result<(), StartupError> {
+        let Some(admin) = admin else {
+            return Ok(());
+        };
+        let drain = &self.0;
+        let owned = admin
+            .spawn(drain.application.stop.clone())
+            .and_then(|thread| drain.admin.own(thread));
+        if let Err(error) = owned {
+            drain.request();
+            let _ = drain.closed().await;
+            return Err(StartupError::Runtime(format!("admin owner: {error}")));
+        }
+        Ok(())
     }
 }
 
@@ -60,7 +85,7 @@ impl Drain {
         if !self.started.swap(true, Ordering::AcqRel) {
             let drain = self.clone();
             let spawned = std::thread::Builder::new()
-                .name("ozzy_drain".into())
+                .name("ozzy/drain".into())
                 .spawn(move || {
                     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                         futures::executor::block_on(async {
@@ -74,6 +99,7 @@ impl Drain {
                         // Completion here means its threads have exited.
                         drain.application.join();
                         drain.frontend.join();
+                        drain.admin.join();
                         drain.pools.drain();
                     }));
                     if result.is_err() {

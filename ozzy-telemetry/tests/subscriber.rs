@@ -47,7 +47,7 @@ async fn standalone_endpoint_publishes_worker_telemetry_and_logs() {
     let context = Context::new();
     let socket = context.socket(SocketType::Sub, Options::default().recv_hwm(32));
     socket.subscribe(Vec::<u8>::new()).await.unwrap();
-    socket.bind(endpoint.parse().unwrap()).await.unwrap();
+    socket.bind(&endpoint).await.unwrap();
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "worker_publishes_on_ipc_endpoint", "--nocapture"])
         .env("OZZY_TELEMETRY_TEST_CHILD", "1")

@@ -546,7 +546,7 @@ async fn subscriber(
         ))
         .await
         .unwrap();
-    socket.connect(endpoint.parse().unwrap()).await.unwrap();
+    socket.connect(endpoint).await.unwrap();
     socket
         .wait_connected(1, Duration::from_secs(5))
         .await

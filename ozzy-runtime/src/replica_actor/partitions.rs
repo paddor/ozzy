@@ -119,6 +119,17 @@ impl PartitionActors {
             .map(|&slot| self.actors[slot].status())
     }
 
+    /// Committed facts of one known partition, for diagnostics.
+    pub fn facts(
+        &self,
+        group: GroupId,
+        partition: PartitionIncarnation,
+    ) -> Option<crate::replica_journal::PartitionFacts> {
+        self.index
+            .get(&group)
+            .and_then(|&slot| self.actors[slot].facts(partition))
+    }
+
     /// Initial watch identity. This observation cannot activate write authority.
     pub fn route_state(
         &self,

@@ -134,11 +134,7 @@ impl Frontend {
         let server = context.socket(SocketType::Peer, options(local));
         let sdk = context.socket(SocketType::Peer, options(link(70, 80).binding.peer));
         let endpoint = server
-            .bind(
-                format!("inproc://native-shard-{}", RequestId::new())
-                    .parse()
-                    .unwrap(),
-            )
+            .bind(format!("inproc://native-shard-{}", RequestId::new()))
             .await
             .unwrap();
         sdk.connect(endpoint).await.unwrap();

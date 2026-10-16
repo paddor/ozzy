@@ -17,6 +17,7 @@
     )
 )]
 
+pub mod admin;
 pub mod append;
 pub mod data;
 pub mod directory;

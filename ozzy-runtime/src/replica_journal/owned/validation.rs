@@ -194,17 +194,17 @@ impl OwnedJournal {
             self.limits.operations,
             primary_payloads_validated,
         )?;
-        if crate::profiling::counting() {
-            use crate::profiling::{Event, event, peak};
-            use ozzy_journal::operation::OperationKind;
-            for operation in buffer.operations() {
-                if matches!(
-                    operation.kind,
-                    OperationKind::Append | OperationKind::ResolvedAppend
-                ) {
-                    event(Event::PreparedOperation);
-                    peak(Event::PreparedPayloadBytesMax, operation.body.len() as u64);
-                }
+        for operation in buffer.operations() {
+            if matches!(
+                operation.kind,
+                ozzy_journal::operation::OperationKind::Append
+                    | ozzy_journal::operation::OperationKind::ResolvedAppend
+            ) {
+                crate::profiling::event(crate::profiling::Event::PreparedOperation);
+                crate::profiling::peak(
+                    crate::profiling::Event::PreparedPayloadBytesMax,
+                    operation.body.len() as u64,
+                );
             }
         }
         Ok(prepared)

@@ -55,6 +55,17 @@ impl Links {
         self.0.current.load().get(&peer).copied().flatten()
     }
 
+    /// Established sessions of peers authorized as `kind`.
+    pub fn established(&self, kind: Kind) -> usize {
+        self.0
+            .current
+            .load()
+            .values()
+            .flatten()
+            .filter(|link| link.binding.kind == kind)
+            .count()
+    }
+
     /// Capture before inspecting links, then wait for a subsequent change.
     pub fn generation(&self) -> u64 {
         self.0.changed.generation()

@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 const SINGLE: &str = include_str!("../../ozzy-config/tests/fixtures/single.toml");
 
+mod admin_client;
 mod journals;
 mod local_identity;
 #[cfg(target_os = "linux")]

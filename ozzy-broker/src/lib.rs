@@ -19,6 +19,7 @@
 )]
 
 mod actors;
+mod admin;
 mod devices;
 mod format;
 mod frontend;

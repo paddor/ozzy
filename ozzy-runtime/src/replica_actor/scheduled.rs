@@ -38,6 +38,14 @@ impl ScheduledReplica {
         (ticket, &mut self.actor.journal)
     }
 
+    /// Committed facts of `partition` for diagnostics; `None` while busy.
+    pub(super) fn facts(
+        &self,
+        partition: ozzy_proto::PartitionIncarnation,
+    ) -> Option<crate::replica_journal::PartitionFacts> {
+        self.actor.journal.facts(partition)
+    }
+
     /// Take a startup submission lane before shared scheduling begins.
     pub fn take_submitter(&mut self) -> Option<super::ProposalSubmitter> {
         self.actor.take_submitter()

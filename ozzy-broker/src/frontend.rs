@@ -143,10 +143,7 @@ impl Frontend {
         let io_threads = plan.broker.omq_io_threads;
         // Create owned OMQ workers before applying dispatcher affinity.
         let context = context.unwrap_or_else(|| {
-            Context::with_config_and_name(
-                ContextConfig { io_threads },
-                format!("ozzy_omq-{}", plan.local),
-            )
+            Context::with_config_and_name(ContextConfig { io_threads }, "ozzy/omq")
         });
         if context.io_threads() != io_threads {
             return Err(error("OMQ context worker count differs from broker plan"));
@@ -348,7 +345,7 @@ where
 {
     let worker = state.clone();
     let registration = Registration::new(state.clone());
-    let (thread, readiness) = ozzy_io::spawn_ready("ozzy_dispatch".into(), move |ready| {
+    let (thread, readiness) = ozzy_io::spawn_ready("ozzy/dispatch".into(), move |ready| {
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
             crate::placement::pin(cpu).map_err(|failure| error(failure.to_string()))?;
             let runtime = tokio::runtime::Builder::new_current_thread()

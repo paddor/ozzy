@@ -103,6 +103,14 @@ impl LocalActor {
         (ticket, &mut self.journal)
     }
 
+    /// Committed facts of `partition` for diagnostics; `None` while busy.
+    pub(super) fn facts(
+        &self,
+        partition: ozzy_proto::PartitionIncarnation,
+    ) -> Option<crate::replica_journal::PartitionFacts> {
+        self.journal.facts(partition)
+    }
+
     /// Immutable partition group. This observation grants no write authority.
     pub fn group(&self) -> ozzy_proto::GroupId {
         self.driver.configuration().scope().group_id

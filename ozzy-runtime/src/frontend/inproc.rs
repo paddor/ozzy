@@ -15,8 +15,10 @@ pub(super) fn pair(
 ) -> Result<(Socket, Socket), omq_tokio::Error> {
     let router =
         context.blocking_socket(SocketType::Router, options.clone().router_mandatory(true));
-    let endpoint = format!("inproc://ozzy-lane-{}", ozzy_proto::RequestId::new()).parse()?;
-    let bound = router.bind(endpoint)?;
+    let bound = router.bind(format!(
+        "inproc://ozzy-lane-{}",
+        ozzy_proto::RequestId::new()
+    ))?;
     let dealer = context.blocking_socket(SocketType::Dealer, options);
     dealer.connect(bound)?;
     Ok((dealer.into_async(), router.into_async()))

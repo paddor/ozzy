@@ -47,15 +47,21 @@ impl Deployment {
             check_append_backing(broker, &local, max_append, &path)?;
             shards.insert(name.clone(), local);
         }
-        // Each broker receives every socket through one buffer profile.
+        // Each broker receives every client and broker socket through one
+        // buffer profile. The plain admin endpoint has its own.
         let compressed = endpoints
             .iter()
             .filter(|endpoint| {
                 EndpointScheme::parse(endpoint).is_some_and(|(scheme, _)| scheme.compressed())
             })
             .count();
+        let admins = self
+            .brokers
+            .values()
+            .filter(|broker| broker.endpoints.admin.is_some())
+            .count();
         require(
-            compressed == 0 || compressed == endpoints.len(),
+            compressed == 0 || compressed + admins == endpoints.len(),
             "brokers",
             "compressed endpoints cannot mix with plain transports",
         )?;
@@ -125,6 +131,7 @@ fn validate_endpoints(
         Some(&broker.endpoints.data_peer),
         Some(&broker.endpoints.reader_pub),
         broker.endpoints.follower_pub.as_ref(),
+        broker.endpoints.admin.as_ref(),
     ]
     .into_iter()
     .flatten()
@@ -136,7 +143,17 @@ fn validate_endpoints(
             "endpoint reused within deployment",
         )?;
     }
-    Ok(())
+    // TODO(admin-auth): accept TCP once admins authenticate with CURVE keys.
+    require(
+        broker.endpoints.admin.as_deref().is_none_or(|endpoint| {
+            matches!(
+                EndpointScheme::parse(endpoint),
+                Some((EndpointScheme::Ipc | EndpointScheme::Inproc, _))
+            )
+        }),
+        path,
+        "admin endpoint must use ipc:// or inproc://",
+    )
 }
 
 /// One accepted APPEND needs receive backing and two canonical buffers while

@@ -123,10 +123,7 @@ async fn shared_peer_negotiates_client_and_broker_profiles_with_independent_fenc
                     .router_mandatory(true)
                     .linger(Duration::from_millis(5)),
             );
-            socket
-                .connect(endpoints.peer.parse().unwrap())
-                .await
-                .unwrap();
+            socket.connect(&endpoints.peer).await.unwrap();
             socket
                 .wait_connected(1, Duration::from_secs(5))
                 .await
@@ -286,10 +283,7 @@ async fn serving_lifecycle(trusted: bool, distinct: bool) {
                     .router_mandatory(true)
                     .linger(Duration::from_millis(5)),
             );
-            socket
-                .connect(endpoints.peer.parse().unwrap())
-                .await
-                .unwrap();
+            socket.connect(&endpoints.peer).await.unwrap();
             socket
                 .wait_connected(1, Duration::from_secs(5))
                 .await

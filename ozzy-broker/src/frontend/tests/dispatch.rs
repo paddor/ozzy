@@ -272,7 +272,7 @@ async fn ordinary_peer_dispatch_preserves_healthy_shard_and_reserved_control_pro
                 .identity(Bytes::copy_from_slice(binding.peer.as_bytes()))
                 .router_mandatory(true),
         );
-        sdk.connect(endpoints.peer.parse().unwrap()).await.unwrap();
+        sdk.connect(&endpoints.peer).await.unwrap();
         sdk.wait_connected(1, Duration::from_secs(5)).await.unwrap();
         for (shard, control) in [(0, false), (0, false), (0, false), (7, false), (0, true)] {
             sdk.send(message(binding, target(shard), control))

@@ -47,12 +47,9 @@ struct Installed {
 }
 
 impl Installed {
-    /// Count one installed image. `None` while telemetry does not count.
-    fn count(bytes: usize, entries: usize) -> Option<Self> {
-        use crate::profiling::{Event, count, counting, event, gauge};
-        if !counting() {
-            return None;
-        }
+    /// Count one installed image.
+    fn count(bytes: usize, entries: usize) -> Self {
+        use crate::profiling::{Event, count, event, gauge};
         event(Event::DedupIndexImage);
         count(Event::DedupIndexBytes, bytes as u64);
         count(Event::DedupIndexEntries, entries as u64);
@@ -62,7 +59,7 @@ impl Installed {
         };
         gauge(Event::DedupLiveBytes, installed.bytes);
         gauge(Event::DedupLiveEntries, installed.entries);
-        Some(installed)
+        installed
     }
 }
 

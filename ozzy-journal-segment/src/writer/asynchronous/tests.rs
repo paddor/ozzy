@@ -658,7 +658,6 @@ fn encoded_bytes_exclude_preallocation_and_rejected_or_failed_appends() {
     ozzy_telemetry::enable();
     let encoded_group_bytes = || {
         ozzy_telemetry::events()
-            .unwrap()
             .into_iter()
             .find(|(name, _)| *name == "encoded_group_bytes")
             .unwrap()

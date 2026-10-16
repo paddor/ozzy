@@ -276,11 +276,7 @@ async fn ordinary_peer_receive_multiplexes_native_partitions_over_one_connection
     let server = context.socket(SocketType::Peer, options(broker));
     let sdk = context.socket(SocketType::Peer, options(binding.peer));
     let endpoint = server
-        .bind(
-            format!("inproc://frontend-routing-{}", RequestId::new())
-                .parse()
-                .unwrap(),
-        )
+        .bind(format!("inproc://frontend-routing-{}", RequestId::new()))
         .await
         .unwrap();
     sdk.connect(endpoint).await.unwrap();

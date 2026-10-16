@@ -90,6 +90,10 @@ pub struct Endpoints {
     pub reader_pub: String,
     /// Optional PUB endpoint for live follower replication.
     pub follower_pub: Option<String>,
+    /// Optional PEER endpoint for the admin console. `ipc://` or `inproc://`
+    /// only: it has no authentication, so any client that connects is an admin.
+    // TODO(admin-auth): allow TCP once admins authenticate with CURVE keys.
+    pub admin: Option<String>,
 }
 
 /// Persistent topic attributes and bounded APPEND admission.

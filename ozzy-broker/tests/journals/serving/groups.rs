@@ -1,7 +1,11 @@
 //! Automatic consumer groups over real brokers: membership, handoff, resume.
 
 use super::*;
-use ozzy_proto::ConsumerMemberId;
+use crate::admin_client::AdminClient;
+use ozzy_proto::{
+    ConsumerMemberId,
+    admin::{Reply, Request},
+};
 use ozzy_runtime::replicated::{GroupReader, GroupReaderConfig, GroupReaderError};
 use std::{
     collections::BTreeSet,
@@ -61,6 +65,34 @@ async fn write(
     }
 }
 
+/// Broker 0's admin endpoint shows the group's two members and an owned,
+/// committed cursor on each partition, whether it leads them or not.
+async fn assert_admin_shows_group(brokers: &[Broker], runtime: &WriterRuntime, endpoint: &str) {
+    let mut client = AdminClient::connect(runtime.context(), endpoint).await;
+    live_many(brokers, "admin shows the group", async {
+        loop {
+            let Reply::Partitions(partitions) = client.ask(Request::Partitions).await else {
+                panic!("partitions reply expected");
+            };
+            let logs = || partitions.rows.iter().filter_map(|row| row.log.as_ref());
+            let members = logs()
+                .flat_map(|log| &log.groups)
+                .find(|group| group.name == "workers")
+                .map(|group| group.members.len());
+            let cursors = logs()
+                .flat_map(|log| &log.cursors)
+                .filter(|cursor| cursor.member.is_some() && cursor.offset.is_some())
+                .count();
+            if members == Some(2) && cursors == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    client.close().await;
+}
+
 /// Deliver and acknowledge until stopped, then close cooperatively.
 async fn consume(
     mut reader: GroupReader,
@@ -109,7 +141,13 @@ async fn scenario(policy: Confirmation) {
     } else {
         DeploymentMode::Three
     };
-    let deployment = deployment(root.path(), mode, policy, 2);
+    let admin = format!("inproc://groups-admin-{}", Uuid::now_v7());
+    let deployment = deployment_with(root.path(), mode, policy, 2, |config| {
+        for (name, broker) in &mut config.brokers {
+            broker.endpoints.admin = Some(format!("{admin}-{name}"));
+        }
+    });
+    let admin = format!("{admin}-{}", deployment[0].0.plan.name);
     let sdk = links(&runtime, &deployment[0].0).await;
     let first_links = group_links(&runtime, &deployment[0].0).await;
     let second_links = group_links(&runtime, &deployment[0].0).await;
@@ -177,6 +215,7 @@ async fn scenario(policy: Confirmation) {
         seen.len() == 2 * written
     })
     .await;
+    assert_admin_shows_group(&brokers, &runtime, &admin).await;
     stop.send(true).unwrap();
     live_many(&brokers, "close first member", first)
         .await

@@ -37,6 +37,10 @@ How Ozzy crates reach crates.io. For maintainers.
 
 ## Trusted publisher setup
 
+A new crate's first version is published by hand: an owner runs
+`cargo publish -p <crate>`, after any unpublished workspace crate it depends
+on. Trusted publishing covers later versions.
+
 For each released crate, open `https://crates.io/crates/<crate>/settings` and
 add a GitHub trusted publisher:
 

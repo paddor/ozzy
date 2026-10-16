@@ -1,6 +1,6 @@
 /.claude/
 /.chart_hw
-/target/
+/target
 /tmp/
 Cargo.lock.bak
 perf.data*

@@ -40,6 +40,9 @@ pub(super) struct Config {
     pub budgets: BTreeMap<u32, Budgets>,
     pub catalog: Vec<ozzy_proto::directory::TopicPage>,
     pub maximum_partitions: usize,
+    /// The admin owner's lane and links, when the broker serves an admin
+    /// endpoint.
+    pub admin: Option<crate::admin::Hooks>,
 }
 
 impl Config {
@@ -123,6 +126,7 @@ impl Config {
             budgets,
             catalog,
             maximum_partitions: checked.plan.partitions.len(),
+            admin: None,
         })
     }
 
@@ -131,6 +135,9 @@ impl Config {
         service: &mut Service,
         handoffs: Handoffs,
     ) -> Result<(), StartupError> {
+        if let Some(admin) = &self.admin {
+            admin.publish_links(service.links());
+        }
         for (id, handoff) in handoffs {
             let port = service
                 .port_with_publications(

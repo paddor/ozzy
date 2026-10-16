@@ -57,7 +57,7 @@ labels. Field names and enum values are fixed.
 | --- | --- |
 | `[cluster]` | `mode`: `"single"` or `"three"` |
 | `[limits]` | `max_topics` (1024), `max_partitions` (65536), `max_clients` (128, at most 4096) |
-| `[brokers.NAME.endpoints]` | `peer` (control), `data_peer` (APPEND, replay), `reader_pub` (live records); optional `follower_pub` |
+| `[brokers.NAME.endpoints]` | `peer` (control), `data_peer` (APPEND, replay), `reader_pub` (live records); optional `follower_pub`, `admin` |
 | `[brokers.NAME.devices.DEVICE]` | `root`, `controller` |
 | `[brokers.NAME.devices.DEVICE.workers]` | `backend` (`"aio"` on Linux, else `"pool"`), worker, CPU, job, byte, and handle bounds |
 | `[brokers.NAME.topology]` | `omq.io_threads` (1), `dispatcher`, `shards`, `memory_pools`, `partitions` |
@@ -80,6 +80,9 @@ says what each policy confirms.
 
 - Every endpoint is unique in the deployment. TCP endpoints need a fixed
   nonzero port and a connectable address.
+- `admin` must be `ipc://` or `inproc://`. It has no authentication: anyone
+  who can connect is an admin. An `ipc://@name` endpoint is in the Linux
+  abstract namespace, open to every local user; a path uses file permissions.
 - One device gets one shard by default. Several devices need explicit `shards`.
 - `segment_bytes` is at least 1 MiB, a multiple of 4096, and at least twice
   `max_append_bytes`. `max_append_bytes` is at most 8 MiB.

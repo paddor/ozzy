@@ -18,6 +18,8 @@ peer = "tcp://192.0.2.1:7100" # Control and confirmations.
 data_peer = "tcp://192.0.2.1:7103" # APPENDs and replay data.
 reader_pub = "tcp://192.0.2.1:7101" # Live consumer records.
 follower_pub = "tcp://192.0.2.1:7102" # Live follower replication.
+# Admin console for ozzy-tui. No authentication: any local user can connect.
+# admin = "ipc://@ozzy-admin"
 
 [brokers.my_server_1.devices.my_ssd]
 root = "/var/lib/ozzy/data"

@@ -10,13 +10,13 @@ peer = "tcp://127.0.0.1:7200"
 data_peer = "tcp://127.0.0.1:7203"
 reader_pub = "tcp://127.0.0.1:7201"
 follower_pub = "tcp://127.0.0.1:7202"
+admin = "ipc://@ozzy-three-broker-0-admin"
 
 [brokers.broker-0.devices.ssd]
 root = "/var/tmp/ozzy-three/broker-0"
 controller = "ssd"
 
 [brokers.broker-0.devices.ssd.workers]
-backend = "pool"
 write_threads = 1
 
 [[brokers.broker-0.topology.shards]]
@@ -32,13 +32,13 @@ peer = "tcp://127.0.0.1:7210"
 data_peer = "tcp://127.0.0.1:7213"
 reader_pub = "tcp://127.0.0.1:7211"
 follower_pub = "tcp://127.0.0.1:7212"
+admin = "ipc://@ozzy-three-broker-1-admin"
 
 [brokers.broker-1.devices.ssd]
 root = "/var/tmp/ozzy-three/broker-1"
 controller = "ssd"
 
 [brokers.broker-1.devices.ssd.workers]
-backend = "pool"
 write_threads = 1
 
 [[brokers.broker-1.topology.shards]]
@@ -54,13 +54,13 @@ peer = "tcp://127.0.0.1:7220"
 data_peer = "tcp://127.0.0.1:7223"
 reader_pub = "tcp://127.0.0.1:7221"
 follower_pub = "tcp://127.0.0.1:7222"
+admin = "ipc://@ozzy-three-broker-2-admin"
 
 [brokers.broker-2.devices.ssd]
 root = "/var/tmp/ozzy-three/broker-2"
 controller = "ssd"
 
 [brokers.broker-2.devices.ssd.workers]
-backend = "pool"
 write_threads = 1
 
 [[brokers.broker-2.topology.shards]]

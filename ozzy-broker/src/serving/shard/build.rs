@@ -56,6 +56,11 @@ pub(super) async fn build(
         outbound: outbound(&config),
         indices,
         group_cursor: 0,
+        admin: config
+            .admin
+            .as_ref()
+            .map(|admin| crate::admin::ShardLane::connect(&config.omq, admin, shard.plan.id))
+            .transpose()?,
         config,
     })
 }

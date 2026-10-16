@@ -114,7 +114,7 @@ impl Broker {
                 omq_tokio::ContextConfig {
                     io_threads: checked.plan.omq_io_threads,
                 },
-                format!("ozzy_omq-{}", checked.plan.name),
+                "ozzy/omq",
             )
         });
         let (owner, lanes) = DevicePools::start(&checked.plan)?;
@@ -146,7 +146,10 @@ impl Broker {
         context: ServingContext,
         storage: ShardStorage<B, impl StorageOwner>,
     ) -> Result<Self, StartupError> {
-        let config = Arc::new(config::Config::new(&checked, context)?);
+        let mut config = config::Config::new(&checked, context)?;
+        let admin = crate::admin::Admin::bind(&checked, &config.omq, config.local, config.clients)?;
+        config.admin = admin.as_ref().map(crate::admin::Admin::hooks);
+        let config = Arc::new(config);
         let checked = Arc::new(checked);
         let shards = checked.plan.shards.len();
         let (application_start, frontend_start) = startup_groups(shards);
@@ -155,6 +158,7 @@ impl Broker {
             application_start.state(),
             frontend_start.state(),
         );
+        devices.start_admin(admin).await?;
         let (send, registrations) = mpsc::channel(shards);
         let preflight = Arc::new(tokio::sync::Barrier::new(shards));
         let application = ApplicationShards::start_registered(

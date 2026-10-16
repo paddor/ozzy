@@ -9,11 +9,13 @@ formats. [Overview](OVERVIEW.md) defines the terms.
 
 | Thread | Count | Owns |
 | --- | --- | --- |
-| Dispatcher `ozzy_dispatch` | One per broker | Public sockets, sessions, routing, source pause and resume |
-| OMQ I/O | `topology.omq.io_threads` per broker | Connections, framing, socket queues |
-| Application shard `ozzy_app-N` | One per `topology.shards` entry | Partition actors, journals, readers, group coordinators |
-| Storage backend `ozzy_io-N` | Per `controller`: `write_threads` workers plus up to two progress workers | File handles, physical jobs, buffers |
-| AIO writer `ozzy_io-direct` | One per controller with `backend = "aio"` | Linux AIO submission and completion |
+| Dispatcher `ozzy/dispatch` | One per broker | Public sockets, sessions, routing, source pause and resume |
+| OMQ I/O `ozzy/omq/IO/N` | `topology.omq.io_threads` per broker | Connections, framing, socket queues |
+| Shard `ozzy/shard/N` | One per `topology.shards` entry | Partition actors, journals, readers, group coordinators |
+| Disk worker `ozzy/disk/N` | `write_threads` per `controller` | Segment data writes; with `aio`, only those without `O_DIRECT` |
+| Disk progress worker `ozzy/disk/pN` | Up to two per `controller` | Syncs, reads, opens, directory listings, metadata; never queued behind segment data |
+| AIO writer `ozzy/disk/aio` | One per controller with `backend = "aio"` | Linux AIO submission and completion |
+| Admin owner `ozzy/admin` | One per broker with an `admin` endpoint | Admin endpoint; asks shards for partition status, reads counters and links |
 | SDK owner `ozzy/sdk` | One per `WriterRuntime` | Links, routing, batching, compression, retries, receipts, reader inboxes |
 | SDK OMQ I/O | `OMQ_IO_THREADS` for `WriterRuntime::new` | SDK connections |
 
@@ -225,6 +227,7 @@ what the keys mean at runtime.
 | `data_peer` | Data PEER: APPENDs and replay |
 | `reader_pub` | PUB for live consumer records |
 | `follower_pub` | PUB for live follower replication; required with `mode = "three"` |
+| `admin` | Optional PEER for the [admin console](PROTOCOL.md#admin-console); `ipc://` or `inproc://` only, no authentication |
 
 - Each endpoint is both the bind and the connect address. Schemes are
   `tcp://`, `ipc://`, and `inproc://`.
@@ -278,7 +281,8 @@ runs. A HELLO beyond `max_clients` is dropped, counted as
 
 ## Telemetry
 
-Telemetry is optional and off by default.
+Event counters always count, per thread. Stage timing and PUB snapshots are
+optional and off by default.
 
 | Variable | Effect |
 | --- | --- |
@@ -293,11 +297,19 @@ Telemetry is optional and off by default.
 - Delivery is best effort and nonblocking. Sequence gaps show lost snapshots.
 - Telemetry carries no payloads, record identities, or file paths. It proves
   no confirmation.
-- Fully disabled telemetry allocates nothing and reads no clock. An idle
-  enabled thread adds no wakeups.
-- `ozzy_telemetry::enable_counters` records events without stage timing.
-  `ozzy_telemetry::totals` sums them across all threads, including exited
-  ones.
+- A counter update is a relaxed store to a thread-owned atomic. Without stage
+  timing or an endpoint, no path reads the clock. An idle enabled thread adds
+  no wakeups.
+- `ozzy_telemetry::totals` sums the counters across all threads, including
+  exited ones. `ozzy_telemetry::threads` lists them by thread; the admin
+  endpoint serves both.
+- Shards answer admin status queries between turns. A full admin lane drops
+  the answer, and the admin owner reports that shard as missing.
+- A partition's committed state (offsets, groups, cursors) is read from its
+  journal owner without I/O or a read ticket, so followers answer too. A
+  journal busy with a command answers without it.
+- Link state comes from the frontend's published link observations, which
+  the dispatcher hands to the admin owner at startup.
 - [Benchmark tools](../ozzy-bench/README.md) describe collection and event
   names.
 
@@ -310,3 +322,4 @@ Telemetry is optional and off by default.
 - Storage backends: `ozzy-io/`, `ozzy-io-pool/`, `ozzy-io-aio/`
 - Deployment schema and validation: `ozzy-config/src/`
 - Telemetry: `ozzy-telemetry/src/`
+- Admin owner: `ozzy-broker/src/admin.rs`

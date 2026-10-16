@@ -4,6 +4,8 @@
 mod config;
 pub use config::{DedupLimits, OwnedConfig, dedup_limits};
 pub(in crate::replica_journal) mod dedup;
+mod facts;
+pub use facts::{GroupSource, PartitionFacts};
 mod groups;
 mod local;
 mod mode;

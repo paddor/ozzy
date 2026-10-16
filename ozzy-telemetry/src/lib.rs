@@ -1,13 +1,15 @@
-//! Opt-in thread-owned stage diagnostics. Disabled paths never read the clock.
+//! Thread-owned diagnostics. Event counters always count; stage timing and PUB
+//! snapshots are opt-in. Without them, no path reads the clock.
 //!
-//! Enable before starting clients or brokers. Thread-owned histograms cover
-//! each thread's lifetime, use bounded storage, and measure different work units:
-//! record queues, write groups, and confirmation replies. Their percentiles
-//! must not be added. No payload bytes or record identities are retained.
+//! Enable stage timing before starting clients or brokers. Thread-owned
+//! histograms cover each thread's lifetime, use bounded storage, and measure
+//! different work units: record queues, write groups, and confirmation
+//! replies. Their percentiles must not be added. No payload bytes or record
+//! identities are retained.
 //!
 //! Event values also belong to their thread. [`totals`] combines every
-//! thread's values by each event's [`Kind`], including threads that exited.
-//! [`enable_counters`] records events on every thread without stage timing.
+//! thread's values by each event's [`Kind`], including threads that exited;
+//! [`threads`] lists them by thread.
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
 #![cfg_attr(
@@ -25,10 +27,7 @@
 
 use std::{
     cell::{Cell, RefCell},
-    sync::{
-        Arc, OnceLock,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -39,14 +38,13 @@ const PUBLISH_INTERVAL: Duration = Duration::from_millis(20);
 /// Recorded operations between clock reads for the publication interval.
 const PUBLISH_CHECK_OPERATIONS: u32 = 64;
 static TRANSPORT: OnceLock<Context> = OnceLock::new();
-static COUNTING: AtomicBool = AtomicBool::new(false);
 
 mod counters;
 mod histogram;
 mod names;
 
 use counters::Values;
-pub use counters::{Totals, totals};
+pub use counters::{Threads, Totals, threads, totals};
 use histogram::Metric;
 pub use histogram::{Snapshot, summarize_stage};
 use names::{EVENT_NAMES, STAGE_NAMES};
@@ -80,7 +78,7 @@ impl Local {
         let socket = std::env::var("OZZY_TELEMETRY_ENDPOINT")
             .ok()
             .and_then(|endpoint| {
-                let address = endpoint.parse().ok()?;
+                let address = endpoint.parse::<omq_tokio::Endpoint>().ok()?;
                 let context = TRANSPORT.get_or_init(|| {
                     Context::with_config_and_name(ContextConfig { io_threads: 1 }, "ozzy/tele")
                 });
@@ -93,12 +91,14 @@ impl Local {
             });
         let thread = std::thread::current();
         let started = Instant::now();
+        let id = format!("{:?}", thread.id());
+        let thread_name = thread.name().map(str::to_owned);
         Self {
-            events: Values::register(),
+            events: Values::register(thread_name.clone().unwrap_or_else(|| id.clone())),
             metrics: Vec::new(),
             socket,
-            thread: format!("{:?}", thread.id()),
-            thread_name: thread.name().map(str::to_owned),
+            thread: id,
+            thread_name,
             started,
             published: started,
             unchecked: 0,
@@ -254,23 +254,23 @@ pub fn compression(site: CompressionSite, packed: bool, input: usize, output: us
     count(output_bytes, output as u64);
 }
 
-/// Record one event while counting, publishing due snapshots.
+/// Record one event, publishing due snapshots.
 pub fn event(event: Event) {
     count(event, 1);
 }
 
-/// Add bytes or events to a [`Kind::Count`] event while counting.
+/// Add bytes or events to a [`Kind::Count`] event.
 pub fn count(event: Event, amount: u64) {
     record(event, Kind::Count, |count| count.wrapping_add(amount));
 }
 
-/// Raise a [`Kind::Peak`] event to `value` while counting.
+/// Raise a [`Kind::Peak`] event to `value`.
 pub fn peak(event: Event, value: u64) {
     record(event, Kind::Peak, |peak| peak.max(value));
 }
 
-/// Raise or lower a [`Kind::Gauge`] event while counting. Lower only what was
-/// raised while counting, on this thread or another.
+/// Raise or lower a [`Kind::Gauge`] event. Lower only what was raised, on this
+/// thread or another.
 pub fn gauge(event: Event, change: i64) {
     record(event, Kind::Gauge, |level| {
         level.wrapping_add_signed(change)
@@ -279,24 +279,23 @@ pub fn gauge(event: Event, change: i64) {
 
 fn record(event: Event, kind: Kind, change: impl FnOnce(u64) -> u64) {
     debug_assert_eq!(event.kind(), kind, "{event:?} recorded as {kind:?}");
-    if counting() {
-        local(|local| {
-            local.events.update(event, change);
+    local(|local| {
+        local.events.update(event, change);
+        // Without a PUB socket nothing is due, so skip the clock check.
+        if local.socket.is_some() {
             local.publish_if_due();
-        });
-    }
+        }
+    });
 }
 
 /// This thread's event values. Cross-thread aggregation belongs to SUB or
 /// [`totals`].
-pub fn events() -> Option<Vec<(&'static str, u64)>> {
-    counting().then(|| {
-        LOCAL.with(|cell| {
-            cell.borrow().as_ref().map_or_else(
-                || EVENT_NAMES.into_iter().map(|name| (name, 0)).collect(),
-                |local| EVENT_NAMES.into_iter().zip(local.events.get()).collect(),
-            )
-        })
+pub fn events() -> Vec<(&'static str, u64)> {
+    LOCAL.with(|cell| {
+        cell.borrow().as_ref().map_or_else(
+            || EVENT_NAMES.into_iter().map(|name| (name, 0)).collect(),
+            |local| EVENT_NAMES.into_iter().zip(local.events.get()).collect(),
+        )
     })
 }
 
@@ -308,17 +307,6 @@ pub fn enable() {
 /// Whether this thread enabled stage diagnostics.
 pub fn enabled() -> bool {
     ENABLED.with(Cell::get)
-}
-
-/// Record events on every thread from now on, without stage timing. Enable
-/// before starting clients or brokers.
-pub fn enable_counters() {
-    COUNTING.store(true, Ordering::Relaxed);
-}
-
-/// Whether this thread records events.
-pub fn counting() -> bool {
-    enabled() || COUNTING.load(Ordering::Relaxed)
 }
 
 /// Capture a stage boundary only when explicitly enabled.

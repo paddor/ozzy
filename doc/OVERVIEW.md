@@ -70,6 +70,9 @@ mode accepts `disk-quorum` or `replicated-persisting` per topic.
 
 - Transport receipt and buffered write completion never prove durability.
 - RP can lose an unpersisted tail if every in-memory copy is lost.
+- RP is mostly for disks with slow flushes, such as consumer SSDs and hard
+  disks. Where flushes are cheap, DQ costs little more and keeps every
+  confirmation on disk.
 - Single durable has no elections or failover.
 - A failed three-broker group never becomes a single broker.
 - [Replication](REPLICATION.md) owns voting and elections;

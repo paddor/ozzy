@@ -52,3 +52,11 @@ release = true
 [[package]]
 name = "ozzy-runtime"
 release = true
+
+[[package]]
+name = "ozzy-telemetry"
+release = true
+
+[[package]]
+name = "ozzy-ui"
+release = true

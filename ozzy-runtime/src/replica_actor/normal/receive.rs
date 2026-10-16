@@ -89,14 +89,10 @@ impl Receive {
         limits: PipelineLimits,
     ) -> Result<bool, ActorError> {
         event(Event::ReplicaReceive);
-        let packet_bytes = if crate::profiling::enabled() {
-            batch
-                .operations()
-                .map(|op| op.canonical().body.len() as u64)
-                .sum()
-        } else {
-            0
-        };
+        let packet_bytes = batch
+            .operations()
+            .map(|op| op.canonical().body.len() as u64)
+            .sum();
         crate::profiling::count(Event::ReceiveBytes, packet_bytes);
         let predecessor = self
             .end

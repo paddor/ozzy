@@ -623,13 +623,41 @@ fn compressed_endpoints_validate_like_tcp_and_cannot_mix_with_plain_transports()
             endpoints.follower_pub = Some(format!("{scheme}://127.0.0.1:{}", port + 3));
         }
         let mut mixed = config.clone();
+        let mut admin = config.clone();
         config.validate().unwrap();
+        admin.brokers.get_mut("a").unwrap().endpoints.admin = Some("ipc://@ozzy-admin-a".into());
+        admin.validate().unwrap();
         let endpoints = &mut mixed.brokers.get_mut("a").unwrap().endpoints;
         endpoints.reader_pub = endpoints
             .reader_pub
             .replacen(&format!("{scheme}://"), "tcp://", 1);
         assert!(mixed.validate().is_err());
     }
+}
+
+#[test]
+fn admin_endpoints_are_local_and_unique() {
+    for (endpoint, valid) in [
+        ("ipc://@ozzy-admin", true),
+        ("ipc:///run/ozzy/admin.sock", true),
+        ("inproc://ozzy-admin", true),
+        ("tcp://127.0.0.1:7900", false),
+        ("lz4+tcp://127.0.0.1:7900", false),
+        ("ipc://@", false),
+    ] {
+        let mut config = single();
+        config.brokers.get_mut("laptop").unwrap().endpoints.admin = Some(endpoint.to_owned());
+        assert_eq!(config.validate().is_ok(), valid, "{endpoint}");
+    }
+    let mut config = three();
+    for name in ["a", "b"] {
+        config.brokers.get_mut(name).unwrap().endpoints.admin = Some("ipc://@ozzy-admin".into());
+    }
+    assert!(config.validate().is_err());
+    let mut config = single();
+    let broker = config.brokers.get_mut("laptop").unwrap();
+    broker.endpoints.admin = Some(broker.endpoints.peer.clone());
+    assert!(config.validate().is_err());
 }
 
 #[test]

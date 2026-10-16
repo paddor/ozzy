@@ -7,6 +7,8 @@ mode = "single" # Fixed values: "single" or "three".
 peer = "tcp://127.0.0.1:7100" # Control and confirmations.
 data_peer = "tcp://127.0.0.1:7103" # APPENDs and replay data.
 reader_pub = "tcp://127.0.0.1:7101" # Live consumer records.
+# Admin console for ozzy-tui. No authentication: any local user can connect.
+# admin = "ipc://@ozzy-admin"
 
 # "my_ssd" is your device label. The root is the actual local storage directory.
 [brokers.my_server.devices.my_ssd]

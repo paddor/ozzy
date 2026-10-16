@@ -8,6 +8,7 @@ use ozzy_runtime::replicated::{
 };
 use std::{task::Poll, time::Duration};
 
+mod admin;
 mod failover;
 mod groups;
 mod large;
@@ -558,11 +559,9 @@ async fn production_failed_frontend_bind_drains_shards_before_retry() {
             .socket(omq_tokio::SocketType::Pub, omq_tokio::Options::default());
         blocker
             .bind(
-                checked.deployment.deployment().brokers[&checked.plan.name]
+                &checked.deployment.deployment().brokers[&checked.plan.name]
                     .endpoints
-                    .reader_pub
-                    .parse()
-                    .unwrap(),
+                    .reader_pub,
             )
             .await
             .unwrap();

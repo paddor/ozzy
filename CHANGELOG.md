@@ -6,6 +6,8 @@
 
 - `BrokerLinks::routes` is async. The SDK owner thread registers the topic,
   so routing state needs no lock shared with application threads.
+- The re-exported `Context` and `Endpoint` come from omq-tokio 0.26 instead
+  of 0.25.
 
 ### Added
 
@@ -41,9 +43,24 @@
   removed unselected storage objects.
 - Telemetry times the storage cleanup pass of a retention turn
   (`retention_cleanup`).
+- Optional broker `admin` endpoint (`ipc://` or `inproc://`) for an admin
+  console. It answers broker facts, event counters per thread, broker links
+  and connected clients, and each local partition's replication status and
+  committed state: record offsets, consumer groups, and their cursors. It has
+  no authentication yet.
+- `ozzy_telemetry::threads()` returns each live thread's event values by
+  thread name.
+- `ozzy-tui` (crate `ozzy-ui`), a terminal console of one broker's admin
+  endpoint: broker, cluster, and link facts; partitions with record offsets
+  and commit rates; replication progress and follower lag; consumer groups
+  with members and cursor lag; event counters per thread with rates. Keys
+  and mouse clicks pick screens, panes, and rows.
 
 ### Changed
 
+- Broker threads have slash names: `ozzy/dispatch`, `ozzy/shard/N`,
+  `ozzy/disk/N`, `ozzy/disk/pN`, `ozzy/disk/aio`, `ozzy/admin`, `ozzy/drain`,
+  and OMQ's `ozzy/omq/IO/N`, matching the SDK's `ozzy/sdk` and `ozzy/omq`.
 - Retention removes unselected segments, indexes, checkpoints, and manifests in
   a job beside later writes. The partition stops only to capture its selection,
   instead of holding its journal for each pass, about 80-110 ms on average and
@@ -108,10 +125,10 @@
   counts `partition_sweep_progress` when only the sweep found work.
 - Telemetry events are thread-owned atomics. `ozzy_telemetry::totals()`
   combines every thread's values, including exited threads, by each event's
-  `Kind`: count, peak, or gauge. `enable_counters()` counts events on every
-  thread without stage timing. Journal read, write, delivery, progress, and
-  dedup counters are telemetry events; the `storage-metrics` feature and its
-  process-wide counters are gone.
+  `Kind`: count, peak, or gauge. Events always count on every thread; stage
+  timing and PUB snapshots stay opt-in. Journal read, write, delivery,
+  progress, and dedup counters are telemetry events; the `storage-metrics`
+  feature and its process-wide counters are gone.
 
 ### Fixed
 

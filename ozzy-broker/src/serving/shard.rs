@@ -68,6 +68,8 @@ struct State {
     indices: BTreeMap<GroupId, usize>,
     /// Reservation slots whose deferred input its actor can take now.
     config: Arc<Config>,
+    /// Partition status queries from the admin owner, when one runs.
+    admin: Option<crate::admin::ShardLane>,
 }
 
 pub(super) async fn run(
@@ -213,6 +215,29 @@ impl State {
             Some(RoutePublisher::new(&self.actors, &self.identities, 16).map_err(failure)?);
         Ok(())
     }
+
+    /// Answer admin query `sequence` with every partition's status.
+    fn answer_admin(&self, sequence: u64) {
+        let Some(admin) = &self.admin else {
+            return;
+        };
+        let rows = self
+            .identities
+            .iter()
+            .filter_map(|&(group, partition)| {
+                let status = self.actors.status(group)?;
+                let route = self.actors.route_state(group, partition)?;
+                let facts = self.actors.facts(group, partition);
+                Some(crate::admin::partition_status(
+                    group,
+                    &status,
+                    &route,
+                    facts.as_ref(),
+                ))
+            })
+            .collect();
+        admin.answer(sequence, rows);
+    }
 }
 
 async fn serve(
@@ -228,7 +253,8 @@ async fn serve(
         let port_generation = binding.port.generation();
         let [data, replica, control, replica_control] =
             std::array::from_fn(|index| state.incoming[index].ready());
-        tokio::pin!(data, replica, control, replica_control);
+        let admin = state.admin.as_ref().map(crate::admin::ShardLane::query);
+        tokio::pin!(data, replica, control, replica_control, admin);
         let port = binding.port.changed_after(port_generation);
         let links = binding.links.clone();
         if !*serving.borrow() && state.serving() {
@@ -244,6 +270,17 @@ async fn serve(
                 }
                 // Wake for the earliest timer the turn left.
                 if alarm.poll_at(cx, state.next_deadline(now)).is_ready() {
+                    return Poll::Ready(Ok(()));
+                }
+                if let Some(query) = admin.as_mut().as_pin_mut()
+                    && let Poll::Ready(query) = query.poll(cx)
+                {
+                    match query {
+                        Ok(Some(sequence)) => state.answer_admin(sequence),
+                        Ok(None) => {}
+                        // The admin owner stopped; stop listening.
+                        Err(_) => state.admin = None,
+                    }
                     return Poll::Ready(Ok(()));
                 }
                 // Progress can fill a deferred slot. Check it at each poll,

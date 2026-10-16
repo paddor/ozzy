@@ -195,11 +195,7 @@ async fn connected(context: &Context) -> [IdentitySocket; 3] {
     let sockets = [socket(context, 0), socket(context, 1), socket(context, 2)];
     for other in &sockets[1..] {
         let endpoint = other
-            .bind(
-                format!("inproc://outbox-{}", NodeId::new())
-                    .parse()
-                    .unwrap(),
-            )
+            .bind(format!("inproc://outbox-{}", NodeId::new()))
             .await
             .unwrap();
         sockets[0].connect(endpoint).await.unwrap();
@@ -337,11 +333,7 @@ async fn absent_voter_reports_unroutable_without_discarding_healthy_peer_work() 
         let sender = socket(&context, 0);
         let healthy = socket(&context, 2);
         let endpoint = healthy
-            .bind(
-                format!("inproc://outbox-{}", NodeId::new())
-                    .parse()
-                    .unwrap(),
-            )
+            .bind(format!("inproc://outbox-{}", NodeId::new()))
             .await
             .unwrap();
         sender.connect(endpoint).await.unwrap();

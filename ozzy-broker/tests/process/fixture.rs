@@ -39,11 +39,13 @@ impl Fixture {
         let sockets = [
             TcpListener::bind("127.0.0.1:0").unwrap(),
             TcpListener::bind("127.0.0.1:0").unwrap(),
+            TcpListener::bind("127.0.0.1:0").unwrap(),
         ];
         let source = SINGLE
             .replace("/var/lib/ozzy/data", root.to_str().unwrap())
             .replace("7100", &sockets[0].local_addr().unwrap().port().to_string())
-            .replace("7101", &sockets[1].local_addr().unwrap().port().to_string());
+            .replace("7101", &sockets[1].local_addr().unwrap().port().to_string())
+            .replace("7103", &sockets[2].local_addr().unwrap().port().to_string());
         fs::write(
             &config,
             format!(

@@ -55,7 +55,7 @@ async fn zero_leading_peer_nodes_exchange_native_control_and_data_over_inproc_an
             } else {
                 format!("inproc://{}", ozzy_proto::RequestId::new())
             };
-            receiver.bind(endpoint.parse().unwrap()).await.unwrap();
+            receiver.bind(endpoint).await.unwrap();
             sender
                 .connect(receiver.last_bound_endpoint().unwrap())
                 .await

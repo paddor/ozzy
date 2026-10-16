@@ -287,7 +287,7 @@ async fn file_and_directory_operations_run_on_explicit_workers() {
             .unwrap()
             .threads
             .iter()
-            .all(|name| name.starts_with("ozzy_io-"))
+            .all(|name| name.starts_with("ozzy/disk/"))
     );
 }
 
@@ -769,7 +769,7 @@ impl Wake for Unpark {
 #[cfg(target_os = "linux")]
 impl direct::Worker for HeldDirect {
     fn run(self: Box<Self>, queue: &mut direct::Queue) -> io::Result<()> {
-        assert_eq!(std::thread::current().name(), Some("ozzy_io-direct"));
+        assert_eq!(std::thread::current().name(), Some("ozzy/disk/aio"));
         let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
         loop {
             queue.register(&waker);
