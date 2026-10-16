@@ -1,9 +1,9 @@
 //! One bounded SUB socket per broker, shared across every topic reader.
 
-use super::{Arc, BTreeSet, BrokerLinkError, BrokerLinksConfig, Bytes, NodeId, Shared};
+use super::{Arc, BTreeSet, BrokerLinkError, BrokerLinksConfig, Bytes, NodeId, Shared, readers};
 use crate::signal::CloseSignal;
 use omq_tokio::{Socket, SocketType};
-use std::time::Duration;
+use std::{rc::Rc, time::Duration};
 
 #[derive(Debug, Default)]
 pub(super) struct Link {
@@ -13,6 +13,7 @@ pub(super) struct Link {
 pub(super) struct Driver {
     socket: Socket,
     shared: Arc<Shared>,
+    readers: Rc<readers::Registry>,
     link: Arc<Link>,
     broker: NodeId,
     connected: bool,
@@ -27,6 +28,7 @@ impl Driver {
     pub(super) fn new(
         context: &omq_tokio::Context,
         shared: Arc<Shared>,
+        readers: Rc<readers::Registry>,
         broker: NodeId,
         config: &BrokerLinksConfig,
     ) -> Result<(Arc<Link>, Self), BrokerLinkError> {
@@ -47,6 +49,7 @@ impl Driver {
             Self {
                 socket,
                 shared,
+                readers,
                 link,
                 broker,
                 connected: false,
@@ -75,14 +78,14 @@ impl Driver {
             if self.shared.stop.is_closed() {
                 return Ok(());
             }
-            let seen = self.shared.readers.interests.generation();
+            let seen = self.readers.interests.generation();
             if self.observed != Some(seen) {
-                self.desired = self.shared.readers.prefixes();
+                self.desired = self.readers.prefixes();
                 self.observed = Some(seen);
                 self.updating = true;
             }
             if !self.connected
-                && let Some(endpoint) = self.shared.readers.endpoint(self.broker)
+                && let Some(endpoint) = self.readers.endpoint(self.broker)
             {
                 self.socket.connect(endpoint).await?;
                 self.connected = true;
@@ -93,9 +96,9 @@ impl Driver {
             }
             tokio::select! {
                 () = self.shared.stop.closed() => return Ok(()),
-                () = self.shared.readers.interests.changed_after(seen) => {},
+                () = self.readers.interests.changed_after(seen) => {},
                 message = self.socket.recv() => {
-                    self.shared.readers.publication(self.broker, &message?, self.limits);
+                    self.readers.publication(self.broker, &message?, self.limits);
                     ready += 1;
                     if ready == 16 { ready = 0; tokio::task::yield_now().await; }
                 }

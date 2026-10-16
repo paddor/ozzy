@@ -4,6 +4,7 @@ use super::{
     NativeIntake, NativeIntakeConfig, Outbound, PartitionActors, Policy, ShardContext,
     StartupError, State, TopicTopology, WRITER_WINDOW, WRITERS, failure, frontend,
 };
+use ozzy_runtime::replica_actor::PartitionActor;
 use std::time::Duration;
 
 pub(super) async fn build(
@@ -12,70 +13,22 @@ pub(super) async fn build(
     config: Arc<Config>,
     incoming: [DataReceiver; 4],
 ) -> Result<State, StartupError> {
-    let mut actors = Vec::new();
-    let mut natives = Vec::new();
-    let mut coordinators = Vec::new();
     let topologies = topologies(&config)?;
-    let mut bootstrap = Vec::new();
-    let mut recoveries = BTreeMap::new();
-    let mut identities = Vec::new();
-    let initialized = Box::pin(async {
-        for plan in journals
-            .partitions
-            .iter()
-            .filter(|partition| partition.placement.shard == shard.plan.id)
-        {
-            let (policy, _, group) = profile(&plan.config);
-            if policy != ozzy_proto::append::Policy::LocalDurable {
-                // Normal copies can withdraw after falling below retained
-                // history. Keep their service recipe for every later rejoin.
-                recoveries.insert(group, plan.clone());
-            }
-            if let Some(&intent) = journals.recovery.get(&group) {
-                let mut actor = open_recovery(shard, plan, intent, &config).await?;
-                if let Err(error) = actor.bind_receive_owner(&shard.memory.replica) {
-                    actors.push(actor);
-                    return Err(failure(error));
-                }
-                identities.push((group, plan.incarnation));
-                bootstrap.push(None);
-                actors.push(actor);
-                continue;
-            }
-            let mut started = Box::pin(open_actor(shard, plan, &config)).await?;
-            let initialized = initialize_started(&mut started, shard, &config, plan, &topologies);
-            match initialized {
-                Ok((native, coordinator)) => {
-                    natives.push(native);
-                    coordinators.push(coordinator);
-                }
-                Err(error) => {
-                    actors.push(started.actor);
-                    return Err(error);
-                }
-            }
-            identities.push((group, plan.incarnation));
-            bootstrap.push(Some(Bootstrap {
-                group,
-                submitter: started.proposal,
-                buffer: Some(started.buffer),
-                pending: None,
-                done: false,
-            }));
-            actors.push(started.actor);
-        }
-        Ok(())
-    })
-    .await;
-    if let Err(error) = initialized {
-        drop(natives);
-        drop(coordinators);
-        drop(bootstrap);
-        for actor in actors {
-            let _ = actor.shutdown().await;
-        }
+    let mut opening = Opening::new(shard, &config, &topologies);
+    let opened = Box::pin(opening.open_all(journals)).await;
+    if let Err(error) = opened {
+        opening.shut_down().await;
         return Err(error);
     }
+    let Opening {
+        actors,
+        natives,
+        coordinators,
+        bootstrap,
+        recoveries,
+        identities,
+        ..
+    } = opening;
     let routes = routing(shard.plan.id, &identities, config.envelope)?;
     let actors = scheduled(actors, identities.len())?;
     let indices = identities
@@ -107,6 +60,119 @@ pub(super) async fn build(
     })
 }
 
+/// Opens the shard's partitions. Holds the services opened so far, in
+/// partition order, and the service recipes kept for later rejoins.
+struct Opening<'a> {
+    shard: &'a ShardContext,
+    config: &'a Config,
+    topologies: &'a BTreeMap<String, Arc<TopicTopology>>,
+    actors: Vec<PartitionActor>,
+    natives: Vec<NativeIntake>,
+    coordinators: Vec<GroupCoordinator>,
+    bootstrap: Vec<Option<Bootstrap>>,
+    recoveries: BTreeMap<GroupId, crate::PartitionJournal>,
+    identities: Vec<(GroupId, ozzy_proto::PartitionIncarnation)>,
+}
+
+impl<'a> Opening<'a> {
+    fn new(
+        shard: &'a ShardContext,
+        config: &'a Config,
+        topologies: &'a BTreeMap<String, Arc<TopicTopology>>,
+    ) -> Self {
+        Self {
+            shard,
+            config,
+            topologies,
+            actors: Vec::new(),
+            natives: Vec::new(),
+            coordinators: Vec::new(),
+            bootstrap: Vec::new(),
+            recoveries: BTreeMap::new(),
+            identities: Vec::new(),
+        }
+    }
+
+    /// Open every partition placed on this shard. A failed partition keeps
+    /// its actor here so the caller can shut it down with the others.
+    async fn open_all(&mut self, journals: &JournalPlan) -> Result<(), StartupError> {
+        let shard = self.shard.plan.id;
+        for plan in journals
+            .partitions
+            .iter()
+            .filter(|partition| partition.placement.shard == shard)
+        {
+            let (policy, _, group) = profile(&plan.config);
+            if policy != ozzy_proto::append::Policy::LocalDurable {
+                // Normal copies can withdraw after falling below retained
+                // history. Keep their service recipe for every later rejoin.
+                self.recoveries.insert(group, plan.clone());
+            }
+            if let Some(&intent) = journals.recovery.get(&group) {
+                self.open_recovering(plan, intent).await?;
+            } else {
+                self.open_serving(plan, group).await?;
+            }
+            self.identities.push((group, plan.incarnation));
+        }
+        Ok(())
+    }
+
+    /// A partition under nonvoting recovery serves nothing until it rejoins.
+    async fn open_recovering(
+        &mut self,
+        plan: &crate::PartitionJournal,
+        intent: crate::RecoveryIntent,
+    ) -> Result<(), StartupError> {
+        let mut actor = open_recovery(self.shard, plan, intent, self.config).await?;
+        if let Err(error) = actor.bind_receive_owner(&self.shard.memory.replica) {
+            self.actors.push(actor);
+            return Err(failure(error));
+        }
+        self.bootstrap.push(None);
+        self.actors.push(actor);
+        Ok(())
+    }
+
+    /// A serving partition with its native intake, coordinator, and bootstrap.
+    async fn open_serving(
+        &mut self,
+        plan: &crate::PartitionJournal,
+        group: GroupId,
+    ) -> Result<(), StartupError> {
+        let mut started = Box::pin(open_actor(self.shard, plan, self.config)).await?;
+        match initialize_started(&mut started, self.shard, self.config, plan, self.topologies) {
+            Ok((native, coordinator)) => {
+                self.natives.push(native);
+                self.coordinators.push(coordinator);
+            }
+            Err(error) => {
+                self.actors.push(started.actor);
+                return Err(error);
+            }
+        }
+        self.bootstrap.push(Some(Bootstrap {
+            group,
+            submitter: started.proposal,
+            buffer: Some(started.buffer),
+            pending: None,
+            done: false,
+        }));
+        self.actors.push(started.actor);
+        Ok(())
+    }
+
+    /// Release the services before their actors, then drain every actor.
+    async fn shut_down(self) {
+        drop(self.natives);
+        drop(self.coordinators);
+        drop(self.bootstrap);
+        for actor in self.actors {
+            let _ = actor.shutdown().await;
+        }
+    }
+}
+
 fn initialize_started(
     started: &mut crate::StartedPartition,
     shard: &ShardContext,
@@ -132,7 +198,6 @@ fn initialize_started(
         &mut started.actor,
         config,
         plan,
-        group,
         topologies,
         &shard.memory.control,
     )?;
@@ -143,10 +208,8 @@ fn scheduled(
     actors: Vec<ozzy_runtime::replica_actor::PartitionActor>,
     partitions: usize,
 ) -> Result<PartitionActors, StartupError> {
-    // Partition timers start at 10 ms. Visit idle partitions often enough
-    // to observe them at most 2 ms late.
     PartitionActors::new(actors, partitions.max(1), 16)
-        .and_then(|actors| actors.with_timer_interval(super::TIMER_INTERVAL))
+        .and_then(|actors| actors.with_safety_sweep(super::SAFETY_SWEEP))
         .map_err(failure)
 }
 
@@ -196,7 +259,7 @@ async fn open_actor(
     config: &Config,
 ) -> Result<crate::StartedPartition, StartupError> {
     let opened = tokio::select! {
-        () = shard.shutdown.requested() => return Err(failure("partition startup stopped")),
+        () = shard.shutdown.closed() => return Err(failure("partition startup stopped")),
         opened = plan.clone().open(shard.io.clone(), JournalGeneration(uuid::Uuid::now_v7().as_u128())) => opened?,
     };
     let time = config.time.clone();
@@ -219,7 +282,7 @@ async fn open_recovery(
         temporary: JournalGeneration(uuid::Uuid::now_v7().as_u128()),
     };
     let opened = tokio::select! {
-        () = shard.shutdown.requested() => return Err(failure("partition recovery startup stopped")),
+        () = shard.shutdown.closed() => return Err(failure("partition recovery startup stopped")),
         opened = plan.clone().recover(shard.io.clone(), generations, intent) => opened?,
     };
     let time = config.time.clone();
@@ -259,8 +322,7 @@ pub(super) fn recovered_services(
         data_memory,
         control,
     )?;
-    let coordinator =
-        coordinator_service(actor, config, plan, group, &topologies(config)?, control)?;
+    let coordinator = coordinator_service(actor, config, plan, &topologies(config)?, control)?;
     Ok((
         Bootstrap {
             group,
@@ -304,11 +366,10 @@ fn coordinator_service(
     actor: &mut ozzy_runtime::replica_actor::PartitionActor,
     config: &Config,
     plan: &crate::PartitionJournal,
-    group: GroupId,
     topologies: &BTreeMap<String, Arc<TopicTopology>>,
     control: &ozzy_runtime::memory::Owner,
 ) -> Result<GroupCoordinator, StartupError> {
-    let (_, body_bytes, _) = profile(&plan.config);
+    let (_, body_bytes, group) = profile(&plan.config);
     let topology = topologies
         .get(&plan.placement.topic)
         .ok_or_else(|| failure("partition topic is missing from the catalog"))?
@@ -365,7 +426,9 @@ fn native_intake(
         .map(|index| {
             let mut buffer = actor
                 .lease_proposal_buffer_with_limits(
-                    native.buffer_limits(index).expect("fixed native slot"),
+                    native
+                        .buffer_limits(index)
+                        .ok_or_else(|| failure("native arena slot outside its layout"))?,
                 )
                 .map_err(failure)?;
             if index >= WRITERS * stride || index.is_multiple_of(stride) {

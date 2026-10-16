@@ -358,10 +358,7 @@ impl PreparedOperationRecords {
                     shared_backing_bytes: self.shared_backing_bytes,
                     batch,
                     decoded: cell,
-                    record: batch
-                        .records
-                        .get(index, &self.body)
-                        .expect("bounded record range"),
+                    record: batch.records.record(index, &self.body),
                     index: index as u64,
                 })
             })

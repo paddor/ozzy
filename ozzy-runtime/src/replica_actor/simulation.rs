@@ -84,7 +84,7 @@ impl ControlledReplica {
 
     /// Latest coalesced observation. This is not permission to vote or acknowledge.
     pub fn status(&self) -> ActorStatus {
-        *self.actor.status.borrow()
+        self.actor.status()
     }
 
     /// Close admission and join admitted journal work through production shutdown.

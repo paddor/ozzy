@@ -2,6 +2,7 @@
 
 use super::{RetryPolicy, TopicRoutes, TopicWriterError};
 use crate::replicated::BrokerLinkError;
+use crate::replicated::broker_links::LeaderRoute;
 use ozzy_proto::{OperationId, ProducerId, append::Authority, nack::RetryClass, producer};
 
 pub(super) async fn resolve(
@@ -53,24 +54,12 @@ async fn request(
     let clock = routes.links().clock();
     let mut backoff = retry.initial_backoff;
     loop {
-        let generation = routes.generation();
-        let route = routes.route(number)?;
-        let Some(route) = route.filter(|route| route.leader.is_some()) else {
-            tokio::select! {
-                changed = routes.changed_after(generation) => changed?,
-                () = clock.until(clock.now().saturating_add(retry.response_timeout)) => routes.refresh(number)?,
-            }
-            continue;
-        };
-        open.authority = Authority {
-            group_id: route.group,
-            config_epoch: route.config_epoch,
-            view: route.view,
-        };
+        let LeaderRoute { leader, route } = routes.leader(number, retry.response_timeout).await?;
+        open.authority = route.authority();
         let deadline = clock.now().saturating_add(retry.response_timeout);
         let response = tokio::select! {
             result = routes.links().open_producer(
-                route.leader.expect("known leader"),
+                leader,
                 open,
                 routes.metadata().policy(),
             ) => result,
@@ -86,6 +75,6 @@ async fn request(
         }
         routes.refresh(number)?;
         clock.until(clock.now().saturating_add(backoff)).await;
-        backoff = backoff.saturating_mul(2).min(retry.max_backoff);
+        backoff = retry.next_backoff(backoff);
     }
 }

@@ -7,6 +7,50 @@ use ozzy_journal::operation::{OperationLimits, logical_operation_digest};
 use ozzy_proto::GroupId;
 use std::{future::Future, pin::pin, sync::Arc, task::Poll};
 
+/// Synchronous oracle for the cooperative recovery decision.
+fn prepare(
+    image: &[u8],
+    generation: JournalGeneration,
+    first_group_number: u64,
+    initial_chain: ChainPosition,
+    limits: DecodeLimits,
+    validation: RecoveryValidation,
+) -> Result<Recovery, WriterError> {
+    let scan = crate::codec::scan(
+        image,
+        first_group_number,
+        initial_chain,
+        limits,
+        validation.discard_damaged_tail,
+    )?;
+    let mut checks = Checks::new(initial_chain, validation);
+    let mut segment_digest = SegmentDigestBuilder::new(&scan.header);
+    for group in &scan.groups {
+        for operation in &group.operations {
+            checks.operation(operation)?;
+        }
+        segment_digest.push(group.digest);
+    }
+    checks.finish(scan.next_chain)?;
+    let truncate = matches!(scan.tail, TailState::Truncated { .. }).then_some(scan.valid_bytes);
+    let zero = if matches!(scan.tail, TailState::Damaged { .. }) {
+        let start = scan.valid_bytes as usize;
+        let mut end = image.len();
+        while end > start {
+            let block = ((end - 1) / crate::WRITE_GROUP_ALIGNMENT * crate::WRITE_GROUP_ALIGNMENT)
+                .max(start);
+            if image[block..end].iter().any(|byte| *byte != 0) {
+                break;
+            }
+            end = block;
+        }
+        scan.valid_bytes..end as u64
+    } else {
+        0..0
+    };
+    Ok(finish(scan, generation, segment_digest, truncate, zero))
+}
+
 fn fixture(initial: ChainPosition, fault: u8) -> (Vec<u8>, Vec<ChainPosition>) {
     let header = SegmentHeader::new(
         GroupId::from_bytes([1; 16]),
@@ -42,7 +86,12 @@ fn fixture(initial: ChainPosition, fault: u8) -> (Vec<u8>, Vec<ChainPosition>) {
         operations.push(operation);
     }
     let mut image = encode_segment_header(&header).to_vec();
-    let group = encode_group(&header, 1, image.len() as u64, initial, &operations).unwrap();
+    let group = encode_group(
+        &header,
+        crate::GroupStart::new(1, image.len() as u64, initial),
+        &operations,
+    )
+    .unwrap();
     image.extend_from_slice(group.as_bytes());
     (image, positions)
 }
@@ -76,9 +125,11 @@ fn asynchronous(
 ) -> (Result<Recovery, WriterError>, usize) {
     run(prepare_async(
         image,
-        JournalGeneration(2),
-        1,
-        initial,
+        Start {
+            generation: JournalGeneration(2),
+            first_group_number: 1,
+            initial_chain: initial,
+        },
         DecodeLimits::default(),
         validation,
     ))
@@ -191,9 +242,11 @@ fn cooperative_recovery_cancellation_keeps_exact_damaged_tail_decisions() {
     for cut in 1..polls {
         let mut future = Box::pin(prepare_async(
             &image,
-            JournalGeneration(2),
-            1,
-            ChainPosition::GENESIS,
+            Start {
+                generation: JournalGeneration(2),
+                first_group_number: 1,
+                initial_chain: ChainPosition::GENESIS,
+            },
             DecodeLimits::default(),
             requirements,
         ));

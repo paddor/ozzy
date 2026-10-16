@@ -1,10 +1,10 @@
 use super::{
     Journal,
-    replay::{Resolved, finish_replay},
+    replay::{Resolved, finish_replay, identities, settled_images},
 };
 use crate::{
-    AsyncJournalIdentityIndex, CanonicalRecoveryLimits, CanonicalStateRecoveryError as Error,
-    CurrentReference, LogPosition,
+    CanonicalRecoveryLimits, CanonicalStateRecoveryError as Error, CurrentReference,
+    JournalIdentityIndex, LogPosition,
 };
 use ozzy_core::state::{CanonicalImages, CanonicalImagesError, CanonicalState};
 use ozzy_journal::{operation::decode_operation_body, progress::JournalGeneration};
@@ -13,9 +13,9 @@ use ozzy_journal::{operation::decode_operation_body, progress::JournalGeneration
 /// is published. No consensus authority or live admission is supplied here.
 #[derive(Debug)]
 pub struct Candidate {
-    committed: CanonicalImages<AsyncJournalIdentityIndex>,
+    committed: CanonicalImages<JournalIdentityIndex>,
     selected: CanonicalState,
-    identities: AsyncJournalIdentityIndex,
+    identities: JournalIdentityIndex,
     source: CurrentReference,
     generation: JournalGeneration,
     configuration_epoch: u64,
@@ -35,10 +35,7 @@ impl Journal {
         if self.is_faulted() || self.writer.written_position() != self.writer.durable_position() {
             return Err(Error::SelectionChanged);
         }
-        let mut selected = self
-            .selected_canonical_checkpoint(limits.state, limits.snapshot, limits.checkpoint)
-            .await?
-            .unwrap_or_else(|| CanonicalState::new(limits.state));
+        let mut selected = self.initial_canonical_state(limits).await?;
         let committed_position = self.committed_position()?;
         let accepted_position = self.accepted_position()?;
         let (committed_snapshot, accepted_snapshot) =
@@ -70,27 +67,15 @@ impl Journal {
             return Err(Error::PositionMismatch);
         }
         let committed = committed.ok_or(Error::PositionMismatch)?;
-        let identities = AsyncJournalIdentityIndex::new(
-            committed_snapshot,
-            limits.retained_identities,
-            limits.retained_identities,
-        );
-        let committed = CanonicalImages::from_recovered(
-            committed.clone(),
+        let committed = settled_images(
             committed,
-            identities.clone(),
-            identities,
-            Vec::new(),
+            identities(committed_snapshot, limits),
             limits.accepted_transitions,
         )?;
         Ok(Candidate {
             committed,
             selected,
-            identities: AsyncJournalIdentityIndex::new(
-                accepted_snapshot,
-                limits.retained_identities,
-                limits.retained_identities,
-            ),
+            identities: identities(accepted_snapshot, limits),
             source: self.current,
             generation: self.writer.durable_position().generation(),
             configuration_epoch: self.manifest.configuration_epoch,
@@ -103,7 +88,7 @@ impl Journal {
 
 impl Candidate {
     /// Canonical application images through the selected committed prefix.
-    pub const fn committed_images(&self) -> &CanonicalImages<AsyncJournalIdentityIndex> {
+    pub const fn committed_images(&self) -> &CanonicalImages<JournalIdentityIndex> {
         &self.committed
     }
     /// Canonical prefix accepted under this journal mode.
@@ -116,7 +101,7 @@ impl Candidate {
     pub fn activate(
         self,
         journal: &Journal,
-    ) -> Result<CanonicalImages<AsyncJournalIdentityIndex>, Error> {
+    ) -> Result<CanonicalImages<JournalIdentityIndex>, Error> {
         let manifest = &journal.manifest;
         let current = journal.current;
         let accepted = self.accepted_position();
@@ -136,12 +121,9 @@ impl Candidate {
         if journal.committed_position()? != accepted || manifest.committed != accepted {
             return Err(Error::CommitNotPublished);
         }
-        Ok(CanonicalImages::from_recovered(
-            self.selected.clone(),
+        Ok(settled_images(
             self.selected,
-            self.identities.clone(),
             self.identities,
-            Vec::new(),
             self.pending_capacity,
         )?)
     }

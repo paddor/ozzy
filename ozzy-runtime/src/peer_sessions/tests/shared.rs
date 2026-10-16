@@ -20,17 +20,17 @@ fn configured(id: u8, parameters: Parameters, required: u32, maximum: usize) -> 
 }
 
 fn transcript() -> Vec<Vec<Bytes>> {
-    let a = configured(1, profile(handshake::OWNER), handshake::OWNER, 2);
-    let b = configured(2, profile(handshake::OWNER), handshake::OWNER, 2);
+    let mut a = configured(1, profile(handshake::OWNER), handshake::OWNER, 2);
+    let mut b = configured(2, profile(handshake::OWNER), handshake::OWNER, 2);
     let mut transcript = Vec::new();
     for _ in 0..5 {
         let left = a.start(node(2)).unwrap();
         let right = b.start(node(1)).unwrap();
         assert_eq!(left, a.start(node(2)).unwrap());
-        let welcome = receive(&b, node(1), &left).reply.unwrap();
-        assert_eq!(welcome, receive(&b, node(1), &left).reply.unwrap());
-        receive(&a, node(2), &welcome);
-        assert!(receive(&a, node(2), &right).reply.is_none());
+        let welcome = receive(&mut b, node(1), &left).reply.unwrap();
+        assert_eq!(welcome, receive(&mut b, node(1), &left).reply.unwrap());
+        receive(&mut a, node(2), &welcome);
+        assert!(receive(&mut a, node(2), &right).reply.is_none());
         assert_eq!(a.session(node(2)), b.session(node(1)));
         transcript.extend([left, right, welcome]);
     }
@@ -47,7 +47,7 @@ fn mixed_clients_preserve_directional_profiles_without_partition_attachment() {
     let mut local = profile(handshake::OWNER);
     local.receive.max_parts = 64;
     local.receive.envelope.max_metadata_bytes = 1024;
-    let broker = configured(1, local, 0, 3);
+    let mut broker = configured(1, local, 0, 3);
     for (id, role) in [(2, handshake::PRODUCER), (3, handshake::CONSUMER)] {
         let mut parameters = profile(role);
         parameters.receive.max_records = 32;
@@ -57,12 +57,12 @@ fn mixed_clients_preserve_directional_profiles_without_partition_attachment() {
         if role == handshake::CONSUMER {
             parameters.capabilities = handshake::OWNER_READ;
         }
-        let client = configured(id, parameters, handshake::OWNER, 1);
+        let mut client = configured(id, parameters, handshake::OWNER, 1);
         let hello = client.start(node(1)).unwrap();
-        let reply = receive(&broker, node(id), &hello).reply.unwrap();
-        receive(&client, node(1), &reply);
+        let reply = receive(&mut broker, node(id), &hello).reply.unwrap();
+        receive(&mut client, node(1), &reply);
         assert_eq!(client.session(node(1)), broker.session(node(id)));
-        let selected = broker.remote_parameters(node(id)).unwrap();
+        let selected = broker.established(node(id)).unwrap().remote;
         assert_eq!(selected.roles, role);
         assert_eq!(selected.receive, parameters.receive);
         assert_eq!(selected.capabilities, parameters.capabilities);
@@ -75,10 +75,10 @@ fn mixed_clients_preserve_directional_profiles_without_partition_attachment() {
             max_parts: 64,
             max_record_bytes: 8192,
         };
-        assert_eq!(broker.send_limits(node(id)).unwrap(), expected);
-        assert_eq!(client.send_limits(node(1)).unwrap(), expected);
+        assert_eq!(broker.established(node(id)).unwrap().send, expected);
+        assert_eq!(client.established(node(1)).unwrap().send, expected);
         assert_eq!(
-            client.remote_parameters(node(1)).unwrap().receive,
+            client.established(node(1)).unwrap().remote.receive,
             local.receive
         );
     }
@@ -92,30 +92,33 @@ fn configured_receive_profiles_survive_reconnect_without_widening_clients() {
     native.receive.max_record_bytes = 1024;
     let mut bulk = native.receive;
     bulk.envelope.max_payload_bytes = 65536;
-    let local = Sessions::with_receive_profiles(
+    let mut local = Sessions::with_ids(
         node(1),
         native,
         0,
         2,
         LinkIds::deterministic(NonZeroU64::new(99).unwrap()),
-        &[(node(2), bulk)],
     )
+    .and_then(|sessions| sessions.with_receive_profiles(&[(node(2), bulk)]))
     .unwrap();
-    let broker = configured(2, profile(handshake::OWNER | 8), handshake::OWNER, 1);
-    let client = configured(3, profile(handshake::PRODUCER), handshake::OWNER, 1);
+    let mut broker = configured(2, profile(handshake::OWNER | 8), handshake::OWNER, 1);
+    let mut client = configured(3, profile(handshake::PRODUCER), handshake::OWNER, 1);
     let mut previous = None;
     for _ in 0..3 {
-        for (id, remote, expected) in [(2, &broker, bulk), (3, &client, native.receive)] {
+        for (id, remote, expected) in [(2, &mut broker, bulk), (3, &mut client, native.receive)] {
             let hello = remote.start(node(1)).unwrap();
-            let welcome = receive(&local, node(id), &hello).reply.unwrap();
+            let welcome = receive(&mut local, node(id), &hello).reply.unwrap();
             receive(remote, node(1), &welcome);
-            assert_eq!(remote.remote_parameters(node(1)).unwrap().receive, expected);
             assert_eq!(
-                local.send_limits(node(id)).unwrap().envelope,
+                remote.established(node(1)).unwrap().remote.receive,
+                expected
+            );
+            assert_eq!(
+                local.established(node(id)).unwrap().send.envelope,
                 expected.envelope
             );
             assert_eq!(
-                remote.send_limits(node(1)).unwrap().envelope,
+                remote.established(node(1)).unwrap().send.envelope,
                 expected.envelope
             );
         }
@@ -132,7 +135,8 @@ fn configured_receive_profiles_survive_reconnect_without_widening_clients() {
         vec![(node(2), bulk), (node(3), bulk), (node(4), bulk)],
     ] {
         assert!(
-            Sessions::with_receive_profiles(node(1), native, 0, 2, LinkIds::random(), &profiles,)
+            Sessions::with_ids(node(1), native, 0, 2, LinkIds::random())
+                .and_then(|sessions| sessions.with_receive_profiles(&profiles))
                 .is_err()
         );
     }
@@ -140,44 +144,44 @@ fn configured_receive_profiles_survive_reconnect_without_widening_clients() {
 
 #[test]
 fn disconnected_peer_keeps_its_tombstone_and_rejects_old_hello() {
-    let a = configured(1, profile(handshake::OWNER), handshake::OWNER, 1);
-    let b = configured(2, profile(handshake::OWNER), handshake::OWNER, 1);
+    let mut a = configured(1, profile(handshake::OWNER), handshake::OWNER, 1);
+    let mut b = configured(2, profile(handshake::OWNER), handshake::OWNER, 1);
     let hello = a.start(node(2)).unwrap();
-    let welcome = receive(&b, node(1), &hello).reply.unwrap();
-    receive(&a, node(2), &welcome);
+    let welcome = receive(&mut b, node(1), &hello).reply.unwrap();
+    receive(&mut a, node(2), &welcome);
     let old = b.session(node(1)).unwrap();
     b.disconnect(node(1));
     assert_eq!(b.session(node(1)), None);
-    assert!(!receive(&b, node(1), &hello).replaced);
-    assert!(receive(&b, node(1), &hello).reply.is_none());
+    assert!(receive(&mut b, node(1), &hello).replaced.is_none());
+    assert!(receive(&mut b, node(1), &hello).reply.is_none());
     assert_eq!(b.session(node(1)), None);
     assert!(matches!(
         b.start(node(3)),
         Err(Error::TooManyPendingRequests)
     ));
     let next = a.start(node(2)).unwrap();
-    let welcome = receive(&b, node(1), &next).reply.unwrap();
-    receive(&a, node(2), &welcome);
+    let welcome = receive(&mut b, node(1), &next).reply.unwrap();
+    receive(&mut a, node(2), &welcome);
     assert_eq!(a.session(node(2)), b.session(node(1)));
     assert_ne!(b.session(node(1)), Some(old));
 }
 
 #[test]
 fn rejected_role_or_unsolicited_welcome_consumes_no_peer_capacity() {
-    let broker = configured(1, profile(handshake::OWNER), handshake::OWNER, 1);
-    let client = configured(2, profile(handshake::PRODUCER), handshake::OWNER, 1);
+    let mut broker = configured(1, profile(handshake::OWNER), handshake::OWNER, 1);
+    let mut client = configured(2, profile(handshake::PRODUCER), handshake::OWNER, 1);
     let hello = client.start(node(1)).unwrap();
     let frames: Vec<_> = hello.iter().map(Bytes::as_ref).collect();
     let packet = ozzy_proto::decode_packet(&frames, DataLimits::default().envelope).unwrap();
     assert!(broker.receive(node(2), packet).is_err());
     assert_eq!(broker.session(node(2)), None);
 
-    let other = configured(3, profile(handshake::OWNER), handshake::OWNER, 1);
-    let old = configured(1, profile(handshake::OWNER), handshake::OWNER, 1);
+    let mut other = configured(3, profile(handshake::OWNER), handshake::OWNER, 1);
+    let mut old = configured(1, profile(handshake::OWNER), handshake::OWNER, 1);
     let hello = old.start(node(3)).unwrap();
-    let welcome = receive(&other, node(1), &hello).reply.unwrap();
-    assert!(!receive(&broker, node(3), &welcome).replaced);
-    assert!(broker.peers.lock().unwrap().is_empty());
+    let welcome = receive(&mut other, node(1), &hello).reply.unwrap();
+    assert!(receive(&mut broker, node(3), &welcome).replaced.is_none());
+    assert!(broker.peers.is_empty());
     assert!(broker.start(node(4)).is_ok());
 }
 

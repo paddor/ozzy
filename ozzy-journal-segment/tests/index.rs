@@ -1,10 +1,20 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
+
 use ozzy_journal::operation::{
     Append, AppendBatch, AppendRecord, Barrier, CanonicalOperation, ChainPosition, OperationBody,
     OperationLimits, encode_operation_body, logical_operation_digest,
 };
 use ozzy_journal_segment::{
-    DecodeLimits, Digest, IndexError, SEGMENT_HEADER_BYTES, SegmentHeader, decode_group,
-    derive_index_entries, encode_group,
+    DecodeLimits, Digest, GroupStart, IndexError, SEGMENT_HEADER_BYTES, SegmentHeader,
+    decode_group, derive_index_entries, encode_group,
 };
 use ozzy_proto::{
     GroupId, MessageId, Offset, OperationId, OwnerEpoch, PartitionIncarnation, ProducerEpoch,
@@ -87,17 +97,13 @@ fn validated_operations_yield_exact_record_and_retry_entries() {
     };
     let encoded = encode_group(
         &header,
-        1,
-        SEGMENT_HEADER_BYTES as u64,
-        ChainPosition::GENESIS,
+        GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS),
         &[append_operation, barrier_operation],
     )
     .unwrap();
     let decoded = decode_group(
         &header,
-        1,
-        SEGMENT_HEADER_BYTES as u64,
-        ChainPosition::GENESIS,
+        GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS),
         encoded.as_bytes(),
         DecodeLimits::default(),
     )

@@ -2,11 +2,12 @@
 //! Nothing here is authority: plans commit through the journal and sources
 //! fence stale revisions themselves.
 
+use crate::replica_actor::deadline::Earliest;
 use ozzy_core::state::CoordinatorGroup;
 use ozzy_journal::operation::{GroupMember, GroupTarget};
 use ozzy_proto::{
     ConsumerMemberId, NodeId, OperationId, PartitionIncarnation,
-    group::{Mode, Owned, Start, Target},
+    group::{JoinRequest, Mode, Owned, Start, Status, Target},
 };
 use std::{collections::BTreeMap, time::Duration};
 
@@ -21,6 +22,40 @@ pub(super) struct LiveMember {
     pub owned: Vec<Owned>,
     pub ownership_observed: bool,
     pub leaving: bool,
+}
+
+impl LiveMember {
+    /// A member instance that just reported what it owns.
+    fn new(join: OperationId, node: NodeId, now: Duration, owned: Vec<Owned>) -> Self {
+        Self {
+            join,
+            node,
+            seen: now,
+            owned,
+            ownership_observed: true,
+            leaving: false,
+        }
+    }
+
+    fn refresh(&mut self, node: NodeId, now: Duration, owned: Vec<Owned>) {
+        self.seen = now;
+        self.node = node;
+        self.owned = owned;
+        self.ownership_observed = true;
+    }
+}
+
+/// One membership request as the coordinator received it.
+pub(super) struct Observation {
+    pub request: JoinRequest,
+    pub node: NodeId,
+    pub now: Duration,
+}
+
+/// How reply targets are numbered and when moved ones may activate.
+pub(super) struct Targeting<'a> {
+    pub number: &'a dyn Fn(PartitionIncarnation) -> Option<u32>,
+    pub drain_deadline: Duration,
 }
 
 /// One group name on this coordinator while this actor serves as leader.
@@ -46,7 +81,7 @@ pub(super) enum Disposition {
     /// Another instance of the same member ID joined later.
     Fenced,
     /// Reply with the committed view: status and this instance's targets.
-    Reply(ozzy_proto::group::Status, Vec<Target>),
+    Reply(Status, Vec<Target>),
 }
 
 impl GroupState {
@@ -60,12 +95,8 @@ impl GroupState {
         self.initial = image.initial;
         for member in &image.members {
             let live = self.members.entry(member.id).or_insert_with(|| LiveMember {
-                join: member.join,
-                node: member.node,
-                seen: now,
-                owned: Vec::new(),
                 ownership_observed: false,
-                leaving: false,
+                ..LiveMember::new(member.join, member.node, now, Vec::new())
             });
             if live.join == member.join {
                 live.node = member.node;
@@ -81,6 +112,20 @@ impl GroupState {
         });
     }
 
+    /// Add each member's expiry and each moved target's drain deadline.
+    pub(super) fn deadlines(&self, next: Earliest, timeout: Duration, drain: Duration) -> Earliest {
+        next.each(
+            self.members
+                .values()
+                .map(|live| live.seen.saturating_add(timeout)),
+        )
+        .each(
+            self.drains
+                .values()
+                .map(|first| first.saturating_add(drain)),
+        )
+    }
+
     pub(super) fn expire(&mut self, now: Duration, timeout: Duration) -> bool {
         let before = self.members.len();
         self.members
@@ -93,13 +138,57 @@ impl GroupState {
     pub(super) fn observe(
         &mut self,
         image: Option<&CoordinatorGroup>,
-        request: ozzy_proto::group::JoinRequest,
+        seen: Observation,
+        targeting: &Targeting<'_>,
+    ) -> Disposition {
+        let Observation { request, node, now } = seen;
+        let instance = GroupMember {
+            id: request.member,
+            node,
+            join: request.join,
+        };
+        let mode = request.mode;
+        if !self.record(image, request, node, now) {
+            return Disposition::Fenced;
+        }
+        let Some(image) = image else {
+            let status = if mode == Mode::Join {
+                Status::Joining
+            } else {
+                Status::Unknown
+            };
+            return Disposition::Reply(status, Vec::new());
+        };
+        if !image.members.contains(&instance) {
+            return Disposition::Reply(Status::Joining, Vec::new());
+        }
+        let targets = image
+            .targets
+            .iter()
+            .filter(|target| target.member == Some(instance))
+            .filter_map(|target| {
+                Some(Target {
+                    partition: target.partition,
+                    number: (targeting.number)(target.partition)?,
+                    plan_revision: target.plan_revision,
+                    activatable: self.activatable(target, now, targeting.drain_deadline),
+                    prior_member: target.prior_member.map(|prior| prior.id),
+                })
+            })
+            .collect();
+        Disposition::Reply(Status::Member, targets)
+    }
+
+    /// Update the live member a request names. `false` fences a heartbeat or
+    /// leave from an instance this coordinator does not hold.
+    fn record(
+        &mut self,
+        image: Option<&CoordinatorGroup>,
+        request: JoinRequest,
         node: NodeId,
         now: Duration,
-        drain_deadline: Duration,
-        number: &impl Fn(PartitionIncarnation) -> Option<u32>,
-    ) -> Disposition {
-        let ozzy_proto::group::JoinRequest {
+    ) -> bool {
+        let JoinRequest {
             member,
             join,
             mode,
@@ -109,79 +198,23 @@ impl GroupState {
         } = request;
         match (mode, self.members.get_mut(&member)) {
             (Mode::Join, Some(live)) if live.join != join => {
-                *live = LiveMember {
-                    join,
-                    node,
-                    seen: now,
-                    owned,
-                    ownership_observed: true,
-                    leaving: false,
-                };
+                *live = LiveMember::new(join, node, now, owned);
             }
-            (Mode::Join, Some(live)) => {
-                live.seen = now;
-                live.node = node;
-                live.owned = owned;
-                live.ownership_observed = true;
-            }
+            (Mode::Join, Some(live)) => live.refresh(node, now, owned),
             (Mode::Join, None) => {
                 if image.is_none() && self.members.is_empty() {
                     self.initial = initial;
                 }
-                self.members.insert(
-                    member,
-                    LiveMember {
-                        join,
-                        node,
-                        seen: now,
-                        owned,
-                        ownership_observed: true,
-                        leaving: false,
-                    },
-                );
+                self.members
+                    .insert(member, LiveMember::new(join, node, now, owned));
             }
             (Mode::Heartbeat | Mode::Leave, Some(live)) if live.join == join => {
-                live.seen = now;
-                live.node = node;
-                live.owned = owned;
-                live.ownership_observed = true;
+                live.refresh(node, now, owned);
                 live.leaving |= mode == Mode::Leave;
             }
-            (Mode::Heartbeat | Mode::Leave, _) => return Disposition::Fenced,
+            (Mode::Heartbeat | Mode::Leave, _) => return false,
         }
-        let Some(image) = image else {
-            return Disposition::Reply(
-                if mode == Mode::Join {
-                    ozzy_proto::group::Status::Joining
-                } else {
-                    ozzy_proto::group::Status::Unknown
-                },
-                Vec::new(),
-            );
-        };
-        let instance = GroupMember {
-            id: member,
-            node,
-            join,
-        };
-        if !image.members.contains(&instance) {
-            return Disposition::Reply(ozzy_proto::group::Status::Joining, Vec::new());
-        }
-        let targets = image
-            .targets
-            .iter()
-            .filter(|target| target.member == Some(instance))
-            .filter_map(|target| {
-                Some(Target {
-                    partition: target.partition,
-                    number: number(target.partition)?,
-                    plan_revision: target.plan_revision,
-                    activatable: self.activatable(target, now, drain_deadline),
-                    prior_member: target.prior_member.map(|prior| prior.id),
-                })
-            })
-            .collect();
-        Disposition::Reply(ozzy_proto::group::Status::Member, targets)
+        true
     }
 
     fn activatable(&mut self, target: &GroupTarget, now: Duration, deadline: Duration) -> bool {

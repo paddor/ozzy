@@ -1,13 +1,12 @@
 //! Execution-neutral canonical validation. No filesystem access or authority changes.
 
-use super::{AppendBuffer, JournalError, MAX_APPEND_OPERATIONS};
+use super::{AppendBuffer, JournalError};
 use ozzy_core::state::{CanonicalImages, IdentityIndex, PreparedCanonicalGroup};
 use ozzy_journal::operation::{
-    Barrier, OperationBody, OperationKind, OperationLimits, decode_operation_body,
-    decode_resolved_append, decode_resolved_append_with_validated_payload,
+    OperationKind, OperationLimits, decode_operation_body, decode_resolved_append,
+    decode_resolved_append_with_validated_payload,
 };
 use ozzy_journal_segment::{DecodeLimits, PreparedOperationRecords};
-use ozzy_proto::OperationId;
 
 pub(super) fn segment_full(error: &ozzy_journal_segment::DirectoryError) -> bool {
     use ozzy_journal_segment::{CodecError, DirectoryError, WriterError};
@@ -81,21 +80,14 @@ pub(super) fn prepare<I: IdentityIndex + Clone>(
         return Ok(validated);
     }
     // Synchronous bounded scratch, never retained across an await.
-    let mut bodies: [_; MAX_APPEND_OPERATIONS] = std::array::from_fn(|_| {
-        (
-            0,
-            OperationBody::Barrier(Barrier {
-                operation_id: OperationId::from_bytes([0; 16]),
-            }),
-        )
-    });
-    for (slot, operation) in bodies.iter_mut().zip(buffer.operations()) {
-        *slot = (
-            operation.op_number,
-            decode_operation_body(operation.kind, operation.body, limits)?,
-        );
-    }
-    let plan = images.prepare_group(&bodies[..buffer.len()])?;
+    let bodies = buffer
+        .operations()
+        .map(|operation| {
+            let body = decode_operation_body(operation.kind, operation.body, limits)?;
+            Ok((operation.op_number, body))
+        })
+        .collect::<Result<smallvec::SmallVec<[_; 8]>, JournalError>>()?;
+    let plan = images.prepare_group(&bodies)?;
     drop(bodies);
     buffer.set_validated(true);
     Ok((plan, Vec::new()))
@@ -208,7 +200,3 @@ pub(super) fn retained_records(
         })
         .collect()
 }
-
-const _: () = assert!(
-    std::mem::size_of::<[(u64, OperationBody<'static>); MAX_APPEND_OPERATIONS]>() <= 64 * 1024
-);

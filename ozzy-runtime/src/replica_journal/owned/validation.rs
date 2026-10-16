@@ -4,7 +4,7 @@ use super::{AppendBuffer, JournalError, OwnedJournal};
 use crate::replica_journal::{ValidatedAppend, canonical, commands::read_fault};
 use ozzy_core::state::{CanonicalImagesError, IdentityKey, StateError};
 use ozzy_journal::operation::decode_operation_body;
-use ozzy_journal_segment::AsyncIdentityResolveError;
+use ozzy_journal_segment::IdentityResolveError;
 use ozzy_replication::{Scope, driver::ValidationTicket};
 
 impl OwnedJournal {
@@ -181,8 +181,8 @@ impl OwnedJournal {
                 .resolve(&keys)
                 .await
                 .map_err(|error| match error {
-                    AsyncIdentityResolveError::Lookup(error) => JournalError::Index(error),
-                    AsyncIdentityResolveError::Identity(error) => JournalError::Images(
+                    IdentityResolveError::Lookup(error) => JournalError::Index(error),
+                    IdentityResolveError::Identity(error) => JournalError::Images(
                         CanonicalImagesError::State(StateError::IdentityIndex(error)),
                     ),
                 })?;
@@ -194,14 +194,17 @@ impl OwnedJournal {
             self.limits.operations,
             primary_payloads_validated,
         )?;
-        #[cfg(feature = "storage-metrics")]
-        for operation in buffer.operations() {
+        if crate::profiling::counting() {
+            use crate::profiling::{Event, event, peak};
             use ozzy_journal::operation::OperationKind;
-            if matches!(
-                operation.kind,
-                OperationKind::Append | OperationKind::ResolvedAppend
-            ) {
-                crate::storage_metrics::prepared_operation(operation.body.len());
+            for operation in buffer.operations() {
+                if matches!(
+                    operation.kind,
+                    OperationKind::Append | OperationKind::ResolvedAppend
+                ) {
+                    event(Event::PreparedOperation);
+                    peak(Event::PreparedPayloadBytesMax, operation.body.len() as u64);
+                }
             }
         }
         Ok(prepared)

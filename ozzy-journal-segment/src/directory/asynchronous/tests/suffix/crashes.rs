@@ -28,7 +28,7 @@ fn async_suffix_execution_observation_crash_cuts_select_only_complete_histories(
                 &mut controller,
                 async {
                     let mut installer = journal
-                        .begin_suffix_replacement(replacement, position(ops[2]), stream_limits())
+                        .begin_suffix_replacement(stream_request(replacement, position(ops[2])))
                         .await?;
                     for chunk in ops.chunks(2) {
                         installer.append_chunk(chunk).await?;
@@ -83,7 +83,7 @@ fn async_suffix_abort_crash_cuts_never_delete_selected_history() {
         let replacement = request(&journal, LogPosition::GENESIS);
         let mut installer = drive(
             &mut controller,
-            journal.begin_suffix_replacement(replacement, position(ops[2]), stream_limits()),
+            journal.begin_suffix_replacement(stream_request(replacement, position(ops[2]))),
         )
         .unwrap();
         for chunk in ops.chunks(2) {

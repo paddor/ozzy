@@ -1,12 +1,11 @@
 //! Adaptive whole-APPEND packing without materializing record payloads.
 
+use super::append_encoder::{CODEC_METADATA_BYTES, ONE_BATCH_HEADER_BYTES as HEADER_BYTES};
 use super::{
-    OperationCodecError, OperationLimits, PREPARED_PAYLOAD, RECORD_COUNT_MASK, TINY_RECORDS,
+    BatchPayload, OperationCodecError, OperationLimits, PREPARED_PAYLOAD, TINY_RECORDS,
     ValidatedWireAppend, decode_append_view,
 };
-
-const HEADER_BYTES: usize = 80;
-const CODEC_METADATA_BYTES: usize = 9;
+use ozzy_proto::layout::{self, Fixed, Writer};
 
 /// Reusable bounded state for one journal owner.
 #[derive(Debug)]
@@ -53,6 +52,14 @@ impl AppendPackScratch {
         self.encoded.resize(capacity, 0);
         Ok(())
     }
+
+    /// Compress `payload` into the reusable block; returns its encoded bytes.
+    fn compress(&mut self, payload: &[u8]) -> Result<usize, OperationCodecError> {
+        self.reserve_encoded(payload.len())?;
+        self.compressor
+            .compress_into(payload, &mut self.encoded)
+            .map_err(|_| OperationCodecError::AppendCompression)
+    }
 }
 
 /// Outcome of one adaptive packing decision.
@@ -93,12 +100,9 @@ pub fn pack_append_payload(
     if batches.next().is_some() {
         return Ok(AppendPackResult::Ineligible);
     }
-    if batch.prepared_payload.is_some() {
+    let BatchPayload::Raw(records) = batch.payload else {
         return Ok(AppendPackResult::Prepared);
-    }
-    let records = batch
-        .raw_records()
-        .ok_or(OperationCodecError::InvalidPreparedPayload)?;
+    };
     if records
         .clone()
         .any(|record| record.encoding != ozzy_proto::data::Encoding::Raw)
@@ -106,19 +110,12 @@ pub fn pack_append_payload(
         return Ok(AppendPackResult::Ineligible);
     }
     let (descriptors, payload) = records.remaining_bytes();
-    let decoded_bytes = payload.len();
-    if decoded_bytes < ozzy_proto::append::ADAPTIVE_LZ4_THRESHOLD {
+    if payload.len() < ozzy_proto::append::ADAPTIVE_LZ4_THRESHOLD {
         return Ok(AppendPackResult::Ineligible);
     }
-    scratch.reserve_encoded(decoded_bytes)?;
-    let encoded_bytes = scratch
-        .compressor
-        .compress_into(payload, &mut scratch.encoded)
-        .map_err(|_| OperationCodecError::AppendCompression)?;
+    let encoded_bytes = scratch.compress(payload)?;
 
     let tiny_lengths = records.tiny_lengths();
-    let was_tiny = tiny_lengths.is_some();
-    let record_count = batch.summary.record_count;
     let descriptor_start = descriptors.as_ptr() as usize - body.as_ptr() as usize;
     let payload_start = payload.as_ptr() as usize - body.as_ptr() as usize;
     if descriptor_start != HEADER_BYTES || payload_start > body.len() {
@@ -127,60 +124,32 @@ pub fn pack_append_payload(
     let prepared_descriptor_bytes = if let Some(lengths) = tiny_lengths {
         scratch.tiny_lengths.clear();
         scratch.tiny_lengths.extend_from_slice(lengths);
-        record_count
+        batch
+            .summary
+            .record_count
             .checked_mul(24)
             .ok_or(OperationCodecError::LengthOverflow)?
     } else {
         descriptors.len()
     };
-    let descriptor_end = HEADER_BYTES
-        .checked_add(prepared_descriptor_bytes)
-        .ok_or(OperationCodecError::LengthOverflow)?;
-    let packed_body_bytes = descriptor_end
-        .checked_add(CODEC_METADATA_BYTES)
-        .and_then(|bytes| bytes.checked_add(encoded_bytes))
-        .ok_or(OperationCodecError::LengthOverflow)?;
-    if packed_body_bytes >= body.len() {
-        return Ok(AppendPackResult::Raw {
-            decoded_bytes,
-            encoded_bytes,
-        });
-    }
-    let decoded_bytes_u32 =
-        u32::try_from(decoded_bytes).map_err(|_| OperationCodecError::LengthOverflow)?;
-    let encoded_bytes_u32 =
-        u32::try_from(encoded_bytes).map_err(|_| OperationCodecError::LengthOverflow)?;
-
-    if was_tiny {
-        body.resize(packed_body_bytes, 0);
-        for index in (0..record_count).rev() {
-            let source = HEADER_BYTES + index * 16;
-            let destination = HEADER_BYTES + index * 24;
-            body.copy_within(source..source + 16, destination);
-            body[destination + 16..destination + 20].copy_from_slice(&1_u32.to_be_bytes());
-            body[destination + 20..destination + 24]
-                .copy_from_slice(&u32::from(scratch.tiny_lengths[index]).to_be_bytes());
-        }
-    } else {
-        body.truncate(descriptor_end);
-        body.resize(packed_body_bytes, 0);
-    }
-    let count = u32::from_be_bytes(
-        body[HEADER_BYTES - 4..HEADER_BYTES]
-            .try_into()
-            .expect("fixed append header"),
-    );
-    body[HEADER_BYTES - 4..HEADER_BYTES]
-        .copy_from_slice(&((count & !TINY_RECORDS) | PREPARED_PAYLOAD).to_be_bytes());
-    body[descriptor_end] = ozzy_proto::append::PayloadEncoding::Lz4 as u8;
-    body[descriptor_end + 1..descriptor_end + 5].copy_from_slice(&decoded_bytes_u32.to_be_bytes());
-    body[descriptor_end + 5..descriptor_end + 9].copy_from_slice(&encoded_bytes_u32.to_be_bytes());
-    body[descriptor_end + CODEC_METADATA_BYTES..]
-        .copy_from_slice(&scratch.encoded[..encoded_bytes]);
-    Ok(AppendPackResult::Packed {
-        decoded_bytes,
+    let packing = Packing {
+        descriptor_end: HEADER_BYTES
+            .checked_add(prepared_descriptor_bytes)
+            .ok_or(OperationCodecError::LengthOverflow)?,
+        decoded_bytes: payload.len(),
         encoded_bytes,
-    })
+    };
+    let Some(packed_body_bytes) = packing.shrunk_bytes(body.len())? else {
+        return Ok(packing.raw());
+    };
+    if tiny_lengths.is_some() {
+        widen_tiny_descriptors(body, packed_body_bytes, &scratch.tiny_lengths)?;
+    } else {
+        body.truncate(packing.descriptor_end);
+        body.resize(packed_body_bytes, 0);
+    }
+    let count = (header_count(body)? & !TINY_RECORDS) | PREPARED_PAYLOAD;
+    packing.write(body, count, &scratch.encoded)
 }
 
 /// Adaptively pack a one-batch wire APPEND already validated by `ozzy-proto`.
@@ -193,69 +162,114 @@ pub fn pack_validated_wire_append_payload(
     proof: &mut ValidatedWireAppend,
     scratch: &mut AppendPackScratch,
 ) -> Result<AppendPackResult, OperationCodecError> {
-    let descriptor_end = HEADER_BYTES
-        .checked_add(proof.descriptor_bytes())
-        .ok_or(OperationCodecError::LengthOverflow)?;
-    let encoded_metadata = usize::from(proof.encoded_bytes().is_some()) * CODEC_METADATA_BYTES;
-    let payload_bytes = proof.encoded_bytes().unwrap_or(proof.decoded_bytes());
-    let expected = descriptor_end
-        .checked_add(encoded_metadata)
-        .and_then(|bytes| bytes.checked_add(payload_bytes))
-        .ok_or(OperationCodecError::LengthOverflow)?;
-    let encoded_count = u32::from_be_bytes(
-        body.get(HEADER_BYTES - 4..HEADER_BYTES)
-            .and_then(|bytes| bytes.try_into().ok())
-            .ok_or(OperationCodecError::InvalidPreparedPayload)?,
-    );
-    if body.len() != expected
-        || encoded_count & RECORD_COUNT_MASK
-            != u32::try_from(proof.record_count())
-                .map_err(|_| OperationCodecError::LengthOverflow)?
-        || encoded_count & TINY_RECORDS != 0
-        || (proof.encoded_bytes().is_some()) != (encoded_count & PREPARED_PAYLOAD != 0)
-    {
-        return Err(OperationCodecError::InvalidPreparedPayload);
-    }
-    if proof.encoded_bytes().is_some() {
+    let (descriptor_end, count) = proof.check_layout(body)?;
+    if proof.payload_is_prepared() {
         return Ok(AppendPackResult::Prepared);
     }
     let decoded_bytes = proof.decoded_bytes();
     if decoded_bytes < ozzy_proto::append::ADAPTIVE_LZ4_THRESHOLD {
         return Ok(AppendPackResult::Ineligible);
     }
-    scratch.reserve_encoded(decoded_bytes)?;
-    let encoded_bytes = scratch
-        .compressor
-        .compress_into(&body[descriptor_end..], &mut scratch.encoded)
-        .map_err(|_| OperationCodecError::AppendCompression)?;
-    let packed_body_bytes = descriptor_end
-        .checked_add(CODEC_METADATA_BYTES)
-        .and_then(|bytes| bytes.checked_add(encoded_bytes))
-        .ok_or(OperationCodecError::LengthOverflow)?;
-    if packed_body_bytes >= body.len() {
-        return Ok(AppendPackResult::Raw {
-            decoded_bytes,
-            encoded_bytes,
-        });
-    }
-    let decoded_bytes_u32 =
-        u32::try_from(decoded_bytes).map_err(|_| OperationCodecError::LengthOverflow)?;
-    let encoded_bytes_u32 =
-        u32::try_from(encoded_bytes).map_err(|_| OperationCodecError::LengthOverflow)?;
+    let payload = body
+        .get(descriptor_end..)
+        .ok_or(OperationCodecError::InvalidPreparedPayload)?;
+    let packing = Packing {
+        descriptor_end,
+        decoded_bytes,
+        encoded_bytes: scratch.compress(payload)?,
+    };
+    let Some(packed_body_bytes) = packing.shrunk_bytes(body.len())? else {
+        return Ok(packing.raw());
+    };
     body.truncate(descriptor_end);
     body.resize(packed_body_bytes, 0);
-    body[HEADER_BYTES - 4..HEADER_BYTES]
-        .copy_from_slice(&(encoded_count | PREPARED_PAYLOAD).to_be_bytes());
-    body[descriptor_end] = ozzy_proto::append::PayloadEncoding::Lz4 as u8;
-    body[descriptor_end + 1..descriptor_end + 5].copy_from_slice(&decoded_bytes_u32.to_be_bytes());
-    body[descriptor_end + 5..descriptor_end + 9].copy_from_slice(&encoded_bytes_u32.to_be_bytes());
-    body[descriptor_end + CODEC_METADATA_BYTES..]
-        .copy_from_slice(&scratch.encoded[..encoded_bytes]);
-    proof.packed(encoded_bytes)?;
-    Ok(AppendPackResult::Packed {
-        decoded_bytes,
-        encoded_bytes,
-    })
+    let result = packing.write(body, count | PREPARED_PAYLOAD, &scratch.encoded)?;
+    proof.packed(packing.encoded_bytes)?;
+    Ok(result)
+}
+
+/// One LZ4 block compressed from the payload after a body's descriptors.
+#[derive(Debug, Clone, Copy)]
+struct Packing {
+    descriptor_end: usize,
+    decoded_bytes: usize,
+    encoded_bytes: usize,
+}
+
+impl Packing {
+    /// The packed body length when it is smaller than `body_bytes`. Both
+    /// lengths are checked to fit their fields before the body changes.
+    fn shrunk_bytes(self, body_bytes: usize) -> Result<Option<usize>, OperationCodecError> {
+        let packed_body_bytes = self
+            .descriptor_end
+            .checked_add(CODEC_METADATA_BYTES)
+            .and_then(|bytes| bytes.checked_add(self.encoded_bytes))
+            .ok_or(OperationCodecError::LengthOverflow)?;
+        if packed_body_bytes >= body_bytes {
+            return Ok(None);
+        }
+        u32::try_from(self.decoded_bytes).map_err(|_| OperationCodecError::LengthOverflow)?;
+        u32::try_from(self.encoded_bytes).map_err(|_| OperationCodecError::LengthOverflow)?;
+        Ok(Some(packed_body_bytes))
+    }
+
+    const fn raw(self) -> AppendPackResult {
+        AppendPackResult::Raw {
+            decoded_bytes: self.decoded_bytes,
+            encoded_bytes: self.encoded_bytes,
+        }
+    }
+
+    /// Set the header count, then write the LZ4 codec metadata and block
+    /// after the descriptors of a body already sized for them.
+    fn write(
+        self,
+        body: &mut [u8],
+        count: u32,
+        encoded: &[u8],
+    ) -> Result<AppendPackResult, OperationCodecError> {
+        let length =
+            |bytes: usize| u32::try_from(bytes).map_err(|_| OperationCodecError::LengthOverflow);
+        layout::patch(body, HEADER_BYTES - 4, count.to_be_bytes())?;
+        let tail = body
+            .get_mut(self.descriptor_end..)
+            .ok_or(OperationCodecError::LengthOverflow)?;
+        let mut writer = Writer::new(tail);
+        writer.u8(ozzy_proto::append::PayloadEncoding::Lz4 as u8)?;
+        writer.u32(length(self.decoded_bytes)?)?;
+        writer.u32(length(self.encoded_bytes)?)?;
+        writer.bytes(encoded.get(..self.encoded_bytes).unwrap_or_default())?;
+        Ok(AppendPackResult::Packed {
+            decoded_bytes: self.decoded_bytes,
+            encoded_bytes: self.encoded_bytes,
+        })
+    }
+}
+
+/// Resize a tiny-record body and widen each 16-byte ID to a raw single-part
+/// 24-byte descriptor, last first so no ID is overwritten before it moves.
+fn widen_tiny_descriptors(
+    body: &mut Vec<u8>,
+    packed_body_bytes: usize,
+    lengths: &[u8],
+) -> Result<(), OperationCodecError> {
+    body.resize(packed_body_bytes, 0);
+    for (index, &length) in lengths.iter().enumerate().rev() {
+        let source = HEADER_BYTES + index * 16;
+        let destination = HEADER_BYTES + index * 24;
+        body.copy_within(source..source + 16, destination);
+        let [a, b, c, d] = u32::from(length).to_be_bytes();
+        layout::patch(body, destination + 16, [0, 0, 0, 1, a, b, c, d])?;
+    }
+    Ok(())
+}
+
+/// The record count at the end of the fixed APPEND header.
+fn header_count(body: &[u8]) -> Result<u32, OperationCodecError> {
+    let header: &[u8; HEADER_BYTES] = body
+        .first_chunk()
+        .ok_or(OperationCodecError::InvalidPreparedPayload)?;
+    Ok(header.u32_at::<{ HEADER_BYTES - 4 }>())
 }
 
 #[cfg(test)]
@@ -304,7 +318,7 @@ mod tests {
             .batches()
             .next()
             .unwrap()
-            .prepared_payload
+            .prepared_payload()
             .unwrap()
     }
 

@@ -101,3 +101,41 @@ fn failed_marker_barrier_fences_even_if_the_marker_reached_storage() {
         assert!(drive(&mut controller, journal.publish_drained_memory_history()).is_err());
     }
 }
+
+#[test]
+fn every_corrupted_byte_missing_file_and_temporary_clean_file_fail_closed() {
+    use crate::directory::memory_voting::BYTES;
+    let path = "/group/MEMORY_VOTING";
+    let (mut controller, io) = setup(baseline());
+    let mut journal = drive(&mut controller, open(io, 2)).unwrap();
+    drive(&mut controller, journal.publish_drained_memory_history()).unwrap();
+    let original = controller
+        .image()
+        .bytes(Path::new(path), false)
+        .unwrap()
+        .to_vec();
+    assert_eq!(original.len(), BYTES);
+    for index in 0..BYTES {
+        let mut bytes = original.clone();
+        bytes[index] ^= 1;
+        write_file(&mut controller, &journal.access, path, &bytes);
+        assert!(
+            drive(&mut controller, journal.require_drained_memory_history()).is_err(),
+            "byte {index}"
+        );
+    }
+    write_file(&mut controller, &journal.access, path, &original);
+    drive(&mut controller, journal.require_drained_memory_history()).unwrap();
+    write_file(
+        &mut controller,
+        &journal.access,
+        "/group/.MEMORY_VOTING.tmp",
+        &original,
+    );
+    remove_file(&mut controller, &journal.access, path);
+    assert!(drive(&mut controller, journal.require_drained_memory_history()).is_err());
+    for bytes in [&original[..BYTES - 1], &[0; BYTES + 1][..]] {
+        write_file(&mut controller, &journal.access, path, bytes);
+        assert!(drive(&mut controller, journal.require_drained_memory_history()).is_err());
+    }
+}

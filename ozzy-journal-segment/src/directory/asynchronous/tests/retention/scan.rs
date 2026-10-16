@@ -200,3 +200,35 @@ async fn sparse_gib_segment_scans_under_a_group_sized_reservation() {
     drop(journal);
     pool.shutdown().await;
 }
+
+#[test]
+fn retirement_respects_the_through_position_and_the_proof_operation_floor() {
+    // Segment 1 holds operation 1, segment 2 operation 2, and 3 is active.
+    let image = super::retained_baseline();
+    let cases: [(Option<u64>, bool, &[u64]); 5] = [
+        (None, true, &[1, 2]),
+        (None, false, &[1]),
+        (Some(3), true, &[1, 2]),
+        (Some(2), true, &[1]),
+        (Some(1), true, &[]),
+    ];
+    for (floor, committed, retired) in cases {
+        let (mut controller, io) = setup(image.clone());
+        let journal = drive(&mut controller, open(io, 3)).unwrap();
+        let mut floors = crate::RetentionFloors::new(vec![]).unwrap();
+        if let Some(floor) = floor {
+            floors = floors.with_protected_operation(floor);
+        }
+        let through = if committed {
+            journal.committed_position().unwrap()
+        } else {
+            position_before(journal.manifest.segments[1].first_chain).unwrap()
+        };
+        let scan = journal
+            .prepare_retirement_scan(floors, through, super::budget(), &[])
+            .unwrap();
+        let prefix = drive(&mut controller, scan.scan()).unwrap();
+        let ids: Vec<_> = prefix.references().iter().map(|r| r.segment_id).collect();
+        assert_eq!(ids, retired, "floor {floor:?}, committed {committed}");
+    }
+}

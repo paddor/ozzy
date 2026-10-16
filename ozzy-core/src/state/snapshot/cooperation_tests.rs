@@ -1,5 +1,6 @@
 use super::*;
 use crate::state::{CanonicalPartition, CanonicalProducer, PartitionAddress};
+use ozzy_proto::layout;
 use ozzy_proto::{OwnerEpoch, PartitionId, ProducerEpoch, ProducerId, ProducerSequence};
 use std::{
     future::Future,
@@ -110,21 +111,21 @@ fn canonical_snapshot_encoding_bytes_fixture() {
             0,
             0,
             10773,
-            0x1ada_1786_19db_3292_4992_2026_adea_a60b_u128,
+            0x5036_dd30_aa00_ee6d_2077_9ead_39d0_40f9_u128,
         ),
         (
             2,
             130,
             130,
             27573,
-            0x9e1a_338c_057f_6ffa_1cc2_14c0_69c6_f3ad_u128,
+            0x83ff_7993_7593_32bb_bbcc_de4d_0097_fc0f_u128,
         ),
         (
             2,
             6000,
             130,
             497_173,
-            0x47bf_5d68_a0bb_aa64_eb38_867b_f037_5afc_u128,
+            0x5e7b_8f6f_fa26_1811_c9f5_fd96_2b70_6060_u128,
         ),
     ] {
         let state = state(writers, spans, metadata);
@@ -135,7 +136,7 @@ fn canonical_snapshot_encoding_bytes_fixture() {
         assert_eq!(bytes.len(), length);
         let mut expected = [0; 32];
         expected[..16].copy_from_slice(&digest.to_be_bytes());
-        assert_eq!(snapshot_digest(&bytes).as_bytes(), &expected);
+        assert_eq!(snapshot_digest(&bytes).unwrap().as_bytes(), &expected);
         assert_eq!(
             &bytes[SNAPSHOT_DIGEST_START..SNAPSHOT_DIGEST_END],
             &expected
@@ -299,11 +300,11 @@ fn cooperative_state_snapshot_refuses_late_semantic_errors_and_resource_limits()
         .encode_snapshot(StateSnapshotLimits::default())
         .unwrap();
     let partition = STATE_SNAPSHOT_HEADER_BYTES;
-    let names = usize::from(read_u16(&original, partition + 4))
-        + usize::from(read_u16(&original, partition + 6));
+    let fixed: &[u8; 104] = layout::record(&original, partition).unwrap();
+    let names = usize::from(fixed.u16_at::<4>()) + usize::from(fixed.u16_at::<6>());
     let first = partition + 104 + names;
     let second = first + 80 + 130 * 40;
-    let progress = partition + read_u32(&original, partition) as usize;
+    let progress = partition + fixed.u32_at::<0>() as usize;
     let assignments = progress + 130 * PROGRESS_BYTES;
     for (at, value, error) in [
         (second + 80 + 8, 0, StateSnapshotError::InvalidPartition),
@@ -336,8 +337,8 @@ fn cooperative_state_snapshot_refuses_late_semantic_errors_and_resource_limits()
         (96, 261, StateSnapshotError::LengthMismatch),
     ] {
         let mut bytes = original.clone();
-        put_u64(&mut bytes, at, value);
-        let digest = snapshot_digest(&bytes);
+        layout::patch(&mut bytes, at, u64::to_be_bytes(value)).unwrap();
+        let digest = snapshot_digest(&bytes).unwrap();
         bytes[SNAPSHOT_DIGEST_START..SNAPSHOT_DIGEST_END].copy_from_slice(digest.as_bytes());
         let (result, polls) = run(CanonicalState::decode_snapshot_cooperative(
             &bytes,

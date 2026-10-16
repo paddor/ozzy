@@ -26,6 +26,11 @@ pub struct CheckedConfig {
 }
 
 impl CheckedConfig {
+    /// This broker's entry in the checked deployment.
+    pub fn local_broker(&self) -> Result<&ozzy_config::Broker, StartupError> {
+        Ok(self.deployment.deployment().broker(&self.plan.name)?)
+    }
+
     /// SDK-visible immutable topic identity from the checked deployment record.
     /// Neither local shard placement nor runtime leader guesses enter this table.
     pub fn topic_catalog(&self) -> Result<TopicCatalog, StartupError> {
@@ -35,15 +40,15 @@ impl CheckedConfig {
             .brokers
             .iter()
             .map(|(name, id)| {
-                let endpoints = &deployment.brokers[name].endpoints;
-                directory::BrokerEndpoint {
+                let endpoints = &deployment.broker(name)?.endpoints;
+                Ok(directory::BrokerEndpoint {
                     node: NodeId::from_bytes(*id.as_bytes()),
                     peer: endpoints.peer.clone(),
                     reader_pub: endpoints.reader_pub.clone(),
                     follower_pub: endpoints.follower_pub.clone(),
-                }
+                })
             })
-            .collect();
+            .collect::<Result<_, StartupError>>()?;
         let mut pages = Vec::new();
         for (name, topic) in &self.identity.topics {
             let policy = match topic.confirmation {

@@ -70,15 +70,14 @@ impl Fixture {
             PayloadEncoding::Lz4 => lz4rip::block::compress(&self.payload),
         };
         let mut canonical = Vec::new();
-        let (_, proof) = append_wire_record_batch(
-            &mut canonical,
+        let batch = ozzy_journal::operation::WireBatch {
             header,
-            descriptors,
+            records: descriptors,
             encoding,
-            &encoded,
-            OperationLimits::default(),
-        )
-        .unwrap();
+            payload: &encoded,
+        };
+        let (_, proof) =
+            append_wire_record_batch(&mut canonical, batch, OperationLimits::default()).unwrap();
         let body = Bytes::from(canonical);
         let trusted = proof.batch(&body, OperationLimits::default()).unwrap();
         let ordinary = decode_append_batches(&body, OperationLimits::default()).unwrap();
@@ -138,10 +137,10 @@ impl Fixture {
                 range: 0..self.records.len(),
                 ..span
             };
-            let (table, count, backing, selected) = full.prepared_backing(body.len()).unwrap();
-            assert_eq!(table, &self.metadata[4..]);
-            assert_eq!(count, self.payload.len());
-            assert_eq!(&backing[selected], encoded);
+            let block = full.prepared_backing(body.len()).unwrap();
+            assert_eq!(block.descriptors, &self.metadata[4..]);
+            assert_eq!(block.decoded_bytes, self.payload.len());
+            assert_eq!(&block.body[block.encoded], encoded);
         }
     }
 }

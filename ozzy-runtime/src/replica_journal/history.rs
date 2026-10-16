@@ -3,8 +3,46 @@
 use ozzy_replication::wire::{FetchOps, Operation};
 use ozzy_replication::{LogSource, OpNumber, Prefix};
 
-use super::commands::Action;
-use super::{AppendBuffer, JournalCompletion, Rejected, ReplicaJournal, SubmitError};
+use super::commands::{Action, Gate};
+use super::{
+    AppendBuffer, JournalCompletion, JournalError, Rejected, ReplicaJournal, SubmitError,
+    completion,
+};
+
+/// Source capture, lookup, and history export commands for the journal owner.
+#[derive(Debug)]
+pub(super) enum HistoryAction {
+    Capture {
+        source: LogSource,
+        done: completion::Sender<Result<LogSource, JournalError>>,
+    },
+    Release {
+        source: LogSource,
+        done: completion::Sender<Result<LogSource, JournalError>>,
+    },
+    Position {
+        source: LogSource,
+        op: OpNumber,
+        done: completion::Sender<Result<HistoryPosition, JournalError>>,
+    },
+    Fetch {
+        request: FetchOps,
+        buffer: AppendBuffer,
+        done: completion::Sender<Result<FetchedHistory, JournalError>>,
+    },
+    FetchReplication {
+        ticket: ozzy_replication::driver::ValidationTicket,
+        predecessor: Prefix,
+        limits: ozzy_replication::PipelineLimits,
+        buffer: AppendBuffer,
+        done: completion::Sender<Result<FetchedHistory, JournalError>>,
+    },
+    ReplicationPositions {
+        ticket: ozzy_replication::driver::ValidationTicket,
+        requested: [OpNumber; 2],
+        done: completion::Sender<Result<ReplicationPositions, JournalError>>,
+    },
+}
 
 /// Result for an exact source/op selection-cache key. No vote or nonexistence proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,21 +132,13 @@ impl ReplicaJournal {
         ticket: ozzy_replication::driver::ValidationTicket,
         requested: [OpNumber; 2],
     ) -> Result<JournalCompletion<ReplicationPositions>, SubmitError> {
-        self.submit(
-            (ticket, requested),
-            |(ticket, requested), done| Action::ReplicationPositions {
+        self.command(Gate::Free, |done| {
+            Action::History(HistoryAction::ReplicationPositions {
                 ticket,
                 requested,
                 done,
-            },
-            |action| match action {
-                Action::ReplicationPositions {
-                    ticket, requested, ..
-                } => (ticket, requested),
-                _ => unreachable!("submission preserves command kind"),
-            },
-        )
-        .map_err(|rejected| rejected.reason)
+            })
+        })
     }
 
     /// Read stable normal history for one lagging replica without replacing the
@@ -133,16 +163,15 @@ impl ReplicaJournal {
     ) -> Result<JournalCompletion<FetchedHistory>, Rejected<AppendBuffer>> {
         self.submit(
             buffer,
-            |buffer, done| Action::FetchReplication {
-                ticket,
-                predecessor,
-                limits,
-                buffer,
-                done,
-            },
-            |action| match action {
-                Action::FetchReplication { buffer, .. } => buffer,
-                _ => unreachable!("submission preserves command kind"),
+            |_| Gate::Free,
+            |buffer, done| {
+                Action::History(HistoryAction::FetchReplication {
+                    ticket,
+                    predecessor,
+                    limits,
+                    buffer,
+                    done,
+                })
             },
         )
     }
@@ -154,15 +183,9 @@ impl ReplicaJournal {
         &mut self,
         source: LogSource,
     ) -> Result<JournalCompletion<LogSource>, SubmitError> {
-        self.submit(
-            source,
-            |source, done| Action::CaptureHistory { source, done },
-            |action| match action {
-                Action::CaptureHistory { source, .. } => source,
-                _ => unreachable!("submission preserves command kind"),
-            },
-        )
-        .map_err(|rejected| rejected.reason)
+        self.command(Gate::Settled, |done| {
+            Action::History(HistoryAction::Capture { source, done })
+        })
     }
 
     /// Retire the exact source after all consumers no longer require its files.
@@ -171,15 +194,9 @@ impl ReplicaJournal {
         &mut self,
         source: LogSource,
     ) -> Result<JournalCompletion<LogSource>, SubmitError> {
-        self.submit(
-            source,
-            |source, done| Action::ReleaseHistory { source, done },
-            |action| match action {
-                Action::ReleaseHistory { source, .. } => source,
-                _ => unreachable!("submission preserves command kind"),
-            },
-        )
-        .map_err(|rejected| rejected.reason)
+        self.command(Gate::Free, |done| {
+            Action::History(HistoryAction::Release { source, done })
+        })
     }
 
     /// Populate a bounded actor-owned digest cache asynchronously for core selection.
@@ -189,15 +206,9 @@ impl ReplicaJournal {
         source: LogSource,
         op: OpNumber,
     ) -> Result<JournalCompletion<HistoryPosition>, SubmitError> {
-        self.submit(
-            (source, op),
-            |(source, op), done| Action::HistoryPosition { source, op, done },
-            |action| match action {
-                Action::HistoryPosition { source, op, .. } => (source, op),
-                _ => unreachable!("submission preserves command kind"),
-            },
-        )
-        .map_err(|rejected| rejected.reason)
+        self.command(Gate::Free, |done| {
+            Action::History(HistoryAction::Position { source, op, done })
+        })
     }
 
     /// Fetch into an empty leased arena. Scope/source/predecessor and request bounds
@@ -214,14 +225,13 @@ impl ReplicaJournal {
     ) -> Result<JournalCompletion<FetchedHistory>, Rejected<AppendBuffer>> {
         self.submit(
             buffer,
-            |buffer, done| Action::FetchHistory {
-                request,
-                buffer,
-                done,
-            },
-            |action| match action {
-                Action::FetchHistory { buffer, .. } => buffer,
-                _ => unreachable!("submission preserves command kind"),
+            |_| Gate::Free,
+            |buffer, done| {
+                Action::History(HistoryAction::Fetch {
+                    request,
+                    buffer,
+                    done,
+                })
             },
         )
     }

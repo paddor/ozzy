@@ -5,8 +5,8 @@
 //! runtime obligations; this codec establishes the structure only.
 
 use super::{
-    AppendDisposition, AppendKey, Authority, CodecError, Cursor, ENVELOPE_BYTES, Envelope, Opcode,
-    Packet, PartitionIncarnation, Policy, capacity, command, decode_common, encode_common,
+    AppendDisposition, AppendKey, Authority, CodecError, ENVELOPE_BYTES, Envelope, Opcode, Packet,
+    PartitionIncarnation, Policy, Reader, capacity, command, decode_common, encode_common,
     identities,
 };
 use crate::EnvelopeLimits;
@@ -95,7 +95,7 @@ pub fn decode_confirmed(
     if !packet.payload.is_empty() || packet.metadata.len() != 107 {
         return Err(CodecError::Length);
     }
-    let mut cursor = Cursor(packet.metadata);
+    let mut cursor = Reader::new(packet.metadata);
     let (authority, partition, owner_epoch, key) = decode_common(&mut cursor)?;
     let confirmed = Confirmed {
         authority,
@@ -104,8 +104,8 @@ pub fn decode_confirmed(
         key,
         end_sequence: cursor.u64()?,
         first_offset: cursor.u64()?,
-        disposition: AppendDisposition::try_from(cursor.byte()?)?,
-        policy: Policy::try_from(cursor.byte()?)?,
+        disposition: AppendDisposition::try_from(cursor.u8()?)?,
+        policy: Policy::try_from(cursor.u8()?)?,
     };
     range(confirmed)?;
     Ok(confirmed)

@@ -1,82 +1,29 @@
 //! Shared link negotiation, routing, and bounded transport progress.
 
-use std::{
-    collections::BTreeMap,
-    ops::Bound::{Excluded, Unbounded},
-    sync::Arc,
-};
+use crate::transport::Frames;
+use std::{collections::BTreeMap, sync::Arc};
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use omq_tokio::{Message, TrySendError};
-use ozzy_proto::{
-    Envelope, NodeId, Opcode, data::DataLimits, decode_packet, directory, handshake, nack,
-};
+use ozzy_proto::{NodeId, Opcode, data::DataLimits, decode_packet, handshake, nack};
 
 use super::{
-    Binding, CatalogError, Dispatcher, Kind, LinkIds, LinkSessions, ReplyError, RouteState, Routed,
-    SetupError, TopicCatalog, WatchRegistry,
+    Binding, CatalogError, Dispatcher, Kind, LinkIds, LinkSessions, ReplyError, Routed, SetupError,
+    TopicCatalog, WatchRegistry,
 };
 use crate::dispatch::Class;
 use crate::replica_transport::SendAttempt;
 use crate::signal::StateSignal;
 
 mod admission;
+mod directory;
+mod links;
+use links::LinkState;
+pub use links::{Access, Link, Links};
 mod progress;
 
 const BROKER_ROLE: u32 = 1 << 3;
-
-/// Transport identity authorized by an adapter or explicit trust policy.
-/// HELLO role claims never grant broker membership.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Access {
-    /// Identity from the authenticated adapter or explicit trust configuration.
-    pub peer: NodeId,
-    /// Authorized protocol role, independent of the peer's claimed role.
-    pub kind: Kind,
-}
-
-/// Established link observation, with negotiated directional codec limits.
-/// This grants no partition authority.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Link {
-    /// Current peer, role, and session fence.
-    pub binding: Binding,
-    /// Common outbound codec bounds.
-    pub send: DataLimits,
-    /// Selected capabilities and remote codec limits.
-    pub remote: handshake::Parameters,
-}
-
-/// Read-only coalesced link state for application shards. Replacement first
-/// fences dispatcher replies, then publishes this observation. A shard
-/// checks the current session before delivering already queued work to actors.
-#[derive(Clone, Debug)]
-pub struct Links(Arc<LinkState>);
-
-#[derive(Debug)]
-struct LinkState {
-    current: ArcSwap<BTreeMap<NodeId, Option<Link>>>,
-    changed: StateSignal,
-}
-
-impl Links {
-    /// Latest established session, absent before negotiation or after closure.
-    pub fn get(&self, peer: NodeId) -> Option<Link> {
-        self.0.current.load().get(&peer).copied().flatten()
-    }
-
-    /// Capture before inspecting links, then wait for a subsequent change.
-    pub fn generation(&self) -> u64 {
-        self.0.changed.generation()
-    }
-
-    /// No event backlog: reconnecting shards inspect the newest session. Taking
-    /// a generation before inspection prevents a lost snapshot/update race.
-    pub async fn changed_after(&self, generation: u64) {
-        self.0.changed.changed_after(generation).await;
-    }
-}
 
 #[derive(Debug)]
 struct Peer {
@@ -85,6 +32,27 @@ struct Peer {
     initiating: bool,
     handshake: Option<Message>,
     awaiting_welcome: bool,
+    link: Option<Link>,
+}
+
+impl Peer {
+    const fn new(access: Access, trusted: bool) -> Self {
+        Self {
+            access,
+            trusted,
+            initiating: false,
+            handshake: None,
+            awaiting_welcome: false,
+            link: None,
+        }
+    }
+
+    /// Returns whether the established link changed.
+    fn replace_link(&mut self, link: Option<Link>) -> bool {
+        let changed = self.link != link;
+        self.link = link;
+        changed
+    }
 }
 
 /// Dispatcher-thread service shared by broker transports and deterministic
@@ -96,7 +64,6 @@ pub struct Service {
     sessions: LinkSessions,
     parameters: handshake::Parameters,
     peers: BTreeMap<NodeId, Peer>,
-    link_current: BTreeMap<NodeId, Option<Link>>,
     links: Links,
     pub(super) watches: Option<WatchRegistry>,
     catalog: Option<TopicCatalog>,
@@ -145,16 +112,7 @@ impl Service {
             if access.peer == dispatcher.local
                 || access.peer.as_bytes() == &[0; 16]
                 || peers
-                    .insert(
-                        access.peer,
-                        Peer {
-                            access,
-                            trusted: false,
-                            initiating: false,
-                            handshake: None,
-                            awaiting_welcome: false,
-                        },
-                    )
+                    .insert(access.peer, Peer::new(access, false))
                     .is_some()
             {
                 return Err(ServiceError::Access);
@@ -165,17 +123,16 @@ impl Service {
             .filter(|access| access.kind == Kind::Broker && broker_receive != parameters.receive)
             .map(|access| (access.peer, broker_receive))
             .collect::<Vec<_>>();
-        let sessions = LinkSessions::with_receive_profiles(
+        let sessions = LinkSessions::with_ids(
             dispatcher.local,
             parameters,
             0,
             dispatcher.limits.peers,
             ids,
-            &profiles,
-        )?;
-        let link_current: BTreeMap<_, _> = peers.keys().map(|&peer| (peer, None)).collect();
+        )?
+        .with_receive_profiles(&profiles)?;
         let links = Links(Arc::new(LinkState {
-            current: ArcSwap::from_pointee(link_current.clone()),
+            current: ArcSwap::from_pointee(peers.keys().map(|&peer| (peer, None)).collect()),
             changed: StateSignal::default(),
         }));
         Ok(Self {
@@ -183,7 +140,6 @@ impl Service {
             sessions,
             parameters,
             peers,
-            link_current,
             links,
             watches: None,
             catalog: None,
@@ -206,15 +162,19 @@ impl Service {
 
     /// Only the dispatcher writes link state. Shards read immutable snapshots.
     fn set_link(&mut self, peer: NodeId, link: Option<Link>) {
-        let current = self.link_current.get_mut(&peer).expect("authorized peer");
-        if *current != link {
-            *current = link;
-            self.links
-                .0
-                .current
-                .store(Arc::new(self.link_current.clone()));
-            self.links.0.changed.notify_changed();
+        if self
+            .peers
+            .get_mut(&peer)
+            .is_some_and(|state| state.replace_link(link))
+        {
+            self.publish_links();
         }
+    }
+
+    fn publish_links(&self) {
+        let current = self.peers.iter().map(|(&id, state)| (id, state.link));
+        self.links.0.current.store(Arc::new(current.collect()));
+        self.links.0.changed.notify_changed();
     }
 
     /// Local identity of the single bound broker socket.
@@ -232,11 +192,11 @@ impl Service {
     /// sets use multiple bounded registrations. No partition actor moves here.
     pub fn install_watches(&mut self, watches: WatchRegistry) -> Result<(), ServiceError> {
         let limits = watches.limits();
-        let maximum = directory::Limits::default()
+        let maximum = ozzy_proto::directory::Limits::default()
             .maximum_snapshot_bytes(limits.interests_per_registration)
             .and_then(|size| size.checked_add(80));
         if self.watches.is_some()
-            || self.link_current.values().any(Option::is_some)
+            || self.peers.values().any(|peer| peer.link.is_some())
             || limits.peers
                 < self
                     .peers
@@ -257,7 +217,7 @@ impl Service {
     /// One partition plus explicit broker endpoints must fit a control reply.
     pub fn install_catalog(&mut self, catalog: TopicCatalog) -> Result<(), ServiceError> {
         if self.catalog.is_some()
-            || self.link_current.values().any(Option::is_some)
+            || self.peers.values().any(|peer| peer.link.is_some())
             || catalog
                 .largest_single_bytes()
                 .checked_add(80)
@@ -273,19 +233,18 @@ impl Service {
     /// session fences its replies and shard observation immediately.
     /// No connection to another broker is required to finish this negotiation.
     pub fn start(&mut self, peer: NodeId) -> Result<(), ServiceError> {
-        if !self.peers.contains_key(&peer) {
-            return Err(ServiceError::Access);
-        }
-        if let (Some(watches), Some(link)) = (&mut self.watches, self.links.get(peer)) {
+        let state = self.peers.get_mut(&peer).ok_or(ServiceError::Access)?;
+        if let (Some(watches), Some(link)) = (&mut self.watches, state.link) {
             watches.disconnect(peer, link.binding.session);
         }
         let frames = self.sessions.start(peer)?;
         self.dispatcher.disconnect(peer);
-        self.set_link(peer, None);
-        let state = self.peers.get_mut(&peer).expect("authorized peer");
         state.initiating = true;
         state.awaiting_welcome = false;
         state.handshake = Some(routed(peer, frames));
+        if state.replace_link(None) {
+            self.publish_links();
+        }
         Ok(())
     }
 
@@ -303,19 +262,23 @@ impl Service {
     /// invalidate a replacement session. Reconnect requires an explicit start
     /// or a fresh remote HELLO; old queued frames remain charged until released.
     pub fn disconnect(&mut self, binding: Binding) -> bool {
-        if self.links.get(binding.peer).map(|link| link.binding) != Some(binding) {
+        let Some(state) = self
+            .peers
+            .get_mut(&binding.peer)
+            .filter(|state| state.link.map(|link| link.binding) == Some(binding))
+        else {
             return false;
-        }
+        };
         self.dispatcher.disconnect(binding.peer);
         if let Some(watches) = &mut self.watches {
             watches.disconnect(binding.peer, binding.session);
         }
         self.sessions.disconnect(binding.peer);
-        let state = self.peers.get_mut(&binding.peer).expect("authorized peer");
         state.handshake = None;
         state.initiating = false;
         state.awaiting_welcome = false;
-        self.set_link(binding.peer, None);
+        state.link = None;
+        self.publish_links();
         true
     }
 
@@ -332,16 +295,16 @@ impl Service {
         message: &Message,
         retained_bytes: usize,
     ) -> Result<Option<Routed>, ReceiveError> {
-        if message.len() != 4
-            || self
-                .links
-                .get(publisher)
-                .is_none_or(|link| link.binding.kind != Kind::Broker)
+        let Some((route, frames)) = message.routed_packet() else {
+            return Err(ReceiveError::Peer);
+        };
+        if self
+            .links
+            .get(publisher)
+            .is_none_or(|link| link.binding.kind != Kind::Broker)
         {
             return Err(ReceiveError::Peer);
         }
-        let frames =
-            std::array::from_fn::<_, 3, _>(|i| message.part_slice(i + 1).expect("four frames"));
         let packet = decode_packet(&frames, self.dispatcher.routes.limits)?;
         let scope = ozzy_replication::wire::route(packet, self.dispatcher.routes.limits).map_err(
             |error| {
@@ -351,14 +314,14 @@ impl Service {
             },
         )?;
         if packet.envelope.opcode != Opcode::PreparePub
-            || message.part_slice(0) != Some(scope.group_id.as_bytes().as_slice())
+            || route != scope.group_id.as_bytes()
             || packet.envelope.sender != publisher
         {
             return Err(ReceiveError::Peer);
         }
+        let (_, packet_frames) = message.routed_packet_bytes().ok_or(ReceiveError::Peer)?;
         let normalized = Message::multipart(
-            std::iter::once(Bytes::copy_from_slice(publisher.as_bytes()))
-                .chain((1..4).map(|i| message.part_bytes(i).expect("four frames"))),
+            std::iter::once(Bytes::copy_from_slice(publisher.as_bytes())).chain(packet_frames),
         );
         self.dispatcher
             .dispatch_data(publisher, normalized, retained_bytes)
@@ -398,21 +361,14 @@ impl Service {
         if message.len() == 2 {
             return self.receive_compact(&message, retained_bytes);
         }
-        if message.len() != 4 {
+        let Some((route, frames)) = message.routed_packet() else {
             return Err(ReceiveError::Peer);
-        }
-        let peer = NodeId::from_bytes(
-            message
-                .part_slice(0)
-                .and_then(|p| p.try_into().ok())
-                .ok_or(ReceiveError::Peer)?,
-        );
+        };
+        let peer = NodeId::from_bytes(route.try_into().map_err(|_| ReceiveError::Peer)?);
         let access = self.peers.get(&peer).map(|state| state.access);
         if access.is_none() && self.trusted_maximum == 0 {
             return Err(ReceiveError::Peer);
         }
-        let frames =
-            std::array::from_fn::<_, 3, _>(|i| message.part_slice(i + 1).expect("four frames"));
         let envelope = self.sessions.receive_limits(peer).envelope;
         let packet = decode_packet(&frames, envelope)?;
         if packet.envelope.opcode == Opcode::PreparePub {
@@ -428,10 +384,7 @@ impl Service {
         } else if packet.envelope.opcode == Opcode::StateSnapshotRequest {
             match packet.metadata.first() {
                 Some(0) => self.receive_topic(peer, packet)?,
-                Some(1) if self.watches.is_some() => self.receive_watch(peer, packet)?,
-                Some(1) => {
-                    self.reject_directory(peer, packet.envelope, 2, nack::RetryClass::Permanent)?;
-                }
+                Some(1) => self.receive_watch(peer, packet)?,
                 _ => {
                     return Err(ReceiveError::Directory(
                         ozzy_proto::data::CodecError::Profile,
@@ -447,288 +400,6 @@ impl Service {
                 .dispatch_data(peer, message, retained_bytes)
                 .map(Some)
                 .map_err(|rejected| ReceiveError::Dispatch(rejected.reason))
-        }
-    }
-
-    fn receive_topic(
-        &mut self,
-        peer: NodeId,
-        packet: ozzy_proto::Packet<'_>,
-    ) -> Result<(), ReceiveError> {
-        let link = self.links.get(peer).ok_or(CatalogError::Unknown)?;
-        if link.binding.kind != Kind::Client
-            || packet.envelope.sender != peer
-            || packet.envelope.session != Some(link.binding.session)
-        {
-            return Err(ReceiveError::Role);
-        }
-        let Ok(request) = directory::decode_topic_request(
-            packet,
-            self.parameters.receive.envelope,
-            directory::Limits::default(),
-        ) else {
-            return self.reject_directory(peer, packet.envelope, 1, nack::RetryClass::Permanent);
-        };
-        let max_metadata = link.send.envelope.max_metadata_bytes.min(
-            self.dispatcher
-                .limits
-                .replies
-                .control
-                .message_bytes
-                .saturating_sub(80),
-        );
-        let Some(catalog) = self.catalog.as_ref() else {
-            return self.reject_directory(peer, packet.envelope, 2, nack::RetryClass::Permanent);
-        };
-        let page = match catalog.page(&request, max_metadata) {
-            Ok(page) => page,
-            Err(error) => {
-                return self.reject_directory(
-                    peer,
-                    packet.envelope,
-                    if error == CatalogError::Unknown {
-                        18
-                    } else {
-                        1
-                    },
-                    nack::RetryClass::Permanent,
-                );
-            }
-        };
-        let mut metadata = Vec::with_capacity(page.metadata_bytes()?);
-        let header = directory::encode_topic_page(
-            Envelope {
-                opcode: Opcode::StateSnapshot,
-                response: true,
-                request_id: packet.envelope.request_id,
-                sender: self.local(),
-                session: Some(link.binding.session),
-            },
-            &page,
-            &mut metadata,
-            link.send.envelope,
-            directory::Limits::default(),
-        )?;
-        let reply = Message::multipart([
-            Bytes::copy_from_slice(peer.as_bytes()),
-            Bytes::copy_from_slice(&header),
-            Bytes::from(metadata.into_boxed_slice()),
-            Bytes::new(),
-        ]);
-        match self.try_reply(Class::Control, reply) {
-            Ok(()) | Err((ReplyError::Full, _)) => Ok(()),
-            Err((error, _)) => Err(ReceiveError::DirectoryReply(error)),
-        }
-    }
-
-    fn reject_directory(
-        &mut self,
-        peer: NodeId,
-        request: Envelope,
-        code: u16,
-        retry: nack::RetryClass,
-    ) -> Result<(), ReceiveError> {
-        let link = self.links.get(peer).ok_or(ReceiveError::Role)?;
-        if link.binding.kind != Kind::Client
-            || request.sender != peer
-            || request.session != Some(link.binding.session)
-            || request.request_id.is_none()
-        {
-            return Err(ReceiveError::Role);
-        }
-        let mut metadata = Vec::with_capacity(11);
-        let header = nack::encode(
-            Envelope {
-                opcode: Opcode::Nack,
-                response: true,
-                sender: self.local(),
-                ..request
-            },
-            nack::Nack {
-                code,
-                retry,
-                detail: &[],
-                diagnostic: "",
-            },
-            &mut metadata,
-            link.send.envelope,
-        )?;
-        let reply = crate::native_frames::message(peer.as_bytes(), header, &metadata, Bytes::new());
-        match self.try_reply(Class::Control, reply) {
-            Ok(()) | Err((ReplyError::Full, _)) => Ok(()),
-            Err((error, _)) => Err(ReceiveError::DirectoryReply(error)),
-        }
-    }
-
-    fn receive_watch(
-        &mut self,
-        peer: NodeId,
-        packet: ozzy_proto::Packet<'_>,
-    ) -> Result<(), ReceiveError> {
-        let link = self.links.get(peer).ok_or(super::WatchError::Session)?;
-        if link.binding.kind != Kind::Client
-            || packet.envelope.sender != peer
-            || packet.envelope.session != Some(link.binding.session)
-        {
-            return Err(ReceiveError::Role);
-        }
-        let Ok(request) = directory::decode_request(
-            packet,
-            self.parameters.receive.envelope,
-            directory::Limits::default(),
-        ) else {
-            return self.reject_directory(peer, packet.envelope, 1, nack::RetryClass::Permanent);
-        };
-        let routes = match self
-            .watches
-            .as_mut()
-            .expect("installed watch registry")
-            .register_bounded(
-                peer,
-                link.binding.session,
-                request.watch,
-                &request.groups,
-                link.send.envelope.max_metadata_bytes,
-            ) {
-            Ok(routes) => routes,
-            Err(super::WatchError::Full) => {
-                return self.reject_directory(
-                    peer,
-                    packet.envelope,
-                    10,
-                    nack::RetryClass::AfterBackoff,
-                );
-            }
-            Err(super::WatchError::Unknown) => {
-                return self.reject_directory(
-                    peer,
-                    packet.envelope,
-                    18,
-                    nack::RetryClass::Permanent,
-                );
-            }
-            Err(super::WatchError::Session) => return Err(ReceiveError::Role),
-            Err(
-                super::WatchError::Invalid | super::WatchError::Conflict | super::WatchError::Stale,
-            ) => {
-                return self.reject_directory(
-                    peer,
-                    packet.envelope,
-                    1,
-                    nack::RetryClass::Permanent,
-                );
-            }
-        };
-        let snapshot = directory::Snapshot {
-            watch: request.watch,
-            routes,
-        };
-        let mut metadata = Vec::with_capacity(snapshot.metadata_bytes()?);
-        let header = directory::encode_snapshot(
-            Envelope {
-                opcode: Opcode::StateSnapshot,
-                response: true,
-                request_id: packet.envelope.request_id,
-                sender: self.local(),
-                session: Some(link.binding.session),
-            },
-            &snapshot,
-            &mut metadata,
-            link.send.envelope,
-            directory::Limits::default(),
-        )?;
-        let reply = Message::multipart([
-            Bytes::copy_from_slice(peer.as_bytes()),
-            Bytes::copy_from_slice(&header),
-            Bytes::from(metadata.into_boxed_slice()),
-            Bytes::new(),
-        ]);
-        match self.try_reply(Class::Control, reply) {
-            Ok(()) | Err((ReplyError::Full, _)) => Ok(()),
-            Err((error, _)) => Err(ReceiveError::DirectoryReply(error)),
-        }
-    }
-
-    /// Install one trusted partition actor's newer observation. This changes
-    /// only routing hints, never election or confirmation authority. A bounded
-    /// shard port command supplies the cross-thread path in broker assembly.
-    pub fn publish_route(&mut self, update: &RouteState) -> Result<bool, ServiceError> {
-        self.watches
-            .as_mut()
-            .ok_or(ServiceError::Watch)?
-            .publish(update)
-            .map_err(|_| ServiceError::Watch)
-    }
-
-    /// Queue at most one pending watch hint. Full peer queues preserve it for a
-    /// later attempt. A queued hint may still be lost on disconnect, so clients
-    /// also refresh after timeout or a wrong-leader response.
-    pub fn poll_watch(&mut self) -> Result<bool, ServiceError> {
-        let Some(notice) = self.watches.as_mut().and_then(WatchRegistry::next_notice) else {
-            return Ok(false);
-        };
-        let link = self.links.get(notice.peer).ok_or(ServiceError::Watch)?;
-        if link.binding.session != notice.session {
-            return Err(ServiceError::Watch);
-        }
-        let (header, metadata) = if let Some(route) = &notice.update {
-            let update = directory::Update {
-                watch: notice.watch,
-                route: route.clone(),
-            };
-            let mut metadata =
-                Vec::with_capacity(update.metadata_bytes().map_err(|_| ServiceError::Watch)?);
-            let header = directory::encode_update(
-                Envelope {
-                    opcode: Opcode::StateUpdate,
-                    response: false,
-                    request_id: None,
-                    sender: self.local(),
-                    session: Some(notice.session),
-                },
-                &update,
-                &mut metadata,
-                link.send.envelope,
-                directory::Limits::default(),
-            )
-            .map_err(|_| ServiceError::Watch)?;
-            (header, metadata)
-        } else {
-            let mut metadata = Vec::with_capacity(17);
-            let header = directory::encode_resync(
-                Envelope {
-                    opcode: Opcode::StateResync,
-                    response: false,
-                    request_id: None,
-                    sender: self.local(),
-                    session: Some(notice.session),
-                },
-                directory::Resync {
-                    watch: notice.watch,
-                },
-                &mut metadata,
-                link.send.envelope,
-            )
-            .map_err(|_| ServiceError::Watch)?;
-            (header, metadata)
-        };
-        let message = Message::multipart([
-            Bytes::copy_from_slice(notice.peer.as_bytes()),
-            Bytes::copy_from_slice(&header),
-            Bytes::from(metadata.into_boxed_slice()),
-            Bytes::new(),
-        ]);
-        match self.try_reply(Class::Control, message) {
-            Ok(()) => {
-                self.watches
-                    .as_mut()
-                    .expect("watch registry")
-                    .queued(&notice)
-                    .map_err(|_| ServiceError::Watch)?;
-                Ok(true)
-            }
-            Err((ReplyError::Full, _)) => Ok(false),
-            Err(_) => Err(ServiceError::Watch),
         }
     }
 
@@ -748,19 +419,10 @@ impl Service {
         if message.len() == 2 {
             return Ok(());
         }
-        if message.len() != 4 {
-            return Err(ReplyError::Frames);
-        }
-        let peer = NodeId::from_bytes(
-            message
-                .part_slice(0)
-                .and_then(|p| p.try_into().ok())
-                .ok_or(ReplyError::Peer)?,
-        );
+        let (route, [_, metadata, payload]) = message.routed_packet().ok_or(ReplyError::Frames)?;
+        let peer = NodeId::from_bytes(route.try_into().map_err(|_| ReplyError::Peer)?);
         let limits = self.links.get(peer).ok_or(ReplyError::Peer)?.send.envelope;
-        if message.part_slice(2).expect("four frames").len() > limits.max_metadata_bytes
-            || message.part_slice(3).expect("four frames").len() > limits.max_payload_bytes
-        {
+        if metadata.len() > limits.max_metadata_bytes || payload.len() > limits.max_payload_bytes {
             return Err(ReplyError::Size);
         }
         Ok(())
@@ -784,14 +446,10 @@ impl Service {
             } else {
                 let peers = &self.peers;
                 let progress = self.dispatcher.flush_replies(|message| {
-                    let peer = NodeId::from_bytes(
-                        message
-                            .part_slice(0)
-                            .expect("validated reply")
-                            .try_into()
-                            .expect("peer identity"),
-                    );
-                    if peers[&peer].awaiting_welcome {
+                    let awaiting = route_peer(&message)
+                        .and_then(|peer| peers.get(&peer))
+                        .is_some_and(|state| state.awaiting_welcome);
+                    if awaiting {
                         Err(TrySendError::Full(message))
                     } else {
                         send(message)
@@ -815,15 +473,9 @@ impl Service {
         &mut self,
         send: &mut impl FnMut(Message) -> Result<(), TrySendError>,
     ) -> Result<bool, omq_tokio::Error> {
-        let next = self
-            .handshake_turn
-            .and_then(|last| self.peers.range((Excluded(last), Unbounded)).next())
-            .or_else(|| self.peers.first_key_value())
-            .map(|(&id, _)| id);
         let mut advanced = false;
-        if let Some(next) = next {
+        if let Some((next, state)) = crate::turn::after_mut(&mut self.peers, self.handshake_turn) {
             self.handshake_turn = Some(next);
-            let state = self.peers.get_mut(&next).expect("selected peer");
             if let Some(message) = state.handshake.take() {
                 match send(message) {
                     Ok(()) => {
@@ -852,6 +504,11 @@ impl Drop for Service {
             self.set_link(peer, None);
         }
     }
+}
+
+/// Destination identity in a routed message's first frame.
+pub(super) fn route_peer(message: &Message) -> Option<NodeId> {
+    Some(NodeId::from_bytes(message.part_slice(0)?.try_into().ok()?))
 }
 
 fn routed(peer: NodeId, frames: Vec<Bytes>) -> Message {

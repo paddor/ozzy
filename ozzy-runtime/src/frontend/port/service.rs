@@ -1,24 +1,19 @@
 //! Dispatcher side of bounded shard command lanes.
 
-use super::{
-    Port, ProgressError, ServiceError,
-    retention::{Capacity, Return},
-    wire,
-};
+use super::{Port, ProgressError, retention::Capacity, wire};
 use crate::{
     dispatch::{self, Budget, Budgets, Class},
     frontend::{
         ReplyError, Service, SetupError,
         inproc::{self, Inbox},
     },
+    signal::CloseSignal,
 };
 use omq_tokio::{Message, Options, TrySendError};
 use ozzy_proto::NodeId;
 use std::{
     future::Future,
-    ops::Bound::{Excluded, Unbounded},
     pin::Pin,
-    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
@@ -41,14 +36,14 @@ impl std::fmt::Debug for Parked {
 pub(in crate::frontend) struct Mailbox {
     lanes: [Inbox; 2],
     parked: [Option<Parked>; 2],
-    returns: Arc<Return>,
+    closed: CloseSignal,
     incarnation: ozzy_proto::RequestId,
     next_lane: usize,
     _context: omq_tokio::Context,
 }
 impl Drop for Mailbox {
     fn drop(&mut self) {
-        self.returns.closed.close();
+        self.closed.close();
     }
 }
 
@@ -71,7 +66,7 @@ impl Mailbox {
     }
 
     fn receive(&mut self) -> Result<Option<(usize, wire::Incoming)>, dispatch::Error> {
-        if self.returns.closed.is_closed() {
+        if self.closed.is_closed() {
             return Ok(None);
         }
         for _ in 0..2 {
@@ -102,7 +97,7 @@ impl Mailbox {
     }
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), omq_tokio::Error>> {
-        if self.returns.closed.is_closed() {
+        if self.closed.is_closed() {
             return Poll::Pending;
         }
         for index in [1, 0] {
@@ -187,7 +182,7 @@ impl Service {
             Mailbox {
                 lanes: [Inbox::new(data_in), Inbox::new(control_in)],
                 parked: [None, None],
-                returns: capacity.returns.clone(),
+                closed: capacity.closed.clone(),
                 incarnation,
                 next_lane: 1,
                 _context: context.clone(),
@@ -206,28 +201,21 @@ impl Service {
     /// Process one command. Rotate shards and classes after every bounded turn;
     /// a parked data completion leaves control and other shards runnable.
     pub fn poll_command(&mut self) -> Result<bool, dispatch::Error> {
-        let next = self
-            .port_turn
-            .and_then(|last| self.ports.range((Excluded(last), Unbounded)).next())
-            .or_else(|| self.ports.first_key_value())
-            .map(|(&id, _)| id);
-        let Some(shard) = next else { return Ok(false) };
+        let Some((shard, port)) = crate::turn::after_mut(&mut self.ports, self.port_turn) else {
+            return Ok(false);
+        };
         self.port_turn = Some(shard);
-        let Some((index, incoming)) = self
-            .ports
-            .get_mut(&shard)
-            .expect("selected shard")
-            .receive()?
-        else {
+        let Some((index, incoming)) = port.receive()? else {
             return Ok(false);
         };
         crate::profiling::event(crate::profiling::Event::DispatcherCommand);
         let status = self.apply_command(shard, incoming.action);
         let completion =
             Message::with_prefix(incoming.identity, wire::completion(incoming.key, status));
+        // Ports are never removed, so a missing one means the shard closed.
         self.ports
             .get_mut(&shard)
-            .expect("selected shard")
+            .ok_or(dispatch::Error::Closed)?
             .send(index, completion)?;
         Ok(true)
     }
@@ -252,8 +240,7 @@ impl Service {
                     match self.publish_route(&route) {
                         Ok(false) => wire::RouteStatus::Unchanged,
                         Ok(true) => wire::RouteStatus::Changed,
-                        Err(ServiceError::Watch) => wire::RouteStatus::Watch,
-                        Err(_) => unreachable!("route publication only accesses watch state"),
+                        Err(_) => wire::RouteStatus::Watch,
                     }
                 } else {
                     wire::RouteStatus::Destination

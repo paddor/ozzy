@@ -140,7 +140,7 @@ impl ScheduledReplica {
                     .normal()
                     .map(|normal| normal.snapshot().committed)
         {
-            self.actor.ready_work.mark();
+            self.actor.more_work = true;
         }
         self.finish(result)
     }
@@ -233,7 +233,7 @@ impl ScheduledReplica {
             self.actor.outbox.discard(peer, class);
         }
         self.actor.ack_at = now;
-        self.actor.ready_work.mark();
+        self.actor.more_work = true;
     }
 
     /// Attempt bounded outbox progress. A full destination must return the exact
@@ -284,7 +284,7 @@ impl ScheduledReplica {
 
     /// Coalesced observation only, never a substitute for partition authority.
     pub fn status(&self) -> ActorStatus {
-        *self.actor.status.borrow()
+        self.actor.status()
     }
 
     /// Current per-partition route, including proposed leader changes. This is
@@ -408,5 +408,8 @@ impl ScheduledReplica {
     }
     pub(super) fn into_actor(self) -> ReplicaActor {
         *self.actor
+    }
+    pub(super) fn next_deadline(&self, now: Duration) -> Option<Duration> {
+        self.actor.next_deadline(now)
     }
 }

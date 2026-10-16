@@ -1,12 +1,13 @@
 //! Durable attempt outcomes, separate from the newly stored record body.
 
+use crate::operation::codec::encode_atomic;
 use ozzy_proto::append::{
     AppendDisposition, AppendOutcome, OUTCOME_RUN_BYTES, OutcomeRun, OutcomeRuns,
 };
 use ozzy_proto::{Offset, ProducerSequence};
 
 use super::{
-    Decoder, Encoder, OperationCodecError, OperationLimits, OperationOutput, RetryFingerprint,
+    Encoder, OperationCodecError, OperationLimits, OperationOutput, Reader, RetryFingerprint,
     enforce_limit, validate_limits,
 };
 
@@ -158,21 +159,22 @@ impl<'a> AppendResults<'a> {
     ) -> impl Iterator<Item = (AppendOutcome, Option<RetryFingerprint>)> + Clone + 'a {
         let mut proofs = self.duplicate_fingerprints();
         self.runs()
-            .flat_map(|run| {
-                (0..run.records)
-                    .map(move |index| run.outcome(index).expect("validated outcome offset"))
-            })
+            .flat_map(OutcomeRun::outcomes)
             .map(move |outcome| {
-                let proof = (outcome.disposition == AppendDisposition::Duplicate).then(|| {
-                    proofs
-                        .next()
-                        .expect("validated duplicate fingerprint count")
-                });
+                let proof = if outcome.disposition == AppendDisposition::Duplicate {
+                    proofs.next()
+                } else {
+                    None
+                };
                 (outcome, proof)
             })
     }
 
     /// Iterate the shared compact mapping without allocating or copying payloads.
+    #[expect(
+        clippy::expect_used,
+        reason = "read_results validated every encoded run"
+    )]
     pub fn runs(self) -> impl Iterator<Item = OutcomeRun> + Clone + 'a {
         let (classified, encoded) = match self.runs {
             Runs::Classified(rows) => (Some(OutcomeRuns::new(rows)), None),
@@ -224,14 +226,10 @@ pub fn append_results(
     results: AppendResults<'_>,
     limits: OperationLimits,
 ) -> Result<(), OperationCodecError> {
-    validate_limits(limits)?;
-    let start = output.len();
-    let mut encoder = Encoder::new(output, start, limits.max_body_bytes);
-    let result = write_results(&mut encoder, results, limits);
-    if result.is_err() {
-        encoder.restore_start();
-    }
-    result
+    encode_atomic(output, limits, |encoder| {
+        write_results(encoder, results, limits)
+    })
+    .map(|_| ())
 }
 
 pub(super) fn write_results(
@@ -268,14 +266,14 @@ pub fn decode_append_results(
 ) -> Result<AppendResults<'_>, OperationCodecError> {
     validate_limits(limits)?;
     enforce_limit("append result bytes", input.len(), limits.max_body_bytes)?;
-    let mut decoder = Decoder::new(input);
+    let mut decoder = Reader::new(input);
     let results = read_results(&mut decoder, limits)?;
     decoder.finish()?;
     Ok(results)
 }
 
 pub(super) fn read_results<'a>(
-    decoder: &mut Decoder<'a>,
+    decoder: &mut Reader<'a>,
     limits: OperationLimits,
 ) -> Result<AppendResults<'a>, OperationCodecError> {
     let logical_time = decoder.u64()?;

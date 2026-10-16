@@ -48,8 +48,23 @@ pub trait IdentityIndex {
     /// Check whether this many additional unique claims fit.
     fn check_capacity(&self, additional: usize) -> Result<(), IdentityIndexError>;
 
-    /// Validate an atomic reservation without changing the index.
-    fn check_reserve(&self, claims: &[IdentityClaim]) -> Result<(), IdentityIndexError>;
+    /// Validate an atomic reservation without changing the index: claims must
+    /// be unique, none may exist yet, and all must fit.
+    fn check_reserve(&self, claims: &[IdentityClaim]) -> Result<(), IdentityIndexError> {
+        let keys = claims
+            .iter()
+            .map(|claim| claim.key())
+            .collect::<HashSet<_>>();
+        if keys.len() != claims.len() {
+            return Err(IdentityIndexError::Conflict);
+        }
+        for key in keys {
+            if self.lookup(key)?.is_some() {
+                return Err(IdentityIndexError::Conflict);
+            }
+        }
+        self.check_capacity(claims.len())
+    }
 
     /// Atomically reserve identity claims; an error inserts nothing.
     fn reserve(&mut self, claims: &[IdentityClaim]) -> Result<(), IdentityIndexError>;
@@ -137,21 +152,6 @@ impl IdentityIndex for MemoryIdentityIndex {
             return Err(IdentityIndexError::Capacity);
         }
         Ok(())
-    }
-
-    fn check_reserve(&self, claims: &[IdentityClaim]) -> Result<(), IdentityIndexError> {
-        let keys = claims
-            .iter()
-            .map(|claim| claim.key())
-            .collect::<HashSet<_>>();
-        if keys.len() != claims.len()
-            || keys
-                .iter()
-                .any(|key| self.claims.contains_key(&key.operation_id()))
-        {
-            return Err(IdentityIndexError::Conflict);
-        }
-        self.check_capacity(keys.len())
     }
 
     fn reserve(&mut self, claims: &[IdentityClaim]) -> Result<(), IdentityIndexError> {

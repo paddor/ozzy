@@ -10,14 +10,18 @@ mod host;
 use ozzy_sim::broker::Cluster as MemoryCluster;
 
 #[tokio::test(flavor = "current_thread")]
-async fn varied_inproc_churn_preserves_payloads_across_short_writes_and_recovery() {
-    for policy in [
-        Confirmation::LocalDurable,
-        Confirmation::DiskQuorum,
-        Confirmation::ReplicatedPersisting,
-    ] {
-        churn(policy, None, None).await;
-    }
+async fn single_durable_varied_churn_preserves_payloads_across_short_writes_and_recovery() {
+    churn(Confirmation::LocalDurable, None, None).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn disk_quorum_varied_churn_preserves_payloads_across_short_writes_and_recovery() {
+    churn(Confirmation::DiskQuorum, None, None).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn replicated_persisting_varied_churn_preserves_payloads_across_short_writes_and_recovery() {
+    churn(Confirmation::ReplicatedPersisting, None, None).await;
 }
 
 #[tokio::test(flavor = "current_thread")]

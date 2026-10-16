@@ -1,6 +1,6 @@
 use super::*;
 use ozzy_core::dedup::Match;
-use ozzy_journal_segment::AsyncRetirementBudget;
+use ozzy_journal_segment::RetirementBudget;
 use ozzy_proto::CheckpointId;
 
 fn append(
@@ -47,7 +47,7 @@ fn retire(controller: &mut Controller, journal: &mut OwnedJournal, driver: &Driv
         journal.retire_confirmed_history(
             driver.begin_validation().unwrap(),
             CheckpointId::from_bytes([id; 16]),
-            AsyncRetirementBudget {
+            RetirementBudget {
                 max_segments: 1,
                 max_read_bytes: 32768,
             },
@@ -281,7 +281,7 @@ async fn a_confirmation_lost_beside_a_checkpoint_resolves_to_its_original_offset
         journal.begin_retirement(
             ticket,
             CheckpointId::from_bytes([82; 16]),
-            AsyncRetirementBudget {
+            RetirementBudget {
                 max_segments: 1,
                 max_read_bytes: 32768,
             },

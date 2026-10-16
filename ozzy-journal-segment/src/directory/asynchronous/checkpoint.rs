@@ -18,7 +18,7 @@ use ozzy_proto::CheckpointId;
 pub struct CheckpointBuildPlan {
     prepared: crate::checkpoint::asynchronous::PreparedBuild,
     limits: crate::CheckpointLimits,
-    lease: crate::retention::CheckpointLease<ozzy_io::Handle>,
+    lease: crate::retention::CheckpointLease,
 }
 
 impl CheckpointBuildPlan {
@@ -54,7 +54,7 @@ impl CheckpointBuildPlan {
 #[must_use = "plan the encoded state or drop the source"]
 pub struct CheckpointSource {
     config: crate::checkpoint::asynchronous::BuildConfig,
-    lease: crate::retention::CheckpointLease<ozzy_io::Handle>,
+    lease: crate::retention::CheckpointLease,
 }
 
 impl CheckpointSource {
@@ -84,7 +84,7 @@ impl CheckpointSource {
 pub struct CheckpointWriter {
     builder: Box<crate::checkpoint::asynchronous::Builder>,
     limits: crate::CheckpointLimits,
-    lease: crate::retention::CheckpointLease<ozzy_io::Handle>,
+    lease: crate::retention::CheckpointLease,
 }
 
 impl CheckpointWriter {
@@ -133,7 +133,7 @@ impl CheckpointWriter {
 pub struct CheckpointFiles {
     pub(super) checkpoint: Checkpoint,
     limits: crate::CheckpointLimits,
-    _lease: crate::retention::CheckpointLease<ozzy_io::Handle>,
+    _lease: crate::retention::CheckpointLease,
 }
 
 impl CheckpointFiles {
@@ -313,10 +313,7 @@ impl Journal {
         let lease = self.pins.acquire_checkpoint_lease(
             id,
             spec.source_manifest_generation,
-            self.access
-                .protection
-                .clone()
-                .expect("journal retains group ownership"),
+            self.group_lock()?,
         )?;
         Ok(CheckpointSource { config, lease })
     }
@@ -339,10 +336,7 @@ impl Journal {
         let lease = self.pins.acquire_checkpoint_lease(
             checkpoint.manifest.checkpoint_id,
             checkpoint.manifest.source_manifest_generation,
-            self.access
-                .protection
-                .clone()
-                .expect("journal retains group ownership"),
+            self.group_lock()?,
         )?;
         Ok(CheckpointFiles {
             checkpoint,
@@ -372,12 +366,7 @@ impl Journal {
                 self.manifest.identity.group_id,
                 self.manifest.identity.store_id,
             ),
-            limits,
-            self.limits.io.chunk_bytes,
-            (
-                self.limits.directory_entries,
-                self.limits.directory_name_bytes,
-            ),
+            self.limits.checkpoint_bounds(limits),
         )
         .await?;
         if checkpoint.manifest.checkpoint_id != id {
@@ -404,6 +393,7 @@ impl Journal {
         &self,
         checkpoint: &Checkpoint,
     ) -> Result<CheckpointReference, DirectoryError> {
+        self.require_no_cleanup()?;
         let id = checkpoint.manifest.checkpoint_id;
         validate_checkpoint_successor(&self.manifest, &checkpoint.manifest)?;
         let bytes = self

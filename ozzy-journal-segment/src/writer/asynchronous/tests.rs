@@ -1,5 +1,4 @@
 use super::*;
-use crate::SegmentWriter;
 use crate::test_io::{drive, drive_with, poll};
 use crate::{Digest, OperationKind, OperationLimits};
 use ozzy_io::simulation::{self, Controller, Effect, Image, ImageLimits};
@@ -17,6 +16,13 @@ fn options() -> Options {
         chunk_bytes: 4096,
         direct: false,
         write_mode: SegmentWriteMode::Buffered,
+    }
+}
+fn file(path: PathBuf, io: Local) -> File {
+    File {
+        path,
+        io,
+        protection: None,
     }
 }
 fn start(generation: u128) -> Start {
@@ -81,7 +87,7 @@ fn setup(image: Image) -> (Controller, Local) {
 fn create(controller: &mut Controller, io: Local, path: &str) -> Writer {
     let writer = drive(
         controller,
-        Writer::create(path.into(), io.clone(), None, header(), start(1), options()),
+        Writer::create(file(path.into(), io.clone()), header(), start(1), options()),
     )
     .unwrap();
     // Publish the file's directory entry independently of its synchronized data.
@@ -126,40 +132,35 @@ fn requirements(protected: ChainPosition) -> CanonicalRecoveryRequirements {
 
 #[tokio::test]
 #[cfg(target_os = "linux")]
-async fn real_backends_exchange_segments_with_the_legacy_writer() {
-    for (aio, direct, mode) in [
+async fn real_backends_exchange_segments() {
+    let configurations = [
         (false, false, SegmentWriteMode::Buffered),
         (false, false, SegmentWriteMode::DataSync),
         (false, true, SegmentWriteMode::DataSync),
         (true, true, SegmentWriteMode::DataSync),
-    ] {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("segment");
-        let pool_config = ozzy_io_pool::Config {
+    ];
+    let real = |index: usize| {
+        let (aio, direct, write_mode) = configurations[index % configurations.len()];
+        let pool = ozzy_io_pool::Config {
             threads: 1,
             max_inflight: 1,
             handles: 16,
             limits: limits(),
         };
-        let (pool, aio_backend, mut clients) = if aio {
-            let (backend, clients) = ozzy_io_aio::Aio::new(ozzy_io_aio::Config {
-                pool: pool_config,
-                depth: 1,
-            })
-            .unwrap();
-            (None, Some(backend), clients)
-        } else {
-            let (backend, clients) = ozzy_io_pool::Pool::new(pool_config).unwrap();
-            (Some(backend), None, clients)
-        };
-        let io = Local::new(clients.remove(0));
+        let (backend, io) = crate::test_io::RealBackend::start(aio, pool);
         let selected = Options {
             direct,
-            write_mode: mode,
+            write_mode,
             ..options()
         };
+        (backend, io, selected)
+    };
+    for index in 0..configurations.len() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("segment");
+        let (backend, io, selected) = real(index);
         let mut writer =
-            Writer::create(path.clone(), io.clone(), None, header(), start(1), selected)
+            Writer::create(file(path.clone(), io.clone()), header(), start(1), selected)
                 .await
                 .unwrap();
         let first = writer
@@ -170,28 +171,30 @@ async fn real_backends_exchange_segments_with_the_legacy_writer() {
         assert_eq!(writer.sync_through(first).await.unwrap(), first);
         writer.zero_remainder().await.unwrap();
         writer.close().await.unwrap();
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        let mut legacy = SegmentWriter::recover(
-            file,
-            JournalGeneration(2),
-            1,
-            ChainPosition::GENESIS,
+        // The next configuration continues the same file in strict recovery.
+        let (other, other_io, exchanged) = real(index + 1);
+        let mut continued = Writer::recover(
+            file(path.clone(), other_io),
+            start(2),
+            exchanged,
             DecodeLimits::default(),
-            CAPACITY,
-        )
-        .unwrap();
-        assert_eq!(legacy.written_position().next_chain(), first.next_chain());
-        let second = legacy.append(&[operation(first.next_chain())]).unwrap();
-        legacy.sync_through(second).unwrap();
-        drop(legacy);
-        let mut reopened = Writer::recover(
-            path,
-            io,
             None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            continued.written_position().next_chain(),
+            first.next_chain()
+        );
+        let second = continued
+            .append(&[operation(first.next_chain())], BodyEncoding::Raw)
+            .await
+            .unwrap();
+        continued.sync_through(second).await.unwrap();
+        continued.close().await.unwrap();
+        other.shutdown().await;
+        let mut reopened = Writer::recover(
+            file(path, io),
             start(3),
             selected,
             DecodeLimits::default(),
@@ -208,12 +211,7 @@ async fn real_backends_exchange_segments_with_the_legacy_writer() {
             Err(WriterError::InvalidSyncPosition)
         ));
         reopened.close().await.unwrap();
-        if let Some(pool) = pool {
-            pool.shutdown().await;
-        }
-        if let Some(aio) = aio_backend {
-            aio.shutdown().await;
-        }
+        backend.shutdown().await;
     }
 }
 
@@ -319,9 +317,7 @@ fn power_loss_hole_is_discarded_only_beyond_every_protected_position() {
         let result = drive(
             &mut controller,
             Writer::recover(
-                "/segment".into(),
-                io,
-                None,
+                file("/segment".into(), io),
                 start(2),
                 options(),
                 DecodeLimits::default(),
@@ -365,9 +361,7 @@ fn interrupted_tail_repair_and_failed_barrier_never_report_recovery_success() {
         let result = drive_with(
             &mut controller,
             Writer::recover(
-                "/segment".into(),
-                io,
-                None,
+                file("/segment".into(), io),
                 start(2),
                 options(),
                 DecodeLimits::default(),
@@ -393,9 +387,7 @@ fn interrupted_tail_repair_and_failed_barrier_never_report_recovery_success() {
         let recovered = drive(
             &mut controller,
             Writer::recover(
-                "/segment".into(),
-                io,
-                None,
+                file("/segment".into(), io),
                 start(3),
                 options(),
                 DecodeLimits::default(),
@@ -491,9 +483,7 @@ fn completed_writes_reuse_encoding_memory_and_recovery_handles_short_reads() {
     let recovered = drive_with(
         &mut controller,
         Writer::recover(
-            "/segment".into(),
-            io,
-            None,
+            file("/segment".into(), io),
             start(2),
             options(),
             DecodeLimits::default(),
@@ -535,9 +525,7 @@ fn truncated_tail_is_repaired_only_after_canonical_protection_checks() {
         let result = drive(
             &mut controller,
             Writer::recover(
-                "/segment".into(),
-                io,
-                None,
+                file("/segment".into(), io),
                 start(2),
                 options(),
                 DecodeLimits::default(),
@@ -641,4 +629,87 @@ fn read_handles_reuse_exact_sources_and_eviction_keeps_running_leases() {
         "changed source must reopen"
     );
     assert_eq!(access.readers.borrow().len(), 4);
+}
+
+#[test]
+fn sync_position_from_another_segment_is_rejected_without_faulting() {
+    let (mut controller, io) = setup(Image::default());
+    let mut writer = create(&mut controller, io.clone(), "/1.log");
+    let other = SegmentHeader::new(header().group_id(), 2, None, Digest::ZERO, CAPACITY).unwrap();
+    let mut other = drive(
+        &mut controller,
+        Writer::create(file("/2.log".into(), io), other, start(1), options()),
+    )
+    .unwrap();
+    let foreign = append(&mut controller, &mut other);
+    append(&mut controller, &mut writer);
+    assert!(matches!(
+        drive(&mut controller, writer.sync_through(foreign)),
+        Err(WriterError::InvalidSyncPosition)
+    ));
+    assert!(!writer.is_faulted());
+    let written = writer.written_position();
+    drive(&mut controller, writer.sync_through(written)).unwrap();
+}
+
+/// Simulated writes run on the test thread, which owns its counters.
+#[test]
+fn encoded_bytes_exclude_preallocation_and_rejected_or_failed_appends() {
+    ozzy_telemetry::enable();
+    let encoded_group_bytes = || {
+        ozzy_telemetry::events()
+            .unwrap()
+            .into_iter()
+            .find(|(name, _)| *name == "encoded_group_bytes")
+            .unwrap()
+            .1
+    };
+    let encodings = [
+        BodyEncoding::Raw,
+        #[cfg(feature = "lz4")]
+        BodyEncoding::Lz4 {
+            min_savings_bytes: 8,
+        },
+    ];
+    let body = vec![42; 8 * 1024];
+    for encoding in encodings {
+        let (mut controller, io) = setup(Image::default());
+        let before = encoded_group_bytes();
+        let mut writer = create(&mut controller, io, "/1.log");
+        assert_eq!(encoded_group_bytes(), before);
+        let first = CanonicalOperation {
+            body: &body,
+            ..operation(ChainPosition::GENESIS)
+        };
+        let position = drive(
+            &mut controller,
+            writer.append(std::slice::from_ref(&first), encoding),
+        )
+        .unwrap();
+        let expected = position.end_offset() - crate::SEGMENT_HEADER_BYTES as u64;
+        assert_eq!(encoded_group_bytes() - before, expected);
+        // A stale chain is refused before any write.
+        assert!(drive(&mut controller, writer.append(&[first], encoding)).is_err());
+        assert_eq!(encoded_group_bytes() - before, expected);
+        let second = CanonicalOperation {
+            body: &body,
+            ..operation(position.next_chain())
+        };
+        let failed = drive_with(
+            &mut controller,
+            writer.append(&[second], encoding),
+            |operation| {
+                if matches!(operation, Operation::Write { .. }) {
+                    Effect::FailBefore(std::io::ErrorKind::Other)
+                } else {
+                    Effect::Normal
+                }
+            },
+        );
+        assert!(failed.is_err());
+        assert_eq!(encoded_group_bytes() - before, expected);
+        if !matches!(encoding, BodyEncoding::Raw) {
+            assert!(expected < body.len() as u64);
+        }
+    }
 }

@@ -1,6 +1,7 @@
 use std::rc::{Rc, Weak};
 
 use super::{Error, Index, Offset};
+use ozzy_proto::layout::Fixed;
 
 /// Fixed header bytes; the enclosing checkpoint supplies integrity and authority.
 pub const SNAPSHOT_HEADER_BYTES: usize = 64;
@@ -78,20 +79,20 @@ impl SnapshotHeader {
 
     /// Reject unknown versions, reserved fields, and inconsistent row coordinates.
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
-        if bytes.len() != SNAPSHOT_HEADER_BYTES
-            || &bytes[..8] != MAGIC
-            || bytes[8..10] != VERSION.to_be_bytes()
-            || bytes[10..16] != [0; 6]
+        let bytes: &[u8; SNAPSHOT_HEADER_BYTES] = bytes.try_into().map_err(|_| Error::Snapshot)?;
+        if bytes.array::<0, 8>() != *MAGIC
+            || bytes.array::<8, 2>() != VERSION.to_be_bytes()
+            || bytes.array::<10, 6>() != [0; 6]
         {
             return Err(Error::Snapshot);
         }
         Self {
-            operation: read_u64(&bytes[16..24]),
-            time: read_u64(&bytes[24..32]),
-            window: read_u64(&bytes[32..40]),
-            first: Offset::new(read_u64(&bytes[40..48])),
-            end: Offset::new(read_u64(&bytes[48..56])),
-            rows: read_u64(&bytes[56..64]),
+            operation: bytes.u64_at::<16>(),
+            time: bytes.u64_at::<24>(),
+            window: bytes.u64_at::<32>(),
+            first: Offset::new(bytes.u64_at::<40>()),
+            end: Offset::new(bytes.u64_at::<48>()),
+            rows: bytes.u64_at::<56>(),
         }
         .validated()
     }
@@ -110,10 +111,6 @@ impl SnapshotHeader {
         }
         Ok(self)
     }
-}
-
-pub(super) fn read_u64(bytes: &[u8]) -> u64 {
-    u64::from_be_bytes(bytes.try_into().expect("fixed snapshot integer"))
 }
 
 #[derive(Debug)]
@@ -224,16 +221,12 @@ impl Index {
             return Err(Error::Snapshot);
         }
         let bytes = count * SNAPSHOT_ROW_BYTES;
-        for (position, target) in output[..bytes]
-            .as_chunks_mut::<SNAPSHOT_ROW_BYTES>()
-            .0
-            .iter_mut()
-            .enumerate()
-        {
-            let row = self.expiry[snapshot.next + position];
-            target[..16].copy_from_slice(row.id.as_bytes());
-            target[16..24].copy_from_slice(&row.offset.get().to_be_bytes());
-            target[24..32].copy_from_slice(&row.time.to_be_bytes());
+        let targets = output.as_chunks_mut::<SNAPSHOT_ROW_BYTES>().0.iter_mut();
+        let rows = self.expiry.iter().skip(snapshot.next);
+        for (target, row) in targets.zip(rows).take(count) {
+            target.put::<0, 16>(*row.id.as_bytes());
+            target.put_u64::<16>(row.offset.get());
+            target.put_u64::<24>(row.time);
         }
         snapshot.next += count;
         Ok(bytes)

@@ -4,6 +4,8 @@
 //! Scope decoding checks the immutable configuration; the production cores still
 //! decide whether the message's view, history, role, and evidence are admissible.
 
+#![cfg_attr(not(test), warn(clippy::arithmetic_side_effects))]
+
 mod admission;
 mod election;
 pub use admission::ReceiveFence;
@@ -14,8 +16,8 @@ pub use compact::{COMPACT_STATE_BYTES, CompactState};
 mod prepare;
 mod publication;
 pub use publication::{
-    PUBLICATION_BYTES, PUBLICATION_TOPIC_BYTES, PublicationPart, decode_publication,
-    encode_publication, encode_publication_group, publication_topic,
+    PUBLICATION_BYTES, PUBLICATION_TOPIC_BYTES, decode_publication, encode_publication,
+    publication_topic,
 };
 mod checkpoint;
 mod recovery;
@@ -23,6 +25,7 @@ pub use checkpoint::{
     CheckpointMessage, CheckpointRequest, HistoryFence, HistoryRetired, encode_checkpoint,
     encode_history_retired,
 };
+mod fields;
 mod transfer;
 
 pub use flow::{FlowMessage, FlowProbe, FlowState, encode_flow_probe, encode_flow_state};
@@ -36,13 +39,15 @@ pub use recovery::{
 };
 pub use transfer::{FetchOps, OpsBatch, encode_fetch, encode_ops};
 
+use fields::{ReadFields, WriteFields, validate_election_view, validate_prefix, validate_scope};
+use ozzy_proto::layout::{LayoutError, Reader, Writer};
 use ozzy_proto::{Envelope, EnvelopeError, EnvelopeLimits, Opcode};
-use ozzy_proto::{GroupId, LinkSessionId, NodeId};
+use ozzy_proto::{LinkSessionId, NodeId};
 
 use crate::flow::{FlowError, ReceiveEpoch};
 use crate::{
-    Commit, Configuration, Digest, DoViewChange, OpNumber, Prefix, PrepareOk, QuorumPolicy,
-    ReplicationError, RetainedPrepareOk, Scope, StartView, StartViewChange,
+    Commit, Configuration, DoViewChange, Prefix, PrepareOk, QuorumPolicy, ReplicationError,
+    RetainedPrepareOk, Scope, StartView, StartViewChange,
 };
 
 const COMMON_BYTES: usize = 80;
@@ -88,6 +93,17 @@ impl PeerBinding {
         self.receive_epoch = Some(epoch);
         self
     }
+}
+
+/// Local sender, established link session, and bounds of one encoded packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncodeContext {
+    /// Configured local voter, written as envelope sender and embedded voter.
+    pub sender: NodeId,
+    /// Established session of the destination link.
+    pub session: LinkSessionId,
+    /// Frame and operation bounds of the encoded packet.
+    pub limits: WireLimits,
 }
 
 /// Directional receive and command work bounds.
@@ -276,21 +292,21 @@ pub fn encode_control(
         session: Some(session),
     }
     .encode_header(metadata_bytes, 0, EnvelopeLimits::default())?;
-    let mut writer = Writer::new(&mut output[..metadata_bytes]);
-    writer.scope(scope, sender);
+    let mut writer = Writer::with_len(output, metadata_bytes)?;
+    writer.scope(scope, sender)?;
     match message {
         Control::PrepareOk { ack } => {
-            writer.prefix(ack.durable);
-            writer.bytes(&[2]);
+            writer.prefix(ack.durable)?;
+            writer.bytes(&[2])?;
         }
         Control::PrepareRetained { ack } => {
-            writer.prefix(ack.retained);
-            writer.bytes(&[3]);
+            writer.prefix(ack.retained)?;
+            writer.bytes(&[3])?;
         }
-        Control::Commit(message) => writer.prefix(message.committed),
+        Control::Commit(message) => writer.prefix(message.committed)?,
         Control::StartViewChange(_) | Control::ExitView(_) => {}
-        Control::DoViewChange(message) => election::write_report(&mut writer, message),
-        Control::StartView(message) => election::write_start(&mut writer, message),
+        Control::DoViewChange(message) => election::write_report(&mut writer, message)?,
+        Control::StartView(message) => election::write_start(&mut writer, message)?,
     }
     Ok(ControlEncoding {
         header,
@@ -357,71 +373,73 @@ pub fn decode<'a>(
         return Err(WireError::Peer);
     }
     let mut reader = Reader::new(packet.metadata);
-    let scope = reader.scope(binding)?;
+    let incoming = Incoming {
+        scope: reader.scope(binding)?,
+        envelope: packet.envelope,
+        reader,
+        payload: packet.payload,
+    };
     match packet.envelope.opcode {
         Opcode::HistoryRetired => {
-            return checkpoint::decode_retired(scope, packet.envelope, reader, packet.payload)
-                .map(ReplicaMessage::HistoryRetired);
+            checkpoint::decode_retired(incoming).map(ReplicaMessage::HistoryRetired)
         }
         Opcode::SnapshotBegin | Opcode::SnapshotChunk => {
-            return checkpoint::decode(
-                scope,
-                packet.envelope,
-                reader,
-                packet.payload,
-                binding,
-                limits,
-            )
-            .map(ReplicaMessage::Checkpoint);
+            checkpoint::decode(incoming, binding, limits).map(ReplicaMessage::Checkpoint)
         }
-        Opcode::Recovery => {
-            return recovery::decode_request(scope, packet.envelope, reader, packet.payload)
-                .map(|request| ReplicaMessage::Recovery(RecoveryMessage::Request(request)));
-        }
-        Opcode::RecoveryState => {
-            return recovery::decode_state(scope, packet.envelope, reader, packet.payload, binding)
-                .map(|state| ReplicaMessage::Recovery(RecoveryMessage::State(state)));
-        }
-        Opcode::ReplicaOpen => {
-            return flow::decode_probe(scope, packet.envelope, reader, packet.payload)
-                .map(|probe| ReplicaMessage::Flow(FlowMessage::Probe(probe)));
-        }
-        Opcode::ReplicaState => {
-            return flow::decode_state(scope, packet.envelope, reader, packet.payload)
-                .map(|state| ReplicaMessage::Flow(FlowMessage::State(state)));
-        }
-        _ => {}
+        Opcode::Recovery => recovery::decode_request(incoming)
+            .map(|request| ReplicaMessage::Recovery(RecoveryMessage::Request(request))),
+        Opcode::RecoveryState => recovery::decode_state(incoming, binding)
+            .map(|state| ReplicaMessage::Recovery(RecoveryMessage::State(state))),
+        Opcode::ReplicaOpen => flow::decode_probe(incoming)
+            .map(|probe| ReplicaMessage::Flow(FlowMessage::Probe(probe))),
+        Opcode::ReplicaState => flow::decode_state(incoming)
+            .map(|state| ReplicaMessage::Flow(FlowMessage::State(state))),
+        Opcode::FetchOps => transfer::decode_fetch(incoming, binding).map(ReplicaMessage::FetchOps),
+        Opcode::Ops => transfer::decode_ops(incoming, limits).map(ReplicaMessage::Ops),
+        _ => decode_uncorrelated(incoming, binding, limits),
     }
-    if packet.envelope.opcode == Opcode::FetchOps {
-        return transfer::decode_fetch(scope, packet.envelope, reader, packet.payload, binding)
-            .map(ReplicaMessage::FetchOps);
-    }
-    if packet.envelope.opcode == Opcode::Ops {
-        return transfer::decode_ops(scope, packet.envelope, reader, packet.payload, limits)
-            .map(ReplicaMessage::Ops);
-    }
-    if packet.envelope.response || packet.envelope.request_id.is_some() {
+}
+
+/// Fields after the authenticated scope, borrowing the packet frames.
+struct Incoming<'a> {
+    scope: Scope,
+    envelope: Envelope,
+    reader: Reader<'a>,
+    payload: &'a [u8],
+}
+
+/// Decode normal data and control, which carry no request correlation.
+fn decode_uncorrelated(
+    Incoming {
+        scope,
+        envelope,
+        mut reader,
+        payload,
+    }: Incoming<'_>,
+    binding: PeerBinding,
+    limits: WireLimits,
+) -> Result<ReplicaMessage<'_>, WireError> {
+    if envelope.response || envelope.request_id.is_some() {
         return Err(WireError::Correlation);
     }
-    if packet.envelope.opcode == Opcode::PrepareFlow {
-        let epoch = ReceiveEpoch::new(u128::from_be_bytes(reader.bytes()?))?;
-        if binding.receive_epoch != Some(epoch) {
-            return Err(FlowError::Channel.into());
+    match envelope.opcode {
+        Opcode::PrepareFlow => {
+            let epoch = ReceiveEpoch::new(u128::from_be_bytes(reader.array()?))?;
+            if binding.receive_epoch != Some(epoch) {
+                return Err(FlowError::Channel.into());
+            }
+            prepare::decode_prepare(scope, reader, payload, limits)
+                .map(|batch| ReplicaMessage::Flow(FlowMessage::Prepare { epoch, batch }))
         }
-        return prepare::decode_prepare(scope, reader, packet.payload, limits)
-            .map(|batch| ReplicaMessage::Flow(FlowMessage::Prepare { epoch, batch }));
-    }
-    if packet.envelope.opcode == Opcode::Prepare {
-        if binding.receive_epoch.is_some() {
-            return Err(FlowError::Channel.into());
+        Opcode::Prepare => {
+            if binding.receive_epoch.is_some() {
+                return Err(FlowError::Channel.into());
+            }
+            prepare::decode_prepare(scope, reader, payload, limits).map(ReplicaMessage::Prepare)
         }
-        return prepare::decode_prepare(scope, reader, packet.payload, limits)
-            .map(ReplicaMessage::Prepare);
+        _ if !payload.is_empty() => Err(WireError::Payload),
+        opcode => decode_control(scope, opcode, reader, binding).map(ReplicaMessage::Control),
     }
-    if !packet.payload.is_empty() {
-        return Err(WireError::Payload);
-    }
-    decode_control(scope, packet.envelope.opcode, reader, binding).map(ReplicaMessage::Control)
 }
 
 fn decode_control(
@@ -433,7 +451,7 @@ fn decode_control(
     let message = match opcode {
         Opcode::PrepareOk => {
             let prefix = reader.prefix()?;
-            let evidence = reader.bytes::<1>()?[0];
+            let evidence = reader.u8()?;
             match (binding.configuration.policy(), evidence) {
                 (QuorumPolicy::Durable, 2) => Control::PrepareOk {
                     ack: PrepareOk {
@@ -465,135 +483,6 @@ fn decode_control(
     };
     reader.finish()?;
     Ok(message)
-}
-
-fn validate_scope(scope: Scope) -> Result<(), WireError> {
-    if scope.group_id.as_bytes() == &[0; 16] || scope.configuration_digest == Digest::ZERO {
-        return Err(WireError::Scope);
-    }
-    Ok(())
-}
-
-fn validate_election_view(scope: Scope) -> Result<(), WireError> {
-    if scope.view == 0 {
-        return Err(WireError::History);
-    }
-    Ok(())
-}
-
-fn validate_prefix(prefix: Prefix) -> Result<(), WireError> {
-    if (prefix.op.0 == 0) != (prefix.digest == Digest::ZERO) || prefix.op.0 == u64::MAX {
-        return Err(WireError::Prefix);
-    }
-    Ok(())
-}
-
-#[derive(Debug)]
-struct Reader<'a> {
-    remaining: &'a [u8],
-}
-
-impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { remaining: bytes }
-    }
-    fn bytes<const N: usize>(&mut self) -> Result<[u8; N], WireError> {
-        let (bytes, rest) = self
-            .remaining
-            .split_at_checked(N)
-            .ok_or(WireError::Length)?;
-        self.remaining = rest;
-        Ok(bytes.try_into().expect("exact field"))
-    }
-    fn u64(&mut self) -> Result<u64, WireError> {
-        Ok(u64::from_be_bytes(self.bytes()?))
-    }
-    fn u32(&mut self) -> Result<u32, WireError> {
-        Ok(u32::from_be_bytes(self.bytes()?))
-    }
-    fn digest(&mut self) -> Result<Digest, WireError> {
-        Ok(Digest::from_bytes(self.bytes()?))
-    }
-    fn prefix(&mut self) -> Result<Prefix, WireError> {
-        let value = Prefix {
-            op: OpNumber(self.u64()?),
-            digest: self.digest()?,
-        };
-        validate_prefix(value)?;
-        Ok(value)
-    }
-    fn routing_scope(&mut self, sender: NodeId) -> Result<Scope, WireError> {
-        let group_id = GroupId::from_bytes(self.bytes()?);
-        let configuration_epoch = self.u64()?;
-        let view = self.u64()?;
-        let voter = NodeId::from_bytes(self.bytes()?);
-        let configuration_digest = self.digest()?;
-        if voter != sender {
-            return Err(WireError::Peer);
-        }
-        let scope = Scope {
-            group_id,
-            configuration_epoch,
-            configuration_digest,
-            view,
-        };
-        validate_scope(scope)?;
-        if configuration_epoch == 0 {
-            return Err(WireError::Scope);
-        }
-        Ok(scope)
-    }
-
-    fn scope(&mut self, binding: PeerBinding) -> Result<Scope, WireError> {
-        let scope = self.routing_scope(binding.peer)?;
-        if scope
-            != (Scope {
-                view: scope.view,
-                ..binding.configuration.scope()
-            })
-        {
-            return Err(WireError::Scope);
-        }
-        Ok(scope)
-    }
-    fn finish(self) -> Result<(), WireError> {
-        if self.remaining.is_empty() {
-            Ok(())
-        } else {
-            Err(WireError::Length)
-        }
-    }
-}
-
-#[derive(Debug)]
-struct Writer<'a> {
-    output: &'a mut [u8],
-    offset: usize,
-}
-
-impl<'a> Writer<'a> {
-    fn new(output: &'a mut [u8]) -> Self {
-        Self { output, offset: 0 }
-    }
-    fn bytes(&mut self, bytes: &[u8]) {
-        let end = self.offset + bytes.len();
-        self.output[self.offset..end].copy_from_slice(bytes);
-        self.offset = end;
-    }
-    fn u64(&mut self, value: u64) {
-        self.bytes(&value.to_be_bytes());
-    }
-    fn prefix(&mut self, prefix: Prefix) {
-        self.u64(prefix.op.0);
-        self.bytes(prefix.digest.as_bytes());
-    }
-    fn scope(&mut self, scope: Scope, voter: NodeId) {
-        self.bytes(scope.group_id.as_bytes());
-        self.u64(scope.configuration_epoch);
-        self.u64(scope.view);
-        self.bytes(voter.as_bytes());
-        self.bytes(scope.configuration_digest.as_bytes());
-    }
 }
 
 /// Structural wire failure. No rejection changes replica or journal state.
@@ -653,4 +542,13 @@ pub enum WireError {
     /// Opcode does not have an implemented replica codec.
     #[error("unsupported replica command")]
     UnsupportedCommand,
+}
+
+impl From<LayoutError> for WireError {
+    fn from(error: LayoutError) -> Self {
+        match error {
+            LayoutError::Truncated { .. } | LayoutError::Trailing(_) => Self::Length,
+            LayoutError::Overflow { .. } => Self::Capacity,
+        }
+    }
 }

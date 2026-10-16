@@ -1,7 +1,7 @@
 //! Nonvoting recovery donations, isolated from election and normal replay state.
 
 use super::{
-    AppendBuffer, AsyncJournalHistory, JournalError, JournalOwner, OwnedJournal, history, prefix,
+    AppendBuffer, JournalError, JournalHistory, JournalOwner, OwnedJournal, history, prefix,
 };
 use crate::replica_journal::{
     FetchedHistory, PinnedRecovery, authority::position, commands::read_fault,
@@ -16,23 +16,64 @@ use std::{cell::Cell, rc::Rc};
 #[derive(Debug)]
 pub(super) struct Source {
     pin: PinnedRecovery,
-    metadata: ozzy_journal_segment::AsyncJournalHistoryMetadata,
-    cached: Option<AsyncJournalHistory>,
+    metadata: ozzy_journal_segment::JournalHistoryMetadata,
+    cached: Option<JournalHistory>,
     busy: Rc<Cell<bool>>,
-    checkpoint: Option<Rc<ozzy_journal_segment::AsyncCheckpointFiles>>,
+    checkpoint: Option<Rc<ozzy_journal_segment::CheckpointFiles>>,
     checkpoint_cursor: Option<CheckpointCursor>,
 }
 
 #[derive(Debug)]
 struct CheckpointCursor {
-    cursor: Box<ozzy_journal_segment::AsyncCheckpointCursor>,
+    cursor: Box<ozzy_journal_segment::CheckpointCursor>,
     _charge: Option<crate::memory::Charge>,
+}
+
+impl CheckpointCursor {
+    /// A new cursor over `files`, charged for what it retains.
+    fn open(
+        memory: Option<&crate::memory::Owner>,
+        files: Rc<ozzy_journal_segment::CheckpointFiles>,
+    ) -> Result<Self, JournalError> {
+        let charge = memory
+            .map(|memory| {
+                memory
+                    .try_charge(ozzy_journal_segment::CheckpointCursor::retained_bytes())
+                    .map_err(memory_error)
+            })
+            .transpose()?;
+        Ok(Self {
+            cursor: Box::new(files.cursor()),
+            _charge: charge,
+        })
+    }
 }
 
 #[derive(Debug)]
 struct CheckpointBuffer {
     output: crate::memory::Buffer,
     _scratch: crate::memory::Charge,
+}
+
+impl CheckpointBuffer {
+    /// Output for one chunk of at most `maximum` bytes. Replay ranges retain
+    /// an output plus one I/O scratch fragment; both are separate from the
+    /// backend's accepted physical jobs.
+    fn charge(
+        memory: &crate::memory::Owner,
+        maximum: usize,
+        fragment_bytes: usize,
+    ) -> Result<Self, JournalError> {
+        let scratch_bytes = maximum
+            .checked_add(fragment_bytes)
+            .ok_or(JournalError::AppendCapacity)?;
+        let scratch = memory.try_charge(scratch_bytes).map_err(memory_error)?;
+        let output = memory.try_lease(maximum).map_err(memory_error)?;
+        Ok(Self {
+            output,
+            _scratch: scratch,
+        })
+    }
 }
 
 fn memory_error(error: std::io::Error) -> JournalError {
@@ -57,7 +98,7 @@ impl Drop for Slot {
 pub struct PreparedRecoveryRead {
     key: Rc<()>,
     pin: PinnedRecovery,
-    history: AsyncJournalHistory,
+    history: JournalHistory,
     request: FetchOps,
     buffer: AppendBuffer,
     slot: Slot,
@@ -68,7 +109,7 @@ pub struct PreparedRecoveryRead {
 pub struct CompletedRecoveryRead {
     key: Rc<()>,
     pin: PinnedRecovery,
-    history: AsyncJournalHistory,
+    history: JournalHistory,
     result: Result<FetchedHistory, JournalError>,
     slot: Slot,
 }
@@ -138,6 +179,11 @@ impl OwnedJournal {
             requester,
             response,
             donor,
+            source: ozzy_replication::LogSource {
+                voter: donor,
+                generation: log.generation,
+                accepted: log.accepted,
+            },
         };
         if let Some(existing) = &self.donors[at] {
             let mut original = existing.pin;
@@ -179,7 +225,10 @@ impl OwnedJournal {
             }
             _ => return Err(JournalError::CompletionMismatch),
         }
-        let log = pin.response.primary.expect("validated donor response");
+        let log = pin
+            .response
+            .primary
+            .ok_or(JournalError::HistorySourceMismatch)?;
         let mut history = self
             .journal
             .readable()?
@@ -204,11 +253,9 @@ impl OwnedJournal {
                 chunk_bytes: manifest.chunk_bytes,
             };
             anchor.validate(log.committed)?;
-            pin.response
-                .primary
-                .as_mut()
-                .expect("primary donor")
-                .checkpoint = Some(anchor);
+            if let Some(primary) = pin.response.primary.as_mut() {
+                primary.checkpoint = Some(anchor);
+            }
             Some(files)
         } else {
             None
@@ -402,39 +449,13 @@ impl OwnedJournal {
             .clone()
             .ok_or(JournalError::HistorySourceMismatch)?;
         let maximum = (request.max_bytes as usize).min(files.fragment_bytes());
-        let buffer = self
-            .append_memory
-            .as_ref()
-            .map(|memory| {
-                // Replay ranges retain an output plus one I/O scratch fragment;
-                // both are separate from the backend's accepted physical jobs.
-                let scratch_bytes = maximum
-                    .checked_add(files.fragment_bytes())
-                    .ok_or(JournalError::AppendCapacity)?;
-                let scratch = memory.try_charge(scratch_bytes).map_err(memory_error)?;
-                let output = memory.try_lease(maximum).map_err(memory_error)?;
-                Ok::<_, JournalError>(CheckpointBuffer {
-                    output,
-                    _scratch: scratch,
-                })
-            })
+        let memory = self.append_memory.as_ref();
+        let buffer = memory
+            .map(|memory| CheckpointBuffer::charge(memory, maximum, files.fragment_bytes()))
             .transpose()?;
-        let cursor = if let Some(cursor) = source.checkpoint_cursor.take() {
-            cursor
-        } else {
-            let charge = self
-                .append_memory
-                .as_ref()
-                .map(|memory| {
-                    memory
-                        .try_charge(ozzy_journal_segment::AsyncCheckpointCursor::retained_bytes())
-                        .map_err(memory_error)
-                })
-                .transpose()?;
-            CheckpointCursor {
-                cursor: Box::new(files.cursor()),
-                _charge: charge,
-            }
+        let cursor = match source.checkpoint_cursor.take() {
+            Some(cursor) => cursor,
+            None => CheckpointCursor::open(memory, files)?,
         };
         source.busy.set(true);
         Ok(PreparedCheckpointRead {

@@ -29,7 +29,7 @@ fn retire(
         journal.retire_confirmed_history(
             driver.begin_validation().unwrap(),
             CheckpointId::from_bytes([id; 16]),
-            ozzy_journal_segment::AsyncRetirementBudget {
+            ozzy_journal_segment::RetirementBudget {
                 max_segments: 2,
                 max_read_bytes: 65536,
             },

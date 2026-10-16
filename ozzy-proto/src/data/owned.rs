@@ -4,7 +4,7 @@ use bytes::{Buf, Bytes};
 use smallvec::SmallVec;
 
 use super::{RecordIter, Records};
-use crate::MessageId;
+use crate::{MessageId, layout::Fixed};
 
 /// One owned record; multipart bytes may share immutable input or received frames.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,20 +96,20 @@ impl Iterator for OwnedRecordIter {
     type Item = OwnedRecord;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.0.count == 0 {
-            return None;
-        }
-        if self.0.descriptors[16..20] == [0, 0, 0, 1] {
+        let count = self.0.count.checked_sub(1)?;
+        if let Some(entry) = self.0.descriptors.first_chunk::<24>()
+            && entry.array::<16, 4>() == [0, 0, 0, 1]
+        {
             // Raw, single-part records have one fixed 24-byte descriptor.
             // The collection was validated before ownership was retained.
-            let message_id = MessageId::from_bytes(self.0.descriptors[..16].try_into().unwrap());
-            let bytes = u32::from_be_bytes(self.0.descriptors[20..24].try_into().unwrap()) as usize;
+            let message_id = MessageId::from_bytes(entry.array::<0, 16>());
+            let bytes = entry.u32_at::<20>() as usize;
+            let metadata_left = self.0.descriptors.len().checked_sub(24)?;
+            let payload_left = self.0.payload.len().checked_sub(bytes)?;
             let payload = self.0.payload.slice(..bytes);
-            let metadata_left = self.0.descriptors.len() - 24;
-            let payload_left = self.0.payload.len() - bytes;
             retain_tail(&mut self.0.descriptors, metadata_left);
             retain_tail(&mut self.0.payload, payload_left);
-            self.0.count -= 1;
+            self.0.count = count;
             return Some(OwnedRecord {
                 encoding: super::Encoding::Raw,
                 message_id,
@@ -127,7 +127,7 @@ impl Iterator for OwnedRecordIter {
                 .collect(),
         };
         let remaining = (
-            cursor.descriptors.0.len(),
+            cursor.descriptors.rest().len(),
             cursor.payload.len(),
             cursor.remaining,
         );
@@ -151,8 +151,8 @@ fn retain_tail(bytes: &mut Bytes, remaining: usize) {
         // clear()/advance(len) can retain backing storage. Match slice_ref's
         // empty-tail release, even before trailing empty records are consumed.
         *bytes = Bytes::new();
-    } else {
-        bytes.advance(bytes.len() - remaining);
+    } else if let Some(consumed) = bytes.len().checked_sub(remaining) {
+        bytes.advance(consumed);
     }
 }
 

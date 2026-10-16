@@ -29,10 +29,7 @@ impl Closing {
                     .into_iter()
                     .find_map(Result::err)
                     .map(|error| error.to_string());
-                finished
-                    .error
-                    .set(error)
-                    .expect("reader close published once");
+                finished.error.get_or_init(|| error);
                 // Admission remains charged until all cleanup operations settle.
                 drop(cursors);
                 finished.finished.close();
@@ -43,9 +40,12 @@ impl Closing {
 
     pub(super) async fn closed(&self) -> Result<(), TopicReaderError> {
         self.finished.closed().await;
-        match self.error.get().expect("finished reader close").clone() {
-            None => Ok(()),
-            Some(error) => Err(BrokerLinkError::Failed(error).into()),
+        // Cleanup publishes its outcome before finishing; none means the SDK
+        // stopped it first.
+        match self.error.get() {
+            Some(None) => Ok(()),
+            Some(Some(error)) => Err(BrokerLinkError::Failed(error.clone()).into()),
+            None => Err(BrokerLinkError::Closed.into()),
         }
     }
 }

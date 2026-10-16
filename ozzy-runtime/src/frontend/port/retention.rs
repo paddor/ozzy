@@ -3,78 +3,63 @@
 use super::PortError;
 use crate::{
     dispatch::{self, Budget},
+    returning::{ReturnLane, ReturnSlot, Returning},
     signal::{CloseSignal, StateSignal},
 };
 use bytes::Bytes;
 use omq_tokio::{Message, message::Payload};
 use std::sync::Arc;
-use tokio::sync::mpsc;
 
+/// One earlier charge, given back to the port when its holder drops it.
 #[derive(Clone, Copy, Debug)]
 enum Release {
     Queue(usize),
     Retained(usize, usize),
 }
 
-#[derive(Debug)]
-pub(super) struct Return {
-    sender: mpsc::Sender<Release>,
-    pub(super) changed: Arc<StateSignal>,
-    pub(super) closed: CloseSignal,
-}
-
-impl Return {
-    fn release(&self, released: Release) {
-        match self.sender.try_send(released) {
-            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                panic!("bounded port return mailbox overflowed")
-            }
-        }
-        self.changed.notify_changed();
-    }
-}
+/// A charge with its return place reserved at admission, so releasing it
+/// later cannot fail.
+type Credit = Returning<Release, Option<ReturnSlot<Release, StateSignal>>>;
 
 #[derive(Debug)]
 pub(super) struct Capacity {
     pub(super) limits: [Budget; 3],
     used: [Budget; 3],
-    returned: mpsc::Receiver<Release>,
-    pub(super) returns: Arc<Return>,
+    returns: ReturnLane<Release, StateSignal>,
+    /// Closed by either end: the shard's port or the dispatcher's mailbox.
+    pub(super) closed: CloseSignal,
 }
 
 impl Capacity {
     pub(super) fn new(limits: [Budget; 3], return_slots: usize) -> Self {
-        let (sender, returned) = mpsc::channel(return_slots);
         Self {
             limits,
             used: [Budget::default(); 3],
-            returned,
-            returns: Arc::new(Return {
-                sender,
-                changed: Arc::new(StateSignal::default()),
-                closed: CloseSignal::default(),
-            }),
+            returns: ReturnLane::new(return_slots, Arc::new(StateSignal::default())),
+            closed: CloseSignal::default(),
         }
     }
 
+    /// Changes whenever capacity comes back.
+    pub(super) fn changed(&self) -> &Arc<StateSignal> {
+        self.returns.notice()
+    }
+
     pub(super) fn collect(&mut self) {
+        let used = &mut self.used;
         // Fixed-size returns: at most 64 events (2 KiB) per owner turn.
-        for _ in 0..64 {
-            let Ok(released) = self.returned.try_recv() else {
-                break;
-            };
-            match released {
-                Release::Queue(bucket) => self.used[bucket].queue_slots -= 1,
-                Release::Retained(bucket, bytes) => {
-                    self.used[bucket].retained_messages -= 1;
-                    self.used[bucket].bytes -= bytes;
-                }
+        self.returns.drain(64, |released| match released {
+            // Each release returns exactly one earlier charge.
+            Release::Queue(bucket) => {
+                let used = &mut used[bucket];
+                used.queue_slots = used.queue_slots.saturating_sub(1);
             }
-        }
-        if !self.returned.is_empty() {
-            self.returns.changed.notify_changed();
-        }
+            Release::Retained(bucket, bytes) => {
+                let used = &mut used[bucket];
+                used.retained_messages = used.retained_messages.saturating_sub(1);
+                used.bytes = used.bytes.saturating_sub(bytes);
+            }
+        });
     }
 
     pub(super) fn reserve(
@@ -83,59 +68,48 @@ impl Capacity {
         bytes: usize,
     ) -> Result<(QueueSlot, Retention), PortError> {
         self.collect();
-        if self.returns.closed.is_closed() {
+        if self.closed.is_closed() {
             return Err(PortError::Admission(dispatch::SendFailure::Closed));
         }
         let limit = self.limits[bucket];
         let used = &mut self.used[bucket];
+        let full = PortError::Admission(dispatch::SendFailure::Admission(dispatch::Error::Full));
         if used.queue_slots >= limit.queue_slots
             || used.retained_messages >= limit.retained_messages
             || bytes > limit.bytes.saturating_sub(used.bytes)
         {
-            return Err(PortError::Admission(dispatch::SendFailure::Admission(
-                dispatch::Error::Full,
-            )));
+            return Err(full);
         }
-        used.queue_slots += 1;
-        used.retained_messages += 1;
-        used.bytes += bytes;
-        Ok((
-            QueueSlot {
-                bucket,
-                returns: self.returns.clone(),
-            },
-            Retention(Arc::new(Retained {
-                bucket,
-                bytes,
-                returns: self.returns.clone(),
-            })),
-        ))
+        let (Some(queue_return), Some(retained_return)) =
+            (self.returns.reserve(), self.returns.reserve())
+        else {
+            return Err(full);
+        };
+        // The limit checks above keep each charge within its budget.
+        used.queue_slots = used.queue_slots.saturating_add(1);
+        used.retained_messages = used.retained_messages.saturating_add(1);
+        used.bytes = used.bytes.saturating_add(bytes);
+        let queue = Returning::new(Release::Queue(bucket), Some(queue_return));
+        let retained = Returning::new(Release::Retained(bucket, bytes), Some(retained_return));
+        Ok((QueueSlot { _credit: queue }, Retention(Arc::new(retained))))
     }
 }
 
+/// Rides in a queued command's header; dropping the header returns the slot.
 #[derive(Debug)]
 pub(super) struct QueueSlot {
-    bucket: usize,
-    returns: Arc<Return>,
-}
-impl Drop for QueueSlot {
-    fn drop(&mut self) {
-        self.returns.release(Release::Queue(self.bucket));
-    }
+    _credit: Credit,
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct Retention(Arc<Retained>);
-#[derive(Debug)]
-struct Retained {
-    bucket: usize,
-    bytes: usize,
-    returns: Arc<Return>,
-}
-impl Drop for Retained {
-    fn drop(&mut self) {
-        self.returns
-            .release(Release::Retained(self.bucket, self.bytes));
+pub(super) struct Retention(Arc<Credit>);
+
+impl Retention {
+    fn bytes(&self) -> usize {
+        match **self.0 {
+            Release::Retained(_, bytes) => bytes,
+            Release::Queue(_) => 0,
+        }
     }
 }
 
@@ -151,7 +125,7 @@ impl AsRef<[u8]> for TrackedBytes {
 impl Retention {
     pub(super) fn message(&self, mut message: Message) -> Message {
         let parts = std::iter::from_fn(|| message.pop_front_payload()).map(|payload| {
-            let retained = payload.retained_size().unwrap_or(self.0.bytes);
+            let retained = payload.retained_size().unwrap_or(self.bytes());
             let bytes = Bytes::from_owner(TrackedBytes {
                 bytes: payload.as_bytes(),
                 _retention: self.clone(),

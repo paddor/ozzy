@@ -122,7 +122,7 @@ fn missing_evidence_barrier_negative_control_reaches_independent_receipt_oracle(
             .storage
             .as_mut()
             .unwrap()
-            .omit_in_place_sync(true);
+            .omit_evidence_barrier(true);
     }
     let request = sim.propose(0, 1).unwrap();
     sim.until(100, |sim| sim.ready(0, 0, request.end()));
@@ -132,7 +132,7 @@ fn missing_evidence_barrier_negative_control_reaches_independent_receipt_oracle(
         .storage
         .as_mut()
         .unwrap()
-        .omit_in_place_sync(false);
+        .omit_evidence_barrier(false);
     sim.reopen(1); // Broken publisher lets this broker forget its former copy.
     assert!(sim.replicas[1].storage_error.is_none());
     sim.cut(0); // Its intact surviving payload remains unavailable to elections.

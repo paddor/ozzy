@@ -17,10 +17,12 @@ case "$scope" in
     storage) args=(-p ozzy-journal-segment --features lz4 --lib) ;;
     io) args=(-p ozzy-io -p ozzy-io-pool -p ozzy-io-aio --features ozzy-io/simulation) ;;
     replication) args=(-p ozzy-runtime --features lz4-storage,simulation
-        --test ozzy_replica_transport --test ozzy_replication) ;;
+        --test ozzy_replica_transport --lib -E
+        'binary(ozzy_replica_transport) or test(replica_journal::owned::)') ;;
     simulation) args=(-p ozzy-sim -p ozzy-io --features ozzy-io/simulation,ozzy-sim/broker) ;;
     loom)
         export RUSTFLAGS="${RUSTFLAGS:--C target-cpu=native} --cfg ozzy_loom"
+        cargo test -p ozzy-io --test ozzy_io_loom -- "$@"
         cargo test -p ozzy-runtime --test ozzy_loom -- "$@"
         exec cargo test -p ozzy-broker --test ozzy_broker_loom -- "$@" ;;
     -h|--help)
@@ -31,5 +33,6 @@ case "$scope" in
 esac
 
 TIMEFORMAT="test scope=$scope elapsed=%3Rs user=%3Us system=%3Ss"
+# A scope selects its tests in full, including system tests.
 time cargo nextest run --test-threads 8 --status-level fail \
-    --final-status-level fail "${args[@]}" -- "$@"
+    --final-status-level fail --ignore-default-filter "${args[@]}" -- "$@"

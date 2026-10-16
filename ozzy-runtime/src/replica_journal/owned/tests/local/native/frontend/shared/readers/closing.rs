@@ -70,6 +70,7 @@ async fn occupied(replacement: bool) {
         })
         .await;
     let baseline = harness.openings.len();
+    let delivered = links.delivered_replies();
     let opening = Open {
         authority: authority.authority,
         partition: multiple::incarnation(0),
@@ -91,10 +92,11 @@ async fn occupied(replacement: bool) {
             harness.openings.len() == baseline + 4
         })
         .await;
-    for _ in 0..256 {
-        harness.pump(true);
-        tokio::task::yield_now().await;
-    }
+    harness
+        .until(true, "four producer replies retained", |_| {
+            links.delivered_replies() == delivered + 4
+        })
+        .await;
     assert_eq!(links.control_capacity(authority.primary), 0);
     if replacement {
         let session = links.session(authority.primary).unwrap();

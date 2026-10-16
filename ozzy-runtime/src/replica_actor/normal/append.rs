@@ -7,6 +7,7 @@ use super::{
 use crate::replica_actor::HistoryReason;
 use crate::replica_actor::io::Completed;
 use crate::replica_actor::{Bytes, MAX_TRANSFER_OPERATIONS, wire};
+use crate::replica_journal::JournalError;
 use crate::replica_journal::ProposalValidation;
 use ozzy_replication::wire::{Operation, Prepare, PrepareBatch};
 use ozzy_replication::{Admission, Commit, NormalReplica, ReplicationError};
@@ -66,7 +67,7 @@ impl ReplicaActor {
                 // image it leaves. Application last: the proposal's ticket
                 // still names the applied prefix it saw.
                 if let Some(admitted) = turn.admitted {
-                    self.complete_admitted(admitted, now);
+                    self.complete_admitted(admitted, now)?;
                 }
                 if let Some(proposal) = turn.proposal {
                     self.complete_proposal(proposal, now)?;
@@ -87,7 +88,7 @@ impl ReplicaActor {
                             }) {
                                 self.work.receive.defer(buffer);
                             } else {
-                                self.recycle(buffer);
+                                self.recycle(buffer)?;
                             }
                         }
                         crate::replica_journal::ReceivedValidation::Rejected(error) => {
@@ -105,7 +106,8 @@ impl ReplicaActor {
                 }
             }
             Completed::Replay(fetched, to) => self.complete_replay(fetched, to, now)?,
-            _ => unreachable!("election completions handled separately"),
+            // Election completions go to the election path, never here.
+            _ => return Err(JournalError::CompletionMismatch.into()),
         }
         Ok(())
     }
@@ -116,7 +118,7 @@ impl ReplicaActor {
         &mut self,
         admitted: crate::replica_journal::AdmittedAppend,
         now: Duration,
-    ) {
+    ) -> Result<(), ActorError> {
         let (ticket, buffer, persisted) = admitted.into_parts();
         assert!(self.pending_persistence.len() < self.config.pipeline.max_operations);
         self.pending_persistence.push_back(persisted);
@@ -124,7 +126,7 @@ impl ReplicaActor {
             self.ack_at = now;
         }
         self.work.persisting_bytes.push_back(buffer.body_bytes());
-        self.return_admitted(ticket, buffer);
+        self.return_admitted(ticket, buffer)
     }
 
     /// One queued write completed on the dedicated writer, in admission order.
@@ -137,7 +139,7 @@ impl ReplicaActor {
             .work
             .persisting_bytes
             .pop_front()
-            .expect("one admission per queued write");
+            .ok_or(JournalError::CompletionMismatch)?;
         if self.replicated() {
             self.driver.complete_buffered_write(ticket, now)?;
         } else {
@@ -146,9 +148,8 @@ impl ReplicaActor {
             // batch starts now instead of after the running turn.
             self.driver.complete_write(ticket)?;
             self.work.needs_sync = true;
-            self.work.sync_batch_operations +=
-                usize::try_from(ticket.through().0 - ticket.first().0 + 1)
-                    .expect("bounded write ticket");
+            // A write ticket spans at most one pipeline of operations.
+            self.work.sync_batch_operations += (ticket.through().0 - ticket.first().0 + 1) as usize;
             self.work.sync_batch_body_bytes += body_bytes;
             self.work.sync_batch_started.get_or_insert(now);
             if self.pending_sync.is_none()
@@ -175,7 +176,7 @@ impl ReplicaActor {
         &mut self,
         ticket: ozzy_replication::WriteTicket,
         buffer: crate::replica_journal::AppendBuffer,
-    ) {
+    ) -> Result<(), ActorError> {
         if let Some(live) =
             self.work.live.iter_mut().find(|live| {
                 live.generation == ticket.generation() && live.end.op == ticket.through()
@@ -183,8 +184,9 @@ impl ReplicaActor {
         {
             assert!(live.buffer.replace(buffer).is_none());
             live.reply.admitted();
+            Ok(())
         } else {
-            self.recycle(buffer);
+            self.recycle(buffer)
         }
     }
 
@@ -233,7 +235,7 @@ impl ReplicaActor {
             Err(DriverError::StaleValidation) => {
                 crate::profiling::event(crate::profiling::Event::ReplicaStaleValidation);
                 self.retract_received(now)?;
-                self.recycle(validated.into_buffer());
+                self.recycle(validated.into_buffer())?;
             }
             Err(error) => return Err(error.into()),
             _ => return Err(ActorError::history(HistoryReason::ProposalWindow)),
@@ -250,7 +252,7 @@ impl ReplicaActor {
             .work
             .proposals
             .validated()
-            .expect("owned proposal reply");
+            .ok_or(JournalError::CompletionMismatch)?;
         let validated = match result {
             ProposalValidation::Deferred {
                 validation,
@@ -282,7 +284,7 @@ impl ReplicaActor {
 
     fn admit_proposal(
         &mut self,
-        mut validated: crate::replica_journal::ValidatedAppend,
+        validated: crate::replica_journal::ValidatedAppend,
         reply: super::Reply,
         now: Duration,
     ) -> Result<(), ActorError> {
@@ -323,6 +325,17 @@ impl ReplicaActor {
                 _ => return Err(ActorError::history(HistoryReason::ProposalWindow)),
             };
         self.work.sync_batch_started.get_or_insert(now);
+        self.enter_live(ticket, validated, reply)
+    }
+
+    /// Cache the admitted proposal's PREPARE templates in the live window.
+    fn enter_live(
+        &mut self,
+        ticket: ozzy_replication::WriteTicket,
+        mut validated: crate::replica_journal::ValidatedAppend,
+        reply: super::Reply,
+    ) -> Result<(), ActorError> {
+        let validation = validated.validation();
         let payload = validated.shared_bodies();
         let operations: smallvec::SmallVec<[_; MAX_TRANSFER_OPERATIONS]> =
             validated.wire_operations().collect();
@@ -335,7 +348,7 @@ impl ReplicaActor {
         let end = validated
             .prepared()
             .last()
-            .expect("nonempty proposal")
+            .ok_or(JournalError::AppendMismatch)?
             .prefix();
         for operation in &operations {
             self.work.flow.remember(super::flow::operation(*operation));

@@ -1,6 +1,6 @@
 //! Bounded Ozzy framing shared by every command family.
 
-use crate::{LinkSessionId, NodeId, RequestId};
+use crate::{LinkSessionId, NodeId, RequestId, layout::Fixed};
 
 /// Current wire version. This pre-release protocol has no compatibility decoder.
 pub const VERSION: u8 = 1;
@@ -208,6 +208,16 @@ pub struct Packet<'a> {
     pub payload: &'a [u8],
 }
 
+/// The metadata and payload frames of one data command: caller-reserved
+/// buffers to encode into, or received frames that decoded records share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Frames<T> {
+    /// Metadata frame.
+    pub metadata: T,
+    /// Packed payload frame.
+    pub payload: T,
+}
+
 /// Decode exactly three Ozzy frames, after the transport removes routing frames.
 ///
 /// Reject unsupported versions and old frame shapes. All header reads are
@@ -219,35 +229,35 @@ pub fn decode_packet<'a>(
     let [header, metadata, payload] = frames else {
         return Err(EnvelopeError::FrameCount);
     };
-    if header.len() != ENVELOPE_BYTES {
-        return Err(EnvelopeError::HeaderLength);
-    }
+    let header: &[u8; ENVELOPE_BYTES] = (*header)
+        .try_into()
+        .map_err(|_| EnvelopeError::HeaderLength)?;
     validate_lengths(metadata.len(), payload.len(), limits)?;
-    if &header[..4] != b"OZY\0" {
+    if header.array::<0, 4>() != *b"OZY\0" {
         return Err(EnvelopeError::Magic);
     }
-    if header[4] != VERSION {
-        return Err(EnvelopeError::Major(header[4]));
+    if header.u8_at::<4>() != VERSION {
+        return Err(EnvelopeError::Major(header.u8_at::<4>()));
     }
-    let opcode = Opcode::decode(header[5])?;
-    let flags = u16::from_be_bytes(header[6..8].try_into().expect("fixed field"));
+    let opcode = Opcode::decode(header.u8_at::<5>())?;
+    let flags = header.u16_at::<6>();
     if flags & !1 != 0 {
         return Err(EnvelopeError::Flags);
     }
-    let metadata_bytes = u32::from_be_bytes(header[56..60].try_into().expect("fixed field"));
-    let payload_bytes = u32::from_be_bytes(header[60..64].try_into().expect("fixed field"));
+    let metadata_bytes = header.u32_at::<56>();
+    let payload_bytes = header.u32_at::<60>();
     if usize::try_from(metadata_bytes) != Ok(metadata.len())
         || usize::try_from(payload_bytes) != Ok(payload.len())
     {
         return Err(EnvelopeError::Length);
     }
-    let request: [u8; 16] = header[8..24].try_into().expect("fixed field");
-    let session: [u8; 16] = header[40..56].try_into().expect("fixed field");
+    let request = header.array::<8, 16>();
+    let session = header.array::<40, 16>();
     let envelope = Envelope {
         opcode,
         response: flags == 1,
         request_id: (request != [0; 16]).then(|| RequestId::from_bytes(request)),
-        sender: NodeId::from_bytes(header[24..40].try_into().expect("fixed field")),
+        sender: NodeId::from_bytes(header.array::<24, 16>()),
         session: (session != [0; 16]).then(|| LinkSessionId::from_bytes(session)),
     };
     envelope.validate(payload.len())?;

@@ -825,3 +825,35 @@ async fn seeded_schedules_reproduce_exact_events_and_independent_byte_oracle() {
         );
     }
 }
+
+#[tokio::test]
+async fn skipped_barriers_report_success_without_persisting() {
+    let mut harness = Harness::new();
+    let file = harness.established(b"old").await;
+    harness.run(write(&file, 0, b"new")).await;
+    let sync = Operation::Sync {
+        handle: file.clone(),
+        mode: SyncMode::All,
+    };
+    harness.perform(sync, Effect::SkipBarrier).await.unwrap();
+    let value = harness
+        .run(Operation::Open {
+            path: "/data".into(),
+            mode: OpenMode::ReadWrite,
+            direct: false,
+            data_sync: true,
+        })
+        .await;
+    let Outcome::Opened(synced) = &*value else {
+        panic!("open response")
+    };
+    let synced = synced.clone();
+    drop(value);
+    harness
+        .perform(write(&synced, 3, b"!"), Effect::SkipBarrier)
+        .await
+        .unwrap();
+    drop(synced);
+    let (image, _) = harness.controller.crash(true).unwrap();
+    assert_eq!(image.bytes(Path::new("/data"), false).unwrap(), b"old");
+}

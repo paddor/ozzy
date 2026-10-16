@@ -1,4 +1,13 @@
 //! Sustained full-product simulation runner.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "simulation test support"
+)]
 use clap::{Parser, ValueEnum};
 use ozzy_config::Confirmation;
 use ozzy_sim::soak::{self, Action, Config, Resources, Time};

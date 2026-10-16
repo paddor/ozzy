@@ -2,7 +2,7 @@
 
 use crate::{broker::Cluster, client::Client};
 use ozzy_config::Confirmation;
-use ozzy_runtime::replicated::SdkClock;
+use ozzy_runtime::replicated::{SdkClock, TopicReader};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
@@ -147,6 +147,12 @@ pub struct Report {
 }
 
 impl Report {
+    /// Record the protocol time and the real elapsed time at this point.
+    fn stamp(&mut self, clock: &SdkClock, started: Instant) {
+        self.time_millis = millis(clock.now());
+        self.elapsed_millis = millis(started.elapsed());
+    }
+
     fn print_progress(&self, config: &Config, elapsed: Duration) {
         println!(
             "{}",
@@ -186,127 +192,224 @@ pub async fn run(config: &Config) -> Result<Report, String> {
 }
 
 async fn run_cluster(config: &Config, clock: &SdkClock) -> Result<Report, String> {
-    let started = Instant::now();
-    std::fs::create_dir_all(&config.artifacts).map_err(|error| error.to_string())?;
-    save_config(config)?;
-    let mut schedule = BufWriter::new(create(&config.artifacts.join("schedule.jsonl"))?);
-    let mut replay = config
-        .replay
-        .as_ref()
-        .map(|path| File::open(path).map(|file| BufReader::new(file).lines()))
-        .transpose()
-        .map_err(|error| error.to_string())?;
-    let mut cluster = Cluster::configured(
-        config.policy,
-        config.time.duration.map(|_| clock.clone()),
-        |deployment| config.resources.configure(deployment),
-    )
-    .await;
-    let mut client =
-        Some(Client::open_with_clock(&cluster.configs[0].0, &cluster.runtime, clock.clone()).await);
-    let mut reader = Some(client.as_ref().unwrap().reader(true).await);
-    let mut report = Report::default();
+    let mut run = Run::open(config, clock).await?;
     let mut next_report = Duration::ZERO;
-    let mut recent = VecDeque::with_capacity(128);
-    let mut random = config.seed.max(1);
-    'waves: for wave in 0..config.waves {
-        if started.elapsed() >= config.duration
-            || config
-                .time
-                .duration
-                .is_some_and(|duration| clock.now() >= duration)
-        {
+    for wave in 0..config.waves {
+        if run.expired() {
             break;
         }
-        let Some(mut event) = next_event(&mut replay, &mut random, wave, &config.actions)? else {
+        let Some(event) = run.next_event(wave)? else {
             break;
         };
-        if config.time.duration.is_some() && config.replay.is_some() {
-            while clock.now().as_millis() < u128::from(event.time_millis) {
-                if started.elapsed() >= config.duration
-                    || config
-                        .time
-                        .duration
-                        .is_some_and(|duration| clock.now() >= duration)
-                {
-                    break 'waves;
-                }
-                tokio::time::sleep(config.time.tick).await;
-            }
+        if !run.pace(&event).await {
+            break;
         }
-        event.time_millis = millis(clock.now());
-        serde_json::to_writer(&mut schedule, &event).map_err(|error| error.to_string())?;
-        writeln!(schedule).map_err(|error| error.to_string())?;
-        schedule.flush().map_err(|error| error.to_string())?;
-        if recent.len() == 128 {
-            recent.pop_front();
+        let event = run.record(event)?;
+        if let Some(error) = run.boundary(event).await {
+            return run.fail(error).await;
         }
-        recent.push_back(event);
-        let verified = client.as_ref().unwrap().verified_progress();
-        let operation = boundary(&mut cluster, &mut client, &mut reader, event, &mut report);
-        let error = watchdog::run(config.progress_timeout, event, verified, operation).await;
-        if let Some(error) = error {
-            report.time_millis = millis(clock.now());
-            report.elapsed_millis = millis(started.elapsed());
-            report.physical_events = cluster.physical_events();
-            save_failure(config, &cluster, client.as_ref(), &recent, &report, &error).await?;
-            drop(reader.take());
-            drop(client.take());
-            stop_after_failure(cluster).await;
-            return Err(error);
-        }
-        report.waves += 1;
-        if started.elapsed() >= next_report {
-            report.print_progress(config, started.elapsed());
-            next_report = started.elapsed() + Duration::from_secs(60);
+        run.report.waves += 1;
+        if run.started.elapsed() >= next_report {
+            run.report.print_progress(config, run.started.elapsed());
+            next_report = run.started.elapsed() + Duration::from_secs(60);
         }
         tokio::time::sleep(config.interval).await;
     }
-    reader
-        .take()
-        .unwrap()
-        .close()
-        .await
-        .map_err(|error| error.to_string())?;
-    client.take().unwrap().close().await;
-    report.physical_events = cluster.physical_events();
-    cluster.shutdown().await;
-    report.complete = true;
-    report.time_millis = millis(clock.now());
-    report.elapsed_millis = millis(started.elapsed());
-    serde_json::to_writer_pretty(
-        BufWriter::new(create(&config.artifacts.join("report.json"))?),
-        &report,
-    )
-    .map_err(|error| error.to_string())?;
-    Ok(report)
+    run.finish().await
 }
 
-fn next_event(
-    replay: &mut Option<std::io::Lines<BufReader<File>>>,
-    random: &mut u64,
-    wave: usize,
-    actions: &[Action],
-) -> Result<Option<Event>, String> {
-    let event = if let Some(replay) = replay {
-        let Some(line) = replay.next() else {
-            return Ok(None);
-        };
-        serde_json::from_str(&line.map_err(|error| error.to_string())?)
-            .map_err(|error| error.to_string())?
-    } else {
-        let action = actions[(draw(random) as usize) % actions.len()];
-        Event {
-            wave,
-            pattern: (draw(random) as usize) % 6,
-            action,
-            time_millis: 0,
-        }
-    };
-    if event.wave != wave || event.pattern >= 6 {
-        return Err("replay must contain consecutive waves and workload patterns 0..5".into());
+/// One sustained run: the cluster and the SDK client and reader under test,
+/// the schedule being recorded or replayed, and the evidence so far.
+struct Run<'a> {
+    config: &'a Config,
+    clock: &'a SdkClock,
+    started: Instant,
+    schedule: BufWriter<File>,
+    replay: Option<std::io::Lines<BufReader<File>>>,
+    random: u64,
+    cluster: Cluster,
+    client: Option<Client>,
+    reader: Option<TopicReader>,
+    report: Report,
+    recent: VecDeque<Event>,
+}
+
+impl<'a> Run<'a> {
+    async fn open(config: &'a Config, clock: &'a SdkClock) -> Result<Self, String> {
+        let started = Instant::now();
+        std::fs::create_dir_all(&config.artifacts).map_err(|error| error.to_string())?;
+        save_config(config)?;
+        let schedule = BufWriter::new(create(&config.artifacts.join("schedule.jsonl"))?);
+        let replay = config
+            .replay
+            .as_ref()
+            .map(|path| File::open(path).map(|file| BufReader::new(file).lines()))
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        let cluster = Cluster::configured(
+            config.policy,
+            config.time.duration.map(|_| clock.clone()),
+            |deployment| config.resources.configure(deployment),
+        )
+        .await;
+        let client =
+            Client::open_with_clock(&cluster.configs[0].0, &cluster.runtime, clock.clone()).await;
+        let reader = client.reader(true).await;
+        Ok(Self {
+            config,
+            clock,
+            started,
+            schedule,
+            replay,
+            random: config.seed.max(1),
+            cluster,
+            client: Some(client),
+            reader: Some(reader),
+            report: Report::default(),
+            recent: VecDeque::with_capacity(128),
+        })
     }
-    Ok(Some(event))
+
+    /// Whether the wall-clock duration or the protocol-time budget is spent.
+    fn expired(&self) -> bool {
+        self.started.elapsed() >= self.config.duration
+            || self
+                .config
+                .time
+                .duration
+                .is_some_and(|duration| self.clock.now() >= duration)
+    }
+
+    /// The next replayed event, or a generated one from the seeded mix.
+    fn next_event(&mut self, wave: usize) -> Result<Option<Event>, String> {
+        let event = if let Some(replay) = &mut self.replay {
+            let Some(line) = replay.next() else {
+                return Ok(None);
+            };
+            serde_json::from_str(&line.map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?
+        } else {
+            let actions = &self.config.actions;
+            let action = actions[(draw(&mut self.random) as usize) % actions.len()];
+            Event {
+                wave,
+                pattern: (draw(&mut self.random) as usize) % 6,
+                action,
+                time_millis: 0,
+            }
+        };
+        if event.wave != wave || event.pattern >= 6 {
+            return Err("replay must contain consecutive waves and workload patterns 0..5".into());
+        }
+        Ok(Some(event))
+    }
+
+    /// Under manual protocol time, wait for a replayed event's recorded time.
+    /// False when the run expires first.
+    async fn pace(&self, event: &Event) -> bool {
+        if self.config.time.duration.is_none() || self.config.replay.is_none() {
+            return true;
+        }
+        while self.clock.now().as_millis() < u128::from(event.time_millis) {
+            if self.expired() {
+                return false;
+            }
+            tokio::time::sleep(self.config.time.tick).await;
+        }
+        true
+    }
+
+    /// Stamp the event with protocol time, append it to the schedule
+    /// artifact, and keep it in the bounded recent window.
+    fn record(&mut self, mut event: Event) -> Result<Event, String> {
+        event.time_millis = millis(self.clock.now());
+        serde_json::to_writer(&mut self.schedule, &event).map_err(|error| error.to_string())?;
+        writeln!(self.schedule).map_err(|error| error.to_string())?;
+        self.schedule.flush().map_err(|error| error.to_string())?;
+        if self.recent.len() == 128 {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(event);
+        Ok(event)
+    }
+
+    /// Run one boundary under the progress watchdog; returns its failure.
+    async fn boundary(&mut self, event: Event) -> Option<String> {
+        let verified = self.client.as_ref().unwrap().verified_progress();
+        let operation = boundary(
+            &mut self.cluster,
+            &mut self.client,
+            &mut self.reader,
+            event,
+            &mut self.report,
+        );
+        watchdog::run(self.config.progress_timeout, event, verified, operation).await
+    }
+
+    /// Save the failure evidence, then stop every owner without waiting long.
+    async fn fail(mut self, error: String) -> Result<Report, String> {
+        self.report.stamp(self.clock, self.started);
+        self.report.physical_events = self.cluster.physical_events();
+        self.save_failure(&error).await?;
+        drop(self.reader.take());
+        drop(self.client.take());
+        stop_after_failure(self.cluster).await;
+        Err(error)
+    }
+
+    /// Close the SDK and the cluster cleanly, then save the final report.
+    async fn finish(mut self) -> Result<Report, String> {
+        self.reader
+            .take()
+            .unwrap()
+            .close()
+            .await
+            .map_err(|error| error.to_string())?;
+        self.client.take().unwrap().close().await;
+        self.report.physical_events = self.cluster.physical_events();
+        self.cluster.shutdown().await;
+        self.report.complete = true;
+        self.report.stamp(self.clock, self.started);
+        serde_json::to_writer_pretty(
+            BufWriter::new(create(&self.config.artifacts.join("report.json"))?),
+            &self.report,
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(self.report)
+    }
+
+    /// Bounded record, fault, configuration and physical evidence, plus each
+    /// reachable device image.
+    async fn save_failure(&self, error: &str) -> Result<(), String> {
+        let config = self.config;
+        let cluster = &self.cluster;
+        let evidence = serde_json::json!({
+            "seed": config.seed, "mode": format!("{:?}", config.policy),
+            "error": error, "events": self.recent, "coverage": self.report,
+            "time": config.time, "resources": config.resources, "fault_mix": config.actions,
+            "record_evidence": self.client.as_ref().map(Client::evidence),
+            "configuration": cluster.configs.iter().map(|(checked, _)| format!("{checked:?}")).collect::<Vec<_>>(),
+            "physical": cluster.storage_controls().iter().map(|(index, control)|
+                serde_json::json!({"broker":index,"events":format!("{:?}", control.recent_trace())})).collect::<Vec<_>>(),
+        });
+        serde_json::to_writer_pretty(
+            BufWriter::new(create(&config.artifacts.join("failure.json"))?),
+            &evidence,
+        )
+        .map_err(|error| error.to_string())?;
+        for (index, control) in cluster.storage_controls() {
+            if let Ok(image) = tokio::time::timeout(Duration::from_secs(2), control.image()).await {
+                serde_json::to_writer(
+                    BufWriter::new(create(
+                        &config.artifacts.join(format!("image-{index}.json")),
+                    )?),
+                    &image,
+                )
+                .map_err(|error| error.to_string())?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn millis(duration: Duration) -> u64 {
@@ -355,10 +458,31 @@ pub fn default_actions() -> Vec<Action> {
     ]
 }
 
+/// Apply the event's churn action, then run the wave's workload.
 async fn boundary(
     cluster: &mut Cluster,
     client: &mut Option<Client>,
-    reader: &mut Option<ozzy_runtime::replicated::TopicReader>,
+    reader: &mut Option<TopicReader>,
+    event: Event,
+    report: &mut Report,
+) {
+    churn(cluster, client, reader, event, report).await;
+    workload(
+        cluster,
+        client.as_mut().unwrap(),
+        reader.as_mut().unwrap(),
+        event,
+        report,
+    )
+    .await;
+}
+
+/// Reopen SDK owners or restart brokers as the action asks; traffic and
+/// fault-injection actions change nothing here.
+async fn churn(
+    cluster: &mut Cluster,
+    client: &mut Option<Client>,
+    reader: &mut Option<TopicReader>,
     event: Event,
     report: &mut Report,
 ) {
@@ -415,20 +539,12 @@ async fn boundary(
         | Action::TornWrite
         | Action::FailWrite => {}
     }
-    workload(
-        cluster,
-        client.as_mut().unwrap(),
-        reader.as_mut().unwrap(),
-        event,
-        report,
-    )
-    .await;
 }
 
 async fn workload(
     cluster: &mut Cluster,
     client: &mut Client,
-    reader: &mut ozzy_runtime::replicated::TopicReader,
+    reader: &mut TopicReader,
     event: Event,
     report: &mut Report,
 ) {
@@ -530,40 +646,4 @@ fn delayed_completions(
 
 fn create(path: &Path) -> Result<File, String> {
     File::create(path).map_err(|error| error.to_string())
-}
-
-async fn save_failure(
-    config: &Config,
-    cluster: &Cluster,
-    client: Option<&Client>,
-    recent: &VecDeque<Event>,
-    report: &Report,
-    error: &str,
-) -> Result<(), String> {
-    let evidence = serde_json::json!({
-        "seed": config.seed, "mode": format!("{:?}", config.policy),
-        "error": error, "events": recent, "coverage": report,
-        "time": config.time, "resources": config.resources, "fault_mix": config.actions,
-        "record_evidence": client.map(Client::evidence),
-        "configuration": cluster.configs.iter().map(|(checked, _)| format!("{checked:?}")).collect::<Vec<_>>(),
-        "physical": cluster.storage_controls().iter().map(|(index, control)|
-            serde_json::json!({"broker":index,"events":format!("{:?}", control.recent_trace())})).collect::<Vec<_>>(),
-    });
-    serde_json::to_writer_pretty(
-        BufWriter::new(create(&config.artifacts.join("failure.json"))?),
-        &evidence,
-    )
-    .map_err(|error| error.to_string())?;
-    for (index, control) in cluster.storage_controls() {
-        if let Ok(image) = tokio::time::timeout(Duration::from_secs(2), control.image()).await {
-            serde_json::to_writer(
-                BufWriter::new(create(
-                    &config.artifacts.join(format!("image-{index}.json")),
-                )?),
-                &image,
-            )
-            .map_err(|error| error.to_string())?;
-        }
-    }
-    Ok(())
 }

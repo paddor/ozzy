@@ -1,6 +1,6 @@
 use super::{
-    AppendKey, Authority, CodecError, Cursor, DataLimits, ENVELOPE_BYTES, Envelope, MessageId,
-    Opcode, Packet, PartitionIncarnation, Policy, add, capacity, command, count, decode_common,
+    AppendKey, Authority, CodecError, DataLimits, ENVELOPE_BYTES, Envelope, MessageId, Opcode,
+    Packet, PartitionIncarnation, Policy, Reader, add, capacity, command, count, decode_common,
     encode_common, identities, record_count,
 };
 
@@ -142,13 +142,13 @@ pub fn decode_appended(
     if !packet.payload.is_empty() {
         return Err(CodecError::Length);
     }
-    let mut cursor = Cursor(packet.metadata);
+    let mut cursor = Reader::new(packet.metadata);
     let (authority, partition, owner_epoch, key) = decode_common(&mut cursor)?;
     let first_offset = cursor.u64()?;
     let records = cursor.u32()? as usize;
     record_count(records, key.first_sequence, limits)?;
     record_count(records, first_offset, limits)?;
-    let policy = Policy::try_from(cursor.byte()?)?;
+    let policy = Policy::try_from(cursor.u8()?)?;
     let through = OpPosition {
         op: cursor.u64()?,
         digest: cursor.array()?,
@@ -158,7 +158,7 @@ pub fn decode_appended(
         return Err(CodecError::Length);
     }
     let ids = cursor.take(records.checked_mul(16).ok_or(CodecError::Length)?)?;
-    if !cursor.0.is_empty() {
+    if !cursor.rest().is_empty() {
         return Err(CodecError::Length);
     }
     Ok(DecodedAppended {

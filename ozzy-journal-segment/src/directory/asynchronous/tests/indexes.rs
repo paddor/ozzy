@@ -1,8 +1,8 @@
 use super::*;
 mod cooperation;
 use crate::{
-    IndexBuildError, IndexBuildLimits, IndexLimits, IndexSource, SegmentIndex, build_segment_index,
-    scan_segment, segment_index_name,
+    IndexBuildError, IndexBuildLimits, IndexLimits, IndexSource, SegmentIndex, scan_segment,
+    segment_index_name,
 };
 use ozzy_journal::operation::{
     Append, AppendBatch, AppendRecord, OperationBody, encode_operation_body,
@@ -106,7 +106,7 @@ fn check_index(index: &SegmentIndex) {
 }
 
 #[tokio::test]
-async fn async_multi_pass_index_is_byte_identical_to_existing_builder() {
+async fn async_multi_pass_index_is_byte_identical_to_one_pass_encoding() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("group");
     let (pool, mut clients) = ozzy_io_pool::Pool::new(ozzy_io_pool::Config {
@@ -161,10 +161,6 @@ async fn async_multi_pass_index_is_byte_identical_to_existing_builder() {
     let image = journal.segment_image(reference).await.unwrap();
     drop(journal);
     pool.shutdown().await;
-    let indexes = root.path().join("legacy-indexes");
-    let staging = root.path().join("legacy-staging");
-    std::fs::create_dir(&indexes).unwrap();
-    std::fs::create_dir(&staging).unwrap();
     let scan = scan_segment(
         &image,
         reference.first_group_number,
@@ -172,16 +168,32 @@ async fn async_multi_pass_index_is_byte_identical_to_existing_builder() {
         limits().decode,
     )
     .unwrap();
-    let legacy = build_segment_index(
-        &scan,
+    // Entries derived per operation, sorted and encoded in one pass, are the oracle.
+    let (mut offsets, mut messages, mut operations, mut locations) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for operation in scan.groups.iter().flat_map(|group| &group.operations) {
+        let derived =
+            crate::derive_index_entries(&scan.header, operation, limits().operations).unwrap();
+        offsets.extend(derived.offsets);
+        messages.extend(derived.messages);
+        operations.extend(derived.operation);
+        locations.push(derived.location);
+    }
+    let expected = crate::SegmentIndexImage::new(
         source,
-        indexes,
-        staging,
-        limits().operations,
-        build_limits(),
+        build_limits().max_entry_buffer_bytes as u64,
+        crate::IndexEntries {
+            offsets,
+            messages,
+            operations,
+            locations,
+        },
     )
     .unwrap();
-    assert_eq!(index.as_bytes(), legacy.as_bytes());
+    assert_eq!(
+        index.as_bytes(),
+        crate::encode_segment_index(&expected, build_limits().file).unwrap()
+    );
 }
 
 async fn check_snapshot(journal: &Journal) {
@@ -233,7 +245,7 @@ async fn retire_first_segment(journal: &mut Journal) {
     journal
         .retire_sealed_prefix(
             &floors,
-            crate::AsyncRetirementBudget {
+            crate::RetirementBudget {
                 max_segments: 1,
                 max_read_bytes: 32768,
             },

@@ -286,7 +286,7 @@ fn replaced_sessions_stop_waking_quiet_partition_actors() {
             shards.push(
                 PartitionActors::new(vec![PartitionActor::Replicated(actor)], 1, 1)
                     .unwrap()
-                    .with_timer_interval(Duration::from_millis(10))
+                    .with_safety_sweep(Duration::from_millis(10))
                     .unwrap(),
             );
         }
@@ -347,7 +347,7 @@ fn woken_partitions_progress_and_quiet_partitions_wait_for_their_timer_visit() {
     let mut shards = assigned.map(|actors| {
         PartitionActors::new(actors, 3, 3)
             .unwrap()
-            .with_timer_interval(interval)
+            .with_safety_sweep(interval)
             .unwrap()
     });
     let mut routes = StepRoutes::default();
@@ -405,6 +405,61 @@ fn woken_partitions_progress_and_quiet_partitions_wait_for_their_timer_visit() {
     for (shard, quiet) in shards.iter().zip(&quiet) {
         assert_eq!(shard.turns() - quiet, 3);
     }
+    for shard in shards {
+        close_set(&mut controller, shard);
+    }
+}
+
+#[test]
+fn quiet_partitions_are_visited_at_their_own_timers_between_sweeps() {
+    let (mut controller, io) = setup();
+    let (actors, pending) = cluster(&mut controller, &io, 0, QuorumPolicy::Durable);
+    let mut reply = Box::pin(pending);
+    let sweep = Duration::from_secs(1);
+    let mut shards: Vec<_> = actors
+        .into_iter()
+        .map(|actor| {
+            PartitionActors::new(vec![PartitionActor::Replicated(actor)], 1, 1)
+                .unwrap()
+                .with_safety_sweep(sweep)
+                .unwrap()
+        })
+        .collect();
+    let mut routes = StepRoutes::default();
+    let mut now = Duration::ZERO;
+    let mut committed = false;
+    for millis in 0..4000 {
+        now = Duration::from_millis(millis);
+        budgeted_step(&mut shards, &mut routes, now, usize::MAX);
+        settle(&mut controller, &[]);
+        if poll(reply.as_mut()).is_ready() {
+            committed = true;
+            break;
+        }
+    }
+    assert!(committed, "the group never confirmed its proposal");
+    for _ in 0..100 {
+        budgeted_step(&mut shards, &mut routes, now, usize::MAX);
+        settle(&mut controller, &[]);
+    }
+    // A quiet group still keeps protocol timers, due well before the sweep.
+    let deadline = shards
+        .iter()
+        .filter_map(PartitionActors::next_deadline)
+        .min()
+        .unwrap();
+    assert!(deadline > now && deadline < now + sweep, "{deadline:?}");
+    let turns = |shards: &[PartitionActors]| shards.iter().map(PartitionActors::turns).sum::<u64>();
+    let quiet = turns(&shards);
+    budgeted_step(
+        &mut shards,
+        &mut routes,
+        deadline.saturating_sub(Duration::from_micros(1)),
+        usize::MAX,
+    );
+    assert_eq!(turns(&shards), quiet, "visited before any timer was due");
+    budgeted_step(&mut shards, &mut routes, deadline, usize::MAX);
+    assert!(turns(&shards) > quiet, "the due timer was not visited");
     for shard in shards {
         close_set(&mut controller, shard);
     }

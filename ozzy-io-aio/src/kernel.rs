@@ -173,26 +173,27 @@ impl<T, F: AsFd> AioContext<T, F> {
         let Some(slot) = self.slots.iter().position(Option::is_none) else {
             return Err((job, buffer, io::ErrorKind::WouldBlock.into()));
         };
-        let bytes = buffer.as_slice();
+        let request = Request { buffer, file, job };
+        let bytes = request.buffer.as_slice();
         // SAFETY: all-zero is a valid iocb; the fields set below complete it.
         let mut iocb: libc::iocb = unsafe { std::mem::zeroed() };
         iocb.aio_data = slot as u64;
         iocb.aio_lio_opcode = IOCB_CMD_PWRITE;
-        iocb.aio_fildes = file.as_fd().as_raw_fd() as u32;
+        iocb.aio_fildes = request.file.as_fd().as_raw_fd() as u32;
         iocb.aio_buf = bytes.as_ptr() as u64;
         iocb.aio_nbytes = bytes.len() as u64;
         iocb.aio_offset = offset;
         iocb.aio_flags = IOCB_FLAG_RESFD;
         iocb.aio_resfd = self.event.as_raw_fd() as u32;
-        // The slot owns the buffer from here on. Moving `AlignedBuf` moves only
-        // its `Vec` header, so the heap bytes the kernel reads stay in place.
-        self.slots[slot] = Some(Request { buffer, file, job });
         let mut list = [std::ptr::from_mut(&mut iocb)];
         // SAFETY: the iocb is read during the call. Its buffer and descriptor
-        // stay alive in `slots` until io_getevents or io_destroy reports it.
+        // stay alive in `request`, then in `slots` until io_getevents or
+        // io_destroy reports it. Moving `AlignedBuf` moves only its `Vec`
+        // header, so the heap bytes the kernel reads stay in place.
         let result =
             unsafe { libc::syscall(libc::SYS_io_submit, self.context, 1_i64, list.as_mut_ptr()) };
         if result == 1 {
+            self.slots[slot] = Some(request);
             self.in_flight += 1;
             return Ok(());
         }
@@ -206,7 +207,6 @@ impl<T, F: AsFd> AioContext<T, F> {
         } else {
             io::Error::other("io_submit accepted no request")
         };
-        let request = self.slots[slot].take().expect("slot filled above");
         drop(request.file);
         Err((request.job, request.buffer, error))
     }

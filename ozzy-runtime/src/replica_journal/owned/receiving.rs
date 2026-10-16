@@ -5,14 +5,11 @@ mod checkpoint;
 mod transfer;
 
 use super::{
-    AppendBuffer, AsyncGroupJournal, AsyncJournalFormat, CommitMode, Digest, JournalError,
-    JournalGeneration, JournalStartup, Local, OwnedConfig, OwnedJournal, QuorumPolicy,
-    SegmentHeader, SubmitError, authority,
+    AppendBuffer, GroupJournal, JournalError, JournalGeneration, JournalStartup, Local,
+    OwnedConfig, OwnedJournal, QuorumPolicy, SubmitError,
 };
 use crate::replica_journal::{PublishedRecovery, RecoveryStartup, receiving::RecoveryPlan};
-use ozzy_journal_segment::{
-    AsyncRecoveryDirectory, AsyncSealedRepair, AsyncSuffixInstaller, SuffixStreamLimits,
-};
+use ozzy_journal_segment::{RecoveryDirectory, SealedRepair, SuffixInstaller, SuffixStreamLimits};
 use ozzy_replication::recovery::{Recovery, RecoveryError, RecoveryTicket};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -44,10 +41,10 @@ pub struct RecoveryGenerations {
 
 #[derive(Debug)]
 enum State {
-    Journal(Box<AsyncGroupJournal>),
-    Directory(Box<AsyncRecoveryDirectory>),
-    Repair(Box<AsyncSealedRepair>),
-    Installing(Box<(AsyncSuffixInstaller, SuffixStreamLimits)>),
+    Journal(Box<GroupJournal>),
+    Directory(Box<RecoveryDirectory>),
+    Repair(Box<SealedRepair>),
+    Installing(Box<(SuffixInstaller, SuffixStreamLimits)>),
     Fenced,
 }
 
@@ -96,80 +93,13 @@ impl RecoveringJournal {
         if generations.temporary.0 == 0 || generations.attempt == generations.temporary {
             return Err(JournalError::Configuration);
         }
-        let configuration = config.configuration.configuration();
-        let bytes = config.configuration.encode();
         let state = if let RecoveryOpen::FormatNew { segment_capacity } = mode {
-            if segment_capacity > config.limits.io.max_segment_bytes {
-                return Err(JournalError::Configuration);
-            }
-            let first_segment = SegmentHeader::new(
-                config.identity.group_id,
-                1,
-                None,
-                Digest::ZERO,
-                segment_capacity,
-            )
-            .map_err(ozzy_journal_segment::DirectoryError::from)?;
-            let journal = AsyncGroupJournal::format_recovering(
-                config.root.clone(),
-                io.clone(),
-                AsyncJournalFormat {
-                    identity: config.identity,
-                    configuration_epoch: configuration.scope().configuration_epoch,
-                    commit_mode: CommitMode::External,
-                    first_segment,
-                    configuration: bytes.to_vec(),
-                },
-                generations.temporary,
-                config.limits,
-            )
-            .await?;
-            State::Journal(Box::new(journal))
+            Self::format(&config, &io, generations.temporary, segment_capacity).await?
         } else {
-            let mut directory = if mode == RecoveryOpen::Quarantine {
-                let directory = AsyncRecoveryDirectory::open_for_repair(
-                    config.root.clone(),
-                    io.clone(),
-                    config.identity,
-                    &bytes,
-                    config.limits,
-                )
-                .await?;
-                Self::validate_directory(&config, &directory)?;
-                directory.quarantine_for_recovery(&bytes).await?
-            } else {
-                AsyncRecoveryDirectory::open_recovering(
-                    config.root.clone(),
-                    io.clone(),
-                    config.identity,
-                    &bytes,
-                    config.limits,
-                )
-                .await?
-            };
-            Self::validate_directory(&config, &directory)?;
-            let repair = mode != RecoveryOpen::ResumeFull
-                && configuration.policy() == QuorumPolicy::Durable
-                && directory
-                    .sealed_damage(config.limits.io.max_segment_bytes)
-                    .await?
-                    .is_some_and(|ranges| !ranges.is_empty());
-            if repair {
-                State::Directory(Box::new(directory))
-            } else {
-                State::Journal(Box::new(
-                    directory
-                        .recover_nonvoting(
-                            &bytes,
-                            generations.temporary,
-                            config.limits.directory_entries,
-                        )
-                        .await?,
-                ))
-            }
+            Box::pin(Self::reopen(&config, &io, generations.temporary, mode)).await?
         };
         let startup = RecoveryStartup {
-            configuration,
+            configuration: config.configuration.configuration(),
             local: config.identity.replica_node_id,
             generation: generations.attempt,
         };
@@ -192,19 +122,68 @@ impl RecoveringJournal {
         ))
     }
 
-    fn validate_directory(
+    /// Create an absent store with one nonvoting segment of `segment_capacity`.
+    async fn format(
         config: &OwnedConfig,
-        directory: &AsyncRecoveryDirectory,
-    ) -> Result<(), JournalError> {
-        authority::validate_manifest(
-            directory.manifest(),
-            config
-                .configuration
-                .configuration()
-                .scope()
-                .configuration_epoch,
-            config.limits.io.max_segment_bytes,
+        io: &Local,
+        temporary: JournalGeneration,
+        segment_capacity: u64,
+    ) -> Result<State, JournalError> {
+        if segment_capacity > config.limits.io.max_segment_bytes {
+            return Err(JournalError::Configuration);
+        }
+        let journal = GroupJournal::format_recovering(
+            config.root.clone(),
+            io.clone(),
+            config.journal_format(segment_capacity)?,
+            temporary,
+            config.limits,
         )
+        .await?;
+        Ok(State::Journal(Box::new(journal)))
+    }
+
+    /// Open an existing store as nonvoting, quarantining it first if asked.
+    /// A durable store with sealed damage prefers bounded repair over transfer.
+    async fn reopen(
+        config: &OwnedConfig,
+        io: &Local,
+        temporary: JournalGeneration,
+        mode: RecoveryOpen,
+    ) -> Result<State, JournalError> {
+        let bytes = config.configuration.encode();
+        let mut directory = if mode == RecoveryOpen::Quarantine {
+            let directory = RecoveryDirectory::open_for_repair(
+                config.root.clone(),
+                io.clone(),
+                config.identity,
+                &bytes,
+                config.limits,
+            )
+            .await?;
+            config.validate_manifest(directory.manifest())?;
+            directory.quarantine_for_recovery(&bytes).await?
+        } else {
+            RecoveryDirectory::open_recovering(
+                config.root.clone(),
+                io.clone(),
+                config.identity,
+                &bytes,
+                config.limits,
+            )
+            .await?
+        };
+        config.validate_manifest(directory.manifest())?;
+        let repair = mode != RecoveryOpen::ResumeFull
+            && config.configuration.configuration().policy() == QuorumPolicy::Durable
+            && directory
+                .sealed_damage(config.limits.io.max_segment_bytes)
+                .await?
+                .is_some_and(|ranges| !ranges.is_empty());
+        if repair {
+            return Ok(State::Directory(Box::new(directory)));
+        }
+        recover_nonvoting(directory, config, temporary).await
     }
 
     /// True after an interrupted or failed state-changing operation.
@@ -358,6 +337,22 @@ impl RecoveringJournal {
             Ok(())
         })
     }
+}
+
+/// Recover an existing store's journal under the temporary nonvoting writer.
+async fn recover_nonvoting(
+    directory: RecoveryDirectory,
+    config: &OwnedConfig,
+    temporary: JournalGeneration,
+) -> Result<State, JournalError> {
+    let journal = directory
+        .recover_nonvoting(
+            &config.configuration.encode(),
+            temporary,
+            config.limits.directory_entries,
+        )
+        .await?;
+    Ok(State::Journal(Box::new(journal)))
 }
 
 impl OwnedJournal {

@@ -2,12 +2,12 @@
 //! is scanned, overwritten or made eligible to vote by opening this directory.
 
 use super::{Candidate, Format, Journal, Limits};
-use crate::directory::{DATA_DIRECTORIES, recovery::recovery_marker, segment_name};
+use crate::directory::{CONFIGURATION_FILE, recovery::recovery_marker, segment_name};
 use crate::{
-    AsyncSegmentStart, AsyncSegmentWriter, CanonicalRecoveryLimits, ChainPosition, CommitMode,
-    CurrentReference, Digest, DirectoryError, GroupIdentity, LogPosition, Manifest,
-    RecoveryPublication, RecoveryPublicationError, SegmentHeader, SegmentReference, WriterError,
-    async_files::Access, async_metadata,
+    CanonicalRecoveryLimits, ChainPosition, CommitMode, CurrentReference, Digest, DirectoryError,
+    GroupIdentity, LogPosition, Manifest, RecoveryPublication, RecoveryPublicationError,
+    SegmentHeader, SegmentReference, SegmentStart, SegmentWriter, WriterError, async_files::Access,
+    async_metadata,
 };
 use ozzy_io::{Local, Operation};
 use ozzy_journal::progress::JournalGeneration;
@@ -93,10 +93,7 @@ impl RecoveryDirectory {
             return Err(DirectoryError::ConfigurationMismatch);
         }
         let access = directory.access();
-        for name in DATA_DIRECTORIES {
-            let handle = access.open_directory(root.join(name)).await?;
-            access.done(Operation::Close { handle }).await?;
-        }
+        super::opening::open_data_directories(&access, &root).await?;
         super::opening::selected_checkpoint(&access, &root, &selected.manifest, limits).await?;
         Ok(Self {
             directory,
@@ -120,25 +117,21 @@ impl RecoveryDirectory {
         self.require_selected(configuration).await?;
         let marker = recovery_marker(configuration)?;
         self.directory
-            .replace("CONFIGURATION", ".CONFIGURATION.quarantine.tmp", &marker)
+            .replace(CONFIGURATION_FILE, ".CONFIGURATION.quarantine.tmp", &marker)
             .await?;
         self.configuration = marker.to_vec();
         Ok(self)
     }
 
     async fn require_selected(&mut self, configuration: &[u8]) -> Result<(), DirectoryError> {
-        let selected = self
-            .directory
-            .read_selected(
-                self.manifest.identity,
-                self.limits.metadata,
-                Some(configuration),
-            )
-            .await?;
-        if selected.current != self.current || selected.manifest != self.manifest {
-            return Err(DirectoryError::CurrentMismatch);
-        }
-        Ok(())
+        super::metadata::require_current(
+            &mut self.directory,
+            self.current,
+            &self.manifest,
+            Some(configuration),
+            self.limits.metadata,
+        )
+        .await
     }
 
     /// Create a fresh private generation without reading damaged segment bytes.
@@ -155,6 +148,50 @@ impl RecoveryDirectory {
             return Err(DirectoryError::ConfigurationMismatch);
         }
         self.require_selected(&marker).await?;
+        let (segment, writer) = self
+            .create_fresh_segment(generation, max_orphan_probes)
+            .await?;
+        self.access
+            .sync_directory(self.root().join("segments"))
+            .await?;
+        let mut next = super::metadata::successor(&self.manifest)?;
+        next.accepted = LogPosition::GENESIS;
+        next.committed = LogPosition::GENESIS;
+        next.checkpoint = None;
+        next.segments = vec![segment];
+        let (manifest, current) = super::metadata::publish_selected(
+            &mut self.directory,
+            &self.manifest,
+            next,
+            self.limits.metadata,
+        )
+        .await?;
+        let evidence = Some(self.directory.restore_evidence(&manifest).await?);
+        Ok(Journal {
+            directory: self.directory,
+            access: self.access,
+            manifest,
+            current,
+            configuration: Some(self.configuration),
+            writer,
+            evidence,
+            checkpoint: None,
+            limits: self.limits,
+            interrupted: false,
+            cleaning: std::rc::Rc::default(),
+            pins: std::rc::Rc::default(),
+            validated_indexes: std::collections::BTreeMap::new(),
+            active_prefix: None,
+        })
+    }
+
+    /// Create the genesis segment of a fresh generation at the first free id
+    /// after the selected history, with the active segment's capacity.
+    async fn create_fresh_segment(
+        &self,
+        generation: JournalGeneration,
+        max_orphan_probes: usize,
+    ) -> Result<(SegmentReference, SegmentWriter), DirectoryError> {
         let previous = self
             .manifest
             .segments
@@ -173,12 +210,11 @@ impl RecoveryDirectory {
                 Digest::ZERO,
                 capacity,
             )?;
-            let writer = AsyncSegmentWriter::create(
-                self.root().join(segment_name(segment_id)),
-                self.access.io.clone(),
-                self.access.protection.clone(),
+            let writer = SegmentWriter::create(
+                self.access
+                    .segment_file(self.root().join(segment_name(segment_id))),
                 header,
-                AsyncSegmentStart {
+                SegmentStart {
                     generation,
                     first_group_number: 1,
                     initial_chain: ChainPosition::GENESIS,
@@ -186,60 +222,21 @@ impl RecoveryDirectory {
                 self.limits.io,
             )
             .await;
-            let writer = match writer {
-                Ok(writer) => writer,
-                Err(WriterError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    continue;
+            match writer {
+                Ok(writer) => {
+                    let reference = SegmentReference {
+                        segment_id,
+                        file_generation: 0,
+                        first_group_number: 1,
+                        first_chain: ChainPosition::GENESIS,
+                        capacity,
+                        sealed: None,
+                    };
+                    return Ok((reference, writer));
                 }
+                Err(WriterError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error.into()),
-            };
-            self.access
-                .sync_directory(self.root().join("segments"))
-                .await?;
-            let mut next = self.manifest.clone();
-            next.generation = next
-                .generation
-                .checked_add(1)
-                .ok_or(DirectoryError::ManifestGeneration)?;
-            next.parent_generation = self.manifest.generation;
-            next.accepted = LogPosition::GENESIS;
-            next.committed = LogPosition::GENESIS;
-            next.checkpoint = None;
-            next.segments = vec![SegmentReference {
-                segment_id,
-                file_generation: 0,
-                first_group_number: 1,
-                first_chain: ChainPosition::GENESIS,
-                capacity,
-                sealed: None,
-            }];
-            let (manifest, manifest_digest) = self
-                .directory
-                .publish_manifest(&self.manifest, next, self.limits.metadata)
-                .await?;
-            let current = CurrentReference {
-                group_id: manifest.identity.group_id,
-                store_id: manifest.identity.store_id,
-                generation: manifest.generation,
-                manifest_digest,
-            };
-            self.directory.select_current(current).await?;
-            let evidence = Some(self.directory.restore_evidence(&manifest).await?);
-            return Ok(Journal {
-                directory: self.directory,
-                access: self.access,
-                manifest,
-                current,
-                configuration: Some(self.configuration),
-                writer,
-                evidence,
-                checkpoint: None,
-                limits: self.limits,
-                interrupted: false,
-                pins: std::sync::Arc::default(),
-                validated_indexes: std::collections::BTreeMap::new(),
-                active_prefix: None,
-            });
+            }
         }
         Err(DirectoryError::RollProbeLimit {
             limit: max_orphan_probes,
@@ -310,7 +307,7 @@ impl Journal {
         self.access
             .done(Operation::Rename {
                 source: self.root().join(&temporary),
-                destination: self.root().join("CONFIGURATION"),
+                destination: self.root().join(CONFIGURATION_FILE),
             })
             .await?;
         self.access

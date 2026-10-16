@@ -1,4 +1,5 @@
 use super::{Limits, Reservation};
+use crate::returning::{GiveBack, Returning};
 use crate::signal::StateSignal;
 use bytes::Bytes;
 use std::{
@@ -95,9 +96,8 @@ struct Block {
 /// Fixed-capacity mutable payload. Freezing transfers this allocation into
 /// shared bytes. Its last reference returns the allocation to the owner cache.
 pub struct Buffer {
-    block: Option<Block>,
+    block: Returning<Block, Arc<Return>>,
     length: usize,
-    owner: Arc<Return>,
 }
 
 impl fmt::Debug for Buffer {
@@ -267,6 +267,17 @@ impl Local {
     }
 
     fn try_lease(&mut self, length: usize, maximum: usize) -> io::Result<Buffer> {
+        let mut block = self.try_block(length, maximum)?;
+        block.bytes.resize(block.capacity, 0);
+        block.bytes[..length].fill(0);
+        Ok(Buffer {
+            block: Returning::new(block, self.shared.clone()),
+            length,
+        })
+    }
+
+    /// Smallest fitting cached block or a new one, with unspecified contents.
+    fn try_block(&mut self, length: usize, maximum: usize) -> io::Result<Block> {
         let local = self;
         if length == 0 || length > local.limits.bytes || length > maximum {
             return Err(io::ErrorKind::InvalidInput.into());
@@ -279,10 +290,10 @@ impl Local {
             .filter(|(_, block)| (length..=maximum).contains(&block.capacity))
             .min_by_key(|(_, block)| block.capacity)
             .map(|(index, _)| index);
-        let mut block = if let Some(index) = cached {
+        if let Some(index) = cached {
             let block = local.cache.swap_remove(index);
             local.cache_bytes -= block.capacity;
-            block
+            Ok(block)
         } else {
             // Cached smaller blocks may occupy the needed byte or count budget.
             // Eviction happens here on their allocation owner, never on a sender.
@@ -297,15 +308,8 @@ impl Local {
                 local.cache_bytes -= block.capacity;
                 drop(block);
             }
-            Block::new(local.shared.usage.clone(), length)?
-        };
-        block.bytes.resize(block.capacity, 0);
-        block.bytes[..length].fill(0);
-        Ok(Buffer {
-            block: Some(block),
-            length,
-            owner: local.shared.clone(),
-        })
+            Block::new(local.shared.usage.clone(), length)
+        }
     }
 
     fn collect(&mut self) {
@@ -337,9 +341,14 @@ impl Allocator {
             return Err(io::Error::other("journal allocation left its owner thread"));
         }
         let local = self.local.upgrade().ok_or(io::ErrorKind::BrokenPipe)?;
-        let mut buffer = local.borrow_mut().try_lease(capacity, self.maximum)?;
-        buffer.block.as_mut().expect("live buffer").bytes.clear();
-        Ok(Arena(buffer))
+        let mut local = local.borrow_mut();
+        // An arena is written by appending, so skip zeroing the leased bytes.
+        let mut block = local.try_block(capacity, self.maximum)?;
+        block.bytes.clear();
+        Ok(Arena(Buffer {
+            block: Returning::new(block, local.shared.clone()),
+            length: capacity,
+        }))
     }
 
     /// Wait on returned capacity without retaining the owner's mutable state.
@@ -370,7 +379,7 @@ pub(crate) struct Arena(Buffer);
 
 impl Arena {
     pub(crate) fn bytes_mut(&mut self) -> &mut Vec<u8> {
-        &mut self.0.block.as_mut().expect("live arena").bytes
+        &mut self.0.block.bytes
     }
 
     pub(crate) fn capacity(&self) -> usize {
@@ -378,8 +387,9 @@ impl Arena {
     }
 
     pub(crate) fn share(arena: &Arc<Self>) -> Bytes {
-        assert_eq!(
-            arena.0.block.as_ref().expect("live arena").bytes.capacity(),
+        // The block releases its charged capacity regardless; growth is a bug.
+        debug_assert_eq!(
+            arena.0.block.bytes.capacity(),
             arena.capacity(),
             "canonical encoder grew an uncharged allocation"
         );
@@ -397,14 +407,14 @@ impl AsRef<[u8]> for SharedArena {
 
 impl AsRef<[u8]> for Arena {
     fn as_ref(&self) -> &[u8] {
-        &self.0.block.as_ref().expect("live arena").bytes
+        &self.0.block.bytes
     }
 }
 
 impl Drop for Arena {
     fn drop(&mut self) {
-        assert_eq!(
-            self.0.block.as_ref().expect("live arena").bytes.capacity(),
+        debug_assert_eq!(
+            self.0.block.bytes.capacity(),
             self.capacity(),
             "canonical encoder grew an uncharged allocation"
         );
@@ -445,7 +455,7 @@ impl Drop for Block {
 impl Buffer {
     /// Allocation size charged even when only a shorter slice is published.
     pub fn capacity(&self) -> usize {
-        self.block.as_ref().expect("live buffer").capacity
+        self.block.capacity
     }
 
     /// Change visible size without growing the allocation. New bytes are zeroed.
@@ -454,7 +464,7 @@ impl Buffer {
             return Err(io::ErrorKind::InvalidInput.into());
         }
         if length > self.length {
-            self.block.as_mut().expect("live buffer").bytes[self.length..length].fill(0);
+            self.block.bytes[self.length..length].fill(0);
         }
         self.length = length;
         Ok(())
@@ -469,12 +479,12 @@ impl Buffer {
 impl Deref for Buffer {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
-        &self.block.as_ref().expect("live buffer").bytes[..self.length]
+        &self.block.bytes[..self.length]
     }
 }
 impl DerefMut for Buffer {
     fn deref_mut(&mut self) -> &mut [u8] {
-        &mut self.block.as_mut().expect("live buffer").bytes[..self.length]
+        &mut self.block.bytes[..self.length]
     }
 }
 impl AsRef<[u8]> for Buffer {
@@ -483,13 +493,11 @@ impl AsRef<[u8]> for Buffer {
     }
 }
 
-impl Drop for Buffer {
-    fn drop(&mut self) {
-        let block = self.block.take().expect("one buffer release");
-        let result = self.owner.sender.try_send(block);
+impl GiveBack<Block> for Arc<Return> {
+    fn give_back(&mut self, block: Block) {
         // Owner shutdown may have disconnected the receiver. In that case the
         // final observer reclaims bytes, with no unbounded detached return list.
-        drop(result);
-        self.owner.usage.changed.notify_changed();
+        drop(self.sender.try_send(block));
+        self.usage.changed.notify_changed();
     }
 }

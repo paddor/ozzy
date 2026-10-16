@@ -1,6 +1,7 @@
 use super::*;
 use crate::frontend::{
-    DataPressure, Placement, Rejection, data_channel, dispatch::tests::fixture, test_support,
+    DataLaneLimits, DataPressure, Placement, Rejection, data_channel, dispatch::tests::fixture,
+    test_support,
 };
 use ozzy_proto::{Envelope, RequestId, directory};
 use std::num::NonZeroU64;
@@ -47,15 +48,17 @@ fn full_backpressured_append_sends_no_admission_refusal() {
         0,
         Kind::Client,
         crate::dispatch::Class::Data,
-        1,
-        4096,
-        8192,
+        DataLaneLimits {
+            slots: 1,
+            maximum_retained_bytes: 4096,
+            retained_budget_bytes: 8192,
+        },
     )
     .unwrap();
     service.dispatcher.install_data_lane(0, sender).unwrap();
     let peer = NodeId::from_bytes([1; 16]);
-    let client = remote(1, handshake::PRODUCER);
-    let (binding, _) = begin(&mut service, &client, peer);
+    let mut client = remote(1, handshake::PRODUCER);
+    let (binding, _) = begin(&mut service, &mut client, peer);
     assert!(
         service
             .receive(test_support::append(placements[0], binding), 4096)
@@ -86,9 +89,11 @@ fn publications_require_configured_source_and_group_but_no_dispatch_grant() {
         0,
         Kind::Broker,
         crate::dispatch::Class::Data,
-        1,
-        4096,
-        8192,
+        DataLaneLimits {
+            slots: 1,
+            maximum_retained_bytes: 4096,
+            retained_budget_bytes: 8192,
+        },
     )
     .unwrap();
     service.dispatcher.install_data_lane(0, sender).unwrap();
@@ -97,9 +102,11 @@ fn publications_require_configured_source_and_group_but_no_dispatch_grant() {
         0,
         Kind::Client,
         crate::dispatch::Class::Data,
-        1,
-        4096,
-        8192,
+        DataLaneLimits {
+            slots: 1,
+            maximum_retained_bytes: 4096,
+            retained_budget_bytes: 8192,
+        },
     )
     .unwrap();
     service
@@ -107,12 +114,16 @@ fn publications_require_configured_source_and_group_but_no_dispatch_grant() {
         .install_data_lane(0, writer_lane)
         .unwrap();
     let client = NodeId::from_bytes([1; 16]);
-    let (writer, _) = begin(&mut service, &remote(1, handshake::PRODUCER), client);
+    let (writer, _) = begin(&mut service, &mut remote(1, handshake::PRODUCER), client);
     service
         .receive(test_support::append(placements[0], writer), 4096)
         .unwrap();
     let publisher = NodeId::from_bytes([8; 16]);
-    let (binding, _) = begin(&mut service, &remote(8, handshake::OWNER | 8), publisher);
+    let (binding, _) = begin(
+        &mut service,
+        &mut remote(8, handshake::OWNER | 8),
+        publisher,
+    );
     let original = test_support::control(
         placements[0],
         Binding {
@@ -216,7 +227,7 @@ fn watch_request(
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines, reason = "one linear scenario")]
 fn watch_rejections_are_correlated_and_leave_the_link_usable() {
     let (mut service, _lanes, placements) = setup();
     service
@@ -247,8 +258,8 @@ fn watch_rejections_are_correlated_and_leave_the_link_usable() {
         )
         .unwrap();
     let peer = NodeId::from_bytes([1; 16]);
-    let client = remote(1, handshake::PRODUCER);
-    let (binding, _) = begin(&mut service, &client, peer);
+    let mut client = remote(1, handshake::PRODUCER);
+    let (binding, _) = begin(&mut service, &mut client, peer);
     for (request, watch, group, rejection) in [
         (
             10,
@@ -327,8 +338,8 @@ async fn topic_lookup_returns_bounded_page_on_established_client_link() {
     let (mut service, _, _) = setup();
     service.install_catalog(topic_catalog()).unwrap();
     let peer = NodeId::from_bytes([1; 16]);
-    let client = remote(1, handshake::PRODUCER);
-    let (binding, _) = begin(&mut service, &client, peer);
+    let mut client = remote(1, handshake::PRODUCER);
+    let (binding, _) = begin(&mut service, &mut client, peer);
     let request_id = RequestId::from_bytes([6; 16]);
     let mut metadata = Vec::with_capacity(256);
     let header = directory::encode_topic_request(
@@ -418,10 +429,14 @@ fn configured_broker_bulk_replies_preserve_native_client_limits() {
     ];
     let mut service =
         Service::new_with_broker_limits(dispatcher, native, bulk, &access, ids(99)).unwrap();
-    let (client, _) = begin(&mut service, &remote(1, handshake::PRODUCER), original.peer);
+    let (client, _) = begin(
+        &mut service,
+        &mut remote(1, handshake::PRODUCER),
+        original.peer,
+    );
     let (broker, _) = begin(
         &mut service,
-        &remote(8, handshake::OWNER | 8),
+        &mut remote(8, handshake::OWNER | 8),
         access[1].peer,
     );
     for (binding, opcode, expected) in [
@@ -458,7 +473,7 @@ fn configured_broker_bulk_replies_preserve_native_client_limits() {
         service.links.get(broker.peer).unwrap().send.envelope,
         bulk.envelope
     );
-    let forged = remote(1, handshake::OWNER | 8);
+    let mut forged = remote(1, handshake::OWNER | 8);
     let hello = Message::with_prefix(
         Bytes::copy_from_slice(original.peer.as_bytes()),
         Message::multipart(forged.start(service.local()).unwrap()),
@@ -471,7 +486,6 @@ fn configured_broker_bulk_replies_preserve_native_client_limits() {
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
 fn trusted_clients_keep_membership_capacity_and_disconnect_fences_separate() {
     let (mut dispatcher, _lanes, _, original) = fixture();
     dispatcher.disconnect(original.peer);
@@ -488,32 +502,32 @@ fn trusted_clients_keep_membership_capacity_and_disconnect_fences_separate() {
     .with_trusted_clients(1)
     .unwrap();
     let local = service.dispatcher.local;
-    let packet = |id: u8, remote: &LinkSessions| {
+    let packet = |id: u8, remote: &mut LinkSessions| {
         Message::with_prefix(
             Bytes::copy_from_slice(NodeId::from_bytes([id; 16]).as_bytes()),
             Message::multipart(remote.start(local).unwrap()),
         )
     };
-    let forged = remote(2, handshake::OWNER | 8);
+    let mut forged = remote(2, handshake::OWNER | 8);
     assert!(matches!(
-        service.receive(packet(2, &forged), 4096),
+        service.receive(packet(2, &mut forged), 4096),
         Err(ReceiveError::Role)
     ));
     assert!(service.links.get(NodeId::from_bytes([2; 16])).is_none());
-    let claimant = remote(8, handshake::PRODUCER);
+    let mut claimant = remote(8, handshake::PRODUCER);
     assert!(matches!(
-        service.receive(packet(8, &claimant), 4096),
+        service.receive(packet(8, &mut claimant), 4096),
         Err(ReceiveError::Role)
     ));
-    let client = remote(1, handshake::PRODUCER);
-    let (binding, old_hello) = begin(&mut service, &client, NodeId::from_bytes([1; 16]));
+    let mut client = remote(1, handshake::PRODUCER);
+    let (binding, old_hello) = begin(&mut service, &mut client, NodeId::from_bytes([1; 16]));
     assert_eq!(binding.kind, Kind::Client);
-    let broker = remote(8, handshake::OWNER | 8);
-    let (broker_binding, _) = begin(&mut service, &broker, NodeId::from_bytes([8; 16]));
+    let mut broker = remote(8, handshake::OWNER | 8);
+    let (broker_binding, _) = begin(&mut service, &mut broker, NodeId::from_bytes([8; 16]));
     assert_eq!(broker_binding.kind, Kind::Broker);
-    let extra = remote(2, handshake::CONSUMER);
+    let mut extra = remote(2, handshake::CONSUMER);
     assert!(matches!(
-        service.receive(packet(2, &extra), 4096),
+        service.receive(packet(2, &mut extra), 4096),
         Err(ReceiveError::Peer)
     ));
     assert!(service.disconnect(binding));
@@ -525,11 +539,11 @@ fn trusted_clients_keep_membership_capacity_and_disconnect_fences_separate() {
     );
     // Retain the metadata fence rather than admitting an unbounded identity list.
     assert!(matches!(
-        service.receive(packet(2, &extra), 4096),
+        service.receive(packet(2, &mut extra), 4096),
         Err(ReceiveError::Peer)
     ));
     client.disconnect(local);
-    let (current, _) = begin(&mut service, &client, binding.peer);
+    let (current, _) = begin(&mut service, &mut client, binding.peer);
     assert_ne!(current.session, binding.session);
     assert!(!service.disconnect(binding));
     assert_eq!(service.links.get(binding.peer).unwrap().binding, current);
@@ -542,7 +556,7 @@ fn trusted_clients_keep_membership_capacity_and_disconnect_fences_separate() {
     assert!(service.retire_transport_client(current.peer));
     assert!(!service.retire_transport_client(current.peer));
     assert!(service.accepts_transport_peer(NodeId::from_bytes([2; 16])));
-    let (replacement, _) = begin(&mut service, &extra, NodeId::from_bytes([2; 16]));
+    let (replacement, _) = begin(&mut service, &mut extra, NodeId::from_bytes([2; 16]));
     assert_eq!(replacement.kind, Kind::Client);
     assert_eq!(service.peers.len(), 2);
     assert_eq!(service.sessions.session(current.peer), None);
@@ -580,7 +594,7 @@ pub(in crate::frontend) fn remote(id: u8, roles: u32) -> LinkSessions {
 
 pub(in crate::frontend) fn begin(
     service: &mut Service,
-    remote: &LinkSessions,
+    remote: &mut LinkSessions,
     peer: NodeId,
 ) -> (Binding, Message) {
     let local = service.dispatcher.local;
@@ -615,9 +629,9 @@ pub(in crate::frontend) fn reply(binding: Binding, opcode: Opcode) -> Message {
 fn claimed_broker_role_cannot_promote_authorized_client_or_fence_live_link() {
     let (mut service, _lanes, _) = setup();
     let peer = NodeId::from_bytes([1; 16]);
-    let client = remote(1, handshake::PRODUCER);
-    let (binding, _) = begin(&mut service, &client, peer);
-    let forged = remote(1, 8);
+    let mut client = remote(1, handshake::PRODUCER);
+    let (binding, _) = begin(&mut service, &mut client, peer);
+    let mut forged = remote(1, 8);
     let message = Message::with_prefix(
         Bytes::copy_from_slice(peer.as_bytes()),
         Message::multipart(forged.start(service.dispatcher.local).unwrap()),
@@ -636,8 +650,8 @@ fn claimed_broker_role_cannot_promote_authorized_client_or_fence_live_link() {
 #[test]
 fn stalled_handshake_and_recurring_hello_leave_other_links_and_data_runnable() {
     let (mut service, _lanes, _) = setup();
-    let client = remote(1, handshake::PRODUCER);
-    let (binding, hello) = begin(&mut service, &client, NodeId::from_bytes([1; 16]));
+    let mut client = remote(1, handshake::PRODUCER);
+    let (binding, hello) = begin(&mut service, &mut client, NodeId::from_bytes([1; 16]));
     let stalled = NodeId::from_bytes([8; 16]);
     service.start(stalled).unwrap();
     let mut sent = [0; 2];
@@ -679,8 +693,8 @@ fn stalled_handshake_and_recurring_hello_leave_other_links_and_data_runnable() {
 #[test]
 fn application_replies_wait_for_the_new_sessions_welcome_submission() {
     let (mut service, _lanes, _) = setup();
-    let client = remote(1, handshake::PRODUCER);
-    let (binding, hello) = begin(&mut service, &client, NodeId::from_bytes([1; 16]));
+    let mut client = remote(1, handshake::PRODUCER);
+    let (binding, hello) = begin(&mut service, &mut client, NodeId::from_bytes([1; 16]));
     service
         .try_reply(Class::Control, reply(binding, Opcode::Commit))
         .unwrap();
@@ -724,8 +738,8 @@ fn application_replies_wait_for_the_new_sessions_welcome_submission() {
 #[tokio::test]
 async fn unroutable_welcome_waits_for_retry_without_ready_socket_spinning() {
     let (mut service, _lanes, _) = setup();
-    let client = remote(1, handshake::PRODUCER);
-    let (binding, hello) = begin(&mut service, &client, NodeId::from_bytes([1; 16]));
+    let mut client = remote(1, handshake::PRODUCER);
+    let (binding, hello) = begin(&mut service, &mut client, NodeId::from_bytes([1; 16]));
     service
         .try_reply(Class::Control, reply(binding, Opcode::Commit))
         .unwrap();
@@ -794,8 +808,8 @@ fn watch_registration_returns_current_snapshot_and_old_session_cannot_reuse_it()
             .unwrap(),
         )
         .unwrap();
-    let client = remote(1, handshake::PRODUCER);
-    let (binding, _) = begin(&mut service, &client, peer);
+    let mut client = remote(1, handshake::PRODUCER);
+    let (binding, _) = begin(&mut service, &mut client, peer);
     let watch = RequestId::from_bytes([4; 16]);
     let request_id = RequestId::from_bytes([5; 16]);
     let mut metadata = Vec::with_capacity(64);

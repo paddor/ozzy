@@ -70,10 +70,7 @@ impl Window {
         if completed.capacity() > records {
             return Err(ProgressError::Capacity);
         }
-        let mut publisher = Publisher::new(identity, cursor.get(), Some(shared));
-        let submission = publisher
-            .take_submission()
-            .expect("new processing publisher");
+        let (publisher, submission) = Publisher::new(identity, cursor.get(), Some(shared));
         Ok((
             Self {
                 progress: publisher.observer(),
@@ -192,12 +189,9 @@ impl Window {
     pub(crate) fn retire(&mut self, maximum: usize) -> bool {
         let confirmed = self.progress.confirmed();
         for _ in 0..maximum {
-            if self.retired == confirmed {
+            if self.retired == confirmed || self.completed.pop_front().is_none() {
                 return false;
             }
-            self.completed
-                .pop_front()
-                .expect("confirmed delivered record");
             self.retired += 1;
         }
         self.retired < confirmed

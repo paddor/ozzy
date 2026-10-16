@@ -215,7 +215,11 @@ impl CanonicalProducer {
         if first_offset < self.last_stored_end {
             return Err(StateError::OffsetMismatch);
         }
-        if self.needs_result_span(first_offset) {
+        let adjacent = !self.needs_result_span(first_offset);
+        if let Some(span) = self.results.back_mut().filter(|_| adjacent) {
+            // Sum is bounded by the checked sequence and offset ends above.
+            span.records += records;
+        } else {
             if self.results.len() >= max_spans {
                 return Err(StateError::LimitExceeded("producer retry spans"));
             }
@@ -225,12 +229,6 @@ impl CanonicalProducer {
                 records,
                 source: ProducerResultSource::Stored,
             });
-        } else {
-            // Sum is bounded by the checked sequence and offset ends above.
-            self.results
-                .back_mut()
-                .expect("adjacent result span")
-                .records += records;
         }
         self.next_producer_sequence = ProducerSequence::new(next_sequence);
         self.last_stored_end = Offset::new(stored_end);
@@ -273,18 +271,24 @@ impl CanonicalProducer {
             if let Some(last) = spans.last_mut()
                 && last.can_extend(next)
             {
-                last.records += next.records;
+                last.records = last
+                    .records
+                    .checked_add(next.records)
+                    .ok_or(StateError::MalformedBody("producer outcome overflow"))?;
             } else {
                 spans.push(next);
             }
-            sequence += u64::from(run.records);
+            sequence = sequence
+                .checked_add(u64::from(run.records))
+                .ok_or(StateError::MalformedBody("producer outcome overflow"))?;
         }
-        let additional = spans.len()
-            - usize::from(
-                self.results
-                    .back()
-                    .is_some_and(|last| last.can_extend(spans[0])),
-            );
+        // A first span that extends the retained last one adds no new span.
+        let merged = self
+            .results
+            .back()
+            .zip(spans.first())
+            .is_some_and(|(last, &first)| last.can_extend(first));
+        let additional = spans.len().saturating_sub(usize::from(merged));
         Ok(PreparedProducerResults {
             spans,
             additional,

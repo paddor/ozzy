@@ -1,27 +1,27 @@
-//! Durable consumer progress reuses native proposal and reply ownership.
+//! Durable consumer progress: cursor updates held while one proposal is in
+//! flight share the next proposal and each get its outcome.
 
+use super::control::{PROGRESS, operation};
 use super::{
-    BatchState, Batched, Command, NativeIntake, NativeIntakeError, NativeReceive, PROGRESS_BATCH,
-    Pending, ProposalSubmitError, Reply, Request,
+    BatchState, Batched, NativeIntake, NativeIntakeError, NativeReceive, PROGRESS_BATCH, Pending,
+    ProposalSubmitError, Reply, Request,
 };
-use crate::replica_actor::ProposalOutcome;
-use crate::replica_journal::ProposalBuffer;
-use crate::{
-    frontend::Link,
-    replica_journal::{GroupAssignRequest, GroupProgressRequest, JournalError},
-};
+use crate::replica_actor::{ProposalOutcome, response};
+use crate::replica_journal::{GroupProgressRequest, ProposalBuffer};
+use crate::{frontend::Link, profiling::Event};
 use ozzy_proto::{
-    NodeId, OperationId, Packet, group, handshake,
+    NodeId, Packet,
+    append::Policy,
     nack::{AuthorityHint, RetryClass},
     progress,
 };
 
+/// Slots of the updates joined to one progress proposal.
+type Riders = smallvec::SmallVec<[usize; PROGRESS_BATCH]>;
+
 impl NativeIntake {
-    fn progress_start(&self) -> usize {
-        self.config
-            .access
-            .required_buffers(self.config.requests_per_writer)
-            .expect("validated native slots")
+    pub(super) const fn progress_start(&self) -> usize {
+        self.progress_start
     }
 
     pub(super) fn progress_work(&self, node: NodeId) -> usize {
@@ -49,93 +49,45 @@ impl NativeIntake {
         link: Link,
         hint: AuthorityHint,
     ) -> Result<NativeReceive, NativeIntakeError> {
-        let Some(slot) =
-            (self.progress_start()..self.slots.len()).find(|&index| self.slot_free(index))
-        else {
-            if self.config.progress_requests != 0 {
-                crate::profiling::event(crate::profiling::Event::ProcessingSlotRefusal);
-            }
-            return Ok(if self.config.progress_requests == 0 {
-                NativeReceive::Ignored
-            } else {
-                NativeReceive::Busy
-            });
+        let control = match self.admit_control(&packet, link, hint, &PROGRESS)? {
+            Ok(control) => control,
+            Err(received) => return Ok(received),
         };
-        let request = Request {
-            envelope: packet.envelope,
-            send: link.send,
-            command: Command::Progress,
-        };
-        if link.send.envelope.max_metadata_bytes < progress::CONFIRMED_BYTES {
-            return Ok(NativeReceive::Ignored);
-        }
-        self.remaining = self.slots.len();
-        if link.remote.roles & handshake::CONSUMER == 0
-            || link.remote.capabilities & handshake::OWNER_PROGRESS == 0
-        {
-            self.reject(slot, request, 3, RetryClass::Permanent, hint)?;
-            return Ok(NativeReceive::Accepted);
-        }
         let Ok(progress) = progress::decode_request(packet, self.config.limits.envelope) else {
-            self.reject(slot, request, 1, RetryClass::Permanent, hint)?;
-            return Ok(NativeReceive::Accepted);
+            return self.refuse(&control, (1, RetryClass::Permanent));
         };
-        crate::profiling::event(crate::profiling::Event::ProcessingReceived);
-        #[cfg(feature = "storage-metrics")]
-        crate::storage_metrics::add(
-            if progress.cursor.is_some() {
-                &crate::storage_metrics::PROGRESS_UPDATES
-            } else {
-                &crate::storage_metrics::PROGRESS_QUERIES
-            },
-            1,
-        );
-        if progress.assignment.partition != self.config.partition
-            || progress.authority.group_id != self.config.group
-            || progress.authority != hint.authority
-            || hint.primary != self.config.local
-        {
-            self.reject(slot, request, 5, RetryClass::AfterAuthorityRefresh, hint)?;
-            return Ok(NativeReceive::Accepted);
-        }
-        if progress.policy != self.config.policy {
-            self.reject(slot, request, 2, RetryClass::Permanent, hint)?;
-            return Ok(NativeReceive::Accepted);
-        }
-        let buffer = self.slots[slot]
-            .buffer
-            .as_mut()
-            .expect("free progress arena");
-        buffer.clear();
-        let result = buffer.prepare_group_progress(
-            GroupProgressRequest {
-                authority: progress.authority,
-                assignment: progress.assignment,
-                cursor: progress.cursor,
-                operation: OperationId::from_bytes(
-                    *packet
-                        .envelope
-                        .request_id
-                        .expect("correlated progress")
-                        .as_bytes(),
-                ),
-            },
+        crate::profiling::event(Event::ProcessingReceived);
+        crate::profiling::event(if progress.cursor.is_some() {
+            Event::ProgressUpdateRequest
+        } else {
+            Event::ProgressQueryRequest
+        });
+        if let Some(rejection) = self.control_target(
+            progress.assignment.partition,
+            progress.authority,
             progress.policy,
-        );
-        match result {
-            Ok(()) if progress.cursor.is_none() => self.submit_prepared(slot, request, hint),
-            Ok(()) => self.submit_progress(slot, request, hint),
-            Err(JournalError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                crate::profiling::event(crate::profiling::Event::ProcessingArenaRefusal);
-                self.slots[slot].buffer.as_mut().unwrap().clear();
-                Ok(NativeReceive::Busy)
+            hint,
+        ) {
+            return self.refuse(&control, rejection);
+        }
+        let Some(operation) = operation(&packet) else {
+            return self.refuse(&control, (1, RetryClass::Permanent));
+        };
+        let request = GroupProgressRequest {
+            authority: progress.authority,
+            assignment: progress.assignment,
+            cursor: progress.cursor,
+            operation,
+        };
+        let prepared = self.prepare_control(&control, |buffer| {
+            buffer.prepare_group_progress(request, progress.policy)
+        });
+        match prepared {
+            Ok(()) if progress.cursor.is_none() => {
+                self.submit_prepared(control.slot, control.request, hint)
             }
-            Err(error) => {
-                self.slots[slot].buffer.as_mut().unwrap().clear();
-                let (code, retry) = super::super::response::rejection(&error);
-                self.reject(slot, request, code, retry, hint)?;
-                Ok(NativeReceive::Accepted)
-            }
+            Ok(()) => self.submit_progress(control.slot, control.request, hint),
+            Err(failure) => self.control_failure(&control, &PROGRESS, failure),
         }
     }
 
@@ -182,30 +134,21 @@ impl NativeIntake {
         let Some(carrier) = self.first_live_held(current) else {
             return Ok(false);
         };
-        let batched = self.slots[carrier].batch.take().expect("held update");
+        let carrier_slot = &mut self.slots[carrier];
+        let (Some(batched), Some(mut buffer)) =
+            (carrier_slot.batch.take(), carrier_slot.buffer.take())
+        else {
+            return Err(NativeIntakeError::Slot);
+        };
         self.progress_held -= 1;
-        let mut buffer = self.slots[carrier].buffer.take().expect("held arena");
-        let (original, policy) = buffer
+        let original = buffer
             .group_progress_request()
             .ok_or(NativeIntakeError::History)?;
-        let mut riders = smallvec::SmallVec::<[usize; PROGRESS_BATCH]>::new();
-        if batched.state == (BatchState::Held { solo: false }) {
-            for index in carrier + 1..self.slots.len() {
-                if riders.len() + 1 == self.config.progress_batch {
-                    break;
-                }
-                if self.slots[index]
-                    .batch
-                    .as_ref()
-                    .is_some_and(|rider| rider.state == BatchState::Held { solo: false })
-                    && buffer
-                        .join_group_progress(self.slots[index].buffer.as_ref().expect("held arena"))
-                        .map_err(|_| NativeIntakeError::History)?
-                {
-                    riders.push(index);
-                }
-            }
-        }
+        let riders = if batched.state == (BatchState::Held { solo: false }) {
+            self.join_riders(carrier, &mut buffer)?
+        } else {
+            Riders::new()
+        };
         self.remaining = self.slots.len();
         match self.submitter.try_submit(buffer) {
             Ok(proposal) => {
@@ -220,41 +163,86 @@ impl NativeIntake {
                     started: batched.started,
                 });
                 self.track(carrier);
-                self.progress_flight = Some(carrier);
-                self.progress_riders = riders.len();
-                self.progress_held -= riders.len();
-                for (joined, &rider) in riders.iter().enumerate() {
-                    self.slots[rider]
-                        .batch
-                        .as_mut()
-                        .expect("joined update")
-                        .state = BatchState::Riding {
-                        carrier,
-                        index: joined,
-                    };
-                }
+                self.ride(carrier, &riders);
+                Ok(true)
             }
             Err(mut rejected) => {
                 crate::profiling::event(crate::profiling::Event::NativeProposalRefusal);
-                // Restore a lone held update; joined ones stay held.
                 rejected.buffer.clear();
                 if rejected.reason == ProposalSubmitError::Full {
-                    rejected
-                        .buffer
-                        .prepare_group_progress(original, policy)
-                        .map_err(|_| NativeIntakeError::History)?;
-                    self.slots[carrier].buffer = Some(rejected.buffer);
-                    self.slots[carrier].batch = Some(batched);
-                    self.progress_held += 1;
-                    // A completion that frees the lane polls this intake again.
-                    return Ok(false);
+                    return self.hold_carrier(carrier, batched, rejected.buffer, original);
                 }
+                // Any other refusal rejects the carrier's own request.
                 self.slots[carrier].buffer = Some(rejected.buffer);
                 self.busy -= 1;
-                self.reject(carrier, batched.request, 10, RetryClass::AfterBackoff, hint)?;
+                self.reject(
+                    carrier,
+                    batched.request,
+                    (10, RetryClass::AfterBackoff),
+                    hint,
+                )?;
+                Ok(true)
             }
         }
-        Ok(true)
+    }
+
+    /// Join held updates after `carrier` into its arena, up to the batch size.
+    fn join_riders(
+        &self,
+        carrier: usize,
+        buffer: &mut ProposalBuffer,
+    ) -> Result<Riders, NativeIntakeError> {
+        let mut riders = Riders::new();
+        for index in carrier + 1..self.slots.len() {
+            if riders.len() + 1 == self.config.progress_batch {
+                break;
+            }
+            if self.slots[index]
+                .batch
+                .as_ref()
+                .is_some_and(|rider| rider.state == BatchState::Held { solo: false })
+                && let Some(held) = self.slots[index].buffer.as_ref()
+                && buffer
+                    .join_group_progress(held)
+                    .map_err(|_| NativeIntakeError::History)?
+            {
+                riders.push(index);
+            }
+        }
+        Ok(riders)
+    }
+
+    /// Mark the joined updates as riding in the carrier's proposal.
+    fn ride(&mut self, carrier: usize, riders: &Riders) {
+        self.progress_flight = Some(carrier);
+        self.progress_riders = riders.len();
+        self.progress_held -= riders.len();
+        for (joined, &rider) in riders.iter().enumerate() {
+            if let Some(batch) = self.slots[rider].batch.as_mut() {
+                batch.state = BatchState::Riding {
+                    carrier,
+                    index: joined,
+                };
+            }
+        }
+    }
+
+    /// A full lane holds a lone update again; joined ones stay held.
+    fn hold_carrier(
+        &mut self,
+        carrier: usize,
+        batched: Batched,
+        mut buffer: ProposalBuffer,
+        (original, policy): (GroupProgressRequest, Policy),
+    ) -> Result<bool, NativeIntakeError> {
+        buffer
+            .prepare_group_progress(original, policy)
+            .map_err(|_| NativeIntakeError::History)?;
+        self.slots[carrier].buffer = Some(buffer);
+        self.slots[carrier].batch = Some(batched);
+        self.progress_held += 1;
+        // A completion that frees the lane polls this intake again.
+        Ok(false)
     }
 
     /// Drop held updates whose client link changed and return the first
@@ -269,17 +257,11 @@ impl NativeIntake {
                 continue;
             };
             let envelope = batched.request.envelope;
-            if !current(envelope.sender).is_some_and(|link| {
-                link.binding.kind == crate::frontend::Kind::Client
-                    && Some(link.binding.session) == envelope.session
-                    && link.binding.peer == envelope.sender
-            }) {
+            if !response::current_client(current(envelope.sender), &envelope) {
                 self.slots[index].batch = None;
-                self.slots[index]
-                    .buffer
-                    .as_mut()
-                    .expect("held arena")
-                    .clear();
+                if let Some(buffer) = self.slots[index].buffer.as_mut() {
+                    buffer.clear();
+                }
                 self.busy -= 1;
                 self.progress_held -= 1;
                 continue;
@@ -298,7 +280,7 @@ impl NativeIntake {
         carrier: usize,
         pending: &Pending,
         outcome: ProposalOutcome,
-        mut buffer: ProposalBuffer,
+        buffer: ProposalBuffer,
     ) -> Result<Option<(ProposalOutcome, ProposalBuffer)>, NativeIntakeError> {
         self.progress_flight = None;
         if std::mem::take(&mut self.progress_riders) == 0 {
@@ -314,161 +296,94 @@ impl NativeIntake {
             })
             .collect::<smallvec::SmallVec<[_; PROGRESS_BATCH]>>();
         self.remaining = self.slots.len();
-        let shared = match &outcome {
-            ProposalOutcome::Committed { scope, through } => ProposalOutcome::Committed {
-                scope: *scope,
-                through: *through,
-            },
-            ProposalOutcome::NotAdmitted => ProposalOutcome::NotAdmitted,
-            ProposalOutcome::Unknown => ProposalOutcome::Unknown,
-            ProposalOutcome::Invalid(_) => {
-                self.progress_held += riders.len() + 1;
-                for (slot, _) in riders {
-                    self.slots[slot].batch.as_mut().expect("rider").state =
-                        BatchState::Held { solo: true };
-                }
-                let (request, policy) = buffer
-                    .group_progress_request()
-                    .ok_or(NativeIntakeError::History)?;
-                buffer.clear();
-                buffer
-                    .prepare_group_progress(request, policy)
-                    .map_err(|_| NativeIntakeError::History)?;
-                self.slots[carrier].buffer = Some(buffer);
-                self.slots[carrier].batch = Some(Batched {
-                    request: pending.request,
-                    started: pending.started,
-                    state: BatchState::Held { solo: true },
-                });
-                return Ok(None);
-            }
-        };
+        if matches!(outcome, ProposalOutcome::Invalid(_)) {
+            let slots = riders.iter().map(|&(slot, _)| slot).collect();
+            self.split_batch(carrier, pending, &slots, buffer)?;
+            return Ok(None);
+        }
         for (slot, index) in riders {
-            if matches!(shared, ProposalOutcome::Committed { .. }) {
-                let state = buffer
-                    .group_progress_rider_state(index)
-                    .ok_or(NativeIntakeError::History)?;
-                self.slots[slot]
-                    .buffer
-                    .as_mut()
-                    .expect("rider arena")
-                    .adopt_group_progress_state(state)
-                    .map_err(|_| NativeIntakeError::History)?;
-            }
-            let rider = self.slots[slot].batch.take().expect("rider");
-            crate::profiling::finish(crate::profiling::Stage::NativeProposal, rider.started);
-            crate::profiling::event(crate::profiling::Event::ProcessingCompleted);
-            crate::profiling::event(if matches!(shared, ProposalOutcome::Committed { .. }) {
-                crate::profiling::Event::NativeProposalCommitted
-            } else {
-                crate::profiling::Event::NativeProposalUnconfirmed
-            });
-            self.slots[slot].reply = Some(Reply {
-                request: rider.request,
-                outcome: match &shared {
-                    ProposalOutcome::Committed { scope, through } => ProposalOutcome::Committed {
-                        scope: *scope,
-                        through: *through,
-                    },
-                    ProposalOutcome::Unknown => ProposalOutcome::Unknown,
-                    _ => ProposalOutcome::NotAdmitted,
-                },
-                next: 0,
-                frame: None,
-            });
-            self.track(slot);
+            self.complete_rider(slot, index, &outcome, &buffer)?;
         }
         Ok(Some((outcome, buffer)))
     }
 
-    /// Relay one committed coordinator target to this source. The source
-    /// allocates the epoch and captures the cursor; preparation proves nothing.
-    pub(super) fn receive_assign(
+    /// Hold the carrier and its riders again, each to validate alone.
+    fn split_batch(
         &mut self,
-        packet: Packet<'_>,
-        link: Link,
-        hint: AuthorityHint,
-    ) -> Result<NativeReceive, NativeIntakeError> {
-        let Some(slot) =
-            (self.progress_start()..self.slots.len()).find(|&index| self.slot_free(index))
-        else {
-            if self.config.progress_requests != 0 {
-                crate::profiling::event(crate::profiling::Event::AssignmentSlotRefusal);
+        carrier: usize,
+        pending: &Pending,
+        riders: &Riders,
+        mut buffer: ProposalBuffer,
+    ) -> Result<(), NativeIntakeError> {
+        self.progress_held += riders.len() + 1;
+        for &slot in riders {
+            if let Some(batch) = self.slots[slot].batch.as_mut() {
+                batch.state = BatchState::Held { solo: true };
             }
-            return Ok(if self.config.progress_requests == 0 {
-                NativeReceive::Ignored
-            } else {
-                NativeReceive::Busy
-            });
-        };
-        let request = Request {
-            envelope: packet.envelope,
-            send: link.send,
-            command: Command::Assign,
-        };
-        if link.send.envelope.max_metadata_bytes < group::ASSIGNED_BYTES {
-            return Ok(NativeReceive::Ignored);
         }
-        self.remaining = self.slots.len();
-        if link.remote.roles & handshake::CONSUMER == 0
-            || link.remote.capabilities & handshake::OWNER_GROUPS == 0
-        {
-            self.reject(slot, request, 3, RetryClass::Permanent, hint)?;
-            return Ok(NativeReceive::Accepted);
-        }
-        let Ok(assign) = group::decode_assign(packet, self.config.limits.envelope) else {
-            self.reject(slot, request, 1, RetryClass::Permanent, hint)?;
-            return Ok(NativeReceive::Accepted);
-        };
-        if assign.partition != self.config.partition
-            || assign.authority.group_id != self.config.group
-            || assign.authority != hint.authority
-            || hint.primary != self.config.local
-        {
-            self.reject(slot, request, 5, RetryClass::AfterAuthorityRefresh, hint)?;
-            return Ok(NativeReceive::Accepted);
-        }
-        if assign.policy != self.config.policy {
-            self.reject(slot, request, 2, RetryClass::Permanent, hint)?;
-            return Ok(NativeReceive::Accepted);
-        }
-        let buffer = self.slots[slot]
-            .buffer
-            .as_mut()
-            .expect("free consumer control arena");
+        let (request, policy) = buffer
+            .group_progress_request()
+            .ok_or(NativeIntakeError::History)?;
         buffer.clear();
-        let result = buffer.prepare_group_assignment(
-            GroupAssignRequest {
-                authority: assign.authority,
-                group: assign.group,
-                partition: assign.partition,
-                plan_revision: assign.plan_revision,
-                member: assign.member,
-                initial: assign.initial,
-                operation: OperationId::from_bytes(
-                    *packet
-                        .envelope
-                        .request_id
-                        .expect("correlated activation")
-                        .as_bytes(),
-                ),
-            },
-            assign.policy,
-        );
-        match result {
-            Ok(()) => self.submit_prepared(slot, request, hint),
-            Err(JournalError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                crate::profiling::event(crate::profiling::Event::AssignmentArenaRefusal);
-                self.slots[slot].buffer.as_mut().unwrap().clear();
-                Ok(NativeReceive::Busy)
-            }
-            Err(error) => {
-                self.slots[slot].buffer.as_mut().unwrap().clear();
-                let (code, retry) = super::super::response::rejection(&error);
-                self.reject(slot, request, code, retry, hint)?;
-                Ok(NativeReceive::Accepted)
-            }
+        buffer
+            .prepare_group_progress(request, policy)
+            .map_err(|_| NativeIntakeError::History)?;
+        self.slots[carrier].buffer = Some(buffer);
+        self.slots[carrier].batch = Some(Batched {
+            request: pending.request,
+            started: pending.started,
+            state: BatchState::Held { solo: true },
+        });
+        Ok(())
+    }
+
+    /// Give the `index`th joined update the carrier's outcome.
+    fn complete_rider(
+        &mut self,
+        slot: usize,
+        index: usize,
+        outcome: &ProposalOutcome,
+        buffer: &ProposalBuffer,
+    ) -> Result<(), NativeIntakeError> {
+        use crate::profiling::{Event, Stage, event, finish};
+        let committed = matches!(outcome, ProposalOutcome::Committed { .. });
+        if committed {
+            let state = buffer
+                .group_progress_rider_state(index)
+                .ok_or(NativeIntakeError::History)?;
+            self.slots[slot]
+                .buffer
+                .as_mut()
+                .ok_or(NativeIntakeError::Slot)?
+                .adopt_group_progress_state(state)
+                .map_err(|_| NativeIntakeError::History)?;
         }
+        let rider = self.slots[slot]
+            .batch
+            .take()
+            .ok_or(NativeIntakeError::Slot)?;
+        finish(Stage::NativeProposal, rider.started);
+        event(Event::ProcessingCompleted);
+        event(if committed {
+            Event::NativeProposalCommitted
+        } else {
+            Event::NativeProposalUnconfirmed
+        });
+        self.slots[slot].reply = Some(Reply {
+            request: rider.request,
+            outcome: match outcome {
+                ProposalOutcome::Committed { scope, through } => ProposalOutcome::Committed {
+                    scope: *scope,
+                    through: *through,
+                },
+                ProposalOutcome::Unknown => ProposalOutcome::Unknown,
+                _ => ProposalOutcome::NotAdmitted,
+            },
+            next: 0,
+            frame: None,
+        });
+        self.track(slot);
+        Ok(())
     }
 
     pub(super) fn submit_prepared(
@@ -477,7 +392,10 @@ impl NativeIntake {
         request: Request,
         hint: AuthorityHint,
     ) -> Result<NativeReceive, NativeIntakeError> {
-        let buffer = self.slots[slot].buffer.take().expect("free native arena");
+        let buffer = self.slots[slot]
+            .buffer
+            .take()
+            .ok_or(NativeIntakeError::Slot)?;
         match self.submitter.try_submit(buffer) {
             Ok(proposal) => {
                 crate::profiling::event(crate::profiling::Event::NativeProposalSubmitted);
@@ -497,7 +415,7 @@ impl NativeIntake {
                 if full {
                     return Ok(NativeReceive::Busy);
                 }
-                self.reject(slot, request, 10, RetryClass::AfterBackoff, hint)?;
+                self.reject(slot, request, (10, RetryClass::AfterBackoff), hint)?;
             }
         }
         Ok(NativeReceive::Accepted)

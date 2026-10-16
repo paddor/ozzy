@@ -140,7 +140,8 @@ impl CanonicalState {
         results: AppendResults<'_>,
     ) -> Result<TransitionPlan, StateError> {
         self.require_next_operation(op_number)?;
-        let _cursor = self.append_coordinates(batch, results.attempts() as usize)?;
+        // Only the coordinate checks matter; the cursor is rebuilt from results.
+        self.append_coordinates(batch, results.attempts() as usize)?;
         if batch.record_count != results.stored() as usize {
             return Err(StateError::MalformedBody(
                 "stored outcomes do not match records",
@@ -152,7 +153,7 @@ impl CanonicalState {
         }
         let prepared = partition
             .producer(batch.producer_id)
-            .expect("validated producer")
+            .ok_or(StateError::ProducerMismatch)?
             .prepare_results(batch.first_sequence, batch.first_offset, results, op_number)?;
         self.check_retry_span_capacity(prepared.additional)?;
         Ok(TransitionPlan {

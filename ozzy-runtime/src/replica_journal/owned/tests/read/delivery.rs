@@ -112,7 +112,7 @@ fn compressed(
         .batches()
         .next()
         .unwrap()
-        .prepared_payload
+        .prepared_payload()
         .unwrap()
         .encoded
         .to_vec();

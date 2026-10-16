@@ -13,14 +13,7 @@ fn config(member: u8) -> GroupReaderConfig {
 
 #[tokio::test(flavor = "current_thread")]
 async fn sdk_group_activation_retries_before_the_next_heartbeat() {
-    let (mut harness, links, clock, _) = Box::pin(setup_shared_directory_profile(
-        &[],
-        1,
-        Some((2, 4096, 2)),
-        false,
-        Some(ProgressHistory::Available),
-    ))
-    .await;
+    let (mut harness, links, clock, _) = setup_progress(1, Some((2, 4096, 2))).await;
     harness.publish = false;
     harness.refuse_assign = 1;
     let mut config = config(1);
@@ -64,14 +57,7 @@ async fn sdk_group_activation_retries_before_the_next_heartbeat() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn sdk_group_reader_rejoins_fenced_membership_and_discards_unconfirmed_tokens() {
-    let (mut harness, links, clock, hint) = Box::pin(setup_shared_directory_profile(
-        &[],
-        1,
-        Some((2, 4096, 2)),
-        false,
-        Some(ProgressHistory::Available),
-    ))
-    .await;
+    let (mut harness, links, clock, hint) = setup_progress(1, Some((2, 4096, 2))).await;
     harness.publish = false;
     let mut reader = harness
         .drive(
@@ -158,14 +144,7 @@ async fn sdk_group_reader_rejoins_fenced_membership_and_discards_unconfirmed_tok
 
 #[tokio::test(flavor = "current_thread")]
 async fn sdk_group_reader_delivers_confirms_and_hands_off_at_the_confirmed_cursor() {
-    let (mut harness, links, clock, _) = Box::pin(setup_shared_directory_profile(
-        &[],
-        1,
-        Some((2, 4096, 2)),
-        false,
-        Some(ProgressHistory::Available),
-    ))
-    .await;
+    let (mut harness, links, clock, _) = setup_progress(1, Some((2, 4096, 2))).await;
     harness.publish = false;
     let mut first = harness
         .drive(

@@ -38,18 +38,22 @@ impl Decoder {
         if length != decoded_bytes as usize {
             return Err(ReaderError::Response);
         }
-        let decoded = Bytes::from(decoded);
-        let mut offset = 0;
-        let payload = body[4..table_end]
+        // Split the decoded body along the original part table, refusing a
+        // table that claims more bytes than the block decoded to.
+        let mut rest = Bytes::from(decoded);
+        let payload = body
+            .get(4..table_end)
+            .ok_or(ReaderError::Response)?
             .as_chunks::<4>()
             .0
             .iter()
-            .map(|n| {
-                let start = offset;
-                offset += u32::from_be_bytes(*n) as usize;
-                decoded.slice(start..offset)
+            .map(|length| {
+                let length = u32::from_be_bytes(*length) as usize;
+                (length <= rest.len())
+                    .then(|| rest.split_to(length))
+                    .ok_or(ReaderError::Response)
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
         Ok(OwnedRecord {
             encoding: Encoding::Raw,
             message_id: record.message_id,

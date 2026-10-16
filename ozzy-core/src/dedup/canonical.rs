@@ -1,6 +1,6 @@
 use super::{
     AppendDisposition, AppendOutcome, Boundary, Entry, Error, Index, MessageId, Offset, Pending,
-    PreparedAdmission,
+    PreparedAdmission, try_vec,
 };
 
 /// Stored identities declared by an independently verified canonical operation.
@@ -32,14 +32,7 @@ impl Index {
         if confirmed < self.committed_operation || operations.is_empty() {
             return Err(Error::Operation);
         }
-        if operations.len() > self.limits.pending_operations - self.boundaries.len() {
-            return Err(Error::PendingCapacity);
-        }
-        self.reset_scratch();
-        let mut boundaries = smallvec::SmallVec::new();
-        boundaries
-            .try_reserve_exact(operations.len())
-            .map_err(|_| Error::Allocation)?;
+        let mut boundaries = self.begin_preparation(operations.len())?;
         let mut last = Boundary {
             operation: self.accepted_operation,
             time: self.accepted_time,
@@ -62,16 +55,8 @@ impl Index {
             };
             boundaries.push(last);
         }
-        self.check_capacity(self.scratch_rows.len())?;
-        let mut entries = Vec::new();
-        entries
-            .try_reserve_exact(self.scratch_rows.len())
-            .map_err(|_| Error::Allocation)?;
-        entries.extend_from_slice(&self.scratch_rows);
-        let mut outcomes = Vec::new();
-        outcomes
-            .try_reserve_exact(entries.len())
-            .map_err(|_| Error::Allocation)?;
+        let entries = self.take_scratch_rows()?;
+        let mut outcomes = try_vec(entries.len())?;
         outcomes.extend(entries.iter().map(|row| AppendOutcome {
             disposition: AppendDisposition::Stored,
             offset: row.entry.offset,

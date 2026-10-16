@@ -41,7 +41,7 @@ fn unsent_donor_snapshot_before_retirement_cannot_describe_a_newer_checkpoint() 
         donor.journal.retire_confirmed_history(
             donor.driver.begin_validation().unwrap(),
             ozzy_proto::CheckpointId::from_bytes([98; 16]),
-            ozzy_journal_segment::AsyncRetirementBudget {
+            ozzy_journal_segment::RetirementBudget {
                 max_segments: 2,
                 max_read_bytes: 2 * 32768,
             },

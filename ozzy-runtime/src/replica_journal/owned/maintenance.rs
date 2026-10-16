@@ -3,14 +3,14 @@
 use super::{JournalError, OwnedJournal, Scope};
 use crate::replica_journal::{ValidatedStorage, commands::read_fault};
 use ozzy_journal_segment::{
-    AsyncStorageValidation, HistoryError, StorageValidationBudget, StorageValidationStep,
+    HistoryError, StorageValidation, StorageValidationBudget, StorageValidationStep,
 };
 use ozzy_replication::driver::ValidationTicket;
 use std::{cell::Cell, rc::Rc};
 
 #[derive(Debug, Default)]
 pub(super) struct Validation {
-    cursor: Option<(Scope, AsyncStorageValidation)>,
+    cursor: Option<(Scope, StorageValidation)>,
     busy: Rc<Cell<bool>>,
 }
 impl Validation {
@@ -32,7 +32,7 @@ impl Drop for Slot {
 pub struct PreparedStorageValidation {
     key: Rc<()>,
     ticket: ValidationTicket,
-    cursor: AsyncStorageValidation,
+    cursor: StorageValidation,
     budget: StorageValidationBudget,
     slot: Slot,
 }
@@ -42,7 +42,7 @@ pub struct PreparedStorageValidation {
 pub struct CompletedStorageValidation {
     key: Rc<()>,
     ticket: ValidationTicket,
-    cursor: AsyncStorageValidation,
+    cursor: StorageValidation,
     result: Result<Option<StorageValidationStep>, JournalError>,
     _slot: Slot,
 }
@@ -139,7 +139,7 @@ impl OwnedJournal {
     async fn capture_validation(
         &mut self,
         ticket: ValidationTicket,
-    ) -> Result<AsyncStorageValidation, JournalError> {
+    ) -> Result<StorageValidation, JournalError> {
         if let Some((scope, cursor)) = self.storage_validation.cursor.take()
             && scope == ticket.scope()
             && cursor.generation() == ticket.generation()

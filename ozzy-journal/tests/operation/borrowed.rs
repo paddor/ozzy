@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use ozzy_journal::operation::{
-    AppendHeader, AppendRecordList, append_prepared_record_batch, canonical_body_digest,
+    AppendHeader, AppendRecordList, WireBatch, append_prepared_record_batch, canonical_body_digest,
     decode_append_batches,
 };
 use ozzy_proto::data::OwnedRecord;
@@ -68,15 +68,13 @@ fn wire_proofs_check_destination_limits_and_patched_positions() {
             ozzy_proto::append::PayloadEncoding::Lz4 => lz4rip::block::compress(&payload),
         };
         let mut canonical = Vec::new();
-        let (_, proof) = append_wire_record_batch(
-            &mut canonical,
+        let batch = WireBatch {
             header,
-            descriptors,
+            records: descriptors,
             encoding,
-            &encoded,
-            limits,
-        )
-        .unwrap();
+            payload: &encoded,
+        };
+        let (_, proof) = append_wire_record_batch(&mut canonical, batch, limits).unwrap();
         let batch = proof.batch(&canonical, limits).unwrap();
         assert_eq!(
             batch.summary,
@@ -154,7 +152,7 @@ fn prepared_lz4_is_exact_and_replaces_raw_canonical_payload() {
     .unwrap();
     {
         let batches = decode_append_batches(&body, OperationLimits::default()).unwrap();
-        let prepared = batches[0].prepared_payload.unwrap();
+        let prepared = batches[0].prepared_payload().unwrap();
         assert_eq!(prepared.encoding, ozzy_proto::append::PayloadEncoding::Lz4);
         assert_eq!(prepared.decoded_bytes, raw.len());
         assert_eq!(prepared.encoded, encoded);

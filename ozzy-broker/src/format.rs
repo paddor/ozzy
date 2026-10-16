@@ -22,7 +22,8 @@ pub async fn format_partition_journals(
     preflight(&journals)?;
     let journals = Arc::new(journals.partitions);
     let roots: Arc<std::collections::BTreeMap<_, _>> = Arc::new(
-        checked.deployment.deployment().brokers[&checked.plan.name]
+        checked
+            .local_broker()?
             .devices
             .iter()
             .map(|(name, device)| (name.clone(), device.root.clone()))
@@ -31,14 +32,19 @@ pub async fn format_partition_journals(
     let (devices, lanes) = DevicePools::start(&checked.plan)?;
     let application = ApplicationShards::start(&checked.plan, lanes, move |mut context| {
         let journals = journals.clone();
-        let root = roots[&context.plan.device].clone();
+        let root = roots.get(&context.plan.device).cloned();
         async move {
+            let root = root.ok_or_else(|| {
+                StartupError::Runtime(format!("unknown device {}", context.plan.device))
+            })?;
             let mut directories = BTreeSet::new();
             for partition in journals.iter().filter(|partition| partition.placement.shard == context.plan.id) {
-                if context.shutdown.is_requested() { return Ok(()); }
+                if context.shutdown.is_closed() { return Ok(()); }
                 let path = partition.placement.directory.clone();
-                let parent = path.parent().expect("checked partition path").to_path_buf();
-                let relative = parent.strip_prefix(&root).expect("checked device root");
+                let parent = crate::parent_directory(&path)?;
+                let relative = parent
+                    .strip_prefix(&root)
+                    .map_err(|_| io_error(parent, io::ErrorKind::InvalidInput.into()))?;
                 let mut directory = root.clone();
                 for component in relative.components() {
                     directory.push(component);
@@ -47,13 +53,13 @@ pub async fn format_partition_journals(
                     }
                 }
                 let opened = tokio::select! {
-                    () = context.shutdown.requested() => return Ok(()),
+                    () = context.shutdown.closed() => return Ok(()),
                     result = partition.clone().format(context.io.clone(), JournalGeneration(uuid::Uuid::now_v7().as_u128())) => result?,
                 };
                 opened.journal.shutdown().await.map_err(|source| StartupError::Journal { path, source })?;
             }
             context.ready()?;
-            context.shutdown.requested().await;
+            context.shutdown.closed().await;
             Ok(())
         }
     }).await;
@@ -75,7 +81,7 @@ fn preflight(journals: &JournalPlan) -> Result<(), StartupError> {
             Err(error) => return Err(io_error(path, error)),
             Ok(_) => return Err(io_error(path, io::ErrorKind::AlreadyExists.into())),
         }
-        let parent = path.parent().expect("checked partition path");
+        let parent = crate::parent_directory(path)?;
         match fs::symlink_metadata(parent) {
             Ok(metadata) if metadata.is_dir() && !metadata.is_symlink() => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -105,7 +111,7 @@ async fn initialize_directory(
     }
     // Open verifies directory type without following the final path component.
     // Sync both this directory and its parent before publishing partition files.
-    for directory in [path, path.parent().expect("checked directory path")] {
+    for directory in [path, crate::parent_directory(path)?] {
         let opened = io
             .execute(
                 Class::Progress,

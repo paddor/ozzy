@@ -106,14 +106,14 @@ impl Driver {
         if journal.faulted {
             return Err(ProgressError::Faulted.into());
         }
-        Ok(ValidationTicket::from_local_image(
-            self.configuration.broker(),
-            self.configuration.scope(),
-            journal.generation,
-            self.accepted,
-            self.committed,
-            self.applied,
-        ))
+        Ok(ValidationTicket {
+            local: self.configuration.broker(),
+            scope: self.configuration.scope(),
+            generation: journal.generation,
+            accepted: self.accepted,
+            committed: self.committed,
+            applied: self.applied,
+        })
     }
 
     /// Admit only a fresh contiguous suffix validated on this exact image.
@@ -201,14 +201,7 @@ impl Driver {
         {
             return Err(Error::ApplyBeyondDurable);
         }
-        while self
-            .operations
-            .front()
-            .is_some_and(|operation| operation.prefix.op <= through.op)
-        {
-            let operation = self.operations.pop_front().expect("checked prefix");
-            self.body_bytes -= operation.body_bytes;
-        }
+        self.body_bytes -= crate::release_through(&mut self.operations, through.op);
         self.applied = through;
         Ok(())
     }

@@ -8,6 +8,7 @@ use ozzy_proto::{
 use ozzy_runtime::replicated::{BrokerLinkError, ProgressError, TopicRoutes};
 use ozzy_sim::broker::Cluster;
 
+mod churn;
 mod deletion;
 mod reader;
 
@@ -31,6 +32,30 @@ async fn authority(cluster: &Cluster, routes: &TopicRoutes, number: u32) -> (Nod
         }
     })
     .await
+}
+
+/// Progress as the SDK processing driver sends it: a response timeout resends
+/// the cumulative cursor, which is safe to repeat. A loaded suite can delay
+/// one commit past the request timeout; any other outcome returns at once.
+async fn progress(
+    cluster: &Cluster,
+    links: &BrokerLinks,
+    leader: NodeId,
+    request: progress::Request,
+) -> Result<progress::Confirmed, BrokerLinkError> {
+    let mut attempts = 3;
+    loop {
+        let result = tokio::select! {
+            result = links.group_progress(leader, request) => result,
+            (result, broker, _) = futures::future::select_all(
+                cluster.brokers.iter().map(|broker| Box::pin(broker.closed())),
+            ) => panic!("broker {broker} exited during group progress: {result:?}"),
+        };
+        attempts -= 1;
+        if attempts == 0 || !matches!(result, Err(BrokerLinkError::Timeout)) {
+            return result;
+        }
+    }
 }
 
 async fn join(
@@ -185,7 +210,7 @@ async fn failover_during_drain(policy: Confirmation) {
         .await
         .unwrap();
     }
-    let routes = links.routes(writer.metadata().clone()).unwrap();
+    let routes = links.routes(writer.metadata().clone()).await.unwrap();
     let first = join(&cluster, &links, &routes, 2, Mode::Join, Vec::new(), true).await;
     assert_eq!(first.targets.len(), 4);
     let mut owned = Vec::new();
@@ -193,23 +218,21 @@ async fn failover_during_drain(policy: Confirmation) {
         let assigned = activate(&cluster, &links, &routes, &first, 2, *target).await;
         assert_eq!((assigned.epoch, assigned.cursor), (1, Offset::ZERO));
         let (leader, authority) = authority(&cluster, &routes, target.number).await;
-        let reply = live_many(
-            &cluster.brokers,
-            "confirm processing before failover",
-            links.group_progress(
-                leader,
-                progress::Request {
-                    authority,
-                    assignment: progress::Assignment {
-                        group: first.group,
-                        partition: target.partition,
-                        member: ConsumerMemberId::from_bytes([2; 16]),
-                        epoch: assigned.epoch,
-                    },
-                    policy: routes.metadata().policy(),
-                    cursor: Some(Offset::new(1)),
+        let reply = progress(
+            &cluster,
+            &links,
+            leader,
+            progress::Request {
+                authority,
+                assignment: progress::Assignment {
+                    group: first.group,
+                    partition: target.partition,
+                    member: ConsumerMemberId::from_bytes([2; 16]),
+                    epoch: assigned.epoch,
                 },
-            ),
+                policy: routes.metadata().policy(),
+                cursor: Some(Offset::new(1)),
+            },
         )
         .await
         .unwrap();
@@ -306,22 +329,23 @@ async fn failover_during_drain(policy: Confirmation) {
         );
         let (leader, authority) = authority(&cluster, &routes, target.number).await;
         assert!(matches!(
-            links
-                .group_progress(
-                    leader,
-                    progress::Request {
-                        authority,
-                        assignment: progress::Assignment {
-                            group: first.group,
-                            partition: target.partition,
-                            member: ConsumerMemberId::from_bytes([2; 16]),
-                            epoch: 1
-                        },
-                        policy: routes.metadata().policy(),
-                        cursor: Some(Offset::new(1)),
-                    }
-                )
-                .await,
+            progress(
+                &cluster,
+                &links,
+                leader,
+                progress::Request {
+                    authority,
+                    assignment: progress::Assignment {
+                        group: first.group,
+                        partition: target.partition,
+                        member: ConsumerMemberId::from_bytes([2; 16]),
+                        epoch: 1
+                    },
+                    policy: routes.metadata().policy(),
+                    cursor: Some(Offset::new(1)),
+                }
+            )
+            .await,
             Err(BrokerLinkError::Progress(ProgressError::Fenced))
         ));
     }

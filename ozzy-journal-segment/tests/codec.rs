@@ -1,7 +1,17 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
+
 #[cfg(feature = "lz4")]
 use ozzy_journal_segment::{BodyEncoding, encode_group_with_body_encoding};
 use ozzy_journal_segment::{
-    CanonicalOperation, ChainPosition, CodecError, DecodeLimits, Digest, OperationKind,
+    CanonicalOperation, ChainPosition, CodecError, DecodeLimits, Digest, GroupStart, OperationKind,
     SEGMENT_HEADER_BYTES, SegmentHeader, TailState, decode_group, decode_segment_header,
     encode_group, encode_segment_header, logical_operation_digest, scan_segment,
 };
@@ -120,9 +130,7 @@ fn physical_group_matches_frozen_layout_and_round_trips() {
     let operations = two_operations();
     let encoded = encode_group(
         &segment,
-        1,
-        SEGMENT_HEADER_BYTES as u64,
-        ChainPosition::GENESIS,
+        GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS),
         &operations,
     )
     .unwrap();
@@ -136,9 +144,7 @@ fn physical_group_matches_frozen_layout_and_round_trips() {
 
     let decoded = decode_group(
         &segment,
-        1,
-        SEGMENT_HEADER_BYTES as u64,
-        ChainPosition::GENESIS,
+        GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS),
         encoded.as_bytes(),
         DecodeLimits::default(),
     )
@@ -172,9 +178,7 @@ fn every_truncated_group_prefix_is_rejected() {
     let operations = two_operations();
     let encoded = encode_group(
         &segment,
-        1,
-        SEGMENT_HEADER_BYTES as u64,
-        ChainPosition::GENESIS,
+        GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS),
         &operations,
     )
     .unwrap();
@@ -183,11 +187,9 @@ fn every_truncated_group_prefix_is_rejected() {
         assert!(
             decode_group(
                 &segment,
-                1,
-                SEGMENT_HEADER_BYTES as u64,
-                ChainPosition::GENESIS,
+                GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS),
                 &encoded.as_bytes()[..length],
-                DecodeLimits::default(),
+                DecodeLimits::default()
             )
             .is_err(),
             "accepted truncated group at {length} bytes"
@@ -201,9 +203,7 @@ fn corruption_and_wrong_chain_are_rejected() {
     let operations = two_operations();
     let encoded = encode_group(
         &segment,
-        1,
-        SEGMENT_HEADER_BYTES as u64,
-        ChainPosition::GENESIS,
+        GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS),
         &operations,
     )
     .unwrap();
@@ -214,11 +214,9 @@ fn corruption_and_wrong_chain_are_rejected() {
         assert!(
             decode_group(
                 &segment,
-                1,
-                SEGMENT_HEADER_BYTES as u64,
-                ChainPosition::GENESIS,
+                GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS),
                 &corrupt,
-                DecodeLimits::default(),
+                DecodeLimits::default()
             )
             .is_err(),
             "accepted corruption at byte {offset}"
@@ -228,11 +226,13 @@ fn corruption_and_wrong_chain_are_rejected() {
     assert!(matches!(
         decode_group(
             &segment,
-            1,
-            SEGMENT_HEADER_BYTES as u64,
-            ChainPosition::new(2, Digest::ZERO),
+            GroupStart::new(
+                1,
+                SEGMENT_HEADER_BYTES as u64,
+                ChainPosition::new(2, Digest::ZERO)
+            ),
             encoded.as_bytes(),
-            DecodeLimits::default(),
+            DecodeLimits::default()
         ),
         Err(CodecError::ChainMismatch { expected_op: 2 })
     ));
@@ -244,9 +244,7 @@ fn decoder_enforces_body_and_entry_count_limits() {
     let operations = two_operations();
     let encoded = encode_group(
         &segment,
-        1,
-        SEGMENT_HEADER_BYTES as u64,
-        ChainPosition::GENESIS,
+        GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS),
         &operations,
     )
     .unwrap();
@@ -254,14 +252,12 @@ fn decoder_enforces_body_and_entry_count_limits() {
     assert!(matches!(
         decode_group(
             &segment,
-            1,
-            SEGMENT_HEADER_BYTES as u64,
-            ChainPosition::GENESIS,
+            GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS),
             encoded.as_bytes(),
             DecodeLimits {
                 max_entries: 1,
                 ..DecodeLimits::default()
-            },
+            }
         ),
         Err(CodecError::LimitExceeded {
             kind: "entry count",
@@ -271,14 +267,12 @@ fn decoder_enforces_body_and_entry_count_limits() {
     assert!(matches!(
         decode_group(
             &segment,
-            1,
-            SEGMENT_HEADER_BYTES as u64,
-            ChainPosition::GENESIS,
+            GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS),
             encoded.as_bytes(),
             DecodeLimits {
                 max_decoded_body_bytes: 4,
                 ..DecodeLimits::default()
-            },
+            }
         ),
         Err(CodecError::LimitExceeded {
             kind: "decoded body bytes",
@@ -303,9 +297,7 @@ fn scan_keeps_complete_groups_and_classifies_every_truncated_tail() {
     let first = operation(1, Digest::ZERO, OperationKind::Barrier, b"first");
     let first_group = encode_group(
         &segment,
-        1,
-        SEGMENT_HEADER_BYTES as u64,
-        ChainPosition::GENESIS,
+        GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS),
         &[first],
     )
     .unwrap();
@@ -317,9 +309,7 @@ fn scan_keeps_complete_groups_and_classifies_every_truncated_tail() {
     );
     let second_group = encode_group(
         &segment,
-        2,
-        first_group.end_offset(),
-        first_group.next_chain(),
+        GroupStart::new(2, first_group.end_offset(), first_group.next_chain()),
         &[second],
     )
     .unwrap();
@@ -331,9 +321,7 @@ fn scan_keeps_complete_groups_and_classifies_every_truncated_tail() {
     );
     let third_group = encode_group(
         &segment,
-        3,
-        second_group.end_offset(),
-        second_group.next_chain(),
+        GroupStart::new(3, second_group.end_offset(), second_group.next_chain()),
         &[third],
     )
     .unwrap();
@@ -372,9 +360,7 @@ fn scan_distinguishes_unused_zeros_from_corruption() {
     let operations = two_operations();
     let group = encode_group(
         &segment,
-        1,
-        SEGMENT_HEADER_BYTES as u64,
-        ChainPosition::GENESIS,
+        GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS),
         &operations,
     )
     .unwrap();
@@ -419,9 +405,7 @@ fn compression_requires_possible_physical_savings(encoding: BodyEncoding) {
     let one_write = operation(1, Digest::ZERO, OperationKind::Barrier, &one_write_body);
     let encoded = encode_group_with_body_encoding(
         &segment(),
-        1,
-        SEGMENT_HEADER_BYTES as u64,
-        ChainPosition::GENESIS,
+        GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS),
         &[one_write],
         encoding,
     )
@@ -429,9 +413,7 @@ fn compression_requires_possible_physical_savings(encoding: BodyEncoding) {
     assert_eq!(&encoded.as_bytes()[176..178], &[0, 0]);
     let decoded = decode_group(
         &segment(),
-        1,
-        SEGMENT_HEADER_BYTES as u64,
-        ChainPosition::GENESIS,
+        GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS),
         encoded.as_bytes(),
         DecodeLimits::default(),
     )
@@ -450,17 +432,13 @@ fn compression_requires_possible_physical_savings(encoding: BodyEncoding) {
     let operations = [first, second];
     let raw = encode_group(
         &segment(),
-        1,
-        SEGMENT_HEADER_BYTES as u64,
-        ChainPosition::GENESIS,
+        GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS),
         &operations,
     )
     .unwrap();
     let compressed = encode_group_with_body_encoding(
         &segment(),
-        1,
-        SEGMENT_HEADER_BYTES as u64,
-        ChainPosition::GENESIS,
+        GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS),
         &operations,
         encoding,
     )
@@ -468,9 +446,7 @@ fn compression_requires_possible_physical_savings(encoding: BodyEncoding) {
     assert!(compressed.as_bytes().len() < raw.as_bytes().len());
     let decoded = decode_group(
         &segment(),
-        1,
-        SEGMENT_HEADER_BYTES as u64,
-        ChainPosition::GENESIS,
+        GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS),
         compressed.as_bytes(),
         DecodeLimits::default(),
     )
@@ -487,17 +463,13 @@ fn compressed_body_roundtrip(encoding: BodyEncoding) {
     let operation = operation(1, Digest::ZERO, OperationKind::Append, &body);
     let raw = encode_group(
         &segment(),
-        1,
-        SEGMENT_HEADER_BYTES as u64,
-        ChainPosition::GENESIS,
+        GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS),
         &[operation],
     )
     .unwrap();
     let encoded = encode_group_with_body_encoding(
         &segment(),
-        1,
-        SEGMENT_HEADER_BYTES as u64,
-        ChainPosition::GENESIS,
+        GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS),
         &[operation],
         encoding,
     )
@@ -512,9 +484,7 @@ fn compressed_body_roundtrip(encoding: BodyEncoding) {
     );
     let decoded = decode_group(
         &segment(),
-        1,
-        SEGMENT_HEADER_BYTES as u64,
-        ChainPosition::GENESIS,
+        GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS),
         encoded.as_bytes(),
         DecodeLimits::default(),
     )

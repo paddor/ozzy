@@ -93,7 +93,7 @@ fn donors(controller: &mut Controller, io: &Local, policy: QuorumPolicy) -> (Rep
         primary.journal.retire_confirmed_history(
             primary.driver.begin_validation().unwrap(),
             ozzy_proto::CheckpointId::from_bytes([87; 16]),
-            ozzy_journal_segment::AsyncRetirementBudget {
+            ozzy_journal_segment::RetirementBudget {
                 max_segments: 1,
                 max_read_bytes: 32768,
             },

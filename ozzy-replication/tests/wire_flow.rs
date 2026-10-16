@@ -1,3 +1,13 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
+
 use ozzy_journal::operation::{
     Barrier, CanonicalOperation, OperationBody, OperationKind, OperationLimits,
     canonical_body_digest, encode_operation_body,
@@ -214,13 +224,15 @@ fn credited_prepare_reuses_canonical_bytes_and_adds_one_epoch_per_batch() {
     let mut metadata = [0xff; 512];
     let mut payload = [0xff; 64];
     let encoded = wire::encode_flow_prepare(
-        node(0),
-        session(),
+        wire::EncodeContext {
+            sender: node(0),
+            session: session(),
+            limits: WireLimits::default(),
+        },
         epoch(),
         prepare,
         &mut metadata,
         &mut payload,
-        WireLimits::default(),
     )
     .unwrap();
     assert_eq!(encoded.header[5], 0x51);
@@ -263,13 +275,15 @@ fn wrong_epoch_is_rejected_before_body_hashing_and_legacy_cannot_bypass_credit()
     let mut metadata = [0xff; 512];
     let mut payload = [0xff; 64];
     let encoded = wire::encode_flow_prepare(
-        node(0),
-        session(),
+        wire::EncodeContext {
+            sender: node(0),
+            session: session(),
+            limits: WireLimits::default(),
+        },
         epoch(),
         prepare,
         &mut metadata,
         &mut payload,
-        WireLimits::default(),
     )
     .unwrap();
     payload[0] ^= 1;
@@ -303,12 +317,14 @@ fn wrong_epoch_is_rejected_before_body_hashing_and_legacy_cannot_bypass_credit()
         Err(WireError::Digest)
     );
     let legacy = wire::encode_prepare(
-        node(0),
-        session(),
+        wire::EncodeContext {
+            sender: node(0),
+            session: session(),
+            limits: WireLimits::default(),
+        },
         prepare,
         &mut metadata,
         &mut payload,
-        WireLimits::default(),
     )
     .unwrap();
     assert_eq!(
@@ -507,13 +523,15 @@ fn credited_prepare_rejects_truncated_extended_and_empty_batches_atomically() {
     let mut metadata = [0xff; 512];
     let mut payload = [0xff; 64];
     let encoded = wire::encode_flow_prepare(
-        node(0),
-        session(),
+        wire::EncodeContext {
+            sender: node(0),
+            session: session(),
+            limits: WireLimits::default(),
+        },
         epoch(),
         prepare,
         &mut metadata,
         &mut payload,
-        WireLimits::default(),
     )
     .unwrap();
     for length in 0..=encoded.metadata_bytes + 1 {
@@ -537,29 +555,33 @@ fn credited_prepare_rejects_truncated_extended_and_empty_batches_atomically() {
     let before = (metadata, payload);
     assert!(
         wire::encode_flow_prepare(
-            node(0),
-            session(),
+            wire::EncodeContext {
+                sender: node(0),
+                session: session(),
+                limits: WireLimits::default()
+            },
             epoch(),
             Prepare {
                 operations: &[],
                 ..prepare
             },
             &mut metadata,
-            &mut payload,
-            WireLimits::default()
+            &mut payload
         )
         .is_err()
     );
     assert_eq!((metadata, payload), before);
     assert!(
         wire::encode_flow_prepare(
-            node(0),
-            session(),
+            wire::EncodeContext {
+                sender: node(0),
+                session: session(),
+                limits: WireLimits::default()
+            },
             epoch(),
             prepare,
             &mut metadata[..100],
-            &mut payload,
-            WireLimits::default()
+            &mut payload
         )
         .is_err()
     );

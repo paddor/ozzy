@@ -77,14 +77,14 @@ fn async_suffix_splits_only_at_operation_boundaries_and_obeys_decoded_segment_li
         }
         let mut staging = drive(
             &mut controller,
-            journal.begin_suffix_replacement(
+            journal.begin_suffix_replacement(crate::SuffixRequest {
                 replacement,
-                previous,
-                SuffixStreamLimits {
+                accepted: previous,
+                limits: SuffixStreamLimits {
                     max_group_body_bytes: 8192,
                     ..stream_limits()
                 },
-            ),
+            }),
         )
         .unwrap();
         if case == 1 {
@@ -114,8 +114,10 @@ fn async_suffix_splits_only_at_operation_boundaries_and_obeys_decoded_segment_li
             Journal::open(
                 "/group".into(),
                 io,
-                identity(),
-                Some(CONFIG),
+                crate::ExpectedStore {
+                    identity: identity(),
+                    configuration: Some(CONFIG),
+                },
                 JournalGeneration(12),
                 bounds,
             ),
@@ -155,7 +157,11 @@ fn async_suffix_requires_exact_authority_and_valid_bounds_before_creating_files(
         assert!(
             drive(
                 &mut controller,
-                journal.begin_suffix_replacement(replacement, LogPosition::GENESIS, bounds)
+                journal.begin_suffix_replacement(crate::SuffixRequest {
+                    replacement,
+                    accepted: LogPosition::GENESIS,
+                    limits: bounds,
+                })
             )
             .is_err()
         );

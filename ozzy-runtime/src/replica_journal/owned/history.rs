@@ -1,10 +1,10 @@
 //! Source-bound election history with asynchronous reads and deletion protection.
 
-use super::{AppendBuffer, AsyncJournalHistory, JournalError, OwnedJournal, prefix};
+use super::{AppendBuffer, JournalError, JournalHistory, OwnedJournal, prefix};
 use crate::replica_journal::{FetchedHistory, HistoryPosition, authority::position};
 use ozzy_replication::{LogSource, OpNumber, wire::FetchOps};
 
-pub(super) fn source(history: &AsyncJournalHistory) -> LogSource {
+pub(super) fn source(history: &JournalHistory) -> LogSource {
     LogSource {
         voter: history.identity().replica_node_id,
         generation: history.generation(),
@@ -49,7 +49,7 @@ impl OwnedJournal {
         Ok(requested)
     }
 
-    fn history(&mut self, requested: LogSource) -> Result<&mut AsyncJournalHistory, JournalError> {
+    fn history(&mut self, requested: LogSource) -> Result<&mut JournalHistory, JournalError> {
         self.history
             .as_mut()
             .filter(|history| source(history) == requested)
@@ -131,7 +131,7 @@ impl OwnedJournal {
 }
 
 pub(super) async fn fetch(
-    history: &mut AsyncJournalHistory,
+    history: &mut JournalHistory,
     request: FetchOps,
     mut buffer: AppendBuffer,
     backpressure: bool,

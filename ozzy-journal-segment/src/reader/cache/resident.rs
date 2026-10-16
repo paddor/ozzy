@@ -81,36 +81,32 @@ impl ResidentOperations {
         segment: u64,
         operation: Arc<CachedOperation>,
     ) {
-        if self
-            .current
-            .as_ref()
-            .is_none_or(|current| current.group != group || current.id != segment)
-        {
-            if let Some(dropped) = self.previous.take() {
-                self.forget(dropped.group, dropped.id);
+        let current = match self.current.take() {
+            Some(current) if current.group == group && current.id == segment => current,
+            stale => {
+                if let Some(dropped) = self.previous.take() {
+                    self.forget(dropped.group, dropped.id);
+                }
+                self.previous = stale;
+                Segment {
+                    group,
+                    id: segment,
+                    operations: HashMap::new(),
+                }
             }
-            self.previous = self.current.take();
-            self.current = Some(Segment {
-                group,
-                id: segment,
-                operations: HashMap::new(),
-            });
-        }
+        };
+        let current = self.current.insert(current);
         let op_number = operation.location.op_number;
         let bytes = operation.resident_bytes();
-        let current = self.current.as_mut().expect("selected resident segment");
         if let Some(replaced) = current.operations.insert(op_number, operation) {
             // Rare replacement: drop the old order entry so bytes stay exact.
-            let position = self
-                .order
-                .iter()
-                .position(|retained| {
-                    retained.group == group
-                        && retained.segment == segment
-                        && retained.op_number == op_number
-                })
-                .expect("ordered resident operation");
-            self.order.remove(position);
+            if let Some(position) = self.order.iter().position(|retained| {
+                retained.group == group
+                    && retained.segment == segment
+                    && retained.op_number == op_number
+            }) {
+                self.order.remove(position);
+            }
             self.bytes -= replaced.resident_bytes();
         }
         self.order.push_back(Retained {
@@ -122,8 +118,8 @@ impl ResidentOperations {
         self.bytes += bytes;
         while (self.bytes > self.limit || self.order.len() > self.max_operations)
             && self.order.len() > 1
+            && let Some(oldest) = self.order.pop_front()
         {
-            let oldest = self.order.pop_front().expect("nonempty order");
             self.bytes -= oldest.bytes;
             for segment in self.current.iter_mut().chain(self.previous.iter_mut()) {
                 if segment.group == oldest.group && segment.id == oldest.segment {

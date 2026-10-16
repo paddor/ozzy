@@ -1,4 +1,5 @@
-use super::{Error, MessageId, Offset, SNAPSHOT_ROW_BYTES, SnapshotHeader, snapshot::read_u64};
+use super::{Error, MessageId, Offset, SNAPSHOT_ROW_BYTES, SnapshotHeader};
+use ozzy_proto::layout::Fixed;
 
 /// One checked identity row from a private snapshot stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,13 +53,14 @@ impl SnapshotRows {
     }
 
     fn decode(&mut self, bytes: &[u8]) -> Result<SnapshotRow, Error> {
-        if self.failed || bytes.len() != SNAPSHOT_ROW_BYTES || self.rows == self.header.rows() {
+        if self.failed || self.rows == self.header.rows() {
             return Err(Error::Snapshot);
         }
+        let bytes: &[u8; SNAPSHOT_ROW_BYTES] = bytes.try_into().map_err(|_| Error::Snapshot)?;
         let row = SnapshotRow {
-            id: MessageId::from_bytes(bytes[..16].try_into().expect("fixed identity")),
-            offset: Offset::new(read_u64(&bytes[16..24])),
-            time: read_u64(&bytes[24..32]),
+            id: MessageId::from_bytes(bytes.array::<0, 16>()),
+            offset: Offset::new(bytes.u64_at::<16>()),
+            time: bytes.u64_at::<24>(),
         };
         if *row.id.as_bytes() == [0; 16]
             || row.offset.get() != self.header.first_offset().get() + self.rows

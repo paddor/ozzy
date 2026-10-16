@@ -1,11 +1,45 @@
 //! Bounded, worker-owned selected-history installation and application activation.
 
-use ozzy_journal_segment::BodyEncoding;
+use ozzy_journal_segment::{BodyEncoding, JournalLimits, SuffixStreamLimits};
 use ozzy_replication::driver::ActivationTicket;
-use ozzy_replication::{InstallTicket, Prefix, PreparedOperation};
+use ozzy_replication::{InstallTicket, PipelineLimits, Prefix, PreparedOperation};
 
-use super::commands::Action;
-use super::{AppendBuffer, JournalCompletion, Rejected, ReplicaJournal, SubmitError};
+use super::commands::{Action, Gate};
+use super::{
+    AppendBuffer, JournalCompletion, JournalError, Rejected, ReplicaJournal, SubmitError,
+    completion,
+};
+
+/// Selected-history installation and activation commands for the journal owner.
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "bounded command slots retain leased arenas inline without per-command boxes"
+)]
+pub(super) enum InstallAction {
+    Begin {
+        ticket: InstallTicket,
+        config: InstallationConfig,
+        done: completion::Sender<Result<InstallTicket, JournalError>>,
+    },
+    Chunk {
+        ticket: InstallTicket,
+        buffer: AppendBuffer,
+        done: completion::Sender<Result<InstalledChunk, JournalError>>,
+    },
+    Finish {
+        ticket: InstallTicket,
+        done: completion::Sender<Result<InstalledJournal, JournalError>>,
+    },
+    Abort {
+        ticket: InstallTicket,
+        done: completion::Sender<Result<InstallTicket, JournalError>>,
+    },
+    Activate {
+        ticket: ActivationTicket,
+        done: completion::Sender<Result<ActivationTicket, JournalError>>,
+    },
+}
 
 /// Physical staging policy. Source, chunk, and manifest bounds come from the owning partition configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,6 +52,34 @@ pub struct InstallationConfig {
     pub max_staged_bytes: u64,
     /// Maximum exclusive-create probes per segment around unselected orphan files.
     pub max_orphan_probes: usize,
+}
+
+impl InstallationConfig {
+    /// Staging bounds of this policy within an owner's segment, group and
+    /// manifest `limits` and its arena `append` limits.
+    pub(super) fn stream_limits(
+        self,
+        limits: &JournalLimits,
+        append: PipelineLimits,
+    ) -> Result<SuffixStreamLimits, JournalError> {
+        if self.segment_capacity > limits.io.max_segment_bytes
+            || !self.body_encoding.is_supported()
+            || self.max_staged_bytes < self.segment_capacity
+            || self.max_orphan_probes == 0
+        {
+            return Err(JournalError::Configuration);
+        }
+        Ok(SuffixStreamLimits {
+            max_group_operations: append.max_operations.min(limits.decode.max_entries),
+            max_group_body_bytes: append
+                .max_body_bytes
+                .min(limits.decode.max_group_decoded_body_bytes),
+            max_segments: limits.metadata.max_segments,
+            max_staged_bytes: self.max_staged_bytes,
+            max_source_segment_bytes: limits.io.max_segment_bytes,
+            max_orphan_probes: self.max_orphan_probes,
+        })
+    }
 }
 
 /// A staged chunk, not a durable installation, commit, or application completion.
@@ -82,19 +144,13 @@ impl ReplicaJournal {
         ticket: InstallTicket,
         config: InstallationConfig,
     ) -> Result<JournalCompletion<InstallTicket>, SubmitError> {
-        self.submit(
-            ticket,
-            |ticket, done| Action::BeginInstall {
+        self.command(Gate::Settled, |done| {
+            Action::Install(InstallAction::Begin {
                 ticket,
                 config,
                 done,
-            },
-            |action| match action {
-                Action::BeginInstall { ticket, .. } => ticket,
-                _ => unreachable!("submission preserves command kind"),
-            },
-        )
-        .map_err(|rejected| rejected.reason)
+            })
+        })
     }
 
     /// Stage the next contiguous canonical chunk strictly after `protected_committed`.
@@ -113,14 +169,13 @@ impl ReplicaJournal {
     ) -> Result<JournalCompletion<InstalledChunk>, Rejected<AppendBuffer>> {
         self.submit(
             buffer,
-            |buffer, done| Action::InstallChunk {
-                ticket,
-                buffer,
-                done,
-            },
-            |action| match action {
-                Action::InstallChunk { buffer, .. } => buffer,
-                _ => unreachable!("submission preserves command kind"),
+            |_| Gate::Free,
+            |buffer, done| {
+                Action::Install(InstallAction::Chunk {
+                    ticket,
+                    buffer,
+                    done,
+                })
             },
         )
     }
@@ -134,15 +189,9 @@ impl ReplicaJournal {
         &mut self,
         ticket: InstallTicket,
     ) -> Result<JournalCompletion<InstallTicket>, SubmitError> {
-        self.submit(
-            ticket,
-            |ticket, done| Action::AbortInstall { ticket, done },
-            |action| match action {
-                Action::AbortInstall { ticket, .. } => ticket,
-                _ => unreachable!("submission preserves command kind"),
-            },
-        )
-        .map_err(|rejected| rejected.reason)
+        self.command(Gate::Settled, |done| {
+            Action::Install(InstallAction::Abort { ticket, done })
+        })
     }
 
     /// Sync all staged bytes, atomically publish the exact selected tail, and replay
@@ -153,15 +202,9 @@ impl ReplicaJournal {
         &mut self,
         ticket: InstallTicket,
     ) -> Result<JournalCompletion<InstalledJournal>, SubmitError> {
-        self.submit(
-            ticket,
-            |ticket, done| Action::FinishInstall { ticket, done },
-            |action| match action {
-                Action::FinishInstall { ticket, .. } => ticket,
-                _ => unreachable!("submission preserves command kind"),
-            },
-        )
-        .map_err(|rejected| rejected.reason)
+        self.command(Gate::Settled, |done| {
+            Action::Install(InstallAction::Finish { ticket, done })
+        })
     }
 
     /// Publish the whole-tail quorum commit and activate its privately rebuilt image.
@@ -171,14 +214,8 @@ impl ReplicaJournal {
         &mut self,
         ticket: ActivationTicket,
     ) -> Result<JournalCompletion<ActivationTicket>, SubmitError> {
-        self.submit(
-            ticket,
-            |ticket, done| Action::Activate { ticket, done },
-            |action| match action {
-                Action::Activate { ticket, .. } => ticket,
-                _ => unreachable!("submission preserves command kind"),
-            },
-        )
-        .map_err(|rejected| rejected.reason)
+        self.command(Gate::Settled, |done| {
+            Action::Install(InstallAction::Activate { ticket, done })
+        })
     }
 }

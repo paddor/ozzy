@@ -1,10 +1,10 @@
 use std::{
-    fs::File,
+    fs::{File, TryLockError},
     io,
     ops::Deref,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -59,6 +59,8 @@ impl Drop for Reservation {
 #[derive(Debug)]
 pub struct OwnedFile {
     file: File,
+    locked: AtomicBool,
+    process: u32,
     _reservation: Reservation,
 }
 
@@ -66,7 +68,27 @@ impl OwnedFile {
     pub(super) fn new(file: File, reservation: Reservation) -> Self {
         Self {
             file,
+            locked: AtomicBool::new(false),
+            process: std::process::id(),
             _reservation: reservation,
+        }
+    }
+
+    pub(super) fn lock(&self) -> Result<(), TryLockError> {
+        self.file.try_lock()?;
+        self.locked.store(true, Ordering::Release);
+        Ok(())
+    }
+}
+
+impl Drop for OwnedFile {
+    fn drop(&mut self) {
+        // flock survives close while a forked child retains the same open file
+        // description, even with CLOEXEC. Release explicitly on the last local
+        // reference. A copied post-fork file must never unlock its parent's lock.
+        if *self.locked.get_mut() && self.process == std::process::id() {
+            // Drop cannot report errors. Closing the file remains the fallback.
+            let _ = self.file.unlock();
         }
     }
 }

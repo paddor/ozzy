@@ -102,9 +102,11 @@ impl SegmentState {
         self.require_healthy()?;
         let result = finalize_group_bodies(
             &self.header,
-            self.next_group_number,
-            self.written.end_offset,
-            self.written.next_chain,
+            crate::GroupStart::new(
+                self.next_group_number,
+                self.written.end_offset,
+                self.written.next_chain,
+            ),
             operations,
             digests,
             &mut prepared,
@@ -136,10 +138,9 @@ impl SegmentState {
         self.segment_digest.push(plan.digest);
         self.written = plan.after;
         self.next_group_number += 1;
-        #[cfg(feature = "storage-metrics")]
-        crate::write_metrics::ENCODED_GROUP_BYTES.fetch_add(
+        ozzy_telemetry::count(
+            ozzy_telemetry::Event::EncodedGroupBytes,
             plan.after.end_offset - plan.before.end_offset,
-            std::sync::atomic::Ordering::Relaxed,
         );
         Ok(self.written)
     }

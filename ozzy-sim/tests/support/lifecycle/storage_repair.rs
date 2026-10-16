@@ -60,15 +60,40 @@ fn finish(sim: &mut Cluster) {
 }
 
 #[test]
-fn every_repair_staging_and_publication_io_cut_retries_with_fresh_authority() {
+fn sampled_repair_staging_and_publication_io_cuts_retry_with_fresh_authority() {
+    repair_io_cuts(4);
+}
+
+mod stress {
+    #[test]
+    fn every_repair_staging_and_publication_io_cut_retries_with_fresh_authority() {
+        super::repair_io_cuts(1);
+    }
+}
+
+/// Every `stride`th of `actions + 1` I/O cuts, always including the last.
+pub(super) fn io_cuts(actions: usize, stride: usize) -> impl Iterator<Item = usize> {
+    (1..=actions + 1).filter(move |cut| cut % stride == 1 % stride || *cut == actions + 1)
+}
+
+fn repair_io_cuts(stride: usize) {
     for publication in [false, true] {
         let mut baseline = replacement(ozzy_replication::QuorumPolicy::Durable);
         until_action(&mut baseline, publication);
-        let before = baseline.replicas[2].storage.as_ref().unwrap().trace().len();
+        let before = baseline.replicas[2]
+            .storage
+            .as_ref()
+            .unwrap()
+            .executed_operations();
         baseline.perform_disk(2);
-        let actions = baseline.replicas[2].storage.as_ref().unwrap().trace().len() - before;
+        let actions = baseline.replicas[2]
+            .storage
+            .as_ref()
+            .unwrap()
+            .executed_operations()
+            - before;
         assert!(actions > 0);
-        for cut in 1..=actions + 1 {
+        for cut in io_cuts(actions, stride) {
             let mut sim = replacement(ozzy_replication::QuorumPolicy::Durable);
             until_action(&mut sim, publication);
             sim.replicas[2].storage.as_mut().unwrap().fail_after(cut);

@@ -1,5 +1,5 @@
 use super::{
-    CHECKPOINT_MANIFEST_FILE, Checkpoint, CheckpointError, CheckpointLimits,
+    Bounds, CHECKPOINT_MANIFEST_FILE, Checkpoint, CheckpointError, CheckpointLimits,
     checkpoint_manifest_digest, chunk_name,
 };
 use crate::async_files::Access;
@@ -20,6 +20,16 @@ pub(crate) struct Config {
     pub(crate) limits: CheckpointLimits,
     pub(crate) io_bytes: usize,
     pub(crate) listing: (usize, usize),
+}
+
+impl Config {
+    const fn bounds(&self) -> Bounds {
+        Bounds {
+            limits: self.limits,
+            chunk_bytes: self.io_bytes,
+            listing: self.listing,
+        }
+    }
 }
 
 /// Frozen source and bounded manifest storage. Contains no complete state image.
@@ -60,9 +70,7 @@ impl Prepared {
                         config.access.clone(),
                         final_root,
                         (config.spec.group_id, config.spec.store_id),
-                        config.limits,
-                        config.io_bytes,
-                        config.listing,
+                        config.bounds(),
                     )
                     .await?,
                 ))
@@ -141,10 +149,16 @@ impl Builder {
     async fn push_inner(&mut self, mut bytes: &[u8]) -> Result<(), CheckpointError> {
         while !bytes.is_empty() {
             let count = bytes.len().min(self.manifest.chunk_remaining());
-            let next = &bytes[..count];
+            let (next, rest) = bytes
+                .split_at_checked(count)
+                .ok_or(CheckpointError::LengthMismatch)?;
+            // The open chunk lives here during a push and in `self.file`
+            // between pushes; a failed push drops it with the build.
+            let mut file = None;
             if let Target::New(root) = &self.target {
-                if self.file.is_none() {
-                    self.file = Some(
+                let open = match self.file.take() {
+                    Some(open) => open,
+                    None => {
                         self.config
                             .access
                             .open(
@@ -153,30 +167,25 @@ impl Builder {
                                 false,
                                 false,
                             )
-                            .await?,
-                    );
-                }
+                            .await?
+                    }
+                };
                 self.config
                     .access
-                    .write_all(
-                        self.file.as_ref().expect("opened chunk"),
-                        self.manifest.chunk_written() as u64,
-                        next,
-                    )
+                    .write_all(&open, self.manifest.chunk_written() as u64, next)
                     .await?;
+                file = Some(open);
             }
             if let Some(chunk) = self.manifest.append(next)? {
                 match &self.target {
                     Target::New(_) => {
-                        let file = self.file.as_ref().expect("written chunk");
-                        self.config.access.sync(file).await?;
-                        self.config
-                            .access
-                            .done(Operation::Close {
-                                handle: file.clone(),
-                            })
-                            .await?;
-                        self.file = None;
+                        if let Some(file) = file.take() {
+                            self.config.access.sync(&file).await?;
+                            self.config
+                                .access
+                                .done(Operation::Close { handle: file })
+                                .await?;
+                        }
                     }
                     Target::Existing(checkpoint) => {
                         if checkpoint.manifest.chunks.get(chunk.ordinal as usize) != Some(&chunk) {
@@ -185,7 +194,8 @@ impl Builder {
                     }
                 }
             }
-            bytes = &bytes[count..];
+            self.file = file;
+            bytes = rest;
         }
         Ok(())
     }
@@ -241,13 +251,12 @@ impl Builder {
             .await?;
         config.access.sync_directory(checkpoints).await?;
         config.access.sync_directory(staging).await?;
+        let bounds = config.bounds();
         Checkpoint::open(
             config.access,
             final_root,
             (config.spec.group_id, config.spec.store_id),
-            config.limits,
-            config.io_bytes,
-            config.listing,
+            bounds,
         )
         .await
     }

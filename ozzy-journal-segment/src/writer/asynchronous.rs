@@ -27,6 +27,32 @@ pub struct Start {
     pub initial_chain: ChainPosition,
 }
 
+/// A segment file path and the backend that runs its jobs. Optional
+/// protection retains the caller's group lock through every job.
+#[derive(Debug, Clone)]
+pub struct File {
+    /// Segment file path.
+    pub path: PathBuf,
+    /// Shard-local backend handle.
+    pub io: Local,
+    /// Caller lock retained through every job, if any.
+    pub protection: Option<Handle>,
+}
+
+impl File {
+    fn into_access(self) -> (PathBuf, files::Access) {
+        (self.path, files::Access::new(self.io, self.protection))
+    }
+}
+
+/// An open buffered segment file with its path and backend access.
+#[derive(Debug)]
+pub(crate) struct Opened {
+    pub(crate) path: PathBuf,
+    pub(crate) access: files::Access,
+    pub(crate) buffered: Handle,
+}
+
 /// Physical I/O policy. Recovery images and each scratch transfer are bounded.
 /// Prepared append bytes must also fit the shard's backend data-byte share.
 #[derive(Debug, Clone, Copy)]
@@ -69,7 +95,8 @@ impl Options {
                 4096 + size_of::<Operation>() + size_of::<Handle>() + size_of::<bytes::Bytes>(),
             )
         });
-        if needed.is_none_or(|bytes| bytes > limits.share(shard, Class::Progress).bytes) {
+        let progress = limits.share(shard, Class::Progress)?.bytes;
+        if needed.is_none_or(|bytes| bytes > progress) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "segment transfer exceeds progress share",
@@ -112,33 +139,34 @@ impl Writer {
     /// A freshly allocated, exclusively owned successor. Only the directory's
     /// private prepared-file type may supply this handle; never adopt leftovers.
     pub(crate) async fn initialize_prepared(
-        path: PathBuf,
-        access: files::Access,
-        buffered: Handle,
+        opened: Opened,
         header: SegmentHeader,
         start: Start,
         options: Options,
     ) -> Result<Self, WriterError> {
+        let Opened {
+            access, buffered, ..
+        } = &opened;
         options.validate(&access.io)?;
         if start.first_group_number == 0 {
             return Err(CodecError::InvalidGroupNumber.into());
         }
         if header.capacity() > options.max_segment_bytes
-            || access.length(&buffered).await? > header.capacity()
+            || access.length(buffered).await? > header.capacity()
         {
             return Err(WriterError::InvalidSyncPosition);
         }
         access
-            .write_all(&buffered, 0, &encode_segment_header(&header))
+            .write_all(buffered, 0, &encode_segment_header(&header))
             .await?;
-        access.sync(&buffered).await?;
+        access.sync(buffered).await?;
         let state = SegmentState::empty(
             header,
             start.generation,
             start.first_group_number,
             start.initial_chain,
         );
-        Self::finish_open(path, state, access, buffered, options).await
+        Self::finish_open(opened, state, options).await
     }
 
     pub(crate) fn complete_prepared(
@@ -187,14 +215,12 @@ impl Writer {
     /// directory owner must still publish and synchronize its directory entry.
     /// Optional protection retains the caller's group lock through every job.
     pub async fn create(
-        path: PathBuf,
-        io: Local,
-        protection: Option<Handle>,
+        file: File,
         header: SegmentHeader,
         start: Start,
         options: Options,
     ) -> Result<Self, WriterError> {
-        options.validate(&io)?;
+        options.validate(&file.io)?;
         if start.first_group_number == 0 {
             return Err(CodecError::InvalidGroupNumber.into());
         }
@@ -204,7 +230,7 @@ impl Writer {
                 limit: options.max_segment_bytes,
             });
         }
-        let access = files::Access::new(io, protection);
+        let (path, access) = file.into_access();
         let buffered = access
             .open(path.clone(), OpenMode::CreateNew, false, false)
             .await?;
@@ -225,23 +251,26 @@ impl Writer {
             start.first_group_number,
             start.initial_chain,
         );
-        Self::finish_open(path, state, access, buffered, options).await
+        let opened = Opened {
+            path,
+            access,
+            buffered,
+        };
+        Self::finish_open(opened, state, options).await
     }
 
     /// Validate the existing bytes before changing a damaged tail. Canonical
     /// requirements control protected-prefix checks and permitted tail repair;
     /// `None` retains the low-level writer's strict structural recovery mode.
     pub async fn recover(
-        path: PathBuf,
-        io: Local,
-        protection: Option<Handle>,
+        file: File,
         start: Start,
         options: Options,
         limits: DecodeLimits,
         requirements: Option<CanonicalRecoveryRequirements>,
     ) -> Result<Self, WriterError> {
-        options.validate(&io)?;
-        let access = files::Access::new(io, protection);
+        options.validate(&file.io)?;
+        let (path, access) = file.into_access();
         let buffered = access
             .open(path.clone(), OpenMode::ReadWrite, false, false)
             .await?;
@@ -262,15 +291,7 @@ impl Writer {
                 discard_damaged_tail: false,
             },
         };
-        let recovered = recovery::prepare_async(
-            &image,
-            start.generation,
-            start.first_group_number,
-            start.initial_chain,
-            limits,
-            validation,
-        )
-        .await?;
+        let recovered = recovery::prepare_async(&image, start, limits, validation).await?;
         if recovered.writer.header().capacity() > options.max_segment_bytes {
             return Err(WriterError::RecoveryLimit {
                 actual: recovered.writer.header().capacity(),
@@ -290,16 +311,24 @@ impl Writer {
             .zero(&buffered, recovered.zero, options.chunk_bytes)
             .await?;
         access.sync(&buffered).await?;
-        Self::finish_open(path, recovered.writer, access, buffered, options).await
+        let opened = Opened {
+            path,
+            access,
+            buffered,
+        };
+        Self::finish_open(opened, recovered.writer, options).await
     }
 
     async fn finish_open(
-        path: PathBuf,
+        opened: Opened,
         mut state: SegmentState,
-        access: files::Access,
-        buffered: Handle,
         options: Options,
     ) -> Result<Self, WriterError> {
+        let Opened {
+            path,
+            access,
+            buffered,
+        } = opened;
         let data_sync = options.write_mode == SegmentWriteMode::DataSync;
         let output = if options.direct || data_sync {
             access

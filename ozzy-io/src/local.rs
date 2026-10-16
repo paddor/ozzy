@@ -51,17 +51,7 @@ impl Local {
                     // Backend queue availability can lag its admission counter.
                     // Yield once rather than spinning on an immediately-ready
                     // capacity future and monopolizing this shard.
-                    let mut yielded = false;
-                    std::future::poll_fn(|cx| {
-                        if yielded {
-                            std::task::Poll::Ready(())
-                        } else {
-                            yielded = true;
-                            cx.waker().wake_by_ref();
-                            std::task::Poll::Pending
-                        }
-                    })
-                    .await;
+                    crate::signal::yield_once().await;
                 }
                 Err(rejected) => return Err(rejected.error),
             }

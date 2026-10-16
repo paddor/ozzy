@@ -15,6 +15,7 @@ members = [
     "ozzy-journal",
     "ozzy-journal-segment",
     "ozzy-sim",
+    "ozzy-test-alloc",
 ]
 default-members = [
     "ozzy",
@@ -70,6 +71,7 @@ ozzy-replication = { path = "ozzy-replication", version = "0.1.1" }
 ozzy-runtime = { path = "ozzy-runtime", version = "0.1.1" }
 ozzy-telemetry = { path = "ozzy-telemetry", version = "0.1.1" }
 ozzy-sim = { path = "ozzy-sim" }
+ozzy-test-alloc = { path = "ozzy-test-alloc" }
 ozzy-journal = { path = "ozzy-journal", version = "0.1.1" }
 ozzy-journal-segment = { path = "ozzy-journal-segment", version = "0.1.1" }
 tempfile = "3.27.0"
@@ -96,9 +98,18 @@ must_use_candidate = "allow"
 cast_possible_truncation = "allow"
 cast_sign_loss = "allow"
 cast_precision_loss = "allow"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+unreachable = "warn"
+todo = "warn"
+unimplemented = "warn"
 
 [profile.bench]
 debug = "line-tables-only"
 
 [profile.release]
 debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2

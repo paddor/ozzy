@@ -2,7 +2,10 @@
 
 use super::append::Authority;
 use super::{ENVELOPE_BYTES, Envelope, EnvelopeError, EnvelopeLimits, Opcode, Packet};
-use crate::{GroupId, NodeId};
+use crate::{
+    GroupId, NodeId,
+    layout::{Fixed, LayoutError, Reader},
+};
 
 /// Routing information, never evidence of primary activation or quorum commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,11 +34,11 @@ impl AuthorityHint {
         let bytes: &[u8; 48] = bytes.try_into().map_err(|_| NackError::Length)?;
         let hint = Self {
             authority: Authority {
-                group_id: GroupId::from_bytes(bytes[..16].try_into().expect("field size")),
-                config_epoch: u64::from_be_bytes(bytes[16..24].try_into().expect("field size")),
-                view: u64::from_be_bytes(bytes[24..32].try_into().expect("field size")),
+                group_id: GroupId::from_bytes(bytes.array::<0, 16>()),
+                config_epoch: bytes.u64_at::<16>(),
+                view: bytes.u64_at::<24>(),
             },
-            primary: NodeId::from_bytes(bytes[32..].try_into().expect("field size")),
+            primary: NodeId::from_bytes(bytes.array::<32, 16>()),
         };
         hint.validate()?;
         Ok(hint)
@@ -118,9 +121,9 @@ pub fn decode(packet: Packet<'_>, limits: EnvelopeLimits) -> Result<Nack<'_>, Na
     if !packet.payload.is_empty() {
         return Err(NackError::Command);
     }
-    let mut bytes = packet.metadata;
-    let code = u16::from_be_bytes(take(&mut bytes, 2)?.try_into().expect("field size"));
-    let retry = match take(&mut bytes, 1)?[0] {
+    let mut reader = Reader::new(packet.metadata);
+    let code = reader.u16()?;
+    let retry = match reader.u8()? {
         1 => RetryClass::Permanent,
         2 => RetryClass::AfterBackoff,
         3 => RetryClass::AfterReconnect,
@@ -128,13 +131,11 @@ pub fn decode(packet: Packet<'_>, limits: EnvelopeLimits) -> Result<Nack<'_>, Na
         5 => RetryClass::UnknownOutcome,
         _ => return Err(NackError::Command),
     };
-    let size = u32::from_be_bytes(take(&mut bytes, 4)?.try_into().expect("field size")) as usize;
-    let detail = take(&mut bytes, size)?;
-    let size = u32::from_be_bytes(take(&mut bytes, 4)?.try_into().expect("field size")) as usize;
-    let diagnostic = std::str::from_utf8(take(&mut bytes, size)?).map_err(|_| NackError::Length)?;
-    if !bytes.is_empty() {
-        return Err(NackError::Length);
-    }
+    let size = reader.u32()? as usize;
+    let detail = reader.take(size)?;
+    let size = reader.u32()? as usize;
+    let diagnostic = std::str::from_utf8(reader.take(size)?).map_err(|_| NackError::Length)?;
+    reader.finish()?;
     Ok(Nack {
         code,
         retry,
@@ -148,12 +149,6 @@ fn command(envelope: Envelope) -> Result<(), NackError> {
         return Err(NackError::Command);
     }
     Ok(())
-}
-
-fn take<'a>(bytes: &mut &'a [u8], size: usize) -> Result<&'a [u8], NackError> {
-    let (value, rest) = bytes.split_at_checked(size).ok_or(NackError::Length)?;
-    *bytes = rest;
-    Ok(value)
 }
 
 /// Malformed or unencodable negative response.
@@ -174,4 +169,10 @@ pub enum NackError {
     /// Caller must reserve sufficient metadata capacity.
     #[error("NACK encode buffer capacity exhausted")]
     Capacity,
+}
+
+impl From<LayoutError> for NackError {
+    fn from(_: LayoutError) -> Self {
+        Self::Length
+    }
 }

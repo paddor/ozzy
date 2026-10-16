@@ -48,6 +48,7 @@ ozzy-sim = { workspace = true, features = ["broker"] }
 loom = "0.7"
 ozzy-io = { workspace = true, features = ["simulation"] }
 ozzy-runtime = { workspace = true, features = ["simulation"] }
+pin-project-lite.workspace = true
 
 [lints]
 workspace = true

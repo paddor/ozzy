@@ -51,7 +51,7 @@ async fn native_journals_format_and_recover_on_symmetric_shards_with_shared_devi
                                 owners.push(opened.journal);
                             }
                             context.ready()?;
-                            context.shutdown.requested().await;
+                            context.shutdown.closed().await;
                             for owner in owners {
                                 owner.shutdown().await.unwrap();
                             }

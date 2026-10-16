@@ -56,10 +56,10 @@ impl Plan {
             || active.sealed
             || segments.iter().any(|segment| segment.capacity == 0)
             || segments.windows(2).any(|pair| {
-                !pair[0].sealed
-                    || pair[0].id >= pair[1].id
-                    || pair[0].last_operation > pair[1].last_operation
-                    || pair[0].record_end > pair[1].record_end
+                matches!(pair, [left, right] if !left.sealed
+                    || left.id >= right.id
+                    || left.last_operation > right.last_operation
+                    || left.record_end > right.record_end)
             })
         {
             return Err(PlanError);

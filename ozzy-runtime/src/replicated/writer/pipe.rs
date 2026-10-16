@@ -11,8 +11,8 @@
 
 use std::sync::Arc;
 
-use crate::command_channel::TryRecvError;
 use crate::signal::DataSignal;
+use fanring::mpsc::TryRecvError;
 
 use super::{WriterError, completion, state::Queued};
 

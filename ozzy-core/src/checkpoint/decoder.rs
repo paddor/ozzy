@@ -12,7 +12,8 @@ pub struct Decoder {
     header_bytes: usize,
     layout: Option<Layout>,
     core: Vec<u8>,
-    rows: Option<SnapshotRows>,
+    /// Identity section and its row cursor, when the image has one.
+    rows: Option<(Identities, SnapshotRows)>,
     row: [u8; SNAPSHOT_ROW_BYTES],
     row_bytes: usize,
     failed: bool,
@@ -64,35 +65,28 @@ impl Decoder {
         mut on_header: impl FnMut(Layout) -> Result<(), Error>,
         mut on_row: impl FnMut(Identities, &[u8; SNAPSHOT_ROW_BYTES]) -> Result<(), crate::dedup::Error>,
     ) -> Result<(), Error> {
-        if self.header_bytes != HEADER_BYTES {
-            let count = bytes.len().min(HEADER_BYTES - self.header_bytes);
-            self.header[self.header_bytes..self.header_bytes + count]
-                .copy_from_slice(&bytes[..count]);
-            self.header_bytes += count;
-            bytes = &bytes[count..];
+        let layout = if let Some(layout) = self.layout {
+            layout
+        } else {
+            fill(&mut self.header, &mut self.header_bytes, &mut bytes);
             if self.header_bytes != HEADER_BYTES {
                 return Ok(());
             }
-            self.prepare_sections(&mut on_header)?;
-        }
-        let layout = self.layout.expect("validated complete header");
+            self.prepare_sections(&mut on_header)?
+        };
         let core_bytes = layout.core_bytes() as usize;
-        let count = bytes.len().min(core_bytes - self.core.len());
-        self.core.extend_from_slice(&bytes[..count]);
-        bytes = &bytes[count..];
+        let (core, rest) = bytes.split_at(bytes.len().min(core_bytes - self.core.len()));
+        self.core.extend_from_slice(core);
+        bytes = rest;
         if !bytes.is_empty() {
-            let image = layout.identities().ok_or(Error::Length)?;
+            let Some((image, rows)) = self.rows.as_mut() else {
+                return Err(Error::Length);
+            };
             while !bytes.is_empty() {
-                let count = bytes.len().min(SNAPSHOT_ROW_BYTES - self.row_bytes);
-                self.row[self.row_bytes..self.row_bytes + count].copy_from_slice(&bytes[..count]);
-                self.row_bytes += count;
-                bytes = &bytes[count..];
+                fill(&mut self.row, &mut self.row_bytes, &mut bytes);
                 if self.row_bytes == SNAPSHOT_ROW_BYTES {
-                    self.rows
-                        .as_mut()
-                        .expect("identity cursor")
-                        .push(&self.row)?;
-                    on_row(image, &self.row)?;
+                    rows.push(&self.row)?;
+                    on_row(*image, &self.row)?;
                     self.row_bytes = 0;
                 }
             }
@@ -103,7 +97,7 @@ impl Decoder {
     fn prepare_sections(
         &mut self,
         mut on_header: impl FnMut(Layout) -> Result<(), Error>,
-    ) -> Result<(), Error> {
+    ) -> Result<Layout, Error> {
         let layout = Layout::decode(&self.header)?;
         let bytes = usize::try_from(layout.core_bytes()).map_err(|_| Error::Length)?;
         if layout.encoded_bytes()? != self.expected_bytes || bytes > self.maximum_core_bytes {
@@ -115,9 +109,9 @@ impl Decoder {
             .map_err(|_| Error::Allocation)?;
         self.rows = layout
             .identities()
-            .map(|image| SnapshotRows::new(image.header));
+            .map(|image| (image, SnapshotRows::new(image.header)));
         self.layout = Some(layout);
-        Ok(())
+        Ok(layout)
     }
 
     /// Finish complete section decoding. The caller must separately prove outer
@@ -127,10 +121,23 @@ impl Decoder {
         if self.failed
             || self.core.len() as u64 != layout.core_bytes()
             || self.row_bytes != 0
-            || self.rows.as_ref().is_some_and(|rows| !rows.is_complete())
+            || self
+                .rows
+                .as_ref()
+                .is_some_and(|(_, rows)| !rows.is_complete())
         {
             return Err(Error::Length);
         }
         Ok((layout, self.core))
     }
+}
+
+/// Move what fits of `bytes` into `buffer` after its first `filled` bytes.
+fn fill(buffer: &mut [u8], filled: &mut usize, bytes: &mut &[u8]) {
+    let tail = buffer.get_mut(*filled..).unwrap_or_default();
+    let count = tail.len().min(bytes.len());
+    let (head, rest) = bytes.split_at(count);
+    tail.split_at_mut(count).0.copy_from_slice(head);
+    *filled += count;
+    *bytes = rest;
 }

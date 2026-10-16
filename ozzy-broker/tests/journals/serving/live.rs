@@ -335,6 +335,7 @@ async fn publication_check(policy: Confirmation) {
     let before = publish_record(&brokers, &mut writer, 0).await;
     let route = sdk
         .routes(metadata.clone())
+        .await
         .unwrap()
         .route(0)
         .unwrap()

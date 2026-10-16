@@ -7,13 +7,35 @@ use ozzy_proto::{MessageId, Offset, OwnerEpoch, PartitionIncarnation};
 use ozzy_replication::driver::ValidationTicket;
 use ozzy_replication::{JournalGeneration, Prefix, Scope};
 
-use super::commands::Action;
-use super::{JournalCompletion, Rejected, ReplicaJournal};
+use super::commands::{Action, Gate, Reply};
+use super::{JournalCompletion, OwnedSemaphorePermit, Rejected, ReplicaJournal};
 
 mod buffer;
 pub(crate) mod delivery;
 pub(crate) use buffer::PartitionReadBuffer;
 pub use buffer::PartitionReadLease;
+
+/// Partition read commands: resolve a selector, then read from a cursor.
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "bounded command slots retain their arenas inline without another allocation"
+)]
+pub(super) enum ReadAction {
+    Seek {
+        ticket: ValidationTicket,
+        partition: PartitionIncarnation,
+        start: ozzy_proto::reader::Start,
+        done: Reply<PartitionReadCursor>,
+    },
+    ReadPartition {
+        read_permit: OwnedSemaphorePermit,
+        cursor: PartitionReadCursor,
+        limits: PartitionReadLimits,
+        buffer: PartitionReadLease,
+        done: delivery::ReadReply,
+    },
+}
 
 /// Output bounds for one disk read, independent of writer grouping.
 #[derive(Debug, Clone, Copy)]
@@ -171,20 +193,14 @@ impl ReplicaJournal {
         partition: PartitionIncarnation,
         start: ozzy_proto::reader::Start,
     ) -> Result<JournalCompletion<PartitionReadCursor>, super::SubmitError> {
-        self.submit(
-            start,
-            |start, done| Action::Seek {
+        self.command(Gate::Free, |done| {
+            Action::Read(ReadAction::Seek {
                 ticket,
                 partition,
                 start,
                 done,
-            },
-            |action| match action {
-                Action::Seek { start, .. } => start,
-                _ => unreachable!("seek submission"),
-            },
-        )
-        .map_err(|rejected| rejected.reason)
+            })
+        })
     }
 
     /// Resolve a cursor directly against the owner's applied state, without I/O.
@@ -293,16 +309,15 @@ impl ReplicaJournal {
         };
         self.submit(
             buffer,
-            |buffer, done| Action::ReadPartition {
-                read_permit,
-                cursor,
-                limits,
-                buffer,
-                done: reply(done),
-            },
-            |action| match action {
-                Action::ReadPartition { buffer, .. } => buffer,
-                _ => unreachable!("submission preserves command kind"),
+            |_| Gate::Free,
+            |buffer, done| {
+                Action::Read(ReadAction::ReadPartition {
+                    read_permit,
+                    cursor,
+                    limits,
+                    buffer,
+                    done: reply(done),
+                })
             },
         )
     }

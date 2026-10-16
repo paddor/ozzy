@@ -5,6 +5,7 @@ use bytes::Bytes;
 use futures::{StreamExt, stream::FuturesUnordered};
 use omq_tokio::{Endpoint, IdentitySocket, Message, Socket, SocketType, TrySendError};
 use ozzy_proto::{GroupId, NodeId, Opcode};
+use ozzy_runtime::transport::Frames;
 use std::{collections::BTreeMap, future::Future, pin::Pin};
 
 type PublicationWait =
@@ -72,7 +73,6 @@ pub(super) struct Followers {
 impl Followers {
     pub(super) async fn open(
         frontend: &FrontendContext,
-        _brokers: &BTreeMap<NodeId, Endpoint>,
         routes: FollowerRoutes,
     ) -> Result<Self, StartupError> {
         let mut transport = Self {
@@ -133,11 +133,7 @@ impl Followers {
     }
 
     fn destination(&self, message: &Message) -> Option<(NodeId, u32)> {
-        if message.len() != 4 {
-            return None;
-        }
-        let frames =
-            std::array::from_fn::<_, 3, _>(|i| message.part_slice(i + 1).expect("four frames"));
+        let (_, frames) = message.routed_packet()?;
         let packet = ozzy_proto::decode_packet(
             &frames,
             ozzy_proto::EnvelopeLimits {

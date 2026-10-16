@@ -1,7 +1,17 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
+
 use ozzy_journal_segment::{
-    Digest, INDEX_HEADER_BYTES, IndexFileError, IndexLimits, IndexSource, MessageIndexEntry,
-    OffsetIndexEntry, OperationIndexEntry, OperationLocation, RecordLocation, SegmentIndexImage,
-    decode_segment_index, encode_segment_index,
+    Digest, INDEX_HEADER_BYTES, IndexEntries, IndexFileError, IndexLimits, IndexSource,
+    MessageIndexEntry, OffsetIndexEntry, OperationIndexEntry, OperationLocation, RecordLocation,
+    SegmentIndexImage, decode_segment_index, encode_segment_index,
 };
 use ozzy_proto::{GroupId, MessageId, Offset, OperationId, PartitionIncarnation};
 
@@ -35,51 +45,53 @@ fn image() -> SegmentIndexImage {
             last_operation_digest: last_location.operation_digest,
         },
         64 * 1024,
-        vec![
-            OffsetIndexEntry {
-                append_timestamp_millis: 77,
-                partition: second_partition,
-                offset: Offset::new(8),
-                location: RecordLocation {
-                    operation: first_location,
-                    batch_index: 1,
-                    record_index: 0,
+        IndexEntries {
+            offsets: vec![
+                OffsetIndexEntry {
+                    append_timestamp_millis: 77,
+                    partition: second_partition,
+                    offset: Offset::new(8),
+                    location: RecordLocation {
+                        operation: first_location,
+                        batch_index: 1,
+                        record_index: 0,
+                    },
                 },
-            },
-            OffsetIndexEntry {
-                append_timestamp_millis: 0,
-                partition: first_partition,
-                offset: Offset::new(4),
-                location: RecordLocation {
-                    operation: first_location,
-                    batch_index: 0,
-                    record_index: 2,
+                OffsetIndexEntry {
+                    append_timestamp_millis: 0,
+                    partition: first_partition,
+                    offset: Offset::new(4),
+                    location: RecordLocation {
+                        operation: first_location,
+                        batch_index: 0,
+                        record_index: 2,
+                    },
                 },
-            },
-        ],
-        vec![
-            MessageIndexEntry {
-                partition: second_partition,
-                message_id: MessageId::from_bytes([0x41; 16]),
-                offset: Offset::new(8),
-                operation_digest: Digest::from_bytes([0x51; 32]),
-            },
-            MessageIndexEntry {
-                partition: first_partition,
-                message_id: MessageId::from_bytes([0x40; 16]),
-                offset: Offset::new(4),
-                operation_digest: Digest::from_bytes([0x50; 32]),
-            },
-        ],
-        vec![OperationIndexEntry {
-            operation_id: OperationId::from_bytes([0x30; 16]),
-            location: last_location,
-        }],
-        vec![
-            first_location,
-            operation_location(2, 0x80, 4288),
-            last_location,
-        ],
+            ],
+            messages: vec![
+                MessageIndexEntry {
+                    partition: second_partition,
+                    message_id: MessageId::from_bytes([0x41; 16]),
+                    offset: Offset::new(8),
+                    operation_digest: Digest::from_bytes([0x51; 32]),
+                },
+                MessageIndexEntry {
+                    partition: first_partition,
+                    message_id: MessageId::from_bytes([0x40; 16]),
+                    offset: Offset::new(4),
+                    operation_digest: Digest::from_bytes([0x50; 32]),
+                },
+            ],
+            operations: vec![OperationIndexEntry {
+                operation_id: OperationId::from_bytes([0x30; 16]),
+                location: last_location,
+            }],
+            locations: vec![
+                first_location,
+                operation_location(2, 0x80, 4288),
+                last_location,
+            ],
+        },
     )
     .unwrap()
 }
@@ -158,10 +170,12 @@ fn construction_rejects_duplicate_keys_and_invalid_locations() {
         SegmentIndexImage::new(
             image.source(),
             image.build_memory_limit(),
-            vec![duplicate, duplicate],
-            image.messages().to_vec(),
-            image.operations().to_vec(),
-            image.locations().to_vec(),
+            IndexEntries {
+                offsets: vec![duplicate, duplicate],
+                messages: image.messages().to_vec(),
+                operations: image.operations().to_vec(),
+                locations: image.locations().to_vec()
+            }
         )
         .unwrap_err(),
         IndexFileError::UnsortedOrDuplicate("offset")
@@ -173,10 +187,12 @@ fn construction_rejects_duplicate_keys_and_invalid_locations() {
         SegmentIndexImage::new(
             image.source(),
             image.build_memory_limit(),
-            vec![invalid, image.offsets()[1]],
-            image.messages().to_vec(),
-            image.operations().to_vec(),
-            image.locations().to_vec(),
+            IndexEntries {
+                offsets: vec![invalid, image.offsets()[1]],
+                messages: image.messages().to_vec(),
+                operations: image.operations().to_vec(),
+                locations: image.locations().to_vec()
+            }
         )
         .unwrap_err(),
         IndexFileError::InvalidLocation
@@ -203,10 +219,12 @@ fn numeric_selectors_cover_payload_free_operations_near_the_number_limit() {
     let image = SegmentIndexImage::new(
         source,
         0,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        locations.clone(),
+        IndexEntries {
+            offsets: Vec::new(),
+            messages: Vec::new(),
+            operations: Vec::new(),
+            locations: locations.clone(),
+        },
     )
     .unwrap();
     let bytes = encode_segment_index(&image, IndexLimits::default()).unwrap();
@@ -243,10 +261,12 @@ fn numeric_selectors_cover_payload_free_operations_near_the_number_limit() {
         SegmentIndexImage::new(
             source,
             0,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            locations[..2].to_vec()
+            IndexEntries {
+                offsets: Vec::new(),
+                messages: Vec::new(),
+                operations: Vec::new(),
+                locations: locations[..2].to_vec()
+            }
         )
         .unwrap_err(),
         IndexFileError::InvalidLocation
@@ -254,13 +274,33 @@ fn numeric_selectors_cover_payload_free_operations_near_the_number_limit() {
     let mut gap = locations.clone();
     gap[1].op_number = gap[0].op_number;
     assert_eq!(
-        SegmentIndexImage::new(source, 0, Vec::new(), Vec::new(), Vec::new(), gap).unwrap_err(),
+        SegmentIndexImage::new(
+            source,
+            0,
+            IndexEntries {
+                offsets: Vec::new(),
+                messages: Vec::new(),
+                operations: Vec::new(),
+                locations: gap
+            }
+        )
+        .unwrap_err(),
         IndexFileError::InvalidLocation
     );
     let mut overlap = locations;
     overlap[1].entry_offset = overlap[0].entry_offset + 8;
     assert_eq!(
-        SegmentIndexImage::new(source, 0, Vec::new(), Vec::new(), Vec::new(), overlap).unwrap_err(),
+        SegmentIndexImage::new(
+            source,
+            0,
+            IndexEntries {
+                offsets: Vec::new(),
+                messages: Vec::new(),
+                operations: Vec::new(),
+                locations: overlap
+            }
+        )
+        .unwrap_err(),
         IndexFileError::InvalidLocation
     );
 }

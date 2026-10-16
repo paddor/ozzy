@@ -133,10 +133,13 @@ impl Catalog {
         }
         let hot = self.hot_sources(through);
         for source in &hot {
-            let at = self
+            // Hot sources come from this catalog; anything else is searched below.
+            let Ok(at) = self
                 .sources
                 .binary_search_by_key(&source.segment_id, |s| s.segment_id)
-                .expect("cache source belongs to catalog");
+            else {
+                continue;
+            };
             if let Some(location) = self.offset_in(at, partition, offset, through).await? {
                 return Ok(Some(location));
             }
@@ -302,14 +305,16 @@ impl Catalog {
         source: IndexSource,
         lookup: impl FnOnce(&SegmentIndex) -> Result<Option<T>, Error>,
     ) -> Result<Option<T>, Error> {
-        {
+        // Release the cache before running the caller's lookup.
+        let cached = {
             let mut cache = self.cache.borrow_mut();
-            if let Some(at) = cache.hot.iter().position(|index| index.source() == source) {
-                let index = cache.hot.remove(at).expect("cache position exists");
-                let result = lookup(&index);
-                cache.hot.push_front(index);
-                return result;
-            }
+            let at = cache.hot.iter().position(|index| index.source() == source);
+            at.and_then(|at| cache.hot.remove(at))
+        };
+        if let Some(index) = cached {
+            let result = lookup(&index);
+            self.cache.borrow_mut().hot.push_front(index);
+            return result;
         }
         let index = crate::index_builder::asynchronous::open(
             &self.access,

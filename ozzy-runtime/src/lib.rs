@@ -1,8 +1,19 @@
 #![doc = include_str!("../README.md")]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::too_many_lines,
+        clippy::too_many_arguments,
+        reason = "product code is linted without cfg(test)"
+    )
+)]
 
-mod command_channel;
 mod completion;
 pub mod dispatch;
 pub mod frontend;
@@ -11,9 +22,10 @@ mod native_frames;
 mod peer_sessions;
 pub use ozzy_telemetry as profiling;
 mod reader_service;
-mod signal;
-#[cfg(feature = "storage-metrics")]
-pub mod storage_metrics;
+mod returning;
+// Kept as a crate path so the Loom tests can substitute their model.
+use ozzy_io::signal;
+mod turn;
 
 pub mod replica_actor;
 pub mod replica_journal;

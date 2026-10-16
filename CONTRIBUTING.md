@@ -1,8 +1,22 @@
 # Contributing
 
-Run `./scripts/test-all.sh` before submitting changes. Follow `DESIGN.md`. Keep
-protocol logic sans-I/O and storage implementations behind `ozzy-journal`
-contracts.
+Checklist for a change to Ozzy. Check and test details live in
+[DEVELOPMENT.md](DEVELOPMENT.md).
 
-Do not add Ozzy-specific behavior to ZMTP. Ozzy protocol messages are normal
-OMQ multipart messages. Keep payload traffic on direct peer links.
+- [ ] Read [DESIGN.md](DESIGN.md) before an architecture change.
+- [ ] `./scripts/test-all.sh` passes.
+- [ ] The `extended` Nextest profile passes when the change touches TCP,
+  processes, physical storage, or startup.
+- [ ] New tests follow the [test layers](DEVELOPMENT.md#test-layers) and
+  [test rules](DEVELOPMENT.md#test-rules).
+- [ ] Protocol logic stays sans-I/O. Storage implementations stay behind the
+  `ozzy-journal` contracts.
+- [ ] Ozzy messages are normal OMQ multipart messages. No Ozzy-specific
+  behavior goes into ZMTP.
+- [ ] Transport, routing, reconnects, and backpressure stay in OMQ. Socket
+  roles follow [doc/PROTOCOL.md](doc/PROTOCOL.md).
+- [ ] The owning reference doc is updated when a contract changes.
+- [ ] `CHANGELOG.md` gets an entry for user-facing SDK or broker changes
+  only.
+
+Report security issues as described in [SECURITY.md](SECURITY.md).

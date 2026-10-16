@@ -1,5 +1,14 @@
 //! Virtual time and directed links around production driver transitions.
 //! Disk completion below models successful barriers, not filesystem power loss.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "simulation test support"
+)]
 
 use std::collections::VecDeque;
 use std::time::Duration;

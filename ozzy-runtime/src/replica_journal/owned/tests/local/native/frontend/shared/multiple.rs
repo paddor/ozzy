@@ -32,9 +32,11 @@ pub(super) fn service(
         7,
         Kind::Client,
         Class::Data,
-        16,
-        8192,
-        capacity.data.bytes,
+        DataLaneLimits {
+            slots: 16,
+            maximum_retained_bytes: 8192,
+            retained_budget_bytes: capacity.data.bytes,
+        },
     )
     .unwrap();
     let (control, control_rx) = data_channel(
@@ -42,9 +44,11 @@ pub(super) fn service(
         7,
         Kind::Client,
         Class::Control,
-        16,
-        8192,
-        capacity.control.bytes,
+        DataLaneLimits {
+            slots: 16,
+            maximum_retained_bytes: 8192,
+            retained_budget_bytes: capacity.control.bytes,
+        },
     )
     .unwrap();
     let placements = groups

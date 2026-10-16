@@ -31,7 +31,7 @@ pub struct Inbox {
 
 impl Inbox {
     pub(crate) async fn open(
-        journal: &crate::AsyncGroupJournal,
+        journal: &crate::GroupJournal,
         id: CheckpointId,
         bytes: u64,
         expected: Digest,

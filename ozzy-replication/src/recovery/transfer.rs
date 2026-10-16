@@ -14,17 +14,15 @@ impl Recovery {
         anchor: super::CheckpointAnchor,
         state_revision: u64,
     ) -> Result<(), RecoveryError> {
-        self.require_ticket(&ticket)?;
+        let mut pending = self.require_ticket(&ticket)?;
         if ticket.checkpoint() != Some(anchor) {
             return Err(RecoveryError::StaleTransfer);
         }
         if state_revision != anchor.position.op.0 {
             return Err(RecoveryError::ApplicationPending);
         }
-        self.pending
-            .as_mut()
-            .expect("checked transfer")
-            .checkpoint_ready = true;
+        pending.checkpoint_ready = true;
+        self.pending = Some(pending);
         Ok(())
     }
 
@@ -39,7 +37,7 @@ impl Recovery {
         ticket: RecoveryTicket,
         operations: &[PreparedOperation],
     ) -> Result<(), RecoveryError> {
-        let pending = self.require_ticket(&ticket)?;
+        let mut pending = self.require_ticket(&ticket)?;
         if !pending.checkpoint_ready {
             return Err(RecoveryError::ApplicationPending);
         }
@@ -81,10 +79,8 @@ impl Recovery {
             }
             through = operation.prefix;
         }
-        self.pending
-            .as_mut()
-            .expect("checked pending transfer")
-            .through = through;
+        pending.through = through;
+        self.pending = Some(pending);
         Ok(())
     }
 

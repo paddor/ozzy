@@ -1,4 +1,4 @@
-use crate::AsyncSegmentOptions as Options;
+use crate::SegmentOptions as Options;
 use crate::WriterError;
 use ozzy_io::{
     Class, Completed, Handle, Local, OpenMode, Operation, Outcome, SyncMode, WriteBuffer,
@@ -12,6 +12,13 @@ pub(crate) struct Access {
     pub(crate) readers: ReadHandles,
 }
 
+/// `length` bytes of one file, starting at `offset`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Span {
+    pub(crate) offset: u64,
+    pub(crate) length: usize,
+}
+
 pub(crate) type ReadHandles = Rc<RefCell<VecDeque<(PathBuf, crate::IndexSource, Handle)>>>;
 
 impl Access {
@@ -20,6 +27,15 @@ impl Access {
             io,
             protection,
             readers: ReadHandles::default(),
+        }
+    }
+
+    /// The segment file at `path`, run on this backend under this lock.
+    pub(crate) fn segment_file(&self, path: PathBuf) -> crate::SegmentFile {
+        crate::SegmentFile {
+            path,
+            io: self.io.clone(),
+            protection: self.protection.clone(),
         }
     }
 
@@ -32,11 +48,11 @@ impl Access {
     ) -> io::Result<Handle> {
         {
             let mut cache = self.readers.borrow_mut();
-            if let Some(index) = cache
+            if let Some(entry) = cache
                 .iter()
                 .position(|(old, selected, _)| old == &path && *selected == source)
+                .and_then(|index| cache.remove(index))
             {
-                let entry = cache.remove(index).expect("known read handle");
                 let handle = entry.2.clone();
                 cache.push_back(entry);
                 return Ok(handle);
@@ -61,6 +77,17 @@ impl Access {
         }
         cache.push_back((path, source, handle.clone()));
         Ok(handle)
+    }
+
+    /// Drop cached leases of segments the manifest no longer selects. A
+    /// cached lease would keep a removed segment's space allocated; reads
+    /// in flight hold their own.
+    pub(crate) fn retain_read_handles(&self, selected: &[crate::SegmentReference]) {
+        self.readers.borrow_mut().retain(|(_, source, _)| {
+            selected
+                .iter()
+                .any(|reference| reference.segment_id == source.segment_id)
+        });
     }
 
     fn protect(&self, operation: Operation) -> Operation {
@@ -88,7 +115,7 @@ impl Access {
                 .io
                 .admission()
                 .limits()
-                .share(self.io.shard(), Class::Data)
+                .share(self.io.shard(), Class::Data)?
                 .bytes
         {
             return Err(io::Error::new(
@@ -189,7 +216,7 @@ impl Access {
         chunk: usize,
     ) -> io::Result<Vec<u8>> {
         let mut bytes = Vec::new();
-        self.read_append(handle, offset, length, chunk, &mut bytes)
+        self.read_append(handle, Span { offset, length }, chunk, &mut bytes)
             .await?;
         Ok(bytes)
     }
@@ -199,11 +226,11 @@ impl Access {
     pub(crate) async fn read_append(
         &self,
         handle: &Handle,
-        offset: u64,
-        length: usize,
+        span: Span,
         chunk: usize,
         bytes: &mut Vec<u8>,
     ) -> io::Result<()> {
+        let Span { offset, length } = span;
         if chunk == 0 {
             return Err(io::ErrorKind::InvalidInput.into());
         }

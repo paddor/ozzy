@@ -35,9 +35,7 @@ fn fixture(duplicate: bool) -> Vec<u8> {
     let mut image = encode_segment_header(&header).to_vec();
     let group = encode_group(
         &header,
-        1,
-        image.len() as u64,
-        ChainPosition::GENESIS,
+        crate::GroupStart::new(1, image.len() as u64, ChainPosition::GENESIS),
         &operations,
     )
     .unwrap();

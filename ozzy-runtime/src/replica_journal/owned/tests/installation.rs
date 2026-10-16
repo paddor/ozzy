@@ -517,11 +517,13 @@ fn owned_canceled_recovery_parts_never_expose_the_unpublished_installation() {
                 let bytes = voter.config.configuration.encode();
                 let opening = drive(
                     &mut controller,
-                    AsyncGroupJournal::prepare_open(
+                    GroupJournal::prepare_open(
                         voter.config.root,
                         io,
-                        voter.config.identity,
-                        Some(&bytes),
+                        ozzy_journal_segment::ExpectedStore {
+                            identity: voter.config.identity,
+                            configuration: Some(&bytes),
+                        },
                         voter.config.limits,
                     ),
                 )

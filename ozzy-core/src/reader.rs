@@ -43,6 +43,13 @@ impl ReadScheduler {
         }
     }
 
+    /// A subscription parked until its source changes.
+    pub const fn waiting() -> Self {
+        Self {
+            phase: Phase::WaitingForSource,
+        }
+    }
+
     /// Readiness is necessary but does not reserve an output buffer.
     pub const fn is_runnable(self) -> bool {
         matches!(self.phase, Phase::Runnable | Phase::Reading { .. })

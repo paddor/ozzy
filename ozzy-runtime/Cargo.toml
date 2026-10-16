@@ -20,8 +20,6 @@ lz4-transport = ["omq-tokio/lz4"]
 zstd-transport = ["omq-tokio/zstd"]
 lz4-storage = ["ozzy-journal-segment/lz4"]
 simulation = []
-# Batch-level read-cache counters for measurement builds.
-storage-metrics = ["ozzy-journal-segment/storage-metrics"]
 
 [dependencies]
 ahash.workspace = true
@@ -47,7 +45,7 @@ xxhash-rust.workspace = true
 lz4rip.workspace = true
 
 [dev-dependencies]
-loom = "0.7"
+loom = { version = "0.7", features = ["futures"] }
 ozzy-io = { workspace = true, features = ["simulation"] }
 ozzy-io-pool.workspace = true
 tempfile.workspace = true
@@ -61,13 +59,5 @@ name = "ozzy_loom"
 path = "tests/loom.rs"
 
 [[test]]
-name = "ozzy_raw_notify_ban"
-path = "tests/raw_notify_ban.rs"
-
-[[test]]
 name = "ozzy_replica_transport"
 path = "tests/replica_transport.rs"
-
-[[test]]
-name = "ozzy_replication"
-path = "tests/replication.rs"

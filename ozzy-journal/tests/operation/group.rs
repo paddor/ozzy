@@ -31,7 +31,7 @@ fn fixture<'a>() -> OperationBody<'a> {
 #[test]
 fn coordinator_plan_has_independent_bytes_and_strict_framing() {
     let bytes = concat!(
-        "02",
+        "01",
         "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
         "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
         "0000000167",
@@ -71,7 +71,7 @@ fn coordinator_plan_has_independent_bytes_and_strict_framing() {
         assert!(decode_operation_body(OperationKind::GroupPlan, &bytes[..end], limits).is_err());
         assert!(validate_operation_body(OperationKind::GroupPlan, &bytes[..end], limits).is_err());
     }
-    for (index, value) in [(0, 0), (0, 1), (54, 3), (62, 1), (143, 2), (192, 2)] {
+    for (index, value) in [(0, 0), (0, 2), (54, 3), (62, 1), (143, 2), (192, 2)] {
         let mut malformed = bytes.clone();
         malformed[index] = value;
         assert!(

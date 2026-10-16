@@ -1,5 +1,5 @@
 use super::{JournalError, JournalOwner, Observation, OwnedJournal, Rc, SyncTicket};
-use ozzy_journal_segment::{AsyncCompletedJournalSync, AsyncPreparedJournalSync};
+use ozzy_journal_segment::{CompletedJournalSync, PreparedJournalSync};
 
 /// Captured data/evidence barrier. Normal admission and later writes continue;
 /// metadata mutation and segment roll wait for owner observation.
@@ -7,7 +7,7 @@ use ozzy_journal_segment::{AsyncCompletedJournalSync, AsyncPreparedJournalSync};
 #[must_use = "publish and install, or fence and reopen this owner"]
 pub struct PreparedSync {
     ticket: SyncTicket,
-    work: AsyncPreparedJournalSync,
+    work: PreparedJournalSync,
     observed: Observation,
 }
 
@@ -16,7 +16,7 @@ pub struct PreparedSync {
 #[must_use = "install on the originating journal"]
 pub struct CompletedSync {
     ticket: SyncTicket,
-    work: AsyncCompletedJournalSync,
+    work: CompletedJournalSync,
     observed: Observation,
 }
 

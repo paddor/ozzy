@@ -112,9 +112,11 @@ async fn run_shard(
         id,
         Kind::Client,
         Class::Data,
-        2,
-        4096,
-        16384,
+        ozzy_runtime::frontend::DataLaneLimits {
+            slots: 2,
+            maximum_retained_bytes: 4096,
+            retained_budget_bytes: 16384,
+        },
     )
     .unwrap();
     let (control, mut control_rx) = ozzy_runtime::frontend::data_channel(
@@ -122,9 +124,11 @@ async fn run_shard(
         id,
         Kind::Client,
         Class::Control,
-        1,
-        4096,
-        8192,
+        ozzy_runtime::frontend::DataLaneLimits {
+            slots: 1,
+            maximum_retained_bytes: 4096,
+            retained_budget_bytes: 8192,
+        },
     )
     .unwrap();
     setup
@@ -155,7 +159,7 @@ async fn run_shard(
         }
     }
     observed.send((id, classes)).await.unwrap();
-    context.shutdown.requested().await;
+    context.shutdown.closed().await;
     Ok(())
 }
 
@@ -199,7 +203,7 @@ async fn run_frontend(
     for _ in 0..5 {
         let message = tokio::select! {
             result = context.peer.recv() => result.unwrap(),
-            () = context.shutdown.requested() => return Ok(()),
+            () = context.shutdown.closed() => return Ok(()),
         };
         // Trusted inproc fixture owns bounded fresh 1 KiB frame buffers.
         // This is not a general charge for network receive allocations.
@@ -212,7 +216,7 @@ async fn run_frontend(
         }
     }
     delivered.send(rejected).unwrap();
-    context.shutdown.requested().await;
+    context.shutdown.closed().await;
     Ok(())
 }
 
@@ -256,10 +260,7 @@ async fn ordinary_peer_dispatch_preserves_healthy_shard_and_reserved_control_pro
         let endpoints = endpoints(false);
         let (delivered, received) = oneshot::channel();
         let frontend = Frontend::start_with_context(
-            &plan,
-            local(),
-            &endpoints,
-            limits(),
+            frontend_plan(&plan, &endpoints),
             context.clone(),
             move |context| run_frontend(context, binding, shard_threads, senders, delivered),
         )

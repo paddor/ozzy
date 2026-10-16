@@ -2,15 +2,13 @@
 
 use super::{Image, JournalError, State};
 pub(in crate::replica_journal::owned) mod recovery;
-use crate::replica_journal::shard::yield_turn;
 use ozzy_core::{
     checkpoint::Identities,
     dedup::{Limits, SNAPSHOT_ROW_BYTES},
     state::canonical_state_schema_digest,
 };
-use ozzy_journal_segment::{
-    AsyncCheckpointFiles, CanonicalCheckpointError, CanonicalRecoveryLimits,
-};
+use ozzy_io::signal::yield_once;
+use ozzy_journal_segment::{CanonicalCheckpointError, CanonicalRecoveryLimits, CheckpointFiles};
 
 /// Live confirmed identity rows captured for a checkpoint written later.
 #[derive(Debug)]
@@ -72,7 +70,7 @@ fn copy_rows(
 }
 
 pub(super) async fn restore(
-    files: &AsyncCheckpointFiles,
+    files: &CheckpointFiles,
     limits: Limits,
     recovery: CanonicalRecoveryLimits,
 ) -> Result<Image, JournalError> {
@@ -84,7 +82,7 @@ pub(super) async fn restore(
     let mut stream = files.stream();
     while let Some(bytes) = stream.next(64 * 1024).await? {
         decoded.push(&bytes)?;
-        yield_turn().await;
+        yield_once().await;
     }
     if !stream.is_verified() {
         return Err(JournalError::HistorySourceMismatch);

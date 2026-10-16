@@ -26,9 +26,21 @@ struct Packet {
 
 /// Owns admitted resource charge until the backend sends its physical result.
 pub struct Reply {
+    // First, so an unsent reply marks the observer finished before its sender
+    // and charge drop.
+    finish: Finish,
     sender: mpsc::Sender<Packet, Coordinated>,
-    signal: Arc<Signal>,
-    charge: Option<Charge>,
+    charge: Charge,
+}
+
+/// Marks the observer finished when its reply goes, sent or not.
+struct Finish(Arc<Signal>);
+
+impl Drop for Finish {
+    fn drop(&mut self) {
+        self.0.finished.store(true, Ordering::Release);
+        self.0.wake.wake();
+    }
 }
 
 /// Dropping this observer is not physical cancellation.
@@ -71,9 +83,9 @@ pub fn completion(charge: Charge) -> (Reply, Completion) {
     let signal = Arc::new(Signal::default());
     (
         Reply {
+            finish: Finish(signal.clone()),
             sender,
-            signal: signal.clone(),
-            charge: Some(charge),
+            charge,
         },
         Completion { receiver, signal },
     )
@@ -81,20 +93,15 @@ pub fn completion(charge: Charge) -> (Reply, Completion) {
 
 impl Reply {
     /// Call only once no kernel or worker can access the operation's resources.
-    pub fn finish(mut self, result: io::Result<Outcome>) {
-        let packet = Packet {
-            result,
-            charge: self.charge.take().expect("one completion"),
-        };
+    pub fn finish(self, result: io::Result<Outcome>) {
+        let Self {
+            finish,
+            mut sender,
+            charge,
+        } = self;
         // A canceled observer discards the result here, on the backend thread.
-        let _ = self.sender.try_send(packet);
-    }
-}
-
-impl Drop for Reply {
-    fn drop(&mut self) {
-        self.signal.finished.store(true, Ordering::Release);
-        self.signal.wake.wake();
+        let _ = sender.try_send(Packet { result, charge });
+        drop(finish);
     }
 }
 

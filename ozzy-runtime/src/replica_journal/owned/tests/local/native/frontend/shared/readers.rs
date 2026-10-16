@@ -253,10 +253,12 @@ async fn overlap() {
             owner_epoch: owner_epoch + 1,
         },
     ] {
-        links.inject_reader_publication(
-            authority.primary,
-            &publication(authority.primary, wrong, 0, &[(50, 0)], harness.wire),
-        );
+        links
+            .inject_reader_publication(
+                authority.primary,
+                &publication(authority.primary, wrong, 0, &[(50, 0)], harness.wire),
+            )
+            .await;
         let mut next = pin!(reader.next());
         for _ in 0..4 {
             assert!(futures::poll!(next.as_mut()).is_pending());
@@ -272,26 +274,30 @@ async fn overlap() {
         session,
         "foreign publication cannot replace a shared PEER session"
     );
-    links.inject_reader_publication(
-        authority.primary,
-        &publication(
+    links
+        .inject_reader_publication(
             authority.primary,
-            actual,
-            2,
-            &[(52, 2), (53, 3), (54, 4)],
-            harness.wire,
-        ),
-    );
+            &publication(
+                authority.primary,
+                actual,
+                2,
+                &[(52, 2), (53, 3), (54, 4)],
+                harness.wire,
+            ),
+        )
+        .await;
     {
         let mut next = pin!(reader.next());
         for _ in 0..4 {
             assert!(futures::poll!(next.as_mut()).is_pending());
         }
     }
-    links.inject_reader_publication(
-        authority.primary,
-        &publication(authority.primary, source(1), 0, &[(90, 9)], harness.wire),
-    );
+    links
+        .inject_reader_publication(
+            authority.primary,
+            &publication(authority.primary, source(1), 0, &[(90, 9)], harness.wire),
+        )
+        .await;
     let healthy = harness.drive(reader.next(), true).await.unwrap();
     assert_eq!(healthy.partition, 1);
     assert_eq!(healthy.offset, Offset::ZERO);

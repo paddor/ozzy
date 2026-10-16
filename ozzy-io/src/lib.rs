@@ -6,14 +6,35 @@
 //! decides which completed bytes belong to its journal's durable prefix.
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::too_many_lines,
+        clippy::too_many_arguments,
+        reason = "product code is linted without cfg(test)"
+    )
+)]
 
 mod admission;
 mod completion;
 mod handle;
 mod local;
 mod operation;
+pub mod signal;
 #[cfg(feature = "simulation")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    reason = "simulation test support"
+)]
 pub mod simulation;
+mod sync;
 #[cfg(test)]
 mod tests;
 
@@ -24,6 +45,7 @@ pub use local::Local;
 pub use operation::{
     Entry, FileKind, Metadata, OpenMode, Operation, Outcome, ReadBuffer, SyncMode, WriteBuffer,
 };
+pub use sync::{OwnedThreads, Readiness, Ready, lock_unpoisoned, spawn_ready};
 
 use std::{fmt, io};
 

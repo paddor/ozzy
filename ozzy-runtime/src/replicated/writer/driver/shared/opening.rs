@@ -1,46 +1,39 @@
 //! Stable first-use producer transition, separate from physical link sessions.
 
-use super::{Authority, Error, Failure, TopicRoutes};
-use crate::replicated::{BrokerLinkError, WriterConfig};
-use ozzy_proto::{OperationId, directory::RouteState, nack::RetryClass, producer};
+use super::{Error, Failure, TopicRoutes};
+use crate::replicated::{BrokerLinkError, WriterConfig, broker_links::LeaderRoute};
+use ozzy_proto::{OperationId, nack::RetryClass, producer};
 
 pub(super) struct Opening {
-    operation: Option<OperationId>,
-    confirmed: bool,
+    /// Create operation of a fresh producer, until a broker confirms it.
+    pending: Option<OperationId>,
 }
 
 impl Opening {
-    pub(super) fn new(operation: Option<OperationId>) -> Self {
-        Self {
-            operation,
-            confirmed: operation.is_none(),
-        }
+    pub(super) fn new(pending: Option<OperationId>) -> Self {
+        Self { pending }
     }
 
     pub(super) async fn confirm(
         &mut self,
         routes: &TopicRoutes,
-        route: &RouteState,
+        selected: &LeaderRoute,
         config: &WriterConfig,
     ) -> Result<(), Failure> {
-        if self.confirmed {
+        let Some(operation) = self.pending else {
             return Ok(());
-        }
+        };
         let opened = routes
             .links()
             .open_producer(
-                route.leader.expect("selected leader"),
+                selected.leader,
                 producer::Open {
-                    authority: Authority {
-                        group_id: route.group,
-                        config_epoch: route.config_epoch,
-                        view: route.view,
-                    },
-                    partition: route.partition,
+                    authority: selected.route.authority(),
+                    partition: selected.route.partition,
                     producer: config.producer_id,
                     mode: producer::Mode::Create,
                     expected_epoch: None,
-                    operation: self.operation.expect("fresh producer operation"),
+                    operation,
                 },
                 config.policy,
             )
@@ -52,7 +45,7 @@ impl Opening {
         {
             return Err(Failure::Fatal(Error::Response));
         }
-        self.confirmed = true;
+        self.pending = None;
         Ok(())
     }
 }

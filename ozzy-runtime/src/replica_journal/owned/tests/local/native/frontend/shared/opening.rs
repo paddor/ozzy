@@ -19,11 +19,10 @@ async fn automatic_opening_retries_lost_reply_with_same_operation() {
         .unwrap();
 }
 
-#[allow(clippy::too_many_lines)]
 async fn scenario(lose_reply: bool) {
     let (mut harness, links, clock, authority) = setup_shared_with_writers(&[]).await;
     let topic = harness.drive(links.topic("orders"), false).await.unwrap();
-    let routes = links.routes(topic).unwrap();
+    let routes = links.routes(topic).await.unwrap();
     let mut a = Writer::open_shared(&routes, 0, writer_config(40, 0), retry())
         .await
         .unwrap();
@@ -120,7 +119,7 @@ async fn refused_opening_waits_for_its_backoff() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let (mut harness, links, clock, _) = setup_shared_with_writers(&[]).await;
         let topic = harness.drive(links.topic("orders"), false).await.unwrap();
-        let routes = links.routes(topic).unwrap();
+        let routes = links.routes(topic).await.unwrap();
         let mut writer = Writer::open_shared(&routes, 0, writer_config(40, 0), retry())
             .await
             .unwrap();

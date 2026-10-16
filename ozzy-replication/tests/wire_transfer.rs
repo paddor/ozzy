@@ -1,3 +1,13 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
+
 use ozzy_journal::operation::{
     Barrier, CanonicalOperation, OperationBody, OperationLimits, canonical_body_digest,
     encode_operation_body,
@@ -5,8 +15,8 @@ use ozzy_journal::operation::{
 use ozzy_proto::OperationId;
 use ozzy_proto::{GroupId, LinkSessionId, NodeId, RequestId};
 use ozzy_replication::wire::{
-    FetchOps, Operation, PeerBinding, ReplicaMessage, WireError, WireLimits, decode, encode_fetch,
-    encode_ops,
+    EncodeContext, FetchOps, Operation, PeerBinding, ReplicaMessage, WireError, WireLimits, decode,
+    encode_fetch, encode_ops,
 };
 use ozzy_replication::{Configuration, Digest, JournalGeneration, LogSource, OpNumber, Prefix};
 
@@ -139,13 +149,15 @@ fn dispatch_fence_checks_exact_history_metadata_without_hashing_payload() {
     let mut metadata = [0; 512];
     let mut payload = [0; 64];
     let encoded = encode_ops(
-        node(1),
-        session(),
+        EncodeContext {
+            sender: node(1),
+            session: session(),
+            limits: WireLimits::default(),
+        },
         request,
         &operations[..2],
         &mut metadata,
         &mut payload,
-        WireLimits::default(),
     )
     .unwrap();
     // Dispatch handles fixed routing metadata. The actor must still reject the
@@ -194,13 +206,15 @@ fn ops_transfers_borrowed_consecutive_chunks_bound_to_the_request_and_source() {
     let mut metadata = [0xff; 512];
     let mut payload = [0xff; 64];
     let first = encode_ops(
-        node(1),
-        session(),
+        EncodeContext {
+            sender: node(1),
+            session: session(),
+            limits: WireLimits::default(),
+        },
         request,
         &operations[..2],
         &mut metadata,
         &mut payload,
-        WireLimits::default(),
     )
     .unwrap();
     assert_eq!(first.metadata_bytes, 368); // 196 fixed bytes + two 86-byte descriptors.
@@ -237,13 +251,15 @@ fn ops_transfers_borrowed_consecutive_chunks_bound_to_the_request_and_source() {
     request.predecessor = first.end();
     request.request_id = RequestId::from_bytes([15; 16]);
     let last = encode_ops(
-        node(1),
-        session(),
+        EncodeContext {
+            sender: node(1),
+            session: session(),
+            limits: WireLimits::default(),
+        },
         request,
         &operations[2..],
         &mut metadata,
         &mut payload,
-        WireLimits::default(),
     )
     .unwrap();
     let ReplicaMessage::Ops(last) = decode(
@@ -276,13 +292,15 @@ fn delayed_or_oversized_ops_cannot_match_a_replaced_request() {
     let mut metadata = [0; 368];
     let mut payload = [0; 32];
     let encoded = encode_ops(
-        node(1),
-        session(),
+        EncodeContext {
+            sender: node(1),
+            session: session(),
+            limits: WireLimits::default(),
+        },
         original,
         &operations[..2],
         &mut metadata,
         &mut payload,
-        WireLimits::default(),
     )
     .unwrap();
     let binding = PeerBinding::new(configuration(), node(1), session()).unwrap();
@@ -416,13 +434,15 @@ fn ops_rejects_bad_chains_and_preserves_output_on_capacity_or_bound_errors() {
         };
         assert!(
             encode_ops(
-                node(1),
-                session(),
+                EncodeContext {
+                    sender: node(1),
+                    session: session(),
+                    limits: WireLimits::default()
+                },
                 request,
                 &operations[..2],
                 &mut metadata[..metadata_size],
-                &mut payload[..payload_size],
-                WireLimits::default()
+                &mut payload[..payload_size]
             )
             .is_err()
         );
@@ -430,13 +450,15 @@ fn ops_rejects_bad_chains_and_preserves_output_on_capacity_or_bound_errors() {
         assert_eq!(payload, [0xbb; 32]);
     }
     let encoded = encode_ops(
-        node(1),
-        session(),
+        EncodeContext {
+            sender: node(1),
+            session: session(),
+            limits: WireLimits::default(),
+        },
         request,
         &operations[..2],
         &mut metadata,
         &mut payload,
-        WireLimits::default(),
     )
     .unwrap();
     let binding = PeerBinding::new(configuration(), node(1), session()).unwrap();

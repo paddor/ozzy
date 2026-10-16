@@ -25,6 +25,48 @@ impl Deployment {
 
     /// Check deployment-wide contracts without touching storage or starting workers.
     pub fn validate(self) -> Result<ValidatedDeployment, ConfigError> {
+        self.check_counts()?;
+        let mut ids = BTreeSet::new();
+        optional_id(self.cluster.id, &mut ids, "cluster.id")?;
+        validate_topics(&self, &mut ids)?;
+        let max_append = self
+            .topics
+            .values()
+            .map(|t| t.max_append_bytes)
+            .max()
+            .unwrap_or(0);
+        let mut endpoints = BTreeSet::new();
+        let mut shards = BTreeMap::new();
+        for (name, broker) in &self.brokers {
+            safe_name(name, "brokers")?;
+            let path = format!("brokers.{name}");
+            optional_id(broker.id, &mut ids, &path)?;
+            validate_endpoints(broker, &mut endpoints, &path)?;
+            let local = validate_broker(broker, &path)?;
+            self.validate_overrides(broker, &local, &path)?;
+            check_append_backing(broker, &local, max_append, &path)?;
+            shards.insert(name.clone(), local);
+        }
+        // Each broker receives every socket through one buffer profile.
+        let compressed = endpoints
+            .iter()
+            .filter(|endpoint| {
+                EndpointScheme::parse(endpoint).is_some_and(|(scheme, _)| scheme.compressed())
+            })
+            .count();
+        require(
+            compressed == 0 || compressed == endpoints.len(),
+            "brokers",
+            "compressed endpoints cannot mix with plain transports",
+        )?;
+        Ok(ValidatedDeployment {
+            deployment: self,
+            shards,
+        })
+    }
+
+    /// Broker membership, resource limits and topic count.
+    fn check_counts(&self) -> Result<(), ConfigError> {
         let expected = match self.cluster.mode {
             DeploymentMode::Single => 1,
             DeploymentMode::Three => 3,
@@ -45,90 +87,83 @@ impl Deployment {
             !self.topics.is_empty() && self.topics.len() <= self.limits.max_topics,
             "topics",
             "topic count must be nonzero and fit max_topics",
-        )?;
-        let mut ids = BTreeSet::new();
-        optional_id(self.cluster.id, &mut ids, "cluster.id")?;
-        validate_topics(&self, &mut ids)?;
-        let mut endpoints = BTreeSet::new();
-        let mut shards = BTreeMap::new();
-        for (name, broker) in &self.brokers {
-            safe_name(name, "brokers")?;
-            let path = format!("brokers.{name}");
-            optional_id(broker.id, &mut ids, &path)?;
-            for endpoint in [
-                Some(&broker.endpoints.peer),
-                Some(&broker.endpoints.data_peer),
-                Some(&broker.endpoints.reader_pub),
-                broker.endpoints.follower_pub.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                validate_endpoint(endpoint, &path)?;
-                require(
-                    endpoints.insert(endpoint.clone()),
-                    &path,
-                    "endpoint reused within deployment",
-                )?;
-            }
-            let local = validate_broker(broker, &path)?;
-            let mut overrides = BTreeSet::new();
-            for placement in &broker.topology.partitions {
-                let topic = self
-                    .topics
-                    .get(&placement.topic)
-                    .ok_or_else(|| invalid(&path, "placement refers to an unknown topic"))?;
-                require(
-                    placement.partition < topic.partitions
-                        && local.iter().any(|shard| shard.id == placement.shard)
-                        && overrides.insert((&placement.topic, placement.partition)),
-                    &path,
-                    "invalid or duplicate partition placement",
-                )?;
-            }
-            // One accepted APPEND needs receive backing and two canonical
-            // buffers while its destination admits work. Leave one
-            // further body for framing and in-flight settlement.
-            let max_append = self
-                .topics
-                .values()
-                .map(|t| t.max_append_bytes)
-                .max()
-                .unwrap();
-            for shard in &local {
-                let device = &broker.devices[&shard.device];
-                require(
-                    max_append
-                        .checked_mul(4)
-                        .is_some_and(|bytes| shard.budget.resident_bytes >= bytes),
-                    &path,
-                    "shard byte budget must cover APPEND receive and preparation backing",
-                )?;
-                require(
-                    device.workers.queued_bytes >= max_append,
-                    &path,
-                    "device byte budget must hold a maximum APPEND",
-                )?;
-            }
-            shards.insert(name.clone(), local);
-        }
-        // Each broker receives every socket through one buffer profile.
-        let compressed = endpoints
-            .iter()
-            .filter(|endpoint| {
-                EndpointScheme::parse(endpoint).is_some_and(|(scheme, _)| scheme.compressed())
-            })
-            .count();
-        require(
-            compressed == 0 || compressed == endpoints.len(),
-            "brokers",
-            "compressed endpoints cannot mix with plain transports",
-        )?;
-        Ok(ValidatedDeployment {
-            deployment: self,
-            shards,
-        })
+        )
     }
+
+    fn validate_overrides(
+        &self,
+        broker: &Broker,
+        local: &[Shard],
+        path: &str,
+    ) -> Result<(), ConfigError> {
+        let mut overrides = BTreeSet::new();
+        for placement in &broker.topology.partitions {
+            let topic = self
+                .topics
+                .get(&placement.topic)
+                .ok_or_else(|| invalid(path, "placement refers to an unknown topic"))?;
+            require(
+                placement.partition < topic.partitions
+                    && local.iter().any(|shard| shard.id == placement.shard)
+                    && overrides.insert((&placement.topic, placement.partition)),
+                path,
+                "invalid or duplicate partition placement",
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Each endpoint is valid and used once across the deployment.
+fn validate_endpoints(
+    broker: &Broker,
+    endpoints: &mut BTreeSet<String>,
+    path: &str,
+) -> Result<(), ConfigError> {
+    for endpoint in [
+        Some(&broker.endpoints.peer),
+        Some(&broker.endpoints.data_peer),
+        Some(&broker.endpoints.reader_pub),
+        broker.endpoints.follower_pub.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        validate_endpoint(endpoint, path)?;
+        require(
+            endpoints.insert(endpoint.clone()),
+            path,
+            "endpoint reused within deployment",
+        )?;
+    }
+    Ok(())
+}
+
+/// One accepted APPEND needs receive backing and two canonical buffers while
+/// its destination admits work. Leave one further body for framing and
+/// in-flight settlement.
+fn check_append_backing(
+    broker: &Broker,
+    local: &[Shard],
+    max_append: u64,
+    path: &str,
+) -> Result<(), ConfigError> {
+    for shard in local {
+        let device = broker.device(&shard.device)?;
+        require(
+            max_append
+                .checked_mul(4)
+                .is_some_and(|bytes| shard.budget.resident_bytes >= bytes),
+            path,
+            "shard byte budget must cover APPEND receive and preparation backing",
+        )?;
+        require(
+            device.workers.queued_bytes >= max_append,
+            path,
+            "device byte budget must hold a maximum APPEND",
+        )?;
+    }
+    Ok(())
 }
 
 impl ValidatedDeployment {
@@ -300,14 +335,16 @@ fn validate_broker(broker: &Broker, path: &str) -> Result<Vec<Shard>, ConfigErro
     )?;
     let mut shards = broker.topology.shards.clone();
     if shards.is_empty() {
-        require(
-            broker.devices.len() == 1,
-            path,
-            "multiple devices require explicit shard-to-device assignments",
-        )?;
+        let mut devices = broker.devices.keys();
+        let (Some(device), None) = (devices.next(), devices.next()) else {
+            return Err(invalid(
+                path,
+                "multiple devices require explicit shard-to-device assignments",
+            ));
+        };
         shards.push(Shard {
             id: 0,
-            device: broker.devices.keys().next().unwrap().clone(),
+            device: device.clone(),
             affinity: crate::Affinity::default(),
             budget: QueueBudget::default(),
         });
@@ -319,30 +356,40 @@ fn validate_broker(broker: &Broker, path: &str) -> Result<Vec<Shard>, ConfigErro
             path,
             "duplicate shard ID or unknown shard device",
         )?;
-        let budget = &shard.budget;
-        require(
-            budget.append_slots > 0
-                && budget.control_slots > 0
-                && budget.resident_bytes > 0
-                && budget.control_bytes > 0
-                && budget
-                    .append_slots
-                    .checked_add(budget.control_slots)
-                    .is_some()
-                && budget
-                    .resident_bytes
-                    .checked_add(budget.control_bytes)
-                    .is_some(),
-            path,
-            "invalid shard data/control budget",
-        )?;
-        require(
-            shard.affinity.numa_node.is_none() || shard.affinity.cpu.is_some(),
-            path,
-            "NUMA placement requires an explicit CPU",
-        )?;
+        validate_shard(shard, path)?;
     }
     shards.sort_by_key(|shard| shard.id);
+    check_numa_pools(broker, &shards, path)?;
+    Ok(shards)
+}
+
+fn validate_shard(shard: &Shard, path: &str) -> Result<(), ConfigError> {
+    let budget = &shard.budget;
+    require(
+        budget.append_slots > 0
+            && budget.control_slots > 0
+            && budget.resident_bytes > 0
+            && budget.control_bytes > 0
+            && budget
+                .append_slots
+                .checked_add(budget.control_slots)
+                .is_some()
+            && budget
+                .resident_bytes
+                .checked_add(budget.control_bytes)
+                .is_some(),
+        path,
+        "invalid shard data/control budget",
+    )?;
+    require(
+        shard.affinity.numa_node.is_none() || shard.affinity.cpu.is_some(),
+        path,
+        "NUMA placement requires an explicit CPU",
+    )
+}
+
+/// NUMA pools are unique and nonempty and cover the shards placed on them.
+fn check_numa_pools(broker: &Broker, shards: &[Shard], path: &str) -> Result<(), ConfigError> {
     let mut pools = BTreeMap::new();
     for pool in &broker.topology.memory_pools {
         require(
@@ -352,7 +399,7 @@ fn validate_broker(broker: &Broker, path: &str) -> Result<Vec<Shard>, ConfigErro
         )?;
     }
     let mut reserved = BTreeMap::<u32, u64>::new();
-    for shard in &shards {
+    for shard in shards {
         if let Some(node) = shard.affinity.numa_node {
             let total = reserved.entry(node).or_default();
             *total = total
@@ -365,7 +412,7 @@ fn validate_broker(broker: &Broker, path: &str) -> Result<Vec<Shard>, ConfigErro
             )?;
         }
     }
-    Ok(shards)
+    Ok(())
 }
 
 fn validate_endpoint(endpoint: &str, path: &str) -> Result<(), ConfigError> {
@@ -438,7 +485,10 @@ fn safe_root(root: &Path, path: &str) -> Result<(), ConfigError> {
 pub(crate) fn safe_name(name: &str, path: &str) -> Result<(), ConfigError> {
     require(
         (1..=128).contains(&name.len())
-            && name.as_bytes()[0].is_ascii_alphanumeric()
+            && name
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
             && name.bytes().all(|byte| {
                 byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"-_.".contains(&byte)
             }),

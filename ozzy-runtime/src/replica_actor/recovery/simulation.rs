@@ -80,7 +80,7 @@ impl<J: RecoveryStorage> ControlledRecovery<J> {
         let result = tokio::select! {
             biased;
             result = pending.wait() => result,
-            error = std::future::poll_fn(|cx| self.actor.journal.as_mut().expect("recovery owner").poll_stopped(cx)) => Err(ActorError::Journal(error)),
+            error = std::future::poll_fn(|cx| self.actor.journal.poll_stopped(cx)) => Err(ActorError::Journal(error)),
         };
         self.actor.pending = None;
         let result = result.and_then(|completed| self.actor.complete(completed, now));
@@ -90,7 +90,7 @@ impl<J: RecoveryStorage> ControlledRecovery<J> {
 
     /// Latest coalesced observation. Always nonvoting before owned handoff.
     pub fn status(&self) -> ActorStatus {
-        *self.actor.status.borrow()
+        self.actor.status()
     }
 
     /// Whether publication or abandonment has reached an owned lifecycle boundary.

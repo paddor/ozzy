@@ -81,7 +81,7 @@ async fn multiple_devices_and_partitions_share_one_fixed_pool_and_budget() {
             assert_eq!(lane.client.shard(), index);
             assert_eq!(lane.client.admission().limits(), limits);
         }
-        let quota = limits.share(0, Class::Data);
+        let quota = limits.share(0, Class::Data).unwrap();
         let directory = tempfile::tempdir().unwrap();
         let reservations: Vec<_> = (0..quota.operations)
             .map(|index| {

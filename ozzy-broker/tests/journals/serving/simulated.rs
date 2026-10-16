@@ -3,7 +3,7 @@
 use super::*;
 use ozzy_io::simulation::Image;
 use ozzy_sim::broker::{
-    provision, start_controlled, start_image, start_image_selected, start_images,
+    Memory, provision, start_controlled, start_image, start_image_selected, start_images,
 };
 
 mod churn;
@@ -482,135 +482,143 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn single_durable_configured_retention_advances_sdk_earliest_and_keeps_producer_identity()
+    {
+        configured_retention(Confirmation::LocalDurable).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn disk_quorum_configured_retention_advances_sdk_earliest_and_keeps_producer_identity() {
+        configured_retention(Confirmation::DiskQuorum).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replicated_persisting_configured_retention_advances_sdk_earliest_and_keeps_producer_identity()
+     {
+        configured_retention(Confirmation::ReplicatedPersisting).await;
+    }
+
     #[expect(
         clippy::too_many_lines,
-        reason = "one SDK retention and resume schedule across all policies"
+        reason = "one SDK retention and resume schedule"
     )]
-    async fn configured_retention_advances_sdk_earliest_and_keeps_producer_identity() {
+    async fn configured_retention(policy: Confirmation) {
         use ozzy_config::TopicRetention;
         use ozzy_runtime::replicated::ReaderStart;
-        for policy in [
-            Confirmation::LocalDurable,
-            Confirmation::DiskQuorum,
-            Confirmation::ReplicatedPersisting,
-        ] {
-            let runtime = WriterRuntime::new().unwrap();
-            let root = std::path::PathBuf::from(format!("/ozzy-retention-{}", Uuid::now_v7()));
-            let deployment = deployment_with(
-                &root,
-                if policy == Confirmation::LocalDurable {
-                    DeploymentMode::Single
-                } else {
-                    DeploymentMode::Three
-                },
-                policy,
-                1,
-                |config| {
-                    let topic = config.topics.get_mut("orders").unwrap();
-                    topic.segment_bytes = 1024 * 1024;
-                    topic.max_append_bytes = 64 * 1024;
-                    topic.retention = TopicRetention {
-                        max_age_secs: None,
-                        max_bytes: Some(1024 * 1024),
-                    };
-                },
-            );
-            let producer = role_links(&runtime, &deployment[0].0, handshake::PRODUCER).await;
-            let consumer = role_links(&runtime, &deployment[0].0, handshake::CONSUMER).await;
-            let (brokers, _) = Box::pin(start_controlled(&runtime, deployment, true)).await;
-            let config = SharedTopicWriterConfig::new(limits());
-            let mut writer = live_many(
-                &brokers,
-                "open retained writer",
-                SharedTopicWriter::open(
-                    &producer,
-                    "orders",
-                    config.clone(),
-                    RetryPolicy::default(),
-                ),
-            )
-            .await
-            .unwrap();
-            let identity = writer.identity();
-            for index in 0..600u128 {
-                let pending = writer
-                    .send(
-                        RecordInput::single(
-                            MessageId::from_bytes((index + 1).to_be_bytes()),
-                            bytes::Bytes::from(vec![index as u8; 512]),
-                        ),
-                        None,
-                    )
-                    .await
-                    .unwrap();
-                live_many(&brokers, "confirm retained record", pending.confirmed())
-                    .await
-                    .unwrap();
-            }
-            live_many(&brokers, "close retained writer", writer.close())
+        let runtime = WriterRuntime::new().unwrap();
+        let root = std::path::PathBuf::from(format!("/ozzy-retention-{}", Uuid::now_v7()));
+        let deployment = deployment_with(
+            &root,
+            if policy == Confirmation::LocalDurable {
+                DeploymentMode::Single
+            } else {
+                DeploymentMode::Three
+            },
+            policy,
+            1,
+            |config| {
+                let topic = config.topics.get_mut("orders").unwrap();
+                topic.segment_bytes = 1024 * 1024;
+                topic.max_append_bytes = 64 * 1024;
+                topic.retention = TopicRetention {
+                    max_age_secs: None,
+                    max_bytes: Some(1024 * 1024),
+                };
+            },
+        );
+        let producer = role_links(&runtime, &deployment[0].0, handshake::PRODUCER).await;
+        let consumer = role_links(&runtime, &deployment[0].0, handshake::CONSUMER).await;
+        let (brokers, _) = Box::pin(start_controlled(&runtime, deployment, true)).await;
+        let config = SharedTopicWriterConfig::new(limits());
+        let mut writer = live_many(
+            &brokers,
+            "open retained writer",
+            SharedTopicWriter::open(&producer, "orders", config.clone(), RetryPolicy::default()),
+        )
+        .await
+        .unwrap();
+        let identity = writer.identity();
+        for index in 0..600u128 {
+            let pending = writer
+                .send(
+                    RecordInput::single(
+                        MessageId::from_bytes((index + 1).to_be_bytes()),
+                        bytes::Bytes::from(vec![index as u8; 512]),
+                    ),
+                    None,
+                )
                 .await
                 .unwrap();
-            tokio::time::sleep(Duration::from_secs(4)).await;
-            let mut reader = live_many(
-                &brokers,
-                "open retained earliest",
-                TopicReader::open(
+            live_many(&brokers, "confirm retained record", pending.confirmed())
+                .await
+                .unwrap();
+        }
+        live_many(&brokers, "close retained writer", writer.close())
+            .await
+            .unwrap();
+        // Retention retires the rolled segments in the background.
+        live_many(&brokers, "retention advances earliest", async {
+            loop {
+                let mut reader = TopicReader::open(
                     consumer.clone(),
                     "orders",
                     TopicReaderConfig {
                         start: ReaderStart::Earliest,
                         ..Default::default()
                     },
-                ),
-            )
-            .await
-            .unwrap();
-            let record = live_many(&brokers, "read retained earliest", reader.next())
-                .await
-                .unwrap();
-            assert!(
-                record.offset.get() > 0,
-                "retention did not run for {policy:?}"
-            );
-            live_many(&brokers, "close retained reader", reader.close())
-                .await
-                .unwrap();
-            let mut resumed = live_many(
-                &brokers,
-                "resume retained producer",
-                SharedTopicWriter::resume(
-                    &producer,
-                    "orders",
-                    identity,
-                    config,
-                    RetryPolicy::default(),
-                ),
-            )
-            .await
-            .unwrap();
-            let pending = resumed
-                .send(
-                    RecordInput::single(
-                        MessageId::from_bytes([101; 16]),
-                        bytes::Bytes::from_static(b"after retention"),
-                    ),
-                    None,
                 )
                 .await
                 .unwrap();
-            let receipt = live_many(&brokers, "confirm retained resume", pending.confirmed())
-                .await
-                .unwrap();
-            assert_eq!(receipt.record.offset, 600);
-            live_many(&brokers, "close retained resume", resumed.close())
-                .await
-                .unwrap();
-            for broker in brokers {
-                broker.shutdown().await.unwrap();
+                let next = reader.next().await;
+                reader.close().await.unwrap();
+                match next {
+                    // Retention can retire the opened start before the read.
+                    Err(ozzy_runtime::replicated::TopicReaderError::RetentionGap { .. }) => {}
+                    next => {
+                        if next.unwrap().offset.get() > 0 {
+                            break;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            producer.shutdown().await.unwrap();
-            consumer.shutdown().await.unwrap();
+        })
+        .await;
+        let mut resumed = live_many(
+            &brokers,
+            "resume retained producer",
+            SharedTopicWriter::resume(
+                &producer,
+                "orders",
+                identity,
+                config,
+                RetryPolicy::default(),
+            ),
+        )
+        .await
+        .unwrap();
+        let pending = resumed
+            .send(
+                RecordInput::single(
+                    MessageId::from_bytes([101; 16]),
+                    bytes::Bytes::from_static(b"after retention"),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        let receipt = live_many(&brokers, "confirm retained resume", pending.confirmed())
+            .await
+            .unwrap();
+        assert_eq!(receipt.record.offset, 600);
+        live_many(&brokers, "close retained resume", resumed.close())
+            .await
+            .unwrap();
+        for broker in brokers {
+            broker.shutdown().await.unwrap();
         }
+        producer.shutdown().await.unwrap();
+        consumer.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

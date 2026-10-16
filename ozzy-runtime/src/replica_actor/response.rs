@@ -1,10 +1,13 @@
 //! Reply mapping shared by shard intake and recovery routing.
 
+use crate::transport::Frames;
 use bytes::Bytes;
 use omq_tokio::Message;
 use ozzy_proto::append::Authority;
 use ozzy_proto::nack::{self, RetryClass};
-use ozzy_proto::{Envelope, EnvelopeLimits, NodeId, Opcode};
+use ozzy_proto::{Envelope, EnvelopeLimits, GroupId, NodeId, Opcode, Packet, decode_packet};
+
+use crate::frontend::{Kind, Link};
 
 use crate::replica_journal::{
     AppendAdmissionError, GroupAssignError, GroupProgressError, JournalError,
@@ -61,45 +64,68 @@ pub(super) fn rejection(error: &JournalError) -> (u16, RetryClass) {
     }
 }
 
-/// One bounded typed rejection for a correlated client request. Authority
-/// codes carry the routing hint; other codes carry the supplied detail.
+/// One bounded typed rejection of a correlated client request.
+pub(super) struct Nack<'a> {
+    /// The request it answers.
+    pub request: Envelope,
+    /// The requester's negotiated reply bounds.
+    pub send: EnvelopeLimits,
+    pub rejection: (u16, RetryClass),
+    pub hint: nack::AuthorityHint,
+    /// Code-specific detail. Authority codes carry the routing hint instead.
+    pub detail: &'a [u8],
+}
+
+/// Encode one rejection frame addressed to its requester.
 pub(super) fn nack_frame(
     local: NodeId,
-    request: Envelope,
-    send: EnvelopeLimits,
-    rejection: (u16, RetryClass),
-    hint: nack::AuthorityHint,
-    detail: &[u8],
+    rejected: &Nack<'_>,
     metadata: &mut Vec<u8>,
 ) -> Result<Message, nack::NackError> {
-    let (code, retry) = rejection;
+    let (code, retry) = rejected.rejection;
     let hint = if matches!(code, 5 | 12 | 13) {
-        Some(hint.encode()?)
+        Some(rejected.hint.encode()?)
     } else {
         None
     };
     let header = nack::encode(
-        Envelope {
-            opcode: Opcode::Nack,
-            response: true,
-            sender: local,
-            ..request
-        },
+        reply_envelope(rejected.request, local, Opcode::Nack),
         nack::Nack {
             code,
             retry,
-            detail: hint.as_ref().map_or(detail, |bytes| bytes.as_slice()),
+            detail: hint
+                .as_ref()
+                .map_or(rejected.detail, |bytes| bytes.as_slice()),
             diagnostic: "",
         },
         metadata,
-        send,
+        rejected.send,
     )?;
     Ok(crate::native_frames::message(
-        request.sender.as_bytes(),
+        rejected.request.sender.as_bytes(),
         header,
         metadata,
         Bytes::new(),
     ))
+}
+
+/// The header envelope of a reply from this broker to a client request.
+pub(super) fn reply_envelope(request: Envelope, local: NodeId, opcode: Opcode) -> Envelope {
+    Envelope {
+        opcode,
+        response: true,
+        sender: local,
+        ..request
+    }
+}
+
+/// The authority a committed or current scope grants.
+pub(super) const fn authority(scope: ozzy_replication::Scope) -> Authority {
+    Authority {
+        group_id: scope.group_id,
+        config_epoch: scope.configuration_epoch,
+        view: scope.view,
+    }
 }
 
 pub(super) fn authority_hint(
@@ -107,13 +133,55 @@ pub(super) fn authority_hint(
     scope: ozzy_replication::Scope,
 ) -> nack::AuthorityHint {
     nack::AuthorityHint {
-        authority: Authority {
-            group_id: scope.group_id,
-            config_epoch: scope.configuration_epoch,
-            view: scope.view,
-        },
+        authority: authority(scope),
         primary: configuration.primary(scope.view),
     }
+}
+
+/// Whether `local` leads `group` under the authority a request names.
+pub(super) fn leads(
+    group: GroupId,
+    local: NodeId,
+    authority: Authority,
+    hint: nack::AuthorityHint,
+) -> bool {
+    authority.group_id == group && authority == hint.authority && hint.primary == local
+}
+
+/// Whether `link` is still the client session that sent `request`.
+pub(super) fn current_client(link: Option<Link>, request: &Envelope) -> bool {
+    link.is_some_and(|link| {
+        link.binding.kind == Kind::Client
+            && Some(link.binding.session) == request.session
+            && link.binding.peer == request.sender
+    })
+}
+
+/// Decode a correlated client request from its own live session. Requests
+/// with any other opcode are ignored.
+pub(super) fn client_packet<'a>(
+    message: &'a Message,
+    link: Link,
+    local: NodeId,
+    limits: EnvelopeLimits,
+    opcodes: &[Opcode],
+) -> Option<Packet<'a>> {
+    let (route, frames) = message.routed_packet()?;
+    if link.binding.kind != Kind::Client
+        || link.binding.peer == local
+        || link.binding.peer.as_bytes() == &[0; 16]
+        || route != link.binding.peer.as_bytes()
+    {
+        return None;
+    }
+    let packet = decode_packet(&frames, limits).ok()?;
+    let envelope = packet.envelope;
+    (envelope.sender == link.binding.peer
+        && envelope.session == Some(link.binding.session)
+        && !envelope.response
+        && envelope.request_id.is_some()
+        && opcodes.contains(&envelope.opcode))
+    .then_some(packet)
 }
 
 #[cfg(test)]

@@ -1,23 +1,12 @@
-//! Copy-on-write repair of sealed files under externally acquired group authority.
+//! Copy-on-write repair of sealed files under externally acquired group
+//! authority: bounds, fragment salvage and donor-range validation.
 
-use std::fs::{File, OpenOptions};
-use std::io;
-use std::sync::Arc;
-
-use super::super::{
-    DirectoryError, GroupDirectory, evidence, position_before, read_limited_file,
-    segment_reference_name, sync_directory,
-};
-use super::{RecoveryPublication, RecoveryPublicationError};
+use crate::directory::{DirectoryError, validate_operation_bodies};
 use crate::{
-    BodyEncoding, CanonicalOperation, CanonicalRecoveryLimits, DecodeLimits, Digest, LogPosition,
-    OpenGroupJournal, OperationLimits, SealedSegment, SegmentHeader, SegmentReference,
-    SegmentWriter,
+    BodyEncoding, CanonicalOperation, DecodeLimits, Digest, JournalLimits, LogPosition, Manifest,
+    OperationLimits, SegmentHeader, SegmentReference, TailState, scan_segment,
 };
-#[cfg(test)]
-use ozzy_journal::operation::logical_operation_digest;
-pub(crate) mod state;
-use ozzy_journal::progress::JournalGeneration;
+use ozzy_journal::operation::{logical_operation_digest, validate_operation_body};
 
 /// A manifest-authenticated logical range, independent of donor file boundaries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +17,16 @@ pub struct RepairRange {
     pub after: LogPosition,
     /// Exact inclusive canonical operation prefix captured by this work.
     pub through: LogPosition,
+}
+
+/// Donor authority a sealed repair runs under. Every repair range must end
+/// within the donor's accepted prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepairSource {
+    /// View the repair promises; never below the selected promised view.
+    pub view: u64,
+    /// Exact accepted prefix of the donor's selected source generation.
+    pub accepted: LogPosition,
 }
 
 /// Explicit memory, transfer, and replacement-file bounds.
@@ -47,408 +46,282 @@ pub struct SealedRepairLimits {
     pub body_encoding: BodyEncoding,
 }
 
-/// An exclusively owned, persistently nonvoting physical repair attempt.
-///
-/// Healthy files and logical metadata remain unchanged. Only replacement files
-/// are written. No manifest is published until every range verifies and syncs.
-/// Dropping this object leaves the marker and old selected generation intact.
 #[derive(Debug)]
-pub struct SealedRepair {
-    directory: GroupDirectory,
-    state: state::State,
-    replacements: Vec<SegmentReference>,
-    writer: Option<SegmentWriter<Arc<File>>>,
-    current_reference: Option<SegmentReference>,
-    generation: JournalGeneration,
-    staged_bytes: u64,
-    faulted: bool,
+pub(crate) struct State {
+    pub(crate) ranges: Vec<RepairRange>,
+    pub(crate) next: usize,
+    pub(crate) view: u64,
+    pub(crate) decode: DecodeLimits,
+    pub(crate) operations: OperationLimits,
+    pub(crate) limits: SealedRepairLimits,
+    pub(crate) source: Vec<Option<crate::DecodedOperation<'static>>>,
+    pub(crate) source_bytes: usize,
+    pub(crate) missing: usize,
+    pub(crate) missing_end: usize,
 }
 
-impl GroupDirectory {
-    /// Inspect one bounded file at a time. `None` means active-file damage needs
-    /// full recovery. Empty ranges mean no sealed repair is needed. Authority
-    /// metadata and checkpoints must already have passed metadata-only open.
-    pub fn sealed_damage(
-        &self,
+impl State {
+    pub(crate) fn validate_limits(
         decode: DecodeLimits,
-        operations: OperationLimits,
-        max_segment_bytes: u64,
-    ) -> Result<Option<Vec<RepairRange>>, DirectoryError> {
-        let mut damaged = Vec::new();
-        for (index, reference) in self.manifest.segments.iter().enumerate() {
-            if reference.capacity > max_segment_bytes {
-                return Err(DirectoryError::SegmentMismatch(reference.segment_id));
-            }
-            let valid = validate_file(self, index, decode, operations);
-            if let Err(DirectoryError::Io(error)) = &valid
-                && error.kind() != io::ErrorKind::NotFound
-                && error.kind() != io::ErrorKind::UnexpectedEof
-            {
-                // Permission/device errors do not become payload corruption.
-                return valid.map(|()| None);
-            }
-            if valid.is_err() {
-                let Some(next) = self.manifest.segments.get(index + 1) else {
-                    return Ok(None);
-                };
-                damaged.push(RepairRange {
-                    segment_id: reference.segment_id,
-                    after: position_before(reference.first_chain)?,
-                    through: position_before(next.first_chain)?,
-                });
-            }
-        }
-        Ok(Some(damaged))
-    }
-
-    /// Start repair after fresh recovery authority has selected a pinned donor.
-    /// The caller must authenticate every chunk against that donor's exact source
-    /// generation and request. Local range checks grant no consensus authority.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "explicit cold recovery bounds and authority"
-    )]
-    pub fn begin_sealed_repair(
-        self,
-        configuration: &[u8],
-        generation: JournalGeneration,
-        view: u64,
-        source_accepted: LogPosition,
-        decode: DecodeLimits,
-        operations: OperationLimits,
         limits: SealedRepairLimits,
-    ) -> Result<SealedRepair, DirectoryError> {
-        self.require_recovering(configuration)?;
-        state::State::validate_limits(decode, limits)?;
-        let ranges = self
-            .sealed_damage(decode, operations, limits.max_segment_bytes)?
-            .ok_or(DirectoryError::ConfigurationMismatch)?;
-        let state = state::State::new(
-            &self.manifest,
-            ranges,
-            view,
-            source_accepted,
-            decode,
-            operations,
-            limits,
-        )?;
-        let mut repair = SealedRepair {
-            directory: self,
-            state,
-            replacements: Vec::new(),
-            writer: None,
-            current_reference: None,
-            generation,
-            staged_bytes: 0,
-            faulted: false,
-        };
-        repair.advance_local()?;
-        Ok(repair)
-    }
-}
-
-impl SealedRepair {
-    /// Next missing range. The first boundary advances after each complete chunk.
-    pub fn pending(&self) -> Result<Option<RepairRange>, DirectoryError> {
-        self.require_healthy()?;
-        Ok(self.state.pending())
-    }
-
-    /// Append canonical operations to a replacement incarnation, never to damaged
-    /// bytes. Callers bound requests at `pending().through`, even if donors use
-    /// different file boundaries. Every error fences the attempt.
-    pub fn append(&mut self, operations: &[CanonicalOperation<'_>]) -> Result<(), DirectoryError> {
-        self.require_healthy()?;
-        let result = self.append_inner(operations);
-        self.faulted |= result.is_err();
-        result
-    }
-
-    fn append_inner(
-        &mut self,
-        operations: &[CanonicalOperation<'_>],
     ) -> Result<(), DirectoryError> {
-        self.state.append(&self.directory.manifest, operations)?;
-        self.advance_local()
-    }
-
-    fn advance_local(&mut self) -> Result<(), DirectoryError> {
-        while let Some(range) = self.state.ranges.get(self.state.next).copied() {
-            if self.state.source.is_empty() {
-                self.load_local(range)?;
-            }
-            self.state.missing += self.state.source[self.state.missing..]
-                .iter()
-                .take_while(|entry| entry.is_some())
-                .count();
-            if self.state.missing < self.state.source.len() {
-                if self.state.missing >= self.state.missing_end {
-                    self.state.missing_end = self.state.source[self.state.missing..]
-                        .iter()
-                        .position(Option::is_some)
-                        .map_or(self.state.source.len(), |end| self.state.missing + end);
-                }
-                return Ok(());
-            }
-            self.write_replacement(range)?;
-            self.state.source.clear();
-            self.state.source_bytes = 0;
-            self.state.missing = 0;
-            self.state.missing_end = 0;
-            self.state.next += 1;
+        if limits.max_chunk_operations == 0
+            || limits.max_chunk_operations > decode.max_entries
+            || limits.max_chunk_body_bytes == 0
+            || limits.max_chunk_body_bytes > decode.max_group_decoded_body_bytes
+            || limits.max_orphan_probes == 0
+            || !limits.body_encoding.is_supported()
+        {
+            return Err(DirectoryError::ConfigurationMismatch);
         }
         Ok(())
     }
 
-    fn load_local(&mut self, range: RepairRange) -> Result<(), DirectoryError> {
-        let reference = *self
-            .directory
-            .manifest
-            .segments
-            .iter()
-            .find(|r| r.segment_id == range.segment_id)
-            .expect("repair source");
-        self.state.prepare(range, reference)?;
-        let image = match read_limited_file(
-            &self.directory.root.join(segment_reference_name(reference)),
-            reference.capacity as usize,
-            "repair source",
-        ) {
-            Ok(image) => image,
-            Err(DirectoryError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(());
+    pub(crate) fn new(
+        manifest: &Manifest,
+        ranges: Vec<RepairRange>,
+        source: RepairSource,
+        journal: JournalLimits,
+        limits: SealedRepairLimits,
+    ) -> Result<Self, DirectoryError> {
+        Self::validate_limits(journal.decode, limits)?;
+        for range in &ranges {
+            if range.through.op_number > source.accepted.op_number
+                || (range.through.op_number == source.accepted.op_number
+                    && range.through != source.accepted)
+            {
+                return Err(DirectoryError::CurrentMismatch);
             }
-            Err(DirectoryError::FileLimit { .. }) => return Ok(()),
-            Err(error) => return Err(error),
-        };
-        self.state
-            .load(&self.directory.manifest, range, reference, &image)
+        }
+        Ok(Self {
+            ranges,
+            next: 0,
+            view: source.view.max(manifest.promised_view),
+            decode: journal.decode,
+            operations: journal.operations,
+            limits,
+            source: Vec::new(),
+            source_bytes: 0,
+            missing: 0,
+            missing_end: 0,
+        })
+    }
+    pub(crate) fn pending(&self) -> Option<RepairRange> {
+        let mut range = self.ranges.get(self.next).copied()?;
+        let first = self.missing;
+        let end = self.missing_end;
+        if first > 0 {
+            // Operations around the missing run are present.
+            let previous = self.source.get(first - 1)?.as_ref()?;
+            range.after = LogPosition {
+                op_number: previous.op_number,
+                digest: previous.digest,
+            };
+        }
+        if end < self.source.len() {
+            let next = self.source.get(end)?.as_ref()?;
+            range.through = LogPosition {
+                op_number: next.op_number - 1,
+                digest: next.previous_digest,
+            };
+        }
+        Some(range)
     }
 
-    fn write_replacement(&mut self, range: RepairRange) -> Result<(), DirectoryError> {
-        self.create_replacement(range.segment_id)?;
-        let writer = self.writer.as_mut().expect("replacement writer");
-        let mut chunk = Vec::with_capacity(self.state.limits.max_chunk_operations);
-        let mut bytes = 0;
-        for entry in &self.state.source {
-            let entry = entry.as_ref().expect("complete repair source");
-            if entry.body.len() > self.state.limits.max_chunk_body_bytes {
-                return Err(DirectoryError::SegmentMismatch(range.segment_id));
-            }
-            if chunk.len() == self.state.limits.max_chunk_operations
-                || entry.body.len() > self.state.limits.max_chunk_body_bytes - bytes
+    pub(crate) fn append(
+        &mut self,
+        manifest: &crate::Manifest,
+        operations: &[CanonicalOperation<'_>],
+    ) -> Result<(), DirectoryError> {
+        let range = self.pending().ok_or(DirectoryError::CurrentMismatch)?;
+        if operations.is_empty() || operations.len() > self.limits.max_chunk_operations {
+            return Err(DirectoryError::CurrentMismatch);
+        }
+        let mut after = range.after;
+        let mut bytes = 0usize;
+        for operation in operations {
+            bytes = bytes
+                .checked_add(operation.body.len())
+                .ok_or(DirectoryError::CurrentMismatch)?;
+            if bytes > self.limits.max_chunk_body_bytes
+                || operation.body.len() > self.decode.max_decoded_body_bytes
+                || operation.group_id != manifest.identity.group_id
+                || operation.configuration_epoch != manifest.configuration_epoch
+                || operation.original_view > self.view
+                || Some(operation.op_number) != after.op_number.checked_add(1)
+                || operation.previous_digest != after.digest
+                || operation.op_number > range.through.op_number
             {
-                writer.append_with_body_encoding(&chunk, self.state.limits.body_encoding)?;
-                chunk.clear();
-                bytes = 0;
+                return Err(DirectoryError::CurrentMismatch);
             }
-            bytes += entry.body.len();
-            chunk.push(CanonicalOperation {
-                group_id: entry.group_id,
-                configuration_epoch: entry.configuration_epoch,
-                original_view: entry.original_view,
-                op_number: entry.op_number,
-                previous_digest: entry.previous_digest,
-                kind: entry.kind,
-                body: &entry.body,
-            });
+            validate_operation_body(operation.kind, operation.body, self.operations)?;
+            after = LogPosition {
+                op_number: operation.op_number,
+                digest: logical_operation_digest(operation),
+            };
         }
-        if !chunk.is_empty() {
-            writer.append_with_body_encoding(&chunk, self.state.limits.body_encoding)?;
+        if after.op_number == range.through.op_number && after != range.through {
+            return Err(DirectoryError::CurrentMismatch);
         }
-        if position_before(writer.written_position().next_chain())? != range.through
-            || writer.written_position().group_number()
-                - (self
-                    .current_reference
-                    .expect("reference")
-                    .first_group_number
-                    - 1)
-                > self.state.decode.max_groups as u64
+        if bytes
+            > self
+                .decode
+                .max_segment_decoded_body_bytes
+                .saturating_sub(self.source_bytes)
         {
             return Err(DirectoryError::SegmentMismatch(range.segment_id));
         }
-        writer.sync_through(writer.begin_sync())?;
-        let mut reference = self
-            .current_reference
-            .take()
-            .expect("replacement reference");
-        reference.sealed = Some(SealedSegment {
-            valid_bytes: writer.durable_position().end_offset(),
-            digest: writer.structural_digest(),
-        });
-        self.replacements.push(reference);
-        self.writer = None;
+        let first = self.ranges[self.next].after.op_number + 1;
+        for operation in operations {
+            let body_digest = ozzy_journal::operation::canonical_body_digest(operation.body);
+            self.source[(operation.op_number - first) as usize] = Some(crate::DecodedOperation {
+                entry_offset: 0,
+                entry_bytes: 0,
+                group_id: operation.group_id,
+                configuration_epoch: operation.configuration_epoch,
+                original_view: operation.original_view,
+                op_number: operation.op_number,
+                previous_digest: operation.previous_digest,
+                digest: ozzy_journal::operation::logical_operation_digest_with_body_digest(
+                    operation,
+                    body_digest,
+                ),
+                body_digest,
+                kind: operation.kind,
+                body: std::borrow::Cow::Owned(operation.body.to_vec()),
+            });
+        }
+        self.source_bytes += bytes;
         Ok(())
     }
 
-    fn create_replacement(&mut self, id: u64) -> Result<(), DirectoryError> {
-        let index = self
-            .directory
-            .manifest
-            .segments
-            .iter()
-            .position(|reference| reference.segment_id == id)
-            .expect("planned segment");
-        let mut reference = self.directory.manifest.segments[index];
-        let staged = self
-            .staged_bytes
-            .checked_add(reference.capacity)
-            .ok_or(DirectoryError::CurrentMismatch)?;
-        if staged > self.state.limits.max_staged_bytes {
-            return Err(DirectoryError::SegmentMismatch(id));
+    pub(crate) fn prepare(
+        &mut self,
+        range: RepairRange,
+        reference: SegmentReference,
+    ) -> Result<(), DirectoryError> {
+        let count = usize::try_from(range.through.op_number - range.after.op_number)
+            .map_err(|_| DirectoryError::SegmentMismatch(range.segment_id))?;
+        if count as u64 > reference.capacity / crate::ENTRY_HEADER_BYTES as u64 {
+            return Err(DirectoryError::SegmentMismatch(range.segment_id));
         }
-        let predecessor = index
-            .checked_sub(1)
-            .map(|index| self.directory.manifest.segments[index].segment_id);
+        self.source.resize_with(count, || None);
+        Ok(())
+    }
+
+    pub(crate) fn load(
+        &mut self,
+        manifest: &Manifest,
+        range: RepairRange,
+        reference: SegmentReference,
+        image: &[u8],
+    ) -> Result<(), DirectoryError> {
         let header = SegmentHeader::new(
-            self.directory.identity.group_id,
-            id,
-            predecessor,
-            predecessor.map_or(Digest::ZERO, |_| reference.first_chain.previous_digest()),
+            manifest.identity.group_id,
+            reference.segment_id,
+            None,
+            Digest::ZERO,
             reference.capacity,
         )?;
-        for _ in 0..self.state.limits.max_orphan_probes {
-            reference.file_generation = reference
-                .file_generation
-                .checked_add(1)
-                .ok_or(DirectoryError::SegmentIdExhausted)?;
-            let path = self.directory.root.join(segment_reference_name(reference));
-            let file = match OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(path)
-            {
-                Ok(file) => file,
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error.into()),
-            };
-            super::super::allocate_segment(&file, reference.capacity)?;
-            self.writer = Some(SegmentWriter::initialize_allocated_at(
-                std::sync::Arc::new(file),
-                header.with_file_generation(reference.file_generation),
-                self.generation,
-                reference.first_group_number,
-                reference.first_chain,
-                true,
-            )?);
-            self.current_reference = Some(reference);
-            self.staged_bytes = staged;
-            return Ok(());
-        }
-        Err(DirectoryError::RollProbeLimit {
-            limit: self.state.limits.max_orphan_probes,
-        })
-    }
-
-    /// Install all replacements in one manifest publication, privately replay all
-    /// retained history, then remove the nonvoting marker. Preserve last-normal
-    /// view: restoring bytes does not install the donor's current logical history.
-    /// Success permits fenced intact restart only. Uncertain errors consume ownership.
-    pub fn finish(
-        self,
-        configuration: &[u8],
-        recovery: CanonicalRecoveryLimits,
-    ) -> Result<OpenGroupJournal, RecoveryPublicationError> {
-        self.finish_observing(
-            configuration,
-            recovery,
-            &mut super::super::NoopObserver,
-            |_| Ok(()),
-        )
-    }
-
-    fn finish_observing(
-        mut self,
-        configuration: &[u8],
-        recovery: CanonicalRecoveryLimits,
-        observer: &mut impl super::super::PersistenceObserver,
-        completed: impl FnMut(super::PublicationPhase) -> io::Result<()>,
-    ) -> Result<OpenGroupJournal, RecoveryPublicationError> {
-        self.require_healthy()?;
-        if self.state.next != self.state.ranges.len() || self.writer.is_some() {
-            return Err(DirectoryError::CurrentMismatch.into());
-        }
-        self.directory.require_recovering(configuration)?;
-        sync_directory(&self.directory.root.join("segments"))?;
-        let mut next = self.directory.manifest.clone();
-        next.parent_generation = next.generation;
-        next.generation = next
-            .generation
-            .checked_add(1)
-            .ok_or(DirectoryError::ManifestGeneration)?;
-        next.promised_view = self.state.view;
-        for replacement in self.replacements {
-            *next
-                .segments
-                .iter_mut()
-                .find(|r| r.segment_id == replacement.segment_id)
-                .expect("selected repair segment") = replacement;
-        }
-        self.directory.install_manifest(next, observer)?;
-        let journal =
-            self.directory
-                .recover(self.generation, self.state.decode, self.state.operations)?;
-        let publication = RecoveryPublication {
-            current: journal.directory().current(),
-            generation: self.generation,
-            view: self.state.view,
-            accepted: journal.directory().manifest().accepted,
-            committed: journal.directory().manifest().committed,
-        };
-        let (journal, _) = journal.publish_configuration_observing(
-            configuration,
-            publication,
-            recovery,
-            true,
-            completed,
+        let entries = crate::codec::salvage_entries(
+            &header,
+            image,
+            range.after.op_number + 1,
+            range.through.op_number,
+            self.decode,
         )?;
-        Ok(journal)
-    }
-
-    /// Abandon unpublished work. Orphan cleanup after recovery removes only
-    /// unselected incarnations; damaged originals remain selected and nonvoting.
-    pub fn abort(self) -> GroupDirectory {
-        self.directory
-    }
-
-    fn require_healthy(&self) -> Result<(), DirectoryError> {
-        if self.faulted {
-            Err(crate::WriterError::Faulted.into())
-        } else {
-            Ok(())
+        for entry in entries {
+            if entry.configuration_epoch != manifest.configuration_epoch
+                || entry.original_view > manifest.promised_view
+                || validate_operation_body(entry.kind, &entry.body, self.operations).is_err()
+            {
+                continue;
+            }
+            let slot = &mut self.source[(entry.op_number - range.after.op_number - 1) as usize];
+            if slot.is_some() {
+                self.discard_local();
+                return Ok(());
+            }
+            self.source_bytes += entry.body.len();
+            *slot = Some(entry);
         }
+        // Disagreeing independently valid fragments are ambiguous. Ask the donor
+        // for the whole range instead of choosing one possible local history.
+        let mut previous = Some(range.after.digest);
+        for entry in &self.source {
+            if let Some(entry) = entry {
+                if previous.is_some_and(|digest| digest != entry.previous_digest) {
+                    self.discard_local();
+                    return Ok(());
+                }
+                previous = Some(entry.digest);
+            } else {
+                previous = None;
+            }
+        }
+        if previous.is_some_and(|digest| digest != range.through.digest) {
+            self.discard_local();
+        }
+        Ok(())
+    }
+
+    fn discard_local(&mut self) {
+        self.source.iter_mut().for_each(|slot| *slot = None);
+        self.source_bytes = 0;
     }
 }
 
-#[cfg(test)]
-mod tests;
-
-fn validate_file(
-    directory: &GroupDirectory,
+pub(crate) fn validate_image(
+    manifest: &Manifest,
     index: usize,
-    decode: DecodeLimits,
-    operations: OperationLimits,
+    image: &[u8],
+    protected: LogPosition,
+    journal: JournalLimits,
 ) -> Result<(), DirectoryError> {
-    let reference = directory.manifest.segments[index];
-    let capacity = usize::try_from(reference.capacity)
-        .map_err(|_| DirectoryError::SegmentMismatch(reference.segment_id))?;
-    let image = read_limited_file(
-        &directory.root.join(segment_reference_name(reference)),
-        capacity,
-        "segment",
+    let reference = manifest.segments[index];
+    let scan = scan_segment(
+        image,
+        reference.first_group_number,
+        reference.first_chain,
+        journal.decode,
     )?;
-    let protected = if reference.sealed.is_none() {
-        evidence::protected(&directory.root, &directory.manifest)?
+    if scan.header.group_id() != manifest.identity.group_id
+        || scan.header.segment_id() != reference.segment_id
+        || scan.header.file_generation() != reference.file_generation
+        || scan.header.capacity() != reference.capacity
+        || (index > 0
+            && (scan.header.predecessor_segment_id()
+                != Some(manifest.segments[index - 1].segment_id)
+                || scan.header.predecessor_digest() != reference.first_chain.previous_digest()))
+    {
+        return Err(DirectoryError::SegmentMismatch(reference.segment_id));
+    }
+    validate_operation_bodies(
+        &scan,
+        journal.operations,
+        manifest.configuration_epoch,
+        manifest.promised_view,
+    )?;
+    if let Some(sealed) = reference.sealed {
+        if scan.valid_bytes != sealed.valid_bytes
+            || scan.digest != sealed.digest
+            || scan.next_chain != manifest.segments[index + 1].first_chain
+            || matches!(scan.tail, TailState::Truncated { .. })
+        {
+            return Err(DirectoryError::SegmentMismatch(reference.segment_id));
+        }
     } else {
-        LogPosition::GENESIS
-    };
-    state::validate_image(
-        &directory.manifest,
-        index,
-        &image,
-        protected,
-        decode,
-        operations,
-    )
+        for protected in [protected, manifest.committed] {
+            if protected.op_number >= reference.first_chain.next_op_number()
+                && !crate::directory::scan_contains_position(
+                    &scan,
+                    reference.first_chain,
+                    protected.following_chain()?,
+                )
+            {
+                return Err(DirectoryError::SegmentMismatch(reference.segment_id));
+            }
+        }
+    }
+    Ok(())
 }

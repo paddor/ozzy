@@ -1,6 +1,6 @@
 use super::*;
 use ozzy_core::state::group_targets;
-use ozzy_proto::{ConsumerGroupId, append::Authority, group::JoinRequest};
+use ozzy_proto::{ConsumerGroupId, append::Authority};
 
 fn member(id: u8) -> GroupMember {
     GroupMember {
@@ -51,11 +51,15 @@ fn heartbeat(image: &CoordinatorGroup, id: u8, owned: Vec<Owned>) -> JoinRequest
 fn target(state: &mut GroupState, image: &CoordinatorGroup, now: Duration) -> Target {
     let Disposition::Reply(ozzy_proto::group::Status::Member, targets) = state.observe(
         Some(image),
-        heartbeat(image, 1, Vec::new()),
-        member(1).node,
-        now,
-        Duration::from_secs(5),
-        &|_| Some(0),
+        Observation {
+            request: heartbeat(image, 1, Vec::new()),
+            node: member(1).node,
+            now,
+        },
+        &Targeting {
+            number: &|_| Some(0),
+            drain_deadline: Duration::from_secs(5),
+        },
     ) else {
         panic!("committed member must receive its persisted target")
     };
@@ -80,20 +84,28 @@ fn recovered_plan_waits_for_prior_ownership_report_then_explicit_release() {
     };
     state.observe(
         Some(&image),
-        heartbeat(&image, 2, vec![owned]),
-        member(2).node,
-        now,
-        Duration::from_secs(5),
-        &|_| Some(0),
+        Observation {
+            request: heartbeat(&image, 2, vec![owned]),
+            node: member(2).node,
+            now,
+        },
+        &Targeting {
+            number: &|_| Some(0),
+            drain_deadline: Duration::from_secs(5),
+        },
     );
     assert!(!target(&mut state, &image, now).activatable);
     state.observe(
         Some(&image),
-        heartbeat(&image, 2, Vec::new()),
-        member(2).node,
-        now,
-        Duration::from_secs(5),
-        &|_| Some(0),
+        Observation {
+            request: heartbeat(&image, 2, Vec::new()),
+            node: member(2).node,
+            now,
+        },
+        &Targeting {
+            number: &|_| Some(0),
+            drain_deadline: Duration::from_secs(5),
+        },
     );
     assert!(target(&mut state, &image, now).activatable);
 }

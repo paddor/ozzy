@@ -1,5 +1,5 @@
 use super::*;
-use ozzy_journal_segment::AsyncRetirementBudget;
+use ozzy_journal_segment::RetirementBudget;
 use std::io;
 
 mod adapter;
@@ -30,7 +30,7 @@ fn retirement_does_not_reread_unaffected_sealed_bodies() {
         journal.retire_confirmed_history(
             driver.begin_validation().unwrap(),
             CheckpointId::from_bytes([92; 16]),
-            AsyncRetirementBudget {
+            RetirementBudget {
                 max_segments: 1,
                 max_read_bytes: 32768,
             },
@@ -71,7 +71,7 @@ fn retirement_checks_rolled_segments_from_their_read_index() {
         journal.begin_retirement(
             driver.begin_validation().unwrap(),
             CheckpointId::from_bytes([92; 16]),
-            AsyncRetirementBudget {
+            RetirementBudget {
                 max_segments: 2,
                 max_read_bytes: 1,
             },
@@ -115,7 +115,7 @@ fn retirement_narrows_identity_coverage_without_indexing_surviving_segments() {
         journal.retire_confirmed_history(
             driver.begin_validation().unwrap(),
             CheckpointId::from_bytes([92; 16]),
-            AsyncRetirementBudget {
+            RetirementBudget {
                 max_segments: 1,
                 max_read_bytes: 32768,
             },
@@ -134,7 +134,7 @@ fn retirement_narrows_identity_coverage_without_indexing_surviving_segments() {
     assert_eq!(retired.unreferenced_segment_ids, [1]);
     assert!(!indexed, "retirement indexed surviving segments");
     let ready = journal.journal.ready().unwrap();
-    assert!(ready.pins_released(&[1], &[]).unwrap());
+    assert!(ready.pins_released(&[1], &[]));
     let first = ready.manifest().segments[0];
     let snapshot = journal.images().unwrap().committed_identities().snapshot();
     assert_eq!(snapshot.segment_references(), []);
@@ -159,7 +159,7 @@ fn retirement_writes_its_checkpoint_beside_later_appends() {
         journal.begin_retirement(
             ticket,
             CheckpointId::from_bytes([92; 16]),
-            AsyncRetirementBudget {
+            RetirementBudget {
                 max_segments: 1,
                 max_read_bytes: 32768,
             },
@@ -314,7 +314,7 @@ fn reused_checkpoint_read_failure_fences_retirement_before_unreferencing_segment
         journal.retire_confirmed_history(
             ticket,
             CheckpointId::from_bytes([93; 16]),
-            AsyncRetirementBudget {
+            RetirementBudget {
                 max_segments: 1,
                 max_read_bytes: 32768,
             },
@@ -364,7 +364,7 @@ fn retire(
         journal.retire_confirmed_history(
             ticket,
             CheckpointId::from_bytes([id; 16]),
-            AsyncRetirementBudget {
+            RetirementBudget {
                 max_segments: 1,
                 max_read_bytes: 32768,
             },

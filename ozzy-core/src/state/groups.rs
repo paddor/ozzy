@@ -229,10 +229,10 @@ pub(super) fn validate_image(plan: &GroupPlan<'_>) -> Result<(), StateError> {
                 .members
                 .binary_search_by_key(&member.id, |m| m.id)
                 .map_err(|_| StateError::InvalidGroupPlan)?;
-            if plan.members[index] != member {
+            if plan.members.get(index) != Some(&member) {
                 return Err(StateError::InvalidGroupPlan);
             }
-            counts[index] += 1;
+            *counts.get_mut(index).ok_or(StateError::InvalidGroupPlan)? += 1;
         } else if !plan.members.is_empty() {
             return Err(StateError::InvalidGroupPlan);
         }

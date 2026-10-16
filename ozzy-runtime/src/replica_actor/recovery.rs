@@ -1,15 +1,26 @@
 //! Nonvoting full-WAL recovery on a shared application shard.
 
 use crate::replica_actor::HistoryReason;
+mod deadline;
+mod requests;
 mod scheduled;
 #[cfg(feature = "simulation")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "simulation test support"
+)]
 pub(super) mod simulation;
 pub use scheduled::ScheduledRecovery;
 
 use super::{
     ActorConfig, ActorError, ActorIds, ActorStatus, AppendBuffer, Bytes, Configuration, Duration,
-    EnqueueError, Message, NodeId, PeerBinding, Prefix, ReplicaActor, ReplicaMessage,
-    ReplicaOutbox, Scope, SendClass, WireLimits, watch, wire,
+    Message, NodeId, PeerBinding, Prefix, ReplicaActor, ReplicaMessage, ReplicaOutbox, Scope,
+    SharedStatus, WireLimits, routed, wire,
 };
 use crate::replica_journal::{
     JournalCompletion, OwnedRecoveryGenerations, PublishedRecovery, ReceivedChunk, RecoveryPlan,
@@ -17,6 +28,7 @@ use crate::replica_journal::{
 };
 use ozzy_replication::recovery::{Recovery, RecoveryError, RecoveryTicket};
 use ozzy_replication::wire::{Control, FetchOps, RecoveryMessage, RecoveryRequest};
+use std::cell::Cell;
 
 /// Recovery request pacing, independent of normal PREPARE/receipt timers.
 #[derive(Debug, Clone, Copy)]
@@ -36,6 +48,17 @@ impl Default for RecoveryTiming {
             maximum: Duration::from_secs(1),
             stalled: Duration::from_secs(10),
         }
+    }
+}
+
+impl RecoveryTiming {
+    /// Retries back off from a nonzero start and give up only after their
+    /// ceiling.
+    fn validate(self) -> Result<Self, ActorError> {
+        if self.initial.is_zero() || self.maximum < self.initial || self.stalled <= self.maximum {
+            return Err(ActorError::Limits);
+        }
+        Ok(self)
     }
 }
 
@@ -115,7 +138,7 @@ pub struct RecoveryActor<J: RecoveryStorage = ShardRecoveringJournal> {
     local: NodeId,
     config: ActorConfig,
     timing: RecoveryTiming,
-    journal: Option<J>,
+    journal: J,
     ids: ActorIds,
     recovery: Recovery,
     scope: Scope,
@@ -139,7 +162,7 @@ pub struct RecoveryActor<J: RecoveryStorage = ShardRecoveringJournal> {
     bindings: [Option<PeerBinding>; 3],
     wire_limits: WireLimits,
     outbox: ReplicaOutbox,
-    status: watch::Sender<ActorStatus>,
+    status: SharedStatus,
 }
 
 impl<J: RecoveryStorage> RecoveryActor<J> {
@@ -163,46 +186,19 @@ impl<J: RecoveryStorage> RecoveryActor<J> {
         timing: RecoveryTiming,
         mut ids: ActorIds,
     ) -> Result<Self, ActorError> {
-        if timing.initial.is_zero()
-            || timing.maximum < timing.initial
-            || timing.stalled <= timing.maximum
-        {
-            return Err(ActorError::Limits);
-        }
+        let timing = timing.validate()?;
         let configuration = startup.configuration();
         let local = startup.local();
         let scope = configuration.scope();
         let buffer = journal.lease_append_buffer()?;
-        if buffer.owner_generation() != startup.generation() {
-            return Err(ActorError::StartupMismatch);
-        }
-        if config.transfer.max_operations > buffer.limits().max_operations
-            || config.transfer.max_body_bytes > buffer.limits().max_body_bytes
-        {
-            return Err(ActorError::Limits);
-        }
+        let buffer =
+            super::construct::checked_arena(buffer, startup.generation(), config.transfer)?;
         let wire_limits = config.wire_limits()?;
         let nonce = ids.request()?;
         let recovery = startup.into_recovery(nonce, config.transfer)?;
         let outbox = ReplicaOutbox::new(configuration, local, config.control, config.data)?;
-        let mut bindings = [None; 3];
-        for (index, &peer) in configuration.voters().iter().enumerate() {
-            if peer != local && config.sessions[index].as_bytes() != &[0; 16] {
-                bindings[index] = Some(PeerBinding::new(
-                    configuration,
-                    peer,
-                    config.sessions[index],
-                )?);
-            }
-        }
-        let (status, _) = watch::channel(ActorStatus {
-            maintenance: super::MaintenanceStatus::default(),
-            scope,
-            normal: None,
-            disk_pending: false,
-            application_ready: false,
-            running: false,
-        });
+        let bindings = super::construct::peer_bindings(configuration, local, &config, None)?;
+        let status = SharedStatus::new(Cell::new(ActorStatus::initial(scope)));
         let requests =
             [ids.request()?, ids.request()?, ids.request()?].map(|request_id| RecoveryRequest {
                 scope,
@@ -214,7 +210,7 @@ impl<J: RecoveryStorage> RecoveryActor<J> {
             local,
             config,
             timing,
-            journal: Some(journal),
+            journal,
             ids,
             recovery,
             scope,
@@ -242,16 +238,16 @@ impl<J: RecoveryStorage> RecoveryActor<J> {
         })
     }
 
-    /// Observe recovery and the succeeding normal actor through the same watch channel.
-    /// No observation grants authority; normal/ready remain absent throughout transfer.
-    pub fn subscribe(&self) -> watch::Receiver<ActorStatus> {
-        self.status.subscribe()
+    /// Latest observation. No observation grants authority; normal and ready
+    /// stay absent throughout transfer.
+    pub fn status(&self) -> ActorStatus {
+        self.status.get()
     }
 
     // The OMQ loop and controlled event driver use exactly the same lifecycle.
     // Owning self keeps cancellation from leaving a resumable half-handoff.
     async fn transition(mut self, outcome: Outcome) -> Result<Transition<J>, ActorError> {
-        let journal = self.journal.take().expect("owned recovery journal");
+        let journal = self.journal;
         self.buffer = None;
         match outcome {
             Outcome::Published(publication) => {
@@ -285,11 +281,7 @@ impl<J: RecoveryStorage> RecoveryActor<J> {
     async fn shutdown(mut self) -> Result<(), ActorError> {
         self.publish(false);
         self.buffer = None;
-        self.journal
-            .take()
-            .expect("owned recovery journal")
-            .shutdown()
-            .await?;
+        self.journal.shutdown().await?;
         Ok(())
     }
 
@@ -302,20 +294,14 @@ impl<J: RecoveryStorage> RecoveryActor<J> {
             application_ready: false,
             running,
         };
-        self.status.send_if_modified(|old| {
-            let mut next = next;
-            // Recovery requests may start with a lower view hint. Routing must
-            // keep its last observed fence while this copy remains nonvoting.
-            if old.scope.view > next.scope.view {
-                next.scope = old.scope;
-            }
-            if *old == next {
-                false
-            } else {
-                *old = next;
-                true
-            }
-        });
+        let mut next = next;
+        // Recovery requests may start with a lower view hint. Routing must
+        // keep its last observed fence while this copy remains nonvoting.
+        let old = self.status.get();
+        if old.scope.view > next.scope.view {
+            next.scope = old.scope;
+        }
+        self.status.set(next);
     }
 
     fn observe(&mut self, from: NodeId, scope: Scope) -> Result<(), ActorError> {
@@ -351,10 +337,9 @@ impl<J: RecoveryStorage> RecoveryActor<J> {
         if self.pending.is_some() {
             return Ok(None);
         }
-        let journal = self.journal.as_mut().expect("owned recovery journal");
         if self.abandoning {
             if let Some(ticket) = self.ticket.filter(|_| self.staged.is_some()) {
-                self.pending = Some(Pending::Abort(journal.abort_recovery(ticket)?));
+                self.pending = Some(Pending::Abort(self.journal.abort_recovery(ticket)?));
                 return Ok(None);
             }
             return Ok(Some(Outcome::Restart));
@@ -364,7 +349,8 @@ impl<J: RecoveryStorage> RecoveryActor<J> {
                 Ok(ticket) => {
                     self.ticket = Some(ticket);
                     self.pending = Some(Pending::Begin(
-                        journal.begin_recovery(ticket, self.config.installation)?,
+                        self.journal
+                            .begin_recovery(ticket, self.config.installation)?,
                     ));
                     return Ok(None);
                 }
@@ -373,178 +359,27 @@ impl<J: RecoveryStorage> RecoveryActor<J> {
             }
             self.request_quorum(now)?;
         } else if let (Some(ticket), Some(staged)) = (self.ticket, self.staged) {
-            if let Some(anchor) = ticket.checkpoint().filter(|_| !self.checkpoint_ready) {
-                if self.checkpoint_fetch.is_none() {
-                    self.checkpoint_fetch = Some((
-                        wire::CheckpointRequest {
-                            scope: ticket.scope(),
-                            request_id: self.ids.request()?,
-                            nonce: ticket.nonce(),
-                            source: ticket.source(),
-                            offset: self.checkpoint_through,
-                            max_bytes: self
-                                .config
-                                .transfer
-                                .max_body_bytes
-                                .min(anchor.chunk_bytes as usize)
-                                as u32,
-                        },
-                        Retry::new(self.timing),
-                    ));
-                }
-                self.request_checkpoint(now)?;
-                return Ok(None);
-            }
-            if matches!(self.plan, RecoveryPlan::Repair(None))
-                || (self.plan == RecoveryPlan::Full && staged == ticket.source().accepted)
-            {
-                self.pending = Some(Pending::Finish(journal.finish_recovery(ticket)?));
-            } else {
-                if self.fetch.is_none() {
-                    self.fetch = Some((
-                        FetchOps {
-                            scope: ticket.scope(),
-                            request_id: self.ids.request()?,
-                            source: ticket.source(),
-                            predecessor: staged,
-                            max_operations: match self.plan {
-                                RecoveryPlan::Repair(Some(range)) => {
-                                    self.config.transfer.max_operations.min(
-                                        (range.through.op_number - range.after.op_number) as usize,
-                                    ) as u32
-                                }
-                                _ => self.config.transfer.max_operations as u32,
-                            },
-                            max_body_bytes: self.config.transfer.max_body_bytes as u32,
-                        },
-                        Retry::new(self.timing),
-                    ));
-                }
-                self.request_chunk(now)?;
-            }
+            self.transfer(&ticket, staged, now)?;
         }
         Ok(None)
     }
 
-    fn request_quorum(&mut self, now: Duration) -> Result<(), ActorError> {
-        for index in 0..3 {
-            let to = self.configuration.voters()[index];
-            if to != self.local
-                && self.bindings[index].is_some()
-                && self.replies[index] != Some(self.scope.view)
-                && now >= self.retries[index].at
-            {
-                let encoded = wire::encode_recovery(
-                    self.local,
-                    self.config.sessions[index],
-                    self.requests[index],
-                    &mut self.metadata,
-                    self.wire_limits,
-                )?;
-                let message = Message::multipart([
-                    Bytes::copy_from_slice(&encoded.header),
-                    Bytes::copy_from_slice(&self.metadata[..encoded.metadata_bytes]),
-                    Bytes::new(),
-                ]);
-                self.enqueue(to, SendClass::Control, message)?;
-                self.retries[index].sent(now, self.timing);
-            }
-        }
-        Ok(())
-    }
-
-    fn request_chunk(&mut self, now: Duration) -> Result<(), ActorError> {
-        let (request, retry) = self.fetch.as_mut().expect("pending chunk request");
-        if now < retry.at {
-            return Ok(());
-        }
-        let request = *request;
-        retry.sent(now, self.timing);
-        let index = self
-            .configuration
-            .voters()
-            .iter()
-            .position(|voter| *voter == request.source.voter)
-            .expect("configured donor");
-        if self.bindings[index].is_none() {
-            return Ok(());
-        }
-        let encoded = wire::encode_fetch(
-            self.local,
-            self.config.sessions[index],
-            request,
-            &mut self.metadata,
-            self.wire_limits,
-        )?;
-        let message = Message::multipart([
-            Bytes::copy_from_slice(&encoded.header),
-            Bytes::copy_from_slice(&self.metadata[..encoded.metadata_bytes]),
-            Bytes::new(),
-        ]);
-        self.enqueue(request.source.voter, SendClass::Data, message)
-    }
-
-    fn enqueue(
-        &mut self,
-        to: NodeId,
-        class: SendClass,
-        message: Message,
-    ) -> Result<(), ActorError> {
-        match self.outbox.try_enqueue(to, class, message) {
-            Ok(()) | Err((EnqueueError::Full, _)) => Ok(()),
-            Err((error, _)) => Err(ActorError::Enqueue(error)),
-        }
-    }
-
     fn receive(&mut self, message: &Message, now: Duration) -> Result<(), ActorError> {
-        if message.len() != 4 {
-            return Ok(());
-        }
-        let route = message.part_bytes(0).expect("checked part count");
-        let Some(index) = self
-            .configuration
-            .voters()
-            .iter()
-            .position(|voter| voter.as_bytes().as_slice() == route.as_ref())
+        let Some((index, binding, frames)) = routed(self.configuration, &self.bindings, message)
         else {
             return Ok(());
         };
-        let Some(binding) = self.bindings[index] else {
-            return Ok(());
-        };
         let from = self.configuration.voters()[index];
-        let frames: [Bytes; 3] =
-            std::array::from_fn(|index| message.part_bytes(index + 1).expect("checked part count"));
-        let frames = frames.each_ref().map(AsRef::as_ref);
         let Ok(decoded) = wire::decode(&frames, binding, self.wire_limits) else {
             return Ok(());
         };
         match decoded {
             ReplicaMessage::Recovery(RecoveryMessage::State(state)) => {
-                if state.validate_response(self.requests[index]).is_err() {
-                    return Ok(());
-                }
-                self.recovery.receive(from, state.response)?;
-                self.observe(from, state.response.scope)?;
-                if self.replies[index].is_none_or(|view| state.response.scope.view > view) {
-                    self.progress_at = now;
-                    self.replies[index] = Some(state.response.scope.view);
-                }
+                self.receive_state(index, &state, now)?;
             }
             ReplicaMessage::Control(control) => {
-                let scope = control.scope();
-                let primary = self.configuration.primary(scope.view);
-                let authoritative = match control {
-                    // Volatile suspicion cannot supersede a recovery attempt.
-                    Control::ExitView(_) => false,
-                    Control::Commit(_) | Control::StartView(_) => from == primary,
-                    Control::PrepareOk { .. }
-                    | Control::PrepareRetained { .. }
-                    | Control::DoViewChange(_) => self.local == primary,
-                    Control::StartViewChange(_) => true,
-                };
-                if authoritative {
-                    self.observe(from, scope)?;
+                if self.authoritative(from, control) {
+                    self.observe(from, control.scope())?;
                 }
             }
             ReplicaMessage::Checkpoint(wire::CheckpointMessage::Chunk { request, .. }) => {
@@ -555,46 +390,79 @@ impl<J: RecoveryStorage> RecoveryActor<J> {
                         .ok_or_else(|| ActorError::history(HistoryReason::Recovery))?,
                 )?;
             }
-            ReplicaMessage::Ops(batch) => {
-                let Some((request, _)) = self.fetch else {
-                    return Ok(());
-                };
-                if self.abandoning
-                    || self.pending.is_some()
-                    || batch.validate_response(request).is_err()
-                {
-                    return Ok(());
-                }
-                let ticket = self
-                    .ticket
-                    .ok_or_else(|| ActorError::history(HistoryReason::Recovery))?;
-                let bytes = batch.operations().map(|op| op.canonical().body.len()).sum();
-                if !self
-                    .buffer
-                    .as_mut()
-                    .ok_or_else(|| ActorError::history(HistoryReason::Recovery))?
-                    .reserve_incoming(bytes)?
-                {
-                    return Ok(()); // Preserve fetch correlation and retry without partial staging.
-                }
-                let mut buffer = self
-                    .buffer
-                    .take()
-                    .ok_or_else(|| ActorError::history(HistoryReason::BufferUnavailable))?;
-                for operation in batch.operations() {
-                    buffer.push(operation.canonical())?;
-                }
-                self.fetch = None;
-                self.pending = Some(Pending::Chunk(
-                    self.journal
-                        .as_mut()
-                        .expect("owned journal")
-                        .receive_chunk(ticket, buffer)
-                        .map_err(|rejected| rejected.reason)?,
-                ));
-            }
+            ReplicaMessage::Ops(batch) => self.receive_ops(&batch)?,
             _ => {} // Never answer normal votes, flow credits, or recovery requests.
         }
+        Ok(())
+    }
+
+    fn receive_state(
+        &mut self,
+        index: usize,
+        state: &wire::RecoveryState,
+        now: Duration,
+    ) -> Result<(), ActorError> {
+        if state.validate_response(self.requests[index]).is_err() {
+            return Ok(());
+        }
+        let from = self.configuration.voters()[index];
+        self.recovery.receive(from, state.response)?;
+        self.observe(from, state.response.scope)?;
+        if self.replies[index].is_none_or(|view| state.response.scope.view > view) {
+            self.progress_at = now;
+            self.replies[index] = Some(state.response.scope.view);
+        }
+        Ok(())
+    }
+
+    /// Whether `control` from `from` proves its view for this copy.
+    fn authoritative(&self, from: NodeId, control: Control) -> bool {
+        let primary = self.configuration.primary(control.scope().view);
+        match control {
+            // Volatile suspicion cannot supersede a recovery attempt.
+            Control::ExitView(_) => false,
+            Control::Commit(_) | Control::StartView(_) => from == primary,
+            Control::PrepareOk { .. }
+            | Control::PrepareRetained { .. }
+            | Control::DoViewChange(_) => self.local == primary,
+            Control::StartViewChange(_) => true,
+        }
+    }
+
+    /// Stage a fetched chunk for the journal, or keep the fetch for a retry
+    /// when the arena has no room.
+    fn receive_ops(&mut self, batch: &wire::OpsBatch<'_>) -> Result<(), ActorError> {
+        let Some((request, _)) = self.fetch else {
+            return Ok(());
+        };
+        if self.abandoning || self.pending.is_some() || batch.validate_response(request).is_err() {
+            return Ok(());
+        }
+        let ticket = self
+            .ticket
+            .ok_or_else(|| ActorError::history(HistoryReason::Recovery))?;
+        let bytes = batch.operations().map(|op| op.canonical().body.len()).sum();
+        if !self
+            .buffer
+            .as_mut()
+            .ok_or_else(|| ActorError::history(HistoryReason::Recovery))?
+            .reserve_incoming(bytes)?
+        {
+            return Ok(()); // Preserve fetch correlation and retry without partial staging.
+        }
+        let mut buffer = self
+            .buffer
+            .take()
+            .ok_or_else(|| ActorError::history(HistoryReason::BufferUnavailable))?;
+        for operation in batch.operations() {
+            buffer.push(operation.canonical())?;
+        }
+        self.fetch = None;
+        self.pending = Some(Pending::Chunk(
+            self.journal
+                .receive_chunk(ticket, buffer)
+                .map_err(|rejected| rejected.reason)?,
+        ));
         Ok(())
     }
 
@@ -616,8 +484,6 @@ impl<J: RecoveryStorage> RecoveryActor<J> {
             .ok_or_else(|| ActorError::history(HistoryReason::Recovery))?;
         let completion = match self
             .journal
-            .as_mut()
-            .expect("owned journal")
             .receive_checkpoint(ticket, request.offset, payload)
         {
             Ok(completion) => completion,
@@ -694,45 +560,5 @@ impl<J: RecoveryStorage> RecoveryActor<J> {
             Completed::Abort => return Ok(Some(Outcome::Restart)),
         }
         Ok(None)
-    }
-}
-
-impl<J: RecoveryStorage> RecoveryActor<J> {
-    fn request_checkpoint(&mut self, now: Duration) -> Result<(), ActorError> {
-        let (request, retry) = self
-            .checkpoint_fetch
-            .as_mut()
-            .expect("pending checkpoint range");
-        if now < retry.at {
-            return Ok(());
-        }
-        let request = *request;
-        retry.sent(now, self.timing);
-        let index = self
-            .configuration
-            .voters()
-            .iter()
-            .position(|&voter| voter == request.source.voter)
-            .expect("configured donor");
-        if self.bindings[index].is_none() {
-            return Ok(());
-        }
-        let encoded = wire::encode_checkpoint(
-            self.local,
-            self.config.sessions[index],
-            wire::CheckpointMessage::Request(request),
-            &mut self.metadata,
-            self.wire_limits,
-        )?;
-        self.enqueue(
-            request.source.voter,
-            SendClass::Control,
-            Message::multipart([
-                Bytes::copy_from_slice(&encoded.header),
-                Bytes::copy_from_slice(&self.metadata[..encoded.metadata_bytes]),
-                Bytes::new(),
-            ]),
-        )?;
-        Ok(())
     }
 }

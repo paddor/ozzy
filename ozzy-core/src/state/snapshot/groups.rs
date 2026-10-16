@@ -1,11 +1,10 @@
-use super::{
-    CanonicalState, StateSnapshotError, StateSnapshotLimits, enforce_limit, put_u32, read_u32,
-};
+use super::{CanonicalState, StateSnapshotError, StateSnapshotLimits, enforce_limit};
 use crate::state::{CoordinatorGroup, groups::validate_image};
 use ozzy_journal::operation::{
     OperationBody, OperationCodecError, OperationKind, OperationLimits, OperationOutput,
     append_operation_body_to, decode_operation_body, encode_operation_body,
 };
+use ozzy_proto::layout::{Reader, Writer};
 use std::{collections::BTreeSet, sync::Arc};
 
 #[derive(Default)]
@@ -71,47 +70,32 @@ pub(super) async fn encode(
 ) -> Result<usize, StateSnapshotError> {
     let body = encode_operation_body(&OperationBody::GroupPlan(group.image()), limits(bounds))
         .map_err(|_| StateSnapshotError::InvalidGroup)?;
-    put_u32(
-        output,
-        cursor,
-        u32::try_from(body.len()).map_err(|_| StateSnapshotError::LengthOverflow)?,
-    );
-    let mut next = cursor + 4;
+    let mut writer = Writer::new(output.get_mut(cursor..).unwrap_or_default());
+    writer.u32(u32::try_from(body.len()).map_err(|_| StateSnapshotError::LengthOverflow)?)?;
     for chunk in body.chunks(64 * 1024) {
-        output[next..next + chunk.len()].copy_from_slice(chunk);
-        next += chunk.len();
+        writer.bytes(chunk)?;
         step(chunk.len()).await;
     }
-    Ok(next)
+    Ok(cursor + writer.offset())
 }
 
 pub(super) async fn decode(
     state: &mut CanonicalState,
-    input: &[u8],
-    mut cursor: usize,
+    entries: &mut Reader<'_>,
     count: usize,
     bounds: StateSnapshotLimits,
     step: &mut impl AsyncFnMut(usize),
-) -> Result<usize, StateSnapshotError> {
+) -> Result<(), StateSnapshotError> {
     let mut previous = None;
     let mut names = BTreeSet::new();
     for _ in 0..count {
-        if input.len().saturating_sub(cursor) < 4 {
-            return Err(StateSnapshotError::Truncated);
-        }
-        let length = read_u32(input, cursor) as usize;
-        cursor += 4;
-        let end = cursor
-            .checked_add(length)
-            .ok_or(StateSnapshotError::LengthOverflow)?;
-        let body = input
-            .get(cursor..end)
-            .ok_or(StateSnapshotError::Truncated)?;
+        let length = entries.u32()? as usize;
+        let body = entries.take(length)?;
         let OperationBody::GroupPlan(plan) =
             decode_operation_body(OperationKind::GroupPlan, body, limits(bounds))
                 .map_err(|_| StateSnapshotError::InvalidGroup)?
         else {
-            unreachable!()
+            return Err(StateSnapshotError::InvalidGroup);
         };
         validate_image(&plan).map_err(|_| StateSnapshotError::InvalidGroup)?;
         if plan.revision > state.revision || !state.partitions.contains_key(&plan.coordinator) {
@@ -144,10 +128,9 @@ pub(super) async fn decode(
         state
             .groups
             .insert(plan.group, Arc::new(CoordinatorGroup::from_plan(&plan)));
-        cursor = end;
         for chunk in body.chunks(64 * 1024) {
             step(chunk.len()).await;
         }
     }
-    Ok(cursor)
+    Ok(())
 }

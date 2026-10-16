@@ -1,7 +1,18 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
+
 use ozzy_proto::append::{
     Append, AppendKey, Appended, Authority, DataLimits, OpPosition, PayloadEncoding, Policy,
-    Record, decode_append, decode_append_with_scratch, decode_appended, encode_append,
-    encode_append_metadata, encode_appended, encode_prepared_append_metadata, validate_append,
+    PreparedPayload, Record, decode_append, decode_append_with_scratch, decode_appended,
+    encode_append, encode_append_metadata, encode_appended, encode_prepared_append_metadata,
+    validate_append,
 };
 use ozzy_proto::{Envelope, EnvelopeLimits, Opcode, Packet, decode_packet};
 use ozzy_proto::{
@@ -229,8 +240,10 @@ fn compressed_group_validates_once_and_restores_clear_record_boundaries() {
         envelope(),
         append,
         &mut metadata,
-        PayloadEncoding::Lz4,
-        encoded.len(),
+        PreparedPayload {
+            encoding: PayloadEncoding::Lz4,
+            encoded_bytes: encoded.len(),
+        },
         limits,
     )
     .unwrap();
@@ -294,8 +307,10 @@ fn compressed_group_rejects_bad_codec_lengths_syntax_and_trailing_input() {
         envelope(),
         append,
         &mut metadata,
-        PayloadEncoding::Lz4,
-        encoded.len(),
+        PreparedPayload {
+            encoding: PayloadEncoding::Lz4,
+            encoded_bytes: encoded.len(),
+        },
         limits,
     )
     .unwrap();
@@ -397,8 +412,10 @@ fn compressed_group_rejects_bad_codec_lengths_syntax_and_trailing_input() {
             envelope(),
             append,
             &mut metadata,
-            PayloadEncoding::Lz4,
-            body.len(),
+            PreparedPayload {
+                encoding: PayloadEncoding::Lz4,
+                encoded_bytes: body.len(),
+            },
             limits,
         )
         .is_err()

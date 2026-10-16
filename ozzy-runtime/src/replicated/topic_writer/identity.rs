@@ -1,7 +1,7 @@
 //! The application-owned token needed to attach to a producer again.
 
 use super::TopicWriterError;
-use ozzy_proto::{ProducerId, TopicId};
+use ozzy_proto::{ProducerId, TopicId, layout::Fixed};
 
 /// Stable topic incarnation and producer identity. Contains no pending records
 /// or partition epochs. Save once; broker state supplies resume coordinates.
@@ -24,8 +24,8 @@ impl ProducerIdentity {
 
     /// Decode an application-saved token, rejecting empty identities.
     pub fn from_bytes(bytes: [u8; 32]) -> Result<Self, TopicWriterError> {
-        let topic = bytes[..16].try_into().expect("topic UUID");
-        let producer = bytes[16..].try_into().expect("producer UUID");
+        let topic = bytes.array::<0, 16>();
+        let producer = bytes.array::<16, 16>();
         if topic == [0; 16] || producer == [0; 16] {
             return Err(TopicWriterError::Configuration);
         }

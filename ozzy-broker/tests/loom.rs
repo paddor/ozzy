@@ -4,11 +4,22 @@
     dead_code,
     reason = "production lifecycle exposes more than these models use"
 )]
+#![allow(
+    unreachable_pub,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
 
 pub use ozzy_broker::StartupError;
 #[path = "../src/shards/lifecycle.rs"]
 mod lifecycle;
-pub use lifecycle::Shutdown;
+#[path = "../../ozzy-io/src/signal.rs"]
+mod signal;
 
 use lifecycle::{Registration, State};
 use loom::sync::Arc;
@@ -50,10 +61,10 @@ fn failure_in_either_owner_requests_peer_shutdown_before_closing_its_queue() {
                 })
             };
             if closed.load(Ordering::Acquire) {
-                assert!(peer.stop.is_requested());
+                assert!(peer.stop.is_closed());
             }
             exit.join().unwrap();
-            assert!(peer.stop.is_requested());
+            assert!(peer.stop.is_closed());
             assert!(matches!(
                 peer.result(),
                 Err(StartupError::Runtime(reason)) if reason == "injected owner failure"
@@ -92,13 +103,13 @@ fn race_owner_exit(application: Registration, frontend: Registration, frontend_f
     } else {
         (&application_state, &frontend_state)
     };
-    first.stop.request();
+    first.stop.close();
     thread::yield_now();
-    second.stop.request();
+    second.stop.close();
     application_owner.join().unwrap();
     frontend_owner.join().unwrap();
-    assert!(application_state.finished.is_requested());
-    assert!(frontend_state.finished.is_requested());
+    assert!(application_state.finished.is_closed());
+    assert!(frontend_state.finished.is_closed());
     assert!(application_state.result().is_ok());
     assert!(frontend_state.result().is_ok());
 }
@@ -110,12 +121,12 @@ fn owner_exit(
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let state = registration.state();
-        if state.stop.is_requested() {
+        if state.stop.is_closed() {
             own_closed.store(true, Ordering::Release);
         }
         if peer_closed.load(Ordering::Acquire) {
             assert!(
-                state.stop.is_requested(),
+                state.stop.is_closed(),
                 "peer queue closed before this owner observed shutdown"
             );
         }

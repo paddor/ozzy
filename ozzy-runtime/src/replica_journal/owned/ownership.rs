@@ -1,12 +1,12 @@
 //! Exclusive journal ownership across consuming asynchronous transitions.
 
-use super::{AsyncGroupJournal, JournalError, install::PendingInstallation};
+use super::{GroupJournal, JournalError, install::PendingInstallation};
 
 #[derive(Debug)]
 pub(super) enum JournalOwner {
-    Ready(Box<AsyncGroupJournal>),
-    Writing(Box<ozzy_journal_segment::AsyncJournalWritePipeline>),
-    Rolling(Box<ozzy_journal_segment::AsyncPendingJournalRoll>),
+    Ready(Box<GroupJournal>),
+    Writing(Box<ozzy_journal_segment::JournalWritePipeline>),
+    Rolling(Box<ozzy_journal_segment::PendingJournalRoll>),
     Installing(Box<PendingInstallation>),
     Fenced,
 }
@@ -22,7 +22,7 @@ impl JournalOwner {
         }
     }
 
-    pub(super) fn readable(&self) -> Result<&AsyncGroupJournal, JournalError> {
+    pub(super) fn readable(&self) -> Result<&GroupJournal, JournalError> {
         match self {
             Self::Ready(journal) => Ok(journal),
             Self::Writing(pipeline) => Ok(pipeline.journal()),
@@ -34,7 +34,7 @@ impl JournalOwner {
     pub(super) async fn retry_snapshot(
         &mut self,
         limits: ozzy_journal_segment::IndexBuildLimits,
-    ) -> Result<ozzy_journal_segment::AsyncJournalIndexSnapshot, JournalError> {
+    ) -> Result<ozzy_journal_segment::JournalIndexSnapshot, JournalError> {
         use ozzy_journal_segment::JournalIndexBoundary::Written;
         Ok(match self {
             Self::Ready(journal) => journal.build_index_snapshot(Written, limits).await?,
@@ -47,7 +47,7 @@ impl JournalOwner {
     pub(super) fn pipeline(
         &mut self,
         capacity: usize,
-    ) -> Result<&mut ozzy_journal_segment::AsyncJournalWritePipeline, JournalError> {
+    ) -> Result<&mut ozzy_journal_segment::JournalWritePipeline, JournalError> {
         if matches!(self, Self::Ready(_)) {
             *self = Self::Writing(Box::new(self.take_ready()?.begin_write_pipeline(capacity)?));
         }
@@ -58,47 +58,60 @@ impl JournalOwner {
     }
 
     pub(super) fn finish_writes(&mut self) -> Result<(), JournalError> {
-        if let Self::Writing(pipeline) = self {
-            if pipeline.pending() != 0 || pipeline.sync_pending() {
-                return Err(JournalError::CompletionMismatch);
-            }
-            let Self::Writing(pipeline) = std::mem::replace(self, Self::Fenced) else {
-                unreachable!()
-            };
-            *self = Self::Ready(Box::new(pipeline.finish()?));
+        let Self::Writing(pipeline) = self else {
+            return Ok(());
+        };
+        if pipeline.pending() != 0 || pipeline.sync_pending() {
+            return Err(JournalError::CompletionMismatch);
         }
+        let pipeline = self.take(JournalError::CompletionMismatch, |state| match state {
+            Self::Writing(pipeline) => Ok(pipeline),
+            state => Err(state),
+        })?;
+        *self = Self::Ready(Box::new(pipeline.finish()?));
         Ok(())
+    }
+
+    /// Take the state `pick` accepts, leaving `Fenced`; any other state stays.
+    fn take<T>(
+        &mut self,
+        mismatch: JournalError,
+        pick: impl FnOnce(Self) -> Result<T, Self>,
+    ) -> Result<T, JournalError> {
+        pick(std::mem::replace(self, Self::Fenced)).map_err(|state| {
+            *self = state;
+            mismatch
+        })
     }
 
     pub(super) fn take_rolling(
         &mut self,
-    ) -> Result<ozzy_journal_segment::AsyncPendingJournalRoll, JournalError> {
+    ) -> Result<ozzy_journal_segment::PendingJournalRoll, JournalError> {
         match std::mem::replace(self, Self::Fenced) {
             Self::Rolling(pending) => Ok(*pending),
             _ => Err(JournalError::CompletionMismatch),
         }
     }
 
-    pub(super) fn ready(&self) -> Result<&AsyncGroupJournal, JournalError> {
+    pub(super) fn ready(&self) -> Result<&GroupJournal, JournalError> {
         match self {
             Self::Ready(journal) => Ok(journal),
             _ => Err(JournalError::InstallationMismatch),
         }
     }
 
-    pub(super) fn ready_mut(&mut self) -> Result<&mut AsyncGroupJournal, JournalError> {
+    pub(super) fn ready_mut(&mut self) -> Result<&mut GroupJournal, JournalError> {
         match self {
             Self::Ready(journal) => Ok(journal),
             _ => Err(JournalError::InstallationMismatch),
         }
     }
 
-    pub(super) fn take_ready(&mut self) -> Result<AsyncGroupJournal, JournalError> {
-        self.ready()?;
-        let Self::Ready(journal) = std::mem::replace(self, Self::Fenced) else {
-            unreachable!("ready owner checked")
-        };
-        Ok(*journal)
+    pub(super) fn take_ready(&mut self) -> Result<GroupJournal, JournalError> {
+        self.take(JournalError::InstallationMismatch, |state| match state {
+            Self::Ready(journal) => Ok(*journal),
+            state => Err(state),
+        })
     }
 
     pub(super) fn installing_mut(&mut self) -> Result<&mut PendingInstallation, JournalError> {
@@ -109,10 +122,9 @@ impl JournalOwner {
     }
 
     pub(super) fn take_installing(&mut self) -> Result<PendingInstallation, JournalError> {
-        self.installing_mut()?;
-        let Self::Installing(pending) = std::mem::replace(self, Self::Fenced) else {
-            unreachable!("pending installation checked")
-        };
-        Ok(*pending)
+        self.take(JournalError::InstallationMismatch, |state| match state {
+            Self::Installing(pending) => Ok(*pending),
+            state => Err(state),
+        })
     }
 }

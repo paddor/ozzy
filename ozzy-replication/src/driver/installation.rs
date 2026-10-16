@@ -8,7 +8,8 @@ use super::{Action, DriverError, ReplicaDriver, Role};
 use crate::wire::Control;
 use crate::{
     Commit, Digest, InstallOutcome, InstallTicket, InstallingView, JournalGeneration, LogSource,
-    OpNumber, Prefix, PreparedOperation, ReplicationError, Scope, StartView,
+    OpNumber, Prefix, PreparedOperation, ReceivedStart, ReplicationError, Scope, StartView,
+    ViewChangeError, VoterSet,
 };
 
 /// Whole-tail commit authority captured before worker-side image activation.
@@ -46,19 +47,21 @@ impl ActivationTicket {
 }
 
 impl ReplicaDriver {
+    /// Send one pending new-view activation commit. A voter set only while an
+    /// installed view exists, so a missing view drops the pending set.
     pub(super) fn activation_action(&mut self) -> Result<Option<Action>, DriverError> {
-        if self.activation_pending == 0 {
+        if self.activation_pending.is_empty() {
             return Ok(None);
         }
-        let start = self
-            .normal()
-            .expect("normal role")
-            .start_view()?
-            .expect("activation response requires an installed view");
-        let voter = self.activation_pending.trailing_zeros() as usize;
-        self.activation_pending &= !(1 << voter);
+        let Some(start) = self.require_normal()?.start_view()? else {
+            self.activation_pending = VoterSet::EMPTY;
+            return Ok(None);
+        };
+        let Some(voter) = self.activation_pending.pop_first() else {
+            return Ok(None);
+        };
         Ok(Some(Action::Send {
-            to: self.configuration.voters()[voter],
+            to: self.configuration.voter(voter),
             message: Control::Commit(Commit {
                 scope: start.scope,
                 committed: start.accepted,
@@ -74,7 +77,7 @@ impl ReplicaDriver {
         let through = normal.activation_prefix()?;
         let snapshot = normal.snapshot();
         Ok(ActivationTicket {
-            local: self.local,
+            local: self.configuration.voter(self.local),
             scope: snapshot.scope,
             generation: snapshot.journal.generation,
             through,
@@ -93,9 +96,9 @@ impl ReplicaDriver {
 
     /// Inspect the exact pending selected-log action without granting normal authority.
     pub fn installation_ticket(&self) -> Option<InstallTicket> {
-        match self.role.as_ref().expect("owned role") {
+        match &self.role {
             Role::Installing(installing) => Some(installing.ticket()),
-            Role::Normal(_) | Role::ViewChanging(_) => None,
+            Role::Normal(_) | Role::ViewChanging(_) | Role::Fenced(_) => None,
         }
     }
 
@@ -120,33 +123,33 @@ impl ReplicaDriver {
         generation: JournalGeneration,
         lookup: impl FnMut(LogSource, OpNumber) -> Option<Digest>,
     ) -> Result<InstallTicket, DriverError> {
-        self.begin_install(Some((from, start)), generation, lookup)
+        self.begin_install(Some(ReceivedStart { from, start }), generation, lookup)
     }
 
     fn begin_install(
         &mut self,
-        backup: Option<(NodeId, StartView)>,
+        backup: Option<ReceivedStart>,
         generation: JournalGeneration,
         lookup: impl FnMut(LogSource, OpNumber) -> Option<Digest>,
     ) -> Result<InstallTicket, DriverError> {
         self.changing()?;
-        let Role::ViewChanging(changing) = self.role.take().expect("owned role") else {
-            unreachable!("view-changing checked");
+        let Role::ViewChanging(changing) = self.take_role() else {
+            return Err(ViewChangeError::Faulted.into());
         };
         let admitted = match backup {
-            Some((from, start)) => changing.begin_backup_install(from, start, generation, lookup),
+            Some(received) => changing.begin_backup_install(received, generation, lookup),
             None => changing.begin_primary_install(generation),
         };
         match admitted {
             Ok(installing) => {
                 let ticket = installing.ticket();
-                self.role = Some(Role::Installing(installing));
-                self.election_deadline = self.now + self.election_delay;
+                self.role = Role::Installing(installing);
+                self.election_deadline = self.now.saturating_add(self.election_delay);
                 Ok(ticket)
             }
             Err(rejected) => {
                 let error = rejected.error();
-                self.role = Some(Role::ViewChanging(rejected.into_view_change()));
+                self.role = Role::ViewChanging(rejected.into_view_change());
                 Err(error.into())
             }
         }
@@ -175,19 +178,19 @@ impl ReplicaDriver {
         self.observe_time(now)?;
         let outcome = self.installing_mut()?.complete(ticket, applied)?;
         let changing = matches!(outcome, InstallOutcome::ViewChanging(_));
-        self.role = Some(match outcome {
+        self.role = match outcome {
             InstallOutcome::Normal(normal) => Role::Normal(normal),
             InstallOutcome::ViewChanging(changing) => Role::ViewChanging(changing),
-        });
-        self.contact_deadline = now + self.timing.primary_timeout;
-        self.persistence_deadline = now + self.timing.primary_timeout;
-        self.progress_deadline = now + self.progress_timeout();
-        self.election_deadline = now + self.election_delay;
+        };
+        self.contact_deadline = now.saturating_add(self.timing.primary_timeout);
+        self.persistence_deadline = now.saturating_add(self.timing.primary_timeout);
+        self.progress_deadline = now.saturating_add(self.progress_timeout());
+        self.election_deadline = now.saturating_add(self.election_delay);
         self.retry_at = now;
         self.start_pending = changing;
         self.report_pending = changing;
         self.commit_pending = false;
-        self.activation_pending = 0;
+        self.activation_pending = VoterSet::EMPTY;
         Ok(())
     }
 
@@ -202,20 +205,21 @@ impl ReplicaDriver {
     ) -> Result<(), DriverError> {
         self.observe_time(now)?;
         let changing = self.installing_mut()?.complete_abandon(ticket)?;
-        self.role = Some(Role::ViewChanging(changing));
-        self.election_deadline = now + self.election_delay;
+        self.role = Role::ViewChanging(changing);
+        self.election_deadline = now.saturating_add(self.election_delay);
         self.retry_at = now;
         self.start_pending = true;
         self.report_pending = true;
         self.commit_pending = false;
-        self.activation_pending = 0;
+        self.activation_pending = VoterSet::EMPTY;
         Ok(())
     }
 
     fn installing_mut(&mut self) -> Result<&mut InstallingView, DriverError> {
-        match self.role.as_mut().expect("owned role") {
+        match &mut self.role {
             Role::Installing(installing) => Ok(installing),
             Role::Normal(_) | Role::ViewChanging(_) => Err(ReplicationError::WrongRole.into()),
+            Role::Fenced(_) => Err(ViewChangeError::Faulted.into()),
         }
     }
 }

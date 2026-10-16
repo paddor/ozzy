@@ -1,164 +1,253 @@
 # Development
 
-Ozzy requires Rust 1.93 or newer.
+How to check, test, and soak Ozzy changes. For contributors. Release steps live
+in [RELEASING.md](RELEASING.md); benchmark rules live in
+[BENCHMARKS.md](BENCHMARKS.md) and [ozzy-bench](ozzy-bench/README.md).
 
-CI uses published OMQ/fanring revisions and generic x86_64 codegen. Formatting
-and Clippy gate tests, MSRV, and the twelve-crate publishing dry run. PR/main use
-Nextest `ci` with bounded all-mode smoke tests; weekly/manual `Extended` runs
-broker lifecycle, recovery, churn, load, exhaustive crash-cut tests, and Loom
-(Sunday 03:00 UTC).
-See [RELEASING.md](RELEASING.md) for release PRs and trusted publishing.
+## Requirements
 
-## Local check
+- Rust 1.93 or newer, edition 2024, ASCII-only source.
+- [`cargo-nextest`](https://nexte.st/).
+- Optional, for [verification](#verification): Kani, Java, ripgrep, and the
+  TLA+ tools jar.
 
-```sh
-./scripts/test-all.sh
-```
-
-The script checks formatting, runs Clippy with warnings denied, runs workspace
-tests through Nextest with eight threads, runs doctests separately, and builds
-strict public API documentation.
-Use `scripts/test-all.sh lint` or `scripts/test-all.sh tests` to run only one
-phase; CI runs them in separate jobs.
-
-Tools and integration tests use the `ozzy_` prefix; the broker command is `ozzy`.
-Linux truncates process names to 15 characters; benchmark isolation resolves the
-full executable path.
-The suite also names its Cargo, compiler, and rustdoc processes. Use
-`scripts/ozzy_cargo build --workspace` for the same naming and artifact
-directory on individual commands. Clippy retains its own compiler wrapper.
-`OZZY_ARTIFACT_ROOT` selects the artifact root; it defaults to the system
-temporary directory. Explicit `CARGO_TARGET_DIR` and `TMPDIR` take precedence
-for builds and temporary files.
-
-Individual commands:
+## Local checks
 
 ```sh
-source scripts/ozzy_tools.sh
-cargo build --workspace
+./scripts/test-all.sh          # full gate: every check below
+./scripts/test-all.sh lint     # format, file shape, Clippy
+./scripts/test-all.sh tests    # Nextest, doctests, API docs
+
+# The same checks one at a time:
+source scripts/ozzy_tools.sh   # artifact paths, see below
 cargo fmt --all -- --check
+scripts/check-shape.sh
+cargo build --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo nextest run --workspace --test-threads 8
 cargo test --workspace --doc
-RUSTDOCFLAGS='-D warnings' cargo doc -p ozzy -p ozzy-runtime -p ozzy-proto \
-  --no-deps
+RUSTDOCFLAGS='-D warnings' cargo doc -p ozzy -p ozzy-runtime -p ozzy-proto --no-deps
 ```
 
-`ozzy-bench` is excluded from the default workspace members. Build it
-explicitly when working on benchmarks:
+- `scripts/ozzy_cargo <args>` runs Cargo with the same artifact paths.
+- `ozzy-bench` is not a default member. A plain `cargo build` skips it; use
+  `cargo build -p ozzy-bench` or `--workspace`.
+
+### Artifact paths
+
+`scripts/ozzy_tools.sh` sets these. An explicit value always wins.
+
+| Variable | Default |
+| --- | --- |
+| `OZZY_ARTIFACT_ROOT` | `$TMPDIR`, else `/tmp`; a relative path resolves from the repo root |
+| `CARGO_TARGET_DIR` | `$OZZY_ARTIFACT_ROOT/cargo-target/checkouts/<checkout hash>` |
+| `TMPDIR` | `$OZZY_ARTIFACT_ROOT` |
+
+### Code limits
+
+Clippy and `scripts/check-shape.sh` enforce these:
+
+- Product code has no `unwrap`, `expect`, `panic!`, `unreachable!`, `todo!`,
+  or `unimplemented!`. Test builds allow them.
+- A function has at most 60 code lines and 5 arguments besides `self`
+  (`clippy.toml`).
+- A Rust file has at most 600 lines; tests and simulation support have 1000.
+- `scripts/check-shape.allow` lists exempt files. Remove an entry once its file
+  fits, or the check fails.
+- Test targets and tools use the `ozzy_` prefix. The broker command is `ozzy`.
+
+## CI
+
+| Workflow | Runs on | Jobs |
+| --- | --- | --- |
+| `ci.yml` | Pull requests, pushes to `main`, manual | `test-all.sh lint`, then build plus `test-all.sh tests`, MSRV `cargo check` on Rust 1.93, and `cargo publish --dry-run` |
+| `extended.yml` | Sundays 03:00 UTC, manual | `test-all.sh lint`, then the `extended` profile and `scripts/test.sh loom` |
+| `release-plz.yml` | After a green `main` CI run | Release PRs and publishing, see [RELEASING.md](RELEASING.md) |
+
+CI builds with `-C target-cpu=x86-64`. Local builds use `target-cpu=native`
+from `.cargo/config.toml`.
+
+## Nextest profiles
+
+`.config/nextest.toml` owns the split and the timeouts.
+
+| Profile | Runs | When |
+| --- | --- | --- |
+| `default` | Fast suite, a few minutes: unit, core, simulation, inproc broker/SDK over memory storage | Every PR and push |
+| `extended` | System tests: TCP, processes, physical disk, `stress` modules, exhaustive crash cuts, timed bench cohorts | Weekly CI; locally when a change touches TCP, processes, physical storage, or startup |
 
 ```sh
-cargo build -p ozzy-bench
+cargo nextest run --workspace --test-threads 8 --profile extended
 ```
 
-For fast inside-out checks, use `scripts/test.sh core`, `writer`, `inproc`,
-`simulation`, or `loom` before the full gate. The test layers below define
-their evidence and limits.
+- An integration case in the default profile finishes in about ten seconds.
+- Put TCP/process, physical-disk, long, and exhaustive cases in a `stress`
+  module or the `extended` filter.
+- Command-line filters intersect with the profile filter. To select a system
+  test by name, add `--profile extended` or `--ignore-default-filter`.
+
+### Focused scopes
+
+`scripts/test.sh <scope> [filters]` runs one slice, such as `core`, `storage`,
+or `replication`. `scripts/test.sh --help` lists the scopes, and the script
+shows what each selects. A scope ignores the default filter, so it includes the
+system tests in that slice.
+
+## Test layers
+
+| Layer | Proves | Lives in | Profile |
+| --- | --- | --- | --- |
+| Unit and core | Codecs, state transitions, bounds, authority fences | `src/` and `tests/` of `ozzy-proto`, `ozzy-core`, `ozzy-journal`, `ozzy-journal-segment`, `ozzy-replication`, `ozzy-config` | `default` |
+| Core simulation | Replayable protocol fault schedules with gated time, messages, and file jobs | `ozzy-sim/tests/` | `default`; `stress` in `extended` |
+| Inproc integration | Real SDKs and brokers over OMQ inproc and memory file jobs; owner lifecycle | `ozzy-broker/tests/journals/serving/`, `ozzy-sim/tests/broker/` | `default`; `stress` in `extended` |
+| Full-product simulator | Sustained workload and fault churn over real owners, SDKs, and brokers | `ozzy-sim` `ozzy_sim` binary | Short gate in `default`; long runs manual |
+| Backend conformance | The same owned file operations on the pool and AIO backends | `ozzy-io-pool/tests/`, `ozzy-io-aio/tests/` | `default` |
+| File-model power cuts | Dirty and durable bytes, file lengths, namespace barriers | `ozzy-io` `simulation` backend; crash-cut tests in `ozzy-journal-segment` and `ozzy-sim` | `default`; exhaustive cuts in `extended` |
+| TCP and process | Framing, pressure, reconnect, SIGKILL and restart | `ozzy-broker/tests/process/` | `extended` |
+| Disk lifecycle | Broker startup, format, and recovery over real device pools | `ozzy-broker/tests/journals/actors.rs`, `startup.rs` | `extended` |
+| Loom | Shared counters and wakeup protocols | `tests/loom.rs` in `ozzy-io`, `ozzy-runtime`, `ozzy-broker` | None; `scripts/test.sh loom` |
+| Soaks | Hours of churn over processes or memory-only brokers | Ignored tests, see [Soaks](#soaks-and-simulator-runs) | None; manual |
+
+What a layer does not prove:
+
+- Unit and core: only finite state and format cases.
+- Core simulation: only within model bounds and injected faults.
+- Inproc: no ZMTP wire and no physical disk. Threaded scheduling stays
+  nondeterministic.
+- Simulator: seed replay reproduces the fault prefix, not the transport
+  schedule.
+- Backend conformance: kernel and filesystem evidence, not hardware power loss.
+- File model: a file-level model, not a complete filesystem.
+- TCP and process: SIGKILL keeps the OS page cache, so this is not power loss.
+
+### Test rules
+
+- Integration tests embed the real broker over OMQ inproc and the memory file
+  backend. No other product mode.
+- Control execution and completion as separate steps. Aliased or canceled jobs
+  keep their physical charges.
+- Check with independent oracles: message IDs, multipart boundaries, payload
+  bytes, sequence numbers, and offsets.
+- Poll for conditions. Never sleep a fixed time. Drive long timers with manual
+  broker time.
+- Test under bounded load first.
+- Run builds, heavy checks, benchmarks, and profiling serially.
+
+## Loom
+
+```sh
+scripts/test.sh loom [filters]
+```
+
+The scope builds with `--cfg ozzy_loom` and runs the `tests/loom.rs` models of
+`ozzy-io`, `ozzy-runtime`, and `ozzy-broker`. Models compile the production
+atomics and cover Ozzy-owned shared counters and wakeup protocols: storage
+signals, SDK capacity, receipts, replica wakeups, and broker shutdown. Each
+model file lists its cases.
+
+Outside Loom: Tokio `Notify` internals, Tokio wakes, OMQ internals, physical
+I/O, and complete replication.
+
+## Required coverage
+
+A change keeps or adds cases for each area it touches:
+
+- **Identity and order:** exact bytes, parts, and message IDs; shared offsets;
+  independent producer epochs; unchanged retries.
+- **Confirmation:** local durability; two durable disk quorum copies; two
+  retained replicated-persisting copies; reply-before-COMMIT failover.
+- **Authority:** configuration, view, session, incarnation, and receive-epoch
+  fencing; stale work after replacement.
+- **Pressure:** full-backing charges through aliases and cancellation;
+  separate control capacity; slow readers and followers.
+- **Repair:** lost, duplicate, and reordered PUB; quiet final loss; bounded
+  PEER repair; unavailable quorum.
+- **Storage:** short and torn writes; reversed results; failed barriers; roll
+  and checkpoint cuts; captured-source pins.
+- **Recovery:** nonvoting damage; frozen donors; private replay; bounded
+  transfer; interrupted publication.
+- **SDK lifecycle:** resume and takeover; control-slot reuse; idle readers;
+  detached close; lost replies.
+- **Retention:** confirmed retry and record floors; repeated retirement;
+  checkpoints; cold replay; ancient replicas.
 
 ## Verification
 
 ```sh
-cargo nextest run -p ozzy-journal -p ozzy-core -p ozzy-sim --test-threads 8
-bash scripts/verify-rust.sh
-bash scripts/verify-models.sh
+scripts/verify-rust.sh     # Kani proofs
+scripts/verify-models.sh   # TLC models and negative controls
 ```
 
-The optional verification scripts require Kani and the TLA+ tools jar;
-see [verification/README.md](verification/README.md) for versions, model bounds,
-and limits of each claim. Set `OZZY_KANI_BIN` if `cargo-kani` is not on PATH,
-and `OZZY_TLC_JAR` for a nondefault jar location. No tools are downloaded by
-the check scripts. Do not run heavy verification alongside benchmarks.
-## Test layers
-
-| Layer | Evidence | Limits |
-| --- | --- | --- |
-| Unit/core | Production codecs, transitions, bounds, authority fences | Finite state/format cases |
-| Inproc integration | Real SDKs/brokers, OMQ, memory-only file jobs, owner lifecycle | No ZMTP or physical disk; threaded scheduling remains nondeterministic |
-| Core simulation | Gated time/messages/file jobs; replayable protocol fault schedules | Model bounds and injected faults |
-| Full-product simulator | Real owners/SDKs/brokers over OMQ inproc; sustained workload/fault churn | Seed replay reproduces fault prefixes, not exact transport scheduling |
-| Pool/AIO conformance | Same owned operations on physical backends | Kernel/filesystem evidence, not hardware power-loss proof |
-| TCP/process | Framing, pressure, reconnect, SIGKILL/restart | SIGKILL retains OS page cache |
-| File-model power cuts | Dirty/durable bytes, file lengths, namespace barriers | File-level model, not a complete filesystem |
-
-Use independent IDs, multipart boundaries, payload bytes, and sequence/offset
-oracles. Inproc cases embed the production broker and memory backend, with distinct
-broker stores in one shared OMQ context registry. Execution and completion are
-controlled separately; aliases/canceled jobs retain their physical charges.
-
-| `scripts/test.sh` scope | Selection |
-| --- | --- |
-| `unit` / `core` | Workspace library / protocol, owner, journal, replication |
-| `writer` / `local` | SDK / configuration and native integration |
-| `inproc` | Real broker simulation subtree and full-product simulator gate |
-| `storage` / `io` | Segment/index/recovery / backend contract and conformance |
-| `replication` / `simulation` | Runtime/socket/process / core and full-product schedules |
-| `loom` | Production shared counters, readiness, receipt publication, shutdown |
-
-Nextest uses eight threads except Loom. Process-global/lifecycle cases have
-separate isolation groups. Run builds, heavy checks, benchmarks, and profiling
-serially. Benchmark commands/boundaries live in [ozzy-bench](ozzy-bench/README.md)
-and [BENCHMARKS.md](BENCHMARKS.md).
-
-### Loom
-
-Run `scripts/test.sh loom`. Models compile production atomics and cover capacity
-admission/cancellation/release, readiness versus drain, receipt publication, and
-broker shutdown versus queue closure. Admission uses a two-preemption bound;
-receipt offsets use relaxed stores followed by release/acquire prefix publication.
-Shutdown models retain both owners' completion state and include a negative control.
-OMQ/Tokio internals, physical I/O, and complete replication are outside Loom.
-
-### Required coverage
-
-| Area | Cases |
-| --- | --- |
-| Identity/order | Exact bytes/parts/IDs, shared offsets, independent producer epochs, unchanged retries |
-| Confirmation | Local durability, two durable DQ copies, two retained RP copies, reply-before-COMMIT failover |
-| Authority | Configuration/view/session/incarnation/receive-epoch fencing; stale work after replacement |
-| Pressure | Full-backing charges through aliases/cancellation; separate control capacity; slow readers/followers |
-| Repair | Lost/duplicate/reordered PUB, quiet final loss, bounded PEER repair, unavailable quorum |
-| Storage | Short/torn writes, reversed results, failed barriers, roll/checkpoint cuts, captured-source pins |
-| Recovery | Nonvoting damage, frozen donors, private replay, bounded transfer, interrupted publication |
-| SDK lifecycle | Resume/takeover, control-slot reuse, idle readers, detached close, lost replies |
-| Retention | Confirmed retry/record floors, repeated retirement, checkpoints, cold replay, ancient replicas |
+Tool versions, setup, and claim limits:
+[verification/README.md](verification/README.md). The scripts download
+nothing. Do not run them alongside benchmarks.
 
 ## Soaks and simulator runs
 
-The simulator command/resource reference is [ozzy-sim/README.md](ozzy-sim/README.md).
-The shared `ozzy-sim` broker feature supplies storage ownership, deployment
-placement, and the independent SDK record oracle to short integration tests and
-sustained product runs. Virtual and wall-clock durations are separate.
+Long runs are ignored tests or the `ozzy_sim` binary. Neither profile runs
+them. Write results as JSONL under `~/.cache/ozzy/`. Run one at a time on idle
+hosts. `OZZY_SOAK_TRACE=1` prints producer reopen steps in any soak.
 
-Product workloads cover concurrent producers, resume/takeover, consumer checkpoint
-reopen/pause, reconnect, retention, quorum loss, broker restart, short writes,
-and held completions. Fault logs stream to disk; bounded recent events and dirty/
-durable images support failure inspection. Process cuts retain dirty bytes;
-modeled device cuts restore only durable bytes/namespace effects. Seed replay
-reproduces the recorded fault prefix, not the complete threaded schedule.
+### Full-product simulator
+
+```sh
+scripts/ozzy_cargo run -p ozzy-sim --features broker --bin ozzy_sim -- \
+  --mode replicated-persisting --seed 42 --duration 28800 \
+  --artifacts tmp/ozzy-sim-rp-42
+```
+
+Flags, actions, artifacts, and replay: [ozzy-sim/README.md](ozzy-sim/README.md).
+
+### Memory-only broker churn
+
+Real inproc brokers and SDKs over the memory backend.
+`OZZY_SOAK_POLICY` is `single`, `dq`, or `rp`.
+
+```sh
+OZZY_SOAK_POLICY=rp OZZY_SOAK_SECONDS=3600 \
+OZZY_SOAK_RESULTS=$HOME/.cache/ozzy/churn-rp.jsonl \
+  scripts/ozzy_cargo test -p ozzy-broker --test ozzy_broker_config \
+  journals::serving::simulated::churn::memory_only_varied_churn_soak \
+  -- --ignored --exact --nocapture
+```
+
+### Core fault churn
+
+Seeded storage and recovery schedules over the core simulation.
+
+```sh
+OZZY_CHURN_SECONDS=3600 OZZY_CHURN_SEED=1 \
+OZZY_CHURN_RESULTS=$HOME/.cache/ozzy/core-churn.jsonl \
+  scripts/ozzy_cargo test -p ozzy-sim --test ozzy_lifecycle \
+  churn::long_running_accelerated_fault_churn -- --ignored --exact --nocapture
+```
+
+### Single-broker disk soak
+
+One durable broker process on physical storage. Single durable has no
+failover; the soak restarts its only broker. `OZZY_SOAK_BROKER_BINARY` pins
+the `ozzy` binary; the default is the one Cargo builds.
+
+```sh
+OZZY_SOAK_SECONDS=3600 OZZY_SOAK_RESULTS=$HOME/.cache/ozzy/single.jsonl \
+  scripts/ozzy_cargo test -p ozzy-broker --test ozzy_broker_config \
+  process::soak::single::single_broker_varied_io_soak \
+  -- --ignored --exact --nocapture
+```
 
 ### Cross-host crash soak
 
-Use `process::soak::three_host_crash_soak` in broker integration tests for DQ/RP,
-or `process::soak::cross_host_single_crash_soak` for single durable. Provision
-fresh isolated directories with identical broker binary, `deployment.toml`,
-`shared.identity`, and each broker's `local.identity`. Initialize volumes/stores
-through the CLI. Use topic `orders`, four partitions, bounded retention.
+Broker processes on three hosts (disk quorum or replicated-persisting) or one
+host (single durable), with SIGKILL and orderly restarts. These are
+process-crash tests, not power-loss tests.
 
-| Variable | Value/default |
-| --- | --- |
-| `OZZY_SOAK_CONFIG` | Controller deployment file |
-| `OZZY_SOAK_HOSTS` | Host order; default `si-dev,wu-dev,er-dev` |
-| `OZZY_SOAK_DIRS` | Comma-separated directories in host order |
-| `OZZY_SOAK_LOGS` | Artifact directory |
-| `OZZY_SOAK_RESULTS` | JSONL under `~/.cache/ozzy/` |
-| `OZZY_SOAK_SECONDS` | Default 3600; use a short gate first |
-| `OZZY_SOAK_IDENTITY` | Controller's shared identity when first broker is remote |
-| `OZZY_SOAK_BROKER_BINARY` | Copied CLI binary to keep restart provenance fixed |
-
-On separate hosts, broker/storage use core 0 and the SDK uses cores 4-5.
-For three local processes, use distinct directories/endpoints and broker cores
-0/1/2; set all three hosts to `si-dev`. Keep hosts idle. Single durable restarts
-its only broker before awaiting progress; it has no failover.
+1. Create a fresh directory per broker with the same `ozzy` binary,
+   `deployment.toml`, and `shared.identity`, plus that broker's
+   `local.identity`. Provision as in [GETTING_STARTED.md](GETTING_STARTED.md).
+2. Use topic `orders` with four partitions and bounded retention.
+3. Give the controller `ssh` key login to every host. It starts each broker
+   with `taskset`.
+4. Run a short gate first, then the full run.
 
 ```sh
 source scripts/ozzy_tools.sh
@@ -166,23 +255,27 @@ taskset -c 4,5 cargo test -p ozzy-broker --test ozzy_broker_config \
   process::soak::three_host_crash_soak -- --ignored --exact --nocapture
 ```
 
-The workload verifies every confirmed record/offset, releases verified oracle
-payloads, churns saved producer/consumer identities, repairs slow-reader gaps,
-and checks checkpoint replay and expired-checkpoint retention gaps. Sparse,
-burst, hot-partition, mixed-size, and empty
-multipart traffic rotate with SIGKILL/orderly restart. Unclean RP copies are
-quarantined for recovery. Process failure or 30 seconds without completion fails
-the run. These are process-crash tests, not power-loss tests.
+Use `process::soak::cross_host_single_crash_soak` for single durable.
 
-| Additional ignored case | Configuration |
+| Variable | Meaning |
 | --- | --- |
-| `process::soak::single::single_broker_varied_io_soak` | Single durable; same seconds/results/binary controls |
-| `journals::serving::simulated::churn::memory_only_varied_churn_soak` | Real inproc brokers/SDKs; `OZZY_SOAK_POLICY=single/dq/rp` |
-| `churn::long_running_accelerated_fault_churn` | Core schedules; `OZZY_CHURN_SECONDS` (3600), `OZZY_CHURN_SEED`, `OZZY_CHURN_RESULTS` |
+| `OZZY_SOAK_CONFIG` | Controller's deployment file |
+| `OZZY_SOAK_DIRS` | Comma-separated broker directories, in host order |
+| `OZZY_SOAK_HOSTS` | Host order; default `si-dev,wu-dev,er-dev` |
+| `OZZY_SOAK_LOGS` | Broker log directory |
+| `OZZY_SOAK_RESULTS` | JSONL results file |
+| `OZZY_SOAK_SECONDS` | Duration; default 3600 |
+| `OZZY_SOAK_IDENTITY` | Controller's `shared.identity` when the first broker is remote |
+| `OZZY_SOAK_MEMORY` | `1` runs memory-only brokers, see below |
 
-Cross-host memory-only runs use `OZZY_SOAK_MEMORY=1` and copy the same broker
-integration test executable as `memory-broker` into every run directory. Its
-ignored `journals::serving::simulated::churn::host::memory_only_broker_process`
-embeds the real broker over TCP with simulated files. Restart loses the store and
-requires both remaining copies for recovery, including DQ. This is a test harness,
-not a product storage mode or durability claim.
+- On separate hosts, brokers use core 0 and the SDK uses cores 4-5.
+- For three local processes, set all hosts to `si-dev` and use distinct
+  directories and endpoints. Brokers then use cores 0, 1, and 2.
+- Single durable restarts its only broker before it waits for progress.
+- Process failure, or 30 seconds without progress, fails the run.
+
+With `OZZY_SOAK_MEMORY=1`, copy the `ozzy_broker_config` test executable as
+`memory-broker` into every directory. Each broker then runs over TCP with
+simulated files. A restart loses that broker's store, so recovery needs both
+other copies, also for disk quorum. This is a test harness, not a storage mode
+or a durability claim.

@@ -1,9 +1,9 @@
 //! Pure recovery decisions, shared by blocking and asynchronous execution.
 
+use super::asynchronous::Start;
 use super::{
     BodyEncodeScratch, ChainPosition, DecodeLimits, JournalGeneration, RecoveryValidation,
-    SegmentDigestBuilder, SegmentState, TailState, WriterError, WriterPosition, damaged_tail_end,
-    scan_segment,
+    SegmentDigestBuilder, SegmentState, TailState, WriterError, WriterPosition,
 };
 use crate::{DecodedOperation, SegmentScan, cooperative::Budget};
 use ozzy_journal::operation::validate_operation_body;
@@ -18,45 +18,17 @@ pub(super) struct Recovery {
     pub(super) zero: Range<u64>,
 }
 
-pub(super) fn prepare(
-    image: &[u8],
-    generation: JournalGeneration,
-    first_group_number: u64,
-    initial_chain: ChainPosition,
-    limits: DecodeLimits,
-    validation: RecoveryValidation,
-) -> Result<Recovery, WriterError> {
-    let scan = if validation.discard_damaged_tail {
-        crate::codec::scan_segment_prefix(image, first_group_number, initial_chain, limits)?
-    } else {
-        scan_segment(image, first_group_number, initial_chain, limits)?
-    };
-    let mut checks = Checks::new(initial_chain, validation);
-    let mut segment_digest = SegmentDigestBuilder::new(&scan.header);
-    for group in &scan.groups {
-        for operation in &group.operations {
-            checks.operation(operation)?;
-        }
-        segment_digest.push(group.digest);
-    }
-    checks.finish(scan.next_chain)?;
-    let truncate = matches!(scan.tail, TailState::Truncated { .. }).then_some(scan.valid_bytes);
-    let zero = if matches!(scan.tail, TailState::Damaged { .. }) {
-        scan.valid_bytes..damaged_tail_end(image, scan.valid_bytes as usize) as u64
-    } else {
-        0..0
-    };
-    Ok(finish(scan, generation, segment_digest, truncate, zero))
-}
-
 pub(super) async fn prepare_async(
     image: &[u8],
-    generation: JournalGeneration,
-    first_group_number: u64,
-    initial_chain: ChainPosition,
+    start: Start,
     limits: DecodeLimits,
     validation: RecoveryValidation,
 ) -> Result<Recovery, WriterError> {
+    let Start {
+        generation,
+        first_group_number,
+        initial_chain,
+    } = start;
     let scan = if validation.discard_damaged_tail {
         crate::codec::scan_segment_prefix_async(image, first_group_number, initial_chain, limits)
             .await?

@@ -42,3 +42,7 @@ workspace = true
 [[test]]
 name = "ozzy_io_conformance"
 path = "tests/conformance.rs"
+
+[[test]]
+name = "ozzy_io_lock_lifetime"
+path = "tests/lock_lifetime.rs"

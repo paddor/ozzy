@@ -2,14 +2,14 @@
 
 use super::{JournalError, RecoveringJournal, RecoveryTicket, State};
 use crate::replica_journal::{
-    owned::dedup::checkpoint::recovery::Restoring, receiving::CheckpointProgress, shard::yield_turn,
+    owned::dedup::checkpoint::recovery::Restoring, receiving::CheckpointProgress,
 };
 use ozzy_core::state::{CanonicalState, canonical_state_schema_digest};
-use ozzy_journal_segment::AsyncCheckpointInbox;
+use ozzy_journal_segment::CheckpointInbox;
 
 #[derive(Debug)]
 pub(super) struct ReceivingCheckpoint {
-    pub(super) inbox: AsyncCheckpointInbox,
+    pub(super) inbox: CheckpointInbox,
     parser: Option<Restoring>,
     pub(super) state: Option<CanonicalState>,
     _metadata: Option<crate::memory::Charge>,
@@ -115,7 +115,7 @@ impl RecoveringJournal {
                 .as_mut()
                 .ok_or(JournalError::HistorySourceMismatch)?
                 .push(fragment)?;
-            yield_turn().await;
+            ozzy_io::signal::yield_once().await;
         }
         let revision = if checkpoint.inbox.is_complete() {
             let decoded = checkpoint
@@ -133,15 +133,10 @@ impl RecoveringJournal {
                 .await?;
             // Keep only bounded metadata here. Normal activation restores the verified
             // identity file; no second long-lived index is retained during adoption.
+            let revision = decoded.state.revision();
             checkpoint.state = Some(decoded.state);
             checkpoint.core_charge = decoded.charge;
-            Some(
-                checkpoint
-                    .state
-                    .as_ref()
-                    .expect("complete state")
-                    .revision(),
-            )
+            Some(revision)
         } else {
             None
         };

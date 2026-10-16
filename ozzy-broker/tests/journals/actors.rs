@@ -232,7 +232,7 @@ async fn serve(mut context: ShardContext, mut run: Run) -> Result<(), StartupErr
         }
         tokio::select! {
             biased;
-            () = context.shutdown.requested() => break,
+            () = context.shutdown.closed() => break,
             Some((group, message)) = run.incoming.recv() => actors.receive(group, &message, now).map_err(failure)?,
             result = std::future::poll_fn(|cx| {
                 for creation in &mut creations {

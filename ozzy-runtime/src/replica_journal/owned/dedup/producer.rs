@@ -1,6 +1,11 @@
 use super::{JournalError, OwnedJournal};
-use crate::replica_journal::{AppendBuffer, append::dedup::Rewrite};
+use crate::replica_journal::{
+    AppendBuffer,
+    append::dedup::{CodecScratch, Rewrite},
+};
 use ozzy_core::dedup::AttemptOperation;
+use ozzy_journal::operation::AppendBatchView;
+use ozzy_proto::{MessageId, PartitionIncarnation};
 use ozzy_replication::{JournalGeneration, Scope, driver::ValidationTicket};
 use tokio::time::Instant;
 
@@ -78,21 +83,7 @@ impl OwnedJournal {
             .0
             .checked_add(1)
             .ok_or(JournalError::AppendMismatch)?;
-        let mut ids = Vec::new();
-        ids.try_reserve_exact(batches.len())
-            .map_err(std::io::Error::other)?;
-        for batch in &batches {
-            if Some(batch.summary.partition) != image.partition
-                || batch.summary.record_count > limits.batch_records
-            {
-                return Err(JournalError::AppendMismatch);
-            }
-            let mut rows = Vec::new();
-            rows.try_reserve_exact(batch.summary.record_count)
-                .map_err(std::io::Error::other)?;
-            rows.extend(batch.descriptors().map(|record| record.message_id));
-            ids.push(rows);
-        }
+        let ids = batch_ids(&batches, image.partition, limits.batch_records)?;
         let operations: smallvec::SmallVec<[_; 4]> = ids
             .iter()
             .enumerate()
@@ -111,12 +102,33 @@ impl OwnedJournal {
             return Err(ozzy_core::dedup::Error::PendingOriginal(original).into());
         }
         let codec_budget = limits.bytes.saturating_sub(image.index.reserved_bytes());
-        buffer.resolve_dedup(
-            &prepared,
-            &mut self.dedup.codec,
-            codec_budget,
-            self.limits.operations,
-            charge,
-        )
+        let codec = CodecScratch {
+            codec: &mut self.dedup.codec,
+            budget: codec_budget,
+        };
+        buffer.resolve_dedup(&prepared, codec, self.limits.operations, charge)
     }
+}
+
+/// Each batch's message IDs, once it names the image's partition and fits
+/// the batch record limit.
+fn batch_ids(
+    batches: &[AppendBatchView<'_>],
+    partition: Option<PartitionIncarnation>,
+    max_records: usize,
+) -> Result<Vec<Vec<MessageId>>, JournalError> {
+    let mut ids = Vec::new();
+    ids.try_reserve_exact(batches.len())
+        .map_err(std::io::Error::other)?;
+    for batch in batches {
+        if Some(batch.summary.partition) != partition || batch.summary.record_count > max_records {
+            return Err(JournalError::AppendMismatch);
+        }
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(batch.summary.record_count)
+            .map_err(std::io::Error::other)?;
+        rows.extend(batch.descriptors().map(|record| record.message_id));
+        ids.push(rows);
+    }
+    Ok(ids)
 }

@@ -13,6 +13,14 @@ const BODIES: [[u8; 16]; 12] = [
     [11; 16], [12; 16],
 ];
 
+fn stream_request(replacement: SuffixReplacement, accepted: LogPosition) -> crate::SuffixRequest {
+    crate::SuffixRequest {
+        replacement,
+        accepted,
+        limits: stream_limits(),
+    }
+}
+
 fn stream_limits() -> SuffixStreamLimits {
     SuffixStreamLimits {
         max_group_operations: 2,
@@ -93,7 +101,7 @@ pub(super) async fn check_real_suffix(journal: Journal) -> Journal {
         ..request(&journal, protected)
     };
     let mut installer = journal
-        .begin_suffix_replacement(replacement, accepted, stream_limits())
+        .begin_suffix_replacement(stream_request(replacement, accepted))
         .await
         .unwrap();
     installer.append_chunk(&[selected]).await.unwrap();
@@ -146,7 +154,7 @@ fn async_suffix_preserves_exact_protected_fragment_and_old_captured_history() {
         replacement.body_encoding = encoding;
         let mut installer = drive(
             &mut controller,
-            journal.begin_suffix_replacement(replacement, position(new[5]), stream_limits()),
+            journal.begin_suffix_replacement(stream_request(replacement, position(new[5]))),
         )
         .unwrap();
         for chunk in new.chunks(2) {
@@ -221,7 +229,7 @@ fn async_suffix_rejects_whole_bad_chunks_before_writing_and_can_abort_healthy_st
     let replacement = request(&journal, position(ops[2]));
     let mut installer = drive(
         &mut controller,
-        journal.begin_suffix_replacement(replacement, position(ops[3]), stream_limits()),
+        journal.begin_suffix_replacement(stream_request(replacement, position(ops[3]))),
     )
     .unwrap();
     let wrong = CanonicalOperation {
@@ -258,7 +266,7 @@ fn async_suffix_rejects_whole_bad_chunks_before_writing_and_can_abort_healthy_st
     );
     let mut installer = drive(
         &mut controller,
-        journal.begin_suffix_replacement(replacement, position(ops[3]), stream_limits()),
+        journal.begin_suffix_replacement(stream_request(replacement, position(ops[3]))),
     )
     .unwrap();
     let wrong = CanonicalOperation {
@@ -305,7 +313,7 @@ fn async_suffix_canceled_or_failed_write_fences_staging_but_not_old_selection() 
         let replacement = request(&journal, position(ops[0]));
         let mut installer = drive(
             &mut controller,
-            journal.begin_suffix_replacement(replacement, position(ops[1]), stream_limits()),
+            journal.begin_suffix_replacement(stream_request(replacement, position(ops[1]))),
         )
         .unwrap();
         if cancel {
@@ -356,14 +364,14 @@ fn async_suffix_quota_and_probe_bounds_leave_old_generation_selected() {
     let replacement = request(&journal, LogPosition::GENESIS);
     let mut installer = drive(
         &mut controller,
-        journal.begin_suffix_replacement(
+        journal.begin_suffix_replacement(crate::SuffixRequest {
             replacement,
-            position(ops[3]),
-            SuffixStreamLimits {
+            accepted: position(ops[3]),
+            limits: SuffixStreamLimits {
                 max_staged_bytes: 8192,
                 ..stream_limits()
             },
-        ),
+        }),
     )
     .unwrap();
     drive(&mut controller, installer.append_chunk(&ops[..2])).unwrap();
@@ -377,14 +385,14 @@ fn async_suffix_quota_and_probe_bounds_leave_old_generation_selected() {
     assert!(matches!(
         drive(
             &mut controller,
-            journal.begin_suffix_replacement(
+            journal.begin_suffix_replacement(crate::SuffixRequest {
                 replacement,
-                position(ops[3]),
-                SuffixStreamLimits {
+                accepted: position(ops[3]),
+                limits: SuffixStreamLimits {
                     max_orphan_probes: 1,
                     ..stream_limits()
                 }
-            )
+            })
         ),
         Err(Error::ReplacementSegmentConflict)
     ));
@@ -392,7 +400,7 @@ fn async_suffix_quota_and_probe_bounds_leave_old_generation_selected() {
     assert_eq!(journal.current(), selected);
     let mut installer = drive(
         &mut controller,
-        journal.begin_suffix_replacement(replacement, position(ops[3]), stream_limits()),
+        journal.begin_suffix_replacement(stream_request(replacement, position(ops[3]))),
     )
     .unwrap();
     drive(&mut controller, installer.append_chunk(&ops[..2])).unwrap();
@@ -420,7 +428,7 @@ fn async_recovery_suffix_keeps_marker_until_exact_private_configuration_publicat
     let replacement = request(&journal, position(ops[0]));
     let mut installer = drive(
         &mut controller,
-        journal.begin_recovery_replacement(CONFIG, replacement, position(ops[3]), stream_limits()),
+        journal.begin_recovery_replacement(CONFIG, stream_request(replacement, position(ops[3]))),
     )
     .unwrap();
     for chunk in ops.chunks(2) {
@@ -454,4 +462,187 @@ fn async_recovery_suffix_keeps_marker_until_exact_private_configuration_publicat
     let journal = drive(&mut controller, open(io, 12)).unwrap();
     assert_eq!(journal.accepted_position().unwrap(), position(ops[3]));
     assert_eq!(journal.committed_position().unwrap(), position(ops[0]));
+}
+
+#[test]
+fn replacement_preserves_earlier_sealed_segments_and_supports_empty_selected_suffix() {
+    for inside_group in [false, true] {
+        let (mut controller, mut journal) = empty_journal();
+        let ops = operations(LogPosition::GENESIS, &BODIES[..4], 0);
+        let written = drive(
+            &mut controller,
+            journal.append(&ops[..2], BodyEncoding::Raw),
+        )
+        .unwrap();
+        drive(&mut controller, journal.sync_through(written)).unwrap();
+        drive(&mut controller, journal.roll_active(32768, 4)).unwrap();
+        let earlier = journal.manifest.segments[0];
+        let sealed = Path::new("/group/segments/1.log");
+        let original = controller.image().bytes(sealed, false).unwrap().to_vec();
+        let written = drive(
+            &mut controller,
+            journal.append(&ops[2..], BodyEncoding::Raw),
+        )
+        .unwrap();
+        drive(&mut controller, journal.sync_through(written)).unwrap();
+        let protected = position(ops[if inside_group { 2 } else { 1 }]);
+        let mut next = journal.next_manifest().unwrap();
+        next.accepted = position(ops[3]);
+        next.committed = protected;
+        drive(&mut controller, journal.install_metadata(next)).unwrap();
+        let replacement = request(&journal, protected);
+        let installer = drive(
+            &mut controller,
+            journal.begin_suffix_replacement(stream_request(replacement, protected)),
+        )
+        .unwrap();
+        let journal = drive(&mut controller, installer.finish()).unwrap();
+        assert_eq!(journal.manifest.segments[0], earlier);
+        assert_eq!(controller.image().bytes(sealed, false).unwrap(), original);
+        assert_eq!(journal.accepted_position().unwrap(), protected);
+        assert_eq!(journal.committed_position().unwrap(), protected);
+        drop(journal);
+        let (mut controller, io) = setup(controller.crash(true).unwrap().0);
+        let journal = drive(&mut controller, open(io, 10)).unwrap();
+        assert_eq!(journal.accepted_position().unwrap(), protected);
+    }
+}
+
+fn recovering(controller: &mut Controller, io: &Local) -> Journal {
+    drive(
+        controller,
+        Journal::format_recovering(
+            "/group".into(),
+            io.clone(),
+            spec(CommitMode::External),
+            JournalGeneration(1),
+            limits(),
+        ),
+    )
+    .unwrap()
+}
+
+#[test]
+fn fresh_recovery_replaces_unadmitted_attempt_not_ordinary_voter_history() {
+    use super::recovery::{recovery_limits, reopen_replacement};
+    let (mut controller, io) = setup(Image::default());
+    let journal = recovering(&mut controller, &io);
+    let ops = operations(LogPosition::GENESIS, &BODIES[..1], 2);
+    let accepted = position(ops[0]);
+    let mut replacement = SuffixReplacement {
+        writer_generation: JournalGeneration(2),
+        ..request(&journal, accepted)
+    };
+    let mut installer = drive(
+        &mut controller,
+        journal.begin_suffix_replacement(stream_request(replacement, accepted)),
+    )
+    .unwrap();
+    drive(&mut controller, installer.append_chunk(&ops)).unwrap();
+    // Stop before publishing the voter configuration.
+    drop(drive(&mut controller, installer.finish()).unwrap());
+
+    let journal = drive(&mut controller, reopen_replacement(io.clone(), 3)).unwrap();
+    replacement.expected_current = journal.current();
+    replacement.writer_generation = JournalGeneration(4);
+    replacement.promised_view = 3;
+    replacement.last_normal_view = 3;
+    replacement.committed = LogPosition::GENESIS;
+    // Ordinary suffix installation still cannot lower even this local commit floor.
+    assert!(matches!(
+        drive(
+            &mut controller,
+            journal.begin_suffix_replacement(crate::SuffixRequest {
+                replacement,
+                accepted,
+                limits: stream_limits()
+            })
+        ),
+        Err(Error::ProtectedCommitMismatch)
+    ));
+    let journal = drive(&mut controller, reopen_replacement(io.clone(), 3)).unwrap();
+    let mut installer = drive(
+        &mut controller,
+        journal.begin_recovery_replacement(CONFIG, stream_request(replacement, accepted)),
+    )
+    .unwrap();
+    drive(&mut controller, installer.append_chunk(&ops)).unwrap();
+    let mut journal = drive(&mut controller, installer.finish()).unwrap();
+    assert_eq!(journal.committed_position().unwrap(), LogPosition::GENESIS);
+    let publication = crate::RecoveryPublication {
+        current: journal.current(),
+        generation: JournalGeneration(4),
+        view: 3,
+        accepted,
+        committed: LogPosition::GENESIS,
+    };
+    let candidate = drive(
+        &mut controller,
+        journal.publish_recovered_configuration(CONFIG, publication, recovery_limits()),
+    )
+    .unwrap();
+    assert_eq!(candidate.accepted_position(), accepted);
+    drop(candidate);
+    replacement.expected_current = journal.current();
+    replacement.writer_generation = JournalGeneration(5);
+    assert!(matches!(
+        drive(
+            &mut controller,
+            journal.begin_recovery_replacement(
+                CONFIG,
+                crate::SuffixRequest {
+                    replacement,
+                    accepted,
+                    limits: stream_limits()
+                }
+            )
+        ),
+        Err(Error::Directory(DirectoryError::ConfigurationMismatch))
+    ));
+}
+
+#[test]
+fn syntactically_valid_duplicate_identity_cannot_publish_voter_configuration() {
+    use super::recovery::{recovery_limits, reopen_replacement};
+    const SAME: [[u8; 16]; 2] = [[1; 16]; 2];
+    let (mut controller, io) = setup(Image::default());
+    let journal = recovering(&mut controller, &io);
+    let ops = operations(LogPosition::GENESIS, &SAME, 1);
+    let accepted = position(ops[1]);
+    let replacement = request(&journal, accepted);
+    let mut installer = drive(
+        &mut controller,
+        journal.begin_recovery_replacement(CONFIG, stream_request(replacement, accepted)),
+    )
+    .unwrap();
+    drive(&mut controller, installer.append_chunk(&ops)).unwrap();
+    let mut journal = drive(&mut controller, installer.finish()).unwrap();
+    assert_eq!(journal.accepted_position().unwrap(), accepted);
+    let publication = crate::RecoveryPublication {
+        current: journal.current(),
+        generation: JournalGeneration(9),
+        view: 2,
+        accepted,
+        committed: accepted,
+    };
+    let error = drive(
+        &mut controller,
+        journal.publish_recovered_configuration(CONFIG, publication, recovery_limits()),
+    )
+    .err()
+    .unwrap();
+    assert!(
+        matches!(error, crate::RecoveryPublicationError::Canonical(_)),
+        "{error:?}"
+    );
+    assert!(
+        !controller
+            .image()
+            .exists(Path::new("/group/.CONFIGURATION.recovered.9.tmp"), false)
+    );
+    drop(journal);
+    assert!(drive(&mut controller, open(io.clone(), 10)).is_err());
+    let journal = drive(&mut controller, reopen_replacement(io, 11)).unwrap();
+    assert_eq!(journal.current(), publication.current);
+    assert_eq!(journal.manifest.accepted, accepted);
 }

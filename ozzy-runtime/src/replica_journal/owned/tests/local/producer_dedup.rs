@@ -332,7 +332,7 @@ async fn all_unique_lz4_keeps_the_sdk_block_and_mixed_resolution_decodes_only_se
     )
     .unwrap();
     assert_eq!(resolved.results.stored(), 8);
-    let payload = resolved.batch.prepared_payload.unwrap();
+    let payload = resolved.batch.prepared_payload().unwrap();
     assert_eq!(payload.encoding, ozzy_proto::append::PayloadEncoding::Lz4);
     assert_eq!(payload.encoded, block);
     accept(&mut controller, &mut journal, &mut driver, validated);
@@ -354,7 +354,7 @@ async fn all_unique_lz4_keeps_the_sdk_block_and_mixed_resolution_decodes_only_se
     assert_eq!(resolved.results.stored(), 4);
     assert_eq!(resolved.results.attempts() - resolved.results.stored(), 4);
     assert_eq!(
-        resolved.batch.prepared_payload.unwrap().encoding,
+        resolved.batch.prepared_payload().unwrap().encoding,
         ozzy_proto::append::PayloadEncoding::Lz4
     );
     let batch = resolved.batch.materialize().unwrap();
@@ -393,7 +393,7 @@ async fn all_unique_lz4_keeps_the_sdk_block_and_mixed_resolution_decodes_only_se
     .unwrap();
     assert_eq!(resolved.results.stored(), 0);
     assert_eq!(resolved.results.attempts() - resolved.results.stored(), 8);
-    assert!(resolved.batch.prepared_payload.is_none());
+    assert!(resolved.batch.prepared_payload().is_none());
     assert_eq!(resolved.batch.summary.record_count, 0);
     accept(&mut controller, &mut journal, &mut driver, validated);
     assert_eq!(stored_end(&journal), Offset::new(12));
@@ -434,7 +434,7 @@ fn compressed(
     mut request: crate::replica_journal::ProducerAppend<'static>,
 ) -> (ProposalBuffer, Vec<u8>) {
     use ozzy_proto::append::{
-        Append, AppendKey, Authority, DataLimits, PayloadEncoding, Policy, Record,
+        Append, AppendKey, Authority, DataLimits, PayloadEncoding, Policy, PreparedPayload, Record,
         encode_prepared_append_metadata, validate_append,
     };
     for record in &mut request.records {
@@ -483,8 +483,10 @@ fn compressed(
             records: &records,
         },
         &mut metadata,
-        PayloadEncoding::Lz4,
-        payload.len(),
+        PreparedPayload {
+            encoding: PayloadEncoding::Lz4,
+            encoded_bytes: payload.len(),
+        },
         limits,
     )
     .unwrap();

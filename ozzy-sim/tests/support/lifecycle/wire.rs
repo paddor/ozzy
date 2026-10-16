@@ -169,8 +169,11 @@ impl Packet {
         let mut metadata = [0; METADATA_BYTES];
         let mut payload = [0; BODY_BYTES];
         let encoded = wire::encode_flow_prepare(
-            node(from),
-            session(),
+            wire::EncodeContext {
+                sender: node(from),
+                session: session(),
+                limits: wire_limits(),
+            },
             epoch,
             Prepare {
                 scope,
@@ -179,7 +182,6 @@ impl Packet {
             },
             &mut metadata,
             &mut payload,
-            wire_limits(),
         )
         .unwrap();
         Self {
@@ -247,13 +249,15 @@ impl Packet {
         let mut metadata = [0; METADATA_BYTES];
         let mut payload = [0; BODY_BYTES];
         let encoded = wire::encode_ops(
-            node(from),
-            session(),
+            wire::EncodeContext {
+                sender: node(from),
+                session: session(),
+                limits: wire_limits(),
+            },
             request,
             &borrowed,
             &mut metadata,
             &mut payload,
-            wire_limits(),
         )
         .unwrap();
         Self {

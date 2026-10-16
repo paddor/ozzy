@@ -3,15 +3,18 @@
 //! Staged operations are unadmitted hints. Count/body limits include the core's
 //! accepted suffix, read-only validation in flight, and this queued suffix together.
 
+use crate::profiling::{Event, event};
 use crate::replica_actor::HistoryReason;
+use crate::replica_journal::JournalError;
 use ozzy_replication::flow::{Operation, Receiver};
 use ozzy_replication::wire::PrepareBatch;
 use ozzy_replication::{PipelineLimits, ReplicaSnapshot};
 
 use super::{ActorError, AppendBuffer, Prefix, ReplicaActor};
 
+/// End, operation count, and body bytes of one received suffix.
 #[derive(Debug, Clone, Copy)]
-struct Flight {
+struct Suffix {
     end: Prefix,
     operations: usize,
     bytes: usize,
@@ -21,7 +24,7 @@ struct Flight {
 pub(in crate::replica_actor) struct Receive {
     pub(in crate::replica_actor) queued: AppendBuffer,
     end: Option<Prefix>,
-    flight: Option<Flight>,
+    flight: Option<Suffix>,
     retry: Option<AppendBuffer>,
     pub(in crate::replica_actor) ledger: Receiver,
     operations: Vec<Operation>,
@@ -85,7 +88,6 @@ impl Receive {
         snapshot: &ReplicaSnapshot,
         limits: PipelineLimits,
     ) -> Result<bool, ActorError> {
-        use crate::profiling::{Event, event};
         event(Event::ReplicaReceive);
         let packet_bytes = if crate::profiling::enabled() {
             batch
@@ -102,18 +104,7 @@ impl Receive {
             .unwrap_or(snapshot.accepted);
         // Duplicates do not consume capacity. Check every retained boundary that
         // coincides with the packet's end before ignoring an already seen packet.
-        for known in [
-            Some(snapshot.accepted),
-            self.end,
-            self.flight.map(|flight| flight.end),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if batch.end().op == known.op && batch.end() != known {
-                return Err(ActorError::history(HistoryReason::ReceiveWindow));
-            }
-        }
+        self.check_known_end(batch.end(), snapshot)?;
         if batch.end().op <= predecessor.op {
             event(Event::ReplicaReceiveDuplicate);
             crate::profiling::count(Event::DuplicateBytes, packet_bytes);
@@ -123,19 +114,45 @@ impl Receive {
             event(Event::ReplicaReceiveGap);
             return Ok(false);
         }
-        let first = batch
-            .operations()
-            .find(|operation| operation.prefix().op > predecessor.op)
-            .ok_or_else(|| ActorError::history(HistoryReason::ReceiveWindow))?;
-        if first.canonical().previous_digest != predecessor.digest {
-            return Err(ActorError::history(HistoryReason::ReceiveWindow));
+        let suffix = suffix_after(batch, predecessor)?;
+        if !self.has_room(suffix, snapshot, limits)? {
+            return Ok(false);
         }
-        let (count, bytes) = batch
-            .operations()
-            .filter(|op| op.prefix().op > predecessor.op)
-            .fold((0, 0), |(count, bytes), op| {
-                (count + 1, bytes + op.canonical().body.len())
-            });
+        self.retain(batch, predecessor)?;
+        crate::profiling::count(Event::RetainedBytes, suffix.bytes as u64);
+        self.end = Some(batch.end());
+        Ok(true)
+    }
+
+    fn check_known_end(&self, end: Prefix, snapshot: &ReplicaSnapshot) -> Result<(), ActorError> {
+        for known in [
+            Some(snapshot.accepted),
+            self.end,
+            self.flight.map(|flight| flight.end),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if end.op == known.op && end != known {
+                return Err(ActorError::history(HistoryReason::ReceiveWindow));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the suffix fits the receipt ledger, the core's retained
+    /// window, and the receive arena. Reserves the arena bytes when it does.
+    fn has_room(
+        &mut self,
+        suffix: Suffix,
+        snapshot: &ReplicaSnapshot,
+        limits: PipelineLimits,
+    ) -> Result<bool, ActorError> {
+        let Suffix {
+            end,
+            operations: count,
+            bytes,
+        } = suffix;
         // Once admitted, the core charges the flight. Before that, charge it here.
         let validating = self
             .flight
@@ -159,7 +176,7 @@ impl Receive {
         let retained = snapshot.retained_limits;
         if count > retained.max_operations.saturating_sub(used_ops)
             || bytes > retained.max_body_bytes.saturating_sub(used_bytes)
-            || batch.end().op.0.saturating_sub(snapshot.live_base.0) > limits.max_operations as u64
+            || end.op.0.saturating_sub(snapshot.live_base.0) > limits.max_operations as u64
         {
             event(Event::ReplicaReceiveWindowFull);
             return Ok(false);
@@ -172,6 +189,12 @@ impl Receive {
             event(Event::ReplicaReceiveArenaFull);
             return Ok(false);
         }
+        Ok(true)
+    }
+
+    /// Queue the verified operations after `predecessor` and retain them in
+    /// the receipt ledger.
+    fn retain(&mut self, batch: PrepareBatch<'_>, predecessor: Prefix) -> Result<(), ActorError> {
         for operation in batch
             .verified_operations()
             .filter(|op| op.prefix().op > predecessor.op)
@@ -188,10 +211,30 @@ impl Receive {
         self.ledger
             .retain(self.ledger.report().channel, &self.operations)
             .map_err(ozzy_replication::flow::TransmitError::from)?;
-        crate::profiling::count(Event::RetainedBytes, bytes as u64);
-        self.end = Some(batch.end());
-        Ok(true)
+        Ok(())
     }
+}
+
+/// The part of `batch` after `predecessor`, which must chain onto it.
+fn suffix_after(batch: PrepareBatch<'_>, predecessor: Prefix) -> Result<Suffix, ActorError> {
+    let first = batch
+        .operations()
+        .find(|operation| operation.prefix().op > predecessor.op)
+        .ok_or_else(|| ActorError::history(HistoryReason::ReceiveWindow))?;
+    if first.canonical().previous_digest != predecessor.digest {
+        return Err(ActorError::history(HistoryReason::ReceiveWindow));
+    }
+    let (operations, bytes) = batch
+        .operations()
+        .filter(|op| op.prefix().op > predecessor.op)
+        .fold((0, 0), |(count, bytes), op| {
+            (count + 1, bytes + op.canonical().body.len())
+        });
+    Ok(Suffix {
+        end: batch.end(),
+        operations,
+        bytes,
+    })
 }
 
 impl ReplicaActor {
@@ -230,7 +273,7 @@ impl ReplicaActor {
             return Ok(None);
         }
         let ticket = self.driver.begin_validation()?;
-        Ok(self.swap_received().map(|buffer| (ticket, buffer)))
+        Ok(self.swap_received()?.map(|buffer| (ticket, buffer)))
     }
 
     /// The next barrier cannot start until the previous one finishes. Coalesce
@@ -266,25 +309,27 @@ impl ReplicaActor {
 
     /// Move the staged suffix into flight, replacing its arena. Changes
     /// nothing when no arena is free.
-    pub(super) fn swap_received(&mut self) -> Option<AppendBuffer> {
-        let mut spare = self
+    pub(super) fn swap_received(&mut self) -> Result<Option<AppendBuffer>, ActorError> {
+        let Some(mut spare) = self
             .buffer
             .take()
             .or_else(|| self.spare.take())
-            .or_else(|| self.journal.lease_append_buffer().ok())?;
+            .or_else(|| self.journal.lease_append_buffer().ok())
+        else {
+            return Ok(None);
+        };
         assert!(spare.is_empty());
         let receive = &mut self.work.receive;
         if let Some(allocator) = &receive.allocator {
-            spare
-                .bind_allocator(allocator)
-                .expect("empty same-shard receive arena");
+            spare.bind_allocator(allocator)?;
         }
+        let end = receive.end.take().ok_or(JournalError::AppendMismatch)?;
         let buffer = std::mem::replace(&mut receive.queued, spare);
-        receive.flight = Some(Flight {
-            end: receive.end.take().expect("nonempty queued suffix"),
+        receive.flight = Some(Suffix {
+            end,
             operations: buffer.len(),
             bytes: buffer.body_bytes(),
         });
-        Some(buffer)
+        Ok(Some(buffer))
     }
 }

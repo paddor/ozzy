@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    AsyncRecoveryDirectory as Recovery, CanonicalRecoveryLimits, RecoveryPublication,
+    CanonicalRecoveryLimits, RecoveryDirectory as Recovery, RecoveryPublication,
     RecoveryPublicationError,
 };
 
@@ -91,13 +91,18 @@ fn replacement() -> Image {
     drop(journal);
     controller.crash(true).unwrap().0
 }
-async fn reopen_replacement(io: Local, generation: u128) -> Result<Journal, DirectoryError> {
+pub(super) async fn reopen_replacement(
+    io: Local,
+    generation: u128,
+) -> Result<Journal, DirectoryError> {
     let marker = crate::directory::recovery::recovery_marker(CONFIG)?;
     Journal::open(
         "/group".into(),
         io,
-        identity(),
-        Some(&marker),
+        crate::ExpectedStore {
+            identity: identity(),
+            configuration: Some(&marker),
+        },
         JournalGeneration(generation),
         limits(),
     )
@@ -400,5 +405,83 @@ fn async_recovered_configuration_crash_cuts_select_only_complete_validated_image
             }
         }
         assert!(completed);
+    }
+}
+
+#[test]
+fn invalid_intended_configuration_never_creates_replacement_directory() {
+    let too_long = vec![0; crate::GROUP_CONFIGURATION_MAX_BYTES + 1];
+    for bytes in [
+        b"".as_slice(),
+        b"OZYRECOV reserved namespace".as_slice(),
+        &too_long,
+    ] {
+        let (mut controller, io) = setup(Image::default());
+        let mut format = spec(CommitMode::External);
+        format.configuration = bytes.to_vec();
+        assert!(
+            drive(
+                &mut controller,
+                Journal::format_recovering(
+                    "/group".into(),
+                    io,
+                    format,
+                    JournalGeneration(1),
+                    limits()
+                ),
+            )
+            .is_err()
+        );
+        assert!(!controller.image().exists(Path::new("/group"), false));
+    }
+}
+
+#[test]
+fn conflicting_temporary_configuration_is_preserved_without_admitting_store() {
+    for bytes in [b"conflicting membership".as_slice(), &CONFIG[..8]] {
+        let (mut controller, io) = setup(replacement());
+        let mut journal = drive(&mut controller, reopen_replacement(io.clone(), 3)).unwrap();
+        let authority = publication(&journal);
+        let temporary = "/group/.CONFIGURATION.recovered.3.tmp";
+        write_file(&mut controller, &journal.access, temporary, bytes);
+        let marker = controller
+            .image()
+            .bytes(Path::new("/group/CONFIGURATION"), false)
+            .unwrap()
+            .to_vec();
+        assert!(matches!(
+            drive(
+                &mut controller,
+                journal.publish_recovered_configuration(CONFIG, authority, recovery_limits())
+            ),
+            Err(RecoveryPublicationError::Directory(_))
+        ));
+        drop(journal);
+        let image = controller.crash(true).unwrap().0;
+        assert_eq!(image.bytes(Path::new(temporary), true).unwrap(), bytes);
+        assert_eq!(
+            image
+                .bytes(Path::new("/group/CONFIGURATION"), true)
+                .unwrap(),
+            marker
+        );
+        let (mut controller, io) = setup(image);
+        assert!(drive(&mut controller, open(io.clone(), 4)).is_err());
+        // A fresh writer makes progress without touching the earlier attempt.
+        let mut journal = drive(&mut controller, reopen_replacement(io, 5)).unwrap();
+        let authority = publication(&journal);
+        drive(
+            &mut controller,
+            journal.publish_recovered_configuration(CONFIG, authority, recovery_limits()),
+        )
+        .unwrap();
+        assert_eq!(journal.configuration(), Some(CONFIG));
+        assert_eq!(
+            controller
+                .image()
+                .bytes(Path::new(temporary), true)
+                .unwrap(),
+            bytes
+        );
     }
 }

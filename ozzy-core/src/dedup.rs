@@ -211,12 +211,16 @@ impl PreparedAdmission {
             .boundaries
             .iter()
             .position(|row| row.operation == operation)?;
-        let previous = index.checked_sub(1).map(|index| self.boundaries[index]);
-        let row = self.boundaries[index];
+        let row = self.boundaries.get(index)?;
+        let previous = index
+            .checked_sub(1)
+            .and_then(|index| self.boundaries.get(index));
         Some(OperationAdmission {
             first_offset: previous.map_or(self.first_offset, |row| row.end),
             logical_time: row.time,
-            outcomes: &self.outcomes[previous.map_or(0, |row| row.attempt_end)..row.attempt_end],
+            outcomes: self
+                .outcomes
+                .get(previous.map_or(0, |row| row.attempt_end)..row.attempt_end)?,
         })
     }
 
@@ -261,6 +265,15 @@ pub struct Index {
     committed_end: Offset,
     reserved_bytes: usize,
     snapshot: Option<snapshot::ActiveSnapshot>,
+}
+
+/// An empty vector with room for exactly `capacity` items.
+fn try_vec<T>(capacity: usize) -> Result<Vec<T>, Error> {
+    let mut items = Vec::new();
+    items
+        .try_reserve_exact(capacity)
+        .map_err(|_| Error::Allocation)?;
+    Ok(items)
 }
 
 impl Index {
@@ -318,12 +331,10 @@ impl Index {
         if operation < self.committed_operation || operation > self.accepted_operation {
             return Err(Error::Operation);
         }
-        while self
+        while let Some(row) = self
             .pending_rows
-            .front()
-            .is_some_and(|row| row.operation <= operation)
+            .pop_front_if(|row| row.operation <= operation)
         {
-            let row = self.pending_rows.pop_front().expect("checked pending row");
             let hash = self.hash.hash_one(row.entry.id);
             // A verified canonical group can contain several expired versions
             // of one ID. Keep the latest accepted version until its own commit.
@@ -342,12 +353,10 @@ impl Index {
         }
         self.pending
             .settle(&self.pending_rows, |row| self.hash.hash_one(row.entry.id));
-        while self
+        while let Some(boundary) = self
             .boundaries
-            .front()
-            .is_some_and(|boundary| boundary.operation <= operation)
+            .pop_front_if(|boundary| boundary.operation <= operation)
         {
-            let boundary = self.boundaries.pop_front().expect("checked boundary");
             self.committed_time = boundary.time;
             self.committed_end = boundary.end;
         }
@@ -366,11 +375,10 @@ impl Index {
         let maximum = maximum_records.min(maximum_bytes / size_of::<Entry>());
         let mut removed = 0;
         while removed < maximum
-            && self.expiry.front().is_some_and(|row| {
+            && let Some(row) = self.expiry.pop_front_if(|row| {
                 self.committed_time.saturating_sub(row.time) >= self.limits.window_millis
             })
         {
-            let row = self.expiry.pop_front().expect("checked expiry row");
             if let Ok(entry) = self
                 .committed
                 .find_entry(self.hash.hash_one(row.id), |entry| {

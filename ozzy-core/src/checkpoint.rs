@@ -5,7 +5,7 @@ mod decoder;
 pub use decoder::Decoder;
 
 use crate::{dedup, state::CanonicalState};
-use ozzy_proto::PartitionIncarnation;
+use ozzy_proto::{PartitionIncarnation, layout::Fixed};
 
 /// Fixed bytes before the canonical snapshot and optional identity rows.
 pub const HEADER_BYTES: usize = 104;
@@ -80,22 +80,20 @@ impl Layout {
 
     /// Reject legacy bare snapshots, unknown versions, and nonzero reserved bytes.
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
-        if bytes.len() != HEADER_BYTES
-            || &bytes[..8] != MAGIC
-            || bytes[8..10] != VERSION.to_be_bytes()
-            || bytes[10..16] != [0; 6]
+        let bytes: &[u8; HEADER_BYTES] = bytes.try_into().map_err(|_| Error::Header)?;
+        if bytes.array::<0, 8>() != *MAGIC
+            || bytes.array::<8, 2>() != VERSION.to_be_bytes()
+            || bytes.array::<10, 6>() != [0; 6]
         {
             return Err(Error::Header);
         }
-        let core_bytes = u64::from_be_bytes(bytes[16..24].try_into().expect("fixed length"));
-        let identities = if bytes[24..] == [0; 80] {
+        let core_bytes = bytes.u64_at::<16>();
+        let identities = if bytes.array::<24, 80>() == [0; 80] {
             None
         } else {
             Some(Identities {
-                partition: PartitionIncarnation::from_bytes(
-                    bytes[24..40].try_into().expect("fixed incarnation"),
-                ),
-                header: dedup::SnapshotHeader::decode(&bytes[40..])?,
+                partition: PartitionIncarnation::from_bytes(bytes.array::<24, 16>()),
+                header: dedup::SnapshotHeader::decode(bytes.slice::<40, 64>())?,
             })
         };
         Self::new(core_bytes, identities)

@@ -1,0 +1,3 @@
+# Files exempt from scripts/check-shape.sh until they fit their line limit.
+# Remove an entry once its file fits; the check fails on a listed file that
+# fits.

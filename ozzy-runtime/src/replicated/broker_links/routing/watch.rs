@@ -1,8 +1,9 @@
 use super::super::{
-    BrokerLinkError, BrokerLinksConfig, Shared,
+    BrokerLinkError, BrokerLinksConfig, Established, Shared,
     driver::{self, Lease},
 };
-use super::{Rejection, State};
+use super::{Registry, Rejection, State};
+use crate::topic_metadata::RouteCache;
 use bytes::Bytes;
 use omq_tokio::Message;
 use ozzy_proto::{
@@ -10,7 +11,6 @@ use ozzy_proto::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ops::Bound::{Excluded, Unbounded},
     sync::Arc,
     time::Duration,
 };
@@ -20,11 +20,33 @@ const TURN: usize = 32;
 
 struct Entry {
     state: Arc<State>,
+    /// This broker's routes for the group, from the entry's one watch.
+    cache: RouteCache,
     session: LinkSessionId,
     watch: RequestId,
     revision: u64,
     retry_at: Duration,
     rejected: Option<u64>,
+}
+
+impl Entry {
+    /// Publish the group's routes from `broker` to callers.
+    fn publish(&self, broker: NodeId, group: GroupId) {
+        self.state
+            .publish_routes(group, broker, self.cache.published_observations(group));
+    }
+
+    /// Apply `update` to the group's cache, then publish its routes.
+    fn update<R>(
+        &mut self,
+        broker: NodeId,
+        group: GroupId,
+        update: impl FnOnce(&mut RouteCache) -> R,
+    ) -> R {
+        let result = update(&mut self.cache);
+        self.publish(broker, group);
+        result
+    }
 }
 
 struct Pending {
@@ -34,6 +56,13 @@ struct Pending {
     deadline: Duration,
     frame: Message,
     sent: bool,
+}
+
+/// A group whose routes to request, at the routing revision they answer.
+#[derive(Clone, Copy)]
+struct Snapshot {
+    group: GroupId,
+    revision: u64,
 }
 
 /// One bounded watcher beside an existing broker socket owner. There is one
@@ -89,50 +118,55 @@ impl Watcher {
         }
     }
 
+    /// Visit every group again, from the turn cursor.
+    fn rescan(&mut self) {
+        self.remaining = usize::MAX;
+    }
+
     pub(in crate::replicated::broker_links) fn fence(&mut self) {
         self.pending = None;
         self.capacity_wait = false;
         self.cleanup = None;
         self.cleanup_remaining = self.entries.len();
-        self.remaining = self
-            .shared
-            .routing
-            .lock()
-            .expect("SDK routing poisoned")
-            .groups
-            .len();
+        self.rescan();
     }
 
+    /// One bounded turn over the `routing` groups to watch on the live `link`.
     pub(in crate::replicated::broker_links) fn progress(
         &mut self,
         now: Duration,
+        link: Option<Established>,
+        routing: &Registry,
     ) -> Result<bool, BrokerLinkError> {
-        let cleanup = self.prune();
-        self.progress_routes(now).map(|routes| routes || cleanup)
+        let cleanup = self.prune(link.map(|link| link.session));
+        self.progress_routes(now, link, routing)
+            .map(|routes| routes || cleanup)
     }
 
-    fn prune(&mut self) -> bool {
+    /// Drop cached routes of watches bound to a session other than `current`.
+    fn prune(&mut self, current: Option<LinkSessionId>) -> bool {
         if self.cleanup_remaining == 0 {
             return false;
         }
-        let current = self.shared.sessions.session(self.remote);
         for _ in 0..TURN {
             if self.cleanup_remaining == 0 {
                 break;
             }
             self.cleanup_remaining -= 1;
-            let entry = self
-                .cleanup
-                .and_then(|last| self.entries.range((Excluded(last), Unbounded)).next())
-                .or_else(|| self.entries.first_key_value());
-            let Some((&group, entry)) = entry else {
+            let Some(group) =
+                crate::turn::after(&self.entries, self.cleanup.as_ref()).map(|(&group, _)| group)
+            else {
                 break;
             };
             self.cleanup = Some(group);
-            if current != Some(entry.session)
-                && entry
-                    .state
-                    .update_cache(group, |cache| cache.disconnect(self.remote, entry.session))
+            let Some(entry) = self.entries.get_mut(&group) else {
+                break;
+            };
+            let session = entry.session;
+            if current != Some(session)
+                && entry.update(self.remote, group, |cache| {
+                    cache.disconnect(self.remote, session)
+                })
             {
                 entry.state.changed.notify_changed();
             }
@@ -140,19 +174,20 @@ impl Watcher {
         self.cleanup_remaining != 0
     }
 
-    fn progress_routes(&mut self, now: Duration) -> Result<bool, BrokerLinkError> {
-        let generation = self.shared.changed.generation();
+    fn progress_routes(
+        &mut self,
+        now: Duration,
+        link: Option<Established>,
+        routing: &Registry,
+    ) -> Result<bool, BrokerLinkError> {
+        // New interest or freed capacity restarts the scan; so do a fenced
+        // session, due timers, and broker notices.
+        let generation = self.shared.interests.generation();
         if self.generation != generation
             || self.capacity_wait && self.frames.available_permits() != 0
         {
             self.generation = generation;
-            self.remaining = self
-                .shared
-                .routing
-                .lock()
-                .expect("SDK routing poisoned")
-                .groups
-                .len();
+            self.rescan();
             self.capacity_wait = false;
         }
         if self
@@ -162,6 +197,51 @@ impl Watcher {
         {
             self.retry_pending(now)?;
         }
+        self.expire_timers(now);
+        let Some(link) = link else {
+            return Ok(false);
+        };
+        if self.pending.is_some() {
+            return Ok(false);
+        }
+        // A rescan visits each group once.
+        self.remaining = self.remaining.min(routing.groups.len());
+        for _ in 0..TURN {
+            if self.remaining == 0 {
+                break;
+            }
+            self.remaining -= 1;
+            let Some((&group, state)) = crate::turn::after(&routing.groups, self.turn.as_ref())
+            else {
+                break;
+            };
+            self.turn = Some(group);
+            if state.topic.broker(self.remote).is_none() {
+                continue;
+            }
+            let snapshot = Snapshot {
+                group,
+                revision: state.revision(group),
+            };
+            if snapshot.revision == 0 || !self.wants(snapshot, link.session, now) {
+                continue;
+            }
+            let Ok(permit) = self.frames.clone().try_acquire_owned() else {
+                self.capacity_wait = true;
+                self.remaining += 1;
+                break;
+            };
+            self.bind(group, state, link.session)?;
+            let lease = Arc::new(Lease { _permit: permit });
+            self.prepare(snapshot, link, now, &lease)?;
+            return Ok(false);
+        }
+        Ok(self.remaining != 0 && !self.capacity_wait)
+    }
+
+    /// Clear the retry time of each group whose timer is due by `now`, a
+    /// bounded turn at a time.
+    fn expire_timers(&mut self, now: Duration) {
         for _ in 0..TURN {
             let Some(&(deadline, group)) = self.timers.first() else {
                 break;
@@ -173,110 +253,70 @@ impl Watcher {
             if let Some(entry) = self.entries.get_mut(&group) {
                 entry.retry_at = Duration::ZERO;
             }
-            self.remaining = self
-                .shared
-                .routing
-                .lock()
-                .expect("SDK routing poisoned")
-                .groups
-                .len();
+            self.rescan();
         }
-        let Some(session) = self.shared.sessions.session(self.remote) else {
-            return Ok(false);
-        };
-        if self.pending.is_some() {
-            return Ok(false);
-        }
-        for _ in 0..TURN {
-            if self.remaining == 0 {
-                break;
-            }
-            self.remaining -= 1;
-            let target = {
-                let registry = self.shared.routing.lock().expect("SDK routing poisoned");
-                self.turn
-                    .and_then(|last| registry.groups.range((Excluded(last), Unbounded)).next())
-                    .or_else(|| registry.groups.first_key_value())
-                    .map(|(&group, state)| (group, state.clone()))
-            };
-            let Some((group, state)) = target else {
-                break;
-            };
-            self.turn = Some(group);
-            if state.topic.broker(self.remote).is_none() {
-                continue;
-            }
-            let revision = state.interests.lock().expect("SDK interests poisoned")[&group];
-            let ready = self.entries.get(&group).is_none_or(|entry| {
-                entry.session != session
-                    || entry.retry_at <= now
-                        && entry.rejected != Some(revision)
-                        && (entry.revision != revision
-                            || entry
-                                .state
-                                .cache
-                                .lock()
-                                .expect("SDK route cache poisoned")
-                                .needs_snapshot(self.remote, entry.watch))
-            });
-            if !ready {
-                continue;
-            }
-            let Ok(permit) = self.frames.clone().try_acquire_owned() else {
-                self.capacity_wait = true;
-                self.remaining += 1;
-                break;
-            };
-            self.prepare(
-                group,
-                state,
-                session,
-                revision,
-                now,
-                &Arc::new(Lease { _permit: permit }),
-            )?;
-            return Ok(false);
-        }
-        Ok(self.remaining != 0 && !self.capacity_wait)
     }
 
-    fn prepare(
+    /// Whether `snapshot` needs a request on the live `session`: the group
+    /// has no entry on it, or its retry is due, the broker did not reject
+    /// this revision, and the revision or its routes are stale.
+    fn wants(&self, snapshot: Snapshot, session: LinkSessionId, now: Duration) -> bool {
+        self.entries.get(&snapshot.group).is_none_or(|entry| {
+            entry.session != session
+                || entry.retry_at <= now
+                    && entry.rejected != Some(snapshot.revision)
+                    && (entry.revision != snapshot.revision
+                        || entry.cache.needs_snapshot(self.remote, entry.watch))
+        })
+    }
+
+    /// Replace the entry of `group` unless it already watches on `session`.
+    fn bind(
         &mut self,
         group: GroupId,
-        state: Arc<State>,
+        state: &Arc<State>,
         session: LinkSessionId,
-        revision: u64,
-        now: Duration,
-        lease: &Arc<Lease>,
     ) -> Result<(), BrokerLinkError> {
         if self
             .entries
             .get(&group)
-            .is_none_or(|entry| entry.session != session)
+            .is_some_and(|entry| entry.session == session)
         {
-            if let Some(old) = self.entries.remove(&group) {
-                self.ids.remove(&old.watch);
-                self.timers.remove(&(old.retry_at, group));
-            }
-            let watch = self.shared.next_request()?;
-            state.update_cache(group, |cache| -> Result<(), BrokerLinkError> {
-                cache.bind(self.remote, session)?;
-                cache.register(self.remote, session, watch, &[group])?;
-                Ok(())
-            })?;
-            self.ids.insert(watch, group);
-            self.entries.insert(
-                group,
-                Entry {
-                    state,
-                    session,
-                    watch,
-                    revision: 0,
-                    retry_at: Duration::ZERO,
-                    rejected: None,
-                },
-            );
+            return Ok(());
         }
+        if let Some(old) = self.entries.remove(&group) {
+            self.ids.remove(&old.watch);
+            self.timers.remove(&(old.retry_at, group));
+        }
+        let watch = self.shared.next_request()?;
+        // One registration: this entry's watch of its one group.
+        let mut cache = RouteCache::shared(state.topic.clone(), 1, 1)?;
+        cache.bind(self.remote, session)?;
+        cache.register(self.remote, session, watch, &[group])?;
+        let entry = Entry {
+            state: state.clone(),
+            cache,
+            session,
+            watch,
+            revision: 0,
+            retry_at: Duration::ZERO,
+            rejected: None,
+        };
+        entry.publish(self.remote, group);
+        self.ids.insert(watch, group);
+        self.entries.insert(group, entry);
+        Ok(())
+    }
+
+    /// Frame the snapshot request of the bound entry on the live `link`.
+    fn prepare(
+        &mut self,
+        snapshot: Snapshot,
+        link: Established,
+        now: Duration,
+        lease: &Arc<Lease>,
+    ) -> Result<(), BrokerLinkError> {
+        let group = snapshot.group;
         let entry = &self.entries[&group];
         let request = self.shared.next_request()?;
         let header = directory::encode_request(
@@ -285,20 +325,20 @@ impl Watcher {
                 response: false,
                 request_id: Some(request),
                 sender: self.shared.local,
-                session: Some(session),
+                session: Some(link.session),
             },
             &directory::SnapshotRequest {
                 watch: entry.watch,
                 groups: vec![group],
             },
             &mut self.metadata,
-            self.shared.sessions.send_limits(self.remote)?.envelope,
+            link.send.envelope,
             directory::Limits::default(),
         )?;
         self.pending = Some(Pending {
             group,
             request,
-            revision,
+            revision: snapshot.revision,
             deadline: now.saturating_add(self.timeout),
             frame: driver::track(
                 &crate::native_frames::message(
@@ -322,8 +362,11 @@ impl Watcher {
             .map(|pending| &pending.frame)
     }
 
+    /// Mark the frame last returned by [`Self::frame`] as sent.
     pub(in crate::replicated::broker_links) fn sent(&mut self) {
-        self.pending.as_mut().expect("prepared watch").sent = true;
+        if let Some(pending) = &mut self.pending {
+            pending.sent = true;
+        }
     }
 
     pub(in crate::replicated::broker_links) fn deadline(&self) -> Option<Duration> {
@@ -343,58 +386,50 @@ impl Watcher {
     }
 
     fn retry_pending(&mut self, now: Duration) -> Result<(), BrokerLinkError> {
-        let pending = self.pending.take().expect("outstanding watch");
-        let entry = self
-            .entries
-            .get_mut(&pending.group)
-            .expect("registered watch");
-        entry.state.update_cache(pending.group, |cache| {
-            cache.resync(
-                self.remote,
-                entry.session,
-                directory::Resync { watch: entry.watch },
-            )
-        })?;
-        self.timers.remove(&(entry.retry_at, pending.group));
-        entry.retry_at = now.saturating_add(self.retry);
-        self.timers.insert((entry.retry_at, pending.group));
-        entry.state.changed.notify_changed();
-        self.remaining = self
-            .shared
-            .routing
-            .lock()
-            .expect("SDK routing poisoned")
-            .groups
-            .len();
+        if let Some(pending) = self.pending.take()
+            && let Some(entry) = self.entries.get_mut(&pending.group)
+        {
+            let (session, watch) = (entry.session, entry.watch);
+            entry.update(self.remote, pending.group, |cache| {
+                cache.resync(self.remote, session, directory::Resync { watch })
+            })?;
+            self.timers.remove(&(entry.retry_at, pending.group));
+            entry.retry_at = now.saturating_add(self.retry);
+            self.timers.insert((entry.retry_at, pending.group));
+            entry.state.changed.notify_changed();
+        }
+        self.rescan();
         Ok(())
     }
 
+    /// Consume a watch reply or notice on the live `session`. `false` when
+    /// `packet` is neither.
     pub(in crate::replicated::broker_links) fn receive(
         &mut self,
         packet: Packet<'_>,
+        session: Option<LinkSessionId>,
         now: Duration,
     ) -> Result<bool, BrokerLinkError> {
-        if packet.envelope.session != self.shared.sessions.session(self.remote)
-            || packet.envelope.session.is_none()
-        {
+        if packet.envelope.session != session || session.is_none() {
             return Ok(false);
         }
-        let is_reply = self.pending.as_ref().is_some_and(|pending| {
-            pending.sent
-                && packet.envelope.response
-                && packet.envelope.request_id == Some(pending.request)
-        });
-        let limits = self.limits;
-        if is_reply {
-            return self.receive_reply(packet, limits, now);
+        let reply = self
+            .pending
+            .as_ref()
+            .filter(|pending| {
+                pending.sent
+                    && packet.envelope.response
+                    && packet.envelope.request_id == Some(pending.request)
+            })
+            .map(|pending| (pending.group, pending.revision));
+        if let Some((group, revision)) = reply {
+            return self.receive_reply(packet, now, group, revision);
         }
-        if !matches!(
-            packet.envelope.opcode,
-            Opcode::StateUpdate | Opcode::StateResync
-        ) || packet.envelope.response
-        {
-            return Ok(false);
-        }
+        let resync = match (packet.envelope.opcode, packet.envelope.response) {
+            (Opcode::StateUpdate, false) => false,
+            (Opcode::StateResync, false) => true,
+            _ => return Ok(false),
+        };
         let Some(watch) = packet
             .metadata
             .get(1..17)
@@ -406,111 +441,82 @@ impl Watcher {
         let Some(&group) = self.ids.get(&watch) else {
             return Ok(true);
         };
-        let entry = &self.entries[&group];
-        if packet.envelope.session != Some(entry.session) {
+        let Some(entry) = self.entries.get_mut(&group) else {
+            return Ok(true);
+        };
+        let session = entry.session;
+        if packet.envelope.session != Some(session) {
             return Ok(true);
         }
-        entry
-            .state
-            .update_cache(group, |cache| -> Result<(), BrokerLinkError> {
-                match packet.envelope.opcode {
-                    Opcode::StateUpdate => {
-                        cache.update(
-                            self.remote,
-                            entry.session,
-                            directory::decode_update(packet, limits, directory::Limits::default())?,
-                        )?;
-                    }
-                    Opcode::StateResync => {
-                        cache.resync(
-                            self.remote,
-                            entry.session,
-                            directory::decode_resync(packet, limits)?,
-                        )?;
-                    }
-                    _ => unreachable!(),
-                }
-                Ok(())
+        let limits = self.limits;
+        if resync {
+            let notice = directory::decode_resync(packet, limits)?;
+            entry.update(self.remote, group, |cache| {
+                cache.resync(self.remote, session, notice)
             })?;
+        } else {
+            let update = directory::decode_update(packet, limits, directory::Limits::default())?;
+            entry.update(self.remote, group, |cache| {
+                cache.update(self.remote, session, update)
+            })?;
+        }
         entry.state.changed.notify_changed();
-        self.remaining = self
-            .shared
-            .routing
-            .lock()
-            .expect("SDK routing poisoned")
-            .groups
-            .len();
+        self.rescan();
         Ok(true)
     }
 
+    /// Answer to the outstanding snapshot request for `group` at `revision`.
     fn receive_reply(
         &mut self,
         packet: Packet<'_>,
-        limits: ozzy_proto::EnvelopeLimits,
         now: Duration,
+        group: GroupId,
+        revision: u64,
     ) -> Result<bool, BrokerLinkError> {
         if !matches!(packet.envelope.opcode, Opcode::StateSnapshot | Opcode::Nack) {
             return Ok(true);
         }
+        let limits = self.limits;
         if packet.envelope.opcode == Opcode::Nack {
             let reply = nack::decode(packet, limits)?;
-            let (group, revision) = self
-                .pending
-                .as_ref()
-                .map(|pending| (pending.group, pending.revision))
-                .unwrap();
             self.retry_pending(now)?;
-            if reply.retry == nack::RetryClass::Permanent {
-                let entry = self.entries.get_mut(&group).unwrap();
+            if reply.retry == nack::RetryClass::Permanent
+                && let Some(entry) = self.entries.get_mut(&group)
+            {
                 entry.rejected = Some(revision);
-                entry
-                    .state
-                    .rejections
-                    .lock()
-                    .expect("SDK route rejections poisoned")
-                    .insert(
-                        (group, self.remote),
-                        Rejection {
-                            session: entry.session,
-                            code: reply.code,
-                            retry: reply.retry,
-                        },
-                    );
+                entry.state.reject(
+                    group,
+                    self.remote,
+                    Rejection {
+                        session: entry.session,
+                        code: reply.code,
+                        retry: reply.retry,
+                    },
+                );
                 entry.state.changed.notify_changed();
             }
             return Ok(true);
         }
         let snapshot = directory::decode_snapshot(packet, limits, directory::Limits::default())?;
-        let pending = self.pending.as_ref().expect("matching watch reply");
-        let entry = self
-            .entries
-            .get_mut(&pending.group)
-            .expect("registered watch");
+        let Some(entry) = self.entries.get_mut(&group) else {
+            self.pending = None;
+            return Ok(true);
+        };
         if snapshot.watch != entry.watch {
             return Ok(true);
         }
-        entry.state.update_cache(pending.group, |cache| {
-            cache.snapshot(self.remote, entry.session, snapshot)
+        let session = entry.session;
+        entry.update(self.remote, group, |cache| {
+            cache.snapshot(self.remote, session, snapshot)
         })?;
-        entry
-            .state
-            .rejections
-            .lock()
-            .expect("SDK route rejections poisoned")
-            .remove(&(pending.group, self.remote));
-        entry.revision = pending.revision;
-        self.timers.remove(&(entry.retry_at, pending.group));
+        entry.state.clear_rejection(group, self.remote);
+        entry.revision = revision;
+        self.timers.remove(&(entry.retry_at, group));
         entry.retry_at = Duration::ZERO;
         entry.rejected = None;
         entry.state.changed.notify_changed();
         self.pending = None;
-        self.remaining = self
-            .shared
-            .routing
-            .lock()
-            .expect("SDK routing poisoned")
-            .groups
-            .len();
+        self.rescan();
         Ok(true)
     }
 }

@@ -1,15 +1,14 @@
 //! Writer assignment uses pure shared policy; cold retry reads are file futures.
 
-use super::{AppendBuffer, JournalError, OwnedJournal, prefix};
+mod retry;
+
+use super::{AppendBuffer, JournalError, OwnedJournal};
 use crate::replica_journal::{
     AppendAdmissionError, ProposalBuffer, ProposalDeferral, ProposalValidation, ValidatedAppend,
     append::ProducerRetryResults,
     commands::read_fault,
     producer::{self, Assignment, Plan},
 };
-use ozzy_core::state::ProducerResultSource;
-use ozzy_journal::operation::{OperationBody, decode_operation_body};
-use ozzy_journal_segment::{DecodedBatches, JournalIndexError};
 use ozzy_replication::{Prefix, driver::ValidationTicket};
 
 enum Prepared {
@@ -19,18 +18,6 @@ enum Prepared {
         Option<Box<super::dedup::Prepared>>,
     ),
     Retry(Prefix),
-}
-
-// A protocol APPEND is one canonical operation. Read all its records together
-// so a cold retry does not reread and decode that operation for each small
-// verification chunk. ReadLimits still bounds the returned payload bytes.
-const RETRY_READ_RECORDS: usize = 2048;
-
-#[derive(Clone, Copy)]
-struct DuplicateEvidence {
-    number: u64,
-    through: Prefix,
-    proof: producer::DuplicateProof,
 }
 
 impl OwnedJournal {
@@ -129,48 +116,66 @@ impl OwnedJournal {
                 through,
                 buffer: ProposalBuffer(buffer),
             },
+            Err(reason) => self.refuse_proposal(ticket, buffer, positions, reason),
+        }
+    }
+
+    /// Restore the original bytes and positions of a refused proposal. Defer
+    /// it when only capacity or a pending original stood in its way.
+    fn refuse_proposal(
+        &self,
+        ticket: ValidationTicket,
+        mut buffer: AppendBuffer,
+        positions: smallvec::SmallVec<[[u8; 16]; 8]>,
+        reason: JournalError,
+    ) -> ProposalValidation {
+        buffer.restore_dedup_original();
+        let restored = positions
+            .into_iter()
+            .enumerate()
+            .try_for_each(|(index, position)| {
+                buffer.replace_append_position(index, position).map(drop)
+            });
+        let deferral = match restored.and_then(|()| self.deferral(&reason)) {
+            Ok(deferral) => deferral,
             Err(reason) => {
-                buffer.restore_dedup_original();
-                for (index, position) in positions.into_iter().enumerate() {
-                    buffer
-                        .replace_append_position(index, position)
-                        .expect("private proposal backing is already reserved");
-                }
-                let deferral = match &reason {
-                    JournalError::Dedup(ozzy_core::dedup::Error::PendingOriginal(original)) => {
-                        Some(ProposalDeferral::Original(ozzy_replication::OpNumber(
-                            *original,
-                        )))
-                    }
-                    JournalError::Dedup(
-                        ozzy_core::dedup::Error::Capacity
-                        | ozzy_core::dedup::Error::PendingCapacity
-                        | ozzy_core::dedup::Error::SnapshotCapacity,
-                    ) => Some(ProposalDeferral::IdentityCapacity),
-                    JournalError::Io(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        if let Err(reason) = self.retain_validation_pressure() {
-                            return ProposalValidation::Rejected {
-                                reason,
-                                buffer: ProposalBuffer(buffer),
-                            };
-                        }
-                        Some(ProposalDeferral::MemoryCapacity)
-                    }
-                    _ => None,
-                };
-                if let Some(reason) = deferral {
-                    return ProposalValidation::Deferred {
-                        validation: ticket,
-                        reason,
-                        buffer: ProposalBuffer(buffer),
-                    };
-                }
-                ProposalValidation::Rejected {
+                return ProposalValidation::Rejected {
                     reason,
                     buffer: ProposalBuffer(buffer),
-                }
+                };
             }
+        };
+        if let Some(reason) = deferral {
+            return ProposalValidation::Deferred {
+                validation: ticket,
+                reason,
+                buffer: ProposalBuffer(buffer),
+            };
         }
+        ProposalValidation::Rejected {
+            reason,
+            buffer: ProposalBuffer(buffer),
+        }
+    }
+
+    /// Why a refused proposal may retry later, if it may. Memory pressure is
+    /// retained here so the retry waits for room.
+    fn deferral(&self, reason: &JournalError) -> Result<Option<ProposalDeferral>, JournalError> {
+        Ok(match reason {
+            JournalError::Dedup(ozzy_core::dedup::Error::PendingOriginal(original)) => Some(
+                ProposalDeferral::Original(ozzy_replication::OpNumber(*original)),
+            ),
+            JournalError::Dedup(
+                ozzy_core::dedup::Error::Capacity
+                | ozzy_core::dedup::Error::PendingCapacity
+                | ozzy_core::dedup::Error::SnapshotCapacity,
+            ) => Some(ProposalDeferral::IdentityCapacity),
+            JournalError::Io(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                self.retain_validation_pressure()?;
+                Some(ProposalDeferral::MemoryCapacity)
+            }
+            _ => None,
+        })
     }
 
     async fn prepare_proposal(
@@ -194,62 +199,15 @@ impl OwnedJournal {
         }
         buffer.retry_results = None;
         self.validate_proposal_fences(ticket, buffer)?;
-        if buffer.producer_session.is_some()
-            && let Some(through) = Box::pin(self.prepare_producer_open(ticket, buffer)).await?
+        if let Some(through) = self.resolve_control(ticket, buffer).await? {
+            return Ok(Prepared::Retry(through));
+        }
+        if buffer.is_producer()
+            && let Some(through) = self
+                .assign_producers(buffer, timestamp_millis, positions)
+                .await?
         {
             return Ok(Prepared::Retry(through));
-        }
-        if buffer.group_progress.is_some()
-            && let Some(through) = self.prepare_group_progress(ticket, buffer)?
-        {
-            return Ok(Prepared::Retry(through));
-        }
-        if buffer.group_assignment.is_some()
-            && let Some(through) = self.prepare_group_assignment(ticket, buffer)?
-        {
-            return Ok(Prepared::Retry(through));
-        }
-        if let Some(through) = crate::replica_journal::proposal::partition_retry(
-            self.images()?,
-            buffer,
-            ticket,
-            self.buffer_generation,
-            self.limits.operations,
-        )? {
-            return Ok(Prepared::Retry(through));
-        }
-        if buffer.is_producer() {
-            let grouped = buffer.len() > 1;
-            for index in 0..buffer.len() {
-                let Assignment {
-                    position,
-                    retry,
-                    trim,
-                    results,
-                } = self
-                    .assign_producer(buffer, index, timestamp_millis)
-                    .await?;
-                if grouped && (retry.is_some() || trim != 0) {
-                    return Err(JournalError::AppendMismatch);
-                }
-                if trim != 0 {
-                    if self.dedup.limits.is_some() {
-                        let charge = self.charge_validation(1024)?;
-                        buffer.preserve_dedup_original(charge)?;
-                    }
-                    buffer.trim_producer_prefix(trim, self.limits.operations)?;
-                }
-                buffer.retry_results = (!results.is_empty()).then(|| {
-                    Box::new(ProducerRetryResults {
-                        ranges: results,
-                        trimmed: trim != 0,
-                    })
-                });
-                positions.push(buffer.replace_append_position(index, position)?);
-                if let Some(through) = retry {
-                    return Ok(Prepared::Retry(through));
-                }
-            }
         }
         if buffer.is_producer() && self.dedup.limits.is_some() {
             let rewrite = self.resolve_producer_ids(ticket, buffer)?;
@@ -262,6 +220,79 @@ impl OwnedJournal {
         let (plan, records) = self.prepare_append(ticket, buffer, true).await?;
         let dedup = self.prepare_dedup(ticket, buffer)?;
         Ok(Prepared::Fresh(plan, records, dedup))
+    }
+
+    /// A writer open, consumer control request, or partition operation that
+    /// retries an earlier one resolves to that one's position.
+    async fn resolve_control(
+        &mut self,
+        ticket: ValidationTicket,
+        buffer: &mut AppendBuffer,
+    ) -> Result<Option<Prefix>, JournalError> {
+        if buffer.producer_session.is_some()
+            && let Some(through) = Box::pin(self.prepare_producer_open(ticket, buffer)).await?
+        {
+            return Ok(Some(through));
+        }
+        if buffer.group_progress.is_some()
+            && let Some(through) = self.prepare_group_progress(ticket, buffer)?
+        {
+            return Ok(Some(through));
+        }
+        if buffer.group_assignment.is_some()
+            && let Some(through) = self.prepare_group_assignment(ticket, buffer)?
+        {
+            return Ok(Some(through));
+        }
+        crate::replica_journal::proposal::partition_retry(
+            self.images()?,
+            buffer,
+            ticket,
+            self.buffer_generation,
+            self.limits.operations,
+        )
+    }
+
+    /// Assign every producer batch its position. A retry resolves to the
+    /// position its original reached; only a lone batch may retry.
+    async fn assign_producers(
+        &mut self,
+        buffer: &mut AppendBuffer,
+        timestamp_millis: u64,
+        positions: &mut smallvec::SmallVec<[[u8; 16]; 8]>,
+    ) -> Result<Option<Prefix>, JournalError> {
+        let grouped = buffer.len() > 1;
+        for index in 0..buffer.len() {
+            let Assignment {
+                position,
+                retry,
+                trim,
+                results,
+            } = self
+                .assign_producer(buffer, index, timestamp_millis)
+                .await?;
+            if grouped && (retry.is_some() || trim != 0) {
+                return Err(JournalError::AppendMismatch);
+            }
+            if trim != 0 {
+                if self.dedup.limits.is_some() {
+                    let charge = self.charge_validation(1024)?;
+                    buffer.preserve_dedup_original(charge)?;
+                }
+                buffer.trim_producer_prefix(trim, self.limits.operations)?;
+            }
+            buffer.retry_results = (!results.is_empty()).then(|| {
+                Box::new(ProducerRetryResults {
+                    ranges: results,
+                    trimmed: trim != 0,
+                })
+            });
+            positions.push(buffer.replace_append_position(index, position)?);
+            if retry.is_some() {
+                return Ok(retry);
+            }
+        }
+        Ok(None)
     }
 
     fn validate_proposal_fences(
@@ -295,225 +326,5 @@ impl OwnedJournal {
             return Err(AppendAdmissionError::Authority.into());
         }
         Ok(())
-    }
-
-    async fn assign_producer(
-        &mut self,
-        buffer: &AppendBuffer,
-        index: usize,
-        now: u64,
-    ) -> Result<Assignment, JournalError> {
-        let plan = producer::plan(
-            self.images()?.speculative(),
-            buffer,
-            index,
-            self.buffer_generation,
-            self.limits.operations,
-        )?;
-        let Plan::Retry(retry) = plan else {
-            let Plan::Fresh(offset) = plan else {
-                unreachable!()
-            };
-            return Ok(Assignment::fresh(offset, now));
-        };
-        let operation = buffer
-            .operations()
-            .nth(index)
-            .ok_or(JournalError::AppendMismatch)?;
-        let OperationBody::Append(body) =
-            decode_operation_body(operation.kind, operation.body, self.limits.operations)?
-        else {
-            return Err(JournalError::AppendMismatch);
-        };
-        let [expected] = body.batches.as_slice() else {
-            return Err(JournalError::AppendMismatch);
-        };
-        let mut snapshot = None;
-        let mut decoded = DecodedBatches::default();
-        let mut timestamp = None;
-        let mut through = Prefix::GENESIS;
-        let mut expected_records = expected.records.iter();
-        let mut duplicate = None::<DuplicateEvidence>;
-        let mut index = 0;
-        while index < retry.retained {
-            match retry.source(index)? {
-                ProducerResultSource::Stored => {}
-                ProducerResultSource::Duplicate { operation: number } => {
-                    let evidence = if let Some(evidence) =
-                        duplicate.filter(|evidence| evidence.number == number)
-                    {
-                        evidence
-                    } else {
-                        self.duplicate_evidence(&retry, number, &expected.records, &mut snapshot)
-                            .await?
-                    };
-                    if !evidence
-                        .proof
-                        .contains(retry.batch.first_sequence.get() + index as u64)
-                    {
-                        return Err(JournalIndexError::Read(
-                            ozzy_journal_segment::IndexedReadError::RecordMismatch,
-                        )
-                        .into());
-                    }
-                    duplicate = Some(evidence);
-                    expected_records
-                        .next()
-                        .ok_or(JournalError::AppendMismatch)?;
-                    timestamp.get_or_insert(evidence.proof.timestamp);
-                    through = evidence.through;
-                    index += 1;
-                    continue;
-                }
-                _ => return Err(JournalError::AppendMismatch),
-            }
-            let offset = retry.offset(index)?;
-            if let Some((actual, position)) =
-                self.writeback
-                    .record(retry.batch.partition, offset, &mut decoded)
-            {
-                retry.verify(
-                    index,
-                    &actual,
-                    expected_records
-                        .next()
-                        .ok_or(JournalError::AppendMismatch)?,
-                )?;
-                timestamp.get_or_insert(actual.append_timestamp_millis);
-                through = position;
-                index += 1;
-                continue;
-            }
-            let records = self
-                .cold_retry_records(&retry, index, &mut decoded, &mut snapshot)
-                .await?;
-            for (actual, position) in records {
-                retry.verify(
-                    index,
-                    &actual,
-                    expected_records
-                        .next()
-                        .ok_or(JournalError::AppendMismatch)?,
-                )?;
-                timestamp.get_or_insert(actual.append_timestamp_millis);
-                through = prefix(position);
-                index += 1;
-            }
-        }
-        Ok(retry.finish(timestamp.expect("nonempty retry"), through, now))
-    }
-
-    async fn duplicate_evidence(
-        &mut self,
-        retry: &producer::Retry,
-        number: u64,
-        expected: &ozzy_journal::operation::AppendRecordList<'_>,
-        snapshot: &mut Option<ozzy_journal_segment::AsyncJournalIndexSnapshot>,
-    ) -> Result<DuplicateEvidence, JournalError> {
-        if let Some((operation, through)) = self.writeback.operation(number) {
-            return Ok(DuplicateEvidence {
-                number,
-                through,
-                proof: retry
-                    .verify_duplicates(
-                        number,
-                        operation.kind,
-                        operation.body,
-                        expected,
-                        self.limits.operations,
-                    )
-                    .await?,
-            });
-        }
-        if snapshot.is_none() {
-            *snapshot = Some(self.journal.retry_snapshot(self.recovery.index).await?);
-        }
-        let operation = snapshot
-            .as_ref()
-            .expect("retry snapshot")
-            .read_operation_number(number)
-            .await?
-            .ok_or(JournalIndexError::MissingOperationNumber(number))?;
-        Ok(DuplicateEvidence {
-            number,
-            through: Prefix {
-                op: ozzy_replication::OpNumber(number),
-                digest: operation.digest,
-            },
-            proof: retry
-                .verify_duplicates(
-                    number,
-                    operation.kind,
-                    operation.body.as_ref(),
-                    expected,
-                    self.limits.operations,
-                )
-                .await?,
-        })
-    }
-
-    async fn cold_retry_records(
-        &mut self,
-        retry: &producer::Retry,
-        index: usize,
-        decoded: &mut DecodedBatches,
-        snapshot: &mut Option<ozzy_journal_segment::AsyncJournalIndexSnapshot>,
-    ) -> Result<
-        Vec<(
-            ozzy_journal_segment::IndexedRecord,
-            ozzy_journal_segment::LogPosition,
-        )>,
-        JournalError,
-    > {
-        let end = (index + RETRY_READ_RECORDS).min(retry.retained);
-        let mut offsets = Vec::with_capacity(end - index);
-        for next in index..end {
-            if retry.source(next)? != ProducerResultSource::Stored {
-                break;
-            }
-            let offset = retry.offset(next)?;
-            // A later retry range can still be queued for its physical write.
-            // Its authoritative bytes remain in writeback, outside this snapshot.
-            if next != index
-                && self
-                    .writeback
-                    .record(retry.batch.partition, offset, decoded)
-                    .is_some()
-            {
-                break;
-            }
-            offsets.push(offset);
-        }
-        let limits = ozzy_journal::ReadLimits {
-            max_records: RETRY_READ_RECORDS,
-            max_bytes: self.limits.operations.max_payload_bytes,
-        };
-        let recent = self
-            .reader
-            .as_ref()
-            .ok_or(JournalError::AppendMismatch)?
-            .read_offsets_with_positions(
-                self.journal.readable()?,
-                retry.batch.partition,
-                &offsets,
-                limits,
-            )
-            .await?;
-        let records = if let Some(records) = recent {
-            records
-        } else {
-            if snapshot.is_none() {
-                *snapshot = Some(self.journal.retry_snapshot(self.recovery.index).await?);
-            }
-            snapshot
-                .as_ref()
-                .expect("retry snapshot")
-                .read_offsets_with_positions(retry.batch.partition, &offsets, limits)
-                .await?
-        };
-        if records.is_empty() {
-            return Err(JournalIndexError::MissingOffset(retry.offset(index)?).into());
-        }
-        Ok(records)
     }
 }

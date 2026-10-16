@@ -46,7 +46,7 @@ path = "tests/nack.rs"
 
 [[test]]
 name = "ozzy_reader"
-path = "tests/reader.rs"
+path = "tests/reader/mod.rs"
 
 [[test]]
 name = "ozzy_stream"

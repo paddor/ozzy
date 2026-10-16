@@ -2,7 +2,7 @@
 //! coordinator confirmation boundary; deletion fences sources separately.
 
 use super::{
-    Cursor, MAX_MEMBERS, MAX_NAME_BYTES, MAX_PARTITIONS, SOURCE_TAG, Start, check, command,
+    MAX_MEMBERS, MAX_NAME_BYTES, MAX_PARTITIONS, Reader, SOURCE_TAG, Start, check, command,
     decode_authority, decode_member, encode_authority, member_bytes, nonzero, reserve,
     validate_scope,
 };
@@ -107,10 +107,14 @@ pub struct DeleteReply {
 
 /// Exact inspection request metadata bytes.
 pub fn inspect_bytes(name: &str) -> Result<usize, CodecError> {
-    name_bytes(name).map(|name| INSPECT_FIXED_BYTES + name)
+    name_bytes(name).and_then(|name| crate::data::add(INSPECT_FIXED_BYTES, name))
 }
 
 /// Exact inspection reply metadata bytes.
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "both counts are capped first, far below overflow"
+)]
 pub fn inspected_bytes(members: usize, targets: usize) -> Result<usize, CodecError> {
     if members > MAX_MEMBERS || targets > MAX_PARTITIONS {
         return Err(CodecError::Limit);
@@ -120,7 +124,7 @@ pub fn inspected_bytes(members: usize, targets: usize) -> Result<usize, CodecErr
 
 /// Exact deletion request metadata bytes.
 pub fn delete_bytes(name: &str) -> Result<usize, CodecError> {
-    name_bytes(name).map(|name| DELETE_FIXED_BYTES + name)
+    name_bytes(name).and_then(|name| crate::data::add(DELETE_FIXED_BYTES, name))
 }
 
 /// Encode one correlated, payload-free inspection request.
@@ -149,10 +153,10 @@ pub fn decode_inspect(
     limits: EnvelopeLimits,
 ) -> Result<InspectRequest, CodecError> {
     check(packet, Opcode::GroupInspect, false, limits)?;
-    let mut cursor = Cursor(packet.metadata);
+    let mut cursor = Reader::new(packet.metadata);
     let (authority, coordinator) = decode_scope(&mut cursor)?;
     let name = decode_name(&mut cursor)?;
-    if !cursor.0.is_empty() {
+    if !cursor.rest().is_empty() {
         return Err(CodecError::Length);
     }
     Ok(InspectRequest {
@@ -204,13 +208,13 @@ pub fn decode_inspected(
     limits: EnvelopeLimits,
 ) -> Result<Inspection, CodecError> {
     check(packet, Opcode::GroupInspected, true, limits)?;
-    let mut cursor = Cursor(packet.metadata);
+    let mut cursor = Reader::new(packet.metadata);
     let (authority, coordinator) = decode_scope(&mut cursor)?;
     let group = cursor.array::<16>()?;
     let revision = cursor.u64()?;
     let initial = Start::decode(&mut cursor)?;
     let count = cursor.u32()? as usize;
-    if count > MAX_MEMBERS || cursor.0.len() < count * INSPECTED_MEMBER_BYTES {
+    if count > MAX_MEMBERS || cursor.rest().len() < count * INSPECTED_MEMBER_BYTES {
         return Err(CodecError::Length);
     }
     let mut members = Vec::with_capacity(count);
@@ -222,7 +226,7 @@ pub fn decode_inspected(
         });
     }
     let count = cursor.u32()? as usize;
-    if count > MAX_PARTITIONS || cursor.0.len() != count * INSPECTED_TARGET_BYTES {
+    if count > MAX_PARTITIONS || cursor.rest().len() != count * INSPECTED_TARGET_BYTES {
         return Err(CodecError::Length);
     }
     let mut targets = Vec::with_capacity(count);
@@ -275,12 +279,12 @@ pub fn decode_delete(
     limits: EnvelopeLimits,
 ) -> Result<DeleteRequest, CodecError> {
     check(packet, Opcode::GroupDelete, false, limits)?;
-    let mut cursor = Cursor(packet.metadata);
+    let mut cursor = Reader::new(packet.metadata);
     let (authority, coordinator) = decode_scope(&mut cursor)?;
     let group = ConsumerGroupId::from_bytes(cursor.array()?);
     nonzero(group.as_bytes())?;
     let name = decode_name(&mut cursor)?;
-    if !cursor.0.is_empty() {
+    if !cursor.rest().is_empty() {
         return Err(CodecError::Length);
     }
     Ok(DeleteRequest {
@@ -321,11 +325,11 @@ pub fn decode_deleted(
     if packet.metadata.len() != DELETED_BYTES {
         return Err(CodecError::Length);
     }
-    let mut cursor = Cursor(packet.metadata);
+    let mut cursor = Reader::new(packet.metadata);
     let (authority, coordinator) = decode_scope(&mut cursor)?;
     let group = ConsumerGroupId::from_bytes(cursor.array()?);
     nonzero(group.as_bytes())?;
-    let deleted = match cursor.byte()? {
+    let deleted = match cursor.u8()? {
         0 => true,
         1 => false,
         _ => return Err(CodecError::Profile),
@@ -350,8 +354,8 @@ fn encode_name(metadata: &mut Vec<u8>, name: &str) {
     metadata.extend_from_slice(name.as_bytes());
 }
 
-fn decode_name(cursor: &mut Cursor<'_>) -> Result<String, CodecError> {
-    let length = cursor.byte()? as usize;
+fn decode_name(cursor: &mut Reader<'_>) -> Result<String, CodecError> {
+    let length = cursor.u8()? as usize;
     if length == 0 {
         return Err(CodecError::Limit);
     }
@@ -360,8 +364,8 @@ fn decode_name(cursor: &mut Cursor<'_>) -> Result<String, CodecError> {
         .map_err(|_| CodecError::Profile)
 }
 
-fn decode_scope(cursor: &mut Cursor<'_>) -> Result<(Authority, PartitionIncarnation), CodecError> {
-    if cursor.byte()? != SOURCE_TAG {
+fn decode_scope(cursor: &mut Reader<'_>) -> Result<(Authority, PartitionIncarnation), CodecError> {
+    if cursor.u8()? != SOURCE_TAG {
         return Err(CodecError::Profile);
     }
     let authority = decode_authority(cursor)?;

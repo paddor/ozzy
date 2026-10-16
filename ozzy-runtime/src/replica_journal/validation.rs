@@ -1,6 +1,6 @@
 //! Explicit bounded storage validation on the existing device executor.
 
-use super::commands::Action;
+use super::commands::{Action, Gate, MaintenanceAction};
 use super::{JournalCompletion, ReplicaJournal, SubmitError};
 use ozzy_replication::driver::ValidationTicket;
 
@@ -20,19 +20,13 @@ impl ReplicaJournal {
         ticket: ValidationTicket,
         budget: ozzy_journal_segment::MaintenanceBudget,
     ) -> Result<JournalCompletion<crate::replica_journal::OwnedCleanedStorage>, SubmitError> {
-        self.submit(
-            ticket,
-            |ticket, done| Action::CleanupOrphans {
+        self.command(Gate::Settled, |done| {
+            Action::Maintenance(MaintenanceAction::CleanupOrphans {
                 ticket,
                 budget,
                 done,
-            },
-            |action| match action {
-                Action::CleanupOrphans { ticket, .. } => ticket,
-                _ => unreachable!("submission preserves command kind"),
-            },
-        )
-        .map_err(|rejected| rejected.reason)
+            })
+        })
     }
 
     /// Reclaim bounded historical metadata on the device executor. Payloads remain selected.
@@ -41,19 +35,13 @@ impl ReplicaJournal {
         ticket: ValidationTicket,
         budget: ozzy_journal_segment::MaintenanceBudget,
     ) -> Result<JournalCompletion<crate::replica_journal::OwnedCleanedStorage>, SubmitError> {
-        self.submit(
-            ticket,
-            |ticket, done| Action::CleanupMetadata {
+        self.command(Gate::Settled, |done| {
+            Action::Maintenance(MaintenanceAction::CleanupMetadata {
                 ticket,
                 budget,
                 done,
-            },
-            |action| match action {
-                Action::CleanupMetadata { ticket, .. } => ticket,
-                _ => unreachable!("submission preserves command kind"),
-            },
-        )
-        .map_err(|rejected| rejected.reason)
+            })
+        })
     }
 
     /// Schedule one bounded storage-validation step with normal command backpressure.
@@ -78,18 +66,12 @@ impl ReplicaJournal {
         ticket: ValidationTicket,
         budget: ozzy_journal_segment::StorageValidationBudget,
     ) -> Result<JournalCompletion<ValidatedStorage>, SubmitError> {
-        self.submit(
-            ticket,
-            |ticket, done| Action::ValidateStorage {
+        self.command(Gate::Settled, |done| {
+            Action::Maintenance(MaintenanceAction::ValidateStorage {
                 ticket,
                 budget,
                 done,
-            },
-            |action| match action {
-                Action::ValidateStorage { ticket, .. } => ticket,
-                _ => unreachable!("submission preserves command kind"),
-            },
-        )
-        .map_err(|rejected| rejected.reason)
+            })
+        })
     }
 }

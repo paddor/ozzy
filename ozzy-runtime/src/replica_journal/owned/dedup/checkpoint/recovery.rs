@@ -1,6 +1,6 @@
 //! The same private metadata and identity validation for local and transferred images.
 
-use super::{Image, JournalError, yield_turn};
+use super::{Image, JournalError, yield_once};
 use crate::memory::{Charge, Owner};
 use ozzy_core::{
     checkpoint::{Decoder, Error},
@@ -78,16 +78,14 @@ impl Restoring {
                     Ok(())
                 },
                 |image, row| {
-                    if index.is_none() {
-                        *index = Some(RestoringIndex::new(
-                            limits.expect("checked identity policy"),
+                    let restoring = match index.take() {
+                        Some(restoring) => restoring,
+                        None => RestoringIndex::new(
+                            limits.ok_or(ozzy_core::dedup::Error::Snapshot)?,
                             image.header,
-                        )?);
-                    }
-                    index
-                        .as_mut()
-                        .expect("initialized private index")
-                        .push_rows(row)
+                        )?,
+                    };
+                    index.insert(restoring).push_rows(row)
                 },
             )
             .map_err(CanonicalCheckpointError::from)?;
@@ -106,7 +104,7 @@ impl Restoring {
             &bytes,
             self.recovery.state,
             self.recovery.snapshot,
-            async |_| yield_turn().await,
+            async |_| yield_once().await,
         )
         .await
         .map_err(CanonicalCheckpointError::from)?;
@@ -125,7 +123,6 @@ impl Restoring {
                 partition: Some(image.partition),
                 time: image.header.logical_time(),
                 end: image.header.next_offset(),
-                #[cfg(feature = "storage-metrics")]
                 reservation: None,
             }),
             (None, None)

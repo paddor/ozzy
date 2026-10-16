@@ -42,23 +42,18 @@ impl Body {
     }
 
     pub(super) fn freeze(&mut self) -> Bytes {
-        if let State::Charged(arena) = &self.state {
-            return Arena::share(arena);
-        }
-        let previous = std::mem::replace(&mut self.state, State::Mutable(Vec::new()));
-        self.state = match previous {
-            State::Mutable(mut bytes) => {
+        match &mut self.state {
+            State::Charged(arena) => Arena::share(arena),
+            State::Shared(bytes, _) => bytes.clone(),
+            State::Mutable(bytes) => {
+                let mut bytes = std::mem::take(bytes);
                 bytes.shrink_to_fit();
                 let capacity = bytes.capacity();
-                State::Shared(Bytes::from(bytes), capacity)
+                let shared = Bytes::from(bytes);
+                self.state = State::Shared(shared.clone(), capacity);
+                shared
             }
-            State::Charged(_) => unreachable!(),
-            shared @ State::Shared(..) => shared,
-        };
-        let State::Shared(bytes, _) = &self.state else {
-            unreachable!()
-        };
-        bytes.clone()
+        }
     }
 
     pub(super) fn retained_bytes(&self) -> usize {
@@ -115,27 +110,28 @@ impl Body {
             arena.bytes_mut().extend_from_slice(self);
             self.state = State::Charged(Arc::new(arena));
         } else {
-            if let State::Shared(bytes, _) = &mut self.state {
-                self.state = State::Mutable(Vec::from(std::mem::take(bytes)));
-            }
-            let State::Mutable(bytes) = &mut self.state else {
-                unreachable!()
+            // An uncharged body only shares; it never holds an arena.
+            let mut bytes = match std::mem::replace(&mut self.state, State::Mutable(Vec::new())) {
+                State::Mutable(bytes) => bytes,
+                State::Shared(bytes, _) => Vec::from(bytes),
+                State::Charged(arena) => arena.as_ref().as_ref().to_vec(),
             };
-            bytes
-                .try_reserve_exact(additional)
-                .map_err(std::io::Error::other)?;
+            let reserved = bytes.try_reserve_exact(additional);
+            self.state = State::Mutable(bytes);
+            reserved.map_err(std::io::Error::other)?;
         }
         Ok(())
     }
 
     pub(super) fn mutable(&mut self) -> Result<&mut Vec<u8>, JournalError> {
         self.reserve(0)?;
+        // Reserving made the body private: mutable bytes or an unshared arena.
         match &mut self.state {
             State::Mutable(bytes) => Ok(bytes),
-            State::Charged(arena) => Ok(Arc::get_mut(arena)
-                .expect("reserved private arena")
-                .bytes_mut()),
-            State::Shared(..) => unreachable!(),
+            State::Charged(arena) => Arc::get_mut(arena)
+                .map(Arena::bytes_mut)
+                .ok_or(JournalError::AppendMismatch),
+            State::Shared(..) => Err(JournalError::AppendMismatch),
         }
     }
 
@@ -145,16 +141,15 @@ impl Body {
     ) -> Result<(), JournalError> {
         match self.reserve(additional) {
             Err(JournalError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                // Only a charged body waits for memory.
+                let Some(allocator) = &self.allocator else {
+                    return Err(error.into());
+                };
                 let required = self
                     .len()
                     .checked_add(additional)
                     .ok_or(JournalError::AppendCapacity)?;
-                let mut arena = self
-                    .allocator
-                    .as_ref()
-                    .expect("charged body")
-                    .arena(required)
-                    .await?;
+                let mut arena = allocator.arena(required).await?;
                 arena.bytes_mut().extend_from_slice(self);
                 self.state = State::Charged(Arc::new(arena));
                 Ok(())

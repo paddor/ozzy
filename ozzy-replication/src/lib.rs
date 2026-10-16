@@ -12,6 +12,20 @@
 //! separate adapters. Normal metadata storage is preallocated and byte-bounded.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![warn(clippy::indexing_slicing)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::indexing_slicing,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::too_many_lines,
+        clippy::too_many_arguments,
+        reason = "product code is linted without cfg(test)"
+    )
+)]
 
 mod configuration_record;
 pub mod driver;
@@ -21,13 +35,14 @@ pub mod local;
 mod normal;
 pub mod recovery;
 mod view_change;
+mod voters;
 pub mod wire;
 
 pub use configuration_record::{
     CONFIGURATION_RECORD_BYTES, ConfigurationRecord, ConfigurationRecordError, ConfiguredVoter,
 };
 pub use installation::{
-    InstallOutcome, InstallTicket, InstallingView, RejectedInstallation, StartView,
+    InstallOutcome, InstallTicket, InstallingView, ReceivedStart, RejectedInstallation, StartView,
 };
 pub use normal::{Admission, NormalReplica, ReplicaSnapshot, Status};
 pub use ozzy_journal::operation::Digest;
@@ -37,9 +52,12 @@ pub use view_change::{
     StartViewChange, ViewChange, ViewChangeError,
 };
 
+use std::collections::VecDeque;
+
 use ozzy_journal::operation::{CanonicalOperation, logical_operation_digest_with_body_digest};
 use ozzy_journal::progress::ProgressError;
 use ozzy_proto::{GroupId, NodeId};
+use voters::{VoterIndex, VoterSet, Voters};
 
 /// Exact canonical group prefix. Zero with the zero digest is genesis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,7 +104,7 @@ pub enum QuorumPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Configuration {
     scope: Scope,
-    voters: [NodeId; 3],
+    voters: Voters<NodeId>,
     policy: QuorumPolicy,
 }
 
@@ -119,7 +137,7 @@ impl Configuration {
                 configuration_digest: digest,
                 view: 0,
             },
-            voters,
+            voters: Voters(voters),
             policy: QuorumPolicy::Durable,
         })
     }
@@ -144,18 +162,22 @@ impl Configuration {
 
     /// Ordered persistent voter identities.
     pub const fn voters(&self) -> &[NodeId; 3] {
-        &self.voters
+        &self.voters.0
     }
 
     /// Deterministic primary selection. Does not grant leadership authority.
     pub fn primary(&self, view: u64) -> NodeId {
-        self.voters[(view % 3) as usize]
+        self.voters[VoterIndex::primary(view)]
     }
 
-    fn voter_index(&self, id: NodeId) -> Result<usize, ReplicationError> {
+    fn voter(&self, index: VoterIndex) -> NodeId {
+        self.voters[index]
+    }
+
+    fn voter_index(&self, id: NodeId) -> Result<VoterIndex, ReplicationError> {
         self.voters
             .iter()
-            .position(|&voter| voter == id)
+            .find_map(|(index, &voter)| (voter == id).then_some(index))
             .ok_or(ReplicationError::UnknownVoter)
     }
 }
@@ -231,6 +253,16 @@ impl PreparedOperation {
     pub const fn body_bytes(self) -> usize {
         self.body_bytes
     }
+}
+
+/// Drop the leading operations through `through` from a contiguous window.
+/// Returns the canonical body bytes they retained.
+fn release_through(operations: &mut VecDeque<PreparedOperation>, through: OpNumber) -> usize {
+    let count = operations.partition_point(|operation| operation.prefix.op <= through);
+    operations
+        .drain(..count)
+        .map(|operation| operation.body_bytes)
+        .sum()
 }
 
 /// Cumulative durable `PREPARE_OK`. Sender identity comes from authentication.

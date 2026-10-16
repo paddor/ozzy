@@ -1,6 +1,6 @@
 //! Device ownership survives canceled startup and shutdown observations.
 
-use crate::{DevicePools, Shutdown, StartupError, shards::lifecycle::State};
+use crate::{DevicePools, StartupError, shards::lifecycle::State, signal::CloseSignal};
 use std::{
     panic::AssertUnwindSafe,
     sync::{
@@ -32,7 +32,7 @@ pub(super) struct Drain {
     pub(super) frontend: Arc<State>,
     pools: Box<dyn StorageOwner>,
     started: AtomicBool,
-    finished: Shutdown,
+    finished: CloseSignal,
     error: OnceLock<String>,
 }
 
@@ -47,7 +47,7 @@ impl DeviceDrain {
             frontend,
             pools: Box::new(pools),
             started: AtomicBool::new(false),
-            finished: Shutdown::default(),
+            finished: CloseSignal::default(),
             error: OnceLock::new(),
         }))
     }
@@ -55,8 +55,8 @@ impl DeviceDrain {
 
 impl Drain {
     pub(super) fn request(self: &Arc<Self>) {
-        self.frontend.stop.request();
-        self.application.stop.request();
+        self.frontend.stop.close();
+        self.application.stop.close();
         if !self.started.swap(true, Ordering::AcqRel) {
             let drain = self.clone();
             let spawned = std::thread::Builder::new()
@@ -65,8 +65,8 @@ impl Drain {
                     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                         futures::executor::block_on(async {
                             futures::future::join(
-                                drain.application.finished.requested(),
-                                drain.frontend.finished.requested(),
+                                drain.application.finished.closed(),
+                                drain.frontend.finished.closed(),
                             )
                             .await;
                         });
@@ -79,17 +79,17 @@ impl Drain {
                     if result.is_err() {
                         let _ = drain.error.set("broker drain worker panicked".into());
                     }
-                    drain.finished.request();
+                    drain.finished.close();
                 });
             if let Err(error) = spawned {
                 let _ = self.error.set(format!("broker drain worker: {error}"));
-                self.finished.request();
+                self.finished.close();
             }
         }
     }
 
     pub(super) async fn closed(&self) -> Result<(), StartupError> {
-        self.finished.requested().await;
+        self.finished.closed().await;
         if let Some(error) = self.error.get() {
             return Err(StartupError::Runtime(error.clone()));
         }
@@ -117,12 +117,14 @@ mod tests {
         let registration = Registration::new(state.clone());
         let stop = state.stop.clone();
         let ended = ended.clone();
-        state.own(std::thread::spawn(move || {
-            futures::executor::block_on(stop.requested());
-            drop(registration);
-            std::thread::sleep(Duration::from_millis(50));
-            ended.fetch_add(1, Ordering::AcqRel);
-        }));
+        state
+            .own(std::thread::spawn(move || {
+                futures::executor::block_on(stop.closed());
+                drop(registration);
+                std::thread::sleep(Duration::from_millis(50));
+                ended.fetch_add(1, Ordering::AcqRel);
+            }))
+            .unwrap();
         state
     }
 

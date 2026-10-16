@@ -11,7 +11,7 @@ use ozzy_proto::{NodeId, RequestId};
 
 use crate::{
     Configuration, JournalGeneration, LogSource, NormalReplica, PipelineLimits, Prefix,
-    ReplicationError, Scope, Status,
+    ReplicationError, Scope, Status, VoterIndex, VoterSet, Voters,
 };
 
 /// Primary's immutable full-log snapshot for one recovery nonce.
@@ -92,11 +92,11 @@ impl NormalReplica {
         if nonce.as_bytes() == &[0; 16] {
             return Err(RecoveryError::InvalidIdentity);
         }
-        let (configuration, local) = self.driver_identity();
+        let (_, local) = self.driver_identity();
         Ok(RecoveryResponse {
             scope: snapshot.scope,
             nonce,
-            primary: (local == configuration.primary(snapshot.scope.view)).then_some(RecoveryLog {
+            primary: (local == VoterIndex::primary(snapshot.scope.view)).then_some(RecoveryLog {
                 generation: snapshot.journal.generation,
                 accepted: snapshot.accepted,
                 committed: snapshot.committed,
@@ -116,7 +116,7 @@ pub struct RecoveryTicket {
     scope: Scope,
     source: LogSource,
     committed: Prefix,
-    voters: u8,
+    voters: VoterSet,
 }
 
 impl RecoveryTicket {
@@ -151,7 +151,7 @@ impl RecoveryTicket {
     }
     /// Configured response participants. Never contains the recovering voter.
     pub const fn voter_mask(self) -> u8 {
-        self.voters
+        self.voters.mask()
     }
 }
 
@@ -159,12 +159,12 @@ impl RecoveryTicket {
 #[derive(Debug)]
 pub struct Recovery {
     configuration: Configuration,
-    local: usize,
+    local: VoterIndex,
     generation: JournalGeneration,
     nonce: RequestId,
     view: u64,
     limits: PipelineLimits,
-    responses: [Option<RecoveryResponse>; 3],
+    responses: Voters<Option<RecoveryResponse>>,
     pending: Option<Transfer>,
     completed: bool,
     faulted: bool,
@@ -202,7 +202,7 @@ impl Recovery {
             nonce,
             view: 0,
             limits,
-            responses: [None; 3],
+            responses: Voters::splat(None),
             pending: None,
             completed: false,
             faulted: false,
@@ -243,8 +243,10 @@ impl Recovery {
         {
             return Err(RecoveryError::InvalidResponse);
         }
-        if let Some(anchor) = response.primary.and_then(|log| log.checkpoint) {
-            anchor.validate(response.primary.expect("checkpoint primary").committed)?;
+        if let Some(log) = response.primary
+            && let Some(anchor) = log.checkpoint
+        {
+            anchor.validate(log.committed)?;
         }
         if let Some(previous) = self.responses[voter] {
             if response.scope.view < previous.scope.view {
@@ -288,18 +290,16 @@ impl Recovery {
         if self.pending.is_some() {
             return Err(RecoveryError::TransferPending);
         }
-        let voters = self
+        let voters: VoterSet = self
             .responses
             .iter()
-            .enumerate()
-            .fold(0_u8, |mask, (index, response)| {
-                mask | (u8::from(response.is_some()) << index)
-            });
-        if voters.count_ones() < 2 {
+            .filter_map(|(voter, response)| response.is_some().then_some(voter))
+            .collect();
+        if voters.len() < 2 {
             return Err(RecoveryError::QuorumMissing);
         }
-        let primary = self.configuration.primary(self.view);
-        let response = self.responses[self.configuration.voter_index(primary)?]
+        let primary = VoterIndex::primary(self.view);
+        let response = self.responses[primary]
             .filter(|response| response.scope.view == self.view)
             .ok_or(RecoveryError::PrimaryMissing)?;
         let log = response.primary.ok_or(RecoveryError::PrimaryMissing)?;
@@ -308,12 +308,12 @@ impl Recovery {
         }
         let ticket = RecoveryTicket {
             checkpoint: log.checkpoint,
-            local: self.configuration.voters()[self.local],
+            local: self.configuration.voter(self.local),
             generation: self.generation,
             nonce: self.nonce,
             scope: response.scope,
             source: LogSource {
-                voter: primary,
+                voter: self.configuration.voter(primary),
                 generation: log.generation,
                 accepted: log.accepted,
             },

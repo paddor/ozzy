@@ -4,7 +4,7 @@
 use ozzy_replication::WriteTicket;
 use ozzy_replication::driver::ValidationTicket;
 
-use super::commands::{Action, Rejected};
+use super::commands::{Action, AppendAction, Gate, Rejected};
 use super::{
     AdmittedAppend, AppendBuffer, JournalCompletion, JournalError, ProposalBuffer,
     ProposalValidation, ReplicaJournal, ValidatedAppend,
@@ -82,11 +82,8 @@ impl ReplicaJournal {
         debug_assert!(!turn.is_empty());
         self.submit(
             turn,
-            |turn, done| Action::Turn { turn, done },
-            |action| match action {
-                Action::Turn { turn, .. } => turn,
-                _ => unreachable!("submission preserves command kind"),
-            },
+            |turn| Gate::Turn(turn),
+            |turn, done| Action::Append(AppendAction::Turn { turn, done }),
         )
     }
 }

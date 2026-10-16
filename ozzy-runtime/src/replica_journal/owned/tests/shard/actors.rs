@@ -7,6 +7,7 @@ use crate::replica_journal::InstallationConfig;
 use crate::replica_transport::QueueLimits;
 use omq_tokio::Message;
 use ozzy_proto::LinkSessionId;
+mod barriers;
 mod dedup;
 mod identities;
 mod maintenance;

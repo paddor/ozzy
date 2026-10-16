@@ -2,7 +2,7 @@
 
 use ozzy_proto::{EnvelopeLimits, Opcode, Packet};
 
-use super::{FetchOps, Reader, WireError};
+use super::{FetchOps, ReadFields, Reader, WireError};
 use crate::flow::{Channel, FlowError, ReceiveEpoch};
 
 /// Exact purpose of one actor-backed replica receive reservation.
@@ -47,7 +47,7 @@ impl ReceiveFence {
                 if packet.envelope.response || packet.envelope.request_id.is_some() {
                     return Err(WireError::Correlation);
                 }
-                let epoch = ReceiveEpoch::new(u128::from_be_bytes(reader.bytes()?))?;
+                let epoch = ReceiveEpoch::new(u128::from_be_bytes(reader.array()?))?;
                 if epoch != channel.epoch {
                     return Err(FlowError::Channel.into());
                 }

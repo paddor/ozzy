@@ -1,6 +1,6 @@
 use super::{
-    AsyncGroupJournal, AsyncJournalFormat, CommitMode, Digest, JournalError, JournalGeneration,
-    Local, Mode, OwnedConfig, OwnedJournal, SegmentHeader, prefix,
+    CommitMode, Digest, GroupJournal, JournalError, JournalFormat, JournalGeneration, Local, Mode,
+    OwnedConfig, OwnedJournal, SegmentHeader, prefix,
 };
 use ozzy_journal_segment::SegmentWriteMode;
 use ozzy_replication::local::{Configuration, Driver};
@@ -37,10 +37,10 @@ impl OwnedJournal {
         let first_segment =
             SegmentHeader::new(config.identity.group_id, 1, None, Digest::ZERO, capacity)
                 .map_err(ozzy_journal_segment::DirectoryError::from)?;
-        let journal = AsyncGroupJournal::format(
+        let journal = GroupJournal::format(
             config.root.clone(),
             io,
-            AsyncJournalFormat {
+            JournalFormat {
                 identity: config.identity,
                 configuration_epoch: config.configuration.scope().configuration_epoch,
                 commit_mode: CommitMode::LocalDurable,
@@ -64,11 +64,13 @@ impl OwnedJournal {
         generation: JournalGeneration,
     ) -> Result<(Self, Driver), JournalError> {
         config.validate_local(generation)?;
-        let opening = AsyncGroupJournal::prepare_open(
+        let opening = GroupJournal::prepare_open(
             config.root.clone(),
             io,
-            config.identity,
-            Some(&config.configuration.encode()),
+            ozzy_journal_segment::ExpectedStore {
+                identity: config.identity,
+                configuration: Some(&config.configuration.encode()),
+            },
             config.limits,
         )
         .await?;
@@ -88,7 +90,7 @@ impl OwnedJournal {
 
     async fn start_local(
         config: OwnedConfig<Configuration>,
-        mut journal: AsyncGroupJournal,
+        mut journal: GroupJournal,
         generation: JournalGeneration,
     ) -> Result<(Self, Driver), JournalError> {
         let candidate = journal.recover_canonical_candidate(config.recovery).await?;
@@ -98,7 +100,7 @@ impl OwnedJournal {
         }
         let images = candidate.activate(&journal)?;
         let reader =
-            ozzy_journal_segment::AsyncJournalPartitionIndex::open(&journal, config.reads).await?;
+            ozzy_journal_segment::JournalPartitionIndex::open(&journal, config.reads).await?;
         let driver = Driver::recover(config.configuration, generation, applied, config.writeback)?;
         let mode = Mode::Local(config.configuration);
         let mut owner = Self::from_open(&config, mode, journal, Some(images), Some(reader))?;

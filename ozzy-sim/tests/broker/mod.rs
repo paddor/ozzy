@@ -1,6 +1,16 @@
 //! Full product smoke gate sharing the broker integration storage and SDK oracle.
-use ozzy_config::{Confirmation, DeploymentMode, HostResources};
-use ozzy_runtime::replicated::WriterRuntime;
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "simulation test support"
+)]
+use clock::progress;
+use ozzy_config::{Confirmation, HostResources};
+use ozzy_runtime::replicated::{SdkClock, WriterRuntime};
 use ozzy_sim::{broker, client::Client};
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 mod clock;
@@ -22,14 +32,12 @@ async fn inproc_memory_all_modes_share_the_real_broker_and_sdk_harness() {
                 memory_nodes: [0].into(),
                 linux_aio: true,
             };
-            let mode = match policy {
-                Confirmation::LocalDurable => DeploymentMode::Single,
-                Confirmation::DiskQuorum | Confirmation::ReplicatedPersisting => {
-                    DeploymentMode::Three
-                }
-            };
-            let configs =
-                broker::deployment_with_resources(&root, mode, policy, 2, &resources, |_| {});
+            let configs = broker::deployment_with_resources(
+                &root,
+                broker::Shape::for_policy(policy, 2),
+                &resources,
+                |_| {},
+            );
             let checked = configs[0].0.clone();
             let brokers = broker::start_brokers(&runtime, configs, true).await;
             let mut client = Client::open_with_runtime(&checked, &runtime).await;
@@ -91,11 +99,20 @@ async fn inproc_memory_sequential_sdk_identities_reclaim_client_slots_in_every_m
 async fn inproc_memory_recovery_retries_while_a_donor_completion_is_held() {
     tokio::time::timeout(Duration::from_secs(90), async {
         for policy in [Confirmation::DiskQuorum, Confirmation::ReplicatedPersisting] {
-            let mut cluster = broker::Cluster::new(policy).await;
-            let mut client =
-                Client::open_with_runtime(&cluster.configs[0].0, &cluster.runtime).await;
-            let pending = client.queue(0).await;
-            client.confirm(pending).await;
+            // Manual broker time crosses the recovery stall deadline quickly.
+            let clock = SdkClock::manual();
+            let mut cluster = progress(
+                &clock,
+                broker::Cluster::configured(policy, Some(clock.clone()), |_| {}),
+            )
+            .await;
+            let mut client = progress(
+                &clock,
+                Client::open_with_clock(&cluster.configs[0].0, &cluster.runtime, clock.clone()),
+            )
+            .await;
+            let pending = progress(&clock, client.queue(0)).await;
+            progress(&clock, client.confirm(pending)).await;
             let primary = client.leader(0);
             let donor = cluster
                 .configs
@@ -109,7 +126,7 @@ async fn inproc_memory_recovery_retries_while_a_donor_completion_is_held() {
             let requester = (donor + 1) % 3;
             let control = cluster.controls[donor].clone();
             control.hold_completions(true);
-            cluster.restart_fresh(requester).await;
+            progress(&clock, cluster.restart_fresh(requester)).await;
             let held = async {
                 tokio::time::timeout(Duration::from_secs(5), async {
                     while control.pending_completions() == 0 {
@@ -118,24 +135,28 @@ async fn inproc_memory_recovery_retries_while_a_donor_completion_is_held() {
                 })
                 .await
                 .expect("recovery never submitted physical donor work");
-                // The production recovery actor abandons an unprogressing
-                // attempt after ten seconds and sends a fresh nonce on reopen.
-                tokio::time::sleep(Duration::from_secs(12)).await;
+                // The production recovery actor abandons an attempt after ten
+                // seconds of broker time without progress and sends a fresh
+                // nonce on reopen.
+                let until = clock.now() + Duration::from_secs(12);
+                while clock.now() < until {
+                    tokio::task::yield_now().await;
+                }
             };
             tokio::select! {
-                () = held => {},
+                () = progress(&clock, held) => {},
                 (result, index, _) = futures::future::select_all(
                     cluster.brokers.iter().map(|broker| Box::pin(broker.closed()))
                 ) => panic!("broker {index} failed during delayed donor pin: {result:?}"),
             }
             control.hold_completions(false);
-            cluster.wait_recovered(requester).await;
-            client.replay().await;
-            let pending = client.queue(1).await;
-            client.confirm(pending).await;
-            client.replay().await;
-            client.close().await;
-            cluster.shutdown().await;
+            progress(&clock, cluster.wait_recovered(requester)).await;
+            progress(&clock, client.replay()).await;
+            let pending = progress(&clock, client.queue(1)).await;
+            progress(&clock, client.confirm(pending)).await;
+            progress(&clock, client.replay()).await;
+            progress(&clock, client.close()).await;
+            progress(&clock, cluster.shutdown()).await;
         }
     })
     .await

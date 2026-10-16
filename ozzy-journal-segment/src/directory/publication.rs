@@ -1,35 +1,11 @@
-//! One publication algorithm over real or simulated file/directory operations.
+//! Crash-safe metadata publication ordering over one directory I/O driver.
 
-use super::{DirectoryError, PersistenceObserver, PersistencePhase, io};
-use std::io::Write;
-use std::path::Path;
+use std::io;
 
-/// `DURABLE` opened once by the journal. Recovery checked its type and size.
-pub(crate) struct OpenEvidence<'a>(pub &'a std::fs::File);
+use super::{CURRENT_FILE, DirectoryError, evidence, manifest_name};
 
-impl SyncedOverwrite for OpenEvidence<'_> {
-    fn write_synced(
-        &mut self,
-        name: &str,
-        offsets: &[usize],
-        bytes: &[u8],
-    ) -> Result<(), DirectoryError> {
-        use std::os::unix::fs::FileExt;
-        debug_assert_eq!(name, super::evidence::NAME);
-        for offset in offsets {
-            self.0.write_all_at(bytes, *offset as u64)?;
-        }
-        self.0.sync_data()?;
-        Ok(())
-    }
-}
-
-/// The one operation a `DURABLE` publication needs.
-pub(crate) trait SyncedOverwrite {
-    /// Overwrite existing bytes in place at every offset and return once all
-    /// copies are durable. One barrier covers every copy. The file keeps its
-    /// size, so no metadata or directory sync is needed.
-    fn write_synced(
+pub(crate) trait Overwrite {
+    async fn write_synced(
         &mut self,
         name: &str,
         offsets: &[usize],
@@ -37,187 +13,165 @@ pub(crate) trait SyncedOverwrite {
     ) -> Result<(), DirectoryError>;
 }
 
-pub(crate) trait MetadataIo: SyncedOverwrite {
-    fn exists(&mut self, name: &str) -> Result<bool, DirectoryError>;
-    fn read_exact(&mut self, name: &str, bytes: usize) -> Result<Vec<u8>, DirectoryError>;
-    fn write_new(&mut self, name: &str, bytes: &[u8]) -> Result<(), DirectoryError>;
-    fn sync_file(&mut self, name: &str) -> Result<(), DirectoryError>;
-    fn link(&mut self, source: &str, target: &str) -> Result<(), DirectoryError>;
-    fn remove(&mut self, name: &str) -> Result<(), DirectoryError>;
-    fn rename(&mut self, source: &str, target: &str) -> Result<(), DirectoryError>;
-    fn sync_directory(&mut self) -> Result<(), DirectoryError>;
+pub(crate) trait Io: Overwrite {
+    async fn exists(&mut self, name: &str) -> Result<bool, DirectoryError>;
+    async fn read_exact(&mut self, name: &str, bytes: usize) -> Result<Vec<u8>, DirectoryError>;
+    async fn write_new(&mut self, name: &str, bytes: &[u8]) -> Result<(), DirectoryError>;
+    async fn sync_file(&mut self, name: &str) -> Result<(), DirectoryError>;
+    async fn link(&mut self, source: &str, target: &str) -> Result<(), DirectoryError>;
+    async fn remove(&mut self, name: &str) -> Result<(), DirectoryError>;
+    async fn rename(&mut self, source: &str, target: &str) -> Result<(), DirectoryError>;
+    async fn sync_directory(&mut self) -> Result<(), DirectoryError>;
 }
 
-pub(crate) struct Filesystem<'a>(pub &'a Path);
-
-impl MetadataIo for Filesystem<'_> {
-    fn exists(&mut self, name: &str) -> Result<bool, DirectoryError> {
-        super::path_exists(&self.0.join(name))
-    }
-
-    fn read_exact(&mut self, name: &str, bytes: usize) -> Result<Vec<u8>, DirectoryError> {
-        super::read_exact_file(&self.0.join(name), bytes, "immutable metadata")
-    }
-
-    fn write_new(&mut self, name: &str, bytes: &[u8]) -> Result<(), DirectoryError> {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(self.0.join(name))?;
-        file.write_all(bytes)?;
+async fn exact(io: &mut impl Io, name: &str, bytes: &[u8]) -> Result<(), DirectoryError> {
+    if io.read_exact(name, bytes.len()).await? == bytes {
         Ok(())
-    }
-
-    fn sync_file(&mut self, name: &str) -> Result<(), DirectoryError> {
-        super::open_regular_file(&self.0.join(name), "metadata")?.sync_all()?;
-        Ok(())
-    }
-
-    fn link(&mut self, source: &str, target: &str) -> Result<(), DirectoryError> {
-        Ok(std::fs::hard_link(
-            self.0.join(source),
-            self.0.join(target),
-        )?)
-    }
-
-    fn remove(&mut self, name: &str) -> Result<(), DirectoryError> {
-        Ok(std::fs::remove_file(self.0.join(name))?)
-    }
-
-    fn rename(&mut self, source: &str, target: &str) -> Result<(), DirectoryError> {
-        Ok(std::fs::rename(self.0.join(source), self.0.join(target))?)
-    }
-
-    fn sync_directory(&mut self) -> Result<(), DirectoryError> {
-        super::sync_directory(self.0)
+    } else {
+        Err(DirectoryError::ImmutableConflict)
     }
 }
 
-impl SyncedOverwrite for Filesystem<'_> {
-    fn write_synced(
-        &mut self,
-        name: &str,
-        offsets: &[usize],
-        bytes: &[u8],
-    ) -> Result<(), DirectoryError> {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            use std::os::unix::fs::FileExt;
-            let path = self.0.join(name);
-            super::require_regular_file(&path, "metadata")?;
-            let file = std::fs::OpenOptions::new().write(true).open(path)?;
-            let len = file.metadata()?.len();
-            for offset in offsets {
-                let end = *offset as u64 + bytes.len() as u64;
-                if len < end {
-                    return Err(DirectoryError::WrongFileSize {
-                        object: "metadata",
-                        actual: len,
-                        expected: end,
-                    });
-                }
-            }
-            for offset in offsets {
-                file.write_all_at(bytes, *offset as u64)?;
-            }
-            file.sync_data()?;
-            Ok(())
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        {
-            let _ = (name, offsets, bytes);
-            Err(io::Error::new(io::ErrorKind::Unsupported, "O_DSYNC requires Linux").into())
-        }
-    }
-}
-
-pub(crate) mod algorithm;
-mod blocking;
-use blocking::{Blocking, run_ready};
-
-pub(crate) fn prepare_manifest(
-    io: &mut impl MetadataIo,
+/// Select a free immutable generation after an interrupted publication.
+pub(crate) async fn prepare_manifest(
+    io: &mut impl Io,
     previous: &crate::Manifest,
-    next: crate::Manifest,
+    mut next: crate::Manifest,
     limits: crate::MetadataLimits,
 ) -> Result<(crate::Manifest, Vec<u8>, crate::Digest), DirectoryError> {
-    run_ready(algorithm::prepare_manifest(
-        &mut Blocking(io),
-        previous,
-        next,
-        limits,
-    ))
+    if next.identity != previous.identity
+        || next.generation
+            != previous
+                .generation
+                .checked_add(1)
+                .ok_or(DirectoryError::ManifestGeneration)?
+        || next.parent_generation != previous.generation
+    {
+        return Err(DirectoryError::ManifestGeneration);
+    }
+    let bytes = loop {
+        let bytes = crate::encode_manifest_with_limits(&next, limits)?;
+        let name = manifest_name(next.generation);
+        let occupied = if io.exists(&name).await? {
+            name
+        } else {
+            let temporary = format!(".{name}.tmp");
+            if !io.exists(&temporary).await? {
+                break bytes;
+            }
+            temporary
+        };
+        match exact(io, &occupied, &bytes).await {
+            Ok(()) => break bytes,
+            Err(DirectoryError::ImmutableConflict | DirectoryError::WrongFileSize { .. }) => {}
+            Err(error) => return Err(error),
+        }
+        next.generation = next
+            .generation
+            .checked_add(1)
+            .ok_or(DirectoryError::ManifestGeneration)?;
+    };
+    let digest = crate::manifest_digest(&bytes, limits)?;
+    Ok((next, bytes, digest))
 }
 
-pub(crate) fn install_immutable(
-    io: &mut impl MetadataIo,
+/// Write and synchronize an unselected temporary. An interrupted attempt can
+/// leave its name with no, some, or other bytes. Nothing refers to that name,
+/// so it is removed and created again. The old file is never written: an
+/// interrupted link may share it with an installed target.
+async fn prepare(io: &mut impl Io, name: &str, bytes: &[u8]) -> Result<(), DirectoryError> {
+    match io.write_new(name, bytes).await {
+        Ok(()) => {}
+        Err(DirectoryError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {
+            match exact(io, name, bytes).await {
+                Ok(()) => {}
+                Err(DirectoryError::ImmutableConflict | DirectoryError::WrongFileSize { .. }) => {
+                    io.remove(name).await?;
+                    io.write_new(name, bytes).await?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(error) => return Err(error),
+    }
+    io.sync_file(name).await
+}
+
+pub(crate) async fn install_immutable(
+    io: &mut impl Io,
     name: &str,
     bytes: &[u8],
-    observer: &mut impl PersistenceObserver,
 ) -> Result<(), DirectoryError> {
-    run_ready(algorithm::install_immutable(
-        &mut Blocking(io),
-        name,
-        bytes,
-        observer,
-    ))
+    if io.exists(name).await? {
+        exact(io, name, bytes).await?;
+        io.sync_directory().await?;
+        return Ok(());
+    }
+    let temporary = format!(".{name}.tmp");
+    prepare(io, &temporary, bytes).await?;
+    match io.link(&temporary, name).await {
+        Ok(()) => {}
+        Err(DirectoryError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {
+            exact(io, name, bytes).await?;
+        }
+        Err(error) => return Err(error),
+    }
+    match io.remove(&temporary).await {
+        Ok(()) => {}
+        Err(DirectoryError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    io.sync_directory().await?;
+    Ok(())
 }
 
-pub(crate) fn replace_current(
-    io: &mut impl MetadataIo,
+pub(crate) async fn replace_current(
+    io: &mut impl Io,
     generation: u64,
-    bytes: &[u8; super::CURRENT_BYTES],
-    observer: &mut impl PersistenceObserver,
+    bytes: &[u8; crate::CURRENT_BYTES],
 ) -> Result<(), DirectoryError> {
-    run_ready(algorithm::replace_current(
-        &mut Blocking(io),
-        generation,
-        bytes,
-        observer,
-    ))
+    let temporary = format!(".CURRENT.{generation}.tmp");
+    prepare(io, &temporary, bytes).await?;
+    io.rename(&temporary, CURRENT_FILE).await?;
+    io.sync_directory().await?;
+    Ok(())
 }
 
-pub(crate) fn replace_evidence(
-    io: &mut impl MetadataIo,
-    bytes: &[u8],
-    observer: &mut impl PersistenceObserver,
-) -> Result<(), DirectoryError> {
-    run_ready(algorithm::replace_evidence(
-        &mut Blocking(io),
-        bytes,
-        observer,
-    ))
-}
-
-pub(crate) fn overwrite_evidence(
-    io: &mut impl SyncedOverwrite,
+/// Publish one `DURABLE` record into both copies, `first` before the other.
+/// `first` never holds the newest intact record, so a failure at any point
+/// leaves an intact copy with at least the previous completed publication.
+pub(crate) async fn overwrite_evidence(
+    io: &mut impl Overwrite,
     first: usize,
     bytes: &[u8],
-    observer: &mut impl PersistenceObserver,
 ) -> Result<(), DirectoryError> {
-    run_ready(algorithm::overwrite_evidence(
-        &mut Blocking(io),
-        first,
+    // Each copy lies inside one sector, and a sector is written whole or not
+    // at all. So one barrier cannot tear both copies of the last completed
+    // publication, and afterwards both copies hold the new record.
+    io.write_synced(
+        evidence::NAME,
+        &[
+            first * evidence::COPY_STRIDE,
+            (1 - first) * evidence::COPY_STRIDE,
+        ],
         bytes,
-        observer,
-    ))
+    )
+    .await?;
+    Ok(())
 }
 
-pub(crate) fn replace_reusable(
-    io: &mut impl MetadataIo,
+pub(crate) async fn replace_reusable(
+    io: &mut impl Io,
     target: &str,
     temporary: &str,
     bytes: &[u8],
-    observer: &mut impl PersistenceObserver,
 ) -> Result<(), DirectoryError> {
-    run_ready(algorithm::replace_reusable(
-        &mut Blocking(io),
-        target,
-        temporary,
-        bytes,
-        observer,
-    ))
+    // Only this unselected temporary is reusable. The target is replaced whole.
+    if io.exists(temporary).await? {
+        io.remove(temporary).await?;
+    }
+    prepare(io, temporary, bytes).await?;
+    io.rename(temporary, target).await?;
+    io.sync_directory().await?;
+    Ok(())
 }
-
-#[cfg(test)]
-mod simulation;

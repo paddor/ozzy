@@ -17,6 +17,7 @@ confirmation = "disk-quorum"
 peer = "tcp://192.0.2.1:7100" # Control and confirmations.
 data_peer = "tcp://192.0.2.1:7103" # APPENDs and replay data.
 reader_pub = "tcp://192.0.2.1:7101" # Live consumer records.
+follower_pub = "tcp://192.0.2.1:7102" # Live follower replication.
 
 [brokers.my_server_1.devices.my_ssd]
 root = "/var/lib/ozzy/data"
@@ -26,6 +27,7 @@ controller = "my_controller" # Shares workers/budgets only within this broker.
 peer = "tcp://192.0.2.2:7100"
 data_peer = "tcp://192.0.2.2:7103"
 reader_pub = "tcp://192.0.2.2:7101"
+follower_pub = "tcp://192.0.2.2:7102"
 
 [brokers.my_server_2.devices.my_ssd]
 root = "/var/lib/ozzy/data"
@@ -35,6 +37,7 @@ controller = "my_controller"
 peer = "tcp://192.0.2.3:7100"
 data_peer = "tcp://192.0.2.3:7103"
 reader_pub = "tcp://192.0.2.3:7101"
+follower_pub = "tcp://192.0.2.3:7102"
 
 [brokers.my_server_3.devices.my_ssd]
 root = "/var/lib/ozzy/data"

@@ -6,7 +6,8 @@ use std::{collections::BTreeSet, sync::Arc};
 use crate::{
     ENVELOPE_BYTES, Envelope, EnvelopeLimits, GroupId, NodeId, Opcode, Packet,
     PartitionIncarnation, RequestId,
-    data::{self, CodecError, Cursor},
+    data::{self, CodecError},
+    layout::Reader,
 };
 
 const WATCH_TAG: u8 = 1;
@@ -74,6 +75,15 @@ pub struct RouteState {
 }
 
 impl RouteState {
+    /// The authority a request to this route's leader carries.
+    pub const fn authority(&self) -> crate::append::Authority {
+        crate::append::Authority {
+            group_id: self.group,
+            config_epoch: self.config_epoch,
+            view: self.view,
+        }
+    }
+
     /// Check structural identity only. A caller must independently compare this
     /// with trusted topic metadata before treating it as a routing hint.
     pub fn valid(&self) -> bool {
@@ -125,11 +135,11 @@ impl RouteState {
         }
     }
 
-    fn decode(cursor: &mut Cursor<'_>, limits: Limits) -> Result<Self, CodecError> {
+    fn decode(cursor: &mut Reader<'_>, limits: Limits) -> Result<Self, CodecError> {
         let group = GroupId::from_bytes(cursor.array()?);
         let config_epoch = cursor.u64()?;
         let partition = PartitionIncarnation::from_bytes(cursor.array()?);
-        let count = usize::from(cursor.byte()?);
+        let count = usize::from(cursor.u8()?);
         if !matches!(count, 1 | 3 | 6) || count > limits.members {
             return Err(CodecError::Limit);
         }
@@ -228,14 +238,7 @@ pub fn encode_request(
     let size = 19_usize
         .checked_add(groups.len().checked_mul(16).ok_or(CodecError::Length)?)
         .ok_or(CodecError::Length)?;
-    let header = prepare(
-        envelope,
-        Opcode::StateSnapshotRequest,
-        true,
-        size,
-        out,
-        frame,
-    )?;
+    let header = prepare(envelope, Opcode::StateSnapshotRequest, size, out, frame)?;
     prefix(out, request.watch);
     out.extend_from_slice(&(groups.len() as u16).to_be_bytes());
     for group in groups {
@@ -250,10 +253,10 @@ pub fn decode_request(
     frame: EnvelopeLimits,
     limits: Limits,
 ) -> Result<SnapshotRequest, CodecError> {
-    let mut cursor = control(packet, Opcode::StateSnapshotRequest, true, frame, limits)?;
+    let mut cursor = control(packet, Opcode::StateSnapshotRequest, frame, limits)?;
     let watch = read_prefix(&mut cursor)?;
     let count = usize::from(u16::from_be_bytes(cursor.array()?));
-    if count == 0 || count > limits.partitions || cursor.0.len() != 16 * count {
+    if count == 0 || count > limits.partitions || cursor.rest().len() != 16 * count {
         return Err(CodecError::Length);
     }
     let mut groups = Vec::with_capacity(count);
@@ -296,7 +299,7 @@ pub fn encode_snapshot(
         }
         size = size.checked_add(route.size()?).ok_or(CodecError::Length)?;
     }
-    let header = prepare(envelope, Opcode::StateSnapshot, true, size, out, frame)?;
+    let header = prepare(envelope, Opcode::StateSnapshot, size, out, frame)?;
     prefix(out, snapshot.watch);
     out.extend_from_slice(&(snapshot.routes.len() as u16).to_be_bytes());
     for route in &snapshot.routes {
@@ -311,10 +314,10 @@ pub fn decode_snapshot(
     frame: EnvelopeLimits,
     limits: Limits,
 ) -> Result<Snapshot, CodecError> {
-    let mut cursor = control(packet, Opcode::StateSnapshot, true, frame, limits)?;
+    let mut cursor = control(packet, Opcode::StateSnapshot, frame, limits)?;
     let watch = read_prefix(&mut cursor)?;
     let count = usize::from(u16::from_be_bytes(cursor.array()?));
-    if count == 0 || count > limits.partitions || cursor.0.len() < ROUTE_BASE * count {
+    if count == 0 || count > limits.partitions || cursor.rest().len() < ROUTE_BASE * count {
         return Err(CodecError::Length);
     }
     let mut routes = Vec::with_capacity(count);
@@ -327,7 +330,7 @@ pub fn decode_snapshot(
         }
         routes.push(route);
     }
-    if !cursor.0.is_empty() {
+    if !cursor.rest().is_empty() {
         return Err(CodecError::Length);
     }
     Ok(Snapshot { watch, routes })
@@ -351,7 +354,7 @@ pub fn encode_update(
     let size = 17_usize
         .checked_add(update.route.size()?)
         .ok_or(CodecError::Length)?;
-    let header = prepare(envelope, Opcode::StateUpdate, false, size, out, frame)?;
+    let header = prepare(envelope, Opcode::StateUpdate, size, out, frame)?;
     prefix(out, update.watch);
     update.route.encode(out);
     Ok(header)
@@ -363,10 +366,10 @@ pub fn decode_update(
     frame: EnvelopeLimits,
     limits: Limits,
 ) -> Result<Update, CodecError> {
-    let mut cursor = control(packet, Opcode::StateUpdate, false, frame, limits)?;
+    let mut cursor = control(packet, Opcode::StateUpdate, frame, limits)?;
     let watch = read_prefix(&mut cursor)?;
     let route = RouteState::decode(&mut cursor, limits)?;
-    if !cursor.0.is_empty() {
+    if !cursor.rest().is_empty() {
         return Err(CodecError::Length);
     }
     Ok(Update { watch, route })
@@ -382,16 +385,16 @@ pub fn encode_resync(
     if !watch_valid(resync.watch) {
         return Err(CodecError::Profile);
     }
-    let header = prepare(envelope, Opcode::StateResync, false, 17, out, frame)?;
+    let header = prepare(envelope, Opcode::StateResync, 17, out, frame)?;
     prefix(out, resync.watch);
     Ok(header)
 }
 
 /// Decode a resync notice without changing topic or writer authority.
 pub fn decode_resync(packet: Packet<'_>, frame: EnvelopeLimits) -> Result<Resync, CodecError> {
-    let mut cursor = control(packet, Opcode::StateResync, false, frame, Limits::default())?;
+    let mut cursor = control(packet, Opcode::StateResync, frame, Limits::default())?;
     let watch = read_prefix(&mut cursor)?;
-    if !cursor.0.is_empty() {
+    if !cursor.rest().is_empty() {
         return Err(CodecError::Length);
     }
     Ok(Resync { watch })
@@ -406,8 +409,8 @@ fn prefix(out: &mut Vec<u8>, watch: RequestId) {
     out.extend_from_slice(watch.as_bytes());
 }
 
-fn read_prefix(cursor: &mut Cursor<'_>) -> Result<RequestId, CodecError> {
-    if cursor.byte()? != WATCH_TAG {
+fn read_prefix(cursor: &mut Reader<'_>) -> Result<RequestId, CodecError> {
+    if cursor.u8()? != WATCH_TAG {
         return Err(CodecError::Profile);
     }
     let watch = RequestId::from_bytes(cursor.array()?);
@@ -420,12 +423,11 @@ fn read_prefix(cursor: &mut Cursor<'_>) -> Result<RequestId, CodecError> {
 fn prepare(
     envelope: Envelope,
     opcode: Opcode,
-    correlated: bool,
     size: usize,
     out: &mut Vec<u8>,
     limits: EnvelopeLimits,
 ) -> Result<[u8; ENVELOPE_BYTES], CodecError> {
-    command(envelope, opcode, correlated)?;
+    command(envelope, opcode)?;
     let header = envelope.encode_header(size, 0, limits)?;
     data::capacity(out, size)?;
     out.clear();
@@ -435,24 +437,26 @@ fn prepare(
 fn control(
     packet: Packet<'_>,
     opcode: Opcode,
-    correlated: bool,
     frame: EnvelopeLimits,
     limits: Limits,
-) -> Result<Cursor<'_>, CodecError> {
+) -> Result<Reader<'_>, CodecError> {
     if !limits.valid() {
         return Err(CodecError::Limit);
     }
-    command(packet.envelope, opcode, correlated)?;
+    command(packet.envelope, opcode)?;
     packet
         .envelope
         .validate_frames(packet.metadata.len(), packet.payload.len(), frame)?;
     if !packet.payload.is_empty() {
         return Err(CodecError::Length);
     }
-    Ok(Cursor(packet.metadata))
+    Ok(Reader::new(packet.metadata))
 }
 
-fn command(envelope: Envelope, opcode: Opcode, correlated: bool) -> Result<(), CodecError> {
+/// Snapshot requests and their replies are correlated; updates and resyncs are
+/// pushed.
+fn command(envelope: Envelope, opcode: Opcode) -> Result<(), CodecError> {
+    let correlated = matches!(opcode, Opcode::StateSnapshotRequest | Opcode::StateSnapshot);
     if envelope.opcode != opcode
         || envelope.response != (opcode == Opcode::StateSnapshot)
         || envelope.request_id.is_some() != correlated

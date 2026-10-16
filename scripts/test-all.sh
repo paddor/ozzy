@@ -24,6 +24,7 @@ check_phase() {
 
 if [[ "$phase" != tests ]]; then
     check_phase format cargo fmt --all -- --check
+    check_phase shape scripts/check-shape.sh
     check_phase lint cargo clippy --workspace --all-targets -- -D warnings
 fi
 if [[ "$phase" == lint ]]; then

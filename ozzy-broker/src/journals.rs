@@ -4,7 +4,7 @@ mod limits;
 mod recovery;
 pub use recovery::{RecoveryIntent, RecoverySelection};
 
-use ozzy_config::{BrokerIdentity, Confirmation, PartitionPlacement};
+use ozzy_config::{BrokerIdentity, Confirmation, PartitionIdentity, PartitionPlacement};
 use ozzy_io::Local;
 use ozzy_journal_segment::GroupIdentity;
 use ozzy_proto::{GroupId, NodeId, PartitionIncarnation, StoreId, VolumeId};
@@ -89,8 +89,8 @@ impl JournalPlan {
             .identity
             .brokers
             .iter()
-            .map(|(name, id)| (*id, Digest::from_bytes(checked.identity.principals[name])))
-            .collect();
+            .map(|(name, id)| Ok((*id, Digest::from_bytes(checked.identity.principal(name)?))))
+            .collect::<Result<_, StartupError>>()?;
         Self::new(checked, local, &principals)
     }
 
@@ -105,91 +105,144 @@ impl JournalPlan {
         checked
             .deployment
             .check_broker_identity(&checked.identity, &checked.plan.name, local)?;
-        if principals.len() != checked.identity.brokers.len()
-            || checked.identity.brokers.values().any(|id| {
-                principals
-                    .get(id)
-                    .is_none_or(|principal| *principal == Digest::ZERO)
-            })
-        {
-            return Err(StartupError::Runtime(
-                "missing broker principal binding".into(),
-            ));
-        }
-        let mut distinct = std::collections::BTreeSet::new();
-        if principals
-            .values()
-            .any(|value| !distinct.insert(*value.as_bytes()))
-        {
-            return Err(StartupError::Runtime(
-                "duplicate broker principal binding".into(),
-            ));
-        }
+        check_principals(checked, principals)?;
         let mut partitions = Vec::with_capacity(checked.plan.partitions.len());
         for placement in &checked.plan.partitions {
-            let partition =
-                &checked.identity.topics[&placement.topic].partitions[placement.partition as usize];
-            let store = &local.topics[&placement.topic][placement.partition as usize];
-            let identity = GroupIdentity {
-                group_id: GroupId::from_bytes(*partition.group.as_bytes()),
-                replica_node_id: NodeId::from_bytes(*local.broker.as_bytes()),
-                volume_id: VolumeId::from_bytes(*store.volume.as_bytes()),
-                store_id: StoreId::from_bytes(*store.store.as_bytes()),
-                store_generation: store.generation,
+            let binding = PartitionSetup {
+                placement,
+                principals,
             };
-            let settings = limits::Settings::new(checked, placement)?;
-            let error = |reason: String| {
-                StartupError::Runtime(format!(
-                    "partition {}/{}: {reason}",
-                    placement.topic, placement.partition,
-                ))
-            };
-            let config = match checked.identity.topics[&placement.topic].confirmation {
-                Confirmation::LocalDurable => {
-                    let configuration = local::Configuration::new(
-                        identity.group_id,
-                        partition.config_epoch,
-                        identity.replica_node_id,
-                        principals[&local.broker],
-                    )
-                    .map_err(|failure| error(failure.to_string()))?;
-                    JournalConfig::Local(settings.config(placement, identity, configuration))
-                }
-                policy => {
-                    let members: [Uuid; 3] = partition
-                        .members
-                        .clone()
-                        .try_into()
-                        .map_err(|_| error("expected three broker members".into()))?;
-                    let configuration = ConfigurationRecord::with_policy(
-                        identity.group_id,
-                        partition.config_epoch,
-                        members.map(|id| ConfiguredVoter {
-                            node_id: NodeId::from_bytes(*id.as_bytes()),
-                            principal: principals[&id],
-                        }),
-                        if policy == Confirmation::DiskQuorum {
-                            QuorumPolicy::Durable
-                        } else {
-                            QuorumPolicy::Replicated
-                        },
-                    )
-                    .map_err(|failure| error(failure.to_string()))?;
-                    JournalConfig::Replicated(settings.config(placement, identity, configuration))
-                }
-            };
-            partitions.push(PartitionJournal {
-                cluster: checked.identity.cluster,
-                actors: ActorSettings::new(checked, placement, &config)?,
-                placement: placement.clone(),
-                incarnation: PartitionIncarnation::from_bytes(*partition.incarnation.as_bytes()),
-                config,
-            });
+            partitions.push(binding.journal(checked, local)?);
         }
         Ok(Self {
             partitions,
             recovery: BTreeMap::new(),
         })
+    }
+}
+
+/// Every broker has exactly one nonzero principal, and no two share one.
+fn check_principals(
+    checked: &CheckedConfig,
+    principals: &BTreeMap<Uuid, Digest>,
+) -> Result<(), StartupError> {
+    if principals.len() != checked.identity.brokers.len()
+        || checked.identity.brokers.values().any(|id| {
+            principals
+                .get(id)
+                .is_none_or(|principal| *principal == Digest::ZERO)
+        })
+    {
+        return Err(StartupError::Runtime(
+            "missing broker principal binding".into(),
+        ));
+    }
+    let mut distinct = std::collections::BTreeSet::new();
+    if principals
+        .values()
+        .any(|value| !distinct.insert(*value.as_bytes()))
+    {
+        return Err(StartupError::Runtime(
+            "duplicate broker principal binding".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// One placed partition and the principals its configuration binds.
+struct PartitionSetup<'a> {
+    placement: &'a PartitionPlacement,
+    principals: &'a BTreeMap<Uuid, Digest>,
+}
+
+impl PartitionSetup<'_> {
+    /// This broker's journal for the partition, in its topic's mode.
+    fn journal(
+        &self,
+        checked: &CheckedConfig,
+        local: &BrokerIdentity,
+    ) -> Result<PartitionJournal, StartupError> {
+        let placement = self.placement;
+        let partition = checked
+            .identity
+            .partition(&placement.topic, placement.partition)?;
+        let store = local.store(&placement.topic, placement.partition)?;
+        let identity = GroupIdentity {
+            group_id: GroupId::from_bytes(*partition.group.as_bytes()),
+            replica_node_id: NodeId::from_bytes(*local.broker.as_bytes()),
+            volume_id: VolumeId::from_bytes(*store.volume.as_bytes()),
+            store_id: StoreId::from_bytes(*store.store.as_bytes()),
+            store_generation: store.generation,
+        };
+        let settings = limits::Settings::new(checked, placement)?;
+        let config = match checked.identity.topic(&placement.topic)?.confirmation {
+            Confirmation::LocalDurable => {
+                let configuration = local::Configuration::new(
+                    identity.group_id,
+                    partition.config_epoch,
+                    identity.replica_node_id,
+                    self.principal(&local.broker)?,
+                )
+                .map_err(|failure| self.error(&failure.to_string()))?;
+                JournalConfig::Local(settings.config(placement, identity, configuration))
+            }
+            policy => {
+                let configuration = self.replicated(identity.group_id, partition, policy)?;
+                JournalConfig::Replicated(settings.config(placement, identity, configuration))
+            }
+        };
+        Ok(PartitionJournal {
+            cluster: checked.identity.cluster,
+            actors: ActorSettings::new(checked, placement, &config)?,
+            placement: placement.clone(),
+            incarnation: PartitionIncarnation::from_bytes(*partition.incarnation.as_bytes()),
+            config,
+        })
+    }
+
+    /// The fixed-three voter configuration under the topic's quorum policy.
+    fn replicated(
+        &self,
+        group: GroupId,
+        partition: &PartitionIdentity,
+        policy: Confirmation,
+    ) -> Result<ConfigurationRecord, StartupError> {
+        let members: [Uuid; 3] = partition
+            .members
+            .clone()
+            .try_into()
+            .map_err(|_| self.error("expected three broker members"))?;
+        let [first, second, third] = members.map(|id| {
+            self.principal(&id).map(|principal| ConfiguredVoter {
+                node_id: NodeId::from_bytes(*id.as_bytes()),
+                principal,
+            })
+        });
+        ConfigurationRecord::with_policy(
+            group,
+            partition.config_epoch,
+            [first?, second?, third?],
+            if policy == Confirmation::DiskQuorum {
+                QuorumPolicy::Durable
+            } else {
+                QuorumPolicy::Replicated
+            },
+        )
+        .map_err(|failure| self.error(&failure.to_string()))
+    }
+
+    fn principal(&self, id: &Uuid) -> Result<Digest, StartupError> {
+        self.principals
+            .get(id)
+            .copied()
+            .ok_or_else(|| self.error("missing broker principal"))
+    }
+
+    fn error(&self, reason: &str) -> StartupError {
+        StartupError::Runtime(format!(
+            "partition {}/{}: {reason}",
+            self.placement.topic, self.placement.partition,
+        ))
     }
 }
 

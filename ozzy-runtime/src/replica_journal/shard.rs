@@ -3,9 +3,10 @@
 
 mod dispatch;
 mod jobs;
+mod owner_work;
 
-use super::commands::{Action, Command};
-use super::{JournalError, OwnedJournal, OwnedWriteStep};
+use super::commands::{Command, Gate};
+use super::{JournalError, OwnedJournal};
 use futures::{
     FutureExt, StreamExt,
     future::LocalBoxFuture,
@@ -50,6 +51,7 @@ pub struct ShardJournal {
     state: Option<Box<State>>,
     active: Option<CommandWork>,
     capacity_wait: Option<LocalBoxFuture<'static, ()>>,
+    poller: super::execution::PollWaker,
     jobs: FuturesUnordered<Job>,
     writes: FuturesOrdered<LocalBoxFuture<'static, super::OwnedCompletedWrite>>,
     completed: VecDeque<Completed>,
@@ -125,52 +127,35 @@ enum Completed {
     Job(Install),
 }
 
-// Always yield once, even with an entirely memory-resident workload. This does
-// not consult a wall clock and also works under a manually polled simulator.
-pub(super) async fn yield_turn() {
-    let mut yielded = false;
-    std::future::poll_fn(|cx| {
-        if yielded {
-            Poll::Ready(())
-        } else {
-            yielded = true;
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        }
-    })
-    .await;
+/// A turn waits for settled writes when it admits and validates in one
+/// command, or when its validation may read storage.
+fn turn_needs_settled(turn: &super::Turn, owner: &OwnedJournal) -> bool {
+    (turn.admit.is_some() && (turn.propose.is_some() || turn.validate.is_some()))
+        || turn
+            .propose
+            .as_ref()
+            .is_some_and(|(_, buffer)| owner.validation_may_read(&buffer.0))
+        || turn
+            .validate
+            .as_ref()
+            .is_some_and(|(_, buffer)| owner.validation_may_read(buffer))
 }
 
-fn needs_settled_writes(action: &Action, owner: &OwnedJournal) -> bool {
-    matches!(
-        action,
-        Action::Retention { .. }
-            | Action::Promise { .. }
-            | Action::Sync { .. }
-            | Action::CaptureHistory { .. }
-            | Action::BeginInstall { .. }
-            | Action::FinishInstall { .. }
-            | Action::AbortInstall { .. }
-            | Action::Activate { .. }
-            | Action::CleanupOrphans { .. }
-            | Action::CleanupMetadata { .. }
-            | Action::ValidateStorage { .. }
-            | Action::Recovery(super::recovery::RecoveryAction::Pin { .. })
-    ) || match action {
-        Action::Propose { buffer, .. } => owner.validation_may_read(&buffer.0),
-        Action::Validate { buffer, .. } => owner.validation_may_read(buffer),
-        Action::Turn { turn, .. } => {
-            (turn.admit.is_some() && (turn.propose.is_some() || turn.validate.is_some()))
-                || turn
-                    .propose
-                    .as_ref()
-                    .is_some_and(|(_, buffer)| owner.validation_may_read(&buffer.0))
-                || turn
-                    .validate
-                    .as_ref()
-                    .is_some_and(|(_, buffer)| owner.validation_may_read(buffer))
-        }
-        _ => false,
+/// The owner state taken for one admitted command.
+pub(super) struct Admitted<'a> {
+    journal: &'a mut ShardJournal,
+    state: Box<State>,
+}
+
+impl Admitted<'_> {
+    /// Run the command. Pure owner work completes in the call. A suspended
+    /// file operation is retained and wakes the partition that last polled.
+    pub(super) fn start(self, command: Command) {
+        let Self { journal, state } = self;
+        journal.idle = false;
+        journal.active = Some(dispatch::run(state, command, (journal.timestamp)()).boxed_local());
+        let waker = journal.poller.waker();
+        journal.poll_active(&mut Context::from_waker(&waker));
     }
 }
 
@@ -191,6 +176,7 @@ impl ShardJournal {
             })),
             active: None,
             capacity_wait: None,
+            poller: super::execution::PollWaker::new(),
             jobs: FuturesUnordered::new(),
             writes: FuturesOrdered::new(),
             completed: VecDeque::with_capacity(config.commands + config.write_depth),
@@ -213,11 +199,7 @@ impl ShardJournal {
         partition: ozzy_proto::PartitionIncarnation,
         from: Option<ozzy_proto::Offset>,
     ) -> Result<super::PartitionReadCursor, JournalError> {
-        self.state
-            .as_ref()
-            .expect("available journal owner")
-            .owner
-            .open_reader(ticket, partition, from)
+        self.idle_owner()?.open_reader(ticket, partition, from)
     }
     pub(super) fn coordinator_group(
         &self,
@@ -225,12 +207,18 @@ impl ShardJournal {
         coordinator: ozzy_proto::PartitionIncarnation,
         name: &str,
     ) -> Result<Option<std::sync::Arc<ozzy_core::state::CoordinatorGroup>>, JournalError> {
-        self.state
-            .as_ref()
-            .expect("available journal owner")
-            .owner
+        self.idle_owner()?
             .coordinator_group(ticket, coordinator, name)
     }
+    /// The owner, unless a command holds it. A held owner is busy; the caller
+    /// retries on its next turn.
+    fn idle_owner(&self) -> Result<&OwnedJournal, JournalError> {
+        self.state
+            .as_ref()
+            .map(|state| &state.owner)
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::WouldBlock).into())
+    }
+
     pub(super) fn available(&self) -> usize {
         usize::from(
             !self.is_closed()
@@ -262,10 +250,16 @@ impl ShardJournal {
     }
     /// Whether a retirement still runs its job or awaits installation. A
     /// command holding the owner counts as busy.
-    pub(super) fn retiring(&self) -> bool {
+    pub(super) fn retention_busy(&self) -> bool {
         self.state
             .as_ref()
-            .is_none_or(|state| state.owner.retiring())
+            .is_none_or(|state| state.owner.retention_busy())
+    }
+    /// Whether a cleanup job runs. A command holding the owner counts as busy.
+    pub(super) fn cleaning(&self) -> bool {
+        self.state
+            .as_ref()
+            .is_none_or(|state| state.owner.cleaning())
     }
     pub(super) fn validation_ready(&self, buffer: &super::AppendBuffer) -> bool {
         use crate::profiling::{Event, event};
@@ -287,50 +281,39 @@ impl ShardJournal {
         }
         true
     }
-    #[expect(
-        clippy::result_large_err,
-        reason = "refusal returns caller-owned buffers without allocating"
-    )]
-    pub(super) fn submit(&mut self, mut command: Command) -> Result<(), Command> {
+    /// Take the owner for one command when its gate lets it start now. An
+    /// available owner is never rolling.
+    pub(super) fn admit(&mut self, gate: Gate<'_>) -> Option<Admitted<'_>> {
         if self.available() == 0 {
-            return Err(command);
+            return None;
         }
         let settled = self.settled();
-        let state = self.state.as_mut().expect("available owner");
-        let capacity = match &mut command.action {
-            Action::Admit { validated, .. } => state.owner.can_admit(validated),
-            Action::Turn { turn, .. } => turn
-                .admit
-                .as_mut()
-                .is_none_or(|(_, validated)| state.owner.can_admit(validated)),
-            _ => true,
+        let owner = &self.state.as_ref()?.owner;
+        let (capacity, settle) = match gate {
+            Gate::Free => (true, false),
+            Gate::Settled => (true, true),
+            Gate::Validate(buffer) => (true, owner.validation_may_read(buffer)),
+            Gate::Admit(validated) => (owner.can_admit(validated), false),
+            Gate::Turn(turn) => (
+                turn.admit
+                    .as_mut()
+                    .is_none_or(|(_, validated)| owner.can_admit(validated)),
+                turn_needs_settled(turn, owner),
+            ),
         };
-        if (!capacity || needs_settled_writes(&command.action, &state.owner)) && !settled
-            || (matches!(command.action, Action::BeginPipelinedSync { .. }) && state.rolling)
-        {
-            if !settled {
-                crate::profiling::event(if capacity {
-                    crate::profiling::Event::JournalSettleWait
-                } else {
-                    crate::profiling::Event::JournalCapacityWait
-                });
-            }
-            return Err(command);
+        if (!capacity || settle) && !settled {
+            crate::profiling::event(if capacity {
+                crate::profiling::Event::JournalSettleWait
+            } else {
+                crate::profiling::Event::JournalCapacityWait
+            });
+            return None;
         }
-        self.idle = false;
-        self.active = Some(
-            dispatch::run(
-                self.state.take().expect("available owner"),
-                command,
-                (self.timestamp)(),
-            )
-            .boxed_local(),
-        );
-        // Pure owner work completes in the call. A suspended file operation is
-        // retained here and receives the actor's real waker on its next poll.
-        let mut cx = Context::from_waker(std::task::Waker::noop());
-        self.poll_active(&mut cx);
-        Ok(())
+        let state = self.state.take()?;
+        Some(Admitted {
+            journal: self,
+            state,
+        })
     }
     fn poll_active(&mut self, cx: &mut Context<'_>) -> bool {
         let Some(active) = &mut self.active else {
@@ -348,11 +331,8 @@ impl ShardJournal {
         cx.waker().wake_by_ref();
         true
     }
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one bounded owner progress and shutdown turn"
-    )]
     pub(super) fn poll_finished(&mut self, cx: &mut Context<'_>) -> Poll<bool> {
+        self.poller.observe(cx);
         if self.finished {
             return Poll::Ready(self.failed);
         }
@@ -363,166 +343,71 @@ impl ShardJournal {
             return Poll::Ready(self.failed);
         }
         for _ in 0..self.config.turn_steps {
-            if let Some(state) = &mut self.state {
-                if let Some(done) = self.completed.pop_front() {
-                    self.failed |= match done {
-                        Completed::Write(done) => match state.owner.complete_write(done) {
-                            Ok(_) => false,
-                            Err(error) => {
-                                super::commands::fault_log(&error);
-                                true
-                            }
-                        },
-                        Completed::Job(install) => install(state),
-                    };
-                    self.failed |= state.owner.is_faulted();
+            if self.state.is_some() {
+                if self.step_owner() {
                     continue;
                 }
-                if let Some(work) = state.owner.take_retirement_work() {
-                    self.jobs.push(
-                        async move {
-                            let done = Box::pin(work.run()).await;
-                            Box::new(move |state: &mut State| {
-                                state.owner.complete_retirement(done);
-                                false
-                            }) as Install
-                        }
-                        .boxed_local(),
-                    );
-                    continue;
-                }
-                self.idle = self.failed;
-                // Retirement installs with one manifest publication between
-                // writes, like a roll: no new write starts until in-flight
-                // writes drain. Its file work already ran as a job.
-                let retiring = !self.failed && state.owner.retirement_ready();
-                if retiring && self.writes.is_empty() && !state.sync_busy && !state.rolling {
-                    let mut state = self.state.take().expect("available owner");
-                    self.active = Some(
-                        async move {
-                            let failed = match state.owner.finish_retirement().await {
-                                Ok(_) => false,
-                                Err(error) => {
-                                    super::commands::fault_log(&error);
-                                    true
-                                }
-                            };
-                            (state, None, failed)
-                        }
-                        .boxed_local(),
-                    );
-                    continue;
-                }
-                if !self.failed && !retiring && self.writes.len() < self.config.write_depth {
-                    match state.owner.prepare_write() {
-                        Ok(OwnedWriteStep::Idle) => self.idle = true,
-                        Ok(OwnedWriteStep::Write(work)) => {
-                            self.writes.push_back(
-                                async move {
-                                    let started = crate::profiling::start();
-                                    let done = work.write().await;
-                                    crate::profiling::finish(
-                                        crate::profiling::Stage::JournalPhysicalWrite,
-                                        started,
-                                    );
-                                    done
-                                }
-                                .boxed_local(),
-                            );
-                            continue;
-                        }
-                        Ok(OwnedWriteStep::RollRequired)
-                            if self.writes.is_empty() && !state.sync_busy =>
-                        {
-                            match state.owner.begin_roll(self.config.roll_probes) {
-                                Ok(work) => {
-                                    state.rolling = true;
-                                    self.jobs.push(
-                                        async move {
-                                            let done = work.publish().await;
-                                            Box::new(move |state: &mut State| {
-                                                state.rolling = false;
-                                                state.owner.complete_roll(done).is_err()
-                                            })
-                                                as Install
-                                        }
-                                        .boxed_local(),
-                                    );
-                                }
-                                Err(_) => self.failed = true,
-                            }
-                            continue;
-                        }
-                        Ok(OwnedWriteStep::Waiting | OwnedWriteStep::RollRequired) => {}
-                        Err(_) => {
-                            self.failed = true;
-                            continue;
-                        }
-                    }
-                }
-                if !self.failed
-                    && !state.sync_busy
-                    && self.writes.is_empty()
-                    && state.owner.identity_refresh_due()
-                {
-                    let mut state = self.state.take().expect("available owner");
-                    self.active = Some(
-                        async move {
-                            let failed = state.owner.refresh_settled_identities().await.is_err();
-                            (state, None, failed)
-                        }
-                        .boxed_local(),
-                    );
-                    continue;
-                }
-                if (self.closing || self.failed)
-                    && self.idle
-                    && self.jobs.is_empty()
-                    && self.writes.is_empty()
-                {
+                if self.drained() {
                     if self.retain && !self.failed {
                         self.finished = true;
                         return Poll::Ready(false);
                     }
-                    let state = self.state.take().expect("settled owner");
-                    self.shutdown =
-                        Some(async move { state.owner.shutdown().await.is_err() }.boxed_local());
-                    return self.poll_finished(cx);
-                }
-            }
-            let mut progressed = self.poll_active(cx);
-            if let Poll::Ready(Some(done)) = self.writes.poll_next_unpin(cx) {
-                self.completed.push_back(Completed::Write(done));
-                progressed = true;
-            }
-            if let Poll::Ready(Some(done)) = self.jobs.poll_next_unpin(cx) {
-                self.completed.push_back(Completed::Job(done));
-                progressed = true;
-            }
-            if !progressed {
-                if self.capacity_wait.is_none() {
-                    self.capacity_wait = self
-                        .state
-                        .as_ref()
-                        .and_then(|state| state.owner.validation_memory_wait())
-                        .map(FutureExt::boxed_local);
-                }
-                if self
-                    .capacity_wait
-                    .as_mut()
-                    .is_some_and(|wait| wait.as_mut().poll(cx).is_ready())
-                {
-                    self.capacity_wait = None;
-                    if let Some(state) = &self.state {
-                        state.owner.clear_validation_memory_wait();
+                    if let Some(state) = self.state.take() {
+                        self.shutdown = Some(
+                            async move { state.owner.shutdown().await.is_err() }.boxed_local(),
+                        );
+                        return self.poll_finished(cx);
                     }
-                    cx.waker().wake_by_ref();
                 }
+            }
+            if !self.poll_progress(cx) {
+                self.poll_capacity_wait(cx);
                 return Poll::Pending;
             }
         }
         cx.waker().wake_by_ref();
         Poll::Pending
+    }
+
+    /// Closing or failed with no owner work left to start or finish.
+    fn drained(&self) -> bool {
+        (self.closing || self.failed) && self.idle && self.jobs.is_empty() && self.writes.is_empty()
+    }
+
+    /// Poll held, write, and job work once. `true` when any of it finished.
+    fn poll_progress(&mut self, cx: &mut Context<'_>) -> bool {
+        let mut progressed = self.poll_active(cx);
+        if let Poll::Ready(Some(done)) = self.writes.poll_next_unpin(cx) {
+            self.completed.push_back(Completed::Write(done));
+            progressed = true;
+        }
+        if let Poll::Ready(Some(done)) = self.jobs.poll_next_unpin(cx) {
+            self.completed.push_back(Completed::Job(done));
+            progressed = true;
+        }
+        progressed
+    }
+
+    /// Wake once validation memory frees up, so a waiting owner is not lost.
+    fn poll_capacity_wait(&mut self, cx: &mut Context<'_>) {
+        if self.capacity_wait.is_none() {
+            self.capacity_wait = self
+                .state
+                .as_ref()
+                .and_then(|state| state.owner.validation_memory_wait())
+                .map(FutureExt::boxed_local);
+        }
+        if self
+            .capacity_wait
+            .as_mut()
+            .is_some_and(|wait| wait.as_mut().poll(cx).is_ready())
+        {
+            self.capacity_wait = None;
+            if let Some(state) = &self.state {
+                state.owner.clear_validation_memory_wait();
+            }
+            cx.waker().wake_by_ref();
+        }
     }
 }
 

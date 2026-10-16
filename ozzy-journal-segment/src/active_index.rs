@@ -8,7 +8,7 @@ use crate::{
     INDEX_HEADER_BYTES, IndexFileError, IndexLimits, IndexSource, MESSAGE_INDEX_ENTRY_BYTES,
     MessageIndexEntry, OFFSET_INDEX_ENTRY_BYTES, OPERATION_INDEX_ENTRY_BYTES,
     OPERATION_LOCATION_BYTES, OffsetIndexEntry, OperationIndexEntry, OperationLocation,
-    SegmentIndexImage, SegmentScan,
+    SealedSegment, SegmentIndexImage, SegmentScan,
 };
 
 mod building;
@@ -88,28 +88,10 @@ impl ActiveSegmentIndex {
                 }
             }
             ozzy_proto::reader::Start::Timestamp(timestamp) => {
-                let at_floor = self.find_offset(query.partition, query.retained_from);
-                for head in self.image.offsets().iter().filter(|entry| {
-                    entry.partition == query.partition
-                        && entry.location.record_index == 0
-                        && entry.append_timestamp_millis >= timestamp
-                        && entry.location.operation.op_number <= query.through
-                        && entry.offset < query.confirmed_end
-                }) {
-                    let offset = if head.offset >= query.retained_from {
-                        Some(head.offset)
-                    } else {
-                        at_floor
-                            .filter(|entry| {
-                                entry.location.operation == head.location.operation
-                                    && entry.location.batch_index == head.location.batch_index
-                            })
-                            .map(|_| query.retained_from)
-                    };
-                    if let Some(offset) = offset {
-                        result.observe_match(offset);
-                        break;
-                    }
+                let offsets = self.image.offsets().iter().copied();
+                let find = |partition, offset| self.find_offset(partition, offset);
+                if let Some(offset) = query.timestamp_offset(timestamp, offsets, find) {
+                    result.observe_match(offset);
                 }
             }
             _ => {}
@@ -117,6 +99,7 @@ impl ActiveSegmentIndex {
     }
 
     /// Build through one exact operation, ignoring later complete physical groups.
+    #[cfg(test)]
     pub(crate) fn build(
         scan: &SegmentScan<'_>,
         through_op: u64,
@@ -132,8 +115,10 @@ impl ActiveSegmentIndex {
         }
         let Some(source) = entries.source(
             &scan.header,
-            scan.valid_bytes,
-            scan.digest,
+            SealedSegment {
+                valid_bytes: scan.valid_bytes,
+                digest: scan.digest,
+            },
             through_op,
             None,
         )?
@@ -162,8 +147,10 @@ impl ActiveSegmentIndex {
         }
         let Some(source) = entries.source(
             &scan.header,
-            scan.valid_bytes,
-            scan.digest,
+            SealedSegment {
+                valid_bytes: scan.valid_bytes,
+                digest: scan.digest,
+            },
             through_op,
             None,
         )?
@@ -176,18 +163,17 @@ impl ActiveSegmentIndex {
     }
 
     /// Index groups through `through_op`, continuing `prefix` when the reader
-    /// resumed after it. With `keep`, a scan that indexed every operation also
-    /// returns the prefix for the next build of this segment.
+    /// resumed after it. A scan that indexed every operation also returns the
+    /// prefix for the next build of this segment.
     pub(crate) async fn build_groups(
         mut groups: Box<crate::directory::asynchronous::groups::Groups>,
         prefix: Option<ActivePrefix>,
-        keep: bool,
         through_op: u64,
         operations: OperationLimits,
         limits: IndexLimits,
     ) -> Result<(Option<std::rc::Rc<Self>>, Option<ActivePrefix>), crate::JournalIndexError> {
         let header = groups.header().clone();
-        let (valid_bytes, digest) = groups.boundary();
+        let boundary = groups.boundary();
         let base = prefix
             .filter(|_| groups.resumed())
             .and_then(|prefix| prefix.index);
@@ -204,10 +190,10 @@ impl ActiveSegmentIndex {
                 }
             }
         }
-        let resume = groups.resume().filter(|_| keep && complete);
+        let resume = groups.resume().filter(|_| complete);
         groups.finish().await?;
         let base_image = base.as_deref().map(|base| &base.image);
-        let index = match entries.source(&header, valid_bytes, digest, through_op, base_image)? {
+        let index = match entries.source(&header, boundary, through_op, base_image)? {
             None => None,
             Some(source)
                 if entries.is_empty()

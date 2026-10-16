@@ -75,7 +75,7 @@ impl OwnedJournal {
         let replacement = identities.handoff(snapshot).await?;
         self.images
             .as_mut()
-            .expect("active image checked")
+            .ok_or(JournalError::CompletionMismatch)?
             .replace_settled_identity_index(self.applied.op.0, replacement)?;
         self.faulted = false;
         Ok(())

@@ -1,3 +1,13 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
+
 use bytes::Bytes;
 use ozzy_journal::operation::{
     Append, AppendBatch, AppendRecordList, OperationBody, OperationLimits, append_operation_body,
@@ -6,7 +16,7 @@ use ozzy_journal::operation::{
 use ozzy_proto::data::{Authority, DataLimits, Encoding, IndexedRecords, Record, RecordBatch};
 use ozzy_proto::reader::{self, RecordHeader, Source, Subscription};
 use ozzy_proto::{
-    Envelope, GroupId, LinkSessionId, MessageId, NodeId, Offset, Opcode, OwnerEpoch,
+    Envelope, Frames, GroupId, LinkSessionId, MessageId, NodeId, Offset, Opcode, OwnerEpoch,
     PartitionIncarnation, ProducerEpoch, ProducerId, ProducerSequence, RequestId, SubscriptionId,
 };
 
@@ -56,8 +66,10 @@ fn input() -> RecordBatch {
             first_offset: 0,
         },
         &records,
-        &mut metadata,
-        &mut payload,
+        Frames {
+            metadata: &mut metadata,
+            payload: &mut payload,
+        },
         limits,
     )
     .unwrap();
@@ -94,8 +106,8 @@ fn received_spans_match_general_encoding_across_partial_mixed_and_tiny_ranges() 
     let general = RecordBatch::General(wire.clone().into_owned());
     for start in 0..wire.len() {
         for end in start + 1..=wire.len() {
-            let expected = body(AppendRecordList::batch(&general, start..end));
-            let mut selected = AppendRecordList::batch(&wire, start..start + 1);
+            let expected = body(AppendRecordList::batch(&general, start..end).unwrap());
+            let mut selected = AppendRecordList::batch(&wire, start..start + 1).unwrap();
             selected.extend_batch(&wire, start + 1..end).unwrap();
             let encoded = body(selected);
             for limits in [
@@ -133,7 +145,7 @@ fn received_spans_match_general_encoding_across_partial_mixed_and_tiny_ranges() 
                 }
             }
             // Mixed representations use the ordinary codec with identical bytes.
-            let mut mixed = AppendRecordList::batch(&wire, start..start + 1);
+            let mut mixed = AppendRecordList::batch(&wire, start..start + 1).unwrap();
             mixed.extend_batch(&general, start + 1..end).unwrap();
             assert_eq!(
                 encode_operation_body(&body(mixed), OperationLimits::default()).unwrap(),

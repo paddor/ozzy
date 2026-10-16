@@ -1,10 +1,10 @@
 use std::any::Any;
-use std::fmt;
 use std::sync::{
     Arc, OnceLock, Weak,
     atomic::{AtomicBool, Ordering},
 };
 use std::task::Waker;
+use std::{fmt, io};
 
 /// A reference to backend-owned state, never a file descriptor. Dropping the
 /// last reference only wakes its backend. It performs no file close or wait.
@@ -70,14 +70,15 @@ impl HandleOwner {
 
     /// Bind a backend resource without transferring its ownership to the
     /// application handle. Only backend workers may upgrade this weak link.
-    pub fn bind<T: Any + Send + Sync>(&self, handle: &Handle, resource: &Arc<T>) {
-        assert!(self.key(handle).is_some(), "foreign handle binding");
+    /// Fails for a foreign handle or one that is already bound.
+    pub fn bind<T: Any + Send + Sync>(&self, handle: &Handle, resource: &Arc<T>) -> io::Result<()> {
+        self.key(handle).ok_or(io::ErrorKind::InvalidInput)?;
         let erased: Arc<dyn Any + Send + Sync> = resource.clone();
         handle
             .0
             .resource
             .set(Arc::downgrade(&erased))
-            .expect("handle resource bound once");
+            .map_err(|_| io::ErrorKind::AlreadyExists.into())
     }
 
     /// Resolve a still-open backend resource. The second live check fences a
@@ -92,9 +93,11 @@ impl HandleOwner {
     }
 
     /// Fence new resolutions before the backend drops its strong resource.
-    pub fn invalidate(&self, handle: &Handle) {
-        assert!(self.key(handle).is_some(), "foreign handle invalidation");
+    /// Fails for a foreign handle.
+    pub fn invalidate(&self, handle: &Handle) -> io::Result<()> {
+        self.key(handle).ok_or(io::ErrorKind::InvalidInput)?;
         handle.0.live.store(false, Ordering::Release);
+        Ok(())
     }
 }
 

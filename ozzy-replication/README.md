@@ -1,25 +1,38 @@
 # ozzy-replication
 
-Sans-I/O replication and recovery cores. Fixed three-broker groups support disk
-quorum and replicated-persisting; `local` supplies explicit single-broker durable
-authority. Runtime, transport and physical file execution live outside this crate.
+Sans-I/O replication and recovery cores for
+[Ozzy](https://github.com/paddor/ozzy) partitions. Runtime, transport, and file
+execution live outside this crate. Applications use the
+[`ozzy`](https://github.com/paddor/ozzy/blob/main/ozzy/README.md) SDK.
 
-| Module | Owns |
+## Owns
+
+- Fixed three-broker groups for disk quorum and replicated-persisting:
+  ordered operations, digest chains, votes, commit, and application.
+- Elections: contact deadlines, durable promises, and view installation.
+- Bounded retention, volatile receipts, probes, and gap repair.
+- Recovery of a broker that lost its store, from two other brokers.
+- Single durable authority with no quorum or election.
+- Native replica message codecs.
+
+## Entry points
+
+| Item | Use |
 | --- | --- |
-| Normal core | Ordered canonical operations, digest chains, eligible votes, commit and application |
-| `driver` | Normal/election scheduling, contact deadlines, durable promises and view installation |
-| `flow` | Bounded local retention, volatile receipts, correlated probes and gap repair |
-| `recovery` | Fresh two-peer authority, frozen donor prefixes and nonvoting lost-store recovery |
-| `local` | Local written/durable/applied frontiers with no quorum or election |
-| `wire` | Bounded native replica codecs and borrowed operation bodies |
+| `NormalReplica` | Normal-operation core of one group |
+| `driver::ReplicaDriver` | Normal and election scheduling |
+| `flow::{Sender, Receiver, Transmitter, ProbeScheduler}` | Retention, receipts, probes, and repair |
+| `recovery::Recovery` | Lost-store recovery admission |
+| `local::Driver` | Single durable authority |
+| `wire` | Replica message codecs |
+| `Configuration`, `QuorumPolicy` | Group membership and confirmation policy |
 
-Disk quorum requires exact durable copies on two brokers. Replicated-persisting
-requires validated retained copies on two brokers while bounded persistence drains.
-Receipts/probes schedule repair; they are neither votes nor remote grants. A full
-local backlog creates pressure without changing the confirmation policy.
+The broker adapter in `ozzy-runtime` (`replica_actor`) owns the sockets and
+partition journals.
 
-The broker adapter owns PUB/SUB replication and PEER control/repair sockets.
-It composes the cores with partition-owned async journals and checkpoint
-transfer. Membership changes and online partition movement are not implemented.
-See [replication](https://github.com/paddor/ozzy/blob/main/doc/REPLICATION.md) for authority, election, and recovery
-contracts, and [protocol](https://github.com/paddor/ozzy/blob/main/doc/PROTOCOL.md) for messages.
+## Docs
+
+- [Replication](https://github.com/paddor/ozzy/blob/main/doc/REPLICATION.md):
+  authority, voting, elections, recovery, and limits.
+- [Protocol](https://github.com/paddor/ozzy/blob/main/doc/PROTOCOL.md): replica
+  messages.

@@ -1,6 +1,6 @@
 use super::{
     Admission, AppendDisposition, AppendOutcome, AttemptOperation, Boundary, Entry, Error, Index,
-    Match, MessageId, Offset, Pending, PreparedAdmission, memory,
+    Match, MessageId, Offset, Pending, PreparedAdmission, memory, try_vec,
 };
 
 impl Index {
@@ -76,24 +76,14 @@ impl Index {
         if first_offset != self.accepted_end {
             return Err(Error::Offset);
         }
-        if operations.len() > self.limits.pending_operations - self.boundaries.len() {
-            return Err(Error::PendingCapacity);
-        }
         let attempts = operations.iter().try_fold(0_usize, |count, operation| {
             if operation.ids.len() > self.limits.batch_records {
                 return Err(Error::Batch);
             }
             count.checked_add(operation.ids.len()).ok_or(Error::Batch)
         })?;
-        self.reset_scratch();
-        let mut outcomes = Vec::new();
-        outcomes
-            .try_reserve_exact(attempts)
-            .map_err(|_| Error::Allocation)?;
-        let mut boundaries = smallvec::SmallVec::new();
-        boundaries
-            .try_reserve_exact(operations.len())
-            .map_err(|_| Error::Allocation)?;
+        let mut boundaries = self.begin_preparation(operations.len())?;
+        let mut outcomes = try_vec(attempts)?;
         let mut next = first_offset;
         let mut pending_original = None;
         let mut operation = self.accepted_operation;
@@ -115,12 +105,7 @@ impl Index {
                 attempt_end: outcomes.len(),
             });
         }
-        self.check_capacity(self.scratch_rows.len())?;
-        let mut entries = Vec::new();
-        entries
-            .try_reserve_exact(self.scratch_rows.len())
-            .map_err(|_| Error::Allocation)?;
-        entries.extend_from_slice(&self.scratch_rows);
+        let entries = self.take_scratch_rows()?;
         Ok(PreparedAdmission {
             owner: self.owner.clone(),
             accepted_operation: self.accepted_operation,
@@ -196,6 +181,31 @@ impl Index {
             outcomes.push(outcome);
         }
         Ok(next)
+    }
+
+    /// Start preparing `operations` canonical operations: they must fit the
+    /// pending boundaries, and the scratch table starts empty.
+    pub(super) fn begin_preparation(
+        &mut self,
+        operations: usize,
+    ) -> Result<smallvec::SmallVec<[Boundary; 1]>, Error> {
+        if operations > self.limits.pending_operations - self.boundaries.len() {
+            return Err(Error::PendingCapacity);
+        }
+        self.reset_scratch();
+        let mut boundaries = smallvec::SmallVec::new();
+        boundaries
+            .try_reserve_exact(operations)
+            .map_err(|_| Error::Allocation)?;
+        Ok(boundaries)
+    }
+
+    /// Copy the prepared scratch rows once the image can hold them.
+    pub(super) fn take_scratch_rows(&mut self) -> Result<Vec<Pending>, Error> {
+        self.check_capacity(self.scratch_rows.len())?;
+        let mut entries = try_vec(self.scratch_rows.len())?;
+        entries.extend_from_slice(&self.scratch_rows);
+        Ok(entries)
     }
 
     pub(super) fn check_capacity(&self, unique: usize) -> Result<(), Error> {

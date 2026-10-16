@@ -9,6 +9,7 @@ confirmation = "disk-quorum"
 peer = "tcp://127.0.0.1:7200"
 data_peer = "tcp://127.0.0.1:7203"
 reader_pub = "tcp://127.0.0.1:7201"
+follower_pub = "tcp://127.0.0.1:7202"
 
 [brokers.broker-0.devices.ssd]
 root = "/var/tmp/ozzy-three/broker-0"
@@ -30,6 +31,7 @@ device = "ssd"
 peer = "tcp://127.0.0.1:7210"
 data_peer = "tcp://127.0.0.1:7213"
 reader_pub = "tcp://127.0.0.1:7211"
+follower_pub = "tcp://127.0.0.1:7212"
 
 [brokers.broker-1.devices.ssd]
 root = "/var/tmp/ozzy-three/broker-1"
@@ -51,6 +53,7 @@ device = "ssd"
 peer = "tcp://127.0.0.1:7220"
 data_peer = "tcp://127.0.0.1:7223"
 reader_pub = "tcp://127.0.0.1:7221"
+follower_pub = "tcp://127.0.0.1:7222"
 
 [brokers.broker-2.devices.ssd]
 root = "/var/tmp/ozzy-three/broker-2"

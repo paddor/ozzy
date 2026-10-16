@@ -81,7 +81,8 @@ impl Progress {
         if self.transition.load(Ordering::Acquire) != SEALED {
             return None;
         }
-        let failure = self.failure.get().expect("failure precedes terminal seal");
+        // Failure precedes the terminal seal.
+        let failure = self.failure.get()?;
         // The terminal seal follows any publisher that won admission before it.
         if target <= self.confirmed() {
             Some(Ok(()))
@@ -116,7 +117,7 @@ impl Progress {
             .compare_exchange(0, PUBLISHING, Ordering::Acquire, Ordering::Acquire)
             .map_err(|state| {
                 assert_ne!(state & SEALED, 0, "one confirmation publisher");
-                self.failure.get().expect("failure precedes seal").clone()
+                self.failure.get().cloned().unwrap_or(WriterError::Closed)
             })?;
         let publication = Publication(self);
         let retired = retire(count);

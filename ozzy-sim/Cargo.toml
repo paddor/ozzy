@@ -71,11 +71,3 @@ path = "tests/lifecycle.rs"
 [[test]]
 name = "ozzy_replication"
 path = "tests/replication.rs"
-
-[[test]]
-name = "ozzy_segment_replay"
-path = "tests/segment_replay.rs"
-
-[[test]]
-name = "ozzy_view_change_storage"
-path = "tests/view_change_storage.rs"

@@ -2,9 +2,9 @@ use super::*;
 use crate::{
     dispatch::{Budget, Budgets, Class},
     frontend::{
-        Access, DataInput, DataReceiver, Dispatcher, DispatcherLimits, Kind, LinkIds, LinkSessions,
-        Placement, Port, ReceiveBuffers, ReceiveStorage, ReplyError, ReplyLimits, RoutingTable,
-        Service, data_channel,
+        Access, DataInput, DataLaneLimits, DataReceiver, Dispatcher, DispatcherLimits, Kind,
+        LinkIds, LinkSessions, Placement, Port, ReceiveBuffers, ReceiveStorage, ReplyError,
+        ReplyLimits, RoutingTable, Service, data_channel,
     },
     replica_actor::{PartitionActor, PartitionActors},
     replica_transport::QueueLimits,
@@ -56,9 +56,11 @@ fn service(local: NodeId, group: GroupId) -> (Service, TestInput) {
         7,
         Kind::Client,
         Class::Data,
-        4,
-        8192,
-        65536,
+        DataLaneLimits {
+            slots: 4,
+            maximum_retained_bytes: 8192,
+            retained_budget_bytes: 65536,
+        },
     )
     .unwrap();
     let (control, control_rx) = data_channel(
@@ -66,9 +68,11 @@ fn service(local: NodeId, group: GroupId) -> (Service, TestInput) {
         7,
         Kind::Client,
         Class::Control,
-        4,
-        8192,
-        65536,
+        DataLaneLimits {
+            slots: 4,
+            maximum_retained_bytes: 8192,
+            retained_budget_bytes: 65536,
+        },
     )
     .unwrap();
     let routes = crate::frontend::RoutingTable::new(
@@ -143,7 +147,7 @@ impl Frontend {
             .wait_connected(1, Duration::from_secs(5))
             .await
             .unwrap();
-        let remote = LinkSessions::with_ids(
+        let mut remote = LinkSessions::with_ids(
             link(70, 80).binding.peer,
             link(70, 80).remote,
             handshake::OWNER,

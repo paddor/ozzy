@@ -63,7 +63,8 @@ impl ActorIds {
     pub(super) fn channel(&mut self, scope: Scope) -> Result<Channel, ActorError> {
         Ok(Channel {
             scope,
-            epoch: ReceiveEpoch::new(self.next()?).expect("nonzero ID source"),
+            epoch: ReceiveEpoch::new(self.next()?)
+                .map_err(ozzy_replication::flow::TransmitError::from)?,
         })
     }
 }

@@ -1,8 +1,7 @@
 use super::{
-    ActorError, Context, DataLimits, Envelope, Failure, Message, NodeId, Opcode, PartitionActor,
-    Poll, SharedReaders, Slot, TrySendError, reader_frame, wait,
+    ActorError, Client, Context, Cursor, DataLimits, Delivery, Envelope, Failure, Message, NodeId,
+    Opcode, PartitionActor, Poll, SharedReaders, Slot, TrySendError, Visit, reader_frame,
 };
-use crate::replica_journal::ReplicaJournal;
 use ozzy_proto::reader::{RecordHeader, RecordsEncoder};
 use ozzy_replication::driver::ValidationTicket;
 
@@ -13,30 +12,16 @@ impl SharedReaders {
         cx: &mut Context<'_>,
         send: &mut impl FnMut(&mut Context<'_>, Message) -> Result<(), TrySendError>,
     ) -> Result<bool, ActorError> {
+        self.wake.register(cx.waker());
         self.discard_stale();
-        if self.readiness.as_mut().poll(cx).is_ready() {
-            self.work.drain(|| ());
-            self.readiness = wait(self.work.clone());
-            cx.waker().wake_by_ref();
-        }
         let hint = actor.authority_hint();
         let (ticket, journal) = actor.read_access().ok_or(ActorError::StartupMismatch)?;
-        let observed = ticket.map(|ticket| (ticket.scope(), ticket.generation(), ticket.applied()));
-        if self.observed != observed {
-            let fenced = observed.is_none()
-                || self.observed.is_some_and(|(scope, generation, _)| {
-                    observed.map(|(new_scope, new_generation, _)| (new_scope, new_generation))
-                        != Some((scope, generation))
-                });
-            if fenced {
-                self.slots.clear();
-            }
-            self.observed = observed;
-            self.publication.changed(fenced, ticket.is_some());
-            for slot in &mut self.slots {
-                slot.delivery.schedule.source_changed();
-            }
-        }
+        self.observe(ticket);
+        let mut visit = Visit {
+            local: self.local,
+            ticket,
+            journal,
+        };
         let mut progress = flush(&mut self.rejection, cx, send)?;
         // At most 16 subscriptions make progress per poll. Idle ones cost no
         // budget, so a poll that ends without progress has checked every
@@ -55,20 +40,17 @@ impl SharedReaders {
                 && self.rejection.is_none()
                 && let Some(link) = self.links.get(slot.peer)
             {
-                match output(
-                    slot,
-                    self.local,
-                    self.config.limits.intersection(link.send),
-                    &mut self.metadata,
-                    ticket,
-                    journal,
-                    cx,
-                ) {
+                let limits = self.config.limits.intersection(link.send);
+                match output(slot, &mut visit, limits, &mut self.metadata, cx) {
                     Ok(changed) => served |= changed,
                     Err(error) => {
                         let slot = self.slots.remove(index);
                         self.next = index;
-                        self.reject(slot.peer, slot.delivery.request, link, error, hint)?;
+                        let client = Client {
+                            peer: slot.peer,
+                            link,
+                        };
+                        self.reject(client, slot.delivery.request, error, hint)?;
                         served = true;
                     }
                 }
@@ -78,13 +60,33 @@ impl SharedReaders {
                 budget -= 1;
             }
         }
-        progress |= self
-            .publication
-            .poll(self.local, self.config, ticket, journal, cx, send)?;
+        progress |= self.publication.poll(&mut visit, self.config, cx, send)?;
         if progress {
             cx.waker().wake_by_ref();
         }
         Ok(progress)
+    }
+
+    /// Follow the journal view. Losing it, or a new scope or generation,
+    /// drops every subscription; otherwise each one reschedules its read.
+    fn observe(&mut self, ticket: Option<ValidationTicket>) {
+        let observed = ticket.map(|ticket| (ticket.scope(), ticket.generation(), ticket.applied()));
+        if self.observed == observed {
+            return;
+        }
+        let fenced = observed.is_none()
+            || self.observed.is_some_and(|(scope, generation, _)| {
+                observed.map(|(new_scope, new_generation, _)| (new_scope, new_generation))
+                    != Some((scope, generation))
+            });
+        if fenced {
+            self.slots.clear();
+        }
+        self.observed = observed;
+        self.publication.changed(fenced, ticket.is_some());
+        for slot in &mut self.slots {
+            slot.delivery.schedule.source_changed();
+        }
     }
 }
 
@@ -109,51 +111,30 @@ pub(super) fn flush(
 
 fn output(
     slot: &mut Slot,
-    local: NodeId,
+    visit: &mut Visit<'_>,
     limits: DataLimits,
     metadata: &mut Vec<u8>,
-    ticket: Option<ValidationTicket>,
-    journal: &mut ReplicaJournal,
     cx: &mut Context<'_>,
 ) -> Result<bool, Failure> {
     if slot.reply_due {
-        return open_reply(slot, local, limits, metadata, ticket, journal, cx);
+        return open_reply(slot, visit, limits, metadata, cx);
     }
     let delivery = &mut slot.delivery;
     if !delivery.schedule.is_runnable() {
         return Ok(false);
     }
-    let Some(ticket) = ticket else {
+    let Some(ticket) = visit.ticket else {
         return Err(Failure::new(12));
     };
     let Some(mut payload) = slot.payload.try_take() else {
         return Ok(false);
     };
-    let envelope = Envelope {
-        opcode: Opcode::Records,
-        response: false,
-        request_id: None,
-        sender: local,
-        session: delivery.request.session,
-    };
-    let mut output = RecordsEncoder::new(
-        envelope,
-        RecordHeader {
-            subscription: delivery.subscribe.subscription,
-            source: delivery.source,
-            first_offset: delivery.next,
-        },
-        metadata,
-        &mut payload.body,
-        limits,
-    )
-    .map_err(|_| Failure::new(1))?;
+    let (envelope, header) = records_header(delivery, visit.local);
+    let mut output = RecordsEncoder::new(envelope, header, metadata, &mut payload.body, limits)
+        .map_err(|_| Failure::new(1))?;
     output.allow_shared_payload();
     assert!(delivery.schedule.begin_poll());
-    let more = match delivery
-        .cursor
-        .poll(delivery.source, ticket, journal, &mut output, limits, cx)
-    {
+    let more = match delivery.cursor.poll(ticket, visit.journal, &mut output, cx) {
         Poll::Ready(Ok(state)) => delivery
             .schedule
             .complete(state)
@@ -179,23 +160,38 @@ fn output(
     Ok(true)
 }
 
+/// The RECORDS envelope and header for one subscription's next offset.
+fn records_header(delivery: &Delivery<Cursor>, local: NodeId) -> (Envelope, RecordHeader) {
+    let envelope = Envelope {
+        opcode: Opcode::Records,
+        response: false,
+        request_id: None,
+        sender: local,
+        session: delivery.request.session,
+    };
+    let header = RecordHeader {
+        subscription: delivery.subscribe.subscription,
+        source: delivery.source,
+        first_offset: delivery.next,
+    };
+    (envelope, header)
+}
+
 fn open_reply(
     slot: &mut Slot,
-    local: NodeId,
+    visit: &mut Visit<'_>,
     limits: DataLimits,
     metadata: &mut Vec<u8>,
-    ticket: Option<ValidationTicket>,
-    journal: &mut ReplicaJournal,
     cx: &mut Context<'_>,
 ) -> Result<bool, Failure> {
-    let ticket = ticket.ok_or_else(|| Failure::new(12))?;
+    let ticket = visit.ticket.ok_or_else(|| Failure::new(12))?;
     let delivery = &mut slot.delivery;
     let resolved = match slot.resolved_offset {
         Some(offset) => offset,
         None => match delivery.cursor.poll_open(
             journal_partition(delivery.source)?,
             ticket,
-            journal,
+            visit.journal,
             cx,
         ) {
             Poll::Pending => return Ok(false),
@@ -211,7 +207,7 @@ fn open_reply(
         Envelope {
             opcode: Opcode::Subscribed,
             response: true,
-            sender: local,
+            sender: visit.local,
             ..delivery.request
         },
         ozzy_proto::reader::Subscribed {

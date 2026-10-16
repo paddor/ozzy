@@ -46,7 +46,7 @@ impl Cluster {
     pub(crate) fn with_storage_policy(seed: u64, policy: QuorumPolicy) -> Self {
         let mut cluster = Self::with_policy(seed, policy);
         for replica in &mut cluster.replicas {
-            replica.enable_storage(seed);
+            replica.enable_storage();
         }
         cluster
     }

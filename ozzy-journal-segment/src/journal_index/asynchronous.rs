@@ -67,22 +67,8 @@ impl Snapshot {
     /// only the captured prefix, so later appends or their incomplete tail do
     /// not change an older snapshot's answer.
     pub async fn contains_position(&self, position: LogPosition) -> Result<bool, Error> {
-        if position == LogPosition::GENESIS {
-            return Ok(true);
-        }
-        if position.op_number > self.through.op_number {
-            return Ok(false);
-        }
-        if position.op_number == self.through.op_number {
-            return Ok(position.digest == self.through.digest);
-        }
-        // The selected first segment binds its predecessor, like genesis.
-        if self
-            .references
-            .first()
-            .is_some_and(|first| anchor(first.first_chain) == Some(position))
-        {
-            return Ok(true);
+        if let Some(contained) = self.bounds_contain(position) {
+            return Ok(contained);
         }
         let Some(reference) = self
             .references
@@ -97,6 +83,55 @@ impl Snapshot {
             .map_or((self.active_bytes, self.active_digest), |sealed| {
                 (sealed.valid_bytes, sealed.digest)
             });
+        let image = self.read_prefix(reference, bytes).await?;
+        let scan = scan_segment(
+            &image,
+            reference.first_group_number,
+            reference.first_chain,
+            self.decode,
+        )?;
+        let captured = scan.header.group_id() == self.identity.group_id
+            && scan.header.segment_id() == reference.segment_id
+            && scan.header.capacity() == reference.capacity
+            && scan.valid_bytes == bytes
+            && scan.digest == digest
+            && !matches!(scan.tail, TailState::Truncated { .. });
+        if !captured {
+            return Err(Error::LineageSegmentMismatch(reference.segment_id));
+        }
+        Ok(scan
+            .groups
+            .iter()
+            .flat_map(|group| &group.operations)
+            .find(|operation| operation.op_number == position.op_number)
+            .is_some_and(|operation| operation.digest == position.digest))
+    }
+
+    /// The answer when `position` is genesis, at or past the captured end, or
+    /// the first segment's predecessor; `None` when a segment must be read.
+    fn bounds_contain(&self, position: LogPosition) -> Option<bool> {
+        if position == LogPosition::GENESIS {
+            return Some(true);
+        }
+        if position.op_number > self.through.op_number {
+            return Some(false);
+        }
+        if position.op_number == self.through.op_number {
+            return Some(position.digest == self.through.digest);
+        }
+        // The selected first segment binds its predecessor, like genesis.
+        self.references
+            .first()
+            .is_some_and(|first| anchor(first.first_chain) == Some(position))
+            .then_some(true)
+    }
+
+    /// Read the captured `bytes` prefix of one referenced segment file.
+    async fn read_prefix(
+        &self,
+        reference: &SegmentReference,
+        bytes: u64,
+    ) -> Result<Vec<u8>, Error> {
         let handle = self
             .access
             .open(
@@ -117,27 +152,7 @@ impl Snapshot {
             .read_range(&handle, 0, count, self.chunk)
             .await?;
         self.access.done(Operation::Close { handle }).await?;
-        let scan = scan_segment(
-            &image,
-            reference.first_group_number,
-            reference.first_chain,
-            self.decode,
-        )?;
-        if scan.header.group_id() != self.identity.group_id
-            || scan.header.segment_id() != reference.segment_id
-            || scan.header.capacity() != reference.capacity
-            || scan.valid_bytes != bytes
-            || scan.digest != digest
-            || matches!(scan.tail, TailState::Truncated { .. })
-        {
-            return Err(Error::LineageSegmentMismatch(reference.segment_id));
-        }
-        Ok(scan
-            .groups
-            .iter()
-            .flat_map(|group| &group.operations)
-            .find(|operation| operation.op_number == position.op_number)
-            .is_some_and(|operation| operation.digest == position.digest))
+        Ok(image)
     }
 
     /// Drop sources before `first`, the first segment the same journal still
@@ -315,16 +330,7 @@ impl Snapshot {
                 .iter()
                 .map(|location| location.entry)
                 .collect::<Vec<_>>();
-            let decoded = crate::reader::asynchronous::read_records(
-                &self.access,
-                self.segment_path(location.source.segment_id)?,
-                location.source,
-                &entries,
-                self.decode,
-                self.operations,
-                self.chunk,
-            )
-            .await?;
+            let decoded = self.reader(location.source)?.records(&entries).await?;
             for record in decoded {
                 let bytes = record.payload_bytes();
                 if records.is_empty() && bytes > limits.max_bytes {
@@ -441,15 +447,9 @@ impl Snapshot {
             return Ok(None);
         };
         Ok(Some(
-            crate::reader::asynchronous::read_operation(
-                &self.access,
-                self.segment_path(indexed.source.segment_id)?,
-                indexed.source,
-                indexed.location,
-                self.decode,
-                self.chunk,
-            )
-            .await?,
+            self.reader(indexed.source)?
+                .operation(indexed.location)
+                .await?,
         ))
     }
 
@@ -464,16 +464,9 @@ impl Snapshot {
             return Ok(None);
         };
         Ok(Some(
-            crate::reader::asynchronous::read_control(
-                &self.access,
-                self.segment_path(location.source.segment_id)?,
-                location.source,
-                location.entry,
-                self.decode,
-                self.operations,
-                self.chunk,
-            )
-            .await?,
+            self.reader(location.source)?
+                .control(location.entry)
+                .await?,
         ))
     }
 
@@ -529,16 +522,22 @@ impl Snapshot {
     }
 
     async fn read_location(&self, location: IndexedOffsetLocation) -> Result<IndexedRecord, Error> {
-        Ok(crate::reader::asynchronous::read_record(
-            &self.access,
-            self.segment_path(location.source.segment_id)?,
-            location.source,
-            location.entry,
-            self.decode,
-            self.operations,
-            self.chunk,
-        )
-        .await?)
+        Ok(self.reader(location.source)?.record(location.entry).await?)
+    }
+
+    /// Read extents of one captured segment.
+    fn reader(
+        &self,
+        source: crate::IndexSource,
+    ) -> Result<crate::reader::asynchronous::ExtentReader<'_>, Error> {
+        Ok(crate::reader::asynchronous::ExtentReader {
+            access: &self.access,
+            path: self.segment_path(source.segment_id)?,
+            source,
+            decode: self.decode,
+            operations: self.operations,
+            chunk: self.chunk,
+        })
     }
 }
 

@@ -36,7 +36,9 @@ pub(in crate::replica_journal) fn partition_retry<I: IdentityIndex + Clone>(
     if buffer.len() != 1 || buffer.is_producer() || buffer.owner_generation() != generation {
         return Err(JournalError::AppendMismatch);
     }
-    let operation = buffer.operations().next().expect("one creation operation");
+    let Some(operation) = buffer.operations().next() else {
+        return Err(JournalError::AppendMismatch);
+    };
     let OperationBody::CreatePartition(request) =
         decode_operation_body(operation.kind, operation.body, limits)?
     else {

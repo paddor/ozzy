@@ -2,12 +2,15 @@
 
 use super::sources::{Observation, Sources};
 use crate::{
-    replicated::{BrokerLinkError, ProgressError, RetryPolicy, TopicRoutes, retry::classify},
+    replicated::{
+        BrokerLinkError, ProgressError, RetryPolicy, TopicRoutes, broker_links::OwnerClock,
+        retry::classify,
+    },
     signal::{CloseSignal, StateSignal},
 };
 use futures::{StreamExt, stream::FuturesUnordered};
 use ozzy_proto::{
-    ConsumerGroupId, ConsumerMemberId, Offset, OperationId, PartitionIncarnation,
+    ConsumerGroupId, ConsumerMemberId, GroupId, NodeId, Offset, OperationId, PartitionIncarnation,
     append::Authority,
     group::{self, JoinReply, JoinRequest, Mode, Owned, Start, Status, Target},
 };
@@ -19,6 +22,16 @@ use std::{
     time::Duration,
 };
 use tokio::sync::watch;
+
+mod requests;
+use requests::{assign, join};
+
+/// Placeholder authority; the request helper fills the selected leader's.
+const UNSELECTED: Authority = Authority {
+    group_id: GroupId::from_bytes([0; 16]),
+    config_epoch: 0,
+    view: 0,
+};
 
 /// Source coordinates confirmed by the source leader for one committed target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,9 +70,7 @@ pub(super) struct View {
 
 impl View {
     pub(super) fn targets(&self, partition: PartitionIncarnation, plan_revision: u64) -> bool {
-        self.targets
-            .iter()
-            .any(|target| target.partition == partition && target.plan_revision == plan_revision)
+        find(&self.targets, partition, plan_revision).is_some()
     }
 }
 
@@ -76,6 +87,18 @@ type Joining = Pin<Box<dyn Future<Output = Result<JoinReply, BrokerLinkError>> +
 type Assigning =
     Pin<Box<dyn Future<Output = (Target, Result<group::AssignReply, BrokerLinkError>)> + Send>>;
 
+/// What the membership owner shares with its reader.
+pub(super) struct Channels {
+    /// Committed membership the owner publishes.
+    pub(super) view: watch::Sender<View>,
+    /// Sources the reader still owns.
+    pub(super) sources: watch::Receiver<Vec<Observation>>,
+    /// Closed when the reader leaves the group.
+    pub(super) leave: CloseSignal,
+    /// Signaled on every published change.
+    pub(super) activity: Arc<StateSignal>,
+}
+
 struct ActivationRetry {
     due: Duration,
     backoff: Duration,
@@ -86,11 +109,14 @@ struct ActivationRetry {
 pub(super) fn start(
     routes: TopicRoutes,
     settings: Settings,
-    view: watch::Sender<View>,
-    sources: watch::Receiver<Vec<Observation>>,
-    leave: CloseSignal,
-    activity: Arc<StateSignal>,
+    channels: Channels,
 ) -> tokio::task::JoinHandle<()> {
+    let Channels {
+        view,
+        sources,
+        leave,
+        activity,
+    } = channels;
     let executor = routes.links().runtime().driver().clone();
     executor.spawn(async move {
         let coordinator = routes.metadata().coordinator(&settings.name);
@@ -156,12 +182,7 @@ impl Membership {
         let mut reported = Vec::new();
         loop {
             let seen = activity.generation();
-            if sources.has_changed().unwrap_or(false) {
-                self.sources.replace(&sources.borrow_and_update());
-            }
-            let owned = self
-                .sources
-                .owned(&self.targets, self.generation, clock.now());
+            let owned = self.owned(&mut sources, &clock);
             if reported != owned {
                 reported = owned;
                 if joining.is_none() {
@@ -169,27 +190,10 @@ impl Membership {
                 }
             }
             if joining.is_none() && clock.now() >= due {
-                joining = Some(Box::pin(join(
-                    self.routes.clone(),
-                    self.coordinator.0,
-                    self.request(self.mode, reported.clone()),
-                    self.settings.retry.response_timeout,
-                )));
+                joining = Some(self.start_join(reported.clone()));
             }
             self.activate(&mut assigning, clock.now());
-            let activation_due = self
-                .activation_retries
-                .iter()
-                .filter(|(key, _)| !self.inflight.contains(key))
-                .filter(|((partition, revision), _)| {
-                    self.targets.iter().any(|target| {
-                        target.activatable
-                            && target.partition == *partition
-                            && target.plan_revision == *revision
-                    })
-                })
-                .map(|(_, retry)| retry.due)
-                .min();
+            let activation_due = self.activation_due();
             tokio::select! {
                 biased;
                 () = links.closed() => return Err(Failure::Closed),
@@ -206,7 +210,12 @@ impl Membership {
                         due = clock.now();
                     }
                 }
-                result = async { joining.as_mut().expect("heartbeat").await }, if joining.is_some() => {
+                result = async {
+                    match joining.as_mut() {
+                        Some(joining) => joining.await,
+                        None => std::future::pending().await,
+                    }
+                }, if joining.is_some() => {
                     joining = None;
                     due = self.complete_join(result, &mut assigning, &mut backoff, clock.now())?;
                     self.publish(view, activity);
@@ -216,21 +225,46 @@ impl Membership {
                     self.publish(view, activity);
                 }
                 () = activity.changed_after(seen) => {}
-                () = async {
-                    match activation_due {
-                        Some(deadline) => clock.until(deadline).await,
-                        None => std::future::pending().await,
-                    }
-                } => {}
-                () = async {
-                    match self.sources.deadline() {
-                        Some(deadline) => clock.until(deadline).await,
-                        None => std::future::pending().await,
-                    }
-                } => {}
+                () = clock.until_due(activation_due) => {}
+                () = clock.until_due(self.sources.deadline()) => {}
                 () = clock.until(due), if joining.is_none() => {}
             }
         }
+    }
+
+    /// Take a changed source list, then the sources this reader owns now.
+    fn owned(
+        &mut self,
+        sources: &mut watch::Receiver<Vec<Observation>>,
+        clock: &OwnerClock,
+    ) -> Vec<Owned> {
+        if sources.has_changed().unwrap_or(false) {
+            self.sources.replace(&sources.borrow_and_update());
+        }
+        self.sources
+            .owned(&self.targets, self.generation, clock.now())
+    }
+
+    /// A join or rejoin request reporting the `owned` sources.
+    fn start_join(&self, owned: Vec<Owned>) -> Joining {
+        Box::pin(join(
+            self.routes.clone(),
+            self.coordinator.0,
+            self.request(self.mode, owned),
+            self.settings.retry.response_timeout,
+        ))
+    }
+
+    /// When the earliest retry of a refused activation is due.
+    fn activation_due(&self) -> Option<Duration> {
+        self.activation_retries
+            .iter()
+            .filter(|(key, _)| !self.inflight.contains(key))
+            .filter(|((partition, revision), _)| {
+                find(&self.targets, *partition, *revision).is_some_and(|target| target.activatable)
+            })
+            .map(|(_, retry)| retry.due)
+            .min()
     }
 
     fn complete_join(
@@ -261,9 +295,7 @@ impl Membership {
             Err(error) => {
                 self.retry(self.coordinator.0, error)?;
                 let due = now.saturating_add(*backoff);
-                *backoff = backoff
-                    .saturating_mul(2)
-                    .min(self.settings.retry.max_backoff);
+                *backoff = self.settings.retry.next_backoff(*backoff);
                 Ok(due)
             }
         }
@@ -272,11 +304,7 @@ impl Membership {
     fn request(&self, mode: Mode, owned: Vec<Owned>) -> JoinRequest {
         JoinRequest {
             // The request helper fills the selected coordinator leader.
-            authority: Authority {
-                group_id: ozzy_proto::GroupId::from_bytes([0; 16]),
-                config_epoch: 0,
-                view: 0,
-            },
+            authority: UNSELECTED,
             coordinator: self.coordinator.1,
             name: self.settings.name.clone(),
             member: self.settings.member,
@@ -364,7 +392,7 @@ impl Membership {
                 self.rejoin()?;
                 return Ok(true);
             }
-            Status::Deleted => unreachable!("handled above"),
+            Status::Deleted => return Err(Failure::Deleted),
         };
         let metadata = self.routes.metadata();
         if targets.iter().any(|target| {
@@ -376,11 +404,7 @@ impl Membership {
         }
         self.targets = targets;
         let targets = &self.targets;
-        let current = |partition: PartitionIncarnation, revision: u64| {
-            targets
-                .iter()
-                .any(|target| target.partition == partition && target.plan_revision == revision)
-        };
+        let current = |partition, revision| find(targets, partition, revision).is_some();
         self.activations
             .retain(|&partition, activation| current(partition, activation.plan_revision));
         self.skipped
@@ -412,11 +436,7 @@ impl Membership {
             }
             self.inflight.insert(key);
             let request = group::AssignRequest {
-                authority: Authority {
-                    group_id: ozzy_proto::GroupId::from_bytes([0; 16]),
-                    config_epoch: 0,
-                    view: 0,
-                },
+                authority: UNSELECTED,
                 partition: target.partition,
                 group,
                 member: Some(self.settings.member),
@@ -496,10 +516,7 @@ impl Membership {
                         backoff: self.settings.retry.initial_backoff,
                     });
                 retry.due = now.saturating_add(retry.backoff);
-                retry.backoff = retry
-                    .backoff
-                    .saturating_mul(2)
-                    .min(self.settings.retry.max_backoff);
+                retry.backoff = self.settings.retry.next_backoff(retry.backoff);
             }
         }
         Ok(())
@@ -540,59 +557,9 @@ fn failure(error: BrokerLinkError) -> Failure {
     }
 }
 
-async fn join(
-    routes: TopicRoutes,
-    number: u32,
-    mut request: JoinRequest,
-    timeout: Duration,
-) -> Result<JoinReply, BrokerLinkError> {
-    let route = routes.leader(number, timeout).await?;
-    request.authority = Authority {
-        group_id: route.group,
-        config_epoch: route.config_epoch,
-        view: route.view,
-    };
-    let links = routes.links();
-    let deadline = links.clock().now().saturating_add(timeout);
-    let leader = route.leader.expect("selected leader");
-    let result = routes
-        .while_current(
-            number,
-            &route,
-            links.group_join_until(leader, request, deadline),
-        )
-        .await?;
-    if let Err(error) = &result {
-        classify(error, Some(&route))?;
-    }
-    result
-}
-
-async fn assign(
-    routes: TopicRoutes,
-    number: u32,
-    mut request: group::AssignRequest,
-    timeout: Duration,
-) -> Result<group::AssignReply, BrokerLinkError> {
-    routes.interest(number)?;
-    let route = routes.leader(number, timeout).await?;
-    request.authority = Authority {
-        group_id: route.group,
-        config_epoch: route.config_epoch,
-        view: route.view,
-    };
-    let links = routes.links();
-    let deadline = links.clock().now().saturating_add(timeout);
-    let leader = route.leader.expect("selected leader");
-    let result = routes
-        .while_current(
-            number,
-            &route,
-            links.group_assign_until(leader, request, deadline),
-        )
-        .await?;
-    if let Err(error) = &result {
-        classify(error, Some(&route))?;
-    }
-    result
+/// The target for `(partition, revision)`, if `targets` lists it.
+fn find(targets: &[Target], partition: PartitionIncarnation, revision: u64) -> Option<&Target> {
+    targets
+        .iter()
+        .find(|target| target.partition == partition && target.plan_revision == revision)
 }

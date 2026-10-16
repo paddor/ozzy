@@ -29,7 +29,7 @@ pub(in crate::replica_journal) mod seek;
 pub use read::{CompletedDelivery, CompletedRead, PartitionDelivery, PreparedRead};
 mod replay;
 mod retention;
-pub use replay::{CompletedReplay, PreparedReplay};
+pub use replay::{CompletedReplay, PreparedReplay, ReplayRequest};
 mod receiving;
 pub use receiving::{RecoveringJournal, RecoveryGenerations, RecoveryOpen};
 mod validation;
@@ -46,9 +46,8 @@ use ownership::JournalOwner;
 use ozzy_core::state::CanonicalImages;
 use ozzy_io::Local;
 use ozzy_journal_segment::{
-    AsyncCanonicalRecoveryCandidate, AsyncGroupJournal, AsyncJournalFormat, AsyncJournalHistory,
-    AsyncJournalIdentityIndex, AsyncJournalLimits, CanonicalRecoveryLimits, CommitMode,
-    SegmentHeader,
+    CanonicalRecoveryCandidate, CanonicalRecoveryLimits, CommitMode, GroupJournal, JournalFormat,
+    JournalHistory, JournalIdentityIndex, JournalLimits, SegmentHeader,
 };
 use ozzy_replication::{
     Digest, FrozenLog, JournalGeneration, PipelineLimits, Prefix, PromiseTicket, QuorumPolicy,
@@ -73,20 +72,20 @@ pub struct OwnedJournal {
     journal: JournalOwner,
     configuration: Mode,
     scope: Scope,
-    images: Option<CanonicalImages<AsyncJournalIdentityIndex>>,
+    images: Option<CanonicalImages<JournalIdentityIndex>>,
     dedup: dedup::State,
-    selected: Option<AsyncCanonicalRecoveryCandidate>,
-    history: Option<AsyncJournalHistory>,
+    selected: Option<CanonicalRecoveryCandidate>,
+    history: Option<JournalHistory>,
     replay: replay::Replay,
     storage_validation: maintenance::Validation,
     donors: [Option<donor::Source>; 3],
     applied: Prefix,
     pending: std::collections::VecDeque<Prefix>,
     writeback: writeback::Writeback,
-    reader: Option<ozzy_journal_segment::AsyncJournalPartitionIndex>,
-    read_limits: ozzy_journal_segment::AsyncPartitionReadLimits,
+    reader: Option<ozzy_journal_segment::JournalPartitionIndex>,
+    read_limits: ozzy_journal_segment::PartitionReadLimits,
     read_key: std::rc::Rc<()>,
-    limits: AsyncJournalLimits,
+    limits: JournalLimits,
     recovery: CanonicalRecoveryLimits,
     buffer_generation: JournalGeneration,
     append_buffers: usize,
@@ -159,20 +158,10 @@ impl OwnedJournal {
         capacity: u64,
     ) -> Result<(Self, JournalStartup), JournalError> {
         config.validate(generation)?;
-        let configuration = config.configuration.configuration();
-        let first_segment =
-            SegmentHeader::new(config.identity.group_id, 1, None, Digest::ZERO, capacity)
-                .map_err(ozzy_journal_segment::DirectoryError::from)?;
-        let journal = AsyncGroupJournal::format(
+        let journal = GroupJournal::format(
             config.root.clone(),
             io,
-            AsyncJournalFormat {
-                identity: config.identity,
-                configuration_epoch: configuration.scope().configuration_epoch,
-                commit_mode: CommitMode::External,
-                first_segment,
-                configuration: config.configuration.encode().to_vec(),
-            },
+            config.journal_format(capacity)?,
             generation,
             config.limits,
         )
@@ -189,30 +178,24 @@ impl OwnedJournal {
     ) -> Result<(Self, JournalStartup), JournalError> {
         config.validate(generation)?;
         let bytes = config.configuration.encode();
-        let opening = AsyncGroupJournal::prepare_open(
+        let opening = GroupJournal::prepare_open(
             config.root.clone(),
             io,
-            config.identity,
-            Some(&bytes),
+            ozzy_journal_segment::ExpectedStore {
+                identity: config.identity,
+                configuration: Some(&bytes),
+            },
             config.limits,
         )
         .await?;
-        authority::validate_manifest(
-            opening.manifest(),
-            config
-                .configuration
-                .configuration()
-                .scope()
-                .configuration_epoch,
-            config.limits.io.max_segment_bytes,
-        )?;
+        config.validate_manifest(opening.manifest())?;
         let journal = opening.recover(generation).await?;
         Box::pin(Self::start(config, journal, generation, false)).await
     }
 
     async fn start(
         config: OwnedConfig,
-        mut journal: AsyncGroupJournal,
+        mut journal: GroupJournal,
         generation: JournalGeneration,
         fresh: bool,
     ) -> Result<(Self, JournalStartup), JournalError> {
@@ -249,10 +232,7 @@ impl OwnedJournal {
             }),
         };
         let reader = if fresh {
-            Some(
-                ozzy_journal_segment::AsyncJournalPartitionIndex::open(&journal, config.reads)
-                    .await?,
-            )
+            Some(ozzy_journal_segment::JournalPartitionIndex::open(&journal, config.reads).await?)
         } else {
             None
         };
@@ -272,9 +252,9 @@ impl OwnedJournal {
     fn from_open<C>(
         config: &OwnedConfig<C>,
         configuration: Mode,
-        journal: AsyncGroupJournal,
-        images: Option<CanonicalImages<AsyncJournalIdentityIndex>>,
-        reader: Option<ozzy_journal_segment::AsyncJournalPartitionIndex>,
+        journal: GroupJournal,
+        images: Option<CanonicalImages<JournalIdentityIndex>>,
+        reader: Option<ozzy_journal_segment::JournalPartitionIndex>,
     ) -> Result<Self, JournalError> {
         let scope = Scope {
             view: journal.manifest().promised_view,
@@ -361,7 +341,7 @@ impl OwnedJournal {
 
     /// Inspect recovered canonical state only after this owner has activated it.
     /// Intact restart and election promises expose no old normal authority.
-    pub fn images(&self) -> Result<&CanonicalImages<AsyncJournalIdentityIndex>, JournalError> {
+    pub fn images(&self) -> Result<&CanonicalImages<JournalIdentityIndex>, JournalError> {
         self.healthy()?;
         self.images
             .as_ref()
@@ -392,14 +372,7 @@ impl OwnedJournal {
         self.writeback.require_idle()?;
         self.faulted = true;
         let journal = self.journal.ready()?;
-        let next = authority::promise_manifest(
-            self.scope,
-            journal.manifest(),
-            journal.writer().written_position(),
-            journal.writer().durable_position(),
-            prefix(journal.accepted_position()?),
-            ticket,
-        )?;
+        let next = authority::promise_manifest(self.scope, journal, ticket)?;
         if let Some(next) = next {
             self.abandon_retirement();
             self.images = None;

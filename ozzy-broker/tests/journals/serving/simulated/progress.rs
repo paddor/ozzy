@@ -42,7 +42,7 @@ async fn production_progress_negotiates_and_fences_unassigned_consumers_in_all_m
         .await
         .unwrap();
         let source = topic.partition(0).unwrap();
-        let routes = consumer.routes(topic.clone()).unwrap();
+        let routes = consumer.routes(topic.clone()).await.unwrap();
         routes.interest(0).unwrap();
         let route = live_many(&brokers, "progress source authority", async {
             loop {

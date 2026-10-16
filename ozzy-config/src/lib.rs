@@ -5,9 +5,22 @@
 //! contributes to partition identity or replicated membership.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::too_many_lines,
+        clippy::too_many_arguments,
+        reason = "product code is linted without cfg(test)"
+    )
+)]
 
 mod broker_identity;
 mod identity;
+mod lookup;
 mod placement;
 mod record;
 mod schema;

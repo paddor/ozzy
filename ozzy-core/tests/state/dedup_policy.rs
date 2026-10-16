@@ -50,14 +50,14 @@ fn dedup_policy_is_canonical_and_survives_checkpoint_independently_of_retention(
             window
         );
         let mut old_version = encoded;
-        old_version[8..10].copy_from_slice(&3_u16.to_be_bytes());
+        old_version[8..10].copy_from_slice(&2_u16.to_be_bytes());
         assert!(matches!(
             CanonicalState::decode_snapshot(
                 &old_version,
                 StateLimits::default(),
                 StateSnapshotLimits::default(),
             ),
-            Err(StateSnapshotError::UnsupportedVersion(3))
+            Err(StateSnapshotError::UnsupportedVersion(2))
         ));
     }
 }

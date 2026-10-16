@@ -59,7 +59,7 @@ fn roots(
     checked
         .deployment
         .check_broker_identity(&checked.identity, &checked.plan.name, identity)?;
-    let broker = &checked.deployment.deployment().brokers[&checked.plan.name];
+    let broker = checked.local_broker()?;
     let mut selected = BTreeSet::new();
     #[cfg(unix)]
     let mut objects = BTreeSet::new();
@@ -97,7 +97,9 @@ fn roots(
         selected.insert(canonical);
         roots.push((
             device.root.clone(),
-            identity.volume(name).expect("validated device identity"),
+            identity
+                .volume(name)
+                .ok_or_else(|| io_error(&device.root, io::ErrorKind::NotFound.into()))?,
         ));
     }
     Ok(roots)

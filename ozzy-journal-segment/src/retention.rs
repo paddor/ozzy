@@ -1,15 +1,12 @@
 //! Committed trim floors and live immutable-segment pins.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::hash::Hash;
+use std::rc::Rc;
 
-use ozzy_journal::operation::{OperationBody, OperationLimits, decode_operation_body};
 use ozzy_proto::{CheckpointId, Offset, PartitionIncarnation};
 use thiserror::Error;
-
-use crate::store_lock::StoreLock;
-use crate::{SegmentReference, SegmentScan};
 
 /// Exact committed earliest-retained offset per partition.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +63,12 @@ impl RetentionFloors {
         self.protected_operation
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_protected_operation(mut self, operation: u64) -> Self {
+        self.protected_operation = Some(operation);
+        self
+    }
+
     /// Derive every committed partition floor from one canonical state image.
     pub fn from_canonical_state(
         state: &ozzy_core::state::CanonicalState,
@@ -83,31 +86,6 @@ impl RetentionFloors {
             .min();
         Ok(floors)
     }
-}
-
-/// Result after a manifest-first physical retention pass.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RetentionResult {
-    /// Segments removed from the selected manifest.
-    pub unreferenced_segment_ids: Vec<u64>,
-    /// Unreferenced segments physically deleted during this call.
-    pub removed_segment_ids: Vec<u64>,
-    /// Logical file bytes removed, excluding allocation overhead.
-    pub reclaimed_bytes: u64,
-    /// First otherwise-eligible segment held by a live reader/transfer.
-    pub blocked_by_pin: Option<u64>,
-}
-
-/// Bounds for retiring a checkpoint-covered sealed prefix. One segment is
-/// indivisible; a budget smaller than the oldest eligible segment refuses work.
-#[derive(Debug, Clone, Copy)]
-pub struct RetentionScanBudget {
-    /// Maximum selected or scanned physical segments.
-    pub max_segments: usize,
-    /// Maximum physical bytes read in this maintenance step.
-    pub max_read_bytes: usize,
-    /// Cooperative elapsed-time bound between complete decoding or scan units.
-    pub max_work: std::time::Duration,
 }
 
 /// Manifest publication only. Incremental orphan cleanup performs deletion.
@@ -154,63 +132,70 @@ pub struct UnreferencedMetadataCleanup {
     pub reclaimed_bytes: u64,
 }
 
-/// Owned immutable segment set. Holding it keeps group ownership locked.
+/// Protect a checkpoint and its source manifest while a build or reader holds it.
 #[derive(Debug)]
-pub struct SegmentPin {
-    root: PathBuf,
-    references: Vec<SegmentReference>,
-    registry: Arc<PinRegistry>,
-    _group_lock: Arc<StoreLock>,
-}
-
-impl SegmentPin {
-    /// Exact protected segment references in caller selection order.
-    pub fn references(&self) -> &[SegmentReference] {
-        &self.references
-    }
-
-    /// Resolve a captured physical segment ID to its exact path.
-    pub fn segment_path(&self, segment_id: u64) -> Option<PathBuf> {
-        self.references
-            .iter()
-            .find(|reference| reference.segment_id == segment_id)
-            .map(|reference| self.root.join(reference.file_name()))
-    }
-}
-
-impl Drop for SegmentPin {
-    fn drop(&mut self) {
-        self.registry.release(&self.references);
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct CheckpointLease<L = Arc<StoreLock>> {
+pub(crate) struct CheckpointLease {
     checkpoint_id: CheckpointId,
     source_manifest_generation: u64,
-    registry: Arc<PinRegistry>,
-    _group_lock: L,
+    registry: Rc<PinRegistry>,
+    _group_lock: ozzy_io::Handle,
 }
 
-impl<L> Drop for CheckpointLease<L> {
+impl Drop for CheckpointLease {
     fn drop(&mut self) {
+        self.registry.checkpoints.release(self.checkpoint_id);
         self.registry
-            .release_checkpoint(self.checkpoint_id, self.source_manifest_generation);
+            .metadata
+            .release(self.source_manifest_generation);
     }
 }
 
+/// Owner-local pin counts. Every holder lives on the journal's thread.
 #[derive(Debug, Default)]
 pub(crate) struct PinRegistry {
-    segments: Mutex<HashMap<u64, usize>>,
-    checkpoints: Mutex<HashMap<CheckpointId, usize>>,
-    metadata: Mutex<HashMap<u64, usize>>,
+    segments: Counts<u64>,
+    checkpoints: Counts<CheckpointId>,
+    metadata: Counts<u64>,
+}
+
+#[derive(Debug)]
+struct Counts<K>(RefCell<HashMap<K, usize>>);
+
+impl<K> Default for Counts<K> {
+    fn default() -> Self {
+        Self(RefCell::new(HashMap::new()))
+    }
+}
+
+impl<K: Copy + Eq + Hash> Counts<K> {
+    fn acquire(&self, key: K) -> Result<(), RetentionError> {
+        let mut counts = self.0.borrow_mut();
+        let count = counts.entry(key).or_default();
+        *count = count.checked_add(1).ok_or(RetentionError::PinOverflow)?;
+        Ok(())
+    }
+
+    fn release(&self, key: K) {
+        let mut counts = self.0.borrow_mut();
+        if let Some(count) = counts.get_mut(&key) {
+            debug_assert_ne!(*count, 0);
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&key);
+            }
+        }
+    }
+
+    fn contains(&self, key: K) -> bool {
+        self.0.borrow().contains_key(&key)
+    }
 }
 
 /// Protect a reserved successor before its file becomes visible to cleanup.
 #[derive(Debug)]
 pub(crate) struct PreparedSegmentLease {
     segment_id: u64,
-    registry: Arc<PinRegistry>,
+    registry: Rc<PinRegistry>,
 }
 
 impl PreparedSegmentLease {
@@ -226,216 +211,57 @@ impl PreparedSegmentLease {
 
 impl Drop for PreparedSegmentLease {
     fn drop(&mut self) {
-        let Ok(mut counts) = self.registry.segments.lock() else {
-            return;
-        };
-        if let Some(count) = counts.get_mut(&self.segment_id) {
-            debug_assert_ne!(*count, 0);
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                counts.remove(&self.segment_id);
-            }
-        }
+        self.registry.segments.release(self.segment_id);
     }
 }
 
 impl PinRegistry {
     pub(crate) fn protect_prepared_segment(
-        self: &Arc<Self>,
+        self: &Rc<Self>,
         segment_id: u64,
     ) -> Result<PreparedSegmentLease, RetentionError> {
-        let mut counts = self.segments.lock().map_err(|_| RetentionError::Poisoned)?;
-        let count = counts.entry(segment_id).or_default();
-        *count = count.checked_add(1).ok_or(RetentionError::PinOverflow)?;
+        self.segments.acquire(segment_id)?;
         Ok(PreparedSegmentLease {
             segment_id,
-            registry: Arc::clone(self),
+            registry: Rc::clone(self),
         })
     }
 
-    pub(crate) fn acquire(
-        self: &Arc<Self>,
-        root: PathBuf,
-        references: Vec<SegmentReference>,
-        group_lock: Arc<StoreLock>,
-    ) -> Result<SegmentPin, RetentionError> {
-        if references.is_empty() {
-            return Err(RetentionError::EmptyPin);
-        }
-        let mut counts = self.segments.lock().map_err(|_| RetentionError::Poisoned)?;
-        if references.iter().any(|reference| {
-            counts
-                .get(&reference.segment_id)
-                .is_some_and(|count| *count == usize::MAX)
-        }) {
-            return Err(RetentionError::PinOverflow);
-        }
-        for reference in &references {
-            let count = counts.entry(reference.segment_id).or_default();
-            *count += 1;
-        }
-        drop(counts);
-        Ok(SegmentPin {
-            root,
-            references,
-            registry: Arc::clone(self),
-            _group_lock: group_lock,
-        })
+    pub(crate) fn is_pinned(&self, segment_id: u64) -> bool {
+        self.segments.contains(segment_id)
     }
 
-    pub(crate) fn is_pinned(&self, segment_id: u64) -> Result<bool, RetentionError> {
-        let ordinary = self
-            .segments
-            .lock()
-            .map_err(|_| RetentionError::Poisoned)?
-            .get(&segment_id)
-            .is_some_and(|count| *count != 0);
-        Ok(ordinary)
-    }
-
-    pub(crate) fn acquire_checkpoint_lease<L>(
-        self: &Arc<Self>,
+    pub(crate) fn acquire_checkpoint_lease(
+        self: &Rc<Self>,
         checkpoint_id: CheckpointId,
         source_manifest_generation: u64,
-        group_lock: L,
-    ) -> Result<CheckpointLease<L>, RetentionError> {
-        let mut counts = self
-            .checkpoints
-            .lock()
-            .map_err(|_| RetentionError::Poisoned)?;
-        let count = counts.entry(checkpoint_id).or_default();
-        let mut metadata = self.metadata.lock().map_err(|_| RetentionError::Poisoned)?;
-        let source_count = metadata.entry(source_manifest_generation).or_default();
-        if *count == usize::MAX || *source_count == usize::MAX {
-            return Err(RetentionError::PinOverflow);
+        group_lock: ozzy_io::Handle,
+    ) -> Result<CheckpointLease, RetentionError> {
+        self.checkpoints.acquire(checkpoint_id)?;
+        if let Err(error) = self.metadata.acquire(source_manifest_generation) {
+            self.checkpoints.release(checkpoint_id);
+            return Err(error);
         }
-        *count += 1;
-        *source_count += 1;
-        drop(counts);
         Ok(CheckpointLease {
             checkpoint_id,
             source_manifest_generation,
-            registry: Arc::clone(self),
+            registry: Rc::clone(self),
             _group_lock: group_lock,
         })
     }
 
-    pub(crate) fn checkpoint_is_pinned(
-        &self,
-        checkpoint_id: CheckpointId,
-    ) -> Result<bool, RetentionError> {
-        Ok(self
-            .checkpoints
-            .lock()
-            .map_err(|_| RetentionError::Poisoned)?
-            .get(&checkpoint_id)
-            .is_some_and(|count| *count != 0))
+    pub(crate) fn checkpoint_is_pinned(&self, checkpoint_id: CheckpointId) -> bool {
+        self.checkpoints.contains(checkpoint_id)
     }
 
-    pub(crate) fn metadata_is_pinned(&self, generation: u64) -> Result<bool, RetentionError> {
-        Ok(self
-            .metadata
-            .lock()
-            .map_err(|_| RetentionError::Poisoned)?
-            .get(&generation)
-            .is_some_and(|count| *count != 0))
-    }
-
-    fn release(&self, references: &[SegmentReference]) {
-        let Ok(mut counts) = self.segments.lock() else {
-            return;
-        };
-        for reference in references {
-            if let std::collections::hash_map::Entry::Occupied(mut entry) =
-                counts.entry(reference.segment_id)
-            {
-                let count = entry.get_mut();
-                debug_assert_ne!(*count, 0);
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    entry.remove();
-                }
-            }
-        }
-    }
-
-    fn release_checkpoint(&self, checkpoint_id: CheckpointId, source_manifest_generation: u64) {
-        let Ok(mut counts) = self.checkpoints.lock() else {
-            return;
-        };
-        let remove = if let Some(count) = counts.get_mut(&checkpoint_id) {
-            debug_assert_ne!(*count, 0);
-            *count = count.saturating_sub(1);
-            *count == 0
-        } else {
-            false
-        };
-        if remove {
-            counts.remove(&checkpoint_id);
-        }
-        let Ok(mut metadata) = self.metadata.lock() else {
-            return;
-        };
-        if let Some(count) = metadata.get_mut(&source_manifest_generation) {
-            debug_assert_ne!(*count, 0);
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                metadata.remove(&source_manifest_generation);
-            }
-        }
+    pub(crate) fn metadata_is_pinned(&self, generation: u64) -> bool {
+        self.metadata.contains(generation)
     }
 }
 
-pub(crate) fn scan_is_below_floors(
-    scan: &SegmentScan<'_>,
-    through_op: u64,
-    floors: &RetentionFloors,
-    limits: OperationLimits,
-) -> Result<bool, RetentionError> {
-    for operation in scan.groups.iter().flat_map(|group| &group.operations) {
-        if operation.op_number > through_op
-            || floors
-                .protected_operation()
-                .is_some_and(|floor| operation.op_number >= floor)
-        {
-            return Ok(false);
-        }
-        let body = decode_operation_body(operation.kind, operation.body.as_ref(), limits)?;
-        let batches = match &body {
-            OperationBody::Append(append) => append.batches.as_slice(),
-            OperationBody::ResolvedAppend(append) => std::slice::from_ref(&append.batch),
-            _ => continue,
-        };
-        for batch in batches {
-            if batch.records.is_empty() {
-                continue;
-            }
-            let Some(floor) = floors.get(batch.partition) else {
-                return Ok(false);
-            };
-            let record_count =
-                u64::try_from(batch.records.len()).map_err(|_| RetentionError::LengthOverflow)?;
-            let Some(end) = batch.first_offset.get().checked_add(record_count) else {
-                return Err(RetentionError::LengthOverflow);
-            };
-            if end > floor.get() {
-                return Ok(false);
-            }
-        }
-    }
-    Ok(true)
-}
-
-pub(crate) fn segments_root(root: &Path) -> PathBuf {
-    root.join("segments")
-}
-
-/// Retention plan, pin, or canonical-body failure.
+/// Retention plan or pin failure.
 #[derive(Debug, Error)]
 pub enum RetentionError {
-    #[error(transparent)]
-    /// Canonical operation-body validation failed.
-    Operation(#[from] ozzy_journal::operation::OperationCodecError),
     #[error("retention floor contains a zero partition identity")]
     /// Retention floor contains a zero partition identity.
     ZeroPartition,
@@ -451,68 +277,7 @@ pub enum RetentionError {
     #[error("segment pin count overflow")]
     /// Segment pin count overflow.
     PinOverflow,
-    #[error("segment pin registry is poisoned")]
-    /// Segment pin registry is poisoned.
-    Poisoned,
     #[error("retention integer or length overflow")]
     /// Integer or byte-count arithmetic overflows the supported range.
     LengthOverflow,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{RetentionFloors, scan_is_below_floors};
-    use crate::{
-        CanonicalOperation, ChainPosition, DecodeLimits, Digest, OperationKind, OperationLimits,
-        SEGMENT_HEADER_BYTES, SegmentHeader, encode_group, encode_segment_header, scan_segment,
-    };
-    use ozzy_journal::operation::logical_operation_digest;
-    use ozzy_proto::GroupId;
-
-    #[test]
-    fn coordinates_checkpoint_cannot_retire_a_still_referenced_proof_operation() {
-        let header = SegmentHeader::new(
-            GroupId::from_bytes([1; 16]),
-            1,
-            None,
-            Digest::ZERO,
-            64 * 1024,
-        )
-        .unwrap();
-        let first = CanonicalOperation {
-            group_id: header.group_id(),
-            configuration_epoch: 1,
-            original_view: 0,
-            op_number: 1,
-            previous_digest: Digest::ZERO,
-            kind: OperationKind::Barrier,
-            body: &[1; 16],
-        };
-        let second = CanonicalOperation {
-            op_number: 2,
-            previous_digest: logical_operation_digest(&first),
-            body: &[2; 16],
-            ..first
-        };
-        let group = encode_group(
-            &header,
-            1,
-            SEGMENT_HEADER_BYTES as u64,
-            ChainPosition::GENESIS,
-            &[first, second],
-        )
-        .unwrap();
-        let mut bytes = encode_segment_header(&header).to_vec();
-        bytes.extend_from_slice(group.as_bytes());
-        bytes.resize(64 * 1024, 0);
-        let scan =
-            scan_segment(&bytes, 1, ChainPosition::GENESIS, DecodeLimits::default()).unwrap();
-        let mut floors = RetentionFloors::new(Vec::new()).unwrap();
-        assert!(scan_is_below_floors(&scan, 2, &floors, OperationLimits::default()).unwrap());
-        floors.protected_operation = Some(2);
-        assert!(!scan_is_below_floors(&scan, 2, &floors, OperationLimits::default()).unwrap());
-        floors.protected_operation = Some(3);
-        assert!(scan_is_below_floors(&scan, 2, &floors, OperationLimits::default()).unwrap());
-        assert!(!scan_is_below_floors(&scan, 1, &floors, OperationLimits::default()).unwrap());
-    }
 }

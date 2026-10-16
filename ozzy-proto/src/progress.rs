@@ -1,10 +1,12 @@
 //! Cumulative group processing cursors on the addressed control plane.
 
 use crate::{
-    ConsumerGroupId, ConsumerMemberId, ENVELOPE_BYTES, Envelope, EnvelopeLimits, GroupId, Offset,
-    Opcode, Packet, PartitionIncarnation,
+    ConsumerGroupId, ConsumerMemberId, ENVELOPE_BYTES, Envelope, EnvelopeLimits, Offset, Opcode,
+    Packet, PartitionIncarnation,
     append::{Authority, Policy},
-    data::{CodecError, Cursor},
+    data::CodecError,
+    layout::Reader,
+    wire::{check_exact, command, decode_authority, encode_authority, reserve},
 };
 
 /// Fixed request metadata; queries encode an absent cursor as zero tag/value.
@@ -37,7 +39,7 @@ impl HistoryExpired {
         if bytes.len() != 16 {
             return Err(CodecError::Length);
         }
-        let mut cursor = Cursor(bytes);
+        let mut cursor = Reader::new(bytes);
         let expired = Self {
             cursor: Offset::new(cursor.u64()?),
             retained_from: Offset::new(cursor.u64()?),
@@ -121,10 +123,10 @@ pub fn encode_request(
 
 /// Decode shape and identities. Link trust and assignment remain owner checks.
 pub fn decode_request(packet: Packet<'_>, limits: EnvelopeLimits) -> Result<Request, CodecError> {
-    check(packet, Opcode::ProgressCommit, false, REQUEST_BYTES, limits)?;
-    let mut cursor = Cursor(packet.metadata);
+    check_exact(packet, Opcode::ProgressCommit, false, REQUEST_BYTES, limits)?;
+    let mut cursor = Reader::new(packet.metadata);
     let (authority, assignment, policy) = decode_common(&mut cursor)?;
-    let tag = cursor.byte()?;
+    let tag = cursor.u8()?;
     let value = cursor.u64()?;
     let offset = match (tag, value) {
         (0, 0) => None,
@@ -167,14 +169,14 @@ pub fn decode_confirmed(
     packet: Packet<'_>,
     limits: EnvelopeLimits,
 ) -> Result<Confirmed, CodecError> {
-    check(
+    check_exact(
         packet,
         Opcode::ProgressCommitted,
         true,
         CONFIRMED_BYTES,
         limits,
     )?;
-    let mut cursor = Cursor(packet.metadata);
+    let mut cursor = Reader::new(packet.metadata);
     let (authority, assignment, policy) = decode_common(&mut cursor)?;
     let confirmed = Confirmed {
         authority,
@@ -188,42 +190,6 @@ pub fn decode_confirmed(
     Ok(confirmed)
 }
 
-fn command(envelope: Envelope, opcode: Opcode, response: bool) -> Result<(), CodecError> {
-    if envelope.opcode != opcode
-        || envelope.response != response
-        || envelope.request_id.is_none()
-        || envelope.session.is_none()
-    {
-        return Err(CodecError::Profile);
-    }
-    Ok(())
-}
-
-fn check(
-    packet: Packet<'_>,
-    opcode: Opcode,
-    response: bool,
-    length: usize,
-    limits: EnvelopeLimits,
-) -> Result<(), CodecError> {
-    command(packet.envelope, opcode, response)?;
-    packet
-        .envelope
-        .validate_frames(packet.metadata.len(), packet.payload.len(), limits)?;
-    if packet.metadata.len() != length || !packet.payload.is_empty() {
-        return Err(CodecError::Length);
-    }
-    Ok(())
-}
-
-fn reserve(metadata: &mut Vec<u8>, length: usize) -> Result<(), CodecError> {
-    if metadata.capacity() < length {
-        return Err(CodecError::Capacity);
-    }
-    metadata.clear();
-    Ok(())
-}
-
 fn encode_common(
     metadata: &mut Vec<u8>,
     authority: Authority,
@@ -231,9 +197,7 @@ fn encode_common(
     policy: Policy,
 ) {
     metadata.push(SOURCE_TAG);
-    metadata.extend_from_slice(authority.group_id.as_bytes());
-    metadata.extend_from_slice(&authority.config_epoch.to_be_bytes());
-    metadata.extend_from_slice(&authority.view.to_be_bytes());
+    encode_authority(metadata, authority);
     metadata.extend_from_slice(assignment.partition.as_bytes());
     metadata.extend_from_slice(assignment.group.as_bytes());
     metadata.extend_from_slice(assignment.member.as_bytes());
@@ -241,22 +205,18 @@ fn encode_common(
     metadata.push(policy as u8);
 }
 
-fn decode_common(cursor: &mut Cursor<'_>) -> Result<(Authority, Assignment, Policy), CodecError> {
-    if cursor.byte()? != SOURCE_TAG {
+fn decode_common(cursor: &mut Reader<'_>) -> Result<(Authority, Assignment, Policy), CodecError> {
+    if cursor.u8()? != SOURCE_TAG {
         return Err(CodecError::Profile);
     }
-    let authority = Authority {
-        group_id: GroupId::from_bytes(cursor.array()?),
-        config_epoch: cursor.u64()?,
-        view: cursor.u64()?,
-    };
+    let authority = decode_authority(cursor)?;
     let assignment = Assignment {
         partition: PartitionIncarnation::from_bytes(cursor.array()?),
         group: ConsumerGroupId::from_bytes(cursor.array()?),
         member: ConsumerMemberId::from_bytes(cursor.array()?),
         epoch: cursor.u64()?,
     };
-    let policy = Policy::try_from(cursor.byte()?)?;
+    let policy = Policy::try_from(cursor.u8()?)?;
     validate(authority, assignment)?;
     Ok((authority, assignment, policy))
 }

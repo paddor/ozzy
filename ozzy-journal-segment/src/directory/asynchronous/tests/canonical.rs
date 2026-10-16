@@ -423,8 +423,10 @@ async fn async_checkpoint_plus_replay_preserves_interleaved_writer_results_after
     let mut reopened = Journal::open(
         path,
         io,
-        identity(),
-        Some(b"test deployment"),
+        crate::ExpectedStore {
+            identity: identity(),
+            configuration: Some(b"test deployment"),
+        },
         JournalGeneration(2),
         limits(),
     )

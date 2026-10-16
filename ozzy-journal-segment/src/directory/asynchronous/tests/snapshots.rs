@@ -2,7 +2,7 @@ use super::empty_journal as empty;
 use super::indexes::{append_body, build_limits, partition, populate};
 use super::*;
 use crate::{
-    AsyncJournalIdentityIndex, JournalIdentityHandoffError, JournalIndexBoundary as Boundary,
+    JournalIdentityHandoffError, JournalIdentityIndex, JournalIndexBoundary as Boundary,
     JournalIndexError,
 };
 use ozzy_core::state::{IdentityClaim, IdentityIndex, IdentityIndexError, IdentityKey};
@@ -411,7 +411,7 @@ fn async_identity_resolution_is_bounded_atomic_and_memory_only() {
         journal.build_index_snapshot(Boundary::Accepted, build_limits()),
     )
     .unwrap();
-    let mut identities = AsyncJournalIdentityIndex::new(snapshot, 2, 2);
+    let mut identities = JournalIdentityIndex::new(snapshot, 2, 2);
     let first = IdentityClaim {
         operation_id: OperationId::from_bytes([2; 16]),
         op_number: 2,
@@ -485,7 +485,7 @@ fn async_identity_handoff_checks_lineage_and_every_claim() {
         journal.open_index_snapshot(Boundary::Accepted, build_limits().file),
     )
     .unwrap();
-    let mut identities = AsyncJournalIdentityIndex::new(initial, 4, 4);
+    let mut identities = JournalIdentityIndex::new(initial, 4, 4);
     let claim = drive(&mut controller, barrier(&mut journal, 2));
     drive(&mut controller, identities.resolve(&[claim.key()])).unwrap();
     identities.reserve(&[claim]).unwrap();
@@ -544,7 +544,7 @@ fn async_identity_retirement_narrows_coverage_without_reading_files() {
         journal.build_index_snapshot(Boundary::Accepted, build_limits()),
     )
     .unwrap();
-    let mut identities = AsyncJournalIdentityIndex::new(snapshot, 4, 4);
+    let mut identities = JournalIdentityIndex::new(snapshot, 4, 4);
     let overlay = drive(&mut controller, barrier(&mut journal, 3));
     drive(&mut controller, identities.resolve(&[overlay.key()])).unwrap();
     identities.reserve(&[overlay]).unwrap();
@@ -561,7 +561,7 @@ fn async_identity_retirement_narrows_coverage_without_reading_files() {
     .unwrap();
     drive(&mut controller, journal.install_checkpoint(id)).unwrap();
     let floors = crate::RetentionFloors::new(vec![]).unwrap();
-    let one = crate::AsyncRetirementBudget {
+    let one = crate::RetirementBudget {
         max_segments: 1,
         max_read_bytes: 65536,
     };
@@ -580,8 +580,8 @@ fn async_identity_retirement_narrows_coverage_without_reading_files() {
     let narrowed = identities.retire_prefix(first).unwrap();
     assert!(controller.jobs().is_empty(), "narrowing reads no files");
     drop(identities);
-    assert!(journal.pins_released(&[1], &[]).unwrap());
-    assert!(!journal.pins_released(&[2], &[]).unwrap());
+    assert!(journal.pins_released(&[1], &[]));
+    assert!(!journal.pins_released(&[2], &[]));
     drive(
         &mut controller,
         narrowed.resolve(&[retired.key(), kept.key()]),
@@ -598,7 +598,7 @@ fn async_identity_retirement_narrows_coverage_without_reading_files() {
     assert_eq!(first.segment_id, 3);
     let mut anchored = narrowed.retire_prefix(first).unwrap();
     drop(narrowed);
-    assert!(journal.pins_released(&[2], &[]).unwrap());
+    assert!(journal.pins_released(&[2], &[]));
     assert_eq!(anchored.snapshot().segment_references(), []);
     assert_eq!(anchored.snapshot().through().op_number, overlay.op_number);
     assert!(anchored.overlay().is_empty());
@@ -634,7 +634,7 @@ fn async_catalog_cold_lookups_can_interleave_and_cancel_without_poisoning() {
         journal.build_index_snapshot(Boundary::Accepted, build_limits()),
     )
     .unwrap();
-    let index = AsyncJournalIdentityIndex::new(snapshot, 4, 4);
+    let index = JournalIdentityIndex::new(snapshot, 4, 4);
     drive(&mut controller, index.resolve(&[claims[0].key()])).unwrap();
     let cold = [claims[4].key()];
     let mut first = Box::pin(index.resolve(&cold));

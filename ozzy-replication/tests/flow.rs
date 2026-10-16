@@ -1,3 +1,13 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
+
 use ozzy_proto::GroupId;
 use ozzy_replication::flow::{Channel, FlowError, Operation, ReceiveEpoch, Receiver, Sender};
 use ozzy_replication::{Digest, OpNumber, PipelineLimits, Prefix, Scope};

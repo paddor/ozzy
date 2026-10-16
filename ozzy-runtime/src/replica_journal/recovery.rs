@@ -5,7 +5,7 @@ use ozzy_replication::LogSource;
 use ozzy_replication::recovery::RecoveryResponse;
 use ozzy_replication::wire::{CheckpointRequest, FetchOps};
 
-use super::commands::Action;
+use super::commands::{Action, Gate};
 use super::{
     AppendBuffer, FetchedHistory, JournalCompletion, JournalError, Rejected, ReplicaJournal,
     SubmitError, completion,
@@ -49,6 +49,8 @@ pub struct PinnedRecovery {
     pub(super) requester: NodeId,
     pub(super) response: RecoveryResponse,
     pub(super) donor: NodeId,
+    /// The primary log the response names, fixed when the pin was taken.
+    pub(super) source: LogSource,
 }
 
 impl PinnedRecovery {
@@ -63,16 +65,8 @@ impl PinnedRecovery {
     }
 
     /// Exact source for independently correlated `FETCH_OPS` exchanges.
-    pub fn source(self) -> LogSource {
-        let log = self
-            .response
-            .primary
-            .expect("only primary responses own a pin");
-        LogSource {
-            voter: self.donor,
-            generation: log.generation,
-            accepted: log.accepted,
-        }
+    pub const fn source(self) -> LogSource {
+        self.source
     }
 }
 
@@ -90,25 +84,13 @@ impl ReplicaJournal {
         requester: NodeId,
         response: RecoveryResponse,
     ) -> Result<JournalCompletion<PinnedRecovery>, SubmitError> {
-        self.submit(
-            (requester, response),
-            |(requester, response), done| {
-                Action::Recovery(RecoveryAction::Pin {
-                    requester,
-                    response,
-                    done,
-                })
-            },
-            |action| match action {
-                Action::Recovery(RecoveryAction::Pin {
-                    requester,
-                    response,
-                    ..
-                }) => (requester, response),
-                _ => unreachable!("submission preserves command kind"),
-            },
-        )
-        .map_err(|rejected| rejected.reason)
+        self.command(Gate::Settled, |done| {
+            Action::Recovery(RecoveryAction::Pin {
+                requester,
+                response,
+                done,
+            })
+        })
     }
 
     /// Retire only the matching donor nonce/view/source, never a newer pin.
@@ -116,15 +98,9 @@ impl ReplicaJournal {
         &mut self,
         pin: PinnedRecovery,
     ) -> Result<JournalCompletion<PinnedRecovery>, SubmitError> {
-        self.submit(
-            pin,
-            |pin, done| Action::Recovery(RecoveryAction::Release { pin, done }),
-            |action| match action {
-                Action::Recovery(RecoveryAction::Release { pin, .. }) => pin,
-                _ => unreachable!("submission preserves command kind"),
-            },
-        )
-        .map_err(|rejected| rejected.reason)
+        self.command(Gate::Free, |done| {
+            Action::Recovery(RecoveryAction::Release { pin, done })
+        })
     }
 
     /// Read one bounded chunk from an exact retained donor pin into a leased arena.
@@ -141,6 +117,7 @@ impl ReplicaJournal {
     ) -> Result<JournalCompletion<FetchedHistory>, Rejected<AppendBuffer>> {
         self.submit(
             buffer,
+            |_| Gate::Free,
             |buffer, done| {
                 Action::Recovery(RecoveryAction::Fetch {
                     pin,
@@ -148,10 +125,6 @@ impl ReplicaJournal {
                     buffer,
                     done,
                 })
-            },
-            |action| match action {
-                Action::Recovery(RecoveryAction::Fetch { buffer, .. }) => buffer,
-                _ => unreachable!("submission preserves command kind"),
             },
         )
     }
@@ -173,16 +146,8 @@ impl ReplicaJournal {
         pin: PinnedRecovery,
         request: CheckpointRequest,
     ) -> Result<JournalCompletion<RecoveryCheckpointRead>, SubmitError> {
-        self.submit(
-            (pin, request),
-            |(pin, request), done| {
-                Action::Recovery(RecoveryAction::Checkpoint { pin, request, done })
-            },
-            |action| match action {
-                Action::Recovery(RecoveryAction::Checkpoint { pin, request, .. }) => (pin, request),
-                _ => unreachable!("submission preserves command kind"),
-            },
-        )
-        .map_err(|rejected| rejected.reason)
+        self.command(Gate::Free, |done| {
+            Action::Recovery(RecoveryAction::Checkpoint { pin, request, done })
+        })
     }
 }

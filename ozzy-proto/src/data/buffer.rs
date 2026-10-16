@@ -82,7 +82,12 @@ impl RecordBuffer {
         {
             return Err(CodecError::Length);
         }
-        let metadata = add(self.metadata.len(), metadata + encoding.metadata_bytes())?;
+        let metadata = add(
+            add(self.metadata.len(), metadata)?,
+            encoding.metadata_bytes(),
+        )?;
+        let next_count = add(self.count, 1)?;
+        let next_parts = add(self.parts, part_count)?;
         let payload = add(self.payload.len(), payload)?;
         if metadata > limits.envelope.max_metadata_bytes
             || payload > limits.envelope.max_payload_bytes
@@ -107,8 +112,8 @@ impl RecordBuffer {
                 Some(&mut self.payload),
             );
         }
-        self.count += 1;
-        self.parts += part_count;
+        self.count = next_count;
+        self.parts = next_parts;
         Ok(())
     }
 }

@@ -8,14 +8,26 @@ pub(crate) use read::Reader;
 
 use super::{
     CHECKPOINT_CHUNK_HASH_CONTEXT, CHECKPOINT_MANIFEST_FILE, CHECKPOINT_STATE_HASH_CONTEXT,
-    CheckpointError, CheckpointLimits, CheckpointManifest, Hasher, checkpoint_manifest_digest,
-    chunk_name, decode_checkpoint_manifest, enforce_u64, validate_checkpoint_names,
-    validate_limits,
+    CheckpointChunk, CheckpointError, CheckpointLimits, CheckpointManifest, Hasher,
+    checkpoint_manifest_digest, chunk_name, decode_checkpoint_manifest, enforce_u64,
+    validate_checkpoint_names, validate_limits,
 };
-use crate::{Digest, async_files::Access};
-use ozzy_io::{OpenMode, Operation};
+use crate::{
+    Digest,
+    async_files::{Access, Span},
+};
+use ozzy_io::{Handle, OpenMode, Operation};
 use ozzy_proto::{GroupId, StoreId};
-use std::path::PathBuf;
+use std::{ops::Range, path::PathBuf};
+
+/// Bounds for opening one checkpoint: its codec limits, the backend transfer
+/// size, and the directory listing bounds (entries, name bytes).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Bounds {
+    pub(crate) limits: CheckpointLimits,
+    pub(crate) chunk_bytes: usize,
+    pub(crate) listing: (usize, usize),
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct Checkpoint {
@@ -46,7 +58,11 @@ impl Checkpoint {
             .partition_point(|chunk| chunk.logical_offset <= offset)
             .checked_sub(1)
             .ok_or(CheckpointError::LengthMismatch)?;
-        let chunk = self.manifest.chunks[index];
+        let chunk = *self
+            .manifest
+            .chunks
+            .get(index)
+            .ok_or(CheckpointError::LengthMismatch)?;
         let length = usize::try_from(chunk.bytes).map_err(|_| CheckpointError::LengthOverflow)?;
         enforce_u64(
             "checkpoint chunk bytes",
@@ -69,48 +85,57 @@ impl Checkpoint {
                 false,
             )
             .await?;
-        let result = async {
-            if self.access.length(&file).await? != chunk.bytes {
-                return Err(CheckpointError::LengthMismatch);
-            }
-            let mut bytes = Vec::new();
-            bytes
-                .try_reserve_exact(count)
-                .map_err(|_| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
-            let mut scratch = Vec::new();
-            let mut hasher = Hasher::new(CHECKPOINT_CHUNK_HASH_CONTEXT);
-            let mut through = 0;
-            while through < length {
-                scratch.clear();
-                self.access
-                    .read_append(
-                        &file,
-                        through as u64,
-                        self.chunk_bytes.min(length - through),
-                        self.chunk_bytes,
-                        &mut scratch,
-                    )
-                    .await?;
-                hasher.update(&scratch);
-                let from = start.max(through);
-                let end = (start + count).min(through + scratch.len());
-                if from < end {
-                    bytes.extend_from_slice(&scratch[from - through..end - through]);
-                }
-                through += scratch.len();
-            }
-            if self.access.length(&file).await? != chunk.bytes {
-                return Err(CheckpointError::LengthMismatch);
-            }
-            if hasher.finish() != chunk.digest {
-                return Err(CheckpointError::DigestMismatch("checkpoint chunk"));
-            }
-            Ok(bytes)
-        }
-        .await;
+        let result = self.read_verified(&file, chunk, start..start + count).await;
         let closed = self.access.done(Operation::Close { handle: file }).await;
         let bytes = result?;
         closed?;
+        Ok(bytes)
+    }
+
+    /// Read and hash one whole chunk file, keeping only `wanted` bytes of it.
+    /// The file length is checked before and after; the digest must match.
+    async fn read_verified(
+        &self,
+        file: &Handle,
+        chunk: CheckpointChunk,
+        wanted: Range<usize>,
+    ) -> Result<Vec<u8>, CheckpointError> {
+        let length = usize::try_from(chunk.bytes).map_err(|_| CheckpointError::LengthOverflow)?;
+        if self.access.length(file).await? != chunk.bytes {
+            return Err(CheckpointError::LengthMismatch);
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(wanted.len())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
+        let mut scratch = Vec::new();
+        let mut hasher = Hasher::new(CHECKPOINT_CHUNK_HASH_CONTEXT);
+        let mut through = 0;
+        while through < length {
+            scratch.clear();
+            let span = Span {
+                offset: through as u64,
+                length: self.chunk_bytes.min(length - through),
+            };
+            self.access
+                .read_append(file, span, self.chunk_bytes, &mut scratch)
+                .await?;
+            hasher.update(&scratch);
+            let from = wanted.start.max(through);
+            let end = wanted.end.min(through + scratch.len());
+            if from < end
+                && let Some(part) = scratch.get(from - through..end - through)
+            {
+                bytes.extend_from_slice(part);
+            }
+            through += scratch.len();
+        }
+        if self.access.length(file).await? != chunk.bytes {
+            return Err(CheckpointError::LengthMismatch);
+        }
+        if hasher.finish() != chunk.digest {
+            return Err(CheckpointError::DigestMismatch("checkpoint chunk"));
+        }
         Ok(bytes)
     }
 
@@ -118,10 +143,13 @@ impl Checkpoint {
         access: Access,
         root: PathBuf,
         identity: (GroupId, StoreId),
-        limits: CheckpointLimits,
-        chunk_bytes: usize,
-        listing: (usize, usize),
+        bounds: Bounds,
     ) -> Result<Self, CheckpointError> {
+        let Bounds {
+            limits,
+            chunk_bytes,
+            listing,
+        } = bounds;
         validate_limits(limits)?;
         if chunk_bytes == 0 {
             return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput).into());
@@ -189,22 +217,4 @@ impl Checkpoint {
         self.validate_chunks(limits, Some(&mut state)).await?;
         Ok(state)
     }
-}
-
-/// Validate the descriptor digest of a bounded checkpoint assembled over PEER.
-/// The callback lets the owning shard yield between fixed hash chunks.
-pub async fn verify_checkpoint_state(
-    input: &[u8],
-    expected: Digest,
-    mut step: impl AsyncFnMut(usize),
-) -> Result<(), CheckpointError> {
-    let mut hasher = Hasher::new(CHECKPOINT_STATE_HASH_CONTEXT);
-    for chunk in input.chunks(64 * 1024) {
-        hasher.update(chunk);
-        step(chunk.len()).await;
-    }
-    if hasher.finish() != expected {
-        return Err(CheckpointError::DigestMismatch("checkpoint state"));
-    }
-    Ok(())
 }

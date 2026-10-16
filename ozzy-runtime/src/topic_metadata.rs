@@ -117,6 +117,11 @@ impl TopicMetadata {
         self.partitions.len()
     }
 
+    /// Every partition's group, in group order.
+    pub(crate) fn groups(&self) -> impl Iterator<Item = GroupId> + '_ {
+        self.groups.keys().copied()
+    }
+
     /// Numeric partition lookup. Group IDs never define hash order.
     pub fn partition(&self, number: u32) -> Option<&TopicPartition> {
         self.partitions.get(usize::try_from(number).ok()?)

@@ -36,8 +36,42 @@ pub(super) struct Image {
     partition: Option<PartitionIncarnation>,
     time: u64,
     end: Offset,
-    #[cfg(feature = "storage-metrics")]
-    reservation: Option<crate::storage_metrics::DedupReservation>,
+    reservation: Option<Installed>,
+}
+
+/// Holds an installed image's reservation in the live dedup gauges.
+#[derive(Debug)]
+struct Installed {
+    bytes: i64,
+    entries: i64,
+}
+
+impl Installed {
+    /// Count one installed image. `None` while telemetry does not count.
+    fn count(bytes: usize, entries: usize) -> Option<Self> {
+        use crate::profiling::{Event, count, counting, event, gauge};
+        if !counting() {
+            return None;
+        }
+        event(Event::DedupIndexImage);
+        count(Event::DedupIndexBytes, bytes as u64);
+        count(Event::DedupIndexEntries, entries as u64);
+        let installed = Self {
+            bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
+            entries: i64::try_from(entries).unwrap_or(i64::MAX),
+        };
+        gauge(Event::DedupLiveBytes, installed.bytes);
+        gauge(Event::DedupLiveEntries, installed.entries);
+        Some(installed)
+    }
+}
+
+impl Drop for Installed {
+    fn drop(&mut self) {
+        use crate::profiling::{Event, gauge};
+        gauge(Event::DedupLiveBytes, -self.bytes);
+        gauge(Event::DedupLiveEntries, -self.entries);
+    }
 }
 
 /// A reversible identity image for the same exact validated canonical group.
@@ -118,20 +152,7 @@ impl OwnedJournal {
         buffer: &AppendBuffer,
     ) -> Result<Option<Box<Prepared>>, JournalError> {
         let Some(limits) = self.dedup.limits else {
-            // Never publish enabled policy without its independently owned image.
-            for operation in buffer
-                .operations()
-                .filter(|op| op.kind == OperationKind::CreatePartition)
-            {
-                let OperationBody::CreatePartition(create) =
-                    decode_operation_body(operation.kind, operation.body, self.limits.operations)?
-                else {
-                    unreachable!("decoded create kind")
-                };
-                if create.dedup_window_millis.is_some() {
-                    return Err(JournalError::Configuration);
-                }
-            }
+            self.refuse_dedup_creation(buffer)?;
             return Ok(None);
         };
         // Decode each stored batch once. Charge returned preparation and
@@ -188,6 +209,26 @@ impl OwnedJournal {
             partition,
             _charge: charge,
         })))
+    }
+}
+
+impl OwnedJournal {
+    /// Never publish an enabled policy without its independently owned image.
+    fn refuse_dedup_creation(&self, buffer: &AppendBuffer) -> Result<(), JournalError> {
+        for operation in buffer
+            .operations()
+            .filter(|op| op.kind == OperationKind::CreatePartition)
+        {
+            let OperationBody::CreatePartition(create) =
+                decode_operation_body(operation.kind, operation.body, self.limits.operations)?
+            else {
+                return Err(JournalError::AppendMismatch);
+            };
+            if create.dedup_window_millis.is_some() {
+                return Err(JournalError::Configuration);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -271,6 +312,33 @@ fn stored_view<'a>(
     Ok(view)
 }
 
+/// The IDs of a stored batch that continues `partition` at `first`, with the
+/// log time and record end it leaves.
+fn stored_ids(
+    view: &ResolvedAppendView<'_>,
+    partition: Option<PartitionIncarnation>,
+    first: Offset,
+) -> Result<(u64, Offset, Vec<MessageId>), JournalError> {
+    let summary = &view.batch.summary;
+    if Some(summary.partition) != partition {
+        return Err(JournalError::AppendMismatch);
+    }
+    let end = summary
+        .first_offset
+        .get()
+        .checked_add(summary.record_count as u64)
+        .map(Offset::new)
+        .ok_or(JournalError::AppendCapacity)?;
+    if summary.first_offset != first {
+        return Err(JournalError::AppendMismatch);
+    }
+    let mut ids = Vec::new();
+    ids.try_reserve_exact(summary.record_count)
+        .map_err(std::io::Error::other)?;
+    ids.extend(view.batch.descriptors().map(|record| record.message_id));
+    Ok((view.results.logical_time(), end, ids))
+}
+
 impl Image {
     /// The row of one recovered operation.
     fn row(
@@ -309,26 +377,8 @@ impl Image {
             let ids = match operation.kind {
                 OperationKind::ResolvedAppend => {
                     let view = views.next().ok_or(JournalError::AppendMismatch)?;
-                    if Some(view.batch.summary.partition) != partition {
-                        return Err(JournalError::AppendMismatch);
-                    }
-                    time = view.results.logical_time();
-                    end = view
-                        .batch
-                        .summary
-                        .first_offset
-                        .get()
-                        .checked_add(view.batch.summary.record_count as u64)
-                        .map(Offset::new)
-                        .ok_or(JournalError::AppendCapacity)?;
-                    if view.batch.summary.first_offset != first {
-                        return Err(JournalError::AppendMismatch);
-                    }
-                    let count = view.batch.summary.record_count;
-                    let mut ids = Vec::new();
-                    ids.try_reserve_exact(count)
-                        .map_err(std::io::Error::other)?;
-                    ids.extend(view.batch.descriptors().map(|record| record.message_id));
+                    let ids;
+                    (time, end, ids) = stored_ids(&view, partition, first)?;
                     ids
                 }
                 // Enabled partitions require canonical outcomes and log time.

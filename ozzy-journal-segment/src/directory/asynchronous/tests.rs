@@ -2,6 +2,7 @@ use super::*;
 mod canonical;
 mod checkpoints;
 mod cooperation;
+mod evidence;
 mod history;
 mod indexes;
 mod lifecycle;
@@ -16,8 +17,10 @@ mod repair;
 mod retention;
 mod snapshots;
 mod suffix;
+mod unselected;
+mod validation;
 use crate::{
-    Digest, GroupDirectory, OperationKind, SegmentWriteMode,
+    Digest, OperationKind, SegmentWriteMode,
     test_io::{drive, drive_with, poll},
 };
 use ozzy_io::simulation::{self, Controller, Effect, Image, ImageLimits, Stage};
@@ -44,7 +47,7 @@ fn limits() -> Limits {
             max_chunk_bytes: 4096,
             max_state_bytes: 256 * 1024,
         },
-        io: AsyncSegmentOptions {
+        io: SegmentOptions {
             max_segment_bytes: 32768,
             chunk_bytes: 4096,
             direct: false,
@@ -146,8 +149,10 @@ async fn open(io: Local, generation: u128) -> Result<Journal, DirectoryError> {
     Journal::open(
         "/group".into(),
         io,
-        identity(),
-        Some(b"test deployment"),
+        crate::ExpectedStore {
+            identity: identity(),
+            configuration: Some(b"test deployment"),
+        },
         JournalGeneration(generation),
         limits(),
     )
@@ -171,35 +176,79 @@ fn baseline() -> Image {
     controller.crash(true).unwrap().0
 }
 
-#[tokio::test]
+/// Access without a journal, for damage that a later open must handle.
+fn raw_access(io: &Local) -> Access {
+    Access {
+        io: io.clone(),
+        protection: None,
+        readers: std::rc::Rc::default(),
+    }
+}
+/// Replace or create a whole file outside the journal and make it durable.
+fn write_file(controller: &mut Controller, access: &Access, path: &str, bytes: &[u8]) {
+    let path = PathBuf::from(path);
+    let mode = if controller.image().exists(&path, false) {
+        ozzy_io::OpenMode::ReadWrite
+    } else {
+        ozzy_io::OpenMode::CreateNew
+    };
+    let handle = drive(controller, access.open(path.clone(), mode, false, false)).unwrap();
+    set_length(controller, access, &handle, bytes.len() as u64);
+    drive(controller, access.write_all(&handle, 0, bytes)).unwrap();
+    drive(controller, access.sync(&handle)).unwrap();
+    drive(
+        controller,
+        access.sync_directory(path.parent().unwrap().into()),
+    )
+    .unwrap();
+}
+fn set_length(controller: &mut Controller, access: &Access, handle: &ozzy_io::Handle, length: u64) {
+    let handle = handle.clone();
+    drive(
+        controller,
+        access.done(Operation::SetLength { handle, length }),
+    )
+    .unwrap();
+}
+fn remove_file(controller: &mut Controller, access: &Access, path: &str) {
+    let path = PathBuf::from(path);
+    drive(
+        controller,
+        access.done(Operation::RemoveFile { path: path.clone() }),
+    )
+    .unwrap();
+    drive(
+        controller,
+        access.sync_directory(path.parent().unwrap().into()),
+    )
+    .unwrap();
+}
+
 #[cfg(target_os = "linux")]
-async fn pool_and_aio_journals_exchange_rolls_and_progress_with_legacy_recovery() {
-    for aio in [false, true] {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("group");
-        let config = ozzy_io_pool::Config {
+fn real_backend(aio: bool) -> (crate::test_io::RealBackend, Local) {
+    crate::test_io::RealBackend::start(
+        aio,
+        ozzy_io_pool::Config {
             threads: 1,
             max_inflight: 1,
             handles: 32,
             limits: io_limits(),
-        };
-        let (pool, aio_backend, mut clients) = if aio {
-            let (backend, clients) = ozzy_io_aio::Aio::new(ozzy_io_aio::Config {
-                pool: config,
-                depth: 1,
-            })
-            .unwrap();
-            (None, Some(backend), clients)
-        } else {
-            let (pool, clients) = ozzy_io_pool::Pool::new(config).unwrap();
-            (Some(pool), None, clients)
-        };
-        let io = Local::new(clients.remove(0));
+        },
+    )
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn pool_and_aio_journals_exchange_rolls_and_progress() {
+    for aio in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("group");
+        let (backend, io) = real_backend(aio);
         let mut limits = limits();
         limits.io.direct = aio;
         let mut journal = Journal::format(
             path.clone(),
-            io.clone(),
+            io,
             spec(CommitMode::External),
             JournalGeneration(1),
             limits,
@@ -225,54 +274,40 @@ async fn pool_and_aio_journals_exchange_rolls_and_progress_with_legacy_recovery(
         history::check_real_history(&mut journal).await;
         let journal = Box::pin(suffix::check_real_suffix(journal)).await;
         drop(journal);
-        if let Some(pool) = pool {
-            pool.shutdown().await;
-        }
-        if let Some(aio) = aio_backend {
-            aio.shutdown().await;
-        }
-        let directory = GroupDirectory::open_with_configuration(
-            &path,
-            identity(),
-            limits.metadata,
-            b"test deployment",
-        )
-        .unwrap();
-        let mut legacy = directory
-            .recover(JournalGeneration(2), limits.decode, limits.operations)
-            .unwrap();
-        assert_eq!(legacy.accepted_position().unwrap().op_number, 2);
-        assert_eq!(legacy.committed_position().unwrap().op_number, 1);
-        let chain = legacy.writer().written_position().next_chain();
-        let third = CanonicalOperation {
-            op_number: chain.next_op_number(),
-            previous_digest: chain.previous_digest(),
-            group_id: identity().group_id,
-            configuration_epoch: 1,
-            original_view: 0,
-            kind: OperationKind::Barrier,
-            body: &[2; 16],
-        };
-        let written = legacy.append(&[third]).unwrap();
-        legacy.sync_through(written).unwrap();
-        legacy.publish_durable_progress().unwrap();
-        drop(legacy);
-        let (pool, mut clients) = ozzy_io_pool::Pool::new(config).unwrap();
-        let journal = Journal::open(
-            path,
-            Local::new(clients.remove(0)),
-            identity(),
-            Some(b"test deployment"),
-            JournalGeneration(3),
-            limits,
-        )
-        .await
-        .unwrap();
+        backend.shutdown().await;
+        // The other backend continues the same files.
+        let (backend, io) = real_backend(!aio);
+        limits.io.direct = !aio;
+        let mut exchanged = open_real(&path, io, 2, limits).await;
+        assert_eq!(exchanged.accepted_position().unwrap().op_number, 2);
+        assert_eq!(exchanged.committed_position().unwrap().op_number, 1);
+        append_confirmed(&mut exchanged).await;
+        drop(exchanged);
+        backend.shutdown().await;
+        let (backend, io) = real_backend(aio);
+        limits.io.direct = aio;
+        let journal = open_real(&path, io, 3, limits).await;
         assert_eq!(journal.accepted_position().unwrap().op_number, 3);
         assert_eq!(journal.manifest.segments.len(), 2);
         drop(journal);
-        pool.shutdown().await;
+        backend.shutdown().await;
     }
+}
+
+#[cfg(target_os = "linux")]
+async fn open_real(path: &Path, io: Local, generation: u128, limits: Limits) -> Journal {
+    Journal::open(
+        path.to_path_buf(),
+        io,
+        crate::ExpectedStore {
+            identity: identity(),
+            configuration: Some(b"test deployment"),
+        },
+        JournalGeneration(generation),
+        limits,
+    )
+    .await
+    .unwrap()
 }
 
 #[test]
@@ -547,8 +582,10 @@ async fn pool_open(path: PathBuf) -> Result<(), DirectoryError> {
     let result = Journal::open(
         path,
         Local::new(clients.remove(0)),
-        identity(),
-        Some(b"test deployment"),
+        crate::ExpectedStore {
+            identity: identity(),
+            configuration: Some(b"test deployment"),
+        },
         JournalGeneration(9),
         limits(),
     )
@@ -580,27 +617,19 @@ async fn selected_checkpoint_is_read_and_validated_before_active_tail_repair() {
     .unwrap();
     append_confirmed(&mut journal).await;
     journal.publish_progress().await.unwrap();
-    drop(journal);
-    pool.shutdown().await;
-    let legacy = GroupDirectory::open_with_configuration(
-        &path,
-        identity(),
-        limits().metadata,
-        b"test deployment",
-    )
-    .unwrap()
-    .recover(JournalGeneration(2), limits().decode, limits().operations)
-    .unwrap();
     let id = ozzy_proto::CheckpointId::from_bytes([0x55; 16]);
     let state = b"selected checkpoint state";
-    let image = legacy
-        .checkpoint_plan(id, Digest::from_bytes([0x56; 32]), 8)
-        .unwrap()
-        .build(state, limits().checkpoint)
-        .unwrap();
-    let checkpoint_path = image.root().to_path_buf();
-    drop(image);
-    drop(legacy.install_checkpoint(id, limits().checkpoint).unwrap());
+    let schema = Digest::from_bytes([0x56; 32]);
+    drop(
+        journal
+            .build_checkpoint(id, schema, 8, state)
+            .await
+            .unwrap(),
+    );
+    journal.install_checkpoint(id).await.unwrap();
+    let checkpoint_path = path.join("checkpoints").join(crate::checkpoint_name(id));
+    drop(journal);
+    pool.shutdown().await;
 
     let (pool, mut clients) = ozzy_io_pool::Pool::new(ozzy_io_pool::Config {
         threads: 1,
@@ -612,8 +641,10 @@ async fn selected_checkpoint_is_read_and_validated_before_active_tail_repair() {
     let journal = Journal::open(
         path.clone(),
         Local::new(clients.remove(0)),
-        identity(),
-        Some(b"test deployment"),
+        crate::ExpectedStore {
+            identity: identity(),
+            configuration: Some(b"test deployment"),
+        },
         JournalGeneration(3),
         limits(),
     )
@@ -636,6 +667,7 @@ async fn selected_checkpoint_is_read_and_validated_before_active_tail_repair() {
     let original = std::fs::read(&segment_path).unwrap();
     // This tail would be erased by recovery if checkpoint validation were late.
     let mut damaged_tail = original;
+    damaged_tail.resize(32768, 0);
     damaged_tail[8192] = 99;
     std::fs::write(&segment_path, &damaged_tail).unwrap();
     let chunk = checkpoint_path.join(crate::checkpoint::chunk_name(0));

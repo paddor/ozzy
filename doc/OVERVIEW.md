@@ -1,164 +1,128 @@
 # Overview
 
+This page defines Ozzy's terms, its three modes, and how records flow from
+producers through brokers to consumers. Other docs link here for definitions.
+
 Ozzy is a broker-owned, partitioned record log over OMQ. Brokers own storage,
-replication, and confirmation; producer and consumer SDKs own client state.
-OMQ provides routing, framing, reconnects, fairness, and transport backpressure.
+replication, and confirmation. SDKs own client state. OMQ provides routing,
+framing, reconnects, fairness, and transport backpressure.
 
 ## Terms
 
-| Term | Contract |
+| Term | Meaning |
 | --- | --- |
-| Topic | Immutable partition set, incarnation, partitioner, and policy; no total order across partitions |
-| Partition | Shared ordered log with one actor and journal per broker |
-| Offset | Partition-global record position, starting at zero |
-| Producer sequence | Per-producer, per-partition retry position; independent of offsets |
-| Retry identity | Partition, producer ID, epoch, sequence, and exact record identity/bytes |
-| APPEND | Consecutive records from one producer/epoch/partition; no transaction guarantee |
-| Canonical operation | Validated history entry with partition-local operation number and digest |
-| Physical write group | Aligned segment write containing one or more canonical operations |
-| Authority | Group, configuration, view, partition, and owner fences |
-| Session / generation | Link-attempt / subscription fences; neither replaces durable authority |
-| Accepted / written | Validated contiguous history / completed physical writes |
-| Durable | History protected by required barriers and restart evidence |
-| Committed / applied | Policy-confirmed history / confirmed state installed for readers |
-| Producer receipt | Exact confirmed sequence, original partition offset, and achieved policy |
-| Replica receipt / vote | Retained-prefix report / policy-specific confirmation evidence |
-| Retained backing | Complete allocation held by messages or aliases; dequeue releases only queue slots |
-| Retention floor | Earliest readable offset; older reads fail explicitly |
-| Retry floor | Earliest producer sequence with an exact retained result |
-| Consumer checkpoint | Application-saved next offset per partition |
-| Storage checkpoint | Canonical state and original chain anchor; payloads remain in segments |
+| Accepted | History the leader validated as contiguous; not yet confirmed |
+| APPEND | One SDK request: consecutive records from one producer epoch to one partition. Not a transaction |
+| Applied | Committed history installed for readers and replies |
+| Authority | The fences a request or job must match: group, configuration, view, partition, owner |
+| Broker | One server process, named under `[brokers.NAME]`. Owns its journals, replication state, and confirmations |
+| Canonical operation | One validated history entry, with a partition-local operation number and digest |
+| Committed | History that met the topic's confirmation policy |
+| Confirmation | The broker's statement that records met the topic's `confirmation` policy. The writer turns it into receipts |
+| Consumer checkpoint | Next offset per partition, saved by the application (`TopicCheckpoint`) |
+| Consumer group | Named set of `GroupReader` members on one topic. Brokers assign its partitions and store its progress |
+| Coordinator | The partition, chosen by group name, whose journal stores a consumer group's membership and plans |
+| Dedup window | Logical time (`window_millis`) in which the first record with a message ID wins on its partition. Repeats do not extend it |
+| Dispatcher | Broker thread that owns the public sockets and sessions and routes messages to shards |
+| Durable | History protected by the required barriers and restart evidence |
+| Eligible copy | A partition copy that may vote. Copies in recovery or quarantine are nonvoting |
+| Follower | A broker whose copy of a partition is not the leader in the current view |
+| Generation | Fence for one subscription attempt |
+| Group progress | Next offset per partition that brokers store for a consumer group, confirmed like records |
+| Incarnation | Persistent ID of a topic or partition. A reused name never adopts an old store |
+| Journal | One partition's append-only history on one broker, stored as segments |
+| Leader | The broker that admits writes for a partition in the current view |
+| Message ID | Nonzero 16-byte ID the producer gives each record (`MessageId`). Deduplication keys on it |
+| Mode | Single durable, disk quorum, or replicated-persisting; see [modes](#modes) |
+| Offset | A record's position in its partition, from zero, shared by all producers |
+| Partition | Ordered log within a topic, shared by producers. Each broker runs one actor and one journal per partition |
+| Partition actor | Task on a shard that owns one partition's journal, replication state, readers, and dedup index |
+| Physical write group | One aligned segment write holding one or more canonical operations |
+| Producer epoch | Generation of one producer on one partition. Takeover advances it and fences older writers |
+| Producer sequence | Contiguous per-producer position within one partition and epoch, used for retries. Independent of offsets |
+| Reader | Consumer SDK handle (`TopicReader`, `GroupReader`) that reads confirmed records in partition order |
+| Receipt | Per-record result: confirmed sequence, original offset, achieved policy, and whether this attempt stored the record or found a duplicate |
+| Replica receipt | A follower's report of the prefix it retains |
+| Retained backing | The whole allocation held by messages or aliases. Dequeue frees only the queue slot |
+| Retention floor | Earliest readable offset. Older reads fail explicitly |
+| Retry floor | Earliest producer sequence that still has an exact retained result |
+| Retry identity | Partition, producer ID, epoch, sequence, and the exact record identity and bytes |
+| Segment | Append-only journal file of canonical operations and record payloads. Retention deletes whole segments |
+| Session | Fence for one link attempt. Does not replace durable authority |
+| Shard | Broker-local thread that hosts many partition actors. Shard IDs never reach SDKs or storage |
+| Storage checkpoint | Saved canonical state and original chain anchor. Payloads stay in segments |
+| Topic | Named, immutable set of partitions with one partitioner seed and one confirmation policy. No order across partitions |
+| View | Replication term of a partition's three-broker group. A view change elects a new leader |
+| Vote | Mode-specific evidence that a copy counts toward confirmation |
+| Writer | Producer SDK handle (`SharedTopicWriter`) that routes, batches, and retries records for one topic |
 
-## Writers and readers
+## Modes
 
-Topics default to 16 partitions. Keyed routing is
-`XXH3-64(key, topic_seed) % partition_count`; keyless routing is sticky within
-SDK batching. Routing precedes sequencing. Retries retain their partition.
+`cluster.mode` is `single` or `three`; it is set explicitly, never inferred.
+Each topic sets `confirmation`. Single mode accepts only `local-durable`; three
+mode accepts `disk-quorum` or `replicated-persisting` per topic.
 
-Each SDK link owner uses two PEER sockets across all configured brokers:
-control and data. Live consumers add one SUB per broker, shared across topics.
-Partition count adds no client sockets or threads.
+| Mode | `confirmation` | A confirmation means | Availability |
+| --- | --- | --- | --- |
+| Single durable | `local-durable` | The sole broker applied its synchronized local prefix | No failover |
+| Disk quorum (DQ) | `disk-quorum` | Leader and one follower applied matching synchronized history | Two of three brokers |
+| Replicated-persisting (RP) | `replicated-persisting` | Leader and one follower applied matching retained bytes; persistence continues in the background | Two of three brokers |
 
-### Producer to broker
+- Transport receipt and buffered write completion never prove durability.
+- RP can lose an unpersisted tail if every in-memory copy is lost.
+- Single durable has no elections or failover.
+- A failed three-broker group never becomes a single broker.
+- [Replication](REPLICATION.md) owns voting and elections;
+  [storage](STORAGE.md) owns barriers and the failure model.
+
+## Placement
+
+- Every broker in a three-broker group stores every partition.
+- Each partition elects its own leader: `brokers[view % 3]` over the persisted
+  broker order.
+- Each broker places partitions on its own shards. Shard counts may differ
+  between brokers.
+- Routing hints and shard IDs grant no authority.
+
+## Record flow
+
+### Writing
+
+Writers route each record before batching: keyed records by key hash, keyless
+records to one partition per batch. Retries keep their partition.
+[Protocol](PROTOCOL.md#topic-and-routing-contract) owns the hash.
 
 ```mermaid
 flowchart LR
-    A[Producer application]
-    subgraph SDK[Producer SDK]
-        W[Route and batch]
-        SD[Data PEER]
-        SC[Control PEER]
-    end
-    subgraph B[Broker]
-        BD[Data PEER]
-        BC[Control PEER]
-        P[Partition actor]
-    end
-    IO[Device backend]
-    A -->|one record| W
-    W -->|APPEND| SD
-    SD -->|PEER addressed to leader| BD
-    BD -->|dispatcher and inproc| P
-    P -->|owned file jobs| IO
-    IO -->|matching completions| P
-    P -->|APPENDED or NACK via inproc| BC
-    BC -->|PEER| SC
-    SC -->|exact confirmation range| W
-    W -->|per-record receipt| A
+    A[Application] -->|record| W[Writer]
+    W -->|APPEND, data PEER| L[Partition leader]
+    L <-->|three-broker modes| F[Follower]
+    L -->|file jobs| S[(Storage backend)]
+    S -->|completions| L
+    L -->|APPENDED or NACK, control PEER| W
+    W -->|receipt| A
 ```
 
-`send` means local admission. `confirmed` and `flush` observe the configured
-broker policy. A timeout leaves the outcome unknown; retry the same identity
-and bytes. Resume restores producer epochs/sequences; takeover fences the old
-producer. Neither supplies an application outbox.
+- `send` admits a record locally. `confirmed()` and `flush` wait for the
+  topic's confirmation.
+- A timeout leaves the outcome unknown. Retry the same identity and bytes; a
+  confirmed retry returns the original offset.
+- Resume restores producer epochs and sequences; takeover fences the old
+  producer. Neither is an outbox: a crash can lose unconfirmed input.
 
-### Broker to consumer
+### Reading
 
 ```mermaid
 flowchart LR
-    subgraph B[Broker]
-        P[Partition actor]
-        PUB[Reader PUB]
-        BD[Data PEER]
-        BC[Control PEER]
-    end
-    subgraph SDK[Consumer SDK]
-        SUB[SUB per broker]
-        CD[Data PEER]
-        CC[Control PEER]
-        R[Checked offset cursor]
-    end
-    A[Consumer application]
-    P -->|confirmed RECORDS_PUB| PUB
-    PUB -->|PUB to SUB| SUB
-    SUB --> R
-    CC -->|SUBSCRIBE and ACK over PEER| BC
-    BC -->|SUBSCRIBED or NACK over PEER| CC
-    BC -->|dispatcher and inproc| P
-    P -->|bounded replay RECORDS| BD
-    BD -->|PEER| CD
-    CD --> R
-    R -->|individual records| A
-    R -->|gap or quiet interval| CC
+    P[Partition actor] -->|RECORDS_PUB, reader PUB| R[Reader]
+    R -->|SUBSCRIBE, ACK, control PEER| P
+    P -->|replay RECORDS, data PEER| R
+    R -->|records in offset order| A[Application]
 ```
 
-Readers expose confirmed, applied records in partition order. PUB loss is
-repaired over PEER from the next undelivered offset. Slow consumers do not gate
-producer confirmation or extend retention. Applications persist processing
-checkpoints and tolerate replay; exactly-once processing is not provided.
-
-## Partition ownership and leader placement
-
-Every replicated broker stores every partition. Each partition elects its own
-leader using persisted broker order and `brokers[view % 3]`. Local shard counts
-may differ. Routing hints do not establish authority.
-
-## Inside one broker
-
-| Owner | Responsibility |
-| --- | --- |
-| Dispatcher | Public sockets, sessions, routing, source pressure |
-| Application shard | One thread/current-thread runtime hosting partition actors |
-| Partition actor | Replication, journal state, readers; direct same-thread journal calls |
-| OMQ I/O worker | Network framing and socket I/O |
-| Storage backend | File handles, physical jobs, fixed device workers |
-
-Shards are symmetric. Separate bounded control/data lanes prevent bulk traffic
-from consuming progress capacity. Full PEER intake pauses its source; PUB drops.
-
-## What a successful write means
-
-| Mode | Confirmation boundary | Availability |
-| --- | --- | --- |
-| Single-broker durable | Applied local durable prefix | No failover |
-| Disk quorum | Applied matching durable prefix on leader and one follower | Two of three required |
-| Replicated-persisting | Applied matching retained bytes on leader and one follower | Two of three required; persistence continues asynchronously |
-
-Transport receipt and buffered write completion do not establish disk durability.
-RP can lose an unpersisted tail if every volatile copy is lost. A failed cluster
-never becomes a single-broker deployment.
-
-## Segment files and disk reads
-
-Each partition lives under
-`<broker-root>/topics/<topic>/partitions/<partition>/`.
-
-| Files | Purpose |
-| --- | --- |
-| `CONFIGURATION`, identity, lock | Authority, store binding, exclusive ownership |
-| `CURRENT`, `MANIFEST.*` | Select exact segment/checkpoint incarnations |
-| `segments/` | Canonical operations and record payloads |
-| `indexes/` | Rebuildable lookup data |
-| `checkpoints/` | Canonical state and chain anchors |
-| `DURABLE`, `MEMORY_VOTING` | Durable-prefix / RP restart evidence |
-| `staging/` | Unselected replacement work |
-
-Reads use bounded recent caches and indexed cold segments. Captured reads pin
-exact files through physical reclamation; subscriptions do not pin retention.
-
-## Reference
-
-- [Protocol](PROTOCOL.md): frames, commands, sessions, errors.
-- [Runtime](RUNTIME.md): owners, scheduling, SDKs, pressure.
-- [Storage](STORAGE.md): formats, barriers, retention, recovery.
-- [Replication](REPLICATION.md): voting, elections, repair.
+- Readers see only confirmed, applied records, in partition order.
+- Lost PUB messages are repaired over PEER from the next undelivered offset.
+- Slow consumers hold back neither producer confirmation nor retention.
+- Processing is at least once. Save consumer checkpoints or acknowledge records
+  to a consumer group, and tolerate replay. Ozzy never provides exactly-once
+  processing.

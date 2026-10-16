@@ -30,18 +30,10 @@ impl Journal {
         prefix: Option<ActivePrefix>,
     ) -> Result<(Snapshot, Option<ActivePrefix>), JournalIndexError> {
         self.healthy()?;
-        let sources = self
-            .manifest
-            .segments
-            .windows(2)
-            .map(|pair| {
-                crate::directory::sealed_source(self.manifest.identity.group_id, &pair[0], &pair[1])
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         let sealed = Catalog::open(
             self.access.clone(),
             self.root().join("indexes"),
-            sources,
+            self.sealed_sources()?,
             limits,
             self.limits.io.chunk_bytes,
         )
@@ -51,11 +43,7 @@ impl Journal {
             JournalIndexBoundary::Accepted => self.accepted_position()?,
             JournalIndexBoundary::Committed => self.committed_position()?,
         };
-        let reference = self
-            .manifest
-            .segments
-            .last()
-            .expect("validated manifest has active segment");
+        let reference = super::active_segment(&self.manifest.segments)?;
         let active_bytes = self.writer.written_position().end_offset();
         let active_digest = self.writer.state().structural_digest();
         let prefix = prefix.filter(|prefix| prefix.reusable(through.op_number, limits));
@@ -65,7 +53,6 @@ impl Journal {
         let (active, prefix) = ActiveSegmentIndex::build_groups(
             groups,
             prefix,
-            keep,
             through.op_number,
             self.limits.operations,
             limits,
@@ -93,7 +80,18 @@ impl Journal {
             chunk: self.limits.io.chunk_bytes,
             leases: leases.into(),
         };
-        Ok((snapshot, prefix))
+        Ok((snapshot, prefix.filter(|_| keep)))
+    }
+
+    /// Index sources of every sealed segment, oldest first.
+    fn sealed_sources(&self) -> Result<Vec<crate::IndexSource>, DirectoryError> {
+        self.manifest
+            .segments
+            .windows(2)
+            .map(|pair| {
+                crate::directory::sealed_source(self.manifest.identity.group_id, &pair[0], &pair[1])
+            })
+            .collect()
     }
 
     /// Build missing indexes without silently repairing corrupt derived files,

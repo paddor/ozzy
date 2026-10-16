@@ -80,8 +80,9 @@ impl TopicCatalog {
         if topics.is_empty()
             || topics.len() > max_topics
             || topics.values().any(|pages| {
-                let last = pages.last().expect("nonempty topic");
-                last.first + last.partitions.len() as u32 != last.total
+                pages
+                    .last()
+                    .is_none_or(|last| last.first + last.partitions.len() as u32 != last.total)
             })
         {
             return Err(CatalogError::Invalid);

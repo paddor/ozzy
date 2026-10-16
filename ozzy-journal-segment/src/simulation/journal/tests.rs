@@ -1,8 +1,10 @@
 use super::*;
 use ozzy_proto::{GroupId, NodeId, StoreId, VolumeId};
 
-fn memory_voter() -> Journal {
-    let mut journal = Journal::format(
+mod publication;
+
+fn voter() -> Journal {
+    Journal::format(
         GroupIdentity {
             group_id: GroupId::from_bytes([1; 16]),
             replica_node_id: NodeId::from_bytes([2; 16]),
@@ -13,9 +15,12 @@ fn memory_voter() -> Journal {
         vec![5; 32],
         1,
         JournalGeneration(1),
-        97,
     )
-    .unwrap();
+    .unwrap()
+}
+
+fn memory_voter() -> Journal {
+    let mut journal = voter();
     journal.enable_memory_voting().unwrap();
     journal
         .append(&[CanonicalOperation {
@@ -68,12 +73,12 @@ fn drained_restart_marker_never_outruns_data_or_metadata_publication() {
 }
 
 #[test]
-fn omitted_directory_barriers_cannot_turn_a_running_marker_into_a_clean_restart() {
+fn omitted_metadata_barriers_cannot_turn_a_running_marker_into_a_clean_restart() {
     let mut journal = memory_voter();
-    journal.omit_directory_sync(true);
+    journal.omit_metadata_barriers(true);
     journal.drain_memory_voting().unwrap();
     journal.crash();
-    journal.omit_directory_sync(false);
+    journal.omit_metadata_barriers(false);
     assert!(matches!(
         journal.recover(JournalGeneration(2)),
         Err(DirectoryError::MemoryHistoryUnproven)

@@ -3,6 +3,11 @@ use crate::index_file::{
     compare_locations, compare_message_entries, compare_offset_entries, compare_operation_entries,
     encode_message_entry, encode_offset_entry, encode_operation_entry, encode_operation_location,
 };
+use crate::{
+    MESSAGE_INDEX_ENTRY_BYTES, MessageIndexEntry, OFFSET_INDEX_ENTRY_BYTES,
+    OPERATION_INDEX_ENTRY_BYTES, OPERATION_LOCATION_BYTES, OffsetIndexEntry, OperationIndexEntry,
+    OperationLocation,
+};
 use ozzy_io::{Handle, OpenMode, Operation};
 use std::{cmp::Ordering, path::PathBuf};
 
@@ -53,6 +58,34 @@ impl<'a> Output<'a> {
     }
 }
 
+/// One staging-run section: its kind, entry order, and fixed-width encoding.
+struct RunFormat<T, const W: usize> {
+    kind: RunKind,
+    compare: fn(&T, &T) -> Ordering,
+    encode: fn(&T, &mut [u8; W]),
+}
+
+const OFFSETS: RunFormat<OffsetIndexEntry, OFFSET_INDEX_ENTRY_BYTES> = RunFormat {
+    kind: RunKind::Offset,
+    compare: compare_offset_entries,
+    encode: encode_offset_entry,
+};
+const MESSAGES: RunFormat<MessageIndexEntry, MESSAGE_INDEX_ENTRY_BYTES> = RunFormat {
+    kind: RunKind::Message,
+    compare: compare_message_entries,
+    encode: encode_message_entry,
+};
+const OPERATIONS: RunFormat<OperationIndexEntry, OPERATION_INDEX_ENTRY_BYTES> = RunFormat {
+    kind: RunKind::Operation,
+    compare: compare_operation_entries,
+    encode: encode_operation_entry,
+};
+const LOCATIONS: RunFormat<OperationLocation, OPERATION_LOCATION_BYTES> = RunFormat {
+    kind: RunKind::Location,
+    compare: compare_locations,
+    encode: encode_operation_location,
+};
+
 impl PendingRuns {
     pub(super) async fn flush_async(
         &mut self,
@@ -60,42 +93,34 @@ impl PendingRuns {
     ) -> Result<(), IndexBuildError> {
         write_typed_run(
             &mut self.offsets,
-            RunKind::Offset,
+            OFFSETS,
             workspace,
             &mut self.offset_runs,
             self.max_runs,
-            compare_offset_entries,
-            encode_offset_entry,
         )
         .await?;
         write_typed_run(
             &mut self.messages,
-            RunKind::Message,
+            MESSAGES,
             workspace,
             &mut self.message_runs,
             self.max_runs,
-            compare_message_entries,
-            encode_message_entry,
         )
         .await?;
         write_typed_run(
             &mut self.operations,
-            RunKind::Operation,
+            OPERATIONS,
             workspace,
             &mut self.operation_runs,
             self.max_runs,
-            compare_operation_entries,
-            encode_operation_entry,
         )
         .await?;
         write_typed_run(
             &mut self.locations,
-            RunKind::Location,
+            LOCATIONS,
             workspace,
             &mut self.location_runs,
             self.max_runs,
-            compare_locations,
-            encode_operation_location,
         )
         .await?;
         self.buffered_bytes = 0;
@@ -103,15 +128,18 @@ impl PendingRuns {
     }
 }
 
-async fn write_typed_run<T>(
+async fn write_typed_run<T, const W: usize>(
     entries: &mut Vec<T>,
-    kind: RunKind,
+    format: RunFormat<T, W>,
     workspace: &mut Workspace,
     runs: &mut Vec<PathBuf>,
     max_runs: usize,
-    compare: fn(&T, &T) -> Ordering,
-    encode: fn(&T, &mut [u8]),
 ) -> Result<(), IndexBuildError> {
+    let RunFormat {
+        kind,
+        compare,
+        encode,
+    } = format;
     if entries.is_empty() {
         return Ok(());
     }
@@ -132,7 +160,8 @@ async fn write_typed_run<T>(
         .open(path.clone(), OpenMode::CreateNew, false, false)
         .await?;
     let mut output = Output::new(&workspace.access, &file, workspace.limits.chunk_bytes);
-    let mut buffer = vec![0; kind.width()];
+    debug_assert_eq!(kind.width(), W);
+    let mut buffer = [0; W];
     for entry in entries.iter() {
         buffer.fill(0);
         encode(entry, &mut buffer);
@@ -199,14 +228,12 @@ async fn merge_runs(
     let mut output = Output::new(&workspace.access, &file, workspace.limits.chunk_bytes);
     let mut previous = Vec::new();
     let mut budget = crate::cooperative::Budget::default();
-    while let Some(selected) = readers
+    while let Some((selected, entry)) = readers
         .iter()
         .enumerate()
         .filter_map(|(index, reader)| reader.head().map(|entry| (index, entry)))
         .min_by(|(_, a), (_, b)| a[..kind.key_bytes()].cmp(&b[..kind.key_bytes()]))
-        .map(|(index, _)| index)
     {
-        let entry = readers[selected].head().expect("selected entry");
         let key = &entry[..kind.key_bytes()];
         if !previous.is_empty() && previous.as_slice() >= key {
             return Err(IndexFileError::UnsortedOrDuplicate(kind.name()).into());

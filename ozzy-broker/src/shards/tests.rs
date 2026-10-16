@@ -89,13 +89,13 @@ async fn non_send_partition_tasks_share_symmetric_fixed_shard_threads() {
                         tasks.push(tokio::task::spawn_local(async move {
                             assert_eq!(std::thread::current().id(), id);
                             let payload = memory.lease(32).await.unwrap().freeze();
-                            shutdown.requested().await;
+                            shutdown.closed().await;
                             drop(payload);
                             local.set(local.get() + 1);
                         }));
                     }
                     context.ready()?;
-                    context.shutdown.requested().await;
+                    context.shutdown.closed().await;
                     for task in tasks {
                         task.await.unwrap();
                     }
@@ -150,7 +150,7 @@ async fn failed_placement_wakes_other_shards_still_initializing() {
             let drained = drained.clone();
             async move {
                 // This shard intentionally never publishes readiness.
-                context.shutdown.requested().await;
+                context.shutdown.closed().await;
                 drained.fetch_add(1, Ordering::Release);
                 Ok(())
             }
@@ -180,7 +180,7 @@ async fn cancellation_of_shutdown_observation_does_not_drop_worker_drain() {
             let completed = completed.clone();
             async move {
                 context.ready()?;
-                context.shutdown.requested().await;
+                context.shutdown.closed().await;
                 drain.acquire().await.unwrap().forget();
                 completed.fetch_add(1, Ordering::Release);
                 Ok(())
@@ -217,7 +217,7 @@ async fn one_runtime_panic_stops_and_drains_the_other_shards() {
                     trigger.acquire().await.unwrap().forget();
                     panic!("injected application failure");
                 }
-                context.shutdown.requested().await;
+                context.shutdown.closed().await;
                 drained.fetch_add(1, Ordering::Release);
                 Ok(())
             }
@@ -241,7 +241,7 @@ async fn dropping_startup_requests_independent_thread_shutdown() {
         move |context| {
             let finished = finished.clone();
             async move {
-                context.shutdown.requested().await;
+                context.shutdown.closed().await;
                 finished.add_permits(1);
                 Ok(())
             }
@@ -282,7 +282,7 @@ async fn affinity_is_installed_before_factory_and_local_state_allocation() {
         local.fill(42);
         async move {
             context.ready()?;
-            context.shutdown.requested().await;
+            context.shutdown.closed().await;
             assert_eq!(local[0], 42);
             Ok(())
         }

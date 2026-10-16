@@ -5,7 +5,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, oneshot};
 
 mod dispatch;
 mod sessions;
@@ -63,21 +63,26 @@ fn local() -> NodeId {
     NodeId::from_bytes([9; 16])
 }
 
+fn frontend_plan<'a>(plan: &'a BrokerPlan, endpoints: &'a Endpoints) -> FrontendPlan<'a> {
+    FrontendPlan {
+        broker: plan,
+        local: local(),
+        endpoints,
+        limits: limits(),
+    }
+}
+
 async fn serve(mut context: FrontendContext) -> Result<(), StartupError> {
     context.ready()?;
-    context.shutdown.requested().await;
+    context.shutdown.closed().await;
     Ok(())
 }
 
 async fn rebound(context: &Context, endpoints: &Endpoints) {
-    let sockets = Sockets::bind(
-        context,
-        local(),
-        Bindings::parse(endpoints).unwrap(),
-        limits(),
-    )
-    .await
-    .expect("frontend left a bound endpoint behind");
+    let bindings = Bindings::parse(frontend_plan(&plan(), endpoints)).unwrap();
+    let (sockets, _) = Sockets::bind(context, bindings)
+        .await
+        .expect("frontend left a bound endpoint behind");
     sockets.close().await.unwrap();
 }
 
@@ -88,10 +93,7 @@ async fn owned_dispatcher_runs_non_send_state_and_closes_all_shared_sockets() {
     let endpoints = endpoints(true);
     let (tx, rx) = oneshot::channel();
     let frontend = Frontend::start_with_context(
-        &plan(),
-        local(),
-        &endpoints,
-        limits(),
+        frontend_plan(&plan(), &endpoints),
         context.clone(),
         move |mut context| {
             assert_ne!(std::thread::current().id(), main);
@@ -116,7 +118,7 @@ async fn owned_dispatcher_runs_non_send_state_and_closes_all_shared_sockets() {
                 });
                 task.await.unwrap();
                 context.ready()?;
-                context.shutdown.requested().await;
+                context.shutdown.closed().await;
                 assert_eq!(state.get(), 1);
                 Ok(())
             }
@@ -151,10 +153,7 @@ async fn failed_bind_closes_previously_bound_endpoints_before_returning() {
         };
         blocker.bind(endpoint.parse().unwrap()).await.unwrap();
         let result = Frontend::start_with_context(
-            &plan(),
-            local(),
-            &endpoints,
-            limits(),
+            frontend_plan(&plan(), &endpoints),
             context.clone(),
             |_| async {
                 panic!("factory must not run after a failed bind");
@@ -173,10 +172,7 @@ async fn startup_error_and_synchronous_factory_panic_close_bound_sockets() {
         let context = Context::new();
         let endpoints = endpoints(true);
         let result = Frontend::start_with_context(
-            &plan(),
-            local(),
-            &endpoints,
-            limits(),
+            frontend_plan(&plan(), &endpoints),
             context.clone(),
             move |_| {
                 assert!(!panic, "injected factory panic");
@@ -201,11 +197,11 @@ async fn startup_error_and_synchronous_factory_panic_close_bound_sockets() {
 #[tokio::test]
 async fn canceled_shutdown_observation_preserves_drain_and_error() {
     let finish = Arc::new(Semaphore::new(0));
-    let frontend = Frontend::start(&plan(), local(), &endpoints(false), limits(), {
+    let frontend = Frontend::start(frontend_plan(&plan(), &endpoints(false)), {
         let finish = finish.clone();
         move |mut context| async move {
             context.ready()?;
-            context.shutdown.requested().await;
+            context.shutdown.closed().await;
             finish.acquire().await.unwrap().forget();
             Err(error("injected drain failure"))
         }
@@ -236,10 +232,7 @@ async fn canceled_startup_and_drop_request_shutdown_without_waiting() {
         let finish = Arc::new(Semaphore::new(0));
         let completed = Arc::new(AtomicBool::new(false));
         let mut startup = Box::pin(Frontend::start_with_context(
-            &plan,
-            local(),
-            &endpoints,
-            limits(),
+            frontend_plan(&plan, &endpoints),
             context.clone(),
             {
                 let finish = finish.clone();
@@ -249,7 +242,7 @@ async fn canceled_startup_and_drop_request_shutdown_without_waiting() {
                     if ready {
                         context.ready()?;
                     }
-                    context.shutdown.requested().await;
+                    context.shutdown.closed().await;
                     finish.acquire().await.unwrap().forget();
                     completed.store(true, Ordering::Release);
                     Ok(())
@@ -270,7 +263,7 @@ async fn canceled_startup_and_drop_request_shutdown_without_waiting() {
         assert!(!completed.load(Ordering::Acquire));
         finish.add_permits(1);
         if let Some(state) = state {
-            state.finished.requested().await;
+            state.finished.closed().await;
             state.result().unwrap();
         } else {
             tokio::time::timeout(Duration::from_secs(5), async {
@@ -289,16 +282,9 @@ async fn validation_rejects_borrowed_runtime_and_bad_placement_before_factory() 
     let plan = plan();
     let endpoints = endpoints(false);
     assert!(
-        Frontend::start_with_context(
-            &plan,
-            local(),
-            &endpoints,
-            limits(),
-            Context::current(),
-            serve
-        )
-        .await
-        .is_err()
+        Frontend::start_with_context(frontend_plan(&plan, &endpoints), Context::current(), serve)
+            .await
+            .is_err()
     );
     let mut plan = plan;
     plan.dispatcher = Affinity {
@@ -306,7 +292,7 @@ async fn validation_rejects_borrowed_runtime_and_bad_placement_before_factory() 
         numa_node: None,
     };
     assert!(
-        Frontend::start(&plan, local(), &endpoints, limits(), serve)
+        Frontend::start(frontend_plan(&plan, &endpoints), serve)
             .await
             .is_err()
     );
@@ -322,22 +308,16 @@ async fn dispatcher_affinity_precedes_factory_and_leaves_coordinator_unchanged()
         .unwrap();
     let mut plan = plan();
     plan.dispatcher.cpu = Some(cpu as u32);
-    let frontend = Frontend::start(
-        &plan,
-        local(),
-        &endpoints(false),
-        limits(),
-        move |context| {
-            let actual = sched_getaffinity(None).unwrap();
-            assert_eq!(
-                (0..CpuSet::MAX_CPU)
-                    .filter(|&cpu| actual.is_set(cpu))
-                    .collect::<Vec<_>>(),
-                [cpu]
-            );
-            serve(context)
-        },
-    )
+    let frontend = Frontend::start(frontend_plan(&plan, &endpoints(false)), move |context| {
+        let actual = sched_getaffinity(None).unwrap();
+        assert_eq!(
+            (0..CpuSet::MAX_CPU)
+                .filter(|&cpu| actual.is_set(cpu))
+                .collect::<Vec<_>>(),
+            [cpu]
+        );
+        serve(context)
+    })
     .await
     .unwrap();
     assert_eq!(sched_getaffinity(None).unwrap(), inherited);

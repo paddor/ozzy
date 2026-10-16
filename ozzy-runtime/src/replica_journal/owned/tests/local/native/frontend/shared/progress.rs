@@ -98,18 +98,11 @@ async fn reader_at(
     reason = "keep the controlled fault schedule and its assertions together"
 )]
 async fn sdk_processing_handoff_fences_old_tokens_and_retries_the_captured_start() {
-    let (mut harness, links, _, hint) = Box::pin(setup_shared_directory_profile(
-        &[],
-        1,
-        Some((2, 4096, 2)),
-        false,
-        Some(ProgressHistory::Available),
-    ))
-    .await;
+    let (mut harness, links, _, hint) = setup_progress(1, Some((2, 4096, 2))).await;
     harness.publish = false;
     let sockets = links.socket_count();
     let topic = harness.drive(links.topic("orders"), true).await.unwrap();
-    let routes = links.routes(topic.clone()).unwrap();
+    let routes = links.routes(topic.clone()).await.unwrap();
     let budget = Arc::new(Semaphore::new(4096));
     let (mut old, publisher) = Window::new(identity(), Offset::ZERO, 2, &budget).unwrap();
     let old_owner =
@@ -241,18 +234,11 @@ async fn sdk_processing_handoff_fences_old_tokens_and_retries_the_captured_start
 
 #[tokio::test(flavor = "current_thread")]
 async fn sdk_processing_reads_acknowledges_and_resumes_from_persisted_broker_progress() {
-    let (mut harness, links, _, hint) = Box::pin(setup_shared_directory_profile(
-        &[],
-        1,
-        Some((2, 4096, 2)),
-        false,
-        Some(ProgressHistory::Available),
-    ))
-    .await;
+    let (mut harness, links, _, hint) = setup_progress(1, Some((2, 4096, 2))).await;
     harness.publish = false;
     let sockets = links.socket_count();
     let topic = harness.drive(links.topic("orders"), true).await.unwrap();
-    let routes = links.routes(topic.clone()).unwrap();
+    let routes = links.routes(topic.clone()).await.unwrap();
     let budget = Arc::new(Semaphore::new(4096));
     let mut old_waiters = Vec::new();
     for (from, end) in [(0, 2), (2, 3)] {
@@ -314,19 +300,12 @@ async fn sdk_processing_reads_acknowledges_and_resumes_from_persisted_broker_pro
 
 #[tokio::test(flavor = "current_thread")]
 async fn sdk_processing_owner_closes_ready_holes_without_further_caller_polls() {
-    let (mut harness, links, _, _) = Box::pin(setup_shared_directory_profile(
-        &[],
-        1,
-        None,
-        false,
-        Some(ProgressHistory::Available),
-    ))
-    .await;
+    let (mut harness, links, _, _) = setup_progress(1, None).await;
     let topic = harness.drive(links.topic("orders"), true).await.unwrap();
     let budget = Arc::new(Semaphore::new(4096));
     let (mut window, publisher) = Window::new(identity(), Offset::ZERO, 3, &budget).unwrap();
     let owner = driver::start(
-        links.routes(topic).unwrap(),
+        links.routes(topic).await.unwrap(),
         0,
         publisher,
         RetryPolicy::default(),
@@ -382,19 +361,12 @@ async fn sdk_processing_owner_closes_ready_holes_without_further_caller_polls() 
 
 #[tokio::test(flavor = "current_thread")]
 async fn sdk_processing_owner_recovers_lost_reply_with_the_latest_cumulative_intent() {
-    let (mut harness, links, clock, hint) = Box::pin(setup_shared_directory_profile(
-        &[],
-        1,
-        None,
-        false,
-        Some(ProgressHistory::Available),
-    ))
-    .await;
+    let (mut harness, links, clock, hint) = setup_progress(1, None).await;
     let topic = harness.drive(links.topic("orders"), true).await.unwrap();
     let budget = Arc::new(Semaphore::new(4096));
     let (mut window, publisher) = Window::new(identity(), Offset::ZERO, 2, &budget).unwrap();
     let owner = driver::start(
-        links.routes(topic).unwrap(),
+        links.routes(topic).await.unwrap(),
         0,
         publisher,
         RetryPolicy::default(),
@@ -451,19 +423,12 @@ async fn sdk_processing_owner_recovers_lost_reply_with_the_latest_cumulative_int
 
 #[tokio::test(flavor = "current_thread")]
 async fn sdk_processing_owner_resends_a_lost_request_without_a_second_commit() {
-    let (mut harness, links, clock, hint) = Box::pin(setup_shared_directory_profile(
-        &[],
-        1,
-        None,
-        false,
-        Some(ProgressHistory::Available),
-    ))
-    .await;
+    let (mut harness, links, clock, hint) = setup_progress(1, None).await;
     let topic = harness.drive(links.topic("orders"), true).await.unwrap();
     let budget = Arc::new(Semaphore::new(4096));
     let (mut window, publisher) = Window::new(identity(), Offset::ZERO, 2, &budget).unwrap();
     let owner = driver::start(
-        links.routes(topic).unwrap(),
+        links.routes(topic).await.unwrap(),
         0,
         publisher,
         RetryPolicy::default(),
@@ -519,19 +484,12 @@ async fn sdk_processing_owner_stop_releases_waiters_before_an_admitted_write_fin
         (ProgressError::Fenced, false),
         (ProgressError::Closed, true),
     ] {
-        let (mut harness, links, _, hint) = Box::pin(setup_shared_directory_profile(
-            &[],
-            1,
-            None,
-            false,
-            Some(ProgressHistory::Available),
-        ))
-        .await;
+        let (mut harness, links, _, hint) = setup_progress(1, None).await;
         let topic = harness.drive(links.topic("orders"), true).await.unwrap();
         let budget = Arc::new(Semaphore::new(4096));
         let (mut window, publisher) = Window::new(identity(), Offset::ZERO, 1, &budget).unwrap();
         let owner = driver::start(
-            links.routes(topic).unwrap(),
+            links.routes(topic).await.unwrap(),
             0,
             publisher,
             RetryPolicy::default(),
@@ -607,21 +565,14 @@ async fn sdk_processing_owner_stop_releases_waiters_before_an_admitted_write_fin
 
 #[tokio::test(flavor = "current_thread")]
 async fn sdk_processing_owner_preserves_source_assignment_fencing() {
-    let (mut harness, links, _, _) = Box::pin(setup_shared_directory_profile(
-        &[],
-        1,
-        None,
-        false,
-        Some(ProgressHistory::Available),
-    ))
-    .await;
+    let (mut harness, links, _, _) = setup_progress(1, None).await;
     let topic = harness.drive(links.topic("orders"), true).await.unwrap();
     let budget = Arc::new(Semaphore::new(4096));
     let mut wrong = identity();
     wrong.member = ConsumerMemberId::from_bytes([99; 16]);
     let (mut window, publisher) = Window::new(wrong, Offset::ZERO, 1, &budget).unwrap();
     let owner = driver::start(
-        links.routes(topic).unwrap(),
+        links.routes(topic).await.unwrap(),
         0,
         publisher,
         RetryPolicy::default(),
@@ -647,14 +598,7 @@ async fn sdk_processing_owner_preserves_source_assignment_fencing() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn sdk_progress_over_inproc_waits_for_disk_and_recovers_after_a_lost_reply() {
-    let (mut harness, links, clock, hint) = Box::pin(setup_shared_directory_profile(
-        &[],
-        1,
-        None,
-        false,
-        Some(ProgressHistory::Available),
-    ))
-    .await;
+    let (mut harness, links, clock, hint) = setup_progress(1, None).await;
     assert_eq!(links.socket_count(), 2, "progress reuses broker sockets");
     let before = accepted(&harness);
     let mut pending = pin!(links.group_progress(hint.primary, request(hint.authority, Some(2))));
@@ -807,14 +751,7 @@ async fn sdk_progress_cancellation_keeps_commit_and_retention_errors_do_not_rese
 )]
 async fn sdk_activation_over_shared_links_allocates_epochs_and_reports_typed_rejections() {
     use ozzy_proto::group::{self, AssignRequest, Start};
-    let (mut harness, links, _, hint) = Box::pin(setup_shared_directory_profile(
-        &[],
-        1,
-        None,
-        false,
-        Some(ProgressHistory::Available),
-    ))
-    .await;
+    let (mut harness, links, _, hint) = setup_progress(1, None).await;
     let sockets = links.socket_count();
     let request = AssignRequest {
         authority: hint.authority,

@@ -1,5 +1,6 @@
 //! Bounded canonical body validation failures.
 
+use ozzy_proto::layout::LayoutError;
 use thiserror::Error;
 
 /// Canonical operation body codec failure.
@@ -80,4 +81,20 @@ pub enum OperationCodecError {
         /// Configured maximum size or count.
         limit: usize,
     },
+    #[error("record range is outside its batch")]
+    /// A selected record range is reversed or ends past its batch.
+    RecordRange,
+    #[error("record list cannot extend another representation")]
+    /// An extension does not match the record list representation.
+    RecordListKind,
+}
+
+impl From<LayoutError> for OperationCodecError {
+    fn from(error: LayoutError) -> Self {
+        match error {
+            LayoutError::Truncated { needed, available } => Self::Truncated { needed, available },
+            LayoutError::Trailing(bytes) => Self::TrailingBytes(bytes),
+            LayoutError::Overflow { .. } => Self::LengthOverflow,
+        }
+    }
 }

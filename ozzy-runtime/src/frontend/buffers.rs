@@ -1,6 +1,7 @@
 //! Receive allocation accounting at the ordinary OMQ boundary. Metadata gets
 //! compact owners; opaque payloads keep their original backing allocation.
 
+use crate::transport::Frames;
 use bytes::Bytes;
 use omq_tokio::{Message, message::Payload};
 use ozzy_proto::{ENVELOPE_BYTES, EnvelopeLimits};
@@ -177,25 +178,39 @@ impl ReceiveBuffers {
     /// Normalize a received frame without consuming it. The caller can return
     /// the original frame to its source lane if destination admission is full.
     pub fn prepare_borrowed(&self, message: &Message) -> Result<(Message, usize), BufferError> {
-        if message.len() == 2 && message.part_slice(0).is_some_and(|id| id.len() == 16) {
-            ozzy_replication::wire::CompactState::decode(message.part_slice(1).unwrap_or_default())
-                .map_err(|_| BufferError::Frames)?;
-            let normalized = Message::multipart_payloads([
-                Payload::from_slice(message.part_slice(0).unwrap()),
-                Payload::from_slice(message.part_slice(1).unwrap()),
-            ]);
-            return Ok((
-                normalized,
-                DESCRIPTORS + 16 + ozzy_replication::wire::COMPACT_STATE_BYTES,
-            ));
+        if let Some([id, state]) = message.frames().filter(|[id, _]| id.len() == 16) {
+            return prepare_compact(id, state);
         }
-        if message.len() != 4 || message.part_slice(0).is_none_or(|id| id.len() != 16) {
+        let Some((id, frames)) = message.routed_packet().filter(|(id, _)| id.len() == 16) else {
             return Err(BufferError::Frames);
-        }
-        let frames: [&[u8]; 3] =
-            std::array::from_fn(|index| message.part_slice(index + 1).unwrap());
+        };
         ozzy_proto::decode_packet(&frames, self.limits).map_err(|_| BufferError::Frames)?;
         let payload_bytes = frames[2].len();
+        self.check_size(message, payload_bytes)?;
+        let backing = self.retained_backing(message, payload_bytes);
+        // Discard even an empty Bytes owner: empty application frames must not
+        // smuggle an unrelated allocation through the zero-payload charge.
+        let payload = if payload_bytes == 0 {
+            Bytes::new()
+        } else {
+            message.part_bytes(3).ok_or(BufferError::Frames)?
+        };
+        let retained = DESCRIPTORS
+            + 16
+            + ENVELOPE_BYTES
+            + frames[1].len()
+            + if payload_bytes == 0 { 0 } else { backing };
+        let normalized = Message::multipart_payloads([
+            Payload::from_slice(id),
+            Payload::from_slice(frames[0]),
+            Payload::from_slice(frames[1]),
+            Payload::from_bytes_with_retained_size(payload, backing),
+        ]);
+        Ok((normalized, retained))
+    }
+
+    /// Reject a frame larger than the configured message or payload backing.
+    fn check_size(&self, message: &Message, payload_bytes: usize) -> Result<(), BufferError> {
         match self.storage {
             ReceiveStorage::Stream { message_bytes } => {
                 if message.max_message_size_len() > message_bytes {
@@ -216,43 +231,39 @@ impl ReceiveBuffers {
                 }
             }
         }
-        // Small stream frames can share an entire read chunk. Large frames can
-        // reuse a larger pool slot. Charge the backing, not the visible slice.
-        let mut backing = self.payload_backing(payload_bytes);
+        Ok(())
+    }
+
+    /// Small stream frames can share an entire read chunk. Large frames can
+    /// reuse a larger pool slot. Charge the backing, not the visible slice.
+    fn retained_backing(&self, message: &Message, payload_bytes: usize) -> usize {
+        let backing = self.payload_backing(payload_bytes);
         // OMQ's large stream read owns its buffer and reports its capacity.
         // Preserve that evidence instead of charging every frame as the
         // largest reusable pool slot. Opaque read chunks retain the fallback.
-        if payload_bytes >= 128 * 1024 {
-            let mut parts = message.clone();
-            for _ in 0..3 {
-                parts.pop_front_payload();
-            }
-            if let Some(retained) = parts.retained_size() {
-                // The configured profile also proves an upper bound. Its
-                // descriptor allowance covers OMQ's accounted-owner overhead.
-                backing = backing.min(retained);
-            }
+        if payload_bytes < 128 * 1024 {
+            return backing;
         }
-        // Discard even an empty Bytes owner: empty application frames must not
-        // smuggle an unrelated allocation through the zero-payload charge.
-        let payload = if payload_bytes == 0 {
-            Bytes::new()
-        } else {
-            message.part_bytes(3).expect("validated payload")
-        };
-        let retained = DESCRIPTORS
-            + 16
-            + ENVELOPE_BYTES
-            + frames[1].len()
-            + if payload_bytes == 0 { 0 } else { backing };
-        let normalized = Message::multipart_payloads([
-            Payload::from_slice(message.part_slice(0).unwrap()),
-            Payload::from_slice(frames[0]),
-            Payload::from_slice(frames[1]),
-            Payload::from_bytes_with_retained_size(payload, backing),
-        ]);
-        Ok((normalized, retained))
+        let mut parts = message.clone();
+        for _ in 0..3 {
+            parts.pop_front_payload();
+        }
+        // The configured profile also proves an upper bound. Its descriptor
+        // allowance covers OMQ's accounted-owner overhead.
+        parts
+            .retained_size()
+            .map_or(backing, |retained| backing.min(retained))
     }
+}
+
+fn prepare_compact(id: &[u8], state: &[u8]) -> Result<(Message, usize), BufferError> {
+    ozzy_replication::wire::CompactState::decode(state).map_err(|_| BufferError::Frames)?;
+    let normalized =
+        Message::multipart_payloads([Payload::from_slice(id), Payload::from_slice(state)]);
+    Ok((
+        normalized,
+        DESCRIPTORS + 16 + ozzy_replication::wire::COMPACT_STATE_BYTES,
+    ))
 }
 
 fn stream_backing(payload_bytes: usize, message_bytes: usize) -> usize {

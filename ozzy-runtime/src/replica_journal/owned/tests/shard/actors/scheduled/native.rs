@@ -101,7 +101,7 @@ fn cluster_with_window(
                 NativeIntake::new(
                     NativeIntakeConfig {
                         local: NodeId::from_bytes([1; 16]),
-                        group: actor.subscribe().borrow().scope.group_id,
+                        group: actor.status().scope.group_id,
                         partition: partition(),
                         policy: match policy {
                             QuorumPolicy::Durable => append::Policy::QuorumDurable,

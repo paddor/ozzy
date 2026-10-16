@@ -1,11 +1,10 @@
 use crate::{CheckedConfig, StartupError};
-use ozzy_config::{Confirmation, IoBackend, PartitionPlacement};
+use ozzy_config::{BrokerPlan, Confirmation, ControllerPlan, IoBackend, PartitionPlacement, Topic};
 use ozzy_journal::operation::OperationLimits;
 use ozzy_journal_segment::{
-    AsyncJournalLimits, AsyncPartitionReadLimits, AsyncSegmentOptions, CanonicalRecoveryLimits,
-    CheckpointLimits, DecodeLimits, ENTRY_HEADER_BYTES, GROUP_SEAL_BYTES, GroupIdentity,
-    IndexBuildLimits, MetadataLimits, SEGMENT_HEADER_BYTES, SegmentWriteMode,
-    WRITE_GROUP_ALIGNMENT,
+    CanonicalRecoveryLimits, CheckpointLimits, DecodeLimits, ENTRY_HEADER_BYTES, GROUP_SEAL_BYTES,
+    GroupIdentity, IndexBuildLimits, JournalLimits, MetadataLimits, PartitionReadLimits,
+    SEGMENT_HEADER_BYTES, SegmentOptions, SegmentWriteMode, WRITE_GROUP_ALIGNMENT,
 };
 use ozzy_replication::PipelineLimits;
 use ozzy_runtime::replica_journal::OwnedConfig;
@@ -14,10 +13,10 @@ const CORE_CHECKPOINT_BYTES: usize = 32 * 1024 * 1024;
 
 /// Finite journal work bounds. Shared shard admission bounds aggregate live requests.
 pub(super) struct Settings {
-    limits: AsyncJournalLimits,
+    limits: JournalLimits,
     recovery: CanonicalRecoveryLimits,
     pipeline: PipelineLimits,
-    reads: AsyncPartitionReadLimits,
+    reads: PartitionReadLimits,
     clients: usize,
 }
 
@@ -32,83 +31,26 @@ impl Settings {
                 placement.topic, placement.partition,
             ))
         };
-        let topic = &checked.deployment.deployment().topics[&placement.topic];
-        let native = |bytes| usize::try_from(bytes).map_err(|_| error("byte limit overflow"));
-        let Execution {
-            backend,
-            lane,
-            direct,
-            operations,
-            resident_operations,
-            resident_bytes,
-        } = execution(checked, placement)?;
-        let data = backend.share(lane, ozzy_io::Class::Data).bytes;
-        let progress = backend.share(lane, ozzy_io::Class::Progress).bytes;
-        let body = native(topic.max_append_bytes)?;
-        let segment = native(topic.segment_bytes)?;
-        if body < 1024 || operations == 0 {
-            return Err(error(
-                "journal needs at least 1 KiB APPEND and one operation",
-            ));
-        }
-        check_write(operations, body, segment, data).map_err(error)?;
-        let chunk = (progress / 4).min(64 * 1024) / WRITE_GROUP_ALIGNMENT * WRITE_GROUP_ALIGNMENT;
-        if chunk < WRITE_GROUP_ALIGNMENT {
-            return Err(error(
-                "backend progress share cannot fit a segment transfer",
-            ));
-        }
+        let topic = checked.deployment.deployment().topic(&placement.topic)?;
+        let execution = execution(checked, placement)?;
+        let sizes = Sizes::check(topic, &execution).map_err(error)?;
         let pipeline = PipelineLimits {
-            max_operations: operations,
-            max_body_bytes: body,
+            max_operations: sizes.operations,
+            max_body_bytes: sizes.body,
         };
-        let listing = ((progress / 256).min(1024), (progress / 4).min(64 * 1024));
         let mut snapshot = CanonicalRecoveryLimits::default().snapshot;
         snapshot.max_snapshot_bytes = CORE_CHECKPOINT_BYTES;
         let checkpoint =
-            checkpoint_limits(placement, listing).map_err(|failure| error(&failure.to_string()))?;
+            checkpoint_limits(placement, sizes).map_err(|failure| error(&failure.to_string()))?;
         let index = IndexBuildLimits {
-            max_entry_buffer_bytes: chunk,
+            max_entry_buffer_bytes: sizes.chunk,
             max_merge_fan_in: 8,
             max_resident_bytes: 0,
             ..IndexBuildLimits::default()
         };
-        let limits = AsyncJournalLimits {
-            metadata: MetadataLimits {
-                max_manifest_bytes: 64 * 1024,
-                max_segments: 256,
-            },
-            decode: DecodeLimits {
-                max_groups: segment / WRITE_GROUP_ALIGNMENT,
-                max_entries: operations,
-                max_entry_bytes: body + ENTRY_HEADER_BYTES + 7,
-                max_decoded_body_bytes: body,
-                max_group_decoded_body_bytes: body,
-                max_segment_decoded_body_bytes: segment,
-            },
-            operations: OperationLimits {
-                max_body_bytes: body,
-                max_records: 2048,
-                max_payload_bytes: body,
-                ..OperationLimits::default()
-            },
-            checkpoint,
-            io: AsyncSegmentOptions {
-                max_segment_bytes: topic.segment_bytes,
-                chunk_bytes: chunk,
-                direct,
-                write_mode: match topic.confirmation {
-                    Confirmation::ReplicatedPersisting => SegmentWriteMode::Buffered,
-                    Confirmation::LocalDurable | Confirmation::DiskQuorum => {
-                        SegmentWriteMode::DataSync
-                    }
-                },
-            },
-            directory_entries: listing.0,
-            directory_name_bytes: listing.1,
-        };
+        let limits = sizes.journal_limits(topic, execution.direct, checkpoint);
         limits
-            .validate_backend(backend, lane, &placement.directory)
+            .validate_backend(execution.backend, execution.lane, &placement.directory)
             .map_err(|failure| error(&failure.to_string()))?;
         let recovery = CanonicalRecoveryLimits {
             retained_identities: 4096,
@@ -122,7 +64,11 @@ impl Settings {
             limits,
             recovery,
             pipeline,
-            reads: reader_limits(index, resident_operations, resident_bytes),
+            reads: reader_limits(
+                index,
+                execution.resident_operations,
+                execution.resident_bytes,
+            ),
             clients: checked.deployment.deployment().limits.max_clients,
         })
     }
@@ -159,6 +105,90 @@ impl Settings {
     }
 }
 
+/// Checked write path sizes of one partition, from its topic and its share of
+/// the device lane.
+#[derive(Debug, Clone, Copy)]
+struct Sizes {
+    operations: usize,
+    body: usize,
+    segment: usize,
+    /// Physical transfer size, also the index entry buffer.
+    chunk: usize,
+    /// Directory entries one listing may return.
+    directory_entries: usize,
+    /// Directory name bytes one listing may return.
+    directory_name_bytes: usize,
+}
+
+impl Sizes {
+    fn check(topic: &Topic, execution: &Execution) -> Result<Self, &'static str> {
+        let native = |bytes| usize::try_from(bytes).map_err(|_| "byte limit overflow");
+        let (data, progress) = share_bytes(execution.backend, execution.lane)
+            .map_err(|_| "device lane outside its backend")?;
+        let operations = execution.operations;
+        let body = native(topic.max_append_bytes)?;
+        let segment = native(topic.segment_bytes)?;
+        if body < 1024 || operations == 0 {
+            return Err("journal needs at least 1 KiB APPEND and one operation");
+        }
+        check_write(operations, body, segment, data)?;
+        let chunk = (progress / 4).min(64 * 1024) / WRITE_GROUP_ALIGNMENT * WRITE_GROUP_ALIGNMENT;
+        if chunk < WRITE_GROUP_ALIGNMENT {
+            return Err("backend progress share cannot fit a segment transfer");
+        }
+        Ok(Self {
+            operations,
+            body,
+            segment,
+            chunk,
+            directory_entries: (progress / 256).min(1024),
+            directory_name_bytes: (progress / 4).min(64 * 1024),
+        })
+    }
+
+    fn journal_limits(
+        self,
+        topic: &Topic,
+        direct: bool,
+        checkpoint: CheckpointLimits,
+    ) -> JournalLimits {
+        JournalLimits {
+            metadata: MetadataLimits {
+                max_manifest_bytes: 64 * 1024,
+                max_segments: 256,
+            },
+            decode: DecodeLimits {
+                max_groups: self.segment / WRITE_GROUP_ALIGNMENT,
+                max_entries: self.operations,
+                max_entry_bytes: self.body + ENTRY_HEADER_BYTES + 7,
+                max_decoded_body_bytes: self.body,
+                max_group_decoded_body_bytes: self.body,
+                max_segment_decoded_body_bytes: self.segment,
+            },
+            operations: OperationLimits {
+                max_body_bytes: self.body,
+                max_records: 2048,
+                max_payload_bytes: self.body,
+                ..OperationLimits::default()
+            },
+            checkpoint,
+            io: SegmentOptions {
+                max_segment_bytes: topic.segment_bytes,
+                chunk_bytes: self.chunk,
+                direct,
+                write_mode: match topic.confirmation {
+                    Confirmation::ReplicatedPersisting => SegmentWriteMode::Buffered,
+                    Confirmation::LocalDurable | Confirmation::DiskQuorum => {
+                        SegmentWriteMode::DataSync
+                    }
+                },
+            },
+            directory_entries: self.directory_entries,
+            directory_name_bytes: self.directory_name_bytes,
+        }
+    }
+}
+
 // Three in-flight APPENDs can move writeback ahead of PUB. Keep recent
 // written operations in RAM for live reader publication. Share the existing
 // read allowance with compact sealed indexes so repair pages avoid rescans.
@@ -166,9 +196,9 @@ fn reader_limits(
     index: IndexBuildLimits,
     max_resident_operations: usize,
     max_resident_bytes: usize,
-) -> AsyncPartitionReadLimits {
+) -> PartitionReadLimits {
     let cached_index_bytes = (max_resident_bytes / 2).min(2 * 1024 * 1024);
-    AsyncPartitionReadLimits {
+    PartitionReadLimits {
         index: IndexBuildLimits {
             max_resident_bytes: max_resident_bytes - cached_index_bytes,
             ..index
@@ -206,30 +236,14 @@ fn execution(
         .iter()
         .find(|shard| shard.id == placement.shard)
         .ok_or_else(|| error("missing application shard"))?;
-    let controller = checked
-        .plan
-        .controllers
-        .iter()
-        .find(|controller| controller.shards.contains(&placement.shard))
+    let (controller, lane) = controller_lane(&checked.plan, placement.shard)
         .ok_or_else(|| error("missing device controller"))?;
-    let lane = controller
-        .shards
-        .iter()
-        .position(|id| *id == placement.shard)
-        .expect("selected controller lane");
-    let backend = ozzy_io::Limits {
-        shards: controller.shards.len(),
-        data: ozzy_io::Quota {
-            operations: controller.workers.queued_jobs,
-            bytes: native(controller.workers.queued_bytes)?,
-        },
-        progress: ozzy_io::Quota {
-            operations: controller.workers.progress_jobs,
-            bytes: native(controller.workers.progress_bytes)?,
-        },
-    }
-    .validate()
-    .map_err(|_| error("invalid shared backend budget"))?;
+    let backend = backend_limits(controller).map_err(error)?;
+    let max_append = checked
+        .deployment
+        .deployment()
+        .topic(&placement.topic)?
+        .max_append_bytes;
     let partitions = checked
         .plan
         .partitions
@@ -248,11 +262,44 @@ fn execution(
         // Cached records retain the original charged APPEND arenas. Reserve
         // room for live proposals and follower replay across all partitions.
         resident_bytes: reader_budget(
-            native(checked.deployment.deployment().topics[&placement.topic].max_append_bytes)?,
+            native(max_append)?,
             native(shard.budget.resident_bytes)?,
             partitions,
         ),
     })
+}
+
+/// The device controller serving `shard`, and the shard's lane on it.
+fn controller_lane(plan: &BrokerPlan, shard: u32) -> Option<(&ControllerPlan, usize)> {
+    plan.controllers.iter().find_map(|controller| {
+        let lane = controller.shards.iter().position(|id| *id == shard)?;
+        Some((controller, lane))
+    })
+}
+
+/// One controller's shared backend budget, split later across its lanes.
+fn backend_limits(controller: &ControllerPlan) -> Result<ozzy_io::Limits, &'static str> {
+    let bytes = |value: u64| usize::try_from(value).map_err(|_| "byte limit overflow");
+    ozzy_io::Limits {
+        shards: controller.shards.len(),
+        data: ozzy_io::Quota {
+            operations: controller.workers.queued_jobs,
+            bytes: bytes(controller.workers.queued_bytes)?,
+        },
+        progress: ozzy_io::Quota {
+            operations: controller.workers.progress_jobs,
+            bytes: bytes(controller.workers.progress_bytes)?,
+        },
+    }
+    .validate()
+    .map_err(|_| "invalid shared backend budget")
+}
+
+/// Data and progress byte shares of one device lane.
+fn share_bytes(backend: ozzy_io::Limits, lane: usize) -> std::io::Result<(usize, usize)> {
+    let data = backend.share(lane, ozzy_io::Class::Data)?;
+    let progress = backend.share(lane, ozzy_io::Class::Progress)?;
+    Ok((data.bytes, progress.bytes))
 }
 
 fn reader_budget(append: usize, shard_bytes: usize, partitions: usize) -> usize {
@@ -296,14 +343,14 @@ fn check_write(
 
 fn checkpoint_limits(
     placement: &PartitionPlacement,
-    listing: (usize, usize),
+    sizes: Sizes,
 ) -> Result<CheckpointLimits, ozzy_journal_segment::CheckpointError> {
     CheckpointLimits::for_canonical_image(
         CORE_CHECKPOINT_BYTES,
         placement
             .deduplication
             .map_or(0, |policy| policy.max_entries),
-        listing,
+        (sizes.directory_entries, sizes.directory_name_bytes),
     )
 }
 

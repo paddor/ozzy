@@ -75,56 +75,53 @@ impl<T> Future for Pending<T> {
     }
 }
 
+/// Queued command awaiting its completion. Messages stay here so a refusal
+/// can return them to the caller.
 #[derive(Debug)]
 enum Command {
     Reply {
         message: Message,
         reply: oneshot::Sender<Completion<ReplyResult>>,
-        /// The shard's per-destination send sequence; the dispatcher admits
-        /// one destination's replies in this order.
-        sequence: u64,
     },
     Publication {
         message: Message,
         reply: oneshot::Sender<Completion<PublicationResult>>,
     },
-    Route {
-        route: RouteState,
-        reply: oneshot::Sender<Completion<RouteResult>>,
-    },
+    Route(oneshot::Sender<Completion<RouteResult>>),
 }
 
-impl Command {
-    fn kind(&self) -> u8 {
-        match self {
-            Self::Reply { .. } => 0,
-            Self::Publication { .. } => 1,
-            Self::Route { .. } => 2,
+impl Request {
+    /// Deliver a completion of the matching kind. Any other kind leaves the
+    /// request pending and returns it.
+    fn complete(self, status: Status) -> Result<(), Self> {
+        let retention = self.retention;
+        match (self.command, status) {
+            (Command::Reply { message, reply }, Status::Reply(result)) => {
+                finish(reply, result.map_err(|error| (error, message)), retention);
+            }
+            (Command::Publication { message, reply }, Status::Publication(result)) => {
+                finish(reply, result.map_err(|error| (error, message)), retention);
+            }
+            (Command::Route(reply), Status::Route(result)) => {
+                finish(reply, wire::route_result(result), retention);
+            }
+            (command, _) => return Err(Self { command, retention }),
         }
+        Ok(())
     }
-    fn complete(self, status: Status, retention: Retention) {
-        match (self, status) {
-            (Self::Reply { message, reply, .. }, Status::Reply(result)) => {
-                let _ = reply.send(Completion {
-                    result: result.map_err(|error| (error, message)),
-                    _retention: retention,
-                });
-            }
-            (Self::Publication { message, reply }, Status::Publication(result)) => {
-                let _ = reply.send(Completion {
-                    result: result.map_err(|error| (error, message)),
-                    _retention: retention,
-                });
-            }
-            (Self::Route { reply, .. }, Status::Route(result)) => {
-                let _ = reply.send(Completion {
-                    result: wire::route_result(result),
-                    _retention: retention,
-                });
-            }
-            _ => unreachable!("completion kind checked before removing request"),
-        }
-    }
+}
+
+fn finish<T>(reply: oneshot::Sender<Completion<T>>, result: T, retention: Retention) {
+    let _ = reply.send(Completion {
+        result,
+        _retention: retention,
+    });
+}
+
+/// Command queued to the dispatcher; its retention charge now travels with it.
+struct Sent {
+    id: u64,
+    retention: Retention,
 }
 
 #[derive(Debug)]
@@ -148,20 +145,20 @@ pub struct Port {
 
 impl Drop for Port {
     fn drop(&mut self) {
-        self.capacity.returns.closed.close();
+        self.capacity.closed.close();
     }
 }
 
 impl Port {
     /// Capture before admission and use `changed_after` if capacity is full.
     pub fn generation(&self) -> u64 {
-        self.capacity.returns.changed.generation()
+        self.capacity.changed().generation()
     }
 
     /// Independent readiness observation, cancel-safe across later send calls.
     pub fn changed_after(&self, generation: u64) -> impl Future<Output = ()> + use<> {
-        let changed = self.capacity.returns.changed.clone();
-        let closed = self.capacity.returns.closed.clone();
+        let changed = self.capacity.changed().clone();
+        let closed = self.capacity.closed.clone();
         async move {
             tokio::select! {
                 () = changed.changed_after(generation) => {},
@@ -190,19 +187,13 @@ impl Port {
         let Some(bytes) = message_charge(&message, retained_bytes) else {
             return Err((PortError::Charge, message));
         };
-        let (reply, receiver) = oneshot::channel();
-        match self.submit(
-            class,
-            bytes,
-            Command::Reply {
-                message,
-                reply,
-                sequence,
-            },
-        ) {
-            Ok(()) => Ok(self.pending(receiver)),
-            Err((error, Command::Reply { message, .. })) => Err((error, message)),
-            Err(_) => unreachable!("unchanged command"),
+        let body = wire::Body::Reply {
+            message: &message,
+            sequence,
+        };
+        match self.send(index(class), class, bytes, body) {
+            Ok(sent) => Ok(self.track(sent, |reply| Command::Reply { message, reply })),
+            Err(error) => Err((error, message)),
         }
     }
 
@@ -224,17 +215,12 @@ impl Port {
         let Some(bytes) = message_charge(&message, retained_bytes) else {
             return Err((PortError::Charge, message));
         };
-        let (reply, receiver) = oneshot::channel();
-        let command = Command::Publication { message, reply };
-        let result = if self.capacity.limits[2] == Budget::default() {
-            Err((PortError::Publication, command))
-        } else {
-            self.submit_bucket(2, Class::Data, bytes, command)
-        };
-        match result {
-            Ok(()) => Ok(self.pending(receiver)),
-            Err((error, Command::Publication { message, .. })) => Err((error, message)),
-            Err(_) => unreachable!("unchanged publication"),
+        if self.capacity.limits[2] == Budget::default() {
+            return Err((PortError::Publication, message));
+        }
+        match self.send(2, Class::Data, bytes, wire::Body::Publication(&message)) {
+            Ok(sent) => Ok(self.track(sent, |reply| Command::Publication { message, reply })),
+            Err(error) => Err((error, message)),
         }
     }
 
@@ -245,25 +231,32 @@ impl Port {
         &mut self,
         route: RouteState,
     ) -> Result<Pending<RouteResult>, (PortError, RouteState)> {
-        if !route.valid() {
+        let encoded = route.valid().then(|| wire::route_message(&route)).flatten();
+        let Some(encoded) = encoded else {
             return Err((PortError::Route, route));
-        }
-        let (reply, receiver) = oneshot::channel();
-        match self.submit(
-            Class::Control,
-            COMMAND_BYTES,
-            Command::Route { route, reply },
-        ) {
-            Ok(()) => Ok(self.pending(receiver)),
-            Err((error, Command::Route { route, .. })) => Err((error, route)),
-            Err(_) => unreachable!("unchanged route command"),
+        };
+        let body = wire::Body::Route(encoded);
+        match self.send(index(Class::Control), Class::Control, COMMAND_BYTES, body) {
+            Ok(sent) => Ok(self.track(sent, Command::Route)),
+            Err(error) => Err((error, route)),
         }
     }
 
-    fn pending<T>(&self, receiver: oneshot::Receiver<Completion<T>>) -> Pending<T> {
+    /// Correlate a queued command with its completion observer.
+    fn track<T>(
+        &mut self,
+        sent: Sent,
+        command: impl FnOnce(oneshot::Sender<Completion<T>>) -> Command,
+    ) -> Pending<T> {
+        let (reply, receiver) = oneshot::channel();
+        let request = Request {
+            command: command(reply),
+            retention: sent.retention,
+        };
+        self.requests.insert(sent.id, request);
         Pending {
             receiver,
-            closed: Box::pin(self.capacity.returns.closed.closed()),
+            closed: Box::pin(self.capacity.closed.closed()),
         }
     }
 
@@ -282,7 +275,7 @@ impl Port {
     }
 
     fn collect_results(&mut self) -> Result<bool, PortError> {
-        if self.capacity.returns.closed.is_closed() {
+        if self.capacity.closed.is_closed() {
             self.requests.clear();
             self.capacity.collect();
             return Ok(false);
@@ -306,69 +299,50 @@ impl Port {
 
     fn observe(&mut self, message: &Message) -> Result<(), PortError> {
         let (key, status) = wire::decode_completion(message)?;
-        if key.generation != self.incarnation
-            || self
-                .requests
-                .get(&key.id)
-                .is_none_or(|request| request.command.kind() != status.kind())
+        if key.generation == self.incarnation
+            && let Some(request) = self.requests.remove(&key.id)
+            && let Err(request) = request.complete(status)
         {
-            return Ok(());
+            self.requests.insert(key.id, request);
         }
-        let request = self.requests.remove(&key.id).expect("checked correlation");
-        request.command.complete(status, request.retention);
         Ok(())
     }
 
-    fn submit(
-        &mut self,
-        class: Class,
-        bytes: usize,
-        command: Command,
-    ) -> Result<(), (PortError, Command)> {
-        self.submit_bucket(index(class), class, bytes, command)
-    }
-
-    fn submit_bucket(
+    /// Queue one command under `bytes` of `bucket` capacity. Failure leaves
+    /// the borrowed content with the caller.
+    fn send(
         &mut self,
         bucket: usize,
         class: Class,
         bytes: usize,
-        command: Command,
-    ) -> Result<(), (PortError, Command)> {
-        if let Err(error) = self.collect_results() {
-            return Err((error, command));
-        }
-        let (queue, retention) = match self.capacity.reserve(bucket, bytes) {
-            Ok(reserved) => reserved,
-            Err(error) => return Err((error, command)),
-        };
+        body: wire::Body<'_>,
+    ) -> Result<Sent, PortError> {
+        let next_id = self.next_id.checked_add(1).ok_or(PortError::Exhausted)?;
+        self.collect_results()?;
+        let (queue, retention) = self.capacity.reserve(bucket, bytes)?;
         let key = wire::Key {
             generation: self.incarnation,
             id: self.next_id,
         };
-        self.next_id = self
-            .next_id
-            .checked_add(1)
-            .expect("port request identity exhausted");
-        let message = wire::command(key, class, &command, queue, &retention);
-        match self.lanes[index(class)].socket.try_send(message) {
-            Ok(()) => {
-                self.requests.insert(key.id, Request { command, retention });
-                Ok(())
-            }
-            Err(error) => {
-                let reason = match error {
-                    omq_tokio::TrySendError::Full(_) => {
-                        dispatch::SendFailure::Admission(dispatch::Error::Full)
-                    }
-                    omq_tokio::TrySendError::Closed => dispatch::SendFailure::Closed,
-                    omq_tokio::TrySendError::Error(_) => dispatch::SendFailure::CapacityInvariant,
-                };
-                drop(retention);
-                self.capacity.collect();
-                Err((PortError::Admission(reason), command))
-            }
+        self.next_id = next_id;
+        let message = wire::command(key, class, body, queue, &retention);
+        if let Err(error) = self.lanes[index(class)].socket.try_send(message) {
+            drop(retention);
+            self.capacity.collect();
+            return Err(PortError::Admission(send_failure(&error)));
         }
+        Ok(Sent {
+            id: key.id,
+            retention,
+        })
+    }
+}
+
+fn send_failure(error: &omq_tokio::TrySendError) -> dispatch::SendFailure {
+    match error {
+        omq_tokio::TrySendError::Full(_) => dispatch::SendFailure::Admission(dispatch::Error::Full),
+        omq_tokio::TrySendError::Closed => dispatch::SendFailure::Closed,
+        omq_tokio::TrySendError::Error(_) => dispatch::SendFailure::CapacityInvariant,
     }
 }
 
@@ -413,6 +387,9 @@ pub enum PortError {
     /// Dispatcher ended before reporting this command's outcome.
     #[error("frontend port closed")]
     Closed,
+    /// This port incarnation used every request identity.
+    #[error("frontend port request identities exhausted")]
+    Exhausted,
     /// Independent class capacity is full, revoked, or closed.
     #[error("frontend port admission failed: {0:?}")]
     Admission(dispatch::SendFailure),

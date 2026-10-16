@@ -1,7 +1,7 @@
 //! Exact derived-index entries extracted from validated segment operations.
 
 use ozzy_journal::operation::{
-    Digest, OperationBody, OperationCodecError, OperationLimits, decode_operation_body,
+    AppendBatch, Digest, OperationBody, OperationCodecError, OperationLimits, decode_operation_body,
 };
 use ozzy_proto::{MessageId, Offset, OperationId, PartitionIncarnation};
 use thiserror::Error;
@@ -117,7 +117,20 @@ pub fn derive_index_entries(
             });
         }
     };
+    let (offsets, messages) = record_entries(batches, location)?;
+    Ok(DerivedIndexEntries {
+        location,
+        offsets,
+        messages,
+        operation: None,
+    })
+}
 
+/// Offset and message selectors for every record of one APPEND's batches.
+fn record_entries(
+    batches: &[AppendBatch<'_>],
+    location: OperationLocation,
+) -> Result<(Vec<OffsetIndexEntry>, Vec<MessageIndexEntry>), IndexError> {
     let record_count = batches
         .iter()
         .try_fold(0_usize, |count, batch| {
@@ -156,16 +169,11 @@ pub fn derive_index_entries(
                 partition: batch.partition,
                 message_id: record.message_id,
                 offset,
-                operation_digest: operation.digest,
+                operation_digest: location.operation_digest,
             });
         }
     }
-    Ok(DerivedIndexEntries {
-        location,
-        offsets,
-        messages,
-        operation: None,
-    })
+    Ok((offsets, messages))
 }
 
 pub(crate) fn operation_id(body: &OperationBody<'_>) -> Option<OperationId> {

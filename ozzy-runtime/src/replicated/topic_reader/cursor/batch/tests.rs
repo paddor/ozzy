@@ -1,10 +1,10 @@
 use super::*;
 use bytes::Bytes;
-use omq_tokio::message::Payload;
+use omq_tokio::{Message, message::Payload};
 use ozzy_proto::{
     Envelope, LinkSessionId, MessageId, NodeId, Opcode, ProducerId, SubscriptionId,
     data::Encoding,
-    reader::{RecordHeader, RecordsEncoder, Source, Subscription},
+    reader::{PreparedBlock, RecordHeader, RecordsEncoder, Source, Subscription},
 };
 use std::sync::{
     Arc,
@@ -89,7 +89,15 @@ fn message(encoding: WirePayload, limits: DataLimits, dropped: Arc<AtomicBool>) 
             output.allow_shared_payload();
             assert!(
                 output
-                    .extend_shared_prepared_lz4(&descriptor, 64, &encoded, 0..encoded.len(), 1)
+                    .extend_shared_prepared_lz4(
+                        PreparedBlock {
+                            descriptors: &descriptor,
+                            decoded_bytes: 64,
+                            body: &encoded,
+                            encoded: 0..encoded.len()
+                        },
+                        1
+                    )
                     .unwrap()
             );
         }
@@ -136,7 +144,8 @@ fn decoded_record_alias_retains_the_original_frame_reservation() {
             &mut bytes::BytesMut::new(),
         )
         .unwrap();
-        let mut batch = FrameRecords::new(delivery.records, &message).into_batch(0);
+        let mut batch =
+            FrameRecords::new(delivery.records, message.part_bytes(1).unwrap()).into_batch(0);
         drop(message);
         let record = batch
             .next(&mut Decoder::default(), limits)

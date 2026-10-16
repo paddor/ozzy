@@ -22,20 +22,18 @@ async fn inproc_memory_manual_broker_time_drives_timestamp_seeks_and_age_retenti
                 memory_nodes: [0].into(),
                 linux_aio: true,
             };
-            let mode = match policy {
-                Confirmation::LocalDurable => DeploymentMode::Single,
-                Confirmation::DiskQuorum | Confirmation::ReplicatedPersisting => {
-                    DeploymentMode::Three
-                }
-            };
-            let configs =
-                broker::deployment_with_resources(&root, mode, policy, 2, &resources, |config| {
+            let configs = broker::deployment_with_resources(
+                &root,
+                broker::Shape::for_policy(policy, 2),
+                &resources,
+                |config| {
                     config.topics.get_mut("orders").unwrap().retention =
                         ozzy_config::TopicRetention {
                             max_age_secs: Some(10),
                             max_bytes: None,
                         };
-                });
+                },
+            );
             let checked = configs[0].0.clone();
             let (brokers, _, images) =
                 progress(&clock, broker::start_images(context, configs, true)).await;

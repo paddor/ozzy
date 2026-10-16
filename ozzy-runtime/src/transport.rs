@@ -35,6 +35,51 @@ pub fn native_peer_identity(identity: Bytes) -> Option<Bytes> {
     })
 }
 
+/// Exact-arity views of a multipart message.
+pub trait Frames {
+    /// Every frame, only when the message has exactly `N`.
+    fn frames<const N: usize>(&self) -> Option<[&[u8]; N]>;
+
+    /// Every frame as shared bytes, only when the message has exactly `N`.
+    fn frame_bytes<const N: usize>(&self) -> Option<[Bytes; N]>;
+
+    /// Every frame in order, borrowed.
+    fn slices(&self) -> impl Iterator<Item = &[u8]>;
+
+    /// A routing frame followed by one Ozzy packet: header, metadata, payload.
+    fn routed_packet(&self) -> Option<(&[u8], [&[u8]; 3])> {
+        let [route, header, metadata, payload] = self.frames()?;
+        Some((route, [header, metadata, payload]))
+    }
+
+    /// [`Self::routed_packet`] as shared bytes.
+    fn routed_packet_bytes(&self) -> Option<(Bytes, [Bytes; 3])> {
+        let [route, header, metadata, payload] = self.frame_bytes()?;
+        Some((route, [header, metadata, payload]))
+    }
+}
+
+impl Frames for omq_tokio::Message {
+    fn frames<const N: usize>(&self) -> Option<[&[u8]; N]> {
+        if self.len() != N {
+            return None;
+        }
+        let mut frames = [&[][..]; N];
+        for (index, frame) in frames.iter_mut().enumerate() {
+            *frame = self.part_slice(index)?;
+        }
+        Some(frames)
+    }
+
+    fn frame_bytes<const N: usize>(&self) -> Option<[Bytes; N]> {
+        self.try_as_parts().ok()
+    }
+
+    fn slices(&self) -> impl Iterator<Item = &[u8]> {
+        (0..self.len()).filter_map(|index| self.part_slice(index))
+    }
+}
+
 /// Base options for every Ozzy socket. A compressing transport such as
 /// `lz4+tcp://` compresses on the socket's own OMQ I/O thread, never on
 /// Tokio's blocking pool.
@@ -53,9 +98,9 @@ pub fn try_send_peer(
     // Preserve the existing owner until socket admission succeeds. Materializing
     // an inline body from a parts vector would otherwise promote it into Bytes
     // when OMQ adds its routing ID, defeating the compact control fast path.
-    if packet.len() == 2 && packet.part_slice(1).is_some_and(|body| body.len() <= 51) {
-        let body = omq_tokio::Message::from_slice(packet.part_slice(1).unwrap());
-        let identity = send_identity(packet.part_slice(0).unwrap())?;
+    if let Some([route, body]) = packet.frames().filter(|[_, body]| body.len() <= 51) {
+        let body = omq_tokio::Message::from_slice(body);
+        let identity = send_identity(route)?;
         return match socket.try_send_to(&identity, body) {
             Err(omq_tokio::TrySendError::Full(_)) => Err(omq_tokio::TrySendError::Full(packet)),
             result => result,
@@ -77,18 +122,14 @@ pub fn try_send_peer(
 
 /// Wait on the same physical destination used by native peer submission.
 pub async fn wait_send_peer(socket: &omq_tokio::IdentitySocket, packet: &omq_tokio::Message) {
-    if packet
+    if let Some(identity) = packet
         .part_slice(0)
-        .is_some_and(|identity| identity.len() == 16 && identity[0] == 0)
+        .and_then(|identity| <[u8; 16]>::try_from(identity).ok())
+        && identity[0] == 0
     {
         let mut body = packet.clone();
-        let identity = body.pop_front_payload().expect("checked routing identity");
-        let transport = peer_identity(NodeId::from_bytes(
-            identity
-                .as_slice()
-                .try_into()
-                .expect("checked identity length"),
-        ));
+        body.pop_front_payload();
+        let transport = peer_identity(NodeId::from_bytes(identity));
         socket
             .wait_send_progress_for(&omq_tokio::Message::with_prefix(transport, body))
             .await;

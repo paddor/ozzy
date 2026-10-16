@@ -8,7 +8,7 @@ pub(crate) use selected::Selected;
 #[cfg(test)]
 mod tests;
 
-use crate::directory::{NoopObserver, publication::algorithm};
+use crate::directory::{manifest_name, publication};
 use crate::{CurrentReference, Digest, DirectoryError, Manifest, MetadataLimits, WriterError};
 use ozzy_io::Local;
 use std::{io, path::PathBuf};
@@ -71,7 +71,7 @@ impl Directory {
         &mut self,
         manifest: &Manifest,
     ) -> Result<crate::directory::evidence::Copies, DirectoryError> {
-        use crate::directory::{evidence, publication::algorithm::Overwrite};
+        use crate::directory::{evidence, publication::Overwrite};
         let copies = self.load_evidence(manifest).await?;
         copies.protected(manifest)?;
         if !copies.mirrored() {
@@ -149,12 +149,11 @@ impl Directory {
         self.begin()?;
         let result = async {
             let (next, bytes, digest) =
-                algorithm::prepare_manifest(&mut self.files, previous, next, limits).await?;
-            algorithm::install_immutable(
+                publication::prepare_manifest(&mut self.files, previous, next, limits).await?;
+            publication::install_immutable(
                 &mut self.files,
-                &format!("MANIFEST.{}", next.generation),
+                &manifest_name(next.generation),
                 &bytes,
-                &mut NoopObserver,
             )
             .await?;
             Ok((next, digest))
@@ -170,13 +169,8 @@ impl Directory {
     ) -> Result<(), DirectoryError> {
         let bytes = crate::encode_current(current)?;
         self.begin()?;
-        let result = algorithm::replace_current(
-            &mut self.files,
-            current.generation,
-            &bytes,
-            &mut NoopObserver,
-        )
-        .await;
+        let result =
+            publication::replace_current(&mut self.files, current.generation, &bytes).await;
         self.finish(result)
     }
 
@@ -188,8 +182,7 @@ impl Directory {
     ) -> Result<(), DirectoryError> {
         self.files.check(name, bytes.len())?;
         self.begin()?;
-        let result =
-            algorithm::install_immutable(&mut self.files, name, bytes, &mut NoopObserver).await;
+        let result = publication::install_immutable(&mut self.files, name, bytes).await;
         self.finish(result)
     }
 
@@ -212,14 +205,7 @@ impl Directory {
             );
         }
         self.begin()?;
-        let result = algorithm::replace_reusable(
-            &mut self.files,
-            target,
-            temporary,
-            bytes,
-            &mut NoopObserver,
-        )
-        .await;
+        let result = publication::replace_reusable(&mut self.files, target, temporary, bytes).await;
         self.finish(result)
     }
 
@@ -234,8 +220,7 @@ impl Directory {
             return Err(io::Error::from(io::ErrorKind::InvalidInput).into());
         }
         self.begin()?;
-        let result =
-            algorithm::overwrite_evidence(&mut self.files, first, bytes, &mut NoopObserver).await;
+        let result = publication::overwrite_evidence(&mut self.files, first, bytes).await;
         self.finish(result)
     }
 }

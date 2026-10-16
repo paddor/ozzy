@@ -91,8 +91,8 @@ impl WriterConfig {
     /// Payload and multipart-table bytes one handle may admit before packing.
     /// One ready request plus an intact lookahead record and their part tables.
     pub(super) fn lane_bytes(&self) -> usize {
-        reservation::intake_bytes(self.limits, self.batch_target_bytes)
-            .expect("validated writer intake bounds")
+        // Validation rejects configurations whose intake overflows.
+        reservation::intake_bytes(self.limits, self.batch_target_bytes).unwrap_or(usize::MAX)
     }
 
     fn parameters_with_local_group(&self, local_group: bool) -> Result<Parameters, WriterError> {
@@ -322,9 +322,13 @@ impl Writer {
                     capacity,
                     Some(connection.reservation()),
                 );
-                runtime::spawn_local(driver::run_shared(
-                    shared, connection, routes, number, retry, operation,
-                ));
+                let target = driver::Target {
+                    routes,
+                    number,
+                    retry,
+                };
+                runtime::spawn_local(driver::run_shared(shared, connection, target, operation))
+                    .ok_or(Error::SharedLink(super::BrokerLinkError::Closed))?;
                 Ok(writer)
             })
             .await

@@ -32,9 +32,7 @@ fn native_recovery_cancellation_between_validation_turns_never_starts_repair() {
             .to_vec();
         let scheduling = Arc::new(Scheduling::default());
         let mut recovery = Box::pin(Writer::recover(
-            "/segment".into(),
-            io.clone(),
-            None,
+            file("/segment".into(), io.clone()),
             start(2),
             options(),
             DecodeLimits::default(),
@@ -74,9 +72,7 @@ fn native_recovery_cancellation_between_validation_turns_never_starts_repair() {
         let recovered = drive(
             &mut controller,
             Writer::recover(
-                "/segment".into(),
-                io,
-                None,
+                file("/segment".into(), io),
                 start(3),
                 options(),
                 DecodeLimits::default(),

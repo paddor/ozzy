@@ -64,6 +64,23 @@ pub(in crate::operation) fn enforce_limit(
     }
 }
 
+/// Encode one body into `output` atomically: an error truncates the output
+/// back to its previous length. Returns the encoded range.
+pub(in crate::operation) fn encode_atomic<O: OperationOutput>(
+    output: &mut O,
+    limits: OperationLimits,
+    encode: impl FnOnce(&mut Encoder<'_, O>) -> Result<(), OperationCodecError>,
+) -> Result<std::ops::Range<usize>, OperationCodecError> {
+    validate_limits(limits)?;
+    let start = output.len();
+    let mut encoder = Encoder::new(output, start, limits.max_body_bytes);
+    if let Err(error) = encode(&mut encoder) {
+        encoder.restore_start();
+        return Err(error);
+    }
+    Ok(start..encoder.finish())
+}
+
 #[derive(Debug)]
 pub(in crate::operation) struct Encoder<'a, O: OperationOutput> {
     output: &'a mut O,
@@ -180,86 +197,29 @@ impl<'a, O: OperationOutput> Encoder<'a, O> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(in crate::operation) struct Decoder<'a> {
-    pub(in crate::operation) input: &'a [u8],
-    pub(in crate::operation) offset: usize,
+pub(in crate::operation) use ozzy_proto::layout::Reader;
+
+/// Canonical body fields over the shared layout reader.
+pub(in crate::operation) trait ReadFields<'a> {
+    fn id(&mut self) -> Result<[u8; 16], OperationCodecError>;
+    fn count(&mut self, kind: &'static str, limit: usize) -> Result<usize, OperationCodecError>;
+    fn text(&mut self, kind: &'static str, limit: usize) -> Result<&'a str, OperationCodecError>;
+    fn optional_u64(&mut self) -> Result<Option<u64>, OperationCodecError>;
+    fn optional_id(&mut self) -> Result<Option<[u8; 16]>, OperationCodecError>;
 }
 
-impl<'a> Decoder<'a> {
-    pub(in crate::operation) const fn new(input: &'a [u8]) -> Self {
-        Self { input, offset: 0 }
+impl<'a> ReadFields<'a> for Reader<'a> {
+    fn id(&mut self) -> Result<[u8; 16], OperationCodecError> {
+        Ok(self.array()?)
     }
 
-    pub(in crate::operation) fn finish(self) -> Result<(), OperationCodecError> {
-        let remaining = self.input.len() - self.offset;
-        if remaining == 0 {
-            Ok(())
-        } else {
-            Err(OperationCodecError::TrailingBytes(remaining))
-        }
-    }
-
-    pub(in crate::operation) fn take(
-        &mut self,
-        length: usize,
-    ) -> Result<&'a [u8], OperationCodecError> {
-        let end = self
-            .offset
-            .checked_add(length)
-            .ok_or(OperationCodecError::LengthOverflow)?;
-        let Some(bytes) = self.input.get(self.offset..end) else {
-            return Err(OperationCodecError::Truncated {
-                needed: end,
-                available: self.input.len(),
-            });
-        };
-        self.offset = end;
-        Ok(bytes)
-    }
-
-    pub(in crate::operation) fn u8(&mut self) -> Result<u8, OperationCodecError> {
-        Ok(self.take(1)?[0])
-    }
-
-    pub(in crate::operation) fn u16(&mut self) -> Result<u16, OperationCodecError> {
-        let bytes = self.take(2)?;
-        Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
-    }
-
-    pub(in crate::operation) fn u32(&mut self) -> Result<u32, OperationCodecError> {
-        let bytes = self.take(4)?;
-        Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-    }
-
-    pub(in crate::operation) fn u64(&mut self) -> Result<u64, OperationCodecError> {
-        let bytes = self.take(8)?;
-        Ok(u64::from_be_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ]))
-    }
-
-    pub(in crate::operation) fn id(&mut self) -> Result<[u8; 16], OperationCodecError> {
-        let mut id = [0; 16];
-        id.copy_from_slice(self.take(16)?);
-        Ok(id)
-    }
-
-    pub(in crate::operation) fn count(
-        &mut self,
-        kind: &'static str,
-        limit: usize,
-    ) -> Result<usize, OperationCodecError> {
+    fn count(&mut self, kind: &'static str, limit: usize) -> Result<usize, OperationCodecError> {
         let count = self.u32()? as usize;
         enforce_limit(kind, count, limit)?;
         Ok(count)
     }
 
-    pub(in crate::operation) fn text(
-        &mut self,
-        kind: &'static str,
-        limit: usize,
-    ) -> Result<&'a str, OperationCodecError> {
+    fn text(&mut self, kind: &'static str, limit: usize) -> Result<&'a str, OperationCodecError> {
         let length = self.count(kind, limit)?;
         let bytes = self.take(length)?;
         let value =
@@ -268,19 +228,15 @@ impl<'a> Decoder<'a> {
         Ok(value)
     }
 
-    pub(in crate::operation) fn optional_u64(
-        &mut self,
-    ) -> Result<Option<u64>, OperationCodecError> {
+    fn optional_u64(&mut self) -> Result<Option<u64>, OperationCodecError> {
         match self.u8()? {
             0 => Ok(None),
-            1 => self.u64().map(Some),
+            1 => Ok(Some(self.u64()?)),
             tag => Err(OperationCodecError::InvalidOptionTag(tag)),
         }
     }
 
-    pub(in crate::operation) fn optional_id(
-        &mut self,
-    ) -> Result<Option<[u8; 16]>, OperationCodecError> {
+    fn optional_id(&mut self) -> Result<Option<[u8; 16]>, OperationCodecError> {
         match self.u8()? {
             0 => Ok(None),
             1 => self.id().map(Some),

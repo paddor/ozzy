@@ -1,11 +1,12 @@
 //! Separate bounded inproc lanes for reliable replay and disposable live data.
 
-use super::{Registry, frame_slots};
+use super::{Admission, frame_slots};
 use crate::signal::StateSignal;
+use crate::transport::Frames;
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use omq_tokio::{Context, Message, Socket, SocketType};
-use ozzy_proto::{LinkSessionId, NodeId, RequestId, SubscriptionId, reader};
+use ozzy_proto::{EnvelopeLimits, LinkSessionId, NodeId, RequestId, SubscriptionId, reader};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -28,11 +29,18 @@ impl Drop for MessageLease {
     }
 }
 
+/// A sent SUBSCRIBE: its broker, link session, and request ID. Records and
+/// replies of the selection must come back on the same.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::replicated::broker_links) struct Sent {
+    pub(in crate::replicated::broker_links) broker: NodeId,
+    pub(in crate::replicated::broker_links) session: LinkSessionId,
+    pub(in crate::replicated::broker_links) request: RequestId,
+}
+
 #[derive(Debug)]
 struct Selection {
-    broker: NodeId,
-    session: LinkSessionId,
-    request: RequestId,
+    sent: Sent,
     subscribed: reader::Subscribed,
 }
 
@@ -75,16 +83,19 @@ impl Lane {
         self.slots.add_permits(1);
         Some(message)
     }
-
-    fn clear(&self) {
-        for _ in 0..self.capacity {
-            if self.pop().is_none() {
-                break;
-            }
-        }
-    }
 }
 
+/// A broker refusal of a subscription, tagged with the generation it ended.
+#[derive(Debug)]
+struct Rejection {
+    subscription: reader::Subscription,
+    message: Message,
+}
+
+/// One partition subscription's input. The SDK driver alone selects, pushes
+/// and rejects; the reader cursor alone pops and clears. A selection changes
+/// only when the driver sends a SUBSCRIBE or UNSUBSCRIBE, so the cursor drops
+/// input of any generation other than the one it selected or is opening.
 #[derive(Debug)]
 pub(in crate::replicated) struct Inbox {
     pub(in crate::replicated) id: SubscriptionId,
@@ -92,10 +103,11 @@ pub(in crate::replicated) struct Inbox {
     selected: ArcSwapOption<Selection>,
     messages: Lane,
     publications: Lane,
-    rejection: ArcSwapOption<Message>,
+    rejection: ArcSwapOption<Rejection>,
     ready: OnceLock<()>,
     lease: Arc<Lease>,
     frames: Arc<Semaphore>,
+    limits: EnvelopeLimits,
     changed: Arc<StateSignal>,
     interests: Arc<StateSignal>,
 }
@@ -105,20 +117,21 @@ impl Inbox {
         id: SubscriptionId,
         context: &Context,
         permit: OwnedSemaphorePermit,
-        registry: &Registry,
+        admission: &Admission,
     ) -> Self {
         Self {
             id,
             namespace: SubscriptionId::new(),
             selected: ArcSwapOption::empty(),
-            messages: Lane::new(context, registry.queue, registry.maximum),
-            publications: Lane::new(context, registry.queue, registry.maximum),
+            messages: Lane::new(context, admission.queue, admission.maximum),
+            publications: Lane::new(context, admission.queue, admission.maximum),
             rejection: ArcSwapOption::empty(),
             ready: OnceLock::new(),
             lease: Arc::new(Lease { _permit: permit }),
-            frames: Arc::new(Semaphore::new(frame_slots(registry.queue))),
-            changed: registry.changed.clone(),
-            interests: registry.interests.clone(),
+            frames: Arc::new(Semaphore::new(frame_slots(admission.queue))),
+            limits: admission.limits,
+            changed: admission.changed.clone(),
+            interests: admission.interests.clone(),
         }
     }
 
@@ -130,25 +143,30 @@ impl Inbox {
         self.publications
             .initialize(format!("inproc://ozzy-reader-{namespace:032x}-live").parse()?)
             .await?;
-        self.ready.set(()).expect("one inbox initializer");
+        self.ready.get_or_init(|| ());
         self.changed.notify_changed();
         Ok(())
     }
 
-    pub(super) fn select(
-        &self,
-        broker: NodeId,
-        session: LinkSessionId,
-        request: RequestId,
-        subscribed: reader::Subscribed,
-    ) {
-        self.reset_delivery();
-        self.selected.store(Some(Arc::new(Selection {
-            broker,
-            session,
-            request,
-            subscribed,
-        })));
+    /// Driver: a SUBSCRIBE was sent. Queued input of earlier generations
+    /// stays for the cursor to drop.
+    pub(super) fn select(&self, sent: Sent, subscribed: reader::Subscribed) {
+        self.selected
+            .store(Some(Arc::new(Selection { sent, subscribed })));
+    }
+
+    /// Driver: an UNSUBSCRIBE of `subscription` was sent. `true` when that
+    /// generation was selected, so its later frames no longer enter.
+    pub(super) fn unselect(&self, subscription: reader::Subscription) -> bool {
+        let selected = self
+            .selected
+            .load()
+            .as_ref()
+            .is_some_and(|selected| selected.subscribed.subscription == subscription);
+        if selected {
+            self.selected.store(None);
+        }
+        selected
     }
 
     pub(super) fn matches_records(
@@ -159,8 +177,8 @@ impl Inbox {
         source: reader::Source,
     ) -> bool {
         self.selected.load().as_ref().is_some_and(|selected| {
-            selected.broker == broker
-                && Some(selected.session) == session
+            selected.sent.broker == broker
+                && Some(selected.sent.session) == session
                 && selected.subscribed.subscription == subscription
                 && selected.subscribed.source == source
         })
@@ -173,17 +191,21 @@ impl Inbox {
         request: Option<RequestId>,
     ) -> bool {
         self.selected.load().as_ref().is_some_and(|selected| {
-            selected.broker == broker
-                && Some(selected.session) == session
-                && Some(selected.request) == request
+            selected.sent.broker == broker
+                && Some(selected.sent.session) == session
+                && Some(selected.sent.request) == request
         })
     }
 
+    /// Driver: the broker refused the selected subscription.
     pub(super) fn reject(&self, message: &Message) {
-        self.rejection
-            .store(Some(Arc::new(Message::multipart((0..4).map(|i| {
-                Bytes::copy_from_slice(message.part_slice(i).expect("four frames"))
-            })))));
+        let Some(selected) = self.selected.load_full() else {
+            return;
+        };
+        self.rejection.store(Some(Arc::new(Rejection {
+            subscription: selected.subscribed.subscription,
+            message: Message::multipart(message.slices().map(Bytes::copy_from_slice)),
+        })));
         self.changed.notify_changed();
     }
 
@@ -212,8 +234,8 @@ impl Inbox {
     }
 
     pub(in crate::replicated) fn can_subscribe(&self) -> bool {
-        // A replacement subscription clears queued replay. Late old frames
-        // after reset must not prevent that replacement from opening.
+        // The cursor drops queued replay of old generations while it opens
+        // a replacement. Late old frames must not keep it from opening.
         self.ready.get().is_some()
             && (self.frames.available_permits() > 0
                 || self.messages.slots.available_permits() < self.messages.capacity)
@@ -225,9 +247,9 @@ impl Inbox {
             _subscription: self.lease.clone(),
             changed: self.changed.clone(),
         });
-        Some(Message::multipart_payloads((0..4).map(|i| {
+        Some(Message::multipart_payloads(message.slices().map(|frame| {
             omq_tokio::message::Payload::from_bytes(Bytes::from_owner(Frame {
-                bytes: Bytes::copy_from_slice(message.part_slice(i).expect("four frames")),
+                bytes: Bytes::copy_from_slice(frame),
                 _lease: lease.clone(),
             }))
         })))
@@ -241,34 +263,62 @@ impl Inbox {
     pub(in crate::replicated) fn selected(
         &self,
     ) -> Option<(NodeId, LinkSessionId, reader::Subscribed)> {
-        self.selected
-            .load()
-            .as_ref()
-            .map(|selected| (selected.broker, selected.session, selected.subscribed))
+        self.selected.load().as_ref().map(|selected| {
+            (
+                selected.sent.broker,
+                selected.sent.session,
+                selected.subscribed,
+            )
+        })
     }
 
-    pub(in crate::replicated) fn pop(&self) -> Option<Message> {
-        let message = self
-            .ready
-            .get()
-            .and_then(|()| self.messages.pop())
-            .or_else(|| self.rejection.swap(None).map(Arc::unwrap_or_clone));
-        if message.is_some() {
+    /// Cursor: the next replay frame or rejection of `current`, the
+    /// generation selected or being opened. Input of every other generation
+    /// is stale and dropped, which frees its queue slot and backing.
+    pub(in crate::replicated) fn pop(
+        &self,
+        current: Option<reader::Subscription>,
+    ) -> Option<Message> {
+        let mut popped = false;
+        let mut found = None;
+        if self.ready.get().is_some() {
+            for _ in 0..self.messages.capacity {
+                let Some(message) = self.messages.pop() else {
+                    break;
+                };
+                popped = true;
+                if current.is_some() && self.subscription(&message) == current {
+                    found = Some(message);
+                    break;
+                }
+            }
+        }
+        if found.is_none()
+            && let Some(rejection) = self.rejection.swap(None)
+        {
+            popped = true;
+            if Some(rejection.subscription) == current {
+                found = Some(rejection.message.clone());
+            }
+        }
+        if popped {
             self.changed.notify_changed();
         }
-        message
+        found
     }
 
+    /// The subscription generation a replay frame belongs to.
+    fn subscription(&self, message: &Message) -> Option<reader::Subscription> {
+        let (_, frames) = message.routed_packet()?;
+        let packet = ozzy_proto::decode_packet(&frames, self.limits).ok()?;
+        reader::route_subscription(packet, self.limits)
+            .ok()
+            .map(|(subscription, _)| subscription)
+    }
+
+    /// Cursor: drop all queued replay input and any rejection.
     pub(in crate::replicated) fn clear(&self) {
-        self.selected.store(None);
-        self.reset_delivery();
-    }
-
-    pub(in crate::replicated) fn reset_delivery(&self) {
-        if self.ready.get().is_some() {
-            self.messages.clear();
-        }
-        self.rejection.store(None);
+        let _ = self.pop(None);
         self.changed.notify_changed();
     }
 }

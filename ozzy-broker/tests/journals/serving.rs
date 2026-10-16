@@ -37,10 +37,15 @@ fn deployment_with(
     partitions: u32,
     configure: impl FnOnce(&mut Deployment),
 ) -> Vec<(CheckedConfig, BrokerIdentity)> {
-    deployment_with_resources(root, mode, policy, partitions, &host(), configure)
+    let shape = Shape {
+        mode,
+        policy,
+        partitions,
+    };
+    deployment_with_resources(root, shape, &host(), configure)
 }
 
-use ozzy_sim::broker::deployment_with_resources;
+use ozzy_sim::broker::{Shape, deployment_with_resources};
 
 fn limits() -> DataLimits {
     DataLimits {

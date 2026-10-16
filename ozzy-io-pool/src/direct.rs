@@ -5,17 +5,15 @@
 
 use fanring::{mpmc, teardown::Coordinated};
 use futures::task::AtomicWaker;
-use ozzy_io::{Class, Limits, Operation, Outcome, WriteBuffer};
+use ozzy_io::{Class, Handle, Limits, Operation, Outcome, Reply, WriteBuffer};
 use std::{
     fmt, io,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, atomic::Ordering},
     task::Waker,
 };
 
 pub use crate::files::handles::OwnedFile;
+use crate::parking::Unpark;
 
 type Sender = mpmc::Sender<crate::Job, Coordinated>;
 type Receiver = mpmc::Receiver<crate::Job, Coordinated>;
@@ -31,7 +29,6 @@ pub trait Worker: Send + 'static {
 }
 
 pub(crate) struct Shared {
-    closed: AtomicBool,
     pub(crate) wake: AtomicWaker,
 }
 
@@ -51,7 +48,6 @@ impl Shared {
         let (progress, progress_rx) = queue(limits.progress.operations)?;
         Ok((
             Self {
-                closed: AtomicBool::new(false),
                 wake: AtomicWaker::new(),
             },
             [data_rx, progress_rx],
@@ -62,15 +58,51 @@ impl Shared {
 
 /// Owns the admitted operation, its descriptor reservation and completion.
 /// Moving to a kernel request does not release any admission or handle budget.
+/// Fields drop in order: descriptor, write handles and payload, reply, slot.
 pub struct Write {
-    pub(crate) file: Arc<OwnedFile>,
-    pub(crate) job: crate::Job,
+    file: Arc<OwnedFile>,
+    parts: WriteParts,
+    reply: Reply,
+    slot: crate::Slot,
+}
+
+/// A direct write's payload at its offset, with the handles it keeps alive.
+struct WriteParts {
+    offset: u64,
+    data: WriteBuffer,
+    _target: Handle,
+    _protection: Vec<Handle>,
+}
+
+impl WriteParts {
+    /// Take apart a plain or protected write; any other operation is `None`.
+    fn take(operation: Operation) -> Option<Self> {
+        let (operation, protection) = match operation {
+            Operation::Protected { operation, handles } => (*operation, handles),
+            operation => (operation, Vec::new()),
+        };
+        let Operation::Write {
+            handle,
+            offset,
+            data,
+        } = operation
+        else {
+            return None;
+        };
+        Some(Self {
+            offset,
+            data,
+            _target: handle,
+            _protection: protection,
+        })
+    }
 }
 
 impl fmt::Debug for Write {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DirectWrite")
-            .field("operation", &self.job.operation)
+            .field("offset", &self.parts.offset)
+            .field("bytes", &self.parts.data.len())
             .finish_non_exhaustive()
     }
 }
@@ -82,43 +114,28 @@ impl Write {
     }
     /// Independent data or reserved-progress admission class.
     pub fn class(&self) -> Class {
-        self.job.class
+        self.slot.class
     }
     /// Explicit starting byte offset of this physical write.
     pub fn offset(&self) -> u64 {
-        let Operation::Write { offset, .. } = self
-            .job
-            .operation
-            .as_ref()
-            .expect("unrun write")
-            .unprotected()
-        else {
-            unreachable!()
-        };
-        *offset
+        self.parts.offset
     }
     /// Borrow owned scatter/gather payload while the write remains admitted.
     pub fn data(&self) -> &WriteBuffer {
-        let Operation::Write { data, .. } = self
-            .job
-            .operation
-            .as_ref()
-            .expect("unrun write")
-            .unprotected()
-        else {
-            unreachable!()
-        };
-        data
+        &self.parts.data
     }
 
     /// Call after physical completion and after releasing staging allocations.
     pub fn finish(self, result: io::Result<usize>) {
-        let Self { file, mut job } = self;
+        let Self {
+            file,
+            parts,
+            reply,
+            slot,
+        } = self;
         drop(file);
-        drop(job.operation.take());
-        let result = result.map(Outcome::Written);
-        job.observe_finish(&result);
-        job.reply.take().expect("one reply").finish(result);
+        drop(parts);
+        slot.settle(reply, result.map(Outcome::Written));
     }
 }
 
@@ -127,6 +144,7 @@ pub struct Queue {
     receivers: Receivers,
     pending: Option<crate::Job>,
     shared: Arc<crate::Shared>,
+    direct: Arc<Shared>,
 }
 
 impl fmt::Debug for Queue {
@@ -139,18 +157,9 @@ impl Queue {
     /// Register before inspecting queues/drain state. The worker must turn this
     /// wake into its own readiness mechanism, alongside kernel completions.
     pub fn register(&self, waker: &Waker) {
-        self.shared
-            .direct
-            .as_ref()
-            .expect("direct worker")
-            .wake
-            .register(waker);
+        self.direct.wake.register(waker);
     }
     /// Take one eligible write without waiting; execution limits may return none.
-    #[allow(
-        deprecated,
-        reason = "Atomic::try_update requires Rust 1.95; MSRV is 1.93"
-    )]
     pub fn try_recv(&mut self, class: Class) -> Option<Write> {
         loop {
             let job = if class == Class::Data {
@@ -160,43 +169,37 @@ impl Queue {
             } else {
                 self.receivers[1].try_recv().ok()
             };
-            let mut job = job?;
+            let job = job?;
             let executing = class == Class::Data && !self.shared.failed.load(Ordering::Acquire);
-            if executing
-                && self
-                    .shared
-                    .executing
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                        (used < self.shared.max_inflight).then_some(used + 1)
-                    })
-                    .is_err()
-            {
+            if executing && !self.shared.reserve_execution() {
                 self.pending = Some(job);
                 return None;
             }
-            job.executing = executing;
-            job.observe_start();
+            let crate::Job {
+                operation,
+                reply,
+                mut slot,
+            } = job;
+            slot.executing = executing;
+            slot.observe_start(&operation);
             let file = if self.shared.failed.load(Ordering::Acquire) {
                 Err(io::ErrorKind::BrokenPipe.into())
             } else {
-                crate::files::direct_file(
-                    job.operation.as_ref().expect("unrun write"),
-                    &self.shared,
-                )
+                crate::files::direct_file(&operation, &self.shared)
             };
-            match file {
-                Ok(Some(file)) => return Some(Write { file, job }),
-                Ok(None) => {
-                    let result = Err(io::ErrorKind::InvalidInput.into());
-                    job.observe_finish(&result);
-                    job.reply.take().expect("one reply").finish(result);
+            let error = match file.map(|file| file.zip(WriteParts::take(operation))) {
+                Ok(Some((file, parts))) => {
+                    return Some(Write {
+                        file,
+                        parts,
+                        reply,
+                        slot,
+                    });
                 }
-                Err(error) => {
-                    let result = Err(error);
-                    job.observe_finish(&result);
-                    job.reply.take().expect("one reply").finish(result);
-                }
-            }
+                Ok(None) => io::ErrorKind::InvalidInput.into(),
+                Err(error) => error,
+            };
+            slot.settle(reply, Err(error));
         }
     }
     /// Whether admission is fenced and all queued/running jobs have settled.
@@ -205,65 +208,42 @@ impl Queue {
     }
 }
 
-pub(crate) fn spawn(
+/// The direct worker's thread body after its placement initialized: run the
+/// driver, then finish every accepted write before releasing the pool.
+pub(crate) fn run(
     worker: Box<dyn Worker>,
-    receivers: Receivers,
-    shared: &Arc<crate::Shared>,
-    initialize: crate::Initializer,
-) -> io::Result<std::thread::JoinHandle<()>> {
-    let owner = shared.clone();
-    let (started, ready) = std::sync::mpsc::sync_channel(1);
-    shared.state.lock().expect("worker state poisoned").workers += 1;
-    let thread = match std::thread::Builder::new()
-        .name("ozzy_io-direct".into())
-        .spawn(move || {
-            if !crate::startup::initialize(&initialize, crate::Worker::Direct, &started) {
-                owner.fail();
-                owner.worker_finished();
-                return;
-            }
-            let mut queue = Queue {
-                receivers,
-                pending: None,
-                shared: owner.clone(),
-            };
-            let result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.run(&mut queue)));
-            if !matches!(result, Ok(Ok(()))) || !queue.drained() {
-                owner.fail();
-            }
-            // Client publication is fenced by the shared active reservation.
-            // Drain every accepted write before releasing the backend owner.
-            owner
-                .direct
-                .as_ref()
-                .expect("direct worker")
-                .closed
-                .store(true, Ordering::Release);
-            loop {
-                let mut progressed = false;
-                for class in [Class::Progress, Class::Data] {
-                    while let Some(write) = queue.try_recv(class) {
-                        progressed = true;
-                        write.finish(Err(io::ErrorKind::BrokenPipe.into()));
-                    }
-                }
-                if owner.drained() {
-                    break;
-                }
-                if !progressed {
-                    std::thread::yield_now();
-                }
-            }
-            drop(owner.direct.as_ref().expect("direct worker").wake.take());
-            owner.worker_finished();
-        }) {
-        Ok(thread) => thread,
-        Err(error) => {
-            shared.worker_finished();
-            return Err(error);
-        }
+    (direct, receivers): (Arc<Shared>, Receivers),
+    owner: &Arc<crate::Shared>,
+) {
+    let mut queue = Queue {
+        receivers,
+        pending: None,
+        shared: owner.clone(),
+        direct,
     };
-    crate::startup::ready(&ready)?;
-    Ok(thread)
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.run(&mut queue)));
+    if !matches!(result, Ok(Ok(()))) || !queue.drained() {
+        owner.fail();
+    }
+    // Client publication is fenced by the shared active reservation.
+    // Drain every accepted write before releasing the backend owner.
+    let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+    loop {
+        queue.register(&waker);
+        let mut progressed = false;
+        for class in [Class::Progress, Class::Data] {
+            while let Some(write) = queue.try_recv(class) {
+                progressed = true;
+                write.finish(Err(io::ErrorKind::BrokenPipe.into()));
+            }
+        }
+        if owner.drained() {
+            break;
+        }
+        if !progressed {
+            std::thread::park();
+        }
+    }
+    drop(queue.direct.wake.take());
+    owner.worker_finished();
 }

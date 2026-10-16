@@ -2,19 +2,16 @@
 //! authority stay outside this physical installer.
 
 use super::Journal;
-use crate::directory::recovery::recovery_marker;
-use crate::suffix::{
-    OwnedOperation, enforce_limit, position_before, retained_image, rewrite_segment_index,
-    state::Source, streaming, validate_common_request,
-};
+use crate::suffix::{OwnedOperation, enforce_limit, streaming};
 use crate::{
-    AsyncSegmentStart, AsyncSegmentWriter, CanonicalOperation, ChainPosition, CodecError, Digest,
-    ENTRY_HEADER_BYTES, GROUP_SEAL_BYTES, LogPosition, SEGMENT_HEADER_BYTES, SealedSegment,
-    SegmentHeader, SegmentReference, SuffixReplacement, SuffixReplacementError as Error,
-    SuffixReplacementLimits, SuffixStreamLimits, WRITE_GROUP_ALIGNMENT, WriterError,
+    CanonicalOperation, ChainPosition, CodecError, Digest, LogPosition, SEGMENT_HEADER_BYTES,
+    SealedSegment, SegmentHeader, SegmentReference, SegmentStart, SegmentWriter, SuffixReplacement,
+    SuffixReplacementError as Error, SuffixStreamLimits, WriterError, metadata::position_before,
 };
 use ozzy_io::Operation;
 use std::io;
+
+mod begin;
 
 /// Owns the old selected journal plus bounded, unselected replacement files.
 /// Dropping/canceling this object leaves originals and selection intact unless
@@ -24,15 +21,25 @@ pub struct Installer {
     checkpoint_position: Option<LogPosition>,
     checkpoint_seen: bool,
     journal: Journal,
-    replacement: SuffixReplacement,
-    accepted: LogPosition,
-    limits: SuffixStreamLimits,
-    writer: AsyncSegmentWriter,
+    request: SuffixRequest,
+    writer: SegmentWriter,
     segments: Vec<SegmentReference>,
     body_digests: Vec<Digest>,
     staged_bytes: u64,
     committed_seen: bool,
     faulted: bool,
+}
+
+/// One streamed suffix replacement: the selection it installs, the accepted
+/// prefix its staged operations must end at, and its bounds.
+#[derive(Debug, Clone, Copy)]
+pub struct SuffixRequest {
+    /// Consensus authorization and resulting hard state.
+    pub replacement: SuffixReplacement,
+    /// Exact accepted prefix the staged suffix must reach.
+    pub accepted: LogPosition,
+    /// Memory, work, and disk bounds for this attempt.
+    pub limits: SuffixStreamLimits,
 }
 
 /// Original checkpoint and predecessor of its required retained operations.
@@ -68,245 +75,6 @@ struct Start {
     first_chain: ChainPosition,
 }
 
-impl Journal {
-    fn suffix_source(&self) -> Source<'_> {
-        Source {
-            manifest: &self.manifest,
-            current: self.current,
-            header: self.writer.header(),
-            written: self.writer.written_position(),
-            durable: self.writer.durable_position(),
-            healthy: !self.is_faulted(),
-            decode: self.limits.decode,
-            operations: self.limits.operations,
-            max_segments: self.limits.metadata.max_segments,
-        }
-    }
-
-    /// Preserve the exact protected prefix and stage a selected suffix. Copies
-    /// at most one bounded source segment; older sealed predecessors stay shared.
-    pub async fn begin_suffix_replacement(
-        mut self,
-        replacement: SuffixReplacement,
-        accepted: LogPosition,
-        limits: SuffixStreamLimits,
-    ) -> Result<Installer, Error> {
-        streaming::validate_stream_request(&self.suffix_source(), replacement, accepted, limits)?;
-        self.validate_authority_files().await?;
-        let index = rewrite_segment_index(&self.manifest, replacement.protected_committed)?;
-        let reference = self.manifest.segments[index];
-        if reference.capacity > limits.max_source_segment_bytes {
-            return Err(Error::InvalidLimits);
-        }
-        let image = self.segment_image(reference).await?;
-        let retained = retained_image(
-            &self.suffix_source(),
-            reference,
-            replacement.protected_committed,
-            SuffixReplacementLimits {
-                max_operations: usize::try_from(reference.capacity / ENTRY_HEADER_BYTES as u64)
-                    .map_err(|_| Error::LengthOverflow)?,
-                max_body_bytes: self.limits.decode.max_segment_decoded_body_bytes,
-                max_segment_bytes: limits.max_source_segment_bytes,
-            },
-            &image,
-        )?;
-        drop(image);
-        Box::pin(self.start_suffix(replacement, accepted, limits, index, reference, &retained))
-            .await
-    }
-
-    /// Replace an unfinished nonvoting store from genesis under fresh external
-    /// authority. Final selection leaves its marker intact. Private replay and
-    /// configuration publication remain separate required gates.
-    pub async fn begin_recovery_replacement(
-        self,
-        configuration: &[u8],
-        replacement: SuffixReplacement,
-        accepted: LogPosition,
-        limits: SuffixStreamLimits,
-    ) -> Result<Installer, Error> {
-        self.begin_anchored_recovery(
-            configuration,
-            replacement,
-            accepted,
-            limits,
-            ChainPosition::GENESIS,
-        )
-        .await
-    }
-
-    /// Stage retained operations from an externally authorized checkpoint's
-    /// original predecessor. The target remains nonvoting until checkpoint state,
-    /// complete retained chain and accepted suffix are privately validated.
-    pub async fn begin_checkpoint_replacement(
-        self,
-        configuration: &[u8],
-        replacement: SuffixReplacement,
-        accepted: LogPosition,
-        limits: SuffixStreamLimits,
-        anchor: CheckpointRecovery,
-    ) -> Result<Installer, Error> {
-        let predecessor = anchor.predecessor;
-        predecessor
-            .validate()
-            .map_err(crate::DirectoryError::from)?;
-        anchor
-            .position
-            .validate()
-            .map_err(crate::DirectoryError::from)?;
-        if predecessor.op_number > replacement.committed.op_number
-            || (predecessor.op_number == replacement.committed.op_number
-                && predecessor != replacement.committed)
-            || predecessor.op_number > anchor.position.op_number
-            || anchor.position.op_number == 0
-            || anchor.position.op_number > replacement.committed.op_number
-            || (anchor.position.op_number == predecessor.op_number
-                && anchor.position != predecessor)
-            || (anchor.position.op_number == replacement.committed.op_number
-                && anchor.position != replacement.committed)
-        {
-            return Err(Error::ProtectedCommitMismatch);
-        }
-        let next = predecessor
-            .op_number
-            .checked_add(1)
-            .ok_or(Error::LengthOverflow)?;
-        let mut installer = self
-            .begin_anchored_recovery(
-                configuration,
-                replacement,
-                accepted,
-                limits,
-                ChainPosition::new(next, predecessor.digest),
-            )
-            .await?;
-        installer.checkpoint_position = Some(anchor.position);
-        installer.checkpoint_seen = predecessor == anchor.position;
-        Ok(installer)
-    }
-
-    async fn begin_anchored_recovery(
-        mut self,
-        configuration: &[u8],
-        replacement: SuffixReplacement,
-        accepted: LogPosition,
-        limits: SuffixStreamLimits,
-        first_chain: ChainPosition,
-    ) -> Result<Installer, Error> {
-        let marker = recovery_marker(configuration)?;
-        if self.configuration.as_deref() != Some(marker.as_slice()) {
-            return Err(crate::DirectoryError::ConfigurationMismatch.into());
-        }
-        validate_common_request(
-            &self.suffix_source(),
-            replacement,
-            SuffixReplacementLimits {
-                max_operations: limits.max_group_operations,
-                max_body_bytes: limits.max_group_body_bytes,
-                max_segment_bytes: limits.max_staged_bytes,
-            },
-        )?;
-        if replacement.protected_committed != LogPosition::GENESIS
-            || self.manifest.checkpoint.is_some()
-            || self.manifest.segments[0].first_chain != ChainPosition::GENESIS
-        {
-            return Err(Error::ProtectedCommitMismatch);
-        }
-        if replacement.promised_view != replacement.last_normal_view {
-            return Err(Error::InvalidView);
-        }
-        streaming::validate_stream_limits(&self.suffix_source(), replacement, accepted, limits)?;
-        self.validate_authority_files().await?;
-        let source = SegmentReference {
-            first_group_number: 1,
-            first_chain,
-            ..self.manifest.segments[0]
-        };
-        Box::pin(self.start_suffix(replacement, accepted, limits, 0, source, &[])).await
-    }
-
-    async fn start_suffix(
-        self,
-        replacement: SuffixReplacement,
-        accepted: LogPosition,
-        limits: SuffixStreamLimits,
-        rewrite_index: usize,
-        source: SegmentReference,
-        retained: &[OwnedOperation],
-    ) -> Result<Installer, Error> {
-        enforce_limit(
-            "selected manifest segments",
-            rewrite_index + 1,
-            limits.max_segments,
-        )?;
-        if replacement.segment_capacity > self.limits.io.max_segment_bytes {
-            return Err(Error::InvalidLimits);
-        }
-        let mut segments = Vec::new();
-        segments
-            .try_reserve_exact(limits.max_segments)
-            .map_err(|_| Error::Allocation)?;
-        segments.extend_from_slice(&self.manifest.segments[..rewrite_index]);
-        let (predecessor, predecessor_digest) =
-            segments.last().map_or((None, Digest::ZERO), |segment| {
-                (
-                    Some(segment.segment_id),
-                    source.first_chain.previous_digest(),
-                )
-            });
-        let start = Start {
-            first_id: self
-                .manifest
-                .segments
-                .last()
-                .expect("active segment")
-                .segment_id
-                .checked_add(1)
-                .ok_or(Error::SegmentIdExhausted)?,
-            predecessor,
-            predecessor_digest,
-            first_group: source.first_group_number,
-            first_chain: source.first_chain,
-        };
-        let mut body_digests = Vec::new();
-        body_digests
-            .try_reserve_exact(limits.max_group_operations)
-            .map_err(|_| Error::Allocation)?;
-        let reserve = limits
-            .max_group_operations
-            .checked_mul(ENTRY_HEADER_BYTES + 7)
-            .and_then(|overhead| overhead.checked_add(limits.max_group_body_bytes))
-            .and_then(|bytes| bytes.checked_add(GROUP_SEAL_BYTES + WRITE_GROUP_ALIGNMENT))
-            .ok_or(Error::LengthOverflow)?;
-        let mut writer = create_segment(&self, replacement, limits, start).await?;
-        writer.reserve_encode_buffer(reserve, replacement.body_encoding)?;
-        segments.push(active_reference(&writer, start));
-        let mut installer = Installer {
-            checkpoint_position: None,
-            checkpoint_seen: false,
-            journal: self,
-            replacement,
-            accepted,
-            limits,
-            writer,
-            segments,
-            body_digests,
-            staged_bytes: replacement.segment_capacity,
-            committed_seen: replacement.committed == position_before(start.first_chain)?,
-            faulted: false,
-        };
-        installer.copy_retained(retained).await?;
-        if !retained.is_empty() || source.first_chain == ChainPosition::GENESIS {
-            debug_assert_eq!(
-                position_before(installer.writer.written_position().next_chain())?,
-                replacement.protected_committed
-            );
-        }
-        Ok(installer)
-    }
-}
-
 impl Installer {
     fn healthy(&self) -> Result<(), Error> {
         if self.faulted {
@@ -319,16 +87,16 @@ impl Installer {
     async fn copy_retained(&mut self, retained: &[OwnedOperation]) -> Result<(), Error> {
         let mut borrowed = Vec::new();
         borrowed
-            .try_reserve_exact(self.limits.max_group_operations)
+            .try_reserve_exact(self.request.limits.max_group_operations)
             .map_err(|_| Error::Allocation)?;
         let mut bytes = 0usize;
         for operation in retained {
             let operation = operation.borrowed();
-            if operation.body.len() > self.limits.max_group_body_bytes {
+            if operation.body.len() > self.request.limits.max_group_body_bytes {
                 return Err(Error::InvalidLimits);
             }
-            if borrowed.len() == self.limits.max_group_operations
-                || operation.body.len() > self.limits.max_group_body_bytes - bytes
+            if borrowed.len() == self.request.limits.max_group_operations
+                || operation.body.len() > self.request.limits.max_group_body_bytes - bytes
             {
                 self.append_chunk(&borrowed).await?;
                 borrowed.clear();
@@ -352,9 +120,7 @@ impl Installer {
         self.healthy()?;
         let (bytes, committed_seen) = streaming::validate_chunk(
             &self.journal.suffix_source(),
-            self.replacement,
-            self.accepted,
-            self.limits,
+            &self.request,
             self.writer.written_position().next_chain(),
             &mut self.body_digests,
             operations,
@@ -392,7 +158,7 @@ impl Installer {
         let mut parts = Vec::with_capacity(usize::BITS as usize + 1);
         parts.push((0..operations.len(), body_bytes));
         while let Some((range, bytes)) = parts.pop() {
-            let reference = self.segments.last().expect("active reference");
+            let reference = super::active_segment(&self.segments)?;
             let groups =
                 self.writer.written_position().group_number() - (reference.first_group_number - 1);
             let decoded = self.writer.written_position().decoded_body_bytes();
@@ -406,7 +172,7 @@ impl Installer {
                 .append_with_limits_and_digests(
                     &operations[range.clone()],
                     &self.body_digests[range.clone()],
-                    self.replacement.body_encoding,
+                    self.request.replacement.body_encoding,
                     Some(self.journal.limits.decode),
                 )
                 .await;
@@ -439,16 +205,16 @@ impl Installer {
         enforce_limit(
             "selected manifest segments",
             self.segments.len() + 1,
-            self.limits.max_segments,
+            self.request.limits.max_segments,
         )?;
         let staged = self
             .staged_bytes
-            .checked_add(self.replacement.segment_capacity)
+            .checked_add(self.request.replacement.segment_capacity)
             .ok_or(Error::LengthOverflow)?;
-        if staged > self.limits.max_staged_bytes {
+        if staged > self.request.limits.max_staged_bytes {
             return Err(Error::StagingQuota {
                 actual: staged,
-                limit: self.limits.max_staged_bytes,
+                limit: self.request.limits.max_staged_bytes,
             });
         }
         let position = self.writer.written_position();
@@ -472,10 +238,18 @@ impl Installer {
                 .ok_or(Error::LengthOverflow)?,
             first_chain: position.next_chain(),
         };
-        let mut successor =
-            create_segment(&self.journal, self.replacement, self.limits, start).await?;
+        let mut successor = create_segment(
+            &self.journal,
+            self.request.replacement,
+            self.request.limits,
+            start,
+        )
+        .await?;
         self.writer.transfer_buffers_to(&mut successor);
-        self.segments.last_mut().expect("active reference").sealed = Some(sealed);
+        self.segments
+            .last_mut()
+            .ok_or(crate::DirectoryError::MissingActiveSegment)?
+            .sealed = Some(sealed);
         self.segments.push(active_reference(&successor, start));
         let old = std::mem::replace(&mut self.writer, successor);
         old.close().await?;
@@ -487,13 +261,7 @@ impl Installer {
     /// old history is touched. Failed/canceled cleanup requires explicit reopen.
     pub async fn abort(self) -> Result<Journal, Error> {
         self.healthy()?;
-        let last_old = self
-            .journal
-            .manifest
-            .segments
-            .last()
-            .expect("selected active segment")
-            .segment_id;
+        let last_old = super::active_segment(&self.journal.manifest.segments)?.segment_id;
         let Self {
             journal,
             writer,
@@ -573,7 +341,7 @@ impl Installer {
         checkpoint: Option<CanonicalCheckpointImport<'_>>,
     ) -> Result<Journal, Error> {
         self.healthy()?;
-        if position_before(self.writer.written_position().next_chain())? != self.accepted
+        if position_before(self.writer.written_position().next_chain())? != self.request.accepted
             || !self.committed_seen
         {
             return Err(Error::IncompleteSuffix);
@@ -587,10 +355,10 @@ impl Installer {
             .sync_directory(self.journal.root().join("segments"))
             .await?;
         let mut next = self.journal.next_manifest()?;
-        next.promised_view = self.replacement.promised_view;
-        next.last_normal_view = self.replacement.last_normal_view;
-        next.accepted = self.accepted;
-        next.committed = self.replacement.committed;
+        next.promised_view = self.request.replacement.promised_view;
+        next.last_normal_view = self.request.replacement.last_normal_view;
+        next.accepted = self.request.accepted;
+        next.committed = self.request.replacement.committed;
         next.segments = std::mem::take(&mut self.segments);
         if let Some(checkpoint) = checkpoint {
             next = self.publish_checkpoint_source(next, checkpoint).await?;
@@ -653,7 +421,7 @@ impl Installer {
         }
         self.journal.manifest = source;
         let mut selected = self.journal.next_manifest()?;
-        selected.committed = self.replacement.committed;
+        selected.committed = self.request.replacement.committed;
         selected.checkpoint = Some(crate::CheckpointReference {
             checkpoint_id: import.id,
             position: import.position,
@@ -664,7 +432,7 @@ impl Installer {
     }
 }
 
-fn active_reference(writer: &AsyncSegmentWriter, start: Start) -> SegmentReference {
+fn active_reference(writer: &SegmentWriter, start: Start) -> SegmentReference {
     SegmentReference {
         segment_id: writer.header().segment_id(),
         file_generation: 0,
@@ -680,7 +448,7 @@ async fn create_segment(
     replacement: SuffixReplacement,
     limits: SuffixStreamLimits,
     start: Start,
-) -> Result<AsyncSegmentWriter, Error> {
+) -> Result<SegmentWriter, Error> {
     let mut id = start.first_id;
     for _ in 0..limits.max_orphan_probes {
         let header = SegmentHeader::new(
@@ -690,12 +458,12 @@ async fn create_segment(
             start.predecessor_digest,
             replacement.segment_capacity,
         )?;
-        let writer = AsyncSegmentWriter::create(
-            journal.root().join(format!("segments/{id}.log")),
-            journal.access.io.clone(),
-            journal.access.protection.clone(),
+        let writer = SegmentWriter::create(
+            journal
+                .access
+                .segment_file(journal.root().join(format!("segments/{id}.log"))),
             header,
-            AsyncSegmentStart {
+            SegmentStart {
                 generation: replacement.writer_generation,
                 first_group_number: start.first_group,
                 initial_chain: start.first_chain,

@@ -30,8 +30,8 @@ pub struct Selection {
     start: Start,
     floor: Offset,
     end: Offset,
-    first: Option<Offset>,
-    last: Option<Offset>,
+    /// First and last matching offsets.
+    matched: Option<(Offset, Offset)>,
 }
 
 impl Selection {
@@ -41,8 +41,7 @@ impl Selection {
             start,
             floor,
             end,
-            first: None,
-            last: None,
+            matched: None,
         }
     }
 
@@ -63,8 +62,9 @@ impl Selection {
         if offset < self.floor || offset >= self.end {
             return;
         }
-        self.first = Some(self.first.map_or(offset, |first| first.min(offset)));
-        self.last = Some(self.last.map_or(offset, |last| last.max(offset)));
+        self.matched = Some(self.matched.map_or((offset, offset), |(first, last)| {
+            (first.min(offset), last.max(offset))
+        }));
     }
 
     /// Resolve once. Future deliveries advance ordinary offsets, with no filter.
@@ -73,12 +73,11 @@ impl Selection {
             Start::Earliest => Ok(self.floor),
             Start::Latest => Ok(self.end),
             Start::Offset(offset) => Ok(Offset::new(offset)),
-            Start::Timestamp(_) => Ok(self.first.unwrap_or(self.end)),
+            Start::Timestamp(_) => Ok(self.matched.map_or(self.end, |(first, _)| first)),
             Start::RecordId { policy, .. } => {
-                let first = self.first.ok_or(SeekError::NotFound {
+                let (first, last) = self.matched.ok_or(SeekError::NotFound {
                     earliest: self.floor,
                 })?;
-                let last = self.last.expect("first match establishes both bounds");
                 match policy {
                     IdPolicy::RequireUnique if first != last => {
                         Err(SeekError::Ambiguous { first, last })

@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound::{Excluded, Unbounded};
 
 pub use ozzy_proto::directory::RouteState;
+use ozzy_proto::directory::{Snapshot, SnapshotRequest};
 use ozzy_proto::{GroupId, LinkSessionId, NodeId, RequestId};
 
 /// Fixed metadata bounds. No limit grows with the number of clients at run time.
@@ -20,6 +21,12 @@ pub struct WatchLimits {
     pub interests_per_registration: usize,
     /// Coalesced updates held for one registration before resync is required.
     pub pending_per_registration: usize,
+}
+
+/// Validated interests and their initial routes, not yet installed.
+struct Reservation {
+    interests: BTreeSet<GroupId>,
+    snapshot: Snapshot,
 }
 
 #[derive(Debug)]
@@ -173,7 +180,8 @@ impl WatchRegistry {
         id: RequestId,
         groups: &[GroupId],
     ) -> Result<Vec<RouteState>, WatchError> {
-        self.register_bounded(peer, session, id, groups, usize::MAX)
+        let reservation = self.reserve(peer, session, id, groups)?;
+        self.install(peer, reservation, usize::MAX)
     }
 
     /// Reserve a registration only if its complete initial snapshot fits the
@@ -182,10 +190,21 @@ impl WatchRegistry {
         &mut self,
         peer: NodeId,
         session: LinkSessionId,
-        id: RequestId,
-        groups: &[GroupId],
+        request: &SnapshotRequest,
         metadata_bytes: usize,
     ) -> Result<Vec<RouteState>, WatchError> {
+        let reservation = self.reserve(peer, session, request.watch, &request.groups)?;
+        self.install(peer, reservation, metadata_bytes)
+    }
+
+    /// Validate one registration and capture its routes. Changes no state.
+    fn reserve(
+        &self,
+        peer: NodeId,
+        session: LinkSessionId,
+        id: RequestId,
+        groups: &[GroupId],
+    ) -> Result<Reservation, WatchError> {
         self.check_session(peer, session)?;
         if id.as_bytes() == &[0; 16]
             || groups.is_empty()
@@ -203,8 +222,7 @@ impl WatchRegistry {
         {
             return Err(WatchError::Unknown);
         }
-        let key = (peer, id);
-        if let Some(existing) = self.registrations.get(&key) {
+        if let Some(existing) = self.registrations.get(&(peer, id)) {
             if existing.interests != interests {
                 return Err(WatchError::Conflict);
             }
@@ -215,10 +233,26 @@ impl WatchRegistry {
             .iter()
             .map(|group| self.routes[group].clone())
             .collect();
-        let snapshot = ozzy_proto::directory::Snapshot { watch: id, routes };
+        Ok(Reservation {
+            interests,
+            snapshot: Snapshot { watch: id, routes },
+        })
+    }
+
+    fn install(
+        &mut self,
+        peer: NodeId,
+        reservation: Reservation,
+        metadata_bytes: usize,
+    ) -> Result<Vec<RouteState>, WatchError> {
+        let Reservation {
+            interests,
+            snapshot,
+        } = reservation;
         if snapshot.metadata_bytes().map_err(|_| WatchError::Invalid)? > metadata_bytes {
             return Err(WatchError::Invalid);
         }
+        let key = (peer, snapshot.watch);
         self.registrations.insert(
             key,
             Registration {
@@ -360,11 +394,10 @@ impl WatchRegistry {
             return Ok(WatchUpdates::Resync);
         }
         let mut updates = Vec::with_capacity(maximum.min(registration.pending.len()));
-        for _ in 0..maximum {
-            let Some((&group, _)) = registration.pending.first_key_value() else {
-                break;
-            };
-            updates.push(registration.pending.remove(&group).expect("present hint"));
+        while updates.len() < maximum
+            && let Some((_, update)) = registration.pending.pop_first()
+        {
+            updates.push(update);
         }
         if registration.pending.is_empty() {
             self.ready.remove(&(peer, id));

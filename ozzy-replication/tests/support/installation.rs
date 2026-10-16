@@ -9,8 +9,8 @@ use ozzy_journal::progress::ProgressError;
 use ozzy_proto::{GroupId, OperationId};
 use ozzy_replication::{
     Admission, Commit, Digest, InstallOutcome, InstallingView, JournalGeneration, NormalReplica,
-    OpNumber, PipelineLimits, Prefix, PreparedOperation, ReplicationError, Scope, StartView,
-    Status, ViewChange, ViewChangeError as Error,
+    OpNumber, PipelineLimits, Prefix, PreparedOperation, ReceivedStart, ReplicationError, Scope,
+    StartView, Status, ViewChange, ViewChangeError as Error,
 };
 
 fn selected(count: u8) -> ViewChange {
@@ -97,8 +97,10 @@ fn failed_installation_cannot_be_abandoned_to_reuse_uncertain_storage() {
 fn backup(start: StartView, count: u8) -> InstallingView {
     promised(2, 0, start.scope.view)
         .install_backup(
-            node(1),
-            start,
+            ReceivedStart {
+                from: node(1),
+                start,
+            },
             JournalGeneration(200),
             &operations(count),
             lookup,
@@ -269,7 +271,15 @@ fn already_committed_selected_tail_still_needs_a_new_view_backup_vote() {
     assert!(!primary.snapshot().ready_for_appends);
     let start = primary.start_view().unwrap().unwrap();
     let mut pending_backup = promised(2, 0, 1)
-        .install_backup(node(1), start, JournalGeneration(200), &[], lookup)
+        .install_backup(
+            ReceivedStart {
+                from: node(1),
+                start,
+            },
+            JournalGeneration(200),
+            &[],
+            lookup,
+        )
         .unwrap();
     let backup = finish(&mut pending_backup);
     primary
@@ -292,7 +302,15 @@ fn backup_keeps_a_higher_local_commit_than_start_view_advertises() {
     let promise = election.begin_promise().unwrap();
     election.complete_promise(promise).unwrap();
     let mut pending = election
-        .install_backup(node(1), start, JournalGeneration(300), &[], lookup)
+        .install_backup(
+            ReceivedStart {
+                from: node(1),
+                start,
+            },
+            JournalGeneration(300),
+            &[],
+            lookup,
+        )
         .unwrap();
     assert_eq!(pending.ticket().committed(), committed);
     assert_eq!(pending.ticket().protected_committed(), committed);
@@ -475,8 +493,10 @@ fn installation_rejects_missing_wrong_or_new_view_tail_and_capacity_overruns() {
     assert!(matches!(
         promised(2, 0, 1)
             .install_backup(
-                node(1),
-                start,
+                ReceivedStart {
+                    from: node(1),
+                    start
+                },
                 JournalGeneration(200),
                 &operations(33),
                 lookup
@@ -501,10 +521,12 @@ fn installation_rejects_missing_wrong_or_new_view_tail_and_capacity_overruns() {
     assert!(matches!(
         small
             .install_backup(
-                node(1),
-                StartView {
-                    accepted: operations(2)[1].prefix(),
-                    ..start
+                ReceivedStart {
+                    from: node(1),
+                    start: StartView {
+                        accepted: operations(2)[1].prefix(),
+                        ..start
+                    }
                 },
                 JournalGeneration(200),
                 &operations(2),
@@ -524,8 +546,10 @@ fn backup_rejects_wrong_primary_or_view_and_conflicting_protected_history() {
     assert!(matches!(
         promised(2, 0, 1)
             .install_backup(
-                node(0),
-                start,
+                ReceivedStart {
+                    from: node(0),
+                    start
+                },
                 JournalGeneration(200),
                 &operations(4),
                 lookup
@@ -536,8 +560,10 @@ fn backup_rejects_wrong_primary_or_view_and_conflicting_protected_history() {
     assert!(matches!(
         promised(2, 0, 2)
             .install_backup(
-                node(1),
-                start,
+                ReceivedStart {
+                    from: node(1),
+                    start
+                },
                 JournalGeneration(200),
                 &operations(4),
                 lookup
@@ -560,8 +586,10 @@ fn backup_rejects_wrong_primary_or_view_and_conflicting_protected_history() {
     assert!(matches!(
         election
             .install_backup(
-                node(1),
-                start,
+                ReceivedStart {
+                    from: node(1),
+                    start,
+                },
                 JournalGeneration(200),
                 &operations(4)[2..],
                 |_, _| Some(Digest::from_bytes([99; 32]))
@@ -617,8 +645,10 @@ fn rejected_installation_returns_fenced_ownership_for_missing_data_and_stale_ret
     let before = election.normal_snapshot();
     let error = election
         .install_backup(
-            node(1),
-            start,
+            ReceivedStart {
+                from: node(1),
+                start,
+            },
             JournalGeneration(200),
             &operations(4)[2..],
             |_, _| None,
@@ -633,8 +663,10 @@ fn rejected_installation_returns_fenced_ownership_for_missing_data_and_stale_ret
     };
     let error = election
         .install_backup(
-            node(1),
-            stale,
+            ReceivedStart {
+                from: node(1),
+                start: stale,
+            },
             JournalGeneration(200),
             &operations(4)[2..],
             lookup,
@@ -649,8 +681,10 @@ fn rejected_installation_returns_fenced_ownership_for_missing_data_and_stale_ret
     let backup = finish(
         &mut election
             .install_backup(
-                node(1),
-                start,
+                ReceivedStart {
+                    from: node(1),
+                    start,
+                },
                 JournalGeneration(200),
                 &operations(4)[2..],
                 lookup,

@@ -15,7 +15,7 @@ use std::{
 };
 
 mod config;
-pub use config::deployment_with_resources;
+pub use config::{Shape, deployment_with_resources};
 mod cluster;
 pub use cluster::Cluster;
 
@@ -29,7 +29,7 @@ pub struct Storage {
 impl Storage {
     fn stop(&self) {
         self.control.stop.store(true, Ordering::Release);
-        self.control.wake.notify_one();
+        self.control.wake.mark();
     }
 }
 
@@ -37,7 +37,7 @@ impl Storage {
 #[derive(Debug, Default)]
 pub struct Control {
     stop: AtomicBool,
-    wake: tokio::sync::Notify,
+    wake: ozzy_io::signal::DataSignal,
     crash: std::sync::atomic::AtomicU8,
     hold_writes: AtomicBool,
     hold_completions: AtomicBool,
@@ -63,7 +63,7 @@ impl Control {
     pub fn crash(&self, power_loss: bool) {
         self.crash
             .store(if power_loss { 2 } else { 1 }, Ordering::Release);
-        self.wake.notify_one();
+        self.wake.mark();
     }
 
     fn record(&self, events: Vec<ozzy_io::simulation::Event>) {
@@ -78,7 +78,10 @@ impl Control {
         }
     }
 
-    fn finish(&self, image: Image, done: &tokio::sync::Semaphore) -> Image {
+    /// Cut the device and hand its image to a waiting snapshot and the drain.
+    fn finish(&self, device: Controller, power_loss: bool, done: &tokio::sync::Semaphore) -> Image {
+        let (image, events) = device.crash(power_loss).unwrap();
+        self.record(events);
         let mut snapshot = self.snapshot.lock().unwrap();
         snapshot.finished = Some(image.clone());
         if let Some(reply) = snapshot.pending.take() {
@@ -98,14 +101,14 @@ impl Control {
             }
             assert!(snapshot.pending.replace(send).is_none());
         }
-        self.wake.notify_one();
+        self.wake.mark();
         receive.await.unwrap()
     }
 
     /// Hold segment data execution until released; metadata can progress.
     pub fn hold_record_writes(&self, hold: bool) {
         self.hold_writes.store(hold, Ordering::Release);
-        self.wake.notify_one();
+        self.wake.mark();
     }
     /// Number of segment writes currently held by the pump.
     pub fn held_writes(&self) -> usize {
@@ -114,7 +117,7 @@ impl Control {
     /// Hold result delivery independently of physical execution.
     pub fn hold_completions(&self, hold: bool) {
         self.hold_completions.store(hold, Ordering::Release);
-        self.wake.notify_one();
+        self.wake.mark();
     }
     /// Physically finished jobs whose result has not reached its observer.
     pub fn pending_completions(&self) -> usize {
@@ -131,7 +134,7 @@ impl Control {
     /// Fail the next admitted segment write before changing its bytes.
     pub fn fail_next_record_write(&self) {
         self.fail_write.store(true, Ordering::Release);
-        self.wake.notify_one();
+        self.wake.mark();
     }
     /// Number of injected write failures observed by the pump.
     pub fn failures(&self) -> usize {
@@ -142,8 +145,88 @@ impl Control {
     pub fn short_next_record_write(&self, bytes: usize) {
         assert!(bytes > 0);
         self.short_write.store(bytes, Ordering::Release);
-        self.wake.notify_one();
+        self.wake.mark();
     }
+
+    /// One pass over the device jobs: execute queued jobs and deliver
+    /// executed results unless held. Returns whether any job advanced.
+    fn schedule(&self, device: &mut Controller, reverse: bool, draining: bool) -> bool {
+        let mut jobs = device.jobs();
+        if reverse {
+            jobs.reverse();
+        }
+        let mut held = 0;
+        let mut completions = 0;
+        let mut progressed = false;
+        for (job, stage) in jobs {
+            match stage {
+                Stage::Queued => match self.effect(device.operation(job), draining) {
+                    Some(effect) => {
+                        device.execute(job, effect).unwrap();
+                        progressed = true;
+                    }
+                    None => held += 1,
+                },
+                Stage::Executed => {
+                    if !draining && self.hold_completions.load(Ordering::Acquire) {
+                        completions += 1;
+                    } else {
+                        device.deliver(job).unwrap();
+                        progressed = true;
+                    }
+                }
+            }
+        }
+        self.held.store(held, Ordering::Release);
+        self.pending_completions
+            .store(completions, Ordering::Release);
+        if !device.trace().is_empty() {
+            self.record(device.take_trace());
+        }
+        progressed
+    }
+
+    /// The injected effect for one queued job, or none while record writes
+    /// are held. A drain never holds writes.
+    fn effect(&self, operation: Option<&Operation>, draining: bool) -> Option<Effect> {
+        let record = operation.is_some_and(is_record_write);
+        if record && !draining && self.hold_writes.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(if record && self.fail_write.swap(false, Ordering::AcqRel) {
+            self.failed.fetch_add(1, Ordering::Release);
+            Effect::FailBefore(std::io::ErrorKind::Other)
+        } else if operation.is_some_and(is_entry_write) {
+            match self.short_write.swap(0, Ordering::AcqRel) {
+                0 => Effect::Normal,
+                bytes => Effect::Short(bytes),
+            }
+        } else {
+            Effect::Normal
+        })
+    }
+
+    /// Deliver the results left after physical drain, then stop the device.
+    fn finish_drained(&self, mut device: Controller, done: &tokio::sync::Semaphore) -> Image {
+        // Results remain deliverable even after physical drain.
+        for (job, stage) in device.jobs() {
+            assert_eq!(stage, Stage::Executed);
+            device.deliver(job).unwrap();
+        }
+        self.finish(device, false, done)
+    }
+}
+
+/// Segment record writes start past the segment header.
+fn is_record_write(operation: &Operation) -> bool {
+    matches!(operation.unprotected(), Operation::Write { offset, .. } if *offset >= 4096)
+}
+
+/// A record write that starts a journal entry.
+fn is_entry_write(operation: &Operation) -> bool {
+    is_record_write(operation)
+        && matches!(operation.unprotected(), Operation::Write { data, .. }
+            if data.parts().first().is_some_and(|bytes| bytes.starts_with(b"OZJE")))
 }
 
 impl StorageOwner for Storage {
@@ -178,11 +261,11 @@ pub fn pump(
     let task = tokio::spawn(async move {
         let mut drain = None;
         loop {
+            // Clear before inspecting controls; a later change marks again.
+            scheduling.wake.drain(|| ());
             let crash = scheduling.crash.swap(0, Ordering::AcqRel);
             if crash != 0 {
-                let (image, events) = device.crash(crash == 2).unwrap();
-                scheduling.record(events);
-                return scheduling.finish(image, &done);
+                return scheduling.finish(device, crash == 2, &done);
             }
             if scheduling.stop.load(Ordering::Acquire) && drain.is_none() {
                 drain = Some(Box::pin(device.begin_shutdown().unwrap().wait()));
@@ -190,71 +273,14 @@ pub fn pump(
             if let Some(reply) = scheduling.snapshot.lock().unwrap().pending.take() {
                 let _ = reply.send(device.image().clone());
             }
-            let mut jobs = device.jobs();
-            if reverse {
-                jobs.reverse();
-            }
-            let mut held = 0;
-            let mut completions = 0;
-            let mut progressed = false;
-            for (job, stage) in jobs {
-                match stage {
-                    Stage::Queued => {
-                        let record = device.operation(job).is_some_and(|op| matches!(op.unprotected(), Operation::Write { offset, .. } if *offset >= 4096));
-                        let entry = device.operation(job).is_some_and(|op| matches!(op.unprotected(), Operation::Write { offset, data, .. } if *offset >= 4096 && data.parts().first().is_some_and(|bytes| bytes.starts_with(b"OZJE"))));
-                        if record
-                            && drain.is_none()
-                            && scheduling.hold_writes.load(Ordering::Acquire)
-                        {
-                            held += 1;
-                            continue;
-                        }
-                        let effect =
-                            if record && scheduling.fail_write.swap(false, Ordering::AcqRel) {
-                                scheduling.failed.fetch_add(1, Ordering::Release);
-                                Effect::FailBefore(std::io::ErrorKind::Other)
-                            } else if entry {
-                                match scheduling.short_write.swap(0, Ordering::AcqRel) {
-                                    0 => Effect::Normal,
-                                    bytes => Effect::Short(bytes),
-                                }
-                            } else {
-                                Effect::Normal
-                            };
-                        device.execute(job, effect).unwrap();
-                        progressed = true;
-                    }
-                    Stage::Executed => {
-                        if drain.is_none() && scheduling.hold_completions.load(Ordering::Acquire) {
-                            completions += 1;
-                        } else {
-                            device.deliver(job).unwrap();
-                            progressed = true;
-                        }
-                    }
-                }
-            }
-            scheduling.held.store(held, Ordering::Release);
-            scheduling
-                .pending_completions
-                .store(completions, Ordering::Release);
-            if !device.trace().is_empty() {
-                scheduling.record(device.take_trace());
-            }
+            let progressed = scheduling.schedule(&mut device, reverse, drain.is_some());
             let drained = if let Some(drain) = drain.as_mut() {
                 futures::poll!(drain.as_mut()).is_ready()
             } else {
                 false
             };
             if drained {
-                // Results remain deliverable even after physical drain.
-                for (job, stage) in device.jobs() {
-                    assert_eq!(stage, Stage::Executed);
-                    device.deliver(job).unwrap();
-                }
-                let (image, events) = device.crash(false).unwrap();
-                scheduling.record(events);
-                return scheduling.finish(image, &done);
+                return scheduling.finish_drained(device, &done);
             }
             if progressed {
                 tokio::task::yield_now().await;
@@ -262,7 +288,7 @@ pub fn pump(
                 // Physical drain only advances through this pump's execution.
                 tokio::select! {
                     () = device.submitted() => {}
-                    () = scheduling.wake.notified() => {}
+                    () = scheduling.wake.ready() => {}
                 }
             }
         }
@@ -426,7 +452,7 @@ pub async fn start_images(
         .await
         .unwrap_or_else(|_| panic!("virtual provision stalled: {name}"));
         let (broker, control, task) =
-            start_image(context.clone(), checked, local, reverse, image).await;
+            start_image(context.clone(), checked, local, Memory::new(image, reverse)).await;
         brokers.push(broker);
         controls.push(control);
         images.push(task);
@@ -434,15 +460,36 @@ pub async fn start_images(
     (brokers, controls, images)
 }
 
+/// The memory device one broker starts on.
+#[derive(Debug)]
+pub struct Memory {
+    /// Image the device boots from.
+    pub image: Image,
+    /// Bounds on dirty and durable media.
+    pub limits: ImageLimits,
+    /// Whether the pump delivers newer jobs first.
+    pub reverse: bool,
+}
+
+impl Memory {
+    /// An image under the default test media bounds.
+    pub fn new(image: Image, reverse: bool) -> Self {
+        Self {
+            image,
+            limits: IMAGE_LIMITS,
+            reverse,
+        }
+    }
+}
+
 /// Restart one broker from an image under ordinary startup selection.
 pub async fn start_image(
     context: impl Into<ServingContext>,
     checked: CheckedConfig,
     local: BrokerIdentity,
-    reverse: bool,
-    image: Image,
+    memory: Memory,
 ) -> (Broker, Arc<Control>, tokio::task::JoinHandle<Image>) {
-    start_image_selected(context, checked, local, reverse, image, &[]).await
+    start_image_selected(context, checked, local, &[], memory).await
 }
 
 /// Restart one broker with explicit production recovery selections.
@@ -450,21 +497,14 @@ pub async fn start_image_selected(
     context: impl Into<ServingContext>,
     checked: CheckedConfig,
     local: BrokerIdentity,
-    reverse: bool,
-    image: Image,
     selections: &[ozzy_broker::RecoverySelection],
+    memory: Memory,
 ) -> (Broker, Arc<Control>, tokio::task::JoinHandle<Image>) {
     let name = checked.plan.name.clone();
     tokio::time::timeout(
         Duration::from_secs(5),
         Box::pin(start_image_sized(
-            context,
-            checked,
-            local,
-            reverse,
-            image,
-            selections,
-            IMAGE_LIMITS,
+            context, checked, local, selections, memory,
         )),
     )
     .await
@@ -477,12 +517,15 @@ pub async fn start_image_sized(
     context: impl Into<ServingContext>,
     checked: CheckedConfig,
     local: BrokerIdentity,
-    reverse: bool,
-    image: Image,
     selections: &[ozzy_broker::RecoverySelection],
-    limits: ImageLimits,
+    memory: Memory,
 ) -> Result<(Broker, Arc<Control>, tokio::task::JoinHandle<Image>), ozzy_broker::StartupError> {
-    let (controller, clients) = device(&checked, checked.plan.shards.len(), image, limits);
+    let (controller, clients) = device(
+        &checked,
+        checked.plan.shards.len(),
+        memory.image,
+        memory.limits,
+    );
     let lanes = checked
         .plan
         .shards
@@ -494,9 +537,9 @@ pub async fn start_image_sized(
             client,
         })
         .collect();
-    let (storage, control, task) = pump(controller, reverse);
+    let (owner, control, task) = pump(controller, memory.reverse);
+    let storage = ozzy_broker::ShardStorage { lanes, owner };
     let broker =
-        Broker::start_trusted_with_storage(checked, local, selections, context, lanes, storage)
-            .await?;
+        Broker::start_trusted_with_storage(checked, local, selections, context, storage).await?;
     Ok((broker, control, task))
 }

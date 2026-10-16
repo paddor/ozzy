@@ -4,7 +4,7 @@ use bytes::Bytes;
 use smallvec::SmallVec;
 
 use super::OwnedRecord;
-use crate::MessageId;
+use crate::{MessageId, layout::Fixed};
 
 /// Mutable packed single-part records. Lengths cover 0 through 255 bytes.
 /// Every 32 records share one payload-position checkpoint for bounded seeking.
@@ -25,7 +25,7 @@ impl TinyRecords {
             || descriptors.len() != records.count
             || descriptors
                 .iter()
-                .any(|entry| entry[16..23] != [0, 0, 0, 1, 0, 0, 0])
+                .any(|entry| entry.array::<16, 7>() != [0, 0, 0, 1, 0, 0, 0])
         {
             return None;
         }
@@ -42,9 +42,9 @@ impl TinyRecords {
             }
             packed
                 .ids
-                .push(MessageId::from_bytes(entry[..16].try_into().unwrap()));
-            packed.lengths.push(entry[23]);
-            offset += usize::from(entry[23]);
+                .push(MessageId::from_bytes(entry.array::<0, 16>()));
+            packed.lengths.push(entry.u8_at::<23>());
+            offset = offset.checked_add(usize::from(entry.u8_at::<23>()))?;
         }
         debug_assert_eq!(offset, packed.payload.len());
         Some(packed)
@@ -92,17 +92,23 @@ impl TinyRecords {
     /// Borrow a record, scanning at most 31 preceding length bytes.
     pub fn get(&self, index: usize) -> Option<BatchRecord<'_>> {
         let id = *self.ids.get(index)?;
-        let block = index / 32;
-        let start = self.checkpoints[block]
-            + self.lengths[block * 32..index]
-                .iter()
-                .map(|&n| n as usize)
-                .sum::<usize>();
+        let start = self.offset(index)?;
+        let end = start.checked_add(usize::from(*self.lengths.get(index)?))?;
         Some(BatchRecord {
             encoding: super::Encoding::Raw,
             message_id: id,
-            payload: PayloadRef::Single(&self.payload[start..start + self.lengths[index] as usize]),
+            payload: PayloadRef::Single(self.payload.get(start..end)?),
         })
+    }
+    /// Payload offset of a record, or of the end at `len()`.
+    fn offset(&self, index: usize) -> Option<usize> {
+        if index == self.len() {
+            return Some(self.payload.len());
+        }
+        // Each checkpoint covers 32 records; bit masks keep the block start exact.
+        let preceding = self.lengths.get(index & !31..index)?;
+        let skipped = preceding.iter().map(|&n| usize::from(n)).sum::<usize>();
+        self.checkpoints.get(index >> 5)?.checked_add(skipped)
     }
     /// Contiguous record IDs in arrival order.
     pub fn ids(&self) -> &[MessageId] {
@@ -122,19 +128,8 @@ impl TinyRecords {
         if range.start > range.end || range.end > self.len() {
             return None;
         }
-        let offset = |index: usize| {
-            if index == self.len() {
-                self.payload.len()
-            } else {
-                let block = index / 32;
-                self.checkpoints[block]
-                    + self.lengths[block * 32..index]
-                        .iter()
-                        .map(|&n| n as usize)
-                        .sum::<usize>()
-            }
-        };
-        Some(&self.payload[offset(range.start)..offset(range.end)])
+        self.payload
+            .get(self.offset(range.start)?..self.offset(range.end)?)
     }
 }
 
@@ -307,8 +302,7 @@ impl RecordBatch {
     pub fn iter(&self) -> BatchIter<'_> {
         BatchIter {
             records: self,
-            front: 0,
-            back: self.len(),
+            indices: 0..self.len(),
             front_byte: 0,
             back_byte: match self {
                 Self::Tiny(r) => r.payload.len(),
@@ -343,52 +337,43 @@ impl<'a> IntoIterator for &'a RecordBatch {
 #[derive(Debug, Clone)]
 pub struct BatchIter<'a> {
     records: &'a RecordBatch,
-    front: usize,
-    back: usize,
+    indices: std::ops::Range<usize>,
     front_byte: usize,
     back_byte: usize,
 }
 impl<'a> Iterator for BatchIter<'a> {
     type Item = BatchRecord<'a>;
     fn next(&mut self) -> Option<Self::Item> {
-        if self.front == self.back {
-            return None;
-        }
-        let index = self.front;
-        self.front += 1;
+        let index = self.indices.next()?;
         match self.records {
             RecordBatch::General(_) | RecordBatch::Encoded(_) => self.records.get(index),
             RecordBatch::Tiny(r) => {
                 let start = self.front_byte;
-                self.front_byte += r.lengths[index] as usize;
+                self.front_byte = start.checked_add(usize::from(*r.lengths.get(index)?))?;
                 Some(BatchRecord {
                     encoding: super::Encoding::Raw,
-                    message_id: r.ids[index],
-                    payload: PayloadRef::Single(&r.payload[start..self.front_byte]),
+                    message_id: *r.ids.get(index)?,
+                    payload: PayloadRef::Single(r.payload.get(start..self.front_byte)?),
                 })
             }
         }
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let n = self.back - self.front;
-        (n, Some(n))
+        self.indices.size_hint()
     }
 }
 impl DoubleEndedIterator for BatchIter<'_> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        if self.front == self.back {
-            return None;
-        }
-        self.back -= 1;
+        let index = self.indices.next_back()?;
         match self.records {
-            RecordBatch::General(_) | RecordBatch::Encoded(_) => self.records.get(self.back),
+            RecordBatch::General(_) | RecordBatch::Encoded(_) => self.records.get(index),
             RecordBatch::Tiny(r) => {
                 let end = self.back_byte;
-                self.back_byte -= r.lengths[self.back] as usize;
+                self.back_byte = end.checked_sub(usize::from(*r.lengths.get(index)?))?;
                 Some(BatchRecord {
                     encoding: super::Encoding::Raw,
-                    message_id: r.ids[self.back],
-                    payload: PayloadRef::Single(&r.payload[self.back_byte..end]),
+                    message_id: *r.ids.get(index)?,
+                    payload: PayloadRef::Single(r.payload.get(self.back_byte..end)?),
                 })
             }
         }

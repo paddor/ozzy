@@ -52,6 +52,11 @@ impl Default for RetryPolicy {
 }
 
 impl RetryPolicy {
+    /// The delay after `backoff`: doubled, up to the cap.
+    pub(crate) fn next_backoff(&self, backoff: Duration) -> Duration {
+        backoff.saturating_mul(2).min(self.max_backoff)
+    }
+
     pub(super) fn validate(self) -> Result<(), Error> {
         let now = tokio::time::Instant::now();
         if [

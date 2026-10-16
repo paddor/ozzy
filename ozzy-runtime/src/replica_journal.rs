@@ -27,8 +27,9 @@ pub use owned::{
     PreparedRoll as OwnedPreparedRoll, PreparedStorageValidation as OwnedPreparedStorageValidation,
     PreparedSync as OwnedPreparedSync, PreparedWrite as OwnedPreparedWrite,
     RecoveringJournal as OwnedRecoveringJournal, RecoveryGenerations as OwnedRecoveryGenerations,
-    RecoveryOpen as OwnedRecoveryOpen, StorageCleanup as OwnedStorageCleanup,
-    WriteStep as OwnedWriteStep, WrittenRecords as OwnedWrittenRecords, dedup_limits,
+    RecoveryOpen as OwnedRecoveryOpen, ReplayRequest as OwnedReplayRequest,
+    StorageCleanup as OwnedStorageCleanup, WriteStep as OwnedWriteStep,
+    WrittenRecords as OwnedWrittenRecords, dedup_limits,
 };
 mod assignment;
 mod producer;
@@ -248,8 +249,14 @@ impl ReplicaJournal {
 
     /// Whether a retirement's checkpoint write, prefix scan, or installation
     /// is still outstanding. Its writes continue; the next retention turn waits.
-    pub(crate) fn retiring(&self) -> bool {
-        self.execution.retiring()
+    pub(crate) fn retention_busy(&self) -> bool {
+        self.execution.retention_busy()
+    }
+
+    /// Whether a storage cleanup job runs beside writes. Installation and
+    /// explicit cleanup wait for it.
+    pub(crate) fn cleaning(&self) -> bool {
+        self.execution.cleaning()
     }
 
     /// Configured outstanding command bound, including executing work.
@@ -266,15 +273,9 @@ impl ReplicaJournal {
         &mut self,
         ticket: PromiseTicket,
     ) -> Result<JournalCompletion<PromiseTicket>, SubmitError> {
-        self.submit(
-            ticket,
-            |ticket, done| commands::Action::Promise { ticket, done },
-            |action| match action {
-                commands::Action::Promise { ticket, .. } => ticket,
-                _ => unreachable!("submission preserves command kind"),
-            },
-        )
-        .map_err(|rejected| rejected.reason)
+        self.command(commands::Gate::Settled, |done| {
+            commands::Action::Append(commands::AppendAction::Promise { ticket, done })
+        })
     }
 
     fn begin_shutdown(&mut self) {
@@ -495,19 +496,13 @@ impl ReplicaJournal {
         ticket: ozzy_replication::driver::ValidationTicket,
         leader: bool,
     ) -> Result<JournalCompletion<IdentityRetention>, SubmitError> {
-        self.submit(
-            ticket,
-            |ticket, done| commands::Action::RetainIdentities {
+        self.command(commands::Gate::Free, |done| {
+            commands::Action::Maintenance(commands::MaintenanceAction::RetainIdentities {
                 ticket,
                 leader,
                 done,
-            },
-            |action| match action {
-                commands::Action::RetainIdentities { ticket, .. } => ticket,
-                _ => unreachable!("preserved identity retention action"),
-            },
-        )
-        .map_err(|error| error.reason)
+            })
+        })
     }
 
     /// Plan one sealed segment or retire a previously confirmed prefix.
@@ -517,19 +512,13 @@ impl ReplicaJournal {
         seed: ozzy_proto::OperationId,
         leader: bool,
     ) -> Result<JournalCompletion<RetentionTurn>, SubmitError> {
-        self.submit(
-            ticket,
-            |ticket, done| commands::Action::Retention {
+        self.command(commands::Gate::Settled, |done| {
+            commands::Action::Maintenance(commands::MaintenanceAction::Retention {
                 ticket,
                 seed,
                 leader,
                 done,
-            },
-            |action| match action {
-                commands::Action::Retention { ticket, .. } => ticket,
-                _ => unreachable!("preserved retention action"),
-            },
-        )
-        .map_err(|error| error.reason)
+            })
+        })
     }
 }

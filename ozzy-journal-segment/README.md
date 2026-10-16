@@ -1,19 +1,37 @@
 # ozzy-journal-segment
 
-Canonical append-only segment engine for Ozzy.
+Append-only segment journal for [Ozzy](https://github.com/paddor/ozzy)
+partitions. Applications use the
+[`ozzy`](https://github.com/paddor/ozzy/blob/main/ozzy/README.md) SDK.
 
-Broker partition actors use `AsyncGroupJournal`, `AsyncRecoveryDirectory`,
-and the asynchronous partition reader. File operations run through shared
-device backends. The actor owns journal state and installs completed results;
-the backend owns handles, buffers, and physical I/O. See
-[storage](https://github.com/paddor/ozzy/blob/main/doc/STORAGE.md) and [runtime](https://github.com/paddor/ozzy/blob/main/doc/RUNTIME.md).
+## Owns
 
-The segment engine checks physical framing, canonical operations, chain
-digests, manifests, checkpoints, and recovery evidence. Active writes use
-explicit durable or buffered policy. A writer reply follows the configured
-confirmation boundary, never a transport receipt.
+- Segment, index, manifest, and checkpoint file formats.
+- Integrity checks: physical framing, canonical operations, chain digests,
+  manifests, checkpoints, and recovery evidence.
+- Active writes with an explicit durable or buffered mode.
+- Recovery, suffix installation, and sealed-segment repair.
+- Whole-segment retention and cleanup of unreferenced files.
 
-`GroupDirectory` and `SegmentWriter` remain for offline volume and
-relocation work and older segment tests. Broker startup uses async backends. They are
-not a second broker execution path. The old blocking store wrapper, detached
-sealed-read cache, and packed-output buffer have been removed.
+File work runs on async storage backends; there is no blocking path. The
+partition actor owns journal state and installs completed results. A writer
+reply follows the configured confirmation boundary, never a transport receipt.
+
+## Entry points
+
+| Item | Use |
+| --- | --- |
+| `GroupJournal` | One partition's journal: append, sync, replay, close |
+| `RecoveryDirectory` | Locked partition directory metadata for opening and recovery |
+| `PartitionRead` | Captured read that holds back deletion of its segments |
+| `SegmentWriter`, `SegmentWriteMode` | Active segment writes |
+| `encode_segment_header`, `scan_segment`, `encode_manifest`, ... | Exact on-disk codecs |
+
+Feature `lz4` reads and writes LZ4 segment bodies.
+
+## Docs
+
+- [Storage](https://github.com/paddor/ozzy/blob/main/doc/STORAGE.md): formats,
+  barriers, retention, and recovery.
+- [Runtime](https://github.com/paddor/ozzy/blob/main/doc/RUNTIME.md): storage
+  owners and cancellation.

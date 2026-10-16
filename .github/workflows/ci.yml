@@ -46,7 +46,6 @@ jobs:
       - run: ./scripts/ozzy_cargo build --workspace --locked
       - run: ./scripts/test-all.sh tests
         env:
-          NEXTEST_PROFILE: ci
           NEXTEST_FINAL_STATUS_LEVEL: pass
 
   msrv:

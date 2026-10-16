@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Breaking
+
+- `BrokerLinks::routes` is async. The SDK owner thread registers the topic,
+  so routing state needs no lock shared with application threads.
+
 ### Added
 
 - Optional per-topic first-wins deduplication with bounded identity windows.
@@ -31,9 +36,19 @@
   `lz4-transport` feature. A deployment uses it for every endpoint or none.
 - Brokers and `BrokerLinks` accept `zstd+tcp://` endpoints with the
   `zstd-transport` feature, under the same all-or-none rule.
+- Telemetry counts retention progress: deferred turns, turns waiting for an
+  earlier retirement, proposed floors, started and installed retirements, and
+  removed unselected storage objects.
+- Telemetry times the storage cleanup pass of a retention turn
+  (`retention_cleanup`).
 
 ### Changed
 
+- Retention removes unselected segments, indexes, checkpoints, and manifests in
+  a job beside later writes. The partition stops only to capture its selection,
+  instead of holding its journal for each pass, about 80-110 ms on average and
+  up to 0.5 s at p99 on disk, which also delayed follower progress. A pass after
+  a metadata-only publication removes old manifests alone.
 - Deduplication keeps accepted-only and per-batch identity rows in a small
   table and moves them into the full reservation only while they outgrow it.
   Both tables had the full worst-case size, so every probe of a few hundred
@@ -79,6 +94,24 @@
   them to look for control identities they cannot carry.
 - Telemetry reads the clock once per 64 recorded operations instead of on every
   counter update, so quiet threads publish less often than every 20 ms.
+- `ShardContext::shutdown` and `FrontendContext::shutdown` are
+  `ozzy_io::signal::CloseSignal` (`close`, `closed`, `is_closed`). The broker's
+  own `Shutdown` type is gone.
+- Input that reaches a partition at the end of a shard turn wakes the shard
+  instead of waiting for its 2 ms timer sweep, and proposals queue on the
+  partition's thread instead of through a cross-thread channel. Inproc
+  acknowledgment p50 fell from 21.4 to 20.7 ms at 160k attempts/s and from 14.1
+  to 13.4 ms at 2000 attempts/s.
+- Broker shards sleep until the earliest partition timer instead of waking every
+  2 ms. Each turn visits only the partitions that were woken or whose timer is
+  due, plus a sweep of every partition each 100 ms as a safety net. Telemetry
+  counts `partition_sweep_progress` when only the sweep found work.
+- Telemetry events are thread-owned atomics. `ozzy_telemetry::totals()`
+  combines every thread's values, including exited threads, by each event's
+  `Kind`: count, peak, or gauge. `enable_counters()` counts events on every
+  thread without stage timing. Journal read, write, delivery, progress, and
+  dedup counters are telemetry events; the `storage-metrics` feature and its
+  process-wide counters are gone.
 
 ### Fixed
 
@@ -152,6 +185,20 @@
   retrying full destinations on every turn.
 - Stop broker dispatchers from spinning on a congested peer when OMQ reports
   send progress that a retry still cannot use; such retries back off briefly.
+- Start no retention or identity-expiry turn while an earlier turn's proposal
+  still waits to validate. Under sustained deduplicated load the second
+  proposal found the slot taken and stopped the broker shard with a panic.
+- Free a retired segment's space as soon as cleanup removes it. Cached read
+  handles kept up to four removed segments per partition allocated, beyond
+  the byte retention limit.
+- Let a restarted retained-topic copy with no stored operations ask its peers
+  whether its history expired, as other restarted copies do. It used to start
+  an election it could not win, which stalled the other two copies' writes
+  for an election timeout before it recovered. The first election of a newly
+  formatted retained partition now waits for that probe, up to 500 ms.
+- Release a closed store's group lock even while a child process that the
+  application is starting still holds inherited descriptors. Reopening the store
+  in the same process failed as locked until the child ran exec.
 
 ## [0.1.1] - 2026-10-09
 

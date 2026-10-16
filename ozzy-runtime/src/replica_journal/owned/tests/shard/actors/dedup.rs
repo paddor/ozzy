@@ -27,7 +27,7 @@ fn cluster(
 }
 
 /// Broker `n` formats and runs on `devices[n % devices.len()]`.
-fn cluster_on(
+pub(super) fn cluster_on(
     devices: &mut [(&mut Controller, &Local)],
     policy: QuorumPolicy,
     limits: ozzy_core::dedup::Limits,

@@ -59,7 +59,7 @@ async fn resume_partitions(policy: Confirmation) {
         partition_wave(&brokers, &mut writer, &keys[..=round], &mut next, 1).await;
     }
     assert_eq!(next, [4, 3, 2, 1]);
-    let routes = producer.routes(writer.metadata().clone()).unwrap();
+    let routes = producer.routes(writer.metadata().clone()).await.unwrap();
     let old_route = routes.route(0).unwrap().unwrap();
     live_many(&brokers, "close partitioned producer", writer.close())
         .await

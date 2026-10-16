@@ -1,7 +1,14 @@
 //! Allocation regressions for the canonical journal codec.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::hint::black_box;
 
 use ozzy_journal::operation::{
@@ -12,66 +19,7 @@ use ozzy_proto::{
     MessageId, Offset, OwnerEpoch, PartitionIncarnation, ProducerEpoch, ProducerId,
     ProducerSequence,
 };
-
-thread_local! {
-    static ALLOCATIONS: Cell<Option<usize>> = const { Cell::new(None) };
-}
-
-struct CountedAllocator;
-
-#[global_allocator]
-static ALLOCATOR: CountedAllocator = CountedAllocator;
-
-fn count() {
-    // Ignore other test threads and allocations during thread-local teardown.
-    let _ = ALLOCATIONS.try_with(|counter| {
-        if let Some(value) = counter.get() {
-            counter.set(Some(value.saturating_add(1)));
-        }
-    });
-}
-
-// SAFETY: Every operation forwards its unchanged pointer/layout to System.
-// Accounting uses allocation-free thread-local cells and never touches memory.
-unsafe impl GlobalAlloc for CountedAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        count();
-        // SAFETY: The caller supplies the allocator's required valid layout.
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        count();
-        // SAFETY: The caller supplies the allocator's required valid layout.
-        unsafe { System.alloc_zeroed(layout) }
-    }
-
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        // SAFETY: All allocations came from System with the same layout.
-        unsafe { System.dealloc(pointer, layout) }
-    }
-
-    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        count();
-        // SAFETY: The caller supplies System's original allocation and valid size.
-        unsafe { System.realloc(pointer, layout, size) }
-    }
-}
-
-fn measure<T>(operation: impl FnOnce() -> T) -> (T, usize) {
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            ALLOCATIONS.with(|counter| counter.set(None));
-        }
-    }
-    ALLOCATIONS.with(|counter| assert!(counter.replace(Some(0)).is_none()));
-    let reset = Reset;
-    let output = operation();
-    let allocations = ALLOCATIONS.with(|counter| counter.get().unwrap());
-    drop(reset);
-    (output, allocations)
-}
+use ozzy_test_alloc::measure;
 
 fn fixture(part_count: usize) -> Vec<u8> {
     let body = OperationBody::Append(Append {
@@ -115,9 +63,12 @@ fn indexed_summary_keeps_borrowed_boundaries_without_record_allocations() {
                 batch.append_timestamp_millis,
                 previous.append_timestamp_millis
             );
-            assert_eq!(batch.records().len(), previous.records().len());
-            let (table, payload) = batch.records().remaining_bytes();
-            let (old_table, old_payload) = previous.records().remaining_bytes();
+            assert_eq!(
+                batch.raw_records().unwrap().len(),
+                previous.raw_records().unwrap().len()
+            );
+            let (table, payload) = batch.raw_records().unwrap().remaining_bytes();
+            let (old_table, old_payload) = previous.raw_records().unwrap().remaining_bytes();
             assert_eq!(
                 (table.as_ptr(), table.len()),
                 (old_table.as_ptr(), old_table.len())
@@ -329,7 +280,7 @@ fn borrowed_view_and_all_record_parts_allocate_nothing() {
             )
             .unwrap();
             view.batches()
-                .flat_map(|batch| batch.records())
+                .flat_map(|batch| batch.raw_records().unwrap())
                 .flat_map(|record| record.parts)
                 .map(|part| black_box(part).len())
                 .sum::<usize>()
@@ -350,7 +301,7 @@ fn captured_batch_views_reuse_validated_descriptors_without_allocating() {
             )
             .unwrap()
             .iter()
-            .flat_map(ozzy_journal::operation::AppendBatchView::records)
+            .flat_map(|batch| batch.raw_records().unwrap())
             .flat_map(|record| record.parts)
             .map(|part| black_box(part).len())
             .sum::<usize>()
@@ -401,7 +352,7 @@ fn indexed_fragments_validate_only_selected_descriptors_without_allocating() {
         .batches()
         .next()
         .unwrap();
-    let mut records = batch.records();
+    let mut records = batch.raw_records().unwrap();
     while records.len() != 0 {
         let (descriptors, payload) = records.remaining_bytes();
         let expected = records.next().unwrap();

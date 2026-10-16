@@ -55,8 +55,17 @@ fn fixture(count: usize) -> (Vec<u8>, SegmentIndexImage) {
         });
     }
     let locations = operations.iter().map(|entry| entry.location).collect();
-    let image = SegmentIndexImage::new(source, 64 * 1024, offsets, messages, operations, locations)
-        .unwrap();
+    let image = SegmentIndexImage::new(
+        source,
+        64 * 1024,
+        crate::IndexEntries {
+            offsets,
+            messages,
+            operations,
+            locations,
+        },
+    )
+    .unwrap();
     (
         encode_segment_index(&image, IndexLimits::default()).unwrap(),
         image,
@@ -133,7 +142,7 @@ fn cooperative_index_open_preserves_every_lookup_and_yields_within_each_table() 
 
 fn repair_digest(bytes: &mut [u8]) {
     let digest = index_digest(bytes);
-    bytes[INDEX_DIGEST_START..INDEX_DIGEST_END].copy_from_slice(digest.as_bytes());
+    bytes[INDEX_DIGEST_START..INDEX_DIGEST_START + 32].copy_from_slice(digest.as_bytes());
 }
 
 fn rejects(bytes: &[u8], expected: &IndexFileError) {
@@ -340,10 +349,12 @@ fn cooperative_index_construction_sorts_all_tables_and_builds_identical_read_run
     let (actual, polls) = run(SegmentIndexImage::new_async(
         image.source(),
         image.build_memory_limit(),
-        image.offsets().iter().rev().copied().collect(),
-        image.messages().iter().rev().copied().collect(),
-        image.operations().iter().rev().copied().collect(),
-        image.locations().iter().rev().copied().collect(),
+        crate::IndexEntries {
+            offsets: image.offsets().iter().rev().copied().collect(),
+            messages: image.messages().iter().rev().copied().collect(),
+            operations: image.operations().iter().rev().copied().collect(),
+            locations: image.locations().iter().rev().copied().collect(),
+        },
     ));
     assert!(polls > 10);
     assert_eq!(actual.unwrap(), image);
@@ -352,15 +363,21 @@ fn cooperative_index_construction_sorts_all_tables_and_builds_identical_read_run
     let (invalid, polls) = run(SegmentIndexImage::new_async(
         image.source(),
         0,
-        image.offsets().to_vec(),
-        messages,
-        image.operations().to_vec(),
-        image.locations().to_vec(),
+        crate::IndexEntries {
+            offsets: image.offsets().to_vec(),
+            messages,
+            operations: image.operations().to_vec(),
+            locations: image.locations().to_vec(),
+        },
     ));
     assert!(polls > 1);
     assert_eq!(invalid.unwrap_err(), IndexFileError::MissingOffsetEntry);
-    let persisted =
-        crate::SegmentIndex::from_bytes(bytes, image.source(), IndexLimits::default()).unwrap();
+    let (persisted, _) = run(crate::SegmentIndex::from_bytes_async(
+        bytes,
+        image.source(),
+        IndexLimits::default(),
+    ));
+    let persisted = persisted.unwrap();
     let (read, polls) =
         run(crate::active_read_index::ActiveReadIndex::from_persisted_async(&persisted));
     let read = read.unwrap();

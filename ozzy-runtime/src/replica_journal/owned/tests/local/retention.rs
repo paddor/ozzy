@@ -64,8 +64,13 @@ fn append(
     sync_apply(controller, journal, driver);
 }
 
-/// Run captured retirement work and install it, as the shard does between writes.
-fn install_retirement(controller: &mut Controller, journal: &mut OwnedJournal) {
+/// Run captured cleanup and retirement work and install it, as the shard does
+/// between writes.
+fn run_retention_jobs(controller: &mut Controller, journal: &mut OwnedJournal) {
+    if let Some(work) = journal.take_cleanup_work() {
+        let done = drive(controller, Box::pin(work.run()));
+        journal.complete_cleanup(done);
+    }
     if let Some(work) = journal.take_retirement_work() {
         let done = drive(controller, Box::pin(work.run()));
         journal.complete_retirement(done);
@@ -199,10 +204,12 @@ fn a_clean_storage_pass_repeats_only_after_the_next_manifest_publication() {
         .unwrap();
         assert!(turn.enabled);
         assert!(turn.proposal.is_none());
+        run_retention_jobs(controller, journal);
     };
     turn(&mut controller, &mut journal, &driver);
-    // Selection is unchanged, so the next settled turn lists nothing.
-    let orphan = config.root.join("segments/999.log");
+    // Selection is unchanged, so the next settled turn lists nothing. Passes
+    // beside writes reclaim only IDs below the active segment.
+    let orphan = config.root.join("segments/0.log");
     super::super::maintenance::orphan(&mut controller, &io, orphan.clone());
     turn(&mut controller, &mut journal, &driver);
     assert!(controller.image().exists(&orphan, false));
@@ -250,7 +257,7 @@ fn a_released_pin_reopens_cleanup_without_a_manifest_publication() {
             write(controller, journal, driver, receipt);
             sync_apply(controller, journal, driver);
         }
-        install_retirement(controller, journal);
+        run_retention_jobs(controller, journal);
     };
     // Confirm the record floor, then retire segment 1 while it is pinned.
     turn(&mut controller, &mut journal, &mut driver);
@@ -374,7 +381,7 @@ fn retention_confirms_retry_floors_before_checkpoint_retirement_and_identity_res
         journal.retire_confirmed_history(
             driver.begin_validation().unwrap(),
             CheckpointId::from_bytes([92; 16]),
-            ozzy_journal_segment::AsyncRetirementBudget {
+            ozzy_journal_segment::RetirementBudget {
                 max_segments: 1,
                 max_read_bytes: 32768,
             },
@@ -470,7 +477,7 @@ fn retirement_restores_independent_retry_floors_for_interleaved_producers() {
         journal.retire_confirmed_history(
             driver.begin_validation().unwrap(),
             CheckpointId::from_bytes([95; 16]),
-            ozzy_journal_segment::AsyncRetirementBudget {
+            ozzy_journal_segment::RetirementBudget {
                 max_segments: 1,
                 max_read_bytes: 32768,
             },
@@ -515,4 +522,91 @@ fn retirement_restores_independent_retry_floors_for_interleaved_producers() {
         Offset::new(8)
     );
     drive(&mut controller, journal.shutdown()).unwrap();
+}
+
+/// Seed a journal whose first cleanup sweep ran, then owe a pass beside
+/// writes by rolling, with a stale segment below the new active one.
+fn capture_cleanup_beside_writes(
+    controller: &mut Controller,
+    io: &ozzy_io::Local,
+) -> (OwnedJournal, Driver, std::path::PathBuf) {
+    let config = local_config();
+    let (mut journal, mut driver) = drive(
+        controller,
+        OwnedJournal::format_local(config.clone(), io.clone(), JournalGeneration(1), 32768),
+    )
+    .unwrap();
+    initialize(controller, &mut journal, &mut driver);
+    append(controller, &mut journal, &mut driver, 12, 0, 1);
+    limit_bytes(controller, &mut journal, &mut driver, 65536);
+    let turn = |controller: &mut Controller, journal: &mut OwnedJournal, driver: &Driver| {
+        drive(
+            controller,
+            journal.retention_turn(
+                driver.begin_validation().unwrap(),
+                999,
+                OperationId::from_bytes([94; 16]),
+                true,
+            ),
+        )
+        .unwrap()
+    };
+    // The first pass after opening sweeps while holding the journal.
+    turn(controller, &mut journal, &driver);
+    assert!(!journal.cleaning());
+    roll(controller, &mut journal);
+    let stale = config.root.join("segments/0.log");
+    super::super::maintenance::orphan(controller, io, stale.clone());
+    turn(controller, &mut journal, &driver);
+    assert!(journal.cleaning());
+    (journal, driver, stale)
+}
+
+#[test]
+fn cleanup_runs_beside_appends_and_a_roll() {
+    let (mut controller, io) = setup();
+    let (mut journal, mut driver, stale) = capture_cleanup_beside_writes(&mut controller, &io);
+    let work = journal.take_cleanup_work().unwrap();
+    // Admission, writes, and a roll continue while the captured pass waits.
+    append(&mut controller, &mut journal, &mut driver, 12, 1, 1);
+    roll(&mut controller, &mut journal);
+    let active = journal.journal.ready().unwrap().manifest().segments.clone();
+    let done = drive(&mut controller, Box::pin(work.run()));
+    journal.complete_cleanup(done);
+    assert!(!journal.cleaning());
+    assert!(!journal.is_faulted());
+    assert!(!controller.image().exists(&stale, false));
+    let root = local_config().root;
+    for reference in &active {
+        let name = match reference.file_generation {
+            0 => format!("{}.log", reference.segment_id),
+            generation => format!("{}.{generation}.log", reference.segment_id),
+        };
+        assert!(
+            controller
+                .image()
+                .exists(&root.join("segments").join(name), false)
+        );
+    }
+    append(&mut controller, &mut journal, &mut driver, 12, 2, 1);
+    drive(&mut controller, journal.shutdown()).unwrap();
+}
+
+#[test]
+fn a_failed_cleanup_job_fences_the_owner() {
+    let (mut controller, io) = setup();
+    let (mut journal, _driver, stale) = capture_cleanup_beside_writes(&mut controller, &io);
+    let work = journal.take_cleanup_work().unwrap();
+    let done = drive_except(&mut controller, Box::pin(work.run()), None, |operation| {
+        if matches!(operation, Operation::RemoveFile { .. }) {
+            Effect::FailAfter(std::io::ErrorKind::Other)
+        } else {
+            Effect::Normal
+        }
+    });
+    journal.complete_cleanup(done);
+    assert!(journal.is_faulted());
+    assert!(!journal.cleaning());
+    // The removal may have happened; only its directory sync is uncertain.
+    let _ = controller.image().exists(&stale, false);
 }

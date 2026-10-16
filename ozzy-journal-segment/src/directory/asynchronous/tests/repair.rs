@@ -1,6 +1,6 @@
 use super::*;
 mod real;
-use crate::{AsyncSealedRepair, ChainPosition, SealedRepairLimits, logical_operation_digest};
+use crate::{ChainPosition, SealedRepair, SealedRepairLimits, logical_operation_digest};
 
 const CONFIG: &[u8] = b"test deployment";
 const BODIES: [[u8; 16]; 8] = [
@@ -84,16 +84,21 @@ async fn start(
     io: Local,
     accepted: LogPosition,
     limits: SealedRepairLimits,
-) -> Result<AsyncSealedRepair, DirectoryError> {
+) -> Result<SealedRepair, DirectoryError> {
     directory(io)
         .await?
         .quarantine_for_recovery(CONFIG)
         .await?
-        .begin_sealed_repair(CONFIG, JournalGeneration(9), 7, accepted, limits)
+        .begin_sealed_repair(
+            CONFIG,
+            JournalGeneration(9),
+            crate::RepairSource { view: 7, accepted },
+            limits,
+        )
         .await
 }
 
-async fn fill(repair: &mut AsyncSealedRepair, operations: &[CanonicalOperation<'_>]) -> usize {
+async fn fill(repair: &mut SealedRepair, operations: &[CanonicalOperation<'_>]) -> usize {
     let mut transferred = 0;
     while let Some(range) = repair.pending().unwrap() {
         let index = range.after.op_number as usize;

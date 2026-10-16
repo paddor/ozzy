@@ -1,3 +1,13 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
+
 use ozzy_config::{Deployment, DeploymentIdentity};
 use uuid::Uuid;
 
@@ -26,6 +36,7 @@ fn deduplication_is_opt_in_with_a_five_minute_window_and_explicit_capacity() {
     assert!(
         enabled
             .partition_placements("laptop")
+            .unwrap()
             .iter()
             .all(|partition| { partition.deduplication == Some(policy) })
     );

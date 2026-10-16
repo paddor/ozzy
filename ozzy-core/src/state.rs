@@ -30,6 +30,7 @@ pub use producer::{
 
 pub use images::{
     CanonicalImages, CanonicalImagesError, CanonicalRecovery, PreparedCanonicalGroup,
+    RecoveredImages,
 };
 pub use snapshot::{
     STATE_SNAPSHOT_HEADER_BYTES, StateSnapshotError, StateSnapshotLimits,
@@ -109,6 +110,13 @@ impl CanonicalPartition {
     /// Look up one partition-local producer session.
     pub fn producer(&self, producer: ProducerId) -> Option<&CanonicalProducer> {
         self.producers.get(&producer)
+    }
+
+    /// The open producer session a validated plan names.
+    fn producer_mut(&mut self, producer: ProducerId) -> Result<&mut CanonicalProducer, StateError> {
+        self.producers
+            .get_mut(&producer)
+            .ok_or(StateError::ProducerMismatch)
     }
 
     /// Iterate partition-local producer sessions in unspecified order.

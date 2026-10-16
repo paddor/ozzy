@@ -3,7 +3,8 @@ use crate::{
     CurrentReference,
     async_files::Access,
     async_metadata,
-    directory::{evidence, position_before, position_regresses},
+    directory::{evidence, position_regresses},
+    metadata::position_before,
 };
 use ozzy_io::Operation;
 

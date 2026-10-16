@@ -5,7 +5,7 @@ use super::{
 };
 use omq_tokio::Message;
 use ozzy_core::live::{LiveCursor, Publication, Replayed};
-use ozzy_proto::{LinkSessionId, NodeId, reader};
+use ozzy_proto::{LinkSessionId, NodeId, directory::RouteState, reader};
 use std::{future::Future, pin::Pin, sync::Arc};
 
 mod batch;
@@ -13,10 +13,19 @@ mod delivery;
 mod subscription;
 use batch::{Batch, FrameRecords};
 
+/// Reader and route generations a reader poll captured before visiting any
+/// cursor, and the owner time of this visit.
+#[derive(Clone, Copy)]
+pub(super) struct Observed {
+    pub(super) input: (u64, RouteGeneration),
+    pub(super) now: Duration,
+}
+
 type Selected = (NodeId, LinkSessionId, reader::Subscribed);
 pub(super) struct Opening {
     broker: NodeId,
     session: LinkSessionId,
+    subscription: reader::Subscription,
     source: reader::Source,
     request: Pin<Box<dyn Future<Output = Result<Selected, BrokerLinkError>> + Send>>,
 }
@@ -30,6 +39,9 @@ pub(super) struct Cursor {
     selected: Option<Selected>,
     accepted: Option<Selected>,
     opening: Option<Opening>,
+    /// The opening subscription's first replay input, taken from the inbox
+    /// early so stale input behind it cannot hold the capacity it needs.
+    early: Option<Message>,
     canceling: Option<Returning>,
     pending: Option<Batch>,
     pending_live: bool,
@@ -69,6 +81,7 @@ impl Cursor {
             selected: None,
             accepted: None,
             opening: None,
+            early: None,
             canceling: None,
             pending: None,
             pending_live: false,
@@ -102,28 +115,29 @@ impl Cursor {
             && !self.inbox.can_subscribe()
     }
 
-    fn waiting_for_input(&self, input: (u64, RouteGeneration), now: Duration) -> bool {
+    fn waiting_for_input(&self, observed: Observed) -> bool {
         // A quiet partition cannot gain records or a new source
         // without input, a pending future, or its existing repair timer.
         // Buffered records and observer futures remain independently runnable.
-        self.observed_input == Some(input)
+        self.observed_input == Some(observed.input)
             && self.pending.is_none()
             && self.ready.is_none()
             && self.opening.is_none()
             && self.canceling.is_none()
-            && self.deadline().is_none_or(|deadline| now < deadline)
+            && self
+                .deadline()
+                .is_none_or(|deadline| observed.now < deadline)
     }
 
     pub(super) fn poll(
         &mut self,
-        links: &BrokerLinks,
         routes: &TopicRoutes,
         decoder: &mut Decoder,
-        now: Duration,
-        input: (u64, RouteGeneration),
+        observed: Observed,
         cx: &mut Context<'_>,
     ) -> Poll<Result<TopicRecord, TopicReaderError>> {
-        if self.waiting_for_input(input, now) {
+        let (links, now, input) = (routes.links(), observed.now, observed.input);
+        if self.waiting_for_input(observed) {
             return Poll::Pending;
         }
         // Buffered records already passed the source check. Route and physical
@@ -138,38 +152,15 @@ impl Cursor {
         self.observed_input = Some(input);
         let accepted = self.accepted;
         let route = routes.route(self.number)?;
-        let source = self
-            .accepted
-            .map(|(broker, session, selected)| (broker, session, selected.source))
-            .or_else(|| {
-                self.opening
-                    .as_ref()
-                    .map(|opening| (opening.broker, opening.session, opening.source))
-            });
-        if let Some((broker, session, source)) = source
-            && (links.session(broker) != Some(session)
-                || route.as_ref().is_some_and(|route| {
-                    route.leader != Some(broker) || source_view(source) != route.view
-                }))
-        {
-            self.reset();
-            // Dropping the old observer frees its SDK control slot when the
-            // driver runs. Wake it even if retained payloads block a new open.
-            routes.refresh(self.number)?;
-        }
-        // A partition that waits for a leader subscribes as soon as a route
-        // names one, not at its next refresh.
-        let leader = route
-            .as_ref()
-            .and_then(|route| route.leader.map(|leader| (route.view, leader)));
-        if leader != self.leader {
-            self.leader = leader;
-            if leader.is_some() && self.selected.is_none() && self.opening.is_none() {
-                self.due = now;
-            }
-        }
+        self.check_source(routes, route.as_ref())?;
+        self.follow_leader(route.as_ref(), now);
         self.poll_returns(routes, cx)?;
         self.poll_opening(links, routes, now, cx)?;
+        if self.selected.is_none() && self.early.is_none() {
+            // Without a selection, queued replay is stale, except the first
+            // input of an opening subscription, held until it is accepted.
+            self.early = self.next_replay();
+        }
         if accepted.is_some() && self.accepted == accepted {
             self.verified_source = Some(input.1);
         }
@@ -177,33 +168,13 @@ impl Cursor {
             return Poll::Ready(Ok(record));
         }
         self.pending = None;
-        if let Some(ready) = self.ready.take() {
-            self.pending = Some(ready);
-            self.pending_live = true;
-            cx.waker().wake_by_ref();
-        } else {
-            if self.accepted.is_some()
-                && !self.live.is_paused()
-                && let Some(message) = self.inbox.publication()
-            {
-                self.publication(links, &message, now)?;
-                cx.waker().wake_by_ref();
-            }
-            if self.pending.is_none()
-                && self.live.replay().is_some()
-                && self.selected.is_some()
-                && let Some(message) = self.inbox.pop()
-            {
-                self.replay(links, &message, now, cx)?;
-                cx.waker().wake_by_ref();
-            }
-        }
-        self.retire(links);
+        self.take_input(links, now, cx)?;
+        self.retire(links, routes, cx)?;
         if self.pending.is_none() && self.live.tick(now) {
             self.due = now;
         }
         if now >= self.due && !self.waiting_for_capacity() {
-            self.due = now + self.refresh;
+            self.due = now.saturating_add(self.refresh);
             routes.refresh(self.number)?;
             if self.live.replay().is_some()
                 && self.selected.is_none()
@@ -219,6 +190,95 @@ impl Cursor {
         Poll::Pending
     }
 
+    /// Reset when the accepted or opening source lost its link session, or
+    /// `route` names another leader or view.
+    fn check_source(
+        &mut self,
+        routes: &TopicRoutes,
+        route: Option<&RouteState>,
+    ) -> Result<(), TopicReaderError> {
+        let source = self
+            .accepted
+            .map(|(broker, session, selected)| (broker, session, selected.source))
+            .or_else(|| {
+                self.opening
+                    .as_ref()
+                    .map(|opening| (opening.broker, opening.session, opening.source))
+            });
+        if let Some((broker, session, source)) = source
+            && (routes.links().session(broker) != Some(session)
+                || route.is_some_and(|route| {
+                    route.leader != Some(broker) || source_view(source) != route.view
+                }))
+        {
+            self.reset();
+            // Dropping the old observer frees its SDK control slot when the
+            // driver runs. Wake it even if retained payloads block a new open.
+            routes.refresh(self.number)?;
+        }
+        Ok(())
+    }
+
+    /// A partition that waits for a leader subscribes as soon as a route
+    /// names one, not at its next refresh.
+    fn follow_leader(&mut self, route: Option<&RouteState>, now: Duration) {
+        let leader = route.and_then(|route| route.leader.map(|leader| (route.view, leader)));
+        if leader != self.leader {
+            self.leader = leader;
+            if leader.is_some() && self.selected.is_none() && self.opening.is_none() {
+                self.due = now;
+            }
+        }
+    }
+
+    /// Stage the held live records, else apply one publication and one
+    /// replay input, waking the reader after each.
+    fn take_input(
+        &mut self,
+        links: &BrokerLinks,
+        now: Duration,
+        cx: &mut Context<'_>,
+    ) -> Result<(), TopicReaderError> {
+        if let Some(ready) = self.ready.take() {
+            self.pending = Some(ready);
+            self.pending_live = true;
+            cx.waker().wake_by_ref();
+            return Ok(());
+        }
+        if self.accepted.is_some()
+            && !self.live.is_paused()
+            && let Some(message) = self.inbox.publication()
+        {
+            self.publication(links, &message, now)?;
+            cx.waker().wake_by_ref();
+        }
+        if self.pending.is_none()
+            && self.live.replay().is_some()
+            && self.selected.is_some()
+            && let Some(message) = self.early.take().or_else(|| self.next_replay())
+        {
+            self.replay(links, &message, now, cx)?;
+            cx.waker().wake_by_ref();
+        }
+        Ok(())
+    }
+
+    /// The next replay input of the subscription this cursor selected or is
+    /// opening. The inbox drops every other generation's input.
+    fn next_replay(&self) -> Option<Message> {
+        let current = self
+            .selected
+            .map(|(_, _, selected)| selected.subscription)
+            .or_else(|| self.opening.as_ref().map(|opening| opening.subscription));
+        self.inbox.pop(current)
+    }
+
+    /// Drop queued replay, including an early frame.
+    fn clear_replay(&mut self) {
+        self.early = None;
+        self.inbox.clear();
+    }
+
     fn reset(&mut self) {
         self.verified_source = None;
         self.opening = None;
@@ -228,7 +288,7 @@ impl Cursor {
         self.ready = None;
         self.selected = None;
         self.accepted = None;
-        self.inbox.reset_delivery();
+        self.clear_replay();
         self.live = LiveCursor::new(self.next, self.refresh);
         self.due = Duration::ZERO;
     }

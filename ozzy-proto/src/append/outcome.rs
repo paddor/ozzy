@@ -1,5 +1,5 @@
 use super::CodecError;
-use crate::Offset;
+use crate::{Offset, layout::Fixed};
 
 /// Bytes in one contiguous outcome run: disposition, first offset, record count.
 pub const OUTCOME_RUN_BYTES: usize = 13;
@@ -61,6 +61,16 @@ impl OutcomeRun {
             })
     }
 
+    /// Every attempt of this run, in order.
+    pub fn outcomes(self) -> impl Iterator<Item = AppendOutcome> + Clone {
+        let first = self.first_offset.get();
+        let end = first.saturating_add(u64::from(self.records));
+        (first..end).map(move |offset| AppendOutcome {
+            disposition: self.disposition,
+            offset: Offset::new(offset),
+        })
+    }
+
     /// Encode one nonempty run, rejecting an unrepresentable exclusive end.
     pub fn encode(self) -> Result<[u8; OUTCOME_RUN_BYTES], CodecError> {
         self.validate()?;
@@ -75,9 +85,9 @@ impl OutcomeRun {
     /// Session, sequence, and partition fences remain the caller's obligation.
     pub fn decode(bytes: &[u8; OUTCOME_RUN_BYTES]) -> Result<Self, CodecError> {
         let run = Self {
-            disposition: AppendDisposition::try_from(bytes[0])?,
-            first_offset: Offset::new(u64::from_be_bytes(bytes[1..9].try_into().unwrap())),
-            records: u32::from_be_bytes(bytes[9..].try_into().unwrap()),
+            disposition: AppendDisposition::try_from(bytes.u8_at::<0>())?,
+            first_offset: Offset::new(bytes.u64_at::<1>()),
+            records: bytes.u32_at::<9>(),
         };
         run.validate()?;
         Ok(run)
@@ -123,16 +133,22 @@ impl Iterator for OutcomeRuns<'_> {
             records: 1,
         };
         for outcome in rest {
-            if run.records == u32::MAX
-                || outcome.disposition != run.disposition
+            let Some(records) = run.records.checked_add(1) else {
+                break;
+            };
+            if outcome.disposition != run.disposition
                 || run.first_offset.get().checked_add(u64::from(run.records))
                     != Some(outcome.offset.get())
             {
                 break;
             }
-            run.records += 1;
+            run.records = records;
         }
-        self.remaining = &self.remaining[run.records as usize..];
+        // The run counts outcomes it took from `remaining`.
+        self.remaining = self
+            .remaining
+            .get(run.records as usize..)
+            .unwrap_or_default();
         Some(run)
     }
 

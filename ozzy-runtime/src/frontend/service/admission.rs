@@ -4,6 +4,7 @@ use super::{
     Access, BROKER_ROLE, Binding, Kind, Link, NodeId, Opcode, Peer, ReceiveError, Service,
     ServiceError, handshake, routed,
 };
+use crate::peer_sessions::Established;
 
 pub(super) fn validate_roles(kind: Kind, roles: u32) -> Result<(), ReceiveError> {
     let valid = match kind {
@@ -27,53 +28,66 @@ impl Service {
         // a routing identity or establish replication membership.
         validate_roles(kind, hello.parameters.roles)?;
         let handled = self.sessions.receive(peer, packet)?;
-        if handled.replaced {
-            let binding = Binding {
-                peer,
-                kind,
-                session: self.sessions.session(peer).expect("established handshake"),
-            };
-            if let Err(error) = self.dispatcher.bind(binding) {
-                self.dispatcher.disconnect(peer);
-                self.sessions.disconnect(peer);
-                self.set_link(peer, None);
-                self.peers
-                    .get_mut(&peer)
-                    .expect("authorized peer")
-                    .handshake = None;
-                return Err(error.into());
+        let link = match handled.replaced {
+            Some(established) => Some(self.establish(peer, kind, established)?),
+            None => None,
+        };
+        let state = self.peers.get_mut(&peer).ok_or(ReceiveError::Peer)?;
+        let reply = handled.reply.map(|reply| routed(peer, reply));
+        let changed = if let Some(link) = link {
+            state.awaiting_welcome = reply.is_some();
+            state.handshake = reply;
+            state.replace_link(Some(link))
+        } else {
+            if reply.is_some() {
+                state.handshake = reply;
             }
-            if kind == Kind::Client
-                && let Some(watches) = &mut self.watches
-                && let Err(error) = watches.bind(peer, binding.session)
-            {
-                self.dispatcher.disconnect(peer);
-                self.sessions.disconnect(peer);
-                self.set_link(peer, None);
-                return Err(ReceiveError::Watch(error));
-            }
-            self.set_link(
-                peer,
-                Some(Link {
-                    binding,
-                    send: self.sessions.send_limits(peer)?,
-                    remote: self
-                        .sessions
-                        .remote_parameters(peer)
-                        .expect("established handshake"),
-                }),
-            );
-            let state = self.peers.get_mut(&peer).expect("authorized peer");
-            state.handshake = None;
-            state.awaiting_welcome = handled.reply.is_some();
-        }
-        if let Some(reply) = handled.reply {
-            self.peers
-                .get_mut(&peer)
-                .expect("authorized peer")
-                .handshake = Some(routed(peer, reply));
+            false
+        };
+        if changed {
+            self.publish_links();
         }
         Ok(())
+    }
+
+    /// Bind a replacement session in the dispatcher and watch registry. A
+    /// refusal fences the session again.
+    fn establish(
+        &mut self,
+        peer: NodeId,
+        kind: Kind,
+        established: Established,
+    ) -> Result<Link, ReceiveError> {
+        let binding = Binding {
+            peer,
+            kind,
+            session: established.session,
+        };
+        if let Err(error) = self.dispatcher.bind(binding) {
+            self.abandon(peer);
+            if let Some(state) = self.peers.get_mut(&peer) {
+                state.handshake = None;
+            }
+            return Err(error.into());
+        }
+        if kind == Kind::Client
+            && let Some(watches) = &mut self.watches
+            && let Err(error) = watches.bind(peer, binding.session)
+        {
+            self.abandon(peer);
+            return Err(ReceiveError::Watch(error));
+        }
+        Ok(Link {
+            binding,
+            send: established.send,
+            remote: established.remote,
+        })
+    }
+
+    fn abandon(&mut self, peer: NodeId) {
+        self.dispatcher.disconnect(peer);
+        self.sessions.disconnect(peer);
+        self.set_link(peer, None);
     }
 
     /// Bound physical connection metadata, including trusted clients before HELLO.
@@ -147,17 +161,7 @@ impl Service {
             peer,
             kind: Kind::Client,
         };
-        self.peers.insert(
-            peer,
-            Peer {
-                access,
-                trusted: true,
-                initiating: false,
-                handshake: None,
-                awaiting_welcome: false,
-            },
-        );
-        self.link_current.insert(peer, None);
+        self.peers.insert(peer, Peer::new(access, true));
         Ok(access)
     }
 
@@ -175,12 +179,7 @@ impl Service {
         self.dispatcher.disconnect(peer);
         self.sessions.retire(peer);
         self.peers.remove(&peer);
-        self.link_current.remove(&peer);
-        self.links
-            .0
-            .current
-            .store(std::sync::Arc::new(self.link_current.clone()));
-        self.links.0.changed.notify_changed();
+        self.publish_links();
         true
     }
 }

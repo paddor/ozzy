@@ -40,9 +40,11 @@ fn service(routes: Vec<directory::RouteState>) -> Service {
         7,
         Kind::Client,
         dispatch::Class::Control,
-        1,
-        4096,
-        8192,
+        crate::frontend::DataLaneLimits {
+            slots: 1,
+            maximum_retained_bytes: 4096,
+            retained_budget_bytes: 8192,
+        },
     )
     .unwrap();
     let queue = QueueLimits {
@@ -94,7 +96,7 @@ fn service(routes: Vec<directory::RouteState>) -> Service {
 
 fn register(service: &mut Service, groups: Vec<GroupId>) -> Vec<Message> {
     let peer = NodeId::from_bytes([70; 16]);
-    let remote = LinkSessions::with_ids(
+    let mut remote = LinkSessions::with_ids(
         peer,
         handshake::Parameters::append(DataLimits::default(), handshake::PRODUCER).unwrap(),
         handshake::OWNER,

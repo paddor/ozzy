@@ -1,10 +1,13 @@
 //! Durable view-change initiation and selection. Installation is a separate gate.
 
+mod recovery;
+mod selection;
+
 use ozzy_proto::NodeId;
 
 use crate::{
-    Configuration, Digest, JournalGeneration, NormalReplica, OpNumber, PipelineLimits, Prefix,
-    ReplicaSnapshot, ReplicationError, Scope, Status, SyncTicket, WriteTicket,
+    Configuration, Digest, JournalGeneration, NormalReplica, Prefix, ReplicaSnapshot,
+    ReplicationError, Scope, Status, SyncTicket, VoterIndex, VoterSet, Voters, WriteTicket,
 };
 
 /// One immutable, synchronized log description for a view-change report.
@@ -102,7 +105,7 @@ pub struct SelectedView {
     scope: Scope,
     source: LogSource,
     committed: Prefix,
-    voters: u8,
+    voters: VoterSet,
 }
 
 impl SelectedView {
@@ -120,7 +123,7 @@ impl SelectedView {
     }
     /// Bitset of participating voters in configured order, including the primary.
     pub const fn voter_mask(self) -> u8 {
-        self.voters
+        self.voters.mask()
     }
 }
 
@@ -135,141 +138,52 @@ impl SelectedView {
 pub struct ViewChange {
     pub(crate) normal: NormalReplica,
     pub(crate) configuration: Configuration,
-    pub(crate) local: usize,
+    pub(crate) local: VoterIndex,
     view: u64,
-    promised: u64,
+    promise: Promise,
     pending: Option<PromiseTicket>,
-    pub(crate) completed: Option<PromiseTicket>,
-    starts: u8,
-    reports: [Option<DoViewChange>; 3],
+    starts: VoterSet,
+    reports: Voters<Option<DoViewChange>>,
     pub(crate) selected: Option<SelectedView>,
+}
+
+/// Highest view whose durable promise this core has observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Promise {
+    /// Promised before this core began: the installed view, or recovered
+    /// metadata without a promise for the requested view.
+    Prior(u64),
+    /// Completed here, carried across an abandoned installation, or restored
+    /// from durable restart evidence.
+    Completed(PromiseTicket),
+}
+
+impl Promise {
+    const fn view(self) -> u64 {
+        match self {
+            Self::Prior(view) => view,
+            Self::Completed(ticket) => ticket.scope.view,
+        }
+    }
 }
 
 impl ViewChange {
     /// Frozen reported sources available for bounded, externally verified history repair.
     /// A report alone supplies no ancestry or installation authority.
     pub fn history_sources(&self) -> [Option<LogSource>; 3] {
-        std::array::from_fn(|index| {
-            self.reports[index].map(|report| LogSource {
-                voter: self.configuration.voters()[index],
+        VoterIndex::ALL.map(|voter| {
+            self.reports[voter].map(|report| LogSource {
+                voter: self.configuration.voter(voter),
                 generation: report.generation,
                 accepted: report.log.accepted,
             })
         })
     }
 
-    pub(crate) fn after_abandon(
-        mut normal: NormalReplica,
-        previous: PromiseTicket,
-        requested_view: u64,
-    ) -> Result<Self, ViewChangeError> {
-        normal.restore_fenced(previous.generation(), previous.log());
-        let mut changing = normal.into_view_change(requested_view)?;
-        changing.promised = previous.scope().view;
-        changing.completed = Some(previous);
-        Ok(changing)
-    }
-
-    /// Restart an intact durable voter without granting same-view authority.
-    ///
-    /// Restart from an installed normal view requests its successor, fencing a
-    /// primary that sent prepares before its local write completed. An already
-    /// promised but never installed election resumes that same view: it could
-    /// not have assigned normal operations there. Repeated restarts cannot
-    /// ratchet that unfinished election. Quorum selection and durable selected
-    /// installation/activation remain mandatory before any normal authority.
-    ///
-    /// `generation` must be a fresh writer incarnation. Journal recovery and
-    /// validation run on the storage worker before calling this sans-I/O method.
-    /// Retained operations stay on disk; only the live pipeline is preallocated.
-    /// Canonical application recovery is deferred to selected-view installation.
-    pub fn recover_intact(
-        configuration: Configuration,
-        local: NodeId,
-        generation: JournalGeneration,
-        recovered: RecoveredState,
-        limits: PipelineLimits,
-    ) -> Result<Self, ViewChangeError> {
-        if configuration.policy() == crate::QuorumPolicy::Replicated {
-            return Err(ViewChangeError::VolatileRestart);
-        }
-        Self::recover_verified(configuration, local, generation, recovered, limits)
-    }
-
-    /// Restart a memory-voting broker from independently proven drained history.
-    ///
-    /// The adapter must verify a durable shutdown marker bound to the exact
-    /// configuration, store, selected manifest, and accepted prefix, or a fresh
-    /// completed group recovery. Before returning any driver it must replace
-    /// that marker durably with running state. Intact bytes alone are insufficient:
-    /// they cannot prove that an unpersisted RAM vote never existed.
-    pub fn recover_drained(
-        configuration: Configuration,
-        local: NodeId,
-        generation: JournalGeneration,
-        recovered: RecoveredState,
-        limits: PipelineLimits,
-    ) -> Result<Self, ViewChangeError> {
-        if configuration.policy() != crate::QuorumPolicy::Replicated {
-            return Err(ReplicationError::PolicyMismatch.into());
-        }
-        Self::recover_verified(configuration, local, generation, recovered, limits)
-    }
-
-    fn recover_verified(
-        configuration: Configuration,
-        local: NodeId,
-        generation: JournalGeneration,
-        recovered: RecoveredState,
-        limits: PipelineLimits,
-    ) -> Result<Self, ViewChangeError> {
-        if recovered.scope
-            != (Scope {
-                view: recovered.scope.view,
-                ..configuration.scope()
-            })
-        {
-            return Err(ReplicationError::ScopeMismatch.into());
-        }
-        if recovered.log.last_normal_view > recovered.scope.view {
-            return Err(ViewChangeError::InvalidReport);
-        }
-        let view = if recovered.scope.view > recovered.log.last_normal_view {
-            recovered.scope.view
-        } else {
-            recovered
-                .scope
-                .view
-                .checked_add(1)
-                .ok_or(ViewChangeError::ViewExhausted)?
-        };
-        validate_report(DoViewChange {
-            scope: Scope {
-                view,
-                ..recovered.scope
-            },
-            generation,
-            log: recovered.log,
-        })?;
-        let normal =
-            NormalReplica::recover_fenced(configuration, local, generation, recovered.log, limits)?;
-        let mut changing = normal.into_view_change(view)?;
-        changing.promised = recovered.scope.view;
-        if changing.promised == view {
-            changing.starts |= 1 << changing.local; // Independently recovered durable promise.
-            changing.completed = Some(PromiseTicket {
-                scope: changing.scope(),
-                generation,
-                log: recovered.log,
-            });
-        }
-        Ok(changing)
-    }
-
     pub(crate) fn begin(
         mut normal: NormalReplica,
         configuration: Configuration,
-        local: usize,
+        local: VoterIndex,
         view: u64,
     ) -> Result<Self, ViewChangeError> {
         normal.fence();
@@ -284,11 +198,10 @@ impl ViewChange {
             configuration,
             local,
             view,
-            promised: configuration.scope().view,
+            promise: Promise::Prior(configuration.scope().view),
             pending: None,
-            completed: None,
-            starts: 0,
-            reports: [None; 3],
+            starts: VoterSet::EMPTY,
+            reports: Voters::splat(None),
             selected: None,
         })
     }
@@ -308,7 +221,7 @@ impl ViewChange {
 
     /// Highest view whose promise completion this core has observed.
     pub const fn promised_view(&self) -> u64 {
-        self.promised
+        self.promise.view()
     }
 
     /// Move toward a later view without discarding an outstanding disk action.
@@ -322,8 +235,8 @@ impl ViewChange {
             return Err(ViewChangeError::ViewNotHigher);
         }
         self.view = view;
-        self.starts = 0;
-        self.reports = [None; 3];
+        self.starts = VoterSet::EMPTY;
+        self.reports = Voters::splat(None);
         self.selected = None;
         Ok(())
     }
@@ -357,7 +270,7 @@ impl ViewChange {
         if self.pending.is_some() {
             return Err(ViewChangeError::PromisePending);
         }
-        if self.promised == self.view {
+        if self.promise.view() == self.view {
             return Err(ViewChangeError::AlreadyPromised);
         }
         let snapshot = self.normal.snapshot();
@@ -380,15 +293,14 @@ impl ViewChange {
     /// Observe successful durable publication of the exact issued promise.
     pub fn complete_promise(&mut self, ticket: PromiseTicket) -> Result<(), ViewChangeError> {
         self.require_active()?;
-        if self.completed == Some(ticket) {
+        if self.promise == Promise::Completed(ticket) {
             return Ok(());
         }
         self.require_ticket(ticket)?;
         self.pending = None;
-        self.completed = Some(ticket);
-        self.promised = ticket.scope.view;
-        if self.promised == self.view {
-            self.starts |= 1 << self.local;
+        self.promise = Promise::Completed(ticket);
+        if ticket.scope.view == self.view {
+            self.starts.insert(self.local);
         }
         Ok(())
     }
@@ -420,18 +332,17 @@ impl ViewChange {
         if voter == self.local {
             return Err(ReplicationError::WrongRole.into());
         }
-        self.starts |= 1 << voter;
+        self.starts.insert(voter);
         Ok(())
     }
 
     /// Freeze the local second-phase report after a first-phase majority.
     /// Send it to the configured primary; the primary retains its own report too.
     pub fn report(&mut self) -> Result<DoViewChange, ViewChangeError> {
-        self.require_promised()?;
-        if self.starts.count_ones() < 2 {
+        let promise = self.require_promised()?;
+        if self.starts.len() < 2 {
             return Err(ViewChangeError::StartQuorumMissing);
         }
-        let promise = self.completed.expect("requested view promised");
         let report = DoViewChange {
             scope: self.scope(),
             generation: promise.generation,
@@ -477,95 +388,6 @@ impl ViewChange {
         Ok(())
     }
 
-    /// Select the highest last-normal-view, then longest accepted lineage.
-    ///
-    /// `lookup` must be a nonblocking lookup into already verified, pinned
-    /// canonical history anchored by the supplied source's exact tail digest.
-    /// An isolated matching hash or a chunk from another generation is not such
-    /// evidence. Missing bytes return `None`; fetch/verify them outside the core.
-    /// At most six protected-prefix lookups are needed for three voters.
-    ///
-    /// Selection includes this primary's report and another distinct voter. It
-    /// protects every reported commit and same-normal-view accepted prefix.
-    /// Higher-normal-view histories may discard only older uncertain suffixes.
-    pub fn select(
-        &mut self,
-        mut lookup: impl FnMut(LogSource, OpNumber) -> Option<Digest>,
-    ) -> Result<SelectedView, ViewChangeError> {
-        self.require_promised()?;
-        self.require_primary()?;
-        if let Some(selected) = self.selected {
-            return Ok(selected);
-        }
-        let reports = self.reports;
-        if reports[self.local].is_none() || reports.iter().flatten().count() < 2 {
-            return Err(ViewChangeError::ReportQuorumMissing);
-        }
-        let mut chosen = self.local;
-        let mut voters = 0;
-        for (index, report) in reports.iter().enumerate() {
-            let Some(report) = report else {
-                continue;
-            };
-            voters |= 1 << index;
-            let current = reports[chosen].expect("selected report");
-            let rank = (report.log.last_normal_view, report.log.accepted.op);
-            let best = (current.log.last_normal_view, current.log.accepted.op);
-            if rank == best && report.log.accepted != current.log.accepted {
-                return Err(self.conflict());
-            }
-            if rank > best {
-                chosen = index;
-            }
-        }
-        let report = reports[chosen].expect("selected report");
-        let source = LogSource {
-            voter: self.configuration.voters()[chosen],
-            generation: report.generation,
-            accepted: report.log.accepted,
-        };
-        let mut committed = Prefix::GENESIS;
-        for candidate in reports.iter().flatten() {
-            if candidate.log.committed.op > committed.op {
-                committed = candidate.log.committed;
-            }
-            self.verify_prefix(source, candidate.log.committed, &mut lookup)?;
-            if candidate.log.last_normal_view == report.log.last_normal_view {
-                self.verify_prefix(source, candidate.log.accepted, &mut lookup)?;
-            }
-        }
-        let selected = SelectedView {
-            scope: self.scope(),
-            source,
-            committed,
-            voters,
-        };
-        self.selected = Some(selected);
-        Ok(selected)
-    }
-
-    pub(crate) fn verify_prefix(
-        &mut self,
-        source: LogSource,
-        prefix: Prefix,
-        lookup: &mut impl FnMut(LogSource, OpNumber) -> Option<Digest>,
-    ) -> Result<(), ViewChangeError> {
-        if prefix.op > source.accepted.op {
-            return Err(self.conflict());
-        }
-        let digest = if prefix.op == OpNumber(0) {
-            Digest::ZERO
-        } else if prefix.op == source.accepted.op {
-            source.accepted.digest
-        } else {
-            lookup(source, prefix.op).ok_or(ViewChangeError::HistoryMissing)?
-        };
-        if digest != prefix.digest {
-            return Err(self.conflict());
-        }
-        Ok(())
-    }
-
     fn require_active(&self) -> Result<(), ViewChangeError> {
         if self.normal.snapshot().status == Status::Faulted {
             return Err(ViewChangeError::Faulted);
@@ -582,18 +404,19 @@ impl ViewChange {
     }
 
     pub(crate) fn require_primary(&self) -> Result<(), ViewChangeError> {
-        if self.configuration.primary(self.view) != self.configuration.voters()[self.local] {
+        if VoterIndex::primary(self.view) != self.local {
             return Err(ReplicationError::WrongRole.into());
         }
         Ok(())
     }
 
-    pub(crate) fn require_promised(&self) -> Result<(), ViewChangeError> {
+    /// The completed promise for the requested view.
+    pub(crate) fn require_promised(&self) -> Result<PromiseTicket, ViewChangeError> {
         self.require_active()?;
-        if self.promised != self.view {
-            return Err(ViewChangeError::PromiseRequired);
+        match self.promise {
+            Promise::Completed(ticket) if ticket.scope.view == self.view => Ok(ticket),
+            Promise::Prior(_) | Promise::Completed(_) => Err(ViewChangeError::PromiseRequired),
         }
-        Ok(())
     }
 
     fn require_ticket(&self, ticket: PromiseTicket) -> Result<(), ViewChangeError> {
@@ -604,9 +427,7 @@ impl ViewChange {
     }
 
     fn conflict(&mut self) -> ViewChangeError {
-        self.normal
-            .fail_io(self.normal.snapshot().journal.generation)
-            .expect("current generation");
+        self.normal.fault();
         ViewChangeError::ConflictingHistory
     }
 }

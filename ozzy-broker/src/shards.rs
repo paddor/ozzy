@@ -5,15 +5,14 @@ mod memory;
 #[cfg(test)]
 mod tests;
 
+use crate::signal::CloseSignal;
 use crate::{ShardIo, StartupError};
 use futures::{StreamExt, stream::FuturesUnordered};
-pub use lifecycle::Shutdown;
 use lifecycle::{Registration, State};
 pub use memory::ShardMemory;
 use ozzy_config::{BrokerPlan, PartitionPlacement, ShardPlan};
-use ozzy_io::{Backend, Local};
+use ozzy_io::{Backend, Local, Ready};
 use std::{collections::BTreeMap, future::Future, panic::AssertUnwindSafe, sync::Arc};
-use tokio::sync::oneshot;
 
 /// One OS thread/current-thread Tokio runtime per configured application shard.
 /// Dropping requests shutdown. Worker drain does not depend on the caller runtime.
@@ -35,8 +34,8 @@ pub struct ShardContext {
     /// Shard-owned data and control allocation domains.
     pub memory: ShardMemory,
     /// Shared shutdown request and observation handle.
-    pub shutdown: Shutdown,
-    ready: Option<oneshot::Sender<()>>,
+    pub shutdown: CloseSignal,
+    ready: Option<Ready<()>>,
 }
 
 impl ShardContext {
@@ -49,8 +48,9 @@ impl ShardContext {
                 shard: self.plan.id,
                 reason: "shard readiness already published".into(),
             })?
-            .send(())
-            .map_err(|()| StartupError::Shard {
+            .report(())
+            .then_some(())
+            .ok_or_else(|| StartupError::Shard {
                 shard: self.plan.id,
                 reason: "shard startup observer disappeared".into(),
             })
@@ -97,87 +97,39 @@ impl ApplicationShards {
         // Prevent early worker completion from closing the whole startup group.
         let mut readiness = FuturesUnordered::new();
         for shard in &plan.shards {
-            let memory = domains.plan(shard, follower_progress)?;
-            let lane = lanes.remove(&shard.id).expect("validated shard lane");
-            let placements = plan
-                .partitions
-                .iter()
-                .filter(|part| part.shard == shard.id)
-                .cloned()
-                .collect();
-            let (ready, receiver) = oneshot::channel();
-            let registration = Registration::new(state.clone());
-            let worker = state.clone();
-            let shard = shard.clone();
-            let id = shard.id;
-            let factory = factory.clone();
-            let spawned = std::thread::Builder::new()
-                .name(format!("ozzy_app-{id}"))
-                .spawn(move || {
-                    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                        run(
-                            shard,
-                            placements,
-                            lane,
-                            ready,
-                            &worker.stop,
-                            &*factory,
-                            memory,
-                        )
-                    }))
-                    .unwrap_or_else(|_| {
-                        Err(StartupError::Shard {
-                            shard: id,
-                            reason: "application runtime panicked".into(),
-                        })
-                    });
-                    if let Err(error) = result {
-                        worker.fail(error);
-                    } else if !worker.stop.is_requested() {
-                        worker.fail(StartupError::Shard {
-                            shard: id,
-                            reason: "application runtime exited before shutdown".into(),
-                        });
-                    }
-                    // Runtime and every local task are gone before observers see
-                    // completion. Observers never need a blocking join. The
-                    // broker drain thread joins to report exited threads.
-                    drop(registration);
-                });
-            match spawned {
-                Ok(thread) => state.own(thread),
+            let assignment = Assignment {
+                memory: domains.plan(shard, follower_progress)?,
+                lane: lanes.remove(&shard.id).ok_or_else(|| StartupError::Shard {
+                    shard: shard.id,
+                    reason: "missing device lane".into(),
+                })?,
+                partitions: plan
+                    .partitions
+                    .iter()
+                    .filter(|part| part.shard == shard.id)
+                    .cloned()
+                    .collect(),
+                plan: shard.clone(),
+            };
+            match spawn_shard(&state, &factory, assignment) {
+                Ok(receiver) => {
+                    readiness.push(observe_readiness(state.clone(), shard.id, receiver));
+                }
                 Err(error) => {
-                    state.fail(StartupError::Shard {
-                        shard: id,
-                        reason: error.to_string(),
-                    });
+                    state.fail(error);
                     break;
                 }
             }
-            let observer = state.clone();
-            readiness.push(async move {
-                if receiver.await.is_err() {
-                    // The sender drops as the shard unwinds, before its thread
-                    // records the actual startup error. Wait for that report.
-                    observer.stop.requested().await;
-                    return observer.result().and(Err(StartupError::Shard {
-                        shard: id,
-                        reason: "application startup exited before readiness".into(),
-                    }));
-                }
-                Ok(())
-            });
         }
         drop(startup);
         let result = tokio::select! {
             biased;
-            () = state.stop.requested() => state.result().and(Err(StartupError::Runtime("application startup stopped".into()))),
+            () = state.stop.closed() => state.result().and(Err(StartupError::Runtime("application startup stopped".into()))),
             result = async { while let Some(result) = readiness.next().await { result?; } Ok(()) } => result,
         };
         if let Err(error) = result {
             state.fail(error);
             owner.closed().await?;
-            unreachable!("startup failure is retained");
         }
         state.result()?;
         Ok(owner)
@@ -190,7 +142,7 @@ impl ApplicationShards {
 
     /// Observe all worker runtimes being destroyed, including failure drain.
     pub async fn closed(&self) -> Result<(), StartupError> {
-        self.state.finished.requested().await;
+        self.state.finished.closed().await;
         self.state.result()
     }
 
@@ -201,13 +153,13 @@ impl ApplicationShards {
     }
 
     pub(crate) fn request_shutdown(&self) {
-        self.state.stop.request();
+        self.state.stop.close();
     }
 }
 
 impl Drop for ApplicationShards {
     fn drop(&mut self) {
-        self.state.stop.request();
+        self.state.stop.close();
     }
 }
 
@@ -261,20 +213,96 @@ fn validate_lanes<B: Backend>(
     Ok(lanes)
 }
 
-fn run<B, F, Fut>(
+/// Everything one application shard thread owns from startup.
+struct Assignment<B: Backend> {
     plan: ShardPlan,
     partitions: Vec<PartitionPlacement>,
     lane: ShardIo<B>,
-    ready: oneshot::Sender<()>,
-    shutdown: &Shutdown,
-    factory: &F,
     memory: memory::Plan,
+}
+
+/// Start the owner thread of one shard. Its result fails the whole group,
+/// and so does an exit before shutdown was requested.
+fn spawn_shard<B, F, Fut>(
+    state: &Arc<State>,
+    factory: &Arc<F>,
+    assignment: Assignment<B>,
+) -> Result<ozzy_io::Readiness<()>, StartupError>
+where
+    B: Backend + 'static,
+    F: Fn(ShardContext) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<(), StartupError>> + 'static,
+{
+    let registration = Registration::new(state.clone());
+    let worker = state.clone();
+    let id = assignment.plan.id;
+    let factory = factory.clone();
+    let spawned = ozzy_io::spawn_ready(format!("ozzy_app-{id}"), move |ready| {
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            run(assignment, ready, &worker.stop, &*factory)
+        }))
+        .unwrap_or_else(|_| {
+            Err(StartupError::Shard {
+                shard: id,
+                reason: "application runtime panicked".into(),
+            })
+        });
+        if let Err(error) = result {
+            worker.fail(error);
+        } else if !worker.stop.is_closed() {
+            worker.fail(StartupError::Shard {
+                shard: id,
+                reason: "application runtime exited before shutdown".into(),
+            });
+        }
+        // Runtime and every local task are gone before observers see
+        // completion. Observers never need a blocking join. The
+        // broker drain thread joins to report exited threads.
+        drop(registration);
+    });
+    spawned
+        .map_err(|error| StartupError::Shard {
+            shard: id,
+            reason: error.to_string(),
+        })
+        .and_then(|(thread, readiness)| state.own(thread).map(|()| readiness))
+}
+
+/// Shard `id` reported ready, or the startup error its thread recorded.
+async fn observe_readiness(
+    state: Arc<State>,
+    id: u32,
+    receiver: ozzy_io::Readiness<()>,
+) -> Result<(), StartupError> {
+    if receiver.await.is_none() {
+        // The sender drops as the shard unwinds, before its thread
+        // records the actual startup error. Wait for that report.
+        state.stop.closed().await;
+        return state.result().and(Err(StartupError::Shard {
+            shard: id,
+            reason: "application startup exited before readiness".into(),
+        }));
+    }
+    Ok(())
+}
+
+fn run<B, F, Fut>(
+    assignment: Assignment<B>,
+    ready: Ready<()>,
+    shutdown: &CloseSignal,
+    factory: &F,
 ) -> Result<(), StartupError>
 where
     B: Backend + 'static,
     F: Fn(ShardContext) -> Fut,
     Fut: Future<Output = Result<(), StartupError>> + 'static,
 {
+    let Assignment {
+        plan,
+        partitions,
+        lane,
+        memory,
+    } = assignment;
     let error = |error: std::io::Error| StartupError::Shard {
         shard: plan.id,
         reason: error.to_string(),

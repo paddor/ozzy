@@ -4,8 +4,8 @@ use super::{
     DirectoryError, Journal, Limits, OperationEnvelope, SegmentReference, validate_operation,
 };
 use crate::{
-    ChainPosition, CodecError, DecodedGroup, Digest, SEGMENT_HEADER_BYTES, SegmentHeader,
-    WRITE_GROUP_ALIGNMENT, async_files::Access, codec::SegmentDigestBuilder,
+    ChainPosition, CodecError, DecodedGroup, Digest, SEGMENT_HEADER_BYTES, SealedSegment,
+    SegmentHeader, WRITE_GROUP_ALIGNMENT, async_files::Access, codec::SegmentDigestBuilder,
 };
 use ozzy_io::{Handle, OpenMode, Operation};
 
@@ -250,8 +250,12 @@ impl Groups {
         &self.header
     }
 
-    pub(crate) fn boundary(&self) -> (u64, Digest) {
-        (self.expected.offset, self.expected.digest)
+    /// The validated prefix this reader must end at.
+    pub(crate) fn boundary(&self) -> SealedSegment {
+        SealedSegment {
+            valid_bytes: self.expected.offset,
+            digest: self.expected.digest,
+        }
     }
 
     /// Whether this reader started after a previously validated prefix.
@@ -278,28 +282,20 @@ impl Groups {
             return Ok(None);
         }
         if self.cursor.offset == self.expected.offset {
-            self.zero_tail().await?;
-            if self.digest.finish() != self.expected.digest
-                || self.cursor.chain != self.expected.chain
-                || self.cursor.group_number != self.expected.group_number
-            {
-                return Err(DirectoryError::SegmentMismatch(self.reference.segment_id));
-            }
-            self.ended = true;
+            self.reach_end().await?;
             return Ok(None);
         }
-        if self.cursor.offset > self.expected.offset
-            || self.cursor.group_number - self.reference.first_group_number
-                >= self.limits.decode.max_groups as u64
-        {
+        if self.cursor.offset > self.expected.offset || self.group_budget_spent() {
             return Err(DirectoryError::RetentionScanBudget);
         }
         self.read_group().await?;
         let group = crate::decode_group(
             &self.header,
-            self.cursor.group_number,
-            self.cursor.offset,
-            self.cursor.chain,
+            crate::GroupStart::new(
+                self.cursor.group_number,
+                self.cursor.offset,
+                self.cursor.chain,
+            ),
             &self.bytes,
             self.limits.decode,
         )?;
@@ -341,6 +337,30 @@ impl Groups {
         Ok(Some(group))
     }
 
+    /// At the expected end: the zero tail and end authority must match.
+    async fn reach_end(&mut self) -> Result<(), DirectoryError> {
+        self.zero_tail().await?;
+        if !self.matches_end() {
+            return Err(DirectoryError::SegmentMismatch(self.reference.segment_id));
+        }
+        self.ended = true;
+        Ok(())
+    }
+
+    /// Whether the digest, chain, and group number read so far are the
+    /// expected end authority.
+    fn matches_end(&self) -> bool {
+        self.digest.finish() == self.expected.digest
+            && self.cursor.chain == self.expected.chain
+            && self.cursor.group_number == self.expected.group_number
+    }
+
+    /// Whether this segment already yielded its decode limit of groups.
+    fn group_budget_spent(&self) -> bool {
+        self.cursor.group_number - self.reference.first_group_number
+            >= self.limits.decode.max_groups as u64
+    }
+
     async fn read_group(&mut self) -> Result<(), DirectoryError> {
         self.bytes.clear();
         let initial =
@@ -348,8 +368,10 @@ impl Groups {
         self.access
             .read_append(
                 &self.handle,
-                self.cursor.offset,
-                initial,
+                crate::async_files::Span {
+                    offset: self.cursor.offset,
+                    length: initial,
+                },
                 self.limits.io.chunk_bytes,
                 &mut self.bytes,
             )
@@ -382,8 +404,10 @@ impl Groups {
                     self.access
                         .read_append(
                             &self.handle,
-                            self.cursor.offset + self.bytes.len() as u64,
-                            extra,
+                            crate::async_files::Span {
+                                offset: self.cursor.offset + self.bytes.len() as u64,
+                                length: extra,
+                            },
                             self.limits.io.chunk_bytes,
                             &mut self.bytes,
                         )
@@ -416,12 +440,7 @@ impl Groups {
     }
 
     pub(crate) async fn finish(self: Box<Self>) -> Result<(), DirectoryError> {
-        if !self.ended
-            || self.cursor.offset != self.expected.offset
-            || self.digest.finish() != self.expected.digest
-            || self.cursor.chain != self.expected.chain
-            || self.cursor.group_number != self.expected.group_number
-        {
+        if !self.ended || self.cursor.offset != self.expected.offset || !self.matches_end() {
             return Err(DirectoryError::SegmentMismatch(self.reference.segment_id));
         }
         self.access

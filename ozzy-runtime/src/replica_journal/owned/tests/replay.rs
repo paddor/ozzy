@@ -1,5 +1,6 @@
 use super::writeback::{Replica, admit, finish, prepare, replica, settle, synchronize};
 use super::*;
+use crate::replica_journal::OwnedReplayRequest as ReplayRequest;
 use ozzy_proto::RequestId;
 use ozzy_replication::{LogSource, OpNumber};
 
@@ -14,13 +15,15 @@ fn capture(
         .journal
         .prepare_replay(
             ticket,
-            predecessor,
-            PipelineLimits {
-                max_operations: 8,
-                max_body_bytes: bytes,
+            ReplayRequest {
+                predecessor,
+                limits: PipelineLimits {
+                    max_operations: 8,
+                    max_body_bytes: bytes,
+                },
+                request_id: RequestId::from_bytes([42; 16]),
             },
             buffer,
-            RequestId::from_bytes([42; 16]),
         )
         .unwrap()
 }
@@ -205,10 +208,12 @@ fn owned_replay_cancellation_frees_its_slot_and_does_not_cancel_writes() {
     assert!(matches!(
         replica.journal.prepare_replay(
             ticket,
-            Prefix::GENESIS,
-            pipeline(),
+            ReplayRequest {
+                predecessor: Prefix::GENESIS,
+                limits: pipeline(),
+                request_id: RequestId::from_bytes([43; 16]),
+            },
             arena,
-            RequestId::from_bytes([43; 16])
         ),
         Err(JournalError::AppendCapacity)
     ));

@@ -1,41 +1,51 @@
-[profile.ci]
+# The default profile is the fast suite: unit, core, simulation, and inproc
+# broker/SDK tests, mostly over memory storage and a few on small temporary
+# files, each within about ten seconds. The extended profile holds the system
+# tests: TCP and child processes, fixed-port and physical-disk broker
+# lifecycles, stress variants, exhaustive crash cuts and fault schedules, and
+# timed bench cohorts. Weekly CI runs it.
+
+[profile.default]
 default-filter = '''
 not (
     test(::stress::)
-    | (package(ozzy-broker) & (test(journals::serving::) | test(journals::actors::) | test(journals::startup::) | test(process::)))
+    | (package(ozzy-broker) & (test(process::) | test(journals::actors::) | test(journals::startup::) | test(journals::serving::perf::)))
     | test(=journals::format::explicit_formatter_initializes_symmetric_shards_and_restart_keeps_election_fencing)
-    | (package(ozzy-sim) & (binary(ozzy_broker_simulation) | binary(ozzy_lifecycle)))
-    | test(crash_cuts) | test(every_execution_and_observation_cut) | test(sparse_gib_segment_scans)
     | (package(ozzy-bench) & (binary(ozzy_timed) | binary(ozzy_native) | test(bench::timed::producer::client::tests::) | test(bench::timed::native::clients::tests::)))
+    | test(=directory::asynchronous::tests::repair::async_sealed_repair_publication_crash_cuts_keep_complete_nonvoting_or_repaired_history)
+    | test(=directory::asynchronous::tests::orphans::orphan_cleanup_crash_cuts_preserve_selected_bytes_and_unknown_names)
+    | test(=directory::asynchronous::tests::metadata_cleanup::checkpoint_and_manifest_cleanup_crash_cuts_keep_selected_sources)
+    | test(=availability::every_healthy_pair_progresses_after_seeded_faults_with_a_permanent_outsider)
 )
-| test(=inproc_memory_all_modes_share_the_real_broker_and_sdk_harness)
-| test(=journals::serving::pressure::inproc_memory_bounded_sources_preserve_records_in_all_modes)
 '''
+slow-timeout = { period = "10s", terminate-after = 12 }
 
 [profile.extended]
 default-filter = '''
-(
-    test(::stress::)
-    | (package(ozzy-broker) & (test(journals::serving::) | test(journals::actors::) | test(journals::startup::) | test(process::)))
-    | test(=journals::format::explicit_formatter_initializes_symmetric_shards_and_restart_keeps_election_fencing)
-    | (package(ozzy-sim) & (binary(ozzy_broker_simulation) | binary(ozzy_lifecycle)))
-    | test(crash_cuts) | test(every_execution_and_observation_cut) | test(sparse_gib_segment_scans)
-    | (package(ozzy-bench) & (binary(ozzy_timed) | binary(ozzy_native) | test(bench::timed::producer::client::tests::) | test(bench::timed::native::clients::tests::)))
-)
-& not (
-    test(=inproc_memory_all_modes_share_the_real_broker_and_sdk_harness)
-    | test(=journals::serving::pressure::inproc_memory_bounded_sources_preserve_records_in_all_modes)
-)
+test(::stress::)
+| (package(ozzy-broker) & (test(process::) | test(journals::actors::) | test(journals::startup::) | test(journals::serving::perf::)))
+| test(=journals::format::explicit_formatter_initializes_symmetric_shards_and_restart_keeps_election_fencing)
+| (package(ozzy-bench) & (binary(ozzy_timed) | binary(ozzy_native) | test(bench::timed::producer::client::tests::) | test(bench::timed::native::clients::tests::)))
+| test(=directory::asynchronous::tests::repair::async_sealed_repair_publication_crash_cuts_keep_complete_nonvoting_or_repaired_history)
+| test(=directory::asynchronous::tests::orphans::orphan_cleanup_crash_cuts_preserve_selected_bytes_and_unknown_names)
+| test(=directory::asynchronous::tests::metadata_cleanup::checkpoint_and_manifest_cleanup_crash_cuts_keep_selected_sources)
+| test(=availability::every_healthy_pair_progresses_after_seeded_faults_with_a_permanent_outsider)
 '''
+slow-timeout = { period = "60s" }
 fail-fast = false
 
 [test-groups.broker-lifecycle]
-# Each case starts several real brokers, SDK runtimes, and shared disk pools.
-# Keep lifecycle qualification isolated from other CPU-heavy test work.
+# Each case starts several real brokers, SDK runtimes, and shared disk pools,
+# some on fixed TCP ports. Keep it isolated from other CPU-heavy test work.
 max-threads = 1
 
+[test-groups.inproc-cluster]
+# Inproc brokers and SDKs over memory storage. These cases mostly wait on
+# confirmation round trips, so several share the CPUs.
+max-threads = 4
+
 [[profile.default.overrides]]
-filter = '(package(ozzy-broker) & (test(journals::serving::) | test(journals::actors::) | test(journals::startup::) | test(process::))) | test(=journals::format::explicit_formatter_initializes_symmetric_shards_and_restart_keeps_election_fencing) | (package(ozzy-sim) & binary(ozzy_broker_simulation))'
+filter = '(package(ozzy-broker) & (test(::stress::) | test(process::) | test(journals::actors::) | test(journals::startup::) | test(journals::serving::perf::))) | test(=journals::format::explicit_formatter_initializes_symmetric_shards_and_restart_keeps_election_fencing) | (package(ozzy-sim) & binary(ozzy_broker_simulation) & test(::stress::))'
 test-group = 'broker-lifecycle'
 threads-required = 8
 
@@ -45,3 +55,10 @@ threads-required = 8
 filter = 'package(ozzy-bench) & (binary(ozzy_timed) | binary(ozzy_native) | test(bench::timed::producer::client::tests::) | test(bench::timed::native::clients::tests::))'
 test-group = 'broker-lifecycle'
 threads-required = 8
+
+[[profile.default.overrides]]
+# Inproc cluster cases are the longest in the fast suite. Starting them first
+# keeps them out of the tail of the run.
+filter = '(package(ozzy-broker) & test(journals::serving::)) | (package(ozzy-sim) & binary(ozzy_broker_simulation))'
+test-group = 'inproc-cluster'
+priority = 50

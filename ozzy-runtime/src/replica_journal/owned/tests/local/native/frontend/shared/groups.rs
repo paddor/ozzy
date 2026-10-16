@@ -62,14 +62,7 @@ async fn until_plan(
     reason = "keep the controlled fault schedule and its assertions together"
 )]
 async fn sdk_group_membership_creates_plans_fences_instances_and_moves_sources() {
-    let (mut harness, links, _, hint) = Box::pin(setup_shared_directory_profile(
-        &[],
-        1,
-        None,
-        false,
-        Some(ProgressHistory::Available),
-    ))
-    .await;
+    let (mut harness, links, _, hint) = setup_progress(1, None).await;
     let first = join(hint, 1, 11, Mode::Join, Vec::new());
     let created = harness
         .drive(links.group_join(hint.primary, first.clone()), true)
@@ -317,14 +310,7 @@ async fn sdk_group_membership_creates_plans_fences_instances_and_moves_sources()
     reason = "keep the controlled fault schedule and its assertions together"
 )]
 async fn sdk_group_handoff_waits_for_the_prior_owner_or_the_drain_deadline() {
-    let (mut harness, links, _, hint) = Box::pin(setup_shared_directory_profile(
-        &[],
-        2,
-        None,
-        false,
-        Some(ProgressHistory::Available),
-    ))
-    .await;
+    let (mut harness, links, _, hint) = setup_progress(2, None).await;
     let topic = harness.drive(links.topic("orders"), true).await.unwrap();
     let coordinator = topic.coordinator("workers");
     let other = topic

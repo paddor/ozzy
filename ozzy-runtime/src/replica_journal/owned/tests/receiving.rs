@@ -354,7 +354,7 @@ fn owned_checkpoint_recovery_after_retirement_preserves_confirmed_anchor_and_acc
             primary.journal.retire_confirmed_history(
                 ticket,
                 ozzy_proto::CheckpointId::from_bytes([95; 16]),
-                ozzy_journal_segment::AsyncRetirementBudget {
+                ozzy_journal_segment::RetirementBudget {
                     max_segments: 1,
                     max_read_bytes: 32768,
                 },
@@ -450,7 +450,7 @@ fn owned_checkpoint_recovery_at_the_accepted_tail_needs_no_operations() {
             primary.journal.retire_confirmed_history(
                 primary.driver.begin_validation().unwrap(),
                 ozzy_proto::CheckpointId::from_bytes([97; 16]),
-                ozzy_journal_segment::AsyncRetirementBudget {
+                ozzy_journal_segment::RetirementBudget {
                     max_segments: 1,
                     max_read_bytes: 32768,
                 },

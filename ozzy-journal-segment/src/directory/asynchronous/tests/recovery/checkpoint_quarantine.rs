@@ -1,6 +1,6 @@
 use super::*;
 use crate::directory::segment_name;
-use crate::{AsyncRetirementBudget, RetentionFloors};
+use crate::{RetentionFloors, RetirementBudget};
 
 #[test]
 fn async_quarantine_resets_checkpoint_selection_and_preserves_old_files() {
@@ -12,7 +12,7 @@ fn async_quarantine_resets_checkpoint_selection_and_preserves_old_files() {
                 &mut controller,
                 journal.retire_sealed_prefix(
                     &RetentionFloors::new(vec![]).unwrap(),
-                    AsyncRetirementBudget {
+                    RetirementBudget {
                         max_segments: 2,
                         max_read_bytes: 65536,
                     },

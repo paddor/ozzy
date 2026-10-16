@@ -1,9 +1,12 @@
 //! One source owner submits cumulative intent through existing SDK broker links.
 
-use super::{ProgressError, progress::Publisher};
-use crate::replicated::{BrokerLinkError, RetryPolicy, TopicRoutes, retry::classify};
+use super::{ProcessingIdentity, ProgressError, progress::Publisher};
+use crate::replicated::{
+    BrokerLinkError, RetryPolicy, TopicRoutes, broker_links::LeaderRoute, retry::classify,
+};
 use crate::signal::CloseSignal;
-use ozzy_proto::{Offset, append::Authority, nack::RetryClass, progress};
+use ozzy_proto::{Offset, directory::RouteState, nack::RetryClass, progress};
+use std::time::Duration;
 use tokio::task::JoinHandle;
 
 /// Spawn on the existing SDK owner, never the application executor. Dropping
@@ -73,8 +76,8 @@ async fn drive(
     loop {
         publisher.ready().await?;
         crate::profiling::event(crate::profiling::Event::ProcessingReady);
-        let route = match routes.leader(number, retry.response_timeout).await {
-            Ok(route) => route,
+        let selected = match routes.leader(number, retry.response_timeout).await {
+            Ok(selected) => selected,
             Err(error) => {
                 crate::profiling::event(crate::profiling::Event::ProcessingRetry);
                 classify(&error, None)
@@ -82,42 +85,15 @@ async fn drive(
                     .ok_or_else(|| terminal(&error))?;
                 routes.refresh(number).map_err(|error| terminal(&error))?;
                 clock.until(clock.now().saturating_add(backoff)).await;
-                backoff = backoff.saturating_mul(2).min(retry.max_backoff);
+                backoff = retry.next_backoff(backoff);
                 continue;
             }
         };
+        let route = &selected.route;
         let cursor = publisher.ready().await?;
-        let request = progress::Request {
-            authority: Authority {
-                group_id: route.group,
-                config_epoch: route.config_epoch,
-                view: route.view,
-            },
-            assignment: progress::Assignment {
-                group: identity.group,
-                partition: identity.partition,
-                member: identity.member,
-                epoch: identity.assignment_epoch,
-            },
-            policy: identity.policy,
-            cursor: Some(Offset::new(cursor)),
-        };
+        let request = request(&identity, route, cursor);
         let deadline = clock.now().saturating_add(retry.response_timeout);
-        crate::profiling::event(crate::profiling::Event::ProcessingRequest);
-        let started = crate::profiling::start();
-        let result = routes
-            .while_current(
-                number,
-                &route,
-                routes.links().group_progress_until(
-                    route.leader.expect("selected leader"),
-                    request,
-                    deadline,
-                ),
-            )
-            .await
-            .and_then(|result| result);
-        crate::profiling::finish(crate::profiling::Stage::ProcessingRoundtrip, started);
+        let result = commit(routes, number, &selected, request, deadline).await;
         let later = match result {
             Ok(confirmed) => {
                 crate::profiling::event(crate::profiling::Event::ProcessingConfirmed);
@@ -129,7 +105,7 @@ async fn drive(
             }
             Err(error) => {
                 crate::profiling::event(crate::profiling::Event::ProcessingRetry);
-                let class = classify(&error, Some(&route))
+                let class = classify(&error, Some(route))
                     .map_err(|error| terminal(&error))?
                     .ok_or_else(|| terminal(&error))?;
                 class == RetryClass::AfterBackoff
@@ -140,15 +116,55 @@ async fn drive(
             backoff = retry.initial_backoff;
         }
         let moved = routes
-            .wait_retry(number, &route, backoff)
+            .wait_retry(number, route, backoff)
             .await
             .map_err(|error| terminal(&error))?;
         backoff = if moved || later {
             retry.initial_backoff
         } else {
-            backoff.saturating_mul(2).min(retry.max_backoff)
+            retry.next_backoff(backoff)
         };
     }
+}
+
+/// Commit `identity`'s window through `cursor` under `route`'s authority.
+fn request(identity: &ProcessingIdentity, route: &RouteState, cursor: u64) -> progress::Request {
+    progress::Request {
+        authority: route.authority(),
+        assignment: progress::Assignment {
+            group: identity.group,
+            partition: identity.partition,
+            member: identity.member,
+            epoch: identity.assignment_epoch,
+        },
+        policy: identity.policy,
+        cursor: Some(Offset::new(cursor)),
+    }
+}
+
+/// Send `request` to the selected leader by `deadline`, while its route
+/// stays current.
+async fn commit(
+    routes: &TopicRoutes,
+    number: u32,
+    selected: &LeaderRoute,
+    request: progress::Request,
+    deadline: Duration,
+) -> Result<progress::Confirmed, BrokerLinkError> {
+    crate::profiling::event(crate::profiling::Event::ProcessingRequest);
+    let started = crate::profiling::start();
+    let result = routes
+        .while_current(
+            number,
+            &selected.route,
+            routes
+                .links()
+                .group_progress_until(selected.leader, request, deadline),
+        )
+        .await
+        .and_then(|result| result);
+    crate::profiling::finish(crate::profiling::Stage::ProcessingRoundtrip, started);
+    result
 }
 
 fn terminal(error: &BrokerLinkError) -> ProgressError {

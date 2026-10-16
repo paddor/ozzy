@@ -5,7 +5,10 @@
 //! the coordinator image so the name can start a new incarnation. Retrying a
 //! failed deletion repeats both steps; each is idempotent.
 
-use super::{BrokerLinkError, BrokerLinks, RetryPolicy, TopicRoutes, retry::classify};
+use super::{
+    BrokerLinkError, BrokerLinks, RetryPolicy, TopicRoutes, broker_links::LeaderRoute,
+    retry::classify,
+};
 use ozzy_proto::{
     ConsumerGroupId, NodeId,
     append::Authority,
@@ -118,7 +121,7 @@ impl BrokerLinks {
         if metadata.partition_count() == 0 || metadata.partition_count() > group::MAX_PARTITIONS {
             return Err(BrokerLinkError::Configuration);
         }
-        self.routes(metadata)
+        self.routes(metadata).await
     }
 }
 
@@ -164,19 +167,13 @@ where
     routes.interest(number)?;
     let mut backoff = retry.initial_backoff;
     for attempt in 1..=ATTEMPTS {
-        let route = tokio::select! {
-            route = routes.leader(number, retry.response_timeout) => route?,
+        let LeaderRoute { leader, route } = tokio::select! {
+            selected = routes.leader(number, retry.response_timeout) => selected?,
             () = clock.until(clock.now().saturating_add(retry.response_timeout)) => continue,
         };
-        let authority = Authority {
-            group_id: route.group,
-            config_epoch: route.config_epoch,
-            view: route.view,
-        };
         let deadline = clock.now().saturating_add(retry.response_timeout);
-        let leader = route.leader.expect("selected leader");
         let error = match routes
-            .while_current(number, &route, call(authority, leader, deadline))
+            .while_current(number, &route, call(route.authority(), leader, deadline))
             .await
         {
             Ok(Ok(value)) => return Ok(value),
@@ -192,7 +189,7 @@ where
             routes.refresh(number)?;
         }
         clock.until(clock.now().saturating_add(backoff)).await;
-        backoff = backoff.saturating_mul(2).min(retry.max_backoff);
+        backoff = retry.next_backoff(backoff);
     }
     Err(BrokerLinkError::Timeout)
 }

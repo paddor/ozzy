@@ -93,6 +93,12 @@ impl ProbeScheduler {
         })
     }
 
+    /// When an unchanged exchange is next sent or retried. New work after a
+    /// completed exchange opens one sooner.
+    pub const fn due(&self) -> Duration {
+        self.due
+    }
+
     /// Currently outstanding frozen request, for exact response/history-work matching.
     pub const fn pending(&self) -> Option<Probe> {
         self.pending

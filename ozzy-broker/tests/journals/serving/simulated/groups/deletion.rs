@@ -65,7 +65,7 @@ async fn deleted(policy: Confirmation) {
             .unwrap();
         }
     }
-    let routes = links.routes(writer.metadata().clone()).unwrap();
+    let routes = links.routes(writer.metadata().clone()).await.unwrap();
     live_many(
         &cluster.brokers,
         "stop deleted group writer",

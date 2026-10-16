@@ -49,7 +49,7 @@ fn position(prefix: Prefix) -> LogPosition {
 }
 
 impl Replica {
-    pub(super) fn enable_storage(&mut self, seed: u64) {
+    pub(super) fn enable_storage(&mut self) {
         assert_eq!(self.accepted.len(), 0);
         self.storage = Some(
             Journal::format(
@@ -65,7 +65,6 @@ impl Replica {
                     .to_vec(),
                 1,
                 self.generation,
-                97 + seed as usize % 4096,
             )
             .unwrap(),
         );

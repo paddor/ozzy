@@ -89,16 +89,13 @@ fn raw_and_compressed_resident_and_cold_reads_preserve_sequence_gaps_near_exhaus
             PayloadEncoding::Lz4 => lz4rip::block::compress(payload),
         };
         let mut output = Vec::new();
-        append_resolved_wire_record_batch(
-            &mut output,
+        let batch = ozzy_journal::operation::WireBatch {
             header,
-            descriptors,
+            records: descriptors,
             encoding,
-            &block,
-            results,
-            limits,
-        )
-        .unwrap();
+            payload: &block,
+        };
+        append_resolved_wire_record_batch(&mut output, batch, results, limits).unwrap();
         let body = Bytes::from(output);
         let prepared =
             PreparedOperationRecords::new(operation_header, body.clone(), limits).unwrap();

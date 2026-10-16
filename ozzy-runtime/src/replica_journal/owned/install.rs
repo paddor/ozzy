@@ -2,16 +2,43 @@
 
 use super::{AppendBuffer, JournalError, JournalOwner, OwnedJournal, history, prefix};
 use crate::replica_journal::{
-    InstallationConfig, InstalledChunk, InstalledJournal, authority::position,
+    InstallationConfig, InstalledChunk, InstalledJournal,
+    authority::{position, successor},
 };
-use ozzy_journal::operation::canonical_body_digest;
-use ozzy_journal_segment::{AsyncSuffixInstaller, SuffixReplacement, SuffixStreamLimits};
+use ozzy_journal::operation::{CanonicalOperation, canonical_body_digest};
+use ozzy_journal_segment::{SuffixInstaller, SuffixReplacement, SuffixStreamLimits};
 use ozzy_replication::{InstallTicket, PreparedOperation, driver::ActivationTicket};
+
+/// Stage `operations` in physical groups within the stream's count and body
+/// bounds. An operation larger than one group's body bound is refused.
+pub(super) async fn stage_chunks(
+    staging: &mut SuffixInstaller,
+    limits: SuffixStreamLimits,
+    operations: &[CanonicalOperation<'_>],
+) -> Result<(), JournalError> {
+    let mut first = 0;
+    let mut bytes = 0;
+    for (index, operation) in operations.iter().enumerate() {
+        if operation.body.len() > limits.max_group_body_bytes {
+            return Err(JournalError::AppendCapacity);
+        }
+        if index - first == limits.max_group_operations
+            || bytes > limits.max_group_body_bytes - operation.body.len()
+        {
+            staging.append_chunk(&operations[first..index]).await?;
+            first = index;
+            bytes = 0;
+        }
+        bytes += operation.body.len();
+    }
+    staging.append_chunk(&operations[first..]).await?;
+    Ok(())
+}
 
 #[derive(Debug)]
 pub(super) struct PendingInstallation {
     pub(super) ticket: InstallTicket,
-    staging: AsyncSuffixInstaller,
+    staging: SuffixInstaller,
     limits: SuffixStreamLimits,
 }
 
@@ -40,13 +67,7 @@ impl OwnedJournal {
         {
             return Err(JournalError::InstallationMismatch);
         }
-        if config.segment_capacity > self.limits.io.max_segment_bytes
-            || !config.body_encoding.is_supported()
-            || config.max_staged_bytes < config.segment_capacity
-            || config.max_orphan_probes == 0
-        {
-            return Err(JournalError::Configuration);
-        }
+        let limits = config.stream_limits(&self.limits, self.append_limits)?;
         if ticket.source().voter == manifest.identity.replica_node_id
             && self.history.as_ref().map(history::source) != Some(ticket.source())
         {
@@ -62,23 +83,13 @@ impl OwnedJournal {
             segment_capacity: config.segment_capacity,
             body_encoding: config.body_encoding,
         };
-        let limits = SuffixStreamLimits {
-            max_group_operations: self
-                .append_limits
-                .max_operations
-                .min(self.limits.decode.max_entries),
-            max_group_body_bytes: self
-                .append_limits
-                .max_body_bytes
-                .min(self.limits.decode.max_group_decoded_body_bytes),
-            max_segments: self.limits.metadata.max_segments,
-            max_staged_bytes: config.max_staged_bytes,
-            max_source_segment_bytes: self.limits.io.max_segment_bytes,
-            max_orphan_probes: config.max_orphan_probes,
-        };
         let journal = self.journal.take_ready()?;
         let staging = journal
-            .begin_suffix_replacement(replacement, position(ticket.accepted()), limits)
+            .begin_suffix_replacement(ozzy_journal_segment::SuffixRequest {
+                replacement,
+                accepted: position(ticket.accepted()),
+                limits,
+            })
             .await?;
         self.journal = JournalOwner::Installing(Box::new(PendingInstallation {
             ticket,
@@ -116,35 +127,17 @@ impl OwnedJournal {
         {
             return Err(JournalError::InstallationMismatch);
         }
-        let mut first = 0;
-        let mut bytes = 0;
-        for (index, operation) in operations.iter().enumerate() {
-            if operation.body.len() > installing.limits.max_group_body_bytes {
-                return Err(JournalError::AppendCapacity);
-            }
-            if index - first == installing.limits.max_group_operations
-                || bytes > installing.limits.max_group_body_bytes - operation.body.len()
-            {
-                installing
-                    .staging
-                    .append_chunk(&operations[first..index])
-                    .await?;
-                first = index;
-                bytes = 0;
-            }
-            bytes += operation.body.len();
-        }
-        installing
-            .staging
-            .append_chunk(&operations[first..])
-            .await?;
+        stage_chunks(&mut installing.staging, installing.limits, &operations).await?;
         for operation in &operations {
             prepared.push(PreparedOperation::from_verified(
                 operation,
                 canonical_body_digest(operation.body),
             ));
         }
-        let end = prepared.last().expect("nonempty staged chunk").prefix();
+        let end = prepared
+            .last()
+            .ok_or(JournalError::InstallationMismatch)?
+            .prefix();
         drop(operations);
         buffer.prepared = prepared;
         self.faulted = false;
@@ -225,18 +218,16 @@ impl OwnedJournal {
         {
             return Err(JournalError::InstallationMismatch);
         }
-        let mut next = manifest.clone();
-        next.parent_generation = next.generation;
-        next.generation = next
-            .generation
-            .checked_add(1)
-            .ok_or(JournalError::InstallationMismatch)?;
+        let mut next = successor(manifest).ok_or(JournalError::InstallationMismatch)?;
         next.accepted = position(ticket.through());
         next.committed = next.accepted;
         self.journal.ready_mut()?.install_metadata(next).await?;
-        let candidate = self.selected.take().expect("selected candidate checked");
+        let candidate = self
+            .selected
+            .take()
+            .ok_or(JournalError::InstallationMismatch)?;
         self.reader = Some(
-            ozzy_journal_segment::AsyncJournalPartitionIndex::open(
+            ozzy_journal_segment::JournalPartitionIndex::open(
                 self.journal.ready()?,
                 self.read_limits,
             )

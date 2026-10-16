@@ -7,7 +7,7 @@ async fn receive_image(
     journal: &Journal,
     state: &CanonicalState,
     id: CheckpointId,
-) -> Result<crate::AsyncCheckpointInbox, crate::SuffixReplacementError> {
+) -> Result<crate::CheckpointInbox, crate::SuffixReplacementError> {
     let core = state.encode_snapshot(StateSnapshotLimits::default())?;
     let mut bytes = ozzy_core::checkpoint::Layout::new(core.len() as u64, None)?
         .encode()
@@ -61,9 +61,7 @@ fn checkpoint_transfer(reset_checkpoint: bool) {
         &mut controller,
         journal.begin_checkpoint_replacement(
             CONFIG,
-            replacement,
-            accepted,
-            stream_limits(),
+            stream_request(replacement, accepted),
             CheckpointRecovery {
                 predecessor: anchor,
                 position: anchor,
@@ -118,7 +116,7 @@ fn checkpoint_transfer(reset_checkpoint: bool) {
 
 async fn checkpoint_target(io: ozzy_io::Local, reset_checkpoint: bool) -> Journal {
     if reset_checkpoint {
-        let directory = crate::AsyncRecoveryDirectory::open_for_repair(
+        let directory = crate::RecoveryDirectory::open_for_repair(
             "/group".into(),
             io,
             identity(),
@@ -190,9 +188,7 @@ fn checkpoint_selection_crash_cuts_leave_old_or_complete_nonvoting_history() {
                     let mut installing = journal
                         .begin_checkpoint_replacement(
                             CONFIG,
-                            replacement,
-                            accepted,
-                            stream_limits(),
+                            stream_request(replacement, accepted),
                             CheckpointRecovery {
                                 predecessor: anchor,
                                 position: anchor,
@@ -255,8 +251,10 @@ async fn open_nonvoting(io: ozzy_io::Local, generation: u128) -> Result<Journal,
     Journal::open(
         "/group".into(),
         io,
-        identity(),
-        Some(&marker),
+        crate::ExpectedStore {
+            identity: identity(),
+            configuration: Some(&marker),
+        },
         JournalGeneration(generation),
         limits(),
     )

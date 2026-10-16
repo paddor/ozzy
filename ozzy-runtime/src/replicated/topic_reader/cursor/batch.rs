@@ -2,7 +2,6 @@
 
 use super::Decoder;
 use bytes::Bytes;
-use omq_tokio::Message;
 use ozzy_proto::data::{DataLimits, OwnedRecord, OwnedRecordIter, OwnedRecords};
 
 pub(super) struct FrameRecords {
@@ -16,17 +15,17 @@ pub(super) struct Batch {
 }
 
 impl FrameRecords {
-    pub(super) fn new(records: OwnedRecords, message: &Message) -> Self {
-        Self {
-            records,
-            owner: message.part_bytes(1).expect("validated envelope frame"),
-        }
+    /// Records decoded from a delivery, kept alive with its header frame.
+    pub(super) fn new(records: OwnedRecords, owner: Bytes) -> Self {
+        Self { records, owner }
     }
 
     pub(super) fn into_batch(self, skip: u64) -> Batch {
         let mut records = self.records.into_records();
         for _ in 0..skip {
-            records.next().expect("validated skipped prefix");
+            if records.next().is_none() {
+                break;
+            }
         }
         Batch {
             records,

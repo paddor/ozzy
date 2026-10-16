@@ -16,7 +16,7 @@ async fn shared_topic_keeps_sparse_partitions_and_stalled_storage_independent() 
         .unwrap();
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines, reason = "one linear scenario")]
 async fn multiple() {
     let (mut harness, links, _, authority) = setup_shared_partitions(&[], 2).await;
     let options = || SharedTopicWriterConfig {

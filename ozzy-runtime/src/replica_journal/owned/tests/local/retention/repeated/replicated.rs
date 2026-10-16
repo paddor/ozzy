@@ -32,7 +32,7 @@ fn repeated_retirement_preserves_both_quorum_policies_and_the_retained_chain() {
                 primary.journal.retire_confirmed_history(
                     ticket,
                     CheckpointId::from_bytes([91; 16]),
-                    AsyncRetirementBudget {
+                    RetirementBudget {
                         max_segments: 1,
                         max_read_bytes: 32768
                     },
@@ -114,7 +114,7 @@ fn a_promise_abandons_an_unfinished_retirement_without_fencing() {
         primary.journal.begin_retirement(
             ticket,
             CheckpointId::from_bytes([91; 16]),
-            AsyncRetirementBudget {
+            RetirementBudget {
                 max_segments: 1,
                 max_read_bytes: 32768,
             },

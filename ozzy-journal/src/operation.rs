@@ -26,7 +26,7 @@ pub use resolved::{
 };
 mod view;
 pub use append_encoder::{
-    AppendBodyEncoder, AppendHeader, DescriptorLayout, ValidatedWireAppend,
+    AppendBodyEncoder, AppendHeader, DescriptorLayout, ValidatedWireAppend, WireBatch,
     append_prepared_record_batch, append_record_batches, append_wire_record_batch,
 };
 pub use append_pack::{
@@ -36,8 +36,8 @@ pub use output::OperationOutput;
 pub use records::{AppendRecordList, RecordIter, RecordParts, RecordRef};
 pub use view::{
     AppendBatchView, AppendBatches, AppendPartLengths, AppendParts, AppendRecordDescriptor,
-    AppendRecordDescriptors, AppendRecordView, AppendRecords, AppendView, PreparedAppendPayload,
-    decode_append_batches, decode_append_batches_indexed,
+    AppendRecordDescriptors, AppendRecordView, AppendRecords, AppendView, BatchPayload,
+    PreparedAppendPayload, decode_append_batches, decode_append_batches_indexed,
     decode_append_batches_with_validated_payload, decode_append_records, decode_append_view,
     decode_packed_append_records,
 };
@@ -65,8 +65,9 @@ pub fn append_metadata_bound(batches: usize, records: usize, resolved: bool) -> 
 }
 
 use codec::{
-    AppendTotals, Decoder, Encoder, decode_append_batch, encode_append_records, enforce_limit,
-    records_are_tiny, validate_append_descriptors, validate_limits, validate_position_count,
+    AppendTotals, Encoder, ReadFields, Reader, TinyTable, decode_append_batch,
+    encode_append_records, enforce_limit, read_descriptor_head, records_are_tiny,
+    validate_append_descriptors, validate_limits, validate_position_count,
     validate_tiny_descriptors,
 };
 pub use codec::{

@@ -1,7 +1,7 @@
 //! Retired ancestry is proved through an overlapping, exact-tail-verified source.
 
-use super::{ActorError, Duration, LogSource, Lookup, OpNumber, PendingIo, Prefix, ReplicaActor};
-use super::{HistoryReason, TransferPurpose};
+use super::HistoryReason;
+use super::{ActorError, LogSource, Lookup, OpNumber, Prefix, ReplicaActor};
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Bridge {
@@ -21,7 +21,8 @@ impl Lookup {
                 return Ok(());
             }
             if source == bridge.source && prefix.op == bridge.donor.accepted.op {
-                let bridge = self.bridge.take().expect("checked bridge");
+                let bridge = *bridge;
+                self.bridge = None;
                 if prefix != bridge.donor.accepted {
                     // An older uncertain tail may legitimately diverge. It is
                     // not evidence for this prefix and cannot unlock selection.
@@ -84,10 +85,7 @@ impl ReplicaActor {
         }
     }
 
-    pub(in crate::replica_actor) fn schedule_bridge(
-        &mut self,
-        now: Duration,
-    ) -> Result<bool, ActorError> {
+    pub(in crate::replica_actor) fn schedule_bridge(&mut self) -> Result<bool, ActorError> {
         let Some(bridge) = self.lookup.bridge else {
             return Ok(false);
         };
@@ -101,22 +99,7 @@ impl ReplicaActor {
         } else {
             (bridge.donor, bridge.op)
         };
-        if source.voter == self.local {
-            if self.pinned != Some(source) {
-                return Err(ActorError::history(HistoryReason::Lookup));
-            }
-            self.pending = Some(PendingIo::Position(
-                self.journal.history_position(source, op)?,
-            ));
-        } else {
-            self.start_transfer(
-                self.driver.scope(),
-                source,
-                Prefix::GENESIS,
-                TransferPurpose::Lookup { op, found: None },
-                now,
-            )?;
-        }
+        self.lookup_history(source, op, HistoryReason::Lookup)?;
         Ok(true)
     }
 }

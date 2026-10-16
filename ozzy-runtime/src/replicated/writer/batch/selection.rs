@@ -3,31 +3,41 @@
 use super::{DataLimits, Error};
 use ozzy_proto::data::Encoding;
 
+/// Records sized for one request, with running totals so a partial selection
+/// resumes with records queued later instead of sizing its records again.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Selection {
     pub(super) records: usize,
     pub(super) bytes: usize,
     pub(super) full: bool,
+    metadata: usize,
+    parts: usize,
+    logical: usize,
 }
 
 impl Selection {
+    /// An empty selection whose request metadata starts at `fixed` bytes.
+    pub(super) const fn new(fixed: usize) -> Self {
+        Self {
+            records: 0,
+            bytes: 0,
+            full: false,
+            metadata: fixed,
+            parts: 0,
+            logical: 0,
+        }
+    }
+
+    /// Add the shapes that follow the selected records until one does not fit.
     /// Shapes are (wire bytes, part count, encoding). A soft target never splits a
     /// record; hard packet limits also apply to singletons.
-    pub(super) fn collect(
+    pub(super) fn extend(
+        &mut self,
         shapes: impl Iterator<Item = (usize, usize, Encoding)>,
         limits: DataLimits,
         target_bytes: usize,
         cap: usize,
-        fixed: usize,
-    ) -> Result<Self, Error> {
-        let mut selected = Self {
-            records: 0,
-            bytes: 0,
-            full: false,
-        };
-        let mut metadata = fixed;
-        let mut parts = 0;
-        let mut logical = 0;
+    ) -> Result<(), Error> {
         let payload_limit = limits.envelope.max_payload_bytes;
         for (bytes, record_parts, encoding) in shapes {
             let original = match encoding {
@@ -36,12 +46,16 @@ impl Selection {
             };
             let descriptors = record_parts
                 .checked_mul(4)
-                .and_then(|bytes| bytes.checked_add(20 + encoding.metadata_bytes()))
+                .and_then(|bytes| bytes.checked_add(encoding.head_bytes()))
                 .ok_or(Error::Configuration)?;
-            if selected.records == 0
+            if self.records == 0
                 && (!encoding.validate(record_parts, limits.max_parts, limits.max_record_bytes)
                     || record_parts > limits.max_parts
-                    || descriptors > limits.envelope.max_metadata_bytes.saturating_sub(fixed)
+                    || descriptors
+                        > limits
+                            .envelope
+                            .max_metadata_bytes
+                            .saturating_sub(self.metadata)
                     || bytes
                         > limits
                             .envelope
@@ -50,30 +64,35 @@ impl Selection {
             {
                 return Err(Error::Configuration);
             }
-            if selected.records == cap
+            if self.records == cap
                 || original > limits.max_record_bytes
                 || bytes > limits.max_record_bytes
-                || (selected.records != 0
-                    && (logical >= target_bytes || original > target_bytes.saturating_sub(logical)))
-                || record_parts > limits.max_parts.saturating_sub(parts)
-                || descriptors > limits.envelope.max_metadata_bytes.saturating_sub(metadata)
-                || bytes > payload_limit.saturating_sub(selected.bytes)
+                || (self.records != 0
+                    && (self.logical >= target_bytes
+                        || original > target_bytes.saturating_sub(self.logical)))
+                || record_parts > limits.max_parts.saturating_sub(self.parts)
+                || descriptors
+                    > limits
+                        .envelope
+                        .max_metadata_bytes
+                        .saturating_sub(self.metadata)
+                || bytes > payload_limit.saturating_sub(self.bytes)
             {
-                selected.full = true;
+                self.full = true;
                 break;
             }
-            selected.records += 1;
-            selected.bytes += bytes;
-            logical += original;
-            metadata += descriptors;
-            parts += record_parts;
+            self.records += 1;
+            self.bytes += bytes;
+            self.logical += original;
+            self.metadata += descriptors;
+            self.parts += record_parts;
         }
-        selected.full |= selected.records == cap
-            || logical >= target_bytes
-            || parts == limits.max_parts
-            || selected.bytes == payload_limit
-            || metadata == limits.envelope.max_metadata_bytes;
-        Ok(selected)
+        self.full |= self.records == cap
+            || self.logical >= target_bytes
+            || self.parts == limits.max_parts
+            || self.bytes == payload_limit
+            || self.metadata == limits.envelope.max_metadata_bytes;
+        Ok(())
     }
 }
 
@@ -81,6 +100,19 @@ impl Selection {
 mod tests {
     use super::*;
     use ozzy_proto::EnvelopeLimits;
+
+    /// (records, bytes, full) of one walk over `shapes`.
+    fn collect(
+        shapes: impl Iterator<Item = (usize, usize, Encoding)>,
+        limits: DataLimits,
+        target_bytes: usize,
+        cap: usize,
+        fixed: usize,
+    ) -> Result<(usize, usize, bool), Error> {
+        let mut selection = Selection::new(fixed);
+        selection.extend(shapes, limits, target_bytes, cap)?;
+        Ok((selection.records, selection.bytes, selection.full))
+    }
 
     fn limits() -> DataLimits {
         DataLimits {
@@ -97,23 +129,16 @@ mod tests {
     #[test]
     fn target_preserves_large_singleton_but_hard_limits_still_bound_it() {
         let shapes = [(512, 1, Encoding::Raw), (16, 1, Encoding::Raw)];
-        let selected = Selection::collect(shapes.into_iter(), limits(), 128, 8, 100).unwrap();
-        assert_eq!(
-            selected,
-            Selection {
-                records: 1,
-                bytes: 512,
-                full: true
-            }
-        );
+        let selected = collect(shapes.into_iter(), limits(), 128, 8, 100).unwrap();
+        assert_eq!(selected, (1, 512, true));
         let mut hard = limits();
         hard.max_record_bytes = 511;
-        assert!(Selection::collect(shapes.into_iter(), hard, 128, 8, 100).is_err());
+        assert!(collect(shapes.into_iter(), hard, 128, 8, 100).is_err());
     }
 
     #[test]
     fn empty_parts_charge_descriptors_and_part_limits() {
-        let selected = Selection::collect(
+        let selected = collect(
             [(0, 4, Encoding::Raw), (0, 5, Encoding::Raw)].into_iter(),
             limits(),
             128,
@@ -121,35 +146,18 @@ mod tests {
             100,
         )
         .unwrap();
-        assert_eq!(
-            selected,
-            Selection {
-                records: 1,
-                bytes: 0,
-                full: true
-            }
-        );
+        assert_eq!(selected, (1, 0, true));
         let mut bounds = limits();
         bounds.envelope.max_metadata_bytes = 135;
-        assert!(
-            Selection::collect([(0, 4, Encoding::Raw)].into_iter(), bounds, 128, 8, 100).is_err()
-        );
+        assert!(collect([(0, 4, Encoding::Raw)].into_iter(), bounds, 128, 8, 100).is_err());
     }
 
     #[test]
     fn sparse_batch_is_ready_and_renegotiated_oversize_is_rejected_when_first() {
         let selected =
-            Selection::collect([(16, 1, Encoding::Raw)].into_iter(), limits(), 128, 8, 100)
-                .unwrap();
-        assert_eq!(
-            selected,
-            Selection {
-                records: 1,
-                bytes: 16,
-                full: false
-            }
-        );
-        let selected = Selection::collect(
+            collect([(16, 1, Encoding::Raw)].into_iter(), limits(), 128, 8, 100).unwrap();
+        assert_eq!(selected, (1, 16, false));
+        let selected = collect(
             [(16, 1, Encoding::Raw), (1025, 1, Encoding::Raw)].into_iter(),
             limits(),
             4096,
@@ -157,9 +165,9 @@ mod tests {
             100,
         )
         .unwrap();
-        assert_eq!(selected.records, 1);
+        assert_eq!(selected.0, 1);
         assert!(
-            Selection::collect(
+            collect(
                 [(1025, 1, Encoding::Raw)].into_iter(),
                 limits(),
                 4096,
@@ -168,5 +176,29 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn resumed_selection_matches_one_walk_over_the_same_records() {
+        let shapes = [
+            (100, 1, Encoding::Raw),
+            (40, 2, Encoding::Lz4 { decoded_bytes: 90 }),
+            (0, 3, Encoding::Raw),
+            (200, 1, Encoding::Raw),
+            (16, 1, Encoding::Raw),
+        ];
+        for target in [64, 300, 4096] {
+            let whole = collect(shapes.into_iter(), limits(), target, 8, 100).unwrap();
+            // Records arrive one at a time; each pass sizes only new ones.
+            let mut resumed = Selection::new(100);
+            for arrived in 1..=shapes.len() {
+                if resumed.full {
+                    break;
+                }
+                let new = shapes[resumed.records..arrived].iter().copied();
+                resumed.extend(new, limits(), target, 8).unwrap();
+            }
+            assert_eq!((resumed.records, resumed.bytes, resumed.full), whole);
+        }
     }
 }

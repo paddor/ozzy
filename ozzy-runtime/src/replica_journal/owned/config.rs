@@ -1,8 +1,11 @@
-use super::{JournalError, MAX_APPEND_OPERATIONS};
+use super::{JournalError, MAX_APPEND_OPERATIONS, authority};
 use ozzy_journal_segment::{
-    AsyncJournalLimits, CanonicalRecoveryLimits, GroupIdentity, SegmentWriteMode,
+    CanonicalRecoveryLimits, CommitMode, GroupIdentity, JournalFormat, JournalLimits, Manifest,
+    SegmentHeader, SegmentWriteMode,
 };
-use ozzy_replication::{ConfigurationRecord, JournalGeneration, PipelineLimits, QuorumPolicy};
+use ozzy_replication::{
+    ConfigurationRecord, Digest, JournalGeneration, PipelineLimits, QuorumPolicy,
+};
 use std::path::PathBuf;
 use tokio::sync::Semaphore;
 
@@ -41,7 +44,7 @@ pub struct OwnedConfig<C = ConfigurationRecord> {
     /// Exact persisted membership, order and confirmation policy.
     pub configuration: C,
     /// Bounded metadata, segment, transfer and directory work.
-    pub limits: AsyncJournalLimits,
+    pub limits: JournalLimits,
     /// Canonical replay, identity cache and pending-transition bounds. A
     /// replicated owner admits a backup's retained window unapplied.
     pub recovery: CanonicalRecoveryLimits,
@@ -59,7 +62,7 @@ pub struct OwnedConfig<C = ConfigurationRecord> {
     /// under decoder and segment limits rather than being split.
     pub write_group_bytes: usize,
     /// Incremental reader indexes, payload residency, and detached read limits.
-    pub reads: ozzy_journal_segment::AsyncPartitionReadLimits,
+    pub reads: ozzy_journal_segment::PartitionReadLimits,
 }
 
 impl OwnedConfig {
@@ -77,6 +80,36 @@ impl OwnedConfig {
             return Err(JournalError::Configuration);
         }
         self.validate_storage(generation, mode)
+    }
+
+    /// Reject a stored manifest outside this configuration's supported profile.
+    pub(super) fn validate_manifest(&self, manifest: &Manifest) -> Result<(), JournalError> {
+        authority::validate_manifest(
+            manifest,
+            self.configuration
+                .configuration()
+                .scope()
+                .configuration_epoch,
+            self.limits.io.max_segment_bytes,
+        )
+    }
+
+    /// Format of an absent store whose first segment holds `capacity` bytes.
+    pub(super) fn journal_format(&self, capacity: u64) -> Result<JournalFormat, JournalError> {
+        let first_segment =
+            SegmentHeader::new(self.identity.group_id, 1, None, Digest::ZERO, capacity)
+                .map_err(ozzy_journal_segment::DirectoryError::from)?;
+        Ok(JournalFormat {
+            identity: self.identity,
+            configuration_epoch: self
+                .configuration
+                .configuration()
+                .scope()
+                .configuration_epoch,
+            commit_mode: CommitMode::External,
+            first_segment,
+            configuration: self.configuration.encode().to_vec(),
+        })
     }
 }
 

@@ -53,7 +53,9 @@ async fn paused_reader_control_replies_do_not_block_producer_attachment() {
     // Duplicate confirmed publications switch replay to live without adding
     // any new records. All four cursors must retire their replay subscriptions.
     while let Some(publication) = harness.publications.pop_front() {
-        links.inject_reader_publication(harness.local, &publication);
+        links
+            .inject_reader_publication(harness.local, &publication)
+            .await;
     }
     pause_controls(&mut harness, &mut readers, Opcode::Unsubscribe).await;
     let identity = writer.identity();

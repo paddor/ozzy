@@ -1,10 +1,9 @@
-//! Deterministic storage adapter using production writers, decoders, and publishers.
+//! Deterministic storage adapter over the async journal and a simulated device.
 //!
-//! Models one bounded active segment, immutable metadata, and nonvoting staging.
-//! It does not model OS locks, directories on a device, or checkpoints.
+//! Runs the production metadata, segment, suffix and recovery paths on the
+//! `ozzy_io` simulation controller. It does not model checkpoints or rolls.
 //! Protocol authority belongs to the caller's production replication core.
 
-pub(crate) mod io;
 mod journal;
 
 pub use journal::{Journal, Recovered};

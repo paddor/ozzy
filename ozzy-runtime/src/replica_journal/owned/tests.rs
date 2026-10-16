@@ -19,8 +19,7 @@ use ozzy_io::{
     simulation::{self, Controller, Effect, Image, ImageLimits, JobId},
 };
 use ozzy_journal_segment::{
-    AsyncSegmentOptions, CheckpointLimits, DecodeLimits, GroupIdentity, MetadataLimits,
-    SegmentWriteMode,
+    CheckpointLimits, DecodeLimits, GroupIdentity, MetadataLimits, SegmentOptions, SegmentWriteMode,
 };
 use ozzy_proto::{GroupId, NodeId, StoreId, VolumeId};
 use ozzy_replication::{
@@ -55,7 +54,7 @@ fn config(root: &str, id: u8, policy: QuorumPolicy) -> OwnedConfig {
             store_generation: 1,
         },
         configuration,
-        limits: AsyncJournalLimits {
+        limits: JournalLimits {
             metadata: MetadataLimits {
                 max_manifest_bytes: 256 * 1024,
                 max_segments: 16,
@@ -68,7 +67,7 @@ fn config(root: &str, id: u8, policy: QuorumPolicy) -> OwnedConfig {
                 max_chunk_bytes: 4096,
                 max_state_bytes: 256 * 1024,
             },
-            io: AsyncSegmentOptions {
+            io: SegmentOptions {
                 max_segment_bytes: 32768,
                 chunk_bytes: 4096,
                 direct: false,
@@ -91,7 +90,7 @@ fn config(root: &str, id: u8, policy: QuorumPolicy) -> OwnedConfig {
         append_limits: pipeline(),
         writeback: pipeline(),
         write_group_bytes: 8192,
-        reads: ozzy_journal_segment::AsyncPartitionReadLimits {
+        reads: ozzy_journal_segment::PartitionReadLimits {
             index: ozzy_journal_segment::IndexBuildLimits::default(),
             max_resident_operations: 128,
             cached_index_bytes: 8192,
@@ -192,7 +191,7 @@ fn drive_except<T>(
 #[test]
 fn owned_driver_observes_cooperative_yields_without_storage_jobs() {
     let (mut controller, _) = setup();
-    drive(&mut controller, crate::replica_journal::shard::yield_turn());
+    drive(&mut controller, ozzy_io::signal::yield_once());
     assert_eq!(controller.jobs().len(), 0);
 }
 
@@ -451,10 +450,10 @@ fn unsupported_owned_profile_is_rejected_before_mutable_recovery() {
     let config = config("/partition", 7, QuorumPolicy::Durable);
     let journal = drive(
         &mut controller,
-        AsyncGroupJournal::format(
+        GroupJournal::format(
             config.root.clone(),
             io.clone(),
-            AsyncJournalFormat {
+            JournalFormat {
                 identity: config.identity,
                 configuration_epoch: 1,
                 commit_mode: CommitMode::LocalDurable,

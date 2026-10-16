@@ -4,13 +4,15 @@ use ozzy_proto::{
     ProducerSequence,
 };
 
+use ozzy_proto::layout::{self, Fixed, Reader, Writer};
+use std::ops::Range;
+
 use super::{
-    StateSnapshotError, StateSnapshotLimits, array_16, decode_retention, encode_retention,
-    enforce_limit, put_u16, put_u32, put_u64, read_u16, read_u32, read_u64, require_nonzero,
-    usize_to_u16, usize_to_u32, validate_name,
+    StateSnapshotError, StateSnapshotLimits, decode_retention, encode_retention, enforce_limit,
+    require_nonzero, usize_to_u16, usize_to_u32, validate_name,
 };
 use crate::state::{
-    CanonicalPartition, CanonicalProducer, PartitionAddress, ProducerResultSource,
+    CanonicalPartition, CanonicalProducer, CanonicalState, PartitionAddress, ProducerResultSource,
     ProducerResultSpan,
 };
 
@@ -43,11 +45,11 @@ pub(super) async fn partition_bytes(
     Ok(total)
 }
 
+/// Encode one partition entry at `start`; returns its end.
 pub(super) async fn encode_partition(
     output: &mut [u8],
     start: usize,
-    partition: PartitionIncarnation,
-    value: &CanonicalPartition,
+    (partition, value): (PartitionIncarnation, &CanonicalPartition),
     revision: u64,
     step: &mut impl AsyncFnMut(usize),
 ) -> Result<usize, StateSnapshotError> {
@@ -59,32 +61,33 @@ pub(super) async fn encode_partition(
     let target = output
         .get_mut(start..end)
         .ok_or(StateSnapshotError::Truncated)?;
-    put_u32(target, 0, usize_to_u32(entry_bytes)?);
-    put_u16(target, 4, usize_to_u16(value.address.stream.len())?);
-    put_u16(target, 6, usize_to_u16(value.address.topic.len())?);
-    target[8..24].copy_from_slice(partition.as_bytes());
-    put_u32(target, 24, value.address.partition_id.get());
-    put_u32(target, 28, usize_to_u32(value.producers.len())?);
-    put_u64(target, 32, value.owner_epoch.get());
-    put_u64(target, 40, value.next_offset.get());
-    put_u64(target, 48, value.retained_from.get());
-    put_u64(target, 56, value.policy_revision);
+    let (fixed, rest) = target
+        .split_first_chunk_mut::<PARTITION_BYTES>()
+        .ok_or(StateSnapshotError::Truncated)?;
+    fixed.put_u32::<0>(usize_to_u32(entry_bytes)?);
+    fixed.put_u16::<4>(usize_to_u16(value.address.stream.len())?);
+    fixed.put_u16::<6>(usize_to_u16(value.address.topic.len())?);
+    fixed.put::<8, 16>(*partition.as_bytes());
+    fixed.put_u32::<24>(value.address.partition_id.get());
+    fixed.put_u32::<28>(usize_to_u32(value.producers.len())?);
+    fixed.put_u64::<32>(value.owner_epoch.get());
+    fixed.put_u64::<40>(value.next_offset.get());
+    fixed.put_u64::<48>(value.retained_from.get());
+    fixed.put_u64::<56>(value.policy_revision);
     let (flags, age, bytes) = encode_retention(value.retention);
-    put_u32(target, 64, flags);
-    put_u64(target, 72, age);
-    put_u64(target, 80, bytes);
-    put_u64(target, 88, value.dedup_time);
-    put_u64(
-        target,
-        96,
+    fixed.put_u32::<64>(flags);
+    fixed.put_u64::<72>(age);
+    fixed.put_u64::<80>(bytes);
+    fixed.put_u64::<88>(value.dedup_time);
+    fixed.put_u64::<96>(
         value
             .dedup_window_millis
             .map_or(0, std::num::NonZeroU64::get),
     );
-    let stream_end = PARTITION_BYTES + value.address.stream.len();
-    let mut cursor = stream_end + value.address.topic.len();
-    target[PARTITION_BYTES..stream_end].copy_from_slice(value.address.stream.as_bytes());
-    target[stream_end..cursor].copy_from_slice(value.address.topic.as_bytes());
+    let mut names = Writer::new(rest);
+    names.bytes(value.address.stream.as_bytes())?;
+    names.bytes(value.address.topic.as_bytes())?;
+    let mut cursor = PARTITION_BYTES + names.offset();
     step(cursor).await;
     let producers = super::encoding::sorted(
         value.producers.iter(),
@@ -93,85 +96,75 @@ pub(super) async fn encode_partition(
     )
     .await;
     for (id, producer) in producers {
-        let fixed = &mut target[cursor..cursor + PRODUCER_BYTES];
-        fixed[..16].copy_from_slice(id.as_bytes());
-        put_u64(fixed, 16, producer.producer_epoch.get());
-        put_u64(fixed, 24, producer.next_producer_sequence.get());
-        put_u64(fixed, 32, producer.producer_result_floor.get());
-        put_u32(fixed, 40, usize_to_u32(producer.results.len())?);
-        put_u64(fixed, 72, producer.last_stored_end.get());
-        if let Some(transition) = producer.transition {
-            put_u32(fixed, 44, 1);
-            fixed[48..64].copy_from_slice(transition.operation_id.as_bytes());
-            put_u64(
-                fixed,
-                64,
-                transition.expected_epoch.map_or(0, ProducerEpoch::get),
-            );
-        }
-        cursor += PRODUCER_BYTES;
-        step(PRODUCER_BYTES).await;
-        for span in &producer.results {
-            put_u64(target, cursor, span.first_sequence.get());
-            put_u64(target, cursor + 8, span.first_offset.get());
-            put_u64(target, cursor + 16, span.records);
-            if let ProducerResultSource::Duplicate { operation } = span.source {
-                target[cursor + 24] = 1;
-                put_u64(target, cursor + 32, operation);
-            }
-            cursor += SPAN_BYTES;
-            step(SPAN_BYTES).await;
-        }
+        cursor = encode_producer(target, cursor, *id, producer, step).await?;
     }
     debug_assert_eq!(cursor, entry_bytes);
     Ok(end)
 }
 
-pub(super) async fn decode_partition(
-    input: &[u8],
-    start: usize,
-    limits: StateSnapshotLimits,
-    remaining_producers: usize,
-    remaining_spans: usize,
-    revision: u64,
+/// Encode one producer and its retry spans at `cursor`; returns their end.
+async fn encode_producer(
+    target: &mut [u8],
+    mut cursor: usize,
+    id: ProducerId,
+    producer: &CanonicalProducer,
     step: &mut impl AsyncFnMut(usize),
-) -> Result<(PartitionIncarnation, CanonicalPartition, usize, usize), StateSnapshotError> {
-    let fixed_end = start
-        .checked_add(PARTITION_BYTES)
-        .ok_or(StateSnapshotError::LengthOverflow)?;
-    let fixed = input
-        .get(start..fixed_end)
-        .ok_or(StateSnapshotError::Truncated)?;
-    if read_u32(fixed, 68) != 0 {
+) -> Result<usize, StateSnapshotError> {
+    let fixed: &mut [u8; PRODUCER_BYTES] = layout::record_mut(target, cursor)?;
+    fixed.put::<0, 16>(*id.as_bytes());
+    fixed.put_u64::<16>(producer.producer_epoch.get());
+    fixed.put_u64::<24>(producer.next_producer_sequence.get());
+    fixed.put_u64::<32>(producer.producer_result_floor.get());
+    fixed.put_u32::<40>(usize_to_u32(producer.results.len())?);
+    fixed.put_u64::<72>(producer.last_stored_end.get());
+    if let Some(transition) = producer.transition {
+        fixed.put_u32::<44>(1);
+        fixed.put::<48, 16>(*transition.operation_id.as_bytes());
+        fixed.put_u64::<64>(transition.expected_epoch.map_or(0, ProducerEpoch::get));
+    }
+    cursor += PRODUCER_BYTES;
+    step(PRODUCER_BYTES).await;
+    for span in &producer.results {
+        let entry: &mut [u8; SPAN_BYTES] = layout::record_mut(target, cursor)?;
+        entry.put_u64::<0>(span.first_sequence.get());
+        entry.put_u64::<8>(span.first_offset.get());
+        entry.put_u64::<16>(span.records);
+        if let ProducerResultSource::Duplicate { operation } = span.source {
+            entry.put_u8::<24>(1);
+            entry.put_u64::<32>(operation);
+        }
+        cursor += SPAN_BYTES;
+        step(SPAN_BYTES).await;
+    }
+    Ok(cursor)
+}
+
+/// Decode the next partition entry into the producers and retry spans `state`
+/// still has room for. Returns the partition, its state and its span count.
+pub(super) async fn decode_partition(
+    entries: &mut Reader<'_>,
+    limits: StateSnapshotLimits,
+    state: &CanonicalState,
+    step: &mut impl AsyncFnMut(usize),
+) -> Result<(PartitionIncarnation, CanonicalPartition, usize), StateSnapshotError> {
+    let remaining_producers = state.limits.max_producers - state.producer_count;
+    let remaining_spans = state.limits.max_retry_spans - state.retry_span_count;
+    let fixed: &[u8; PARTITION_BYTES] = layout::record(entries.rest(), 0)?;
+    if fixed.u32_at::<68>() != 0 {
         return Err(StateSnapshotError::UnsupportedFields);
     }
-    let entry_bytes = read_u32(fixed, 0) as usize;
-    let stream_bytes = read_u16(fixed, 4) as usize;
-    let topic_bytes = read_u16(fixed, 6) as usize;
+    let entry_bytes = fixed.u32_at::<0>() as usize;
+    let stream_bytes = fixed.u16_at::<4>() as usize;
+    let topic_bytes = fixed.u16_at::<6>() as usize;
     enforce_limit("stream name bytes", stream_bytes, limits.max_name_bytes)?;
     enforce_limit("topic name bytes", topic_bytes, limits.max_name_bytes)?;
-    let producer_count = read_u32(fixed, 28) as usize;
+    let producer_count = fixed.u32_at::<28>() as usize;
     enforce_limit("producers", producer_count, remaining_producers)?;
-    let end = start
-        .checked_add(entry_bytes)
-        .ok_or(StateSnapshotError::LengthOverflow)?;
-    let entry = input.get(start..end).ok_or(StateSnapshotError::Truncated)?;
+    let entry = entries.take(entry_bytes)?;
     let stream_end = PARTITION_BYTES + stream_bytes;
     let mut cursor = stream_end + topic_bytes;
-    let stream = std::str::from_utf8(
-        entry
-            .get(PARTITION_BYTES..stream_end)
-            .ok_or(StateSnapshotError::LengthMismatch)?,
-    )
-    .map_err(|_| StateSnapshotError::InvalidUtf8)?
-    .to_owned();
-    let topic = std::str::from_utf8(
-        entry
-            .get(stream_end..cursor)
-            .ok_or(StateSnapshotError::LengthMismatch)?,
-    )
-    .map_err(|_| StateSnapshotError::InvalidUtf8)?
-    .to_owned();
+    let stream = decode_name(entry, PARTITION_BYTES..stream_end)?;
+    let topic = decode_name(entry, stream_end..cursor)?;
     validate_name(&stream, limits)?;
     validate_name(&topic, limits)?;
     let mut producers = AHashMap::new();
@@ -191,28 +184,45 @@ pub(super) async fn decode_partition(
     if cursor != entry_bytes {
         return Err(StateSnapshotError::LengthMismatch);
     }
-    let partition = PartitionIncarnation::from_bytes(array_16(fixed, 8));
-    let value = CanonicalPartition {
-        address: PartitionAddress {
-            stream,
-            topic,
-            partition_id: PartitionId::new(read_u32(fixed, 24)),
-        },
-        owner_epoch: OwnerEpoch::new(read_u64(fixed, 32)),
-        producers,
-        next_offset: Offset::new(read_u64(fixed, 40)),
-        retained_from: Offset::new(read_u64(fixed, 48)),
-        policy_revision: read_u64(fixed, 56),
-        retention: decode_retention(
-            read_u32(fixed, 64),
-            read_u64(fixed, 72),
-            read_u64(fixed, 80),
-        )?,
-        dedup_time: read_u64(fixed, 88),
-        dedup_window_millis: std::num::NonZeroU64::new(read_u64(fixed, 96)),
+    let partition = PartitionIncarnation::from_bytes(fixed.array::<8, 16>());
+    let address = PartitionAddress {
+        stream,
+        topic,
+        partition_id: PartitionId::new(fixed.u32_at::<24>()),
     };
-    validate_partition_cooperative(partition, &value, revision, step).await?;
-    Ok((partition, value, end, spans))
+    let value = decode_fields(fixed, address, producers)?;
+    validate_partition_cooperative(partition, &value, state.revision, step).await?;
+    Ok((partition, value, spans))
+}
+
+fn decode_name(entry: &[u8], range: Range<usize>) -> Result<String, StateSnapshotError> {
+    let bytes = entry.get(range).ok_or(StateSnapshotError::LengthMismatch)?;
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|_| StateSnapshotError::InvalidUtf8)
+}
+
+/// The partition state stored in the fixed fields of its entry.
+fn decode_fields(
+    fixed: &[u8; PARTITION_BYTES],
+    address: PartitionAddress,
+    producers: AHashMap<ProducerId, CanonicalProducer>,
+) -> Result<CanonicalPartition, StateSnapshotError> {
+    Ok(CanonicalPartition {
+        address,
+        owner_epoch: OwnerEpoch::new(fixed.u64_at::<32>()),
+        producers,
+        next_offset: Offset::new(fixed.u64_at::<40>()),
+        retained_from: Offset::new(fixed.u64_at::<48>()),
+        policy_revision: fixed.u64_at::<56>(),
+        retention: decode_retention(
+            fixed.u32_at::<64>(),
+            fixed.u64_at::<72>(),
+            fixed.u64_at::<80>(),
+        )?,
+        dedup_time: fixed.u64_at::<88>(),
+        dedup_window_millis: std::num::NonZeroU64::new(fixed.u64_at::<96>()),
+    })
 }
 
 async fn decode_producer(
@@ -221,18 +231,14 @@ async fn decode_producer(
     remaining_spans: usize,
     step: &mut impl AsyncFnMut(usize),
 ) -> Result<(ProducerId, CanonicalProducer, usize), StateSnapshotError> {
-    let mut cursor = start
-        .checked_add(PRODUCER_BYTES)
-        .ok_or(StateSnapshotError::LengthOverflow)?;
-    let fixed = input
-        .get(start..cursor)
-        .ok_or(StateSnapshotError::Truncated)?;
-    let transition = match read_u32(fixed, 44) {
-        0 if fixed[48..72] == [0; 24] => None,
+    let fixed: &[u8; PRODUCER_BYTES] = layout::record(input, start)?;
+    let mut cursor = start + PRODUCER_BYTES;
+    let transition = match fixed.u32_at::<44>() {
+        0 if fixed.array::<48, 24>() == [0; 24] => None,
         1 => {
-            let operation_id = OperationId::from_bytes(array_16(fixed, 48));
+            let operation_id = OperationId::from_bytes(fixed.array::<48, 16>());
             require_nonzero("producer transition", operation_id.as_bytes())?;
-            let expected = read_u64(fixed, 64);
+            let expected = fixed.u64_at::<64>();
             Some(crate::state::ProducerTransition {
                 operation_id,
                 expected_epoch: (expected != 0).then_some(ProducerEpoch::new(expected)),
@@ -242,14 +248,14 @@ async fn decode_producer(
             return Err(StateSnapshotError::UnsupportedFields);
         }
     };
-    let id = ProducerId::from_bytes(array_16(fixed, 0));
+    let id = ProducerId::from_bytes(fixed.array::<0, 16>());
     require_nonzero("producer", id.as_bytes())?;
-    let mut producer = CanonicalProducer::new(ProducerEpoch::new(read_u64(fixed, 16)));
-    producer.next_producer_sequence = ProducerSequence::new(read_u64(fixed, 24));
-    producer.producer_result_floor = ProducerSequence::new(read_u64(fixed, 32));
+    let mut producer = CanonicalProducer::new(ProducerEpoch::new(fixed.u64_at::<16>()));
+    producer.next_producer_sequence = ProducerSequence::new(fixed.u64_at::<24>());
+    producer.producer_result_floor = ProducerSequence::new(fixed.u64_at::<32>());
     producer.transition = transition;
-    producer.last_stored_end = Offset::new(read_u64(fixed, 72));
-    let count = read_u32(fixed, 40) as usize;
+    producer.last_stored_end = Offset::new(fixed.u64_at::<72>());
+    let count = fixed.u32_at::<40>() as usize;
     enforce_limit("producer retry spans", count, remaining_spans)?;
     let bytes = count
         .checked_mul(SPAN_BYTES)
@@ -259,18 +265,19 @@ async fn decode_producer(
         return Err(StateSnapshotError::Truncated);
     }
     for _ in 0..count {
-        let source = match (input[cursor + 24], read_u64(input, cursor + 32)) {
+        let entry: &[u8; SPAN_BYTES] = layout::record(input, cursor)?;
+        let source = match (entry.u8_at::<24>(), entry.u64_at::<32>()) {
             (0, 0) => ProducerResultSource::Stored,
             (1, operation) if operation != 0 => ProducerResultSource::Duplicate { operation },
             _ => return Err(StateSnapshotError::InvalidPartition),
         };
-        if input[cursor + 25..cursor + 32] != [0; 7] {
+        if entry.array::<25, 7>() != [0; 7] {
             return Err(StateSnapshotError::UnsupportedFields);
         }
         producer.results.push_back(ProducerResultSpan {
-            first_sequence: ProducerSequence::new(read_u64(input, cursor)),
-            first_offset: Offset::new(read_u64(input, cursor + 8)),
-            records: read_u64(input, cursor + 16),
+            first_sequence: ProducerSequence::new(entry.u64_at::<0>()),
+            first_offset: Offset::new(entry.u64_at::<8>()),
+            records: entry.u64_at::<16>(),
             source,
         });
         cursor += SPAN_BYTES;
@@ -301,7 +308,9 @@ async fn validate_partition_cooperative(
     }
     ozzy_journal::work::sort_by(&mut occupied, <(u64, u64)>::cmp, step).await;
     for pair in occupied.windows(2) {
-        if pair[0].1 > pair[1].0 {
+        if let [left, right] = pair
+            && left.1 > right.0
+        {
             return Err(StateSnapshotError::InvalidPartition);
         }
         step(size_of::<(u64, u64)>()).await;
@@ -317,15 +326,7 @@ async fn validate_producer(
     occupied: &mut Vec<(u64, u64)>,
     step: &mut impl AsyncFnMut(usize),
 ) -> Result<(), StateSnapshotError> {
-    if producer.producer_epoch.get() == 0
-        || producer.producer_result_floor > producer.next_producer_sequence
-        || producer.transition.is_some_and(|transition| {
-            transition.operation_id.as_bytes() == &[0; 16]
-                || transition
-                    .expected_epoch
-                    .is_some_and(|epoch| epoch.get() == 0 || epoch >= producer.producer_epoch)
-        })
-    {
+    if has_invalid_fields(producer) {
         return Err(StateSnapshotError::InvalidPartition);
     }
     let mut sequence = producer.producer_result_floor.get();
@@ -368,15 +369,39 @@ async fn validate_producer(
         previous = Some(*span);
         step(SPAN_BYTES).await;
     }
-    if sequence != producer.next_producer_sequence.get()
-        || producer.last_stored_end > partition.next_offset
-        || previous_stored_end.is_some_and(|end| end != producer.last_stored_end.get())
-        || (producer.producer_result_floor == ProducerSequence::ZERO
-            && previous_stored_end.is_none()
-            && producer.last_stored_end != Offset::ZERO)
-    {
+    if spans_miss_producer_end(producer, partition, sequence, previous_stored_end) {
         return Err(StateSnapshotError::InvalidPartition);
     }
     step(PRODUCER_BYTES).await;
     Ok(())
+}
+
+/// A producer needs a session epoch, a result floor not past its next
+/// sequence, and a transition naming an operation and an earlier epoch.
+fn has_invalid_fields(producer: &CanonicalProducer) -> bool {
+    producer.producer_epoch.get() == 0
+        || producer.producer_result_floor > producer.next_producer_sequence
+        || producer.transition.is_some_and(|transition| {
+            transition.operation_id.as_bytes() == &[0; 16]
+                || transition
+                    .expected_epoch
+                    .is_some_and(|epoch| epoch.get() == 0 || epoch >= producer.producer_epoch)
+        })
+}
+
+/// Retry spans must end at the producer's next sequence, and its last stored
+/// span at its stored end inside the partition's records. A producer with no
+/// stored span and no expired results has stored nothing.
+fn spans_miss_producer_end(
+    producer: &CanonicalProducer,
+    partition: &CanonicalPartition,
+    sequence: u64,
+    stored_end: Option<u64>,
+) -> bool {
+    sequence != producer.next_producer_sequence.get()
+        || producer.last_stored_end > partition.next_offset
+        || stored_end.is_some_and(|end| end != producer.last_stored_end.get())
+        || (producer.producer_result_floor == ProducerSequence::ZERO
+            && stored_end.is_none()
+            && producer.last_stored_end != Offset::ZERO)
 }

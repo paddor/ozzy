@@ -3,7 +3,7 @@
 use super::{JournalError, OwnedJournal};
 use crate::replica_journal::PartitionReadCursor;
 use ozzy_core::reader::seek::Selection;
-use ozzy_journal_segment::{AsyncJournalIndexSnapshot, PreparedOperationRecords, SeekQuery};
+use ozzy_journal_segment::{JournalIndexSnapshot, PreparedOperationRecords, SeekQuery};
 use ozzy_proto::{PartitionIncarnation, reader::Start};
 use ozzy_replication::driver::ValidationTicket;
 use std::rc::Rc;
@@ -13,7 +13,7 @@ pub(in crate::replica_journal) struct PreparedSeek {
     key: Rc<()>,
     cursor: PartitionReadCursor,
     query: SeekQuery,
-    stored: Option<AsyncJournalIndexSnapshot>,
+    stored: Option<JournalIndexSnapshot>,
     memory: Vec<PreparedOperationRecords>,
 }
 

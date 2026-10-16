@@ -5,10 +5,10 @@ mod decoder;
 mod error;
 pub use error::ReaderError;
 mod cursor;
-use super::{BrokerLinkError, BrokerLinks, RouteGeneration, SdkClock, TopicRoutes};
+use super::{BrokerLinkError, BrokerLinks, RouteGeneration, TopicRoutes, broker_links::OwnerClock};
 use bytes::Bytes;
 use closing::Closing;
-use cursor::Cursor;
+use cursor::{Cursor, Observed};
 use decoder::Decoder;
 use ozzy_proto::{MessageId, Offset, PartitionIncarnation, TopicId};
 use std::{
@@ -61,6 +61,28 @@ impl ReaderStart {
             policy: ozzy_proto::reader::IdPolicy::RequireUnique,
         }
     }
+
+    /// The wire start of partition `number`. A checkpoint must name it.
+    fn partition_start(&self, number: u32) -> Result<ozzy_proto::reader::Start, TopicReaderError> {
+        Ok(match self {
+            Self::Earliest => ozzy_proto::reader::Start::Earliest,
+            Self::Latest => ozzy_proto::reader::Start::Latest,
+            Self::Timestamp(timestamp) => ozzy_proto::reader::Start::Timestamp(*timestamp),
+            Self::RecordId { id, policy, .. } => ozzy_proto::reader::Start::RecordId {
+                id: *id,
+                policy: *policy,
+            },
+            Self::Checkpoint(checkpoint) => ozzy_proto::reader::Start::Offset(
+                checkpoint
+                    .positions
+                    .iter()
+                    .find(|&&(n, _)| n == number)
+                    .ok_or(TopicReaderError::Configuration)?
+                    .1
+                    .get(),
+            ),
+        })
+    }
 }
 
 pub use ozzy_proto::reader::IdPolicy;
@@ -83,6 +105,46 @@ impl Default for TopicReaderConfig {
             partitions: None,
             refresh: Duration::from_millis(100),
         }
+    }
+}
+
+impl TopicReaderConfig {
+    /// Distinct existing partitions to read: the filter, else the record-ID
+    /// partition, else all. A record-ID start reads only its partition, and a
+    /// checkpoint must cover exactly these partitions of this topic.
+    fn selected(
+        &self,
+        metadata: &crate::topic_metadata::TopicMetadata,
+    ) -> Result<Vec<u32>, TopicReaderError> {
+        let selected = self.partitions.clone().unwrap_or_else(|| match self.start {
+            ReaderStart::RecordId { partition, .. } => vec![partition],
+            _ => (0..metadata.partition_count() as u32).collect(),
+        });
+        if let ReaderStart::RecordId { partition, .. } = self.start
+            && selected != [partition]
+        {
+            return Err(TopicReaderError::Configuration);
+        }
+        let unique: BTreeSet<_> = selected.iter().copied().collect();
+        if selected.is_empty()
+            || unique.len() != selected.len()
+            || selected.iter().any(|&n| metadata.partition(n).is_none())
+        {
+            return Err(TopicReaderError::Configuration);
+        }
+        if let ReaderStart::Checkpoint(checkpoint) = &self.start
+            && (checkpoint.topic != metadata.id()
+                || checkpoint.positions.len() != selected.len()
+                || checkpoint
+                    .positions
+                    .iter()
+                    .map(|&(n, _)| n)
+                    .collect::<BTreeSet<_>>()
+                    != unique)
+        {
+            return Err(TopicReaderError::Configuration);
+        }
+        Ok(selected)
     }
 }
 
@@ -117,7 +179,7 @@ pub struct TopicReaderStats {
 pub struct TopicReader {
     links: BrokerLinks,
     routes: TopicRoutes,
-    clock: SdkClock,
+    clock: OwnerClock,
     refresh: Duration,
     cursors: Vec<Cursor>,
     next: usize,
@@ -155,6 +217,7 @@ impl TopicReader {
     }
 
     /// Empty reader whose sources an owner attaches at exact cursors.
+    /// `routes` come from [`BrokerLinks::reader_routes`].
     pub(in crate::replicated) fn sources(
         routes: TopicRoutes,
         refresh: Duration,
@@ -163,7 +226,6 @@ impl TopicReader {
             return Err(TopicReaderError::Configuration);
         }
         let links = routes.links().clone();
-        links.reader_publications(routes.metadata())?;
         Ok(Self {
             clock: links.clock(),
             links,
@@ -244,73 +306,19 @@ impl TopicReader {
             return Err(TopicReaderError::Configuration);
         }
         let metadata = links.topic(topic).await?;
-        let selected = config
-            .partitions
-            .clone()
-            .unwrap_or_else(|| match config.start {
-                ReaderStart::RecordId { partition, .. } => vec![partition],
-                _ => (0..metadata.partition_count() as u32).collect(),
-            });
-        if let ReaderStart::RecordId { partition, .. } = config.start
-            && selected != [partition]
-        {
-            return Err(TopicReaderError::Configuration);
-        }
-        let unique: BTreeSet<_> = selected.iter().copied().collect();
-        if selected.is_empty()
-            || unique.len() != selected.len()
-            || selected.iter().any(|&n| metadata.partition(n).is_none())
-        {
-            return Err(TopicReaderError::Configuration);
-        }
-        let checkpoint = match &config.start {
-            ReaderStart::Checkpoint(checkpoint) => Some(checkpoint),
-            _ => None,
-        };
-        if let Some(checkpoint) = checkpoint
-            && (checkpoint.topic != metadata.id()
-                || checkpoint.positions.len() != selected.len()
-                || checkpoint
-                    .positions
-                    .iter()
-                    .map(|&(n, _)| n)
-                    .collect::<BTreeSet<_>>()
-                    != unique)
-        {
-            return Err(TopicReaderError::Configuration);
-        }
+        let selected = config.selected(&metadata)?;
         let clock = links.clock();
-        let routes = links.routes(metadata)?;
-        links.reader_publications(routes.metadata())?;
+        let routes = links.reader_routes(metadata).await?;
         let mut cursors = Vec::with_capacity(selected.len());
         for number in selected {
             routes.interest(number)?;
-            let from = match &config.start {
-                ReaderStart::Earliest => ozzy_proto::reader::Start::Earliest,
-                ReaderStart::Latest => ozzy_proto::reader::Start::Latest,
-                ReaderStart::Timestamp(timestamp) => {
-                    ozzy_proto::reader::Start::Timestamp(*timestamp)
-                }
-                ReaderStart::RecordId { id, policy, .. } => ozzy_proto::reader::Start::RecordId {
-                    id: *id,
-                    policy: *policy,
-                },
-                ReaderStart::Checkpoint(checkpoint) => ozzy_proto::reader::Start::Offset(
-                    checkpoint
-                        .positions
-                        .iter()
-                        .find(|&&(n, _)| n == number)
-                        .expect("checked checkpoint")
-                        .1
-                        .get(),
-                ),
-            };
+            let from = config.start.partition_start(number)?;
             cursors.push(Cursor::new(
                 &links,
                 routes
                     .metadata()
                     .partition(number)
-                    .expect("checked partition"),
+                    .ok_or(TopicReaderError::Configuration)?,
                 from,
                 config.refresh,
             )?);
@@ -335,20 +343,22 @@ impl TopicReader {
     /// Wait for one individual record. A slow or unreachable partition leaves
     /// other partitions runnable. Cancellation never advances a checkpoint.
     pub async fn next(&mut self) -> Result<TopicRecord, TopicReaderError> {
-        self.next_or(|_| true, std::future::pending())
-            .await
-            .expect("uninterrupted reader")
+        let Ok(result) = self
+            .next_or(|_| true, std::future::pending::<std::convert::Infallible>())
+            .await;
+        result
     }
 
-    /// Deliver only from partitions the gate admits, or return `None` once
-    /// `interrupt` completes. Gated partitions keep their received records.
-    pub(in crate::replicated) async fn next_or(
+    /// Deliver only from partitions the gate admits, or return the output of
+    /// `interrupt` once it completes. Gated partitions keep their received
+    /// records.
+    pub(in crate::replicated) async fn next_or<I>(
         &mut self,
         gate: impl Fn(u32) -> bool,
-        interrupt: impl std::future::Future<Output = ()>,
-    ) -> Option<Result<TopicRecord, TopicReaderError>> {
+        interrupt: impl std::future::Future<Output = I>,
+    ) -> Result<Result<TopicRecord, TopicReaderError>, I> {
         if self.failed || self.closed {
-            return Some(Err(TopicReaderError::Closed));
+            return Ok(Err(TopicReaderError::Closed));
         }
         let mut interrupt = std::pin::pin!(interrupt);
         loop {
@@ -360,7 +370,7 @@ impl TopicReader {
                 if result.is_err() {
                     self.failed = true;
                 }
-                return Some(result);
+                return Ok(result);
             }
             let deadline = self.gated_deadline(&gate);
             let links = self.links.clone();
@@ -369,24 +379,19 @@ impl TopicReader {
             tokio::select! {
                 result = poll_fn(|cx| self.poll(&gate, cx)) => {
                     if result.is_err() { self.failed = true; }
-                    return Some(result);
+                    return Ok(result);
                 }
-                () = interrupt.as_mut() => return None,
+                interrupted = interrupt.as_mut() => return Err(interrupted),
                 () = links.reader_changed_after(seen) => {},
                 result = routes.changed_after(routes_seen) => {
                     if let Err(error) = result {
-                        return Some(Err(error.into()));
+                        return Ok(Err(error.into()));
                     }
                 }
-                () = async {
-                    match deadline {
-                        Some(deadline) => clock.until(deadline).await,
-                        // Retained payloads can consume every frame permit.
-                        // Alias release wakes through reader_changed_after.
-                        None => std::future::pending().await,
-                    }
-                } => {},
-                () = links.closed() => return Some(Err(links.closed_error().into())),
+                // Without a deadline, retained payloads can consume every
+                // frame permit. Alias release wakes through reader_changed_after.
+                () = clock.until_due(deadline) => {},
+                () = links.closed() => return Ok(Err(links.closed_error().into())),
             }
         }
     }
@@ -411,14 +416,11 @@ impl TopicReader {
             if !gate(self.cursors[index].number) {
                 continue;
             }
-            match self.cursors[index].poll(
-                &self.links,
-                &self.routes,
-                &mut self.decoder,
-                self.clock.now(),
+            let observed = Observed {
                 input,
-                cx,
-            ) {
+                now: self.clock.now(),
+            };
+            match self.cursors[index].poll(&self.routes, &mut self.decoder, observed, cx) {
                 Poll::Ready(Ok(record)) => {
                     // This partition may hold more received records. Visit
                     // every partition again before waiting for input.
@@ -487,15 +489,14 @@ impl TopicReader {
     ) -> impl std::future::Future<Output = Result<(), TopicReaderError>> + Send + 'static + use<>
     {
         self.closed = true;
-        if self.closing.is_none() {
+        let closing = if let Some(closing) = &self.closing {
+            closing.clone()
+        } else {
             self.closed_checkpoint = Some(self.checkpoint());
             self.closed_stats = Some(self.stats());
-            self.closing = Some(Closing::start(
-                &self.links,
-                std::mem::take(&mut self.cursors),
-            ));
-        }
-        let closing = self.closing.as_ref().expect("requested close").clone();
+            let closing = Closing::start(&self.links, std::mem::take(&mut self.cursors));
+            self.closing.insert(closing).clone()
+        };
         async move { closing.closed().await }
     }
 }

@@ -42,19 +42,23 @@ async fn publication_gap() {
     };
     // Establish and then retire the initial replay subscription using PUB.
     wait_for_request(&mut harness, &mut reader, Opcode::Subscribe).await;
-    links.inject_reader_publication(
-        authority.primary,
-        &publication(authority.primary, source, 0, &[(50, 0)], harness.wire),
-    );
+    links
+        .inject_reader_publication(
+            authority.primary,
+            &publication(authority.primary, source, 0, &[(50, 0)], harness.wire),
+        )
+        .await;
     let first = harness.drive(reader.next(), true).await.unwrap();
     assert_eq!(first.offset, Offset::ZERO);
     drop(first);
     wait_for_request(&mut harness, &mut reader, Opcode::Unsubscribe).await;
     harness.readers.hold_records = false;
-    links.inject_reader_publication(
-        authority.primary,
-        &publication(authority.primary, source, 2, &[(52, 2)], harness.wire),
-    );
+    links
+        .inject_reader_publication(
+            authority.primary,
+            &publication(authority.primary, source, 2, &[(52, 2)], harness.wire),
+        )
+        .await;
     let mut repaired = None;
     {
         let mut next = pin!(reader.next());

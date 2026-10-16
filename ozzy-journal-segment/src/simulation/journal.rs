@@ -1,26 +1,31 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::ops::Range;
+use std::path::{Path, PathBuf};
+use std::task::{Context, Poll, Waker};
 
 use super::Damage;
-use super::io::{Memory, Segment};
-use crate::directory::publication::{self, MetadataIo, SyncedOverwrite};
-use crate::directory::{NoopObserver, evidence, memory_voting, recovery::recovery_marker};
+use crate::async_files::Access;
+use crate::directory::{CONFIGURATION_FILE, evidence, segment_reference_name};
 use crate::{
-    CanonicalOperation, CanonicalRecoveryRequirements, ChainPosition, CommitMode, CurrentReference,
-    DecodeLimits, DecodedOperation, Digest, DirectoryError, GroupIdentity, LogPosition, Manifest,
-    MetadataError, MetadataLimits, OperationLimits, SegmentHeader, SegmentReference, SegmentWriter,
-    WriterError, WriterPosition, decode_current, decode_group_identity, decode_manifest,
-    decode_segment_header, encode_current, encode_group_identity, encode_manifest, manifest_digest,
-    scan_segment,
+    BodyEncoding, CanonicalOperation, CanonicalRecoveryLimits, CheckpointLimits, CommitMode,
+    DecodeLimits, DecodedOperation, Digest, DirectoryError, GroupIdentity, GroupJournal,
+    JournalFormat, JournalLimits, LogPosition, Manifest, MetadataLimits, OperationLimits,
+    RecoveryDirectory, RecoveryPublication, SegmentHeader, SegmentOptions, SegmentWriteMode,
+    SuffixReplacement, SuffixStreamLimits, WriterPosition, logical_operation_digest, scan_segment,
 };
-use memory_voting::VoteState;
+use ozzy_io::simulation::{self, Controller, Effect, Image, ImageLimits};
+use ozzy_io::{Local, OpenMode, Operation, Quota, SyncMode};
 use ozzy_journal::progress::JournalGeneration;
 
 #[cfg(test)]
 mod tests;
 
 const CAPACITY: u64 = 1024 * 1024;
+const ROOT: &str = "/group";
+const CHUNK_OPERATIONS: usize = 16;
+const ORPHAN_PROBES: usize = 128;
 
 /// Decoded storage state. The scheduler may observe it; it supplies no vote.
 #[derive(Debug)]
@@ -29,21 +34,32 @@ pub struct Recovered {
     pub manifest: Manifest,
     /// Whether recovered evidence permits this replica to vote.
     pub admitted: bool,
-    /// Validated canonical operations recovered from the selected segment.
+    /// Validated canonical operations recovered from the selected segments.
     pub operations: Vec<DecodedOperation<'static>>,
 }
 
-/// Single-segment adapter for seeded storage/protocol schedules.
-#[derive(Debug)]
+/// The async journal over one simulated device for seeded storage schedules.
+/// Every call runs its physical jobs to completion before returning.
 pub struct Journal {
-    memory: Memory,
+    device: Device,
+    store: Option<GroupJournal>,
     identity: GroupIdentity,
     configuration: Vec<u8>,
     manifest: Manifest,
-    writer: Option<SegmentWriter<Segment>>,
     positions: BTreeMap<u64, WriterPosition>,
     memory_voting: bool,
-    body_encoding: crate::BodyEncoding,
+    body_encoding: BodyEncoding,
+}
+
+impl std::fmt::Debug for Journal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Journal")
+            .field("identity", &self.identity)
+            .field("manifest", &self.manifest)
+            .field("open", &self.store.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Journal {
@@ -53,57 +69,44 @@ impl Journal {
         configuration: Vec<u8>,
         epoch: u64,
         generation: JournalGeneration,
-        max_write: usize,
     ) -> Result<Self, DirectoryError> {
-        let memory = Memory::default();
-        memory.0.lock().unwrap().max_write = max_write.max(1);
-        let mut journal = Self {
-            memory,
+        let mut device = Device::new(Image::default())?;
+        let format = JournalFormat {
+            identity,
+            configuration_epoch: epoch,
+            commit_mode: CommitMode::External,
+            first_segment: SegmentHeader::new(identity.group_id, 1, None, Digest::ZERO, CAPACITY)?,
+            configuration: configuration.clone(),
+        };
+        let io = device.io.clone();
+        let journal = device.run(GroupJournal::format(
+            ROOT.into(),
+            io,
+            format,
+            generation,
+            limits(),
+        ))?;
+        Ok(Self {
+            device,
+            manifest: journal.manifest().clone(),
+            store: Some(journal),
             identity,
             configuration,
-            manifest: Manifest {
-                generation: 1,
-                parent_generation: 0,
-                identity,
-                configuration_epoch: epoch,
-                commit_mode: CommitMode::External,
-                durable_evidence: true,
-                promised_view: 0,
-                last_normal_view: 0,
-                accepted: LogPosition::GENESIS,
-                committed: LogPosition::GENESIS,
-                checkpoint: None,
-                segments: vec![reference(1)],
-            },
-            writer: None,
             positions: BTreeMap::new(),
             memory_voting: false,
-            body_encoding: crate::BodyEncoding::Raw,
-        };
-        journal
-            .memory
-            .write_new("identity", &encode_group_identity(identity)?)?;
-        journal.memory.sync_file("identity")?;
-        journal
-            .memory
-            .write_new("CONFIGURATION", &journal.configuration)?;
-        journal.memory.sync_file("CONFIGURATION")?;
-        journal.create_segment(1, generation)?;
-        journal.publish_evidence()?;
-        journal.publish_manifest(journal.manifest.clone(), false)?;
-        Ok(journal)
+            body_encoding: BodyEncoding::Raw,
+        })
     }
 
     /// Fresh bootstrap only: publish the production running marker before RAM votes.
     /// Subsequent opens require drained evidence or explicit nonvoting recovery.
     pub fn enable_memory_voting(&mut self) -> Result<(), DirectoryError> {
-        if self.memory_voting
-            || position(self.writer.as_ref().unwrap().written_position()) != LogPosition::GENESIS
-        {
+        let journal = self.store.as_mut().expect("opened journal");
+        if self.memory_voting || journal.written_position()? != LogPosition::GENESIS {
             return Err(DirectoryError::MemoryHistoryUnproven);
         }
         self.memory_voting = true;
-        self.publish_memory_evidence(VoteState::Running)
+        self.device.run(journal.mark_memory_voting_running())
     }
 
     /// Shutdown after the adapter has stopped voting and drained all accepted work.
@@ -111,19 +114,14 @@ impl Journal {
         if !self.memory_voting {
             return Err(DirectoryError::ConfigurationMismatch);
         }
-        self.publish_view(
-            self.manifest.promised_view,
-            self.manifest.last_normal_view,
-            self.manifest.committed,
-        )?;
-        self.publish_memory_evidence(VoteState::Drained)
+        let journal = self.store.as_mut().expect("opened journal");
+        let result = self.device.run(journal.publish_drained_memory_history());
+        self.manifest = journal.manifest().clone();
+        result
     }
 
     /// Select the production per-operation encoder, including raw fallback.
-    pub fn set_body_encoding(
-        &mut self,
-        encoding: crate::BodyEncoding,
-    ) -> Result<(), DirectoryError> {
+    pub fn set_body_encoding(&mut self, encoding: BodyEncoding) -> Result<(), DirectoryError> {
         if !encoding.is_supported() {
             return Err(DirectoryError::ConfigurationMismatch);
         }
@@ -133,29 +131,28 @@ impl Journal {
 
     /// Physical append only; the caller observes its completion separately.
     pub fn append(&mut self, operations: &[CanonicalOperation<'_>]) -> Result<(), DirectoryError> {
+        let journal = self.store.as_mut().expect("opened journal");
         let position = self
-            .writer
-            .as_mut()
-            .expect("opened journal")
-            .append_with_body_encoding(operations, self.body_encoding)?;
-        self.positions
-            .insert(position.next_chain().next_op_number() - 1, position);
+            .device
+            .run(journal.append(operations, self.body_encoding))?;
+        self.positions.insert(last_operation(position), position);
         Ok(())
     }
 
     /// Exact captured data barrier followed by independent accepted evidence.
     pub fn sync(&mut self, through: u64) -> Result<(), DirectoryError> {
-        let writer = self.writer.as_mut().expect("opened journal");
-        let position = if writer.durable_position().next_chain().next_op_number() - 1 == through {
-            writer.durable_position()
+        let journal = self.store.as_mut().expect("opened journal");
+        let durable = journal.writer().durable_position();
+        let position = if last_operation(durable) == through {
+            durable
         } else {
             *self
                 .positions
                 .get(&through)
                 .expect("complete append boundary")
         };
-        writer.sync_through(position)?;
-        self.publish_evidence()
+        self.device.run(journal.sync_through(position))?;
+        self.device.run(journal.publish_durable_progress())
     }
 
     /// Publish a promise, selected view, or activation floor authorized by the core.
@@ -165,18 +162,21 @@ impl Journal {
         normal: u64,
         committed: LogPosition,
     ) -> Result<(), DirectoryError> {
-        let writer = self.writer.as_mut().expect("opened journal");
-        writer.sync_through(writer.written_position())?;
-        let accepted = position(writer.durable_position());
-        let mut next = self.successor();
+        let journal = self.store.as_mut().expect("opened journal");
+        let written = journal.writer().written_position();
+        self.device.run(journal.sync_through(written))?;
+        let mut next = successor(journal.manifest());
         next.promised_view = promised;
         next.last_normal_view = normal;
-        next.accepted = accepted;
+        next.accepted = journal.accepted_position()?;
         next.committed = committed;
-        self.publish_manifest(next, true)
+        let result = self.device.run(journal.install_metadata(next));
+        self.manifest = journal.manifest().clone();
+        result
     }
 
-    /// Install externally selected complete history on a fresh segment.
+    /// Install externally selected complete history. The protected committed
+    /// prefix stays in place; later operations go to a fresh segment.
     pub fn replace(
         &mut self,
         generation: JournalGeneration,
@@ -184,51 +184,86 @@ impl Journal {
         committed: LogPosition,
         operations: &[CanonicalOperation<'_>],
     ) -> Result<(), DirectoryError> {
-        let segment = self.fresh_segment(generation)?;
-        if !operations.is_empty() {
-            self.append(operations)?;
+        let journal = self.store.take().expect("opened journal");
+        self.positions.clear();
+        let protected = journal.committed_position()?;
+        let accepted = operations
+            .last()
+            .map_or(LogPosition::GENESIS, |operation| LogPosition {
+                op_number: operation.op_number,
+                digest: logical_operation_digest(operation),
+            });
+        let replacement = SuffixReplacement {
+            expected_current: journal.current(),
+            protected_committed: protected,
+            promised_view: view,
+            last_normal_view: view,
+            committed,
+            writer_generation: generation,
+            segment_capacity: CAPACITY,
+            body_encoding: self.body_encoding,
+        };
+        let mut installer = self
+            .device
+            .run(journal.begin_suffix_replacement(crate::SuffixRequest {
+                replacement,
+                accepted,
+                limits: stream_limits(),
+            }))
+            .map_err(other)?;
+        let suffix: Vec<_> = operations
+            .iter()
+            .filter(|operation| operation.op_number > protected.op_number)
+            .copied()
+            .collect();
+        for chunk in suffix.chunks(CHUNK_OPERATIONS) {
+            self.device
+                .run(installer.append_chunk(chunk))
+                .map_err(other)?;
         }
-        let writer = self.writer.as_mut().unwrap();
-        writer.sync_through(writer.written_position())?;
-        let accepted = position(writer.durable_position());
-        let mut next = self.successor();
-        next.segments = vec![reference(segment)];
-        next.accepted = accepted;
-        next.committed = committed;
-        next.promised_view = view;
-        next.last_normal_view = view;
-        self.publish_manifest(next, true)
+        let journal = self.device.run(installer.finish()).map_err(other)?;
+        self.manifest = journal.manifest().clone();
+        self.store = Some(journal);
+        Ok(())
     }
 
     /// Remove voting eligibility without reading or altering damaged payloads.
     pub fn quarantine(&mut self) -> Result<(), DirectoryError> {
-        let (manifest, admitted) = self.load_authority()?;
-        if !admitted {
-            return Err(DirectoryError::ConfigurationMismatch);
-        }
-        self.manifest = manifest;
-        publication::replace_reusable(
-            &mut self.memory,
-            "CONFIGURATION",
-            ".CONFIGURATION.quarantine.tmp",
-            &recovery_marker(&self.configuration)?,
-            &mut NoopObserver,
-        )
+        self.close();
+        let io = self.device.io.clone();
+        let recovery = self.device.run(RecoveryDirectory::open_for_repair(
+            ROOT.into(),
+            io,
+            self.identity,
+            &self.configuration,
+            limits(),
+        ))?;
+        self.manifest = recovery.manifest().clone();
+        let recovery = self
+            .device
+            .run(recovery.quarantine_for_recovery(&self.configuration))?;
+        self.device.run(recovery.close())
     }
 
     /// Start fresh staging after durable nonvoting admission and a fresh nonce.
     pub fn begin_staging(&mut self, generation: JournalGeneration) -> Result<(), DirectoryError> {
-        let (manifest, admitted) = self.load_authority()?;
-        if admitted {
-            return Err(DirectoryError::ConfigurationMismatch);
-        }
-        self.manifest = manifest;
-        let segment = self.fresh_segment(generation)?;
-        let mut next = self.successor();
-        next.segments = vec![reference(segment)];
-        next.accepted = LogPosition::GENESIS;
-        next.committed = LogPosition::GENESIS;
-        self.publish_manifest(next, true)
+        self.close();
+        let io = self.device.io.clone();
+        let recovery = self.device.run(RecoveryDirectory::open_recovering(
+            ROOT.into(),
+            io,
+            self.identity,
+            &self.configuration,
+            limits(),
+        ))?;
+        let journal = self.device.run(recovery.recover_nonvoting(
+            &self.configuration,
+            generation,
+            ORPHAN_PROBES,
+        ))?;
+        self.manifest = journal.manifest().clone();
+        self.store = Some(journal);
+        Ok(())
     }
 
     /// Publish a complete core-authorized replacement after private semantic replay.
@@ -237,179 +272,184 @@ impl Journal {
         view: u64,
         committed: LogPosition,
     ) -> Result<(), DirectoryError> {
-        if self.memory.read("CONFIGURATION")? != recovery_marker(&self.configuration)? {
-            return Err(DirectoryError::ConfigurationMismatch);
-        }
         self.publish_view(view, view, committed)?;
-        let operations = self.read_operations()?;
-        let mut replay = ozzy_core::state::CanonicalRecovery::new(
-            ozzy_core::state::StateLimits::default(),
-            128,
-            4,
-        );
-        for operation in operations {
-            let body = ozzy_journal::operation::decode_operation_body(
-                operation.kind,
-                &operation.body,
-                OperationLimits::default(),
-            )
-            .map_err(WriterError::from)?;
-            replay
-                .apply(
-                    operation.op_number,
-                    &body,
-                    operation.op_number <= committed.op_number,
-                )
-                .map_err(|error| std::io::Error::other(error.to_string()))?;
-        }
-        replay
-            .finish()
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-        publication::replace_reusable(
-            &mut self.memory,
-            "CONFIGURATION",
-            ".CONFIGURATION.recovered.tmp",
-            &self.configuration,
-            &mut NoopObserver,
-        )?;
+        let journal = self.store.as_mut().expect("opened journal");
+        let publication = RecoveryPublication {
+            current: journal.current(),
+            generation: journal.writer().written_position().generation(),
+            view,
+            accepted: journal.manifest().accepted,
+            committed: journal.manifest().committed,
+        };
+        let candidate = self
+            .device
+            .run(journal.publish_recovered_configuration(
+                &self.configuration,
+                publication,
+                recovery_limits(),
+            ))
+            .map_err(other)?;
+        drop(candidate);
         if self.memory_voting {
-            self.publish_memory_evidence(VoteState::Drained)?;
+            self.device.run(journal.publish_drained_memory_history())?;
         }
+        self.manifest = journal.manifest().clone();
         Ok(())
     }
 
     /// Lose volatile bytes and directory changes without completing pending callbacks.
     pub fn crash(&mut self) {
-        self.writer = None;
+        self.store = None;
         self.positions.clear();
-        self.memory.0.lock().unwrap().crash();
+        self.device.crash();
     }
 
-    /// Decode selected bytes and execute the production protected-tail recovery.
+    /// Reopen through the production recovery path. A nonvoting store is only
+    /// inspected; its operations remain private until recovery publication.
     pub fn recover(&mut self, generation: JournalGeneration) -> Result<Recovered, DirectoryError> {
-        let (manifest, admitted) = self.load_authority()?;
-        self.manifest = manifest;
-        if !admitted {
-            return self.snapshot();
+        self.close();
+        let result = self.open(generation);
+        if result.is_err() {
+            self.close();
         }
-        let copies = self.evidence(&self.manifest)?;
-        let protected = copies.protected(&self.manifest)?;
-        if !copies.mirrored() {
-            let (record, copy) = copies.repair();
-            self.memory
-                .write_synced(evidence::NAME, &[copy * evidence::COPY_STRIDE], &record)?;
-        }
-        let segment = self.manifest.segments[0];
-        let writer = SegmentWriter::recover_canonical(
-            Segment(self.memory.clone(), segment_name(segment.segment_id)),
-            generation,
-            segment.first_group_number,
-            segment.first_chain,
-            DecodeLimits::default(),
-            CAPACITY,
-            CanonicalRecoveryRequirements {
-                operation_limits: OperationLimits::default(),
-                protected: [
-                    Some(following(protected)?),
-                    Some(following(self.manifest.committed)?),
-                ],
-                configuration_epoch: Some(self.manifest.configuration_epoch),
-                promised_view: Some(self.manifest.promised_view),
-                discard_damaged_tail: true,
+        result
+    }
+
+    fn open(&mut self, generation: JournalGeneration) -> Result<Recovered, DirectoryError> {
+        let io = self.device.io.clone();
+        let opened = self.device.run(GroupJournal::open(
+            ROOT.into(),
+            io.clone(),
+            crate::ExpectedStore {
+                identity: self.identity,
+                configuration: Some(&self.configuration),
             },
-        )?;
-        let accepted = position(writer.durable_position());
-        self.writer = Some(writer);
-        if self.manifest.accepted != accepted {
-            let mut next = self.successor();
-            next.accepted = accepted;
-            self.publish_manifest(next, true)?;
-        }
-        if self.memory_voting {
-            let expected = memory_voting::encode(
-                &self.manifest,
-                &self.configuration,
-                accepted,
-                VoteState::Drained,
-            )?;
-            if self.memory.read(memory_voting::NAME).ok().as_deref() != Some(expected.as_slice()) {
-                return Err(DirectoryError::MemoryHistoryUnproven);
+            generation,
+            limits(),
+        ));
+        let mut journal = match opened {
+            Ok(journal) => journal,
+            Err(DirectoryError::ConfigurationMismatch) => {
+                self.device.settle();
+                let recovery = self.device.run(RecoveryDirectory::open_recovering(
+                    ROOT.into(),
+                    io,
+                    self.identity,
+                    &self.configuration,
+                    limits(),
+                ))?;
+                self.manifest = recovery.manifest().clone();
+                self.device.run(recovery.close())?;
+                return self.snapshot();
             }
-            self.publish_memory_evidence(VoteState::Running)?;
+            Err(error) => return Err(error),
+        };
+        self.manifest = journal.manifest().clone();
+        if self.memory_voting {
+            self.device
+                .run(journal.require_drained_memory_history())
+                .map_err(|_| DirectoryError::MemoryHistoryUnproven)?;
+            self.device.run(journal.mark_memory_voting_running())?;
         }
+        self.store = Some(journal);
         self.snapshot()
     }
 
     /// Decode a projection after successful physical work. Never used as an oracle.
     pub fn snapshot(&self) -> Result<Recovered, DirectoryError> {
-        let admitted = self.memory.inspect("CONFIGURATION")? == self.configuration;
+        let image = self.device.image();
+        let admitted = image
+            .bytes(&root().join(CONFIGURATION_FILE), false)
+            .is_ok_and(|bytes| bytes == self.configuration);
+        let manifest = self.store.as_ref().map_or_else(
+            || self.manifest.clone(),
+            |journal| journal.manifest().clone(),
+        );
+        let operations = if admitted {
+            self.read_operations(image, &manifest)?
+        } else {
+            Vec::new()
+        };
         Ok(Recovered {
-            manifest: self.manifest.clone(),
+            manifest,
             admitted,
-            operations: if admitted {
-                self.read_operations()?
-            } else {
-                Vec::new()
-            },
+            operations,
         })
     }
 
     /// Corrupt an offline file, preserving the result through future crashes.
     pub fn damage(&mut self, name: &str, damage: Damage) {
-        assert!(self.writer.is_none(), "damage requires an offline broker");
-        let mut disk = self.memory.0.lock().unwrap();
-        let id = disk.inode(name).unwrap();
-        match damage {
-            Damage::Flip(offset) => disk.files[id].stable[offset] ^= 1,
-            Damage::ZeroSuffix(offset) => disk.files[id].stable[offset..].fill(0),
-            Damage::Truncate(offset) => disk.files[id].stable.truncate(offset),
-            Damage::Missing => {
-                disk.stable_names.remove(name);
+        assert!(self.store.is_none(), "damage requires an offline broker");
+        let path = root().join(name);
+        let access = Access::new(self.device.io.clone(), None);
+        if let Damage::Missing = damage {
+            let parent = path.parent().unwrap().to_path_buf();
+            self.device
+                .run(access.done(Operation::RemoveFile { path }))
+                .unwrap();
+            self.device.run(access.sync_directory(parent)).unwrap();
+        } else {
+            let mut bytes = self.device.image().bytes(&path, true).unwrap().to_vec();
+            match damage {
+                Damage::Flip(offset) => bytes[offset] ^= 1,
+                Damage::ZeroSuffix(offset) => bytes[offset..].fill(0),
+                Damage::Truncate(offset) => bytes.truncate(offset),
+                Damage::Missing => unreachable!(),
             }
+            self.device.run(overwrite(&access, path, &bytes)).unwrap();
         }
-        disk.crash();
+        drop(access);
+        self.device.crash();
     }
 
     /// Selected payload file for a scoped fault schedule.
     pub fn active_name(&self) -> String {
-        segment_name(self.manifest.segments[0].segment_id)
+        let manifest = self
+            .store
+            .as_ref()
+            .map_or(&self.manifest, GroupJournal::manifest);
+        let active = *manifest.segments.last().expect("active segment");
+        segment_reference_name(active)
+            .to_string_lossy()
+            .into_owned()
     }
 
-    /// Inject an I/O error before the nth next byte/directory operation.
+    /// Inject an I/O error into the nth next physical operation.
     pub fn fail_after(&mut self, operations: usize) {
         assert!(operations > 0);
-        let mut disk = self.memory.0.lock().unwrap();
-        disk.fail_at = Some(disk.trace.len() + operations);
+        self.device.fail_at = Some(self.device.executed + operations);
     }
 
     /// End the injected I/O-failure period when a schedule restores healthy storage.
     pub fn clear_failure(&mut self) {
-        self.memory.0.lock().unwrap().fail_at = None;
+        self.device.fail_at = None;
     }
 
-    /// Negative control: simulate a publisher omitting the directory barrier.
-    pub fn omit_directory_sync(&mut self, omit: bool) {
-        self.memory.0.lock().unwrap().omit_directory_sync = omit;
+    /// Negative control: directory and metadata-file barriers report success
+    /// without persisting anything.
+    pub fn omit_metadata_barriers(&mut self, omit: bool) {
+        self.device.omit_metadata_barriers = omit;
     }
 
-    /// Negative control: simulate `DURABLE` writes returning before they are durable.
-    pub fn omit_in_place_sync(&mut self, omit: bool) {
-        self.memory.0.lock().unwrap().omit_in_place_sync = omit;
+    /// Negative control: `DURABLE` evidence writes return before they are durable.
+    pub fn omit_evidence_barrier(&mut self, omit: bool) {
+        self.device.omit_evidence_barrier = omit;
     }
 
-    /// Persist only a prefix of an unsynchronized append before the next crash.
+    /// Persist only a prefix of unsynchronized active bytes before the next crash.
     /// Never changes bytes already covered by a successful file barrier.
     pub fn tear_unsynced(&mut self, kept_bytes: usize) {
-        let name = self.active_name();
-        let mut disk = self.memory.0.lock().unwrap();
-        let index = disk.inode(&name).unwrap();
-        let file = &mut disk.files[index];
-        let kept = file
-            .stable
-            .len()
-            .saturating_add(kept_bytes)
-            .min(file.pending.len());
-        file.stable = file.pending[..kept].to_vec();
+        let path = root().join(self.active_name());
+        let image = self.device.image();
+        let durable = image.bytes(&path, true).unwrap().len();
+        let dirty = image.bytes(&path, false).unwrap().len();
+        let end = durable.saturating_add(kept_bytes).min(dirty);
+        if durable < end {
+            self.device
+                .controller()
+                .persist_range(&path, durable..end)
+                .unwrap();
+        }
     }
 
     /// Let selected pending bytes and their required file length survive a crash.
@@ -417,212 +457,249 @@ impl Journal {
     /// complete a journal barrier; the scheduler may persist ranges in any order.
     /// This chooses a possible crash image, not a writeback syscall's guarantee.
     pub fn persist_range(&mut self, name: &str, range: Range<usize>) -> Result<(), DirectoryError> {
-        self.memory.0.lock().unwrap().persist_range(name, range)?;
+        let path = root().join(name);
+        self.device.controller().persist_range(&path, range)?;
         Ok(())
     }
 
     /// Complete active-segment writes not yet covered by a journal barrier.
     /// Range writeback can preserve some bytes without advancing this boundary.
     pub fn unsynced_active_range(&self) -> Range<usize> {
-        let writer = self.writer.as_ref().expect("opened journal");
+        let writer = self.store.as_ref().expect("opened journal").writer();
         writer.durable_position().end_offset() as usize
             ..writer.written_position().end_offset() as usize
     }
 
-    /// Trace belongs to the scheduler; it is never protocol evidence.
-    pub fn trace(&self) -> Vec<String> {
-        self.memory.0.lock().unwrap().trace.clone()
+    /// Physical operations executed so far. Schedules use it to bound fault cuts.
+    pub fn executed_operations(&self) -> usize {
+        self.device.executed
     }
 
-    fn successor(&self) -> Manifest {
-        let mut next = self.manifest.clone();
-        next.parent_generation = next.generation;
-        next.generation += 1;
-        next
-    }
-
-    fn create_segment(
-        &mut self,
-        id: u64,
-        generation: JournalGeneration,
-    ) -> Result<(), DirectoryError> {
-        let name = segment_name(id);
-        self.memory.write_new(&name, &[])?;
-        self.writer = Some(SegmentWriter::initialize_at(
-            Segment(self.memory.clone(), name),
-            SegmentHeader::new(self.identity.group_id, id, None, Digest::ZERO, CAPACITY)?,
-            generation,
-            1,
-            ChainPosition::GENESIS,
-        )?);
-        self.memory.sync_parent("segments")?;
+    fn close(&mut self) {
+        self.store = None;
         self.positions.clear();
-        Ok(())
+        self.device.settle();
     }
 
-    fn fresh_segment(&mut self, generation: JournalGeneration) -> Result<u64, DirectoryError> {
-        let mut id = self.manifest.segments[0].segment_id;
-        for _ in 0..128 {
-            id += 1;
-            if !self.memory.exists(&segment_name(id))? {
-                self.create_segment(id, generation)?;
-                return Ok(id);
+    fn read_operations(
+        &self,
+        image: &Image,
+        manifest: &Manifest,
+    ) -> Result<Vec<DecodedOperation<'static>>, DirectoryError> {
+        let durable = self
+            .store
+            .as_ref()
+            .map(|journal| journal.writer().durable_position().end_offset() as usize);
+        let mut operations = Vec::new();
+        for reference in &manifest.segments {
+            let mut bytes = image
+                .bytes(&root().join(segment_reference_name(*reference)), false)?
+                .to_vec();
+            let end = match reference.sealed {
+                Some(sealed) => Some(sealed.valid_bytes as usize),
+                None => durable,
+            };
+            if let Some(end) = end {
+                bytes.truncate(end);
             }
-        }
-        Err(DirectoryError::RollProbeLimit { limit: 128 })
-    }
-
-    fn publish_memory_evidence(&mut self, state: VoteState) -> Result<(), DirectoryError> {
-        let accepted = position(self.writer.as_ref().unwrap().durable_position());
-        let bytes = memory_voting::encode(&self.manifest, &self.configuration, accepted, state)?;
-        publication::replace_reusable(
-            &mut self.memory,
-            memory_voting::NAME,
-            memory_voting::TEMPORARY,
-            &bytes,
-            &mut NoopObserver,
-        )
-    }
-
-    fn publish_evidence(&mut self) -> Result<(), DirectoryError> {
-        let accepted = position(self.writer.as_ref().unwrap().durable_position());
-        if !self.memory.exists(evidence::NAME)? {
-            return publication::replace_evidence(
-                &mut self.memory,
-                &evidence::image(&self.manifest, accepted)?,
-                &mut NoopObserver,
+            let scan = scan_segment(
+                &bytes,
+                reference.first_group_number,
+                reference.first_chain,
+                DecodeLimits::default(),
+            )?;
+            operations.extend(
+                scan.groups
+                    .into_iter()
+                    .flat_map(|group| group.operations)
+                    .map(|operation| DecodedOperation {
+                        body: Cow::Owned(operation.body.into_owned()),
+                        ..operation
+                    }),
             );
         }
-        let copies = self.evidence(&self.manifest)?;
-        let (bytes, first) = copies.next(&self.manifest, accepted)?;
-        publication::overwrite_evidence(&mut self.memory, first, &bytes, &mut NoopObserver)
-    }
-
-    fn evidence(&self, manifest: &Manifest) -> Result<evidence::Copies, DirectoryError> {
-        evidence::Copies::decode_file(&self.memory.read(evidence::NAME)?, manifest)
-    }
-
-    fn publish_manifest(&mut self, next: Manifest, successor: bool) -> Result<(), DirectoryError> {
-        let (next, bytes, digest) = if successor {
-            publication::prepare_manifest(
-                &mut self.memory,
-                &self.manifest,
-                next,
-                MetadataLimits::default(),
-            )?
-        } else {
-            let bytes = encode_manifest(&next)?;
-            let digest = manifest_digest(&bytes, MetadataLimits::default())?;
-            (next, bytes, digest)
-        };
-        publication::install_immutable(
-            &mut self.memory,
-            &format!("MANIFEST.{}", next.generation),
-            &bytes,
-            &mut NoopObserver,
-        )?;
-        let current = encode_current(CurrentReference {
-            group_id: self.identity.group_id,
-            store_id: self.identity.store_id,
-            generation: next.generation,
-            manifest_digest: digest,
-        })?;
-        publication::replace_current(
-            &mut self.memory,
-            next.generation,
-            &current,
-            &mut NoopObserver,
-        )?;
-        self.manifest = next;
-        Ok(())
-    }
-
-    fn load_authority(&self) -> Result<(Manifest, bool), DirectoryError> {
-        if decode_group_identity(&self.memory.read("identity")?)? != self.identity {
-            return Err(DirectoryError::IdentityMismatch);
-        }
-        let current = decode_current(&self.memory.read("CURRENT")?)?;
-        let bytes = self
-            .memory
-            .read(&format!("MANIFEST.{}", current.generation))?;
-        let manifest = decode_manifest(&bytes, MetadataLimits::default())?;
-        if current.group_id != self.identity.group_id
-            || current.store_id != self.identity.store_id
-            || manifest.identity != self.identity
-            || manifest.generation != current.generation
-            || manifest_digest(&bytes, MetadataLimits::default())? != current.manifest_digest
-            || !manifest.durable_evidence
-            || manifest.segments.len() != 1
-            || manifest.checkpoint.is_some()
-        {
-            return Err(DirectoryError::CurrentMismatch);
-        }
-        self.evidence(&manifest)?.protected(&manifest)?;
-        let header = decode_segment_header(
-            &self
-                .memory
-                .read(&segment_name(manifest.segments[0].segment_id))?,
-        )?;
-        if header.group_id() != self.identity.group_id
-            || header.segment_id() != manifest.segments[0].segment_id
-        {
-            return Err(DirectoryError::IdentityMismatch);
-        }
-        let configuration = self.memory.read("CONFIGURATION")?;
-        let admitted = configuration == self.configuration;
-        if !admitted && configuration != recovery_marker(&self.configuration)? {
-            return Err(DirectoryError::ConfigurationMismatch);
-        }
-        Ok((manifest, admitted))
-    }
-
-    fn read_operations(&self) -> Result<Vec<DecodedOperation<'static>>, DirectoryError> {
-        let mut bytes = self.memory.inspect(&self.active_name())?;
-        if let Some(writer) = &self.writer {
-            bytes.truncate(writer.durable_position().end_offset() as usize);
-        }
-        let scan = scan_segment(&bytes, 1, ChainPosition::GENESIS, DecodeLimits::default())?;
-        Ok(scan
-            .groups
-            .into_iter()
-            .flat_map(|group| group.operations)
-            .map(|op| DecodedOperation {
-                body: Cow::Owned(op.body.into_owned()),
-                ..op
-            })
-            .collect())
+        Ok(operations)
     }
 }
 
-fn position(position: WriterPosition) -> LogPosition {
-    LogPosition {
-        op_number: position.next_chain().next_op_number() - 1,
-        digest: position.next_chain().previous_digest(),
+/// One simulated device whose jobs complete in submission order.
+struct Device {
+    controller: Option<Controller>,
+    io: Local,
+    executed: usize,
+    fail_at: Option<usize>,
+    omit_metadata_barriers: bool,
+    omit_evidence_barrier: bool,
+    evidence_written: bool,
+}
+
+impl Device {
+    fn new(image: Image) -> Result<Self, DirectoryError> {
+        let (controller, mut clients) = Controller::new(config(), image)?;
+        Ok(Self {
+            controller: Some(controller),
+            io: Local::new(clients.remove(0)),
+            executed: 0,
+            fail_at: None,
+            omit_metadata_barriers: false,
+            omit_evidence_barrier: false,
+            evidence_written: false,
+        })
+    }
+
+    fn controller(&mut self) -> &mut Controller {
+        self.controller.as_mut().expect("running device")
+    }
+
+    fn image(&self) -> &Image {
+        self.controller.as_ref().expect("running device").image()
+    }
+
+    /// Process death with power loss; injected failures end with it.
+    fn crash(&mut self) {
+        let controller = self.controller.take().expect("running device");
+        let (image, _) = controller.crash(true).expect("simulated crash");
+        let (controller, mut clients) = Controller::new(config(), image).expect("restart");
+        self.controller = Some(controller);
+        self.io = Local::new(clients.remove(0));
+        self.fail_at = None;
+    }
+
+    fn run<T>(&mut self, future: impl Future<Output = T>) -> T {
+        let mut future = std::pin::pin!(future);
+        let mut context = Context::from_waker(Waker::noop());
+        for _ in 0..1_000_000 {
+            if let Poll::Ready(result) = future.as_mut().poll(&mut context) {
+                return result;
+            }
+            self.execute_queued();
+        }
+        panic!("simulated storage exceeded its step bound")
+    }
+
+    /// Complete deferred work, such as closes from dropped handles.
+    fn settle(&mut self) {
+        while !self.controller().jobs().is_empty() {
+            self.execute_queued();
+        }
+    }
+
+    fn execute_queued(&mut self) {
+        let controller = self.controller.as_mut().expect("running device");
+        for (id, _) in controller.jobs() {
+            self.executed += 1;
+            let effect = match controller.operation(id).unwrap().unprotected() {
+                _ if self.fail_at == Some(self.executed) => {
+                    Effect::FailBefore(std::io::ErrorKind::Other)
+                }
+                Operation::Sync {
+                    mode: SyncMode::All,
+                    ..
+                } if self.omit_metadata_barriers => Effect::SkipBarrier,
+                Operation::Sync {
+                    mode: SyncMode::Data,
+                    ..
+                } if std::mem::take(&mut self.evidence_written) => Effect::SkipBarrier,
+                Operation::Write { offset, data, .. } => {
+                    // Evidence overwrites each copy in place, then barriers it.
+                    self.evidence_written |= self.omit_evidence_barrier
+                        && data.len() == evidence::RECORD_BYTES
+                        && matches!(*offset as usize, 0 | evidence::COPY_STRIDE);
+                    Effect::Normal
+                }
+                _ => Effect::Normal,
+            };
+            controller.execute(id, effect).unwrap();
+            controller.deliver(id).unwrap();
+        }
+        drop(controller.take_trace());
     }
 }
 
-fn segment_name(id: u64) -> String {
-    format!("segments/{id}.log")
+async fn overwrite(access: &Access, path: PathBuf, bytes: &[u8]) -> std::io::Result<()> {
+    let handle = access.open(path, OpenMode::ReadWrite, false, false).await?;
+    access
+        .done(Operation::SetLength {
+            handle: handle.clone(),
+            length: bytes.len() as u64,
+        })
+        .await?;
+    access.write_all(&handle, 0, bytes).await?;
+    access.sync(&handle).await
 }
 
-fn reference(id: u64) -> SegmentReference {
-    SegmentReference {
-        segment_id: id,
-        file_generation: 0,
-        first_group_number: 1,
-        first_chain: ChainPosition::GENESIS,
-        capacity: CAPACITY,
-        sealed: None,
+fn root() -> &'static Path {
+    Path::new(ROOT)
+}
+
+fn config() -> simulation::Config {
+    let quota = Quota {
+        operations: 8,
+        bytes: 4 * 1024 * 1024,
+    };
+    simulation::Config {
+        limits: ozzy_io::Limits {
+            shards: 1,
+            data: quota,
+            progress: quota,
+        },
+        handles: 64,
+        image: ImageLimits {
+            nodes: 1024,
+            directory_entries: 4096,
+            file_bytes: 2 * CAPACITY as usize,
+            total_bytes: 256 * 1024 * 1024,
+        },
+        trace_events: 100_000,
     }
 }
 
-fn following(position: LogPosition) -> Result<ChainPosition, MetadataError> {
-    position.validate()?;
-    Ok(ChainPosition::new(
-        position
-            .op_number
-            .checked_add(1)
-            .ok_or(MetadataError::InvalidLogPosition)?,
-        position.digest,
-    ))
+fn limits() -> JournalLimits {
+    JournalLimits {
+        metadata: MetadataLimits::default(),
+        decode: DecodeLimits::default(),
+        operations: OperationLimits::default(),
+        checkpoint: CheckpointLimits::default(),
+        io: SegmentOptions {
+            max_segment_bytes: CAPACITY,
+            chunk_bytes: 64 * 1024,
+            direct: false,
+            write_mode: SegmentWriteMode::Buffered,
+        },
+        directory_entries: 1024,
+        directory_name_bytes: 64 * 1024,
+    }
+}
+
+fn stream_limits() -> SuffixStreamLimits {
+    SuffixStreamLimits {
+        max_group_operations: CHUNK_OPERATIONS,
+        max_group_body_bytes: 1024 * 1024,
+        max_segments: 16,
+        max_staged_bytes: 16 * 1024 * 1024,
+        max_source_segment_bytes: CAPACITY,
+        max_orphan_probes: ORPHAN_PROBES,
+    }
+}
+
+fn recovery_limits() -> CanonicalRecoveryLimits {
+    CanonicalRecoveryLimits {
+        retained_identities: 128,
+        ..CanonicalRecoveryLimits::default()
+    }
+}
+
+fn successor(manifest: &Manifest) -> Manifest {
+    let mut next = manifest.clone();
+    next.parent_generation = next.generation;
+    next.generation += 1;
+    next
+}
+
+fn last_operation(position: WriterPosition) -> u64 {
+    position.next_chain().next_op_number() - 1
+}
+
+fn other(error: impl std::fmt::Display) -> DirectoryError {
+    std::io::Error::other(error.to_string()).into()
 }

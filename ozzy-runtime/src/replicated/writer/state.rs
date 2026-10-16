@@ -1,5 +1,7 @@
 pub(super) use super::completion::Completion;
 pub(super) use super::progress::Progress;
+#[cfg(test)]
+mod test_support;
 use super::{PendingRecord, RecordInput, Writer, WriterConfig, WriterError};
 use super::{WriterRuntime, pipe};
 use super::{inbox::Inbox, payload::Body};
@@ -42,7 +44,6 @@ pub(super) struct Shared {
     _runtime: WriterRuntime,
     pub(super) progress: Arc<Progress>,
     pub(super) inbox: Inbox,
-    staged: AtomicU64,
     pub(super) capacity: Arc<StateSignal>,
     pub(super) work: Arc<DataSignal>,
     pub(super) stop: CloseSignal,
@@ -64,6 +65,8 @@ pub(super) struct Driver {
     reorder: Vec<Option<Queued>>,
     reordered: usize,
     ready_next: u64,
+    /// Records before this sequence moved into request ownership.
+    staged: u64,
     last_outcome: Option<AppendOutcome>,
     last_stored_offset: Option<u64>,
     pub(super) admission: Admission,
@@ -154,32 +157,12 @@ impl Admission {
             }
         }
     }
-    pub(super) fn payload(&mut self, index: usize) -> &Payload {
+    pub(super) fn payload(&mut self, index: usize) -> Payload {
         let record = &mut self.records[index];
         record.body.payload()
     }
 }
-#[cfg(test)]
-pub(super) struct TestRecord {
-    pub(super) payload: Payload,
-    pub(super) lengths: Vec<usize>,
-}
 impl Shared {
-    #[cfg(test)]
-    pub(super) fn channel_with_capacity(
-        config: WriterConfig,
-        lane_capacity: usize,
-    ) -> (Writer, Driver) {
-        let runtime = WriterRuntime::new().unwrap();
-        let owned = runtime.clone();
-        futures::executor::block_on(
-            runtime
-                .driver()
-                .spawn(async move { Self::open_reserved(owned, config, lane_capacity, None) }),
-        )
-        .unwrap()
-    }
-
     pub(super) fn open_reserved(
         runtime: WriterRuntime,
         config: WriterConfig,
@@ -188,9 +171,8 @@ impl Shared {
     ) -> (Writer, Driver) {
         let capacity = Arc::new(StateSignal::default());
         let work = Arc::new(DataSignal::default());
-        let inbox_capacity = lane_capacity
-            .checked_mul(config.max_producers)
-            .expect("validated inbox capacity");
+        // Validation bounds every lane's records times the producer count.
+        let inbox_capacity = lane_capacity.saturating_mul(config.max_producers);
         let inbox_bytes = config.lane_bytes().saturating_mul(config.max_producers);
         let inbox = Inbox::new(inbox_capacity, inbox_bytes, capacity.clone());
         let (direct, incoming) = pipe::channel(inbox_capacity, work.clone());
@@ -203,7 +185,6 @@ impl Shared {
             _runtime: runtime,
             progress: Arc::new(Progress::new(&config)),
             inbox,
-            staged: AtomicU64::new(next),
             capacity,
             work,
             stop: CloseSignal::default(),
@@ -232,6 +213,7 @@ impl Shared {
                 reorder,
                 reordered: 0,
                 ready_next: next,
+                staged: next,
                 last_outcome: None,
                 last_stored_offset: None,
                 admission: Admission { records },
@@ -246,20 +228,22 @@ impl Shared {
         let metadata = parts
             .checked_mul(4)
             .and_then(|n| n.checked_add(ozzy_proto::append::IDENTITY_METADATA_BYTES + 30));
+        let Some(bytes) = bytes.filter(|&n| {
+            n <= limits
+                .envelope
+                .max_payload_bytes
+                .min(limits.max_record_bytes)
+        }) else {
+            return Err(WriterError::RecordLimits);
+        };
         if record.message_id.as_bytes() == &[0; 16]
             || parts == 0
             || parts > limits.max_parts
             || metadata.is_none_or(|n| n > limits.envelope.max_metadata_bytes)
-            || bytes.is_none_or(|n| {
-                n > limits
-                    .envelope
-                    .max_payload_bytes
-                    .min(limits.max_record_bytes)
-            })
         {
             return Err(WriterError::RecordLimits);
         }
-        Ok(bytes.expect("checked size"))
+        Ok(bytes)
     }
 
     pub(super) fn sealed(&self) -> bool {
@@ -347,11 +331,9 @@ impl Shared {
         }))
     }
     pub(super) fn fail(&self, error: WriterError) {
+        // Each step notifies its own waiters.
         self.progress.fail(error);
         self.seal();
-        self.progress.changed.notify_changed();
-        self.capacity.notify_changed();
-        self.work.mark();
     }
 }
 impl Driver {
@@ -366,8 +348,8 @@ impl Driver {
                     .incoming
                     .try_recv_batch_into(&mut batch, self.config.limits.max_records.max(1024))
                 {
-                    Ok(_) | Err(crate::command_channel::TryRecvError::Empty) => {}
-                    Err(crate::command_channel::TryRecvError::Disconnected) => {
+                    Ok(_) | Err(fanring::mpsc::TryRecvError::Empty) => {}
+                    Err(fanring::mpsc::TryRecvError::Disconnected) => {
                         self.incoming_batch = batch.into();
                         self.fail(WriterError::Pipeline);
                         self.stop.close();
@@ -413,31 +395,15 @@ impl Driver {
             self.admission.records.push_back(record);
         }
     }
-    #[cfg(test)]
-    pub(super) fn settle(&mut self) {
-        self.drain();
-    }
 
-    #[cfg(test)]
-    pub(super) fn record(&mut self, sequence: u64) -> Option<TestRecord> {
-        self.settle();
-        let first = self.admission.records.front()?.sequence;
-        let index = usize::try_from(sequence.checked_sub(first)?).ok()?;
-        self.admission.records.get(index)?;
-        let payload = self.admission.payload(index).clone();
-        let record = &self.admission.records[index];
-        Some(TestRecord {
-            payload,
-            lengths: record.lengths().collect(),
-        })
-    }
     /// Transfer an admitted prefix into request ownership. Retries never return
     /// inbox capacity twice, including after reconnect with different grouping.
-    pub(super) fn stage(&self, end: u64) {
-        let previous = self.staged.fetch_max(end, Ordering::AcqRel);
+    pub(super) fn stage(&mut self, end: u64) {
+        let previous = self.staged;
         if end <= previous {
             return;
         }
+        self.staged = end;
         // Staged records stay admitted until confirmed, so the whole newly
         // staged range is still in the admission queue.
         let first = self
@@ -454,30 +420,6 @@ impl Driver {
             .map(Queued::admission_bytes)
             .sum();
         self.inbox.release((end - previous) as usize, bytes);
-    }
-
-    /// Remote confirmation releases local retry state and drops original payloads.
-    /// Every confirmed record was selected from the admission queue, so no
-    /// intake drain is needed to cover `end`.
-    #[cfg(test)]
-    pub(super) fn confirm(
-        &mut self,
-        first: u64,
-        end: u64,
-        first_offset: u64,
-    ) -> Result<usize, WriterError> {
-        let records = end
-            .checked_sub(first)
-            .and_then(|count| u32::try_from(count).ok())
-            .ok_or(super::Error::Response)?;
-        self.confirm_outcomes(
-            first,
-            OutcomeRun {
-                disposition: AppendDisposition::Stored,
-                first_offset: ozzy_proto::Offset::new(first_offset),
-                records,
-            },
-        )
     }
 
     pub(super) fn confirm_outcomes(

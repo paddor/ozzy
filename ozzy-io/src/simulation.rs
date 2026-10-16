@@ -12,6 +12,7 @@ mod tests;
 
 pub use disk::{Image, ImageLimits};
 
+use crate::signal::CloseSignal;
 use crate::{
     Admission, Backend, Class, Completion, HandleOwner, Lane, Limits, Operation, Outcome, Rejected,
     Reply, completion,
@@ -24,7 +25,6 @@ use std::{
     path::Path,
     sync::{Arc, Mutex},
 };
-use tokio::sync::Notify;
 
 /// Fixed admission, handle, media-image, and trace limits for one simulated device.
 #[derive(Clone, Copy, Debug)]
@@ -66,6 +66,9 @@ pub enum Effect {
         /// Reported failure after the physical prefix write.
         error: io::ErrorKind,
     },
+    /// Negative control: report a barrier, or an `O_DSYNC` write, as complete
+    /// without persisting it. Other operations execute normally.
+    SkipBarrier,
 }
 
 /// Whether a job awaits physical execution or only result delivery.
@@ -114,7 +117,6 @@ struct Intake {
     closed: bool,
     next: u64,
     active: usize,
-    drained: bool,
 }
 
 #[derive(Debug)]
@@ -122,7 +124,7 @@ struct Shared {
     admission: Admission,
     boot: u64,
     intake: Mutex<Intake>,
-    changed: Notify,
+    drained: CloseSignal,
 }
 
 struct Job {
@@ -138,6 +140,36 @@ pub struct Client {
     shared: Arc<Shared>,
     shard: usize,
     admission: Lane,
+}
+
+impl Client {
+    /// One submission client per shard. Shard 0 keeps the original sender.
+    fn per_shard(
+        state: &Arc<Shared>,
+        sender: mpsc::Sender<Job, Coordinated>,
+        shards: usize,
+    ) -> io::Result<Vec<Self>> {
+        let mut clients = Vec::with_capacity(shards);
+        for shard in 1..shards {
+            let sender = sender.try_clone().ok_or(io::ErrorKind::BrokenPipe)?;
+            clients.push(Self::new(state, sender, shard)?);
+        }
+        clients.insert(0, Self::new(state, sender, 0)?);
+        Ok(clients)
+    }
+
+    fn new(
+        state: &Arc<Shared>,
+        sender: mpsc::Sender<Job, Coordinated>,
+        shard: usize,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            sender,
+            shared: state.clone(),
+            shard,
+            admission: state.admission.lane(shard)?,
+        })
+    }
 }
 
 impl fmt::Debug for Client {
@@ -187,21 +219,7 @@ pub struct Drain(Arc<Shared>);
 impl Drain {
     /// Wait for physical shutdown drain while the harness continues scheduling jobs.
     pub async fn wait(self) {
-        loop {
-            let notified = self.0.changed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self
-                .0
-                .intake
-                .lock()
-                .expect("simulation intake poisoned")
-                .drained
-            {
-                return;
-            }
-            notified.await;
-        }
+        self.0.drained.closed().await;
     }
 }
 
@@ -223,36 +241,18 @@ impl Controller {
                 closed: false,
                 next: 0,
                 active: 0,
-                drained: false,
             }),
-            changed: Notify::new(),
+            drained: CloseSignal::default(),
         });
         let capacity = config
             .limits
-            .share(0, Class::Data)
+            .share(0, Class::Data)?
             .operations
-            .checked_add(config.limits.share(0, Class::Progress).operations)
+            .checked_add(config.limits.share(0, Class::Progress)?.operations)
             .ok_or(io::ErrorKind::InvalidInput)?;
         let (sender, receiver) = mpsc::try_channel_with_policy(capacity)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        let mut clients = Vec::with_capacity(config.limits.shards);
-        for shard in 1..config.limits.shards {
-            clients.push(Client {
-                sender: sender.try_clone().ok_or(io::ErrorKind::BrokenPipe)?,
-                shared: shared.clone(),
-                shard,
-                admission: shared.admission.lane(shard)?,
-            });
-        }
-        clients.insert(
-            0,
-            Client {
-                sender,
-                shared: shared.clone(),
-                shard: 0,
-                admission: shared.admission.lane(0)?,
-            },
-        );
+        let clients = Client::per_shard(&shared, sender, config.limits.shards)?;
         Ok((
             Self {
                 shared,
@@ -339,13 +339,14 @@ impl Controller {
                 | Operation::RemoveFile { .. }
                 | Operation::RemoveDirectory { .. }
         );
-        let result = self.files.execute(
-            &mut self.image,
-            self.config.image,
-            job.origin,
-            job.operation,
+        let result = execute::Execution {
+            files: &mut self.files,
+            image: &mut self.image,
+            limits: self.config.image,
+            origin: job.origin,
             effect,
-        );
+        }
+        .execute(job.operation);
         self.pending.insert(
             id,
             Pending::Executed {
@@ -433,16 +434,15 @@ impl Controller {
     }
 
     fn finish_drain(&mut self) {
-        let mut intake = self
+        let intake = self
             .shared
             .intake
             .lock()
             .expect("simulation intake poisoned");
-        if intake.closed && intake.active == 0 && !intake.drained {
-            self.files.clear();
-            intake.drained = true;
+        if intake.closed && intake.active == 0 && !self.shared.drained.is_closed() {
             drop(intake);
-            self.shared.changed.notify_waiters();
+            self.files.clear();
+            self.shared.drained.close();
         }
     }
 
@@ -494,9 +494,8 @@ impl Drop for Controller {
             .lock()
             .expect("simulation intake poisoned");
         intake.active = 0;
-        intake.drained = true;
         drop(intake);
-        self.shared.changed.notify_waiters();
+        self.shared.drained.close();
     }
 }
 
@@ -559,6 +558,7 @@ impl Effect {
         match (self, operation.unprotected()) {
             (Self::Short(_), Operation::Read { .. } | Operation::Write { .. })
             | (Self::WriteThenError { .. }, Operation::Write { .. })
+            | (Self::SkipBarrier, Operation::Sync { .. } | Operation::Write { .. })
             | (Self::Normal | Self::FailBefore(_) | Self::FailAfter(_), _) => Ok(()),
             _ => Err(io::ErrorKind::InvalidInput.into()),
         }

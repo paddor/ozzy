@@ -44,15 +44,15 @@ impl SegmentFiles {
             .iter()
             .position(|candidate| *candidate == source)
             .ok_or(crate::IndexedReadError::SourceMismatch)?;
-        crate::reader::asynchronous::read_record(
-            &self.access,
-            self.root.join(self.references[at].file_name()),
+        crate::reader::asynchronous::ExtentReader {
+            access: &self.access,
+            path: self.root.join(self.references[at].file_name()),
             source,
-            entry,
-            self.decode,
-            self.operations,
-            self.chunk_bytes,
-        )
+            decode: self.decode,
+            operations: self.operations,
+            chunk: self.chunk_bytes,
+        }
+        .record(entry)
         .await
     }
 
@@ -154,18 +154,14 @@ impl Journal {
     /// Revalidate selected authority before deleting or retiring any artifact.
     pub async fn validate_authority_files(&mut self) -> Result<(), DirectoryError> {
         self.healthy()?;
-        let selected = self
-            .directory
-            .read_selected(
-                self.manifest.identity,
-                self.limits.metadata,
-                self.configuration.as_deref(),
-            )
-            .await?;
-        if selected.current != self.current || selected.manifest != self.manifest {
-            return Err(DirectoryError::CurrentMismatch);
-        }
-        Ok(())
+        super::metadata::require_current(
+            &mut self.directory,
+            self.current,
+            &self.manifest,
+            self.configuration.as_deref(),
+            self.limits.metadata,
+        )
+        .await
     }
 
     /// Retire a checkpoint-covered sealed prefix. Floors must come from that
@@ -244,8 +240,19 @@ impl Journal {
             leases.push(self.pins.protect_prepared_segment(reference.segment_id)?);
             candidates.push(Candidate::Scan(Box::new(self.group_scope(reference)?)));
         }
-        let selected = self
-            .manifest
+        Ok(RetirementScan {
+            candidates,
+            selected: self.selected_checkpoint_at(through),
+            floors,
+            through,
+            leases,
+        })
+    }
+
+    /// The selected checkpoint's files, for revalidation, when it sits
+    /// exactly at `through`.
+    fn selected_checkpoint_at(&self, through: crate::LogPosition) -> Option<SelectedCheckpoint> {
+        self.manifest
             .checkpoint
             .is_some_and(|checkpoint| checkpoint.position == through)
             .then(|| SelectedCheckpoint {
@@ -253,14 +260,7 @@ impl Journal {
                 root: self.root().to_path_buf(),
                 manifest: self.manifest.clone(),
                 limits: self.limits,
-            });
-        Ok(RetirementScan {
-            candidates,
-            selected,
-            floors,
-            through,
-            leases,
-        })
+            })
     }
 
     /// Unreference a scanned prefix in one manifest publication. With

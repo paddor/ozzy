@@ -212,7 +212,7 @@ impl GroupReader {
         if partitions == 0 || partitions > group::MAX_PARTITIONS {
             return Err(GroupReaderError::Configuration);
         }
-        let routes = links.routes(metadata)?;
+        let routes = links.reader_routes(metadata).await?;
         let reader = TopicReader::sources(routes.clone(), config.refresh)?;
         // Each source window and its shared confirmation state; a revoked copy
         // can still drain while the same source activates again.
@@ -235,10 +235,12 @@ impl GroupReader {
                 drain: config.drain,
                 retry: config.retry,
             },
-            view_sender,
-            sources_receiver,
-            leave.clone(),
-            activity.clone(),
+            membership::Channels {
+                view: view_sender,
+                sources: sources_receiver,
+                leave: leave.clone(),
+                activity: activity.clone(),
+            },
         );
         Ok(Self {
             reader,
@@ -287,17 +289,17 @@ impl GroupReader {
                     .is_some_and(|source| source.window.has_capacity())
             };
             let record = match reader.next_or(gate, activity.changed_after(seen)).await {
-                None => continue,
-                Some(Ok(record)) => record,
-                Some(Err(error)) => {
+                Err(()) => continue,
+                Ok(Ok(record)) => record,
+                Ok(Err(error)) => {
                     self.fail();
                     return Err(error.into());
                 }
             };
-            let source = self
-                .sources
-                .get_mut(&record.partition)
-                .expect("gated source");
+            // A source revoked after the gate no longer owns this record.
+            let Some(source) = self.sources.get_mut(&record.partition) else {
+                continue;
+            };
             match source.window.deliver(record.offset) {
                 Ok(token) => return Ok(GroupRecord { record, token }),
                 // The source moved; its next owner resumes at the confirmed cursor.
@@ -395,6 +397,29 @@ impl GroupReader {
             return Err(failure.into());
         }
         self.rejoin(view.generation);
+        self.revoke_untargeted(&view)?;
+        if let Some(group) = view.group {
+            if self.group.is_some_and(|current| current != group) {
+                return Err(GroupReaderError::Fenced);
+            }
+            self.group = Some(group);
+        }
+        for activation in &view.activations {
+            if self
+                .sources
+                .get(&activation.number)
+                .is_some_and(|source| source.plan_revision == activation.plan_revision)
+                || !view.targets(activation.partition, activation.plan_revision)
+            {
+                continue;
+            }
+            self.activate(activation)?;
+        }
+        self.reconcile_progress()
+    }
+
+    /// Revoke sources the view no longer targets or whose window stopped.
+    fn revoke_untargeted(&mut self, view: &membership::View) -> Result<(), GroupReaderError> {
         let revoked: Vec<u32> = self
             .sources
             .values()
@@ -413,73 +438,63 @@ impl GroupReader {
             }
             self.revoke(number);
         }
-        if let Some(group) = view.group {
-            if self.group.is_some_and(|current| current != group) {
-                return Err(GroupReaderError::Fenced);
-            }
-            self.group = Some(group);
+        Ok(())
+    }
+
+    /// Start reading one confirmed target from its activation cursor, with
+    /// its own progress window and driver.
+    fn activate(&mut self, activation: &membership::Activation) -> Result<(), GroupReaderError> {
+        if activation.cursor < activation.retained_from {
+            return Err(GroupReaderError::HistoryExpired {
+                partition: activation.number,
+                cursor: activation.cursor,
+                retained_from: activation.retained_from,
+            });
         }
-        for activation in &view.activations {
-            if self
-                .sources
-                .get(&activation.number)
-                .is_some_and(|source| source.plan_revision == activation.plan_revision)
-                || !view.targets(activation.partition, activation.plan_revision)
-            {
-                continue;
+        // An older copy of this source can no longer confirm anything.
+        for draining in &mut self.draining {
+            if draining.source.partition == activation.partition {
+                draining.source.window.close(ProgressError::Fenced);
             }
-            if activation.cursor < activation.retained_from {
-                return Err(GroupReaderError::HistoryExpired {
-                    partition: activation.number,
-                    cursor: activation.cursor,
-                    retained_from: activation.retained_from,
-                });
-            }
-            // An older copy of this source can no longer confirm anything.
-            for draining in &mut self.draining {
-                if draining.source.partition == activation.partition {
-                    draining.source.window.close(ProgressError::Fenced);
-                }
-            }
-            let identity = ProcessingIdentity {
-                group: self
-                    .group
-                    .ok_or(GroupReaderError::Broker(BrokerLinkError::Response))?,
+        }
+        let identity = ProcessingIdentity {
+            group: self
+                .group
+                .ok_or(GroupReaderError::Broker(BrokerLinkError::Response))?,
+            partition: activation.partition,
+            member: self.config.member,
+            assignment_epoch: activation.epoch,
+            policy: self.reader.policy(),
+        };
+        let (window, mut publisher) = Window::new(
+            identity,
+            activation.cursor,
+            self.config.window,
+            &self.budget,
+        )?;
+        let stop = CloseSignal::default();
+        publisher.notify_on(self.activity.clone());
+        drop(driver::start(
+            self.reader.routes().clone(),
+            activation.number,
+            publisher,
+            self.config.retry,
+            Some(stop.clone()),
+        )?);
+        self.reader.attach(activation.number, activation.cursor)?;
+        self.observations_dirty = true;
+        self.sources.insert(
+            activation.number,
+            Source {
+                number: activation.number,
                 partition: activation.partition,
-                member: self.config.member,
-                assignment_epoch: activation.epoch,
-                policy: self.reader.policy(),
-            };
-            let (window, mut publisher) = Window::new(
-                identity,
-                activation.cursor,
-                self.config.window,
-                &self.budget,
-            )?;
-            let stop = CloseSignal::default();
-            publisher.notify_on(self.activity.clone());
-            drop(driver::start(
-                self.reader.routes().clone(),
-                activation.number,
-                publisher,
-                self.config.retry,
-                Some(stop.clone()),
-            )?);
-            self.reader.attach(activation.number, activation.cursor)?;
-            self.observations_dirty = true;
-            self.sources.insert(
-                activation.number,
-                Source {
-                    number: activation.number,
-                    partition: activation.partition,
-                    plan_revision: activation.plan_revision,
-                    epoch: activation.epoch,
-                    window,
-                    stop,
-                },
-            );
-        }
-        self.reconcile_progress()
+                plan_revision: activation.plan_revision,
+                epoch: activation.epoch,
+                window,
+                stop,
+            },
+        );
+        Ok(())
     }
 
     fn reconcile_progress(&mut self) -> Result<(), GroupReaderError> {

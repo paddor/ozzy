@@ -1,16 +1,10 @@
 use crate::StartupError;
-use futures::{
-    FutureExt,
-    future::{BoxFuture, Shared},
-};
+use crate::signal::CloseSignal;
 #[cfg(all(test, ozzy_loom))]
-use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use loom::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(not(all(test, ozzy_loom)))]
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use tokio::sync::Notify;
-
-type ThreadJoin = Shared<BoxFuture<'static, ()>>;
 
 pub(crate) fn startup_groups(shards: usize) -> (Registration, Registration) {
     let application = State::new(shards);
@@ -23,48 +17,14 @@ pub(crate) fn startup_groups(shards: usize) -> (Registration, Registration) {
     )
 }
 
-/// Coalesced shutdown signal, independent of the startup caller's executor.
-#[derive(Clone, Debug, Default)]
-pub struct Shutdown(Arc<Signal>);
-
-#[derive(Debug, Default)]
-struct Signal {
-    requested: AtomicBool,
-    changed: Notify,
-}
-
-impl Shutdown {
-    /// Whether this owner has received a shutdown request.
-    pub fn is_requested(&self) -> bool {
-        self.0.requested.load(Ordering::Acquire)
-    }
-    pub(crate) fn request(&self) {
-        self.0.requested.store(true, Ordering::Release);
-        self.0.changed.notify_waiters();
-    }
-    /// Wait for shutdown; cancellation does not clear the request.
-    pub async fn requested(&self) {
-        loop {
-            let changed = self.0.changed.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-            if self.is_requested() {
-                return;
-            }
-            changed.await;
-        }
-    }
-}
-
 #[derive(Debug)]
 pub(crate) struct State {
-    pub(crate) stop: Shutdown,
-    pub(crate) finished: Shutdown,
+    pub(crate) stop: CloseSignal,
+    pub(crate) finished: CloseSignal,
     pub(crate) threads: usize,
     active: AtomicUsize,
     error: Arc<OnceLock<Failure>>,
-    next_thread: AtomicUsize,
-    owned: Vec<OnceLock<ThreadJoin>>,
+    owned: ozzy_io::OwnedThreads,
 }
 
 #[derive(Debug, Clone)]
@@ -77,34 +37,24 @@ enum Failure {
 impl State {
     pub(crate) fn new(threads: usize) -> Self {
         Self {
-            stop: Shutdown::default(),
-            finished: Shutdown::default(),
+            stop: CloseSignal::default(),
+            finished: CloseSignal::default(),
             threads,
             active: AtomicUsize::new(0),
             error: Arc::new(OnceLock::new()),
-            next_thread: AtomicUsize::new(0),
-            owned: (0..threads).map(|_| OnceLock::new()).collect(),
+            owned: ozzy_io::OwnedThreads::new(threads),
         }
     }
-    pub(crate) fn own(&self, thread: std::thread::JoinHandle<()>) {
-        let slot = self.next_thread.fetch_add(1, Ordering::Relaxed);
-        self.owned[slot]
-            .set(
-                async move {
-                    let _ = thread.join();
-                }
-                .boxed()
-                .shared(),
-            )
-            .expect("thread handle published more than once");
+    pub(crate) fn own(&self, thread: std::thread::JoinHandle<()>) -> Result<(), StartupError> {
+        self.owned
+            .own(thread)
+            .map_err(|error| StartupError::Runtime(error.to_string()))
     }
     /// Block until every owned thread has exited. A thread reports `finished`
     /// as its last action and can outlive that report briefly. Call only
     /// from a thread that may block and is not owned here.
     pub(crate) fn join(&self) {
-        for thread in self.owned.iter().filter_map(OnceLock::get) {
-            futures::executor::block_on(thread.clone());
-        }
+        self.owned.join();
     }
     pub(crate) fn fail(&self, error: StartupError) {
         let error = match error {
@@ -114,7 +64,7 @@ impl State {
             other => Failure::Runtime(other.to_string()),
         };
         let _ = self.error.set(error);
-        self.stop.request();
+        self.stop.close();
     }
     pub(crate) fn result(&self) -> Result<(), StartupError> {
         match self.error.get() {
@@ -143,7 +93,7 @@ impl Registration {
 impl Drop for Registration {
     fn drop(&mut self) {
         if self.0.active.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.0.finished.request();
+            self.0.finished.close();
         }
     }
 }

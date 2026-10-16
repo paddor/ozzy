@@ -358,7 +358,8 @@ fn owned_follower_writes_primary_validated_lz4_payload() {
     use ozzy_journal::operation::{canonical_body_digest, decode_append_summary};
     use ozzy_proto::{LinkSessionId, Offset, PartitionIncarnation};
     use ozzy_replication::wire::{
-        PeerBinding, Prepare, ReplicaMessage, WireLimits, decode, encode_prepare_metadata,
+        EncodeContext, PeerBinding, Prepare, ReplicaMessage, WireLimits, decode,
+        encode_prepare_metadata,
     };
 
     let (mut controller, io) = setup();
@@ -395,11 +396,13 @@ fn owned_follower_writes_primary_validated_lz4_payload() {
     };
     let mut metadata = [0; 512];
     let wire = encode_prepare_metadata(
-        primary,
-        session,
+        EncodeContext {
+            sender: primary,
+            session,
+            limits: WireLimits::default(),
+        },
         prepare_message,
         &mut metadata,
-        WireLimits::default(),
     )
     .unwrap();
     let binding = PeerBinding::new(

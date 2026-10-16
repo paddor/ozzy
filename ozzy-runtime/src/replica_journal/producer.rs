@@ -1,7 +1,7 @@
 //! Storage-independent writer assignment and exact retry policy.
 
 use ozzy_core::state::{
-    CanonicalProducer, CanonicalState, ProducerResultSource, ProducerResultSpan,
+    CanonicalPartition, CanonicalProducer, CanonicalState, ProducerResultSource, ProducerResultSpan,
 };
 use ozzy_journal::operation::{
     AppendBatchSummary, OperationKind, OperationLimits, RecordRef, decode_append_batches,
@@ -13,7 +13,7 @@ use smallvec::SmallVec;
 
 use super::{AppendAdmissionError, AppendBuffer, JournalError};
 mod duplicate;
-pub(super) use duplicate::DuplicateProof;
+pub(super) use duplicate::{DuplicateProof, Original};
 
 pub(super) struct Assignment {
     pub position: [u8; 16],
@@ -141,15 +141,7 @@ pub(super) fn plan(
         return Err(JournalError::AppendMismatch);
     }
     let batch = summary(buffer, index, limits)?;
-    let state = image
-        .partition(batch.partition)
-        .ok_or(AppendAdmissionError::UnknownPartition)?;
-    let producer = state
-        .producer(batch.producer_id)
-        .ok_or(AppendAdmissionError::Fenced)?;
-    if state.owner_epoch != batch.owner_epoch || producer.producer_epoch != batch.producer_epoch {
-        return Err(AppendAdmissionError::Fenced.into());
-    }
+    let (state, producer) = current_producer(image, &batch)?;
     let (offset_delta, sequence_delta) = prior_records(buffer, index, &batch, limits)?;
     let next_offset = Offset::new(
         state
@@ -199,6 +191,24 @@ pub(super) fn plan(
         next_offset,
         results,
     }))
+}
+
+/// The batch's partition and producer session, unless a newer owner or
+/// producer epoch fenced it.
+fn current_producer<'a>(
+    image: &'a CanonicalState,
+    batch: &AppendBatchSummary,
+) -> Result<(&'a CanonicalPartition, &'a CanonicalProducer), AppendAdmissionError> {
+    let state = image
+        .partition(batch.partition)
+        .ok_or(AppendAdmissionError::UnknownPartition)?;
+    let producer = state
+        .producer(batch.producer_id)
+        .ok_or(AppendAdmissionError::Fenced)?;
+    if state.owner_epoch != batch.owner_epoch || producer.producer_epoch != batch.producer_epoch {
+        return Err(AppendAdmissionError::Fenced);
+    }
+    Ok((state, producer))
 }
 
 fn summary(

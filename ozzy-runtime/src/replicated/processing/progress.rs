@@ -38,7 +38,6 @@ pub(super) const RESERVATION_BYTES: usize = size_of::<Shared>() + 2 * size_of::<
 #[derive(Debug)]
 pub(crate) struct Publisher {
     shared: Arc<Shared>,
-    submission_taken: bool,
     activity: Option<Arc<StateSignal>>,
 }
 
@@ -55,25 +54,31 @@ pub(super) struct Submission {
 pub(crate) struct Observer(Arc<Shared>);
 
 impl Publisher {
+    /// A window's owner and its single submission writer.
     pub(super) fn new(
         identity: ProcessingIdentity,
         cursor: u64,
         permit: Option<OwnedSemaphorePermit>,
-    ) -> Self {
-        Self {
-            submission_taken: false,
+    ) -> (Self, Submission) {
+        let shared = Arc::new(Shared {
+            identity,
+            confirmed: AtomicU64::new(cursor),
+            submitted: AtomicU64::new(cursor),
+            delivered: AtomicU64::new(cursor),
+            closing: OnceLock::new(),
+            failure: OnceLock::new(),
+            changed: StateSignal::default(),
+            _permit: permit,
+        });
+        let submission = Submission {
+            shared: shared.clone(),
+            cursor,
+        };
+        let publisher = Self {
+            shared,
             activity: None,
-            shared: Arc::new(Shared {
-                identity,
-                confirmed: AtomicU64::new(cursor),
-                submitted: AtomicU64::new(cursor),
-                delivered: AtomicU64::new(cursor),
-                closing: OnceLock::new(),
-                failure: OnceLock::new(),
-                changed: StateSignal::default(),
-                _permit: permit,
-            }),
-        }
+        };
+        (publisher, submission)
     }
 
     /// Fan confirmations and closure into one reader/membership wakeup.
@@ -90,17 +95,6 @@ impl Publisher {
 
     pub(super) fn observer(&self) -> Observer {
         Observer(self.shared.clone())
-    }
-
-    pub(super) fn take_submission(&mut self) -> Option<Submission> {
-        if self.submission_taken {
-            return None;
-        }
-        self.submission_taken = true;
-        Some(Submission {
-            shared: self.shared.clone(),
-            cursor: self.shared.submitted.load(Ordering::Relaxed),
-        })
     }
 
     pub(super) fn submitted(&self) -> u64 {

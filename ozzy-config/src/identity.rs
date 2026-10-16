@@ -152,6 +152,16 @@ impl ValidatedDeployment {
             "identity",
             "cluster identity, mode or metadata set changed",
         )?;
+        self.check_broker_identities(identity, &mut used)?;
+        self.check_topic_identities(identity, &mut used)
+    }
+
+    fn check_broker_identities(
+        &self,
+        identity: &DeploymentIdentity,
+        used: &mut BTreeSet<Uuid>,
+    ) -> Result<(), ConfigError> {
+        let config = &self.deployment;
         let mut principals = BTreeSet::new();
         for (name, broker) in &config.brokers {
             let id = identity.brokers.get(name);
@@ -160,7 +170,7 @@ impl ValidatedDeployment {
                 "identity.brokers",
                 "broker identity or name changed",
             )?;
-            optional_id(id.copied(), &mut used, "identity.brokers")?;
+            optional_id(id.copied(), used, "identity.brokers")?;
             require(
                 identity.principals.get(name).is_some_and(|principal| {
                     principal != &[0; 32] && principals.insert(*principal)
@@ -169,6 +179,15 @@ impl ValidatedDeployment {
                 "broker principal binding is missing, zero or reused",
             )?;
         }
+        Ok(())
+    }
+
+    fn check_topic_identities(
+        &self,
+        identity: &DeploymentIdentity,
+        used: &mut BTreeSet<Uuid>,
+    ) -> Result<(), ConfigError> {
+        let config = &self.deployment;
         let members: Vec<_> = identity.brokers.values().copied().collect();
         let mut ordinal = 0;
         for (name, topic) in &config.topics {
@@ -176,7 +195,7 @@ impl ValidatedDeployment {
                 .topics
                 .get(name)
                 .ok_or_else(|| crate::invalid("identity.topics", "topic set changed"))?;
-            optional_id(Some(stored.id), &mut used, "identity.topics")?;
+            optional_id(Some(stored.id), used, "identity.topics")?;
             require(
                 topic.id.is_none_or(|id| id == stored.id)
                     && stored.partitioner == "xxh3-64"
@@ -198,14 +217,10 @@ impl ValidatedDeployment {
                     "identity.partitions",
                     "partition order, configuration epoch or persisted membership changed",
                 )?;
-                optional_id(
-                    Some(partition.group),
-                    &mut used,
-                    "identity.partitions.group",
-                )?;
+                optional_id(Some(partition.group), used, "identity.partitions.group")?;
                 optional_id(
                     Some(partition.incarnation),
-                    &mut used,
+                    used,
                     "identity.partitions.incarnation",
                 )?;
                 ordinal += 1;

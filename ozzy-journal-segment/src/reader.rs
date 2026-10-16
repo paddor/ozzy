@@ -2,9 +2,7 @@
 
 pub(crate) mod asynchronous;
 
-use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::io::{self};
 
 use bytes::Bytes;
 use ozzy_journal::operation::{OperationCodecError, OperationKind, OperationLimits};
@@ -16,9 +14,8 @@ use smallvec::SmallVec;
 use thiserror::Error;
 
 use crate::{
-    CodecError, DecodeLimits, ENTRY_HEADER_BYTES, IndexSource, MessageIndexEntry, OffsetIndexEntry,
-    OperationLocation, SEGMENT_HEADER_BYTES, SegmentHeader, decode_indexed_operation,
-    decode_segment_header,
+    CodecError, DecodeLimits, ENTRY_HEADER_BYTES, IndexSource, OffsetIndexEntry, OperationLocation,
+    SEGMENT_HEADER_BYTES, SegmentHeader, decode_indexed_operation, decode_segment_header,
 };
 
 mod cache;
@@ -57,92 +54,6 @@ impl IndexedRecord {
     pub fn payload_bytes(&self) -> usize {
         self.parts.iter().map(Bytes::len).sum()
     }
-}
-
-/// Read one offset location, revalidating authoritative entry bytes.
-pub fn read_indexed_record(
-    segment_path: impl AsRef<Path>,
-    source: IndexSource,
-    entry: OffsetIndexEntry,
-    decode_limits: DecodeLimits,
-    operation_limits: OperationLimits,
-) -> Result<IndexedRecord, IndexedReadError> {
-    let mut records = read_indexed_records(
-        segment_path,
-        source,
-        std::slice::from_ref(&entry),
-        decode_limits,
-        operation_limits,
-    )?;
-    let mut record = records.pop().ok_or(IndexedReadError::InvalidSelector)?;
-    for part in &mut record.parts {
-        *part = Bytes::copy_from_slice(part);
-    }
-    Ok(record)
-}
-
-/// Read selectors from one canonical operation, validating its bytes once.
-pub(crate) fn read_indexed_records(
-    segment_path: impl AsRef<Path>,
-    source: IndexSource,
-    entries: &[OffsetIndexEntry],
-    decode_limits: DecodeLimits,
-    operation_limits: OperationLimits,
-) -> Result<Vec<IndexedRecord>, IndexedReadError> {
-    let first = *entries.first().ok_or(IndexedReadError::InvalidSelector)?;
-    if entries
-        .iter()
-        .any(|entry| entry.location.operation != first.location.operation)
-    {
-        return Err(IndexedReadError::InvalidLocation);
-    }
-    with_indexed_append_body(
-        segment_path.as_ref(),
-        source,
-        first,
-        decode_limits,
-        |kind, body| {
-            CachedOperation::from_body(first, kind, body.clone(), operation_limits)?
-                .materialize(entries, false)
-        },
-    )
-}
-
-/// Validate the physical entry and its identity before decoding append records.
-/// Callers must still validate the canonical append schema against their limits.
-fn with_indexed_append_body<T>(
-    segment_path: &Path,
-    source: IndexSource,
-    first: OffsetIndexEntry,
-    decode_limits: DecodeLimits,
-    inspect: impl FnOnce(OperationKind, &Bytes) -> Result<T, IndexedReadError>,
-) -> Result<T, IndexedReadError> {
-    let location = validate_location(source, first, decode_limits)?;
-    let path = segment_path;
-    if !fs::symlink_metadata(path)?.file_type().is_file() {
-        return Err(IndexedReadError::NotRegularFile);
-    }
-    let mut file = File::open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.file_type().is_file() || metadata.len() < source.valid_bytes {
-        return Err(IndexedReadError::SourceMismatch);
-    }
-    let mut header_bytes = [0_u8; SEGMENT_HEADER_BYTES];
-    file.read_exact(&mut header_bytes)?;
-    let header = decode_segment_header(&header_bytes)?;
-    validate_source_header(&header, source, metadata.len())?;
-    let length =
-        usize::try_from(location.entry_bytes).map_err(|_| IndexedReadError::InvalidLocation)?;
-    let mut operation_bytes = vec![0_u8; length];
-    file.seek(SeekFrom::Start(location.entry_offset))?;
-    file.read_exact(&mut operation_bytes)?;
-    let (kind, body) = decode_body(
-        &header,
-        location,
-        &Bytes::from(operation_bytes),
-        decode_limits,
-    )?;
-    inspect(kind, &body)
 }
 
 fn validate_location(
@@ -237,35 +148,6 @@ fn shared_range(bytes: &Bytes, slice: &[u8]) -> Result<std::ops::Range<usize>, I
         return Err(IndexedReadError::InvalidSelector);
     }
     Ok(start..end)
-}
-
-/// Read one message-ID result after verifying both index sections agree.
-pub fn read_indexed_message(
-    segment_path: impl AsRef<Path>,
-    source: IndexSource,
-    offset_entry: OffsetIndexEntry,
-    message_entry: MessageIndexEntry,
-    decode_limits: DecodeLimits,
-    operation_limits: OperationLimits,
-) -> Result<IndexedRecord, IndexedReadError> {
-    if message_entry.partition != offset_entry.partition
-        || message_entry.offset != offset_entry.offset
-    {
-        return Err(IndexedReadError::RecordMismatch);
-    }
-    let record = read_indexed_record(
-        segment_path,
-        source,
-        offset_entry,
-        decode_limits,
-        operation_limits,
-    )?;
-    if record.message_id != message_entry.message_id
-        || offset_entry.location.operation.operation_digest != message_entry.operation_digest
-    {
-        return Err(IndexedReadError::RecordMismatch);
-    }
-    Ok(record)
 }
 
 /// Indexed source, pointer, or authoritative entry failure.

@@ -1,6 +1,6 @@
 use super::*;
 use ozzy_journal::operation::{
-    AppendHeader, AppendResults, ResolvedAppend, RetryFingerprint,
+    AppendHeader, AppendResults, ResolvedAppend, RetryFingerprint, WireBatch,
     append_resolved_wire_record_batch, append_wire_record_batch, decode_resolved_append,
     decode_resolved_append_indexed, validate_operation_body,
 };
@@ -104,7 +104,7 @@ fn all_duplicates_store_no_user_records_and_cannot_be_decoded_as_ordinary_append
     let decoded = decode_operation_body(body.kind(), &encoded, limits).unwrap();
     assert_eq!(encode_operation_body(&decoded, limits).unwrap(), encoded);
     let view = decode_resolved_append(&encoded, limits).unwrap();
-    assert_eq!(view.batch.records().count(), 0);
+    assert_eq!(view.batch.raw_records().unwrap().count(), 0);
     assert_eq!(view.results.attempts(), 3);
     assert!(validate_operation_body(OperationKind::Append, &encoded, limits).is_err());
     for flag in [1u32 << 30, 1 << 31] {
@@ -192,45 +192,31 @@ fn wire_append_preserves_raw_and_lz4_blocks_and_rolls_back_combined_limits() {
             PayloadEncoding::Raw => payload.to_vec(),
             PayloadEncoding::Lz4 => lz4rip::block::compress(payload),
         };
-        let mut ordinary = Vec::new();
-        append_wire_record_batch(&mut ordinary, header, descriptors, encoding, &block, limits)
-            .unwrap();
-        let mut resolved = vec![0xaa, 0xbb];
-        let range = append_resolved_wire_record_batch(
-            &mut resolved,
+        let batch = WireBatch {
             header,
-            descriptors,
+            records: descriptors,
             encoding,
-            &block,
-            results,
-            limits,
-        )
-        .unwrap();
+            payload: &block,
+        };
+        let mut ordinary = Vec::new();
+        append_wire_record_batch(&mut ordinary, batch, limits).unwrap();
+        let mut resolved = vec![0xaa, 0xbb];
+        let range =
+            append_resolved_wire_record_batch(&mut resolved, batch, results, limits).unwrap();
         assert_eq!(
             &resolved[range.start..range.start + ordinary.len()],
             ordinary
         );
         let view = decode_resolved_append(&resolved[range.clone()], limits).unwrap();
         if encoding == PayloadEncoding::Lz4 {
-            assert_eq!(view.batch.prepared_payload.unwrap().encoded, block);
+            assert_eq!(view.batch.prepared_payload().unwrap().encoded, block);
         }
         let tight = OperationLimits {
             max_body_bytes: range.len() - 1,
             ..limits
         };
         let mut output = vec![0x55];
-        assert!(
-            append_resolved_wire_record_batch(
-                &mut output,
-                header,
-                descriptors,
-                encoding,
-                &block,
-                results,
-                tight
-            )
-            .is_err()
-        );
+        assert!(append_resolved_wire_record_batch(&mut output, batch, results, tight).is_err());
         assert_eq!(output, [0x55]);
     }
 }

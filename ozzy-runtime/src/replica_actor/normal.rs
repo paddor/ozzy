@@ -1,22 +1,23 @@
 //! One bounded live window, independent of lagging peers' retained disk history.
 
 use crate::replica_actor::HistoryReason;
+use crate::replica_actor::require_normal;
 mod append;
 mod flow;
 mod receive;
 mod recent;
 mod replay;
 
-pub(super) use flow::Flow;
+pub(super) use flow::{Flow, remote_transmitters};
 
 use std::collections::VecDeque;
 
-use ozzy_replication::{Commit, NormalReplica, ReplicationError};
+use ozzy_replication::{Commit, NormalReplica, ReplicaSnapshot, ReplicationError};
 
 use super::ingress::{NextProposal, ProposalWait, Proposals, Reply, Submission};
 use super::{
-    ActorError, AppendBuffer, Control, DriverError, Duration, JournalGeneration, Message, NodeId,
-    PendingIo, Prefix, ProposalOutcome, ReplicaActor, Scope, SendClass,
+    ActorConfig, ActorError, AppendBuffer, Control, DriverError, Duration, JournalGeneration,
+    Message, NodeId, PendingIo, Prefix, ProposalOutcome, ReplicaActor, Scope, SendClass,
 };
 
 #[derive(Debug)]
@@ -68,14 +69,20 @@ pub(super) struct Work {
 }
 
 impl Work {
+    /// When an unsynced batch reaches its maximum age.
+    pub(super) fn sync_deadline(&self, max_age: Duration) -> Option<Duration> {
+        self.sync_batch_started
+            .filter(|_| self.needs_sync)
+            .map(|started| started.saturating_add(max_age))
+    }
+
     pub(super) fn new(
-        capacity: usize,
+        config: &ActorConfig,
         channel: ozzy_replication::flow::Channel,
         receive_buffer: AppendBuffer,
-        pipeline: ozzy_replication::PipelineLimits,
-        replay_cache: ozzy_replication::PipelineLimits,
         flow: Flow,
     ) -> Result<Self, ActorError> {
+        let capacity = config.proposal_capacity;
         Ok(Self {
             scope: channel.scope,
             live: VecDeque::with_capacity(capacity),
@@ -94,61 +101,47 @@ impl Work {
             replay_peer: 0,
             replay_plan: None,
             replay_blocked: [None; 3],
-            receive: receive::Receive::new(receive_buffer, channel, pipeline)?,
-            recent: recent::Recent::new(replay_cache),
+            receive: receive::Receive::new(receive_buffer, channel, config.pipeline)?,
+            recent: recent::Recent::new(config.replay_cache),
             flow,
         })
     }
 
-    pub(super) fn receive_report(&self) -> ozzy_replication::flow::Report {
-        self.receive.ledger.report()
+    /// Drop every cursor, staged suffix, and cached packet of the old scope.
+    fn change_scope(&mut self, scope: Scope, now: Duration) -> Result<(), ActorError> {
+        self.proposals.reject_deferred();
+        self.scope = scope;
+        self.cursors = [None; 3];
+        self.announced = None;
+        self.sync_batch_attempts = 0;
+        self.deferred_commit = None;
+        self.receive.reset();
+        self.recent.clear();
+        self.replay_plan = None;
+        self.replay_blocked = [None; 3];
+        self.flow.change_scope(scope, now)
     }
 
-    pub(super) fn receive_has_work(&self) -> bool {
-        self.receive.in_flight() || self.receive.queued_operations() != 0
-    }
-
-    pub(super) fn receive_capacity(&self) -> ozzy_replication::PipelineLimits {
-        self.receive.ledger.available()
-    }
-
-    pub(super) fn receive_epoch(&self) -> ozzy_replication::flow::ReceiveEpoch {
-        self.receive.ledger.report().channel.epoch
-    }
-}
-
-impl ReplicaActor {
-    pub(super) fn normal_round(&mut self, now: Duration) -> Result<(), ActorError> {
-        if self.work.scope != self.driver.scope() {
-            self.work.proposals.reject_deferred();
-            self.work.scope = self.driver.scope();
-            self.work.cursors = [None; 3];
-            self.work.announced = None;
-            self.work.sync_batch_attempts = 0;
-            self.work.deferred_commit = None;
-            self.work.receive.reset();
-            self.work.recent.clear();
-            self.work.replay_plan = None;
-            self.work.replay_blocked = [None; 3];
-            self.work.flow.change_scope(self.driver.scope(), now)?;
-        }
-        let snapshot = self.driver.normal().map(NormalReplica::snapshot);
+    /// Reply to live entries whose writes returned their arenas: committed
+    /// once applied in the same scope and generation, unknown once fenced.
+    fn finish_live(&mut self, snapshot: Option<&ReplicaSnapshot>) {
         // Count/body bounded by the admitted live window, not total retained history.
-        while let Some(front) = self.work.live.front() {
-            if front.buffer.is_none() {
-                break;
-            } // An admitted write still owns the arena.
-            let same = snapshot.is_some_and(|s| {
-                s.scope == front.scope && s.journal.generation == front.generation
-            });
-            if same && snapshot.is_some_and(|s| s.applied.op < front.end.op) {
-                break;
-            }
-            let live = self.work.live.pop_front().expect("checked front");
-            let buffer = live.buffer.expect("completed write");
+        let same = |live: &Live| {
+            snapshot
+                .is_some_and(|s| s.scope == live.scope && s.journal.generation == live.generation)
+        };
+        // An admitted write still owns its arena; an applied-pending entry waits.
+        while let Some(mut live) = self.live.pop_front_if(|front| {
+            front.buffer.is_some()
+                && !(same(front) && snapshot.is_some_and(|s| s.applied.op < front.end.op))
+        }) {
+            let same = same(&live);
+            let Some(buffer) = live.buffer.take() else {
+                continue;
+            };
             let outcome = if same {
                 if !live.retry {
-                    self.work.recent.retain(recent::Entry {
+                    self.recent.retain(recent::Entry {
                         scope: live.scope,
                         generation: live.generation,
                         predecessor: live.predecessor,
@@ -174,6 +167,32 @@ impl ReplicaActor {
             };
             live.reply.finish(buffer.into(), outcome);
         }
+    }
+
+    pub(super) fn receive_report(&self) -> ozzy_replication::flow::Report {
+        self.receive.ledger.report()
+    }
+
+    pub(super) fn receive_has_work(&self) -> bool {
+        self.receive.in_flight() || self.receive.queued_operations() != 0
+    }
+
+    pub(super) fn receive_capacity(&self) -> ozzy_replication::PipelineLimits {
+        self.receive.ledger.available()
+    }
+
+    pub(super) fn receive_epoch(&self) -> ozzy_replication::flow::ReceiveEpoch {
+        self.receive.ledger.report().channel.epoch
+    }
+}
+
+impl ReplicaActor {
+    pub(super) fn normal_round(&mut self, now: Duration) -> Result<(), ActorError> {
+        if self.work.scope != self.driver.scope() {
+            self.work.change_scope(self.driver.scope(), now)?;
+        }
+        let snapshot = self.driver.normal().map(NormalReplica::snapshot);
+        self.work.finish_live(snapshot.as_ref());
         let Some(snapshot) = snapshot else {
             return Ok(());
         };
@@ -188,12 +207,7 @@ impl ReplicaActor {
         if self.configuration.primary(snapshot.scope.view) != self.local {
             return Ok(());
         }
-        let committed = self
-            .driver
-            .normal()
-            .expect("normal primary")
-            .snapshot()
-            .committed;
+        let committed = require_normal(&self.driver)?.snapshot().committed;
         if self.work.announced != Some(committed) {
             for to in *self.configuration.voters() {
                 if to != self.local {
@@ -246,7 +260,9 @@ impl ReplicaActor {
                 .voters()
                 .iter()
                 .position(|voter| *voter == from)
-                .expect("authenticated voter");
+                .ok_or_else(|| {
+                    DriverError::from(ozzy_replication::ReplicationError::UnknownVoter)
+                })?;
             // Below the core's applied floor this is only a replay hint. Disk
             // or recent-cache lookup verifies its digest before a specific COMMIT.
             if self.work.cursors[index].is_none_or(|cursor| cursor.op < prefix.op) {
@@ -277,31 +293,11 @@ impl ReplicaActor {
     }
 
     pub(super) fn schedule_normal(&mut self, now: Duration) -> Result<(), ActorError> {
-        let snapshot = self.driver.normal().expect("normal scheduling").snapshot();
+        let snapshot = require_normal(&self.driver)?.snapshot();
         let primary = self.configuration.primary(snapshot.scope.view) == self.local;
         debug_assert!(self.work.ready.is_none(), "ready admission rides its turn");
         if snapshot.applied != snapshot.committed {
-            let ticket = self.driver.begin_validation()?;
-            // A staged suffix validates in the same turn, before the apply.
-            // Confirmed identity time must be applied before bounded expiry can
-            // make room for a following canonical batch on a full follower.
-            let validate = if !primary
-                && !self.sync_due(primary, now)
-                && !self.journal.deduplication_enabled()
-            {
-                self.take_received()?
-            } else {
-                None
-            };
-            if validate.is_some() {
-                return self.submit_turn(crate::replica_journal::Turn {
-                    validate,
-                    apply: Some(ticket),
-                    ..Default::default()
-                });
-            }
-            self.pending = Some(PendingIo::Apply(self.journal.apply_committed(ticket)?));
-            return Ok(());
+            return self.schedule_apply(primary, now);
         }
         if self.sync_due(primary, now) {
             if self.pending_sync.is_none() {
@@ -344,6 +340,29 @@ impl ReplicaActor {
         if self.work.proposals.is_idle() {
             self.ingress.resume();
         }
+        Ok(())
+    }
+
+    /// Apply the committed suffix. A follower's staged suffix validates in
+    /// the same turn, before the apply.
+    fn schedule_apply(&mut self, primary: bool, now: Duration) -> Result<(), ActorError> {
+        let ticket = self.driver.begin_validation()?;
+        // Confirmed identity time must be applied before bounded expiry can
+        // make room for a following canonical batch on a full follower.
+        let validate =
+            if !primary && !self.sync_due(primary, now) && !self.journal.deduplication_enabled() {
+                self.take_received()?
+            } else {
+                None
+            };
+        if validate.is_some() {
+            return self.submit_turn(crate::replica_journal::Turn {
+                validate,
+                apply: Some(ticket),
+                ..Default::default()
+            });
+        }
+        self.pending = Some(PendingIo::Apply(self.journal.apply_committed(ticket)?));
         Ok(())
     }
 
@@ -401,7 +420,9 @@ impl ReplicaActor {
             return Ok(None);
         }
         self.work.window_full = false;
-        let buffer = self.work.proposals.start();
+        let Some(buffer) = self.work.proposals.start() else {
+            return Ok(None);
+        };
         let ticket = self.driver.begin_validation()?;
         if !self.work.needs_sync {
             self.work.sync_batch_attempts = 0;

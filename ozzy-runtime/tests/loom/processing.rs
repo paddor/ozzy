@@ -3,9 +3,9 @@ use super::*;
 #[test]
 fn confirmed_processing_observation_also_observes_its_delivered_prefix() {
     loom::model(|| {
-        let mut publisher = processing_progress::Publisher::new(identity(), 0, None);
+        let (mut publisher, mut submission) =
+            processing_progress::Publisher::new(identity(), 0, None);
         let observer = publisher.observer();
-        let mut submission = publisher.take_submission().unwrap();
         let caller = thread::spawn(move || {
             submission.record_delivery(1);
             submission.publish(1).unwrap();
@@ -36,9 +36,8 @@ fn processing_new_intent_racing_confirmation_remains_ready() {
     let mut model = loom::model::Builder::new();
     model.preemption_bound = Some(3);
     model.check(|| {
-        let mut publisher = processing_progress::Publisher::new(identity(), 0, None);
-        let mut submission = publisher.take_submission().unwrap();
-        assert!(publisher.take_submission().is_none());
+        let (mut publisher, mut submission) =
+            processing_progress::Publisher::new(identity(), 0, None);
         submission.publish(1).unwrap();
         let caller = thread::spawn(move || {
             submission.publish(2).unwrap();
@@ -63,8 +62,8 @@ fn processing_submission_close_racing_owner_read_seals_without_reopening() {
     let mut model = loom::model::Builder::new();
     model.preemption_bound = Some(3);
     model.check(|| {
-        let mut publisher = processing_progress::Publisher::new(identity(), 0, None);
-        let mut submission = publisher.take_submission().unwrap();
+        let (mut publisher, mut submission) =
+            processing_progress::Publisher::new(identity(), 0, None);
         let caller = thread::spawn(move || {
             submission.publish(1).unwrap();
             submission.close(ProgressError::Fenced);
@@ -110,7 +109,8 @@ fn processing_confirmation_and_terminal_failure_keep_observations_stable() {
         let mut model = loom::model::Builder::new();
         model.preemption_bound = Some(3);
         model.check(move || {
-            let mut publisher = processing_progress::Publisher::new(identity(), 0, None);
+            let (mut publisher, _submission) =
+                processing_progress::Publisher::new(identity(), 0, None);
             let observer = publisher.observer();
             let owner = thread::spawn(move || {
                 publisher.confirm(confirmed, 2).unwrap();
@@ -143,7 +143,7 @@ fn processing_confirmation_and_terminal_failure_keep_observations_stable() {
 #[test]
 fn processing_owner_drop_preserves_confirmations_and_closes_unconfirmed_waiters() {
     loom::model(|| {
-        let mut publisher = processing_progress::Publisher::new(identity(), 0, None);
+        let (mut publisher, _submission) = processing_progress::Publisher::new(identity(), 0, None);
         let observer = publisher.observer();
         let owner = thread::spawn(move || {
             publisher.confirm(1, 1).unwrap();
@@ -167,7 +167,8 @@ fn processing_wait_observes_confirmation_or_close_after_the_owner_settles() {
         let mut model = loom::model::Builder::new();
         model.preemption_bound = Some(3);
         model.check(move || {
-            let mut publisher = processing_progress::Publisher::new(identity(), 0, None);
+            let (mut publisher, _submission) =
+                processing_progress::Publisher::new(identity(), 0, None);
             let observer = publisher.observer();
             let owner = thread::spawn(move || {
                 if confirm {
@@ -175,8 +176,9 @@ fn processing_wait_observes_confirmation_or_close_after_the_owner_settles() {
                 }
                 drop(publisher);
             });
-            // Model the actual cursor/failure ordering. Tokio registration
-            // and wakes are covered by the production real-thread tests.
+            // Model the cursor/failure ordering and wait registration, whose
+            // order the signal module shadows for Loom. Real-thread tests cover
+            // Tokio's wakes.
             let mut cx = Context::from_waker(std::task::Waker::noop());
             let mut wait = pin!(observer.wait(1));
             let early = wait.as_mut().poll(&mut cx);

@@ -1,51 +1,21 @@
-use super::{Image, Index, JournalError, Offset, OwnedJournal, StoredOperation};
-use ozzy_journal_segment::{JournalIndexBoundary, JournalIndexError};
+use super::{Image, Index, Installed, JournalError, Offset, OwnedJournal, StoredOperation};
+use ozzy_journal::operation::CanonicalOperation;
+use ozzy_journal_segment::{
+    CanonicalRecoveryLimits, DecodedOperation, GroupJournal, JournalIndexBoundary,
+    JournalIndexError,
+};
 
 impl OwnedJournal {
     /// Rebuild only independently validated canonical history before admission.
     /// Missing identities are never replaced with an empty recovered index.
     pub(in crate::replica_journal) async fn restore_dedup(&mut self) -> Result<(), JournalError> {
         let Some(limits) = self.dedup.limits else {
-            if self.images.as_ref().is_some_and(|images| {
-                images
-                    .speculative()
-                    .partitions()
-                    .any(|(_, partition)| partition.dedup_window_millis.is_some())
-            }) {
-                return Err(JournalError::Configuration);
-            }
-            return Ok(());
+            return self.refuse_dedup_windows();
         };
         let journal = self.journal.ready_mut()?;
         let accepted = journal.accepted_position()?.op_number;
-        let (mut image, first) = if let Some(selected) = journal.manifest().checkpoint {
-            if selected.position.op_number > self.applied.op.0 {
-                return Err(JournalError::CompletionMismatch);
-            }
-            let files = journal.capture_checkpoint()?;
-            if files.reference() != selected {
-                return Err(JournalError::HistorySourceMismatch);
-            }
-            let image = super::checkpoint::restore(&files, limits, self.recovery).await?;
-            let first = selected
-                .position
-                .op_number
-                .checked_add(1)
-                .ok_or(JournalError::CompletionMismatch)?;
-            (image, first)
-        } else {
-            (
-                Image {
-                    index: Index::new(limits, Offset::ZERO, 0)?,
-                    partition: None,
-                    time: 0,
-                    end: Offset::ZERO,
-                    #[cfg(feature = "storage-metrics")]
-                    reservation: None,
-                },
-                1,
-            )
-        };
+        let (mut image, first) =
+            Image::restore_base(journal, self.applied.op.0, limits, self.recovery).await?;
         if first <= accepted {
             let snapshot = journal
                 .build_index_snapshot(JournalIndexBoundary::Accepted, self.recovery.index)
@@ -55,15 +25,7 @@ impl OwnedJournal {
                     .read_operation_number(number)
                     .await?
                     .ok_or(JournalIndexError::MissingOperationNumber(number))?;
-                let operation = ozzy_journal::operation::CanonicalOperation {
-                    group_id: decoded.group_id,
-                    configuration_epoch: decoded.configuration_epoch,
-                    original_view: decoded.original_view,
-                    op_number: decoded.op_number,
-                    previous_digest: decoded.previous_digest,
-                    kind: decoded.kind,
-                    body: &decoded.body,
-                };
+                let operation = canonical(&decoded);
                 let (partition, row) = image.row(operation, self.limits.operations, limits)?;
                 let prepared = image.index.prepare_stored(
                     &[StoredOperation {
@@ -90,16 +52,24 @@ impl OwnedJournal {
             }
         }
         self.validate_dedup_image(&image, accepted, limits)?;
-        #[cfg(feature = "storage-metrics")]
-        {
-            image.reservation = Some(crate::storage_metrics::dedup_image(
-                image.index.reserved_bytes(),
-                limits.entries,
-            ));
-        }
+        image.reservation = Installed::count(image.index.reserved_bytes(), limits.entries);
         self.dedup.image = Some(image);
         Ok(())
     }
+
+    /// Without identity limits, no recovered partition may enable a window.
+    fn refuse_dedup_windows(&self) -> Result<(), JournalError> {
+        if self.images.as_ref().is_some_and(|images| {
+            images
+                .speculative()
+                .partitions()
+                .any(|(_, partition)| partition.dedup_window_millis.is_some())
+        }) {
+            return Err(JournalError::Configuration);
+        }
+        Ok(())
+    }
+
     fn validate_dedup_image(
         &self,
         image: &Image,
@@ -125,5 +95,54 @@ impl OwnedJournal {
             return Err(JournalError::InstallationMismatch);
         }
         Ok(())
+    }
+}
+
+impl Image {
+    /// The image at the selected checkpoint, or an empty one without it, and
+    /// the first operation replay adds to it.
+    async fn restore_base(
+        journal: &GroupJournal,
+        applied: u64,
+        limits: ozzy_core::dedup::Limits,
+        recovery: CanonicalRecoveryLimits,
+    ) -> Result<(Self, u64), JournalError> {
+        let Some(selected) = journal.manifest().checkpoint else {
+            let empty = Self {
+                index: Index::new(limits, Offset::ZERO, 0)?,
+                partition: None,
+                time: 0,
+                end: Offset::ZERO,
+                reservation: None,
+            };
+            return Ok((empty, 1));
+        };
+        if selected.position.op_number > applied {
+            return Err(JournalError::CompletionMismatch);
+        }
+        let files = journal.capture_checkpoint()?;
+        if files.reference() != selected {
+            return Err(JournalError::HistorySourceMismatch);
+        }
+        let image = super::checkpoint::restore(&files, limits, recovery).await?;
+        let first = selected
+            .position
+            .op_number
+            .checked_add(1)
+            .ok_or(JournalError::CompletionMismatch)?;
+        Ok((image, first))
+    }
+}
+
+/// The canonical fields of one indexed operation.
+fn canonical<'a>(decoded: &'a DecodedOperation<'_>) -> CanonicalOperation<'a> {
+    CanonicalOperation {
+        group_id: decoded.group_id,
+        configuration_epoch: decoded.configuration_epoch,
+        original_view: decoded.original_view,
+        op_number: decoded.op_number,
+        previous_digest: decoded.previous_digest,
+        kind: decoded.kind,
+        body: &decoded.body,
     }
 }

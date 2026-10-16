@@ -35,15 +35,16 @@ impl Body {
         self.bytes().len()
     }
 
-    /// Pack a singleton for transport once. Multi-record packing borrows inline
-    /// bytes directly, without allocating a transport payload for each record.
-    pub(super) fn payload(&mut self) -> &Payload {
-        if let Self::Inline(body) = self {
-            *self = Self::Packed(Payload::from_slice(body.as_slice()));
+    /// Pack a singleton for transport once and share it. Multi-record packing
+    /// borrows inline bytes directly, without a transport payload per record.
+    pub(super) fn payload(&mut self) -> Payload {
+        match self {
+            Self::Packed(body) => body.clone(),
+            Self::Inline(body) => {
+                let packed = Payload::from_slice(body.as_slice());
+                *self = Self::Packed(packed.clone());
+                packed
+            }
         }
-        let Self::Packed(body) = self else {
-            unreachable!("singleton payload was packed")
-        };
-        body
     }
 }

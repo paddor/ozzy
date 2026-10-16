@@ -80,7 +80,7 @@ async fn a_held_file_job_leaves_other_partitions_and_timer_observations_runnable
                     times.fetch_add(1, Ordering::Release);
                 }));
                 context.ready()?;
-                context.shutdown.requested().await;
+                context.shutdown.closed().await;
                 for task in tasks {
                     task.await.unwrap();
                 }

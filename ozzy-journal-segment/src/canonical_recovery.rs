@@ -1,21 +1,13 @@
 //! Checkpoint-backed canonical state reconstruction from selected journal bytes.
 
-mod selected;
-
-pub use selected::CanonicalRecoveryCandidate;
-
-use std::collections::HashSet;
-
 use ozzy_core::state::{
-    CanonicalImages, CanonicalImagesError, CanonicalState, IdentityClaim, IdentityIndex,
-    IdentityIndexError, IdentityKey, StateLimits, StateSnapshotLimits,
+    CanonicalImagesError, IdentityIndexError, StateLimits, StateSnapshotLimits,
 };
-use ozzy_journal::operation::{OperationCodecError, decode_operation_body};
+use ozzy_journal::operation::OperationCodecError;
 use thiserror::Error;
 
 use crate::{
-    CanonicalCheckpointError, CheckpointLimits, DirectoryError, IndexBuildLimits,
-    JournalIdentityIndex, JournalIndexError, JournalIndexSnapshot, OpenGroupJournal, ReplayError,
+    CanonicalCheckpointError, CheckpointLimits, DirectoryError, IndexBuildLimits, JournalIndexError,
 };
 
 /// Explicit bounds for semantic state and retained retry reconstruction.
@@ -46,134 +38,6 @@ impl Default for CanonicalRecoveryLimits {
             retained_identities: 16 * 1024 * 1024,
             accepted_transitions: 1_048_576,
         }
-    }
-}
-
-impl OpenGroupJournal {
-    /// Restore committed/speculative canonical images from checkpoint plus log.
-    ///
-    /// Exact identity checks use source-bound disk indexes while replay advances
-    /// their visible operation boundary. RAM grows with accepted transition
-    /// plans and the configured live overlay, not retained record count.
-    pub fn recover_canonical_images(
-        &self,
-        limits: CanonicalRecoveryLimits,
-    ) -> Result<CanonicalImages<JournalIdentityIndex>, CanonicalStateRecoveryError> {
-        let checkpoint =
-            self.selected_canonical_checkpoint(limits.state, limits.snapshot, limits.checkpoint)?;
-        let checkpoint_position = checkpoint
-            .as_ref()
-            .map_or(0, ozzy_core::state::CanonicalState::revision);
-        let (committed_snapshot, accepted_snapshot) =
-            self.build_recovery_index_snapshots(limits.index)?;
-        let initial = checkpoint.unwrap_or_else(|| CanonicalState::new(limits.state));
-        let mut committed = initial.clone();
-        let mut speculative = initial;
-        let mut committed_replay =
-            ReplayIdentityIndex::new(&committed_snapshot, checkpoint_position);
-        let mut speculative_replay =
-            ReplayIdentityIndex::new(&accepted_snapshot, checkpoint_position);
-        let mut pending = Vec::new();
-        let mut accepted_only_seen = false;
-        flatten_replay(self.replay_accepted(|item| {
-            let body = decode_operation_body(
-                item.operation.kind,
-                item.operation.body.as_ref(),
-                self.operation_limits(),
-            )?;
-            if item.committed {
-                if accepted_only_seen {
-                    return Err(CanonicalImagesError::CommittedAfterAccepted.into());
-                }
-                let plan = committed.prepare(item.operation.op_number, &body, &committed_replay)?;
-                committed.apply(plan.clone(), &mut committed_replay)?;
-                committed_replay.advance(item.operation.op_number);
-                speculative.apply(plan, &mut speculative_replay)?;
-                speculative_replay.advance(item.operation.op_number);
-            } else {
-                accepted_only_seen = true;
-                if pending.len() >= limits.accepted_transitions {
-                    return Err(CanonicalImagesError::PendingCapacity.into());
-                }
-                let plan =
-                    speculative.prepare(item.operation.op_number, &body, &speculative_replay)?;
-                speculative.apply(plan.clone(), &mut speculative_replay)?;
-                speculative_replay.advance(item.operation.op_number);
-                pending.push(plan);
-            }
-            Ok::<_, CanonicalReplayError>(())
-        }))?;
-        if committed.revision() != self.committed_position()?.op_number
-            || speculative.revision() != self.accepted_position()?.op_number
-        {
-            return Err(CanonicalStateRecoveryError::PositionMismatch);
-        }
-        Ok(CanonicalImages::from_recovered(
-            committed,
-            speculative,
-            JournalIdentityIndex::new(committed_snapshot, limits.retained_identities),
-            JournalIdentityIndex::new(accepted_snapshot, limits.retained_identities),
-            pending,
-            limits.accepted_transitions,
-        )?)
-    }
-}
-
-#[derive(Debug)]
-struct ReplayIdentityIndex<'a> {
-    snapshot: &'a JournalIndexSnapshot,
-    through: u64,
-}
-
-impl ReplayIdentityIndex<'_> {
-    const fn new(snapshot: &JournalIndexSnapshot, through: u64) -> ReplayIdentityIndex<'_> {
-        ReplayIdentityIndex { snapshot, through }
-    }
-
-    fn advance(&mut self, through: u64) {
-        self.through = through;
-    }
-}
-
-impl IdentityIndex for ReplayIdentityIndex<'_> {
-    fn lookup(&self, key: IdentityKey) -> Result<Option<IdentityClaim>, IdentityIndexError> {
-        self.snapshot
-            .identity_claim_through(key, self.through)
-            .map_err(|_| IdentityIndexError::LookupUnavailable)
-    }
-
-    fn check_capacity(&self, _additional: usize) -> Result<(), IdentityIndexError> {
-        Ok(())
-    }
-
-    fn check_reserve(&self, claims: &[IdentityClaim]) -> Result<(), IdentityIndexError> {
-        let keys = claims
-            .iter()
-            .map(|claim| claim.key())
-            .collect::<HashSet<_>>();
-        if keys.len() != claims.len() {
-            return Err(IdentityIndexError::Conflict);
-        }
-        for key in keys {
-            if self.lookup(key)?.is_some() {
-                return Err(IdentityIndexError::Conflict);
-            }
-        }
-        Ok(())
-    }
-
-    fn reserve(&mut self, claims: &[IdentityClaim]) -> Result<(), IdentityIndexError> {
-        self.check_reserve(claims)
-    }
-}
-
-fn flatten_replay(
-    result: Result<(), ReplayError<CanonicalReplayError>>,
-) -> Result<(), CanonicalStateRecoveryError> {
-    match result {
-        Ok(()) => Ok(()),
-        Err(ReplayError::Journal(error)) => Err(error.into()),
-        Err(ReplayError::Visitor(error)) => Err(error.into()),
     }
 }
 

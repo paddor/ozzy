@@ -180,15 +180,35 @@ fn ram_confirmed_leader_with_stalled_persistence_yields_to_healthy_pair() {
 
 #[test]
 fn interrupted_memory_voter_repair_never_reopens_with_unproven_authority() {
-    use super::storage_repair::{replacement, until_action};
+    memory_voter_repair_cuts(4);
+}
+
+mod stress {
+    #[test]
+    fn every_interrupted_memory_voter_repair_cut_never_reopens_with_unproven_authority() {
+        super::memory_voter_repair_cuts(1);
+    }
+}
+
+fn memory_voter_repair_cuts(stride: usize) {
+    use super::storage_repair::{io_cuts, replacement, until_action};
     for publication in [false, true] {
         let mut baseline = replacement(QuorumPolicy::Replicated);
         until_action(&mut baseline, publication);
-        let before = baseline.replicas[2].storage.as_ref().unwrap().trace().len();
+        let before = baseline.replicas[2]
+            .storage
+            .as_ref()
+            .unwrap()
+            .executed_operations();
         baseline.perform_disk(2);
-        let actions = baseline.replicas[2].storage.as_ref().unwrap().trace().len() - before;
+        let actions = baseline.replicas[2]
+            .storage
+            .as_ref()
+            .unwrap()
+            .executed_operations()
+            - before;
         assert!(actions > 0);
-        for cut in 1..=actions + 1 {
+        for cut in io_cuts(actions, stride) {
             let mut sim = replacement(QuorumPolicy::Replicated);
             let protected = sim.acknowledged.last().unwrap().prefix();
             until_action(&mut sim, publication);

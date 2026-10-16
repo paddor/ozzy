@@ -58,6 +58,9 @@ impl Staged<'_> {
     }
 }
 
+/// Codec bytes independent of the batch: the state itself and its tables.
+const CODEC_FIXED_BYTES: usize = size_of::<Codec>() + 2048 * size_of::<u32>() + 1024;
+
 /// Reusable mixed/all-duplicate codec state, bounded with the identity budget.
 #[derive(Debug)]
 pub(in crate::replica_journal) struct Codec {
@@ -67,6 +70,34 @@ pub(in crate::replica_journal) struct Codec {
     payload_peak: usize,
     records_peak: usize,
     parts_peak: usize,
+}
+
+/// The owner's reusable codec for batches with duplicates, and the bytes it
+/// may grow to within the identity budget.
+#[derive(Debug)]
+pub(in crate::replica_journal) struct CodecScratch<'a> {
+    pub(in crate::replica_journal) codec: &'a mut Option<Box<Codec>>,
+    pub(in crate::replica_journal) budget: usize,
+}
+
+impl CodecScratch<'_> {
+    /// Encode a batch with its duplicates removed, creating the codec on
+    /// first use if the budget allows it.
+    fn encode(
+        &mut self,
+        batch: &AppendBatchView<'_>,
+        resolution: ozzy_core::dedup::OperationAdmission<'_>,
+        limits: OperationLimits,
+    ) -> Result<&[u8], JournalError> {
+        if self.codec.is_none() && self.budget < CODEC_FIXED_BYTES {
+            return Err(JournalError::AppendCapacity);
+        }
+        let codec = self
+            .codec
+            .get_or_insert_with(|| Box::new(Codec::new(limits.max_payload_bytes)));
+        codec.reserve_budget(batch, self.budget)?;
+        codec.encode(batch, resolution, limits)
+    }
 }
 
 impl Codec {
@@ -102,7 +133,7 @@ impl Codec {
             .checked_mul(6)
             .and_then(|bytes| bytes.checked_add(records_peak.checked_mul(256)?))
             .and_then(|bytes| bytes.checked_add(parts_peak.checked_mul(64)?))
-            .and_then(|bytes| bytes.checked_add(size_of::<Self>() + 2048 * size_of::<u32>() + 1024))
+            .and_then(|bytes| bytes.checked_add(CODEC_FIXED_BYTES))
             .ok_or(JournalError::AppendCapacity)?;
         if bound > budget {
             return Err(JournalError::AppendCapacity);
@@ -210,10 +241,10 @@ impl AppendBuffer {
                 proof.batch(operation.body, limits)?
             } else {
                 let mut decoded = decode_append_batches(operation.body, limits)?;
-                if decoded.len() != 1 {
-                    return Err(JournalError::AppendMismatch);
+                match (decoded.pop(), decoded.is_empty()) {
+                    (Some(batch), true) => batch,
+                    _ => return Err(JournalError::AppendMismatch),
                 }
-                decoded.pop().expect("one batch")
             };
             batches.push(batch);
         }
@@ -223,24 +254,11 @@ impl AppendBuffer {
     pub(in crate::replica_journal) fn resolve_dedup(
         &self,
         admission: &PreparedAdmission,
-        codec: &mut Option<Box<Codec>>,
-        codec_budget: usize,
+        mut codec: CodecScratch<'_>,
         limits: OperationLimits,
         charge: Option<crate::memory::Charge>,
     ) -> Result<Rewrite, JournalError> {
-        let mut rewrite = Rewrite {
-            bodies: self
-                .bodies
-                .allocator()
-                .map_or_else(|| Body::new(0), Body::charged),
-            entries: Vec::new(),
-            results: None,
-            charge,
-        };
-        rewrite
-            .entries
-            .try_reserve_exact(self.len())
-            .map_err(std::io::Error::other)?;
+        let mut rewrite = self.empty_rewrite(charge)?;
         let first_operation = admission
             .operation()
             .checked_sub(self.len() as u64 - 1)
@@ -263,36 +281,9 @@ impl AppendBuffer {
                 .iter()
                 .all(|outcome| outcome.disposition == AppendDisposition::Stored)
             {
-                let results = AppendResults::classified(
-                    resolution.logical_time,
-                    resolution.outcomes,
-                    &[],
-                    limits,
-                )?;
-                let mut size = super::body::EncodedSize::default();
-                append_results(&mut size, results, limits)?;
-                let bytes = operation
-                    .body
-                    .len()
-                    .checked_add(size.0)
-                    .ok_or(JournalError::AppendCapacity)?;
-                rewrite.reserve(bytes, self.limits.max_body_bytes, limits.max_body_bytes)?;
-                let target = rewrite.bodies.mutable()?;
-                target.extend_from_slice(operation.body);
-                // Same fixed position field patched by producer assignment.
-                target[start + 60..start + 68]
-                    .copy_from_slice(&resolution.first_offset.get().to_be_bytes());
-                append_results(target, results, limits)?;
+                self.rewrite_stored(&mut rewrite, operation.body, resolution, limits)?;
             } else {
-                if codec.is_none()
-                    && codec_budget < size_of::<Codec>() + 2048 * size_of::<u32>() + 1024
-                {
-                    return Err(JournalError::AppendCapacity);
-                }
-                let scratch =
-                    codec.get_or_insert_with(|| Box::new(Codec::new(limits.max_payload_bytes)));
-                scratch.reserve_budget(batch, codec_budget)?;
-                let body = scratch.encode(batch, resolution, limits)?;
+                let body = codec.encode(batch, resolution, limits)?;
                 rewrite.reserve(
                     body.len(),
                     self.limits.max_body_bytes,
@@ -300,16 +291,7 @@ impl AppendBuffer {
                 )?;
                 rewrite.bodies.extend_from_slice(body)?;
             }
-            rewrite.entries.push(Descriptor {
-                envelope: ozzy_journal::operation::CanonicalOperation {
-                    kind: OperationKind::ResolvedAppend,
-                    ..entry.envelope
-                },
-                body: start..rewrite.bodies.len(),
-                digest: None,
-                proof: None,
-                primary_payload_validated: true,
-            });
+            rewrite.push_resolved(entry, start);
             if self.len() == 1 {
                 rewrite.results = Some(Box::new(
                     self.resolved_result_ranges(batch, number, resolution)?,
@@ -317,6 +299,53 @@ impl AppendBuffer {
             }
         }
         Ok(rewrite)
+    }
+
+    /// A rewrite on this buffer's allocator, with room for each entry.
+    fn empty_rewrite(
+        &self,
+        charge: Option<crate::memory::Charge>,
+    ) -> Result<Rewrite, JournalError> {
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(self.len())
+            .map_err(std::io::Error::other)?;
+        Ok(Rewrite {
+            bodies: self
+                .bodies
+                .allocator()
+                .map_or_else(|| Body::new(0), Body::charged),
+            entries,
+            results: None,
+            charge,
+        })
+    }
+
+    /// An all-stored batch keeps its body; its position and results follow.
+    fn rewrite_stored(
+        &self,
+        rewrite: &mut Rewrite,
+        body: &[u8],
+        resolution: ozzy_core::dedup::OperationAdmission<'_>,
+        limits: OperationLimits,
+    ) -> Result<(), JournalError> {
+        let results =
+            AppendResults::classified(resolution.logical_time, resolution.outcomes, &[], limits)?;
+        let mut size = super::body::EncodedSize::default();
+        append_results(&mut size, results, limits)?;
+        let bytes = body
+            .len()
+            .checked_add(size.0)
+            .ok_or(JournalError::AppendCapacity)?;
+        rewrite.reserve(bytes, self.limits.max_body_bytes, limits.max_body_bytes)?;
+        let start = rewrite.bodies.len();
+        let target = rewrite.bodies.mutable()?;
+        target.extend_from_slice(body);
+        // Same fixed position field patched by producer assignment.
+        target[start + 60..start + 68]
+            .copy_from_slice(&resolution.first_offset.get().to_be_bytes());
+        append_results(target, results, limits)?;
+        Ok(())
     }
 
     fn resolved_result_ranges(
@@ -448,5 +477,19 @@ impl Rewrite {
             return Err(JournalError::AppendCapacity);
         }
         self.bodies.reserve(bytes)
+    }
+
+    /// Describe the resolved body written since `start` for `entry`.
+    fn push_resolved(&mut self, entry: &Descriptor, start: usize) {
+        self.entries.push(Descriptor {
+            envelope: ozzy_journal::operation::CanonicalOperation {
+                kind: OperationKind::ResolvedAppend,
+                ..entry.envelope
+            },
+            body: start..self.bodies.len(),
+            digest: None,
+            proof: None,
+            primary_payload_validated: true,
+        });
     }
 }

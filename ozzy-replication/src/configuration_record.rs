@@ -1,4 +1,4 @@
-use ozzy_proto::{GroupId, NodeId};
+use ozzy_proto::{GroupId, NodeId, layout::Fixed};
 
 use crate::{Configuration, Digest, QuorumPolicy, ReplicationError};
 
@@ -98,43 +98,35 @@ impl ConfigurationRecord {
     /// Validate exact length, supported policy/versions, canonical fields, and digest.
     /// Unknown fields and malformed membership are rejected, never normalized.
     pub fn decode(bytes: &[u8]) -> Result<Self, ConfigurationRecordError> {
-        if bytes.len() != CONFIGURATION_RECORD_BYTES {
-            return Err(ConfigurationRecordError::Length);
-        }
-        if &bytes[..8] != MAGIC
-            || bytes[8..12] != [0, 2, 1, 0]
-            || !matches!(bytes[12], 1 | 2)
-            || bytes[13..16] != [1, ozzy_proto::VERSION, 1]
-            || bytes[40] != 3
-            || bytes[41..48].iter().any(|&byte| byte != 0)
-            || bytes[224..].iter().any(|&byte| byte != 0)
+        let bytes: &[u8; CONFIGURATION_RECORD_BYTES] = bytes
+            .try_into()
+            .map_err(|_| ConfigurationRecordError::Length)?;
+        if bytes.array::<0, 8>() != *MAGIC
+            || bytes.array::<8, 4>() != [0, 2, 1, 0]
+            || !matches!(bytes.u8_at::<12>(), 1 | 2)
+            || bytes.array::<13, 3>() != [1, ozzy_proto::VERSION, 1]
+            || bytes.u8_at::<40>() != 3
+            || bytes.slice::<41, 7>().iter().any(|&byte| byte != 0)
+            || bytes.slice::<224, 32>().iter().any(|&byte| byte != 0)
         {
             return Err(ConfigurationRecordError::UnsupportedFields);
         }
-        let stored = Digest::from_bytes(
-            bytes[DIGEST_START..DIGEST_START + 32]
-                .try_into()
-                .expect("fixed digest"),
-        );
+        let stored = Digest::from_bytes(bytes.array::<DIGEST_START, 32>());
         if record_digest(bytes) != stored {
             return Err(ConfigurationRecordError::DigestMismatch);
         }
-        let group = GroupId::from_bytes(bytes[16..32].try_into().expect("fixed group"));
-        let epoch = u64::from_be_bytes(bytes[32..40].try_into().expect("fixed epoch"));
-        let voters = std::array::from_fn(|index| {
-            let start = 48 + index * 48;
-            ConfiguredVoter {
-                node_id: NodeId::from_bytes(
-                    bytes[start..start + 16].try_into().expect("fixed voter"),
-                ),
-                principal: Digest::from_bytes(
-                    bytes[start + 16..start + 48]
-                        .try_into()
-                        .expect("fixed principal"),
-                ),
-            }
+        let group = GroupId::from_bytes(bytes.array::<16, 16>());
+        let epoch = bytes.u64_at::<32>();
+        let voters = [
+            bytes.array::<48, 48>(),
+            bytes.array::<96, 48>(),
+            bytes.array::<144, 48>(),
+        ]
+        .map(|entry| ConfiguredVoter {
+            node_id: NodeId::from_bytes(entry.array::<0, 16>()),
+            principal: Digest::from_bytes(entry.array::<16, 32>()),
         });
-        let policy = if bytes[12] == 1 {
+        let policy = if bytes.u8_at::<12>() == 1 {
             QuorumPolicy::Durable
         } else {
             QuorumPolicy::Replicated
@@ -159,19 +151,20 @@ fn unsigned_record(
     bytes[16..32].copy_from_slice(group.as_bytes());
     bytes[32..40].copy_from_slice(&epoch.to_be_bytes());
     bytes[40] = 3;
-    for (index, voter) in voters.iter().enumerate() {
-        let start = 48 + index * 48;
-        bytes[start..start + 16].copy_from_slice(voter.node_id.as_bytes());
-        bytes[start + 16..start + 48].copy_from_slice(voter.principal.as_bytes());
+    // Voters fill 48-byte entries 1 through 3.
+    let entries = bytes.as_chunks_mut::<48>().0.iter_mut().skip(1);
+    for (entry, voter) in entries.zip(voters) {
+        entry.put::<0, 16>(*voter.node_id.as_bytes());
+        entry.put::<16, 32>(*voter.principal.as_bytes());
     }
     bytes
 }
 
-fn record_digest(bytes: &[u8]) -> Digest {
+fn record_digest(bytes: &[u8; CONFIGURATION_RECORD_BYTES]) -> Digest {
     let mut hasher = ozzy_journal::integrity::IntegrityHasher::new(HASH_CONTEXT);
-    hasher.update(&bytes[..DIGEST_START]);
+    hasher.update(bytes.slice::<0, DIGEST_START>());
     hasher.update(&[0; 32]);
-    hasher.update(&bytes[DIGEST_START + 32..]);
+    hasher.update(bytes.slice::<{ DIGEST_START + 32 }, 32>());
     hasher.finish()
 }
 

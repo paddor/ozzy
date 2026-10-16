@@ -10,8 +10,8 @@ use ozzy_proto::{NodeId, Opcode, directory, handshake};
 #[tokio::test]
 async fn progress_retries_network_send_after_registering_capacity_wait() {
     let (mut service, _lanes, _) = setup();
-    let client = remote(1, handshake::PRODUCER);
-    let (binding, _) = begin(&mut service, &client, NodeId::from_bytes([1; 16]));
+    let mut client = remote(1, handshake::PRODUCER);
+    let (binding, _) = begin(&mut service, &mut client, NodeId::from_bytes([1; 16]));
     service
         .try_reply(Class::Data, reply(binding, Opcode::Records))
         .unwrap();
@@ -40,8 +40,8 @@ async fn progress_retries_network_send_after_registering_capacity_wait() {
 #[tokio::test]
 async fn refused_destinations_keep_one_wait_and_retry_only_after_send_progress() {
     let (mut service, _lanes, _) = setup();
-    let client = remote(1, handshake::PRODUCER);
-    let (binding, _) = begin(&mut service, &client, NodeId::from_bytes([1; 16]));
+    let mut client = remote(1, handshake::PRODUCER);
+    let (binding, _) = begin(&mut service, &mut client, NodeId::from_bytes([1; 16]));
     while service.flush(|_| Ok(())).unwrap() {}
     service
         .try_reply(Class::Data, reply(binding, Opcode::Records))
@@ -85,8 +85,8 @@ async fn refused_destinations_keep_one_wait_and_retry_only_after_send_progress()
 #[tokio::test(start_paused = true)]
 async fn send_waits_that_complete_without_usable_space_back_off() {
     let (mut service, _lanes, _) = setup();
-    let client = remote(1, handshake::PRODUCER);
-    let (binding, _) = begin(&mut service, &client, NodeId::from_bytes([1; 16]));
+    let mut client = remote(1, handshake::PRODUCER);
+    let (binding, _) = begin(&mut service, &mut client, NodeId::from_bytes([1; 16]));
     while service.flush(|_| Ok(())).unwrap() {}
     service
         .try_reply(Class::Data, reply(binding, Opcode::Records))
@@ -135,8 +135,8 @@ async fn send_waits_that_complete_without_usable_space_back_off() {
 async fn completed_send_waits_are_observed_while_commands_keep_arriving() {
     let context = omq_tokio::Context::new();
     let (mut service, _lanes, _) = setup();
-    let client = remote(1, handshake::PRODUCER);
-    let (binding, _) = begin(&mut service, &client, NodeId::from_bytes([1; 16]));
+    let mut client = remote(1, handshake::PRODUCER);
+    let (binding, _) = begin(&mut service, &mut client, NodeId::from_bytes([1; 16]));
     while service.flush(|_| Ok(())).unwrap() {}
     service
         .try_reply(Class::Data, reply(binding, Opcode::Records))
@@ -182,8 +182,8 @@ async fn completed_send_waits_are_observed_while_commands_keep_arriving() {
 async fn reply_capacity_follows_transport_aliases_and_unobserved_completions() {
     let context = omq_tokio::Context::new();
     let (mut service, _lanes, _) = setup();
-    let client = remote(1, handshake::PRODUCER);
-    let (binding, _) = begin(&mut service, &client, NodeId::from_bytes([1; 16]));
+    let mut client = remote(1, handshake::PRODUCER);
+    let (binding, _) = begin(&mut service, &mut client, NodeId::from_bytes([1; 16]));
     let mut port = service.port(&context, 0, capacity()).unwrap();
     let packet = reply(binding, Opcode::Records);
     let pending = port
@@ -245,8 +245,8 @@ async fn reply_capacity_follows_transport_aliases_and_unobserved_completions() {
 async fn full_port_wakes_when_dispatcher_exits() {
     let context = omq_tokio::Context::new();
     let (mut service, _lanes, _) = setup();
-    let client = remote(1, handshake::PRODUCER);
-    let (binding, _) = begin(&mut service, &client, NodeId::from_bytes([1; 16]));
+    let mut client = remote(1, handshake::PRODUCER);
+    let (binding, _) = begin(&mut service, &mut client, NodeId::from_bytes([1; 16]));
     let mut port = service.port(&context, 0, capacity()).unwrap();
     let packet = reply(binding, Opcode::Records);
     let pending = port
@@ -271,8 +271,8 @@ async fn full_port_wakes_when_dispatcher_exits() {
 async fn queued_replies_transmit_before_more_shard_commands_are_admitted() {
     let context = omq_tokio::Context::new();
     let (mut service, _lanes, _) = setup();
-    let client = remote(1, handshake::PRODUCER);
-    let (binding, _) = begin(&mut service, &client, NodeId::from_bytes([1; 16]));
+    let mut client = remote(1, handshake::PRODUCER);
+    let (binding, _) = begin(&mut service, &mut client, NodeId::from_bytes([1; 16]));
     while service.flush(|_| Ok(())).unwrap() {}
     for _ in 0..2 {
         service
@@ -303,8 +303,8 @@ async fn queued_replies_transmit_before_more_shard_commands_are_admitted() {
 async fn full_peer_returns_original_message_and_cannot_deadlock_its_own_retry_credit() {
     let context = omq_tokio::Context::new();
     let (mut service, _lanes, _) = setup();
-    let client = remote(1, handshake::PRODUCER);
-    let (binding, _) = begin(&mut service, &client, NodeId::from_bytes([1; 16]));
+    let mut client = remote(1, handshake::PRODUCER);
+    let (binding, _) = begin(&mut service, &mut client, NodeId::from_bytes([1; 16]));
     for _ in 0..2 {
         service
             .try_reply(Class::Data, reply(binding, Opcode::Records))
@@ -486,8 +486,8 @@ async fn reader_publications_fence_sources_and_charge_transport_aliases() {
         service.poll_command().unwrap();
     }
     assert!(right.try_publish(publication(&route, local), 2048).is_err());
-    let client = remote(1, handshake::PRODUCER);
-    let (binding, _) = begin(&mut service, &client, NodeId::from_bytes([1; 16]));
+    let mut client = remote(1, handshake::PRODUCER);
+    let (binding, _) = begin(&mut service, &mut client, NodeId::from_bytes([1; 16]));
     let reply = right
         .try_reply(Class::Data, reply(binding, Opcode::Records), 2048, 0)
         .unwrap();

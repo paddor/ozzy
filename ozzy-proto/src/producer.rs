@@ -1,10 +1,12 @@
 //! Broker-owned producer sessions. An open reply follows canonical confirmation.
 
 use crate::{
-    ENVELOPE_BYTES, Envelope, EnvelopeLimits, GroupId, Opcode, OperationId, Packet,
-    PartitionIncarnation, ProducerId,
+    ENVELOPE_BYTES, Envelope, EnvelopeLimits, Opcode, OperationId, Packet, PartitionIncarnation,
+    ProducerId,
     append::{Authority, Policy},
-    data::{CodecError, Cursor},
+    data::CodecError,
+    layout::Reader,
+    wire::{decode_authority, encode_authority, reserve},
 };
 
 const GROUP_TAG: u8 = 1;
@@ -94,9 +96,9 @@ pub fn encode_open(
 /// Decode structure only. Session, leader, and canonical state remain actor checks.
 pub fn decode_open(packet: Packet<'_>, limits: EnvelopeLimits) -> Result<Open, CodecError> {
     check(packet, Opcode::OpenProducer, OPEN_BYTES, limits)?;
-    let mut cursor = Cursor(packet.metadata);
+    let mut cursor = Reader::new(packet.metadata);
     let (authority, partition, producer) = read_common(&mut cursor)?;
-    let mode = Mode::try_from(cursor.byte()?)?;
+    let mode = Mode::try_from(cursor.u8()?)?;
     let old = cursor.u64()?;
     let open = Open {
         authority,
@@ -137,7 +139,7 @@ pub fn encode_opened(
 /// Decode a structurally valid response before SDK identity/session checks.
 pub fn decode_opened(packet: Packet<'_>, limits: EnvelopeLimits) -> Result<Opened, CodecError> {
     check(packet, Opcode::ProducerOpened, OPENED_BYTES, limits)?;
-    let mut cursor = Cursor(packet.metadata);
+    let mut cursor = Reader::new(packet.metadata);
     let (authority, partition, producer) = read_common(&mut cursor)?;
     let opened = Opened {
         authority,
@@ -146,7 +148,7 @@ pub fn decode_opened(packet: Packet<'_>, limits: EnvelopeLimits) -> Result<Opene
         epoch: cursor.u64()?,
         next_sequence: cursor.u64()?,
         retry_floor: cursor.u64()?,
-        policy: Policy::try_from(cursor.byte()?)?,
+        policy: Policy::try_from(cursor.u8()?)?,
     };
     validate_opened(opened)?;
     Ok(opened)
@@ -179,14 +181,6 @@ fn check(
     Ok(())
 }
 
-fn reserve(metadata: &mut Vec<u8>, length: usize) -> Result<(), CodecError> {
-    if metadata.capacity() < length {
-        return Err(CodecError::Capacity);
-    }
-    metadata.clear();
-    Ok(())
-}
-
 fn common(
     metadata: &mut Vec<u8>,
     authority: Authority,
@@ -194,24 +188,18 @@ fn common(
     producer: ProducerId,
 ) {
     metadata.push(GROUP_TAG);
-    metadata.extend_from_slice(authority.group_id.as_bytes());
-    metadata.extend_from_slice(&authority.config_epoch.to_be_bytes());
-    metadata.extend_from_slice(&authority.view.to_be_bytes());
+    encode_authority(metadata, authority);
     metadata.extend_from_slice(partition.as_bytes());
     metadata.extend_from_slice(producer.as_bytes());
 }
 
 fn read_common(
-    cursor: &mut Cursor<'_>,
+    cursor: &mut Reader<'_>,
 ) -> Result<(Authority, PartitionIncarnation, ProducerId), CodecError> {
-    if cursor.byte()? != GROUP_TAG {
+    if cursor.u8()? != GROUP_TAG {
         return Err(CodecError::Profile);
     }
-    let authority = Authority {
-        group_id: GroupId::from_bytes(cursor.array()?),
-        config_epoch: cursor.u64()?,
-        view: cursor.u64()?,
-    };
+    let authority = decode_authority(cursor)?;
     let partition = PartitionIncarnation::from_bytes(cursor.array()?);
     let producer = ProducerId::from_bytes(cursor.array()?);
     validate_common(authority, partition, producer)?;

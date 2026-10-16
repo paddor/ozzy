@@ -1,14 +1,13 @@
-use super::{Decoder, Encoder, enforce_limit};
+use super::{Encoder, ReadFields, Reader, enforce_limit};
 use crate::operation::{
     GroupDelete, GroupMember, GroupPlan, GroupTarget, OperationCodecError, OperationLimits,
     OperationOutput,
 };
 use ozzy_proto::{
-    ConsumerGroupId, ConsumerMemberId, NodeId, Offset, OperationId, PartitionIncarnation,
-    group::Start,
+    ConsumerGroupId, ConsumerMemberId, NodeId, OperationId, PartitionIncarnation, group::Start,
 };
 
-const FORMAT: u8 = 2;
+const FORMAT: u8 = 1;
 const DELETE_FORMAT: u8 = 1;
 const MEMBER_BYTES: usize = 48;
 const MIN_TARGET_BYTES: usize = 26;
@@ -19,19 +18,11 @@ pub(super) fn encode(
     out: &mut Encoder<'_, impl OperationOutput>,
 ) -> Result<(), OperationCodecError> {
     super::primitives::validate_name("consumer group", value.name, limits.max_name_bytes)?;
-    enforce_limit(
-        "group members",
-        value.members.len(),
-        limits
-            .max_group_members
-            .min(crate::operation::GROUP_PLAN_MAX_MEMBERS),
-    )?;
+    enforce_limit("group members", value.members.len(), member_limit(limits))?;
     enforce_limit(
         "group source partitions",
         value.targets.len(),
-        limits
-            .max_group_partitions
-            .min(crate::operation::GROUP_PLAN_MAX_PARTITIONS),
+        partition_limit(limits),
     )?;
     out.u8(FORMAT)?;
     out.id(value.coordinator.as_bytes())?;
@@ -55,7 +46,7 @@ pub(super) fn encode(
 }
 
 pub(super) fn decode<'a, const MATERIALIZE: bool>(
-    input: &mut Decoder<'a>,
+    input: &mut Reader<'a>,
     limits: OperationLimits,
 ) -> Result<GroupPlan<'a>, OperationCodecError> {
     if input.u8()? != FORMAT {
@@ -67,50 +58,20 @@ pub(super) fn decode<'a, const MATERIALIZE: bool>(
     let expected_revision = input.u64()?;
     let revision = input.u64()?;
     let initial = decode_start(input)?;
-    let count = input.count(
+    let members = decode_list::<_, MATERIALIZE>(
+        input,
         "group members",
-        limits
-            .max_group_members
-            .min(crate::operation::GROUP_PLAN_MAX_MEMBERS),
+        member_limit(limits),
+        MEMBER_BYTES,
+        decode_member,
     )?;
-    // Validate the declared backing before any count-sized allocation.
-    let mut backing = *input;
-    backing.take(
-        count
-            .checked_mul(MEMBER_BYTES)
-            .ok_or(OperationCodecError::LengthOverflow)?,
-    )?;
-    let mut members = Vec::with_capacity(if MATERIALIZE { count } else { 0 });
-    for _ in 0..count {
-        let member = decode_member(input)?;
-        if MATERIALIZE {
-            members.push(member);
-        }
-    }
-    let count = input.count(
+    let targets = decode_list::<_, MATERIALIZE>(
+        input,
         "group source partitions",
-        limits
-            .max_group_partitions
-            .min(crate::operation::GROUP_PLAN_MAX_PARTITIONS),
+        partition_limit(limits),
+        MIN_TARGET_BYTES,
+        decode_target,
     )?;
-    let mut backing = *input;
-    backing.take(
-        count
-            .checked_mul(MIN_TARGET_BYTES)
-            .ok_or(OperationCodecError::LengthOverflow)?,
-    )?;
-    let mut targets = Vec::with_capacity(if MATERIALIZE { count } else { 0 });
-    for _ in 0..count {
-        let target = GroupTarget {
-            partition: PartitionIncarnation::from_bytes(input.id()?),
-            plan_revision: input.u64()?,
-            member: decode_optional_member(input)?,
-            prior_member: decode_optional_member(input)?,
-        };
-        if MATERIALIZE {
-            targets.push(target);
-        }
-    }
     Ok(GroupPlan {
         coordinator,
         group,
@@ -121,6 +82,53 @@ pub(super) fn decode<'a, const MATERIALIZE: bool>(
         members,
         targets,
         operation_id: OperationId::from_bytes(input.id()?),
+    })
+}
+
+fn member_limit(limits: OperationLimits) -> usize {
+    limits
+        .max_group_members
+        .min(crate::operation::GROUP_PLAN_MAX_MEMBERS)
+}
+
+fn partition_limit(limits: OperationLimits) -> usize {
+    limits
+        .max_group_partitions
+        .min(crate::operation::GROUP_PLAN_MAX_PARTITIONS)
+}
+
+/// Decode a counted list after checking that the input holds `min_bytes`
+/// per entry, so an untrusted count reserves nothing for missing entries.
+fn decode_list<'a, T, const MATERIALIZE: bool>(
+    input: &mut Reader<'a>,
+    kind: &'static str,
+    limit: usize,
+    min_bytes: usize,
+    mut decode: impl FnMut(&mut Reader<'a>) -> Result<T, OperationCodecError>,
+) -> Result<Vec<T>, OperationCodecError> {
+    let count = input.count(kind, limit)?;
+    let mut backing = *input;
+    backing.take(
+        count
+            .checked_mul(min_bytes)
+            .ok_or(OperationCodecError::LengthOverflow)?,
+    )?;
+    let mut entries = Vec::with_capacity(if MATERIALIZE { count } else { 0 });
+    for _ in 0..count {
+        let entry = decode(input)?;
+        if MATERIALIZE {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
+}
+
+fn decode_target(input: &mut Reader<'_>) -> Result<GroupTarget, OperationCodecError> {
+    Ok(GroupTarget {
+        partition: PartitionIncarnation::from_bytes(input.id()?),
+        plan_revision: input.u64()?,
+        member: decode_optional_member(input)?,
+        prior_member: decode_optional_member(input)?,
     })
 }
 
@@ -135,7 +143,7 @@ pub(super) fn encode_delete(
     out.id(value.operation_id.as_bytes())
 }
 
-pub(super) fn decode_delete(input: &mut Decoder<'_>) -> Result<GroupDelete, OperationCodecError> {
+pub(super) fn decode_delete(input: &mut Reader<'_>) -> Result<GroupDelete, OperationCodecError> {
     if input.u8()? != DELETE_FORMAT {
         return Err(OperationCodecError::InvalidGroupPlan);
     }
@@ -151,22 +159,14 @@ fn encode_start(
     start: Start,
     out: &mut Encoder<'_, impl OperationOutput>,
 ) -> Result<(), OperationCodecError> {
-    let (tag, value) = match start {
-        Start::Earliest => (0, 0),
-        Start::Latest => (1, 0),
-        Start::Offset(offset) => (2, offset.get()),
-    };
+    let (tag, value) = start.to_wire();
     out.u8(tag)?;
     out.u64(value)
 }
 
-fn decode_start(input: &mut Decoder<'_>) -> Result<Start, OperationCodecError> {
-    match (input.u8()?, input.u64()?) {
-        (0, 0) => Ok(Start::Earliest),
-        (1, 0) => Ok(Start::Latest),
-        (2, value) => Ok(Start::Offset(Offset::new(value))),
-        _ => Err(OperationCodecError::InvalidGroupPlan),
-    }
+fn decode_start(input: &mut Reader<'_>) -> Result<Start, OperationCodecError> {
+    let (tag, value) = (input.u8()?, input.u64()?);
+    Start::from_wire(tag, value).ok_or(OperationCodecError::InvalidGroupPlan)
 }
 
 fn encode_member(
@@ -178,7 +178,7 @@ fn encode_member(
     out.id(member.join.as_bytes())
 }
 
-fn decode_member(input: &mut Decoder<'_>) -> Result<GroupMember, OperationCodecError> {
+fn decode_member(input: &mut Reader<'_>) -> Result<GroupMember, OperationCodecError> {
     Ok(GroupMember {
         id: ConsumerMemberId::from_bytes(input.id()?),
         node: NodeId::from_bytes(input.id()?),
@@ -198,7 +198,7 @@ fn encode_optional_member(
 }
 
 fn decode_optional_member(
-    input: &mut Decoder<'_>,
+    input: &mut Reader<'_>,
 ) -> Result<Option<GroupMember>, OperationCodecError> {
     match input.u8()? {
         0 => Ok(None),

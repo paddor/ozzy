@@ -1750,6 +1750,7 @@ checksum = "419e0dc8046cb947daa77eb95ae174acfbddb7673b4151f56d1eed8e93fbfaca"
 dependencies = [
  "cfg-if",
  "generator",
+ "pin-utils",
  "scoped-tls",
  "tracing",
  "tracing-subscriber",
@@ -1997,6 +1998,7 @@ dependencies = [
  "ozzy-replication",
  "ozzy-runtime",
  "ozzy-sim",
+ "pin-project-lite",
  "rustix",
  "tempfile",
  "thiserror",
@@ -2037,6 +2039,8 @@ dependencies = [
  "bytes",
  "fanring",
  "futures",
+ "loom",
+ "pin-project-lite",
  "serde",
  "tokio",
 ]
@@ -2077,6 +2081,7 @@ dependencies = [
  "bytes",
  "lz4rip",
  "ozzy-proto",
+ "ozzy-test-alloc",
  "smallvec",
  "thiserror",
  "xxhash-rust",
@@ -2096,6 +2101,7 @@ dependencies = [
  "ozzy-io-pool",
  "ozzy-journal",
  "ozzy-proto",
+ "ozzy-telemetry",
  "rustix",
  "smallvec",
  "tempfile",
@@ -2122,6 +2128,7 @@ dependencies = [
  "ozzy-core",
  "ozzy-journal",
  "ozzy-proto",
+ "ozzy-test-alloc",
  "thiserror",
 ]
 
@@ -2188,6 +2195,10 @@ dependencies = [
  "serde_json",
  "tokio",
 ]
+
+[[package]]
+name = "ozzy-test-alloc"
+version = "0.1.1"
 
 [[package]]
 name = "papaya"

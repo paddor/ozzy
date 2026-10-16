@@ -21,6 +21,9 @@ ozzy-journal.workspace = true
 ozzy-proto.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+ozzy-test-alloc.workspace = true
+
 [lints]
 workspace = true
 

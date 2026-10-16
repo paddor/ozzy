@@ -142,9 +142,7 @@ fn pinned_deployment(
 ) -> Vec<(CheckedConfig, BrokerIdentity)> {
     deployment_with_resources(
         root,
-        DeploymentMode::Single,
-        Confirmation::LocalDurable,
-        PARTITIONS as u32,
+        ozzy_sim::broker::Shape::for_policy(Confirmation::LocalDurable, PARTITIONS as u32),
         resources,
         |config| {
             let broker = config.brokers.get_mut("broker-0").unwrap();

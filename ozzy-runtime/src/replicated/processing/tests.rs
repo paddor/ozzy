@@ -48,8 +48,7 @@ impl Wake for WakeFlag {
 fn processing_intent_racing_confirmation_or_close_wakes_a_registered_owner() {
     for close in [false, true] {
         for _ in 0..128 {
-            let mut publisher = progress::Publisher::new(identity(), 0, None);
-            let mut submission = publisher.take_submission().unwrap();
+            let (mut publisher, mut submission) = progress::Publisher::new(identity(), 0, None);
             submission.publish(1).unwrap();
             let flag = Arc::new(WakeFlag::default());
             let waker = Waker::from(flag.clone());
@@ -134,9 +133,7 @@ async fn submitted_processing_closes_the_whole_ready_hole_without_another_caller
 
 #[tokio::test]
 async fn processing_intent_is_unique_monotonic_and_closure_preserves_its_first_reason() {
-    let mut publisher = progress::Publisher::new(identity(), 0, None);
-    let mut submission = publisher.take_submission().unwrap();
-    assert!(publisher.take_submission().is_none());
+    let (mut publisher, mut submission) = progress::Publisher::new(identity(), 0, None);
     assert_eq!(submission.publish(u64::MAX), Ok(()));
     assert_eq!(
         submission.publish(u64::MAX - 1),

@@ -1,6 +1,6 @@
 use super::{
-    CHECKPOINT_CHUNK_HASH_CONTEXT, CHECKPOINT_STATE_HASH_CONTEXT, Checkpoint, CheckpointError,
-    CheckpointLimits, Hasher, chunk_name, enforce_u64, validate_limits,
+    CHECKPOINT_CHUNK_HASH_CONTEXT, CHECKPOINT_STATE_HASH_CONTEXT, Checkpoint, CheckpointChunk,
+    CheckpointError, CheckpointLimits, Hasher, chunk_name, enforce_u64, validate_limits,
 };
 use ozzy_io::{Handle, OpenMode, Operation};
 use std::{io, ops::Deref};
@@ -68,63 +68,86 @@ impl<C: Deref<Target = Checkpoint>> Reader<C> {
 
     async fn next_inner(&mut self, maximum: usize) -> Result<Vec<u8>, CheckpointError> {
         let source = &*self.checkpoint;
-        let chunk = source.manifest.chunks[self.ordinal];
+        let chunk = *source
+            .manifest
+            .chunks
+            .get(self.ordinal)
+            .ok_or(CheckpointError::LengthMismatch)?;
         enforce_u64(
             "checkpoint chunk bytes",
             chunk.bytes,
             self.limits.max_chunk_bytes as u64,
         )?;
-        if self.file.is_none() {
-            let file = source
-                .access
-                .open(
-                    source.root.join(chunk_name(chunk.ordinal)),
-                    OpenMode::Read,
-                    false,
-                    false,
-                )
-                .await?;
-            if source.access.length(&file).await? != chunk.bytes {
-                return Err(CheckpointError::LengthMismatch);
-            }
-            self.file = Some(file);
-        }
+        // The open chunk lives here during a read and in `self.file` between
+        // reads; a failed read drops it with the reader.
+        let file = match self.file.take() {
+            Some(file) => file,
+            None => open_chunk(source, chunk).await?,
+        };
         let count = maximum
             .min(source.chunk_bytes)
             .min((chunk.bytes - self.offset).min(usize::MAX as u64) as usize);
         let bytes = source
             .access
-            .read_range(
-                self.file.as_ref().expect("opened chunk"),
-                self.offset,
-                count,
-                source.chunk_bytes,
-            )
+            .read_range(&file, self.offset, count, source.chunk_bytes)
             .await?;
         self.chunk_hash.update(&bytes);
         self.state_hash.update(&bytes);
         self.offset += bytes.len() as u64;
-        if self.offset == chunk.bytes {
-            let file = self.file.take().expect("read chunk");
-            let length = source.access.length(&file).await;
-            let closed = source.access.done(Operation::Close { handle: file }).await;
-            if length? != chunk.bytes {
-                return Err(CheckpointError::LengthMismatch);
-            }
-            closed?;
-            if self.chunk_hash.finish() != chunk.digest {
-                return Err(CheckpointError::DigestMismatch("checkpoint chunk"));
-            }
-            self.ordinal += 1;
-            self.offset = 0;
-            self.chunk_hash = Hasher::new(CHECKPOINT_CHUNK_HASH_CONTEXT);
-            if self.ordinal == source.manifest.chunks.len() {
-                if self.state_hash.finish() != source.manifest.state_digest {
-                    return Err(CheckpointError::DigestMismatch("checkpoint state"));
-                }
-                self.verified = true;
-            }
+        if self.offset != chunk.bytes {
+            self.file = Some(file);
+            return Ok(bytes);
         }
+        self.finish_chunk(file, chunk).await?;
         Ok(bytes)
     }
+
+    /// Close a fully read chunk and check its length and digest; after the
+    /// last chunk, check the state digest too.
+    async fn finish_chunk(
+        &mut self,
+        file: Handle,
+        chunk: CheckpointChunk,
+    ) -> Result<(), CheckpointError> {
+        let source = &*self.checkpoint;
+        let length = source.access.length(&file).await;
+        let closed = source.access.done(Operation::Close { handle: file }).await;
+        if length? != chunk.bytes {
+            return Err(CheckpointError::LengthMismatch);
+        }
+        closed?;
+        if self.chunk_hash.finish() != chunk.digest {
+            return Err(CheckpointError::DigestMismatch("checkpoint chunk"));
+        }
+        self.ordinal += 1;
+        self.offset = 0;
+        self.chunk_hash = Hasher::new(CHECKPOINT_CHUNK_HASH_CONTEXT);
+        if self.ordinal == source.manifest.chunks.len() {
+            if self.state_hash.finish() != source.manifest.state_digest {
+                return Err(CheckpointError::DigestMismatch("checkpoint state"));
+            }
+            self.verified = true;
+        }
+        Ok(())
+    }
+}
+
+/// Open one chunk file and check its length against the manifest.
+async fn open_chunk(
+    source: &Checkpoint,
+    chunk: CheckpointChunk,
+) -> Result<Handle, CheckpointError> {
+    let file = source
+        .access
+        .open(
+            source.root.join(chunk_name(chunk.ordinal)),
+            OpenMode::Read,
+            false,
+            false,
+        )
+        .await?;
+    if source.access.length(&file).await? != chunk.bytes {
+        return Err(CheckpointError::LengthMismatch);
+    }
+    Ok(file)
 }

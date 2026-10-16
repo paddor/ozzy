@@ -1,14 +1,24 @@
 use super::*;
 use crate::codec::{
-    CanonicalOperation, ChainPosition, Digest, OperationKind, SegmentHeader, encode_group,
-    encode_segment_header, scan_segment, scan_segment_prefix,
+    ChainPosition, Digest, SegmentHeader, encode_group, encode_segment_header, scan_segment,
 };
+use ozzy_journal::operation::{CanonicalOperation, OperationKind};
 use ozzy_proto::GroupId;
 use std::{
     future::Future,
     pin::pin,
     task::{Context, Poll, Waker},
 };
+
+/// Synchronous oracle for the cooperative prefix scan.
+fn scan_segment_prefix(
+    input: &[u8],
+    first_group_number: u64,
+    initial_chain: ChainPosition,
+    limits: DecodeLimits,
+) -> Result<crate::SegmentScan<'_>, CodecError> {
+    super::scan(input, first_group_number, initial_chain, limits, true)
+}
 
 fn image(groups: u64, zero_bytes: usize) -> Vec<u8> {
     let header = SegmentHeader::new(
@@ -31,7 +41,12 @@ fn image(groups: u64, zero_bytes: usize) -> Vec<u8> {
             kind: OperationKind::Barrier,
             body: &u128::from(number).to_be_bytes(),
         };
-        let group = encode_group(&header, number, image.len() as u64, chain, &[operation]).unwrap();
+        let group = encode_group(
+            &header,
+            crate::GroupStart::new(number, image.len() as u64, chain),
+            &[operation],
+        )
+        .unwrap();
         chain = group.next_chain();
         image.extend_from_slice(group.as_bytes());
     }
@@ -171,9 +186,7 @@ fn cooperative_scan_charges_decoded_work_for_small_compressed_groups() {
         };
         let group = crate::codec::encode_group_with_body_encoding(
             &header,
-            number,
-            image.len() as u64,
-            chain,
+            crate::GroupStart::new(number, image.len() as u64, chain),
             &[operation],
             crate::BodyEncoding::Lz4 {
                 min_savings_bytes: 0,

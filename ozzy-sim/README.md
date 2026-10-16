@@ -1,25 +1,30 @@
 # ozzy-sim
 
-Deterministic workload and fault tests around production cores. They control
-message order, virtual time, physical storage effects, and completion
-observation. An independent history checks submitted, confirmed, and
-delivered records.
+Deterministic workload and fault tests around Ozzy production code, plus the
+`ozzy_sim` full-product runner. An unpublished test crate for contributors.
 
-The fast suites exercise canonical state, three-broker replication, leader
-change, recovery, and persisted history. Actor suites use production runtime
-actors. These tests do not replace TCP/process-crash or real-disk checks.
-The `broker` feature provides the shared real-broker OMQ inproc harness and SDK
-record oracle. Broker integration tests and full product simulation use the same
-production SDKs, broker owners, and controlled `ozzy-io` backend. Execution and
-result delivery are separate events, with file/directory persistence modeled
-without journal filesystem I/O. The smaller core suites control protocol
-schedules; threaded OMQ runs do not claim exact deterministic execution from a
-seed alone. See [test layers](../DEVELOPMENT.md#test-layers).
+## What it covers
 
-Run `scripts/test.sh simulation` for both layers, or `scripts/test.sh inproc`
-for the full broker and SDK gates.
+- Core suites in `tests/` control message order, virtual time, storage
+  effects, and completion observation. They cover canonical state,
+  three-broker replication, leader change, recovery, and persisted history.
+- The `broker` feature is the shared real-broker harness: production SDKs and
+  broker owners over OMQ inproc and the controlled `ozzy-io` memory backend.
+  `ozzy-broker` integration tests and `ozzy_sim` both use it.
+- An independent record oracle checks every submitted, confirmed, and
+  delivered record.
+- Limits: it does not replace TCP/process-crash or real-disk checks. A seed
+  alone does not reproduce a threaded OMQ run. See
+  [test layers](../DEVELOPMENT.md#test-layers).
 
-Run sustained workloads with the same production harness:
+## Run the tests
+
+```sh
+scripts/test.sh simulation   # core suites and the full-product gate
+scripts/test.sh inproc       # inproc broker and SDK gates
+```
+
+## Run the full-product simulator
 
 ```sh
 scripts/ozzy_cargo run -p ozzy-sim --features broker --bin ozzy_sim -- \
@@ -28,60 +33,86 @@ scripts/ozzy_cargo run -p ozzy-sim --features broker --bin ozzy_sim -- \
   --artifacts tmp/ozzy-sim-rp-42
 ```
 
-Modes are `durable`, `disk-quorum`, and `replicated-persisting`. `--waves` limits
-CI runs. `--scenarios N` runs N fresh clusters with successive seeds and separate
-artifact subdirectories; the default sustains one cluster. The seed chooses sparse, burst, hot-partition and multipart traffic,
-concurrent independent producers sharing partitions, saved-identity resume,
-takeover while the old producer is still alive, consumer checkpoint reopen, fresh SDK transport
-identities, independently delayed completions, broker restarts and short writes.
-Paused consumers use separate SDK owners, repair missed PUB traffic through PEER,
-consume slowly and retain returned payload aliases across close. Quorum-loss
-actions stop two replicated brokers, require admitted records to remain
-unconfirmed, drop confirmation futures and restore their exact clean images.
-Retention-lag actions roll bounded 64-record cohorts while the foreground reader
-verifies them, then reopen an expired checkpoint and require an explicit gap.
-Process-crash actions cut the live memory device without draining physical work
-and retain dirty bytes. Power-loss actions restore only modeled durable effects.
-Both reopen the surviving image through production recovery selection; a held
-completion regression verifies retries keep their original record identities.
-Single durable delays writes without claiming quorum failover. Retention rolls
-1 MiB segments and bounds selected history to 2 MiB per partition.
+Pass `--help` to `ozzy_sim` for every flag and its default.
 
-`--duration` bounds wall time for generating work. `--simulated-duration` also
-bounds protocol time; `--clock-tick-ms` and `--clock-step-ms` control its pace
-(defaults: 2 ms real time per 10 ms simulated time). SDK retries, broker deadlines
-and append timestamps share that clock, including across broker restart. Storage
-holds and threaded transport delivery remain independent. The progress deadline
-resets only after independent record verification; disk activity alone cannot
-extend it. It covers admission, recovery and verification for the whole fault
-boundary. Finishing a boundary and shutdown can extend the generation limit.
+| Flag | Meaning |
+| --- | --- |
+| `--mode` | `durable`, `disk-quorum`, or `replicated-persisting` |
+| `--seed` | Workload and fault seed |
+| `--scenarios N` | Run N fresh clusters with successive seeds, each in `scenario-<i>-seed-<seed>/` |
+| `--artifacts` | Output directory (required) |
+| `--duration` | Wall-clock seconds of work generation |
+| `--waves` | Maximum waves; bounds CI runs and replays |
+| `--interval-ms` | Pause between bounded waves |
+| `--progress-timeout` | Seconds without independently verified records before the run fails |
+| `--simulated-duration` | Use a simulated clock and also stop at this simulated time, in seconds; without it the clock is elapsed time |
+| `--clock-tick-ms`, `--clock-step-ms` | With a simulated clock: real milliseconds between ticks, simulated milliseconds per tick |
+| `--partitions` | Partitions, 1 to 8 |
+| `--resident-mib`, `--physical-jobs`, `--physical-mib` | Shard and device admission limits |
+| `--retained-mib`, `--retained-age` | Retention size (1 to 8 MiB) and age in seconds |
+| `--actions` | Comma-separated fault mix; a repeated action runs more often |
+| `--replay` | Replay a recorded `schedule.jsonl` |
 
-`--interval-ms` controls load between bounded waves. `--actions` accepts a
-comma-separated fault mix, for example `traffic,shared-producers,consumer,reconnect`;
-repeating an action increases its frequency. Workload shape is drawn separately.
-`--partitions` accepts 1 through 8. `--resident-mib`, `--physical-jobs` and
-`--physical-mib` set production shard and device admission limits. Retention uses
-`--retained-mib` (1 through 8) and `--retained-age` in seconds. The memory backend additionally
-bounds each file to 16 MiB, media to 256 MiB per device, nodes to 4096 and directory
-entries to 16384. SDK limits remain 128 admitted records and eight subscriptions;
-each wave retains at most 32 records per partition or 64 in one hot partition.
+Rules:
 
-Each wave verifies confirmation identity, partition-global offsets, payloads and
-consumer checkpoints. Verified payload evidence is discarded between waves.
-Storage keeps 4096 recent physical events per device and bounded media images;
-the terminal report has `complete: true` after clean shutdown and counts completed
-churn, recovery faults and actual PUB/PEER delivery. Progress is printed every minute.
-The selected controls are saved in `config.json`. The entire injected fault
-schedule, including clock observations, streams to `schedule.jsonl`. The first failure
-saves outstanding record evidence, SDK routes and batching counters, configuration, recent physical order and
-dirty/durable memory images before stopping. Orderly stopped owners retain their
-final images until restoration, including when a fault boundary is interrupted.
+- Disk activity alone never extends the progress deadline.
+- SDK retries, broker deadlines, and append timestamps share one clock, also
+  across broker restarts. Storage holds and threaded transport
+  delivery do not.
+- Single durable delays writes; it has no quorum failover.
 
-Replay a fault prefix with `--replay /path/to/schedule.jsonl --waves N` and a new
-artifact directory. This controls the recorded workload/fault boundaries, not
-the exact threaded OMQ or kernel schedule. With manual time, replay waits for a
-recorded boundary's observation when execution reaches it early; it cannot rewind
-time if threaded execution reaches it late. The default runner uses elapsed time.
-The shared harness also accepts `ServingContext::simulated` with a manual
-`SdkClock` and a timestamp epoch, independently of physical execution and
-completion delivery. Inproc runs still require TCP/process-crash qualification.
+### Actions
+
+The default mix is every action except `fail-write`.
+
+| Action | Effect |
+| --- | --- |
+| `traffic` | Live traffic and reader verification |
+| `shared-producers` | A fresh producer shares the live producer's partitions, then leaves |
+| `slow-consumer` | Pause a consumer through a burst, repair gaps, hold returned payloads |
+| `retention-lag` | A paused checkpoint falls behind retention and reopens with an explicit gap |
+| `quorum-loss` | Stop two voters; admitted records stay unconfirmed; restore exact clean images |
+| `consumer` | Close and reopen a reader at its verified checkpoint |
+| `resume` | Resume a closed producer with its saved identity |
+| `takeover` | Fence the live old producer and start a new epoch |
+| `reconnect` | Replace OMQ links and resume with a fresh SDK identity |
+| `completions` | Run physical work while holding its completions |
+| `restart` | Restart a broker with its retained memory image |
+| `process-crash` | Cut a live memory device and keep dirty cached bytes |
+| `power-loss` | Cut a live memory device and keep only modeled durable effects |
+| `torn-write` | Inject a short write |
+| `fail-write` | Fail a physical write and keep the fail-closed broker evidence |
+
+### Artifacts
+
+| File | Content |
+| --- | --- |
+| `config.json` | Selected controls |
+| `schedule.jsonl` | Full injected fault schedule, with clock observations |
+| `report.json` | Terminal report; `complete: true` after a clean shutdown |
+| `failure.json` | First-failure evidence: recent events, outstanding records, configuration, physical order |
+| `image-<broker>.json` | Dirty and durable memory images at the first failure |
+
+Progress prints every minute.
+
+### Replay
+
+```sh
+scripts/ozzy_cargo run -p ozzy-sim --features broker --bin ozzy_sim -- \
+  --replay tmp/ozzy-sim-rp-42/schedule.jsonl --waves 100 \
+  --artifacts tmp/ozzy-sim-rp-42-replay
+```
+
+- Use a new artifact directory.
+- Replay controls the recorded workload and fault boundaries, not the threaded
+  OMQ or kernel schedule.
+- With `--simulated-duration`, replay waits for a boundary reached early. It
+  cannot rewind a boundary reached late.
+- An inproc pass still needs TCP/process-crash qualification.
+
+## In the code
+
+- `src/soak.rs`: sustained runner, actions, report.
+- `src/broker.rs`, `src/broker/`: shared real-broker harness.
+- `src/client.rs`: SDK client and record oracle.
+- `src/bin/ozzy_sim.rs`: command line.

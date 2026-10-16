@@ -2,9 +2,11 @@
 
 use super::{AppendBuffer, JournalError, OwnedJournal};
 use crate::replica_journal::AppendAdmissionError;
-use ozzy_core::state::{CanonicalImagesError, IdentityIndex, IdentityKey, StateError};
+use ozzy_core::state::{
+    CanonicalImagesError, CanonicalProducer, IdentityIndex, IdentityKey, StateError,
+};
 use ozzy_journal::operation::{OpenProducer, OperationBody, decode_operation_body};
-use ozzy_journal_segment::AsyncIdentityResolveError;
+use ozzy_journal_segment::IdentityResolveError;
 use ozzy_proto::{
     append::Authority,
     producer::{Mode, Opened},
@@ -31,7 +33,9 @@ impl OwnedJournal {
             return Err(JournalError::AppendMismatch);
         }
         self.validate_image(ticket)?;
-        let operation = buffer.operations().next().expect("one open");
+        let Some(operation) = buffer.operations().next() else {
+            return Err(JournalError::AppendMismatch);
+        };
         let OperationBody::OpenProducer(expected) =
             decode_operation_body(operation.kind, operation.body, self.limits.operations)?
         else {
@@ -43,17 +47,11 @@ impl OwnedJournal {
             .partition(request.partition)
             .ok_or(AppendAdmissionError::UnknownPartition)?
             .producer(request.producer);
-        let current = current_state.map(|state| {
-            (
-                state.producer_epoch.get(),
-                state.next_producer_sequence.get(),
-                state.producer_result_floor.get(),
-            )
-        });
+        let current = current_state.map(coordinates);
         // The latest transition belongs to canonical state, not a historical
         // index. Retiring its segment must not turn an exact fence retry into
         // another transition or force a read of deleted operation bytes.
-        if let Some(state) = current_state
+        let (coordinates, resolved) = if let Some(state) = current_state
             && let Some(transition) = state.transition()
             && transition.operation_id == request.operation
         {
@@ -62,29 +60,15 @@ impl OwnedJournal {
             {
                 return Err(JournalError::AppendMismatch);
             }
-            buffer
-                .producer_session
-                .as_mut()
-                .expect("open request")
-                .opened = Some(opened(
-                ticket,
-                request,
-                (
-                    state.producer_epoch.get(),
-                    state.next_producer_sequence.get(),
-                    state.producer_result_floor.get(),
-                ),
-                self.configuration.append_policy(),
-            ));
-            return Ok(Some(ticket.accepted()));
-        }
-        let (coordinates, resolved) = self
-            .resolve_producer_open(request, expected, current)
-            .await?;
+            (coordinates(state), true)
+        } else {
+            self.resolve_producer_open(request, expected, current)
+                .await?
+        };
         buffer
             .producer_session
             .as_mut()
-            .expect("open request")
+            .ok_or(JournalError::AppendMismatch)?
             .opened = Some(opened(
             ticket,
             request,
@@ -107,8 +91,8 @@ impl OwnedJournal {
                 .resolve(&[key])
                 .await
                 .map_err(|error| match error {
-                    AsyncIdentityResolveError::Lookup(error) => JournalError::Index(error),
-                    AsyncIdentityResolveError::Identity(error) => identity_error(error),
+                    IdentityResolveError::Lookup(error) => JournalError::Index(error),
+                    IdentityResolveError::Identity(error) => identity_error(error),
                 })?;
             identities.lookup(key).map_err(identity_error)?
         };
@@ -173,6 +157,15 @@ impl OwnedJournal {
         };
         Ok(open)
     }
+}
+
+/// Session epoch, next sequence and retry floor.
+fn coordinates(state: &CanonicalProducer) -> (u64, u64, u64) {
+    (
+        state.producer_epoch.get(),
+        state.next_producer_sequence.get(),
+        state.producer_result_floor.get(),
+    )
 }
 
 fn opened(

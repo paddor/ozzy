@@ -249,24 +249,7 @@ impl CanonicalState {
         if value.plan_revision <= current.plan_revision {
             return Err(StateError::AssignmentPlanNotAdvanced);
         }
-        let progress = progress_key(
-            ProgressOwner::ConsumerGroup(value.consumer_group_id),
-            value.partition,
-        );
-        if let Some(prior) = self.progress.get(&progress) {
-            if value.resume_cursor != *prior {
-                return Err(StateError::AssignmentProgressMismatch);
-            }
-        } else {
-            if value.resume_cursor < partition.retained_from
-                || value.resume_cursor > partition.next_offset
-            {
-                return Err(StateError::InvalidAssignmentCursor);
-            }
-            if self.progress.len() >= self.limits.max_progress {
-                return Err(StateError::LimitExceeded("progress owners"));
-            }
-        }
+        self.check_resume_cursor(&value, partition)?;
         if !self.assignments.contains_key(&key)
             && self.assignments.len() >= self.limits.max_assignments
         {
@@ -285,6 +268,34 @@ impl CanonicalState {
             },
             claims,
         ))
+    }
+
+    /// A group's resume cursor must equal its committed progress, or start a
+    /// new progress owner inside the partition's retained records.
+    fn check_resume_cursor(
+        &self,
+        value: &Assign,
+        partition: &CanonicalPartition,
+    ) -> Result<(), StateError> {
+        let progress = progress_key(
+            ProgressOwner::ConsumerGroup(value.consumer_group_id),
+            value.partition,
+        );
+        if let Some(prior) = self.progress.get(&progress) {
+            if value.resume_cursor != *prior {
+                return Err(StateError::AssignmentProgressMismatch);
+            }
+        } else {
+            if value.resume_cursor < partition.retained_from
+                || value.resume_cursor > partition.next_offset
+            {
+                return Err(StateError::InvalidAssignmentCursor);
+            }
+            if self.progress.len() >= self.limits.max_progress {
+                return Err(StateError::LimitExceeded("progress owners"));
+            }
+        }
+        Ok(())
     }
 
     fn prepare_trim(

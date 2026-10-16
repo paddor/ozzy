@@ -1,6 +1,10 @@
 use super::*;
+use crate::codec::body::decode_lz4_body;
 use crate::codec::*;
-use ozzy_journal::operation::logical_operation_digest;
+use ozzy_journal::operation::{
+    CanonicalOperation, OperationKind, canonical_body_digest, logical_operation_digest,
+};
+use ozzy_proto::GroupId;
 
 fn fixture() -> (SegmentHeader, EncodedGroup, Vec<Vec<u8>>) {
     let header = SegmentHeader::new(GroupId::new(), 1, None, Digest::ZERO, 1024 * 1024).unwrap();
@@ -43,9 +47,7 @@ fn fixture() -> (SegmentHeader, EncodedGroup, Vec<Vec<u8>>) {
     assert!(layouts.windows(2).all(|pair| pair[0] == pair[1]));
     let finalized = finalize_group_bodies(
         &header,
-        1,
-        SEGMENT_HEADER_BYTES as u64,
-        ChainPosition::GENESIS,
+        crate::GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS),
         &operations,
         &operations
             .iter()
@@ -73,9 +75,7 @@ fn one_block_roundtrips_independent_operations_and_indexed_selections() {
     );
     let decoded = decode_group(
         &header,
-        1,
-        encoded.start_offset(),
-        ChainPosition::GENESIS,
+        crate::GroupStart::new(1, encoded.start_offset(), ChainPosition::GENESIS),
         encoded.as_bytes(),
         limits,
     )
@@ -115,9 +115,7 @@ fn torn_headers_bodies_and_seals_fail_and_intact_shared_bodies_can_be_salvaged()
     let decode = |bytes: &[u8]| {
         decode_group(
             &header,
-            1,
-            encoded.start_offset(),
-            ChainPosition::GENESIS,
+            crate::GroupStart::new(1, encoded.start_offset(), ChainPosition::GENESIS),
             bytes,
             limits,
         )
@@ -173,8 +171,12 @@ fn declared_lengths_and_per_operation_limits_are_checked_before_decompression() 
     let limits = DecodeLimits::default();
     for (field, value) in [(8, u64::MAX), (16, u64::MAX), (24, u64::MAX), (24, 8191)] {
         let mut bytes = encoded.as_bytes().to_vec();
-        put_u64(&mut bytes, field, value);
-        let digest = hash_with_zeroed_range(HASH_CONTEXT, &bytes[..HEADER_BYTES], HASH);
+        ozzy_proto::layout::patch(&mut bytes, field, value.to_be_bytes()).unwrap();
+        let digest = ozzy_journal::integrity::hash_without_digest(
+            HASH_CONTEXT,
+            &bytes[..HEADER_BYTES],
+            HASH.start,
+        );
         bytes[HASH].copy_from_slice(digest.as_bytes());
         assert!(parse(&bytes, limits).is_err());
     }

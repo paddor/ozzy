@@ -2,7 +2,16 @@
 //!
 //! Only normal dependencies count. Dev and build dependencies may cross layers
 //! for tests and benchmarks. `ozzy-bench` may depend on any crate; no crate may
-//! depend on it or on `ozzy-sim` outside dev dependencies.
+//! depend on it, `ozzy-sim`, or `ozzy-test-alloc` outside dev dependencies.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
 
 use std::collections::BTreeSet;
 use std::process::Command;
@@ -38,6 +47,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
         ],
     ),
     ("ozzy-io", &["fanring", "tokio"]),
+    ("ozzy-test-alloc", &[]),
     ("ozzy-telemetry", &["omq-tokio"]),
     (
         "ozzy-io-pool",
@@ -65,6 +75,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
             "ozzy-io-aio",
             "ozzy-journal",
             "ozzy-proto",
+            "ozzy-telemetry",
         ],
     ),
     (

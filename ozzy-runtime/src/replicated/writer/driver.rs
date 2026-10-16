@@ -1,3 +1,5 @@
+use crate::signal::DataSignal;
+use crate::transport::Frames;
 use bytes::Bytes;
 use omq_tokio::message::Payload;
 use omq_tokio::{Message, TrySendError};
@@ -6,13 +8,13 @@ use ozzy_proto::append::{Authority, stream};
 use ozzy_proto::nack::{self, AuthorityHint, RetryClass};
 use ozzy_proto::{Envelope, NodeId, Opcode, decode_packet};
 
-use super::batch::{Batch, PayloadView};
+use super::batch::{Batch, PayloadView, RequestView};
 use super::{Error, RetryPolicy, Shared};
 
 mod shared;
 mod window;
-use crate::replicated::{SdkClock as Clock, broker_links::append};
-pub(super) use shared::run_shared;
+use crate::replicated::broker_links::{OwnerClock as Clock, append};
+pub(super) use shared::{Target, run_shared};
 use window::{Sent, Window};
 
 const TURN_RECORDS: usize = 1024;
@@ -40,7 +42,7 @@ struct SessionBinding<'a> {
     connection: &'a mut append::Connection,
     remote: NodeId,
     local: NodeId,
-    authority: Option<Authority>,
+    authority: Authority,
     retry: RetryPolicy,
 }
 
@@ -96,16 +98,7 @@ impl Session {
                 return Ok(());
             }
             if self.retry_at.is_some_and(|at| self.clock.now() >= at) && self.replay_ready() {
-                // Preserve the physical session and drain earlier confirmations
-                // before replaying the remaining prefix. Old request IDs cannot
-                // confirm the new window. Transport aliases retain their local backing charge.
-                binding.connection.forget_requests();
-                self.window =
-                    Window::new(shared.progress.confirmed(), shared.config.inflight_appends);
-                self.pending = None;
-                self.retry_at = None;
-                self.refused = None;
-                self.deadline = None;
+                self.restart(shared, &mut binding);
             }
             if self
                 .deadline
@@ -118,68 +111,82 @@ impl Session {
             // Admitted records only matter while a transmission can be
             // prepared. Leaving the intake flag set otherwise means a full
             // window costs each push one atomic swap instead of a task wake.
-            let wants_records = self.can_prepare();
-            let mut turn = || {
-                match binding
-                    .connection
-                    .try_recv_many_into(TURN_RECORDS, &mut self.incoming)
-                {
-                    Ok(_) | Err(omq_tokio::Error::WouldBlock) => {}
-                    Err(_) => return Err(Failure::Retry(None)),
-                }
-                let incoming = std::mem::take(&mut self.incoming);
-                let receive_full = incoming.len() == TURN_RECORDS;
-                for message in &incoming {
-                    self.receive(shared, &binding, message)?;
-                }
-                self.incoming = incoming;
-                self.incoming.clear();
-                let filled = self.send_ready(shared, &mut binding)?;
-                Ok((filled, receive_full))
-            };
-            let (filled, receive_full) = if wants_records {
-                work.drain(turn)?
+            let (filled, receive_full) = if self.can_prepare() {
+                work.drain(|| self.turn(shared, &mut binding))?
             } else {
-                turn()?
+                self.turn(shared, &mut binding)?
             };
             if filled || receive_full {
                 // Bound executor work even when both sockets and application stay ready.
                 tokio::task::yield_now().await;
                 continue;
             }
-            // Confirmations in this turn may have emptied the window. An intake
-            // flag left set by a skipped drain then wakes the next turn at once.
-            let wants_records = self.can_prepare();
-            let deadline = self.deadline;
-            let retry_at = self.retry_at.filter(|_| self.replay_ready());
-            tokio::select! {
-                result = binding.connection.recv_ready() => {
-                    result.map_err(|_| Failure::Retry(None))?;
-                }
-                () = work.ready(), if wants_records => {}
-                () = async {
-                    match &self.pending {
-                        Some(pending) => binding.connection.wait_send_progress_for(&pending.message).await,
-                        None => std::future::pending().await,
-                    }
-                } => {}
-                () = async {
-                    match deadline {
-                        Some(deadline) => self.clock.until(deadline).await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    crate::profiling::event(crate::profiling::Event::SdkResponseTimeout);
-                    return Err(Failure::Retry(None));
-                },
-                () = async {
-                    match retry_at {
-                        Some(at) => self.clock.until(at).await,
-                        None => std::future::pending().await,
-                    }
-                } => {},
-            }
+            self.wait(&work, &binding).await?;
         }
+    }
+
+    /// Preserve the physical session and drain earlier confirmations before
+    /// replaying the remaining prefix. Old request IDs cannot confirm the new
+    /// window. Transport aliases retain their local backing charge.
+    fn restart(&mut self, shared: &super::state::Driver, binding: &mut SessionBinding<'_>) {
+        binding.connection.forget_requests();
+        self.window = Window::new(shared.progress.confirmed(), shared.config.inflight_appends);
+        self.pending = None;
+        self.retry_at = None;
+        self.refused = None;
+        self.deadline = None;
+    }
+
+    /// Apply ready replies, then send what the window allows. Whether the
+    /// send turn and the receive turn each filled their bound.
+    fn turn(
+        &mut self,
+        shared: &mut super::state::Driver,
+        binding: &mut SessionBinding<'_>,
+    ) -> Result<(bool, bool), Failure> {
+        match binding
+            .connection
+            .try_recv_many_into(TURN_RECORDS, &mut self.incoming)
+        {
+            Ok(_) | Err(omq_tokio::Error::WouldBlock) => {}
+            Err(_) => return Err(Failure::Retry(None)),
+        }
+        let incoming = std::mem::take(&mut self.incoming);
+        let receive_full = incoming.len() == TURN_RECORDS;
+        for message in &incoming {
+            self.receive(shared, binding, message)?;
+        }
+        self.incoming = incoming;
+        self.incoming.clear();
+        let filled = self.send_ready(shared, binding)?;
+        Ok((filled, receive_full))
+    }
+
+    /// Wait for replies, admitted records while a request could be prepared,
+    /// send progress of a blocked request, the response deadline, or a retry.
+    async fn wait(&self, work: &DataSignal, binding: &SessionBinding<'_>) -> Result<(), Failure> {
+        // Confirmations in this turn may have emptied the window. An intake
+        // flag left set by a skipped drain then wakes the next turn at once.
+        let wants_records = self.can_prepare();
+        let retry_at = self.retry_at.filter(|_| self.replay_ready());
+        tokio::select! {
+            result = binding.connection.recv_ready() => {
+                result.map_err(|_| Failure::Retry(None))?;
+            }
+            () = work.ready(), if wants_records => {}
+            () = async {
+                match &self.pending {
+                    Some(pending) => binding.connection.wait_send_progress_for(&pending.message).await,
+                    None => std::future::pending().await,
+                }
+            } => {}
+            () = self.clock.until_due(self.deadline) => {
+                crate::profiling::event(crate::profiling::Event::SdkResponseTimeout);
+                return Err(Failure::Retry(None));
+            },
+            () = self.clock.until_due(retry_at) => {},
+        }
+        Ok(())
     }
 
     /// Whether a new request or record could be prepared this turn: nothing
@@ -194,6 +201,12 @@ impl Session {
         self.refused.is_none_or(|id| !self.window.has_prior(id))
     }
 
+    /// Replay after the initial backoff, unless a replay is already due.
+    fn back_off(&mut self, retry: &RetryPolicy) {
+        self.retry_at
+            .get_or_insert_with(|| self.clock.now().saturating_add(retry.initial_backoff));
+    }
+
     fn send_ready(
         &mut self,
         shared: &mut super::state::Driver,
@@ -202,57 +215,30 @@ impl Session {
         if self.retry_at.is_some() {
             return Ok(false);
         }
-        let parameters = binding.connection.parameters().expect("negotiated session");
+        // The session was negotiated before this owner started sending.
+        let parameters = binding
+            .connection
+            .parameters()
+            .ok_or(Failure::Retry(None))?;
         let limits = shared.config.limits.intersection(parameters.receive);
         let mut sent_records = 0;
         let mut sent_bytes = 0;
         while sent_records < TURN_RECORDS {
-            if self.pending.is_none() {
-                // A partially confirmed request still occupies one slot. A
-                // transport-blocked prepared request reserves the next slot;
-                // neither queue admission nor partial confirmations release it.
-                if self.window.requests() >= self.request_capacity {
-                    return Ok(false);
-                }
-                let next = self.window.next();
-                let in_flight = self.window.requests() != 0;
-                if !self
-                    .batch
-                    .select(next, limits, in_flight, shared)
-                    .map_err(Failure::Fatal)?
-                {
-                    if self.batch.waiting_for_payload {
-                        // A revisited route can still own old packed frames.
-                        // Keep failure detection active while waiting for OMQ
-                        // to release them, so other brokers remain reachable.
-                        self.deadline.get_or_insert_with(|| {
-                            self.clock
-                                .now()
-                                .saturating_add(binding.retry.response_timeout)
-                        });
-                    }
-                    return Ok(false);
-                }
-                let Some(decoded_payload) = self.batch.take_payload() else {
-                    return Ok(false);
-                };
-                let compressed = match self.compressor.as_mut() {
-                    Some(compressor) => compressor
-                        .prepare(decoded_payload.as_slice())
-                        .map_err(|_| Failure::Fatal(Error::AppendCompression))?,
-                    None => None,
-                };
-                self.install_pending(shared, binding, limits, decoded_payload, compressed)?;
-            }
-            let mut pending = self.pending.take().expect("prepared request");
+            let pending = match self.pending.take() {
+                Some(pending) => Some(pending),
+                None => self.next_request(shared, binding, limits)?,
+            };
+            let Some(mut pending) = pending else {
+                return Ok(false);
+            };
             let records = (pending.sent.end - self.window.next()) as usize;
-            match binding.connection.try_send(
-                pending.message,
-                pending.sent.id,
-                pending.sent.end,
+            let outgoing = append::Outgoing {
+                id: pending.sent.id,
+                end: pending.sent.end,
                 records,
-                pending.retained_bytes,
-            ) {
+                retained_bytes: pending.retained_bytes,
+            };
+            match binding.connection.try_send(pending.message, outgoing) {
                 Ok(()) => {
                     pending.sent.admitted_at = crate::profiling::start();
                     shared.stats.record(
@@ -288,14 +274,64 @@ impl Session {
         Ok(true)
     }
 
-    fn install_pending(
+    /// The LZ4 form of a request body when compression is on and it is
+    /// smaller; `None` sends the body raw.
+    fn compress(&mut self, decoded: &Payload) -> Result<Option<Payload>, Failure> {
+        self.compressor
+            .as_mut()
+            .map_or(Ok(None), |compressor| {
+                compressor.prepare(decoded.as_slice())
+            })
+            .map_err(|_| Failure::Fatal(Error::AppendCompression))
+    }
+
+    /// Select, pack, and frame the next request, if the window and queue allow.
+    fn next_request(
+        &mut self,
+        shared: &mut super::state::Driver,
+        binding: &SessionBinding<'_>,
+        limits: ozzy_proto::append::DataLimits,
+    ) -> Result<Option<Prepared>, Failure> {
+        // A partially confirmed request still occupies one slot. A
+        // transport-blocked prepared request reserves the next slot;
+        // neither queue admission nor partial confirmations release it.
+        if self.window.requests() >= self.request_capacity {
+            return Ok(None);
+        }
+        let next = self.window.next();
+        let in_flight = self.window.requests() != 0;
+        if !self
+            .batch
+            .select(next, limits, in_flight, shared)
+            .map_err(Failure::Fatal)?
+        {
+            if self.batch.waiting_for_payload {
+                // A revisited route can still own old packed frames.
+                // Keep failure detection active while waiting for OMQ
+                // to release them, so other brokers remain reachable.
+                self.deadline.get_or_insert_with(|| {
+                    self.clock
+                        .now()
+                        .saturating_add(binding.retry.response_timeout)
+                });
+            }
+            return Ok(None);
+        }
+        let Some(decoded_payload) = self.batch.take_payload() else {
+            return Ok(None);
+        };
+        self.prepare(shared, binding, limits, decoded_payload)
+            .map(Some)
+    }
+
+    fn prepare(
         &mut self,
         shared: &mut super::state::Driver,
         binding: &SessionBinding<'_>,
         limits: ozzy_proto::append::DataLimits,
         decoded_payload: Payload,
-        compressed: Option<Payload>,
-    ) -> Result<(), Failure> {
+    ) -> Result<Prepared, Failure> {
+        let compressed = self.compress(&decoded_payload)?;
         let (payload_encoding, encoded_payload_bytes) = compressed
             .as_ref()
             .map_or((PayloadEncoding::Raw, decoded_payload.len()), |encoded| {
@@ -305,32 +341,29 @@ impl Session {
             .connection
             .next_request()
             .map_err(|error| Failure::Fatal(error.into()))?;
-        let envelope = Envelope {
-            opcode: Opcode::Append,
-            response: false,
-            request_id: Some(id),
-            sender: binding.local,
-            session: binding.connection.session(),
+        let request = RequestView {
+            envelope: Envelope {
+                opcode: Opcode::Append,
+                response: false,
+                request_id: Some(id),
+                sender: binding.local,
+                session: binding.connection.session(),
+            },
+            authority: binding.authority,
+            payload: PayloadView {
+                decoded: decoded_payload.as_slice(),
+                encoding: payload_encoding,
+                encoded_bytes: encoded_payload_bytes,
+            },
         };
         let header = self
             .batch
-            .encode(
-                shared,
-                binding.authority,
-                envelope,
-                PayloadView {
-                    decoded: decoded_payload.as_slice(),
-                    encoding: payload_encoding,
-                    encoded_bytes: encoded_payload_bytes,
-                },
-                &mut self.metadata,
-                limits,
-            )
+            .encode(shared, request, &mut self.metadata, limits)
             .map_err(Failure::Fatal)?;
         let bytes = self.batch.bytes;
         let end = self.window.next() + self.batch.records.len() as u64;
         let payload = compressed.unwrap_or(decoded_payload);
-        self.pending = Some(Prepared {
+        let prepared = Prepared {
             message: self
                 .frames
                 .message(&self.route, header, &self.metadata, payload),
@@ -345,7 +378,7 @@ impl Session {
             // Packing and LZ4 vectors retain growth capacity. A pooled
             // control view can retain a whole 64 KiB chunk.
             retained_bytes: shared.config.transport_backing_bytes(),
-        });
+        };
         shared.stage(end);
         self.batch.records.clear();
         self.deadline.get_or_insert_with(|| {
@@ -353,7 +386,7 @@ impl Session {
                 .now()
                 .saturating_add(binding.retry.response_timeout)
         });
-        Ok(())
+        Ok(prepared)
     }
 
     fn receive(
@@ -374,53 +407,64 @@ impl Session {
         if packet.envelope.sender != binding.remote
             || packet.envelope.session != binding.connection.session()
             || !packet.envelope.response
-            || !self.window.correlates(packet.envelope.request_id)
         {
             return Ok(());
         }
+        let Some(id) = packet
+            .envelope
+            .request_id
+            .filter(|&id| self.window.correlates(id))
+        else {
+            return Ok(());
+        };
         if packet.envelope.opcode == Opcode::Nack {
-            let reply = nack::decode(packet, shared.config.limits.envelope)
-                .map_err(|_| Failure::Fatal(Error::Response))?;
-            if reply.retry == RetryClass::AfterBackoff {
-                crate::profiling::event(crate::profiling::Event::SdkAdmissionRefusal);
-                let id = packet.envelope.request_id.expect("correlated request");
-                if self
-                    .refused
-                    .is_none_or(|earlier| self.window.precedes(id, earlier))
-                {
-                    self.refused = Some(id);
-                }
-                self.retry_at.get_or_insert_with(|| {
-                    self.clock
-                        .now()
-                        .saturating_add(binding.retry.initial_backoff)
-                });
-                return Ok(());
-            }
-            return reject_packet(
-                packet,
-                shared.config.limits.envelope,
-                binding.authority.is_some(),
-            );
+            return self.receive_nack(shared, binding, packet, id);
         }
+        self.receive_confirmation(shared, binding, packet, id)
+    }
+
+    /// A NACK of request `id`. A refusal to try later backs off and replays
+    /// from the earliest refused request; any other fails or retries.
+    fn receive_nack(
+        &mut self,
+        shared: &super::state::Driver,
+        binding: &SessionBinding<'_>,
+        packet: ozzy_proto::Packet<'_>,
+        id: ozzy_proto::RequestId,
+    ) -> Result<(), Failure> {
+        let reply = nack::decode(packet, shared.config.limits.envelope)
+            .map_err(|_| Failure::Fatal(Error::Response))?;
+        if reply.retry == RetryClass::AfterBackoff {
+            crate::profiling::event(crate::profiling::Event::SdkAdmissionRefusal);
+            if self
+                .refused
+                .is_none_or(|earlier| self.window.precedes(id, earlier))
+            {
+                self.refused = Some(id);
+            }
+            self.back_off(&binding.retry);
+            return Ok(());
+        }
+        reject_packet(packet, shared.config.limits.envelope)
+    }
+
+    /// The confirmation of request `id`, applied in sequence order only.
+    fn receive_confirmation(
+        &mut self,
+        shared: &mut super::state::Driver,
+        binding: &SessionBinding<'_>,
+        packet: ozzy_proto::Packet<'_>,
+        id: ozzy_proto::RequestId,
+    ) -> Result<(), Failure> {
         let apply_at = crate::profiling::start();
         let reply = stream::decode_confirmed(packet, shared.config.limits.envelope)
             .map_err(|error| Failure::Fatal(error.into()))?;
-        if Some(reply.authority) != binding.authority || reply.partition != shared.config.partition
-        {
+        if !confirms_producer(&reply, binding, &shared.config) {
             return Err(Failure::Fatal(Error::Response));
         }
         let key = reply.key;
         let end_sequence = reply.end_sequence;
         let confirmed = shared.progress.confirmed();
-        if reply.owner_epoch != shared.config.owner_epoch
-            || key.producer_id != shared.config.producer_id
-            || key.producer_epoch != shared.config.producer_epoch
-            || reply.policy != shared.config.policy
-        {
-            return Err(Failure::Fatal(Error::Response));
-        }
-        let id = packet.envelope.request_id.expect("correlated request");
         if self
             .window
             .skips(id, key.first_sequence, end_sequence, confirmed)
@@ -428,11 +472,7 @@ impl Session {
             // The broker holds the records before this range from an earlier
             // attempt, and refused or has not yet answered their resent
             // request. Only their own confirmation carries their offsets.
-            self.retry_at.get_or_insert_with(|| {
-                self.clock
-                    .now()
-                    .saturating_add(binding.retry.initial_backoff)
-            });
+            self.back_off(&binding.retry);
             return Ok(());
         }
         if !self
@@ -464,13 +504,27 @@ impl Session {
     }
 }
 
+/// Whether `reply` confirms this producer: its authority, partition, owner
+/// and producer epochs, producer identity, and policy.
+fn confirms_producer(
+    reply: &stream::Confirmed,
+    binding: &SessionBinding<'_>,
+    config: &super::WriterConfig,
+) -> bool {
+    reply.authority == binding.authority
+        && reply.partition == config.partition
+        && reply.owner_epoch == config.owner_epoch
+        && reply.key.producer_id == config.producer_id
+        && reply.key.producer_epoch == config.producer_epoch
+        && reply.policy == config.policy
+}
+
 fn reject_packet(
     packet: ozzy_proto::Packet<'_>,
     limits: ozzy_proto::EnvelopeLimits,
-    routed: bool,
 ) -> Result<(), Failure> {
     let reply = nack::decode(packet, limits).map_err(|_| Failure::Fatal(Error::Response))?;
-    let hint = if routed && matches!(reply.code, 5 | 12 | 13) {
+    let hint = if matches!(reply.code, 5 | 12 | 13) {
         Some(AuthorityHint::decode(reply.detail).map_err(|_| Failure::Fatal(Error::Response))?)
     } else {
         None
@@ -487,10 +541,6 @@ fn reject_packet(
 }
 
 fn frames(message: &Message, remote: NodeId) -> Option<[Bytes; 3]> {
-    if message.len() != 4 || message.part_slice(0)? != remote.as_bytes() {
-        return None;
-    }
-    Some(std::array::from_fn(|i| {
-        message.part_bytes(i + 1).expect("checked frames")
-    }))
+    let (route, frames) = message.routed_packet_bytes()?;
+    (route.as_ref() == remote.as_bytes()).then_some(frames)
 }

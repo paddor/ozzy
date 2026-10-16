@@ -177,6 +177,12 @@ impl Transmitter {
         Ok(())
     }
 
+    /// When `poll_probe` next sends or retries on time alone. `None` while a
+    /// repair runs, which probes never overtake.
+    pub fn next_probe(&self) -> Option<Duration> {
+        self.repair.is_none().then(|| self.probes.due())
+    }
+
     /// Poll small status traffic independently of durable ACK or election timers.
     ///
     /// `transport_pending` includes this peer's locally retained data transmissions.
@@ -205,9 +211,9 @@ impl Transmitter {
     /// Reserve a fresh suffix once after ensuring the adapter can retain its packet.
     /// Known repair takes precedence over sending more data beyond that gap.
     pub fn record_send(&mut self, operations: &[Operation]) -> Result<(), FlowError> {
-        if !self.active {
+        let Some(sender) = self.sender.as_mut().filter(|_| self.active) else {
             return Err(FlowError::Channel);
-        }
+        };
         if self.repair.is_some()
             || self.broadcast
                 && self.catch_up.is_some_and(|through| {
@@ -216,7 +222,6 @@ impl Transmitter {
         {
             return Err(FlowError::Capacity);
         }
-        let sender = self.sender.as_mut().expect("active ledger");
         sender.record_send(sender.channel(), operations)
     }
 
@@ -253,89 +258,122 @@ impl Transmitter {
             None
         };
         report.validate_shape()?;
+        let request = OpenRequest { request_id, report };
         if self
             .sender()
-            .is_some_and(|sender| sender.channel() == report.channel)
+            .is_none_or(|sender| sender.channel() != report.channel)
         {
-            if self.candidate.is_some_and(|old| {
-                old.report.channel == report.channel && old.report.revision > report.revision
-            }) {
+            if correlated.is_none() {
+                // A changed receive epoch announces reset volatile history between
+                // periodic probes. Ask immediately, but keep any live correlation
+                // and history lookup. The hint itself installs no receive capacity.
+                if self.sender().is_some() && self.announced_channel != Some(report.channel) {
+                    self.probes.expedite(now)?;
+                    self.announced_channel = Some(report.channel);
+                }
                 return Ok(StatusOutcome::Ignored);
             }
-            if self.broadcast && report.received.op > self.sender().expect("active").sent().op {
-                self.candidate = Some(OpenRequest { request_id, report });
-                self.candidate_limit = repair_limit;
-                return Ok(StatusOutcome::Verify);
-            }
-            let sender = self.sender.as_mut().expect("active ledger");
-            let before = sender.received();
-            let changed = sender.observe(report)?;
-            if sender.received().op > before.op {
-                self.receipt_progress.advanced(sender.received().op.0, now);
-            }
-            if let Some(probe) = correlated {
-                let target = if self.broadcast {
-                    repair_limit.unwrap_or(probe.tail.op).min(probe.tail.op)
-                } else {
-                    probe.tail.op
-                };
-                if self.broadcast {
-                    self.catch_up = (sender.received().op < target).then_some(target);
-                }
-                let through = sender
-                    .outstanding()
-                    .take_while(|op| op.prefix.op <= target)
-                    .last()
-                    .map_or(sender.received(), |op| op.prefix);
-                // A status reply can overtake the data connection. Retrying a
-                // moving window duplicates the stream and competes with repair.
-                let quiet = !self.broadcast
-                    || self
-                        .receipt_progress
-                        .repair_limit(sender.received().op.0, None, now)
-                        .is_none();
-                self.repair = if quiet && sender.received().op < through.op {
-                    Some(Repair {
-                        channel: sender.channel(),
-                        after: sender.received(),
-                        through,
-                    })
-                } else {
-                    None
-                };
-                self.probes.complete(probe.scope, probe.request_id, now)?;
-                self.candidate = None;
-                self.candidate_limit = None;
-            }
-            self.trim_repair();
-            return Ok(if changed || correlated.is_some() {
-                StatusOutcome::Observed
-            } else {
-                StatusOutcome::Ignored
-            });
+            return Ok(self.hold(request, repair_limit));
         }
-        let Some(probe) = correlated else {
-            // A changed receive epoch announces reset volatile history between
-            // periodic probes. Ask immediately, but keep any live correlation
-            // and history lookup. The hint itself installs no receive capacity.
-            if self.sender().is_some() && self.announced_channel != Some(report.channel) {
-                self.probes.expedite(now)?;
-                self.announced_channel = Some(report.channel);
-            }
-            return Ok(StatusOutcome::Ignored);
-        };
-        if self.candidate.is_some_and(|old| {
-            old.report.channel == report.channel && old.report.revision > report.revision
-        }) {
+        if self.superseded(report) {
             return Ok(StatusOutcome::Ignored);
         }
-        let candidate = OpenRequest {
-            request_id: Some(probe.request_id),
-            report,
-        };
-        self.candidate = Some(candidate);
+        if self.broadcast
+            && self
+                .sender()
+                .is_some_and(|sender| report.received.op > sender.sent().op)
+        {
+            return Ok(self.hold(request, repair_limit));
+        }
+        let changed = self.observe_receipt(report, now)?;
+        if let Some(probe) = correlated {
+            self.answer_probe(probe, repair_limit, now)?;
+        }
+        self.trim_repair();
+        Ok(if changed || correlated.is_some() {
+            StatusOutcome::Observed
+        } else {
+            StatusOutcome::Ignored
+        })
+    }
+
+    /// Hold a report for local-history verification, unless the pending
+    /// candidate already carries a newer revision of the same channel.
+    fn hold(&mut self, request: OpenRequest, repair_limit: Option<OpNumber>) -> StatusOutcome {
+        if self.superseded(request.report) {
+            return StatusOutcome::Ignored;
+        }
+        self.candidate = Some(request);
         self.candidate_limit = repair_limit;
-        Ok(StatusOutcome::Verify)
+        StatusOutcome::Verify
+    }
+
+    fn superseded(&self, report: Report) -> bool {
+        self.candidate.is_some_and(|old| {
+            old.report.channel == report.channel && old.report.revision > report.revision
+        })
+    }
+
+    fn clear_candidate(&mut self) {
+        self.candidate = None;
+        self.candidate_limit = None;
+    }
+
+    /// Retire reservations the current channel reports received.
+    fn observe_receipt(&mut self, report: Report, now: Duration) -> Result<bool, FlowError> {
+        let Some(sender) = self.sender.as_mut() else {
+            return Ok(false);
+        };
+        let before = sender.received();
+        let changed = sender.observe(report)?;
+        if sender.received().op > before.op {
+            self.receipt_progress.advanced(sender.received().op.0, now);
+        }
+        Ok(changed)
+    }
+
+    /// Complete a live probe on the current channel and plan the repair of
+    /// what it shows outstanding through its frozen tail.
+    fn answer_probe(
+        &mut self,
+        probe: Probe,
+        repair_limit: Option<OpNumber>,
+        now: Duration,
+    ) -> Result<(), TransmitError> {
+        if let Some(sender) = self.sender.as_ref() {
+            let target = if self.broadcast {
+                repair_limit.unwrap_or(probe.tail.op).min(probe.tail.op)
+            } else {
+                probe.tail.op
+            };
+            if self.broadcast {
+                self.catch_up = (sender.received().op < target).then_some(target);
+            }
+            let through = sender
+                .outstanding()
+                .take_while(|op| op.prefix.op <= target)
+                .last()
+                .map_or(sender.received(), |op| op.prefix);
+            // A status reply can overtake the data connection. Retrying a
+            // moving window duplicates the stream and competes with repair.
+            let quiet = !self.broadcast
+                || self
+                    .receipt_progress
+                    .repair_limit(sender.received().op.0, None, now)
+                    .is_none();
+            self.repair = if quiet && sender.received().op < through.op {
+                Some(Repair {
+                    channel: sender.channel(),
+                    after: sender.received(),
+                    through,
+                })
+            } else {
+                None
+            };
+        }
+        self.probes.complete(probe.scope, probe.request_id, now)?;
+        self.clear_candidate();
+        Ok(())
     }
 
     /// Adopt only the still-current candidate after exact local-history verification.
@@ -380,22 +418,9 @@ impl Transmitter {
             .sender()
             .is_some_and(|sender| sender.channel() == report.channel);
         let previous = self.sender().map(|sender| sender.received().op);
-        if let Some(sender) = &mut self.sender {
-            if self.broadcast && same_channel {
-                if !sender.observe_publication(report, received)? {
-                    self.candidate = None;
-                    self.candidate_limit = None;
-                    return Ok(false);
-                }
-            } else {
-                sender.reopen(report, received)?;
-            }
-        } else {
-            self.sender = Some(Sender::from_checked_report(
-                report,
-                self.limits,
-                std::mem::take(&mut self.spare),
-            ));
+        if !self.adopt(report, received, same_channel)? {
+            self.clear_candidate();
+            return Ok(false);
         }
         if let Some(probe) = probe {
             self.probes.complete(probe.scope, probe.request_id, now)?;
@@ -408,8 +433,7 @@ impl Transmitter {
             }
         }
         self.active = true;
-        self.candidate = None;
-        self.candidate_limit = None;
+        self.clear_candidate();
         if !same_channel {
             self.repair = None;
             self.receipt_progress.reset();
@@ -419,6 +443,31 @@ impl Transmitter {
         }
         self.trim_repair();
         Ok(true)
+    }
+
+    /// Move the ledger to a verified report: accept PUB progress on the same
+    /// channel, reopen on a new one, or install the reserved ledger. Returns
+    /// false when same-channel progress no longer applies.
+    fn adopt(
+        &mut self,
+        report: Report,
+        received: Prefix,
+        same_channel: bool,
+    ) -> Result<bool, FlowError> {
+        match &mut self.sender {
+            Some(sender) if self.broadcast && same_channel => {
+                sender.observe_publication(report, received)
+            }
+            Some(sender) => sender.reopen(report, received).map(|()| true),
+            None => {
+                self.sender = Some(Sender::from_checked_report(
+                    report,
+                    self.limits,
+                    std::mem::take(&mut self.spare),
+                ));
+                Ok(true)
+            }
+        }
     }
 
     /// Current bounded retry range, suppressed while this peer has queued data.
@@ -458,13 +507,10 @@ impl Transmitter {
         }) {
             self.catch_up = None;
         }
-        let Some(repair) = self.repair else {
+        let (Some(repair), Some(received)) = (self.repair, self.sender().map(Sender::received))
+        else {
             return;
         };
-        let received = self
-            .sender()
-            .expect("repair has an active ledger")
-            .received();
         self.repair = if received.op >= repair.through.op {
             None
         } else if received.op > repair.after.op {

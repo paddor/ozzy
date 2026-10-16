@@ -1,6 +1,6 @@
 //! Same-channel receipt counters. Opening still verifies full history.
 
-use ozzy_proto::Opcode;
+use ozzy_proto::{Opcode, layout::Fixed};
 
 use crate::{
     OpNumber, Prefix,
@@ -66,18 +66,15 @@ impl CompactState {
 
     /// Reject extensions and truncations before interpreting any counters.
     pub fn decode(bytes: &[u8]) -> Result<Self, WireError> {
-        if bytes.len() != COMPACT_STATE_BYTES {
-            return Err(WireError::Length);
-        }
-        if bytes[0] != Opcode::ReplicaReceipt as u8 {
+        let bytes: &[u8; COMPACT_STATE_BYTES] = bytes.try_into().map_err(|_| WireError::Length)?;
+        if bytes.u8_at::<0>() != Opcode::ReplicaReceipt as u8 {
             return Err(WireError::UnsupportedCommand);
         }
-        let read = |offset| u64::from_be_bytes(bytes[offset..offset + 8].try_into().unwrap());
         let state = Self {
-            handle: u32::from_be_bytes(bytes[1..5].try_into().unwrap()),
-            revision: read(5),
-            received: OpNumber(read(13)),
-            received_bytes: read(21),
+            handle: bytes.u32_at::<1>(),
+            revision: bytes.u64_at::<5>(),
+            received: OpNumber(bytes.u64_at::<13>()),
+            received_bytes: bytes.u64_at::<21>(),
         };
         state.validate()?;
         Ok(state)

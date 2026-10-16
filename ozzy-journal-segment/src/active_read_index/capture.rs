@@ -5,6 +5,7 @@ use super::{
     PartitionIncarnation,
 };
 use smallvec::SmallVec;
+use std::ops::Range;
 
 /// Exact selected ranges only. No borrowed index, payloads, or later appends.
 #[derive(Debug, Clone)]
@@ -15,13 +16,9 @@ pub(crate) struct CapturedReadEntries {
 
 impl CapturedReadEntries {
     pub(crate) fn ranges(self) -> impl Iterator<Item = (OffsetIndexEntry, usize)> {
-        self.runs.into_iter().map(move |run| {
-            (
-                run.entry(self.partition, run.first_offset)
-                    .expect("captured record range"),
-                run.records as usize,
-            )
-        })
+        self.runs
+            .into_iter()
+            .map(move |run| (run.entry_at(self.partition, 0), run.records as usize))
     }
 
     pub(crate) fn operations(&self) -> impl Iterator<Item = crate::OperationLocation> + '_ {
@@ -29,15 +26,9 @@ impl CapturedReadEntries {
     }
 
     pub(crate) fn entries(self) -> impl Iterator<Item = OffsetIndexEntry> {
+        // Capture checked both endpoints and the exact first selector.
         self.runs.into_iter().flat_map(move |run| {
-            (0..run.records).map(move |index| {
-                // Capture checked both endpoints and the exact first selector.
-                run.entry(
-                    self.partition,
-                    Offset::new(run.first_offset.get() + u64::from(index)),
-                )
-                .expect("captured record range")
-            })
+            (0..run.records).map(move |delta| run.entry_at(self.partition, delta))
         })
     }
 }
@@ -48,8 +39,7 @@ impl ActiveReadIndex {
     pub(crate) fn capture(
         &self,
         partition: PartitionIncarnation,
-        start: Offset,
-        end: Offset,
+        Range { start, end }: Range<Offset>,
         max_records: usize,
         through_operation: u64,
     ) -> Result<CapturedReadEntries, ActiveReadIndexError> {

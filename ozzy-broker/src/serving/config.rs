@@ -4,7 +4,9 @@ use omq_tokio::Endpoint;
 use ozzy_proto::{NodeId, data::DataLimits, directory::EndpointScheme, handshake};
 use ozzy_runtime::{
     dispatch::{Budget, Budgets},
-    frontend::{self, Access, DataSender, Kind, ReceiveBuffers, ReceiveStorage, Service},
+    frontend::{
+        self, Access, DataLaneLimits, DataSender, Kind, ReceiveBuffers, ReceiveStorage, Service,
+    },
     replica_transport::QueueLimits,
 };
 use std::{collections::BTreeMap, time::Duration};
@@ -33,8 +35,7 @@ pub(super) struct Config {
     pub envelope: ozzy_proto::EnvelopeLimits,
     pub buffers: ReceiveBuffers,
     pub transport: TransportLimits,
-    pub brokers: BTreeMap<NodeId, Endpoint>,
-    pub followers: crate::FollowerRoutes,
+    pub remote: crate::RemoteBrokers,
     pub peers: usize,
     pub budgets: BTreeMap<u32, Budgets>,
     pub catalog: Vec<ozzy_proto::directory::TopicPage>,
@@ -42,18 +43,23 @@ pub(super) struct Config {
 }
 
 impl Config {
+    /// Admission budgets of one local shard.
+    pub(super) fn budget(&self, shard: u32) -> Result<Budgets, StartupError> {
+        self.budgets
+            .get(&shard)
+            .copied()
+            .ok_or_else(|| failure("unknown shard budget"))
+    }
+
     /// Bound writer and follower queues separately from canonical actor arenas.
     /// Each queue reserves one further frame while its actor is busy.
-    pub(super) fn data_lane(
-        &self,
-        shard: u32,
-        kind: Kind,
-    ) -> Result<(usize, usize, usize), StartupError> {
+    pub(super) fn data_lane(&self, shard: u32, kind: Kind) -> Result<DataLaneLimits, StartupError> {
         let maximum = self.buffers.maximum_retained_bytes();
         let minimum = maximum
             .checked_mul(4)
             .ok_or_else(|| failure("data frame budget overflow"))?;
-        let budget = self.budgets[&shard]
+        let budget = self
+            .budget(shard)?
             .data
             .bytes
             .min(128 * 1024 * 1024)
@@ -62,11 +68,15 @@ impl Config {
         // Lossy publication needs room for storage-completion bursts. The
         // weighted byte bound still includes the separately reserved pending frame.
         let maximum_slots = if kind == Kind::Broker { 128 } else { 16 };
-        let available = self.budgets[&shard].data.queue_slots.min(maximum_slots);
+        let available = self.budget(shard)?.data.queue_slots.min(maximum_slots);
         if available == 0 {
             return Err(failure("data shard has no queue capacity"));
         }
-        Ok((available, maximum, budget))
+        Ok(DataLaneLimits {
+            slots: available,
+            maximum_retained_bytes: maximum,
+            retained_budget_bytes: budget,
+        })
     }
 
     pub(super) fn new(
@@ -75,7 +85,7 @@ impl Config {
     ) -> Result<Self, StartupError> {
         let super::ServingContext { omq, time } = context;
         let deployment = checked.deployment.deployment();
-        let local = NodeId::from_bytes(*checked.identity.brokers[&checked.plan.name].as_bytes());
+        let local = NodeId::from_bytes(*checked.identity.broker_id(&checked.plan.name)?.as_bytes());
         let clients = deployment.limits.max_clients;
         let limits = native_limits(checked)?;
         let body = deployment
@@ -83,74 +93,18 @@ impl Config {
             .values()
             .map(|topic| topic.max_append_bytes as usize)
             .max()
-            .expect("nonempty topics");
+            .ok_or_else(|| failure("no topics"))?;
         let envelope = ozzy_proto::EnvelopeLimits {
             max_metadata_bytes: 64 * 1024,
             max_payload_bytes: body,
         };
-        let message_bytes = body
-            .checked_add(64 * 1024 + 4096)
-            .ok_or_else(|| failure("transport size overflow"))?;
-        let transport = TransportLimits {
-            send_messages: 64,
-            receive_messages: 64,
-            message_bytes,
-            close_linger: Duration::from_millis(100),
-        };
-        if checked.identity.brokers.len() == 3
-            && deployment
-                .brokers
-                .values()
-                .any(|broker| broker.endpoints.follower_pub.is_none())
-        {
-            return Err(failure(
-                "replicated brokers require explicit follower PUB endpoints",
-            ));
-        }
-        let endpoints = &deployment.brokers[&checked.plan.name].endpoints;
-        let storage = match EndpointScheme::parse(&endpoints.peer) {
-            Some((EndpointScheme::Inproc, _)) => ReceiveStorage::Inproc {
-                payload_backing_bytes: body,
-            },
-            Some((scheme, _)) if scheme.compressed() => compressed_storage(message_bytes)?,
-            _ => ReceiveStorage::Stream { message_bytes },
-        };
+        let transport = transport_limits(body)?;
+        require_follower_pub_endpoints(checked)?;
+        let storage = receive_storage(checked, body, transport.message_bytes)?;
         let buffers = ReceiveBuffers::new(envelope, storage).map_err(failure)?;
-        let brokers = checked
-            .identity
-            .brokers
-            .iter()
-            .filter(|(_, id)| NodeId::from_bytes(*id.as_bytes()) != local)
-            .map(|(name, id)| {
-                Ok((
-                    NodeId::from_bytes(*id.as_bytes()),
-                    deployment.brokers[name]
-                        .endpoints
-                        .peer
-                        .parse()
-                        .map_err(failure)?,
-                ))
-            })
-            .collect::<Result<BTreeMap<_, _>, StartupError>>()?;
+        let brokers = peer_endpoints(checked, local)?;
         let followers = follower_routes(checked, local, &brokers)?;
-        let mut budgets = BTreeMap::new();
-        for shard in &checked.plan.shards {
-            budgets.insert(
-                shard.id,
-                Budgets {
-                    data: Budget {
-                        queue_slots: shard.budget.append_slots,
-                        retained_messages: shard.budget.append_slots,
-                        bytes: shard.budget.resident_bytes as usize,
-                    },
-                    control: Budget {
-                        queue_slots: shard.budget.control_slots,
-                        retained_messages: shard.budget.control_slots,
-                        bytes: shard.budget.control_bytes as usize,
-                    },
-                },
-            );
-        }
+        let budgets = shard_budgets(checked);
         let catalog = catalog(checked)?;
         Ok(Self {
             time,
@@ -162,8 +116,10 @@ impl Config {
             buffers,
             transport,
             peers: clients + brokers.len(),
-            brokers,
-            followers,
+            remote: crate::RemoteBrokers {
+                control: brokers,
+                followers,
+            },
             budgets,
             catalog,
             maximum_partitions: checked.plan.partitions.len(),
@@ -176,12 +132,11 @@ impl Config {
         handoffs: Handoffs,
     ) -> Result<(), StartupError> {
         for (id, handoff) in handoffs {
-            let budgets = &self.budgets;
             let port = service
                 .port_with_publications(
                     &self.omq,
                     id,
-                    budgets[&id],
+                    self.budget(id)?,
                     ozzy_runtime::dispatch::Budget {
                         queue_slots: 2,
                         retained_messages: 2,
@@ -203,59 +158,15 @@ impl Config {
         &self,
         shards: Vec<Registration>,
     ) -> Result<(Service, Handoffs), StartupError> {
-        let placements = shards
-            .iter()
-            .flat_map(|shard| {
-                shard.routes.iter().map(move |route| frontend::Placement {
-                    group: route.group,
-                    partition: route.partition,
-                    shard: shard.id,
-                })
-            })
-            .collect::<Vec<_>>();
-        let ids = shards.iter().map(|shard| shard.id).collect::<Vec<_>>();
+        let routes = self.routing_table(&shards)?;
         let states = shards
             .iter()
             .flat_map(|shard| shard.routes.clone())
             .collect::<Vec<_>>();
-        let routes =
-            frontend::RoutingTable::new(&ids, &placements, self.maximum_partitions, self.envelope)
-                .map_err(failure)?;
-        let mut handoffs = Vec::with_capacity(shards.len());
-        let mut data_lanes = Vec::with_capacity(shards.len());
-        let lanes = shards
-            .into_iter()
-            .map(|shard| {
-                handoffs.push((shard.id, shard.handoff));
-                data_lanes.push((shard.id, shard.data));
-                data_lanes.push((shard.id, shard.replica));
-                data_lanes.push((shard.id, shard.broker_control));
-                (shard.id, shard.sender)
-            })
-            .collect();
-        let control = QueueLimits {
-            messages: 8,
-            bytes: 1024 * 1024,
-            message_bytes: 128 * 1024,
-        };
-        let data = QueueLimits {
-            messages: 4,
-            bytes: self.transport.message_bytes * 4,
-            message_bytes: self.transport.message_bytes,
-        };
-        let mut dispatcher = frontend::Dispatcher::new(
-            self.local,
-            routes,
-            lanes,
-            frontend::DispatcherLimits {
-                peers: self.peers,
-                replies: frontend::ReplyLimits { data, control },
-            },
-        )
-        .map_err(failure)?;
-        install_data_lanes(&mut dispatcher, data_lanes)?;
+        let (dispatcher, handoffs) = self.dispatcher(routes, shards)?;
         let access = self
-            .brokers
+            .remote
+            .control
             .keys()
             .map(|&peer| Access {
                 peer,
@@ -275,6 +186,84 @@ impl Config {
         .map_err(failure)?
         .with_trusted_clients(self.clients)
         .map_err(failure)?;
+        self.install_directory(&mut service, states)?;
+        Ok((service, handoffs))
+    }
+
+    /// Route every registered partition to its shard.
+    fn routing_table(
+        &self,
+        shards: &[Registration],
+    ) -> Result<frontend::RoutingTable, StartupError> {
+        let placements = shards
+            .iter()
+            .flat_map(|shard| {
+                shard.routes.iter().map(move |route| frontend::Placement {
+                    group: route.group,
+                    partition: route.partition,
+                    shard: shard.id,
+                })
+            })
+            .collect::<Vec<_>>();
+        let ids = shards.iter().map(|shard| shard.id).collect::<Vec<_>>();
+        frontend::RoutingTable::new(&ids, &placements, self.maximum_partitions, self.envelope)
+            .map_err(failure)
+    }
+
+    /// The dispatcher with each shard's command and data lanes installed,
+    /// plus the handoff that later delivers each shard its binding.
+    fn dispatcher(
+        &self,
+        routes: frontend::RoutingTable,
+        shards: Vec<Registration>,
+    ) -> Result<(frontend::Dispatcher, Handoffs), StartupError> {
+        let mut handoffs = Vec::with_capacity(shards.len());
+        let mut data_lanes = Vec::with_capacity(shards.len());
+        let lanes = shards
+            .into_iter()
+            .map(|shard| {
+                handoffs.push((shard.id, shard.handoff));
+                data_lanes.push((shard.id, shard.data));
+                data_lanes.push((shard.id, shard.replica));
+                data_lanes.push((shard.id, shard.broker_control));
+                (shard.id, shard.sender)
+            })
+            .collect();
+        let mut dispatcher = frontend::Dispatcher::new(
+            self.local,
+            routes,
+            lanes,
+            frontend::DispatcherLimits {
+                peers: self.peers,
+                replies: self.reply_limits(),
+            },
+        )
+        .map_err(failure)?;
+        install_data_lanes(&mut dispatcher, data_lanes)?;
+        Ok((dispatcher, handoffs))
+    }
+
+    /// Queue bounds of shard replies to the dispatcher, by class.
+    fn reply_limits(&self) -> frontend::ReplyLimits {
+        let control = QueueLimits {
+            messages: 8,
+            bytes: 1024 * 1024,
+            message_bytes: 128 * 1024,
+        };
+        let data = QueueLimits {
+            messages: 4,
+            bytes: self.transport.message_bytes * 4,
+            message_bytes: self.transport.message_bytes,
+        };
+        frontend::ReplyLimits { data, control }
+    }
+
+    /// Install the topic catalog and the partition watch registry.
+    fn install_directory(
+        &self,
+        service: &mut Service,
+        states: Vec<ozzy_proto::directory::RouteState>,
+    ) -> Result<(), StartupError> {
         service
             .install_catalog(
                 frontend::TopicCatalog::new(
@@ -299,8 +288,7 @@ impl Config {
                 )
                 .map_err(failure)?,
             )
-            .map_err(failure)?;
-        Ok((service, handoffs))
+            .map_err(failure)
     }
 
     fn handshake_parameters(&self) -> Result<handshake::Parameters, StartupError> {
@@ -318,6 +306,101 @@ impl Config {
     }
 }
 
+/// Bounds of the broker transport around the largest topic append body.
+fn transport_limits(body: usize) -> Result<TransportLimits, StartupError> {
+    let message_bytes = body
+        .checked_add(64 * 1024 + 4096)
+        .ok_or_else(|| failure("transport size overflow"))?;
+    Ok(TransportLimits {
+        send_messages: 64,
+        receive_messages: 64,
+        message_bytes,
+        close_linger: Duration::from_millis(100),
+    })
+}
+
+/// Replicated brokers each need an explicit follower PUB endpoint.
+fn require_follower_pub_endpoints(checked: &CheckedConfig) -> Result<(), StartupError> {
+    if checked.identity.brokers.len() == 3
+        && checked
+            .deployment
+            .deployment()
+            .brokers
+            .values()
+            .any(|broker| broker.endpoints.follower_pub.is_none())
+    {
+        return Err(failure(
+            "replicated brokers require explicit follower PUB endpoints",
+        ));
+    }
+    Ok(())
+}
+
+/// Receive backing for the local PEER endpoint scheme.
+fn receive_storage(
+    checked: &CheckedConfig,
+    body: usize,
+    message_bytes: usize,
+) -> Result<ReceiveStorage, StartupError> {
+    let endpoints = &checked.local_broker()?.endpoints;
+    match EndpointScheme::parse(&endpoints.peer) {
+        Some((EndpointScheme::Inproc, _)) => Ok(ReceiveStorage::Inproc {
+            payload_backing_bytes: body,
+        }),
+        Some((scheme, _)) if scheme.compressed() => compressed_storage(message_bytes),
+        _ => Ok(ReceiveStorage::Stream { message_bytes }),
+    }
+}
+
+/// Control endpoint of every other configured broker.
+fn peer_endpoints(
+    checked: &CheckedConfig,
+    local: NodeId,
+) -> Result<BTreeMap<NodeId, Endpoint>, StartupError> {
+    let deployment = checked.deployment.deployment();
+    checked
+        .identity
+        .brokers
+        .iter()
+        .filter(|(_, id)| NodeId::from_bytes(*id.as_bytes()) != local)
+        .map(|(name, id)| {
+            Ok((
+                NodeId::from_bytes(*id.as_bytes()),
+                deployment
+                    .broker(name)?
+                    .endpoints
+                    .peer
+                    .parse()
+                    .map_err(failure)?,
+            ))
+        })
+        .collect()
+}
+
+/// Data and control admission budgets of each local shard.
+fn shard_budgets(checked: &CheckedConfig) -> BTreeMap<u32, Budgets> {
+    checked
+        .plan
+        .shards
+        .iter()
+        .map(|shard| {
+            let budget = Budgets {
+                data: Budget {
+                    queue_slots: shard.budget.append_slots,
+                    retained_messages: shard.budget.append_slots,
+                    bytes: shard.budget.resident_bytes as usize,
+                },
+                control: Budget {
+                    queue_slots: shard.budget.control_slots,
+                    retained_messages: shard.budget.control_slots,
+                    bytes: shard.budget.control_bytes as usize,
+                },
+            };
+            (shard.id, budget)
+        })
+        .collect()
+}
+
 fn follower_routes(
     checked: &CheckedConfig,
     local: NodeId,
@@ -326,8 +409,9 @@ fn follower_routes(
     let deployment = checked.deployment.deployment();
     let mut followers = crate::FollowerRoutes::default();
     for placement in &checked.plan.partitions {
-        let partition =
-            &checked.identity.topics[&placement.topic].partitions[placement.partition as usize];
+        let partition = checked
+            .identity
+            .partition(&placement.topic, placement.partition)?;
         followers.local.insert(
             ozzy_proto::GroupId::from_bytes(*partition.group.as_bytes()),
             placement.shard,
@@ -338,7 +422,8 @@ fn follower_routes(
         if broker != local {
             followers.repairs.insert(
                 broker,
-                deployment.brokers[name]
+                deployment
+                    .broker(name)?
                     .endpoints
                     .data_peer
                     .parse()
@@ -348,14 +433,15 @@ fn follower_routes(
         if broker == local {
             continue;
         }
-        if let Some(endpoint) = &deployment.brokers[name].endpoints.follower_pub {
+        if let Some(endpoint) = &deployment.broker(name)?.endpoints.follower_pub {
             followers
                 .publications
                 .insert(broker, endpoint.parse().map_err(failure)?);
         }
-        for placement in checked.deployment.partition_placements(name) {
-            let partition =
-                &checked.identity.topics[&placement.topic].partitions[placement.partition as usize];
+        for placement in checked.deployment.partition_placements(name)? {
+            let partition = checked
+                .identity
+                .partition(&placement.topic, placement.partition)?;
             followers.destinations.insert(
                 (
                     broker,
@@ -415,34 +501,40 @@ fn catalog(checked: &CheckedConfig) -> Result<Vec<ozzy_proto::directory::TopicPa
 
 fn native_limits(checked: &CheckedConfig) -> Result<DataLimits, StartupError> {
     let deployment = checked.deployment.deployment();
-    let mut profiles = deployment.topics.values().map(|topic| {
-        let resolved = topic.deduplication.is_some();
-        let header =
-            ozzy_journal::operation::append_metadata_bound(1, 0, resolved).expect("fixed header");
-        let row = ozzy_journal::operation::append_metadata_bound(1, 1, resolved)
-            .expect("fixed row")
-            - header;
-        (
-            topic.max_append_bytes as usize,
-            header,
-            row,
-            topic
-                .deduplication
-                .map_or(2048, |policy| (policy.max_entries as usize).min(2048)),
-        )
-    });
+    let profiles = deployment
+        .topics
+        .values()
+        .map(|topic| {
+            let resolved = topic.deduplication.is_some();
+            let bound = |records| {
+                ozzy_journal::operation::append_metadata_bound(1, records, resolved)
+                    .ok_or_else(|| failure("append metadata bound overflows"))
+            };
+            let header = bound(0)?;
+            Ok((
+                topic.max_append_bytes as usize,
+                header,
+                bound(1)? - header,
+                topic
+                    .deduplication
+                    .map_or(2048, |policy| (policy.max_entries as usize).min(2048)),
+            ))
+        })
+        .collect::<Result<Vec<_>, StartupError>>()?;
     let records = profiles
-        .clone()
-        .map(|(body, header, row, count)| count.min(body.saturating_sub(header) / (row + 1)))
+        .iter()
+        .map(|&(body, header, row, count)| count.min(body.saturating_sub(header) / (row + 1)))
         .min()
         .ok_or_else(|| failure("no topics"))?
         .max(1);
-    let payload = profiles.try_fold(usize::MAX, |minimum, (body, header, row, _)| {
-        body.checked_sub(header + row * records)
-            .filter(|bytes| *bytes > 0)
-            .map(|bytes| minimum.min(bytes))
-            .ok_or_else(|| failure("native request bound too small"))
-    })?;
+    let payload = profiles
+        .iter()
+        .try_fold(usize::MAX, |minimum, &(body, header, row, _)| {
+            body.checked_sub(header + row * records)
+                .filter(|bytes| *bytes > 0)
+                .map(|bytes| minimum.min(bytes))
+                .ok_or_else(|| failure("native request bound too small"))
+        })?;
     Ok(DataLimits {
         envelope: ozzy_proto::EnvelopeLimits {
             max_metadata_bytes: 64 * 1024,

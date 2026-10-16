@@ -1,8 +1,11 @@
 //! Production cluster lifecycle and storage faults shared with the simulator.
-use super::{Control, deployment_with_resources, provision, start_image_selected, start_images};
+use super::{
+    Control, Memory, Shape, deployment_with_resources, provision, start_image_selected,
+    start_images,
+};
 use crate::client::Client;
 use ozzy_broker::{Broker, CheckedConfig, RecoveryIntent, RecoverySelection, ServingContext};
-use ozzy_config::{BrokerIdentity, Confirmation, DeploymentMode};
+use ozzy_config::{BrokerIdentity, Confirmation};
 use ozzy_io::simulation::Image;
 use ozzy_runtime::replicated::{SdkClock, TopicReader, WriterRuntime};
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -53,25 +56,14 @@ impl Cluster {
             memory_nodes: [0].into(),
             linux_aio: true,
         };
-        let deployment = deployment_with_resources(
-            &root,
-            match policy {
-                Confirmation::LocalDurable => DeploymentMode::Single,
-                Confirmation::DiskQuorum | Confirmation::ReplicatedPersisting => {
-                    DeploymentMode::Three
-                }
-            },
-            policy,
-            4,
-            &resources,
-            |config| {
+        let deployment =
+            deployment_with_resources(&root, Shape::for_policy(policy, 4), &resources, |config| {
                 config.topics.get_mut("orders").unwrap().retention = ozzy_config::TopicRetention {
                     max_age_secs: Some(120),
                     max_bytes: Some(2 * 1024 * 1024),
                 };
                 configure(config);
-            },
-        );
+            });
         let configs = deployment.clone();
         let (brokers, controls, images) = start_images(context.clone(), deployment, true).await;
         Self {
@@ -128,9 +120,8 @@ impl Cluster {
             self.context.clone(),
             checked,
             local,
-            true,
-            image,
             selections,
+            Memory::new(image, true),
         )
         .await;
         self.brokers.insert(index, broker);

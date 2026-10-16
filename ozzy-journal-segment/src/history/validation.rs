@@ -33,13 +33,27 @@ impl StorageValidationBudget {
     }
 }
 
+/// Cooperative time bound of one validation step: the first unit always
+/// runs; later units run while the step's work time remains.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct StepClock {
+    pub(super) started: Instant,
+    pub(super) max_work: Duration,
+}
+
+impl StepClock {
+    fn allows(self, progressed: bool) -> bool {
+        !progressed || self.started.elapsed() < self.max_work
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct SegmentWork<F> {
     pub(super) file: F,
     pub(super) length: usize,
     offset: usize,
-    header: Option<SegmentHeader>,
-    digest: Option<SegmentDigestBuilder>,
+    /// The checked segment header and its running digest, once read.
+    decoding: Option<(SegmentHeader, SegmentDigestBuilder)>,
     group_number: u64,
     chain: ChainPosition,
     groups: usize,
@@ -71,8 +85,7 @@ impl<F> SegmentWork<F> {
             file,
             length,
             offset: SEGMENT_HEADER_BYTES,
-            header: None,
-            digest: None,
+            decoding: None,
             group_number: reference.first_group_number,
             chain: reference.first_chain,
             groups: 0,
@@ -84,15 +97,14 @@ impl<F> SegmentWork<F> {
         &mut self,
         history: &super::HistoryState<S>,
         index: usize,
-        budget: StorageValidationBudget,
-        started: Instant,
+        clock: StepClock,
         progressed: bool,
     ) -> Result<bool, HistoryError> {
         let reference = history.pin.references()[index];
         let mut progressed = progressed;
-        if self.header.is_none()
+        if self.decoding.is_none()
             && history.bytes.len() >= SEGMENT_HEADER_BYTES
-            && (!progressed || started.elapsed() < budget.max_work)
+            && clock.allows(progressed)
         {
             let header = crate::decode_segment_header(&history.bytes[..SEGMENT_HEADER_BYTES])?;
             if header.group_id() != history.identity.group_id
@@ -101,35 +113,37 @@ impl<F> SegmentWork<F> {
             {
                 return Err(HistoryError::Source);
             }
-            self.digest = Some(SegmentDigestBuilder::new(&header));
-            self.header = Some(header);
+            let digest = SegmentDigestBuilder::new(&header);
+            self.decoding = Some((header, digest));
             progressed = true;
         }
-        while self.header.is_some()
+        while self.decoding.is_some()
             && self.offset < history.bytes.len()
-            && (!progressed || started.elapsed() < budget.max_work)
+            && clock.allows(progressed)
         {
             if !self.decode_next(history)? {
                 break;
             }
             progressed = true;
         }
-        let complete = self.header.is_some() && self.offset == self.length;
-        if complete {
-            let expected = history
-                .pin
-                .references()
-                .get(index + 1)
-                .map_or(history.physical_through, |next| {
-                    super::before(next.first_chain)
-                });
-            if self.digest.as_ref().unwrap().finish() != history.seal(index).digest
-                || super::before(self.chain) != expected
-            {
-                return Err(HistoryError::Source);
-            }
+        let Some((_, digest)) = self
+            .decoding
+            .as_ref()
+            .filter(|_| self.offset == self.length)
+        else {
+            return Ok(false);
+        };
+        let expected = history
+            .pin
+            .references()
+            .get(index + 1)
+            .map_or(history.physical_through, |next| {
+                super::before(next.first_chain)
+            });
+        if digest.finish() != history.seal(index).digest || super::before(self.chain) != expected {
+            return Err(HistoryError::Source);
         }
-        Ok(complete)
+        Ok(true)
     }
 
     fn decode_next<S: super::Source>(
@@ -144,11 +158,12 @@ impl<F> SegmentWork<F> {
             }
             .into());
         }
+        let Some((header, digest)) = self.decoding.as_mut() else {
+            return Ok(false);
+        };
         let group = match crate::decode_group(
-            self.header.as_ref().unwrap(),
-            self.group_number,
-            self.offset as u64,
-            self.chain,
+            header,
+            crate::GroupStart::new(self.group_number, self.offset as u64, self.chain),
             &history.bytes[self.offset..],
             history.decode,
         ) {
@@ -181,7 +196,7 @@ impl<F> SegmentWork<F> {
             }
             .into());
         }
-        self.digest.as_mut().unwrap().push(group.digest);
+        digest.push(group.digest);
         self.offset = usize::try_from(group.end_offset).map_err(|_| HistoryError::Capacity)?;
         self.group_number = self
             .group_number

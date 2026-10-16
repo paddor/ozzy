@@ -1,24 +1,23 @@
 //! Logical APPEND reply lanes on the existing physical broker sockets.
 
-use std::{
-    cell::RefCell,
-    collections::BTreeMap,
-    rc::Rc,
-    sync::{
-        Arc, Weak,
-        atomic::{AtomicBool, Ordering},
-    },
+use crate::transport::Frames;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
 use bytes::Bytes;
 use omq_tokio::{Message, TrySendError, message::Payload};
-use ozzy_proto::{LinkSessionId, NodeId, Opcode, Packet, RequestId, handshake::Parameters};
+use ozzy_proto::{LinkSessionId, NodeId, RequestId, handshake::Parameters};
 
 use super::{BrokerLinkError, BrokerLinks, StateSignal};
 use tokio::sync::mpsc;
 
 mod budget;
-use budget::{Budget, Cost, Lease};
+mod registry;
+use budget::{Cost, Lease};
+pub(super) use registry::{Owner, Registry};
+use registry::{Request, Stream};
 
 /// Fixed APPEND transport bounds for one SDK owner, shared across its brokers.
 /// Requests and record windows remain reserved through actual buffer release.
@@ -51,48 +50,6 @@ impl AppendLinkLimits {
     }
 }
 
-#[derive(Debug)]
-struct Stream {
-    id: RequestId,
-    sender: mpsc::Sender<Message>,
-    ready: StateSignal,
-    failed: AtomicBool,
-    memory: Arc<Lease>,
-}
-
-#[derive(Debug)]
-struct Request {
-    stream: Weak<Stream>,
-    writer: RequestId,
-    broker: NodeId,
-    session: LinkSessionId,
-    end: u64,
-    remaining_replies: usize,
-    lease: Arc<Lease>,
-}
-
-#[derive(Debug)]
-pub(super) struct Registry {
-    budget: Arc<Budget>,
-    thread: std::thread::ThreadId,
-}
-
-/// Correlations never leave the SDK executor. Public handles retain only budgets.
-#[derive(Clone, Debug)]
-pub(super) struct Owner {
-    budget: Arc<Budget>,
-    requests: Rc<Requests>,
-}
-
-type Requests = RefCell<BTreeMap<RequestId, Request>>;
-type LocalOwners = BTreeMap<usize, std::rc::Weak<Requests>>;
-
-thread_local! {
-    // Cold bootstrap lookup only. Drivers retain their owner directly afterward.
-    // Weak entries retain no requests, leases, sockets, or SDK runtime.
-    static OWNERS: RefCell<LocalOwners> = const { RefCell::new(BTreeMap::new()) };
-}
-
 /// Keeps declared SDK allocation capacity reserved through owner and alias
 /// destruction. It never keeps the socket manager or SDK runtime alive.
 #[derive(Clone, Debug)]
@@ -100,96 +57,19 @@ pub(in crate::replicated) struct Reservation {
     _lease: Arc<Lease>,
 }
 
-impl Registry {
-    pub(super) fn new(limits: Option<AppendLinkLimits>) -> Self {
-        Self {
-            budget: Arc::new(Budget::new(limits)),
-            thread: std::thread::current().id(),
-        }
-    }
-
-    pub(super) fn owner(&self) -> Owner {
-        assert_eq!(
-            self.thread,
-            std::thread::current().id(),
-            "APPEND state left its SDK owner"
-        );
-        let key = Arc::as_ptr(&self.budget) as usize;
-        let requests = OWNERS.with(|owners| {
-            let mut owners = owners.borrow_mut();
-            owners.retain(|_, owner| owner.strong_count() != 0);
-            if let Some(owner) = owners.get(&key).and_then(std::rc::Weak::upgrade) {
-                owner
-            } else {
-                let owner = Rc::new(RefCell::new(BTreeMap::new()));
-                owners.insert(key, Rc::downgrade(&owner));
-                owner
-            }
-        });
-        Owner {
-            budget: self.budget.clone(),
-            requests,
-        }
-    }
+/// One APPEND request leaving a writer: its correlation, the end of its
+/// sequence range, and the records and backing bytes it reserves.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::replicated) struct Outgoing {
+    pub(in crate::replicated) id: RequestId,
+    pub(in crate::replicated) end: u64,
+    pub(in crate::replicated) records: usize,
+    pub(in crate::replicated) retained_bytes: usize,
 }
 
-impl Owner {
-    pub(super) fn fence(&self, broker: NodeId) {
-        self.requests.borrow_mut().retain(|_, request| {
-            if request.broker != broker {
-                return true;
-            }
-            if let Some(stream) = request.stream.upgrade() {
-                stream.failed.store(true, Ordering::Release);
-            }
-            false
-        });
-    }
-
-    fn forget(&self, writer: RequestId, confirmed: Option<u64>) {
-        self.requests.borrow_mut().retain(|_, request| {
-            request.writer != writer || confirmed.is_some_and(|end| request.end > end)
-        });
-    }
-
-    /// Single physical receiver never waits for one logical writer's queue.
-    /// Canonical authority, writer identity, and offsets stay driver checks.
-    pub(super) fn receive(&self, broker: NodeId, message: &Message, packet: Packet<'_>) -> bool {
-        let Some(id) = packet.envelope.request_id else {
-            return false;
-        };
-        let mut requests = self.requests.borrow_mut();
-        let Some(request) = requests.get_mut(&id) else {
-            return false;
-        };
-        if request.broker != broker
-            || packet.envelope.session != Some(request.session)
-            || !packet.envelope.response
-            || !matches!(packet.envelope.opcode, Opcode::Appended | Opcode::Nack)
-            || !packet.payload.is_empty()
-        {
-            return true;
-        }
-        let Some(stream) = request.stream.upgrade() else {
-            return true;
-        };
-        if request.remaining_replies == 0 {
-            stream.failed.store(true, Ordering::Release);
-            self.budget.changed.notify_changed();
-            return true;
-        }
-        request.remaining_replies -= 1;
-        let lease = request.lease.clone();
-        drop(requests);
-        let response = track(message, &lease, Some(&stream.memory), true);
-        if stream.sender.try_send(response).is_err() {
-            stream.failed.store(true, Ordering::Release);
-            self.budget.changed.notify_changed();
-        } else {
-            stream.ready.notify_changed();
-        }
-        true
-    }
+/// A send that can never succeed with this configuration.
+fn configuration(reason: &'static str) -> TrySendError {
+    TrySendError::Error(omq_tokio::Error::Config(reason.into()))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -271,7 +151,7 @@ impl Connection {
     pub(in crate::replicated) const fn parameters(&self) -> Option<Parameters> {
         self.parameters
     }
-    pub(in crate::replicated) fn clock(&self) -> super::SdkClock {
+    pub(in crate::replicated) fn clock(&self) -> super::OwnerClock {
         self.links.clock()
     }
 
@@ -362,28 +242,35 @@ impl Connection {
             if self.links.0.shared.stop.is_closed() || peer.closed.is_closed() {
                 return Err(BrokerLinkError::Closed);
             }
-            if let Some(session) = self.links.session(broker)
-                && let Some(parameters) = self.links.0.shared.sessions.remote_parameters(broker)
-                && self.links.session(broker) == Some(session)
-            {
-                if parameters.capabilities & ozzy_proto::handshake::OWNER_STREAM == 0 {
+            if let Some(link) = peer.link() {
+                if link.remote.capabilities & ozzy_proto::handshake::OWNER_STREAM == 0 {
                     return Err(BrokerLinkError::Configuration);
                 }
-                self.session = Some(session);
-                self.parameters = Some(parameters);
+                self.session = Some(link.session);
+                self.parameters = Some(link.remote);
                 return Ok(());
             }
-            self.links.0.shared.changed.changed_after(seen).await;
+            // Wait for closure itself too, not only the driver's teardown change.
+            tokio::select! {
+                () = self.links.0.shared.changed.changed_after(seen) => {}
+                () = self.links.0.shared.stop.closed() => {}
+                () = peer.closed.closed() => {}
+            }
         }
     }
 
     fn live(&self) -> bool {
-        !self.links.0.shared.stop.is_closed()
+        self.bound().is_some()
+    }
+
+    /// Selected broker and session while both are current and the stream is
+    /// healthy.
+    fn bound(&self) -> Option<(NodeId, LinkSessionId)> {
+        let (broker, session) = (self.broker?, self.session?);
+        (!self.links.0.shared.stop.is_closed()
             && !self.stream.failed.load(Ordering::Acquire)
-            && self.session.is_some()
-            && self
-                .broker
-                .is_some_and(|broker| self.links.session(broker) == self.session)
+            && self.links.session(broker) == Some(session))
+        .then_some((broker, session))
     }
 
     /// Register before actual socket admission on the same SDK thread. A full
@@ -391,44 +278,22 @@ impl Connection {
     pub(in crate::replicated) fn try_send(
         &mut self,
         message: Message,
-        id: RequestId,
-        end: u64,
-        records: usize,
-        retained_bytes: usize,
+        outgoing: Outgoing,
     ) -> Result<(), TrySendError> {
-        if !self.live() {
+        let Some((broker, session)) = self.bound() else {
             return Err(TrySendError::Closed);
-        }
-        let broker = self.broker.expect("selected broker");
-        let replies = records.checked_add(1);
-        let bytes = Self::request_bytes(&self.links, records, retained_bytes);
-        let Some(bytes) = bytes.filter(|_| records != 0) else {
-            return Err(TrySendError::Error(omq_tokio::Error::Config(
-                "invalid shared APPEND reservation".into(),
-            )));
         };
-        let cost = Cost {
-            requests: 1,
-            records,
-            bytes,
-            ..Cost::default()
-        };
+        let (cost, replies) = self.cost(outgoing)?;
         let registry = &self.registry;
-        if !registry.budget.possible(cost) {
-            return Err(TrySendError::Error(omq_tokio::Error::Config(
-                "shared APPEND exceeds aggregate capacity".into(),
-            )));
-        }
         let Some(lease) = registry.budget.acquire(cost) else {
             self.blocked = Some(Blocked::Budget(cost));
             return Err(TrySendError::Full(message));
         };
         let tracked = track(&message, &lease, Some(&self.stream.memory), false);
+        let id = outgoing.id;
         let mut requests = registry.requests.borrow_mut();
         if requests.contains_key(&id) {
-            return Err(TrySendError::Error(omq_tokio::Error::Config(
-                "duplicate shared APPEND request ID".into(),
-            )));
+            return Err(configuration("duplicate shared APPEND request ID"));
         }
         requests.insert(
             id,
@@ -436,9 +301,9 @@ impl Connection {
                 stream: Arc::downgrade(&self.stream),
                 writer: self.stream.id,
                 broker,
-                session: self.session.unwrap(),
-                end,
-                remaining_replies: replies.unwrap(),
+                session,
+                end: outgoing.end,
+                remaining_replies: replies,
                 lease,
             },
         );
@@ -460,6 +325,28 @@ impl Connection {
                 }
             }
         }
+    }
+
+    /// Budget cost and expected reply count of `outgoing`. A reservation
+    /// that is invalid or exceeds aggregate capacity can never be admitted.
+    fn cost(&self, outgoing: Outgoing) -> Result<(Cost, usize), TrySendError> {
+        let records = outgoing.records;
+        let reservation = Self::request_bytes(&self.links, records, outgoing.retained_bytes)
+            .filter(|_| records != 0)
+            .zip(records.checked_add(1));
+        let Some((bytes, replies)) = reservation else {
+            return Err(configuration("invalid shared APPEND reservation"));
+        };
+        let cost = Cost {
+            requests: 1,
+            records,
+            bytes,
+            ..Cost::default()
+        };
+        if !self.registry.budget.possible(cost) {
+            return Err(configuration("shared APPEND exceeds aggregate capacity"));
+        }
+        Ok((cost, replies))
     }
 
     /// Only the writer's validated confirmed prefix retires correlations.
@@ -526,9 +413,9 @@ impl Connection {
         loop {
             let generation = registry.budget.changed.generation();
             let links = self.links.0.shared.changed.generation();
-            if !self.live() {
+            let Some((broker, _)) = self.bound() else {
                 return;
-            }
+            };
             let blocked = self.blocked;
             if let Some(Blocked::Budget(cost)) = blocked {
                 if registry.budget.available(cost) {
@@ -540,7 +427,6 @@ impl Connection {
                     () = self.links.0.shared.stop.closed() => return,
                 }
             } else {
-                let broker = self.broker.expect("selected broker");
                 tokio::select! {
                     () = crate::transport::wait_send_peer(&self.links.0.peers[&broker].data, message) => {},
                     () = self.links.0.shared.changed.changed_after(links) => {},
@@ -576,18 +462,18 @@ fn track(
     memory: Option<&Arc<Lease>>,
     compact: bool,
 ) -> Message {
-    Message::multipart_payloads((0..4).map(|index| {
-        let payload = if compact {
-            Payload::from_slice(message.part_slice(index).unwrap())
-        } else {
-            Payload::from_bytes(message.part_bytes(index).unwrap())
-        };
+    let tracked = |payload| {
         Payload::from_bytes(Bytes::from_owner(Tracked {
             payload,
             _lease: lease.clone(),
             _memory: memory.cloned(),
         }))
-    }))
+    };
+    if compact {
+        Message::multipart_payloads(message.slices().map(Payload::from_slice).map(tracked))
+    } else {
+        Message::multipart_payloads(message.iter().map(Payload::from_bytes).map(tracked))
+    }
 }
 
 #[cfg(test)]

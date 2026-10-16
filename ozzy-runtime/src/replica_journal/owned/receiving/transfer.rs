@@ -1,9 +1,10 @@
 use super::{
-    AppendBuffer, JournalError, PublishedRecovery, QuorumPolicy, RecoveringJournal, RecoveryError,
-    RecoveryPlan, RecoveryTicket, State, SuffixStreamLimits, authority,
+    AppendBuffer, GroupJournal, JournalError, PublishedRecovery, QuorumPolicy, RecoveringJournal,
+    RecoveryError, RecoveryPlan, RecoveryTicket, SealedRepair, State, SuffixInstaller,
+    SuffixStreamLimits, recover_nonvoting,
 };
-use crate::replica_journal::owned::prefix;
-use crate::replica_journal::{InstallationConfig, ReceivedChunk, authority::position};
+use crate::replica_journal::owned::{install::stage_chunks, prefix};
+use crate::replica_journal::{InstallationConfig, ReceivedChunk, authority, authority::position};
 use ozzy_journal_segment::{RecoveryPublication, SealedRepairLimits, SuffixReplacement};
 use ozzy_replication::{FrozenLog, Prefix, PreparedOperation, RecoveredState, Scope};
 
@@ -26,30 +27,18 @@ impl RecoveringJournal {
             self.generations.attempt,
             &ticket,
         )?;
-        if physical.segment_capacity > self.config.limits.io.max_segment_bytes
-            || !physical.body_encoding.is_supported()
-            || physical.max_staged_bytes < physical.segment_capacity
-            || physical.max_orphan_probes == 0
-        {
-            return Err(JournalError::Configuration);
-        }
-        if ticket.checkpoint().is_some() && matches!(self.state, State::Directory(_)) {
-            let State::Directory(directory) = self.take_state() else {
-                unreachable!("checked directory");
+        let limits = physical.stream_limits(&self.config.limits, self.config.append_limits)?;
+        if ticket.checkpoint().is_some() {
+            self.state = match self.take_state() {
+                State::Directory(directory) => {
+                    recover_nonvoting(*directory, &self.config, self.generations.temporary).await?
+                }
+                state => state,
             };
-            self.state = State::Journal(Box::new(
-                directory
-                    .recover_nonvoting(
-                        &self.config.configuration.encode(),
-                        self.generations.temporary,
-                        self.config.limits.directory_entries,
-                    )
-                    .await?,
-            ));
         }
         self.prepare_checkpoint(&ticket).await?;
         if matches!(self.state, State::Directory(_))
-            && let Some(plan) = self.begin_repair(&ticket, physical).await?
+            && let Some(plan) = self.begin_repair(&ticket, physical, limits).await?
         {
             self.attempt = Some(ticket);
             self.faulted = false;
@@ -58,6 +47,22 @@ impl RecoveringJournal {
         let State::Journal(journal) = self.take_state() else {
             return Err(JournalError::Faulted);
         };
+        let staging = Box::pin(self.begin_replacement(journal, &ticket, physical, limits)).await?;
+        self.state = State::Installing(Box::new((staging, limits)));
+        self.attempt = Some(ticket);
+        self.faulted = false;
+        Ok(RecoveryPlan::Full)
+    }
+
+    /// Stage a full replacement of `journal` from the donor's source, from
+    /// its checkpoint when the ticket names one.
+    async fn begin_replacement(
+        &self,
+        journal: Box<GroupJournal>,
+        ticket: &RecoveryTicket,
+        physical: InstallationConfig,
+        limits: SuffixStreamLimits,
+    ) -> Result<SuffixInstaller, JournalError> {
         let replacement = SuffixReplacement {
             expected_current: journal.current(),
             protected_committed: position(Prefix::GENESIS),
@@ -68,30 +73,17 @@ impl RecoveringJournal {
             segment_capacity: physical.segment_capacity,
             body_encoding: physical.body_encoding,
         };
-        let limits = SuffixStreamLimits {
-            max_group_operations: self
-                .config
-                .append_limits
-                .max_operations
-                .min(self.config.limits.decode.max_entries),
-            max_group_body_bytes: self
-                .config
-                .append_limits
-                .max_body_bytes
-                .min(self.config.limits.decode.max_group_decoded_body_bytes),
-            max_segments: self.config.limits.metadata.max_segments,
-            max_staged_bytes: physical.max_staged_bytes,
-            max_source_segment_bytes: self.config.limits.io.max_segment_bytes,
-            max_orphan_probes: physical.max_orphan_probes,
-        };
         let configuration = self.config.configuration.encode();
+        let request = ozzy_journal_segment::SuffixRequest {
+            replacement,
+            accepted: position(ticket.source().accepted),
+            limits,
+        };
         let staging = if let Some(anchor) = ticket.checkpoint() {
             journal
                 .begin_checkpoint_replacement(
                     &configuration,
-                    replacement,
-                    position(ticket.source().accepted),
-                    limits,
+                    request,
                     ozzy_journal_segment::CheckpointRecovery {
                         predecessor: position(anchor.predecessor),
                         position: position(anchor.position),
@@ -100,24 +92,17 @@ impl RecoveringJournal {
                 .await?
         } else {
             journal
-                .begin_recovery_replacement(
-                    &configuration,
-                    replacement,
-                    position(ticket.source().accepted),
-                    limits,
-                )
+                .begin_recovery_replacement(&configuration, request)
                 .await?
         };
-        self.state = State::Installing(Box::new((staging, limits)));
-        self.attempt = Some(ticket);
-        self.faulted = false;
-        Ok(RecoveryPlan::Full)
+        Ok(staging)
     }
 
     async fn begin_repair(
         &mut self,
         ticket: &RecoveryTicket,
         physical: InstallationConfig,
+        limits: SuffixStreamLimits,
     ) -> Result<Option<RecoveryPlan>, JournalError> {
         let State::Directory(directory) = self.take_state() else {
             return Err(JournalError::Faulted);
@@ -126,44 +111,31 @@ impl RecoveringJournal {
             .manifest()
             .segments
             .last()
-            .expect("active segment")
+            .ok_or(ozzy_journal_segment::DirectoryError::MissingActiveSegment)?
             .first_chain;
         let source = ticket.source().accepted;
         let sealed_end = boundary.next_op_number() - 1;
         if sealed_end > source.op.0
             || (sealed_end == source.op.0 && boundary.previous_digest() != source.digest)
         {
-            self.state = State::Journal(Box::new(
-                directory
-                    .recover_nonvoting(
-                        &self.config.configuration.encode(),
-                        self.generations.temporary,
-                        self.config.limits.directory_entries,
-                    )
-                    .await?,
-            ));
+            self.state =
+                recover_nonvoting(*directory, &self.config, self.generations.temporary).await?;
             return Ok(None);
         }
         let repair = directory
             .begin_sealed_repair(
                 &self.config.configuration.encode(),
                 self.generations.attempt,
-                ticket.scope().view,
-                position(source),
+                ozzy_journal_segment::RepairSource {
+                    view: ticket.scope().view,
+                    accepted: position(source),
+                },
                 SealedRepairLimits {
                     max_segment_bytes: self.config.limits.io.max_segment_bytes,
-                    max_chunk_operations: self
-                        .config
-                        .append_limits
-                        .max_operations
-                        .min(self.config.limits.decode.max_entries),
-                    max_chunk_body_bytes: self
-                        .config
-                        .append_limits
-                        .max_body_bytes
-                        .min(self.config.limits.decode.max_group_decoded_body_bytes),
-                    max_staged_bytes: physical.max_staged_bytes,
-                    max_orphan_probes: physical.max_orphan_probes,
+                    max_chunk_operations: limits.max_group_operations,
+                    max_chunk_body_bytes: limits.max_group_body_bytes,
+                    max_staged_bytes: limits.max_staged_bytes,
+                    max_orphan_probes: limits.max_orphan_probes,
                     body_encoding: physical.body_encoding,
                 },
             )
@@ -200,22 +172,7 @@ impl RecoveringJournal {
             },
             State::Installing(pending) => {
                 let (staging, limits) = &mut **pending;
-                let mut first = 0;
-                let mut bytes = 0;
-                for (index, operation) in operations.iter().enumerate() {
-                    if operation.body.len() > limits.max_group_body_bytes {
-                        return Err(JournalError::AppendCapacity);
-                    }
-                    if index - first == limits.max_group_operations
-                        || bytes > limits.max_group_body_bytes - operation.body.len()
-                    {
-                        staging.append_chunk(&operations[first..index]).await?;
-                        first = index;
-                        bytes = 0;
-                    }
-                    bytes += operation.body.len();
-                }
-                staging.append_chunk(&operations[first..]).await?;
+                stage_chunks(staging, *limits, &operations).await?;
                 RecoveryPlan::Full
             }
             _ => return Err(RecoveryError::StaleTransfer.into()),
@@ -258,84 +215,8 @@ impl RecoveringJournal {
             return Ok(published);
         }
         let (mut journal, published) = match self.take_state() {
-            State::Repair(repair) => {
-                let journal = Box::pin(
-                    repair.finish(&self.config.configuration.encode(), self.config.recovery),
-                )
-                .await?;
-                let manifest = journal.manifest();
-                let recovered = RecoveredState {
-                    scope: Scope {
-                        view: manifest.promised_view,
-                        ..ticket.scope()
-                    },
-                    log: FrozenLog {
-                        last_normal_view: manifest.last_normal_view,
-                        accepted: prefix(manifest.accepted),
-                        committed: prefix(manifest.committed),
-                    },
-                };
-                (
-                    journal,
-                    PublishedRecovery {
-                        ticket,
-                        applied: recovered.log.committed,
-                        repaired: Some(recovered),
-                    },
-                )
-            }
-            State::Installing(staging) => {
-                let mut journal = if let Some(anchor) = ticket.checkpoint() {
-                    let checkpoint = self
-                        .checkpoint
-                        .take()
-                        .ok_or(JournalError::HistorySourceMismatch)?;
-                    checkpoint
-                        .state
-                        .as_ref()
-                        .ok_or(JournalError::HistorySourceMismatch)?;
-                    let journal = Box::pin(staging.0.finish_with_checkpoint(
-                        ozzy_journal_segment::CanonicalCheckpointImport {
-                            id: ozzy_proto::CheckpointId::from_bytes(*ticket.nonce().as_bytes()),
-                            position: position(anchor.position),
-                            image: &checkpoint.inbox,
-                            state_limits: self.config.recovery.state,
-                            snapshot_limits: self.config.recovery.snapshot,
-                        },
-                    ))
-                    .await?;
-                    checkpoint.inbox.discard().await?;
-                    journal
-                } else {
-                    Box::pin(staging.0.finish()).await?
-                };
-                let publication = RecoveryPublication {
-                    current: journal.current(),
-                    generation: self.generations.attempt,
-                    view: ticket.scope().view,
-                    accepted: position(ticket.source().accepted),
-                    committed: position(ticket.committed()),
-                };
-                let candidate = journal
-                    .publish_recovered_configuration(
-                        &self.config.configuration.encode(),
-                        publication,
-                        self.config.recovery,
-                    )
-                    .await?;
-                if candidate.committed_images().committed().revision() != ticket.committed().op.0 {
-                    return Err(JournalError::CompletionMismatch);
-                }
-                drop(candidate);
-                (
-                    journal,
-                    PublishedRecovery {
-                        ticket,
-                        applied: ticket.committed(),
-                        repaired: None,
-                    },
-                )
-            }
+            State::Repair(repair) => self.finish_repair(repair, &ticket).await?,
+            State::Installing(staging) => Box::pin(self.finish_transfer(staging, &ticket)).await?,
             _ => return Err(RecoveryError::StaleTransfer.into()),
         };
         if self.config.configuration.configuration().policy() == QuorumPolicy::Replicated {
@@ -345,5 +226,91 @@ impl RecoveringJournal {
         self.published = Some(published);
         self.faulted = false;
         Ok(published)
+    }
+
+    /// Publish repaired sealed files; their manifest is the recovered state.
+    async fn finish_repair(
+        &self,
+        repair: Box<SealedRepair>,
+        ticket: &RecoveryTicket,
+    ) -> Result<(GroupJournal, PublishedRecovery), JournalError> {
+        let journal =
+            Box::pin(repair.finish(&self.config.configuration.encode(), self.config.recovery))
+                .await?;
+        let manifest = journal.manifest();
+        let recovered = RecoveredState {
+            scope: Scope {
+                view: manifest.promised_view,
+                ..ticket.scope()
+            },
+            log: FrozenLog {
+                last_normal_view: manifest.last_normal_view,
+                accepted: prefix(manifest.accepted),
+                committed: prefix(manifest.committed),
+            },
+        };
+        let published = PublishedRecovery {
+            ticket: *ticket,
+            applied: recovered.log.committed,
+            repaired: Some(recovered),
+        };
+        Ok((journal, published))
+    }
+
+    /// Publish a fully transferred replacement once its replayed state
+    /// commits exactly through the ticket.
+    async fn finish_transfer(
+        &mut self,
+        staging: Box<(SuffixInstaller, SuffixStreamLimits)>,
+        ticket: &RecoveryTicket,
+    ) -> Result<(GroupJournal, PublishedRecovery), JournalError> {
+        let mut journal = if let Some(anchor) = ticket.checkpoint() {
+            let checkpoint = self
+                .checkpoint
+                .take()
+                .ok_or(JournalError::HistorySourceMismatch)?;
+            checkpoint
+                .state
+                .as_ref()
+                .ok_or(JournalError::HistorySourceMismatch)?;
+            let journal = Box::pin(staging.0.finish_with_checkpoint(
+                ozzy_journal_segment::CanonicalCheckpointImport {
+                    id: ozzy_proto::CheckpointId::from_bytes(*ticket.nonce().as_bytes()),
+                    position: position(anchor.position),
+                    image: &checkpoint.inbox,
+                    state_limits: self.config.recovery.state,
+                    snapshot_limits: self.config.recovery.snapshot,
+                },
+            ))
+            .await?;
+            checkpoint.inbox.discard().await?;
+            journal
+        } else {
+            Box::pin(staging.0.finish()).await?
+        };
+        let publication = RecoveryPublication {
+            current: journal.current(),
+            generation: self.generations.attempt,
+            view: ticket.scope().view,
+            accepted: position(ticket.source().accepted),
+            committed: position(ticket.committed()),
+        };
+        let candidate = journal
+            .publish_recovered_configuration(
+                &self.config.configuration.encode(),
+                publication,
+                self.config.recovery,
+            )
+            .await?;
+        if candidate.committed_images().committed().revision() != ticket.committed().op.0 {
+            return Err(JournalError::CompletionMismatch);
+        }
+        drop(candidate);
+        let published = PublishedRecovery {
+            ticket: *ticket,
+            applied: ticket.committed(),
+            repaired: None,
+        };
+        Ok((journal, published))
     }
 }

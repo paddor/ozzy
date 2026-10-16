@@ -2,12 +2,13 @@
 //! separate publications; all old selected files survive an interrupted repair.
 
 use super::{Journal, RecoveryDirectory, recovery_marker};
-use crate::directory::{position_before, recovery::repair::state, segment_reference_name};
+use crate::directory::recovery::repair::{State, validate_image};
+use crate::directory::segment_reference_name;
+use crate::metadata::position_before;
 use crate::{
-    AsyncSegmentStart, AsyncSegmentWriter, CanonicalOperation, CanonicalRecoveryLimits,
-    CurrentReference, Digest, DirectoryError, LogPosition, RecoveryPublication,
-    RecoveryPublicationError, RepairRange, SealedRepairLimits, SealedSegment, SegmentHeader,
-    SegmentReference, WriterError,
+    CanonicalOperation, CanonicalRecoveryLimits, Digest, DirectoryError, RecoveryPublication,
+    RecoveryPublicationError, RepairRange, RepairSource, SealedRepairLimits, SealedSegment,
+    SegmentHeader, SegmentReference, SegmentStart, SegmentWriter, WriterError,
 };
 use ozzy_io::{OpenMode, Operation};
 use ozzy_journal::progress::JournalGeneration;
@@ -18,7 +19,7 @@ use std::io;
 #[derive(Debug)]
 pub struct Repair {
     directory: RecoveryDirectory,
-    state: state::State,
+    state: State,
     replacements: Vec<SegmentReference>,
     generation: JournalGeneration,
     staged_bytes: u64,
@@ -81,14 +82,7 @@ impl RecoveryDirectory {
                 return Err(DirectoryError::SegmentMismatch(reference.segment_id));
             }
             let valid = match self.read_segment(*reference).await {
-                Ok(image) => state::validate_image(
-                    &self.manifest,
-                    index,
-                    &image,
-                    protected,
-                    self.limits.decode,
-                    self.limits.operations,
-                ),
+                Ok(image) => validate_image(&self.manifest, index, &image, protected, self.limits),
                 Err(error) => Err(error),
             };
             if let Err(DirectoryError::Io(error)) = &valid
@@ -117,8 +111,7 @@ impl RecoveryDirectory {
         mut self,
         configuration: &[u8],
         generation: JournalGeneration,
-        view: u64,
-        source_accepted: LogPosition,
+        source: RepairSource,
         limits: SealedRepairLimits,
     ) -> Result<Repair, DirectoryError> {
         let marker = recovery_marker(configuration)?;
@@ -126,20 +119,12 @@ impl RecoveryDirectory {
             return Err(DirectoryError::ConfigurationMismatch);
         }
         self.require_selected(&marker).await?;
-        state::State::validate_limits(self.limits.decode, limits)?;
+        State::validate_limits(self.limits.decode, limits)?;
         let ranges = self
             .sealed_damage(limits.max_segment_bytes)
             .await?
             .ok_or(DirectoryError::ConfigurationMismatch)?;
-        let state = state::State::new(
-            &self.manifest,
-            ranges,
-            view,
-            source_accepted,
-            self.limits.decode,
-            self.limits.operations,
-            limits,
-        )?;
+        let state = State::new(&self.manifest, ranges, source, self.limits, limits)?;
         let mut repair = Repair {
             directory: self,
             state,
@@ -217,7 +202,7 @@ impl Repair {
             .segments
             .iter()
             .find(|r| r.segment_id == range.segment_id)
-            .expect("repair source");
+            .ok_or(DirectoryError::SegmentMismatch(range.segment_id))?;
         self.state.prepare(range, reference)?;
         let image = match self.directory.read_segment(reference).await {
             Ok(image) => image,
@@ -236,7 +221,9 @@ impl Repair {
         let mut chunk = Vec::with_capacity(self.state.limits.max_chunk_operations);
         let mut bytes = 0;
         for entry in &self.state.source {
-            let entry = entry.as_ref().expect("complete repair source");
+            let Some(entry) = entry else {
+                return Err(DirectoryError::SegmentMismatch(range.segment_id));
+            };
             if entry.body.len() > self.state.limits.max_chunk_body_bytes {
                 return Err(DirectoryError::SegmentMismatch(range.segment_id));
             }
@@ -292,15 +279,15 @@ impl Repair {
     async fn create_replacement(
         &mut self,
         id: u64,
-    ) -> Result<(SegmentReference, AsyncSegmentWriter), DirectoryError> {
-        let index = self
-            .directory
-            .manifest
-            .segments
-            .iter()
-            .position(|r| r.segment_id == id)
-            .expect("planned segment");
-        let mut reference = self.directory.manifest.segments[index];
+    ) -> Result<(SegmentReference, SegmentWriter), DirectoryError> {
+        let segments = &self.directory.manifest.segments;
+        // Each selected segment paired with the one before it.
+        let (predecessor, mut reference) = std::iter::once(None)
+            .chain(segments.iter().map(Some))
+            .zip(segments)
+            .find(|(_, segment)| segment.segment_id == id)
+            .map(|(previous, segment)| (previous.map(|previous| previous.segment_id), *segment))
+            .ok_or(DirectoryError::SegmentMismatch(id))?;
         let staged = self
             .staged_bytes
             .checked_add(reference.capacity)
@@ -308,9 +295,6 @@ impl Repair {
         if staged > self.state.limits.max_staged_bytes {
             return Err(DirectoryError::SegmentMismatch(id));
         }
-        let predecessor = index
-            .checked_sub(1)
-            .map(|i| self.directory.manifest.segments[i].segment_id);
         let header = SegmentHeader::new(
             self.directory.manifest.identity.group_id,
             id,
@@ -323,16 +307,16 @@ impl Repair {
                 .file_generation
                 .checked_add(1)
                 .ok_or(DirectoryError::SegmentIdExhausted)?;
-            let writer = AsyncSegmentWriter::create(
-                self.directory
-                    .root()
-                    .join(segment_reference_name(reference)),
-                self.directory.access.io.clone(),
-                self.directory.access.protection.clone(),
+            let writer = SegmentWriter::create(
+                self.directory.access.segment_file(
+                    self.directory
+                        .root()
+                        .join(segment_reference_name(reference)),
+                ),
                 header
                     .clone()
                     .with_file_generation(reference.file_generation),
-                AsyncSegmentStart {
+                SegmentStart {
                     generation: self.generation,
                     first_group_number: reference.first_group_number,
                     initial_chain: reference.first_chain,
@@ -375,36 +359,22 @@ impl Repair {
             .access
             .sync_directory(self.directory.root().join("segments"))
             .await?;
-        let mut next = self.directory.manifest.clone();
-        next.parent_generation = next.generation;
-        next.generation = next
-            .generation
-            .checked_add(1)
-            .ok_or(DirectoryError::ManifestGeneration)?;
+        let mut next = super::super::metadata::successor(&self.directory.manifest)?;
         next.promised_view = self.state.view;
         for replacement in self.replacements {
             *next
                 .segments
                 .iter_mut()
                 .find(|r| r.segment_id == replacement.segment_id)
-                .expect("selected repair segment") = replacement;
+                .ok_or(DirectoryError::SegmentMismatch(replacement.segment_id))? = replacement;
         }
-        let (manifest, manifest_digest) = self
-            .directory
-            .directory
-            .publish_manifest(
-                &self.directory.manifest,
-                next,
-                self.directory.limits.metadata,
-            )
-            .await?;
-        let current = CurrentReference {
-            group_id: manifest.identity.group_id,
-            store_id: manifest.identity.store_id,
-            generation: manifest.generation,
-            manifest_digest,
-        };
-        self.directory.directory.select_current(current).await?;
+        let (manifest, _) = super::super::metadata::publish_selected(
+            &mut self.directory.directory,
+            &self.directory.manifest,
+            next,
+            self.directory.limits.metadata,
+        )
+        .await?;
         let selected = self
             .directory
             .directory

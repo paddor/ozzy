@@ -18,12 +18,27 @@ impl LocalActor {
         let mut changed = false;
         if let Some(work) = self.persistence.front_mut()
             && let Poll::Ready(result) = Pin::new(&mut work.0).poll(cx)
+            && let Some((_, started_at)) = self.persistence.pop_front()
         {
-            let (_, started_at) = self.persistence.pop_front().expect("completed write");
             crate::profiling::finish(crate::profiling::Stage::LocalWrite, started_at);
             self.driver.complete_write(result?)?;
             changed = true;
         }
+        changed |= self.poll_sync(cx)?;
+        if self.journal.available_command_slots() != 0 {
+            changed |= self.poll_pending(cx)?;
+        }
+        changed |= self.reply_committed()?;
+        changed |= self.schedule()?;
+        if !self.closing && self.pending.is_none() && self.proposals.is_idle() {
+            self.ingress.resume();
+            changed |= self.ingress.poll_ready(cx).is_ready();
+        }
+        Ok(changed)
+    }
+
+    /// Advance the barrier: publish its synced prefix, then install it.
+    fn poll_sync(&mut self, cx: &mut Context<'_>) -> Result<bool, ActorError> {
         let sync = if self.journal.available_command_slots() == 0 {
             Poll::Pending
         } else {
@@ -31,54 +46,54 @@ impl LocalActor {
                 .as_mut()
                 .map_or(Poll::Pending, |sync| std::pin::pin!(sync.wait()).poll(cx))
         };
-        if let Poll::Ready(result) = sync {
-            self.sync = match result? {
-                SyncEvent::Ready(ready) => {
-                    crate::profiling::finish(
-                        crate::profiling::Stage::LocalSyncPublish,
-                        self.sync_started_at.take(),
-                    );
-                    let install = self
-                        .journal
-                        .finish_pipelined_sync(ready)
-                        .map_err(|rejected| rejected.reason)?;
-                    self.sync_install_started_at = crate::profiling::start();
-                    Some(PendingSync::Install(install))
-                }
-                SyncEvent::Installed(ticket) => {
-                    crate::profiling::finish(
-                        crate::profiling::Stage::LocalSyncInstall,
-                        self.sync_install_started_at.take(),
-                    );
-                    self.driver.complete_sync(ticket)?;
-                    None
-                }
-            };
-            changed = true;
-        }
-        if self.journal.available_command_slots() != 0 {
-            changed |= self.poll_pending(cx)?;
-        }
-        if let Some(front) = self.live.front()
-            && front.buffer.is_some()
-            && front.through.op <= self.driver.snapshot().applied.op
-        {
-            let live = self.live.pop_front().expect("confirmed request");
-            live.reply.finish(
-                live.buffer.expect("admitted buffer").into(),
-                ProposalOutcome::Committed {
-                    scope: self.driver.begin_validation()?.scope(),
-                    through: live.through,
-                },
-            );
-            changed = true;
-        }
-        changed |= self.schedule()?;
-        if !self.closing && self.pending.is_none() && self.proposals.is_idle() {
-            self.ingress.resume();
-            changed |= std::pin::pin!(self.ingress.ready()).poll(cx).is_ready();
-        }
-        Ok(changed)
+        let Poll::Ready(result) = sync else {
+            return Ok(false);
+        };
+        self.sync = match result? {
+            SyncEvent::Ready(ready) => {
+                crate::profiling::finish(
+                    crate::profiling::Stage::LocalSyncPublish,
+                    self.sync_started_at.take(),
+                );
+                let install = self
+                    .journal
+                    .finish_pipelined_sync(ready)
+                    .map_err(|rejected| rejected.reason)?;
+                self.sync_install_started_at = crate::profiling::start();
+                Some(PendingSync::Install(install))
+            }
+            SyncEvent::Installed(ticket) => {
+                crate::profiling::finish(
+                    crate::profiling::Stage::LocalSyncInstall,
+                    self.sync_install_started_at.take(),
+                );
+                self.driver.complete_sync(ticket)?;
+                None
+            }
+        };
+        Ok(true)
+    }
+
+    /// Answer the oldest live proposal once its write applied.
+    fn reply_committed(&mut self) -> Result<bool, ActorError> {
+        let applied = self.driver.snapshot().applied.op;
+        let Some(live) = self
+            .live
+            .pop_front_if(|front| front.buffer.is_some() && front.through.op <= applied)
+        else {
+            return Ok(false);
+        };
+        let Some(buffer) = live.buffer else {
+            return Ok(false);
+        };
+        live.reply.finish(
+            buffer.into(),
+            ProposalOutcome::Committed {
+                scope: self.driver.begin_validation()?.scope(),
+                through: live.through,
+            },
+        );
+        Ok(true)
     }
 
     fn poll_pending(&mut self, cx: &mut Context<'_>) -> Result<bool, ActorError> {
@@ -89,40 +104,18 @@ impl LocalActor {
             Pending::Retention(work) => match Pin::new(work).poll(cx) {
                 Poll::Pending => false,
                 Poll::Ready(result) => {
-                    let turn = result?;
                     self.foreground_turn_due = true;
-                    if turn.expired_identities != 0 {
-                        self.proposals.release_capacity();
-                    }
-                    if !turn.enabled {
-                        self.retention.at = None;
-                    } else if turn.more_work {
-                        // Identity expiry continues without draining the
-                        // journal again; record retention repeats its turn.
-                        self.retention.identities = turn.expired_identities != 0;
-                        self.retention.at = self.config.retention_interval.map(|_| self.now);
-                    }
-                    if let Some(buffer) = turn.proposal {
-                        self.proposals.set_maintenance(buffer);
-                    }
+                    self.retention
+                        .complete_turn(result?, self.now, &mut self.proposals);
                     true
                 }
             },
             Pending::IdentityRetention(work) => match Pin::new(work).poll(cx) {
                 Poll::Pending => false,
                 Poll::Ready(result) => {
-                    let turn = result?;
                     self.foreground_turn_due = true;
-                    if turn.expired != 0 {
-                        self.proposals.release_capacity();
-                    }
-                    if turn.more_work {
-                        self.retention.identities = true;
-                        self.retention.at = self.config.retention_interval.map(|_| self.now);
-                    }
-                    if let Some(buffer) = turn.proposal {
-                        self.proposals.set_maintenance(buffer);
-                    }
+                    self.retention
+                        .complete_identities(result?, self.now, &mut self.proposals);
                     true
                 }
             },
@@ -211,30 +204,7 @@ impl LocalActor {
                 through,
                 buffer,
             } => {
-                let current = self.driver.begin_validation()?;
-                if current != validation {
-                    if self.closing || reply.fenced() {
-                        reply.finish(buffer, ProposalOutcome::NotAdmitted);
-                    } else {
-                        self.proposals.requeue(super::Submission { buffer, reply });
-                    }
-                } else if through.op <= current.applied().op {
-                    // A confirmed query or retry must not wait behind a newer
-                    // live append whose storage work is still pending.
-                    reply.finish(
-                        buffer,
-                        ProposalOutcome::Committed {
-                            scope: current.scope(),
-                            through,
-                        },
-                    );
-                } else {
-                    self.live.push_back(Live {
-                        through,
-                        reply,
-                        buffer: Some(buffer.0),
-                    });
-                }
+                self.complete_resolved(super::Submission { buffer, reply }, validation, through)?;
             }
             ProposalValidation::Ready(validated) if self.closing || reply.fenced() => {
                 reply.finish(validated.into_buffer().into(), ProposalOutcome::NotAdmitted);
@@ -250,6 +220,41 @@ impl LocalActor {
                 });
                 self.admit_ready(ticket, validated)?;
             }
+        }
+        Ok(())
+    }
+
+    /// A query or retry resolved to an earlier write: answer once that write
+    /// applied, or wait for it. A stale validation asks again.
+    fn complete_resolved(
+        &mut self,
+        super::Submission { buffer, reply }: super::Submission,
+        validation: ozzy_replication::driver::ValidationTicket,
+        through: ozzy_replication::Prefix,
+    ) -> Result<(), ActorError> {
+        let current = self.driver.begin_validation()?;
+        if current != validation {
+            if self.closing || reply.fenced() {
+                reply.finish(buffer, ProposalOutcome::NotAdmitted);
+            } else {
+                self.proposals.requeue(super::Submission { buffer, reply });
+            }
+        } else if through.op <= current.applied().op {
+            // A confirmed query or retry must not wait behind a newer
+            // live append whose storage work is still pending.
+            reply.finish(
+                buffer,
+                ProposalOutcome::Committed {
+                    scope: current.scope(),
+                    through,
+                },
+            );
+        } else {
+            self.live.push_back(Live {
+                through,
+                reply,
+                buffer: Some(buffer.0),
+            });
         }
         Ok(())
     }

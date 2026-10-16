@@ -2,6 +2,7 @@
 //! Transport and shared broker dispatch remain outside partition authority.
 
 mod progress;
+use super::retention_turns::{RetentionDue, RetentionStep};
 use super::{
     ActorError, ProposalOutcome, ProposalSubmitter,
     ingress::{Ingress, NextProposal, ProposalWait, Proposals, Reply, Submission},
@@ -65,15 +66,6 @@ struct Live {
     through: Prefix,
     reply: Reply,
     buffer: Option<AppendBuffer>,
-}
-
-/// Pending retention work: the next settled retention turn, and whether
-/// identity expiry owes a bounded step that runs between foreground turns
-/// without waiting for a settled journal.
-#[derive(Debug, Clone, Copy)]
-struct RetentionDue {
-    at: Option<std::time::Duration>,
-    identities: bool,
 }
 
 /// One local-durable partition actor. It polls storage futures on its application
@@ -198,10 +190,7 @@ impl LocalActor {
         Ok(Self {
             journal,
             now: std::time::Duration::ZERO,
-            retention: RetentionDue {
-                at: config.retention_interval,
-                identities: false,
-            },
+            retention: RetentionDue::new(config.retention_interval),
             foreground_turn_due: false,
             driver,
             config,
@@ -323,10 +312,9 @@ impl LocalActor {
         if self.journal.available_command_slots() == 0 {
             return Ok(false);
         }
-        if matches!(self.pending, Some(Pending::Ready(_))) {
-            let Some(Pending::Ready(ready)) = self.pending.take() else {
-                unreachable!("ready admission");
-            };
+        if let Some(Pending::Ready(_)) = self.pending
+            && let Some(Pending::Ready(ready)) = self.pending.take()
+        {
             let (ticket, validated) = *ready;
             return self.admit_ready(ticket, validated);
         }
@@ -352,56 +340,57 @@ impl LocalActor {
             return Ok(true);
         }
         if self.closing {
-            if self.proposals.reject_all() != 0 {
-                return Ok(true);
-            }
-            if let Some(waiting) = self.ingress.pop() {
-                waiting
-                    .reply
-                    .finish(waiting.buffer, ProposalOutcome::NotAdmitted);
-                return Ok(true);
-            }
-            return Ok(changed);
+            return Ok(self.reject_unadmitted() || changed);
         }
         let foreground_turn = std::mem::take(&mut self.foreground_turn_due);
         if !foreground_turn
-            && self.retention.at.is_some_and(|at| self.now >= at)
+            && self.retention.due(self.now)
             && !self.proposals.blocks_maintenance()
-            && !self.journal.retiring()
+            && !self.proposals.holds_maintenance()
+            && !self.journal.retention_busy()
         {
-            if !self.settled() {
-                if self.retention.identities {
-                    // Identity expiry owed by the last turn runs now instead
-                    // of waiting for the journal to drain for a full turn.
-                    self.retention.identities = false;
-                    self.foreground_turn_due = true;
-                    crate::profiling::event(crate::profiling::Event::IdentityRetention);
-                    self.pending = Some(Pending::IdentityRetention(
-                        self.journal
-                            .retain_identities(self.driver.begin_validation()?, true)?,
-                    ));
-                    self.retention.at = self
-                        .config
-                        .retention_interval
-                        .map(|interval| self.now.saturating_add(interval));
-                    return Ok(true);
-                }
+            let Some(step) = self.retention.start(self.now, self.settled(), true) else {
                 return Ok(changed);
-            }
-            self.retention.identities = false;
-            crate::profiling::event(crate::profiling::Event::RetentionTurn);
-            self.pending = Some(Pending::Retention(self.journal.retention_turn(
-                self.driver.begin_validation()?,
-                ozzy_proto::OperationId::from_bytes(*ozzy_proto::RequestId::new().as_bytes()),
-                true,
-            )?));
-            self.retention.at = self
-                .config
-                .retention_interval
-                .map(|interval| self.now.saturating_add(interval));
+            };
+            self.start_retention(step)?;
             return Ok(true);
         }
         Ok(self.schedule_proposal()? | changed)
+    }
+
+    /// Refuse one unadmitted proposal while closing. `true` when one was.
+    fn reject_unadmitted(&mut self) -> bool {
+        if self.proposals.reject_all() != 0 {
+            return true;
+        }
+        let Some(waiting) = self.ingress.pop() else {
+            return false;
+        };
+        waiting
+            .reply
+            .finish(waiting.buffer, ProposalOutcome::NotAdmitted);
+        true
+    }
+
+    fn start_retention(&mut self, step: RetentionStep) -> Result<(), ActorError> {
+        self.pending = Some(match step {
+            // Identity expiry owed by the last turn runs now instead of
+            // waiting for the journal to drain for a full turn.
+            RetentionStep::Identities => {
+                self.foreground_turn_due = true;
+                crate::profiling::event(crate::profiling::Event::IdentityRetention);
+                let ticket = self.driver.begin_validation()?;
+                Pending::IdentityRetention(self.journal.retain_identities(ticket, true)?)
+            }
+            RetentionStep::Turn => {
+                crate::profiling::event(crate::profiling::Event::RetentionTurn);
+                let seed =
+                    ozzy_proto::OperationId::from_bytes(*ozzy_proto::RequestId::new().as_bytes());
+                let ticket = self.driver.begin_validation()?;
+                Pending::Retention(self.journal.retention_turn(ticket, seed, true)?)
+            }
+        });
+        Ok(())
     }
 
     fn schedule_proposal(&mut self) -> Result<bool, ActorError> {
@@ -432,7 +421,9 @@ impl LocalActor {
         {
             return Ok(false);
         }
-        let buffer = self.proposals.start();
+        let Some(buffer) = self.proposals.start() else {
+            return Ok(false);
+        };
         self.pending = Some(Pending::Propose(
             self.journal
                 .propose_append(self.driver.begin_validation()?, buffer)
@@ -446,5 +437,12 @@ impl LocalActor {
 impl LocalActor {
     pub(super) fn observe_time(&mut self, now: std::time::Duration) {
         self.now = now;
+    }
+
+    /// The next retention turn, its only timer.
+    pub(super) fn next_deadline(&self, now: std::time::Duration) -> Option<std::time::Duration> {
+        super::deadline::Earliest::after(now)
+            .at(self.retention.at())
+            .get()
     }
 }

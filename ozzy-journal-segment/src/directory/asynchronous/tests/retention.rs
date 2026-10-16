@@ -1,10 +1,10 @@
 use super::*;
-use crate::{AsyncRetirementBudget, RetentionFloors};
+use crate::{RetentionFloors, RetirementBudget};
 
 mod scan;
 
-fn budget() -> AsyncRetirementBudget {
-    AsyncRetirementBudget {
+fn budget() -> RetirementBudget {
+    RetirementBudget {
         max_segments: 2,
         max_read_bytes: 65536,
     }
@@ -169,7 +169,7 @@ fn retirement_scan_bounds_and_damaged_authority_prevent_unlinking() {
             &mut controller,
             journal.retire_sealed_prefix(
                 &floors,
-                AsyncRetirementBudget {
+                RetirementBudget {
                     max_segments: 1,
                     max_read_bytes: 32767
                 }
@@ -182,7 +182,7 @@ fn retirement_scan_bounds_and_damaged_authority_prevent_unlinking() {
         &mut controller,
         journal.retire_sealed_prefix(
             &floors,
-            AsyncRetirementBudget {
+            RetirementBudget {
                 max_segments: 1,
                 max_read_bytes: 32768,
             },

@@ -1,9 +1,51 @@
 use super::{AppendBuffer, JournalError, OwnedJournal};
 use crate::replica_journal::append::JoinedProgress;
-use crate::replica_journal::{GroupAssignment, GroupProgressError, GroupProgressState};
-use ozzy_core::state::CanonicalState;
+use crate::replica_journal::{
+    GroupAssignment, GroupProgressError, GroupProgressRequest, GroupProgressState,
+};
+use ozzy_core::state::{CanonicalPartition, CanonicalState};
 use ozzy_journal::operation::ProgressOwner;
+use ozzy_proto::{Offset, append::Policy};
 use ozzy_replication::{Prefix, driver::ValidationTicket};
+
+/// Where one cursor update stands against its partition.
+enum Update {
+    /// An accepted cursor already covers it.
+    Repeat(Offset),
+    /// It moves the cursor from `prior`.
+    Advance { prior: Option<Offset> },
+    /// It names an offset past the partition's end.
+    Beyond,
+    /// It names an offset retention already removed.
+    Expired,
+}
+
+fn classify(prior: Option<Offset>, cursor: Offset, partition: &CanonicalPartition) -> Update {
+    if cursor > partition.next_offset {
+        Update::Beyond
+    } else if let Some(prior) = prior.filter(|&prior| prior >= cursor) {
+        Update::Repeat(prior)
+    } else if cursor < partition.retained_from {
+        Update::Expired
+    } else {
+        Update::Advance { prior }
+    }
+}
+
+fn progress_state(
+    assignment: GroupAssignment,
+    cursor: Offset,
+    partition: &CanonicalPartition,
+    policy: Policy,
+) -> GroupProgressState {
+    GroupProgressState {
+        assignment,
+        cursor,
+        retained_from: partition.retained_from,
+        end: partition.next_offset,
+        policy,
+    }
+}
 
 impl OwnedJournal {
     // Out of line: inlined into the shared proposal path, this rare branch
@@ -28,68 +70,52 @@ impl OwnedJournal {
         }
         let images = self.images()?;
         validate_assignment(images.speculative(), request.assignment)?;
-        let committed = images.committed();
-        let partition = committed
+        let partition = images
+            .committed()
             .partition(request.assignment.partition)
             .ok_or(GroupProgressError::UnknownPartition)?;
-        let owner = ProgressOwner::ConsumerGroup(request.assignment.group);
-        let prior = images
-            .speculative()
-            .progress(owner, request.assignment.partition);
-        let (cursor, resolved) = if let Some(cursor) = request.cursor {
-            if cursor > partition.next_offset {
-                return Err(GroupProgressError::BeyondCommit {
-                    cursor,
-                    end: partition.next_offset,
+        let (cursor, resolved) = match request.cursor {
+            Some(cursor) => {
+                let prior = images.speculative().progress(
+                    ProgressOwner::ConsumerGroup(request.assignment.group),
+                    request.assignment.partition,
+                );
+                match classify(prior, cursor, partition) {
+                    Update::Beyond => {
+                        let end = partition.next_offset;
+                        return Err(GroupProgressError::BeyondCommit { cursor, end }.into());
+                    }
+                    Update::Expired => return Err(expired(cursor, partition)),
+                    // Cumulative retries cover existing accepted work. The actor waits
+                    // for confirmation and application of this exact accepted prefix.
+                    Update::Repeat(prior) => (prior, Some(ticket.accepted())),
+                    Update::Advance { prior } => {
+                        buffer.assign_group_progress(prior)?;
+                        (cursor, None)
+                    }
                 }
-                .into());
-            }
-            if let Some(prior) = prior.filter(|&prior| prior >= cursor) {
-                // Cumulative retries cover existing accepted work. The actor waits
-                // for confirmation and application of this exact accepted prefix.
-                (prior, Some(ticket.accepted()))
-            } else if cursor < partition.retained_from {
-                return Err(GroupProgressError::HistoryExpired {
-                    cursor,
-                    retained_from: partition.retained_from,
-                }
-                .into());
-            } else {
-                buffer.assign_group_progress(prior)?;
-                (cursor, None)
-            }
-        } else {
-            validate_assignment(committed, request.assignment)?;
-            let cursor = committed
-                .progress(owner, request.assignment.partition)
-                .ok_or(GroupProgressError::Fenced)?;
-            if cursor < partition.retained_from {
-                return Err(GroupProgressError::HistoryExpired {
-                    cursor,
-                    retained_from: partition.retained_from,
-                }
-                .into());
             }
             // Query only confirmed application state, even with newer accepted
             // progress. It neither waits for unrelated work nor changes the log.
-            (cursor, Some(self.applied))
+            None => (
+                confirmed_cursor(images.committed(), request, partition)?,
+                Some(self.applied),
+            ),
         };
+        let policy = self.configuration.append_policy();
         buffer
             .group_progress
             .as_mut()
-            .expect("validated request")
-            .state = Some(GroupProgressState {
-            assignment: request.assignment,
+            .ok_or(JournalError::AppendMismatch)?
+            .state = Some(progress_state(
+            request.assignment,
             cursor,
-            retained_from: partition.retained_from,
-            end: partition.next_offset,
-            policy: self.configuration.append_policy(),
-        });
+            partition,
+            policy,
+        ));
         Ok(resolved)
     }
-}
 
-impl OwnedJournal {
     /// Validate every joined update on its own assignment, then rewrite one
     /// operation per fresh cursor with its expected prior. An update that
     /// repeats an accepted cursor needs no operation: the proposal's commit
@@ -124,24 +150,18 @@ impl OwnedJournal {
                 ProgressOwner::ConsumerGroup(request.assignment.group),
                 request.assignment.partition,
             );
-            if cursor > partition.next_offset {
-                return Err(GroupProgressError::Batch.into());
-            }
-            let (cursor, joined) = match prior.filter(|&prior| prior >= cursor) {
-                Some(prior) => (prior, JoinedProgress::Repeat),
-                None if cursor < partition.retained_from => {
-                    return Err(GroupProgressError::Batch.into());
-                }
-                None => (cursor, JoinedProgress::Advance { expected: prior }),
+            let (cursor, joined) = match classify(prior, cursor, partition) {
+                Update::Beyond | Update::Expired => return Err(GroupProgressError::Batch.into()),
+                Update::Repeat(prior) => (prior, JoinedProgress::Repeat),
+                Update::Advance { prior } => (cursor, JoinedProgress::Advance { expected: prior }),
             };
             expected.push(joined);
-            session.state = Some(GroupProgressState {
-                assignment: request.assignment,
+            session.state = Some(progress_state(
+                request.assignment,
                 cursor,
-                retained_from: partition.retained_from,
-                end: partition.next_offset,
+                partition,
                 policy,
-            });
+            ));
         }
         if expected
             .iter()
@@ -152,6 +172,33 @@ impl OwnedJournal {
         buffer.assign_group_progress_batch(&expected)?;
         Ok(None)
     }
+}
+
+/// The confirmed cursor a progress query answers with.
+fn confirmed_cursor(
+    committed: &CanonicalState,
+    request: GroupProgressRequest,
+    partition: &CanonicalPartition,
+) -> Result<Offset, JournalError> {
+    validate_assignment(committed, request.assignment)?;
+    let cursor = committed
+        .progress(
+            ProgressOwner::ConsumerGroup(request.assignment.group),
+            request.assignment.partition,
+        )
+        .ok_or(GroupProgressError::Fenced)?;
+    if cursor < partition.retained_from {
+        return Err(expired(cursor, partition));
+    }
+    Ok(cursor)
+}
+
+fn expired(cursor: Offset, partition: &CanonicalPartition) -> JournalError {
+    GroupProgressError::HistoryExpired {
+        cursor,
+        retained_from: partition.retained_from,
+    }
+    .into()
 }
 
 fn validate_assignment(
