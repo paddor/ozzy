@@ -14,7 +14,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Barrier};
 
-use ozzy_broker::{check_config, initialize_identity, load_deployment};
+use ozzy_broker::{check_config, check_partition_limits, initialize_identity, load_deployment};
 use ozzy_config::{Deployment, HostResources, ValidatedDeployment};
 use uuid::Uuid;
 
@@ -80,6 +80,39 @@ fn explicit_initialization_persists_exact_shared_identity() {
             .peer
     );
     assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn deduplication_bytes_are_checked_against_the_partition_index_before_provisioning() {
+    let deployment = |bytes: usize| {
+        let text = format!(
+            "{SINGLE}\n[topics.orders.deduplication]\nmax_entries = 100000\nmax_bytes = {bytes}\n"
+        );
+        Deployment::parse(&text).unwrap().validate().unwrap()
+    };
+    // The deployment check accepts encoded rows; the index needs far more.
+    let short = deployment(3_200_000);
+    let plan = short.broker_plan("laptop", &host()).unwrap();
+    let error = check_partition_limits(&short, &plan)
+        .unwrap_err()
+        .to_string();
+    let prefix = "topics.orders.deduplication.max_bytes: max_entries 100000 needs at least ";
+    let needed: usize = error
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.split(' ').next())
+        .unwrap_or_else(|| panic!("{error}"))
+        .parse()
+        .unwrap();
+    assert!(
+        error.ends_with("bytes on partition 0, not 3200000"),
+        "{error}"
+    );
+    let fits = deployment(needed);
+    let plan = fits.broker_plan("laptop", &host()).unwrap();
+    check_partition_limits(&fits, &plan).unwrap();
+    let below = deployment(needed - 1);
+    let plan = below.broker_plan("laptop", &host()).unwrap();
+    check_partition_limits(&below, &plan).unwrap_err();
 }
 
 #[test]

@@ -16,9 +16,10 @@ ozzy-tui --config deployment.toml --broker broker-0
 - There is no authentication yet: anyone who can connect is an admin.
 - `--interval-ms` sets the refresh interval, 1000 by default. Rates are per
   second between two refreshes, measured by the broker's uptime.
-- To try the Groups screen, the `ozzy_group_reader` example of `ozzy-broker`
-  writes a few records, joins group `workers`, and reads until the group is
-  deleted or Ctrl-C. It takes `--config`, `--broker`, and `--identity`.
+- To try every screen with live traffic, follow
+  [Try it](https://github.com/paddor/ozzy/blob/main/GETTING_STARTED.md#try-it):
+  `ozzy quickstart` runs a broker and the `ozzy_demo` example of `ozzy-broker`
+  writes and reads as group `workers`.
 
 ## Screens
 

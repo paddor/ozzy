@@ -1,5 +1,7 @@
-use crate::{CheckedConfig, StartupError};
-use ozzy_config::{BrokerPlan, ControllerPlan, IoBackend, PartitionPlacement, Topic};
+use crate::StartupError;
+use ozzy_config::{
+    BrokerPlan, ControllerPlan, IoBackend, PartitionPlacement, Topic, ValidatedDeployment,
+};
 use ozzy_journal::operation::OperationLimits;
 use ozzy_journal_segment::{
     CanonicalRecoveryLimits, CheckpointLimits, DecodeLimits, ENTRY_HEADER_BYTES, GROUP_SEAL_BYTES,
@@ -7,7 +9,7 @@ use ozzy_journal_segment::{
     SEGMENT_HEADER_BYTES, SegmentOptions, SegmentWriteMode, WRITE_GROUP_ALIGNMENT,
 };
 use ozzy_replication::PipelineLimits;
-use ozzy_runtime::replica_journal::OwnedConfig;
+use ozzy_runtime::replica_journal::{DedupLimits, OwnedConfig};
 
 const CORE_CHECKPOINT_BYTES: usize = 32 * 1024 * 1024;
 
@@ -22,7 +24,8 @@ pub(super) struct Settings {
 
 impl Settings {
     pub(super) fn new(
-        checked: &CheckedConfig,
+        deployment: &ValidatedDeployment,
+        plan: &BrokerPlan,
         placement: &PartitionPlacement,
     ) -> Result<Self, StartupError> {
         let error = |reason: &str| {
@@ -31,8 +34,8 @@ impl Settings {
                 placement.topic, placement.partition,
             ))
         };
-        let topic = checked.deployment.deployment().topic(&placement.topic)?;
-        let execution = execution(checked, placement)?;
+        let topic = deployment.deployment().topic(&placement.topic)?;
+        let execution = execution(deployment, plan, placement)?;
         let sizes = Sizes::check(topic, &execution).map_err(error)?;
         let pipeline = PipelineLimits {
             max_operations: sizes.operations,
@@ -69,7 +72,7 @@ impl Settings {
                 execution.resident_operations,
                 execution.resident_bytes,
             ),
-            clients: checked.deployment.deployment().limits.max_clients,
+            clients: deployment.deployment().limits.max_clients,
         })
     }
 
@@ -85,15 +88,7 @@ impl Settings {
             configuration,
             limits: self.limits,
             recovery: self.recovery,
-            deduplication: placement.deduplication.map(|policy| {
-                ozzy_runtime::replica_journal::dedup_limits(
-                    policy.window_millis,
-                    policy.max_entries as usize,
-                    policy.max_bytes as usize,
-                    self.limits.operations.max_records,
-                    self.pipeline,
-                )
-            }),
+            deduplication: self.deduplication(placement),
             // Native intake arenas, plus the actor's own receive, transfer,
             // and bootstrap leases.
             append_buffers: crate::serving::native_arenas(self.clients) + 32,
@@ -103,6 +98,51 @@ impl Settings {
             reads: self.reads,
         }
     }
+
+    /// The identity index this partition reserves, sized for its pipeline.
+    fn deduplication(&self, placement: &PartitionPlacement) -> Option<DedupLimits> {
+        placement.deduplication.map(|policy| {
+            ozzy_runtime::replica_journal::dedup_limits(
+                policy.window_millis,
+                policy.max_entries as usize,
+                policy.max_bytes as usize,
+                self.limits.operations.max_records,
+                self.pipeline,
+            )
+        })
+    }
+}
+
+/// Derive every local partition's journal bounds as startup would, so a
+/// deployment that cannot open fails before provisioning writes anything.
+pub fn check_partition_limits(
+    deployment: &ValidatedDeployment,
+    plan: &BrokerPlan,
+) -> Result<(), StartupError> {
+    for placement in &plan.partitions {
+        let settings = Settings::new(deployment, plan, placement)?;
+        let Some(limits) = settings.deduplication(placement) else {
+            continue;
+        };
+        if limits.validate().is_err() {
+            let (entries, partition) = (limits.entries, placement.partition);
+            let reason = match limits.required_bytes() {
+                Some(needed) if needed > limits.bytes => format!(
+                    "max_entries {entries} needs at least {needed} bytes on partition \
+                     {partition}, not {}",
+                    limits.bytes
+                ),
+                None => format!("max_entries {entries} needs more bytes than fit in memory"),
+                Some(_) => format!("partition {partition} cannot size its identity index"),
+            };
+            return Err(ozzy_config::ConfigError::Invalid {
+                path: format!("topics.{}.deduplication.max_bytes", placement.topic),
+                reason,
+            }
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// Checked write path sizes of one partition, from its topic and its share of
@@ -215,7 +255,8 @@ struct Execution {
 }
 
 fn execution(
-    checked: &CheckedConfig,
+    deployment: &ValidatedDeployment,
+    plan: &BrokerPlan,
     placement: &PartitionPlacement,
 ) -> Result<Execution, StartupError> {
     let error = |reason: &str| {
@@ -225,22 +266,19 @@ fn execution(
         ))
     };
     let native = |bytes| usize::try_from(bytes).map_err(|_| error("byte limit overflow"));
-    let shard = checked
-        .plan
+    let shard = plan
         .shards
         .iter()
         .find(|shard| shard.id == placement.shard)
         .ok_or_else(|| error("missing application shard"))?;
-    let (controller, lane) = controller_lane(&checked.plan, placement.shard)
-        .ok_or_else(|| error("missing device controller"))?;
+    let (controller, lane) =
+        controller_lane(plan, placement.shard).ok_or_else(|| error("missing device controller"))?;
     let backend = backend_limits(controller).map_err(error)?;
-    let max_append = checked
-        .deployment
+    let max_append = deployment
         .deployment()
         .topic(&placement.topic)?
         .max_append_bytes;
-    let partitions = checked
-        .plan
+    let partitions = plan
         .partitions
         .iter()
         .filter(|partition| partition.shard == shard.id)

@@ -202,6 +202,7 @@ pub fn check_config(
     let identity = DeploymentIdentity::decode(&read_bounded(identity_path, maximum)?)?;
     deployment.check_identity(&identity)?;
     let plan = deployment.broker_plan(broker, host)?;
+    crate::check_partition_limits(&deployment, &plan)?;
     Ok(CheckedConfig {
         deployment,
         identity,

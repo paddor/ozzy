@@ -2,6 +2,7 @@
 
 mod limits;
 mod recovery;
+pub use limits::check_partition_limits;
 pub use recovery::{RecoveryIntent, RecoverySelection};
 
 use ozzy_config::{BrokerIdentity, DeploymentMode, PartitionIdentity, PartitionPlacement};
@@ -172,7 +173,7 @@ impl PartitionSetup<'_> {
             store_id: StoreId::from_bytes(*store.store.as_bytes()),
             store_generation: store.generation,
         };
-        let settings = limits::Settings::new(checked, placement)?;
+        let settings = limits::Settings::new(&checked.deployment, &checked.plan, placement)?;
         let config = match checked.identity.mode {
             DeploymentMode::Single => {
                 let configuration = local::Configuration::new(

@@ -1,23 +1,48 @@
 # Getting started
 
-This page builds the broker, provisions storage, and runs one broker, a
-container, or three brokers. Then connect applications with the
-[Rust SDK](ozzy/README.md).
+This page tries Ozzy in three commands, then builds the broker, provisions
+storage, and runs one broker, a container, or three brokers. Then connect
+applications with the [Rust SDK](ozzy/README.md).
 
 Requires Linux, Rust 1.93 or newer, and bash. Run every command from the
 repository root.
 
+## Try it
+
+Run each command in its own terminal:
+
+```bash
+cargo run --release -p ozzy-broker -- quickstart tmp/try
+cargo run --release -p ozzy-ui -- --config tmp/try/deployment.toml --broker local
+cargo run --release -p ozzy-broker --example ozzy_demo -- \
+  --config tmp/try/deployment.toml --broker local --identity tmp/try/shared.identity
+```
+
+1. `quickstart` provisions broker `local` in `tmp/try` with the steps below,
+   then serves topic `orders` (4 partitions) on loopback TCP ports it picks.
+   Formatting writes 64 MiB; retention keeps at most 256 MiB per partition.
+2. `ozzy-tui` shows the broker. Keys and screens: [ozzy-ui](ozzy-ui/README.md).
+3. `ozzy_demo` writes 100 records a second (`--rate`) and reads them as a
+   member of group `workers`. It stops on Ctrl-C or when you delete the group
+   on the console's Groups screen.
+
+- Ctrl-C stops the broker. Run the same `quickstart` command to restart it;
+  it serves the existing stores and never formats again.
+- A directory with files but no `deployment.toml` is refused. Remove
+  `tmp/try` to start over.
+- Like `serve --trusted-transport`, it does not authenticate clients: any
+  local user can connect.
+
 ## Build
 
 ```bash
-source scripts/ozzy_tools.sh
-scripts/ozzy_cargo build --locked --release -p ozzy-broker --bin ozzy
-export PATH="$CARGO_TARGET_DIR/release:$PATH"
+cargo install --locked --path ozzy-broker
+cargo install --locked --path ozzy-ui
 ```
 
-- `scripts/ozzy_tools.sh` puts build output under `OZZY_ARTIFACT_ROOT`.
+- This installs `ozzy` and `ozzy-tui` into `~/.cargo/bin`.
 - To serve compressed endpoints, add `--features lz4-transport` or
-  `--features zstd-transport`.
+  `--features zstd-transport` to the broker install.
 
 ## Start a single durable broker
 
@@ -78,7 +103,7 @@ ozzy serve --broker laptop --identity "$ozzy_dir/shared.identity" \
 
 ## Build and run a container
 
-Requires Podman. Build the binary first, with a toolchain compatible with
+Requires Podman. Install the broker first ([Build](#build)), with a toolchain compatible with
 Debian 13 (the image base). The image holds only the server; data lives in a
 bind mount.
 
@@ -86,7 +111,7 @@ bind mount.
 ozzy_image="$PWD/tmp/ozzy-image"
 ozzy_container_dir="$PWD/tmp/ozzy-container"
 mkdir -p "$ozzy_image" "$ozzy_container_dir/data"
-cp "$CARGO_TARGET_DIR/release/ozzy" "$ozzy_image/"
+cp "$(command -v ozzy)" "$ozzy_image/"
 cp ozzy-broker/container.toml "$ozzy_container_dir/deployment.toml"
 podman build -f ozzy-broker/Containerfile -t localhost/ozzy:dev "$ozzy_image"
 ozzy_container() {
@@ -146,11 +171,11 @@ ozzy_three serve --broker broker-0 --identity "$ozzy_dir/shared.identity" \
 
 `ozzy-tui` shows one broker's status and counters in the terminal. The samples
 give each broker an `admin` endpoint in the local IPC namespace, so run it on
-the broker's host:
+the broker's host with the same config and broker name:
 
 ```bash
-scripts/ozzy_cargo build --locked --release -p ozzy-ui
-ozzy-tui --config "$ozzy_dir/deployment.toml" --broker broker-0
+ozzy-tui --config "$ozzy_dir/deployment.toml" --broker laptop    # single broker
+ozzy-tui --config "$ozzy_dir/deployment.toml" --broker broker-0  # three brokers
 ```
 
 Keys and screens: [ozzy-ui](ozzy-ui/README.md).

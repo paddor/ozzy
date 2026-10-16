@@ -42,7 +42,7 @@ pub use frontend::{
 pub use host::host_resources;
 pub use journals::{
     JournalConfig, JournalPlan, OpenedPartition, PartitionAuthority, PartitionJournal,
-    RecoveryIntent, RecoverySelection,
+    RecoveryIntent, RecoverySelection, check_partition_limits,
 };
 pub use provisioning::{
     CheckedConfig, check_config, initialize_broker_identity, initialize_identity,

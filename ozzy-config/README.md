@@ -110,14 +110,15 @@ max_bytes = 1073741824
 ```toml
 [topics.orders.deduplication]
 window_millis = 300000
-max_entries = 1000000
+max_entries = 200000
 max_bytes = 268435456
 ```
 
 - Off unless the topic sets it. Whether it is on, and its window, are fixed
   at initialization.
-- `max_entries` and `max_bytes` bound each partition's identity index;
-  `max_bytes` must allow 32 bytes per entry.
+- `max_entries` and `max_bytes` bound each partition's identity index. The
+  index reserves its budget up front: about 1 KiB per entry, so 1M entries
+  need about 1 GiB per partition. `ozzy validate` reports the exact minimum.
 - A full index makes producers retry later. It never evicts a live identity.
 
 ## Docs
