@@ -218,3 +218,25 @@ fn threads_list_live_values_by_name_and_fold_exited_ones() {
         assert_eq!(row, ("io_read", Kind::Count, now.totals.get(Event::IoRead)));
     });
 }
+
+#[test]
+fn recent_logs_keep_the_newest_entries_of_every_thread_without_telemetry() {
+    std::thread::Builder::new()
+        .name("logger".into())
+        .spawn(|| {
+            ENABLED.with(|enabled| enabled.set(false));
+            for index in 0..70 {
+                log(Level::Warn, &format!("entry {index}"));
+            }
+            log(Level::Error, &"é".repeat(200));
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    let recent = recent_logs();
+    assert_eq!(recent.len(), 64);
+    assert_eq!(recent[0].message, "entry 7");
+    let last = recent.last().unwrap();
+    assert_eq!((last.level, last.thread.as_str()), (Level::Error, "logger"));
+    assert_eq!(last.message.len(), 256);
+}

@@ -6,11 +6,12 @@ use crate::{
 use ozzy_proto::{
     ConsumerGroupId, ConsumerMemberId, GroupId, NodeId,
     admin::{
-        Broker, Connections, Counters, EventKind, GroupCursor, GroupStatus, PartitionLog,
-        PartitionName, PartitionState, PartitionStatus, Partitions, Reply, Request,
+        Broker, Connections, Counters, EventKind, GroupCursor, GroupStatus, LogEntry, LogLevel,
+        PartitionLog, PartitionName, PartitionState, PartitionStatus, Partitions, Reply, Request,
     },
 };
 use ratatui::{Terminal, backend::TestBackend};
+use std::num::NonZeroU64;
 
 const A: NodeId = NodeId::from_bytes([1; 16]);
 const B: NodeId = NodeId::from_bytes([2; 16]);
@@ -175,7 +176,8 @@ fn restarts_and_lost_links_ask_for_broker_facts_again() {
             Request::Broker,
             Request::Counters,
             Request::Partitions,
-            Request::Connections
+            Request::Connections,
+            Request::Logs,
         ]
     );
     app.link(false);
@@ -185,7 +187,12 @@ fn restarts_and_lost_links_ask_for_broker_facts_again() {
     app.reply(counters(5_000, 1));
     assert_eq!(
         app.requests(),
-        [Request::Counters, Request::Partitions, Request::Connections]
+        [
+            Request::Counters,
+            Request::Partitions,
+            Request::Connections,
+            Request::Logs,
+        ]
     );
     app.reply(counters(6_000, 2));
     assert!(app.event_rows()[0].rate.is_some());
@@ -208,9 +215,9 @@ fn keys_switch_screens_and_keep_selections_in_range() {
     assert_eq!(app.screen(), Screen::Partitions);
     app.key(Key::BackTab);
     app.key(Key::BackTab);
-    assert_eq!(app.screen(), Screen::Threads);
+    assert_eq!(app.screen(), Screen::Logs);
     app.key(Key::Char('9'));
-    assert_eq!(app.screen(), Screen::Threads);
+    assert_eq!(app.screen(), Screen::Logs);
     app.key(Key::Char('2'));
     app.key(Key::PageDown);
     assert_eq!(app.partition_table.selected(), Some(2));
@@ -333,6 +340,13 @@ fn log(next_offset: u64, groups: Vec<GroupStatus>, cursors: Vec<GroupCursor>) ->
         first_offset: 0,
         next_offset,
         producers: 1,
+        retention_age_millis: NonZeroU64::new(7 * 86_400_000),
+        retention_bytes: None,
+        policy_revision: 2,
+        segments: 3,
+        segment_bytes: 3 << 26,
+        dedup_entries: 1_200,
+        dedup_limit: NonZeroU64::new(100_000),
         groups,
         cursors,
     }
@@ -407,6 +421,148 @@ fn groups_join_plans_and_cursors_and_survive_a_busy_journal() {
     app.key(Key::Char('l'));
     app.key(Key::Down);
     assert_eq!(app.cursor_table.selected(), Some(0));
+}
+
+#[test]
+fn partitions_show_storage_and_limits() {
+    let mut app = App::new("ipc://@admin");
+    app.reply(broker());
+    app.reply(grouped(1_000, true));
+    app.key(Key::Char('2'));
+    let text = screen(&mut app);
+    for expected in [
+        "Segs",
+        "192 MiB",
+        "1.20%",
+        "retention age 7d (revision 2)  dedup 1,200 of 100,000",
+    ] {
+        assert!(text.contains(expected), "{expected}:\n{text}");
+    }
+}
+
+/// A single broker replicates nothing: no Replication tab, and the tabs
+/// after it move up.
+#[test]
+fn a_single_broker_has_no_replication_screen() {
+    let mut app = App::new("ipc://@admin");
+    app.key(Key::Char('3'));
+    assert_eq!(app.screen(), Screen::Replication);
+    let mut single = broker();
+    if let Reply::Broker(facts) = &mut single {
+        facts.brokers.truncate(1);
+    }
+    app.reply(single);
+    assert_eq!(app.screen(), Screen::Partitions);
+    app.key(Key::Char('3'));
+    assert_eq!(app.screen(), Screen::Groups);
+    app.key(Key::Tab);
+    app.key(Key::Tab);
+    assert_eq!(app.screen(), Screen::Logs);
+    app.key(Key::Tab);
+    assert_eq!(app.screen(), Screen::Broker);
+    app.key(Key::BackTab);
+    assert_eq!(app.screen(), Screen::Logs);
+    app.key(Key::Char('6'));
+    assert_eq!(app.screen(), Screen::Logs);
+    app.key(Key::Char('1'));
+    app.reply(counters(1_000, 1));
+    let text = screen(&mut app);
+    for expected in ["3 Groups", "4 Threads", "5 Logs", "Tab/1-5", "I/O errors"] {
+        assert!(text.contains(expected), "{expected}:\n{text}");
+    }
+    for hidden in ["Replication", "Cluster", "Electing", "Led here", "Replica"] {
+        assert!(!text.contains(hidden), "{hidden}:\n{text}");
+    }
+    app.reply(partitions(1_000, 1));
+    app.key(Key::Char('2'));
+    let text = screen(&mut app);
+    assert!(text.contains("Next offset"), "{text}");
+    for hidden in ["Leader", "View"] {
+        assert!(!text.contains(hidden), "{hidden}:\n{text}");
+    }
+}
+
+#[test]
+fn logs_show_the_newest_first() {
+    let mut app = App::new("ipc://@admin");
+    app.reply(broker());
+    app.key(Key::Char('6'));
+    assert!(screen(&mut app).contains("Logs (none)"));
+    let entry = |uptime_ms, level, message: &str| LogEntry {
+        uptime_ms,
+        level,
+        thread: "ozzy/admin".into(),
+        message: message.into(),
+    };
+    app.reply(Reply::Logs(vec![
+        entry(1_000, LogLevel::Info, "alpha"),
+        entry(61_000, LogLevel::Error, "omega"),
+    ]));
+    let text = screen(&mut app);
+    for expected in ["00:01:01", "error", "ozzy/admin"] {
+        assert!(text.contains(expected), "{expected}:\n{text}");
+    }
+    assert!(text.find("omega") < text.find("alpha"), "{text}");
+    app.key(Key::Down);
+    assert_eq!(app.log_table.selected(), Some(1));
+}
+
+/// Records per second come from fresh logs only: a busy journal's
+/// carried-over log keeps the last rate.
+#[test]
+fn record_rates_skip_carried_over_logs() {
+    let mut app = App::new("ipc://@admin");
+    app.reply(broker());
+    let at = |uptime_ms, next_offset| {
+        let mut status = status(0, 10, A);
+        status.log = Some(log(next_offset, Vec::new(), Vec::new()));
+        Reply::Partitions(Partitions {
+            uptime_ms,
+            missing_shards: 0,
+            rows: vec![status],
+        })
+    };
+    app.reply(at(1_000, 100));
+    assert_eq!(app.partition_rows()[0].records, None);
+    app.reply(at(3_000, 300));
+    assert_eq!(app.partition_rows()[0].records, Some(100.0));
+    app.reply(partitions(4_000, 10));
+    assert_eq!(app.partition_rows()[0].records, Some(100.0));
+    assert!((app.summary().records - 100.0).abs() < f64::EPSILON);
+    app.key(Key::Char('2'));
+    assert!(screen(&mut app).contains("Records/s"));
+}
+
+#[test]
+fn groups_are_deleted_only_after_asking() {
+    let mut app = App::new("ipc://@admin");
+    app.reply(broker());
+    app.key(Key::Char('4'));
+    app.key(Key::Char('d'));
+    assert!(screen(&mut app).contains("no group to delete"));
+    app.reply(grouped(1_000, true));
+    assert_eq!(app.key(Key::Char('d')), Action::None);
+    assert!(screen(&mut app).contains("Delete group orders/workers? y deletes"));
+    // Any other key cancels, without its usual effect.
+    assert_eq!(app.key(Key::Esc), Action::None);
+    assert!(!screen(&mut app).contains("Delete group"));
+    app.key(Key::Char('d'));
+    let delete = Request::DeleteGroup {
+        topic: "orders".into(),
+        name: "workers".into(),
+    };
+    assert_eq!(app.key(Key::Char('y')), Action::Command(delete));
+    assert!(screen(&mut app).contains("deleting orders/workers"));
+    // No second deletion while one runs.
+    app.key(Key::Char('d'));
+    assert!(!screen(&mut app).contains("Delete group"));
+    app.reply(Reply::GroupDeleted(Some(WORKERS)));
+    let deleted = format!("deleted orders/workers ({WORKERS})");
+    assert!(screen(&mut app).contains(&deleted));
+    app.key(Key::Char('d'));
+    app.key(Key::Char('y'));
+    app.command_failed("no reply in 70 s");
+    assert!(screen(&mut app).contains("orders/workers: no reply in 70 s"));
 }
 
 /// The Broker and Replication screens name broker events, so a renamed

@@ -70,6 +70,23 @@ pub(crate) fn uptime(ms: u64) -> String {
     }
 }
 
+/// A configured age in its largest whole unit: `7d`, `36h`, `90s`, `250ms`.
+pub(crate) fn age(ms: u64) -> String {
+    const UNITS: [(u64, &str); 4] = [
+        (86_400_000, "d"),
+        (3_600_000, "h"),
+        (60_000, "m"),
+        (1000, "s"),
+    ];
+    UNITS
+        .iter()
+        .find(|(unit, _)| ms.is_multiple_of(*unit))
+        .map_or_else(
+            || format!("{ms}ms"),
+            |(unit, name)| format!("{}{name}", ms / unit),
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,5 +110,9 @@ mod tests {
         assert_eq!(uptime(59_999), "00:00:59");
         assert_eq!(uptime(3_723_000), "01:02:03");
         assert_eq!(uptime(2 * 86_400_000 + 5_000), "2d 00:00:05");
+        assert_eq!(age(7 * 86_400_000), "7d");
+        assert_eq!(age(36 * 3_600_000), "36h");
+        assert_eq!(age(90_000), "90s");
+        assert_eq!(age(250), "250ms");
     }
 }

@@ -16,17 +16,25 @@ ozzy-tui --config deployment.toml --broker broker-0
 - There is no authentication yet: anyone who can connect is an admin.
 - `--interval-ms` sets the refresh interval, 1000 by default. Rates are per
   second between two refreshes, measured by the broker's uptime.
+- To try the Groups screen, the `ozzy_group_reader` example of `ozzy-broker`
+  writes a few records, joins group `workers`, and reads until the group is
+  deleted or Ctrl-C. It takes `--config`, `--broker`, and `--identity`.
 
 ## Screens
 
 | Key | Screen | Shows |
 | --- | --- | --- |
 | `1` | Broker | Identity, connected clients, cluster members with link state and the partitions each leads, partition totals, key counters |
-| `2` | Partitions | Each local partition's state, leader, record offsets, producers, commit rate, pending work, and cleanup |
+| `2` | Partitions | Each local partition's state, leader, record offsets, producers, segments and their size, dedup fill, commit and record rates, pending work, and cleanup; the selected partition's retention policy and dedup limit |
 | `3` | Replication | Links to the other brokers, repair counters, and each partition's journal progress and how far each broker is behind |
-| `4` | Groups | Consumer groups with their lag; the selected group's members and its cursor on each partition |
+| `4` | Groups | Consumer groups with their lag; the selected group's members and its cursor on each partition; `d` deletes the selected group after a `y` |
 | `5` | Threads | Every event counter, totaled or for one thread |
+| `6` | Logs | The broker process's last 64 diagnostics, newest first |
 
+- A single broker replicates nothing: it has no Replication screen, so
+  Groups is `3`, Threads `4`, and Logs `5`. The Broker and Partitions screens
+  leave out cluster members, elections, leaders, views, and replica
+  counters.
 - Tab and Shift+Tab cycle screens.
 - Arrows, PgUp/PgDn, Home/End (or `j`, `k`, `g`, `G`) select rows. Left and
   Right (or `h`, `l`) switch panes on Groups and Threads.
@@ -49,5 +57,7 @@ ozzy-tui --config deployment.toml --broker broker-0
 
 `App` holds the console state and draws it with ratatui. It does no I/O and
 reads no clock, so any frontend can drive it: ask `App::requests` what to
-send, then feed it replies, link changes, keys, and mouse events. The default
-`terminal` feature adds the `client` module and the binary.
+send, then feed it replies, link changes, keys, and mouse events. A key can
+return `Action::Command`; send it and feed its reply to
+`App::command_reply`. The default `terminal` feature adds the `client`
+module and the binary.

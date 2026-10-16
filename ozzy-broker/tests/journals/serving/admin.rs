@@ -1,10 +1,14 @@
 //! The admin endpoint answers broker, counter, partition, and connection
-//! requests.
+//! requests, and deletes consumer groups.
 
 use super::*;
 use crate::admin_client::AdminClient;
-use ozzy_proto::admin::{self, Reply, Request};
-use std::collections::BTreeSet;
+use ozzy_proto::{
+    ConsumerMemberId,
+    admin::{self, Reply, Request},
+};
+use ozzy_runtime::replicated::{GroupReader, GroupReaderConfig};
+use std::{collections::BTreeSet, num::NonZeroU64};
 
 async fn assert_counters(client: &mut AdminClient) {
     let Reply::Counters(counters) = client.ask(Request::Counters).await else {
@@ -66,6 +70,16 @@ async fn assert_partitions(client: &mut AdminClient, broker: &admin::Broker) {
         }
         let log = row.log.as_ref().unwrap();
         assert_eq!((log.first_offset, log.next_offset), (0, 0));
+        assert_eq!(
+            (log.retention_age_millis, log.retention_bytes),
+            (NonZeroU64::new(3_600_000), None)
+        );
+        assert_eq!(log.policy_revision, 1);
+        assert!(log.segments >= 1 && log.segment_bytes > 0, "{log:?}");
+        assert_eq!(
+            (log.dedup_entries, log.dedup_limit),
+            (0, NonZeroU64::new(1024))
+        );
     }
 }
 
@@ -100,6 +114,13 @@ async fn admin_endpoint_reports_broker_counters_partitions_and_links() {
             for (name, broker) in &mut config.brokers {
                 broker.endpoints.admin = Some(format!("inproc://admin-test-{name}"));
             }
+            let orders = config.topics.get_mut("orders").unwrap();
+            orders.retention.max_age_secs = Some(3600);
+            orders.deduplication = Some(ozzy_config::TopicDeduplication {
+                window_millis: 60_000,
+                max_entries: 1024,
+                max_bytes: 4 * 1024 * 1024,
+            });
         });
         let shards = deployment
             .iter()
@@ -125,7 +146,7 @@ async fn admin_endpoint_reports_broker_counters_partitions_and_links() {
             assert_connections(&mut client, &broker).await;
             if index == 0 {
                 assert_counters(&mut client).await;
-                let mut unknown = admin::encode_request(9, Request::Broker);
+                let mut unknown = admin::encode_request(9, &Request::Broker).unwrap();
                 unknown[0] = 0x7f;
                 assert_eq!(
                     client.ask_raw(unknown).await,
@@ -134,6 +155,85 @@ async fn admin_endpoint_reports_broker_counters_partitions_and_links() {
             }
             client.close().await;
         }
+        for broker in brokers {
+            broker.shutdown().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// The admin owner logs each deletion; the recent log has it.
+async fn assert_deletion_logged(client: &mut AdminClient, group: ozzy_proto::ConsumerGroupId) {
+    let Reply::Logs(logs) = client.ask(Request::Logs).await else {
+        panic!("logs reply expected");
+    };
+    let deleted = format!("admin deleted consumer group orders/workers ({group})");
+    assert!(
+        logs.iter()
+            .any(|entry| entry.message == deleted && entry.thread == "ozzy/admin"),
+        "{logs:?}"
+    );
+}
+
+/// Any broker deletes a group, wherever its partitions lead: the admin
+/// owner routes through its own client link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_endpoint_deletes_a_consumer_group() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let root = std::path::PathBuf::from(format!("/ozzy-simulation-{}", Uuid::now_v7()));
+        let runtime = WriterRuntime::new().unwrap();
+        let deployment = deployment_with(&root, DeploymentMode::Three, 4, |config| {
+            for (name, broker) in &mut config.brokers {
+                broker.endpoints.admin = Some(format!("inproc://admin-delete-{name}"));
+            }
+        });
+        let checked = deployment[0].0.clone();
+        let last = deployment[2].0.plan.name.clone();
+        let brokers = Box::pin(ozzy_sim::broker::start_brokers(&runtime, deployment, false)).await;
+        for broker in &brokers {
+            broker.ready().await.unwrap();
+        }
+        let mut writer = ozzy_sim::client::Client::open_with_runtime(&checked, &runtime).await;
+        let pending = writer.queue(0).await;
+        writer.confirm(pending).await;
+        let links = writer.group_links().await;
+        let config = GroupReaderConfig::new(ConsumerMemberId::new());
+        let mut reader = GroupReader::open(links.clone(), "orders", "workers", config)
+            .await
+            .unwrap();
+        let record = reader.next().await.unwrap();
+        drop(reader.acknowledge(record.token).unwrap());
+        reader.close().await.unwrap();
+        let inspection = links.inspect_group("orders", "workers").await.unwrap();
+        let group = inspection.unwrap().group;
+
+        let endpoint = format!("inproc://admin-delete-{last}");
+        let mut client = AdminClient::connect(runtime.context(), &endpoint).await;
+        let delete = |topic: &str| Request::DeleteGroup {
+            topic: topic.into(),
+            name: "workers".into(),
+        };
+        assert_eq!(
+            client.ask(delete("orders")).await,
+            Reply::GroupDeleted(Some(group))
+        );
+        assert_eq!(
+            links.inspect_group("orders", "workers").await.unwrap(),
+            None
+        );
+        assert_eq!(
+            client.ask(delete("orders")).await,
+            Reply::GroupDeleted(None)
+        );
+        assert!(matches!(
+            client.ask(delete("missing")).await,
+            Reply::Error(_)
+        ));
+        assert_deletion_logged(&mut client, group).await;
+        client.close().await;
+        links.shutdown().await.unwrap();
+        writer.close().await;
         for broker in brokers {
             broker.shutdown().await.unwrap();
         }

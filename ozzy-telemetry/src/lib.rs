@@ -41,12 +41,14 @@ static TRANSPORT: OnceLock<Context> = OnceLock::new();
 
 mod counters;
 mod histogram;
+mod logs;
 mod names;
 
 use counters::Values;
 pub use counters::{Threads, Totals, threads, totals};
 use histogram::Metric;
 pub use histogram::{Snapshot, summarize_stage};
+pub use logs::{LogEntry, recent_logs};
 use names::{EVENT_NAMES, STAGE_NAMES};
 pub use names::{Event, Kind, Stage};
 
@@ -186,7 +188,7 @@ fn local(f: impl FnOnce(&mut Local)) {
 }
 
 /// Severity of a bounded diagnostic entry, independent of application logging.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Level {
     /// A notable state transition.
     Info,
@@ -196,15 +198,17 @@ pub enum Level {
     Error,
 }
 
-/// Publish a diagnostic on this thread's existing PUB socket. At most sixteen
-/// entries of 256 UTF-8 bytes are retained per thread. Do not pass payloads,
-/// record identities, credentials, or unbounded application details.
+/// Keep a diagnostic in [`recent_logs`] and, when enabled, publish it on this
+/// thread's PUB socket. A message keeps at most 256 UTF-8 bytes; each thread
+/// publishes its last sixteen. Do not pass payloads, record identities,
+/// credentials, or unbounded application details.
 pub fn log(level: Level, message: &str) {
+    let mut length = message.len().min(256);
+    while !message.is_char_boundary(length) {
+        length -= 1;
+    }
+    logs::keep(level, &message[..length]);
     with_local(|local| {
-        let mut length = message.len().min(256);
-        while !message.is_char_boundary(length) {
-            length -= 1;
-        }
         let level = match level {
             Level::Info => "info",
             Level::Warn => "warn",

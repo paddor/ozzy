@@ -6,7 +6,7 @@ use ozzy_config::{
     BrokerIdentity, BrokerPlan, Deployment, DeploymentIdentity, HostResources, ValidatedDeployment,
 };
 use ozzy_proto::{GroupId, NodeId, PartitionIncarnation, TopicId, directory};
-use ozzy_runtime::frontend::TopicCatalog;
+use ozzy_runtime::{frontend::TopicCatalog, replicated::BrokerAddress};
 use uuid::Uuid;
 
 use crate::{StartupError, io_error};
@@ -28,6 +28,28 @@ impl CheckedConfig {
     /// This broker's entry in the checked deployment.
     pub fn local_broker(&self) -> Result<&ozzy_config::Broker, StartupError> {
         Ok(self.deployment.deployment().broker(&self.plan.name)?)
+    }
+
+    /// SDK addresses of every configured broker, in persistent order.
+    pub fn broker_addresses(&self) -> Result<Vec<BrokerAddress>, StartupError> {
+        let deployment = self.deployment.deployment();
+        self.identity
+            .brokers
+            .iter()
+            .map(|(name, id)| {
+                let endpoints = &deployment.broker(name)?.endpoints;
+                let parse = |endpoint: &str| {
+                    endpoint
+                        .parse()
+                        .map_err(|error| StartupError::Frontend(format!("broker {name}: {error}")))
+                };
+                Ok(BrokerAddress {
+                    node: NodeId::from_bytes(*id.as_bytes()),
+                    endpoint: parse(&endpoints.peer)?,
+                    data_endpoint: parse(&endpoints.data_peer)?,
+                })
+            })
+            .collect()
     }
 
     /// SDK-visible immutable topic identity from the checked deployment record.

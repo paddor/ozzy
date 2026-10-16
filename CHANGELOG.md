@@ -71,15 +71,23 @@
 - Optional broker `admin` endpoint (`ipc://` or `inproc://`) for an admin
   console. It answers broker facts, event counters per thread, broker links
   and connected clients, and each local partition's replication status and
-  committed state: record offsets, consumer groups, and their cursors. It has
-  no authentication yet.
+  committed state: record offsets, retention policy and revision, segments,
+  dedup fill, consumer groups, and their cursors, plus the process's recent
+  diagnostics. It deletes consumer groups on request. It has no
+  authentication yet.
 - `ozzy_telemetry::threads()` returns each live thread's event values by
   thread name.
+- `ozzy_telemetry::recent_logs()` returns the process's last 64 diagnostics,
+  kept whether or not telemetry publishes.
+- Telemetry counts existence probes that find a path absent or present
+  (`io_probe_missed`) apart from storage errors (`io_failed`).
 - `ozzy-tui` (crate `ozzy-ui`), a terminal console of one broker's admin
-  endpoint: broker, cluster, and link facts; partitions with record offsets
-  and commit rates; replication progress and follower lag; consumer groups
-  with members and cursor lag; event counters per thread with rates. Keys
-  and mouse clicks pick screens, panes, and rows.
+  endpoint: broker, cluster, and link facts; partitions with record offsets,
+  commit and record rates, segments, dedup fill, and retention; replication
+  progress and follower lag (three-broker clusters only); consumer groups
+  with members and cursor lag; event counters per thread with rates; recent
+  broker logs. Keys and mouse clicks pick screens, panes, and rows. `d`
+  deletes the selected consumer group after a `y`.
 - Telemetry counts reader publications that waited for space in the
   broker's full PUB socket (`reader_publication_send_wait`), as it does for
   followers.

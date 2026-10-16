@@ -15,8 +15,8 @@ formats. [Overview](OVERVIEW.md) defines the terms.
 | Disk worker `ozzy/disk/N` | `write_threads` per `controller` | Segment data writes; with `aio`, only those without `O_DIRECT` |
 | Disk progress worker `ozzy/disk/pN` | Up to two per `controller` | Syncs, reads, opens, directory listings, metadata; never queued behind segment data |
 | AIO writer `ozzy/disk/aio` | One per controller with `backend = "aio"` | Linux AIO submission and completion |
-| Admin owner `ozzy/admin` | One per broker with an `admin` endpoint | Admin endpoint; asks shards for partition status, reads counters and links |
-| SDK owner `ozzy/sdk` | One per `WriterRuntime` | Links, routing, batching, compression, retries, receipts, reader inboxes |
+| Admin owner `ozzy/admin` | One per broker with an `admin` endpoint | Admin endpoint; asks shards for partition status, reads counters and links, deletes consumer groups |
+| SDK owner `ozzy/sdk` | One per `WriterRuntime`; one in a broker after its first admin group deletion | Links, routing, batching, compression, retries, receipts, reader inboxes |
 | SDK OMQ I/O | `OMQ_IO_THREADS` for `WriterRuntime::new` | SDK connections |
 
 - Each thread owns its mutable state. Partition actors are tasks on a shard.
@@ -307,13 +307,25 @@ optional and off by default.
 - `ozzy_telemetry::totals` sums the counters across all threads, including
   exited ones. `ozzy_telemetry::threads` lists them by thread; the admin
   endpoint serves both.
+- `ozzy_telemetry::log` always keeps the process's last 64 diagnostics for
+  `ozzy_telemetry::recent_logs`, which the admin endpoint serves. Publishing
+  them stays optional. Logging is rare, so one lock guards that list.
+- `io_failed` counts storage errors. An open, metadata, remove, or directory
+  creation that finds a path absent or present counts as `io_probe_missed`
+  instead; startup probes produce these.
 - Shards answer admin status queries between turns. A full admin lane drops
   the answer, and the admin owner reports that shard as missing.
-- A partition's committed state (offsets, groups, cursors) is read from its
-  journal owner without I/O or a read ticket, so followers answer too. A
-  journal busy with a command answers without it.
+- A partition's committed state (offsets, retention policy, segments, dedup
+  fill, groups, cursors) is read from its journal owner without I/O or a
+  read ticket, so followers answer too. A journal busy with a command
+  answers without it.
 - Link state comes from the frontend's published link observations, which
   the dispatcher hands to the admin owner at startup.
+- Brokers never send group requests to each other, so the admin owner
+  deletes a group through its own `BrokerLinks` to every broker's `peer`
+  endpoint, as the SDK does. The link takes one client slot per broker while
+  it runs. One deletion runs at a time, beside other admin requests, and
+  gives up after 60 s; deleting again finishes it.
 - [Benchmark tools](../ozzy-bench/README.md) describe collection and event
   names.
 

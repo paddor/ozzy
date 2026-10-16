@@ -2,9 +2,9 @@ use super::*;
 use ozzy_broker::{Broker, format_partition_journals, initialize_volumes};
 use ozzy_proto::{EnvelopeLimits, MessageId, NodeId, data::DataLimits, handshake};
 use ozzy_runtime::replicated::{
-    AppendLinkLimits, BrokerAddress, BrokerLinks, BrokerLinksConfig, ReaderLinkLimits, RecordInput,
-    RetryPolicy, SdkClock, SharedTopicWriter, SharedTopicWriterConfig, TopicReader,
-    TopicReaderConfig, WriterRuntime,
+    AppendLinkLimits, BrokerLinks, BrokerLinksConfig, ReaderLinkLimits, RecordInput, RetryPolicy,
+    SdkClock, SharedTopicWriter, SharedTopicWriterConfig, TopicReader, TopicReaderConfig,
+    WriterRuntime,
 };
 use std::{task::Poll, time::Duration};
 
@@ -86,24 +86,7 @@ async fn role_links_with_config(
     parameters.capabilities |= handshake::OWNER_READ;
     let mut config = BrokerLinksConfig {
         local: NodeId::from_bytes(*Uuid::now_v7().as_bytes()),
-        brokers: checked
-            .identity
-            .brokers
-            .iter()
-            .map(|(name, id)| BrokerAddress {
-                node: NodeId::from_bytes(*id.as_bytes()),
-                endpoint: checked.deployment.deployment().brokers[name]
-                    .endpoints
-                    .peer
-                    .parse()
-                    .unwrap(),
-                data_endpoint: checked.deployment.deployment().brokers[name]
-                    .endpoints
-                    .data_peer
-                    .parse()
-                    .unwrap(),
-            })
-            .collect(),
+        brokers: checked.broker_addresses().unwrap(),
         parameters,
         requests: 12,
         control_bytes: (1024 * 1024).max(16 * wire.max_record_bytes),

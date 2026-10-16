@@ -63,6 +63,13 @@ fn replies() -> Vec<Reply> {
                         first_offset: 100,
                         next_offset: 250,
                         producers: 3,
+                        retention_age_millis: NonZeroU64::new(86_400_000),
+                        retention_bytes: NonZeroU64::new(1 << 34),
+                        policy_revision: 2,
+                        segments: 5,
+                        segment_bytes: 5 << 28,
+                        dedup_entries: 1200,
+                        dedup_limit: NonZeroU64::new(100_000),
                         groups: vec![GroupStatus {
                             id: ConsumerGroupId::from_bytes([8; 16]),
                             name: "billing".into(),
@@ -110,6 +117,22 @@ fn replies() -> Vec<Reply> {
             clients: 12,
         }),
         Reply::Error("unknown request".into()),
+        Reply::GroupDeleted(Some(ConsumerGroupId::from_bytes([11; 16]))),
+        Reply::GroupDeleted(None),
+        Reply::Logs(vec![
+            LogEntry {
+                uptime_ms: 0,
+                level: LogLevel::Info,
+                thread: "ozzy/admin".into(),
+                message: "admin deleted consumer group orders/billing".into(),
+            },
+            LogEntry {
+                uptime_ms: 5_000,
+                level: LogLevel::Error,
+                thread: "ozzy/shard/0".into(),
+                message: "replica journal fault".into(),
+            },
+        ]),
     ]
 }
 
@@ -120,11 +143,16 @@ fn requests_round_trip_and_unknown_kinds_keep_their_id() {
         Request::Counters,
         Request::Partitions,
         Request::Connections,
+        Request::Logs,
+        Request::DeleteGroup {
+            topic: "orders".into(),
+            name: "billing".into(),
+        },
     ] {
-        let bytes = encode_request(42, request);
+        let bytes = encode_request(42, &request).unwrap();
         assert_eq!(decode_request(&bytes).unwrap(), (42, request));
     }
-    let mut unknown = encode_request(43, Request::Broker);
+    let mut unknown = encode_request(43, &Request::Broker).unwrap();
     unknown[0] = 9;
     assert!(matches!(decode_request(&unknown), Err(CodecError::Command)));
     assert_eq!(request_id(&unknown), Some(43));
@@ -198,5 +226,61 @@ fn unknown_cursor_flags_are_rejected() {
     let flags = bytes.len() - 1;
     assert_eq!(bytes[flags], 0);
     bytes[flags] = 4;
+    assert!(matches!(decode_reply(&bytes), Err(CodecError::Profile)));
+}
+
+#[test]
+fn unset_limits_travel_as_zero() {
+    let Reply::Partitions(mut partitions) = replies().swap_remove(2) else {
+        unreachable!()
+    };
+    partitions.rows.truncate(1);
+    let log = partitions.rows[0].log.as_mut().unwrap();
+    log.retention_age_millis = None;
+    log.retention_bytes = None;
+    log.segments = 0;
+    log.segment_bytes = 0;
+    log.dedup_entries = 0;
+    log.dedup_limit = None;
+    let reply = Reply::Partitions(partitions);
+    let bytes = encode_reply(1, &reply).unwrap();
+    assert_eq!(decode_reply(&bytes).unwrap(), (1, reply));
+}
+
+#[test]
+fn delete_group_requests_reject_truncation_and_long_names() {
+    let request = Request::DeleteGroup {
+        topic: "orders".into(),
+        name: "billing".into(),
+    };
+    let bytes = encode_request(7, &request).unwrap();
+    for end in 9..bytes.len() {
+        assert!(decode_request(&bytes[..end]).is_err(), "{end}");
+    }
+    let long = Request::DeleteGroup {
+        topic: "orders".into(),
+        name: "n".repeat(usize::from(u16::MAX) + 1),
+    };
+    assert!(encode_request(7, &long).is_err());
+}
+
+#[test]
+fn unknown_log_levels_are_rejected() {
+    let reply = Reply::Logs(vec![LogEntry {
+        uptime_ms: 1,
+        level: LogLevel::Warn,
+        thread: String::new(),
+        message: String::new(),
+    }]);
+    let mut bytes = encode_reply(1, &reply).unwrap();
+    // Kind, ID, count, uptime, then the level.
+    bytes[21] = 3;
+    assert!(matches!(decode_reply(&bytes), Err(CodecError::Profile)));
+}
+
+#[test]
+fn unknown_deletion_flags_are_rejected() {
+    let mut bytes = encode_reply(1, &Reply::GroupDeleted(None)).unwrap();
+    bytes[9] = 2;
     assert!(matches!(decode_reply(&bytes), Err(CodecError::Profile)));
 }

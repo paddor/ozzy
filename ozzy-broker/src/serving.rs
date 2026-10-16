@@ -7,6 +7,7 @@ mod drain;
 mod outbound;
 mod shard;
 
+use crate::admin::Admin;
 use crate::shards::lifecycle::startup_groups;
 use crate::{
     ApplicationShards, CheckedConfig, DevicePools, Frontend, JournalPlan, RecoverySelection,
@@ -147,8 +148,9 @@ impl Broker {
         storage: ShardStorage<B, impl StorageOwner>,
     ) -> Result<Self, StartupError> {
         let mut config = config::Config::new(&checked, context)?;
-        let admin = crate::admin::Admin::bind(&checked, &config.omq, config.local, config.clients)?;
-        config.admin = admin.as_ref().map(crate::admin::Admin::hooks);
+        let clock = config.time.sdk_clock();
+        let admin = Admin::bind(&checked, &config.omq, config.local, config.clients, clock)?;
+        config.admin = admin.as_ref().map(Admin::hooks);
         let config = Arc::new(config);
         let checked = Arc::new(checked);
         let shards = checked.plan.shards.len();

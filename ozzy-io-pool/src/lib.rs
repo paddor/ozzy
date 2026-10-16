@@ -434,8 +434,8 @@ impl Slot {
         reply.finish(result);
     }
 
-    /// Counters always count; stage timing and the diagnostic name only when
-    /// this thread enabled stage diagnostics.
+    /// Counters and the operation name always; stage timing only when this
+    /// thread enabled stage diagnostics. The name tells probe misses apart.
     fn observe_start(&mut self, operation: &Operation) {
         ozzy_telemetry::finish(ozzy_telemetry::Stage::IoQueue, self.enqueued.take());
         self.started = ozzy_telemetry::start();
@@ -443,25 +443,25 @@ impl Slot {
         if self.class == Class::Progress {
             ozzy_telemetry::event(ozzy_telemetry::Event::IoProgressStarted);
         }
-        let operation = operation.unprotected();
-        match operation {
-            Operation::Read { .. } => ozzy_telemetry::event(ozzy_telemetry::Event::IoRead),
-            Operation::Write { .. } => ozzy_telemetry::event(ozzy_telemetry::Event::IoWrite),
-            Operation::Sync { .. } => ozzy_telemetry::event(ozzy_telemetry::Event::IoSync),
-            _ => {}
-        }
-        if ozzy_telemetry::enabled() {
-            self.diagnostic_operation = match operation {
-                Operation::Open { .. } | Operation::OpenDirectory { .. } => "open",
-                Operation::Metadata { .. } => "metadata",
-                Operation::Read { .. } => "read",
-                Operation::Write { .. } => "write",
-                Operation::Sync { .. } => "sync",
-                Operation::RemoveFile { .. } | Operation::RemoveDirectory { .. } => "remove",
-                Operation::CreateDirectory { .. } => "create_directory",
-                _ => "other",
-            };
-        }
+        self.diagnostic_operation = match operation.unprotected() {
+            Operation::Open { .. } | Operation::OpenDirectory { .. } => "open",
+            Operation::Metadata { .. } => "metadata",
+            Operation::Read { .. } => {
+                ozzy_telemetry::event(ozzy_telemetry::Event::IoRead);
+                "read"
+            }
+            Operation::Write { .. } => {
+                ozzy_telemetry::event(ozzy_telemetry::Event::IoWrite);
+                "write"
+            }
+            Operation::Sync { .. } => {
+                ozzy_telemetry::event(ozzy_telemetry::Event::IoSync);
+                "sync"
+            }
+            Operation::RemoveFile { .. } | Operation::RemoveDirectory { .. } => "remove",
+            Operation::CreateDirectory { .. } => "create_directory",
+            _ => "other",
+        };
     }
 
     fn observe_finish(&mut self, result: &io::Result<Outcome>) {
@@ -480,21 +480,29 @@ impl Slot {
                 }
             }
             Err(error) => {
-                ozzy_telemetry::event(ozzy_telemetry::Event::IoFailed);
-                if ozzy_telemetry::enabled() {
-                    let expected = matches!(
-                        error.kind(),
-                        io::ErrorKind::NotFound | io::ErrorKind::AlreadyExists
-                    ) && matches!(
-                        self.diagnostic_operation,
-                        "open" | "metadata" | "remove" | "create_directory"
-                    );
+                let probe = matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::AlreadyExists
+                ) && matches!(
+                    self.diagnostic_operation,
+                    "open" | "metadata" | "remove" | "create_directory"
+                );
+                let (event, level) = if probe {
+                    (
+                        ozzy_telemetry::Event::IoProbeMissed,
+                        ozzy_telemetry::Level::Info,
+                    )
+                } else {
+                    (
+                        ozzy_telemetry::Event::IoFailed,
+                        ozzy_telemetry::Level::Error,
+                    )
+                };
+                ozzy_telemetry::event(event);
+                // Probe misses are expected; they would crowd the recent log.
+                if !probe || ozzy_telemetry::enabled() {
                     ozzy_telemetry::log(
-                        if expected {
-                            ozzy_telemetry::Level::Info
-                        } else {
-                            ozzy_telemetry::Level::Error
-                        },
+                        level,
                         &format!(
                             "storage {} returned {:?}",
                             self.diagnostic_operation,

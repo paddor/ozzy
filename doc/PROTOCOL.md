@@ -605,9 +605,9 @@ Replies are observations, never authority. There is no authentication yet:
 any client that connects is an admin. `ozzy-tui` from the `ozzy-ui` crate is the
 terminal client.
 
-Each message is one frame: kind `u8`, ID `u64`, body. Integers are big-endian,
-IDs 16 bytes. A string is a `u16` length plus UTF-8; a list is a `u32` count
-plus items.
+Each message is one frame: kind `u8`, ID `u64`, body. Only a delete group
+request has a body. Integers are big-endian, IDs 16 bytes. A string is a
+`u16` length plus UTF-8; a list is a `u32` count plus items.
 
 | Kind | Request | Reply body |
 | --- | --- | --- |
@@ -615,6 +615,8 @@ plus items.
 | 2 | Counters | uptime ms `u64`, events (name, kind `u8`: 0 count, 1 peak, 2 gauge), totals (`u64` per event), threads (name, `u64` per event) |
 | 3 | Partitions | uptime ms `u64`, missing shards `u32`, rows |
 | 4 | Connections | other brokers (ID, link up `u8`), connected clients `u32` |
+| 5 | Delete group: topic, name | deleted `u8`, then the group ID when 1 |
+| 6 | Logs | entries, oldest first (broker uptime ms `u64`, level `u8`: 0 info, 1 warn, 2 error, thread, message) |
 | 255 | none | error message |
 
 A partition row:
@@ -627,15 +629,24 @@ A partition row:
 | view, leader | `u64`, ID (zero when unknown) |
 | positions | `u64` each: accepted, committed, applied, pending operations, pending body bytes, validation cycles, reclaimed bytes, written, durable, leader commit |
 | followers | list of (ID, acknowledged `u64`); a leader lists both followers, others none |
-| log | only with flag 8: first offset `u64`, next offset `u64`, producers `u32`, groups, cursors |
+| log | only with flag 8: first offset `u64`, next offset `u64`, producers `u32`, limits, groups, cursors |
 
 - Positions are operation numbers. Only the log has record offsets.
+- Limits are retention age ms `u64`, retention bytes `u64`, policy revision
+  `u64`, segments `u32`, segment bytes `u64`, retained dedup identities
+  `u64`, and the dedup identity limit `u64`. A zero limit means none; zero
+  segments means the journal is being installed. Segment bytes sum the
+  segment capacities, the size retention bytes limit.
 - Groups are the consumer groups this partition coordinates: group ID, name,
   plan revision `u64`, members (member ID, client ID).
 - Cursors are the groups reading this partition: group ID, flags `u8`
   (1 member, 2 offset), then the active member's ID and the exclusive
   committed offset `u64` when flagged.
 - A partition whose journal is busy answers without its log; ask again.
+- Delete group fences the group on every partition, then frees its name,
+  like `BrokerLinks::delete_group`. Deleted 0 means no group has that name.
+  The reply comes when the deletion ends, after other replies; a second
+  deletion meanwhile gets an error.
 - An unknown kind gets an error reply with the request's ID.
 - A reply the client cannot take is dropped; the client times out.
 - The last thread in a counters reply, `exited`, combines ended threads.

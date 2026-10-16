@@ -5,18 +5,18 @@ use ozzy_proto::{
     ConsumerGroupId, GroupId, NodeId,
     admin::{
         Counters, EventKind, GroupCursor, GroupStatus, PartitionName, PartitionState,
-        PartitionStatus,
+        PartitionStatus, Partitions,
     },
 };
 use std::collections::BTreeMap;
 
-/// Counters the Broker screen shows, with their labels. `io_failed` is left
-/// out: it also counts expected misses, such as probing an absent file.
-pub(crate) const OVERVIEW: [(&str, &str); 12] = [
+/// Counters the Broker screen shows, with their labels.
+pub(crate) const OVERVIEW: [(&str, &str); 13] = [
     ("native_proposal_committed", "Appends confirmed"),
     ("native_admission_refusal", "Appends refused"),
     ("client_limit_refusal", "Clients over limit"),
     ("dispatcher_input_paused", "Input paused"),
+    ("io_failed", "I/O errors"),
     ("reader_publication", "Reader publications"),
     ("historical_read_delivery", "Historical reads"),
     ("replica_send", "Replica sends"),
@@ -60,6 +60,8 @@ pub(crate) struct GroupRow<'a> {
     pub(crate) id: ConsumerGroupId,
     /// `topic/name`, or the ID without a plan.
     pub(crate) label: String,
+    /// The topic, known with the plan.
+    pub(crate) topic: Option<&'a str>,
     pub(crate) status: Option<&'a GroupStatus>,
     pub(crate) cursors: Vec<CursorRow<'a>>,
 }
@@ -98,6 +100,18 @@ pub(crate) struct PartitionRow<'a> {
     pub(crate) status: Option<&'a PartitionStatus>,
     /// Committed operations per second.
     pub(crate) rate: Option<f64>,
+    /// Records per second.
+    pub(crate) records: Option<f64>,
+}
+
+/// One partition's record rate between its last two logs. A busy journal
+/// answers without its log; the screens show the previous one, which would
+/// read as a stall, so only fresh logs count.
+#[derive(Debug)]
+pub(crate) struct RecordRate {
+    uptime_ms: u64,
+    next_offset: u64,
+    rate: Option<f64>,
 }
 
 /// One event's value for the selected thread.
@@ -122,6 +136,7 @@ pub(crate) struct Summary {
     pub(crate) pending_body_bytes: u64,
     pub(crate) reclaimed_bytes: u64,
     pub(crate) rate: f64,
+    pub(crate) records: f64,
 }
 
 /// The first entry of the Threads screen's list totals every thread.
@@ -158,6 +173,7 @@ impl App {
                     name: Some(name),
                     status,
                     rate: rate(status),
+                    records: self.records(name.group),
                 }
             })
             .collect::<Vec<_>>();
@@ -166,8 +182,34 @@ impl App {
             name: None,
             status: Some(status),
             rate: rate(Some(status)),
+            records: self.records(status.group),
         }));
         rows
+    }
+
+    fn records(&self, group: GroupId) -> Option<f64> {
+        self.record_rates.get(&group)?.rate
+    }
+
+    /// Update record rates from the fresh logs of `partitions`. A restarted
+    /// broker starts over.
+    pub(crate) fn track_records(&mut self, partitions: &Partitions) {
+        for row in &partitions.rows {
+            let Some(log) = &row.log else {
+                continue;
+            };
+            let now = RecordRate {
+                uptime_ms: partitions.uptime_ms,
+                next_offset: log.next_offset,
+                rate: None,
+            };
+            let rate = self.record_rates.get(&row.group).and_then(|before| {
+                let elapsed = now.uptime_ms.checked_sub(before.uptime_ms)?;
+                per_second(now.next_offset, before.next_offset, elapsed)
+            });
+            self.record_rates
+                .insert(row.group, RecordRate { rate, ..now });
+        }
     }
 
     pub(crate) fn summary(&self) -> Summary {
@@ -176,6 +218,7 @@ impl App {
         for row in self.partition_rows() {
             summary.partitions += 1;
             summary.rate += row.rate.unwrap_or(0.0);
+            summary.records += row.records.unwrap_or(0.0);
             let Some(status) = row.status else {
                 continue;
             };
@@ -235,9 +278,10 @@ impl App {
             };
             let partition = row.label();
             for status in &log.groups {
-                let topic = row.name.map_or("?", |name| name.topic.as_str());
+                let topic = row.name.map(|name| name.topic.as_str());
                 let group = group_entry(&mut groups, status.id);
-                group.label = format!("{topic}/{}", status.name);
+                group.label = format!("{}/{}", topic.unwrap_or("?"), status.name);
+                group.topic = topic;
                 group.status = Some(status);
             }
             for cursor in &log.cursors {
@@ -342,7 +386,7 @@ impl App {
     /// [`OVERVIEW`].
     pub(crate) fn labeled(
         &self,
-        events: &'static [(&'static str, &'static str)],
+        events: &[(&'static str, &'static str)],
     ) -> Vec<(&'static str, EventRow<'_>)> {
         let Some(current) = &self.counters.current else {
             return Vec::new();
@@ -391,6 +435,7 @@ fn group_entry<'a, 'b>(
     groups.entry(id).or_insert_with(|| GroupRow {
         id,
         label: id.to_string(),
+        topic: None,
         status: None,
         cursors: Vec::new(),
     })
