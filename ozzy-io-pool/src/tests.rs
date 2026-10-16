@@ -531,6 +531,7 @@ async fn failed_open_and_last_handle_drop_release_capacity_and_file_lock() {
         ..config()
     })
     .unwrap();
+    let missed = ozzy_telemetry::totals().get(ozzy_telemetry::Event::IoProbeMissed);
     let error = perform(
         &mut clients[0],
         Operation::Open {
@@ -543,6 +544,8 @@ async fn failed_open_and_last_handle_drop_release_capacity_and_file_lock() {
     .await
     .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    // A probe miss, not a storage error, with telemetry off too.
+    assert!(ozzy_telemetry::totals().get(ozzy_telemetry::Event::IoProbeMissed) > missed);
     let mut handle = open(&mut clients[0], &path, OpenMode::CreateNew).await;
     perform(
         &mut clients[0],
