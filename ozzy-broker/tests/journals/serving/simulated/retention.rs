@@ -3,6 +3,7 @@
 use super::*;
 use ozzy_config::TopicRetention;
 use ozzy_journal_segment::{Manifest, MetadataLimits, decode_current, decode_manifest};
+use ozzy_runtime::replicated::ReaderStart;
 use std::path::PathBuf;
 
 pub(super) fn selected(image: &Image, root: &Path) -> Manifest {
@@ -44,11 +45,18 @@ async fn append_one(brokers: &[Broker], writer: &mut SharedTopicWriter, number: 
     .unwrap();
 }
 
-async fn read_retained(brokers: &[Broker], consumer: &BrokerLinks, end: u64) {
+async fn read_retained(brokers: &[Broker], consumer: &BrokerLinks, end: u64, start: ReaderStart) {
     let mut reader = live_many(
         brokers,
         "open retained payload reader",
-        TopicReader::open(consumer.clone(), "orders", TopicReaderConfig::default()),
+        TopicReader::open(
+            consumer.clone(),
+            "orders",
+            TopicReaderConfig {
+                start,
+                ..Default::default()
+            },
+        ),
     )
     .await
     .unwrap();
@@ -56,7 +64,7 @@ async fn read_retained(brokers: &[Broker], consumer: &BrokerLinks, end: u64) {
     loop {
         let record = live_many(brokers, "read retained payload", reader.next())
             .await
-            .unwrap();
+            .unwrap_or_else(|error| panic!("read retained payload at {next:?}: {error:?}"));
         let offset = record.offset.get();
         if let Some(expected) = next {
             assert_eq!(offset, expected);
@@ -81,124 +89,181 @@ async fn read_retained(brokers: &[Broker], consumer: &BrokerLinks, end: u64) {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn lagging_follower_recovers_retained_checkpoint_then_supplies_the_required_quorum() {
-    for policy in [Confirmation::DiskQuorum, Confirmation::ReplicatedPersisting] {
-        let runtime = WriterRuntime::new().unwrap();
-        let root = PathBuf::from(format!("/ozzy-retained-recovery-{}", Uuid::now_v7()));
-        let deployment = deployment_with(&root, DeploymentMode::Three, policy, 1, |config| {
-            let topic = config.topics.get_mut("orders").unwrap();
-            topic.retention = TopicRetention {
-                max_age_secs: None,
-                max_bytes: Some(1024 * 1024),
-            };
-        });
-        let restart = deployment[2].clone();
-        let directory = restart.0.plan.partitions[0].directory.clone();
-        let recovered_node = ozzy_proto::NodeId::from_bytes(
-            *restart.0.identity.brokers[&restart.0.plan.name].as_bytes(),
-        );
-        let leader_directory = deployment[0].0.plan.partitions[0].directory.clone();
-        let producer = role_links(&runtime, &deployment[0].0, handshake::PRODUCER).await;
-        let consumer = role_links(&runtime, &deployment[0].0, handshake::CONSUMER).await;
-        let (mut brokers, mut controls, mut images) =
-            start_images(runtime.context().clone(), deployment, true).await;
-        let mut writer = live_many(
-            &brokers,
-            "open retained recovery writer",
-            SharedTopicWriter::open(
-                &producer,
-                "orders",
-                SharedTopicWriterConfig::new(limits()),
-                RetryPolicy::default(),
-            ),
+async fn disk_quorum_lagging_follower_recovers_retained_checkpoint_then_supplies_the_required_quorum()
+ {
+    lagging_follower().await;
+}
+
+async fn lagging_follower() {
+    let runtime = WriterRuntime::new().unwrap();
+    let root = PathBuf::from(format!("/ozzy-retained-recovery-{}", Uuid::now_v7()));
+    let deployment = deployment_with(&root, DeploymentMode::Three, 1, |config| {
+        let topic = config.topics.get_mut("orders").unwrap();
+        topic.retention = TopicRetention {
+            max_age_secs: None,
+            max_bytes: Some(1024 * 1024),
+        };
+    });
+    let restart = deployment[2].clone();
+    let directories = deployment
+        .iter()
+        .map(|(checked, _)| checked.plan.partitions[0].directory.clone())
+        .collect::<Vec<_>>();
+    let directory = directories[2].clone();
+    let recovered_node = ozzy_proto::NodeId::from_bytes(
+        *restart.0.identity.brokers[&restart.0.plan.name].as_bytes(),
+    );
+    let producer = role_links(&runtime, &deployment[0].0, handshake::PRODUCER).await;
+    let consumer = role_links(&runtime, &deployment[0].0, handshake::CONSUMER).await;
+    let (mut brokers, mut controls, mut images) =
+        start_images(runtime.context().clone(), deployment, true).await;
+    let mut writer = live_many(
+        &brokers,
+        "open retained recovery writer",
+        SharedTopicWriter::open(
+            &producer,
+            "orders",
+            SharedTopicWriterConfig::new(limits()),
+            RetryPolicy::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    append_one(&brokers, &mut writer, 1).await;
+    brokers.remove(2).shutdown().await.unwrap();
+    controls.remove(2);
+    let old_image = images.remove(2).await.unwrap();
+    for number in 2..=600 {
+        append_one(&brokers, &mut writer, number).await;
+    }
+    // The restart probe sees expiry only in the primary's retained floor, and
+    // either copy may lead.
+    let tail = stopped_tail(&old_image, &directory);
+    retired(&brokers, &controls, &directories[..2], tail).await;
+    assert!(selected(&old_image, &directory).checkpoint.is_none());
+    for round in 0..2 {
+        let (checked, local) = restart.clone();
+        let (restarted, control, task) = start_image(
+            runtime.context().clone(),
+            checked,
+            local,
+            Memory::new(old_image.clone(), true),
         )
-        .await
-        .unwrap();
-        append_one(&brokers, &mut writer, 1).await;
-        brokers.remove(2).shutdown().await.unwrap();
-        controls.remove(2);
-        let old_image = images.remove(2).await.unwrap();
-        for number in 2..=600 {
-            append_one(&brokers, &mut writer, number).await;
-        }
-        tokio::time::sleep(Duration::from_secs(4)).await;
-        let leader_image = controls[0].image().await;
-        assert!(
-            selected(&leader_image, &leader_directory)
-                .checkpoint
-                .is_some()
-        );
-        assert!(selected(&old_image, &directory).checkpoint.is_none());
-        for round in 0..2 {
-            let (checked, local) = restart.clone();
-            let (restarted, control, task) = start_image(
-                runtime.context().clone(),
-                checked,
-                local,
-                true,
-                old_image.clone(),
+        .await;
+        brokers.push(restarted);
+        controls.push(control);
+        images.push(task);
+        let recovered = recovered(&brokers, &controls[2], &directory).await;
+        if round == 0 {
+            brokers.remove(2).shutdown().await.unwrap();
+            controls.remove(2);
+            images.remove(2).await.unwrap();
+            // The stopped copy may have started an election it can no longer
+            // finish. Commit once so the next restart meets a settled pair.
+            append_one(&brokers, &mut writer, 601).await;
+        } else {
+            // Stop another copy only once this one votes in an installed view,
+            // so the failover needs at most one more election.
+            joined(
+                &brokers,
+                &controls[2],
+                &directory,
+                recovered.last_normal_view,
             )
             .await;
-            brokers.push(restarted);
-            controls.push(control);
-            images.push(task);
-            live_many(&brokers, "recover lagging retained checkpoint", async {
-                loop {
-                    let image = controls[2].image().await;
-                    if selected(&image, &directory).checkpoint.is_some()
-                        && ozzy_replication::ConfigurationRecord::decode(
-                            image
-                                .bytes(&directory.join("CONFIGURATION"), false)
-                                .unwrap(),
-                        )
-                        .is_ok()
-                    {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await;
-            if round == 0 {
-                brokers.remove(2).shutdown().await.unwrap();
-                controls.remove(2);
-                images.remove(2).await.unwrap();
-            }
-        }
-        brokers.remove(1).shutdown().await.unwrap();
-        controls.remove(1);
-        images.remove(1).await.unwrap();
-        append_one(&brokers, &mut writer, 601).await;
-        assert_recovered_leader(&producer, &writer, recovered_node);
-        read_retained(&brokers, &consumer, 601).await;
-        writer.close().await.unwrap();
-        producer.shutdown().await.unwrap();
-        consumer.shutdown().await.unwrap();
-        for broker in brokers {
-            broker.shutdown().await.unwrap();
-        }
-        for image in images {
-            image.await.unwrap();
         }
     }
+    brokers.remove(1).shutdown().await.unwrap();
+    controls.remove(1);
+    images.remove(1).await.unwrap();
+    append_one(&brokers, &mut writer, 602).await;
+    assert_recovered_leader(&producer, &writer, recovered_node).await;
+    read_retained(&brokers, &consumer, 602, ReaderStart::Earliest).await;
+    writer.close().await.unwrap();
+    producer.shutdown().await.unwrap();
+    consumer.shutdown().await.unwrap();
+    for broker in brokers {
+        broker.shutdown().await.unwrap();
+    }
+    for image in images {
+        image.await.unwrap();
+    }
+}
+
+/// Wait until every listed copy retired the history through `tail`.
+async fn retired(
+    brokers: &[Broker],
+    controls: &[std::sync::Arc<ozzy_sim::broker::Control>],
+    directories: &[PathBuf],
+    tail: u64,
+) {
+    live_many(brokers, "retire history past the stopped copy", async {
+        loop {
+            let mut all = true;
+            for (control, directory) in controls.iter().zip(directories) {
+                all &= retired_past(&control.image().await, directory, tail);
+            }
+            if all {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+}
+
+/// Wait until a nonvoting copy publishes its recovered checkpoint and
+/// configuration, and return the selected manifest.
+async fn recovered(
+    brokers: &[Broker],
+    control: &ozzy_sim::broker::Control,
+    directory: &Path,
+) -> Manifest {
+    live_many(brokers, "recover lagging retained checkpoint", async {
+        loop {
+            let image = control.image().await;
+            let manifest = selected(&image, directory);
+            if manifest.checkpoint.is_some()
+                && ozzy_replication::ConfigurationRecord::decode(
+                    image
+                        .bytes(&directory.join("CONFIGURATION"), false)
+                        .unwrap(),
+                )
+                .is_ok()
+            {
+                return manifest;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+}
+
+/// Wait until a recovered copy installs a normal view after `recovered_view`.
+async fn joined(
+    brokers: &[Broker],
+    control: &ozzy_sim::broker::Control,
+    directory: &Path,
+    recovered_view: u64,
+) {
+    live_many(brokers, "join a normal view after recovery", async {
+        while selected(&control.image().await, directory).last_normal_view <= recovered_view {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn disk_quorum_cluster_restart_with_an_ancient_replica_preserves_retained_history() {
-    restart_with_ancient_replica(Confirmation::DiskQuorum).await;
+    restart_with_ancient_replica().await;
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn replicated_persisting_cluster_restart_with_an_ancient_replica_preserves_retained_history()
-{
-    restart_with_ancient_replica(Confirmation::ReplicatedPersisting).await;
-}
-
-async fn restart_with_ancient_replica(policy: Confirmation) {
+async fn restart_with_ancient_replica() {
     let runtime = WriterRuntime::new().unwrap();
     let context = runtime.context().clone();
     let root = PathBuf::from(format!("/ozzy-ancient-restart-{}", Uuid::now_v7()));
-    let deployment = deployment_with(&root, DeploymentMode::Three, policy, 1, |config| {
+    let deployment = deployment_with(&root, DeploymentMode::Three, 1, |config| {
         config.topics.get_mut("orders").unwrap().retention = TopicRetention {
             max_age_secs: None,
             max_bytes: Some(1024 * 1024),
@@ -226,7 +291,13 @@ async fn restart_with_ancient_replica(policy: Confirmation) {
         append_one(&brokers, &mut writer, number).await;
     }
     writer.close().await.unwrap();
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    let ancient_directory = &restart[0].0.plan.partitions[0].directory;
+    let tail = stopped_tail(&ancient, ancient_directory);
+    let directories = restart[1..]
+        .iter()
+        .map(|(checked, _)| checked.plan.partitions[0].directory.clone())
+        .collect::<Vec<_>>();
+    retired(&brokers, &controls, &directories, tail).await;
     for broker in brokers {
         broker.shutdown().await.unwrap();
     }
@@ -235,7 +306,7 @@ async fn restart_with_ancient_replica(policy: Confirmation) {
         stopped.push(image.await.unwrap());
     }
     stopped.insert(0, ancient);
-    assert_ancient_history_retired(&stopped, &restart, policy);
+    assert_ancient_history_retired(&stopped, &restart);
     let mut brokers = Vec::new();
     let mut controls = Vec::new();
     let mut images = Vec::new();
@@ -249,7 +320,7 @@ async fn restart_with_ancient_replica(policy: Confirmation) {
     for index in [0, 2, 1] {
         let ((checked, local), image) = stopped[index].take().unwrap();
         let (broker, control, image) =
-            start_image(context.clone(), checked, local, true, image).await;
+            start_image(context.clone(), checked, local, Memory::new(image, true)).await;
         brokers.push(broker);
         controls.push(control);
         images.push(image);
@@ -282,106 +353,132 @@ async fn restart_with_ancient_replica(policy: Confirmation) {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn retained_history_survives_complete_cluster_restart_and_producer_resume() {
+async fn disk_quorum_retained_history_survives_complete_cluster_restart_and_producer_resume() {
+    complete_cluster_restart().await;
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "one complete retained-history restart and producer-resume scenario"
+)]
+async fn complete_cluster_restart() {
     use ozzy_proto::Offset;
-    use ozzy_runtime::replicated::ReaderStart;
-    for policy in [Confirmation::DiskQuorum, Confirmation::ReplicatedPersisting] {
-        let runtime = WriterRuntime::new().unwrap();
-        let root = PathBuf::from(format!("/ozzy-retained-restart-{}", Uuid::now_v7()));
-        let deployment = deployment_with(&root, DeploymentMode::Three, policy, 1, |config| {
-            config.topics.get_mut("orders").unwrap().retention = TopicRetention {
-                max_age_secs: None,
-                max_bytes: Some(1024 * 1024),
-            };
-        });
-        let restart = deployment.clone();
-        let producer = role_links(&runtime, &deployment[0].0, handshake::PRODUCER).await;
-        let consumer = role_links(&runtime, &deployment[0].0, handshake::CONSUMER).await;
-        let (brokers, controls, images) =
-            start_images(runtime.context().clone(), deployment, true).await;
-        let config = SharedTopicWriterConfig::new(limits());
-        let mut writer = live_many(
-            &brokers,
-            "open full retained restart writer",
-            SharedTopicWriter::open(&producer, "orders", config.clone(), RetryPolicy::default()),
-        )
+    use ozzy_runtime::replicated::TopicCheckpoint;
+    let runtime = WriterRuntime::new().unwrap();
+    let root = PathBuf::from(format!("/ozzy-retained-restart-{}", Uuid::now_v7()));
+    let deployment = deployment_with(&root, DeploymentMode::Three, 1, |config| {
+        config.topics.get_mut("orders").unwrap().retention = TopicRetention {
+            max_age_secs: None,
+            max_bytes: Some(1024 * 1024),
+        };
+    });
+    let restart = deployment.clone();
+    let producer = role_links(&runtime, &deployment[0].0, handshake::PRODUCER).await;
+    let consumer = role_links(&runtime, &deployment[0].0, handshake::CONSUMER).await;
+    let (brokers, controls, images) =
+        start_images(runtime.context().clone(), deployment, true).await;
+    let config = SharedTopicWriterConfig::new(limits());
+    let mut writer = live_many(
+        &brokers,
+        "open full retained restart writer",
+        SharedTopicWriter::open(&producer, "orders", config.clone(), RetryPolicy::default()),
+    )
+    .await
+    .unwrap();
+    let identity = writer.identity();
+    for number in 1..=600 {
+        append_one(&brokers, &mut writer, number).await;
+    }
+    writer.close().await.unwrap();
+    let tail = retained_tail(&brokers, &controls, &restart).await;
+    let mut reader = live_many(
+        &brokers,
+        "resolve time seek before disconnect",
+        TopicReader::open(
+            consumer.clone(),
+            "orders",
+            TopicReaderConfig {
+                start: ReaderStart::Timestamp(0),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    let mut first = live_many(&brokers, "read before disconnect", reader.next())
         .await
         .unwrap();
-        let identity = writer.identity();
-        for number in 1..=600 {
-            append_one(&brokers, &mut writer, number).await;
-        }
-        writer.close().await.unwrap();
-        let tail = retained_tail(&brokers, &controls, &restart).await;
-        let mut reader = live_many(
-            &brokers,
-            "resolve time seek before disconnect",
-            TopicReader::open(
-                consumer.clone(),
-                "orders",
-                TopicReaderConfig {
-                    start: ReaderStart::Timestamp(0),
-                    ..Default::default()
-                },
-            ),
+    assert!(first.offset.get() > 0);
+    // Copies can roll at different operations. A future leader may advance
+    // the earliest retained floor, so continue from their common active tail.
+    while first.offset.get() < tail {
+        first = live_many(&brokers, "advance into retained tail", reader.next())
+            .await
+            .unwrap();
+    }
+    let floor = first.offset.get();
+    assert!(floor > 0 && floor + 5 < 600);
+    for broker in brokers {
+        broker.shutdown().await.unwrap();
+    }
+    let mut restarted = Vec::new();
+    let mut restarted_controls = Vec::new();
+    let mut restarted_images = Vec::new();
+    let recovered_deployment = restart.clone();
+    for ((checked, local), image) in restart.into_iter().zip(images) {
+        let image = image.await.unwrap();
+        let (broker, control, image) = start_image(
+            runtime.context().clone(),
+            checked,
+            local,
+            Memory::new(image, true),
         )
+        .await;
+        restarted.push(broker);
+        restarted_controls.push(control);
+        restarted_images.push(image);
+    }
+    let mut writer = resumed_writer(&restarted, &producer, identity, config).await;
+    let next = live_many(
+        &restarted,
+        "continue resolved seek after reconnect",
+        reader.next(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(next.offset, Offset::new(floor + 1));
+    live_many(&restarted, "close reconnected seek", reader.close())
         .await
         .unwrap();
-        let mut first = live_many(&brokers, "read before disconnect", reader.next())
-            .await
-            .unwrap();
-        assert!(first.offset.get() > 0);
-        // Copies can roll at different operations. A future leader may advance
-        // the earliest retained floor, so continue from their common active tail.
-        while first.offset.get() < tail {
-            first = live_many(&brokers, "advance into retained tail", reader.next())
-                .await
-                .unwrap();
-        }
-        let floor = first.offset.get();
-        assert!(floor > 0 && floor + 5 < 600);
-        for broker in brokers {
-            broker.shutdown().await.unwrap();
-        }
-        let mut restarted = Vec::new();
-        let mut restarted_images = Vec::new();
-        for ((checked, local), image) in restart.into_iter().zip(images) {
-            let image = image.await.unwrap();
-            let (broker, _, image) =
-                start_image(runtime.context().clone(), checked, local, true, image).await;
-            restarted.push(broker);
-            restarted_images.push(image);
-        }
-        let mut writer = resumed_writer(&restarted, &producer, identity, config).await;
-        let next = live_many(
-            &restarted,
-            "continue resolved seek after reconnect",
-            reader.next(),
-        )
+    read_cold_seeks(&restarted, &consumer, identity.topic, floor).await;
+    let mut latest = parked_latest(&restarted, &consumer).await;
+    append_one(&restarted, &mut writer, 601).await;
+    let record = live_many(&restarted, "deliver after latest", latest.next())
         .await
         .unwrap();
-        assert_eq!(next.offset, Offset::new(floor + 1));
-        live_many(&restarted, "close reconnected seek", reader.close())
-            .await
-            .unwrap();
-        read_cold_seeks(&restarted, &consumer, identity.topic, floor).await;
-        let mut latest = parked_latest(&restarted, &consumer).await;
-        append_one(&restarted, &mut writer, 601).await;
-        let record = live_many(&restarted, "deliver after latest", latest.next())
-            .await
-            .unwrap();
-        assert_eq!(record.offset, Offset::new(600));
-        latest.close().await.unwrap();
-        read_retained(&restarted, &consumer, 601).await;
-        writer.close().await.unwrap();
-        producer.shutdown().await.unwrap();
-        consumer.shutdown().await.unwrap();
-        for broker in restarted {
-            broker.shutdown().await.unwrap();
-        }
-        for image in restarted_images {
-            image.await.unwrap();
-        }
+    assert_eq!(record.offset, Offset::new(600));
+    latest.close().await.unwrap();
+    // Earliest can resolve before another copy's retained floor wins after
+    // restart. Verify the common retained tail across that authority change.
+    let tail = retained_tail(&restarted, &restarted_controls, &recovered_deployment).await;
+    read_retained(
+        &restarted,
+        &consumer,
+        601,
+        ReaderStart::Checkpoint(TopicCheckpoint {
+            topic: identity.topic,
+            positions: vec![(0, Offset::new(tail))],
+        }),
+    )
+    .await;
+    writer.close().await.unwrap();
+    producer.shutdown().await.unwrap();
+    consumer.shutdown().await.unwrap();
+    for broker in restarted {
+        broker.shutdown().await.unwrap();
+    }
+    for image in restarted_images {
+        image.await.unwrap();
     }
 }
 
@@ -516,7 +613,7 @@ async fn resumed_writer(
     .unwrap()
 }
 
-fn assert_recovered_leader(
+async fn assert_recovered_leader(
     producer: &BrokerLinks,
     writer: &SharedTopicWriter,
     recovered_node: ozzy_proto::NodeId,
@@ -524,6 +621,7 @@ fn assert_recovered_leader(
     assert_eq!(
         producer
             .routes(writer.metadata().clone())
+            .await
             .unwrap()
             .route(0)
             .unwrap()
@@ -534,28 +632,29 @@ fn assert_recovered_leader(
     );
 }
 
-fn assert_ancient_history_retired(
-    stopped: &[Image],
-    restart: &[(CheckedConfig, BrokerIdentity)],
-    policy: Confirmation,
-) {
-    let ancient_directory = &restart[0].0.plan.partitions[0].directory;
-    let (evidence, offset) = if policy == Confirmation::DiskQuorum {
-        ("DURABLE", 72)
-    } else {
-        ("MEMORY_VOTING", 88)
-    };
-    let ancient_tail = u64::from_be_bytes(
-        stopped[0]
-            .bytes(&ancient_directory.join(evidence), false)
-            .unwrap()[offset..offset + 8]
+/// The last accepted operation in a stopped copy's evidence.
+fn stopped_tail(image: &Image, directory: &Path) -> u64 {
+    u64::from_be_bytes(
+        image.bytes(&directory.join("DURABLE"), false).unwrap()[72..80]
             .try_into()
             .unwrap(),
-    );
-    assert!(ancient_tail > 0);
+    )
+}
+
+/// A checkpoint covers history beyond a stopped copy's last operation.
+fn retired_past(image: &Image, directory: &Path, tail: u64) -> bool {
+    let manifest = selected(image, directory);
+    manifest.checkpoint.is_some() && manifest.segments[0].first_chain.next_op_number() > tail + 1
+}
+
+fn assert_ancient_history_retired(stopped: &[Image], restart: &[(CheckedConfig, BrokerIdentity)]) {
+    let tail = stopped_tail(&stopped[0], &restart[0].0.plan.partitions[0].directory);
+    assert!(tail > 0);
     for (image, (checked, _)) in stopped[1..].iter().zip(&restart[1..]) {
-        let manifest = selected(image, &checked.plan.partitions[0].directory);
-        assert!(manifest.checkpoint.is_some());
-        assert!(manifest.segments[0].first_chain.next_op_number() > ancient_tail + 1);
+        assert!(retired_past(
+            image,
+            &checked.plan.partitions[0].directory,
+            tail
+        ));
     }
 }

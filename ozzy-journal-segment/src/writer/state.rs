@@ -3,7 +3,6 @@
 use super::{
     BodyEncodeScratch, BodyEncoding, ChainPosition, Digest, JournalGeneration, PreparedGroupBodies,
     SEGMENT_HEADER_BYTES, SegmentDigestBuilder, SegmentHeader, WriterError, WriterPosition, io,
-    prepare_group_bodies, prepare_raw_group_extents,
 };
 
 /// Sans-I/O segment state shared by asynchronous and blocking file executors.
@@ -22,28 +21,6 @@ pub struct SegmentState {
 }
 
 impl SegmentState {
-    pub(crate) fn prepare_group_bodies<'a>(
-        &mut self,
-        bodies: impl Iterator<Item = &'a [u8]> + Clone,
-        encoding: BodyEncoding,
-    ) -> Result<PreparedGroupBodies, WriterError> {
-        self.require_healthy()?;
-        if encoding == BodyEncoding::Raw {
-            return Ok(prepare_raw_group_extents(
-                bodies,
-                std::mem::take(&mut self.encode_buffer),
-            )?);
-        }
-        Ok(prepare_group_bodies(
-            bodies,
-            encoding,
-            std::mem::take(&mut self.encode_buffer),
-            self.body_encode_scratch
-                .as_mut()
-                .ok_or(WriterError::InvalidSyncPosition)?,
-        )?)
-    }
-
     pub(super) fn restore_encode_buffer(&mut self, encoded: PreparedGroupBodies) {
         self.encode_buffer = encoded.into_bytes();
         self.encode_buffer.clear();
@@ -113,10 +90,6 @@ impl SegmentState {
     /// Whether failure or canceled mutation fences further use.
     pub const fn is_faulted(&self) -> bool {
         self.faulted
-    }
-
-    pub(crate) fn fence(&mut self) {
-        self.faulted = true;
     }
 
     /// Reserve physical output and codec scratch before serving appends.

@@ -49,11 +49,7 @@ fn barriers(journal: &OwnedJournal, ticket: ValidationTicket, ids: &[u8]) -> App
 #[test]
 fn owned_control_validation_changes_no_journal_or_canonical_authority() {
     let (mut controller, io) = setup();
-    let (mut journal, driver) = fresh(
-        &mut controller,
-        io,
-        config("/partition", 7, QuorumPolicy::Durable),
-    );
+    let (mut journal, driver) = fresh(&mut controller, io, config("/partition", 7));
     let ticket = driver.begin_validation().unwrap();
     let buffer = barriers(&journal, ticket, &[1, 2]);
     let mut effects = 0;
@@ -94,11 +90,7 @@ fn owned_control_validation_changes_no_journal_or_canonical_authority() {
 #[test]
 fn owned_duplicate_control_identity_rejects_whole_group_without_fencing() {
     let (mut controller, io) = setup();
-    let (mut journal, driver) = fresh(
-        &mut controller,
-        io,
-        config("/partition", 7, QuorumPolicy::Durable),
-    );
+    let (mut journal, driver) = fresh(&mut controller, io, config("/partition", 7));
     let ticket = driver.begin_validation().unwrap();
     let buffer = barriers(&journal, ticket, &[1, 1]);
     assert!(drive(&mut controller, journal.validate_append(ticket, buffer)).is_err());
@@ -112,19 +104,10 @@ fn owned_duplicate_control_identity_rejects_whole_group_without_fencing() {
 #[test]
 fn owned_validation_rejects_foreign_arenas_before_file_work() {
     let (mut controller, io) = setup();
-    let (mut journal, driver) = fresh(
-        &mut controller,
-        io.clone(),
-        config("/partition", 7, QuorumPolicy::Durable),
-    );
+    let (mut journal, driver) = fresh(&mut controller, io.clone(), config("/partition", 7));
     let (other, _) = drive(
         &mut controller,
-        OwnedJournal::format_new(
-            config("/other", 8, QuorumPolicy::Durable),
-            io,
-            JournalGeneration(2),
-            32768,
-        ),
+        OwnedJournal::format_new(config("/other", 8), io, JournalGeneration(2), 32768),
     )
     .unwrap();
     let ticket = driver.begin_validation().unwrap();
@@ -142,7 +125,7 @@ fn owned_validation_rejects_foreign_arenas_before_file_work() {
 #[test]
 fn owned_validation_enforces_raw_capacity_before_decoding() {
     let (mut controller, io) = setup();
-    let mut config = config("/partition", 7, QuorumPolicy::Durable);
+    let mut config = config("/partition", 7);
     config.append_limits.max_body_bytes = 65536;
     let (mut journal, driver) = fresh(&mut controller, io, config);
     let ticket = driver.begin_validation().unwrap();

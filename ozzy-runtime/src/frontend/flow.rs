@@ -1,5 +1,6 @@
 //! Bounded compact-channel routing hints. Actors retain all partition authority.
 
+use crate::transport::Frames;
 use std::collections::BTreeMap;
 
 use super::{Kind, ReceiveError};
@@ -44,18 +45,16 @@ impl super::Service {
         message: &omq_tokio::Message,
         retained_bytes: usize,
     ) -> Result<Option<super::Routed>, super::ReceiveError> {
-        let peer = message
-            .part_slice(0)
-            .and_then(|p| <[u8; 16]>::try_from(p).ok())
+        let [peer, state] = message.frames().ok_or(ReceiveError::Peer)?;
+        let peer = <[u8; 16]>::try_from(peer)
             .map(NodeId::from_bytes)
-            .ok_or(ReceiveError::Peer)?;
+            .map_err(|_| ReceiveError::Peer)?;
         let link = self.links().get(peer).ok_or(ReceiveError::Peer)?;
         if link.binding.kind != Kind::Broker {
             return Err(ReceiveError::Peer);
         }
         let compact =
-            ozzy_replication::wire::CompactState::decode(message.part_slice(1).unwrap_or_default())
-                .map_err(|_| ReceiveError::Peer)?;
+            ozzy_replication::wire::CompactState::decode(state).map_err(|_| ReceiveError::Peer)?;
         let channel = self
             .dispatcher
             .peers
@@ -65,7 +64,7 @@ impl super::Service {
         let routed = Message::multipart_payloads([
             omq_tokio::message::Payload::from_slice(peer.as_bytes()),
             omq_tokio::message::Payload::from_slice(channel.scope.group_id.as_bytes()),
-            omq_tokio::message::Payload::from_slice(message.part_slice(1).unwrap()),
+            omq_tokio::message::Payload::from_slice(state),
         ]);
         self.dispatcher
             .dispatch_data(peer, routed, retained_bytes)

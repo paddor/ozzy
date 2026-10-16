@@ -15,7 +15,7 @@ pub use delivery::{CompletedDelivery, PartitionDelivery};
 #[expect(clippy::large_enum_variant, reason = "captured read jobs stay inline")]
 enum Source {
     Memory(CapturedRecords),
-    Stored(ozzy_journal_segment::AsyncPartitionRead),
+    Stored(ozzy_journal_segment::PartitionRead),
     Empty,
 }
 
@@ -71,8 +71,8 @@ impl OwnedJournal {
         })
     }
 
-    /// Capture committed records without file access. Accepted RAM-only records
-    /// are readable only after the configured group policy has confirmed them.
+    /// Capture committed records without file access. Accepted records are
+    /// readable only after the configured group policy has confirmed them.
     pub fn prepare_read(
         &self,
         mut cursor: PartitionReadCursor,
@@ -104,35 +104,7 @@ impl OwnedJournal {
         cursor.end = state.next_offset;
         cursor.retained_from = state.retained_from;
         cursor.observed = self.applied;
-        let memory_first = self.writeback.first_offset(cursor.partition);
-        let source = if cursor.next == cursor.end {
-            Source::Empty
-        } else if memory_first.is_some_and(|first| cursor.next >= first) {
-            Source::Memory(self.writeback.capture_records(
-                cursor.partition,
-                cursor.next,
-                cursor.end,
-                self.applied,
-                limits,
-            )?)
-        } else {
-            Source::Stored(
-                self.reader
-                    .as_ref()
-                    .ok_or(PartitionReadError::Unavailable)?
-                    .prepare_read(
-                        self.journal.readable()?,
-                        cursor.partition,
-                        cursor.next,
-                        memory_first.map_or(cursor.end, |first| cursor.end.min(first)),
-                        self.applied.op.0,
-                        ozzy_journal::ReadLimits {
-                            max_records: limits.max_records,
-                            max_bytes: self.limits.operations.max_payload_bytes.max(1),
-                        },
-                    )?,
-            )
-        };
+        let source = self.read_source(&cursor, limits)?;
         Ok(PreparedRead {
             key: self.read_key.clone(),
             cursor,
@@ -140,6 +112,42 @@ impl OwnedJournal {
             buffer,
             source,
         })
+    }
+
+    /// Records from `cursor.next` to its end: captured from writeback once
+    /// they reach records still held there, otherwise read from segments.
+    fn read_source(
+        &self,
+        cursor: &PartitionReadCursor,
+        limits: PartitionReadLimits,
+    ) -> Result<Source, JournalError> {
+        if cursor.next == cursor.end {
+            return Ok(Source::Empty);
+        }
+        let memory_first = self.writeback.first_offset(cursor.partition);
+        if memory_first.is_some_and(|first| cursor.next >= first) {
+            return Ok(Source::Memory(
+                self.writeback.capture_records(cursor, limits)?,
+            ));
+        }
+        let read = self
+            .reader
+            .as_ref()
+            .ok_or(PartitionReadError::Unavailable)?
+            .prepare_read(
+                self.journal.readable()?,
+                ozzy_journal_segment::PartitionReadRange {
+                    partition: cursor.partition,
+                    start: cursor.next,
+                    end: memory_first.map_or(cursor.end, |first| cursor.end.min(first)),
+                    through: self.applied.op.0,
+                },
+                ozzy_journal::ReadLimits {
+                    max_records: limits.max_records,
+                    max_bytes: self.limits.operations.max_payload_bytes.max(1),
+                },
+            )?;
+        Ok(Source::Stored(read))
     }
 
     /// Reject stale/foreign results before delivery. The subscription still owns
@@ -177,87 +185,124 @@ impl PreparedRead {
     pub async fn read(self) -> CompletedRead {
         let Self {
             key,
-            mut cursor,
+            cursor,
             limits,
-            mut buffer,
+            buffer,
             source,
         } = self;
-        let original = cursor;
-        let mut parts = 0usize;
-        let mut rejected = None;
-        let visit = |span: &ozzy_journal_segment::RecordSpan<'_>| {
-            // Reserve the accepted records of this stored group once, using
-            // the same bounds as the copy below.
-            let mut group_bytes = 0;
-            let mut group_parts = 0;
-            for record in span.records() {
-                let bytes = record.payload_bytes();
-                let record_parts = record.part_count();
-                if bytes > limits.max_payload_bytes - buffer.body_bytes() - group_bytes
-                    || record_parts > limits.max_parts - parts - group_parts
-                {
-                    break;
-                }
-                group_bytes += bytes;
-                group_parts += record_parts;
-            }
-            if let Err(error) = buffer.reserve_payload(group_bytes) {
-                rejected = Some(error);
-                return 0;
-            }
-            let mut taken = 0;
-            for record in span.records() {
-                let bytes = record.payload_bytes();
-                let record_parts = record.part_count();
-                if bytes > limits.max_payload_bytes - buffer.body_bytes()
-                    || record_parts > limits.max_parts - parts
-                {
-                    if buffer.records().is_empty() {
-                        rejected = Some(
-                            PartitionReadError::RecordTooLarge {
-                                bytes,
-                                parts: record_parts,
-                            }
-                            .into(),
-                        );
-                    }
-                    break;
-                }
-                parts += record_parts;
-                buffer.push_view(&record);
-                cursor.next = cursor.next.checked_next().expect("validated read end");
-                taken += 1;
-            }
-            taken
+        let mut copy = RecordCopy {
+            cursor,
+            limits,
+            buffer,
+            parts: 0,
+            rejected: None,
         };
         let result = match source {
             Source::Empty => Ok(()),
             Source::Memory(records) => {
-                records.visit_spans(visit);
+                records.visit_spans(|span| copy.span(span));
                 Ok(())
             }
             Source::Stored(records) => records
-                .visit(visit)
+                .visit(|span| copy.span(span))
                 .await
                 .map(|_| ())
                 .map_err(JournalError::from),
         }
-        .and_then(|()| {
-            if let Some(error) = rejected {
-                Err(error)
-            } else {
-                Ok(ReadPartition {
-                    cursor,
-                    first: original.next,
-                    buffer,
-                })
-            }
-        });
+        .and_then(|()| copy.finish(cursor.next));
         CompletedRead {
             key,
-            cursor: original,
+            cursor,
             result,
         }
+    }
+}
+
+/// Whole records copied into the output lease within the read limits. The
+/// cursor advances past each copied record.
+struct RecordCopy {
+    cursor: PartitionReadCursor,
+    limits: PartitionReadLimits,
+    buffer: PartitionReadLease,
+    parts: usize,
+    rejected: Option<JournalError>,
+}
+
+impl RecordCopy {
+    /// Copy the leading records of `span` that fit. Returns how many.
+    fn span(&mut self, span: &ozzy_journal_segment::RecordSpan<'_>) -> usize {
+        if let Err(error) = self.buffer.reserve_payload(self.fitting_bytes(span)) {
+            self.rejected = Some(error);
+            return 0;
+        }
+        let limits = self.limits;
+        let mut taken = 0;
+        for record in span.records() {
+            let bytes = record.payload_bytes();
+            let record_parts = record.part_count();
+            if bytes > limits.max_payload_bytes - self.buffer.body_bytes()
+                || record_parts > limits.max_parts - self.parts
+            {
+                if self.buffer.records().is_empty() {
+                    self.rejected = Some(
+                        PartitionReadError::RecordTooLarge {
+                            bytes,
+                            parts: record_parts,
+                        }
+                        .into(),
+                    );
+                }
+                break;
+            }
+            self.parts += record_parts;
+            let pushed = self.buffer.push_view(&record).and_then(|()| {
+                self.cursor
+                    .next
+                    .checked_next()
+                    .ok_or_else(|| PartitionReadError::Limits.into())
+            });
+            match pushed {
+                Ok(next) => self.cursor.next = next,
+                Err(error) => {
+                    self.rejected = Some(error);
+                    break;
+                }
+            }
+            taken += 1;
+        }
+        taken
+    }
+
+    /// Payload bytes of the records of this stored group that the copy will
+    /// accept, so they are reserved once with the same bounds.
+    fn fitting_bytes(&self, span: &ozzy_journal_segment::RecordSpan<'_>) -> usize {
+        let limits = self.limits;
+        let mut group_bytes = 0;
+        let mut group_parts = 0;
+        for record in span.records() {
+            let bytes = record.payload_bytes();
+            let record_parts = record.part_count();
+            if bytes > limits.max_payload_bytes - self.buffer.body_bytes() - group_bytes
+                || record_parts > limits.max_parts - self.parts - group_parts
+            {
+                break;
+            }
+            group_bytes += bytes;
+            group_parts += record_parts;
+        }
+        group_bytes
+    }
+
+    /// The delivery starting at `first`, unless a record was rejected.
+    fn finish(self, first: Offset) -> Result<ReadPartition, JournalError> {
+        if let Some(error) = self.rejected {
+            return Err(error);
+        }
+        Ok(ReadPartition {
+            cursor: self.cursor,
+            first,
+            buffer: self.buffer,
+        })
     }
 }
 

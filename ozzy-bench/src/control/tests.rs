@@ -55,12 +55,11 @@ async fn abstract_control_roundtrips_chunked_reports_and_shutdown() {
 fn framing_rejects_wrong_run_peer_and_oversized_chunks() {
     let run = Uuid::now_v7();
     let worker = Uuid::now_v7();
-    let message = Route {
+    let message = Frame::chunk(Kind::Data, 1, 0, 2, b"{}").encode(Route {
         run,
         worker,
         peer: CONTROLLER,
-    }
-    .packet(Kind::Data, 1, 0, 2, b"{}");
+    });
     assert!(
         Frame::decode(
             &message,
@@ -105,12 +104,11 @@ fn framing_rejects_wrong_run_peer_and_oversized_chunks() {
         )
         .is_err()
     );
-    let message = Route {
+    let message = Frame::chunk(Kind::Data, 1, 0, MAX_REPORT_BYTES + 1, b"{}").encode(Route {
         run,
         worker,
         peer: CONTROLLER,
-    }
-    .packet(Kind::Data, 1, 0, MAX_REPORT_BYTES + 1, b"{}");
+    });
     assert!(
         Frame::decode(
             &message,

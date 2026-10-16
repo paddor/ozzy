@@ -39,19 +39,17 @@ impl ResidentRecordRead {
         let mut bytes = 0;
         let mut records = 0;
         for (entry, count) in self.entries.ranges() {
-            #[cfg(feature = "storage-metrics")]
-            crate::read_metrics::RESIDENT_SELECTIONS
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ozzy_telemetry::event(ozzy_telemetry::Event::ResidentSelection);
             let batch = self.records.select(self.source, entry)?;
             let span = batch.span(entry, count)?;
-            if records == 0 {
-                let first = span.records().next().expect("nonempty captured range");
-                if first.payload_bytes() > self.limits.max_bytes {
-                    return Err(JournalIndexError::RecordExceedsReadLimit {
-                        actual: first.payload_bytes(),
-                        limit: self.limits.max_bytes,
-                    });
-                }
+            if records == 0
+                && let Some(first) = span.records().next()
+                && first.payload_bytes() > self.limits.max_bytes
+            {
+                return Err(JournalIndexError::RecordExceedsReadLimit {
+                    actual: first.payload_bytes(),
+                    limit: self.limits.max_bytes,
+                });
             }
             let span = span.limit(
                 self.limits.max_records - records,
@@ -89,9 +87,7 @@ impl ResidentRecordRead {
         let mut bytes = 0usize;
         let mut count = 0;
         loop {
-            #[cfg(feature = "storage-metrics")]
-            crate::read_metrics::RESIDENT_SELECTIONS
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ozzy_telemetry::event(ozzy_telemetry::Event::ResidentSelection);
             let batch = self.records.select(self.source, entry)?;
             while let Some(record) = batch.record(entry)? {
                 let size = record.payload_bytes();

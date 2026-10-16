@@ -1,5 +1,5 @@
 use super::*;
-use ozzy_journal_segment::AsyncRetirementBudget;
+use ozzy_journal_segment::RetirementBudget;
 use std::io;
 
 mod adapter;
@@ -30,7 +30,7 @@ fn retirement_does_not_reread_unaffected_sealed_bodies() {
         journal.retire_confirmed_history(
             driver.begin_validation().unwrap(),
             CheckpointId::from_bytes([92; 16]),
-            AsyncRetirementBudget {
+            RetirementBudget {
                 max_segments: 1,
                 max_read_bytes: 32768,
             },
@@ -58,6 +58,170 @@ fn retirement_does_not_reread_unaffected_sealed_bodies() {
     );
     assert_eq!(result.unwrap().unreferenced_segment_ids, [1]);
     assert_eq!(journal.images().unwrap().committed(), &before);
+    verify_retained(&mut controller, &mut journal, &driver);
+    drive(&mut controller, journal.shutdown()).unwrap();
+}
+
+#[test]
+fn retirement_checks_rolled_segments_from_their_read_index() {
+    let (mut controller, io) = setup();
+    let (mut journal, driver) = seed(&mut controller, io, local_config());
+    drive(
+        &mut controller,
+        journal.begin_retirement(
+            driver.begin_validation().unwrap(),
+            CheckpointId::from_bytes([92; 16]),
+            RetirementBudget {
+                max_segments: 2,
+                max_read_bytes: 1,
+            },
+        ),
+    )
+    .unwrap();
+    let work = journal.take_retirement_work().unwrap();
+    let mut read = false;
+    let done = drive_except(&mut controller, Box::pin(work.run()), None, |operation| {
+        read |= matches!(operation, Operation::Open { path, .. }
+            if path.ends_with("segments/1.log") || path.ends_with("segments/2.log"));
+        Effect::Normal
+    });
+    assert!(!read, "retirement read a segment this owner rolled");
+    journal.complete_retirement(done);
+    let retired = drive(&mut controller, journal.finish_retirement())
+        .unwrap()
+        .unwrap();
+    assert_eq!(retired.unreferenced_segment_ids, [1, 2]);
+    assert_eq!(retired.scanned_segments, 0);
+    verify_retained(&mut controller, &mut journal, &driver);
+    drive(&mut controller, journal.shutdown()).unwrap();
+}
+
+#[test]
+fn retirement_narrows_identity_coverage_without_indexing_surviving_segments() {
+    let (mut controller, io) = setup();
+    let (mut journal, driver) = seed(&mut controller, io, local_config());
+    let retained_from = journal.journal.ready().unwrap().manifest().segments[1]
+        .first_chain
+        .next_op_number();
+    let overlay = journal.images().unwrap().committed_identities().overlay();
+    let retained = overlay
+        .claims()
+        .filter(|claim| claim.op_number >= retained_from)
+        .count();
+    assert!(retained != 0 && retained < overlay.len());
+    let mut indexed = false;
+    let retired = drive_except(
+        &mut controller,
+        journal.retire_confirmed_history(
+            driver.begin_validation().unwrap(),
+            CheckpointId::from_bytes([92; 16]),
+            RetirementBudget {
+                max_segments: 1,
+                max_read_bytes: 32768,
+            },
+        ),
+        None,
+        |operation| {
+            if let Operation::Open { path, .. } = operation
+                && path.components().any(|part| part.as_os_str() == "indexes")
+            {
+                indexed = true;
+            }
+            Effect::Normal
+        },
+    )
+    .unwrap();
+    assert_eq!(retired.unreferenced_segment_ids, [1]);
+    assert!(!indexed, "retirement indexed surviving segments");
+    let ready = journal.journal.ready().unwrap();
+    assert!(ready.pins_released(&[1], &[]));
+    let first = ready.manifest().segments[0];
+    let snapshot = journal.images().unwrap().committed_identities().snapshot();
+    assert_eq!(snapshot.segment_references(), []);
+    assert_eq!(
+        snapshot.through().op_number + 1,
+        first.first_chain.next_op_number()
+    );
+    assert_eq!(first.first_chain.next_op_number(), retained_from);
+    assert_eq!(journal.identity_capacity().unwrap().0, retained);
+    verify_retained(&mut controller, &mut journal, &driver);
+    drive(&mut controller, journal.shutdown()).unwrap();
+}
+
+#[test]
+fn retirement_writes_its_checkpoint_beside_later_appends() {
+    let (mut controller, io) = setup();
+    let config = local_config();
+    let (mut journal, mut driver) = seed(&mut controller, io.clone(), config.clone());
+    let ticket = driver.begin_validation().unwrap();
+    drive(
+        &mut controller,
+        journal.begin_retirement(
+            ticket,
+            CheckpointId::from_bytes([92; 16]),
+            RetirementBudget {
+                max_segments: 1,
+                max_read_bytes: 32768,
+            },
+        ),
+    )
+    .unwrap();
+    let work = journal.take_retirement_work().unwrap();
+    assert!(journal.retiring());
+    // Admission continues while the checkpoint and prefix scan run.
+    append(&mut controller, &mut journal, &mut driver, 12, 4, 1);
+    let done = drive(&mut controller, Box::pin(work.run()));
+    journal.complete_retirement(done);
+    // An accepted, unconfirmed control operation keeps its identity claim.
+    let mut buffer = journal.lease_proposal_buffer().unwrap();
+    buffer
+        .push(ozzy_journal::operation::OperationKind::Barrier, &[98; 16])
+        .unwrap();
+    let receipt = admit(&mut controller, &mut journal, &mut driver, buffer);
+    write(&mut controller, &mut journal, &mut driver, receipt);
+    let retired = drive(&mut controller, journal.finish_retirement())
+        .unwrap()
+        .unwrap();
+    assert_eq!(retired.unreferenced_segment_ids, [1]);
+    assert!(!journal.retiring());
+    let barrier = ozzy_core::state::IdentityKey::operation(OperationId::from_bytes([98; 16]));
+    let images = journal.images().unwrap();
+    assert!(
+        images
+            .speculative_identities()
+            .overlay()
+            .get(barrier)
+            .is_some()
+    );
+    assert!(
+        images
+            .committed_identities()
+            .overlay()
+            .get(barrier)
+            .is_none()
+    );
+    let selected = journal
+        .journal
+        .ready()
+        .unwrap()
+        .manifest()
+        .checkpoint
+        .unwrap();
+    assert_eq!(prefix(selected.position), ticket.applied());
+    sync_apply(&mut controller, &mut journal, &mut driver);
+    let applied = driver.snapshot().applied;
+    verify_retained(&mut controller, &mut journal, &driver);
+    drive(&mut controller, journal.shutdown()).unwrap();
+    let (mut journal, driver) = drive(
+        &mut controller,
+        OwnedJournal::open_local(config, io, JournalGeneration(2)),
+    )
+    .unwrap();
+    assert_eq!(
+        journal.journal.ready().unwrap().manifest().checkpoint,
+        Some(selected)
+    );
+    assert_eq!(driver.snapshot().applied, applied);
     verify_retained(&mut controller, &mut journal, &driver);
     drive(&mut controller, journal.shutdown()).unwrap();
 }
@@ -126,6 +290,7 @@ fn seed(
         .retention_proposal(
             partition(),
             Offset::new(3),
+            0,
             OperationId::from_bytes([91; 16]),
         )
         .unwrap()
@@ -149,7 +314,7 @@ fn reused_checkpoint_read_failure_fences_retirement_before_unreferencing_segment
         journal.retire_confirmed_history(
             ticket,
             CheckpointId::from_bytes([93; 16]),
-            AsyncRetirementBudget {
+            RetirementBudget {
                 max_segments: 1,
                 max_read_bytes: 32768,
             },
@@ -199,7 +364,7 @@ fn retire(
         journal.retire_confirmed_history(
             ticket,
             CheckpointId::from_bytes([id; 16]),
-            AsyncRetirementBudget {
+            RetirementBudget {
                 max_segments: 1,
                 max_read_bytes: 32768,
             },

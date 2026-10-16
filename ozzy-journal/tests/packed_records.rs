@@ -1,3 +1,13 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
+
 use ozzy_journal::operation::{
     Append, AppendBatch, AppendRecordList, OperationBody, OperationKind, OperationLimits,
     decode_append_batches, decode_operation_body, decode_packed_append_records,
@@ -19,7 +29,7 @@ fn body(records: &RecordBatch) -> OperationBody<'_> {
             first_sequence: ProducerSequence::new(11),
             first_offset: Offset::new(31),
             append_timestamp_millis: 77,
-            records: AppendRecordList::batch(records, 0..records.len()),
+            records: AppendRecordList::batch(records, 0..records.len()).unwrap(),
         }],
     })
 }
@@ -52,14 +62,14 @@ fn compact_canonical_bytes_preserve_empty_parts_and_indexed_fragments() {
         unreachable!()
     };
     let slices = &mut append.batches[0].records;
-    *slices = AppendRecordList::batch(&records, 0..1);
+    *slices = AppendRecordList::batch(&records, 0..1).unwrap();
     slices.extend_batch(&records, 1..4).unwrap();
     slices.extend_batch(&records, 4..5).unwrap();
     assert_eq!(encode_operation_body(&split, limits).unwrap(), encoded);
     let decoded = decode_operation_body(OperationKind::Append, &encoded, limits).unwrap();
     assert_eq!(encode_operation_body(&decoded, limits).unwrap(), encoded);
     let batches = decode_append_batches(&encoded, limits).unwrap();
-    let mut cursor = batches[0].records();
+    let mut cursor = batches[0].raw_records().unwrap();
     for expected in &records {
         let (ids, payload) = cursor.remaining_bytes();
         let lengths = cursor.tiny_lengths().unwrap();

@@ -18,7 +18,9 @@ pub async fn sort_by<T>(
     for end in (1..values.len()).rev() {
         values.swap(0, end);
         step(size_of::<T>().saturating_mul(2)).await;
-        sift_down(&mut values[..end], 0, compare, step).await;
+        if let Some(heap) = values.get_mut(..end) {
+            sift_down(heap, 0, compare, step).await;
+        }
     }
 }
 
@@ -29,17 +31,17 @@ async fn sift_down<T>(
     step: &mut impl AsyncFnMut(usize),
 ) {
     while let Some(left) = root.checked_mul(2).and_then(|value| value.checked_add(1)) {
-        if left >= values.len() {
+        let Some(left_value) = values.get(left) else {
             break;
-        }
-        let child = if left + 1 < values.len()
-            && compare(&values[left], &values[left + 1]) == Ordering::Less
-        {
-            left + 1
-        } else {
-            left
         };
-        let ordered = compare(&values[root], &values[child]) != Ordering::Less;
+        let child = match values.get(left + 1) {
+            Some(right) if compare(left_value, right) == Ordering::Less => left + 1,
+            _ => left,
+        };
+        let (Some(parent), Some(larger)) = (values.get(root), values.get(child)) else {
+            break;
+        };
+        let ordered = compare(parent, larger) != Ordering::Less;
         if !ordered {
             values.swap(root, child);
             root = child;

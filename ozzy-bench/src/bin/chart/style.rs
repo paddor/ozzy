@@ -1,6 +1,6 @@
 //! Match OMQ's `chart/common.rs` and `chart/pushpull_compression.rs` style.
 use ozzy_bench::automation::Result;
-use plotters::prelude::*;
+use plotters::{prelude::*, style::TextStyle};
 use std::{fmt::Write, path::Path};
 
 pub(super) const BACKGROUND: RGBColor = RGBColor(0, 0, 0);
@@ -14,6 +14,7 @@ pub(super) const WIDTH: u32 = CONTENT_WIDTH + 40;
 pub(super) const PANEL_HEIGHT: u32 = 280;
 pub(super) const ROW_GAP: u32 = 60;
 pub(super) const TOP: u32 = 56;
+pub(super) const FOOTER_HEIGHT: u32 = 144;
 
 #[derive(Clone, Copy)]
 pub(super) struct Series {
@@ -78,6 +79,31 @@ pub(super) fn records_per_second(value: f64) -> String {
     }
 }
 
+/// Body text: sans-serif in the text color.
+pub(super) fn text(size: i32) -> TextStyle<'static> {
+    ("sans-serif", size).into_font().color(&TEXT)
+}
+
+/// Secondary text: sans-serif in the muted color.
+pub(super) fn muted(size: i32) -> TextStyle<'static> {
+    ("sans-serif", size).into_font().color(&MUTED)
+}
+
+/// A bold title centered at `(x, y)` above one panel.
+pub(super) struct PanelTitle {
+    pub(super) x: u32,
+    pub(super) y: u32,
+    pub(super) text: String,
+}
+
+/// Text that `finish` adds over the rendered chart.
+pub(super) struct Labels<'a> {
+    pub(super) title: &'a str,
+    /// Hardware line under the title; empty for none.
+    pub(super) subtitle: &'a str,
+    pub(super) panels: &'a [PanelTitle],
+}
+
 fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -85,12 +111,12 @@ fn escape(text: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// Make the rendered SVG scalable, then add the title, subtitle, panel titles
+/// and the coverage stamp of `rows`.
 pub(super) fn finish(
     path: &Path,
     height: u32,
-    title: &str,
-    subtitle: &str,
-    panels: &[(u32, u32, String)],
+    labels: &Labels<'_>,
     rows: &[&serde_json::Value],
 ) -> Result<()> {
     let mut svg = std::fs::read_to_string(path)?;
@@ -106,13 +132,13 @@ pub(super) fn finish(
     );
     let mut header = format!(
         "\n<text x=\"400\" y=\"17\" text-anchor=\"middle\" font-family=\"sans-serif\" font-size=\"14\" font-weight=\"bold\" fill=\"#F9FAFB\">{}</text>",
-        escape(title)
+        escape(labels.title)
     );
-    if !subtitle.is_empty() {
+    if !labels.subtitle.is_empty() {
         write!(
             header,
             "\n<text x=\"400\" y=\"31\" text-anchor=\"middle\" font-family=\"sans-serif\" font-size=\"10\" fill=\"#9CA3AF\">{}</text>",
-            escape(subtitle)
+            escape(labels.subtitle)
         )?;
     }
     let start = svg.find("<rect").ok_or("missing SVG background")?;
@@ -120,11 +146,11 @@ pub(super) fn finish(
     svg.insert_str(end, &header);
     svg = svg.replace("r=\"2\"", "r=\"2.5\"");
     let mut titles = String::new();
-    for (x, y, label) in panels {
+    for PanelTitle { x, y, text } in labels.panels {
         write!(
             titles,
             "\n<text x=\"{x}\" y=\"{y}\" text-anchor=\"middle\" font-family=\"sans-serif\" font-size=\"13\" font-weight=\"bold\" fill=\"#F9FAFB\">{}</text>",
-            escape(label)
+            escape(text)
         )?;
     }
     let end = svg.rfind("</svg>").ok_or("missing SVG end")?;

@@ -1,5 +1,6 @@
 use super::writeback::{Replica, admit, finish, prepare, replica, settle, synchronize};
 use super::*;
+use crate::replica_journal::OwnedReplayRequest as ReplayRequest;
 use ozzy_proto::RequestId;
 use ozzy_replication::{LogSource, OpNumber};
 
@@ -14,13 +15,15 @@ fn capture(
         .journal
         .prepare_replay(
             ticket,
-            predecessor,
-            PipelineLimits {
-                max_operations: 8,
-                max_body_bytes: bytes,
+            ReplayRequest {
+                predecessor,
+                limits: PipelineLimits {
+                    max_operations: 8,
+                    max_body_bytes: bytes,
+                },
+                request_id: RequestId::from_bytes([42; 16]),
             },
             buffer,
-            RequestId::from_bytes([42; 16]),
         )
         .unwrap()
 }
@@ -35,9 +38,9 @@ pub(super) fn persist(controller: &mut Controller, replica: &mut Replica) -> Pre
 }
 
 #[test]
-fn owned_history_fetch_preserves_a_durable_source_beside_later_unsynchronized_writes() {
+fn owned_history_fetch_preserves_a_durable_source_beside_later_writes() {
     let (mut controller, io) = setup();
-    let mut replica = replica(&mut controller, io, 0, QuorumPolicy::Replicated, 8192);
+    let mut replica = replica(&mut controller, io, 0, 8192);
     let first = persist(&mut controller, &mut replica);
     let source = LogSource {
         voter: replica.config.identity.replica_node_id,
@@ -71,7 +74,7 @@ fn owned_history_fetch_preserves_a_durable_source_beside_later_unsynchronized_wr
             &mut controller,
             replica.journal.fetch_history(request, buffer),
         )
-        .expect("later unsynchronized writes must not hide the older durable source");
+        .expect("later writes must not hide the older durable source");
         assert_eq!(fetched.request(), request);
         assert_eq!(fetched.end(), first);
         assert_eq!(fetched.buffer().len(), 1);
@@ -79,21 +82,6 @@ fn owned_history_fetch_preserves_a_durable_source_beside_later_unsynchronized_wr
         assert_eq!(operation.op_number, first.op.0);
         assert_eq!(operation.body, &[1; 16]);
     }
-    let buffer = replica.journal.lease_append_buffer().unwrap();
-    let unproven = ozzy_replication::wire::FetchOps {
-        source: LogSource {
-            accepted: snapshot.accepted,
-            ..source
-        },
-        ..request
-    };
-    assert!(
-        drive(
-            &mut controller,
-            replica.journal.fetch_history(unproven, buffer)
-        )
-        .is_err()
-    );
     assert!(!replica.journal.is_faulted());
     assert_eq!(replica.driver.normal().unwrap().snapshot(), snapshot);
     drive(&mut controller, replica.journal.shutdown()).unwrap();
@@ -102,7 +90,7 @@ fn owned_history_fetch_preserves_a_durable_source_beside_later_unsynchronized_wr
 #[test]
 fn owned_replay_refresh_reads_only_the_new_segment_suffix() {
     let (mut controller, io) = setup();
-    let mut replica = replica(&mut controller, io, 0, QuorumPolicy::Durable, 8192);
+    let mut replica = replica(&mut controller, io, 0, 8192);
     let first = persist(&mut controller, &mut replica);
     let initial = capture(&mut replica, Prefix::GENESIS, 8192);
     let done = drive(&mut controller, initial.read());
@@ -130,7 +118,7 @@ fn owned_replay_refresh_reads_only_the_new_segment_suffix() {
 #[test]
 fn owned_detached_replay_preserves_election_source_and_never_replaces_newer_cache() {
     let (mut controller, io) = setup();
-    let mut replica = replica(&mut controller, io, 0, QuorumPolicy::Durable, 8192);
+    let mut replica = replica(&mut controller, io, 0, 8192);
     let first = persist(&mut controller, &mut replica);
     let source = LogSource {
         voter: replica.config.identity.replica_node_id,
@@ -176,7 +164,7 @@ fn owned_detached_replay_preserves_election_source_and_never_replaces_newer_cach
 #[test]
 fn owned_replay_body_credit_reports_required_size_without_advancing_history() {
     let (mut controller, io) = setup();
-    let mut replica = replica(&mut controller, io, 0, QuorumPolicy::Durable, 8192);
+    let mut replica = replica(&mut controller, io, 0, 8192);
     let end = persist(&mut controller, &mut replica);
     let work = capture(&mut replica, Prefix::GENESIS, 15);
     let done = drive(&mut controller, work.read());
@@ -197,7 +185,7 @@ fn owned_replay_body_credit_reports_required_size_without_advancing_history() {
 #[test]
 fn owned_replay_cancellation_frees_its_slot_and_does_not_cancel_writes() {
     let (mut controller, io) = setup();
-    let mut replica = replica(&mut controller, io, 0, QuorumPolicy::Replicated, 8192);
+    let mut replica = replica(&mut controller, io, 0, 8192);
     let first = persist(&mut controller, &mut replica);
     let work = capture(&mut replica, Prefix::GENESIS, 8192);
     let ticket = replica.driver.begin_validation().unwrap();
@@ -205,10 +193,12 @@ fn owned_replay_cancellation_frees_its_slot_and_does_not_cancel_writes() {
     assert!(matches!(
         replica.journal.prepare_replay(
             ticket,
-            Prefix::GENESIS,
-            pipeline(),
+            ReplayRequest {
+                predecessor: Prefix::GENESIS,
+                limits: pipeline(),
+                request_id: RequestId::from_bytes([43; 16]),
+            },
             arena,
-            RequestId::from_bytes([43; 16])
         ),
         Err(JournalError::AppendCapacity)
     ));
@@ -238,7 +228,7 @@ fn owned_replay_cancellation_frees_its_slot_and_does_not_cancel_writes() {
 fn owned_replay_reserves_whole_chunk_and_waits_for_shared_capacity() {
     for (free, cancel) in [(0, false), (0, true), (32, false)] {
         let (mut controller, io) = setup();
-        let mut replica = replica(&mut controller, io, 0, QuorumPolicy::Durable, 8192);
+        let mut replica = replica(&mut controller, io, 0, 8192);
         persist(&mut controller, &mut replica);
         let end = persist(&mut controller, &mut replica);
         let work = capture(&mut replica, Prefix::GENESIS, 32);

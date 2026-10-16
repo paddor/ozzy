@@ -14,10 +14,9 @@ fn adapter(
     io: Local,
     root: &str,
     id: u8,
-    policy: QuorumPolicy,
     depth: usize,
 ) -> (Adapter, ReplicaDriver) {
-    let mut config = config(root, id, policy);
+    let mut config = config(root, id);
     config.write_group_bytes = 1;
     let (mut owner, startup) = drive(
         controller,
@@ -138,53 +137,43 @@ fn admit(
 
 #[test]
 fn shard_adapter_settles_writes_before_cold_control_validation_and_captures_exact_sync() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        let (mut controller, io) = setup();
-        let (mut journal, mut driver) = adapter(&mut controller, io, "/journal", 5, policy, 2);
-        let first = admit(&mut controller, &mut journal, &mut driver, 1);
-        let second = admit(&mut controller, &mut journal, &mut driver, 2);
-        for _ in 0..16 {
-            pump(&mut journal);
-        }
-        // A fresh control identity may require a file read. Its validation
-        // waits for the earlier physical write to settle.
-        let jobs = controller.jobs();
-        assert_eq!(jobs.len(), 1, "only the later write remains pending");
-        for (id, _) in jobs {
-            controller.execute(id, Effect::Normal).unwrap();
-            controller.deliver(id).unwrap();
-        }
-        let first = complete(&mut controller, &mut journal, first).unwrap();
-        driver.complete_write(first).unwrap();
-        let second = complete(&mut controller, &mut journal, second).unwrap();
-        driver.complete_write(second).unwrap();
-        let sync = driver.begin_sync().unwrap();
-        let request = journal.begin_pipelined_sync(sync).unwrap();
-        let ready = complete(&mut controller, &mut journal, request).unwrap();
-        let request = journal.finish_pipelined_sync(ready).unwrap();
-        assert_eq!(
-            complete(&mut controller, &mut journal, request).unwrap(),
-            sync
-        );
-        driver.complete_sync(sync, Duration::ZERO).unwrap();
-        assert_eq!(driver.normal().unwrap().snapshot().journal.durable.0, 2);
-        shutdown(&mut controller, &mut journal);
+    let (mut controller, io) = setup();
+    let (mut journal, mut driver) = adapter(&mut controller, io, "/journal", 5, 2);
+    let first = admit(&mut controller, &mut journal, &mut driver, 1);
+    let second = admit(&mut controller, &mut journal, &mut driver, 2);
+    for _ in 0..16 {
+        pump(&mut journal);
     }
+    // A fresh control identity may require a file read. Its validation
+    // waits for the earlier physical write to settle.
+    let jobs = controller.jobs();
+    assert_eq!(jobs.len(), 1, "only the later write remains pending");
+    for (id, _) in jobs {
+        controller.execute(id, Effect::Normal).unwrap();
+        controller.deliver(id).unwrap();
+    }
+    let first = complete(&mut controller, &mut journal, first).unwrap();
+    driver.complete_write(first).unwrap();
+    let second = complete(&mut controller, &mut journal, second).unwrap();
+    driver.complete_write(second).unwrap();
+    let sync = driver.begin_sync().unwrap();
+    let request = journal.begin_pipelined_sync(sync).unwrap();
+    let ready = complete(&mut controller, &mut journal, request).unwrap();
+    let request = journal.finish_pipelined_sync(ready).unwrap();
+    assert_eq!(
+        complete(&mut controller, &mut journal, request).unwrap(),
+        sync
+    );
+    driver.complete_sync(sync, Duration::ZERO).unwrap();
+    assert_eq!(driver.normal().unwrap().snapshot().journal.durable.0, 2);
+    shutdown(&mut controller, &mut journal);
 }
 
 #[test]
 fn shard_adapter_stalled_partition_does_not_stop_another_on_same_thread() {
     let (mut controller, io) = setup();
-    let (mut blocked, mut first_driver) = adapter(
-        &mut controller,
-        io.clone(),
-        "/blocked",
-        5,
-        QuorumPolicy::Durable,
-        1,
-    );
-    let (mut healthy, mut second_driver) =
-        adapter(&mut controller, io, "/healthy", 6, QuorumPolicy::Durable, 1);
+    let (mut blocked, mut first_driver) = adapter(&mut controller, io.clone(), "/blocked", 5, 1);
+    let (mut healthy, mut second_driver) = adapter(&mut controller, io, "/healthy", 6, 1);
     let abandoned = admit(&mut controller, &mut blocked, &mut first_driver, 1);
     drop(abandoned);
     for _ in 0..16 {
@@ -273,8 +262,7 @@ fn shard_adapter_stalled_partition_does_not_stop_another_on_same_thread() {
 #[test]
 fn shard_adapter_write_failure_closes_admission_without_advancing_driver() {
     let (mut controller, io) = setup();
-    let (mut journal, mut driver) =
-        adapter(&mut controller, io, "/failed", 5, QuorumPolicy::Durable, 1);
+    let (mut journal, mut driver) = adapter(&mut controller, io, "/failed", 5, 1);
     let mut receipt = admit(&mut controller, &mut journal, &mut driver, 1);
     for _ in 0..16 {
         pump(&mut journal);

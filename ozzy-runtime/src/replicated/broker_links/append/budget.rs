@@ -1,15 +1,31 @@
 //! Aggregate transport reservations, including unused reply capacity and aliases.
 
 use std::{
-    collections::BTreeMap,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
+    collections::{BTreeMap, btree_map},
+    sync::Arc,
 };
 
 use super::AppendLinkLimits;
 use crate::signal::StateSignal;
+#[cfg(all(test, ozzy_loom))]
+use loom::sync::{
+    Mutex, MutexGuard,
+    atomic::{AtomicUsize, Ordering},
+};
+#[cfg(not(all(test, ozzy_loom)))]
+use ozzy_io::lock_unpoisoned as lock;
+#[cfg(not(all(test, ozzy_loom)))]
+use std::sync::{
+    Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
+
+#[cfg(all(test, ozzy_loom))]
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct Cost {
@@ -112,8 +128,7 @@ impl Budget {
 
     pub(super) fn acquire(self: &Arc<Self>, cost: Cost) -> Option<Arc<Lease>> {
         let limits = self.limits?;
-        let mut progress =
-            (cost.writers != 0).then(|| self.progress.lock().expect("SDK writer budget poisoned"));
+        let mut progress = (cost.writers != 0).then(|| lock(&self.progress));
         let headroom = progress.as_ref().map_or(0, |_| {
             self.progress_max
                 .load(Ordering::Acquire)
@@ -173,17 +188,14 @@ pub(super) struct Lease {
 impl Drop for Lease {
     fn drop(&mut self) {
         if self.cost.writers != 0 {
-            let mut progress = self
-                .budget
-                .progress
-                .lock()
-                .expect("SDK writer budget poisoned");
-            let count = progress
-                .get_mut(&self.cost.progress_bytes)
-                .expect("reserved SDK progress");
-            *count -= 1;
-            if *count == 0 {
-                progress.remove(&self.cost.progress_bytes);
+            let mut progress = lock(&self.budget.progress);
+            if let btree_map::Entry::Occupied(mut count) = progress.entry(self.cost.progress_bytes)
+            {
+                if *count.get() > 1 {
+                    *count.get_mut() -= 1;
+                } else {
+                    count.remove();
+                }
             }
             self.budget.progress_max.store(
                 progress.last_key_value().map_or(0, |(&bytes, _)| bytes),

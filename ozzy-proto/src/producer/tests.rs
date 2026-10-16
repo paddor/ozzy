@@ -1,4 +1,5 @@
 use super::*;
+use crate::GroupId;
 use crate::{LinkSessionId, NodeId, RequestId, decode_packet};
 
 fn envelope(opcode: Opcode) -> Envelope {

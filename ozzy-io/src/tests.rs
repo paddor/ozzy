@@ -158,7 +158,9 @@ fn split_remainders_do_not_create_capacity() {
         },
     };
     for class in [Class::Data, Class::Progress] {
-        let shares: Vec<_> = (0..3).map(|shard| limits.share(shard, class)).collect();
+        let shares: Vec<_> = (0..3)
+            .map(|shard| limits.share(shard, class).unwrap())
+            .collect();
         let total = match class {
             Class::Data => limits.data,
             Class::Progress => limits.progress,

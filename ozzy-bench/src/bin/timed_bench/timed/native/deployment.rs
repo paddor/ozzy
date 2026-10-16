@@ -119,18 +119,7 @@ fn specifications(
             {
                 return Err(error("invalid prepared broker resources"));
             }
-            for endpoint in [&endpoints.peer, &endpoints.data_peer, &endpoints.reader_pub]
-                .into_iter()
-                .chain(endpoints.follower_pub.iter())
-            {
-                let address = endpoint
-                    .strip_prefix("tcp://")
-                    .ok_or_else(|| error("prepared endpoint must use TCP"))?
-                    .parse::<std::net::SocketAddr>()?;
-                if address.ip() != placement.bind || address.port() == 0 {
-                    return Err(error("prepared endpoint differs from broker placement"));
-                }
-            }
+            check_endpoints(config, placement, &endpoints)?;
             Ok(settings::Broker {
                 name,
                 root: root.into(),
@@ -138,6 +127,35 @@ fn specifications(
             })
         })
         .collect()
+}
+
+/// Every prepared endpoint uses inproc, or the selected TCP transport on
+/// the broker's placement address with a bound port.
+fn check_endpoints(
+    config: &Config,
+    placement: &ozzy_bench::placement::Placement,
+    endpoints: &ozzy_config::Endpoints,
+) -> Result<()> {
+    for endpoint in [&endpoints.peer, &endpoints.data_peer, &endpoints.reader_pub]
+        .into_iter()
+        .chain(endpoints.follower_pub.iter())
+    {
+        if config.args.inproc {
+            if !endpoint.starts_with("inproc://") {
+                return Err(error("prepared inproc broker endpoint must use inproc"));
+            }
+            continue;
+        }
+        let address = ozzy_proto::directory::EndpointScheme::parse(endpoint)
+            .filter(|(scheme, _)| *scheme == config.args.transport.scheme())
+            .map(|(_, address)| address)
+            .ok_or_else(|| error("prepared endpoint must use the selected TCP transport"))?
+            .parse::<std::net::SocketAddr>()?;
+        if address.ip() != placement.bind || address.port() == 0 {
+            return Err(error("prepared endpoint differs from broker placement"));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

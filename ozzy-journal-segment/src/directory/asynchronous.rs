@@ -3,21 +3,23 @@
 
 mod canonical;
 mod checkpoint;
+mod unselected;
 pub use canonical::Candidate;
-pub use checkpoint::CheckpointFiles;
+pub use checkpoint::{
+    CheckpointBuildPlan, CheckpointCursor, CheckpointFiles, CheckpointInbox, CheckpointInboxStream,
+    CheckpointSource, CheckpointStream, CheckpointWriter,
+};
 pub(crate) mod groups;
 mod history;
 mod index;
-mod memory_voting;
 mod metadata;
-mod metadata_cleanup;
 mod opening;
 pub use opening::Opening;
-mod orphans;
 mod partition_read;
 mod pipeline;
 pub use partition_read::{
     Index as PartitionIndex, Limits as PartitionReadLimits, Read as PartitionRead,
+    ReadRange as PartitionReadRange,
 };
 pub use pipeline::{Completed, CompletedSync, Pipeline, Prepared, PreparedSync};
 mod prepared_roll;
@@ -30,22 +32,26 @@ pub use recovery::{RecoveryDirectory, Repair};
 mod retention;
 mod roll;
 mod snapshot;
+mod spare;
 mod suffix;
-pub use retention::{RetirementBudget, SegmentFiles};
-pub use suffix::{CanonicalCheckpointImport, CheckpointRecovery, Installer};
+pub use retention::{
+    RetirementBudget, RetirementProof, RetirementScan, ScannedPrefix, SegmentFiles,
+};
+pub use suffix::{CanonicalCheckpointImport, CheckpointRecovery, Installer, SuffixRequest};
+pub use unselected::UnselectedFiles;
 #[cfg(test)]
 mod tests;
 
 use super::{
-    DirectoryError, GroupIdentity, LogPosition, Manifest, OperationEnvelope, ReplayError,
-    ReplayedOperation, SegmentReference, evidence, position_before, segment_reference_name,
-    validate_operation,
+    DirectoryError, OperationEnvelope, ReplayError, ReplayedOperation, evidence,
+    segment_reference_name, validate_operation,
 };
 use crate::{
-    AsyncSegmentOptions, AsyncSegmentWriter, BodyEncoding, CanonicalOperation, CheckpointLimits,
-    CodecError, CommitMode, CurrentReference, DecodeLimits, MetadataLimits, OperationLimits,
-    SegmentHeader, WriterError, WriterPosition, async_files::Access, async_metadata,
-    checkpoint::asynchronous::Checkpoint,
+    BodyEncoding, CanonicalOperation, CheckpointLimits, CodecError, CommitMode, CurrentReference,
+    DecodeLimits, GroupIdentity, LogPosition, Manifest, MetadataLimits, OperationLimits,
+    SegmentHeader, SegmentOptions, SegmentReference, SegmentWriter, WriterError, WriterPosition,
+    async_files::Access, async_metadata, checkpoint::asynchronous::Checkpoint,
+    metadata::position_before,
 };
 use std::path::Path;
 
@@ -61,7 +67,7 @@ pub struct Limits {
     /// Checkpoint construction and decoding bounds.
     pub checkpoint: CheckpointLimits,
     /// Physical transfer, segment capacity, and write-mode bounds.
-    pub io: AsyncSegmentOptions,
+    pub io: SegmentOptions,
     /// Maximum entries returned by one bounded directory listing.
     pub directory_entries: usize,
     /// Maximum combined filename bytes per directory listing.
@@ -83,6 +89,16 @@ pub struct Format {
     pub configuration: Vec<u8>,
 }
 
+/// The established store an open must find. Opening never formats.
+#[derive(Debug, Clone, Copy)]
+pub struct ExpectedStore<'a> {
+    /// Exact group, node, volume, store, and store-generation binding.
+    pub identity: GroupIdentity,
+    /// Adapter configuration bytes the store must hold exactly; `None`
+    /// accepts the stored configuration, if any.
+    pub configuration: Option<&'a [u8]>,
+}
+
 /// One mutable journal, with no OS descriptors or independently running owner.
 /// Failed/canceled metadata mutations fence it until an explicit reopen.
 #[derive(Debug)]
@@ -92,13 +108,17 @@ pub struct Journal {
     manifest: Manifest,
     current: CurrentReference,
     configuration: Option<Vec<u8>>,
-    writer: AsyncSegmentWriter,
+    writer: SegmentWriter,
     evidence: Option<evidence::Copies>,
     checkpoint: Option<Checkpoint>,
     limits: Limits,
     interrupted: bool,
-    pins: std::sync::Arc<crate::retention::PinRegistry>,
+    pins: std::rc::Rc<crate::retention::PinRegistry>,
+    /// Set while a cleanup capture lives; checkpoint selection waits for it.
+    cleaning: std::rc::Rc<std::cell::Cell<bool>>,
     validated_indexes: std::collections::BTreeMap<u64, crate::IndexSource>,
+    /// Validated active-segment prefix reused by the next built snapshot.
+    active_prefix: Option<Box<crate::active_index::ActivePrefix>>,
 }
 
 impl Journal {
@@ -119,13 +139,33 @@ impl Journal {
     pub const fn current(&self) -> CurrentReference {
         self.current
     }
+
+    /// Whether live deletion protection released any of these unselected
+    /// objects. Reads only the in-memory pin registry.
+    pub fn pins_released(
+        &self,
+        segments: &[u64],
+        checkpoints: &[ozzy_proto::CheckpointId],
+    ) -> bool {
+        segments.iter().any(|&id| !self.pins.is_pinned(id))
+            || checkpoints
+                .iter()
+                .any(|&id| !self.pins.checkpoint_is_pinned(id))
+    }
     /// Exact persisted adapter configuration bytes, when present.
     pub fn configuration(&self) -> Option<&[u8]> {
         self.configuration.as_deref()
     }
     /// Borrow the active physical segment writer.
-    pub const fn writer(&self) -> &AsyncSegmentWriter {
+    pub const fn writer(&self) -> &SegmentWriter {
         &self.writer
+    }
+    /// Write zeros over up to `bytes` of the active segment's unused capacity,
+    /// so appends there overwrite written blocks instead of converting
+    /// unwritten extents. The broker does this once when it formats a store.
+    pub async fn zero_ahead(&mut self, bytes: u64) -> Result<(), DirectoryError> {
+        self.healthy()?;
+        Ok(self.writer.zero_ahead(bytes).await?)
     }
     /// Whether failure or canceled mutation fences further use.
     pub fn is_faulted(&self) -> bool {
@@ -141,24 +181,28 @@ impl Journal {
 
     /// Exact written canonical prefix; this does not prove durability.
     pub fn written_position(&self) -> Result<LogPosition, DirectoryError> {
-        position_before(self.writer.written_position().next_chain())
+        Ok(position_before(
+            self.writer.written_position().next_chain(),
+        )?)
     }
     /// Canonical prefix accepted under this journal mode.
     pub fn accepted_position(&self) -> Result<LogPosition, DirectoryError> {
-        position_before(
+        Ok(position_before(
             if self.manifest.commit_mode == CommitMode::LocalDurable {
                 self.writer.written_position()
             } else {
                 self.writer.durable_position()
             }
             .next_chain(),
-        )
+        )?)
     }
     /// Confirmed canonical prefix exposed by this journal mode.
     pub fn committed_position(&self) -> Result<LogPosition, DirectoryError> {
         self.healthy()?;
         if self.manifest.commit_mode == CommitMode::LocalDurable {
-            position_before(self.writer.durable_position().next_chain())
+            Ok(position_before(
+                self.writer.durable_position().next_chain(),
+            )?)
         } else {
             Ok(self.manifest.committed)
         }
@@ -223,11 +267,7 @@ impl Journal {
         &self,
         operations: &[CanonicalOperation<'_>],
     ) -> Result<(), DirectoryError> {
-        let active = self
-            .manifest
-            .segments
-            .last()
-            .expect("validated active segment");
+        let active = active_segment(&self.manifest.segments)?;
         let groups =
             self.writer.written_position().group_number() - (active.first_group_number - 1);
         let groups = usize::try_from(groups)
@@ -291,15 +331,22 @@ impl Journal {
         }
     }
 
+    /// The valid prefix of a selected segment: its sealed bytes, or what the
+    /// writer has written.
     async fn segment_image(&self, reference: SegmentReference) -> Result<Vec<u8>, DirectoryError> {
         if reference.capacity > self.limits.io.max_segment_bytes {
             return Err(DirectoryError::SegmentMismatch(reference.segment_id));
         }
+        let valid_bytes = reference.sealed.map_or_else(
+            || self.writer.written_position().end_offset(),
+            |sealed| sealed.valid_bytes,
+        );
         Ok(self
             .access
-            .read_file(
+            .read_prefix(
                 self.root().join(segment_reference_name(reference)),
-                reference.capacity as usize,
+                valid_bytes,
+                reference.capacity,
                 self.limits.io.chunk_bytes,
             )
             .await?)
@@ -416,4 +463,24 @@ async fn scan_contains_position(
         budget.charge(0).await;
     }
     false
+}
+
+impl Journal {
+    /// The group lock an opened journal holds; leases keep it alive.
+    fn group_lock(&self) -> Result<ozzy_io::Handle, DirectoryError> {
+        self.access.protection.clone().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "journal holds no group lock",
+            )
+            .into()
+        })
+    }
+}
+
+/// The writable last segment of a selected chain.
+pub(crate) fn active_segment(
+    segments: &[SegmentReference],
+) -> Result<&SegmentReference, DirectoryError> {
+    segments.last().ok_or(DirectoryError::MissingActiveSegment)
 }

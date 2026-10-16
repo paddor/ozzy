@@ -4,26 +4,48 @@
     dead_code,
     reason = "production modules expose more than these models use"
 )]
+#![allow(
+    unreachable_pub,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
 
+#[path = "../src/replicated/broker_links/append/budget.rs"]
+mod budget;
 #[path = "../src/replicated/writer/completion.rs"]
 mod completion;
 #[path = "../src/replicated/writer/inbox.rs"]
 mod inbox;
+#[path = "../src/replicated/broker_links/routing/interest.rs"]
+mod interest;
+#[path = "../src/replicated/processing/progress.rs"]
+mod processing_progress;
 #[path = "../src/replicated/writer/progress.rs"]
 mod progress;
-#[path = "../src/signal.rs"]
+#[path = "../../ozzy-io/src/signal.rs"]
 mod signal;
+#[path = "../src/replica_actor/partitions/woken.rs"]
+mod woken;
 
 use loom::sync::Arc;
 use loom::sync::atomic::{AtomicBool, Ordering};
 use loom::thread;
-use ozzy_proto::ProducerId;
+use ozzy_proto::{ProducerId, append::AppendDisposition};
 use ozzy_runtime::replicated::{
-    AppendKey, Error, Policy, RecordReceipt, WriterConfig, WriterError,
+    AppendKey, AppendLinkLimits, Error, Policy, ProcessingIdentity, ProgressError, RecordReceipt,
+    WriterConfig, WriterError,
 };
 use std::future::Future;
 use std::pin::pin;
 use std::task::{Context, Poll};
+
+#[path = "loom/processing.rs"]
+mod processing;
 
 #[test]
 fn confirmed_prefix_publishes_exact_offsets_before_observation() {
@@ -43,9 +65,9 @@ fn confirmed_prefix_publishes_exact_offsets_before_observation() {
                 thread::spawn(move || {
                     for (index, offset) in offsets.into_iter().enumerate() {
                         progress
-                            .confirm(index as u64, index as u64 + 1, offset, 2, |count| {
+                            .confirm(index as u64, index as u64 + 1, 2, |count| {
                                 assert_eq!(count, 1);
-                                records[index].publish(offset);
+                                records[index].publish(offset, AppendDisposition::Duplicate);
                             })
                             .unwrap();
                         thread::yield_now();
@@ -55,6 +77,7 @@ fn confirmed_prefix_publishes_exact_offsets_before_observation() {
             let confirmed = progress.confirmed();
             for index in 0..confirmed as usize {
                 assert_eq!(records[index].offset(), offsets[index]);
+                assert_eq!(records[index].disposition(), AppendDisposition::Duplicate);
             }
             publisher.join().unwrap();
             assert_eq!(progress.confirmed(), 2);
@@ -67,7 +90,7 @@ fn confirmed_prefix_publishes_exact_offsets_before_observation() {
 
 fn config() -> WriterConfig {
     WriterConfig {
-        policy: Policy::QuorumReplicatedPersisting,
+        policy: Policy::QuorumDurable,
         partition: ozzy_proto::PartitionIncarnation::from_bytes([1; 16]),
         owner_epoch: 1,
         producer_id: ProducerId::from_bytes([2; 16]),
@@ -106,11 +129,10 @@ fn terminal_failure_racing_confirmation_seals_the_real_progress_prefix() {
             let records = records.clone();
             thread::spawn(move || {
                 for (index, offset) in [7, 50].into_iter().enumerate() {
-                    let result =
-                        progress.confirm(index as u64, index as u64 + 1, offset, 2, |count| {
-                            assert_eq!(count, 1);
-                            records[index].publish(offset);
-                        });
+                    let result = progress.confirm(index as u64, index as u64 + 1, 2, |count| {
+                        assert_eq!(count, 1);
+                        records[index].publish(offset, AppendDisposition::Duplicate);
+                    });
                     if let Err(error) = result {
                         assert!(matches!(error, WriterError::Closed));
                         break;
@@ -148,7 +170,7 @@ fn terminal_failure_racing_confirmation_seals_the_real_progress_prefix() {
         ));
         let confirmed = progress.confirmed();
         assert!(matches!(
-            progress.confirm(confirmed, confirmed + 1, 100, 3, |_| {
+            progress.confirm(confirmed, confirmed + 1, 3, |_| {
                 panic!("terminal failure published another receipt")
             }),
             Err(WriterError::Closed)
@@ -221,23 +243,89 @@ fn capacity_change_between_observation_and_wait_is_not_lost() {
 }
 
 #[test]
-fn publication_racing_a_drain_is_observed_or_leaves_readiness_set() {
+fn an_interest_raised_before_a_scan_is_never_lost() {
     loom::model(|| {
-        let work = Arc::new(AtomicBool::new(false));
-        let signal = Arc::new(signal::DataSignal::default());
-        signal.mark();
-        let publisher = {
-            let work = work.clone();
-            let signal = signal.clone();
+        let changed = std::sync::Arc::new(signal::StateSignal::default());
+        let interest = Arc::new(interest::Interest::default());
+        let caller = {
+            let changed = changed.clone();
+            let interest = interest.clone();
             thread::spawn(move || {
-                work.store(true, Ordering::Release);
-                signal.mark();
+                interest.register(&changed);
+                interest.refresh(&changed);
             })
         };
-        let observed = signal.drain(|| work.load(Ordering::Acquire));
-        publisher.join().unwrap();
-        let mut ready = pin!(signal.ready());
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        assert!(observed || matches!(ready.as_mut().poll(&mut cx), Poll::Ready(())));
+        // The watcher's scan: capture the routing signal, then read.
+        let seen = changed.generation();
+        let revision = interest.revision();
+        caller.join().unwrap();
+        assert!(
+            revision == interest.revision() || changed.generation() != seen,
+            "revision {revision} was read after its signal was captured"
+        );
+    });
+}
+
+#[test]
+fn a_wake_racing_a_partition_visit_is_seen_or_left_marked() {
+    loom::model(|| {
+        let shard = std::sync::Arc::new(loom::future::AtomicWaker::new());
+        // A new partition starts marked: an earlier wake is still pending
+        // when the producer marks it again during the visit.
+        let mark = std::sync::Arc::new(woken::Woken::new(shard));
+        let work = Arc::new(AtomicBool::new(false));
+        let producer = {
+            let mark = mark.clone();
+            let work = work.clone();
+            thread::spawn(move || {
+                work.store(true, Ordering::Release);
+                std::task::Wake::wake_by_ref(&mark);
+            })
+        };
+        let seen = mark.is_set() && mark.take() && work.load(Ordering::Acquire);
+        producer.join().unwrap();
+        assert!(seen || mark.is_set(), "the wake was neither seen nor kept");
+    });
+}
+
+#[test]
+fn a_writer_lease_dropped_during_admission_frees_its_charge_or_signals() {
+    let writer = |bytes, progress_bytes| budget::Cost {
+        writers: 1,
+        bytes,
+        progress_bytes,
+        ..budget::Cost::default()
+    };
+    let request = budget::Cost {
+        requests: 1,
+        records: 1,
+        bytes: 60,
+        ..budget::Cost::default()
+    };
+    loom::model(move || {
+        let budget = std::sync::Arc::new(budget::Budget::new(Some(AppendLinkLimits {
+            writers: 2,
+            requests: 1,
+            records: 1,
+            bytes: 100,
+        })));
+        let first = budget.acquire(writer(50, 20)).unwrap();
+        let closed = thread::spawn(move || drop(first));
+        // A blocked APPEND: capture the signal, then check capacity.
+        let seen = budget.changed.generation();
+        let available = budget.available(request);
+        // Another writer opens while the first one's headroom is released.
+        let second = budget.acquire(writer(10, 30)).unwrap();
+        closed.join().unwrap();
+        assert!(
+            available || budget.changed.generation() != seen,
+            "the freed charge was neither seen nor signaled"
+        );
+        assert!(budget.acquire(request).is_some());
+        // Only the second writer's bytes and headroom stay reserved.
+        assert!(budget.available(writer(60, 0)));
+        assert!(!budget.available(writer(61, 0)));
+        drop(second);
+        assert!(budget.available(writer(100, 0)), "every charge returned");
     });
 }

@@ -19,6 +19,7 @@ use ozzy_proto::{
 
 mod dynamic;
 mod frontend;
+mod group_progress;
 mod pipeline;
 
 fn limits() -> DataLimits {
@@ -106,7 +107,10 @@ fn intake_access_profile(
         policy: Policy::LocalDurable,
         access,
         limits: wire,
+        reserve_dedup_results: false,
         requests_per_writer: 1,
+        progress_requests: 0,
+        progress_batch: 1,
         turn_slots: 2,
     };
     let buffers = (0..config.access.required_buffers(1).unwrap())
@@ -246,14 +250,16 @@ fn settle(
     intake: &mut NativeIntake,
     output: &mut Vec<Message>,
 ) {
+    // A round without I/O jobs also finishes trailing durable evidence.
     for _ in 0..10000 {
         progress(actor, intake, None, output, false);
-        for (id, _) in controller.jobs() {
+        let jobs = controller.jobs();
+        if jobs.is_empty() && !intake.has_work() && actor.storage_idle() {
+            return;
+        }
+        for (id, _) in jobs {
             controller.execute(id, Effect::Normal).unwrap();
             controller.deliver(id).unwrap();
-        }
-        if !intake.has_work() {
-            return;
         }
     }
     panic!("native partition intake did not settle");

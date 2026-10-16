@@ -1,4 +1,4 @@
-use lz4rip::block::{Compressor, Decompressor, DictCompressor, DictTrainer};
+use lz4rip::block::{CompressError, Compressor, Decompressor, DictCompressor, DictTrainer};
 use ozzy_bench::automation::Result;
 use ozzy_journal_segment::{ENTRY_HEADER_BYTES, GROUP_SEAL_BYTES, WRITE_GROUP_ALIGNMENT};
 use serde_json::{Value, json};
@@ -73,23 +73,25 @@ fn timed(
     Ok(start.elapsed().as_secs_f64() * 1e9 / completed as f64)
 }
 
-pub(super) fn measure(
-    bodies: &[Vec<u8>],
-    dict: &Dictionary,
-    warmup: Duration,
-    duration: Duration,
-) -> Result<Value> {
+/// Warm-up and measured time for each codec phase.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Timing {
+    pub warmup: Duration,
+    pub duration: Duration,
+}
+
+pub(super) fn measure(bodies: &[Vec<u8>], dict: &Dictionary, timing: Timing) -> Result<Value> {
     let start = Instant::now();
     if dict.bytes.is_empty() {
         let mut compressor = Compressor::new();
         let setup = start.elapsed().as_nanos();
-        measure_with(bodies, dict, warmup, duration, setup, |input, output| {
+        measure_with(bodies, dict, timing, setup, |input, output| {
             compressor.compress_into(input, output)
         })
     } else {
         let mut compressor = DictCompressor::new(&dict.bytes);
         let setup = start.elapsed().as_nanos();
-        measure_with(bodies, dict, warmup, duration, setup, |input, output| {
+        measure_with(bodies, dict, timing, setup, |input, output| {
             compressor.compress_into(input, output)
         })
     }
@@ -98,77 +100,40 @@ pub(super) fn measure(
 fn measure_with(
     bodies: &[Vec<u8>],
     dict: &Dictionary,
-    warmup: Duration,
-    duration: Duration,
+    timing: Timing,
     setup: u128,
-    mut compress: impl FnMut(
-        &[u8],
-        &mut [u8],
-    ) -> std::result::Result<usize, lz4rip::block::CompressError>,
+    compress: impl FnMut(&[u8], &mut [u8]) -> std::result::Result<usize, CompressError>,
 ) -> Result<Value> {
     let maximum = bodies.iter().map(Vec::len).max().ok_or("empty corpus")?;
-    let mut output = vec![0; lz4rip::get_maximum_output_size(maximum)];
-    let mut restored = vec![0; maximum];
-    let decoder = Decompressor::with_dict(&dict.bytes);
-    let mut encoded = Vec::with_capacity(bodies.len());
-    for body in bodies {
-        let n = compress(body, &mut output)?;
-        let restored_len = decoder.decompress_into(&output[..n], &mut restored)?;
-        if &restored[..restored_len] != body {
-            return Err("dictionary roundtrip mismatch".into());
-        }
-        encoded.push(output[..n].to_vec());
-    }
-    timed(warmup, bodies.len(), |i| {
-        let n = compress(black_box(&bodies[i]), black_box(&mut output))?;
-        black_box(&output[..n]);
-        Ok(())
-    })?;
-    // Epoch-based table reuse may legitimately vary compressed bytes. Measure
-    // their actual lengths instead of requiring a deterministic representation.
-    let mut lengths = vec![(usize::MAX, 0, 0_u64, 0_u64); bodies.len()];
-    let encode_ns = timed(duration, bodies.len(), |i| {
-        let n = compress(black_box(&bodies[i]), black_box(&mut output))?;
-        let stats = &mut lengths[i];
-        stats.0 = stats.0.min(n);
-        stats.1 = stats.1.max(n);
-        stats.2 += n as u64;
-        stats.3 += 1;
-        black_box(&output[..n]);
-        Ok(())
-    })?;
+    let mut codec = Codec {
+        compress,
+        decoder: Decompressor::with_dict(&dict.bytes),
+        output: vec![0; lz4rip::get_maximum_output_size(maximum)],
+        restored: vec![0; maximum],
+    };
+    let mut encoded = bodies
+        .iter()
+        .map(|body| {
+            Ok(codec
+                .roundtrip(body, "dictionary roundtrip mismatch")?
+                .to_vec())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let (encode_ns, sizes) = codec.time_encode(bodies, timing)?;
     // Use the warmed encoder's output for decompression and size modeling.
     for (body, encoded) in bodies.iter().zip(&mut encoded) {
-        let n = compress(body, &mut output)?;
-        let restored_len = decoder.decompress_into(&output[..n], &mut restored)?;
-        if &restored[..restored_len] != body {
-            return Err("post-encode roundtrip mismatch".into());
-        }
+        let fresh = codec.roundtrip(body, "post-encode roundtrip mismatch")?;
         encoded.clear();
-        encoded.extend_from_slice(&output[..n]);
+        encoded.extend_from_slice(fresh);
     }
-    let mut decode_one = |i: usize| -> Result<()> {
-        let n = decoder.decompress_into(black_box(&encoded[i]), black_box(&mut restored))?;
-        if n != bodies[i].len() {
-            return Err("decoded length mismatch".into());
-        }
-        black_box(&restored[..n]);
-        Ok(())
-    };
-    timed(warmup, bodies.len(), &mut decode_one)?;
-    let decode_ns = timed(duration, bodies.len(), decode_one)?;
+    let decode_ns = codec.time_decode(bodies, &encoded, timing)?;
     // Recheck full bytes after all context reuse and measured iterations.
     for body in bodies {
-        let n = compress(body, &mut output)?;
-        let n = decoder.decompress_into(&output[..n], &mut restored)?;
-        if &restored[..n] != body {
-            return Err("post-timing roundtrip mismatch".into());
-        }
+        codec.roundtrip(body, "post-timing roundtrip mismatch")?;
     }
     let body_bytes: usize = bodies.iter().map(Vec::len).sum();
-    let encoded_mean =
-        lengths.iter().map(|s| s.2 as f64 / s.3 as f64).sum::<f64>() / bodies.len() as f64;
-    let groups = observed_write_sizes(bodies, &encoded, &lengths);
+    let encoded_mean = sizes.iter().map(|size| size.mean()).sum::<f64>() / bodies.len() as f64;
+    let groups = observed_write_sizes(bodies, &encoded, &sizes);
     Ok(
         json!({"dict_capacity":dict.requested,"dict_bytes":dict.bytes.len(),
         "dict_sha256":format!("{:x}",Sha256::digest(&dict.bytes)),
@@ -176,20 +141,130 @@ fn measure_with(
         "compressor_setup_ns":setup,"body_bytes":bodies[0].len(),"samples":bodies.len(),
         "lz4_bytes_mean":encoded_mean,
         "encoded_fraction":encoded_mean * bodies.len() as f64 / body_bytes as f64,
-        "samples_with_encoded_size_variation":lengths.iter().filter(|s| s.0 != s.1).count(),
+        "samples_with_encoded_size_variation":sizes.iter().filter(|size| size.varied()).count(),
         "encode_ns_per_operation":encode_ns,"decode_ns_per_operation":decode_ns,
         "write_groups":groups,"verified_roundtrips":bodies.len()*3}),
     )
 }
 
+/// One compressor, the matching dictionary decoder, and their scratch buffers.
+struct Codec<C> {
+    compress: C,
+    decoder: Decompressor,
+    output: Vec<u8>,
+    restored: Vec<u8>,
+}
+
+impl<C> Codec<C>
+where
+    C: FnMut(&[u8], &mut [u8]) -> std::result::Result<usize, CompressError>,
+{
+    /// Compress `body`, require it to decode back exactly, and return the
+    /// encoded bytes.
+    fn roundtrip(&mut self, body: &[u8], mismatch: &'static str) -> Result<&[u8]> {
+        let n = (self.compress)(body, &mut self.output)?;
+        let restored = self
+            .decoder
+            .decompress_into(&self.output[..n], &mut self.restored)?;
+        if &self.restored[..restored] != body {
+            return Err(mismatch.into());
+        }
+        Ok(&self.output[..n])
+    }
+
+    /// Warm the encoder, then measure its mean time per body and the sizes
+    /// each body compressed to while measured.
+    fn time_encode(
+        &mut self,
+        bodies: &[Vec<u8>],
+        timing: Timing,
+    ) -> Result<(f64, Vec<EncodedSizes>)> {
+        timed(timing.warmup, bodies.len(), |i| {
+            let n = (self.compress)(black_box(&bodies[i]), black_box(&mut self.output))?;
+            black_box(&self.output[..n]);
+            Ok(())
+        })?;
+        // Epoch-based table reuse may legitimately vary compressed bytes. Measure
+        // their actual lengths instead of requiring a deterministic representation.
+        let mut sizes = vec![EncodedSizes::NONE; bodies.len()];
+        let encode_ns = timed(timing.duration, bodies.len(), |i| {
+            let n = (self.compress)(black_box(&bodies[i]), black_box(&mut self.output))?;
+            sizes[i].record(n);
+            black_box(&self.output[..n]);
+            Ok(())
+        })?;
+        Ok((encode_ns, sizes))
+    }
+
+    /// Warm the decoder, then measure its mean time per encoded body.
+    fn time_decode(
+        &mut self,
+        bodies: &[Vec<u8>],
+        encoded: &[Vec<u8>],
+        timing: Timing,
+    ) -> Result<f64> {
+        let mut decode_one = |i: usize| -> Result<()> {
+            let n = self
+                .decoder
+                .decompress_into(black_box(&encoded[i]), black_box(&mut self.restored))?;
+            if n != bodies[i].len() {
+                return Err("decoded length mismatch".into());
+            }
+            black_box(&self.restored[..n]);
+            Ok(())
+        };
+        timed(timing.warmup, bodies.len(), &mut decode_one)?;
+        timed(timing.duration, bodies.len(), decode_one)
+    }
+}
+
+/// The compressed sizes one body produced over the measured iterations.
+#[derive(Clone, Copy, Debug)]
+struct EncodedSizes {
+    min: usize,
+    max: usize,
+    total: u64,
+    count: u64,
+}
+
+impl EncodedSizes {
+    const NONE: Self = Self {
+        min: usize::MAX,
+        max: 0,
+        total: 0,
+        count: 0,
+    };
+
+    fn record(&mut self, bytes: usize) {
+        self.min = self.min.min(bytes);
+        self.max = self.max.max(bytes);
+        self.total += bytes as u64;
+        self.count += 1;
+    }
+
+    fn mean(self) -> f64 {
+        self.total as f64 / self.count as f64
+    }
+
+    fn varied(self) -> bool {
+        self.min != self.max
+    }
+}
+
 fn observed_write_sizes(
     bodies: &[Vec<u8>],
     encoded: &[Vec<u8>],
-    lengths: &[(usize, usize, u64, u64)],
+    sizes: &[EncodedSizes],
 ) -> Vec<Value> {
     let mut groups = write_sizes(bodies, &encoded.iter().map(Vec::len).collect::<Vec<_>>());
-    let minimum = write_sizes(bodies, &lengths.iter().map(|s| s.0).collect::<Vec<_>>());
-    let maximum = write_sizes(bodies, &lengths.iter().map(|s| s.1).collect::<Vec<_>>());
+    let minimum = write_sizes(
+        bodies,
+        &sizes.iter().map(|size| size.min).collect::<Vec<_>>(),
+    );
+    let maximum = write_sizes(
+        bodies,
+        &sizes.iter().map(|size| size.max).collect::<Vec<_>>(),
+    );
     for ((group, minimum), maximum) in groups.iter_mut().zip(minimum).zip(maximum) {
         group["observed_min_selected_bytes_mean"] = minimum["selected_bytes_mean"].clone();
         group["observed_max_selected_bytes_mean"] = maximum["selected_bytes_mean"].clone();
@@ -221,8 +296,8 @@ mod tests {
     use super::super::corpus::{self, Shape};
     use super::*;
     use ozzy_journal_segment::{
-        BodyEncoding, CanonicalOperation, ChainPosition, Digest as JournalDigest, OperationKind,
-        SEGMENT_HEADER_BYTES, SegmentHeader, encode_group_with_body_encoding,
+        BodyEncoding, CanonicalOperation, ChainPosition, Digest as JournalDigest, GroupStart,
+        OperationKind, SEGMENT_HEADER_BYTES, SegmentHeader, encode_group_with_body_encoding,
     };
     use ozzy_proto::GroupId;
 
@@ -254,8 +329,10 @@ mod tests {
         measure(
             &bodies,
             &dict,
-            Duration::from_millis(50),
-            Duration::from_millis(50),
+            Timing {
+                warmup: Duration::from_millis(50),
+                duration: Duration::from_millis(50),
+            },
         )
         .unwrap();
     }
@@ -307,9 +384,11 @@ mod tests {
                             .collect();
                         let group = encode_group_with_body_encoding(
                             &header,
-                            1,
-                            SEGMENT_HEADER_BYTES as u64,
-                            ChainPosition::new(1, JournalDigest::ZERO),
+                            GroupStart::new(
+                                1,
+                                SEGMENT_HEADER_BYTES as u64,
+                                ChainPosition::new(1, JournalDigest::ZERO),
+                            ),
                             &descriptions,
                             BodyEncoding::Lz4 {
                                 min_savings_bytes: 32,
@@ -348,8 +427,10 @@ mod tests {
             let result = measure(
                 &test,
                 &dict,
-                Duration::from_millis(1),
-                Duration::from_millis(1),
+                Timing {
+                    warmup: Duration::from_millis(1),
+                    duration: Duration::from_millis(1),
+                },
             )
             .unwrap();
             assert_eq!(result["verified_roundtrips"], 48);

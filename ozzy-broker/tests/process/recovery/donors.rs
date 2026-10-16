@@ -1,29 +1,18 @@
 //! A donor's new process session cannot stall healthy neighboring partitions.
 
 use super::{Client, Cluster, Processes};
-use ozzy_config::Confirmation;
 use ozzy_proto::{LinkSessionId, NodeId};
 use std::{fs, time::Duration};
 
 #[tokio::test(flavor = "current_thread")]
 async fn cli_changed_donor_sessions_preserve_neighbor_progress_disk_quorum() {
-    tokio::time::timeout(Duration::from_secs(60), scenario(Confirmation::DiskQuorum))
+    tokio::time::timeout(Duration::from_secs(60), scenario())
         .await
         .unwrap();
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn cli_changed_donor_sessions_preserve_neighbor_progress_replicated_persisting() {
-    tokio::time::timeout(
-        Duration::from_secs(60),
-        scenario(Confirmation::ReplicatedPersisting),
-    )
-    .await
-    .unwrap();
-}
-
-async fn scenario(policy: Confirmation) {
-    let cluster = Cluster::new(policy);
+async fn scenario() {
+    let cluster = Cluster::new();
     cluster.provision();
     let checked = cluster.checked(0);
     let donor = NodeId::from_bytes(*checked.identity.brokers["broker-1"].as_bytes());
@@ -67,8 +56,8 @@ async fn scenario(policy: Confirmation) {
     confirm_neighbors(&mut processes, &mut client, 1).await;
     assert_eq!(fs::read(replaced.join("CONFIGURATION")).unwrap(), marker);
 
-    // Graceful restart preserves this donor's proven voting history under both
-    // policies. Recovery still cannot publish until the second donor returns.
+    // Graceful restart preserves this donor's proven voting history.
+    // Recovery still cannot publish until the second donor returns.
     processes.stop(1, "TERM").await;
     processes.restart(&cluster, 1, 2);
     processes.ready(1).await;

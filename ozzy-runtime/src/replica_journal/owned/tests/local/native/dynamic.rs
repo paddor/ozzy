@@ -51,7 +51,6 @@ fn rejected(output: &mut Vec<Message>, code: u16, retry: RetryClass) {
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
 fn dynamic_writers_keep_trust_capacity_and_old_io_ownership_separate() {
     scenario(
         NativeAccess::Clients {
@@ -258,7 +257,7 @@ fn idle_writer_arenas_reuse_live_sessions_without_losing_retry_history() {
     close(&mut controller, actor);
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines, reason = "one linear scenario")]
 fn scenario(access: NativeAccess, trusted: bool) {
     let (mut controller, io) = setup();
     let mut actor = actor(&mut controller, io, 1);

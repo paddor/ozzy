@@ -1,6 +1,6 @@
 use super::Error;
 use crate::{Digest, Scope};
-use ozzy_proto::{GroupId, NodeId};
+use ozzy_proto::{GroupId, NodeId, layout::Fixed};
 
 /// Exact encoded single-broker configuration length.
 pub const CONFIGURATION_BYTES: usize = 128;
@@ -77,16 +77,14 @@ impl Configuration {
 
     /// Reject corruption, unsupported fields, or replicated membership records.
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
-        if bytes.len() != CONFIGURATION_BYTES {
-            return Err(Error::Encoding);
-        }
+        let bytes: &[u8; CONFIGURATION_BYTES] = bytes.try_into().map_err(|_| Error::Encoding)?;
         let configuration = Self::new(
-            GroupId::from_bytes(bytes[16..32].try_into().expect("fixed group")),
-            u64::from_be_bytes(bytes[32..40].try_into().expect("fixed epoch")),
-            NodeId::from_bytes(bytes[40..56].try_into().expect("fixed broker")),
-            Digest::from_bytes(bytes[56..88].try_into().expect("fixed principal")),
+            GroupId::from_bytes(bytes.array::<16, 16>()),
+            bytes.u64_at::<32>(),
+            NodeId::from_bytes(bytes.array::<40, 16>()),
+            Digest::from_bytes(bytes.array::<56, 32>()),
         )?;
-        if bytes != configuration.encode() {
+        if *bytes != configuration.encode() {
             return Err(Error::Encoding);
         }
         Ok(configuration)

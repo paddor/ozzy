@@ -16,32 +16,15 @@ use crate::{
 /// boundary alone changes neither image until application advances.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValidationTicket {
-    local: NodeId,
-    scope: Scope,
-    generation: JournalGeneration,
-    accepted: Prefix,
-    committed: Prefix,
-    applied: Prefix,
+    pub(crate) local: NodeId,
+    pub(crate) scope: Scope,
+    pub(crate) generation: JournalGeneration,
+    pub(crate) accepted: Prefix,
+    pub(crate) committed: Prefix,
+    pub(crate) applied: Prefix,
 }
 
 impl ValidationTicket {
-    pub(crate) const fn from_local_image(
-        local: NodeId,
-        scope: Scope,
-        generation: JournalGeneration,
-        accepted: Prefix,
-        committed: Prefix,
-        applied: Prefix,
-    ) -> Self {
-        Self {
-            local,
-            scope,
-            generation,
-            accepted,
-            committed,
-            applied,
-        }
-    }
     /// Group, configuration, and view against which validation started.
     pub const fn scope(self) -> Scope {
         self.scope
@@ -97,7 +80,7 @@ impl ReplicaDriver {
             return Err(ReplicationError::ActivationPending.into());
         }
         Ok(ValidationTicket {
-            local: self.local,
+            local: self.configuration.voter(self.local),
             scope: snapshot.scope,
             generation: snapshot.journal.generation,
             accepted: snapshot.accepted,

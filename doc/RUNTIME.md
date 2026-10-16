@@ -1,236 +1,329 @@
 # Runtime
 
-Each owner keeps mutable state on its own thread. OMQ carries broker/shard
-messages through inproc and public traffic through PEER or PUB/SUB.
-[Protocol](PROTOCOL.md) owns wire layouts; [storage](STORAGE.md) owns file order.
+This page covers which thread owns what, when the SDK and broker batch and
+confirm, how pressure shows up, and the deployment and telemetry settings.
+[Protocol](PROTOCOL.md) owns wire layouts. [Storage](STORAGE.md) owns file
+formats. [Overview](OVERVIEW.md) defines the terms.
 
-## Deployment configuration
+## Threads and owners
 
-TOML binds broker identities, immutable topic partitions/membership, local shard
-placement, device roots/backends, and public endpoints. Each broker binds one
-control PEER, data PEER, reader PUB, and optional follower PUB.
+| Thread | Count | Owns |
+| --- | --- | --- |
+| Dispatcher `ozzy/dispatch` | One per broker | Public sockets, sessions, routing, source pause and resume |
+| OMQ I/O `ozzy/omq/IO/N` | `topology.omq.io_threads` per broker | Connections, framing, socket queues |
+| Shard `ozzy/shard/N` | One per `topology.shards` entry | Partition actors, journals, readers, group coordinators |
+| Disk worker `ozzy/disk/N` | `write_threads` per `controller` | Segment data writes; with `aio`, only those without `O_DIRECT` |
+| Disk progress worker `ozzy/disk/pN` | Up to two per `controller` | Syncs, reads, opens, directory listings, metadata; never queued behind segment data |
+| AIO writer `ozzy/disk/aio` | One per controller with `backend = "aio"` | Linux AIO submission and completion |
+| Admin owner `ozzy/admin` | One per broker with an `admin` endpoint | Admin endpoint; asks shards for partition status, reads counters and links |
+| SDK owner `ozzy/sdk` | One per `WriterRuntime` | Links, routing, batching, compression, retries, receipts, reader inboxes |
+| SDK OMQ I/O | `OMQ_IO_THREADS` for `WriterRuntime::new` | SDK connections |
 
-## OMQ ownership and scheduling
-
-| Owner | Execution and state |
-| --- | --- |
-| Dispatcher | Separate thread; sockets, sessions, routing, source pause/resume |
-| Application shard | OS thread/current-thread runtime; partition actors, journals, readers |
-| Producer SDK owner | Current-thread runtime; sequence order, packing, retry, receipts |
-| Consumer SDK role | Separate subscriptions, offsets, replay/live merge, processing observations |
-| OMQ I/O worker | Network runtime; framing, connections, socket queues |
-| AIO device owner | One thread/device; direct-write submission/completion |
-| Device helpers / pool | Fixed blocking workers; file operations and reserved progress |
-
-Actors are tasks, not threads. Shard 0 has no special duties; actors call journals
-directly. The broker defaults to one dispatcher and one OMQ I/O worker.
+- Each thread owns its mutable state. Partition actors are tasks on a shard.
+- Shards are symmetric. Shard 0 has no special duties.
+- One `BrokerLinks` holds a control PEER and a data PEER across all brokers,
+  plus one SUB per broker for live reads.
+- Dropping an observer, such as a future or a pending record, never cancels
+  admitted work.
+- Deadlines use monotonic time. Append and retention timestamps use Unix time.
 
 ```mermaid
-flowchart TD
-    CP[Control PEER]
-    DP[Data PEER]
-    FS[Follower SUB]
-    D[Broker dispatcher]
-    subgraph S[One application shard]
-        BC[Broker control ROUTER]
-        CC[Client control ROUTER]
-        BD[Broker data ROUTER]
-        PD[Producer data ROUTER]
-        P[Partition actors and journal owners]
-        BC --> P
-        CC --> P
-        BD --> P
-        PD --> P
-    end
-    IO[Shared device backend]
-    CP --> D
-    DP --> D
-    FS --> D
-    D -->|inproc DEALER| BC
-    D -->|inproc DEALER| CC
-    D -->|inproc DEALER| BD
-    D -->|inproc DEALER| PD
-    P -->|separate data and control inproc ports| D
-    P -->|owned file jobs and completions| IO
+flowchart LR
+    C[SDK owner] -->|control and data PEER| D[Dispatcher]
+    B[Other brokers] -->|PEER and follower PUB| D
+    D -->|inproc lanes| S[Application shards]
+    S -->|replies and PUB| D
+    S -->|file jobs| IO[Storage backend]
+    IO -->|completions| S
 ```
-
-Four input lanes and separate data/control output ports have count/byte bounds.
-Completion IDs remain in a bounded owner table. Dropping observers does not
-cancel admitted work.
-
-`BrokerLinks` shares SDK session/transport code: two PEER sockets across all
-brokers, plus one SUB/broker for live readers. Discovery returns the first
-complete validated catalog under one deadline. Pages keep one donor; replacement
-sessions restart at page zero and fence late replies.
-
-Each producer driver owns and drains its APPEND reply receiver. Readiness waits
-do not consume replies; retained frame leases still hold admission until release.
-
-Deadlines use monotonic time; append/retention timestamps use Unix time.
-Simulation clocks control both independently of storage execution/completion.
 
 ## Confirmation boundaries
 
-| Mode | Required evidence before apply/reply |
+`cluster.mode` fixes when a writer gets its receipt.
+
+| `cluster.mode` | Evidence before apply and reply |
 | --- | --- |
-| Single-broker durable | Local durable prefix |
-| Disk quorum | Matching durable history on leader and one follower |
-| Replicated-persisting | Matching validated retained bytes on leader and one follower |
+| `single` | Local durable prefix on the sole broker |
+| `three` | Matching durable history on the leader and one follower |
 
-### Replicated confirmation with background persistence
+- A partition applies records only after the mode's evidence exists. A
+  storage wait on one partition leaves the others on the shard runnable.
+- Group progress updates wait for the same boundary. Updates that arrive
+  while a partition's progress proposal is in flight share the next one.
 
-RP retains backing until application and physical writing permit release;
-a full backlog backpressures admission. Unclean restart stays nonvoting until
-recovery. RAM confirmation supplies no durable-prefix evidence.
+## Writers
 
-Donor pinning waits for captured writes and its independent barrier, then freezes
-one source per recovery nonce. Repeated requests reuse that snapshot. Link loss,
-nonce replacement, or view change invalidates the exchange; late completions
-cannot overwrite a newer response or recapture a moving tail under an old nonce.
-Busy history reads keep the original correlated request available for retry.
-
-### Local durable pipeline
-
-Validation assigns offsets and freezes operations. The journal prepares groups,
-installs ordered writes, publishes durable evidence, then applies records.
-Storage waits leave other partitions runnable; a backing-blocked ready batch
-keeps its position when capacity returns.
-
-## Writer API
-
-`send` observes local admission; `confirmed` and `flush` observe broker policy.
-Flush captures a sequence end. Request/session IDs may change on retry; record
-identity, multipart boundaries, destination, and bytes remain fixed.
-Resume/takeover resolves every partition before admission and keeps a stable
-transition ID across response retries. Route hints never grant authority.
+- `send` waits for bounded local admission. Canceling it before admission
+  assigns nothing.
+- Dropping the pending record stops observation only. The record still goes
+  out. `confirmed` resolves at the confirmation boundary.
+- `flush` captures every record admitted before the call, even before it is
+  first polled.
+- `close` seals admission and confirms the captured prefix. Canceling `close`
+  leaves admission sealed.
+- Retries keep record identity, multipart boundaries, destination, and bytes.
+  Request and session IDs may change.
+- A duplicate retry is checked against the original attempt's persisted
+  fingerprint, without the original payload or a dedup window. It returns
+  the original offsets after the confirmation boundary.
 
 ### SDK protocol batching
 
-| Bound | Contract |
+Callers submit individual records. The SDK routes each record to a partition,
+then batches per partition. One APPEND holds one partition.
+
+| Rule | Behavior |
 | --- | --- |
-| Records/APPEND | Negotiated limit, capped at 2,048 |
-| Default payload target | 64 KiB; a permitted larger record goes alone |
-| Default outstanding APPENDs | One per partition writer; configurable |
-| Collection delay | None; collect ready work |
-| Intake reservation | Payload/part tables, including empty parts, plus one lookahead record |
+| Collection delay | None. The SDK never waits to fill a batch. |
+| Nothing in flight | Ready records go at once, even a single record |
+| APPEND in flight | A partial batch keeps collecting until a slot frees |
+| Full batch or `flush` | Goes at once into a free APPEND slot |
+| Records per APPEND | Negotiated limit, capped at 2,048 (`MAX_APPEND_RECORDS`) |
+| Large record | A permitted record above the byte target goes alone |
+| Keyless records | Stick to one partition until an APPEND forms, then rotate |
 
-A full successor pipelines behind outstanding APPENDs; partial replies retain
-the request slot. Payload, metadata, record, and part limits remain independent.
+- Every batch is bounded by record count and bytes.
+- A partial reply keeps its request slot until all its records confirm.
+- Batching never changes retry identity.
 
-```mermaid
-sequenceDiagram
-    participant A as Producer application
-    participant W as Producer SDK owner
-    participant B as Broker leader
-    A->>W: send one record
-    W-->>A: PendingRecord after local admission
-    W->>W: Route, sequence, collect ready records
-    W->>B: APPEND on data PEER
-    A->>W: More individual records
-    W->>W: Collect successor with bounded lookahead
-    opt Full successor and free APPEND slot
-        W->>B: Next APPEND on data PEER
-    end
-    B-->>W: APPENDED range on control PEER
-    W->>W: Store exact offsets, then publish confirmed prefix
-    W-->>A: confirmed receipt
-    Note over W,B: Partial ranges retain the request slot, retries preserve records
-```
+`SharedTopicWriterConfig::new` sets one outstanding APPEND per partition and a
+64 KiB target.
 
-Payloads up to 128 bytes remain inline during intake/packing. Receipts use
-16-cell pages containing identities/offsets, no payloads. Offset stores precede
-confirmed-prefix release publication; callers acquire the prefix before reading.
-Packing returns inbox slots, confirmation releases retry state, and final
-transport aliases release backing. All remain separately charged.
+| Field | Effect |
+| --- | --- |
+| `batch_target_bytes` | Uncompressed grouping target |
+| `inflight_appends` | Outstanding APPENDs per partition, including partial replies |
+| `compress_payloads` | Adaptive whole-APPEND LZ4; turn off with `lz4+tcp://` or `zstd+tcp://` |
 
 ## Readers
 
+[Protocol](PROTOCOL.md) owns the reader exchange and its socket planes.
+
 | Event | Behavior |
 | --- | --- |
-| SUBSCRIBE | Resolve selector once; open indexed confirmed-history cursor |
-| Applied end | Park until append, source change, or buffer release |
-| Reconnect / PEER gap | Resume next undelivered offset; gaps use a fresh subscription generation |
-| Full SDK inbox | Retain frame and pause exact source; connection-sharing readers share pressure |
-| SUBSCRIBED / UNSUBSCRIBED | Become bounded cursor completions before releasing raw control admission |
-| Detached cancellation | Keep original session; disconnect/replacement settles locally; a lost original-session reply times out |
+| Subscribe | Resolve the start selector once, then read confirmed history |
+| Applied end | Wait for the next append; no polling |
+| Live record | Arrives over PUB; only confirmed, applied records are published |
+| Gap, reconnect, or silence | Resubscribe over PEER from the next undelivered offset |
+| Behind retention | Fail with `TopicReaderError::RetentionGap`; readers do not extend retention |
 
-RECORDS uses data PEER; subscription, cancellation, ACK, and NACK use control.
-Idle readers cannot pin producer control capacity. Readers do not extend
-retention; ACK observes volatile delivery, not durable application processing.
+- PUB and PEER replay merge by offset. The reader drops duplicates.
+- `TopicReaderConfig::refresh` sets how long a quiet partition waits before
+  it checks for a lost final record.
+- Reader ACK observes delivery, not application processing. Save a
+  checkpoint only after processing.
 
-### Live reader publication
+### Consumer groups
 
-```mermaid
-sequenceDiagram
-    participant C as Consumer SDK
-    participant B as Broker
-    participant A as Consumer application
-    C->>B: SUB topic filter before first replay
-    C->>B: SUBSCRIBE offset n on control PEER
-    B-->>C: SUBSCRIBED with source fence on control PEER
-    B-->>C: Bounded RECORDS on data PEER
-    B-->>C: Contiguous RECORDS_PUB on PUB/SUB
-    C->>B: UNSUBSCRIBE replay on control PEER
-    C-->>A: next record at checked offset
-    alt Gap, quiet interval, or source change
-        C->>B: SUBSCRIBE next offset with fresh generation
-        B-->>C: Bounded repair RECORDS on data PEER
-        C->>C: Merge by offset, discard covered duplicates
-    end
-    Note over C,A: Save received checkpoint only after processing
-```
+- `GroupReader` heartbeats from the SDK owner, even while the application
+  does not poll.
+- Each owned partition has a processing window (`GroupReaderConfig::window`).
+  A full window stops delivery for that partition only.
+- Acknowledgments go out at once and advance a contiguous cursor. An
+  unacknowledged record holds the cursor and is redelivered to the
+  partition's next owner.
+- Revocation stops delivery at once. The member keeps the partition until its
+  submitted acknowledgments confirm or `GroupReaderConfig::drain` passes.
+- `close` drains, then leaves, so partitions move without a membership
+  timeout.
+- `BrokerLinks::delete_group` is idempotent; a retry completes a failed
+  delete. Readers of the deleted group stop with `GroupReaderError::Deleted`.
 
-PUB contains only confirmed applied records. Consumers verify source/offsets,
-merge overlaps, and repair gaps or quiet final loss over PEER. PUB drops under
-pressure and owns separate encoded backing, so slow consumers cannot pin writer
-arenas. Consumer checkpoints require application persistence.
+### Follower catch-up
 
-## Follower catch-up
-
-Normal replication uses PUB/SUB; votes/probes use control PEER; bounded targeted
-repair uses data PEER. Repair aliases identify destination shards without
-replacing control sessions. [Replication](REPLICATION.md#receipt-and-repair)
-owns receipt epochs, history validation, and vote evidence.
+Normal replication uses PUB/SUB, votes and probes use control PEER, and
+bounded repair uses data PEER. [Replication](REPLICATION.md#receipt-and-repair)
+owns receipt and vote evidence.
 
 ## Backpressure isolation
 
-Shards visit broker control, client control, broker data, then producer data in
-bounded turns. Each input holds at most one separately charged deferred frame.
-Full PEER destinations return the frame to its exact OMQ source and pause it;
-full PUB intake drops. The dispatcher never waits for a full destination.
-Paused-source retry turns allow 16 attempts or 2 MiB, with one indivisible-frame
-exception. OMQ supplies connection fairness inside each socket.
+Transport pressure controls flow. No owner waits on a full destination while
+other work is ready.
 
-Dequeue releases slots; final aliases release bytes. All partition actors share
-shard budgets. Lifecycle events are drained before native dequeue; each body is
-admitted synchronously before observing another disconnect/replacement. Exact
-connection IDs fence late teardown; OMQ fences queued generations and retired
-receive sources. Ozzy admission does not query transport liveness.
+On the broker:
 
-## Disk workers
+- Each shard has four input lanes, visited in this order: broker control,
+  client control, broker data, producer data. Each visit is bounded by count
+  and bytes.
+- Data and control have separate shard budgets. Data cannot borrow control
+  capacity.
+- A full lane for a PEER input pauses that one connection. Other connections
+  keep flowing. The transport carries the pause back to the sender.
+- A full lane for follower PUB input drops the frame. The follower repairs
+  over PEER.
+- A full PUB socket keeps its refused frame until OMQ reports space. That
+  socket takes no other frame meanwhile, so the shards behind it hold
+  intake. Inside OMQ a slow subscriber still loses frames and repairs over
+  PEER.
+- A reply to a full destination waits for that destination's send progress.
+  Later replies to it keep their order. Other destinations continue.
+- Dequeue frees a queue slot. Bytes return when the last payload alias drops.
+- OMQ provides fairness between connections inside each socket.
 
-### Async storage
+On the SDK:
 
-Backends own handles, buffers, admission, and execution. Shards install ordered,
-generation-matching completions without filesystem calls. Queued, running, and
-canceled-but-unsettled jobs remain charged. One AIO owner/device uses fixed file
-helpers and reserved progress; the pool backend obeys the same contract.
+- `send` waits while the writer's local intake is full.
+- A full live lane drops publications. The reader repairs them over PEER.
+- A full replay lane pauses that broker source. Readers sharing a connection
+  share that pressure. `ReaderLinkLimits` bounds both lanes.
+- PUB owns separate backing and drops under pressure, so a slow consumer
+  cannot pin writer memory.
 
-Frontend/shards share one shutdown request and the first failure, with separate
-completion state. Failure is published before queues and sockets close.
-Both observe shutdown before lanes close; unexpected service-time closure is
-fatal. Shutdown drains journals, transport, and backend workers.
+## Partition scheduling
 
-Write handles survive until roll/shutdown. A four-entry read-handle LRU drops
-only cache leases; running reads keep handles and selected-file protection.
+- Each partition wakes on its own events: storage completions, proposals,
+  returned buffers, delivered input, and its next timer.
+- A shard turn delivers input first, then visits the marked partitions.
+  A visit repeats, up to four rounds, while the partition makes progress or
+  wakes itself, instead of waiting for later turns.
+- Freed reply slots and returned port capacity wake the shard only after a
+  send was refused.
+- A periodic safety sweep visits every partition. Work that only the sweep
+  finds counts as `partition_sweep_progress`; a nonzero value means a missed
+  wakeup.
 
-### Local ring exceptions
+## Storage backends
 
-SDK caller lanes and backend jobs/completions use typed owned rings and local
-signals. Broker/shard commands use OMQ inproc. The backend handle registry is
-shared by fixed workers; blocking journal APIs serve offline work only.
+- Backends own file handles, buffers, admission, and execution. Shards make no
+  filesystem calls.
+- `backend = "aio"` uses Linux AIO for direct writes plus blocking helpers for
+  other file work. `backend = "pool"` uses blocking workers for everything.
+  Both keep the same contract. Ozzy does not use io_uring.
+- Devices with the same `controller` share one backend and its budgets.
+- Queued, running, and canceled-but-unsettled jobs stay charged. Cancellation
+  never frees a running job's buffers or handles.
+- Only completions that match the current journal generation advance journal
+  state.
+- Segment write handles stay open until roll or shutdown.
+- Reader and follower replay buffers take bounded shares of the shard's
+  `budget.resident_bytes`.
 
-Broker recent-read allowances divide at most one third of shard memory across
-journals, with up to 2 MiB/journal for compact indexes. Follower replay uses a
-separate one-eighth share, at least one append pipeline; oversized packets bypass
-it. Whole backing allocations remain charged, including compressed aliases.
+## Local ring exceptions
+
+Cross-thread work uses OMQ inproc sockets, including dispatcher-shard lanes
+and SDK reader inboxes. Two places use typed local queues instead:
+
+- SDK caller lanes. Application handles pass owned Rust values (records,
+  commands, receipts) to the SDK owner over bounded typed queues.
+- Storage jobs. Shards submit jobs to a backend and receive completions over
+  bounded rings. The backend's fixed workers share its file table.
+
+## Shutdown and failure
+
+- `SIGINT`, `SIGTERM`, or `Broker::shutdown` stops the dispatcher and shards.
+  Shards drain accepted journal work. The backend then finishes accepted
+  physical jobs and stops its workers.
+- An unexpected exit of a shard or the dispatcher starts the same drain. The
+  broker then reports the failure.
+
+## Deployment configuration
+
+One TOML file describes the whole deployment. Each broker process selects its
+entry with `--broker NAME`. The [`ozzy-config` README](../ozzy-config/README.md)
+owns the key reference, defaults, and validation rules; this section covers
+what the keys mean at runtime.
+
+### Endpoints
+
+| Key in `[brokers.NAME.endpoints]` | Socket |
+| --- | --- |
+| `peer` | Control PEER: sessions, confirmations, subscription control |
+| `data_peer` | Data PEER: APPENDs and replay |
+| `reader_pub` | PUB for live consumer records |
+| `follower_pub` | PUB for live follower replication; required with `mode = "three"` |
+| `admin` | Optional PEER for the [admin console](PROTOCOL.md#admin-console); `ipc://` or `inproc://` only, no authentication |
+
+- Each endpoint is both the bind and the connect address. Schemes are
+  `tcp://`, `ipc://`, and `inproc://`.
+- `lz4+tcp://` and `zstd+tcp://` compress each connection on its OMQ I/O
+  thread, separate from APPEND and segment compression. They need the broker
+  feature `lz4-transport` or `zstd-transport`.
+- A deployment compresses every endpoint or none, because a broker receives
+  through one buffer profile.
+
+### Limits
+
+`[limits]` bounds topics, partitions, and clients. One `BrokerLinks` counts
+once against `max_clients` per broker, however many readers and writers it
+runs. A HELLO beyond `max_clients` is dropped, counted as
+`client_limit_refusal`, and logged. The client times out.
+
+### Topology
+
+| Key in `[brokers.NAME.topology]` | Meaning |
+| --- | --- |
+| `omq.io_threads` | OMQ I/O threads |
+| `dispatcher.cpu`, `dispatcher.numa_node` | Dispatcher affinity |
+| `shards[].id`, `shards[].device` | Shard ID and the device it writes to |
+| `shards[].affinity.cpu`, `shards[].affinity.numa_node` | Shard affinity |
+| `shards[].budget.append_slots`, `.resident_bytes` | Data admission: APPENDs and retained bytes |
+| `shards[].budget.control_slots`, `.control_bytes` | Control admission, separate from data |
+| `memory_pools[].numa_node`, `memory_pools[].bytes` | NUMA allocation domains |
+| `partitions[].topic`, `.partition`, `.shard` | Partition placement override |
+
+- Omitting `shards` gives one shard on the sole device. Multiple devices need
+  explicit shard assignments.
+- CPU and NUMA values are OS IDs. NUMA placement needs an explicit CPU.
+
+### Devices
+
+`[brokers.NAME.devices.DEV]` sets `root` and `controller`. Devices that share a
+`controller` must use identical `workers` settings.
+
+| Key in `workers` | Meaning |
+| --- | --- |
+| `backend` | `aio` (Linux default) or `pool` |
+| `write_threads` | Ordinary blocking workers |
+| `cpus`, `progress_cpu`, `aio_cpu` | Worker CPU pinning; empty `cpus` means none |
+| `aio_depth` | Kernel-outstanding direct writes |
+| `max_inflight` | Ordinary physical jobs in execution |
+| `queued_jobs`, `queued_bytes` | Retained ordinary jobs and bytes |
+| `progress_jobs`, `progress_bytes` | Reserved progress jobs and bytes |
+| `open_handles` | Open file and directory handles |
+
+[Storage](STORAGE.md#operator-tuning) covers the tradeoffs.
+
+## Telemetry
+
+Event counters always count, per thread. Stage timing and PUB snapshots are
+optional and off by default.
+
+| Variable | Effect |
+| --- | --- |
+| `OZZY_TELEMETRY_ENDPOINT` | Publish to this OMQ endpoint, such as `ipc://@ozzy-telemetry` |
+| `OZZY_BENCH_PROFILE=stages` | Stage timing without an endpoint, for benchmark tools |
+
+- Each instrumented thread connects its own PUB socket to the endpoint. One
+  external SUB collector aggregates them. Publishers share one OMQ I/O thread
+  per process, independent of `OMQ_IO_THREADS`.
+- Each snapshot is one JSON message with `pid`, `thread`, `thread_name`,
+  `sequence`, `elapsed_ms`, `events`, `stages`, and `logs`.
+- Delivery is best effort and nonblocking. Sequence gaps show lost snapshots.
+- Telemetry carries no payloads, record identities, or file paths. It proves
+  no confirmation.
+- A counter update is a relaxed store to a thread-owned atomic. Without stage
+  timing or an endpoint, no path reads the clock. An idle enabled thread adds
+  no wakeups.
+- `ozzy_telemetry::totals` sums the counters across all threads, including
+  exited ones. `ozzy_telemetry::threads` lists them by thread; the admin
+  endpoint serves both.
+- Shards answer admin status queries between turns. A full admin lane drops
+  the answer, and the admin owner reports that shard as missing.
+- A partition's committed state (offsets, groups, cursors) is read from its
+  journal owner without I/O or a read ticket, so followers answer too. A
+  journal busy with a command answers without it.
+- Link state comes from the frontend's published link observations, which
+  the dispatcher hands to the admin owner at startup.
+- [Benchmark tools](../ozzy-bench/README.md) describe collection and event
+  names.
+
+## In the code
+
+- Broker threads, serving, and drain: `ozzy-broker/src/frontend/`,
+  `ozzy-broker/src/serving/`, `ozzy-broker/src/shards.rs`
+- Dispatcher and shard lanes: `ozzy-runtime/src/frontend/`
+- SDK owner, writers, readers, groups: `ozzy-runtime/src/replicated/`
+- Storage backends: `ozzy-io/`, `ozzy-io-pool/`, `ozzy-io-aio/`
+- Deployment schema and validation: `ozzy-config/src/`
+- Telemetry: `ozzy-telemetry/src/`
+- Admin owner: `ozzy-broker/src/admin.rs`

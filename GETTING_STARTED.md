@@ -1,24 +1,31 @@
 # Getting started
 
-Ozzy streams records through partitioned topics. Run a broker, then connect
-producers and consumers with the [Rust SDK](ozzy/README.md). Brokers own the
-retained log; OMQ handles message passing.
+This page builds the broker, provisions storage, and runs one broker, a
+container, or three brokers. Then connect applications with the
+[Rust SDK](ozzy/README.md).
+
+Requires Linux, Rust 1.93 or newer, and bash. Run every command from the
+repository root.
 
 ## Build
 
-Requires Linux and Rust 1.93+. Run these commands from the repository root:
-
-```sh
+```bash
 source scripts/ozzy_tools.sh
 scripts/ozzy_cargo build --locked --release -p ozzy-broker --bin ozzy
 export PATH="$CARGO_TARGET_DIR/release:$PATH"
 ```
 
+- `scripts/ozzy_tools.sh` puts build output under `OZZY_ARTIFACT_ROOT`.
+- To serve compressed endpoints, add `--features lz4-transport` or
+  `--features zstd-transport`.
+
 ## Start a single durable broker
 
-The sample binds loopback ports and stores data under `tmp/ozzy-single`.
+The sample [`container.toml`](ozzy-broker/container.toml) defines broker
+`laptop` on loopback ports and topic `orders`. This stores data under
+`tmp/ozzy-single`.
 
-```sh
+```bash
 ozzy_dir="$PWD/tmp/ozzy-single"
 mkdir -p "$ozzy_dir/data"
 sed "s|/ozzy/data|$ozzy_dir/data|" ozzy-broker/container.toml > "$ozzy_dir/deployment.toml"
@@ -34,29 +41,48 @@ ozzy serve --broker laptop --identity "$ozzy_dir/shared.identity" \
   --local-identity "$ozzy_dir/local.identity" --trusted-transport
 ```
 
-Provision once. Restart with `serve` and the same configuration and identities.
-Ctrl-C requests a drain of journals, sockets, and storage workers.
-`--trusted-transport` requires a trusted transport domain; client IDs do not
-authenticate clients.
+- Provision once. To restart, run only `serve` with the same configuration and
+  identity files.
+- Ctrl-C (SIGINT) or SIGTERM drains journals, sockets, and storage workers,
+  then exits.
+- `format` writes zeros over one segment file (`segment_bytes`) per
+  partition, so the samples write several GiB once.
 
-| Command | Creates or checks |
+## Commands
+
+`--config FILE` goes before the subcommand.
+
+| Command | What it does |
 | --- | --- |
-| `validate` | Configuration and local resource placement |
-| `init` | Shared deployment identity; distribute the same file to every broker |
-| `init-broker` | This broker's local store bindings |
-| `init-volumes` | Volume markers in existing device roots |
-| `format` | New partition journals |
-| `serve` | Opens existing stores and starts serving |
+| `validate` | Checks the configuration and this host's resources; writes nothing |
+| `init` | Creates the shared deployment identity; copy the same file to every broker |
+| `init-broker` | Creates this broker's local identity (store bindings) |
+| `init-volumes` | Binds existing device root directories to this broker |
+| `format` | Creates absent partition journals on this broker's shards |
+| `check` | Checks identities and placement; opens no stores |
+| `serve` | Opens existing stores and serves |
+| `recover` | Serves with selected partitions in nonvoting recovery |
 
-Initialization refuses existing state. `serve` refuses missing or damaged
-stores. Keep shared/local identities with the persistent data.
+| Flags | Commands |
+| --- | --- |
+| `--broker NAME` | All but `init` |
+| `--identity FILE` | All but `validate` |
+| `--local-identity FILE` | `init-broker`, `init-volumes`, `format`, `serve`, `recover`; optional for `check` |
+| `--trusted-transport` | Required for `serve` and `recover` |
+
+- Initialization refuses existing state.
+- `serve` refuses missing or damaged stores and never creates them.
+- Keep the shared and local identity files with the persistent data.
+- `--trusted-transport` states that the network is already trusted. Client IDs
+  are admission identities; they do not authenticate clients.
 
 ## Build and run a container
 
-Requires Podman. Build above with a Linux toolchain compatible with Debian 13.
-The image contains only the server; data lives in a persistent bind mount.
+Requires Podman. Build the binary first, with a toolchain compatible with
+Debian 13 (the image base). The image holds only the server; data lives in a
+bind mount.
 
-```sh
+```bash
 ozzy_image="$PWD/tmp/ozzy-image"
 ozzy_container_dir="$PWD/tmp/ozzy-container"
 mkdir -p "$ozzy_image" "$ozzy_container_dir/data"
@@ -78,18 +104,17 @@ ozzy_container serve --broker laptop --identity /ozzy/shared.identity \
   --local-identity /ozzy/local.identity --trusted-transport
 ```
 
-Restart with the last command. Host networking keeps the sample's loopback
-endpoints; `--userns keep-id` preserves bind-mount ownership.
+- To restart, run only the last command.
+- `--network host` keeps the sample's loopback endpoints.
+- `--userns keep-id` keeps bind-mount file ownership.
 
 ## Run three brokers
 
-[three.toml](ozzy-broker/three.toml) defines six partitions in disk-quorum mode,
-with distinct loopback endpoints. Edit endpoints and device roots for separate
-hosts. Use `replicated-persisting` confirmation for background persistence.
+The sample [`three.toml`](ozzy-broker/three.toml) defines `broker-0`,
+`broker-1`, and `broker-2` on loopback, and topic `orders` with six partitions
+in disk quorum mode. Provision once:
 
-Provision this local example once:
-
-```sh
+```bash
 ozzy_dir="$PWD/tmp/ozzy-three"
 mkdir -p "$ozzy_dir"/broker-{0,1,2}
 sed "s|/var/tmp/ozzy-three|$ozzy_dir|g" ozzy-broker/three.toml > "$ozzy_dir/deployment.toml"
@@ -103,36 +128,62 @@ for n in 0 1 2; do
 done
 ```
 
-Run one process per broker, selecting `broker-0`, `broker-1`, or `broker-2`:
+Run one process per broker. Repeat this for `broker-1` and `broker-2`:
 
-```sh
+```bash
 ozzy_three serve --broker broker-0 --identity "$ozzy_dir/shared.identity" \
   --local-identity "$ozzy_dir/broker-0.identity" --trusted-transport
 ```
 
-Each broker keeps its own local identity and stores. Two of three eligible
-copies are required for confirmation. Single durable has no failover.
+- Every broker needs its own `peer`, `data_peer`, `reader_pub`, and
+  `follower_pub` endpoint. For separate hosts, edit the endpoints and device
+  roots.
+- All brokers share one `shared.identity`. Each keeps its own local identity
+  and stores.
+- Writes confirm while two of the three brokers are up.
 
-## Recover a replicated partition
+## Watch a broker
 
-An unclean replicated-persisting restart may require explicit nonvoting recovery.
-Select each affected partition:
+`ozzy-tui` shows one broker's status and counters in the terminal. The samples
+give each broker an `admin` endpoint in the local IPC namespace, so run it on
+the broker's host:
 
-```sh
+```bash
+scripts/ozzy_cargo build --locked --release -p ozzy-ui
+ozzy-tui --config "$ozzy_dir/deployment.toml" --broker broker-0
+```
+
+Keys and screens: [ozzy-ui](ozzy-ui/README.md).
+
+## Recover a partition
+
+In three-broker mode, start a broker with `recover` instead of `serve` when one
+of its partition stores is lost or must stop voting.
+
+```bash
 ozzy_three recover --broker broker-0 --identity "$ozzy_dir/shared.identity" \
   --local-identity "$ozzy_dir/broker-0.identity" --trusted-transport \
   --quarantine orders/0
 ```
 
-| Flag | Required state |
+| Flag | Use when |
 | --- | --- |
-| `--replace TOPIC/PARTITION` | Absent partition directory |
-| `--quarantine TOPIC/PARTITION` | Established identity and authority metadata |
-| `--resume TOPIC/PARTITION` | Unfinished recovery marker; permits sealed-file repair |
-| `--resume-full TOPIC/PARTITION` | Unfinished recovery marker; forces full history transfer |
+| `--replace TOPIC/PARTITION` | The partition directory is absent, for example after a lost disk |
+| `--quarantine TOPIC/PARTITION` | The store exists but must lose its vote, for example after storage damage |
+| `--resume TOPIC/PARTITION` | An earlier recovery did not finish; allows sealed-file repair |
+| `--resume-full TOPIC/PARTITION` | An earlier recovery did not finish; forces a full history transfer |
 
-Repeat flags for multiple partitions. Selected partitions remain nonvoting
-until recovery completes. Restart completed stores with `serve`.
+- Repeat flags to select several partitions, each at most once.
+- Recovery needs both other brokers running.
+- Selected partitions stay nonvoting until recovery completes.
+- After recovery completes, restart with `serve`.
+- Single-broker partitions cannot recover.
 
-See [runtime configuration](doc/RUNTIME.md#deployment-configuration),
-[storage](doc/STORAGE.md), and [replication](doc/REPLICATION.md) for the contracts.
+## Next
+
+- [Configuration keys](ozzy-config/README.md): every key, its default, and the
+  validation rules.
+- [Deployment configuration](doc/RUNTIME.md#deployment-configuration): what
+  endpoints, limits, shards, and devices do at runtime.
+- [Storage](doc/STORAGE.md) and [replication](doc/REPLICATION.md): what
+  survives a crash and how recovery works.

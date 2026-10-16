@@ -4,11 +4,11 @@ use ozzy_proto::{Envelope, Opcode};
 use ozzy_proto::{LinkSessionId, NodeId, RequestId};
 
 use super::{
-    COMMON_BYTES, ControlEncoding, PrepareBatch, Reader, WireError, WireLimits, Writer,
-    validate_prefix, validate_scope,
+    COMMON_BYTES, ControlEncoding, Incoming, PrepareBatch, ReadFields, Reader, WireError,
+    WireLimits, WriteFields, Writer, validate_prefix, validate_scope,
 };
+use crate::OpNumber;
 use crate::flow::{Channel, ReceiveEpoch, Report};
-use crate::{OpNumber, Scope};
 
 pub use crate::flow::Probe as FlowProbe;
 
@@ -109,10 +109,10 @@ pub fn encode_flow_probe(
     if output.len() < PROBE_BYTES {
         return Err(WireError::Capacity);
     }
-    let mut writer = Writer::new(&mut output[..PROBE_BYTES]);
-    writer.scope(probe.scope, sender);
-    writer.prefix(probe.tail);
-    writer.u64(probe.available.0);
+    let mut writer = Writer::with_len(output, PROBE_BYTES)?;
+    writer.scope(probe.scope, sender)?;
+    writer.prefix(probe.tail)?;
+    writer.u64(probe.available.0)?;
     Ok(ControlEncoding {
         header,
         metadata_bytes: PROBE_BYTES,
@@ -140,16 +140,16 @@ pub fn encode_flow_state(
     if output.len() < STATE_BYTES {
         return Err(WireError::Capacity);
     }
-    let mut writer = Writer::new(&mut output[..STATE_BYTES]);
+    let mut writer = Writer::with_len(output, STATE_BYTES)?;
     let report = state.report;
-    writer.scope(report.channel.scope, sender);
-    writer.bytes(&report.channel.epoch.get().to_be_bytes());
-    writer.u64(report.revision);
-    writer.prefix(report.base);
-    writer.prefix(report.received);
-    writer.u64(report.received_bytes);
-    writer.u64(state.repair_limit.map_or(u64::MAX, |op| op.0));
-    writer.bytes(&state.handle.to_be_bytes());
+    writer.scope(report.channel.scope, sender)?;
+    writer.bytes(&report.channel.epoch.get().to_be_bytes())?;
+    writer.u64(report.revision)?;
+    writer.prefix(report.base)?;
+    writer.prefix(report.received)?;
+    writer.u64(report.received_bytes)?;
+    writer.u64(state.repair_limit.map_or(u64::MAX, |op| op.0))?;
+    writer.bytes(&state.handle.to_be_bytes())?;
     Ok(ControlEncoding {
         header,
         metadata_bytes: STATE_BYTES,
@@ -157,10 +157,12 @@ pub fn encode_flow_state(
 }
 
 pub(super) fn decode_probe(
-    scope: Scope,
-    envelope: Envelope,
-    mut reader: Reader<'_>,
-    payload: &[u8],
+    Incoming {
+        scope,
+        envelope,
+        mut reader,
+        payload,
+    }: Incoming<'_>,
 ) -> Result<FlowProbe, WireError> {
     if !payload.is_empty() {
         return Err(WireError::Payload);
@@ -180,10 +182,12 @@ pub(super) fn decode_probe(
 }
 
 pub(super) fn decode_state(
-    scope: Scope,
-    envelope: Envelope,
-    mut reader: Reader<'_>,
-    payload: &[u8],
+    Incoming {
+        scope,
+        envelope,
+        mut reader,
+        payload,
+    }: Incoming<'_>,
 ) -> Result<FlowState, WireError> {
     if !payload.is_empty() {
         return Err(WireError::Payload);
@@ -191,7 +195,7 @@ pub(super) fn decode_state(
     if envelope.response != envelope.request_id.is_some() {
         return Err(WireError::Correlation);
     }
-    let epoch = ReceiveEpoch::new(u128::from_be_bytes(reader.bytes()?))?;
+    let epoch = ReceiveEpoch::new(u128::from_be_bytes(reader.array()?))?;
     let state = FlowState {
         handle: 1,
         request_id: envelope.request_id,
@@ -229,6 +233,10 @@ pub fn flow_state_route(
         return Err(WireError::UnsupportedCommand);
     }
     let mut reader = Reader::new(packet.metadata);
-    let scope = reader.routing_scope(packet.envelope.sender)?;
-    decode_state(scope, packet.envelope, reader, packet.payload)
+    decode_state(Incoming {
+        scope: reader.routing_scope(packet.envelope.sender)?,
+        envelope: packet.envelope,
+        reader,
+        payload: packet.payload,
+    })
 }

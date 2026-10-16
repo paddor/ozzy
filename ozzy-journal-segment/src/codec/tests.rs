@@ -1,5 +1,10 @@
+use super::entry::parse_entry;
 use super::*;
-use ozzy_journal::operation::logical_operation_digest;
+use ozzy_journal::integrity::hash_without_digest;
+use ozzy_journal::operation::{
+    CanonicalOperation, OperationKind, canonical_body_digest, logical_operation_digest,
+};
+use ozzy_proto::GroupId;
 
 #[test]
 fn physical_incarnation_changes_source_digests_without_changing_logical_history() {
@@ -21,9 +26,7 @@ fn physical_incarnation_changes_source_digests_without_changing_logical_history(
     let encode = |header| {
         encode_group(
             header,
-            1,
-            SEGMENT_HEADER_BYTES as u64,
-            ChainPosition::GENESIS,
+            crate::GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS),
             &[operation],
         )
         .unwrap()
@@ -51,8 +54,11 @@ fn segment_header_rejects_reserved_bytes_even_with_valid_checksum() {
     ] {
         let mut bytes = encode_segment_header(&header);
         bytes[offset] = 1;
-        let digest =
-            hash_with_zeroed_range(SEGMENT_HEADER_HASH_CONTEXT, &bytes, SEGMENT_DIGEST_RANGE);
+        let digest = hash_without_digest(
+            SEGMENT_HEADER_HASH_CONTEXT,
+            &bytes,
+            SEGMENT_DIGEST_RANGE.start,
+        );
         bytes[SEGMENT_DIGEST_RANGE].copy_from_slice(digest.as_bytes());
         assert!(matches!(
             decode_segment_header(&bytes),
@@ -75,15 +81,13 @@ fn entry_rejects_unsupported_codecs_and_reserved_fields() {
     };
     let group = encode_group(
         &header,
-        1,
-        SEGMENT_HEADER_BYTES as u64,
-        ChainPosition::GENESIS,
+        crate::GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS),
         &[operation],
     )
     .unwrap();
     for codec in [2, 3, u16::MAX] {
         let mut bytes = group.as_bytes().to_vec();
-        put_u16(&mut bytes, 176, codec);
+        ozzy_proto::layout::patch(&mut bytes, 176, codec.to_be_bytes()).unwrap();
         assert!(matches!(
             parse_entry(&bytes, 0, DecodeLimits::default()),
             Err(CodecError::UnsupportedCodec(actual)) if actual == codec
@@ -133,9 +137,7 @@ fn raw_extents_match_contiguous_encoding_without_copying_bodies() {
         .collect();
     let expected = encode_group(
         &segment,
-        1,
-        SEGMENT_HEADER_BYTES as u64,
-        ChainPosition::GENESIS,
+        crate::GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS),
         &operations,
     )
     .unwrap();
@@ -147,9 +149,14 @@ fn raw_extents_match_contiguous_encoding_without_copying_bodies() {
         let layouts = prepared.entry_layouts(SEGMENT_HEADER_BYTES as u64).unwrap();
         let finalized = finalize_group_bodies(
             &segment,
-            1,
-            SEGMENT_HEADER_BYTES as u64,
-            ChainPosition::GENESIS,
+            crate::codec::GroupWrite {
+                start: crate::GroupStart::new(
+                    1,
+                    SEGMENT_HEADER_BYTES as u64,
+                    ChainPosition::GENESIS,
+                ),
+                durable_through: 0,
+            },
             &operations,
             &digests,
             &mut prepared,
@@ -164,9 +171,7 @@ fn raw_extents_match_contiguous_encoding_without_copying_bodies() {
         assert_eq!(chunks.concat(), expected.as_bytes());
         let decoded = decode_group(
             &segment,
-            1,
-            SEGMENT_HEADER_BYTES as u64,
-            ChainPosition::GENESIS,
+            crate::GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS),
             expected.as_bytes(),
             DecodeLimits::default(),
         )
@@ -218,9 +223,14 @@ fn lz4_requires_matching_canonical_body_digest() {
         // accepted under the original canonical body/operation/structural seal.
         let finalized = finalize_group_bodies(
             &segment,
-            1,
-            SEGMENT_HEADER_BYTES as u64,
-            ChainPosition::GENESIS,
+            crate::codec::GroupWrite {
+                start: crate::GroupStart::new(
+                    1,
+                    SEGMENT_HEADER_BYTES as u64,
+                    ChainPosition::GENESIS,
+                ),
+                durable_through: 0,
+            },
             &[operation],
             &[body_digest],
             &mut prepared,
@@ -229,9 +239,7 @@ fn lz4_requires_matching_canonical_body_digest() {
         let encoded = prepared.finish(finalized);
         let decoded = decode_group(
             &segment,
-            1,
-            SEGMENT_HEADER_BYTES as u64,
-            ChainPosition::GENESIS,
+            crate::GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS),
             encoded.as_bytes(),
             DecodeLimits::default(),
         );

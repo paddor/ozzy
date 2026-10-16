@@ -16,14 +16,18 @@ use ozzy_replication::{
 
 mod actor;
 mod cooperation;
+mod dedup;
 mod faults;
+mod identities;
 mod native;
 mod partition;
+mod producer_dedup;
 mod producer_session;
+mod progress;
 mod retention;
 
 fn local_config() -> OwnedConfig<Configuration> {
-    let base = config("/local", 7, QuorumPolicy::Durable);
+    let base = config("/local", 7);
     OwnedConfig {
         configuration: Configuration::new(
             base.identity.group_id,
@@ -36,6 +40,7 @@ fn local_config() -> OwnedConfig<Configuration> {
         identity: base.identity,
         limits: base.limits,
         recovery: base.recovery,
+        deduplication: base.deduplication,
         append_buffers: base.append_buffers,
         append_limits: base.append_limits,
         writeback: base.writeback,
@@ -143,6 +148,10 @@ fn initialize_partition(
         topic: "orders",
         partition_id: number,
         owner_epoch: OwnerEpoch::INITIAL,
+        dedup_window_millis: journal
+            .dedup
+            .limits
+            .and_then(|limits| std::num::NonZeroU64::new(limits.window_millis)),
         retention: RetentionPolicy::default(),
     });
     buffer
@@ -287,7 +296,7 @@ fn local_power_loss_restart_preserves_shared_writer_offsets_and_exact_retries() 
 #[test]
 fn local_open_rejects_group_configuration_and_changed_identity() {
     let (mut controller, io) = setup();
-    let base = config("/local", 7, QuorumPolicy::Durable);
+    let base = config("/local", 7);
     let (journal, _) = drive(
         &mut controller,
         OwnedJournal::format_new(base, io.clone(), JournalGeneration(1), 32768),

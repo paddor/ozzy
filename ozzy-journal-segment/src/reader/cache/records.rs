@@ -3,6 +3,7 @@
 
 use super::{AppendBatchView, IndexedReadError, MessageId, Range};
 use ozzy_proto::data::Encoding;
+use ozzy_proto::layout::{self, Reader};
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct RecordStart {
@@ -46,13 +47,19 @@ impl CachedRecords {
             descriptor,
             payload,
         };
-        let mut starts = Vec::with_capacity(batch.summary.record_count + 1);
-        let mut parts = 0;
+        let mut starts = Vec::with_capacity(batch.summary.record_count.saturating_add(1));
+        let mut parts = 0_usize;
         for record in batch.descriptors() {
             starts.push(next);
             let count = record.part_lengths.len();
-            next.descriptor += 20 + record.encoding.metadata_bytes() + count * 4;
-            parts += count;
+            next.descriptor = count
+                .checked_mul(4)
+                .and_then(|lengths| lengths.checked_add(record.encoding.head_bytes()))
+                .and_then(|bytes| next.descriptor.checked_add(bytes))
+                .ok_or(IndexedReadError::InvalidSelector)?;
+            parts = parts
+                .checked_add(count)
+                .ok_or(IndexedReadError::InvalidSelector)?;
             for length in record.part_lengths {
                 next.payload = next
                     .payload
@@ -104,6 +111,16 @@ impl CachedRecords {
         }
     }
 
+    /// The record at `index`, which callers bound by the cached record count.
+    #[expect(
+        clippy::expect_used,
+        reason = "the table was validated when cached and the index is in range"
+    )]
+    #[inline]
+    pub(super) fn record<'a>(&'a self, index: usize, body: &'a [u8]) -> RecordRef<'a> {
+        self.get(index, body).expect("cached record in range")
+    }
+
     #[inline]
     pub(super) fn get<'a>(&'a self, index: usize, body: &'a [u8]) -> Option<RecordRef<'a>> {
         match self {
@@ -120,30 +137,28 @@ impl CachedRecords {
                 let payload = payload + index * record_bytes;
                 Some(RecordRef {
                     encoding: Encoding::Raw,
-                    message_id: MessageId::from_bytes(
-                        body[descriptor..descriptor + 16].try_into().unwrap(),
-                    ),
+                    message_id: MessageId::from_bytes(*layout::record(body, descriptor).ok()?),
                     parts: Parts::Single(payload..payload + record_bytes),
                 })
             }
             Self::General { starts, .. } => {
                 let start = starts.get(index)?;
                 let end = starts.get(index + 1)?;
-                let descriptor = &body[start.descriptor..end.descriptor];
-                let encoding = match u32_at(descriptor, 16) >> 24 {
+                // The table was validated, so no read below fails.
+                let mut descriptor = Reader::new(body.get(start.descriptor..end.descriptor)?);
+                let message_id = MessageId::from_bytes(descriptor.array().ok()?);
+                let encoding = match descriptor.u32().ok()? >> 24 {
                     0 => Encoding::Raw,
                     1 => Encoding::Lz4 {
-                        decoded_bytes: u32_at(descriptor, 20),
+                        decoded_bytes: descriptor.u32().ok()?,
                     },
-                    _ => unreachable!("validated encoding"),
+                    _ => return None,
                 };
                 Some(RecordRef {
                     encoding,
-                    message_id: MessageId::from_bytes(descriptor[..16].try_into().unwrap()),
+                    message_id,
                     parts: Parts::Encoded {
-                        lengths: descriptor[20 + encoding.metadata_bytes()..]
-                            .as_chunks::<4>()
-                            .0,
+                        lengths: descriptor.rest().as_chunks::<4>().0,
                         payload: start.payload..end.payload,
                     },
                 })
@@ -151,7 +166,7 @@ impl CachedRecords {
             Self::Packed { ids, offsets } => Some(RecordRef {
                 encoding: Encoding::Raw,
                 message_id: *ids.get(index)?,
-                parts: Parts::Single(offsets[index]..offsets[index + 1]),
+                parts: Parts::Single(*offsets.get(index)?..*offsets.get(index + 1)?),
             }),
         }
     }
@@ -165,10 +180,6 @@ impl CachedRecords {
             Self::General { starts, .. } => starts.capacity() * size_of::<RecordStart>(),
         }
     }
-}
-
-fn u32_at(bytes: &[u8], at: usize) -> u32 {
-    u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap())
 }
 
 #[derive(Debug)]
@@ -221,7 +232,9 @@ impl Iterator for PartRanges<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.single.take().or_else(|| {
-            let end = self.start + u32::from_be_bytes(*self.lengths.next()?) as usize;
+            let end = self
+                .start
+                .checked_add(u32::from_be_bytes(*self.lengths.next()?) as usize)?;
             let range = self.start..end;
             self.start = end;
             Some(range)

@@ -1,18 +1,31 @@
 //! Shared bounded data-command fields and multipart records.
 
 use super::{Envelope, EnvelopeError, EnvelopeLimits, Opcode};
-use crate::{GroupId, MessageId};
+use crate::{
+    GroupId, MessageId,
+    layout::{LayoutError, Reader},
+};
 
 mod batch;
+mod descriptors;
 mod encoding;
+mod records;
 pub use encoding::Encoding;
 mod buffer;
 pub use batch::{BatchIter, BatchRecord, PayloadRef, RecordBatch, TinyRecords};
 mod indexed;
 mod owned;
+mod payload;
 pub use buffer::RecordBuffer;
+pub(super) use descriptors::validate_raw_record_entries;
+pub use descriptors::{
+    RecordDescriptor, RecordDescriptorIter, RecordDescriptors, decode_record_descriptors,
+};
 pub use indexed::{EncodedParts, IndexedRecords};
 pub use owned::{OwnedRecord, OwnedRecordIter, OwnedRecords};
+pub use payload::RecordPayload;
+pub(super) use records::validate_record_entries;
+pub use records::{DecodedRecord, Parts, RecordIter, Records, decode_records};
 
 /// Group membership and primary generation, not proof of serving authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,51 +139,6 @@ pub struct Record<'a> {
     pub parts: &'a [&'a [u8]],
 }
 
-/// Validated record collection with no allocated descriptor table.
-#[derive(Debug, Clone, Copy)]
-pub struct Records<'a> {
-    descriptors: &'a [u8],
-    payload: &'a [u8],
-    count: usize,
-    /// Totals the validating walk already computed, when this view came
-    /// straight from it. Derived views compute them on demand.
-    summary: Option<RecordSummary>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct RecordSummary {
-    parts: usize,
-    nonzero_message_ids: bool,
-}
-
-/// Validated raw-record descriptors without materializing their payload.
-#[derive(Debug, Clone, Copy)]
-pub struct RecordDescriptors<'a> {
-    framed: &'a [u8],
-    descriptors: &'a [u8],
-    count: usize,
-    payload_bytes: usize,
-    parts: usize,
-    nonzero_message_ids: bool,
-    uniform_part_bytes: Option<u32>,
-}
-
-/// One raw record descriptor and its original multipart lengths.
-#[derive(Debug, Clone, Copy)]
-pub struct RecordDescriptor<'a> {
-    /// Stable record identity.
-    pub message_id: MessageId,
-    /// Original multipart payload lengths in network byte order.
-    pub part_lengths: &'a [[u8; 4]],
-}
-
-/// Iterator over validated raw record descriptors.
-#[derive(Debug, Clone)]
-pub struct RecordDescriptorIter<'a> {
-    descriptors: Cursor<'a>,
-    remaining: usize,
-}
-
 pub(super) fn records_size(
     records: &[Record<'_>],
     first: u64,
@@ -199,9 +167,9 @@ where
     let mut payload = 0_usize;
     let mut parts = 0_usize;
     for (_, encoding, record) in records {
-        metadata = add(metadata, 20 + encoding.metadata_bytes())?;
-        let before = parts;
-        let payload_before = payload;
+        metadata = add(metadata, encoding.head_bytes())?;
+        let mut record_parts = 0_usize;
+        let mut record_bytes = 0_usize;
         for part in record {
             if encoding
                 .frame_offset(part, limits.max_parts, limits.max_record_bytes)
@@ -210,6 +178,7 @@ where
                 return Err(CodecError::Length);
             }
             parts = add(parts, 1)?;
+            record_parts = add(record_parts, 1)?;
             count(parts)?;
             if parts > limits.max_parts {
                 return Err(CodecError::Limit);
@@ -217,11 +186,12 @@ where
             metadata = add(metadata, 4)?;
             count(part.len())?;
             payload = add(payload, part.len())?;
-            if payload - payload_before > limits.max_record_bytes {
+            record_bytes = add(record_bytes, part.len())?;
+            if record_bytes > limits.max_record_bytes {
                 return Err(CodecError::Limit);
             }
         }
-        if !encoding.validate(parts - before, limits.max_parts, limits.max_record_bytes) {
+        if !encoding.validate(record_parts, limits.max_parts, limits.max_record_bytes) {
             return Err(CodecError::Parts);
         }
     }
@@ -262,6 +232,10 @@ where
 }
 
 /// Append validated entries without a new collection count.
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "callers validated each part count against max_parts, a u32"
+)]
 pub(super) fn write_record_entries<'a, I, P>(
     records: I,
     metadata: &mut Vec<u8>,
@@ -285,421 +259,8 @@ pub(super) fn write_record_entries<'a, I, P>(
                 payload.extend_from_slice(part);
             }
         }
-        metadata[count_at..count_at + 4].copy_from_slice(&(count | encoding.tag()).to_be_bytes());
-    }
-}
-
-/// Validate a counted record descriptor table against the exact payload it
-/// covers. The first sequence bounds the collection's position range.
-pub fn decode_records<'a>(
-    metadata: &'a [u8],
-    payload: &'a [u8],
-    first: u64,
-    limits: DataLimits,
-) -> Result<Records<'a>, CodecError> {
-    let mut cursor = Cursor(metadata);
-    let count = cursor.u32()? as usize;
-    let (parts, nonzero_message_ids) =
-        validate_record_entries(cursor.0, payload, count, first, limits)?;
-    Ok(Records {
-        descriptors: cursor.0,
-        payload,
-        count,
-        summary: Some(RecordSummary {
-            parts,
-            nonzero_message_ids,
-        }),
-    })
-}
-
-/// Validate APPEND record metadata against its declared decoded payload length.
-/// Every record must use raw per-record encoding; whole-APPEND compression is
-/// represented separately by the command payload encoding.
-pub fn decode_record_descriptors(
-    metadata: &[u8],
-    payload_bytes: usize,
-    first: u64,
-    limits: DataLimits,
-) -> Result<RecordDescriptors<'_>, CodecError> {
-    let mut cursor = Cursor(metadata);
-    let count = cursor.u32()? as usize;
-    let entries = validate_raw_record_entries(cursor.0, count, payload_bytes, first, limits)?;
-    Ok(RecordDescriptors {
-        framed: metadata,
-        descriptors: entries.descriptors,
-        count,
-        payload_bytes,
-        parts: entries.parts,
-        nonzero_message_ids: entries.nonzero_message_ids,
-        uniform_part_bytes: entries.uniform_part_bytes,
-    })
-}
-
-pub(super) struct RawRecordEntries<'a> {
-    pub(super) parts: usize,
-    pub(super) descriptors: &'a [u8],
-    pub(super) nonzero_message_ids: bool,
-    pub(super) uniform_part_bytes: Option<u32>,
-}
-
-pub(super) fn validate_raw_record_entries(
-    descriptors: &[u8],
-    count: usize,
-    payload_bytes: usize,
-    first: u64,
-    limits: DataLimits,
-) -> Result<RawRecordEntries<'_>, CodecError> {
-    record_count(count, first, limits)?;
-    if payload_bytes > limits.envelope.max_payload_bytes {
-        return Err(CodecError::Limit);
-    }
-    let mut cursor = Cursor(descriptors);
-    let mut decoded = 0_usize;
-    let mut total_parts = 0_usize;
-    let mut nonzero_message_ids = true;
-    let mut uniform_part_bytes = None;
-    for index in 0..count {
-        let before = decoded;
-        nonzero_message_ids &= cursor.take(16)? != [0; 16];
-        let (parts, encoding) = descriptor(&mut cursor)?;
-        if encoding != Encoding::Raw {
-            return Err(CodecError::Profile);
-        }
-        if parts == 0 {
-            return Err(CodecError::Parts);
-        }
-        total_parts = add(total_parts, parts)?;
-        if total_parts > limits.max_parts {
-            return Err(CodecError::Limit);
-        }
-        let lengths = cursor.take(parts.checked_mul(4).ok_or(CodecError::Length)?)?;
-        let single = (parts == 1).then(|| u32::from_be_bytes(lengths.try_into().unwrap()));
-        if index == 0 {
-            uniform_part_bytes = single;
-        } else if uniform_part_bytes != single {
-            uniform_part_bytes = None;
-        }
-        for length in lengths.as_chunks::<4>().0 {
-            decoded = add(decoded, u32::from_be_bytes(*length) as usize)?;
-            if decoded > payload_bytes {
-                return Err(CodecError::Length);
-            }
-            if decoded - before > limits.max_record_bytes {
-                return Err(CodecError::Limit);
-            }
-        }
-    }
-    if !cursor.0.is_empty() || decoded != payload_bytes {
-        return Err(CodecError::Length);
-    }
-    Ok(RawRecordEntries {
-        parts: total_parts,
-        descriptors,
-        nonzero_message_ids,
-        uniform_part_bytes,
-    })
-}
-
-impl<'a> RecordDescriptors<'a> {
-    /// Collection count followed by exact record descriptor bytes.
-    pub const fn framed(self) -> &'a [u8] {
-        self.framed
-    }
-
-    /// Exact descriptor bytes without the collection count.
-    pub const fn encoded(self) -> &'a [u8] {
-        self.descriptors
-    }
-
-    /// Number of records.
-    pub const fn len(self) -> usize {
-        self.count
-    }
-
-    /// Whether the collection has no records.
-    pub const fn is_empty(self) -> bool {
-        self.count == 0
-    }
-
-    /// Total decoded application payload bytes.
-    pub const fn payload_bytes(self) -> usize {
-        self.payload_bytes
-    }
-
-    /// Total number of multipart payload parts.
-    pub const fn parts(self) -> usize {
-        self.parts
-    }
-
-    /// Whether every record carries a nonzero retry identity.
-    pub const fn nonzero_message_ids(self) -> bool {
-        self.nonzero_message_ids
-    }
-
-    /// Part length when every record has exactly one part of that length.
-    /// Computed during validation, including zero-length parts.
-    pub const fn uniform_part_bytes(self) -> Option<u32> {
-        self.uniform_part_bytes
-    }
-
-    /// Iterate over record identities and multipart lengths.
-    pub fn iter(self) -> RecordDescriptorIter<'a> {
-        RecordDescriptorIter {
-            descriptors: Cursor(self.descriptors),
-            remaining: self.count,
-        }
-    }
-}
-
-impl<'a> Iterator for RecordDescriptorIter<'a> {
-    type Item = RecordDescriptor<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 {
-            return None;
-        }
-        let message_id = MessageId::from_bytes(
-            self.descriptors
-                .array()
-                .expect("validated record descriptor"),
-        );
-        let (parts, encoding) =
-            descriptor(&mut self.descriptors).expect("validated record descriptor");
-        debug_assert_eq!(encoding, Encoding::Raw);
-        let lengths = self
-            .descriptors
-            .take(parts * 4)
-            .expect("validated record lengths")
-            .as_chunks::<4>()
-            .0;
-        self.remaining -= 1;
-        Some(RecordDescriptor {
-            message_id,
-            part_lengths: lengths,
-        })
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining, Some(self.remaining))
-    }
-}
-
-impl ExactSizeIterator for RecordDescriptorIter<'_> {}
-impl std::iter::FusedIterator for RecordDescriptorIter<'_> {}
-
-/// Validate a descriptor table without its collection count. Returns the
-/// total part count and whether every record identity is nonzero.
-pub(super) fn validate_record_entries(
-    descriptors: &[u8],
-    payload: &[u8],
-    count: usize,
-    first: u64,
-    limits: DataLimits,
-) -> Result<(usize, bool), CodecError> {
-    record_count(count, first, limits)?;
-    let mut cursor = Cursor(descriptors);
-    let mut payload_bytes = 0_usize;
-    let mut total_parts = 0_usize;
-    let mut nonzero_message_ids = true;
-    for _ in 0..count {
-        let payload_before = payload_bytes;
-        nonzero_message_ids &= cursor.take(16)? != [0; 16];
-        let (parts, encoding) = descriptor(&mut cursor)?;
-        if !encoding.validate(parts, limits.max_parts, limits.max_record_bytes) {
-            return Err(CodecError::Limit);
-        }
-        if parts == 0 {
-            return Err(CodecError::Parts);
-        }
-        total_parts = add(total_parts, parts)?;
-        if total_parts > limits.max_parts {
-            return Err(CodecError::Limit);
-        }
-        let lengths = cursor.take(parts.checked_mul(4).ok_or(CodecError::Length)?)?;
-        for length in lengths.as_chunks::<4>().0 {
-            payload_bytes = add(payload_bytes, u32::from_be_bytes(*length) as usize)?;
-            if payload_bytes > payload.len() {
-                return Err(CodecError::Length);
-            }
-            if payload_bytes - payload_before > limits.max_record_bytes {
-                return Err(CodecError::Limit);
-            }
-        }
-        if encoding
-            .frame_offset(
-                &payload[payload_before..payload_bytes],
-                limits.max_parts,
-                limits.max_record_bytes,
-            )
-            .is_none()
-        {
-            return Err(CodecError::Length);
-        }
-    }
-    if !cursor.0.is_empty() || payload_bytes != payload.len() {
-        return Err(CodecError::Length);
-    }
-    Ok((total_parts, nonzero_message_ids))
-}
-
-impl<'a> Records<'a> {
-    /// Validated descriptor and payload spans, without the collection count.
-    pub const fn encoded(self) -> (&'a [u8], &'a [u8]) {
-        (self.descriptors, self.payload)
-    }
-
-    /// Total multipart parts across every record, including empty parts.
-    pub fn parts(self) -> usize {
-        match self.summary {
-            Some(summary) => summary.parts,
-            None => self.iter().map(|record| record.parts.len()).sum(),
-        }
-    }
-
-    /// Whether every record carries a nonzero retry identity.
-    pub fn nonzero_message_ids(self) -> bool {
-        match self.summary {
-            Some(summary) => summary.nonzero_message_ids,
-            None => self
-                .iter()
-                .all(|record| record.message_id.as_bytes() != &[0; 16]),
-        }
-    }
-    /// Exact validated descriptor bytes, excluding the collection count.
-    pub const fn descriptor_bytes(self) -> usize {
-        self.descriptors.len()
-    }
-
-    /// Total opaque application bytes, excluding metadata and routing.
-    pub const fn payload_bytes(self) -> usize {
-        self.payload.len()
-    }
-
-    /// Number of records, checked against the receive limit.
-    pub const fn len(self) -> usize {
-        self.count
-    }
-
-    /// Whether this collection contains no records.
-    pub const fn is_empty(self) -> bool {
-        self.count == 0
-    }
-
-    /// The records after the first `count`, without copying or revalidation.
-    /// A reader uses this when part of a shared batch was already delivered.
-    #[must_use]
-    pub fn skip(self, count: usize) -> Self {
-        let mut iter = self.iter();
-        let skipped = iter.by_ref().take(count).count();
-        Self {
-            descriptors: iter.descriptors.0,
-            payload: iter.payload,
-            count: self.count - skipped,
-            summary: None,
-        }
-    }
-
-    /// Iterate over validated records without copying payloads or allocating.
-    pub fn iter(self) -> RecordIter<'a> {
-        RecordIter {
-            descriptors: Cursor(self.descriptors),
-            payload: self.payload,
-            remaining: self.count,
-        }
-    }
-}
-
-/// One decoded record with an independent iterator over its borrowed parts.
-#[derive(Debug, Clone)]
-pub struct DecodedRecord<'a> {
-    /// Payload representation.
-    pub encoding: Encoding,
-    /// Stable record identity.
-    pub message_id: MessageId,
-    /// Ordered parts, including empty ones.
-    pub parts: Parts<'a>,
-}
-
-/// Iterator over a previously validated collection.
-#[derive(Debug, Clone)]
-pub struct RecordIter<'a> {
-    descriptors: Cursor<'a>,
-    payload: &'a [u8],
-    remaining: usize,
-}
-
-impl<'a> Iterator for RecordIter<'a> {
-    type Item = DecodedRecord<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 {
-            return None;
-        }
-        let message_id =
-            MessageId::from_bytes(self.descriptors.array().expect("validated record ID"));
-        let (count, encoding) = descriptor(&mut self.descriptors).expect("validated descriptor");
-        let lengths = self
-            .descriptors
-            .take(count * 4)
-            .expect("validated part lengths");
-        let bytes = lengths
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|part| u32::from_be_bytes(*part) as usize)
-            .sum();
-        let (payload, rest) = self.payload.split_at(bytes);
-        self.payload = rest;
-        self.remaining -= 1;
-        Some(DecodedRecord {
-            encoding,
-            message_id,
-            parts: Parts {
-                lengths: lengths.as_chunks::<4>().0.iter(),
-                payload,
-            },
-        })
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining, Some(self.remaining))
-    }
-}
-
-impl ExactSizeIterator for RecordIter<'_> {}
-impl std::iter::FusedIterator for RecordIter<'_> {}
-
-/// Borrowed multipart iterator. Dropping it cannot disturb the next record.
-#[derive(Debug, Clone)]
-pub struct Parts<'a> {
-    lengths: std::slice::Iter<'a, [u8; 4]>,
-    payload: &'a [u8],
-}
-
-impl<'a> Iterator for Parts<'a> {
-    type Item = &'a [u8];
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let length = u32::from_be_bytes(*self.lengths.next()?) as usize;
-        let (part, rest) = self.payload.split_at(length);
-        self.payload = rest;
-        Some(part)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.lengths.size_hint()
-    }
-}
-
-impl ExactSizeIterator for Parts<'_> {}
-impl std::iter::FusedIterator for Parts<'_> {}
-
-impl DoubleEndedIterator for Parts<'_> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        let length = u32::from_be_bytes(*self.lengths.next_back()?) as usize;
-        let (rest, part) = self.payload.split_at(self.payload.len() - length);
-        self.payload = rest;
-        Some(part)
+        // The placeholder above is in bounds, so this cannot fail.
+        let _ = crate::layout::patch(metadata, count_at, (count | encoding.tag()).to_be_bytes());
     }
 }
 
@@ -731,6 +292,10 @@ pub(super) fn record_count(
 pub(super) fn add(left: usize, right: usize) -> Result<usize, CodecError> {
     left.checked_add(right).ok_or(CodecError::Length)
 }
+/// Checked total of encoded field sizes.
+pub(super) fn sum(terms: &[usize]) -> Result<usize, CodecError> {
+    terms.iter().try_fold(0, |total, &term| add(total, term))
+}
 pub(super) fn count(value: usize) -> Result<u32, CodecError> {
     u32::try_from(value).map_err(|_| CodecError::Length)
 }
@@ -739,29 +304,6 @@ pub(super) fn capacity(buffer: &Vec<u8>, length: usize) -> Result<(), CodecError
         return Err(CodecError::Capacity);
     }
     Ok(())
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct Cursor<'a>(pub(super) &'a [u8]);
-
-impl<'a> Cursor<'a> {
-    pub(super) fn take(&mut self, count: usize) -> Result<&'a [u8], CodecError> {
-        let (bytes, rest) = self.0.split_at_checked(count).ok_or(CodecError::Length)?;
-        self.0 = rest;
-        Ok(bytes)
-    }
-    pub(super) fn array<const N: usize>(&mut self) -> Result<[u8; N], CodecError> {
-        Ok(self.take(N)?.try_into().expect("checked field"))
-    }
-    pub(super) fn byte(&mut self) -> Result<u8, CodecError> {
-        Ok(self.array::<1>()?[0])
-    }
-    pub(super) fn u32(&mut self) -> Result<u32, CodecError> {
-        Ok(u32::from_be_bytes(self.array()?))
-    }
-    pub(super) fn u64(&mut self) -> Result<u64, CodecError> {
-        Ok(u64::from_be_bytes(self.array()?))
-    }
 }
 
 /// Structural rejection. No error establishes whether an earlier retry committed.
@@ -799,7 +341,13 @@ pub enum CodecError {
     Profile,
 }
 
-fn descriptor(cursor: &mut Cursor<'_>) -> Result<(usize, Encoding), CodecError> {
+impl From<LayoutError> for CodecError {
+    fn from(_: LayoutError) -> Self {
+        Self::Length
+    }
+}
+
+fn descriptor(cursor: &mut Reader<'_>) -> Result<(usize, Encoding), CodecError> {
     let tagged = cursor.u32()?;
     let encoding = match tagged >> 24 {
         0 => Encoding::Raw,

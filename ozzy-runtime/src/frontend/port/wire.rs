@@ -1,14 +1,15 @@
 //! Private commands carry bytes, never typed Rust values or pointers.
 
 use super::retention::{QueueSlot, Retention};
-use super::{Command, PortError, ReplyError, RouteError, RouteState, ServiceError};
+use super::{PortError, ReplyError, RouteError, RouteState, ServiceError};
 use crate::dispatch::Class;
 use crate::frontend::PublicationError;
 use bytes::Bytes;
 use omq_tokio::{Message, message::Payload};
+use ozzy_proto::layout::Fixed;
 use ozzy_proto::{Envelope, EnvelopeLimits, LinkSessionId, Opcode, RequestId, directory};
 
-const HEADER_BYTES: usize = 26;
+const HEADER_BYTES: usize = 34;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct Key {
@@ -42,7 +43,8 @@ impl Status {
 }
 
 pub(super) enum Action {
-    Reply(Class, Message),
+    /// A reply with its shard's per-destination send sequence.
+    Reply(Class, Message, u64),
     Publication(Message),
     Route(RouteState),
 }
@@ -62,10 +64,34 @@ impl AsRef<[u8]> for Header {
     }
 }
 
+/// Command content. Borrowed parts stay with the caller until queueing succeeds.
+#[derive(Debug)]
+pub(super) enum Body<'a> {
+    Reply {
+        message: &'a Message,
+        /// The shard's per-destination send sequence; the dispatcher admits
+        /// one destination's replies in this order.
+        sequence: u64,
+    },
+    Publication(&'a Message),
+    /// Route observation already encoded by [`route_message`].
+    Route(Message),
+}
+
+impl Body<'_> {
+    const fn kind(&self) -> u8 {
+        match self {
+            Self::Reply { .. } => 0,
+            Self::Publication(_) => 1,
+            Self::Route(_) => 2,
+        }
+    }
+}
+
 pub(super) fn command(
     key: Key,
     class: Class,
-    command: &Command,
+    command: Body<'_>,
     slot: QueueSlot,
     retention: &Retention,
 ) -> Message {
@@ -74,11 +100,14 @@ pub(super) fn command(
     header[16..24].copy_from_slice(&key.id.to_be_bytes());
     header[24] = command.kind();
     header[25] = u8::from(class == Class::Control);
+    if let Body::Reply { sequence, .. } = command {
+        header[26..34].copy_from_slice(&sequence.to_be_bytes());
+    }
     let mut body = match command {
-        Command::Reply { message, .. } | Command::Publication { message, .. } => {
+        Body::Reply { message, .. } | Body::Publication(message) => {
             retention.message(message.clone())
         }
-        Command::Route { route, .. } => route_message(route),
+        Body::Route(message) => message,
     };
     let header = Payload::from_bytes_with_retained_size(
         Bytes::from_owner(Header {
@@ -107,8 +136,8 @@ pub(super) fn decode(
         .try_into()
         .map_err(|_| PortError::Frames)?;
     let key = Key {
-        generation: RequestId::from_bytes(bytes[..16].try_into().unwrap()),
-        id: u64::from_be_bytes(bytes[16..24].try_into().unwrap()),
+        generation: RequestId::from_bytes(bytes.array::<0, 16>()),
+        id: bytes.u64_at::<16>(),
     };
     if key.generation != generation
         || key.id == 0
@@ -121,7 +150,7 @@ pub(super) fn decode(
         return Err(PortError::Frames);
     }
     let action = match bytes[24] {
-        0 if matches!(message.len(), 2 | 4) => Action::Reply(class, message),
+        0 if matches!(message.len(), 2 | 4) => Action::Reply(class, message, bytes.u64_at::<26>()),
         1 if message.len() == 4 => Action::Publication(message),
         2 => Action::Route(decode_route(&message)?),
         _ => return Err(PortError::Frames),
@@ -133,7 +162,8 @@ pub(super) fn decode(
     })
 }
 
-fn route_message(route: &RouteState) -> Message {
+/// Encode a valid route observation; `None` when it cannot be encoded.
+pub(super) fn route_message(route: &RouteState) -> Option<Message> {
     let limits = EnvelopeLimits {
         max_metadata_bytes: 1024,
         max_payload_bytes: 0,
@@ -144,7 +174,7 @@ fn route_message(route: &RouteState) -> Message {
             opcode: Opcode::StateUpdate,
             response: false,
             request_id: None,
-            sender: route.members[0],
+            sender: *route.members.first()?,
             session: Some(LinkSessionId::from_bytes([1; 16])),
         },
         &directory::Update {
@@ -155,12 +185,12 @@ fn route_message(route: &RouteState) -> Message {
         limits,
         directory::Limits::default(),
     )
-    .expect("validated route");
-    Message::multipart([
+    .ok()?;
+    Some(Message::multipart([
         Bytes::copy_from_slice(&header),
         Bytes::from(metadata),
         Bytes::new(),
-    ])
+    ]))
 }
 
 fn decode_route(message: &Message) -> Result<RouteState, PortError> {
@@ -222,8 +252,8 @@ pub(super) fn decode_completion(message: &Message) -> Result<(Key, Status), Port
         .try_into()
         .map_err(|_| PortError::Frames)?;
     let key = Key {
-        generation: RequestId::from_bytes(bytes[..16].try_into().unwrap()),
-        id: u64::from_be_bytes(bytes[16..24].try_into().unwrap()),
+        generation: RequestId::from_bytes(bytes.array::<0, 16>()),
+        id: bytes.u64_at::<16>(),
     };
     let status = match (bytes[24], bytes[25]) {
         (0, 0) => Status::Reply(Ok(())),

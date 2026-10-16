@@ -16,7 +16,7 @@ async fn shared_topic_keeps_sparse_partitions_and_stalled_storage_independent() 
         .unwrap();
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines, reason = "one linear scenario")]
 async fn multiple() {
     let (mut harness, links, _, authority) = setup_shared_partitions(&[], 2).await;
     let options = || SharedTopicWriterConfig {
@@ -67,6 +67,9 @@ async fn multiple() {
     assert_eq!(healthy.record.offset, 0);
     assert_eq!(healthy.record.key.first_sequence, 0);
     assert_eq!(harness.openings.len(), 1, "sparse partition opened early");
+    // Partition 1 publishes its durable evidence after the confirmation;
+    // that write must not be the I/O held for partition 0 below.
+    harness.quiesce().await;
     let blocked = writer.send(record(51), Some(&first_key)).await.unwrap();
     assert_eq!(blocked.partition(), 0);
     for _ in 0..10000 {

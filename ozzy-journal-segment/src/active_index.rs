@@ -6,8 +6,9 @@ use thiserror::Error;
 
 use crate::{
     INDEX_HEADER_BYTES, IndexFileError, IndexLimits, IndexSource, MESSAGE_INDEX_ENTRY_BYTES,
-    MessageIndexEntry, OFFSET_INDEX_ENTRY_BYTES, OPERATION_INDEX_ENTRY_BYTES, OffsetIndexEntry,
-    OperationIndexEntry, SegmentIndexImage, SegmentScan,
+    MessageIndexEntry, OFFSET_INDEX_ENTRY_BYTES, OPERATION_INDEX_ENTRY_BYTES,
+    OPERATION_LOCATION_BYTES, OffsetIndexEntry, OperationIndexEntry, OperationLocation,
+    SealedSegment, SegmentIndexImage, SegmentScan,
 };
 
 mod building;
@@ -19,6 +20,38 @@ mod tests;
 #[derive(Debug, Clone)]
 pub(crate) struct ActiveSegmentIndex {
     image: SegmentIndexImage,
+}
+
+/// The validated index of an active-segment prefix with its reader state. The
+/// next build of the same segment sorts and merges only appended operations.
+pub(crate) struct ActivePrefix {
+    resume: crate::directory::asynchronous::groups::Resume,
+    index: Option<std::rc::Rc<ActiveSegmentIndex>>,
+    limits: IndexLimits,
+}
+
+impl ActivePrefix {
+    /// Reusable only with identical limits and a boundary covering every entry.
+    pub(crate) fn reusable(&self, through_op: u64, limits: IndexLimits) -> bool {
+        self.limits == limits
+            && self
+                .index
+                .as_ref()
+                .is_none_or(|index| index.image.source().last_op_number <= through_op)
+    }
+
+    pub(crate) fn resume(&self) -> crate::directory::asynchronous::groups::Resume {
+        self.resume.clone()
+    }
+}
+
+impl std::fmt::Debug for ActivePrefix {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ActivePrefix")
+            .field("source", &self.index.as_ref().map(|index| index.source()))
+            .finish_non_exhaustive()
+    }
 }
 
 impl ActiveSegmentIndex {
@@ -55,28 +88,10 @@ impl ActiveSegmentIndex {
                 }
             }
             ozzy_proto::reader::Start::Timestamp(timestamp) => {
-                let at_floor = self.find_offset(query.partition, query.retained_from);
-                for head in self.image.offsets().iter().filter(|entry| {
-                    entry.partition == query.partition
-                        && entry.location.record_index == 0
-                        && entry.append_timestamp_millis >= timestamp
-                        && entry.location.operation.op_number <= query.through
-                        && entry.offset < query.confirmed_end
-                }) {
-                    let offset = if head.offset >= query.retained_from {
-                        Some(head.offset)
-                    } else {
-                        at_floor
-                            .filter(|entry| {
-                                entry.location.operation == head.location.operation
-                                    && entry.location.batch_index == head.location.batch_index
-                            })
-                            .map(|_| query.retained_from)
-                    };
-                    if let Some(offset) = offset {
-                        result.observe_match(offset);
-                        break;
-                    }
+                let offsets = self.image.offsets().iter().copied();
+                let find = |partition, offset| self.find_offset(partition, offset);
+                if let Some(offset) = query.timestamp_offset(timestamp, offsets, find) {
+                    result.observe_match(offset);
                 }
             }
             _ => {}
@@ -84,6 +99,7 @@ impl ActiveSegmentIndex {
     }
 
     /// Build through one exact operation, ignoring later complete physical groups.
+    #[cfg(test)]
     pub(crate) fn build(
         scan: &SegmentScan<'_>,
         through_op: u64,
@@ -97,8 +113,15 @@ impl ActiveSegmentIndex {
             }
             entries.push(&scan.header, operation, operation_limits)?;
         }
-        let Some(source) =
-            entries.source(&scan.header, scan.valid_bytes, scan.digest, through_op)?
+        let Some(source) = entries.source(
+            &scan.header,
+            SealedSegment {
+                valid_bytes: scan.valid_bytes,
+                digest: scan.digest,
+            },
+            through_op,
+            None,
+        )?
         else {
             return Ok(None);
         };
@@ -122,8 +145,15 @@ impl ActiveSegmentIndex {
             entries.push(&scan.header, operation, operation_limits)?;
             budget.charge(operation.body.len()).await;
         }
-        let Some(source) =
-            entries.source(&scan.header, scan.valid_bytes, scan.digest, through_op)?
+        let Some(source) = entries.source(
+            &scan.header,
+            SealedSegment {
+                valid_bytes: scan.valid_bytes,
+                digest: scan.digest,
+            },
+            through_op,
+            None,
+        )?
         else {
             return Ok(None);
         };
@@ -132,31 +162,58 @@ impl ActiveSegmentIndex {
         }))
     }
 
+    /// Index groups through `through_op`, continuing `prefix` when the reader
+    /// resumed after it. A scan that indexed every operation also returns the
+    /// prefix for the next build of this segment.
     pub(crate) async fn build_groups(
         mut groups: Box<crate::directory::asynchronous::groups::Groups>,
+        prefix: Option<ActivePrefix>,
         through_op: u64,
         operations: OperationLimits,
         limits: IndexLimits,
-    ) -> Result<Option<Self>, crate::JournalIndexError> {
+    ) -> Result<(Option<std::rc::Rc<Self>>, Option<ActivePrefix>), crate::JournalIndexError> {
         let header = groups.header().clone();
-        let (valid_bytes, digest) = groups.boundary();
+        let boundary = groups.boundary();
+        let base = prefix
+            .filter(|_| groups.resumed())
+            .and_then(|prefix| prefix.index);
         let mut entries = Entries::new(limits)?;
+        let mut complete = true;
         let mut budget = crate::cooperative::Budget::default();
         while let Some(group) = groups.next().await? {
             for operation in &group.operations {
                 if operation.op_number <= through_op {
                     entries.push(&header, operation, operations)?;
                     budget.charge(operation.body.len()).await;
+                } else {
+                    complete = false;
                 }
             }
         }
+        let resume = groups.resume().filter(|_| complete);
         groups.finish().await?;
-        let Some(source) = entries.source(&header, valid_bytes, digest, through_op)? else {
-            return Ok(None);
+        let base_image = base.as_deref().map(|base| &base.image);
+        let index = match entries.source(&header, boundary, through_op, base_image)? {
+            None => None,
+            Some(source)
+                if entries.is_empty()
+                    && base_image.map(SegmentIndexImage::source) == Some(source) =>
+            {
+                base
+            }
+            Some(source) => Some(std::rc::Rc::new(Self {
+                image: match base_image {
+                    Some(base) => entries.extend_async(base, source).await?,
+                    None => entries.finish_async(source).await?,
+                },
+            })),
         };
-        Ok(Some(Self {
-            image: entries.finish_async(source).await?,
-        }))
+        let prefix = resume.map(|resume| ActivePrefix {
+            resume,
+            index: index.clone(),
+            limits,
+        });
+        Ok((index, prefix))
     }
 
     pub(crate) const fn source(&self) -> IndexSource {
@@ -165,6 +222,14 @@ impl ActiveSegmentIndex {
 
     pub(crate) fn operation_count(&self) -> usize {
         self.image.operations().len()
+    }
+
+    pub(crate) fn location_count(&self) -> usize {
+        self.image.locations().len()
+    }
+
+    pub(crate) fn find_operation_number(&self, number: u64) -> Option<OperationLocation> {
+        self.image.find_operation_number(number)
     }
 
     pub(crate) fn offsets(&self) -> &[OffsetIndexEntry] {
@@ -245,6 +310,7 @@ fn enforce_footprint(
     offsets: usize,
     messages: usize,
     operations: usize,
+    locations: usize,
     limits: IndexLimits,
 ) -> Result<(), ActiveIndexError> {
     let bytes = offsets
@@ -257,6 +323,11 @@ fn enforce_footprint(
         .and_then(|value| {
             operations
                 .checked_mul(OPERATION_INDEX_ENTRY_BYTES)
+                .and_then(|section| value.checked_add(section))
+        })
+        .and_then(|value| {
+            locations
+                .checked_mul(OPERATION_LOCATION_BYTES)
                 .and_then(|section| value.checked_add(section))
         })
         .and_then(|value| value.checked_add(INDEX_HEADER_BYTES))

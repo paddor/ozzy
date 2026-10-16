@@ -1,7 +1,7 @@
 //! One detached normal replication-history read, separate from election history.
 
 use super::{
-    AppendBuffer, AsyncJournalHistory, JournalError, OwnedJournal, PipelineLimits, Scope, history,
+    AppendBuffer, JournalError, JournalHistory, OwnedJournal, PipelineLimits, Scope, history,
 };
 use crate::replica_journal::{FetchedHistory, ReplicationPositions, commands::read_fault};
 use ozzy_proto::RequestId;
@@ -10,7 +10,7 @@ use std::{cell::Cell, rc::Rc};
 
 #[derive(Debug, Default)]
 pub(super) struct Replay {
-    cached: Option<(Scope, AsyncJournalHistory)>,
+    cached: Option<(Scope, JournalHistory)>,
     busy: Rc<Cell<bool>>,
 }
 impl Replay {
@@ -27,12 +27,24 @@ impl Drop for Slot {
     }
 }
 
+/// One normal replay fetch: operations after `predecessor` within `limits`,
+/// correlated by the actor's `request_id`.
+#[derive(Debug, Clone, Copy)]
+pub struct ReplayRequest {
+    /// Last prefix the follower holds.
+    pub predecessor: Prefix,
+    /// Operation and body bounds of the response.
+    pub limits: PipelineLimits,
+    /// Nonzero correlation ID chosen by the actor.
+    pub request_id: RequestId,
+}
+
 /// Captured installed history. This job borrows no application/journal owner;
 /// writes may continue beyond its immutable prefix while file jobs execute.
 #[derive(Debug)]
 pub struct PreparedReplay {
     key: Rc<()>,
-    history: AsyncJournalHistory,
+    history: JournalHistory,
     request: FetchOps,
     buffer: AppendBuffer,
     slot: Slot,
@@ -43,7 +55,7 @@ pub struct PreparedReplay {
 #[derive(Debug)]
 pub struct CompletedReplay {
     key: Rc<()>,
-    history: AsyncJournalHistory,
+    history: JournalHistory,
     scope: Scope,
     result: Result<FetchedHistory, JournalError>,
     _slot: Slot,
@@ -71,16 +83,12 @@ impl PreparedReplay {
 }
 
 impl OwnedJournal {
-    fn normal_history(&self) -> Result<AsyncJournalHistory, JournalError> {
+    fn normal_history(&self) -> Result<JournalHistory, JournalError> {
         let journal = self.journal.readable()?;
-        Ok(if self.configuration.memory_voting() {
-            journal.freeze_written_history(self.limits.io.max_segment_bytes as usize)?
-        } else {
-            journal.freeze_history(self.limits.io.max_segment_bytes as usize)?
-        })
+        Ok(journal.freeze_history(self.limits.io.max_segment_bytes as usize)?)
     }
 
-    fn refreshed_history(&mut self, scope: Scope) -> Result<AsyncJournalHistory, JournalError> {
+    fn refreshed_history(&mut self, scope: Scope) -> Result<JournalHistory, JournalError> {
         let mut history = self.normal_history()?;
         if let Some((old_scope, mut old)) = self.replay.cached.take()
             && old_scope == scope
@@ -107,11 +115,14 @@ impl OwnedJournal {
     pub fn prepare_replay(
         &mut self,
         ticket: ValidationTicket,
-        predecessor: Prefix,
-        limits: PipelineLimits,
+        request: ReplayRequest,
         buffer: AppendBuffer,
-        request_id: RequestId,
     ) -> Result<PreparedReplay, JournalError> {
+        let ReplayRequest {
+            predecessor,
+            limits,
+            request_id,
+        } = request;
         self.primary_history(ticket)?;
         if self.replay.busy.get() {
             return Err(JournalError::AppendCapacity);
@@ -134,10 +145,12 @@ impl OwnedJournal {
                 && predecessor.op.0 >= history.predecessor().op_number
                 && predecessor.op.0 < history.through().op_number
         });
-        let history = if reusable {
-            self.replay.cached.take().expect("checked source").1
-        } else {
-            self.refreshed_history(ticket.scope())?
+        let history = match self.replay.cached.take() {
+            Some((_, history)) if reusable => history,
+            stale => {
+                self.replay.cached = stale;
+                self.refreshed_history(ticket.scope())?
+            }
         };
         let request = FetchOps {
             scope: ticket.scope(),
@@ -195,11 +208,15 @@ impl OwnedJournal {
                     op.0 >= history.predecessor().op_number && op.0 <= history.through().op_number
                 })
         });
-        if !reusable {
-            self.replay.cached = Some((ticket.scope(), self.refreshed_history(ticket.scope())?));
-        }
+        let cached = match self.replay.cached.take() {
+            Some(cached) if reusable => cached,
+            stale => {
+                self.replay.cached = stale;
+                (ticket.scope(), self.refreshed_history(ticket.scope())?)
+            }
+        };
+        let (_, history) = self.replay.cached.insert(cached);
         let result = async {
-            let (_, history) = self.replay.cached.as_mut().expect("captured source");
             let positions = [
                 history.position(requested[0].0).await?.map(super::prefix),
                 history.position(requested[1].0).await?.map(super::prefix),

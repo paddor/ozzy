@@ -12,7 +12,7 @@ impl ProposalBuffer {
     /// Prepare in an empty lease. Matching accepted creation waits for application;
     /// matching applied creation resolves without another canonical operation.
     /// Incarnation, address, and owner epoch must agree. A changed retention policy
-    /// becomes a separate confirmed policy operation on coordinated restart.
+    /// becomes a separate confirmed policy operation; the dedup window is fixed.
     /// This service request supplies no authority or confirmation by itself.
     pub fn prepare_partition(
         &mut self,
@@ -36,7 +36,9 @@ pub(in crate::replica_journal) fn partition_retry<I: IdentityIndex + Clone>(
     if buffer.len() != 1 || buffer.is_producer() || buffer.owner_generation() != generation {
         return Err(JournalError::AppendMismatch);
     }
-    let operation = buffer.operations().next().expect("one creation operation");
+    let Some(operation) = buffer.operations().next() else {
+        return Err(JournalError::AppendMismatch);
+    };
     let OperationBody::CreatePartition(request) =
         decode_operation_body(operation.kind, operation.body, limits)?
     else {
@@ -49,6 +51,7 @@ pub(in crate::replica_journal) fn partition_retry<I: IdentityIndex + Clone>(
         || existing.address.topic != request.topic
         || existing.address.partition_id != request.partition_id
         || existing.owner_epoch != request.owner_epoch
+        || existing.dedup_window_millis != request.dedup_window_millis
     {
         return Err(JournalError::AppendMismatch);
     }

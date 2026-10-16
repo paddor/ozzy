@@ -1,24 +1,28 @@
-//! Startup-registered fanring lanes with a global outstanding-request bound.
+//! Owner-local proposal queue with an outstanding-request bound. The actor's
+//! admission state above it lives in `admission`.
 
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::{Context, Poll};
+use std::rc::Rc;
+use std::task::{Context, Poll, Waker};
 
 use ozzy_replication::{JournalGeneration, PipelineLimits, Prefix, Scope};
 use pin_project_lite::pin_project;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::sync::oneshot;
 
-use crate::command_channel as mpsc;
 use crate::replica_journal::{JournalError, ProposalBuffer};
 use crate::signal::{CloseSignal, Closed};
+
+mod admission;
+pub(super) use admission::{NextProposal, ProposalWait, Proposals};
 
 /// Completion of this proposal, not a consumer's external processing transaction.
 #[derive(Debug)]
 pub enum ProposalOutcome {
     /// Every operation through this exact prefix satisfies the configured group
-    /// confirmation policy and is applied. RAM confirmation is not disk durability.
+    /// confirmation policy and is applied.
     Committed {
         /// Group, configuration, and view that authorized this reply.
         scope: Scope,
@@ -102,15 +106,13 @@ pub struct UnsubmittedProposal {
     pub buffer: ProposalBuffer,
 }
 
-/// One preallocated, non-clonable MPSC lane. Move it to its submitting thread.
+/// One submission lane into an actor on the same thread. Submitting wakes the
+/// actor's partition.
 #[derive(Debug)]
 pub struct ProposalSubmitter {
-    sender: mpsc::NotifiedSender<Submission>,
-    closed: CloseSignal,
-    capacity: Arc<Semaphore>,
+    queue: Rc<Queue>,
     generation: JournalGeneration,
     limits: PipelineLimits,
-    untaken: Arc<AtomicUsize>,
 }
 
 impl ProposalSubmitter {
@@ -123,7 +125,8 @@ impl ProposalSubmitter {
         &mut self,
         buffer: ProposalBuffer,
     ) -> Result<PendingProposal, UnsubmittedProposal> {
-        let reason = if self.closed.is_closed() || self.sender.is_disconnected() {
+        let queue = &self.queue;
+        let reason = if queue.closed.is_closed() {
             Some(ProposalSubmitError::Stopped)
         } else if buffer.owner_generation() != self.generation
             || buffer.is_empty()
@@ -131,73 +134,81 @@ impl ProposalSubmitter {
             || buffer.body_bytes() > self.limits.max_body_bytes
         {
             Some(ProposalSubmitError::Buffer)
+        } else if queue.outstanding.get() == queue.slots {
+            Some(ProposalSubmitError::Full)
         } else {
             None
         };
         if let Some(reason) = reason {
             return Err(UnsubmittedProposal { reason, buffer });
         }
-        let Ok(permit) = self.capacity.clone().try_acquire_owned() else {
-            return Err(UnsubmittedProposal {
-                reason: ProposalSubmitError::Full,
-                buffer,
-            });
-        };
         let (done, pending) = oneshot::channel();
         let admission = CloseSignal::default();
-        self.untaken.fetch_add(1, Ordering::Relaxed);
-        let submission = Submission {
+        queue.push(Submission {
             buffer,
             reply: Reply {
                 done,
-                _permit: Some(permit),
-                untaken: Untaken(Some(self.untaken.clone())),
+                slot: Some(Slot::take(queue)),
                 queued_at: crate::profiling::start(),
                 admitted_at: None,
                 admission: admission.clone(),
             },
-        };
-        if let Err(error) = self.sender.try_send(submission) {
-            let (reason, submission) = match error {
-                mpsc::TrySendError::Full(value) => (ProposalSubmitError::Full, value),
-                mpsc::TrySendError::Disconnected(value) => (ProposalSubmitError::Stopped, value),
-            };
-            return Err(UnsubmittedProposal {
-                reason,
-                buffer: submission.buffer,
-            });
-        }
+        });
         Ok(PendingProposal {
             reply: pending,
-            closed: self.closed.closed(),
+            closed: queue.closed.closed(),
             admission,
         })
     }
 }
 
-/// Counts a submission as untaken until the actor schedules or finishes it.
+/// Submissions not yet taken by the actor. The actor and its submitters share
+/// it on one thread.
 #[derive(Debug)]
-struct Untaken(Option<Arc<AtomicUsize>>);
+struct Queue {
+    submissions: RefCell<VecDeque<Submission>>,
+    /// Submissions whose reply has not finished, queued or taken.
+    outstanding: Cell<usize>,
+    slots: usize,
+    closed: CloseSignal,
+    /// The actor's partition, from its last readiness poll. The first
+    /// submission into an empty queue wakes it.
+    waker: RefCell<Option<Waker>>,
+}
 
-impl Untaken {
-    fn taken(&mut self) {
-        if let Some(count) = self.0.take() {
-            count.fetch_sub(1, Ordering::Relaxed);
+impl Queue {
+    fn push(&self, submission: Submission) {
+        let mut submissions = self.submissions.borrow_mut();
+        let first = submissions.is_empty();
+        submissions.push_back(submission);
+        drop(submissions);
+        if first && let Some(waker) = &*self.waker.borrow() {
+            waker.wake_by_ref();
         }
     }
 }
 
-impl Drop for Untaken {
+/// One unit of the outstanding-request bound, held until its reply finishes.
+#[derive(Debug)]
+struct Slot(Rc<Queue>);
+
+impl Slot {
+    fn take(queue: &Rc<Queue>) -> Self {
+        queue.outstanding.set(queue.outstanding.get() + 1);
+        Self(queue.clone())
+    }
+}
+
+impl Drop for Slot {
     fn drop(&mut self) {
-        self.taken();
+        self.0.outstanding.set(self.0.outstanding.get() - 1);
     }
 }
 
 #[derive(Debug)]
 pub(super) struct Reply {
     done: oneshot::Sender<ProposalReply>,
-    _permit: Option<OwnedSemaphorePermit>,
-    untaken: Untaken,
+    slot: Option<Slot>,
     queued_at: Option<std::time::Instant>,
     admitted_at: Option<std::time::Instant>,
     admission: CloseSignal,
@@ -210,8 +221,7 @@ impl Reply {
         drop(observer);
         Self {
             done,
-            _permit: None,
-            untaken: Untaken(None),
+            slot: None,
             queued_at: None,
             admitted_at: None,
             admission: CloseSignal::default(),
@@ -221,8 +231,10 @@ impl Reply {
     pub(super) fn fenced(&self) -> bool {
         self.admission.is_closed()
     }
+    pub(super) fn is_maintenance(&self) -> bool {
+        self.slot.is_none()
+    }
     pub(super) fn scheduled(&mut self) {
-        self.untaken.taken();
         crate::profiling::finish(crate::profiling::Stage::ReplicaQueue, self.queued_at.take());
     }
 
@@ -233,16 +245,14 @@ impl Reply {
     pub(super) fn finish(self, buffer: ProposalBuffer, outcome: ProposalOutcome) {
         let Self {
             done,
-            _permit: permit,
-            untaken,
+            slot,
             admitted_at,
             ..
         } = self;
-        drop(untaken);
         if matches!(outcome, ProposalOutcome::Committed { .. }) {
             crate::profiling::finish(crate::profiling::Stage::ReplicaConfirmation, admitted_at);
         }
-        drop(permit);
+        drop(slot);
         let _ = done.send(ProposalReply { outcome, buffer });
     }
 }
@@ -255,14 +265,40 @@ pub(super) struct Submission {
 
 #[derive(Debug)]
 pub(super) struct Ingress {
-    receiver: mpsc::NotifiedReceiver<Submission>,
-    closed: CloseSignal,
+    queue: Rc<Queue>,
     pollable: bool,
 }
 
 impl Ingress {
+    pub(super) fn new(
+        lanes: usize,
+        slots: usize,
+        generation: JournalGeneration,
+        limits: PipelineLimits,
+    ) -> (Self, Vec<ProposalSubmitter>) {
+        let queue = Rc::new(Queue {
+            submissions: RefCell::new(VecDeque::with_capacity(slots)),
+            outstanding: Cell::new(0),
+            slots,
+            closed: CloseSignal::default(),
+            waker: RefCell::new(None),
+        });
+        let submitters = (0..lanes)
+            .map(|_| ProposalSubmitter {
+                queue: queue.clone(),
+                generation,
+                limits,
+            })
+            .collect();
+        let ingress = Self {
+            queue,
+            pollable: false,
+        };
+        (ingress, submitters)
+    }
+
     pub(super) fn close(&self) {
-        self.closed.close();
+        self.queue.closed.close();
     }
 
     pub(super) fn begin_round(&mut self) {
@@ -273,62 +309,40 @@ impl Ingress {
         self.pollable = true;
     }
 
-    pub(super) async fn ready(&self) {
-        // Queued work is actionable only when another scheduling round can
-        // inspect ingress. Election, full sync groups and admission pressure
-        // resume on their own completions, traffic or timers, not queue backlog.
-        if !self.pollable {
-            std::future::pending::<()>().await;
+    /// Ready once queued work is actionable, when another scheduling round can
+    /// inspect ingress. Election, full sync groups and admission pressure
+    /// resume on their own completions, traffic or timers, not queue backlog.
+    /// The registration outlives this poll: a later submission still wakes it.
+    pub(super) fn poll_ready(&self, cx: &Context<'_>) -> Poll<()> {
+        let mut registered = self.queue.waker.borrow_mut();
+        if !registered
+            .as_ref()
+            .is_some_and(|waker| waker.will_wake(cx.waker()))
+        {
+            *registered = Some(cx.waker().clone());
         }
-        self.receiver.ready().await;
+        drop(registered);
+        if self.pollable && !self.queue.submissions.borrow().is_empty() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
     }
 
-    pub(super) fn new(
-        lanes: usize,
-        slots: usize,
-        generation: JournalGeneration,
-        limits: PipelineLimits,
-    ) -> (Self, Vec<ProposalSubmitter>) {
-        let (sender, mut receiver) = mpsc::notified_channel(slots);
-        let closed = CloseSignal::default();
-        let capacity = Arc::new(Semaphore::new(slots));
-        let mut senders = Vec::with_capacity(lanes);
-        for _ in 1..lanes {
-            senders.push(sender.try_clone().expect("new receiver alive"));
-        }
-        senders.push(sender);
-        // Register all lanes and their receiver scratch before accepting traffic.
-        assert!(receiver.try_recv().is_err());
-        let submitters = senders
-            .into_iter()
-            .map(|sender| ProposalSubmitter {
-                sender,
-                closed: closed.clone(),
-                capacity: capacity.clone(),
-                generation,
-                limits,
-                untaken: Arc::new(AtomicUsize::new(0)),
-            })
-            .collect();
-        (
-            Self {
-                receiver,
-                closed,
-                pollable: false,
-            },
-            submitters,
-        )
+    pub(super) async fn ready(&self) {
+        std::future::poll_fn(|cx| self.poll_ready(cx)).await;
     }
 
     pub(super) fn pop(&mut self) -> Option<Submission> {
-        self.receiver.try_recv().ok()
+        self.queue.submissions.borrow_mut().pop_front()
     }
 }
 
 impl Drop for Ingress {
     fn drop(&mut self) {
-        // Admission closes before worker draining. Coordinated teardown also
-        // permits late cleanup by an overlapping sender, so notify independently.
+        // Stop admission, and finish queued submissions now rather than when
+        // the last submitter drops.
         self.close();
+        self.queue.submissions.borrow_mut().clear();
     }
 }

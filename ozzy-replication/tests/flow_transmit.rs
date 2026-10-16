@@ -1,3 +1,13 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
+
 use std::time::Duration;
 
 use ozzy_proto::{GroupId, RequestId};
@@ -184,6 +194,24 @@ fn new_unsent_work_advertises_receive_demand_without_timer_delay_or_repair() {
     sender.record_send(&ops[..1]).unwrap();
     receiver.retain(channel(1), &ops[..1]).unwrap();
     assert_eq!(receiver.report().received, ops[0].prefix);
+}
+
+#[test]
+fn broadcast_new_work_waits_for_the_probe_delay() {
+    let (mut sender, _receiver) = pair();
+    sender.enable_broadcast();
+    let ops = operations();
+    // The opening exchange completed at 0 ms; receipt of PUB work comes unasked.
+    assert_eq!(
+        sender.poll_probe(ops[0].prefix, false, ms(1)).unwrap(),
+        None
+    );
+    assert_eq!(sender.next_probe(), Some(ms(10)));
+    let probe = sender
+        .poll_probe(ops[0].prefix, false, ms(10))
+        .unwrap()
+        .expect("a due probe still looks for loss");
+    assert_eq!(probe.available, ops[0].prefix.op);
 }
 
 #[test]

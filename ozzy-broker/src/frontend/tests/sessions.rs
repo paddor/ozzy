@@ -29,7 +29,7 @@ fn source(id: u8, roles: u32) -> LinkSessions {
     .unwrap()
 }
 
-async fn negotiate(socket: &Socket, sessions: &LinkSessions) -> LinkSessionId {
+async fn negotiate(socket: &Socket, sessions: &mut LinkSessions) -> LinkSessionId {
     let hello = sessions.start(local()).unwrap();
     socket
         .send(Message::with_prefix(
@@ -42,7 +42,13 @@ async fn negotiate(socket: &Socket, sessions: &LinkSessions) -> LinkSessionId {
     assert_eq!(welcome.part_slice(0), Some(local().as_bytes().as_slice()));
     let frames = std::array::from_fn::<_, 3, _>(|i| welcome.part_slice(i + 1).unwrap());
     let packet = ozzy_proto::decode_packet(&frames, DataLimits::default().envelope).unwrap();
-    assert!(sessions.receive(local(), packet).unwrap().replaced);
+    assert!(
+        sessions
+            .receive(local(), packet)
+            .unwrap()
+            .replaced
+            .is_some()
+    );
     sessions.session(local()).unwrap()
 }
 
@@ -54,13 +60,10 @@ async fn shared_peer_negotiates_client_and_broker_profiles_with_independent_fenc
         let roles = [handshake::PRODUCER, handshake::CONSUMER, REPLICA];
         let (reported, mut reports) = tokio::sync::mpsc::channel(4);
         let frontend = Frontend::start_with_context(
-            &plan(),
-            local(),
-            &endpoints,
-            limits(),
+            frontend_plan(&plan(), &endpoints),
             context.clone(),
             move |mut context| async move {
-                let sessions = LinkSessions::with_ids(
+                let mut sessions = LinkSessions::with_ids(
                     context.local,
                     profile(handshake::OWNER | REPLICA),
                     0,
@@ -71,7 +74,7 @@ async fn shared_peer_negotiates_client_and_broker_profiles_with_independent_fenc
                 context.ready()?;
                 loop {
                     let message = tokio::select! {
-                        () = context.shutdown.requested() => break,
+                        () = context.shutdown.closed() => break,
                         result = context.peer.recv() => result.unwrap(),
                     };
                     // The fixture explicitly trusts these three identities.
@@ -99,7 +102,7 @@ async fn shared_peer_negotiates_client_and_broker_profiles_with_independent_fenc
                             ))
                             .unwrap();
                     }
-                    if handled.replaced {
+                    if handled.replaced.is_some() {
                         reported
                             .try_send((remote, sessions.session(remote).unwrap()))
                             .unwrap();
@@ -120,23 +123,21 @@ async fn shared_peer_negotiates_client_and_broker_profiles_with_independent_fenc
                     .router_mandatory(true)
                     .linger(Duration::from_millis(5)),
             );
-            socket
-                .connect(endpoints.peer.parse().unwrap())
-                .await
-                .unwrap();
+            socket.connect(&endpoints.peer).await.unwrap();
             socket
                 .wait_connected(1, Duration::from_secs(5))
                 .await
                 .unwrap();
-            let sessions = source(id, role);
-            let current = negotiate(&socket, &sessions).await;
+            let mut sessions = source(id, role);
+            let current = negotiate(&socket, &mut sessions).await;
             assert_eq!(
                 reports.recv().await.unwrap(),
                 (NodeId::from_bytes([id; 16]), current)
             );
             clients.push((socket, sessions, current));
         }
-        let replacement = negotiate(&clients[0].0, &clients[0].1).await;
+        let (socket, sessions, _) = &mut clients[0];
+        let replacement = negotiate(socket, sessions).await;
         assert_ne!(replacement, clients[0].2);
         assert_eq!(
             reports.recv().await.unwrap(),
@@ -170,9 +171,11 @@ fn serving_service(
                 shard,
                 frontend::Kind::Client,
                 dispatch::Class::Control,
-                2,
-                4096,
-                8192,
+                frontend::DataLaneLimits {
+                    slots: 2,
+                    maximum_retained_bytes: 4096,
+                    retained_budget_bytes: 8192,
+                },
             )
             .unwrap();
             receivers.push(receiver);
@@ -241,10 +244,7 @@ async fn serving_lifecycle(trusted: bool, distinct: bool) {
         let endpoints = endpoints(false);
         let (reported, report) = oneshot::channel();
         let frontend = Frontend::start_with_context(
-            &plan(),
-            local(),
-            &endpoints,
-            limits(),
+            frontend_plan(&plan(), &endpoints),
             omq.clone(),
             move |context| async move {
                 let (service, _receivers) = serving_service(trusted);
@@ -259,8 +259,7 @@ async fn serving_lifecycle(trusted: bool, distinct: bool) {
                 context
                     .serve(
                         service,
-                        std::collections::BTreeMap::new(),
-                        crate::FollowerRoutes::default(),
+                        crate::RemoteBrokers::default(),
                         buffers,
                         Duration::from_millis(10),
                     )
@@ -270,13 +269,13 @@ async fn serving_lifecycle(trusted: bool, distinct: bool) {
         .await
         .unwrap();
         let links = report.await.unwrap();
-        let repeated = source(1, handshake::PRODUCER);
+        let mut repeated = source(1, handshake::PRODUCER);
         let mut previous = None;
         for wave in 0..if distinct { 40 } else { 2 } {
             let id = if distinct { wave + 32 } else { 1 };
             let remote = NodeId::from_bytes([id; 16]);
-            let fresh = source(id, handshake::PRODUCER);
-            let sessions = if distinct { &fresh } else { &repeated };
+            let mut fresh = source(id, handshake::PRODUCER);
+            let sessions = if distinct { &mut fresh } else { &mut repeated };
             let socket = omq.socket(
                 SocketType::Peer,
                 omq_tokio::Options::default()
@@ -284,10 +283,7 @@ async fn serving_lifecycle(trusted: bool, distinct: bool) {
                     .router_mandatory(true)
                     .linger(Duration::from_millis(5)),
             );
-            socket
-                .connect(endpoints.peer.parse().unwrap())
-                .await
-                .unwrap();
+            socket.connect(&endpoints.peer).await.unwrap();
             socket
                 .wait_connected(1, Duration::from_secs(5))
                 .await
@@ -369,12 +365,12 @@ async fn paused_repair_source_preserves_control_other_shards_and_reconnect() {
             .send_to(local().as_bytes(), Message::single("held repair"))
             .await
             .unwrap();
-        let (receipt, body) = bound.recv_from_source(None).await.unwrap();
+        let (receipt, body) = bound.recv_with_receipt(None).await.unwrap();
         assert_eq!(
             receipt.identity_bytes().as_deref(),
             Some(identities[1].as_bytes().as_slice())
         );
-        let old_source = receipt.source().unwrap().clone();
+        let old_source = receipt.lane().unwrap().clone();
         bound.unshift(receipt, body).unwrap();
         // An unshifted repair lane must not intercept either eligible source.
         for index in [0, 2] {
@@ -382,7 +378,7 @@ async fn paused_repair_source_preserves_control_other_shards_and_reconnect() {
                 .send_to(local().as_bytes(), Message::single("progress"))
                 .await
                 .unwrap();
-            let (receipt, _) = bound.recv_from_source(None).await.unwrap();
+            let (receipt, _) = bound.recv_with_receipt(None).await.unwrap();
             assert_eq!(
                 receipt.identity_bytes().as_deref(),
                 Some(identities[index].as_bytes().as_slice())
@@ -407,11 +403,11 @@ async fn paused_repair_source_preserves_control_other_shards_and_reconnect() {
             .send_to(local().as_bytes(), Message::single("replacement"))
             .await
             .unwrap();
-        let (receipt, body) = bound.recv_from_source(None).await.unwrap();
+        let (receipt, body) = bound.recv_with_receipt(None).await.unwrap();
         assert_eq!(body.part_slice(0), Some(b"replacement".as_slice()));
-        assert_ne!(receipt.source().unwrap(), &old_source);
+        assert_ne!(receipt.lane().unwrap(), &old_source);
         assert!(matches!(
-            bound.try_recv_from_source(Some(&old_source)),
+            bound.try_recv_with_receipt(Some(&old_source)),
             Err(omq_tokio::Error::Closed)
         ));
         replacement.into_inner().close().await.unwrap();

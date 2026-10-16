@@ -11,7 +11,7 @@ use std::{
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 #[derive(Debug)]
@@ -36,6 +36,89 @@ pub struct Redpanda {
     stopped: bool,
 }
 
+/// Loopback ports held until every node configuration is written.
+struct Ports(Vec<TcpListener>);
+
+impl Ports {
+    fn bind(count: usize) -> Result<Self> {
+        Ok(Self(
+            (0..count)
+                .map(|_| TcpListener::bind("127.0.0.1:0"))
+                .collect::<std::io::Result<Vec<_>>>()?,
+        ))
+    }
+
+    fn port(&self, index: usize) -> Result<u16> {
+        Ok(self.0[index].local_addr()?.port())
+    }
+
+    fn address(&self, index: usize) -> Result<Value> {
+        Ok(json!({"address":"127.0.0.1","port":self.port(index)?}))
+    }
+}
+
+/// One configured node that has not started yet.
+struct Configured {
+    root: PathBuf,
+    admin: String,
+}
+
+/// Write each node's configuration into fresh directories under `root`, with
+/// its data under `data`. Node `n` uses ports `3n` (Kafka), `3n + 1` (RPC),
+/// and `3n + 2` (admin).
+fn configure(root: &Path, data: &Path, ports: &Ports, replicas: usize) -> Result<Vec<Configured>> {
+    let seeds = if replicas == 1 {
+        vec![]
+    } else {
+        (0..replicas)
+            .map(|node| Ok(json!({"host":ports.address(3 * node + 1)?})))
+            .collect::<Result<Vec<_>>>()?
+    };
+    let mut configs = vec![];
+    for node in 0..replicas {
+        let (node_root, node_data) = if replicas == 1 {
+            (root.to_path_buf(), data.to_path_buf())
+        } else {
+            (root.join(node.to_string()), data.join(node.to_string()))
+        };
+        fs::create_dir_all(&node_root)?;
+        fs::create_dir_all(&node_data)?;
+        let (kafka, rpc, admin) = (3 * node, 3 * node + 1, 3 * node + 2);
+        let config = json!({"redpanda":{
+            "data_directory":node_data,"developer_mode":false,"seed_servers":seeds,
+            "empty_seed_starts_cluster":replicas == 1,
+            "kafka_api":[ports.address(kafka)?],"advertised_kafka_api":[ports.address(kafka)?],
+            "rpc_server":ports.address(rpc)?,"advertised_rpc_api":ports.address(rpc)?,"admin":[ports.address(admin)?]
+        }});
+        // JSON is a YAML subset. Keep exact requested and effective settings.
+        json_file(&node_root.join("redpanda.yaml"), &config)?;
+        json_file(&node_root.join(".bootstrap.yaml"), &bootstrap(replicas))?;
+        configs.push(Configured {
+            root: node_root,
+            admin: format!("http://127.0.0.1:{}", ports.port(admin)?),
+        });
+    }
+    Ok(configs)
+}
+
+/// Cluster settings applied when the cluster first forms.
+fn bootstrap(replicas: usize) -> Value {
+    json!({
+        "enable_metrics_reporter":false,"auto_create_topics_enabled":false,
+        // The fixture does not scrape internal metrics. Redpanda's
+        // internal leadership counter also treats its own controller
+        // topic as missing during bootstrap. Disable that unused
+        // instrumentation, while retaining diagnostic logs.
+        "disable_metrics":true,
+        // Readers use explicit partition assignment and never
+        // commit offsets. Keep their required group topic small.
+        "group_topic_partitions":1,
+        "default_topic_replications":replicas,
+        "internal_topic_replication_factor":replicas,
+        "write_caching_default":"false","rpk_path":build::rpk()
+    })
+}
+
 impl Redpanda {
     /// Start fresh Redpanda with the requested persistence policy and CPU placement.
     pub fn start(root: &Path, mode: &str, cpus: &[Vec<usize>]) -> Result<Self> {
@@ -44,10 +127,8 @@ impl Redpanda {
         } else {
             1
         };
-        if !matches!(
-            mode,
-            "buffered" | "durable" | "disk-quorum" | "replicated-persisting"
-        ) || cpus.len() != replicas
+        if !matches!(mode, "buffered" | "durable" | "disk-quorum")
+            || cpus.len() != replicas
             || cpus.iter().any(Vec::is_empty)
         {
             return Err("Redpanda comparison requires a supported mode and CPU budget".into());
@@ -58,70 +139,16 @@ impl Redpanda {
             .join("ozzy-bench")
             .join(root.file_name().ok_or("missing run name")?);
         // Hold every selected port until all configurations have been written.
-        let ports = (0..3 * replicas)
-            .map(|_| TcpListener::bind("127.0.0.1:0"))
-            .collect::<std::io::Result<Vec<_>>>()?;
-        let port = |index: usize| -> Result<u16> { Ok(ports[index].local_addr()?.port()) };
-        let address = |index: usize| -> Result<Value> {
-            Ok(json!({"address":"127.0.0.1","port":port(index)?}))
-        };
-        let seeds = if replicas == 1 {
-            vec![]
-        } else {
-            (0..replicas)
-                .map(|node| Ok(json!({"host":address(3 * node + 1)?})))
-                .collect::<Result<Vec<_>>>()?
-        };
-        let mut configs = vec![];
-        for node in 0..replicas {
-            let node_root = if replicas == 1 {
-                root.to_path_buf()
-            } else {
-                root.join(node.to_string())
-            };
-            let node_data = if replicas == 1 {
-                data.clone()
-            } else {
-                data.join(node.to_string())
-            };
-            fs::create_dir_all(&node_root)?;
-            fs::create_dir_all(&node_data)?;
-            let (kafka, rpc, admin) = (3 * node, 3 * node + 1, 3 * node + 2);
-            let config = json!({"redpanda":{
-                "data_directory":node_data,"developer_mode":false,"seed_servers":seeds,
-                "empty_seed_starts_cluster":replicas == 1,
-                "kafka_api":[address(kafka)?],"advertised_kafka_api":[address(kafka)?],
-                "rpc_server":address(rpc)?,"advertised_rpc_api":address(rpc)?,"admin":[address(admin)?]
-            }});
-            // JSON is a YAML subset. Keep exact requested and effective settings.
-            json_file(&node_root.join("redpanda.yaml"), &config)?;
-            json_file(
-                &node_root.join(".bootstrap.yaml"),
-                &json!({
-                    "enable_metrics_reporter":false,"auto_create_topics_enabled":false,
-                    // The fixture does not scrape internal metrics. Redpanda's
-                    // internal leadership counter also treats its own controller
-                    // topic as missing during bootstrap. Disable that unused
-                    // instrumentation, while retaining diagnostic logs.
-                    "disable_metrics":true,
-                    // Readers use explicit partition assignment and never
-                    // commit offsets. Keep their required group topic small.
-                    "group_topic_partitions":1,
-                    "default_topic_replications":replicas,
-                    "internal_topic_replication_factor":replicas,
-                    "write_caching_default":"false","rpk_path":build::rpk()
-                }),
-            )?;
-            configs.push((node_root, format!("http://127.0.0.1:{}", port(admin)?)));
-        }
-        let endpoint = format!("127.0.0.1:{}", port(0)?);
+        let ports = Ports::bind(3 * replicas)?;
+        let configs = configure(root, &data, &ports, replicas)?;
+        let endpoint = format!("127.0.0.1:{}", ports.port(0)?);
         drop(ports);
         // One reactor per CPU of a node's own list. Three nodes sharing one
         // pool get one reactor each, like the three Iggy brokers.
         let nodes = configs
             .into_iter()
             .enumerate()
-            .map(|(index, (root, admin))| {
+            .map(|(index, Configured { root, admin })| {
                 let smp = crate::automation::cpus::shards(cpus, index);
                 Ok(Node {
                     child: spawn(&root, &cpus[index], smp, &format!("{}G", 2 * smp))?,
@@ -170,7 +197,15 @@ impl Redpanda {
     }
 
     fn wait_ready(&mut self) -> Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        self.wait_started()?;
+        self.verify_effective()?;
+        self.affinity()?;
+        self.wait_producer_ids()
+    }
+
+    /// Wait until every node reports ready and a cluster is healthy.
+    fn wait_started(&mut self) -> Result<()> {
+        let deadline = Instant::now() + super::READY;
         loop {
             check_canceled()?;
             self.check()?;
@@ -190,8 +225,14 @@ impl Redpanda {
             if Instant::now() >= deadline {
                 return Err("Redpanda readiness deadline expired".into());
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(super::READY_POLL);
         }
+        Ok(())
+    }
+
+    /// Keep the effective node and cluster settings, rejecting any that
+    /// would weaken durability or differ from the requested ones.
+    fn verify_effective(&self) -> Result<()> {
         for node in &self.nodes {
             let effective = Self::admin(node, "/v1/node_config")?;
             if effective["developer_mode"] != false {
@@ -209,8 +250,12 @@ impl Redpanda {
         {
             return Err("Redpanda effective cluster configuration differs".into());
         }
-        json_file(&self.root.join("effective-cluster.json"), &cluster)?;
-        self.affinity()?;
+        json_file(&self.root.join("effective-cluster.json"), &cluster)
+    }
+
+    /// Allocate one producer ID before clients start; a new cluster may
+    /// still be electing the allocator group leader.
+    fn wait_producer_ids(&self) -> Result<()> {
         let started = Instant::now();
         let mut attempts = 0;
         loop {
@@ -240,10 +285,10 @@ impl Redpanda {
                 )?;
                 break;
             }
-            if started.elapsed() >= Duration::from_secs(60) {
+            if started.elapsed() >= super::READY {
                 return Err("Redpanda producer-ID startup deadline expired".into());
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(super::READY_POLL);
         }
         Ok(())
     }

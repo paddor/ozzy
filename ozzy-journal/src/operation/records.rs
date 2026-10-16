@@ -41,6 +41,14 @@ impl<'a> BatchSlice<'a> {
             .take(self.range.len())
     }
 }
+fn check_range(batch: &RecordBatch, range: &Range<usize>) -> Result<(), OperationCodecError> {
+    if range.start <= range.end && range.end <= batch.len() {
+        Ok(())
+    } else {
+        Err(OperationCodecError::RecordRange)
+    }
+}
+
 impl<'a> AppendRecordList<'a> {
     /// Original descriptor and payload runs when every input uses shared wire
     /// storage. Partial selections use the input's constant-time position table.
@@ -56,11 +64,12 @@ impl<'a> AppendRecordList<'a> {
         {
             return None;
         }
-        Some(slices.iter().map(|slice| {
+        // An encoded list holds only encoded batches with in-range slices.
+        Some(slices.iter().filter_map(|slice| {
             let RecordBatch::Encoded(records) = slice.batch else {
-                unreachable!("checked encoded record list")
+                return None;
             };
-            records.range(slice.range.clone()).expect("validated range")
+            records.range(slice.range.clone())
         }))
     }
 
@@ -71,34 +80,35 @@ impl<'a> AppendRecordList<'a> {
 
     /// Borrow contiguous IDs, one-byte lengths, and payload runs when all ranges
     /// are packed. General/multipart lists return `None` without materialization.
-    pub fn packed_slices(&self) -> Option<impl Iterator<Item = (&[MessageId], &[u8], &[u8])>> {
+    pub fn packed_slices(
+        &self,
+    ) -> Option<impl Iterator<Item = (&[MessageId], &[u8], &[u8])> + Clone> {
+        let Storage::Batches { slices, .. } = &self.0 else {
+            return None;
+        };
         if !self.is_packed() {
             return None;
         }
-        let Storage::Batches { slices, .. } = &self.0 else {
-            unreachable!("checked packed record list")
-        };
-        Some(slices.iter().map(|slice| {
+        // A packed list holds only tiny batches with in-range slices.
+        Some(slices.iter().filter_map(|slice| {
             let RecordBatch::Tiny(records) = slice.batch else {
-                unreachable!("checked packed record list")
+                return None;
             };
-            (
-                &records.ids()[slice.range.clone()],
-                &records.lengths()[slice.range.clone()],
-                records
-                    .payload_range(slice.range.clone())
-                    .expect("validated range"),
-            )
+            Some((
+                records.ids().get(slice.range.clone())?,
+                records.lengths().get(slice.range.clone())?,
+                records.payload_range(slice.range.clone())?,
+            ))
         }))
     }
 
     /// Borrow a range of group-owned records, including packed tiny payloads.
-    pub fn batch(batch: &'a RecordBatch, range: Range<usize>) -> Self {
-        assert!(range.start <= range.end && range.end <= batch.len());
-        Self(Storage::Batches {
+    pub fn batch(batch: &'a RecordBatch, range: Range<usize>) -> Result<Self, OperationCodecError> {
+        check_range(batch, &range)?;
+        Ok(Self(Storage::Batches {
             len: range.len(),
             slices: smallvec::smallvec![BatchSlice { batch, range }],
-        })
+        }))
     }
     /// Extend a list of group-owned ranges without making record owners.
     pub fn extend_batch(
@@ -106,9 +116,9 @@ impl<'a> AppendRecordList<'a> {
         batch: &'a RecordBatch,
         range: Range<usize>,
     ) -> Result<(), OperationCodecError> {
-        assert!(range.start <= range.end && range.end <= batch.len());
+        check_range(batch, &range)?;
         let Storage::Batches { slices, len } = &mut self.0 else {
-            panic!("group-owned record list required")
+            return Err(OperationCodecError::RecordListKind);
         };
         *len = len
             .checked_add(range.len())
@@ -129,15 +139,14 @@ impl<'a> AppendRecordList<'a> {
         })
     }
 
-    /// Add another slice from the same contiguous partition range.
-    ///
-    /// Panics if this list was constructed from individual descriptors.
+    /// Add another slice from the same contiguous partition range. Fails for
+    /// a list that does not borrow input slices.
     pub fn extend_borrowed(
         &mut self,
         records: &'a [OwnedRecord],
     ) -> Result<(), OperationCodecError> {
         let Storage::Borrowed { slices, len } = &mut self.0 else {
-            panic!("extend_borrowed requires a borrowed record list");
+            return Err(OperationCodecError::RecordListKind);
         };
         let next = len
             .checked_add(records.len())

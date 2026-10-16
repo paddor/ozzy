@@ -265,7 +265,7 @@ async fn cross_host_single_crash_soak() {
 async fn run_crash_soak() {
     let seconds = duration_secs();
     let mut fleet = Fleet::start().await;
-    let policy = fleet.checked.deployment.deployment().topics["orders"].confirmation;
+    let mode = fleet.checked.deployment.deployment().cluster.mode;
     let mut ledger = File::create(std::env::var("OZZY_SOAK_RESULTS").unwrap()).unwrap();
     let mut client = observe(
         &mut fleet.brokers,
@@ -322,7 +322,7 @@ async fn run_crash_soak() {
         if elapsed >= next_report {
             let kills = fleet.kills;
             let record = format!(
-                "{{\"policy\":\"{policy:?}\",\"elapsed_secs\":{},\"verified_records\":{},\"kills\":{kills},\"resumes\":{resumes},\"takeovers\":{takeovers},\"consumers\":{},\"retention_gaps\":{},\"slow_consumers\":{},\"replayed_records\":{}}}",
+                "{{\"mode\":\"{mode:?}\",\"elapsed_secs\":{},\"verified_records\":{},\"kills\":{kills},\"resumes\":{resumes},\"takeovers\":{takeovers},\"consumers\":{},\"retention_gaps\":{},\"slow_consumers\":{},\"replayed_records\":{}}}",
                 elapsed.as_secs(),
                 verified,
                 fleet.consumers,

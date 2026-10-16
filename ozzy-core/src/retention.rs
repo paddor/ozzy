@@ -28,6 +28,8 @@ pub struct Plan {
     pub retire: Vec<u64>,
     /// Exclusive record floor through that prefix; used only when it is nonempty.
     pub record_floor: Offset,
+    /// Exclusive operation floor through the proposed sealed prefix.
+    pub operation_floor: u64,
     /// Selected capacities after the proposed prefix retirement.
     pub selected_bytes: u64,
     /// Seal an aged, fully committed active segment before a subsequent plan.
@@ -54,10 +56,10 @@ impl Plan {
             || active.sealed
             || segments.iter().any(|segment| segment.capacity == 0)
             || segments.windows(2).any(|pair| {
-                !pair[0].sealed
-                    || pair[0].id >= pair[1].id
-                    || pair[0].last_operation > pair[1].last_operation
-                    || pair[0].record_end > pair[1].record_end
+                matches!(pair, [left, right] if !left.sealed
+                    || left.id >= right.id
+                    || left.last_operation > right.last_operation
+                    || left.record_end > right.record_end)
             })
         {
             return Err(PlanError);
@@ -75,6 +77,7 @@ impl Plan {
         };
         let mut retire = Vec::new();
         let mut record_floor = Offset::ZERO;
+        let mut operation_floor = 0;
         for segment in segments.iter().take(maximum_segments) {
             if !segment.sealed || segment.last_operation > committed_operation {
                 break;
@@ -87,11 +90,13 @@ impl Plan {
             }
             selected_bytes -= segment.capacity;
             record_floor = segment.record_end;
+            operation_floor = segment.last_operation.checked_add(1).ok_or(PlanError)?;
             retire.push(segment.id);
         }
         Ok(Self {
             retire,
             record_floor,
+            operation_floor,
             selected_bytes,
             roll_active: active.newest_append_millis.is_some()
                 && expired(active)

@@ -7,6 +7,7 @@ use super::{
 use crate::replica_actor::HistoryReason;
 use crate::replica_actor::io::Completed;
 use crate::replica_actor::{Bytes, MAX_TRANSFER_OPERATIONS, wire};
+use crate::replica_journal::JournalError;
 use crate::replica_journal::ProposalValidation;
 use ozzy_replication::wire::{Operation, Prepare, PrepareBatch};
 use ozzy_replication::{Admission, Commit, NormalReplica, ReplicationError};
@@ -66,13 +67,34 @@ impl ReplicaActor {
                 // image it leaves. Application last: the proposal's ticket
                 // still names the applied prefix it saw.
                 if let Some(admitted) = turn.admitted {
-                    self.complete_admitted(admitted, now);
+                    self.complete_admitted(admitted)?;
                 }
                 if let Some(proposal) = turn.proposal {
                     self.complete_proposal(proposal, now)?;
                 }
                 if let Some(validated) = turn.validated {
-                    self.complete_received(validated?, now)?;
+                    match validated {
+                        crate::replica_journal::ReceivedValidation::Ready(validated) => {
+                            self.complete_received(validated, now)?;
+                        }
+                        crate::replica_journal::ReceivedValidation::Deferred {
+                            validation,
+                            buffer,
+                        } => {
+                            if self.driver.normal().is_some_and(|normal| {
+                                let state = normal.snapshot();
+                                state.scope == validation.scope()
+                                    && state.journal.generation == validation.generation()
+                            }) {
+                                self.work.receive.defer(buffer);
+                            } else {
+                                self.recycle(buffer)?;
+                            }
+                        }
+                        crate::replica_journal::ReceivedValidation::Rejected(error) => {
+                            return Err(error.into());
+                        }
+                    }
                 }
                 if let Some(ticket) = turn.applied {
                     self.complete_applied(ticket)?;
@@ -84,26 +106,23 @@ impl ReplicaActor {
                 }
             }
             Completed::Replay(fetched, to) => self.complete_replay(fetched, to, now)?,
-            _ => unreachable!("election completions handled separately"),
+            // Election completions go to the election path, never here.
+            _ => return Err(JournalError::CompletionMismatch.into()),
         }
         Ok(())
     }
 
-    /// The write is queued on the dedicated writer. Replicated-persisting
-    /// votes now; disk quorum votes after the write and its evidence persist.
+    /// The write is queued on the dedicated writer. The vote waits for its
+    /// `O_DSYNC` completion.
     fn complete_admitted(
         &mut self,
         admitted: crate::replica_journal::AdmittedAppend,
-        now: Duration,
-    ) {
+    ) -> Result<(), ActorError> {
         let (ticket, buffer, persisted) = admitted.into_parts();
         assert!(self.pending_persistence.len() < self.config.pipeline.max_operations);
         self.pending_persistence.push_back(persisted);
-        if self.replicated() {
-            self.ack_at = now;
-        }
         self.work.persisting_bytes.push_back(buffer.body_bytes());
-        self.return_admitted(ticket, buffer);
+        self.return_admitted(ticket, buffer)
     }
 
     /// One queued write completed on the dedicated writer, in admission order.
@@ -116,45 +135,34 @@ impl ReplicaActor {
             .work
             .persisting_bytes
             .pop_front()
-            .expect("one admission per queued write");
-        if self.replicated() {
-            self.driver.complete_buffered_write(ticket, now)?;
-        } else {
-            // O_DSYNC data is on disk; the vote also needs DURABLE evidence.
-            // The written group joins the next barrier batch, which a due
-            // batch starts now instead of after the running turn.
-            self.driver.complete_write(ticket)?;
-            self.work.needs_sync = true;
-            self.work.sync_batch_operations +=
-                usize::try_from(ticket.through().0 - ticket.first().0 + 1)
-                    .expect("bounded write ticket");
-            self.work.sync_batch_body_bytes += body_bytes;
-            self.work.sync_batch_started.get_or_insert(now);
-            if self.pending_sync.is_none()
-                && self.journal.available_command_slots() != 0
-                && let Some(normal) = self.driver.normal()
-            {
-                let primary =
-                    self.configuration.primary(normal.snapshot().scope.view) == self.local;
-                if self.sync_due(primary, now) {
-                    self.schedule_sync()?;
-                    // As in scheduling: the captured group syncs while the next fills.
-                    self.ingress.resume();
-                }
-            }
+            .ok_or(JournalError::CompletionMismatch)?;
+        // `O_DSYNC` made the write durable, and later seals mark it, so the
+        // vote goes now. The group still joins the next `DURABLE` publication,
+        // which a due batch starts now.
+        self.driver.complete_durable_write(ticket, now)?;
+        self.ack_at = now;
+        self.work.last_persisted = Some(now);
+        self.work.needs_sync = true;
+        // A write ticket spans at most one pipeline of operations.
+        self.work.sync_batch_operations += (ticket.through().0 - ticket.first().0 + 1) as usize;
+        self.work.sync_batch_body_bytes += body_bytes;
+        if self.pending_sync.is_none()
+            && self.journal.available_command_slots() != 0
+            && self.driver.normal().is_some()
+            && self.sync_due(now)
+        {
+            self.schedule_sync()?;
+            // As in scheduling: the captured group syncs while the next fills.
+            self.ingress.resume();
         }
         Ok(())
-    }
-
-    pub(in crate::replica_actor) fn replicated(&self) -> bool {
-        self.configuration.policy() == ozzy_replication::QuorumPolicy::Replicated
     }
 
     fn return_admitted(
         &mut self,
         ticket: ozzy_replication::WriteTicket,
         buffer: crate::replica_journal::AppendBuffer,
-    ) {
+    ) -> Result<(), ActorError> {
         if let Some(live) =
             self.work.live.iter_mut().find(|live| {
                 live.generation == ticket.generation() && live.end.op == ticket.through()
@@ -162,8 +170,9 @@ impl ReplicaActor {
         {
             assert!(live.buffer.replace(buffer).is_none());
             live.reply.admitted();
+            Ok(())
         } else {
-            self.recycle(buffer);
+            self.recycle(buffer)
         }
     }
 
@@ -198,21 +207,14 @@ impl ReplicaActor {
                 ticket,
                 first_new: 0,
             }) => {
-                self.work.sync_batch_started.get_or_insert(now);
                 self.work.receive.admitted();
-                if self.configuration.policy() == ozzy_replication::QuorumPolicy::Replicated {
-                    // The retained vote is the core's accepted prefix. The
-                    // validated bytes are held here until their install turn,
-                    // which runs before any election command can capture history.
-                    self.ack_at = now;
-                }
                 assert!(self.work.ready.replace((ticket, validated)).is_none());
                 self.observe_window();
             }
             Err(DriverError::StaleValidation) => {
                 crate::profiling::event(crate::profiling::Event::ReplicaStaleValidation);
                 self.retract_received(now)?;
-                self.recycle(validated.into_buffer());
+                self.recycle(validated.into_buffer())?;
             }
             Err(error) => return Err(error.into()),
             _ => return Err(ActorError::history(HistoryReason::ProposalWindow)),
@@ -225,8 +227,23 @@ impl ReplicaActor {
         result: ProposalValidation,
         now: Duration,
     ) -> Result<(), ActorError> {
-        let reply = self.work.validating.take().expect("owned proposal reply");
-        let mut validated = match result {
+        let reply = self
+            .work
+            .proposals
+            .validated()
+            .ok_or(JournalError::CompletionMismatch)?;
+        let validated = match result {
+            ProposalValidation::Deferred {
+                validation,
+                reason,
+                buffer,
+            } => {
+                self.defer_proposal(
+                    super::ProposalWait { validation, reason },
+                    Submission { buffer, reply },
+                );
+                return Ok(());
+            }
             ProposalValidation::Ready(validated) => validated,
             ProposalValidation::Resolved {
                 validation,
@@ -241,6 +258,15 @@ impl ReplicaActor {
                 return Ok(());
             }
         };
+        self.admit_proposal(validated, reply, now)
+    }
+
+    fn admit_proposal(
+        &mut self,
+        validated: crate::replica_journal::ValidatedAppend,
+        reply: super::Reply,
+        now: Duration,
+    ) -> Result<(), ActorError> {
         if reply.fenced() {
             reply.finish(validated.into_buffer().into(), ProposalOutcome::NotAdmitted);
             return Ok(());
@@ -259,16 +285,12 @@ impl ReplicaActor {
                     crate::profiling::event(crate::profiling::Event::ReplicaStaleValidation);
                     let buffer =
                         crate::replica_journal::ProposalBuffer::from(validated.into_buffer());
-                    if !buffer.has_trimmed_retry()
+                    if !reply.is_maintenance()
+                        && !buffer.has_trimmed_retry()
                         && self.application_ready()
                         && self.driver.scope() == validation.scope()
                     {
-                        assert!(
-                            self.work
-                                .waiting
-                                .replace(Submission { buffer, reply })
-                                .is_none()
-                        );
+                        self.work.proposals.requeue(Submission { buffer, reply });
                     } else {
                         reply.finish(buffer, ProposalOutcome::NotAdmitted);
                     }
@@ -281,7 +303,17 @@ impl ReplicaActor {
                 Err(error) => return Err(error.into()),
                 _ => return Err(ActorError::history(HistoryReason::ProposalWindow)),
             };
-        self.work.sync_batch_started.get_or_insert(now);
+        self.enter_live(ticket, validated, reply)
+    }
+
+    /// Cache the admitted proposal's PREPARE templates in the live window.
+    fn enter_live(
+        &mut self,
+        ticket: ozzy_replication::WriteTicket,
+        mut validated: crate::replica_journal::ValidatedAppend,
+        reply: super::Reply,
+    ) -> Result<(), ActorError> {
+        let validation = validated.validation();
         let payload = validated.shared_bodies();
         let operations: smallvec::SmallVec<[_; MAX_TRANSFER_OPERATIONS]> =
             validated.wire_operations().collect();
@@ -294,7 +326,7 @@ impl ReplicaActor {
         let end = validated
             .prepared()
             .last()
-            .expect("nonempty proposal")
+            .ok_or(JournalError::AppendMismatch)?
             .prefix();
         for operation in &operations {
             self.work.flow.remember(super::flow::operation(*operation));
@@ -320,6 +352,25 @@ impl ReplicaActor {
         Ok(())
     }
 
+    fn defer_proposal(&mut self, original: super::ProposalWait, submission: Submission) {
+        crate::profiling::event(match original.reason {
+            crate::replica_journal::ProposalDeferral::Original(_) => {
+                crate::profiling::Event::OriginalWait
+            }
+            _ => crate::profiling::Event::CapacityDeferral,
+        });
+        if !submission.reply.fenced()
+            && self.application_ready()
+            && self.driver.scope() == original.validation.scope()
+        {
+            self.work.proposals.defer(submission, original);
+        } else {
+            submission
+                .reply
+                .finish(submission.buffer, ProposalOutcome::NotAdmitted);
+        }
+    }
+
     fn complete_retry(
         &mut self,
         validation: ozzy_replication::driver::ValidationTicket,
@@ -328,12 +379,7 @@ impl ReplicaActor {
     ) {
         if self.driver.begin_validation().ok() != Some(validation) {
             if self.application_ready() && self.driver.scope() == validation.scope() {
-                assert!(
-                    self.work
-                        .waiting
-                        .replace(Submission { buffer, reply })
-                        .is_none()
-                );
+                self.work.proposals.requeue(Submission { buffer, reply });
             } else {
                 reply.finish(buffer, ProposalOutcome::NotAdmitted);
             }

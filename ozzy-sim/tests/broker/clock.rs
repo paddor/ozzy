@@ -4,11 +4,7 @@ use ozzy_runtime::replicated::{ReaderStart, SdkClock, TopicReader, TopicReaderCo
 #[tokio::test(flavor = "current_thread")]
 async fn inproc_memory_manual_broker_time_drives_timestamp_seeks_and_age_retention() {
     tokio::time::timeout(Duration::from_secs(60), async {
-        for policy in [
-            Confirmation::LocalDurable,
-            Confirmation::DiskQuorum,
-            Confirmation::ReplicatedPersisting,
-        ] {
+        for mode in [DeploymentMode::Single, DeploymentMode::Three] {
             let runtime = WriterRuntime::new().unwrap();
             let clock = SdkClock::manual();
             let context = ozzy_broker::ServingContext::simulated(
@@ -22,20 +18,21 @@ async fn inproc_memory_manual_broker_time_drives_timestamp_seeks_and_age_retenti
                 memory_nodes: [0].into(),
                 linux_aio: true,
             };
-            let mode = match policy {
-                Confirmation::LocalDurable => DeploymentMode::Single,
-                Confirmation::DiskQuorum | Confirmation::ReplicatedPersisting => {
-                    DeploymentMode::Three
-                }
-            };
-            let configs =
-                broker::deployment_with_resources(&root, mode, policy, 2, &resources, |config| {
+            let configs = broker::deployment_with_resources(
+                &root,
+                broker::Shape {
+                    mode,
+                    partitions: 2,
+                },
+                &resources,
+                |config| {
                     config.topics.get_mut("orders").unwrap().retention =
                         ozzy_config::TopicRetention {
                             max_age_secs: Some(10),
                             max_bytes: None,
                         };
-                });
+                },
+            );
             let checked = configs[0].0.clone();
             let (brokers, _, images) =
                 progress(&clock, broker::start_images(context, configs, true)).await;

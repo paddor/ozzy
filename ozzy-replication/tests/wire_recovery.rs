@@ -1,7 +1,13 @@
 //! Recovery wire evidence remains distinct from normal durable votes.
-
-#[path = "../../ozzy-journal-segment/tests/support/allocations.rs"]
-mod allocations;
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
 
 use ozzy_proto::{GroupId, LinkSessionId, NodeId, RequestId};
 use ozzy_replication::recovery::{RecoveryLog, RecoveryResponse};
@@ -315,7 +321,7 @@ fn recovery_encoders_preserve_caller_storage_on_capacity_and_limit_errors() {
         assert!(encode(&mut output, limits).is_err());
         assert_eq!(output, [0xff; 208]);
         let binding = PeerBinding::new(configuration(), from, session()).unwrap();
-        let ((), count) = allocations::measure(|| {
+        let ((), count) = ozzy_test_alloc::measure(|| {
             let encoded = encode(&mut output, WireLimits::default()).unwrap();
             assert_eq!(
                 decode(
@@ -440,7 +446,7 @@ fn transfer(
     ticket: &ozzy_replication::recovery::RecoveryTicket,
     operation: ozzy_replication::wire::Operation<'_>,
 ) -> ozzy_replication::PreparedOperation {
-    use ozzy_replication::wire::{FetchOps, encode_fetch, encode_ops};
+    use ozzy_replication::wire::{EncodeContext, FetchOps, encode_fetch, encode_ops};
     let fetch = FetchOps {
         scope: ticket.scope(),
         request_id: RequestId::from_bytes([18; 16]),
@@ -470,13 +476,15 @@ fn transfer(
     assert_eq!(decoded_fetch, fetch);
     let mut payload = [0; 16];
     let encoded = encode_ops(
-        node(0),
-        session(),
+        EncodeContext {
+            sender: node(0),
+            session: session(),
+            limits: WireLimits::default(),
+        },
         decoded_fetch,
         &[operation],
         &mut metadata,
         &mut payload,
-        WireLimits::default(),
     )
     .unwrap();
     let ReplicaMessage::Ops(batch) = decode_bytes(

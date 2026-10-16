@@ -1,23 +1,24 @@
 //! Receipt and repair transport policy; durable votes remain in the replication driver.
 
 use crate::replica_actor::HistoryReason;
+use crate::replica_actor::require_normal;
+use crate::replica_transport::EnqueueError;
 use std::collections::VecDeque;
 
-use ozzy_proto::Opcode;
-use ozzy_replication::Configuration;
-use ozzy_replication::flow::{
-    OpenRequest, ReceiveEpoch, Report, StatusOutcome, TransmitError, Transmitter,
-};
+use ozzy_replication::flow::{Report, StatusOutcome, TransmitError, Transmitter};
 use ozzy_replication::wire::{FlowMessage, FlowState};
+use ozzy_replication::{Configuration, PipelineLimits};
+
+mod channels;
+mod packets;
 
 use super::{
     ActorError, Duration, JournalGeneration, Message, NodeId, Prefix, ReplicaActor, Scope,
     SendClass,
 };
-use crate::replica_actor::{ActorConfig, Bytes, PendingIo, wire};
-use crate::replica_journal::ReplicationPositions;
+use crate::replica_actor::{ActorConfig, control_message, wire};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct ReceiptBinding {
     voter: usize,
     channel: ozzy_replication::flow::Channel,
@@ -43,27 +44,35 @@ pub(in crate::replica_actor) struct Flow {
     pub(in crate::replica_actor) pending_publication: Option<ozzy_replication::OpNumber>,
 }
 
+/// One transmitter per remote voter; the local voter has none.
+pub(in crate::replica_actor) fn remote_transmitters(
+    configuration: Configuration,
+    local: NodeId,
+    scope: Scope,
+    config: &ActorConfig,
+    ids: &mut crate::replica_actor::ActorIds,
+) -> Result<[Option<Transmitter>; 3], ActorError> {
+    let mut peers = [None, None, None];
+    for (index, peer) in configuration.voters().iter().enumerate() {
+        if *peer != local {
+            peers[index] = Some(Transmitter::new(
+                scope,
+                config.pipeline,
+                ids.request()?,
+                config.flow_probe,
+                Duration::ZERO,
+            )?);
+        }
+    }
+    Ok(peers)
+}
+
 impl Flow {
     pub(in crate::replica_actor) fn new(
-        configuration: Configuration,
-        local: NodeId,
-        scope: Scope,
+        peers: [Option<Transmitter>; 3],
         key: Option<(Scope, JournalGeneration)>,
         config: &ActorConfig,
-        ids: &mut crate::replica_actor::ActorIds,
     ) -> Result<Self, ActorError> {
-        let mut peers = [None, None, None];
-        for (index, peer) in configuration.voters().iter().enumerate() {
-            if *peer != local {
-                peers[index] = Some(Transmitter::new(
-                    scope,
-                    config.pipeline,
-                    ids.request()?,
-                    config.flow_probe,
-                    Duration::ZERO,
-                )?);
-            }
-        }
         let history_limit = config
             .pipeline
             .max_operations
@@ -107,10 +116,7 @@ impl Flow {
         voter: usize,
         now: Duration,
     ) -> Result<(), ActorError> {
-        self.peers[voter]
-            .as_mut()
-            .expect("remote peer")
-            .replace_session(now)?;
+        remote_peer(&mut self.peers, voter)?.replace_session(now)?;
         self.published = None;
         self.handles[voter] = None;
         // Dispatcher fencing can discard the held frame on a link change.
@@ -171,6 +177,50 @@ impl Flow {
         }
         self.history.push_back(operation);
     }
+
+    /// The last operation a probe answer lets the primary repair. `None`,
+    /// always so without publication, sets no limit.
+    fn repair_limit(&self, received: u64, now: Duration) -> Option<u64> {
+        if !self.publication_enabled {
+            return None;
+        }
+        if self.pending_publication.is_some() {
+            // The shard already owns the next contiguous frame. Repair cannot
+            // make local room for it.
+            return Some(received);
+        }
+        self.receive_progress
+            .repair_limit(received, self.missing.map(|end| end.0), now)
+    }
+
+    /// Stage the remembered operations after `cursor` through `end` in
+    /// `scratch`. A gap in that history misses; a fresh send also needs its
+    /// receipt room in `available`.
+    fn stage_operations(
+        &mut self,
+        cursor: Prefix,
+        end: Prefix,
+        available: Option<PipelineLimits>,
+    ) -> Result<(), PacketSend> {
+        self.scratch.clear();
+        self.scratch.extend(
+            self.history
+                .iter()
+                .filter(|op| op.prefix.op > cursor.op && op.prefix.op <= end.op)
+                .copied(),
+        );
+        if self.scratch.len() as u64 != end.op.0 - cursor.op.0 {
+            return Err(PacketSend::Miss);
+        }
+        if let Some(available) = available
+            && (self.scratch.len() > available.max_operations
+                || self.scratch.iter().map(|op| op.body_bytes).sum::<u64>()
+                    > available.max_body_bytes as u64)
+        {
+            return Err(PacketSend::Wait);
+        }
+        Ok(())
+    }
 }
 
 pub(super) fn operation(operation: wire::Operation<'_>) -> ozzy_replication::flow::Operation {
@@ -207,54 +257,13 @@ impl ReplicaActor {
                     let limit = self
                         .work
                         .flow
-                        .publication_enabled
-                        .then(|| {
-                            if self.work.flow.pending_publication.is_some() {
-                                // The shard already owns the next contiguous
-                                // frame. Repair cannot make local room for it.
-                                return Some(report.received.op.0);
-                            }
-                            self.work.flow.receive_progress.repair_limit(
-                                report.received.op.0,
-                                self.work.flow.missing.map(|end| end.0),
-                                now,
-                            )
-                        })
-                        .flatten()
+                        .repair_limit(report.received.op.0, now)
                         .map(|limit| ozzy_replication::OpNumber(limit.min(probe.tail.op.0)));
                     self.send_flow_state(voter, report, Some(probe.request_id), limit)?;
                 }
             }
             FlowMessage::State(state) if primary == self.local => {
-                let result = self.work.flow.peers[voter]
-                    .as_mut()
-                    .expect("remote peer")
-                    .observe_with_repair_limit(
-                        state.report,
-                        state.request_id,
-                        state.repair_limit,
-                        now,
-                    )?;
-                let established = self.work.flow.peers[voter]
-                    .as_ref()
-                    .and_then(Transmitter::sender)
-                    .is_some_and(|sender| sender.report() == state.report);
-                if (result != StatusOutcome::Ignored || established)
-                    && self.work.flow.handles[voter].is_none_or(|(channel, handle)| {
-                        channel != state.report.channel || handle <= state.handle
-                    })
-                {
-                    self.work.flow.handles[voter] = Some((state.report.channel, state.handle));
-                }
-                if result == StatusOutcome::Verify {
-                    let request = self.work.flow.peers[voter]
-                        .as_ref()
-                        .and_then(Transmitter::candidate)
-                        .expect("history candidate");
-                    self.try_open_flow(voter, request, now)?;
-                } else if result == StatusOutcome::Observed {
-                    self.release_received_prefix(voter)?;
-                }
+                self.observe_flow_state(voter, state, now)?;
             }
             FlowMessage::Prepare { batch, .. } if from == primary => {
                 self.receive_prepare(from, batch, now)?;
@@ -270,11 +279,46 @@ impl ReplicaActor {
         Ok(())
     }
 
+    /// Observe a backup's receipt report on the primary.
+    fn observe_flow_state(
+        &mut self,
+        voter: usize,
+        state: FlowState,
+        now: Duration,
+    ) -> Result<(), ActorError> {
+        let result = remote_peer(&mut self.work.flow.peers, voter)?.observe_with_repair_limit(
+            state.report,
+            state.request_id,
+            state.repair_limit,
+            now,
+        )?;
+        let established = self.work.flow.peers[voter]
+            .as_ref()
+            .and_then(Transmitter::sender)
+            .is_some_and(|sender| sender.report() == state.report);
+        if (result != StatusOutcome::Ignored || established)
+            && self.work.flow.handles[voter].is_none_or(|(channel, handle)| {
+                channel != state.report.channel || handle <= state.handle
+            })
+        {
+            self.work.flow.handles[voter] = Some((state.report.channel, state.handle));
+        }
+        if result == StatusOutcome::Verify {
+            let request = remote_peer(&mut self.work.flow.peers, voter)?
+                .candidate()
+                .ok_or_else(no_channel)?;
+            self.try_open_flow(voter, request, now)?;
+        } else if result == StatusOutcome::Observed {
+            self.release_received_prefix(voter)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn flow_round(&mut self, now: Duration) -> Result<(), ActorError> {
         if !self.application_ready() {
             return Ok(());
         }
-        let snapshot = self.driver.normal().expect("normal flow").snapshot();
+        let snapshot = require_normal(&self.driver)?.snapshot();
         let key = (snapshot.scope, snapshot.journal.generation);
         if self.work.flow.key != Some(key) {
             if snapshot.pending_operations != 0 {
@@ -286,59 +330,72 @@ impl ReplicaActor {
                 .reinitialize(self.ids.channel(snapshot.scope)?, snapshot.applied)
                 .map_err(TransmitError::from)?;
             self.work.flow.key = Some(key);
-            self.work.flow.published = None;
-            let received = self.work.receive_report().received.op;
-            self.work.flow.reset_receipt(received, now);
-            self.bind_receive_epoch();
+            self.restart_receipt(now);
         }
         if self.configuration.primary(snapshot.scope.view) != self.local {
             self.work
                 .receive
                 .ledger
-                .release(
-                    self.driver
-                        .normal()
-                        .expect("normal flow")
-                        .reclaimed_prefix(),
-                )
+                .release(require_normal(&self.driver)?.reclaimed_prefix())
                 .map_err(TransmitError::from)?;
             return Ok(());
         }
         for voter in 0..3 {
-            let to = self.configuration.voters()[voter];
-            let Some(session) = self.session(to) else {
-                continue;
-            };
-            let Some(peer) = &mut self.work.flow.peers[voter] else {
-                continue;
-            };
-            if peer
-                .sender()
-                .is_some_and(|sender| sender.received() == snapshot.accepted)
-                && self.work.cursors[voter].is_some_and(|cursor| cursor.op >= snapshot.accepted.op)
-            {
-                continue;
-            }
-            let queued = self.outbox.queued(to, SendClass::Data).expect("peer").0 > 0;
-            let Some(probe) = peer.poll_probe(snapshot.accepted, queued, now)? else {
-                continue;
-            };
-            let encoded = wire::encode_flow_probe(
-                self.local,
-                session,
-                probe,
-                &mut self.metadata,
-                self.wire_limits,
-            )?;
-            let message = Message::multipart([
-                Bytes::copy_from_slice(&encoded.header),
-                Bytes::copy_from_slice(&self.metadata[..encoded.metadata_bytes]),
-                Bytes::new(),
-            ]);
-            self.enqueue(to, SendClass::Exchange, message)?;
-            crate::profiling::event(crate::profiling::Event::ReplicaProbe);
+            self.send_probe(voter, snapshot.accepted, now)?;
         }
         Ok(())
+    }
+
+    /// Probe a backup whose receipt or commit cursor trails `accepted`.
+    fn send_probe(
+        &mut self,
+        voter: usize,
+        accepted: Prefix,
+        now: Duration,
+    ) -> Result<(), ActorError> {
+        let to = self.configuration.voters()[voter];
+        let Some(session) = self.session(to) else {
+            return Ok(());
+        };
+        let Some(peer) = &mut self.work.flow.peers[voter] else {
+            return Ok(());
+        };
+        if peer
+            .sender()
+            .is_some_and(|sender| sender.received() == accepted)
+            && self.work.cursors[voter].is_some_and(|cursor| cursor.op >= accepted.op)
+        {
+            return Ok(());
+        }
+        let queued = self
+            .outbox
+            .queued(to, SendClass::Data)
+            .ok_or(ActorError::Enqueue(EnqueueError::Peer))?
+            .0
+            > 0;
+        let Some(probe) = peer.poll_probe(accepted, queued, now)? else {
+            return Ok(());
+        };
+        let encoded = wire::encode_flow_probe(
+            self.local,
+            session,
+            probe,
+            &mut self.metadata,
+            self.wire_limits,
+        )?;
+        let message = control_message(encoded, &self.metadata);
+        self.enqueue(to, SendClass::Exchange, message)?;
+        crate::profiling::event(crate::profiling::Event::ReplicaProbe);
+        Ok(())
+    }
+
+    /// Republish receipt from the receive ledger's new channel or retracted
+    /// prefix, and bind PEER sessions to its epoch.
+    fn restart_receipt(&mut self, now: Duration) {
+        self.work.flow.published = None;
+        let received = self.work.receive_report().received.op;
+        self.work.flow.reset_receipt(received, now);
+        self.bind_receive_epoch();
     }
 
     fn bind_receive_epoch(&mut self) {
@@ -361,10 +418,7 @@ impl ReplicaActor {
                 .ledger
                 .retract(self.ids.channel(snapshot.scope)?.epoch, snapshot.accepted)
                 .map_err(TransmitError::from)?;
-            self.work.flow.published = None;
-            let received = self.work.receive_report().received.op;
-            self.work.flow.reset_receipt(received, now);
-            self.bind_receive_epoch();
+            self.restart_receipt(now);
         }
         self.work.receive.reset();
         Ok(())
@@ -387,7 +441,7 @@ impl ReplicaActor {
             .voters()
             .iter()
             .position(|peer| *peer == primary)
-            .expect("primary");
+            .ok_or_else(no_channel)?;
         self.send_flow_state(voter, report, None, None)?;
         self.work.flow.published = Some(report);
         Ok(())
@@ -405,22 +459,20 @@ impl ReplicaActor {
             return Ok(());
         };
         let channel = report.channel;
-        if self
-            .work
-            .flow
-            .local_handle
-            .as_ref()
-            .is_none_or(|bound| bound.channel != channel || bound.session != session)
-        {
-            self.work.flow.local_handle = Some(ReceiptBinding {
-                voter,
-                channel,
-                session,
-                handle: crate::replica_actor::ActorIds::compact_handle()?,
-                established: false,
-            });
-        }
-        let bound = self.work.flow.local_handle.as_ref().expect("bound channel");
+        let bound = match self.work.flow.local_handle {
+            Some(bound) if bound.channel == channel && bound.session == session => bound,
+            _ => {
+                let bound = ReceiptBinding {
+                    voter,
+                    channel,
+                    session,
+                    handle: crate::replica_actor::ActorIds::compact_handle()?,
+                    established: false,
+                };
+                self.work.flow.local_handle = Some(bound);
+                bound
+            }
+        };
         let (handle, confirmed) = (bound.handle, bound.established);
         let state = FlowState {
             handle,
@@ -441,11 +493,7 @@ impl ReplicaActor {
             &mut self.metadata,
             self.wire_limits,
         )?;
-        let message = Message::multipart([
-            Bytes::copy_from_slice(&encoded.header),
-            Bytes::copy_from_slice(&self.metadata[..encoded.metadata_bytes]),
-            Bytes::new(),
-        ]);
+        let message = control_message(encoded, &self.metadata);
         self.enqueue(
             to,
             if state.request_id.is_some() {
@@ -491,459 +539,27 @@ impl ReplicaActor {
             return Ok(());
         };
         let report = compact.report(bound, received)?;
-        if self.work.flow.peers[voter]
-            .as_mut()
-            .expect("bound peer")
-            .observe(report, None, now)?
+        if remote_peer(&mut self.work.flow.peers, voter)?.observe(report, None, now)?
             == StatusOutcome::Observed
         {
             self.release_received_prefix(voter)?;
         }
         Ok(())
     }
-
-    fn known_prefix(&self, wanted: Prefix) -> Result<Option<Prefix>, ActorError> {
-        let snapshot = self
-            .driver
-            .normal()
-            .expect("normal flow history")
-            .snapshot();
-        for known in [snapshot.applied, snapshot.committed, snapshot.accepted] {
-            if known.op == wanted.op {
-                return if known == wanted {
-                    Ok(Some(known))
-                } else {
-                    Err(ActorError::history(HistoryReason::ReceiveWindow))
-                };
-            }
-        }
-        let Some(first) = self.work.flow.history.front() else {
-            return Ok(None);
-        };
-        let Some(index) = wanted
-            .op
-            .0
-            .checked_sub(first.prefix.op.0)
-            .and_then(|index| usize::try_from(index).ok())
-        else {
-            return Ok(None);
-        };
-        let Some(known) = self
-            .work
-            .flow
-            .history
-            .get(index)
-            .map(|operation| operation.prefix)
-        else {
-            return Ok(None);
-        };
-        debug_assert_eq!(known.op, wanted.op, "flow history lost contiguity");
-        if known == wanted {
-            Ok(Some(known))
-        } else {
-            Err(ActorError::history(HistoryReason::ReceiveWindow))
-        }
-    }
-
-    fn try_open_flow(
-        &mut self,
-        voter: usize,
-        request: OpenRequest,
-        now: Duration,
-    ) -> Result<bool, ActorError> {
-        let report = request.report();
-        // A channel's base was independently verified at open. Do not reread
-        // old journal history on every live PUB receipt after cache eviction.
-        let established = self.work.flow.peers[voter]
-            .as_ref()
-            .and_then(Transmitter::sender)
-            .filter(|sender| sender.channel() == report.channel);
-        let base = if let Some(sender) = established {
-            let base = sender.report().base;
-            if base != report.base {
-                return Err(ActorError::history(HistoryReason::ReceiveWindow));
-            }
-            Some(base)
-        } else {
-            self.known_prefix(report.base)?
-        };
-        let (Some(base), Some(received)) = (base, self.known_prefix(report.received)?) else {
-            return Ok(false);
-        };
-        self.adopt_flow(voter, request, base, received, now)
-    }
-
-    fn adopt_flow(
-        &mut self,
-        voter: usize,
-        request: OpenRequest,
-        base: Prefix,
-        received: Prefix,
-        now: Duration,
-    ) -> Result<bool, ActorError> {
-        let same_channel = self.work.flow.peers[voter]
-            .as_ref()
-            .and_then(Transmitter::sender)
-            .is_some_and(|sender| sender.channel() == request.report().channel);
-        let opened = self.work.flow.peers[voter]
-            .as_mut()
-            .expect("remote peer")
-            .open_verified(request, base, received, now)?;
-        if opened {
-            // Old-incarnation packets keep their old epochs.
-            if !same_channel {
-                self.outbox
-                    .discard(self.configuration.voters()[voter], SendClass::Data);
-            }
-            self.release_received_prefix(voter)?;
-        }
-        Ok(opened)
-    }
-
-    fn release_received_prefix(&mut self, voter: usize) -> Result<(), ActorError> {
-        let received = self.work.flow.peers[voter]
-            .as_ref()
-            .and_then(Transmitter::sender)
-            .expect("verified flow")
-            .received();
-        let snapshot = self.driver.normal().expect("normal primary").snapshot();
-        // The primary's independent quorum commit, not receipt, authorizes this.
-        let committed = if received.op <= snapshot.committed.op {
-            received
-        } else {
-            snapshot.committed
-        };
-        self.control(
-            self.configuration.voters()[voter],
-            super::Control::Commit(super::Commit {
-                scope: snapshot.scope,
-                committed,
-            }),
-        )
-    }
-
-    /// True reserves this journal turn, including a barrier drain for a real lookup.
-    pub(super) fn schedule_flow_verification(&mut self) -> Result<bool, ActorError> {
-        if self.work.needs_sync {
-            return Ok(false);
-        }
-        for voter in 0..3 {
-            let Some(request) = self.work.flow.peers[voter]
-                .as_ref()
-                .and_then(Transmitter::candidate)
-            else {
-                continue;
-            };
-            let report = request.report();
-            let snapshot = self.driver.normal().expect("normal flow").snapshot();
-            if report.received.op > snapshot.accepted.op {
-                continue;
-            }
-            if self.pending_sync.is_some() || !self.pending_persistence.is_empty() {
-                return Ok(true); // Reserve quiescence only for an eligible lookup.
-            }
-            self.pending = Some(PendingIo::FlowPositions(
-                self.journal.replication_positions(
-                    self.driver.begin_validation()?,
-                    [report.base.op, report.received.op],
-                )?,
-                voter,
-                request,
-            ));
-            return Ok(true);
-        }
-        Ok(false)
-    }
-
-    pub(in crate::replica_actor) fn complete_flow_verification(
-        &mut self,
-        positions: &ReplicationPositions,
-        voter: usize,
-        request: OpenRequest,
-        now: Duration,
-    ) -> Result<(), ActorError> {
-        if !self.application_ready() {
-            return Ok(());
-        }
-        let snapshot = self.driver.normal().expect("normal flow").snapshot();
-        if snapshot.scope != positions.ticket.scope()
-            || snapshot.journal.generation != positions.ticket.generation()
-            || self.work.flow.peers[voter]
-                .as_ref()
-                .and_then(Transmitter::candidate)
-                != Some(request)
-        {
-            return Ok(());
-        }
-        let [Some(base), Some(received)] = positions.positions else {
-            if request.report().base.op < positions.retained_predecessor.op {
-                let to = self.configuration.voters()[voter];
-                let Some(session) = self.session(to) else {
-                    return Ok(());
-                };
-                let notice = wire::HistoryRetired {
-                    scope: snapshot.scope,
-                    fence: wire::HistoryFence::Receive(request.report().channel.epoch),
-                    before: positions.retained_predecessor,
-                };
-                let encoded = wire::encode_history_retired(
-                    self.local,
-                    session,
-                    notice,
-                    &mut self.metadata,
-                    self.wire_limits,
-                )?;
-                return self.enqueue(
-                    to,
-                    SendClass::Control,
-                    Message::multipart([
-                        Bytes::copy_from_slice(&encoded.header),
-                        Bytes::copy_from_slice(&self.metadata[..encoded.metadata_bytes]),
-                        Bytes::new(),
-                    ]),
-                );
-            }
-            return Err(ActorError::history(HistoryReason::ReceiveWindow));
-        };
-        self.adopt_flow(voter, request, base, received, now)?;
-        Ok(())
-    }
-
-    pub(super) fn send_live(&mut self) -> Result<(), ActorError> {
-        if !self.application_ready() {
-            return Ok(());
-        }
-        if self.work.flow.publication_enabled && self.work.flow.publication.is_none() {
-            let snapshot = self.driver.normal().expect("normal publication").snapshot();
-            if let Some(live) = self
-                .work
-                .live
-                .iter_mut()
-                .find(|live| !live.published && live.scope == snapshot.scope)
-            {
-                let packet = live
-                    .packets
-                    .iter()
-                    .flatten()
-                    .next()
-                    .expect("new canonical packet");
-                let frames: [&[u8]; 3] =
-                    std::array::from_fn(|i| packet.part_slice(i).expect("template"));
-                let encoded = wire::encode_publication(
-                    self.local,
-                    &frames,
-                    snapshot.committed,
-                    &mut self.metadata,
-                    self.wire_limits,
-                )?;
-                self.work.flow.publication = Some(Message::multipart([
-                    Bytes::copy_from_slice(snapshot.scope.group_id.as_bytes()),
-                    Bytes::copy_from_slice(&encoded.header),
-                    Bytes::copy_from_slice(&self.metadata[..encoded.metadata_bytes]),
-                    packet.part_bytes(2).expect("template body"),
-                ]));
-                live.published = true;
-                self.ready_work.mark();
-            }
-        }
-        for index in 0..self.work.live.len() {
-            for voter in 0..3 {
-                let live = &mut self.work.live[index];
-                if live.scope != self.driver.scope() {
-                    continue;
-                }
-                let Some(packet) = live.packets[voter].take() else {
-                    continue;
-                };
-                let (predecessor, end) = (live.predecessor, live.end);
-                let (_, packet) = self.send_cached_packet(voter, packet, predecessor, end)?;
-                self.work.live[index].packets[voter] = Some(packet);
-            }
-        }
-        Ok(())
-    }
-
-    pub(super) fn send_cached_packet(
-        &mut self,
-        voter: usize,
-        packet: Message,
-        predecessor: Prefix,
-        end: Prefix,
-    ) -> Result<(PacketSend, Message), ActorError> {
-        // Return the owned template on every nonterminal path. Polling a live
-        // window without local room/new work must not clone its multipart vectors.
-        let to = self.configuration.voters()[voter];
-        let Some(session) = self.session(to) else {
-            return Ok((PacketSend::Wait, packet));
-        };
-        let Some(peer) = &self.work.flow.peers[voter] else {
-            return Ok((PacketSend::Wait, packet));
-        };
-        let Some(sender) = peer.sender() else {
-            return Ok((PacketSend::Wait, packet));
-        };
-        if self.work.flow.handles[voter].is_none_or(|(channel, _)| channel != sender.channel()) {
-            return Ok((PacketSend::Wait, packet));
-        }
-        let queued = self.outbox.queued(to, SendClass::Data).expect("peer");
-        let repair = peer.repair(queued.0 > 0);
-        // An existing retry blocked on local transport must not become a fresh send.
-        if repair.is_none() && peer.repair(false).is_some() {
-            return Ok((PacketSend::Wait, packet));
-        }
-        if self.work.flow.publication_enabled && repair.is_none() && !peer.needs_catch_up() {
-            return Ok((PacketSend::Wait, packet));
-        }
-        let cursor = repair.map_or(sender.sent(), |repair| repair.after);
-        if cursor.op < predecessor.op || cursor.op >= end.op {
-            return Ok((PacketSend::Miss, packet));
-        }
-        if repair.is_some_and(|repair| end.op > repair.through.op) {
-            return Ok((PacketSend::Miss, packet));
-        }
-        if self.work.flow.publication_enabled
-            && repair.is_none()
-            && peer
-                .catch_up_through()
-                .is_none_or(|through| end.op > through)
-        {
-            return Ok((PacketSend::Miss, packet));
-        }
-        let epoch = sender.channel().epoch;
-        self.work.flow.scratch.clear();
-        self.work.flow.scratch.extend(
-            self.work
-                .flow
-                .history
-                .iter()
-                .filter(|op| op.prefix.op > cursor.op && op.prefix.op <= end.op)
-                .copied(),
-        );
-        if self.work.flow.scratch.len() as u64 != end.op.0 - cursor.op.0 {
-            return Ok((PacketSend::Miss, packet));
-        }
-        if repair.is_none() {
-            let available = sender.available();
-            if self.work.flow.scratch.len() > available.max_operations
-                || self
-                    .work
-                    .flow
-                    .scratch
-                    .iter()
-                    .map(|op| op.body_bytes)
-                    .sum::<u64>()
-                    > available.max_body_bytes as u64
-            {
-                return Ok((PacketSend::Wait, packet));
-            }
-        }
-        let bytes = bound_packet_bytes(&packet);
-        if queued.0 == self.config.data.messages || bytes > self.config.data.bytes - queued.1 {
-            return Ok((PacketSend::Wait, packet));
-        }
-        let committed = self
-            .driver
-            .normal()
-            .expect("normal data")
-            .snapshot()
-            .committed;
-        let commit = if end.op <= committed.op {
-            end
-        } else {
-            committed
-        };
-        let packet = self.bind_packet(packet, epoch, commit, session)?;
-        let peer = self.work.flow.peers[voter].as_mut().expect("remote peer");
-        if let Some(repair) = repair {
-            peer.record_repair(repair, end)
-        } else {
-            peer.record_send(&self.work.flow.scratch)
-        }
-        .map_err(TransmitError::from)?;
-        crate::profiling::count(
-            crate::profiling::Event::ReplicaPayloadBytes,
-            packet.part_bytes(2).expect("payload").len() as u64,
-        );
-        self.outbox
-            .try_enqueue(to, SendClass::Data, packet.clone())
-            .map_err(|(error, _)| ActorError::Enqueue(error))?;
-        crate::profiling::event(if repair.is_some() {
-            crate::profiling::Event::ReplicaRepair
-        } else {
-            crate::profiling::Event::ReplicaSend
-        });
-        Ok((PacketSend::Sent, packet))
-    }
-
-    pub(super) fn bind_packet(
-        &mut self,
-        message: Message,
-        epoch: ReceiveEpoch,
-        commit: Prefix,
-        session: ozzy_proto::LinkSessionId,
-    ) -> Result<Message, ActorError> {
-        let frames: [Bytes; 3] =
-            std::array::from_fn(|index| message.part_bytes(index).expect("owned template"));
-        let envelope = if frames[0].is_empty() {
-            ozzy_proto::Envelope {
-                opcode: Opcode::Prepare,
-                response: false,
-                request_id: None,
-                sender: self.local,
-                session: None,
-            }
-        } else {
-            ozzy_proto::decode_packet(
-                &frames.each_ref().map(AsRef::as_ref),
-                self.wire_limits.envelope,
-            )
-            .map_err(wire::WireError::from)?
-            .envelope
-        };
-        let old_offset = if envelope.opcode == Opcode::PrepareFlow {
-            96
-        } else {
-            80
-        };
-        let metadata = &frames[1];
-        let mut prefix = [0u8; 40];
-        prefix[..8].copy_from_slice(&commit.op.0.to_be_bytes());
-        prefix[8..].copy_from_slice(commit.digest.as_bytes());
-        if old_offset == 96
-            && metadata[80..96] == epoch.get().to_be_bytes()
-            && metadata[136..176] == prefix
-            && envelope.session == Some(session)
-        {
-            return Ok(message);
-        }
-        let length = metadata.len() + 96 - old_offset;
-        self.metadata[..80].copy_from_slice(&metadata[..80]);
-        self.metadata[80..96].copy_from_slice(&epoch.get().to_be_bytes());
-        self.metadata[96..length].copy_from_slice(&metadata[old_offset..]);
-        self.metadata[136..176].copy_from_slice(&prefix);
-        let header = ozzy_proto::Envelope {
-            opcode: Opcode::PrepareFlow,
-            session: Some(session),
-            ..envelope
-        }
-        .encode_header(length, frames[2].len(), self.wire_limits.envelope)
-        .map_err(wire::WireError::from)?;
-        Ok(Message::multipart([
-            Bytes::copy_from_slice(&header),
-            Bytes::copy_from_slice(&self.metadata[..length]),
-            frames[2].clone(),
-        ]))
-    }
 }
 
-fn bound_packet_bytes(packet: &Message) -> usize {
-    let header = packet.part_slice(0).expect("template header");
-    let added = if header.is_empty() {
-        80 // Envelope plus newly bound receive epoch.
-    } else if header[5] == Opcode::Prepare as u8 {
-        16 // Receive epoch; the template already has an envelope.
-    } else {
-        0
-    };
-    16 + packet.byte_len() + added // OMQ destination identity precedes Ozzy frames.
+/// No transmitter or verified channel serves this voter.
+pub(super) fn no_channel() -> ActorError {
+    TransmitError::from(ozzy_replication::flow::FlowError::Channel).into()
+}
+
+/// The transmitter for one remote voter; the local voter has none.
+pub(in crate::replica_actor) fn remote_peer(
+    peers: &mut [Option<Transmitter>; 3],
+    voter: usize,
+) -> Result<&mut Transmitter, ActorError> {
+    peers
+        .get_mut(voter)
+        .and_then(Option::as_mut)
+        .ok_or_else(no_channel)
 }

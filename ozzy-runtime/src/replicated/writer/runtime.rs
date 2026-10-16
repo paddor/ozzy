@@ -8,6 +8,20 @@ use tokio::runtime::Handle;
 
 use crate::signal::CloseSignal;
 
+thread_local! {
+    // Bootstrap factories run through Tokio's Send handle on this same thread.
+    // LocalSet::spawn_local also works outside a currently polled local task.
+    static EXECUTOR: std::cell::RefCell<std::rc::Weak<tokio::task::LocalSet>> = const { std::cell::RefCell::new(std::rc::Weak::new()) };
+}
+
+/// Spawn on this thread's SDK executor; `None` when it has stopped or this
+/// is not the SDK thread.
+pub(in crate::replicated) fn spawn_local<F: Future + 'static>(
+    future: F,
+) -> Option<tokio::task::JoinHandle<F::Output>> {
+    EXECUTOR.with(|executor| Some(executor.borrow().upgrade()?.spawn_local(future)))
+}
+
 /// Background execution shared by native writer clients. Callers may use any
 /// executor, or poll writer futures with a plain-thread executor.
 ///
@@ -56,6 +70,23 @@ impl WriterRuntime {
         &self.0.sdk
     }
 
+    /// Create local owner state only after entering the SDK executor. `None`
+    /// when that executor stopped first.
+    pub(in crate::replicated) async fn on_owner<F, Fut, T>(&self, start: F) -> Option<T>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = T> + 'static,
+        T: Send + 'static,
+    {
+        let owner = self.driver().spawn(async move {
+            match spawn_local(start()) {
+                Some(local) => local.await.ok(),
+                None => None,
+            }
+        });
+        owner.await.ok().flatten()
+    }
+
     /// Stop the SDK executor immediately, without draining producers. Fault
     /// tests retain the OMQ context and restart a distinct SDK owner.
     #[cfg(feature = "simulation")]
@@ -67,33 +98,30 @@ impl WriterRuntime {
 
 fn start(name: &str, stop: CloseSignal) -> std::io::Result<(Handle, JoinHandle<()>)> {
     // Bootstrap only. Record and completion traffic use OMQ and shared signals.
-    let (ready, receive) = std::sync::mpsc::sync_channel(1);
-    let thread = std::thread::Builder::new()
-        .name(name.into())
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build();
-            match runtime {
-                Ok(runtime) => runtime.block_on(async move {
-                    if ready.send(Ok(Handle::current())).is_ok() {
+    let (thread, readiness) = ozzy_io::spawn_ready(name.into(), move |ready| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        match runtime {
+            Ok(runtime) => {
+                let executor = std::rc::Rc::new(tokio::task::LocalSet::new());
+                EXECUTOR.with(|current| *current.borrow_mut() = std::rc::Rc::downgrade(&executor));
+                runtime.block_on(executor.run_until(async move {
+                    if ready.report(Ok(Handle::current())) {
                         stop.closed().await;
                     }
-                }),
-                Err(error) => {
-                    let _ = ready.send(Err(error));
-                }
+                }));
             }
-        })?;
-    match receive.recv() {
-        Ok(Ok(handle)) => Ok((handle, thread)),
-        Ok(Err(error)) => {
-            let _ = thread.join();
-            Err(error)
+            Err(error) => {
+                let _ = ready.report(Err(error));
+            }
         }
+    })?;
+    match readiness.started() {
+        Ok(handle) => Ok((handle, thread)),
         Err(error) => {
             let _ = thread.join();
-            Err(std::io::Error::other(error))
+            Err(error)
         }
     }
 }

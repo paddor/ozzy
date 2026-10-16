@@ -8,9 +8,8 @@ use ozzy_replication::{OpNumber, wire::FetchOps};
 #[test]
 fn unsent_donor_snapshot_before_retirement_cannot_describe_a_newer_checkpoint() {
     let (mut controller, io) = setup();
-    let policy = QuorumPolicy::Durable;
-    let mut donor = replica(&mut controller, io.clone(), 0, policy, 8192);
-    let mut witness = replica(&mut controller, io, 1, policy, 8192);
+    let mut donor = replica(&mut controller, io.clone(), 0, 8192);
+    let mut witness = replica(&mut controller, io, 1, 8192);
     let nonce = RequestId::from_bytes([97; 16]);
     let mut candidate = None;
     for number in 1..=3 {
@@ -26,7 +25,7 @@ fn unsent_donor_snapshot_before_retirement_cannot_describe_a_newer_checkpoint() 
                     .unwrap(),
             );
         }
-        confirm(&mut donor, &witness, policy);
+        confirm(&mut donor, &witness);
         if number < 3 {
             let work = donor.journal.begin_roll(8).unwrap();
             let done = drive(&mut controller, work.publish());
@@ -41,7 +40,7 @@ fn unsent_donor_snapshot_before_retirement_cannot_describe_a_newer_checkpoint() 
         donor.journal.retire_confirmed_history(
             donor.driver.begin_validation().unwrap(),
             ozzy_proto::CheckpointId::from_bytes([98; 16]),
-            ozzy_journal_segment::AsyncRetirementBudget {
+            ozzy_journal_segment::RetirementBudget {
                 max_segments: 2,
                 max_read_bytes: 2 * 32768,
             },
@@ -101,7 +100,7 @@ fn read(replica: &mut Replica, pin: &PinnedRecovery) -> super::super::PreparedRe
 #[test]
 fn owned_donor_canceled_reads_keep_exact_source_while_writes_and_other_donor_continue() {
     let (mut controller, io) = setup();
-    let mut replica = replica(&mut controller, io, 0, QuorumPolicy::Durable, 8192);
+    let mut replica = replica(&mut controller, io, 0, 8192);
     let first = persist(&mut controller, &mut replica);
     let response = replica
         .driver
@@ -172,7 +171,7 @@ fn owned_donor_canceled_reads_keep_exact_source_while_writes_and_other_donor_con
 #[test]
 fn owned_released_and_recreated_donor_rejects_old_completion_even_for_same_nonce() {
     let (mut controller, io) = setup();
-    let mut replica = replica(&mut controller, io, 0, QuorumPolicy::Durable, 8192);
+    let mut replica = replica(&mut controller, io, 0, 8192);
     persist(&mut controller, &mut replica);
     let response = replica
         .driver
@@ -210,7 +209,7 @@ fn owned_released_and_recreated_donor_rejects_old_completion_even_for_same_nonce
 #[test]
 fn owned_donor_requires_installed_bytes_and_preserves_truncated_logical_snapshot() {
     let (mut controller, io) = setup();
-    let mut replica = replica(&mut controller, io, 0, QuorumPolicy::Replicated, 8192);
+    let mut replica = replica(&mut controller, io, 0, 8192);
     let (_, _, receipt1) = admit(&mut controller, &mut replica, 1);
     let response = replica
         .driver

@@ -19,17 +19,7 @@ impl Budget {
         self.bytes = self.bytes.saturating_add(bytes);
         self.steps += 1;
         if self.bytes >= TURN_BYTES || self.steps >= TURN_STEPS {
-            let mut yielded = false;
-            std::future::poll_fn(|cx| {
-                if yielded {
-                    std::task::Poll::Ready(())
-                } else {
-                    yielded = true;
-                    cx.waker().wake_by_ref();
-                    std::task::Poll::Pending
-                }
-            })
-            .await;
+            ozzy_io::signal::yield_once().await;
             self.bytes = 0;
             self.steps = 0;
         }

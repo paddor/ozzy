@@ -2,22 +2,15 @@
 
 use super::{Action, DriverError, ReplicaDriver, Role};
 use crate::wire::Control;
-use crate::{Scope, Status, ViewChangeError};
+use crate::{Scope, VoterIndex, VoterSet};
 
 impl ReplicaDriver {
-    pub(super) fn receive_exit(&mut self, voter: usize, scope: Scope) -> Result<(), DriverError> {
-        match self.role.as_ref().expect("owned role") {
-            Role::Normal(normal) if normal.snapshot().status == Status::Faulted => {
-                return Err(ViewChangeError::Faulted.into());
-            }
-            Role::ViewChanging(changing)
-                if changing.normal_snapshot().status == Status::Faulted =>
-            {
-                return Err(ViewChangeError::Faulted.into());
-            }
-            Role::Installing(installing) => installing.require_pending()?,
-            _ => {}
-        }
+    pub(super) fn receive_exit(
+        &mut self,
+        voter: VoterIndex,
+        scope: Scope,
+    ) -> Result<(), DriverError> {
+        self.require_healthy()?;
         // Neither a distant wish nor a duplicate from another view is evidence
         // that anyone has entered that view. START_VIEW_CHANGE supplies that fence.
         if scope.view < self.scope().view {
@@ -31,12 +24,13 @@ impl ReplicaDriver {
             // request. Answer only the sender, and each sender at most once
             // per retransmission interval, so two such voters fall silent.
             if self.promise_pending() && self.now >= self.exit_echo_at[voter] {
-                self.exit_echo_at[voter] = self.now + self.timing.retransmit;
-                let asked = match self.exit_echo {
+                self.exit_echo_at[voter] = self.now.saturating_add(self.timing.retransmit);
+                let mut asked = match self.exit_echo {
                     Some((old, asked)) if old == scope => asked,
-                    _ => 0,
+                    _ => VoterSet::EMPTY,
                 };
-                self.exit_echo = Some((scope, asked | 1 << voter));
+                asked.insert(voter);
+                self.exit_echo = Some((scope, asked));
             }
             return Ok(());
         }
@@ -49,18 +43,18 @@ impl ReplicaDriver {
                 self.withdraw_exit();
             }
         }
-        self.exit_votes |= 1 << voter;
+        self.exit_votes.insert(voter);
         self.advance_if_exit_quorum()
     }
 
     pub(super) fn request_exit(&mut self) -> Result<(), DriverError> {
         self.exit_retry_at.get_or_insert(self.now);
-        self.exit_votes |= 1 << self.configuration.voter_index(self.local)?;
+        self.exit_votes.insert(self.local);
         self.advance_if_exit_quorum()
     }
 
     fn advance_if_exit_quorum(&mut self) -> Result<(), DriverError> {
-        if self.exit_votes.count_ones() >= 2 {
+        if self.exit_votes.len() >= 2 {
             if self
                 .normal()
                 .is_none_or(|normal| !normal.snapshot().ready_for_appends)
@@ -76,17 +70,13 @@ impl ReplicaDriver {
     }
 
     pub(super) fn withdraw_exit(&mut self) {
-        let local = self
-            .configuration
-            .voter_index(self.local)
-            .expect("configured local voter");
-        self.exit_votes &= !(1 << local);
+        self.exit_votes.remove(self.local);
         self.exit_retry_at = None;
     }
 
     fn promise_pending(&self) -> bool {
         matches!(
-            self.role.as_ref().expect("owned role"),
+            &self.role,
             Role::ViewChanging(changing) if changing.promised_view() != changing.scope().view
         )
     }
@@ -94,14 +84,13 @@ impl ReplicaDriver {
     /// Support one sender's exit from an older view per call. The sender
     /// retransmits, so a lost answer is repeated after that interval.
     pub(super) fn exit_echo_action(&mut self) -> Option<Action> {
-        let (scope, asked) = self.exit_echo.take()?;
-        let voter = asked.trailing_zeros() as usize;
-        let remaining = asked & !(1 << voter);
-        if remaining != 0 {
-            self.exit_echo = Some((scope, remaining));
+        let (scope, mut asked) = self.exit_echo.take()?;
+        let voter = asked.pop_first()?;
+        if !asked.is_empty() {
+            self.exit_echo = Some((scope, asked));
         }
         Some(Action::Send {
-            to: self.configuration.voters()[voter],
+            to: self.configuration.voter(voter),
             message: Control::ExitView(scope),
         })
     }
@@ -110,7 +99,7 @@ impl ReplicaDriver {
         if self.now < self.exit_retry_at? {
             return None;
         }
-        self.exit_retry_at = Some(self.now + self.timing.retransmit);
+        self.exit_retry_at = Some(self.now.saturating_add(self.timing.retransmit));
         Some(Action::Broadcast(Control::ExitView(self.scope())))
     }
 }

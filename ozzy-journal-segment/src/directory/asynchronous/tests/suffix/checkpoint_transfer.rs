@@ -3,6 +3,27 @@ use crate::{CanonicalCheckpointImport, CheckpointRecovery};
 use ozzy_core::state::{CanonicalState, MemoryIdentityIndex, StateLimits, StateSnapshotLimits};
 use ozzy_proto::{CheckpointId, OperationId};
 
+async fn receive_image(
+    journal: &Journal,
+    state: &CanonicalState,
+    id: CheckpointId,
+) -> Result<crate::CheckpointInbox, crate::SuffixReplacementError> {
+    let core = state.encode_snapshot(StateSnapshotLimits::default())?;
+    let mut bytes = ozzy_core::checkpoint::Layout::new(core.len() as u64, None)?
+        .encode()
+        .to_vec();
+    bytes.extend_from_slice(&core);
+    let digest =
+        ozzy_journal::integrity::hash(crate::checkpoint::CHECKPOINT_STATE_HASH_CONTEXT, &bytes);
+    let mut inbox = journal
+        .begin_checkpoint_receive(id, bytes.len() as u64, digest)
+        .await?;
+    for fragment in bytes.chunks(inbox.fragment_bytes()) {
+        inbox.push(inbox.through(), fragment).await?;
+    }
+    Ok(inbox)
+}
+
 #[test]
 fn checkpoint_transfer_selects_destination_state_and_retained_chain_before_voting() {
     for reset_checkpoint in [false, true] {
@@ -29,18 +50,18 @@ fn checkpoint_transfer(reset_checkpoint: bool) {
     let body = ozzy_journal::operation::OperationBody::Barrier(ozzy_journal::operation::Barrier {
         operation_id: OperationId::from_bytes(BODIES[0]),
     });
-    let plan = state.prepare(1, &body, &identities, &state).unwrap();
+    let plan = state.prepare(1, &body, &identities).unwrap();
     state.apply(plan, &mut identities).unwrap();
     let mut replacement = request(&journal, accepted);
     replacement.promised_view = 2;
     replacement.last_normal_view = 2;
+    let id = CheckpointId::from_bytes([91; 16]);
+    let inbox = drive(&mut controller, receive_image(&journal, &state, id)).unwrap();
     let mut installing = drive(
         &mut controller,
         journal.begin_checkpoint_replacement(
             CONFIG,
-            replacement,
-            accepted,
-            stream_limits(),
+            stream_request(replacement, accepted),
             CheckpointRecovery {
                 predecessor: anchor,
                 position: anchor,
@@ -49,17 +70,18 @@ fn checkpoint_transfer(reset_checkpoint: bool) {
     )
     .unwrap();
     drive(&mut controller, installing.append_chunk(&source[1..])).unwrap();
-    let id = CheckpointId::from_bytes([91; 16]);
     let mut journal = drive(
         &mut controller,
         installing.finish_with_checkpoint(CanonicalCheckpointImport {
             id,
             position: anchor,
-            state: &state,
-            limits: StateSnapshotLimits::default(),
+            image: &inbox,
+            state_limits: StateLimits::default(),
+            snapshot_limits: StateSnapshotLimits::default(),
         }),
     )
     .unwrap();
+    drive(&mut controller, inbox.discard()).unwrap();
     assert_eq!(journal.manifest.checkpoint.unwrap().position, anchor);
     assert_eq!(journal.manifest.segments[0].first_chain.next_op_number(), 2);
     assert_eq!(journal.manifest.committed, accepted);
@@ -94,7 +116,7 @@ fn checkpoint_transfer(reset_checkpoint: bool) {
 
 async fn checkpoint_target(io: ozzy_io::Local, reset_checkpoint: bool) -> Journal {
     if reset_checkpoint {
-        let directory = crate::AsyncRecoveryDirectory::open_for_repair(
+        let directory = crate::RecoveryDirectory::open_for_repair(
             "/group".into(),
             io,
             identity(),
@@ -148,7 +170,7 @@ fn checkpoint_selection_crash_cuts_leave_old_or_complete_nonvoting_history() {
     let body = ozzy_journal::operation::OperationBody::Barrier(ozzy_journal::operation::Barrier {
         operation_id: OperationId::from_bytes(BODIES[0]),
     });
-    let plan = state.prepare(1, &body, &identities, &state).unwrap();
+    let plan = state.prepare(1, &body, &identities).unwrap();
     state.apply(plan, &mut identities).unwrap();
     for immediate in [false, true] {
         let mut finished = false;
@@ -161,12 +183,12 @@ fn checkpoint_selection_crash_cuts_leave_old_or_complete_nonvoting_history() {
             let done = super::super::recovery::run_cut(
                 &mut controller,
                 async {
+                    let id = CheckpointId::from_bytes([92; 16]);
+                    let inbox = receive_image(&journal, &state, id).await?;
                     let mut installing = journal
                         .begin_checkpoint_replacement(
                             CONFIG,
-                            replacement,
-                            accepted,
-                            stream_limits(),
+                            stream_request(replacement, accepted),
                             CheckpointRecovery {
                                 predecessor: anchor,
                                 position: anchor,
@@ -174,15 +196,18 @@ fn checkpoint_selection_crash_cuts_leave_old_or_complete_nonvoting_history() {
                         )
                         .await?;
                     installing.append_chunk(&source[1..]).await?;
-                    Box::pin(
-                        installing.finish_with_checkpoint(CanonicalCheckpointImport {
-                            id: CheckpointId::from_bytes([92; 16]),
+                    let journal = Box::pin(installing.finish_with_checkpoint(
+                        CanonicalCheckpointImport {
+                            id,
                             position: anchor,
-                            state: &state,
-                            limits: StateSnapshotLimits::default(),
-                        }),
-                    )
-                    .await
+                            image: &inbox,
+                            state_limits: StateLimits::default(),
+                            snapshot_limits: StateSnapshotLimits::default(),
+                        },
+                    ))
+                    .await?;
+                    inbox.discard().await?;
+                    Ok::<_, crate::SuffixReplacementError>(journal)
                 },
                 cut,
                 immediate,
@@ -226,8 +251,10 @@ async fn open_nonvoting(io: ozzy_io::Local, generation: u128) -> Result<Journal,
     Journal::open(
         "/group".into(),
         io,
-        identity(),
-        Some(&marker),
+        crate::ExpectedStore {
+            identity: identity(),
+            configuration: Some(&marker),
+        },
         JournalGeneration(generation),
         limits(),
     )

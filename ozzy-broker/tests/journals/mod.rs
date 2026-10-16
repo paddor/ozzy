@@ -1,8 +1,7 @@
 use super::{SINGLE, host, ids};
 use ozzy_broker::{CheckedConfig, JournalConfig, JournalPlan, PartitionAuthority};
 use ozzy_config::{
-    Affinity, BrokerIdentity, Confirmation, Deployment, DeploymentMode, IoBackend, QueueBudget,
-    Shard,
+    Affinity, BrokerIdentity, Deployment, DeploymentMode, IoBackend, QueueBudget, Shard,
 };
 use ozzy_replication::{Digest, JournalGeneration};
 use std::{collections::BTreeMap, path::Path};
@@ -17,16 +16,14 @@ mod startup;
 fn fixture(
     root: &Path,
     mode: DeploymentMode,
-    policy: Confirmation,
     partitions: u32,
 ) -> Vec<(CheckedConfig, BrokerIdentity, JournalPlan)> {
-    fixture_backend(root, mode, policy, partitions, IoBackend::Pool)
+    fixture_backend(root, mode, partitions, IoBackend::Pool)
 }
 
 fn fixture_backend(
     root: &Path,
     mode: DeploymentMode,
-    policy: Confirmation,
     partitions: u32,
     backend: IoBackend,
 ) -> Vec<(CheckedConfig, BrokerIdentity, JournalPlan)> {
@@ -34,7 +31,6 @@ fn fixture_backend(
     config.cluster.mode = mode;
     let topic = config.topics.get_mut("orders").unwrap();
     topic.partitions = partitions;
-    topic.confirmation = policy;
     topic.segment_bytes = 1024 * 1024;
     topic.max_append_bytes = 64 * 1024;
     let template = config.brokers.remove("laptop").unwrap();
@@ -106,50 +102,41 @@ fn storage(checked: &CheckedConfig, local: &BrokerIdentity) {
 
 #[test]
 fn journal_membership_is_identical_across_different_local_shard_counts() {
-    for policy in [Confirmation::DiskQuorum, Confirmation::ReplicatedPersisting] {
-        let directory = tempfile::tempdir().unwrap();
-        let brokers = fixture(directory.path(), DeploymentMode::Three, policy, 6);
-        for partition in 0..6 {
-            let configs: Vec<_> = brokers
-                .iter()
-                .map(|(_, _, plan)| {
-                    let JournalConfig::Replicated(config) = &plan.partitions[partition].config
-                    else {
-                        panic!("replicated placement downgraded");
-                    };
-                    config
-                })
-                .collect();
-            assert!(
-                configs
-                    .windows(2)
-                    .all(|pair| pair[0].configuration == pair[1].configuration)
-            );
-            let members = &brokers[0].0.identity.topics["orders"].partitions[partition].members;
-            assert_eq!(
-                configs[0]
-                    .configuration
-                    .voters()
-                    .map(|voter| *voter.node_id.as_bytes()),
-                std::array::from_fn(|index| *members[index].as_bytes())
-            );
-            assert_ne!(configs[0].identity.store_id, configs[1].identity.store_id);
-            assert_ne!(configs[0].identity.volume_id, configs[1].identity.volume_id);
-        }
-        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    let directory = tempfile::tempdir().unwrap();
+    let brokers = fixture(directory.path(), DeploymentMode::Three, 6);
+    for partition in 0..6 {
+        let configs: Vec<_> = brokers
+            .iter()
+            .map(|(_, _, plan)| {
+                let JournalConfig::Replicated(config) = &plan.partitions[partition].config else {
+                    panic!("replicated placement downgraded");
+                };
+                config
+            })
+            .collect();
+        assert!(
+            configs
+                .windows(2)
+                .all(|pair| pair[0].configuration == pair[1].configuration)
+        );
+        let members = &brokers[0].0.identity.topics["orders"].partitions[partition].members;
+        assert_eq!(
+            configs[0]
+                .configuration
+                .voters()
+                .map(|voter| *voter.node_id.as_bytes()),
+            std::array::from_fn(|index| *members[index].as_bytes())
+        );
+        assert_ne!(configs[0].identity.store_id, configs[1].identity.store_id);
+        assert_ne!(configs[0].identity.volume_id, configs[1].identity.volume_id);
     }
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
 }
 
 #[test]
 fn native_journal_planning_rejects_impossible_budgets_and_unbound_principals() {
     let directory = tempfile::tempdir().unwrap();
-    let (mut checked, local, _) = fixture(
-        directory.path(),
-        DeploymentMode::Single,
-        Confirmation::LocalDurable,
-        1,
-    )
-    .remove(0);
+    let (mut checked, local, _) = fixture(directory.path(), DeploymentMode::Single, 1).remove(0);
     let principals = principals(&checked.identity);
     assert!(JournalPlan::new(&checked, &local, &BTreeMap::new()).is_err());
     checked.plan.controllers[0].workers.queued_bytes = 64 * 1024;
@@ -163,12 +150,7 @@ fn native_journal_planning_rejects_impossible_budgets_and_unbound_principals() {
 #[test]
 fn native_actor_transfer_limits_match_across_asymmetric_shard_budgets() {
     let directory = tempfile::tempdir().unwrap();
-    let brokers = fixture(
-        directory.path(),
-        DeploymentMode::Three,
-        Confirmation::DiskQuorum,
-        6,
-    );
+    let brokers = fixture(directory.path(), DeploymentMode::Three, 6);
     let mut config = brokers[0].0.deployment.deployment().clone();
     config.brokers.get_mut("broker-1").unwrap().topology.shards[0]
         .budget

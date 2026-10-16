@@ -1,3 +1,13 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
+
 use ozzy_journal::operation::{
     Barrier, CanonicalOperation, OperationBody, OperationLimits, canonical_body_digest,
     encode_operation_body,
@@ -8,8 +18,8 @@ use ozzy_replication::wire::{
 };
 use ozzy_replication::{
     Admission, Configuration, Digest, DoViewChange, FrozenLog, InstallOutcome, JournalGeneration,
-    NormalReplica, PipelineLimits, Prefix, PreparedOperation, StartView, StartViewChange,
-    ViewChange, ViewChangeError,
+    NormalReplica, PipelineLimits, Prefix, PreparedOperation, ReceivedStart, StartView,
+    StartViewChange, ViewChange, ViewChangeError,
 };
 
 fn node(index: u8) -> NodeId {
@@ -234,8 +244,10 @@ fn decoded_start_view_still_requires_installation_and_a_fresh_tail_quorum() {
     };
     let mut pending = backup
         .install_backup(
-            node(2),
-            start,
+            ReceivedStart {
+                from: node(2),
+                start,
+            },
             JournalGeneration(21),
             &[operation()],
             |_, _| None,

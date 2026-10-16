@@ -79,6 +79,7 @@ pub(super) enum PendingIo {
         ozzy_replication::wire::FetchOps,
     ),
     Retention(JournalCompletion<crate::replica_journal::RetentionTurn>),
+    IdentityRetention(JournalCompletion<crate::replica_journal::IdentityRetention>),
     OrphanCleanup(JournalCompletion<crate::replica_journal::OwnedCleanedStorage>),
     MetadataCleanup(JournalCompletion<crate::replica_journal::OwnedCleanedStorage>),
     StorageValidation(JournalCompletion<crate::replica_journal::ValidatedStorage>),
@@ -116,6 +117,7 @@ pub(super) enum Completed {
         ozzy_replication::wire::FetchOps,
     ),
     Retention(crate::replica_journal::RetentionTurn),
+    IdentityRetention(crate::replica_journal::IdentityRetention),
     OrphanCleanup(crate::replica_journal::OwnedCleanedStorage),
     MetadataCleanup(crate::replica_journal::OwnedCleanedStorage),
     StorageValidation(crate::replica_journal::ValidatedStorage),
@@ -150,6 +152,7 @@ impl PendingIo {
                 Completed::RetiredLookup(future.await?, *to, *request)
             }
             Self::Retention(future) => Completed::Retention(future.await?),
+            Self::IdentityRetention(future) => Completed::IdentityRetention(future.await?),
             Self::OrphanCleanup(future) => Completed::OrphanCleanup(future.await?),
             Self::MetadataCleanup(future) => Completed::MetadataCleanup(future.await?),
             Self::StorageValidation(future) => Completed::StorageValidation(future.await?),

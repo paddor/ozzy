@@ -7,11 +7,13 @@ use std::{
     time::Duration,
 };
 
+/// Connect, read, and write limit for one allocation probe.
+const SOCKET: Duration = Duration::from_secs(2);
+
 pub(super) fn allocate(endpoint: &str) -> Result<Option<i64>> {
-    let mut socket =
-        TcpStream::connect_timeout(&endpoint.parse::<SocketAddr>()?, Duration::from_secs(2))?;
-    socket.set_read_timeout(Some(Duration::from_secs(2)))?;
-    socket.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let mut socket = TcpStream::connect_timeout(&endpoint.parse::<SocketAddr>()?, SOCKET)?;
+    socket.set_read_timeout(Some(SOCKET))?;
+    socket.set_write_timeout(Some(SOCKET))?;
     let client = b"ozzy-fixture";
     let mut request = Vec::new();
     request.extend_from_slice(&22_i16.to_be_bytes()); // API key
@@ -65,9 +67,7 @@ mod tests {
             let endpoint = listener.local_addr().unwrap().to_string();
             let server = thread::spawn(move || {
                 let (mut socket, _) = listener.accept().unwrap();
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
+                socket.set_read_timeout(Some(SOCKET)).unwrap();
                 let mut request = [0; 32];
                 socket.read_exact(&mut request).unwrap();
                 assert_eq!(i32::from_be_bytes(request[..4].try_into().unwrap()), 28);

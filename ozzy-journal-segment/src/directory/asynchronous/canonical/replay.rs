@@ -1,11 +1,11 @@
 use super::Journal;
 use crate::{
-    AsyncJournalIdentityIndex, AsyncJournalIndexSnapshot, CanonicalRecoveryLimits,
-    CanonicalStateRecoveryError as Error, ReplayError,
+    CanonicalRecoveryLimits, CanonicalStateRecoveryError as Error, JournalIdentityIndex,
+    JournalIndexSnapshot, ReplayError,
 };
 use ozzy_core::state::{
     CanonicalImages, CanonicalImagesError, CanonicalState, IdentityClaim, IdentityIndex,
-    IdentityIndexError, IdentityKey,
+    IdentityIndexError, IdentityKey, RecoveredImages, TransitionPlan,
 };
 use ozzy_journal::operation::{OperationBody, decode_operation_body};
 
@@ -16,78 +16,147 @@ impl Journal {
     pub async fn recover_canonical_images(
         &mut self,
         limits: CanonicalRecoveryLimits,
-    ) -> Result<CanonicalImages<AsyncJournalIdentityIndex>, Error> {
-        let initial = self
-            .selected_canonical_checkpoint(limits.state, limits.snapshot, limits.checkpoint)
-            .await?
-            .unwrap_or_else(|| CanonicalState::new(limits.state));
+    ) -> Result<CanonicalImages<JournalIdentityIndex>, Error> {
+        let initial = self.initial_canonical_state(limits).await?;
         let (committed_snapshot, accepted_snapshot) =
             self.build_recovery_index_snapshots(limits.index).await?;
-        let mut committed = initial.clone();
-        let mut speculative = initial;
-        let mut pending = Vec::new();
-        let mut accepted_only_seen = false;
+        let mut images = Replayed {
+            committed: initial.clone(),
+            speculative: initial,
+            pending: Vec::new(),
+            accepted_only_seen: false,
+            max_pending: limits.accepted_transitions,
+        };
         finish_replay(
             self.replay_accepted_async(async |item| {
-                let body = decode_operation_body(
-                    item.operation.kind,
-                    &item.operation.body,
-                    self.limits.operations,
-                )?;
+                let op = item.operation;
+                let body = decode_operation_body(op.kind, &op.body, self.limits.operations)?;
                 let mut replay =
-                    Resolved::new(&accepted_snapshot, &body, speculative.revision()).await?;
+                    Resolved::new(&accepted_snapshot, &body, images.speculative.revision()).await?;
                 if item.committed {
-                    if accepted_only_seen {
-                        return Err(CanonicalImagesError::CommittedAfterAccepted.into());
-                    }
-                    let plan = committed
-                        .prepare(item.operation.op_number, &body, &replay, &committed)
-                        .map_err(CanonicalImagesError::from)?;
-                    committed
-                        .apply(plan.clone(), &mut replay)
-                        .map_err(CanonicalImagesError::from)?;
-                    speculative
-                        .apply(plan, &mut replay)
-                        .map_err(CanonicalImagesError::from)?;
+                    images.commit(op.op_number, &body, &mut replay)
                 } else {
-                    accepted_only_seen = true;
-                    if pending.len() >= limits.accepted_transitions {
-                        return Err(CanonicalImagesError::PendingCapacity.into());
-                    }
-                    let plan = speculative
-                        .prepare(item.operation.op_number, &body, &replay, &committed)
-                        .map_err(CanonicalImagesError::from)?;
-                    speculative
-                        .apply(plan.clone(), &mut replay)
-                        .map_err(CanonicalImagesError::from)?;
-                    pending.push(plan);
+                    images.accept(op.op_number, &body, &mut replay)
                 }
-                Ok(())
             })
             .await,
         )?;
-        if committed.revision() != self.committed_position()?.op_number
-            || speculative.revision() != self.accepted_position()?.op_number
+        if images.committed.revision() != self.committed_position()?.op_number
+            || images.speculative.revision() != self.accepted_position()?.op_number
         {
             return Err(Error::PositionMismatch);
         }
         Ok(CanonicalImages::from_recovered(
-            committed,
-            speculative,
-            AsyncJournalIdentityIndex::new(
-                committed_snapshot,
-                limits.retained_identities,
-                limits.retained_identities,
-            ),
-            AsyncJournalIdentityIndex::new(
-                accepted_snapshot,
-                limits.retained_identities,
-                limits.retained_identities,
-            ),
-            pending,
+            RecoveredImages {
+                committed: images.committed,
+                committed_identities: identities(committed_snapshot, limits),
+                speculative: images.speculative,
+                speculative_identities: identities(accepted_snapshot, limits),
+                pending: images.pending,
+            },
             limits.accepted_transitions,
         )?)
     }
+
+    /// The selected checkpoint's canonical state, or empty state without one.
+    pub(super) async fn initial_canonical_state(
+        &self,
+        limits: CanonicalRecoveryLimits,
+    ) -> Result<CanonicalState, Error> {
+        Ok(self
+            .selected_canonical_checkpoint(limits.state, limits.snapshot, limits.checkpoint)
+            .await?
+            .unwrap_or_else(|| CanonicalState::new(limits.state)))
+    }
+}
+
+/// Committed and speculative images replayed together. Accepted-only
+/// operations follow every committed one and stay pending plans.
+struct Replayed {
+    committed: CanonicalState,
+    speculative: CanonicalState,
+    pending: Vec<TransitionPlan>,
+    accepted_only_seen: bool,
+    max_pending: usize,
+}
+
+impl Replayed {
+    /// Apply a committed operation to both images.
+    fn commit(
+        &mut self,
+        op_number: u64,
+        body: &OperationBody<'_>,
+        replay: &mut Resolved,
+    ) -> Result<(), Error> {
+        if self.accepted_only_seen {
+            return Err(CanonicalImagesError::CommittedAfterAccepted.into());
+        }
+        let plan = self
+            .committed
+            .prepare(op_number, body, &*replay)
+            .map_err(CanonicalImagesError::from)?;
+        self.committed
+            .apply(plan.clone(), replay)
+            .map_err(CanonicalImagesError::from)?;
+        self.speculative
+            .apply(plan, replay)
+            .map_err(CanonicalImagesError::from)?;
+        Ok(())
+    }
+
+    /// Apply an accepted-only operation to the speculative image and keep
+    /// its plan pending.
+    fn accept(
+        &mut self,
+        op_number: u64,
+        body: &OperationBody<'_>,
+        replay: &mut Resolved,
+    ) -> Result<(), Error> {
+        self.accepted_only_seen = true;
+        if self.pending.len() >= self.max_pending {
+            return Err(CanonicalImagesError::PendingCapacity.into());
+        }
+        let plan = self
+            .speculative
+            .prepare(op_number, body, &*replay)
+            .map_err(CanonicalImagesError::from)?;
+        self.speculative
+            .apply(plan.clone(), replay)
+            .map_err(CanonicalImagesError::from)?;
+        self.pending.push(plan);
+        Ok(())
+    }
+}
+
+/// Identity index over `snapshot`, retaining the configured identities.
+pub(super) fn identities(
+    snapshot: JournalIndexSnapshot,
+    limits: CanonicalRecoveryLimits,
+) -> JournalIdentityIndex {
+    JournalIdentityIndex::new(
+        snapshot,
+        limits.retained_identities,
+        limits.retained_identities,
+    )
+}
+
+/// Images with no pending transitions: committed and speculative are both
+/// `state` with `identities`.
+pub(super) fn settled_images(
+    state: CanonicalState,
+    identities: JournalIdentityIndex,
+    pending_capacity: usize,
+) -> Result<CanonicalImages<JournalIdentityIndex>, CanonicalImagesError> {
+    CanonicalImages::from_recovered(
+        RecoveredImages {
+            committed: state.clone(),
+            committed_identities: identities.clone(),
+            speculative: state,
+            speculative_identities: identities,
+            pending: Vec::new(),
+        },
+        pending_capacity,
+    )
 }
 
 /// One operation's exact pre-resolved identity. No history-sized overlay and no
@@ -96,7 +165,7 @@ pub(super) struct Resolved(Option<(IdentityKey, Option<IdentityClaim>)>);
 
 impl Resolved {
     pub(super) async fn new(
-        snapshot: &AsyncJournalIndexSnapshot,
+        snapshot: &JournalIndexSnapshot,
         body: &OperationBody<'_>,
         through: u64,
     ) -> Result<Self, Error> {

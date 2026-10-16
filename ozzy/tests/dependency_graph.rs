@@ -2,7 +2,16 @@
 //!
 //! Only normal dependencies count. Dev and build dependencies may cross layers
 //! for tests and benchmarks. `ozzy-bench` may depend on any crate; no crate may
-//! depend on it or on `ozzy-sim` outside dev dependencies.
+//! depend on it, `ozzy-sim`, or `ozzy-test-alloc` outside dev dependencies.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
 
 use std::collections::BTreeSet;
 use std::process::Command;
@@ -16,7 +25,8 @@ const BOUNDARY: &[&str] = &["fanring", "omq-tokio", "rustix", "tokio"];
 /// Allowed normal dependencies on workspace crates and boundary libraries.
 const ALLOWED: &[(&str, &[&str])] = &[
     ("ozzy-proto", &[]),
-    ("ozzy-config", &[]),
+    // Deployment validation applies the protocol's endpoint rules.
+    ("ozzy-config", &["ozzy-proto"]),
     // Deployment assembly selects storage backends, starts application shards,
     // and binds the shared frontend. Lower layers never depend on the broker.
     (
@@ -37,7 +47,12 @@ const ALLOWED: &[(&str, &[&str])] = &[
         ],
     ),
     ("ozzy-io", &["fanring", "tokio"]),
-    ("ozzy-io-pool", &["fanring", "rustix", "ozzy-io", "tokio"]),
+    ("ozzy-test-alloc", &[]),
+    ("ozzy-telemetry", &["omq-tokio"]),
+    (
+        "ozzy-io-pool",
+        &["fanring", "rustix", "ozzy-io", "ozzy-telemetry", "tokio"],
+    ),
     ("ozzy-io-aio", &["rustix", "ozzy-io", "ozzy-io-pool"]),
     ("ozzy-journal", &["ozzy-proto"]),
     ("ozzy-core", &["ozzy-journal", "ozzy-proto"]),
@@ -60,6 +75,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
             "ozzy-io-aio",
             "ozzy-journal",
             "ozzy-proto",
+            "ozzy-telemetry",
         ],
     ),
     (
@@ -73,10 +89,17 @@ const ALLOWED: &[(&str, &[&str])] = &[
             "ozzy-journal-segment",
             "ozzy-proto",
             "ozzy-replication",
+            "ozzy-telemetry",
             "tokio",
         ],
     ),
     ("ozzy", &["omq-tokio", "ozzy-proto", "ozzy-runtime"]),
+    // The console core uses only the admin codec. Its terminal frontend adds
+    // the OMQ client and reads the deployment config for the endpoint.
+    (
+        "ozzy-ui",
+        &["omq-tokio", "ozzy-config", "ozzy-proto", "tokio"],
+    ),
     (
         "ozzy-sim",
         &[
@@ -115,6 +138,11 @@ fn workspace_metadata() -> Value {
     serde_json::from_slice(&output.stdout).expect("cargo metadata JSON")
 }
 
+/// User commands as (package, binary). Every other executable, tests
+/// included, starts with `ozzy_`, so a process list shows its repository.
+/// `ozzy-<command>` binaries leave room for a git-style `ozzy <command>`.
+const COMMANDS: &[(&str, &str)] = &[("ozzy-broker", "ozzy"), ("ozzy-ui", "ozzy-tui")];
+
 fn tracked(name: &str) -> bool {
     name.starts_with("ozzy") || BOUNDARY.contains(&name)
 }
@@ -127,11 +155,10 @@ fn executable_names_identify_ozzy_and_all_integration_tests_are_registered() {
         for target in targets {
             if target["kind"] != serde_json::json!(["lib"]) {
                 let name = target["name"].as_str().unwrap();
-                let broker_command = package["name"] == "ozzy-broker"
-                    && target["kind"] == serde_json::json!(["bin"])
-                    && name == "ozzy";
+                let command = target["kind"] == serde_json::json!(["bin"])
+                    && COMMANDS.contains(&(package["name"].as_str().unwrap(), name));
                 assert!(
-                    broker_command || name.starts_with("ozzy_"),
+                    command || name.starts_with("ozzy_"),
                     "unprefixed executable: {target}"
                 );
             }

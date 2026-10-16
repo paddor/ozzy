@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
-    AsyncJournalPartitionIndex as Index, AsyncPartitionReadLimits as ReadConfig, JournalIndexError,
-    PreparedOperationRecords, SharedJournalOperation,
+    JournalIndexError, JournalPartitionIndex as Index, PartitionReadLimits as ReadConfig,
+    PartitionReadRange, PreparedOperationRecords, SharedJournalOperation,
 };
 use ozzy_journal::{ReadLimits, operation::canonical_body_digest};
 use ozzy_proto::Offset;
@@ -58,20 +58,26 @@ fn append(
     journal
 }
 
+fn range(first: u64, end: u64, through: u64) -> PartitionReadRange {
+    PartitionReadRange {
+        partition: indexes::partition(),
+        start: Offset::new(first),
+        end: Offset::new(end),
+        through,
+    }
+}
+
 fn capture(
     index: &Index,
     journal: &Journal,
     first: u64,
     end: u64,
     through: u64,
-) -> crate::AsyncPartitionRead {
+) -> crate::PartitionRead {
     index
         .prepare_read(
             journal,
-            indexes::partition(),
-            Offset::new(first),
-            Offset::new(end),
-            through,
+            range(first, end, through),
             ReadLimits {
                 max_records: 16,
                 max_bytes: 8192,
@@ -80,7 +86,7 @@ fn capture(
         .unwrap()
 }
 
-fn read(controller: &mut Controller, captured: crate::AsyncPartitionRead) -> (Vec<u64>, usize) {
+fn read(controller: &mut Controller, captured: crate::PartitionRead) -> (Vec<u64>, usize) {
     let mut offsets = Vec::new();
     let mut jobs = 0;
     drive_with(
@@ -107,14 +113,11 @@ fn async_incremental_reads_capture_exact_prefix_without_file_work() {
     let mut index = drive(&mut controller, Index::open(&journal, read_config(8192))).unwrap();
     let journal = append(&mut controller, journal, &mut index, 0, 0);
     let captured = capture(&index, &journal, 0, 1, 1);
-    assert!(journal.pins.is_pinned(1).unwrap());
+    assert!(journal.pins.is_pinned(1));
     assert!(matches!(
         index.prepare_read(
             &journal,
-            indexes::partition(),
-            Offset::ZERO,
-            Offset::new(1),
-            1,
+            range(0, 1, 1),
             ReadLimits {
                 max_records: 1,
                 max_bytes: 8192
@@ -124,7 +127,7 @@ fn async_incremental_reads_capture_exact_prefix_without_file_work() {
     ));
     let journal = append(&mut controller, journal, &mut index, 1, 0);
     assert_eq!(read(&mut controller, captured), (vec![0], 0));
-    assert!(!journal.pins.is_pinned(1).unwrap());
+    assert!(!journal.pins.is_pinned(1));
     let captured = capture(&index, &journal, 0, 2, 1);
     assert_eq!(read(&mut controller, captured), (vec![0], 0));
     let captured = capture(&index, &journal, 0, 2, 2);
@@ -223,12 +226,59 @@ fn async_retry_reads_reuse_predecessor_and_cached_sealed_selectors() {
 }
 
 #[test]
+fn a_rolled_read_index_proves_what_a_retention_scan_finds() {
+    let (mut controller, journal) = empty_journal();
+    let mut index = drive(&mut controller, Index::open(&journal, read_config(0))).unwrap();
+    let partition = indexes::partition();
+    assert_eq!(index.sealed_retirement_proof(&journal).unwrap(), None);
+    let journal = append(&mut controller, journal, &mut index, 0, 0);
+    let mut journal = append(&mut controller, journal, &mut index, 1, 0);
+    drive(&mut controller, journal.roll_active(32768, 4)).unwrap();
+    index.rolled(&journal).unwrap();
+    let proof = index.sealed_retirement_proof(&journal).unwrap().unwrap();
+    assert_eq!(controller.jobs().len(), 0);
+    let summary = proof.retention_segment(partition);
+    assert_eq!(summary.record_end, Offset::new(2));
+    assert_eq!(
+        summary,
+        drive(&mut controller, journal.retention_segment(1, partition)).unwrap()
+    );
+    let position = journal.written_position().unwrap();
+    let budget = crate::RetirementBudget {
+        max_segments: 1,
+        max_read_bytes: 1,
+    };
+    // A proven segment needs no read budget; one above the floors stops the prefix.
+    let below = crate::RetentionFloors::new(vec![(partition, Offset::new(2))]).unwrap();
+    let scan = journal
+        .prepare_retirement_scan(below, position, budget, std::slice::from_ref(&proof))
+        .unwrap();
+    let mut read = false;
+    let prefix = crate::test_io::drive_with(&mut controller, scan.scan(), |operation| {
+        read |= matches!(operation, ozzy_io::Operation::Open { .. });
+        ozzy_io::simulation::Effect::Normal
+    })
+    .unwrap();
+    assert_eq!(prefix.references().len(), 1);
+    assert!(!read, "a proven segment was read");
+    let above = crate::RetentionFloors::new(vec![(partition, Offset::new(1))]).unwrap();
+    let scan = journal
+        .prepare_retirement_scan(above, position, budget, &[proof])
+        .unwrap();
+    assert_eq!(
+        drive(&mut controller, scan.scan()).unwrap().references(),
+        []
+    );
+    drive(&mut controller, journal.close()).unwrap();
+}
+
+#[test]
 fn async_resident_delivery_releases_file_protection_and_keeps_bounded_selection() {
     let (mut controller, journal) = empty_journal();
     let mut index = drive(&mut controller, Index::open(&journal, read_config(0))).unwrap();
     let journal = append(&mut controller, journal, &mut index, 0, 0);
     let resident = capture(&index, &journal, 0, 1, 1).into_resident().unwrap();
-    assert!(!journal.pins.is_pinned(1).unwrap());
+    assert!(!journal.pins.is_pinned(1));
     let mut journal = append(&mut controller, journal, &mut index, 1, 0);
     let cold = capture(&index, &journal, 0, 1, 1)
         .into_resident()
@@ -370,7 +420,7 @@ fn async_read_cancellation_releases_admission_without_invalidating_owner() {
     let journal = append(&mut controller, journal, &mut index, 1, 0);
     let captured = capture(&index, &journal, 0, 1, 1);
     drop(captured);
-    assert!(!journal.pins.is_pinned(1).unwrap());
+    assert!(!journal.pins.is_pinned(1));
     let captured = capture(&index, &journal, 0, 1, 1);
     #[expect(
         clippy::redundant_closure_for_method_calls,
@@ -400,10 +450,7 @@ fn async_read_obeys_byte_limits_and_rejects_uninstalled_index_growth() {
         let captured = index
             .prepare_read(
                 &journal,
-                indexes::partition(),
-                Offset::ZERO,
-                Offset::new(2),
-                2,
+                range(0, 2, 2),
                 ReadLimits {
                     max_records: 2,
                     max_bytes: bytes,
@@ -426,10 +473,7 @@ fn async_read_obeys_byte_limits_and_rejects_uninstalled_index_growth() {
     assert!(matches!(
         index.prepare_read(
             &journal,
-            indexes::partition(),
-            Offset::ZERO,
-            Offset::new(3),
-            3,
+            range(0, 3, 3),
             ReadLimits {
                 max_records: 3,
                 max_bytes: 8192
@@ -469,7 +513,7 @@ fn retirement_prunes_live_reader_sources_and_preserves_already_captured_reads() 
         &mut controller,
         journal.retire_sealed_prefix(
             &crate::RetentionFloors::new(vec![(indexes::partition(), Offset::new(1))]).unwrap(),
-            crate::AsyncRetirementBudget {
+            crate::RetirementBudget {
                 max_segments: 1,
                 max_read_bytes: 32768,
             },
@@ -487,5 +531,79 @@ fn retirement_prunes_live_reader_sources_and_preserves_already_captured_reads() 
     assert_eq!(read(&mut controller, current), (vec![1], 0));
     let cleanup = drive(&mut controller, journal.reclaim_unreferenced_segments(1)).unwrap();
     assert_eq!(cleanup.removed_segment_ids, [1]);
+    drive(&mut controller, journal.close()).unwrap();
+}
+
+#[test]
+fn retirement_drops_cached_read_handles_so_cleanup_frees_the_segment() {
+    let (mut controller, journal) = empty_journal();
+    let mut index = drive(&mut controller, Index::open(&journal, read_config(0))).unwrap();
+    let mut journal = append(&mut controller, journal, &mut index, 0, 1024);
+    drive(&mut controller, journal.roll_active(32768, 4)).unwrap();
+    index.rolled(&journal).unwrap();
+    journal = append(&mut controller, journal, &mut index, 1, 1024);
+    drive(
+        &mut controller,
+        journal.sync_through(journal.writer().written_position()),
+    )
+    .unwrap();
+    // A file read of the sealed segment leaves a cached read handle.
+    let (offsets, jobs) = read(&mut controller, capture(&index, &journal, 0, 1, 2));
+    assert_eq!(offsets, [0]);
+    assert_ne!(jobs, 0, "the sealed read uses the segment file");
+    let mut next = journal.next_manifest().unwrap();
+    next.accepted = journal.written_position().unwrap();
+    next.committed = next.accepted;
+    drive(&mut controller, journal.install_metadata(next)).unwrap();
+    let id = ozzy_proto::CheckpointId::from_bytes([0x73; 16]);
+    drive(
+        &mut controller,
+        journal.build_checkpoint(id, Digest::from_bytes([0x74; 32]), 8, b"retained state"),
+    )
+    .unwrap();
+    drive(&mut controller, journal.install_checkpoint(id)).unwrap();
+    let retired = drive(
+        &mut controller,
+        journal.retire_sealed_prefix(
+            &crate::RetentionFloors::new(vec![(indexes::partition(), Offset::new(1))]).unwrap(),
+            crate::RetirementBudget {
+                max_segments: 1,
+                max_read_bytes: 32768,
+            },
+        ),
+    )
+    .unwrap();
+    assert_eq!(retired.unreferenced_segment_ids, [1]);
+    index
+        .retired(&journal, &retired.unreferenced_segment_ids)
+        .unwrap();
+    let path = std::path::Path::new("/group/segments/1.log");
+    let segment = controller.image().bytes(path, false).unwrap().len()
+        + controller.image().bytes(path, true).unwrap().len();
+    // With a spare already kept, cleanup unlinks the segment.
+    let spare = drive(
+        &mut controller,
+        journal.access.open(
+            "/group/segments/spare.log".into(),
+            ozzy_io::OpenMode::CreateNew,
+            false,
+            false,
+        ),
+    )
+    .unwrap();
+    drive(
+        &mut controller,
+        journal.access.done(Operation::Close { handle: spare }),
+    )
+    .unwrap();
+    let before = controller.image().stored_bytes();
+    let cleanup = drive(&mut controller, journal.reclaim_unreferenced_segments(1)).unwrap();
+    assert_eq!(cleanup.removed_segment_ids, [1]);
+    controller.jobs();
+    assert!(!controller.image().exists(path, false));
+    assert!(
+        before - controller.image().stored_bytes() >= segment,
+        "no cached handle keeps the removed segment's bytes"
+    );
     drive(&mut controller, journal.close()).unwrap();
 }

@@ -1,15 +1,17 @@
 //! Canonical encoding directly from caller-owned record iterators.
 
+use crate::operation::codec::encode_atomic;
 use ozzy_proto::{
     MessageId, Offset, OwnerEpoch, PartitionIncarnation, ProducerEpoch, ProducerId,
-    ProducerSequence,
+    ProducerSequence, append::PayloadEncoding, data::RecordDescriptors, layout::Fixed,
 };
 use std::ops::Range;
 
 use super::{
     AppendBatch, AppendBatchSummary, AppendBatchView, AppendTotals, Encoder, OperationCodecError,
-    OperationLimits, OperationOutput, PREPARED_PAYLOAD, TINY_RECORDS, encode_append_records,
-    enforce_limit, records_are_tiny, validate_limits, validate_position_count,
+    OperationLimits, OperationOutput, PREPARED_PAYLOAD, RECORD_COUNT_MASK, ReadFields, Reader,
+    TINY_RECORDS, encode_append_records, enforce_limit, records_are_tiny, validate_limits,
+    validate_position_count,
 };
 
 /// Proof that one canonical one-batch APPEND was constructed from a validated
@@ -26,7 +28,60 @@ pub struct ValidatedWireAppend {
     nonzero_message_ids: bool,
 }
 
+/// Fixed bytes before the descriptors of a one-batch APPEND: the batch count
+/// and the batch header.
+pub(super) const ONE_BATCH_HEADER_BYTES: usize = 80;
+/// Whole-payload codec fields: encoding, decoded and encoded lengths.
+pub(super) const CODEC_METADATA_BYTES: usize = 9;
+
 impl ValidatedWireAppend {
+    fn new(
+        records: RecordDescriptors<'_>,
+        encoding: PayloadEncoding,
+        payload: &[u8],
+    ) -> Result<Self, OperationCodecError> {
+        let length =
+            |bytes: usize| u32::try_from(bytes).map_err(|_| OperationCodecError::LengthOverflow);
+        Ok(Self {
+            descriptor_bytes: length(records.encoded().len())?,
+            decoded_bytes: length(records.payload_bytes())?,
+            encoded_bytes: match encoding {
+                PayloadEncoding::Raw => 0,
+                PayloadEncoding::Lz4 => length(payload.len())?,
+            },
+            record_count: length(records.len())?,
+            part_count: length(records.parts())?,
+            uniform_part_bytes: records.uniform_part_bytes(),
+            nonzero_message_ids: records.nonzero_message_ids(),
+        })
+    }
+
+    /// Check that `body` has exactly the length and header count bits this
+    /// proof describes. Returns where its descriptors end and the count.
+    pub(super) fn check_layout(self, body: &[u8]) -> Result<(usize, u32), OperationCodecError> {
+        let descriptor_end = ONE_BATCH_HEADER_BYTES
+            .checked_add(self.descriptor_bytes())
+            .ok_or(OperationCodecError::LengthOverflow)?;
+        let codec_bytes = usize::from(self.payload_is_prepared()) * CODEC_METADATA_BYTES;
+        let payload_bytes = self.encoded_bytes().unwrap_or(self.decoded_bytes());
+        let expected = descriptor_end
+            .checked_add(codec_bytes)
+            .and_then(|bytes| bytes.checked_add(payload_bytes))
+            .ok_or(OperationCodecError::LengthOverflow)?;
+        let header: &[u8; ONE_BATCH_HEADER_BYTES] = body
+            .first_chunk()
+            .ok_or(OperationCodecError::InvalidPreparedPayload)?;
+        let count = header.u32_at::<{ ONE_BATCH_HEADER_BYTES - 4 }>();
+        if body.len() != expected
+            || count & RECORD_COUNT_MASK != self.record_count
+            || count & TINY_RECORDS != 0
+            || (count & PREPARED_PAYLOAD != 0) != self.payload_is_prepared()
+        {
+            return Err(OperationCodecError::InvalidPreparedPayload);
+        }
+        Ok((descriptor_end, count))
+    }
+
     pub(super) const fn uniform_part_bytes(self) -> Option<usize> {
         match self.uniform_part_bytes {
             Some(bytes) => Some(bytes as usize),
@@ -139,21 +194,61 @@ impl From<&AppendBatch<'_>> for AppendHeader {
 }
 
 impl AppendHeader {
+    pub(super) fn decode(decoder: &mut Reader<'_>) -> Result<Self, OperationCodecError> {
+        Ok(Self {
+            partition: PartitionIncarnation::from_bytes(decoder.id()?),
+            owner_epoch: OwnerEpoch::new(decoder.u64()?),
+            producer_id: ProducerId::from_bytes(decoder.id()?),
+            producer_epoch: ProducerEpoch::new(decoder.u64()?),
+            first_sequence: ProducerSequence::new(decoder.u64()?),
+            first_offset: Offset::new(decoder.u64()?),
+            append_timestamp_millis: decoder.u64()?,
+        })
+    }
+
+    /// Count a batch's records and check that both of its position ranges
+    /// can hold them.
+    pub(super) fn admit(
+        self,
+        records: usize,
+        totals: &mut AppendTotals,
+    ) -> Result<(), OperationCodecError> {
+        totals.add_records(records)?;
+        if records != 0 {
+            validate_position_count(self.first_sequence.get(), records)?;
+            validate_position_count(self.first_offset.get(), records)?;
+        }
+        Ok(())
+    }
+
+    pub(super) const fn summary(
+        self,
+        record_count: usize,
+        nonzero_message_ids: bool,
+    ) -> AppendBatchSummary {
+        AppendBatchSummary {
+            partition: self.partition,
+            owner_epoch: self.owner_epoch,
+            producer_id: self.producer_id,
+            producer_epoch: self.producer_epoch,
+            first_sequence: self.first_sequence,
+            first_offset: self.first_offset,
+            record_count,
+            nonzero_message_ids,
+        }
+    }
+
     pub(super) fn encode(
         self,
         records: usize,
-        tiny: bool,
-        prepared: bool,
-        limits: OperationLimits,
+        layout: BatchLayout,
         totals: &mut AppendTotals,
         encoder: &mut Encoder<'_, impl OperationOutput>,
     ) -> Result<(), OperationCodecError> {
-        if records == 0 {
+        if (records == 0) != (layout == BatchLayout::Empty) {
             return Err(OperationCodecError::EmptyAppend);
         }
-        totals.add_records(records, limits)?;
-        validate_position_count(self.first_sequence.get(), records)?;
-        validate_position_count(self.first_offset.get(), records)?;
+        self.admit(records, totals)?;
         encoder.id(self.partition.as_bytes())?;
         encoder.u64(self.owner_epoch.get())?;
         encoder.id(self.producer_id.as_bytes())?;
@@ -162,14 +257,38 @@ impl AppendHeader {
         encoder.u64(self.first_offset.get())?;
         encoder.u64(self.append_timestamp_millis)?;
         let count = u32::try_from(records).map_err(|_| OperationCodecError::LengthOverflow)?;
-        if count & TINY_RECORDS != 0 {
+        if count & (TINY_RECORDS | PREPARED_PAYLOAD) != 0 {
             return Err(OperationCodecError::LengthOverflow);
         }
         encoder.u32(
             count
-                | if tiny { TINY_RECORDS } else { 0 }
-                | if prepared { PREPARED_PAYLOAD } else { 0 },
+                | match layout {
+                    BatchLayout::Compact => TINY_RECORDS,
+                    BatchLayout::Prepared => PREPARED_PAYLOAD,
+                    BatchLayout::General | BatchLayout::Empty => 0,
+                },
         )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BatchLayout {
+    General,
+    Compact,
+    Prepared,
+    Empty,
+}
+
+impl BatchLayout {
+    pub(super) const fn records(tiny: bool) -> Self {
+        if tiny { Self::Compact } else { Self::General }
+    }
+
+    const fn payload(encoding: PayloadEncoding) -> Self {
+        match encoding {
+            PayloadEncoding::Raw => Self::General,
+            PayloadEncoding::Lz4 => Self::Prepared,
+        }
     }
 }
 
@@ -193,7 +312,6 @@ pub struct AppendBodyEncoder<'a, O: OperationOutput> {
     encoder: Encoder<'a, O>,
     totals: AppendTotals,
     remaining: usize,
-    limits: OperationLimits,
 }
 
 impl<'a, O: OperationOutput> AppendBodyEncoder<'a, O> {
@@ -216,9 +334,8 @@ impl<'a, O: OperationOutput> AppendBodyEncoder<'a, O> {
         }
         Ok(Self {
             encoder,
-            totals: AppendTotals::default(),
+            totals: AppendTotals::new(limits),
             remaining: batches,
-            limits,
         })
     }
 
@@ -235,15 +352,15 @@ impl<'a, O: OperationOutput> AppendBodyEncoder<'a, O> {
         parts: usize,
         chunks: impl Iterator<Item = (&'b [u8], &'b [u8])> + Clone,
     ) -> Result<(), OperationCodecError> {
-        self.batch(|encoder, totals, limits| {
-            header.encode(records, false, false, limits, totals, encoder)?;
-            enforce_limit("append part count", parts, limits.max_parts)?;
-            totals.add_parts(parts, limits)?;
+        self.batch(|encoder, totals| {
+            header.encode(records, BatchLayout::General, totals, encoder)?;
+            enforce_limit("append part count", parts, totals.limits().max_parts)?;
+            totals.add_parts(parts)?;
             for (descriptors, _) in chunks.clone() {
                 encoder.bytes(descriptors)?;
             }
             for (_, payload) in chunks {
-                totals.add_payload(payload.len(), limits)?;
+                totals.add_payload(payload.len())?;
                 encoder.payload(payload)?;
             }
             Ok(())
@@ -262,12 +379,12 @@ impl<'a, O: OperationOutput> AppendBodyEncoder<'a, O> {
         P: AsRef<[u8]> + 'b,
         I: ExactSizeIterator<Item = (MessageId, ozzy_proto::data::Encoding, &'b [P])> + Clone,
     {
-        self.batch(|encoder, totals, limits| {
+        self.batch(|encoder, totals| {
             let records = records
                 .map(|(id, encoding, parts)| (id, encoding, parts.iter().map(AsRef::as_ref)));
             let tiny = layout == DescriptorLayout::Compact && records_are_tiny(records.clone());
-            header.encode(records.len(), tiny, false, limits, totals, encoder)?;
-            encode_append_records(records, tiny, limits, totals, encoder)
+            header.encode(records.len(), BatchLayout::records(tiny), totals, encoder)?;
+            encode_append_records(records, tiny, totals, encoder)
         })
     }
 
@@ -283,17 +400,13 @@ impl<'a, O: OperationOutput> AppendBodyEncoder<'a, O> {
 
     fn batch(
         &mut self,
-        encode: impl FnOnce(
-            &mut Encoder<'a, O>,
-            &mut AppendTotals,
-            OperationLimits,
-        ) -> Result<(), OperationCodecError>,
+        encode: impl FnOnce(&mut Encoder<'a, O>, &mut AppendTotals) -> Result<(), OperationCodecError>,
     ) -> Result<(), OperationCodecError> {
         if self.remaining == 0 {
             self.encoder.restore_start();
             return Err(OperationCodecError::LengthOverflow);
         }
-        if let Err(error) = encode(&mut self.encoder, &mut self.totals, self.limits) {
+        if let Err(error) = encode(&mut self.encoder, &mut self.totals) {
             self.encoder.restore_start();
             return Err(error);
         }
@@ -323,77 +436,69 @@ where
     encoder.finish()
 }
 
+/// One validated wire batch as an SDK sent it: its canonical header, record
+/// descriptors, and payload block in its wire encoding.
+#[derive(Clone, Copy, Debug)]
+pub struct WireBatch<'a> {
+    /// Canonical batch header.
+    pub header: AppendHeader,
+    /// Record descriptors exactly as received.
+    pub records: ozzy_proto::data::RecordDescriptors<'a>,
+    /// Encoding of `payload`.
+    pub encoding: ozzy_proto::append::PayloadEncoding,
+    /// Raw payload bytes, or the exact LZ4 block.
+    pub payload: &'a [u8],
+}
+
 /// Encode one validated wire batch without changing its payload representation.
 /// Whole-APPEND LZ4 stores descriptors plus only the exact encoded block.
 pub fn append_wire_record_batch(
     output: &mut impl OperationOutput,
-    header: AppendHeader,
-    records: ozzy_proto::data::RecordDescriptors<'_>,
-    payload_encoding: ozzy_proto::append::PayloadEncoding,
-    payload: &[u8],
+    batch: WireBatch<'_>,
     limits: OperationLimits,
 ) -> Result<(Range<usize>, ValidatedWireAppend), OperationCodecError> {
+    let WireBatch {
+        header,
+        records,
+        encoding,
+        payload,
+    } = batch;
     validate_limits(limits)?;
     if records.is_empty() {
         return Err(OperationCodecError::EmptyAppend);
     }
-    let proof = ValidatedWireAppend {
-        descriptor_bytes: u32::try_from(records.encoded().len())
-            .map_err(|_| OperationCodecError::LengthOverflow)?,
-        decoded_bytes: u32::try_from(records.payload_bytes())
-            .map_err(|_| OperationCodecError::LengthOverflow)?,
-        encoded_bytes: match payload_encoding {
-            ozzy_proto::append::PayloadEncoding::Raw => 0,
-            ozzy_proto::append::PayloadEncoding::Lz4 => {
-                u32::try_from(payload.len()).map_err(|_| OperationCodecError::LengthOverflow)?
-            }
-        },
-        record_count: u32::try_from(records.len())
-            .map_err(|_| OperationCodecError::LengthOverflow)?,
-        part_count: u32::try_from(records.parts())
-            .map_err(|_| OperationCodecError::LengthOverflow)?,
-        uniform_part_bytes: records.uniform_part_bytes(),
-        nonzero_message_ids: records.nonzero_message_ids(),
-    };
-    let start = output.len();
-    let mut encoder = Encoder::new(output, start, limits.max_body_bytes);
-    let result = (|| {
+    let proof = ValidatedWireAppend::new(records, encoding, payload)?;
+    let range = encode_atomic(output, limits, |encoder| {
         encoder.count(1)?;
-        let mut totals = AppendTotals::default();
+        let mut totals = AppendTotals::new(limits);
         header.encode(
             records.len(),
-            false,
-            payload_encoding == ozzy_proto::append::PayloadEncoding::Lz4,
-            limits,
+            BatchLayout::payload(encoding),
             &mut totals,
-            &mut encoder,
+            encoder,
         )?;
         enforce_limit("append part count", records.parts(), limits.max_parts)?;
-        totals.add_payload(records.payload_bytes(), limits)?;
+        totals.add_payload(records.payload_bytes())?;
         encoder.bytes(records.encoded())?;
-        match payload_encoding {
-            ozzy_proto::append::PayloadEncoding::Raw => {
+        match encoding {
+            PayloadEncoding::Raw => {
                 if payload.len() != records.payload_bytes() {
                     return Err(OperationCodecError::LengthOverflow);
                 }
                 encoder.payload(payload)
             }
-            ozzy_proto::append::PayloadEncoding::Lz4 => {
+            PayloadEncoding::Lz4 => {
                 if payload.is_empty() {
                     return Err(OperationCodecError::InvalidPreparedPayload);
                 }
-                encoder.u8(payload_encoding as u8)?;
+                encoder.u8(encoding as u8)?;
                 encoder.length(records.payload_bytes())?;
                 encoder.length(payload.len())?;
                 encoder.payload(payload)
             }
         }
-    })();
-    if let Err(error) = result {
-        encoder.restore_start();
-        return Err(error);
-    }
-    Ok((start..encoder.finish(), proof))
+    })?;
+    Ok((range, proof))
 }
 
 /// Encode one whole-APPEND LZ4 batch from decoded record descriptors. Payload
@@ -409,39 +514,23 @@ where
     P: ExactSizeIterator<Item = &'a [u8]> + Clone,
     I: ExactSizeIterator<Item = (MessageId, ozzy_proto::data::Encoding, P)> + Clone,
 {
-    validate_limits(limits)?;
     if records.len() == 0 || encoded_payload.is_empty() {
         return Err(OperationCodecError::EmptyAppend);
     }
-    let start = output.len();
-    let mut encoder = Encoder::new(output, start, limits.max_body_bytes);
-    let result = (|| {
+    encode_atomic(output, limits, |encoder| {
         encoder.count(1)?;
-        let mut totals = AppendTotals::default();
-        header.encode(
-            records.len(),
-            false,
-            true,
-            limits,
-            &mut totals,
-            &mut encoder,
-        )?;
-        encode_append_record_descriptors(records, limits, &mut totals, &mut encoder)?;
-        encoder.u8(ozzy_proto::append::PayloadEncoding::Lz4 as u8)?;
+        let mut totals = AppendTotals::new(limits);
+        header.encode(records.len(), BatchLayout::Prepared, &mut totals, encoder)?;
+        encode_append_record_descriptors(records, &mut totals, encoder)?;
+        encoder.u8(PayloadEncoding::Lz4 as u8)?;
         encoder.length(totals.payload_bytes)?;
         encoder.length(encoded_payload.len())?;
         encoder.payload(encoded_payload)
-    })();
-    if let Err(error) = result {
-        encoder.restore_start();
-        return Err(error);
-    }
-    Ok(start..encoder.finish())
+    })
 }
 
 fn encode_append_record_descriptors<'a, P, I>(
     records: I,
-    limits: OperationLimits,
     totals: &mut AppendTotals,
     encoder: &mut Encoder<'_, impl OperationOutput>,
 ) -> Result<(), OperationCodecError>
@@ -449,18 +538,19 @@ where
     P: ExactSizeIterator<Item = &'a [u8]> + Clone,
     I: ExactSizeIterator<Item = (MessageId, ozzy_proto::data::Encoding, P)> + Clone,
 {
+    let limits = totals.limits();
     for (id, encoding, parts) in records {
         if encoding != ozzy_proto::data::Encoding::Raw
             || !encoding.validate(parts.len(), limits.max_parts, limits.max_payload_bytes)
         {
             return Err(OperationCodecError::EmptyRecordParts);
         }
-        totals.add_parts(parts.len(), limits)?;
+        totals.add_parts(parts.len())?;
         let count = u32::try_from(parts.len()).map_err(|_| OperationCodecError::LengthOverflow)?;
         encoder.id(id.as_bytes())?;
         encoder.u32(count)?;
         for part in parts {
-            totals.add_payload(part.len(), limits)?;
+            totals.add_payload(part.len())?;
             encoder.length(part.len())?;
         }
     }

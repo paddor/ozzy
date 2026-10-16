@@ -2,16 +2,31 @@
 
 mod codec;
 mod error;
+mod group;
 mod integrity;
 mod schema;
+pub use group::{
+    GROUP_PLAN_MAX_MEMBERS, GROUP_PLAN_MAX_PARTITIONS, GroupDelete, GroupMember, GroupPlan,
+    GroupTarget,
+};
 
 mod append_encoder;
 mod append_pack;
 mod output;
 mod records;
+mod retry;
+pub use retry::{RetryFingerprint, retry_fingerprint};
+mod results;
+pub use results::{AppendResults, append_results, decode_append_results};
+mod resolved;
+pub use resolved::{
+    ResolvedAppendView, append_resolved_record_batch, append_resolved_wire_record_batch,
+    decode_resolved_append, decode_resolved_append_indexed,
+    decode_resolved_append_with_validated_payload,
+};
 mod view;
 pub use append_encoder::{
-    AppendBodyEncoder, AppendHeader, DescriptorLayout, ValidatedWireAppend,
+    AppendBodyEncoder, AppendHeader, DescriptorLayout, ValidatedWireAppend, WireBatch,
     append_prepared_record_batch, append_record_batches, append_wire_record_batch,
 };
 pub use append_pack::{
@@ -21,8 +36,8 @@ pub use output::OperationOutput;
 pub use records::{AppendRecordList, RecordIter, RecordParts, RecordRef};
 pub use view::{
     AppendBatchView, AppendBatches, AppendPartLengths, AppendParts, AppendRecordDescriptor,
-    AppendRecordDescriptors, AppendRecordView, AppendRecords, AppendView, PreparedAppendPayload,
-    decode_append_batches, decode_append_batches_indexed,
+    AppendRecordDescriptors, AppendRecordView, AppendRecords, AppendView, BatchPayload,
+    PreparedAppendPayload, decode_append_batches, decode_append_batches_indexed,
     decode_append_batches_with_validated_payload, decode_append_records, decode_append_view,
     decode_packed_append_records,
 };
@@ -31,9 +46,28 @@ const TINY_RECORDS: u32 = 1 << 31;
 const PREPARED_PAYLOAD: u32 = 1 << 30;
 const RECORD_COUNT_MASK: u32 = !(TINY_RECORDS | PREPARED_PAYLOAD);
 
+/// Conservative canonical APPEND metadata bound, excluding payload backing.
+/// Includes the largest stored-record descriptors and, for resolved APPENDs,
+/// one outcome run and duplicate fingerprint per attempted record. Batch framing
+/// reserves whole-payload encoding fields even for an uncompressed payload.
+pub fn append_metadata_bound(batches: usize, records: usize, resolved: bool) -> Option<usize> {
+    let bytes = batches
+        .checked_mul(76)?
+        .checked_add(13)?
+        .checked_add(records.checked_mul(24)?)?;
+    if resolved {
+        bytes
+            .checked_add(16)?
+            .checked_add(records.checked_mul(ozzy_proto::append::OUTCOME_RUN_BYTES + 32)?)
+    } else {
+        Some(bytes)
+    }
+}
+
 use codec::{
-    AppendTotals, Decoder, Encoder, decode_append_batch, encode_append_records, enforce_limit,
-    records_are_tiny, validate_append_descriptors, validate_limits, validate_position_count,
+    AppendTotals, Encoder, ReadFields, Reader, TinyTable, decode_append_batch,
+    encode_append_records, enforce_limit, read_descriptor_head, records_are_tiny,
+    validate_append_descriptors, validate_limits, validate_position_count,
     validate_tiny_descriptors,
 };
 pub use codec::{
@@ -50,7 +84,8 @@ pub use integrity::{
 };
 pub use schema::{
     Append, AppendBatch, AppendBatchSummary, AppendRecord, AppendSummary, Assign, Barrier,
-    CanonicalOperation, ChainPosition, CreatePartition, Digest, OpenProducer, OperationBody,
-    OperationHeader, OperationKind, OperationLimits, PartitionPolicy, ProducerResultFloor,
-    Progress, ProgressOwner, RecordPosition, RetentionPolicy, Trim,
+    CanonicalOperation, ChainPosition, CreatePartition, DedupWatermark, Digest, OpenProducer,
+    OperationBody, OperationHeader, OperationKind, OperationLimits, PartitionPolicy,
+    ProducerResultFloor, Progress, ProgressAssignment, ProgressOwner, RecordPosition,
+    ResolvedAppend, RetentionPolicy, Trim,
 };

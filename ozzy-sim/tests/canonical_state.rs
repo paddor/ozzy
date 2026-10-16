@@ -1,3 +1,13 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "simulation test support"
+)]
+
 use ozzy_core::state::{CanonicalState, StateError, StateLimits};
 use ozzy_journal::operation::{
     Append, AppendBatch, AppendRecord, Barrier, CreatePartition, OpenProducer, OperationBody,
@@ -27,6 +37,7 @@ fn create() -> OperationBody<'static> {
         topic: "topic",
         partition_id: PartitionId::new(7),
         owner_epoch: OwnerEpoch::new(9),
+        dedup_window_millis: None,
         retention: RetentionPolicy::default(),
     })
 }

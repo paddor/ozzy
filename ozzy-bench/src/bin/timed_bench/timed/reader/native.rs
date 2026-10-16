@@ -7,7 +7,7 @@ use super::{
     workload,
 };
 use ozzy_runtime::{
-    replicated::{BrokerLinks, TopicReader, TopicReaderConfig, WriterRuntime},
+    replicated::{BrokerLinks, TopicReader, TopicReaderConfig, TopicRecord, WriterRuntime},
     topic_metadata::TopicMetadata,
 };
 use serde_json::json;
@@ -26,14 +26,14 @@ pub(super) async fn run(
     setup: &Value,
     mut input: tokio::sync::mpsc::Receiver<Result<Value>>,
 ) -> Result<()> {
-    let runtime = WriterRuntime::new()?;
+    let runtime = super::super::native::sdk_runtime(&config)?;
     let (tasks, links) = connect(&runtime, &config, setup, index).await?;
     launch::reply(&json!({"event":"connected", "index":index, "pid":std::process::id()}))?;
     let start = super::command(&mut input, "start").await?;
     let window = super::super::window(&start, &config.args)?;
     let group = super::config::group(&config.args)?;
     window.wait().await;
-    let meter = metrics::Meter::start();
+    let meter = metrics::Meter::start(!config.args.inproc);
     let (finish, finished) = watch::channel(None);
     let work = try_join_all(
         tasks
@@ -127,45 +127,40 @@ pub(in crate::bench::timed) async fn run_task(
         partitions,
         copy,
     } = task;
-    let mut oracle = Oracle::new(
+    let yield_mask = yield_mask(config.args.record_bytes);
+    let count = metadata.partition_count();
+    let mut verifier = Verifier {
+        oracle: Oracle::new(config, count, &partitions, copy, window)?,
         config,
-        metadata.partition_count(),
-        &partitions,
-        copy,
-        window,
-    )?;
-    let turn = (2 * 1024 * 1024 / config.args.record_bytes).clamp(1, 256) as u64;
+        group,
+        metadata: &metadata,
+        // A batch never crosses more than one yield point.
+        batch: CLOCK_BATCH.min(yield_mask + 1),
+    };
     let mut delivered = 0_u64;
     let mut stage = "records";
     tokio::time::timeout_at(window.deadline(&config.args), async {
+        // Borrowing the watch takes its lock, so read the final counts only
+        // when they change, not per record.
+        let mut target = finished.borrow_and_update().clone();
         loop {
-            let target = finished.borrow().clone();
             if let Some(target) = &target
-                && oracle.complete(target)?
+                && verifier.oracle.complete(target)?
             {
                 break;
             }
             let record = tokio::select! {
+                biased;
                 record = reader.next() => record?,
                 changed = finished.changed(), if target.is_none() => {
                     changed.map_err(|_| error("final reader counts unavailable"))?;
+                    target.clone_from(&finished.borrow_and_update());
                     continue;
                 }
             };
-            let expected = metadata.partition(record.partition)
-                .ok_or_else(|| error("reader returned an unknown partition"))?;
-            if record.topic != metadata.id() || record.incarnation != expected.incarnation {
-                return Err(error("reader topic or partition identity mismatch"));
-            }
-            let [payload] = record.payload.as_slice() else {
-                return Err(error("invalid record layout"));
-            };
-            oracle.observe(config, group, Record {
-                partition: record.partition, offset: record.offset.get(),
-                id: record.message_id, payload,
-            }, metrics::monotonic_ns())?;
-            delivered += 1;
-            if delivered.is_multiple_of(turn) {
+            let before = delivered;
+            verifier.ready(&mut reader, &record, &mut delivered)?;
+            if (before ^ delivered) & !yield_mask != 0 {
                 tokio::task::yield_now().await;
             }
         }
@@ -177,9 +172,70 @@ pub(in crate::bench::timed) async fn run_task(
     .map_err(|cause| {
         error(format!(
             "topic reader stage={stage} copy={copy} delivered={delivered} pending={:?} stats={:?}: {cause}",
-            oracle.pending(finished.borrow().as_deref()), reader.stats(),
+            verifier.oracle.pending(finished.borrow().as_deref()), reader.stats(),
         ))
     })??;
+    verify_drained(&reader, &verifier.oracle, delivered)?;
+    let stats = reader.stats();
+    let detail = json!({"copy":copy, "partitions":partitions, "delivered":delivered,
+        "live_records":stats.live_records, "replayed_records":stats.replayed_records, "live_gaps":stats.live_gaps,
+        "positions":verifier.oracle.positions()});
+    Ok((verifier.oracle.rows(), detail))
+}
+
+/// Most ready records verified before one shared completion clock read.
+const CLOCK_BATCH: u64 = 64;
+
+/// One task's independent record checks.
+struct Verifier<'a> {
+    oracle: Oracle,
+    config: &'a Config,
+    group: GroupId,
+    metadata: &'a TopicMetadata,
+    /// Most ready records that share one completion clock read.
+    batch: u64,
+}
+
+impl Verifier<'_> {
+    fn verify(&mut self, record: &TopicRecord) -> Result<()> {
+        let record = Record::delivered(self.metadata, record)?;
+        self.oracle.observe_untimed(self.config, self.group, record)
+    }
+
+    /// Verify `first` and the records ready after it, at most `batch` in all.
+    /// They share one clock read taken after the last of them, so no latency
+    /// is under-reported. `delivered` counts each verified record.
+    fn ready(
+        &mut self,
+        reader: &mut TopicReader,
+        first: &TopicRecord,
+        delivered: &mut u64,
+    ) -> Result<()> {
+        let end = *delivered + self.batch;
+        self.verify(first)?;
+        *delivered += 1;
+        while *delivered < end
+            && let Some(record) = reader.try_next()?
+        {
+            self.verify(&record)?;
+            *delivered += 1;
+        }
+        self.oracle.flush(metrics::monotonic_ns())
+    }
+}
+
+/// Records between yields, less one. A power of two, so the per-record check
+/// is a mask, not a division.
+fn yield_mask(record_bytes: usize) -> u64 {
+    (2 * 1024 * 1024 / record_bytes)
+        .clamp(1, 256)
+        .next_power_of_two() as u64
+        - 1
+}
+
+/// The closed reader's checkpoint and transport counts match what the
+/// oracle verified independently.
+fn verify_drained(reader: &TopicReader, oracle: &Oracle, delivered: u64) -> Result<()> {
     let checkpoint = reader.checkpoint();
     if checkpoint
         .positions
@@ -198,8 +254,5 @@ pub(in crate::bench::timed) async fn run_task(
             "reader transport counts differ from verified records",
         ));
     }
-    let detail = json!({"copy":copy, "partitions":partitions, "delivered":delivered,
-        "live_records":stats.live_records, "replayed_records":stats.replayed_records,
-        "positions":oracle.positions()});
-    Ok((oracle.rows(), detail))
+    Ok(())
 }

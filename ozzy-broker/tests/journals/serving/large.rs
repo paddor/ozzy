@@ -12,17 +12,11 @@ async fn production_large_records_survive_single_broker_restart() {
 async fn run() {
     let root = tempfile::tempdir().unwrap();
     let runtime = WriterRuntime::new().unwrap();
-    let mut deployment = deployment_with(
-        root.path(),
-        DeploymentMode::Single,
-        Confirmation::LocalDurable,
-        1,
-        |config| {
-            let topic = config.topics.get_mut("orders").unwrap();
-            topic.segment_bytes = 256 * MIB as u64;
-            topic.max_append_bytes = 8 * MIB as u64;
-        },
-    );
+    let mut deployment = deployment_with(root.path(), DeploymentMode::Single, 1, |config| {
+        let topic = config.topics.get_mut("orders").unwrap();
+        topic.segment_bytes = 256 * MIB as u64;
+        topic.max_append_bytes = 8 * MIB as u64;
+    });
     let (checked, local) = deployment.pop().unwrap();
     for device in checked.deployment.deployment().brokers[&checked.plan.name]
         .devices

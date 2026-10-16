@@ -45,6 +45,7 @@ fn index() -> ActiveReadIndex {
         )]),
         records: 17,
         operations: 3,
+        locations: 3,
     }
 }
 
@@ -73,8 +74,7 @@ fn captured_ranges_match_individual_selection_under_every_boundary() {
                         let captured = index
                             .capture(
                                 partition,
-                                Offset::new(start),
-                                Offset::new(end),
+                                Offset::new(start)..Offset::new(end),
                                 cap,
                                 through,
                             )
@@ -100,13 +100,13 @@ fn common_captures_keep_ranges_inline_and_do_not_retain_the_index() {
         (27, 4, true),
     ] {
         let capture = index
-            .capture(partition(), Offset::new(10), Offset::new(end), 1024, 3)
+            .capture(partition(), Offset::new(10)..Offset::new(end), 1024, 3)
             .unwrap();
         assert_eq!(capture.runs.len(), runs);
         assert_eq!(capture.runs.spilled(), spilled);
     }
     let capture = index
-        .capture(partition(), Offset::new(12), Offset::new(27), 1024, 2)
+        .capture(partition(), Offset::new(12)..Offset::new(27), 1024, 2)
         .unwrap();
     let expected = capture.runs.clone();
     index
@@ -131,8 +131,7 @@ fn capture_handles_extreme_offsets_without_wrapping() {
     let entries = index
         .capture(
             partition(),
-            Offset::new(u64::MAX - 2),
-            Offset::new(u64::MAX),
+            Offset::new(u64::MAX - 2)..Offset::new(u64::MAX),
             usize::MAX,
             1,
         )
@@ -144,8 +143,7 @@ fn capture_handles_extreme_offsets_without_wrapping() {
     let empty = index
         .capture(
             partition(),
-            Offset::new(u64::MAX),
-            Offset::new(u64::MAX),
+            Offset::new(u64::MAX)..Offset::new(u64::MAX),
             usize::MAX,
             1,
         )
@@ -156,7 +154,7 @@ fn capture_handles_extreme_offsets_without_wrapping() {
     index.partitions.insert(partition(), vec![invalid]);
     assert!(
         index
-            .capture(partition(), Offset::new(10), Offset::new(12), 2, 1)
+            .capture(partition(), Offset::new(10)..Offset::new(12), 2, 1)
             .is_err()
     );
 }

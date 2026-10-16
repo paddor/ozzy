@@ -6,3 +6,5 @@ doc-valid-idents = [
     "ZeroMQ",
     "ZMTP",
 ]
+too-many-lines-threshold = 60
+too-many-arguments-threshold = 5

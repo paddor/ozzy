@@ -2,17 +2,12 @@ use super::*;
 
 #[test]
 fn shard_actors_refresh_bounded_control_indexes_while_intake_stays_queued() {
-    for (policy, capacity) in [
-        (QuorumPolicy::Durable, 8),
-        (QuorumPolicy::Replicated, 8),
-        (QuorumPolicy::Durable, 64),
-        (QuorumPolicy::Replicated, 64),
-    ] {
+    for capacity in [8, 64] {
         let (mut controller, io) = setup();
         // Eight identity slots and an eight-operation live window. Each
         // three-control proposal must wait when fewer than three slots remain.
         let (mut actors, requests, mut submitter) =
-            cluster_with_proposals(&mut controller, &io, 0, policy, capacity, 4, 3);
+            cluster_with_proposals(&mut controller, &io, 0, capacity, 4, 3);
         let mut pending: Vec<_> = requests
             .into_iter()
             .map(|request| Some(Box::pin(request)))

@@ -48,14 +48,12 @@ fn envelope(message: &Message) -> ozzy_proto::Envelope {
 
 #[test]
 fn recovery_retry_retains_latest_sessions_and_starts_new_relative_deadlines() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        retry(policy);
-    }
+    retry();
 }
 
-fn retry(policy: QuorumPolicy) {
+fn retry() {
     let (mut controller, io) = setup();
-    let (actor, memory) = recovery_actor(&mut controller, io, policy, [ZERO_SESSION; 3]);
+    let (actor, memory) = recovery_actor(&mut controller, io, [ZERO_SESSION; 3]);
     let mut actor = ScheduledRecovery::new(actor);
     actor.bind_receive_owner(&memory).unwrap();
     let origin = Duration::from_secs(3600);
@@ -131,40 +129,36 @@ fn retry(policy: QuorumPolicy) {
 
 #[test]
 fn scheduled_recovery_handoff_preserves_general_memory_and_requires_election() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        rebuild(policy);
-    }
+    rebuild();
 }
 
 #[test]
 fn recovery_shutdown_settles_a_transition_with_canceled_observations() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        let (mut controller, io) = setup();
-        let (actor, _) = recovery_actor(&mut controller, io, policy, [ZERO_SESSION; 3]);
-        let mut actor = ScheduledRecovery::new(actor);
-        turn(&mut actor, Duration::ZERO);
-        let abandoned = Duration::from_secs(11);
-        turn(&mut actor, abandoned);
-        assert!(actor.transition_pending());
-        turn(&mut actor, abandoned);
-        let held = controller.jobs();
-        assert_ne!(held.len(), 0);
-        let mut closing = Box::pin(actor.shutdown());
-        for _ in 0..16 {
-            assert!(poll(closing.as_mut()).is_pending());
-        }
-        assert_eq!(controller.jobs(), held);
-        drain(&mut controller, closing);
-        assert!(
-            controller.jobs().is_empty(),
-            "transition leaked admitted I/O"
-        );
+    let (mut controller, io) = setup();
+    let (actor, _) = recovery_actor(&mut controller, io, [ZERO_SESSION; 3]);
+    let mut actor = ScheduledRecovery::new(actor);
+    turn(&mut actor, Duration::ZERO);
+    let abandoned = Duration::from_secs(11);
+    turn(&mut actor, abandoned);
+    assert!(actor.transition_pending());
+    turn(&mut actor, abandoned);
+    let held = controller.jobs();
+    assert_ne!(held.len(), 0);
+    let mut closing = Box::pin(actor.shutdown());
+    for _ in 0..16 {
+        assert!(poll(closing.as_mut()).is_pending());
     }
+    assert_eq!(controller.jobs(), held);
+    drain(&mut controller, closing);
+    assert!(
+        controller.jobs().is_empty(),
+        "transition leaked admitted I/O"
+    );
 }
 
-fn rebuild(policy: QuorumPolicy) {
+fn rebuild() {
     let (mut controller, io) = setup();
-    let (mut actors, pending) = cluster(&mut controller, &io, 0, policy);
+    let (mut actors, pending) = cluster(&mut controller, &io, 0);
     let mut pending = Box::pin(pending);
     let mut confirmed = false;
     for _ in 0..10000 {
@@ -179,7 +173,7 @@ fn rebuild(policy: QuorumPolicy) {
         }
     }
     assert!(confirmed);
-    let (actor, memory) = recovery_actor(&mut controller, io, policy, actor_config().sessions);
+    let (actor, memory) = recovery_actor(&mut controller, io, actor_config().sessions);
     let mut recovering = ScheduledRecovery::new(actor);
     recovering.bind_receive_owner(&memory).unwrap();
     finish_transfer(&mut controller, &mut actors, &mut recovering);

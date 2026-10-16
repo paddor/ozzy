@@ -67,8 +67,7 @@ async fn pool_and_aio_repair_reopen_exact_history_and_preserve_original_files() 
             .begin_sealed_repair(
                 CONFIG,
                 JournalGeneration(9),
-                7,
-                accepted,
+                crate::RepairSource { view: 7, accepted },
                 repair_limits(BodyEncoding::Raw),
             )
             .await
@@ -90,8 +89,10 @@ async fn pool_and_aio_repair_reopen_exact_history_and_preserve_original_files() 
         let journal = Journal::open(
             root,
             io,
-            identity(),
-            Some(CONFIG),
+            crate::ExpectedStore {
+                identity: identity(),
+                configuration: Some(CONFIG),
+            },
             JournalGeneration(10),
             limits,
         )

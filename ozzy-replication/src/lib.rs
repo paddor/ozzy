@@ -12,6 +12,20 @@
 //! separate adapters. Normal metadata storage is preallocated and byte-bounded.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![warn(clippy::indexing_slicing)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::indexing_slicing,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::too_many_lines,
+        clippy::too_many_arguments,
+        reason = "product code is linted without cfg(test)"
+    )
+)]
 
 mod configuration_record;
 pub mod driver;
@@ -21,13 +35,14 @@ pub mod local;
 mod normal;
 pub mod recovery;
 mod view_change;
+mod voters;
 pub mod wire;
 
 pub use configuration_record::{
     CONFIGURATION_RECORD_BYTES, ConfigurationRecord, ConfigurationRecordError, ConfiguredVoter,
 };
 pub use installation::{
-    InstallOutcome, InstallTicket, InstallingView, RejectedInstallation, StartView,
+    InstallOutcome, InstallTicket, InstallingView, ReceivedStart, RejectedInstallation, StartView,
 };
 pub use normal::{Admission, NormalReplica, ReplicaSnapshot, Status};
 pub use ozzy_journal::operation::Digest;
@@ -37,9 +52,12 @@ pub use view_change::{
     StartViewChange, ViewChange, ViewChangeError,
 };
 
+use std::collections::VecDeque;
+
 use ozzy_journal::operation::{CanonicalOperation, logical_operation_digest_with_body_digest};
 use ozzy_journal::progress::ProgressError;
 use ozzy_proto::{GroupId, NodeId};
+use voters::{VoterIndex, VoterSet, Voters};
 
 /// Exact canonical group prefix. Zero with the zero digest is genesis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,23 +89,12 @@ pub struct Scope {
     pub view: u64,
 }
 
-/// Confirmation boundary for a group whose history is persisted to a journal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum QuorumPolicy {
-    /// Confirmation requires synchronized history on the leader and one backup.
-    Durable = 1,
-    /// Confirmation requires retained history on the leader and one backup.
-    /// Journal writes proceed independently; restart needs separate recovery evidence.
-    Replicated = 2,
-}
-
-/// Three ordered, distinct voters with an immutable confirmation policy.
+/// Three ordered, distinct voters. Confirmation needs synchronized history on
+/// the leader and one backup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Configuration {
     scope: Scope,
-    voters: [NodeId; 3],
-    policy: QuorumPolicy,
+    voters: Voters<NodeId>,
 }
 
 impl Configuration {
@@ -119,22 +126,8 @@ impl Configuration {
                 configuration_digest: digest,
                 view: 0,
             },
-            voters,
-            policy: QuorumPolicy::Durable,
+            voters: Voters(voters),
         })
-    }
-
-    /// Confirmation boundary bound into the canonical configuration digest.
-    pub const fn policy(self) -> QuorumPolicy {
-        self.policy
-    }
-
-    /// Native writer policy bound to this immutable group configuration.
-    pub const fn append_policy(self) -> ozzy_proto::append::Policy {
-        match self.policy {
-            QuorumPolicy::Durable => ozzy_proto::append::Policy::QuorumDurable,
-            QuorumPolicy::Replicated => ozzy_proto::append::Policy::QuorumReplicatedPersisting,
-        }
     }
 
     /// Initial configuration scope. Later views require the view-change protocol.
@@ -144,18 +137,22 @@ impl Configuration {
 
     /// Ordered persistent voter identities.
     pub const fn voters(&self) -> &[NodeId; 3] {
-        &self.voters
+        &self.voters.0
     }
 
     /// Deterministic primary selection. Does not grant leadership authority.
     pub fn primary(&self, view: u64) -> NodeId {
-        self.voters[(view % 3) as usize]
+        self.voters[VoterIndex::primary(view)]
     }
 
-    fn voter_index(&self, id: NodeId) -> Result<usize, ReplicationError> {
+    fn voter(&self, index: VoterIndex) -> NodeId {
+        self.voters[index]
+    }
+
+    fn voter_index(&self, id: NodeId) -> Result<VoterIndex, ReplicationError> {
         self.voters
             .iter()
-            .position(|&voter| voter == id)
+            .find_map(|(index, &voter)| (voter == id).then_some(index))
             .ok_or(ReplicationError::UnknownVoter)
     }
 }
@@ -168,6 +165,24 @@ pub struct PipelineLimits {
     pub max_operations: usize,
     /// Maximum total canonical body bytes retained by the payload adapter.
     pub max_body_bytes: usize,
+}
+
+/// Live windows a backup retains beyond its released prefix: the primary's
+/// window beyond the commit it announced, plus the window that release can
+/// trail that commit by while the other backup confirms the primary's writes.
+const BACKUP_WINDOWS: usize = 2;
+
+impl PipelineLimits {
+    /// Capacity a backup retains beyond its released prefix for a primary
+    /// with this live window. Everything a backup holds accepted but not yet
+    /// applied, in any owner, must fit this bound.
+    #[must_use]
+    pub const fn backup(self) -> Self {
+        Self {
+            max_operations: self.max_operations.saturating_mul(BACKUP_WINDOWS),
+            max_body_bytes: self.max_body_bytes.saturating_mul(BACKUP_WINDOWS),
+        }
+    }
 }
 
 /// Metadata for one already validated canonical operation.
@@ -215,6 +230,16 @@ impl PreparedOperation {
     }
 }
 
+/// Drop the leading operations through `through` from a contiguous window.
+/// Returns the canonical body bytes they retained.
+fn release_through(operations: &mut VecDeque<PreparedOperation>, through: OpNumber) -> usize {
+    let count = operations.partition_point(|operation| operation.prefix.op <= through);
+    operations
+        .drain(..count)
+        .map(|operation| operation.body_bytes)
+        .sum()
+}
+
 /// Cumulative durable `PREPARE_OK`. Sender identity comes from authentication.
 ///
 /// There is deliberately no written/received evidence variant in this initial
@@ -225,16 +250,6 @@ pub struct PrepareOk {
     pub scope: Scope,
     /// Highest matching contiguous prefix covered by a completed disk barrier.
     pub durable: Prefix,
-}
-
-/// Cumulative retained-memory vote for a background-persisting group.
-/// This type cannot be passed to the disk-quorum acknowledgment entry point.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RetainedPrepareOk {
-    /// Exact group, immutable policy/configuration, and current view.
-    pub scope: Scope,
-    /// Complete validated prefix whose payload remains owned by this broker.
-    pub retained: Prefix,
 }
 
 /// Primary's cumulative commit announcement, also usable as an idle heartbeat.
@@ -250,9 +265,6 @@ pub struct Commit {
 /// conflicting current lineage faults the normal core.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ReplicationError {
-    /// A vote's evidence does not match the group's immutable confirmation policy.
-    #[error("replication confirmation policy mismatch")]
-    PolicyMismatch,
     /// Configuration needs nonzero group/voter IDs, distinct voters, and a digest.
     #[error("invalid fixed replication configuration")]
     InvalidConfiguration,

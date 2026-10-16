@@ -2,13 +2,19 @@
 
 use super::append::DataLimits;
 use super::{ENVELOPE_BYTES, Envelope, EnvelopeError, EnvelopeLimits, Opcode, Packet};
+use crate::layout::{LayoutError, Reader};
+use smallvec::SmallVec;
 
 /// Owner-append capability, including exact retry reconciliation.
 pub const OWNER_APPEND: u16 = 1;
+/// Consumer-group membership and source activation; requires durable progress.
+pub const OWNER_GROUPS: u16 = 1 << 7;
 /// Typed authority hints for fixed-group owner discovery and unchanged retries.
 pub const OWNER_ROUTING: u16 = 1 << 9;
 /// Single-partition reader delivery and receipt/processing observations.
 pub const OWNER_READ: u16 = 1 << 10;
+/// Durable group processing progress, with exact member/assignment fencing.
+pub const OWNER_PROGRESS: u16 = 1 << 11;
 /// Pipelined owner append with record-based retries and per-writer range replies.
 pub const OWNER_STREAM: u16 = 1 << 12;
 /// Reader role, not independent authorization.
@@ -17,8 +23,8 @@ pub const CONSUMER: u32 = 2;
 pub const PRODUCER: u32 = 1;
 /// Log-owner role. Serving authority still comes from the active group.
 pub const OWNER: u32 = 4;
-// Capabilities 12 and 14 are unassigned. Required use must fail, never imply delivery.
-const KNOWN_CAPABILITIES: u16 = 0x17ff;
+// Capability 14 is unassigned. Required use must fail, never imply delivery.
+const KNOWN_CAPABILITIES: u16 = 0x1fff;
 const MAX_PROPERTIES: usize = 32;
 const NAMES: [&[u8]; 10] = [
     b"versions",
@@ -66,6 +72,24 @@ impl Parameters {
         parameters.required_capabilities = OWNER_READ;
         Ok(parameters)
     }
+
+    /// Reader profile requiring durable progress in addition to record delivery.
+    pub fn processing(receive: DataLimits, roles: u32) -> Result<Self, HandshakeError> {
+        let mut parameters = Self::reader(receive, roles)?;
+        parameters.capabilities |= OWNER_PROGRESS;
+        parameters.required_capabilities |= OWNER_PROGRESS;
+        parameters.validate()?;
+        Ok(parameters)
+    }
+
+    /// Processing profile that also requires automatic group membership.
+    pub fn group(receive: DataLimits, roles: u32) -> Result<Self, HandshakeError> {
+        let mut parameters = Self::processing(receive, roles)?;
+        parameters.capabilities |= OWNER_GROUPS;
+        parameters.required_capabilities |= OWNER_GROUPS;
+        parameters.validate()?;
+        Ok(parameters)
+    }
     /// Single-request append profile; other command families remain unadvertised.
     pub fn append(receive: DataLimits, roles: u32) -> Result<Self, HandshakeError> {
         let parameters = Self {
@@ -91,6 +115,8 @@ impl Parameters {
             || self.receive.envelope.max_metadata_bytes < 512
             || self.capabilities & !KNOWN_CAPABILITIES != 0
             || (self.capabilities & OWNER_STREAM != 0 && self.capabilities & OWNER_APPEND == 0)
+            || (self.capabilities & OWNER_PROGRESS != 0 && self.capabilities & OWNER_READ == 0)
+            || (self.capabilities & OWNER_GROUPS != 0 && self.capabilities & OWNER_PROGRESS == 0)
             || self.required_capabilities & !self.capabilities != 0
             || self.roles == 0
             || self.roles & !31 != 0
@@ -140,12 +166,12 @@ pub fn encode(
 ) -> Result<[u8; ENVELOPE_BYTES], HandshakeError> {
     validate_command(envelope, handshake)?;
     let p = handshake.parameters;
-    let (caps, caps_len) = capabilities(p.capabilities);
-    let (required, required_len) = capabilities(p.required_capabilities);
+    let caps = capabilities(p.capabilities);
+    let required = capabilities(p.required_capabilities);
     let properties: [(&[u8], &[u8]); 9] = [
         (b"versions", &[0, 0, 0, 1, super::VERSION]),
-        (b"capabilities", &caps[..caps_len]),
-        (b"required-capabilities", &required[..required_len]),
+        (b"capabilities", caps.as_slice()),
+        (b"required-capabilities", required.as_slice()),
         (
             b"max-metadata-bytes",
             &(p.receive.envelope.max_metadata_bytes as u32).to_be_bytes(),
@@ -168,12 +194,21 @@ pub fn encode(
             &(p.receive.max_record_bytes as u32).to_be_bytes(),
         ),
     ];
-    let size = 32
-        + properties
-            .iter()
-            .map(|(name, value)| 5 + name.len() + value.len())
-            .sum::<usize>()
-        + usize::from(handshake.superseded_hello.is_some()) * 37;
+    let superseded = handshake.superseded_hello.map(u128::to_be_bytes);
+    let properties = properties.into_iter().chain(
+        superseded
+            .as_ref()
+            .map(|nonce| (&b"superseded-hello"[..], &nonce[..])),
+    );
+    // Identity, then one length-prefixed name and value per property.
+    let size = properties
+        .clone()
+        .try_fold(32_usize, |size, (name, value)| {
+            size.checked_add(5)?
+                .checked_add(name.len())?
+                .checked_add(value.len())
+        })
+        .ok_or(HandshakeError::Length)?;
     let header = envelope.encode_header(size, 0, limits)?;
     if metadata.capacity() < size {
         return Err(HandshakeError::Capacity);
@@ -182,22 +217,20 @@ pub fn encode(
     metadata.extend_from_slice(&handshake.instance_id.to_be_bytes());
     metadata.extend_from_slice(&handshake.hello_nonce.to_be_bytes());
     for (name, value) in properties {
-        metadata.push(u8::try_from(name.len()).expect("fixed ASCII property name"));
-        metadata.extend_from_slice(name);
-        metadata.extend_from_slice(
-            &u32::try_from(value.len())
-                .expect("fixed property size")
-                .to_be_bytes(),
-        );
-        metadata.extend_from_slice(value);
-    }
-    if let Some(nonce) = handshake.superseded_hello {
-        metadata.push(16);
-        metadata.extend_from_slice(b"superseded-hello");
-        metadata.extend_from_slice(&16_u32.to_be_bytes());
-        metadata.extend_from_slice(&nonce.to_be_bytes());
+        write_property(metadata, name, value)?;
     }
     Ok(header)
+}
+
+/// One length-prefixed property name and value.
+fn write_property(metadata: &mut Vec<u8>, name: &[u8], value: &[u8]) -> Result<(), HandshakeError> {
+    let name_bytes = u8::try_from(name.len()).map_err(|_| HandshakeError::Properties)?;
+    let value_bytes = u32::try_from(value.len()).map_err(|_| HandshakeError::Properties)?;
+    metadata.push(name_bytes);
+    metadata.extend_from_slice(name);
+    metadata.extend_from_slice(&value_bytes.to_be_bytes());
+    metadata.extend_from_slice(value);
+    Ok(())
 }
 
 /// Decode without allocating. Unknown optional properties/capabilities are ignored.
@@ -210,65 +243,16 @@ pub fn decode(packet: Packet<'_>, limits: EnvelopeLimits) -> Result<Handshake, H
     if !packet.payload.is_empty() {
         return Err(HandshakeError::Command);
     }
-    let mut bytes = packet.metadata;
-    let instance_id = u128::from_be_bytes(take(&mut bytes, 16)?.try_into().expect("field size"));
-    let hello_nonce = u128::from_be_bytes(take(&mut bytes, 16)?.try_into().expect("field size"));
-    let mut names: [&[u8]; MAX_PROPERTIES] = [&[]; MAX_PROPERTIES];
-    let mut seen = 0;
-    let mut values: [Option<&[u8]>; 10] = [None; 10];
-    while !bytes.is_empty() {
-        if seen == MAX_PROPERTIES {
-            return Err(HandshakeError::Properties);
-        }
-        let length = usize::from(take(&mut bytes, 1)?[0]);
-        let name = take(&mut bytes, length)?;
-        if name.is_empty()
-            || !name.is_ascii()
-            || names[..seen]
-                .iter()
-                .any(|old| old.eq_ignore_ascii_case(name))
-        {
-            return Err(HandshakeError::Properties);
-        }
-        names[seen] = name;
-        seen += 1;
-        let length = number(take(&mut bytes, 4)?)? as usize;
-        let value = take(&mut bytes, length)?;
-        if let Some(index) = NAMES
-            .iter()
-            .position(|known| known.eq_ignore_ascii_case(name))
-        {
-            values[index] = Some(value);
-        }
-    }
+    let mut reader = Reader::new(packet.metadata);
+    let instance_id = u128::from_be_bytes(reader.array()?);
+    let hello_nonce = u128::from_be_bytes(reader.array()?);
+    let values = read_properties(reader)?;
     let mut v = [&[][..]; 9];
     for (to, from) in v.iter_mut().zip(values) {
         *to = from.ok_or(HandshakeError::Properties)?;
     }
-    let mut versions = v[0];
-    let count = number(take(&mut versions, 4)?)? as usize;
-    if count == 0
-        || count > 256
-        || count != versions.len()
-        || !versions.contains(&super::VERSION)
-        || (packet.envelope.opcode == Opcode::Welcome && versions != [super::VERSION])
-    {
-        return Err(HandshakeError::Version);
-    }
-    let parameters = Parameters {
-        capabilities: decode_capabilities(v[1], false)?,
-        required_capabilities: decode_capabilities(v[2], true)?,
-        receive: DataLimits {
-            envelope: EnvelopeLimits {
-                max_metadata_bytes: number(v[3])? as usize,
-                max_payload_bytes: number(v[4])? as usize,
-            },
-            max_records: number(v[5])? as usize,
-            max_parts: number(v[6])? as usize,
-            max_record_bytes: number(v[8])? as usize,
-        },
-        roles: number(v[7])?,
-    };
+    check_versions(v[0], packet.envelope.opcode)?;
+    let parameters = decode_parameters(&v)?;
     let handshake = Handshake {
         superseded_hello: values[9]
             .map(|v| {
@@ -285,6 +269,71 @@ pub fn decode(packet: Packet<'_>, limits: EnvelopeLimits) -> Result<Handshake, H
     Ok(handshake)
 }
 
+/// Known property values in [`NAMES`] order. Unknown names count only toward
+/// the property bound and duplicate rejection.
+fn read_properties(mut reader: Reader<'_>) -> Result<[Option<&[u8]>; NAMES.len()], HandshakeError> {
+    let mut names: SmallVec<[&[u8]; MAX_PROPERTIES]> = SmallVec::new();
+    let mut values = [None; NAMES.len()];
+    while !reader.rest().is_empty() {
+        if names.len() == MAX_PROPERTIES {
+            return Err(HandshakeError::Properties);
+        }
+        let length = usize::from(reader.u8()?);
+        let name = reader.take(length)?;
+        if name.is_empty()
+            || !name.is_ascii()
+            || names.iter().any(|old| old.eq_ignore_ascii_case(name))
+        {
+            return Err(HandshakeError::Properties);
+        }
+        names.push(name);
+        let length = reader.u32()? as usize;
+        let value = reader.take(length)?;
+        if let Some(slot) = NAMES
+            .iter()
+            .zip(&mut values)
+            .find_map(|(known, slot)| known.eq_ignore_ascii_case(name).then_some(slot))
+        {
+            *slot = Some(value);
+        }
+    }
+    Ok(values)
+}
+
+/// A HELLO offers this version among others; a WELCOME selects only it.
+fn check_versions(value: &[u8], opcode: Opcode) -> Result<(), HandshakeError> {
+    let mut versions = Reader::new(value);
+    let count = versions.u32()? as usize;
+    let versions = versions.rest();
+    if count == 0
+        || count > 256
+        || count != versions.len()
+        || !versions.contains(&super::VERSION)
+        || (opcode == Opcode::Welcome && versions != [super::VERSION])
+    {
+        return Err(HandshakeError::Version);
+    }
+    Ok(())
+}
+
+/// Parameters from the required property values, in [`NAMES`] order.
+fn decode_parameters(v: &[&[u8]; 9]) -> Result<Parameters, HandshakeError> {
+    Ok(Parameters {
+        capabilities: decode_capabilities(v[1], false)?,
+        required_capabilities: decode_capabilities(v[2], true)?,
+        receive: DataLimits {
+            envelope: EnvelopeLimits {
+                max_metadata_bytes: number(v[3])? as usize,
+                max_payload_bytes: number(v[4])? as usize,
+            },
+            max_records: number(v[5])? as usize,
+            max_parts: number(v[6])? as usize,
+            max_record_bytes: number(v[8])? as usize,
+        },
+        roles: number(v[7])?,
+    })
+}
+
 fn validate_command(envelope: Envelope, handshake: Handshake) -> Result<(), HandshakeError> {
     if !matches!(envelope.opcode, Opcode::Hello | Opcode::Welcome)
         || envelope.response != (envelope.opcode == Opcode::Welcome)
@@ -298,21 +347,27 @@ fn validate_command(envelope: Envelope, handshake: Handshake) -> Result<(), Hand
     handshake.parameters.validate()
 }
 
-fn capabilities(bits: u16) -> ([u8; 32], usize) {
-    let mut bytes = [0; 32];
-    bytes[..4].copy_from_slice(&bits.count_ones().to_be_bytes());
-    let mut size = 4;
-    for id in 1..=14_u16 {
-        if bits & (1 << (id - 1)) != 0 {
-            bytes[size..size + 2].copy_from_slice(&id.to_be_bytes());
-            size += 2;
-        }
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "capability ids lie in 1..=14"
+)]
+fn capabilities(bits: u16) -> SmallVec<[u8; 32]> {
+    let mut bytes = SmallVec::new();
+    bytes.extend_from_slice(&bits.count_ones().to_be_bytes());
+    for id in (1..=14_u16).filter(|id| bits & (1 << (id - 1)) != 0) {
+        bytes.extend_from_slice(&id.to_be_bytes());
     }
-    (bytes, size)
+    bytes
 }
 
-fn decode_capabilities(mut bytes: &[u8], required: bool) -> Result<u16, HandshakeError> {
-    let count = number(take(&mut bytes, 4)?)? as usize;
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "the count is capped at 64 first, and set ids lie in 1..=14"
+)]
+fn decode_capabilities(bytes: &[u8], required: bool) -> Result<u16, HandshakeError> {
+    let mut reader = Reader::new(bytes);
+    let count = reader.u32()? as usize;
+    let bytes = reader.rest();
     if count > 64 || bytes.len() != count * 2 {
         return Err(HandshakeError::Capabilities);
     }
@@ -329,14 +384,6 @@ fn decode_capabilities(mut bytes: &[u8], required: bool) -> Result<u16, Handshak
         }
     }
     Ok(bits)
-}
-
-fn take<'a>(bytes: &mut &'a [u8], count: usize) -> Result<&'a [u8], HandshakeError> {
-    let (value, rest) = bytes
-        .split_at_checked(count)
-        .ok_or(HandshakeError::Length)?;
-    *bytes = rest;
-    Ok(value)
 }
 
 fn number(bytes: &[u8]) -> Result<u32, HandshakeError> {
@@ -372,4 +419,10 @@ pub enum HandshakeError {
     /// Caller did not reserve enough metadata space.
     #[error("handshake encode buffer capacity exhausted")]
     Capacity,
+}
+
+impl From<LayoutError> for HandshakeError {
+    fn from(_: LayoutError) -> Self {
+        Self::Length
+    }
 }

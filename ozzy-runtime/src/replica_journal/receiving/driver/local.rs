@@ -6,7 +6,7 @@ use crate::replica_journal::{
     OwnedJournal, OwnedRecoveringJournal, OwnedRecoveryGenerations, OwnedRecoveryOpen,
     PublishedRecovery, ReceivedChunk, RecoveryPlan, RecoveryStartup, Rejected, ReplicaJournal,
     ShardJournalConfig, SubmitError,
-    commands::{Action, Command, finish},
+    commands::{Command, finish},
     receiving::ReceiveAction,
 };
 use futures::{FutureExt, future::LocalBoxFuture};
@@ -33,6 +33,7 @@ pub(in crate::replica_journal) struct Execution {
     closing: bool,
     finished: bool,
     shutdown: Option<LocalBoxFuture<'static, Result<(), JournalError>>>,
+    poller: crate::replica_journal::execution::PollWaker,
 }
 impl std::fmt::Debug for Execution {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -52,23 +53,16 @@ impl Execution {
     pub(in crate::replica_journal) fn close(&mut self) {
         self.closing = true;
     }
-    #[expect(
-        clippy::result_large_err,
-        reason = "refusal returns the original recovery action"
-    )]
-    pub(in crate::replica_journal) fn submit(&mut self, command: Command) -> Result<(), Command> {
-        if self.available() == 0 {
-            return Err(command);
+    /// Take the owner for one transfer command when it is idle.
+    pub(in crate::replica_journal) fn admit(&mut self) -> Option<Admitted<'_>> {
+        if self.is_closed() {
+            return None;
         }
-        self.running = Some(
-            run(
-                self.owner.take().expect("available recovery owner"),
-                command,
-            )
-            .boxed_local(),
-        );
-        let _ = self.poll_work(&mut Context::from_waker(std::task::Waker::noop()));
-        Ok(())
+        let owner = self.owner.take()?;
+        Some(Admitted {
+            execution: self,
+            owner,
+        })
     }
     fn poll_work(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         if let Some(running) = &mut self.running {
@@ -80,6 +74,7 @@ impl Execution {
         Poll::Ready(())
     }
     pub(in crate::replica_journal) fn poll_finished(&mut self, cx: &mut Context<'_>) -> Poll<bool> {
+        self.poller.observe(cx);
         if self.finished {
             return Poll::Ready(self.failed);
         }
@@ -91,21 +86,33 @@ impl Execution {
             self.finished = true;
             return Poll::Ready(false);
         }
-        if self.shutdown.is_none() {
-            let owner = self.owner.take().expect("settled recovery owner");
+        if self.shutdown.is_none()
+            && let Some(owner) = self.owner.take()
+        {
             self.shutdown = Some(async move { owner.shutdown().await }.boxed_local());
         }
-        self.failed |= std::task::ready!(
-            self.shutdown
-                .as_mut()
-                .expect("closing owner")
-                .as_mut()
-                .poll(cx)
-        )
-        .is_err();
+        // A command holding the owner returned it before the journal closed.
+        if let Some(shutdown) = &mut self.shutdown {
+            self.failed |= std::task::ready!(shutdown.as_mut().poll(cx)).is_err();
+        }
         self.shutdown = None;
         self.finished = true;
         Poll::Ready(self.failed)
+    }
+}
+
+/// The recovery owner taken for one admitted transfer command.
+pub(in crate::replica_journal) struct Admitted<'a> {
+    execution: &'a mut Execution,
+    owner: Box<OwnedRecoveringJournal>,
+}
+
+impl Admitted<'_> {
+    pub(in crate::replica_journal) fn start(self, command: Command<ReceiveAction>) {
+        let Self { execution, owner } = self;
+        execution.running = Some(run(owner, command).boxed_local());
+        let waker = execution.poller.waker();
+        let _ = execution.poll_work(&mut Context::from_waker(&waker));
     }
 }
 
@@ -159,8 +166,15 @@ impl ShardRecoveringJournal {
         let memory = owner.append_memory.clone();
         let journal = ReplicaJournal {
             backlog: config.writeback,
-            replicated: config.configuration.configuration().policy()
-                == ozzy_replication::QuorumPolicy::Replicated,
+            unapplied: config.deduplication.map_or(
+                config.recovery.accepted_transitions,
+                |limits| {
+                    limits
+                        .pending_operations
+                        .min(config.recovery.accepted_transitions)
+                },
+            ),
+            dedup_window_millis: config.deduplication.map(|limits| limits.window_millis),
             capacity: Arc::new(Semaphore::new(scheduler.commands)),
             command_capacity: scheduler.commands,
             read_capacity: Arc::new(Semaphore::new(0)),
@@ -177,6 +191,7 @@ impl ShardRecoveringJournal {
                 closing: false,
                 finished: false,
                 shutdown: None,
+                poller: crate::replica_journal::execution::PollWaker::new(),
             }),
         };
         Ok(Self {
@@ -190,13 +205,16 @@ impl ShardRecoveringJournal {
     }
 
     async fn take_owner(&mut self) -> Result<OwnedRecoveringJournal, JournalError> {
-        self.journal.execution.recovery().retain = true;
+        self.journal
+            .execution
+            .recovery()
+            .ok_or(JournalError::Faulted)?
+            .retain = true;
         self.journal.shutdown().await?;
         self.journal
             .execution
             .recovery()
-            .owner
-            .take()
+            .and_then(|execution| execution.owner.take())
             .map(|owner| *owner)
             .ok_or(JournalError::Faulted)
     }
@@ -204,15 +222,12 @@ impl ShardRecoveringJournal {
 
 async fn run(
     mut owner: Box<OwnedRecoveringJournal>,
-    command: Command,
+    command: Command<ReceiveAction>,
 ) -> (Box<OwnedRecoveringJournal>, bool) {
     let Command {
         action,
         _permit: permit,
     } = command;
-    let Action::Receiving(action) = action else {
-        unreachable!("recovery admits only transfer work");
-    };
     let failed = match action {
         ReceiveAction::Checkpoint {
             ticket,
@@ -254,42 +269,23 @@ impl RecoveryStorage for ShardRecoveringJournal {
         ticket: RecoveryTicket,
         config: InstallationConfig,
     ) -> Result<JournalCompletion<RecoveryPlan>, SubmitError> {
-        self.journal
-            .submit(
-                ticket,
-                |ticket, done| {
-                    Action::Receiving(ReceiveAction::Begin {
-                        ticket,
-                        config,
-                        done,
-                    })
-                },
-                |action| match action {
-                    Action::Receiving(ReceiveAction::Begin { ticket, .. }) => ticket,
-                    _ => unreachable!("preserved action"),
-                },
-            )
-            .map_err(|error| error.reason)
+        self.journal.receive(|done| ReceiveAction::Begin {
+            ticket,
+            config,
+            done,
+        })
     }
     fn receive_chunk(
         &mut self,
         ticket: RecoveryTicket,
         buffer: AppendBuffer,
     ) -> Result<JournalCompletion<ReceivedChunk>, Rejected<AppendBuffer>> {
-        self.journal.submit(
-            buffer,
-            |buffer, done| {
-                Action::Receiving(ReceiveAction::Chunk {
-                    ticket,
-                    buffer,
-                    done,
-                })
-            },
-            |action| match action {
-                Action::Receiving(ReceiveAction::Chunk { buffer, .. }) => buffer,
-                _ => unreachable!("preserved action"),
-            },
-        )
+        self.journal
+            .submit_receive(buffer, |buffer, done| ReceiveAction::Chunk {
+                ticket,
+                buffer,
+                done,
+            })
     }
     fn receive_checkpoint(
         &mut self,
@@ -308,53 +304,26 @@ impl RecoveryStorage for ShardRecoveringJournal {
         } else {
             bytes
         };
-        self.journal
-            .submit(
-                bytes,
-                |bytes, done| {
-                    Action::Receiving(ReceiveAction::Checkpoint {
-                        ticket,
-                        offset,
-                        bytes,
-                        done,
-                    })
-                },
-                |action| match action {
-                    Action::Receiving(ReceiveAction::Checkpoint { bytes, .. }) => bytes,
-                    _ => unreachable!("preserved action"),
-                },
-            )
-            .map_err(|rejected| rejected.reason)
+        self.journal.receive(|done| ReceiveAction::Checkpoint {
+            ticket,
+            offset,
+            bytes,
+            done,
+        })
     }
     fn finish_recovery(
         &mut self,
         ticket: RecoveryTicket,
     ) -> Result<JournalCompletion<PublishedRecovery>, SubmitError> {
         self.journal
-            .submit(
-                ticket,
-                |ticket, done| Action::Receiving(ReceiveAction::Finish { ticket, done }),
-                |action| match action {
-                    Action::Receiving(ReceiveAction::Finish { ticket, .. }) => ticket,
-                    _ => unreachable!("preserved action"),
-                },
-            )
-            .map_err(|error| error.reason)
+            .receive(|done| ReceiveAction::Finish { ticket, done })
     }
     fn abort_recovery(
         &mut self,
         ticket: RecoveryTicket,
     ) -> Result<JournalCompletion<RecoveryTicket>, SubmitError> {
         self.journal
-            .submit(
-                ticket,
-                |ticket, done| Action::Receiving(ReceiveAction::Abort { ticket, done }),
-                |action| match action {
-                    Action::Receiving(ReceiveAction::Abort { ticket, .. }) => ticket,
-                    _ => unreachable!("preserved action"),
-                },
-            )
-            .map_err(|error| error.reason)
+            .receive(|done| ReceiveAction::Abort { ticket, done })
     }
     fn poll_stopped(&mut self, cx: &mut Context<'_>) -> Poll<JournalError> {
         self.journal.poll_stopped(cx)

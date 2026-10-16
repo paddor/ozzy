@@ -1,3 +1,13 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
+
 use ozzy_proto::append::DataLimits;
 use ozzy_proto::handshake::{self, Handshake, HandshakeError, Parameters};
 use ozzy_proto::{Envelope, EnvelopeLimits, Opcode, Packet, decode_packet};
@@ -248,9 +258,9 @@ fn streaming_capability_requires_append_and_all_known_ids_round_trip() {
         parameters.required_capabilities = parameters.capabilities;
         assert_eq!(parameters.validate(), Err(HandshakeError::Parameters));
     }
-    // Former FETCH capability 12 is unassigned. Streaming remains capability 13.
-    parameters.capabilities = 0x17ff;
-    parameters.required_capabilities = 0x17ff;
+    // Every assigned capability, with each dependency satisfied.
+    parameters.capabilities = 0x1fff;
+    parameters.required_capabilities = 0x1fff;
     let hello = Handshake {
         parameters,
         ..hello()

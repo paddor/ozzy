@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
-    AsyncJournalWritePipeline as Pipeline, AsyncPreparedJournalWrite as Prepared,
-    JournalGroupEncoder, PreencodedJournalGroup, SharedJournalOperation, logical_operation_digest,
+    JournalGroupEncoder, JournalWritePipeline as Pipeline, PreencodedJournalGroup,
+    PreparedJournalWrite as Prepared, SharedJournalOperation, logical_operation_digest,
 };
 use ozzy_journal::operation::canonical_body_digest;
 use std::num::NonZeroUsize;
@@ -548,4 +548,50 @@ fn async_pipeline_reuses_preencoded_group_after_roll_and_rejects_impossible_char
     assert_eq!(pipeline.pending(), 0);
     assert_eq!(controller.jobs().len(), 0);
     assert!(pipeline.finish().is_ok());
+}
+
+#[test]
+fn async_pipeline_segment_decoded_body_limit_defers_the_group_to_the_next_segment() {
+    let (mut controller, io) = setup(Image::default());
+    let mut chosen = limits();
+    chosen.decode.max_decoded_body_bytes = 16;
+    chosen.decode.max_group_decoded_body_bytes = 16;
+    chosen.decode.max_segment_decoded_body_bytes = 16;
+    let journal = drive(
+        &mut controller,
+        Journal::format(
+            "/group".into(),
+            io,
+            spec(CommitMode::External),
+            JournalGeneration(1),
+            chosen,
+        ),
+    )
+    .unwrap();
+    let mut pipeline = journal.begin_write_pipeline(2).unwrap();
+    let work = reserve(&mut pipeline, 1, BodyEncoding::Raw, false)
+        .pop()
+        .unwrap();
+    pipeline
+        .complete(drive(&mut controller, work.write()))
+        .unwrap();
+    let group = next_group(&mut pipeline);
+    assert!(matches!(
+        pipeline.check(&group),
+        Err(DirectoryError::Codec(CodecError::SegmentDecodedBodyLimit {
+            actual: 32,
+            limit: 16
+        }))
+    ));
+    assert_eq!(pipeline.pending(), 0);
+    let mut journal = pipeline.finish().unwrap();
+    drive(&mut controller, journal.roll_active(32768, 4)).unwrap();
+    let mut pipeline = journal.begin_write_pipeline(1).unwrap();
+    let prepared = pipeline.prepare(group, 0).unwrap();
+    pipeline
+        .complete(drive(&mut controller, prepared.write()))
+        .unwrap();
+    let journal = pipeline.finish().unwrap();
+    assert_eq!(journal.accepted_position().unwrap().op_number, 2);
+    assert_eq!(journal.manifest.segments.len(), 2);
 }

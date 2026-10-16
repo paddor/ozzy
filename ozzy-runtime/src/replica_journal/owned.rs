@@ -2,7 +2,11 @@
 //! No command lane, task, file descriptor or execution pool is created here.
 
 mod config;
-pub use config::OwnedConfig;
+pub use config::{DedupLimits, OwnedConfig, dedup_limits};
+pub(in crate::replica_journal) mod dedup;
+mod facts;
+pub use facts::{GroupSource, PartitionFacts};
+mod groups;
 mod local;
 mod mode;
 use mode::Mode;
@@ -17,15 +21,17 @@ mod maintenance;
 pub use maintenance::{
     CleanedStorage, CompletedStorageValidation, PreparedStorageValidation, StorageCleanup,
 };
+mod assignment;
 mod ownership;
 mod producer_session;
+mod progress;
 mod proposal;
 mod read;
 pub(in crate::replica_journal) mod seek;
 pub use read::{CompletedDelivery, CompletedRead, PartitionDelivery, PreparedRead};
 mod replay;
 mod retention;
-pub use replay::{CompletedReplay, PreparedReplay};
+pub use replay::{CompletedReplay, PreparedReplay, ReplayRequest};
 mod receiving;
 pub use receiving::{RecoveringJournal, RecoveryGenerations, RecoveryOpen};
 mod validation;
@@ -42,13 +48,12 @@ use ownership::JournalOwner;
 use ozzy_core::state::CanonicalImages;
 use ozzy_io::Local;
 use ozzy_journal_segment::{
-    AsyncCanonicalRecoveryCandidate, AsyncGroupJournal, AsyncJournalFormat, AsyncJournalHistory,
-    AsyncJournalIdentityIndex, AsyncJournalLimits, CanonicalRecoveryLimits, CommitMode,
-    SegmentHeader,
+    CanonicalRecoveryCandidate, CanonicalRecoveryLimits, CommitMode, GroupJournal, JournalFormat,
+    JournalHistory, JournalIdentityIndex, JournalLimits, SegmentHeader,
 };
 use ozzy_replication::{
-    Digest, FrozenLog, JournalGeneration, PipelineLimits, Prefix, PromiseTicket, QuorumPolicy,
-    RecoveredState, Scope,
+    Digest, FrozenLog, JournalGeneration, PipelineLimits, Prefix, PromiseTicket, RecoveredState,
+    Scope,
 };
 use tokio::sync::Semaphore;
 
@@ -69,19 +74,20 @@ pub struct OwnedJournal {
     journal: JournalOwner,
     configuration: Mode,
     scope: Scope,
-    images: Option<CanonicalImages<AsyncJournalIdentityIndex>>,
-    selected: Option<AsyncCanonicalRecoveryCandidate>,
-    history: Option<AsyncJournalHistory>,
+    images: Option<CanonicalImages<JournalIdentityIndex>>,
+    dedup: dedup::State,
+    selected: Option<CanonicalRecoveryCandidate>,
+    history: Option<JournalHistory>,
     replay: replay::Replay,
     storage_validation: maintenance::Validation,
     donors: [Option<donor::Source>; 3],
     applied: Prefix,
     pending: std::collections::VecDeque<Prefix>,
     writeback: writeback::Writeback,
-    reader: Option<ozzy_journal_segment::AsyncJournalPartitionIndex>,
-    read_limits: ozzy_journal_segment::AsyncPartitionReadLimits,
+    reader: Option<ozzy_journal_segment::JournalPartitionIndex>,
+    read_limits: ozzy_journal_segment::PartitionReadLimits,
     read_key: std::rc::Rc<()>,
-    limits: AsyncJournalLimits,
+    limits: JournalLimits,
     recovery: CanonicalRecoveryLimits,
     buffer_generation: JournalGeneration,
     append_buffers: usize,
@@ -117,7 +123,15 @@ impl OwnedJournal {
         }
         let journal = super::ReplicaJournal {
             backlog: self.writeback.limits,
-            replicated: self.configuration.memory_voting(),
+            unapplied: self
+                .dedup
+                .limits
+                .map_or(self.recovery.accepted_transitions, |limits| {
+                    limits
+                        .pending_operations
+                        .min(self.recovery.accepted_transitions)
+                }),
+            dedup_window_millis: self.dedup.limits.map(|limits| limits.window_millis),
             capacity: Arc::new(Semaphore::new(config.commands)),
             command_capacity: config.commands,
             read_capacity: Arc::new(Semaphore::new(self.read_limits.concurrent_reads)),
@@ -145,20 +159,10 @@ impl OwnedJournal {
         capacity: u64,
     ) -> Result<(Self, JournalStartup), JournalError> {
         config.validate(generation)?;
-        let configuration = config.configuration.configuration();
-        let first_segment =
-            SegmentHeader::new(config.identity.group_id, 1, None, Digest::ZERO, capacity)
-                .map_err(ozzy_journal_segment::DirectoryError::from)?;
-        let journal = AsyncGroupJournal::format(
+        let journal = GroupJournal::format(
             config.root.clone(),
             io,
-            AsyncJournalFormat {
-                identity: config.identity,
-                configuration_epoch: configuration.scope().configuration_epoch,
-                commit_mode: CommitMode::External,
-                first_segment,
-                configuration: config.configuration.encode().to_vec(),
-            },
+            config.journal_format(capacity)?,
             generation,
             config.limits,
         )
@@ -175,42 +179,30 @@ impl OwnedJournal {
     ) -> Result<(Self, JournalStartup), JournalError> {
         config.validate(generation)?;
         let bytes = config.configuration.encode();
-        let opening = AsyncGroupJournal::prepare_open(
+        let opening = GroupJournal::prepare_open(
             config.root.clone(),
             io,
-            config.identity,
-            Some(&bytes),
+            ozzy_journal_segment::ExpectedStore {
+                identity: config.identity,
+                configuration: Some(&bytes),
+            },
             config.limits,
         )
         .await?;
-        authority::validate_manifest(
-            opening.manifest(),
-            config
-                .configuration
-                .configuration()
-                .scope()
-                .configuration_epoch,
-            config.limits.io.max_segment_bytes,
-        )?;
+        config.validate_manifest(opening.manifest())?;
         let journal = opening.recover(generation).await?;
         Box::pin(Self::start(config, journal, generation, false)).await
     }
 
     async fn start(
         config: OwnedConfig,
-        mut journal: AsyncGroupJournal,
+        mut journal: GroupJournal,
         generation: JournalGeneration,
         fresh: bool,
     ) -> Result<(Self, JournalStartup), JournalError> {
         let configuration = config.configuration.configuration();
         let candidate = journal.recover_canonical_candidate(config.recovery).await?;
         let accepted = prefix(journal.accepted_position()?);
-        if configuration.policy() == QuorumPolicy::Replicated {
-            if !fresh {
-                journal.require_drained_memory_history().await?;
-            }
-            journal.mark_memory_voting_running().await?;
-        }
         let images = if fresh {
             Some(candidate.activate(&journal)?)
         } else {
@@ -235,31 +227,29 @@ impl OwnedJournal {
             }),
         };
         let reader = if fresh {
-            Some(
-                ozzy_journal_segment::AsyncJournalPartitionIndex::open(&journal, config.reads)
-                    .await?,
-            )
+            Some(ozzy_journal_segment::JournalPartitionIndex::open(&journal, config.reads).await?)
         } else {
             None
         };
-        Ok((
-            Self::from_open(
-                &config,
-                Mode::Replicated(configuration),
-                journal,
-                images,
-                reader,
-            )?,
-            startup,
-        ))
+        let mut owner = Self::from_open(
+            &config,
+            Mode::Replicated(configuration),
+            journal,
+            images,
+            reader,
+        )?;
+        if fresh {
+            owner.restore_dedup().await?;
+        }
+        Ok((owner, startup))
     }
 
     fn from_open<C>(
         config: &OwnedConfig<C>,
         configuration: Mode,
-        journal: AsyncGroupJournal,
-        images: Option<CanonicalImages<AsyncJournalIdentityIndex>>,
-        reader: Option<ozzy_journal_segment::AsyncJournalPartitionIndex>,
+        journal: GroupJournal,
+        images: Option<CanonicalImages<JournalIdentityIndex>>,
+        reader: Option<ozzy_journal_segment::JournalPartitionIndex>,
     ) -> Result<Self, JournalError> {
         let scope = Scope {
             view: journal.manifest().promised_view,
@@ -273,6 +263,7 @@ impl OwnedJournal {
             configuration,
             scope,
             images,
+            dedup: dedup::State::new(config.deduplication),
             selected: None,
             history: None,
             replay: replay::Replay::default(),
@@ -345,7 +336,7 @@ impl OwnedJournal {
 
     /// Inspect recovered canonical state only after this owner has activated it.
     /// Intact restart and election promises expose no old normal authority.
-    pub fn images(&self) -> Result<&CanonicalImages<AsyncJournalIdentityIndex>, JournalError> {
+    pub fn images(&self) -> Result<&CanonicalImages<JournalIdentityIndex>, JournalError> {
         self.healthy()?;
         self.images
             .as_ref()
@@ -376,16 +367,11 @@ impl OwnedJournal {
         self.writeback.require_idle()?;
         self.faulted = true;
         let journal = self.journal.ready()?;
-        let next = authority::promise_manifest(
-            self.scope,
-            journal.manifest(),
-            journal.writer().written_position(),
-            journal.writer().durable_position(),
-            prefix(journal.accepted_position()?),
-            ticket,
-        )?;
+        let next = authority::promise_manifest(self.scope, journal, ticket)?;
         if let Some(next) = next {
+            self.abandon_retirement();
             self.images = None;
+            self.dedup.clear();
             self.reader = None;
             self.replay.clear();
             self.storage_validation.clear();
@@ -397,6 +383,22 @@ impl OwnedJournal {
         }
         self.faulted = false;
         Ok(ticket)
+    }
+
+    /// Write up to `bytes` zeros where a freshly formatted store's first
+    /// appends land, so they overwrite written blocks: a local store's active
+    /// segment, or the spare that a replicated store's first election installs
+    /// its log into.
+    pub async fn zero_first_segment(&mut self, bytes: u64) -> Result<(), JournalError> {
+        self.healthy()?;
+        let local = matches!(self.configuration, Mode::Local(_));
+        let journal = self.journal.ready_mut()?;
+        if local {
+            journal.zero_ahead(bytes).await?;
+        } else {
+            journal.zero_spare(bytes).await?;
+        }
+        Ok(())
     }
 
     /// After the actor stops voting and admission, synchronize its installed
@@ -420,11 +422,7 @@ impl OwnedJournal {
             self.donors = std::array::from_fn(|_| None);
             self.images = None;
             self.selected = None;
-            let mut journal = self.journal.take_ready()?;
-            if self.configuration.memory_voting() {
-                journal.publish_drained_memory_history().await?;
-            }
-            journal.close().await?;
+            self.journal.take_ready()?.close().await?;
             Ok(())
         })
     }

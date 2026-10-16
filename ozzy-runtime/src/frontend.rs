@@ -25,7 +25,7 @@ pub use port::{
 };
 
 mod publication;
-pub use publication::{PublicationError, PublicationResult};
+pub use publication::{PublicationError, PublicationResult, PublicationSocket};
 
 mod buffers;
 pub use buffers::{BufferError, ReceiveBuffers, ReceiveStorage};
@@ -33,7 +33,7 @@ pub use buffers::{BufferError, ReceiveBuffers, ReceiveStorage};
 mod data_lane;
 mod inproc;
 pub use data_lane::{
-    DataInput, DataLaneError, DataReceiver, DataSendError, DataSender, data_channel,
+    DataInput, DataLaneError, DataLaneLimits, DataReceiver, DataSendError, DataSender, data_channel,
 };
 
 mod watch;

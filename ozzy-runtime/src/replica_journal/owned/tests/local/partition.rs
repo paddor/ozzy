@@ -8,6 +8,7 @@ fn definition() -> CreatePartition<'static> {
         topic: "orders",
         partition_id: PartitionId::ZERO,
         owner_epoch: OwnerEpoch::INITIAL,
+        dedup_window_millis: None,
         retention: RetentionPolicy::default(),
     }
 }
@@ -101,7 +102,7 @@ fn owned_partition_creation_rejects_changed_identity_without_changing_policy() {
     .unwrap();
     initialize(&mut controller, &mut journal, &mut driver);
     let before = driver.snapshot();
-    for case in 0..5 {
+    for case in 0..6 {
         let mut changed = definition();
         changed.retention.max_bytes = std::num::NonZeroU64::new(1234);
         match case {
@@ -109,6 +110,7 @@ fn owned_partition_creation_rejects_changed_identity_without_changing_policy() {
             1 => changed.topic = "different",
             2 => changed.partition_id = PartitionId::new(1),
             3 => changed.owner_epoch = OwnerEpoch::new(2),
+            4 => changed.dedup_window_millis = std::num::NonZeroU64::new(300_000),
             _ => changed.partition = PartitionIncarnation::from_bytes([99; 16]),
         }
         let mut buffer = journal.lease_proposal_buffer().unwrap();

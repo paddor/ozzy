@@ -3,7 +3,14 @@ use ozzy_bench::automation::Result;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-type Case = (String, u64, u64);
+/// One release chart cell; saturation cells have rate 0.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct Case {
+    mode: String,
+    size: u64,
+    rate: u64,
+}
+
 const LATENCIES: [&str; 6] = [
     "ack_p50_us",
     "ack_p99_us",
@@ -23,7 +30,7 @@ fn rows(data: &Value, fixed: bool) -> Result<BTreeMap<Case, &Value>> {
         let mode = case["mode"].as_str().ok_or("missing mode")?;
         let size = case["size"].as_u64().ok_or("missing size")?;
         let rate = case["rate"].as_u64().unwrap_or(0);
-        if !matches!(mode, "durable" | "disk-quorum" | "replicated-persisting")
+        if !matches!(mode, "durable" | "disk-quorum")
             || !matches!(size, 128 | 1024 | 8192)
             || case["codec"] != "raw"
             || case["pattern"] != "events"
@@ -34,7 +41,12 @@ fn rows(data: &Value, fixed: bool) -> Result<BTreeMap<Case, &Value>> {
         {
             return Err("regression gate requires the release chart workload".into());
         }
-        if rows.insert((mode.into(), size, rate), row).is_some() {
+        let cell = Case {
+            mode: mode.into(),
+            size,
+            rate,
+        };
+        if rows.insert(cell, row).is_some() {
             return Err("duplicate performance cell".into());
         }
     }
@@ -65,7 +77,28 @@ pub(crate) fn compare(baseline: &Value, candidate: &Value, fixed: bool) -> Resul
     if prior.keys().ne(current.keys()) {
         return Err("performance cell coverage changed".into());
     }
-    for (mode, _, _) in prior.keys() {
+    require_release_cells(&prior, fixed)?;
+    let compatible = compatible(baseline, candidate);
+    let mut comparisons = Vec::new();
+    let mut regressed = false;
+    for (case, before) in &prior {
+        let after = current[case];
+        for metric in metrics(fixed) {
+            let (comparison, regression) = compare_metric(case, before, after, &metric)?;
+            regressed |= regression;
+            comparisons.push(comparison);
+        }
+    }
+    Ok(json!({
+        "status":if !compatible { "incomparable" } else if regressed { "regression" } else { "pass" },
+        "threshold_percent":5,"compatible":compatible,"comparisons":comparisons,
+        "baseline":baseline,"candidate":candidate
+    }))
+}
+
+/// Every measured mode has each release chart cell.
+fn require_release_cells(cells: &BTreeMap<Case, &Value>, fixed: bool) -> Result<()> {
+    for Case { mode, .. } in cells.keys() {
         for size in [128, 1024, 8192] {
             let rates: &[u64] = if !fixed {
                 &[0]
@@ -74,64 +107,78 @@ pub(crate) fn compare(baseline: &Value, candidate: &Value, fixed: bool) -> Resul
             } else {
                 &[100, 1000, 10000, 100_000]
             };
-            for rate in rates {
-                if !prior.contains_key(&(mode.clone(), size, *rate)) {
+            for &rate in rates {
+                let case = Case {
+                    mode: mode.clone(),
+                    size,
+                    rate,
+                };
+                if !cells.contains_key(&case) {
                     return Err(format!("missing release cell {mode}/{size}/{rate}").into());
                 }
             }
         }
     }
-    let compatible = !baseline["compatibility"].is_null()
-        && baseline["compatibility"] == candidate["compatibility"]
-        && baseline["fixed_load_windows"] == candidate["fixed_load_windows"]
-        && baseline["batch_records"] == candidate["batch_records"]
-        && baseline["writer_payload_caps"] == candidate["writer_payload_caps"]
-        && baseline["payload_compression"] == candidate["payload_compression"];
-    let compatible = compatible && baseline["writer_protocols"] == candidate["writer_protocols"];
-    let mut comparisons = Vec::new();
-    let mut regressed = false;
-    for (case, before) in &prior {
-        let after = current[case];
-        let metrics = LATENCIES
-            .iter()
-            .map(|key| {
-                if fixed {
-                    format!("scheduled_{key}")
-                } else {
-                    (*key).into()
-                }
-            })
-            .chain(
-                (!fixed)
-                    .then_some(["confirmed_s", "delivered_s"])
-                    .into_iter()
-                    .flatten()
-                    .map(str::to_owned),
-            );
-        for metric in metrics {
-            let (before_min, before_median, before_max) = measurement(before, &metric)?;
-            let (after_min, after_median, after_max) = measurement(after, &metric)?;
-            let throughput = matches!(metric.as_str(), "confirmed_s" | "delivered_s");
-            let ratio = after_median / before_median;
-            let regression = if throughput {
-                ratio <= 0.95
-            } else {
-                ratio >= 1.05
-            };
-            regressed |= regression;
-            comparisons.push(json!({
-                "mode":case.0,"size":case.1,"rate":case.2,"metric":metric,
-                "baseline":before["measurements"][&metric],"candidate":after["measurements"][&metric],
-                "delta_percent":(ratio-1.0)*100.0,"regression":regression,
-                "overlapping_ranges":before_min <= after_max && after_min <= before_max
-            }));
+    Ok(())
+}
+
+/// Both ledgers measured the same configuration and controls.
+fn compatible(baseline: &Value, candidate: &Value) -> bool {
+    !baseline["compatibility"].is_null()
+        && [
+            "compatibility",
+            "fixed_load_windows",
+            "batch_records",
+            "writer_payload_caps",
+            "payload_compression",
+            "writer_protocols",
+        ]
+        .iter()
+        .all(|field| baseline[field] == candidate[field])
+}
+
+/// Gated metrics: scheduled latencies at fixed load, latencies and
+/// throughput at saturation.
+fn metrics(fixed: bool) -> Vec<String> {
+    let latencies = LATENCIES.iter().map(|key| {
+        if fixed {
+            format!("scheduled_{key}")
+        } else {
+            (*key).into()
         }
-    }
-    Ok(json!({
-        "status":if !compatible { "incomparable" } else if regressed { "regression" } else { "pass" },
-        "threshold_percent":5,"compatible":compatible,"comparisons":comparisons,
-        "baseline":baseline,"candidate":candidate
-    }))
+    });
+    let throughput = (!fixed)
+        .then_some(["confirmed_s", "delivered_s"])
+        .into_iter()
+        .flatten()
+        .map(str::to_owned);
+    latencies.chain(throughput).collect()
+}
+
+/// One metric of one cell: the 5% median gate, and whether the repetition
+/// ranges overlap.
+fn compare_metric(
+    case: &Case,
+    before: &Value,
+    after: &Value,
+    metric: &str,
+) -> Result<(Value, bool)> {
+    let (before_min, before_median, before_max) = measurement(before, metric)?;
+    let (after_min, after_median, after_max) = measurement(after, metric)?;
+    let throughput = matches!(metric, "confirmed_s" | "delivered_s");
+    let ratio = after_median / before_median;
+    let regression = if throughput {
+        ratio <= 0.95
+    } else {
+        ratio >= 1.05
+    };
+    let comparison = json!({
+        "mode":case.mode,"size":case.size,"rate":case.rate,"metric":metric,
+        "baseline":before["measurements"][metric],"candidate":after["measurements"][metric],
+        "delta_percent":(ratio-1.0)*100.0,"regression":regression,
+        "overlapping_ranges":before_min <= after_max && after_min <= before_max
+    });
+    Ok((comparison, regression))
 }
 
 #[cfg(test)]

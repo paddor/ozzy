@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::validate::{optional_id, require};
-use crate::{ConfigError, Confirmation, DeploymentMode, ValidatedDeployment};
+use crate::{ConfigError, DeploymentMode, ValidatedDeployment};
 
 /// Shared provisioning output. Persist exactly once and distribute unchanged to
 /// all brokers. Decoding alone does not validate it against a deployment.
@@ -34,8 +34,8 @@ pub struct TopicIdentity {
     pub partitioner: String,
     /// Persistent seed used by SDK keyed routing.
     pub partitioner_seed: u64,
-    /// Persistent topic confirmation policy.
-    pub confirmation: Confirmation,
+    /// Fixed first-wins window; resource limits do not change event identity.
+    pub dedup_window_millis: Option<std::num::NonZeroU64>,
     /// Numeric partition order, never sorted by random group IDs.
     pub partitions: Vec<PartitionIdentity>,
 }
@@ -107,7 +107,9 @@ impl ValidatedDeployment {
                     id,
                     partitioner: "xxh3-64".to_owned(),
                     partitioner_seed: topic.partitioner_seed,
-                    confirmation: topic.confirmation,
+                    dedup_window_millis: topic
+                        .deduplication
+                        .and_then(|policy| std::num::NonZeroU64::new(policy.window_millis)),
                     partitions,
                 },
             );
@@ -147,6 +149,16 @@ impl ValidatedDeployment {
             "identity",
             "cluster identity, mode or metadata set changed",
         )?;
+        self.check_broker_identities(identity, &mut used)?;
+        self.check_topic_identities(identity, &mut used)
+    }
+
+    fn check_broker_identities(
+        &self,
+        identity: &DeploymentIdentity,
+        used: &mut BTreeSet<Uuid>,
+    ) -> Result<(), ConfigError> {
+        let config = &self.deployment;
         let mut principals = BTreeSet::new();
         for (name, broker) in &config.brokers {
             let id = identity.brokers.get(name);
@@ -155,7 +167,7 @@ impl ValidatedDeployment {
                 "identity.brokers",
                 "broker identity or name changed",
             )?;
-            optional_id(id.copied(), &mut used, "identity.brokers")?;
+            optional_id(id.copied(), used, "identity.brokers")?;
             require(
                 identity.principals.get(name).is_some_and(|principal| {
                     principal != &[0; 32] && principals.insert(*principal)
@@ -164,6 +176,15 @@ impl ValidatedDeployment {
                 "broker principal binding is missing, zero or reused",
             )?;
         }
+        Ok(())
+    }
+
+    fn check_topic_identities(
+        &self,
+        identity: &DeploymentIdentity,
+        used: &mut BTreeSet<Uuid>,
+    ) -> Result<(), ConfigError> {
+        let config = &self.deployment;
         let members: Vec<_> = identity.brokers.values().copied().collect();
         let mut ordinal = 0;
         for (name, topic) in &config.topics {
@@ -171,15 +192,16 @@ impl ValidatedDeployment {
                 .topics
                 .get(name)
                 .ok_or_else(|| crate::invalid("identity.topics", "topic set changed"))?;
-            optional_id(Some(stored.id), &mut used, "identity.topics")?;
+            optional_id(Some(stored.id), used, "identity.topics")?;
             require(
                 topic.id.is_none_or(|id| id == stored.id)
                     && stored.partitioner == "xxh3-64"
                     && stored.partitioner_seed == topic.partitioner_seed
-                    && stored.confirmation == topic.confirmation
+                    && stored.dedup_window_millis.map(std::num::NonZeroU64::get)
+                        == topic.deduplication.map(|policy| policy.window_millis)
                     && stored.partitions.len() == topic.partitions as usize,
                 "identity.topics",
-                "topic identity, hash parameters, partition count or policy changed",
+                "topic identity, hash parameters, partition count or window changed",
             )?;
             for (index, partition) in stored.partitions.iter().enumerate() {
                 let mut ordered = members.clone();
@@ -191,14 +213,10 @@ impl ValidatedDeployment {
                     "identity.partitions",
                     "partition order, configuration epoch or persisted membership changed",
                 )?;
-                optional_id(
-                    Some(partition.group),
-                    &mut used,
-                    "identity.partitions.group",
-                )?;
+                optional_id(Some(partition.group), used, "identity.partitions.group")?;
                 optional_id(
                     Some(partition.incarnation),
-                    &mut used,
+                    used,
                     "identity.partitions.incarnation",
                 )?;
                 ordinal += 1;

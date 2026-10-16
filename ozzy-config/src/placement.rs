@@ -3,7 +3,8 @@ use std::path::PathBuf;
 
 use crate::validate::require;
 use crate::{
-    Affinity, ConfigError, IoBackend, QueueBudget, StorageWorkers, ValidatedDeployment, invalid,
+    Affinity, Broker, ConfigError, IoBackend, QueueBudget, StorageWorkers, ValidatedDeployment,
+    invalid,
 };
 
 /// Effective resources available to this process, not the machine's full CPU set.
@@ -77,6 +78,8 @@ pub struct PartitionPlacement {
     pub directory: PathBuf,
     /// Current configured retention targets; canonical policy remains mutable.
     pub retention: crate::TopicRetention,
+    /// Optional per-partition deduplication policy and index resource bounds.
+    pub deduplication: Option<crate::TopicDeduplication>,
 }
 
 impl ValidatedDeployment {
@@ -98,34 +101,8 @@ impl ValidatedDeployment {
                 "memory pool NUMA node is outside process restrictions",
             )?;
         }
-        let mut controllers = BTreeSet::new();
-        for device in broker.devices.values() {
-            require(
-                device.workers.backend != IoBackend::Aio || host.linux_aio,
-                name,
-                "Linux AIO requested but unsupported on this host",
-            )?;
-            if controllers.insert(&device.controller) {
-                for cpu in device
-                    .workers
-                    .cpus
-                    .iter()
-                    .chain(device.workers.progress_cpu.iter())
-                    .chain(device.workers.aio_cpu.iter())
-                {
-                    check_affinity(
-                        &Affinity {
-                            cpu: Some(*cpu),
-                            numa_node: None,
-                        },
-                        host,
-                        &mut pinned,
-                        name,
-                    )?;
-                }
-            }
-        }
-        let shards = &self.shards[name];
+        check_controllers(broker, host, &mut pinned, name)?;
+        let shards = self.broker_shards(name)?;
         for shard in shards {
             check_affinity(&shard.affinity, host, &mut pinned, name)?;
         }
@@ -144,54 +121,69 @@ impl ValidatedDeployment {
                     budget: shard.budget.clone(),
                 })
                 .collect(),
-            partitions: self.partition_placements(name),
+            partitions: self.partition_placements(name)?,
         })
     }
 
     /// Deterministic partition placement for a configured broker.
-    /// The caller must select a name present in `deployment().brokers`.
-    pub fn partition_placements(&self, name: &str) -> Vec<PartitionPlacement> {
-        let broker = &self.deployment.brokers[name];
-        let shards = &self.shards[name];
+    pub fn partition_placements(&self, name: &str) -> Result<Vec<PartitionPlacement>, ConfigError> {
+        let broker = self.deployment.broker(name)?;
+        let shards = self.broker_shards(name)?;
+        // Validation admits only overrides naming a local shard.
         let overrides: BTreeMap<_, _> = broker
             .topology
             .partitions
             .iter()
-            .map(|entry| ((entry.topic.as_str(), entry.partition), entry.shard))
+            .filter_map(|entry| {
+                let shard = shards.iter().find(|shard| shard.id == entry.shard)?;
+                Some(((entry.topic.as_str(), entry.partition), shard))
+            })
             .collect();
         let mut placements = Vec::new();
-        let mut ordinal = 0;
+        // Partitions without an override rotate over the shards in order.
+        let mut rotation = shards.iter().cycle();
         for (topic_name, topic) in &self.deployment.topics {
             for partition in 0..topic.partitions {
-                let shard = match overrides.get(&(topic_name.as_str(), partition)) {
-                    Some(id) => shards.iter().find(|shard| shard.id == *id).unwrap(),
-                    None => &shards[ordinal % shards.len()],
-                };
+                let next = rotation.next();
+                let shard = overrides
+                    .get(&(topic_name.as_str(), partition))
+                    .copied()
+                    .or(next)
+                    .ok_or_else(|| invalid(name, "broker has no shards"))?;
                 placements.push(PartitionPlacement {
                     topic: topic_name.clone(),
                     partition,
                     retention: topic.retention,
+                    deduplication: topic.deduplication,
                     shard: shard.id,
                     device: shard.device.clone(),
-                    directory: broker.devices[&shard.device]
+                    directory: broker
+                        .device(&shard.device)?
                         .root
                         .join("topics")
                         .join(topic_name)
                         .join("partitions")
                         .join(partition.to_string()),
                 });
-                ordinal += 1;
             }
         }
-        placements
+        Ok(placements)
+    }
+
+    /// Application shards of one configured broker.
+    fn broker_shards(&self, name: &str) -> Result<&[crate::Shard], ConfigError> {
+        self.shards
+            .get(name)
+            .map(Vec::as_slice)
+            .ok_or_else(|| invalid(name, "unknown broker"))
     }
 
     fn controller_plans(&self, name: &str) -> Result<Vec<ControllerPlan>, ConfigError> {
-        let broker = &self.deployment.brokers[name];
-        let shards = &self.shards[name];
+        let broker = self.deployment.broker(name)?;
+        let shards = self.broker_shards(name)?;
         let mut pools = BTreeMap::<String, ControllerPlan>::new();
         for shard in shards {
-            let device = &broker.devices[&shard.device];
+            let device = broker.device(&shard.device)?;
             pools
                 .entry(device.controller.clone())
                 .or_insert_with(|| ControllerPlan {
@@ -216,7 +208,7 @@ impl ValidatedDeployment {
                 .values()
                 .map(|t| t.max_append_bytes)
                 .max()
-                .unwrap();
+                .unwrap_or(0);
             require(
                 w.queued_bytes / count as u64 >= max_append && w.progress_bytes / count as u64 > 0,
                 name,
@@ -231,6 +223,43 @@ impl ValidatedDeployment {
         }
         Ok(pools.into_values().collect())
     }
+}
+
+/// Each storage controller's worker CPUs, checked once per controller.
+fn check_controllers(
+    broker: &Broker,
+    host: &HostResources,
+    pinned: &mut BTreeSet<u32>,
+    name: &str,
+) -> Result<(), ConfigError> {
+    let mut controllers = BTreeSet::new();
+    for device in broker.devices.values() {
+        require(
+            device.workers.backend != IoBackend::Aio || host.linux_aio,
+            name,
+            "Linux AIO requested but unsupported on this host",
+        )?;
+        if controllers.insert(&device.controller) {
+            for cpu in device
+                .workers
+                .cpus
+                .iter()
+                .chain(device.workers.progress_cpu.iter())
+                .chain(device.workers.aio_cpu.iter())
+            {
+                check_affinity(
+                    &Affinity {
+                        cpu: Some(*cpu),
+                        numa_node: None,
+                    },
+                    host,
+                    pinned,
+                    name,
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn check_affinity(

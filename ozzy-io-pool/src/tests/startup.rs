@@ -60,18 +60,8 @@ async fn independent_progress_jobs_run_while_another_is_blocked() {
     let second = clients[1]
         .submit(Class::Progress, Operation::Metadata { handle })
         .unwrap();
-    let second_ready = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        loop {
-            let entered = gate.entered.notified();
-            tokio::pin!(entered);
-            entered.as_mut().enable();
-            if gate.state.lock().unwrap().blocked == 2 {
-                break;
-            }
-            entered.await;
-        }
-    })
-    .await;
+    let second_ready =
+        tokio::time::timeout(std::time::Duration::from_secs(1), gate.wait_blocked(2)).await;
     gate.release();
     second_ready.expect("second progress worker was blocked by the first");
     first.await.unwrap();

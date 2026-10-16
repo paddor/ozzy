@@ -1,9 +1,10 @@
+use crate::transport::Frames;
 use std::collections::{BTreeMap, BTreeSet};
 
 use omq_tokio::Message;
 use ozzy_proto::{
     EnvelopeLimits, GroupId, LinkSessionId, NodeId, Opcode, PartitionIncarnation, ProducerId,
-    append, decode_packet, producer, reader,
+    append, decode_packet, group, producer, progress, reader,
 };
 use ozzy_replication::wire;
 
@@ -61,6 +62,25 @@ pub struct RoutingTable {
     pub(super) limits: EnvelopeLimits,
 }
 
+/// Destination decoded from one packet before placement lookup.
+struct Target {
+    group: GroupId,
+    partition: Option<PartitionIncarnation>,
+    class: Class,
+    writer: Option<ProducerId>,
+}
+
+impl Target {
+    fn control(group: GroupId, partition: PartitionIncarnation) -> Self {
+        Self {
+            group,
+            partition: Some(partition),
+            class: Class::Control,
+            writer: None,
+        }
+    }
+}
+
 impl RoutingTable {
     /// Build from bounded deployment metadata. Duplicate groups/incarnations,
     /// unknown shards, and zero identities are refused before traffic starts.
@@ -103,6 +123,118 @@ impl RoutingTable {
     /// copying or scanning record payloads. Link negotiation runs before this
     /// established-session path. The original message remains with its caller.
     pub fn route(&self, message: &Message, binding: Binding) -> Result<Routed, RoutingError> {
+        if let Some(route) = self.compact(message, binding)? {
+            return Ok(route);
+        }
+        let Some((_, frames)) = message
+            .routed_packet()
+            .filter(|(route, _)| *route == binding.peer.as_bytes())
+        else {
+            return Err(RoutingError::Peer);
+        };
+        let packet = decode_packet(&frames, self.limits)?;
+        if packet.envelope.sender != binding.peer
+            || if packet.envelope.opcode == Opcode::PreparePub && binding.kind == Kind::Broker {
+                packet.envelope.session.is_some()
+            } else {
+                packet.envelope.session != Some(binding.session)
+            }
+        {
+            return Err(RoutingError::Session);
+        }
+        let Target {
+            group,
+            partition,
+            class,
+            writer,
+        } = match binding.kind {
+            Kind::Broker => self.broker_target(packet)?,
+            Kind::Client => self.client_target(packet)?,
+        };
+        let placement = *self.partitions.get(&group).ok_or(RoutingError::Partition)?;
+        if partition.is_some_and(|id| id != placement.partition) {
+            return Err(RoutingError::Partition);
+        }
+        Ok(Routed {
+            placement,
+            class,
+            writer,
+        })
+    }
+    fn broker_target(&self, packet: ozzy_proto::Packet<'_>) -> Result<Target, RoutingError> {
+        // Normal replication uses PUB; addressed repair uses PrepareFlow.
+        if packet.envelope.opcode == Opcode::Prepare {
+            return Err(RoutingError::Command);
+        }
+        let scope = wire::route(packet, self.limits)?;
+        let class = if matches!(
+            packet.envelope.opcode,
+            Opcode::PrepareFlow | Opcode::PreparePub | Opcode::Ops | Opcode::SnapshotChunk
+        ) {
+            Class::Data
+        } else {
+            Class::Control
+        };
+        Ok(Target {
+            group: scope.group_id,
+            partition: None,
+            class,
+            writer: None,
+        })
+    }
+
+    fn client_target(&self, packet: ozzy_proto::Packet<'_>) -> Result<Target, RoutingError> {
+        let limits = self.limits;
+        Ok(match packet.envelope.opcode {
+            Opcode::Append => {
+                let target = append::route(packet, limits)?;
+                Target {
+                    group: target.authority.group_id,
+                    partition: Some(target.partition),
+                    class: Class::Data,
+                    writer: Some(target.key.producer_id),
+                }
+            }
+            Opcode::OpenProducer => {
+                let target = producer::decode_open(packet, limits)?;
+                Target::control(target.authority.group_id, target.partition)
+            }
+            Opcode::ProgressCommit => {
+                let target = progress::decode_request(packet, limits)?;
+                Target::control(target.authority.group_id, target.assignment.partition)
+            }
+            Opcode::GroupAssign => {
+                let target = group::decode_assign(packet, limits)?;
+                Target::control(target.authority.group_id, target.partition)
+            }
+            Opcode::GroupJoin => {
+                let target = group::decode_join(packet, limits)?;
+                Target::control(target.authority.group_id, target.coordinator)
+            }
+            Opcode::GroupInspect => {
+                let target = group::decode_inspect(packet, limits)?;
+                Target::control(target.authority.group_id, target.coordinator)
+            }
+            Opcode::GroupDelete => {
+                let target = group::decode_delete(packet, limits)?;
+                Target::control(target.authority.group_id, target.coordinator)
+            }
+            Opcode::Subscribe | Opcode::Ack | Opcode::Unsubscribe if !packet.envelope.response => {
+                let reader::Source::Group {
+                    authority,
+                    partition,
+                    ..
+                } = reader::route(packet, limits)?
+                else {
+                    return Err(RoutingError::Command);
+                };
+                Target::control(authority.group_id, partition)
+            }
+            _ => return Err(RoutingError::Command),
+        })
+    }
+
+    fn compact(&self, message: &Message, binding: Binding) -> Result<Option<Routed>, RoutingError> {
         if message.len() == 3
             && binding.kind == Kind::Broker
             && message.part_slice(0) == Some(binding.peer.as_bytes().as_slice())
@@ -115,92 +247,13 @@ impl RoutingTable {
             );
             wire::CompactState::decode(message.part_slice(2).unwrap_or_default())?;
             let placement = *self.partitions.get(&group).ok_or(RoutingError::Partition)?;
-            return Ok(Routed {
+            return Ok(Some(Routed {
                 placement,
                 class: Class::Control,
                 writer: None,
-            });
+            }));
         }
-        if message.len() != 4 || message.part_slice(0) != Some(binding.peer.as_bytes().as_slice()) {
-            return Err(RoutingError::Peer);
-        }
-        let frames = std::array::from_fn::<_, 3, _>(|index| {
-            message.part_slice(index + 1).expect("checked frame count")
-        });
-        let packet = decode_packet(&frames, self.limits)?;
-        if packet.envelope.sender != binding.peer
-            || if packet.envelope.opcode == Opcode::PreparePub && binding.kind == Kind::Broker {
-                packet.envelope.session.is_some()
-            } else {
-                packet.envelope.session != Some(binding.session)
-            }
-        {
-            return Err(RoutingError::Session);
-        }
-        let (group, partition, class, writer) = match binding.kind {
-            Kind::Broker => {
-                // Normal replication uses PUB; addressed repair uses PrepareFlow.
-                if packet.envelope.opcode == Opcode::Prepare {
-                    return Err(RoutingError::Command);
-                }
-                let scope = wire::route(packet, self.limits)?;
-                let class = if matches!(
-                    packet.envelope.opcode,
-                    Opcode::PrepareFlow | Opcode::PreparePub | Opcode::Ops | Opcode::SnapshotChunk
-                ) {
-                    Class::Data
-                } else {
-                    Class::Control
-                };
-                (scope.group_id, None, class, None)
-            }
-            Kind::Client if packet.envelope.opcode == Opcode::Append => {
-                let target = append::route(packet, self.limits)?;
-                (
-                    target.authority.group_id,
-                    Some(target.partition),
-                    Class::Data,
-                    Some(target.key.producer_id),
-                )
-            }
-            Kind::Client if packet.envelope.opcode == Opcode::OpenProducer => {
-                let target = producer::decode_open(packet, self.limits)?;
-                (
-                    target.authority.group_id,
-                    Some(target.partition),
-                    Class::Control,
-                    None,
-                )
-            }
-            Kind::Client => {
-                if packet.envelope.response
-                    || !matches!(
-                        packet.envelope.opcode,
-                        Opcode::Subscribe | Opcode::Ack | Opcode::Unsubscribe
-                    )
-                {
-                    return Err(RoutingError::Command);
-                }
-                let reader::Source::Group {
-                    authority,
-                    partition,
-                    ..
-                } = reader::route(packet, self.limits)?
-                else {
-                    return Err(RoutingError::Command);
-                };
-                (authority.group_id, Some(partition), Class::Control, None)
-            }
-        };
-        let placement = *self.partitions.get(&group).ok_or(RoutingError::Partition)?;
-        if partition.is_some_and(|id| id != placement.partition) {
-            return Err(RoutingError::Partition);
-        }
-        Ok(Routed {
-            placement,
-            class,
-            writer,
-        })
+        Ok(None)
     }
 }
 

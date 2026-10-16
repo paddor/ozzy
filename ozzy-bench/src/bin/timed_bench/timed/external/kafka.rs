@@ -5,8 +5,12 @@ use ozzy_proto::MessageId;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, ResourceSpecifier, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::consumer::{Consumer, StreamConsumer};
+use rdkafka::metadata::Metadata;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
+
+/// A topic metadata request completes within this.
+const METADATA: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// librdkafka's ready receive/delivery futures do not consume Tokio's task
 /// budget. Bound each turn so one lane cannot starve other lanes or control.
@@ -16,27 +20,32 @@ pub(super) async fn cooperate(records: u64) {
     }
 }
 
-fn settings(config: &Config) -> ClientConfig {
+fn settings(config: &Config) -> Result<ClientConfig> {
     let mut settings = ClientConfig::new();
-    settings.set(
-        "bootstrap.servers",
-        config.args.external_endpoint.as_deref().unwrap(),
-    );
-    settings
+    settings.set("bootstrap.servers", super::endpoint(config)?);
+    Ok(settings)
 }
 
 pub(super) async fn provision(config: &Config, name: &str) -> Result<Value> {
-    let admin: AdminClient<DefaultClientContext> = settings(config).create()?;
+    let admin: AdminClient<DefaultClientContext> = settings(config)?.create()?;
     let segment_bytes = (config.args.segment_mib as u64 * 1024 * 1024).to_string();
     let topic = topic(config, name, &segment_bytes)?;
     let topics = admin.create_topics(&[topic], &AdminOptions::new()).await?;
     if topics.len() != 1 || topics[0].is_err() {
         return Err(error(format!("Kafka topic creation failed: {topics:?}")));
     }
-    let metadata = admin
-        .inner()
-        .fetch_metadata(Some(name), std::time::Duration::from_secs(10))?;
-    let copies = replicas(config);
+    let metadata = admin.inner().fetch_metadata(Some(name), METADATA)?;
+    check_placement(config, &metadata)?;
+    check_settings(config, &admin, name, &segment_bytes).await?;
+    Ok(super::topic_topology(
+        metadata.topics().len(),
+        metadata.topics()[0].partitions().len(),
+    ))
+}
+
+/// The topic has exactly the requested partitions, one copy per broker.
+fn check_placement(config: &Config, metadata: &Metadata) -> Result<()> {
+    let copies = replicas(config)?;
     let actual_topic = metadata
         .topics()
         .first()
@@ -60,43 +69,49 @@ pub(super) async fn provision(config: &Config, name: &str) -> Result<Value> {
             "external topic must have one copy per broker and the requested partitions",
         ));
     }
+    Ok(())
+}
+
+/// The topic keeps the requested segment size and, on Redpanda, the write
+/// caching the confirmation policy needs.
+async fn check_settings(
+    config: &Config,
+    admin: &AdminClient<DefaultClientContext>,
+    name: &str,
+    segment_bytes: &str,
+) -> Result<()> {
+    let resources = admin
+        .describe_configs(&[ResourceSpecifier::Topic(name)], &AdminOptions::new())
+        .await?;
+    let [Ok(resource)] = resources.as_slice() else {
+        return Err(error(format!(
+            "external topic configuration unavailable: {resources:?}"
+        )));
+    };
+    if resource
+        .get("segment.bytes")
+        .and_then(|entry| entry.value.as_deref())
+        != Some(segment_bytes)
     {
-        let resources = admin
-            .describe_configs(&[ResourceSpecifier::Topic(name)], &AdminOptions::new())
-            .await?;
-        let [Ok(resource)] = resources.as_slice() else {
-            return Err(error(format!(
-                "external topic configuration unavailable: {resources:?}"
-            )));
-        };
-        if resource
-            .get("segment.bytes")
-            .and_then(|entry| entry.value.as_deref())
-            != Some(segment_bytes.as_str())
-        {
-            return Err(error(
-                "external segment.bytes does not match requested size",
-            ));
-        }
-        if let Some(expected) = write_caching(config)
-            && resource
-                .get("write.caching")
-                .and_then(|entry| entry.value.as_deref())
-                != Some(expected)
-        {
-            return Err(error(
-                "Redpanda write.caching does not match confirmation policy",
-            ));
-        }
+        return Err(error(
+            "external segment.bytes does not match requested size",
+        ));
     }
-    Ok(super::topic_topology(
-        metadata.topics().len(),
-        metadata.topics()[0].partitions().len(),
-    ))
+    if let Some(expected) = write_caching(config)?
+        && resource
+            .get("write.caching")
+            .and_then(|entry| entry.value.as_deref())
+            != Some(expected)
+    {
+        return Err(error(
+            "Redpanda write.caching does not match confirmation policy",
+        ));
+    }
+    Ok(())
 }
 
 fn topic<'a>(config: &Config, name: &'a str, segment_bytes: &'a str) -> Result<NewTopic<'a>> {
-    let copies = replicas(config);
+    let copies = replicas(config)?;
     let mut topic = NewTopic::new(
         name,
         i32::try_from(config.partitions())?,
@@ -110,30 +125,31 @@ fn topic<'a>(config: &Config, name: &'a str, segment_bytes: &'a str) -> Result<N
     .set("min.insync.replicas", if copies == 1 { "1" } else { "2" });
     // A 4 MiB SDK batch must fit the topic's encoded-batch ceiling.
     topic = topic.set("max.message.bytes", "8388608");
-    if let Some(value) = write_caching(config) {
+    if let Some(value) = write_caching(config)? {
         topic = topic.set("write.caching", value);
     }
     Ok(topic)
 }
 
 /// Three copies for group policies, one broker each; one for local policies.
-pub(super) fn replicas(config: &Config) -> usize {
-    super::policy(config).brokers()
+pub(super) fn replicas(config: &Config) -> Result<usize> {
+    Ok(super::policy(config)?.brokers())
 }
 
-/// Disk policies wait for fsync; the others confirm from memory.
-pub(super) fn write_caching(config: &Config) -> Option<&'static str> {
-    (config.args.external_system == Some(super::System::Redpanda)).then_some(
-        if super::policy(config).durable() {
+/// Durable policies wait for fsync; buffered confirms from memory.
+pub(super) fn write_caching(config: &Config) -> Result<Option<&'static str>> {
+    let durable = super::policy(config)?.durable();
+    Ok(
+        (config.args.external_system == Some(super::System::Redpanda)).then_some(if durable {
             "false"
         } else {
             "true"
-        },
+        }),
     )
 }
 
 pub(super) async fn cleanup(config: &Config, name: &str) -> Result<()> {
-    let admin: AdminClient<DefaultClientContext> = settings(config).create()?;
+    let admin: AdminClient<DefaultClientContext> = settings(config)?.create()?;
     let deleted = admin.delete_topics(&[name], &AdminOptions::new()).await?;
     if deleted.len() != 1 || deleted[0].is_err() {
         return Err(error(format!(
@@ -152,7 +168,7 @@ pub(super) struct Client {
 
 impl Client {
     pub(super) fn connect(config: &Config, name: &str, lane: usize, reader: bool) -> Result<Self> {
-        let mut settings = settings(config);
+        let mut settings = settings(config)?;
         let partition = i32::try_from(if reader {
             lane
         } else {

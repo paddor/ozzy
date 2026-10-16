@@ -21,6 +21,9 @@ ozzy-journal.workspace = true
 ozzy-proto.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+ozzy-test-alloc.workspace = true
+
 [lints]
 workspace = true
 
@@ -51,10 +54,6 @@ path = "tests/lost_state.rs"
 [[test]]
 name = "ozzy_normal"
 path = "tests/normal.rs"
-
-[[test]]
-name = "ozzy_persisting"
-path = "tests/persisting.rs"
 
 [[test]]
 name = "ozzy_view_change"

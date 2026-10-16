@@ -1,5 +1,5 @@
 use super::*;
-use crate::frontend::{Placement, data_channel, test_support::*};
+use crate::frontend::{DataLaneLimits, Placement, data_channel, test_support::*};
 use ozzy_proto::EnvelopeLimits;
 
 pub(in crate::frontend) fn fixture() -> (
@@ -15,9 +15,11 @@ pub(in crate::frontend) fn fixture() -> (
         0,
         Kind::Client,
         Class::Control,
-        1,
-        4096,
-        8192,
+        DataLaneLimits {
+            slots: 1,
+            maximum_retained_bytes: 4096,
+            retained_budget_bytes: 8192,
+        },
     )
     .unwrap();
     let (second, b) = data_channel(
@@ -25,9 +27,11 @@ pub(in crate::frontend) fn fixture() -> (
         17,
         Kind::Client,
         Class::Control,
-        1,
-        4096,
-        8192,
+        DataLaneLimits {
+            slots: 1,
+            maximum_retained_bytes: 4096,
+            retained_budget_bytes: 8192,
+        },
     )
     .unwrap();
     let mut dispatcher = Dispatcher::new(
@@ -65,9 +69,11 @@ fn direct_producer_queue_returns_full_frame_without_a_grant() {
         0,
         Kind::Client,
         crate::dispatch::Class::Data,
-        1,
-        4096,
-        8192,
+        DataLaneLimits {
+            slots: 1,
+            maximum_retained_bytes: 4096,
+            retained_budget_bytes: 8192,
+        },
     )
     .unwrap();
     let (second, mut second_rx) = data_channel(
@@ -75,9 +81,11 @@ fn direct_producer_queue_returns_full_frame_without_a_grant() {
         17,
         Kind::Client,
         crate::dispatch::Class::Data,
-        1,
-        4096,
-        8192,
+        DataLaneLimits {
+            slots: 1,
+            maximum_retained_bytes: 4096,
+            retained_budget_bytes: 8192,
+        },
     )
     .unwrap();
     dispatcher.install_data_lane(0, first).unwrap();

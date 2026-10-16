@@ -1,30 +1,33 @@
 use super::*;
 use bytes::Bytes;
-use omq_tokio::message::Payload;
+use omq_tokio::{Message, message::Payload};
 use ozzy_proto::{
     Envelope, LinkSessionId, MessageId, NodeId, Opcode, ProducerId, SubscriptionId,
     data::Encoding,
-    reader::{RecordHeader, RecordsEncoder, Source, Subscription},
+    reader::{PreparedBlock, RecordHeader, RecordsEncoder, Source, Subscription},
 };
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 
-struct EnvelopeOwner {
-    bytes: [u8; 64],
-    dropped: Arc<AtomicBool>,
-}
+/// The inbox reservation that every received frame of one message shares.
+struct Lease(Arc<AtomicBool>);
 
-impl AsRef<[u8]> for EnvelopeOwner {
-    fn as_ref(&self) -> &[u8] {
-        &self.bytes
+impl Drop for Lease {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
     }
 }
 
-impl Drop for EnvelopeOwner {
-    fn drop(&mut self) {
-        self.dropped.store(true, Ordering::SeqCst);
+struct Leased {
+    bytes: Bytes,
+    _lease: Arc<Lease>,
+}
+
+impl AsRef<[u8]> for Leased {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
     }
 }
 
@@ -89,20 +92,32 @@ fn message(encoding: WirePayload, limits: DataLimits, dropped: Arc<AtomicBool>) 
             output.allow_shared_payload();
             assert!(
                 output
-                    .extend_shared_prepared_lz4(&descriptor, 64, &encoded, 0..encoded.len(), 1)
+                    .extend_shared_prepared_lz4(
+                        PreparedBlock {
+                            descriptors: &descriptor,
+                            decoded_bytes: 64,
+                            body: &encoded,
+                            encoded: 0..encoded.len()
+                        },
+                        1
+                    )
                     .unwrap()
             );
         }
     }
     let (header, shared) = output.finish_with_payload().unwrap();
+    let lease = Arc::new(Lease(dropped));
+    let leased = |bytes| {
+        Payload::from_bytes(Bytes::from_owner(Leased {
+            bytes,
+            _lease: lease.clone(),
+        }))
+    };
     Message::multipart_payloads([
         Payload::new(),
-        Payload::from_bytes(Bytes::from_owner(EnvelopeOwner {
-            bytes: header,
-            dropped,
-        })),
-        Payload::from_bytes(Bytes::from(metadata)),
-        Payload::from_bytes(shared.unwrap_or_else(|| Bytes::from(payload))),
+        leased(Bytes::copy_from_slice(&header)),
+        leased(Bytes::from(metadata)),
+        leased(shared.unwrap_or_else(|| Bytes::from(payload))),
     ])
 }
 
@@ -136,8 +151,13 @@ fn decoded_record_alias_retains_the_original_frame_reservation() {
             &mut bytes::BytesMut::new(),
         )
         .unwrap();
-        let mut batch = FrameRecords::new(delivery.records, &message).into_batch(0);
-        drop(message);
+        let mut batch = FrameRecords::new(
+            delivery.records,
+            delivery.payload_encoding,
+            message.part_bytes(1).unwrap(),
+        )
+        .into_batch(0);
+        drop((message, metadata, payload));
         let record = batch
             .next(&mut Decoder::default(), limits)
             .unwrap()

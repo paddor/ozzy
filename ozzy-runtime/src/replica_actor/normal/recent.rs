@@ -3,6 +3,7 @@
 use super::{ActorError, JournalGeneration, Message, Prefix, ReplicaActor, Scope, VecDeque};
 use crate::profiling::{Event, event};
 use crate::replica_actor::HistoryReason;
+use crate::replica_actor::require_normal;
 use ozzy_replication::PipelineLimits;
 
 #[cfg(test)]
@@ -16,6 +17,7 @@ pub(super) struct Entry {
     pub end: Prefix,
     pub operations: usize,
     pub retained_bytes: usize,
+    pub control: bool,
     pub packets: [Option<Message>; 3],
 }
 
@@ -49,6 +51,16 @@ impl Recent {
         // Transport slabs can exceed the visible payload. Cache admission must
         // charge the backing once, and let oversized packets fall back to disk.
         if entry.retained_bytes > self.limits.max_body_bytes {
+            event(Event::ReplayCacheOversizedBypass);
+            self.clear();
+            return;
+        }
+        // Control arenas are independently bounded and shared by all shard
+        // partitions. Control-bearing packets must not stay in this optional
+        // cache, even when only one arena is configured. Clear the older prefix
+        // as well: cached repair ranges must remain contiguous.
+        if entry.control {
+            event(Event::ReplayCacheControlBypass);
             self.clear();
             return;
         }
@@ -60,10 +72,11 @@ impl Recent {
             event(Event::ReplayCacheReset);
             self.clear();
         }
-        while entry.operations > self.limits.max_operations - self.operations
-            || entry.retained_bytes > self.limits.max_body_bytes - self.retained_bytes
+        while (entry.operations > self.limits.max_operations - self.operations
+            || entry.retained_bytes > self.limits.max_body_bytes - self.retained_bytes)
+            && let Some(oldest) = self.entries.pop_front()
         {
-            let oldest = self.entries.pop_front().expect("nonempty overfull cache");
+            event(Event::ReplayCacheCapacityEviction);
             self.operations -= oldest.operations;
             self.retained_bytes -= oldest.retained_bytes;
         }
@@ -100,15 +113,11 @@ impl Recent {
                 return Err(ActorError::history(HistoryReason::Lookup));
             }
         }
-        event(
-            if cursor.op < self.entries.front().expect("nonempty cache").predecessor.op {
-                Event::ReplayCacheEvicted
-            } else if cursor.op < self.entries.back().expect("nonempty cache").end.op {
-                Event::ReplayCacheInterior
-            } else {
-                Event::ReplayCacheAhead
-            },
-        );
+        event(match (self.entries.front(), self.entries.back()) {
+            (Some(oldest), _) if cursor.op < oldest.predecessor.op => Event::ReplayCacheEvicted,
+            (_, Some(newest)) if cursor.op < newest.end.op => Event::ReplayCacheInterior,
+            _ => Event::ReplayCacheAhead,
+        });
         Ok(None)
     }
 }
@@ -119,7 +128,7 @@ impl ReplicaActor {
         voter: usize,
         cursor: Prefix,
     ) -> Result<bool, ActorError> {
-        let snapshot = self.driver.normal().expect("normal replay").snapshot();
+        let snapshot = require_normal(&self.driver)?.snapshot();
         let Some(first) =
             self.work
                 .recent
@@ -131,7 +140,9 @@ impl ReplicaActor {
         // the same sender; refreshed piggyback commits release each bounded chunk.
         for index in first..self.work.recent.entries.len() {
             let entry = &mut self.work.recent.entries[index];
-            let packet = entry.packets[voter].take().expect("remote voter packet");
+            let packet = entry.packets[voter]
+                .take()
+                .ok_or_else(super::flow::no_channel)?;
             let (predecessor, end) = (entry.predecessor, entry.end);
             let (sent, packet) = self.send_cached_packet(voter, packet, predecessor, end)?;
             self.work.recent.entries[index].packets[voter] = Some(packet);

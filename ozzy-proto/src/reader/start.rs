@@ -1,9 +1,6 @@
 //! Initial selection resolves once to a partition offset.
 
-use crate::{
-    MessageId,
-    data::{CodecError, Cursor},
-};
+use crate::{MessageId, data::CodecError, layout::Reader};
 
 /// Duplicate application record IDs do not imply duplicate producer records.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -74,15 +71,15 @@ impl Start {
         }
     }
 
-    pub(super) fn decode(cursor: &mut Cursor<'_>) -> Result<Self, CodecError> {
-        Ok(match cursor.byte()? {
+    pub(super) fn decode(cursor: &mut Reader<'_>) -> Result<Self, CodecError> {
+        Ok(match cursor.u8()? {
             0 => Self::Earliest,
             1 => Self::Latest,
             2 => Self::Offset(cursor.u64()?),
             3 => Self::Timestamp(cursor.u64()?),
             4 => {
                 let id = MessageId::from_bytes(cursor.array()?);
-                let policy = match cursor.byte()? {
+                let policy = match cursor.u8()? {
                     0 => IdPolicy::RequireUnique,
                     1 => IdPolicy::FirstRetained,
                     2 => IdPolicy::LastRetained,
@@ -116,11 +113,14 @@ mod tests {
             let mut encoded = Vec::new();
             selector.encode(&mut encoded);
             assert_eq!(encoded.len(), selector.size());
-            assert_eq!(Start::decode(&mut Cursor(&encoded)), Ok(selector));
+            assert_eq!(Start::decode(&mut Reader::new(&encoded)), Ok(selector));
         }
         let mut bytes = vec![4];
         bytes.extend_from_slice(&[4; 16]);
         bytes.push(3);
-        assert_eq!(Start::decode(&mut Cursor(&bytes)), Err(CodecError::Profile));
+        assert_eq!(
+            Start::decode(&mut Reader::new(&bytes)),
+            Err(CodecError::Profile)
+        );
     }
 }

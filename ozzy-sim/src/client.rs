@@ -9,7 +9,7 @@ use ozzy_proto::{
 use ozzy_runtime::replicated::{
     AppendLinkLimits, BrokerAddress, BrokerLinks, BrokerLinksConfig, ReaderLinkLimits, RecordInput,
     RetryPolicy, SdkClock, SharedTopicPendingRecord, SharedTopicWriter, SharedTopicWriterConfig,
-    TopicCheckpoint, TopicReader, TopicReaderConfig, WriterRuntime,
+    TopicCheckpoint, TopicReader, TopicReaderConfig, TopicRoutes, WriterRuntime,
 };
 use std::{
     sync::{
@@ -30,6 +30,8 @@ pub struct Client {
     pub links: BrokerLinks,
     runtime: WriterRuntime,
     writer: SharedTopicWriter,
+    /// The writer topic's routes on `links`, registered at open.
+    routes: TopicRoutes,
     links_config: BrokerLinksConfig,
     keys: Vec<[u8; 4]>,
     history: Vec<Vec<(MessageId, Vec<Bytes>)>>,
@@ -79,94 +81,31 @@ impl Client {
     ) -> Self {
         let topic = &checked.deployment.deployment().topics["orders"];
         let partitions = topic.partitions as usize;
-        let policy = match topic.confirmation {
-            ozzy_config::Confirmation::LocalDurable => Policy::LocalDurable,
-            ozzy_config::Confirmation::DiskQuorum => Policy::QuorumDurable,
-            ozzy_config::Confirmation::ReplicatedPersisting => Policy::QuorumReplicatedPersisting,
-        };
-        let limits = DataLimits {
-            envelope: EnvelopeLimits {
-                max_metadata_bytes: 16 * 1024,
-                max_payload_bytes: 4096,
-            },
-            max_records: 4,
-            max_parts: 4,
-            max_record_bytes: 1024,
-        };
-        let mut parameters =
-            handshake::Parameters::streaming(limits, handshake::PRODUCER | handshake::CONSUMER)
-                .unwrap();
-        parameters.capabilities |= handshake::OWNER_ROUTING | handshake::OWNER_READ;
-        let links_config = BrokerLinksConfig {
-            local: NodeId::from_bytes(*uuid::Uuid::now_v7().as_bytes()),
-            brokers: checked
-                .identity
-                .brokers
-                .iter()
-                .map(|(name, id)| BrokerAddress {
-                    node: NodeId::from_bytes(*id.as_bytes()),
-                    endpoint: checked.deployment.deployment().brokers[name]
-                        .endpoints
-                        .peer
-                        .parse()
-                        .unwrap(),
-                    data_endpoint: checked.deployment.deployment().brokers[name]
-                        .endpoints
-                        .data_peer
-                        .parse()
-                        .unwrap(),
-                })
-                .collect(),
-            parameters,
-            requests: 12,
-            control_bytes: 1024 * 1024,
-            routing_bytes: 1024 * 1024,
-            append: Some(AppendLinkLimits {
-                writers: 32,
-                requests: 32,
-                records: 128,
-                bytes: 256 * 1024 * 1024,
-            }),
-            maximum_partitions: partitions,
-            reader: Some(ReaderLinkLimits {
-                subscriptions: 8,
-                bytes: 16 * 1024 * 1024,
-                queue_messages: 4,
-            }),
-            request_timeout: Duration::from_secs(5),
-            retry_interval: Duration::from_millis(10),
-            clock,
-        };
+        let links_config = links_config(checked, partitions, clock);
         let links = BrokerLinks::connect(runtime, links_config.clone())
             .await
             .unwrap();
         let writer = SharedTopicWriter::open(
             &links,
             "orders",
-            SharedTopicWriterConfig::new(limits),
+            SharedTopicWriterConfig::new(DATA_LIMITS),
             RetryPolicy::default(),
         )
         .await
         .unwrap();
-        let keys = (0..topic.partitions)
-            .map(|number| {
-                (0_u32..1000)
-                    .map(u32::to_be_bytes)
-                    .find(|key| writer.metadata().keyed_partition(key).number == number)
-                    .unwrap()
-            })
-            .collect();
+        let routes = links.routes(writer.metadata().clone()).await.unwrap();
         Self {
             links,
             runtime: runtime.clone(),
             links_config,
+            keys: partition_keys(&writer, topic.partitions),
             writer,
-            keys,
+            routes,
             history: vec![Vec::new(); partitions],
             bases: vec![0; partitions],
             next_sequences: vec![0; partitions],
             submitted: Vec::new(),
-            policy,
+            policy: checked.identity.mode.policy(),
             verified: Arc::default(),
         }
     }
@@ -183,16 +122,7 @@ impl Client {
             println!("producer close started, takeover={takeover}");
         }
         let identity = self.writer.identity();
-        let limits = DataLimits {
-            envelope: EnvelopeLimits {
-                max_metadata_bytes: 16 * 1024,
-                max_payload_bytes: 4096,
-            },
-            max_records: 4,
-            max_parts: 4,
-            max_record_bytes: 1024,
-        };
-        let config = SharedTopicWriterConfig::new(limits);
+        let config = SharedTopicWriterConfig::new(DATA_LIMITS);
         let writer = if takeover {
             let writer = SharedTopicWriter::takeover(
                 &self.links,
@@ -222,23 +152,10 @@ impl Client {
             println!("producer attachment finished");
         }
         assert_eq!(writer.producer(), identity.producer);
-        Self {
-            next_sequences: if takeover {
-                vec![0; self.keys.len()]
-            } else {
-                self.next_sequences
-            },
-            writer,
-            links: self.links,
-            runtime: self.runtime,
-            links_config: self.links_config,
-            keys: self.keys,
-            history: self.history,
-            bases: self.bases,
-            policy: self.policy,
-            submitted: self.submitted,
-            verified: self.verified,
+        if takeover {
+            self.next_sequences = vec![0; self.keys.len()];
         }
+        Self { writer, ..self }
     }
 
     /// Replace the actual OMQ connections and resume the producer's saved identity.
@@ -263,6 +180,11 @@ impl Client {
         )
         .await
         .unwrap();
+        self.routes = self
+            .links
+            .routes(self.writer.metadata().clone())
+            .await
+            .unwrap();
         self
     }
 
@@ -344,7 +266,7 @@ impl Client {
         &self,
         pending: &SharedTopicPendingRecord,
     ) -> ozzy_runtime::replicated::SharedTopicReceipt {
-        let routes = self.links.routes(self.writer.metadata().clone()).unwrap();
+        let routes = &self.routes;
         let mut confirmation = std::pin::pin!(pending.confirmed());
         loop {
             tokio::select! {
@@ -359,6 +281,17 @@ impl Client {
                 }
             }
         }
+    }
+
+    /// Links for one consumer-group member, as a separate client of the
+    /// same brokers.
+    pub async fn group_links(&self) -> BrokerLinks {
+        let mut config = self.links_config.clone();
+        config.local = NodeId::from_bytes(*uuid::Uuid::now_v7().as_bytes());
+        config.parameters = handshake::Parameters::group(DATA_LIMITS, handshake::CONSUMER).unwrap();
+        config.parameters.capabilities |= handshake::OWNER_ROUTING;
+        config.append = None;
+        BrokerLinks::connect(&self.runtime, config).await.unwrap()
     }
 
     /// Open at the retained oracle base or its observed end.
@@ -407,9 +340,7 @@ impl Client {
 
     /// Observe current routing for a controlled broker fault.
     pub fn leader(&self, partition: u32) -> NodeId {
-        self.links
-            .routes(self.writer.metadata().clone())
-            .unwrap()
+        self.routes
             .route(partition)
             .unwrap()
             .unwrap()
@@ -516,7 +447,7 @@ impl Client {
     /// Independently submitted and confirmed identities and opaque payload parts.
     /// Outstanding submissions do not constitute confirmation evidence.
     pub fn evidence(&self) -> serde_json::Value {
-        let routes = self.links.routes(self.writer.metadata().clone());
+        let routes = &self.routes;
         let records = |id: &MessageId, parts: &[Bytes]| {
             serde_json::json!({
                 "id": id.as_bytes(), "parts": parts.iter().map(Bytes::as_ref).collect::<Vec<_>>()
@@ -527,7 +458,7 @@ impl Client {
             "bases": self.bases, "next_sequences": self.next_sequences,
             "sdk": (0..self.keys.len()).map(|partition| serde_json::json!({
                 "partition": partition,
-                "route": format!("{:?}", routes.as_ref().map(|routes| routes.route(partition as u32))),
+                "route": format!("{:?}", routes.route(partition as u32)),
                 "stats": format!("{:?}", self.writer.partition_stats(partition as u32)),
             })).collect::<Vec<_>>(),
             "confirmed": self.history.iter().map(|history| history.iter()
@@ -539,6 +470,70 @@ impl Client {
             "verified_deliveries": self.verified.load(Ordering::Relaxed)
         })
     }
+}
+
+/// Record bounds shared by the oracle's writers.
+const DATA_LIMITS: DataLimits = DataLimits {
+    envelope: EnvelopeLimits {
+        max_metadata_bytes: 16 * 1024,
+        max_payload_bytes: 4096,
+    },
+    max_records: 4,
+    max_parts: 4,
+    max_record_bytes: 1024,
+};
+
+/// Producer and consumer links to every configured broker under a fresh node id.
+fn links_config(checked: &CheckedConfig, partitions: usize, clock: SdkClock) -> BrokerLinksConfig {
+    let mut parameters =
+        handshake::Parameters::streaming(DATA_LIMITS, handshake::PRODUCER | handshake::CONSUMER)
+            .unwrap();
+    parameters.capabilities |= handshake::OWNER_ROUTING | handshake::OWNER_READ;
+    let brokers = &checked.deployment.deployment().brokers;
+    BrokerLinksConfig {
+        local: NodeId::from_bytes(*uuid::Uuid::now_v7().as_bytes()),
+        brokers: checked
+            .identity
+            .brokers
+            .iter()
+            .map(|(name, id)| BrokerAddress {
+                node: NodeId::from_bytes(*id.as_bytes()),
+                endpoint: brokers[name].endpoints.peer.parse().unwrap(),
+                data_endpoint: brokers[name].endpoints.data_peer.parse().unwrap(),
+            })
+            .collect(),
+        parameters,
+        requests: 12,
+        control_bytes: 1024 * 1024,
+        routing_bytes: 1024 * 1024,
+        append: Some(AppendLinkLimits {
+            writers: 32,
+            requests: 32,
+            records: 128,
+            bytes: 256 * 1024 * 1024,
+        }),
+        maximum_partitions: partitions,
+        reader: Some(ReaderLinkLimits {
+            subscriptions: 8,
+            bytes: 16 * 1024 * 1024,
+            queue_messages: 4,
+        }),
+        request_timeout: Duration::from_secs(5),
+        retry_interval: Duration::from_millis(10),
+        clock,
+    }
+}
+
+/// One small key per partition that the writer's keyed placement routes there.
+fn partition_keys(writer: &SharedTopicWriter, partitions: u32) -> Vec<[u8; 4]> {
+    (0..partitions)
+        .map(|number| {
+            (0_u32..1000)
+                .map(u32::to_be_bytes)
+                .find(|key| writer.metadata().keyed_partition(key).number == number)
+                .unwrap()
+        })
+        .collect()
 }
 
 impl std::fmt::Debug for Client {

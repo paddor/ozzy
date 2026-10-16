@@ -47,7 +47,15 @@ fn snapshot_limit_rejection_preserves_watch_slots_and_existing_notifications() {
     let mut registry = registry(2);
     registry.bind(peer(9), session(7)).unwrap();
     assert_eq!(
-        registry.register_bounded(peer(9), session(7), id(5), &[group(20)], 1),
+        registry.register_bounded(
+            peer(9),
+            session(7),
+            &SnapshotRequest {
+                watch: id(5),
+                groups: vec![group(20)],
+            },
+            1,
+        ),
         Err(WatchError::Invalid)
     );
     assert!(!registry.unregister(peer(9), session(7), id(5)).unwrap());
@@ -59,7 +67,15 @@ fn snapshot_limit_rejection_preserves_watch_slots_and_existing_notifications() {
     newer.leader = Some(peer(2));
     registry.publish(&newer).unwrap();
     assert_eq!(
-        registry.register_bounded(peer(9), session(7), id(5), &[group(20)], 1),
+        registry.register_bounded(
+            peer(9),
+            session(7),
+            &SnapshotRequest {
+                watch: id(5),
+                groups: vec![group(20)],
+            },
+            1,
+        ),
         Err(WatchError::Invalid)
     );
     assert_eq!(

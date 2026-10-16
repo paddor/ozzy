@@ -1,19 +1,19 @@
 //! General native/externally managed workload sweeps, sharing strict supervision.
 use super::{
-    Result, artifact_root, cache, capture, check_canceled, install_signals, isolation, json_file,
-    records, root, run_id, source, supervise, validation,
+    Result, artifact_root, cache, capture, check_canceled, install_signals, isolation, json_field,
+    json_file, records, root, run_id, source, supervise, validation,
 };
 use clap::Parser;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
-    fs::{self, OpenOptions},
+    fs,
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
 };
 
-const NATIVE: &[&str] = &["single-durable", "disk-quorum", "replicated-persisting"];
+const NATIVE: &[&str] = &["single-durable", "disk-quorum"];
 const EXTERNAL: &[&str] = &[
     "kafka-buffered",
     "redpanda-buffered",
@@ -21,11 +21,24 @@ const EXTERNAL: &[&str] = &[
     "iggy-buffered",
     "iggy-durable",
 ];
+/// The system a profile measures: the external server's name, or `ozzy`.
+fn implementation(profile: &str) -> &str {
+    if EXTERNAL.contains(&profile) {
+        system(profile)
+    } else {
+        "ozzy"
+    }
+}
+
+/// The system prefix of a profile such as `iggy-durable`.
+fn system(profile: &str) -> &str {
+    profile
+        .split_once('-')
+        .map_or(profile, |(system, _)| system)
+}
+
 fn disk(profile: &str) -> bool {
-    matches!(
-        profile,
-        "single-durable" | "disk-quorum" | "replicated-persisting"
-    )
+    matches!(profile, "single-durable" | "disk-quorum")
 }
 
 #[derive(Debug, Parser)]
@@ -40,7 +53,7 @@ pub struct Args {
     #[arg(
         long,
         value_delimiter = ',',
-        default_value = "single-durable,replicated-persisting"
+        default_value = "single-durable,disk-quorum"
     )]
     /// Native or external persistence profiles included in the sweep.
     pub profiles: Vec<String>,
@@ -224,8 +237,8 @@ impl Args {
         cases
     }
     /// Build workload worker arguments for one expanded case and storage directory.
-    pub fn command(&self, case: &Value, storage: &Path) -> Vec<String> {
-        let profile = case["profile"].as_str().unwrap();
+    pub fn command(&self, case: &Value, storage: &Path) -> Result<Vec<String>> {
+        let profile = json_field(case, "profile", Value::as_str)?;
         let external = EXTERNAL.contains(&profile);
         let mut cmd = vec![
             self.binary().display().to_string(),
@@ -261,10 +274,7 @@ impl Args {
         }
         add("--partitions", case["partitions"].to_string());
         if external {
-            add(
-                "--external-system",
-                profile.split('-').next().unwrap().into(),
-            );
+            add("--external-system", system(profile).into());
             add("--external-endpoint", self.external(profile).0.into());
         } else {
             for key in [
@@ -280,9 +290,13 @@ impl Args {
         }
         if let Some(path) = &self.placements {
             add("--placements", path.display().to_string());
-            add("--control-bind", self.control_bind.clone().unwrap());
+            let bind = self
+                .control_bind
+                .clone()
+                .ok_or("placements need a control bind")?;
+            add("--control-bind", bind);
         }
-        cmd
+        Ok(cmd)
     }
 }
 
@@ -317,14 +331,18 @@ fn server_identity(args: &Args, profile: &str) -> Result<Option<Value>> {
     Ok(Some(info))
 }
 
-async fn execute_matrix(
-    args: &Args,
-    id: &str,
-    directory: &Path,
-    identity: &Value,
-    hash: &str,
-    server: Option<&Value>,
-) -> Result<Vec<Value>> {
+/// What every case of one workload run shares.
+struct Run<'a> {
+    id: &'a str,
+    directory: &'a Path,
+    identity: &'a Value,
+    /// Worker executable digest, rechecked before every case.
+    hash: &'a str,
+    /// The prestarted external server's `podman inspect` record, if any.
+    server: Option<&'a Value>,
+}
+
+async fn execute_matrix(args: &Args, run: &Run<'_>) -> Result<Vec<Value>> {
     let cases = args.cases();
     let mut rows = vec![];
     for repetition in 1..=args.repetitions {
@@ -334,65 +352,74 @@ async fn execute_matrix(
         }
         for index in order {
             check_canceled()?;
-            source::require_unchanged(&root(), identity)?;
-            if source::sha256(&args.binary())? != hash {
+            source::require_unchanged(&root(), run.identity)?;
+            if source::sha256(&args.binary())? != run.hash {
                 return Err("workload binary changed".into());
             }
-            let case = &cases[index];
-            let profile = case["profile"].as_str().unwrap();
-            let implementation = if EXTERNAL.contains(&profile) {
-                profile.split('-').next().unwrap()
-            } else {
-                "ozzy"
-            };
-            let pid = server
-                .map(|s| s["State"]["Pid"].as_u64().ok_or("missing server PID"))
-                .transpose()?
-                .map(u32::try_from)
-                .transpose()?;
-            let profiled = ["OZZY_BENCH_PROFILE", "OZZY_BENCH_HEAPTRACK"]
-                .iter()
-                .any(|key| std::env::var_os(key).is_some());
-            let mut guard = isolation::Guard::new(implementation, pid).with_profiling(profiled)?;
-            if pid.is_some() || profiled {
-                guard.check(0)?;
-            } else {
-                isolation::require_idle()?;
-            }
-            let case_dir = directory.join(format!("r{repetition}-{index}"));
-            fs::create_dir(&case_dir)?;
-            let cmd = args.command(case, &artifact_root().join("ozzy-bench"));
-            json_file(&case_dir.join("command.json"), &json!(cmd))?;
-            capture(Command::new("sync").args(["-f"]).arg(artifact_root()))?;
-            let before = supervise::CpuSnapshot::take(pid)?;
-            let name = if pid.is_some() {
-                args.external(profile).1.map(|s| (s, case_dir.as_path()))
-            } else {
-                None
-            };
-            let raw = supervise::execute(
-                &cmd,
-                &case_dir,
-                Duration::from_secs_f64(args.warmup + args.duration + 90.0),
-                &std::collections::BTreeMap::new(),
-                name.map(|(name, root)| super::server::Monitor::Container(name, root)),
-                Some(&mut guard),
-            )
-            .await?;
-            let cpu = before.elapsed(&supervise::CpuSnapshot::take(pid)?)?;
-            source::require_unchanged(&root(), identity)?;
-            let row = json!({"kind":"measurement","run_id":id,"repetition":repetition,"case":case,"raw":raw,"measurements":validation::measurements(case,&raw)?,"execution_cpu":cpu,"source":identity,"executable_sha256":hash,"artifact_dir":case_dir,"process_isolation":guard.report()?});
-            if pid.is_some() || profiled {
-                guard.check(0)?;
-            } else {
-                isolation::require_idle()?;
-            }
-            records::append(&cache(), implementation, &row)?;
-            println!("VALID {}", row["measurements"]);
-            rows.push(row);
+            let case_dir = run.directory.join(format!("r{repetition}-{index}"));
+            rows.push(measure(args, run, &cases[index], &case_dir, repetition).await?);
         }
     }
     Ok(rows)
+}
+
+/// Measure one case under isolation and append its row to the ledger.
+async fn measure(
+    args: &Args,
+    run: &Run<'_>,
+    case: &Value,
+    case_dir: &Path,
+    repetition: u64,
+) -> Result<Value> {
+    let profile = json_field(case, "profile", Value::as_str)?;
+    let implementation = implementation(profile);
+    let pid = run
+        .server
+        .map(|s| s["State"]["Pid"].as_u64().ok_or("missing server PID"))
+        .transpose()?
+        .map(u32::try_from)
+        .transpose()?;
+    let profiled = ["OZZY_BENCH_PROFILE", "OZZY_BENCH_HEAPTRACK"]
+        .iter()
+        .any(|key| std::env::var_os(key).is_some());
+    let mut guard = isolation::Guard::new(implementation, pid).with_profiling(profiled)?;
+    if pid.is_some() || profiled {
+        guard.check(0)?;
+    } else {
+        isolation::require_idle()?;
+    }
+    fs::create_dir(case_dir)?;
+    let cmd = args.command(case, &artifact_root().join("ozzy-bench"))?;
+    json_file(&case_dir.join("command.json"), &json!(cmd))?;
+    capture(Command::new("sync").args(["-f"]).arg(artifact_root()))?;
+    let before = supervise::CpuSnapshot::take(pid)?;
+    let name = if pid.is_some() {
+        args.external(profile).1
+    } else {
+        None
+    };
+    let raw = supervise::execute(
+        &cmd,
+        case_dir,
+        Duration::from_secs_f64(args.warmup + args.duration + 90.0),
+        &std::collections::BTreeMap::new(),
+        supervise::Monitors {
+            server: name.map(|name| super::server::Monitor::Container(name, case_dir)),
+            isolation: Some(&mut guard),
+        },
+    )
+    .await?;
+    let cpu = before.elapsed(&supervise::CpuSnapshot::take(pid)?)?;
+    source::require_unchanged(&root(), run.identity)?;
+    let row = json!({"kind":"measurement","run_id":run.id,"repetition":repetition,"case":case,"raw":raw,"measurements":validation::measurements(case,&raw)?,"execution_cpu":cpu,"source":run.identity,"executable_sha256":run.hash,"artifact_dir":case_dir,"process_isolation":guard.report()?});
+    if pid.is_some() || profiled {
+        guard.check(0)?;
+    } else {
+        isolation::require_idle()?;
+    }
+    records::append(&cache()?, implementation, &row)?;
+    println!("VALID {}", row["measurements"]);
+    Ok(row)
 }
 
 /// Execute supervised cases serially and append verified measurement rows.
@@ -403,18 +430,13 @@ pub async fn run(mut args: Args) -> Result<()> {
         for case in args.cases() {
             println!(
                 "{}",
-                json!(args.command(&case, &artifact_root().join("ozzy-bench")))
+                json!(args.command(&case, &artifact_root().join("ozzy-bench"))?)
             );
         }
         return Ok(());
     }
-    fs::create_dir_all(cache())?;
-    fs::create_dir_all(super::artifacts())?;
-    let lock = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(super::artifacts().join("runner.lock"))?;
-    lock.try_lock()?;
+    fs::create_dir_all(cache()?)?;
+    let _lock = super::lock_runner(&super::artifacts())?;
     super::require_artifact_disk()?;
     let id = run_id()?;
     let directory = super::artifacts().join("runs").join(&id);
@@ -432,36 +454,15 @@ pub async fn run(mut args: Args) -> Result<()> {
     let implementations = args
         .profiles
         .iter()
-        .map(|p| {
-            if EXTERNAL.contains(&p.as_str()) {
-                p.split('-').next().unwrap()
-            } else {
-                "ozzy"
-            }
-        })
+        .map(|profile| implementation(profile))
         .collect::<BTreeSet<_>>();
-    let rows = match execute_matrix(&args, &id, &directory, &identity, &hash, server.as_ref()).await
-    {
-        Ok(rows) => rows,
-        Err(error) => {
-            for implementation in &implementations {
-                records::append(
-                    &cache(),
-                    implementation,
-                    &json!({"kind":"run-failed","run_id":id,"reason":error.to_string()}),
-                )?;
-            }
-            return Err(error);
-        }
+    let run = Run {
+        id: &id,
+        directory: &directory,
+        identity: &identity,
+        hash: &hash,
+        server: server.as_ref(),
     };
-    for implementation in implementations {
-        records::append(
-            &cache(),
-            implementation,
-            &json!({"kind":"run-complete","run_id":id}),
-        )?;
-    }
-    json_file(&directory.join("summary.json"), &records::summarize(&rows)?)?;
-    println!("COMPLETE {id}");
-    Ok(())
+    let outcome = execute_matrix(&args, &run).await;
+    records::close_run(&implementations, &id, &directory, outcome)
 }

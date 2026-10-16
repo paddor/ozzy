@@ -30,12 +30,12 @@ pub struct SharedTopicWriterConfig {
 }
 
 impl SharedTopicWriterConfig {
+    /// A fresh producer's writer: epoch 1 from sequence 0. Resumed writers
+    /// replace both with the broker's.
     fn writer(
         &self,
         partition: ozzy_proto::PartitionIncarnation,
         producer_id: ProducerId,
-        producer_epoch: u64,
-        next_sequence: u64,
         policy: ozzy_proto::append::Policy,
     ) -> WriterConfig {
         WriterConfig {
@@ -43,8 +43,8 @@ impl SharedTopicWriterConfig {
             partition,
             owner_epoch: 1,
             producer_id,
-            producer_epoch,
-            next_sequence,
+            producer_epoch: 1,
+            next_sequence: 0,
             limits: self.limits,
             compress_payloads: self.compress_payloads,
             batch_target_bytes: self.batch_target_bytes,
@@ -184,7 +184,7 @@ impl SharedTopicWriter {
             return Err(TopicWriterError::Configuration);
         }
         let metadata = links.topic(name).await?;
-        let routes = links.routes(metadata)?;
+        let routes = links.routes(metadata).await?;
         // Grow only after each owner's aggregate reservation succeeds. An
         // untrusted large topic cannot preallocate an uncharged writer array.
         let mut entries = Vec::new();
@@ -193,16 +193,20 @@ impl SharedTopicWriter {
             let partition = routes
                 .metadata()
                 .partition(number)
-                .expect("complete numeric topic");
+                .ok_or(TopicWriterError::Configuration)?;
             let target = partition.incarnation;
             let writer = Writer::open_shared(
                 &routes,
                 number,
-                config.writer(target, producer, 1, 0, routes.metadata().policy()),
+                config.writer(target, producer, routes.metadata().policy()),
                 retry,
             )
             .await?;
-            entries.push(Partition { target, writer });
+            entries.push(Partition {
+                number,
+                target,
+                writer,
+            });
         }
         let seed = routes.metadata().partitioner_seed();
         Ok(Self {
@@ -255,7 +259,7 @@ impl SharedTopicWriter {
         let (number, pending) = self.state.send(record, selection).await?;
         Ok(SharedTopicPendingRecord {
             topic: self.metadata().id(),
-            partition: u32::try_from(number).expect("bounded numeric partition"),
+            partition: number,
             pending,
         })
     }

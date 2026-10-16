@@ -1,16 +1,18 @@
-use super::{Format, Journal, Limits, scan_contains_position, validate_operation_bodies};
+use super::{
+    ExpectedStore, Format, Journal, Limits, scan_contains_position, validate_operation_bodies,
+};
 use crate::directory::{
-    DATA_DIRECTORIES, DirectoryError, GROUP_CONFIGURATION_MAX_BYTES, evidence,
-    is_checkpoint_staging_name, is_index_staging_name, position_before, segment_name,
-    segment_reference_name, validate_configuration_length, validate_initial_segment,
+    CONFIGURATION_FILE, DATA_DIRECTORIES, DirectoryError, GROUP_CONFIGURATION_MAX_BYTES,
+    IDENTITY_FILE, evidence, is_checkpoint_staging_name, is_index_staging_name, manifest_name,
+    segment_name, segment_reference_name, validate_configuration_length, validate_initial_segment,
     validate_segment_header,
 };
 use crate::{
-    AsyncSegmentStart, AsyncSegmentWriter, CanonicalRecoveryRequirements, ChainPosition,
-    CommitMode, CurrentReference, GroupIdentity, LogPosition, Manifest, SegmentReference,
-    TailState, async_files::Access, async_metadata, checkpoint::asynchronous::Checkpoint,
-    checkpoint_name, decode_segment_header, encode_group_identity, encode_manifest_with_limits,
-    manifest_digest, scan_segment_async,
+    CanonicalRecoveryRequirements, ChainPosition, CommitMode, CurrentReference, LogPosition,
+    Manifest, SegmentReference, SegmentStart, SegmentWriter, TailState, async_files::Access,
+    async_metadata, checkpoint::asynchronous::Checkpoint, checkpoint_name, decode_segment_header,
+    encode_group_identity, encode_manifest_with_limits, manifest_digest, metadata::position_before,
+    scan_segment_async,
 };
 use ozzy_io::{FileKind, Local, OpenMode, Operation};
 use ozzy_journal::progress::JournalGeneration;
@@ -70,13 +72,25 @@ impl Limits {
             || self.metadata.max_segments == 0
             || self.metadata.max_manifest_bytes
                 < crate::MANIFEST_HEADER_BYTES + crate::SEGMENT_REFERENCE_BYTES
-            || listing_bytes > limits.share(shard, ozzy_io::Class::Progress).bytes
+            || listing_bytes > limits.share(shard, ozzy_io::Class::Progress)?.bytes
         {
             return Err(
                 io::Error::new(io::ErrorKind::InvalidInput, "invalid journal I/O limits").into(),
             );
         }
         Ok(())
+    }
+
+    /// Bounds for opening one checkpoint under `checkpoint` codec limits.
+    pub(super) const fn checkpoint_bounds(
+        self,
+        checkpoint: crate::CheckpointLimits,
+    ) -> crate::checkpoint::asynchronous::Bounds {
+        crate::checkpoint::asynchronous::Bounds {
+            limits: checkpoint,
+            chunk_bytes: self.io.chunk_bytes,
+            listing: (self.directory_entries, self.directory_name_bytes),
+        }
     }
 
     pub(super) fn metadata_io(self) -> async_metadata::Limits {
@@ -103,9 +117,7 @@ impl Journal {
         limits: Limits,
     ) -> Result<Self, DirectoryError> {
         limits.validate(&io, &root)?;
-        spec.identity.validate()?;
-        validate_initial_segment(spec.identity, &spec.first_segment)?;
-        validate_configuration_length(spec.configuration.len())?;
+        spec.validate()?;
         let parent = root
             .parent()
             .ok_or(DirectoryError::MissingParent)?
@@ -117,45 +129,18 @@ impl Journal {
         }
         let manifest = initial_manifest(&spec);
         let bytes = encode_manifest_with_limits(&manifest, limits.metadata)?;
-        let access = Access {
-            io: io.clone(),
-            protection: None,
-            readers: std::rc::Rc::default(),
-        };
-        let directory = access.open_directory(parent.clone()).await?;
-        access.done(Operation::Close { handle: directory }).await?;
-        access
-            .done(Operation::CreateDirectory { path: root.clone() })
-            .await
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::AlreadyExists {
-                    DirectoryError::StoreAlreadyExists
-                } else {
-                    error.into()
-                }
-            })?;
-        let mut directory =
-            async_metadata::Directory::open(root.clone(), io.clone(), limits.metadata_io()).await?;
+        let mut directory = create_store(&root, &parent, &io, limits).await?;
         let access = directory.access();
-        for name in DATA_DIRECTORIES {
-            access
-                .done(Operation::CreateDirectory {
-                    path: root.join(name),
-                })
-                .await?;
-        }
         directory
-            .install_immutable("identity", &encode_group_identity(spec.identity)?)
+            .install_immutable(IDENTITY_FILE, &encode_group_identity(spec.identity)?)
             .await?;
         directory
-            .install_immutable("CONFIGURATION", &spec.configuration)
+            .install_immutable(CONFIGURATION_FILE, &spec.configuration)
             .await?;
-        let writer = AsyncSegmentWriter::create(
-            root.join(segment_name(spec.first_segment.segment_id())),
-            io,
-            access.protection.clone(),
+        let writer = SegmentWriter::create(
+            access.segment_file(root.join(segment_name(spec.first_segment.segment_id()))),
             spec.first_segment,
-            AsyncSegmentStart {
+            SegmentStart {
                 generation,
                 first_group_number: 1,
                 initial_chain: ChainPosition::GENESIS,
@@ -164,21 +149,7 @@ impl Journal {
         )
         .await?;
         access.sync_directory(root.join("segments")).await?;
-        directory
-            .replace(
-                evidence::NAME,
-                ".DURABLE.tmp",
-                &evidence::image(&manifest, LogPosition::GENESIS)?,
-            )
-            .await?;
-        directory.install_immutable("MANIFEST.1", &bytes).await?;
-        let current = CurrentReference {
-            group_id: spec.identity.group_id,
-            store_id: spec.identity.store_id,
-            generation: 1,
-            manifest_digest: manifest_digest(&bytes, limits.metadata)?,
-        };
-        directory.select_current(current).await?;
+        let current = select_initial(&mut directory, &manifest, &bytes, limits).await?;
         access.sync_directory(parent).await?;
         let evidence = Some(directory.load_evidence(&manifest).await?);
         Ok(Self {
@@ -192,8 +163,10 @@ impl Journal {
             checkpoint: None,
             limits,
             interrupted: false,
-            pins: std::sync::Arc::default(),
+            cleaning: std::rc::Rc::default(),
+            pins: std::rc::Rc::default(),
             validated_indexes: std::collections::BTreeMap::new(),
+            active_prefix: None,
         })
     }
 
@@ -202,12 +175,11 @@ impl Journal {
     pub async fn open(
         root: PathBuf,
         io: Local,
-        identity: GroupIdentity,
-        configuration: Option<&[u8]>,
+        expected: ExpectedStore<'_>,
         generation: JournalGeneration,
         limits: Limits,
     ) -> Result<Self, DirectoryError> {
-        Self::prepare_open(root, io, identity, configuration, limits)
+        Self::prepare_open(root, io, expected, limits)
             .await?
             .recover(generation)
             .await
@@ -218,8 +190,7 @@ impl Journal {
     pub async fn prepare_open(
         root: PathBuf,
         io: Local,
-        identity: GroupIdentity,
-        configuration: Option<&[u8]>,
+        expected: ExpectedStore<'_>,
         limits: Limits,
     ) -> Result<Opening, DirectoryError> {
         limits.validate(&io, &root)?;
@@ -230,7 +201,7 @@ impl Journal {
         )
         .await?;
         let selected = directory
-            .read_selected(identity, limits.metadata, configuration)
+            .read_selected(expected.identity, limits.metadata, expected.configuration)
             .await?;
         Ok(Opening {
             directory,
@@ -247,10 +218,7 @@ impl Journal {
     ) -> Result<Self, DirectoryError> {
         let root = directory.root().to_path_buf();
         let access = directory.access();
-        for name in DATA_DIRECTORIES {
-            let handle = access.open_directory(root.join(name)).await?;
-            access.done(Operation::Close { handle }).await?;
-        }
+        open_data_directories(&access, &root).await?;
         validate_headers(&access, &root, &selected.manifest, limits).await?;
         let checkpoint = selected_checkpoint(&access, &root, &selected.manifest, limits).await?;
         cleanup_staging(&access, &root, limits).await?;
@@ -264,29 +232,22 @@ impl Journal {
             selected.manifest.committed.following_chain()?,
         ];
         let seen = validate_sealed(&access, &root, &selected.manifest, protected, limits).await?;
-        let active = *selected
-            .manifest
-            .segments
-            .last()
-            .ok_or(DirectoryError::MissingActiveSegment)?;
-        let mut writer = AsyncSegmentWriter::recover(
-            root.join(segment_reference_name(active)),
-            access.io.clone(),
-            access.protection.clone(),
-            AsyncSegmentStart {
+        let active = *super::active_segment(&selected.manifest.segments)?;
+        let mut writer = SegmentWriter::recover(
+            access.segment_file(root.join(segment_reference_name(active))),
+            SegmentStart {
                 generation,
                 first_group_number: active.first_group_number,
                 initial_chain: active.first_chain,
             },
             limits.io,
             limits.decode,
-            Some(CanonicalRecoveryRequirements {
-                operation_limits: limits.operations,
-                protected: std::array::from_fn(|i| (!seen[i]).then_some(protected[i])),
-                configuration_epoch: Some(selected.manifest.configuration_epoch),
-                promised_view: Some(selected.manifest.promised_view),
-                discard_damaged_tail: true,
-            }),
+            Some(active_requirements(
+                &selected.manifest,
+                protected,
+                seen,
+                limits,
+            )),
         )
         .await?;
         writer.restore_allocation().await?;
@@ -302,22 +263,146 @@ impl Journal {
             checkpoint,
             limits,
             interrupted: false,
-            pins: std::sync::Arc::default(),
+            cleaning: std::rc::Rc::default(),
+            pins: std::rc::Rc::default(),
             validated_indexes: std::collections::BTreeMap::new(),
+            active_prefix: None,
         };
-        let committed = if journal.manifest.commit_mode == CommitMode::LocalDurable {
-            recovered
-        } else {
-            journal.manifest.committed
-        };
-        if journal.manifest.accepted != recovered || journal.manifest.committed != committed {
-            let mut next = journal.next_manifest()?;
-            next.accepted = recovered;
-            next.committed = committed;
-            journal.install_selected(next).await?;
+        if let Some(next) = journal.recovered_manifest(recovered)? {
+            // Boxed: inline, this publication pushes broker startup past
+            // the large-future bound.
+            Box::pin(journal.install_selected(next)).await?;
         }
         Ok(journal)
     }
+
+    /// The successor manifest selecting the recovered durable prefix as
+    /// accepted, and as committed in local-durable mode, unless the manifest
+    /// already says so.
+    fn recovered_manifest(
+        &self,
+        recovered: LogPosition,
+    ) -> Result<Option<Manifest>, DirectoryError> {
+        let committed = if self.manifest.commit_mode == CommitMode::LocalDurable {
+            recovered
+        } else {
+            self.manifest.committed
+        };
+        if self.manifest.accepted == recovered && self.manifest.committed == committed {
+            return Ok(None);
+        }
+        let mut next = self.next_manifest()?;
+        next.accepted = recovered;
+        next.committed = committed;
+        Ok(Some(next))
+    }
+}
+
+impl Format {
+    /// Check the identity, genesis segment, and configuration length.
+    fn validate(&self) -> Result<(), DirectoryError> {
+        self.identity.validate()?;
+        validate_initial_segment(self.identity, &self.first_segment)?;
+        validate_configuration_length(self.configuration.len())
+    }
+}
+
+/// Create the absent store directory and its data directories below an
+/// existing parent. An existing store is never reused.
+async fn create_store(
+    root: &Path,
+    parent: &Path,
+    io: &Local,
+    limits: Limits,
+) -> Result<async_metadata::Directory, DirectoryError> {
+    let access = Access {
+        io: io.clone(),
+        protection: None,
+        readers: std::rc::Rc::default(),
+    };
+    let directory = access.open_directory(parent.to_path_buf()).await?;
+    access.done(Operation::Close { handle: directory }).await?;
+    access
+        .done(Operation::CreateDirectory {
+            path: root.to_path_buf(),
+        })
+        .await
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                DirectoryError::StoreAlreadyExists
+            } else {
+                error.into()
+            }
+        })?;
+    let directory =
+        async_metadata::Directory::open(root.to_path_buf(), io.clone(), limits.metadata_io())
+            .await?;
+    let access = directory.access();
+    for name in DATA_DIRECTORIES {
+        access
+            .done(Operation::CreateDirectory {
+                path: root.join(name),
+            })
+            .await?;
+    }
+    Ok(directory)
+}
+
+/// Publish genesis evidence and the first manifest, then select it as
+/// CURRENT.
+async fn select_initial(
+    directory: &mut async_metadata::Directory,
+    manifest: &Manifest,
+    bytes: &[u8],
+    limits: Limits,
+) -> Result<CurrentReference, DirectoryError> {
+    directory
+        .replace(
+            evidence::NAME,
+            ".DURABLE.tmp",
+            &evidence::image(manifest, LogPosition::GENESIS)?,
+        )
+        .await?;
+    directory
+        .install_immutable(&manifest_name(1), bytes)
+        .await?;
+    let current = CurrentReference {
+        group_id: manifest.identity.group_id,
+        store_id: manifest.identity.store_id,
+        generation: 1,
+        manifest_digest: manifest_digest(bytes, limits.metadata)?,
+    };
+    directory.select_current(current).await?;
+    Ok(current)
+}
+
+/// Checks the active segment's recovery must pass under the selected
+/// authority. It must hold each protected position no sealed segment held.
+fn active_requirements(
+    manifest: &Manifest,
+    protected: [ChainPosition; 2],
+    seen: [bool; 2],
+    limits: Limits,
+) -> CanonicalRecoveryRequirements {
+    CanonicalRecoveryRequirements {
+        operation_limits: limits.operations,
+        protected: std::array::from_fn(|i| (!seen[i]).then_some(protected[i])),
+        configuration_epoch: Some(manifest.configuration_epoch),
+        promised_view: Some(manifest.promised_view),
+        discard_damaged_tail: true,
+    }
+}
+
+/// Each data directory must exist and open as a directory.
+pub(super) async fn open_data_directories(
+    access: &Access,
+    root: &Path,
+) -> Result<(), DirectoryError> {
+    for name in DATA_DIRECTORIES {
+        let handle = access.open_directory(root.join(name)).await?;
+        access.done(Operation::Close { handle }).await?;
+    }
+    Ok(())
 }
 
 fn initial_manifest(spec: &Format) -> Manifest {
@@ -358,9 +443,7 @@ pub(super) async fn selected_checkpoint(
         root.join("checkpoints")
             .join(checkpoint_name(reference.checkpoint_id)),
         (manifest.identity.group_id, manifest.identity.store_id),
-        limits.checkpoint,
-        limits.io.chunk_bytes,
-        (limits.directory_entries, limits.directory_name_bytes),
+        limits.checkpoint_bounds(limits.checkpoint),
     )
     .await?;
     if checkpoint.manifest.checkpoint_id != reference.checkpoint_id
@@ -423,9 +506,10 @@ async fn validate_sealed(
             .sealed
             .ok_or(DirectoryError::SegmentMismatch(reference.segment_id))?;
         let bytes = access
-            .read_file(
+            .read_prefix(
                 root.join(segment_reference_name(reference)),
-                reference.capacity as usize,
+                sealed.valid_bytes,
+                reference.capacity,
                 limits.io.chunk_bytes,
             )
             .await?;

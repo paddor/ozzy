@@ -9,14 +9,13 @@ pub(crate) fn reader_frame(
     payload: crate::replicated::payload::Lease,
     shared: Option<Bytes>,
 ) -> Bytes {
-    #[cfg(feature = "storage-metrics")]
-    crate::storage_metrics::add(
+    crate::profiling::count(
         if shared.is_some() {
-            &crate::storage_metrics::SHARED_READER_BYTES
+            crate::profiling::Event::SharedReaderBytes
         } else {
-            &crate::storage_metrics::COPIED_READER_BYTES
+            crate::profiling::Event::CopiedReaderBytes
         },
-        shared.as_ref().map_or(payload.body.len(), Bytes::len),
+        shared.as_ref().map_or(payload.body.len(), Bytes::len) as u64,
     );
     match shared {
         Some(bytes) => payload.freeze_shared(bytes),
@@ -26,15 +25,18 @@ pub(crate) fn reader_frame(
 
 /// Use the single PUB output lease so slow inproc subscribers cannot retain
 /// writer allocations. Packed payload bytes remain unchanged without decoding.
+/// `None` when the shared bytes exceed the lease, which never grows.
 pub(crate) fn publication_frame(
     mut payload: crate::replicated::payload::Lease,
     shared: Option<Bytes>,
-) -> Bytes {
+) -> Option<Bytes> {
     if let Some(bytes) = shared {
-        assert!(bytes.len() <= payload.body.capacity());
+        if bytes.len() > payload.body.capacity() {
+            return None;
+        }
         payload.body.extend_from_slice(&bytes);
     }
-    reader_frame(payload, None)
+    Some(reader_frame(payload, None))
 }
 
 mod delivery;
@@ -91,7 +93,8 @@ impl Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{memory, replicated::payload::Payload, signal::DataSignal};
+    use crate::{memory, replicated::payload::Payload};
+    use futures::task::AtomicWaker;
     use std::sync::Arc;
 
     #[tokio::test(flavor = "current_thread")]
@@ -106,8 +109,8 @@ mod tests {
             .unwrap();
         let mut source = owner.try_lease(4096).unwrap();
         source.as_mut().fill(7);
-        let payload = Payload::notifying(4096, Arc::new(DataSignal::default()));
-        let frame = publication_frame(payload.try_take().unwrap(), Some(source.freeze()));
+        let payload = Payload::waking(4096, Arc::new(AtomicWaker::new()));
+        let frame = publication_frame(payload.try_take().unwrap(), Some(source.freeze())).unwrap();
         assert_eq!(frame.as_ref(), &[7; 4096]);
         assert!(payload.try_take().is_none(), "one outstanding PUB payload");
         owner.trim_cache();

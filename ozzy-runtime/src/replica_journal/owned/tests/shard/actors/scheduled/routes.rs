@@ -40,9 +40,11 @@ fn service(routes: Vec<directory::RouteState>) -> Service {
         7,
         Kind::Client,
         dispatch::Class::Control,
-        1,
-        4096,
-        8192,
+        crate::frontend::DataLaneLimits {
+            slots: 1,
+            maximum_retained_bytes: 4096,
+            retained_budget_bytes: 8192,
+        },
     )
     .unwrap();
     let queue = QueueLimits {
@@ -94,7 +96,7 @@ fn service(routes: Vec<directory::RouteState>) -> Service {
 
 fn register(service: &mut Service, groups: Vec<GroupId>) -> Vec<Message> {
     let peer = NodeId::from_bytes([70; 16]);
-    let remote = LinkSessions::with_ids(
+    let mut remote = LinkSessions::with_ids(
         peer,
         handshake::Parameters::append(DataLimits::default(), handshake::PRODUCER).unwrap(),
         handshake::OWNER,
@@ -201,15 +203,12 @@ fn close(controller: &mut Controller, actors: PartitionActors) {
 
 #[test]
 fn surviving_broker_notifies_watch_after_full_port_without_dead_leader() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        scenario(policy);
-    }
+    scenario();
 }
 
 fn actor_sets(
     controller: &mut Controller,
     io: &Local,
-    policy: QuorumPolicy,
 ) -> (
     [PartitionActors; 3],
     Vec<(GroupId, ozzy_proto::PartitionIncarnation)>,
@@ -218,7 +217,7 @@ fn actor_sets(
     let mut assigned: [Vec<_>; 3] = std::array::from_fn(|_| Vec::new());
     let mut identities = Vec::new();
     for group in 0..2 {
-        let (actors, pending) = cluster(controller, io, group, policy);
+        let (actors, pending) = cluster(controller, io, group);
         identities.push((
             actors[0].status().scope.group_id,
             ozzy_proto::PartitionIncarnation::from_bytes([91 + group; 16]),
@@ -265,9 +264,9 @@ fn updates(output: &[Message]) -> Vec<directory::RouteState> {
         .collect()
 }
 
-fn scenario(policy: QuorumPolicy) {
+fn scenario() {
     let (mut controller, io) = setup();
-    let (mut shards, identities, mut routes) = actor_sets(&mut controller, &io, policy);
+    let (mut shards, identities, mut routes) = actor_sets(&mut controller, &io);
     let initial_routes = identities
         .iter()
         .map(|&(group, partition)| shards[1].route_state(group, partition).unwrap())

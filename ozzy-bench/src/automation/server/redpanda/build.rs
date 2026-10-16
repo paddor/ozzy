@@ -17,18 +17,19 @@ pub(super) fn loader() -> PathBuf {
 pub(super) fn rpk() -> PathBuf {
     directory().join("libexec/rpk")
 }
-fn stamp() -> PathBuf {
-    cache().join(format!("redpanda-{RELEASE}-build.json"))
+fn stamp() -> Result<PathBuf> {
+    Ok(cache()?.join(format!("redpanda-{RELEASE}-build.json")))
 }
 
 fn identity() -> Result<Value> {
     let directory = directory();
     let mut libraries = std::collections::BTreeMap::new();
     for entry in fs::read_dir(directory.join("lib"))? {
-        let path = entry?.path();
+        let entry = entry?;
+        let path = entry.path();
         if path.is_file() {
             libraries.insert(
-                path.file_name().unwrap().to_string_lossy().into_owned(),
+                entry.file_name().to_string_lossy().into_owned(),
                 source::sha256(&path)?,
             );
         }
@@ -40,7 +41,7 @@ fn identity() -> Result<Value> {
 
 pub(super) fn verified_identity() -> Result<Value> {
     let actual = identity()?;
-    if actual != read_json(&stamp())? {
+    if actual != read_json(&stamp()?)? {
         return Err("Redpanda install changed; rerun without --no-build".into());
     }
     Ok(actual)
@@ -51,7 +52,7 @@ pub fn prepare(no_build: bool) -> Result<()> {
     if no_build {
         return verified_identity().map(|_| ());
     }
-    if stamp().exists() && verified_identity().is_ok() {
+    if stamp()?.exists() && verified_identity().is_ok() {
         return Ok(());
     }
     if std::env::consts::ARCH != "x86_64" {
@@ -81,5 +82,5 @@ pub fn prepare(no_build: bool) -> Result<()> {
     )?;
     // Invoke the bundled loader explicitly. Rewriting this distribution's
     // interpreter with patchelf corrupts its ELF layout, even with 2 MiB pages.
-    json_file(&stamp(), &identity()?)
+    json_file(&stamp()?, &identity()?)
 }

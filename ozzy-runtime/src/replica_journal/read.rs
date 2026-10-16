@@ -7,13 +7,35 @@ use ozzy_proto::{MessageId, Offset, OwnerEpoch, PartitionIncarnation};
 use ozzy_replication::driver::ValidationTicket;
 use ozzy_replication::{JournalGeneration, Prefix, Scope};
 
-use super::commands::Action;
-use super::{JournalCompletion, Rejected, ReplicaJournal};
+use super::commands::{Action, Gate, Reply};
+use super::{JournalCompletion, OwnedSemaphorePermit, Rejected, ReplicaJournal};
 
 mod buffer;
 pub(crate) mod delivery;
 pub(crate) use buffer::PartitionReadBuffer;
 pub use buffer::PartitionReadLease;
+
+/// Partition read commands: resolve a selector, then read from a cursor.
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "bounded command slots retain their arenas inline without another allocation"
+)]
+pub(super) enum ReadAction {
+    Seek {
+        ticket: ValidationTicket,
+        partition: PartitionIncarnation,
+        start: ozzy_proto::reader::Start,
+        done: Reply<PartitionReadCursor>,
+    },
+    ReadPartition {
+        read_permit: OwnedSemaphorePermit,
+        cursor: PartitionReadCursor,
+        limits: PartitionReadLimits,
+        buffer: PartitionReadLease,
+        done: delivery::ReadReply,
+    },
+}
 
 /// Output bounds for one disk read, independent of writer grouping.
 #[derive(Debug, Clone, Copy)]
@@ -171,20 +193,14 @@ impl ReplicaJournal {
         partition: PartitionIncarnation,
         start: ozzy_proto::reader::Start,
     ) -> Result<JournalCompletion<PartitionReadCursor>, super::SubmitError> {
-        self.submit(
-            start,
-            |start, done| Action::Seek {
+        self.command(Gate::Free, |done| {
+            Action::Read(ReadAction::Seek {
                 ticket,
                 partition,
                 start,
                 done,
-            },
-            |action| match action {
-                Action::Seek { start, .. } => start,
-                _ => unreachable!("seek submission"),
-            },
-        )
-        .map_err(|rejected| rejected.reason)
+            })
+        })
     }
 
     /// Resolve a cursor directly against the owner's applied state, without I/O.
@@ -207,6 +223,42 @@ impl ReplicaJournal {
                 owner.open_reader(ticket, partition, from).map(Some)
             }
             super::execution::Execution::Recovery(_) => Err(PartitionReadError::Unavailable.into()),
+        }
+    }
+
+    /// Read one committed coordinator image directly from the owner's applied
+    /// state, without I/O or a command slot. A busy owner returns `WouldBlock`;
+    /// the caller retries on its next turn.
+    pub fn coordinator_group(
+        &self,
+        ticket: ValidationTicket,
+        coordinator: PartitionIncarnation,
+        name: &str,
+    ) -> Result<Option<std::sync::Arc<ozzy_core::state::CoordinatorGroup>>, super::JournalError>
+    {
+        if self.execution.is_closed() {
+            return Err(super::JournalError::Stopped);
+        }
+        if self.available_command_slots() == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into());
+        }
+        match &self.execution {
+            super::execution::Execution::Normal(owner) => {
+                owner.coordinator_group(ticket, coordinator, name)
+            }
+            super::execution::Execution::Recovery(_) => Err(PartitionReadError::Unavailable.into()),
+        }
+    }
+
+    /// Summarize committed partition state for diagnostics, without I/O.
+    /// `None` while a command holds the owner, during recovery, or after a
+    /// fault; the caller asks again later.
+    pub fn facts(&self, partition: PartitionIncarnation) -> Option<super::PartitionFacts> {
+        match &self.execution {
+            super::execution::Execution::Normal(owner) if !self.execution.is_closed() => {
+                owner.facts(partition).ok().flatten()
+            }
+            _ => None,
         }
     }
 
@@ -269,16 +321,15 @@ impl ReplicaJournal {
         };
         self.submit(
             buffer,
-            |buffer, done| Action::ReadPartition {
-                read_permit,
-                cursor,
-                limits,
-                buffer,
-                done: reply(done),
-            },
-            |action| match action {
-                Action::ReadPartition { buffer, .. } => buffer,
-                _ => unreachable!("submission preserves command kind"),
+            |_| Gate::Free,
+            |buffer, done| {
+                Action::Read(ReadAction::ReadPartition {
+                    read_permit,
+                    cursor,
+                    limits,
+                    buffer,
+                    done: reply(done),
+                })
             },
         )
     }

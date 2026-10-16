@@ -52,49 +52,13 @@ async fn run_processes(config: Config) -> Result<()> {
     let directory = tempfile::Builder::new().prefix("ram-timed-").tempdir()?;
     let group = GroupId::new();
     let placements = Placement::load(config.args.placements.as_deref())?;
-    let Workers {
-        mut brokers,
-        mut writers,
-        mut readers,
-    } = spawn(&config, &placements, group, directory.path()).await?;
-    let monitors: Vec<_> = brokers
-        .iter()
-        .chain(&writers)
-        .chain(&readers)
-        .map(Process::monitor)
-        .collect();
-    let watchdog = Duration::from_secs_f64(
-        65.0 + config.args.warmup
-            + config.args.duration.unwrap()
-            + config.args.drain_timeout_secs as f64,
-    );
-    let result = tokio::select! {
-        result = tokio::time::timeout(watchdog, async {
-            #[cfg(feature = "comparisons")]
-            if config.args.external_system.is_some() {
-                return external::coordinate(&config, &mut writers, &mut readers).await;
-            }
-            let mut prepared = native::Prepared::new(&config, &mut brokers, directory.path()).await?;
-            native::coordinate(&config, &mut prepared, &mut brokers, &mut writers, &mut readers).await
-        }) => match result {
-                Ok(result) => result,
-                Err(error) => Err(error.into()),
-            },
-        diagnostic = launch::watch_diagnostics(&monitors) => Err(diagnostic),
-    };
-    let row = match result {
+    let mut workers = spawn(&config, &placements, group, directory.path()).await?;
+    let row = match workers.coordinate(&config, directory.path()).await {
         Ok(row) => row,
         Err(error) => {
             // Close control and observe worker exit before Drop's kill fallback.
             // Prepared storage and port reservations belong to those workers.
-            futures::future::join_all(
-                brokers
-                    .iter_mut()
-                    .chain(&mut writers)
-                    .chain(&mut readers)
-                    .map(Process::stop),
-            )
-            .await;
+            workers.stop_all().await;
             let path = directory.keep();
             return Err(super::error(format!(
                 "{error}; failed worker artifacts: {}",
@@ -102,18 +66,7 @@ async fn run_processes(config: Config) -> Result<()> {
             )));
         }
     };
-    finish(
-        &config,
-        row,
-        provenance,
-        directory,
-        Workers {
-            brokers,
-            writers,
-            readers,
-        },
-    )
-    .await
+    finish(&config, row, provenance, directory, workers).await
 }
 
 async fn finish(
@@ -133,11 +86,10 @@ async fn finish(
     }
     #[cfg(feature = "comparisons")]
     if config.args.external_system.is_some() {
-        external::cleanup(
-            config,
-            row["external_topic"].as_str().expect("run-scoped topic"),
-        )
-        .await?;
+        let topic = row["external_topic"]
+            .as_str()
+            .ok_or_else(|| error("external row lacks its run-scoped topic"))?;
+        external::cleanup(config, topic).await?;
     }
     #[cfg(not(feature = "comparisons"))]
     let _ = config;
@@ -158,6 +110,52 @@ struct Workers {
     brokers: Vec<Process>,
     writers: Vec<Process>,
     readers: Vec<Process>,
+}
+
+impl Workers {
+    /// Run the measured workload under the run watchdog. Any worker
+    /// diagnostic fails the run at once.
+    async fn coordinate(&mut self, config: &Config, directory: &std::path::Path) -> Result<Value> {
+        let monitors: Vec<_> = self
+            .brokers
+            .iter()
+            .chain(&self.writers)
+            .chain(&self.readers)
+            .map(Process::monitor)
+            .collect();
+        let Self {
+            brokers,
+            writers,
+            readers,
+        } = self;
+        let watchdog = config.args.budget().watchdog();
+        tokio::select! {
+            result = tokio::time::timeout(watchdog, async {
+                #[cfg(feature = "comparisons")]
+                if config.args.external_system.is_some() {
+                    return external::coordinate(config, writers, readers).await;
+                }
+                let mut prepared = native::Prepared::new(config, brokers, directory).await?;
+                native::coordinate(config, &mut prepared, brokers, writers, readers).await
+            }) => match result {
+                Ok(result) => result,
+                Err(error) => Err(error.into()),
+            },
+            diagnostic = launch::watch_diagnostics(&monitors) => Err(diagnostic),
+        }
+    }
+
+    /// Stop every worker, ignoring its exit status.
+    async fn stop_all(&mut self) {
+        futures::future::join_all(
+            self.brokers
+                .iter_mut()
+                .chain(&mut self.writers)
+                .chain(&mut self.readers)
+                .map(Process::stop),
+        )
+        .await;
+    }
 }
 
 async fn spawn(
@@ -206,16 +204,19 @@ fn preserve_logs(children: [&[Process]; 3]) -> Result<Option<std::path::PathBuf>
         .filter(|child| std::fs::metadata(&child.errors).is_ok_and(|meta| meta.len() > 0))
         .collect();
     if !logs.is_empty() {
-        let cache = ozzy_bench::automation::cache().join("client-logs");
+        let cache = ozzy_bench::automation::cache()?.join("client-logs");
         std::fs::create_dir_all(&cache)?;
         let saved = tempfile::Builder::new()
             .prefix("timed-")
             .tempdir_in(cache)?;
         for child in logs {
-            std::fs::copy(
-                &child.errors,
-                saved.path().join(child.errors.file_name().unwrap()),
-            )?;
+            let name = child.errors.file_name().ok_or_else(|| {
+                error(format!(
+                    "worker log {} has no file name",
+                    child.errors.display()
+                ))
+            })?;
+            std::fs::copy(&child.errors, saved.path().join(name))?;
         }
         return Ok(Some(saved.keep()));
     }
@@ -246,7 +247,7 @@ async fn measure(
     send_all(writers, &start)?;
     // Workers enforce the actual drain deadline. Allow bounded report encoding
     // and transfer afterward, without extending the measured or drained cohort.
-    let reports_by = window.deadline(&config.args) + Duration::from_secs(5);
+    let reports_by = window.deadline(&config.args) + ozzy_bench::budget::REPORTS;
     let writer_rows = try_join_all(
         writers
             .iter_mut()
@@ -254,7 +255,12 @@ async fn measure(
     )
     .await?;
     validate_reports(&writer_rows, writers)?;
-    let totals = results::totals(&writer_rows, config.writers)?;
+    let expected = config
+        .args
+        .native
+        .feeds
+        .logical_rows(config.writers, &writer_rows)?;
+    let totals = results::totals(&expected, config.logical_writers())?;
     send_all(readers, &json!({"command":"finish","counts":totals}))?;
     let reader_rows = try_join_all(
         readers
@@ -265,12 +271,12 @@ async fn measure(
     validate_reports(&reader_rows, readers)?;
     for copy in 0..config.args.readers_per_partition {
         let rows = results::reader_copy(&reader_rows, copy)?;
-        if totals != results::totals(&rows, config.writers)? {
+        if totals != results::totals(&rows, config.logical_writers())? {
             return Err(error(
                 "reader/writer final identities do not cover the same prefix",
             ));
         }
-        results::verify_digests(&writer_rows, &rows, config.writers)?;
+        results::verify_digests(&expected, &rows, config.logical_writers())?;
     }
     Ok((window, writer_rows, reader_rows))
 }
@@ -285,7 +291,11 @@ async fn receive_all(children: &mut [Process], event: &str) -> Result<Vec<Value>
     try_join_all(children.iter_mut().map(|child| child.receive(event))).await
 }
 async fn command(input: &mut mpsc::Receiver<Result<Value>>, expected: &str) -> Result<Value> {
-    command_with_timeout(input, expected, Duration::from_secs(60)).await
+    command_with_timeout(input, expected, ozzy_bench::budget::CONTROL_STEP).await
+}
+/// Workers wait for `connect` while brokers set up, which includes formatting.
+async fn await_connect(input: &mut mpsc::Receiver<Result<Value>>) -> Result<Value> {
+    command_with_timeout(input, "connect", ozzy_bench::budget::SETUP).await
 }
 
 async fn command_with_timeout(
@@ -339,7 +349,6 @@ mod tests {
             ("single-buffered", false),
             ("single-durable", true),
             ("disk-quorum", true),
-            ("replicated-persisting", true),
         ] {
             let parsed = Args::try_parse_from([
                 "bench",

@@ -32,7 +32,6 @@ pub(crate) struct Cluster {
     // this. It proves past durability, never current history availability.
     lost_disks: [Option<Vec<Operation>>; 3],
     // Historical RAM retention is oracle evidence only, never repair input.
-    lost_ram: [Vec<Operation>; 3],
     seed: u64,
     random: u64,
     trace: VecDeque<String>,
@@ -40,13 +39,9 @@ pub(crate) struct Cluster {
 
 impl Cluster {
     pub(crate) fn with_storage(seed: u64) -> Self {
-        Self::with_storage_policy(seed, QuorumPolicy::Durable)
-    }
-
-    pub(crate) fn with_storage_policy(seed: u64, policy: QuorumPolicy) -> Self {
-        let mut cluster = Self::with_policy(seed, policy);
+        let mut cluster = Self::new(seed);
         for replica in &mut cluster.replicas {
-            replica.enable_storage(seed);
+            replica.enable_storage();
         }
         cluster
     }
@@ -84,16 +79,9 @@ impl Cluster {
     }
 
     pub(crate) fn new(seed: u64) -> Self {
-        Self::with_policy(seed, QuorumPolicy::Durable)
-    }
-
-    fn with_policy(seed: u64, policy: QuorumPolicy) -> Self {
         Self {
-            configuration: configuration_record_with_policy(policy).configuration(),
-            replicas: std::array::from_fn(|id| match policy {
-                QuorumPolicy::Durable => Replica::new(id),
-                QuorumPolicy::Replicated => Replica::with_policy(id, policy),
-            }),
+            configuration: configuration_record().configuration(),
+            replicas: std::array::from_fn(Replica::new),
             network: VecDeque::new(),
             links: [[true; 3]; 3],
             disk_paused: [false; 3],
@@ -103,7 +91,6 @@ impl Cluster {
             acknowledged: Vec::new(),
             acknowledged_view: 0,
             lost_disks: std::array::from_fn(|_| None),
-            lost_ram: std::array::from_fn(|_| Vec::new()),
             seed,
             random: seed.max(1),
             trace: VecDeque::new(),
@@ -163,15 +150,13 @@ impl Cluster {
         let first = request.operations[0].number as usize - 1;
         assert_eq!(&operations[first..through], &request.operations);
         assert_eq!(prefix(operations, through), end);
-        if self.configuration.policy() == QuorumPolicy::Durable {
-            assert_eq!(
-                self.replicas[request.primary]
-                    .stable
-                    .operations
-                    .get(..through),
-                Some(&operations[..through])
-            );
-        }
+        assert_eq!(
+            self.replicas[request.primary]
+                .stable
+                .operations
+                .get(..through),
+            Some(&operations[..through])
+        );
         assert!(
             self.replicas
                 .iter()
@@ -192,29 +177,6 @@ impl Cluster {
         ));
         self.check();
         true
-    }
-
-    /// Retry lookup through the current ready leader. The original canonical
-    /// bytes must already be applied; this never manufactures a replacement or
-    /// uses the independent confirmation oracle as protocol input.
-    pub(crate) fn acknowledge_retry(&mut self, request: &Request) -> bool {
-        let Some(primary) = self.primary() else {
-            return false;
-        };
-        let snapshot = self.replicas[primary].snapshot().unwrap();
-        let first = request.operations[0].number as usize - 1;
-        let through = request.end().op.0 as usize;
-        if snapshot.applied.op < request.end().op
-            || self.replicas[primary].accepted.get(first..through)
-                != Some(request.operations.as_slice())
-        {
-            return false;
-        }
-        self.acknowledge(&Request {
-            primary,
-            scope: snapshot.scope,
-            operations: request.operations.clone(),
-        })
     }
 
     fn enqueue(&mut self, packets: Vec<Packet>) {
@@ -280,9 +242,6 @@ impl Cluster {
 
     pub(crate) fn cut(&mut self, replica: usize) {
         self.event(format!("power cut {replica}"));
-        if self.replicas[replica].accepted.len() > self.lost_ram[replica].len() {
-            self.lost_ram[replica].clone_from(&self.replicas[replica].accepted);
-        }
         self.replicas[replica].power_cut();
         self.check();
     }
@@ -313,9 +272,6 @@ impl Cluster {
 
     fn held_confirming_copy(&self, replica: usize, known: &[Operation]) -> bool {
         self.was_durable(replica, known)
-            || (self.configuration.policy() == QuorumPolicy::Replicated
-                && (self.replicas[replica].accepted.get(..known.len()) == Some(known)
-                    || self.lost_ram[replica].get(..known.len()) == Some(known)))
     }
 
     fn was_durable(&self, replica: usize, known: &[Operation]) -> bool {
@@ -395,10 +351,8 @@ impl Cluster {
             let known = &replica.accepted[..through];
             assert_eq!(tail(known), snapshot.committed);
             assert!(snapshot.applied.op <= snapshot.committed.op);
-            if self.configuration.policy() == QuorumPolicy::Durable {
-                assert!(snapshot.committed.op <= snapshot.journal.durable);
-                assert_eq!(replica.stable.operations.get(..through), Some(known));
-            }
+            assert!(snapshot.committed.op <= snapshot.journal.durable);
+            assert_eq!(replica.stable.operations.get(..through), Some(known));
             assert!(snapshot.journal.durable <= snapshot.journal.written);
             assert!(snapshot.journal.written <= snapshot.accepted.op);
             assert!(snapshot.pending_operations <= PIPELINE);
@@ -463,26 +417,17 @@ impl Cluster {
     }
 
     fn check_surviving_copies(&self) {
-        // The RAM-policy schedules preserve at least one live or persisted copy.
-        // Total volatile loss is outside their fault budget and tested separately
-        // as refusal to restart from unproven state. Oracle memory is never a donor.
+        // Oracle memory is never a donor; only persisted copies count.
         let surviving = self
             .replicas
             .iter()
             .filter(|replica| {
                 replica.stable.operations.get(..self.acknowledged.len())
                     == Some(self.acknowledged.as_slice())
-                    || (self.configuration.policy() == QuorumPolicy::Replicated
-                        && replica.accepted.get(..self.acknowledged.len())
-                            == Some(self.acknowledged.as_slice()))
             })
             .count();
-        let required = match self.configuration.policy() {
-            QuorumPolicy::Replicated => 1,
-            QuorumPolicy::Durable => {
-                2_usize.saturating_sub(self.lost_disks.iter().filter(|loss| loss.is_some()).count())
-            }
-        };
+        let required =
+            2_usize.saturating_sub(self.lost_disks.iter().filter(|loss| loss.is_some()).count());
         assert!(
             surviving >= required,
             "acknowledged history lost its required surviving copies"

@@ -1,14 +1,15 @@
 //! One PEER receive owner: lifecycle fences, admission, and bounded retry turns.
 
-use super::{FollowerRoutes, StartupError, error, failure, fatal};
+use super::{FollowerRoutes, Serving, StartupError, error, failure, fatal};
 use futures::{StreamExt, stream::FuturesUnordered};
 use omq_tokio::{
-    IdentitySocket, Message, MonitorEvent, MonitorStream, ReceiveReceipt, ReceiveSource,
+    IdentitySocket, Message, MonitorEvent, MonitorStream, ReceiveLane, ReceiveReceipt,
 };
 use ozzy_proto::{NodeId, Opcode};
+use ozzy_runtime::transport::Frames;
 use ozzy_runtime::{
     dispatch::Class,
-    frontend::{BufferError, DataPressure, Kind, ReceiveBuffers, ReceiveError, Rejection, Service},
+    frontend::{BufferError, DataPressure, Kind, ReceiveError, Rejection, Service},
 };
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -23,7 +24,8 @@ const TURN_BYTES: usize = 2 * 1024 * 1024;
 
 pub(super) struct Ingress<'a> {
     pub(super) socket: &'a IdentitySocket,
-    shutdown: &'a crate::Shutdown,
+    shutdown: &'a crate::signal::CloseSignal,
+    serving: Serving<'a>,
     pub(super) monitor: MonitorStream,
     connections: Connections,
     pub(super) paused: PausedSources,
@@ -35,11 +37,13 @@ impl<'a> Ingress<'a> {
         socket: &'a IdentitySocket,
         monitor: MonitorStream,
         bulk: bool,
-        shutdown: &'a crate::Shutdown,
+        shutdown: &'a crate::signal::CloseSignal,
+        serving: Serving<'a>,
     ) -> Self {
         Self {
             socket,
             shutdown,
+            serving,
             monitor,
             connections: Connections::new(!bulk),
             paused: PausedSources::default(),
@@ -47,33 +51,31 @@ impl<'a> Ingress<'a> {
         }
     }
 
+    fn follower_routes(&self) -> &'a FollowerRoutes {
+        &self.serving.followers.routes
+    }
+
     pub(super) fn observe(
         &mut self,
         event: MonitorEvent,
         service: &mut Service,
-        followers: &FollowerRoutes,
     ) -> Result<(), StartupError> {
-        self.connections.observe(event, service, followers)
+        self.connections
+            .observe(event, service, self.follower_routes())
     }
 
-    pub(super) fn prepare(
-        &mut self,
-        service: &mut Service,
-        followers: &FollowerRoutes,
-    ) -> Result<bool, StartupError> {
-        self.connections
-            .drain(&mut self.monitor, service, followers)
+    pub(super) fn prepare(&mut self, service: &mut Service) -> Result<bool, StartupError> {
+        let routes = self.follower_routes();
+        self.connections.drain(&mut self.monitor, service, routes)
     }
 
     pub(super) fn receive(
         &mut self,
         service: &mut Service,
-        buffers: &ReceiveBuffers,
-        followers: &FollowerRoutes,
         receipt: ReceiveReceipt,
         body: Message,
     ) -> Result<(), StartupError> {
-        if let Some(pressure) = self.admit(service, buffers, followers, receipt, body)? {
+        if let Some(pressure) = self.admit(service, receipt, body)? {
             self.paused.hold(service, pressure)?;
         }
         Ok(())
@@ -82,8 +84,6 @@ impl<'a> Ingress<'a> {
     fn admit(
         &mut self,
         service: &mut Service,
-        buffers: &ReceiveBuffers,
-        followers: &FollowerRoutes,
         receipt: ReceiveReceipt,
         body: Message,
     ) -> Result<Option<Pressure>, StartupError> {
@@ -97,15 +97,15 @@ impl<'a> Ingress<'a> {
         // Admission contains no await or lifecycle observation: an old body
         // cannot cross client retirement into a reused slot. OMQ fences queued
         // generations and rejects restoration to a retired source.
-        if receipt.source().is_none() || !self.connections.contains(&message) {
+        if receipt.lane().is_none() || !self.connections.contains(&message) {
             return Ok(None);
         }
-        let (message, retained) = match buffers.prepare_borrowed(&message) {
+        let (message, retained) = match self.serving.buffers.prepare_borrowed(&message) {
             Ok(input) => input,
             Err(BufferError::Frames) => return Ok(None),
             Err(error) => return Err(failure(error)),
         };
-        let Some(message) = self.route(service, followers, message)? else {
+        let Some(message) = self.route(service, message)? else {
             return Ok(None);
         };
         match service.receive(message, retained) {
@@ -116,9 +116,12 @@ impl<'a> Ingress<'a> {
                 generation,
             }))) => {
                 let source = receipt
-                    .source()
+                    .lane()
                     .cloned()
                     .ok_or_else(|| error("PEER receive lacks a source"))?;
+                ozzy_runtime::profiling::event(
+                    ozzy_runtime::profiling::Event::DispatcherInputPaused,
+                );
                 match self.socket.unshift(receipt, body) {
                     Ok(()) => Ok(Some(Pressure {
                         lane: (shard, kind, class),
@@ -130,27 +133,31 @@ impl<'a> Ingress<'a> {
                 }
             }
             Err(ReceiveError::Dispatch(Rejection::Data(DataPressure::Closed)))
-                if self.shutdown.is_requested() =>
+                if self.shutdown.is_closed() =>
             {
                 Ok(None)
             }
             Err(error) if fatal(&error) => Err(failure(error)),
-            _ => Ok(None),
+            Err(_) => {
+                ozzy_runtime::profiling::event(
+                    ozzy_runtime::profiling::Event::DispatcherInputDropped,
+                );
+                Ok(None)
+            }
+            Ok(_) => Ok(None),
         }
     }
 
     fn route(
         &self,
         service: &Service,
-        followers: &FollowerRoutes,
         mut message: Message,
     ) -> Result<Option<Message>, StartupError> {
-        if message.len() != 4 {
+        let followers = self.follower_routes();
+        let Some((_, frames)) = message.routed_packet() else {
             // Compact broker progress belongs to control; Service validates it.
             return Ok((!self.bulk).then_some(message));
-        }
-        let frames =
-            std::array::from_fn::<_, 3, _>(|i| message.part_slice(i + 1).expect("four frames"));
+        };
         let Ok(packet) = ozzy_proto::decode_packet(&frames, service.envelope_limits()) else {
             return Ok(None);
         };
@@ -191,13 +198,7 @@ impl<'a> Ingress<'a> {
         Ok(Some(message))
     }
 
-    pub(super) fn retry(
-        &mut self,
-        lane: Lane,
-        service: &mut Service,
-        buffers: &ReceiveBuffers,
-        followers: &FollowerRoutes,
-    ) -> Result<(), StartupError> {
+    pub(super) fn retry(&mut self, lane: Lane, service: &mut Service) -> Result<(), StartupError> {
         self.paused.waiting.remove(&lane);
         let mut sources = self.paused.sources.remove(&lane).unwrap_or_default();
         let mut bytes = 0usize;
@@ -208,13 +209,14 @@ impl<'a> Ingress<'a> {
             let Some(source) = sources.pop_front() else {
                 return Ok(());
             };
-            let (receipt, body) = match self.socket.try_recv_from_source(Some(&source)) {
+            ozzy_runtime::profiling::event(ozzy_runtime::profiling::Event::DispatcherInputRetry);
+            let (receipt, body) = match self.socket.try_recv_with_receipt(Some(&source)) {
                 Ok(received) => received,
                 Err(omq_tokio::Error::Closed | omq_tokio::Error::WouldBlock) => continue,
                 Err(error) => return Err(failure(error)),
             };
             bytes = bytes.saturating_add(body.max_message_size_len());
-            if let Some(pressure) = self.admit(service, buffers, followers, receipt, body)? {
+            if let Some(pressure) = self.admit(service, receipt, body)? {
                 if pressure.lane == lane {
                     sources.push_back(source);
                     self.paused.sources.insert(lane, sources);
@@ -236,12 +238,12 @@ impl<'a> Ingress<'a> {
 struct Pressure {
     lane: Lane,
     generation: u64,
-    source: ReceiveSource,
+    source: ReceiveLane,
 }
 
 #[derive(Default)]
 pub(super) struct PausedSources {
-    sources: BTreeMap<Lane, VecDeque<ReceiveSource>>,
+    sources: BTreeMap<Lane, VecDeque<ReceiveLane>>,
     waiting: BTreeSet<Lane>,
     wakes: FuturesUnordered<LaneWake>,
 }

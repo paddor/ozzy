@@ -1,15 +1,33 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
+
 use std::num::NonZeroU64;
 
 #[path = "operation/borrowed.rs"]
 mod borrowed;
+#[path = "operation/dedup_policy.rs"]
+mod dedup_policy;
+#[path = "operation/group.rs"]
+mod group;
+#[path = "operation/resolved.rs"]
+mod resolved;
 #[path = "operation/validation.rs"]
 mod validation;
+#[path = "operation/watermark.rs"]
+mod watermark;
 
 use ozzy_journal::operation::{
     Append, AppendBatch, AppendRecord, Assign, Barrier, CreatePartition, OpenProducer,
     OperationBody, OperationCodecError, OperationKind, OperationLimits, PartitionPolicy,
-    ProducerResultFloor, Progress, ProgressOwner, RetentionPolicy, Trim, append_operation_body,
-    decode_operation_body, encode_operation_body,
+    ProducerResultFloor, Progress, ProgressAssignment, ProgressOwner, RetentionPolicy, Trim,
+    append_operation_body, decode_operation_body, encode_operation_body,
 };
 use ozzy_proto::{
     ConsumerGroupId, ConsumerMemberId, MessageId, Offset, OperationId, OwnerEpoch, PartitionId,
@@ -21,6 +39,7 @@ const FIXTURES: [&str; 9] = [
         "10101010101010101010101010101010",
         "0000000673747265616d00000005746f706963",
         "000000070000000000000009",
+        "0000000000000000",
         "01030000000000000000ea6000000000000f4240",
     ),
     concat!(
@@ -45,14 +64,18 @@ const FIXTURES: [&str; 9] = [
         "02",
         "50505050505050505050505050505050",
         "10101010101010101010101010101010",
-        "010000000000000007010000000000000027",
+        "020000000000000007",
+        "60606060606060606060606060606060",
+        "010000000000000027",
         "0000000000000029",
         "31313131313131313131313131313131",
     ),
     concat!(
+        "02",
         "50505050505050505050505050505050",
         "10101010101010101010101010101010",
         "00000000000000070000000000000008",
+        "00000000000000090000000000000029",
         "0160606060606060606060606060606060",
         "32323232323232323232323232323232",
     ),
@@ -86,6 +109,7 @@ fn bodies() -> Vec<OperationBody<'static>> {
             topic: "topic",
             partition_id: PartitionId::new(7),
             owner_epoch: OwnerEpoch::new(9),
+            dedup_window_millis: None,
             retention: RetentionPolicy {
                 max_age_millis: NonZeroU64::new(60_000),
                 max_bytes: NonZeroU64::new(1_000_000),
@@ -125,7 +149,10 @@ fn bodies() -> Vec<OperationBody<'static>> {
         OperationBody::Progress(Progress {
             owner: ProgressOwner::ConsumerGroup(ConsumerGroupId::from_bytes([0x50; 16])),
             partition,
-            assignment_epoch: Some(7),
+            assignment: Some(ProgressAssignment {
+                epoch: 7,
+                member: ConsumerMemberId::from_bytes([0x60; 16]),
+            }),
             expected_progress: Some(Offset::new(39)),
             new_progress: Offset::new(41),
             operation_id: OperationId::from_bytes([0x31; 16]),
@@ -135,6 +162,8 @@ fn bodies() -> Vec<OperationBody<'static>> {
             partition,
             expected_assignment_epoch: 7,
             new_assignment_epoch: 8,
+            plan_revision: 9,
+            resume_cursor: Offset::new(41),
             new_member: Some(ConsumerMemberId::from_bytes([0x60; 16])),
             operation_id: OperationId::from_bytes([0x32; 16]),
         }),
@@ -198,6 +227,10 @@ fn every_operation_matches_frozen_bytes_and_round_trips() {
             decode_operation_body(body.kind(), &fixture, OperationLimits::default()).unwrap();
         assert_eq!(decoded.kind(), body.kind());
         assert_eq!(
+            decoded.operation_id().is_some(),
+            body.kind().has_operation_id()
+        );
+        assert_eq!(
             encode_operation_body(&decoded, OperationLimits::default()).unwrap(),
             fixture
         );
@@ -210,6 +243,30 @@ fn every_operation_matches_frozen_bytes_and_round_trips() {
                 body.kind()
             );
         }
+    }
+}
+
+#[test]
+fn assignment_rejects_the_previous_body_format() {
+    let current = unhex(FIXTURES[4]);
+    assert_eq!(current.len(), 98);
+    let mut old = current[1..49].to_vec();
+    old.extend_from_slice(&current[65..]);
+    assert_eq!(
+        decode_operation_body(OperationKind::Assign, &old, OperationLimits::default()),
+        Err(OperationCodecError::UnsupportedAssignmentFormat(0x50))
+    );
+    for tag in [0, 1, 3, u8::MAX] {
+        let mut unsupported = current.clone();
+        unsupported[0] = tag;
+        assert_eq!(
+            decode_operation_body(
+                OperationKind::Assign,
+                &unsupported,
+                OperationLimits::default()
+            ),
+            Err(OperationCodecError::UnsupportedAssignmentFormat(tag))
+        );
     }
 }
 
@@ -264,14 +321,34 @@ fn progress_owner_and_assignment_epoch_must_agree() {
     let progress = OperationBody::Progress(Progress {
         owner: ProgressOwner::Subscription(SubscriptionId::from_bytes([1; 16])),
         partition: PartitionIncarnation::from_bytes([2; 16]),
-        assignment_epoch: Some(1),
+        assignment: Some(ProgressAssignment {
+            epoch: 1,
+            member: ConsumerMemberId::from_bytes([0x60; 16]),
+        }),
         expected_progress: None,
         new_progress: Offset::ZERO,
         operation_id: OperationId::from_bytes([3; 16]),
     });
     assert_eq!(
         encode_operation_body(&progress, OperationLimits::default()),
-        Err(OperationCodecError::UnexpectedAssignmentEpoch)
+        Err(OperationCodecError::UnexpectedProgressAssignment)
+    );
+}
+
+#[test]
+fn group_progress_rejects_the_epoch_only_format_and_missing_assignment() {
+    let mut bytes = unhex(FIXTURES[3]);
+    // Owner tag and ID plus partition ID precede the assignment tag.
+    assert_eq!(bytes[33], 2);
+    bytes[33] = 1;
+    assert_eq!(
+        decode_operation_body(OperationKind::Progress, &bytes, OperationLimits::default()),
+        Err(OperationCodecError::InvalidOptionTag(1))
+    );
+    bytes[33] = 0;
+    assert_eq!(
+        decode_operation_body(OperationKind::Progress, &bytes, OperationLimits::default()),
+        Err(OperationCodecError::MissingProgressAssignment)
     );
 }
 
@@ -284,7 +361,7 @@ fn body_decoder_rejects_trailing_bytes_and_unknown_kinds() {
         Err(OperationCodecError::TrailingBytes(1))
     );
     assert_eq!(
-        OperationKind::try_from(10),
-        Err(OperationCodecError::UnsupportedOperationKind(10))
+        OperationKind::try_from(u16::MAX),
+        Err(OperationCodecError::UnsupportedOperationKind(u16::MAX))
     );
 }

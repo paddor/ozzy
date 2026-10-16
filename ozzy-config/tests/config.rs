@@ -1,8 +1,18 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use ozzy_config::{
-    Affinity, Confirmation, Deployment, DeploymentIdentity, DeploymentMode, HostResources,
-    IoBackend, MemoryPool, PartitionOverride, QueueBudget, Shard,
+    Affinity, Deployment, DeploymentIdentity, DeploymentMode, HostResources, IoBackend, MemoryPool,
+    PartitionOverride, QueueBudget, Shard,
 };
 use uuid::Uuid;
 
@@ -17,7 +27,6 @@ fn single() -> Deployment {
 fn three() -> Deployment {
     let mut config = single();
     config.cluster.mode = DeploymentMode::Three;
-    config.topics.get_mut("orders").unwrap().confirmation = Confirmation::DiskQuorum;
     let broker = config.brokers.remove("laptop").unwrap();
     for name in ["a", "b", "c"] {
         let mut broker = broker.clone();
@@ -322,18 +331,14 @@ fn explicit_ids_are_constraints_and_generation_must_be_unique_nonzero() {
 #[test]
 fn restart_rejects_changed_immutable_metadata_but_not_worker_settings() {
     let original = three().validate().unwrap().initialize(ids()).unwrap();
-    for change in 0..6 {
+    for change in 0..5 {
         let mut config = three();
         match change {
             0 => config.cluster.id = Some(Uuid::from_u128(9999)),
             1 => config.topics.get_mut("orders").unwrap().partitions = 17,
             2 => config.topics.get_mut("orders").unwrap().partitioner_seed = 99,
-            3 => {
-                config.topics.get_mut("orders").unwrap().confirmation =
-                    Confirmation::ReplicatedPersisting;
-            }
-            4 => config.brokers.get_mut("b").unwrap().id = Some(Uuid::from_u128(9999)),
-            5 => config.topics.get_mut("orders").unwrap().id = Some(Uuid::from_u128(9999)),
+            3 => config.brokers.get_mut("b").unwrap().id = Some(Uuid::from_u128(9999)),
+            4 => config.topics.get_mut("orders").unwrap().id = Some(Uuid::from_u128(9999)),
             _ => unreachable!(),
         }
         assert!(
@@ -407,18 +412,17 @@ fn parse_rejects_unknown_fields_including_unsupported_omq_affinity() {
 }
 
 #[test]
-fn membership_and_confirmation_policy_are_explicit() {
+fn membership_must_match_the_cluster_mode() {
     let mut config = single();
     config.cluster.mode = DeploymentMode::Three;
     assert!(config.validate().is_err());
-    for policy in [Confirmation::DiskQuorum, Confirmation::ReplicatedPersisting] {
-        let mut config = single();
-        config.topics.get_mut("orders").unwrap().confirmation = policy;
-        assert!(config.validate().is_err());
-    }
     let mut config = three();
-    config.topics.get_mut("orders").unwrap().confirmation = Confirmation::LocalDurable;
+    config.cluster.mode = DeploymentMode::Single;
     assert!(config.validate().is_err());
+    assert!(
+        Deployment::parse(&format!("{SINGLE}confirmation = \"local-durable\"\n")).is_err(),
+        "topics no longer take a confirmation key"
+    );
 }
 
 #[test]
@@ -585,6 +589,10 @@ fn endpoint_collisions_and_non_connectable_addresses_are_rejected() {
         "ipc://relative",
         "tcp://host:99999",
         "tcp://host: 1",
+        "lz4+tcp://127.0.0.1:0",
+        "zstd+tcp://127.0.0.1:0",
+        "lz4+tcp://*:7100",
+        "zstd+tcp://*:7100",
     ] {
         let mut config = single();
         config.brokers.get_mut("laptop").unwrap().endpoints.peer = endpoint.to_owned();
@@ -593,6 +601,56 @@ fn endpoint_collisions_and_non_connectable_addresses_are_rejected() {
     let mut config = three();
     let peer = config.brokers["a"].endpoints.peer.clone();
     config.brokers.get_mut("b").unwrap().endpoints.peer = peer;
+    assert!(config.validate().is_err());
+}
+
+#[test]
+fn compressed_endpoints_validate_like_tcp_and_cannot_mix_with_plain_transports() {
+    for scheme in ["lz4+tcp", "zstd+tcp"] {
+        let mut config = three();
+        for (index, broker) in config.brokers.values_mut().enumerate() {
+            let endpoints = &mut broker.endpoints;
+            let port = 7200 + 10 * index;
+            endpoints.peer = format!("{scheme}://127.0.0.1:{port}");
+            endpoints.data_peer = format!("{scheme}://127.0.0.1:{}", port + 1);
+            endpoints.reader_pub = format!("{scheme}://127.0.0.1:{}", port + 2);
+            endpoints.follower_pub = Some(format!("{scheme}://127.0.0.1:{}", port + 3));
+        }
+        let mut mixed = config.clone();
+        let mut admin = config.clone();
+        config.validate().unwrap();
+        admin.brokers.get_mut("a").unwrap().endpoints.admin = Some("ipc://@ozzy-admin-a".into());
+        admin.validate().unwrap();
+        let endpoints = &mut mixed.brokers.get_mut("a").unwrap().endpoints;
+        endpoints.reader_pub = endpoints
+            .reader_pub
+            .replacen(&format!("{scheme}://"), "tcp://", 1);
+        assert!(mixed.validate().is_err());
+    }
+}
+
+#[test]
+fn admin_endpoints_are_local_and_unique() {
+    for (endpoint, valid) in [
+        ("ipc://@ozzy-admin", true),
+        ("ipc:///run/ozzy/admin.sock", true),
+        ("inproc://ozzy-admin", true),
+        ("tcp://127.0.0.1:7900", false),
+        ("lz4+tcp://127.0.0.1:7900", false),
+        ("ipc://@", false),
+    ] {
+        let mut config = single();
+        config.brokers.get_mut("laptop").unwrap().endpoints.admin = Some(endpoint.to_owned());
+        assert_eq!(config.validate().is_ok(), valid, "{endpoint}");
+    }
+    let mut config = three();
+    for name in ["a", "b"] {
+        config.brokers.get_mut(name).unwrap().endpoints.admin = Some("ipc://@ozzy-admin".into());
+    }
+    assert!(config.validate().is_err());
+    let mut config = single();
+    let broker = config.brokers.get_mut("laptop").unwrap();
+    broker.endpoints.admin = Some(broker.endpoints.peer.clone());
     assert!(config.validate().is_err());
 }
 

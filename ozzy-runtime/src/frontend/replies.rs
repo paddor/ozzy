@@ -1,9 +1,9 @@
-use std::ops::Bound::{Excluded, Unbounded};
+use crate::transport::Frames;
 
 use omq_tokio::{Message, TrySendError};
 use ozzy_proto::{EnvelopeLimits, NodeId, Opcode, decode_packet};
 
-use super::{Dispatcher, SetupError};
+use super::{Dispatcher, SetupError, dispatch::Peer};
 use crate::dispatch::Class;
 use crate::replica_transport::{QueueLimits, SendAttempt};
 
@@ -51,113 +51,90 @@ impl Dispatcher {
         class: Class,
         message: Message,
     ) -> Result<(), (ReplyError, Message)> {
-        match self.reply_target(class, &message) {
-            Ok((peer, bytes)) => {
-                if message.len() == 4 {
-                    let frames =
-                        std::array::from_fn::<_, 3, _>(|i| message.part_slice(i + 1).unwrap());
-                    let limits = self.routes.limits;
-                    if let Ok(packet) = decode_packet(&frames, limits)
-                        && packet.envelope.opcode == Opcode::ReplicaState
-                    {
-                        let Ok(state) = ozzy_replication::wire::flow_state_route(packet, limits)
-                        else {
-                            return Err((ReplyError::Frames, message));
-                        };
-                        if !self
-                            .routes
-                            .partitions
-                            .contains_key(&state.report.channel.scope.group_id)
-                            || !self
-                                .peers
-                                .get_mut(&peer)
-                                .expect("bound peer")
-                                .outgoing_channels
-                                .bind(state)
-                        {
-                            return Err((ReplyError::Session, message));
-                        }
-                    }
+        let (peer, bytes) = match self.reply_target(class, &message) {
+            Ok(target) => target,
+            Err(error) => return Err((error, message)),
+        };
+        let Some(peer) = self.peers.get_mut(&peer) else {
+            return Err((ReplyError::Peer, message));
+        };
+        if let Some((_, frames)) = message.routed_packet() {
+            let limits = self.routes.limits;
+            if let Ok(packet) = decode_packet(&frames, limits)
+                && packet.envelope.opcode == Opcode::ReplicaState
+            {
+                let Ok(state) = ozzy_replication::wire::flow_state_route(packet, limits) else {
+                    return Err((ReplyError::Frames, message));
+                };
+                if !self
+                    .routes
+                    .partitions
+                    .contains_key(&state.report.channel.scope.group_id)
+                    || !peer.outgoing_channels.bind(state)
+                {
+                    return Err((ReplyError::Session, message));
                 }
-                let queue =
-                    &mut self.peers.get_mut(&peer).expect("validated peer").replies[index(class)];
-                if class == Class::Control && queue.contains(&message, 0) {
-                    return Ok(());
-                }
-                queue.messages.push_back((message, bytes));
-                queue.bytes += bytes;
-                Ok(())
             }
-            Err(error) => Err((error, message)),
         }
+        let queue = &mut peer.replies[index(class)];
+        if class == Class::Control && queue.contains(&message, 0) {
+            return Ok(());
+        }
+        queue.messages.push_back((message, bytes));
+        queue.bytes += bytes;
+        Ok(())
     }
 
     fn reply_target(&self, class: Class, message: &Message) -> Result<(NodeId, usize), ReplyError> {
         if message.len() != 4 && message.len() != 2 {
             return Err(ReplyError::Frames);
         }
-        let to = NodeId::from_bytes(
-            message
-                .part_slice(0)
-                .and_then(|part| part.try_into().ok())
-                .ok_or(ReplyError::Peer)?,
-        );
+        let to = super::service::route_peer(message).ok_or(ReplyError::Peer)?;
         let peer = self.peers.get(&to).ok_or(ReplyError::Peer)?;
         let queue = &peer.replies[index(class)];
         let bytes = message.byte_len();
         if bytes > queue.limits.message_bytes {
             return Err(ReplyError::Size);
         }
-        let limits = EnvelopeLimits {
-            max_metadata_bytes: queue.limits.message_bytes,
-            max_payload_bytes: queue.limits.message_bytes,
-        };
         if message.len() == 2 {
-            let compact = ozzy_replication::wire::CompactState::decode(
-                message.part_slice(1).unwrap_or_default(),
-            )
-            .map_err(|_| ReplyError::Frames)?;
-            if peer.binding.kind != super::Kind::Broker
-                || class != Class::Control
-                || peer.outgoing_channels.channel(compact.handle).is_none()
-            {
-                return Err(ReplyError::Session);
-            }
-            if queue.messages.len() == queue.limits.messages
-                || bytes > queue.limits.bytes - queue.bytes
-            {
+            check_compact(peer, class, message)?;
+            if queue.lacks_room(bytes) {
+                crate::profiling::event(crate::profiling::Event::DispatcherBrokerFull);
                 return Err(ReplyError::Full);
             }
             return Ok((to, bytes));
         }
-        let frames =
-            std::array::from_fn::<_, 3, _>(|i| message.part_slice(i + 1).expect("four frames"));
+        self.check_packet(peer, class, message)?;
+        if queue.lacks_room(bytes) && !(class == Class::Control && queue.contains(message, 0)) {
+            crate::profiling::event(if peer.binding.kind == super::Kind::Broker {
+                crate::profiling::Event::DispatcherBrokerFull
+            } else {
+                crate::profiling::Event::DispatcherReplyFull
+            });
+            return Err(ReplyError::Full);
+        }
+        Ok((to, bytes))
+    }
+
+    /// A routed reply comes from this broker in the peer's current session,
+    /// and its opcode fits the chosen class.
+    fn check_packet(&self, peer: &Peer, class: Class, message: &Message) -> Result<(), ReplyError> {
+        let message_bytes = peer.replies[index(class)].limits.message_bytes;
+        let limits = EnvelopeLimits {
+            max_metadata_bytes: message_bytes,
+            max_payload_bytes: message_bytes,
+        };
+        let (_, frames) = message.routed_packet().ok_or(ReplyError::Frames)?;
         let packet = decode_packet(&frames, limits).map_err(|_| ReplyError::Frames)?;
         if packet.envelope.sender != self.local
             || packet.envelope.session != Some(peer.binding.session)
         {
             return Err(ReplyError::Session);
         }
-        let data = matches!(
-            packet.envelope.opcode,
-            Opcode::PrepareFlow | Opcode::Ops | Opcode::SnapshotChunk | Opcode::Records
-        );
-        if data != (class == Class::Data)
-            || (!data && !packet.payload.is_empty())
-            || matches!(
-                packet.envelope.opcode,
-                Opcode::Prepare | Opcode::Append | Opcode::Subscribe | Opcode::Unsubscribe
-            )
-        {
+        if !class_allows(class, &packet) {
             return Err(ReplyError::Class);
         }
-        if (queue.messages.len() == queue.limits.messages
-            || bytes > queue.limits.bytes - queue.bytes)
-            && !(class == Class::Control && queue.contains(message, 0))
-        {
-            return Err(ReplyError::Full);
-        }
-        Ok((to, bytes))
+        Ok(())
     }
 
     /// Attempt one peer's control and data independently, then advance to the
@@ -169,21 +146,20 @@ impl Dispatcher {
         &mut self,
         mut try_send: impl FnMut(Message) -> Result<(), TrySendError>,
     ) -> Result<ReplyProgress, omq_tokio::Error> {
-        let next = self
-            .replied
-            .and_then(|last| self.peers.range((Excluded(last), Unbounded)).next())
-            .or_else(|| self.peers.first_key_value())
-            .map(|(node, _)| *node);
+        let next = crate::turn::after_mut(&mut self.peers, self.replied);
         let mut progress = ReplyProgress {
-            peer: next,
+            peer: next.as_ref().map(|&(id, _)| id),
             control: SendAttempt::Idle,
             data: SendAttempt::Idle,
         };
-        if let Some(next) = next {
+        if let Some((next, peer)) = next {
             self.replied = Some(next);
-            let peer = self.peers.get_mut(&next).expect("selected peer");
             for class in [peer.next_reply_class, 1 - peer.next_reply_class] {
-                let attempt = peer.replies[class].flush(&mut try_send)?;
+                let attempt = if peer.blocked[class] {
+                    SendAttempt::Idle
+                } else {
+                    flush_class(peer, class, &mut try_send)?
+                };
                 if class == 0 {
                     progress.control = attempt;
                 } else {
@@ -195,6 +171,46 @@ impl Dispatcher {
             }
         }
         Ok(progress)
+    }
+
+    /// Front frames of classes OMQ refused, for registering send-progress
+    /// waits. Retrying them before that progress only spends the dispatcher's
+    /// core.
+    pub(super) fn blocked(&self) -> impl Iterator<Item = (NodeId, usize, &Message)> {
+        self.peers.iter().flat_map(|(&node, peer)| {
+            (0..2).filter_map(move |class| {
+                peer.blocked[class]
+                    .then(|| peer.replies[class].messages.front())
+                    .flatten()
+                    .map(|(message, _)| (node, class, message))
+            })
+        })
+    }
+
+    pub(super) fn is_blocked(&self, peer: NodeId, class: usize) -> bool {
+        self.peers
+            .get(&peer)
+            .is_some_and(|peer| peer.blocked[class])
+    }
+
+    /// Make a refused class eligible for flushing again.
+    pub(super) fn unblock(&mut self, peer: NodeId, class: usize) {
+        if let Some(peer) = self.peers.get_mut(&peer) {
+            peer.blocked[class] = false;
+        }
+    }
+
+    /// Attempt one class of one peer, outside the round-robin rotation.
+    pub(super) fn flush_peer_class(
+        &mut self,
+        peer: NodeId,
+        class: usize,
+        mut try_send: impl FnMut(Message) -> Result<(), TrySendError>,
+    ) -> Result<SendAttempt, omq_tokio::Error> {
+        match self.peers.get_mut(&peer) {
+            Some(peer) => flush_class(peer, class, &mut try_send),
+            None => Ok(SendAttempt::Idle),
+        }
     }
 
     /// Whether bounded outgoing PEER queues contain unsent messages.
@@ -209,6 +225,66 @@ impl Dispatcher {
         let queue = &self.peers.get(&peer)?.replies[index(class)];
         Some((queue.messages.len(), queue.bytes))
     }
+}
+
+/// Compact flow state goes only to a broker over control, on a bound channel.
+fn check_compact(peer: &Peer, class: Class, message: &Message) -> Result<(), ReplyError> {
+    let [_, state] = message.frames().ok_or(ReplyError::Frames)?;
+    let compact =
+        ozzy_replication::wire::CompactState::decode(state).map_err(|_| ReplyError::Frames)?;
+    if peer.binding.kind != super::Kind::Broker
+        || class != Class::Control
+        || peer.outgoing_channels.channel(compact.handle).is_none()
+    {
+        return Err(ReplyError::Session);
+    }
+    Ok(())
+}
+
+/// Data carries transfer and delivery opcodes; control carries the rest
+/// without payload. Client requests never travel as replies.
+fn class_allows(class: Class, packet: &ozzy_proto::Packet<'_>) -> bool {
+    let data = matches!(
+        packet.envelope.opcode,
+        Opcode::PrepareFlow | Opcode::Ops | Opcode::SnapshotChunk | Opcode::Records
+    );
+    data == (class == Class::Data)
+        && (data || packet.payload.is_empty())
+        && !matches!(
+            packet.envelope.opcode,
+            Opcode::Prepare
+                | Opcode::Append
+                | Opcode::Subscribe
+                | Opcode::Unsubscribe
+                | Opcode::ProgressCommit
+                | Opcode::GroupJoin
+                | Opcode::GroupAssign
+                | Opcode::GroupInspect
+                | Opcode::GroupDelete
+        )
+}
+
+fn flush_class(
+    peer: &mut super::dispatch::Peer,
+    class: usize,
+    try_send: &mut impl FnMut(Message) -> Result<(), TrySendError>,
+) -> Result<SendAttempt, omq_tokio::Error> {
+    let attempt = peer.replies[class].flush(try_send)?;
+    match attempt {
+        SendAttempt::Submitted => {
+            crate::profiling::event(crate::profiling::Event::DispatcherReplySent);
+        }
+        SendAttempt::Blocked => {
+            peer.blocked[class] = true;
+            crate::profiling::event(if peer.binding.kind == super::Kind::Broker {
+                crate::profiling::Event::DispatcherBrokerBlocked
+            } else {
+                crate::profiling::Event::DispatcherReplyBlocked
+            });
+        }
+        SendAttempt::Idle | SendAttempt::Unroutable => {}
+    }
+    Ok(attempt)
 }
 
 const fn index(class: Class) -> usize {

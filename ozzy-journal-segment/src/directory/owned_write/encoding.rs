@@ -1,7 +1,12 @@
 //! Owned body preparation; no file handle or mutable journal crosses the worker boundary.
 
 use super::{CanonicalOperation, DirectoryError, PreencodedJournalGroup};
+use crate::codec::PackedOperation;
+use crate::directory::{OperationEnvelope, validate_operation, validate_operation_metadata};
 use crate::{BodyEncoding, DecodeLimits, OperationLimits};
+use ozzy_journal::operation::{
+    Digest, canonical_body_digest, validate_operation_body_with_validated_payload,
+};
 
 /// Reusable compressor state owned by one CPU worker.
 #[derive(Debug, Default)]
@@ -60,14 +65,96 @@ impl JournalGroupEncoding {
         self
     }
 
-    fn body_check(&self) -> super::BodyCheck {
+    fn body_check(&self) -> BodyCheck {
         if self.validated == Some(self.operations) {
-            super::BodyCheck::Metadata
+            BodyCheck::Metadata
         } else if self.validated_payloads {
-            super::BodyCheck::Descriptors
+            BodyCheck::Descriptors
         } else {
-            super::BodyCheck::Full
+            BodyCheck::Full
         }
+    }
+
+    /// Validate one operation as far as `body` requires.
+    fn check(
+        &self,
+        envelope: OperationEnvelope<'_>,
+        body: BodyCheck,
+    ) -> Result<(), DirectoryError> {
+        match body {
+            BodyCheck::Full => {
+                validate_operation(
+                    envelope,
+                    self.operations,
+                    self.configuration_epoch,
+                    self.promised_view,
+                )?;
+            }
+            BodyCheck::Descriptors => {
+                validate_operation_body_with_validated_payload(
+                    envelope.kind,
+                    envelope.body,
+                    self.operations,
+                )?;
+                validate_operation_metadata(
+                    envelope,
+                    self.configuration_epoch,
+                    self.promised_view,
+                )?;
+            }
+            BodyCheck::Metadata => {
+                validate_operation_metadata(
+                    envelope,
+                    self.configuration_epoch,
+                    self.promised_view,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate each operation under this job's limits and authority, then
+    /// describe its header, body size, and body digest.
+    fn describe<'a>(
+        &self,
+        operations: impl ExactSizeIterator<Item = (CanonicalOperation<'a>, Option<Digest>)>,
+    ) -> Result<Vec<PackedOperation>, DirectoryError> {
+        if operations.len() == 0 {
+            return Err(crate::CodecError::EmptyGroup.into());
+        }
+        require_limit("group entries", operations.len(), self.decode.max_entries)?;
+        let body_check = self.body_check();
+        let mut body_bytes = 0usize;
+        let mut descriptors = Vec::with_capacity(operations.len());
+        for (operation, body_digest) in operations {
+            let envelope = OperationEnvelope {
+                kind: operation.kind,
+                body: operation.body,
+                op_number: operation.op_number,
+                configuration_epoch: operation.configuration_epoch,
+                original_view: operation.original_view,
+            };
+            self.check(envelope, body_check)?;
+            body_bytes = body_bytes
+                .checked_add(operation.body.len())
+                .ok_or(crate::CodecError::LengthOverflow)?;
+            require_limit(
+                "decoded operation bytes",
+                operation.body.len(),
+                self.decode.max_decoded_body_bytes,
+            )?;
+            require_limit(
+                "decoded group bytes",
+                body_bytes,
+                self.decode.max_group_decoded_body_bytes,
+            )?;
+            descriptors.push(PackedOperation {
+                header: operation.header(),
+                body_bytes: operation.body.len(),
+                body_digest: body_digest.unwrap_or_else(|| canonical_body_digest(operation.body)),
+            });
+        }
+        Ok(descriptors)
     }
 
     /// Keep canonical raw bodies shared; allocate only headers and group framing.
@@ -75,15 +162,10 @@ impl JournalGroupEncoding {
         self,
         operations: Vec<super::SharedJournalOperation>,
     ) -> Result<PreencodedJournalGroup, DirectoryError> {
-        let descriptors = super::describe_operations(
+        let descriptors = self.describe(
             operations
                 .iter()
                 .map(|op| (op.canonical(), Some(op.body_digest))),
-            self.decode,
-            self.operations,
-            self.body_check(),
-            self.configuration_epoch,
-            self.promised_view,
         )?;
         let bodies = crate::codec::prepare_raw_group_extents(
             operations.iter().map(|op| op.body.as_ref()),
@@ -138,14 +220,7 @@ impl JournalGroupEncoding {
         > + Clone,
         encoding: BodyEncoding,
     ) -> Result<PreencodedJournalGroup, DirectoryError> {
-        let descriptors = super::describe_operations(
-            operations.clone(),
-            self.decode,
-            self.operations,
-            self.body_check(),
-            self.configuration_epoch,
-            self.promised_view,
-        )?;
+        let descriptors = self.describe(operations.clone())?;
         let bodies = crate::codec::prepare_shared_group_bodies(
             operations.map(|(operation, _)| operation.body),
             encoding,
@@ -157,5 +232,30 @@ impl JournalGroupEncoding {
             bodies,
             shared: Vec::new(),
         })
+    }
+}
+
+/// How much of each body encoding walks again before describing it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BodyCheck {
+    /// Walk the whole body, including any whole-payload LZ4 block.
+    Full,
+    /// Walk descriptors and limits; the caller validated or produced each
+    /// body's LZ4 block.
+    Descriptors,
+    /// The caller decoded every body with the journal's limits.
+    Metadata,
+}
+
+fn require_limit(kind: &'static str, actual: usize, limit: usize) -> Result<(), DirectoryError> {
+    if actual > limit {
+        Err(crate::CodecError::LimitExceeded {
+            kind,
+            actual,
+            limit,
+        }
+        .into())
+    } else {
+        Ok(())
     }
 }

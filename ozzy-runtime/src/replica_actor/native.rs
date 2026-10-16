@@ -4,75 +4,34 @@ use std::{pin::Pin, task::Context};
 
 use omq_tokio::{Message, TrySendError};
 use ozzy_proto::{
-    Envelope, GroupId, NodeId, Opcode, Packet, PartitionIncarnation, append,
+    Envelope, GroupId, NodeId, Opcode, Packet, append,
     data::DataLimits,
-    decode_packet, handshake,
-    nack::{self, AuthorityHint, RetryClass},
+    handshake,
+    nack::{AuthorityHint, RetryClass},
     producer,
 };
 
 use super::{PendingProposal, ProposalOutcome, ProposalSubmitError, ProposalSubmitter};
 use crate::{
-    frontend::{Kind, Link},
+    frontend::Link,
     replica_journal::{JournalError, ProposalBuffer},
 };
 
 mod access;
 mod completion;
+mod config;
+mod control;
+mod error;
+mod progress;
 pub use access::NativeAccess;
 use access::Writers;
+use completion::Visit;
+pub use config::NativeIntakeConfig;
+use config::validate;
+pub use error::NativeIntakeError;
 
-/// Fixed per-partition resources. The broker link and its HELLO are shared;
-/// journal proposals and logical writer authorization stay on this shard.
-#[derive(Clone, Debug)]
-pub struct NativeIntakeConfig {
-    /// Broker process identity.
-    pub local: NodeId,
-    /// Immutable partition group.
-    pub group: GroupId,
-    /// Immutable partition incarnation.
-    pub partition: PartitionIncarnation,
-    /// Exact configured confirmation boundary.
-    pub policy: append::Policy,
-    /// Trusted physical clients or explicitly provisioned logical writers.
-    pub access: NativeAccess,
-    /// Full validation limits, independently bounded by journal arenas.
-    pub limits: DataLimits,
-    /// Outstanding APPENDs per writer. Each also reserves one separate open slot.
-    pub requests_per_writer: usize,
-    /// Slots polled per turn, including blocked destinations.
-    pub turn_slots: usize,
-}
-
-impl NativeIntakeConfig {
-    /// Exact arena profile for a startup slot. APPEND slots cover the complete
-    /// canonical request. Writer-open slots need at most 65 bytes; independent
-    /// rejection slots never prepare a body. Narrow allocation limits prevent
-    /// a small control request from retaining a large cached APPEND allocation.
-    pub fn buffer_limits(&self, index: usize) -> Option<ozzy_replication::PipelineLimits> {
-        let count = self.access.required_buffers(self.requests_per_writer)?;
-        let stride = self.requests_per_writer.checked_add(1)?;
-        if self.requests_per_writer == 0 || index >= count {
-            return None;
-        }
-        let writer_slots = self.access.writer_count().checked_mul(stride)?;
-        let max_body_bytes = if index >= writer_slots {
-            1
-        } else if index.is_multiple_of(stride) {
-            65
-        } else {
-            crate::replicated::ClientConfig {
-                peers: Vec::new(),
-                limits: self.limits,
-            }
-            .prepared_canonical_body_bytes()?
-        };
-        Some(ozzy_replication::PipelineLimits {
-            max_operations: 1,
-            max_body_bytes,
-        })
-    }
-}
+/// Joined progress updates tracked inline per batch.
+const PROGRESS_BATCH: usize = 16;
 
 /// Request disposition. None of these establish confirmation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,8 +55,11 @@ struct Request {
 enum Command {
     Open,
     Append(append::stream::Confirmed),
+    Progress,
+    Assign,
 }
 
+#[derive(Clone, Copy)]
 enum PrepareFailure {
     Busy,
     Reject(u16, RetryClass),
@@ -122,6 +84,7 @@ fn prepare_failure(error: &JournalError) -> PrepareFailure {
 struct Pending {
     request: Request,
     proposal: Pin<Box<PendingProposal>>,
+    started: Option<std::time::Instant>,
 }
 
 #[derive(Debug)]
@@ -137,6 +100,25 @@ struct Slot {
     buffer: Option<ProposalBuffer>,
     pending: Option<Pending>,
     reply: Option<Reply>,
+    /// A prepared progress update held for, or riding in, this partition's
+    /// progress proposal.
+    batch: Option<Batched>,
+}
+
+/// One progress update outside its own proposal.
+#[derive(Debug)]
+struct Batched {
+    request: Request,
+    started: Option<std::time::Instant>,
+    state: BatchState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchState {
+    /// Waits for the proposal in flight; `solo` updates go in their own.
+    Held { solo: bool },
+    /// Joined the carrier slot's proposal as its `index`th extra update.
+    Riding { carrier: usize, index: usize },
 }
 
 /// One partition's external client adapter. It owns no socket, journal state,
@@ -150,14 +132,29 @@ pub struct NativeIntake {
     metadata: Vec<u8>,
     next: usize,
     remaining: usize,
-    /// Slots that own a proposal or a reply.
+    /// Slots that own a proposal, a reply, or a batched progress update.
     busy: usize,
+    /// One bit per slot that owns a proposal or a reply: the slots a poll
+    /// visits. Idle slots are skipped a word at a time.
+    active: Vec<u64>,
+    /// Slot whose progress proposal is in flight. Updates received meanwhile
+    /// wait and then share the next one.
+    progress_flight: Option<usize>,
+    /// Updates held for the next progress proposal.
+    progress_held: usize,
+    /// Updates riding in the progress proposal in flight.
+    progress_riders: usize,
+    /// First slot of the progress updates, after every writer's slots.
+    progress_start: usize,
+    /// Progress proposals submitted, for tests.
+    #[cfg(test)]
+    progress_proposals: usize,
     writers: Writers,
 }
 
 impl NativeIntake {
     /// Leases come from this partition actor before shared scheduling starts.
-    /// Requires exactly `config.access.required_buffers(requests_per_writer)`
+    /// Requires exactly `config.required_buffers()`
     /// nonempty-capacity, empty arenas. Dynamic clients have independent
     /// rejection slots. The caller backs ingress with shard/lane reservations.
     pub fn new(
@@ -166,6 +163,11 @@ impl NativeIntake {
         buffers: Vec<ProposalBuffer>,
     ) -> Result<Self, NativeIntakeError> {
         validate(&config, &buffers)?;
+        let active = vec![0; buffers.len().div_ceil(64)];
+        let progress_start = config
+            .access
+            .required_buffers(config.requests_per_writer)
+            .ok_or(NativeIntakeError::Configuration)?;
         Ok(Self {
             writers: Writers::new(config.access.clone()),
             config,
@@ -176,12 +178,20 @@ impl NativeIntake {
                     buffer: Some(buffer),
                     pending: None,
                     reply: None,
+                    batch: None,
                 })
                 .collect(),
             metadata: Vec::with_capacity(256),
             next: 0,
             remaining: 0,
             busy: 0,
+            active,
+            progress_flight: None,
+            progress_held: 0,
+            progress_riders: 0,
+            progress_start,
+            #[cfg(test)]
+            progress_proposals: 0,
         })
     }
 
@@ -197,12 +207,18 @@ impl NativeIntake {
         let Some((peer, packet)) = self.packet(message, link) else {
             return Ok(NativeReceive::Ignored);
         };
+        if packet.envelope.opcode == Opcode::ProgressCommit {
+            return self.receive_progress(packet, link, hint);
+        }
+        if packet.envelope.opcode == Opcode::GroupAssign {
+            return self.receive_assign(packet, link, hint);
+        }
         let request = Request {
             envelope: packet.envelope,
             send: link.send,
             command: Command::Open,
         };
-        if link.send.envelope.max_metadata_bytes < 106 {
+        if link.send.envelope.max_metadata_bytes < 107 {
             return Ok(NativeReceive::Ignored);
         }
         let selected = self.select_writer(packet, link, hint);
@@ -218,59 +234,35 @@ impl NativeIntake {
                 if !self.slot_free(slot) {
                     return Ok(NativeReceive::Busy);
                 }
-                let (code, retry) = match result {
-                    Err(rejection) => rejection,
-                    Ok(None) => (10, RetryClass::AfterBackoff),
-                    Ok(Some(_)) => unreachable!(),
-                };
-                self.reject(slot, request, code, retry, hint)?;
+                // A selected writer was taken above; only refusals reach here.
+                let (code, retry) = result.err().unwrap_or((10, RetryClass::AfterBackoff));
+                self.reject(slot, request, (code, retry), hint)?;
                 self.remaining = self.slots.len();
                 return Ok(NativeReceive::Accepted);
             }
         };
         let Some(slot) = self.free_slot(writer, packet.envelope.opcode) else {
+            crate::profiling::event(crate::profiling::Event::NativeSlotRefusal);
             return Ok(NativeReceive::Busy);
         };
         // New input may target an already visited slot. Complete a fresh bounded
         // scan so its completion receiver is polled before the scheduler sleeps.
         self.remaining = self.slots.len();
-        let prepared = self.prepare(slot, writer, packet, link, hint);
+        let prepared = self.prepare(slot, packet, link, hint);
         match prepared {
             Ok(command) => {
                 let request = Request { command, ..request };
-                let buffer = self.slots[slot].buffer.take().expect("free arena");
-                match self.submitter.try_submit(buffer) {
-                    Ok(proposal) => {
-                        self.busy += 1;
-                        self.slots[slot].pending = Some(Pending {
-                            request,
-                            proposal: Box::pin(proposal),
-                        });
-                    }
-                    Err(mut rejected) => {
-                        crate::profiling::event(crate::profiling::Event::NativeProposalRefusal);
-                        let full = rejected.reason == ProposalSubmitError::Full;
-                        rejected.buffer.clear();
-                        self.slots[slot].buffer = Some(rejected.buffer);
-                        if full {
-                            // Keep the unchanged request on the shard. A later
-                            // actor turn releases proposal capacity and retries it.
-                            return Ok(NativeReceive::Busy);
-                        }
-                        self.reject(slot, request, 10, RetryClass::AfterBackoff, hint)?;
-                    }
-                }
+                return self.submit_prepared(slot, request, hint);
             }
             Err(PrepareFailure::Busy) => {
-                self.slots[slot]
-                    .buffer
-                    .as_mut()
-                    .expect("free arena")
-                    .clear();
+                crate::profiling::event(crate::profiling::Event::NativeArenaRefusal);
+                if let Some(buffer) = self.slots[slot].buffer.as_mut() {
+                    buffer.clear();
+                }
                 return Ok(NativeReceive::Busy);
             }
             Err(PrepareFailure::Reject(code, retry)) => {
-                self.reject(slot, request, code, retry, hint)?;
+                self.reject(slot, request, (code, retry), hint)?;
             }
         }
         Ok(NativeReceive::Accepted)
@@ -298,35 +290,24 @@ impl NativeIntake {
             send: link.send,
             command: Command::Open,
         };
-        self.reject(slot, request, 10, RetryClass::AfterBackoff, hint)?;
+        self.reject(slot, request, (10, RetryClass::AfterBackoff), hint)?;
         self.remaining = self.slots.len();
         Ok(NativeReceive::Accepted)
     }
 
     fn packet<'a>(&mut self, message: &'a Message, link: Link) -> Option<(usize, Packet<'a>)> {
-        if link.binding.kind != Kind::Client
-            || link.binding.peer == self.config.local
-            || link.binding.peer.as_bytes() == &[0; 16]
-            || message.len() != 4
-            || message.part_slice(0) != Some(link.binding.peer.as_bytes().as_slice())
-        {
-            return None;
-        }
-        let frames = std::array::from_fn::<_, 3, _>(|index| {
-            message.part_slice(index + 1).expect("checked frames")
-        });
-        let packet = decode_packet(&frames, self.config.limits.envelope).ok()?;
-        if packet.envelope.sender != link.binding.peer
-            || packet.envelope.session != Some(link.binding.session)
-            || packet.envelope.response
-            || packet.envelope.request_id.is_none()
-            || !matches!(
-                packet.envelope.opcode,
-                Opcode::OpenProducer | Opcode::Append
-            )
-        {
-            return None;
-        }
+        let packet = super::response::client_packet(
+            message,
+            link,
+            self.config.local,
+            self.config.limits.envelope,
+            &[
+                Opcode::OpenProducer,
+                Opcode::Append,
+                Opcode::ProgressCommit,
+                Opcode::GroupAssign,
+            ],
+        )?;
         let peer = self.writers.peer(link.binding.peer)?;
         Some((peer, packet))
     }
@@ -335,6 +316,7 @@ impl NativeIntake {
         self.slots[index].buffer.is_some()
             && self.slots[index].pending.is_none()
             && self.slots[index].reply.is_none()
+            && self.slots[index].batch.is_none()
     }
 
     fn select_writer(
@@ -358,10 +340,7 @@ impl NativeIntake {
         if partition != self.config.partition || writer.as_bytes() == &[0; 16] {
             return Err((3, RetryClass::Permanent));
         }
-        if authority.group_id != self.config.group
-            || authority != hint.authority
-            || hint.primary != self.config.local
-        {
+        if !super::response::leads(self.config.group, self.config.local, authority, hint) {
             return Err((5, RetryClass::AfterAuthorityRefresh));
         }
         if packet.envelope.opcode == Opcode::OpenProducer {
@@ -392,17 +371,21 @@ impl NativeIntake {
         range.into_iter().find(|&index| self.slot_free(index))
     }
 
+    /// Copy a request into the arena of `slot`, one of its writer's slots.
     fn prepare(
         &mut self,
         slot: usize,
-        peer: usize,
         packet: Packet<'_>,
         link: Link,
         hint: AuthorityHint,
     ) -> Result<Command, PrepareFailure> {
-        let buffer = self.slots[slot].buffer.as_mut().expect("free arena");
+        let buffer = self.slots[slot]
+            .buffer
+            .as_mut()
+            .ok_or(PrepareFailure::Busy)?;
         buffer.clear();
-        let authorized = self.writers.producer(peer).expect("assigned writer");
+        let writer = slot / (self.config.requests_per_writer + 1);
+        let authorized = self.writers.producer(writer).ok_or(PrepareFailure::Busy)?;
         if hint.authority.group_id != self.config.group || hint.primary != self.config.local {
             return Err((5, RetryClass::AfterAuthorityRefresh).into());
         }
@@ -448,6 +431,7 @@ impl NativeIntake {
                 key: append.key,
                 end_sequence,
                 first_offset: 0,
+                disposition: append::AppendDisposition::Stored,
                 policy: append.policy,
             };
             buffer
@@ -468,7 +452,7 @@ impl NativeIntake {
         mut current: impl FnMut(NodeId) -> Option<Link>,
         mut try_send: impl FnMut(&mut Context<'_>, Message) -> Result<(), TrySendError>,
     ) -> Result<bool, NativeIntakeError> {
-        let mut changed = false;
+        let mut changed = self.dispatch_progress(hint, &mut current)?;
         if self.remaining == 0 {
             self.remaining = self.slots.len();
         }
@@ -477,16 +461,28 @@ impl NativeIntake {
         }
         // Only slots with a proposal or reply count against the turn bound.
         // A scan that finds no work ends in this call and asks for no turn.
+        let len = self.slots.len();
         let mut turn = self.config.turn_slots;
         while turn > 0 && self.remaining > 0 {
             let index = self.next;
-            self.next = (index + 1) % self.slots.len();
-            self.remaining -= 1;
-            if self.slots[index].pending.is_none() && self.slots[index].reply.is_none() {
+            let offset = index % 64;
+            let idle = ((self.active[index / 64] >> offset).trailing_zeros() as usize)
+                .min(64 - offset)
+                .min(len - index)
+                .min(self.remaining);
+            if idle != 0 {
+                self.next = (index + idle) % len;
+                self.remaining -= idle;
                 continue;
             }
+            self.next = (index + 1) % len;
+            self.remaining -= 1;
             turn -= 1;
-            changed |= self.poll_slot(index, cx, hint, &mut current, &mut try_send)?;
+            changed |= match self.poll_slot(index, cx, &mut current)? {
+                Visit::Done(changed) => changed,
+                Visit::Reply(changed) => self.send_reply(index, cx, hint, &mut try_send)? | changed,
+            };
+            self.track(index);
         }
         if changed || self.remaining > 0 {
             cx.waker().wake_by_ref();
@@ -497,6 +493,17 @@ impl NativeIntake {
             &mut current,
         );
         Ok(changed)
+    }
+
+    /// Record whether `index` owns a proposal or a reply after it changed.
+    fn track(&mut self, index: usize) {
+        let slot = &self.slots[index];
+        let bit = 1 << (index % 64);
+        if slot.pending.is_some() || slot.reply.is_some() {
+            self.active[index / 64] |= bit;
+        } else {
+            self.active[index / 64] &= !bit;
+        }
     }
 
     /// Requests of this client's writer that still own a proposal or a reply,
@@ -532,7 +539,7 @@ impl NativeIntake {
             .writers
             .assigned_rejection(node, stride)
             .is_some_and(|slot| self.slots.get(slot).is_some_and(busy));
-        opens + usize::from(rejection)
+        opens + usize::from(rejection) + self.progress_work(node)
     }
 
     /// Pending proposals and replies remain bounded by startup slots.
@@ -541,71 +548,42 @@ impl NativeIntake {
             self.busy,
             self.slots
                 .iter()
-                .filter(|slot| slot.pending.is_some() || slot.reply.is_some())
+                .filter(|slot| slot.pending.is_some()
+                    || slot.reply.is_some()
+                    || slot.batch.is_some())
+                .count()
+        );
+        debug_assert!(self.slots.iter().enumerate().all(|(index, slot)| {
+            (slot.pending.is_some() || slot.reply.is_some())
+                == (self.active[index / 64] & 1 << (index % 64) != 0)
+        }));
+        debug_assert_eq!(
+            self.progress_held,
+            self.slots
+                .iter()
+                .filter(|slot| {
+                    slot.batch
+                        .as_ref()
+                        .is_some_and(|batched| matches!(batched.state, BatchState::Held { .. }))
+                })
                 .count()
         );
         self.busy != 0
     }
 
+    /// Progress updates riding in another update's proposal.
+    #[cfg(test)]
+    pub(crate) const fn progress_riders(&self) -> usize {
+        self.progress_riders
+    }
+
+    /// Cursor-update proposals this intake submitted.
+    #[cfg(test)]
+    pub(crate) const fn progress_proposals(&self) -> usize {
+        self.progress_proposals
+    }
+
     pub(super) fn identity(&self) -> (GroupId, NodeId, append::Policy) {
         (self.config.group, self.config.local, self.config.policy)
     }
-}
-
-fn validate(
-    config: &NativeIntakeConfig,
-    buffers: &[ProposalBuffer],
-) -> Result<(), NativeIntakeError> {
-    config.access.validate(config.local)?;
-    let count = config.access.required_buffers(config.requests_per_writer);
-    if config.local.as_bytes() == &[0; 16]
-        || config.group.as_bytes() == &[0; 16]
-        || config.partition.as_bytes() == &[0; 16]
-        || config.requests_per_writer == 0
-        || count != Some(buffers.len())
-        || buffers.len() > 1024
-        || !(1..=1024).contains(&config.turn_slots)
-        || !matches!(
-            config.policy,
-            append::Policy::LocalDurable
-                | append::Policy::QuorumDurable
-                | append::Policy::QuorumReplicatedPersisting
-        )
-        || config.limits.max_records == 0
-        || config.limits.max_parts == 0
-        || config.limits.envelope.max_metadata_bytes < 106
-        || buffers.iter().enumerate().any(|(index, buffer)| {
-            !buffer.is_empty()
-                || buffer.limits().max_operations == 0
-                || config
-                    .buffer_limits(index)
-                    .is_none_or(|limits| limits.max_body_bytes > buffer.limits().max_body_bytes)
-        })
-    {
-        return Err(NativeIntakeError::Configuration);
-    }
-    Ok(())
-}
-
-/// Terminal adapter error. No error creates confirmation evidence.
-#[derive(Debug, thiserror::Error)]
-pub enum NativeIntakeError {
-    /// Invalid startup identities, admission limits, or arena count/capacity.
-    #[error("invalid native partition intake configuration")]
-    Configuration,
-    /// Actor stopped with an unresolved proposal.
-    #[error(transparent)]
-    Stopped(#[from] super::ProposalStopped),
-    /// Completed arena does not describe the admitted request.
-    #[error("native proposal result does not match its request")]
-    History,
-    /// Bounded wire result cannot be encoded.
-    #[error(transparent)]
-    Codec(#[from] ozzy_proto::data::CodecError),
-    /// Bounded rejection cannot be encoded.
-    #[error(transparent)]
-    Nack(#[from] nack::NackError),
-    /// Shared outgoing transport failed.
-    #[error(transparent)]
-    Transport(#[from] omq_tokio::Error),
 }

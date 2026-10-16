@@ -1,3 +1,13 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
+
 use ozzy_journal::operation::{ChainPosition, Digest};
 use ozzy_journal_segment::{
     CURRENT_BYTES, CheckpointReference, CommitMode, CurrentReference, GROUP_IDENTITY_BYTES,

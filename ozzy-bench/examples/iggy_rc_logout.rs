@@ -15,7 +15,6 @@ mod diagnostic {
     use ozzy_bench::control::{self, Connection};
     use serde_json::json;
     use std::{
-        fs::OpenOptions,
         process::{Child, Command, Stdio},
         time::Duration,
     };
@@ -65,6 +64,16 @@ mod diagnostic {
         children: Vec<Child>,
         connections: Vec<Connection>,
     }
+
+    /// Clients and worker processes of one diagnostic. Declared before the
+    /// brokers start, so the brokers stop first and the disconnects add no
+    /// noise to the diagnostics.
+    struct Session<'a> {
+        root: &'a std::path::Path,
+        clients: Vec<TcpClient>,
+        workers: Workers,
+    }
+
     impl Drop for Workers {
         fn drop(&mut self) {
             for child in &mut self.children {
@@ -76,10 +85,13 @@ mod diagnostic {
         }
     }
 
-    async fn worker(args: &Args) -> Result<()> {
-        let lane = args.worker.unwrap();
-        let client = connect(args.endpoint.as_deref().unwrap()).await?;
-        let mut input = control::input();
+    async fn worker(args: &Args, lane: usize) -> Result<()> {
+        let endpoint = args
+            .endpoint
+            .as_deref()
+            .ok_or("worker requires --endpoint")?;
+        let client = connect(endpoint).await?;
+        let mut input = control::input()?;
         control::reply(&json!({"event":"ready"}))?;
         control::command(&mut input, "start").await?;
         if lane < args.writers {
@@ -106,46 +118,11 @@ mod diagnostic {
         Ok(())
     }
 
-    async fn process_data(
-        args: &Args,
-        endpoint: &str,
-        workers: &mut Workers,
-        root: &std::path::Path,
-    ) -> Result<()> {
+    async fn process_data(args: &Args, endpoint: &str, session: &mut Session<'_>) -> Result<()> {
+        let workers = &mut session.workers;
         for index in 0..args.writers * if args.poll { 2 } else { 1 } {
-            let (mut connection, config) = Connection::listen(None).await?;
-            let mut arguments = vec![
-                "--worker".into(),
-                index.to_string(),
-                "--endpoint".into(),
-                endpoint.into(),
-                "--writers".into(),
-                args.writers.to_string(),
-                "--writes".into(),
-                args.writes.to_string(),
-                "--records".into(),
-                args.records.to_string(),
-                "--record-bytes".into(),
-                args.record_bytes.to_string(),
-            ];
-            config.append(&mut arguments);
-            if args.logout_on_eof {
-                arguments.push("--logout-on-eof".into());
-            }
-            let log = std::fs::File::create(root.join(format!("worker-{index}.log")))?;
-            workers.children.push(
-                Command::new("taskset")
-                    .args(["-c", "4-11"])
-                    .arg(std::env::current_exe()?)
-                    .args(arguments)
-                    .stdin(Stdio::null())
-                    .stdout(log.try_clone()?)
-                    .stderr(log)
-                    .spawn()?,
-            );
-            if connection.receive().await?["event"] != "ready" {
-                return Err("worker not ready".into());
-            }
+            let (connection, child) = spawn_worker(args, endpoint, session.root, index).await?;
+            workers.children.push(child);
             workers.connections.push(connection);
         }
         for connection in &workers.connections {
@@ -157,15 +134,55 @@ mod diagnostic {
             }
         }
         println!("all writer and verified reader processes finished");
-        if args.sync_before_logout {
-            automation::capture(
-                Command::new("sync")
-                    .arg("-f")
-                    .arg(automation::artifact_root()),
-            )?;
-        }
-        tokio::time::sleep(Duration::from_millis(args.pause_ms)).await;
+        settle_before_logout(args).await?;
         println!("first writer process logout requested");
+        logout_first(args, workers).await
+        // Keep control connections alive until the caller snapshots diagnostics.
+    }
+
+    /// Start worker process `index` and wait until it reports ready.
+    async fn spawn_worker(
+        args: &Args,
+        endpoint: &str,
+        root: &std::path::Path,
+        index: usize,
+    ) -> Result<(Connection, Child)> {
+        let (mut connection, config) = Connection::listen(None).await?;
+        let mut arguments = vec![
+            "--worker".into(),
+            index.to_string(),
+            "--endpoint".into(),
+            endpoint.into(),
+            "--writers".into(),
+            args.writers.to_string(),
+            "--writes".into(),
+            args.writes.to_string(),
+            "--records".into(),
+            args.records.to_string(),
+            "--record-bytes".into(),
+            args.record_bytes.to_string(),
+        ];
+        config.append(&mut arguments);
+        if args.logout_on_eof {
+            arguments.push("--logout-on-eof".into());
+        }
+        let log = std::fs::File::create(root.join(format!("worker-{index}.log")))?;
+        let child = Command::new("taskset")
+            .args(["-c", "4-11"])
+            .arg(std::env::current_exe()?)
+            .args(arguments)
+            .stdin(Stdio::null())
+            .stdout(log.try_clone()?)
+            .stderr(log)
+            .spawn()?;
+        if connection.receive().await?["event"] != "ready" {
+            return Err("worker not ready".into());
+        }
+        Ok((connection, child))
+    }
+
+    /// Log out the first writer process, by controller EOF or by command.
+    async fn logout_first(args: &Args, workers: &mut Workers) -> Result<()> {
         if args.logout_on_eof {
             workers.connections[0].shutdown()?;
             loop {
@@ -183,7 +200,6 @@ mod diagnostic {
                 return Err("worker did not logout".into());
             }
         }
-        // Keep control connections alive until the caller snapshots diagnostics.
         Ok(())
     }
 
@@ -259,11 +275,9 @@ mod diagnostic {
 
     async fn operation(
         control: &TcpClient,
-        clients: &mut Vec<TcpClient>,
-        endpoint: &str,
         args: &Args,
-        workers: &mut Workers,
-        root: &std::path::Path,
+        endpoint: &str,
+        session: &mut Session<'_>,
     ) -> Result<()> {
         if args.writes == 0 {
             println!("control logout requested");
@@ -290,38 +304,51 @@ mod diagnostic {
             control.logout_user().await?;
             control.shutdown().await?;
             if args.processes {
-                process_data(args, endpoint, workers, root).await?;
-                println!("logout completed");
-                return Ok(());
+                process_data(args, endpoint, session).await?;
+            } else {
+                client_data(args, endpoint, session).await?;
             }
-            for _ in 0..args.writers * if args.poll { 2 } else { 1 } {
-                clients.push(connect(endpoint).await?);
-            }
-            let writes = try_join_all(
-                clients[..args.writers]
-                    .iter()
-                    .enumerate()
-                    .map(|(lane, client)| write(client, args, lane)),
-            );
-            let reads = try_join_all(
-                clients[args.writers..]
-                    .iter()
-                    .enumerate()
-                    .map(|(lane, client)| read(client, args, lane)),
-            );
-            tokio::try_join!(writes, reads)?;
-            if args.sync_before_logout {
-                automation::capture(
-                    Command::new("sync")
-                        .arg("-f")
-                        .arg(automation::artifact_root()),
-                )?;
-            }
-            tokio::time::sleep(Duration::from_millis(args.pause_ms)).await;
-            println!("first writer logout requested; all readers finished");
-            clients[0].logout_user().await?;
         }
         println!("logout completed");
+        Ok(())
+    }
+
+    /// Write and verify through in-process clients, then log out the first
+    /// writer.
+    async fn client_data(args: &Args, endpoint: &str, session: &mut Session<'_>) -> Result<()> {
+        for _ in 0..args.writers * if args.poll { 2 } else { 1 } {
+            session.clients.push(connect(endpoint).await?);
+        }
+        let clients = &session.clients;
+        let writes = try_join_all(
+            clients[..args.writers]
+                .iter()
+                .enumerate()
+                .map(|(lane, client)| write(client, args, lane)),
+        );
+        let reads = try_join_all(
+            clients[args.writers..]
+                .iter()
+                .enumerate()
+                .map(|(lane, client)| read(client, args, lane)),
+        );
+        tokio::try_join!(writes, reads)?;
+        settle_before_logout(args).await?;
+        println!("first writer logout requested; all readers finished");
+        clients[0].logout_user().await?;
+        Ok(())
+    }
+
+    /// Sync the artifact root when asked, then pause before the logout.
+    async fn settle_before_logout(args: &Args) -> Result<()> {
+        if args.sync_before_logout {
+            automation::capture(
+                Command::new("sync")
+                    .arg("-f")
+                    .arg(automation::artifact_root()),
+            )?;
+        }
+        tokio::time::sleep(Duration::from_millis(args.pause_ms)).await;
         Ok(())
     }
 
@@ -331,38 +358,42 @@ mod diagnostic {
         control::run(&control, 1, execute(args)).await
     }
 
-    async fn execute(args: Args) -> Result<()> {
-        if args.worker.is_some() {
-            return worker(&args).await;
+    /// Refuse workloads outside the bounded diagnostic shape.
+    fn check_bounds(args: &Args) -> Result<()> {
+        let within = args.writes <= 128
+            && (1..=1024).contains(&args.records)
+            && (1..=8192).contains(&args.record_bytes)
+            && (1..=4).contains(&args.writers)
+            && args.pause_ms <= 8000;
+        if within {
+            Ok(())
+        } else {
+            Err("diagnostic workload exceeds its bounds".into())
         }
-        if args.writes > 128
-            || !(1..=1024).contains(&args.records)
-            || !(1..=8192).contains(&args.record_bytes)
-            || !(1..=4).contains(&args.writers)
-            || args.pause_ms > 8000
-        {
-            return Err("diagnostic workload exceeds its bounds".into());
-        }
-        isolation::require_idle()?;
-        isolation::pin(None, &[4, 5, 6, 7, 8, 9, 10, 11])?;
-        let lock = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(automation::cache().join("runner.lock"))?;
-        lock.try_lock()?;
-        let root = automation::cache()
-            .join("diagnostics")
-            .join(format!("iggy-logout-{}", automation::run_id()?));
-        std::fs::create_dir_all(&root)?;
-        server::prepare(true, &root)?;
-        let mut workers = Workers::default();
+    }
+
+    /// The saved outcome row; never a performance ledger row.
+    fn outcome_row(
+        args: &Args,
+        result: &str,
+        diagnostics: Option<&str>,
+        server: &serde_json::Value,
+    ) -> serde_json::Value {
+        json!({"kind":"diagnostic-not-benchmark", "result":result,
+            "singleton":args.singleton,"writes":args.writes,"records":args.records,"writers":args.writers,
+            "record_bytes":args.record_bytes,"poll":args.poll,"persisted":args.persisted,"pause_ms":args.pause_ms,"processes":args.processes,"logout_on_eof":args.logout_on_eof,"sync_before_logout":args.sync_before_logout,
+            "server_diagnostics":diagnostics,"server":server})
+    }
+
+    /// Start the singleton or three-broker Iggy fixture under `root`.
+    fn start_brokers(args: &Args, root: &std::path::Path) -> Result<server::Iggy> {
         let brokers = if args.singleton { 1 } else { 3 };
-        let broker = server::Iggy::start(
-            &root,
+        server::Iggy::start(
+            root,
             if args.singleton {
                 "buffered"
             } else {
-                "replicated-persisting"
+                "disk-quorum"
             },
             &vec![vec![0, 1, 2, 3]; brokers],
             if args.debug {
@@ -370,22 +401,35 @@ mod diagnostic {
             } else {
                 "info"
             },
-        )?;
+        )
+    }
+
+    async fn execute(args: Args) -> Result<()> {
+        if let Some(lane) = args.worker {
+            return worker(&args, lane).await;
+        }
+        check_bounds(&args)?;
+        isolation::require_idle()?;
+        isolation::pin(None, &[4, 5, 6, 7, 8, 9, 10, 11])?;
+        let _lock = automation::lock_runner(&automation::cache()?)?;
+        let root = automation::cache()?
+            .join("diagnostics")
+            .join(format!("iggy-logout-{}", automation::run_id()?));
+        std::fs::create_dir_all(&root)?;
+        server::prepare(true, &root)?;
+        let mut session = Session {
+            root: &root,
+            clients: Vec::new(),
+            workers: Workers::default(),
+        };
+        let broker = start_brokers(&args, &root)?;
         println!("DIAGNOSTIC ONLY: {}", root.display());
         let control =
             tokio::time::timeout(Duration::from_secs(5), connect(&broker.endpoint)).await??;
-        let mut clients = vec![];
         println!("connected");
         let outcome = tokio::time::timeout(
             Duration::from_secs(30),
-            operation(
-                &control,
-                &mut clients,
-                &broker.endpoint,
-                &args,
-                &mut workers,
-                &root,
-            ),
+            operation(&control, &args, &broker.endpoint, &mut session),
         )
         .await;
         let result = match outcome {
@@ -394,10 +438,7 @@ mod diagnostic {
             Err(_) => "deadline expired".to_owned(),
         };
         let diagnostics = broker.check().err().map(|error| error.to_string());
-        let row = json!({"kind":"diagnostic-not-benchmark", "result":result,
-            "singleton":args.singleton,"writes":args.writes,"records":args.records,"writers":args.writers,
-            "record_bytes":args.record_bytes,"poll":args.poll,"persisted":args.persisted,"pause_ms":args.pause_ms,"processes":args.processes,"logout_on_eof":args.logout_on_eof,"sync_before_logout":args.sync_before_logout,
-            "server_diagnostics":diagnostics,"server":broker.identity()?});
+        let row = outcome_row(&args, &result, diagnostics.as_deref(), &broker.identity()?);
         automation::json_file(&root.join("outcome.json"), &row)?;
         println!("{result}; diagnostics: {diagnostics:?}");
         // End the disposable fixture after the bounded observation. Connections
@@ -409,12 +450,15 @@ mod diagnostic {
 }
 
 #[cfg(feature = "comparisons")]
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> ozzy_bench::automation::Result<()> {
-    diagnostic::run().await
+fn main() -> ozzy_bench::automation::Result<()> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(diagnostic::run())
 }
 
 #[cfg(not(feature = "comparisons"))]
 fn main() {
-    panic!("build this diagnostic with --features comparisons");
+    eprintln!("build this diagnostic with --features comparisons");
+    std::process::exit(2);
 }

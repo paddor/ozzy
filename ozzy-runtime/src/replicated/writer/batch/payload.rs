@@ -63,7 +63,7 @@ impl PayloadPool {
         records: Range<usize>,
     ) -> Option<Payload> {
         if records.len() == 1 {
-            return Some(admission.payload(records.start).clone());
+            return Some(admission.payload(records.start));
         }
         for slot in &mut self.slots[self.route] {
             if let Some(output) = Arc::get_mut(slot) {

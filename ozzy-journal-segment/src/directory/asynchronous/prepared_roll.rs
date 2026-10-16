@@ -1,19 +1,17 @@
 //! Owned successor preparation and detached roll publication. The live owner
 //! stays read-only until its exact completion is installed.
 
+use super::roll::{RollBoundary, roll_manifest_after, validate_buffered_roll_state};
 use super::{Journal, Limits};
-use crate::directory::{
-    RollBoundary, roll_manifest_after, segment_name, validate_buffered_roll_state,
-};
+use crate::directory::segment_name;
 use crate::retention::{PinRegistry, PreparedSegmentLease};
 use crate::{
-    AsyncSegmentStart, AsyncSegmentWriter, CurrentReference, DirectoryError, GroupIdentity,
-    JournalGroupEncoding, Manifest, SegmentHeader, WriterError, async_files::Access,
-    async_metadata, encode_manifest_with_limits,
+    CurrentReference, DirectoryError, GroupIdentity, JournalGroupEncoding, Manifest, SegmentWriter,
+    WriterError, async_files::Access, async_metadata, encode_manifest_with_limits,
 };
-use ozzy_io::{Handle, OpenMode, Operation};
+use ozzy_io::Handle;
 use ozzy_journal::progress::JournalGeneration;
-use std::{io, ops::Range, path::PathBuf, sync::Arc};
+use std::{io, ops::Range, path::PathBuf, rc::Rc, sync::Arc};
 
 /// Captured allocation request. It contains no final predecessor digest, so
 /// appends can continue while this request executes on the storage backend.
@@ -27,7 +25,7 @@ pub struct Preparation {
     capacity: u64,
     max_probes: usize,
     chunk_bytes: usize,
-    pins: Arc<PinRegistry>,
+    pins: Rc<PinRegistry>,
 }
 
 /// Unselected new file, protected from cleanup. Interrupted zeroing fences it.
@@ -80,7 +78,7 @@ pub struct Completed {
 #[derive(Debug)]
 struct Rolled {
     directory: async_metadata::Directory,
-    writer: AsyncSegmentWriter,
+    writer: SegmentWriter,
     manifest: Manifest,
     current: CurrentReference,
 }
@@ -139,7 +137,7 @@ impl Journal {
         let successor = match prepared {
             Some(file)
                 if !file.faulted
-                    && Arc::ptr_eq(&file.scope.pins, &self.pins)
+                    && Rc::ptr_eq(&file.scope.pins, &self.pins)
                     && file.scope.identity == self.manifest.identity
                     && file.scope.predecessor == self.writer.header().segment_id()
                     && file.scope.generation == self.writer.written_position().generation()
@@ -166,7 +164,8 @@ impl Journal {
 }
 
 impl Preparation {
-    /// Exclusive-create, allocate and sync without selecting or writing a header.
+    /// Exclusive-create, take the spare if there is one, allocate and sync
+    /// without selecting or writing a header.
     pub async fn prepare(self) -> Result<Segment, DirectoryError> {
         let mut id = self.predecessor;
         for _ in 0..self.max_probes {
@@ -174,27 +173,14 @@ impl Preparation {
                 .checked_add(1)
                 .ok_or(DirectoryError::SegmentIdExhausted)?;
             let lease = self.pins.protect_prepared_segment(id)?;
-            let file = match self
-                .access
-                .open(
-                    self.root.join(segment_name(id)),
-                    OpenMode::CreateNew,
-                    false,
-                    false,
-                )
-                .await
-            {
+            let created =
+                super::spare::create_segment_file(&self.access, &self.root, id, self.capacity)
+                    .await;
+            let file = match created {
                 Ok(file) => file,
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error.into()),
             };
-            self.access
-                .done(Operation::Allocate {
-                    handle: file.clone(),
-                    offset: 0,
-                    length: self.capacity,
-                })
-                .await?;
             self.access.sync(&file).await?;
             return Ok(Segment {
                 scope: self,
@@ -247,17 +233,14 @@ impl Prepared {
     }
 
     async fn execute(mut self) -> Result<Rolled, DirectoryError> {
-        let selected = self
-            .directory
-            .read_selected(
-                self.manifest.identity,
-                self.limits.metadata,
-                self.configuration.as_deref(),
-            )
-            .await?;
-        if selected.current != self.current || selected.manifest != self.manifest {
-            return Err(DirectoryError::CurrentMismatch);
-        }
+        super::metadata::require_current(
+            &mut self.directory,
+            self.current,
+            &self.manifest,
+            self.configuration.as_deref(),
+            self.limits.metadata,
+        )
+        .await?;
         let prepared = match self.successor {
             Successor::Allocate(work) => work.prepare().await?,
             Successor::Ready(file) => file,
@@ -269,24 +252,20 @@ impl Prepared {
             prepared.scope.capacity,
         )?;
         encode_manifest_with_limits(&next, self.limits.metadata)?;
-        let header = SegmentHeader::new(
+        let header = self.boundary.successor_header(
             self.manifest.identity.group_id,
             prepared.id,
-            Some(self.boundary.active.segment_id),
-            self.boundary.next_chain.previous_digest(),
             prepared.scope.capacity,
         )?;
         let access = self.directory.access();
-        let writer = AsyncSegmentWriter::initialize_prepared(
-            prepared.scope.root.join(segment_name(prepared.id)),
-            access.clone(),
-            prepared.file,
-            header,
-            AsyncSegmentStart {
-                generation: self.boundary.writer_generation,
-                first_group_number: self.boundary.next_group_number,
-                initial_chain: self.boundary.next_chain,
+        let writer = SegmentWriter::initialize_prepared(
+            crate::writer::asynchronous::Opened {
+                path: prepared.scope.root.join(segment_name(prepared.id)),
+                access: access.clone(),
+                buffered: prepared.file,
             },
+            header,
+            self.boundary.successor_start(),
             self.limits.io,
         )
         .await?;
@@ -296,17 +275,13 @@ impl Prepared {
         access
             .sync_directory(self.directory.root().join("segments"))
             .await?;
-        let (manifest, digest) = self
-            .directory
-            .publish_manifest(&self.manifest, next, self.limits.metadata)
-            .await?;
-        let current = CurrentReference {
-            group_id: manifest.identity.group_id,
-            store_id: manifest.identity.store_id,
-            generation: manifest.generation,
-            manifest_digest: digest,
-        };
-        self.directory.select_current(current).await?;
+        let (manifest, current) = super::metadata::publish_selected(
+            &mut self.directory,
+            &self.manifest,
+            next,
+            self.limits.metadata,
+        )
+        .await?;
         Ok(Rolled {
             directory: self.directory,
             writer,
@@ -336,7 +311,7 @@ impl Pending {
         &mut self,
         boundary: crate::JournalIndexBoundary,
         limits: crate::IndexBuildLimits,
-    ) -> Result<crate::AsyncJournalIndexSnapshot, crate::JournalIndexError> {
+    ) -> Result<crate::JournalIndexSnapshot, crate::JournalIndexError> {
         self.journal.build_index_snapshot(boundary, limits).await
     }
 
@@ -354,6 +329,7 @@ impl Pending {
         let mut rolled = completed.result?;
         self.journal.writer.transfer_buffers_to(&mut rolled.writer);
         self.journal.writer = rolled.writer;
+        self.journal.active_prefix = None;
         self.journal.directory = rolled.directory;
         self.journal.manifest = rolled.manifest;
         self.journal.current = rolled.current;

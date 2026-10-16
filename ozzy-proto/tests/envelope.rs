@@ -1,3 +1,13 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
+
 use ozzy_proto::{Envelope, EnvelopeError, EnvelopeLimits, Opcode, decode_packet};
 use ozzy_proto::{LinkSessionId, NodeId, RequestId};
 
@@ -211,7 +221,7 @@ fn every_allocated_opcode_is_distinct_and_unallocated_values_reject() {
             header[7] = 1;
         }
         let packet = decode_packet(&[&header, &[], &[]], limits);
-        if matches!(byte, 0x01..=0x03 | 0x10..=0x17 | 0x20..=0x25 | 0x27..=0x28 | 0x30..=0x43 | 0x50..=0x55 | 0x7f)
+        if matches!(byte, 0x01..=0x03 | 0x10..=0x17 | 0x20..=0x25 | 0x27..=0x28 | 0x30..=0x43 | 0x50..=0x55 | 0x60..=0x67 | 0x7f)
         {
             let packet = packet.unwrap();
             assert_eq!(packet.envelope.opcode as u8, byte);

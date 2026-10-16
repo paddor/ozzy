@@ -1,9 +1,6 @@
 use super::*;
 use crate::test_io::{drive, drive_with, poll};
-use crate::{
-    ChainPosition, CommitMode, Digest, GroupDirectory, GroupIdentity, LogPosition, SegmentHeader,
-    SegmentReference,
-};
+use crate::{ChainPosition, CommitMode, GroupIdentity, LogPosition, SegmentReference};
 use ozzy_io::simulation::{self, Controller, Effect, Image, ImageLimits, Stage};
 use ozzy_io::{Class, Operation, Outcome, Quota};
 use ozzy_proto::{GroupId, NodeId, StoreId, VolumeId};
@@ -98,20 +95,9 @@ fn current(manifest: &Manifest) -> CurrentReference {
 }
 
 #[tokio::test]
-async fn async_metadata_is_readable_by_the_existing_segment_recovery() {
+async fn pool_metadata_publication_is_selected_after_reopen() {
     let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("group");
-    let header = SegmentHeader::new(identity().group_id, 1, None, Digest::ZERO, 32768).unwrap();
-    let old = GroupDirectory::format_new_with_durable_evidence(
-        &root,
-        identity(),
-        1,
-        &header,
-        b"test deployment",
-    )
-    .unwrap();
-    let previous = old.manifest().clone();
-    drop(old);
+    let root = temp.path().to_path_buf();
     let (pool, mut clients) = ozzy_io_pool::Pool::new(ozzy_io_pool::Config {
         threads: 1,
         max_inflight: 1,
@@ -119,9 +105,12 @@ async fn async_metadata_is_readable_by_the_existing_segment_recovery() {
         limits: config().limits,
     })
     .unwrap();
-    let mut directory = Directory::open(root.clone(), Local::new(clients.remove(0)), limits())
+    let io = Local::new(clients.remove(0));
+    let mut directory = Directory::open(root.clone(), io.clone(), limits())
         .await
         .unwrap();
+    establish(&mut directory).await;
+    let previous = manifest();
     let mut next = previous.clone();
     next.generation += 1;
     next.parent_generation = previous.generation;
@@ -132,16 +121,15 @@ async fn async_metadata_is_readable_by_the_existing_segment_recovery() {
     assert_eq!(digest, current(&next).manifest_digest);
     directory.select_current(current(&next)).await.unwrap();
     drop(directory);
-    pool.shutdown().await;
-    let recovered = GroupDirectory::open(&root, identity(), metadata_limits()).unwrap();
-    assert_eq!(recovered.manifest(), &next);
-    recovered
-        .recover(
-            ozzy_journal::progress::JournalGeneration(2),
-            crate::DecodeLimits::default(),
-            crate::OperationLimits::default(),
-        )
+    let mut reopened = Directory::open_existing(root, io, limits()).await.unwrap();
+    let loaded = reopened
+        .read_selected(identity(), metadata_limits(), Some(b"test deployment"))
+        .await
         .unwrap();
+    assert_eq!(loaded.current, current(&next));
+    assert_eq!(loaded.manifest, next);
+    drop(reopened);
+    pool.shutdown().await;
 }
 
 #[test]
@@ -194,39 +182,35 @@ fn exact_immutable_reuse_conflicts_short_transfers_and_name_bounds() {
     );
 }
 
+async fn establish(directory: &mut Directory) {
+    let manifest = manifest();
+    directory
+        .install_immutable(
+            "identity",
+            &crate::encode_group_identity(identity()).unwrap(),
+        )
+        .await
+        .unwrap();
+    directory
+        .install_immutable("CONFIGURATION", b"test deployment")
+        .await
+        .unwrap();
+    directory
+        .install_immutable("MANIFEST.1", &crate::encode_manifest(&manifest).unwrap())
+        .await
+        .unwrap();
+    directory.select_current(current(&manifest)).await.unwrap();
+    let evidence = crate::directory::evidence::image(&manifest, LogPosition::GENESIS).unwrap();
+    directory
+        .replace("DURABLE", ".DURABLE.tmp", &evidence)
+        .await
+        .unwrap();
+}
+
 fn established() -> Image {
     let (mut controller, io) = setup(Image::default());
     let mut directory = drive(&mut controller, Directory::open("/".into(), io, limits())).unwrap();
-    let manifest = manifest();
-    drive(
-        &mut controller,
-        directory.install_immutable(
-            "identity",
-            &crate::encode_group_identity(identity()).unwrap(),
-        ),
-    )
-    .unwrap();
-    drive(
-        &mut controller,
-        directory.install_immutable("CONFIGURATION", b"test deployment"),
-    )
-    .unwrap();
-    drive(
-        &mut controller,
-        directory.install_immutable("MANIFEST.1", &crate::encode_manifest(&manifest).unwrap()),
-    )
-    .unwrap();
-    drive(
-        &mut controller,
-        directory.select_current(current(&manifest)),
-    )
-    .unwrap();
-    let evidence = crate::directory::evidence::image(&manifest, LogPosition::GENESIS).unwrap();
-    drive(
-        &mut controller,
-        directory.replace("DURABLE", ".DURABLE.tmp", &evidence),
-    )
-    .unwrap();
+    drive(&mut controller, establish(&mut directory));
     drop(directory);
     controller.crash(true).unwrap().0
 }
@@ -413,8 +397,7 @@ fn canceled_publication_fences_owner_and_keeps_group_locked_until_physical_work_
     )
     .unwrap();
     let pending = {
-        let mut future =
-            std::pin::pin!(directory.replace("MEMORY_VOTING", ".MEMORY_VOTING.tmp", b"state"));
+        let mut future = std::pin::pin!(directory.replace("STATE", ".STATE.tmp", b"state"));
         assert!(poll(future.as_mut()).is_pending());
         controller.jobs()[0].0
     };

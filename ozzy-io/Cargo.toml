@@ -20,8 +20,20 @@ simulation = ["dep:serde"]
 bytes.workspace = true
 fanring.workspace = true
 futures.workspace = true
+pin-project-lite.workspace = true
 serde = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["sync"] }
 
+[dev-dependencies]
+loom = "0.7"
+
 [lints]
 workspace = true
+
+[[test]]
+name = "ozzy_io_loom"
+path = "tests/loom.rs"
+
+[[test]]
+name = "ozzy_raw_notify_ban"
+path = "tests/raw_notify_ban.rs"

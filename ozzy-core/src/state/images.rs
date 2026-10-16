@@ -2,9 +2,7 @@
 
 use std::{borrow::Cow, collections::VecDeque};
 
-use ahash::AHashSet as HashSet;
-
-use ozzy_journal::operation::{AppendSummary, OperationBody};
+use ozzy_journal::operation::{AppendBatchSummary, AppendResults, AppendSummary, OperationBody};
 use thiserror::Error;
 
 use super::{
@@ -22,6 +20,22 @@ pub struct CanonicalImages<I = MemoryIdentityIndex> {
     speculative_identities: Option<I>,
     pending: VecDeque<TransitionPlan>,
     pending_capacity: usize,
+}
+
+/// Committed and speculative images rebuilt by replay, with the accepted
+/// transition plans that lead from one to the other.
+#[derive(Debug)]
+pub struct RecoveredImages<I> {
+    /// Application state through the confirmed canonical prefix.
+    pub committed: CanonicalState,
+    /// Identity index matching `committed`.
+    pub committed_identities: I,
+    /// Application state through accepted, possibly unconfirmed operations.
+    pub speculative: CanonicalState,
+    /// Identity index matching `speculative`.
+    pub speculative_identities: I,
+    /// Accepted plans from `committed` to `speculative`, in order.
+    pub pending: Vec<TransitionPlan>,
 }
 
 /// State transitions validated atomically against one canonical image revision.
@@ -79,13 +93,16 @@ where
 {
     /// Restore exact committed/speculative images and accepted transition plans.
     pub fn from_recovered(
-        committed: CanonicalState,
-        speculative: CanonicalState,
-        committed_identities: I,
-        speculative_identities: I,
-        pending: Vec<TransitionPlan>,
+        recovered: RecoveredImages<I>,
         pending_capacity: usize,
     ) -> Result<Self, CanonicalImagesError> {
+        let RecoveredImages {
+            committed,
+            committed_identities,
+            speculative,
+            speculative_identities,
+            pending,
+        } = recovered;
         if pending.len() > pending_capacity
             || speculative.revision() < committed.revision()
             || speculative.revision() - committed.revision() != pending.len() as u64
@@ -161,6 +178,27 @@ where
         Ok(())
     }
 
+    /// Replace the committed and any speculative identity index with ones
+    /// derived from them, such as coverage narrowed to retained history. Both
+    /// change or neither does. The caller must keep every claim a later lookup
+    /// can reach; this supplies no storage or replication authority.
+    pub fn map_identity_indexes<E>(
+        &mut self,
+        mut map: impl FnMut(&I) -> Result<I, E>,
+    ) -> Result<(), E> {
+        let committed = map(&self.committed_identities)?;
+        let speculative = self
+            .speculative_identities
+            .as_ref()
+            .map(&mut map)
+            .transpose()?;
+        self.committed_identities = committed;
+        if speculative.is_some() {
+            self.speculative_identities = speculative;
+        }
+        Ok(())
+    }
+
     /// Validate a group without cloning retained identity history.
     ///
     /// The returned plans remain valid only while this image stays unchanged.
@@ -171,10 +209,10 @@ where
         &self,
         operations: &[(u64, OperationBody<'_>)],
     ) -> Result<PreparedCanonicalGroup, CanonicalImagesError> {
-        self.prepare_group_with(operations.len(), |index, candidate, identities| {
-            let (number, body) = &operations[index];
-            candidate.prepare(*number, body, identities, &self.committed)
-        })
+        self.prepare_group_with(
+            operations.iter(),
+            |(number, body), candidate, identities| candidate.prepare(*number, body, identities),
+        )
     }
 
     /// Validate schema-checked append groups without materializing record tables.
@@ -183,9 +221,19 @@ where
         &self,
         operations: &[(u64, AppendSummary)],
     ) -> Result<PreparedCanonicalGroup, CanonicalImagesError> {
-        self.prepare_group_with(operations.len(), |index, candidate, _| {
-            let (number, summary) = &operations[index];
+        self.prepare_group_with(operations.iter(), |(number, summary), candidate, _| {
             candidate.prepare_append_summary(*number, summary)
+        })
+    }
+
+    /// Validate resolved attempt metadata without materializing stored payloads.
+    /// The caller must validate every summary and result against its exact body.
+    pub fn prepare_resolved_append_group(
+        &self,
+        bodies: &[(u64, AppendBatchSummary, AppendResults<'_>)],
+    ) -> Result<PreparedCanonicalGroup, CanonicalImagesError> {
+        self.prepare_group_with(bodies.iter(), |&(number, batch, results), candidate, _| {
+            candidate.prepare_resolved_append_summary(number, batch, results)
         })
     }
 
@@ -195,32 +243,34 @@ where
         first_op_number: u64,
         bodies: &[OperationBody<'_>],
     ) -> Result<PreparedCanonicalGroup, CanonicalImagesError> {
-        self.prepare_group_with(bodies.len(), |index, candidate, identities| {
+        let bodies = bodies.iter().enumerate();
+        self.prepare_group_with(bodies, |(index, body), candidate, identities| {
             let delta = u64::try_from(index).map_err(|_| StateError::RevisionExhausted)?;
             let number = first_op_number
                 .checked_add(delta)
                 .ok_or(StateError::RevisionExhausted)?;
-            candidate.prepare(number, &bodies[index], identities, &self.committed)
+            candidate.prepare(number, body, identities)
         })
     }
 
-    fn prepare_group_with(
+    fn prepare_group_with<T>(
         &self,
-        count: usize,
+        items: impl ExactSizeIterator<Item = T>,
         mut prepare: impl FnMut(
-            usize,
+            T,
             &CanonicalState,
             &StagedIdentityIndex<'_, I>,
         ) -> Result<TransitionPlan, StateError>,
     ) -> Result<PreparedCanonicalGroup, CanonicalImagesError> {
+        let count = items.len();
         if self.pending.len().saturating_add(count) > self.pending_capacity {
             return Err(CanonicalImagesError::PendingCapacity);
         }
         let mut candidate = Cow::Borrowed(&self.speculative);
         let mut identities = StagedIdentityIndex::new(self.speculative_identities());
         let mut plans = Vec::with_capacity(count);
-        for index in 0..count {
-            let plan = prepare(index, &candidate, &identities)?;
+        for (index, item) in items.enumerate() {
+            let plan = prepare(item, &candidate, &identities)?;
             if index + 1 == count {
                 identities
                     .check_capacity(plan.identity_claims().len())
@@ -251,16 +301,12 @@ where
             .iter()
             .flat_map(|plan| plan.identity_claims().iter().copied())
             .collect::<Vec<_>>();
-        if self.speculative_identities.is_none() {
-            self.speculative_identities = Some(self.committed_identities.clone());
-        }
         self.speculative_identities
-            .as_mut()
-            .expect("speculative identities initialized")
+            .get_or_insert_with(|| self.committed_identities.clone())
             .reserve_validated(&claims)
             .map_err(StateError::from)?;
         for plan in prepared.plans {
-            self.speculative.install_prepared(plan.clone());
+            self.speculative.install_prepared_copy(&plan)?;
             self.pending.push_back(plan);
         }
         Ok(())
@@ -290,8 +336,8 @@ where
             .reserve_validated(&claims)
             .map_err(StateError::from)?;
         for plan in prepared.plans {
-            self.speculative.install_prepared(plan.clone());
-            self.committed.install_prepared(plan);
+            self.speculative.install_prepared_copy(&plan)?;
+            self.committed.install_prepared(plan)?;
         }
         Ok(())
     }
@@ -305,12 +351,9 @@ where
         if self.pending.len() >= self.pending_capacity {
             return Err(CanonicalImagesError::PendingCapacity);
         }
-        let plan = self.speculative.prepare(
-            op_number,
-            body,
-            self.speculative_identities(),
-            &self.committed,
-        )?;
+        let plan = self
+            .speculative
+            .prepare(op_number, body, self.speculative_identities())?;
         self.admit_plan(plan)
     }
 
@@ -331,14 +374,10 @@ where
     }
 
     fn admit_plan(&mut self, plan: TransitionPlan) -> Result<(), CanonicalImagesError> {
-        if self.speculative_identities.is_none() {
-            self.speculative_identities = Some(self.committed_identities.clone());
-        }
         self.speculative.apply(
             plan.clone(),
             self.speculative_identities
-                .as_mut()
-                .expect("speculative identities initialized"),
+                .get_or_insert_with(|| self.committed_identities.clone()),
         )?;
         self.pending.push_back(plan);
         Ok(())
@@ -375,9 +414,8 @@ where
         self.committed_identities
             .reserve_validated(&claims)
             .map_err(StateError::from)?;
-        for _ in 0..count {
-            let plan = self.pending.pop_front().expect("validated pending count");
-            self.committed.install_prepared(plan);
+        for plan in self.pending.drain(..count) {
+            self.committed.install_prepared(plan)?;
         }
         if self.pending.is_empty() {
             self.speculative_identities = None;
@@ -427,22 +465,6 @@ impl<I: IdentityIndex> IdentityIndex for StagedIdentityIndex<'_, I> {
     fn check_capacity(&self, additional: usize) -> Result<(), IdentityIndexError> {
         self.base
             .check_capacity(self.claims.len().saturating_add(additional))
-    }
-
-    fn check_reserve(&self, claims: &[IdentityClaim]) -> Result<(), IdentityIndexError> {
-        let keys = claims
-            .iter()
-            .map(|claim| claim.key())
-            .collect::<HashSet<_>>();
-        if keys.len() != claims.len() {
-            return Err(IdentityIndexError::Conflict);
-        }
-        for key in keys {
-            if self.lookup(key)?.is_some() {
-                return Err(IdentityIndexError::Conflict);
-            }
-        }
-        self.check_capacity(claims.len())
     }
 
     fn reserve(&mut self, claims: &[IdentityClaim]) -> Result<(), IdentityIndexError> {

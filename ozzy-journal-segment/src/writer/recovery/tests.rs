@@ -7,6 +7,63 @@ use ozzy_journal::operation::{OperationLimits, logical_operation_digest};
 use ozzy_proto::GroupId;
 use std::{future::Future, pin::pin, sync::Arc, task::Poll};
 
+/// Synchronous oracle for the cooperative recovery decision.
+fn prepare(
+    image: &[u8],
+    generation: JournalGeneration,
+    first_group_number: u64,
+    initial_chain: ChainPosition,
+    limits: DecodeLimits,
+    validation: RecoveryValidation,
+) -> Result<Recovery, WriterError> {
+    let scan = crate::codec::scan(
+        image,
+        first_group_number,
+        initial_chain,
+        limits,
+        validation.discard_damaged_tail,
+    )?;
+    let mut checks = Checks::new(initial_chain, validation);
+    let mut segment_digest = SegmentDigestBuilder::new(&scan.header);
+    for group in &scan.groups {
+        for operation in &group.operations {
+            checks.operation(operation)?;
+        }
+        segment_digest.push(group.digest);
+    }
+    checks.finish(scan.next_chain)?;
+    let mut later = Vec::new();
+    if matches!(
+        scan.tail,
+        TailState::Truncated { .. } | TailState::Damaged { .. }
+    ) {
+        let damaged = scan.next_group_number;
+        let start = scan.valid_bytes as usize;
+        for end in (start + crate::WRITE_GROUP_ALIGNMENT..=image.len())
+            .step_by(crate::WRITE_GROUP_ALIGNMENT)
+        {
+            match crate::codec::durable_mark_ending_at(
+                &scan.header,
+                image,
+                (damaged, scan.valid_bytes),
+                end,
+                limits,
+            ) {
+                Some(mark) if mark >= damaged => {
+                    return Err(WriterError::DurableGroupDamaged(damaged));
+                }
+                Some(_) => later.push(end as u64 - 4096..end as u64),
+                None => {}
+            }
+        }
+    }
+    let truncate = matches!(scan.tail, TailState::Truncated { .. }).then_some(scan.valid_bytes);
+    if truncate.is_some() {
+        later.clear();
+    }
+    Ok(finish(scan, generation, segment_digest, truncate, later))
+}
+
 fn fixture(initial: ChainPosition, fault: u8) -> (Vec<u8>, Vec<ChainPosition>) {
     let header = SegmentHeader::new(
         GroupId::from_bytes([1; 16]),
@@ -42,9 +99,75 @@ fn fixture(initial: ChainPosition, fault: u8) -> (Vec<u8>, Vec<ChainPosition>) {
         operations.push(operation);
     }
     let mut image = encode_segment_header(&header).to_vec();
-    let group = encode_group(&header, 1, image.len() as u64, initial, &operations).unwrap();
+    let group = encode_group(
+        &header,
+        crate::GroupStart::new(1, image.len() as u64, initial),
+        &operations,
+    )
+    .unwrap();
     image.extend_from_slice(group.as_bytes());
     (image, positions)
+}
+
+/// Three groups of two operations, stamped with `marks` as a writer with
+/// writes in flight would. Returns the image and each group's end offset.
+fn marked_groups(marks: [u64; 3]) -> (Vec<u8>, Vec<u64>) {
+    let header = SegmentHeader::new(
+        GroupId::from_bytes([1; 16]),
+        1,
+        None,
+        Digest::ZERO,
+        2 * 1024 * 1024,
+    )
+    .unwrap();
+    let mut image = encode_segment_header(&header).to_vec();
+    let mut chain = ChainPosition::GENESIS;
+    let mut ends = Vec::new();
+    for (number, mark) in (1..).zip(marks) {
+        let start = crate::GroupStart::new(number, image.len() as u64, chain);
+        let mut operations = Vec::new();
+        for _ in 0..2 {
+            let operation = CanonicalOperation {
+                group_id: header.group_id(),
+                configuration_epoch: 1,
+                original_view: 1,
+                op_number: chain.next_op_number(),
+                previous_digest: chain.previous_digest(),
+                kind: OperationKind::Barrier,
+                body: &[3; 16],
+            };
+            chain = ChainPosition::new(
+                operation.op_number + 1,
+                logical_operation_digest(&operation),
+            );
+            operations.push(operation);
+        }
+        let digests = operations
+            .iter()
+            .map(|operation| ozzy_journal::operation::canonical_body_digest(operation.body))
+            .collect::<Vec<_>>();
+        let mut bodies = crate::codec::prepare_group_bodies(
+            operations.iter().map(|operation| operation.body),
+            crate::BodyEncoding::Raw,
+            Vec::new(),
+            &mut crate::codec::BodyEncodeScratch::default(),
+        )
+        .unwrap();
+        let finalized = crate::codec::finalize_group_bodies(
+            &header,
+            crate::codec::GroupWrite {
+                start,
+                durable_through: mark,
+            },
+            &operations,
+            &digests,
+            &mut bodies,
+        )
+        .unwrap();
+        image.extend_from_slice(bodies.finish(finalized).as_bytes());
+        ends.push(image.len() as u64);
+    }
+    (image, ends)
 }
 
 fn validation(protected: [Option<ChainPosition>; 2]) -> RecoveryValidation {
@@ -76,9 +199,11 @@ fn asynchronous(
 ) -> (Result<Recovery, WriterError>, usize) {
     run(prepare_async(
         image,
-        JournalGeneration(2),
-        1,
-        initial,
+        Start {
+            generation: JournalGeneration(2),
+            first_group_number: 1,
+            initial_chain: initial,
+        },
         DecodeLimits::default(),
         validation,
     ))
@@ -117,7 +242,7 @@ fn cooperative_recovery_validates_each_operation_inside_one_group() {
         expected.writer.structural_digest()
     );
     assert_eq!(result.truncate, None);
-    assert_eq!(result.zero, 0..0);
+    assert_eq!(result.invalidate, [] as [Range<u64>; 0]);
 }
 
 #[test]
@@ -186,14 +311,16 @@ fn cooperative_recovery_cancellation_keeps_exact_damaged_tail_decisions() {
         polls >= 6,
         "validation and long reverse-tail scan must yield"
     );
-    assert_eq!(result.zero, valid..valid + 4096);
+    assert_eq!(result.invalidate, [] as [Range<u64>; 0]);
     assert_eq!(result.truncate, None);
     for cut in 1..polls {
         let mut future = Box::pin(prepare_async(
             &image,
-            JournalGeneration(2),
-            1,
-            ChainPosition::GENESIS,
+            Start {
+                generation: JournalGeneration(2),
+                first_group_number: 1,
+                initial_chain: ChainPosition::GENESIS,
+            },
             DecodeLimits::default(),
             requirements,
         ));
@@ -205,7 +332,9 @@ fn cooperative_recovery_cancellation_keeps_exact_damaged_tail_decisions() {
         drop(future);
         assert_eq!(image, before);
         let (result, _) = asynchronous(&image, ChainPosition::GENESIS, requirements);
-        assert_eq!(result.unwrap().zero, valid..valid + 4096);
+        let result = result.unwrap();
+        assert_eq!(result.writer.written_position().end_offset(), valid);
+        assert_eq!(result.invalidate, [] as [Range<u64>; 0]);
     }
     image.truncate(valid as usize - 1);
     let (result, _) = asynchronous(
@@ -215,5 +344,99 @@ fn cooperative_recovery_cancellation_keeps_exact_damaged_tail_decisions() {
     );
     let result = result.unwrap();
     assert_eq!(result.truncate, Some(crate::SEGMENT_HEADER_BYTES as u64));
-    assert_eq!(result.zero, 0..0);
+    assert_eq!(result.invalidate, [] as [Range<u64>; 0]);
+}
+
+#[test]
+fn recovery_refuses_a_damaged_group_that_a_later_group_marks_durable() {
+    let (mut image, ends) = marked_groups([0, 1, 2]);
+    // Group 3 was prepared after group 2 completed, so group 2 is durable.
+    image[ends[0] as usize + 200] ^= 1;
+    let (result, _) = asynchronous(&image, ChainPosition::GENESIS, validation([None; 2]));
+    assert!(matches!(result, Err(WriterError::DurableGroupDamaged(2))));
+}
+
+#[test]
+fn recovery_ends_the_log_at_a_damaged_group_no_later_group_marks() {
+    // Group 3 was prepared while group 2 was in flight and completed first;
+    // a crash left group 2 unfinished. Neither was ever voted.
+    let (mut image, ends) = marked_groups([0, 1, 1]);
+    image[ends[0] as usize + 200] ^= 1;
+    let (result, _) = asynchronous(&image, ChainPosition::GENESIS, validation([None; 2]));
+    let result = result.unwrap();
+    assert_eq!(result.writer.written_position().end_offset(), ends[0]);
+    // Group 3 loses its seal, so a rewritten group 2 cannot chain into it.
+    assert_eq!(result.invalidate, vec![ends[2] - 4096..ends[2]]);
+    // A torn newest group ends the log the same way, with nothing after it.
+    let (mut image, ends) = marked_groups([0, 1, 2]);
+    image[ends[1] as usize + 200] ^= 1;
+    let (result, _) = asynchronous(&image, ChainPosition::GENESIS, validation([None; 2]));
+    let result = result.unwrap();
+    assert_eq!(result.writer.written_position().end_offset(), ends[1]);
+    assert_eq!(result.invalidate, [] as [Range<u64>; 0]);
+}
+
+#[test]
+fn a_rewritten_damaged_group_cannot_chain_into_an_invalidated_later_group() {
+    // Group 3 completed while group 2 was in flight; a crash tore group 2.
+    let (original, ends) = marked_groups([0, 1, 1]);
+    let (whole, _) = asynchronous(&original, ChainPosition::GENESIS, validation([None; 2]));
+    assert_eq!(
+        whole.unwrap().writer.written_position().end_offset(),
+        ends[2],
+        "intact, group 3 chains after group 2"
+    );
+    let mut image = original.clone();
+    image[ends[0] as usize + 200] ^= 1;
+    let (result, _) = asynchronous(&image, ChainPosition::GENESIS, validation([None; 2]));
+    for range in result.unwrap().invalidate {
+        image[range.start as usize..range.end as usize].fill(0);
+    }
+    // The writer then writes group 2 again, byte for byte.
+    let group = ends[0] as usize..ends[1] as usize;
+    image[group.clone()].copy_from_slice(&original[group]);
+    let (result, _) = asynchronous(&image, ChainPosition::GENESIS, validation([None; 2]));
+    let result = result.unwrap();
+    assert_eq!(result.writer.written_position().end_offset(), ends[1]);
+    assert_eq!(result.invalidate, [] as [Range<u64>; 0]);
+}
+
+#[test]
+fn bytes_after_the_log_end_it_even_beyond_decode_limits() {
+    let (mut image, ends) = marked_groups([0, 1, 2]);
+    // An earlier use of the file left a group with a larger entry here.
+    let old = SegmentHeader::new(
+        GroupId::from_bytes([1; 16]),
+        7,
+        None,
+        Digest::ZERO,
+        2 * 1024 * 1024,
+    )
+    .unwrap();
+    let operation = CanonicalOperation {
+        group_id: old.group_id(),
+        configuration_epoch: 1,
+        original_view: 1,
+        op_number: 1,
+        previous_digest: Digest::ZERO,
+        kind: OperationKind::Barrier,
+        body: &[5; 2048],
+    };
+    let start = crate::GroupStart::new(1, image.len() as u64, ChainPosition::GENESIS);
+    let group = encode_group(&old, start, &[operation]).unwrap();
+    image.extend_from_slice(group.as_bytes());
+    let limits = DecodeLimits {
+        max_entry_bytes: 1024,
+        max_decoded_body_bytes: 1024,
+        ..DecodeLimits::default()
+    };
+    let start = Start {
+        generation: JournalGeneration(2),
+        first_group_number: 1,
+        initial_chain: ChainPosition::GENESIS,
+    };
+    let (result, _) = run(prepare_async(&image, start, limits, validation([None; 2])));
+    let result = result.unwrap();
+    assert_eq!(result.writer.written_position().end_offset(), ends[2]);
+    assert_eq!(result.invalidate, [] as [Range<u64>; 0]);
 }

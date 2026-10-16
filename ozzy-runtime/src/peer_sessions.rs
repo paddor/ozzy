@@ -1,16 +1,12 @@
 //! Native broker/client link negotiation, including simultaneous HELLO.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use arc_swap::ArcSwap;
 use bytes::Bytes;
 use ozzy_proto::data::DataLimits;
 use ozzy_proto::handshake::{self, Handshake, Parameters};
 use ozzy_proto::{Envelope, LinkSessionId, NodeId, Opcode, Packet, RequestId};
 
-use crate::signal::StateSignal;
 use crate::{Error, Result};
 
 mod ids;
@@ -31,31 +27,42 @@ struct Peer {
     welcome_superseded: Option<u128>,
 }
 
-/// Bounded HELLO/WELCOME state shared by broker and SDK transports. Owns link
+/// Bounded HELLO/WELCOME state of one broker or SDK transport owner. Owns link
 /// fences, not authorization, partition roles, queue permits, or confirmations.
+/// The owner publishes its own fenced view of the live links.
 #[derive(Debug)]
 pub struct Sessions {
     local: NodeId,
     instance: u128,
-    next_nonce: AtomicU64,
+    next_nonce: u64,
     parameters: Parameters,
     receive_profiles: HashMap<NodeId, DataLimits>,
     required_remote_roles: u32,
     maximum: usize,
-    ids: Mutex<LinkIds>,
-    peers: Mutex<HashMap<NodeId, Peer>>,
-    current: ArcSwap<HashMap<NodeId, LinkSessionId>>,
-    changed: StateSignal,
+    ids: LinkIds,
+    peers: HashMap<NodeId, Peer>,
 }
 
 /// Result of a handshake observation. Install any changed fence before routing
 /// application traffic. A reply still needs bounded transport admission.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Handled {
     /// Three Ozzy frames, excluding the transport destination identity.
     pub reply: Option<Vec<Bytes>>,
-    /// The live session changed. Old grants and replies must be invalidated.
-    pub replaced: bool,
+    /// A new live session replaced the old one. Old grants and replies must
+    /// be invalidated.
+    pub replaced: Option<Established>,
+}
+
+/// Live session installed by a handshake.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Established {
+    /// New link fence.
+    pub session: LinkSessionId,
+    /// Remote receive limits and the capabilities both sides support.
+    pub remote: Parameters,
+    /// Common outbound codec bounds within both endpoint profiles.
+    pub send: DataLimits,
 }
 
 impl Sessions {
@@ -84,91 +91,76 @@ impl Sessions {
         maximum: usize,
         ids: LinkIds,
     ) -> Result<Self> {
-        Self::with_receive_profiles(local, parameters, required_remote_roles, maximum, ids, &[])
+        parameters.validate()?;
+        if local.as_bytes() == &[0; 16] || maximum == 0 || required_remote_roles & !31 != 0 {
+            return Err(Error::NotConnected);
+        }
+        Ok(Self {
+            local,
+            instance: ids.next()?,
+            next_nonce: 1,
+            parameters,
+            receive_profiles: HashMap::new(),
+            required_remote_roles,
+            maximum,
+            ids,
+            peers: HashMap::new(),
+        })
     }
 
     /// Fixed, independently authorized peer profiles. Overrides change receive
     /// bounds only, preserving capability/role negotiation and session fencing.
     pub(crate) fn with_receive_profiles(
-        local: NodeId,
-        parameters: Parameters,
-        required_remote_roles: u32,
-        maximum: usize,
-        ids: LinkIds,
+        mut self,
         profiles: &[(NodeId, DataLimits)],
     ) -> Result<Self> {
-        parameters.validate()?;
-        if local.as_bytes() == &[0; 16]
-            || maximum == 0
-            || required_remote_roles & !31 != 0
-            || profiles.len() > maximum
-        {
+        if profiles.len() > self.maximum {
             return Err(Error::NotConnected);
         }
-        let mut receive_profiles = HashMap::new();
         for &(remote, receive) in profiles {
             Parameters {
                 receive,
-                ..parameters
+                ..self.parameters
             }
             .validate()?;
-            if remote == local
+            if remote == self.local
                 || remote.as_bytes() == &[0; 16]
-                || receive_profiles.insert(remote, receive).is_some()
+                || self.receive_profiles.insert(remote, receive).is_some()
             {
                 return Err(Error::NotConnected);
             }
         }
-        Ok(Self {
-            local,
-            instance: ids.next()?,
-            next_nonce: AtomicU64::new(1),
-            parameters,
-            receive_profiles,
-            required_remote_roles,
-            maximum,
-            ids: Mutex::new(ids),
-            peers: Mutex::new(HashMap::new()),
-            current: ArcSwap::from_pointee(HashMap::new()),
-            changed: StateSignal::default(),
-        })
+        Ok(self)
     }
 
     /// Begin or retry one HELLO. Repeated calls preserve its exact request and
     /// nonce until negotiation finishes. Beginning a new attempt fences the old
     /// live session immediately; the caller must also fence its grants/replies.
-    #[allow(
-        deprecated,
-        reason = "Atomic::try_update requires Rust 1.95; MSRV is 1.93"
-    )]
-    pub fn start(&self, remote: NodeId) -> Result<Vec<Bytes>> {
+    pub fn start(&mut self, remote: NodeId) -> Result<Vec<Bytes>> {
         if remote == self.local || remote.as_bytes() == &[0; 16] {
             return Err(Error::NotConnected);
         }
         let parameters = self.profile(remote);
-        let mut peers = self.peers.lock().expect("session mutex poisoned");
-        self.capacity(&peers, remote)?;
-        let peer = peers.entry(remote).or_default();
-        if peer.pending.is_none() {
-            let nonce = self
-                .next_nonce
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-                .map_err(|_| Error::NotConnected)?;
-            peer.pending = Some((
-                RequestId::from_bytes(self.next_id()?.to_be_bytes()),
+        self.capacity(remote)?;
+        let peer = self.peers.entry(remote).or_default();
+        let (id, hello) = if let Some(attempt) = peer.pending {
+            attempt
+        } else {
+            let nonce = self.next_nonce;
+            self.next_nonce = nonce.checked_add(1).ok_or(Error::NotConnected)?;
+            *peer.pending.insert((
+                RequestId::from_bytes(self.ids.next()?.to_be_bytes()),
                 Handshake {
                     superseded_hello: None,
                     instance_id: self.instance,
                     hello_nonce: u128::from(nonce),
                     parameters,
                 },
-            ));
-        }
-        let (id, hello) = peer.pending.expect("installed attempt");
+            ))
+        };
         // A repeated simultaneous initiator shares the active HELLO attempt.
         peer.live = None;
         peer.incoming = None;
-        self.publish(&peers);
         encode(
             Envelope {
                 opcode: Opcode::Hello,
@@ -182,17 +174,9 @@ impl Sessions {
         )
     }
 
-    /// Cancel-safe wait for this one broker link, without waiting for other
-    /// brokers, partitions, or application authority.
-    pub async fn ready(&self, remote: NodeId) {
-        self.changed
-            .wait_for(|| self.session(remote).map(|_| ()))
-            .await;
-    }
-
     /// Current independently negotiated link fence, if established.
     pub fn session(&self, remote: NodeId) -> Option<LinkSessionId> {
-        self.current.load().get(&remote).copied()
+        self.peers.get(&remote)?.live.map(|live| live.id)
     }
 
     /// Test a command's session before admitting any application work.
@@ -200,95 +184,56 @@ impl Sessions {
         self.session(remote) == Some(session)
     }
 
-    /// Negotiated capabilities and the remote's directional receive limits.
-    /// These limits do not constitute destination-backed admission credit.
-    pub fn remote_parameters(&self, remote: NodeId) -> Option<Parameters> {
-        let peers = self.peers.lock().expect("session mutex poisoned");
-        let mut parameters = peers.get(&remote)?.live?.remote;
-        parameters.capabilities &= self.parameters.capabilities;
-        Some(parameters)
+    /// The live session, its negotiated parameters, and send limits. The
+    /// remote limits do not constitute destination-backed admission credit.
+    pub fn established(&self, remote: NodeId) -> Option<Established> {
+        Some(self.establish(remote, self.peers.get(&remote)?.live?))
+    }
+
+    fn establish(&self, remote: NodeId, live: Live) -> Established {
+        Established {
+            session: live.id,
+            remote: Parameters {
+                capabilities: live.remote.capabilities & self.parameters.capabilities,
+                ..live.remote
+            },
+            send: self
+                .receive_limits(remote)
+                .intersection(live.remote.receive),
+        }
     }
 
     /// Forget live/pending state while retaining the old receive fence and its
     /// metadata slot. A delayed duplicate HELLO cannot resurrect the old link.
-    pub fn disconnect(&self, remote: NodeId) {
-        let mut peers = self.peers.lock().expect("session mutex poisoned");
-        if let Some(peer) = peers.get_mut(&remote) {
+    pub fn disconnect(&mut self, remote: NodeId) {
+        if let Some(peer) = self.peers.get_mut(&remote) {
             peer.live = None;
             peer.pending = None;
             peer.incoming = None;
             peer.welcome_superseded = None;
         }
-        self.publish(&peers);
-        drop(peers);
-        self.changed.notify_changed();
     }
 
     /// Reclaim metadata after the transport owner completes dequeued input and
     /// observes control retirement. OMQ fences remaining queued/restored input.
-    pub(crate) fn retire(&self, remote: NodeId) {
-        let mut peers = self.peers.lock().expect("session mutex poisoned");
-        peers.remove(&remote);
-        self.publish(&peers);
-        drop(peers);
-        self.changed.notify_changed();
-    }
-
-    /// Common codec bounds within both configured endpoint profiles.
-    pub fn send_limits(&self, remote: NodeId) -> Result<DataLimits> {
-        let local = self.receive_limits(remote);
-        let peers = self.peers.lock().expect("session mutex poisoned");
-        let remote = peers
-            .get(&remote)
-            .and_then(|p| p.live)
-            .ok_or(Error::NotConnected)?
-            .remote
-            .receive;
-        Ok(local.intersection(remote))
+    pub(crate) fn retire(&mut self, remote: NodeId) {
+        self.peers.remove(&remote);
     }
 
     /// Process one bounded handshake. `remote` comes from an independently
     /// validated transport identity. No socket, timer, or payload work occurs.
-    pub fn receive(&self, remote: NodeId, packet: Packet<'_>) -> Result<Handled> {
-        let parameters = self.profile(remote);
-        let h = handshake::decode(packet, parameters.receive.envelope)?;
-        if packet.envelope.sender != remote
-            || remote == self.local
-            || remote.as_bytes() == &[0; 16]
-            || h.parameters.roles & self.required_remote_roles != self.required_remote_roles
-        {
-            return Err(Error::NotConnected);
+    pub fn receive(&mut self, remote: NodeId, packet: Packet<'_>) -> Result<Handled> {
+        let (h, selected) = self.check_handshake(remote, packet)?;
+        if packet.envelope.opcode == Opcode::Welcome && !self.peers.contains_key(&remote) {
+            return Ok(Handled::default());
         }
-        let selected = parameters.select(h.parameters)?;
-        let mut peers = self.peers.lock().expect("session mutex poisoned");
-        if packet.envelope.opcode == Opcode::Welcome && !peers.contains_key(&remote) {
-            return Ok(Handled {
-                reply: None,
-                replaced: false,
-            });
-        }
-        self.capacity(&peers, remote)?;
-        let peer = peers.entry(remote).or_default();
+        self.capacity(remote)?;
+        let peer = self.peers.entry(remote).or_default();
         let old = peer.live.map(|l| l.id);
         let reply = match packet.envelope.opcode {
             Opcode::Hello => {
-                if peer.observed.is_some_and(|(instance, nonce)| {
-                    instance == h.instance_id
-                        && (h.hello_nonce < nonce
-                            || (h.hello_nonce == nonce && peer.incoming != Some(h)))
-                }) {
-                    return Ok(Handled {
-                        reply: None,
-                        replaced: false,
-                    });
-                }
-                // During simultaneous initiation, lower ID's HELLO wins.
-                if peer.pending.is_some() && self.local < remote {
-                    peer.observed = Some((h.instance_id, h.hello_nonce));
-                    return Ok(Handled {
-                        reply: None,
-                        replaced: false,
-                    });
+                if peer.ignores_hello(h, self.local < remote) {
+                    return Ok(Handled::default());
                 }
                 let duplicate = peer.incoming == Some(h);
                 let superseded = if duplicate {
@@ -299,7 +244,7 @@ impl Sessions {
                 let session = if duplicate {
                     old.ok_or(Error::NotConnected)?
                 } else {
-                    LinkSessionId::from_bytes(self.next_id()?.to_be_bytes())
+                    LinkSessionId::from_bytes(self.ids.next()?.to_be_bytes())
                 };
                 let response = encode(
                     Envelope {
@@ -317,14 +262,7 @@ impl Sessions {
                     },
                     h.parameters.receive,
                 )?;
-                peer.observed = Some((h.instance_id, h.hello_nonce));
-                peer.pending = None;
-                peer.welcome_superseded = superseded;
-                peer.incoming = Some(h);
-                peer.live = Some(Live {
-                    id: session,
-                    remote: h.parameters,
-                });
+                peer.accept_hello(h, session, superseded);
                 Some(response)
             }
             Opcode::Welcome => {
@@ -333,11 +271,29 @@ impl Sessions {
             }
             _ => return Err(Error::NotConnected),
         };
-        let replaced = old != peer.live.map(|l| l.id);
-        self.publish(&peers);
-        drop(peers);
-        self.changed.notify_changed();
+        let replaced = peer
+            .live
+            .filter(|live| old != Some(live.id))
+            .map(|live| self.establish(remote, live));
         Ok(Handled { reply, replaced })
+    }
+
+    /// Decode a HELLO or WELCOME from `remote` and select common parameters.
+    fn check_handshake(
+        &self,
+        remote: NodeId,
+        packet: Packet<'_>,
+    ) -> Result<(Handshake, Parameters)> {
+        let parameters = self.profile(remote);
+        let h = handshake::decode(packet, parameters.receive.envelope)?;
+        if packet.envelope.sender != remote
+            || remote == self.local
+            || remote.as_bytes() == &[0; 16]
+            || h.parameters.roles & self.required_remote_roles != self.required_remote_roles
+        {
+            return Err(Error::NotConnected);
+        }
+        Ok((h, parameters.select(h.parameters)?))
     }
 
     pub(crate) fn receive_limits(&self, remote: NodeId) -> DataLimits {
@@ -354,28 +310,44 @@ impl Sessions {
         }
     }
 
-    fn capacity(&self, peers: &HashMap<NodeId, Peer>, remote: NodeId) -> Result<()> {
-        if !peers.contains_key(&remote) && peers.len() >= self.maximum {
+    fn capacity(&self, remote: NodeId) -> Result<()> {
+        if !self.peers.contains_key(&remote) && self.peers.len() >= self.maximum {
             return Err(Error::TooManyPendingRequests);
         }
         Ok(())
     }
-
-    fn publish(&self, peers: &HashMap<NodeId, Peer>) {
-        self.current.store(std::sync::Arc::new(
-            peers
-                .iter()
-                .filter_map(|(&node, peer)| peer.live.map(|live| (node, live.id)))
-                .collect(),
-        ));
-    }
-
-    fn next_id(&self) -> Result<u128> {
-        self.ids.lock().expect("session ID mutex poisoned").next()
-    }
 }
 
 impl Peer {
+    /// Drop a stale or replayed HELLO, or one that loses simultaneous
+    /// initiation to this side's pending HELLO.
+    fn ignores_hello(&mut self, h: Handshake, local_wins: bool) -> bool {
+        if self.observed.is_some_and(|(instance, nonce)| {
+            instance == h.instance_id
+                && (h.hello_nonce < nonce || (h.hello_nonce == nonce && self.incoming != Some(h)))
+        }) {
+            return true;
+        }
+        // During simultaneous initiation, lower ID's HELLO wins.
+        if self.pending.is_some() && local_wins {
+            self.observed = Some((h.instance_id, h.hello_nonce));
+            return true;
+        }
+        false
+    }
+
+    /// Install the session this side's WELCOME grants.
+    fn accept_hello(&mut self, h: Handshake, session: LinkSessionId, superseded: Option<u128>) {
+        self.observed = Some((h.instance_id, h.hello_nonce));
+        self.pending = None;
+        self.welcome_superseded = superseded;
+        self.incoming = Some(h);
+        self.live = Some(Live {
+            id: session,
+            remote: h.parameters,
+        });
+    }
+
     fn welcome(&mut self, envelope: Envelope, h: Handshake, selected: Parameters) -> Result<()> {
         let Some((request, hello)) = self.pending else {
             return Ok(());

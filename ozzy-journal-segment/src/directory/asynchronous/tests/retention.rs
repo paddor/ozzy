@@ -1,10 +1,10 @@
 use super::*;
-use crate::{AsyncRetirementBudget, RetentionFloors};
+use crate::{RetentionFloors, RetirementBudget};
 
 mod scan;
 
-fn budget() -> AsyncRetirementBudget {
-    AsyncRetirementBudget {
+fn budget() -> RetirementBudget {
+    RetirementBudget {
         max_segments: 2,
         max_read_bytes: 65536,
     }
@@ -86,6 +86,80 @@ fn captured_generations_stay_readable_after_retirement_and_delay_deletion() {
 }
 
 #[test]
+fn detached_retirement_installs_beside_later_appends_in_one_publication() {
+    let (mut controller, io) = setup(baseline());
+    let mut journal = drive(&mut controller, open(io, 2)).unwrap();
+    drive(&mut controller, journal.roll_active(32768, 4)).unwrap();
+    drive(&mut controller, append_confirmed(&mut journal));
+    drive(&mut controller, journal.roll_active(32768, 4)).unwrap();
+    let mut next = journal.next_manifest().unwrap();
+    next.accepted = journal.accepted_position().unwrap();
+    next.committed = next.accepted;
+    drive(&mut controller, journal.install_metadata(next)).unwrap();
+    let position = journal.committed_position().unwrap();
+    let state = b"retained state";
+    let plan = journal
+        .prepare_checkpoint(
+            ozzy_proto::CheckpointId::from_bytes([0x66; 16]),
+            Digest::from_bytes([0x67; 32]),
+            8,
+            state.len() as u64,
+        )
+        .unwrap();
+    let floors = RetentionFloors::new(vec![]).unwrap();
+    let scan = journal
+        .prepare_retirement_scan(floors.clone(), position, budget(), &[])
+        .unwrap();
+    let repeated = journal
+        .prepare_retirement_scan(floors, position, budget(), &[])
+        .unwrap();
+    // Appends continue while the checkpoint is written and the prefix scanned.
+    drive(&mut controller, append_confirmed(&mut journal));
+    let files = drive(&mut controller, async {
+        let mut writer = plan.start().await.unwrap();
+        writer.push(state).await.unwrap();
+        writer.finish().await.unwrap()
+    });
+    let prefix = drive(&mut controller, scan.scan()).unwrap();
+    assert_eq!(
+        prefix
+            .references()
+            .iter()
+            .map(|reference| reference.segment_id)
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
+    let generation = journal.manifest.generation;
+    let mut rescanned = false;
+    let retired = crate::test_io::drive_with(
+        &mut controller,
+        journal.install_retirement(Some(&files), prefix),
+        |operation| {
+            rescanned |= matches!(
+                operation,
+                Operation::Open { path, .. }
+                    if path.ends_with("segments/1.log") || path.ends_with("segments/2.log")
+            );
+            Effect::Normal
+        },
+    )
+    .unwrap();
+    assert!(
+        !rescanned,
+        "selecting the published committed position rescanned history"
+    );
+    assert_eq!(retired.unreferenced_segment_ids, [1, 2]);
+    assert_eq!(journal.manifest.generation, generation + 1);
+    assert_eq!(journal.manifest.checkpoint.unwrap().position, position);
+    assert_eq!(journal.manifest.segments.len(), 1);
+    let repeated = drive(&mut controller, repeated.scan()).unwrap();
+    assert!(matches!(
+        drive(&mut controller, journal.install_retirement(None, repeated)),
+        Err(DirectoryError::RetentionPrefixMismatch)
+    ));
+}
+
+#[test]
 fn retirement_scan_bounds_and_damaged_authority_prevent_unlinking() {
     let (mut controller, io) = setup(retained_baseline());
     let mut journal = drive(&mut controller, open(io, 3)).unwrap();
@@ -95,7 +169,7 @@ fn retirement_scan_bounds_and_damaged_authority_prevent_unlinking() {
             &mut controller,
             journal.retire_sealed_prefix(
                 &floors,
-                AsyncRetirementBudget {
+                RetirementBudget {
                     max_segments: 1,
                     max_read_bytes: 32767
                 }
@@ -108,7 +182,7 @@ fn retirement_scan_bounds_and_damaged_authority_prevent_unlinking() {
         &mut controller,
         journal.retire_sealed_prefix(
             &floors,
-            AsyncRetirementBudget {
+            RetirementBudget {
                 max_segments: 1,
                 max_read_bytes: 32768,
             },

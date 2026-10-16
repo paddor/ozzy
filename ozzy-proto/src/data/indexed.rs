@@ -17,11 +17,15 @@ impl IndexedRecords {
     pub fn new(records: OwnedRecords) -> Self {
         let view = records.as_records();
         let mut cursor = view.iter();
-        let mut positions = Vec::with_capacity(view.len() + 1);
+        let mut positions = Vec::with_capacity(view.len().saturating_add(1));
         positions.push((0, 0));
         while cursor.next().is_some() {
+            #[expect(
+                clippy::arithmetic_side_effects,
+                reason = "a cursor's rest is a suffix of the view it walks"
+            )]
             positions.push((
-                view.descriptor_bytes() - cursor.descriptors.0.len(),
+                view.descriptor_bytes() - cursor.descriptors.rest().len(),
                 view.payload_bytes() - cursor.payload.len(),
             ));
         }
@@ -44,11 +48,11 @@ impl IndexedRecords {
             return None;
         }
         let (descriptors, payload) = self.records.as_records().encoded();
-        let start = self.positions[range.start];
-        let end = self.positions[range.end];
+        let start = *self.positions.get(range.start)?;
+        let end = *self.positions.get(range.end)?;
         Some(Records {
-            descriptors: &descriptors[start.0..end.0],
-            payload: &payload[start.1..end.1],
+            descriptors: descriptors.get(start.0..end.0)?,
+            payload: payload.get(start.1..end.1)?,
             count: range.len(),
             summary: None,
         })
@@ -56,14 +60,14 @@ impl IndexedRecords {
 
     pub(super) fn get(&self, index: usize) -> Option<BatchRecord<'_>> {
         let (metadata, payload) = self.range(index..index.checked_add(1)?)?.encoded();
-        let mut cursor = super::Cursor(metadata);
-        let message_id = crate::MessageId::from_bytes(cursor.array().expect("validated ID"));
-        let (_, encoding) = super::descriptor(&mut cursor).expect("validated descriptor");
+        let mut cursor = super::Reader::new(metadata);
+        let message_id = crate::MessageId::from_bytes(cursor.array().ok()?);
+        let (_, encoding) = super::descriptor(&mut cursor).ok()?;
         Some(BatchRecord {
             message_id,
             encoding,
             payload: PayloadRef::Encoded(EncodedParts {
-                lengths: cursor.0.as_chunks::<4>().0,
+                lengths: cursor.rest().as_chunks::<4>().0,
                 payload,
             }),
         })

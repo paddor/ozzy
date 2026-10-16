@@ -56,19 +56,30 @@ fn prepare_dependencies() -> Result<()> {
 pub(crate) fn library_path() -> PathBuf {
     dependencies().join("usr/lib/x86_64-linux-gnu")
 }
-fn identity() -> Result<Value> {
-    let directory = checkout();
+/// Where the verified build identity is kept between runs.
+fn stamp() -> Result<PathBuf> {
+    Ok(cache()?.join(format!("iggy-{RELEASE}-build.json")))
+}
+
+/// Whether `directory` holds the pinned release commit without local changes.
+fn unmodified_pinned(directory: &Path) -> Result<bool> {
     let revision = capture(
         Command::new("git")
             .args(["rev-parse", "HEAD"])
-            .current_dir(&directory),
+            .current_dir(directory),
     )?;
-    let status = capture(
-        Command::new("git")
-            .args(["status", "--porcelain"])
-            .current_dir(&directory),
-    )?;
-    if revision != REVISION || !status.is_empty() {
+    Ok(revision == REVISION
+        && capture(
+            Command::new("git")
+                .args(["status", "--porcelain"])
+                .current_dir(directory),
+        )?
+        .is_empty())
+}
+
+fn identity() -> Result<Value> {
+    let directory = checkout();
+    if !unmodified_pinned(&directory)? {
         return Err("Iggy checkout must be the unmodified pinned release".into());
     }
     let tag_revision = capture(
@@ -80,20 +91,31 @@ fn identity() -> Result<Value> {
         return Err("Iggy release tag differs from pinned source".into());
     }
     Ok(
-        json!({"release_tag":RELEASE_TAG,"revision":revision,"executable_sha256":source::sha256(&binary())?,"compiler":capture(Command::new("rustc").arg("-vV").current_dir(directory))?,"features":["mimalloc"],"default_features":false,"hwloc_sha256":source::sha256(&library_path().join("libhwloc.so.15"))?,"udev_sha256":source::sha256(&library_path().join("libudev.so.1"))?}),
+        json!({"release_tag":RELEASE_TAG,"revision":REVISION,"executable_sha256":source::sha256(&binary())?,"compiler":capture(Command::new("rustc").arg("-vV").current_dir(directory))?,"features":["mimalloc"],"default_features":false,"hwloc_sha256":source::sha256(&library_path().join("libhwloc.so.15"))?,"udev_sha256":source::sha256(&library_path().join("libudev.so.1"))?}),
     )
 }
 
 /// Check or build the pinned Iggy server, retaining build diagnostics.
 pub fn prepare(no_build: bool, logs: &Path) -> Result<()> {
     let directory = checkout();
-    let stamp = cache().join(format!("iggy-{RELEASE}-build.json"));
+    let stamp = stamp()?;
     if no_build {
         if read_json(&stamp)? != identity()? {
             return Err("Iggy build stamp changed; rerun without --no-build".into());
         }
         return Ok(());
     }
+    fetch_release(&directory)?;
+    if !unmodified_pinned(&directory)? {
+        return Err("Iggy source differs from pinned release".into());
+    }
+    prepare_dependencies()?;
+    compile(&directory, logs)?;
+    json_file(&stamp, &identity()?)
+}
+
+/// Clone the pinned release, or fetch its tag into an existing checkout.
+fn fetch_release(directory: &Path) -> Result<()> {
     if !directory.exists() {
         capture(
             Command::new("git")
@@ -105,7 +127,7 @@ pub fn prepare(no_build: bool, logs: &Path) -> Result<()> {
                     RELEASE_TAG,
                     "https://github.com/apache/iggy.git",
                 ])
-                .arg(&directory),
+                .arg(directory),
         )?;
     }
     // Existing RC artifacts contain the same source commit as the final release.
@@ -117,30 +139,21 @@ pub fn prepare(no_build: bool, logs: &Path) -> Result<()> {
             "--quiet",
             &format!("refs/tags/{RELEASE_TAG}"),
         ])
-        .current_dir(&directory)
+        .current_dir(directory)
         .status()?
         .success()
     {
         capture(
             Command::new("git")
                 .args(["fetch", "--depth=1", "origin", "tag", RELEASE_TAG])
-                .current_dir(&directory),
+                .current_dir(directory),
         )?;
     }
-    if capture(
-        Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(&directory),
-    )? != REVISION
-        || !capture(
-            Command::new("git")
-                .args(["status", "--porcelain"])
-                .current_dir(&directory),
-        )?
-        .is_empty()
-    {
-        return Err("Iggy source differs from pinned release".into());
-    }
+    Ok(())
+}
+
+/// Build the release server; a failure or any warning rejects it.
+fn compile(directory: &Path, logs: &Path) -> Result<()> {
     let arguments = [
         "build",
         "--locked",
@@ -153,11 +166,10 @@ pub fn prepare(no_build: bool, logs: &Path) -> Result<()> {
         "--features",
         "mimalloc",
     ];
-    prepare_dependencies()?;
     println!("CHECK Iggy cargo {}", arguments.join(" "));
     let output = Command::new("cargo")
         .args(arguments)
-        .current_dir(&directory)
+        .current_dir(directory)
         .env(
             "CARGO_TARGET_DIR",
             artifact_root().join("cargo-target/iggy-0.9.0-rc.1"),
@@ -172,11 +184,11 @@ pub fn prepare(no_build: bool, logs: &Path) -> Result<()> {
     if !output.status.success() || String::from_utf8_lossy(&log).contains("warning:") {
         return Err("Iggy release build failed or emitted warnings".into());
     }
-    json_file(&stamp, &identity()?)
+    Ok(())
 }
 
 pub(super) fn verified_identity() -> Result<Value> {
-    let expected = read_json(&cache().join(format!("iggy-{RELEASE}-build.json")))?;
+    let expected = read_json(&stamp()?)?;
     let actual = identity()?;
     if actual != expected {
         return Err("Iggy source or executable changed".into());

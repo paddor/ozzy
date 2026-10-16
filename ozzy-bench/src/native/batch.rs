@@ -23,6 +23,8 @@ pub struct AppendBudget {
     pub record_bytes: usize,
     /// Requested SDK collection target before record and segment clamping.
     pub target_bytes: usize,
+    /// Canonical operations include producer attempt outcomes and retry proofs.
+    pub resolved: bool,
 }
 
 impl AppendBudget {
@@ -34,12 +36,12 @@ impl AppendBudget {
             .checked_mul(self.record_bytes)
             .ok_or_else(overflow)?
             .min(self.target_bytes.max(self.record_bytes));
-        let fixed = self
-            .writers
-            .checked_mul(76)
-            .and_then(|n| n.checked_add(self.records.checked_mul(24)?))
-            .and_then(|n| n.checked_add(13))
-            .ok_or_else(overflow)?;
+        let fixed = ozzy_journal::operation::append_metadata_bound(
+            self.writers,
+            self.records,
+            self.resolved,
+        )
+        .ok_or_else(overflow)?;
         let payload = requested.min(body_capacity.saturating_sub(fixed) / 2);
         if self.record_bytes == 0 || payload < self.record_bytes {
             return Err(bench_error(
@@ -63,22 +65,36 @@ impl AppendBudget {
             )
             .ok_or_else(|| bench_error("prepared APPEND budget overflow"))?;
         let message = body
-            .max(89 + 24 * ozzy_runtime::replicated::MAX_APPEND_RECORDS + payload)
+            .max(
+                ozzy_journal::operation::append_metadata_bound(
+                    1,
+                    ozzy_runtime::replicated::MAX_APPEND_RECORDS,
+                    self.resolved,
+                )
+                .ok_or_else(|| bench_error("prepared APPEND budget overflow"))?
+                    + payload,
+            )
             .max(1024)
             .min(ozzy_config::MAX_APPEND_BYTES as usize)
             .min(segment / 2);
         Ok(payload
-            .min(peer_payload_capacity(message))
+            .min(peer_payload_capacity(message, self.resolved)?)
             .min(records * self.record_bytes))
     }
 }
 
 /// Payload fitting broker PEER framing at the production APPEND record ceiling.
-pub fn peer_payload_capacity(message: usize) -> usize {
+pub fn peer_payload_capacity(message: usize, resolved: bool) -> BenchResult<usize> {
+    let bound = |records| {
+        ozzy_journal::operation::append_metadata_bound(1, records, resolved)
+            .ok_or_else(|| bench_error("APPEND metadata bound overflow"))
+    };
+    let header = bound(0)?;
+    let row = bound(1)? - header;
     let records = ozzy_runtime::replicated::MAX_APPEND_RECORDS
-        .min(message.saturating_sub(89) / 25)
+        .min(message.saturating_sub(header) / (row + 1))
         .max(1);
-    message.saturating_sub(89 + 24 * records)
+    Ok(message.saturating_sub(header + row * records))
 }
 
 /// Available canonical body bytes after physical framing and decoded-segment bounds.
@@ -110,6 +126,7 @@ mod tests {
                 records: 2048,
                 record_bytes,
                 target_bytes,
+                resolved: false,
             }
             .bounds(64 * 1024 * 1024)
             .unwrap();
@@ -120,6 +137,7 @@ mod tests {
                 records: 2048,
                 record_bytes,
                 target_bytes,
+                resolved: false,
             }
             .bounds(fixed + record_bytes * 2)
             .unwrap();
@@ -134,6 +152,7 @@ mod tests {
             records: 2048,
             record_bytes: 8192,
             target_bytes: 4 * 1024 * 1024,
+            resolved: false,
         };
         assert_eq!(
             budget
@@ -141,7 +160,7 @@ mod tests {
                 .unwrap(),
             2 * 1024 * 1024 - 49_241
         );
-        assert_eq!(peer_payload_capacity(0), 0);
+        assert_eq!(peer_payload_capacity(0, false).unwrap(), 0);
         assert!(budget.bounds(49_773 + 2 * 8192 - 1).is_err());
     }
 }

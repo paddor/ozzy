@@ -1,23 +1,19 @@
 //! Dispatcher side of bounded shard command lanes.
 
-use super::{
-    Port, ProgressError, ServiceError,
-    retention::{Capacity, Return},
-    wire,
-};
+use super::{Port, ProgressError, retention::Capacity, wire};
 use crate::{
     dispatch::{self, Budget, Budgets, Class},
     frontend::{
-        Service, SetupError,
+        ReplyError, Service, SetupError,
         inproc::{self, Inbox},
     },
+    signal::CloseSignal,
 };
 use omq_tokio::{Message, Options, TrySendError};
+use ozzy_proto::NodeId;
 use std::{
     future::Future,
-    ops::Bound::{Excluded, Unbounded},
     pin::Pin,
-    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
@@ -40,14 +36,14 @@ impl std::fmt::Debug for Parked {
 pub(in crate::frontend) struct Mailbox {
     lanes: [Inbox; 2],
     parked: [Option<Parked>; 2],
-    returns: Arc<Return>,
+    closed: CloseSignal,
     incarnation: ozzy_proto::RequestId,
     next_lane: usize,
     _context: omq_tokio::Context,
 }
 impl Drop for Mailbox {
     fn drop(&mut self) {
-        self.returns.closed.close();
+        self.closed.close();
     }
 }
 
@@ -70,7 +66,7 @@ impl Mailbox {
     }
 
     fn receive(&mut self) -> Result<Option<(usize, wire::Incoming)>, dispatch::Error> {
-        if self.returns.closed.is_closed() {
+        if self.closed.is_closed() {
             return Ok(None);
         }
         for _ in 0..2 {
@@ -101,7 +97,7 @@ impl Mailbox {
     }
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), omq_tokio::Error>> {
-        if self.returns.closed.is_closed() {
+        if self.closed.is_closed() {
             return Poll::Pending;
         }
         for index in [1, 0] {
@@ -186,7 +182,7 @@ impl Service {
             Mailbox {
                 lanes: [Inbox::new(data_in), Inbox::new(control_in)],
                 parked: [None, None],
-                returns: capacity.returns.clone(),
+                closed: capacity.closed.clone(),
                 incarnation,
                 next_lane: 1,
                 _context: context.clone(),
@@ -205,35 +201,29 @@ impl Service {
     /// Process one command. Rotate shards and classes after every bounded turn;
     /// a parked data completion leaves control and other shards runnable.
     pub fn poll_command(&mut self) -> Result<bool, dispatch::Error> {
-        let next = self
-            .port_turn
-            .and_then(|last| self.ports.range((Excluded(last), Unbounded)).next())
-            .or_else(|| self.ports.first_key_value())
-            .map(|(&id, _)| id);
-        let Some(shard) = next else { return Ok(false) };
-        self.port_turn = Some(shard);
-        let Some((index, incoming)) = self
-            .ports
-            .get_mut(&shard)
-            .expect("selected shard")
-            .receive()?
-        else {
+        let Some((shard, port)) = crate::turn::after_mut(&mut self.ports, self.port_turn) else {
             return Ok(false);
         };
+        self.port_turn = Some(shard);
+        let Some((index, incoming)) = port.receive()? else {
+            return Ok(false);
+        };
+        crate::profiling::event(crate::profiling::Event::DispatcherCommand);
         let status = self.apply_command(shard, incoming.action);
         let completion =
             Message::with_prefix(incoming.identity, wire::completion(incoming.key, status));
+        // Ports are never removed, so a missing one means the shard closed.
         self.ports
             .get_mut(&shard)
-            .expect("selected shard")
+            .ok_or(dispatch::Error::Closed)?
             .send(index, completion)?;
         Ok(true)
     }
 
     fn apply_command(&mut self, shard: u32, action: wire::Action) -> wire::Status {
         match action {
-            wire::Action::Reply(class, message) => {
-                wire::Status::Reply(self.try_reply(class, message).map_err(|(error, _)| error))
+            wire::Action::Reply(class, message, sequence) => {
+                wire::Status::Reply(self.reply_in_order(shard, class, sequence, message))
             }
             wire::Action::Publication(message) => {
                 wire::Status::Publication(self.publish(shard, message).map_err(|(error, _)| error))
@@ -250,13 +240,64 @@ impl Service {
                     match self.publish_route(&route) {
                         Ok(false) => wire::RouteStatus::Unchanged,
                         Ok(true) => wire::RouteStatus::Changed,
-                        Err(ServiceError::Watch) => wire::RouteStatus::Watch,
-                        Err(_) => unreachable!("route publication only accesses watch state"),
+                        Err(_) => wire::RouteStatus::Watch,
                     }
                 } else {
                     wire::RouteStatus::Destination
                 };
                 wire::Status::Route(result)
+            }
+        }
+    }
+
+    /// Admit one shard's replies to a destination class in sequence order. A
+    /// reply refused for capacity holds that destination's later sequences
+    /// until the shard re-submits it, so a retry is never overtaken by a reply
+    /// the shard produced after it.
+    fn reply_in_order(
+        &mut self,
+        shard: u32,
+        class: Class,
+        sequence: u64,
+        message: Message,
+    ) -> Result<(), ReplyError> {
+        let Some(peer) = message
+            .part_slice(0)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(NodeId::from_bytes)
+        else {
+            return self.try_reply(class, message).map_err(|(error, _)| error);
+        };
+        let key = (shard, peer, class);
+        if let Some(&refused) = self.refused_replies.get(&key)
+            && sequence > refused
+        {
+            if self.dispatcher.peers.contains_key(&peer) {
+                crate::profiling::event(crate::profiling::Event::DispatcherReplyHeld);
+                return Err(ReplyError::Full);
+            }
+            self.refused_replies.remove(&key);
+        }
+        match self.try_reply(class, message) {
+            Ok(()) => {
+                if self.refused_replies.get(&key) == Some(&sequence) {
+                    self.refused_replies.remove(&key);
+                }
+                Ok(())
+            }
+            Err((ReplyError::Full, _)) => {
+                self.refused_replies
+                    .entry(key)
+                    .and_modify(|refused| *refused = (*refused).min(sequence))
+                    .or_insert(sequence);
+                Err(ReplyError::Full)
+            }
+            Err((error, _)) => {
+                // The shard drops this reply, so nothing waits behind it.
+                if self.refused_replies.get(&key) == Some(&sequence) {
+                    self.refused_replies.remove(&key);
+                }
+                Err(error)
             }
         }
     }
@@ -284,6 +325,14 @@ impl Service {
         send: impl FnMut(Message) -> Result<(), TrySendError>,
         wait: impl FnMut(Message) -> Pin<Box<dyn Future<Output = ()>>>,
     ) -> Result<(), ProgressError> {
+        let (mut send, mut wait) = (send, wait);
+        // Observe send progress for refused destinations, then transmit one
+        // queued frame before admitting another command. A command that
+        // finds its destination queue full is refused and retried, so
+        // admitting commands first starves the queues they wait on.
+        self.watch_blocked(&mut wait);
+        let woke = std::future::poll_fn(|cx| Poll::Ready(self.poll_blocked(cx, &mut send))).await?;
+        let flushed = (self.has_pending() && self.flush_turn(&mut send).await?) || woke;
         for index in 0..self.ports.len() {
             if self.poll_command()? {
                 return Ok(());
@@ -292,16 +341,13 @@ impl Service {
                 tokio::task::yield_now().await;
             }
         }
-        if self.poll_watch()? {
+        if flushed || self.poll_watch()? {
             return Ok(());
         }
-        let mut send = send;
-        if self.flush_turn(&mut send).await? {
-            return Ok(());
-        }
-        let mut replies = self.reply_progress(wait).await;
+        self.watch_blocked(&mut wait);
+        let mut replies = self.reply_progress(&mut wait).await;
         std::future::poll_fn(|cx| {
-            if let Poll::Ready(result) = replies.poll_ready(self, cx, &mut send) {
+            if let Poll::Ready(result) = replies.poll_ready(self, cx, &mut send, &mut wait) {
                 return Poll::Ready(result);
             }
             for mailbox in self.ports.values_mut() {

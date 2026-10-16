@@ -2,15 +2,10 @@
 
 pub(crate) mod asynchronous;
 
-use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::io::{self};
 
 use bytes::Bytes;
-use ozzy_journal::operation::{
-    OperationBody, OperationCodecError, OperationLimits, decode_append_batches,
-    decode_operation_body,
-};
+use ozzy_journal::operation::{OperationCodecError, OperationKind, OperationLimits};
 use ozzy_proto::{
     MessageId, Offset, OwnerEpoch, PartitionIncarnation, ProducerEpoch, ProducerId,
     ProducerSequence,
@@ -19,9 +14,8 @@ use smallvec::SmallVec;
 use thiserror::Error;
 
 use crate::{
-    CodecError, DecodeLimits, ENTRY_HEADER_BYTES, IndexSource, MessageIndexEntry, OffsetIndexEntry,
-    OperationLocation, SEGMENT_HEADER_BYTES, SegmentHeader, decode_indexed_operation,
-    decode_segment_header,
+    CodecError, DecodeLimits, ENTRY_HEADER_BYTES, IndexSource, OffsetIndexEntry, OperationLocation,
+    SEGMENT_HEADER_BYTES, SegmentHeader, decode_indexed_operation, decode_segment_header,
 };
 
 mod cache;
@@ -60,136 +54,6 @@ impl IndexedRecord {
     pub fn payload_bytes(&self) -> usize {
         self.parts.iter().map(Bytes::len).sum()
     }
-}
-
-/// Read one offset location, revalidating authoritative entry bytes.
-pub fn read_indexed_record(
-    segment_path: impl AsRef<Path>,
-    source: IndexSource,
-    entry: OffsetIndexEntry,
-    decode_limits: DecodeLimits,
-    operation_limits: OperationLimits,
-) -> Result<IndexedRecord, IndexedReadError> {
-    let mut records = read_indexed_records(
-        segment_path,
-        source,
-        std::slice::from_ref(&entry),
-        decode_limits,
-        operation_limits,
-    )?;
-    let mut record = records.pop().ok_or(IndexedReadError::InvalidSelector)?;
-    for part in &mut record.parts {
-        *part = Bytes::copy_from_slice(part);
-    }
-    Ok(record)
-}
-
-/// Read selectors from one canonical operation, validating its bytes once.
-pub(crate) fn read_indexed_records(
-    segment_path: impl AsRef<Path>,
-    source: IndexSource,
-    entries: &[OffsetIndexEntry],
-    decode_limits: DecodeLimits,
-    operation_limits: OperationLimits,
-) -> Result<Vec<IndexedRecord>, IndexedReadError> {
-    let first = *entries.first().ok_or(IndexedReadError::InvalidSelector)?;
-    if entries
-        .iter()
-        .any(|entry| entry.location.operation != first.location.operation)
-    {
-        return Err(IndexedReadError::InvalidLocation);
-    }
-    with_indexed_operation(
-        segment_path.as_ref(),
-        source,
-        first,
-        decode_limits,
-        operation_limits,
-        |append, body, prepared_batches| {
-            entries
-                .iter()
-                .map(|entry| select_indexed_record(append, body, prepared_batches, *entry))
-                .collect()
-        },
-    )
-}
-
-fn with_indexed_operation<T>(
-    segment_path: &Path,
-    source: IndexSource,
-    first: OffsetIndexEntry,
-    decode_limits: DecodeLimits,
-    operation_limits: OperationLimits,
-    inspect: impl FnOnce(
-        &ozzy_journal::operation::Append<'_>,
-        &Bytes,
-        &[bool],
-    ) -> Result<T, IndexedReadError>,
-) -> Result<T, IndexedReadError> {
-    with_indexed_append_body(segment_path, source, first, decode_limits, |body| {
-        inspect_append_body(body, operation_limits, inspect)
-    })
-}
-
-fn inspect_append_body<T>(
-    body: &Bytes,
-    operation_limits: OperationLimits,
-    inspect: impl FnOnce(
-        &ozzy_journal::operation::Append<'_>,
-        &Bytes,
-        &[bool],
-    ) -> Result<T, IndexedReadError>,
-) -> Result<T, IndexedReadError> {
-    let prepared = decode_append_batches(body, operation_limits)?
-        .iter()
-        .map(|batch| batch.prepared_payload.is_some())
-        .collect::<SmallVec<[_; 4]>>();
-    let OperationBody::Append(append) = decode_operation_body(
-        ozzy_journal::operation::OperationKind::Append,
-        body,
-        operation_limits,
-    )?
-    else {
-        return Err(IndexedReadError::NotAppend);
-    };
-    inspect(&append, body, &prepared)
-}
-
-/// Validate the physical entry and its identity before decoding append records.
-/// Callers must still validate the canonical append schema against their limits.
-fn with_indexed_append_body<T>(
-    segment_path: &Path,
-    source: IndexSource,
-    first: OffsetIndexEntry,
-    decode_limits: DecodeLimits,
-    inspect: impl FnOnce(&Bytes) -> Result<T, IndexedReadError>,
-) -> Result<T, IndexedReadError> {
-    let location = validate_location(source, first, decode_limits)?;
-    let path = segment_path;
-    if !fs::symlink_metadata(path)?.file_type().is_file() {
-        return Err(IndexedReadError::NotRegularFile);
-    }
-    let mut file = File::open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.file_type().is_file() || metadata.len() < source.valid_bytes {
-        return Err(IndexedReadError::SourceMismatch);
-    }
-    let mut header_bytes = [0_u8; SEGMENT_HEADER_BYTES];
-    file.read_exact(&mut header_bytes)?;
-    let header = decode_segment_header(&header_bytes)?;
-    validate_source_header(&header, source, metadata.len())?;
-    let length =
-        usize::try_from(location.entry_bytes).map_err(|_| IndexedReadError::InvalidLocation)?;
-    let mut operation_bytes = vec![0_u8; length];
-    file.seek(SeekFrom::Start(location.entry_offset))?;
-    file.read_exact(&mut operation_bytes)?;
-    let body = decode_body(
-        &header,
-        location,
-        &Bytes::from(operation_bytes),
-        decode_limits,
-    )?;
-    inspect(&body)
 }
 
 fn validate_location(
@@ -241,7 +105,7 @@ fn decode_body(
     location: OperationLocation,
     operation_bytes: &Bytes,
     decode_limits: DecodeLimits,
-) -> Result<Bytes, IndexedReadError> {
+) -> Result<(OperationKind, Bytes), IndexedReadError> {
     let operation = decode_indexed_operation(
         header,
         location.entry_offset,
@@ -255,73 +119,17 @@ fn decode_body(
     {
         return Err(IndexedReadError::LocationMismatch);
     }
-    if operation.kind != ozzy_journal::operation::OperationKind::Append {
+    if !matches!(
+        operation.kind,
+        OperationKind::Append | OperationKind::ResolvedAppend
+    ) {
         return Err(IndexedReadError::NotAppend);
     }
     let body = match operation.body {
         std::borrow::Cow::Borrowed(body) => shared_subslice(operation_bytes, body)?,
         std::borrow::Cow::Owned(body) => Bytes::from(body),
     };
-    Ok(body)
-}
-
-fn select_indexed_record(
-    append: &ozzy_journal::operation::Append<'_>,
-    body: &Bytes,
-    prepared_batches: &[bool],
-    entry: OffsetIndexEntry,
-) -> Result<IndexedRecord, IndexedReadError> {
-    let batch_index = entry.location.batch_index as usize;
-    let batch = append
-        .batches
-        .get(batch_index)
-        .ok_or(IndexedReadError::InvalidSelector)?;
-    let prepared_payload = *prepared_batches
-        .get(batch_index)
-        .ok_or(IndexedReadError::InvalidSelector)?;
-    let record_index = entry.location.record_index as usize;
-    let record = batch
-        .records
-        .get(record_index)
-        .ok_or(IndexedReadError::InvalidSelector)?;
-    let delta = u64::try_from(record_index).map_err(|_| IndexedReadError::InvalidSelector)?;
-    let offset = batch
-        .first_offset
-        .get()
-        .checked_add(delta)
-        .map(Offset::new)
-        .ok_or(IndexedReadError::InvalidSelector)?;
-    let producer_sequence = batch
-        .first_sequence
-        .get()
-        .checked_add(delta)
-        .map(ProducerSequence::new)
-        .ok_or(IndexedReadError::InvalidSelector)?;
-    if batch.partition != entry.partition || offset != entry.offset {
-        return Err(IndexedReadError::RecordMismatch);
-    }
-    Ok(IndexedRecord {
-        encoding: record.encoding,
-        partition: batch.partition,
-        owner_epoch: batch.owner_epoch,
-        producer_id: batch.producer_id,
-        producer_epoch: batch.producer_epoch,
-        producer_sequence,
-        offset,
-        append_timestamp_millis: batch.append_timestamp_millis,
-        message_id: record.message_id,
-        parts: record
-            .parts
-            .iter()
-            .map(|part| {
-                if prepared_payload {
-                    Ok(Bytes::copy_from_slice(part))
-                } else {
-                    shared_subslice(body, part)
-                }
-            })
-            .collect::<Result<_, _>>()?,
-    })
+    Ok((operation.kind, body))
 }
 
 fn shared_subslice(bytes: &Bytes, slice: &[u8]) -> Result<Bytes, IndexedReadError> {
@@ -340,35 +148,6 @@ fn shared_range(bytes: &Bytes, slice: &[u8]) -> Result<std::ops::Range<usize>, I
         return Err(IndexedReadError::InvalidSelector);
     }
     Ok(start..end)
-}
-
-/// Read one message-ID result after verifying both index sections agree.
-pub fn read_indexed_message(
-    segment_path: impl AsRef<Path>,
-    source: IndexSource,
-    offset_entry: OffsetIndexEntry,
-    message_entry: MessageIndexEntry,
-    decode_limits: DecodeLimits,
-    operation_limits: OperationLimits,
-) -> Result<IndexedRecord, IndexedReadError> {
-    if message_entry.partition != offset_entry.partition
-        || message_entry.offset != offset_entry.offset
-    {
-        return Err(IndexedReadError::RecordMismatch);
-    }
-    let record = read_indexed_record(
-        segment_path,
-        source,
-        offset_entry,
-        decode_limits,
-        operation_limits,
-    )?;
-    if record.message_id != message_entry.message_id
-        || offset_entry.location.operation.operation_digest != message_entry.operation_digest
-    {
-        return Err(IndexedReadError::RecordMismatch);
-    }
-    Ok(record)
 }
 
 /// Indexed source, pointer, or authoritative entry failure.

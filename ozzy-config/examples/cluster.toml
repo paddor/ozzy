@@ -3,13 +3,10 @@
 # Each host needs its own data directory; the same path on different hosts is OK.
 [cluster]
 mode = "three" # Exactly three brokers; no automatic fallback to single.
+# A record confirms once the leader and one follower sync it to disk.
 
 [topics.orders]
 partitions = 16 # Every broker stores every partition; initial leaders rotate.
-# Confirm after the leader and one follower synchronize records to disk.
-confirmation = "disk-quorum"
-# Alternative: "replicated-persisting" confirms two retained copies before disk
-# sync. Losing every volatile copy can lose the confirmed, unpersisted tail.
 
 # All broker/device/controller labels below are user-chosen.
 # Start this entry with --broker my_server_1.
@@ -17,6 +14,9 @@ confirmation = "disk-quorum"
 peer = "tcp://192.0.2.1:7100" # Control and confirmations.
 data_peer = "tcp://192.0.2.1:7103" # APPENDs and replay data.
 reader_pub = "tcp://192.0.2.1:7101" # Live consumer records.
+follower_pub = "tcp://192.0.2.1:7102" # Live follower replication.
+# Admin console for ozzy-tui. No authentication: any local user can connect.
+# admin = "ipc://@ozzy-admin"
 
 [brokers.my_server_1.devices.my_ssd]
 root = "/var/lib/ozzy/data"
@@ -26,6 +26,7 @@ controller = "my_controller" # Shares workers/budgets only within this broker.
 peer = "tcp://192.0.2.2:7100"
 data_peer = "tcp://192.0.2.2:7103"
 reader_pub = "tcp://192.0.2.2:7101"
+follower_pub = "tcp://192.0.2.2:7102"
 
 [brokers.my_server_2.devices.my_ssd]
 root = "/var/lib/ozzy/data"
@@ -35,6 +36,7 @@ controller = "my_controller"
 peer = "tcp://192.0.2.3:7100"
 data_peer = "tcp://192.0.2.3:7103"
 reader_pub = "tcp://192.0.2.3:7101"
+follower_pub = "tcp://192.0.2.3:7102"
 
 [brokers.my_server_3.devices.my_ssd]
 root = "/var/lib/ozzy/data"

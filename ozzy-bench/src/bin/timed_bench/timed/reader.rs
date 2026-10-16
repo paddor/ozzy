@@ -4,8 +4,9 @@ use serde_json::Value;
 use tokio::sync::watch;
 
 use super::super::{Result, error, metrics, workload};
-use super::{Config, Window, command, config, launch, report};
+use super::{Config, Window, await_connect, command, config, launch, report};
 
+mod groups;
 pub(in crate::bench::timed) mod native;
 pub(in crate::bench::timed) mod oracle;
 
@@ -14,12 +15,16 @@ pub(super) async fn run(config: Config) -> Result<()> {
         .args
         .reader_worker
         .ok_or_else(|| error("missing reader worker"))?;
-    let mut input = launch::input();
-    let connect = command(&mut input, "connect").await?;
+    let mut input = launch::input()?;
+    let connect = await_connect(&mut input).await?;
     let setup = connect
         .get("native")
         .ok_or_else(|| error("missing production reader setup"))?;
-    native::run(config, index, setup, input).await
+    if config.args.native.groups != 0 {
+        groups::run(config, index, setup, input).await
+    } else {
+        native::run(config, index, setup, input).await
+    }
 }
 
 async fn final_counts(
@@ -42,7 +47,7 @@ async fn final_counts(
         .iter()
         .map(|n| n.as_u64().ok_or_else(|| error("invalid writer count")))
         .collect::<Result<Vec<_>>>()?;
-    if counts.len() != config.writers {
+    if counts.len() != config.logical_writers() {
         return Err(error("invalid writer count length"));
     }
     finish

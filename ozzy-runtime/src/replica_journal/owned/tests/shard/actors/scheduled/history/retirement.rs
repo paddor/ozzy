@@ -22,15 +22,14 @@ fn election_bridges_retired_commit_with_a_local_selected_source() {
 )]
 fn election_bridges_retired_commit(installed_view: u64) {
     let (mut controller, io) = setup();
-    let policy = QuorumPolicy::Durable;
-    let mut primary = replica(&mut controller, io.clone(), 0, policy, 8192);
-    let mut lagging = replica(&mut controller, io.clone(), 1, policy, 8192);
-    let mut witness = replica(&mut controller, io.clone(), 2, policy, 8192);
+    let mut primary = replica(&mut controller, io.clone(), 0, 8192);
+    let mut lagging = replica(&mut controller, io.clone(), 1, 8192);
+    let mut witness = replica(&mut controller, io.clone(), 2, 8192);
     let mut accepted = Prefix::GENESIS;
     for number in 1..=4 {
         accepted = persist(&mut controller, &mut primary);
         persist(&mut controller, &mut witness);
-        confirm(&mut primary, &witness, policy);
+        confirm(&mut primary, &witness);
         if number <= 3 {
             persist(&mut controller, &mut lagging);
         }
@@ -61,7 +60,7 @@ fn election_bridges_retired_commit(installed_view: u64) {
         primary.journal.retire_confirmed_history(
             primary.driver.begin_validation().unwrap(),
             CheckpointId::from_bytes([94; 16]),
-            ozzy_journal_segment::AsyncRetirementBudget {
+            ozzy_journal_segment::RetirementBudget {
                 max_segments: 3,
                 max_read_bytes: 3 * 32768,
             },

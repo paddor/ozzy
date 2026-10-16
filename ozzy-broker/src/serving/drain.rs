@@ -1,6 +1,6 @@
 //! Device ownership survives canceled startup and shutdown observations.
 
-use crate::{DevicePools, Shutdown, StartupError, shards::lifecycle::State};
+use crate::{DevicePools, StartupError, shards::lifecycle::State, signal::CloseSignal};
 use std::{
     panic::AssertUnwindSafe,
     sync::{
@@ -31,8 +31,11 @@ pub(super) struct Drain {
     pub(super) application: Arc<State>,
     pub(super) frontend: Arc<State>,
     pools: Box<dyn StorageOwner>,
+    /// The admin owner thread, when the broker serves an admin endpoint. It
+    /// stops with the application owners.
+    admin: ozzy_io::OwnedThreads,
     started: AtomicBool,
-    finished: Shutdown,
+    finished: CloseSignal,
     error: OnceLock<String>,
 }
 
@@ -46,27 +49,49 @@ impl DeviceDrain {
             application,
             frontend,
             pools: Box::new(pools),
+            admin: ozzy_io::OwnedThreads::new(1),
             started: AtomicBool::new(false),
-            finished: Shutdown::default(),
+            finished: CloseSignal::default(),
             error: OnceLock::new(),
         }))
+    }
+
+    /// Serve `admin` until the application owners stop, and join it before
+    /// draining devices. A failed start drains them now.
+    pub(super) async fn start_admin(
+        &self,
+        admin: Option<crate::admin::Admin>,
+    ) -> Result<(), StartupError> {
+        let Some(admin) = admin else {
+            return Ok(());
+        };
+        let drain = &self.0;
+        let owned = admin
+            .spawn(drain.application.stop.clone())
+            .and_then(|thread| drain.admin.own(thread));
+        if let Err(error) = owned {
+            drain.request();
+            let _ = drain.closed().await;
+            return Err(StartupError::Runtime(format!("admin owner: {error}")));
+        }
+        Ok(())
     }
 }
 
 impl Drain {
     pub(super) fn request(self: &Arc<Self>) {
-        self.frontend.stop.request();
-        self.application.stop.request();
+        self.frontend.stop.close();
+        self.application.stop.close();
         if !self.started.swap(true, Ordering::AcqRel) {
             let drain = self.clone();
             let spawned = std::thread::Builder::new()
-                .name("ozzy_drain".into())
+                .name("ozzy/drain".into())
                 .spawn(move || {
                     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                         futures::executor::block_on(async {
                             futures::future::join(
-                                drain.application.finished.requested(),
-                                drain.frontend.finished.requested(),
+                                drain.application.finished.closed(),
+                                drain.frontend.finished.closed(),
                             )
                             .await;
                         });
@@ -74,22 +99,23 @@ impl Drain {
                         // Completion here means its threads have exited.
                         drain.application.join();
                         drain.frontend.join();
+                        drain.admin.join();
                         drain.pools.drain();
                     }));
                     if result.is_err() {
                         let _ = drain.error.set("broker drain worker panicked".into());
                     }
-                    drain.finished.request();
+                    drain.finished.close();
                 });
             if let Err(error) = spawned {
                 let _ = self.error.set(format!("broker drain worker: {error}"));
-                self.finished.request();
+                self.finished.close();
             }
         }
     }
 
     pub(super) async fn closed(&self) -> Result<(), StartupError> {
-        self.finished.requested().await;
+        self.finished.closed().await;
         if let Some(error) = self.error.get() {
             return Err(StartupError::Runtime(error.clone()));
         }
@@ -117,12 +143,14 @@ mod tests {
         let registration = Registration::new(state.clone());
         let stop = state.stop.clone();
         let ended = ended.clone();
-        state.own(std::thread::spawn(move || {
-            futures::executor::block_on(stop.requested());
-            drop(registration);
-            std::thread::sleep(Duration::from_millis(50));
-            ended.fetch_add(1, Ordering::AcqRel);
-        }));
+        state
+            .own(std::thread::spawn(move || {
+                futures::executor::block_on(stop.closed());
+                drop(registration);
+                std::thread::sleep(Duration::from_millis(50));
+                ended.fetch_add(1, Ordering::AcqRel);
+            }))
+            .unwrap();
         state
     }
 

@@ -1,5 +1,5 @@
 //! Freeze local dependency contents, compiler settings, and the workload contract.
-use super::{Result, capture};
+use super::{Result, capture, json_field_mut};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -104,18 +104,24 @@ pub fn worker_checkout(directory: &Path) -> Result<Value> {
                 || name == "ozzy-bench/src/bin/ozzy_timed_bench.rs"
                 || name.starts_with("ozzy-bench/src/bin/timed_bench/"))
     })?;
-    value.as_object_mut().unwrap().remove("status");
+    value
+        .as_object_mut()
+        .ok_or("checkout identity is not an object")?
+        .remove("status");
     Ok(value)
 }
 
 /// Fingerprint the checkout-specific benchmark worker executable.
 pub fn worker_identity(root: &Path) -> Result<Value> {
     let mut value = identity(root)?;
-    for checkout in value["checkouts"].as_array_mut().unwrap() {
+    for checkout in json_field_mut(&mut value, "checkouts", Value::as_array_mut)? {
         if checkout["root"] == root.to_string_lossy().as_ref() {
             *checkout = worker_checkout(root)?;
         } else {
-            checkout.as_object_mut().unwrap().remove("status");
+            checkout
+                .as_object_mut()
+                .ok_or("checkout identity is not an object")?
+                .remove("status");
         }
     }
     Ok(value)
@@ -153,10 +159,10 @@ pub fn identity(root: &Path) -> Result<Value> {
     let roots = manifests
         .iter()
         .map(|m| {
-            git(
-                Path::new(m).parent().unwrap(),
-                &["rev-parse", "--show-toplevel"],
-            )
+            let directory = Path::new(m)
+                .parent()
+                .ok_or("manifest path has no directory")?;
+            git(directory, &["rev-parse", "--show-toplevel"])
         })
         .collect::<Result<BTreeSet<_>>>()?;
     let checkouts = roots

@@ -78,7 +78,7 @@ async fn hash(mut body: &[u8], remaining: &mut usize) -> Digest {
     let mut hasher = canonical_body_hasher();
     while !body.is_empty() {
         if *remaining == 0 {
-            crate::replica_journal::shard::yield_turn().await;
+            ozzy_io::signal::yield_once().await;
             *remaining = HASH_TURN_BYTES;
         }
         let count = body.len().min(*remaining);

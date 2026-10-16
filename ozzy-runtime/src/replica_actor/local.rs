@@ -2,9 +2,10 @@
 //! Transport and shared broker dispatch remain outside partition authority.
 
 mod progress;
+use super::retention_turns::{RetentionDue, RetentionStep};
 use super::{
     ActorError, ProposalOutcome, ProposalSubmitter,
-    ingress::{Ingress, Reply, Submission},
+    ingress::{Ingress, NextProposal, ProposalWait, Proposals, Reply, Submission},
     io::PendingSync,
 };
 use crate::replica_journal::{
@@ -36,6 +37,10 @@ pub struct LocalActorConfig {
     pub proposal_capacity: usize,
     /// Ready actor steps before yielding to other partition actors.
     pub turn_steps: usize,
+    /// Publish `DURABLE` once no write is in flight and none completed for this
+    /// long. Half a window of unpublished writes, due retention, or close
+    /// publishes sooner. Zero publishes as soon as no write is in flight.
+    pub evidence_quiet: std::time::Duration,
 }
 
 impl Default for LocalActorConfig {
@@ -46,6 +51,7 @@ impl Default for LocalActorConfig {
             proposal_lanes: 1,
             proposal_capacity: 64,
             turn_steps: 16,
+            evidence_quiet: std::time::Duration::ZERO,
         }
     }
 }
@@ -57,6 +63,7 @@ enum Pending {
     Admit(JournalCompletion<AdmittedAppend>),
     Apply(JournalCompletion<ValidationTicket>),
     Retention(JournalCompletion<crate::replica_journal::RetentionTurn>),
+    IdentityRetention(JournalCompletion<crate::replica_journal::IdentityRetention>),
 }
 
 #[derive(Debug)]
@@ -73,18 +80,21 @@ struct Live {
 pub struct LocalActor {
     journal: ReplicaJournal,
     now: std::time::Duration,
-    retention_at: Option<std::time::Duration>,
+    retention: RetentionDue,
     foreground_turn_due: bool,
     driver: Driver,
     config: LocalActorConfig,
     ingress: Ingress,
     submitters: Vec<ProposalSubmitter>,
-    waiting: Option<Submission>,
-    validating: Option<Reply>,
+    proposals: Proposals,
     live: VecDeque<Live>,
     pending: Option<Pending>,
     persistence: VecDeque<(JournalCompletion<WriteTicket>, Option<Instant>)>,
     sync: Option<PendingSync>,
+    /// Durable prefix the last durable evidence publication captured.
+    evidence_through: ozzy_replication::OpNumber,
+    /// When the last write completed.
+    last_persisted: Option<std::time::Duration>,
     propose_started_at: Option<Instant>,
     admit_started_at: Option<Instant>,
     apply_started_at: Option<Instant>,
@@ -100,6 +110,14 @@ impl LocalActor {
             .then(|| self.driver.begin_validation().ok())
             .flatten();
         (ticket, &mut self.journal)
+    }
+
+    /// Committed facts of `partition` for diagnostics; `None` while busy.
+    pub(super) fn facts(
+        &self,
+        partition: ozzy_proto::PartitionIncarnation,
+    ) -> Option<crate::replica_journal::PartitionFacts> {
+        self.journal.facts(partition)
     }
 
     /// Immutable partition group. This observation grants no write authority.
@@ -154,7 +172,7 @@ impl LocalActor {
     pub fn new(
         owner: OwnedJournal,
         driver: Driver,
-        config: LocalActorConfig,
+        mut config: LocalActorConfig,
         timestamp: impl Fn() -> u64 + 'static,
     ) -> Result<Self, ActorError> {
         owner.check_local_driver(&driver)?;
@@ -172,7 +190,9 @@ impl LocalActor {
             return Err(ActorError::Limits);
         }
         let journal = owner.into_shard_journal(config.journal, timestamp)?;
+        config.retention_interval = journal.retention_interval(config.retention_interval);
         let limits = driver.limits();
+        let evidence_through = driver.snapshot().journal.durable;
         let backlog = journal.backlog();
         if limits.max_operations > backlog.max_operations
             || limits.max_body_bytes > backlog.max_body_bytes
@@ -188,18 +208,19 @@ impl LocalActor {
         Ok(Self {
             journal,
             now: std::time::Duration::ZERO,
-            retention_at: config.retention_interval,
+            retention: RetentionDue::new(config.retention_interval),
             foreground_turn_due: false,
             driver,
             config,
             ingress,
             submitters,
-            waiting: None,
-            validating: None,
+            proposals: Proposals::default(),
             live: VecDeque::with_capacity(config.proposal_capacity),
             pending: None,
             persistence: VecDeque::with_capacity(limits.max_operations),
             sync: None,
+            evidence_through,
+            last_persisted: None,
             propose_started_at: None,
             admit_started_at: None,
             apply_started_at: None,
@@ -261,7 +282,7 @@ impl LocalActor {
                     return Poll::Ready(Err(error));
                 }
                 Ok(false) => {
-                    return if self.closing && self.drained() {
+                    return if self.closing && self.settled() {
                         Poll::Ready(Ok(()))
                     } else {
                         Poll::Pending
@@ -296,35 +317,58 @@ impl LocalActor {
         Ok(())
     }
 
-    fn drained(&self) -> bool {
+    /// No admitted write, barrier, live reply, or unapplied suffix remains.
+    /// Shutdown completes and maintenance may rewrite settled state.
+    fn settled(&self) -> bool {
         let state = self.driver.snapshot();
         self.pending.is_none()
             && self.persistence.is_empty()
             && self.sync.is_none()
+            && state.journal.durable == self.evidence_through
             && self.live.is_empty()
             && state.accepted == state.applied
+    }
+
+    /// No write or durable evidence is outstanding.
+    #[cfg(test)]
+    pub(crate) fn storage_idle(&self) -> bool {
+        self.persistence.is_empty()
+            && self.sync.is_none()
+            && self.driver.snapshot().journal.durable == self.evidence_through
     }
 
     fn schedule(&mut self) -> Result<bool, ActorError> {
         if self.journal.available_command_slots() == 0 {
             return Ok(false);
         }
-        if matches!(self.pending, Some(Pending::Ready(_))) {
-            let Some(Pending::Ready(ready)) = self.pending.take() else {
-                unreachable!("ready admission");
-            };
-            let (ticket, validated) = *ready;
-            return self.admit_ready(ticket, validated);
-        }
+        // Durable evidence is never a confirmation, so it waits for a quiet
+        // moment, half a window of writes, due retention, or close. It starts
+        // in the turn that made it due.
         let state = self.driver.snapshot();
         let mut changed = false;
-        if self.sync.is_none() && state.journal.written > state.journal.durable {
+        let lag = state.journal.durable.0 - self.evidence_through.0;
+        let half_window = self.driver.limits().max_operations.div_ceil(2) as u64;
+        let idle = self.persistence.is_empty();
+        if self.sync.is_none()
+            && lag > 0
+            && (self.evidence_deadline().is_some_and(|at| self.now >= at)
+                || lag >= half_window
+                || (idle && self.retention.due(self.now))
+                || self.closing)
+        {
+            let ticket = self.driver.begin_sync()?;
+            self.evidence_through = ticket.through();
             self.sync = Some(PendingSync::Barrier(
-                self.journal
-                    .begin_pipelined_sync(self.driver.begin_sync()?)?,
+                self.journal.begin_pipelined_sync(ticket)?,
             ));
             self.sync_started_at = crate::profiling::start();
             changed = true;
+        }
+        if let Some(Pending::Ready(_)) = self.pending
+            && let Some(Pending::Ready(ready)) = self.pending.take()
+        {
+            let (ticket, validated) = *ready;
+            return Ok(self.admit_ready(ticket, validated)? | changed);
         }
         if self.pending.is_some() || self.journal.available_command_slots() == 0 {
             return Ok(changed);
@@ -338,50 +382,78 @@ impl LocalActor {
             return Ok(true);
         }
         if self.closing {
-            if let Some(waiting) = self.waiting.take().or_else(|| self.ingress.pop()) {
-                waiting
-                    .reply
-                    .finish(waiting.buffer, ProposalOutcome::NotAdmitted);
-                return Ok(true);
-            }
-            return Ok(changed);
+            return Ok(self.reject_unadmitted() || changed);
         }
         let foreground_turn = std::mem::take(&mut self.foreground_turn_due);
         if !foreground_turn
-            && self.retention_at.is_some_and(|at| self.now >= at)
-            && self.waiting.is_none()
+            && self.retention.due(self.now)
+            && !self.proposals.blocks_maintenance()
+            && !self.proposals.holds_maintenance()
+            && !self.journal.retention_busy()
         {
-            if !self.persistence.is_empty()
-                || self.sync.is_some()
-                || !self.live.is_empty()
-                || state.accepted != state.applied
-            {
+            let Some(step) = self.retention.start(self.now, self.settled(), true) else {
                 return Ok(changed);
-            }
-            self.pending = Some(Pending::Retention(self.journal.retention_turn(
-                self.driver.begin_validation()?,
-                ozzy_proto::OperationId::from_bytes(*ozzy_proto::RequestId::new().as_bytes()),
-                true,
-            )?));
-            self.retention_at = self
-                .config
-                .retention_interval
-                .map(|interval| self.now.saturating_add(interval));
+            };
+            self.start_retention(step)?;
             return Ok(true);
         }
-        if self.waiting.is_none() {
-            self.waiting = self.ingress.pop();
+        Ok(self.schedule_proposal()? | changed)
+    }
+
+    /// Refuse one unadmitted proposal while closing. `true` when one was.
+    fn reject_unadmitted(&mut self) -> bool {
+        if self.proposals.reject_all() != 0 {
+            return true;
         }
-        let Some(waiting) = &self.waiting else {
-            return Ok(changed);
+        let Some(waiting) = self.ingress.pop() else {
+            return false;
         };
-        if waiting.reply.fenced() {
-            let waiting = self.waiting.take().expect("waiting request");
-            waiting
-                .reply
-                .finish(waiting.buffer, ProposalOutcome::NotAdmitted);
+        waiting
+            .reply
+            .finish(waiting.buffer, ProposalOutcome::NotAdmitted);
+        true
+    }
+
+    fn start_retention(&mut self, step: RetentionStep) -> Result<(), ActorError> {
+        self.pending = Some(match step {
+            // Identity expiry owed by the last turn runs now instead of
+            // waiting for the journal to drain for a full turn.
+            RetentionStep::Identities => {
+                self.foreground_turn_due = true;
+                crate::profiling::event(crate::profiling::Event::IdentityRetention);
+                let ticket = self.driver.begin_validation()?;
+                Pending::IdentityRetention(self.journal.retain_identities(ticket, true)?)
+            }
+            RetentionStep::Turn => {
+                crate::profiling::event(crate::profiling::Event::RetentionTurn);
+                let seed =
+                    ozzy_proto::OperationId::from_bytes(*ozzy_proto::RequestId::new().as_bytes());
+                let ticket = self.driver.begin_validation()?;
+                Pending::Retention(self.journal.retention_turn(ticket, seed, true)?)
+            }
+        });
+        Ok(())
+    }
+
+    fn schedule_proposal(&mut self) -> Result<bool, ActorError> {
+        let state = self.driver.snapshot();
+        if let Some(buffer) = self.proposals.start_maintenance() {
+            self.pending = Some(Pending::Propose(
+                self.journal
+                    .propose_append(self.driver.begin_validation()?, buffer)
+                    .map_err(|rejected| rejected.reason)?,
+            ));
             return Ok(true);
         }
+        let driver = &self.driver;
+        let waiting = match self
+            .proposals
+            .next(&mut self.ingress, || driver.begin_validation())?
+        {
+            NextProposal::Idle | NextProposal::Blocked => return Ok(false),
+            NextProposal::Finished => return Ok(true),
+            NextProposal::Ready(waiting) => waiting,
+        };
         let limits = self.driver.limits();
         if waiting.buffer.len() > limits.max_operations - state.pending_operations
             || waiting.buffer.body_bytes() > limits.max_body_bytes - state.pending_body_bytes
@@ -389,17 +461,17 @@ impl LocalActor {
                 .journal
                 .validation_has_capacity(&waiting.buffer.0, state.accepted.op)
         {
-            return Ok(changed);
+            return Ok(false);
         }
-        let mut waiting = self.waiting.take().expect("waiting request");
-        waiting.reply.scheduled();
+        let Some(buffer) = self.proposals.start() else {
+            return Ok(false);
+        };
         self.pending = Some(Pending::Propose(
             self.journal
-                .propose_append(self.driver.begin_validation()?, waiting.buffer)
+                .propose_append(self.driver.begin_validation()?, buffer)
                 .map_err(|rejected| rejected.reason)?,
         ));
         self.propose_started_at = crate::profiling::start();
-        self.validating = Some(waiting.reply);
         Ok(true)
     }
 }
@@ -407,5 +479,23 @@ impl LocalActor {
 impl LocalActor {
     pub(super) fn observe_time(&mut self, now: std::time::Duration) {
         self.now = now;
+    }
+
+    /// The next retention turn or durable evidence publication.
+    pub(super) fn next_deadline(&self, now: std::time::Duration) -> Option<std::time::Duration> {
+        super::deadline::Earliest::after(now)
+            .at(self.retention.at())
+            .at(self.evidence_deadline())
+            .get()
+    }
+
+    /// When unpublished durable evidence comes due with no write in flight.
+    fn evidence_deadline(&self) -> Option<std::time::Duration> {
+        let behind = self.driver.snapshot().journal.durable > self.evidence_through;
+        (behind && self.sync.is_none() && self.persistence.is_empty()).then(|| {
+            self.last_persisted.map_or(std::time::Duration::ZERO, |at| {
+                at.saturating_add(self.config.evidence_quiet)
+            })
+        })
     }
 }

@@ -21,25 +21,15 @@ fn copy(checked: &CheckedConfig) -> CheckedConfig {
 
 #[tokio::test(flavor = "current_thread")]
 async fn production_lost_partition_recovers_and_contributes_to_disk_quorum() {
-    tokio::time::timeout(Duration::from_secs(35), replace(Confirmation::DiskQuorum))
+    tokio::time::timeout(Duration::from_secs(35), replace())
         .await
         .unwrap();
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn production_lost_partition_recovers_and_contributes_to_replicated_persisting() {
-    tokio::time::timeout(
-        Duration::from_secs(35),
-        replace(Confirmation::ReplicatedPersisting),
-    )
-    .await
-    .unwrap();
-}
-
-async fn replace(policy: Confirmation) {
+async fn replace() {
     let root = tempfile::tempdir().unwrap();
     let runtime = WriterRuntime::new().unwrap();
-    let deployment = deployment(root.path(), DeploymentMode::Three, policy, 6);
+    let deployment = deployment(root.path(), DeploymentMode::Three, 6);
     let restart = deployment
         .iter()
         .map(|(checked, local)| (copy(checked), local.clone()))
@@ -237,11 +227,8 @@ async fn wait_for_publication(
 #[tokio::test(flavor = "current_thread")]
 async fn production_recovery_rejects_unknown_duplicate_and_local_selections_without_writes() {
     let root = tempfile::tempdir().unwrap();
-    for (mode, policy) in [
-        (DeploymentMode::Single, Confirmation::LocalDurable),
-        (DeploymentMode::Three, Confirmation::DiskQuorum),
-    ] {
-        let (checked, local) = deployment(root.path(), mode, policy, 2).remove(0);
+    for mode in [DeploymentMode::Single, DeploymentMode::Three] {
+        let (checked, local) = deployment(root.path(), mode, 2).remove(0);
         let selection = selected(RecoveryIntent::Quarantine);
         if mode == DeploymentMode::Single {
             assert!(
@@ -283,13 +270,7 @@ async fn production_recovery_rejects_unknown_duplicate_and_local_selections_with
 #[tokio::test(flavor = "current_thread")]
 async fn production_recovery_preflights_all_store_intents_before_any_mutation() {
     let root = tempfile::tempdir().unwrap();
-    let (checked, local) = deployment(
-        root.path(),
-        DeploymentMode::Three,
-        Confirmation::DiskQuorum,
-        3,
-    )
-    .remove(0);
+    let (checked, local) = deployment(root.path(), DeploymentMode::Three, 3).remove(0);
     for device in checked.deployment.deployment().brokers[&checked.plan.name]
         .devices
         .values()

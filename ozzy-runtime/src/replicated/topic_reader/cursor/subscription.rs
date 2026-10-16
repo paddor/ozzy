@@ -39,12 +39,17 @@ impl Cursor {
             start: self.selector.unwrap_or(reader::Start::Offset(self.next)),
         };
         let links = links.clone();
+        let inbox = std::sync::Arc::downgrade(&self.inbox);
         self.opening = Some(Opening {
             broker,
             session,
-            source: subscribe.target.group_source().expect("group target"),
+            subscription: subscribe.subscription,
+            source: subscribe
+                .target
+                .group_source()
+                .ok_or(BrokerLinkError::Configuration)?,
             request: Box::pin(async move {
-                let selected = links.subscribe(broker, subscribe).await?;
+                let selected = links.subscribe(broker, inbox, subscribe).await?;
                 Ok((broker, session, selected))
             }),
         });
@@ -84,7 +89,7 @@ impl Cursor {
         self.pending = None;
         self.held = None;
         self.ready = None;
-        self.inbox.clear();
+        self.clear_replay();
         self.canceling.take().or_else(|| {
             selected.map(|(broker, session, selected)| {
                 let links = links.clone();
@@ -114,6 +119,7 @@ impl Cursor {
                 }
                 Poll::Ready(Err(error)) => {
                     self.opening = None;
+                    self.early = None;
                     if let BrokerLinkError::RetentionGap { earliest } = error {
                         return Err(TopicReaderError::RetentionGap {
                             partition: self.number,
@@ -193,15 +199,24 @@ impl Cursor {
         Ok(())
     }
 
-    pub(super) fn retire(&mut self, links: &BrokerLinks) {
+    pub(super) fn retire(
+        &mut self,
+        links: &BrokerLinks,
+        routes: &TopicRoutes,
+        cx: &mut Context<'_>,
+    ) -> Result<(), TopicReaderError> {
         if self.live.replay().is_none()
             && let Some((broker, session, selected)) = self.selected.take()
         {
             let links = links.clone();
-            self.inbox.clear();
+            self.clear_replay();
             self.canceling = Some(Box::pin(async move {
                 links.unsubscribe(broker, session, selected).await
             }));
+            // Queue the UNSUBSCRIBE now. Until the driver sends it, frames
+            // of this generation still enter the inbox.
+            self.poll_returns(routes, cx)?;
         }
+        Ok(())
     }
 }

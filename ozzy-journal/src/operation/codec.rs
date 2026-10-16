@@ -9,22 +9,24 @@ use ozzy_proto::OperationId;
 use smallvec::SmallVec;
 use std::ops::Range;
 
-mod append;
+pub(super) mod append;
 mod control;
+mod group;
 mod primitives;
 pub(super) use append::{
-    AppendTotals, decode_append_batch, encode_append_records, records_are_tiny,
-    validate_append_descriptors, validate_tiny_descriptors,
+    AppendTotals, TinyTable, decode_append_batch, encode_append_records, read_descriptor_head,
+    records_are_tiny, validate_append_descriptors, validate_tiny_descriptors,
 };
 use append::{decode_append, encode_append};
 use control::{
-    decode_assign, decode_create, decode_open_producer, decode_policy,
+    decode_assign, decode_create, decode_dedup_watermark, decode_open_producer, decode_policy,
     decode_producer_result_floor, decode_progress, decode_trim, encode_assign, encode_create,
-    encode_open_producer, encode_policy, encode_producer_result_floor, encode_progress,
-    encode_trim,
+    encode_dedup_watermark, encode_open_producer, encode_policy, encode_producer_result_floor,
+    encode_progress, encode_trim,
 };
 pub(super) use primitives::{
-    Decoder, Encoder, enforce_limit, validate_limits, validate_position_count,
+    Encoder, ReadFields, Reader, encode_atomic, enforce_limit, validate_limits,
+    validate_position_count,
 };
 
 /// Encode one typed body into its canonical network-byte-order representation.
@@ -57,30 +59,28 @@ pub fn append_operation_body_to(
     body: &OperationBody<'_>,
     limits: OperationLimits,
 ) -> Result<Range<usize>, OperationCodecError> {
-    validate_limits(limits)?;
-    let start = output.len();
-    let mut encoder = Encoder::new(output, start, limits.max_body_bytes);
-    let result = (|| {
+    primitives::encode_atomic(output, limits, |encoder| {
         match body {
-            OperationBody::CreatePartition(value) => encode_create(value, limits, &mut encoder)?,
-            OperationBody::OpenProducer(value) => encode_open_producer(*value, &mut encoder)?,
-            OperationBody::Append(value) => encode_append(value, limits, &mut encoder)?,
-            OperationBody::Progress(value) => encode_progress(*value, &mut encoder)?,
-            OperationBody::Assign(value) => encode_assign(*value, &mut encoder)?,
-            OperationBody::Trim(value) => encode_trim(*value, &mut encoder)?,
-            OperationBody::PartitionPolicy(value) => encode_policy(*value, &mut encoder)?,
+            OperationBody::CreatePartition(value) => encode_create(value, limits, encoder)?,
+            OperationBody::OpenProducer(value) => encode_open_producer(*value, encoder)?,
+            OperationBody::Append(value) => encode_append(value, limits, encoder)?,
+            OperationBody::ResolvedAppend(value) => {
+                super::resolved::encode_resolved_append(value, limits, encoder)?;
+            }
+            OperationBody::Progress(value) => encode_progress(*value, encoder)?,
+            OperationBody::Assign(value) => encode_assign(*value, encoder)?,
+            OperationBody::Trim(value) => encode_trim(*value, encoder)?,
+            OperationBody::PartitionPolicy(value) => encode_policy(*value, encoder)?,
             OperationBody::Barrier(value) => encoder.id(value.operation_id.as_bytes())?,
             OperationBody::ProducerResultFloor(value) => {
-                encode_producer_result_floor(*value, &mut encoder)?;
+                encode_producer_result_floor(*value, encoder)?;
             }
+            OperationBody::DedupWatermark(value) => encode_dedup_watermark(*value, encoder)?,
+            OperationBody::GroupPlan(value) => group::encode(value, limits, encoder)?,
+            OperationBody::GroupDelete(value) => group::encode_delete(*value, encoder)?,
         }
         Ok(())
-    })();
-    if let Err(error) = result {
-        encoder.restore_start();
-        return Err(error);
-    }
-    Ok(start..encoder.finish())
+    })
 }
 
 /// Validate exactly one canonical body and its configured schema limits.
@@ -142,22 +142,21 @@ pub fn decode_append_summary_and_view(
 ) -> Result<(AppendSummary, AppendView<'_>), OperationCodecError> {
     validate_limits(limits)?;
     enforce_limit("operation body bytes", input.len(), limits.max_body_bytes)?;
-    let mut decoder = Decoder::new(input);
+    let mut decoder = Reader::new(input);
     let count = decoder.count("append batch count", limits.max_append_batches)?;
     if count == 0 {
         return Err(OperationCodecError::EmptyAppend);
     }
     let mut batches = SmallVec::with_capacity(count);
-    let mut totals = AppendTotals::default();
+    let mut totals = AppendTotals::new(limits);
     for _ in 0..count {
-        let (_, view) =
-            decode_append_batch::<false, true>(&mut decoder, limits, &mut totals, None)?;
+        let (_, view) = decode_append_batch::<false, true, false>(&mut decoder, &mut totals, None)?;
         batches.push(view.summary);
     }
     decoder.finish()?;
     Ok((
         AppendSummary { batches },
-        AppendView::validated(input, limits),
+        AppendView::validated(input, limits)?,
     ))
 }
 
@@ -213,7 +212,7 @@ fn decode_body<const MATERIALIZE: bool, const VALIDATE_PREPARED: bool>(
 ) -> Result<OperationBody<'_>, OperationCodecError> {
     validate_limits(limits)?;
     enforce_limit("operation body bytes", input.len(), limits.max_body_bytes)?;
-    let mut decoder = Decoder::new(input);
+    let mut decoder = Reader::new(input);
     let body = match kind {
         OperationKind::CreatePartition => {
             OperationBody::CreatePartition(decode_create(&mut decoder, limits)?)
@@ -225,6 +224,14 @@ fn decode_body<const MATERIALIZE: bool, const VALIDATE_PREPARED: bool>(
             MATERIALIZE,
             VALIDATE_PREPARED,
         >(&mut decoder, limits)?),
+        OperationKind::ResolvedAppend => OperationBody::ResolvedAppend(
+            super::resolved::read_resolved_append::<MATERIALIZE, VALIDATE_PREPARED>(
+                &mut decoder,
+                limits,
+                None,
+            )?
+            .0,
+        ),
         OperationKind::Progress => OperationBody::Progress(decode_progress(&mut decoder)?),
         OperationKind::Assign => OperationBody::Assign(decode_assign(&mut decoder)?),
         OperationKind::Trim => OperationBody::Trim(decode_trim(&mut decoder)?),
@@ -236,6 +243,15 @@ fn decode_body<const MATERIALIZE: bool, const VALIDATE_PREPARED: bool>(
         }),
         OperationKind::ProducerResultFloor => {
             OperationBody::ProducerResultFloor(decode_producer_result_floor(&mut decoder)?)
+        }
+        OperationKind::DedupWatermark => {
+            OperationBody::DedupWatermark(decode_dedup_watermark(&mut decoder)?)
+        }
+        OperationKind::GroupPlan => {
+            OperationBody::GroupPlan(group::decode::<MATERIALIZE>(&mut decoder, limits)?)
+        }
+        OperationKind::GroupDelete => {
+            OperationBody::GroupDelete(group::decode_delete(&mut decoder)?)
         }
     };
     decoder.finish()?;

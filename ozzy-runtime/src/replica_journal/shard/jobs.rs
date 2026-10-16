@@ -9,18 +9,33 @@ use futures::FutureExt;
 
 type Reply<T> = completion::Sender<Result<T, JournalError>>;
 
+/// Run detached file work, then install its result on the owner and reply.
+fn installed<R: 'static, T: 'static>(
+    work: impl Future<Output = R> + 'static,
+    done: Reply<T>,
+    permit: OwnedSemaphorePermit,
+    complete: impl FnOnce(&mut journal::OwnedJournal, R) -> Result<T, JournalError> + 'static,
+) -> Job {
+    async move {
+        let result = work.await;
+        Box::new(move |state: &mut State| {
+            finish_read(done, complete(&mut state.owner, result), permit)
+        }) as Install
+    }
+    .boxed_local()
+}
+
 pub(super) fn seek(
     prepared: journal::owned::seek::PreparedSeek,
     done: Reply<journal::PartitionReadCursor>,
     permit: OwnedSemaphorePermit,
 ) -> Job {
-    async move {
-        let result = prepared.execute().await;
-        Box::new(move |state: &mut State| {
-            finish_read(done, state.owner.complete_seek(result), permit)
-        }) as Install
-    }
-    .boxed_local()
+    installed(
+        prepared.execute(),
+        done,
+        permit,
+        journal::OwnedJournal::complete_seek,
+    )
 }
 
 pub(super) fn sync(
@@ -111,13 +126,12 @@ pub(super) fn replay(
     done: Reply<journal::FetchedHistory>,
     permit: OwnedSemaphorePermit,
 ) -> Job {
-    async move {
-        let result = work.read().await;
-        Box::new(move |state: &mut State| {
-            finish_read(done, state.owner.complete_replay(result), permit)
-        }) as Install
-    }
-    .boxed_local()
+    installed(
+        work.read(),
+        done,
+        permit,
+        journal::OwnedJournal::complete_replay,
+    )
 }
 
 pub(super) fn donation(
@@ -125,13 +139,12 @@ pub(super) fn donation(
     done: Reply<journal::FetchedHistory>,
     permit: OwnedSemaphorePermit,
 ) -> Job {
-    async move {
-        let result = work.read().await;
-        Box::new(move |state: &mut State| {
-            finish_read(done, state.owner.complete_recovery_read(result), permit)
-        }) as Install
-    }
-    .boxed_local()
+    installed(
+        work.read(),
+        done,
+        permit,
+        journal::OwnedJournal::complete_recovery_read,
+    )
 }
 
 pub(super) fn validate(
@@ -139,17 +152,12 @@ pub(super) fn validate(
     done: Reply<journal::ValidatedStorage>,
     permit: OwnedSemaphorePermit,
 ) -> Job {
-    async move {
-        let result = work.validate().await;
-        Box::new(move |state: &mut State| {
-            finish_read(
-                done,
-                state.owner.complete_storage_validation(result),
-                permit,
-            )
-        }) as Install
-    }
-    .boxed_local()
+    installed(
+        work.validate(),
+        done,
+        permit,
+        journal::OwnedJournal::complete_storage_validation,
+    )
 }
 
 pub(super) async fn cleanup(
@@ -180,11 +188,10 @@ pub(super) fn checkpoint(
     done: Reply<journal::recovery::RecoveryCheckpointRead>,
     permit: OwnedSemaphorePermit,
 ) -> Job {
-    async move {
-        let result = work.read().await;
-        Box::new(move |state: &mut State| {
-            finish_read(done, state.owner.complete_checkpoint_read(result), permit)
-        }) as Install
-    }
-    .boxed_local()
+    installed(
+        work.read(),
+        done,
+        permit,
+        journal::OwnedJournal::complete_checkpoint_read,
+    )
 }

@@ -16,6 +16,18 @@ use std::{
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
+/// A fresh external server becomes ready to serve. Run lifetimes count it
+/// as one control step.
+const READY: Duration = crate::budget::CONTROL_STEP;
+/// One connection attempt while a server starts.
+const PROBE: Duration = Duration::from_millis(20);
+/// How often a starting server is checked.
+const READY_POLL: Duration = Duration::from_millis(100);
+/// Stopping servers freeze within this before they are killed.
+const FREEZE: Duration = Duration::from_secs(2);
+/// How often a freezing server is checked.
+const FREEZE_POLL: Duration = Duration::from_millis(10);
+
 /// Pinned Iggy release label used in comparison provenance.
 pub const RELEASE: &str = "0.9.0";
 /// Source tag corresponding to the pinned Iggy release.
@@ -79,6 +91,114 @@ pub struct Iggy {
     stopped: bool,
 }
 
+/// One configured Iggy broker that has not started yet.
+struct Configured {
+    root: PathBuf,
+    data: PathBuf,
+    endpoint: String,
+}
+
+/// Write one configuration per broker into fresh directories. Every selected
+/// port stays held until all configurations are written.
+/// The Iggy configuration every broker of a run shares: TCP only, no
+/// heartbeat or file logs, unpinned shards, and one cluster named `name` over
+/// all `nodes`, enabled when `cluster`.
+fn shared_config(name: &str, nodes: &[Value], cluster: bool, log_filter: &str) -> Result<Value> {
+    let mut config: Value = serde_json::to_value(toml::from_str::<toml::Value>(
+        &fs::read_to_string(build::checkout().join("core/server/config.toml"))?,
+    )?)?;
+    for transport in ["http", "quic", "websocket"] {
+        config[transport]["enabled"] = json!(false);
+    }
+    config["heartbeat"]["enabled"] = json!(false);
+    config["logging"]["file_enabled"] = json!(false);
+    config["logging"]["level"] = json!(log_filter);
+    config["sharding"]["pin_cores"] = json!(false);
+    config["cluster"]["enabled"] = json!(cluster);
+    config["cluster"]["name"] = json!(name);
+    config["cluster"]["nodes"] = json!(nodes);
+    Ok(config)
+}
+
+fn configure(root: &Path, cpus: &[Vec<usize>], log_filter: &str) -> Result<Vec<Configured>> {
+    let count = cpus.len();
+    let cluster = count == 3;
+    let run_name = root.file_name().ok_or("missing run name")?;
+    let ports = (0..count * 2)
+        .map(|_| TcpListener::bind("127.0.0.1:0"))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let nodes = (0..count).map(|index| Ok(json!({"name":format!("broker-{index}"),"ip":"127.0.0.1","replica_id":index,"ports":{"tcp":ports[2*index].local_addr()?.port(),"tcp_replica":ports[2*index+1].local_addr()?.port()}}))).collect::<Result<Vec<Value>>>()?;
+    let template = shared_config(&run_name.to_string_lossy(), &nodes, cluster, log_filter)?;
+    let mut configs = vec![];
+    for index in 0..count {
+        let broker_root = root.join(index.to_string());
+        fs::create_dir(&broker_root)?;
+        let data = artifact_root()
+            .join("ozzy-bench")
+            .join(run_name)
+            .join(index.to_string());
+        fs::create_dir_all(&data)?;
+        let mut config = template.clone();
+        config["path"] = json!(data);
+        // A shared CPU pool belongs to the entire deployment: do not
+        // multiply a four-core allocation into twelve Iggy shards.
+        config["sharding"]["cpu_allocation"] = json!(crate::automation::cpus::shards(cpus, index));
+        let endpoint = format!("127.0.0.1:{}", ports[index * 2].local_addr()?.port());
+        config["tcp"]["address"] = json!(endpoint);
+        fs::write(broker_root.join("config.toml"), toml::to_string(&config)?)?;
+        fs::write(broker_root.join(".env"), "")?;
+        configs.push(Configured {
+            root: broker_root,
+            data,
+            endpoint,
+        });
+    }
+    drop(ports);
+    Ok(configs)
+}
+
+impl Configured {
+    /// Start this broker pinned to `cpus`, as cluster `replica` if set.
+    fn spawn(self, cpus: &[usize], replica: Option<usize>) -> Result<Broker> {
+        let log = fs::File::create(self.root.join("server.log"))?;
+        let mut command = Command::new("taskset");
+        command
+            .args([
+                "-c",
+                &cpus
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ])
+            .arg(build::binary());
+        if let Some(replica) = replica {
+            command.args(["--replica-id", &replica.to_string()]);
+        }
+        for (key, _) in
+            std::env::vars().filter(|(key, _)| key.starts_with("IGGY_") || key == "RUST_LOG")
+        {
+            command.env_remove(key);
+        }
+        command
+            .current_dir(&self.root)
+            .env("IGGY_CONFIG_PATH", self.root.join("config.toml"))
+            .env("IGGY_ROOT_USERNAME", "iggy")
+            .env("IGGY_ROOT_PASSWORD", "iggy")
+            .env("TMPDIR", artifact_root())
+            .env("LD_LIBRARY_PATH", build::library_path())
+            .stdin(Stdio::null())
+            .stdout(log.try_clone()?)
+            .stderr(log);
+        Ok(Broker {
+            child: command.spawn()?,
+            root: self.root,
+            data: self.data,
+            endpoint: self.endpoint,
+        })
+    }
+}
+
 impl Iggy {
     /// Create fresh storage and start pinned Iggy with the requested persistence and CPU placement.
     pub fn start(root: &Path, mode: &str, cpus: &[Vec<usize>], log_filter: &str) -> Result<Self> {
@@ -96,82 +216,9 @@ impl Iggy {
         if cpus.len() != count {
             return Err("expected one CPU list per Iggy broker".into());
         }
-        // Hold every selected port until all configurations have been written.
-        let ports = (0..count * 2)
-            .map(|_| TcpListener::bind("127.0.0.1:0"))
-            .collect::<std::io::Result<Vec<_>>>()?;
-        let nodes = (0..count).map(|index| Ok(json!({"name":format!("broker-{index}"),"ip":"127.0.0.1","replica_id":index,"ports":{"tcp":ports[2*index].local_addr()?.port(),"tcp_replica":ports[2*index+1].local_addr()?.port()}}))).collect::<Result<Vec<Value>>>()?;
-        let template = fs::read_to_string(build::checkout().join("core/server/config.toml"))?;
-        let mut configs = vec![];
-        for index in 0..count {
-            let broker_root = root.join(index.to_string());
-            fs::create_dir(&broker_root)?;
-            let data = artifact_root()
-                .join("ozzy-bench")
-                .join(root.file_name().ok_or("missing run name")?)
-                .join(index.to_string());
-            fs::create_dir_all(&data)?;
-            let mut config: Value =
-                serde_json::to_value(toml::from_str::<toml::Value>(&template)?)?;
-            config["path"] = json!(data);
-            for transport in ["http", "quic", "websocket"] {
-                config[transport]["enabled"] = json!(false);
-            }
-            config["heartbeat"]["enabled"] = json!(false);
-            config["logging"]["file_enabled"] = json!(false);
-            config["logging"]["level"] = json!(log_filter);
-            // A shared CPU pool belongs to the entire deployment: do not
-            // multiply a four-core allocation into twelve Iggy shards.
-            config["sharding"]["cpu_allocation"] =
-                json!(crate::automation::cpus::shards(cpus, index));
-            config["sharding"]["pin_cores"] = json!(false);
-            config["cluster"]["enabled"] = json!(cluster);
-            config["cluster"]["name"] = json!(root.file_name().unwrap().to_string_lossy());
-            config["cluster"]["nodes"] = json!(nodes);
-            let endpoint = format!("127.0.0.1:{}", ports[index * 2].local_addr()?.port());
-            config["tcp"]["address"] = json!(endpoint);
-            fs::write(broker_root.join("config.toml"), toml::to_string(&config)?)?;
-            fs::write(broker_root.join(".env"), "")?;
-            configs.push((broker_root, data, endpoint));
-        }
-        drop(ports);
-        for (index, (broker_root, data, endpoint)) in configs.into_iter().enumerate() {
-            let log = fs::File::create(broker_root.join("server.log"))?;
-            let mut command = Command::new("taskset");
-            command
-                .args([
-                    "-c",
-                    &cpus[index]
-                        .iter()
-                        .map(usize::to_string)
-                        .collect::<Vec<_>>()
-                        .join(","),
-                ])
-                .arg(build::binary());
-            if cluster {
-                command.args(["--replica-id", &index.to_string()]);
-            }
-            for (key, _) in
-                std::env::vars().filter(|(key, _)| key.starts_with("IGGY_") || key == "RUST_LOG")
-            {
-                command.env_remove(key);
-            }
-            command
-                .current_dir(&broker_root)
-                .env("IGGY_CONFIG_PATH", broker_root.join("config.toml"))
-                .env("IGGY_ROOT_USERNAME", "iggy")
-                .env("IGGY_ROOT_PASSWORD", "iggy")
-                .env("TMPDIR", artifact_root())
-                .env("LD_LIBRARY_PATH", build::library_path())
-                .stdin(Stdio::null())
-                .stdout(log.try_clone()?)
-                .stderr(log);
-            server.brokers.push(Broker {
-                child: command.spawn()?,
-                root: broker_root,
-                data,
-                endpoint,
-            });
+        for (index, directory) in configure(root, cpus, log_filter)?.into_iter().enumerate() {
+            let replica = cluster.then_some(index);
+            server.brokers.push(directory.spawn(&cpus[index], replica)?);
         }
         server.wait_ready()?;
         server.endpoint.clone_from(&server.brokers[0].endpoint);
@@ -180,7 +227,7 @@ impl Iggy {
     }
 
     fn wait_ready(&mut self) -> Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + READY;
         let cluster = self.brokers.len() == 3;
         loop {
             check_canceled()?;
@@ -201,11 +248,7 @@ impl Iggy {
                     ) && (!cluster
                         || fs::read_to_string(broker.root.join("server.log"))?
                             .contains("replica mesh complete: all peer connections established"))
-                        && TcpStream::connect_timeout(
-                            &broker.endpoint.parse()?,
-                            Duration::from_millis(20),
-                        )
-                        .is_ok();
+                        && TcpStream::connect_timeout(&broker.endpoint.parse()?, PROBE).is_ok();
             }
             if ready {
                 break;
@@ -213,7 +256,7 @@ impl Iggy {
             if Instant::now() >= deadline {
                 return Err("Iggy readiness deadline expired".into());
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(READY_POLL);
         }
         for broker in &self.brokers {
             fs::copy(
@@ -254,8 +297,9 @@ impl Iggy {
         for (broker, budget) in self.brokers.iter().zip(&self.cpus) {
             let mut threads = BTreeMap::new();
             for entry in fs::read_dir(format!("/proc/{}/task", broker.child.id()))? {
-                let task = entry?.path();
-                let tid = task.file_name().unwrap().to_string_lossy().parse::<u32>()?;
+                let entry = entry?;
+                let tid = entry.file_name().to_string_lossy().parse::<u32>()?;
+                let task = entry.path();
                 let result = (|| -> Result<Value> {
                     let cpus = isolation::cpus(Some(tid))?;
                     if cpus.iter().any(|cpu| !budget.contains(cpu)) {
@@ -304,7 +348,7 @@ impl Iggy {
             signals.arg(broker.child.id().to_string());
         }
         super::capture(&mut signals)?;
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + FREEZE;
         loop {
             let mut stopped = true;
             for broker in &self.brokers {
@@ -318,7 +362,7 @@ impl Iggy {
             if Instant::now() >= deadline {
                 return Err("Iggy fixture freeze deadline expired".into());
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(FREEZE_POLL);
         }
         self.check()?;
         let mut terminate = Command::new("kill");

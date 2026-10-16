@@ -9,7 +9,7 @@ use rustix::time::{
 use tokio::io::unix::AsyncFd;
 
 use super::super::{Result, error, metrics};
-use super::{Config, Window};
+use super::{Config, Window, measurement::Counts};
 
 /// An arrival not admitted this long after its due time means the system did
 /// not sustain the offered load. Unadmitted arrivals are ordinals, not memory.
@@ -150,16 +150,66 @@ impl Plan {
     }
 }
 
+/// The arrivals a paced lane may still admit. An overloaded ramp lowers the
+/// limit, once, to the arrivals of the stages before the late one.
+pub(super) struct Arrivals {
+    plan: Plan,
+    limit: u64,
+}
+
+impl Arrivals {
+    pub(super) fn new(plan: &Plan) -> Self {
+        Self {
+            plan: *plan,
+            limit: plan.total(),
+        }
+    }
+
+    pub(super) fn plan(&self) -> Plan {
+        self.plan
+    }
+
+    /// Whether the lane admitted every arrival it may.
+    pub(super) fn exhausted(&self, sequence: u64) -> bool {
+        sequence >= self.limit
+    }
+
+    /// Check the admission backlog of arrival `sequence` at the time `now`
+    /// reads, which runs only while the limit is still unlowered. The first
+    /// overload records its stage and lowers the limit; returns whether this
+    /// check lowered it.
+    pub(super) fn lower_on_backlog(
+        &mut self,
+        counts: &mut Counts,
+        sequence: u64,
+        now: impl FnOnce() -> u64,
+    ) -> Result<bool> {
+        if self.limit != self.plan.total() {
+            return Ok(false);
+        }
+        let Some(stage) = self.plan.check_backlog(sequence, now())? else {
+            return Ok(false);
+        };
+        counts.overload(stage);
+        self.limit = self.plan.total_before(stage)?;
+        Ok(true)
+    }
+}
+
 /// One reusable timer per writer lane. No millisecond rounding, busy waiting,
 /// or blocking the Tokio thread while confirmations need observation.
 pub(super) struct Timer(AsyncFd<OwnedFd>);
 
 impl Timer {
     pub(super) fn new() -> Result<Self> {
-        Ok(Self(AsyncFd::new(timerfd_create(
+        let timer = timerfd_create(
             TimerfdClockId::Monotonic,
             TimerfdFlags::NONBLOCK | TimerfdFlags::CLOEXEC,
-        )?)?))
+        )?;
+        // SAFETY: the `OwnedFd` keeps its descriptor open and unchanged until
+        // the `AsyncFd` drops it.
+        let timer = unsafe { AsyncFd::register(timer) }.map_err(std::io::Error::from)?;
+        Ok(Self(timer))
     }
 
     pub(super) async fn wait_until(&mut self, at: u64) -> Result<()> {

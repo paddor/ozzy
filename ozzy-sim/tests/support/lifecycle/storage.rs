@@ -49,7 +49,7 @@ fn position(prefix: Prefix) -> LogPosition {
 }
 
 impl Replica {
-    pub(super) fn enable_storage(&mut self, seed: u64) {
+    pub(super) fn enable_storage(&mut self) {
         assert_eq!(self.accepted.len(), 0);
         self.storage = Some(
             Journal::format(
@@ -60,22 +60,12 @@ impl Replica {
                     store_id: StoreId::from_bytes([self.id as u8 + 31; 16]),
                     store_generation: 1,
                 },
-                configuration_record_with_policy(self.configuration.policy())
-                    .encode()
-                    .to_vec(),
+                configuration_record().encode().to_vec(),
                 1,
                 self.generation,
-                97 + seed as usize % 4096,
             )
             .unwrap(),
         );
-        if self.configuration.policy() == QuorumPolicy::Replicated {
-            self.storage
-                .as_mut()
-                .unwrap()
-                .enable_memory_voting()
-                .unwrap();
-        }
     }
 
     pub(super) fn perform_storage(&mut self, action: &DiskAction) -> Result<(), DirectoryError> {

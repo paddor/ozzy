@@ -1,3 +1,13 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
+
 use ozzy_journal::operation::{
     Barrier, CanonicalOperation, OperationBody, OperationLimits, canonical_body_digest,
     encode_operation_body,
@@ -5,7 +15,7 @@ use ozzy_journal::operation::{
 use ozzy_proto::OperationId;
 use ozzy_proto::{GroupId, LinkSessionId, NodeId};
 use ozzy_replication::wire::{
-    Control, PeerBinding, ReplicaMessage, WireLimits, decode, encode_control,
+    Control, EncodeContext, PeerBinding, ReplicaMessage, WireLimits, decode, encode_control,
 };
 use ozzy_replication::{
     Admission, JournalGeneration, NormalReplica, PipelineLimits, PreparedOperation,
@@ -177,9 +187,8 @@ fn decoded_durable_ack_still_waits_for_the_primary_disk_boundary() {
     let message = Control::PrepareOk {
         ack: backup.acknowledgment().unwrap(),
     };
-    let mut metadata = [0; 121];
+    let mut metadata = [0; 120];
     let encoded = encode_control(node(1), session(), message, &mut metadata).unwrap();
-    assert_eq!(metadata[120], 2); // Durable evidence, not RAM or socket receipt.
     let binding = PeerBinding::new(configuration(), node(1), session()).unwrap();
     let ReplicaMessage::Control(Control::PrepareOk { ack }) = decode(
         &[&encoded.header, &metadata, &[]],
@@ -237,12 +246,14 @@ fn prepare_roundtrip_preserves_canonical_bodies_views_and_hash_chain() {
     let mut metadata = [0xff; 512];
     let mut payload = [0xff; 64];
     let encoded = encode_prepare(
-        node(2),
-        session(),
+        EncodeContext {
+            sender: node(2),
+            session: session(),
+            limits: WireLimits::default(),
+        },
         request,
         &mut metadata,
         &mut payload,
-        WireLimits::default(),
     )
     .unwrap();
     assert_eq!(encoded.metadata_bytes, 336);
@@ -279,8 +290,7 @@ fn prepare_roundtrip_preserves_canonical_bodies_views_and_hash_chain() {
 #[test]
 fn unbound_prepare_metadata_requires_real_framing_and_preserves_publication_bytes() {
     use ozzy_replication::wire::{
-        Operation, Prepare, PublicationPart, encode_prepare_metadata, encode_prepare_unbound,
-        encode_publication, encode_publication_group,
+        Operation, Prepare, encode_prepare_metadata, encode_prepare_unbound, encode_publication,
     };
     let scope = configuration().scope();
     let body = [11; 16];
@@ -306,7 +316,16 @@ fn unbound_prepare_metadata_requires_real_framing_and_preserves_publication_byte
     let mut metadata = [0xff; 512];
     let sizes = encode_prepare_unbound(node(0), prepare, &mut metadata, limits).unwrap();
     let mut bound = [0xff; 512];
-    let wire = encode_prepare_metadata(node(0), session(), prepare, &mut bound, limits).unwrap();
+    let wire = encode_prepare_metadata(
+        EncodeContext {
+            sender: node(0),
+            session: session(),
+            limits,
+        },
+        prepare,
+        &mut bound,
+    )
+    .unwrap();
     assert_eq!(sizes.metadata_bytes, wire.metadata_bytes);
     assert_eq!(sizes.payload_bytes, body.len());
     assert_eq!(metadata, bound);
@@ -325,26 +344,6 @@ fn unbound_prepare_metadata_requires_real_framing_and_preserves_publication_byte
         expected
     );
     assert_eq!(output, published);
-    let part = PublicationPart {
-        frames: unbound,
-        predecessor: Prefix::GENESIS,
-        end: operation.prefix(),
-    };
-    let mut payload = Vec::new();
-    assert_eq!(
-        encode_publication_group(
-            node(0),
-            &[part],
-            operation.prefix(),
-            &mut output,
-            &mut payload,
-            limits
-        )
-        .unwrap(),
-        expected
-    );
-    assert_eq!(payload, body);
-    assert_eq!(output, published);
 
     for length in 0..sizes.metadata_bytes {
         let mut truncated = [0xab; 512];
@@ -358,90 +357,6 @@ fn unbound_prepare_metadata_requires_real_framing_and_preserves_publication_byte
         encode_prepare_unbound(NodeId::from_bytes([0; 16]), prepare, &mut invalid, limits).is_err()
     );
     assert_eq!(invalid, [0xab; 512]);
-}
-
-#[test]
-fn consecutive_prepares_combine_into_one_publication() {
-    use ozzy_replication::wire::{
-        Operation, Prepare, PublicationPart, decode_publication, encode_prepare_metadata,
-        encode_publication_group, publication_topic,
-    };
-    let scope = configuration().scope();
-    let bodies = [[10; 16], [11; 16]];
-    let mut previous = Prefix::GENESIS;
-    let mut headers = Vec::new();
-    let mut metadata = Vec::new();
-    let mut operations = Vec::new();
-    for body in &bodies {
-        let canonical = CanonicalOperation {
-            group_id: scope.group_id,
-            configuration_epoch: scope.configuration_epoch,
-            original_view: scope.view,
-            op_number: previous.op.0 + 1,
-            previous_digest: previous.digest,
-            kind: ozzy_journal::operation::OperationKind::Barrier,
-            body,
-        };
-        let operation = Operation::from_verified(canonical, canonical_body_digest(body));
-        let mut encoded_metadata = [0; 250];
-        let encoded = encode_prepare_metadata(
-            node(0),
-            session(),
-            Prepare {
-                scope,
-                committed: Prefix::GENESIS,
-                operations: &[operation],
-            },
-            &mut encoded_metadata,
-            WireLimits::default(),
-        )
-        .unwrap();
-        headers.push(encoded.header);
-        metadata.push(encoded_metadata[..encoded.metadata_bytes].to_vec());
-        operations.push((previous, operation.prefix()));
-        previous = operation.prefix();
-    }
-    let parts = (0..2)
-        .map(|index| PublicationPart {
-            frames: [&headers[index], &metadata[index], &bodies[index]],
-            predecessor: operations[index].0,
-            end: operations[index].1,
-        })
-        .collect::<Vec<_>>();
-    let mut grouped_metadata = [0; 512];
-    let mut payload = Vec::new();
-    let encoded = encode_publication_group(
-        node(0),
-        &parts,
-        Prefix::GENESIS,
-        &mut grouped_metadata,
-        &mut payload,
-        WireLimits::default(),
-    )
-    .unwrap();
-    let topic = publication_topic(scope.group_id);
-    let decoded = decode_publication(
-        &[
-            &topic,
-            &encoded.header,
-            &grouped_metadata[..encoded.metadata_bytes],
-            &payload,
-        ],
-        PeerBinding::new(configuration(), node(0), session()).unwrap(),
-        node(1),
-        scope,
-        WireLimits::default(),
-    )
-    .unwrap();
-    assert_eq!(decoded.predecessor(), Prefix::GENESIS);
-    assert_eq!(decoded.end(), previous);
-    assert_eq!(
-        decoded
-            .operations()
-            .map(|operation| operation.canonical().body)
-            .collect::<Vec<_>>(),
-        bodies.iter().map(<[u8; 16]>::as_slice).collect::<Vec<_>>()
-    );
 }
 
 fn one_prepare() -> ([u8; 64], [u8; 250], [u8; 16]) {
@@ -461,8 +376,11 @@ fn one_prepare() -> ([u8; 64], [u8; 250], [u8; 16]) {
     let mut metadata = [0; 250];
     let mut payload = [0; 16];
     let encoded = encode_prepare(
-        node(0),
-        session(),
+        EncodeContext {
+            sender: node(0),
+            session: session(),
+            limits: WireLimits::default(),
+        },
         Prepare {
             scope,
             committed: Prefix::GENESIS,
@@ -470,7 +388,6 @@ fn one_prepare() -> ([u8; 64], [u8; 250], [u8; 16]) {
         },
         &mut metadata,
         &mut payload,
-        WireLimits::default(),
     )
     .unwrap();
     (encoded.header, metadata, payload)
@@ -541,7 +458,7 @@ fn prepare_rejects_malformed_counts_chains_digests_and_trailing_bytes() {
 }
 
 #[test]
-fn peer_session_configuration_and_weaker_votes_cannot_reach_the_core() {
+fn peer_session_and_configuration_mismatches_cannot_reach_the_core() {
     use ozzy_replication::wire::WireError;
     let limits = WireLimits::default();
     let binding = PeerBinding::new(configuration(), node(1), session()).unwrap();
@@ -551,16 +468,8 @@ fn peer_session_configuration_and_weaker_votes_cannot_reach_the_core() {
             durable: Prefix::GENESIS,
         },
     };
-    let mut metadata = [0; 121];
+    let mut metadata = [0; 120];
     let encoded = encode_control(node(1), session(), message, &mut metadata).unwrap();
-    for evidence in [0, 1, 3, 255] {
-        let mut bad = metadata;
-        bad[120] = evidence;
-        assert_eq!(
-            decode(&[&encoded.header, &bad, &[]], binding, limits),
-            Err(WireError::Evidence)
-        );
-    }
     for offset in [24, 40] {
         let mut bad = encoded.header;
         bad[offset] ^= 1;
@@ -620,15 +529,17 @@ fn encoding_rejections_leave_reusable_output_buffers_unchanged() {
         let mut payload = [0xbb; 16];
         assert_eq!(
             encode_prepare(
-                node(0),
-                session(),
+                EncodeContext {
+                    sender: node(0),
+                    session: session(),
+                    limits: WireLimits {
+                        max_operations,
+                        ..WireLimits::default()
+                    }
+                },
                 request,
                 &mut metadata[..metadata_capacity],
-                &mut payload[..payload_capacity],
-                WireLimits {
-                    max_operations,
-                    ..WireLimits::default()
-                }
+                &mut payload[..payload_capacity]
             ),
             Err(expected)
         );

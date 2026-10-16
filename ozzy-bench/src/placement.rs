@@ -7,7 +7,36 @@ use std::{
     io::Read,
     net::IpAddr,
     path::{Path, PathBuf},
+    process::Command,
 };
+
+/// SSH connection setup limit, in seconds.
+const SSH_CONNECT_SECS: u64 = 8;
+/// SSH keepalive probe interval, in seconds.
+const SSH_ALIVE_SECS: u64 = 5;
+/// Missed keepalive probes that end an SSH session.
+const SSH_ALIVE_MISSES: u32 = 2;
+
+/// Non-interactive SSH to a known host. A dead link ends the session.
+pub fn ssh(host: &str) -> Command {
+    let mut command = Command::new("ssh");
+    command.args([
+        "-T",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+    ]);
+    for option in [
+        format!("ConnectTimeout={SSH_CONNECT_SECS}"),
+        format!("ServerAliveInterval={SSH_ALIVE_SECS}"),
+        format!("ServerAliveCountMax={SSH_ALIVE_MISSES}"),
+    ] {
+        command.arg("-o").arg(option);
+    }
+    command.args(["--", host]);
+    command
+}
 
 #[derive(Debug, Clone)]
 /// One broker host, reachable bind address, storage parent, and CPU placement.
@@ -74,53 +103,54 @@ impl Placement {
         if bind.is_unspecified() || bind.is_multicast() {
             return Err(bench_error("concrete unicast bind required"));
         }
-        let remote = if let Some(host) = entry.get("ssh") {
-            let host = host
-                .as_str()
-                .ok_or_else(|| bench_error("invalid SSH host"))?;
-            if host.is_empty()
-                || host.starts_with('-')
-                || !host
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"._-@:[]".contains(&b))
-            {
-                return Err(bench_error("unsafe SSH host"));
-            }
-            Some((host.to_owned(), absolute(&entry["executable"])?))
-        } else {
+        Ok(Self {
+            bind,
+            remote: Self::remote(entry)?,
+            storage_dir: entry.get("storage_dir").map(absolute).transpose()?,
+            cpus: entry.get("cpus").map(Self::cpus).transpose()?,
+        })
+    }
+
+    /// The SSH host and its absolute broker executable, for a remote entry.
+    fn remote(entry: &Value) -> BenchResult<Option<(String, PathBuf)>> {
+        let Some(host) = entry.get("ssh") else {
             if entry.get("executable").is_some() {
                 return Err(bench_error("local executable override is unsupported"));
             }
-            None
+            return Ok(None);
         };
-        let storage_dir = entry.get("storage_dir").map(absolute).transpose()?;
-        let cpus = entry
-            .get("cpus")
-            .map(|value| -> BenchResult<Vec<usize>> {
-                let values = value
-                    .as_array()
-                    .filter(|values| !values.is_empty())
-                    .ok_or_else(|| bench_error("empty CPU placement"))?;
-                let mut seen = BTreeSet::new();
-                for value in values {
-                    let cpu = value
-                        .as_u64()
-                        .and_then(|v| usize::try_from(v).ok())
-                        .filter(|&v| v < rustix::thread::CpuSet::MAX_CPU)
-                        .ok_or_else(|| bench_error("invalid CPU placement"))?;
-                    if !seen.insert(cpu) {
-                        return Err(bench_error("duplicate placement CPU"));
-                    }
-                }
-                Ok(seen.into_iter().collect())
-            })
-            .transpose()?;
-        Ok(Self {
-            bind,
-            remote,
-            storage_dir,
-            cpus,
-        })
+        let host = host
+            .as_str()
+            .ok_or_else(|| bench_error("invalid SSH host"))?;
+        let plain_host = !host.is_empty()
+            && !host.starts_with('-')
+            && host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-@:[]".contains(&b));
+        if !plain_host {
+            return Err(bench_error("unsafe SSH host"));
+        }
+        Ok(Some((host.to_owned(), absolute(&entry["executable"])?)))
+    }
+
+    /// Distinct, in-range CPU IDs in ascending order.
+    fn cpus(value: &Value) -> BenchResult<Vec<usize>> {
+        let values = value
+            .as_array()
+            .filter(|values| !values.is_empty())
+            .ok_or_else(|| bench_error("empty CPU placement"))?;
+        let mut seen = BTreeSet::new();
+        for value in values {
+            let cpu = value
+                .as_u64()
+                .and_then(|v| usize::try_from(v).ok())
+                .filter(|&v| v < rustix::thread::CpuSet::MAX_CPU)
+                .ok_or_else(|| bench_error("invalid CPU placement"))?;
+            if !seen.insert(cpu) {
+                return Err(bench_error("duplicate placement CPU"));
+            }
+        }
+        Ok(seen.into_iter().collect())
     }
 
     /// Render configured CPU IDs for affinity commands.
@@ -172,6 +202,27 @@ pub fn execution() -> BenchResult<Value> {
         serde_json::json!({"threads": threads, "monotonic_ns": monotonic_ns,
         "scheduler_wait_enabled": scheduler_wait_enabled}),
     )
+}
+
+/// Threads sharing the calling thread's CPU mask. A pinned inproc broker role
+/// observes itself and the shard/dispatcher threads that inherited its mask.
+pub fn mask_execution() -> BenchResult<Value> {
+    let mut execution = execution()?;
+    let tid = rustix::thread::gettid().as_raw_nonzero().get();
+    let threads = execution["threads"]
+        .as_array()
+        .ok_or_else(|| bench_error("missing thread observation"))?;
+    let mask = threads
+        .iter()
+        .find(|thread| thread["tid"] == tid)
+        .map(|thread| thread["cpus"].clone())
+        .ok_or_else(|| bench_error("calling thread absent from observation"))?;
+    execution["threads"] = threads
+        .iter()
+        .filter(|thread| thread["cpus"] == mask)
+        .cloned()
+        .collect();
+    Ok(execution)
 }
 
 fn execution_thread(path: &Path, tid: u32, scheduler_wait: bool) -> BenchResult<Option<Value>> {

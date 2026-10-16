@@ -16,6 +16,7 @@ include.workspace = true
 
 [dependencies]
 ahash.workspace = true
+hashbrown.workspace = true
 smallvec.workspace = true
 bytes.workspace = true
 ozzy-journal.workspace = true

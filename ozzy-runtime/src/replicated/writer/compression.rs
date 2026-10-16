@@ -45,15 +45,12 @@ impl Compressor {
         let reusable = self
             .slots
             .iter_mut()
-            .position(|slot| Arc::get_mut(slot).is_some());
+            .enumerate()
+            .find_map(|(index, slot)| Some((index, Arc::get_mut(slot)?)));
         let mut fallback = Vec::new();
-        let output = match reusable {
-            Some(index) => {
-                &mut Arc::get_mut(&mut self.slots[index])
-                    .expect("unique compression slot")
-                    .0
-            }
-            None => &mut fallback,
+        let (reusable, output) = match reusable {
+            Some((index, slot)) => (Some(index), &mut slot.0),
+            None => (None, &mut fallback),
         };
         output.resize(maximum, 0);
         let Ok(encoded_bytes) = self.codec.compress_into(body, output) else {

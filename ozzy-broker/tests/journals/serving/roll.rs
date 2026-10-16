@@ -13,16 +13,10 @@ async fn production_two_topics_roll_and_replay_after_restart() {
 async fn run() {
     let root = tempfile::tempdir().unwrap();
     let runtime = WriterRuntime::new().unwrap();
-    let mut deployment = deployment_with(
-        root.path(),
-        DeploymentMode::Single,
-        Confirmation::LocalDurable,
-        1,
-        |config| {
-            let second = config.topics["orders"].clone();
-            config.topics.insert("events".into(), second);
-        },
-    );
+    let mut deployment = deployment_with(root.path(), DeploymentMode::Single, 1, |config| {
+        let second = config.topics["orders"].clone();
+        config.topics.insert("events".into(), second);
+    });
     let (checked, local) = deployment.pop().unwrap();
     for device in checked.deployment.deployment().brokers[&checked.plan.name]
         .devices

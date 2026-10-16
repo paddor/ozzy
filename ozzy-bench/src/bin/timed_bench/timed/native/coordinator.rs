@@ -1,7 +1,11 @@
 //! Coordinate production workers without legacy topic-wide broker snapshots.
 
 use super::{Config, Prepared, Result, error};
-use crate::bench::timed::{launch::Process, measure, receive_all, results, send_all};
+use crate::bench::{
+    metrics,
+    timed::{launch::Process, measure, receive_all, results, send_all},
+};
+use futures::future::try_join_all;
 use serde_json::{Value, json};
 
 pub(in crate::bench::timed) async fn coordinate(
@@ -11,18 +15,7 @@ pub(in crate::bench::timed) async fn coordinate(
     writers: &mut [Process],
     readers: &mut [Process],
 ) -> Result<Value> {
-    send_all(brokers, &prepared.initialize()?)?;
-    let initialized = receive_all(brokers, "initialized").await?;
-    let configuration = ozzy_bench::provenance::digest(&prepared.artifact.configuration)?;
-    let identity = ozzy_bench::provenance::digest(&prepared.artifact.identity)?;
-    for (index, row) in initialized.iter().enumerate() {
-        if row["index"] != index
-            || row["configuration_xxh3_128"] != configuration
-            || row["identity_xxh3_128"] != identity
-        {
-            return Err(error("production broker initialization identity mismatch"));
-        }
-    }
+    initialize(prepared, brokers).await?;
     send_all(brokers, &json!({"command": "serve"}))?;
     let ready = receive_all(brokers, "ready").await?;
     verify_ready(config, prepared, brokers, &ready)?;
@@ -45,7 +38,10 @@ pub(in crate::bench::timed) async fn coordinate(
     }
     receive_all(writers, "connected").await?;
     receive_all(readers, "connected").await?;
+    // Inproc roles share this process; one meter counts its allocations.
+    let process = config.args.inproc.then(|| metrics::Meter::start(true));
     let (window, writer_rows, reader_rows) = measure(config, brokers, writers, readers).await?;
+    let process = process.map(metrics::Meter::finish);
     send_all(brokers, &json!({"command": "drain"}))?;
     let states = receive_all(brokers, "drained").await?;
     for (worker, state) in brokers.iter().zip(&states) {
@@ -57,7 +53,37 @@ pub(in crate::bench::timed) async fn coordinate(
     row["effective_deployment"] = prepared.configuration.clone();
     row["sdk_reservations"] = json!({"writers": clients.writers, "readers": clients.readers,
         "scope": "per SDK process; includes unused partition writers and reply aliases"});
+    if let Some(mut usage) = process {
+        usage["scope"] = json!(
+            "inproc process: every broker and client role, broker start command through client reports"
+        );
+        row["inproc_process_usage"] = usage;
+    }
     Ok(row)
+}
+
+/// Brokers format their stores under one deadline. Each must report the
+/// shared deployment it installed.
+async fn initialize(prepared: &Prepared, brokers: &mut [Process]) -> Result<()> {
+    send_all(brokers, &prepared.initialize()?)?;
+    let deadline = tokio::time::Instant::now() + ozzy_bench::budget::INITIALIZE;
+    let initialized = try_join_all(
+        brokers
+            .iter_mut()
+            .map(|broker| broker.receive_until("initialized", deadline)),
+    )
+    .await?;
+    let configuration = ozzy_bench::provenance::digest(&prepared.artifact.configuration)?;
+    let identity = ozzy_bench::provenance::digest(&prepared.artifact.identity)?;
+    for (index, row) in initialized.iter().enumerate() {
+        if row["index"] != index
+            || row["configuration_xxh3_128"] != configuration
+            || row["identity_xxh3_128"] != identity
+        {
+            return Err(error("production broker initialization identity mismatch"));
+        }
+    }
+    Ok(())
 }
 
 fn verify_ready(
@@ -67,6 +93,11 @@ fn verify_ready(
     ready: &[Value],
 ) -> Result<()> {
     let digest = ozzy_bench::provenance::digest(&std::env::current_exe()?)?;
+    let partitions = config
+        .native
+        .as_ref()
+        .ok_or_else(|| error("missing native deployment settings"))?
+        .partitions;
     if ready.len() != prepared.brokers.len() || brokers.len() != ready.len() {
         return Err(error("production broker count differs from deployment"));
     }
@@ -86,9 +117,7 @@ fn verify_ready(
             || row["topology"]["dispatcher_threads"] != 1
             || row["topology"]["partitions"]
                 .as_array()
-                .is_none_or(|partitions| {
-                    partitions.len() != config.native.as_ref().unwrap().partitions
-                })
+                .is_none_or(|actual| actual.len() != partitions)
         {
             return Err(error(
                 "production broker identity, build, or topology mismatch",

@@ -1,6 +1,8 @@
 //! Fixed-size election evidence. Full-WAL transfer is a separate exchange.
 
-use super::{Reader, WireError, Writer, validate_election_view, validate_prefix};
+use super::{
+    ReadFields, Reader, WireError, WriteFields, Writer, validate_election_view, validate_prefix,
+};
 use crate::{DoViewChange, FrozenLog, JournalGeneration, Prefix, Scope, StartView};
 
 pub(super) fn validate_report(message: DoViewChange) -> Result<(), WireError> {
@@ -32,11 +34,15 @@ fn validate_history(
     Ok(())
 }
 
-pub(super) fn write_report(writer: &mut Writer<'_>, message: DoViewChange) {
-    writer.bytes(&message.generation.0.to_be_bytes());
-    writer.u64(message.log.last_normal_view);
-    writer.prefix(message.log.accepted);
-    writer.prefix(message.log.committed);
+pub(super) fn write_report(
+    writer: &mut Writer<'_>,
+    message: DoViewChange,
+) -> Result<(), WireError> {
+    writer.bytes(&message.generation.0.to_be_bytes())?;
+    writer.u64(message.log.last_normal_view)?;
+    writer.prefix(message.log.accepted)?;
+    writer.prefix(message.log.committed)?;
+    Ok(())
 }
 
 pub(super) fn read_report(
@@ -45,7 +51,7 @@ pub(super) fn read_report(
 ) -> Result<DoViewChange, WireError> {
     let message = DoViewChange {
         scope,
-        generation: JournalGeneration(u128::from_be_bytes(reader.bytes()?)),
+        generation: JournalGeneration(u128::from_be_bytes(reader.array()?)),
         log: FrozenLog {
             last_normal_view: reader.u64()?,
             accepted: reader.prefix()?,
@@ -61,16 +67,17 @@ pub(super) fn validate_start(message: StartView) -> Result<(), WireError> {
     validate_history(message.generation, message.accepted, message.committed)
 }
 
-pub(super) fn write_start(writer: &mut Writer<'_>, message: StartView) {
-    writer.bytes(&message.generation.0.to_be_bytes());
-    writer.prefix(message.accepted);
-    writer.prefix(message.committed);
+pub(super) fn write_start(writer: &mut Writer<'_>, message: StartView) -> Result<(), WireError> {
+    writer.bytes(&message.generation.0.to_be_bytes())?;
+    writer.prefix(message.accepted)?;
+    writer.prefix(message.committed)?;
+    Ok(())
 }
 
 pub(super) fn read_start(scope: Scope, reader: &mut Reader<'_>) -> Result<StartView, WireError> {
     let message = StartView {
         scope,
-        generation: JournalGeneration(u128::from_be_bytes(reader.bytes()?)),
+        generation: JournalGeneration(u128::from_be_bytes(reader.array()?)),
         accepted: reader.prefix()?,
         committed: reader.prefix()?,
     };

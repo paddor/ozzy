@@ -11,9 +11,12 @@ members = [
     "ozzy-proto",
     "ozzy-replication",
     "ozzy-runtime",
+    "ozzy-telemetry",
     "ozzy-journal",
     "ozzy-journal-segment",
     "ozzy-sim",
+    "ozzy-test-alloc",
+    "ozzy-ui",
 ]
 default-members = [
     "ozzy",
@@ -26,8 +29,10 @@ default-members = [
     "ozzy-proto",
     "ozzy-replication",
     "ozzy-runtime",
+    "ozzy-telemetry",
     "ozzy-journal",
     "ozzy-journal-segment",
+    "ozzy-ui",
 ]
 resolver = "3"
 
@@ -44,17 +49,18 @@ repository = "https://github.com/paddor/ozzy"
 ahash = "0.8.12"
 arc-swap = "1.9.2"
 bytes = "1.12.1"
+blake3 = "1.8.7"
 clap = { version = "4.6.6", features = ["derive"] }
 fanring = { version = "0.3.9", features = ["async"] }
 futures = "0.3.34"
+hashbrown = { version = "0.17.1", default-features = false, features = ["inline-more"] }
 lz4rip = { version = "0.11.7", default-features = false, features = ["std"] }
-omq-tokio = { version = "0.25.0", default-features = false }
+omq-tokio = { version = "0.29.0", default-features = false }
 pin-project-lite = "0.2.17"
 rustix = { version = "1.1.4", features = ["fs"] }
 smallvec = "1.15.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ozzy = { path = "ozzy", version = "0.1.1" }
 ozzy-broker = { path = "ozzy-broker", version = "0.1.1" }
 ozzy-core = { path = "ozzy-core", version = "0.1.1" }
 ozzy-config = { path = "ozzy-config", version = "0.1.1" }
@@ -64,7 +70,9 @@ ozzy-io-aio = { path = "ozzy-io-aio", version = "0.1.1" }
 ozzy-proto = { path = "ozzy-proto", version = "0.1.1" }
 ozzy-replication = { path = "ozzy-replication", version = "0.1.1" }
 ozzy-runtime = { path = "ozzy-runtime", version = "0.1.1" }
+ozzy-telemetry = { path = "ozzy-telemetry", version = "0.1.1" }
 ozzy-sim = { path = "ozzy-sim" }
+ozzy-test-alloc = { path = "ozzy-test-alloc" }
 ozzy-journal = { path = "ozzy-journal", version = "0.1.1" }
 ozzy-journal-segment = { path = "ozzy-journal-segment", version = "0.1.1" }
 tempfile = "3.27.0"
@@ -91,9 +99,18 @@ must_use_candidate = "allow"
 cast_possible_truncation = "allow"
 cast_sign_loss = "allow"
 cast_precision_loss = "allow"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+unreachable = "warn"
+todo = "warn"
+unimplemented = "warn"
 
 [profile.bench]
 debug = "line-tables-only"
 
 [profile.release]
 debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2

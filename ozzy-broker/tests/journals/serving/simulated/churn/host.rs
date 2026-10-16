@@ -33,9 +33,8 @@ async fn memory_only_broker_process() {
         runtime.context().clone(),
         checked,
         local,
-        true,
-        image,
         &selections,
+        ozzy_sim::broker::Memory::new(image, true),
     )
     .await;
     println!("Serving broker {name} with test memory storage");

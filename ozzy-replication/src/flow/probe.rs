@@ -55,7 +55,7 @@ pub enum ProbeError {
 /// Poll only when the adapter needs receipt status. Opening is immediate;
 /// unanswered small requests back off to an explicit ceiling. Repeated calls at
 /// one instant emit at most one pending request. New work after a completed
-/// exchange opens immediately; unchanged status retains its pacing delay.
+/// exchange opens immediately unless paced; unchanged status retains its pacing delay.
 /// A fresh valid response resets pacing.
 /// No observation changes durable ACKs, quorum state, or commit-progress deadlines.
 #[derive(Debug)]
@@ -67,6 +67,7 @@ pub struct ProbeScheduler {
     delay: Duration,
     pending: Option<Probe>,
     advertised: OpNumber,
+    pace_new_work: bool,
 }
 
 impl ProbeScheduler {
@@ -90,7 +91,20 @@ impl ProbeScheduler {
             delay: timing.initial,
             pending: None,
             advertised: OpNumber(0),
+            pace_new_work: false,
         })
+    }
+
+    /// When an unchanged exchange is next sent or retried. New work after a
+    /// completed exchange opens one sooner unless paced.
+    pub const fn due(&self) -> Duration {
+        self.due
+    }
+
+    /// Hold new work to the pacing delay too, for a receiver that reports
+    /// receipt unasked. A probe then only has to find loss.
+    pub fn pace_new_work(&mut self) {
+        self.pace_new_work = true;
     }
 
     /// Currently outstanding frozen request, for exact response/history-work matching.
@@ -101,7 +115,8 @@ impl ProbeScheduler {
     /// Emit a new small probe when due, or retry the exact pending request.
     ///
     /// Changed `tail` or `available` does not mutate a live exchange. After
-    /// completion new availability bypasses the idle delay and captures both.
+    /// completion new availability bypasses the idle delay unless paced, and
+    /// the next request captures both.
     /// A returned request remains owned
     /// here even if transport admission fails; retry keeps its request identity.
     pub fn poll(
@@ -124,7 +139,7 @@ impl ProbeScheduler {
         if self.pending.is_some_and(|request| request.scope != scope) {
             return Err(ProbeError::Scope);
         }
-        let new_work = self.pending.is_none() && available > self.advertised;
+        let new_work = !self.pace_new_work && self.pending.is_none() && available > self.advertised;
         if now < self.due && !new_work {
             self.now = now;
             return Ok(None);

@@ -4,31 +4,48 @@
 
 # Ozzy
 
-Ozzy is a message streaming system written in Rust, built for high throughput
-and durable event logs. It runs as a single broker or a replicated cluster,
-with [OMQ](https://github.com/paddor/omq.rs) handling message passing.
+Ozzy is a message streaming system in Rust for durable event logs. Brokers own
+the log; [OMQ](https://github.com/paddor/omq.rs) carries the messages. Run one
+broker or a three-broker cluster.
 
-Run a broker with the [getting started guide](GETTING_STARTED.md), then connect
-applications using the [Rust SDK](ozzy/README.md). Requires Linux and Rust 1.93.
+Requires Linux and Rust 1.93. Start a broker with the
+[getting started guide](GETTING_STARTED.md), then connect applications with the
+[Rust SDK](ozzy/README.md).
 
 ## Goals
 
-- Keep message streaming fast and durable.
-- Aim for very low latency, and keep it steady across workloads.
-- Let OMQ handle the networking.
-- Natural batching: no artificial delays; better efficiency under load.
-- Backpressure all the way through queues; no credits or grants.
-- Run on one broker or as a three-broker cluster.
-- Run in ordinary Linux containers with the default security profile.
-- Use OMQ's inproc transport to run the real broker sans I/O in a simulator.
+- Fast, durable streaming with very low, steady latency across workloads.
+- OMQ handles the networking.
+- Natural batching: no artificial delay; larger batches under load.
+- Backpressure through every queue; no credits or grants.
+- One broker, or a three-broker cluster.
+- Runs in ordinary Linux containers with the default security profile.
+- Tests run the real broker in a simulator over OMQ inproc and memory storage.
 
 ## Broker modes
 
-| Mode | Write confirmation | Brokers |
+| Mode | A write is confirmed when | Brokers |
 | --- | --- | --- |
-| Single durable | Persisted locally | One; no failover |
-| Disk quorum | Persisted on the leader and one follower | Three; two eligible copies required |
-| Replicated-persisting | Retained on the leader and one follower; persisted in the background | Three; two eligible copies required |
+| Single durable | It is persisted locally | One; no failover |
+| Disk quorum | It is persisted on the leader and one follower | Three; two eligible copies required |
+
+The [overview](doc/OVERVIEW.md#modes) defines each boundary and its config
+value.
+
+## Features
+
+- Partitioned topics shared by many producers. A retried record returns its
+  original offset.
+- Producer resume and takeover across restarts.
+- Optional per-topic deduplication: within a configured window, the first record
+  with a message ID is stored, and repeats confirm with its original offset.
+- Consumer groups with broker-stored progress and automatic partition
+  assignment.
+- Readers start at the earliest or latest record, an offset, a broker timestamp,
+  or a record ID, and repair live-stream gaps on their own.
+- Optional per-topic retention by age or size, in whole segments.
+- Optional `lz4+tcp://` and `zstd+tcp://` endpoints (Cargo features
+  `lz4-transport` and `zstd-transport`).
 
 ## Workspace
 
@@ -46,23 +63,29 @@ applications using the [Rust SDK](ozzy/README.md). Requires Linux and Rust 1.93.
 | [`ozzy-io`](ozzy-io/) | File jobs, handles, completion, and controlled memory storage |
 | [`ozzy-io-pool`](ozzy-io-pool/) | Bounded blocking storage workers |
 | [`ozzy-io-aio`](ozzy-io-aio/) | Linux AIO storage backend |
+| [`ozzy-telemetry`](ozzy-telemetry/) | Optional thread-owned IPC telemetry and bounded diagnostic logs |
+| [`ozzy-ui`](ozzy-ui/) | Terminal admin console of one broker |
 | [`ozzy-sim`](ozzy-sim/) | Controlled simulation and full-product workload/fault runs |
 | [`ozzy-bench`](ozzy-bench/) | Benchmarks, comparisons, profiles, and SVG charts |
+| [`ozzy-test-alloc`](ozzy-test-alloc/) | Allocation counting for allocation budget tests |
 
-The simulator and benchmark tools are development crates, not published packages.
+The simulator, benchmark, and allocation test crates are for development only
+and are not published.
 
 ## Further reading
 
-- [Getting started](GETTING_STARTED.md): build, provision, run, containers, recovery.
-- [Rust SDK](ozzy/README.md): producing, resume, consuming, checkpoints.
-- [Overview](doc/OVERVIEW.md): terms and producer/consumer sequence diagrams.
-- [Architecture](DESIGN.md): component boundaries and reference map.
-- [Protocol](doc/PROTOCOL.md): wire messages, sessions, commands, errors.
-- [Runtime](doc/RUNTIME.md): owners, scheduling, batching, backpressure.
-- [Storage](doc/STORAGE.md): segments, integrity, retention, restart.
-- [Replication](doc/REPLICATION.md): authority, confirmation, elections, repair.
-- [Development](DEVELOPMENT.md) and [contributing](CONTRIBUTING.md): checks and test layers.
-- [Benchmarks](BENCHMARKS.md): six charts and their measurement conditions.
+| Document | Covers |
+| --- | --- |
+| [Getting started](GETTING_STARTED.md) | Build, provision, run, containers, recovery |
+| [Rust SDK](ozzy/README.md) | Producing, resume, deduplication, consuming, checkpoints, consumer groups |
+| [Overview](doc/OVERVIEW.md) | Terms, modes, placement, record flow |
+| [Architecture](DESIGN.md) | Component boundaries and reference map |
+| [Protocol](doc/PROTOCOL.md) | Wire messages, sessions, commands, errors |
+| [Runtime](doc/RUNTIME.md) | Owners, scheduling, batching, backpressure, deployment config |
+| [Storage](doc/STORAGE.md) | Segments, integrity, retention, restart |
+| [Replication](doc/REPLICATION.md) | Authority, confirmation, elections, repair |
+| [Development](DEVELOPMENT.md), [contributing](CONTRIBUTING.md) | Checks and test layers |
+| [Benchmarks](BENCHMARKS.md) | The four charts and their measurement conditions |
 
 ## License
 

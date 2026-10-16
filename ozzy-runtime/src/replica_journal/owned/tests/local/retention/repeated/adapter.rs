@@ -132,6 +132,18 @@ fn automatic_retention_reuses_a_checkpoint_without_an_intervening_append() {
         .unwrap();
         assert!(turn.enabled);
         assert!(turn.proposal.is_none());
+        drive(
+            &mut controller,
+            std::future::poll_fn(|cx| {
+                assert!(adapter.poll_stopped(cx).is_pending());
+                if adapter.retention_busy() {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                } else {
+                    Poll::Ready(())
+                }
+            }),
+        );
         let manifest = selected_manifest(&controller);
         assert_eq!(manifest.checkpoint, Some(selected));
         assert_eq!(

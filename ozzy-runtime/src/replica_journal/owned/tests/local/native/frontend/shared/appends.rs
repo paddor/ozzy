@@ -58,7 +58,7 @@ async fn admission_refusal_keeps_earlier_confirmation_correlated() {
 async fn refused_successor() {
     let (mut harness, links, clock, _) = setup_shared_with_writers(&[]).await;
     let topic = harness.drive(links.topic("orders"), false).await.unwrap();
-    let routes = links.routes(topic).unwrap();
+    let routes = links.routes(topic).await.unwrap();
     let mut config = writer_config(40, 0);
     config.inflight_appends = 2;
     // Each record fills its batch, so the second APPEND pipelines behind the
@@ -137,7 +137,7 @@ async fn refused_successor() {
 async fn predecessor() {
     let (mut harness, links, clock, _) = setup_shared_with_writers(&[]).await;
     let topic = harness.drive(links.topic("orders"), false).await.unwrap();
-    let routes = links.routes(topic).unwrap();
+    let routes = links.routes(topic).await.unwrap();
     let mut config = writer_config(40, 0);
     config.inflight_appends = 2;
     // Each record fills its batch, so the second APPEND pipelines behind the
@@ -221,11 +221,11 @@ async fn predecessor() {
     harness.shutdown().await;
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines, reason = "one linear scenario")]
 async fn replacement() {
     let (mut harness, links, clock, authority) = setup_shared().await;
     let topic = harness.drive(links.topic("orders"), false).await.unwrap();
-    let routes = links.routes(topic).unwrap();
+    let routes = links.routes(topic).await.unwrap();
     let opened = harness
         .drive(
             links.open_producer(
@@ -350,11 +350,11 @@ async fn replacement() {
     harness.shutdown().await;
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines, reason = "one linear scenario")]
 async fn scenario() {
     let (mut harness, links, clock, authority) = setup_shared().await;
     let topic = harness.drive(links.topic("orders"), false).await.unwrap();
-    let routes = links.routes(topic).unwrap();
+    let routes = links.routes(topic).await.unwrap();
     let session = links.session(authority.primary).unwrap();
     let open = |writer, operation| Open {
         authority: authority.authority,

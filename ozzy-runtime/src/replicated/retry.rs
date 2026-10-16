@@ -2,7 +2,29 @@
 
 use std::time::Duration;
 
-use super::Error;
+use super::{BrokerLinkError, Error, TopicRoutes};
+use ozzy_proto::{directory::RouteState, nack::RetryClass};
+
+/// Shared classification for membership and cumulative progress. A selected
+/// route also validates authority hints before they influence another attempt.
+pub(crate) fn classify(
+    error: &BrokerLinkError,
+    route: Option<&RouteState>,
+) -> Result<Option<RetryClass>, BrokerLinkError> {
+    let class = match error {
+        BrokerLinkError::Timeout | BrokerLinkError::Session | BrokerLinkError::Transport(_) => {
+            RetryClass::UnknownOutcome
+        }
+        BrokerLinkError::Rejected { retry, .. } if *retry != RetryClass::Permanent => *retry,
+        _ => return Ok(None),
+    };
+    if class != RetryClass::AfterBackoff
+        && let (BrokerLinkError::Rejected { hint, .. }, Some(route)) = (error, route)
+    {
+        TopicRoutes::validate_hint(*hint, route)?;
+    }
+    Ok(Some(class))
+}
 
 /// Client failure-detection and retry pacing, independent of replica election timers.
 #[derive(Debug, Clone, Copy)]
@@ -30,6 +52,11 @@ impl Default for RetryPolicy {
 }
 
 impl RetryPolicy {
+    /// The delay after `backoff`: doubled, up to the cap.
+    pub(crate) fn next_backoff(&self, backoff: Duration) -> Duration {
+        backoff.saturating_mul(2).min(self.max_backoff)
+    }
+
     pub(super) fn validate(self) -> Result<(), Error> {
         let now = tokio::time::Instant::now();
         if [

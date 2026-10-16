@@ -81,11 +81,7 @@ impl ReadDelivery {
             Self::Resident(delivery) => delivery.encode(output, maximum),
             Self::Copied(read) => {
                 if read.records().len() != 0 {
-                    #[cfg(feature = "storage-metrics")]
-                    crate::storage_metrics::add(
-                        &crate::storage_metrics::HISTORICAL_READ_DELIVERIES,
-                        1,
-                    );
+                    crate::profiling::event(crate::profiling::Event::HistoricalReadDelivery);
                     output
                         .extend(read.records())
                         .map_err(|_| PartitionReadError::Limits)?;
@@ -126,14 +122,90 @@ fn whole_compressed_batch(
     Ok(())
 }
 
-fn advance(cursor: &mut PartitionReadCursor, records: usize) {
-    cursor.next = ozzy_proto::Offset::new(
-        cursor
-            .next
-            .get()
-            .checked_add(records as u64)
-            .expect("validated read end"),
-    );
+/// Move the cursor past `records` delivered records.
+fn advance(cursor: &mut PartitionReadCursor, records: usize) -> Result<(), PartitionReadError> {
+    cursor.next = cursor
+        .next
+        .get()
+        .checked_add(records as u64)
+        .map(ozzy_proto::Offset::new)
+        .ok_or(PartitionReadError::Limits)?;
+    Ok(())
+}
+
+/// Forward a whole span over its shared stored backing when the message
+/// takes it. Returns the records delivered, or `None` to copy them instead.
+fn share_span(
+    span: &ozzy_journal_segment::RecordSpan<'_>,
+    output: &mut RecordsEncoder<'_>,
+    cursor: &mut PartitionReadCursor,
+) -> Option<Result<usize, PartitionReadError>> {
+    if span.len() <= output.remaining().max_records
+        && let Some(block) = span.prepared_backing(output.shared_backing_limit())
+        && output.extend_shared_prepared_lz4(block, span.len()) == Ok(true)
+    {
+        return Some(advance(cursor, span.len()).map(|()| span.len()));
+    }
+    if span.len() <= output.remaining().max_records
+        && let Some((descriptors, body, range)) =
+            span.encoded_backing(output.shared_backing_limit())
+        && output.extend_shared_packed(descriptors, body, range, span.len()) == Ok(true)
+    {
+        return Some(advance(cursor, span.len()).map(|()| span.len()));
+    }
+    None
+}
+
+/// Deliver the leading records of `span` that fit the message one by one,
+/// sharing each record's backing where possible. Only a first record too
+/// large for an empty message or a failed encode is an error.
+fn copy_records(
+    span: &ozzy_journal_segment::RecordSpan<'_>,
+    output: &mut RecordsEncoder<'_>,
+    cursor: &mut PartitionReadCursor,
+) -> Result<(), PartitionReadError> {
+    for record in span.records() {
+        let limits = output.remaining();
+        let bytes = record.payload_bytes();
+        let parts = record.parts().len();
+        if limits.max_records == 0 {
+            break;
+        }
+        if bytes > limits.envelope.max_payload_bytes || parts > limits.max_parts {
+            if output.is_empty() {
+                return Err(PartitionReadError::RecordTooLarge { bytes, parts });
+            }
+            break;
+        }
+        let shared = match record.payload_backing(output.shared_backing_limit()) {
+            Some((body, ranges)) => {
+                output.push_shared(record.message_id(), record.encoding(), body, ranges)
+            }
+            None => Ok(false),
+        };
+        let encoded = if shared == Ok(true) {
+            Ok(())
+        } else if shared.is_err() {
+            shared.map(|_| ())
+        } else if let Some(part) = (record.encoding() == ozzy_proto::data::Encoding::Raw
+            && parts == 1)
+            .then(|| record.parts().next())
+            .flatten()
+        {
+            output.push_raw(record.message_id(), part)
+        } else {
+            output.extend(std::iter::once((
+                record.message_id(),
+                record.encoding(),
+                record.parts(),
+            )))
+        };
+        if encoded.is_err() {
+            return Err(PartitionReadError::Limits);
+        }
+        advance(cursor, 1)?;
+    }
+    Ok(())
 }
 
 impl ResidentPartition {
@@ -142,9 +214,8 @@ impl ResidentPartition {
         output: &mut RecordsEncoder<'_>,
         maximum: ozzy_proto::data::DataLimits,
     ) -> Result<PartitionReadCursor, JournalError> {
-        #[cfg(feature = "storage-metrics")]
         if self.records.is_some() {
-            crate::storage_metrics::add(&crate::storage_metrics::DIRECT_RESIDENT_READS, 1);
+            crate::profiling::event(crate::profiling::Event::DirectResidentRead);
         }
         let mut error = None;
         let receive = |span: &ozzy_journal_segment::RecordSpan<'_>| {
@@ -153,76 +224,21 @@ impl ResidentPartition {
                 error = stop;
                 return 0;
             }
-            if span.len() <= output.remaining().max_records
-                && let Some((descriptors, decoded_bytes, body, encoded)) =
-                    span.prepared_backing(output.shared_backing_limit())
-                && output.extend_shared_prepared_lz4(
-                    descriptors,
-                    decoded_bytes,
-                    body,
-                    encoded,
-                    span.len(),
-                ) == Ok(true)
-            {
-                advance(&mut self.cursor, span.len());
-                return span.len();
+            if let Some(shared) = share_span(span, output, &mut self.cursor) {
+                return shared.unwrap_or_else(|stop| {
+                    error = Some(stop);
+                    0
+                });
             }
-            if span.len() <= output.remaining().max_records
-                && let Some((descriptors, body, range)) =
-                    span.encoded_backing(output.shared_backing_limit())
-                && output.extend_shared_packed(descriptors, body, range, span.len()) == Ok(true)
-            {
-                advance(&mut self.cursor, span.len());
-                return span.len();
-            }
-            for record in span.records() {
-                let limits = output.remaining();
-                let bytes = record.payload_bytes();
-                let parts = record.parts().len();
-                if limits.max_records == 0 {
-                    break;
-                }
-                if bytes > limits.envelope.max_payload_bytes || parts > limits.max_parts {
-                    if output.is_empty() {
-                        error = Some(PartitionReadError::RecordTooLarge { bytes, parts });
-                    }
-                    break;
-                }
-                let shared = match record.payload_backing(output.shared_backing_limit()) {
-                    Some((body, ranges)) => {
-                        output.push_shared(record.message_id(), record.encoding(), body, ranges)
-                    }
-                    None => Ok(false),
-                };
-                let encoded = if shared == Ok(true) {
-                    Ok(())
-                } else if shared.is_err() {
-                    shared.map(|_| ())
-                } else if record.encoding() == ozzy_proto::data::Encoding::Raw && parts == 1 {
-                    output.push_raw(
-                        record.message_id(),
-                        record.parts().next().expect("one part"),
-                    )
-                } else {
-                    output.extend(std::iter::once((
-                        record.message_id(),
-                        record.encoding(),
-                        record.parts(),
-                    )))
-                };
-                if encoded.is_err() {
-                    error = Some(PartitionReadError::Limits);
-                    break;
-                }
-                self.cursor.next = self.cursor.next.checked_next().expect("validated read end");
+            if let Err(stop) = copy_records(span, output, &mut self.cursor) {
+                error = Some(stop);
             }
             output.len() - before
         };
         match self.records {
             Some(ResidentSource::Stored(read)) => read.visit_spans(receive)?,
             Some(ResidentSource::Pending(read)) => {
-                #[cfg(feature = "storage-metrics")]
-                crate::storage_metrics::add(&crate::storage_metrics::BACKGROUND_RESIDENT_READS, 1);
+                crate::profiling::event(crate::profiling::Event::BackgroundResidentRead);
                 read.visit_spans(receive);
             }
             None => {}

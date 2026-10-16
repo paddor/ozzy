@@ -1,3 +1,13 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
+
 use ozzy_proto::{GroupId, NodeId};
 use ozzy_replication::{
     CONFIGURATION_RECORD_BYTES, ConfigurationRecord, ConfigurationRecordError, ConfiguredVoter,
@@ -25,7 +35,7 @@ fn configuration_record_has_canonical_bytes_and_roundtrips() {
     let record = record();
     let bytes = record.encode();
     assert_eq!(bytes.len(), CONFIGURATION_RECORD_BYTES);
-    assert_eq!(&bytes[..16], b"OZYVOTER\0\x02\x01\0\x01\x01\x01\x01");
+    assert_eq!(&bytes[..16], b"OZYVOTER\0\x02\x01\0\x01\x01\x01\0");
     assert_eq!(&bytes[16..32], &[7; 16]);
     assert_eq!(&bytes[32..40], &[1, 2, 3, 4, 5, 6, 7, 8]);
     assert_eq!(&bytes[40..48], &[3, 0, 0, 0, 0, 0, 0, 0]);
@@ -38,7 +48,7 @@ fn configuration_record_has_canonical_bytes_and_roundtrips() {
     assert_eq!(
         &bytes[192..224],
         &[
-            149, 26, 224, 160, 76, 98, 93, 108, 178, 73, 35, 17, 212, 115, 39, 107, 0, 0, 0, 0, 0,
+            56, 16, 89, 168, 241, 174, 133, 106, 216, 22, 37, 108, 51, 206, 109, 34, 0, 0, 0, 0, 0,
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ]
     );

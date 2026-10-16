@@ -2,12 +2,13 @@
 
 use super::{
     Arc, Bytes, CachedBatch, CachedOperation, DecodedBatches, IndexedReadError, RecordView,
-    cache_batch,
+    cache_batch, cache_resolved_batch,
 };
 use crate::OperationLocation;
 use ozzy_journal::operation::{
-    AppendSummary, OperationHeader, OperationKind, OperationLimits, ValidatedWireAppend,
-    decode_append_summary_and_batches, decode_append_summary_and_batches_with_validated_payload,
+    AppendSummary, OperationHeader, OperationKind, OperationLimits, ResolvedAppendView,
+    ValidatedWireAppend, decode_append_summary_and_batches,
+    decode_append_summary_and_batches_with_validated_payload, decode_resolved_append,
     validate_operation_body,
 };
 use ozzy_proto::{Offset, PartitionIncarnation};
@@ -136,12 +137,38 @@ impl PreparedOperationRecords {
         if header.kind == OperationKind::Append {
             return Self::new_append(header, body, limits).map(|(_, records)| records);
         }
+        if header.kind == OperationKind::ResolvedAppend {
+            let view = decode_resolved_append(&body, limits)?;
+            return Self::new_resolved_append(header, body.clone(), &view);
+        }
         validate_operation_body(header.kind, &body, limits)?;
         Ok(Self {
             header,
             body,
             shared_backing_bytes: None,
             batches: Arc::from([]),
+        })
+    }
+
+    /// Capture selectors from a resolved view already validated for these exact
+    /// immutable body bytes. Outcome metadata stays in the body, outside the
+    /// resident record table. Boundaries are checked against its shared backing.
+    pub fn new_resolved_append(
+        header: OperationHeader,
+        body: Bytes,
+        view: &ResolvedAppendView<'_>,
+    ) -> Result<Self, IndexedReadError> {
+        if header.kind != OperationKind::ResolvedAppend {
+            return Err(IndexedReadError::NotAppend);
+        }
+        let batches = cache_resolved_batch(&body, view)?
+            .into_iter()
+            .collect::<Vec<_>>();
+        Ok(Self {
+            header,
+            body,
+            shared_backing_bytes: None,
+            batches: batches.into(),
         })
     }
 
@@ -235,7 +262,11 @@ impl PreparedOperationRecords {
     }
 
     pub(crate) fn bind(&self, location: OperationLocation) -> Option<Arc<CachedOperation>> {
-        (self.header.kind == OperationKind::Append).then(|| {
+        matches!(
+            self.header.kind,
+            OperationKind::Append | OperationKind::ResolvedAppend
+        )
+        .then(|| {
             Arc::new(CachedOperation {
                 location,
                 body: self.body.clone(),
@@ -327,10 +358,7 @@ impl PreparedOperationRecords {
                     shared_backing_bytes: self.shared_backing_bytes,
                     batch,
                     decoded: cell,
-                    record: batch
-                        .records
-                        .get(index, &self.body)
-                        .expect("bounded record range"),
+                    record: batch.records.record(index, &self.body),
                     index: index as u64,
                 })
             })

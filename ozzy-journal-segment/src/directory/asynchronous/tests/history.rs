@@ -341,9 +341,11 @@ fn async_history_validates_the_whole_physical_group_before_exposing_a_prefix() {
         .collect::<Vec<_>>();
     let encoded = crate::encode_group(
         journal.writer.header(),
-        1,
-        crate::SEGMENT_HEADER_BYTES as u64,
-        ChainPosition::GENESIS,
+        crate::GroupStart::new(
+            1,
+            crate::SEGMENT_HEADER_BYTES as u64,
+            ChainPosition::GENESIS,
+        ),
         &ops,
     )
     .unwrap();
@@ -430,7 +432,7 @@ fn async_history_cancellation_discards_partial_cache_without_losing_file_protect
         &mut controller,
         journal.retire_sealed_prefix(
             &crate::RetentionFloors::new(vec![]).unwrap(),
-            crate::AsyncRetirementBudget {
+            crate::RetirementBudget {
                 max_segments: 2,
                 max_read_bytes: 65536,
             },

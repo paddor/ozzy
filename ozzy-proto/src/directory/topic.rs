@@ -5,9 +5,7 @@ use std::net::SocketAddr;
 
 use crate::{
     ENVELOPE_BYTES, Envelope, EnvelopeLimits, GroupId, NodeId, Opcode, Packet,
-    PartitionIncarnation, TopicId,
-    append::Policy,
-    data::{CodecError, Cursor},
+    PartitionIncarnation, TopicId, append::Policy, data::CodecError, layout::Reader,
 };
 
 use super::{Limits, control, prepare};
@@ -96,11 +94,7 @@ impl TopicPage {
                 .is_none_or(|end| end > self.total)
             || !matches!(
                 (self.brokers.len(), self.policy),
-                (1, Policy::LocalDurable)
-                    | (
-                        3,
-                        Policy::QuorumDurable | Policy::QuorumReplicatedPersisting
-                    )
+                (1, Policy::LocalDurable) | (3, Policy::QuorumDurable)
             )
         {
             return false;
@@ -122,7 +116,10 @@ impl TopicPage {
         let mut groups = BTreeSet::new();
         let mut incarnations = BTreeSet::new();
         for (index, partition) in self.partitions.iter().enumerate() {
-            if partition.number != self.first + index as u32
+            if u32::try_from(index)
+                .ok()
+                .and_then(|index| self.first.checked_add(index))
+                != Some(partition.number)
                 || partition.group.as_bytes() == &[0; 16]
                 || partition.config_epoch == 0
                 || partition.incarnation.as_bytes() == &[0; 16]
@@ -144,12 +141,14 @@ impl TopicPage {
             .checked_add(self.name.len())
             .ok_or(CodecError::Length)?;
         for broker in &self.brokers {
-            size = size
-                .checked_add(16 + 2 + broker.peer.len() + 2 + broker.reader_pub.len() + 2)
-                .and_then(|value| {
-                    value.checked_add(broker.follower_pub.as_ref().map_or(0, String::len))
-                })
-                .ok_or(CodecError::Length)?;
+            // Identity, three length prefixes, and the endpoints.
+            size = crate::data::sum(&[
+                size,
+                22,
+                broker.peer.len(),
+                broker.reader_pub.len(),
+                broker.follower_pub.as_ref().map_or(0, String::len),
+            ])?;
         }
         for partition in &self.partitions {
             size = size
@@ -185,8 +184,7 @@ pub fn encode_topic_request(
     let header = prepare(
         envelope,
         Opcode::StateSnapshotRequest,
-        true,
-        8 + request.name.len(),
+        crate::data::add(8, request.name.len())?,
         out,
         frame,
     )?;
@@ -203,14 +201,14 @@ pub fn decode_topic_request(
     frame: EnvelopeLimits,
     limits: Limits,
 ) -> Result<TopicRequest, CodecError> {
-    let mut cursor = control(packet, Opcode::StateSnapshotRequest, true, frame, limits)?;
-    if cursor.byte()? != TOPIC_TAG {
+    let mut cursor = control(packet, Opcode::StateSnapshotRequest, frame, limits)?;
+    if cursor.u8()? != TOPIC_TAG {
         return Err(CodecError::Profile);
     }
     let name = read_name(&mut cursor)?;
     let first = cursor.u32()?;
     let maximum = u16::from_be_bytes(cursor.array()?);
-    if !cursor.0.is_empty() || maximum == 0 || usize::from(maximum) > limits.partitions {
+    if !cursor.rest().is_empty() || maximum == 0 || usize::from(maximum) > limits.partitions {
         return Err(CodecError::Profile);
     }
     Ok(TopicRequest {
@@ -234,7 +232,6 @@ pub fn encode_topic_page(
     let header = prepare(
         envelope,
         Opcode::StateSnapshot,
-        true,
         page.metadata_bytes()?,
         out,
         frame,
@@ -275,63 +272,22 @@ pub fn decode_topic_page(
     frame: EnvelopeLimits,
     limits: Limits,
 ) -> Result<TopicPage, CodecError> {
-    let mut cursor = control(packet, Opcode::StateSnapshot, true, frame, limits)?;
-    if cursor.byte()? != TOPIC_TAG {
+    let mut cursor = control(packet, Opcode::StateSnapshot, frame, limits)?;
+    if cursor.u8()? != TOPIC_TAG {
         return Err(CodecError::Profile);
     }
     let id = TopicId::from_bytes(cursor.array()?);
     let name = read_name(&mut cursor)?;
-    if cursor.byte()? != 1 {
+    if cursor.u8()? != 1 {
         return Err(CodecError::Profile);
     }
     let partitioner_seed = cursor.u64()?;
     let total = cursor.u32()?;
     let first = cursor.u32()?;
-    let policy = Policy::try_from(cursor.byte()?)?;
-    let broker_count = usize::from(cursor.byte()?);
-    if !matches!(broker_count, 1 | 3) || broker_count > limits.members {
-        return Err(CodecError::Limit);
-    }
-    let mut brokers = Vec::with_capacity(broker_count);
-    for _ in 0..broker_count {
-        let node = NodeId::from_bytes(cursor.array()?);
-        let peer = read_endpoint(&mut cursor)?.ok_or(CodecError::Profile)?;
-        let reader_pub = read_endpoint(&mut cursor)?.ok_or(CodecError::Profile)?;
-        let follower_pub = read_endpoint(&mut cursor)?;
-        brokers.push(BrokerEndpoint {
-            node,
-            peer,
-            reader_pub,
-            follower_pub,
-        });
-    }
-    let count = usize::from(u16::from_be_bytes(cursor.array()?));
-    if count == 0 || count > limits.partitions || cursor.0.len() < PARTITION_BASE * count {
-        return Err(CodecError::Limit);
-    }
-    let mut partitions = Vec::with_capacity(count);
-    for _ in 0..count {
-        let number = cursor.u32()?;
-        let group = GroupId::from_bytes(cursor.array()?);
-        let config_epoch = cursor.u64()?;
-        let incarnation = PartitionIncarnation::from_bytes(cursor.array()?);
-        let members = usize::from(cursor.byte()?);
-        if members != broker_count {
-            return Err(CodecError::Profile);
-        }
-        let mut ordered = Vec::with_capacity(members);
-        for _ in 0..members {
-            ordered.push(NodeId::from_bytes(cursor.array()?));
-        }
-        partitions.push(TopicPartition {
-            number,
-            group,
-            config_epoch,
-            incarnation,
-            members: ordered,
-        });
-    }
-    if !cursor.0.is_empty() {
+    let policy = Policy::try_from(cursor.u8()?)?;
+    let brokers = read_brokers(&mut cursor, limits)?;
+    let partitions = read_partitions(&mut cursor, brokers.len(), limits)?;
+    if !cursor.rest().is_empty() {
         return Err(CodecError::Length);
     }
     let page = TopicPage {
@@ -350,12 +306,135 @@ pub fn decode_topic_page(
     Ok(page)
 }
 
+fn read_brokers(
+    cursor: &mut Reader<'_>,
+    limits: Limits,
+) -> Result<Vec<BrokerEndpoint>, CodecError> {
+    let count = usize::from(cursor.u8()?);
+    if !matches!(count, 1 | 3) || count > limits.members {
+        return Err(CodecError::Limit);
+    }
+    let mut brokers = Vec::with_capacity(count);
+    for _ in 0..count {
+        let node = NodeId::from_bytes(cursor.array()?);
+        let peer = read_endpoint(cursor)?.ok_or(CodecError::Profile)?;
+        let reader_pub = read_endpoint(cursor)?.ok_or(CodecError::Profile)?;
+        let follower_pub = read_endpoint(cursor)?;
+        brokers.push(BrokerEndpoint {
+            node,
+            peer,
+            reader_pub,
+            follower_pub,
+        });
+    }
+    Ok(brokers)
+}
+
+/// Each partition lists one member per page broker.
+fn read_partitions(
+    cursor: &mut Reader<'_>,
+    members: usize,
+    limits: Limits,
+) -> Result<Vec<TopicPartition>, CodecError> {
+    let count = usize::from(u16::from_be_bytes(cursor.array()?));
+    if count == 0 || count > limits.partitions || cursor.rest().len() < PARTITION_BASE * count {
+        return Err(CodecError::Limit);
+    }
+    let mut partitions = Vec::with_capacity(count);
+    for _ in 0..count {
+        let number = cursor.u32()?;
+        let group = GroupId::from_bytes(cursor.array()?);
+        let config_epoch = cursor.u64()?;
+        let incarnation = PartitionIncarnation::from_bytes(cursor.array()?);
+        if usize::from(cursor.u8()?) != members {
+            return Err(CodecError::Profile);
+        }
+        let mut ordered = Vec::with_capacity(members);
+        for _ in 0..members {
+            ordered.push(NodeId::from_bytes(cursor.array()?));
+        }
+        partitions.push(TopicPartition {
+            number,
+            group,
+            config_epoch,
+            incarnation,
+            members: ordered,
+        });
+    }
+    Ok(partitions)
+}
+
 fn name_valid(name: &str) -> bool {
     (1..=MAX_NAME).contains(&name.len())
-        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && name
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
         && name.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"-_.".contains(&byte)
         })
+}
+
+/// Transport scheme of a broker endpoint. Compressed schemes transform each
+/// connection on its OMQ I/O thread. A broker receives every socket through
+/// one buffer profile, so a deployment compresses every endpoint or none.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EndpointScheme {
+    /// Plain `tcp://host:port`.
+    Tcp,
+    /// `lz4+tcp://host:port`.
+    Lz4Tcp,
+    /// `zstd+tcp://host:port`.
+    ZstdTcp,
+    /// `ipc://` filesystem or abstract socket path.
+    Ipc,
+    /// `inproc://` name within one OMQ context.
+    Inproc,
+}
+
+impl EndpointScheme {
+    const ALL: [Self; 5] = [
+        Self::Tcp,
+        Self::Lz4Tcp,
+        Self::ZstdTcp,
+        Self::Ipc,
+        Self::Inproc,
+    ];
+
+    /// Split an endpoint into its scheme and the address after `://`.
+    #[must_use]
+    pub fn parse(endpoint: &str) -> Option<(Self, &str)> {
+        Self::ALL.into_iter().find_map(|scheme| {
+            endpoint
+                .strip_prefix(scheme.as_str())
+                .and_then(|rest| rest.strip_prefix("://"))
+                .map(|address| (scheme, address))
+        })
+    }
+
+    /// The scheme without `://`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Lz4Tcp => "lz4+tcp",
+            Self::ZstdTcp => "zstd+tcp",
+            Self::Ipc => "ipc",
+            Self::Inproc => "inproc",
+        }
+    }
+
+    /// TCP, with or without a per-connection transform.
+    #[must_use]
+    pub const fn is_tcp(self) -> bool {
+        matches!(self, Self::Tcp | Self::Lz4Tcp | Self::ZstdTcp)
+    }
+
+    /// Connections are compressed on the OMQ I/O thread.
+    #[must_use]
+    pub const fn compressed(self) -> bool {
+        matches!(self, Self::Lz4Tcp | Self::ZstdTcp)
+    }
 }
 
 fn endpoint_valid(endpoint: &str) -> bool {
@@ -366,26 +445,27 @@ fn endpoint_valid(endpoint: &str) -> bool {
     {
         return false;
     }
-    if let Some(address) = endpoint.strip_prefix("tcp://") {
-        if let Ok(address) = address.parse::<SocketAddr>() {
-            return address.port() > 0
-                && !address.ip().is_unspecified()
-                && !address.ip().is_multicast();
+    match EndpointScheme::parse(endpoint) {
+        Some((scheme, address)) if scheme.is_tcp() => {
+            if let Ok(address) = address.parse::<SocketAddr>() {
+                return address.port() > 0
+                    && !address.ip().is_unspecified()
+                    && !address.ip().is_multicast();
+            }
+            address.rsplit_once(':').is_some_and(|(host, port)| {
+                !host.is_empty()
+                    && host
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+                    && port.parse::<u16>().is_ok_and(|port| port > 0)
+            })
         }
-        return address.rsplit_once(':').is_some_and(|(host, port)| {
-            !host.is_empty()
-                && host
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
-                && port.parse::<u16>().is_ok_and(|port| port > 0)
-        });
+        Some((EndpointScheme::Ipc, name)) => {
+            name.starts_with('/') || (name.starts_with('@') && name.len() > 1)
+        }
+        Some((EndpointScheme::Inproc, name)) => !name.is_empty(),
+        _ => false,
     }
-    if let Some(name) = endpoint.strip_prefix("ipc://") {
-        return name.starts_with('/') || (name.starts_with('@') && name.len() > 1);
-    }
-    endpoint
-        .strip_prefix("inproc://")
-        .is_some_and(|name| !name.is_empty())
 }
 
 fn write_name(out: &mut Vec<u8>, name: &str) {
@@ -393,8 +473,8 @@ fn write_name(out: &mut Vec<u8>, name: &str) {
     out.extend_from_slice(name.as_bytes());
 }
 
-fn read_name(cursor: &mut Cursor<'_>) -> Result<String, CodecError> {
-    let count = usize::from(cursor.byte()?);
+fn read_name(cursor: &mut Reader<'_>) -> Result<String, CodecError> {
+    let count = usize::from(cursor.u8()?);
     if count == 0 || count > MAX_NAME {
         return Err(CodecError::Profile);
     }
@@ -410,7 +490,7 @@ fn write_endpoint(out: &mut Vec<u8>, endpoint: &str) {
     out.extend_from_slice(endpoint.as_bytes());
 }
 
-fn read_endpoint(cursor: &mut Cursor<'_>) -> Result<Option<String>, CodecError> {
+fn read_endpoint(cursor: &mut Reader<'_>) -> Result<Option<String>, CodecError> {
     let count = usize::from(u16::from_be_bytes(cursor.array()?));
     if count == 0 {
         return Ok(None);

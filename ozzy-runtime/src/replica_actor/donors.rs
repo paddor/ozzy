@@ -3,6 +3,7 @@
 use super::io::FetchPurpose;
 use super::{ActorError, Bytes, Message, NodeId, PendingIo, ReplicaActor, SendClass, wire};
 use crate::replica_actor::HistoryReason;
+use crate::replica_actor::require_normal;
 use crate::replica_journal::{FetchedHistory, PinnedRecovery};
 use ozzy_replication::recovery::RecoveryResponse;
 use ozzy_replication::wire::{FetchOps, RecoveryRequest, RecoveryState};
@@ -52,6 +53,13 @@ impl Pin {
 }
 
 impl Slot {
+    /// The response a current request still needs pinned before serving.
+    fn wanted_pin(&self) -> Option<RecoveryResponse> {
+        self.response.filter(|response| {
+            response.primary.is_some() && matches!(self.pin, Pin::Empty) && self.request.is_some()
+        })
+    }
+
     fn clear_request(&mut self) {
         self.request = None;
         self.fetch = None;
@@ -98,10 +106,13 @@ impl ReplicaActor {
         index: usize,
         request: RecoveryRequest,
     ) -> Result<(), ActorError> {
-        if self.donors.is_none() || !self.application_ready() {
+        if !self.application_ready() {
             return Ok(());
         }
-        let slot = &mut self.donors.as_mut().expect("enabled donors").slots[index];
+        let Some(donors) = &mut self.donors else {
+            return Ok(());
+        };
+        let slot = &mut donors.slots[index];
         if let Some(response) = slot.response.filter(|response| {
             response.scope == self.driver.scope()
                 && response.nonce == request.nonce
@@ -127,9 +138,7 @@ impl ReplicaActor {
             }) {
                 response
             } else {
-                self.driver
-                    .normal()
-                    .expect("ready normal")
+                require_normal(&self.driver)?
                     .recovery_response(request.nonce)
                     .map_err(crate::replica_journal::JournalError::from)?
             };
@@ -186,11 +195,7 @@ impl ReplicaActor {
                     &mut self.metadata,
                     self.wire_limits,
                 )?;
-                let message = Message::multipart([
-                    Bytes::copy_from_slice(&encoded.header),
-                    Bytes::copy_from_slice(&self.metadata[..encoded.metadata_bytes]),
-                    Bytes::new(),
-                ]);
+                let message = super::control_message(encoded, &self.metadata);
                 self.enqueue(to, SendClass::Control, message)?;
             }
         }
@@ -204,12 +209,14 @@ impl ReplicaActor {
         let Some(donors) = &mut self.donors else {
             return false;
         };
-        let index = self
+        let Some(index) = self
             .configuration
             .voters()
             .iter()
             .position(|voter| *voter == from)
-            .expect("configured sender");
+        else {
+            return false;
+        };
         let slot = &mut donors.slots[index];
         let Some(pin) = slot.pin.held().filter(|pin| pin.source() == request.source) else {
             return false;
@@ -235,18 +242,14 @@ impl ReplicaActor {
             donors.yield_normal = false;
             return Ok(false);
         }
+        let writes_unsettled = !self.pending_persistence.is_empty()
+            || self.pending_sync.is_some()
+            || !self.journal.settled();
         for delta in 0..3 {
             let index = (donors.cursor + delta) % 3;
             let slot = &mut donors.slots[index];
-            let action = if let Some(response) = slot.response.filter(|response| {
-                response.primary.is_some()
-                    && matches!(slot.pin, Pin::Empty)
-                    && slot.request.is_some()
-            }) {
-                if !self.pending_persistence.is_empty()
-                    || self.pending_sync.is_some()
-                    || !self.journal.settled()
-                {
+            let action = if let Some(response) = slot.wanted_pin() {
+                if writes_unsettled {
                     // Drain writes and their independent barrier before pinning
                     // authoritative history; busy admission is backpressure.
                     return Ok(true);
@@ -255,10 +258,7 @@ impl ReplicaActor {
                 // or commit may have advanced while it waited for the journal.
                 // Freeze current authority at pin admission, then keep that
                 // exact response across retries and asynchronous completion.
-                let response = self
-                    .driver
-                    .normal()
-                    .expect("ready normal")
+                let response = require_normal(&self.driver)?
                     .recovery_response(response.nonce)
                     .map_err(crate::replica_journal::JournalError::from)?;
                 slot.response = Some(response);
@@ -389,7 +389,7 @@ impl ReplicaActor {
         if current {
             self.send_ops(to, fetched)
         } else {
-            self.recycle(fetched.into_buffer());
+            self.recycle(fetched.into_buffer())?;
             Ok(())
         }
     }

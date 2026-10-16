@@ -1,100 +1,173 @@
 //! Individual SDK submissions with concurrent delivery observation and pacing.
-use super::super::super::pacing::{Plan, Timer};
+use super::super::super::pacing::{Arrivals, Plan, Timer};
 use super::super::{Config, Counts, Result, Value, Window, config, metrics, producer};
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt, stream::FuturesOrdered};
-use ozzy_proto::MessageId;
+use ozzy_proto::{GroupId, MessageId};
 use std::future::Future;
 
 pub(super) async fn produce<F: Future<Output = Result<u64>>>(
     config: &Config,
-    lane: usize,
+    index: usize,
     window: Window,
     mut send: impl FnMut(MessageId, Bytes, u64) -> Result<F>,
 ) -> Result<Value> {
-    let group = config::group(&config.args)?;
-    let plan = Plan::new(config, window, lane)?;
-    let mut timer = plan.map(|_| Timer::new()).transpose()?;
-    let mut counts = Counts::new(window);
-    if let Some(plan) = &plan {
-        counts.enable_schedule(plan.bounds());
-    }
+    let mut lane = LaneRun::new(config, index, window)?;
+    let mut timer = lane.arrivals.as_ref().map(|_| Timer::new()).transpose()?;
     let mut pending = FuturesOrdered::new();
-    let mut sequence = 0;
-    let partition = lane % config.partitions();
-    let shared = partition + config.partitions() < config.writers;
-    let mut offsets = Offsets {
-        shared,
-        first: None,
-        previous: None,
-    };
-    // An overloaded ramp lowers the limit to the arrivals of earlier stages.
-    let mut limit = plan.map(Plan::total);
     loop {
         // Completed deliveries must be observed during sparse traffic too.
         // Waiting until the queue fills would inflate latency by seconds.
-        while let Some(Some(result)) = pending.next().now_or_never() {
-            observe(result, plan.as_ref(), &mut counts, &mut offsets)?;
+        while let Some(Some(delivery)) = pending.next().now_or_never() {
+            lane.observe(delivery)?;
         }
         let now = metrics::monotonic_ns();
-        if limit.map_or(now >= window.end, |limit| sequence >= limit) {
+        if lane.finished(now) {
             break;
         }
-        if let Some(plan) = plan
-            && limit == Some(plan.total())
-            && let Some(stage) = plan.check_backlog(sequence, now)?
+        if lane.lower_on_backlog(|| now)? {
+            continue;
+        }
+        if pending.len() == config.args.request_records
+            && let Some(delivery) = pending.next().await
         {
-            counts.overload(stage);
-            limit = Some(plan.total_before(stage)?);
+            lane.observe(delivery)?;
             continue;
         }
-        if pending.len() == config.args.request_records {
-            observe(
-                pending.next().await.unwrap(),
-                plan.as_ref(),
-                &mut counts,
-                &mut offsets,
-            )?;
-            continue;
-        }
-        if let Some(plan) = plan {
-            let due = plan.due(sequence)?;
+        if let (Some(plan), Some(timer)) = (lane.plan(), timer.as_mut()) {
+            let due = plan.due(lane.sequence)?;
             if now < due {
                 tokio::select! {
-                    result = pending.next(), if !pending.is_empty() => observe(result.unwrap(), Some(&plan), &mut counts, &mut offsets)?,
-                    result = timer.as_mut().unwrap().wait_until(due) => result?,
+                    Some(delivery) = pending.next(), if !pending.is_empty() => lane.observe(delivery)?,
+                    result = timer.wait_until(due) => result?,
                 }
                 continue;
             }
         }
-        let start = metrics::monotonic_ns();
-        let payload = producer::payload(config, lane, sequence, start)?;
-        let id = config::message_id(group, lane, sequence);
-        counts.record_bytes(id, &payload);
+        let (start, id, payload) = lane.record()?;
+        let sequence = lane.sequence;
         let future = send(id, payload, sequence)?;
-        counts.submission(start, 1);
+        lane.counts.submission(start, 1);
         pending.push_back(async move {
-            let result = future.await;
-            (result, start, sequence, metrics::monotonic_ns())
+            let offset = future.await;
+            Delivery {
+                offset,
+                start,
+                sequence,
+                finished: metrics::monotonic_ns(),
+            }
         });
-        sequence += 1;
-        super::cooperate(sequence).await;
+        lane.sequence += 1;
+        super::cooperate(lane.sequence).await;
     }
-    while let Some(result) = pending.next().await {
-        observe(result, plan.as_ref(), &mut counts, &mut offsets)?;
+    while let Some(delivery) = pending.next().await {
+        lane.observe(delivery)?;
     }
-    if counts.total != sequence {
-        return Err("incomplete Kafka confirmations".into());
+    lane.report()
+}
+
+/// One writer lane: its pacing, counters and confirmed partition offsets.
+struct LaneRun<'a> {
+    config: &'a Config,
+    index: usize,
+    group: GroupId,
+    window: Window,
+    arrivals: Option<Arrivals>,
+    counts: Counts,
+    partition: usize,
+    offsets: Offsets,
+    /// The next record to submit.
+    sequence: u64,
+}
+
+impl<'a> LaneRun<'a> {
+    fn new(config: &'a Config, index: usize, window: Window) -> Result<Self> {
+        let group = config::group(&config.args)?;
+        let plan = Plan::new(config, window, index)?;
+        let mut counts = Counts::new(window);
+        if let Some(plan) = &plan {
+            counts.enable_schedule(plan.bounds());
+        }
+        let partition = index % config.partitions();
+        Ok(Self {
+            config,
+            index,
+            group,
+            window,
+            arrivals: plan.as_ref().map(Arrivals::new),
+            counts,
+            partition,
+            offsets: Offsets {
+                shared: partition + config.partitions() < config.writers,
+                first: None,
+                previous: None,
+            },
+            sequence: 0,
+        })
     }
-    let mut row = counts.report(lane);
-    row["partition"] = serde_json::json!(partition);
-    row["confirmed_partition_offset_range"] = serde_json::json!(
-        offsets
-            .first
-            .zip(offsets.previous)
-            .map(|(first, last)| [first, last])
-    );
-    Ok(row)
+
+    /// Whether the lane submitted its last record: its arrival limit, or the
+    /// window end for an unpaced lane.
+    fn finished(&self, now: u64) -> bool {
+        self.arrivals
+            .as_ref()
+            .map_or(now >= self.window.end, |arrivals| {
+                arrivals.exhausted(self.sequence)
+            })
+    }
+
+    /// The arrival plan of a paced lane.
+    fn plan(&self) -> Option<Plan> {
+        self.arrivals.as_ref().map(Arrivals::plan)
+    }
+
+    /// Whether an overloaded ramp just lowered the arrival limit.
+    fn lower_on_backlog(&mut self, now: impl FnOnce() -> u64) -> Result<bool> {
+        match &mut self.arrivals {
+            Some(arrivals) => arrivals.lower_on_backlog(&mut self.counts, self.sequence, now),
+            None => Ok(false),
+        }
+    }
+
+    /// Confirm one delivery's offset and count its completion.
+    fn observe(&mut self, delivery: Delivery) -> Result<()> {
+        let plan = self.plan();
+        observe(delivery, plan.as_ref(), &mut self.counts, &mut self.offsets)
+    }
+
+    /// Generate the next record and count its bytes.
+    fn record(&mut self) -> Result<(u64, MessageId, Bytes)> {
+        let start = metrics::monotonic_ns();
+        let payload = producer::payload(self.config, self.index, self.sequence, start)?;
+        let id = config::message_id(self.group, self.index, self.sequence);
+        self.counts.record_bytes(id, &payload);
+        Ok((start, id, payload))
+    }
+
+    /// The lane row, once every submitted record is confirmed.
+    fn report(self) -> Result<Value> {
+        if self.counts.total != self.sequence {
+            return Err("incomplete Kafka confirmations".into());
+        }
+        let mut row = self.counts.report(self.index);
+        row["partition"] = serde_json::json!(self.partition);
+        row["confirmed_partition_offset_range"] = serde_json::json!(
+            self.offsets
+                .first
+                .zip(self.offsets.previous)
+                .map(|(first, last)| [first, last])
+        );
+        Ok(row)
+    }
+}
+
+/// One send outcome: the confirmed offset, the submission and completion
+/// clocks, and the record sequence.
+struct Delivery {
+    offset: Result<u64>,
+    start: u64,
+    sequence: u64,
+    finished: u64,
 }
 
 struct Offsets {
@@ -119,16 +192,20 @@ impl Offsets {
 }
 
 fn observe(
-    (result, start, sequence, finished): (Result<u64>, u64, u64, u64),
+    delivery: Delivery,
     plan: Option<&Plan>,
     counts: &mut Counts,
     offsets: &mut Offsets,
 ) -> Result<()> {
-    offsets.confirm(result?, sequence)?;
+    offsets.confirm(delivery.offset?, delivery.sequence)?;
     if let Some(plan) = plan {
-        counts.scheduled_complete(plan.due(sequence)?, start, finished)
+        counts.scheduled_complete(
+            plan.due(delivery.sequence)?,
+            delivery.start,
+            delivery.finished,
+        )
     } else {
-        counts.complete(start, finished, 1)
+        counts.complete(delivery.start, delivery.finished, 1)
     }
 }
 
@@ -137,6 +214,15 @@ mod tests {
     use super::*;
     use clap::Parser;
     use std::{cell::Cell, rc::Rc, time::Duration};
+
+    fn delivered(offset: u64, sequence: u64) -> Delivery {
+        Delivery {
+            offset: Ok(offset),
+            start: 100,
+            sequence,
+            finished: 200,
+        }
+    }
 
     #[test]
     fn shared_delivery_offsets_allow_gaps_and_reject_reordered_confirmations() {
@@ -151,9 +237,9 @@ mod tests {
             first: None,
             previous: None,
         };
-        observe((Ok(3), 100, 0, 200), None, &mut counts, &mut offsets).unwrap();
-        observe((Ok(8), 100, 1, 200), None, &mut counts, &mut offsets).unwrap();
-        assert!(observe((Ok(7), 100, 2, 200), None, &mut counts, &mut offsets).is_err());
+        observe(delivered(3, 0), None, &mut counts, &mut offsets).unwrap();
+        observe(delivered(8, 1), None, &mut counts, &mut offsets).unwrap();
+        assert!(observe(delivered(7, 2), None, &mut counts, &mut offsets).is_err());
         assert_eq!(counts.total, 2);
         assert_eq!((offsets.first, offsets.previous), (Some(3), Some(8)));
         let mut exclusive = Offsets {
@@ -161,7 +247,7 @@ mod tests {
             first: None,
             previous: None,
         };
-        assert!(observe((Ok(1), 100, 0, 200), None, &mut counts, &mut exclusive).is_err());
+        assert!(observe(delivered(1, 0), None, &mut counts, &mut exclusive).is_err());
         assert_eq!(counts.total, 2);
     }
 

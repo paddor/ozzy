@@ -72,7 +72,7 @@ impl NativeAccess {
                         .all(|(index, &node)| valid_node(node) && !peers[..index].contains(&node))
             }
             Self::TrustedClients { clients, writers } => {
-                (1..=32).contains(clients) && (1..=32).contains(writers)
+                (1..=4096).contains(clients) && (1..=32).contains(writers)
             }
         };
         if valid {
@@ -156,13 +156,22 @@ impl Writers {
         slots: &[Slot],
         stride: usize,
     ) -> Option<usize> {
-        if let Some(index) = self.entries.iter().position(|entry| {
-            entry.is_some_and(|entry| {
-                entry.client.node == link.binding.peer && entry.client.producer == producer
-            })
-        }) {
+        if let Some((index, entry)) =
+            self.entries
+                .iter_mut()
+                .enumerate()
+                .find_map(|(index, entry)| {
+                    entry
+                        .as_mut()
+                        .filter(|entry| {
+                            entry.client.node == link.binding.peer
+                                && entry.client.producer == producer
+                        })
+                        .map(|entry| (index, entry))
+                })
+        {
             if !matches!(self.access, NativeAccess::Writers(_)) {
-                self.entries[index].as_mut().unwrap().session = Some(link.binding.session);
+                entry.session = Some(link.binding.session);
             }
             return Some(index);
         }
@@ -197,7 +206,8 @@ impl Writers {
 
     pub(super) fn revoked(&self, node: NodeId, producer: ProducerId) -> bool {
         self.assigned(node, producer)
-            .is_some_and(|index| self.entries[index].unwrap().revoked)
+            .and_then(|index| self.entries.get(index).copied().flatten())
+            .is_some_and(|entry| entry.revoked)
     }
 
     /// Invalidate old physical attachments before capturing resume coordinates.

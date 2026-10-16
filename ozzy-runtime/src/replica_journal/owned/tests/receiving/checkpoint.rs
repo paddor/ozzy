@@ -2,16 +2,21 @@ use super::*;
 use crate::replica_journal::{RecoveryStorage, ShardJournalConfig, ShardRecoveringJournal};
 
 #[cfg(feature = "simulation")]
+mod dedup;
+
+#[cfg(feature = "simulation")]
 mod messages;
+
+mod donor;
 
 #[test]
 fn checkpoint_receive_charges_pending_chunks_and_refuses_exhausted_memory() {
     let (mut controller, io) = setup();
-    let (mut primary, backup) = donors(&mut controller, &io, QuorumPolicy::Durable);
+    let (mut primary, backup) = donors(&mut controller, &io);
     let (mut receiver, startup) = drive(
         &mut controller,
         RecoveringJournal::start(
-            receiver_config(QuorumPolicy::Durable),
+            receiver_config(),
             io,
             generations(800),
             RecoveryOpen::FormatNew {
@@ -74,12 +79,12 @@ fn checkpoint_receive_charges_pending_chunks_and_refuses_exhausted_memory() {
     drive(&mut controller, backup.journal.shutdown()).unwrap();
 }
 
-fn donors(controller: &mut Controller, io: &Local, policy: QuorumPolicy) -> (Replica, Replica) {
-    let mut primary = replica(controller, io.clone(), 0, policy, 8192);
-    let mut backup = replica(controller, io.clone(), 2, policy, 8192);
+fn donors(controller: &mut Controller, io: &Local) -> (Replica, Replica) {
+    let mut primary = replica(controller, io.clone(), 0, 8192);
+    let mut backup = replica(controller, io.clone(), 2, 8192);
     persist(controller, &mut primary);
     persist(controller, &mut backup);
-    confirm(&mut primary, &backup, policy);
+    confirm(&mut primary, &backup);
     let roll = primary.journal.begin_roll(8).unwrap();
     let done = drive(controller, roll.publish());
     primary.journal.complete_roll(done).unwrap();
@@ -88,7 +93,7 @@ fn donors(controller: &mut Controller, io: &Local, policy: QuorumPolicy) -> (Rep
         primary.journal.retire_confirmed_history(
             primary.driver.begin_validation().unwrap(),
             ozzy_proto::CheckpointId::from_bytes([87; 16]),
-            ozzy_journal_segment::AsyncRetirementBudget {
+            ozzy_journal_segment::RetirementBudget {
                 max_segments: 1,
                 max_read_bytes: 32768,
             },
@@ -100,102 +105,99 @@ fn donors(controller: &mut Controller, io: &Local, policy: QuorumPolicy) -> (Rep
 
 #[test]
 fn interrupted_checkpoint_receive_restarts_with_a_fresh_nonce_and_releases_memory() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        let (mut controller, io) = setup();
-        let (mut primary, backup) = donors(&mut controller, &io, policy);
-        let config = receiver_config(policy);
-        let memory = payload_owner(32768);
-        let (mut receiver, startup) = drive(
-            &mut controller,
-            RecoveringJournal::start(
-                config.clone(),
-                io.clone(),
-                generations(840),
-                RecoveryOpen::FormatNew {
-                    segment_capacity: 32768,
-                },
-            ),
-        )
-        .unwrap();
-        receiver.bind_append_memory(&memory).unwrap();
-        let (_, old, pin) = authorize(&mut controller, &mut primary, &backup, startup, 93);
-        drive(&mut controller, receiver.begin_recovery(old, physical())).unwrap();
-        let work = primary
-            .journal
-            .prepare_checkpoint_read(
-                pin,
-                ozzy_replication::wire::CheckpointRequest {
-                    scope: old.scope(),
-                    request_id: RequestId::from_bytes([94; 16]),
-                    nonce: old.nonce(),
-                    source: old.source(),
-                    offset: 0,
-                    max_bytes: 64,
-                },
-            )
-            .unwrap();
-        let done = drive(&mut controller, work.read());
-        let chunk = primary.journal.complete_checkpoint_read(done).unwrap();
-        let progress = drive(
-            &mut controller,
-            receiver.receive_checkpoint(old, 0, &chunk.bytes),
-        )
-        .unwrap();
-        assert!(progress.revision.is_none());
-        assert!(memory.allocated_bytes() > 0);
-        drive(&mut controller, receiver.shutdown()).unwrap();
-        memory.trim_cache();
-        assert_eq!(memory.allocated_bytes(), 0);
-        primary.journal.release_recovery(pin).unwrap();
-        assert!(
-            drive(
-                &mut controller,
-                OwnedJournal::open(config.clone(), io.clone(), JournalGeneration(850))
-            )
-            .is_err()
-        );
-        let (mut receiver, startup) = drive(
-            &mut controller,
-            RecoveringJournal::start(config, io, generations(860), RecoveryOpen::Resume),
-        )
-        .unwrap();
-        receiver.bind_append_memory(&memory).unwrap();
-        let (mut recovery, fresh, pin) =
-            authorize(&mut controller, &mut primary, &backup, startup, 95);
-        assert_ne!(old.nonce(), fresh.nonce());
-        let plan = drive(&mut controller, receiver.begin_recovery(fresh, physical())).unwrap();
-        assert!(
-            drive(
-                &mut controller,
-                receiver.receive_checkpoint(old, 0, &chunk.bytes)
-            )
-            .is_err()
-        );
-        assert!(!receiver.is_faulted());
-        transfer(
-            &mut controller,
-            &mut primary,
-            &mut receiver,
-            &mut recovery,
-            fresh,
+    let (mut controller, io) = setup();
+    let (mut primary, backup) = donors(&mut controller, &io);
+    let config = receiver_config();
+    let memory = payload_owner(32768);
+    let (mut receiver, startup) = drive(
+        &mut controller,
+        RecoveringJournal::start(
+            config.clone(),
+            io.clone(),
+            generations(840),
+            RecoveryOpen::FormatNew {
+                segment_capacity: 32768,
+            },
+        ),
+    )
+    .unwrap();
+    receiver.bind_append_memory(&memory).unwrap();
+    let (_, old, pin) = authorize(&mut controller, &mut primary, &backup, startup, 93);
+    drive(&mut controller, receiver.begin_recovery(old, physical())).unwrap();
+    let work = primary
+        .journal
+        .prepare_checkpoint_read(
             pin,
-            plan,
-        );
-        let publication = drive(&mut controller, receiver.finish_recovery(fresh)).unwrap();
-        let (journal, startup) = drive(
-            &mut controller,
-            receiver.into_journal(&mut recovery, publication, JournalGeneration(870)),
+            ozzy_replication::wire::CheckpointRequest {
+                scope: old.scope(),
+                request_id: RequestId::from_bytes([94; 16]),
+                nonce: old.nonce(),
+                source: old.source(),
+                offset: 0,
+                max_bytes: 64,
+            },
         )
         .unwrap();
-        assert_eq!(
-            startup.recovered().unwrap().log.accepted,
-            fresh.source().accepted
-        );
-        drive(&mut controller, journal.shutdown()).unwrap();
-        memory.trim_cache();
-        assert_eq!(memory.allocated_bytes(), 0);
-        primary.journal.release_recovery(pin).unwrap();
-        drive(&mut controller, primary.journal.shutdown()).unwrap();
-        drive(&mut controller, backup.journal.shutdown()).unwrap();
-    }
+    let done = drive(&mut controller, work.read());
+    let chunk = primary.journal.complete_checkpoint_read(done).unwrap();
+    let progress = drive(
+        &mut controller,
+        receiver.receive_checkpoint(old, 0, &chunk.bytes),
+    )
+    .unwrap();
+    assert!(progress.revision.is_none());
+    assert!(memory.allocated_bytes() > 0);
+    drive(&mut controller, receiver.shutdown()).unwrap();
+    memory.trim_cache();
+    assert_eq!(memory.allocated_bytes(), 0);
+    primary.journal.release_recovery(pin).unwrap();
+    assert!(
+        drive(
+            &mut controller,
+            OwnedJournal::open(config.clone(), io.clone(), JournalGeneration(850))
+        )
+        .is_err()
+    );
+    let (mut receiver, startup) = drive(
+        &mut controller,
+        RecoveringJournal::start(config, io, generations(860), RecoveryOpen::Resume),
+    )
+    .unwrap();
+    receiver.bind_append_memory(&memory).unwrap();
+    let (mut recovery, fresh, pin) = authorize(&mut controller, &mut primary, &backup, startup, 95);
+    assert_ne!(old.nonce(), fresh.nonce());
+    let plan = drive(&mut controller, receiver.begin_recovery(fresh, physical())).unwrap();
+    assert!(
+        drive(
+            &mut controller,
+            receiver.receive_checkpoint(old, 0, &chunk.bytes)
+        )
+        .is_err()
+    );
+    assert!(!receiver.is_faulted());
+    transfer(
+        &mut controller,
+        &mut primary,
+        &mut receiver,
+        &mut recovery,
+        fresh,
+        pin,
+        plan,
+    );
+    let publication = drive(&mut controller, receiver.finish_recovery(fresh)).unwrap();
+    let (journal, startup) = drive(
+        &mut controller,
+        receiver.into_journal(&mut recovery, publication, JournalGeneration(870)),
+    )
+    .unwrap();
+    assert_eq!(
+        startup.recovered().unwrap().log.accepted,
+        fresh.source().accepted
+    );
+    drive(&mut controller, journal.shutdown()).unwrap();
+    memory.trim_cache();
+    assert_eq!(memory.allocated_bytes(), 0);
+    primary.journal.release_recovery(pin).unwrap();
+    drive(&mut controller, primary.journal.shutdown()).unwrap();
+    drive(&mut controller, backup.journal.shutdown()).unwrap();
 }

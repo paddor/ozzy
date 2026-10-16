@@ -4,8 +4,8 @@ use std::{cell::RefCell, path::PathBuf, rc::Rc};
 
 use super::{
     HOT_INDEX_CAPACITY, IndexCache, IndexCatalogError as Error, IndexedMessageLocation,
-    IndexedOffsetLocation, IndexedOperationLocation, OFFSET_HINT_CAPACITY, OffsetHint,
-    message_location, validate_sources,
+    IndexedOffsetLocation, IndexedOperation, IndexedOperationLocation, OFFSET_HINT_CAPACITY,
+    OffsetHint, message_location, validate_sources,
 };
 use crate::{IndexLimits, IndexSource, SegmentIndex, async_files::Access, segment_index_name};
 use ozzy_proto::{MessageId, Offset, OperationId, PartitionIncarnation};
@@ -76,6 +76,31 @@ impl Catalog {
         })
     }
 
+    /// Keep only sources of segments from `segment_id` on. Their cached
+    /// indexes move to the narrowed catalog; offset hints start over.
+    pub(crate) fn retain_from(&self, segment_id: u64) -> Self {
+        let sources: Rc<[IndexSource]> = self
+            .sources
+            .iter()
+            .filter(|source| source.segment_id >= segment_id)
+            .copied()
+            .collect();
+        let mut cache = IndexCache::new();
+        cache.hot.extend(
+            std::mem::take(&mut self.cache.borrow_mut().hot)
+                .into_iter()
+                .filter(|index| index.source().segment_id >= segment_id),
+        );
+        Self {
+            access: self.access.clone(),
+            directory: self.directory.clone(),
+            sources,
+            limits: self.limits,
+            chunk: self.chunk,
+            cache: Rc::new(RefCell::new(cache)),
+        }
+    }
+
     pub(crate) async fn find_offset(
         &self,
         partition: PartitionIncarnation,
@@ -108,10 +133,13 @@ impl Catalog {
         }
         let hot = self.hot_sources(through);
         for source in &hot {
-            let at = self
+            // Hot sources come from this catalog; anything else is searched below.
+            let Ok(at) = self
                 .sources
                 .binary_search_by_key(&source.segment_id, |s| s.segment_id)
-                .expect("cache source belongs to catalog");
+            else {
+                continue;
+            };
             if let Some(location) = self.offset_in(at, partition, offset, through).await? {
                 return Ok(Some(location));
             }
@@ -236,6 +264,32 @@ impl Catalog {
         Ok(None)
     }
 
+    pub(crate) async fn find_operation_number(
+        &self,
+        number: u64,
+        through: u64,
+    ) -> Result<Option<IndexedOperation>, Error> {
+        if number == 0 || number > through {
+            return Ok(None);
+        }
+        let at = self
+            .sources
+            .partition_point(|source| source.last_op_number < number);
+        let Some(source) = self
+            .sources
+            .get(at)
+            .copied()
+            .filter(|source| source.first_op_number <= number)
+        else {
+            return Ok(None);
+        };
+        let location = self
+            .with_source(source, |index| Ok(index.find_operation_number(number)))
+            .await?
+            .ok_or(Error::InconsistentIndex)?;
+        Ok(Some(IndexedOperation { source, location }))
+    }
+
     fn hot_sources(&self, through: u64) -> smallvec::SmallVec<[IndexSource; HOT_INDEX_CAPACITY]> {
         self.cache
             .borrow()
@@ -251,14 +305,16 @@ impl Catalog {
         source: IndexSource,
         lookup: impl FnOnce(&SegmentIndex) -> Result<Option<T>, Error>,
     ) -> Result<Option<T>, Error> {
-        {
+        // Release the cache before running the caller's lookup.
+        let cached = {
             let mut cache = self.cache.borrow_mut();
-            if let Some(at) = cache.hot.iter().position(|index| index.source() == source) {
-                let index = cache.hot.remove(at).expect("cache position exists");
-                let result = lookup(&index);
-                cache.hot.push_front(index);
-                return result;
-            }
+            let at = cache.hot.iter().position(|index| index.source() == source);
+            at.and_then(|at| cache.hot.remove(at))
+        };
+        if let Some(index) = cached {
+            let result = lookup(&index);
+            self.cache.borrow_mut().hot.push_front(index);
+            return result;
         }
         let index = crate::index_builder::asynchronous::open(
             &self.access,

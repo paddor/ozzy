@@ -2,7 +2,8 @@ use super::{config, durable, installation::next, local_report, lookup, node, nor
 use ozzy_journal::progress::ProgressError;
 use ozzy_replication::{
     Admission, FrozenLog, InstallOutcome, JournalGeneration, PipelineLimits, Prefix, PrepareOk,
-    RecoveredState, ReplicationError, Scope, Status, ViewChange, ViewChangeError as Error,
+    ReceivedStart, RecoveredState, ReplicationError, Scope, Status, ViewChange,
+    ViewChangeError as Error,
 };
 
 fn limits() -> PipelineLimits {
@@ -68,7 +69,14 @@ fn streamed_installation_reconfirms_long_disk_tail_without_live_pipeline_growth(
     assert!(!primary.snapshot().ready_for_appends);
     let start = primary.start_view().unwrap().unwrap();
     let mut backup_install = backup
-        .begin_backup_install(node(1), start, JournalGeneration(202), lookup)
+        .begin_backup_install(
+            ReceivedStart {
+                from: node(1),
+                start,
+            },
+            JournalGeneration(202),
+            lookup,
+        )
         .unwrap();
     for chunk in operations.chunks(limits().max_operations) {
         backup_install.validate_suffix(chunk).unwrap();

@@ -5,23 +5,23 @@ mod publication;
 mod receive;
 
 use super::{ActorError, NativeReceive, PartitionActor, reader_cursor::Cursor};
+use crate::transport::Frames;
 use crate::{
     frontend::{Kind, Link, Links},
     reader_service::{Delivery, Failure, reader_frame},
-    replica_journal::{PartitionReadBuffer, PartitionReadLimits},
+    replica_journal::{PartitionReadBuffer, PartitionReadLimits, ReplicaJournal},
     replicated::payload::Payload,
-    signal::DataSignal,
 };
 use bytes::Bytes;
+use futures::task::AtomicWaker;
 use omq_tokio::{Message, TrySendError};
 use ozzy_proto::{
     Envelope, NodeId, Opcode, PartitionIncarnation, data::DataLimits, decode_packet,
     nack::AuthorityHint, reader,
 };
+use ozzy_replication::driver::ValidationTicket;
 use ozzy_replication::{JournalGeneration, PipelineLimits, Prefix, Scope};
 use std::{
-    future::Future,
-    pin::Pin,
     sync::Arc,
     task::{Context, Poll},
 };
@@ -35,6 +35,21 @@ pub struct SharedReaderConfig {
     pub limits: DataLimits,
     /// Aggregate subscriptions on this partition, including idle readers.
     pub subscriptions: usize,
+}
+
+/// What one poll reads with: this broker's identity and the journal view
+/// current for the poll.
+struct Visit<'a> {
+    local: NodeId,
+    ticket: Option<ValidationTicket>,
+    journal: &'a mut ReplicaJournal,
+}
+
+/// A consumer and its current link, which bounds and carries replies to it.
+#[derive(Clone, Copy, Debug)]
+struct Client {
+    peer: NodeId,
+    link: Link,
 }
 
 #[derive(Debug)]
@@ -51,14 +66,16 @@ pub(super) struct SharedReaders {
     local: NodeId,
     config: SharedReaderConfig,
     links: Links,
-    slots: Vec<Option<Slot>>,
+    /// Installed subscriptions, at most `config.subscriptions`, preallocated.
+    slots: Vec<Slot>,
     pool: PartitionReadBuffer,
     metadata: Vec<u8>,
     rejection: Option<Message>,
     next: usize,
     observed: Option<(Scope, JournalGeneration, Prefix)>,
-    work: Arc<DataSignal>,
-    readiness: Pin<Box<dyn Future<Output = ()> + Send>>,
+    /// Registered by each visit before it checks reader state. Returned read
+    /// arenas and payloads, also from transport threads, wake it.
+    wake: Arc<AtomicWaker>,
     publication: publication::Publication,
 }
 
@@ -93,7 +110,7 @@ impl SharedReaders {
             max_operations: 1,
             max_body_bytes: config.limits.envelope.max_payload_bytes,
         })?;
-        let work = Arc::new(DataSignal::default());
+        let wake = Arc::new(AtomicWaker::new());
         let pool = PartitionReadBuffer::new(
             buffer,
             PartitionReadLimits {
@@ -101,23 +118,27 @@ impl SharedReaders {
                 max_parts: config.limits.max_parts,
                 max_payload_bytes: config.limits.envelope.max_payload_bytes,
             },
-            work.clone(),
+            wake.clone(),
         )?;
-        let publication = publication::Publication::new(journal, config, work.clone())?;
+        let publication = publication::Publication::new(journal, config, wake.clone())?;
         Ok(Self {
             local,
             config,
             links,
-            slots: (0..config.subscriptions).map(|_| None).collect(),
+            slots: Vec::with_capacity(config.subscriptions),
             pool,
             metadata: Vec::with_capacity(config.limits.envelope.max_metadata_bytes),
             rejection: None,
             next: 0,
             observed: None,
-            readiness: wait(work.clone()),
-            work,
+            wake,
             publication,
         })
+    }
+
+    /// Whether a framed publication still waits for the dispatcher.
+    pub(super) fn publishing(&self) -> bool {
+        self.publication.waiting()
     }
 
     pub(super) fn supports(message: &Message) -> bool {
@@ -129,13 +150,16 @@ impl SharedReaders {
         })
     }
 
-    fn current(&self, peer: NodeId, envelope: Envelope) -> Option<Link> {
-        self.links.get(peer).filter(|link| {
-            link.binding.kind == Kind::Client
-                && envelope.session == Some(link.binding.session)
-                && envelope.sender == peer
-                && link.remote.roles & ozzy_proto::handshake::CONSUMER != 0
-        })
+    fn current(&self, peer: NodeId, envelope: Envelope) -> Option<Client> {
+        self.links
+            .get(peer)
+            .filter(|link| {
+                link.binding.kind == Kind::Client
+                    && envelope.session == Some(link.binding.session)
+                    && envelope.sender == peer
+                    && link.remote.roles & ozzy_proto::handshake::CONSUMER != 0
+            })
+            .map(|link| Client { peer, link })
     }
 
     /// Whether this client's refusal or acknowledgment still waits in the
@@ -149,15 +173,12 @@ impl SharedReaders {
     }
 
     fn discard_stale(&mut self) {
-        for slot in &mut self.slots {
-            if slot.as_ref().is_some_and(|slot| {
-                self.links
-                    .get(slot.peer)
-                    .is_none_or(|link| Some(link.binding.session) != slot.delivery.request.session)
-            }) {
-                *slot = None;
-            }
-        }
+        let links = &self.links;
+        self.slots.retain(|slot| {
+            links
+                .get(slot.peer)
+                .is_some_and(|link| Some(link.binding.session) == slot.delivery.request.session)
+        });
         if self.rejection.as_ref().is_some_and(|message| {
             let Some(peer) = message
                 .part_slice(0)
@@ -179,16 +200,8 @@ impl SharedReaders {
 }
 
 fn envelope(message: &Message) -> Option<Envelope> {
-    if message.len() != 4 {
-        return None;
-    }
-    let frames: [&[u8]; 3] =
-        std::array::from_fn(|index| message.part_slice(index + 1).expect("four frames"));
+    let (_, frames) = message.routed_packet()?;
     decode_packet(&frames, ozzy_proto::EnvelopeLimits::default())
         .ok()
         .map(|packet| packet.envelope)
-}
-
-fn wait(work: Arc<DataSignal>) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-    Box::pin(async move { work.ready().await })
 }

@@ -86,8 +86,9 @@ impl Journal {
                 directory_entries: self.limits.directory_entries,
                 directory_name_bytes: self.limits.directory_name_bytes,
             },
+            operations: self.limits.operations,
         }
-        .build(groups, source, self.limits.operations, limits, repair)
+        .build(groups, source, limits, repair)
         .await?;
         self.interrupted = false;
         Ok(index)

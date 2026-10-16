@@ -39,6 +39,17 @@ pub enum DeploymentMode {
     Three,
 }
 
+impl DeploymentMode {
+    /// The confirmation policy this mode fixes for every topic: local durable
+    /// for one broker, disk quorum for three.
+    pub const fn policy(self) -> ozzy_proto::append::Policy {
+        match self {
+            Self::Single => ozzy_proto::append::Policy::LocalDurable,
+            Self::Three => ozzy_proto::append::Policy::QuorumDurable,
+        }
+    }
+}
+
 /// Explicit bounds checked before allocating per-partition state.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -47,6 +58,10 @@ pub struct ResourceLimits {
     pub max_topics: usize,
     /// Maximum partitions across all topics.
     pub max_partitions: usize,
+    /// SDK link owners each broker admits at once. Each owner holds one
+    /// control and one data connection to every broker, so a process with
+    /// one `BrokerLinks` counts once however many readers or writers it runs.
+    pub max_clients: usize,
 }
 
 impl Default for ResourceLimits {
@@ -54,6 +69,7 @@ impl Default for ResourceLimits {
         Self {
             max_topics: 1024,
             max_partitions: 65_536,
+            max_clients: 128,
         }
     }
 }
@@ -85,6 +101,10 @@ pub struct Endpoints {
     pub reader_pub: String,
     /// Optional PUB endpoint for live follower replication.
     pub follower_pub: Option<String>,
+    /// Optional PEER endpoint for the admin console. `ipc://` or `inproc://`
+    /// only: it has no authentication, so any client that connects is an admin.
+    // TODO(admin-auth): allow TCP once admins authenticate with CURVE keys.
+    pub admin: Option<String>,
 }
 
 /// Persistent topic attributes and bounded APPEND admission.
@@ -99,8 +119,6 @@ pub struct Topic {
     #[serde(default)]
     /// Seed shared by SDK keyed partition routing.
     pub partitioner_seed: u64,
-    /// Fixed record confirmation policy.
-    pub confirmation: Confirmation,
     #[serde(default = "default_segment_bytes")]
     /// Maximum physical bytes per segment file.
     pub segment_bytes: u64,
@@ -111,6 +129,27 @@ pub struct Topic {
     /// Whole-segment retention targets per partition and per broker.
     #[serde(default)]
     pub retention: TopicRetention,
+    /// Optional first-wins deduplication and per-partition resource limits.
+    /// Omitted preserves every producer's records.
+    pub deduplication: Option<TopicDeduplication>,
+}
+
+/// Deduplicate event identities within each partition, independently of routing.
+/// Live identities are never evicted to admit new events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TopicDeduplication {
+    /// Replicated logical-time window, fixed when the partition is created.
+    #[serde(default = "default_dedup_window")]
+    pub window_millis: u64,
+    /// Maximum live and pending identities in each partition's owner-local index.
+    pub max_entries: u64,
+    /// Per-partition byte ceiling for index tables, queues, and scratch storage.
+    pub max_bytes: u64,
+}
+
+const fn default_dedup_window() -> u64 {
+    300_000
 }
 
 /// Optional age and stored segment capacity targets. Either limit expires the
@@ -127,6 +166,9 @@ pub struct TopicRetention {
 /// Maximum configured broker APPEND message and canonical body size.
 pub const MAX_APPEND_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Upper bound on `limits.max_clients`.
+pub const MAX_CLIENTS: usize = 4096;
+
 const fn default_partitions() -> u32 {
     16
 }
@@ -137,18 +179,6 @@ const fn default_segment_bytes() -> u64 {
 
 const fn default_append_bytes() -> u64 {
     MAX_APPEND_BYTES
-}
-
-/// Exact confirmation boundary, never selected per request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Confirmation {
-    /// Confirm after the sole broker synchronizes its journal.
-    LocalDurable,
-    /// Confirm after leader and one follower synchronize matching history.
-    DiskQuorum,
-    /// Confirm after leader and one follower retain records; persistence proceeds independently.
-    ReplicatedPersisting,
 }
 
 /// Ozzy-owned CPU affinity. OS identifiers, not hwloc logical indexes.

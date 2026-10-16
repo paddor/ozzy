@@ -3,6 +3,7 @@
 use super::*;
 use omq_tokio::{Message, Options, Socket, SocketType};
 use ozzy_proto::{data::Authority, reader};
+use ozzy_runtime::profiling::Event;
 use ozzy_runtime::replicated::{TopicCheckpoint, TopicRecord};
 
 pub(super) type History = Vec<(MessageId, bytes::Bytes)>;
@@ -177,27 +178,18 @@ fn check_record(record: &TopicRecord, expected: &[History], positions: &mut [usi
 #[tokio::test(flavor = "current_thread")]
 async fn plain_thread_writer_compresses_groups_and_reader_restores_original_parts() {
     tokio::time::timeout(Duration::from_secs(20), async {
-        for policy in [
-            Confirmation::LocalDurable,
-            Confirmation::DiskQuorum,
-            Confirmation::ReplicatedPersisting,
-        ] {
-            plain_thread(policy).await;
+        for mode in [DeploymentMode::Single, DeploymentMode::Three] {
+            plain_thread(mode).await;
         }
     })
     .await
     .unwrap();
 }
 
-async fn plain_thread(policy: Confirmation) {
+async fn plain_thread(mode: DeploymentMode) {
     let root = tempfile::tempdir().unwrap();
     let runtime = WriterRuntime::new().unwrap();
-    let mode = if policy == Confirmation::LocalDurable {
-        DeploymentMode::Single
-    } else {
-        DeploymentMode::Three
-    };
-    let deployment = deployment(root.path(), mode, policy, 1);
+    let deployment = deployment(root.path(), mode, 1);
     let wire = DataLimits {
         envelope: EnvelopeLimits {
             max_payload_bytes: 12 * 1024,
@@ -307,18 +299,17 @@ fn compressed_parts(index: u8) -> Vec<bytes::Bytes> {
 #[tokio::test(flavor = "current_thread")]
 async fn leader_publishes_confirmed_records_once_and_a_stalled_reader_delays_nobody() {
     tokio::time::timeout(Duration::from_secs(25), async {
-        for policy in [Confirmation::DiskQuorum, Confirmation::ReplicatedPersisting] {
-            publication_check(policy).await;
-        }
+        publication_check().await;
     })
     .await
     .unwrap();
 }
 
-async fn publication_check(policy: Confirmation) {
+async fn publication_check() {
+    let received = ozzy_runtime::profiling::totals().get(Event::ReplicaPublicationReceived);
     let root = tempfile::tempdir().unwrap();
     let runtime = WriterRuntime::new().unwrap();
-    let deployment = deployment(root.path(), DeploymentMode::Three, policy, 1);
+    let deployment = deployment(root.path(), DeploymentMode::Three, 1);
     let sdk = links(&runtime, &deployment[0].0).await;
     let brokers = start_brokers(&runtime, deployment).await;
     let mut config = SharedTopicWriterConfig::new(limits());
@@ -335,6 +326,7 @@ async fn publication_check(policy: Confirmation) {
     let before = publish_record(&brokers, &mut writer, 0).await;
     let route = sdk
         .routes(metadata.clone())
+        .await
         .unwrap()
         .route(0)
         .unwrap()
@@ -399,6 +391,11 @@ async fn publication_check(policy: Confirmation) {
     assert!(
         second_follower.is_err(),
         "follower published leader records"
+    );
+    // Followers apply the leader's PUB copies, not only PEER catch-up.
+    assert!(
+        ozzy_runtime::profiling::totals().get(Event::ReplicaPublicationReceived) > received,
+        "followers dropped every PREPARE_PUB"
     );
     live_many(&brokers, "close publication writer", writer.close())
         .await
@@ -545,7 +542,7 @@ async fn subscriber(
         ))
         .await
         .unwrap();
-    socket.connect(endpoint.parse().unwrap()).await.unwrap();
+    socket.connect(endpoint).await.unwrap();
     socket
         .wait_connected(1, Duration::from_secs(5))
         .await

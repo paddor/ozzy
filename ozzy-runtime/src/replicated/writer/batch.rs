@@ -4,18 +4,78 @@ use omq_tokio::message::Payload;
 use ozzy_proto::Envelope;
 use ozzy_proto::append::{self, Append, Authority, DataLimits, PayloadEncoding, Record};
 use smallvec::SmallVec;
+use std::{collections::VecDeque, ops::Range};
 
-use super::{AppendKey, Error, Shared};
+use super::{AppendKey, Error, Shared, state::Queued};
 
 mod payload;
 mod selection;
 pub(super) use payload::PayloadPool;
+use selection::Selection;
 
 pub(super) struct Batch {
     pub(super) records: SelectedRecords,
     pub(super) bytes: usize,
     pub(super) waiting_for_payload: bool,
     payload: Option<Payload>,
+    /// A partial selection waiting for an in-flight APPEND. Records queued
+    /// later extend it, so each record is sized once per request.
+    partial: Option<Partial>,
+}
+
+/// A partial selection and the inputs it was sized with.
+struct Partial {
+    sizing: Sizing,
+    selection: Selection,
+}
+
+/// What a selection is sized with: its first sequence, record cap, and
+/// request limits. A partial selection resumes only under the same inputs.
+#[derive(Clone, Copy, PartialEq)]
+struct Sizing {
+    next: u64,
+    cap: usize,
+    limits: DataLimits,
+}
+
+impl Sizing {
+    /// Extend `partial` when it was sized with these inputs and its records
+    /// are still queued from `index`, else size afresh from `index`. Only
+    /// records queued since are sized.
+    fn extend(
+        self,
+        partial: Option<Partial>,
+        records: &VecDeque<Queued>,
+        index: usize,
+        target_bytes: usize,
+    ) -> Result<Selection, Error> {
+        let mut selection = partial
+            .filter(|partial| {
+                partial.sizing == self && index + partial.selection.records <= records.len()
+            })
+            .map_or_else(
+                || Selection::new(append::IDENTITY_METADATA_BYTES + 10),
+                |partial| partial.selection,
+            );
+        selection.extend(
+            records
+                .range(index + selection.records..)
+                .map(|record| (record.body.len(), record.parts(), record.encoding)),
+            self.limits,
+            target_bytes,
+            self.cap,
+        )?;
+        Ok(selection)
+    }
+}
+
+/// One APPEND request to encode: its envelope, the partition authority it
+/// writes under, and its packed body.
+#[derive(Clone, Copy)]
+pub(super) struct RequestView<'a> {
+    pub(super) envelope: Envelope,
+    pub(super) authority: Authority,
+    pub(super) payload: PayloadView<'a>,
 }
 
 /// Borrowed admission range. Selection and encoding run synchronously on the
@@ -49,6 +109,7 @@ impl Batch {
             bytes: 0,
             waiting_for_payload: false,
             payload: None,
+            partial: None,
         }
     }
 
@@ -67,19 +128,19 @@ impl Batch {
         self.payload = None;
         self.bytes = 0;
         self.waiting_for_payload = false;
+        let partial = self.partial.take();
         shared.drain();
         let force_through = shared
             .flush_through
             .load(std::sync::atomic::Ordering::Acquire);
         let sealed = shared.sealed();
-        let fixed = append::IDENTITY_METADATA_BYTES + 10;
         let target_bytes = shared.config.batch_target_bytes;
-        let admission = &mut shared.admission;
-        let Some(first) = admission.records.front() else {
+        let records = &shared.admission.records;
+        let Some(first) = records.front() else {
             return Ok(false);
         };
         let index = usize::try_from(next - first.sequence).map_err(|_| Error::Response)?;
-        if admission.records.get(index).is_none() {
+        if records.get(index).is_none() {
             return Ok(false);
         }
         let force = next < force_through || sealed;
@@ -87,38 +148,38 @@ impl Batch {
         if next < force_through {
             cap = cap.min((force_through - next) as usize);
         }
-        let selection = selection::Selection::collect(
-            admission
-                .records
-                .range(index..)
-                .map(|record| (record.body.len(), record.parts(), record.encoding)),
-            limits,
-            target_bytes,
-            cap,
-            fixed,
-        )?;
+        let sizing = Sizing { next, cap, limits };
+        let selection = sizing.extend(partial, records, index, target_bytes)?;
         let count = selection.records;
         if count == 0 {
             return Ok(false);
         }
         self.bytes = selection.bytes;
         if !force && !selection.full && in_flight {
+            self.partial = Some(Partial { sizing, selection });
             return Ok(false);
         }
-        let Some(payload) = shared.batches.pack(admission, index..index + count) else {
+        Ok(self.pack(shared, index..index + count))
+    }
+
+    /// Pack the selected `range` into one transport body. `false` while sent
+    /// frames still hold every packing buffer of this route.
+    fn pack(&mut self, shared: &mut super::state::Driver, range: Range<usize>) -> bool {
+        let admission = &mut shared.admission;
+        let Some(payload) = shared.batches.pack(admission, range.clone()) else {
             self.waiting_for_payload = true;
-            return Ok(false);
+            return false;
         };
         self.payload = Some(payload);
-        admission.profile_queue(index..index + count);
+        admission.profile_queue(range.clone());
         self.records = SelectedRecords {
-            start: index,
-            count,
+            start: range.start,
+            count: range.len(),
         };
         shared
             .groups_formed
             .fetch_add(1, std::sync::atomic::Ordering::Release);
-        Ok(true)
+        true
     }
 
     /// Transfer the prepared frame once; descriptor scratch retains no payloads.
@@ -129,19 +190,21 @@ impl Batch {
     pub(super) fn encode(
         &self,
         driver: &super::state::Driver,
-        authority: Option<Authority>,
-        envelope: Envelope,
-        payload: PayloadView<'_>,
+        request: RequestView<'_>,
         metadata: &mut Vec<u8>,
         limits: DataLimits,
     ) -> Result<[u8; 64], Error> {
         // Borrow the already packed transport body once, not each record's
         // original owner. Its order and part boundaries match this selection.
         let shared: &Shared = driver;
-        let selected = driver
-            .admission
-            .records
-            .range(self.records.start..self.records.start + self.records.count);
+        let payload = request.payload;
+        let selected = self.selected(driver);
+        // An empty selection is an APPEND without records.
+        let first_sequence = selected
+            .clone()
+            .next()
+            .ok_or(Error::Append(append::CodecError::Limit))?
+            .sequence;
         let body = payload.decoded;
         debug_assert_eq!(body.len(), self.bytes);
         let mut parts: SmallVec<[&[u8]; 1024]> = SmallVec::new();
@@ -170,16 +233,12 @@ impl Batch {
         let key = AppendKey {
             producer_id: shared.config.producer_id,
             producer_epoch: shared.config.producer_epoch,
-            first_sequence: self
-                .selected(driver)
-                .next()
-                .expect("nonempty selected batch")
-                .sequence,
+            first_sequence,
         };
         Ok(append::encode_prepared_append_metadata(
-            envelope,
+            request.envelope,
             Append {
-                authority: authority.expect("group route"),
+                authority: request.authority,
                 partition: shared.config.partition,
                 owner_epoch: shared.config.owner_epoch,
                 key,
@@ -187,8 +246,10 @@ impl Batch {
                 records: &records,
             },
             metadata,
-            payload.encoding,
-            payload.encoded_bytes,
+            append::PreparedPayload {
+                encoding: payload.encoding,
+                encoded_bytes: payload.encoded_bytes,
+            },
             limits,
         )?)
     }

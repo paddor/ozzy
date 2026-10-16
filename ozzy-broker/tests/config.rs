@@ -1,3 +1,13 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
@@ -10,6 +20,7 @@ use uuid::Uuid;
 
 const SINGLE: &str = include_str!("../../ozzy-config/tests/fixtures/single.toml");
 
+mod admin_client;
 mod journals;
 mod local_identity;
 #[cfg(target_os = "linux")]

@@ -14,7 +14,7 @@ fn config(records: usize, bytes: usize) -> WriterConfig {
     WriterConfig {
         compress_payloads: true,
         batch_target_bytes: 4 * 1024 * 1024,
-        policy: Policy::QuorumReplicatedPersisting,
+        policy: Policy::QuorumDurable,
         partition: PartitionIncarnation::from_bytes([1; 16]),
         owner_epoch: 1,
         producer_id: ProducerId::from_bytes([2; 16]),
@@ -101,6 +101,7 @@ async fn compact_pending_handles_preserve_writer_identity_after_owner_drop() {
         },
         message_id: MessageId::from_bytes([9; 16]),
         offset: 191,
+        disposition: ozzy_proto::append::AppendDisposition::Stored,
         policy: settings.policy,
     };
     assert_eq!(pending.confirmed().await.unwrap(), expected);

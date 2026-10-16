@@ -45,6 +45,7 @@ pub enum TopicWriterError {
 }
 
 struct Partition {
+    number: u32,
     target: PartitionIncarnation,
     writer: Writer,
 }

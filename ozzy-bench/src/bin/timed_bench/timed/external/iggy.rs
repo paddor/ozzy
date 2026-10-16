@@ -4,16 +4,20 @@ use super::{Config, Record, Result, Value, Window};
 use iggy::prelude::{
     Client as _, ClusterClient, ClusterNodeStatus, CompressionAlgorithm, Consumer, Durability,
     Identifier, IggyByteSize, IggyExpiry, MaxTopicSize, MessageClient, Partitioning,
-    PollingStrategy, StreamClient, TcpClient, TopicClient, TopicCreateOptions, UserClient,
+    PollingStrategy, StreamClient, TcpClient, TopicClient, TopicCreateOptions, TopicDetails,
+    UserClient,
 };
 use ozzy_proto::MessageId;
+
+/// How often provisioning checks cluster health.
+const HEALTH_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 async fn connect(config: &Config) -> Result<TcpClient> {
     // The transport client owns its socket without the high-level wrapper's
     // detached heartbeat task. The test server disables heartbeat requirements.
     let client = TcpClient::from_connection_string(&format!(
         "iggy://iggy:iggy@{}",
-        config.args.external_endpoint.as_deref().unwrap()
+        super::endpoint(config)?
     ))?;
     client.connect().await?;
     Ok(client)
@@ -21,21 +25,8 @@ async fn connect(config: &Config) -> Result<TcpClient> {
 
 pub(super) async fn provision(config: &Config, name: &str) -> Result<Value> {
     let client = connect(config).await?;
-    let expected = super::policy(config).brokers();
-    loop {
-        let metadata = client.get_cluster_metadata().await?;
-        if metadata.nodes.len() != expected {
-            return Err("Iggy broker count differs from requested topology".into());
-        }
-        if metadata
-            .nodes
-            .iter()
-            .all(|node| node.status == ClusterNodeStatus::Healthy)
-        {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    let policy = super::policy(config)?;
+    await_healthy(&client, policy.brokers()).await?;
     client.create_stream(name).await?;
     let requested = TopicCreateOptions {
         partitions_count: Some(config.partitions() as u32),
@@ -45,7 +36,7 @@ pub(super) async fn provision(config: &Config, name: &str) -> Result<Value> {
         segment_size: Some(IggyByteSize::from(
             config.args.segment_mib as u64 * 1024 * 1024,
         )),
-        durability: if super::policy(config).durable() {
+        durability: if policy.durable() {
             Durability::Persisted
         } else {
             Durability::Replicated
@@ -56,6 +47,45 @@ pub(super) async fn provision(config: &Config, name: &str) -> Result<Value> {
     let topic = client
         .create_topic(&Identifier::try_from(name)?, "records", &requested)
         .await?;
+    check_topic(config, &requested, &topic)?;
+    let topics = client.get_topics(&Identifier::try_from(name)?).await?;
+    if topics.len() != 1
+        || topics[0].id != topic.id
+        || topics[0].partitions_count != topic.partitions_count
+    {
+        return Err("Iggy metadata differs from requested topic topology".into());
+    }
+    let topology = super::topic_topology(topics.len(), topic.partitions.len());
+    client.logout_user().await?;
+    client.shutdown().await?;
+    Ok(topology)
+}
+
+/// Wait until the cluster reports `expected` nodes, all healthy.
+async fn await_healthy(client: &TcpClient, expected: usize) -> Result<()> {
+    loop {
+        let metadata = client.get_cluster_metadata().await?;
+        if metadata.nodes.len() != expected {
+            return Err("Iggy broker count differs from requested topology".into());
+        }
+        if metadata
+            .nodes
+            .iter()
+            .all(|node| node.status == ClusterNodeStatus::Healthy)
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(HEALTH_POLL).await;
+    }
+}
+
+/// The created topic has the requested durability, segment size,
+/// partitions and no compression.
+fn check_topic(
+    config: &Config,
+    requested: &TopicCreateOptions,
+    topic: &TopicDetails,
+) -> Result<()> {
     let mut partition_ids = topic
         .partitions
         .iter()
@@ -72,17 +102,7 @@ pub(super) async fn provision(config: &Config, name: &str) -> Result<Value> {
     {
         return Err("Iggy effective topic options differ from benchmark request".into());
     }
-    let topics = client.get_topics(&Identifier::try_from(name)?).await?;
-    if topics.len() != 1
-        || topics[0].id != topic.id
-        || topics[0].partitions_count != topic.partitions_count
-    {
-        return Err("Iggy metadata differs from requested topic topology".into());
-    }
-    let topology = super::topic_topology(topics.len(), topic.partitions.len());
-    client.logout_user().await?;
-    client.shutdown().await?;
-    Ok(topology)
+    Ok(())
 }
 
 pub(super) async fn cleanup(config: &Config, name: &str) -> Result<()> {

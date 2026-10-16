@@ -35,9 +35,9 @@ impl ImageLimits {
     }
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 enum Contents {
-    File(Box<[u8]>),
+    File(Vec<u8>),
     Directory(#[serde(with = "directory_entries")] BTreeMap<OsString, Inode>),
 }
 
@@ -57,6 +57,23 @@ mod directory_entries {
     ) -> Result<BTreeMap<OsString, Inode>, D::Error> {
         Vec::<(OsString, Inode)>::deserialize(deserializer)
             .map(|entries| entries.into_iter().collect())
+    }
+}
+
+impl Clone for Contents {
+    fn clone(&self) -> Self {
+        match self {
+            Self::File(bytes) => Self::File(bytes.clone()),
+            Self::Directory(entries) => Self::Directory(entries.clone()),
+        }
+    }
+
+    // Reuse the target buffer, so a sync keeps a preallocated durable copy.
+    fn clone_from(&mut self, source: &Self) {
+        match (self, source) {
+            (Self::File(target), Self::File(bytes)) => target.clone_from(bytes),
+            (target, source) => *target = source.clone(),
+        }
     }
 }
 
@@ -125,6 +142,15 @@ impl Image {
         self.resolve(path, durable).is_ok()
     }
 
+    /// Dirty and durable file bytes the image charges, including removed
+    /// files that open handles still keep.
+    pub fn stored_bytes(&self) -> usize {
+        self.nodes
+            .values()
+            .map(|node| node.dirty.bytes() + node.durable.bytes())
+            .sum()
+    }
+
     pub(super) fn validate(&self, limits: ImageLimits) -> io::Result<()> {
         let mut bytes = 0_usize;
         let mut entries = 0_usize;
@@ -151,11 +177,7 @@ impl Image {
     }
 
     fn byte_capacity(&self, removed: usize, added: usize, limits: ImageLimits) -> io::Result<()> {
-        let total: usize = self
-            .nodes
-            .values()
-            .map(|n| n.dirty.bytes() + n.durable.bytes())
-            .sum();
+        let total = self.stored_bytes();
         if added > limits.file_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::StorageFull,
@@ -297,7 +319,7 @@ impl Image {
         let empty = if directory {
             Contents::Directory(BTreeMap::new())
         } else {
-            Contents::File(Box::default())
+            Contents::File(Vec::new())
         };
         self.nodes.insert(
             inode,
@@ -319,15 +341,28 @@ impl Image {
     ) -> io::Result<()> {
         let old = self.file(inode, durable)?;
         self.byte_capacity(old.len(), length, limits)?;
-        let mut resized = vec![0; length].into_boxed_slice();
-        let keep = old.len().min(length);
-        resized[..keep].copy_from_slice(&old[..keep]);
         let node = self.nodes.get_mut(&inode).expect("existing file");
-        *if durable {
+        // Appends grow in place with amortized capacity, not one copy per write.
+        let Contents::File(file) = (if durable {
             &mut node.durable
         } else {
             &mut node.dirty
-        } = Contents::File(resized);
+        }) else {
+            unreachable!()
+        };
+        file.resize(length, 0);
+        Ok(())
+    }
+
+    /// Reserve memory for both copies up to `end` without changing either
+    /// length, as preallocation does for a real file.
+    pub(super) fn reserve(&mut self, inode: Inode, end: usize) -> io::Result<()> {
+        let node = self.nodes.get_mut(&inode).ok_or(io::ErrorKind::NotFound)?;
+        for contents in [&mut node.dirty, &mut node.durable] {
+            if let Contents::File(file) = contents {
+                file.reserve_exact(end.saturating_sub(file.len()));
+            }
+        }
         Ok(())
     }
 

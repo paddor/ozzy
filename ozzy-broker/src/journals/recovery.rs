@@ -94,7 +94,7 @@ impl JournalPlan {
                         ));
                     }
                 }
-                let parent = config.root.parent().expect("configured partition parent");
+                let parent = crate::parent_directory(&config.root)?;
                 let parent_metadata = std::fs::symlink_metadata(parent)
                     .map_err(|error| crate::io_error(parent, error))?;
                 if !parent_metadata.is_dir() || parent_metadata.is_symlink() {
@@ -139,7 +139,7 @@ impl JournalPlan {
             }
             let configuration = config.configuration.encode();
             let inspected = if intent == RecoveryIntent::Quarantine {
-                ozzy_journal_segment::AsyncRecoveryDirectory::open_for_repair(
+                ozzy_journal_segment::RecoveryDirectory::open_for_repair(
                     config.root.clone(),
                     io.clone(),
                     config.identity,
@@ -148,7 +148,7 @@ impl JournalPlan {
                 )
                 .await
             } else {
-                ozzy_journal_segment::AsyncRecoveryDirectory::open_recovering(
+                ozzy_journal_segment::RecoveryDirectory::open_recovering(
                     config.root.clone(),
                     io.clone(),
                     config.identity,

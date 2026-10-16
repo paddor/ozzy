@@ -1,7 +1,8 @@
 //! Nonvoting checkpoint bytes over bounded, source/nonce-bound PEER exchanges.
 
 use super::{
-    COMMON_BYTES, ControlEncoding, PeerBinding, Reader, WireError, WireLimits, Writer,
+    COMMON_BYTES, ControlEncoding, Incoming, PeerBinding, ReadFields, WireError, WireLimits,
+    WriteFields, Writer,
     transfer::{read_source, validate_source, write_source},
     validate_scope,
 };
@@ -91,32 +92,34 @@ pub fn encode_checkpoint(
     if output.len() < METADATA_BYTES {
         return Err(WireError::Capacity);
     }
-    let mut writer = Writer::new(&mut output[..METADATA_BYTES]);
-    writer.scope(request.scope, sender);
-    writer.bytes(request.nonce.as_bytes());
-    write_source(&mut writer, request.source);
-    writer.bytes(&request.offset.to_be_bytes());
-    writer.bytes(&request.max_bytes.to_be_bytes());
+    let mut writer = Writer::with_len(output, METADATA_BYTES)?;
+    writer.scope(request.scope, sender)?;
+    writer.bytes(request.nonce.as_bytes())?;
+    write_source(&mut writer, request.source)?;
+    writer.bytes(&request.offset.to_be_bytes())?;
+    writer.bytes(&request.max_bytes.to_be_bytes())?;
     Ok(ControlEncoding {
         header,
         metadata_bytes: METADATA_BYTES,
     })
 }
 
-pub(super) fn decode<'a>(
-    scope: Scope,
-    envelope: Envelope,
-    mut reader: Reader<'_>,
-    payload: &'a [u8],
+pub(super) fn decode(
+    Incoming {
+        scope,
+        envelope,
+        mut reader,
+        payload,
+    }: Incoming<'_>,
     binding: PeerBinding,
     limits: WireLimits,
-) -> Result<CheckpointMessage<'a>, WireError> {
+) -> Result<CheckpointMessage<'_>, WireError> {
     let request = CheckpointRequest {
         scope,
         request_id: envelope.request_id.ok_or(WireError::Correlation)?,
-        nonce: RequestId::from_bytes(reader.bytes()?),
+        nonce: RequestId::from_bytes(reader.array()?),
         source: read_source(&mut reader)?,
-        offset: u64::from_be_bytes(reader.bytes()?),
+        offset: u64::from_be_bytes(reader.array()?),
         max_bytes: reader.u32()?,
     };
     reader.finish()?;
@@ -189,19 +192,19 @@ pub fn encode_history_retired(
     if output.len() < length {
         return Err(WireError::Capacity);
     }
-    let mut writer = Writer::new(&mut output[..length]);
-    writer.scope(notice.scope, sender);
+    let mut writer = Writer::with_len(output, length)?;
+    writer.scope(notice.scope, sender)?;
     match notice.fence {
         HistoryFence::Receive(epoch) => {
-            writer.bytes(&[0]);
-            writer.bytes(&epoch.get().to_be_bytes());
+            writer.bytes(&[0])?;
+            writer.bytes(&epoch.get().to_be_bytes())?;
         }
         HistoryFence::Fetch(id) => {
-            writer.bytes(&[1]);
-            writer.bytes(id.as_bytes());
+            writer.bytes(&[1])?;
+            writer.bytes(id.as_bytes())?;
         }
     }
-    writer.prefix(notice.before);
+    writer.prefix(notice.before)?;
     Ok(ControlEncoding {
         header,
         metadata_bytes: length,
@@ -209,16 +212,18 @@ pub fn encode_history_retired(
 }
 
 pub(super) fn decode_retired(
-    scope: Scope,
-    envelope: Envelope,
-    mut reader: Reader<'_>,
-    payload: &[u8],
+    Incoming {
+        scope,
+        envelope,
+        mut reader,
+        payload,
+    }: Incoming<'_>,
 ) -> Result<HistoryRetired, WireError> {
     if envelope.response || envelope.request_id.is_some() || !payload.is_empty() {
         return Err(WireError::Correlation);
     }
-    let tag: [u8; 1] = reader.bytes()?;
-    let id: [u8; 16] = reader.bytes()?;
+    let tag: [u8; 1] = reader.array()?;
+    let id: [u8; 16] = reader.array()?;
     let fence = match tag[0] {
         0 => HistoryFence::Receive(crate::flow::ReceiveEpoch::new(u128::from_be_bytes(id))?),
         1 if id != [0; 16] => HistoryFence::Fetch(RequestId::from_bytes(id)),

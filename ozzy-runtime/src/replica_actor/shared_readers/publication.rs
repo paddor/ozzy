@@ -1,15 +1,16 @@
 //! Leader-only, applied-record publication without a partition-owned socket.
 
-use super::{ActorError, Cursor, NodeId, Payload, SharedReaderConfig, output::flush};
+use super::{ActorError, Cursor, Payload, SharedReaderConfig, Visit, output::flush};
 use crate::{
     reader_service::publication_frame,
+    replica_actor::response,
     replica_journal::{PartitionReadBuffer, PartitionReadLimits, ReplicaJournal},
-    signal::DataSignal,
 };
+use futures::task::AtomicWaker;
 use omq_tokio::{Message, TrySendError};
-use ozzy_core::reader::{ReadOutcome, ReadScheduler};
+use ozzy_core::reader::ReadScheduler;
 use ozzy_proto::{
-    Envelope, Opcode,
+    Envelope, Opcode, PartitionIncarnation,
     reader::{self, PublicationHeader, RecordsEncoder, Source},
 };
 use ozzy_replication::{PipelineLimits, driver::ValidationTicket};
@@ -32,7 +33,7 @@ impl Publication {
     pub(super) fn new(
         journal: &mut ReplicaJournal,
         config: SharedReaderConfig,
-        work: Arc<DataSignal>,
+        wake: Arc<AtomicWaker>,
     ) -> Result<Self, ActorError> {
         let buffer = journal.lease_append_buffer_with_limits(PipelineLimits {
             max_operations: 1,
@@ -45,16 +46,22 @@ impl Publication {
                 max_parts: config.limits.max_parts,
                 max_payload_bytes: config.limits.envelope.max_payload_bytes,
             },
-            work.clone(),
+            wake.clone(),
         )?;
         Ok(Self {
             cursor: Cursor::new(pool.clone(), None),
             pool,
             schedule: ReadScheduler::new(),
-            payload: Payload::notifying(config.limits.envelope.max_payload_bytes, work),
+            payload: Payload::waking(config.limits.envelope.max_payload_bytes, wake),
             metadata: Vec::with_capacity(config.limits.envelope.max_metadata_bytes),
             pending: None,
         })
+    }
+
+    /// A framed publication still waits for the shard's dispatcher slot.
+    /// A sent frame that a slow SUB retains does not count.
+    pub(super) fn waiting(&self) -> bool {
+        self.pending.is_some()
     }
 
     pub(super) fn changed(&mut self, fenced: bool, active: bool) {
@@ -68,21 +75,17 @@ impl Publication {
     fn reset(&mut self, active: bool) {
         self.cursor = Cursor::new(self.pool.clone(), None);
         self.pending = None;
-        self.schedule = ReadScheduler::new();
-        if !active {
-            assert!(self.schedule.begin_poll());
-            self.schedule
-                .complete(ReadOutcome::CaughtUp)
-                .expect("pending publication");
-        }
+        self.schedule = if active {
+            ReadScheduler::new()
+        } else {
+            ReadScheduler::waiting()
+        };
     }
 
     pub(super) fn poll(
         &mut self,
-        local: NodeId,
+        visit: &mut Visit<'_>,
         config: SharedReaderConfig,
-        ticket: Option<ValidationTicket>,
-        journal: &mut ReplicaJournal,
         cx: &mut Context<'_>,
         send: &mut impl FnMut(&mut Context<'_>, Message) -> Result<(), TrySendError>,
     ) -> Result<bool, ActorError> {
@@ -94,42 +97,66 @@ impl Publication {
         if self.pending.is_some() || !self.schedule.is_runnable() {
             return Ok(advanced);
         }
-        let Some(ticket) = ticket else {
-            return Ok(advanced);
-        };
-        let position = match self.cursor.poll_open(config.partition, ticket, journal, cx) {
-            Poll::Pending => return Ok(advanced),
+        let published = self.publish(visit, config, cx)?;
+        Ok(advanced || published)
+    }
+
+    /// Where the next frame starts: the cursor's open position under the
+    /// current authority. A failed open restarts the cursor.
+    fn start(
+        &mut self,
+        visit: &mut Visit<'_>,
+        partition: PartitionIncarnation,
+        cx: &mut Context<'_>,
+    ) -> Option<(ValidationTicket, PublicationHeader)> {
+        let ticket = visit.ticket?;
+        let position = match self.cursor.poll_open(partition, ticket, visit.journal, cx) {
+            Poll::Pending => return None,
             Poll::Ready(Err(_)) => {
                 self.reset(false);
-                return Ok(advanced);
+                return None;
             }
             Poll::Ready(Ok(position)) => position,
         };
-        let Some(mut payload) = self.payload.try_take() else {
-            return Ok(advanced);
-        };
-        let scope = ticket.scope();
         let source = Source::Group {
-            authority: ozzy_proto::data::Authority {
-                group_id: scope.group_id,
-                config_epoch: scope.configuration_epoch,
-                view: scope.view,
-            },
-            partition: config.partition,
+            authority: response::authority(ticket.scope()),
+            partition,
             owner_epoch: position.owner_epoch().get(),
         };
+        let first_offset = position.next_offset().get();
+        Some((
+            ticket,
+            PublicationHeader {
+                source,
+                first_offset,
+            },
+        ))
+    }
+
+    /// Frame the next applied records for publication. A failed read
+    /// restarts the cursor and reports no progress.
+    fn publish(
+        &mut self,
+        visit: &mut Visit<'_>,
+        config: SharedReaderConfig,
+        cx: &mut Context<'_>,
+    ) -> Result<bool, ActorError> {
+        let Some((ticket, header)) = self.start(visit, config.partition, cx) else {
+            return Ok(false);
+        };
+        let Some(mut payload) = self.payload.try_take() else {
+            return Ok(false);
+        };
+        let source = header.source;
         let mut output = RecordsEncoder::publication(
             Envelope {
                 opcode: Opcode::RecordsPub,
                 response: false,
                 request_id: None,
-                sender: local,
+                sender: visit.local,
                 session: None,
             },
-            PublicationHeader {
-                source,
-                first_offset: position.next_offset().get(),
-            },
+            header,
             &mut self.metadata,
             &mut payload.body,
             config.limits,
@@ -137,22 +164,17 @@ impl Publication {
         .map_err(|_| ActorError::Limits)?;
         output.allow_shared_payload();
         assert!(self.schedule.begin_poll());
-        let more = match self
-            .cursor
-            .poll(source, ticket, journal, &mut output, config.limits, cx)
-        {
+        let more = match self.cursor.poll(ticket, visit.journal, &mut output, cx) {
             Poll::Pending => false,
             Poll::Ready(Err(_)) => {
                 self.reset(false);
-                return Ok(advanced);
+                return Ok(false);
             }
-            Poll::Ready(Ok(outcome)) => self
-                .schedule
-                .complete(outcome)
-                .expect("pending publication"),
+            // A read completing without one pending asks for no further turn.
+            Poll::Ready(Ok(outcome)) => self.schedule.complete(outcome).unwrap_or(false),
         };
         if output.is_empty() {
-            return Ok(advanced || more);
+            return Ok(more);
         }
         let (header, shared) = output
             .finish_with_payload()
@@ -162,7 +184,7 @@ impl Publication {
             &prefix,
             header,
             &self.metadata,
-            publication_frame(payload, shared),
+            publication_frame(payload, shared).ok_or(ActorError::Limits)?,
         ));
         Ok(true)
     }

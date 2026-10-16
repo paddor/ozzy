@@ -1,42 +1,58 @@
 # Releasing
 
-Release-plz runs after successful main CI. It opens or updates a version PR;
-merging that PR publishes through crates.io trusted publishing and creates
-per-crate tags and GitHub releases. Failed or superseded main revisions do not
-publish. Bot-created release PRs dispatch the same required CI checks.
+How Ozzy crates reach crates.io. For maintainers.
 
-1. Review the proposed versions and dependency updates.
-2. Add a dated version section below `Unreleased` in
-   [CHANGELOG.md](CHANGELOG.md), with categorized changes. Preserve existing
-   version sections.
-3. Merge with all required checks green. Check the `Release-plz` workflow and
-   crates.io results. Its manual dispatch can retry a failed release after
-   successful main CI.
+## How it works
+
+- After a green CI run on a push to `main`, the `Release-plz` workflow
+  (`release-plz.yml`) publishes merged version bumps and opens or updates a
+  release PR.
+- Only the tested, latest `main` revision publishes. Failed or superseded
+  revisions do not.
+- Bot-created release PRs dispatch the same required CI checks.
+- Publishing uses crates.io trusted publishing over OIDC. No long-lived
+  registry secret exists.
+- Each published crate gets a `<crate>-v<version>` tag and a GitHub release
+  that links to [CHANGELOG.md](CHANGELOG.md).
+- Release-plz does not edit `CHANGELOG.md`.
+
+## Release steps
+
+1. Review the release PR's proposed versions and dependency updates.
+2. In [CHANGELOG.md](CHANGELOG.md), add `## [<version>] - <YYYY-MM-DD>`
+   directly below `## [Unreleased]`, with categorized subsections. Never edit
+   existing version sections.
+3. Merge with all required checks green.
+4. Check the `Release-plz` run and the crates.io pages.
+5. To retry a failed release, dispatch `Release-plz` manually on `main` after
+   a green CI run.
 
 ## Published crates
 
-The allowlist in [release-plz.toml](release-plz.toml) contains the broker, SDK,
-and their supporting crates. `ozzy-bench` and `ozzy-sim` remain unpublished.
+- [release-plz.toml](release-plz.toml) lists the crates that release
+  (`release = true`).
+- `ozzy-bench`, `ozzy-sim`, and `ozzy-test-alloc` are `publish = false`.
+- CI's `publish-check` job dry-runs `cargo publish` for every other workspace
+  crate.
 
-| Crate | Trusted publisher settings |
+## Trusted publisher setup
+
+A new crate's first version is published by hand: an owner runs
+`cargo publish -p <crate>`, after any unpublished workspace crate it depends
+on. Trusted publishing covers later versions.
+
+For each released crate, open `https://crates.io/crates/<crate>/settings` and
+add a GitHub trusted publisher:
+
+| Field | Value |
 | --- | --- |
-| `ozzy` | [crates.io](https://crates.io/crates/ozzy/settings) |
-| `ozzy-broker` | [crates.io](https://crates.io/crates/ozzy-broker/settings) |
-| `ozzy-config` | [crates.io](https://crates.io/crates/ozzy-config/settings) |
-| `ozzy-core` | [crates.io](https://crates.io/crates/ozzy-core/settings) |
-| `ozzy-io` | [crates.io](https://crates.io/crates/ozzy-io/settings) |
-| `ozzy-io-aio` | [crates.io](https://crates.io/crates/ozzy-io-aio/settings) |
-| `ozzy-io-pool` | [crates.io](https://crates.io/crates/ozzy-io-pool/settings) |
-| `ozzy-journal` | [crates.io](https://crates.io/crates/ozzy-journal/settings) |
-| `ozzy-journal-segment` | [crates.io](https://crates.io/crates/ozzy-journal-segment/settings) |
-| `ozzy-proto` | [crates.io](https://crates.io/crates/ozzy-proto/settings) |
-| `ozzy-replication` | [crates.io](https://crates.io/crates/ozzy-replication/settings) |
-| `ozzy-runtime` | [crates.io](https://crates.io/crates/ozzy-runtime/settings) |
+| Owner | `paddor` |
+| Repository | `ozzy` |
+| Workflow | `release-plz.yml` |
+| Environment | None |
 
-For each crate, configure GitHub owner `paddor`, repository `ozzy`, workflow
-`release-plz.yml`, and no environment. The workflow requests an OIDC token;
-it needs no long-lived registry secret. Registry configuration requires a crate
-owner's account or a token with the trusted-publishing scope.
+This needs a crate owner's account or a token with the trusted-publishing
+scope.
 
-Correctness and soak commands live in [DEVELOPMENT.md](DEVELOPMENT.md);
-performance isolation lives in [BENCHMARKS.md](BENCHMARKS.md).
+Correctness checks and soaks: [DEVELOPMENT.md](DEVELOPMENT.md). Performance
+isolation: [BENCHMARKS.md](BENCHMARKS.md).

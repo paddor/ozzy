@@ -8,13 +8,15 @@ use ozzy_core::state::{
 };
 use thiserror::Error;
 
-use crate::{AsyncJournalIndexSnapshot, JournalIdentityHandoffError, JournalIndexError};
+use crate::{
+    JournalIdentityHandoffError, JournalIndexError, JournalIndexSnapshot, SegmentReference,
+};
 
 /// One immutable persistent prefix, bounded resolved lookups, and bounded new
 /// claims. Clones share immutable files, not overlays or resolved-key sets.
 #[derive(Debug, Clone)]
 pub struct Index {
-    snapshot: Rc<AsyncJournalIndexSnapshot>,
+    snapshot: Rc<JournalIndexSnapshot>,
     overlay: MemoryIdentityIndex,
     resolved: RefCell<HashMap<IdentityKey, Option<IdentityClaim>>>,
     lookup_capacity: usize,
@@ -23,7 +25,7 @@ pub struct Index {
 impl Index {
     /// Bind an exact captured journal index to a bounded in-memory identity overlay.
     pub fn new(
-        snapshot: AsyncJournalIndexSnapshot,
+        snapshot: JournalIndexSnapshot,
         overlay_capacity: usize,
         lookup_capacity: usize,
     ) -> Self {
@@ -36,7 +38,7 @@ impl Index {
     }
 
     /// Borrow the exact captured journal-index source.
-    pub fn snapshot(&self) -> &AsyncJournalIndexSnapshot {
+    pub fn snapshot(&self) -> &JournalIndexSnapshot {
         &self.snapshot
     }
     /// Borrow bounded identity claims not yet represented by the captured disk index.
@@ -72,11 +74,27 @@ impl Index {
         Ok(())
     }
 
+    /// Drop coverage of history that retirement unreferenced, without reading
+    /// files. `first` is the first segment the journal still selects. Sources,
+    /// their deletion protection, and overlay claims before it leave, so the
+    /// result covers what a snapshot rebuilt over the retained history would.
+    pub fn retire_prefix(&self, first: SegmentReference) -> Result<Self, JournalIndexError> {
+        let snapshot = self.snapshot.retain_from(first)?;
+        let mut overlay = self.overlay.clone();
+        overlay.retain_from(first.first_chain.next_op_number());
+        Ok(Self {
+            snapshot: Rc::new(snapshot),
+            overlay,
+            resolved: RefCell::new(HashMap::new()),
+            lookup_capacity: self.lookup_capacity,
+        })
+    }
+
     /// Replace persistent coverage only after exact lineage and every overlay
     /// claim have been checked. Resolved negatives never cross the handoff.
     pub async fn handoff(
         self,
-        replacement: AsyncJournalIndexSnapshot,
+        replacement: JournalIndexSnapshot,
     ) -> Result<Self, JournalIdentityHandoffError> {
         if replacement.identity() != self.snapshot.identity()
             || replacement.through().op_number < self.snapshot.through().op_number

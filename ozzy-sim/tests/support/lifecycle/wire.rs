@@ -106,16 +106,8 @@ impl Packet {
     pub(crate) fn decode(&self) -> ReplicaMessage<'_> {
         // Trace inspection has no authority. Actual receive binds the receiver's
         // own configuration and epoch through decode_for, never this fallback.
-        [QuorumPolicy::Durable, QuorumPolicy::Replicated]
-            .into_iter()
-            .find_map(|policy| {
-                self.decode_with(
-                    configuration_record_with_policy(policy).configuration(),
-                    self.epoch,
-                )
-                .ok()
-            })
-            .expect("fixture packet decodes under its configured policy")
+        self.decode_with(configuration_record().configuration(), self.epoch)
+            .expect("fixture packet decodes under its configuration")
     }
 
     pub(super) fn decode_for(
@@ -169,8 +161,11 @@ impl Packet {
         let mut metadata = [0; METADATA_BYTES];
         let mut payload = [0; BODY_BYTES];
         let encoded = wire::encode_flow_prepare(
-            node(from),
-            session(),
+            wire::EncodeContext {
+                sender: node(from),
+                session: session(),
+                limits: wire_limits(),
+            },
             epoch,
             Prepare {
                 scope,
@@ -179,7 +174,6 @@ impl Packet {
             },
             &mut metadata,
             &mut payload,
-            wire_limits(),
         )
         .unwrap();
         Self {
@@ -247,13 +241,15 @@ impl Packet {
         let mut metadata = [0; METADATA_BYTES];
         let mut payload = [0; BODY_BYTES];
         let encoded = wire::encode_ops(
-            node(from),
-            session(),
+            wire::EncodeContext {
+                sender: node(from),
+                session: session(),
+                limits: wire_limits(),
+            },
             request,
             &borrowed,
             &mut metadata,
             &mut payload,
-            wire_limits(),
         )
         .unwrap();
         Self {

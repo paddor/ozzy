@@ -18,6 +18,7 @@ readme = "README.md"
 fanring.workspace = true
 futures.workspace = true
 ozzy-io.workspace = true
+ozzy-telemetry.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -41,3 +42,7 @@ workspace = true
 [[test]]
 name = "ozzy_io_conformance"
 path = "tests/conformance.rs"
+
+[[test]]
+name = "ozzy_io_lock_lifetime"
+path = "tests/lock_lifetime.rs"

@@ -33,9 +33,13 @@ pub struct Iggy {
     brokers: Vec<Broker>,
     build: Value,
     stopped: bool,
+    /// Remote servers are killed once they outlive this.
+    lifetime: Duration,
 }
+
 impl Iggy {
-    pub fn start(root: &Path, placements: &[Placement; 3]) -> Result<Self> {
+    /// Start one server per placement for a case lasting at most `lifetime`.
+    pub fn start(root: &Path, placements: &[Placement; 3], lifetime: Duration) -> Result<Self> {
         fs::create_dir_all(root)?;
         let mut server = Self {
             root: root.into(),
@@ -43,7 +47,13 @@ impl Iggy {
             brokers: vec![],
             build: build::verified_identity()?,
             stopped: false,
+            lifetime,
         };
+        let case = root
+            .file_name()
+            .ok_or("missing case name")?
+            .to_string_lossy()
+            .into_owned();
         let sockets = (0..6)
             .map(|_| TcpListener::bind("127.0.0.1:0"))
             .collect::<std::io::Result<Vec<_>>>()?;
@@ -52,27 +62,26 @@ impl Iggy {
             .map(|s| s.local_addr().map(|a| a.port()))
             .collect::<std::io::Result<Vec<_>>>()?;
         let nodes=placements.iter().enumerate().map(|(i,p)|json!({"name":format!("broker-{i}"),"ip":p.bind,"replica_id":i,"ports":{"tcp":ports[2*i],"tcp_replica":ports[2*i+1]}})).collect::<Vec<_>>();
-        let template: Value = serde_json::to_value(toml::from_str::<toml::Value>(
-            &fs::read_to_string(build::checkout().join("core/server/config.toml"))?,
-        )?)?;
+        let template = super::shared_config(&case, &nodes, true, "info")?;
         drop(sockets);
         for (i, p) in placements.iter().enumerate() {
-            let mut template = template.clone();
-            template["sharding"]["cpu_allocation"] = json!(shard_count(placements, i)?);
-            server.launch(i, p, &ports, &nodes, &template)?;
+            let mut config = template.clone();
+            config["sharding"]["cpu_allocation"] = json!(shard_count(placements, i)?);
+            server.launch(i, p, &ports, config)?;
         }
         server.wait_ready()?;
         server.endpoint.clone_from(&server.brokers[0].endpoint);
         json_file(&root.join("inspect.json"), &server.identity()?)?;
         Ok(server)
     }
+
+    /// Write broker `index`'s configuration on its host and start it there.
     fn launch(
         &mut self,
         index: usize,
         p: &Placement,
         ports: &[u16],
-        nodes: &[Value],
-        template: &Value,
+        mut config: Value,
     ) -> Result<()> {
         let root = self.root.join(index.to_string());
         fs::create_dir(&root)?;
@@ -97,43 +106,12 @@ impl Iggy {
             ),
         )?;
         let endpoint = SocketAddr::new(p.bind, ports[2 * index]).to_string();
-        let mut config = template.clone();
         config["path"] = json!(data);
-        for transport in ["http", "quic", "websocket"] {
-            config[transport]["enabled"] = json!(false);
-        }
-        config["heartbeat"]["enabled"] = json!(false);
-        config["logging"]["file_enabled"] = json!(false);
-        config["logging"]["level"] = json!("info");
-        config["sharding"]["pin_cores"] = json!(false);
-        config["cluster"]["enabled"] = json!(true);
-        config["cluster"]["name"] = json!(self.root.file_name().unwrap().to_string_lossy());
-        config["cluster"]["nodes"] = json!(nodes);
         config["tcp"]["address"] = json!(endpoint);
         let config_path = root.join("config.toml");
         fs::write(&config_path, toml::to_string(&config)?)?;
         remote::copy(p, &config_path, &work.join("config.toml"))?;
-        let (binary, libraries) = if p.remote.is_some() {
-            let root = remote::remote_root(p)?;
-            (root.join("iggy-server"), root)
-        } else {
-            (build::binary(), build::library_path())
-        };
-        let script = format!(
-            "set -e; cd {}; : > .env; echo $$ > pid; exec env -i PATH=/usr/bin:/bin HOME={} TMPDIR={} LD_LIBRARY_PATH={} IGGY_CONFIG_PATH={} IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy taskset -c {} {} --replica-id {index}",
-            quote(&work.to_string_lossy()),
-            quote(&work.to_string_lossy()),
-            quote(&work.to_string_lossy()),
-            quote(&libraries.to_string_lossy()),
-            quote(&work.join("config.toml").to_string_lossy()),
-            quote(&p.cpu_list().ok_or("missing CPU mask")?),
-            quote(&binary.to_string_lossy())
-        );
-        let script = if p.remote.is_some() {
-            format!("exec timeout --signal=KILL 180s sh -c {}", quote(&script))
-        } else {
-            script
-        };
+        let script = self.start_script(index, p, &work)?;
         let log = fs::File::create(root.join("server.log"))?;
         let child = remote::command(p, &script)
             .stdin(Stdio::null())
@@ -151,8 +129,39 @@ impl Iggy {
         });
         Ok(())
     }
+
+    /// The shell script that records the broker PID and runs it pinned in
+    /// `work`; remote brokers die once they outlive the case.
+    fn start_script(&self, index: usize, p: &Placement, work: &Path) -> Result<String> {
+        let (binary, libraries) = if p.remote.is_some() {
+            let root = remote::remote_root(p)?;
+            (root.join("iggy-server"), root)
+        } else {
+            (build::binary(), build::library_path())
+        };
+        let script = format!(
+            "set -e; cd {}; : > .env; echo $$ > pid; exec env -i PATH=/usr/bin:/bin HOME={} TMPDIR={} LD_LIBRARY_PATH={} IGGY_CONFIG_PATH={} IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy taskset -c {} {} --replica-id {index}",
+            quote(&work.to_string_lossy()),
+            quote(&work.to_string_lossy()),
+            quote(&work.to_string_lossy()),
+            quote(&libraries.to_string_lossy()),
+            quote(&work.join("config.toml").to_string_lossy()),
+            quote(&p.cpu_list().ok_or("missing CPU mask")?),
+            quote(&binary.to_string_lossy())
+        );
+        Ok(if p.remote.is_some() {
+            format!(
+                "exec timeout --signal=KILL {} sh -c {}",
+                crate::budget::timeout_arg(self.lifetime),
+                quote(&script)
+            )
+        } else {
+            script
+        })
+    }
+
     fn wait_ready(&mut self) -> Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + super::READY;
         loop {
             crate::automation::check_canceled()?;
             self.check()?;
@@ -176,11 +185,7 @@ impl Iggy {
                 ready &= broker.pid != 0
                     && fs::read_to_string(broker.root.join("server.log"))?
                         .contains("replica mesh complete: all peer connections established")
-                    && TcpStream::connect_timeout(
-                        &broker.endpoint.parse()?,
-                        Duration::from_millis(20),
-                    )
-                    .is_ok();
+                    && TcpStream::connect_timeout(&broker.endpoint.parse()?, super::PROBE).is_ok();
             }
             if ready {
                 break;
@@ -188,7 +193,7 @@ impl Iggy {
             if Instant::now() >= deadline {
                 return Err("distributed Iggy readiness expired".into());
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(super::READY_POLL);
         }
         for broker in &self.brokers {
             let effective = remote::run(

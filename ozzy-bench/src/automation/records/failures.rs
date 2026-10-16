@@ -1,12 +1,54 @@
 //! Explicit failure annotations. These never enter measurement summaries.
+use super::super::json_field_mut;
 use super::{Result, controls, finite};
 use serde_json::{Value, json};
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 /// Include failed offered-load cases as explicit failures in the selected chart data.
 pub fn include_failed_loads(directory: &Path, data: &mut Value, ids: &[String]) -> Result<()> {
     let mut failures = vec![];
     for id in ids {
+        let failed = FailedRun::load(directory, id)?;
+        let config = failed.manifest["arguments"].clone();
+        let case = failed_case(&config)?;
+        let rate = case["rate"]
+            .as_u64()
+            .filter(|r| *r > 0)
+            .ok_or("missing offered load")?;
+        let repeat = repeats_measured(data, &case, &failures)?;
+        require_matching_build(data, &failed.manifest)?;
+        require_compatible(data, failed.manifest, &failed.run, &case)?;
+        let repetitions = config["repetitions"]
+            .as_u64()
+            .ok_or("missing repetitions")?;
+        let evidence = failure_evidence(&failed.run, id, &case, repetitions, data)?;
+        record_window(data, &config, rate)?;
+        failures.push(
+            json!({"run_id":id,"case":case,"failure":"scheduled backlog limit exceeded",
+            "reason":failed.reason,"evidence":evidence,"repeat":repeat}),
+        );
+    }
+    // Keep overloaded ramp stages already selected with the measurements.
+    let mut incomplete = data["incomplete"].as_array().cloned().unwrap_or_default();
+    incomplete.extend(failures);
+    data["incomplete"] = json!(incomplete);
+    Ok(())
+}
+
+/// One failed run's directory, manifest, and recorded failure reason.
+struct FailedRun {
+    run: PathBuf,
+    manifest: Value,
+    reason: String,
+}
+
+impl FailedRun {
+    /// Load a recorded scheduled-backlog failure from the artifacts, or from
+    /// the ledger directory once the artifacts are gone.
+    fn load(directory: &Path, id: &str) -> Result<Self> {
         if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
             return Err("invalid failed run ID".into());
         }
@@ -16,83 +58,94 @@ pub fn include_failed_loads(directory: &Path, data: &mut Value, ids: &[String]) 
         } else {
             directory.join("runs").join(id)
         };
-        let mut manifest: Value = serde_json::from_slice(&fs::read(run.join("manifest.json"))?)?;
+        let manifest: Value = serde_json::from_slice(&fs::read(run.join("manifest.json"))?)?;
         let reason = fs::read_to_string(run.join("FAILED"))?;
         if manifest["run_id"] != *id || !reason.contains("scheduled backlog exceeded: lane=") {
             return Err(
                 "only recorded scheduled-backlog failures can annotate fixed-load charts".into(),
             );
         }
-        let config = manifest["arguments"].clone();
-        let implementation = config["impl"].as_str().ok_or("missing implementation")?;
-        if !matches!(implementation, "ozzy" | "iggy" | "redpanda") {
-            return Err("failed-load annotations require one implementation".into());
-        }
-        let one = |key: &str| -> Result<Value> {
-            let values = config[key].as_array().ok_or("missing case selection")?;
-            if values.len() != 1 {
-                return Err("failed-load run must select exactly one case".into());
-            }
-            Ok(values[0].clone())
-        };
-        let case = json!({"impl":implementation,"mode":one("modes")?,"codec":one("codecs")?,
-            "size":one("sizes")?,"pattern":one("patterns")?,"rate":config["records_per_second"]});
-        let rate = case["rate"]
-            .as_u64()
-            .filter(|r| *r > 0)
-            .ok_or("missing offered load")?;
-        let summaries = data["summary"].as_array().ok_or("missing summaries")?;
-        let repeat = summaries.iter().any(|row| row["case"] == case);
-        let matches_series = |row: &&Value| {
-            ["impl", "mode", "codec", "size", "pattern"]
-                .iter()
-                .all(|key| row["case"][key] == case[key])
-        };
-        if !summaries.iter().any(|row| matches_series(&row))
-            || failures
-                .iter()
-                .chain(data["incomplete"].as_array().into_iter().flatten())
-                .any(|row: &Value| row["case"] == case)
-        {
-            return Err("failed case is uncovered or duplicated".into());
-        }
-        require_matching_build(data, &manifest)?;
-        manifest["configuration"] = config.clone();
-        let mut control = controls(&manifest)?;
-        let settings = control["configuration"].as_object_mut().unwrap();
-        settings.remove("records_per_second");
-        settings.remove("duration");
-        settings.remove("ramp");
-        settings.insert(
-            "producer_workers".into(),
-            json!(producer_workers(&run, &case)?),
-        );
-        if control != data["compatibility"] {
-            return Err("failed run has incompatible workload or environment".into());
-        }
-        let repetitions = config["repetitions"]
-            .as_u64()
-            .ok_or("missing repetitions")?;
-        let evidence = failure_evidence(&run, id, &case, repetitions, data)?;
-        let duration = finite(&config["duration"])?;
-        if duration <= 0.0 {
-            return Err("invalid failed measurement window".into());
-        }
-        let window = json!({"duration":duration,"warmup":config["warmup"],"repetitions":config["repetitions"]});
-        let prior = &data["fixed_load_windows"][rate.to_string()];
-        if !prior.is_null() && *prior != window {
-            return Err("failed-load measurement window differs".into());
-        }
-        data["fixed_load_windows"][rate.to_string()] = window;
-        failures.push(
-            json!({"run_id":id,"case":case,"failure":"scheduled backlog limit exceeded",
-            "reason":reason,"evidence":evidence,"repeat":repeat}),
-        );
+        Ok(Self {
+            run,
+            manifest,
+            reason,
+        })
     }
-    // Keep overloaded ramp stages already selected with the measurements.
-    let mut incomplete = data["incomplete"].as_array().cloned().unwrap_or_default();
-    incomplete.extend(failures);
-    data["incomplete"] = json!(incomplete);
+}
+
+/// The one case a failed run selected, at its offered rate.
+fn failed_case(config: &Value) -> Result<Value> {
+    let implementation = config["impl"].as_str().ok_or("missing implementation")?;
+    if !matches!(implementation, "ozzy" | "iggy" | "redpanda") {
+        return Err("failed-load annotations require one implementation".into());
+    }
+    let one = |key: &str| -> Result<Value> {
+        let values = config[key].as_array().ok_or("missing case selection")?;
+        if values.len() != 1 {
+            return Err("failed-load run must select exactly one case".into());
+        }
+        Ok(values[0].clone())
+    };
+    Ok(
+        json!({"impl":implementation,"mode":one("modes")?,"codec":one("codecs")?,
+        "size":one("sizes")?,"pattern":one("patterns")?,"rate":config["records_per_second"]}),
+    )
+}
+
+/// Whether `case` repeats a measured case. Its series must have measurements,
+/// and the case must not already be failed or incomplete.
+fn repeats_measured(data: &Value, case: &Value, failures: &[Value]) -> Result<bool> {
+    let summaries = data["summary"].as_array().ok_or("missing summaries")?;
+    let repeat = summaries.iter().any(|row| row["case"] == *case);
+    let matches_series = |row: &&Value| {
+        ["impl", "mode", "codec", "size", "pattern"]
+            .iter()
+            .all(|key| row["case"][key] == case[key])
+    };
+    if !summaries.iter().any(|row| matches_series(&row))
+        || failures
+            .iter()
+            .chain(data["incomplete"].as_array().into_iter().flatten())
+            .any(|row: &Value| row["case"] == *case)
+    {
+        return Err("failed case is uncovered or duplicated".into());
+    }
+    Ok(repeat)
+}
+
+/// The failed run's workload and environment controls must match the chart's,
+/// apart from its offered load and window.
+fn require_compatible(data: &Value, mut manifest: Value, run: &Path, case: &Value) -> Result<()> {
+    manifest["configuration"] = manifest["arguments"].clone();
+    let mut control = controls(&manifest)?;
+    let settings = json_field_mut(&mut control, "configuration", Value::as_object_mut)?;
+    settings.remove("records_per_second");
+    settings.remove("duration");
+    settings.remove("ramp");
+    settings.insert(
+        "producer_workers".into(),
+        json!(producer_workers(run, case)?),
+    );
+    if control != data["compatibility"] {
+        return Err("failed run has incompatible workload or environment".into());
+    }
+    Ok(())
+}
+
+/// Record the failed run's measurement window under its offered rate. Every
+/// run at one rate must share the window.
+fn record_window(data: &mut Value, config: &Value, rate: u64) -> Result<()> {
+    let duration = finite(&config["duration"])?;
+    if duration <= 0.0 {
+        return Err("invalid failed measurement window".into());
+    }
+    let window =
+        json!({"duration":duration,"warmup":config["warmup"],"repetitions":config["repetitions"]});
+    let prior = &data["fixed_load_windows"][rate.to_string()];
+    if !prior.is_null() && *prior != window {
+        return Err("failed-load measurement window differs".into());
+    }
+    data["fixed_load_windows"][rate.to_string()] = window;
     Ok(())
 }
 

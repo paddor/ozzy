@@ -1,6 +1,9 @@
 //! Explicit three-device placement, SSH deployment, and remote process auditing.
 use super::{Result, capture, json_file, source};
-use crate::placement::Placement;
+use crate::{
+    budget::{CONTROL_STEP, EXIT_GRACE},
+    placement::Placement,
+};
 use serde_json::{Value, json};
 use std::{
     fmt::Write as _,
@@ -11,6 +14,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// The remote auditor CPU, outside every broker mask that cross-host
+/// placements use.
+const AUDIT_CPU: usize = 5;
+/// How often the controller checks a remote audit for readiness or exit.
+const AUDIT_POLL: Duration = Duration::from_millis(20);
+
 /// Quote a value as one POSIX shell argument.
 pub fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
@@ -18,20 +27,7 @@ pub fn quote(value: &str) -> String {
 /// Construct local or SSH execution for the requested broker placement.
 pub fn command(placement: &Placement, script: &str) -> Command {
     if let Some((host, _)) = &placement.remote {
-        let mut command = Command::new("ssh");
-        command.args([
-            "-T",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=5",
-            "-o",
-            "ServerAliveInterval=5",
-            "-o",
-            "ServerAliveCountMax=2",
-            "--",
-            host,
-        ]);
+        let mut command = crate::placement::ssh(host);
         command.arg(format!("sh -c {}", quote(script)));
         command
     } else {
@@ -120,11 +116,14 @@ pub fn idle(placements: &[Placement; 3]) -> Result<Value> {
 /// Install the native worker and optional Iggy binary on remote placements.
 pub fn deploy(placements: &[Placement; 3], native: &Path, iggy: bool) -> Result<()> {
     let helper = super::build_target(&super::root()).join("release/ozzy_host");
-    for p in placements.iter().filter(|p| p.remote.is_some()) {
+    for p in placements {
+        let Some((_, executable)) = &p.remote else {
+            continue;
+        };
         let root = remote_root(p)?;
         run(p, &format!("mkdir -p {}", quote(&root.to_string_lossy())))?;
         let mut files = vec![
-            (native.to_path_buf(), p.remote.as_ref().unwrap().1.clone()),
+            (native.to_path_buf(), executable.clone()),
             (helper.clone(), root.join("ozzy_host")),
         ];
         if iggy {
@@ -173,8 +172,14 @@ pub struct Audit {
     finished: bool,
 }
 impl Audit {
-    /// Start remote isolation monitors and retain their evidence under the artifact directory.
-    pub fn start(p: &Placement, implementation: &str, artifacts: &Path) -> Result<Self> {
+    /// Start remote isolation monitors and retain their evidence under the
+    /// artifact directory. The monitor fails once the run outlives `lifetime`.
+    pub fn start(
+        p: &Placement,
+        implementation: &str,
+        artifacts: &Path,
+        lifetime: Duration,
+    ) -> Result<Self> {
         let directory = p
             .storage_dir
             .as_ref()
@@ -183,10 +188,11 @@ impl Audit {
         let output = artifacts.join("remote-audit.json");
         let log = artifacts.join("remote-audit.stderr");
         let script = format!(
-            "exec taskset -c 5 {} watch --implementation {} --directory {}",
+            "exec taskset -c {AUDIT_CPU} {} watch --implementation {} --directory {} --deadline-secs {}",
             quote(&remote_root(p)?.join("ozzy_host").to_string_lossy()),
             quote(implementation),
-            quote(&directory.to_string_lossy())
+            quote(&directory.to_string_lossy()),
+            lifetime.as_secs()
         );
         let child = command(p, &script)
             .stdin(Stdio::null())
@@ -201,7 +207,7 @@ impl Audit {
             output,
             finished: false,
         };
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + CONTROL_STEP;
         loop {
             audit.check()?;
             if run(
@@ -217,7 +223,7 @@ impl Audit {
             if Instant::now() >= deadline {
                 return Err("remote audit readiness expired".into());
             }
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(AUDIT_POLL);
         }
         Ok(audit)
     }
@@ -242,7 +248,7 @@ impl Audit {
                 quote(&self.directory.join("stop").to_string_lossy())
             ),
         )?;
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + EXIT_GRACE;
         loop {
             if let Some(status) = self.child.try_wait()? {
                 if !status.success() {
@@ -253,7 +259,7 @@ impl Audit {
             if Instant::now() >= deadline {
                 return Err("remote audit stop expired".into());
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(AUDIT_POLL);
         }
         if fs::metadata(&self.log)?.len() != 0 {
             return Err("remote audit diagnostics".into());

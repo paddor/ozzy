@@ -1,10 +1,10 @@
 //! Native fixed-rate admission. Confirmations are observed even with a sparse
 //! window; cancellation never discards an admitted confirmation or a pending send.
 
-use super::super::pacing::{self, Plan};
+use super::super::pacing::{self, Arrivals, Plan};
 use super::{
-    Config, Counts, GroupId, PendingRecord, ReceiptCheck, RecordInput, Result, VecDeque, Window,
-    Writer, metrics, record_input, turn_records, validate_receipt,
+    Config, LaneRun, PendingRecord, RecordInput, Result, VecDeque, Window, Writer, error, metrics,
+    turn_records,
 };
 
 struct Pending {
@@ -14,107 +14,153 @@ struct Pending {
     due: u64,
 }
 
+/// One lane's arrivals and, for redundant feeds, the earliest copy's plan.
+struct Schedule {
+    arrivals: Arrivals,
+    /// The earliest redundant copy's plan, which fixes every copy's event clock.
+    canonical: Option<Plan>,
+}
+
+impl Schedule {
+    fn new(config: &Config, window: Window, lane: usize) -> Result<Self> {
+        let plan = Plan::new(config, window, lane)?
+            .ok_or_else(|| error("paced writer lane has no schedule"))?;
+        let canonical = config
+            .args
+            .native
+            .feeds
+            .enabled()
+            .then(|| {
+                Plan::new(
+                    config,
+                    window,
+                    config.args.native.feeds.primary(config.logical_lane(lane)),
+                )
+            })
+            .transpose()?
+            .flatten();
+        Ok(Self {
+            arrivals: Arrivals::new(&plan),
+            canonical,
+        })
+    }
+}
+
 pub(super) async fn produce(
     writer: &mut Writer,
-    config: &Config,
-    group: GroupId,
-    lane: usize,
+    run: &mut LaneRun<'_>,
     window: Window,
-    counts: &mut Counts,
-    sequence: &mut u64,
-) -> Result<ReceiptCheck> {
-    let plan = Plan::new(config, window, lane)?.expect("scheduled workload");
+) -> Result<()> {
+    let config = run.lane.config;
+    let mut schedule = Schedule::new(config, window, run.lane.index)?;
     let mut timer = pacing::Timer::new()?;
-    counts.enable_schedule(plan.bounds());
-    let mut check = writer.receipt_check();
+    run.counts
+        .enable_schedule(schedule.arrivals.plan().bounds());
     let mut pending = VecDeque::with_capacity(config.args.request_records);
     let mut scratch = Vec::with_capacity(RecordInput::INLINE_BYTES);
     let turn_records = turn_records(config);
-    // An overloaded ramp lowers the limit to the arrivals of earlier stages.
-    let mut limit = plan.total();
-    while *sequence < limit {
-        let due = plan.due(*sequence)?;
+    while !schedule.arrivals.exhausted(run.sequence) {
+        let due = schedule.arrivals.plan().due(run.sequence)?;
         let now = metrics::monotonic_ns();
-        if limit == plan.total()
-            && let Some(stage) = plan.check_backlog(*sequence, now)?
+        if schedule
+            .arrivals
+            .lower_on_backlog(&mut run.counts, run.sequence, || now)?
         {
-            counts.overload(stage);
-            limit = plan.total_before(stage)?;
             continue;
         }
         if now < due {
-            let release = timer.wait_until(due);
-            tokio::pin!(release);
-            loop {
-                tokio::select! {
-                    biased;
-                    result = observe_front(&mut pending, counts, config, group, lane, &mut check), if !pending.is_empty() => result?,
-                    result = &mut release => { result?; break; },
-                }
-            }
+            wait_until(&mut timer, due, &mut pending, run).await?;
             continue;
         }
         let start = now;
-        let input = record_input(config, group, lane, *sequence, start, &mut scratch)?;
-        counts.record_bytes(
-            input.message_id,
-            input.parts().next().expect("single-part workload"),
-        );
-        // Retain this exact send across confirmation observation. Dropping a
-        // future before admission is allowed by the SDK but loses this arrival.
-        let send = writer.send(input);
-        tokio::pin!(send);
-        let record = loop {
-            tokio::select! {
-                biased;
-                result = observe_front(&mut pending, counts, config, group, lane, &mut check), if !pending.is_empty() => result?,
-                result = &mut send => break result?,
-            }
+        // All redundant occurrences contain the same original event clock and
+        // bytes, independently generated from the earliest copy's schedule.
+        let event_clock = schedule
+            .canonical
+            .map_or(Ok(start), |plan| plan.due(run.sequence))?;
+        let input = run
+            .lane
+            .logical_input(run.sequence, event_clock, &mut scratch)?;
+        let Some(body) = input.parts().next() else {
+            return Err(error("paced record has no payload part"));
         };
-        counts.submission(start, 1);
+        run.counts.record_bytes(input.message_id, body);
+        let record = admit(writer, input, &mut pending, run).await?;
+        run.counts.submission(start, 1);
         pending.push_back(Pending {
             record,
-            sequence: *sequence,
+            sequence: run.sequence,
             start,
             due,
         });
-        *sequence += 1;
-        if sequence.is_multiple_of(turn_records) {
+        run.sequence += 1;
+        if run.sequence.is_multiple_of(turn_records) {
             tokio::task::yield_now().await;
         }
-        if limit == plan.total()
-            && let Some(stage) = plan.check_backlog(*sequence, metrics::monotonic_ns())?
-        {
-            counts.overload(stage);
-            limit = plan.total_before(stage)?;
-        }
+        schedule
+            .arrivals
+            .lower_on_backlog(&mut run.counts, run.sequence, metrics::monotonic_ns)?;
     }
     while !pending.is_empty() {
-        observe_front(&mut pending, counts, config, group, lane, &mut check).await?;
+        observe_front(&mut pending, run).await?;
     }
-    Ok(check)
+    Ok(())
 }
 
-async fn observe_front(
+/// Sleep until `due`, completing confirmations that arrive meanwhile.
+async fn wait_until(
+    timer: &mut pacing::Timer,
+    due: u64,
     pending: &mut VecDeque<Pending>,
-    counts: &mut Counts,
-    config: &Config,
-    group: GroupId,
-    lane: usize,
-    check: &mut ReceiptCheck,
+    run: &mut LaneRun<'_>,
 ) -> Result<()> {
-    let first = pending.front().expect("nonempty confirmation queue");
+    let release = timer.wait_until(due);
+    tokio::pin!(release);
+    loop {
+        tokio::select! {
+            biased;
+            result = observe_front(pending, run), if !pending.is_empty() => result?,
+            result = &mut release => return result,
+        }
+    }
+}
+
+/// Send `input`, completing confirmations while admission waits. Retain this
+/// exact send across confirmation observation: dropping a future before
+/// admission is allowed by the SDK but loses this arrival.
+async fn admit(
+    writer: &mut Writer,
+    input: RecordInput,
+    pending: &mut VecDeque<Pending>,
+    run: &mut LaneRun<'_>,
+) -> Result<PendingRecord> {
+    let send = writer.send(input);
+    tokio::pin!(send);
+    loop {
+        tokio::select! {
+            biased;
+            result = observe_front(pending, run), if !pending.is_empty() => result?,
+            result = &mut send => return result,
+        }
+    }
+}
+
+async fn observe_front(pending: &mut VecDeque<Pending>, run: &mut LaneRun<'_>) -> Result<()> {
+    let Some(first) = pending.front() else {
+        return Ok(());
+    };
     let mut receipt = Some(first.record.confirmed().await);
     let finished = metrics::monotonic_ns();
     // One APPEND confirms many records together. Read the clock once and use
     // ready receipts directly, as in saturation, instead of selecting per record.
-    for _ in 0..turn_records(config) {
-        let Some(confirmed) = receipt else {
+    for _ in 0..turn_records(run.lane.config) {
+        let (Some(confirmed), Some(first)) = (receipt, pending.front()) else {
             return Ok(());
         };
-        let first = pending.front().expect("nonempty confirmation queue");
-        validate_receipt(&confirmed?, first.sequence, config, group, lane, check)?;
-        counts.scheduled_complete(first.due, first.start, finished)?;
+        run.lane
+            .validate_receipt(&confirmed?, first.sequence, &mut run.check)?;
+        run.counts
+            .scheduled_complete(first.due, first.start, finished)?;
         pending.pop_front();
         receipt = pending
             .front()

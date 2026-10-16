@@ -5,7 +5,10 @@ use rustix::event::{EventfdFlags, PollFd, PollFlags, eventfd, poll};
 use std::{
     io,
     os::fd::OwnedFd,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Wake, Waker},
 };
 
@@ -13,8 +16,13 @@ pub(crate) struct Driver {
     pub(crate) depth: usize,
 }
 
+/// Wakers run on submitting threads and cannot fail. A failed eventfd write
+/// is recorded here; the worker observes it on its next turn and stops.
 #[derive(Debug)]
-struct Signal(OwnedFd);
+struct Signal {
+    fd: OwnedFd,
+    failed: AtomicBool,
+}
 
 impl Wake for Signal {
     fn wake(self: Arc<Self>) {
@@ -22,12 +30,15 @@ impl Wake for Signal {
     }
     fn wake_by_ref(self: &Arc<Self>) {
         loop {
-            match rustix::io::write(&self.0, &1_u64.to_ne_bytes()) {
+            match rustix::io::write(&self.fd, &1_u64.to_ne_bytes()) {
                 Err(rustix::io::Errno::INTR) => {}
                 // EAGAIN means the counter is already readable. The descriptor
                 // remains owned through this call and cannot be concurrently closed.
                 Ok(_) | Err(rustix::io::Errno::AGAIN) => return,
-                Err(error) => panic!("AIO worker wake failed: {error}"),
+                Err(_) => {
+                    self.failed.store(true, Ordering::Release);
+                    return;
+                }
             }
         }
     }
@@ -36,7 +47,7 @@ impl Wake for Signal {
 impl Signal {
     fn clear(&self) -> io::Result<()> {
         loop {
-            match rustix::io::read(&self.0, &mut [0_u8; 8]) {
+            match rustix::io::read(&self.fd, &mut [0_u8; 8]) {
                 Err(rustix::io::Errno::INTR) => {}
                 Ok(_) | Err(rustix::io::Errno::AGAIN) => return Ok(()),
                 Err(error) => return Err(error.into()),
@@ -47,10 +58,10 @@ impl Signal {
 
 impl Worker for Driver {
     fn run(self: Box<Self>, queue: &mut Queue) -> io::Result<()> {
-        let signal = Arc::new(Signal(eventfd(
-            0,
-            EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK,
-        )?));
+        let signal = Arc::new(Signal {
+            fd: eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)?,
+            failed: AtomicBool::new(false),
+        });
         let waker = Waker::from(signal.clone());
         let mut context = AioContext::<Write, OwnedFile>::new(self.depth + 1)?;
         let mut data = 0;
@@ -60,6 +71,9 @@ impl Worker for Driver {
             // is covered by the subsequent state inspection. Never clear a
             // wake after registration: it may have consumed that registration.
             signal.clear()?;
+            if signal.failed.load(Ordering::Acquire) {
+                return Err(io::Error::other("AIO worker wake failed"));
+            }
             queue.register(&waker);
             context.reap(|write, buffer, result| {
                 match write.class() {
@@ -99,23 +113,29 @@ impl Worker for Driver {
             if queue.drained() {
                 return Ok(());
             }
-            let mut descriptors = [
-                PollFd::new(&signal.0, PollFlags::IN),
-                PollFd::new(&context, PollFlags::IN),
-            ];
-            loop {
-                match poll(&mut descriptors, None) {
-                    Err(rustix::io::Errno::INTR) => {}
-                    Ok(_) => break,
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            if descriptors.iter().any(|fd| {
-                fd.revents()
-                    .intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL)
-            }) {
-                return Err(io::Error::other("AIO worker readiness failed"));
-            }
+            wait(&signal, &context)?;
         }
     }
+}
+
+/// Block until a wake or a kernel completion is ready.
+fn wait(signal: &Signal, context: &AioContext<Write, OwnedFile>) -> io::Result<()> {
+    let mut descriptors = [
+        PollFd::new(&signal.fd, PollFlags::IN),
+        PollFd::new(context, PollFlags::IN),
+    ];
+    loop {
+        match poll(&mut descriptors, None) {
+            Err(rustix::io::Errno::INTR) => {}
+            Ok(_) => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if descriptors.iter().any(|fd| {
+        fd.revents()
+            .intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL)
+    }) {
+        return Err(io::Error::other("AIO worker readiness failed"));
+    }
+    Ok(())
 }

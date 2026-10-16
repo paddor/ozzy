@@ -1,32 +1,71 @@
 use super::{DirectoryError, Journal, evidence, position_before};
 use crate::directory::{position_regresses, validate_metadata_successor_fields};
-use crate::{CurrentReference, Manifest};
+use crate::{CurrentReference, Manifest, MetadataLimits, async_metadata};
+
+/// The next manifest generation, a child of `manifest`.
+pub(super) fn successor(manifest: &Manifest) -> Result<Manifest, DirectoryError> {
+    let mut next = manifest.clone();
+    next.generation = next
+        .generation
+        .checked_add(1)
+        .ok_or(DirectoryError::ManifestGeneration)?;
+    next.parent_generation = manifest.generation;
+    Ok(next)
+}
+
+/// Publish `next` after `previous`, then select it as CURRENT. Returns the
+/// published manifest and the reference selecting it.
+pub(super) async fn publish_selected(
+    directory: &mut async_metadata::Directory,
+    previous: &Manifest,
+    next: Manifest,
+    limits: MetadataLimits,
+) -> Result<(Manifest, CurrentReference), DirectoryError> {
+    let (manifest, manifest_digest) = directory.publish_manifest(previous, next, limits).await?;
+    let current = CurrentReference {
+        group_id: manifest.identity.group_id,
+        store_id: manifest.identity.store_id,
+        generation: manifest.generation,
+        manifest_digest,
+    };
+    directory.select_current(current).await?;
+    Ok((manifest, current))
+}
+
+/// CURRENT and its selected manifest on disk must still be exactly
+/// `current` and `manifest`.
+pub(super) async fn require_current(
+    directory: &mut async_metadata::Directory,
+    current: CurrentReference,
+    manifest: &Manifest,
+    configuration: Option<&[u8]>,
+    limits: MetadataLimits,
+) -> Result<(), DirectoryError> {
+    let selected = directory
+        .read_selected(manifest.identity, limits, configuration)
+        .await?;
+    if selected.current != current || selected.manifest != *manifest {
+        return Err(DirectoryError::CurrentMismatch);
+    }
+    Ok(())
+}
 
 impl Journal {
     pub(super) fn next_manifest(&self) -> Result<Manifest, DirectoryError> {
-        let mut next = self.manifest.clone();
-        next.generation = next
-            .generation
-            .checked_add(1)
-            .ok_or(DirectoryError::ManifestGeneration)?;
-        next.parent_generation = self.manifest.generation;
-        Ok(next)
+        successor(&self.manifest)
     }
 
     pub(super) async fn install_selected(&mut self, next: Manifest) -> Result<(), DirectoryError> {
         self.interrupted = true;
         super::opening::validate_headers(&self.access, self.root(), &next, self.limits).await?;
-        let (next, digest) = self
-            .directory
-            .publish_manifest(&self.manifest, next, self.limits.metadata)
-            .await?;
-        let current = CurrentReference {
-            group_id: next.identity.group_id,
-            store_id: next.identity.store_id,
-            generation: next.generation,
-            manifest_digest: digest,
-        };
-        self.directory.select_current(current).await?;
+        let (next, current) = publish_selected(
+            &mut self.directory,
+            &self.manifest,
+            next,
+            self.limits.metadata,
+        )
+        .await?;
+        self.access.retain_read_handles(&next.segments);
         self.manifest = next;
         self.current = current;
         self.interrupted = false;
@@ -103,7 +142,12 @@ impl Journal {
         // The writer already validated and synchronized this exact boundary.
         // Publishing its metadata is not another whole-history scrub. Cold
         // positions still require the physical lineage validation below.
-        if positions.iter().all(|position| *position == durable) {
+        // The selected committed position was validated when its manifest
+        // was installed, and no later change truncates a committed prefix.
+        if positions
+            .iter()
+            .all(|position| *position == durable || *position == self.manifest.committed)
+        {
             return Ok(());
         }
         if let Some(position) = positions

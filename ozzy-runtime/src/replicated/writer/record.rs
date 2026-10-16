@@ -51,6 +51,19 @@ impl InlineBody {
     pub(super) fn as_slice(&self) -> &[u8] {
         &self.bytes[..usize::from(self.len)]
     }
+    /// Concatenate parts totalling `bytes`, at most `INLINE_BYTES`.
+    fn concat(parts: &[Bytes], bytes: usize) -> Self {
+        debug_assert!(bytes <= RecordInput::INLINE_BYTES);
+        let mut body = Self::empty();
+        let mut offset = 0;
+        for part in parts {
+            body.bytes[offset..offset + part.len()].copy_from_slice(part);
+            offset += part.len();
+        }
+        debug_assert_eq!(offset, bytes);
+        body.len = bytes as u8;
+        body
+    }
 }
 
 impl RecordInput {
@@ -101,8 +114,10 @@ impl RecordInput {
     /// admission; a single empty part is a valid record and still uses capacity.
     pub fn multipart(message_id: MessageId, parts: impl IntoIterator<Item = Bytes>) -> Self {
         let mut parts: SmallVec<[Bytes; 2]> = parts.into_iter().collect();
-        if parts.len() == 1 {
-            return Self::single(message_id, parts.pop().expect("one part"));
+        if parts.len() == 1
+            && let Some(part) = parts.pop()
+        {
+            return Self::single(message_id, part);
         }
         Self {
             message_id,
@@ -143,82 +158,34 @@ impl RecordInput {
         Some(std::mem::replace(body, InlineBody::empty()))
     }
 
+    /// Move the `bytes`-long payload out, leaving an empty body. Called only
+    /// after validation and successful capacity admission. Dropping
+    /// caller-owned parts here can return other slots to this writer;
+    /// admission holds no shared lock while running these destructors.
     pub(super) fn take_payload(&mut self, bytes: usize) -> omq_tokio::message::Payload {
         use omq_tokio::message::Payload;
-        if matches!(self.body, InputBody::Packed(_)) {
-            let InputBody::Packed(payload) =
-                std::mem::replace(&mut self.body, InputBody::Packed(Payload::new()))
-            else {
-                unreachable!()
-            };
-            return payload;
-        }
-        if let InputBody::Inline(body) = &mut self.body {
-            let payload = Payload::from_slice(body.as_slice());
-            body.len = 0;
-            return payload;
-        }
-        if matches!(self.body, InputBody::Shared(_)) {
-            let InputBody::Shared(body) =
-                std::mem::replace(&mut self.body, InputBody::Inline(InlineBody::empty()))
-            else {
-                unreachable!()
-            };
-            return Payload::from_bytes(body);
-        }
-        if bytes <= Self::INLINE_BYTES {
-            let mut body = InlineBody::empty();
-            self.take_inline_into(&mut body, bytes);
-            Payload::from_slice(body.as_slice())
-        } else {
-            Payload::from_bytes(Bytes::from(self.take_heap_payload(bytes)))
-        }
-    }
-
-    /// Copy tiny parts into the admission entry's inline body. Never retain a
-    /// large caller-owned backing allocation for a small slice.
-    pub(super) fn take_inline_into(&mut self, output: &mut InlineBody, bytes: usize) {
-        debug_assert!(bytes <= Self::INLINE_BYTES);
-        let mut offset = 0;
-        for part in self.parts() {
-            output.bytes[offset..offset + part.len()].copy_from_slice(part);
-            offset += part.len();
-        }
-        debug_assert_eq!(offset, bytes);
-        output.len = bytes as u8;
-        // Dropping caller-owned parts can return other slots to this writer.
-        // Admission holds no shared lock while running these destructors.
-        match &mut self.body {
-            InputBody::Inline(body) => body.len = 0,
-            InputBody::Multipart(parts) => parts.clear(),
-            InputBody::Packed(_) | InputBody::Shared(_) => {
-                unreachable!("packed and shared inputs move directly into payloads")
-            }
-            InputBody::Single(_) => unreachable!("small single inputs are inline"),
-        }
-    }
-
-    // Called only after validation and successful capacity admission. Shared or
-    // custom-backed large slices are copied; unique large storage is reused and
-    // trimmed so a small slice cannot retain an unbounded backing allocation.
-    pub(super) fn take_heap_payload(&mut self, bytes: usize) -> Vec<u8> {
-        debug_assert!(bytes > Self::INLINE_BYTES);
         match std::mem::replace(&mut self.body, InputBody::Inline(InlineBody::empty())) {
-            InputBody::Inline(_) => unreachable!("large input cannot be inline"),
+            InputBody::Packed(payload) => payload,
+            InputBody::Inline(body) => Payload::from_slice(body.as_slice()),
+            InputBody::Shared(body) => Payload::from_bytes(body),
+            // Single inputs are larger than inline. Shared or custom-backed
+            // slices are copied; unique storage is reused and trimmed so a
+            // small slice cannot retain an unbounded backing allocation.
             InputBody::Single(body) => {
                 let mut bytes = Vec::from(body);
                 bytes.shrink_to_fit();
-                bytes
+                Payload::from_bytes(Bytes::from(bytes))
+            }
+            // Never retain a large caller-owned backing for tiny parts.
+            InputBody::Multipart(parts) if bytes <= Self::INLINE_BYTES => {
+                Payload::from_slice(InlineBody::concat(&parts, bytes).as_slice())
             }
             InputBody::Multipart(parts) => {
                 let mut body = Vec::with_capacity(bytes);
-                for part in parts {
-                    body.extend_from_slice(&part);
+                for part in &parts {
+                    body.extend_from_slice(part);
                 }
-                body
-            }
-            InputBody::Packed(_) | InputBody::Shared(_) => {
-                unreachable!("packed and shared inputs move directly into payloads")
+                Payload::from_bytes(Bytes::from(body))
             }
         }
     }
@@ -297,18 +264,8 @@ mod tests {
                 );
                 let expected: Vec<u8> = input.parts().flatten().copied().collect();
                 assert_eq!(input.parts().len(), count);
-                if count == 1 && expected.len() <= omq_tokio::message::MAX_INLINE_PAYLOAD {
-                    // One tiny part is already a transport payload.
-                    assert_eq!(input.take_payload(expected.len()).as_slice(), expected);
-                    assert_eq!(input.parts().flatten().count(), 0);
-                } else if expected.len() <= RecordInput::INLINE_BYTES {
-                    let mut slot = InlineBody::from_slice(&[255; RecordInput::INLINE_BYTES]);
-                    input.take_inline_into(&mut slot, expected.len());
-                    assert_eq!(slot.as_slice(), expected);
-                    assert_eq!(input.parts().flatten().count(), 0);
-                } else {
-                    assert_eq!(input.take_heap_payload(expected.len()), expected);
-                }
+                assert_eq!(input.take_payload(expected.len()).as_slice(), expected);
+                assert_eq!(input.parts().flatten().count(), 0);
             }
         }
     }

@@ -1,6 +1,8 @@
 //! Nonvoting recovery on a shared shard, including owned retry and handoff.
 
-use super::{ActorError, ActorStatus, Outcome, RecoveryActor, RecoveryStorage, Transition};
+use super::{
+    ActorError, ActorStatus, Outcome, RecoveryActor, RecoveryStorage, SharedStatus, Transition,
+};
 use crate::replica_actor::HistoryReason;
 use crate::{
     replica_actor::{ScheduleError, ScheduledReplica},
@@ -34,7 +36,7 @@ pub struct ScheduledRecovery<J: RecoveryStorage = ShardRecoveringJournal> {
     configuration: Configuration,
     local: NodeId,
     sessions: [LinkSessionId; 3],
-    status: tokio::sync::watch::Receiver<ActorStatus>,
+    status: SharedStatus,
     owner: Option<crate::memory::Owner>,
     now: Duration,
     origin: Option<Duration>,
@@ -45,7 +47,7 @@ impl<J: RecoveryStorage> std::fmt::Debug for ScheduledRecovery<J> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ScheduledRecovery")
             .field("configuration", &self.configuration)
-            .field("status", &*self.status.borrow())
+            .field("status", &self.status.get())
             .field("active", &self.active)
             .finish_non_exhaustive()
     }
@@ -59,7 +61,7 @@ impl<J: RecoveryStorage + 'static> ScheduledRecovery<J> {
             configuration: actor.configuration,
             local: actor.local,
             sessions: actor.config.sessions,
-            status: actor.subscribe(),
+            status: actor.status.clone(),
             phase: Phase::Active(Box::new(actor)),
             owner: None,
             now: Duration::ZERO,
@@ -84,7 +86,7 @@ impl<J: RecoveryStorage + 'static> ScheduledRecovery<J> {
 
     /// Current observation stays nonvoting throughout transfer and publication.
     pub fn status(&self) -> ActorStatus {
-        *self.status.borrow()
+        self.status.get()
     }
 
     /// Whether a controlled schedule can interrupt owned close/reopen/handoff.
@@ -95,7 +97,7 @@ impl<J: RecoveryStorage + 'static> ScheduledRecovery<J> {
     }
 
     pub(in crate::replica_actor) fn native_identity(&self) -> (NodeId, ozzy_proto::append::Policy) {
-        (self.local, self.configuration.append_policy())
+        (self.local, ozzy_proto::append::Policy::QuorumDurable)
     }
 
     pub(in crate::replica_actor) fn authority_hint(&self) -> ozzy_proto::nack::AuthorityHint {
@@ -272,7 +274,7 @@ impl<J: RecoveryStorage + 'static> ScheduledRecovery<J> {
     ) -> Result<bool, ActorError> {
         let relative = now.saturating_sub(self.origin.unwrap_or(now));
         let Phase::Active(actor) = &mut self.phase else {
-            unreachable!("active phase");
+            return Ok(false);
         };
         let mut outcome = actor.advance(relative)?;
         let mut changed = false;
@@ -282,30 +284,26 @@ impl<J: RecoveryStorage + 'static> ScheduledRecovery<J> {
             outcome = result?;
             changed = true;
         }
-        if outcome.is_none() {
+        let Some(outcome) = outcome else {
             changed |= actor
                 .outbox
                 .flush_with(|message| try_send(cx, message))?
                 .advanced();
             actor.publish(true);
             return Ok(changed);
-        }
-        actor.publish(true);
-        let Phase::Active(actor) = std::mem::replace(&mut self.phase, Phase::Stopped) else {
-            unreachable!("active phase");
         };
-        self.phase = Phase::Changing(
-            actor
-                .transition(outcome.expect("lifecycle outcome"))
-                .boxed_local(),
-        );
+        actor.publish(true);
+        self.phase = match std::mem::replace(&mut self.phase, Phase::Stopped) {
+            Phase::Active(actor) => Phase::Changing(actor.transition(outcome).boxed_local()),
+            phase => phase,
+        };
         cx.waker().wake_by_ref();
         Ok(true)
     }
 
     fn poll_transition(&mut self, cx: &mut Context<'_>, now: Duration) -> Result<bool, ActorError> {
         let Phase::Changing(future) = &mut self.phase else {
-            unreachable!("changing phase");
+            return Ok(false);
         };
         let Poll::Ready(result) = future.as_mut().poll(cx) else {
             return Ok(false);
@@ -359,13 +357,13 @@ impl<J: RecoveryStorage + 'static> ScheduledRecovery<J> {
     /// Take the fully published, election-fenced actor exactly once. Install its
     /// native services before its first normal scheduling turn.
     pub fn take_ready(&mut self) -> Option<ScheduledReplica> {
-        if !matches!(self.phase, Phase::Ready(_)) {
-            return None;
+        match std::mem::replace(&mut self.phase, Phase::Stopped) {
+            Phase::Ready(actor) => Some(actor),
+            phase => {
+                self.phase = phase;
+                None
+            }
         }
-        let Phase::Ready(actor) = std::mem::replace(&mut self.phase, Phase::Stopped) else {
-            unreachable!("ready phase");
-        };
-        Some(actor)
     }
 
     /// Settle admitted I/O, including a canceled transition observation.
@@ -454,12 +452,7 @@ fn poll_work<J: RecoveryStorage>(
             return Poll::Ready(result.and_then(|completed| actor.complete(completed, now)));
         }
     }
-    if let Poll::Ready(error) = actor
-        .journal
-        .as_mut()
-        .expect("recovery owner")
-        .poll_stopped(cx)
-    {
+    if let Poll::Ready(error) = actor.journal.poll_stopped(cx) {
         return Poll::Ready(Err(ActorError::Journal(error)));
     }
     Poll::Pending
@@ -469,6 +462,24 @@ fn schedule_actor(error: ScheduleError) -> ActorError {
     match error {
         ScheduleError::Actor(error) => error,
         _ => ActorError::StartupMismatch,
+    }
+}
+
+impl<J: RecoveryStorage> ScheduledRecovery<J> {
+    /// The active attempt's timers, or the succeeding replica's. A transition
+    /// in flight wakes through its own future. An attempt counts time from
+    /// its origin.
+    pub(in crate::replica_actor) fn next_deadline(&self, now: Duration) -> Option<Duration> {
+        match &self.phase {
+            Phase::Active(actor) => {
+                let origin = self.origin.unwrap_or(now);
+                actor
+                    .next_deadline(now.saturating_sub(origin))
+                    .map(|deadline| deadline.saturating_add(origin))
+            }
+            Phase::Ready(replica) => replica.next_deadline(now),
+            Phase::Changing(_) | Phase::Stopped => None,
+        }
     }
 }
 
@@ -485,11 +496,12 @@ impl ScheduledRecovery<ShardRecoveringJournal> {
             ..
         } = normal.into_actor();
         let sessions = config.sessions;
-        let observation = status.subscribe();
-        status.send_modify(|state| {
-            state.normal = None;
-            state.application_ready = false;
-            state.disk_pending = true;
+        let observation = status.clone();
+        status.set(ActorStatus {
+            normal: None,
+            application_ready: false,
+            disk_pending: true,
+            ..status.get()
         });
         let future = async move {
             let generations = crate::replica_journal::OwnedRecoveryGenerations {

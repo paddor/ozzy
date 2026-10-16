@@ -5,6 +5,7 @@ use bytes::Bytes;
 use futures::{StreamExt, stream::FuturesUnordered};
 use omq_tokio::{Endpoint, IdentitySocket, Message, Socket, SocketType, TrySendError};
 use ozzy_proto::{GroupId, NodeId, Opcode};
+use ozzy_runtime::transport::Frames;
 use std::{collections::BTreeMap, future::Future, pin::Pin};
 
 type PublicationWait =
@@ -72,7 +73,6 @@ pub(super) struct Followers {
 impl Followers {
     pub(super) async fn open(
         frontend: &FrontendContext,
-        _brokers: &BTreeMap<NodeId, Endpoint>,
         routes: FollowerRoutes,
     ) -> Result<Self, StartupError> {
         let mut transport = Self {
@@ -80,12 +80,7 @@ impl Followers {
             subscribers: BTreeMap::new(),
             routes,
         };
-        let options = ozzy_runtime::transport::socket_options()
-            .router_mandatory(true)
-            .send_hwm(frontend.limits.send_messages)
-            .recv_hwm(frontend.limits.receive_messages)
-            .max_message_size(frontend.limits.message_bytes)
-            .linger(frontend.limits.close_linger);
+        let options = frontend.limits.peer();
         let result = async {
             for (&(broker, _), &shard) in &transport.routes.destinations {
                 if transport.repair.contains_key(&(broker, shard)) {
@@ -116,8 +111,11 @@ impl Followers {
                     )
                     .await?;
             }
+            let publications = frontend.limits.publications(&options);
             for (&broker, endpoint) in &transport.routes.publications {
-                let socket = frontend.context.socket(SocketType::Sub, options.clone());
+                let socket = frontend
+                    .context
+                    .socket(SocketType::Sub, publications.clone());
                 transport.subscribers.insert(broker, socket.clone());
                 socket.subscribe(Bytes::new()).await?;
                 socket.connect(endpoint.clone()).await?;
@@ -133,11 +131,7 @@ impl Followers {
     }
 
     fn destination(&self, message: &Message) -> Option<(NodeId, u32)> {
-        if message.len() != 4 {
-            return None;
-        }
-        let frames =
-            std::array::from_fn::<_, 3, _>(|i| message.part_slice(i + 1).expect("four frames"));
+        let (_, frames) = message.routed_packet()?;
         let packet = ozzy_proto::decode_packet(
             &frames,
             ozzy_proto::EnvelopeLimits {

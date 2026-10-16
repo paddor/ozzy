@@ -39,7 +39,7 @@ fn retention_scratch_depends_on_group_limits_instead_of_segment_capacity() {
 }
 
 #[test]
-fn retention_checks_all_groups_and_zero_tail_after_canceled_reads() {
+fn retention_checks_all_groups_after_canceled_reads_and_ignores_the_tail() {
     let (mut controller, journal) = empty_journal();
     let journal = sealed(&mut controller, journal, BodyEncoding::Raw);
     let before = journal.current;
@@ -85,9 +85,28 @@ fn retention_checks_all_groups_and_zero_tail_after_canceled_reads() {
         ),
     )
     .unwrap();
+    // Bytes past the sealed end are unused capacity, as after reuse.
     drive(
         &mut controller,
         journal.access.write_all(&handle, 32767, &[1]),
+    )
+    .unwrap();
+    drive(
+        &mut controller,
+        journal.retention_segment(1, indexes::partition()),
+    )
+    .unwrap();
+    // Damage inside the sealed bytes still fails the scan.
+    let body = crate::SEGMENT_HEADER_BYTES as u64 + crate::ENTRY_HEADER_BYTES as u64;
+    let mut byte = drive(
+        &mut controller,
+        journal.access.read_range(&handle, body, 1, 1),
+    )
+    .unwrap();
+    byte[0] ^= 1;
+    drive(
+        &mut controller,
+        journal.access.write_all(&handle, body, &byte),
     )
     .unwrap();
     assert!(
@@ -199,4 +218,36 @@ async fn sparse_gib_segment_scans_under_a_group_sized_reservation() {
     assert_eq!(summary.last_operation, 1);
     drop(journal);
     pool.shutdown().await;
+}
+
+#[test]
+fn retirement_respects_the_through_position_and_the_proof_operation_floor() {
+    // Segment 1 holds operation 1, segment 2 operation 2, and 3 is active.
+    let image = super::retained_baseline();
+    let cases: [(Option<u64>, bool, &[u64]); 5] = [
+        (None, true, &[1, 2]),
+        (None, false, &[1]),
+        (Some(3), true, &[1, 2]),
+        (Some(2), true, &[1]),
+        (Some(1), true, &[]),
+    ];
+    for (floor, committed, retired) in cases {
+        let (mut controller, io) = setup(image.clone());
+        let journal = drive(&mut controller, open(io, 3)).unwrap();
+        let mut floors = crate::RetentionFloors::new(vec![]).unwrap();
+        if let Some(floor) = floor {
+            floors = floors.with_protected_operation(floor);
+        }
+        let through = if committed {
+            journal.committed_position().unwrap()
+        } else {
+            position_before(journal.manifest.segments[1].first_chain).unwrap()
+        };
+        let scan = journal
+            .prepare_retirement_scan(floors, through, super::budget(), &[])
+            .unwrap();
+        let prefix = drive(&mut controller, scan.scan()).unwrap();
+        let ids: Vec<_> = prefix.references().iter().map(|r| r.segment_id).collect();
+        assert_eq!(ids, retired, "floor {floor:?}, committed {committed}");
+    }
 }

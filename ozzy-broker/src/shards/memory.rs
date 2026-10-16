@@ -83,7 +83,14 @@ impl Domains {
             })
         };
         Ok(Plan {
-            domain: self.0[&shard.affinity.numa_node].clone(),
+            domain: self
+                .0
+                .get(&shard.affinity.numa_node)
+                .cloned()
+                .ok_or_else(|| StartupError::Shard {
+                    shard: shard.id,
+                    reason: "unplanned memory domain".into(),
+                })?,
             data: limits(shard.budget.resident_bytes, shard.budget.append_slots)?,
             control: limits(shard.budget.control_bytes, shard.budget.control_slots)?,
             follower_progress,

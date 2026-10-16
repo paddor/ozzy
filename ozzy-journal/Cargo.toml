@@ -15,12 +15,16 @@ categories = ["database-implementations"]
 include.workspace = true
 
 [dependencies]
+blake3.workspace = true
 xxhash-rust.workspace = true
 bytes.workspace = true
 lz4rip.workspace = true
 smallvec.workspace = true
 ozzy-proto.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+ozzy-test-alloc.workspace = true
 
 [lints]
 workspace = true

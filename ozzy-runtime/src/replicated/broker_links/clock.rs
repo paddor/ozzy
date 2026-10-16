@@ -14,7 +14,13 @@ use tokio::runtime::Handle;
 #[derive(Clone, Debug)]
 pub struct SdkClock {
     state: Arc<State>,
-    owner: Option<Handle>,
+}
+
+/// An SDK clock whose real-time timers belong to the SDK owner thread.
+#[derive(Clone, Debug)]
+pub(in crate::replicated) struct OwnerClock {
+    clock: SdkClock,
+    owner: Handle,
 }
 
 #[derive(Debug)]
@@ -45,12 +51,14 @@ impl SdkClock {
                 manual_nanos: AtomicU64::new(0),
                 changed: StateSignal::default(),
             }),
-            owner: None,
         }
     }
 
-    pub(super) fn bind_owner(&mut self, owner: Handle) {
-        self.owner = Some(owner);
+    pub(super) fn bind(&self, owner: Handle) -> OwnerClock {
+        OwnerClock {
+            clock: self.clone(),
+            owner,
+        }
     }
 
     /// Start deterministic observations at zero. All clones share advancement.
@@ -90,25 +98,48 @@ impl SdkClock {
         }
         Ok(())
     }
+}
 
-    pub(in crate::replicated) async fn until(&self, deadline: Duration) {
+impl SdkClock {
+    /// Wait until this clock reaches `deadline`. A manual clock wakes when it
+    /// is advanced past it; a real one sleeps on the current Tokio runtime.
+    pub async fn until(&self, deadline: Duration) {
         if self.state.manual {
             self.state
                 .changed
                 .wait_for(|| (self.now() >= deadline).then_some(()))
                 .await;
         } else {
+            tokio::time::sleep(deadline.saturating_sub(self.now())).await;
+        }
+    }
+}
+
+impl OwnerClock {
+    /// Monotonic time since the underlying SDK clock started.
+    pub(in crate::replicated) fn now(&self) -> Duration {
+        self.clock.now()
+    }
+
+    pub(in crate::replicated) async fn until(&self, deadline: Duration) {
+        if self.clock.state.manual {
+            self.clock.until(deadline).await;
+        } else {
             let sleep = {
                 // Callers can poll on any executor. Only timer construction
                 // enters the SDK owner; its guard must end before suspension.
-                let _owner = self
-                    .owner
-                    .as_ref()
-                    .expect("SDK clock owner missing")
-                    .enter();
+                let _owner = self.owner.enter();
                 tokio::time::sleep(deadline.saturating_sub(self.now()))
             };
             sleep.await;
+        }
+    }
+
+    /// [`Self::until`] `deadline`, or never without one.
+    pub(in crate::replicated) async fn until_due(&self, deadline: Option<Duration>) {
+        match deadline {
+            Some(deadline) => self.until(deadline).await,
+            None => std::future::pending().await,
         }
     }
 }
@@ -119,16 +150,17 @@ mod tests {
 
     #[tokio::test]
     async fn manual_deadline_survives_cancellation_and_wakes_after_advancement() {
-        let clock = SdkClock::manual();
+        let manual = SdkClock::manual();
+        let clock = manual.bind(Handle::current());
         let mut first = Box::pin(clock.until(Duration::from_secs(2)));
         assert!(futures::poll!(first.as_mut()).is_pending());
-        clock.advance(Duration::from_secs(1)).unwrap();
-        assert!(clock.advance(Duration::ZERO).is_err());
+        manual.advance(Duration::from_secs(1)).unwrap();
+        assert!(manual.advance(Duration::ZERO).is_err());
         assert_eq!(clock.now(), Duration::from_secs(1));
         drop(first);
         let mut replacement = Box::pin(clock.until(Duration::from_secs(2)));
         assert!(futures::poll!(replacement.as_mut()).is_pending());
-        clock.clone().advance(Duration::from_secs(2)).unwrap();
+        manual.clone().advance(Duration::from_secs(2)).unwrap();
         replacement.await;
         assert!(SdkClock::default().advance(Duration::ZERO).is_err());
     }

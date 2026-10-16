@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test(flavor = "current_thread")]
-async fn two_fresh_memory_voters_recover_while_an_original_donor_keeps_serving() {
+async fn two_fresh_voters_recover_while_an_original_donor_keeps_serving() {
     recover(12, [3, 7]).await;
 }
 
@@ -9,13 +9,13 @@ mod stress {
     use super::*;
 
     #[tokio::test(flavor = "current_thread")]
-    async fn two_fresh_memory_voters_recover_while_an_original_donor_keeps_serving() {
+    async fn two_fresh_voters_recover_while_an_original_donor_keeps_serving() {
         recover(180, [50, 110]).await;
     }
 }
 
 async fn recover(waves: usize, restarts: [usize; 2]) {
-    let mut cluster = MemoryCluster::new(Confirmation::ReplicatedPersisting).await;
+    let mut cluster = MemoryCluster::new(DeploymentMode::Three).await;
     let mut client = SdkClient::open_with_runtime(&cluster.configs[0].0, &cluster.runtime).await;
     let mut reader = live_many(
         &cluster.brokers,

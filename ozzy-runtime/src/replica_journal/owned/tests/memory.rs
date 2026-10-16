@@ -6,12 +6,7 @@ fn journal_arenas_share_shard_capacity_and_aliases_remain_charged() {
     let (mut controller, io) = setup();
     let (mut owner, _) = drive(
         &mut controller,
-        OwnedJournal::format_new(
-            config("/journal", 1, QuorumPolicy::Durable),
-            io,
-            JournalGeneration(1),
-            32768,
-        ),
+        OwnedJournal::format_new(config("/journal", 1), io, JournalGeneration(1), 32768),
     )
     .unwrap();
     let memory = payload_owner(64);
@@ -38,12 +33,7 @@ fn incoming_chunk_reserves_all_bodies_before_partial_staging() {
     let (mut controller, io) = setup();
     let (mut owner, _) = drive(
         &mut controller,
-        OwnedJournal::format_new(
-            config("/journal", 1, QuorumPolicy::Durable),
-            io,
-            JournalGeneration(1),
-            32768,
-        ),
+        OwnedJournal::format_new(config("/journal", 1), io, JournalGeneration(1), 32768),
     )
     .unwrap();
     let memory = payload_owner(32);
@@ -78,7 +68,7 @@ fn recovery_restart_reuses_budget_while_old_transport_bytes_remain_live() {
     let (mut owner, _) = drive(
         &mut controller,
         OwnedRecoveringJournal::start(
-            config("/replacement", 1, QuorumPolicy::Durable),
+            config("/replacement", 1),
             io,
             generations(10),
             OwnedRecoveryOpen::FormatNew {
@@ -126,7 +116,7 @@ fn journals_share_shard_payload_capacity_and_retained_replies_outlive_leases() {
         let (mut owner, _) = drive(
             &mut controller,
             OwnedJournal::format_new(
-                config(path, id, QuorumPolicy::Durable),
+                config(path, id),
                 io.clone(),
                 JournalGeneration(u128::from(id)),
                 32768,
@@ -172,12 +162,7 @@ fn memory_cannot_be_rebound_after_a_lease_escaped_even_when_returned() {
     let (mut controller, io) = setup();
     let (mut owner, _) = drive(
         &mut controller,
-        OwnedJournal::format_new(
-            config("/journal", 1, QuorumPolicy::Durable),
-            io,
-            JournalGeneration(1),
-            32768,
-        ),
+        OwnedJournal::format_new(config("/journal", 1), io, JournalGeneration(1), 32768),
     )
     .unwrap();
     drop(owner.lease_append_buffer().unwrap());

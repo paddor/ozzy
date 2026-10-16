@@ -5,7 +5,7 @@ use ozzy_replication::wire::{self, RecoveryRequest, WireLimits};
 
 #[test]
 fn recovery_donor_waits_for_outstanding_sync_and_preserves_confirmation() {
-    donor_during_sync(QuorumPolicy::Durable);
+    donor_during_sync();
 }
 
 fn finish_jobs(controller: &mut Controller, hold_sync: bool) {
@@ -23,9 +23,9 @@ fn finish_jobs(controller: &mut Controller, hold_sync: bool) {
     }
 }
 
-fn donor_during_sync(policy: QuorumPolicy) {
+fn donor_during_sync() {
     let (mut controller, io) = setup();
-    let (mut actors, mut submitter, buffer) = donor_fixture(&mut controller, &io, policy);
+    let (mut actors, mut submitter, buffer) = donor_fixture(&mut controller, &io);
     for _ in 0..10000 {
         round(&mut actors, Duration::ZERO);
         finish_jobs(&mut controller, false);
@@ -59,13 +59,12 @@ fn donor_during_sync(policy: QuorumPolicy) {
     }
     assert!(
         held_sync,
-        "the fixture must hold a real disk sync: {policy:?}, {:?}, jobs={:?}",
+        "the fixture must hold a real disk sync: {:?}, jobs={:?}",
         actors.iter().map(Actor::status).collect::<Vec<_>>(),
         controller.jobs()
     );
-    if policy == QuorumPolicy::Durable {
-        assert!(poll(pending.as_mut()).is_pending());
-    }
+    // Completed `O_DSYNC` writes confirm the proposal; the held sync only
+    // publishes durable evidence, which the donor must still wait for.
     let (request, message) = recovery_request(actors[0].status().scope);
     actors[0].receive(&message, now).unwrap();
     for _ in 0..20 {
@@ -73,7 +72,6 @@ fn donor_during_sync(policy: QuorumPolicy) {
         finish_jobs(&mut controller, true);
     }
     assert!(actors[0].status().application_ready);
-    assert!(poll(pending.as_mut()).is_pending());
     let mut confirmed = false;
     let mut replied = false;
     for _ in 0..10000 {
@@ -137,14 +135,13 @@ fn recovery_message(request: RecoveryRequest, session: LinkSessionId) -> Message
 fn donor_fixture(
     controller: &mut Controller,
     io: &Local,
-    policy: QuorumPolicy,
 ) -> (
     Vec<Actor>,
     crate::replica_actor::ProposalSubmitter,
     crate::replica_journal::ProposalBuffer,
 ) {
     let mut actors = Vec::new();
-    let mut leader = unstarted_actor(controller, io, 0, policy, 0, 64);
+    let mut leader = unstarted_actor(controller, io, 0, 0, 64);
     let submitter = leader.take_submitter().unwrap();
     let mut buffer = leader.lease_proposal_buffer().unwrap();
     buffer
@@ -153,32 +150,25 @@ fn donor_fixture(
     actors.push(ControlledReplica::new(leader));
     for broker in 1..3 {
         actors.push(ControlledReplica::new(unstarted_actor(
-            controller, io, 0, policy, broker, 64,
+            controller, io, 0, broker, 64,
         )));
     }
     (actors, submitter, buffer)
 }
 
 #[test]
-fn recovery_nonce_replacement_during_pin_disk_quorum() {
-    nonce_replacement(QuorumPolicy::Durable, true);
-}
-
-#[test]
-fn recovery_nonce_replacement_during_pin_replicated_persisting() {
-    nonce_replacement(QuorumPolicy::Replicated, true);
+fn recovery_nonce_replacement_during_pin() {
+    nonce_replacement(true);
 }
 
 #[test]
 fn recovery_same_nonce_during_pin_preserves_its_snapshot() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        nonce_replacement(policy, false);
-    }
+    nonce_replacement(false);
 }
 
-fn pending_donor(policy: QuorumPolicy) -> (Controller, Vec<Actor>, RecoveryRequest) {
+fn pending_donor() -> (Controller, Vec<Actor>, RecoveryRequest) {
     let (mut controller, io) = setup();
-    let (mut actors, pending) = cluster(&mut controller, &io, 0, policy);
+    let (mut actors, pending) = cluster(&mut controller, &io, 0);
     let mut pending = Box::pin(pending);
     let mut confirmed = false;
     for _ in 0..10000 {
@@ -242,8 +232,8 @@ fn pending_donor(policy: QuorumPolicy) -> (Controller, Vec<Actor>, RecoveryReque
     (controller, actors, request)
 }
 
-fn nonce_replacement(policy: QuorumPolicy, replace_nonce: bool) {
-    let (mut controller, mut actors, mut request) = pending_donor(policy);
+fn nonce_replacement(replace_nonce: bool) {
+    let (mut controller, mut actors, mut request) = pending_donor();
     let now = Duration::ZERO;
     if replace_nonce {
         request.nonce = RequestId::from_bytes([92; 16]);
@@ -253,7 +243,7 @@ fn nonce_replacement(policy: QuorumPolicy, replace_nonce: bool) {
     actors[0].receive(&second, now).unwrap();
     complete_pin(&mut controller, &mut actors[0], now);
     assert!(actors[0].status().application_ready);
-    assert_latest_response(&mut controller, &mut actors[0], policy, request);
+    assert_latest_response(&mut controller, &mut actors[0], request);
     // Serving another nonce requires the worker to release the previous exact
     // source. Merely swallowing the obsolete completion cannot pass this.
     request.nonce = RequestId::from_bytes([93; 16]);
@@ -261,7 +251,7 @@ fn nonce_replacement(policy: QuorumPolicy, replace_nonce: bool) {
     actors[0]
         .receive(&recovery_message(request, actor_config().sessions[2]), now)
         .unwrap();
-    assert_latest_response(&mut controller, &mut actors[0], policy, request);
+    assert_latest_response(&mut controller, &mut actors[0], request);
     for actor in actors {
         close(&mut controller, actor);
     }
@@ -283,24 +273,21 @@ fn complete_pin(controller: &mut Controller, actor: &mut Actor, now: Duration) {
 
 #[test]
 fn recovery_duplicates_before_pin_admission_use_the_latest_correlation() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        let (mut controller, mut actors, request) = pending_donor(policy);
-        complete_pin(&mut controller, &mut actors[0], Duration::ZERO);
-        assert_latest_response(&mut controller, &mut actors[0], policy, request);
-        for actor in actors {
-            close(&mut controller, actor);
-        }
+    let (mut controller, mut actors, request) = pending_donor();
+    complete_pin(&mut controller, &mut actors[0], Duration::ZERO);
+    assert_latest_response(&mut controller, &mut actors[0], request);
+    for actor in actors {
+        close(&mut controller, actor);
     }
 }
 
 fn assert_latest_response(
     controller: &mut Controller,
     actor: &mut Actor,
-    policy: QuorumPolicy,
     request: RecoveryRequest,
 ) {
     let binding = wire::PeerBinding::new(
-        config("/unused", 4, policy).configuration.configuration(),
+        config("/unused", 4).configuration.configuration(),
         NodeId::from_bytes([1; 16]),
         actor_config().sessions[2],
     )
@@ -342,62 +329,58 @@ fn assert_latest_response(
 
 #[test]
 fn recovery_pin_completion_after_view_change_releases_the_old_source() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        let (mut controller, mut actors, _) = pending_donor(policy);
-        let now = Duration::from_secs(30);
-        for _ in 0..1000 {
-            let mut messages = Vec::new();
-            for (from, actor) in actors.iter_mut().enumerate().skip(1) {
-                actor.advance(now).unwrap();
-                {
-                    let mut disk = std::pin::pin!(actor.complete_disk(now));
-                    if let Poll::Ready(result) = poll(disk.as_mut()) {
-                        result.unwrap();
-                    }
+    let (mut controller, mut actors, _) = pending_donor();
+    let now = Duration::from_secs(30);
+    for _ in 0..1000 {
+        let mut messages = Vec::new();
+        for (from, actor) in actors.iter_mut().enumerate().skip(1) {
+            actor.advance(now).unwrap();
+            {
+                let mut disk = std::pin::pin!(actor.complete_disk(now));
+                if let Poll::Ready(result) = poll(disk.as_mut()) {
+                    result.unwrap();
                 }
-                actor
-                    .flush(|message| {
-                        messages.push(replace_sender(message, from));
-                        Ok(())
-                    })
-                    .unwrap();
             }
-            for (to, message) in messages {
-                actors[to].receive(&message, now).unwrap();
-            }
-            finish_jobs(&mut controller, false);
-            if actors[0].status().scope.view > 0 {
-                break;
-            }
+            actor
+                .flush(|message| {
+                    messages.push(replace_sender(message, from));
+                    Ok(())
+                })
+                .unwrap();
         }
-        actors[0].advance(now).unwrap();
-        assert!(actors[0].status().scope.view > 0);
-        complete_pin(&mut controller, &mut actors[0], now);
-        for step in 0..20000 {
-            round(&mut actors, now + Duration::from_millis(step / 100));
-            finish_jobs(&mut controller, false);
-            if actors.iter().all(|actor| actor.status().application_ready) {
-                break;
-            }
+        for (to, message) in messages {
+            actors[to].receive(&message, now).unwrap();
         }
-        assert!(
-            actors.iter().all(|actor| actor.status().application_ready),
-            "view installation stalled: {:?}",
-            actors.iter().map(Actor::status).collect::<Vec<_>>()
-        );
-        for actor in actors {
-            close(&mut controller, actor);
+        finish_jobs(&mut controller, false);
+        if actors[0].status().scope.view > 0 {
+            break;
         }
+    }
+    actors[0].advance(now).unwrap();
+    assert!(actors[0].status().scope.view > 0);
+    complete_pin(&mut controller, &mut actors[0], now);
+    for step in 0..20000 {
+        round(&mut actors, now + Duration::from_millis(step / 100));
+        finish_jobs(&mut controller, false);
+        if actors.iter().all(|actor| actor.status().application_ready) {
+            break;
+        }
+    }
+    assert!(
+        actors.iter().all(|actor| actor.status().application_ready),
+        "view installation stalled: {:?}",
+        actors.iter().map(Actor::status).collect::<Vec<_>>()
+    );
+    for actor in actors {
+        close(&mut controller, actor);
     }
 }
 
 #[test]
 fn recovery_shutdown_with_an_unobserved_pin_drains_physical_work() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        let (mut controller, actors, _) = pending_donor(policy);
-        for actor in actors {
-            close(&mut controller, actor);
-        }
-        assert_eq!(controller.jobs().len(), 0);
+    let (mut controller, actors, _) = pending_donor();
+    for actor in actors {
+        close(&mut controller, actor);
     }
+    assert_eq!(controller.jobs().len(), 0);
 }

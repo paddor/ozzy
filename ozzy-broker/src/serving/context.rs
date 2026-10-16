@@ -1,6 +1,9 @@
 //! Transport context and independently controlled protocol/time observations.
 
 use omq_tokio::Context;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{self, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Shared OMQ transport with ordinary or explicitly simulated broker time.
@@ -94,6 +97,103 @@ impl Timer {
             Self::System(start) => start.elapsed(),
             #[cfg(feature = "simulation")]
             Self::Manual { clock, origin } => clock.now().saturating_sub(*origin),
+        }
+    }
+
+    /// One alarm on this timer's clock, re-armed in place for each deadline.
+    pub(super) fn alarm(&self) -> Alarm {
+        let wait = match self {
+            Self::System(start) => Wait::System {
+                start: *start,
+                sleep: Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(
+                    *start,
+                ))),
+            },
+            #[cfg(feature = "simulation")]
+            Self::Manual { clock, origin } => Wait::Manual {
+                clock: clock.clone(),
+                origin: *origin,
+                until: None,
+            },
+        };
+        Alarm { wait, armed: None }
+    }
+}
+
+/// Fires once the clock reaches the deadline it was last polled with. Polling
+/// with a new deadline moves the same registration instead of making another.
+pub(super) struct Alarm {
+    wait: Wait,
+    armed: Option<Duration>,
+}
+
+enum Wait {
+    System {
+        start: Instant,
+        sleep: Pin<Box<tokio::time::Sleep>>,
+    },
+    #[cfg(feature = "simulation")]
+    Manual {
+        clock: ozzy_runtime::replicated::SdkClock,
+        origin: Duration,
+        until: Option<Pin<Box<dyn Future<Output = ()>>>>,
+    },
+}
+
+impl Alarm {
+    /// Ready once `deadline` since the start has passed. Without a deadline,
+    /// never ready.
+    pub(super) fn poll_at(
+        &mut self,
+        cx: &mut task::Context<'_>,
+        deadline: Option<Duration>,
+    ) -> Poll<()> {
+        let Some(deadline) = deadline else {
+            self.armed = None;
+            return Poll::Pending;
+        };
+        // Moving the registration costs more than waking early once, so a
+        // later deadline keeps the earlier wakeup and re-arms after it.
+        if self.armed.is_none_or(|armed| deadline < armed) {
+            self.armed = Some(deadline);
+            self.wait.arm(deadline);
+        }
+        let fired = self.wait.poll(cx);
+        if fired.is_ready() {
+            self.armed = None;
+        }
+        fired
+    }
+}
+
+impl Wait {
+    fn arm(&mut self, deadline: Duration) {
+        match self {
+            Self::System { start, sleep } => {
+                if let Some(at) = start.checked_add(deadline) {
+                    sleep.as_mut().reset(at.into());
+                }
+            }
+            #[cfg(feature = "simulation")]
+            Self::Manual {
+                clock,
+                origin,
+                until,
+            } => {
+                let clock = clock.clone();
+                let at = origin.saturating_add(deadline);
+                *until = Some(Box::pin(async move { clock.until(at).await }));
+            }
+        }
+    }
+
+    fn poll(&mut self, cx: &mut task::Context<'_>) -> Poll<()> {
+        match self {
+            Self::System { sleep, .. } => sleep.as_mut().poll(cx),
+            #[cfg(feature = "simulation")]
+            Self::Manual { until, .. } => until
+                .as_mut()
+                .map_or(Poll::Pending, |until| until.as_mut().poll(cx)),
         }
     }
 }

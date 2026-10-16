@@ -13,10 +13,9 @@ pub(super) fn replica(
     controller: &mut Controller,
     io: Local,
     index: u8,
-    mode: QuorumPolicy,
     group_bytes: usize,
 ) -> Replica {
-    let mut config = config(&format!("/broker-{index}"), 7, mode);
+    let mut config = config(&format!("/broker-{index}"), 7);
     config.identity.replica_node_id = NodeId::from_bytes([index + 1; 16]);
     config.append_limits.max_operations = 16;
     config.recovery.accepted_transitions = 16;
@@ -146,15 +145,10 @@ pub(super) fn synchronize(controller: &mut Controller, replica: &mut Replica) {
         .unwrap();
 }
 
-pub(super) fn confirm(primary: &mut Replica, backup: &Replica, mode: QuorumPolicy) {
+pub(super) fn confirm(primary: &mut Replica, backup: &Replica) {
     let normal = backup.driver.normal().unwrap();
-    let message = match mode {
-        QuorumPolicy::Durable => Control::PrepareOk {
-            ack: normal.acknowledgment().unwrap(),
-        },
-        QuorumPolicy::Replicated => Control::PrepareRetained {
-            ack: normal.retained_acknowledgment().unwrap(),
-        },
+    let message = Control::PrepareOk {
+        ack: normal.acknowledgment().unwrap(),
     };
     primary
         .driver
@@ -172,7 +166,7 @@ pub(super) fn confirm(primary: &mut Replica, backup: &Replica, mode: QuorumPolic
 #[test]
 fn owned_admission_groups_physical_writes_and_keeps_reused_arena_bytes() {
     let (mut controller, io) = setup();
-    let mut replica = replica(&mut controller, io.clone(), 0, QuorumPolicy::Durable, 8192);
+    let mut replica = replica(&mut controller, io.clone(), 0, 8192);
     let (first, mut arena, receipt1) = admit(&mut controller, &mut replica, 1);
     let (second, _, receipt2) = admit(&mut controller, &mut replica, 1);
     let accepted = replica.driver.normal().unwrap().snapshot().accepted;
@@ -224,6 +218,10 @@ pub(super) fn initialize_writer(
             topic: "orders",
             partition_id: PartitionId::ZERO,
             owner_epoch: OwnerEpoch::INITIAL,
+            dedup_window_millis: replica
+                .config
+                .deduplication
+                .and_then(|limits| std::num::NonZeroU64::new(limits.window_millis)),
             retention: RetentionPolicy::default(),
         }),
         OperationBody::OpenProducer(OpenProducer {
@@ -244,7 +242,10 @@ pub(super) fn initialize_writer(
     receipt
 }
 
-fn packed_append_body(limits: ozzy_journal::operation::OperationLimits, payload: &[u8]) -> Vec<u8> {
+pub(super) fn packed_append_body(
+    limits: ozzy_journal::operation::OperationLimits,
+    payload: &[u8],
+) -> Vec<u8> {
     use ozzy_journal::operation::{
         Append, AppendBatch, AppendPackResult, AppendPackScratch, AppendRecord, OperationBody,
         encode_operation_body, pack_append_payload,
@@ -291,7 +292,7 @@ fn owned_sdk_lz4_payload_survives_write_history_and_recovery_byte_exact() {
     use ozzy_replication::{LogSource, wire::FetchOps};
 
     let (mut controller, io) = setup();
-    let mut replica = replica(&mut controller, io.clone(), 0, QuorumPolicy::Durable, 8192);
+    let mut replica = replica(&mut controller, io.clone(), 0, 8192);
     let partition = PartitionIncarnation::from_bytes([11; 16]);
     let receipt = initialize_writer(&mut controller, &mut replica);
     let predecessor = replica.driver.normal().unwrap().snapshot().accepted;
@@ -351,11 +352,12 @@ fn owned_follower_writes_primary_validated_lz4_payload() {
     use ozzy_journal::operation::{canonical_body_digest, decode_append_summary};
     use ozzy_proto::{LinkSessionId, Offset, PartitionIncarnation};
     use ozzy_replication::wire::{
-        PeerBinding, Prepare, ReplicaMessage, WireLimits, decode, encode_prepare_metadata,
+        EncodeContext, PeerBinding, Prepare, ReplicaMessage, WireLimits, decode,
+        encode_prepare_metadata,
     };
 
     let (mut controller, io) = setup();
-    let mut follower = replica(&mut controller, io, 1, QuorumPolicy::Durable, 8192);
+    let mut follower = replica(&mut controller, io, 1, 8192);
     let initial = initialize_writer(&mut controller, &mut follower);
     let limits = follower.config.limits.operations;
     let partition = PartitionIncarnation::from_bytes([11; 16]);
@@ -388,11 +390,13 @@ fn owned_follower_writes_primary_validated_lz4_payload() {
     };
     let mut metadata = [0; 512];
     let wire = encode_prepare_metadata(
-        primary,
-        session,
+        EncodeContext {
+            sender: primary,
+            session,
+            limits: WireLimits::default(),
+        },
         prepare_message,
         &mut metadata,
-        WireLimits::default(),
     )
     .unwrap();
     let binding = PeerBinding::new(
@@ -444,7 +448,7 @@ fn owned_follower_writes_primary_validated_lz4_payload() {
 #[test]
 fn owned_split_request_completes_only_after_all_physical_parts() {
     let (mut controller, io) = setup();
-    let mut replica = replica(&mut controller, io, 0, QuorumPolicy::Durable, 16);
+    let mut replica = replica(&mut controller, io, 0, 16);
     let (ticket, _, mut receipt) = admit(&mut controller, &mut replica, 3);
     let first = prepare(&mut replica);
     let second = prepare(&mut replica);
@@ -473,7 +477,7 @@ fn owned_split_request_completes_only_after_all_physical_parts() {
 #[test]
 fn owned_old_barrier_excludes_later_unobserved_physical_write() {
     let (mut controller, io) = setup();
-    let mut replica = replica(&mut controller, io, 0, QuorumPolicy::Durable, 16);
+    let mut replica = replica(&mut controller, io, 0, 16);
     let (_, _, first) = admit(&mut controller, &mut replica, 1);
     let (_, _, second) = admit(&mut controller, &mut replica, 1);
     let work1 = prepare(&mut replica);
@@ -508,49 +512,30 @@ fn owned_old_barrier_excludes_later_unobserved_physical_write() {
 }
 
 #[test]
-fn owned_both_confirmation_policies_apply_at_their_actual_boundary() {
-    for mode in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        let (mut controller, io) = setup();
-        let mut primary = replica(&mut controller, io.clone(), 0, mode, 8192);
-        let mut backup = replica(&mut controller, io, 1, mode, 8192);
-        let (_, _, first) = admit(&mut controller, &mut primary, 2);
-        let (_, _, second) = admit(&mut controller, &mut backup, 2);
-        if mode == QuorumPolicy::Replicated {
-            confirm(&mut primary, &backup, mode);
-            assert_eq!(primary.journal.images().unwrap().committed().revision(), 2);
-            assert_eq!(
-                primary
-                    .journal
-                    .journal
-                    .readable()
-                    .unwrap()
-                    .written_position()
-                    .unwrap()
-                    .op_number,
-                0
-            );
-        }
-        let work = prepare(&mut primary);
-        finish(&mut controller, &mut primary, work);
-        settle(&mut primary, first);
-        let work = prepare(&mut backup);
-        finish(&mut controller, &mut backup, work);
-        settle(&mut backup, second);
-        synchronize(&mut controller, &mut primary);
-        synchronize(&mut controller, &mut backup);
-        if mode == QuorumPolicy::Durable {
-            confirm(&mut primary, &backup, mode);
-        }
-        assert_eq!(primary.journal.images().unwrap().committed().revision(), 2);
-        drive(&mut controller, primary.journal.shutdown()).unwrap();
-        drive(&mut controller, backup.journal.shutdown()).unwrap();
-    }
+fn owned_disk_quorum_applies_at_its_synchronized_boundary() {
+    let (mut controller, io) = setup();
+    let mut primary = replica(&mut controller, io.clone(), 0, 8192);
+    let mut backup = replica(&mut controller, io, 1, 8192);
+    let (_, _, first) = admit(&mut controller, &mut primary, 2);
+    let (_, _, second) = admit(&mut controller, &mut backup, 2);
+    let work = prepare(&mut primary);
+    finish(&mut controller, &mut primary, work);
+    settle(&mut primary, first);
+    let work = prepare(&mut backup);
+    finish(&mut controller, &mut backup, work);
+    settle(&mut backup, second);
+    synchronize(&mut controller, &mut primary);
+    synchronize(&mut controller, &mut backup);
+    confirm(&mut primary, &backup);
+    assert_eq!(primary.journal.images().unwrap().committed().revision(), 2);
+    drive(&mut controller, primary.journal.shutdown()).unwrap();
+    drive(&mut controller, backup.journal.shutdown()).unwrap();
 }
 
 #[test]
 fn owned_roll_keeps_partly_written_request_and_accepts_while_io_is_pending() {
     let (mut controller, io) = setup();
-    let mut replica = replica(&mut controller, io, 0, QuorumPolicy::Durable, 16);
+    let mut replica = replica(&mut controller, io, 0, 16);
     let (_, _, first) = admit(&mut controller, &mut replica, 8);
     for _ in 0..7 {
         let work = prepare(&mut replica);
@@ -585,7 +570,7 @@ fn owned_roll_keeps_partly_written_request_and_accepts_while_io_is_pending() {
 #[test]
 fn owned_canceled_physical_write_fences_owner_without_freeing_backend_work() {
     let (mut controller, io) = setup();
-    let mut replica = replica(&mut controller, io.clone(), 0, QuorumPolicy::Durable, 16);
+    let mut replica = replica(&mut controller, io.clone(), 0, 16);
     let (_, _, receipt) = admit(&mut controller, &mut replica, 1);
     let work = prepare(&mut replica);
     let held = {
@@ -614,7 +599,7 @@ fn owned_canceled_physical_write_fences_owner_without_freeing_backend_work() {
 #[test]
 fn owned_reordered_installation_fences_even_when_both_writes_succeeded() {
     let (mut controller, io) = setup();
-    let mut replica = replica(&mut controller, io, 0, QuorumPolicy::Durable, 16);
+    let mut replica = replica(&mut controller, io, 0, 16);
     let (_, _, _) = admit(&mut controller, &mut replica, 2);
     let first = prepare(&mut replica);
     let second = prepare(&mut replica);
@@ -627,7 +612,7 @@ fn owned_reordered_installation_fences_even_when_both_writes_succeeded() {
 #[test]
 fn owned_dropped_response_does_not_cancel_admitted_data() {
     let (mut controller, io) = setup();
-    let mut replica = replica(&mut controller, io, 0, QuorumPolicy::Durable, 16);
+    let mut replica = replica(&mut controller, io, 0, 16);
     let (ticket, _, receipt) = admit(&mut controller, &mut replica, 1);
     drop(receipt);
     let work = prepare(&mut replica);

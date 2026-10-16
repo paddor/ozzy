@@ -1,4 +1,4 @@
-# One broker. The only allowed confirmation policy is "local-durable".
+# One broker. It confirms a record once its journal syncs it to disk.
 [cluster]
 mode = "single" # Fixed values: "single" or "three".
 
@@ -7,6 +7,8 @@ mode = "single" # Fixed values: "single" or "three".
 peer = "tcp://127.0.0.1:7100" # Control and confirmations.
 data_peer = "tcp://127.0.0.1:7103" # APPENDs and replay data.
 reader_pub = "tcp://127.0.0.1:7101" # Live consumer records.
+# Admin console for ozzy-tui. No authentication: any local user can connect.
+# admin = "ipc://@ozzy-admin"
 
 # "my_ssd" is your device label. The root is the actual local storage directory.
 [brokers.my_server.devices.my_ssd]
@@ -17,9 +19,6 @@ controller = "my_controller"
 
 # "orders" is your topic name. Omitting partitions defaults to 16.
 [topics.orders]
-# Confirm only after the broker synchronizes the record to disk.
-# "disk-quorum" and "replicated-persisting" require mode = "three".
-confirmation = "local-durable"
 
 # Defaults: one shard, Linux AIO on Linux, 256 MiB segments, unlimited retention.
 # Optional retention, per partition: uncomment to keep at most a day or 1 GiB.

@@ -1,19 +1,15 @@
 //! Bounded typed command admission. Rejected payloads remain owned by the caller.
 
 use super::ReadyJournalSync;
+use super::receiving::ReceiveAction;
 use super::recovery::RecoveryAction;
 use super::{
     AppendBuffer, JournalCompletion, JournalError, OwnedSemaphorePermit, PromiseTicket,
     ReplicaJournal, SubmitError, ValidatedAppend, completion,
 };
-use super::{
-    FetchedHistory, HistoryPosition, ProposalBuffer, ProposalValidation, ReplicationPositions,
-};
-use super::{InstallationConfig, InstalledChunk, InstalledJournal};
+use super::{ProposalBuffer, ProposalValidation};
 use ozzy_core::state::{CanonicalImagesError, IdentityIndexError, StateError};
-use ozzy_replication::driver::{ActivationTicket, ValidationTicket};
-use ozzy_replication::wire::FetchOps;
-use ozzy_replication::{InstallTicket, LogSource, OpNumber, Prefix};
+use ozzy_replication::driver::ValidationTicket;
 use ozzy_replication::{SyncTicket, WriteTicket};
 
 /// An unsubmitted value returned intact for retry. No disk action was admitted.
@@ -25,48 +21,46 @@ pub struct Rejected<T> {
     pub value: T,
 }
 
+pub(super) type Reply<T> = completion::Sender<Result<T, JournalError>>;
+
 #[derive(Debug)]
-pub(super) struct Command {
-    pub action: Action,
+pub(super) struct Command<A = Action> {
+    pub action: A,
     pub(super) _permit: OwnedSemaphorePermit,
 }
 
+/// What a command needs from the normal owner before it may start.
+pub(super) enum Gate<'a> {
+    /// Starts on any available owner.
+    Free,
+    /// Waits until every submitted write settled.
+    Settled,
+    /// Waits for settled writes when validating this suffix may read storage.
+    Validate(&'a AppendBuffer),
+    /// Waits for writeback room, unless every write settled.
+    Admit(&'a mut ValidatedAppend),
+    /// Combines the gates of a turn's parts.
+    Turn(&'a mut super::Turn),
+}
+
+/// One owner command, by family.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "bounded command slots retain their arenas inline without another allocation"
+)]
 pub(super) enum Action {
-    Retention {
-        ticket: ozzy_replication::driver::ValidationTicket,
-        seed: ozzy_proto::OperationId,
-        leader: bool,
-        done: completion::Sender<Result<super::RetentionTurn, JournalError>>,
-    },
-    Seek {
-        ticket: ValidationTicket,
-        partition: ozzy_proto::PartitionIncarnation,
-        start: ozzy_proto::reader::Start,
-        done: completion::Sender<Result<super::PartitionReadCursor, JournalError>>,
-    },
-    CleanupOrphans {
-        ticket: ValidationTicket,
-        budget: ozzy_journal_segment::MaintenanceBudget,
-        done: completion::Sender<Result<crate::replica_journal::OwnedCleanedStorage, JournalError>>,
-    },
-    CleanupMetadata {
-        ticket: ValidationTicket,
-        budget: ozzy_journal_segment::MaintenanceBudget,
-        done: completion::Sender<Result<crate::replica_journal::OwnedCleanedStorage, JournalError>>,
-    },
-    ValidateStorage {
-        ticket: ValidationTicket,
-        budget: ozzy_journal_segment::StorageValidationBudget,
-        done: completion::Sender<Result<super::ValidatedStorage, JournalError>>,
-    },
-    ReadPartition {
-        read_permit: OwnedSemaphorePermit,
-        cursor: super::PartitionReadCursor,
-        limits: super::PartitionReadLimits,
-        buffer: super::PartitionReadLease,
-        done: super::read::delivery::ReadReply,
-    },
+    Read(super::read::ReadAction),
+    Append(AppendAction),
+    Maintenance(MaintenanceAction),
+    History(super::history::HistoryAction),
+    Install(super::install::InstallAction),
+    Recovery(RecoveryAction),
+}
+
+/// Writer-path commands: validation, proposals, admission, and syncs.
+#[derive(Debug)]
+pub(super) enum AppendAction {
     Promise {
         ticket: PromiseTicket,
         done: completion::Sender<Result<PromiseTicket, JournalError>>,
@@ -106,59 +100,36 @@ pub(super) enum Action {
         turn: Box<super::Turn>,
         done: completion::Sender<Result<Box<super::TurnResult>, JournalError>>,
     },
-    CaptureHistory {
-        source: LogSource,
-        done: completion::Sender<Result<LogSource, JournalError>>,
+}
+
+/// Retention, identity expiry, cleanup, and validation turns on the owner.
+#[derive(Debug)]
+pub(super) enum MaintenanceAction {
+    Retention {
+        ticket: ozzy_replication::driver::ValidationTicket,
+        seed: ozzy_proto::OperationId,
+        leader: bool,
+        done: completion::Sender<Result<super::RetentionTurn, JournalError>>,
     },
-    Recovery(RecoveryAction),
-    Receiving(super::receiving::ReceiveAction),
-    ReleaseHistory {
-        source: LogSource,
-        done: completion::Sender<Result<LogSource, JournalError>>,
+    RetainIdentities {
+        ticket: ozzy_replication::driver::ValidationTicket,
+        leader: bool,
+        done: completion::Sender<Result<super::IdentityRetention, JournalError>>,
     },
-    HistoryPosition {
-        source: LogSource,
-        op: OpNumber,
-        done: completion::Sender<Result<HistoryPosition, JournalError>>,
-    },
-    FetchHistory {
-        request: FetchOps,
-        buffer: AppendBuffer,
-        done: completion::Sender<Result<FetchedHistory, JournalError>>,
-    },
-    FetchReplication {
+    CleanupOrphans {
         ticket: ValidationTicket,
-        predecessor: Prefix,
-        limits: ozzy_replication::PipelineLimits,
-        buffer: AppendBuffer,
-        done: completion::Sender<Result<FetchedHistory, JournalError>>,
+        budget: ozzy_journal_segment::MaintenanceBudget,
+        done: completion::Sender<Result<crate::replica_journal::OwnedCleanedStorage, JournalError>>,
     },
-    ReplicationPositions {
+    CleanupMetadata {
         ticket: ValidationTicket,
-        requested: [OpNumber; 2],
-        done: completion::Sender<Result<ReplicationPositions, JournalError>>,
+        budget: ozzy_journal_segment::MaintenanceBudget,
+        done: completion::Sender<Result<crate::replica_journal::OwnedCleanedStorage, JournalError>>,
     },
-    BeginInstall {
-        ticket: InstallTicket,
-        config: InstallationConfig,
-        done: completion::Sender<Result<InstallTicket, JournalError>>,
-    },
-    InstallChunk {
-        ticket: InstallTicket,
-        buffer: AppendBuffer,
-        done: completion::Sender<Result<InstalledChunk, JournalError>>,
-    },
-    FinishInstall {
-        ticket: InstallTicket,
-        done: completion::Sender<Result<InstalledJournal, JournalError>>,
-    },
-    AbortInstall {
-        ticket: InstallTicket,
-        done: completion::Sender<Result<InstallTicket, JournalError>>,
-    },
-    Activate {
-        ticket: ActivationTicket,
-        done: completion::Sender<Result<ActivationTicket, JournalError>>,
+    ValidateStorage {
+        ticket: ValidationTicket,
+        budget: ozzy_journal_segment::StorageValidationBudget,
+        done: completion::Sender<Result<super::ValidatedStorage, JournalError>>,
     },
 }
 
@@ -168,11 +139,31 @@ pub(super) fn finish_read<T>(
     permit: OwnedSemaphorePermit,
 ) -> bool {
     let faulted = result.as_ref().err().is_some_and(read_fault);
+    if faulted && let Err(error) = &result {
+        fault_log(error);
+    }
     // Release command admission before waking the actor. Payload leases remain
     // charged until their completion/owner drops them.
     drop(permit);
     let _ = done.send(result);
     faulted
+}
+
+/// Name the error that fences this journal in the bounded diagnostic log,
+/// so a faulted worker reports its cause and not only the fence.
+pub(super) fn fault_log(error: &JournalError) {
+    crate::profiling::log(
+        crate::profiling::Level::Error,
+        &format!("replica journal fault: {error}"),
+    );
+}
+
+/// Log a failed result as the journal fault it causes. Returns whether it failed.
+pub(super) fn logged_fault<T>(result: &Result<T, JournalError>) -> bool {
+    if let Err(error) = result {
+        fault_log(error);
+    }
+    result.is_err()
 }
 
 pub(super) fn read_fault(error: &JournalError) -> bool {
@@ -203,7 +194,7 @@ pub(super) fn finish<T>(
     result: Result<T, JournalError>,
     permit: OwnedSemaphorePermit,
 ) -> bool {
-    let faulted = result.is_err();
+    let faulted = logged_fault(&result);
     drop(permit);
     // Caller cancellation does not cancel admitted effects or panic the worker.
     let _ = done.send(result);
@@ -225,16 +216,13 @@ impl ReplicaJournal {
     ) -> Result<JournalCompletion<super::AdmittedAppend>, Rejected<ValidatedAppend>> {
         self.submit(
             validated,
-            |validated, done| Action::Admit {
-                ticket,
-                validated,
-                done,
-            },
-            |action| {
-                let Action::Admit { validated, .. } = action else {
-                    unreachable!("same command")
-                };
-                validated
+            |validated| Gate::Admit(validated),
+            |validated, done| {
+                Action::Append(AppendAction::Admit {
+                    ticket,
+                    validated,
+                    done,
+                })
             },
         )
     }
@@ -262,14 +250,13 @@ impl ReplicaJournal {
     ) -> Result<JournalCompletion<ProposalValidation>, Rejected<ProposalBuffer>> {
         self.submit(
             buffer,
-            |buffer, done| Action::Propose {
-                ticket,
-                buffer,
-                done,
-            },
-            |action| match action {
-                Action::Propose { buffer, .. } => buffer,
-                _ => unreachable!("submission preserves command kind"),
+            |buffer| Gate::Validate(&buffer.0),
+            |buffer, done| {
+                Action::Append(AppendAction::Propose {
+                    ticket,
+                    buffer,
+                    done,
+                })
             },
         )
     }
@@ -324,14 +311,13 @@ impl ReplicaJournal {
     ) -> Result<JournalCompletion<ValidatedAppend>, Rejected<AppendBuffer>> {
         self.submit(
             buffer,
-            |buffer, done| Action::Validate {
-                ticket,
-                buffer,
-                done,
-            },
-            |action| match action {
-                Action::Validate { buffer, .. } => buffer,
-                _ => unreachable!("submission preserves command kind"),
+            |buffer| Gate::Validate(buffer),
+            |buffer, done| {
+                Action::Append(AppendAction::Validate {
+                    ticket,
+                    buffer,
+                    done,
+                })
             },
         )
     }
@@ -342,15 +328,9 @@ impl ReplicaJournal {
         &mut self,
         ticket: SyncTicket,
     ) -> Result<JournalCompletion<SyncTicket>, SubmitError> {
-        self.submit(
-            ticket,
-            |ticket, done| Action::Sync { ticket, done },
-            |action| match action {
-                Action::Sync { ticket, .. } => ticket,
-                _ => unreachable!("submission preserves command kind"),
-            },
-        )
-        .map_err(|rejected| rejected.reason)
+        self.command(Gate::Settled, |done| {
+            Action::Append(AppendAction::Sync { ticket, done })
+        })
     }
 
     /// Publish one group's recovery evidence on the assigned disk executor.
@@ -365,15 +345,9 @@ impl ReplicaJournal {
         &mut self,
         ticket: SyncTicket,
     ) -> Result<JournalCompletion<ReadyJournalSync>, SubmitError> {
-        self.submit(
-            ticket,
-            |ticket, done| Action::BeginPipelinedSync { ticket, done },
-            |action| match action {
-                Action::BeginPipelinedSync { ticket, .. } => ticket,
-                _ => unreachable!("submission preserves command kind"),
-            },
-        )
-        .map_err(|rejected| rejected.reason)
+        self.command(Gate::Free, |done| {
+            Action::Append(AppendAction::BeginPipelinedSync { ticket, done })
+        })
     }
 
     /// Consume the worker's completed publication and report its captured ticket.
@@ -388,11 +362,8 @@ impl ReplicaJournal {
     ) -> Result<JournalCompletion<SyncTicket>, Rejected<ReadyJournalSync>> {
         self.submit(
             ready,
-            |ready, done| Action::FinishPipelinedSync { ready, done },
-            |action| match action {
-                Action::FinishPipelinedSync { ready, .. } => ready,
-                _ => unreachable!("submission preserves command kind"),
-            },
+            |_| Gate::Free,
+            |ready, done| Action::Append(AppendAction::FinishPipelinedSync { ready, done }),
         )
     }
 
@@ -404,46 +375,94 @@ impl ReplicaJournal {
         &mut self,
         ticket: ValidationTicket,
     ) -> Result<JournalCompletion<ValidationTicket>, SubmitError> {
-        self.submit(
-            ticket,
-            |ticket, done| Action::Apply { ticket, done },
-            |action| match action {
-                Action::Apply { ticket, .. } => ticket,
-                _ => unreachable!("submission preserves command kind"),
-            },
-        )
-        .map_err(|rejected| rejected.reason)
+        self.command(Gate::Free, |done| {
+            Action::Append(AppendAction::Apply { ticket, done })
+        })
     }
 
+    /// Start a command on the normal owner once `gate` allows it. Rejection
+    /// returns `value` intact; `make` runs only for an admitted command.
     pub(super) fn submit<T, R>(
         &mut self,
-        value: T,
-        make: impl FnOnce(T, completion::Sender<Result<R, JournalError>>) -> Action,
-        recover: impl FnOnce(Action) -> T,
+        mut value: T,
+        gate: impl FnOnce(&mut T) -> Gate<'_>,
+        make: impl FnOnce(T, Reply<R>) -> Action,
     ) -> Result<JournalCompletion<R>, Rejected<T>> {
-        if self.execution.is_closed() {
-            return Err(Rejected {
-                reason: SubmitError::Stopped,
-                value,
-            });
-        }
-        let Ok(permit) = self.capacity.clone().try_acquire_owned() else {
-            return Err(Rejected {
-                reason: SubmitError::Full,
-                value,
-            });
+        let permit = match self.permit() {
+            Ok(permit) => permit,
+            Err(reason) => return Err(Rejected { reason, value }),
         };
-        let (done, receiver) = completion::channel();
-        let command = Command {
-            action: make(value, done),
-            _permit: permit,
-        };
-        if let Err((reason, command)) = self.execution.submit(command) {
-            return Err(Rejected {
-                reason,
-                value: recover(command.action),
-            });
+        match self.execution.admit(gate(&mut value)) {
+            Ok(admitted) => {
+                let (command, completion) = bind(value, permit, make);
+                admitted.start(command);
+                Ok(completion)
+            }
+            Err(reason) => Err(Rejected { reason, value }),
         }
-        Ok(JournalCompletion { receiver })
     }
+
+    /// Start a command whose inputs need not survive rejection.
+    pub(super) fn command<R>(
+        &mut self,
+        gate: Gate<'static>,
+        make: impl FnOnce(Reply<R>) -> Action,
+    ) -> Result<JournalCompletion<R>, SubmitError> {
+        self.submit((), |()| gate, |(), done| make(done))
+            .map_err(|rejected| rejected.reason)
+    }
+
+    /// Start transfer work on a nonvoting recovery owner. Rejection returns
+    /// `value` intact.
+    pub(super) fn submit_receive<T, R>(
+        &mut self,
+        value: T,
+        make: impl FnOnce(T, Reply<R>) -> ReceiveAction,
+    ) -> Result<JournalCompletion<R>, Rejected<T>> {
+        let permit = match self.permit() {
+            Ok(permit) => permit,
+            Err(reason) => return Err(Rejected { reason, value }),
+        };
+        match self.execution.admit_receive() {
+            Ok(admitted) => {
+                let (command, completion) = bind(value, permit, make);
+                admitted.start(command);
+                Ok(completion)
+            }
+            Err(reason) => Err(Rejected { reason, value }),
+        }
+    }
+
+    /// Start transfer work whose inputs need not survive rejection.
+    pub(super) fn receive<R>(
+        &mut self,
+        make: impl FnOnce(Reply<R>) -> ReceiveAction,
+    ) -> Result<JournalCompletion<R>, SubmitError> {
+        self.submit_receive((), |(), done| make(done))
+            .map_err(|rejected| rejected.reason)
+    }
+
+    fn permit(&self) -> Result<OwnedSemaphorePermit, SubmitError> {
+        if self.execution.is_closed() {
+            return Err(SubmitError::Stopped);
+        }
+        self.capacity
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| SubmitError::Full)
+    }
+}
+
+/// Build an admitted command and the completion its caller observes.
+fn bind<T, R, A>(
+    value: T,
+    permit: OwnedSemaphorePermit,
+    make: impl FnOnce(T, Reply<R>) -> A,
+) -> (Command<A>, JournalCompletion<R>) {
+    let (done, receiver) = completion::channel();
+    let command = Command {
+        action: make(value, done),
+        _permit: permit,
+    };
+    (command, JournalCompletion { receiver })
 }

@@ -1,7 +1,12 @@
 //! Owned, bounded buffers crossing the protocol/storage boundary.
 
+mod assignment;
 mod body;
+pub(in crate::replica_journal) mod dedup;
 mod metadata;
+mod producer;
+mod progress;
+pub(in crate::replica_journal) use progress::JoinedProgress;
 mod trim;
 
 use std::ops::Range;
@@ -102,10 +107,19 @@ pub struct AppendBuffer {
     /// Exact results for a single streaming retry, including a fresh suffix.
     /// At most one range per admitted record. Fresh-only proposals use headers.
     pub(super) retry_results: Option<Box<ProducerRetryResults>>,
+    dedup_original: Option<Box<dedup::Original>>,
+    dedup_charge: Option<crate::memory::Charge>,
     validated: bool,
     pub(super) proposal_policy: Option<ozzy_proto::append::Policy>,
     pub(super) proposal_authority: Option<ozzy_proto::append::Authority>,
     pub(super) producer_session: Option<Box<ProducerSession>>,
+    /// The producer of every APPEND entry; none for zero or several producers.
+    producer: Option<ozzy_proto::ProducerId>,
+    pub(super) group_progress: Option<Box<super::progress::Session>>,
+    /// Progress updates joined into this proposal after the first, one per
+    /// later operation.
+    pub(super) progress_riders: Vec<super::progress::Session>,
+    pub(super) group_assignment: Option<Box<super::assignment::Session>>,
     owner_generation: JournalGeneration,
     limits: PipelineLimits,
     entries: Vec<Descriptor>,
@@ -178,6 +192,8 @@ impl AppendBuffer {
     }
 
     pub(super) fn retain(&mut self) -> RetainedAppend {
+        // Canonical acceptance ends the reversible proposal's lifetime.
+        self.dedup_original = None;
         assert_eq!(self.entries.len(), self.body_digests.len());
         let bodies = self.bodies.freeze();
         RetainedAppend {
@@ -238,11 +254,17 @@ impl AppendBuffer {
         Self {
             request_kind: RequestKind::Canonical,
             producer_stream: false,
+            dedup_original: None,
+            dedup_charge: None,
             retry_results: None,
             validated: false,
             proposal_authority: None,
             proposal_policy: None,
             producer_session: None,
+            producer: None,
+            group_progress: None,
+            progress_riders: Vec::new(),
+            group_assignment: None,
             owner_generation,
             limits,
             entries: Vec::with_capacity(limits.max_operations),
@@ -301,6 +323,8 @@ impl AppendBuffer {
     /// Release contents and retain the journal lease. Charged allocations return
     /// to their shared owner cache after the final immutable observer releases them.
     pub fn clear(&mut self) {
+        self.dedup_original = None;
+        self.dedup_charge = None;
         self.request_kind = RequestKind::Canonical;
         self.producer_stream = false;
         self.retry_results = None;
@@ -308,6 +332,10 @@ impl AppendBuffer {
         self.proposal_authority = None;
         self.proposal_policy = None;
         self.producer_session = None;
+        self.producer = None;
+        self.group_progress = None;
+        self.progress_riders.clear();
+        self.group_assignment = None;
         self.entries.clear();
         self.bodies.clear();
         self.prepared.clear();
@@ -424,36 +452,6 @@ impl AppendBuffer {
         self.limits
     }
 
-    pub(super) fn prepare_producer_append(
-        &mut self,
-        request: super::ProducerAppend<'_>,
-    ) -> Result<(), JournalError> {
-        self.prepare_producer_batch(ozzy_journal::operation::AppendBatch {
-            partition: request.partition,
-            owner_epoch: request.owner_epoch,
-            producer_id: request.producer_id,
-            producer_epoch: request.producer_epoch,
-            first_sequence: request.first_sequence,
-            first_offset: ozzy_proto::Offset::ZERO,
-            append_timestamp_millis: 0,
-            records: request.records.into(),
-        })
-    }
-
-    pub(super) fn prepare_producer_batch(
-        &mut self,
-        batch: ozzy_journal::operation::AppendBatch<'_>,
-    ) -> Result<(), JournalError> {
-        use ozzy_journal::operation::{Append, OperationBody};
-        self.check_producer_entry()?;
-        let body = OperationBody::Append(Append {
-            batches: vec![batch],
-        });
-        self.push_typed_body(&body)?;
-        self.request_kind = RequestKind::Producer;
-        Ok(())
-    }
-
     pub(super) fn prepare_partition(
         &mut self,
         partition: ozzy_journal::operation::CreatePartition<'_>,
@@ -465,53 +463,6 @@ impl AppendBuffer {
             partition,
         ))?;
         self.request_kind = RequestKind::Partition;
-        Ok(())
-    }
-
-    pub(super) fn prepare_producer_open(
-        &mut self,
-        request: ozzy_proto::producer::Open,
-        policy: ozzy_proto::append::Policy,
-    ) -> Result<(), JournalError> {
-        if !self.is_empty() {
-            return Err(JournalError::AppendMismatch);
-        }
-        let new_epoch = match (request.mode, request.expected_epoch) {
-            (ozzy_proto::producer::Mode::Resume | ozzy_proto::producer::Mode::Create, None) => 1,
-            (ozzy_proto::producer::Mode::Resume, Some(epoch)) => epoch,
-            (ozzy_proto::producer::Mode::Fence, Some(epoch)) => {
-                epoch.checked_add(1).ok_or(JournalError::AppendMismatch)?
-            }
-            (ozzy_proto::producer::Mode::Fence, None)
-            | (ozzy_proto::producer::Mode::Create, Some(_)) => {
-                return Err(JournalError::AppendMismatch);
-            }
-        };
-        if new_epoch == 0
-            || request.expected_epoch == Some(0)
-            || request.authority.group_id.as_bytes() == &[0; 16]
-            || request.authority.config_epoch == 0
-            || request.partition.as_bytes() == &[0; 16]
-            || request.operation.as_bytes() == &[0; 16]
-            || request.producer.as_bytes() == &[0; 16]
-        {
-            return Err(JournalError::AppendMismatch);
-        }
-        self.push_typed_body(&ozzy_journal::operation::OperationBody::OpenProducer(
-            ozzy_journal::operation::OpenProducer {
-                partition: request.partition,
-                producer_id: request.producer,
-                expected_epoch: request.expected_epoch.map(ozzy_proto::ProducerEpoch::new),
-                new_epoch: ozzy_proto::ProducerEpoch::new(new_epoch),
-                operation_id: request.operation,
-            },
-        ))?;
-        self.producer_session = Some(Box::new(ProducerSession {
-            request,
-            opened: None,
-        }));
-        self.proposal_authority = Some(request.authority);
-        self.proposal_policy = Some(policy);
         Ok(())
     }
 
@@ -569,160 +520,6 @@ impl AppendBuffer {
         });
         Ok(())
     }
-
-    pub(super) fn prepare_wire_producer_batch(
-        &mut self,
-        request: ozzy_proto::append::ValidatedAppend<'_>,
-    ) -> Result<(), JournalError> {
-        use ozzy_journal::operation::{
-            AppendHeader, OperationKind, OperationLimits, append_wire_record_batch,
-        };
-        self.check_producer_entry()?;
-        let room = self.limits.max_body_bytes - self.bodies.len();
-        let limits = OperationLimits {
-            max_body_bytes: room,
-            max_payload_bytes: room,
-            max_records: room / 20,
-            max_parts: room / 4,
-            ..OperationLimits::default()
-        };
-        let bytes = 80_usize
-            .checked_add(request.records.encoded().len())
-            .and_then(|bytes| bytes.checked_add(request.encoded_payload.len()))
-            .and_then(|bytes| {
-                bytes.checked_add(
-                    usize::from(
-                        request.payload_encoding == ozzy_proto::append::PayloadEncoding::Lz4,
-                    ) * 9,
-                )
-            })
-            .ok_or(JournalError::AppendCapacity)?;
-        self.reserve_body_bytes(bytes)?;
-        let (range, proof) = append_wire_record_batch(
-            self.bodies.mutable()?,
-            AppendHeader {
-                partition: request.partition,
-                owner_epoch: ozzy_proto::OwnerEpoch::new(request.owner_epoch),
-                producer_id: request.key.producer_id,
-                producer_epoch: ozzy_proto::ProducerEpoch::new(request.key.producer_epoch),
-                first_sequence: ozzy_proto::ProducerSequence::new(request.key.first_sequence),
-                first_offset: ozzy_proto::Offset::ZERO,
-                append_timestamp_millis: 0,
-            },
-            request.records,
-            request.payload_encoding,
-            request.encoded_payload,
-            limits,
-        )?;
-        self.entries.push(Descriptor {
-            envelope: CanonicalOperation {
-                group_id: ozzy_proto::GroupId::from_bytes([0; 16]),
-                configuration_epoch: 0,
-                original_view: 0,
-                op_number: 0,
-                previous_digest: Digest::ZERO,
-                kind: OperationKind::Append,
-                body: &[],
-            },
-            body: range,
-            digest: None,
-            primary_payload_validated: false,
-            proof: Some(proof),
-        });
-        self.request_kind = RequestKind::Producer;
-        Ok(())
-    }
-
-    /// Remove a verified streaming retry prefix in place. Only the newly
-    /// accepted suffix becomes a canonical operation. No replacement arena.
-    pub(super) fn trim_producer_prefix(
-        &mut self,
-        count: usize,
-        limits: ozzy_journal::operation::OperationLimits,
-    ) -> Result<(), JournalError> {
-        use ozzy_journal::operation::decode_append_view;
-        self.validated = false;
-        if self.entries.len() != 1 {
-            return Err(JournalError::AppendMismatch);
-        }
-        let mut batches = decode_append_view(&self.bodies, limits)?.batches();
-        let batch = batches.next().ok_or(JournalError::AppendMismatch)?;
-        if batches.next().is_some()
-            || count == 0
-            || count >= batch.summary.record_count
-            || !self.producer_stream
-        {
-            return Err(JournalError::AppendMismatch);
-        }
-        if batch.prepared_payload.is_some() {
-            return self.trim_prepared_prefix(count, limits);
-        }
-        let remaining = (batch.summary.record_count - count) as u32;
-        let sequence = batch
-            .summary
-            .first_sequence
-            .get()
-            .checked_add(count as u64)
-            .ok_or(JournalError::AppendMismatch)?;
-        let mut records = batch.raw_records().ok_or(JournalError::AppendMismatch)?;
-        let (descriptors, payload) = records.remaining_bytes();
-        let descriptor_bytes = descriptors.len();
-        let length_bytes = records.tiny_lengths().map_or(0, <[u8]>::len);
-        let payload_bytes = payload.len();
-        records.nth(count - 1).ok_or(JournalError::AppendMismatch)?;
-        let (descriptors, payload) = records.remaining_bytes();
-        let kept_descriptors = descriptors.len();
-        let kept_lengths = records.tiny_lengths().map_or(0, <[u8]>::len);
-        let kept_payload = payload.len();
-        let descriptor_start = 80 + descriptor_bytes - kept_descriptors;
-        let length_start = 80 + descriptor_bytes + length_bytes - kept_lengths;
-        let payload_start = 80 + descriptor_bytes + length_bytes + payload_bytes - kept_payload;
-        let end = 80 + kept_descriptors + kept_lengths + kept_payload;
-        self.bodies.reserve(0)?;
-        // Move IDs/descriptors, optional compact lengths, and payload separately.
-        self.bodies
-            .mutable()?
-            .copy_within(descriptor_start..80 + descriptor_bytes, 80);
-        self.bodies.mutable()?.copy_within(
-            length_start..80 + descriptor_bytes + length_bytes,
-            80 + kept_descriptors,
-        );
-        self.bodies
-            .mutable()?
-            .copy_within(payload_start.., 80 + kept_descriptors + kept_lengths);
-        self.bodies.truncate(end)?;
-        self.bodies.mutable()?[52..60].copy_from_slice(&sequence.to_be_bytes());
-        let remaining = remaining | if length_bytes != 0 { 1 << 31 } else { 0 };
-        self.bodies.mutable()?[76..80].copy_from_slice(&remaining.to_be_bytes());
-        self.entries[0].body.end = end;
-        self.entries[0].proof = None;
-        Ok(())
-    }
-
-    // One-batch canonical header: count, partition, owner, producer, epoch,
-    // sequence, then offset and timestamp. Called only after full typed decoding.
-    pub(super) fn replace_append_position(
-        &mut self,
-        index: usize,
-        position: [u8; 16],
-    ) -> Result<[u8; 16], JournalError> {
-        const START: usize = 4 + 16 + 8 + 16 + 8 + 8;
-        self.validated = false;
-        assert!(self.is_producer() && index < self.len());
-        let start = self.entries[index].body.start + START;
-        let target = &mut self.bodies.mutable()?[start..start + 16];
-        let previous = target.try_into().expect("fixed position fields");
-        target.copy_from_slice(&position);
-        Ok(previous)
-    }
-
-    pub(super) fn validated_producer_summary(
-        &self,
-        index: usize,
-    ) -> Option<ozzy_journal::operation::AppendBatchSummary> {
-        let entry = self.entries.get(index)?;
-        entry.proof?.summary(&self.bodies[entry.body.clone()]).ok()
-    }
 }
 
 /// Worker-validated application plans, not admission, persistence, or quorum evidence.
@@ -737,6 +534,7 @@ pub struct ValidatedAppend {
     pub(super) buffer: AppendBuffer,
     pub(super) plan: PreparedCanonicalGroup,
     pub(super) records: Vec<ozzy_journal_segment::PreparedOperationRecords>,
+    pub(super) dedup: Option<Box<super::owned::dedup::Prepared>>,
 }
 
 impl ValidatedAppend {
@@ -767,7 +565,8 @@ impl ValidatedAppend {
     }
 
     /// Discard unadmitted plans and recover the reusable payload arena.
-    pub fn into_buffer(self) -> AppendBuffer {
+    pub fn into_buffer(mut self) -> AppendBuffer {
+        self.buffer.restore_dedup_original();
         self.buffer
     }
 }

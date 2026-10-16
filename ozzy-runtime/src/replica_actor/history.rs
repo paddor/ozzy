@@ -6,6 +6,7 @@ use crate::replica_actor::HistoryReason;
 use ozzy_replication::wire::{FetchOps, OpsBatch};
 use ozzy_replication::{Digest, OpNumber};
 
+use super::deadline::Earliest;
 use super::io::FetchPurpose;
 use super::{
     ActorError, AppendBuffer, Bytes, Duration, LogSource, Message, NodeId, PendingIo, Prefix,
@@ -85,6 +86,13 @@ pub(super) struct Transfer {
     retry_at: Duration,
 }
 
+impl Transfer {
+    /// Add its next retry.
+    pub(super) fn deadlines(&self, next: Earliest) -> Earliest {
+        next.at(self.retry_at)
+    }
+}
+
 impl ReplicaActor {
     pub(super) fn complete_position(
         &mut self,
@@ -100,13 +108,36 @@ impl ReplicaActor {
         Ok(())
     }
 
+    /// Look up the digest of `op` in `source`: from the journal when it is the
+    /// pinned local source, otherwise through a lookup transfer. `reason`
+    /// names the failure when a local source is not pinned.
+    pub(super) fn lookup_history(
+        &mut self,
+        source: LogSource,
+        op: OpNumber,
+        reason: HistoryReason,
+    ) -> Result<(), ActorError> {
+        if source.voter != self.local {
+            let purpose = TransferPurpose::Lookup { op, found: None };
+            return self.start_transfer(self.driver.scope(), source, Prefix::GENESIS, purpose);
+        }
+        if self.pinned != Some(source) {
+            return Err(ActorError::history(reason));
+        }
+        self.pending = Some(PendingIo::Position(
+            self.journal.history_position(source, op)?,
+        ));
+        Ok(())
+    }
+
+    /// Fetch from `source` after `predecessor`; the first request goes out
+    /// on the next retry turn.
     pub(super) fn start_transfer(
         &mut self,
         scope: Scope,
         source: LogSource,
         predecessor: Prefix,
         purpose: TransferPurpose,
-        now: Duration,
     ) -> Result<(), ActorError> {
         self.transfer = Some(Transfer {
             request: FetchOps {
@@ -115,12 +146,12 @@ impl ReplicaActor {
                 source,
                 predecessor,
                 max_operations: u32::try_from(self.config.transfer.max_operations)
-                    .expect("validated bound"),
+                    .map_err(|_| ActorError::Limits)?,
                 max_body_bytes: u32::try_from(self.config.transfer.max_body_bytes)
-                    .expect("validated bound"),
+                    .map_err(|_| ActorError::Limits)?,
             },
             purpose,
-            retry_at: now,
+            retry_at: Duration::ZERO,
         });
         Ok(())
     }
@@ -155,7 +186,7 @@ impl ReplicaActor {
                 ));
             }
         } else {
-            transfer.retry_at = now + self.config.timing.retransmit;
+            transfer.retry_at = now.saturating_add(self.config.timing.retransmit);
             let Some(session) = self.session(request.source.voter) else {
                 return Ok(());
             };
@@ -166,11 +197,7 @@ impl ReplicaActor {
                 &mut self.metadata,
                 self.wire_limits,
             )?;
-            let message = Message::multipart([
-                Bytes::copy_from_slice(&encoded.header),
-                Bytes::copy_from_slice(&self.metadata[..encoded.metadata_bytes]),
-                Bytes::new(),
-            ]);
+            let message = super::control_message(encoded, &self.metadata);
             self.enqueue(request.source.voter, SendClass::Data, message)?;
         }
         Ok(())
@@ -205,7 +232,6 @@ impl ReplicaActor {
             return Ok(());
         }
         if self.pending.is_some()
-            || self.buffer.is_none()
             || self.promise.is_some()
             || self.pinned != Some(request.source)
             || request.scope != self.journal_scope
@@ -214,7 +240,9 @@ impl ReplicaActor {
         {
             return Ok(()); // No negative vote. Requester retains and retries its request.
         }
-        let buffer = self.buffer.take().expect("checked arena");
+        let Some(buffer) = self.buffer.take() else {
+            return Ok(());
+        };
         self.pending = Some(PendingIo::Fetch(
             self.journal
                 .fetch_history(request, buffer)
@@ -231,7 +259,7 @@ impl ReplicaActor {
     ) -> Result<(), ActorError> {
         if let Some(before) = fetched.retired_predecessor() {
             let request = fetched.request();
-            self.recycle(fetched.into_buffer());
+            self.recycle(fetched.into_buffer())?;
             return self.notify_retired(
                 to,
                 request.scope,
@@ -240,19 +268,21 @@ impl ReplicaActor {
             );
         }
         let Some(session) = self.session(to) else {
-            self.recycle(fetched.into_buffer());
+            self.recycle(fetched.into_buffer())?;
             return Ok(()); // Requester will retry after its new link is ready.
         };
         let operations: smallvec::SmallVec<[_; super::MAX_TRANSFER_OPERATIONS]> =
             fetched.wire_operations().collect();
         let encoded = wire::encode_ops(
-            self.local,
-            session,
+            wire::EncodeContext {
+                sender: self.local,
+                session,
+                limits: self.wire_limits,
+            },
             fetched.request(),
             &operations,
             &mut self.metadata,
             &mut self.payload,
-            self.wire_limits,
         )?;
         let message = Message::multipart([
             Bytes::copy_from_slice(&encoded.header),
@@ -260,7 +290,7 @@ impl ReplicaActor {
             Bytes::copy_from_slice(&self.payload[..encoded.payload_bytes]),
         ]);
         drop(operations);
-        self.recycle(fetched.into_buffer());
+        self.recycle(fetched.into_buffer())?;
         self.enqueue(to, SendClass::Data, message)
     }
 
@@ -295,7 +325,7 @@ impl ReplicaActor {
                 }
             }
             TransferPurpose::Install => {
-                if self.pending.is_some() || self.buffer.is_none() {
+                if self.pending.is_some() {
                     return Ok(());
                 }
                 let ticket = self
@@ -303,25 +333,10 @@ impl ReplicaActor {
                     .installation_ticket()
                     .ok_or_else(|| ActorError::history(HistoryReason::Lookup))?;
                 let bytes = batch.operations().map(|op| op.canonical().body.len()).sum();
-                if let Some(allocator) = &self.history_receive_allocator {
-                    self.buffer
-                        .as_mut()
-                        .expect("checked arena")
-                        .bind_allocator(allocator)?;
-                }
-                if !self
-                    .buffer
-                    .as_mut()
-                    .expect("checked arena")
-                    .reserve_incoming(bytes)?
-                {
-                    self.buffer
-                        .as_mut()
-                        .expect("checked arena")
-                        .restore_allocator(self.history_allocator.as_ref())?;
-                    return Ok(()); // Keep the transfer request for retry after memory returns.
-                }
-                let mut buffer = self.buffer.take().expect("checked arena");
+                // Without room, keep the transfer request for retry after memory returns.
+                let Some(mut buffer) = self.stage_arena(bytes)? else {
+                    return Ok(());
+                };
                 for operation in batch.operations() {
                     buffer.push(operation.canonical())?;
                 }
@@ -336,17 +351,32 @@ impl ReplicaActor {
         Ok(())
     }
 
-    pub(super) fn recycle(&mut self, mut buffer: AppendBuffer) {
+    pub(super) fn recycle(&mut self, mut buffer: AppendBuffer) -> Result<(), ActorError> {
         buffer.clear();
-        buffer
-            .restore_allocator(self.history_allocator.as_ref())
-            .expect("cleared history arena restores its original allocation source");
+        buffer.restore_allocator(self.history_allocator.as_ref())?;
         if self.buffer.is_none() {
             self.buffer = Some(buffer);
         } else {
             assert!(self.spare.is_none());
             self.spare = Some(buffer);
         }
+        Ok(())
+    }
+
+    /// Take the arena once it can stage `bytes`; otherwise leave it bound to
+    /// its usual allocator for a retry.
+    fn stage_arena(&mut self, bytes: usize) -> Result<Option<AppendBuffer>, ActorError> {
+        let Some(buffer) = self.buffer.as_mut() else {
+            return Ok(None);
+        };
+        if let Some(allocator) = &self.history_receive_allocator {
+            buffer.bind_allocator(allocator)?;
+        }
+        if !buffer.reserve_incoming(bytes)? {
+            buffer.restore_allocator(self.history_allocator.as_ref())?;
+            return Ok(None);
+        }
+        Ok(self.buffer.take())
     }
 }
 
@@ -397,11 +427,7 @@ impl ReplicaActor {
         self.enqueue(
             to,
             SendClass::Control,
-            Message::multipart([
-                Bytes::copy_from_slice(&encoded.header),
-                Bytes::copy_from_slice(&self.metadata[..encoded.metadata_bytes]),
-                Bytes::new(),
-            ]),
+            super::control_message(encoded, &self.metadata),
         )?;
         Ok(())
     }
@@ -432,11 +458,7 @@ impl ReplicaActor {
         self.enqueue(
             to,
             SendClass::Control,
-            Message::multipart([
-                Bytes::copy_from_slice(&encoded.header),
-                Bytes::copy_from_slice(&self.metadata[..encoded.metadata_bytes]),
-                Bytes::new(),
-            ]),
+            super::control_message(encoded, &self.metadata),
         )
     }
 
@@ -444,70 +466,77 @@ impl ReplicaActor {
         &mut self,
         from: NodeId,
         notice: wire::HistoryRetired,
-        now: Duration,
     ) -> Result<(), ActorError> {
         if notice.scope != self.driver.scope() {
             return Ok(());
         }
-        match notice.fence {
+        let behind = match notice.fence {
             wire::HistoryFence::Receive(epoch) => {
-                if from == self.configuration.primary(notice.scope.view)
+                from == self.configuration.primary(notice.scope.view)
                     && self.work.receive.ledger.report().channel.epoch == epoch
                     && self
                         .driver
                         .normal()
                         .is_some_and(|normal| normal.snapshot().accepted.op < notice.before.op)
-                {
-                    self.recovery_required = true;
-                    self.ingress.close();
-                }
             }
-            wire::HistoryFence::Fetch(id) => {
-                let Some(transfer) = self.transfer.filter(|transfer| {
-                    transfer.request.request_id == id
-                        && transfer.request.scope == notice.scope
-                        && transfer.request.source.voter == from
-                        && transfer.request.predecessor.op < notice.before.op
-                        && notice.before.op <= transfer.request.source.accepted.op
-                }) else {
-                    return Ok(());
-                };
-                if let TransferPurpose::Lookup { op, .. } = transfer.purpose
-                    && op >= notice.before.op
-                {
-                    if notice.before.op == transfer.request.source.accepted.op {
-                        if notice.before == transfer.request.source.accepted {
-                            self.lookup
-                                .verified(transfer.request.source, notice.before)?;
-                            self.transfer = None;
-                        }
-                        return Ok(());
-                    }
-                    // The boundary is only a scan starting point. No digest
-                    // enters election evidence until the exact tail verifies.
-                    self.start_transfer(
-                        notice.scope,
-                        transfer.request.source,
-                        notice.before,
-                        TransferPurpose::Lookup {
-                            op,
-                            found: (op == notice.before.op).then_some(notice.before),
-                        },
-                        now,
-                    )?;
-                } else if let TransferPurpose::Lookup { op, .. } = transfer.purpose
-                    && self.pinned.is_some_and(|local| {
-                        local.voter == self.local && local.accepted.op >= notice.before.op
-                    })
-                {
-                    self.bridge_or_retire(transfer.request.source, op, notice.before);
-                    self.transfer = None;
-                } else {
-                    self.recovery_required = true;
-                    self.ingress.close();
-                }
-            }
+            wire::HistoryFence::Fetch(id) => self.retired_transfer(from, id, notice)?,
+        };
+        if behind {
+            self.recovery_required = true;
+            self.ingress.close();
         }
         Ok(())
+    }
+
+    /// The donor retired history that transfer `id` asked for. A lookup scans
+    /// on from the boundary or bridges it; `true` when this copy fell behind.
+    fn retired_transfer(
+        &mut self,
+        from: NodeId,
+        id: ozzy_proto::RequestId,
+        notice: wire::HistoryRetired,
+    ) -> Result<bool, ActorError> {
+        let Some(transfer) = self.transfer.filter(|transfer| {
+            transfer.request.request_id == id
+                && transfer.request.scope == notice.scope
+                && transfer.request.source.voter == from
+                && transfer.request.predecessor.op < notice.before.op
+                && notice.before.op <= transfer.request.source.accepted.op
+        }) else {
+            return Ok(false);
+        };
+        if let TransferPurpose::Lookup { op, .. } = transfer.purpose
+            && op >= notice.before.op
+        {
+            if notice.before.op == transfer.request.source.accepted.op {
+                if notice.before == transfer.request.source.accepted {
+                    self.lookup
+                        .verified(transfer.request.source, notice.before)?;
+                    self.transfer = None;
+                }
+                return Ok(false);
+            }
+            // The boundary is only a scan starting point. No digest
+            // enters election evidence until the exact tail verifies.
+            self.start_transfer(
+                notice.scope,
+                transfer.request.source,
+                notice.before,
+                TransferPurpose::Lookup {
+                    op,
+                    found: (op == notice.before.op).then_some(notice.before),
+                },
+            )?;
+        } else if let TransferPurpose::Lookup { op, .. } = transfer.purpose
+            && self.pinned.is_some_and(|local| {
+                local.voter == self.local && local.accepted.op >= notice.before.op
+            })
+        {
+            self.bridge_or_retire(transfer.request.source, op, notice.before);
+            self.transfer = None;
+        } else {
+            return Ok(true);
+        }
+        Ok(false)
     }
 }

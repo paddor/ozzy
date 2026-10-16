@@ -22,6 +22,15 @@ impl Encoding {
         }
     }
 
+    /// Descriptor bytes before the part lengths: identity, tagged part count,
+    /// and encoding metadata.
+    pub const fn head_bytes(self) -> usize {
+        match self {
+            Self::Raw => 20,
+            Self::Lz4 { .. } => 24,
+        }
+    }
+
     /// Upper byte of the descriptor part count identifies the encoding.
     pub const fn tag(self) -> u32 {
         match self {

@@ -6,7 +6,6 @@ use super::{
     Client,
     cluster::{Cluster, Processes},
 };
-use ozzy_config::Confirmation;
 use std::{
     collections::BTreeMap,
     fs,
@@ -43,83 +42,79 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
 
 #[test]
 fn cli_recovery_preflights_every_replicated_selection_before_mutation() {
-    for policy in [Confirmation::DiskQuorum, Confirmation::ReplicatedPersisting] {
-        let cluster = Cluster::new(policy);
-        cluster.provision();
-        let lost = cluster.partition(0, 0);
-        let intact = cluster.partition(0, 1);
-        let before = snapshot(&intact);
-        fs::remove_dir_all(&lost).unwrap();
-        for selections in [
-            ["--replace", "orders/0", "--replace", "orders/999"],
-            ["--replace", "orders/0", "--quarantine", "orders/0"],
-            ["--replace", "orders/0", "--replace", "orders/1"],
-            ["--replace", "orders/0", "--resume", "orders/1"],
-            ["--replace", "orders/0", "--resume-full", "orders/1"],
-            ["--quarantine", "orders/1", "--replace", "orders/2"],
-        ] {
-            let error = refused(cluster.recover(0, &selections));
-            assert!(!error.is_empty(), "{policy:?}: {selections:?}");
-            assert!(
-                !lost.exists(),
-                "later invalid selection created a replacement"
-            );
-            assert_eq!(
-                snapshot(&intact),
-                before,
-                "later invalid selection mutated intact store"
-            );
-        }
-        refused(cluster.serve(0));
-        assert!(!lost.exists(), "ordinary serving created missing history");
-        assert_eq!(snapshot(&intact), before);
+    let cluster = Cluster::new();
+    cluster.provision();
+    let lost = cluster.partition(0, 0);
+    let intact = cluster.partition(0, 1);
+    let before = snapshot(&intact);
+    fs::remove_dir_all(&lost).unwrap();
+    for selections in [
+        ["--replace", "orders/0", "--replace", "orders/999"],
+        ["--replace", "orders/0", "--quarantine", "orders/0"],
+        ["--replace", "orders/0", "--replace", "orders/1"],
+        ["--replace", "orders/0", "--resume", "orders/1"],
+        ["--replace", "orders/0", "--resume-full", "orders/1"],
+        ["--quarantine", "orders/1", "--replace", "orders/2"],
+    ] {
+        let error = refused(cluster.recover(0, &selections));
+        assert!(!error.is_empty(), "{selections:?}");
+        assert!(
+            !lost.exists(),
+            "later invalid selection created a replacement"
+        );
+        assert_eq!(
+            snapshot(&intact),
+            before,
+            "later invalid selection mutated intact store"
+        );
     }
+    refused(cluster.serve(0));
+    assert!(!lost.exists(), "ordinary serving created missing history");
+    assert_eq!(snapshot(&intact), before);
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn cli_replacement_and_quarantine_start_nonvoting_without_donors() {
     tokio::time::timeout(Duration::from_secs(60), async {
-        for policy in [Confirmation::DiskQuorum, Confirmation::ReplicatedPersisting] {
-            let cluster = Cluster::new(policy);
-            cluster.provision();
-            let replaced = cluster.partition(0, 0);
-            let quarantined = cluster.partition(0, 1);
-            let configuration = fs::read(quarantined.join("CONFIGURATION")).unwrap();
-            let segments = snapshot(&quarantined.join("segments"));
-            assert!(!segments.is_empty());
-            fs::remove_dir_all(&replaced).unwrap();
-            let mut processes = Processes::default();
-            processes.restart_recovering(
-                &cluster,
-                0,
-                0,
-                &["--replace", "orders/0", "--quarantine", "orders/1"],
-            );
-            processes.ready(0).await;
-            let replacement_marker = fs::read(replaced.join("CONFIGURATION")).unwrap();
-            let quarantine_marker = fs::read(quarantined.join("CONFIGURATION")).unwrap();
-            assert!(replacement_marker.starts_with(b"OZYRECOV"));
-            assert!(quarantine_marker.starts_with(b"OZYRECOV"));
-            assert_ne!(quarantine_marker, configuration);
-            for (path, bytes) in segments {
-                assert_eq!(
-                    fs::read(quarantined.join("segments").join(path)).unwrap(),
-                    bytes
-                );
-            }
-            processes.stop(0, "TERM").await;
-            let before = [snapshot(&replaced), snapshot(&quarantined)];
-            refused(cluster.serve(0));
-            assert_eq!([snapshot(&replaced), snapshot(&quarantined)], before);
+        let cluster = Cluster::new();
+        cluster.provision();
+        let replaced = cluster.partition(0, 0);
+        let quarantined = cluster.partition(0, 1);
+        let configuration = fs::read(quarantined.join("CONFIGURATION")).unwrap();
+        let segments = snapshot(&quarantined.join("segments"));
+        assert!(!segments.is_empty());
+        fs::remove_dir_all(&replaced).unwrap();
+        let mut processes = Processes::default();
+        processes.restart_recovering(
+            &cluster,
+            0,
+            0,
+            &["--replace", "orders/0", "--quarantine", "orders/1"],
+        );
+        processes.ready(0).await;
+        let replacement_marker = fs::read(replaced.join("CONFIGURATION")).unwrap();
+        let quarantine_marker = fs::read(quarantined.join("CONFIGURATION")).unwrap();
+        assert!(replacement_marker.starts_with(b"OZYRECOV"));
+        assert!(quarantine_marker.starts_with(b"OZYRECOV"));
+        assert_ne!(quarantine_marker, configuration);
+        for (path, bytes) in segments {
             assert_eq!(
-                fs::read(replaced.join("CONFIGURATION")).unwrap(),
-                replacement_marker
-            );
-            assert_eq!(
-                fs::read(quarantined.join("CONFIGURATION")).unwrap(),
-                quarantine_marker
+                fs::read(quarantined.join("segments").join(path)).unwrap(),
+                bytes
             );
         }
+        processes.stop(0, "TERM").await;
+        let before = [snapshot(&replaced), snapshot(&quarantined)];
+        refused(cluster.serve(0));
+        assert_eq!([snapshot(&replaced), snapshot(&quarantined)], before);
+        assert_eq!(
+            fs::read(replaced.join("CONFIGURATION")).unwrap(),
+            replacement_marker
+        );
+        assert_eq!(
+            fs::read(quarantined.join("CONFIGURATION")).unwrap(),
+            quarantine_marker
+        );
     })
     .await
     .unwrap();
@@ -127,26 +122,13 @@ async fn cli_replacement_and_quarantine_start_nonvoting_without_donors() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn cli_interrupted_transfer_resumes_exact_history_with_disk_quorum() {
-    tokio::time::timeout(
-        Duration::from_secs(60),
-        interrupted(Confirmation::DiskQuorum),
-    )
-    .await
-    .unwrap();
+    tokio::time::timeout(Duration::from_secs(60), interrupted())
+        .await
+        .unwrap();
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn cli_interrupted_transfer_resumes_exact_history_with_replicated_persisting() {
-    tokio::time::timeout(
-        Duration::from_secs(60),
-        interrupted(Confirmation::ReplicatedPersisting),
-    )
-    .await
-    .unwrap();
-}
-
-async fn interrupted(policy: Confirmation) {
-    let cluster = Cluster::new(policy);
+async fn interrupted() {
+    let cluster = Cluster::new();
     cluster.provision();
     let mut processes = cluster.start();
     let (client, probe) = seed(&cluster, &mut processes).await;
@@ -175,7 +157,7 @@ async fn interrupted(policy: Confirmation) {
     assert!(marker.starts_with(b"OZYRECOV"));
     processes.stop(0, "KILL").await;
     refused(cluster.serve(0));
-    let selections = after_crash(&cluster, policy);
+    let selections = after_crash(&cluster);
     assert_eq!(
         &selections[..4],
         &["--resume", "orders/0", "--resume-full", "orders/1"]
@@ -202,7 +184,7 @@ async fn interrupted(policy: Confirmation) {
     assert_eq!([snapshot(&replaced), snapshot(&quarantined)], before);
     fs::write(replaced.join("CONFIGURATION"), &marker).unwrap();
 
-    let selections = after_crash(&cluster, policy);
+    let selections = after_crash(&cluster);
     processes.restart_recovering(&cluster, 0, 3, &selections);
     processes.ready(0).await;
     finish_resume(&cluster, &mut processes, client, &configurations).await;
@@ -264,23 +246,15 @@ async fn receive_and_interrupt(
     processes.stop(0, "KILL").await;
 }
 
-fn after_crash(cluster: &Cluster, policy: Confirmation) -> Vec<&'static str> {
-    let mut selections = vec!["--resume", "orders/0"];
-    // An unclean memory-voting partition requires explicit nonvoting recovery
-    // even when its payload files look intact. Disk-quorum neighbors can restart.
-    for (number, name) in [(1, "orders/1"), (2, "orders/2"), (3, "orders/3")] {
-        if number != 1 && policy == Confirmation::DiskQuorum {
-            continue;
-        }
-        let configuration = fs::read(cluster.partition(0, number).join("CONFIGURATION")).unwrap();
-        let flag = if configuration.starts_with(b"OZYRECOV") {
-            "--resume-full"
-        } else {
-            "--quarantine"
-        };
-        selections.extend([flag, name]);
-    }
-    selections
+fn after_crash(cluster: &Cluster) -> Vec<&'static str> {
+    // Disk-quorum neighbors restart intact.
+    let configuration = fs::read(cluster.partition(0, 1).join("CONFIGURATION")).unwrap();
+    let flag = if configuration.starts_with(b"OZYRECOV") {
+        "--resume-full"
+    } else {
+        "--quarantine"
+    };
+    vec!["--resume", "orders/0", flag, "orders/1"]
 }
 
 async fn finish_resume(

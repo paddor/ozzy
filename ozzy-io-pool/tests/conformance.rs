@@ -1,5 +1,14 @@
 //! The same ordered file workload through real workers and controlled storage.
 //! These are backend-contract checks, not broker power-loss qualification.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
 
 use ozzy_io::simulation::{self, Controller, Effect, Image, ImageLimits, Stage};
 use ozzy_io::{

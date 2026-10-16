@@ -7,10 +7,12 @@ use crate::replica_journal::InstallationConfig;
 use crate::replica_transport::QueueLimits;
 use omq_tokio::Message;
 use ozzy_proto::LinkSessionId;
+mod barriers;
+mod dedup;
 mod identities;
 mod maintenance;
 mod recovery;
-mod scheduled;
+pub(in crate::replica_journal::owned::tests) mod scheduled;
 
 type Actor = ControlledReplica;
 
@@ -27,7 +29,7 @@ pub(in crate::replica_journal::owned::tests) fn actor_config() -> ActorConfig {
         replay_cache: pipeline(),
         transfer: pipeline(),
         sync_batch_target: SyncBatchTarget::half_window(pipeline()),
-        sync_batch_max_age: Duration::from_millis(100),
+        evidence_quiet: Duration::ZERO,
         proposal_lanes: 1,
         proposal_capacity: 4,
         control: QueueLimits {
@@ -49,13 +51,8 @@ pub(in crate::replica_journal::owned::tests) fn actor_config() -> ActorConfig {
     }
 }
 
-fn cluster(
-    controller: &mut Controller,
-    io: &Local,
-    group: u8,
-    policy: QuorumPolicy,
-) -> (Vec<Actor>, PendingProposal) {
-    let (actors, mut pending, _) = cluster_with_proposals(controller, io, group, policy, 64, 1, 1);
+fn cluster(controller: &mut Controller, io: &Local, group: u8) -> (Vec<Actor>, PendingProposal) {
+    let (actors, mut pending, _) = cluster_with_proposals(controller, io, group, 64, 1, 1);
     (actors, pending.pop().unwrap())
 }
 
@@ -63,7 +60,6 @@ fn cluster_with_proposals(
     controller: &mut Controller,
     io: &Local,
     group: u8,
-    policy: QuorumPolicy,
     identities: usize,
     proposals: usize,
     operations: u8,
@@ -77,7 +73,7 @@ fn cluster_with_proposals(
     let mut submitter = None;
     let leader = group % 3;
     for broker in 0..3 {
-        let mut actor = unstarted_actor(controller, io, group, policy, broker, identities);
+        let mut actor = unstarted_actor(controller, io, group, broker, identities);
         if broker == leader {
             let mut lane = actor.take_submitter().unwrap();
             for proposal in 0..proposals {
@@ -145,42 +141,40 @@ fn round_with_observer(
 
 #[test]
 fn shard_owned_production_actors_confirm_independent_groups_with_different_leaders() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        let (mut controller, io) = setup();
-        let (first, first_result) = cluster(&mut controller, &io, 0, policy);
-        let (second, second_result) = cluster(&mut controller, &io, 1, policy);
-        let mut groups = [first, second];
-        let mut results = [Some(Box::pin(first_result)), Some(Box::pin(second_result))];
-        for step in 0..10000 {
-            let now = Duration::from_millis(step / 100);
-            for group in &mut groups {
-                round(group, now);
-            }
-            for (id, _) in controller.jobs() {
-                controller.execute(id, Effect::Normal).unwrap();
-                controller.deliver(id).unwrap();
-            }
-            for result in &mut results {
-                if let Some(pending) = result
-                    && let Poll::Ready(reply) = poll(pending.as_mut())
-                {
-                    assert!(
-                        matches!(reply.unwrap().outcome, ProposalOutcome::Committed { through, .. } if through.op.0 == 1)
-                    );
-                    *result = None;
-                }
-            }
-            if results.iter().all(Option::is_none) {
-                break;
+    let (mut controller, io) = setup();
+    let (first, first_result) = cluster(&mut controller, &io, 0);
+    let (second, second_result) = cluster(&mut controller, &io, 1);
+    let mut groups = [first, second];
+    let mut results = [Some(Box::pin(first_result)), Some(Box::pin(second_result))];
+    for step in 0..10000 {
+        let now = Duration::from_millis(step / 100);
+        for group in &mut groups {
+            round(group, now);
+        }
+        for (id, _) in controller.jobs() {
+            controller.execute(id, Effect::Normal).unwrap();
+            controller.deliver(id).unwrap();
+        }
+        for result in &mut results {
+            if let Some(pending) = result
+                && let Poll::Ready(reply) = poll(pending.as_mut())
+            {
+                assert!(
+                    matches!(reply.unwrap().outcome, ProposalOutcome::Committed { through, .. } if through.op.0 == 1)
+                );
+                *result = None;
             }
         }
-        assert!(
-            results.iter().all(Option::is_none),
-            "production actors failed to confirm"
-        );
-        for actor in groups.into_iter().flatten() {
-            close(&mut controller, actor);
+        if results.iter().all(Option::is_none) {
+            break;
         }
+    }
+    assert!(
+        results.iter().all(Option::is_none),
+        "production actors failed to confirm"
+    );
+    for actor in groups.into_iter().flatten() {
+        close(&mut controller, actor);
     }
 }
 
@@ -201,52 +195,50 @@ fn close(controller: &mut Controller, actor: Actor) {
 
 #[test]
 fn shard_owned_actor_leader_change_preserves_confirmed_history() {
-    for policy in [QuorumPolicy::Durable, QuorumPolicy::Replicated] {
-        let (mut controller, io) = setup();
-        let (mut actors, pending) = cluster(&mut controller, &io, 0, policy);
-        let mut pending = Box::pin(pending);
-        let mut confirmed = false;
-        for step in 0..10000 {
-            round(&mut actors, Duration::from_millis(step / 100));
-            for (id, _) in controller.jobs() {
-                controller.execute(id, Effect::Normal).unwrap();
-                controller.deliver(id).unwrap();
-            }
-            if let Poll::Ready(reply) = poll(pending.as_mut()) {
-                assert!(
-                    matches!(reply.unwrap().outcome, ProposalOutcome::Committed { through, .. } if through.op.0 == 1)
-                );
-                confirmed = true;
-                break;
-            }
+    let (mut controller, io) = setup();
+    let (mut actors, pending) = cluster(&mut controller, &io, 0);
+    let mut pending = Box::pin(pending);
+    let mut confirmed = false;
+    for step in 0..10000 {
+        round(&mut actors, Duration::from_millis(step / 100));
+        for (id, _) in controller.jobs() {
+            controller.execute(id, Effect::Normal).unwrap();
+            controller.deliver(id).unwrap();
         }
-        assert!(confirmed);
-        let mut elected = false;
-        for step in 0..20000 {
-            let now = Duration::from_secs(3) + Duration::from_millis(step / 100);
-            round_without(&mut actors, now, Some(0));
-            for (id, _) in controller.jobs() {
-                controller.execute(id, Effect::Normal).unwrap();
-                controller.deliver(id).unwrap();
-            }
-            if actors[1..].iter().all(|actor| {
-                let status = actor.status();
-                status.application_ready
-                    && status.scope.view > 0
-                    && status.normal.is_some_and(|normal| normal.applied.op.0 == 1)
-            }) {
-                elected = true;
-                break;
-            }
+        if let Poll::Ready(reply) = poll(pending.as_mut()) {
+            assert!(
+                matches!(reply.unwrap().outcome, ProposalOutcome::Committed { through, .. } if through.op.0 == 1)
+            );
+            confirmed = true;
+            break;
         }
-        assert!(
-            elected,
-            "surviving pair failed to activate selected history: {:?}",
-            actors.iter().map(Actor::status).collect::<Vec<_>>()
-        );
-        for actor in actors {
-            close(&mut controller, actor);
+    }
+    assert!(confirmed);
+    let mut elected = false;
+    for step in 0..20000 {
+        let now = Duration::from_secs(3) + Duration::from_millis(step / 100);
+        round_without(&mut actors, now, Some(0));
+        for (id, _) in controller.jobs() {
+            controller.execute(id, Effect::Normal).unwrap();
+            controller.deliver(id).unwrap();
         }
+        if actors[1..].iter().all(|actor| {
+            let status = actor.status();
+            status.application_ready
+                && status.scope.view > 0
+                && status.normal.is_some_and(|normal| normal.applied.op.0 == 1)
+        }) {
+            elected = true;
+            break;
+        }
+    }
+    assert!(
+        elected,
+        "surviving pair failed to activate selected history: {:?}",
+        actors.iter().map(Actor::status).collect::<Vec<_>>()
+    );
+    for actor in actors {
+        close(&mut controller, actor);
     }
 }
 
@@ -254,47 +246,67 @@ fn unstarted_actor(
     controller: &mut Controller,
     io: &Local,
     group: u8,
-    policy: QuorumPolicy,
     broker: u8,
     identities: usize,
 ) -> ReplicaActor {
-    unstarted_actor_with_sessions(
+    configured_actor(
         controller,
         io,
         group,
-        policy,
         broker,
-        identities,
-        actor_config().sessions,
+        ActorSettings {
+            identities,
+            ..Default::default()
+        },
     )
 }
 
-fn unstarted_actor_with_sessions(
+thread_local! {
+    /// Leader logical clock for actors this thread configures.
+    static CLOCK: std::cell::Cell<u64> = const { std::cell::Cell::new(123) };
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActorSettings {
+    identities: usize,
+    sessions: [LinkSessionId; 3],
+    deduplication: Option<ozzy_core::dedup::Limits>,
+}
+
+impl Default for ActorSettings {
+    fn default() -> Self {
+        Self {
+            identities: 64,
+            sessions: actor_config().sessions,
+            deduplication: None,
+        }
+    }
+}
+
+fn configured_actor(
     controller: &mut Controller,
     io: &Local,
     group: u8,
-    policy: QuorumPolicy,
     broker: u8,
-    identities: usize,
-    sessions: [LinkSessionId; 3],
+    settings: ActorSettings,
 ) -> ReplicaActor {
     let leader = group % 3;
-    let mut config = config(&format!("/g{group}-b{broker}"), group + 4, policy);
+    let mut config = config(&format!("/g{group}-b{broker}"), group + 4);
     let mut voters = std::array::from_fn(|n| ConfiguredVoter {
         node_id: NodeId::from_bytes([n as u8 + 1; 16]),
         principal: Digest::from_bytes([n as u8 + 20; 32]),
     });
     voters.rotate_left(usize::from(leader));
-    config.configuration = ozzy_replication::ConfigurationRecord::with_policy(
-        config.identity.group_id,
-        1,
-        voters,
-        policy,
-    )
-    .unwrap();
+    config.configuration =
+        ozzy_replication::ConfigurationRecord::new(config.identity.group_id, 1, voters).unwrap();
     config.identity.replica_node_id = NodeId::from_bytes([broker + 1; 16]);
     config.append_buffers = 12;
-    config.recovery.retained_identities = if broker == leader { identities } else { 8 };
+    config.deduplication = settings.deduplication;
+    config.recovery.retained_identities = if broker == leader {
+        settings.identities
+    } else {
+        8
+    };
     let (owner, startup) = drive(
         controller,
         OwnedJournal::format_new(
@@ -311,7 +323,7 @@ fn unstarted_actor_with_sessions(
                 turn_steps: 4,
                 ..Default::default()
             },
-            || 123,
+            || CLOCK.with(std::cell::Cell::get),
         )
         .unwrap();
     let ids = crate::replica_actor::ActorIds::deterministic(
@@ -321,7 +333,7 @@ fn unstarted_actor_with_sessions(
         journal,
         startup,
         ActorConfig {
-            sessions,
+            sessions: settings.sessions,
             ..actor_config()
         },
         ids,

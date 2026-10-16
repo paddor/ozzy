@@ -2,9 +2,7 @@
 
 use super::{Bytes, CachedBatch, DecodedCell, Range, RecordView};
 use ozzy_proto::Offset;
-
-/// Descriptor table, decoded byte count, and exact producer block within one body.
-pub(super) type PreparedBacking<'a> = (&'a [u8], usize, &'a Bytes, Range<usize>);
+use ozzy_proto::reader::PreparedBlock;
 
 /// A bounded range within one immutable canonical batch. No new payload owners.
 #[derive(Debug)]
@@ -18,7 +16,7 @@ pub struct RecordSpan<'a> {
 
 impl<'a> RecordSpan<'a> {
     /// Exact whole-APPEND producer block when this span covers its full batch.
-    pub fn prepared_backing(&self, maximum: usize) -> Option<PreparedBacking<'a>> {
+    pub fn prepared_backing(&self, maximum: usize) -> Option<PreparedBlock<'a>> {
         if self.range.start != 0
             || self.range.end != self.batch.records.len()
             || self.shared_backing_bytes? > maximum
@@ -26,12 +24,12 @@ impl<'a> RecordSpan<'a> {
             return None;
         }
         let prepared = self.batch.prepared.as_ref()?;
-        Some((
-            &self.body[prepared.descriptors.clone()],
-            prepared.decoded_bytes,
-            self.body,
-            prepared.encoded_payload.clone(),
-        ))
+        Some(PreparedBlock {
+            descriptors: &self.body[prepared.descriptors.clone()],
+            decoded_bytes: prepared.decoded_bytes,
+            body: self.body,
+            encoded: prepared.encoded_payload.clone(),
+        })
     }
 
     /// Whether this batch stores one compressed producer block.
@@ -115,11 +113,7 @@ impl<'a> RecordSpan<'a> {
             shared_backing_bytes: self.shared_backing_bytes,
             batch: self.batch,
             decoded: self.decoded,
-            record: self
-                .batch
-                .records
-                .get(index, self.body)
-                .expect("bounded record range"),
+            record: self.batch.records.record(index, self.body),
             index: index as u64,
         })
     }
@@ -293,12 +287,11 @@ mod tests {
             decoded: &DecodedCell::default(),
             range: 0..1024,
         };
-        let (descriptors, decoded_bytes, backing, range) =
-            full.prepared_backing(body.len()).unwrap();
-        assert_ne!(descriptors.len(), 0);
-        assert_eq!(decoded_bytes, decoded.len());
-        assert_eq!(&backing[range.clone()], encoded);
-        forward_prepared(descriptors, decoded_bytes, backing, range, &full);
+        let block = full.prepared_backing(body.len()).unwrap();
+        assert_ne!(block.descriptors.len(), 0);
+        assert_eq!(block.decoded_bytes, decoded.len());
+        assert_eq!(&block.body[block.encoded.clone()], encoded);
+        forward_prepared(block, &full);
         let partial = RecordSpan {
             range: 1..2,
             ..full
@@ -374,13 +367,8 @@ mod tests {
         (body, decoded, encoded, batch)
     }
 
-    fn forward_prepared(
-        descriptors: &[u8],
-        decoded_bytes: usize,
-        backing: &Bytes,
-        range: Range<usize>,
-        full: &RecordSpan<'_>,
-    ) {
+    fn forward_prepared(block: PreparedBlock<'_>, full: &RecordSpan<'_>) {
+        let decoded_bytes = block.decoded_bytes;
         let limits = DataLimits {
             max_records: 1024,
             ..DataLimits::default()
@@ -416,13 +404,7 @@ mod tests {
         .unwrap();
         output.allow_shared_payload();
         assert_eq!(
-            output.extend_shared_prepared_lz4(
-                descriptors,
-                decoded_bytes,
-                backing,
-                range.clone(),
-                full.len()
-            ),
+            output.extend_shared_prepared_lz4(block, full.len()),
             Ok(true)
         );
         assert_eq!(output.remaining().max_records, 0);

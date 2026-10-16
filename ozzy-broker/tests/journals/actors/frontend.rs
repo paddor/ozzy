@@ -2,7 +2,7 @@
 //! scheduling live in this fixture; all link, dispatch, and actor state is real.
 
 use super::*;
-use ozzy_broker::{Frontend, TransportLimits};
+use ozzy_broker::{Frontend, FrontendPlan, TransportLimits};
 use ozzy_proto::{EnvelopeLimits, Opcode, data::DataLimits, handshake};
 use ozzy_runtime::{
     dispatch::{self, Budget, Budgets, Class},
@@ -70,6 +70,7 @@ struct Network {
     peers: BTreeMap<NodeId, LinkSessionId>,
     replies: FuturesUnordered<Pending<ReplyResult>>,
     retries: VecDeque<Message>,
+    sequence: u64,
 }
 
 impl Network {
@@ -90,8 +91,12 @@ impl Network {
                         .disconnect_session(creation.group, peer, *previous, now)
                         .unwrap();
                 } else {
+                    let sessions = ozzy_runtime::replica_actor::SessionReplacement {
+                        expected: *previous,
+                        replacement: current,
+                    };
                     actors
-                        .replace_session(creation.group, peer, *previous, current, now)
+                        .replace_session(creation.group, peer, sessions, now)
                         .unwrap();
                 }
             }
@@ -119,7 +124,11 @@ impl Network {
                 Class::Control
             }
         };
-        match self.port.try_reply(class, message, backing(class)) {
+        self.sequence += 1;
+        match self
+            .port
+            .try_reply(class, message, backing(class), self.sequence)
+        {
             Ok(pending) => {
                 self.replies.push(pending);
                 Ok(())
@@ -241,9 +250,11 @@ async fn serve(mut context: ShardContext, run: ShardRun) -> Result<(), StartupEr
         context.plan.id,
         Kind::Broker,
         Class::Data,
-        32,
-        BACKING,
-        budgets().data.bytes,
+        ozzy_runtime::frontend::DataLaneLimits {
+            slots: 32,
+            maximum_retained_bytes: BACKING,
+            retained_budget_bytes: budgets().data.bytes,
+        },
     )
     .unwrap();
     let (control, control_rx) = ozzy_runtime::frontend::data_channel(
@@ -251,9 +262,11 @@ async fn serve(mut context: ShardContext, run: ShardRun) -> Result<(), StartupEr
         context.plan.id,
         Kind::Broker,
         Class::Control,
-        8,
-        128 * 1024,
-        budgets().control.bytes,
+        ozzy_runtime::frontend::DataLaneLimits {
+            slots: 8,
+            maximum_retained_bytes: 128 * 1024,
+            retained_budget_bytes: budgets().control.bytes,
+        },
     )
     .unwrap();
     let (configured, configuration) = oneshot::channel();
@@ -264,7 +277,7 @@ async fn serve(mut context: ShardContext, run: ShardRun) -> Result<(), StartupEr
     context.ready()?;
     let (links, port, frontend_finished) = tokio::select! {
         result = configuration => result.unwrap(),
-        () = context.shutdown.requested() => return actors.shutdown().await.map_err(failure),
+        () = context.shutdown.closed() => return actors.shutdown().await.map_err(failure),
     };
     let mut network = Network {
         local: run.local,
@@ -278,6 +291,7 @@ async fn serve(mut context: ShardContext, run: ShardRun) -> Result<(), StartupEr
             .collect(),
         replies: FuturesUnordered::new(),
         retries: VecDeque::new(),
+        sequence: 0,
     };
     let clock = std::time::Instant::now();
     let mut now = Duration::ZERO;
@@ -312,7 +326,7 @@ async fn serve(mut context: ShardContext, run: ShardRun) -> Result<(), StartupEr
         let data_ready = network.input[0].ready();
         let control_ready = network.input[1].ready();
         let event = tokio::select! {
-            () = context.shutdown.requested() => Event::Stop,
+            () = context.shutdown.closed() => Event::Stop,
             input = data_ready => match input {
                 Ok(input) => Event::Input(input),
                 Err(ozzy_runtime::frontend::DataLaneError::Closed) => Event::Stop,
@@ -341,7 +355,7 @@ async fn serve(mut context: ShardContext, run: ShardRun) -> Result<(), StartupEr
         };
         // As in production, a pending turn may observe transport closure while
         // another owner requests shutdown. Drain accepted journal work below.
-        if context.shutdown.is_requested() {
+        if context.shutdown.is_closed() {
             break;
         }
         match event {
@@ -450,11 +464,7 @@ async fn run_frontend(
         .unwrap();
     let buffers = ReceiveBuffers::new(EnvelopeLimits::default(), storage).unwrap();
     for peer in &peers {
-        context
-            .data
-            .connect(remote[peer].data_peer.parse().unwrap())
-            .await
-            .unwrap();
+        context.data.connect(&remote[peer].data_peer).await.unwrap();
     }
     let mut finished = Vec::new();
     for (id, configured) in ports {
@@ -470,8 +480,10 @@ async fn run_frontend(
     let result = context
         .serve(
             service,
-            brokers,
-            ozzy_broker::FollowerRoutes::default(),
+            ozzy_broker::RemoteBrokers {
+                control: brokers,
+                followers: ozzy_broker::FollowerRoutes::default(),
+            },
             buffers,
             Duration::from_millis(25),
         )
@@ -506,6 +518,7 @@ async fn start(brokers: &[(CheckedConfig, BrokerIdentity, JournalPlan)], format:
                     data_peer: format!("tcp://{}", sockets[2].local_addr().unwrap()),
                     reader_pub: format!("tcp://{}", sockets[1].local_addr().unwrap()),
                     follower_pub: None,
+                    admin: None,
                 };
                 listeners.insert(peer, sockets);
                 endpoints
@@ -515,6 +528,7 @@ async fn start(brokers: &[(CheckedConfig, BrokerIdentity, JournalPlan)], format:
                     data_peer: format!("inproc://actors-data-{namespace}-{peer}"),
                     reader_pub: format!("inproc://actors-reader-{namespace}-{peer}"),
                     follower_pub: None,
+                    admin: None,
                 }
             };
             (peer, endpoints)
@@ -607,14 +621,18 @@ async fn start(brokers: &[(CheckedConfig, BrokerIdentity, JournalPlan)], format:
             .collect();
         listeners.remove(&local); // Release test-only ephemeral port reservations.
         let frontend = Frontend::start_with_context(
-            &checked.plan,
-            local,
-            &endpoints,
-            TransportLimits {
-                send_messages: 8,
-                receive_messages: 8,
-                message_bytes: 256 * 1024,
-                close_linger: Duration::from_millis(5),
+            FrontendPlan {
+                broker: &checked.plan,
+                local,
+                endpoints: &endpoints,
+                limits: TransportLimits {
+                    send_messages: 8,
+                    receive_messages: 8,
+                    peers: 8,
+                    publication_messages: 8,
+                    message_bytes: 256 * 1024,
+                    close_linger: Duration::from_millis(5),
+                },
             },
             context.clone(),
             move |context| {
@@ -672,31 +690,24 @@ async fn start(brokers: &[(CheckedConfig, BrokerIdentity, JournalPlan)], format:
 
 #[tokio::test]
 async fn shared_peer_frontend_drives_native_partition_actors_and_restart_elections() {
-    for policy in [Confirmation::DiskQuorum, Confirmation::ReplicatedPersisting] {
-        let directory = tempfile::tempdir().unwrap();
-        let brokers = fixture(directory.path(), DeploymentMode::Three, policy, 6);
-        for (checked, local, _) in &brokers {
-            storage(checked, local);
-        }
-        for format in [true, false] {
-            tokio::time::timeout(Duration::from_secs(30), start(&brokers, format, false))
-                .await
-                .unwrap_or_else(|_| {
-                    panic!("shared frontend actor integration stalled: {policy:?}, format={format}")
-                });
-        }
+    let directory = tempfile::tempdir().unwrap();
+    let brokers = fixture(directory.path(), DeploymentMode::Three, 6);
+    for (checked, local, _) in &brokers {
+        storage(checked, local);
+    }
+    for format in [true, false] {
+        tokio::time::timeout(Duration::from_secs(30), start(&brokers, format, false))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("shared frontend actor integration stalled: format={format}")
+            });
     }
 }
 
 #[tokio::test]
 async fn tcp_shared_frontend_runs_native_shards_and_restart_elections() {
     let directory = tempfile::tempdir().unwrap();
-    let brokers = fixture(
-        directory.path(),
-        DeploymentMode::Three,
-        Confirmation::DiskQuorum,
-        6,
-    );
+    let brokers = fixture(directory.path(), DeploymentMode::Three, 6);
     for (checked, local, _) in &brokers {
         storage(checked, local);
     }
@@ -710,12 +721,7 @@ async fn tcp_shared_frontend_runs_native_shards_and_restart_elections() {
 #[tokio::test]
 async fn shared_peer_startup_does_not_wait_for_unavailable_third_broker() {
     let directory = tempfile::tempdir().unwrap();
-    let brokers = fixture(
-        directory.path(),
-        DeploymentMode::Three,
-        Confirmation::DiskQuorum,
-        2,
-    );
+    let brokers = fixture(directory.path(), DeploymentMode::Three, 2);
     for (checked, local, _) in &brokers[..2] {
         storage(checked, local);
     }

@@ -14,23 +14,18 @@ const REQUESTS: u64 = 8;
 #[tokio::test(flavor = "current_thread")]
 async fn production_writers_keep_progress_between_requests() {
     tokio::time::timeout(Duration::from_secs(60), async {
-        for policy in [Confirmation::LocalDurable, Confirmation::DiskQuorum] {
-            scenario(policy).await;
+        for mode in [DeploymentMode::Single, DeploymentMode::Three] {
+            scenario(mode).await;
         }
     })
     .await
     .unwrap();
 }
 
-async fn scenario(policy: Confirmation) {
+async fn scenario(mode: DeploymentMode) {
     let root = tempfile::tempdir().unwrap();
     let runtime = WriterRuntime::new().unwrap();
-    let mode = if policy == Confirmation::LocalDurable {
-        DeploymentMode::Single
-    } else {
-        DeploymentMode::Three
-    };
-    let deployment = deployment(root.path(), mode, policy, 1);
+    let deployment = deployment(root.path(), mode, 1);
     let sdk = links(&runtime, &deployment[0].0).await;
     let brokers = start_brokers(&runtime, deployment).await;
     // Two writers share the only partition.
@@ -81,7 +76,7 @@ async fn scenario(policy: Confirmation) {
         // Normal queue pressure parks the source rather than adding a wire round trip.
         assert!(
             stats.requests <= REQUESTS + 1,
-            "{policy:?}: {} requests sent for {REQUESTS} records",
+            "{mode:?}: {} requests sent for {REQUESTS} records",
             stats.requests
         );
     }
@@ -101,12 +96,7 @@ async fn production_writer_confirms_while_its_requests_keep_growing() {
     tokio::time::timeout(Duration::from_secs(30), async {
         let root = tempfile::tempdir().unwrap();
         let runtime = WriterRuntime::new().unwrap();
-        let deployment = deployment(
-            root.path(),
-            DeploymentMode::Single,
-            Confirmation::LocalDurable,
-            1,
-        );
+        let deployment = deployment(root.path(), DeploymentMode::Single, 1);
         let sdk = links(&runtime, &deployment[0].0).await;
         let brokers = start_brokers(&runtime, deployment).await;
         let mut writer = live_many(
@@ -166,24 +156,19 @@ async fn production_writer_confirms_while_its_requests_keep_growing() {
 #[tokio::test(flavor = "current_thread")]
 async fn production_reader_advances_while_partition_writers_keep_sending() {
     tokio::time::timeout(Duration::from_secs(30), async {
-        for policy in [Confirmation::LocalDurable, Confirmation::DiskQuorum] {
-            reader_during_sustained_writes(policy).await;
+        for mode in [DeploymentMode::Single, DeploymentMode::Three] {
+            reader_during_sustained_writes(mode).await;
         }
     })
     .await
     .unwrap();
 }
 
-async fn reader_during_sustained_writes(policy: Confirmation) {
+async fn reader_during_sustained_writes(mode: DeploymentMode) {
     const READ: u64 = 128;
     let root = tempfile::tempdir().unwrap();
     let runtime = WriterRuntime::new().unwrap();
-    let mode = if policy == Confirmation::LocalDurable {
-        DeploymentMode::Single
-    } else {
-        DeploymentMode::Three
-    };
-    let deployment = deployment(root.path(), mode, policy, 2);
+    let deployment = deployment(root.path(), mode, 2);
     let sdk = links(&runtime, &deployment[0].0).await;
     let brokers = start_brokers(&runtime, deployment).await;
     let mut reader = live_many(
@@ -237,7 +222,7 @@ async fn reader_during_sustained_writes(policy: Confirmation) {
     }
     for offset in 0..READ {
         let stage = format!(
-            "{policy:?} read offset {offset}, admitted {:?}, reader {:?}",
+            "{mode:?} read offset {offset}, admitted {:?}, reader {:?}",
             admitted
                 .iter()
                 .map(|count| count.load(Ordering::Acquire))

@@ -105,23 +105,27 @@ impl ValidatedDeployment {
             .map(|name| (name.clone(), next_id()))
             .collect();
         let mut topics = BTreeMap::<String, Vec<PartitionStore>>::new();
-        for placement in self.partition_placements(broker) {
-            let group =
-                shared.topics[&placement.topic].partitions[placement.partition as usize].group;
+        for placement in self.partition_placements(broker)? {
+            let group = shared
+                .partition(&placement.topic, placement.partition)?
+                .group;
+            let volume = *volumes
+                .get(&placement.device)
+                .ok_or_else(|| invalid(&placement.device, "unknown device"))?;
             topics
                 .entry(placement.topic)
                 .or_default()
                 .push(PartitionStore {
                     partition: placement.partition,
                     group,
-                    volume: volumes[&placement.device],
+                    volume,
                     store: next_id(),
                     generation: 1,
                 });
         }
         let identity = BrokerIdentity {
             cluster: shared.cluster,
-            broker: shared.brokers[broker],
+            broker: shared.broker_id(broker)?,
             volumes,
             topics,
         };
@@ -181,10 +185,10 @@ impl ValidatedDeployment {
                 optional_id(Some(store.store), &mut used, path)?;
             }
         }
-        for placement in self.partition_placements(broker) {
-            let stored = &identity.topics[&placement.topic][placement.partition as usize];
+        for placement in self.partition_placements(broker)? {
+            let stored = identity.store(&placement.topic, placement.partition)?;
             require(
-                stored.volume == identity.volumes[&placement.device],
+                identity.volumes.get(&placement.device) == Some(&stored.volume),
                 path,
                 "partition moved to another volume without explicit storage relocation",
             )?;

@@ -60,15 +60,15 @@ impl Cursor {
             return Poll::Ready(Ok(position));
         }
         if let Some(selector) = self.selector {
-            if self.seeking.is_none() {
-                match journal.seek_reader(ticket, partition, selector) {
-                    Ok(completion) => self.seeking = Some(completion),
+            let seeking = match &mut self.seeking {
+                Some(seeking) => seeking,
+                None => match journal.seek_reader(ticket, partition, selector) {
+                    Ok(completion) => self.seeking.insert(completion),
                     Err(SubmitError::Full) => return Poll::Pending,
                     Err(_) => return Poll::Ready(Err(Failure::new(11))),
-                }
-            }
-            let result =
-                std::task::ready!(Pin::new(self.seeking.as_mut().expect("pending seek")).poll(cx));
+                },
+            };
+            let result = std::task::ready!(Pin::new(seeking).poll(cx));
             self.seeking = None;
             let position = result.map_err(|error| failure(&error))?;
             self.position = Some(position);
@@ -84,15 +84,73 @@ impl Cursor {
         Poll::Ready(Ok(position))
     }
 
+    /// Read the next records of the log `output` carries, within its limits.
     pub(super) fn poll(
+        &mut self,
+        ticket: ValidationTicket,
+        journal: &mut ReplicaJournal,
+        output: &mut RecordsEncoder<'_>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<ReadState, Failure>> {
+        let cursor = std::task::ready!(self.poll_position(output.source(), ticket, journal, cx))?;
+        let reading = if let Some(reading) = &mut self.reading {
+            reading
+        } else {
+            let Some(buffer) = self.buffer.take().or_else(|| self.pool.try_lease()) else {
+                return Poll::Pending;
+            };
+            let limits = output.remaining();
+            match journal.read_delivery(
+                cursor,
+                PartitionReadLimits {
+                    max_records: limits.max_records,
+                    max_parts: limits.max_parts,
+                    max_payload_bytes: limits.envelope.max_payload_bytes,
+                },
+                buffer,
+            ) {
+                Ok(completion) => {
+                    self.read_started = crate::profiling::start();
+                    self.reading.insert(completion)
+                }
+                Err(rejected) => {
+                    self.buffer = Some(rejected.value);
+                    return if rejected.reason == SubmitError::Full {
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(Err(Failure::new(11)))
+                    };
+                }
+            }
+        };
+        let result = std::task::ready!(Pin::new(reading).poll(cx));
+        self.reading = None;
+        crate::profiling::finish(
+            crate::profiling::Stage::ReaderJournal,
+            self.read_started.take(),
+        );
+        let maximum = output.limits();
+        match result.and_then(|records| records.encode(output, maximum)) {
+            Ok(cursor) => {
+                self.position = Some(cursor);
+                Poll::Ready(Ok(if cursor.next_offset() == cursor.committed_end() {
+                    ReadState::CaughtUp
+                } else {
+                    ReadState::More
+                }))
+            }
+            Err(error) => Poll::Ready(Err(failure(&error))),
+        }
+    }
+
+    /// The cursor position for `source`, still under `ticket`'s authority.
+    fn poll_position(
         &mut self,
         source: Source,
         ticket: ValidationTicket,
         journal: &mut ReplicaJournal,
-        output: &mut RecordsEncoder<'_>,
-        maximum: ozzy_proto::data::DataLimits,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<ReadState, Failure>> {
+    ) -> Poll<Result<PartitionReadCursor, Failure>> {
         validate_source(source, ticket.scope())?;
         let Source::Group {
             partition,
@@ -109,52 +167,7 @@ impl Cursor {
         {
             return Poll::Ready(Err(Failure::new(5)));
         }
-        if self.reading.is_none() {
-            let Some(buffer) = self.buffer.take().or_else(|| self.pool.try_lease()) else {
-                return Poll::Pending;
-            };
-            let limits = output.remaining();
-            match journal.read_delivery(
-                cursor,
-                PartitionReadLimits {
-                    max_records: limits.max_records,
-                    max_parts: limits.max_parts,
-                    max_payload_bytes: limits.envelope.max_payload_bytes,
-                },
-                buffer,
-            ) {
-                Ok(completion) => {
-                    self.read_started = crate::profiling::start();
-                    self.reading = Some(completion);
-                }
-                Err(rejected) => {
-                    self.buffer = Some(rejected.value);
-                    return if rejected.reason == SubmitError::Full {
-                        Poll::Pending
-                    } else {
-                        Poll::Ready(Err(Failure::new(11)))
-                    };
-                }
-            }
-        }
-        let result =
-            std::task::ready!(Pin::new(self.reading.as_mut().expect("pending read")).poll(cx));
-        self.reading = None;
-        crate::profiling::finish(
-            crate::profiling::Stage::ReaderJournal,
-            self.read_started.take(),
-        );
-        match result.and_then(|records| records.encode(output, maximum)) {
-            Ok(cursor) => {
-                self.position = Some(cursor);
-                Poll::Ready(Ok(if cursor.next_offset() == cursor.committed_end() {
-                    ReadState::CaughtUp
-                } else {
-                    ReadState::More
-                }))
-            }
-            Err(error) => Poll::Ready(Err(failure(&error))),
-        }
+        Poll::Ready(Ok(cursor))
     }
 }
 

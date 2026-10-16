@@ -79,7 +79,7 @@ impl Workspace {
             .done(Operation::RemoveFile { path: path.clone() })
             .await?;
         self.files.remove(path);
-        self.name_bytes -= path.file_name().expect("owned run name").len();
+        self.name_bytes -= path.file_name().map_or(0, std::ffi::OsStr::len);
         Ok(())
     }
 

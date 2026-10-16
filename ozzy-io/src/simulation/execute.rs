@@ -15,6 +15,22 @@ struct Opened {
     data_sync: bool,
 }
 
+/// How a file handle opens; directory handles have no options.
+#[derive(Clone, Copy, Debug)]
+struct FileOptions {
+    mode: OpenMode,
+    direct: bool,
+    data_sync: bool,
+}
+
+impl FileOptions {
+    const DIRECTORY: Self = Self {
+        mode: OpenMode::Read,
+        direct: false,
+        data_sync: false,
+    };
+}
+
 #[derive(Debug)]
 pub(super) struct Files {
     owner: HandleOwner,
@@ -87,138 +103,6 @@ impl Files {
             .ok_or_else(|| io::ErrorKind::NotFound.into())
     }
 
-    pub(super) fn execute(
-        &mut self,
-        image: &mut Image,
-        limits: ImageLimits,
-        origin: usize,
-        operation: Operation,
-        effect: Effect,
-    ) -> io::Result<Outcome> {
-        if let Effect::FailBefore(error) = effect {
-            return Err(error.into());
-        }
-        if let Operation::Protected { operation, handles } = operation {
-            for handle in &handles {
-                self.get(handle)?;
-            }
-            let result = self.execute(image, limits, origin, *operation, effect);
-            drop(handles);
-            return result;
-        }
-        let result = self.apply(image, limits, origin, operation, effect)?;
-        match effect {
-            Effect::FailAfter(error) | Effect::WriteThenError { error, .. } => Err(error.into()),
-            _ => Ok(result),
-        }
-    }
-
-    fn apply(
-        &mut self,
-        image: &mut Image,
-        limits: ImageLimits,
-        origin: usize,
-        operation: Operation,
-        effect: Effect,
-    ) -> io::Result<Outcome> {
-        match operation {
-            Operation::Protected { .. } => unreachable!("protection handled before execution"),
-            Operation::Open {
-                path,
-                mode,
-                direct,
-                data_sync,
-            } => self.open(
-                image,
-                limits,
-                origin,
-                &path,
-                Some((mode, direct, data_sync)),
-            ),
-            Operation::OpenDirectory { path } => self.open(image, limits, origin, &path, None),
-            Operation::Read {
-                handle,
-                offset,
-                length,
-            } => self.read(image, &handle, offset, length, effect),
-            Operation::Write {
-                handle,
-                offset,
-                data,
-            } => self.write(image, limits, &handle, offset, &data, effect),
-            Operation::Metadata { handle } => {
-                let inode = self.get(&handle)?.inode;
-                let kind = image.kind(inode)?;
-                let length = if kind == FileKind::File {
-                    image.file(inode, false)?.len() as u64
-                } else {
-                    0
-                };
-                Ok(Outcome::Metadata(Metadata { kind, length }))
-            }
-            Operation::SetLength { handle, length } => {
-                let open = self.writable(&handle)?;
-                image.set_length(
-                    open.inode,
-                    usize::try_from(length).map_err(|_| io::ErrorKind::InvalidInput)?,
-                    false,
-                    limits,
-                )?;
-                Ok(Outcome::Done)
-            }
-            Operation::Allocate {
-                handle,
-                offset,
-                length,
-            } => self.allocate(image, limits, &handle, offset, length),
-            Operation::Sync { handle, .. } => {
-                image.sync(self.get(&handle)?.inode, limits)?;
-                Ok(Outcome::Done)
-            }
-            Operation::LockExclusive { handle } => self.lock(&handle),
-            Operation::Close { handle } => {
-                let key = self.key(&handle)?;
-                self.remove(key).ok_or(io::ErrorKind::NotFound)?;
-                Ok(Outcome::Done)
-            }
-            Operation::ReadDirectory {
-                path,
-                max_entries,
-                max_name_bytes,
-            } => Ok(Outcome::Directory(image.list(
-                &path,
-                max_entries,
-                max_name_bytes,
-            )?)),
-            Operation::CreateDirectory { path } => {
-                image.create(&path, true, limits)?;
-                Ok(Outcome::Done)
-            }
-            Operation::Rename {
-                source,
-                destination,
-            } => {
-                image.rename(&source, &destination)?;
-                Ok(Outcome::Done)
-            }
-            Operation::HardLink {
-                source,
-                destination,
-            } => {
-                image.link(&source, &destination, limits)?;
-                Ok(Outcome::Done)
-            }
-            Operation::RemoveFile { path } => {
-                image.remove(&path, false)?;
-                Ok(Outcome::Done)
-            }
-            Operation::RemoveDirectory { path } => {
-                image.remove(&path, true)?;
-                Ok(Outcome::Done)
-            }
-        }
-    }
-
     fn writable(&self, handle: &Handle) -> io::Result<&Opened> {
         let open = self.get(handle)?;
         if !open.writable {
@@ -227,106 +111,240 @@ impl Files {
         Ok(open)
     }
 
-    fn allocate(
-        &self,
-        image: &Image,
-        limits: ImageLimits,
-        handle: &Handle,
-        offset: u64,
-        length: u64,
-    ) -> io::Result<Outcome> {
-        image.file(self.writable(handle)?.inode, false)?;
-        if offset
+    /// Whether `origin` is below its open-handle share: the limit divides
+    /// evenly across shards, and the lowest shards take the remainder.
+    fn has_room(&self, origin: usize) -> bool {
+        let shards = self.used.len();
+        let maximum = self.limit / shards + usize::from(origin < self.limit % shards);
+        self.used[origin] < maximum
+    }
+}
+
+/// One physical job against the device: the handle table, the image and its
+/// bounds, the submitting shard, and the effect the schedule chose.
+pub(super) struct Execution<'a> {
+    pub(super) files: &'a mut Files,
+    pub(super) image: &'a mut Image,
+    pub(super) limits: ImageLimits,
+    pub(super) origin: usize,
+    pub(super) effect: Effect,
+}
+
+impl Execution<'_> {
+    pub(super) fn execute(&mut self, operation: Operation) -> io::Result<Outcome> {
+        if let Effect::FailBefore(error) = self.effect {
+            return Err(error.into());
+        }
+        if let Operation::Protected { operation, handles } = operation {
+            for handle in &handles {
+                self.files.get(handle)?;
+            }
+            let result = self.execute(*operation);
+            drop(handles);
+            return result;
+        }
+        let result = self.apply(operation)?;
+        match self.effect {
+            Effect::FailAfter(error) | Effect::WriteThenError { error, .. } => Err(error.into()),
+            _ => Ok(result),
+        }
+    }
+
+    /// Handle operations go through the handle table; namespace operations
+    /// act on the image by path.
+    fn apply(&mut self, operation: Operation) -> io::Result<Outcome> {
+        match operation {
+            Operation::Protected { .. } => unreachable!("protection handled before execution"),
+            Operation::Open {
+                path,
+                mode,
+                direct,
+                data_sync,
+            } => self.open(
+                &path,
+                Some(FileOptions {
+                    mode,
+                    direct,
+                    data_sync,
+                }),
+            ),
+            Operation::OpenDirectory { path } => self.open(&path, None),
+            Operation::Read {
+                handle,
+                offset,
+                length,
+            } => self.read(&handle, offset, length),
+            Operation::Write {
+                handle,
+                offset,
+                data,
+            } => self.write(&handle, offset, &data),
+            Operation::Metadata { handle } => self.metadata(&handle),
+            Operation::SetLength { handle, length } => self.set_length(&handle, length),
+            Operation::Allocate {
+                handle,
+                offset,
+                length,
+            } => self.allocate(&handle, offset, length),
+            Operation::Sync { handle, .. } => self.sync(&handle),
+            Operation::LockExclusive { handle } => self.lock(&handle),
+            Operation::Close { handle } => {
+                let key = self.files.key(&handle)?;
+                self.files.remove(key).ok_or(io::ErrorKind::NotFound)?;
+                Ok(Outcome::Done)
+            }
+            namespace @ (Operation::ReadDirectory { .. }
+            | Operation::CreateDirectory { .. }
+            | Operation::Rename { .. }
+            | Operation::HardLink { .. }
+            | Operation::RemoveFile { .. }
+            | Operation::RemoveDirectory { .. }) => self.namespace(namespace),
+        }
+    }
+
+    fn namespace(&mut self, operation: Operation) -> io::Result<Outcome> {
+        match operation {
+            Operation::ReadDirectory {
+                path,
+                max_entries,
+                max_name_bytes,
+            } => {
+                let entries = self.image.list(&path, max_entries, max_name_bytes)?;
+                return Ok(Outcome::Directory(entries));
+            }
+            Operation::CreateDirectory { path } => {
+                self.image.create(&path, true, self.limits)?;
+            }
+            Operation::Rename {
+                source,
+                destination,
+            } => self.image.rename(&source, &destination)?,
+            Operation::HardLink {
+                source,
+                destination,
+            } => self.image.link(&source, &destination, self.limits)?,
+            Operation::RemoveFile { path } => self.image.remove(&path, false)?,
+            Operation::RemoveDirectory { path } => self.image.remove(&path, true)?,
+            _ => unreachable!("apply routes only namespace operations here"),
+        }
+        Ok(Outcome::Done)
+    }
+
+    fn metadata(&self, handle: &Handle) -> io::Result<Outcome> {
+        let inode = self.files.get(handle)?.inode;
+        let kind = self.image.kind(inode)?;
+        let length = if kind == FileKind::File {
+            self.image.file(inode, false)?.len() as u64
+        } else {
+            0
+        };
+        Ok(Outcome::Metadata(Metadata { kind, length }))
+    }
+
+    fn set_length(&mut self, handle: &Handle, length: u64) -> io::Result<Outcome> {
+        let inode = self.files.writable(handle)?.inode;
+        let length = usize::try_from(length).map_err(|_| io::ErrorKind::InvalidInput)?;
+        self.image.set_length(inode, length, false, self.limits)?;
+        Ok(Outcome::Done)
+    }
+
+    fn sync(&mut self, handle: &Handle) -> io::Result<Outcome> {
+        let inode = self.files.get(handle)?.inode;
+        if !matches!(self.effect, Effect::SkipBarrier) {
+            self.image.sync(inode, self.limits)?;
+        }
+        Ok(Outcome::Done)
+    }
+
+    fn allocate(&mut self, handle: &Handle, offset: u64, length: u64) -> io::Result<Outcome> {
+        let inode = self.files.writable(handle)?.inode;
+        self.image.file(inode, false)?;
+        let file_bytes = self.limits.file_bytes;
+        let Some(end) = offset
             .checked_add(length)
-            .is_none_or(|end| end > limits.file_bytes as u64)
-        {
+            .and_then(|end| usize::try_from(end).ok())
+            .filter(|&end| end <= file_bytes)
+        else {
             return Err(io::Error::new(
                 io::ErrorKind::StorageFull,
                 format!(
-                    "simulation allocation {offset} + {length} exceeds {} file bytes",
-                    limits.file_bytes
+                    "simulation allocation {offset} + {length} exceeds {file_bytes} file bytes"
                 ),
             ));
-        }
+        };
         // KEEP_SIZE changes no readable bytes. Allocation failure is also an
         // explicit fault event; this model does not emulate extent accounting.
+        // Reserving memory keeps appends into the range from copying the file.
+        self.image.reserve(inode, end)?;
         Ok(Outcome::Done)
     }
 
     fn lock(&mut self, handle: &Handle) -> io::Result<Outcome> {
-        let inode = self.get(handle)?.inode;
-        let key = self.key(handle)?;
-        if self.locks.get(&inode).is_some_and(|owner| *owner != key) {
+        let inode = self.files.get(handle)?.inode;
+        let key = self.files.key(handle)?;
+        if self
+            .files
+            .locks
+            .get(&inode)
+            .is_some_and(|owner| *owner != key)
+        {
             return Err(io::ErrorKind::WouldBlock.into());
         }
-        self.locks.insert(inode, key);
+        self.files.locks.insert(inode, key);
         Ok(Outcome::Done)
     }
 
-    fn open(
-        &mut self,
-        image: &mut Image,
-        limits: ImageLimits,
-        origin: usize,
-        path: &Path,
-        options: Option<(OpenMode, bool, bool)>,
-    ) -> io::Result<Outcome> {
-        self.reclaim();
-        let maximum =
-            self.limit / self.used.len() + usize::from(origin < self.limit % self.used.len());
-        if self.used[origin] == maximum {
+    fn open(&mut self, path: &Path, file: Option<FileOptions>) -> io::Result<Outcome> {
+        let origin = self.origin;
+        self.files.reclaim();
+        if !self.files.has_room(origin) {
             return Err(io::ErrorKind::WouldBlock.into());
         }
-        let key = self.next;
+        let key = self.files.next;
         let next = key.checked_add(1).ok_or(io::ErrorKind::StorageFull)?;
-        let inode = if matches!(options, Some((OpenMode::CreateNew, _, _))) {
-            image.create(path, false, limits)?
+        let inode = if file.is_some_and(|file| file.mode == OpenMode::CreateNew) {
+            self.image.create(path, false, self.limits)?
         } else {
-            image.resolve(path, false)?
+            self.image.resolve(path, false)?
         };
-        let kind = image.kind(inode)?;
-        if (options.is_none() && kind != FileKind::Directory)
-            || (options.is_some() && kind != FileKind::File)
-        {
+        let expected = if file.is_some() {
+            FileKind::File
+        } else {
+            FileKind::Directory
+        };
+        if self.image.kind(inode)? != expected {
             return Err(io::ErrorKind::InvalidInput.into());
         }
-        let (mode, direct, data_sync) = options.unwrap_or((OpenMode::Read, false, false));
+        let options = file.unwrap_or(FileOptions::DIRECTORY);
         // Reclamation is explicit at the controller's next scheduling point.
-        let (handle, token) = self.owner.create(key, futures::task::noop_waker());
-        self.handles.insert(
+        let (handle, token) = self.files.owner.create(key, futures::task::noop_waker());
+        self.files.handles.insert(
             key,
             Opened {
                 inode,
                 origin,
                 token,
-                writable: mode != OpenMode::Read,
-                direct,
-                data_sync,
+                writable: options.mode != OpenMode::Read,
+                direct: options.direct,
+                data_sync: options.data_sync,
             },
         );
-        self.next = next;
-        self.used[origin] += 1;
+        self.files.next = next;
+        self.files.used[origin] += 1;
         Ok(Outcome::Opened(handle))
     }
 
-    fn read(
-        &self,
-        image: &Image,
-        handle: &Handle,
-        offset: u64,
-        length: usize,
-        effect: Effect,
-    ) -> io::Result<Outcome> {
-        let open = self.get(handle)?;
+    fn read(&self, handle: &Handle, offset: u64, length: usize) -> io::Result<Outcome> {
+        let open = self.files.get(handle)?;
         if open.direct {
             return Err(io::ErrorKind::Unsupported.into());
         }
-        let file = image.file(open.inode, false)?;
+        let file = self.image.file(open.inode, false)?;
         let start = usize::try_from(offset)
             .unwrap_or(usize::MAX)
             .min(file.len());
         let mut count = length.min(file.len() - start);
-        if let Effect::Short(limit) = effect {
+        if let Effect::Short(limit) = self.effect {
             count = count.min(limit);
         }
         let mut bytes = vec![0; length].into_boxed_slice();
@@ -334,20 +352,13 @@ impl Files {
         Ok(Outcome::Read(ReadBuffer::new(bytes, count)?))
     }
 
-    fn write(
-        &self,
-        image: &mut Image,
-        limits: ImageLimits,
-        handle: &Handle,
-        offset: u64,
-        data: &WriteBuffer,
-        effect: Effect,
-    ) -> io::Result<Outcome> {
-        let open = self.writable(handle)?;
+    fn write(&mut self, handle: &Handle, offset: u64, data: &WriteBuffer) -> io::Result<Outcome> {
+        let open = self.files.writable(handle)?;
         if open.direct && (!offset.is_multiple_of(4096) || !data.len().is_multiple_of(4096)) {
             return Err(io::ErrorKind::InvalidInput.into());
         }
-        let count = match effect {
+        let (inode, data_sync) = (open.inode, open.data_sync);
+        let count = match self.effect {
             Effect::Short(n) | Effect::WriteThenError { bytes: n, .. } => n.min(data.len()),
             _ => data.len(),
         };
@@ -360,11 +371,17 @@ impl Files {
                 break;
             }
         }
-        image.write(open.inode, offset, &bytes, limits)?;
-        if open.data_sync && !matches!(effect, Effect::WriteThenError { .. }) {
+        self.image.write(inode, offset, &bytes, self.limits)?;
+        if data_sync
+            && !matches!(
+                self.effect,
+                Effect::WriteThenError { .. } | Effect::SkipBarrier
+            )
+        {
             // O_DSYNC preserves this write, not unrelated dirty ranges from
             // another buffered descriptor. Directory publication is separate.
-            image.persist_inode_range(open.inode, offset..offset + count, limits)?;
+            self.image
+                .persist_inode_range(inode, offset..offset + count, self.limits)?;
         }
         Ok(Outcome::Written(count))
     }

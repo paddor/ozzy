@@ -4,12 +4,16 @@ use super::{
     CodecError, DataLimits, ENVELOPE_BYTES, Envelope, PublicationHeader, RecordHeader, data,
 };
 
+use crate::layout;
+
 mod shared;
+pub use shared::PreparedBlock;
 
 /// Encode available records into one bounded reader message. This controls the
 /// application record table, not OMQ transport framing or write coalescing.
 #[derive(Debug)]
 pub struct RecordsEncoder<'a> {
+    source: super::Source,
     first_offset: u64,
     envelope: Envelope,
     metadata: &'a mut Vec<u8>,
@@ -33,12 +37,13 @@ impl<'a> RecordsEncoder<'a> {
         payload: &'a mut Vec<u8>,
         limits: DataLimits,
     ) -> Result<Self, CodecError> {
-        super::command(envelope, super::Opcode::Records, false)?;
+        super::command(envelope, super::Opcode::Records)?;
         header.subscription.validate()?;
         header.source.validate()?;
-        let count_at = 45 + header.source.size();
-        envelope.validate_frames(count_at + 4, 0, limits.envelope)?;
-        data::capacity(metadata, count_at + 4)?;
+        let count_at = data::add(45, header.source.size())?;
+        let header_bytes = data::add(count_at, 4)?;
+        envelope.validate_frames(header_bytes, 0, limits.envelope)?;
+        data::capacity(metadata, header_bytes)?;
         metadata.clear();
         header.subscription.encode(metadata);
         Ok(Self::begin(
@@ -59,11 +64,12 @@ impl<'a> RecordsEncoder<'a> {
         payload: &'a mut Vec<u8>,
         limits: DataLimits,
     ) -> Result<Self, CodecError> {
-        super::command(envelope, super::Opcode::RecordsPub, false)?;
+        super::command(envelope, super::Opcode::RecordsPub)?;
         super::publication_topic(header.source)?;
-        let count_at = 13 + header.source.size();
-        envelope.validate_frames(count_at + 4, 0, limits.envelope)?;
-        data::capacity(metadata, count_at + 4)?;
+        let count_at = data::add(13, header.source.size())?;
+        let header_bytes = data::add(count_at, 4)?;
+        envelope.validate_frames(header_bytes, 0, limits.envelope)?;
+        data::capacity(metadata, header_bytes)?;
         metadata.clear();
         Ok(Self::begin(
             envelope,
@@ -91,6 +97,7 @@ impl<'a> RecordsEncoder<'a> {
         let count_at = metadata.len();
         metadata.extend_from_slice(&[0; 4]);
         Self {
+            source,
             first_offset,
             envelope,
             metadata,
@@ -106,6 +113,16 @@ impl<'a> RecordsEncoder<'a> {
         }
     }
 
+    /// The log whose records this message carries.
+    pub const fn source(&self) -> super::Source {
+        self.source
+    }
+
+    /// The bounds this message was started with.
+    pub const fn limits(&self) -> DataLimits {
+        self.limits
+    }
+
     /// Remaining record, part and payload capacity for a storage read.
     pub fn remaining(&self) -> DataLimits {
         let encoded = self.has_encoded_payload();
@@ -114,19 +131,26 @@ impl<'a> RecordsEncoder<'a> {
             max_records: if encoded {
                 0
             } else {
-                self.limits.max_records - self.records
+                self.limits.max_records.saturating_sub(self.records)
             },
             max_parts: if encoded {
                 0
             } else {
-                self.limits.max_parts - self.parts
+                self.limits.max_parts.saturating_sub(self.parts)
             },
             envelope: super::EnvelopeLimits {
-                max_metadata_bytes: self.limits.envelope.max_metadata_bytes - self.metadata.len(),
+                max_metadata_bytes: self
+                    .limits
+                    .envelope
+                    .max_metadata_bytes
+                    .saturating_sub(self.metadata.len()),
                 max_payload_bytes: if encoded {
                     0
                 } else {
-                    self.limits.envelope.max_payload_bytes - self.payload_bytes()
+                    self.limits
+                        .envelope
+                        .max_payload_bytes
+                        .saturating_sub(self.payload_bytes())
                 },
             },
         }
@@ -153,10 +177,11 @@ impl<'a> RecordsEncoder<'a> {
         if self.has_encoded_payload() {
             return Err(CodecError::Limit);
         }
-        self.materialize();
+        self.materialize()?;
         let records = data::add(self.records, 1)?;
         data::record_count(records, self.first_offset, self.limits)?;
-        if self.parts == self.limits.max_parts || payload.len() > self.limits.max_record_bytes {
+        let parts = data::add(self.parts, 1)?;
+        if parts > self.limits.max_parts || payload.len() > self.limits.max_record_bytes {
             return Err(CodecError::Limit);
         }
         let length = data::count(payload.len())?;
@@ -177,10 +202,9 @@ impl<'a> RecordsEncoder<'a> {
         self.metadata.extend_from_slice(&descriptor);
         self.payload.extend_from_slice(payload);
         self.records = records;
-        self.parts += 1;
-        self.metadata[self.count_at..self.count_at + 4]
-            .copy_from_slice(&(records as u32).to_be_bytes());
-        self.set_raw_payload_bytes();
+        self.parts = parts;
+        layout::patch(self.metadata, self.count_at, (records as u32).to_be_bytes())?;
+        self.set_raw_payload_bytes()?;
         Ok(())
     }
 
@@ -196,7 +220,7 @@ impl<'a> RecordsEncoder<'a> {
         if self.has_encoded_payload() {
             return Err(CodecError::Limit);
         }
-        self.materialize();
+        self.materialize()?;
         let first = self
             .first_offset
             .checked_add(self.records as u64)
@@ -211,13 +235,13 @@ impl<'a> RecordsEncoder<'a> {
         data::capacity(self.payload, bytes)?;
         let parts =
             data::validate_record_entries(descriptors, payload, count, first, self.remaining())?.0;
+        let parts = data::add(self.parts, parts)?;
         self.metadata.extend_from_slice(descriptors);
         self.payload.extend_from_slice(payload);
         self.records = records;
-        self.parts += parts;
-        self.metadata[self.count_at..self.count_at + 4]
-            .copy_from_slice(&(records as u32).to_be_bytes());
-        self.set_raw_payload_bytes();
+        self.parts = parts;
+        layout::patch(self.metadata, self.count_at, (records as u32).to_be_bytes())?;
+        self.set_raw_payload_bytes()?;
         Ok(())
     }
 
@@ -231,7 +255,7 @@ impl<'a> RecordsEncoder<'a> {
         if self.has_encoded_payload() {
             return Err(CodecError::Limit);
         }
-        self.materialize();
+        self.materialize()?;
         let remaining = self.remaining();
         let first = self
             .first_offset
@@ -239,9 +263,13 @@ impl<'a> RecordsEncoder<'a> {
             .ok_or(CodecError::Length)?;
         let count = records.len();
         data::record_count(count, first, remaining)?;
-        data::count(data::add(self.records, count)?)?;
+        let total = data::add(self.records, count)?;
+        data::count(total)?;
         let before = (self.metadata.len(), self.payload.len());
-        let parts = match self.write_entries(records) {
+        let written = self
+            .write_entries(records)
+            .and_then(|parts| data::add(self.parts, parts));
+        let parts = match written {
             Ok(parts) => parts,
             Err(error) => {
                 self.metadata.truncate(before.0);
@@ -249,11 +277,10 @@ impl<'a> RecordsEncoder<'a> {
                 return Err(error);
             }
         };
-        self.records += count;
-        self.parts += parts;
-        self.metadata[self.count_at..self.count_at + 4]
-            .copy_from_slice(&(self.records as u32).to_be_bytes());
-        self.set_raw_payload_bytes();
+        self.records = total;
+        self.parts = parts;
+        layout::patch(self.metadata, self.count_at, (total as u32).to_be_bytes())?;
+        self.set_raw_payload_bytes()?;
         Ok(())
     }
 
@@ -266,21 +293,9 @@ impl<'a> RecordsEncoder<'a> {
     {
         let mut total_parts = 0;
         for (id, encoding, parts) in records {
-            let header_end = data::add(self.metadata.len(), 20 + encoding.metadata_bytes())?;
-            frame_capacity(
-                self.metadata,
-                header_end,
-                self.limits.envelope.max_metadata_bytes,
-            )?;
-            self.metadata.extend_from_slice(id.as_bytes());
-            let count_at = self.metadata.len();
-            self.metadata.extend_from_slice(&[0; 4]);
-            if let data::Encoding::Lz4 { decoded_bytes } = encoding {
-                self.metadata
-                    .extend_from_slice(&decoded_bytes.to_be_bytes());
-            }
-            let payload_start = self.payload.len();
-            let mut count = 0;
+            let count_at = self.begin_entry(id, encoding)?;
+            let mut record_bytes = 0_usize;
+            let mut count = 0_u32;
             for part in parts {
                 if encoding
                     .frame_offset(part, self.limits.max_parts, self.limits.max_record_bytes)
@@ -290,28 +305,11 @@ impl<'a> RecordsEncoder<'a> {
                 }
                 total_parts = data::add(total_parts, 1)?;
                 data::count(total_parts)?;
-                if total_parts > self.limits.max_parts - self.parts {
+                if data::add(self.parts, total_parts)? > self.limits.max_parts {
                     return Err(CodecError::Limit);
                 }
-                let part_bytes = data::count(part.len())?;
-                let metadata_end = data::add(self.metadata.len(), 4)?;
-                let payload_end = data::add(self.payload.len(), part.len())?;
-                if payload_end - payload_start > self.limits.max_record_bytes {
-                    return Err(CodecError::Limit);
-                }
-                frame_capacity(
-                    self.metadata,
-                    metadata_end,
-                    self.limits.envelope.max_metadata_bytes,
-                )?;
-                frame_capacity(
-                    self.payload,
-                    payload_end,
-                    self.limits.envelope.max_payload_bytes,
-                )?;
-                self.metadata.extend_from_slice(&part_bytes.to_be_bytes());
-                self.payload.extend_from_slice(part);
-                count += 1_u32;
+                self.push_part(part, &mut record_bytes)?;
+                count = count.checked_add(1).ok_or(CodecError::Length)?;
             }
             if !encoding.validate(
                 count as usize,
@@ -320,10 +318,61 @@ impl<'a> RecordsEncoder<'a> {
             ) {
                 return Err(CodecError::Parts);
             }
-            self.metadata[count_at..count_at + 4]
-                .copy_from_slice(&(count | encoding.tag()).to_be_bytes());
+            layout::patch(
+                self.metadata,
+                count_at,
+                (count | encoding.tag()).to_be_bytes(),
+            )?;
         }
         Ok(total_parts)
+    }
+
+    /// Write one descriptor head within the frame limit. Returns where its
+    /// part count goes once the parts are known.
+    fn begin_entry(
+        &mut self,
+        id: crate::MessageId,
+        encoding: data::Encoding,
+    ) -> Result<usize, CodecError> {
+        let header_end = data::add(self.metadata.len(), encoding.head_bytes())?;
+        frame_capacity(
+            self.metadata,
+            header_end,
+            self.limits.envelope.max_metadata_bytes,
+        )?;
+        self.metadata.extend_from_slice(id.as_bytes());
+        let count_at = self.metadata.len();
+        self.metadata.extend_from_slice(&[0; 4]);
+        if let data::Encoding::Lz4 { decoded_bytes } = encoding {
+            self.metadata
+                .extend_from_slice(&decoded_bytes.to_be_bytes());
+        }
+        Ok(count_at)
+    }
+
+    /// Append one part's length and bytes, charging `record_bytes` against
+    /// the record limit and both frames against theirs.
+    fn push_part(&mut self, part: &[u8], record_bytes: &mut usize) -> Result<(), CodecError> {
+        let part_bytes = data::count(part.len())?;
+        let metadata_end = data::add(self.metadata.len(), 4)?;
+        let payload_end = data::add(self.payload.len(), part.len())?;
+        *record_bytes = data::add(*record_bytes, part.len())?;
+        if *record_bytes > self.limits.max_record_bytes {
+            return Err(CodecError::Limit);
+        }
+        frame_capacity(
+            self.metadata,
+            metadata_end,
+            self.limits.envelope.max_metadata_bytes,
+        )?;
+        frame_capacity(
+            self.payload,
+            payload_end,
+            self.limits.envelope.max_payload_bytes,
+        )?;
+        self.metadata.extend_from_slice(&part_bytes.to_be_bytes());
+        self.payload.extend_from_slice(part);
+        Ok(())
     }
 
     /// Adopt a complete packed batch into an empty response. Validate all bounds
@@ -352,9 +401,12 @@ impl<'a> RecordsEncoder<'a> {
         std::mem::swap(self.payload, &mut buffer.payload);
         self.records = buffer.count;
         self.parts = buffer.parts;
-        self.metadata[self.count_at..self.count_at + 4]
-            .copy_from_slice(&(self.records as u32).to_be_bytes());
-        self.set_raw_payload_bytes();
+        layout::patch(
+            self.metadata,
+            self.count_at,
+            (self.records as u32).to_be_bytes(),
+        )?;
+        self.set_raw_payload_bytes()?;
         buffer.clear();
         Ok(())
     }
@@ -383,16 +435,31 @@ impl<'a> RecordsEncoder<'a> {
         Ok((header, self.shared.map(shared::Payload::finish)))
     }
 
-    fn set_raw_payload_bytes(&mut self) {
-        self.metadata[self.encoding_at] = crate::append::PayloadEncoding::Raw as u8;
+    fn set_raw_payload_bytes(&mut self) -> Result<(), CodecError> {
         let payload_bytes = self.payload_bytes();
+        self.set_payload_encoding(crate::append::PayloadEncoding::Raw, payload_bytes)?;
         self.decoded_payload_bytes = payload_bytes;
-        self.metadata[self.encoding_at + 1..self.encoding_at + 5]
-            .copy_from_slice(&(payload_bytes as u32).to_be_bytes());
+        Ok(())
+    }
+
+    fn set_payload_encoding(
+        &mut self,
+        encoding: crate::append::PayloadEncoding,
+        decoded_bytes: usize,
+    ) -> Result<(), CodecError> {
+        let [a, b, c, d] = (decoded_bytes as u32).to_be_bytes();
+        layout::patch(
+            self.metadata,
+            self.encoding_at,
+            [encoding as u8, a, b, c, d],
+        )?;
+        Ok(())
     }
 
     fn has_encoded_payload(&self) -> bool {
-        self.metadata[self.encoding_at] != crate::append::PayloadEncoding::Raw as u8
+        self.metadata
+            .get(self.encoding_at)
+            .is_some_and(|&tag| tag != crate::append::PayloadEncoding::Raw as u8)
     }
 }
 

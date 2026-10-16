@@ -1,0 +1,26 @@
+[package]
+autotests = false
+name = "ozzy-telemetry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = ["crates-io"]
+include.workspace = true
+description = "Opt-in thread-owned Ozzy telemetry over OMQ PUB/SUB"
+
+[dependencies]
+omq-tokio.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true
+
+[[test]]
+name = "ozzy_telemetry_subscriber"
+path = "tests/subscriber.rs"

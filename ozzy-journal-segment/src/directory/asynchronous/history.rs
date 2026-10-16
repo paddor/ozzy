@@ -1,13 +1,10 @@
 use super::Journal;
-use crate::{AsyncJournalHistory, AsyncStorageValidation, HistoryError, LogPosition};
+use crate::{HistoryError, JournalHistory, LogPosition, StorageValidation};
 
 impl Journal {
     /// Capture settled history without file access. The snapshot protects exact
     /// file generations and reserves one segment arena plus operation locations.
-    pub fn freeze_history(
-        &self,
-        max_segment_bytes: usize,
-    ) -> Result<AsyncJournalHistory, HistoryError> {
+    pub fn freeze_history(&self, max_segment_bytes: usize) -> Result<JournalHistory, HistoryError> {
         if self.writer.written_position() != self.writer.durable_position() {
             return Err(HistoryError::Unsettled);
         }
@@ -16,22 +13,24 @@ impl Journal {
 
     /// Capture only installed complete writes. Unsynchronized bytes grant no
     /// restart, election or durability authority.
-    pub fn freeze_written_history(
+    pub(crate) fn freeze_written_history(
         &self,
         max_segment_bytes: usize,
-    ) -> Result<AsyncJournalHistory, HistoryError> {
+    ) -> Result<JournalHistory, HistoryError> {
         if self.is_faulted() {
             return Err(HistoryError::Unsettled);
         }
-        AsyncJournalHistory::capture(
+        JournalHistory::capture(
             self.access.clone(),
             self.root().join("segments"),
-            &self.manifest,
-            (
-                self.writer.written_position(),
-                self.writer.state().structural_digest(),
-            ),
-            &self.pins,
+            crate::history::asynchronous::Capture {
+                manifest: &self.manifest,
+                written: (
+                    self.writer.written_position(),
+                    self.writer.state().structural_digest(),
+                ),
+                pins: &self.pins,
+            },
             self.limits,
             max_segment_bytes,
         )
@@ -44,7 +43,7 @@ impl Journal {
         &self,
         through: LogPosition,
         max_segment_bytes: usize,
-    ) -> Result<AsyncJournalHistory, HistoryError> {
+    ) -> Result<JournalHistory, HistoryError> {
         if through.op_number >= self.writer.durable_position().next_chain().next_op_number() {
             return Err(HistoryError::Unsettled);
         }
@@ -57,22 +56,10 @@ impl Journal {
     pub async fn begin_storage_validation(
         &mut self,
         max_segment_bytes: usize,
-    ) -> Result<AsyncStorageValidation, HistoryError> {
+    ) -> Result<StorageValidation, HistoryError> {
         self.validate_authority_files().await?;
-        Ok(AsyncStorageValidation::new(
+        Ok(StorageValidation::new(
             self.freeze_history(max_segment_bytes)?,
-            self.current,
-        ))
-    }
-
-    /// Capture the exact written prefix for a fresh bounded scrub.
-    pub async fn begin_written_storage_validation(
-        &mut self,
-        max_segment_bytes: usize,
-    ) -> Result<AsyncStorageValidation, HistoryError> {
-        self.validate_authority_files().await?;
-        Ok(AsyncStorageValidation::new(
-            self.freeze_written_history(max_segment_bytes)?,
             self.current,
         ))
     }

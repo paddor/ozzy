@@ -18,7 +18,7 @@ async fn buffered_source_change(shutdown: bool) {
         setup_shared_profile(&[], 1, Some((8, 8192, 4))).await;
     harness.publish = false;
     let metadata = harness.drive(links.topic("orders"), true).await.unwrap();
-    let routes = links.routes(metadata).unwrap();
+    let routes = links.routes(metadata).await.unwrap();
     let mut reader = harness
         .drive(
             TopicReader::open(links.clone(), "orders", TopicReaderConfig::default()),
@@ -35,16 +35,18 @@ async fn buffered_source_change(shutdown: bool) {
         partition: multiple::incarnation(0),
         owner_epoch: 1,
     };
-    links.inject_reader_publication(
-        authority.primary,
-        &publication(
+    links
+        .inject_reader_publication(
             authority.primary,
-            source,
-            0,
-            &[(50, 0), (51, 1), (52, 2), (53, 3)],
-            harness.wire,
-        ),
-    );
+            &publication(
+                authority.primary,
+                source,
+                0,
+                &[(50, 0), (51, 1), (52, 2), (53, 3)],
+                harness.wire,
+            ),
+        )
+        .await;
     for offset in 0..3 {
         let record = harness.drive(reader.next(), true).await.unwrap();
         assert_eq!(record.offset, Offset::new(offset));
@@ -101,7 +103,7 @@ async fn unanswered() -> (
 ) {
     let (mut harness, links, clock, _) = setup_shared_profile(&[], 2, Some((8, 8192, 4))).await;
     let metadata = harness.drive(links.topic("orders"), true).await.unwrap();
-    let routes = links.routes(metadata).unwrap();
+    let routes = links.routes(metadata).await.unwrap();
     for number in 0..2 {
         routes.interest(number).unwrap();
     }
@@ -230,7 +232,7 @@ async fn reader_subscribes_when_a_route_names_the_new_leader() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let (mut harness, links, clock, _) = setup_shared_profile(&[], 1, Some((8, 8192, 4))).await;
         let metadata = harness.drive(links.topic("orders"), true).await.unwrap();
-        let routes = links.routes(metadata).unwrap();
+        let routes = links.routes(metadata).await.unwrap();
         routes.interest(0).unwrap();
         let initial = harness
             .drive(

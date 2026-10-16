@@ -41,14 +41,8 @@ async fn configured_local_actor_uses_shared_aio_with_the_same_durability_contrac
 
 async fn configured_actor(backend: IoBackend) {
     let temporary = tempfile::tempdir().unwrap();
-    let (checked, local, journals) = fixture_backend(
-        temporary.path(),
-        DeploymentMode::Single,
-        Confirmation::LocalDurable,
-        1,
-        backend,
-    )
-    .remove(0);
+    let (checked, local, journals) =
+        fixture_backend(temporary.path(), DeploymentMode::Single, 1, backend).remove(0);
     storage(&checked, &local);
     let plan = journals.partitions[0].clone();
     let incarnation = plan.incarnation;
@@ -139,6 +133,7 @@ async fn append_records(actor: &mut LocalActor, incarnation: ozzy_proto::Partiti
             topic: "orders",
             partition_id: PartitionId::ZERO,
             owner_epoch: OwnerEpoch::INITIAL,
+            dedup_window_millis: None,
             retention: RetentionPolicy::default(),
         }),
         OperationBody::OpenProducer(OpenProducer {

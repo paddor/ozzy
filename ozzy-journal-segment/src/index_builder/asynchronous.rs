@@ -29,6 +29,13 @@ pub(crate) struct Builder {
     pub(crate) access: Access,
     pub(crate) root: PathBuf,
     pub(crate) io: Limits,
+    pub(crate) operations: OperationLimits,
+}
+
+/// Merged section runs in file order, with their entry counts.
+struct Merged {
+    counts: IndexCounts,
+    runs: [Option<PathBuf>; 4],
 }
 
 pub(crate) async fn open(
@@ -60,9 +67,8 @@ impl Builder {
     /// artifacts for recovery and the caller fences its journal.
     pub(crate) async fn build(
         &self,
-        mut groups: Box<crate::directory::asynchronous::groups::Groups>,
+        groups: Box<crate::directory::asynchronous::groups::Groups>,
         source: IndexSource,
-        operations: OperationLimits,
         limits: IndexBuildLimits,
         repair: bool,
     ) -> Result<SegmentIndex, crate::DirectoryError> {
@@ -70,9 +76,8 @@ impl Builder {
         if self.io.chunk_bytes < INDEX_HEADER_BYTES || self.io.directory_entries == 0 {
             return Err(IndexBuildError::InvalidBuildLimits.into());
         }
-        let final_path = self.root.join("indexes").join(segment_index_name(source));
         if let Some(index) = self
-            .reuse(final_path.clone(), source, limits.file, repair)
+            .reuse(self.index_path(source), source, limits.file, repair)
             .await?
         {
             return Ok(index);
@@ -84,6 +89,28 @@ impl Builder {
             self.io,
         )
         .await?;
+        let pending = self.stage(groups, limits, &mut workspace).await?;
+        let (temporary, merged) =
+            merge_sections(pending, limits.max_merge_fan_in, &mut workspace).await?;
+        self.write_complete(temporary.clone(), source, limits, merged)
+            .await?;
+        Ok(self
+            .publish(temporary, source, limits.file, workspace)
+            .await?)
+    }
+
+    fn index_path(&self, source: IndexSource) -> PathBuf {
+        self.root.join("indexes").join(segment_index_name(source))
+    }
+
+    /// Derive every operation's entries into sorted staging runs, flushing
+    /// whenever the bounded entry buffer would overflow.
+    async fn stage(
+        &self,
+        mut groups: Box<crate::directory::asynchronous::groups::Groups>,
+        limits: IndexBuildLimits,
+        workspace: &mut Workspace,
+    ) -> Result<PendingRuns, crate::DirectoryError> {
         let mut pending = PendingRuns::new(
             limits.max_entry_buffer_bytes,
             limits.max_run_files,
@@ -93,59 +120,40 @@ impl Builder {
         let mut budget = crate::cooperative::Budget::default();
         while let Some(group) = groups.next().await? {
             for operation in &group.operations {
-                let derived = derive_index_entries(&header, operation, operations)
+                let derived = derive_index_entries(&header, operation, self.operations)
                     .map_err(IndexBuildError::from)?;
                 if pending.requires_flush(&derived)? {
-                    pending.flush_async(&mut workspace).await?;
+                    pending.flush_async(workspace).await?;
                 }
                 pending.buffer(derived)?;
                 budget.charge(operation.body.len()).await;
             }
         }
         groups.finish().await?;
-        pending.flush_async(&mut workspace).await?;
-        let offsets = merge_all(
-            pending.offset_runs,
-            RunKind::Offset,
-            limits.max_merge_fan_in,
-            &mut workspace,
-        )
-        .await?;
-        let messages = merge_all(
-            pending.message_runs,
-            RunKind::Message,
-            limits.max_merge_fan_in,
-            &mut workspace,
-        )
-        .await?;
-        let operations = merge_all(
-            pending.operation_runs,
-            RunKind::Operation,
-            limits.max_merge_fan_in,
-            &mut workspace,
-        )
-        .await?;
-        let temporary = workspace.reserve("complete.idx".into())?;
-        self.write_complete(
-            temporary.clone(),
-            source,
-            limits,
-            pending.counts,
-            [offsets, messages, operations],
-        )
-        .await?;
+        pending.flush_async(workspace).await?;
+        Ok(pending)
+    }
+
+    /// Open the complete staged index, then link it under its final name.
+    async fn publish(
+        &self,
+        temporary: PathBuf,
+        source: IndexSource,
+        limits: IndexLimits,
+        workspace: Workspace,
+    ) -> Result<SegmentIndex, IndexBuildError> {
         let index = open(
             &self.access,
             temporary.clone(),
             source,
-            limits.file,
+            limits,
             self.io.chunk_bytes,
         )
         .await?;
         self.access
             .done(Operation::HardLink {
                 source: temporary,
-                destination: final_path,
+                destination: self.index_path(source),
             })
             .await?;
         self.access
@@ -200,8 +208,7 @@ impl Builder {
         path: PathBuf,
         source: IndexSource,
         limits: IndexBuildLimits,
-        counts: IndexCounts,
-        runs: [Option<PathBuf>; 3],
+        Merged { counts, runs }: Merged,
     ) -> Result<(), IndexBuildError> {
         let layout = calculate_index_layout(counts, limits.file)?;
         let file = self
@@ -217,7 +224,8 @@ impl Builder {
         for (run, bytes) in runs.into_iter().zip([
             layout.message_start - INDEX_HEADER_BYTES,
             layout.operation_start - layout.message_start,
-            layout.file_bytes - layout.operation_start,
+            layout.location_start - layout.operation_start,
+            layout.file_bytes - layout.location_start,
         ]) {
             self.copy_run(run, bytes, &mut writer, &mut hasher).await?;
         }
@@ -271,4 +279,29 @@ impl Builder {
         self.access.done(Operation::Close { handle: file }).await?;
         Ok(())
     }
+}
+
+/// Merge each section's runs to one. The complete file's name is reserved
+/// before the location merge, so the workspace bound counts it there.
+async fn merge_sections(
+    pending: PendingRuns,
+    fan_in: usize,
+    workspace: &mut Workspace,
+) -> Result<(PathBuf, Merged), IndexBuildError> {
+    let offsets = merge_all(pending.offset_runs, RunKind::Offset, fan_in, workspace).await?;
+    let messages = merge_all(pending.message_runs, RunKind::Message, fan_in, workspace).await?;
+    let operations = merge_all(
+        pending.operation_runs,
+        RunKind::Operation,
+        fan_in,
+        workspace,
+    )
+    .await?;
+    let temporary = workspace.reserve("complete.idx".into())?;
+    let locations = merge_all(pending.location_runs, RunKind::Location, fan_in, workspace).await?;
+    let merged = Merged {
+        counts: pending.counts,
+        runs: [offsets, messages, operations, locations],
+    };
+    Ok((temporary, merged))
 }

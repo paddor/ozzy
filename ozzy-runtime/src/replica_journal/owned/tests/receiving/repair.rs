@@ -1,7 +1,7 @@
 use super::*;
 
 fn damaged(controller: &mut Controller, io: &Local) -> OwnedConfig {
-    let mut replica = replica(controller, io.clone(), 1, QuorumPolicy::Durable, 8192);
+    let mut replica = replica(controller, io.clone(), 1, 8192);
     persist(controller, &mut replica);
     let roll = replica.journal.begin_roll(8).unwrap();
     let done = drive(controller, roll.publish());
@@ -58,8 +58,8 @@ fn damaged(controller: &mut Controller, io: &Local) -> OwnedConfig {
 #[test]
 fn owned_recovery_repairs_only_damaged_sealed_history_and_keeps_original_files() {
     let (mut controller, io) = setup();
-    let mut primary = replica(&mut controller, io.clone(), 0, QuorumPolicy::Durable, 8192);
-    let backup = replica(&mut controller, io.clone(), 2, QuorumPolicy::Durable, 8192);
+    let mut primary = replica(&mut controller, io.clone(), 0, 8192);
+    let backup = replica(&mut controller, io.clone(), 2, 8192);
     persist(&mut controller, &mut primary);
     let accepted = persist(&mut controller, &mut primary);
     let config = damaged(&mut controller, &io);
@@ -139,8 +139,8 @@ fn owned_recovery_repairs_only_damaged_sealed_history_and_keeps_original_files()
 fn owned_recovery_conflicting_sealed_donor_requires_fresh_full_transfer() {
     use super::super::writeback::{admit_encoded, finish, prepare, settle, synchronize};
     let (mut controller, io) = setup();
-    let mut primary = replica(&mut controller, io.clone(), 0, QuorumPolicy::Durable, 8192);
-    let backup = replica(&mut controller, io.clone(), 2, QuorumPolicy::Durable, 8192);
+    let mut primary = replica(&mut controller, io.clone(), 0, 8192);
+    let backup = replica(&mut controller, io.clone(), 2, 8192);
     let (_, _, receipt) = admit_encoded(
         &mut controller,
         &mut primary,

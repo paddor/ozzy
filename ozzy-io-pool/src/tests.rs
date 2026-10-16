@@ -2,10 +2,14 @@
 // workers. Gates control execution rather than relying on disk timing.
 
 use super::*;
+use ozzy_io::signal::StateSignal;
 use ozzy_io::{Completed, FileKind, Handle, OpenMode, Outcome, Quota, SyncMode, WriteBuffer};
 use std::path::Path;
-use std::sync::Condvar;
+use std::sync::{Condvar, Mutex};
+#[cfg(target_os = "linux")]
+use std::task::Wake;
 
+mod direct_driver;
 mod queues;
 mod startup;
 
@@ -14,7 +18,7 @@ pub(super) struct Gate {
     filter: fn(&Operation) -> bool,
     state: Mutex<GateState>,
     wake: Condvar,
-    entered: Notify,
+    entered: StateSignal,
 }
 
 #[derive(Debug, Default)]
@@ -30,35 +34,42 @@ impl Gate {
             filter,
             state: Mutex::default(),
             wake: Condvar::new(),
-            entered: Notify::new(),
+            entered: StateSignal::default(),
         })
     }
 
-    pub(super) fn enter(&self, operation: &Operation) {
+    /// Hold `operation` at the pool's installed gate, if any.
+    pub(super) fn enter_installed(shared: &Shared, operation: &Operation) {
+        let gate = shared.gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.pass((gate.filter)(operation));
+        }
+    }
+
+    /// Record this thread, then wait for release when `held`.
+    fn pass(&self, held: bool) {
         let mut state = self.state.lock().unwrap();
         state
             .threads
             .push(std::thread::current().name().unwrap_or("unnamed").into());
-        if !(self.filter)(operation) {
+        if !held {
             return;
         }
         state.blocked += 1;
-        self.entered.notify_waiters();
+        self.entered.notify_changed();
         while !state.released {
             state = self.wake.wait(state).unwrap();
         }
     }
 
     async fn wait(&self) {
-        loop {
-            let entered = self.entered.notified();
-            tokio::pin!(entered);
-            entered.as_mut().enable();
-            if self.state.lock().unwrap().blocked > 0 {
-                return;
-            }
-            entered.await;
-        }
+        self.wait_blocked(1).await;
+    }
+
+    async fn wait_blocked(&self, count: usize) {
+        self.entered
+            .wait_for(|| (self.state.lock().unwrap().blocked >= count).then_some(()))
+            .await;
     }
 
     fn release(&self) {
@@ -276,7 +287,7 @@ async fn file_and_directory_operations_run_on_explicit_workers() {
             .unwrap()
             .threads
             .iter()
-            .all(|name| name.starts_with("ozzy_io-"))
+            .all(|name| name.starts_with("ozzy/disk/"))
     );
 }
 
@@ -625,87 +636,6 @@ async fn special_files_and_symlinks_are_rejected_without_blocking() {
     pool.shutdown().await;
 }
 
-#[cfg(target_os = "linux")]
-#[tokio::test]
-async fn direct_writes_allocation_and_explicit_barriers() {
-    let temp = tempfile::tempdir().unwrap();
-    let (pool, mut clients) = Pool::new(config()).unwrap();
-    let path = temp.path().join("direct");
-    let result = perform(
-        &mut clients[0],
-        Operation::Open {
-            path: path.clone(),
-            mode: OpenMode::CreateNew,
-            direct: true,
-            data_sync: true,
-        },
-    )
-    .await
-    .unwrap();
-    let Outcome::Opened(handle) = &*result else {
-        panic!("open response")
-    };
-    let handle = handle.clone();
-    drop(result);
-    perform(
-        &mut clients[0],
-        Operation::SetLength {
-            handle: handle.clone(),
-            length: 8192,
-        },
-    )
-    .await
-    .unwrap();
-    perform(
-        &mut clients[0],
-        Operation::Allocate {
-            handle: handle.clone(),
-            offset: 0,
-            length: 8192,
-        },
-    )
-    .await
-    .unwrap();
-    assert!(matches!(
-        *perform(&mut clients[0], write(&handle, 4096, &[42; 4096]))
-            .await
-            .unwrap(),
-        Outcome::Written(4096)
-    ));
-    assert_eq!(
-        perform(&mut clients[0], write(&handle, 1, &[42; 4096]))
-            .await
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::InvalidInput
-    );
-    perform(
-        &mut clients[0],
-        Operation::Sync {
-            handle,
-            mode: SyncMode::Data,
-        },
-    )
-    .await
-    .unwrap();
-    let buffered = open(&mut clients[0], &path, OpenMode::Read).await;
-    let read = perform(
-        &mut clients[0],
-        Operation::Read {
-            handle: buffered,
-            offset: 4096,
-            length: 4096,
-        },
-    )
-    .await
-    .unwrap();
-    let Outcome::Read(bytes) = &*read else {
-        panic!("read response")
-    };
-    assert_eq!(bytes.as_slice(), &[42; 4096]);
-    pool.shutdown().await;
-}
-
 #[tokio::test]
 async fn dropping_owner_requests_drain_without_waiting_on_blocked_io() {
     let temp = tempfile::tempdir().unwrap();
@@ -731,8 +661,7 @@ async fn dropping_owner_requests_drain_without_waiting_on_blocked_io() {
     // Wait for the detached drain before the temporary directory is removed.
     let monitor = Pool {
         shared: clients[0].shared.clone(),
-        next_thread: AtomicUsize::new(0),
-        threads: Vec::new(),
+        threads: ozzy_io::OwnedThreads::new(0),
     };
     monitor.shutdown().await;
     assert_eq!(std::fs::read(path).unwrap(), b"still runs");
@@ -840,13 +769,13 @@ impl Wake for Unpark {
 #[cfg(target_os = "linux")]
 impl direct::Worker for HeldDirect {
     fn run(self: Box<Self>, queue: &mut direct::Queue) -> io::Result<()> {
-        assert_eq!(std::thread::current().name(), Some("ozzy_io-direct"));
+        assert_eq!(std::thread::current().name(), Some("ozzy/disk/aio"));
         let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
         loop {
             queue.register(&waker);
             for class in [Class::Progress, Class::Data] {
                 while let Some(write) = queue.try_recv(class) {
-                    self.0.enter(write.job.operation.as_ref().unwrap());
+                    self.0.pass(true);
                     let length = write.data().len();
                     write.finish(Ok(length));
                 }
@@ -859,84 +788,6 @@ impl direct::Worker for HeldDirect {
     }
 }
 
-#[cfg(target_os = "linux")]
-#[tokio::test]
-async fn direct_handoff_retains_canceled_buffers_and_physical_handle_capacity() {
-    let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("data");
-    let gate = Gate::new(|_| true);
-    let (pool, mut clients) = Pool::with_direct_worker(
-        Config {
-            handles: 2,
-            ..config()
-        },
-        HeldDirect(gate.clone()),
-    )
-    .unwrap();
-    let opening = perform(
-        &mut clients[0],
-        Operation::Open {
-            path: path.clone(),
-            mode: OpenMode::CreateNew,
-            direct: true,
-            data_sync: false,
-        },
-    )
-    .await
-    .unwrap();
-    let Outcome::Opened(handle) = &*opening else {
-        panic!("handle")
-    };
-    let handle = handle.clone();
-    drop(opening);
-    perform(
-        &mut clients[0],
-        Operation::LockExclusive {
-            handle: handle.clone(),
-        },
-    )
-    .await
-    .unwrap();
-    let written = clients[0]
-        .submit(Class::Data, write(&handle, 0, &[3; 4096]))
-        .unwrap();
-    gate.wait().await;
-    drop(written);
-    assert_eq!(pool.admission().used(0, Class::Data).operations, 1);
-    // Progress helpers remain runnable even while the direct driver is held.
-    clients[0]
-        .submit(Class::Progress, Operation::Close { handle })
-        .unwrap()
-        .await
-        .unwrap();
-    assert!(matches!(
-        std::fs::File::open(&path).unwrap().try_lock(),
-        Err(std::fs::TryLockError::WouldBlock)
-    ));
-    let error = clients[0]
-        .submit(
-            Class::Progress,
-            Operation::Open {
-                path: path.clone(),
-                mode: OpenMode::Read,
-                direct: false,
-                data_sync: false,
-            },
-        )
-        .unwrap()
-        .await
-        .unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-    let shutdown = pool.shutdown();
-    tokio::pin!(shutdown);
-    assert!(futures::poll!(&mut shutdown).is_pending());
-    gate.release();
-    shutdown.await;
-    assert_eq!(pool.admission().used(0, Class::Data), Quota::default());
-    std::fs::File::open(path).unwrap().try_lock().unwrap();
-    assert_eq!(gate.state.lock().unwrap().threads, ["ozzy_io-direct"]);
-}
-
 struct FailedDirect(u8);
 
 impl direct::Worker for FailedDirect {
@@ -945,32 +796,6 @@ impl direct::Worker for FailedDirect {
             0 => Err(io::Error::other("injected setup failure")),
             1 => panic!("injected driver panic"),
             _ => Ok(()), // Premature successful return is still a failure.
-        }
-    }
-}
-
-#[tokio::test]
-async fn direct_driver_failure_during_startup_fences_and_drains_all_helpers() {
-    for kind in 0..3 {
-        for _ in 0..8 {
-            let (pool, mut clients) =
-                Pool::with_direct_worker(config(), FailedDirect(kind)).unwrap();
-            pool.shutdown().await;
-            assert_eq!(
-                clients[0]
-                    .submit(
-                        Class::Data,
-                        Operation::ReadDirectory {
-                            path: "/".into(),
-                            max_entries: 0,
-                            max_name_bytes: 0,
-                        }
-                    )
-                    .unwrap_err()
-                    .error
-                    .kind(),
-                io::ErrorKind::BrokenPipe
-            );
         }
     }
 }

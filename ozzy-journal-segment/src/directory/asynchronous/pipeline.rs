@@ -111,7 +111,7 @@ impl Pipeline {
         &mut self,
         boundary: crate::JournalIndexBoundary,
         limits: crate::IndexBuildLimits,
-    ) -> Result<crate::AsyncJournalIndexSnapshot, crate::JournalIndexError> {
+    ) -> Result<crate::JournalIndexSnapshot, crate::JournalIndexError> {
         self.healthy()?;
         self.journal.build_index_snapshot(boundary, limits).await
     }
@@ -155,13 +155,7 @@ impl Pipeline {
                 return Err(DirectoryError::CurrentMismatch);
             }
         }
-        let first = self
-            .journal
-            .manifest
-            .segments
-            .last()
-            .expect("active")
-            .first_group_number;
+        let first = super::active_segment(&self.journal.manifest.segments)?.first_group_number;
         if self.reserved.group_number() - (first - 1)
             >= self.journal.limits.decode.max_groups as u64
         {
@@ -209,9 +203,14 @@ impl Pipeline {
         let locations = group.locations(&layout.header, layout.before.end_offset())?;
         let finalized = crate::codec::finalize_group_descriptors(
             &layout.header,
-            layout.group_number,
-            layout.before.end_offset(),
-            layout.before.next_chain(),
+            crate::codec::GroupWrite {
+                start: crate::GroupStart::new(
+                    layout.group_number,
+                    layout.before.end_offset(),
+                    layout.before.next_chain(),
+                ),
+                durable_through: self.journal.writer.durable_position().group_number(),
+            },
             group.operations.iter().copied(),
             &mut group.bodies,
         )?;
@@ -297,14 +296,11 @@ impl Prepared {
     /// Short writes fail the complete group; recovery resolves uncertain bytes.
     pub async fn write(mut self) -> Completed {
         let length = self.physical_bytes() as usize;
-        let result = self
-            .access
-            .write(
-                Class::Data,
-                self.job.take().expect("unsubmitted write"),
-                length,
-            )
-            .await;
+        // Only a batch write leaves a chunk without its job, and it consumes them.
+        let result = match self.job.take() {
+            Some(job) => self.access.write(Class::Data, job, length).await,
+            None => Err(io::ErrorKind::InvalidInput.into()),
+        };
         Completed { work: self, result }
     }
 

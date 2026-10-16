@@ -6,6 +6,7 @@ use super::{Binding, Kind, Placement, Routed};
 use crate::{dispatch::Class, signal::CloseSignal};
 use bytes::Bytes;
 use omq_tokio::{Context, Message, Options, Socket, TrySendError};
+use ozzy_proto::layout::Fixed;
 use std::{
     sync::{
         Arc,
@@ -87,6 +88,17 @@ pub enum DataLaneError {
     Transport(#[from] omq_tokio::Error),
 }
 
+/// Queue bounds of one data or control lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DataLaneLimits {
+    /// Queued message count.
+    pub slots: usize,
+    /// Largest retained backing of one message.
+    pub maximum_retained_bytes: usize,
+    /// Retained bytes of the queue plus one pending message.
+    pub retained_budget_bytes: usize,
+}
+
 /// Construct once at startup on the broker's existing owned OMQ context.
 /// Fixed slots also bound the small routing metadata allocations. Payload bytes
 /// remain charged by received backing, independent of native frame lengths.
@@ -95,10 +107,13 @@ pub fn data_channel(
     shard: u32,
     kind: Kind,
     class: Class,
-    slots: usize,
-    maximum_retained_bytes: usize,
-    retained_budget_bytes: usize,
+    limits: DataLaneLimits,
 ) -> Result<(DataSender, DataReceiver), DataLaneError> {
+    let DataLaneLimits {
+        slots,
+        maximum_retained_bytes,
+        retained_budget_bytes,
+    } = limits;
     if context.io_threads() == 0
         || slots == 0
         || slots > 65536
@@ -170,7 +185,11 @@ impl DataSender {
                 return;
             }
             tokio::select! {
-                reply = socket.recv() => { if let Ok(reply) = reply { return_bytes(&reply, &returned); } },
+                reply = socket.recv() => {
+                    if let Ok(reply) = reply && !returned.credit(&reply) {
+                        closed.close();
+                    }
+                },
                 () = closed.closed() => {},
             }
         }
@@ -208,7 +227,10 @@ impl DataSender {
             return Err(DataSendError::Closed(input));
         }
         while let Ok(reply) = self.socket.try_recv() {
-            return_bytes(&reply, &self.returned);
+            if !self.returned.credit(&reply) {
+                self.closed.close();
+                return Err(DataSendError::Closed(input));
+            }
         }
         self.queued_bytes -= self.returned.bytes.swap(0, Ordering::AcqRel);
         self.queued_slots -= self.returned.slots.swap(0, Ordering::AcqRel);
@@ -269,18 +291,22 @@ impl Drop for DataReceiver {
     }
 }
 
-fn return_bytes(message: &Message, returned: &Returned) {
-    let bytes = message
-        .part_slice(0)
-        .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
-        .map(u64::from_be_bytes)
-        .expect("private dequeue receipt");
-    returned.bytes.fetch_add(
-        usize::try_from(bytes).expect("local byte count"),
-        Ordering::Release,
-    );
-    returned.slots.fetch_add(1, Ordering::Release);
-    returned.generation.fetch_add(1, Ordering::Release);
+impl Returned {
+    /// Credit one private dequeue receipt. A malformed receipt credits nothing
+    /// and returns false; the caller closes the lane.
+    fn credit(&self, receipt: &Message) -> bool {
+        let Some(bytes) = receipt
+            .part_slice(0)
+            .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+            .and_then(|bytes| usize::try_from(u64::from_be_bytes(bytes)).ok())
+        else {
+            return false;
+        };
+        self.bytes.fetch_add(bytes, Ordering::Release);
+        self.slots.fetch_add(1, Ordering::Release);
+        self.generation.fetch_add(1, Ordering::Release);
+        true
+    }
 }
 
 const HEADER_BYTES: usize = 95;
@@ -327,8 +353,8 @@ fn decode(
             } else {
                 Kind::Client
             },
-            peer: ozzy_proto::NodeId::from_bytes(bytes[3..19].try_into().unwrap()),
-            session: ozzy_proto::LinkSessionId::from_bytes(bytes[19..35].try_into().unwrap()),
+            peer: ozzy_proto::NodeId::from_bytes(bytes.array::<3, 16>()),
+            session: ozzy_proto::LinkSessionId::from_bytes(bytes.array::<19, 16>()),
         },
         route: Routed {
             class: if bytes[1] == 1 {
@@ -337,13 +363,11 @@ fn decode(
                 Class::Data
             },
             writer: (bytes[2] == 1)
-                .then(|| ozzy_proto::ProducerId::from_bytes(bytes[71..87].try_into().unwrap())),
+                .then(|| ozzy_proto::ProducerId::from_bytes(bytes.array::<71, 16>())),
             placement: Placement {
-                group: ozzy_proto::GroupId::from_bytes(bytes[35..51].try_into().unwrap()),
-                partition: ozzy_proto::PartitionIncarnation::from_bytes(
-                    bytes[51..67].try_into().unwrap(),
-                ),
-                shard: u32::from_be_bytes(bytes[67..71].try_into().unwrap()),
+                group: ozzy_proto::GroupId::from_bytes(bytes.array::<35, 16>()),
+                partition: ozzy_proto::PartitionIncarnation::from_bytes(bytes.array::<51, 16>()),
+                shard: bytes.u32_at::<67>(),
             },
         },
         message,
@@ -367,210 +391,4 @@ fn decode(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::dispatch::Class;
-    use crate::frontend::{Kind, test_support};
-    use ozzy_proto::ProducerId;
-
-    fn input() -> DataInput {
-        let binding = test_support::binding(Kind::Client);
-        let placement = test_support::placement(0, 0);
-        DataInput {
-            binding,
-            route: Routed {
-                placement,
-                class: Class::Data,
-                writer: Some(ProducerId::from_bytes([4; 16])),
-            },
-            message: test_support::append(placement, binding),
-        }
-    }
-
-    #[tokio::test]
-    async fn received_input_observes_sender_close_before_its_dequeue_receipt() {
-        let (mut sender, receiver) = data_channel(
-            &omq_tokio::Context::new(),
-            0,
-            Kind::Client,
-            Class::Data,
-            1,
-            4096,
-            8192,
-        )
-        .unwrap();
-        sender.try_send(input(), 4096).unwrap();
-        let message = receiver.socket.recv().await.unwrap();
-        // Drop signals closure before destroying the sender's socket. Hold that
-        // exact interval so receipt routing cannot make this schedule flaky.
-        sender.closed.close();
-        assert!(matches!(
-            decode(&receiver.socket, &receiver.closed, message),
-            Err(DataLaneError::Closed)
-        ));
-    }
-
-    #[tokio::test]
-    async fn full_shard_lane_returns_frame_and_wakes_on_dequeue() {
-        let (mut sender, mut receiver) = data_channel(
-            &omq_tokio::Context::new(),
-            0,
-            Kind::Client,
-            crate::dispatch::Class::Data,
-            1,
-            4096,
-            8192,
-        )
-        .unwrap();
-        sender.try_send(input(), 4096).unwrap();
-        let held = match sender.try_send(input(), 4096).unwrap_err() {
-            DataSendError::Full(input) => input,
-            other => panic!("unexpected send result: {other:?}"),
-        };
-        let generation = sender.space_generation();
-        let changed = sender.space_changed_after(generation);
-        tokio::pin!(changed);
-        assert!(futures::poll!(changed.as_mut()).is_pending());
-        assert!(receiver.try_recv().unwrap().is_some());
-        changed.await;
-        sender.try_send(held, 4096).unwrap();
-        assert!(receiver.try_recv().unwrap().is_some());
-        assert!(receiver.try_recv().unwrap().is_none());
-    }
-
-    #[test]
-    fn slot_count_and_held_frame_fit_fixed_retained_budget() {
-        assert!(matches!(
-            data_channel(
-                &omq_tokio::Context::new(),
-                0,
-                Kind::Client,
-                crate::dispatch::Class::Data,
-                2,
-                4096,
-                8191
-            ),
-            Err(DataLaneError::Capacity)
-        ));
-        assert!(matches!(
-            data_channel(
-                &omq_tokio::Context::new(),
-                0,
-                Kind::Client,
-                crate::dispatch::Class::Data,
-                65537,
-                4096,
-                16384
-            ),
-            Err(DataLaneError::Capacity)
-        ));
-    }
-
-    #[test]
-    fn byte_pressure_returns_capacity_without_waiting_for_ring_full() {
-        let (mut sender, mut receiver) = data_channel(
-            &omq_tokio::Context::new(),
-            0,
-            Kind::Client,
-            crate::dispatch::Class::Data,
-            4,
-            4096,
-            12288,
-        )
-        .unwrap();
-        sender.try_send(input(), 4096).unwrap();
-        sender.try_send(input(), 4096).unwrap();
-        let held = match sender.try_send(input(), 4096).unwrap_err() {
-            DataSendError::Full(input) => input,
-            other => panic!("unexpected byte pressure: {other:?}"),
-        };
-        assert_eq!(sender.queued_bytes, 8192);
-        receiver.try_recv().unwrap().unwrap();
-        sender.try_send(held, 4096).unwrap();
-        assert_eq!(sender.queued_bytes, 8192);
-    }
-
-    #[test]
-    fn small_frames_share_the_byte_budget_without_reserving_maximum_per_slot() {
-        let (mut sender, mut receiver) = data_channel(
-            &omq_tokio::Context::new(),
-            0,
-            Kind::Client,
-            crate::dispatch::Class::Data,
-            4,
-            16384,
-            32768,
-        )
-        .unwrap();
-        for _ in 0..4 {
-            sender.try_send(input(), 4096).unwrap();
-        }
-        assert_eq!(sender.queued_bytes, 16384);
-        assert!(matches!(
-            sender.try_send(input(), 4096),
-            Err(DataSendError::Full(_))
-        ));
-        for _ in 0..4 {
-            receiver.try_recv().unwrap().unwrap();
-        }
-        sender.try_send(input(), 16384).unwrap();
-        assert_eq!(sender.queued_bytes, 16384);
-        assert!(matches!(
-            sender.try_send(input(), 4096),
-            Err(DataSendError::Full(_))
-        ));
-    }
-
-    #[test]
-    fn concurrent_dequeues_and_refills_keep_byte_returns_bounded() {
-        let (mut sender, mut receiver) = data_channel(
-            &omq_tokio::Context::new(),
-            0,
-            Kind::Client,
-            crate::dispatch::Class::Data,
-            4,
-            4096,
-            24576,
-        )
-        .unwrap();
-        let reader = std::thread::spawn(move || {
-            for _ in 0..5000 {
-                while receiver.try_recv().unwrap().is_none() {
-                    std::thread::yield_now();
-                }
-            }
-        });
-        for _ in 0..5000 {
-            let mut frame = input();
-            loop {
-                match sender.try_send(frame, 4096) {
-                    Ok(()) => break,
-                    Err(DataSendError::Full(returned)) => frame = returned,
-                    error => panic!("unexpected queue outcome: {error:?}"),
-                }
-                std::thread::yield_now();
-            }
-            assert!(sender.queued_bytes <= sender.queue_bytes);
-        }
-        reader.join().unwrap();
-    }
-
-    #[test]
-    fn wrong_shard_cannot_consume_a_producer_slot() {
-        let (mut sender, mut receiver) = data_channel(
-            &omq_tokio::Context::new(),
-            1,
-            Kind::Client,
-            crate::dispatch::Class::Data,
-            1,
-            4096,
-            8192,
-        )
-        .unwrap();
-        assert!(matches!(
-            sender.try_send(input(), 4096),
-            Err(DataSendError::Invalid(_))
-        ));
-        assert!(receiver.try_recv().unwrap().is_none());
-    }
-}
+mod tests;

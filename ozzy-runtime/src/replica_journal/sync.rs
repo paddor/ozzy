@@ -1,8 +1,7 @@
 //! Exact-prefix data synchronization and recovery-evidence publication.
 //!
 //! `O_DSYNC` groups publish `DURABLE` on the device writer pool while later
-//! writes continue and the journal owner keeps installing them. Buffered
-//! groups synchronize inline.
+//! writes continue and the journal owner keeps installing them.
 
 use ozzy_replication::SyncTicket;
 

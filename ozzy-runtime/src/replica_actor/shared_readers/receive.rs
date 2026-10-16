@@ -1,7 +1,8 @@
 use super::{
-    ActorError, AuthorityHint, Bytes, Cursor, Delivery, Envelope, Failure, Link, Message,
+    ActorError, AuthorityHint, Bytes, Client, Cursor, Delivery, Envelope, Failure, Message,
     NativeReceive, NodeId, Opcode, Payload, SharedReaders, Slot, decode_packet, reader,
 };
+use crate::transport::Frames;
 use ozzy_proto::Packet;
 
 impl SharedReaders {
@@ -12,22 +13,16 @@ impl SharedReaders {
         ready: bool,
     ) -> Result<NativeReceive, ActorError> {
         self.discard_stale();
-        let Some(peer) = message
-            .part_slice(0)
-            .and_then(|bytes| bytes.try_into().ok())
-            .map(NodeId::from_bytes)
-        else {
+        let Some((route, frames)) = message.routed_packet() else {
             return Ok(NativeReceive::Ignored);
         };
-        if message.len() != 4 {
+        let Ok(peer) = <[u8; 16]>::try_from(route).map(NodeId::from_bytes) else {
             return Ok(NativeReceive::Ignored);
-        }
-        let frames: [&[u8]; 3] =
-            std::array::from_fn(|i| message.part_slice(i + 1).expect("four frames"));
+        };
         let Ok(packet) = decode_packet(&frames, self.config.limits.envelope) else {
             return Ok(NativeReceive::Ignored);
         };
-        let Some(link) = self.current(peer, packet.envelope) else {
+        let Some(client) = self.current(peer, packet.envelope) else {
             return Ok(NativeReceive::Ignored);
         };
         // Acknowledgments, unsubscribe replies, and failures share one bounded
@@ -37,26 +32,45 @@ impl SharedReaders {
             return Ok(NativeReceive::Busy);
         }
         let result = if ready {
-            self.command(peer, packet, link, hint)
+            self.command(client, packet, hint)
         } else {
             Err(Failure::new(12))
         };
         if let Err(error) = result {
-            self.reject(peer, packet.envelope, link, error, hint)?;
+            self.reject(client, packet.envelope, error, hint)?;
         }
-        self.work.mark();
+        self.wake.wake();
         Ok(NativeReceive::Accepted)
     }
 
     fn command(
         &mut self,
-        peer: NodeId,
+        client: Client,
         packet: Packet<'_>,
-        link: Link,
         hint: AuthorityHint,
     ) -> Result<(), Failure> {
         let limits = self.config.limits.envelope;
         let source = reader::route(packet, limits).map_err(|_| Failure::new(1))?;
+        self.check_source(source, hint)?;
+        match packet.envelope.opcode {
+            Opcode::Subscribe => {
+                let subscribe =
+                    reader::decode_subscribe(packet, limits).map_err(|_| Failure::new(1))?;
+                let subscribe = reader::Subscribe {
+                    subscription: subscribe.subscription,
+                    target: subscribe.target,
+                    start: subscribe.start,
+                };
+                self.subscribe(client.peer, packet.envelope, &subscribe, source)
+            }
+            Opcode::Ack => self.ack(client, packet),
+            Opcode::Unsubscribe => self.unsubscribe(client, packet),
+            _ => Err(Failure::new(2)),
+        }
+    }
+
+    /// Serve only this partition's group source while this broker is its primary.
+    fn check_source(&self, source: reader::Source, hint: AuthorityHint) -> Result<(), Failure> {
         let reader::Source::Group {
             authority,
             partition,
@@ -74,65 +88,17 @@ impl SharedReaders {
         if authority.view != hint.authority.view || hint.primary != self.local {
             return Err(Failure::new(5));
         }
-        match packet.envelope.opcode {
-            Opcode::Subscribe => {
-                let subscribe =
-                    reader::decode_subscribe(packet, limits).map_err(|_| Failure::new(1))?;
-                let subscribe = reader::Subscribe {
-                    subscription: subscribe.subscription,
-                    target: subscribe.target,
-                    start: subscribe.start,
-                };
-                self.subscribe(peer, packet.envelope, &subscribe, source)
-            }
-            Opcode::Ack => self.ack(peer, packet, link),
-            Opcode::Unsubscribe => {
-                let selected =
-                    reader::decode_unsubscribe(packet, limits).map_err(|_| Failure::new(1))?;
-                if self.rejection.is_some() {
-                    return Err(Failure::new(10));
-                }
-                for slot in &mut self.slots {
-                    if slot.as_ref().is_some_and(|slot| {
-                        slot.peer == peer
-                            && slot.delivery.subscribe.subscription == selected.subscription
-                            && slot.delivery.source == selected.source
-                    }) {
-                        *slot = None;
-                    }
-                }
-                let header = reader::encode_unsubscribed(
-                    Envelope {
-                        opcode: Opcode::Unsubscribed,
-                        response: true,
-                        sender: self.local,
-                        ..packet.envelope
-                    },
-                    selected,
-                    &mut self.metadata,
-                    link.send.envelope,
-                )
-                .map_err(|_| Failure::new(1))?;
-                self.rejection = Some(crate::native_frames::message(
-                    peer.as_bytes(),
-                    header,
-                    &self.metadata,
-                    Bytes::new(),
-                ));
-                Ok(())
-            }
-            _ => Err(Failure::new(2)),
-        }
+        Ok(())
     }
 
-    fn ack(&mut self, peer: NodeId, packet: Packet<'_>, link: Link) -> Result<(), Failure> {
+    fn ack(&mut self, client: Client, packet: Packet<'_>) -> Result<(), Failure> {
         let limits = self.config.limits.envelope;
         if packet.envelope.request_id.is_some() && self.rejection.is_some() {
             return Err(Failure::new(10));
         }
         let ack = reader::decode_ack(packet, limits).map_err(|_| Failure::new(1))?;
         let slot = self
-            .find(peer, ack.subscription)
+            .find(client.peer, ack.subscription)
             .filter(|slot| slot.delivery.source == ack.source)
             .ok_or_else(|| Failure::new(12))?;
         slot.delivery.observe(ack)?;
@@ -145,23 +111,54 @@ impl SharedReaders {
                 },
                 ack,
                 &mut self.metadata,
-                link.send.envelope,
+                client.link.send.envelope,
             )
             .map_err(|_| Failure::new(1))?;
-            self.rejection = Some(crate::native_frames::message(
-                peer.as_bytes(),
-                header,
-                &self.metadata,
-                Bytes::new(),
-            ));
+            self.reply(client, header);
         }
         Ok(())
+    }
+
+    fn unsubscribe(&mut self, client: Client, packet: Packet<'_>) -> Result<(), Failure> {
+        let selected = reader::decode_unsubscribe(packet, self.config.limits.envelope)
+            .map_err(|_| Failure::new(1))?;
+        if self.rejection.is_some() {
+            return Err(Failure::new(10));
+        }
+        self.slots.retain(|slot| {
+            slot.peer != client.peer
+                || slot.delivery.subscribe.subscription != selected.subscription
+                || slot.delivery.source != selected.source
+        });
+        let header = reader::encode_unsubscribed(
+            Envelope {
+                opcode: Opcode::Unsubscribed,
+                response: true,
+                sender: self.local,
+                ..packet.envelope
+            },
+            selected,
+            &mut self.metadata,
+            client.link.send.envelope,
+        )
+        .map_err(|_| Failure::new(1))?;
+        self.reply(client, header);
+        Ok(())
+    }
+
+    /// Hold one encoded reply in the shared reply slot.
+    fn reply(&mut self, client: Client, header: [u8; 64]) {
+        self.rejection = Some(crate::native_frames::message(
+            client.peer.as_bytes(),
+            header,
+            &self.metadata,
+            Bytes::new(),
+        ));
     }
 
     fn find(&mut self, peer: NodeId, subscription: reader::Subscription) -> Option<&mut Slot> {
         self.slots
             .iter_mut()
-            .flatten()
             .find(|slot| slot.peer == peer && slot.delivery.subscribe.subscription == subscription)
     }
 
@@ -173,29 +170,29 @@ impl SharedReaders {
         source: reader::Source,
     ) -> Result<(), Failure> {
         let old = self.slots.iter().position(|slot| {
-            slot.as_ref().is_some_and(|slot| {
-                slot.peer == peer
-                    && slot.delivery.subscribe.subscription.id == subscribe.subscription.id
-            })
+            slot.peer == peer
+                && slot.delivery.subscribe.subscription.id == subscribe.subscription.id
         });
-        let index = old
-            .or_else(|| self.slots.iter().position(Option::is_none))
-            .ok_or_else(|| Failure::new(10))?;
-        if let Some(slot) = &self.slots[index]
-            && slot.delivery.subscribe.subscription == subscribe.subscription
+        let index = if let Some(index) = old
+            && self.slots[index].delivery.subscribe.subscription == subscribe.subscription
         {
+            let slot = &self.slots[index];
             if &slot.delivery.subscribe != subscribe || slot.delivery.source != source {
                 return Err(Failure::new(15));
             }
             if slot.pending.is_some() {
                 return Ok(());
             }
+            index
         } else {
-            self.slots[index] = Some(Slot {
+            if old.is_none() && self.slots.len() == self.config.subscriptions {
+                return Err(Failure::new(10));
+            }
+            let slot = Slot {
                 peer,
-                payload: Payload::notifying(
+                payload: Payload::waking(
                     self.config.limits.envelope.max_payload_bytes,
-                    self.work.clone(),
+                    self.wake.clone(),
                 ),
                 delivery: Delivery::new(
                     envelope,
@@ -206,9 +203,16 @@ impl SharedReaders {
                 pending: None,
                 resolved_offset: None,
                 reply_due: true,
-            });
-        }
-        let slot = self.slots[index].as_mut().expect("installed subscription");
+            };
+            if let Some(index) = old {
+                self.slots[index] = slot;
+                index
+            } else {
+                self.slots.push(slot);
+                self.slots.len() - 1
+            }
+        };
+        let slot = &mut self.slots[index];
         slot.delivery.request = envelope;
         slot.reply_due = true;
         Ok(())
@@ -216,9 +220,8 @@ impl SharedReaders {
 
     pub(super) fn reject(
         &mut self,
-        peer: NodeId,
+        client: Client,
         envelope: Envelope,
-        link: Link,
         error: Failure,
         hint: AuthorityHint,
     ) -> Result<(), ActorError> {
@@ -245,15 +248,10 @@ impl SharedReaders {
                 diagnostic: "",
             },
             &mut self.metadata,
-            link.send.envelope,
+            client.link.send.envelope,
         )
         .map_err(|_| ActorError::Limits)?;
-        self.rejection = Some(crate::native_frames::message(
-            peer.as_bytes(),
-            header,
-            &self.metadata,
-            Bytes::new(),
-        ));
+        self.reply(client, header);
         Ok(())
     }
 }

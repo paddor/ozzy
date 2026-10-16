@@ -71,3 +71,32 @@ pub(crate) fn drive_with<T>(
     }
     panic!("storage future exceeded test step bound")
 }
+
+/// One real file backend over temporary files.
+#[cfg(target_os = "linux")]
+pub(crate) enum RealBackend {
+    Pool(ozzy_io_pool::Pool),
+    Aio(ozzy_io_aio::Aio),
+}
+
+#[cfg(target_os = "linux")]
+impl RealBackend {
+    pub(crate) fn start(aio: bool, pool: ozzy_io_pool::Config) -> (Self, ozzy_io::Local) {
+        let (backend, mut clients) = if aio {
+            let (backend, clients) =
+                ozzy_io_aio::Aio::new(ozzy_io_aio::Config { pool, depth: 1 }).unwrap();
+            (Self::Aio(backend), clients)
+        } else {
+            let (backend, clients) = ozzy_io_pool::Pool::new(pool).unwrap();
+            (Self::Pool(backend), clients)
+        };
+        (backend, ozzy_io::Local::new(clients.remove(0)))
+    }
+
+    pub(crate) async fn shutdown(self) {
+        match self {
+            Self::Pool(pool) => pool.shutdown().await,
+            Self::Aio(aio) => aio.shutdown().await,
+        }
+    }
+}

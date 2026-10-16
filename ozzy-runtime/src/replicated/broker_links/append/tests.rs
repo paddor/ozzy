@@ -1,5 +1,6 @@
 use super::*;
-use ozzy_proto::{Envelope, EnvelopeLimits};
+use budget::Budget;
+use ozzy_proto::{Envelope, EnvelopeLimits, Opcode, Packet};
 
 fn limits() -> AppendLinkLimits {
     AppendLinkLimits {
@@ -167,7 +168,7 @@ fn encoded_payload_is_shared_and_independent_frame_aliases_hold_the_budget() {
     assert!(budget.available(cost()));
 }
 
-fn stream(registry: &Registry, writer: u8) -> (Arc<Stream>, mpsc::Receiver<Message>) {
+fn stream(registry: &Owner, writer: u8) -> (Arc<Stream>, mpsc::Receiver<Message>) {
     let memory = registry
         .budget
         .acquire(Cost {
@@ -189,9 +190,9 @@ fn stream(registry: &Registry, writer: u8) -> (Arc<Stream>, mpsc::Receiver<Messa
     )
 }
 
-fn admit(registry: &Registry, stream: &Arc<Stream>, node: u8, id: u8, end: u64) {
+fn admit(registry: &Owner, stream: &Arc<Stream>, node: u8, id: u8, end: u64) {
     let lease = registry.budget.acquire(cost()).unwrap();
-    registry.requests.lock().unwrap().insert(
+    registry.requests.borrow_mut().insert(
         RequestId::from_bytes([id; 16]),
         Request {
             stream: Arc::downgrade(stream),
@@ -234,7 +235,7 @@ fn reply(node: u8, id: u8) -> (Message, Envelope) {
     )
 }
 
-fn deliver(registry: &Registry, node: u8, id: u8) -> bool {
+fn deliver(registry: &Owner, node: u8, id: u8) -> bool {
     let (message, envelope) = reply(node, id);
     registry.receive(
         NodeId::from_bytes([node; 16]),
@@ -249,7 +250,7 @@ fn deliver(registry: &Registry, node: u8, id: u8) -> bool {
 
 #[test]
 fn partial_confirmation_and_local_retry_do_not_fence_other_writers() {
-    let registry = Registry::new(Some(limits()));
+    let registry = Registry::new(Some(limits())).owner();
     let (first, mut a) = stream(&registry, 10);
     let (second, mut b) = stream(&registry, 20);
     admit(&registry, &first, 1, 11, 4);
@@ -260,8 +261,7 @@ fn partial_confirmation_and_local_retry_do_not_fence_other_writers() {
     assert!(
         registry
             .requests
-            .lock()
-            .unwrap()
+            .borrow()
             .contains_key(&RequestId::from_bytes([11; 16]))
     );
     registry.forget(first.id, None);
@@ -276,7 +276,7 @@ fn partial_confirmation_and_local_retry_do_not_fence_other_writers() {
 
 #[test]
 fn excessive_replies_fence_one_writer_and_physical_disconnect_fences_one_broker() {
-    let registry = Registry::new(Some(limits()));
+    let registry = Registry::new(Some(limits())).owner();
     let (first, _a) = stream(&registry, 10);
     let (second, mut b) = stream(&registry, 20);
     admit(&registry, &first, 1, 11, 4);

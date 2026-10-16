@@ -5,9 +5,22 @@
 //! contributes to partition identity or replicated membership.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::too_many_lines,
+        clippy::too_many_arguments,
+        reason = "product code is linted without cfg(test)"
+    )
+)]
 
 mod broker_identity;
 mod identity;
+mod lookup;
 mod placement;
 mod record;
 mod schema;
@@ -17,9 +30,9 @@ pub use broker_identity::{BrokerIdentity, PartitionStore, VolumeIdentity};
 pub use identity::{DeploymentIdentity, PartitionIdentity, TopicIdentity};
 pub use placement::{BrokerPlan, ControllerPlan, HostResources, PartitionPlacement, ShardPlan};
 pub use schema::{
-    Affinity, Broker, Cluster, Confirmation, Deployment, DeploymentMode, Device, Endpoints,
-    IoBackend, MAX_APPEND_BYTES, MemoryPool, Omq, PartitionOverride, QueueBudget, ResourceLimits,
-    Shard, StorageWorkers, Topic, TopicRetention, Topology,
+    Affinity, Broker, Cluster, Deployment, DeploymentMode, Device, Endpoints, IoBackend,
+    MAX_APPEND_BYTES, MAX_CLIENTS, MemoryPool, Omq, PartitionOverride, QueueBudget, ResourceLimits,
+    Shard, StorageWorkers, Topic, TopicDeduplication, TopicRetention, Topology,
 };
 pub use validate::ValidatedDeployment;
 

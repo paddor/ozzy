@@ -242,9 +242,11 @@ pub(super) fn run() -> Result<()> {
         "executable_sha256":source::sha256(&std::env::current_exe()?)?,
         "scope":"one-file disk probe; includes periodic data barriers; excludes Ozzy framing, metadata roll, network and confirmation",
         "result":result});
-    let path = args.results.unwrap_or_else(|| {
-        PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cache/ozzy/disk-probe.jsonl")
-    });
+    let path = match args.results {
+        Some(path) => path,
+        None => PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?)
+            .join(".cache/ozzy/disk-probe.jsonl"),
+    };
     fs::create_dir_all(path.parent().ok_or("result path needs parent")?)?;
     let mut output = OpenOptions::new().create(true).append(true).open(path)?;
     writeln!(output, "{row}")?;

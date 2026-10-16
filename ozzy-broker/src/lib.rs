@@ -5,8 +5,21 @@
 //! partition actors and publish readiness on their application threads.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::too_many_lines,
+        clippy::too_many_arguments,
+        reason = "product code is linted without cfg(test)"
+    )
+)]
 
 mod actors;
+mod admin;
 mod devices;
 mod format;
 mod frontend;
@@ -17,11 +30,15 @@ mod provisioning;
 mod serving;
 mod shards;
 mod volumes;
+// Kept as a crate path so the Loom tests can substitute their model.
+use ozzy_io::signal;
 
 pub use actors::{ActorSettings, StartedPartition};
 pub use devices::{DevicePools, ShardIo};
 pub use format::format_partition_journals;
-pub use frontend::{FollowerRoutes, Frontend, FrontendContext, TransportLimits};
+pub use frontend::{
+    FollowerRoutes, Frontend, FrontendContext, FrontendPlan, RemoteBrokers, TransportLimits,
+};
 pub use host::host_resources;
 pub use journals::{
     JournalConfig, JournalPlan, OpenedPartition, PartitionAuthority, PartitionJournal,
@@ -31,8 +48,8 @@ pub use provisioning::{
     CheckedConfig, check_config, initialize_broker_identity, initialize_identity,
     load_broker_identity, load_deployment,
 };
-pub use serving::{Broker, ServingContext, StorageOwner};
-pub use shards::{ApplicationShards, ShardContext, ShardMemory, Shutdown};
+pub use serving::{Broker, ServingContext, ShardStorage, StorageOwner};
+pub use shards::{ApplicationShards, ShardContext, ShardMemory};
 pub use volumes::{check_volumes, initialize_volumes};
 
 use std::path::PathBuf;
@@ -94,4 +111,10 @@ pub(crate) fn io_error(path: impl Into<PathBuf>, source: std::io::Error) -> Star
         path: path.into(),
         source,
     }
+}
+
+/// The directory holding a configured path; a root has none.
+pub(crate) fn parent_directory(path: &std::path::Path) -> Result<&std::path::Path, StartupError> {
+    path.parent()
+        .ok_or_else(|| io_error(path, std::io::ErrorKind::InvalidInput.into()))
 }

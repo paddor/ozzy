@@ -38,6 +38,14 @@ impl ScheduledReplica {
         (ticket, &mut self.actor.journal)
     }
 
+    /// Committed facts of `partition` for diagnostics; `None` while busy.
+    pub(super) fn facts(
+        &self,
+        partition: ozzy_proto::PartitionIncarnation,
+    ) -> Option<crate::replica_journal::PartitionFacts> {
+        self.actor.journal.facts(partition)
+    }
+
     /// Take a startup submission lane before shared scheduling begins.
     pub fn take_submitter(&mut self) -> Option<super::ProposalSubmitter> {
         self.actor.take_submitter()
@@ -140,7 +148,7 @@ impl ScheduledReplica {
                     .normal()
                     .map(|normal| normal.snapshot().committed)
         {
-            self.actor.ready_work.mark();
+            self.actor.more_work = true;
         }
         self.finish(result)
     }
@@ -232,8 +240,11 @@ impl ScheduledReplica {
         ] {
             self.actor.outbox.discard(peer, class);
         }
+        // A discarded COMMIT or vote is no longer the last one the peer saw.
+        self.actor.work.announced[voter] = None;
+        self.actor.acked = None;
         self.actor.ack_at = now;
-        self.actor.ready_work.mark();
+        self.actor.more_work = true;
     }
 
     /// Attempt bounded outbox progress. A full destination must return the exact
@@ -284,7 +295,7 @@ impl ScheduledReplica {
 
     /// Coalesced observation only, never a substitute for partition authority.
     pub fn status(&self) -> ActorStatus {
-        *self.actor.status.borrow()
+        self.actor.status()
     }
 
     /// Current per-partition route, including proposed leader changes. This is
@@ -322,7 +333,7 @@ impl ScheduledReplica {
     }
 
     pub(super) fn native_identity(&self) -> (NodeId, ozzy_proto::append::Policy) {
-        (self.actor.local, self.actor.configuration.append_policy())
+        (self.actor.local, ozzy_proto::append::Policy::QuorumDurable)
     }
 
     /// Current follower receive window and its leader. This is an observation,
@@ -408,5 +419,8 @@ impl ScheduledReplica {
     }
     pub(super) fn into_actor(self) -> ReplicaActor {
         *self.actor
+    }
+    pub(super) fn next_deadline(&self, now: Duration) -> Option<Duration> {
+        self.actor.next_deadline(now)
     }
 }

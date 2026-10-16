@@ -1,33 +1,124 @@
 use super::{BrokerLinkError, BrokerLinks};
 use crate::{
     signal::StateSignal,
-    topic_metadata::{RouteCache, TopicMetadata},
+    topic_metadata::{RouteObservations, TopicMetadata},
 };
 use ozzy_proto::{
-    GroupId, LinkSessionId, NodeId, TopicId, directory::RouteState, nack::RetryClass,
+    GroupId, LinkSessionId, NodeId, TopicId,
+    directory::{BrokerEndpoint, RouteState},
+    nack::RetryClass,
 };
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
-};
+use std::{collections::BTreeMap, sync::Arc};
 
+mod interest;
+use interest::Interest;
+mod waiting;
+pub(in crate::replicated) use waiting::LeaderRoute;
 mod watch;
 pub(super) use watch::Watcher;
 
 #[derive(Debug)]
 pub(super) struct State {
     topic: Arc<TopicMetadata>,
-    cache: Mutex<RouteCache>,
-    interests: Mutex<BTreeMap<GroupId, u64>>,
+    /// Per partition number, the view callers route by.
+    views: Vec<arc_swap::ArcSwap<RouteView>>,
+    /// Per partition number, the interest callers raise.
+    interests: Box<[Interest]>,
     changed: StateSignal,
-    rejections: Mutex<BTreeMap<(GroupId, NodeId), Rejection>>,
 }
 
-#[derive(Debug)]
+/// One partition's routing view, as the watchers last published it: route
+/// observations and permanent snapshot rejections by broker, each bound to
+/// the broker session that produced it.
+#[derive(Debug, Default)]
+struct RouteView {
+    routes: RouteObservations,
+    rejections: BTreeMap<NodeId, Rejection>,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct Rejection {
     session: LinkSessionId,
     code: u16,
     retry: RetryClass,
+}
+
+impl RouteView {
+    /// The first broker's rejection once every broker rejected the snapshot
+    /// on its `current` session.
+    fn rejected(
+        &self,
+        brokers: &[BrokerEndpoint],
+        current: impl Fn(NodeId, LinkSessionId) -> bool,
+    ) -> Option<Rejection> {
+        let first = *self.rejections.get(&brokers.first()?.node)?;
+        brokers
+            .iter()
+            .all(|broker| {
+                self.rejections
+                    .get(&broker.node)
+                    .is_some_and(|rejection| current(broker.node, rejection.session))
+            })
+            .then_some(first)
+    }
+}
+
+impl State {
+    /// The group's interest revision, 0 without interest.
+    fn revision(&self, group: GroupId) -> u64 {
+        self.topic
+            .partition_by_group(group)
+            .and_then(|partition| self.interests.get(partition.number as usize))
+            .map_or(0, Interest::revision)
+    }
+
+    /// Replace `broker`'s route observations of the group with `routes`.
+    fn publish_routes(&self, group: GroupId, broker: NodeId, routes: RouteObservations) {
+        self.publish(group, |view| {
+            Some(RouteView {
+                routes: view.routes.replacing(broker, routes),
+                rejections: view.rejections.clone(),
+            })
+        });
+    }
+
+    /// Record `broker`'s permanent rejection of the group's snapshot.
+    fn reject(&self, group: GroupId, broker: NodeId, rejection: Rejection) {
+        self.publish(group, |view| {
+            let mut rejections = view.rejections.clone();
+            rejections.insert(broker, rejection);
+            Some(RouteView {
+                routes: view.routes.clone(),
+                rejections,
+            })
+        });
+    }
+
+    /// Forget `broker`'s rejection once it answered a snapshot.
+    fn clear_rejection(&self, group: GroupId, broker: NodeId) {
+        self.publish(group, |view| {
+            let mut rejections = view.rejections.clone();
+            rejections.remove(&broker)?;
+            Some(RouteView {
+                routes: view.routes.clone(),
+                rejections,
+            })
+        });
+    }
+
+    /// Replace the group's view with `next`, unless it returns `None`. Only
+    /// watchers on the SDK driver thread publish, so a changed copy loses no
+    /// concurrent update.
+    fn publish(&self, group: GroupId, next: impl FnOnce(&RouteView) -> Option<RouteView>) {
+        if let Some(slot) = self
+            .topic
+            .partition_by_group(group)
+            .and_then(|partition| self.views.get(partition.number as usize))
+            && let Some(view) = next(&slot.load())
+        {
+            slot.store(Arc::new(view));
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -74,19 +165,25 @@ impl Registry {
             .checked_add(charge)
             .filter(|n| *n <= self.bytes)
             .ok_or(BrokerLinkError::Configuration)?;
-        let registrations = topic
-            .partition_count()
-            .checked_mul(topic.brokers().len())
-            .ok_or(BrokerLinkError::Configuration)?;
+        // Each group belongs to one topic, so one watch serves it.
+        if topic.groups().any(|group| self.groups.contains_key(&group)) {
+            return Err(BrokerLinkError::Response);
+        }
         let topic = Arc::new(topic);
         let state = Arc::new(State {
-            cache: Mutex::new(RouteCache::shared(topic.clone(), registrations, 1)?),
+            views: (0..topic.partition_count())
+                .map(|_| arc_swap::ArcSwap::from_pointee(RouteView::default()))
+                .collect(),
+            interests: (0..topic.partition_count())
+                .map(|_| Interest::default())
+                .collect(),
             topic,
-            interests: Mutex::new(BTreeMap::new()),
             changed: StateSignal::default(),
-            rejections: Mutex::new(BTreeMap::new()),
         });
         self.topics.insert(state.topic.id(), state.clone());
+        for group in state.topic.groups() {
+            self.groups.insert(group, state.clone());
+        }
         self.partitions = partitions;
         self.used = used;
         Ok(state)
@@ -135,47 +232,16 @@ impl TopicRoutes {
     /// Register one first-used partition on every configured broker link.
     /// This never waits for a broker or grants leadership authority.
     pub fn interest(&self, number: u32) -> Result<(), BrokerLinkError> {
-        if self.links.0.shared.stop.is_closed() {
-            return Err(BrokerLinkError::Closed);
-        }
-        let group = self.group(number)?;
-        let mut registry = self
-            .links
-            .0
-            .shared
-            .routing
-            .lock()
-            .expect("SDK routing poisoned");
-        if registry
-            .groups
-            .get(&group)
-            .is_some_and(|state| !Arc::ptr_eq(state, &self.state))
-        {
-            return Err(BrokerLinkError::Response);
-        }
-        let mut interests = self.state.interests.lock().expect("SDK interests poisoned");
-        if interests.contains_key(&group) {
-            return Ok(());
-        }
-        interests.insert(group, 1);
-        registry.groups.insert(group, self.state.clone());
-        drop((interests, registry));
-        self.links.0.shared.changed.notify_changed();
+        self.partition_interest(number)?
+            .register(&self.links.0.shared.interests);
         Ok(())
     }
 
     /// Request fresh snapshots after timeout or an authority rejection. Record
     /// partition, message IDs, producer epoch, and sequences stay unchanged.
     pub fn refresh(&self, number: u32) -> Result<(), BrokerLinkError> {
-        self.interest(number)?;
-        let group = self.group(number)?;
-        let mut interests = self.state.interests.lock().expect("SDK interests poisoned");
-        let revision = interests.get_mut(&group).expect("registered interest");
-        *revision = revision
-            .checked_add(1)
-            .ok_or(BrokerLinkError::Configuration)?;
-        drop(interests);
-        self.links.0.shared.changed.notify_changed();
+        self.partition_interest(number)?
+            .refresh(&self.links.0.shared.interests);
         Ok(())
     }
 
@@ -185,40 +251,28 @@ impl TopicRoutes {
         if self.links.0.shared.stop.is_closed() {
             return Err(BrokerLinkError::Closed);
         }
-        let group = self.group(number)?;
-        let result = self
+        let view = self
             .state
-            .cache
-            .lock()
-            .expect("SDK route cache poisoned")
-            .route_matching(group, |peer, session| {
-                self.links.session(peer) == Some(session)
-            })?;
-        if result.is_none() {
-            let rejected = self
-                .state
-                .rejections
-                .lock()
-                .expect("SDK route rejections poisoned");
-            if self.state.topic.brokers().iter().all(|broker| {
-                rejected.get(&(group, broker.node)).is_some_and(|rejected| {
-                    self.links.session(broker.node) == Some(rejected.session)
-                })
-            }) {
-                let rejection = rejected
-                    .get(&(group, self.state.topic.brokers()[0].node))
-                    .expect("nonempty brokers");
-                return Err(BrokerLinkError::Rejected {
-                    code: rejection.code,
-                    retry: rejection.retry,
-                    hint: None,
-                });
-            }
+            .views
+            .get(number as usize)
+            .ok_or(BrokerLinkError::Configuration)?
+            .load();
+        let current = |broker, session| self.links.session(broker) == Some(session);
+        if let Some(route) = view.routes.matching(current)? {
+            return Ok(Some(route));
         }
-        Ok(result)
+        match view.rejected(self.state.topic.brokers(), current) {
+            Some(rejection) => Err(BrokerLinkError::Rejected {
+                code: rejection.code,
+                retry: rejection.retry,
+                hint: None,
+            }),
+            None => Ok(None),
+        }
     }
 
     /// Capture before reading the current route to close the read/wait race.
+    #[inline]
     pub fn generation(&self) -> RouteGeneration {
         RouteGeneration {
             routes: self.state.changed.generation(),
@@ -235,11 +289,13 @@ impl TopicRoutes {
         }
     }
 
-    fn group(&self, number: u32) -> Result<GroupId, BrokerLinkError> {
+    fn partition_interest(&self, number: u32) -> Result<&Interest, BrokerLinkError> {
+        if self.links.0.shared.stop.is_closed() {
+            return Err(BrokerLinkError::Closed);
+        }
         self.state
-            .topic
-            .partition(number)
-            .map(|partition| partition.group)
+            .interests
+            .get(number as usize)
             .ok_or(BrokerLinkError::Configuration)
     }
 }

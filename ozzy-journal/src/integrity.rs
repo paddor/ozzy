@@ -41,6 +41,26 @@ impl IntegrityHasher {
     pub fn finish(&self) -> Digest {
         digest(self.0.digest128())
     }
+
+    /// Add `input` through its 32-byte digest field at `at`, read as zeros,
+    /// and return the bytes after the field. Adds nothing and returns `None`
+    /// when the field does not fit.
+    pub fn update_through_digest<'a>(&mut self, input: &'a [u8], at: usize) -> Option<&'a [u8]> {
+        let (head, rest) = input.split_at_checked(at)?;
+        let (_, tail) = rest.split_first_chunk::<32>()?;
+        self.update(head);
+        self.update(&[0; 32]);
+        Some(tail)
+    }
+}
+
+/// Checksum one object whose 32-byte digest field at `at` is read as zeros.
+/// An object too short for the field is hashed whole, so it matches no field.
+pub fn hash_without_digest(context: &str, input: &[u8], at: usize) -> Digest {
+    let mut hasher = IntegrityHasher::new(context);
+    let tail = hasher.update_through_digest(input, at);
+    hasher.update(tail.unwrap_or(input));
+    hasher.finish()
 }
 
 /// Checksum one complete object without allocating a streaming state.

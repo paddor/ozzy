@@ -3,7 +3,42 @@
 use super::{BrokerWorker, DeploymentArtifact, check_storage_parent};
 use crate::{BenchResult, bench_error};
 use ozzy_config::Endpoints;
+use ozzy_proto::directory::EndpointScheme;
 use std::{net::IpAddr, net::TcpListener, path::Path, path::PathBuf};
+
+/// Broker endpoint transport between processes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum Transport {
+    /// Plain `tcp://`.
+    #[default]
+    Tcp,
+    /// `lz4+tcp://`: OMQ compresses each connection on its I/O thread.
+    Lz4,
+    /// `zstd+tcp://`: as `lz4`, with zstd.
+    Zstd,
+}
+
+impl Transport {
+    /// The endpoint scheme this transport binds.
+    #[must_use]
+    pub const fn scheme(self) -> EndpointScheme {
+        match self {
+            Self::Tcp => EndpointScheme::Tcp,
+            Self::Lz4 => EndpointScheme::Lz4Tcp,
+            Self::Zstd => EndpointScheme::ZstdTcp,
+        }
+    }
+
+    /// The `--transport` value selecting this transport.
+    #[must_use]
+    pub const fn flag(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Lz4 => "lz4",
+            Self::Zstd => "zstd",
+        }
+    }
+}
 
 /// Run resources allocated on the broker host. Keep reservations through
 /// initialization; release them immediately before serving fixed addresses.
@@ -18,6 +53,17 @@ pub struct PreparedBroker {
 impl PreparedBroker {
     /// Reserve disk-backed storage and fixed TCP endpoints for one of one or three brokers.
     pub fn new(parent: &Path, index: usize, bind: IpAddr, brokers: usize) -> BenchResult<Self> {
+        Self::with_transport(parent, index, bind, brokers, Transport::Tcp)
+    }
+
+    /// As `new`, naming the reserved endpoints with `transport`'s scheme.
+    pub fn with_transport(
+        parent: &Path,
+        index: usize,
+        bind: IpAddr,
+        brokers: usize,
+        transport: Transport,
+    ) -> BenchResult<Self> {
         if ![1, 3].contains(&brokers)
             || index >= brokers
             || bind.is_unspecified()
@@ -25,15 +71,15 @@ impl PreparedBroker {
         {
             return Err(bench_error("invalid production broker preparation"));
         }
-        std::fs::create_dir_all(parent)?;
-        check_storage_parent(parent)?;
-        let directory = tempfile::Builder::new()
-            .prefix(&format!("native-broker-{index}-"))
-            .tempdir_in(std::fs::canonicalize(parent)?)?;
+        let directory = Self::directory_in(parent, index)?;
         let mut reservations = Vec::new();
         let mut endpoint = || -> BenchResult<String> {
             let listener = TcpListener::bind(std::net::SocketAddr::new(bind, 0))?;
-            let endpoint = format!("tcp://{}", listener.local_addr()?);
+            let endpoint = format!(
+                "{}://{}",
+                transport.scheme().as_str(),
+                listener.local_addr()?
+            );
             reservations.push(listener);
             Ok(endpoint)
         };
@@ -42,6 +88,7 @@ impl PreparedBroker {
             data_peer: endpoint()?,
             reader_pub: endpoint()?,
             follower_pub: (brokers == 3).then(&mut endpoint).transpose()?,
+            admin: None,
         };
         Ok(Self {
             directory,
@@ -49,6 +96,39 @@ impl PreparedBroker {
             endpoints,
             reservations,
         })
+    }
+
+    /// Memory-backed broker for one process: inproc endpoints and no TCP
+    /// reservations. The directory holds deployment files; the device root
+    /// names the broker's memory image, not files on disk.
+    pub fn inproc(parent: &Path, index: usize, brokers: usize) -> BenchResult<Self> {
+        if ![1, 3].contains(&brokers) || index >= brokers {
+            return Err(bench_error("invalid inproc broker preparation"));
+        }
+        let directory = Self::directory_in(parent, index)?;
+        let namespace = uuid::Uuid::now_v7();
+        let endpoint = |plane: &str| format!("inproc://ozzy-bench-{namespace}-{plane}");
+        let endpoints = Endpoints {
+            peer: endpoint("peer"),
+            data_peer: endpoint("data"),
+            reader_pub: endpoint("readers"),
+            follower_pub: (brokers == 3).then(|| endpoint("followers")),
+            admin: None,
+        };
+        Ok(Self {
+            directory,
+            broker: format!("broker-{index}"),
+            endpoints,
+            reservations: Vec::new(),
+        })
+    }
+
+    fn directory_in(parent: &Path, index: usize) -> BenchResult<tempfile::TempDir> {
+        std::fs::create_dir_all(parent)?;
+        check_storage_parent(parent)?;
+        Ok(tempfile::Builder::new()
+            .prefix(&format!("native-broker-{index}-"))
+            .tempdir_in(std::fs::canonicalize(parent)?)?)
     }
 
     /// Worker-owned temporary directory retained through the benchmark deployment.

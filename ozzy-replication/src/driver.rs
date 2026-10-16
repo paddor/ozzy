@@ -9,8 +9,12 @@
 //! owns in-flight installation while the adapter stages and publishes on its disk
 //! worker. This driver does not itself enable networked process failover.
 
+mod deadline;
 mod exit_view;
 mod installation;
+mod poll;
+mod receive;
+mod storage;
 mod validation;
 
 pub use installation::ActivationTicket;
@@ -22,9 +26,9 @@ use ozzy_proto::NodeId;
 
 use crate::wire::Control;
 use crate::{
-    Admission, Configuration, Digest, InstallingView, JournalGeneration, LogSource, NormalReplica,
-    OpNumber, Prefix, PreparedOperation, PromiseTicket, ReplicaSnapshot, ReplicationError, Scope,
-    SelectedView, StartView, Status, SyncTicket, ViewChange, ViewChangeError, WriteTicket,
+    Configuration, Digest, InstallingView, LogSource, NormalReplica, OpNumber, PromiseTicket,
+    ReplicaSnapshot, ReplicationError, Scope, SelectedView, Status, ViewChange, ViewChangeError,
+    VoterIndex, VoterSet, Voters,
 };
 
 /// Independent heartbeat, progress, and election retry intervals.
@@ -91,6 +95,9 @@ pub enum Role {
     ViewChanging(ViewChange),
     /// Owned selected-log publication; no normal authority until exact completion.
     Installing(InstallingView),
+    /// A consuming transition failed and took the previous phase with it.
+    /// Every event fails closed; only restart recovery resumes this voter.
+    Fenced(Scope),
 }
 
 /// Timer and election-message driver for one fixed three-voter group.
@@ -99,9 +106,9 @@ pub enum Role {
 /// Old writes must settle before a promise; a pending promise survives later views.
 #[derive(Debug)]
 pub struct ReplicaDriver {
-    role: Option<Role>,
+    role: Role,
     configuration: Configuration,
-    local: NodeId,
+    local: VoterIndex,
     timing: Timing,
     now: Duration,
     contact_deadline: Duration,
@@ -115,16 +122,16 @@ pub struct ReplicaDriver {
     commit_pending: bool,
     // At most one selected-tail activation response per remote voter. A late
     // installed voter cannot receive fresh payload until that tail is applied.
-    activation_pending: u8,
+    activation_pending: VoterSet,
     /// Current-view timeout suspicions. Never durable or history-selection votes.
-    exit_votes: u8,
+    exit_votes: VoterSet,
     /// `None` means local suspicion is inactive or was withdrawn after progress.
     exit_retry_at: Option<Duration>,
     /// An older view peers still ask to leave, and which voters asked. This
     /// voter already left it.
-    exit_echo: Option<(Scope, u8)>,
+    exit_echo: Option<(Scope, VoterSet)>,
     /// Earliest next answer to each voter's request to leave an older view.
-    exit_echo_at: [Duration; 3],
+    exit_echo_at: Voters<Duration>,
 }
 
 impl ReplicaDriver {
@@ -147,7 +154,7 @@ impl ReplicaDriver {
         timing: Timing,
     ) -> Result<Self, DriverError> {
         let configuration = changing.configuration;
-        let local = configuration.voters()[changing.local];
+        let local = changing.local;
         Self::new(
             Role::ViewChanging(changing),
             configuration,
@@ -160,7 +167,7 @@ impl ReplicaDriver {
     fn new(
         role: Role,
         configuration: Configuration,
-        local: NodeId,
+        local: VoterIndex,
         now: Duration,
         timing: Timing,
     ) -> Result<Self, DriverError> {
@@ -169,20 +176,20 @@ impl ReplicaDriver {
         let activating =
             matches!(&role, Role::Normal(normal) if !normal.snapshot().ready_for_appends);
         Ok(Self {
-            role: Some(role),
+            role,
             configuration,
             local,
             timing,
             now,
-            contact_deadline: now + timing.primary_timeout,
-            persistence_deadline: now + timing.primary_timeout,
+            contact_deadline: now.saturating_add(timing.primary_timeout),
+            persistence_deadline: now.saturating_add(timing.primary_timeout),
             progress_deadline: now
                 + if activating {
                     timing.election_timeout
                 } else {
                     timing.primary_timeout
                 },
-            election_deadline: now + timing.election_timeout,
+            election_deadline: now.saturating_add(timing.election_timeout),
             election_delay: timing.election_timeout,
             retry_at: now
                 + if changing {
@@ -193,25 +200,25 @@ impl ReplicaDriver {
             start_pending: changing,
             report_pending: changing,
             commit_pending: false,
-            activation_pending: 0,
-            exit_votes: 0,
+            activation_pending: VoterSet::EMPTY,
+            exit_votes: VoterSet::EMPTY,
             exit_retry_at: None,
             exit_echo: None,
-            exit_echo_at: [Duration::ZERO; 3],
+            exit_echo_at: Voters::splat(Duration::ZERO),
         })
     }
 
     /// Inspect normal evidence. No mutable access can bypass scheduling/fencing.
     pub fn normal(&self) -> Option<&NormalReplica> {
-        match self.role.as_ref().expect("owned role") {
+        match &self.role {
             Role::Normal(normal) => Some(normal),
-            Role::ViewChanging(_) | Role::Installing(_) => None,
+            Role::ViewChanging(_) | Role::Installing(_) | Role::Fenced(_) => None,
         }
     }
 
     /// A fenced old view needs an actual barrier before publishing its promise.
     pub fn election_needs_sync(&self) -> bool {
-        let Some(Role::ViewChanging(changing)) = &self.role else {
+        let Role::ViewChanging(changing) = &self.role else {
             return false;
         };
         let journal = changing.normal_snapshot().journal;
@@ -220,408 +227,18 @@ impl ReplicaDriver {
 
     /// Current normal or proposed election scope, not necessarily durable.
     pub fn scope(&self) -> Scope {
-        match self.role.as_ref().expect("owned role") {
+        match &self.role {
             Role::Normal(normal) => normal.snapshot().scope,
             Role::ViewChanging(changing) => changing.scope(),
             Role::Installing(installing) => installing.requested_scope(),
+            Role::Fenced(scope) => *scope,
         }
     }
 
     /// Extract phase ownership. Pending I/O still must settle; a replacement driver
     /// must preserve newer-view fencing rather than resume an old normal role.
     pub fn into_role(self) -> Role {
-        self.role.expect("owned role")
-    }
-
-    /// Advance deadlines and emit at most one action, without waiting for I/O.
-    /// Repeated polls at one instant do not create unbounded retransmission.
-    pub fn poll(&mut self, now: Duration) -> Result<Option<Action>, DriverError> {
-        self.observe_time(now)?;
-        if let Some(Role::Installing(installing)) = &self.role {
-            installing.require_pending()?;
-            if let Some(action) = self.exit_echo_action() {
-                return Ok(Some(action));
-            }
-            if now >= self.election_deadline {
-                self.request_exit()?;
-            }
-            // Suspicion can travel, but publication must settle before a promise.
-            return Ok(self.exit_action());
-        }
-        if let Some(Role::ViewChanging(changing)) = &self.role
-            && changing.normal_snapshot().status == Status::Faulted
-        {
-            return Err(ViewChangeError::Faulted.into());
-        }
-        if let Some(action) = self.exit_echo_action() {
-            return Ok(Some(action));
-        }
-        if let Some(normal) = self.normal() {
-            let snapshot = normal.snapshot();
-            if snapshot.status != Status::Normal {
-                return Err(ReplicationError::NotNormal.into());
-            }
-            let primary = self.configuration.primary(snapshot.scope.view) == self.local;
-            let outstanding =
-                snapshot.accepted != snapshot.committed || !snapshot.ready_for_appends;
-            if self.normal_timed_out(&snapshot) {
-                self.request_exit()?;
-                if self.normal().is_some() {
-                    return Ok(self.exit_action());
-                }
-            } else {
-                self.withdraw_exit();
-                if !outstanding {
-                    self.progress_deadline = now + self.timing.primary_timeout;
-                }
-                if primary && self.commit_pending {
-                    self.commit_pending = false;
-                    let message = self.normal().expect("normal role").announcement()?;
-                    return Ok(Some(Action::Broadcast(Control::Commit(message))));
-                }
-                if primary && let Some(action) = self.activation_action()? {
-                    return Ok(Some(action));
-                }
-                if primary && now >= self.retry_at {
-                    self.retry_at = now + self.timing.heartbeat;
-                    if let Some(start) = self.normal().expect("normal role").start_view()? {
-                        self.commit_pending = true;
-                        return Ok(Some(Action::Broadcast(Control::StartView(start))));
-                    }
-                    let message = self.normal().expect("normal role").announcement()?;
-                    return Ok(Some(Action::Broadcast(Control::Commit(message))));
-                }
-                return Ok(None);
-            }
-        } else if now >= self.election_deadline {
-            self.request_exit()?;
-        }
-        if let Some(action) = self.exit_action() {
-            return Ok(Some(action));
-        }
-        if now >= self.retry_at {
-            self.start_pending = true;
-            self.report_pending = true;
-            self.retry_at = now + self.timing.retransmit;
-        }
-        let Role::ViewChanging(changing) = self.role.as_mut().expect("owned role") else {
-            unreachable!("normal path returned or entered election");
-        };
-        if changing.promised_view() != changing.scope().view {
-            return match changing.begin_promise() {
-                Ok(ticket) => Ok(Some(Action::PersistPromise(ticket))),
-                Err(ViewChangeError::StoragePending | ViewChangeError::PromisePending) => Ok(None),
-                Err(error) => Err(error.into()),
-            };
-        }
-        if self.start_pending {
-            let message = changing.start_message()?;
-            self.start_pending = false;
-            return Ok(Some(Action::Broadcast(Control::StartViewChange(message))));
-        }
-        if self.report_pending {
-            match changing.report() {
-                Ok(report) => {
-                    self.report_pending = false;
-                    let to = self.configuration.primary(report.scope.view);
-                    if to != self.local {
-                        return Ok(Some(Action::Send {
-                            to,
-                            message: Control::DoViewChange(report),
-                        }));
-                    }
-                }
-                Err(ViewChangeError::StartQuorumMissing) => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Ok(None)
-    }
-
-    /// Receive one authenticated, wire-validated control. Stale views are ignored.
-    /// A timeout only sends volatile `EXIT_VIEW` suspicion until a quorum agrees.
-    /// A durably promised `START_VIEW_CHANGE` instead fences older authority,
-    /// including an intact voter's restart request. These distinct messages must
-    /// not be interchanged. Senders must obey the crash-fault protocol, not merely
-    /// supply a claimed node identity.
-    ///
-    /// A returned `START_VIEW` needs bounded retention by the adapter until its
-    /// local promise completes, then verified selected installation. It never
-    /// activates a normal role here. Exact duplicate installed descriptors return
-    /// `None` without reinstalling and permit replay of the normal durable ACK.
-    /// Normal ACK grants remain adapter-owned.
-    pub fn receive(
-        &mut self,
-        from: NodeId,
-        message: Control,
-        now: Duration,
-    ) -> Result<Option<StartView>, DriverError> {
-        self.observe_time(now)?;
-        let voter = self.configuration.voter_index(from)?;
-        if from == self.local {
-            return Err(ReplicationError::WrongRole.into());
-        }
-        let scope = message.scope();
-        if scope
-            != (Scope {
-                view: scope.view,
-                ..self.configuration.scope()
-            })
-        {
-            return Err(ReplicationError::ScopeMismatch.into());
-        }
-        if let Control::ExitView(_) = message {
-            self.receive_exit(voter, scope)?;
-            return Ok(None);
-        }
-        if scope.view < self.scope().view {
-            return Ok(None);
-        }
-        let primary = self.configuration.primary(scope.view);
-        match message {
-            Control::Commit(_) | Control::StartView(_) if from != primary => {
-                return Err(ReplicationError::WrongRole.into());
-            }
-            Control::PrepareOk { .. }
-            | Control::PrepareRetained { .. }
-            | Control::DoViewChange(_)
-                if self.local != primary =>
-            {
-                return Err(ReplicationError::WrongRole.into());
-            }
-            _ => {}
-        }
-        if let Control::StartViewChange(_) = message {
-            match self.role.as_ref().expect("owned role") {
-                Role::Normal(normal) if normal.snapshot().status == Status::Faulted => {
-                    return Err(ViewChangeError::Faulted.into());
-                }
-                Role::ViewChanging(changing)
-                    if changing.normal_snapshot().status == Status::Faulted =>
-                {
-                    return Err(ViewChangeError::Faulted.into());
-                }
-                Role::Installing(installing) => installing.require_pending()?,
-                Role::Normal(_) | Role::ViewChanging(_) => {}
-            }
-            // A first-phase sender has durably fenced its previous authority.
-            // Timeout-only suspicion uses EXIT_VIEW and cannot reach this path.
-            if scope.view > self.scope().view {
-                self.change_view(scope.view)?;
-            }
-            if scope.view != self.scope().view {
-                return Ok(None);
-            }
-        }
-        if scope.view > self.scope().view {
-            self.change_view(scope.view)?;
-        }
-        match self.role.as_mut().expect("owned role") {
-            Role::Normal(normal) => {
-                let committed = normal.snapshot().committed;
-                match message {
-                    Control::Commit(commit) => {
-                        normal.receive_commit(from, commit)?;
-                        self.contact_deadline = now + self.timing.primary_timeout;
-                    }
-                    Control::PrepareOk { ack, .. } => normal.receive_ack(from, ack)?,
-                    Control::PrepareRetained { ack, .. } => {
-                        normal.receive_retained_ack(from, ack)?;
-                    }
-                    Control::StartView(start) => {
-                        normal.observe_installed_start(from, start)?;
-                        self.contact_deadline = now + self.timing.primary_timeout;
-                    }
-                    _ => return Ok(None),
-                }
-                if let Some(prefix) = message.acknowledged()
-                    && let Some(start) = normal.start_view()?
-                    && prefix == start.accepted
-                    && start.accepted.op < normal.snapshot().committed.op
-                {
-                    // Selected history plus an established quorum authorizes
-                    // replay. An old vote alone cannot create commit authority.
-                    self.activation_pending |= 1 << voter;
-                }
-                if normal.snapshot().committed != committed {
-                    self.progress_deadline = now + self.progress_timeout();
-                }
-            }
-            Role::ViewChanging(changing) => match message {
-                Control::StartViewChange(start) => changing.receive_start(from, start)?,
-                Control::DoViewChange(report) => changing.receive_report(from, report)?,
-                Control::StartView(start) => return Ok(Some(start)),
-                Control::Commit(_)
-                | Control::PrepareOk { .. }
-                | Control::PrepareRetained { .. }
-                | Control::ExitView(_) => {}
-            },
-            Role::Installing(installing) => installing.observe_view(from, scope)?,
-        }
-        Ok(None)
-    }
-
-    /// Observe actual durable publication of the exact outstanding promise.
-    pub fn complete_promise(&mut self, ticket: PromiseTicket) -> Result<(), DriverError> {
-        self.changing()?.complete_promise(ticket)?;
-        Ok(())
-    }
-
-    /// Report an uncertain metadata publication. No election retry can reuse it.
-    pub fn fail_promise(&mut self, ticket: PromiseTicket) -> Result<(), DriverError> {
-        self.changing()?.fail_promise(ticket)?;
-        Ok(())
-    }
-
-    /// Admit an already body/application-validated canonical group. The returned
-    /// ticket schedules disk work; transmission may overlap that work. Later
-    /// views require selected installation, never implicit normal activation.
-    pub fn prepare(
-        &mut self,
-        from: NodeId,
-        scope: Scope,
-        operations: &[PreparedOperation],
-        now: Duration,
-    ) -> Result<Admission, DriverError> {
-        self.observe_time(now)?;
-        self.configuration.voter_index(from)?;
-        if scope
-            != (Scope {
-                view: scope.view,
-                ..self.configuration.scope()
-            })
-        {
-            return Err(ReplicationError::ScopeMismatch.into());
-        }
-        if from != self.configuration.primary(scope.view) {
-            return Err(ReplicationError::WrongRole.into());
-        }
-        if scope.view > self.scope().view {
-            self.change_view(scope.view)?;
-        }
-        let Role::Normal(normal) = self.role.as_mut().expect("owned role") else {
-            return Err(ReplicationError::NotNormal.into());
-        };
-        let previous = normal.snapshot();
-        let admitted = normal.prepare(from, scope, operations)?;
-        if normal.snapshot().accepted != previous.accepted
-            && previous.accepted == previous.committed
-            && previous.ready_for_appends
-        {
-            self.progress_deadline = now + self.timing.primary_timeout;
-        }
-        if normal.snapshot().accepted != previous.accepted
-            && previous.accepted.op == self.storage_progress(&previous)
-        {
-            self.persistence_deadline = now + self.timing.primary_timeout;
-        }
-        self.contact_deadline = now + self.timing.primary_timeout;
-        Ok(admitted)
-    }
-
-    /// Settle actual complete writes, including writes admitted before a timeout.
-    /// Completion while changing view never restores normal voting or commit.
-    pub fn complete_write(&mut self, ticket: WriteTicket) -> Result<(), DriverError> {
-        match self.role.as_mut().expect("owned role") {
-            Role::Normal(normal) => normal.complete_write(ticket)?,
-            Role::ViewChanging(changing) => changing.complete_write(ticket)?,
-            Role::Installing(_) => return Err(ReplicationError::WrongRole.into()),
-        }
-        Ok(())
-    }
-
-    /// Observe buffered background I/O without asserting stable-storage evidence.
-    /// Only RAM-confirmed groups may release capacity at this boundary.
-    pub fn complete_buffered_write(
-        &mut self,
-        ticket: WriteTicket,
-        now: Duration,
-    ) -> Result<(), DriverError> {
-        if self.configuration.policy() != crate::QuorumPolicy::Replicated {
-            return Err(ReplicationError::PolicyMismatch.into());
-        }
-        self.observe_time(now)?;
-        let previous = self.normal().map(NormalReplica::snapshot);
-        self.complete_write(ticket)?;
-        if let Some(previous) = previous {
-            self.observe_normal_progress(&previous, now);
-        }
-        Ok(())
-    }
-
-    /// Install exact `O_DSYNC` completion independently of the group's confirmation policy.
-    pub fn complete_durable_write(
-        &mut self,
-        ticket: WriteTicket,
-        now: Duration,
-    ) -> Result<(), DriverError> {
-        self.observe_time(now)?;
-        match self.role.as_mut().expect("owned role") {
-            Role::Normal(normal) => {
-                let previous = normal.snapshot();
-                normal.complete_durable_write(ticket)?;
-                self.observe_normal_progress(&previous, now);
-            }
-            Role::ViewChanging(changing) => changing.normal.complete_durable_write(ticket)?,
-            Role::Installing(_) => return Err(ReplicationError::WrongRole.into()),
-        }
-        Ok(())
-    }
-
-    /// Complete deterministic ordered application through an established commit.
-    /// Application replay/identity-index I/O stays outside this driver.
-    pub fn apply_through(&mut self, through: Prefix) -> Result<(), DriverError> {
-        let Role::Normal(normal) = self.role.as_mut().expect("owned role") else {
-            return Err(ReplicationError::NotNormal.into());
-        };
-        let was_ready = normal.snapshot().ready_for_appends;
-        normal.apply_through(through)?;
-        if !was_ready && normal.snapshot().ready_for_appends {
-            self.progress_deadline = self.now + self.timing.primary_timeout;
-            self.election_delay = self.timing.election_timeout;
-        }
-        Ok(())
-    }
-
-    /// Fence on uncertain storage failure. A stale writer cannot fault a new one.
-    pub fn fail_io(&mut self, generation: JournalGeneration) -> Result<(), DriverError> {
-        match self.role.as_mut().expect("owned role") {
-            Role::Normal(normal) => normal.fail_io(generation)?,
-            Role::ViewChanging(changing) => changing.fail_io(generation)?,
-            Role::Installing(installing) => {
-                let ticket = installing.ticket();
-                if generation != ticket.generation() {
-                    return Err(ViewChangeError::StaleInstallation.into());
-                }
-                installing.fail(ticket)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Capture the written prefix for a real disk barrier, never a simulated ACK.
-    pub fn begin_sync(&self) -> Result<SyncTicket, DriverError> {
-        match self.role.as_ref().expect("owned role") {
-            Role::Normal(normal) => Ok(normal.begin_sync()?),
-            Role::ViewChanging(changing) => Ok(changing.begin_sync()?),
-            Role::Installing(_) => Err(ReplicationError::WrongRole.into()),
-        }
-    }
-
-    /// Observe a completed barrier. Commit and persistence deadlines advance
-    /// independently; a late old-view completion only settles the frozen log.
-    pub fn complete_sync(&mut self, ticket: SyncTicket, now: Duration) -> Result<(), DriverError> {
-        self.observe_time(now)?;
-        match self.role.as_mut().expect("owned role") {
-            Role::Normal(normal) => {
-                let previous = normal.snapshot();
-                normal.complete_sync(ticket)?;
-                self.observe_normal_progress(&previous, now);
-            }
-            Role::ViewChanging(changing) => changing.complete_sync(ticket)?,
-            Role::Installing(_) => return Err(ReplicationError::WrongRole.into()),
-        }
-        Ok(())
+        self.role
     }
 
     /// Select after collecting reports, using only nonblocking pinned-history lookup.
@@ -635,17 +252,46 @@ impl ReplicaDriver {
 
     /// Frozen election sources; their bytes still require exact-tail verification.
     pub fn history_sources(&self) -> [Option<LogSource>; 3] {
-        match self.role.as_ref().expect("owned role") {
+        match &self.role {
             Role::ViewChanging(changing) => changing.history_sources(),
-            Role::Normal(_) | Role::Installing(_) => [None; 3],
+            Role::Normal(_) | Role::Installing(_) | Role::Fenced(_) => [None; 3],
         }
     }
 
     fn changing(&mut self) -> Result<&mut ViewChange, DriverError> {
-        match self.role.as_mut().expect("owned role") {
+        match &mut self.role {
             Role::ViewChanging(changing) => Ok(changing),
             Role::Normal(_) | Role::Installing(_) => Err(ReplicationError::WrongRole.into()),
+            Role::Fenced(_) => Err(ViewChangeError::Faulted.into()),
         }
+    }
+
+    fn require_normal(&self) -> Result<&NormalReplica, DriverError> {
+        Ok(self.normal().ok_or(ReplicationError::NotNormal)?)
+    }
+
+    /// Reject events once storage, lineage, or a failed transition faulted this voter.
+    fn require_healthy(&self) -> Result<(), DriverError> {
+        match &self.role {
+            Role::Normal(normal) if normal.snapshot().status == Status::Faulted => {
+                Err(ViewChangeError::Faulted.into())
+            }
+            Role::ViewChanging(changing)
+                if changing.normal_snapshot().status == Status::Faulted =>
+            {
+                Err(ViewChangeError::Faulted.into())
+            }
+            Role::Installing(installing) => Ok(installing.require_pending()?),
+            Role::Fenced(_) => Err(ViewChangeError::Faulted.into()),
+            Role::Normal(_) | Role::ViewChanging(_) => Ok(()),
+        }
+    }
+
+    /// Take the role for a consuming transition. The driver stays fenced until
+    /// the caller installs the next role; a failed transition leaves it fenced.
+    fn take_role(&mut self) -> Role {
+        let fenced = Role::Fenced(self.scope());
+        std::mem::replace(&mut self.role, fenced)
     }
 
     fn observe_time(&mut self, now: Duration) -> Result<(), DriverError> {
@@ -668,30 +314,27 @@ impl ReplicaDriver {
         }
     }
 
-    fn observe_normal_progress(&mut self, previous: &ReplicaSnapshot, now: Duration) {
-        let current = self.normal().expect("normal completion").snapshot();
+    fn observe_normal_progress(
+        &mut self,
+        previous: &ReplicaSnapshot,
+        current: &ReplicaSnapshot,
+        now: Duration,
+    ) {
         if current.committed != previous.committed {
-            self.progress_deadline = now + self.progress_timeout();
+            self.progress_deadline = now.saturating_add(self.progress_timeout());
         }
-        if self.storage_progress(&current) > self.storage_progress(previous) {
-            self.persistence_deadline = now + self.timing.primary_timeout;
+        if current.journal.durable > previous.journal.durable {
+            self.persistence_deadline = now.saturating_add(self.timing.primary_timeout);
         }
     }
 
     fn normal_timed_out(&self, snapshot: &ReplicaSnapshot) -> bool {
-        let primary = self.configuration.primary(snapshot.scope.view) == self.local;
+        let primary = VoterIndex::primary(snapshot.scope.view) == self.local;
         let outstanding = snapshot.accepted != snapshot.committed || !snapshot.ready_for_appends;
         (!primary && self.now >= self.contact_deadline)
             || (outstanding && self.now >= self.progress_deadline)
-            || (snapshot.accepted.op > self.storage_progress(snapshot)
+            || (snapshot.accepted.op > snapshot.journal.durable
                 && self.now >= self.persistence_deadline)
-    }
-
-    fn storage_progress(&self, snapshot: &ReplicaSnapshot) -> OpNumber {
-        match self.configuration.policy() {
-            crate::QuorumPolicy::Durable => snapshot.journal.durable,
-            crate::QuorumPolicy::Replicated => snapshot.journal.written,
-        }
     }
 
     fn next_view(&mut self) -> Result<(), DriverError> {
@@ -704,31 +347,28 @@ impl ReplicaDriver {
     }
 
     fn change_view(&mut self, view: u64) -> Result<(), DriverError> {
-        if let Some(Role::ViewChanging(changing)) = self.role.as_mut() {
-            changing.advance_view(view)?;
-        } else if let Some(Role::Installing(installing)) = self.role.as_mut() {
-            installing.request_view(view)?;
-        } else {
-            if self.normal().expect("normal role").snapshot().status == Status::Faulted {
+        match &mut self.role {
+            Role::ViewChanging(changing) => changing.advance_view(view)?,
+            Role::Installing(installing) => installing.request_view(view)?,
+            Role::Normal(normal) if normal.snapshot().status == Status::Faulted => {
                 return Err(ViewChangeError::Faulted.into());
             }
-            let Role::Normal(normal) = self.role.take().expect("owned role") else {
-                unreachable!("normal branch");
-            };
-            self.role = Some(Role::ViewChanging(
-                normal
-                    .into_view_change(view)
-                    .expect("healthy role and higher view"),
-            ));
+            Role::Normal(_) => {
+                let Role::Normal(normal) = self.take_role() else {
+                    return Err(ViewChangeError::Faulted.into());
+                };
+                self.role = Role::ViewChanging(normal.into_view_change(view)?);
+            }
+            Role::Fenced(_) => return Err(ViewChangeError::Faulted.into()),
         }
-        self.exit_votes = 0;
+        self.exit_votes = VoterSet::EMPTY;
         self.exit_retry_at = None;
-        self.election_deadline = self.now + self.election_delay;
-        self.retry_at = self.now + self.timing.retransmit;
+        self.election_deadline = self.now.saturating_add(self.election_delay);
+        self.retry_at = self.now.saturating_add(self.timing.retransmit);
         self.start_pending = true;
         self.report_pending = true;
         self.commit_pending = false;
-        self.activation_pending = 0;
+        self.activation_pending = VoterSet::EMPTY;
         Ok(())
     }
 }

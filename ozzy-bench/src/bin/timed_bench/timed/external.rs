@@ -3,15 +3,25 @@
 
 mod iggy;
 mod kafka;
+#[cfg(test)]
+mod tests;
 
 use super::super::{Result, error, metrics, workload};
 use super::reader::oracle::{Oracle, Record as ObservedRecord};
-use super::{Config, Window, command, config, launch, measurement::Counts, producer, report};
+use super::{
+    Config, Window, await_connect, command, config, launch, measurement::Counts, producer, report,
+};
 use bytes::Bytes;
 use futures::future::try_join_all;
 use ozzy_proto::MessageId;
 use serde_json::{Value, json};
-use tokio::sync::watch;
+use std::time::Duration;
+use tokio::sync::{mpsc, watch};
+
+/// External topic provisioning or cleanup completes within this.
+const ADMIN: Duration = Duration::from_secs(30);
+/// Pause after an empty external read.
+const EMPTY_READ_PAUSE: Duration = Duration::from_millis(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum System {
@@ -35,7 +45,6 @@ pub(crate) enum Policy {
     Buffered,
     Durable,
     DiskQuorum,
-    ReplicatedPersisting,
 }
 
 impl Policy {
@@ -43,7 +52,6 @@ impl Policy {
         match self {
             Self::Buffered | Self::Durable => super::super::System::SingleDurable,
             Self::DiskQuorum => super::super::System::DiskQuorum,
-            Self::ReplicatedPersisting => super::super::System::ReplicatedPersisting,
         }
     }
 
@@ -52,7 +60,6 @@ impl Policy {
             Self::Buffered => "buffered",
             Self::Durable => "durable",
             Self::DiskQuorum => "disk-quorum",
-            Self::ReplicatedPersisting => "replicated-persisting",
         }
     }
 
@@ -61,7 +68,7 @@ impl Policy {
     }
 
     const fn brokers(self) -> usize {
-        if matches!(self, Self::DiskQuorum | Self::ReplicatedPersisting) {
+        if matches!(self, Self::DiskQuorum) {
             3
         } else {
             1
@@ -69,11 +76,29 @@ impl Policy {
     }
 }
 
-fn policy(config: &Config) -> Policy {
+/// The external system of a comparison run.
+fn system(config: &Config) -> Result<System> {
+    config
+        .args
+        .external_system
+        .ok_or_else(|| error("missing external system"))
+}
+
+/// The confirmation policy of a comparison run.
+fn policy(config: &Config) -> Result<Policy> {
     config
         .args
         .external_policy
-        .expect("validated external policy")
+        .ok_or_else(|| error("missing external confirmation policy"))
+}
+
+/// The external broker endpoint of a comparison run.
+fn endpoint(config: &Config) -> Result<&str> {
+    config
+        .args
+        .external_endpoint
+        .as_deref()
+        .ok_or_else(|| error("missing external endpoint"))
 }
 
 pub(super) fn diagnostics() -> Result<()> {
@@ -86,16 +111,8 @@ pub(super) fn diagnostics() -> Result<()> {
 }
 
 pub(super) fn validate(config: &Config) -> Result<()> {
-    let endpoint: std::net::SocketAddr = config
-        .args
-        .external_endpoint
-        .as_deref()
-        .ok_or_else(|| error("missing external endpoint"))?
-        .parse()?;
-    let requested = config
-        .args
-        .external_policy
-        .ok_or_else(|| error("missing external confirmation policy"))?;
+    let endpoint: std::net::SocketAddr = endpoint(config)?.parse()?;
+    let requested = policy(config)?;
     let policy_supported = match config.args.external_system {
         Some(System::Kafka) => requested == Policy::Buffered,
         Some(System::Iggy | System::Redpanda) => true,
@@ -132,8 +149,8 @@ pub(super) async fn coordinate(
     readers: &mut [launch::Process],
 ) -> Result<Value> {
     let name = format!("ozzy-bench-{}", uuid::Uuid::now_v7().simple());
-    let system = config.args.external_system.unwrap();
-    let topology = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+    let system = system(config)?;
+    let topology = tokio::time::timeout(ADMIN, async {
         match system {
             System::Kafka | System::Redpanda => kafka::provision(config, &name).await,
             System::Iggy => iggy::provision(config, &name).await,
@@ -174,7 +191,7 @@ pub(super) async fn coordinate(
         }
         row["teardown_storage_sync"] = json!({"path":path,"phase":"after measured traffic and complete reader verification, before logout"});
     }
-    describe(config, &name, &mut row);
+    describe(config, &name, &mut row)?;
     for key in [
         "logical_stream_count",
         "topic_count",
@@ -211,11 +228,9 @@ pub(super) fn topology(config: &Config) -> Value {
     })
 }
 
-fn describe(config: &Config, name: &str, row: &mut Value) {
-    let system = config.args.external_system.unwrap();
-    let policy = policy(config);
-    let durable = policy.durable();
-    let cluster = policy.brokers() == 3;
+fn describe(config: &Config, name: &str, row: &mut Value) -> Result<()> {
+    let system = system(config)?;
+    let policy = policy(config)?;
     row["system"] = json!(format!("{}-{}", system.name(), policy.name()));
     row["native_client_protocol"] = json!(false);
     row["writer_protocol"] = json!(if system == System::Iggy {
@@ -242,26 +257,43 @@ fn describe(config: &Config, name: &str, row: &mut Value) {
     row["placement"] = json!(
         "external broker deployment; independent writer/reader processes; server CPU and topology recorded separately"
     );
-    row["confirmation_boundary"] = json!(match system {
-        System::Kafka =>
-            "every delivery future succeeded; acks=all, replication factor 1; OS-buffered, not fsync",
-        System::Redpanda if cluster && durable =>
-            "every delivery future succeeded; acks=all, replication factor 3, write.caching=false; fsync on a Raft majority of 2 of 3",
-        System::Redpanda if cluster =>
-            "every delivery future succeeded; acks=all, replication factor 3, write.caching=true; in memory on a Raft majority of 2 of 3, background flush",
-        System::Redpanda if durable =>
-            "every delivery future succeeded; acks=all, replication factor 1, write.caching=false; local fsync",
-        System::Redpanda =>
-            "every delivery future succeeded; acks=all, replication factor 1, write.caching=true; not fsync",
-        System::Iggy if durable =>
-            "Iggy persisted topic: send reply after recoverable stable-storage copies at replication quorum; singleton quorum 1, cluster quorum 2 of 3",
-        System::Iggy =>
-            "Iggy replicated topic: send reply after VSR commit and application; writes storage without an additional stable-storage barrier; singleton quorum 1, cluster quorum 2 of 3",
-    });
+    row["confirmation_boundary"] = json!(confirmation_boundary(system, policy));
     row["streaming"] = json!(system != System::Iggy);
     if system == System::Redpanda {
-        row["write_caching"] = json!(!durable);
+        row["write_caching"] = json!(!policy.durable());
     }
+    describe_client(config, system, row);
+    Ok(())
+}
+
+/// What a confirmed send proves for each system and policy.
+fn confirmation_boundary(system: System, policy: Policy) -> &'static str {
+    let durable = policy.durable();
+    let cluster = policy.brokers() == 3;
+    match system {
+        System::Kafka => {
+            "every delivery future succeeded; acks=all, replication factor 1; OS-buffered, not fsync"
+        }
+        System::Redpanda if cluster => {
+            "every delivery future succeeded; acks=all, replication factor 3, write.caching=false; fsync on a Raft majority of 2 of 3"
+        }
+        System::Redpanda if durable => {
+            "every delivery future succeeded; acks=all, replication factor 1, write.caching=false; local fsync"
+        }
+        System::Redpanda => {
+            "every delivery future succeeded; acks=all, replication factor 1, write.caching=true; not fsync"
+        }
+        System::Iggy if durable => {
+            "Iggy persisted topic: send reply after recoverable stable-storage copies at replication quorum; singleton quorum 1, cluster quorum 2 of 3"
+        }
+        System::Iggy => {
+            "Iggy replicated topic: send reply after VSR commit and application; writes storage without an additional stable-storage barrier; singleton quorum 1"
+        }
+    }
+}
+
+/// The client SDK settings, request shape and retry guarantee.
+fn describe_client(config: &Config, system: System, row: &mut Value) {
     if system != System::Iggy {
         row["reader_records_max"] = json!(1);
         row["reader_payload_bytes_max"] = json!(config.args.record_bytes);
@@ -293,8 +325,9 @@ fn describe(config: &Config, name: &str, row: &mut Value) {
 }
 
 pub(super) async fn cleanup(config: &Config, name: &str) -> Result<()> {
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        match config.args.external_system.unwrap() {
+    let system = system(config)?;
+    tokio::time::timeout(ADMIN, async {
+        match system {
             System::Kafka | System::Redpanda => kafka::cleanup(config, name).await,
             System::Iggy => iggy::cleanup(config, name).await,
         }
@@ -303,90 +336,22 @@ pub(super) async fn cleanup(config: &Config, name: &str) -> Result<()> {
 }
 
 pub(super) async fn worker(config: Config) -> Result<()> {
-    let reader = config.args.reader_worker.is_some();
-    let index = config
-        .args
-        .reader_worker
-        .or(config.args.producer_worker)
-        .unwrap();
-    let workers = if reader {
-        config.args.reader_workers()
-    } else {
-        config.workers
-    };
-    let count = if reader {
-        config.partitions()
-    } else {
-        config.writers
-    };
-    let lanes = workload::worker_share(count, workers, index)?;
-    let mut input = launch::input();
-    let connect = command(&mut input, "connect").await?;
+    let share = Share::of(&config)?;
+    let mut input = launch::input()?;
+    let connect = await_connect(&mut input).await?;
     let name = connect["name"]
         .as_str()
         .ok_or_else(|| error("missing external topic"))?;
-    let mut clients = Vec::new();
-    for lane in lanes.clone() {
-        clients.push(match config.args.external_system.unwrap() {
-            System::Kafka | System::Redpanda => {
-                Client::Kafka(kafka::Client::connect(&config, name, lane, reader)?)
-            }
-            System::Iggy => Client::Iggy(Box::new(
-                iggy::Client::connect(&config, name, lane, reader).await?,
-            )),
-        });
-        if !reader {
-            producer::build_payload_pool(&config, lane)?;
-        }
-    }
-    launch::reply(&json!({"event":"connected","index":index,"pid":std::process::id()}))?;
+    let mut clients = connect_clients(&config, name, &share).await?;
+    launch::reply(&json!({"event":"connected","index":share.index,"pid":std::process::id()}))?;
     let start = command(&mut input, "start").await?;
     let window = super::window(&start, &config.args)?;
     window.wait().await;
-    let meter = metrics::Meter::start();
-    let (finish, finished) = watch::channel(None);
-    let work = try_join_all(clients.iter_mut().zip(lanes).map(|(client, lane)| {
-        let finished = finished.clone();
-        let config = &config;
-        async move {
-            if reader {
-                return read(client, config, lane, window, finished).await;
-            }
-            let row = tokio::time::timeout_at(window.deadline(&config.args), async {
-                match client {
-                    Client::Kafka(client) => client.write(config, lane, window).await,
-                    Client::Iggy(client) => (*client).write(config, lane, window).await,
-                }
-            })
-            .await
-            .map_err(|cause| {
-                error(format!(
-                    "external {} lane={lane}: {cause}",
-                    if reader { "reader" } else { "writer" }
-                ))
-            })??;
-            Ok(vec![row])
-        }
-    }));
-    let completion = async {
-        if !reader {
-            return Ok(());
-        }
-        let request = command(&mut input, "finish").await?;
-        let totals: Vec<u64> = serde_json::from_value(request["counts"].clone())?;
-        if totals.len() != config.writers {
-            return Err(error("invalid final writer counts"));
-        }
-        finish
-            .send(Some(totals))
-            .map_err(|_| error("external readers exited early"))?;
-        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
-    };
-    let (rows, ()) = tokio::try_join!(work, completion)?;
-    let rows = rows.into_iter().flatten().collect::<Vec<_>>();
+    let meter = metrics::Meter::start(!config.args.inproc);
+    let rows = run_lanes(&config, &share, &mut clients, window, &mut input).await?;
     report(
         &config,
-        &json!({"lanes":rows,"usage":meter.finish(),"index":index,"pid":std::process::id()}),
+        &json!({"lanes":rows,"usage":meter.finish(),"index":share.index,"pid":std::process::id()}),
     )?;
     if input.recv().await.is_some() {
         return Err(error("unexpected external worker command"));
@@ -399,6 +364,106 @@ pub(super) async fn worker(config: Config) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// One external worker: its role, index, and the writer lanes or reader
+/// partitions it serves.
+struct Share {
+    reader: bool,
+    index: usize,
+    lanes: std::ops::Range<usize>,
+}
+
+impl Share {
+    fn of(config: &Config) -> Result<Self> {
+        let reader = config.args.reader_worker.is_some();
+        let index = config
+            .args
+            .reader_worker
+            .or(config.args.producer_worker)
+            .ok_or_else(|| error("external worker needs a reader or producer index"))?;
+        let (count, workers) = if reader {
+            (config.partitions(), config.args.reader_workers())
+        } else {
+            (config.writers, config.workers)
+        };
+        Ok(Self {
+            reader,
+            index,
+            lanes: workload::worker_share(count, workers, index)?,
+        })
+    }
+}
+
+/// One client per lane; writer lanes also build their body pools.
+async fn connect_clients(config: &Config, name: &str, share: &Share) -> Result<Vec<Client>> {
+    let system = system(config)?;
+    let mut clients = Vec::new();
+    for lane in share.lanes.clone() {
+        clients.push(match system {
+            System::Kafka | System::Redpanda => {
+                Client::Kafka(kafka::Client::connect(config, name, lane, share.reader)?)
+            }
+            System::Iggy => Client::Iggy(Box::new(
+                iggy::Client::connect(config, name, lane, share.reader).await?,
+            )),
+        });
+        if !share.reader {
+            producer::build_payload_pool(config, lane)?;
+        }
+    }
+    Ok(clients)
+}
+
+/// Run every lane from the shared start. Writers stop at the deadline;
+/// readers once they cover the final writer counts the coordinator sends.
+async fn run_lanes(
+    config: &Config,
+    share: &Share,
+    clients: &mut [Client],
+    window: Window,
+    input: &mut mpsc::Receiver<Result<Value>>,
+) -> Result<Vec<Value>> {
+    let reader = share.reader;
+    let (finish, finished) = watch::channel(None);
+    let work = try_join_all(
+        clients
+            .iter_mut()
+            .zip(share.lanes.clone())
+            .map(|(client, lane)| {
+                let finished = finished.clone();
+                async move {
+                    if reader {
+                        return read(client, config, lane, window, finished).await;
+                    }
+                    let row = tokio::time::timeout_at(window.deadline(&config.args), async {
+                        match client {
+                            Client::Kafka(client) => client.write(config, lane, window).await,
+                            Client::Iggy(client) => (*client).write(config, lane, window).await,
+                        }
+                    })
+                    .await
+                    .map_err(|cause| error(format!("external writer lane={lane}: {cause}")))??;
+                    Ok(vec![row])
+                }
+            }),
+    );
+    let completion = async {
+        if !reader {
+            return Ok(());
+        }
+        let request = command(input, "finish").await?;
+        let totals: Vec<u64> = serde_json::from_value(request["counts"].clone())?;
+        if totals.len() != config.writers {
+            return Err(error("invalid final writer counts"));
+        }
+        finish
+            .send(Some(totals))
+            .map_err(|_| error("external readers exited early"))?;
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    };
+    let (rows, ()) = tokio::try_join!(work, completion)?;
+    Ok(rows.into_iter().flatten().collect())
 }
 
 enum Client {
@@ -442,7 +507,7 @@ async fn read(
                 Client::Iggy(client) => client.read(offset).await?,
             };
             if records.is_empty() {
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                tokio::time::sleep(EMPTY_READ_PAUSE).await;
             }
             // One clock per poll reply, as in the native reader lane.
             let complete = metrics::monotonic_ns();
@@ -474,247 +539,4 @@ async fn read(
         ))
     })??;
     Ok(oracle.rows())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use clap::Parser;
-    use ozzy_proto::GroupId;
-
-    #[test]
-    fn external_topology_has_adapter_bounds_without_native_claims() {
-        let config = Config::new(super::super::super::Args::parse_from([
-            "bench",
-            "--processes",
-            "--network-ingress",
-            "--streaming",
-            "--duration",
-            "5",
-            "--window",
-            "1",
-            "--external-policy",
-            "disk-quorum",
-            "--external-system",
-            "redpanda",
-            "--external-endpoint",
-            "127.0.0.1:18090",
-        ]))
-        .unwrap();
-        validate(&config).unwrap();
-        let window = Window {
-            start: 1,
-            measured: 10,
-            end: 20,
-        };
-        let report = |finished| {
-            let mut counts = Counts::new(window);
-            counts.submission(12, 1);
-            counts.complete(12, finished, 1).unwrap();
-            json!({"lanes": [counts.report(0)]})
-        };
-        let mut row = super::super::results::summarize(
-            &config,
-            window,
-            vec![report(15)],
-            vec![report(16)],
-            &[],
-        )
-        .unwrap();
-        describe(&config, "records", &mut row);
-        assert_eq!(row["request_records"], config.args.request_records);
-        assert_eq!(row["reader_records_max"], 1);
-        assert_eq!(row["reader_payload_bytes_max"], config.args.record_bytes);
-        assert_eq!(row["system"], "redpanda-disk-quorum");
-        assert_eq!(row["native_client_protocol"], false);
-        for field in [
-            "commit_policy",
-            "ack_copies",
-            "replica_voters",
-            "journal_writes",
-            "segment_write_mode",
-            "broker_io_threads",
-            "disk_io_backend",
-            "native_reader_api",
-        ] {
-            assert!(row.get(field).is_none(), "unexpected native field {field}");
-        }
-    }
-
-    #[test]
-    fn external_policy_sets_labels_copies_and_disk_boundary() {
-        for (mode, name, brokers, durable) in [
-            ("buffered", "buffered", 1, false),
-            ("durable", "durable", 1, true),
-            ("disk-quorum", "disk-quorum", 3, true),
-            ("replicated-persisting", "replicated-persisting", 3, false),
-        ] {
-            let config = Config::new(super::super::super::Args::parse_from([
-                "bench",
-                "--processes",
-                "--network-ingress",
-                "--streaming",
-                "--duration",
-                "5",
-                "--external-policy",
-                mode,
-                "--external-system",
-                "redpanda",
-                "--external-endpoint",
-                "127.0.0.1:18090",
-            ]))
-            .unwrap();
-            validate(&config).unwrap();
-            let mut row = json!({});
-            describe(&config, "records", &mut row);
-            assert_eq!(row["system"], format!("redpanda-{name}"));
-            assert_eq!(row["write_caching"], !durable);
-            assert_eq!(kafka::replicas(&config), brokers);
-            assert_eq!(
-                kafka::write_caching(&config),
-                Some(if durable { "false" } else { "true" })
-            );
-        }
-    }
-
-    #[test]
-    fn external_policies_do_not_silently_weaken_durability() {
-        for (system, policy, valid) in [
-            ("kafka", "buffered", true),
-            ("kafka", "durable", false),
-            ("iggy", "buffered", true),
-            ("iggy", "durable", true),
-            ("iggy", "volatile", false),
-            ("iggy", "disk-quorum", true),
-            ("iggy", "replicated-persisting", true),
-        ] {
-            let accepted = super::super::super::Args::try_parse_from([
-                "bench",
-                "--processes",
-                "--network-ingress",
-                "--streaming",
-                "--duration",
-                "5",
-                "--external-policy",
-                policy,
-                "--external-system",
-                system,
-                "--external-endpoint",
-                "127.0.0.1:18090",
-            ])
-            .ok()
-            .and_then(|args| Config::new(args).ok())
-            .is_some_and(|config| validate(&config).is_ok());
-            assert_eq!(accepted, valid, "{system} {policy}");
-        }
-    }
-
-    #[test]
-    fn external_comparisons_reject_native_queue_overrides() {
-        let config = Config::new(super::super::super::Args::parse_from([
-            "bench",
-            "--processes",
-            "--network-ingress",
-            "--streaming",
-            "--duration",
-            "5",
-            "--external-policy",
-            "buffered",
-            "--external-system",
-            "iggy",
-            "--external-endpoint",
-            "127.0.0.1:18090",
-            "--writer-inflight-appends",
-            "2",
-        ]))
-        .unwrap();
-        assert!(validate(&config).is_err());
-    }
-
-    #[test]
-    fn shared_external_verifier_rejects_offsets_identities_and_payload_corruption() {
-        let config = Config::new(super::super::super::Args::parse_from([
-            "bench",
-            "--processes",
-            "--network-ingress",
-            "--streaming",
-            "--duration",
-            "5",
-            "--external-policy",
-            "buffered",
-            "--external-system",
-            "kafka",
-            "--external-endpoint",
-            "127.0.0.1:19092",
-        ]))
-        .unwrap();
-        validate(&config).unwrap();
-        let group = GroupId::new();
-        let bytes = producer::payload(&config, 0, 0, 100).unwrap();
-        let id = config::message_id(group, 0, 0);
-        let verify = |record: &Record| -> Result<()> {
-            let window = Window {
-                start: 0,
-                measured: 0,
-                end: 5_000_000_000,
-            };
-            let mut oracle = Oracle::new(&config, config.partitions(), &[0], 0, window)?;
-            oracle.observe(
-                &config,
-                group,
-                ObservedRecord {
-                    partition: 0,
-                    offset: record.offset,
-                    id: record.id,
-                    payload: &record.payload,
-                },
-                200,
-            )?;
-            let mut writer = Counts::new(window);
-            writer.record_bytes(id, &bytes);
-            writer.complete(100, 200, 1)?;
-            super::super::results::verify_digests(
-                &[json!({"lanes":[writer.report(0)]})],
-                &[json!({"lanes":oracle.rows()})],
-                1,
-            )
-        };
-        assert!(
-            verify(&Record {
-                offset: 0,
-                id,
-                payload: bytes.clone()
-            },)
-            .is_ok()
-        );
-        assert!(
-            verify(&Record {
-                offset: 1,
-                id,
-                payload: bytes.clone()
-            },)
-            .is_err()
-        );
-        assert!(
-            verify(&Record {
-                offset: 0,
-                id: config::message_id(group, 1, 0),
-                payload: bytes.clone()
-            },)
-            .is_err()
-        );
-        // Every original byte is joined through the final writer/reader digest.
-        for index in 0..bytes.len() {
-            let mut corrupt = bytes.to_vec();
-            corrupt[index] ^= 1;
-            assert!(
-                verify(&Record {
-                    offset: 0,
-                    id,
-                    payload: corrupt.into()
-                },)
-                .is_err()
-            );
-        }
-    }
 }

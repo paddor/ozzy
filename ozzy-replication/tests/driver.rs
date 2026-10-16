@@ -1,3 +1,13 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
+
 use std::collections::VecDeque;
 use std::time::Duration;
 
@@ -24,6 +34,9 @@ mod validation;
 
 #[path = "support/driver_liveness.rs"]
 mod liveness;
+
+#[path = "support/driver_deadline.rs"]
+mod deadline;
 
 fn wire_control(from: u8, control: Control) -> Control {
     let session = LinkSessionId::from_bytes([11; 16]);

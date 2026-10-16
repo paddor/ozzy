@@ -1,0 +1,66 @@
+[package]
+autotests = false
+name = "ozzy-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Admin console for Ozzy brokers."
+readme = "README.md"
+publish = ["crates-io"]
+keywords = ["event-streaming", "admin", "tui", "omq"]
+categories = ["command-line-utilities"]
+include.workspace = true
+
+[features]
+default = ["terminal"]
+# The `ozzy-tui` terminal binary: crossterm and an OMQ client.
+terminal = [
+    "ratatui/crossterm",
+    "dep:bytes",
+    "dep:clap",
+    "dep:crossterm",
+    "dep:futures",
+    "dep:omq-tokio",
+    "dep:ozzy-config",
+    "dep:tokio",
+]
+
+[dependencies]
+ozzy-proto.workspace = true
+ratatui = { version = "0.30.2", default-features = false, features = ["std"] }
+bytes = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+crossterm = { version = "0.29.0", features = ["event-stream"], optional = true }
+futures = { workspace = true, optional = true }
+omq-tokio = { workspace = true, optional = true }
+ozzy-config = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["time"], optional = true }
+
+# `ozzy-proto` creates UUIDs; a browser build takes randomness from JavaScript.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+uuid = { workspace = true, features = ["js"] }
+
+[dev-dependencies]
+ozzy-config.workspace = true
+ozzy-runtime.workspace = true
+ozzy-sim = { workspace = true, features = ["broker"] }
+ozzy-telemetry.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "ozzy-tui"
+path = "src/main.rs"
+required-features = ["terminal"]
+doc = false
+
+[[test]]
+name = "ozzy_ui_console"
+path = "tests/console.rs"
+required-features = ["terminal"]

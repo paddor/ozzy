@@ -1,8 +1,8 @@
 //! Exact subscription selectors and cumulative, generation-fenced capacity.
 
 use super::{
-    Authority, CodecError, Cursor, ENVELOPE_BYTES, Envelope, EnvelopeLimits, Opcode, Packet,
-    PartitionId, Source, Subscribed, Subscription, Topic, control, end, prepare, read_text, text,
+    Authority, CodecError, ENVELOPE_BYTES, Envelope, EnvelopeLimits, Opcode, Packet, PartitionId,
+    Reader, Source, Subscribed, Subscription, Topic, control, end, prepare, read_text, text,
 };
 
 /// Exact log selection. Local logs do not invent replication authority.
@@ -50,6 +50,10 @@ impl Target {
         Ok(())
     }
 
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "Topic::new caps the stream and name at MAX_NAME_LEN"
+    )]
     pub(super) fn size(&self) -> usize {
         match self {
             Self::Local { topic, .. } => 13 + topic.stream().len() + topic.name().len(),
@@ -58,20 +62,19 @@ impl Target {
     }
 
     pub(super) fn encode(&self, output: &mut Vec<u8>) {
-        match self {
-            Self::Local { topic, partition } => {
-                output.push(0);
-                text(output, topic.stream());
-                text(output, topic.name());
-                output.extend_from_slice(&partition.get().to_be_bytes());
-            }
-            Self::Group { .. } => self.group_source().expect("group target").encode(output),
+        if let Some(source) = self.group_source() {
+            source.encode(output);
+        } else if let Self::Local { topic, partition } = self {
+            output.push(0);
+            text(output, topic.stream());
+            text(output, topic.name());
+            output.extend_from_slice(&partition.get().to_be_bytes());
         }
     }
 
-    pub(super) fn decode(cursor: &mut Cursor<'_>) -> Result<Self, CodecError> {
-        if cursor.0.first() == Some(&0) {
-            cursor.byte()?;
+    pub(super) fn decode(cursor: &mut Reader<'_>) -> Result<Self, CodecError> {
+        if cursor.rest().first() == Some(&0) {
+            cursor.u8()?;
             let stream = read_text(cursor)?;
             let name = read_text(cursor)?;
             let topic = Topic::new(stream, name).map_err(|_| CodecError::Profile)?;
@@ -114,8 +117,7 @@ fn encode_close(
     let header = prepare(
         envelope,
         opcode,
-        response,
-        40 + subscription.source.size(),
+        crate::data::add(40, subscription.source.size())?,
         output,
         limits,
     )?;
@@ -135,7 +137,7 @@ fn decode_close(
     } else {
         Opcode::Unsubscribe
     };
-    let mut cursor = control(packet, opcode, response, limits)?;
+    let mut cursor = control(packet, opcode, limits)?;
     let subscription = Subscribed {
         subscription: Subscription::decode(&mut cursor)?,
         source: Source::decode(&mut cursor)?,

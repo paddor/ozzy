@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 async fn reordered_duplicate_and_foreign_completions_cannot_settle_another_request() {
     let context = omq_tokio::Context::new();
     let (mut service, _lanes, _) = setup();
-    let client = remote(1, handshake::PRODUCER);
-    let (binding, _) = begin(&mut service, &client, NodeId::from_bytes([1; 16]));
+    let mut client = remote(1, handshake::PRODUCER);
+    let (binding, _) = begin(&mut service, &mut client, NodeId::from_bytes([1; 16]));
     let mut budgets = capacity();
     budgets.data = Budget {
         queue_slots: 2,
@@ -16,10 +16,10 @@ async fn reordered_duplicate_and_foreign_completions_cannot_settle_another_reque
     };
     let mut port = service.port(&context, 0, budgets).unwrap();
     let mut first = port
-        .try_reply(Class::Data, reply(binding, Opcode::Records), 2048)
+        .try_reply(Class::Data, reply(binding, Opcode::Records), 2048, 0)
         .unwrap();
     let mut second = port
-        .try_reply(Class::Data, reply(binding, Opcode::Records), 2048)
+        .try_reply(Class::Data, reply(binding, Opcode::Records), 2048, 0)
         .unwrap();
     for _ in 0..2 {
         assert!(service.poll_command().unwrap());
@@ -54,11 +54,11 @@ async fn reordered_duplicate_and_foreign_completions_cannot_settle_another_reque
 async fn canceled_observation_keeps_accepted_work_and_releases_only_after_final_alias() {
     let context = omq_tokio::Context::new();
     let (mut service, _lanes, _) = setup();
-    let client = remote(1, handshake::PRODUCER);
-    let (binding, _) = begin(&mut service, &client, NodeId::from_bytes([1; 16]));
+    let mut client = remote(1, handshake::PRODUCER);
+    let (binding, _) = begin(&mut service, &mut client, NodeId::from_bytes([1; 16]));
     let mut port = service.port(&context, 0, capacity()).unwrap();
     drop(
-        port.try_reply(Class::Data, reply(binding, Opcode::Records), 2048)
+        port.try_reply(Class::Data, reply(binding, Opcode::Records), 2048, 0)
             .unwrap(),
     );
     assert!(service.poll_command().unwrap());
@@ -73,12 +73,12 @@ async fn canceled_observation_keeps_accepted_work_and_releases_only_after_final_
     port.poll_progress(&mut cx).unwrap();
     assert!(port.requests.is_empty());
     assert!(
-        port.try_reply(Class::Data, reply(binding, Opcode::Records), 2048)
+        port.try_reply(Class::Data, reply(binding, Opcode::Records), 2048, 0)
             .is_err()
     );
     drop(alias);
     assert!(
-        port.try_reply(Class::Data, reply(binding, Opcode::Records), 2048)
+        port.try_reply(Class::Data, reply(binding, Opcode::Records), 2048, 0)
             .is_ok()
     );
 }
@@ -101,16 +101,16 @@ async fn full_data_keeps_control_and_another_shard_runnable() {
         leader: None,
     };
     publication_watch(&mut service, route.clone());
-    let client = remote(1, handshake::PRODUCER);
-    let (binding, _) = begin(&mut service, &client, NodeId::from_bytes([1; 16]));
+    let mut client = remote(1, handshake::PRODUCER);
+    let (binding, _) = begin(&mut service, &mut client, NodeId::from_bytes([1; 16]));
     service.flush(|_| Ok(())).unwrap();
     let mut busy = service.port(&context, 0, capacity()).unwrap();
     let mut healthy = service.port(&context, 17, capacity()).unwrap();
     let data = busy
-        .try_reply(Class::Data, reply(binding, Opcode::Records), 2048)
+        .try_reply(Class::Data, reply(binding, Opcode::Records), 2048, 0)
         .unwrap();
     assert!(
-        busy.try_reply(Class::Data, reply(binding, Opcode::Records), 2048)
+        busy.try_reply(Class::Data, reply(binding, Opcode::Records), 2048, 0)
             .is_err()
     );
     let control = busy.try_route(route.clone()).unwrap();
@@ -131,8 +131,8 @@ fn cross_thread_saturation_keeps_bounded_requests_and_delivers_every_command() {
     const MESSAGES: usize = 2000;
     let context = omq_tokio::Context::new();
     let (mut service, _lanes, _) = setup();
-    let client = remote(1, handshake::PRODUCER);
-    let (binding, _) = begin(&mut service, &client, NodeId::from_bytes([1; 16]));
+    let mut client = remote(1, handshake::PRODUCER);
+    let (binding, _) = begin(&mut service, &mut client, NodeId::from_bytes([1; 16]));
     service.flush(|_| Ok(())).unwrap();
     let mut budgets = capacity();
     budgets.data = Budget {
@@ -221,7 +221,7 @@ fn saturate(mut port: Port, binding: crate::frontend::Binding, maximum: usize) {
             let Some((id, message)) = input else {
                 break;
             };
-            match port.try_reply(Class::Data, message, 2048) {
+            match port.try_reply(Class::Data, message, 2048, 0) {
                 Ok(result) => pending.push_back((id, result)),
                 Err((
                     PortError::Admission(SendFailure::Admission(dispatch::Error::Full)),

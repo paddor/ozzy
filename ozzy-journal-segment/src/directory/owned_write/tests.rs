@@ -2,7 +2,8 @@ use super::*;
 use crate::{BodyEncoding, DecodeLimits, OperationKind, OperationLimits};
 use bytes::Bytes;
 use ozzy_journal::operation::{
-    Append, AppendBatch, AppendRecord, OperationBody, encode_operation_body,
+    Append, AppendBatch, AppendRecord, Digest, OperationBody, canonical_body_digest,
+    encode_operation_body,
 };
 use ozzy_proto::{
     GroupId, MessageId, Offset, OwnerEpoch, PartitionIncarnation, ProducerEpoch, ProducerId,

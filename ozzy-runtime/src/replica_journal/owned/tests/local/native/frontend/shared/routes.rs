@@ -24,7 +24,7 @@ async fn lost_routing_snapshot_retries_on_injected_clock_without_blocking_shared
 async fn retry_scenario() {
     let (mut harness, links, clock, _) = setup_shared().await;
     let topic = harness.drive(links.topic("orders"), false).await.unwrap();
-    let routes = links.routes(topic).unwrap();
+    let routes = links.routes(topic).await.unwrap();
     harness.drop_snapshots = true;
     routes.interest(0).unwrap();
     for _ in 0..10000 {
@@ -69,6 +69,64 @@ async fn retry_scenario() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn refused_routing_snapshots_reject_the_route_until_a_refresh_is_answered() {
+    tokio::time::timeout(Duration::from_secs(10), refusal_scenario())
+        .await
+        .unwrap();
+}
+
+async fn refusal_scenario() {
+    let (mut harness, links, clock, authority) = setup_shared().await;
+    let topic = harness.drive(links.topic("orders"), false).await.unwrap();
+    let routes = links.routes(topic).await.unwrap();
+    harness.refuse_snapshots = true;
+    routes.interest(0).unwrap();
+    let refused = harness
+        .drive(
+            async {
+                loop {
+                    let generation = routes.generation();
+                    if let Err(error) = routes.route(0) {
+                        return error;
+                    }
+                    routes.changed_after(generation).await.unwrap();
+                }
+            },
+            false,
+        )
+        .await;
+    assert!(matches!(
+        refused,
+        BrokerLinkError::Rejected {
+            code: 18,
+            retry: ozzy_proto::nack::RetryClass::Permanent,
+            hint: None,
+        }
+    ));
+    // A refresh asks again once the refusal's retry interval passed.
+    harness.refuse_snapshots = false;
+    routes.refresh(0).unwrap();
+    clock.advance(Duration::from_millis(100)).unwrap();
+    let answered = harness
+        .drive(
+            async {
+                loop {
+                    let generation = routes.generation();
+                    if let Ok(Some(route)) = routes.route(0) {
+                        return route;
+                    }
+                    routes.changed_after(generation).await.unwrap();
+                }
+            },
+            false,
+        )
+        .await;
+    assert_eq!(answered.leader, Some(authority.primary));
+    links.shutdown().await.unwrap();
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn shared_topic_routes_coalesce_hints_refresh_and_ignore_obsolete_link_notifications() {
     tokio::time::timeout(Duration::from_secs(10), scenario())
         .await
@@ -78,9 +136,9 @@ async fn shared_topic_routes_coalesce_hints_refresh_and_ignore_obsolete_link_not
 async fn scenario() {
     let (mut harness, links, _, authority) = setup_shared().await;
     let topic = harness.drive(links.topic("orders"), false).await.unwrap();
-    let routes = links.routes(topic).unwrap();
+    let routes = links.routes(topic).await.unwrap();
     assert_eq!(routes.route(0).unwrap(), None);
-    let reused = links.routes(routes.metadata().clone()).unwrap();
+    let reused = links.routes(routes.metadata().clone()).await.unwrap();
     assert!(std::ptr::eq(routes.metadata(), reused.metadata()));
     assert!(routes.interest(1).is_err());
     routes.interest(0).unwrap();

@@ -1,4 +1,13 @@
 //! Lost voters collect fresh evidence without contributing their forgotten vote.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
 
 use ozzy_journal::operation::{
     Barrier, CanonicalOperation, OperationBody, OperationLimits, canonical_body_digest,

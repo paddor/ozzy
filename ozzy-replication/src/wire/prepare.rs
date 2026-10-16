@@ -6,12 +6,19 @@ use ozzy_journal::operation::{
     CanonicalOperation, OperationKind, canonical_body_digest,
     logical_operation_digest_with_body_digest,
 };
+use ozzy_proto::NodeId;
 use ozzy_proto::{Envelope, Opcode};
-use ozzy_proto::{LinkSessionId, NodeId};
 
-use super::{COMMON_BYTES, Reader, WireError, WireLimits, Writer, validate_prefix, validate_scope};
+use super::{
+    COMMON_BYTES, EncodeContext, Reader, WireError, WireLimits, Writer, validate_prefix,
+    validate_scope,
+};
+use super::{ReadFields, WriteFields};
 use crate::flow::ReceiveEpoch;
 use crate::{Digest, OpNumber, Prefix, Scope};
+
+mod plan;
+use plan::Planned;
 
 pub(super) const DESCRIPTOR_BYTES: usize = 86;
 pub(super) const BATCH_BYTES: usize = COMMON_BYTES + 8 + 32 + 40 + 4;
@@ -129,7 +136,7 @@ pub fn encode_prepare_unbound(
     metadata: &mut [u8],
     limits: WireLimits,
 ) -> Result<PrepareMetadata, WireError> {
-    encode((sender, None), None, prepare, metadata, None, limits).map(|(_, sizes)| sizes)
+    Planned::new(sender, None, prepare, limits)?.write(metadata, None)
 }
 
 /// Encode into reusable caller-owned buffers, preserving them on rejection.
@@ -137,41 +144,25 @@ pub fn encode_prepare_unbound(
 /// Reuses the supplied body/envelope digests; it does not recompress or rehash
 /// payloads. The caller must retain the exact output until transport releases it.
 pub fn encode_prepare(
-    sender: NodeId,
-    session: LinkSessionId,
+    context: EncodeContext,
     prepare: Prepare<'_>,
     metadata: &mut [u8],
     payload: &mut [u8],
-    limits: WireLimits,
 ) -> Result<PrepareEncoding, WireError> {
-    encode(
-        (sender, Some(session)),
-        None,
-        prepare,
+    Planned::new(context.sender, None, prepare, context.limits)?.bind(
+        context,
         metadata,
         Some(payload),
-        limits,
     )
-    .map(bound_encoding)
 }
 
 /// Encode only PREPARE framing. Pair with the identical canonical body backing.
 pub fn encode_prepare_metadata(
-    sender: NodeId,
-    session: LinkSessionId,
+    context: EncodeContext,
     prepare: Prepare<'_>,
     metadata: &mut [u8],
-    limits: WireLimits,
 ) -> Result<PrepareEncoding, WireError> {
-    encode(
-        (sender, Some(session)),
-        None,
-        prepare,
-        metadata,
-        None,
-        limits,
-    )
-    .map(bound_encoding)
+    Planned::new(context.sender, None, prepare, context.limits)?.bind(context, metadata, None)
 }
 
 /// Encode epoch-bound normal data with a mandatory receiver-issued epoch.
@@ -180,23 +171,17 @@ pub fn encode_prepare_metadata(
 /// Adds exactly 16 metadata bytes per batch. Canonical identities/body digests
 /// are unchanged, and no additional body hashing or allocation is performed.
 pub fn encode_flow_prepare(
-    sender: NodeId,
-    session: LinkSessionId,
+    context: EncodeContext,
     epoch: ReceiveEpoch,
     prepare: Prepare<'_>,
     metadata: &mut [u8],
     payload: &mut [u8],
-    limits: WireLimits,
 ) -> Result<PrepareEncoding, WireError> {
-    encode(
-        (sender, Some(session)),
-        Some(epoch),
-        prepare,
+    Planned::new(context.sender, Some(epoch), prepare, context.limits)?.bind(
+        context,
         metadata,
         Some(payload),
-        limits,
     )
-    .map(bound_encoding)
 }
 
 /// Encode only the header and metadata of a credited `PREPARE_FLOW`.
@@ -207,104 +192,13 @@ pub fn encode_flow_prepare(
 /// instead of copying the bodies again. `payload_bytes` reports the length the
 /// paired payload must have.
 pub fn encode_flow_prepare_metadata(
-    sender: NodeId,
-    session: LinkSessionId,
+    context: EncodeContext,
     epoch: ReceiveEpoch,
     prepare: Prepare<'_>,
     metadata: &mut [u8],
-    limits: WireLimits,
 ) -> Result<PrepareEncoding, WireError> {
-    encode(
-        (sender, Some(session)),
-        Some(epoch),
-        prepare,
-        metadata,
-        None,
-        limits,
-    )
-    .map(bound_encoding)
-}
-
-fn bound_encoding((header, sizes): (Option<[u8; 64]>, PrepareMetadata)) -> PrepareEncoding {
-    PrepareEncoding {
-        header: header.expect("wire encoder supplied a session"),
-        metadata_bytes: sizes.metadata_bytes,
-        payload_bytes: sizes.payload_bytes,
-    }
-}
-
-fn encode(
-    (sender, session): (NodeId, Option<LinkSessionId>),
-    epoch: Option<ReceiveEpoch>,
-    prepare: Prepare<'_>,
-    metadata: &mut [u8],
-    payload: Option<&mut [u8]>,
-    limits: WireLimits,
-) -> Result<(Option<[u8; 64]>, PrepareMetadata), WireError> {
-    if sender.as_bytes() == &[0; 16] {
-        return Err(ozzy_proto::EnvelopeError::ZeroIdentity.into());
-    }
-    validate_scope(prepare.scope)?;
-    validate_prefix(prepare.committed)?;
-    let count = prepare.operations.len();
-    let metadata_bytes = metadata_length(
-        count,
-        BATCH_BYTES + usize::from(epoch.is_some()) * 16,
-        limits,
-    )?;
-    let first = prepare.operations[0].canonical;
-    let predecessor = Prefix {
-        op: OpNumber(first.op_number.checked_sub(1).ok_or(WireError::Chain)?),
-        digest: first.previous_digest,
-    };
-    let payload_bytes = validate_batch(
-        prepare.scope,
-        predecessor,
-        Some(prepare.committed),
-        prepare.operations,
-        limits,
-    )?;
-    u32::try_from(metadata_bytes).map_err(|_| WireError::Limit)?;
-    u32::try_from(payload_bytes).map_err(|_| WireError::Limit)?;
-    let header = session
-        .map(|session| {
-            Envelope {
-                opcode: if epoch.is_some() {
-                    Opcode::PrepareFlow
-                } else {
-                    Opcode::Prepare
-                },
-                response: false,
-                request_id: None,
-                sender,
-                session: Some(session),
-            }
-            .encode_header(metadata_bytes, payload_bytes, limits.envelope)
-        })
-        .transpose()?;
-    if metadata.len() < metadata_bytes
-        || payload
-            .as_ref()
-            .is_some_and(|payload| payload.len() < payload_bytes)
-    {
-        return Err(WireError::Capacity);
-    }
-    let mut writer = Writer::new(&mut metadata[..metadata_bytes]);
-    writer.scope(prepare.scope, sender);
-    if let Some(epoch) = epoch {
-        writer.bytes(&epoch.get().to_be_bytes());
-    }
-    writer.u64(first.op_number);
-    writer.bytes(predecessor.digest.as_bytes());
-    writer.prefix(prepare.committed);
-    write_batch(&mut writer, payload, prepare.operations);
-    Ok((
-        header,
-        PrepareMetadata {
-            metadata_bytes,
-            payload_bytes,
-        },
-    ))
+    Planned::new(context.sender, Some(epoch), prepare, context.limits)?
+        .bind(context, metadata, None)
 }
 
 /// Hash-validated prepare borrowing the packet's backing buffers.
@@ -378,6 +272,10 @@ pub struct Operations<'a> {
 
 impl<'a> Iterator for Operations<'a> {
     type Item = Operation<'a>;
+    #[expect(
+        clippy::expect_used,
+        reason = "decode_batch checked every descriptor and body length"
+    )]
     fn next(&mut self) -> Option<Self::Item> {
         let descriptor = self.descriptors.next()?;
         let mut reader = Reader::new(descriptor);
@@ -407,28 +305,55 @@ pub(super) fn decode_prepare<'a>(
     };
     validate_prefix(predecessor)?;
     let committed = reader.prefix()?;
-    let batch = decode_batch(scope, predecessor, Some(committed), reader, payload, limits)?;
+    let chain = Chain {
+        scope,
+        predecessor,
+        committed: Some(committed),
+    };
+    let batch = decode_batch(chain, reader, payload, limits)?;
     Ok(PrepareBatch { committed, batch })
 }
 
+/// Chain position a batch continues, and the commit claim it must not contradict.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Chain {
+    pub scope: Scope,
+    pub predecessor: Prefix,
+    pub committed: Option<Prefix>,
+}
+
+impl Chain {
+    fn check_start(self) -> Result<(), WireError> {
+        validate_prefix(self.predecessor)?;
+        self.check_commit(self.predecessor)
+    }
+
+    fn check_commit(self, position: Prefix) -> Result<(), WireError> {
+        match self.committed {
+            Some(committed) if committed.op == position.op && committed != position => {
+                Err(WireError::Chain)
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 pub(super) fn decode_batch<'a>(
-    scope: Scope,
-    predecessor: Prefix,
-    committed: Option<Prefix>,
+    chain: Chain,
     mut reader: Reader<'a>,
     mut payload: &'a [u8],
     limits: WireLimits,
 ) -> Result<DecodedBatch<'a>, WireError> {
-    validate_prefix(predecessor)?;
-    if let Some(committed) = committed {
-        check_commit(committed, predecessor)?;
-    }
+    chain.check_start()?;
+    let Chain {
+        scope, predecessor, ..
+    } = chain;
     let count = usize::try_from(reader.u32()?).map_err(|_| WireError::Limit)?;
     let descriptor_bytes = metadata_length(count, 0, limits)?;
-    if reader.remaining.len() != descriptor_bytes {
+    if reader.rest().len() != descriptor_bytes {
         return Err(WireError::Length);
     }
-    let descriptors = reader.remaining;
+    let descriptors = reader.rest();
     let original_payload = payload;
     let mut previous = predecessor;
     for _ in 0..count {
@@ -442,9 +367,7 @@ pub(super) fn decode_batch<'a>(
         {
             return Err(WireError::Digest);
         }
-        if let Some(committed) = committed {
-            check_commit(committed, operation.prefix())?;
-        }
+        chain.check_commit(operation.prefix())?;
         previous = operation.prefix();
     }
     if !payload.is_empty() {
@@ -468,7 +391,7 @@ fn read_operation<'a>(
 ) -> Result<Operation<'a>, WireError> {
     let op_number = reader.u64()?;
     let original_view = reader.u64()?;
-    let kind = u16::from_be_bytes(reader.bytes()?);
+    let kind = u16::from_be_bytes(reader.array()?);
     let kind = OperationKind::try_from(kind).map_err(|_| WireError::OperationKind(kind))?;
     let bytes = usize::try_from(reader.u32()?).map_err(|_| WireError::Limit)?;
     if bytes == 0 {
@@ -530,24 +453,17 @@ pub(super) fn metadata_length(
 }
 
 pub(super) fn validate_batch(
-    scope: Scope,
-    predecessor: Prefix,
-    committed: Option<Prefix>,
+    chain: Chain,
     operations: &[Operation<'_>],
     limits: WireLimits,
 ) -> Result<usize, WireError> {
     metadata_length(operations.len(), 0, limits)?;
-    validate_prefix(predecessor)?;
-    if let Some(committed) = committed {
-        check_commit(committed, predecessor)?;
-    }
-    let mut previous = predecessor;
+    chain.check_start()?;
+    let mut previous = chain.predecessor;
     let mut bytes = 0usize;
     for &operation in operations {
-        validate_step(scope, previous, operation)?;
-        if let Some(committed) = committed {
-            check_commit(committed, operation.prefix())?;
-        }
+        validate_step(chain.scope, previous, operation)?;
+        chain.check_commit(operation.prefix())?;
         bytes = bytes
             .checked_add(operation.canonical.body.len())
             .ok_or(WireError::Limit)?;
@@ -566,29 +482,25 @@ pub(super) fn write_batch(
     writer: &mut Writer<'_>,
     mut payload: Option<&mut [u8]>,
     operations: &[Operation<'_>],
-) {
-    writer.bytes(&(operations.len() as u32).to_be_bytes());
-    let mut offset = 0;
+) -> Result<(), WireError> {
+    writer.bytes(&(operations.len() as u32).to_be_bytes())?;
+    let mut offset = 0_usize;
     for &operation in operations {
         let canonical = operation.canonical;
-        writer.u64(canonical.op_number);
-        writer.u64(canonical.original_view);
-        writer.bytes(&(canonical.kind as u16).to_be_bytes());
-        writer.bytes(&(canonical.body.len() as u32).to_be_bytes());
-        writer.bytes(operation.body_digest.as_bytes());
-        writer.bytes(operation.digest.as_bytes());
-        let end = offset + canonical.body.len();
+        writer.u64(canonical.op_number)?;
+        writer.u64(canonical.original_view)?;
+        writer.bytes(&(canonical.kind as u16).to_be_bytes())?;
+        writer.bytes(&(canonical.body.len() as u32).to_be_bytes())?;
+        writer.bytes(operation.body_digest.as_bytes())?;
+        writer.bytes(operation.digest.as_bytes())?;
+        let end = offset
+            .checked_add(canonical.body.len())
+            .ok_or(WireError::Length)?;
         if let Some(payload) = payload.as_deref_mut() {
-            payload[offset..end].copy_from_slice(canonical.body);
+            let body = payload.get_mut(offset..end).ok_or(WireError::Capacity)?;
+            body.copy_from_slice(canonical.body);
         }
         offset = end;
     }
-}
-
-fn check_commit(committed: Prefix, position: Prefix) -> Result<(), WireError> {
-    if committed.op == position.op && committed != position {
-        Err(WireError::Chain)
-    } else {
-        Ok(())
-    }
+    Ok(())
 }

@@ -1,6 +1,7 @@
 //! Share one contiguous canonical payload; mixed backings use the reserved buffer.
 
 use super::{CodecError, RecordsEncoder, data, frame_capacity};
+use crate::layout;
 use bytes::{Buf, Bytes};
 use std::ops::Range;
 
@@ -18,18 +19,34 @@ impl Payload {
     }
 }
 
+/// One canonical producer LZ4 block within an immutable body.
+#[derive(Clone, Debug)]
+pub struct PreparedBlock<'a> {
+    /// Descriptor table of the uncompressed records.
+    pub descriptors: &'a [u8],
+    /// Total uncompressed payload bytes the descriptors declare.
+    pub decoded_bytes: usize,
+    /// Body that holds the block.
+    pub body: &'a Bytes,
+    /// Exact block range within `body`.
+    pub encoded: Range<usize>,
+}
+
 impl RecordsEncoder<'_> {
     /// Adopt one complete canonical producer LZ4 block into an empty response.
     /// Descriptors are checked against the declared decoded byte count; the
     /// transmitted payload remains the exact producer bytes.
     pub fn extend_shared_prepared_lz4(
         &mut self,
-        descriptors: &[u8],
-        decoded_bytes: usize,
-        body: &Bytes,
-        encoded: Range<usize>,
+        block: PreparedBlock<'_>,
         count: usize,
     ) -> Result<bool, CodecError> {
+        let PreparedBlock {
+            descriptors,
+            decoded_bytes,
+            body,
+            encoded,
+        } = block;
         if !self.shared_enabled || !self.is_empty() || self.shared.is_some() {
             return Ok(false);
         }
@@ -57,18 +74,12 @@ impl RecordsEncoder<'_> {
         )?
         .parts;
         self.metadata.extend_from_slice(descriptors);
-        self.shared = Some(Payload {
-            body: body.clone(),
-            range: encoded,
-        });
+        self.share(body, encoded);
         self.records = count;
         self.parts = parts;
         self.decoded_payload_bytes = decoded_bytes;
-        self.metadata[self.count_at..self.count_at + 4]
-            .copy_from_slice(&(count as u32).to_be_bytes());
-        self.metadata[self.encoding_at] = crate::append::PayloadEncoding::Lz4 as u8;
-        self.metadata[self.encoding_at + 1..self.encoding_at + 5]
-            .copy_from_slice(&(decoded_bytes as u32).to_be_bytes());
+        layout::patch(self.metadata, self.count_at, (count as u32).to_be_bytes())?;
+        self.set_payload_encoding(crate::append::PayloadEncoding::Lz4, decoded_bytes)?;
         Ok(true)
     }
 
@@ -89,11 +100,7 @@ impl RecordsEncoder<'_> {
             return Ok(false);
         }
         let payload = body.get(range.clone()).ok_or(CodecError::Length)?;
-        if let Some(previous) = &self.shared
-            && (previous.body.as_ptr() != body.as_ptr()
-                || previous.body.len() != body.len()
-                || previous.range.end != range.start)
-        {
+        if !self.continues_shared(body, &range) {
             return Ok(false);
         }
         let first = self
@@ -114,21 +121,13 @@ impl RecordsEncoder<'_> {
         )?;
         let parts =
             data::validate_record_entries(descriptors, payload, count, first, self.remaining())?.0;
+        let parts = data::add(self.parts, parts)?;
         self.metadata.extend_from_slice(descriptors);
-        match &mut self.shared {
-            Some(previous) => previous.range.end = range.end,
-            None => {
-                self.shared = Some(Payload {
-                    body: body.clone(),
-                    range,
-                });
-            }
-        }
+        self.share(body, range);
         self.records = records;
-        self.parts += parts;
-        self.metadata[self.count_at..self.count_at + 4]
-            .copy_from_slice(&(records as u32).to_be_bytes());
-        self.set_raw_payload_bytes();
+        self.parts = parts;
+        layout::patch(self.metadata, self.count_at, (records as u32).to_be_bytes())?;
+        self.set_raw_payload_bytes()?;
         Ok(true)
     }
 
@@ -175,34 +174,20 @@ impl RecordsEncoder<'_> {
         if !encoding.validate(count, self.limits.max_parts, self.limits.max_record_bytes) {
             return Err(CodecError::Parts);
         }
-        let first = parts.clone().next().ok_or(CodecError::Parts)?;
-        let mut end = first.start;
-        for part in parts.clone() {
-            if part.start != end {
-                return Ok(false);
-            }
-            if part.end < part.start || part.end > body.len() {
-                return Err(CodecError::Length);
-            }
-            data::count(part.len())?;
-            end = part.end;
-        }
-        let range = first.start..end;
-        if let Some(previous) = &self.shared
-            && (previous.body.as_ptr() != body.as_ptr()
-                || previous.body.len() != body.len()
-                || previous.range.end != range.start)
-        {
+        let Some(range) = contiguous(body.len(), parts.clone())? else {
+            return Ok(false);
+        };
+        if !self.continues_shared(body, &range) {
             return Ok(false);
         }
         let bytes = data::add(self.payload_bytes(), range.len())?;
-        if range.len() > self.limits.max_record_bytes || count > self.limits.max_parts - self.parts
-        {
+        let total_parts = data::add(self.parts, count)?;
+        if range.len() > self.limits.max_record_bytes || total_parts > self.limits.max_parts {
             return Err(CodecError::Limit);
         }
         if encoding
             .frame_offset(
-                &body[range.clone()],
+                body.get(range.clone()).ok_or(CodecError::Length)?,
                 self.limits.max_parts,
                 self.limits.max_record_bytes,
             )
@@ -214,7 +199,7 @@ impl RecordsEncoder<'_> {
         data::record_count(records, self.first_offset, self.limits)?;
         let descriptor = count
             .checked_mul(4)
-            .and_then(|n| n.checked_add(20 + encoding.metadata_bytes()))
+            .and_then(|n| n.checked_add(encoding.head_bytes()))
             .ok_or(CodecError::Length)?;
         frame_capacity(
             self.metadata,
@@ -223,19 +208,28 @@ impl RecordsEncoder<'_> {
         )?;
         // Keep fallback capacity reserved even while sending shared bytes.
         frame_capacity(self.payload, bytes, self.limits.envelope.max_payload_bytes)?;
-        self.metadata.extend_from_slice(id.as_bytes());
-        self.metadata
-            .extend_from_slice(&(data::count(count)? | encoding.tag()).to_be_bytes());
-        if let data::Encoding::Lz4 { decoded_bytes } = encoding {
-            self.metadata
-                .extend_from_slice(&decoded_bytes.to_be_bytes());
-        }
-        for part in parts {
-            self.metadata
-                .extend_from_slice(&(part.len() as u32).to_be_bytes());
-        }
+        write_descriptor(self.metadata, id, encoding, parts)?;
+        self.share(body, range);
+        self.records = records;
+        self.parts = total_parts;
+        layout::patch(self.metadata, self.count_at, (records as u32).to_be_bytes())?;
+        self.set_raw_payload_bytes()?;
+        Ok(true)
+    }
+
+    /// Whether `range` of `body` directly follows the shared payload, or
+    /// would start it.
+    fn continues_shared(&self, body: &Bytes, range: &Range<usize>) -> bool {
+        self.shared.as_ref().is_none_or(|previous| {
+            previous.body.as_ptr() == body.as_ptr()
+                && previous.body.len() == body.len()
+                && previous.range.end == range.start
+        })
+    }
+
+    fn share(&mut self, body: &Bytes, range: Range<usize>) {
         match &mut self.shared {
-            Some(previous) => previous.range.end = end,
+            Some(previous) => previous.range.end = range.end,
             None => {
                 self.shared = Some(Payload {
                     body: body.clone(),
@@ -243,20 +237,54 @@ impl RecordsEncoder<'_> {
                 });
             }
         }
-        self.records = records;
-        self.parts += count;
-        self.metadata[self.count_at..self.count_at + 4]
-            .copy_from_slice(&(records as u32).to_be_bytes());
-        self.set_raw_payload_bytes();
-        Ok(true)
     }
 
-    pub(super) fn materialize(&mut self) {
+    pub(super) fn materialize(&mut self) -> Result<(), CodecError> {
         debug_assert!(!self.has_encoded_payload());
         if let Some(shared) = self.shared.take() {
             debug_assert_eq!(self.payload.len(), 0);
             debug_assert!(self.payload.capacity() >= shared.range.len());
-            self.payload.extend_from_slice(&shared.body[shared.range]);
+            let body = shared.body.get(shared.range).ok_or(CodecError::Length)?;
+            self.payload.extend_from_slice(body);
         }
+        Ok(())
     }
+}
+
+/// The span of `parts` when each starts where the previous one ends, or
+/// `None` at the first gap.
+fn contiguous(
+    body_len: usize,
+    parts: impl Iterator<Item = Range<usize>> + Clone,
+) -> Result<Option<Range<usize>>, CodecError> {
+    let first = parts.clone().next().ok_or(CodecError::Parts)?;
+    let mut end = first.start;
+    for part in parts {
+        if part.start != end {
+            return Ok(None);
+        }
+        if part.end < part.start || part.end > body_len {
+            return Err(CodecError::Length);
+        }
+        data::count(part.len())?;
+        end = part.end;
+    }
+    Ok(Some(first.start..end))
+}
+
+fn write_descriptor(
+    metadata: &mut Vec<u8>,
+    id: crate::MessageId,
+    encoding: data::Encoding,
+    parts: impl ExactSizeIterator<Item = Range<usize>>,
+) -> Result<(), CodecError> {
+    metadata.extend_from_slice(id.as_bytes());
+    metadata.extend_from_slice(&(data::count(parts.len())? | encoding.tag()).to_be_bytes());
+    if let data::Encoding::Lz4 { decoded_bytes } = encoding {
+        metadata.extend_from_slice(&decoded_bytes.to_be_bytes());
+    }
+    for part in parts {
+        metadata.extend_from_slice(&(part.len() as u32).to_be_bytes());
+    }
+    Ok(())
 }

@@ -1,6 +1,9 @@
 use super::*;
-use crate::{CheckpointError, CheckpointReference, checkpoint_name, open_checkpoint};
+use crate::{CheckpointError, CheckpointReference, checkpoint_name};
 use ozzy_proto::CheckpointId;
+
+mod inbox;
+mod ranges;
 
 fn id() -> CheckpointId {
     CheckpointId::from_bytes([0x77; 16])
@@ -25,7 +28,7 @@ async fn build(journal: &mut Journal) -> Result<CheckpointReference, DirectoryEr
 }
 
 #[tokio::test]
-async fn async_checkpoint_build_reuses_exact_artifacts_and_selects_legacy_readable_state() {
+async fn async_checkpoint_build_reuses_exact_artifacts_and_selects_state_after_reopen() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("group");
     let (pool, mut clients) = ozzy_io_pool::Pool::new(ozzy_io_pool::Config {
@@ -66,24 +69,33 @@ async fn async_checkpoint_build_reuses_exact_artifacts_and_selects_legacy_readab
     assert!(!journal.is_faulted());
     drop(journal);
     pool.shutdown().await;
-    let legacy = GroupDirectory::open_with_configuration(
-        &path,
-        identity(),
-        limits().metadata,
-        b"test deployment",
-    )
-    .unwrap()
-    .recover(JournalGeneration(2), limits().decode, limits().operations)
+    let (pool, mut clients) = ozzy_io_pool::Pool::new(ozzy_io_pool::Config {
+        threads: 1,
+        max_inflight: 1,
+        handles: 32,
+        limits: io_limits(),
+    })
     .unwrap();
-    assert_eq!(legacy.committed_position().unwrap(), first.position);
-    let checkpoint = open_checkpoint(
-        path.join("checkpoints").join(checkpoint_name(id())),
-        identity().group_id,
-        identity().store_id,
-        limits().checkpoint,
+    let reopened = Journal::open(
+        path,
+        Local::new(clients.remove(0)),
+        crate::ExpectedStore {
+            identity: identity(),
+            configuration: Some(b"test deployment"),
+        },
+        JournalGeneration(2),
+        limits(),
     )
+    .await
     .unwrap();
-    assert_eq!(checkpoint.read_state(limits().checkpoint).unwrap(), STATE);
+    assert_eq!(reopened.committed_position().unwrap(), first.position);
+    assert_eq!(reopened.manifest.checkpoint, Some(first));
+    assert_eq!(
+        reopened.read_checkpoint_state().await.unwrap().unwrap(),
+        STATE
+    );
+    drop(reopened);
+    pool.shutdown().await;
 }
 
 #[test]
@@ -191,5 +203,95 @@ fn checkpoint_build_and_selection_survive_every_execution_and_observation_cut() 
             }
         }
         assert!(finished);
+    }
+}
+
+fn selected_checkpoint() -> Image {
+    let (mut controller, io) = setup(baseline());
+    let mut journal = drive(&mut controller, open(io, 2)).unwrap();
+    drive(&mut controller, commit(&mut journal));
+    drive(&mut controller, build(&mut journal)).unwrap();
+    drive(&mut controller, journal.install_checkpoint(id())).unwrap();
+    drop(journal);
+    controller.crash(true).unwrap().0
+}
+
+#[test]
+fn open_hashes_chunks_and_rejects_missing_or_extra_files() {
+    let root = format!("/group/checkpoints/{}", checkpoint_name(id()));
+    let chunk = |ordinal: u32| format!("{root}/CHUNK.{ordinal:08}");
+    for damage in 0..4 {
+        let (mut controller, io) = setup(selected_checkpoint());
+        let access = raw_access(&io);
+        match damage {
+            0 => {
+                let mut bytes = controller
+                    .image()
+                    .bytes(Path::new(&chunk(0)), false)
+                    .unwrap()
+                    .to_vec();
+                bytes[0] ^= 1;
+                write_file(&mut controller, &access, &chunk(0), &bytes);
+            }
+            1 => remove_file(&mut controller, &access, &chunk(1)),
+            2 => write_file(
+                &mut controller,
+                &access,
+                &format!("{root}/unexpected"),
+                b"x",
+            ),
+            3 => {}
+            _ => unreachable!(),
+        }
+        let result = drive(&mut controller, open(io, 3));
+        match damage {
+            0 => assert!(matches!(
+                result,
+                Err(DirectoryError::Checkpoint(CheckpointError::DigestMismatch(
+                    "checkpoint chunk"
+                )))
+            )),
+            1 => assert!(matches!(
+                result,
+                Err(DirectoryError::Checkpoint(CheckpointError::MissingChunk))
+            )),
+            2 => assert!(matches!(
+                result,
+                Err(DirectoryError::Checkpoint(CheckpointError::UnexpectedFile))
+            )),
+            _ => assert_eq!(
+                drive(&mut controller, result.unwrap().read_checkpoint_state())
+                    .unwrap()
+                    .unwrap(),
+                STATE
+            ),
+        }
+    }
+}
+
+#[test]
+fn checkpoint_limits_are_enforced_before_publication() {
+    let (mut controller, io) = setup(baseline());
+    let mut journal = drive(&mut controller, open(io, 2)).unwrap();
+    drive(&mut controller, commit(&mut journal));
+    journal.limits.checkpoint.max_state_bytes = 3;
+    assert!(matches!(
+        drive(
+            &mut controller,
+            journal.build_checkpoint(id(), schema(), 8, b"four")
+        ),
+        Err(DirectoryError::Checkpoint(CheckpointError::LimitExceeded {
+            kind: "checkpoint state bytes",
+            ..
+        }))
+    ));
+    assert!(!journal.is_faulted());
+    for directory in ["/group/checkpoints", "/group/staging"] {
+        let entries = drive(
+            &mut controller,
+            journal.access.list(directory.into(), 16, 4096),
+        )
+        .unwrap();
+        assert!(entries.is_empty(), "{directory}");
     }
 }

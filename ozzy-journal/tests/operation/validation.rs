@@ -24,7 +24,11 @@ fn compare(kind: OperationKind, input: &[u8], limits: OperationLimits) {
                     batch.append_timestamp_millis,
                     expected.append_timestamp_millis
                 );
-                for (record, expected) in batch.records().zip(expected.records()) {
+                for (record, expected) in batch
+                    .raw_records()
+                    .unwrap()
+                    .zip(expected.raw_records().unwrap())
+                {
                     assert_eq!(record.message_id, expected.message_id);
                     assert!(record.parts.eq(expected.parts));
                 }
@@ -45,8 +49,8 @@ fn compare(kind: OperationKind, input: &[u8], limits: OperationLimits) {
                 assert_eq!(view.summary.first_sequence, batch.first_sequence);
                 assert_eq!(view.summary.first_offset, batch.first_offset);
                 assert_eq!(view.append_timestamp_millis, batch.append_timestamp_millis);
-                assert_eq!(view.records().len(), batch.records.len());
-                for (view, record) in view.records().zip(&batch.records) {
+                assert_eq!(view.raw_records().unwrap().len(), batch.records.len());
+                for (view, record) in view.raw_records().unwrap().zip(&batch.records) {
                     assert_eq!(view.message_id, record.message_id);
                     assert_eq!(view.parts.len(), record.parts.len());
                     assert_eq!(

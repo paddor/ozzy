@@ -1,7 +1,7 @@
 //! Pure storage-profile and promise checks shared across execution placements.
 
 use ozzy_journal::operation::ChainPosition;
-use ozzy_journal_segment::{CommitMode, LogPosition, Manifest, WriterPosition};
+use ozzy_journal_segment::{CommitMode, GroupJournal, LogPosition, Manifest};
 use ozzy_replication::{Prefix, PromiseTicket, Scope};
 
 use super::JournalError;
@@ -40,6 +40,15 @@ pub(super) fn recovery_ticket(
         return Err(ozzy_replication::recovery::RecoveryError::StaleTransfer.into());
     }
     Ok(())
+}
+
+/// The next metadata generation after `current`, unless the generation
+/// counter is exhausted.
+pub(super) fn successor(current: &Manifest) -> Option<Manifest> {
+    let mut next = current.clone();
+    next.parent_generation = next.generation;
+    next.generation = next.generation.checked_add(1)?;
+    Some(next)
 }
 
 pub(super) fn validate_manifest(
@@ -95,12 +104,13 @@ fn supported_anchor(manifest: &Manifest, first: ChainPosition) -> bool {
 
 pub(super) fn promise_manifest(
     scope: Scope,
-    current: &Manifest,
-    written: WriterPosition,
-    durable: WriterPosition,
-    accepted: Prefix,
+    journal: &GroupJournal,
     ticket: PromiseTicket,
 ) -> Result<Option<Manifest>, JournalError> {
+    let accepted = journal.accepted_position()?;
+    let current = journal.manifest();
+    let written = journal.writer().written_position();
+    let durable = journal.writer().durable_position();
     if ticket.scope()
         != (Scope {
             view: ticket.scope().view,
@@ -110,7 +120,7 @@ pub(super) fn promise_manifest(
         || written != durable
         || ticket.scope().view < current.promised_view
         || ticket.log().last_normal_view != current.last_normal_view
-        || ticket.log().accepted != accepted
+        || position(ticket.log().accepted) != accepted
         || ticket.log().committed.op.0 < current.committed.op_number
     {
         return Err(JournalError::PromiseMismatch);
@@ -124,12 +134,7 @@ pub(super) fn promise_manifest(
         }
         return Ok(None);
     }
-    let mut next = current.clone();
-    next.parent_generation = next.generation;
-    next.generation = next
-        .generation
-        .checked_add(1)
-        .ok_or(JournalError::PromiseMismatch)?;
+    let mut next = successor(current).ok_or(JournalError::PromiseMismatch)?;
     next.promised_view = ticket.scope().view;
     next.accepted = position(ticket.log().accepted);
     next.committed = position(ticket.log().committed);

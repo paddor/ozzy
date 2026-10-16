@@ -3,10 +3,13 @@
 use ozzy_proto::{Envelope, EnvelopeLimits, Opcode};
 use ozzy_proto::{LinkSessionId, NodeId, RequestId};
 
-use super::prepare::{DecodedBatch, decode_batch, metadata_length, validate_batch, write_batch};
+use super::prepare::{
+    Chain, DecodedBatch, decode_batch, metadata_length, validate_batch, write_batch,
+};
 use super::{
-    COMMON_BYTES, ControlEncoding, Operation, Operations, PeerBinding, PrepareEncoding, Reader,
-    WireError, WireLimits, Writer, validate_prefix, validate_scope,
+    COMMON_BYTES, ControlEncoding, EncodeContext, Incoming, Operation, Operations, PeerBinding,
+    PrepareEncoding, ReadFields, Reader, WireError, WireLimits, WriteFields, Writer,
+    validate_prefix, validate_scope,
 };
 use crate::{JournalGeneration, LogSource, Prefix, Scope};
 
@@ -112,14 +115,17 @@ impl<'a> OpsBatch<'a> {
 /// and local wire limits; errors leave metadata and payload output unchanged.
 /// The serving adapter independently verifies the source pin and role lifetime.
 pub fn encode_ops(
-    sender: NodeId,
-    session: LinkSessionId,
+    context: EncodeContext,
     request: FetchOps,
     operations: &[Operation<'_>],
     metadata: &mut [u8],
     payload: &mut [u8],
-    limits: WireLimits,
 ) -> Result<PrepareEncoding, WireError> {
+    let EncodeContext {
+        sender,
+        session,
+        limits,
+    } = context;
     request.validate()?;
     if sender != request.source.voter {
         return Err(WireError::Peer);
@@ -135,12 +141,17 @@ pub fn encode_ops(
         },
     };
     let metadata_bytes = metadata_length(operations.len(), OPS_FIXED_BYTES, limits)?;
-    let payload_bytes =
-        validate_batch(request.scope, request.predecessor, None, operations, limits)?;
-    validate_tail(
-        request.source,
-        operations.last().expect("nonempty validated").prefix(),
+    let payload_bytes = validate_batch(
+        Chain {
+            scope: request.scope,
+            predecessor: request.predecessor,
+            committed: None,
+        },
+        operations,
+        limits,
     )?;
+    let tail = operations.last().ok_or(WireError::Limit)?;
+    validate_tail(request.source, tail.prefix())?;
     let header = Envelope {
         opcode: Opcode::Ops,
         response: true,
@@ -152,11 +163,11 @@ pub fn encode_ops(
     if metadata.len() < metadata_bytes || payload.len() < payload_bytes {
         return Err(WireError::Capacity);
     }
-    let mut writer = Writer::new(&mut metadata[..metadata_bytes]);
-    writer.scope(request.scope, sender);
-    write_source(&mut writer, request.source);
-    writer.prefix(request.predecessor);
-    write_batch(&mut writer, Some(payload), operations);
+    let mut writer = Writer::with_len(metadata, metadata_bytes)?;
+    writer.scope(request.scope, sender)?;
+    write_source(&mut writer, request.source)?;
+    writer.prefix(request.predecessor)?;
+    write_batch(&mut writer, Some(payload), operations)?;
     Ok(PrepareEncoding {
         header,
         metadata_bytes,
@@ -164,13 +175,15 @@ pub fn encode_ops(
     })
 }
 
-pub(super) fn decode_ops<'a>(
-    scope: Scope,
-    envelope: Envelope,
-    mut reader: Reader<'a>,
-    payload: &'a [u8],
+pub(super) fn decode_ops(
+    Incoming {
+        scope,
+        envelope,
+        mut reader,
+        payload,
+    }: Incoming<'_>,
     limits: WireLimits,
-) -> Result<OpsBatch<'a>, WireError> {
+) -> Result<OpsBatch<'_>, WireError> {
     let request_id = envelope.request_id.ok_or(WireError::Correlation)?;
     if !envelope.response {
         return Err(WireError::Correlation);
@@ -179,8 +192,12 @@ pub(super) fn decode_ops<'a>(
     if source.voter != envelope.sender {
         return Err(WireError::Peer);
     }
-    let predecessor = reader.prefix()?;
-    let batch = decode_batch(scope, predecessor, None, reader, payload, limits)?;
+    let chain = Chain {
+        scope,
+        predecessor: reader.prefix()?,
+        committed: None,
+    };
+    let batch = decode_batch(chain, reader, payload, limits)?;
     validate_tail(source, batch.accepted)?;
     Ok(OpsBatch {
         request_id,
@@ -245,12 +262,12 @@ pub fn encode_fetch(
     if metadata.len() < FETCH_BYTES {
         return Err(WireError::Capacity);
     }
-    let mut writer = Writer::new(&mut metadata[..FETCH_BYTES]);
-    writer.scope(request.scope, sender);
-    write_source(&mut writer, request.source);
-    writer.prefix(request.predecessor);
-    writer.bytes(&request.max_operations.to_be_bytes());
-    writer.bytes(&request.max_body_bytes.to_be_bytes());
+    let mut writer = Writer::with_len(metadata, FETCH_BYTES)?;
+    writer.scope(request.scope, sender)?;
+    write_source(&mut writer, request.source)?;
+    writer.prefix(request.predecessor)?;
+    writer.bytes(&request.max_operations.to_be_bytes())?;
+    writer.bytes(&request.max_body_bytes.to_be_bytes())?;
     Ok(ControlEncoding {
         header,
         metadata_bytes: FETCH_BYTES,
@@ -258,10 +275,12 @@ pub fn encode_fetch(
 }
 
 pub(super) fn decode_fetch(
-    scope: Scope,
-    envelope: Envelope,
-    mut reader: Reader<'_>,
-    payload: &[u8],
+    Incoming {
+        scope,
+        envelope,
+        mut reader,
+        payload,
+    }: Incoming<'_>,
     binding: PeerBinding,
 ) -> Result<FetchOps, WireError> {
     let request_id = envelope.request_id.ok_or(WireError::Correlation)?;
@@ -294,16 +313,17 @@ pub(super) fn validate_source(source: LogSource) -> Result<(), WireError> {
     Ok(())
 }
 
-pub(super) fn write_source(writer: &mut Writer<'_>, source: LogSource) {
-    writer.bytes(source.voter.as_bytes());
-    writer.bytes(&source.generation.0.to_be_bytes());
-    writer.prefix(source.accepted);
+pub(super) fn write_source(writer: &mut Writer<'_>, source: LogSource) -> Result<(), WireError> {
+    writer.bytes(source.voter.as_bytes())?;
+    writer.bytes(&source.generation.0.to_be_bytes())?;
+    writer.prefix(source.accepted)?;
+    Ok(())
 }
 
 pub(super) fn read_source(reader: &mut Reader<'_>) -> Result<LogSource, WireError> {
     let source = LogSource {
-        voter: NodeId::from_bytes(reader.bytes()?),
-        generation: JournalGeneration(u128::from_be_bytes(reader.bytes()?)),
+        voter: NodeId::from_bytes(reader.array()?),
+        generation: JournalGeneration(u128::from_be_bytes(reader.array()?)),
         accepted: reader.prefix()?,
     };
     validate_source(source)?;

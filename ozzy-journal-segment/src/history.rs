@@ -1,13 +1,8 @@
 //! Frozen canonical history for replica selection and bounded transfer.
 
 pub(crate) mod asynchronous;
-#[cfg(test)]
-mod tests;
 mod validation;
 pub use validation::{StorageValidationBudget, StorageValidationStep};
-
-use std::fs::{self, File};
-use std::io::Read;
 
 use ozzy_journal::operation::validate_operation_body;
 use ozzy_journal::progress::JournalGeneration;
@@ -15,34 +10,13 @@ use ozzy_journal::progress::JournalGeneration;
 use crate::codec::SegmentDigestBuilder;
 use crate::{
     CanonicalOperation, ChainPosition, CodecError, DecodeLimits, DecodedOperation, DirectoryError,
-    ENTRY_HEADER_BYTES, GroupIdentity, LogPosition, OpenGroupJournal, OperationLimits,
-    SealedSegment, SegmentHeader, SegmentPin, SegmentScan, TailState, decode_group,
-    decode_indexed_operation, scan_segment,
+    ENTRY_HEADER_BYTES, GroupIdentity, LogPosition, OperationLimits, SealedSegment, SegmentHeader,
+    SegmentScan, TailState, decode_group, decode_indexed_operation, scan_segment,
 };
-
-/// Pinned source with an exact stable tail and independently captured physical anchors.
-///
-/// Construct and use on a blocking storage worker. Each newly loaded segment is
-/// fully validated against its frozen anchor, then indexed in reserved memory.
-/// Position queries reuse verified prefixes; chunks revalidate requested entries
-/// without rescanning unrelated bodies. Only one encoded segment and its index
-/// stay cached. Full validation and selected decompression still allocate bounded
-/// temporary storage; this is not a zero-allocation reader.
-/// Pins retain old files and group ownership across suffix replacement/cleanup.
-#[derive(Debug)]
-pub struct JournalHistory {
-    state: HistoryState<SegmentPin>,
-}
 
 /// Metadata and deletion protection only. Loading bytes is deliberately absent.
 trait Source {
     fn references(&self) -> &[crate::SegmentReference];
-}
-
-impl Source for SegmentPin {
-    fn references(&self) -> &[crate::SegmentReference] {
-        self.references()
-    }
 }
 
 #[derive(Debug)]
@@ -85,6 +59,27 @@ struct IndexedOperation {
     bytes: usize,
     position: LogPosition,
     body_bytes: usize,
+}
+
+/// Index one decoded operation; the entry count stays within `limit`.
+fn push_indexed(
+    entries: &mut Vec<IndexedOperation>,
+    limit: usize,
+    operation: &DecodedOperation<'_>,
+) -> Result<(), HistoryError> {
+    if entries.len() == limit {
+        return Err(HistoryError::Capacity);
+    }
+    entries.push(IndexedOperation {
+        offset: usize::try_from(operation.entry_offset).map_err(|_| HistoryError::Capacity)?,
+        bytes: usize::try_from(operation.entry_bytes).map_err(|_| HistoryError::Capacity)?,
+        position: LogPosition {
+            op_number: operation.op_number,
+            digest: operation.digest,
+        },
+        body_bytes: operation.body.len(),
+    });
+    Ok(())
 }
 
 /// Consecutive whole operations borrowed from one verified source segment.
@@ -134,181 +129,6 @@ impl HistoryChunk<'_> {
                 operation.body_digest,
             )
         })
-    }
-}
-
-impl OpenGroupJournal {
-    /// Capture quiescent stable history without scanning files or building record indexes.
-    ///
-    /// Reject unsettled writes, unpublished roll metadata, and any source segment
-    /// exceeding `max_segment_bytes`. Reserve one encoded-segment arena and at
-    /// most one entry per byte in the largest captured segment prefix upfront.
-    /// The index covers operations, never individual records. Later appends cannot
-    /// extend this source; replacement cannot reclaim its pinned files.
-    pub fn freeze_history(&self, max_segment_bytes: usize) -> Result<JournalHistory, HistoryError> {
-        self.capture_history(max_segment_bytes, false)
-    }
-
-    /// Capture complete writes for live replay, including unsynchronized bytes.
-    /// This grants no restart, election, or stable-storage authority. Reserved
-    /// writes beyond the installed prefix are excluded, just as for stable reads.
-    pub fn freeze_written_history(
-        &self,
-        max_segment_bytes: usize,
-    ) -> Result<JournalHistory, HistoryError> {
-        self.capture_history(max_segment_bytes, true)
-    }
-
-    fn capture_history(
-        &self,
-        max_segment_bytes: usize,
-        written: bool,
-    ) -> Result<JournalHistory, HistoryError> {
-        let writer = self.writer();
-        if writer.is_faulted()
-            || (!written && writer.written_position() != writer.durable_position())
-            || self.buffered_roll_pending()
-        {
-            return Err(HistoryError::Unsettled);
-        }
-        let references = &self.directory().manifest().segments;
-        validate_segment_capacities(references, max_segment_bytes)?;
-        let active_seal = SealedSegment {
-            valid_bytes: writer.written_position().end_offset(),
-            digest: writer.structural_digest(),
-        };
-        let maximum = largest_captured_prefix(references, active_seal)?;
-        let (bytes, entries, entry_limit) = reserve_buffers(maximum, max_segment_bytes)?;
-        let pin = self.pin_all_segments()?;
-        let manifest = self.directory().manifest();
-        Ok(JournalHistory {
-            state: HistoryState {
-                pin,
-                identity: self.directory().identity(),
-                generation: writer.durable_position().generation(),
-                configuration_epoch: manifest.configuration_epoch,
-                promised_view: manifest.promised_view,
-                through: self.written_position()?,
-                physical_through: self.written_position()?,
-                active_seal,
-                decode: self.decode_limits(),
-                operations: self.operation_limits(),
-                bytes,
-                entries,
-                entry_limit,
-                loaded: None,
-                #[cfg(test)]
-                full_scans: std::cell::Cell::new(0),
-            },
-        })
-    }
-
-    /// Pin an exact earlier accepted prefix after its physical writes have settled.
-    ///
-    /// Run on the storage worker after synchronizing already submitted writes.
-    /// The captured physical tail may exceed `through`; transfer and lookups never
-    /// expose those later operations. Validate the requested canonical anchor
-    /// against its whole frozen source segment before returning. No scan or barrier
-    /// is moved onto the protocol thread, and this grants no consensus authority.
-    /// Pins retain all captured files until this reader is dropped.
-    pub fn freeze_history_through(
-        &self,
-        through: LogPosition,
-        max_segment_bytes: usize,
-    ) -> Result<JournalHistory, HistoryError> {
-        let mut history = self.freeze_history(max_segment_bytes)?;
-        if history.position(through.op_number)? != Some(through) {
-            return Err(HistoryError::Source);
-        }
-        history.state.through = through;
-        Ok(history)
-    }
-}
-
-impl JournalHistory {
-    /// Persistent source identity, not a remote authentication credential.
-    pub const fn identity(&self) -> GroupIdentity {
-        self.state.identity()
-    }
-    /// Frozen writer incarnation, independent of later live writers.
-    pub const fn generation(&self) -> JournalGeneration {
-        self.state.generation()
-    }
-    /// Exact captured canonical tail. Written captures need not be durable.
-    pub const fn through(&self) -> LogPosition {
-        self.state.through()
-    }
-    /// Boundary immediately before the first retained operation.
-    pub fn predecessor(&self) -> LogPosition {
-        self.state.predecessor()
-    }
-
-    /// Resolve one exact position using at most one cached source segment.
-    pub fn position(&mut self, op: u64) -> Result<Option<LogPosition>, HistoryError> {
-        if op > self.predecessor().op_number && op <= self.through().op_number {
-            let index = self.state.segment_for(op)?;
-            self.load(index)?;
-        }
-        self.state.position_loaded(op)
-    }
-
-    /// Return whole validated operations after an exact captured predecessor.
-    pub fn read_after(
-        &mut self,
-        predecessor: LogPosition,
-        max_operations: usize,
-        max_body_bytes: usize,
-    ) -> Result<HistoryChunk<'_>, HistoryError> {
-        let index = self
-            .state
-            .read_index(predecessor, max_operations, max_body_bytes)?;
-        self.load(index)?;
-        self.state
-            .read_after_loaded(predecessor, max_operations, max_body_bytes)
-    }
-
-    fn load(&mut self, index: usize) -> Result<(), HistoryError> {
-        if self
-            .state
-            .loaded
-            .as_ref()
-            .is_some_and(|loaded| loaded.index == index)
-        {
-            return Ok(());
-        }
-        self.state.loaded = None;
-        self.state.entries.clear();
-        let reference = self.state.pin.references()[index];
-        let seal = self.state.seal(index);
-        let length = usize::try_from(seal.valid_bytes).map_err(|_| HistoryError::Capacity)?;
-        if seal.valid_bytes > reference.capacity || length > self.state.bytes.capacity() {
-            return Err(HistoryError::Source);
-        }
-        let path = self
-            .state
-            .pin
-            .segment_path(reference.segment_id)
-            .ok_or(HistoryError::Source)?;
-        if !fs::symlink_metadata(&path)?.file_type().is_file() {
-            return Err(HistoryError::Source);
-        }
-        let mut file = File::open(path)?;
-        let metadata = file.metadata()?;
-        if !metadata.file_type().is_file()
-            || metadata.len() < seal.valid_bytes
-            || metadata.len() > reference.capacity
-        {
-            return Err(HistoryError::Source);
-        }
-        self.state.bytes.resize(length, 0);
-        file.read_exact(&mut self.state.bytes)?;
-        // Move only the Vec handle to permit borrowing the encoded bytes while
-        // filling the reserved index. Restore the allocation on validation errors.
-        let mut entries = std::mem::take(&mut self.state.entries);
-        let result = self.state.index_segment(index, &mut entries);
-        self.state.entries = entries;
-        self.state.loaded = Some(result?);
-        Ok(())
     }
 }
 
@@ -472,20 +292,7 @@ impl<S: Source> HistoryState<S> {
             digest.push(group.digest);
         }
         for operation in scan.groups.iter().flat_map(|group| &group.operations) {
-            if entries.len() == self.entry_limit {
-                return Err(HistoryError::Capacity);
-            }
-            entries.push(IndexedOperation {
-                offset: usize::try_from(operation.entry_offset)
-                    .map_err(|_| HistoryError::Capacity)?,
-                bytes: usize::try_from(operation.entry_bytes)
-                    .map_err(|_| HistoryError::Capacity)?,
-                position: LogPosition {
-                    op_number: operation.op_number,
-                    digest: operation.digest,
-                },
-                body_bytes: operation.body.len(),
-            });
+            push_indexed(entries, self.entry_limit, operation)?;
         }
         Ok(LoadedSegment {
             index,
@@ -509,63 +316,7 @@ impl<S: Source> HistoryState<S> {
         }
         let mut offset = loaded.valid_bytes as usize;
         while offset < self.bytes.len() {
-            if loaded.groups == self.decode.max_groups {
-                return Err(CodecError::LimitExceeded {
-                    kind: "physical group count",
-                    actual: loaded.groups + 1,
-                    limit: self.decode.max_groups,
-                }
-                .into());
-            }
-            let group = decode_group(
-                &loaded.header,
-                loaded.next_group_number,
-                offset as u64,
-                loaded.next_chain,
-                &self.bytes[offset..],
-                self.decode,
-            )?;
-            for operation in &group.operations {
-                if operation.configuration_epoch != self.configuration_epoch
-                    || operation.original_view > self.promised_view
-                {
-                    return Err(HistoryError::Source);
-                }
-                validate_operation_body(operation.kind, operation.body.as_ref(), self.operations)?;
-                loaded.decoded_body_bytes = loaded
-                    .decoded_body_bytes
-                    .checked_add(operation.body.len())
-                    .ok_or(HistoryError::Capacity)?;
-                if loaded.decoded_body_bytes > self.decode.max_segment_decoded_body_bytes {
-                    return Err(CodecError::SegmentDecodedBodyLimit {
-                        actual: loaded.decoded_body_bytes,
-                        limit: self.decode.max_segment_decoded_body_bytes,
-                    }
-                    .into());
-                }
-                if self.entries.len() == self.entry_limit {
-                    return Err(HistoryError::Capacity);
-                }
-                self.entries.push(IndexedOperation {
-                    offset: usize::try_from(operation.entry_offset)
-                        .map_err(|_| HistoryError::Capacity)?,
-                    bytes: usize::try_from(operation.entry_bytes)
-                        .map_err(|_| HistoryError::Capacity)?,
-                    position: LogPosition {
-                        op_number: operation.op_number,
-                        digest: operation.digest,
-                    },
-                    body_bytes: operation.body.len(),
-                });
-            }
-            offset = usize::try_from(group.end_offset).map_err(|_| HistoryError::Capacity)?;
-            loaded.next_group_number = loaded
-                .next_group_number
-                .checked_add(1)
-                .ok_or(CodecError::InvalidGroupNumber)?;
-            loaded.next_chain = group.next_chain;
-            loaded.digest.push(group.digest);
-            loaded.groups += 1;
+            offset = self.extend_group(&mut loaded, offset)?;
         }
         let expected = self
             .pin
@@ -580,6 +331,68 @@ impl<S: Source> HistoryState<S> {
         }
         loaded.valid_bytes = offset as u64;
         self.loaded = Some(loaded);
+        Ok(())
+    }
+
+    /// Decode, check, and index the group at `offset`; return its end.
+    fn extend_group(
+        &mut self,
+        loaded: &mut LoadedSegment,
+        offset: usize,
+    ) -> Result<usize, HistoryError> {
+        if loaded.groups == self.decode.max_groups {
+            return Err(CodecError::LimitExceeded {
+                kind: "physical group count",
+                actual: loaded.groups + 1,
+                limit: self.decode.max_groups,
+            }
+            .into());
+        }
+        let group = decode_group(
+            &loaded.header,
+            crate::GroupStart::new(loaded.next_group_number, offset as u64, loaded.next_chain),
+            &self.bytes[offset..],
+            self.decode,
+        )?;
+        for operation in &group.operations {
+            self.admit_extended(loaded, operation)?;
+            push_indexed(&mut self.entries, self.entry_limit, operation)?;
+        }
+        let end = usize::try_from(group.end_offset).map_err(|_| HistoryError::Capacity)?;
+        loaded.next_group_number = loaded
+            .next_group_number
+            .checked_add(1)
+            .ok_or(CodecError::InvalidGroupNumber)?;
+        loaded.next_chain = group.next_chain;
+        loaded.digest.push(group.digest);
+        loaded.groups += 1;
+        Ok(end)
+    }
+
+    /// Admit one new operation: it must match the captured epoch and view and
+    /// carry a valid body. Its body is charged to the segment decoded-body limit.
+    fn admit_extended(
+        &self,
+        loaded: &mut LoadedSegment,
+        operation: &DecodedOperation<'_>,
+    ) -> Result<(), HistoryError> {
+        if operation.configuration_epoch != self.configuration_epoch
+            || operation.original_view > self.promised_view
+        {
+            return Err(HistoryError::Source);
+        }
+        validate_operation_body(operation.kind, operation.body.as_ref(), self.operations)?;
+        loaded.decoded_body_bytes = loaded
+            .decoded_body_bytes
+            .checked_add(operation.body.len())
+            .ok_or(HistoryError::Capacity)?;
+        if loaded.decoded_body_bytes > self.decode.max_segment_decoded_body_bytes {
+            return Err(CodecError::SegmentDecodedBodyLimit {
+                actual: loaded.decoded_body_bytes,
+                limit: self.decode.max_segment_decoded_body_bytes,
+            }
+            .into());
+        }
         Ok(())
     }
 

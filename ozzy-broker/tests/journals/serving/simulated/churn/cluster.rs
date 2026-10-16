@@ -5,82 +5,83 @@ mod fresh;
 use ozzy_sim::broker::Cluster as MemoryCluster;
 
 #[tokio::test(flavor = "current_thread")]
-async fn repeated_recovery_reclaims_old_segments_and_preserves_selected_payloads() {
-    for policy in [Confirmation::DiskQuorum, Confirmation::ReplicatedPersisting] {
-        let mut cluster = MemoryCluster::new(policy).await;
-        let mut client =
-            SdkClient::open_with_runtime(&cluster.configs[0].0, &cluster.runtime).await;
-        for wave in 0..4 {
-            let pending = live_many(
-                &cluster.brokers,
-                "seed repeated recovery",
-                client.queue_varied(wave),
-            )
-            .await;
-            live_many(
-                &cluster.brokers,
-                "confirm repeated recovery",
-                client.confirm(pending),
-            )
-            .await;
-            let image = cluster.controls[2].image().await;
-            let old = cluster.configs[2]
-                .0
-                .plan
-                .partitions
-                .iter()
-                .flat_map(|partition| {
-                    super::super::retention::selected(&image, &partition.directory)
-                        .segments
-                        .into_iter()
-                        .map(move |segment| {
-                            let name = if segment.file_generation == 0 {
-                                format!("{}.log", segment.segment_id)
-                            } else {
-                                format!("{}.{}.log", segment.segment_id, segment.file_generation)
-                            };
-                            partition.directory.join("segments").join(name)
-                        })
-                })
-                .collect::<Vec<_>>();
-            assert_ne!(old.len(), 0);
-            drop(image);
-            cluster.restart(2).await;
-            cluster.wait_recovered(2).await;
-            live_many(
-                &cluster.brokers,
-                "reclaim unselected recovery segments",
-                async {
-                    loop {
-                        let image = cluster.controls[2].image().await;
-                        if old.iter().all(|path| !image.exists(path, false)) {
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(20)).await;
-                    }
-                },
-            )
-            .await;
-            live_many(
-                &cluster.brokers,
-                "verify selected recovery payloads",
-                client.replay(),
-            )
-            .await;
-        }
-        live_many(
+async fn disk_quorum_repeated_recovery_reclaims_old_segments_and_preserves_selected_payloads() {
+    repeated_recovery().await;
+}
+
+async fn repeated_recovery() {
+    let mut cluster = MemoryCluster::new(DeploymentMode::Three).await;
+    let mut client = SdkClient::open_with_runtime(&cluster.configs[0].0, &cluster.runtime).await;
+    for wave in 0..4 {
+        let pending = live_many(
             &cluster.brokers,
-            "close repeated recovery SDK",
-            client.close(),
+            "seed repeated recovery",
+            client.queue_varied(wave),
         )
         .await;
-        cluster.shutdown().await;
+        live_many(
+            &cluster.brokers,
+            "confirm repeated recovery",
+            client.confirm(pending),
+        )
+        .await;
+        let image = cluster.controls[2].image().await;
+        let old = cluster.configs[2]
+            .0
+            .plan
+            .partitions
+            .iter()
+            .flat_map(|partition| {
+                super::super::retention::selected(&image, &partition.directory)
+                    .segments
+                    .into_iter()
+                    .map(move |segment| {
+                        let name = if segment.file_generation == 0 {
+                            format!("{}.log", segment.segment_id)
+                        } else {
+                            format!("{}.{}.log", segment.segment_id, segment.file_generation)
+                        };
+                        partition.directory.join("segments").join(name)
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_ne!(old.len(), 0);
+        drop(image);
+        cluster.restart(2).await;
+        cluster.wait_recovered(2).await;
+        live_many(
+            &cluster.brokers,
+            "reclaim unselected recovery segments",
+            async {
+                loop {
+                    let image = cluster.controls[2].image().await;
+                    if old.iter().all(|path| !image.exists(path, false)) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            },
+        )
+        .await;
+        live_many(
+            &cluster.brokers,
+            "verify selected recovery payloads",
+            client.replay(),
+        )
+        .await;
     }
+    live_many(
+        &cluster.brokers,
+        "close repeated recovery SDK",
+        client.close(),
+    )
+    .await;
+    cluster.shutdown().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn repeated_multipartition_attachments_reuse_sdk_capacity_with_a_live_reader() {
-    let cluster = MemoryCluster::new(Confirmation::ReplicatedPersisting).await;
+    let cluster = MemoryCluster::new(DeploymentMode::Three).await;
     let mut client = SdkClient::open_with_runtime(&cluster.configs[0].0, &cluster.runtime).await;
     let mut reader = live_many(
         &cluster.brokers,
@@ -130,7 +131,7 @@ async fn repeated_multipartition_attachments_reuse_sdk_capacity_with_a_live_read
 
 #[tokio::test(flavor = "current_thread")]
 async fn restart_during_unfinished_recovery_resumes_the_nonvoting_store() {
-    let mut cluster = MemoryCluster::new(Confirmation::ReplicatedPersisting).await;
+    let mut cluster = MemoryCluster::new(DeploymentMode::Three).await;
     let mut client = SdkClient::open_with_runtime(&cluster.configs[0].0, &cluster.runtime).await;
     let pending = live_many(
         &cluster.brokers,

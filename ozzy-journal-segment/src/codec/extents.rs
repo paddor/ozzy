@@ -2,8 +2,8 @@
 //! until synchronous I/O completes, instead of copying them into physical output.
 
 use super::{
-    CanonicalOperation, CodecError, ENTRY_HEADER_BYTES, PreparedEntry, PreparedGroupBodies,
-    SmallVec, encoded_entry_len,
+    CodecError, ENTRY_HEADER_BYTES, PreparedGroupBodies, SmallVec, encode::PreparedEntry,
+    entry::encoded_entry_len,
 };
 
 pub(crate) fn prepare_raw_group_extents<'a>(
@@ -63,9 +63,10 @@ impl PreparedGroupBodies {
 
     /// Only use after finalization validates every operation and adds the seal.
     /// No owned slice table or body owner clones are constructed.
+    #[cfg(test)]
     pub(crate) fn extents<'a>(
         &'a self,
-        operations: &'a [CanonicalOperation<'a>],
+        operations: &'a [crate::CanonicalOperation<'a>],
     ) -> impl Iterator<Item = &'a [u8]> {
         const PADDING: [u8; 8] = [0; 8];
         let entries = self

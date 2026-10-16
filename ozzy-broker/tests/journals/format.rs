@@ -6,12 +6,7 @@ use ozzy_io::Local;
 async fn explicit_formatter_initializes_symmetric_shards_and_restart_keeps_election_fencing() {
     for mode in [DeploymentMode::Single, DeploymentMode::Three] {
         let temporary = tempfile::tempdir().unwrap();
-        let policy = if mode == DeploymentMode::Single {
-            Confirmation::LocalDurable
-        } else {
-            Confirmation::DiskQuorum
-        };
-        for (checked, local, journals) in fixture(temporary.path(), mode, policy, 6) {
+        for (checked, local, journals) in fixture(temporary.path(), mode, 6) {
             for device in checked.deployment.deployment().brokers[&checked.plan.name]
                 .devices
                 .values()
@@ -20,6 +15,17 @@ async fn explicit_formatter_initializes_symmetric_shards_and_restart_keeps_elect
             }
             initialize_volumes(&checked, &local).unwrap();
             format_partition_journals(&checked, &local).await.unwrap();
+            // A local store appends to segment 1 first; a replicated one
+            // installs its log into the spare at its first election.
+            let zeroed = if mode == DeploymentMode::Single {
+                "segments/1.log"
+            } else {
+                "segments/spare.log"
+            };
+            for partition in &journals.partitions {
+                let path = partition.placement.directory.join(zeroed);
+                assert_eq!(std::fs::metadata(path).unwrap().len(), 1024 * 1024);
+            }
             let (devices, lanes) = DevicePools::start(&checked.plan).unwrap();
             let lanes: BTreeMap<_, _> = lanes
                 .into_iter()
@@ -55,14 +61,9 @@ async fn explicit_formatter_initializes_symmetric_shards_and_restart_keeps_elect
 #[tokio::test]
 async fn mixed_established_and_absent_stores_are_rejected_before_formatting() {
     let temporary = tempfile::tempdir().unwrap();
-    let (checked, local, _) = fixture(
-        temporary.path(),
-        DeploymentMode::Single,
-        Confirmation::LocalDurable,
-        2,
-    )
-    .pop()
-    .unwrap();
+    let (checked, local, _) = fixture(temporary.path(), DeploymentMode::Single, 2)
+        .pop()
+        .unwrap();
     let root = &checked.deployment.deployment().brokers[&checked.plan.name].devices["ssd"].root;
     std::fs::create_dir(root).unwrap();
     initialize_volumes(&checked, &local).unwrap();
@@ -79,14 +80,9 @@ async fn mixed_established_and_absent_stores_are_rejected_before_formatting() {
 async fn symlink_hierarchy_directory_is_rejected_without_touching_its_target() {
     for relative in ["topics", "topics/orders", "topics/orders/partitions"] {
         let temporary = tempfile::tempdir().unwrap();
-        let (checked, local, _) = fixture(
-            temporary.path(),
-            DeploymentMode::Single,
-            Confirmation::LocalDurable,
-            2,
-        )
-        .pop()
-        .unwrap();
+        let (checked, local, _) = fixture(temporary.path(), DeploymentMode::Single, 2)
+            .pop()
+            .unwrap();
         let root = &checked.deployment.deployment().brokers[&checked.plan.name].devices["ssd"].root;
         std::fs::create_dir(root).unwrap();
         initialize_volumes(&checked, &local).unwrap();

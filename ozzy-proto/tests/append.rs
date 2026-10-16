@@ -1,7 +1,18 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
+
 use ozzy_proto::append::{
     Append, AppendKey, Appended, Authority, DataLimits, OpPosition, PayloadEncoding, Policy,
-    Record, decode_append, decode_append_with_scratch, decode_appended, encode_append,
-    encode_append_metadata, encode_appended, encode_prepared_append_metadata, validate_append,
+    PreparedPayload, Record, decode_append, decode_append_with_scratch, decode_appended,
+    encode_append, encode_append_metadata, encode_appended, encode_prepared_append_metadata,
+    validate_append,
 };
 use ozzy_proto::{Envelope, EnvelopeLimits, Opcode, Packet, decode_packet};
 use ozzy_proto::{
@@ -55,7 +66,7 @@ fn appended_wire_identifies_exact_offsets_policy_and_log_position() {
     assert_eq!(metadata.len(), 178);
     assert_eq!(&metadata[89..97], &9_u64.to_be_bytes());
     assert_eq!(&metadata[97..101], &2_u32.to_be_bytes());
-    assert_eq!(metadata[101], 5);
+    assert_eq!(metadata[101], 2);
     assert_eq!(&metadata[102..110], &11_u64.to_be_bytes());
     assert_eq!(&metadata[110..142], &[12; 32]);
     assert_eq!(&metadata[142..146], &2_u32.to_be_bytes());
@@ -117,7 +128,7 @@ fn append_wire_preserves_multipart_identity_without_assigned_offsets() {
     expected.extend_from_slice(&[6; 16]);
     expected.extend_from_slice(&4_u64.to_be_bytes());
     expected.extend_from_slice(&5_u64.to_be_bytes());
-    expected.push(5);
+    expected.push(2);
     expected.push(0);
     expected.extend_from_slice(&4_u32.to_be_bytes());
     expected.extend_from_slice(&1_u32.to_be_bytes());
@@ -166,7 +177,7 @@ fn append_metadata_reuses_owned_payload_without_changing_wire_or_capacity() {
             producer_epoch: 4,
             first_sequence: 5,
         },
-        policy: Policy::QuorumReplicatedPersisting,
+        policy: Policy::QuorumDurable,
         records: &records,
     };
     let limits = DataLimits::default();
@@ -229,8 +240,10 @@ fn compressed_group_validates_once_and_restores_clear_record_boundaries() {
         envelope(),
         append,
         &mut metadata,
-        PayloadEncoding::Lz4,
-        encoded.len(),
+        PreparedPayload {
+            encoding: PayloadEncoding::Lz4,
+            encoded_bytes: encoded.len(),
+        },
         limits,
     )
     .unwrap();
@@ -294,8 +307,10 @@ fn compressed_group_rejects_bad_codec_lengths_syntax_and_trailing_input() {
         envelope(),
         append,
         &mut metadata,
-        PayloadEncoding::Lz4,
-        encoded.len(),
+        PreparedPayload {
+            encoding: PayloadEncoding::Lz4,
+            encoded_bytes: encoded.len(),
+        },
         limits,
     )
     .unwrap();
@@ -397,8 +412,10 @@ fn compressed_group_rejects_bad_codec_lengths_syntax_and_trailing_input() {
             envelope(),
             append,
             &mut metadata,
-            PayloadEncoding::Lz4,
-            body.len(),
+            PreparedPayload {
+                encoding: PayloadEncoding::Lz4,
+                encoded_bytes: body.len(),
+            },
             limits,
         )
         .is_err()

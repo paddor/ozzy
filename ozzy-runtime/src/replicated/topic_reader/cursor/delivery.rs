@@ -1,13 +1,16 @@
 //! Private delivery buffers and individual checkpoint advancement.
 
 use super::{
-    BrokerLinkError, BrokerLinks, Bytes, Context, Cursor, Decoder, Duration, FrameRecords, Message,
+    BrokerLinkError, BrokerLinks, Context, Cursor, Decoder, Duration, FrameRecords, Message,
     Offset, Publication, Replayed, TopicReaderError, TopicRecord, TopicRoutes, reader,
 };
+use crate::transport::Frames;
 use ozzy_core::live::CursorError;
 use ozzy_proto::Opcode;
 
 impl Cursor {
+    // Inlined into `poll`: runs once per delivered record.
+    #[inline]
     pub(super) fn deliver(
         &mut self,
         links: &BrokerLinks,
@@ -24,7 +27,7 @@ impl Cursor {
         let partition = routes
             .metadata()
             .partition(self.number)
-            .expect("checked partition");
+            .ok_or(TopicReaderError::Configuration)?;
         let offset = self.next;
         self.next = self.next.checked_add(1).ok_or(BrokerLinkError::Response)?;
         if self.pending_live {
@@ -52,7 +55,9 @@ impl Cursor {
         cx: &mut Context<'_>,
     ) -> Result<(), TopicReaderError> {
         let (broker, session, selected) = self.selected.ok_or(BrokerLinkError::Session)?;
-        let frames = frames(message);
+        let (_, frames) = message
+            .routed_packet_bytes()
+            .ok_or(BrokerLinkError::Response)?;
         let limits = links.reader_parameters().receive;
         let packet =
             ozzy_proto::decode_packet(&frames.each_ref().map(AsRef::as_ref), limits.envelope)
@@ -61,31 +66,7 @@ impl Cursor {
             return Ok(());
         }
         if packet.envelope.opcode == Opcode::Nack {
-            let nack =
-                ozzy_proto::nack::decode(packet, limits.envelope).map_err(BrokerLinkError::from)?;
-            if nack.code == 14 && nack.detail.len() == 8 {
-                return Err(TopicReaderError::RetentionGap {
-                    partition: self.number,
-                    earliest: Offset::new(u64::from_be_bytes(
-                        nack.detail.try_into().expect("eight bytes"),
-                    )),
-                });
-            }
-            if matches!(
-                nack.retry,
-                ozzy_proto::nack::RetryClass::AfterAuthorityRefresh
-                    | ozzy_proto::nack::RetryClass::AfterBackoff
-                    | ozzy_proto::nack::RetryClass::UnknownOutcome
-            ) {
-                self.reset();
-                return Ok(());
-            }
-            return Err(BrokerLinkError::Rejected {
-                code: nack.code,
-                retry: nack.retry,
-                hint: None,
-            }
-            .into());
+            return self.replay_nack(packet, limits.envelope);
         }
         let delivery =
             reader::decode_owned_records(packet, &frames[1], &frames[2], limits, &mut self.decode)
@@ -113,15 +94,56 @@ impl Cursor {
         if decision == Replayed::Ignore {
             return Ok(());
         }
-        self.pending = Some(FrameRecords::new(delivery.records, message).into_batch(0));
+        self.pending = Some(
+            FrameRecords::new(
+                delivery.records,
+                delivery.payload_encoding,
+                frames[0].clone(),
+            )
+            .into_batch(0),
+        );
         self.pending_live = false;
-        if let Replayed::DeliverThenHeld { skip } = decision {
-            let held = self.held.take().expect("held publication");
+        if let Replayed::DeliverThenHeld { skip } = decision
+            && let Some(held) = self.held.take()
+        {
             self.ready = skip.map(|skip| held.into_batch(skip));
         }
-        self.due = now + self.refresh;
+        self.due = now.saturating_add(self.refresh);
         cx.waker().wake_by_ref();
         Ok(())
+    }
+
+    /// A replay NACK. A retention gap fails the read, a retryable refusal
+    /// reopens exact history, and anything else is a rejection.
+    fn replay_nack(
+        &mut self,
+        packet: ozzy_proto::Packet<'_>,
+        limits: ozzy_proto::EnvelopeLimits,
+    ) -> Result<(), TopicReaderError> {
+        let nack = ozzy_proto::nack::decode(packet, limits).map_err(BrokerLinkError::from)?;
+        if nack.code == 14
+            && let Ok(earliest) = <[u8; 8]>::try_from(nack.detail)
+        {
+            return Err(TopicReaderError::RetentionGap {
+                partition: self.number,
+                earliest: Offset::new(u64::from_be_bytes(earliest)),
+            });
+        }
+        if matches!(
+            nack.retry,
+            ozzy_proto::nack::RetryClass::AfterAuthorityRefresh
+                | ozzy_proto::nack::RetryClass::AfterBackoff
+                | ozzy_proto::nack::RetryClass::UnknownOutcome
+        ) {
+            self.reset();
+            return Ok(());
+        }
+        Err(BrokerLinkError::Rejected {
+            code: nack.code,
+            retry: nack.retry,
+            hint: None,
+        }
+        .into())
     }
 
     pub(super) fn publication(
@@ -134,7 +156,9 @@ impl Cursor {
         if links.session(broker) != Some(session) {
             return Ok(());
         }
-        let frames = frames(message);
+        let Some((_, frames)) = message.routed_packet_bytes() else {
+            return Ok(());
+        };
         let limits = links.reader_parameters().receive;
         let Ok(packet) =
             ozzy_proto::decode_packet(&frames.each_ref().map(AsRef::as_ref), limits.envelope)
@@ -155,6 +179,7 @@ impl Cursor {
         ) else {
             return Ok(());
         };
+        let live = self.live.replay().is_none();
         match self
             .live
             .publication(
@@ -166,23 +191,27 @@ impl Cursor {
         {
             Publication::Drop => {}
             Publication::Hold => {
-                self.held = Some(FrameRecords::new(delivery.records, message));
+                self.live_gaps += u64::from(live);
+                self.held = Some(FrameRecords::new(
+                    delivery.records,
+                    delivery.payload_encoding,
+                    frames[0].clone(),
+                ));
                 // A known gap needs repair now, independent of quiet refresh.
                 self.due = now;
             }
             Publication::Deliver { skip } => {
-                self.pending = Some(FrameRecords::new(delivery.records, message).into_batch(skip));
+                self.pending = Some(
+                    FrameRecords::new(
+                        delivery.records,
+                        delivery.payload_encoding,
+                        frames[0].clone(),
+                    )
+                    .into_batch(skip),
+                );
                 self.pending_live = true;
             }
         }
         Ok(())
     }
-}
-
-fn frames(message: &Message) -> [Bytes; 3] {
-    std::array::from_fn(|i| {
-        message
-            .part_bytes(i + 1)
-            .expect("registry validates four frames")
-    })
 }

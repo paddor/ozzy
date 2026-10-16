@@ -2,8 +2,8 @@
 //! prefix has expired. Replies are hints only: withdrawal still persists the
 //! nonvoting marker and uses the ordinary two-copy recovery gates.
 
-use super::{ActorError, Duration, Message, Prefix, ReplicaActor, SendClass, wire};
-use bytes::Bytes;
+use super::deadline::Earliest;
+use super::{ActorError, Duration, Prefix, ReplicaActor, SendClass, wire};
 use ozzy_replication::{
     recovery::RecoveryResponse,
     wire::{RecoveryRequest, RecoveryState},
@@ -19,6 +19,11 @@ pub(super) struct Probe {
 }
 
 impl Probe {
+    /// Add its answer deadline and next retry.
+    pub(super) fn deadlines(&self, next: Earliest) -> Earliest {
+        next.at(self.deadline).at(self.retry_at)
+    }
+
     pub(super) fn new(request: RecoveryRequest, accepted: Prefix) -> Self {
         Self {
             request,
@@ -89,11 +94,7 @@ impl ReplicaActor {
                     &mut self.metadata,
                     self.wire_limits,
                 )?;
-                let message = Message::multipart([
-                    Bytes::copy_from_slice(&encoded.header),
-                    Bytes::copy_from_slice(&self.metadata[..encoded.metadata_bytes]),
-                    Bytes::new(),
-                ]);
+                let message = super::control_message(encoded, &self.metadata);
                 self.enqueue(peer, SendClass::Control, message)?;
             }
         }

@@ -91,6 +91,7 @@ fn minimum_and_large_record_profiles_fit_the_broker_receive_declaration() {
                         data_peer: "tcp://127.0.0.1:40002".into(),
                         reader_pub: "tcp://127.0.0.1:40001".into(),
                         follower_pub: None,
+                        admin: None,
                     },
                 }])
                 .unwrap();
@@ -196,6 +197,7 @@ async fn start(size: &str) -> (Config, tempfile::TempDir, ozzy_broker::Broker, S
                 data_peer: format!("tcp://{}", reservations[2].local_addr().unwrap()),
                 reader_pub: format!("tcp://{}", reservations[1].local_addr().unwrap()),
                 follower_pub: None,
+                admin: None,
             },
         }])
         .unwrap();

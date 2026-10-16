@@ -9,6 +9,7 @@
 //! PEER socket with bounded HWM and `router_mandatory(true)`, and independently
 //! bind configured voters to authenticated sessions before interpreting traffic.
 
+use crate::transport::Frames;
 use std::collections::VecDeque;
 use std::future::{Future, pending, poll_fn};
 use std::task::Poll;
@@ -117,6 +118,11 @@ pub(crate) struct Queue {
 }
 
 impl Queue {
+    /// Whether one more message of `bytes` exceeds the count or byte bound.
+    pub(crate) fn lacks_room(&self, bytes: usize) -> bool {
+        self.messages.len() == self.limits.messages || bytes > self.limits.bytes - self.bytes
+    }
+
     /// Compare exact frames, optionally excluding a stored routing prefix.
     pub(crate) fn contains(&self, message: &Message, skip: usize) -> bool {
         self.messages.iter().any(|(held, _)| {
@@ -197,9 +203,12 @@ impl ReplicaOutbox {
         control: QueueLimits,
         data: QueueLimits,
     ) -> Result<Self, OutboxError> {
-        if !configured.contains(&local) {
+        // Exactly two remotes means the local node appears exactly once.
+        let mut remotes = configured.iter().copied().filter(|&node| node != local);
+        let (Some(first), Some(second), None) = (remotes.next(), remotes.next(), remotes.next())
+        else {
             return Err(OutboxError::LocalVoter);
-        }
+        };
         // At most 2 * (3 * control.message_bytes + data.message_bytes) per round.
         control
             .message_bytes
@@ -207,9 +216,7 @@ impl ReplicaOutbox {
             .and_then(|bytes| bytes.checked_add(data.message_bytes))
             .and_then(|bytes| bytes.checked_mul(2))
             .ok_or(OutboxError::Limits)?;
-        let mut voters = configured.iter().copied().filter(|&node| node != local);
-        let mut peer = || -> Result<Peer, OutboxError> {
-            let node = voters.next().expect("two other configured voters");
+        let peer = |node: NodeId| -> Result<Peer, OutboxError> {
             Ok(Peer {
                 node,
                 route: Bytes::copy_from_slice(node.as_bytes()),
@@ -231,7 +238,7 @@ impl ReplicaOutbox {
             })
         };
         Ok(Self {
-            peers: [peer()?, peer()?],
+            peers: [peer(first)?, peer(second)?],
         })
     }
 
@@ -255,9 +262,9 @@ impl ReplicaOutbox {
         };
         if message.len() != 3
             && !(class == SendClass::Receipt
-                && message.len() == 1
-                && ozzy_replication::wire::CompactState::decode(message.part_slice(0).unwrap())
-                    .is_ok())
+                && message.frames().is_some_and(|[state]| {
+                    ozzy_replication::wire::CompactState::decode(state).is_ok()
+                }))
         {
             return Err((EnqueueError::Frames, message));
         }
@@ -275,8 +282,7 @@ impl ReplicaOutbox {
             queue.messages.clear();
             queue.bytes = 0;
         }
-        if queue.messages.len() == queue.limits.messages || bytes > queue.limits.bytes - queue.bytes
-        {
+        if queue.lacks_room(bytes) {
             return Err((EnqueueError::Full, message));
         }
         queue
@@ -435,7 +441,7 @@ pub enum EnqueueError {
 /// Outbox construction failure before any traffic or storage side effect.
 #[derive(Debug, thiserror::Error)]
 pub enum OutboxError {
-    /// Local node must belong to the immutable configuration.
+    /// Local node must appear exactly once in the immutable configuration.
     #[error("local node is not a configured voter")]
     LocalVoter,
     /// Empty, contradictory, or overflowing queue/scheduling bounds.

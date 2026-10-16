@@ -12,4 +12,3 @@ root = "/var/lib/ozzy/data"
 controller = "my_controller" # Logical storage pool label, not an OS device.
 
 [topics.orders]
-confirmation = "local-durable"

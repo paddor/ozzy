@@ -3,50 +3,39 @@
 use std::{cell::RefCell, sync::Arc};
 
 use bytes::Bytes;
-use tokio::sync::mpsc;
+use futures::task::AtomicWaker;
 
-use crate::signal::DataSignal;
+use crate::returning::{Lent, ReturnSlot};
 
 /// The connection never allocates a replacement while transport holds its body.
 #[derive(Debug)]
-pub(crate) struct Payload {
-    body: RefCell<Option<Vec<u8>>>,
-    returned: RefCell<mpsc::Receiver<Vec<u8>>>,
-    return_to: mpsc::Sender<Vec<u8>>,
-    work: Arc<DataSignal>,
-}
+pub(crate) struct Payload(RefCell<Lent<Vec<u8>, AtomicWaker>>);
 
 impl Payload {
-    pub(crate) fn notifying(capacity: usize, work: Arc<DataSignal>) -> Self {
-        let (return_to, returned) = mpsc::channel(1);
-        Self {
-            body: RefCell::new(Some(Vec::with_capacity(capacity))),
-            returned: RefCell::new(returned),
-            return_to,
-            work,
-        }
+    pub(crate) fn waking(capacity: usize, wake: Arc<AtomicWaker>) -> Self {
+        Self(RefCell::new(Lent::new(Vec::with_capacity(capacity), wake)))
     }
 
+    /// Lend the body. The lease reserves its return slot now, so dropping it
+    /// cannot fail.
     pub(crate) fn try_take(&self) -> Option<Lease> {
-        self.body
-            .borrow_mut()
-            .take()
-            .or_else(|| self.returned.borrow_mut().try_recv().ok())
-            .map(|body| Lease {
-                body,
-                return_to: self.return_to.clone(),
-                work: self.work.clone(),
-                transmitted: false,
-            })
+        let (mut body, slot) = self.0.borrow_mut().try_lend()?;
+        body.clear();
+        Some(Lease {
+            body,
+            slot: Some(slot),
+            transmitted: false,
+        })
     }
 }
 
 /// Returns on encode failure, canceled send, or the last immutable frame drop.
+/// Only a transmitted body wakes the owner: the others return during its own
+/// visit.
 #[derive(Debug)]
 pub(crate) struct Lease {
     pub(crate) body: Vec<u8>,
-    return_to: mpsc::Sender<Vec<u8>>,
-    work: Arc<DataSignal>,
+    slot: Option<ReturnSlot<Vec<u8>, AtomicWaker>>,
     transmitted: bool,
 }
 
@@ -88,16 +77,8 @@ impl AsRef<[u8]> for Lease {
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        self.body.clear();
-        let body = std::mem::take(&mut self.body);
-        match self.return_to.try_send(body) {
-            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                panic!("single payload return slot overflowed")
-            }
-        }
-        if self.transmitted {
-            self.work.mark();
+        if let Some(slot) = self.slot.take() {
+            slot.send(std::mem::take(&mut self.body), self.transmitted);
         }
     }
 }

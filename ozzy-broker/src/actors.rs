@@ -9,10 +9,14 @@ use ozzy_runtime::{
         ActorConfig, ActorIds, LocalActor, LocalActorConfig, PartitionActor, ProposalSubmitter,
         ReplicaActor, ScheduledReplica, SyncBatchTarget,
     },
-    replica_journal::{InstallationConfig, ProposalBuffer, ShardJournalConfig},
+    replica_journal::{InstallationConfig, OwnedConfig, ProposalBuffer, ShardJournalConfig},
     replica_transport::QueueLimits,
 };
 use std::{collections::BTreeMap, time::Duration};
+
+/// Quiet time before a partition with no write in flight publishes `DURABLE`.
+/// Votes and confirmations never wait for it.
+const EVIDENCE_QUIET: Duration = Duration::from_millis(20);
 
 /// Native per-partition work bounds. Shared shard memory admission bounds
 /// aggregate live work. Replicated session entries are filled
@@ -78,6 +82,9 @@ pub(crate) fn prepare_partition(
             topic: &placement.topic,
             partition_id: PartitionId::new(placement.partition),
             owner_epoch: OwnerEpoch::INITIAL,
+            dedup_window_millis: placement
+                .deduplication
+                .and_then(|policy| std::num::NonZeroU64::new(policy.window_millis)),
             retention: RetentionPolicy {
                 max_age_millis: placement
                     .retention
@@ -106,53 +113,24 @@ impl ActorSettings {
         let retention_interval = (placement.retention.max_age_secs.is_some()
             || placement.retention.max_bytes.is_some())
         .then_some(Duration::from_secs(1));
-        let JournalConfig::Replicated(config) = config else {
-            let JournalConfig::Local(config) = config else {
-                unreachable!()
-            };
-            return Ok(Self::Local(LocalActorConfig {
-                retention_interval,
-                journal,
-                proposal_lanes: 2,
-                proposal_capacity: config.append_limits.max_operations,
-                turn_steps: 16,
-            }));
+        let config = match config {
+            JournalConfig::Replicated(config) => config,
+            JournalConfig::Local(config) => {
+                return Ok(Self::Local(LocalActorConfig {
+                    retention_interval,
+                    journal,
+                    proposal_lanes: 3,
+                    proposal_capacity: config.append_limits.max_operations,
+                    turn_steps: 16,
+                    evidence_quiet: EVIDENCE_QUIET,
+                }));
+            }
         };
-        // Every broker reads the same document. A common packet profile must
-        // fit even the smallest shard budget, independent of local CPU count or
-        // partition placement. Shard-local pipeline sizes can still differ.
-        let operations = checked
-            .deployment
-            .deployment()
-            .brokers
-            .values()
-            .flat_map(|broker| &broker.topology.shards)
-            .map(|shard| shard.budget.append_slots)
-            .fold(64, usize::min);
         let pipeline = config.append_limits;
         let replay_cache = replay_cache_limits(checked, placement, pipeline)?;
-        if operations == 0 || operations > pipeline.max_operations {
-            return Err(StartupError::Runtime(
-                "common replica transfer exceeds local pipeline".into(),
-            ));
-        }
-        let transfer = PipelineLimits {
-            max_operations: operations,
-            max_body_bytes: pipeline.max_body_bytes,
-        };
-        let message_bytes = ozzy_replication::wire::WireLimits::for_transfer(
-            transfer.max_operations,
-            transfer.max_body_bytes,
-        )
-        .and_then(ozzy_replication::wire::WireLimits::message_bytes)
-        .ok_or_else(|| StartupError::Runtime("replica packet bound overflow".into()))?;
-        let queue_bytes = message_bytes
-            .checked_mul(4)
-            .ok_or_else(|| StartupError::Runtime("replica queue bound overflow".into()))?;
-        let segment_capacity = config.limits.io.max_segment_bytes;
-        let max_staged_bytes = segment_capacity
-            .checked_mul(config.limits.metadata.max_segments as u64)
-            .ok_or_else(|| StartupError::Runtime("replica installation bound overflow".into()))?;
+        let transfer = common_transfer(checked, pipeline)?;
+        let data = data_queue(transfer)?;
+        let installation = installation_config(config)?;
         Ok(Self::Replicated {
             journal,
             actor: Box::new(ActorConfig {
@@ -173,28 +151,78 @@ impl ActorSettings {
                 replay_cache,
                 transfer,
                 sync_batch_target: SyncBatchTarget::half_window(pipeline),
-                sync_batch_max_age: Duration::from_millis(1),
-                proposal_lanes: 2,
+                evidence_quiet: EVIDENCE_QUIET,
+                proposal_lanes: 3,
                 proposal_capacity: pipeline.max_operations,
                 control: QueueLimits {
                     messages: 8,
                     bytes: 8192,
                     message_bytes: 1024,
                 },
-                data: QueueLimits {
-                    messages: 4,
-                    bytes: queue_bytes,
-                    message_bytes,
-                },
-                installation: InstallationConfig {
-                    segment_capacity,
-                    body_encoding: ozzy_journal_segment::BodyEncoding::Raw,
-                    max_staged_bytes,
-                    max_orphan_probes: 16,
-                },
+                data,
+                installation,
             }),
         })
     }
+}
+
+/// The replica transfer every broker can carry. Every broker reads the same
+/// document, so a common packet profile must fit even the smallest shard
+/// budget, independent of local CPU count or partition placement. Shard-local
+/// pipeline sizes can still differ.
+fn common_transfer(
+    checked: &CheckedConfig,
+    pipeline: PipelineLimits,
+) -> Result<PipelineLimits, StartupError> {
+    let operations = checked
+        .deployment
+        .deployment()
+        .brokers
+        .values()
+        .flat_map(|broker| &broker.topology.shards)
+        .map(|shard| shard.budget.append_slots)
+        .fold(64, usize::min);
+    if operations == 0 || operations > pipeline.max_operations {
+        return Err(StartupError::Runtime(
+            "common replica transfer exceeds local pipeline".into(),
+        ));
+    }
+    Ok(PipelineLimits {
+        max_operations: operations,
+        max_body_bytes: pipeline.max_body_bytes,
+    })
+}
+
+/// Replica data queue bounds: four messages of one full transfer each.
+fn data_queue(transfer: PipelineLimits) -> Result<QueueLimits, StartupError> {
+    let message_bytes = ozzy_replication::wire::WireLimits::for_transfer(
+        transfer.max_operations,
+        transfer.max_body_bytes,
+    )
+    .and_then(ozzy_replication::wire::WireLimits::message_bytes)
+    .ok_or_else(|| StartupError::Runtime("replica packet bound overflow".into()))?;
+    let bytes = message_bytes
+        .checked_mul(4)
+        .ok_or_else(|| StartupError::Runtime("replica queue bound overflow".into()))?;
+    Ok(QueueLimits {
+        messages: 4,
+        bytes,
+        message_bytes,
+    })
+}
+
+/// Snapshot installation bounds: a full segment directory of staged segments.
+fn installation_config(config: &OwnedConfig) -> Result<InstallationConfig, StartupError> {
+    let segment_capacity = config.limits.io.max_segment_bytes;
+    let max_staged_bytes = segment_capacity
+        .checked_mul(config.limits.metadata.max_segments as u64)
+        .ok_or_else(|| StartupError::Runtime("replica installation bound overflow".into()))?;
+    Ok(InstallationConfig {
+        segment_capacity,
+        body_encoding: ozzy_journal_segment::BodyEncoding::Raw,
+        max_staged_bytes,
+        max_orphan_probes: 16,
+    })
 }
 
 fn replay_cache_limits(
@@ -281,7 +309,7 @@ impl OpenedPartition {
                     .map_err(|failure| error(failure.to_string()))?;
                 let proposal = actor
                     .take_submitter()
-                    .expect("one configured proposal lane");
+                    .ok_or_else(|| error("partition proposal lane already taken".into()))?;
                 (PartitionActor::Local(Box::new(actor)), proposal, buffer)
             }
             (
@@ -311,7 +339,7 @@ impl OpenedPartition {
                     .map_err(|failure| error(failure.to_string()))?;
                 let proposal = actor
                     .take_submitter()
-                    .expect("one configured proposal lane");
+                    .ok_or_else(|| error("partition proposal lane already taken".into()))?;
                 let actor =
                     ScheduledReplica::new(actor).map_err(|failure| error(failure.to_string()))?;
                 (PartitionActor::Replicated(actor), proposal, buffer)

@@ -1,8 +1,11 @@
 //! Production cluster lifecycle and storage faults shared with the simulator.
-use super::{Control, deployment_with_resources, provision, start_image_selected, start_images};
+use super::{
+    Control, Memory, Shape, deployment_with_resources, provision, start_image_selected,
+    start_images,
+};
 use crate::client::Client;
 use ozzy_broker::{Broker, CheckedConfig, RecoveryIntent, RecoverySelection, ServingContext};
-use ozzy_config::{BrokerIdentity, Confirmation, DeploymentMode};
+use ozzy_config::{BrokerIdentity, DeploymentMode};
 use ozzy_io::simulation::Image;
 use ozzy_runtime::replicated::{SdkClock, TopicReader, WriterRuntime};
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -22,7 +25,7 @@ pub struct Cluster {
     pub controls: Vec<Arc<Control>>,
     /// Tasks yielding memory images after physical drain.
     pub images: Vec<tokio::task::JoinHandle<Image>>,
-    policy: Confirmation,
+    mode: DeploymentMode,
     context: ServingContext,
     retired_physical_events: u64,
     stopped: std::collections::BTreeMap<usize, Arc<Control>>,
@@ -32,13 +35,13 @@ pub struct Cluster {
 
 impl Cluster {
     /// Start a bounded four-partition cluster with rolling retention.
-    pub async fn new(policy: Confirmation) -> Self {
-        Self::configured(policy, None, |_| {}).await
+    pub async fn new(mode: DeploymentMode) -> Self {
+        Self::configured(mode, None, |_| {}).await
     }
 
     /// Configure the shared deployment and optionally step broker time manually.
     pub async fn configured(
-        policy: Confirmation,
+        mode: DeploymentMode,
         clock: Option<SdkClock>,
         configure: impl FnOnce(&mut ozzy_config::Deployment),
     ) -> Self {
@@ -55,14 +58,10 @@ impl Cluster {
         };
         let deployment = deployment_with_resources(
             &root,
-            match policy {
-                Confirmation::LocalDurable => DeploymentMode::Single,
-                Confirmation::DiskQuorum | Confirmation::ReplicatedPersisting => {
-                    DeploymentMode::Three
-                }
+            Shape {
+                mode,
+                partitions: 4,
             },
-            policy,
-            4,
             &resources,
             |config| {
                 config.topics.get_mut("orders").unwrap().retention = ozzy_config::TopicRetention {
@@ -80,7 +79,7 @@ impl Cluster {
             brokers,
             controls,
             images,
-            policy,
+            mode,
             context,
             retired_physical_events: 0,
             stopped: std::collections::BTreeMap::new(),
@@ -91,7 +90,7 @@ impl Cluster {
     /// Restore one stopped broker from its explicitly supplied memory image.
     pub async fn restore(&mut self, index: usize, image: Image) {
         let (checked, _) = &self.configs[index];
-        let selections: Vec<_> = if self.policy == Confirmation::LocalDurable {
+        let selections: Vec<_> = if self.mode == DeploymentMode::Single {
             vec![]
         } else {
             checked
@@ -128,9 +127,8 @@ impl Cluster {
             self.context.clone(),
             checked,
             local,
-            true,
-            image,
             selections,
+            Memory::new(image, true),
         )
         .await;
         self.brokers.insert(index, broker);
@@ -180,7 +178,7 @@ impl Cluster {
 
     /// Wait until every recovering partition has published its configuration.
     pub async fn wait_recovered(&self, index: usize) {
-        if self.policy == Confirmation::LocalDurable {
+        if self.mode == DeploymentMode::Single {
             return;
         }
         live_many(
@@ -254,7 +252,7 @@ impl Cluster {
         wave: usize,
     ) -> usize {
         let positions = client.positions();
-        let count = if wave % 6 == 2 && self.policy != Confirmation::LocalDurable {
+        let count = if wave % 6 == 2 && self.mode == DeploymentMode::Three {
             self.torn_wave(client, wave).await
         } else {
             if wave % 6 == 2 {

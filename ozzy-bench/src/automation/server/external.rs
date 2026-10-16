@@ -15,10 +15,15 @@ pub enum External {
 }
 
 impl External {
-    /// Start an Iggy deployment across the three configured placements.
-    pub fn distributed(root: &Path, placements: &[crate::placement::Placement; 3]) -> Result<Self> {
+    /// Start an Iggy deployment across the three configured placements for
+    /// a case lasting at most `lifetime`.
+    pub fn distributed(
+        root: &Path,
+        placements: &[crate::placement::Placement; 3],
+        lifetime: std::time::Duration,
+    ) -> Result<Self> {
         Ok(Self::Distributed(super::distributed::Iggy::start(
-            root, placements,
+            root, placements, lifetime,
         )?))
     }
     /// `cpus` holds one CPU list per broker.

@@ -1,12 +1,15 @@
+mod admission;
+mod commit;
+mod installation;
+
 use std::collections::VecDeque;
 
 use ozzy_journal::progress::{JournalProgress, JournalSnapshot};
 use ozzy_proto::NodeId;
 
 use crate::{
-    Commit, Configuration, JournalGeneration, OpNumber, PipelineLimits, Prefix, PrepareOk,
-    PreparedOperation, QuorumPolicy, ReplicationError, RetainedPrepareOk, Scope, SyncTicket,
-    WriteTicket,
+    Configuration, JournalGeneration, OpNumber, PipelineLimits, Prefix, PreparedOperation,
+    ReplicationError, Scope, SyncTicket, VoterIndex, Voters, WriteTicket,
 };
 
 /// Whether the normal protocol may emit votes, commit, or apply.
@@ -54,9 +57,18 @@ pub struct ReplicaSnapshot {
     pub pending_operations: usize,
     /// Live canonical body bytes reserved in the external payload adapter.
     pub pending_body_bytes: usize,
+    /// Operations above this number occupy the primary's live window: the
+    /// commit it announced or the released prefix, whichever is later.
+    pub live_base: OpNumber,
+    /// Descriptor and body capacity this role retains beyond its released prefix.
+    pub retained_limits: PipelineLimits,
     /// Installed/recovered suffix retained only in the journal, not the live
     /// descriptor ring. Fresh work waits until this entire tail is applied.
     pub journal_tail: Option<Prefix>,
+    /// Primary only: the highest operation each backup acknowledged.
+    pub backups: Option<[(NodeId, OpNumber); 2]>,
+    /// Highest commit the primary announced, as this replica knows it.
+    pub known_commit: OpNumber,
     /// Whether new operations may be admitted. Duplicates can still be retried
     /// while an installed primary reestablishes its selected-tail quorum. Entries
     /// inside a disk-backed tail require journal lookup, not descriptor retries.
@@ -73,7 +85,7 @@ pub struct ReplicaSnapshot {
 #[derive(Debug)]
 pub struct NormalReplica {
     configuration: Configuration,
-    local: usize,
+    local: VoterIndex,
     status: Status,
     journal: JournalProgress,
     limits: PipelineLimits,
@@ -85,7 +97,7 @@ pub struct NormalReplica {
     // Descriptors start after the applied prefix stored under the group policy.
     retained_base: Prefix,
     known_commit: OpNumber,
-    acknowledged: [OpNumber; 3],
+    acknowledged: Voters<OpNumber>,
     activation_tail: OpNumber,
     installed_view: Option<crate::StartView>,
     journal_tail: Option<Prefix>,
@@ -96,8 +108,8 @@ impl NormalReplica {
     pub const fn reclaimed_prefix(&self) -> Prefix {
         self.retained_base
     }
-    pub(crate) fn driver_identity(&self) -> (Configuration, NodeId) {
-        (self.configuration, self.configuration.voters[self.local])
+    pub(crate) const fn driver_identity(&self) -> (Configuration, VoterIndex) {
+        (self.configuration, self.local)
     }
 
     /// Consume normal-role ownership and immediately fence its decisions.
@@ -130,9 +142,16 @@ impl NormalReplica {
         {
             return Err(ReplicationError::InvalidLimits);
         }
+        // A later installed view can change the role; the ring then grows once.
+        let retained =
+            if configuration.primary(configuration.scope.view) == configuration.voter(local) {
+                limits
+            } else {
+                limits.backup()
+            };
         let mut operations = VecDeque::new();
         operations
-            .try_reserve_exact(limits.max_operations)
+            .try_reserve_exact(retained.max_operations)
             .map_err(|_| ReplicationError::Capacity)?;
         Ok(Self {
             configuration,
@@ -147,7 +166,7 @@ impl NormalReplica {
             applied: Prefix::GENESIS,
             retained_base: Prefix::GENESIS,
             known_commit: OpNumber(0),
-            acknowledged: [OpNumber(0); 3],
+            acknowledged: Voters::splat(OpNumber(0)),
             activation_tail: OpNumber(0),
             installed_view: None,
             journal_tail: None,
@@ -182,7 +201,7 @@ impl NormalReplica {
         self.applied = Prefix::GENESIS;
         self.retained_base = Prefix::GENESIS;
         self.known_commit = log.committed.op;
-        self.acknowledged = [OpNumber(0); 3];
+        self.acknowledged = Voters::splat(OpNumber(0));
         self.activation_tail = log.accepted.op;
         self.installed_view = None;
         self.journal_tail = (log.accepted != Prefix::GENESIS).then_some(log.accepted);
@@ -199,101 +218,48 @@ impl NormalReplica {
             applied: self.applied,
             pending_operations: self.operations.len(),
             pending_body_bytes: self.body_bytes,
+            live_base: self.live_base(),
+            retained_limits: self.retained_limits(),
             journal_tail: self.journal_tail,
+            backups: self.is_primary().then(|| {
+                self.local
+                    .others()
+                    .map(|voter| (self.configuration.voter(voter), self.acknowledged[voter]))
+            }),
+            known_commit: self.known_commit,
             ready_for_appends: self.ready_for_appends(),
         }
     }
 
-    /// Admit a validated local-primary proposal or authenticated backup prepare.
-    ///
-    /// The full slice is checked before any admission. Retransmissions may
-    /// overlap retained operations; identical entries do not consume capacity.
-    /// Missing earlier operations request catch-up; conflicting current history
-    /// faults this core. One call is bounded by the configured pipeline size.
-    pub fn prepare(
-        &mut self,
-        from: NodeId,
-        scope: Scope,
-        operations: &[PreparedOperation],
-    ) -> Result<Admission, ReplicationError> {
-        self.require_scope(scope)?;
-        self.require_primary(from)?;
-        if operations.is_empty() {
-            return Err(ReplicationError::EmptyPrepare);
-        }
-        if operations.len() > self.limits.max_operations {
-            return Err(ReplicationError::Capacity);
-        }
+    /// Operations above this number occupy the primary's live window.
+    fn live_base(&self) -> OpNumber {
+        self.known_commit.max(self.retained_base.op)
+    }
 
-        let mut predecessor = operations[0]
-            .prefix
-            .op
-            .0
-            .checked_sub(1)
-            .ok_or(ReplicationError::HistoryGap)
-            .and_then(|op| self.prefix_at(OpNumber(op)))?;
-        let mut first_new = operations.len();
-        let mut additional_bytes = 0usize;
-        for (index, operation) in operations.iter().enumerate() {
-            if operation.group_id != scope.group_id
-                || operation.configuration_epoch != scope.configuration_epoch
-                || operation.original_view > scope.view
-                || (operation.prefix.op > self.accepted.op && operation.original_view != scope.view)
-            {
-                return Err(ReplicationError::ScopeMismatch);
-            }
-            if predecessor.op.0.checked_add(1) != Some(operation.prefix.op.0) {
-                return Err(ReplicationError::HistoryGap);
-            }
-            if operation.previous_digest != predecessor.digest {
-                return Err(self.conflict());
-            }
-            if operation.prefix.op <= self.accepted.op {
-                if self.prefix_at(operation.prefix.op)? != operation.prefix {
-                    return Err(self.conflict());
-                }
-            } else {
-                first_new = first_new.min(index);
-                additional_bytes = additional_bytes
-                    .checked_add(operation.body_bytes)
-                    .ok_or(ReplicationError::Capacity)?;
-            }
-            predecessor = operation.prefix;
+    /// Descriptor and body capacity retained beyond the released prefix.
+    ///
+    /// The primary keeps one window in flight beyond its released prefix. A
+    /// backup releases only what the primary has announced committed, and its
+    /// own persistence can trail that announcement by a whole window while the
+    /// other backup confirms the primary's writes, so it retains two.
+    fn retained_limits(&self) -> PipelineLimits {
+        if self.is_primary() {
+            self.limits
+        } else {
+            self.limits.backup()
         }
-        if first_new == operations.len() {
-            return Ok(Admission::Duplicate);
-        }
-        if !self.ready_for_appends() {
-            return Err(ReplicationError::ActivationPending);
-        }
-        let new_count = operations.len() - first_new;
-        if new_count > self.limits.max_operations - self.operations.len()
-            || additional_bytes > self.limits.max_body_bytes - self.body_bytes
-        {
-            return Err(ReplicationError::Capacity);
-        }
-        let ticket = self.journal.admit(new_count as u64)?;
-        self.operations.extend(&operations[first_new..]);
-        self.body_bytes += additional_bytes;
-        self.accepted = predecessor;
-        Ok(Admission::Write { ticket, first_new })
     }
 
     /// Observe a complete local write. Page-cache completion casts no vote.
     pub fn complete_write(&mut self, ticket: WriteTicket) -> Result<(), ReplicationError> {
         self.journal.complete_write(ticket)?;
-        self.reclaim();
-        Ok(())
+        self.reclaim()
     }
 
-    /// Local prefix available for replay and releasing applied live capacity.
-    /// RAM-confirmed groups may use completed page-cache writes; disk groups
-    /// require synchronized writes. Neither boundary alone establishes a quorum.
+    /// Local synchronized prefix available for replay and releasing applied
+    /// live capacity. It alone never establishes a quorum.
     pub fn stored_through(&self) -> OpNumber {
-        match self.configuration.policy() {
-            QuorumPolicy::Durable => self.journal.snapshot().durable,
-            QuorumPolicy::Replicated => self.journal.snapshot().written,
-        }
+        self.journal.snapshot().durable
     }
 
     /// Capture the complete written prefix before submitting a disk barrier.
@@ -305,168 +271,15 @@ impl NormalReplica {
     /// Fenced completions update disk evidence but cannot advance commit.
     pub fn complete_sync(&mut self, ticket: SyncTicket) -> Result<(), ReplicationError> {
         self.journal.complete_sync(ticket)?;
-        self.advance_commit();
-        self.reclaim();
-        Ok(())
+        self.advance_commit()?;
+        self.reclaim()
     }
 
     /// Observe an adapter write that also synchronized its complete prefix.
     pub fn complete_durable_write(&mut self, ticket: WriteTicket) -> Result<(), ReplicationError> {
         self.journal.complete_durable_write(ticket)?;
-        self.advance_commit();
-        self.reclaim();
-        Ok(())
-    }
-
-    /// Construct a backup's cumulative durable vote, never a transport receipt.
-    pub fn acknowledgment(&self) -> Result<PrepareOk, ReplicationError> {
-        self.require_normal()?;
-        if self.configuration.policy() != QuorumPolicy::Durable {
-            return Err(ReplicationError::PolicyMismatch);
-        }
-        if self.is_primary() {
-            return Err(ReplicationError::WrongRole);
-        }
-        Ok(PrepareOk {
-            scope: self.configuration.scope(),
-            durable: self.prefix_at(self.journal.snapshot().durable)?,
-        })
-    }
-
-    /// Count one authenticated backup's cumulative matching durable prefix.
-    /// Duplicate deliveries/reconnections do not create extra voters.
-    pub fn receive_ack(&mut self, from: NodeId, ack: PrepareOk) -> Result<(), ReplicationError> {
-        if self.configuration.policy() != QuorumPolicy::Durable {
-            return Err(ReplicationError::PolicyMismatch);
-        }
-        self.receive_prefix(from, ack.scope, ack.durable)
-    }
-
-    /// Vote for the complete validated prefix retained by the payload adapter.
-    /// Physical writes are independent and cannot reclaim this prefix early.
-    pub fn retained_acknowledgment(&self) -> Result<RetainedPrepareOk, ReplicationError> {
-        self.require_normal()?;
-        if self.configuration.policy() != QuorumPolicy::Replicated {
-            return Err(ReplicationError::PolicyMismatch);
-        }
-        if self.is_primary() {
-            return Err(ReplicationError::WrongRole);
-        }
-        Ok(RetainedPrepareOk {
-            scope: self.configuration.scope(),
-            retained: self.accepted,
-        })
-    }
-
-    /// Count one distinct backup's exact retained-memory prefix.
-    pub fn receive_retained_ack(
-        &mut self,
-        from: NodeId,
-        ack: RetainedPrepareOk,
-    ) -> Result<(), ReplicationError> {
-        if self.configuration.policy() != QuorumPolicy::Replicated {
-            return Err(ReplicationError::PolicyMismatch);
-        }
-        self.receive_prefix(from, ack.scope, ack.retained)
-    }
-
-    fn receive_prefix(
-        &mut self,
-        from: NodeId,
-        scope: Scope,
-        prefix: Prefix,
-    ) -> Result<(), ReplicationError> {
-        self.require_scope(scope)?;
-        let voter = self.configuration.voter_index(from)?;
-        if !self.is_primary() || voter == self.local {
-            return Err(ReplicationError::WrongRole);
-        }
-        if prefix.op < self.applied.op {
-            return Ok(());
-        }
-        if self.prefix_at(prefix.op)? != prefix {
-            return Err(self.conflict());
-        }
-        self.acknowledged[voter] = self.acknowledged[voter].max(prefix.op);
-        self.advance_commit();
-        Ok(())
-    }
-
-    /// Construct the primary's current commit announcement or idle heartbeat.
-    pub fn announcement(&self) -> Result<Commit, ReplicationError> {
-        self.require_normal()?;
-        if !self.is_primary() {
-            return Err(ReplicationError::WrongRole);
-        }
-        Ok(Commit {
-            scope: self.configuration.scope(),
-            committed: self.committed,
-        })
-    }
-
-    /// Retransmit the immutable installed-view descriptor after publication.
-    /// Bootstrap has no descriptor. Later appends do not change this snapshot;
-    /// lagging backups install it first, then catch up through normal prepares.
-    pub fn start_view(&self) -> Result<Option<crate::StartView>, ReplicationError> {
-        self.require_normal()?;
-        if !self.is_primary() {
-            return Err(ReplicationError::WrongRole);
-        }
-        Ok(self.installed_view)
-    }
-
-    pub(crate) fn activation_prefix(&self) -> Result<Prefix, ReplicationError> {
-        self.require_normal()?;
-        let snapshot = self.snapshot();
-        if self
-            .installed_view
-            .is_none_or(|installed| installed.accepted != snapshot.accepted)
-            || snapshot.committed != snapshot.accepted
-            || snapshot.journal.durable < snapshot.accepted.op
-            || (self.is_primary()
-                && self.acknowledged[(self.local + 1) % 3]
-                    .max(self.acknowledged[(self.local + 2) % 3])
-                    < snapshot.accepted.op)
-        {
-            return Err(ReplicationError::ActivationPending);
-        }
-        Ok(snapshot.accepted)
-    }
-
-    pub(crate) fn observe_installed_start(
-        &mut self,
-        from: NodeId,
-        start: crate::StartView,
-    ) -> Result<(), ReplicationError> {
-        self.require_scope(start.scope)?;
-        self.require_primary(from)?;
-        if self.is_primary() {
-            return Err(ReplicationError::WrongRole);
-        }
-        if self.installed_view != Some(start) {
-            return Err(self.conflict());
-        }
-        Ok(())
-    }
-
-    /// Observe an authenticated primary's commit, including piggybacked commit.
-    /// Visibility waits for this backup's configured local evidence. Missing
-    /// payload returns `HistoryGap`; retry the announcement after catch-up.
-    pub fn receive_commit(&mut self, from: NodeId, commit: Commit) -> Result<(), ReplicationError> {
-        self.require_scope(commit.scope)?;
-        self.require_primary(from)?;
-        if self.is_primary() {
-            return Err(ReplicationError::WrongRole);
-        }
-        if commit.committed.op < self.applied.op {
-            return Ok(());
-        }
-        if self.prefix_at(commit.committed.op)? != commit.committed {
-            return Err(self.conflict());
-        }
-        self.known_commit = self.known_commit.max(commit.committed.op);
-        self.advance_commit();
-        Ok(())
+        self.advance_commit()?;
+        self.reclaim()
     }
 
     /// Report ordered application. Release capacity only through `stored_through`.
@@ -486,7 +299,7 @@ impl NormalReplica {
             return Err(self.conflict());
         }
         self.applied = through;
-        self.reclaim();
+        self.reclaim()?;
         if self.journal_tail.is_some_and(|tail| through.op >= tail.op) {
             self.journal_tail = None;
         }
@@ -505,13 +318,25 @@ impl NormalReplica {
     /// Report uncertain storage failure. Stale generations cannot fault this core.
     pub fn fail_io(&mut self, generation: JournalGeneration) -> Result<(), ReplicationError> {
         self.journal.fail(generation)?;
-        self.status = Status::Faulted;
+        self.fault();
         Ok(())
     }
 
+    /// Fault the current generation after this core found conflicting history.
+    pub(crate) fn fault(&mut self) {
+        self.journal.fault();
+        self.status = Status::Faulted;
+    }
+
     fn is_primary(&self) -> bool {
-        self.configuration.voters[self.local]
+        self.configuration.voter(self.local)
             == self.configuration.primary(self.configuration.scope.view)
+    }
+
+    /// Highest matching evidence from either distinct backup.
+    fn backup_acknowledged(&self) -> OpNumber {
+        let [left, right] = self.local.others();
+        self.acknowledged[left].max(self.acknowledged[right])
     }
 
     fn ready_for_appends(&self) -> bool {
@@ -520,101 +345,7 @@ impl NormalReplica {
             && (!self.is_primary()
                 || (self.applied.op >= self.activation_tail
                     && self.journal.snapshot().durable >= self.activation_tail
-                    && self.acknowledged[(self.local + 1) % 3]
-                        .max(self.acknowledged[(self.local + 2) % 3])
-                        >= self.activation_tail))
-    }
-
-    /// Prepare private post-install state without exposing durability or votes.
-    /// Reuses the original preallocated descriptor ring. Only `InstallingView` can
-    /// activate it after exact publication and application completion.
-    pub(crate) fn validate_install(
-        &self,
-        ticket: crate::InstallTicket,
-        operations: &[PreparedOperation],
-    ) -> Result<usize, ReplicationError> {
-        let (previous, body_bytes) =
-            self.validate_install_chunk(ticket, ticket.committed(), operations)?;
-        if previous != ticket.accepted() {
-            return Err(ReplicationError::ConflictingHistory);
-        }
-        Ok(body_bytes)
-    }
-
-    pub(crate) fn validate_install_chunk(
-        &self,
-        ticket: crate::InstallTicket,
-        mut previous: Prefix,
-        operations: &[PreparedOperation],
-    ) -> Result<(Prefix, usize), ReplicationError> {
-        if self.status != Status::Fenced {
-            return Err(ReplicationError::NotNormal);
-        }
-        if operations.len() > self.limits.max_operations {
-            return Err(ReplicationError::Capacity);
-        }
-        let mut body_bytes = 0usize;
-        for operation in operations {
-            if operation.group_id != ticket.scope().group_id
-                || operation.configuration_epoch != ticket.scope().configuration_epoch
-                || operation.original_view >= ticket.scope().view
-            {
-                return Err(ReplicationError::ScopeMismatch);
-            }
-            if previous.op.0.checked_add(1) != Some(operation.prefix.op.0) {
-                return Err(ReplicationError::HistoryGap);
-            }
-            if operation.previous_digest != previous.digest {
-                return Err(ReplicationError::ConflictingHistory);
-            }
-            body_bytes = body_bytes
-                .checked_add(operation.body_bytes)
-                .ok_or(ReplicationError::Capacity)?;
-            if body_bytes > self.limits.max_body_bytes {
-                return Err(ReplicationError::Capacity);
-            }
-            previous = operation.prefix;
-        }
-        if previous.op > ticket.accepted().op
-            || (previous.op == ticket.accepted().op && previous != ticket.accepted())
-        {
-            return Err(ReplicationError::ConflictingHistory);
-        }
-        Ok((previous, body_bytes))
-    }
-
-    pub(crate) fn stage_install(
-        mut self,
-        ticket: crate::InstallTicket,
-        operations: &[PreparedOperation],
-        start: crate::StartView,
-        body_bytes: usize,
-    ) -> Self {
-        self.operations.clear();
-        self.operations.extend(operations);
-        self.body_bytes = body_bytes;
-        self.configuration.scope = ticket.scope();
-        self.journal = JournalProgress::recover(ticket.generation(), ticket.accepted().op);
-        self.accepted = ticket.accepted();
-        self.committed = ticket.committed();
-        self.applied = ticket.committed();
-        self.retained_base = ticket.committed();
-        self.known_commit = ticket.committed().op;
-        self.acknowledged = [OpNumber(0); 3];
-        self.activation_tail = ticket.accepted().op;
-        self.installed_view = Some(start);
-        self.journal_tail = None;
-        self
-    }
-
-    pub(crate) fn retain_installed_tail_on_disk(&mut self) {
-        debug_assert!(self.operations.is_empty());
-        self.journal_tail = (self.accepted.op > self.applied.op).then_some(self.accepted);
-    }
-
-    pub(crate) fn activate_installed(&mut self) {
-        debug_assert_eq!(self.status, Status::Fenced);
-        self.status = Status::Normal;
+                    && self.backup_acknowledged() >= self.activation_tail))
     }
 
     fn require_normal(&self) -> Result<(), ReplicationError> {
@@ -664,54 +395,45 @@ impl NormalReplica {
             // the empty live ring or promote partial, unverified tail evidence.
             return Err(ReplicationError::HistoryUnavailable);
         }
-        // Difference is bounded by max_operations, checked before admission.
-        let index = (op.0 - self.retained_base.op.0 - 1) as usize;
-        Ok(self.operations[index].prefix)
+        // The first retained operation follows the retained base.
+        op.0.checked_sub(self.retained_base.op.0)
+            .and_then(|distance| distance.checked_sub(1))
+            .and_then(|index| usize::try_from(index).ok())
+            .and_then(|index| self.operations.get(index))
+            .map(|operation| operation.prefix)
+            .ok_or(ReplicationError::HistoryUnavailable)
     }
 
-    fn reclaim(&mut self) {
+    fn reclaim(&mut self) -> Result<(), ReplicationError> {
         let through = self.applied.op.min(self.stored_through());
         if through <= self.retained_base.op {
-            return;
+            return Ok(());
         }
-        let prefix = self.prefix_at(through).expect("applied persisted prefix");
-        while self
-            .operations
-            .front()
-            .is_some_and(|operation| operation.prefix.op <= through)
-        {
-            let operation = self.operations.pop_front().expect("checked front");
-            self.body_bytes -= operation.body_bytes;
-        }
+        let prefix = self.prefix_at(through)?;
+        self.body_bytes -= crate::release_through(&mut self.operations, through);
         self.retained_base = prefix;
+        Ok(())
     }
 
-    fn advance_commit(&mut self) {
+    fn advance_commit(&mut self) -> Result<(), ReplicationError> {
         if self.status != Status::Normal {
-            return;
+            return Ok(());
         }
-        let available = match self.configuration.policy() {
-            QuorumPolicy::Durable => self.journal.snapshot().durable,
-            QuorumPolicy::Replicated => self.accepted.op,
-        };
+        let available = self.journal.snapshot().durable;
         let eligible = if self.is_primary() {
             // Own matching evidence AND either distinct backup's matching evidence.
-            let backup = self.acknowledged[(self.local + 1) % 3]
-                .max(self.acknowledged[(self.local + 2) % 3]);
-            available.min(backup)
+            available.min(self.backup_acknowledged())
         } else {
             available.min(self.known_commit)
         };
         if eligible > self.committed.op {
-            self.committed = self.prefix_at(eligible).expect("verified retained prefix");
+            self.committed = self.prefix_at(eligible)?;
         }
+        Ok(())
     }
 
     fn conflict(&mut self) -> ReplicationError {
-        self.journal
-            .fail(self.journal.snapshot().generation)
-            .expect("current generation");
-        self.status = Status::Faulted;
+        self.fault();
         ReplicationError::ConflictingHistory
     }
 }

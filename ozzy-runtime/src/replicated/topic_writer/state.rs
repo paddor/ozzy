@@ -46,6 +46,7 @@ impl Partitions {
             .iter()
             .map(|partition| {
                 Ok(Partition {
+                    number: partition.number,
                     target: partition.target,
                     writer: partition.writer.try_clone()?,
                 })
@@ -71,7 +72,7 @@ impl Partitions {
         &mut self,
         record: RecordInput,
         selection: TopicSelection<'_>,
-    ) -> Result<(usize, PendingRecord), TopicWriterError> {
+    ) -> Result<(u32, PendingRecord), TopicWriterError> {
         let index = self.select(selection);
         let partition = &mut self.entries[index];
         let pending =
@@ -83,7 +84,7 @@ impl Partitions {
                     partition: partition.target,
                     source,
                 })?;
-        Ok((index, pending))
+        Ok((partition.number, pending))
     }
 
     pub(super) fn flush(

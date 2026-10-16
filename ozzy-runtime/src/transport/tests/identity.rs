@@ -55,7 +55,7 @@ async fn zero_leading_peer_nodes_exchange_native_control_and_data_over_inproc_an
             } else {
                 format!("inproc://{}", ozzy_proto::RequestId::new())
             };
-            receiver.bind(endpoint.parse().unwrap()).await.unwrap();
+            receiver.bind(endpoint).await.unwrap();
             sender
                 .connect(receiver.last_bound_endpoint().unwrap())
                 .await
@@ -80,7 +80,7 @@ async fn zero_leading_peer_nodes_exchange_native_control_and_data_over_inproc_an
                     Message::with_prefix(Bytes::copy_from_slice(to.as_bytes()), body.clone());
                 try_send_peer(&sender, packet).unwrap();
                 let (identity, body_at_peer) = receiver.recv_from().await.unwrap();
-                assert_eq!(decode_peer_identity(&identity), Some(from));
+                assert_eq!(decode_peer_identity(identity.as_ref()), Some(from));
                 assert_eq!(body_at_peer, body);
                 let reply = Message::with_prefix(
                     Bytes::copy_from_slice(from.as_bytes()),
@@ -88,7 +88,7 @@ async fn zero_leading_peer_nodes_exchange_native_control_and_data_over_inproc_an
                 );
                 try_send_peer(&receiver, reply).unwrap();
                 let (identity, returned) = sender.recv_from().await.unwrap();
-                assert_eq!(decode_peer_identity(&identity), Some(to));
+                assert_eq!(decode_peer_identity(identity.as_ref()), Some(to));
                 assert_eq!(returned, body_at_peer);
             }
             sender.into_inner().close().await.unwrap();

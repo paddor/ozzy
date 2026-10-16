@@ -2,9 +2,12 @@
 //! per mode: a panel per record size, offered load on each X axis, writer
 //! confirmation and verified reader latency together in every panel.
 use super::{
-    AXIS, BACKGROUND, CONTENT_WIDTH, Chart, FOOTER_HEIGHT, GRID, Metric, SERIES, Series, TEXT, TOP,
-    WIDTH, XAxis, clipped_latency_labels, draw_series, id, legend, metric_range, percentile_key,
-    sizes, style, x_values,
+    Chart, Metric, Page, Region, XAxis, chart_builder, chart_path, coverage, id, is_chart_mode,
+    is_charted_series, latency_grid,
+    marks::{clipped_latency_labels, draw_series, percentile_key},
+    metric_range, sizes,
+    style::{self, AXIS, CONTENT_WIDTH, GRID, PanelTitle, SERIES, Series, TOP},
+    x_values,
 };
 use ozzy_bench::automation::Result;
 use plotters::{
@@ -14,6 +17,7 @@ use plotters::{
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ops::Range,
     path::Path,
 };
 
@@ -42,7 +46,7 @@ pub(super) fn reader_color(color: RGBColor) -> RGBColor {
 }
 
 pub(crate) fn render(data: &Value, output: &Path, suffix: &str) -> Result<()> {
-    let rate_limits = super::coverage::rate_limits(data)?;
+    let rate_limits = coverage::rate_limits(data)?;
     let mut modes = BTreeMap::<&str, Vec<&Value>>::new();
     for row in data["summary"]
         .as_array()
@@ -51,10 +55,8 @@ pub(crate) fn render(data: &Value, output: &Path, suffix: &str) -> Result<()> {
         .chain(data["incomplete"].as_array().into_iter().flatten())
     {
         let mode = row["case"]["mode"].as_str().ok_or("missing mode")?;
-        if !matches!(
-            mode,
-            "buffered" | "durable" | "disk-quorum" | "replicated-persisting"
-        ) || !SERIES.iter().any(|s| id(row) == s.id)
+        if !is_chart_mode(mode)
+            || !is_charted_series(row)
             || row["case"]["rate"].as_u64().is_none_or(|r| r == 0)
         {
             return Err("fixed-load charts require supported comparison measurements".into());
@@ -64,48 +66,45 @@ pub(crate) fn render(data: &Value, output: &Path, suffix: &str) -> Result<()> {
     if modes.is_empty() {
         return Err("empty fixed-load summary".into());
     }
-    let ozzy_only_rates: BTreeSet<u64> = data["ozzy_only_rates"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|rate| rate.as_u64().ok_or("invalid Ozzy-only rate"))
-        .collect::<std::result::Result<Vec<_>, _>>()?
-        .into_iter()
-        .collect();
+    let ozzy_only_rates: BTreeSet<u64> = super::ozzy_only_rates(data)?.into_iter().collect();
     // Validate every panel before writing any chart.
+    let suffix = format!("-fixed-load{suffix}");
     for (mode, rows) in &modes {
-        super::coverage::check(
-            &super::chart_path(output, mode, &format!("-fixed-load{suffix}")),
-            rows,
-            &rate_limits,
-        )?;
-        for size in sizes(rows)? {
-            let rows = of_size(rows, size);
-            let rates = x_values(&rows, XAxis::Rate)?;
-            for series in SERIES {
-                let selected: Vec<_> = rows
-                    .iter()
-                    .copied()
-                    .filter(|r| id(r) == series.id)
-                    .collect();
-                let expected: Vec<_> = if series.id == "ozzy/raw" {
-                    rates.clone()
-                } else {
-                    rates
-                        .iter()
-                        .copied()
-                        .filter(|rate| !ozzy_only_rates.contains(rate))
-                        .collect()
-                };
-                if !selected.is_empty() && x_values(&selected, XAxis::Rate)? != expected {
-                    return Err("fixed-load series has missing offered rates".into());
-                }
-            }
-        }
+        coverage::check(&chart_path(output, mode, &suffix), rows, &rate_limits)?;
+        check_offered_rates(rows, &ozzy_only_rates)?;
         metric_range(rows, &METRICS)?;
     }
     for (mode, rows) in modes {
-        render_mode(data, output, suffix, mode, &rows)?;
+        render_mode(data, &chart_path(output, mode, &suffix), mode, &rows)?;
+    }
+    Ok(())
+}
+
+/// Every series of every size covers the panel's offered rates; comparison
+/// series skip only the Ozzy-only rates.
+fn check_offered_rates(rows: &[&Value], ozzy_only_rates: &BTreeSet<u64>) -> Result<()> {
+    for size in sizes(rows)? {
+        let rows = of_size(rows, size);
+        let rates = x_values(&rows, XAxis::Rate)?;
+        for series in SERIES {
+            let selected: Vec<_> = rows
+                .iter()
+                .copied()
+                .filter(|r| id(r) == series.id)
+                .collect();
+            let expected: Vec<_> = if series.id == "ozzy/raw" {
+                rates.clone()
+            } else {
+                rates
+                    .iter()
+                    .copied()
+                    .filter(|rate| !ozzy_only_rates.contains(rate))
+                    .collect()
+            };
+            if !selected.is_empty() && x_values(&selected, XAxis::Rate)? != expected {
+                return Err("fixed-load series has missing offered rates".into());
+            }
+        }
     }
     Ok(())
 }
@@ -117,70 +116,45 @@ fn of_size<'a>(rows: &[&'a Value], size: u64) -> Vec<&'a Value> {
         .collect()
 }
 
-fn render_mode(
-    data: &Value,
-    output: &Path,
-    suffix: &str,
-    mode: &str,
-    rows: &[&Value],
-) -> Result<()> {
-    let path = super::chart_path(output, mode, &format!("-fixed-load{suffix}"));
-    std::fs::create_dir_all(path.parent().expect("chart directory"))?;
+fn render_mode(data: &Value, path: &Path, mode: &str, rows: &[&Value]) -> Result<()> {
     let measured = sizes(rows)?;
     let count = u32::try_from(measured.len())?;
     let body_height = TOP + count * PANEL_HEIGHT + (count - 1) * PANEL_GAP + 24;
-    let height = body_height + FOOTER_HEIGHT;
-    let root = SVGBackend::new(&path, (WIDTH, height)).into_drawing_area();
-    root.fill(&BACKGROUND)?;
-    let range = metric_range(rows, &METRICS)?;
-    let mut titles = vec![];
-    for (index, size) in measured.iter().enumerate() {
-        let top = TOP + u32::try_from(index)? * (PANEL_HEIGHT + PANEL_GAP);
-        let area = root.clone().shrink((0, top), (CONTENT_WIDTH, PANEL_HEIGHT));
-        let sized = of_size(rows, *size);
-        let rates = x_values(&sized, XAxis::Rate)?;
-        panel(&area, &sized, &rates, range.clone())?;
-        titles.push((
-            CONTENT_WIDTH / 2,
-            top - 6,
-            format!("{} records (ms, 0-400)", style::size(*size)),
-        ));
-    }
-    root.draw_text(
-        "Offered records/s (log, total)",
-        &("sans-serif", 11).into_font().color(&TEXT),
-        (
-            i32::try_from(CONTENT_WIDTH / 2)? - 80,
-            i32::try_from(body_height)? - 18,
-        ),
-    )?;
-    legend(
-        &root
-            .clone()
-            .shrink((0, body_height), (WIDTH, FOOTER_HEIGHT)),
+    let page = Page {
         data,
         rows,
         mode,
-    )?;
-    root.present()?;
-    drop(root);
-    style::finish(
-        &path,
-        height,
-        &format!("{} at fixed load", super::mode_title(mode)),
-        super::hardware::subtitle(data).as_deref().unwrap_or(""),
-        &titles,
-        rows,
-    )?;
-    println!("{}", path.display());
-    Ok(())
+        condition: "at fixed load",
+    };
+    page.write(path, body_height, |root| {
+        let range = metric_range(rows, &METRICS)?;
+        let mut titles = vec![];
+        for (index, size) in measured.iter().enumerate() {
+            let top = TOP + u32::try_from(index)? * (PANEL_HEIGHT + PANEL_GAP);
+            let area = root.clone().shrink((0, top), (CONTENT_WIDTH, PANEL_HEIGHT));
+            let sized = of_size(rows, *size);
+            let rates = x_values(&sized, XAxis::Rate)?;
+            panel(&area, &sized, &rates, range.clone())?;
+            titles.push(PanelTitle {
+                x: CONTENT_WIDTH / 2,
+                y: top - 6,
+                text: format!("{} records (ms, 0-400)", style::size(*size)),
+            });
+        }
+        root.draw_text(
+            "Offered records/s (log, total)",
+            &style::text(11),
+            (
+                i32::try_from(CONTENT_WIDTH / 2)? - 80,
+                i32::try_from(body_height)? - 18,
+            ),
+        )?;
+        Ok(titles)
+    })
 }
 
 /// Name the systems that could not sustain a rate in this panel.
-fn backlog_note(
-    area: &DrawingArea<SVGBackend<'_>, plotters::coord::Shift>,
-    rows: &[&Value],
-) -> Result<()> {
+fn backlog_note(area: &Region<'_>, rows: &[&Value]) -> Result<()> {
     let mut notes = vec![];
     for (repeat, label) in [(false, "backlog limit"), (true, "failed repeat")] {
         let mut seen = BTreeSet::new();
@@ -210,76 +184,26 @@ fn backlog_note(
     if !notes.is_empty() {
         area.draw_text(
             &notes.join("; "),
-            &("sans-serif", 10)
-                .into_font()
-                .color(&super::MUTED)
-                .pos(Pos::new(HPos::Right, VPos::Top)),
+            &style::muted(10).pos(Pos::new(HPos::Right, VPos::Top)),
             (i32::try_from(CONTENT_WIDTH)? - 30, 5),
         )?;
     }
     Ok(())
 }
 
-fn panel(
-    area: &DrawingArea<SVGBackend<'_>, plotters::coord::Shift>,
-    rows: &[&Value],
-    rates: &[u64],
-    yrange: std::ops::Range<f64>,
-) -> Result<()> {
-    let axis = XAxis::Rate;
-    let first = axis.position(rates, rates[0]);
-    let last = axis.position(rates, *rates.last().unwrap());
-    let xrange = if rates.len() == 1 {
-        first - 0.5..first + 0.5
-    } else {
-        first - 0.1..last + 0.1
-    };
-    percentile_key(
-        area,
-        rows.iter().any(|row| {
-            METRICS.iter().any(|metric| {
-                metric
-                    .p999
-                    .is_some_and(|key| row["measurements"].get(key).is_some())
-            })
-        }),
-    )?;
+/// Writer and reader latency of one record size over its offered rates.
+fn panel(area: &Region<'_>, rows: &[&Value], rates: &[u64], yrange: Range<f64>) -> Result<()> {
+    let xrange = rate_range(rates)?;
+    percentile_key(area, rows, &METRICS)?;
     backlog_note(area, rows)?;
-    let mut chart: Chart<'_> = ChartBuilder::on(area)
-        .set_label_area_size(LabelAreaPosition::Bottom, 28)
-        .set_label_area_size(LabelAreaPosition::Left, 55)
-        .margin_top(26)
-        .margin_left(10)
+    let mut chart: Chart<'_> = chart_builder(area)
         .margin_right(30)
         .build_cartesian_2d(xrange, yrange.clone())?;
-    chart
-        .configure_mesh()
+    latency_grid(&mut chart.configure_mesh())
         .x_labels(0)
         .disable_x_mesh()
-        .y_labels(16)
-        .y_label_formatter(&|y| format!("{y:.0}"))
-        .y_label_style(("sans-serif", 10).into_font().color(&TEXT))
-        .light_line_style(TRANSPARENT)
-        .bold_line_style(GRID)
-        .axis_style(AXIS)
         .draw()?;
-    // Mark each measured load at its actual logarithmic position.
-    let (origin_x, origin_y) = area.get_pixel_range();
-    let label_style = ("sans-serif", 10)
-        .into_font()
-        .color(&TEXT)
-        .pos(Pos::new(HPos::Center, VPos::Top));
-    for rate in rates {
-        let position = axis.position(rates, *rate);
-        chart.draw_series(std::iter::once(PathElement::new(
-            vec![(position, yrange.start), (position, yrange.end)],
-            GRID,
-        )))?;
-        let (x, y) = chart.backend_coord(&(position, yrange.start));
-        let (x, y) = (x - origin_x.start, y - origin_y.start);
-        area.draw(&PathElement::new(vec![(x, y), (x, y + 5)], AXIS))?;
-        area.draw_text(&axis.label(*rate), &label_style, (x, y + 8))?;
-    }
+    rate_ticks(area, &mut chart, rates, &yrange)?;
     // Readers under writers; all latency lines connect P99 values.
     for metric in [READER, WRITER] {
         for series in SERIES {
@@ -291,7 +215,13 @@ fn panel(
             } else {
                 series
             };
-            draw_series(chart.plotting_area(), rows, (rates, axis), metric, series)?;
+            draw_series(
+                chart.plotting_area(),
+                rows,
+                (rates, XAxis::Rate),
+                metric,
+                series,
+            )?;
         }
     }
     clipped_latency_labels(
@@ -300,6 +230,45 @@ fn panel(
         rates,
         &[(READER, true), (WRITER, false)],
     )?;
+    Ok(())
+}
+
+/// The logarithmic X range around the measured rates; one rate gets a
+/// half-decade on each side.
+fn rate_range(rates: &[u64]) -> Result<Range<f64>> {
+    let (Some(&lowest), Some(&highest)) = (rates.first(), rates.last()) else {
+        return Err("fixed-load panel has no offered rates".into());
+    };
+    let first = XAxis::Rate.position(rates, lowest)?;
+    let last = XAxis::Rate.position(rates, highest)?;
+    Ok(if rates.len() == 1 {
+        first - 0.5..first + 0.5
+    } else {
+        first - 0.1..last + 0.1
+    })
+}
+
+/// Mark each measured load at its actual logarithmic position: a grid line,
+/// an axis tick and its label.
+fn rate_ticks(
+    area: &Region<'_>,
+    chart: &mut Chart<'_>,
+    rates: &[u64],
+    yrange: &Range<f64>,
+) -> Result<()> {
+    let (origin_x, origin_y) = area.get_pixel_range();
+    let label_style = style::text(10).pos(Pos::new(HPos::Center, VPos::Top));
+    for rate in rates {
+        let position = XAxis::Rate.position(rates, *rate)?;
+        chart.draw_series(std::iter::once(PathElement::new(
+            vec![(position, yrange.start), (position, yrange.end)],
+            GRID,
+        )))?;
+        let (x, y) = chart.backend_coord(&(position, yrange.start));
+        let (x, y) = (x - origin_x.start, y - origin_y.start);
+        area.draw(&PathElement::new(vec![(x, y), (x, y + 5)], AXIS))?;
+        area.draw_text(&XAxis::Rate.label(*rate), &label_style, (x, y + 8))?;
+    }
     Ok(())
 }
 
@@ -381,16 +350,14 @@ mod tests {
 
         let mut cluster = data.clone();
         for row in cluster["summary"].as_array_mut().unwrap() {
-            row["case"]["mode"] = json!("replicated-persisting");
+            row["case"]["mode"] = json!("disk-quorum");
         }
         render(&cluster, temp.path(), "").unwrap();
-        let cluster_svg = std::fs::read_to_string(
-            temp.path()
-                .join("cluster/replicated-persisting-fixed-load.svg"),
-        )
-        .unwrap();
-        assert!(cluster_svg.contains("Three brokers: replicated-persisting confirmation"));
-        assert!(cluster_svg.contains("Iggy 0.9.0 replicated"));
+        let cluster_svg =
+            std::fs::read_to_string(temp.path().join("cluster/disk-quorum-fixed-load.svg"))
+                .unwrap();
+        assert!(cluster_svg.contains("Three brokers: durable disk confirmation"));
+        assert!(cluster_svg.contains("Iggy 0.9.0"));
 
         for row in data["summary"].as_array_mut().unwrap() {
             row["measurements"]["scheduled_ack_p999_us"] =

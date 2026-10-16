@@ -2,7 +2,7 @@
 
 use super::{
     BrokerLinks, Partition, Partitions, ProducerIdentity, RetryPolicy, SharedTopicWriter,
-    SharedTopicWriterConfig, TopicWriterError, Writer, session,
+    SharedTopicWriterConfig, TopicRoutes, TopicWriterError, Writer, WriterConfig, session,
 };
 
 impl SharedTopicWriter {
@@ -15,7 +15,8 @@ impl SharedTopicWriter {
         config: SharedTopicWriterConfig,
         retry: RetryPolicy,
     ) -> Result<Self, TopicWriterError> {
-        Self::attach(links, name, identity, config, retry, false).await
+        let routes = Self::identity_routes(links, name, identity, &config, retry).await?;
+        Self::attach(routes, identity, config, retry, false).await
     }
 
     /// Fence every partition before admitting records. A failed attempt may
@@ -27,17 +28,19 @@ impl SharedTopicWriter {
         config: SharedTopicWriterConfig,
         retry: RetryPolicy,
     ) -> Result<Self, TopicWriterError> {
-        Self::attach(links, name, identity, config, retry, true).await
+        let routes = Self::identity_routes(links, name, identity, &config, retry).await?;
+        Self::attach(routes, identity, config, retry, true).await
     }
 
-    async fn attach(
+    /// Routes of topic `name`, once `identity` names it and `config` and
+    /// `retry` are valid for it.
+    async fn identity_routes(
         links: &BrokerLinks,
         name: &str,
         identity: ProducerIdentity,
-        config: SharedTopicWriterConfig,
+        config: &SharedTopicWriterConfig,
         retry: RetryPolicy,
-        takeover: bool,
-    ) -> Result<Self, TopicWriterError> {
+    ) -> Result<TopicRoutes, TopicWriterError> {
         retry
             .validate()
             .map_err(|_| TopicWriterError::Configuration)?;
@@ -53,12 +56,21 @@ impl SharedTopicWriter {
                     .ok_or(TopicWriterError::Configuration)?
                     .incarnation,
                 identity.producer,
-                1,
-                0,
                 metadata.policy(),
             )
             .validate_shared()?;
-        let routes = links.routes(metadata)?;
+        Ok(links.routes(metadata).await?)
+    }
+
+    /// Open or fence the producer on every partition, then connect its
+    /// writer at the broker's epoch and next sequence.
+    async fn attach(
+        routes: TopicRoutes,
+        identity: ProducerIdentity,
+        config: SharedTopicWriterConfig,
+        retry: RetryPolicy,
+        takeover: bool,
+    ) -> Result<Self, TopicWriterError> {
         let mut entries = Vec::new();
         for number in 0..routes.metadata().partition_count() {
             let number = u32::try_from(number).map_err(|_| TopicWriterError::Configuration)?;
@@ -67,17 +79,20 @@ impl SharedTopicWriter {
             let writer = Writer::connect_shared(
                 &routes,
                 number,
-                config.writer(
-                    opened.partition,
-                    identity.producer,
-                    opened.epoch,
-                    opened.next_sequence,
-                    routes.metadata().policy(),
-                ),
+                WriterConfig {
+                    producer_epoch: opened.epoch,
+                    next_sequence: opened.next_sequence,
+                    ..config.writer(
+                        opened.partition,
+                        identity.producer,
+                        routes.metadata().policy(),
+                    )
+                },
                 retry,
             )
             .await?;
             entries.push(Partition {
+                number,
                 target: opened.partition,
                 writer,
             });

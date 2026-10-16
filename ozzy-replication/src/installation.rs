@@ -4,7 +4,8 @@ use ozzy_proto::NodeId;
 
 use crate::{
     Configuration, Digest, JournalGeneration, LogSource, NormalReplica, OpNumber, Prefix,
-    PreparedOperation, ReplicationError, Scope, ViewChange, ViewChangeError,
+    PreparedOperation, PromiseTicket, ReplicationError, Scope, ViewChange, ViewChangeError,
+    VoterIndex,
 };
 
 /// Immutable `START_VIEW` sent only after the primary durably installs this log.
@@ -19,6 +20,16 @@ pub struct StartView {
     pub accepted: Prefix,
     /// Primary's known commit floor at installation time.
     pub committed: Prefix,
+}
+
+/// A `START_VIEW` with the authenticated configured voter that sent it.
+/// Backup installation still checks that this voter is the view's primary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceivedStart {
+    /// Authenticated sender of `start`.
+    pub from: NodeId,
+    /// Installed descriptor as received.
+    pub start: StartView,
 }
 
 /// Exact selected-log publication action. Not evidence of successful I/O.
@@ -118,12 +129,47 @@ impl std::error::Error for RejectedInstallation {
 #[derive(Debug)]
 pub struct InstallingView {
     ticket: InstallTicket,
-    previous_promise: crate::PromiseTicket,
-    normal: Option<NormalReplica>,
+    previous_promise: PromiseTicket,
+    state: InstallState,
     configuration: Configuration,
     requested_view: u64,
-    failed: bool,
     validated_through: Prefix,
+}
+
+/// Ownership of the staged role while publication is outstanding.
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the staged role moves without boxing"
+)]
+enum InstallState {
+    Pending(NormalReplica),
+    /// Ambiguous publication failure; only reopen and recovery remain.
+    Failed,
+    /// Completion transferred the role to its next owner.
+    Completed,
+}
+
+impl InstallState {
+    fn pending(&self) -> Result<&NormalReplica, ViewChangeError> {
+        match self {
+            Self::Pending(normal) => Ok(normal),
+            Self::Failed => Err(ViewChangeError::Faulted),
+            Self::Completed => Err(ViewChangeError::InstallationCompleted),
+        }
+    }
+
+    /// Transfer the staged role out exactly once.
+    fn take(&mut self) -> Result<NormalReplica, ViewChangeError> {
+        match std::mem::replace(self, Self::Completed) {
+            Self::Pending(normal) => Ok(normal),
+            Self::Failed => {
+                *self = Self::Failed;
+                Err(ViewChangeError::Faulted)
+            }
+            Self::Completed => Err(ViewChangeError::InstallationCompleted),
+        }
+    }
 }
 
 impl InstallingView {
@@ -150,12 +196,11 @@ impl InstallingView {
         &mut self,
         operations: &[PreparedOperation],
     ) -> Result<(), ViewChangeError> {
-        self.require_pending()?;
-        let (through, _) = self
-            .normal
-            .as_ref()
-            .expect("pending checked")
-            .validate_install_chunk(self.ticket, self.validated_through, operations)?;
+        let (through, _) = self.state.pending()?.validate_install_chunk(
+            self.ticket,
+            self.validated_through,
+            operations,
+        )?;
         self.validated_through = through;
         Ok(())
     }
@@ -203,7 +248,7 @@ impl InstallingView {
         if applied != ticket.committed {
             return Err(ViewChangeError::ApplicationPending);
         }
-        let mut normal = self.normal.take().expect("pending checked");
+        let mut normal = self.state.take()?;
         normal.activate_installed();
         if self.requested_view > ticket.scope.view {
             Ok(InstallOutcome::ViewChanging(
@@ -229,7 +274,7 @@ impl InstallingView {
             return Err(ViewChangeError::ViewNotHigher);
         }
         ViewChange::after_abandon(
-            self.normal.take().expect("pending checked"),
+            self.state.take()?,
             self.previous_promise,
             self.requested_view,
         )
@@ -238,18 +283,12 @@ impl InstallingView {
     /// Ambiguous publication failure requires reopen/recovery, never old-role reuse.
     pub fn fail(&mut self, ticket: InstallTicket) -> Result<(), ViewChangeError> {
         self.require_ticket(ticket)?;
-        self.failed = true;
+        self.state = InstallState::Failed;
         Ok(())
     }
 
     pub(crate) fn require_pending(&self) -> Result<(), ViewChangeError> {
-        if self.failed {
-            return Err(ViewChangeError::Faulted);
-        }
-        if self.normal.is_none() {
-            return Err(ViewChangeError::InstallationCompleted);
-        }
-        Ok(())
+        self.state.pending().map(|_| ())
     }
 
     fn require_ticket(&self, ticket: InstallTicket) -> Result<(), ViewChangeError> {
@@ -259,6 +298,24 @@ impl InstallingView {
         }
         Ok(())
     }
+}
+
+/// Installation inputs checked before the fenced role moves.
+#[derive(Debug, Clone, Copy)]
+struct Admitted {
+    ticket: InstallTicket,
+    start: StartView,
+    promise: PromiseTicket,
+    body_bytes: usize,
+}
+
+/// Where the selected tail after the commit floor comes from.
+#[derive(Debug, Clone, Copy)]
+enum Suffix<'a> {
+    /// Supplied whole with this call and already validated.
+    Supplied(&'a [PreparedOperation]),
+    /// Stays in the journal and is validated later in bounded chunks.
+    Streamed,
 }
 
 impl ViewChange {
@@ -276,8 +333,8 @@ impl ViewChange {
         self,
         generation: JournalGeneration,
     ) -> Result<InstallingView, RejectedInstallation> {
-        let validated = self.primary_install_ticket(generation);
-        self.stage_streaming(&validated)
+        let admitted = self.admit_primary(generation);
+        self.stage(&admitted, Suffix::Streamed)
     }
 
     /// Stage bounded-stream backup installation after authenticated `START_VIEW`.
@@ -291,13 +348,12 @@ impl ViewChange {
     )]
     pub fn begin_backup_install(
         mut self,
-        from: NodeId,
-        start: StartView,
+        received: ReceivedStart,
         generation: JournalGeneration,
         mut lookup: impl FnMut(LogSource, OpNumber) -> Option<Digest>,
     ) -> Result<InstallingView, RejectedInstallation> {
-        let validated = self.backup_install_ticket(from, start, generation, &mut lookup);
-        self.stage_streaming(&validated)
+        let admitted = self.admit_backup(received, generation, &mut lookup);
+        self.stage(&admitted, Suffix::Streamed)
     }
 
     /// Consume the selected primary's old role and stage atomic installation.
@@ -316,12 +372,10 @@ impl ViewChange {
         generation: JournalGeneration,
         suffix: &[PreparedOperation],
     ) -> Result<InstallingView, RejectedInstallation> {
-        let validated = (|| {
-            let (ticket, start) = self.primary_install_ticket(generation)?;
-            let bytes = self.normal.validate_install(ticket, suffix)?;
-            Ok((ticket, start, bytes))
-        })();
-        self.stage_install(&validated, suffix)
+        let admitted = self
+            .admit_primary(generation)
+            .and_then(|admitted| self.validate_suffix(&admitted, suffix));
+        self.stage(&admitted, Suffix::Supplied(suffix))
     }
 
     /// Consume a backup's fenced role after an authenticated `START_VIEW`.
@@ -338,53 +392,44 @@ impl ViewChange {
     )]
     pub fn install_backup(
         mut self,
-        from: NodeId,
-        start: StartView,
+        received: ReceivedStart,
         generation: JournalGeneration,
         suffix: &[PreparedOperation],
         mut lookup: impl FnMut(LogSource, OpNumber) -> Option<Digest>,
     ) -> Result<InstallingView, RejectedInstallation> {
-        let validated = (|| {
-            let (ticket, start) =
-                self.backup_install_ticket(from, start, generation, &mut lookup)?;
-            let bytes = self.normal.validate_install(ticket, suffix)?;
-            Ok((ticket, start, bytes))
-        })();
-        self.stage_install(&validated, suffix)
+        let admitted = self
+            .admit_backup(received, generation, &mut lookup)
+            .and_then(|admitted| self.validate_suffix(&admitted, suffix));
+        self.stage(&admitted, Suffix::Supplied(suffix))
     }
 
-    fn primary_install_ticket(
-        &self,
-        generation: JournalGeneration,
-    ) -> Result<(InstallTicket, StartView), ViewChangeError> {
-        self.require_promised()?;
+    fn admit_primary(&self, generation: JournalGeneration) -> Result<Admitted, ViewChangeError> {
+        let promise = self.require_promised()?;
         self.require_primary()?;
         let selected = self.selected.ok_or(ViewChangeError::SelectionRequired)?;
-        let start = StartView {
-            scope: selected.scope(),
-            generation,
-            accepted: selected.source().accepted,
-            committed: selected.committed(),
-        };
-        Ok((
-            self.install_ticket(generation, selected.source(), selected.committed())?,
-            start,
-        ))
+        Ok(Admitted {
+            ticket: self.install_ticket(generation, selected.source(), selected.committed())?,
+            start: StartView {
+                scope: selected.scope(),
+                generation,
+                accepted: selected.source().accepted,
+                committed: selected.committed(),
+            },
+            promise,
+            body_bytes: 0,
+        })
     }
 
-    fn backup_install_ticket(
+    fn admit_backup(
         &mut self,
-        from: NodeId,
-        start: StartView,
+        ReceivedStart { from, start }: ReceivedStart,
         generation: JournalGeneration,
         lookup: &mut impl FnMut(LogSource, OpNumber) -> Option<Digest>,
-    ) -> Result<(InstallTicket, StartView), ViewChangeError> {
+    ) -> Result<Admitted, ViewChangeError> {
         self.require_scope(start.scope)?;
-        self.require_promised()?;
-        self.configuration.voter_index(from)?;
-        if from != self.configuration.primary(start.scope.view)
-            || from == self.configuration.voters()[self.local]
-        {
+        let promise = self.require_promised()?;
+        let voter = self.configuration.voter_index(from)?;
+        if voter != VoterIndex::primary(start.scope.view) || voter == self.local {
             return Err(ReplicationError::WrongRole.into());
         }
         if !crate::view_change::valid_prefix(start.accepted)
@@ -406,26 +451,24 @@ impl ViewChange {
         } else {
             start.committed
         };
-        Ok((self.install_ticket(generation, source, committed)?, start))
+        Ok(Admitted {
+            ticket: self.install_ticket(generation, source, committed)?,
+            start,
+            promise,
+            body_bytes: 0,
+        })
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "rejection returns owned fenced role"
-    )]
-    fn stage_streaming(
-        self,
-        validated: &Result<(InstallTicket, StartView), ViewChangeError>,
-    ) -> Result<InstallingView, RejectedInstallation> {
-        let mut installing =
-            self.stage_install(&validated.map(|(ticket, start)| (ticket, start, 0)), &[])?;
-        installing.validated_through = installing.ticket.committed();
-        installing
-            .normal
-            .as_mut()
-            .expect("staged role")
-            .retain_installed_tail_on_disk();
-        Ok(installing)
+    fn validate_suffix(
+        &self,
+        admitted: &Admitted,
+        suffix: &[PreparedOperation],
+    ) -> Result<Admitted, ViewChangeError> {
+        let body_bytes = self.normal.validate_install(admitted.ticket, suffix)?;
+        Ok(Admitted {
+            body_bytes,
+            ..*admitted
+        })
     }
 
     fn install_ticket(
@@ -452,13 +495,13 @@ impl ViewChange {
         clippy::result_large_err,
         reason = "rejection returns protocol ownership without allocation"
     )]
-    fn stage_install(
+    fn stage(
         self,
-        validated: &Result<(InstallTicket, StartView, usize), ViewChangeError>,
-        suffix: &[PreparedOperation],
+        admitted: &Result<Admitted, ViewChangeError>,
+        suffix: Suffix<'_>,
     ) -> Result<InstallingView, RejectedInstallation> {
-        let (ticket, start, bytes) = match *validated {
-            Ok(values) => values,
+        let admitted = match *admitted {
+            Ok(admitted) => admitted,
             Err(error) => {
                 return Err(RejectedInstallation {
                     view_change: self,
@@ -466,18 +509,24 @@ impl ViewChange {
                 });
             }
         };
-        let previous_promise = self
-            .completed
-            .expect("installation requires durable promise");
-        let normal = self.normal.stage_install(ticket, suffix, start, bytes);
+        let ticket = admitted.ticket;
+        let (operations, validated_through) = match suffix {
+            Suffix::Supplied(operations) => (operations, ticket.accepted()),
+            Suffix::Streamed => (&[][..], ticket.committed()),
+        };
+        let mut normal =
+            self.normal
+                .stage_install(ticket, operations, admitted.start, admitted.body_bytes);
+        if let Suffix::Streamed = suffix {
+            normal.retain_installed_tail_on_disk();
+        }
         Ok(InstallingView {
-            normal: Some(normal),
             ticket,
-            previous_promise,
+            previous_promise: admitted.promise,
+            state: InstallState::Pending(normal),
             configuration: self.configuration,
             requested_view: ticket.scope.view,
-            failed: false,
-            validated_through: ticket.accepted(),
+            validated_through,
         })
     }
 }

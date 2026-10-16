@@ -5,14 +5,13 @@ mode = "single"
 peer = "tcp://127.0.0.1:7100"
 data_peer = "tcp://127.0.0.1:7103"
 reader_pub = "tcp://127.0.0.1:7101"
+admin = "ipc://@ozzy-laptop-admin"
 
 [brokers.laptop.devices.ssd]
 root = "/ozzy/data"
 controller = "development"
 
 [brokers.laptop.devices.ssd.workers]
-backend = "pool"
 write_threads = 1
 
 [topics.orders]
-confirmation = "local-durable"

@@ -60,22 +60,11 @@ impl Files {
     pub(super) fn reclaim(&mut self) -> Vec<Arc<OwnedFile>> {
         let mut retired = Vec::new();
         self.entries.retain(|_, slot| {
-            if slot
-                .open
-                .as_ref()
-                .is_some_and(|open| !open.token.is_alive())
-            {
-                retired.push(
-                    slot.open
-                        .take()
-                        .expect("abandoned open handle")
-                        .file
-                        .clone(),
-                );
-                false
-            } else {
-                true
-            }
+            let Some(abandoned) = slot.open.take_if(|open| !open.token.is_alive()) else {
+                return true;
+            };
+            retired.push(abandoned.file.clone());
+            false
         });
         retired
     }
@@ -145,8 +134,8 @@ pub(super) fn execute(
             mode,
             direct,
             data_sync,
-        } => open(shared, origin, &path, Some(mode), direct, data_sync),
-        Operation::OpenDirectory { path } => open(shared, origin, &path, None, false, false),
+        } => open(shared, origin, &path, Target::file(mode, direct, data_sync)),
+        Operation::OpenDirectory { path } => open(shared, origin, &path, Target::DIRECTORY),
         Operation::Read {
             handle,
             offset,
@@ -160,73 +149,57 @@ pub(super) fn execute(
             let (file, direct) = get(&handle)?;
             Ok(Outcome::Written(write(&file, offset, &data, direct)?))
         }
-        Operation::Metadata { handle } => {
-            let metadata = get(&handle)?.0.metadata()?;
-            Ok(Outcome::Metadata(Metadata {
-                kind: kind(metadata.file_type()),
-                length: metadata.len(),
-            }))
-        }
+        Operation::Metadata { handle } => metadata(&get(&handle)?.0),
         Operation::SetLength { handle, length } => {
-            get(&handle)?.0.set_len(length)?;
-            Ok(Outcome::Done)
+            get(&handle)?.0.set_len(length).map(|()| Outcome::Done)
         }
         Operation::Allocate {
             handle,
             offset,
             length,
-        } => {
-            allocate(&get(&handle)?.0, offset, length)?;
-            Ok(Outcome::Done)
-        }
-        Operation::Sync { handle, mode } => {
-            let file = get(&handle)?.0;
-            match mode {
-                SyncMode::Data => file.sync_data()?,
-                SyncMode::All => file.sync_all()?,
-            }
-            Ok(Outcome::Done)
-        }
-        Operation::LockExclusive { handle } => {
-            get(&handle)?.0.try_lock().map_err(|error| match error {
-                std::fs::TryLockError::WouldBlock => io::ErrorKind::WouldBlock.into(),
-                std::fs::TryLockError::Error(error) => error,
-            })?;
-            Ok(Outcome::Done)
-        }
+        } => allocate(&get(&handle)?.0, offset, length).map(|()| Outcome::Done),
+        Operation::Sync { handle, mode } => sync(&get(&handle)?.0, mode).map(|()| Outcome::Done),
+        Operation::LockExclusive { handle } => lock(&get(&handle)?.0).map(|()| Outcome::Done),
         Operation::Close { handle } => close(shared, &handle),
         Operation::ReadDirectory {
             path,
             max_entries,
             max_name_bytes,
         } => list_directory(&path, max_entries, max_name_bytes),
-        Operation::CreateDirectory { path } => {
-            fs::create_dir(path)?;
-            Ok(Outcome::Done)
-        }
+        Operation::CreateDirectory { path } => fs::create_dir(path).map(|()| Outcome::Done),
         Operation::Rename {
             source,
             destination,
-        } => {
-            fs::rename(source, destination)?;
-            Ok(Outcome::Done)
-        }
+        } => fs::rename(source, destination).map(|()| Outcome::Done),
         Operation::HardLink {
             source,
             destination,
-        } => {
-            fs::hard_link(source, destination)?;
-            Ok(Outcome::Done)
-        }
-        Operation::RemoveFile { path } => {
-            fs::remove_file(path)?;
-            Ok(Outcome::Done)
-        }
-        Operation::RemoveDirectory { path } => {
-            fs::remove_dir(path)?;
-            Ok(Outcome::Done)
-        }
+        } => fs::hard_link(source, destination).map(|()| Outcome::Done),
+        Operation::RemoveFile { path } => fs::remove_file(path).map(|()| Outcome::Done),
+        Operation::RemoveDirectory { path } => fs::remove_dir(path).map(|()| Outcome::Done),
     }
+}
+
+fn metadata(file: &File) -> io::Result<Outcome> {
+    let metadata = file.metadata()?;
+    Ok(Outcome::Metadata(Metadata {
+        kind: kind(metadata.file_type()),
+        length: metadata.len(),
+    }))
+}
+
+fn sync(file: &File, mode: SyncMode) -> io::Result<()> {
+    match mode {
+        SyncMode::Data => file.sync_data(),
+        SyncMode::All => file.sync_all(),
+    }
+}
+
+fn lock(file: &OwnedFile) -> io::Result<()> {
+    file.lock().map_err(|error| match error {
+        std::fs::TryLockError::WouldBlock => io::ErrorKind::WouldBlock.into(),
+        std::fs::TryLockError::Error(error) => error,
+    })
 }
 
 fn close(shared: &Shared, handle: &Handle) -> io::Result<Outcome> {
@@ -235,38 +208,93 @@ fn close(shared: &Shared, handle: &Handle) -> io::Result<Outcome> {
     if !files.entries.contains_key(&key) {
         return Err(io::ErrorKind::NotFound.into());
     }
-    files.owner.invalidate(handle);
+    files.owner.invalidate(handle)?;
     let closed = files.remove(key).ok_or(io::ErrorKind::NotFound)?;
     drop(files);
     drop(closed);
     Ok(Outcome::Done)
 }
 
-fn open(
-    shared: &Arc<Shared>,
-    origin: usize,
-    path: &Path,
+/// What an open expects at its path: a file with its access mode and flags, or
+/// a directory.
+#[derive(Clone, Copy)]
+struct Target {
     mode: Option<OpenMode>,
     direct: bool,
     data_sync: bool,
-) -> io::Result<Outcome> {
+}
+
+impl Target {
+    const DIRECTORY: Self = Self {
+        mode: None,
+        direct: false,
+        data_sync: false,
+    };
+
+    const fn file(mode: OpenMode, direct: bool, data_sync: bool) -> Self {
+        Self {
+            mode: Some(mode),
+            direct,
+            data_sync,
+        }
+    }
+
+    fn options(self) -> OpenOptions {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        if matches!(self.mode, Some(OpenMode::ReadWrite | OpenMode::CreateNew)) {
+            options.write(true);
+        }
+        if self.mode == Some(OpenMode::CreateNew) {
+            options.create_new(true);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut flags = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+            if self.mode.is_none() {
+                flags |= libc::O_DIRECTORY;
+            }
+            if self.direct {
+                flags |= libc::O_DIRECT;
+            }
+            if self.data_sync {
+                flags |= libc::O_DSYNC;
+            }
+            options.custom_flags(flags);
+        }
+        options
+    }
+}
+
+fn open(shared: &Arc<Shared>, origin: usize, path: &Path, target: Target) -> io::Result<Outcome> {
     let (key, reservation) = shared.with_reclaimed_files(|files| files.reserve(origin))?;
     // The reserved slot bounds even concurrent opens. No table lock spans I/O.
-    let result = open_file(path, mode, direct, data_sync);
+    let result = open_file(path, target);
     let mut files = shared.files();
     match result {
         Ok(file) => {
             let (handle, token) =
                 files
                     .owner
-                    .create_with_direct_io(key, handle_waker(shared), direct);
+                    .create_with_direct_io(key, handle_waker(shared), target.direct);
             let opened = Arc::new(Opened {
                 file: Arc::new(OwnedFile::new(file, reservation)),
                 token,
-                direct,
+                direct: target.direct,
             });
-            files.owner.bind(&handle, &opened);
-            files.entries.get_mut(&key).expect("reserved slot").open = Some(opened);
+            if let Err(error) = files.owner.bind(&handle, &opened) {
+                // Close the new file only after releasing the table lock.
+                files.remove(key);
+                drop(files);
+                return Err(error);
+            }
+            // Reclamation keeps reserved slots; only abandoned opens leave.
+            let slot = files
+                .entries
+                .get_mut(&key)
+                .ok_or_else(|| io::Error::other("reserved file slot vanished"))?;
+            slot.open = Some(opened);
             Ok(Outcome::Opened(handle))
         }
         Err(error) => {
@@ -316,68 +344,48 @@ fn list_directory(path: &Path, max_entries: usize, max_name_bytes: usize) -> io:
     Ok(Outcome::Directory(entries))
 }
 
-fn open_file(
-    path: &Path,
-    mode: Option<OpenMode>,
-    direct: bool,
-    data_sync: bool,
-) -> io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    if matches!(mode, Some(OpenMode::ReadWrite | OpenMode::CreateNew)) {
-        options.write(true);
-    }
-    if mode == Some(OpenMode::CreateNew) {
-        options.create_new(true);
-    }
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut flags = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
-        if mode.is_none() {
-            flags |= libc::O_DIRECTORY;
-        }
-        if direct {
-            flags |= libc::O_DIRECT;
-        }
-        if data_sync {
-            flags |= libc::O_DSYNC;
-        }
-        options.custom_flags(flags);
-    }
+fn open_file(path: &Path, target: Target) -> io::Result<File> {
     #[cfg(not(target_os = "linux"))]
-    if direct || data_sync {
+    if target.direct || target.data_sync {
         return Err(io::ErrorKind::Unsupported.into());
     }
-    let file = options.open(path)?;
+    let file = target.options().open(path)?;
     let metadata = file.metadata()?;
-    if if mode.is_some() {
-        !metadata.is_file()
+    let expected_kind = if target.mode.is_some() {
+        metadata.is_file()
     } else {
-        !metadata.is_dir()
-    } {
+        metadata.is_dir()
+    };
+    if !expected_kind {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "unexpected filesystem object type",
         ));
     }
     #[cfg(target_os = "linux")]
-    if direct {
-        use rustix::fs::{AtFlags, StatxFlags, statx};
-        let stat = statx(&file, "", AtFlags::EMPTY_PATH, StatxFlags::DIOALIGN)?;
-        if stat.stx_mask & StatxFlags::DIOALIGN.bits() != 0
-            && (stat.stx_dio_mem_align == 0
-                || stat.stx_dio_offset_align == 0
-                || !4096_u32.is_multiple_of(stat.stx_dio_mem_align)
-                || !4096_u32.is_multiple_of(stat.stx_dio_offset_align))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "unsupported direct-I/O alignment",
-            ));
-        }
+    if target.direct {
+        check_direct_alignment(&file)?;
     }
     Ok(file)
+}
+
+/// Direct I/O buffers and offsets are 4 KiB aligned; the device must accept that.
+#[cfg(target_os = "linux")]
+fn check_direct_alignment(file: &File) -> io::Result<()> {
+    use rustix::fs::{AtFlags, StatxFlags, statx};
+    let stat = statx(file, "", AtFlags::EMPTY_PATH, StatxFlags::DIOALIGN)?;
+    if stat.stx_mask & StatxFlags::DIOALIGN.bits() != 0
+        && (stat.stx_dio_mem_align == 0
+            || stat.stx_dio_offset_align == 0
+            || !4096_u32.is_multiple_of(stat.stx_dio_mem_align)
+            || !4096_u32.is_multiple_of(stat.stx_dio_offset_align))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unsupported direct-I/O alignment",
+        ));
+    }
+    Ok(())
 }
 
 fn kind(kind: fs::FileType) -> FileKind {

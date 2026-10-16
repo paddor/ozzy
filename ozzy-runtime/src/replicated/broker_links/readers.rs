@@ -1,13 +1,17 @@
 //! Shared PEER reader inboxes. Slow subscriptions cannot stop another link user.
 
 use super::{
-    Arc, BTreeMap, BrokerLinkError, BrokerLinks, BrokerLinksConfig, Bytes, LinkSessionId, Mutex,
-    NodeId, RequestId, Semaphore, StateSignal, driver, handshake,
+    Arc, BTreeMap, BrokerLinkError, BrokerLinks, BrokerLinksConfig, Bytes, LinkSessionId, NodeId,
+    Semaphore, Shared, StateSignal, driver, handshake,
 };
+use crate::transport::Frames;
 use omq_tokio::Message;
 use ozzy_proto::{EnvelopeLimits, Opcode, Packet, SubscriptionId, reader};
-use std::{collections::VecDeque, sync::Weak};
-use tokio::sync::OwnedSemaphorePermit;
+use std::{cell::RefCell, sync::Weak};
+
+mod inbox;
+pub(in crate::replicated) use inbox::Inbox;
+pub(super) use inbox::Sent;
 
 /// Aggregate SDK reader admission, including unread transport frames.
 #[derive(Clone, Copy, Debug)]
@@ -58,7 +62,8 @@ impl ReaderLinkLimits {
             .checked_mul(frame_slots(self.queue_messages))?
             .checked_add(decode)?
             .checked_add(receive.envelope.max_metadata_bytes.checked_add(256)?)?
-            .checked_add(std::mem::size_of::<Result<driver::Reply, BrokerLinkError>>())?;
+            .checked_add(std::mem::size_of::<Result<driver::Reply, BrokerLinkError>>())?
+            .checked_add(32768 + 2 * self.queue_messages * size_of::<Message>())?;
         let transport = message
             .checked_add(4096)?
             .checked_mul(self.queue_messages)?
@@ -67,69 +72,20 @@ impl ReaderLinkLimits {
     }
 }
 
+/// Reader slots and delivery signals, shared with application threads.
 #[derive(Debug)]
-struct Lease {
-    _permit: OwnedSemaphorePermit,
-}
-
-#[derive(Debug)]
-struct MessageLease {
-    permit: Option<OwnedSemaphorePermit>,
-    _subscription: Arc<Lease>,
-    changed: Arc<StateSignal>,
-}
-
-impl Drop for MessageLease {
-    fn drop(&mut self) {
-        drop(self.permit.take());
-        self.changed.notify_changed();
-    }
-}
-
-#[derive(Debug)]
-struct Selection {
-    broker: NodeId,
-    session: LinkSessionId,
-    request: RequestId,
-    subscribed: reader::Subscribed,
-}
-
-#[derive(Debug, Default)]
-struct State {
-    selected: Option<Selection>,
-    messages: VecDeque<Message>,
-    publications: VecDeque<Message>,
-    rejection: Option<Message>,
-}
-
-#[derive(Debug)]
-pub(in crate::replicated) struct Inbox {
-    pub(in crate::replicated) id: SubscriptionId,
-    state: Mutex<State>,
+pub(super) struct Admission {
+    slots: Arc<Semaphore>,
     queue: usize,
-    lease: Arc<Lease>,
-    frames: Arc<Semaphore>,
-    changed: Arc<StateSignal>,
+    maximum: usize,
+    limits: EnvelopeLimits,
+    /// An inbox gained input or released capacity.
+    pub(super) changed: Arc<StateSignal>,
+    /// Reader prefixes or endpoints changed, or an inbox was dropped.
     interests: Arc<StateSignal>,
 }
 
-#[derive(Debug)]
-struct Topology {
-    endpoints: BTreeMap<NodeId, Option<omq_tokio::Endpoint>>,
-    prefixes: BTreeMap<Bytes, BTreeMap<SubscriptionId, Weak<Inbox>>>,
-}
-
-#[derive(Debug)]
-pub(super) struct Registry {
-    entries: Mutex<BTreeMap<SubscriptionId, Weak<Inbox>>>,
-    slots: Arc<Semaphore>,
-    queue: usize,
-    pub(super) changed: Arc<StateSignal>,
-    topology: Mutex<Topology>,
-    pub(super) interests: Arc<StateSignal>,
-}
-
-impl Registry {
+impl Admission {
     pub(super) fn capacity(config: &BrokerLinksConfig) -> Result<(usize, usize), BrokerLinkError> {
         match config.reader {
             None => Ok((0, 0)),
@@ -154,55 +110,78 @@ impl Registry {
     pub(super) fn new(config: &BrokerLinksConfig) -> Result<Self, BrokerLinkError> {
         let (slots, queue) = Self::capacity(config)?;
         Ok(Self {
-            entries: Mutex::new(BTreeMap::new()),
             slots: Arc::new(Semaphore::new(slots)),
             queue,
+            maximum: crate::transport::message_size_limit(config.parameters.receive.envelope)
+                .ok_or(BrokerLinkError::Configuration)?,
+            limits: config.parameters.receive.envelope,
             changed: Arc::new(StateSignal::default()),
-            topology: Mutex::new(Topology {
-                endpoints: config.brokers.iter().map(|b| (b.node, None)).collect(),
-                prefixes: BTreeMap::new(),
-            }),
             interests: Arc::new(StateSignal::default()),
         })
     }
 
-    pub(in crate::replicated) fn register(
+    /// A new inbox holding one reader slot, for the driver to install.
+    fn inbox(
         &self,
+        context: &omq_tokio::Context,
         id: SubscriptionId,
-        prefix: Bytes,
     ) -> Result<Arc<Inbox>, BrokerLinkError> {
         let permit = self
             .slots
             .clone()
             .try_acquire_owned()
             .map_err(|_| BrokerLinkError::Configuration)?;
-        let inbox = Arc::new(Inbox {
-            id,
-            state: Mutex::new(State::default()),
-            queue: self.queue,
-            lease: Arc::new(Lease { _permit: permit }),
-            frames: Arc::new(Semaphore::new(frame_slots(self.queue))),
-            changed: self.changed.clone(),
-            interests: self.interests.clone(),
-        });
-        let mut entries = self.entries.lock().expect("reader registry poisoned");
-        entries.retain(|_, entry| entry.strong_count() != 0);
-        if entries.contains_key(&id) {
-            return Err(BrokerLinkError::Configuration);
+        Ok(Arc::new(Inbox::new(id, context, permit, self)))
+    }
+}
+
+/// A new inbox for the driver to install. Until then it holds the inbox,
+/// and with it a reader slot, so a lane with a place per slot never fills.
+#[derive(Debug)]
+pub(super) struct Registration {
+    inbox: Arc<Inbox>,
+    prefix: Bytes,
+}
+
+/// Reader state of the SDK thread: the inboxes by subscription, the
+/// publication prefixes they wait for, and each broker's PUB endpoint. The
+/// driver shares it with its SUB drivers on that thread.
+#[derive(Debug)]
+pub(super) struct Registry {
+    /// Installed when a SUBSCRIBE is sent, so its records always find it.
+    entries: RefCell<BTreeMap<SubscriptionId, Weak<Inbox>>>,
+    prefixes: RefCell<BTreeMap<Bytes, BTreeMap<SubscriptionId, Weak<Inbox>>>>,
+    endpoints: RefCell<BTreeMap<NodeId, Option<omq_tokio::Endpoint>>>,
+    changed: Arc<StateSignal>,
+    pub(super) interests: Arc<StateSignal>,
+}
+
+impl Registry {
+    pub(super) fn new(config: &BrokerLinksConfig, admission: &Admission) -> Self {
+        Self {
+            entries: RefCell::new(BTreeMap::new()),
+            prefixes: RefCell::new(BTreeMap::new()),
+            endpoints: RefCell::new(config.brokers.iter().map(|b| (b.node, None)).collect()),
+            changed: admission.changed.clone(),
+            interests: admission.interests.clone(),
         }
-        entries.insert(id, Arc::downgrade(&inbox));
-        let mut topology = self.topology.lock().expect("reader topology poisoned");
-        topology.prefixes.retain(|_, entries| {
+    }
+
+    /// Fan publications under the registration's prefix out to its inbox.
+    /// Returns the inbox for its lanes to be initialized.
+    pub(super) fn register(&self, Registration { inbox, prefix }: Registration) -> Arc<Inbox> {
+        let mut prefixes = self.prefixes.borrow_mut();
+        prefixes.retain(|_, entries| {
             entries.retain(|_, entry| entry.strong_count() != 0);
             !entries.is_empty()
         });
-        topology
-            .prefixes
+        prefixes
             .entry(prefix)
             .or_default()
-            .insert(id, Arc::downgrade(&inbox));
+            .insert(inbox.id, Arc::downgrade(&inbox));
+        drop(prefixes);
         self.interests.notify_changed();
-        Ok(inbox)
+        inbox
     }
 
     pub(super) fn topic(
@@ -219,38 +198,29 @@ impl Registry {
                     .map_err(BrokerLinkError::from)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let mut topology = self.topology.lock().expect("reader topology poisoned");
+        let mut installed = self.endpoints.borrow_mut();
         if endpoints.iter().any(|(node, endpoint)| {
-            topology
-                .endpoints
+            installed
                 .get(node)
                 .is_none_or(|old| old.as_ref().is_some_and(|old| old != endpoint))
         }) {
             return Err(BrokerLinkError::Configuration);
         }
         for (node, endpoint) in endpoints {
-            topology.endpoints.insert(node, Some(endpoint));
+            installed.insert(node, Some(endpoint));
         }
-        drop(topology);
+        drop(installed);
         self.interests.notify_changed();
         Ok(())
     }
 
     pub(super) fn endpoint(&self, node: NodeId) -> Option<omq_tokio::Endpoint> {
-        self.topology
-            .lock()
-            .expect("reader topology poisoned")
-            .endpoints
-            .get(&node)
-            .cloned()
-            .flatten()
+        self.endpoints.borrow().get(&node).cloned().flatten()
     }
 
     pub(super) fn prefixes(&self) -> std::collections::BTreeSet<Bytes> {
-        self.topology
-            .lock()
-            .expect("reader topology poisoned")
-            .prefixes
+        self.prefixes
+            .borrow()
             .iter()
             .filter(|(_, entries)| entries.values().any(|entry| entry.strong_count() != 0))
             .map(|(prefix, _)| prefix.clone())
@@ -258,11 +228,9 @@ impl Registry {
     }
 
     pub(super) fn publication(&self, broker: NodeId, message: &Message, limits: EnvelopeLimits) {
-        if message.len() != 4 {
+        let Some((_, frames)) = message.routed_packet() else {
             return;
-        }
-        let frames =
-            std::array::from_fn::<_, 3, _>(|i| message.part_slice(i + 1).expect("four frames"));
+        };
         let Ok(packet) = ozzy_proto::decode_packet(&frames, limits) else {
             return;
         };
@@ -281,66 +249,55 @@ impl Registry {
         if message.part_slice(0) != Some(prefix.as_slice()) {
             return;
         }
-        let targets = self
-            .topology
-            .lock()
-            .expect("reader topology poisoned")
-            .prefixes
-            .get(prefix.as_slice())
-            .map(|entries| {
-                entries
-                    .values()
-                    .filter_map(Weak::upgrade)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let mut changed = false;
-        for inbox in targets {
-            let mut state = inbox.state.lock().expect("reader inbox poisoned");
-            if state.publications.len() < inbox.queue
-                && let Some(message) = inbox.compact(message)
-            {
-                state.publications.push_back(message);
-                changed = true;
+        let targets = self.prefixes.borrow();
+        if let Some(entries) = targets.get(prefix.as_slice()) {
+            let mut accepted = false;
+            for inbox in entries.values().filter_map(Weak::upgrade) {
+                accepted |= inbox.push(message, true);
             }
-        }
-        if changed {
-            self.changed.notify_changed();
+            if accepted {
+                self.changed.notify_changed();
+            }
         }
     }
 
-    pub(super) fn select(
-        &self,
-        broker: NodeId,
-        session: LinkSessionId,
-        request: RequestId,
-        subscribe: &reader::Subscribe,
-    ) {
+    /// Install the selection of a SUBSCRIBE just sent, unless its inbox is
+    /// gone or belongs to another subscription.
+    pub(super) fn select(&self, inbox: &Weak<Inbox>, sent: Sent, subscribe: &reader::Subscribe) {
         let Some(source) = subscribe.target.group_source() else {
             return;
         };
-        let Some(inbox) = self
-            .entries
-            .lock()
-            .expect("reader registry poisoned")
-            .get(&subscribe.subscription.id)
-            .and_then(Weak::upgrade)
+        let Some(inbox) = inbox
+            .upgrade()
+            .filter(|inbox| inbox.id == subscribe.subscription.id)
         else {
             return;
         };
-        let mut state = inbox.state.lock().expect("reader inbox poisoned");
-        state.messages.clear();
-        state.rejection = None;
-        state.selected = Some(Selection {
-            broker,
-            session,
-            request,
-            subscribed: reader::Subscribed {
+        let mut entries = self.entries.borrow_mut();
+        entries.retain(|_, entry| entry.strong_count() != 0);
+        entries.insert(inbox.id, Arc::downgrade(&inbox));
+        drop(entries);
+        inbox.select(
+            sent,
+            reader::Subscribed {
                 resolved_offset: 0,
                 subscription: subscribe.subscription,
                 source,
             },
-        });
+        );
+    }
+
+    /// An UNSUBSCRIBE was just sent: later frames of that generation are
+    /// dropped here, and a source paused on its full inbox can resume.
+    pub(super) fn unselect(&self, selected: &reader::Subscribed) {
+        let entries = self.entries.borrow();
+        if let Some(inbox) = entries
+            .get(&selected.subscription.id)
+            .and_then(Weak::upgrade)
+            && inbox.unselect(selected.subscription)
+        {
+            self.changed.notify_changed();
+        }
     }
 
     pub(super) fn receive(
@@ -350,144 +307,46 @@ impl Registry {
         packet: Packet<'_>,
         limits: EnvelopeLimits,
     ) -> Result<bool, Arc<Inbox>> {
-        let entries = self.entries.lock().expect("reader registry poisoned");
+        let entries = self.entries.borrow();
         let target = if packet.envelope.opcode == Opcode::Records {
             reader::route_subscription(packet, limits)
                 .ok()
                 .and_then(|(subscription, source)| {
                     let inbox = entries.get(&subscription.id)?.upgrade()?;
-                    let current = inbox
-                        .state
-                        .lock()
-                        .expect("reader inbox poisoned")
-                        .selected
-                        .as_ref()
-                        .is_some_and(|selected| {
-                            selected.broker == broker
-                                && Some(selected.session) == packet.envelope.session
-                                && selected.subscribed.subscription == subscription
-                                && selected.subscribed.source == source
-                        });
-                    current.then_some(inbox)
+                    inbox
+                        .matches_records(broker, packet.envelope.session, subscription, source)
+                        .then_some(inbox)
                 })
         } else {
             entries.values().filter_map(Weak::upgrade).find(|inbox| {
-                inbox
-                    .state
-                    .lock()
-                    .expect("reader inbox poisoned")
-                    .selected
-                    .as_ref()
-                    .is_some_and(|selected| {
-                        selected.broker == broker
-                            && Some(selected.session) == packet.envelope.session
-                            && Some(selected.request) == packet.envelope.request_id
-                    })
+                inbox.matches_request(broker, packet.envelope.session, packet.envelope.request_id)
             })
         };
         drop(entries);
         if let Some(inbox) = target {
-            let mut state = inbox.state.lock().expect("reader inbox poisoned");
             if packet.envelope.opcode == Opcode::Nack {
-                // One terminal reply has reserved metadata backing independent
-                // of record aliases. Slow readers cannot stall control replies.
-                state.rejection =
-                    Some(Message::multipart((0..4).map(|i| {
-                        Bytes::copy_from_slice(message.part_slice(i).expect("four frames"))
-                    })));
+                inbox.reject(message);
+            } else if !inbox.push(message, false) {
+                return Err(inbox);
             } else {
-                let compact = (state.messages.len() < inbox.queue)
-                    .then(|| inbox.compact(message))
-                    .flatten();
-                let Some(message) = compact else {
-                    drop(state);
-                    return Err(inbox);
-                };
-                state.messages.push_back(message);
+                self.changed.notify_changed();
             }
-            drop(state);
-            self.changed.notify_changed();
         }
         Ok(true)
     }
 }
 
-impl Inbox {
-    pub(in crate::replicated) fn has_capacity(&self) -> bool {
-        self.frames.available_permits() > 0
-    }
-
-    fn compact(&self, message: &Message) -> Option<Message> {
-        let lease = Arc::new(MessageLease {
-            permit: Some(self.frames.clone().try_acquire_owned().ok()?),
-            _subscription: self.lease.clone(),
-            changed: self.changed.clone(),
-        });
-        Some(Message::multipart_payloads((0..4).map(|i| {
-            omq_tokio::message::Payload::from_bytes(Bytes::from_owner(Frame {
-                bytes: Bytes::copy_from_slice(message.part_slice(i).expect("four frames")),
-                _lease: lease.clone(),
-            }))
-        })))
-    }
-
-    pub(in crate::replicated) fn publication(&self) -> Option<Message> {
-        self.state
-            .lock()
-            .expect("reader inbox poisoned")
-            .publications
-            .pop_front()
-    }
-    pub(in crate::replicated) fn selected(
-        &self,
-    ) -> Option<(NodeId, LinkSessionId, reader::Subscribed)> {
-        self.state
-            .lock()
-            .expect("reader inbox poisoned")
-            .selected
-            .as_ref()
-            .map(|selected| (selected.broker, selected.session, selected.subscribed))
-    }
-    pub(in crate::replicated) fn pop(&self) -> Option<Message> {
-        let mut state = self.state.lock().expect("reader inbox poisoned");
-        let message = state
-            .messages
-            .pop_front()
-            .or_else(|| state.rejection.take());
-        drop(state);
-        if message.is_some() {
-            self.changed.notify_changed();
+/// Bind and probe a new inbox's lanes. A failure stops the SDK owner.
+pub(super) async fn initialize(inbox: Arc<Inbox>, shared: Arc<Shared>) {
+    tokio::select! {
+        () = shared.stop.closed() => {},
+        result = inbox.initialize() => {
+            if let Err(error) = result {
+                let _ = shared.failure.set(error.to_string());
+                shared.stop.close();
+            }
         }
-        message
     }
-    pub(in crate::replicated) fn clear(&self) {
-        let mut state = self.state.lock().expect("reader inbox poisoned");
-        state.messages.clear();
-        state.selected = None;
-        state.rejection = None;
-        drop(state);
-        self.changed.notify_changed();
-    }
-    pub(in crate::replicated) fn reset_delivery(&self) {
-        let mut state = self.state.lock().expect("reader inbox poisoned");
-        state.messages.clear();
-        state.rejection = None;
-        drop(state);
-        self.changed.notify_changed();
-        // Keep uncertain broker state available to close. A replacement
-        // Subscribe overwrites this selection and fences its queued records.
-    }
-}
-
-impl Drop for Inbox {
-    fn drop(&mut self) {
-        self.interests.notify_changed();
-    }
-}
-
-struct Frame {
-    bytes: Bytes,
-    _lease: Arc<MessageLease>,
 }
 
 fn frame_slots(queue: usize) -> usize {
@@ -496,52 +355,55 @@ fn frame_slots(queue: usize) -> usize {
 
 #[cfg(test)]
 mod tests;
-impl AsRef<[u8]> for Frame {
-    fn as_ref(&self) -> &[u8] {
-        &self.bytes
-    }
-}
-
 impl BrokerLinks {
     #[cfg(test)]
-    pub(crate) fn inject_reader_publication(&self, broker: NodeId, message: &Message) {
-        self.0.shared.readers.publication(
+    pub(crate) async fn inject_reader_publication(&self, broker: NodeId, message: &Message) {
+        let (reply, received) = tokio::sync::oneshot::channel();
+        let publication = driver::Registration::Publication {
             broker,
-            message,
-            self.0.config.parameters.receive.envelope,
-        );
-    }
-    pub(in crate::replicated) fn reader_publications(
-        &self,
-        topic: &crate::topic_metadata::TopicMetadata,
-    ) -> Result<(), BrokerLinkError> {
-        self.0.shared.readers.topic(topic)
+            message: message.clone(),
+            reply,
+        };
+        if self.0.registrations.send(publication).await.is_ok() {
+            let _ = received.await;
+        }
     }
     pub(in crate::replicated) fn reader_inbox(
         &self,
         prefix: Bytes,
     ) -> Result<Arc<Inbox>, BrokerLinkError> {
-        self.0.shared.readers.register(
-            SubscriptionId::from_bytes(*self.next_request()?.as_bytes()),
-            prefix,
-        )
+        // Request IDs never repeat, so neither do subscription IDs.
+        let id = SubscriptionId::from_bytes(*self.next_request()?.as_bytes());
+        let inbox = self.0.shared.readers.inbox(self.0.runtime.context(), id)?;
+        // The lane has a place for every slot: only a stopped driver refuses.
+        self.0
+            .inboxes
+            .try_send(Registration {
+                inbox: inbox.clone(),
+                prefix,
+            })
+            .map_err(|_| self.closed_error())?;
+        Ok(inbox)
     }
     pub(in crate::replicated) fn reader_parameters(&self) -> handshake::Parameters {
         self.0.config.parameters
     }
+    #[inline]
     pub(in crate::replicated) fn reader_generation(&self) -> u64 {
         self.0.shared.readers.changed.generation()
     }
     pub(in crate::replicated) async fn reader_changed_after(&self, seen: u64) {
         self.0.shared.readers.changed.changed_after(seen).await;
     }
+    /// Subscribe `inbox`, which takes the records once the request is sent.
     pub(in crate::replicated) async fn subscribe(
         &self,
         broker: NodeId,
+        inbox: Weak<Inbox>,
         subscribe: reader::Subscribe,
     ) -> Result<reader::Subscribed, BrokerLinkError> {
         match self
-            .request(broker, driver::Body::Subscribe(subscribe))
+            .request(broker, driver::Body::Subscribe { subscribe, inbox })
             .await?
         {
             driver::Reply::Subscribed(selected) => Ok(selected),
@@ -618,7 +480,7 @@ impl BrokerLinks {
                     ..
                 }) if self.0.config.clock.now() < deadline => {
                     self.0
-                        .config
+                        .shared
                         .clock
                         .until(
                             self.0

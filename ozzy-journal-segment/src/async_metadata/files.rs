@@ -1,7 +1,7 @@
 use super::Limits;
 use crate::{
     DirectoryError,
-    directory::{evidence, publication::algorithm},
+    directory::{LOCK_FILE, evidence, publication},
 };
 use ozzy_io::{
     Class, Completed, Handle, Local, OpenMode, Operation, Outcome, SyncMode, WriteBuffer,
@@ -29,25 +29,7 @@ impl Files {
         limits: Limits,
         create_lock: bool,
     ) -> Result<Self, DirectoryError> {
-        let needed = limits.chunk_bytes.checked_mul(2).and_then(|n| {
-            n.checked_add(
-                4096 + size_of::<bytes::Bytes>() + size_of::<Operation>() + size_of::<Handle>(),
-            )
-        });
-        if limits.chunk_bytes < crate::directory::evidence::RECORD_BYTES
-            || limits.chunk_bytes > limits.max_file_bytes
-            || needed.is_none_or(|n| {
-                n > io
-                    .admission()
-                    .limits()
-                    .share(io.shard(), Class::Progress)
-                    .bytes
-            })
-        {
-            return Err(
-                io::Error::new(io::ErrorKind::InvalidInput, "invalid metadata I/O limits").into(),
-            );
-        }
+        check_limits(&io, limits)?;
         let directory = opened(
             io.execute(
                 Class::Progress,
@@ -55,26 +37,7 @@ impl Files {
             )
             .await?,
         )?;
-        let open = |mode| Operation::Open {
-            path: root.join("group.lock"),
-            mode,
-            direct: false,
-            data_sync: false,
-        };
-        let lock = match io.execute(Class::Progress, open(OpenMode::ReadWrite)).await {
-            Ok(result) => opened(result)?,
-            Err(error) if create_lock && error.kind() == io::ErrorKind::NotFound => {
-                match io.execute(Class::Progress, open(OpenMode::CreateNew)).await {
-                    Ok(result) => opened(result)?,
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => opened(
-                        io.execute(Class::Progress, open(OpenMode::ReadWrite))
-                            .await?,
-                    )?,
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let lock = open_lock(&io, &root, create_lock).await?;
         done(
             io.execute(
                 Class::Progress,
@@ -220,7 +183,7 @@ impl Files {
         if !matches!(components.next(), Some(Component::Normal(_)))
             || components.next().is_some()
             || name.contains(['/', '\\'])
-            || name == "group.lock"
+            || name == LOCK_FILE
             || bytes > self.limits.max_file_bytes
         {
             return Err(io::Error::new(
@@ -313,6 +276,55 @@ impl Files {
     }
 }
 
+/// A metadata chunk must hold one evidence record, fit one file, and leave
+/// two transfers within this shard's progress byte share.
+fn check_limits(io: &Local, limits: Limits) -> Result<(), DirectoryError> {
+    let needed = limits.chunk_bytes.checked_mul(2).and_then(|n| {
+        n.checked_add(
+            4096 + size_of::<bytes::Bytes>() + size_of::<Operation>() + size_of::<Handle>(),
+        )
+    });
+    let share = io
+        .admission()
+        .limits()
+        .share(io.shard(), Class::Progress)?
+        .bytes;
+    if limits.chunk_bytes < crate::directory::evidence::RECORD_BYTES
+        || limits.chunk_bytes > limits.max_file_bytes
+        || needed.is_none_or(|n| n > share)
+    {
+        return Err(
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid metadata I/O limits").into(),
+        );
+    }
+    Ok(())
+}
+
+/// Open the lock file, creating it only when asked. A concurrent creator
+/// wins the race; this owner then opens its file.
+async fn open_lock(io: &Local, root: &Path, create_lock: bool) -> Result<Handle, DirectoryError> {
+    let open = |mode| Operation::Open {
+        path: root.join(LOCK_FILE),
+        mode,
+        direct: false,
+        data_sync: false,
+    };
+    match io.execute(Class::Progress, open(OpenMode::ReadWrite)).await {
+        Ok(result) => opened(result),
+        Err(error) if create_lock && error.kind() == io::ErrorKind::NotFound => {
+            match io.execute(Class::Progress, open(OpenMode::CreateNew)).await {
+                Ok(result) => opened(result),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => opened(
+                    io.execute(Class::Progress, open(OpenMode::ReadWrite))
+                        .await?,
+                ),
+                Err(error) => Err(error.into()),
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn opened(result: Completed) -> Result<Handle, DirectoryError> {
     let handle = match &*result {
         Outcome::Opened(handle) => Ok(handle.clone()),
@@ -335,7 +347,7 @@ fn unexpected() -> DirectoryError {
     io::Error::new(io::ErrorKind::InvalidData, "unexpected metadata I/O result").into()
 }
 
-impl algorithm::Io for Files {
+impl publication::Io for Files {
     async fn exists(&mut self, name: &str) -> Result<bool, DirectoryError> {
         match self.open_file(name, OpenMode::Read).await {
             Ok(handle) => self.close(handle, Ok(true)).await,
@@ -418,7 +430,7 @@ impl algorithm::Io for Files {
     }
 }
 
-impl algorithm::Overwrite for Files {
+impl publication::Overwrite for Files {
     async fn write_synced(
         &mut self,
         name: &str,
