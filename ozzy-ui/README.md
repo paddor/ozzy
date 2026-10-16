@@ -22,11 +22,14 @@ ozzy-tui --config deployment.toml --broker broker-0
 | Key | Screen | Shows |
 | --- | --- | --- |
 | `1` | Broker | Identity, connected clients, cluster members with link state and the partitions each leads, partition totals, key counters |
-| `2` | Partitions | Each local partition's state, leader, record offsets, producers, commit rate, pending work, and cleanup |
+| `2` | Partitions | Each local partition's state, leader, record offsets, producers, segments and their size, dedup fill, commit rate, pending work, and cleanup; the selected partition's retention policy and dedup limit |
 | `3` | Replication | Links to the other brokers, repair counters, and each partition's journal progress and how far each broker is behind |
-| `4` | Groups | Consumer groups with their lag; the selected group's members and its cursor on each partition |
+| `4` | Groups | Consumer groups with their lag; the selected group's members and its cursor on each partition; `d` deletes the selected group after a `y` |
 | `5` | Threads | Every event counter, totaled or for one thread |
 
+- A single broker replicates nothing: it has no Replication screen, Groups
+  is `3`, and Threads is `4`. The Broker screen leaves out cluster members
+  and elections.
 - Tab and Shift+Tab cycle screens.
 - Arrows, PgUp/PgDn, Home/End (or `j`, `k`, `g`, `G`) select rows. Left and
   Right (or `h`, `l`) switch panes on Groups and Threads.
@@ -49,5 +52,7 @@ ozzy-tui --config deployment.toml --broker broker-0
 
 `App` holds the console state and draws it with ratatui. It does no I/O and
 reads no clock, so any frontend can drive it: ask `App::requests` what to
-send, then feed it replies, link changes, keys, and mouse events. The default
-`terminal` feature adds the `client` module and the binary.
+send, then feed it replies, link changes, keys, and mouse events. A key can
+return `Action::Command`; send it and feed its reply to
+`App::command_reply`. The default `terminal` feature adds the `client`
+module and the binary.

@@ -7,7 +7,7 @@ use crate::{
     format,
     model::{Behind, PartitionRow, REPAIRS},
 };
-use ozzy_proto::admin::{PartitionState, PartitionStatus};
+use ozzy_proto::admin::{PartitionLog, PartitionState, PartitionStatus};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -17,7 +17,7 @@ use ratatui::{
 };
 use std::borrow::Cow;
 
-const PARTITION_COLUMNS: [Column; 14] = [
+const PARTITION_COLUMNS: [Column; 17] = [
     column("Partition", 9, true),
     column("Shard", 5, true),
     column("State", 9, true),
@@ -26,6 +26,9 @@ const PARTITION_COLUMNS: [Column; 14] = [
     column("First offset", 12, false),
     column("Next offset", 12, true),
     column("Producers", 9, false),
+    column("Segs", 4, false),
+    column("Size", 10, false),
+    column("Dedup", 6, false),
     column("Committed op", 12, true),
     column("Ops/s", 7, true),
     column("Pending", 8, true),
@@ -110,6 +113,14 @@ impl App {
         );
         let log = status.log.as_ref();
         let offset = |offset: Option<u64>| offset.map(format::count).unwrap_or_default();
+        let storage = log.filter(|log| log.segments > 0);
+        let dedup = log.and_then(|log| {
+            let limit = log.dedup_limit?.get();
+            Some(format!(
+                "{}%",
+                format::rate(log.dedup_entries as f64 * 100.0 / limit as f64)
+            ))
+        });
         vec![
             shard,
             state.into(),
@@ -118,6 +129,13 @@ impl App {
             Cell::from(offset(log.map(|log| log.first_offset))),
             Cell::from(offset(log.map(|log| log.next_offset))),
             Cell::from(offset(log.map(|log| log.producers.into()))),
+            Cell::from(offset(storage.map(|log| log.segments.into()))),
+            Cell::from(
+                storage
+                    .map(|log| format::bytes(log.segment_bytes as f64))
+                    .unwrap_or_default(),
+            ),
+            Cell::from(dedup.unwrap_or_default()),
             Cell::from(format::count(status.committed)),
             Cell::from(row.rate.map(format::rate).unwrap_or_default()),
             Cell::from(format::count(status.pending_operations)),
@@ -221,8 +239,8 @@ fn no_answer() -> Cell<'static> {
     "no answer".red().into()
 }
 
-/// The line under the partition table: the selected row's group and what
-/// it waits for.
+/// The line under the partition table: the selected row's group, its
+/// retention and deduplication limits, and what it waits for.
 fn partition_detail(row: &PartitionRow<'_>) -> String {
     let note = row.status.map_or("no answer from its shard", |status| {
         if status.disk_pending {
@@ -231,5 +249,36 @@ fn partition_detail(row: &PartitionRow<'_>) -> String {
             ""
         }
     });
-    format!("group {}  {note}", row.group)
+    let limits = row
+        .status
+        .and_then(|status| status.log.as_ref())
+        .map_or_else(String::new, limits);
+    format!("group {}{limits}  {note}", row.group)
+}
+
+fn limits(log: &PartitionLog) -> String {
+    let mut retention = [
+        log.retention_age_millis
+            .map(|age| format!("age {}", format::age(age.get()))),
+        log.retention_bytes
+            .map(|bytes| format!("size {}", format::bytes(bytes.get() as f64))),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(", ");
+    if retention.is_empty() {
+        retention = "keep all".into();
+    }
+    let dedup = log.dedup_limit.map_or_else(String::new, |limit| {
+        format!(
+            "  dedup {} of {}",
+            format::count(log.dedup_entries),
+            format::count(limit.get())
+        )
+    });
+    format!(
+        "  retention {retention} (revision {}){dedup}",
+        log.policy_revision
+    )
 }

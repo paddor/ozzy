@@ -110,6 +110,8 @@ async fn run(
                 match update {
                     Update::Reply(reply) => app.reply(reply),
                     Update::Failed(message) => app.failed(message),
+                    Update::Command(reply) => app.command_reply(reply),
+                    Update::CommandFailed(message) => app.command_failed(message),
                 }
                 Action::None
             }
@@ -130,6 +132,11 @@ async fn run(
                 app.link(up);
                 if !up {
                     tick.reset_after(CONNECT_POLL);
+                }
+            }
+            Action::Command(request) => {
+                if let Err(message) = client.command(&request) {
+                    app.command_failed(message);
                 }
             }
         }

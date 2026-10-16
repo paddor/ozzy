@@ -6,7 +6,7 @@ use ozzy_proto::ConsumerMemberId;
 use ozzy_runtime::replicated::{GroupReader, GroupReaderConfig, WriterRuntime};
 use ozzy_sim::broker::{Shape, deployment_with_resources, start_brokers};
 use ozzy_ui::{
-    App, Key,
+    Action, App, Key,
     client::{Client, Update},
 };
 use ratatui::{Terminal, backend::TestBackend};
@@ -21,17 +21,23 @@ fn host() -> HostResources {
     }
 }
 
-/// Wait for the handshake, then apply every reply of one refresh.
+/// Wait for the handshake, then apply every reply of one refresh and any
+/// command reply that arrives meanwhile.
 async fn refresh(client: &mut Client, app: &mut App) {
     let requests = app.requests();
     while !client.refresh(&requests).await {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     app.link(true);
-    for _ in &requests {
+    let mut replies = 0;
+    while replies < requests.len() {
         match client.update().await {
-            Update::Reply(reply) => app.reply(reply),
-            Update::Failed(message) => panic!("{message}"),
+            Update::Reply(reply) => {
+                app.reply(reply);
+                replies += 1;
+            }
+            Update::Command(reply) => app.command_reply(reply),
+            Update::Failed(message) | Update::CommandFailed(message) => panic!("{message}"),
         }
     }
 }
@@ -56,6 +62,31 @@ fn assert_shows(text: &str, expected: &[&str]) {
     }
 }
 
+/// Every partition shows its storage, and the selected one its limits. A
+/// busy journal answers without its committed state, so refresh until the
+/// limits show.
+async fn assert_partitions(client: &mut Client, app: &mut App) {
+    app.key(Key::Char('2'));
+    let text = loop {
+        let text = screen(app);
+        if text.contains("retention") {
+            break text;
+        }
+        refresh(client, app).await;
+    };
+    assert_shows(
+        &text,
+        &[
+            "orders/0",
+            "orders/2",
+            "local",
+            "Next offset",
+            "Segs",
+            "retention keep all (revision 1)",
+        ],
+    );
+}
+
 /// One member reads; the Groups screen shows it on every partition's
 /// cursor once its plan and assignments commit, and the Broker screen
 /// counts it as a client.
@@ -72,7 +103,7 @@ async fn assert_groups(writer: &ozzy_sim::client::Client, client: &mut Client, a
     .unwrap();
     let record = reader.next().await.unwrap();
     drop(reader.acknowledge(record.token).unwrap());
-    app.key(Key::Char('4'));
+    app.key(Key::Char('3'));
     let text = loop {
         refresh(client, app).await;
         let text = screen(app);
@@ -88,6 +119,25 @@ async fn assert_groups(writer: &ozzy_sim::client::Client, client: &mut Client, a
     assert_shows(&screen(app), &["2 of", "Groups         1"]);
     reader.close().await.unwrap();
     links.shutdown().await.unwrap();
+    assert_delete(client, app).await;
+}
+
+/// The console deletes the group after asking.
+async fn assert_delete(client: &mut Client, app: &mut App) {
+    app.key(Key::Char('3'));
+    app.key(Key::Char('d'));
+    assert_shows(&screen(app), &["Delete group orders/workers? y deletes"]);
+    let Action::Command(request) = app.key(Key::Char('y')) else {
+        panic!("a delete command expected");
+    };
+    client.command(&request).unwrap();
+    loop {
+        refresh(client, app).await;
+        if screen(app).contains("deleted orders/workers") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -117,20 +167,12 @@ async fn console_shows_a_serving_broker() {
         writer.confirm(pending).await;
         refresh(&mut client, &mut app).await;
         let text = screen(&mut app);
-        assert_shows(&text, &["broker-0", "connected", "this broker", "1 of"]);
+        assert_shows(&text, &["broker-0", "connected", "1 of", "Tab/1-4"]);
+        assert!(!text.contains("Replication"), "{text}");
         assert_ne!(value(&text, "Commits/s"), "0", "{text}");
         assert_ne!(value(&text, "Appends confirmed"), "0", "{text}");
-        app.key(Key::Char('2'));
-        assert_shows(
-            &screen(&mut app),
-            &["orders/0", "orders/2", "local", "Next offset"],
-        );
-        app.key(Key::Char('3'));
-        assert_shows(
-            &screen(&mut app),
-            &["Replication", "Links", "Repairs", "leader", "Durable"],
-        );
-        app.key(Key::Char('5'));
+        assert_partitions(&mut client, &mut app).await;
+        app.key(Key::Char('4'));
         assert_shows(
             &screen(&mut app),
             &["all threads", "ozzy/shard/0", "exited", "shard_turn"],

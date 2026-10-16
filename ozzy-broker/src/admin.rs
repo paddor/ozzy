@@ -2,10 +2,10 @@
 //! from the telemetry registry, partition status from each shard over an
 //! inproc lane, links from the frontend's published observations. It never
 //! takes part in admission or confirmation, and a slow client or shard costs
-//! only its own reply.
+//! only its own reply. Group deletion runs beside the other requests.
 
 use crate::{CheckedConfig, StartupError, signal::CloseSignal};
-use omq_tokio::{Context, Endpoint, IdentitySocket, Message, SocketType};
+use omq_tokio::{Context, Endpoint, Identity, IdentitySocket, Message, SocketType};
 use ozzy_proto::admin::{
     self, Broker, Connections, Counters, EventKind, GroupCursor, GroupStatus, PartitionLog,
     PartitionName, Partitions, Reply, Request,
@@ -30,6 +30,8 @@ const QUEUE: u32 = 16;
 /// The admin owner's identity on the shard lane.
 const LANE_IDENTITY: &[u8] = b"admin";
 
+mod groups;
+
 /// The bound admin sockets, waiting for their thread.
 #[derive(Debug)]
 pub(crate) struct Admin {
@@ -40,6 +42,7 @@ pub(crate) struct Admin {
     /// Local shard IDs, which can be sparse.
     shard_ids: Vec<u32>,
     started: Instant,
+    deleter: groups::Deleter,
 }
 
 impl Admin {
@@ -51,6 +54,7 @@ impl Admin {
         context: &Context,
         local: NodeId,
         max_clients: usize,
+        clock: ozzy_runtime::replicated::SdkClock,
     ) -> Result<Option<Self>, StartupError> {
         let Some(endpoint) = &checked.local_broker()?.endpoints.admin else {
             return Ok(None);
@@ -67,16 +71,19 @@ impl Admin {
                 ozzy_proto::RequestId::new()
             ))
             .map_err(failure)?;
+        let public = public.into_async().identity_routing().map_err(failure)?;
+        let replies = public.clone_shared().identity_routing().map_err(failure)?;
         Ok(Some(Self {
             hooks: Hooks {
                 lane,
                 links: Arc::default(),
             },
-            public: public.into_async().identity_routing().map_err(failure)?,
+            public,
             shards: shards.into_async().identity_routing().map_err(failure)?,
             broker: broker(checked, local, max_clients)?,
             shard_ids: checked.plan.shards.iter().map(|shard| shard.id).collect(),
             started: Instant::now(),
+            deleter: groups::Deleter::new(checked, context, clock, replies)?,
         }))
     }
 
@@ -116,16 +123,20 @@ impl Admin {
             next += 1;
             let reply = tokio::select! {
                 () = stop.closed() => break,
-                reply = self.answer(&request, next) => reply,
+                reply = self.answer(&peer, &request, next) => reply,
             };
             // A client that stopped reading loses its reply, not the broker.
-            let _ = self.public.try_send_to(&peer, Message::from(reply));
+            if let Some(reply) = reply {
+                let _ = self.public.try_send_to(&peer, Message::from(reply));
+            }
         }
+        self.deleter.stop();
         let _ = self.public.into_inner().close().await;
         let _ = self.shards.into_inner().close().await;
     }
 
-    async fn answer(&mut self, request: &[u8], sequence: u64) -> Vec<u8> {
+    /// The encoded reply, or `None` when a group deletion answers later.
+    async fn answer(&mut self, peer: &Identity, request: &[u8], sequence: u64) -> Option<Vec<u8>> {
         let (id, reply) = match admin::decode_request(request) {
             Ok((id, Request::Broker)) => {
                 self.broker.uptime_ms = self.uptime_ms();
@@ -134,14 +145,20 @@ impl Admin {
             Ok((id, Request::Counters)) => (id, Reply::Counters(self.counters())),
             Ok((id, Request::Partitions)) => (id, self.partitions(sequence).await),
             Ok((id, Request::Connections)) => (id, Reply::Connections(self.connections())),
+            Ok((id, Request::DeleteGroup { topic, name })) => {
+                match self.deleter.start(peer.clone(), id, topic, name) {
+                    Ok(()) => return None,
+                    Err(reply) => (id, reply),
+                }
+            }
             Err(_) => (
                 admin::request_id(request).unwrap_or(0),
                 Reply::Error("unknown request".into()),
             ),
         };
-        admin::encode_reply(id, &reply).unwrap_or_else(|error| {
+        Some(admin::encode_reply(id, &reply).unwrap_or_else(|error| {
             admin::encode_reply(id, &Reply::Error(error.to_string())).unwrap_or_default()
-        })
+        }))
     }
 
     fn uptime_ms(&self) -> u64 {
@@ -374,12 +391,27 @@ pub(crate) fn partition_status(
     row
 }
 
+fn saturate(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
 /// The admin view of a partition's committed state.
 fn log(facts: &PartitionFacts) -> PartitionLog {
     PartitionLog {
         first_offset: facts.retained_from.get(),
         next_offset: facts.next_offset.get(),
         producers: u32::try_from(facts.producers).unwrap_or(u32::MAX),
+        retention_age_millis: facts.retention.max_age_millis,
+        retention_bytes: facts.retention.max_bytes,
+        policy_revision: facts.policy_revision,
+        segments: facts
+            .segments
+            .map_or(0, |(count, _)| u32::try_from(count).unwrap_or(u32::MAX)),
+        segment_bytes: facts.segments.map_or(0, |(_, bytes)| bytes),
+        dedup_entries: facts.dedup.map_or(0, |(entries, _)| saturate(entries)),
+        dedup_limit: facts
+            .dedup
+            .and_then(|(_, limit)| std::num::NonZeroU64::new(saturate(limit))),
         groups: facts
             .groups
             .iter()

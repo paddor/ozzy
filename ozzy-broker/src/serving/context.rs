@@ -62,6 +62,15 @@ pub(super) enum Timer {
 }
 
 impl Time {
+    /// The clock of an SDK owner inside this broker.
+    pub(super) fn sdk_clock(&self) -> ozzy_runtime::replicated::SdkClock {
+        match self {
+            Self::System => ozzy_runtime::replicated::SdkClock::default(),
+            #[cfg(feature = "simulation")]
+            Self::Manual { clock, .. } => clock.clone(),
+        }
+    }
+
     pub(super) fn start(&self) -> Timer {
         match self {
             Self::System => Timer::System(Instant::now()),

@@ -6,6 +6,7 @@ use super::{
     read_text, text, values,
 };
 use crate::{ConsumerGroupId, ConsumerMemberId, GroupId, NodeId, data::CodecError, layout::Reader};
+use std::num::NonZeroU64;
 
 const READY: u8 = 1;
 const DISK_PENDING: u8 = 2;
@@ -56,6 +57,23 @@ fn encode_log(out: &mut Vec<u8>, log: &PartitionLog) -> Result<(), CodecError> {
     out.extend_from_slice(&log.first_offset.to_be_bytes());
     out.extend_from_slice(&log.next_offset.to_be_bytes());
     out.extend_from_slice(&log.producers.to_be_bytes());
+    values(
+        out,
+        &[
+            log.retention_age_millis.map_or(0, NonZeroU64::get),
+            log.retention_bytes.map_or(0, NonZeroU64::get),
+            log.policy_revision,
+        ],
+    );
+    out.extend_from_slice(&log.segments.to_be_bytes());
+    values(
+        out,
+        &[
+            log.segment_bytes,
+            log.dedup_entries,
+            log.dedup_limit.map_or(0, NonZeroU64::get),
+        ],
+    );
     count(out, log.groups.len())?;
     for group in &log.groups {
         out.extend_from_slice(group.id.as_bytes());
@@ -132,6 +150,13 @@ fn decode_log(reader: &mut Reader<'_>) -> Result<PartitionLog, CodecError> {
         first_offset: reader.u64()?,
         next_offset: reader.u64()?,
         producers: reader.u32()?,
+        retention_age_millis: NonZeroU64::new(reader.u64()?),
+        retention_bytes: NonZeroU64::new(reader.u64()?),
+        policy_revision: reader.u64()?,
+        segments: reader.u32()?,
+        segment_bytes: reader.u64()?,
+        dedup_entries: reader.u64()?,
+        dedup_limit: NonZeroU64::new(reader.u64()?),
         groups: list(reader, |reader| {
             Ok(GroupStatus {
                 id: ConsumerGroupId::from_bytes(reader.array()?),

@@ -2,7 +2,7 @@
 
 use crate::{
     App, Screen,
-    app::{Link, Pane, Selectable, Target},
+    app::{Command, Link, Pane, Selectable, Target},
     format,
     model::{CursorRow, EventRow, GroupRow, OVERVIEW},
 };
@@ -82,7 +82,8 @@ impl App {
             Constraint::Length(status.width() as u16),
         ])
         .areas(area);
-        let titles = Screen::ALL
+        let screens = self.screens();
+        let titles = screens
             .iter()
             .enumerate()
             .map(|(index, screen)| format!("{} {}", index + 1, screen.title()))
@@ -90,7 +91,7 @@ impl App {
         // Tabs pads each title with a space on both sides and puts a
         // one-column divider between them.
         let mut x = tabs.x;
-        for (screen, title) in Screen::ALL.into_iter().zip(&titles) {
+        for (&screen, title) in screens.iter().zip(&titles) {
             let width = title.len() as u16 + 2;
             let tab = Rect::new(x, tabs.y, width, 1).intersection(tabs);
             self.targets.push((tab, Target::Tab(screen)));
@@ -98,7 +99,7 @@ impl App {
         }
         frame.render_widget(
             Tabs::new(titles)
-                .select(self.screen as usize)
+                .select(self.tab())
                 .highlight_style(Style::new().reversed()),
             tabs,
         );
@@ -106,23 +107,33 @@ impl App {
     }
 
     fn draw_hints(&self, frame: &mut Frame<'_>, area: Rect) {
-        let hints = match self.screen {
-            Screen::Broker => "q quit  Tab/1-5 screen  r refresh",
-            Screen::Partitions | Screen::Replication => {
-                "q quit  Tab/1-5 screen  r refresh  Up/Down/PgUp/PgDn select"
-            }
-            Screen::Groups => "q quit  Tab/1-5 screen  r refresh  Left/Right pane  Up/Down select",
-            Screen::Threads => {
-                "q quit  Tab/1-5 screen  r refresh  Left/Right pane  Up/Down select  z zeros"
-            }
+        if let Some(Command::Asking { label, .. }) = &self.command {
+            let prompt = format!("Delete group {label}? y deletes, any other key cancels");
+            frame.render_widget(prompt.yellow().bold(), area);
+            return;
+        }
+        let select = match self.screen {
+            Screen::Broker => "",
+            Screen::Partitions | Screen::Replication => "  Up/Down/PgUp/PgDn select",
+            Screen::Groups => "  Left/Right pane  Up/Down select  d delete",
+            Screen::Threads => "  Left/Right pane  Up/Down select  z zeros",
         };
-        let error = self.error.as_deref().unwrap_or_default();
-        let [hints_area, error_area] =
+        let hints = format!(
+            "q quit  Tab/1-{} screen  r refresh{select}",
+            self.screens().len()
+        );
+        let status = match (&self.error, &self.command) {
+            (Some(error), _) | (None, Some(Command::Failed(error))) => error.clone().red(),
+            (None, Some(Command::Running(label))) => format!("deleting {label}").yellow(),
+            (None, Some(Command::Done(done))) => done.clone().green(),
+            (None, Some(Command::Asking { .. }) | None) => Span::raw(""),
+        };
+        let [hints_area, status_area] =
             Layout::horizontal([Constraint::Length(hints.len() as u16), Constraint::Min(0)])
                 .spacing(2)
                 .areas(area);
         frame.render_widget(hints.dark_gray(), hints_area);
-        frame.render_widget(Line::from(error.red()).right_aligned(), error_area);
+        frame.render_widget(Line::from(status).right_aligned(), status_area);
     }
 
     fn draw_broker(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -142,7 +153,9 @@ impl App {
         let [summary, activity] =
             Layout::horizontal([Constraint::Length(FACTS), Constraint::Min(0)]).areas(bottom);
         frame.render_widget(pairs("Broker", facts), facts_area);
-        frame.render_widget(self.cluster(cluster.width), cluster);
+        if !self.single() {
+            frame.render_widget(self.cluster(cluster.width), cluster);
+        }
         frame.render_widget(pairs("Partitions", self.summary_pairs()), summary);
         frame.render_widget(counters("Activity", self.labeled(&OVERVIEW)), activity);
     }
@@ -210,8 +223,14 @@ impl App {
         let mut pairs = vec![
             ("Local", summary.partitions.to_string()),
             ("Ready", summary.ready.to_string()),
-            ("Electing", summary.electing.to_string()),
-            ("Led here", summary.leading.to_string()),
+        ];
+        if !self.single() {
+            pairs.extend([
+                ("Electing", summary.electing.to_string()),
+                ("Led here", summary.leading.to_string()),
+            ]);
+        }
+        pairs.extend([
             ("Disk pending", summary.disk_pending.to_string()),
             ("Pending ops", format::count(summary.pending_operations)),
             (
@@ -221,7 +240,7 @@ impl App {
             ("Reclaimed", format::bytes(summary.reclaimed_bytes as f64)),
             ("Commits/s", format::rate(summary.rate)),
             ("Groups", self.group_rows().len().to_string()),
-        ];
+        ]);
         if missing > 0 {
             pairs.push(("Shards silent", missing.to_string()));
         }

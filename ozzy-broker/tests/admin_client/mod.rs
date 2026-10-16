@@ -39,7 +39,7 @@ impl AdminClient {
 
     pub(crate) async fn ask(&mut self, request: Request) -> Reply {
         self.next += 1;
-        let bytes = admin::encode_request(self.next, request);
+        let bytes = admin::encode_request(self.next, &request).unwrap();
         self.ask_raw(bytes).await
     }
 

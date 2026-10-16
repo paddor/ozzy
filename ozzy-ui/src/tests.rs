@@ -11,6 +11,7 @@ use ozzy_proto::{
     },
 };
 use ratatui::{Terminal, backend::TestBackend};
+use std::num::NonZeroU64;
 
 const A: NodeId = NodeId::from_bytes([1; 16]);
 const B: NodeId = NodeId::from_bytes([2; 16]);
@@ -333,6 +334,13 @@ fn log(next_offset: u64, groups: Vec<GroupStatus>, cursors: Vec<GroupCursor>) ->
         first_offset: 0,
         next_offset,
         producers: 1,
+        retention_age_millis: NonZeroU64::new(7 * 86_400_000),
+        retention_bytes: None,
+        policy_revision: 2,
+        segments: 3,
+        segment_bytes: 3 << 26,
+        dedup_entries: 1_200,
+        dedup_limit: NonZeroU64::new(100_000),
         groups,
         cursors,
     }
@@ -407,6 +415,88 @@ fn groups_join_plans_and_cursors_and_survive_a_busy_journal() {
     app.key(Key::Char('l'));
     app.key(Key::Down);
     assert_eq!(app.cursor_table.selected(), Some(0));
+}
+
+#[test]
+fn partitions_show_storage_and_limits() {
+    let mut app = App::new("ipc://@admin");
+    app.reply(broker());
+    app.reply(grouped(1_000, true));
+    app.key(Key::Char('2'));
+    let text = screen(&mut app);
+    for expected in [
+        "Segs",
+        "192 MiB",
+        "1.20%",
+        "retention age 7d (revision 2)  dedup 1,200 of 100,000",
+    ] {
+        assert!(text.contains(expected), "{expected}:\n{text}");
+    }
+}
+
+/// A single broker replicates nothing: no Replication tab, and the tabs
+/// after it move up.
+#[test]
+fn a_single_broker_has_no_replication_screen() {
+    let mut app = App::new("ipc://@admin");
+    app.key(Key::Char('3'));
+    assert_eq!(app.screen(), Screen::Replication);
+    let mut single = broker();
+    if let Reply::Broker(facts) = &mut single {
+        facts.brokers.truncate(1);
+    }
+    app.reply(single);
+    assert_eq!(app.screen(), Screen::Partitions);
+    app.key(Key::Char('3'));
+    assert_eq!(app.screen(), Screen::Groups);
+    app.key(Key::Tab);
+    assert_eq!(app.screen(), Screen::Threads);
+    app.key(Key::Tab);
+    assert_eq!(app.screen(), Screen::Broker);
+    app.key(Key::BackTab);
+    assert_eq!(app.screen(), Screen::Threads);
+    app.key(Key::Char('5'));
+    assert_eq!(app.screen(), Screen::Threads);
+    app.key(Key::Char('1'));
+    let text = screen(&mut app);
+    for expected in ["3 Groups", "4 Threads", "Tab/1-4"] {
+        assert!(text.contains(expected), "{expected}:\n{text}");
+    }
+    for hidden in ["Replication", "Cluster", "Electing", "Led here"] {
+        assert!(!text.contains(hidden), "{hidden}:\n{text}");
+    }
+}
+
+#[test]
+fn groups_are_deleted_only_after_asking() {
+    let mut app = App::new("ipc://@admin");
+    app.reply(broker());
+    app.key(Key::Char('4'));
+    app.key(Key::Char('d'));
+    assert!(screen(&mut app).contains("no group to delete"));
+    app.reply(grouped(1_000, true));
+    assert_eq!(app.key(Key::Char('d')), Action::None);
+    assert!(screen(&mut app).contains("Delete group orders/workers? y deletes"));
+    // Any other key cancels, without its usual effect.
+    assert_eq!(app.key(Key::Esc), Action::None);
+    assert!(!screen(&mut app).contains("Delete group"));
+    app.key(Key::Char('d'));
+    let delete = Request::DeleteGroup {
+        topic: "orders".into(),
+        name: "workers".into(),
+    };
+    assert_eq!(app.key(Key::Char('y')), Action::Command(delete));
+    assert!(screen(&mut app).contains("deleting orders/workers"));
+    // No second deletion while one runs.
+    app.key(Key::Char('d'));
+    assert!(!screen(&mut app).contains("Delete group"));
+    app.reply(Reply::GroupDeleted(Some(WORKERS)));
+    let deleted = format!("deleted orders/workers ({WORKERS})");
+    assert!(screen(&mut app).contains(&deleted));
+    app.key(Key::Char('d'));
+    app.key(Key::Char('y'));
+    app.command_failed("no reply in 70 s");
+    assert!(screen(&mut app).contains("orders/workers: no reply in 70 s"));
 }
 
 /// The Broker and Replication screens name broker events, so a renamed

@@ -32,6 +32,8 @@ impl Screen {
         Self::Groups,
         Self::Threads,
     ];
+    /// A single broker's screens: it replicates nothing.
+    const SINGLE: [Self; 4] = [Self::Broker, Self::Partitions, Self::Groups, Self::Threads];
 
     /// Tab title.
     pub fn title(self) -> &'static str {
@@ -42,10 +44,6 @@ impl Screen {
             Self::Groups => "Groups",
             Self::Threads => "Threads",
         }
-    }
-
-    fn index(self) -> usize {
-        self as usize
     }
 }
 
@@ -90,7 +88,7 @@ pub enum Mouse {
 }
 
 /// What the frontend does after a key or mouse event.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     /// Nothing beyond drawing again.
     None,
@@ -98,6 +96,21 @@ pub enum Action {
     Quit,
     /// Refresh now instead of at the next interval.
     Refresh,
+    /// Send a confirmed command; its reply goes to [`App::command_reply`].
+    Command(Request),
+}
+
+/// The latest command, shown under the screen until the next one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Command {
+    /// Waiting for `y`; any other key cancels.
+    Asking {
+        request: Request,
+        label: String,
+    },
+    Running(String),
+    Done(String),
+    Failed(String),
 }
 
 /// The broker link as the frontend last saw it.
@@ -218,6 +231,7 @@ pub struct App {
     pub(crate) connections: Option<Connections>,
     /// The latest failure; the next reply clears it.
     pub(crate) error: Option<String>,
+    pub(crate) command: Option<Command>,
     /// Shared by the Partitions and Replication screens.
     pub(crate) partition_table: TableState,
     pub(crate) group_table: TableState,
@@ -245,6 +259,7 @@ impl App {
             partitions: Samples::new(),
             connections: None,
             error: None,
+            command: None,
             partition_table: TableState::new().with_selected(0),
             group_table: TableState::new().with_selected(0),
             cursor_table: TableState::new().with_selected(0),
@@ -260,6 +275,30 @@ impl App {
     /// The selected screen.
     pub fn screen(&self) -> Screen {
         self.screen
+    }
+
+    /// The screens in tab order. A single broker has no Replication screen.
+    pub fn screens(&self) -> &'static [Screen] {
+        if self.single() {
+            &Screen::SINGLE
+        } else {
+            &Screen::ALL
+        }
+    }
+
+    /// Whether the broker runs without peers.
+    pub(crate) fn single(&self) -> bool {
+        self.broker
+            .as_ref()
+            .is_some_and(|broker| broker.brokers.len() == 1)
+    }
+
+    /// The selected screen's tab position.
+    pub(crate) fn tab(&self) -> usize {
+        self.screens()
+            .iter()
+            .position(|&screen| screen == self.screen)
+            .unwrap_or(0)
     }
 
     /// What the next refresh asks, in order.
@@ -291,6 +330,9 @@ impl App {
             Reply::Broker(broker) => {
                 self.broker = Some(broker);
                 self.ask_broker = false;
+                if !self.screens().contains(&self.screen) {
+                    self.screen = Screen::Partitions;
+                }
             }
             Reply::Counters(counters) => self.ask_broker |= self.counters.push(counters),
             Reply::Partitions(mut partitions) => {
@@ -298,6 +340,8 @@ impl App {
                 self.ask_broker |= self.partitions.push(partitions);
             }
             Reply::Connections(connections) => self.connections = Some(connections),
+            // Only commands are answered with it.
+            deleted @ Reply::GroupDeleted(_) => self.command_reply(deleted),
             Reply::Error(message) => self.error = Some(message),
         }
     }
@@ -325,25 +369,82 @@ impl App {
         self.error = Some(message.into());
     }
 
+    /// Take the reply to the running command.
+    pub fn command_reply(&mut self, reply: Reply) {
+        let Some(Command::Running(label)) = self.command.take() else {
+            return;
+        };
+        self.command = Some(match reply {
+            Reply::GroupDeleted(Some(group)) => Command::Done(format!("deleted {label} ({group})")),
+            Reply::GroupDeleted(None) => Command::Done(format!("no group {label}")),
+            Reply::Error(message) => Command::Failed(message),
+            _ => Command::Failed(format!("{label}: unexpected reply")),
+        });
+    }
+
+    /// The running command failed: not sent, or no reply in time.
+    pub fn command_failed(&mut self, message: impl Into<String>) {
+        if let Some(Command::Running(label)) = &self.command {
+            self.command = Some(Command::Failed(format!("{label}: {}", message.into())));
+        }
+    }
+
+    /// Ask to delete the selected group, when its plan names it and no
+    /// command runs.
+    fn ask_delete(&mut self) {
+        if matches!(self.command, Some(Command::Running(_))) {
+            return;
+        }
+        let Some(group) = self.selected_group() else {
+            self.command = Some(Command::Failed("no group to delete".into()));
+            return;
+        };
+        let (Some(topic), Some(status)) = (group.topic, group.status) else {
+            let unnamed = format!("group {} has no plan here, so no name", group.label);
+            self.command = Some(Command::Failed(unnamed));
+            return;
+        };
+        let request = Request::DeleteGroup {
+            topic: topic.to_owned(),
+            name: status.name.clone(),
+        };
+        let label = group.label.clone();
+        self.command = Some(Command::Asking { request, label });
+    }
+
     /// Apply `key` and say what the frontend does next.
     pub fn key(&mut self, key: Key) -> Action {
+        if matches!(self.command, Some(Command::Asking { .. }))
+            && let Some(Command::Asking { request, label }) = self.command.take()
+        {
+            if key != Key::Char('y') {
+                return Action::None;
+            }
+            self.command = Some(Command::Running(label));
+            return Action::Command(request);
+        }
         match key {
             Key::Char('q') | Key::Esc => return Action::Quit,
             Key::Char('r') => return Action::Refresh,
             Key::Char(digit @ '1'..='9') => {
                 if let Some(&screen) = digit
                     .to_digit(10)
-                    .and_then(|digit| Screen::ALL.get(digit as usize - 1))
+                    .and_then(|digit| self.screens().get(digit as usize - 1))
                 {
                     self.screen = screen;
                 }
             }
-            Key::Tab => self.screen = Screen::ALL[(self.screen.index() + 1) % Screen::ALL.len()],
-            Key::BackTab => {
-                self.screen =
-                    Screen::ALL[(self.screen.index() + Screen::ALL.len() - 1) % Screen::ALL.len()];
+            Key::Tab | Key::BackTab => {
+                let screens = self.screens();
+                let step = if key == Key::Tab {
+                    1
+                } else {
+                    screens.len() - 1
+                };
+                self.screen = screens[(self.tab() + step) % screens.len()];
             }
             Key::Char('z') => self.show_zero = !self.show_zero,
+            Key::Char('d') if self.screen == Screen::Groups => self.ask_delete(),
             Key::Left | Key::Char('h') => self.focus = Pane::List,
             Key::Right | Key::Char('l') => self.focus = Pane::Detail,
             key => {

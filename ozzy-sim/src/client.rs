@@ -7,8 +7,8 @@ use ozzy_proto::{
     handshake,
 };
 use ozzy_runtime::replicated::{
-    AppendLinkLimits, BrokerAddress, BrokerLinks, BrokerLinksConfig, ReaderLinkLimits, RecordInput,
-    RetryPolicy, SdkClock, SharedTopicPendingRecord, SharedTopicWriter, SharedTopicWriterConfig,
+    AppendLinkLimits, BrokerLinks, BrokerLinksConfig, ReaderLinkLimits, RecordInput, RetryPolicy,
+    SdkClock, SharedTopicPendingRecord, SharedTopicWriter, SharedTopicWriterConfig,
     TopicCheckpoint, TopicReader, TopicReaderConfig, TopicRoutes, WriterRuntime,
 };
 use std::{
@@ -489,19 +489,9 @@ fn links_config(checked: &CheckedConfig, partitions: usize, clock: SdkClock) -> 
         handshake::Parameters::streaming(DATA_LIMITS, handshake::PRODUCER | handshake::CONSUMER)
             .unwrap();
     parameters.capabilities |= handshake::OWNER_ROUTING | handshake::OWNER_READ;
-    let brokers = &checked.deployment.deployment().brokers;
     BrokerLinksConfig {
         local: NodeId::from_bytes(*uuid::Uuid::now_v7().as_bytes()),
-        brokers: checked
-            .identity
-            .brokers
-            .iter()
-            .map(|(name, id)| BrokerAddress {
-                node: NodeId::from_bytes(*id.as_bytes()),
-                endpoint: brokers[name].endpoints.peer.parse().unwrap(),
-                data_endpoint: brokers[name].endpoints.data_peer.parse().unwrap(),
-            })
-            .collect(),
+        brokers: checked.broker_addresses().unwrap(),
         parameters,
         requests: 12,
         control_bytes: 1024 * 1024,

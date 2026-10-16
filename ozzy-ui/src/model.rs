@@ -60,6 +60,8 @@ pub(crate) struct GroupRow<'a> {
     pub(crate) id: ConsumerGroupId,
     /// `topic/name`, or the ID without a plan.
     pub(crate) label: String,
+    /// The topic, known with the plan.
+    pub(crate) topic: Option<&'a str>,
     pub(crate) status: Option<&'a GroupStatus>,
     pub(crate) cursors: Vec<CursorRow<'a>>,
 }
@@ -235,9 +237,10 @@ impl App {
             };
             let partition = row.label();
             for status in &log.groups {
-                let topic = row.name.map_or("?", |name| name.topic.as_str());
+                let topic = row.name.map(|name| name.topic.as_str());
                 let group = group_entry(&mut groups, status.id);
-                group.label = format!("{topic}/{}", status.name);
+                group.label = format!("{}/{}", topic.unwrap_or("?"), status.name);
+                group.topic = topic;
                 group.status = Some(status);
             }
             for cursor in &log.cursors {
@@ -391,6 +394,7 @@ fn group_entry<'a, 'b>(
     groups.entry(id).or_insert_with(|| GroupRow {
         id,
         label: id.to_string(),
+        topic: None,
         status: None,
         cursors: Vec::new(),
     })
