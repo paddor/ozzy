@@ -480,21 +480,29 @@ impl Slot {
                 }
             }
             Err(error) => {
-                ozzy_telemetry::event(ozzy_telemetry::Event::IoFailed);
-                if ozzy_telemetry::enabled() {
-                    let expected = matches!(
-                        error.kind(),
-                        io::ErrorKind::NotFound | io::ErrorKind::AlreadyExists
-                    ) && matches!(
-                        self.diagnostic_operation,
-                        "open" | "metadata" | "remove" | "create_directory"
-                    );
+                let probe = matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::AlreadyExists
+                ) && matches!(
+                    self.diagnostic_operation,
+                    "open" | "metadata" | "remove" | "create_directory"
+                );
+                let (event, level) = if probe {
+                    (
+                        ozzy_telemetry::Event::IoProbeMissed,
+                        ozzy_telemetry::Level::Info,
+                    )
+                } else {
+                    (
+                        ozzy_telemetry::Event::IoFailed,
+                        ozzy_telemetry::Level::Error,
+                    )
+                };
+                ozzy_telemetry::event(event);
+                // Probe misses are expected; they would crowd the recent log.
+                if !probe || ozzy_telemetry::enabled() {
                     ozzy_telemetry::log(
-                        if expected {
-                            ozzy_telemetry::Level::Info
-                        } else {
-                            ozzy_telemetry::Level::Error
-                        },
+                        level,
                         &format!(
                             "storage {} returned {:?}",
                             self.diagnostic_operation,

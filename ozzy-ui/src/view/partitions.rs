@@ -17,7 +17,7 @@ use ratatui::{
 };
 use std::borrow::Cow;
 
-const PARTITION_COLUMNS: [Column; 17] = [
+const PARTITION_COLUMNS: [Column; 18] = [
     column("Partition", 9, true),
     column("Shard", 5, true),
     column("State", 9, true),
@@ -25,16 +25,17 @@ const PARTITION_COLUMNS: [Column; 17] = [
     column("View", 5, true),
     column("First offset", 12, false),
     column("Next offset", 12, true),
+    column("Records/s", 9, true),
     column("Producers", 9, false),
     column("Segs", 4, false),
-    column("Size", 10, false),
+    column("Size", 8, false),
     column("Dedup", 6, false),
     column("Committed op", 12, true),
     column("Ops/s", 7, true),
     column("Pending", 8, true),
-    column("Held", 10, true),
+    column("Held", 8, true),
     column("Checks", 6, false),
-    column("Reclaimed", 10, false),
+    column("Reclaimed", 9, false),
 ];
 const LINK_COLUMNS: [Column; 2] = [column("Broker", 6, true), column("Link", 11, true)];
 /// Replication table columns before one column per broker.
@@ -72,7 +73,12 @@ impl App {
             .iter()
             .map(|row| (row.label(), self.partition_cells(row)))
             .collect();
-        let table = fitted(&PARTITION_COLUMNS, cells, table_area.width)
+        // A single broker leads every partition in view 0.
+        let columns = PARTITION_COLUMNS
+            .into_iter()
+            .filter(|column| !self.single() || !matches!(&*column.title, "Leader" | "View"))
+            .collect::<Vec<_>>();
+        let table = fitted(&columns, cells, table_area.width)
             .block(Block::bordered().title(self.partitions_title("Partitions")))
             .row_highlight_style(SELECTED);
         self.page = table_area.height.saturating_sub(3) as usize;
@@ -97,22 +103,10 @@ impl App {
             (PartitionState::Electing, _) => "electing".yellow(),
             (PartitionState::Local | PartitionState::Normal, false) => "not ready".yellow(),
         };
-        let local = self.broker.as_ref().map(|broker| broker.id);
-        let leader = status.leader.map_or_else(
-            || "unknown".yellow(),
-            |leader| {
-                let name = self
-                    .broker_name(leader)
-                    .map_or_else(|| leader.to_string(), str::to_owned);
-                if Some(leader) == local {
-                    name.bold()
-                } else {
-                    name.into()
-                }
-            },
-        );
         let log = status.log.as_ref();
         let offset = |offset: Option<u64>| offset.map(format::count).unwrap_or_default();
+        let replicated =
+            (!self.single()).then(|| [self.leader(status), Cell::from(status.view.to_string())]);
         let storage = log.filter(|log| log.segments > 0);
         let dedup = log.and_then(|log| {
             let limit = log.dedup_limit?.get();
@@ -121,13 +115,12 @@ impl App {
                 format::rate(log.dedup_entries as f64 * 100.0 / limit as f64)
             ))
         });
-        vec![
-            shard,
-            state.into(),
-            leader.into(),
-            Cell::from(status.view.to_string()),
+        let mut cells = vec![shard, state.into()];
+        cells.extend(replicated.into_iter().flatten());
+        cells.extend([
             Cell::from(offset(log.map(|log| log.first_offset))),
             Cell::from(offset(log.map(|log| log.next_offset))),
+            Cell::from(row.records.map(format::rate).unwrap_or_default()),
             Cell::from(offset(log.map(|log| log.producers.into()))),
             Cell::from(offset(storage.map(|log| log.segments.into()))),
             Cell::from(
@@ -142,7 +135,27 @@ impl App {
             Cell::from(format::bytes(status.pending_body_bytes as f64)),
             Cell::from(format::count(status.validation_cycles)),
             Cell::from(format::bytes(status.reclaimed_bytes as f64)),
-        ]
+        ]);
+        cells
+    }
+
+    /// The leader's name, bold when it is this broker.
+    fn leader(&self, status: &PartitionStatus) -> Cell<'static> {
+        let local = self.broker.as_ref().map(|broker| broker.id);
+        let leader = status.leader.map_or_else(
+            || "unknown".yellow(),
+            |leader| {
+                let name = self
+                    .broker_name(leader)
+                    .map_or_else(|| leader.to_string(), str::to_owned);
+                if Some(leader) == local {
+                    name.bold()
+                } else {
+                    name.into()
+                }
+            },
+        );
+        leader.into()
     }
 
     pub(super) fn draw_replication(&mut self, frame: &mut Frame<'_>, area: Rect) {

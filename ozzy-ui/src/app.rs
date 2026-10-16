@@ -2,11 +2,16 @@
 //! mouse events, and reads no clock: rates come from the broker's uptime in
 //! each reply.
 
-use ozzy_proto::admin::{Broker, Connections, Counters, Partitions, Reply, Request};
+use crate::model::RecordRate;
+use ozzy_proto::{
+    GroupId,
+    admin::{Broker, Connections, Counters, LogEntry, Partitions, Reply, Request},
+};
 use ratatui::{
     layout::{Position, Rect},
     widgets::TableState,
 };
+use std::collections::BTreeMap;
 
 /// Console screens in tab order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,19 +26,28 @@ pub enum Screen {
     Groups,
     /// Every event counter, totaled or for one thread.
     Threads,
+    /// The broker process's recent diagnostics, newest first.
+    Logs,
 }
 
 impl Screen {
     /// Every screen in tab order.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Broker,
         Self::Partitions,
         Self::Replication,
         Self::Groups,
         Self::Threads,
+        Self::Logs,
     ];
     /// A single broker's screens: it replicates nothing.
-    const SINGLE: [Self; 4] = [Self::Broker, Self::Partitions, Self::Groups, Self::Threads];
+    const SINGLE: [Self; 5] = [
+        Self::Broker,
+        Self::Partitions,
+        Self::Groups,
+        Self::Threads,
+        Self::Logs,
+    ];
 
     /// Tab title.
     pub fn title(self) -> &'static str {
@@ -43,6 +57,7 @@ impl Screen {
             Self::Replication => "Replication",
             Self::Groups => "Groups",
             Self::Threads => "Threads",
+            Self::Logs => "Logs",
         }
     }
 }
@@ -140,13 +155,14 @@ pub(crate) enum Selectable {
     Cursors,
     Threads,
     Events,
+    Logs,
 }
 
 impl Selectable {
     /// The pane the table fills, on a two-pane screen.
     fn pane(self) -> Option<Pane> {
         match self {
-            Self::Partitions => None,
+            Self::Partitions | Self::Logs => None,
             Self::Groups | Self::Threads => Some(Pane::List),
             Self::Cursors | Self::Events => Some(Pane::Detail),
         }
@@ -238,6 +254,10 @@ pub struct App {
     pub(crate) cursor_table: TableState,
     pub(crate) thread_table: TableState,
     pub(crate) event_table: TableState,
+    pub(crate) logs: Vec<LogEntry>,
+    pub(crate) log_table: TableState,
+    /// Records per second of each partition; see [`RecordRate`].
+    pub(crate) record_rates: BTreeMap<GroupId, RecordRate>,
     pub(crate) focus: Pane,
     pub(crate) show_zero: bool,
     /// Rows a page key moves, from the last drawn table.
@@ -265,6 +285,9 @@ impl App {
             cursor_table: TableState::new().with_selected(0),
             thread_table: TableState::new().with_selected(0),
             event_table: TableState::new().with_selected(0),
+            logs: Vec::new(),
+            log_table: TableState::new().with_selected(0),
+            record_rates: BTreeMap::new(),
             focus: Pane::List,
             show_zero: false,
             page: 10,
@@ -303,11 +326,16 @@ impl App {
 
     /// What the next refresh asks, in order.
     pub fn requests(&self) -> Vec<Request> {
-        let mut requests = Vec::with_capacity(4);
+        let mut requests = Vec::with_capacity(5);
         if self.ask_broker {
             requests.push(Request::Broker);
         }
-        requests.extend([Request::Counters, Request::Partitions, Request::Connections]);
+        requests.extend([
+            Request::Counters,
+            Request::Partitions,
+            Request::Connections,
+            Request::Logs,
+        ]);
         requests
     }
 
@@ -336,10 +364,12 @@ impl App {
             }
             Reply::Counters(counters) => self.ask_broker |= self.counters.push(counters),
             Reply::Partitions(mut partitions) => {
+                self.track_records(&partitions);
                 self.keep_logs(&mut partitions);
                 self.ask_broker |= self.partitions.push(partitions);
             }
             Reply::Connections(connections) => self.connections = Some(connections),
+            Reply::Logs(logs) => self.logs = logs,
             // Only commands are answered with it.
             deleted @ Reply::GroupDeleted(_) => self.command_reply(deleted),
             Reply::Error(message) => self.error = Some(message),
@@ -514,6 +544,7 @@ impl App {
             (Screen::Groups, Pane::Detail) => Selectable::Cursors,
             (Screen::Threads, Pane::List) => Selectable::Threads,
             (Screen::Threads, Pane::Detail) => Selectable::Events,
+            (Screen::Logs, _) => Selectable::Logs,
         })
     }
 
@@ -524,6 +555,7 @@ impl App {
             Selectable::Cursors => self.selected_group().map_or(0, |group| group.cursors.len()),
             Selectable::Threads => self.thread_names().len(),
             Selectable::Events => self.event_rows().len(),
+            Selectable::Logs => self.logs.len(),
         }
     }
 
@@ -534,6 +566,7 @@ impl App {
             Selectable::Cursors => &mut self.cursor_table,
             Selectable::Threads => &mut self.thread_table,
             Selectable::Events => &mut self.event_table,
+            Selectable::Logs => &mut self.log_table,
         }
     }
 

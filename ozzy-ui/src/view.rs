@@ -16,6 +16,7 @@ use ratatui::{
 };
 use std::borrow::Cow;
 
+mod logs;
 mod partitions;
 
 const SELECTED: Style = Style::new().bg(Color::DarkGray);
@@ -61,6 +62,7 @@ impl App {
             Screen::Replication => self.draw_replication(frame, body),
             Screen::Groups => self.draw_groups(frame, body),
             Screen::Threads => self.draw_threads(frame, body),
+            Screen::Logs => self.draw_logs(frame, body),
         }
         self.draw_hints(frame, bottom);
     }
@@ -114,7 +116,7 @@ impl App {
         }
         let select = match self.screen {
             Screen::Broker => "",
-            Screen::Partitions | Screen::Replication => "  Up/Down/PgUp/PgDn select",
+            Screen::Partitions | Screen::Replication | Screen::Logs => "  Up/Down/PgUp/PgDn select",
             Screen::Groups => "  Left/Right pane  Up/Down select  d delete",
             Screen::Threads => "  Left/Right pane  Up/Down select  z zeros",
         };
@@ -157,7 +159,12 @@ impl App {
             frame.render_widget(self.cluster(cluster.width), cluster);
         }
         frame.render_widget(pairs("Partitions", self.summary_pairs()), summary);
-        frame.render_widget(counters("Activity", self.labeled(&OVERVIEW)), activity);
+        // A single broker replicates nothing.
+        let overview = OVERVIEW
+            .into_iter()
+            .filter(|(name, _)| !self.single() || !name.starts_with("replica_"))
+            .collect::<Vec<_>>();
+        frame.render_widget(counters("Activity", self.labeled(&overview)), activity);
     }
 
     fn facts(&self) -> Vec<(&'static str, String)> {
@@ -232,13 +239,17 @@ impl App {
         }
         pairs.extend([
             ("Disk pending", summary.disk_pending.to_string()),
-            ("Pending ops", format::count(summary.pending_operations)),
             (
-                "Pending bytes",
-                format::bytes(summary.pending_body_bytes as f64),
+                "Pending",
+                format!(
+                    "{} ops, {}",
+                    format::count(summary.pending_operations),
+                    format::bytes(summary.pending_body_bytes as f64)
+                ),
             ),
             ("Reclaimed", format::bytes(summary.reclaimed_bytes as f64)),
             ("Commits/s", format::rate(summary.rate)),
+            ("Records/s", format::rate(summary.records)),
             ("Groups", self.group_rows().len().to_string()),
         ]);
         if missing > 0 {

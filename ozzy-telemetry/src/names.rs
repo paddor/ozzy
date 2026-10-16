@@ -178,8 +178,11 @@ events! {
         IoSync => "io_sync",
         /// Backend execution completed successfully; canceled observation still counts.
         IoCompleted => "io_completed",
-        /// Backend execution completed with an error.
+        /// Backend execution completed with an error other than a probe miss.
         IoFailed => "io_failed",
+        /// An open, metadata, remove, or directory creation found the path
+        /// absent or present: existence probes, mostly at startup.
+        IoProbeMissed => "io_probe_missed",
         /// Successful physical write bytes, counted by the execution worker.
         IoWriteBytes => "io_write_bytes",
         /// Successful physical read bytes, counted by the execution worker.

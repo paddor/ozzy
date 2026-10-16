@@ -8,11 +8,14 @@
 use crate::{ConsumerGroupId, ConsumerMemberId, GroupId, NodeId, data::CodecError, layout::Reader};
 use std::num::NonZeroU64;
 
+mod logs;
 mod partitions;
 
+use logs::{decode_logs, encode_logs};
 use partitions::{decode_status, encode_status};
 
 const DELETE_GROUP: u8 = 5;
+const LOGS: u8 = 6;
 const ERROR: u8 = 0xff;
 
 /// What a client asks for.
@@ -26,6 +29,8 @@ pub enum Request {
     Partitions,
     /// Broker links and connected clients.
     Connections,
+    /// The broker process's recent diagnostics.
+    Logs,
     /// Delete consumer group `name` on `topic`: fence its members on every
     /// partition, then free the name.
     DeleteGroup {
@@ -44,7 +49,8 @@ impl Request {
             Self::Counters => 2,
             Self::Partitions => 3,
             Self::Connections => 4,
-            Self::DeleteGroup { .. } => 5,
+            Self::DeleteGroup { .. } => DELETE_GROUP,
+            Self::Logs => LOGS,
         }
     }
 }
@@ -60,6 +66,8 @@ pub enum Reply {
     Partitions(Partitions),
     /// Answers [`Request::Connections`].
     Connections(Connections),
+    /// Answers [`Request::Logs`], oldest first.
+    Logs(Vec<LogEntry>),
     /// Answers [`Request::DeleteGroup`]: the deleted group incarnation, or
     /// `None` when no group has that name.
     GroupDeleted(Option<ConsumerGroupId>),
@@ -241,6 +249,31 @@ pub struct Connections {
     pub clients: u32,
 }
 
+/// A diagnostic the broker process logged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogEntry {
+    /// Milliseconds after the broker started; 0 for earlier entries.
+    pub uptime_ms: u64,
+    /// Severity.
+    pub level: LogLevel,
+    /// The logging thread's name.
+    pub thread: String,
+    /// The message.
+    pub message: String,
+}
+
+/// Severity of a [`LogEntry`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum LogLevel {
+    /// A notable state transition.
+    Info = 0,
+    /// Recoverable pressure or degraded execution.
+    Warn = 1,
+    /// Execution failure.
+    Error = 2,
+}
+
 /// A partition's replication mode and phase.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -276,7 +309,8 @@ pub fn decode_request(input: &[u8]) -> Result<(u64, Request), CodecError> {
         2 => Request::Counters,
         3 => Request::Partitions,
         4 => Request::Connections,
-        5 => Request::DeleteGroup {
+        LOGS => Request::Logs,
+        DELETE_GROUP => Request::DeleteGroup {
             topic: read_text(&mut reader)?,
             name: read_text(&mut reader)?,
         },
@@ -301,6 +335,7 @@ pub fn encode_reply(id: u64, reply: &Reply) -> Result<Vec<u8>, CodecError> {
         Reply::Counters(_) => Request::Counters.kind(),
         Reply::Partitions(_) => Request::Partitions.kind(),
         Reply::Connections(_) => Request::Connections.kind(),
+        Reply::Logs(_) => LOGS,
         Reply::GroupDeleted(_) => DELETE_GROUP,
         Reply::Error(_) => ERROR,
     };
@@ -325,6 +360,7 @@ pub fn encode_reply(id: u64, reply: &Reply) -> Result<Vec<u8>, CodecError> {
             }
             out.extend_from_slice(&connections.clients.to_be_bytes());
         }
+        Reply::Logs(entries) => encode_logs(&mut out, entries)?,
         Reply::GroupDeleted(group) => {
             out.push(u8::from(group.is_some()));
             if let Some(group) = group {
@@ -366,6 +402,7 @@ pub fn decode_reply(input: &[u8]) -> Result<(u64, Reply), CodecError> {
             })?,
             clients: reader.u32()?,
         }),
+        LOGS => Reply::Logs(decode_logs(&mut reader)?),
         DELETE_GROUP => Reply::GroupDeleted(match reader.u8()? {
             0 => None,
             1 => Some(ConsumerGroupId::from_bytes(reader.array()?)),

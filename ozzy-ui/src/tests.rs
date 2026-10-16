@@ -6,8 +6,8 @@ use crate::{
 use ozzy_proto::{
     ConsumerGroupId, ConsumerMemberId, GroupId, NodeId,
     admin::{
-        Broker, Connections, Counters, EventKind, GroupCursor, GroupStatus, PartitionLog,
-        PartitionName, PartitionState, PartitionStatus, Partitions, Reply, Request,
+        Broker, Connections, Counters, EventKind, GroupCursor, GroupStatus, LogEntry, LogLevel,
+        PartitionLog, PartitionName, PartitionState, PartitionStatus, Partitions, Reply, Request,
     },
 };
 use ratatui::{Terminal, backend::TestBackend};
@@ -176,7 +176,8 @@ fn restarts_and_lost_links_ask_for_broker_facts_again() {
             Request::Broker,
             Request::Counters,
             Request::Partitions,
-            Request::Connections
+            Request::Connections,
+            Request::Logs,
         ]
     );
     app.link(false);
@@ -186,7 +187,12 @@ fn restarts_and_lost_links_ask_for_broker_facts_again() {
     app.reply(counters(5_000, 1));
     assert_eq!(
         app.requests(),
-        [Request::Counters, Request::Partitions, Request::Connections]
+        [
+            Request::Counters,
+            Request::Partitions,
+            Request::Connections,
+            Request::Logs,
+        ]
     );
     app.reply(counters(6_000, 2));
     assert!(app.event_rows()[0].rate.is_some());
@@ -209,9 +215,9 @@ fn keys_switch_screens_and_keep_selections_in_range() {
     assert_eq!(app.screen(), Screen::Partitions);
     app.key(Key::BackTab);
     app.key(Key::BackTab);
-    assert_eq!(app.screen(), Screen::Threads);
+    assert_eq!(app.screen(), Screen::Logs);
     app.key(Key::Char('9'));
-    assert_eq!(app.screen(), Screen::Threads);
+    assert_eq!(app.screen(), Screen::Logs);
     app.key(Key::Char('2'));
     app.key(Key::PageDown);
     assert_eq!(app.partition_table.selected(), Some(2));
@@ -450,21 +456,81 @@ fn a_single_broker_has_no_replication_screen() {
     app.key(Key::Char('3'));
     assert_eq!(app.screen(), Screen::Groups);
     app.key(Key::Tab);
-    assert_eq!(app.screen(), Screen::Threads);
+    app.key(Key::Tab);
+    assert_eq!(app.screen(), Screen::Logs);
     app.key(Key::Tab);
     assert_eq!(app.screen(), Screen::Broker);
     app.key(Key::BackTab);
-    assert_eq!(app.screen(), Screen::Threads);
-    app.key(Key::Char('5'));
-    assert_eq!(app.screen(), Screen::Threads);
+    assert_eq!(app.screen(), Screen::Logs);
+    app.key(Key::Char('6'));
+    assert_eq!(app.screen(), Screen::Logs);
     app.key(Key::Char('1'));
+    app.reply(counters(1_000, 1));
     let text = screen(&mut app);
-    for expected in ["3 Groups", "4 Threads", "Tab/1-4"] {
+    for expected in ["3 Groups", "4 Threads", "5 Logs", "Tab/1-5", "I/O errors"] {
         assert!(text.contains(expected), "{expected}:\n{text}");
     }
-    for hidden in ["Replication", "Cluster", "Electing", "Led here"] {
+    for hidden in ["Replication", "Cluster", "Electing", "Led here", "Replica"] {
         assert!(!text.contains(hidden), "{hidden}:\n{text}");
     }
+    app.reply(partitions(1_000, 1));
+    app.key(Key::Char('2'));
+    let text = screen(&mut app);
+    assert!(text.contains("Next offset"), "{text}");
+    for hidden in ["Leader", "View"] {
+        assert!(!text.contains(hidden), "{hidden}:\n{text}");
+    }
+}
+
+#[test]
+fn logs_show_the_newest_first() {
+    let mut app = App::new("ipc://@admin");
+    app.reply(broker());
+    app.key(Key::Char('6'));
+    assert!(screen(&mut app).contains("Logs (none)"));
+    let entry = |uptime_ms, level, message: &str| LogEntry {
+        uptime_ms,
+        level,
+        thread: "ozzy/admin".into(),
+        message: message.into(),
+    };
+    app.reply(Reply::Logs(vec![
+        entry(1_000, LogLevel::Info, "alpha"),
+        entry(61_000, LogLevel::Error, "omega"),
+    ]));
+    let text = screen(&mut app);
+    for expected in ["00:01:01", "error", "ozzy/admin"] {
+        assert!(text.contains(expected), "{expected}:\n{text}");
+    }
+    assert!(text.find("omega") < text.find("alpha"), "{text}");
+    app.key(Key::Down);
+    assert_eq!(app.log_table.selected(), Some(1));
+}
+
+/// Records per second come from fresh logs only: a busy journal's
+/// carried-over log keeps the last rate.
+#[test]
+fn record_rates_skip_carried_over_logs() {
+    let mut app = App::new("ipc://@admin");
+    app.reply(broker());
+    let at = |uptime_ms, next_offset| {
+        let mut status = status(0, 10, A);
+        status.log = Some(log(next_offset, Vec::new(), Vec::new()));
+        Reply::Partitions(Partitions {
+            uptime_ms,
+            missing_shards: 0,
+            rows: vec![status],
+        })
+    };
+    app.reply(at(1_000, 100));
+    assert_eq!(app.partition_rows()[0].records, None);
+    app.reply(at(3_000, 300));
+    assert_eq!(app.partition_rows()[0].records, Some(100.0));
+    app.reply(partitions(4_000, 10));
+    assert_eq!(app.partition_rows()[0].records, Some(100.0));
+    assert!((app.summary().records - 100.0).abs() < f64::EPSILON);
+    app.key(Key::Char('2'));
+    assert!(screen(&mut app).contains("Records/s"));
 }
 
 #[test]

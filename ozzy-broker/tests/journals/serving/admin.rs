@@ -163,6 +163,19 @@ async fn admin_endpoint_reports_broker_counters_partitions_and_links() {
     .unwrap();
 }
 
+/// The admin owner logs each deletion; the recent log has it.
+async fn assert_deletion_logged(client: &mut AdminClient, group: ozzy_proto::ConsumerGroupId) {
+    let Reply::Logs(logs) = client.ask(Request::Logs).await else {
+        panic!("logs reply expected");
+    };
+    let deleted = format!("admin deleted consumer group orders/workers ({group})");
+    assert!(
+        logs.iter()
+            .any(|entry| entry.message == deleted && entry.thread == "ozzy/admin"),
+        "{logs:?}"
+    );
+}
+
 /// Any broker deletes a group, wherever its partitions lead: the admin
 /// owner routes through its own client link.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -217,6 +230,7 @@ async fn admin_endpoint_deletes_a_consumer_group() {
             client.ask(delete("missing")).await,
             Reply::Error(_)
         ));
+        assert_deletion_logged(&mut client, group).await;
         client.close().await;
         links.shutdown().await.unwrap();
         writer.close().await;

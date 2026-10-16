@@ -145,6 +145,7 @@ impl Admin {
             Ok((id, Request::Counters)) => (id, Reply::Counters(self.counters())),
             Ok((id, Request::Partitions)) => (id, self.partitions(sequence).await),
             Ok((id, Request::Connections)) => (id, Reply::Connections(self.connections())),
+            Ok((id, Request::Logs)) => (id, Reply::Logs(self.logs())),
             Ok((id, Request::DeleteGroup { topic, name })) => {
                 match self.deleter.start(peer.clone(), id, topic, name) {
                     Ok(()) => return None,
@@ -190,6 +191,23 @@ impl Admin {
                 .chain([("exited".to_owned(), values(&threads.exited))])
                 .collect(),
         }
+    }
+
+    /// The process's recent diagnostics, timed by this broker's uptime.
+    fn logs(&self) -> Vec<admin::LogEntry> {
+        profiling::recent_logs()
+            .into_iter()
+            .map(|entry| admin::LogEntry {
+                uptime_ms: entry.at.saturating_duration_since(self.started).as_millis() as u64,
+                level: match entry.level {
+                    profiling::Level::Info => admin::LogLevel::Info,
+                    profiling::Level::Warn => admin::LogLevel::Warn,
+                    profiling::Level::Error => admin::LogLevel::Error,
+                },
+                thread: entry.thread,
+                message: entry.message,
+            })
+            .collect()
     }
 
     /// Links to the other brokers and the number of connected clients. Empty

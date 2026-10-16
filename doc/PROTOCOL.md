@@ -616,6 +616,7 @@ request has a body. Integers are big-endian, IDs 16 bytes. A string is a
 | 3 | Partitions | uptime ms `u64`, missing shards `u32`, rows |
 | 4 | Connections | other brokers (ID, link up `u8`), connected clients `u32` |
 | 5 | Delete group: topic, name | deleted `u8`, then the group ID when 1 |
+| 6 | Logs | entries, oldest first (broker uptime ms `u64`, level `u8`: 0 info, 1 warn, 2 error, thread, message) |
 | 255 | none | error message |
 
 A partition row:

@@ -119,6 +119,20 @@ fn replies() -> Vec<Reply> {
         Reply::Error("unknown request".into()),
         Reply::GroupDeleted(Some(ConsumerGroupId::from_bytes([11; 16]))),
         Reply::GroupDeleted(None),
+        Reply::Logs(vec![
+            LogEntry {
+                uptime_ms: 0,
+                level: LogLevel::Info,
+                thread: "ozzy/admin".into(),
+                message: "admin deleted consumer group orders/billing".into(),
+            },
+            LogEntry {
+                uptime_ms: 5_000,
+                level: LogLevel::Error,
+                thread: "ozzy/shard/0".into(),
+                message: "replica journal fault".into(),
+            },
+        ]),
     ]
 }
 
@@ -129,6 +143,7 @@ fn requests_round_trip_and_unknown_kinds_keep_their_id() {
         Request::Counters,
         Request::Partitions,
         Request::Connections,
+        Request::Logs,
         Request::DeleteGroup {
             topic: "orders".into(),
             name: "billing".into(),
@@ -247,6 +262,20 @@ fn delete_group_requests_reject_truncation_and_long_names() {
         name: "n".repeat(usize::from(u16::MAX) + 1),
     };
     assert!(encode_request(7, &long).is_err());
+}
+
+#[test]
+fn unknown_log_levels_are_rejected() {
+    let reply = Reply::Logs(vec![LogEntry {
+        uptime_ms: 1,
+        level: LogLevel::Warn,
+        thread: String::new(),
+        message: String::new(),
+    }]);
+    let mut bytes = encode_reply(1, &reply).unwrap();
+    // Kind, ID, count, uptime, then the level.
+    bytes[21] = 3;
+    assert!(matches!(decode_reply(&bytes), Err(CodecError::Profile)));
 }
 
 #[test]

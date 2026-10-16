@@ -138,6 +138,13 @@ async fn assert_delete(client: &mut Client, app: &mut App) {
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+    // The broker's log has the deletion after the next refresh.
+    refresh(client, app).await;
+    app.key(Key::Char('5'));
+    assert_shows(
+        &screen(app),
+        &["admin deleted consumer group orders/workers"],
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -167,7 +174,7 @@ async fn console_shows_a_serving_broker() {
         writer.confirm(pending).await;
         refresh(&mut client, &mut app).await;
         let text = screen(&mut app);
-        assert_shows(&text, &["broker-0", "connected", "1 of", "Tab/1-4"]);
+        assert_shows(&text, &["broker-0", "connected", "1 of", "Tab/1-5"]);
         assert!(!text.contains("Replication"), "{text}");
         assert_ne!(value(&text, "Commits/s"), "0", "{text}");
         assert_ne!(value(&text, "Appends confirmed"), "0", "{text}");

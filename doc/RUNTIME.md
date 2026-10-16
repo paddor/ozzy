@@ -307,6 +307,12 @@ optional and off by default.
 - `ozzy_telemetry::totals` sums the counters across all threads, including
   exited ones. `ozzy_telemetry::threads` lists them by thread; the admin
   endpoint serves both.
+- `ozzy_telemetry::log` always keeps the process's last 64 diagnostics for
+  `ozzy_telemetry::recent_logs`, which the admin endpoint serves. Publishing
+  them stays optional. Logging is rare, so one lock guards that list.
+- `io_failed` counts storage errors. An open, metadata, remove, or directory
+  creation that finds a path absent or present counts as `io_probe_missed`
+  instead; startup probes produce these.
 - Shards answer admin status queries between turns. A full admin lane drops
   the answer, and the admin owner reports that shard as missing.
 - A partition's committed state (offsets, retention policy, segments, dedup

@@ -25,14 +25,16 @@ ozzy-tui --config deployment.toml --broker broker-0
 | Key | Screen | Shows |
 | --- | --- | --- |
 | `1` | Broker | Identity, connected clients, cluster members with link state and the partitions each leads, partition totals, key counters |
-| `2` | Partitions | Each local partition's state, leader, record offsets, producers, segments and their size, dedup fill, commit rate, pending work, and cleanup; the selected partition's retention policy and dedup limit |
+| `2` | Partitions | Each local partition's state, leader, record offsets, producers, segments and their size, dedup fill, commit and record rates, pending work, and cleanup; the selected partition's retention policy and dedup limit |
 | `3` | Replication | Links to the other brokers, repair counters, and each partition's journal progress and how far each broker is behind |
 | `4` | Groups | Consumer groups with their lag; the selected group's members and its cursor on each partition; `d` deletes the selected group after a `y` |
 | `5` | Threads | Every event counter, totaled or for one thread |
+| `6` | Logs | The broker process's last 64 diagnostics, newest first |
 
-- A single broker replicates nothing: it has no Replication screen, Groups
-  is `3`, and Threads is `4`. The Broker screen leaves out cluster members
-  and elections.
+- A single broker replicates nothing: it has no Replication screen, so
+  Groups is `3`, Threads `4`, and Logs `5`. The Broker and Partitions screens
+  leave out cluster members, elections, leaders, views, and replica
+  counters.
 - Tab and Shift+Tab cycle screens.
 - Arrows, PgUp/PgDn, Home/End (or `j`, `k`, `g`, `G`) select rows. Left and
   Right (or `h`, `l`) switch panes on Groups and Threads.
