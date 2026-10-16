@@ -1,3 +1,4 @@
+use super::command::Resources;
 use super::*;
 
 #[test]
@@ -73,7 +74,7 @@ fn timed_reader_and_writer_bounds_reach_child_processes() {
         "--processes".into(),
         "--network-ingress".into(),
     ];
-    Process::execution_arguments(&args, &mut arguments);
+    Process::execution_arguments(&args, Resources::shared(&args), &mut arguments);
     let child = Args::parse_from(arguments);
     assert_eq!(child.reader_workers(), 12);
     assert_eq!(child.readers_per_partition, 3);
@@ -93,7 +94,7 @@ fn timed_reader_and_writer_bounds_reach_child_processes() {
         "--processes".into(),
         "--network-ingress".into(),
     ];
-    Process::execution_arguments(&binary, &mut arguments);
+    Process::execution_arguments(&binary, Resources::shared(&binary), &mut arguments);
     let child = Args::parse_from(arguments);
     assert!(child.binary_payload);
     assert!(!child.json_payload);
@@ -138,7 +139,7 @@ fn production_deployment_options_reach_child_processes() {
         "--processes".into(),
         "--network-ingress".into(),
     ];
-    Process::execution_arguments(&args, &mut arguments);
+    Process::execution_arguments(&args, Resources::shared(&args), &mut arguments);
     let child = Args::parse_from(arguments);
     assert_eq!(child.native, args.native);
 }
@@ -166,7 +167,7 @@ fn external_policy_reaches_workers_without_ozzy_mode_argument() {
         "--processes".into(),
         "--network-ingress".into(),
     ];
-    Process::execution_arguments(&args, &mut arguments);
+    Process::execution_arguments(&args, Resources::shared(&args), &mut arguments);
     assert!(!arguments.iter().any(|arg| arg == "--system"));
     let child = Args::parse_from(arguments);
     assert_eq!(child.external_system, args.external_system);
@@ -234,11 +235,7 @@ fn broker_io_threads_reach_brokers_and_leave_clients_unchanged() {
     let placement = &Placement::load(None).unwrap()[0];
     let group = GroupId::from_bytes([1; 16]);
     for (role, threads) in [("--worker-index", "2"), ("--reader-worker", "1")] {
-        let command = Process::command(&args, 0, group, placement, role).unwrap();
-        let arguments: Vec<_> = command
-            .get_args()
-            .map(|arg| arg.to_str().unwrap().to_owned())
-            .collect();
+        let arguments = Process::arguments(&args, 0, group, placement, role).unwrap();
         let offset = arguments
             .iter()
             .position(|arg| arg == "--io-threads")

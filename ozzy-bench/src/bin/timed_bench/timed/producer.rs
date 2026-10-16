@@ -1,13 +1,12 @@
 use bytes::Bytes;
 use futures::future::try_join_all;
 use ozzy_proto::{GroupId, append::AppendKey};
-use ozzy_runtime::replicated::WriterRuntime;
 use ozzy_runtime::replicated::{RecordInput, WriterStats};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 
 use super::super::{Result, error, lanes, metrics, workload};
-use super::{Config, Window, command, config, launch, measurement::Counts, report};
+use super::{Config, Window, await_connect, command, config, launch, measurement::Counts, report};
 
 mod client;
 mod paced;
@@ -50,7 +49,7 @@ pub(super) fn payload_bodies(config: &Config) -> u64 {
 
 /// Build one lane's pool on this thread before the measurement window opens.
 pub(super) fn build_payload_pool(config: &Config, lane: usize) -> Result<()> {
-    encode_payload(&mut Vec::new(), config, lane, 0, 0)
+    encode_payload(&mut Vec::new(), config, config.logical_lane(lane), 0, 0)
 }
 
 /// Memory one lane's pool holds in each writer or reader process.
@@ -68,9 +67,9 @@ pub(super) async fn run(config: Config) -> Result<()> {
         .ok_or_else(|| error("missing producer worker"))?;
     let lanes = workload::worker_share(config.writers, config.workers, index)?;
     let group = config::group(&config.args)?;
-    let mut input = launch::input();
-    let connect = command(&mut input, "connect").await?;
-    let context = WriterRuntime::new()?;
+    let mut input = launch::input()?;
+    let connect = await_connect(&mut input).await?;
+    let context = super::native::sdk_runtime(&config)?;
     let setup = connect
         .get("native")
         .ok_or_else(|| error("missing production writer setup"))?;
@@ -82,7 +81,7 @@ pub(super) async fn run(config: Config) -> Result<()> {
     let start = command(&mut input, "start").await?;
     let window = super::window(&start, &config.args)?;
     window.wait().await;
-    let meter = metrics::Meter::start();
+    let meter = metrics::Meter::start(!config.args.inproc);
     let work = try_join_all(
         clients
             .into_iter()
@@ -186,21 +185,84 @@ fn append_body(body: &mut Vec<u8>, config: &Config, number: u64) {
     debug_assert_eq!(body.len(), end);
 }
 
-fn record_input(
-    config: &Config,
+/// The stream one timed writer lane produces: its run settings, message
+/// group, and lane number.
+#[derive(Clone, Copy)]
+struct Lane<'a> {
+    config: &'a Config,
     group: GroupId,
-    lane: usize,
-    sequence: u64,
+    index: usize,
+}
+
+impl Lane<'_> {
+    /// One record of this writer's logical feed lane, ready for the SDK: inline
+    /// when small, owned otherwise. Redundant feed copies share its id and bytes.
+    fn logical_input(
+        self,
+        sequence: u64,
+        start: u64,
+        scratch: &mut Vec<u8>,
+    ) -> Result<RecordInput> {
+        let lane = self.config.logical_lane(self.index);
+        let id = config::message_id(self.group, lane, sequence);
+        Ok(
+            if self.config.args.record_bytes <= RecordInput::INLINE_BYTES {
+                encode_payload(scratch, self.config, lane, sequence, start)?;
+                RecordInput::copy_from_slice(id, scratch)
+            } else {
+                RecordInput::single(id, payload(self.config, lane, sequence, start)?)
+            },
+        )
+    }
+
+    /// Check one confirmation against what this lane sent as `sequence`.
+    fn validate_receipt(
+        self,
+        receipt: &ozzy_runtime::replicated::RecordReceipt,
+        sequence: u64,
+        check: &mut ReceiptCheck,
+    ) -> Result<()> {
+        let key = AppendKey {
+            producer_id: lanes::producer(self.index),
+            producer_epoch: 1,
+            first_sequence: sequence,
+        };
+        let id = config::message_id(self.group, self.config.logical_lane(self.index), sequence);
+        if !check.offset(receipt.offset, sequence)
+            || receipt.message_id != id
+            || receipt.partition != check.partition
+            || receipt.owner_epoch != 1
+            || receipt.key != key
+            || receipt.policy != self.config.args.system.policy()
+        {
+            return Err(error("stream confirmation identity mismatch"));
+        }
+        let disposition = match receipt.disposition {
+            ozzy_runtime::replicated::AppendDisposition::Stored => 0,
+            ozzy_runtime::replicated::AppendDisposition::Duplicate => 1,
+            _ => return Err(error("stream confirmation disposition mismatch")),
+        };
+        check.dispositions[disposition] += 1;
+        Ok(())
+    }
+}
+
+/// A sent record awaiting confirmation, with the clock reading it carries.
+struct Sent {
+    record: PendingRecord,
     start: u64,
-    scratch: &mut Vec<u8>,
-) -> Result<RecordInput> {
-    let id = config::message_id(group, lane, sequence);
-    Ok(if config.args.record_bytes <= RecordInput::INLINE_BYTES {
-        encode_payload(scratch, config, lane, sequence, start)?;
-        RecordInput::copy_from_slice(id, scratch)
-    } else {
-        RecordInput::single(id, payload(config, lane, sequence, start)?)
-    })
+    sequence: u64,
+}
+
+/// One lane's confirmation bookkeeping while it runs.
+struct LaneRun<'a> {
+    lane: Lane<'a>,
+    counts: Counts,
+    check: ReceiptCheck,
+    /// Records admitted so far, and so the next record's sequence.
+    sequence: u64,
+    /// What the lane waits for, named in deadline errors.
+    stage: &'static str,
 }
 
 async fn run_lane(
@@ -210,184 +272,180 @@ async fn run_lane(
     lane: usize,
     window: Window,
 ) -> Result<Value> {
-    let mut counts = Counts::new(window);
-    let mut check = writer.receipt_check();
-    let number = writer.number();
-    let mut payload_scratch = Vec::with_capacity(config.args.record_bytes);
-    let mut pending: VecDeque<(PendingRecord, u64, u64)> =
-        VecDeque::with_capacity(config.args.request_records);
-    // Admission can stay immediately ready with the SDK on its own runtime.
-    // Bound caller work so all timed writer lanes get polled before the deadline.
-    let turn_records = turn_records(config);
-    let mut sequence = 0;
-    let mut stage = "admission";
-    let mut start = 0;
+    let mut run = LaneRun {
+        lane: Lane {
+            config,
+            group,
+            index: lane,
+        },
+        counts: Counts::new(window),
+        check: writer.receipt_check(config.args.native.feeds.enabled()),
+        sequence: 0,
+        stage: "admission",
+    };
     let deadline = window.deadline(&config.args);
-    tokio::time::timeout_at(deadline, async {
+    let produced = tokio::time::timeout_at(deadline, run.produce(&mut writer, window)).await;
+    let stats = writer.stats()?;
+    produced.map_err(|cause| run.deadline_error(run.stage, &stats, &cause))??;
+    let partition = writer.number();
+    tokio::time::timeout_at(deadline, writer.close())
+        .await
+        .map_err(|cause| run.deadline_error("writer close", &stats, &cause))??;
+    run.check_requests(&stats)?;
+    Ok(run.report(partition, &stats))
+}
+
+impl LaneRun<'_> {
+    /// Admit records until the window ends, then wait for every confirmation.
+    async fn produce(&mut self, writer: &mut Writer, window: Window) -> Result<()> {
+        let config = self.lane.config;
+        if config.args.scheduled() {
+            self.stage = "scheduled admission and confirmations";
+            return paced::produce(writer, self, window).await;
+        }
+        let mut scratch = Vec::with_capacity(config.args.record_bytes);
+        let mut pending = VecDeque::with_capacity(config.args.request_records);
+        // Admission can stay immediately ready with the SDK on its own runtime.
+        // Bound caller work so all timed writer lanes get polled before the deadline.
+        let turn_records = turn_records(config);
+        let mut start = 0;
         loop {
-            if config.args.scheduled() {
-                stage = "scheduled admission and confirmations";
-                check = paced::produce(
-                    &mut writer,
-                    config,
-                    group,
-                    lane,
-                    window,
-                    &mut counts,
-                    &mut sequence,
-                )
-                .await?;
-                break;
-            }
-            if sequence.is_multiple_of(CLOCK_QUANTUM) {
+            if self.sequence.is_multiple_of(CLOCK_QUANTUM) {
                 start = metrics::monotonic_ns();
                 if start >= window.end {
                     break;
                 }
             }
-            encode_payload(&mut payload_scratch, config, lane, sequence, start)?;
-            let id = config::message_id(group, lane, sequence);
-            // Small records take the inline path an application would use for
-            // events it builds in place; larger ones own their buffer.
-            let input = if payload_scratch.len() <= RecordInput::INLINE_BYTES {
-                RecordInput::copy_from_slice(id, &payload_scratch)
-            } else {
-                RecordInput::single(id, Bytes::copy_from_slice(&payload_scratch))
-            };
-            counts.record_bytes(id, &payload_scratch);
-            stage = "admission";
+            let input = self.next_raw_input(&mut scratch, start)?;
+            self.stage = "admission";
             let record = writer.send(input).await?;
-            counts.submission(start, 1);
-            pending.push_back((record, start, sequence));
-            sequence += 1;
-            drain_confirmed(&mut pending, &mut counts, config, group, lane, &mut check)?;
-            if sequence.is_multiple_of(turn_records) {
+            self.counts.submission(start, 1);
+            pending.push_back(Sent {
+                record,
+                start,
+                sequence: self.sequence,
+            });
+            self.sequence += 1;
+            self.drain_confirmed(&mut pending)?;
+            if self.sequence.is_multiple_of(turn_records) {
                 tokio::task::yield_now().await;
             }
         }
-        stage = "final confirmations";
+        self.stage = "final confirmations";
         while !pending.is_empty() {
-            observe_front(&mut pending, &mut counts, config, group, lane, &mut check).await?;
+            self.observe_front(&mut pending).await?;
         }
-        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
-    })
-    .await
-    .map_err(|cause| {
-        deadline_error(lane, stage, sequence, counts.total, &writer.stats(), &cause)
-    })??;
-    let stats = writer.stats();
-    tokio::time::timeout_at(deadline, writer.close())
-        .await
-        .map_err(|cause| {
-            deadline_error(lane, "writer close", sequence, counts.total, &stats, &cause)
-        })??;
-    if counts.total != sequence {
-        return Err(error("incomplete writer cohort"));
+        Ok(())
     }
-    if sequence == 0 && stats != WriterStats::default() {
-        return Err(error("idle writer transmitted an APPEND"));
-    }
-    if sequence != 0
-        && (stats.requests == 0
-            || stats.max_records > config.writer_limits().max_records
-            || !(1..=config.args.writer_inflight_appends).contains(&stats.max_inflight_appends))
-    {
-        return Err(error("native writer did not use bounded SDK APPENDs"));
-    }
-    let mut row = counts.report(lane);
-    row["partition"] = json!(number);
-    row["confirmed_partition_offset_range"] = json!(check.offset_range());
-    row["protocol_requests"] = json!({
-        "scope":"warmup, measurement and drain; includes retry transmissions; not confirmations",
-        "requests":stats.requests, "records":stats.records, "payload_bytes":stats.payload_bytes,
-        "max_inflight_appends":stats.max_inflight_appends,
-        "min_records":stats.min_records, "max_records":stats.max_records,
-        "min_payload_bytes":stats.min_payload_bytes, "max_payload_bytes":stats.max_payload_bytes,
-        "record_count_bucket_upper_bounds":(0..31).map(|i|1_u64 << i).chain([u64::from(u32::MAX)]).collect::<Vec<_>>(),
-        "record_count_buckets":stats.record_count_buckets,
-    });
-    Ok(row)
-}
 
-fn deadline_error(
-    lane: usize,
-    stage: &str,
-    admitted: u64,
-    confirmed: u64,
-    stats: &WriterStats,
-    cause: &tokio::time::error::Elapsed,
-) -> Box<dyn std::error::Error + Send + Sync> {
-    error(format!(
-        "writer lane={lane} stage={stage} admitted={admitted} confirmed={confirmed} \
-         unconfirmed={} socket_requests={} socket_records={} socket_payload_bytes={}: {cause}",
-        admitted.saturating_sub(confirmed),
-        stats.requests,
-        stats.records,
-        stats.payload_bytes,
-    ))
-}
-
-fn drain_confirmed(
-    pending: &mut VecDeque<(PendingRecord, u64, u64)>,
-    counts: &mut Counts,
-    config: &Config,
-    group: GroupId,
-    lane: usize,
-    check: &mut ReceiptCheck,
-) -> Result<()> {
-    let mut finished = None;
-    while let Some((record, start, sequence)) = pending.front() {
-        let Some(receipt) = record.try_confirmed() else {
-            break;
+    /// Encode the next record of this writer's own lane, stamped `start`, and
+    /// count its bytes.
+    fn next_raw_input(&mut self, scratch: &mut Vec<u8>, start: u64) -> Result<RecordInput> {
+        let Lane {
+            config,
+            group,
+            index,
+        } = self.lane;
+        encode_payload(scratch, config, index, self.sequence, start)?;
+        let id = config::message_id(group, index, self.sequence);
+        // Small records take the inline path an application would use for
+        // events it builds in place; larger ones own their buffer.
+        let input = if scratch.len() <= RecordInput::INLINE_BYTES {
+            RecordInput::copy_from_slice(id, scratch)
+        } else {
+            RecordInput::single(id, Bytes::copy_from_slice(scratch))
         };
-        validate_receipt(&receipt?, *sequence, config, group, lane, check)?;
-        let completed = *finished.get_or_insert_with(metrics::monotonic_ns);
-        counts.complete(*start, completed, 1)?;
+        self.counts.record_bytes(id, scratch);
+        Ok(input)
+    }
+
+    /// Complete every already confirmed record at the front, reading the
+    /// clock once.
+    fn drain_confirmed(&mut self, pending: &mut VecDeque<Sent>) -> Result<()> {
+        let mut finished = None;
+        while let Some(sent) = pending.front() {
+            let Some(receipt) = sent.record.try_confirmed() else {
+                break;
+            };
+            self.lane
+                .validate_receipt(&receipt?, sent.sequence, &mut self.check)?;
+            let completed = *finished.get_or_insert_with(metrics::monotonic_ns);
+            self.counts.complete(sent.start, completed, 1)?;
+            pending.pop_front();
+        }
+        Ok(())
+    }
+
+    /// Wait for the oldest confirmation, then complete the ready ones.
+    async fn observe_front(&mut self, pending: &mut VecDeque<Sent>) -> Result<()> {
+        let Some(sent) = pending.front() else {
+            return Ok(());
+        };
+        let receipt = sent.record.confirmed().await?;
+        let completed = metrics::monotonic_ns();
+        self.lane
+            .validate_receipt(&receipt, sent.sequence, &mut self.check)?;
+        self.counts.complete(sent.start, completed, 1)?;
         pending.pop_front();
+        self.drain_confirmed(pending)
     }
-    Ok(())
-}
 
-async fn observe_front(
-    pending: &mut VecDeque<(PendingRecord, u64, u64)>,
-    counts: &mut Counts,
-    config: &Config,
-    group: GroupId,
-    lane: usize,
-    check: &mut ReceiptCheck,
-) -> Result<()> {
-    let (record, start, sequence) = pending.front().expect("pending confirmation");
-    let receipt = record.confirmed().await?;
-    let completed = metrics::monotonic_ns();
-    validate_receipt(&receipt, *sequence, config, group, lane, check)?;
-    counts.complete(*start, completed, 1)?;
-    pending.pop_front();
-    drain_confirmed(pending, counts, config, group, lane, check)
-}
-
-fn validate_receipt(
-    receipt: &ozzy_runtime::replicated::RecordReceipt,
-    sequence: u64,
-    config: &Config,
-    group: GroupId,
-    lane: usize,
-    check: &mut ReceiptCheck,
-) -> Result<()> {
-    if !check.offset(receipt.offset, sequence)
-        || receipt.message_id != config::message_id(group, lane, sequence)
-        || receipt.partition != check.partition
-        || receipt.owner_epoch != 1
-        || receipt.key
-            != (AppendKey {
-                producer_id: lanes::producer(lane),
-                producer_epoch: 1,
-                first_sequence: sequence,
-            })
-        || receipt.policy != config.args.system.policy()
-    {
-        return Err(error("stream confirmation identity mismatch"));
+    /// Every admitted record was confirmed through bounded SDK APPENDs.
+    fn check_requests(&self, stats: &WriterStats) -> Result<()> {
+        let config = self.lane.config;
+        if self.counts.total != self.sequence {
+            return Err(error("incomplete writer cohort"));
+        }
+        if self.sequence == 0 && *stats != WriterStats::default() {
+            return Err(error("idle writer transmitted an APPEND"));
+        }
+        let bounded = stats.requests != 0
+            && stats.max_records <= config.writer_limits().max_records
+            && (1..=config.args.writer_inflight_appends).contains(&stats.max_inflight_appends);
+        if self.sequence != 0 && !bounded {
+            return Err(error("native writer did not use bounded SDK APPENDs"));
+        }
+        Ok(())
     }
-    Ok(())
+
+    fn report(&self, partition: u32, stats: &WriterStats) -> Value {
+        let mut row = self.counts.report(self.lane.index);
+        row["partition"] = json!(partition);
+        row["confirmed_partition_offset_range"] = json!(self.check.offset_range());
+        row["confirmed_dispositions"] =
+            json!({"stored": self.check.dispositions[0], "duplicate": self.check.dispositions[1]});
+        if self.lane.config.args.native.feeds.enabled() {
+            row["confirmed_offset_digest_xxh3_128"] = json!(self.check.offset_digest());
+        }
+        row["protocol_requests"] = json!({
+            "scope":"warmup, measurement and drain; includes retry transmissions; not confirmations",
+            "requests":stats.requests, "records":stats.records, "payload_bytes":stats.payload_bytes,
+            "max_inflight_appends":stats.max_inflight_appends,
+            "min_records":stats.min_records, "max_records":stats.max_records,
+            "min_payload_bytes":stats.min_payload_bytes, "max_payload_bytes":stats.max_payload_bytes,
+            "record_count_bucket_upper_bounds":(0..31).map(|i|1_u64 << i).chain([u64::from(u32::MAX)]).collect::<Vec<_>>(),
+            "record_count_buckets":stats.record_count_buckets,
+        });
+        row
+    }
+
+    fn deadline_error(
+        &self,
+        stage: &str,
+        stats: &WriterStats,
+        cause: &tokio::time::error::Elapsed,
+    ) -> Box<dyn std::error::Error + Send + Sync> {
+        let (admitted, confirmed) = (self.sequence, self.counts.total);
+        error(format!(
+            "writer lane={} stage={stage} admitted={admitted} confirmed={confirmed} \
+             unconfirmed={} socket_requests={} socket_records={} socket_payload_bytes={}: {cause}",
+            self.lane.index,
+            admitted.saturating_sub(confirmed),
+            stats.requests,
+            stats.records,
+            stats.payload_bytes,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -420,8 +478,13 @@ mod tests {
             for lane in 0..4 {
                 for sequence in [0, 129, u64::from(u32::MAX) + 1] {
                     let external = payload(&config, lane, sequence, 1234).unwrap();
-                    let native =
-                        record_input(&config, group, lane, sequence, 1234, &mut scratch).unwrap();
+                    let native = Lane {
+                        config: &config,
+                        group,
+                        index: lane,
+                    }
+                    .logical_input(sequence, 1234, &mut scratch)
+                    .unwrap();
                     assert_eq!(external.len(), config.args.record_bytes);
                     assert_eq!(native.parts().next().unwrap(), external.as_ref());
                     assert_eq!(&external[..8], 1234_u64.to_be_bytes());

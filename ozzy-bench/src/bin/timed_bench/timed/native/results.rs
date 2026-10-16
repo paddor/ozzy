@@ -1,5 +1,6 @@
 //! Labels derived from production owners and the actual shared SDK adapters.
 
+use super::super::results::extend_object;
 use super::{Config, Result, error};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -9,26 +10,30 @@ pub(in crate::bench::timed) fn topology(config: &Config, brokers: &[Value]) -> R
         .native
         .as_ref()
         .ok_or_else(|| error("missing production topology"))?;
-    let observed = |name: &str| -> Result<usize> {
-        let first = brokers
-            .first()
-            .and_then(|broker| broker["identity"]["topology"][name].as_u64())
-            .ok_or_else(|| error(format!("missing production {name} observation")))?;
-        if brokers
-            .iter()
-            .any(|broker| broker["identity"]["topology"][name] != first)
-        {
-            return Err(error(
-                "production broker topology differs from uniform benchmark settings",
-            ));
-        }
-        Ok(usize::try_from(first)?)
-    };
     let topics = effective_topics(config, brokers)?;
-    let mut row = json!({
+    let mut row = workload_labels(config, settings);
+    extend_object(&mut row, deployment_labels(config, settings, brokers)?)?;
+    super::super::results::writer_protocol(&mut row, config);
+    extend_object(&mut row, topics.clone())?;
+    row["effective_topic_topology"] = topics;
+    row["topic_organization"] = json!("one Ozzy topic");
+    row["writer_batch_target_bytes"] = json!(super::writer_settings(config).batch_target_bytes);
+    row["payload_compression_scope"] = json!("SDK APPEND payload packing");
+    Ok(row)
+}
+
+/// Requested topic, group, dedup, writer and reader shape.
+fn workload_labels(config: &Config, settings: &super::Settings) -> Value {
+    json!({
         "system": config.args.system.name(), "broker_runtime": "production-deployment",
         "native_client_protocol": true, "topic_count": 1,
         "partition_count": settings.partitions, "partitions_per_topic": settings.partitions,
+        "consumer_groups": config.args.native.groups,
+        "members_per_group": if config.args.native.groups == 0 { 0 } else { config.args.native.group_members },
+        "ack_window": if config.args.native.groups == 0 { Value::Null } else { json!(config.args.native.ack_window) },
+        "dedup_window_secs": config.args.native.dedup_window_secs,
+        "dedup_max_entries_per_partition": config.args.native.dedup_max_entries,
+        "dedup_max_bytes_per_partition": config.args.native.dedup_max_bytes,
         "producer_workers": config.workers, "reader_workers": config.args.reader_workers(),
         "producer_writers": config.writers, "records_per_submission": 1, "records_per_append": null,
         "streaming": true, "request_records": config.args.request_records,
@@ -41,22 +46,29 @@ pub(in crate::bench::timed) fn topology(config: &Config, brokers: &[Value]) -> R
         "reader_queue_messages": config.live_queue_messages(),
         "readers_per_partition": config.args.readers_per_partition, "live_readers": true,
         "reader_transport": "TCP PUB/SUB live records; PEER subscriptions, replay, gap repair",
-    });
-    row.as_object_mut().unwrap().extend(json!({
+    })
+}
+
+/// Commit policy, observed broker threads, placement and memory scope.
+fn deployment_labels(
+    config: &Config,
+    settings: &super::Settings,
+    brokers: &[Value],
+) -> Result<Value> {
+    Ok(json!({
         "commit_policy": match config.args.system {
             crate::bench::System::SingleDurable => "local_durable",
             crate::bench::System::DiskQuorum => "quorum_durable",
-            crate::bench::System::ReplicatedPersisting => "quorum_replicated_persisting",
         },
         "ack_copies": if config.args.system.brokers() == 1 { 1 } else { 2 },
         "replica_voters": config.args.system.brokers(), "storage_copies": config.args.system.brokers(),
         "journals_per_broker": settings.partitions,
         "replication_groups_per_broker": if config.args.system.brokers() == 3 { settings.partitions } else { 0 },
         "actor_runtime": "application",
-        "broker_application_shards": observed("application_threads")?,
-        "broker_application_threads": observed("application_threads")?,
-        "broker_dispatch_threads": observed("dispatcher_threads")?,
-        "broker_omq_io_threads": observed("omq_io_threads")?, "broker_omq_mode": "dedicated-io",
+        "broker_application_shards": observed(brokers, "application_threads")?,
+        "broker_application_threads": observed(brokers, "application_threads")?,
+        "broker_dispatch_threads": observed(brokers, "dispatcher_threads")?,
+        "broker_omq_io_threads": observed(brokers, "omq_io_threads")?, "broker_omq_mode": "dedicated-io",
         "broker_application_runtime": "one Tokio current_thread runtime per application shard",
         "broker_peer_receive_queues": "ordinary socket receive; dispatcher and bounded shard fanrings",
         "broker_peer_payload_budget_scope": "local writer/follower queues and resident owners are bounded per shard; follower progress and control capacity are reserved",
@@ -76,16 +88,24 @@ pub(in crate::bench::timed) fn topology(config: &Config, brokers: &[Value]) -> R
         },
         "memory_reservation_bytes": settings.reservation_bytes,
         "memory_reservation_scope": "declared SDK, shard, device, and decode headroom; not measured peak memory",
-    }).as_object().unwrap().clone());
-    super::super::results::writer_protocol(&mut row, config);
-    row.as_object_mut()
-        .unwrap()
-        .extend(topics.as_object().unwrap().clone());
-    row["effective_topic_topology"] = topics;
-    row["topic_organization"] = json!("one Ozzy topic");
-    row["writer_batch_target_bytes"] = json!(super::writer_settings(config).batch_target_bytes);
-    row["payload_compression_scope"] = json!("SDK APPEND payload packing");
-    Ok(row)
+    }))
+}
+
+/// One topology field every broker observed alike.
+fn observed(brokers: &[Value], name: &str) -> Result<usize> {
+    let first = brokers
+        .first()
+        .and_then(|broker| broker["identity"]["topology"][name].as_u64())
+        .ok_or_else(|| error(format!("missing production {name} observation")))?;
+    if brokers
+        .iter()
+        .any(|broker| broker["identity"]["topology"][name] != first)
+    {
+        return Err(error(
+            "production broker topology differs from uniform benchmark settings",
+        ));
+    }
+    Ok(usize::try_from(first)?)
 }
 
 fn effective_topics(config: &Config, brokers: &[Value]) -> Result<Value> {

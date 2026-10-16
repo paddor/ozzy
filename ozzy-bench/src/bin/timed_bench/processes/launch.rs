@@ -7,16 +7,28 @@ use std::io::Read;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use super::super::{Args, Result, error};
 
-const MAX_LINE: u64 = 64 * 1024;
-/// Control reply deadline for child processes.
-const DEADLINE: Duration = Duration::from_secs(60);
+use ozzy_bench::budget::CONTROL_STEP;
 
+const MAX_LINE: u64 = 64 * 1024;
+/// How often a stopping worker is checked for exit.
+const EXIT_POLL: Duration = Duration::from_millis(10);
+/// How often running workers are checked for diagnostics.
+const DIAGNOSTIC_POLL: Duration = Duration::from_millis(50);
+
+mod command;
 #[cfg(test)]
 mod tests;
+
+use command::placed_command;
 
 pub(in super::super) use ozzy_bench::placement::Placement;
 
@@ -24,12 +36,22 @@ pub(in super::super) use ozzy_bench::control::{input, reply};
 
 #[derive(Debug)]
 pub(in super::super) struct Process {
-    child: Child,
+    worker: Worker,
     control: Connection,
     pub errors: PathBuf,
     pub remote: bool,
     pub placement: Option<Placement>,
     external_log: Option<regex::bytes::Regex>,
+}
+
+/// A worker process, or an inproc role thread sharing this process.
+#[derive(Debug)]
+enum Worker {
+    Child(Child),
+    Thread {
+        handle: Option<JoinHandle<Result<()>>>,
+        finished: Arc<AtomicBool>,
+    },
 }
 
 #[derive(Clone)]
@@ -38,165 +60,18 @@ pub(in super::super) struct Monitor {
     errors: PathBuf,
     control: ozzy_bench::control::Monitor,
     external_log: Option<regex::bytes::Regex>,
+    finished: Option<Arc<AtomicBool>>,
+}
+
+struct Finished(Arc<AtomicBool>);
+
+impl Drop for Finished {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 impl Process {
-    fn command(
-        args: &Args,
-        index: usize,
-        group: GroupId,
-        placement: &Placement,
-        role: &str,
-    ) -> Result<Command> {
-        let mut arguments = vec![
-            role.into(),
-            index.to_string(),
-            "--bind".into(),
-            placement.bind.to_string(),
-            "--group".into(),
-            group.to_string(),
-            "--record-bytes".into(),
-            args.record_bytes.to_string(),
-            "--history-mib".into(),
-            args.history_mib.to_string(),
-        ];
-        Self::execution_arguments(args, &mut arguments);
-        if let (Some(threads), "--worker-index") = (args.broker_io_threads, role) {
-            let offset = arguments
-                .iter()
-                .position(|arg| arg == "--io-threads")
-                .expect("I/O thread argument");
-            arguments[offset + 1] = threads.to_string();
-        }
-        if let Some(storage) = &placement.storage_dir {
-            let offset = arguments
-                .iter()
-                .position(|arg| arg == "--storage-dir")
-                .expect("storage argument");
-            arguments[offset + 1] = storage
-                .to_str()
-                .ok_or_else(|| error("non-UTF8 storage path"))?
-                .into();
-        }
-        if args.network_ingress {
-            arguments.push("--network-ingress".into());
-        }
-        if args.streaming {
-            arguments.extend([
-                "--streaming".into(),
-                "--request-records".into(),
-                args.request_records.to_string(),
-            ]);
-        }
-        if args.payload_compression == super::super::PayloadCompression::Off {
-            arguments.extend(["--payload-compression".into(), "off".into()]);
-        }
-        if args.network_ingress {
-            arguments.push("--processes".into());
-        }
-        for (name, value) in [
-            ("--producer-workers", args.producer_workers),
-            ("--window", args.window),
-        ] {
-            if let Some(value) = value {
-                arguments.extend([name.into(), value.to_string()]);
-            }
-        }
-        placed_command(placement, arguments)
-    }
-
-    fn execution_arguments(args: &Args, arguments: &mut Vec<String>) {
-        for (enabled, flag) in [
-            (args.balanced_partitions, "--balanced-partitions"),
-            (args.random_payload, "--random-payload"),
-            (args.json_payload, "--json-payload"),
-            (args.live_readers, "--live-readers"),
-            (args.binary_payload, "--binary-payload"),
-        ] {
-            if enabled {
-                arguments.push(flag.into());
-            }
-        }
-
-        #[cfg(feature = "comparisons")]
-        Self::external_arguments(args, arguments);
-        args.control.append(arguments);
-        args.native.append(arguments);
-        #[cfg(feature = "comparisons")]
-        if args.external_system.is_none() {
-            arguments.extend(["--system".into(), args.system.name().into()]);
-        }
-        #[cfg(not(feature = "comparisons"))]
-        arguments.extend(["--system".into(), args.system.name().into()]);
-        arguments.extend([
-            "--storage-dir".into(),
-            args.storage_dir.to_string_lossy().into_owned(),
-            "--segment-decoded-mib".into(),
-            args.segment_decoded_mib.to_string(),
-            "--segment-mib".into(),
-            args.segment_mib.to_string(),
-            "--direct-io".into(),
-            args.direct_io.to_string(),
-            "--io-backend".into(),
-            args.io_backend.name().into(),
-            "--aio-depth".into(),
-            args.aio_depth.to_string(),
-            "--writer-batch-records".into(),
-            args.writer_batch_records.to_string(),
-            "--writer-batch-target-kib".into(),
-            args.writer_batch_target_kib.to_string(),
-            "--writer-inflight-appends".into(),
-            args.writer_inflight_appends.to_string(),
-            "--reader-records".into(),
-            args.reader_records.to_string(),
-            "--reader-payload-mib".into(),
-            args.reader_payload_mib.to_string(),
-            "--io-threads".into(),
-            args.io_threads.to_string(),
-            "--app-threads".into(),
-            args.app_threads.to_string(),
-        ]);
-        if let Some(duration) = args.duration {
-            arguments.extend([
-                "--duration".into(),
-                duration.to_string(),
-                "--warmup".into(),
-                args.warmup.to_string(),
-                "--reader-workers".into(),
-                args.reader_workers().to_string(),
-                "--readers-per-partition".into(),
-                args.readers_per_partition.to_string(),
-                "--history-operations".into(),
-                args.history_operations.to_string(),
-                "--drain-timeout-secs".into(),
-                args.drain_timeout_secs.to_string(),
-            ]);
-        }
-        if let Some(rate) = args.records_per_second {
-            arguments.extend(["--records-per-second".into(), rate.to_string()]);
-        }
-        if let Some(ramp) = &args.ramp {
-            arguments.extend(["--ramp".into(), ramp.to_string()]);
-        }
-    }
-
-    #[cfg(feature = "comparisons")]
-    fn external_arguments(args: &Args, arguments: &mut Vec<String>) {
-        if let Some(system) = args.external_system {
-            arguments.extend([
-                "--external-system".into(),
-                system.name().into(),
-                "--external-policy".into(),
-                args.external_policy
-                    .expect("validated policy")
-                    .name()
-                    .into(),
-                "--external-endpoint".into(),
-                args.external_endpoint.clone().expect("validated endpoint"),
-            ]);
-        }
-    }
-
     pub(in super::super) async fn spawn(
         args: &Args,
         index: usize,
@@ -212,10 +87,23 @@ impl Process {
         let (control, config) = Connection::listen(args.control.control_bind.as_deref()).await?;
         let mut args = args.clone();
         args.control = config;
-        let command = Self::command(&args, index, group, placement, "--worker-index")?;
+        let arguments = Self::arguments(&args, index, group, placement, "--worker-index")?;
         let errors = directory.join(format!("voter-{index}.stderr"));
-        let mut process =
-            Self::spawn_command(command, errors, placement.remote.is_some(), control)?;
+        let mut process = if args.inproc {
+            if placement.remote.is_some() {
+                return Err(error("inproc brokers cannot use remote placements"));
+            }
+            Self::spawn_thread(
+                format!("bench/voter-{index}"),
+                arguments,
+                errors,
+                placement.cpus.clone(),
+                control,
+            )?
+        } else {
+            let command = placed_command(placement, arguments, args.budget().lifetime())?;
+            Self::spawn_command(command, errors, placement.remote.is_some(), control)?
+        };
         process.placement = Some(placement.clone());
         Ok(process)
     }
@@ -242,13 +130,24 @@ impl Process {
         let (control, config) = Connection::listen(None).await?;
         let mut args = args.clone();
         args.control = config;
-        let command = Self::command(&args, index, group, &placement, flag)?;
-        let process = Self::spawn_command(
-            command,
-            directory.join(format!("{role}-{index}.stderr")),
-            false,
-            control,
-        )?;
+        let arguments = Self::arguments(&args, index, group, &placement, flag)?;
+        let errors = directory.join(format!("{role}-{index}.stderr"));
+        let process = if args.inproc {
+            Self::spawn_thread(
+                format!("bench/{role}-{index}"),
+                arguments,
+                errors,
+                None,
+                control,
+            )?
+        } else {
+            Self::spawn_command(
+                placed_command(&placement, arguments, args.budget().lifetime())?,
+                errors,
+                false,
+                control,
+            )?
+        };
         #[cfg(feature = "comparisons")]
         let process = {
             use super::super::timed::external::System;
@@ -298,7 +197,7 @@ impl Process {
             .stderr(stderr)
             .spawn()?;
         Ok(Self {
-            child,
+            worker: Worker::Child(child),
             control,
             errors,
             remote,
@@ -307,23 +206,75 @@ impl Process {
         })
     }
 
+    /// Start an inproc role on its own current-thread runtime. Brokers pin
+    /// before starting so their shard and dispatcher threads inherit the mask.
+    /// Failures return through control; the empty stderr file keeps artifacts uniform.
+    fn spawn_thread(
+        name: String,
+        arguments: Vec<String>,
+        errors: PathBuf,
+        cpus: Option<Vec<usize>>,
+        control: Connection,
+    ) -> Result<Self> {
+        if std::env::var_os("OZZY_BENCH_HEAPTRACK").is_some() {
+            return Err(error("heaptrack mode requires worker processes"));
+        }
+        std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&errors)?;
+        let context = ozzy_bench::control::context();
+        let finished = Arc::new(AtomicBool::new(false));
+        let done = Finished(finished.clone());
+        let handle = std::thread::Builder::new().name(name).spawn(move || {
+            let _done = done;
+            if let Some(cpus) = cpus {
+                let mut set = rustix::thread::CpuSet::new();
+                for cpu in cpus {
+                    set.set(cpu);
+                }
+                rustix::thread::sched_setaffinity(None, &set)?;
+            }
+            super::super::run_inproc_worker(arguments, context)
+        })?;
+        Ok(Self {
+            worker: Worker::Thread {
+                handle: Some(handle),
+                finished,
+            },
+            control,
+            errors,
+            remote: false,
+            placement: None,
+            external_log: None,
+        })
+    }
+
     pub(in super::super) fn monitor(&self) -> Monitor {
         Monitor {
-            pid: self.child.id(),
+            pid: self.id(),
             errors: self.errors.clone(),
             control: self.control.monitor(),
             external_log: self.external_log.clone(),
+            finished: match &self.worker {
+                Worker::Child(_) => None,
+                Worker::Thread { finished, .. } => Some(finished.clone()),
+            },
         }
     }
 
+    /// Thread roles report the shared process ID.
     pub(in super::super) fn id(&self) -> u32 {
-        self.child.id()
+        match &self.worker {
+            Worker::Child(child) => child.id(),
+            Worker::Thread { .. } => std::process::id(),
+        }
     }
     pub(in super::super) fn send(&mut self, value: &Value) -> Result<()> {
         self.control.send(value)
     }
     pub(in super::super) async fn receive(&mut self, expected: &str) -> Result<Value> {
-        self.receive_until(expected, tokio::time::Instant::now() + DEADLINE)
+        self.receive_until(expected, tokio::time::Instant::now() + CONTROL_STEP)
             .await
     }
     pub(in super::super) async fn receive_until(
@@ -354,18 +305,31 @@ impl Process {
     }
     pub(in super::super) async fn stop(&mut self) -> Result<()> {
         self.control.shutdown()?;
-        tokio::time::timeout(DEADLINE, async {
+        tokio::time::timeout(CONTROL_STEP, async {
             loop {
-                if let Some(status) = self.child.try_wait()? {
-                    if fatal_stderr(&self.errors, self.external_log.as_ref())? {
-                        return Err(error(diagnostics(&self.errors)?));
+                match &mut self.worker {
+                    Worker::Child(child) => {
+                        if let Some(status) = child.try_wait()? {
+                            if fatal_stderr(&self.errors, self.external_log.as_ref())? {
+                                return Err(error(diagnostics(&self.errors)?));
+                            }
+                            if !status.success() {
+                                return Err(error(format!("worker exited {status}")));
+                            }
+                            return Ok(());
+                        }
                     }
-                    if !status.success() {
-                        return Err(error(format!("worker exited {status}")));
+                    Worker::Thread { handle, .. } => {
+                        if handle.as_ref().is_none_or(JoinHandle::is_finished) {
+                            return match handle.take().map(JoinHandle::join) {
+                                None | Some(Ok(Ok(()))) => Ok(()),
+                                Some(Ok(Err(cause))) => Err(cause),
+                                Some(Err(_)) => Err(error("inproc worker panicked")),
+                            };
+                        }
                     }
-                    return Ok(());
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::time::sleep(EXIT_POLL).await;
             }
         })
         .await?
@@ -375,10 +339,13 @@ impl Process {
 impl Drop for Process {
     fn drop(&mut self) {
         let _ = self.control.shutdown();
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
+        // A still-running inproc role exits with the process.
+        if let Worker::Child(child) = &mut self.worker {
+            if child.try_wait().ok().flatten().is_none() {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
         }
-        let _ = self.child.wait();
     }
 }
 
@@ -401,12 +368,18 @@ pub(in super::super) async fn watch_diagnostics(
                     diagnostics(path).unwrap_or_default()
                 ));
             }
-            let status = std::fs::read_to_string(format!("/proc/{}/stat", monitor.pid));
-            if status.as_ref().map_or(true, |line| {
-                line.rsplit_once(')')
-                    .is_none_or(|(_, rest)| rest.starts_with(" Z "))
-            }) {
-                return error(format!("worker pid={} exited", monitor.pid));
+            if let Some(finished) = &monitor.finished {
+                if finished.load(Ordering::Acquire) {
+                    return error(format!("inproc worker exited: {}", path.display()));
+                }
+            } else {
+                let status = std::fs::read_to_string(format!("/proc/{}/stat", monitor.pid));
+                if status.as_ref().map_or(true, |line| {
+                    line.rsplit_once(')')
+                        .is_none_or(|(_, rest)| rest.starts_with(" Z "))
+                }) {
+                    return error(format!("worker pid={} exited", monitor.pid));
+                }
             }
             if !monitor.control.is_live() {
                 return error(format!(
@@ -415,61 +388,8 @@ pub(in super::super) async fn watch_diagnostics(
                 ));
             }
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(DIAGNOSTIC_POLL).await;
     }
-}
-
-fn placed_command(placement: &Placement, arguments: Vec<String>) -> Result<Command> {
-    let command = if let Some((host, executable)) = &placement.remote {
-        let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
-        let mut shell = format!(
-            "exec timeout --signal=TERM --kill-after=5s 180s {}{}",
-            placement
-                .cpu_list()
-                .map_or_else(String::new, |cpus| format!(
-                    "taskset --cpu-list {} ",
-                    quote(&cpus)
-                )),
-            quote(
-                executable
-                    .to_str()
-                    .ok_or_else(|| error("non-UTF8 executable"))?
-            )
-        );
-        for argument in &arguments {
-            shell.push(' ');
-            shell.push_str(&quote(argument));
-        }
-        let mut command = Command::new("ssh");
-        command.args([
-            "-T",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=yes",
-            "-o",
-            "ConnectTimeout=8",
-            "-o",
-            "ServerAliveInterval=5",
-            "-o",
-            "ServerAliveCountMax=2",
-            "--",
-        ]);
-        command.arg(host).arg(shell);
-        command
-    } else {
-        let executable = std::env::current_exe()?;
-        let mut command = if let Some(cpus) = placement.cpu_list() {
-            let mut command = Command::new("taskset");
-            command.args(["--cpu-list", &cpus]).arg(executable);
-            command
-        } else {
-            Command::new(executable)
-        };
-        command.args(arguments);
-        command
-    };
-    Ok(command)
 }
 
 #[cfg(any(feature = "comparisons", test))]

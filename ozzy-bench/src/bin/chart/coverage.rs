@@ -117,11 +117,9 @@ fn previous(svg: &str) -> Result<BTreeSet<String>> {
     Ok(SERIES
         .iter()
         .filter(|series| {
-            svg.lines().map(str::trim).any(|line| {
-                line == series.label
-                    || line.starts_with(&format!("{} ", series.label))
-                    || (series.id == "ozzy/raw" && line.starts_with("Ozzy RAM copies ("))
-            })
+            svg.lines()
+                .map(str::trim)
+                .any(|line| line == series.label || line.starts_with(&format!("{} ", series.label)))
         })
         .map(|series| series.id.to_owned())
         .collect())
@@ -185,7 +183,7 @@ mod tests {
 
     #[test]
     fn legacy_legends_and_stable_ids_protect_comparison_series() {
-        let legacy = "<text>\nIggy 0.9.0-rc.1 replicated\n</text>\n<text>\nRedpanda 26.2.2 + librdkafka 2.12.1\n</text>\n<text>\nOzzy RAM copies (three brokers)\n</text>\n<text>\nOzzy packed\n</text>";
+        let legacy = "<text>\nIggy 0.9.0-rc.1\n</text>\n<text>\nRedpanda 26.2.2 + librdkafka 2.12.1\n</text>\n<text>\nOzzy (three brokers)\n</text>\n<text>\nOzzy packed\n</text>";
         let expected = SERIES.iter().map(|series| series.id.to_owned()).collect();
         assert_eq!(previous(legacy).unwrap(), expected);
         let row = json!({"case":{"impl":"ozzy","codec":"raw"}});

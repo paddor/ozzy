@@ -215,11 +215,12 @@ pub struct Schedule {
 
 impl Schedule {
     fn relative(self, ordinal: u64) -> u128 {
+        // The first stage starts at ordinal zero, so it covers any ordinal
+        // that no later stage reaches.
         let stage = self.stages[..self.count]
             .iter()
-            .rev()
-            .find(|stage| stage.first <= ordinal)
-            .expect("the first stage starts at ordinal zero");
+            .rfind(|stage| stage.first <= ordinal)
+            .unwrap_or(&self.stages[0]);
         let steady = u128::from(stage.start)
             + u128::from(ordinal - stage.first) * self.batch as u128 * 1_000_000_000
                 / u128::from(stage.rate);

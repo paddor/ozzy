@@ -7,6 +7,10 @@ use serde_json::{Value, json};
 use std::time::Duration;
 
 pub(super) fn run(args: &Args) -> Result<Value> {
+    let timing = codec::Timing {
+        warmup: Duration::from_millis(args.warmup_ms),
+        duration: Duration::from_millis(args.duration_ms),
+    };
     let mut rows = vec![];
     for random in [false, true] {
         for &record_bytes in &args.record_bytes {
@@ -32,12 +36,7 @@ pub(super) fn run(args: &Args) -> Result<Value> {
                         order.reverse();
                     }
                     for index in order {
-                        let mut row = codec::measure(
-                            &bodies,
-                            &dicts[index],
-                            Duration::from_millis(args.warmup_ms),
-                            Duration::from_millis(args.duration_ms),
-                        )?;
+                        let mut row = codec::measure(&bodies, &dicts[index], timing)?;
                         row["case"] = json!({"pattern":if random {"random"} else {"events"},"record_bytes":record_bytes,
                             "body_target":target,"records_per_operation":records,"repetition":repetition});
                         rows.push(row);

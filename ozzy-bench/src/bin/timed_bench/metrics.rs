@@ -6,15 +6,22 @@ use serde_json::{Value, json};
 pub(super) struct Meter {
     started_ns: u64,
     cpu: Duration,
+    /// Holds the process-wide allocation bracket. Inproc roles share one
+    /// process, so only the coordinator's meter counts there.
+    #[cfg_attr(not(feature = "allocation-counting"), expect(dead_code))]
+    counted: bool,
 }
 
 impl Meter {
-    pub(super) fn start() -> Self {
+    pub(super) fn start(counted: bool) -> Self {
         #[cfg(feature = "allocation-counting")]
-        allocation::start();
+        if counted {
+            allocation::start();
+        }
         Self {
             started_ns: monotonic_ns(),
             cpu: cpu(),
+            counted,
         }
     }
 
@@ -26,11 +33,9 @@ impl Meter {
     /// writers defer that work until every process has stopped its meter.
     pub(super) fn stop(self) -> Measurement {
         #[cfg(feature = "allocation-counting")]
-        let allocations = allocation::snapshot();
-        let cpu_seconds = cpu()
-            .checked_sub(self.cpu)
-            .expect("process CPU clock regressed")
-            .as_secs_f64();
+        let allocations = self.counted.then(allocation::snapshot);
+        // Process CPU time never decreases.
+        let cpu_seconds = cpu().saturating_sub(self.cpu).as_secs_f64();
         Measurement {
             started_ns: self.started_ns,
             finished_ns: monotonic_ns(),
@@ -46,7 +51,7 @@ pub(super) struct Measurement {
     finished_ns: u64,
     cpu_seconds: f64,
     #[cfg(feature = "allocation-counting")]
-    allocations: allocation::Snapshot,
+    allocations: Option<allocation::Snapshot>,
 }
 
 impl Measurement {
@@ -54,10 +59,15 @@ impl Measurement {
         let elapsed = (self.finished_ns - self.started_ns) as f64 / 1e9;
         let cpu_seconds = self.cpu_seconds;
         #[cfg(feature = "allocation-counting")]
-        let allocations = self.allocations.report();
+        let allocations = self
+            .allocations
+            .map_or(Value::Null, allocation::Snapshot::report);
         #[cfg(not(feature = "allocation-counting"))]
         let allocations = Value::Null;
-        let row = json!({"elapsed_seconds": elapsed, "cpu_seconds": cpu_seconds,
+        let memory = memory_snapshot();
+        let row = json!({"rss_bytes": memory["rss_bytes"], "peak_rss_bytes": memory["peak_rss_bytes"],
+            "memory_scope":"current RSS at report generation; peak RSS over process lifetime, including setup; Linux procfs",
+            "elapsed_seconds": elapsed, "cpu_seconds": cpu_seconds,
             "started_monotonic_ns": self.started_ns, "finished_monotonic_ns": self.finished_ns,
             "average_cpu_cores": cpu_seconds / elapsed,
             "allocation_counted": cfg!(feature = "allocation-counting"),
@@ -67,26 +77,43 @@ impl Measurement {
     }
 }
 
+pub(super) fn memory_snapshot() -> Value {
+    let memory = std::fs::read_to_string("/proc/self/status").ok();
+    let bytes = |field: &str| {
+        memory.as_ref().and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(field))?
+                .split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()?
+                .checked_mul(1024)
+        })
+    };
+    json!({"rss_bytes": bytes("VmRSS:"), "peak_rss_bytes": bytes("VmHWM:")})
+}
+
 /// Shared only between local writer processes, never between broker hosts.
 pub(super) fn monotonic_ns() -> u64 {
+    // The monotonic clock never reads negative.
     let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
-    u64::try_from(now.tv_sec).expect("positive monotonic clock") * 1_000_000_000
-        + u64::try_from(now.tv_nsec).expect("positive nanoseconds")
+    now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64
 }
 
 impl Drop for Meter {
     fn drop(&mut self) {
         #[cfg(feature = "allocation-counting")]
-        allocation::disable();
+        if self.counted {
+            allocation::disable();
+        }
     }
 }
 
 fn cpu() -> Duration {
+    // Process CPU time never reads negative, and nanoseconds stay below 1e9.
     let value = rustix::time::clock_gettime(rustix::time::ClockId::ProcessCPUTime);
-    Duration::new(
-        value.tv_sec.try_into().unwrap(),
-        value.tv_nsec.try_into().unwrap(),
-    )
+    Duration::new(value.tv_sec as u64, value.tv_nsec as u32)
 }
 
 #[cfg(feature = "allocation-counting")]

@@ -5,41 +5,34 @@ use serde_json::{Value, json};
 /// Broker counters start before the shared start clock so scheduler skew cannot
 /// omit initial writes. Includes prestart idle, warmup, measurement, and drain;
 /// setup and teardown are excluded, and all process threads are counted.
+/// Inproc brokers count only threads sharing their CPU mask and finish
+/// before shutdown, while those threads still exist.
 #[derive(Default)]
 pub(super) struct BrokerMeter {
     meter: Option<metrics::Meter>,
+    threads: Option<std::collections::BTreeMap<u64, u64>>,
     network: std::collections::BTreeMap<String, (u64, u64)>,
     #[cfg(feature = "comparisons")]
-    reads: (u64, u64, u64),
-    #[cfg(feature = "comparisons")]
-    deliveries: (u64, u64),
-    #[cfg(feature = "comparisons")]
-    delivery_bytes: (u64, u64),
-    #[cfg(feature = "comparisons")]
-    encoded_bytes: u64,
+    counters: Option<ozzy_runtime::profiling::Totals>,
 }
 
 impl BrokerMeter {
-    pub(super) fn start(&mut self) -> Result<()> {
+    pub(super) fn start(&mut self, inproc: bool) -> Result<()> {
         if self.meter.is_some() {
             return Err(error("duplicate broker measurement start"));
         }
+        if inproc {
+            self.threads = Some(
+                thread_runtimes(&ozzy_bench::placement::mask_execution()?)?
+                    .into_iter()
+                    .collect(),
+            );
+        }
         self.network = network_bytes()?;
-        self.meter = Some(metrics::Meter::start());
+        self.meter = Some(metrics::Meter::start(!inproc));
         #[cfg(feature = "comparisons")]
         {
-            self.reads = (
-                ozzy_journal_segment::read_metrics::resident_selections(),
-                ozzy_journal_segment::read_metrics::persisted_loads(),
-                ozzy_runtime::storage_metrics::snapshot().background_resident_reads,
-            );
-            self.encoded_bytes = ozzy_journal_segment::write_metrics::encoded_group_bytes();
-            let reads = ozzy_runtime::storage_metrics::snapshot();
-            self.deliveries = (
-                reads.direct_resident_reads,
-                reads.historical_read_deliveries,
-            );
-            self.delivery_bytes = (reads.shared_reader_bytes, reads.copied_reader_bytes);
+            self.counters = Some(ozzy_runtime::profiling::totals());
         }
         super::launch::reply(&json!({"event":"started"}))
     }
@@ -50,36 +43,99 @@ impl BrokerMeter {
             .take()
             .ok_or_else(|| error("broker meter not started"))?
             .finish();
-        usage["execution"] = ozzy_bench::placement::execution()?;
+        if let Some(started) = &self.threads {
+            let execution = ozzy_bench::placement::mask_execution()?;
+            let cpu_ns: u64 = thread_runtimes(&execution)?
+                .into_iter()
+                .map(|(tid, runtime)| {
+                    runtime.saturating_sub(started.get(&tid).copied().unwrap_or(0))
+                })
+                .sum();
+            let elapsed = elapsed_seconds(&usage)?;
+            usage["cpu_seconds"] = json!(cpu_ns as f64 / 1e9);
+            usage["average_cpu_cores"] = json!(cpu_ns as f64 / 1e9 / elapsed);
+            usage["execution"] = execution;
+        } else {
+            usage["execution"] = ozzy_bench::placement::execution()?;
+        }
+        usage["host_network_scope"] = json!(
+            "host-wide interface counters including loopback, overlapping between brokers; do not sum broker snapshots"
+        );
         usage["host_network_bytes"] = json!(network_bytes()?.into_iter().filter_map(|(name, (rx, tx))| {
             let (old_rx, old_tx) = self.network.get(&name)?;
             Some(json!({"interface":name, "rx":rx.saturating_sub(*old_rx), "tx":tx.saturating_sub(*old_tx)}))
         }).collect::<Vec<_>>());
-        usage["cpu_scope"] = json!(
+        usage["cpu_scope"] = json!(if self.threads.is_some() {
+            "inproc broker: threads sharing this broker role's CPU mask, start command through drain request, including prestart idle, warmup, and measurement; excludes shared OMQ I/O threads and shutdown"
+        } else {
             "broker process: start command through final snapshot, including prestart idle, warmup, measurement, and drain; all threads"
-        );
+        });
         #[cfg(feature = "comparisons")]
-        {
-            let memory =
-                ozzy_runtime::storage_metrics::snapshot().background_resident_reads - self.reads.2;
-            let reads = ozzy_runtime::storage_metrics::snapshot();
-            usage["journal_reads"] = json!({
-                "resident_selections": ozzy_journal_segment::read_metrics::resident_selections() - self.reads.0 + memory,
-                "background_resident_selections": memory,
-                "direct_resident_deliveries": reads.direct_resident_reads - self.deliveries.0,
-                "historical_worker_deliveries": reads.historical_read_deliveries - self.deliveries.1,
-                "shared_payload_bytes": reads.shared_reader_bytes - self.delivery_bytes.0,
-                "copied_payload_bytes": reads.copied_reader_bytes - self.delivery_bytes.1,
-                "persisted_operation_loads": ozzy_journal_segment::read_metrics::persisted_loads() - self.reads.1,
-                "scope": "same broker interval; startup recovery excluded; all owner journals"
-            });
-            usage["journal_writes"] = json!({
-                "encoded_group_bytes": ozzy_journal_segment::write_metrics::encoded_group_bytes() - self.encoded_bytes,
-                "scope": "same broker interval; complete appended groups including seals and padding; excludes file headers, indexes, manifests, and unused capacity"
-            });
+        if let Some(start) = &self.counters.take() {
+            report_counters(&mut usage, start)?;
         }
         Ok(usage)
     }
+}
+
+/// Wall time a finished meter report covers.
+fn elapsed_seconds(usage: &Value) -> Result<f64> {
+    usage["elapsed_seconds"]
+        .as_f64()
+        .ok_or_else(|| error("meter report lacks elapsed time"))
+}
+
+/// Process-wide telemetry counted since the meter started.
+#[cfg(feature = "comparisons")]
+fn report_counters(usage: &mut Value, start: &ozzy_runtime::profiling::Totals) -> Result<()> {
+    use ozzy_runtime::profiling::Event;
+    let now = ozzy_runtime::profiling::totals();
+    let since = |event| now.get(event).wrapping_sub(start.get(event));
+    let elapsed = elapsed_seconds(usage)?;
+    let (updates, queries) = (
+        since(Event::ProgressUpdateRequest),
+        since(Event::ProgressQueryRequest),
+    );
+    usage["group_progress"] = json!({
+        "update_requests": updates,
+        "query_requests": queries,
+        "update_requests_per_second": updates as f64 / elapsed,
+        "query_requests_per_second": queries as f64 / elapsed,
+        "scope": "decoded native source requests, including retries and refusals; same broker interval, all owners"
+    });
+    let memory = since(Event::BackgroundResidentRead);
+    usage["journal_reads"] = json!({
+        "resident_selections": since(Event::ResidentSelection) + memory,
+        "background_resident_selections": memory,
+        "direct_resident_deliveries": since(Event::DirectResidentRead),
+        "historical_worker_deliveries": since(Event::HistoricalReadDelivery),
+        "shared_payload_bytes": since(Event::SharedReaderBytes),
+        "copied_payload_bytes": since(Event::CopiedReaderBytes),
+        "scope": "same broker interval; startup recovery excluded; all owner journals"
+    });
+    usage["journal_writes"] = json!({
+        "encoded_group_bytes": since(Event::EncodedGroupBytes),
+        "scope": "same broker interval; complete appended groups including seals and padding; excludes file headers, indexes, manifests, and unused capacity"
+    });
+    Ok(())
+}
+
+fn thread_runtimes(execution: &Value) -> Result<Vec<(u64, u64)>> {
+    execution["threads"]
+        .as_array()
+        .ok_or_else(|| error("missing thread observation"))?
+        .iter()
+        .map(|thread| {
+            Ok((
+                thread["tid"]
+                    .as_u64()
+                    .ok_or_else(|| error("missing thread ID"))?,
+                thread["runtime_ns"]
+                    .as_u64()
+                    .ok_or_else(|| error("missing thread runtime"))?,
+            ))
+        })
+        .collect()
 }
 
 // Host-wide counters, not per-process attribution. Captured outside timed work.
@@ -88,9 +144,6 @@ fn network_bytes() -> Result<std::collections::BTreeMap<String, (u64, u64)>> {
     for entry in std::fs::read_dir("/sys/class/net")? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name == "lo" {
-            continue;
-        }
         let stats = entry.path().join("statistics");
         let rx = std::fs::read_to_string(stats.join("rx_bytes"))?
             .trim()
@@ -112,11 +165,14 @@ pub(super) struct Window {
 
 impl Window {
     pub(super) fn new(start: u64, args: &Args) -> Result<Self> {
+        let duration = args
+            .duration
+            .ok_or_else(|| error("timed window needs a duration"))?;
         let measured = start
             .checked_add((args.warmup * 1e9) as u64)
             .ok_or_else(|| error("clock overflow"))?;
         let end = measured
-            .checked_add((args.duration.unwrap() * 1e9) as u64)
+            .checked_add((duration * 1e9) as u64)
             .ok_or_else(|| error("clock overflow"))?;
         Ok(Self {
             start,
@@ -176,13 +232,11 @@ impl Histogram {
             let target =
                 (u128::from(samples) * u128::from(numerator)).div_ceil(u128::from(denominator));
             let mut count = 0;
-            for (index, &n) in self.bins.iter().enumerate() {
+            let bucket = self.bins.iter().position(|&n| {
                 count += n;
-                if u128::from(count) >= target {
-                    return Some(Self::upper(index).min(self.max) as f64 / 1000.0);
-                }
-            }
-            unreachable!("histogram count")
+                u128::from(count) >= target
+            })?;
+            Some(Self::upper(bucket).min(self.max) as f64 / 1000.0)
         };
         json!({"samples":samples, "p50_us":quantile(50, 100), "p99_us":quantile(99, 100),
             "p999_us":quantile(999, 1000),
@@ -273,8 +327,11 @@ impl Counts {
                 .iter()
                 .take_while(|end| **end <= due)
                 .count();
-            let (latency, lag) =
-                &mut self.scheduled.as_mut().expect("scheduled counter enabled")[stage];
+            let scheduled = self
+                .scheduled
+                .as_mut()
+                .ok_or_else(|| error("scheduled latency counters not enabled"))?;
+            let (latency, lag) = &mut scheduled[stage];
             latency.record(finished - due);
             lag.record(start - due);
         }

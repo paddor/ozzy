@@ -36,7 +36,7 @@ const SERVERS: &[&str] = &["iggy-server", "redpanda", "java"];
 
 /// Read the allowed CPU IDs for a process, defaulting to the current process.
 pub fn cpus(pid: Option<u32>) -> Result<Vec<usize>> {
-    let mask = sched_getaffinity(pid.map(|id| Pid::from_raw(id.try_into().unwrap()).unwrap()))?;
+    let mask = sched_getaffinity(pid.map(process).transpose()?)?;
     Ok((0..CpuSet::MAX_CPU)
         .filter(|&cpu| mask.is_set(cpu))
         .collect())
@@ -51,34 +51,22 @@ pub fn pin(pid: Option<u32>, cpus: &[usize]) -> Result<()> {
     for &cpu in cpus {
         mask.set(cpu);
     }
-    sched_setaffinity(
-        pid.map(|id| Pid::from_raw(id.try_into().unwrap()).unwrap()),
-        &mask,
-    )?;
+    sched_setaffinity(pid.map(process).transpose()?, &mask)?;
     Ok(())
+}
+
+/// The kernel process ID for `id`; zero and IDs beyond `i32` name no process.
+fn process(id: u32) -> Result<Pid> {
+    Pid::from_raw(i32::try_from(id)?).ok_or_else(|| "process ID 0 names no process".into())
 }
 
 fn inspect(path: &Path) -> Result<Option<Value>> {
     let comm = fs::read_to_string(path.join("comm"))?;
     let comm = comm.trim();
-    if !comm.starts_with("ozzy_")
-        && !comm.starts_with("ozzy-")
-        && !comm.starts_with("omq_")
-        && !BENCHMARKS
-            .iter()
-            .chain(COMPETITORS)
-            .chain(SERVERS)
-            .chain(&["ld.so", "ld-linux-x86-64.so.2"])
-            .any(|name| comm == &name[..name.len().min(15)])
-    {
+    if !watched_comm(comm) {
         return Ok(None);
     }
     let exe = fs::read_link(path.join("exe"))?;
-    let name = exe
-        .file_name()
-        .ok_or("missing executable name")?
-        .to_string_lossy();
-    let name = name.strip_suffix(" (deleted)").unwrap_or(&name);
     let stat = fs::read_to_string(path.join("stat"))?;
     let fields = stat
         .rsplit_once(')')
@@ -91,6 +79,37 @@ fn inspect(path: &Path) -> Result<Option<Value>> {
         .filter(|s| !s.is_empty())
         .map(|s| String::from_utf8_lossy(s).into_owned())
         .collect::<Vec<_>>();
+    let name = executable_name(&exe, comm, &args)?;
+    if !watched_executable(&name) {
+        return Ok(None);
+    }
+    Ok(Some(
+        json!({"pid":path.file_name().ok_or("process path has no ID")?.to_string_lossy().parse::<u32>()?,"executable":name,"state":fields[0],"group":fields[2].parse::<u32>()?,"started":fields[19].parse::<u64>()?,"arguments":args}),
+    ))
+}
+
+/// Whether a kernel command name, truncated to 15 bytes, may belong to a
+/// watched process or to the loader that launches one.
+fn watched_comm(comm: &str) -> bool {
+    comm.starts_with("ozzy_")
+        || comm.starts_with("ozzy-")
+        || comm.starts_with("omq_")
+        || BENCHMARKS
+            .iter()
+            .chain(COMPETITORS)
+            .chain(SERVERS)
+            .chain(&["ld.so", "ld-linux-x86-64.so.2"])
+            .any(|name| comm == &name[..name.len().min(15)])
+}
+
+/// The executable a process runs, seen through loaders, deleted binaries,
+/// and launcher scripts.
+fn executable_name(exe: &Path, comm: &str, args: &[String]) -> Result<String> {
+    let name = exe
+        .file_name()
+        .ok_or("missing executable name")?
+        .to_string_lossy();
+    let name = name.strip_suffix(" (deleted)").unwrap_or(&name);
     // The official Redpanda distribution uses a private glibc loader. Keep
     // loader-launched brokers visible, including stopped or unowned processes.
     let name = if matches!(name, "ld.so" | "ld-linux-x86-64.so.2")
@@ -106,7 +125,7 @@ fn inspect(path: &Path) -> Result<Option<Value>> {
     };
     // Old cached workers still count as competitors. Named Cargo/rustc symlinks
     // resolve to their actual tool; named shell suite launchers retain `comm`.
-    let name = if name.starts_with("ozzy-") {
+    Ok(if name.starts_with("ozzy-") {
         name.replace('-', "_")
     } else if matches!(name, "bash" | "sh")
         && (comm.starts_with("ozzy_") || comm.starts_with("omq_"))
@@ -114,28 +133,27 @@ fn inspect(path: &Path) -> Result<Option<Value>> {
         comm.to_owned()
     } else {
         name.to_owned()
-    };
-    if !name.starts_with("ozzy_")
-        && !name.starts_with("omq_")
-        && !BENCHMARKS.contains(&name.as_str())
-        && !COMPETITORS.contains(&name.as_str())
-        && !SERVERS.contains(&name.as_str())
-    {
-        return Ok(None);
-    }
-    Ok(Some(
-        json!({"pid":path.file_name().unwrap().to_string_lossy().parse::<u32>()?,"executable":name,"state":fields[0],"group":fields[2].parse::<u32>()?,"started":fields[19].parse::<u64>()?,"arguments":args}),
-    ))
+    })
+}
+
+/// Whether an executable is a broker, benchmark, competitor, or server.
+fn watched_executable(name: &str) -> bool {
+    name.starts_with("ozzy_")
+        || name.starts_with("omq_")
+        || BENCHMARKS.contains(&name)
+        || COMPETITORS.contains(&name)
+        || SERVERS.contains(&name)
 }
 
 /// Enumerate relevant resident broker and benchmark processes.
 pub fn processes() -> Result<Vec<Value>> {
     let mut found = vec![];
     for entry in fs::read_dir("/proc")? {
-        let path = entry?.path();
-        let Ok(pid) = path.file_name().unwrap().to_string_lossy().parse::<u32>() else {
+        let entry = entry?;
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
             continue;
         };
+        let path = entry.path();
         if pid == std::process::id() {
             continue;
         }

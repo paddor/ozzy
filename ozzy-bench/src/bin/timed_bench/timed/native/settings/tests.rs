@@ -27,6 +27,7 @@ fn broker_specs(root: &std::path::Path, count: usize) -> Vec<Broker> {
                 data_peer: format!("tcp://127.0.0.1:{}", 30003 + index * 4),
                 reader_pub: format!("tcp://127.0.0.1:{}", 30001 + index * 4),
                 follower_pub: Some(format!("tcp://127.0.0.1:{}", 30002 + index * 4)),
+                admin: None,
             },
         })
         .collect()
@@ -34,7 +35,7 @@ fn broker_specs(root: &std::path::Path, count: usize) -> Vec<Broker> {
 
 #[test]
 fn small_segments_bound_broker_frames_and_sdk_payloads_for_large_records() {
-    for policy in ["single-durable", "disk-quorum", "replicated-persisting"] {
+    for policy in ["single-durable", "disk-quorum"] {
         for size in ["4096", "8192"] {
             let config = Config::production(args(&[
                 "--system",
@@ -69,7 +70,7 @@ fn small_segments_bound_broker_frames_and_sdk_payloads_for_large_records() {
 
 #[test]
 fn production_deployment_round_trips_independent_counts_and_shared_budgets() {
-    for policy in ["single-durable", "disk-quorum", "replicated-persisting"] {
+    for policy in ["single-durable", "disk-quorum"] {
         let config = Config::production(args(&[
             "--system",
             policy,
@@ -125,7 +126,10 @@ fn production_deployment_round_trips_independent_counts_and_shared_budgets() {
             .unwrap();
         let topic = &checked.deployment().topics["benchmark"];
         assert_eq!(topic.partitions, 5);
-        assert_eq!(topic.confirmation, settings.confirmation);
+        assert_eq!(
+            checked.deployment().cluster.mode.policy(),
+            config.args.system.policy()
+        );
         assert_eq!(topic.segment_bytes, 64 * 1024 * 1024);
         assert_eq!(
             topic.max_append_bytes,
@@ -240,9 +244,6 @@ fn retired_timed_switches_are_rejected_at_parse() {
         &["--storage-group-records", "1024"],
         &["--operation-target-kib", "1024"],
         &["--write-group-target-kib", "1024"],
-        &["--write-call-kib", "64"],
-        &["--persistence-backlog-mib", "64"],
-        &["--replication-cache-mib", "64"],
         &["--resident-read-mib", "64"],
         &["--packing-block-kib", "32"],
         &["--storage-group-kib", "128"],
@@ -251,6 +252,30 @@ fn retired_timed_switches_are_rejected_at_parse() {
         &["--mode", "latency"],
         &["--omq-profile", "latency"],
         &["--multipart"],
+    ] {
+        assert!(
+            Args::try_parse_from(["bench"].into_iter().chain(flags.iter().copied())).is_err(),
+            "accepted {flags:?}"
+        );
+    }
+}
+
+#[test]
+fn lz4_transport_needs_processes_and_excludes_inproc() {
+    assert_eq!(args(&[]).transport, ozzy_bench::native::Transport::Tcp);
+    assert_eq!(
+        args(&["--transport", "lz4"]).transport,
+        ozzy_bench::native::Transport::Lz4
+    );
+    for flags in [
+        &["--transport", "lz4"][..],
+        &[
+            "--processes",
+            "--memory-storage",
+            "--inproc",
+            "--transport",
+            "lz4",
+        ],
     ] {
         assert!(
             Args::try_parse_from(["bench"].into_iter().chain(flags.iter().copied())).is_err(),
@@ -278,8 +303,50 @@ fn native_document_refuses_invalid_fixed_endpoints_and_duplicate_brokers() {
             data_peer: "tcp://127.0.0.1:31002".into(),
             reader_pub: "tcp://127.0.0.1:31001".into(),
             follower_pub: None,
+            admin: None,
         },
     });
     assert!(settings.document(&brokers).is_err());
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn group_members_reserve_full_topic_subscriptions_and_dedup_uses_production_limits() {
+    let config = Config::production(args(&[
+        "--system",
+        "single-durable",
+        "--partitions",
+        "4",
+        "--groups",
+        "2",
+        "--group-members",
+        "3",
+        "--ack-window",
+        "1",
+        "--dedup-window-secs",
+        "30",
+        "--dedup-max-entries",
+        "10000",
+        "--dedup-max-bytes",
+        "16777216",
+    ]))
+    .unwrap();
+    assert_eq!(config.args.reader_workers(), 2);
+    assert_eq!(config.args.readers_per_partition, 2);
+    let settings = config.native.as_ref().unwrap();
+    for reader in &settings.clients.as_ref().unwrap().readers {
+        assert_eq!(reader["reader"]["subscriptions"], 12);
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let document = settings
+        .document(&broker_specs(directory.path(), 1))
+        .unwrap();
+    let parsed = ozzy_config::Deployment::parse(&document).unwrap();
+    let dedup = parsed.topics["benchmark"].deduplication.unwrap();
+    assert_eq!(dedup.window_millis, 30000);
+    assert_eq!(dedup.max_entries, 10000);
+    assert_eq!(dedup.max_bytes, 16_777_216);
+    let payload = config.writer_limits().envelope.max_payload_bytes;
+    assert!(settings.append_bytes as usize >= 113 + 69 * 2048 + payload);
+    assert!(Config::production(args(&["--groups", "1", "--reader-workers", "2"])).is_err());
 }

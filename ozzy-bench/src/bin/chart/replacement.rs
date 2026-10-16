@@ -10,10 +10,10 @@ fn executable(data: &Value) -> Result<&str> {
         .values()
         .map(|value| value.as_str().ok_or("missing measured executable hash"))
         .collect::<std::result::Result<_, _>>()?;
-    if hashes.len() != 1 {
+    let mut hashes = hashes.into_iter();
+    let (Some(hash), None) = (hashes.next(), hashes.next()) else {
         return Err("case replacement requires one measured worker binary".into());
-    }
-    let hash = *hashes.first().unwrap();
+    };
     if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("case replacement requires a SHA-256 executable hash".into());
     }
@@ -80,6 +80,9 @@ pub(crate) fn apply(data: &mut Value, replacement: &Value) -> Result<()> {
 }
 
 fn merge(data: &mut Value, replacement: &Value, keys: &BTreeSet<String>) -> Result<()> {
+    let replaced = replacement["summary"]
+        .as_array()
+        .ok_or("missing rerun summary")?;
     for field in ["sources", "executables"] {
         let extra = replacement[field]
             .as_object()
@@ -96,9 +99,11 @@ fn merge(data: &mut Value, replacement: &Value, keys: &BTreeSet<String>) -> Resu
         .as_array_mut()
         .ok_or("missing original run IDs")?
         .extend(ids.clone());
-    let rows = data["summary"].as_array_mut().unwrap();
+    let rows = data["summary"]
+        .as_array_mut()
+        .ok_or("missing chart summary")?;
     rows.retain(|row| !keys.contains(&key(row)));
-    rows.extend(replacement["summary"].as_array().unwrap().clone());
+    rows.extend(replaced.iter().cloned());
     if data["case_replacements"].is_null() {
         data["case_replacements"] = json!([]);
     }
@@ -106,8 +111,7 @@ fn merge(data: &mut Value, replacement: &Value, keys: &BTreeSet<String>) -> Resu
         .as_array_mut()
         .ok_or("invalid case replacement provenance")?
         .push(
-            json!({"run_ids":ids,"cases":replacement["summary"].as_array().unwrap()
-            .iter().map(|row| &row["case"]).collect::<Vec<_>>()}),
+            json!({"run_ids":ids,"cases":replaced.iter().map(|row| &row["case"]).collect::<Vec<_>>()}),
         );
     Ok(())
 }

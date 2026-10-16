@@ -8,7 +8,7 @@ use std::{path::Path, process::Child, time::Duration};
 async fn production_process_control_initializes_serves_and_drains_each_policy() {
     tokio::time::timeout(Duration::from_secs(60), async {
         control::run(&control::Args::default(), 1, async {
-            for policy in ["local-durable", "disk-quorum", "replicated-persisting"] {
+            for policy in ["local-durable", "disk-quorum"] {
                 for io_threads in [1, 2] {
                     lifecycle(policy, io_threads).await.map_err(|cause| {
                         std::io::Error::other(format!("{policy}, OMQ I/O={io_threads}: {cause}"))
@@ -81,9 +81,9 @@ async fn lifecycle(policy: &str, io_threads: usize) -> BenchResult<()> {
         assert!(
             !threads.iter().any(|thread| {
                 thread["name"].as_str().is_some_and(|name| {
-                    name.starts_with("ozzy_app-")
-                        || name == "ozzy_dispatch"
-                        || name.starts_with("ozzy_io-")
+                    name.starts_with("ozzy/shard/")
+                        || name == "ozzy/dispatch"
+                        || name.starts_with("ozzy/disk/")
                 })
             }),
             "production workers survived physical drain: {threads:?}"

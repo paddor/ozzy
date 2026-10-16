@@ -41,7 +41,6 @@ enum PayloadCompression {
 enum System {
     SingleDurable,
     DiskQuorum,
-    ReplicatedPersisting,
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -51,7 +50,7 @@ enum System {
 )]
 #[command(about = "Production Ozzy and external timed writer/reader workloads")]
 struct Args {
-    #[arg(long, value_enum, default_value = "replicated-persisting")]
+    #[arg(long, value_enum, default_value = "disk-quorum")]
     system: System,
     /// Opt-in external single-broker comparison. Server lifecycle stays external.
     #[cfg(feature = "comparisons")]
@@ -112,15 +111,6 @@ struct Args {
     /// Local physical write-group payload target, independent of operation size.
     #[arg(skip = 4096usize)]
     write_group_target_kib: usize,
-    /// Replicated background bytes per write syscall; omitted drains all ready bytes.
-    #[arg(skip)]
-    write_call_kib: Option<usize>,
-    /// Canonical bytes awaiting background writes per broker, independent of repair cache.
-    #[arg(skip)]
-    persistence_backlog_mib: Option<usize>,
-    /// Recent replication bytes retained for RAM gap repair per broker.
-    #[arg(skip)]
-    replication_cache_mib: Option<usize>,
     /// Recently written disk-group operations kept in RAM for readers, per
     /// broker. Older reads load the segment file. Default 512 MiB.
     #[arg(skip)]
@@ -140,7 +130,7 @@ struct Args {
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=32))]
     broker_io_threads: Option<u64>,
     /// Independent local partition owners, each on its own current-thread runtime.
-    /// Replicated modes currently have one ordered group and require one owner.
+    /// Disk quorum currently has one ordered group and requires one owner.
     #[arg(long, default_value_t = 1)]
     app_threads: usize,
     /// Choose partition IDs whose hashes distribute lanes evenly across local shards.
@@ -158,6 +148,29 @@ struct Args {
     /// Run three independent voter processes, locally or at explicit placements.
     #[arg(long)]
     processes: bool,
+    /// Brokers keep journals in bounded memory images; no disk I/O. Storage
+    /// jobs still pass through the production file-job contract.
+    #[arg(long, requires = "processes")]
+    memory_storage: bool,
+    /// Memory image bound per broker in MiB, counting dirty and durable
+    /// copies of every file. Exceeding it fails the run.
+    #[arg(long, requires = "memory_storage", default_value_t = 2048,
+        value_parser = clap::value_parser!(u64).range(256..=65536))]
+    memory_mib: u64,
+    /// Run the same broker, producer, and reader roles as threads of this
+    /// process over OMQ inproc instead of TCP and IPC between processes.
+    #[arg(long, requires = "memory_storage")]
+    inproc: bool,
+    /// Broker endpoint transport between processes; `lz4` and `zstd` bind
+    /// compressed TCP.
+    #[arg(
+        long,
+        value_enum,
+        default_value = "tcp",
+        requires = "processes",
+        conflicts_with = "inproc"
+    )]
+    transport: ozzy_bench::native::Transport,
     /// Native TCP appends; one partition per writer, with optional streaming.
     #[arg(long, requires = "processes")]
     network_ingress: bool,
@@ -241,7 +254,7 @@ struct Args {
     #[arg(long, default_value_t = 131072)]
     history_operations: usize,
     /// Final confirmation and verified-delivery drain deadline, in seconds.
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = ozzy_bench::budget::DEFAULT_DRAIN_SECS)]
     drain_timeout_secs: u64,
     /// Native writers, one partition each. Default: 4.
     #[arg(long)]
@@ -255,6 +268,15 @@ impl Args {
     /// Offered arrivals follow a schedule instead of completions.
     fn scheduled(&self) -> bool {
         self.records_per_second.is_some() || self.ramp.is_some()
+    }
+
+    /// Time limits of this run. A run without a duration has no measured phases.
+    fn budget(&self) -> ozzy_bench::budget::RunBudget {
+        ozzy_bench::budget::RunBudget::new(
+            self.warmup,
+            self.duration.unwrap_or_default(),
+            self.drain_timeout_secs,
+        )
     }
 
     fn reader_workers(&self) -> usize {
@@ -271,6 +293,21 @@ pub(crate) async fn run() -> Result<()> {
         Box::pin(run_args(args.clone())),
     )
     .await
+}
+
+/// Inproc worker roles parse the same arguments as a worker process and
+/// share the coordinator's OMQ context.
+fn run_inproc_worker(arguments: Vec<String>, context: omq_tokio::Context) -> Result<()> {
+    let args =
+        Args::try_parse_from(std::iter::once("ozzy_timed_bench".to_owned()).chain(arguments))?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(ozzy_bench::control::run_in(
+            context,
+            &args.control,
+            Box::pin(run_args(args.clone())),
+        ))
 }
 
 async fn run_args(mut args: Args) -> Result<()> {

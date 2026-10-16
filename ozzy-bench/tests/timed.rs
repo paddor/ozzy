@@ -1,4 +1,13 @@
 //! Functional timed-window and verification gates, not performance assertions.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
 
 mod support;
 
@@ -7,17 +16,13 @@ use std::process::Command;
 #[test]
 fn disk_and_sdk_packing_preserve_native_confirmation_and_reader_verification() {
     let storage = support::storage("native-codecs-");
-    // Live readers stay in memory inside the unpersisted backlog and the newest
-    // two segments. A replicated-persisting broker may write its whole 64 MiB
-    // backlog while its application thread waits for a CPU, so those segments
-    // must cover the backlog. The other modes keep small segments and roll often.
+    // Live readers stay in memory inside the newest two segments. Small
+    // segments roll often.
     for (system, codec, size, segment_mib) in [
         ("single-durable", "raw", "4096", "4"),
         ("single-durable", "lz4", "4096", "4"),
         ("disk-quorum", "lz4", "1024", "4"),
         ("disk-quorum", "raw", "1024", "4"),
-        ("replicated-persisting", "lz4", "1024", "128"),
-        ("replicated-persisting", "raw", "1024", "128"),
     ] {
         let mut command = Command::new(env!("CARGO_BIN_EXE_ozzy_timed_bench"));
         command
@@ -202,7 +207,6 @@ fn native_modes_have_live_verified_readers_and_exact_confirmation_boundaries() {
     for (system, copies, policy) in [
         ("single-durable", 1, "local_durable"),
         ("disk-quorum", 2, "quorum_durable"),
-        ("replicated-persisting", 2, "quorum_replicated_persisting"),
     ] {
         for size in ["128", "1024"] {
             let mut command = Command::new(env!("CARGO_BIN_EXE_ozzy_timed_bench"));
@@ -514,8 +518,6 @@ fn payload_compression_is_decoded_and_verified_by_native_readers() {
         ("single-durable", "8192", "--json-payload"),
         ("disk-quorum", "4096", "--random-payload"),
         ("disk-quorum", "8192", "--json-payload"),
-        ("replicated-persisting", "4096", "--random-payload"),
-        ("replicated-persisting", "8192", "--json-payload"),
     ] {
         let mut command = Command::new(env!("CARGO_BIN_EXE_ozzy_timed_bench"));
         command
@@ -600,9 +602,7 @@ fn check_payload_compression(row: &serde_json::Value, system: &str, size: &str, 
 
 #[test]
 fn native_remote_placement_checks_storage_cpu_masks_and_cleanup() {
-    for policy in ["disk-quorum", "replicated-persisting"] {
-        remote_placement(policy, "normal");
-    }
+    remote_placement("disk-quorum", "normal");
 }
 
 #[test]

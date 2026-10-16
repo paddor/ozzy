@@ -23,6 +23,10 @@ use serde_json::Value;
 use std::time::Duration;
 
 const DIRECTORY_METADATA_BYTES: usize = 64 * 1024;
+/// One SDK request outlasts any broker pause a valid run can contain.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Pause before an SDK retries a refused request.
+const RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 pub(super) fn writer_settings(config: &Config) -> SharedTopicWriterConfig {
     SharedTopicWriterConfig {
@@ -34,6 +38,16 @@ pub(super) fn writer_settings(config: &Config) -> SharedTopicWriterConfig {
         max_producers: 1,
         inflight_appends: config.args.writer_inflight_appends,
     }
+}
+
+/// Inproc roles must reach brokers through the shared OMQ context; worker
+/// processes keep a separate SDK context beside benchmark control.
+pub(super) fn sdk_runtime(config: &Config) -> Result<WriterRuntime> {
+    Ok(if config.args.inproc {
+        WriterRuntime::with_context(ozzy_bench::control::context())?
+    } else {
+        WriterRuntime::new()?
+    })
 }
 
 pub(super) struct Setup {
@@ -128,6 +142,10 @@ impl Setup {
         let limits = Self::reader_limits(config);
         let mut parameters = handshake::Parameters::reader(limits, handshake::CONSUMER)?;
         parameters.capabilities |= handshake::OWNER_ROUTING;
+        if config.args.native.groups != 0 {
+            parameters.capabilities |= handshake::OWNER_GROUPS | handshake::OWNER_PROGRESS;
+            parameters.required_capabilities |= handshake::OWNER_GROUPS | handshake::OWNER_PROGRESS;
+        }
         let mut links = self.links_config(parameters)?;
         links.reader = Some(reader);
         links.validate()?;
@@ -156,8 +174,8 @@ impl Setup {
             append: None,
             reader: None,
             maximum_partitions: self.partitions,
-            request_timeout: Duration::from_secs(30),
-            retry_interval: Duration::from_millis(10),
+            request_timeout: REQUEST_TIMEOUT,
+            retry_interval: RETRY_INTERVAL,
             clock: SdkClock::default(),
         };
         config.control_bytes = config

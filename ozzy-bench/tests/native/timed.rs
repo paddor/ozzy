@@ -140,7 +140,7 @@ fn check_comparison(row: &Value, implementation: &str, partitions: u64, writers:
 #[test]
 fn production_runner_verifies_shared_writer_reader_cohorts_and_drains_each_policy() {
     let storage = super::support::storage("native-timed-production-");
-    for system in ["single-durable", "disk-quorum", "replicated-persisting"] {
+    for system in ["single-durable", "disk-quorum"] {
         let output = Command::new(env!("CARGO_BIN_EXE_ozzy_timed_bench"))
             .args([
                 "--processes",
@@ -272,7 +272,6 @@ fn check_group(row: &Value, system: &str) {
     let (policy, brokers, copies) = match system {
         "single-durable" => ("local_durable", 1, 1),
         "disk-quorum" => ("quorum_durable", 3, 2),
-        "replicated-persisting" => ("quorum_replicated_persisting", 3, 2),
         _ => unreachable!(),
     };
     assert_eq!(row["commit_policy"], policy);

@@ -1,5 +1,17 @@
 //! Untimed host inspection and bounded isolation monitoring for remote fixtures.
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::too_many_lines,
+        clippy::too_many_arguments,
+        reason = "product code is linted without cfg(test)"
+    )
+)]
 use clap::{Parser, Subcommand};
 use ozzy_bench::automation::{Result, isolation};
 use serde_json::{Value, json};
@@ -8,6 +20,9 @@ use std::{
     path::PathBuf,
     time::{Duration, Instant},
 };
+
+/// How often the watcher samples remote processes.
+const POLL: Duration = Duration::from_millis(100);
 
 #[derive(Parser)]
 struct Args {
@@ -27,6 +42,9 @@ enum Action {
         implementation: String,
         #[arg(long)]
         directory: PathBuf,
+        /// Fail once the watched run outlives this many seconds.
+        #[arg(long)]
+        deadline_secs: u64,
     },
 }
 fn main() -> Result<()> {
@@ -35,7 +53,12 @@ fn main() -> Result<()> {
         Action::Watch {
             implementation,
             directory,
-        } => watch(&implementation, &directory)?,
+            deadline_secs,
+        } => watch(
+            &implementation,
+            &directory,
+            Duration::from_secs(deadline_secs),
+        )?,
     }
     Ok(())
 }
@@ -72,7 +95,7 @@ fn inspect(pid: Option<u32>, storage: Option<PathBuf>) -> Result<Value> {
     }
     Ok(row)
 }
-fn watch(implementation: &str, directory: &std::path::Path) -> Result<()> {
+fn watch(implementation: &str, directory: &std::path::Path, deadline: Duration) -> Result<()> {
     if !matches!(implementation, "ozzy" | "iggy") {
         return Err("invalid remote implementation".into());
     }
@@ -99,13 +122,9 @@ fn watch(implementation: &str, directory: &std::path::Path) -> Result<()> {
             if !valid {
                 return Err(format!("remote isolation violated: {row}").into());
             }
-            seen.insert(
-                (
-                    row["pid"].as_u64().unwrap(),
-                    row["started"].as_u64().unwrap(),
-                ),
-                row,
-            );
+            let pid = row["pid"].as_u64().ok_or("missing process id")?;
+            let started = row["started"].as_u64().ok_or("missing process start")?;
+            seen.insert((pid, started), row);
         }
         if seen.len() > 1 {
             return Err("remote host ran more than its one assigned broker".into());
@@ -117,13 +136,13 @@ fn watch(implementation: &str, directory: &std::path::Path) -> Result<()> {
         if directory.join("stop").exists() {
             println!(
                 "{}",
-                json!({"samples":samples,"processes":seen.values().collect::<Vec<_>>(),"elapsed_seconds":started.elapsed().as_secs_f64(),"poll_seconds":0.1})
+                json!({"samples":samples,"processes":seen.values().collect::<Vec<_>>(),"elapsed_seconds":started.elapsed().as_secs_f64(),"poll_seconds":POLL.as_secs_f64()})
             );
             return Ok(());
         }
-        if started.elapsed() > Duration::from_secs(180) {
+        if started.elapsed() > deadline {
             return Err("remote audit deadline expired".into());
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(POLL);
     }
 }

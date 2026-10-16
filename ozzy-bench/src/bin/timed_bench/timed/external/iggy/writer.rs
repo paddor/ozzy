@@ -1,8 +1,9 @@
 //! One Iggy request at a time. Scheduled arrivals keep their clock while an
 //! earlier request waits; batches drain due records without intentional linger.
-use super::super::super::pacing::{Plan, Timer};
-use super::super::{Config, Counts, Result, Value, Window, config, metrics, producer};
+use super::super::super::pacing::{Arrivals, Plan, Timer};
+use super::super::{Config, Counts, Result, Value, Window, config, error, metrics, producer};
 use iggy::prelude::{IggyMessage, SendMessagesResponse};
+use ozzy_proto::GroupId;
 
 pub(super) async fn produce(
     config: &Config,
@@ -11,117 +12,176 @@ pub(super) async fn produce(
     send: impl AsyncFnMut(&mut [IggyMessage]) -> Result<SendMessagesResponse>,
 ) -> Result<Value> {
     let mut timer = config.args.scheduled().then(Timer::new).transpose()?;
-    produce_with_clock(
-        config,
-        lane,
-        window,
-        send,
-        metrics::monotonic_ns,
-        async |due| timer.as_mut().unwrap().wait_until(due).await,
-    )
-    .await
+    let clock = Clock {
+        now: metrics::monotonic_ns,
+        wait_until: async |due| match timer.as_mut() {
+            Some(timer) => timer.wait_until(due).await,
+            None => Err(error("an unpaced Iggy lane has no arrival timer")),
+        },
+    };
+    produce_with_clock(config, lane, window, send, clock).await
 }
 
-async fn produce_with_clock(
+/// Where a lane reads the time and waits for an arrival.
+struct Clock<N, W> {
+    now: N,
+    wait_until: W,
+}
+
+async fn produce_with_clock<N: Fn() -> u64, W: AsyncFnMut(u64) -> Result<()>>(
     config: &Config,
     lane: usize,
     window: Window,
     mut send: impl AsyncFnMut(&mut [IggyMessage]) -> Result<SendMessagesResponse>,
-    now: impl Fn() -> u64,
-    mut wait_until: impl AsyncFnMut(u64) -> Result<()>,
+    mut clock: Clock<N, W>,
 ) -> Result<Value> {
-    let group = config::group(&config.args)?;
-    let mut counts = Counts::new(window);
-    let plan = Plan::new(config, window, lane)?;
-    if let Some(plan) = &plan {
-        counts.enable_schedule(plan.bounds());
-    }
-    let mut sequence = 0;
-    let mut confirmations = Confirmations::new(config, lane);
-    let mut messages = Vec::with_capacity(config.args.request_records);
-    let mut starts = Vec::with_capacity(config.args.request_records);
-    // Unpaced lanes read the clock once per quantum, as the native writer lane
-    // does; paced lanes need every record's own clock. Every record gets its
-    // own body.
-    let mut start = 0;
-    // An overloaded ramp lowers the limit to the arrivals of earlier stages.
-    let mut limit = plan.map(Plan::total);
+    let mut run = LaneRun::new(config, lane, window)?;
     loop {
-        messages.clear();
-        starts.clear();
-        if let Some(plan) = plan {
-            if Some(sequence) >= limit {
+        run.messages.clear();
+        run.starts.clear();
+        if let Some(arrivals) = &mut run.arrivals {
+            if arrivals.exhausted(run.sequence) {
                 break;
             }
-            if limit == Some(plan.total())
-                && let Some(stage) = plan.check_backlog(sequence, now())?
-            {
-                counts.overload(stage);
-                limit = Some(plan.total_before(stage)?);
+            if arrivals.lower_on_backlog(&mut run.counts, run.sequence, &clock.now)? {
                 continue;
             }
-            wait_until(plan.due(sequence)?).await?;
+            (clock.wait_until)(arrivals.plan().due(run.sequence)?).await?;
         }
-        let first = sequence;
-        while messages.len() < config.args.request_records {
-            let fresh = plan.is_some() || sequence.is_multiple_of(producer::CLOCK_QUANTUM);
-            if fresh {
-                start = now();
-            }
-            if let Some(plan) = plan {
-                if Some(sequence) >= limit {
-                    break;
-                }
-                if limit == Some(plan.total())
-                    && let Some(stage) = plan.check_backlog(sequence, start)?
-                {
-                    counts.overload(stage);
-                    limit = Some(plan.total_before(stage)?);
-                    continue;
-                }
-                if start < plan.due(sequence)? {
-                    break;
-                }
-            } else if fresh && start >= window.end {
-                break;
-            }
-            let payload = producer::payload(config, lane, sequence, start)?;
-            let id = config::message_id(group, lane, sequence);
-            counts.record_bytes(id, &payload);
-            messages.push(
-                IggyMessage::builder()
-                    .id(u128::from_be_bytes(*id.as_bytes()))
-                    .payload(payload)
-                    .build()?,
-            );
-            starts.push(start);
-            counts.submission(start, 1);
-            sequence += 1;
-        }
-        if messages.is_empty() {
+        let first = run.sequence;
+        run.fill(&clock.now)?;
+        if run.messages.is_empty() {
             break;
         }
         // Do not cancel/recreate a send when another scheduled arrival becomes
         // due. Iggy's SDK serializes sends on the connection until its reply.
-        let reply = send(&mut messages).await?;
-        confirmations.accept(&reply, first, messages.len())?;
+        let reply = send(&mut run.messages).await?;
+        run.confirm(&reply, first, &clock.now)?;
+    }
+    Ok(run.report())
+}
+
+/// One writer lane: its pacing, counters, confirmations, and the request
+/// being built.
+struct LaneRun<'a> {
+    config: &'a Config,
+    lane: usize,
+    window: Window,
+    group: GroupId,
+    arrivals: Option<Arrivals>,
+    counts: Counts,
+    confirmations: Confirmations,
+    messages: Vec<IggyMessage>,
+    starts: Vec<u64>,
+    /// The next record to add.
+    sequence: u64,
+    /// Unpaced lanes read the clock once per quantum, as the native writer
+    /// lane does; paced lanes need every record's own clock. Every record
+    /// gets its own body.
+    start: u64,
+}
+
+impl<'a> LaneRun<'a> {
+    fn new(config: &'a Config, lane: usize, window: Window) -> Result<Self> {
+        let group = config::group(&config.args)?;
+        let mut counts = Counts::new(window);
+        let plan = Plan::new(config, window, lane)?;
+        if let Some(plan) = &plan {
+            counts.enable_schedule(plan.bounds());
+        }
+        Ok(Self {
+            config,
+            lane,
+            window,
+            group,
+            arrivals: plan.as_ref().map(Arrivals::new),
+            counts,
+            confirmations: Confirmations::new(config, lane),
+            messages: Vec::with_capacity(config.args.request_records),
+            starts: Vec::with_capacity(config.args.request_records),
+            sequence: 0,
+            start: 0,
+        })
+    }
+
+    /// Add due records up to the request size. Stops at the arrival limit,
+    /// at a record not due yet, or, unpaced, at the window end.
+    fn fill(&mut self, now: &impl Fn() -> u64) -> Result<()> {
+        while self.messages.len() < self.config.args.request_records {
+            let fresh =
+                self.arrivals.is_some() || self.sequence.is_multiple_of(producer::CLOCK_QUANTUM);
+            if fresh {
+                self.start = now();
+            }
+            if let Some(arrivals) = &mut self.arrivals {
+                if arrivals.exhausted(self.sequence) {
+                    break;
+                }
+                let start = self.start;
+                if arrivals.lower_on_backlog(&mut self.counts, self.sequence, || start)? {
+                    continue;
+                }
+                if self.start < arrivals.plan().due(self.sequence)? {
+                    break;
+                }
+            } else if fresh && self.start >= self.window.end {
+                break;
+            }
+            self.push()?;
+        }
+        Ok(())
+    }
+
+    /// Generate the next record into the request.
+    fn push(&mut self) -> Result<()> {
+        let payload = producer::payload(self.config, self.lane, self.sequence, self.start)?;
+        let id = config::message_id(self.group, self.lane, self.sequence);
+        self.counts.record_bytes(id, &payload);
+        self.messages.push(
+            IggyMessage::builder()
+                .id(u128::from_be_bytes(*id.as_bytes()))
+                .payload(payload)
+                .build()?,
+        );
+        self.starts.push(self.start);
+        self.counts.submission(self.start, 1);
+        self.sequence += 1;
+        Ok(())
+    }
+
+    /// Accept the reply to the request that began at record `first`, then
+    /// complete each record at the current time.
+    fn confirm(
+        &mut self,
+        reply: &SendMessagesResponse,
+        first: u64,
+        now: &impl Fn() -> u64,
+    ) -> Result<()> {
+        self.confirmations
+            .accept(reply, first, self.messages.len())?;
         let complete = now();
-        for (i, &start) in starts.iter().enumerate() {
+        let plan = self.arrivals.as_ref().map(Arrivals::plan);
+        for (i, &start) in self.starts.iter().enumerate() {
             if let Some(plan) = plan {
-                counts.scheduled_complete(plan.due(first + i as u64)?, start, complete)?;
+                self.counts
+                    .scheduled_complete(plan.due(first + i as u64)?, start, complete)?;
             } else {
-                counts.complete(start, complete, 1)?;
+                self.counts.complete(start, complete, 1)?;
             }
         }
+        Ok(())
     }
-    let mut row = counts.report(lane);
-    row["partition"] = serde_json::json!(confirmations.partition);
-    row["confirmed_partition_offset_range"] = serde_json::json!(
-        confirmations
-            .first
-            .map(|first| [first, confirmations.end - 1])
-    );
-    Ok(row)
+
+    fn report(&self) -> Value {
+        let mut row = self.counts.report(self.lane);
+        row["partition"] = serde_json::json!(self.confirmations.partition);
+        row["confirmed_partition_offset_range"] = serde_json::json!(
+            self.confirmations
+                .first
+                .map(|first| [first, self.confirmations.end - 1])
+        );
+        row
+    }
 }
 
 struct Confirmations {
@@ -263,10 +323,12 @@ mod tests {
                 }
                 Ok(reply(lane, first))
             },
-            || clock.get(),
-            async |due| {
-                clock.set(clock.get().max(due));
-                Ok(())
+            Clock {
+                now: || clock.get(),
+                wait_until: async |due| {
+                    clock.set(clock.get().max(due));
+                    Ok(())
+                },
             },
         )
         .await
@@ -312,10 +374,12 @@ mod tests {
                     clock.set(window.end + 10_000_000);
                     Ok(confirmation)
                 },
-                || clock.get(),
-                async |due| {
-                    clock.set(clock.get().max(due));
-                    Ok(())
+                Clock {
+                    now: || clock.get(),
+                    wait_until: async |due| {
+                        clock.set(clock.get().max(due));
+                        Ok(())
+                    },
                 },
             )
             .await;

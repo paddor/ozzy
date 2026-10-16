@@ -36,7 +36,7 @@ fn storage() -> tempfile::TempDir {
 
 #[test]
 fn prepared_deployment_binds_persisted_identities_and_actual_sdk_windows() {
-    for system in ["single-durable", "disk-quorum", "replicated-persisting"] {
+    for system in ["single-durable", "disk-quorum"] {
         let parent = storage();
         let config = configuration(system, parent.path());
         let mut resources = (0..config.args.system.brokers())

@@ -1,9 +1,23 @@
 #![warn(missing_docs)]
 //! Shared workloads, run identity, serial orchestration, and validated charts.
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::too_many_lines,
+        clippy::too_many_arguments,
+        reason = "product code is linted without cfg(test)"
+    )
+)]
 
 pub mod automation;
+pub mod budget;
 pub mod control;
+pub mod dedup;
 pub mod native;
 pub mod placement;
 pub mod provenance;

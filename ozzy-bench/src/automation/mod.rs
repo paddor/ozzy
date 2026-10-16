@@ -49,9 +49,9 @@ pub fn require_artifact_disk() -> Result<()> {
         })
 }
 
-/// Exactly three brokers, regardless of confirmation or persistence policy.
+/// The three-broker mode.
 pub fn cluster_mode(mode: &str) -> bool {
-    matches!(mode, "disk-quorum" | "replicated-persisting")
+    mode == "disk-quorum"
 }
 
 static CANCELED: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
@@ -80,10 +80,9 @@ pub fn check_canceled() -> Result<()> {
 
 /// Source checkout containing this benchmark automation crate.
 pub fn root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .to_path_buf()
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    // The bench crate is a workspace member, so its directory has a parent.
+    manifest.parent().unwrap_or(manifest).to_path_buf()
 }
 
 /// Benchmark workers must never reuse another checkout's Cargo artifacts.
@@ -101,13 +100,26 @@ pub fn worker_binary() -> PathBuf {
 }
 
 /// Append-only benchmark result ledger directory under the user cache.
-pub fn cache() -> PathBuf {
-    PathBuf::from(std::env::var_os("HOME").expect("HOME is required")).join(".cache/ozzy")
+pub fn cache() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").ok_or("HOME is required for the result ledger")?;
+    Ok(PathBuf::from(home).join(".cache/ozzy"))
 }
 
 /// Disposable run artifacts; the home cache holds append-only result ledgers.
 pub fn artifacts() -> PathBuf {
     artifact_root().join("ozzy-artifacts")
+}
+
+/// Hold `directory/runner.lock` so no other run using that directory starts
+/// meanwhile; the lock is released when the returned file drops.
+pub fn lock_runner(directory: &Path) -> Result<fs::File> {
+    fs::create_dir_all(directory)?;
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(directory.join("runner.lock"))?;
+    lock.try_lock()?;
+    Ok(lock)
 }
 
 /// Run a command to completion; return UTF-8 stdout or its failed status and diagnostics.
@@ -144,6 +156,28 @@ pub fn run_id() -> Result<String> {
         capture(Command::new("date").args(["-u", "+%Y%m%dT%H%M%SZ"]))?,
         &uuid::Uuid::now_v7().simple().to_string()[24..]
     ))
+}
+
+/// The `field` of a JSON object read through `get`, such as `Value::as_str`,
+/// or an error naming the missing or mistyped field.
+pub fn json_field<'a, T>(
+    value: &'a Value,
+    field: &str,
+    get: impl FnOnce(&'a Value) -> Option<T>,
+) -> Result<T> {
+    get(&value[field]).ok_or_else(|| format!("missing or mistyped JSON field `{field}`").into())
+}
+
+/// As [`json_field`], for mutable access such as `Value::as_object_mut`.
+pub fn json_field_mut<'a, T>(
+    value: &'a mut Value,
+    field: &str,
+    get: impl FnOnce(&'a mut Value) -> Option<T>,
+) -> Result<T> {
+    value
+        .get_mut(field)
+        .and_then(get)
+        .ok_or_else(|| format!("missing or mistyped JSON field `{field}`").into())
 }
 
 /// Decode a finite JSON number, rejecting missing or non-finite measurements.

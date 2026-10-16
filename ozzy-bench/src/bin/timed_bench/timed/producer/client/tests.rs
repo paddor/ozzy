@@ -45,6 +45,62 @@ async fn production_shared_writers_use_pacing_with_interleaved_offsets_and_idle_
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn redundant_timed_feeds_confirm_matching_offsets_and_verify_only_unique_records() {
+    use super::super::super::{reader::native, results};
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (_directory, broker, setup) = start_broker(1, true).await;
+        let mut config = config(200);
+        config.args.native.feeds.redundant_producers = 2;
+        config.args.records_per_second = Some(80);
+        config.args.duration = Some(0.25);
+        let runtime = WriterRuntime::new().unwrap();
+        let (writers, writing) = connect_shared(&runtime, &config, &setup, 0..4)
+            .await
+            .unwrap();
+        let (tasks, reading) = native::connect(&runtime, &config, &setup, 0).await.unwrap();
+        let group = super::super::config::group(&config.args).unwrap();
+        let window = super::super::Window::new(
+            super::super::metrics::monotonic_ns() + 20_000_000,
+            &config.args,
+        )
+        .unwrap();
+        window.wait().await;
+        let rows =
+            try_join_all(writers.into_iter().enumerate().map(|(lane, writer)| {
+                super::super::run_lane(writer, &config, group, lane, window)
+            }))
+            .await
+            .unwrap();
+        let rows = vec![json!({"lanes":rows})];
+        let expected = config
+            .args
+            .native
+            .feeds
+            .logical_rows(config.writers, &rows)
+            .unwrap();
+        assert_eq!(results::totals(&rows, 4).unwrap(), [5; 4]);
+        assert_eq!(results::totals(&expected, 2).unwrap(), [5; 2]);
+        let (_finish, finished) = tokio::sync::watch::channel(Some(vec![5; 2]));
+        let reports = try_join_all(
+            tasks
+                .into_iter()
+                .map(|task| native::run_task(task, &config, group, window, finished.clone())),
+        )
+        .await
+        .unwrap();
+        for (lanes, detail) in reports {
+            assert_eq!(detail["positions"], json!([[0, 10]]));
+            results::verify_digests(&expected, &[json!({"lanes":lanes})], 2).unwrap();
+        }
+        reading.shutdown().await.unwrap();
+        writing.shutdown().await.unwrap();
+        broker.shutdown().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn production_topic_readers_replay_raw_and_packed_shared_writer_cohorts() {
     tokio::time::timeout(Duration::from_secs(30), async {
         for size in [128, 4096] {
@@ -55,7 +111,10 @@ async fn production_topic_readers_replay_raw_and_packed_shared_writer_cohorts() 
     .unwrap();
 }
 
-async fn start_broker(partitions: u32) -> (tempfile::TempDir, ozzy_broker::Broker, Value) {
+async fn start_broker(
+    partitions: u32,
+    dedup: bool,
+) -> (tempfile::TempDir, ozzy_broker::Broker, Value) {
     let executable = std::env::current_exe().unwrap();
     let directory = tempfile::Builder::new()
         .prefix("native-shared-writers-")
@@ -73,7 +132,7 @@ async fn start_broker(partitions: u32) -> (tempfile::TempDir, ozzy_broker::Broke
     // Four writers need independent bounded request state while the reader copies run.
     let document = format!(
         "[cluster]\nmode = \"single\"\n\
-         [topics.orders]\nconfirmation = \"local-durable\"\npartitions = {partitions}\n\
+         [topics.orders]\npartitions = {partitions}\n\
          segment_bytes = 1048576\nmax_append_bytes = 65536\n\
          [brokers.local.endpoints]\npeer = \"{peer}\"\ndata_peer = \"{data_peer}\"\nreader_pub = \"{readers}\"\n\
          [brokers.local.devices.ssd]\nroot = {root}\ncontroller = \"ssd\"\n\
@@ -84,6 +143,13 @@ async fn start_broker(partitions: u32) -> (tempfile::TempDir, ozzy_broker::Broke
          [brokers.local.topology.shards.budget]\nappend_slots = 128\n\
          resident_bytes = 67108864\ncontrol_slots = 64\ncontrol_bytes = 1048576\n"
     );
+    let document = if dedup {
+        format!(
+            "{document}\n[topics.orders.deduplication]\nwindow_millis = 30000\nmax_entries = 1024\nmax_bytes = 4194304\n"
+        )
+    } else {
+        document
+    };
     let deployment = DeploymentArtifact::initialize(directory.path(), &document).unwrap();
     let checked = deployment.checked("local").unwrap();
     let setup = json!({
@@ -105,7 +171,7 @@ async fn start_broker(partitions: u32) -> (tempfile::TempDir, ozzy_broker::Broke
 }
 
 async fn exercise_pacing(record_bytes: usize, read: bool) {
-    let (_directory, broker, setup) = start_broker(1).await;
+    let (_directory, broker, setup) = start_broker(1, false).await;
     let config = config(record_bytes);
     let runtime = WriterRuntime::new().unwrap();
     let (writers, links) = connect_shared(&runtime, &config, &setup, 0..4)
@@ -186,7 +252,7 @@ async fn production_topic_readers_assign_partition_copies_across_workers() {
 async fn partition_workers() {
     use super::super::super::reader::native;
     use super::super::super::results;
-    let (_directory, broker, setup) = start_broker(2).await;
+    let (_directory, broker, setup) = start_broker(2, false).await;
     let mut config = config(128);
     config.args.records_per_second = Some(10);
     let runtime = WriterRuntime::new().unwrap();

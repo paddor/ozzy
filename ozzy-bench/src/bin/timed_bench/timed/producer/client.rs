@@ -19,6 +19,8 @@ pub(super) struct Writer {
     sdk: SharedTopicWriter,
     key: Bytes,
     number: u32,
+    /// The keyed partition, resolved once from this writer's own metadata.
+    partition: PartitionIncarnation,
 }
 
 pub(super) struct PendingRecord {
@@ -31,6 +33,8 @@ pub(super) struct ReceiptCheck {
     pub(super) partition: PartitionIncarnation,
     first: Option<u64>,
     previous: Option<u64>,
+    digest: Option<ozzy_journal::integrity::IntegrityHasher>,
+    pub(super) dispositions: [u64; 2],
 }
 
 impl ReceiptCheck {
@@ -39,6 +43,9 @@ impl ReceiptCheck {
         if valid {
             self.first.get_or_insert(offset);
             self.previous = Some(offset);
+            if let Some(digest) = &mut self.digest {
+                digest.update(&offset.to_be_bytes());
+            }
         }
         valid
     }
@@ -46,28 +53,43 @@ impl ReceiptCheck {
     pub(super) fn offset_range(&self) -> Option<[u64; 2]> {
         Some([self.first?, self.previous?])
     }
+
+    /// The first 16 bytes of the confirmed offset digest, when enabled.
+    pub(super) fn offset_digest(&self) -> Option<[u8; 16]> {
+        self.digest
+            .as_ref()?
+            .finish()
+            .as_bytes()
+            .first_chunk()
+            .copied()
+    }
 }
 
 impl Writer {
-    pub(super) fn shared(writer: SharedTopicWriter, key: Bytes) -> Self {
+    pub(super) fn shared(writer: SharedTopicWriter, key: Bytes) -> Result<Self> {
         let number = writer.metadata().keyed_partition(&key).number;
-        Self {
+        let partition = writer
+            .metadata()
+            .partition(number)
+            .ok_or_else(|| error("keyed partition missing from writer metadata"))?
+            .incarnation;
+        Ok(Self {
             sdk: writer,
             key,
             number,
-        }
+            partition,
+        })
     }
 
-    pub(super) fn receipt_check(&self) -> ReceiptCheck {
+    pub(super) fn receipt_check(&self, offsets: bool) -> ReceiptCheck {
         ReceiptCheck {
-            partition: self
-                .sdk
-                .metadata()
-                .partition(self.number)
-                .expect("checked numeric partition")
-                .incarnation,
+            partition: self.partition,
             first: None,
             previous: None,
+            dispositions: [0; 2],
+            digest: offsets.then(|| {
+                ozzy_journal::integrity::IntegrityHasher::new("ozzy benchmark confirmed offsets v1")
+            }),
         }
     }
 
@@ -88,10 +110,11 @@ impl Writer {
         })
     }
 
-    pub(super) fn stats(&self) -> WriterStats {
+    /// SDK counters for this writer's partition.
+    pub(super) fn stats(&self) -> Result<WriterStats> {
         self.sdk
             .partition_stats(self.number)
-            .expect("checked numeric partition")
+            .ok_or_else(|| error("keyed partition has no SDK writer counters"))
     }
 
     pub(super) async fn close(self) -> Result<()> {
@@ -155,12 +178,12 @@ pub(super) async fn connect_shared(
         {
             return Err(error("native topic policy or partition count mismatch"));
         }
-        let desired = lane % setup.partitions;
+        let desired = config.feed_partition(config.logical_lane(lane), setup.partitions);
         let key = (0_u64..1_000_000)
             .map(u64::to_be_bytes)
             .find(|key| writer.metadata().keyed_partition(key).number as usize == desired)
             .ok_or_else(|| error("cannot construct bounded balanced native keys"))?;
-        clients.push(Writer::shared(writer, Bytes::copy_from_slice(&key)));
+        clients.push(Writer::shared(writer, Bytes::copy_from_slice(&key))?);
     }
     Ok((clients, links))
 }

@@ -1,4 +1,13 @@
 //! Functional production worker startup checks. No performance assertions.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "test code"
+)]
 
 #[path = "native/process.rs"]
 mod process;
@@ -6,13 +15,13 @@ mod support;
 #[path = "native/timed.rs"]
 mod timed;
 
-use ozzy_bench::native::{BrokerWorker, DeploymentArtifact, PreparedBroker};
+use ozzy_bench::native::{BrokerWorker, DeploymentArtifact, PreparedBroker, Transport};
 use std::{fmt::Write, fs, net::TcpListener, path::Path, time::Duration};
 
 #[tokio::test(flavor = "current_thread")]
 async fn native_broker_workers_initialize_restart_and_drain_each_policy() {
     tokio::time::timeout(Duration::from_secs(60), async {
-        for policy in ["local-durable", "disk-quorum", "replicated-persisting"] {
+        for policy in ["local-durable", "disk-quorum"] {
             startup(policy).await;
         }
     })
@@ -170,7 +179,7 @@ fn document(root: &Path, policy: &str) -> (String, Vec<TcpListener>) {
         .collect::<Vec<_>>();
     let mut source = format!(
         "[cluster]\nmode = \"{}\"\n\
-         [topics.orders]\nconfirmation = \"{policy}\"\npartitions = 4\n\
+         [topics.orders]\npartitions = 4\n\
          segment_bytes = 1048576\nmax_append_bytes = 65536\n",
         if brokers == 1 { "single" } else { "three" }
     );
@@ -210,4 +219,26 @@ fn document(root: &Path, policy: &str) -> (String, Vec<TcpListener>) {
         }
     }
     (source, reservations)
+}
+
+#[test]
+fn prepared_endpoints_carry_the_selected_transport() {
+    let parent = tempfile::tempdir().unwrap();
+    let bind = "127.0.0.1".parse().unwrap();
+    let plain = PreparedBroker::new(parent.path(), 0, bind, 3).unwrap();
+    let lz4 = PreparedBroker::with_transport(parent.path(), 1, bind, 3, Transport::Lz4).unwrap();
+    let zstd = PreparedBroker::with_transport(parent.path(), 2, bind, 3, Transport::Zstd).unwrap();
+    for (resources, scheme) in [
+        (&plain, "tcp://"),
+        (&lz4, "lz4+tcp://"),
+        (&zstd, "zstd+tcp://"),
+    ] {
+        let endpoints = resources.endpoints();
+        for endpoint in [&endpoints.peer, &endpoints.data_peer, &endpoints.reader_pub]
+            .into_iter()
+            .chain(endpoints.follower_pub.as_ref())
+        {
+            assert!(endpoint.starts_with(scheme), "{endpoint}");
+        }
+    }
 }

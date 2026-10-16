@@ -12,7 +12,7 @@ use std::{
 };
 
 mod prepare;
-pub use prepare::PreparedBroker;
+pub use prepare::{PreparedBroker, Transport};
 mod batch;
 pub use batch::{
     AppendBudget, DEFAULT_SDK_BATCH_TARGET_BYTES, peer_payload_capacity, reader_queue_messages,

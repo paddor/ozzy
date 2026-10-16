@@ -2153,7 +2153,6 @@ dependencies = [
  "libc",
  "lz4rip",
  "omq-tokio",
- "ozzy",
  "ozzy-broker",
  "ozzy-config",
  "ozzy-io",

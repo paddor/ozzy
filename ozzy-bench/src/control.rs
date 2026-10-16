@@ -6,7 +6,7 @@
 use std::cell::RefCell;
 use std::future::Future;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, MutexGuard, PoisonError,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
@@ -95,6 +95,16 @@ pub async fn run<T>(
         return Err(bench_error("OMQ I/O threads must be between 1 and 32"));
     }
     let context = Context::with_config_and_name(ContextConfig { io_threads }, "ozzy/omq");
+    run_in(context, args, work).await
+}
+
+/// Enter a benchmark role on an existing context. Inproc roles share one
+/// context because OMQ resolves inproc endpoints within a context.
+pub async fn run_in<T>(
+    context: Context,
+    args: &Args,
+    work: impl Future<Output = BenchResult<T>>,
+) -> BenchResult<T> {
     CONTEXT
         .scope(context.clone(), async {
             if args.control_endpoint.is_none() {
@@ -129,15 +139,12 @@ pub async fn run<T>(
         .await
 }
 
-/// Take the single control receiver within a configured worker scope; panics outside that scope.
-pub fn input() -> mpsc::Receiver<BenchResult<Value>> {
-    WORKER.with(|worker| {
-        worker
-            .input
-            .borrow_mut()
-            .take()
-            .expect("one control receiver per worker")
-    })
+/// Take the single control receiver within a configured worker scope.
+pub fn input() -> BenchResult<mpsc::Receiver<BenchResult<Value>>> {
+    WORKER
+        .try_with(|worker| worker.input.borrow_mut().take())
+        .map_err(|_| bench_error("worker control is not configured"))?
+        .ok_or_else(|| bench_error("control receiver already taken"))
 }
 
 /// Queue a worker reply, failing when control is unconfigured, full, or closed.
@@ -187,8 +194,7 @@ pub struct Connection {
     output: mpsc::Sender<Outgoing>,
     input: Option<mpsc::Receiver<BenchResult<Value>>>,
     task: tokio::task::JoinHandle<BenchResult<()>>,
-    live: Arc<AtomicBool>,
-    failure: Arc<Mutex<Option<String>>>,
+    monitor: Monitor,
 }
 
 /// Read-only supervision shared with process-liveness checks.
@@ -199,6 +205,13 @@ pub struct Monitor {
 }
 
 impl Monitor {
+    fn new() -> Self {
+        Self {
+            live: Arc::new(AtomicBool::new(true)),
+            failure: Arc::new(Mutex::new(None)),
+        }
+    }
+
     /// Whether the control pump still runs.
     pub fn is_live(&self) -> bool {
         self.live.load(Ordering::Acquire)
@@ -206,7 +219,27 @@ impl Monitor {
 
     /// First recorded control-pump failure, if any.
     pub fn failure(&self) -> Option<String> {
-        self.failure.lock().expect("control failure").clone()
+        self.failure_slot().clone()
+    }
+
+    fn stop(&self) {
+        self.live.store(false, Ordering::Release);
+    }
+
+    /// Keep the cause the worker reported, replacing any earlier one.
+    fn report_failure(&self, cause: String) {
+        *self.failure_slot() = Some(cause);
+    }
+
+    /// Keep the pump's own failure unless a cause is already recorded.
+    fn record_failure(&self, cause: impl FnOnce() -> String) {
+        self.failure_slot().get_or_insert_with(cause);
+    }
+
+    /// The failure slot. Every writer stores one whole value, so a panic
+    /// while another holder had it locked cannot leave it half-written.
+    fn failure_slot(&self) -> MutexGuard<'_, Option<String>> {
+        self.failure.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -223,7 +256,7 @@ impl Connection {
         }
         let context = context();
         let socket = socket(&context, &CONTROLLER);
-        let bound = socket.bind(endpoint.parse()?).await?;
+        let bound = socket.bind(&endpoint).await?;
         let args = Args {
             control_endpoint: Some(bound.to_string()),
             control_run: Some(run),
@@ -248,7 +281,7 @@ impl Connection {
             .as_ref()
             .ok_or_else(|| bench_error("missing control endpoint"))?;
         let socket = socket(context, worker.as_bytes());
-        socket.connect(endpoint.parse()?).await?;
+        socket.connect(endpoint).await?;
         Ok(Self::start(
             context.clone(),
             socket,
@@ -261,35 +294,21 @@ impl Connection {
     fn start(context: Context, socket: Socket, run: Uuid, worker: Uuid, peer: [u8; 16]) -> Self {
         let (output, outgoing) = mpsc::channel(QUEUE);
         let (incoming, input) = mpsc::channel(QUEUE);
-        let live = Arc::new(AtomicBool::new(true));
-        let task_live = live.clone();
+        let monitor = Monitor::new();
+        let task_monitor = monitor.clone();
         let errors = incoming.downgrade();
-        let failure = Arc::new(Mutex::new(None));
-        let task_failure = failure.clone();
         let network_context = context.clone();
         let task = tokio::spawn(async move {
             let _context = network_context;
-            let result = pump(
-                &socket,
-                Route { run, worker, peer },
-                outgoing,
-                incoming,
-                &task_live,
-                &task_failure,
-            )
-            .await;
+            let route = Route { run, worker, peer };
+            let result = pump(&socket, route, outgoing, incoming, &task_monitor).await;
             if let Err(error) = &result {
-                task_failure
-                    .lock()
-                    .expect("control failure")
-                    .get_or_insert_with(|| error.to_string());
+                task_monitor.record_failure(|| error.to_string());
+                if let Some(incoming) = errors.upgrade() {
+                    let _ = incoming.try_send(Err(bench_error(error.to_string())));
+                }
             }
-            if let Err(error) = &result
-                && let Some(incoming) = errors.upgrade()
-            {
-                let _ = incoming.try_send(Err(bench_error(error.to_string())));
-            }
-            task_live.store(false, Ordering::Release);
+            task_monitor.stop();
             result
         });
         Self {
@@ -297,17 +316,13 @@ impl Connection {
             output,
             input: Some(input),
             task,
-            live,
-            failure,
+            monitor,
         }
     }
 
     /// Clone read-only pump liveness and failure supervision.
     pub fn monitor(&self) -> Monitor {
-        Monitor {
-            live: self.live.clone(),
-            failure: self.failure.clone(),
-        }
+        self.monitor.clone()
     }
     /// Queue a control data frame without waiting for destination capacity.
     pub fn send(&self, value: &Value) -> BenchResult<()> {
@@ -326,10 +341,8 @@ impl Connection {
             .await
             .ok_or_else(|| {
                 bench_error(
-                    self.failure
-                        .lock()
-                        .expect("control failure")
-                        .clone()
+                    self.monitor
+                        .failure()
                         .unwrap_or_else(|| "worker control closed".into()),
                 )
             })?
@@ -380,7 +393,7 @@ impl Connection {
 impl Drop for Connection {
     fn drop(&mut self) {
         self.task.abort();
-        self.live.store(false, Ordering::Release);
+        self.monitor.stop();
     }
 }
 

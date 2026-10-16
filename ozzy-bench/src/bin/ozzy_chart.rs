@@ -1,11 +1,23 @@
 //! Render OMQ-style SVG charts from validated append-only result ledgers.
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::too_many_lines,
+        clippy::too_many_arguments,
+        reason = "product code is linted without cfg(test)"
+    )
+)]
 mod chart;
 
 use clap::Parser;
 use ozzy_bench::automation::{self, Result, records};
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -56,6 +68,78 @@ struct Args {
     suffix: String,
 }
 
+impl Args {
+    /// Validated chart rows of `run_ids`, restricted to the selected modes.
+    fn select(&self, run_ids: &[String], iggy_run_id: Option<&str>) -> Result<serde_json::Value> {
+        let mut data = if self.fixed_load {
+            records::select_fixed_load(&automation::cache()?, run_ids)?
+        } else {
+            records::select(&automation::cache()?, run_ids, iggy_run_id)?
+        };
+        records::retain_modes(&mut data, &self.modes)?;
+        Ok(data)
+    }
+
+    /// Replace measured cases with each explicit rerun.
+    fn replace_cases(&self, data: &mut serde_json::Value) -> Result<()> {
+        for id in &self.replace_run_id {
+            let replacement = self.select(std::slice::from_ref(id), None)?;
+            chart::replacement::apply(data, &replacement)?;
+        }
+        Ok(())
+    }
+
+    /// Attach the cached external references the arguments name.
+    fn include_references(&self, data: &mut serde_json::Value) -> Result<()> {
+        let (references, implementations): (_, &[_]) = if self.external_reference_run_id.is_empty()
+        {
+            (&self.iggy_reference_run_id, &["iggy"])
+        } else {
+            (&self.external_reference_run_id, &["iggy", "redpanda"])
+        };
+        if !references.is_empty() {
+            if !self.fixed_load && references.len() != 1 {
+                return Err("saturation charts require one external reference run".into());
+            }
+            records::include_references_with_ozzy_only_rates(
+                &automation::cache()?,
+                data,
+                &records::References {
+                    run_ids: references,
+                    implementations,
+                    fixed_load: self.fixed_load,
+                },
+                &self.ozzy_only_rate,
+            )?;
+        }
+        if !self.redpanda_reference_run_id.is_empty() {
+            if !self.fixed_load && self.redpanda_reference_run_id.len() != 1 {
+                return Err("saturation charts require one Redpanda reference run".into());
+            }
+            records::include_references_with_ozzy_only_rates(
+                &automation::cache()?,
+                data,
+                &records::References {
+                    run_ids: &self.redpanda_reference_run_id,
+                    implementations: &["redpanda"],
+                    fixed_load: self.fixed_load,
+                },
+                &self.ozzy_only_rate,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The `-suffix` of chart and input file names; empty for none.
+    fn file_suffix(&self) -> String {
+        if self.suffix.is_empty() {
+            String::new()
+        } else {
+            format!("-{}", self.suffix)
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     if !args
@@ -66,78 +150,33 @@ fn main() -> Result<()> {
         return Err("suffix must contain only ASCII letters, digits, or hyphens".into());
     }
     automation::isolation::require_idle()?;
-    let mut data = if args.fixed_load {
-        records::select_fixed_load(&automation::cache(), &args.run_id)?
-    } else {
-        records::select(
-            &automation::cache(),
-            &args.run_id,
-            args.iggy_run_id.as_deref(),
-        )?
-    };
-    records::retain_modes(&mut data, &args.modes)?;
-    if args.regression_output.is_some() {
-        return regression(&args, &mut data);
+    let mut data = args.select(&args.run_id, args.iggy_run_id.as_deref())?;
+    if let Some(output) = &args.regression_output {
+        return regression(&args, output, &mut data);
     }
-    for id in &args.replace_run_id {
-        let mut replacement = if args.fixed_load {
-            records::select_fixed_load(&automation::cache(), std::slice::from_ref(id))?
-        } else {
-            records::select(&automation::cache(), std::slice::from_ref(id), None)?
-        };
-        records::retain_modes(&mut replacement, &args.modes)?;
-        chart::replacement::apply(&mut data, &replacement)?;
-    }
+    args.replace_cases(&mut data)?;
     if !args.ozzy_only_rate.is_empty() {
         data["ozzy_only_rates"] = json!(args.ozzy_only_rate);
     }
     // Failed offered rates also need comparison coverage.
     if !args.failed_run_id.is_empty() {
-        records::include_failed_loads(&automation::cache(), &mut data, &args.failed_run_id)?;
+        records::include_failed_loads(&automation::cache()?, &mut data, &args.failed_run_id)?;
         records::retain_modes(&mut data, &args.modes)?;
     }
     chart::coverage::limit_rates(&mut data, &args.max_rate)?;
-    let (references, implementations): (_, &[_]) = if args.external_reference_run_id.is_empty() {
-        (&args.iggy_reference_run_id, &["iggy"])
-    } else {
-        (&args.external_reference_run_id, &["iggy", "redpanda"])
-    };
-    if !references.is_empty() {
-        if !args.fixed_load && references.len() != 1 {
-            return Err("saturation charts require one external reference run".into());
-        }
-        records::include_references_with_ozzy_only_rates(
-            &automation::cache(),
-            &mut data,
-            references,
-            implementations,
-            args.fixed_load,
-            &args.ozzy_only_rate,
-        )?;
-    }
-    if !args.redpanda_reference_run_id.is_empty() {
-        if !args.fixed_load && args.redpanda_reference_run_id.len() != 1 {
-            return Err("saturation charts require one Redpanda reference run".into());
-        }
-        records::include_references_with_ozzy_only_rates(
-            &automation::cache(),
-            &mut data,
-            &args.redpanda_reference_run_id,
-            &["redpanda"],
-            args.fixed_load,
-            &args.ozzy_only_rate,
-        )?;
-    }
+    args.include_references(&mut data)?;
+    render(&args, &data)
+}
+
+/// Save the chart input beside other artifacts, then draw the charts.
+fn render(args: &Args, data: &serde_json::Value) -> Result<()> {
     let output = args
         .output_dir
+        .clone()
         .unwrap_or_else(|| automation::root().join("doc/charts"));
     let cache = automation::artifact_root().join("ozzy-chart-inputs");
     std::fs::create_dir_all(&cache)?;
-    let suffix = if args.suffix.is_empty() {
-        String::new()
-    } else {
-        format!("-{}", args.suffix)
-    };
+    let suffix = args.file_suffix();
     let kind = if args.fixed_load { "-fixed-load" } else { "" };
     let modes = if args.modes.is_empty() {
         String::new()
@@ -145,32 +184,25 @@ fn main() -> Result<()> {
         format!("-{}", args.modes.join("-"))
     };
     let input = cache.join(format!("{}{modes}{kind}{suffix}.json", args.run_id[0]));
-    automation::json_file(&input, &data)?;
+    automation::json_file(&input, data)?;
     if args.fixed_load {
-        chart::render_fixed_load(&data, &output, &suffix)
+        chart::render_fixed_load(data, &output, &suffix)
     } else {
-        chart::render(&data, &output, &suffix)
+        chart::render(data, &output, &suffix)
     }
 }
 
-fn regression(args: &Args, data: &mut serde_json::Value) -> Result<()> {
-    if let Some(output) = &args.regression_output {
-        let mut baseline = if args.fixed_load {
-            records::select_fixed_load(&automation::cache(), &args.baseline_run_id)?
-        } else {
-            records::select(&automation::cache(), &args.baseline_run_id, None)?
-        };
-        records::retain_modes(&mut baseline, &args.modes)?;
-        chart::coverage::limit_rates(&mut baseline, &args.max_rate)?;
-        chart::coverage::limit_rates(data, &args.max_rate)?;
-        let report = chart::regression::compare(&baseline, data, args.fixed_load)?;
-        automation::json_file(output, &report)?;
-        println!("{}: {}", report["status"], output.display());
-        return if report["status"] == "pass" {
-            Ok(())
-        } else {
-            Err("performance gate did not pass; inspect the saved per-cell report".into())
-        };
+/// Gate `data` against the baseline runs and save the per-cell report.
+fn regression(args: &Args, output: &Path, data: &mut serde_json::Value) -> Result<()> {
+    let mut baseline = args.select(&args.baseline_run_id, None)?;
+    chart::coverage::limit_rates(&mut baseline, &args.max_rate)?;
+    chart::coverage::limit_rates(data, &args.max_rate)?;
+    let report = chart::regression::compare(&baseline, data, args.fixed_load)?;
+    automation::json_file(output, &report)?;
+    println!("{}: {}", report["status"], output.display());
+    if report["status"] == "pass" {
+        Ok(())
+    } else {
+        Err("performance gate did not pass; inspect the saved per-cell report".into())
     }
-    unreachable!("regression output was selected")
 }

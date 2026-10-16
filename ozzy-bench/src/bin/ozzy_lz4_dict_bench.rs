@@ -1,11 +1,26 @@
 //! Isolated codec experiment; does not implement dictionary-backed storage.
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::too_many_lines,
+        clippy::too_many_arguments,
+        reason = "product code is linted without cfg(test)"
+    )
+)]
 mod dict_bench;
 
 use clap::Parser;
 use ozzy_bench::automation::{self, Result, isolation, records, source, supervise};
 use serde_json::json;
-use std::{collections::BTreeMap, fs, fs::OpenOptions, time::Duration};
+use std::{collections::BTreeMap, fs, time::Duration};
+
+/// Wall-clock limit of the whole experiment worker.
+const EXPERIMENT_LIMIT: Duration = Duration::from_secs(600);
 
 #[derive(Clone, Debug, Parser)]
 #[command(about = "LZ4 dictionary CPU/size experiment on held-out canonical Append bodies")]
@@ -68,10 +83,22 @@ impl Args {
         }
         Ok(())
     }
+
+    /// The worker and controller CPUs are distinct and inside `inherited`.
+    fn check_cpus(&self, inherited: &[usize]) -> Result<()> {
+        if self.cpu == self.controller_cpu
+            || !inherited.contains(&self.cpu)
+            || !inherited.contains(&self.controller_cpu)
+        {
+            return Err(
+                "worker/controller CPUs must be distinct and inside the inherited mask".into(),
+            );
+        }
+        Ok(())
+    }
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let args = Args::parse();
     args.validate()?;
     if args.worker {
@@ -79,24 +106,22 @@ async fn main() -> Result<()> {
         println!("{}", dict_bench::run(&args)?);
         return Ok(());
     }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(control(&args))
+}
+
+/// Run the experiment worker under supervision on an idle host, verify its
+/// source and executable did not change, and record the result.
+async fn control(args: &Args) -> Result<()> {
     automation::install_signals()?;
     isolation::require_idle()?;
-    fs::create_dir_all(automation::cache())?;
-    let lock = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(automation::cache().join("runner.lock"))?;
-    lock.try_lock()?;
-    let cpus = isolation::cpus(None)?;
-    if args.cpu == args.controller_cpu
-        || !cpus.contains(&args.cpu)
-        || !cpus.contains(&args.controller_cpu)
-    {
-        return Err("worker/controller CPUs must be distinct and inside the inherited mask".into());
-    }
+    let _lock = automation::lock_runner(&automation::cache()?)?;
+    args.check_cpus(&isolation::cpus(None)?)?;
     isolation::pin(None, &[args.controller_cpu])?;
     let id = format!("{}-lz4-dictionary", automation::run_id()?);
-    let directory = automation::cache().join("experiments").join(&id);
+    let directory = automation::cache()?.join("experiments").join(&id);
     fs::create_dir_all(&directory)?;
     let identity = source::identity(&automation::root())?;
     let exe = std::env::current_exe()?;
@@ -113,10 +138,12 @@ async fn main() -> Result<()> {
     let mut result = supervise::execute(
         &command,
         &directory,
-        Duration::from_secs(600),
+        EXPERIMENT_LIMIT,
         &BTreeMap::new(),
-        None,
-        Some(&mut guard),
+        supervise::Monitors {
+            server: None,
+            isolation: Some(&mut guard),
+        },
     )
     .await?;
     source::require_unchanged(&automation::root(), &identity)?;
@@ -127,13 +154,13 @@ async fn main() -> Result<()> {
     result["process_isolation"] = guard.report()?;
     result["after_shutdown"] = isolation::require_idle()?;
     automation::json_file(&directory.join("result.json"), &result)?;
-    records::append(&automation::cache().join("experiments"), "ozzy", &result)?;
+    records::append(&automation::cache()?.join("experiments"), "ozzy", &result)?;
+    let measurements = result["measurements"]
+        .as_array()
+        .ok_or("missing measurements")?
+        .len();
     println!(
-        "VERIFIED {} codec measurements; results appended under ~/.cache/ozzy/experiments/",
-        result["measurements"]
-            .as_array()
-            .ok_or("missing measurements")?
-            .len()
+        "VERIFIED {measurements} codec measurements; results appended under ~/.cache/ozzy/experiments/"
     );
     Ok(())
 }

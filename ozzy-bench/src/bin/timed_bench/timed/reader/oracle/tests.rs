@@ -144,3 +144,54 @@ fn shared_oracle_rejects_gaps_wrong_writers_and_unassigned_partitions() {
     assert!(oracle.complete(&[1, 0, 0, 0]).unwrap());
     assert!(oracle.complete(&[0, 0, 0, 0]).is_err());
 }
+
+#[test]
+fn untimed_records_verify_at_once_and_share_the_flush_clock() {
+    let config = configuration();
+    let group = config::group(&config.args).unwrap();
+    let mut oracle = Oracle::new(&config, 2, &[0], 0, window()).unwrap();
+    let payload = payload(&config);
+    for sequence in 0..3 {
+        oracle
+            .observe_untimed(
+                &config,
+                group,
+                Record {
+                    partition: 0,
+                    offset: sequence,
+                    id: config::message_id(group, 0, sequence),
+                    payload: &payload,
+                },
+            )
+            .unwrap();
+    }
+    // Identity and order checks do not wait for the clock.
+    assert!(
+        oracle
+            .observe_untimed(
+                &config,
+                group,
+                Record {
+                    partition: 0,
+                    offset: 3,
+                    id: config::message_id(group, 0, 4),
+                    payload: &payload,
+                },
+            )
+            .is_err()
+    );
+    assert!(oracle.complete(&[3, 0, 0, 0]).unwrap());
+    oracle.flush(window().start + 300).unwrap();
+    let rows = oracle.rows();
+    assert_eq!(rows[0]["total"], 3);
+    assert_eq!(
+        rows[0]["latency"]["bins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_u64)
+            .sum::<u64>(),
+        3
+    );
+    assert_eq!(rows[0]["last_ns"], window().start + 300);
+}

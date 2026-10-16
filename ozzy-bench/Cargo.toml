@@ -14,7 +14,7 @@ publish = false
 [features]
 # Separate instrumented runs. Never label these as uninstrumented timing rows.
 allocation-counting = []
-comparisons = ["dep:iggy", "dep:rdkafka", "dep:tracing-subscriber", "ozzy-runtime/storage-metrics"]
+comparisons = ["dep:iggy", "dep:rdkafka", "dep:tracing-subscriber"]
 
 [[bin]]
 name = "ozzy_timed_bench"
@@ -59,21 +59,22 @@ plotters = { version = "0.3", default-features = false, features = ["svg_backend
 iggy = { git = "https://github.com/apache/iggy.git", rev = "71f29618ba04917fded0ef5cd085c206fef0ee49", optional = true }
 rdkafka = { version = "=0.38.0", optional = true }
 tracing-subscriber = { version = "0.3", optional = true, features = ["fmt"] }
-omq-tokio = { workspace = true, features = ["lz4"] }
+omq-tokio = { workspace = true, features = ["lz4", "zstd"] }
 serde_json.workspace = true
 sha2 = "0.10"
 signal-hook = "0.3"
 regex = "1"
 toml = "0.8"
 rustix = { workspace = true, features = ["time", "thread"] }
-ozzy = { workspace = true, features = ["lz4-transport"] }
-ozzy-broker.workspace = true
+ozzy-broker = { workspace = true, features = ["lz4-transport", "zstd-transport"] }
 ozzy-config.workspace = true
+ozzy-io = { workspace = true, features = ["simulation"] }
 ozzy-journal.workspace = true
 ozzy-journal-segment = { workspace = true, features = ["lz4"] }
 ozzy-proto.workspace = true
 ozzy-replication.workspace = true
 ozzy-runtime.workspace = true
+ozzy-sim = { workspace = true, features = ["broker"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["process", "io-util"] }
 uuid.workspace = true

@@ -1,26 +1,47 @@
 //! Ordered, acknowledged control transport. Runs on the application runtime.
 
 use super::{
-    AtomicBool, BenchResult, CHUNK, DEADLINE, Frame, Kind, MAX_REPORT_BYTES, Ordering, Outgoing,
-    Route, Socket, Value, bench_error, mpsc,
+    BenchResult, CHUNK, DEADLINE, Frame, Kind, MAX_REPORT_BYTES, Monitor, Outgoing, Route, Socket,
+    Value, bench_error, mpsc,
 };
-use std::sync::Mutex;
+use omq_tokio::{MonitorEvent, MonitorStream};
 
 pub(super) async fn pump(
     socket: &Socket,
     route: Route,
-    mut outgoing: mpsc::Receiver<Outgoing>,
+    outgoing: mpsc::Receiver<Outgoing>,
     incoming: mpsc::Sender<BenchResult<Value>>,
-    live: &AtomicBool,
-    failure: &Mutex<Option<String>>,
+    monitor: &Monitor,
 ) -> BenchResult<()> {
-    let mut monitor = socket.monitor();
+    let events = socket.monitor();
     socket
         .wait_connected(1, DEADLINE)
         .await
         .map_err(|cause| bench_error(format!("control handshake: {cause}")))?;
-    let (acks, mut acknowledged) = mpsc::channel(1);
-    let send = async {
+    let link = Link { socket, route };
+    let (acks, acknowledged) = mpsc::channel(1);
+    tokio::try_join!(
+        link.send_reports(outgoing, acknowledged),
+        link.receive_reports(events, acks, incoming, monitor),
+    )?;
+    Ok(())
+}
+
+/// The connected control socket and the identities that fence its frames.
+#[derive(Clone, Copy)]
+struct Link<'a> {
+    socket: &'a Socket,
+    route: Route,
+}
+
+impl Link<'_> {
+    /// Send queued reports in chunks; each waits for the peer acknowledgment
+    /// of its sequence before its completion fires.
+    async fn send_reports(
+        self,
+        mut outgoing: mpsc::Receiver<Outgoing>,
+        mut acknowledged: mpsc::Receiver<u64>,
+    ) -> BenchResult<()> {
         let mut sequence = 0_u64;
         while let Some(out) = outgoing.recv().await {
             sequence = sequence
@@ -31,12 +52,8 @@ pub(super) async fn pump(
                 return Err(bench_error("oversized benchmark report"));
             }
             for (index, chunk) in bytes.chunks(CHUNK).enumerate() {
-                let message = route.packet(out.kind, sequence, index * CHUNK, bytes.len(), chunk);
-                tokio::time::timeout(DEADLINE, socket.send(message))
-                    .await
-                    .map_err(|cause| {
-                        bench_error(format!("control send sequence={sequence}: {cause}"))
-                    })??;
+                let frame = Frame::chunk(out.kind, sequence, index * CHUNK, bytes.len(), chunk);
+                self.send(frame, "control send").await?;
             }
             let ack = tokio::time::timeout(DEADLINE, acknowledged.recv())
                 .await
@@ -53,69 +70,105 @@ pub(super) async fn pump(
                 let _ = completion.send(Ok(()));
             }
         }
-        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
-    };
-    let receive = async {
-        let mut sequence = 1_u64;
-        let mut assembly = Vec::new();
-        let mut expected_kind = Kind::Data;
-        let mut expected_total = 0;
+        Ok(())
+    }
+
+    /// Reassemble and deliver peer reports, acknowledging each, and pass
+    /// acknowledgments of our own reports to the sender.
+    async fn receive_reports(
+        self,
+        mut events: MonitorStream,
+        acks: mpsc::Sender<u64>,
+        incoming: mpsc::Sender<BenchResult<Value>>,
+        monitor: &Monitor,
+    ) -> BenchResult<()> {
+        let mut assembly = Assembly::new();
         let mut input = Some(incoming);
         loop {
             let message = tokio::select! {
-                message = socket.recv() => message?,
-                event = monitor.recv() => {
-                    if let omq_tokio::MonitorEvent::Disconnected { reason, .. } = event? {
-                        return Err::<(), _>(bench_error(format!("benchmark control peer disconnected: {reason:?}")));
+                message = self.socket.recv() => message?,
+                event = events.recv() => {
+                    if let MonitorEvent::Disconnected { reason, .. } = event? {
+                        return Err(bench_error(format!("benchmark control peer disconnected: {reason:?}")));
                     }
                     continue;
                 }
             };
-            let frame = Frame::decode(&message, route)?;
+            let frame = Frame::decode(&message, self.route)?;
             if frame.kind == Kind::Ack {
                 acks.try_send(frame.sequence)
                     .map_err(|_| bench_error("unexpected control acknowledgment"))?;
                 continue;
             }
-            if frame.sequence != sequence || frame.offset != assembly.len() {
-                return Err(bench_error("stale or discontinuous control frame"));
-            }
-            if assembly.is_empty() {
-                expected_kind = frame.kind;
-                expected_total = frame.total;
-            }
-            if frame.kind != expected_kind || frame.total != expected_total {
-                return Err(bench_error("control report changed during transfer"));
-            }
-            assembly.extend_from_slice(&frame.payload);
-            if assembly.len() != frame.total {
+            if !assembly.push(&frame)? {
                 continue;
             }
-            deliver(frame.kind, &assembly, &mut input, live, failure)?;
-            assembly.clear();
-            let ack = route.packet(Kind::Ack, sequence, 0, 0, &[]);
-            tokio::time::timeout(DEADLINE, socket.send(ack))
-                .await
-                .map_err(|cause| {
-                    bench_error(format!(
-                        "control reply acknowledgment sequence={sequence}: {cause}"
-                    ))
-                })??;
-            sequence = sequence
-                .checked_add(1)
-                .ok_or_else(|| bench_error("control sequence overflow"))?;
+            deliver(assembly.kind, &assembly.bytes, &mut input, monitor)?;
+            let ack = Frame::ack(assembly.sequence);
+            self.send(ack, "control reply acknowledgment").await?;
+            assembly.next()?;
         }
-    };
-    tokio::try_join!(send, receive)?;
-    Ok(())
+    }
+
+    async fn send(self, frame: Frame, purpose: &str) -> BenchResult<()> {
+        let sequence = frame.sequence;
+        tokio::time::timeout(DEADLINE, self.socket.send(frame.encode(self.route)))
+            .await
+            .map_err(|cause| bench_error(format!("{purpose} sequence={sequence}: {cause}")))??;
+        Ok(())
+    }
+}
+
+/// One peer report being reassembled from its ordered chunks.
+struct Assembly {
+    sequence: u64,
+    kind: Kind,
+    total: usize,
+    bytes: Vec<u8>,
+}
+
+impl Assembly {
+    fn new() -> Self {
+        Self {
+            sequence: 1,
+            kind: Kind::Data,
+            total: 0,
+            bytes: Vec::new(),
+        }
+    }
+
+    /// Append the next chunk of the current report; true once it is whole.
+    fn push(&mut self, frame: &Frame) -> BenchResult<bool> {
+        if frame.sequence != self.sequence || frame.offset != self.bytes.len() {
+            return Err(bench_error("stale or discontinuous control frame"));
+        }
+        if self.bytes.is_empty() {
+            self.kind = frame.kind;
+            self.total = frame.total;
+        }
+        if frame.kind != self.kind || frame.total != self.total {
+            return Err(bench_error("control report changed during transfer"));
+        }
+        self.bytes.extend_from_slice(&frame.payload);
+        Ok(self.bytes.len() == frame.total)
+    }
+
+    /// Expect the next report once this one is delivered and acknowledged.
+    fn next(&mut self) -> BenchResult<()> {
+        self.bytes.clear();
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| bench_error("control sequence overflow"))?;
+        Ok(())
+    }
 }
 
 fn deliver(
     kind: Kind,
     payload: &[u8],
     input: &mut Option<mpsc::Sender<BenchResult<Value>>>,
-    live: &AtomicBool,
-    failure: &Mutex<Option<String>>,
+    monitor: &Monitor,
 ) -> BenchResult<()> {
     match kind {
         Kind::Data => {
@@ -129,20 +182,18 @@ fn deliver(
         Kind::Shutdown => {
             input.take();
         }
-        Kind::Finished => {
-            live.store(false, Ordering::Release);
-        }
+        Kind::Finished => monitor.stop(),
         Kind::Failed => {
             let cause: String = serde_json::from_slice(payload)?;
             let cause = format!("benchmark worker failed: {cause}");
-            *failure.lock().expect("control failure") = Some(cause.clone());
+            monitor.report_failure(cause.clone());
             if let Some(input) = input {
                 // The monitor retains the cause even if a full report queue
                 // or completed shutdown has no receiver.
                 let _ = input.try_send(Err(bench_error(cause)));
             }
         }
-        Kind::Ack => unreachable!(),
+        Kind::Ack => return Err(bench_error("control acknowledgment carried a report")),
     }
     Ok(())
 }
