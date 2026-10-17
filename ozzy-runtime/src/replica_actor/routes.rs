@@ -103,8 +103,9 @@ impl RoutePublisher {
         })
     }
 
-    /// Poll after actor progress in the same scheduler turn. Pending port
-    /// completions and capacity waits register wakeups without a retry timer.
+    /// Poll after actor progress in the same scheduler turn, after the caller
+    /// progressed `port` in that turn. Pending port completions and capacity
+    /// waits register wakeups without a retry timer.
     /// Canceling this poll preserves every queued observation and scan position.
     pub fn poll_progress(
         &mut self,
@@ -112,7 +113,6 @@ impl RoutePublisher {
         actors: &PartitionActors,
         port: &mut Port,
     ) -> Poll<Result<(), RoutePublicationError>> {
-        port.poll_progress(cx)?;
         if let Some(wait) = &mut self.capacity
             && wait.as_mut().poll(cx).is_ready()
         {

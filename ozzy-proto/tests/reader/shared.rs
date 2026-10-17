@@ -153,14 +153,8 @@ fn publication_forwards_one_exact_prepared_lz4_group() {
     assert!(reader::decode_publication(packet, limits).is_err());
     let metadata = Bytes::from(metadata);
     let packet = decode_packet(&[&header, &metadata, &payload], limits.envelope).unwrap();
-    let publication = reader::decode_owned_publication(
-        packet,
-        &metadata,
-        &payload,
-        limits,
-        &mut bytes::BytesMut::new(),
-    )
-    .unwrap();
+    let publication =
+        reader::decode_owned_publication(packet, &metadata, &payload, limits).unwrap();
     assert_eq!(
         publication.payload_encoding,
         ozzy_proto::append::PayloadEncoding::Lz4

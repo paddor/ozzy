@@ -228,7 +228,7 @@ impl ReplicaDriver {
     /// Current normal or proposed election scope, not necessarily durable.
     pub fn scope(&self) -> Scope {
         match &self.role {
-            Role::Normal(normal) => normal.snapshot().scope,
+            Role::Normal(normal) => normal.scope(),
             Role::ViewChanging(changing) => changing.scope(),
             Role::Installing(installing) => installing.requested_scope(),
             Role::Fenced(scope) => *scope,

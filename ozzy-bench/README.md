@@ -71,6 +71,9 @@ Disk quorum: replace the mode and CPU arguments with
 
 - `--broker-cpus`: `/` separates per-broker sets; a comma-only list is one
   shared pool. A single broker uses all of them.
+- Each writer and reader process runs on one `--client-cpus` core, assigned
+  in turn with readers after writers, so its application and SDK threads
+  share caches.
 - `--impl all|iggy|redpanda` adds external systems. Run `--check-only` with
   that selection first; it prepares the external servers.
 - Ozzy APPENDs carry at most 2,048 records, even with a larger
@@ -109,6 +112,8 @@ ozzy_compare --impl ozzy --modes durable --sizes 8192 \
   are failed loads.
 - Latency starts at the scheduled arrival and includes admission delay and
   final drain. Late records keep their original timestamp.
+- A writer lane timer wakes at most every 250 us. Arrivals due sooner are
+  admitted together at the next wakeup.
 - Never combine percentiles arithmetically. At 100/s, 30 s gives only 3,000
   samples, so p99 needs repeated runs.
 
@@ -264,9 +269,6 @@ compatible cached runs; incomplete or incompatible inputs are rejected.
 
 - `--ozzy-only-rate` marks an offered load the references do not measure.
   Iggy and Redpanda stop at 100k/s.
-- Disk quorum charts stop 128 B at 100k/s: render them with
-  `--max-rate 128:100000` and without `--ozzy-only-rate`. One shared SSD does
-  not sustain 1M/s for three brokers.
 - Saturation charts take exactly one external reference run.
   `--iggy-reference-run-id` and `--redpanda-reference-run-id` attach Iggy and
   Redpanda from separate runs.

@@ -115,11 +115,20 @@ impl Process {
         reader: bool,
         directory: &Path,
     ) -> Result<Self> {
+        // A timed process keeps its application and SDK threads on one client
+        // core, so each record handoff stays in that core's caches. Readers
+        // continue the rotation after the writers.
+        let slot = if reader {
+            args.producer_workers.unwrap_or(1) + index
+        } else {
+            index
+        };
+        let cpus = worker_cpu(slot)?;
         let placement = Placement {
             bind: IpAddr::from([127, 0, 0, 1]),
             remote: None,
             storage_dir: None,
-            cpus: None,
+            cpus,
         };
         let role = if reader { "reader" } else { "producer" };
         let flag = if reader {
@@ -424,4 +433,28 @@ fn diagnostics(path: &Path) -> std::io::Result<String> {
         text.push_str("\n[diagnostics truncated; full stderr preserved in artifacts]");
     }
     Ok(text)
+}
+
+/// The client CPU of timed process `slot`, round robin over this process's
+/// CPU pool. `None` when no client pool restricts this process.
+fn worker_cpu(slot: usize) -> Result<Option<Vec<usize>>> {
+    let pool = rustix::thread::sched_getaffinity(None)?;
+    let cpus: Vec<usize> = (0..rustix::thread::CpuSet::MAX_CPU)
+        .filter(|&cpu| pool.is_set(cpu))
+        .collect();
+    // Unlike `available_parallelism`, this ignores the affinity mask.
+    let online = std::fs::read_to_string("/sys/devices/system/cpu/online")?
+        .trim()
+        .split(',')
+        .filter_map(|range| match range.split_once('-') {
+            Some((first, last)) => {
+                Some(last.parse::<usize>().ok()? + 1 - first.parse::<usize>().ok()?)
+            }
+            None => range.parse::<usize>().ok().map(|_| 1),
+        })
+        .sum::<usize>();
+    if cpus.is_empty() || cpus.len() >= online {
+        return Ok(None);
+    }
+    Ok(Some(vec![cpus[slot % cpus.len()]]))
 }

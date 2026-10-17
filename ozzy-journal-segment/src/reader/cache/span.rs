@@ -415,14 +415,9 @@ mod tests {
         let metadata = bytes::Bytes::from(metadata);
         let packet =
             ozzy_proto::decode_packet(&[&header, &metadata, &forwarded], limits.envelope).unwrap();
-        let publication = ozzy_proto::reader::decode_owned_publication(
-            packet,
-            &metadata,
-            &forwarded,
-            limits,
-            &mut bytes::BytesMut::new(),
-        )
-        .unwrap();
+        let publication =
+            ozzy_proto::reader::decode_owned_publication(packet, &metadata, &forwarded, limits)
+                .unwrap();
         assert_eq!(publication.records.len(), 1024);
     }
 }

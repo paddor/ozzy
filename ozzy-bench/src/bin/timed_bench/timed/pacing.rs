@@ -196,9 +196,19 @@ impl Arrivals {
     }
 }
 
+/// Shortest interval between two wakeups of one lane timer. Arrivals due
+/// sooner are admitted together at the next wakeup, so a fast schedule does
+/// not pay a timer syscall pair and a thread wakeup per record. Their latency
+/// still counts from the original due time.
+const MIN_WAKE_INTERVAL_NS: u64 = 250_000;
+
 /// One reusable timer per writer lane. No millisecond rounding, busy waiting,
 /// or blocking the Tokio thread while confirmations need observation.
-pub(super) struct Timer(AsyncFd<OwnedFd>);
+pub(super) struct Timer {
+    fd: AsyncFd<OwnedFd>,
+    /// Expiration of the previous wait.
+    woke: u64,
+}
 
 impl Timer {
     pub(super) fn new() -> Result<Self> {
@@ -208,16 +218,17 @@ impl Timer {
         )?;
         // SAFETY: the `OwnedFd` keeps its descriptor open and unchanged until
         // the `AsyncFd` drops it.
-        let timer = unsafe { AsyncFd::register(timer) }.map_err(std::io::Error::from)?;
-        Ok(Self(timer))
+        let fd = unsafe { AsyncFd::register(timer) }.map_err(std::io::Error::from)?;
+        Ok(Self { fd, woke: 0 })
     }
 
     pub(super) async fn wait_until(&mut self, at: u64) -> Result<()> {
+        let at = at.max(self.woke.saturating_add(MIN_WAKE_INTERVAL_NS));
         if metrics::monotonic_ns() >= at {
             return Ok(());
         }
         timerfd_settime(
-            self.0.get_ref(),
+            self.fd.get_ref(),
             TimerfdTimerFlags::ABSTIME,
             &Itimerspec {
                 it_interval: Timespec::default(),
@@ -228,12 +239,15 @@ impl Timer {
             },
         )?;
         loop {
-            let mut ready = self.0.readable_mut().await?;
+            let mut ready = self.fd.readable_mut().await?;
             let read = ready.try_io(|fd| {
                 rustix::io::read(fd.get_ref(), &mut [0_u8; 8]).map_err(std::io::Error::from)
             });
             match read {
-                Ok(Ok(8)) => return Ok(()),
+                Ok(Ok(8)) => {
+                    self.woke = at;
+                    return Ok(());
+                }
                 Ok(Ok(_)) => return Err(error("incomplete timer expiration")),
                 Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => (),
                 Ok(Err(e)) => return Err(e.into()),

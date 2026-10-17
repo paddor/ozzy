@@ -251,11 +251,18 @@ impl Service {
     /// Timer-driven retry of an initiated, unfinished attempt. This preserves
     /// its HELLO identity and never renegotiates a healthy link.
     pub fn retry(&mut self, peer: NodeId) -> Result<(), ServiceError> {
-        let state = self.peers.get(&peer).ok_or(ServiceError::Access)?;
-        if state.initiating && self.sessions.session(peer).is_none() {
+        self.peers.get(&peer).ok_or(ServiceError::Access)?;
+        if self.retrying(peer) {
             self.start(peer)?;
         }
         Ok(())
+    }
+
+    /// Whether `peer` has an initiated, unfinished attempt for [`Self::retry`].
+    pub fn retrying(&self, peer: NodeId) -> bool {
+        self.peers
+            .get(&peer)
+            .is_some_and(|state| state.initiating && self.sessions.session(peer).is_none())
     }
 
     /// Fence an independently observed disconnect. A late disconnect cannot

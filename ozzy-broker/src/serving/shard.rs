@@ -250,6 +250,63 @@ impl State {
     }
 }
 
+/// One lane receive, kept across turns until it yields an input.
+type InputWait = Pin<Box<dyn Future<Output = Result<DataInput, frontend::DataLaneError>>>>;
+/// One admin query receive, kept across turns until it yields.
+type AdminWait = Pin<Box<dyn Future<Output = Result<Option<u64>, omq_tokio::Error>>>>;
+
+/// Receives the serve loop keeps across turns until each yields, so a turn
+/// registers no new idle waker.
+#[derive(Default)]
+struct Waits {
+    inputs: [Option<InputWait>; 4],
+    admin: Option<AdminWait>,
+}
+
+impl Waits {
+    /// Start a receive on every lane without one, and follow the admin lane.
+    fn arm(&mut self, state: &State) {
+        for (input, incoming) in self.inputs.iter_mut().zip(&state.incoming) {
+            if input.is_none() {
+                *input = Some(Box::pin(incoming.ready()));
+            }
+        }
+        match &state.admin {
+            Some(lane) if self.admin.is_none() => self.admin = Some(Box::pin(lane.query())),
+            Some(_) => {}
+            None => self.admin = None,
+        }
+    }
+
+    /// Take one admin query or one input into a free deferred slot. Progress
+    /// can fill a slot, so check it at each poll, after progress, rather than
+    /// using a select guard captured before the turn.
+    fn poll_input(
+        &mut self,
+        state: &mut State,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), StartupError>> {
+        if let Some(query) = self.admin.as_mut()
+            && let Poll::Ready(query) = query.as_mut().poll(cx)
+        {
+            self.admin = None;
+            state.observe_admin(&query);
+            return Poll::Ready(Ok(()));
+        }
+        for lane in [3, 2, 1, 0] {
+            if state.pending[lane].is_none()
+                && let Some(input) = self.inputs[lane].as_mut()
+                && let Poll::Ready(input) = input.as_mut().poll(cx)
+            {
+                self.inputs[lane] = None;
+                state.pending[lane] = Some(input.map_err(failure)?);
+                return Poll::Ready(Ok(()));
+            }
+        }
+        Poll::Pending
+    }
+}
+
 async fn serve(
     shard: &ShardContext,
     state: &mut State,
@@ -258,21 +315,23 @@ async fn serve(
 ) -> Result<(), StartupError> {
     let start = state.config.time.start();
     let mut alarm = start.alarm();
+    // Waits live until they complete, so a turn re-registers no idle waker.
+    let shutdown = shard.shutdown.closed();
+    tokio::pin!(shutdown);
+    let links = binding.links.clone();
+    let mut links_changed = Box::pin(links.changed_after(links.generation()));
+    let mut waits = Waits::default();
     loop {
-        let link_generation = binding.links.generation();
         let port_generation = binding.port.generation();
-        let [data, replica, control, replica_control] =
-            std::array::from_fn(|index| state.incoming[index].ready());
-        let admin = state.admin.as_ref().map(crate::admin::ShardLane::query);
+        waits.arm(state);
         let port = binding.port.changed_after(port_generation);
-        tokio::pin!(data, replica, control, replica_control, admin, port);
-        let links = binding.links.clone();
+        tokio::pin!(port);
         if !*serving.borrow() && state.serving() {
             serving.send_replace(true);
         }
         tokio::select! {
             biased;
-            () = shard.shutdown.closed() => return Ok(()),
+            () = &mut shutdown => return Ok(()),
             result = poll_fn(|cx| {
                 let now = start.elapsed();
                 if let Poll::Ready(result) = state.poll(cx, binding, now) {
@@ -284,34 +343,15 @@ async fn serve(
                 {
                     return Poll::Ready(Ok(()));
                 }
-                if let Some(query) = admin.as_mut().as_pin_mut()
-                    && let Poll::Ready(query) = query.poll(cx)
-                {
-                    state.observe_admin(&query);
-                    return Poll::Ready(Ok(()));
-                }
-                // Progress can fill a deferred slot. Check it at each poll,
-                // after progress, rather than using select's captured guard.
-                for (lane, input) in [
-                    (3, replica_control.as_mut()),
-                    (2, control.as_mut()),
-                    (1, replica.as_mut()),
-                    (0, data.as_mut()),
-                ] {
-                    if state.pending[lane].is_none()
-                        && let Poll::Ready(input) = input.poll(cx)
-                    {
-                        state.pending[lane] = Some(input.map_err(failure)?);
-                        return Poll::Ready(Ok(()));
-                    }
-                }
-                Poll::Pending
+                waits.poll_input(state, cx)
             }) => {
                 if !shard.shutdown.is_closed() {
                     result?;
                 }
             },
-            () = links.changed_after(link_generation) => {},
+            () = &mut links_changed => {
+                links_changed = Box::pin(links.changed_after(links.generation()));
+            },
         }
     }
 }

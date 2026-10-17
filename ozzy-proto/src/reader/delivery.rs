@@ -5,7 +5,7 @@ use super::{Source, Subscription, command};
 use crate::data::{self, CodecError, DataLimits, OwnedRecords, Record, Records, capacity};
 use crate::layout::Reader;
 use crate::{ENVELOPE_BYTES, Envelope, Frames, Opcode, Packet};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 
 /// Common identity and offset fields of one contiguous reader batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,10 +140,9 @@ fn owned_records(
     first_offset: u64,
     frames: Frames<&Bytes>,
     limits: DataLimits,
-    buffer: &mut BytesMut,
 ) -> Result<(crate::append::PayloadEncoding, OwnedRecords), CodecError> {
     let (payload_encoding, payload) =
-        crate::append::decode_owned_payload(&mut c, frames.payload, buffer, limits)?;
+        crate::append::decode_owned_payload(&mut c, frames.payload, limits)?;
     let records = data::decode_records(c.rest(), &payload, first_offset, limits)?;
     Ok((
         payload_encoding,
@@ -153,14 +152,12 @@ fn owned_records(
 
 /// Decode a raw or whole-group LZ4 delivery into owned records. Raw records
 /// share `metadata` and `payload`, the frames `p` was decoded from. LZ4 records
-/// own bytes decompressed into `buffer`, whose allocation is reused once every
-/// record of earlier deliveries is released.
+/// share one allocation of decompressed bytes per delivery.
 pub fn decode_owned_records(
     p: Packet<'_>,
     metadata: &Bytes,
     payload: &Bytes,
     limits: DataLimits,
-    buffer: &mut BytesMut,
 ) -> Result<OwnedDelivery<RecordHeader>, CodecError> {
     command(p.envelope, Opcode::Records)?;
     p.envelope
@@ -171,13 +168,8 @@ pub fn decode_owned_records(
         source: Source::decode(&mut c)?,
         first_offset: c.u64()?,
     };
-    let (payload_encoding, records) = owned_records(
-        c,
-        header.first_offset,
-        Frames { metadata, payload },
-        limits,
-        buffer,
-    )?;
+    let (payload_encoding, records) =
+        owned_records(c, header.first_offset, Frames { metadata, payload }, limits)?;
     Ok(OwnedDelivery {
         header,
         payload_encoding,
@@ -214,13 +206,12 @@ pub fn decode_publication(
 }
 
 /// Decode a raw or whole-group LZ4 publication into owned records, with the
-/// frame and buffer ownership of [`decode_owned_records`].
+/// frame ownership of [`decode_owned_records`].
 pub fn decode_owned_publication(
     p: Packet<'_>,
     metadata: &Bytes,
     payload: &Bytes,
     limits: DataLimits,
-    buffer: &mut BytesMut,
 ) -> Result<OwnedDelivery<PublicationHeader>, CodecError> {
     command(p.envelope, Opcode::RecordsPub)?;
     p.envelope
@@ -231,13 +222,8 @@ pub fn decode_owned_publication(
         first_offset: c.u64()?,
     };
     publication_topic(header.source)?;
-    let (payload_encoding, records) = owned_records(
-        c,
-        header.first_offset,
-        Frames { metadata, payload },
-        limits,
-        buffer,
-    )?;
+    let (payload_encoding, records) =
+        owned_records(c, header.first_offset, Frames { metadata, payload }, limits)?;
     Ok(OwnedDelivery {
         header,
         payload_encoding,

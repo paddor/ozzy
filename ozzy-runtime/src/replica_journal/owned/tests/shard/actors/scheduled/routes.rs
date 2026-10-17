@@ -284,6 +284,7 @@ fn scenario() {
     // The sole control slot stays occupied by the older first publication.
     // A second partition then waits for capacity without blocking elections.
     for _ in 0..4 {
+        port.poll_progress(&mut cx).unwrap();
         assert!(
             publisher
                 .poll_progress(&mut cx, &shards[1], &mut port)
@@ -295,6 +296,7 @@ fn scenario() {
         let now = Duration::from_millis(1100 + tick / 10);
         step(&mut shards, &mut routes, now, Some(0));
         settle(&mut controller, &[]);
+        port.poll_progress(&mut cx).unwrap();
         assert!(
             publisher
                 .poll_progress(&mut cx, &shards[1], &mut port)
@@ -321,6 +323,7 @@ fn scenario() {
             .collect::<Vec<_>>()
     );
     for _ in 0..100 {
+        port.poll_progress(&mut cx).unwrap();
         assert!(
             publisher
                 .poll_progress(&mut cx, &shards[1], &mut port)

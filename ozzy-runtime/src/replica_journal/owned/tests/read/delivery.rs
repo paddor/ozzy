@@ -58,14 +58,9 @@ fn encode(
     let packet =
         ozzy_proto::decode_packet(&[&header, &metadata, &shared], wire_limits(8192).envelope)
             .unwrap();
-    let read = ozzy_proto::reader::decode_owned_records(
-        packet,
-        &metadata,
-        &shared,
-        wire_limits(8192),
-        &mut bytes::BytesMut::new(),
-    )
-    .unwrap();
+    let read =
+        ozzy_proto::reader::decode_owned_records(packet, &metadata, &shared, wire_limits(8192))
+            .unwrap();
     assert_eq!(read.records.len(), 2);
     for record in read.records.as_records().iter() {
         assert_eq!(record.parts.collect::<Vec<_>>(), [&[7; 2048][..]]);

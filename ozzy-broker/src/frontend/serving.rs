@@ -119,12 +119,20 @@ impl FrontendContext {
         let mut publishers = Publishers::new(self.follower_pub.as_ref(), &self.reader_pub);
         let mut tick = tokio::time::interval(serving.retry);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut retrying = false;
         loop {
             // Process lifecycle changes before dequeuing native input. Once
             // received, admit synchronously before observing another cutover.
             let control_ready = control.prepare(service)?;
             let data_ready = data.prepare(service)?;
             publishers.publish(service)?;
+            // Only an unfinished handshake needs the retry timer; idle links
+            // do not wake the dispatcher.
+            let pending = serving.brokers.keys().any(|&peer| service.retrying(peer));
+            if pending && !retrying {
+                tick.reset();
+            }
+            retrying = pending;
             tokio::select! {
                 () = self.shutdown.closed() => return Ok(()),
                 event = control.monitor.recv() => {
@@ -156,7 +164,7 @@ impl FrontendContext {
                         result.map_err(failure)?;
                     }
                 },
-                _ = tick.tick() => {
+                _ = tick.tick(), if retrying => {
                     for &peer in serving.brokers.keys() {
                         service.retry(peer).map_err(failure)?;
                     }
