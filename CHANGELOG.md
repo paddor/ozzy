@@ -2,14 +2,35 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Python SDK ready operations avoid GIL handoffs and per-call waker allocation.
+  Single-buffer sends avoid intermediate payload buffers; confirmation IDs are
+  formatted only when requested.
+- Python SDK receive record/part limits are independent of producer batching,
+  defaulting to 2,048 each so larger raw publications avoid unnecessary replay.
+
 ### Added
 
+- Python consumer statistics for live deliveries, replayed records, and gaps.
+- Python 3.12+ SDK with blocking and asyncio producers and consumers over the
+  Rust SDK, including explicit partitions, confirmations, producer resume,
+  multipart records, and consumer checkpoints.
+- Python SDK raw or adaptive LZ4 payload compression and OMQ `lz4+tcp://`
+  transport support.
+- Configurable Python SDK reader queue window, defaulting to 32 messages
+  to absorb bursts without unnecessary stream repair.
 - Optional per-broker ingress and egress byte limits under `topology.omq`.
   Rates and bursts are shared across broker sockets and OMQ I/O threads;
   exhaustion backpressures network traffic. IPC and inproc are exempt.
 - `SharedTopicWriter::send_to_partition` writes to an exact numeric partition
   through the existing admission, batching, retry, and confirmation path.
   Unknown numbers return `TopicWriterError::UnknownPartition` before admission.
+
+### Fixed
+
+- Python SDK handle destruction releases the GIL while joining native threads,
+  preventing a shutdown deadlock with asyncio wakeups.
 
 ## [0.3.0] - 2026-10-17
 

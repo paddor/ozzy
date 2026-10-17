@@ -1,12 +1,12 @@
 //! Production cluster lifecycle and storage faults shared with the simulator.
 use super::{
-    Control, Memory, Shape, deployment_with_resources, provision, start_image_selected,
-    start_images,
+    Control, IMAGE_LIMITS, Memory, Shape, deployment_with_resources, provision_sized,
+    start_image_selected, start_images_sized,
 };
 use crate::client::Client;
 use ozzy_broker::{Broker, CheckedConfig, RecoveryIntent, RecoverySelection, ServingContext};
 use ozzy_config::{BrokerIdentity, DeploymentMode};
-use ozzy_io::simulation::Image;
+use ozzy_io::simulation::{Image, ImageLimits};
 use ozzy_runtime::replicated::{SdkClock, TopicReader, WriterRuntime};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use uuid::Uuid;
@@ -28,6 +28,7 @@ pub struct Cluster {
     mode: DeploymentMode,
     context: ServingContext,
     retired_physical_events: u64,
+    memory_limits: ImageLimits,
     stopped: std::collections::BTreeMap<usize, Arc<Control>>,
     /// Number of injected torn-write faults.
     pub faults: usize,
@@ -43,6 +44,16 @@ impl Cluster {
     pub async fn configured(
         mode: DeploymentMode,
         clock: Option<SdkClock>,
+        configure: impl FnOnce(&mut ozzy_config::Deployment),
+    ) -> Self {
+        Self::configured_sized(mode, clock, IMAGE_LIMITS, configure).await
+    }
+
+    /// Configure media bounds without changing broker execution or fault controls.
+    pub async fn configured_sized(
+        mode: DeploymentMode,
+        clock: Option<SdkClock>,
+        memory_limits: ImageLimits,
         configure: impl FnOnce(&mut ozzy_config::Deployment),
     ) -> Self {
         let runtime = WriterRuntime::new().unwrap();
@@ -72,7 +83,8 @@ impl Cluster {
             },
         );
         let configs = deployment.clone();
-        let (brokers, controls, images) = start_images(context.clone(), deployment, true).await;
+        let (brokers, controls, images) =
+            start_images_sized(context.clone(), deployment, true, memory_limits).await;
         Self {
             runtime,
             configs,
@@ -82,6 +94,7 @@ impl Cluster {
             mode,
             context,
             retired_physical_events: 0,
+            memory_limits,
             stopped: std::collections::BTreeMap::new(),
             faults: 0,
         }
@@ -128,7 +141,11 @@ impl Cluster {
             checked,
             local,
             selections,
-            Memory::new(image, true),
+            Memory {
+                image,
+                limits: self.memory_limits,
+                reverse: true,
+            },
         )
         .await;
         self.brokers.insert(index, broker);
@@ -172,7 +189,7 @@ impl Cluster {
     pub async fn restart_fresh(&mut self, index: usize) {
         self.stop(index).await;
         let (checked, local) = &self.configs[index];
-        let image = Box::pin(provision(checked, local, true)).await;
+        let image = Box::pin(provision_sized(checked, local, true, self.memory_limits)).await;
         self.restore(index, image).await;
     }
 

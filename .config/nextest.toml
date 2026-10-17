@@ -59,6 +59,6 @@ threads-required = 8
 [[profile.default.overrides]]
 # Inproc cluster cases are the longest in the fast suite. Starting them first
 # keeps them out of the tail of the run.
-filter = '(package(ozzy-broker) & test(journals::serving::)) | (package(ozzy-sim) & binary(ozzy_broker_simulation))'
+filter = '(package(ozzy-broker) & test(journals::serving::)) | (package(ozzy-sim) & binary(ozzy_broker_simulation)) | package(ozzy-python)'
 test-group = 'inproc-cluster'
 priority = 50

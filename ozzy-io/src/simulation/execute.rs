@@ -3,7 +3,11 @@ use crate::{
     FileKind, Handle, HandleOwner, HandleToken, Metadata, OpenMode, Operation, Outcome, ReadBuffer,
     WriteBuffer,
 };
-use std::{collections::BTreeMap, io, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io,
+    path::Path,
+};
 
 #[derive(Debug)]
 struct Opened {
@@ -40,6 +44,7 @@ pub(super) struct Files {
     limit: usize,
     used: Vec<usize>,
     closed: bool,
+    orphans: BTreeSet<u64>,
 }
 
 impl Files {
@@ -52,6 +57,7 @@ impl Files {
             limit,
             used: vec![0; shards],
             closed: false,
+            orphans: BTreeSet::new(),
         }
     }
 
@@ -67,7 +73,7 @@ impl Files {
     }
 
     pub(super) fn clear(&mut self) {
-        self.closed |= !self.handles.is_empty();
+        self.closed |= !self.orphans.is_empty();
         self.handles.clear();
         self.locks.clear();
         self.used.fill(0);
@@ -77,13 +83,22 @@ impl Files {
         self.handles.values().map(|open| open.inode)
     }
 
+    pub(super) fn directory(&self, image: &Image, handle: &Handle) -> bool {
+        self.get(handle)
+            .is_ok_and(|open| image.directory_changed(open.inode))
+    }
+
+    pub(super) fn retain_orphans(&mut self, inodes: BTreeSet<u64>) {
+        self.orphans = inodes;
+    }
+
     pub(super) fn take_closed(&mut self) -> bool {
         std::mem::take(&mut self.closed)
     }
 
     fn remove(&mut self, key: u64) -> Option<Opened> {
         let open = self.handles.remove(&key)?;
-        self.closed = true;
+        self.closed |= self.orphans.contains(&open.inode);
         self.used[open.origin] -= 1;
         if self.locks.get(&open.inode) == Some(&key) {
             self.locks.remove(&open.inode);

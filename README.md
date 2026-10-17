@@ -10,7 +10,8 @@ broker or a three-broker cluster.
 
 Requires Linux and Rust 1.93. [Try it](GETTING_STARTED.md#try-it) in three
 commands: a broker, the admin console, and a demo writer and reader. Then
-connect applications with the [Rust SDK](ozzy/README.md).
+connect applications with the [Rust SDK](ozzy/README.md) or
+[Python SDK](bindings/python/README.md).
 
 ## Goals
 
@@ -53,6 +54,7 @@ value.
 | Crate | Responsibility |
 | --- | --- |
 | [`ozzy`](ozzy/) | Public producer and consumer SDKs |
+| [`ozzy-python`](bindings/python/) | Blocking and asyncio Python bindings to the Rust SDK |
 | [`ozzy-broker`](ozzy-broker/) | Server, provisioning, and embedded broker API |
 | [`ozzy-config`](ozzy-config/) | Deployment configuration, identities, and placement |
 | [`ozzy-runtime`](ozzy-runtime/) | Broker actors, SDK owners, OMQ sessions, and readers |

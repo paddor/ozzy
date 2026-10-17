@@ -94,6 +94,8 @@ const ALLOWED: &[(&str, &[&str])] = &[
         ],
     ),
     ("ozzy", &["omq-tokio", "ozzy-proto", "ozzy-runtime"]),
+    // Language bindings reuse the public SDK and own no transport or log core.
+    ("ozzy-python", &["ozzy"]),
     // The console core uses only the admin codec. Its terminal frontend adds
     // the OMQ client and reads the deployment config for the endpoint.
     (

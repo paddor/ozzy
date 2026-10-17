@@ -101,6 +101,47 @@ formed APPENDs still drive the usual keyless rotation.
 | `inflight_appends` | Outstanding APPENDs per partition, including partial replies |
 | `compress_payloads` | Adaptive whole-APPEND LZ4; turn off with `lz4+tcp://` or `zstd+tcp://` |
 
+## Python bindings
+
+`bindings/python` delegates log operations to `ozzy`'s `BrokerLinks`,
+`SharedTopicWriter`, and `TopicReader`. Both Python APIs share those Rust
+implementations and the existing owned SDK runtime. Python adds input conversion,
+typed values, context managers, and interpreter scheduling only.
+
+Python `ClientConfig.compression` maps `lz4` (the default) and `raw` directly
+to `SharedTopicWriterConfig.compress_payloads`. Adaptive packing, fallback,
+and decoding remain in Rust. Python wheels include OMQ LZ4 transport support;
+endpoint schemes select transport compression independently of APPEND packing.
+`reader_queue_messages` defaults to 32 and accepts 1 through 64. The Rust
+reader reservation charges its queues and retained aliases before opening.
+Producer `max_records` and `max_parts` do not limit inbound publications.
+`reader_max_records` and `reader_max_parts` independently bound receive frames,
+defaulting to 2,048 each; receive reservations use these bounds. Raw broker
+publications may combine more records than any one producer APPEND.
+
+Ready blocking sends, receives, and confirmations poll inline with a cached
+caller waker; waiting releases the GIL and remains interruptible. Their PyO3
+coroutines poll directly from asyncio and return control when pending. Lifecycle
+polls release the GIL because dropping SDK owners may join Python wakeups.
+The asyncio facade probes Rust admission, ready records, and confirmations
+directly; it creates a native coroutine only when the operation would wait.
+An admission probe that cannot proceed assigns no sequence and retains no input.
+An exclusive lease moves a mutable SDK handle out of its Python object
+until completion or cancellation, then returns it. `SyncWrapper` requires
+exclusive Rust access without a mutex, so Python garbage collection may destroy
+handles on another thread. Concurrent operations on a leased handle fail;
+immutable receipt observers may run together. SDK admission, identity, retry,
+checkpoint, and close semantics remain owned by the Rust implementation.
+Native handle destruction releases the GIL while dropping Rust state, including
+the last SDK runtime owner, so a joining thread can complete Python wakeups.
+Single-buffer inputs copy directly into Rust SDK storage, keeping small records
+inline. Receipts retain native IDs and format only requested properties. Record
+payload tuples copy bytes on access; metadata-only reads do not copy payloads
+into Python. Lifecycle futures release the GIL when dropped, including cancellation
+before their first poll, because their captured SDK owners may join threads.
+Python `Consumer.stats()` exposes the Rust reader's live deliveries, replayed
+records, and live gap transitions, including its final counters after close.
+
 ## Readers
 
 [Protocol](PROTOCOL.md) owns the reader exchange and its socket planes.

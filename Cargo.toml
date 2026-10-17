@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "bindings/python",
     "ozzy",
     "ozzy-bench",
     "ozzy-broker",

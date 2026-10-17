@@ -26,6 +26,7 @@ brokers own journals, replication, and confirmation.
 | Admin owner | Admin endpoint, status queries to shards, counter snapshots; read-only | `ozzy-broker`, `ozzy-proto` |
 | Admin console | Console state and screens without I/O; terminal frontend and admin client | `ozzy-ui` |
 | Producer and consumer SDKs | Separate role state over shared session and transport code | `ozzy`, `ozzy-runtime` |
+| Python SDK | Thin PyO3 bindings to the Rust SDK; Python values and scheduling only | `bindings/python` |
 
 ## Rules
 

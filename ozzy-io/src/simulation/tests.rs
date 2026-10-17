@@ -700,6 +700,59 @@ async fn retired_inodes_are_reclaimed_but_unlinked_open_files_stay_readable() {
 }
 
 #[tokio::test]
+async fn unlinked_open_directory_preserves_durable_children_until_its_last_handle_closes() {
+    let mut configuration = config();
+    configuration.image.nodes = 3; // root, directory, file
+    let (controller, clients) = Controller::new(configuration, Image::default()).unwrap();
+    let mut harness = Harness {
+        controller,
+        clients,
+    };
+    harness
+        .run(Operation::CreateDirectory {
+            path: "/dir".into(),
+        })
+        .await;
+    let directory = harness.directory("/dir").await;
+    let file = harness.open("/dir/file", OpenMode::CreateNew).await;
+    harness.run(write(&file, 0, b"retained")).await;
+    harness.sync(&file).await;
+    harness.sync(&directory).await;
+    let root = harness.directory("/").await;
+    harness.sync(&root).await;
+    drop(file);
+    harness
+        .run(Operation::RemoveFile {
+            path: "/dir/file".into(),
+        })
+        .await;
+    harness
+        .run(Operation::RemoveDirectory {
+            path: "/dir".into(),
+        })
+        .await;
+    harness.sync(&root).await;
+    harness.controller.jobs();
+    assert_eq!(harness.controller.image().stored_bytes(), 16);
+    let error = harness
+        .perform(
+            Operation::Open {
+                path: "/other".into(),
+                mode: OpenMode::CreateNew,
+                direct: false,
+                data_sync: false,
+            },
+            Effect::Normal,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+    drop(directory);
+    let _other = harness.open("/other", OpenMode::CreateNew).await;
+    assert_eq!(harness.controller.image().stored_bytes(), 0);
+}
+
+#[tokio::test]
 async fn trace_limit_refuses_the_next_event_without_losing_the_pending_reply() {
     let mut configuration = config();
     configuration.trace_events = 1;

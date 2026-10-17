@@ -15,6 +15,9 @@ runs:
       with:
         toolchain: ${{ inputs.toolchain }}
         components: clippy,rustfmt
+    - uses: actions/setup-python@v7
+      with:
+        python-version: '3.12'
     - uses: taiki-e/install-action@v2
       with:
         tool: cargo-nextest

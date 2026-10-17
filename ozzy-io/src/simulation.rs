@@ -280,7 +280,8 @@ impl Controller {
         // Reads, writes, and idle polls cannot change namespace reachability.
         // Dropped handles and namespace/barrier jobs can retire inode images.
         if self.files.take_closed() || self.reclaim_needed {
-            self.image.reclaim(self.files.inodes());
+            let orphans = self.image.reclaim(self.files.inodes());
+            self.files.retain_orphans(orphans);
             self.reclaim_needed = false;
         }
     }
@@ -332,13 +333,13 @@ impl Controller {
         let Pending::Queued(job) = self.pending.remove(&id).expect("queued job") else {
             unreachable!()
         };
-        self.reclaim_needed |= matches!(
-            job.operation.unprotected(),
-            Operation::Sync { .. }
-                | Operation::Rename { .. }
-                | Operation::RemoveFile { .. }
-                | Operation::RemoveDirectory { .. }
-        );
+        self.reclaim_needed |= match job.operation.unprotected() {
+            Operation::Sync { handle, .. } => self.files.directory(&self.image, handle),
+            Operation::Rename { .. }
+            | Operation::RemoveFile { .. }
+            | Operation::RemoveDirectory { .. } => true,
+            _ => false,
+        };
         let result = execute::Execution {
             files: &mut self.files,
             image: &mut self.image,

@@ -8,6 +8,8 @@ in [RELEASING.md](RELEASING.md); benchmark rules live in
 
 - Rust 1.93 or newer, edition 2024, ASCII-only source.
 - [`cargo-nextest`](https://nexte.st/).
+- CPython 3.12+ and its development library for the Python binding workspace
+  member. Select the interpreter with `PYO3_PYTHON` when needed.
 - Optional, for [verification](#verification): Kani, Java, ripgrep, and the
   TLA+ tools jar.
 
@@ -32,6 +34,12 @@ RUSTDOCFLAGS='-D warnings' cargo doc -p ozzy -p ozzy-runtime -p ozzy-proto --no-
 - `scripts/ozzy_cargo <args>` runs Cargo with the same artifact paths.
 - `ozzy-bench` is not a default member. A plain `cargo build` skips it; use
   `cargo build -p ozzy-bench` or `--workspace`.
+
+`scripts/check-python.sh` uses uv to select Python, keeps its virtual environment
+and wheels under `OZZY_ARTIFACT_ROOT`, and runs Python lint/type checks, inproc
+memory-broker tests, and installed-wheel TCP process tests in both broker modes.
+Set `OZZY_PYTHON_VERSION=3.14` to test another supported interpreter. TCP/process
+tests are opt-in through `wheel-tests` and run in the extended Nextest profile.
 
 ### Artifact paths
 
