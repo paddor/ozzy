@@ -8,6 +8,11 @@
   take no decode buffer. LZ4 records of one delivery share one fresh
   allocation of decoded bytes.
 
+### Changed
+
+- An idle broker no longer wakes its dispatcher every 10 ms. The broker
+  handshake retry timer runs only while a handshake is unfinished.
+
 ## [0.2.0] - 2026-10-16
 
 ### Breaking
