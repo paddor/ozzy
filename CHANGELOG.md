@@ -4,6 +4,9 @@
 
 ### Added
 
+- Optional per-broker ingress and egress byte limits under `topology.omq`.
+  Rates and bursts are shared across broker sockets and OMQ I/O threads;
+  exhaustion backpressures network traffic. IPC and inproc are exempt.
 - `SharedTopicWriter::send_to_partition` writes to an exact numeric partition
   through the existing admission, batching, retry, and confirmation path.
   Unknown numbers return `TopicWriterError::UnknownPartition` before admission.

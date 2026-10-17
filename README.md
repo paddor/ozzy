@@ -44,6 +44,7 @@ value.
 - Readers start at the earliest or latest record, an offset, a broker timestamp,
   or a record ID, and repair live-stream gaps on their own.
 - Optional per-topic retention by age or size, in whole segments.
+- Optional aggregate ingress and egress network byte limits per broker.
 - Optional `lz4+tcp://` and `zstd+tcp://` endpoints (Cargo features
   `lz4-transport` and `zstd-transport`).
 

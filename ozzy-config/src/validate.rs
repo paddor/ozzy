@@ -333,6 +333,18 @@ fn validate_devices(broker: &Broker, path: &str) -> Result<(), ConfigError> {
 
 fn validate_broker(broker: &Broker, path: &str) -> Result<Vec<Shard>, ConfigError> {
     validate_devices(broker, path)?;
+    for (direction, limit) in [
+        ("ingress", broker.topology.omq.ingress),
+        ("egress", broker.topology.omq.egress),
+    ] {
+        if let Some(limit) = limit {
+            require(
+                limit.bytes_per_second > 0 && limit.burst_bytes > 0,
+                &format!("{path}.topology.omq.{direction}"),
+                "network bytes_per_second and burst_bytes must be positive",
+            )?;
+        }
+    }
     require(
         (1..=256).contains(&broker.topology.omq.io_threads),
         path,

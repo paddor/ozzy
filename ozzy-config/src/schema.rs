@@ -191,18 +191,37 @@ pub struct Affinity {
     pub numa_node: Option<u32>,
 }
 
-/// OMQ worker count only. Unsupported affinity fields are rejected by parsing.
-#[derive(Debug, Clone, Deserialize)]
+/// OMQ workers and aggregate network byte limits. Affinity is unsupported.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Omq {
     /// OMQ-owned transport threads per broker.
     pub io_threads: usize,
+    /// Optional aggregate incoming network bytes, after transport framing.
+    pub ingress: Option<ByteRateLimit>,
+    /// Optional aggregate outgoing network bytes, including each fan-out copy.
+    pub egress: Option<ByteRateLimit>,
 }
 
 impl Default for Omq {
     fn default() -> Self {
-        Self { io_threads: 1 }
+        Self {
+            io_threads: 1,
+            ingress: None,
+            egress: None,
+        }
     }
+}
+
+/// Network byte allowance shared by the broker's OMQ context.
+/// Exhaustion backpressures network I/O. IPC, inproc, and SHM are exempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ByteRateLimit {
+    /// Positive sustained refill rate in transport bytes per second.
+    pub bytes_per_second: u64,
+    /// Positive shared burst allowance. The bucket starts full.
+    pub burst_bytes: u64,
 }
 
 /// Local topology. An omitted shard list becomes one shard on the sole device.

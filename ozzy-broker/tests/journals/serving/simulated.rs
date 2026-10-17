@@ -9,6 +9,7 @@ use ozzy_sim::broker::{
 mod churn;
 mod dedup;
 mod groups;
+mod network_limits;
 mod partitions;
 mod progress;
 mod resume;

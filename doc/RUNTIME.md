@@ -259,6 +259,8 @@ runs. A HELLO beyond `max_clients` is dropped, counted as
 | Key in `[brokers.NAME.topology]` | Meaning |
 | --- | --- |
 | `omq.io_threads` | OMQ I/O threads |
+| `omq.ingress.bytes_per_second`, `.burst_bytes` | Aggregate incoming network rate and burst |
+| `omq.egress.bytes_per_second`, `.burst_bytes` | Aggregate outgoing network rate and burst |
 | `dispatcher.cpu`, `dispatcher.numa_node` | Dispatcher affinity |
 | `shards[].id`, `shards[].device` | Shard ID and the device it writes to |
 | `shards[].affinity.cpu`, `shards[].affinity.numa_node` | Shard affinity |
@@ -270,6 +272,22 @@ runs. A HELLO beyond `max_clients` is dropped, counted as
 - Omitting `shards` gives one shard on the sole device. Multiple devices need
   explicit shard assignments.
 - CPU and NUMA values are OS IDs. NUMA placement needs an explicit CPU.
+
+### Network byte limits
+
+Each optional direction sets positive `bytes_per_second` and `burst_bytes`.
+Omission disables that direction. Buckets start full and refill up to the burst;
+exhaustion backpressures transport I/O. Changes take effect on broker restart.
+
+OMQ owns one allowance per broker context, shared across every socket and I/O
+thread. All network traffic on that context counts, including control, readers,
+replication, and repair. Accounting uses transport bytes after framing and
+compression; each PUB subscriber copy counts separately. TCP setup and lower
+network-layer overhead are exempt, as are IPC, inproc, and SHM.
+
+Embedded brokers sharing an injected OMQ context share its allowance. Configure
+limits before its first socket, or supply a context whose limits already match
+the broker plan. Startup rejects conflicting active contexts.
 
 ### Devices
 

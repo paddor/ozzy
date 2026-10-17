@@ -19,6 +19,7 @@ use uuid::Uuid;
 const SINGLE: &str = include_str!("fixtures/single.toml");
 
 mod broker_identity;
+mod network_limits;
 
 fn single() -> Deployment {
     Deployment::parse(SINGLE).unwrap()
@@ -68,6 +69,8 @@ fn minimal_single_broker_has_production_defaults() {
     let validated = single().validate().unwrap();
     let plan = validated.broker_plan("laptop", &host()).unwrap();
     assert_eq!(plan.omq_io_threads, 1);
+    assert_eq!(plan.omq_ingress, None);
+    assert_eq!(plan.omq_egress, None);
     assert_eq!(plan.shards.len(), 1);
     assert_eq!(plan.partitions.len(), 16);
     assert!(plan.partitions.iter().all(|part| part.shard == 0));

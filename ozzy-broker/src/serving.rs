@@ -118,6 +118,7 @@ impl Broker {
                 "ozzy/omq",
             )
         });
+        crate::frontend::configure_network(&omq, &checked.plan)?;
         let (owner, lanes) = DevicePools::start(&checked.plan)?;
         let storage = ShardStorage { lanes, owner };
         Self::start_on_storage(checked, journals, omq.into(), storage).await
