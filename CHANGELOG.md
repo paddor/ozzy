@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-17
+
 ### Breaking
 
 - `ozzy_proto::reader::decode_owned_records` and `decode_owned_publication`
