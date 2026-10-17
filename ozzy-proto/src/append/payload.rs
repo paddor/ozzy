@@ -142,9 +142,8 @@ pub(crate) fn decode_payload_encoding<'a>(
     scratch
         .try_reserve(decoded_bytes)
         .map_err(|_| CodecError::Limit)?;
-    scratch.resize(decoded_bytes, 0);
-    let actual =
-        lz4rip::block::decompress_into(encoded, scratch).map_err(|_| CodecError::Length)?;
+    let actual = lz4rip::block::decompress_append(encoded, scratch, decoded_bytes)
+        .map_err(|_| CodecError::Length)?;
     if actual != decoded_bytes {
         return Err(CodecError::Length);
     }
@@ -152,25 +151,26 @@ pub(crate) fn decode_payload_encoding<'a>(
 }
 
 /// Owned payload of a raw or whole-group LZ4 frame: the received `frame`, or
-/// its decompressed bytes split off `buffer`. Once every earlier split-off
-/// payload is released, `buffer` reuses its allocation.
+/// its bytes decompressed into a fresh allocation without zero-filling it.
 pub(crate) fn decode_owned_payload(
     cursor: &mut Reader<'_>,
     frame: &bytes::Bytes,
-    buffer: &mut bytes::BytesMut,
     limits: DataLimits,
 ) -> Result<(PayloadEncoding, bytes::Bytes), CodecError> {
     let (encoding, decoded_bytes) = read_payload_encoding(cursor, frame.len(), limits)?;
     if encoding == PayloadEncoding::Raw {
         return Ok((encoding, frame.clone()));
     }
-    buffer.clear();
-    buffer.resize(decoded_bytes, 0);
-    let actual = lz4rip::block::decompress_into(frame, buffer).map_err(|_| CodecError::Length)?;
+    let mut decoded = Vec::new();
+    decoded
+        .try_reserve_exact(decoded_bytes)
+        .map_err(|_| CodecError::Limit)?;
+    let actual = lz4rip::block::decompress_append(frame, &mut decoded, decoded_bytes)
+        .map_err(|_| CodecError::Length)?;
     if actual != decoded_bytes {
         return Err(CodecError::Length);
     }
-    Ok((encoding, buffer.split().freeze()))
+    Ok((encoding, bytes::Bytes::from(decoded)))
 }
 
 #[cfg(test)]
@@ -179,48 +179,23 @@ mod owned_payload_tests {
 
     fn decode(
         body: &[u8],
-        buffer: &mut bytes::BytesMut,
+        decoded_bytes: usize,
     ) -> Result<(PayloadEncoding, bytes::Bytes), CodecError> {
         let mut header = Vec::new();
-        encode_payload_encoding(&mut header, PayloadEncoding::Lz4, body.len())?;
+        encode_payload_encoding(&mut header, PayloadEncoding::Lz4, decoded_bytes)?;
         let frame = bytes::Bytes::from(lz4rip::block::compress(body));
-        decode_owned_payload(
-            &mut Reader::new(&header),
-            &frame,
-            buffer,
-            DataLimits::default(),
-        )
+        decode_owned_payload(&mut Reader::new(&header), &frame, DataLimits::default())
     }
 
     #[test]
-    fn released_payload_reuses_buffer_and_retained_payload_stays_intact() {
-        let mut buffer = bytes::BytesMut::new();
-        let (encoding, first) = decode(&[1; 4096], &mut buffer).unwrap();
+    fn retained_payloads_stay_intact_and_lengths_must_match() {
+        let (encoding, first) = decode(&[1; 4096], 4096).unwrap();
         assert_eq!(encoding, PayloadEncoding::Lz4);
-        let address = first.as_ptr();
-        drop(first);
-        let (_, second) = decode(&[2; 4096], &mut buffer).unwrap();
-        assert_eq!(
-            second.as_ptr(),
-            address,
-            "released allocation was not reused"
-        );
-        let (_, third) = decode(&[3; 4096], &mut buffer).unwrap();
-        assert_ne!(third.as_ptr(), second.as_ptr());
+        let (_, second) = decode(&[2; 4096], 4096).unwrap();
+        assert_ne!(first.as_ptr(), second.as_ptr());
+        assert!(first.iter().all(|&byte| byte == 1));
         assert!(second.iter().all(|&byte| byte == 2));
-        assert!(third.iter().all(|&byte| byte == 3));
-        let mut header = Vec::new();
-        encode_payload_encoding(&mut header, PayloadEncoding::Lz4, 4097).unwrap();
-        let frame = bytes::Bytes::from(lz4rip::block::compress(&[4; 4096]));
-        assert!(
-            decode_owned_payload(
-                &mut Reader::new(&header),
-                &frame,
-                &mut buffer,
-                DataLimits::default()
-            )
-            .is_err()
-        );
+        assert!(decode(&[4; 4096], 4097).is_err());
     }
 }
 

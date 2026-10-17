@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Breaking
+
+- `ozzy_proto::reader::decode_owned_records` and `decode_owned_publication`
+  take no decode buffer. LZ4 records of one delivery share one fresh
+  allocation of decoded bytes.
+
 ## [0.2.0] - 2026-10-16
 
 ### Breaking

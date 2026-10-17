@@ -143,14 +143,8 @@ fn decoded_record_alias_retains_the_original_frame_reservation() {
             limits.envelope,
         )
         .unwrap();
-        let delivery = ozzy_proto::reader::decode_owned_records(
-            packet,
-            &metadata,
-            &payload,
-            limits,
-            &mut bytes::BytesMut::new(),
-        )
-        .unwrap();
+        let delivery =
+            ozzy_proto::reader::decode_owned_records(packet, &metadata, &payload, limits).unwrap();
         let mut batch = FrameRecords::new(
             delivery.records,
             delivery.payload_encoding,

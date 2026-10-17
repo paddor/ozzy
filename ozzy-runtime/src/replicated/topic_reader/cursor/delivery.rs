@@ -68,9 +68,8 @@ impl Cursor {
         if packet.envelope.opcode == Opcode::Nack {
             return self.replay_nack(packet, limits.envelope);
         }
-        let delivery =
-            reader::decode_owned_records(packet, &frames[1], &frames[2], limits, &mut self.decode)
-                .map_err(BrokerLinkError::from)?;
+        let delivery = reader::decode_owned_records(packet, &frames[1], &frames[2], limits)
+            .map_err(BrokerLinkError::from)?;
         if delivery.header.subscription != selected.subscription
             || delivery.header.source != selected.source
         {
@@ -170,13 +169,8 @@ impl Cursor {
         {
             return Ok(());
         }
-        let Ok(delivery) = reader::decode_owned_publication(
-            packet,
-            &frames[1],
-            &frames[2],
-            limits,
-            &mut self.decode,
-        ) else {
+        let Ok(delivery) = reader::decode_owned_publication(packet, &frames[1], &frames[2], limits)
+        else {
             return Ok(());
         };
         let live = self.live.replay().is_none();

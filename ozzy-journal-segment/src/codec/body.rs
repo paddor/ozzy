@@ -41,8 +41,11 @@ pub(super) fn decode_entry_body<'a>(
 
 #[cfg(feature = "lz4")]
 pub(super) fn decode_lz4_body(input: &[u8], decoded_len: usize) -> Result<Vec<u8>, CodecError> {
-    let mut output = vec![0_u8; decoded_len];
-    let actual = lz4rip::decompress_into(input, &mut output)
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(decoded_len)
+        .map_err(|_| CodecError::DecompressionFailed("LZ4"))?;
+    let actual = lz4rip::decompress_append(input, &mut output, decoded_len)
         .map_err(|_| CodecError::DecompressionFailed("LZ4"))?;
     if actual != decoded_len {
         return Err(CodecError::DecompressionFailed("LZ4"));
