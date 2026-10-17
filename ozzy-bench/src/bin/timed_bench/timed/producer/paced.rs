@@ -6,6 +6,7 @@ use super::{
     Config, LaneRun, PendingRecord, RecordInput, Result, VecDeque, Window, Writer, error, metrics,
     turn_records,
 };
+use std::task::Poll;
 
 struct Pending {
     record: PendingRecord,
@@ -97,9 +98,7 @@ pub(super) async fn produce(
         if run.sequence.is_multiple_of(turn_records) {
             tokio::task::yield_now().await;
         }
-        schedule
-            .arrivals
-            .lower_on_backlog(&mut run.counts, run.sequence, metrics::monotonic_ns)?;
+        // The next arrival checks its backlog at the top of the loop.
     }
     while !pending.is_empty() {
         observe_front(&mut pending, run).await?;
@@ -134,8 +133,21 @@ async fn admit(
     pending: &mut VecDeque<Pending>,
     run: &mut LaneRun<'_>,
 ) -> Result<PendingRecord> {
+    // Complete ready confirmations without registering a waiter. Admission
+    // is usually immediate; only a waiting send observes confirmations.
+    if pending
+        .front()
+        .is_some_and(|first| first.record.try_confirmed().is_some())
+    {
+        observe_front(pending, run).await?;
+    }
     let send = writer.send(input);
     tokio::pin!(send);
+    if let Poll::Ready(result) =
+        std::future::poll_fn(|cx| Poll::Ready(send.as_mut().poll(cx))).await
+    {
+        return result;
+    }
     loop {
         tokio::select! {
             biased;
