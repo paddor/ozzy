@@ -96,7 +96,7 @@ impl PartitionActor {
     pub fn group(&self) -> GroupId {
         match self {
             Self::Local(actor) => actor.group(),
-            Self::Replicated(actor) => actor.status().scope.group_id,
+            Self::Replicated(actor) => actor.group(),
             Self::Recovering(actor) => actor.status().scope.group_id,
         }
     }

@@ -207,10 +207,15 @@ impl NormalReplica {
         self.journal_tail = (log.accepted != Prefix::GENESIS).then_some(log.accepted);
     }
 
+    /// Current group/configuration/view identity, without a full snapshot.
+    pub const fn scope(&self) -> Scope {
+        self.configuration.scope()
+    }
+
     /// Inspect state without obtaining mutable journal or quorum access.
     pub fn snapshot(&self) -> ReplicaSnapshot {
         ReplicaSnapshot {
-            scope: self.configuration.scope(),
+            scope: self.scope(),
             status: self.status,
             journal: self.journal.snapshot(),
             accepted: self.accepted,

@@ -298,6 +298,11 @@ impl ScheduledReplica {
         self.actor.status()
     }
 
+    /// Immutable group identity, read without copying the status.
+    pub fn group(&self) -> ozzy_proto::GroupId {
+        self.actor.driver.scope().group_id
+    }
+
     /// Current per-partition route, including proposed leader changes. This is
     /// a routing hint. Only actor validation and activation permit admission.
     pub fn authority_hint(&self) -> ozzy_proto::nack::AuthorityHint {
