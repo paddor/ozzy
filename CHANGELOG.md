@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- `SharedTopicWriter::send_to_partition` writes to an exact numeric partition
+  through the existing admission, batching, retry, and confirmation path.
+  Unknown numbers return `TopicWriterError::UnknownPartition` before admission.
+
 ## [0.3.0] - 2026-10-17
 
 ### Breaking

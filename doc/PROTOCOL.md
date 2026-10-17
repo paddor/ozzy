@@ -30,7 +30,9 @@ Ozzy frames. Transport receipt is never record confirmation.
   limits, and per-partition group, configuration epoch, incarnation, and
   policy. Topic config `partitions` sets the count (default 16).
 - Keyed routing is `XXH3-64(key, seed) % count`. Keyless placement is sticky
-  within SDK batching. Routing precedes sequencing; retries keep the partition.
+  within SDK batching. An explicit numeric partition bypasses both choices;
+  an unknown number fails locally before admission, without fallback.
+  Routing precedes sequencing; retries keep the partition across leader changes.
 - One APPEND carries one producer, epoch, and partition. Producers share
   partition offsets but keep independent sequences.
 - HELLO establishes a broker link, not partition ownership. Groups have one

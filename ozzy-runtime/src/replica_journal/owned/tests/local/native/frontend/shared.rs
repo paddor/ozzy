@@ -15,6 +15,7 @@ mod groups;
 mod metadata;
 mod multiple;
 mod opening;
+mod partitions;
 mod progress;
 mod readers;
 mod routes;

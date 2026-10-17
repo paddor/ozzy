@@ -55,6 +55,9 @@ flowchart LR
 
 - `send` waits for bounded local admission. Canceling it before admission
   assigns nothing.
+- `send_to_partition(record, number)` uses the same admission path for an
+  exact zero-based numeric partition. Unknown numbers fail before admission
+  or sequence assignment. It never hashes or falls back to another partition.
 - Dropping the pending record stops observation only. The record still goes
   out. `confirmed` resolves at the confirmation boundary.
 - `flush` captures every record admitted before the call, even before it is
@@ -71,6 +74,9 @@ flowchart LR
 
 Callers submit individual records. The SDK routes each record to a partition,
 then batches per partition. One APPEND holds one partition.
+Explicit, keyed, and keyless writes to the same partition share sequences,
+batches, and limits. Explicit sends do not select a sticky partition; their
+formed APPENDs still drive the usual keyless rotation.
 
 | Rule | Behavior |
 | --- | --- |

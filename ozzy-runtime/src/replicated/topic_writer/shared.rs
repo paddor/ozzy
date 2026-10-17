@@ -84,7 +84,7 @@ impl SharedTopicWriterConfig {
     }
 }
 
-/// Open a named topic and submit individual records with optional keys. One
+/// Open a named topic and submit records by optional key or explicit partition. One
 /// logical identity spans its partitions; epochs and sequences remain local to
 /// each partition. No partition socket or application-built batch is created.
 pub struct SharedTopicWriter {
@@ -256,6 +256,28 @@ impl SharedTopicWriter {
         key: Option<&[u8]>,
     ) -> Result<SharedTopicPendingRecord, TopicWriterError> {
         let selection = key.map_or(TopicSelection::Keyless, TopicSelection::Key);
+        self.send_selected(record, selection).await
+    }
+    /// Admit one record to an exact numeric partition, without hashing or
+    /// fallback. Unknown partitions fail before admission or sequence assignment.
+    ///
+    /// Uses the same partition-local sequences, batches, and confirmation as
+    /// [`Self::send`]. Canceling before admission assigns nothing; retries keep
+    /// this destination across leader changes. Explicit sends do not select a
+    /// sticky partition, but formed APPENDs still drive keyless rotation.
+    pub async fn send_to_partition(
+        &mut self,
+        record: RecordInput,
+        partition: u32,
+    ) -> Result<SharedTopicPendingRecord, TopicWriterError> {
+        self.send_selected(record, TopicSelection::Partition(partition))
+            .await
+    }
+    async fn send_selected(
+        &mut self,
+        record: RecordInput,
+        selection: TopicSelection<'_>,
+    ) -> Result<SharedTopicPendingRecord, TopicWriterError> {
         let (number, pending) = self.state.send(record, selection).await?;
         Ok(SharedTopicPendingRecord {
             topic: self.metadata().id(),

@@ -59,13 +59,17 @@ impl Partitions {
         })
     }
 
-    fn select(&mut self, selection: TopicSelection<'_>) -> usize {
-        match selection {
+    fn select(&mut self, selection: TopicSelection<'_>) -> Result<usize, TopicWriterError> {
+        Ok(match selection {
             TopicSelection::Key(key) => keyed_index(key, self.seed, self.entries.len()),
             TopicSelection::Keyless => self.sticky.select(self.entries.len(), |index| {
                 self.entries[index].writer.groups_formed()
             }),
-        }
+            TopicSelection::Partition(partition) => usize::try_from(partition)
+                .ok()
+                .filter(|&index| index < self.entries.len())
+                .ok_or(TopicWriterError::UnknownPartition { partition })?,
+        })
     }
 
     pub(super) async fn send(
@@ -73,7 +77,7 @@ impl Partitions {
         record: RecordInput,
         selection: TopicSelection<'_>,
     ) -> Result<(u32, PendingRecord), TopicWriterError> {
-        let index = self.select(selection);
+        let index = self.select(selection)?;
         let partition = &mut self.entries[index];
         let pending =
             partition

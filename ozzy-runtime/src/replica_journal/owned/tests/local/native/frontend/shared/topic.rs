@@ -1,5 +1,7 @@
 use super::*;
-use crate::replicated::{RecordInput, SharedTopicWriter, SharedTopicWriterConfig, WriterStats};
+use crate::replicated::{
+    RecordInput, SharedTopicWriter, SharedTopicWriterConfig, TopicWriterError, WriterStats,
+};
 use ozzy_proto::MessageId;
 
 #[tokio::test(flavor = "current_thread")]
@@ -58,10 +60,15 @@ async fn multiple() {
             .find(|key| writer.metadata().keyed_partition(key).number == number)
             .unwrap()
     };
-    let first_key = key(0);
     let second_key = key(1);
     let record = |id| RecordInput::copy_from_slice(MessageId::from_bytes([id; 16]), b"record");
-    let healthy = writer.send(record(50), Some(&second_key)).await.unwrap();
+    for partition in [2, u32::MAX] {
+        assert!(matches!(
+            writer.send_to_partition(record(49), partition).await,
+            Err(TopicWriterError::UnknownPartition { partition: rejected }) if rejected == partition
+        ));
+    }
+    let healthy = writer.send_to_partition(record(50), 1).await.unwrap();
     assert_eq!(healthy.partition(), 1);
     let healthy = harness.drive(healthy.confirmed(), true).await.unwrap();
     assert_eq!(healthy.record.offset, 0);
@@ -70,7 +77,7 @@ async fn multiple() {
     // Partition 1 publishes its durable evidence after the confirmation;
     // that write must not be the I/O held for partition 0 below.
     harness.quiesce().await;
-    let blocked = writer.send(record(51), Some(&first_key)).await.unwrap();
+    let blocked = writer.send_to_partition(record(51), 0).await.unwrap();
     assert_eq!(blocked.partition(), 0);
     for _ in 0..10000 {
         harness.pump(false);
@@ -85,7 +92,7 @@ async fn multiple() {
     assert!(blocked.try_confirmed().is_none());
     assert_eq!(writer.partition_stats(0), Some(WriterStats::default()));
     let a = writer.send(record(52), Some(&second_key)).await.unwrap();
-    let b = clone.send(record(53), Some(&second_key)).await.unwrap();
+    let b = clone.send_to_partition(record(53), 1).await.unwrap();
     assert_eq!(a.sequence(), 1);
     assert_eq!(b.sequence(), 2);
     while writer.partition_stats(1).unwrap().records < 2 {
