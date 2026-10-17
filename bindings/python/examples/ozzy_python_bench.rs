@@ -3,6 +3,7 @@
 use clap::Parser;
 use ozzy_config::DeploymentMode;
 use ozzy_sim::broker::Cluster;
+use ozzy_sim::broker::network as support;
 use serde_json::{Value, json};
 use std::{
     fs::OpenOptions,
@@ -10,8 +11,6 @@ use std::{
     path::PathBuf,
     process::{Command, Stdio},
 };
-#[path = "../tests/support/mod.rs"]
-mod support;
 
 #[derive(Debug, Parser)]
 #[command(about = "Verified Python send/confirm/read throughput over TCP and memory storage")]

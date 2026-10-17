@@ -10,8 +10,9 @@ in [RELEASING.md](RELEASING.md); benchmark rules live in
 - [`cargo-nextest`](https://nexte.st/).
 - CPython 3.12+ and its development library for the Python binding workspace
   member. Select the interpreter with `PYO3_PYTHON` when needed.
-- Optional, for [verification](#verification): Kani, Java, ripgrep, and the
+- Optional, for [verification](#verification): Kani, ripgrep, and the
   TLA+ tools jar.
+- JDK 22+ for the Java binding workspace member; Maven for packaged JAR checks.
 
 ## Local checks
 
@@ -40,6 +41,13 @@ and wheels under `OZZY_ARTIFACT_ROOT`, and runs Python lint/type checks, inproc
 memory-broker tests, and installed-wheel TCP process tests in both broker modes.
 Set `OZZY_PYTHON_VERSION=3.14` to test another supported interpreter. TCP/process
 tests are opt-in through `wheel-tests` and run in the extended Nextest profile.
+
+`scripts/check-java.sh` compiles Java with warnings as errors, generates Javadoc,
+builds native platform JARs, and runs the Java inproc matrix and packaged-JAR
+TCP/process tests. Set `OZZY_JAVA_RELEASE=1` for release native libraries.
+Cargo compiles Java test classes under its artifact directory; Nextest starts
+a JVM per case over the same real-broker memory harness. `package-tests` enables
+the separate-JVM layer in the extended profile. Test Java 22 and a newer JDK.
 
 ### Artifact paths
 

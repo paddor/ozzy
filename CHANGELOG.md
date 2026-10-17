@@ -12,6 +12,10 @@
 
 ### Added
 
+- Java 22+ producer and consumer SDK over the shared Rust SDK, with blocking
+  and cancellable CompletableFuture APIs, explicit routing, multipart buffers,
+  confirmations, identity resume/takeover, checkpoints, reader statistics, and
+  raw/LZ4 payloads and LZ4 transport.
 - Python consumer statistics for live deliveries, replayed records, and gaps.
 - Python 3.12+ SDK with blocking and asyncio producers and consumers over the
   Rust SDK, including explicit partitions, confirmations, producer resume,

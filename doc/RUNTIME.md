@@ -142,6 +142,34 @@ before their first poll, because their captured SDK owners may join threads.
 Python `Consumer.stats()` exposes the Rust reader's live deliveries, replayed
 records, and live gap transitions, including its final counters after close.
 
+## Java bindings
+
+`bindings/java` calls the same `BrokerLinks`, `SharedTopicWriter`, and
+`TopicReader` as Python. Both bindings construct checked reservations through
+`bindings/common`. JNI handles lifecycle, multipart conversion, and async setup;
+FFM polls ready single-buffer admission, reads, and confirmations directly.
+Java adds no network queues, protocol codecs, retry state, or batching worker.
+
+Java atomically leases one mutable native handle per operation. JNI moves its
+owned box into a Rust SDK future and restores it before returning the lease.
+One fixed binding executor polls waiting futures; it owns no transport state.
+Cancellation waits for lease return. If Rust already produced a result,
+cancellation loses and the future delivers it, preserving reader progress.
+Close seals admission before waiting, and canceled closes remain sealed.
+
+Native callbacks prepare values and release leases before dispatching Java
+continuations to the common pool. User callbacks never execute on SDK owner or
+binding executor threads. Pending confirmations are immutable shared observers;
+reachability fences prevent their native storage from being reclaimed during
+concurrent calls. Explicit close owns cleanup; Cleaner is a leak fallback.
+
+FFM copies single inputs directly into Rust SDK storage. Receive calls expose
+payload views only while Java holds the consumer lease; Java copies them before
+returning an immutable record. Native receive backing remains bounded to one
+cached record, and no native payload pointer escapes. UUIDs remain two integers
+until requested, and unsigned offsets/epochs retain their bits in Java longs.
+Scalar failures use caller-owned output storage, including on virtual threads.
+
 ## Readers
 
 [Protocol](PROTOCOL.md) owns the reader exchange and its socket planes.

@@ -1,8 +1,8 @@
 //! Installed wheel in a Python process talking TCP to memory-backed real brokers.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use ozzy_config::DeploymentMode;
+use ozzy_sim::broker::network as support;
 use std::process::Command;
-mod support;
 
 fn roundtrip(mode: DeploymentMode, codec: &str, transport: &str) {
     let runtime = tokio::runtime::Builder::new_multi_thread()

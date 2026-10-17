@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>io.github.paddor</groupId>
+  <artifactId>ozzy-java</artifactId>
+  <version>0.3.0</version>
+  <name>Ozzy Java SDK</name>
+  <description>Blocking and asynchronous Java clients over Ozzy's Rust SDK.</description>
+  <url>https://github.com/paddor/ozzy</url>
+  <licenses><license><name>ISC</name><url>https://opensource.org/license/isc-license-txt</url></license></licenses>
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <maven.compiler.release>22</maven.compiler.release>
+    <ozzy.buildDir>${env.OZZY_ARTIFACT_ROOT}/java</ozzy.buildDir>
+    <ozzy.native.resources>${ozzy.buildDir}/native-resources</ozzy.native.resources>
+    <ozzy.platform>linux-x86_64</ozzy.platform>
+  </properties>
+  <build>
+    <directory>${ozzy.buildDir}</directory>
+    <resources><resource><directory>${ozzy.native.resources}</directory></resource></resources>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId><artifactId>maven-compiler-plugin</artifactId><version>3.14.1</version>
+        <configuration><compilerArgs><arg>-Xlint:all</arg><arg>-Werror</arg></compilerArgs></configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId><artifactId>maven-jar-plugin</artifactId><version>3.5.1</version>
+        <configuration><archive><manifest><addDefaultImplementationEntries>true</addDefaultImplementationEntries></manifest></archive></configuration>
+        <executions>
+          <execution><id>default-jar</id><configuration><excludes><exclude>io/ozzy/native/**</exclude></excludes></configuration></execution>
+          <execution><id>native-jar</id><phase>package</phase><goals><goal>jar</goal></goals>
+            <configuration><classifier>${ozzy.platform}</classifier></configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

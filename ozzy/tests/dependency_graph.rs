@@ -95,7 +95,10 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ),
     ("ozzy", &["omq-tokio", "ozzy-proto", "ozzy-runtime"]),
     // Language bindings reuse the public SDK and own no transport or log core.
-    ("ozzy-python", &["ozzy"]),
+    ("ozzy-bindings", &["ozzy"]),
+    ("ozzy-python", &["ozzy", "ozzy-bindings"]),
+    // Java's executor polls SDK futures; all network I/O remains in the SDK.
+    ("ozzy-java", &["ozzy", "ozzy-bindings", "tokio"]),
     // The console core uses only the admin codec. Its terminal frontend adds
     // the OMQ client and reads the deployment config for the endpoint.
     (
@@ -155,7 +158,9 @@ fn executable_names_identify_ozzy_and_all_integration_tests_are_registered() {
     for package in metadata["packages"].as_array().unwrap() {
         let targets = package["targets"].as_array().unwrap();
         for target in targets {
-            if target["kind"] != serde_json::json!(["lib"]) {
+            if target["kind"] != serde_json::json!(["lib"])
+                && target["kind"] != serde_json::json!(["custom-build"])
+            {
                 let name = target["name"].as_str().unwrap();
                 let command = target["kind"] == serde_json::json!(["bin"])
                     && COMMANDS.contains(&(package["name"].as_str().unwrap(), name));

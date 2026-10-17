@@ -1,0 +1,13 @@
+[package]
+name = "ozzy-bindings"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+ozzy = { path = "../../ozzy" }
+
+[lints]
+workspace = true

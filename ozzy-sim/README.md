@@ -114,5 +114,6 @@ scripts/ozzy_cargo run -p ozzy-sim --features broker --bin ozzy_sim -- \
 
 - `src/soak.rs`: sustained runner, actions, report.
 - `src/broker.rs`, `src/broker/`: shared real-broker harness.
+- `src/broker/network.rs`: TCP broker fixtures shared by SDK package tests.
 - `src/client.rs`: SDK client and record oracle.
 - `src/bin/ozzy_sim.rs`: command line.

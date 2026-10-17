@@ -1,6 +1,7 @@
 //! Concurrent producer, broker, and verified consumer processes over TCP.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use clap::Parser;
+use ozzy_sim::broker::network as support;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -13,8 +14,6 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-#[path = "../tests/support/mod.rs"]
-mod support;
 type Error = Box<dyn std::error::Error>;
 
 #[derive(Debug, Parser)]
