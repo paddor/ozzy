@@ -15,20 +15,27 @@ final class NativeResource {
     private final AtomicBoolean busy = new AtomicBoolean();
     private volatile boolean sealed;
     private volatile NativeFuture<Void> closing;
+    private PendingHandles pending;
     final MemorySegment scratch;
 
-    NativeResource(long pointer, boolean mutable) {
-        Arena arena = mutable ? Arena.ofShared() : null;
+    NativeResource(long pointer) {
+        Arena arena = Arena.ofShared();
         try {
-            scratch = arena == null ? null : arena.allocate(128, 8);
+            scratch = arena.allocate(128, 8);
             state = new State(arena);
             cleanup = CLEANER.register(this, state);
             // Nothing that can allocate or throw follows native ownership transfer.
             state.pointer.set(pointer);
         } catch (Throwable error) {
-            if (arena != null) arena.close();
+            arena.close();
             throw error;
         }
+    }
+
+    PendingHandles observe(long pointer) {
+        if (pending == null || pending.full()) pending = new PendingHandles();
+        pending.add(pointer);
+        return pending;
     }
 
     long pointer() {
@@ -79,6 +86,7 @@ final class NativeResource {
 
     // Called only after Rust has restored the Box, while this lease is still held.
     void disposeLeased() {
+        pending = null;
         cleanup.clean();
     }
 
@@ -86,7 +94,7 @@ final class NativeResource {
         if (isClosed()) return;
         enter(true);
         try {
-            cleanup.clean();
+            disposeLeased();
         } finally {
             exit();
         }
@@ -106,7 +114,7 @@ final class NativeResource {
             try {
                 if (value != 0) Native.release(value);
             } finally {
-                if (arena != null) arena.close();
+                arena.close();
             }
         }
     }

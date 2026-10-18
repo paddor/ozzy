@@ -356,8 +356,8 @@ broker entries. Clients stay on the controller, using one monotonic clock.
 For concurrent throughput, run separate producer, broker, and consumer processes:
 
 ```sh
-scripts/ozzy_cargo build --release -p ozzy-python --example ozzy_python_pipeline
-"$CARGO_TARGET_DIR/release/examples/ozzy_python_pipeline" --python /path/to/venv/bin/python \
+scripts/ozzy_cargo build --release -p ozzy-bench --bin ozzy_sdk_pipeline
+"$CARGO_TARGET_DIR/release/ozzy_sdk_pipeline" --python /path/to/venv/bin/python \
   --broker-cpus 0,1 --producer-cpus 2,3 --consumer-cpu 4 \
   --codec lz4 --size 1024 --warmup 2 --duration 8 --repetitions 2
 ```
@@ -392,7 +392,7 @@ counts every 30 seconds, and aborts after 45 seconds without protocol progress.
 Use a 4 GiB image budget to leave room for concurrent retention cleanup:
 
 ```sh
-"$CARGO_TARGET_DIR/release/examples/ozzy_python_pipeline" --python /path/to/venv/bin/python \
+"$CARGO_TARGET_DIR/release/ozzy_sdk_pipeline" --python /path/to/venv/bin/python \
   --api asyncio --codec raw --size 1024 --reader-queue-messages 64 \
   --memory-mib 4096 --warmup 2 --duration 1200 --repetitions 1 --no-ledger
 ```
@@ -431,6 +431,41 @@ broker errors, or source changes invalidate a run. The runner polls broker
 diagnostics and stops the child when a warning or error appears.
 `--reader-queue-messages` defaults to 32. Compare it with one while keeping
 other controls fixed to measure the effect of the Python SDK's burst window.
+
+## Java SDK
+
+Build the release SDK with `OZZY_JAVA_RELEASE=1 scripts/check-java.sh`, then
+compile its standalone benchmark worker and the shared Rust process runner:
+
+```sh
+javac --release 22 -Xlint:all -Werror \
+  --class-path "$CARGO_TARGET_DIR/java/ozzy-java-0.3.0-linux-x86_64.jar" \
+  -d "$CARGO_TARGET_DIR/java/bench" bindings/java/examples/io/ozzy/bench/Pipeline.java
+scripts/ozzy_cargo build --release -p ozzy-bench --bin ozzy_sdk_pipeline
+taskset -c 5 "$CARGO_TARGET_DIR/release/ozzy_sdk_pipeline" --java /usr/bin/java \
+  --java-classpath "$CARGO_TARGET_DIR/java/ozzy-java-0.3.0-linux-x86_64.jar:$CARGO_TARGET_DIR/java/bench" \
+  --java-library "$CARGO_TARGET_DIR/release/libozzy_java.so" \
+  --broker-cpus 0,1 --producer-cpus 2,3 --consumer-cpu 4 \
+  --codec raw --size 1024 --memory-mib 4096 --reader-queue-messages 64 \
+  --warmup 5 --duration 8 --repetitions 2
+```
+
+The runner shares the Python process protocol, memory broker, four-partition
+payload corpus, bounded credit, and full-byte verification. Every Java producer
+and consumer runs in its own JVM and CPU set; native SDK threads inherit that
+placement. Java uses a 512 MiB heap and Serial GC on each client core. SDK hashes,
+JVM version, process CPU time, and memory are recorded in
+`~/.cache/ozzy/java-sdk.jsonl`. `--api async` measures CompletableFuture calls.
+`--confirmation each` also materializes every receipt. These runs measure SDK
+and memory-broker throughput, without SSD writes.
+Memory storage charges both dirty and durable copies. Its byte limit must
+cover the active phases plus retention headroom; saturation can delay cleanup.
+
+Profile separately with `--profile /absolute/path/prefix --repetitions 1`.
+This saves JFR files per JVM and omits the timing ledger. Add
+`--java-agent /path/to/libasyncProfiler.so` for CPU stacks in collapsed text
+instead of JFR; profiler diagnostics have separate logs. Keep the explicit
+native library path so profilers can resolve Rust symbols after loading.
 
 ## Other tools
 

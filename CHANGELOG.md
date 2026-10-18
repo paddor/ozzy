@@ -4,6 +4,8 @@
 
 ### Changed
 
+- Java pending records share bounded native cleanup groups, reducing per-record
+  allocation and reference-processing costs while preserving independent observers.
 - Python SDK ready operations avoid GIL handoffs and per-call waker allocation.
   Single-buffer sends avoid intermediate payload buffers; confirmation IDs are
   formatted only when requested.

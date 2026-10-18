@@ -13,7 +13,7 @@ public final class Consumer implements AutoCloseable, Iterable<Record> {
     private volatile Checkpoint finalCheckpoint;
 
     Consumer(long pointer) {
-        resource = new NativeResource(pointer, true);
+        resource = new NativeResource(pointer);
     }
 
     /** Blocking iteration until closed. Break explicitly when application work is complete. */
@@ -46,8 +46,8 @@ public final class Consumer implements AutoCloseable, Iterable<Record> {
     }
 
     /**
-     * Await one record. Canceling pending work returns its native lease before cancel completes.
-     * If native delivery already completed, cancellation returns false and its result remains
+     * Await one record. Canceling pending work returns its native lease before cancel completes. If
+     * native delivery already completed, cancellation returns false and its result remains
      * available.
      */
     public CompletableFuture<Record> nextAsync() {

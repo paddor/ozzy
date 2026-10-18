@@ -376,12 +376,22 @@ public final class Scenarios {
     private static void lifetimes(Client client) {
         Record record;
         PendingRecord pending;
+        var retained = new ArrayList<PendingRecord>();
         try (Producer p = producer(client);
                 Consumer c = consumer(client)) {
             pending = send(p, body(19), SendOptions.partition(1));
             confirm(pending);
             record = next(c);
+            // Cross multiple cleanup groups, retaining sparse observations and the
+            // final partially filled group. Unobserved admissions still flush.
+            for (int i = 0; i < 257; i++) {
+                PendingRecord item = send(p, body(i), SendOptions.partition(i % 4));
+                if (i % 128 == 0) retained.add(item);
+            }
+            flush(p);
         }
+        System.gc();
+        for (PendingRecord item : retained) check(confirm(item).sequence() == item.sequence());
         Receipt receipt = confirm(pending);
         check(
                 record.offset() == receipt.offset()

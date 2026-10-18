@@ -17,6 +17,10 @@ allocation-counting = []
 comparisons = ["dep:iggy", "dep:rdkafka", "dep:tracing-subscriber"]
 
 [[bin]]
+name = "ozzy_sdk_pipeline"
+path = "src/bin/ozzy_sdk_pipeline.rs"
+
+[[bin]]
 name = "ozzy_timed_bench"
 path = "src/bin/ozzy_timed_bench.rs"
 
@@ -74,6 +78,7 @@ ozzy-journal-segment = { workspace = true, features = ["lz4"] }
 ozzy-proto.workspace = true
 ozzy-replication.workspace = true
 ozzy-runtime.workspace = true
+ozzy-telemetry.workspace = true
 ozzy-sim = { workspace = true, features = ["broker"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["process", "io-util"] }

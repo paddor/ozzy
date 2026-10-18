@@ -72,7 +72,12 @@ final class Native {
     static native byte[] identity(long handle);
 
     static Object wrap(
-            int kind, long handle, long[] metadata, byte[][] payload, ClientConfig config) {
+            int kind,
+            long handle,
+            long[] metadata,
+            byte[][] payload,
+            ClientConfig config,
+            NativeResource owner) {
         try {
             return switch (kind) {
                 case 0 -> null;
@@ -81,7 +86,12 @@ final class Native {
                 case 3 -> new Consumer(handle);
                 case 4 ->
                         new PendingRecord(
-                                handle, metadata[0], metadata[1], (int) metadata[2], metadata[3]);
+                                owner,
+                                handle,
+                                metadata[0],
+                                metadata[1],
+                                (int) metadata[2],
+                                metadata[3]);
                 case 5 -> new Receipt(metadata);
                 case 6 -> new Record(metadata, payload);
                 default -> throw new OzzyException("invalid native result");
@@ -96,7 +106,6 @@ final class Native {
         if (value instanceof Client c) c.resource.discard();
         else if (value instanceof Producer p) p.resource.discard();
         else if (value instanceof Consumer c) c.resource.discard();
-        else if (value instanceof PendingRecord p) p.resource.discard();
     }
 
     private Native() {}

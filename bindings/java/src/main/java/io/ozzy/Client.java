@@ -13,7 +13,7 @@ public final class Client implements AutoCloseable {
 
     Client(long pointer, ClientConfig config) {
         this.config = config;
-        resource = new NativeResource(pointer, true);
+        resource = new NativeResource(pointer);
     }
 
     /** Open shared connections, reserving the configured finite roles and bounds. */

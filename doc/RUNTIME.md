@@ -161,7 +161,14 @@ Native callbacks prepare values and release leases before dispatching Java
 continuations to the common pool. User callbacks never execute on SDK owner or
 binding executor threads. Pending confirmations are immutable shared observers;
 reachability fences prevent their native storage from being reclaimed during
-concurrent calls. Explicit close owns cleanup; Cleaner is a leak fallback.
+concurrent calls. Explicit close cleans mutable handles; Cleaner is their leak
+fallback.
+Immutable pending handles share one Cleaner registration per group of at most
+64 admissions. The producer's existing lease serializes group construction;
+each observer keeps its group reachable during native calls. Group cleanup
+owns each handle exactly once. One retained observer can retain up to 64 native
+observation handles, never their payloads. Closing the producer drops its
+current group reference without invalidating surviving observers.
 
 FFM copies single inputs directly into Rust SDK storage. Receive calls expose
 payload views only while Java holds the consumer lease; Java copies them before

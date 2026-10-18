@@ -55,6 +55,7 @@ final class Fast {
             long pointer = owner.scratch.getAtIndex(JAVA_LONG, 4);
             try {
                 return new PendingRecord(
+                        owner,
                         pointer,
                         owner.scratch.getAtIndex(JAVA_LONG, 0),
                         owner.scratch.getAtIndex(JAVA_LONG, 1),

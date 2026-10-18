@@ -144,3 +144,9 @@ inproc and memory storage, then tests packaged JARs in separate JVMs over TCP
 and LZ4 TCP, including module-path loading, abrupt producer exit, and native
 extraction cleanup. The shared harness remains the
 real broker; these tests do not establish physical-disk or power-loss safety.
+
+## Benchmarks
+
+The [SDK process benchmark](../../ozzy-bench/README.md#java-sdk) runs independent
+producer JVMs, the real broker, and a consumer JVM on separate CPU sets. It
+verifies payloads and offsets, bounds backlog, and records CPU and memory.

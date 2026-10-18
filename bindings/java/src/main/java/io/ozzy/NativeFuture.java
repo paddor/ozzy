@@ -86,7 +86,7 @@ final class NativeFuture<T> extends CompletableFuture<T> {
         try {
             if (diagnostic != null) error = new OzzyException(diagnostic);
             else {
-                value = Native.wrap(kind, pointer, metadata, payload, config);
+                value = Native.wrap(kind, pointer, metadata, payload, config, owner);
                 if (close) {
                     if (consumer != null) consumer.captureClosed(owner.pointer());
                     owner.disposeLeased();

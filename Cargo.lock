@@ -2217,6 +2217,7 @@ dependencies = [
  "ozzy-replication",
  "ozzy-runtime",
  "ozzy-sim",
+ "ozzy-telemetry",
  "plotters",
  "rdkafka",
  "regex",

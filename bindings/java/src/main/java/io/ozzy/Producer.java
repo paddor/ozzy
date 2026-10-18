@@ -12,7 +12,7 @@ public final class Producer implements AutoCloseable {
 
     Producer(long pointer, ClientConfig config) {
         this.config = config;
-        resource = new NativeResource(pointer, true);
+        resource = new NativeResource(pointer);
     }
 
     /** Opaque 32-byte resume identity. Persist once, then resume after the old process stops. */

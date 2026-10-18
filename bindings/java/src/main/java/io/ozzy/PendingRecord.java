@@ -12,14 +12,22 @@ import java.util.concurrent.CompletableFuture;
 public final class PendingRecord {
     private final long topicHi, topicLo, sequence;
     private final int partition;
-    final NativeResource resource;
+    private final long pointer;
+    private final PendingHandles lifetime;
 
-    PendingRecord(long pointer, long topicHi, long topicLo, int partition, long sequence) {
+    PendingRecord(
+            NativeResource owner,
+            long pointer,
+            long topicHi,
+            long topicLo,
+            int partition,
+            long sequence) {
         this.topicHi = topicHi;
         this.topicLo = topicLo;
         this.partition = partition;
         this.sequence = sequence;
-        resource = new NativeResource(pointer, false);
+        this.pointer = pointer;
+        lifetime = owner.observe(pointer);
     }
 
     /** Topic UUID, constructed only when requested. */
@@ -42,9 +50,9 @@ public final class PendingRecord {
      */
     public Optional<Receipt> tryConfirmed() {
         try {
-            return Optional.ofNullable(Fast.confirmed(resource.pointer()));
+            return Optional.ofNullable(Fast.confirmed(pointer));
         } finally {
-            Reference.reachabilityFence(resource);
+            Reference.reachabilityFence(lifetime);
         }
     }
 
@@ -63,9 +71,9 @@ public final class PendingRecord {
     private CompletableFuture<Receipt> waiting() {
         var future = new NativeFuture<Receipt>(null, null, false, null);
         try {
-            future.start(resource.pointer(), 6, null, null, null, null, null, null);
+            future.start(pointer, 6, null, null, null, null, null, null);
         } finally {
-            Reference.reachabilityFence(resource);
+            Reference.reachabilityFence(lifetime);
         }
         return future;
     }
