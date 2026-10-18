@@ -50,6 +50,11 @@ impl Lease {
             let _ = Box::into_raw(handle);
         }
     }
+    /// Restore without notifying Java, which reports this start failure itself.
+    fn abandon(&mut self) {
+        self.released = true;
+        self.restore();
+    }
     fn release(&mut self) {
         if self.released {
             return;
@@ -67,8 +72,8 @@ impl Drop for Lease {
     }
 }
 
-pub(crate) fn start(mut lease: Lease, request: Request) -> Result<i64, String> {
-    let executor = EXECUTOR
+fn executor() -> Result<&'static Runtime, String> {
+    EXECUTOR
         .get_or_init(|| {
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(1)
@@ -78,7 +83,25 @@ pub(crate) fn start(mut lease: Lease, request: Request) -> Result<i64, String> {
                 .map_err(|e| e.to_string())
         })
         .as_ref()
-        .map_err(Clone::clone)?;
+        .map_err(Clone::clone)
+}
+
+/// Run work that may join threads off the shared binding executor's worker.
+pub(crate) fn blocking<F>(work: F) -> Result<tokio::task::JoinHandle<()>, String>
+where
+    F: FnOnce() + Send + 'static,
+{
+    Ok(executor()?.spawn_blocking(work))
+}
+
+pub(crate) fn start(mut lease: Lease, request: Request) -> Result<i64, String> {
+    let executor = match executor() {
+        Ok(executor) => executor,
+        Err(error) => {
+            lease.abandon();
+            return Err(error);
+        }
+    };
     let mut work = Box::pin(async move {
         let result = AssertUnwindSafe(crate::state::run(&mut lease.handle, request))
             .catch_unwind()

@@ -39,6 +39,13 @@ async def cancelled(task):
 
 async def main():
     async with Client(config) as client:
+        # Opens share the client's links, so they may run concurrently.
+        opened = await asyncio.gather(
+            client.consumer("orders", partitions=[2]),
+            client.consumer("orders", partitions=[3]),
+        )
+        for consumer in opened:
+            await consumer.close()
         async with await client.producer("orders") as producer:
             # Cancellation of confirmation stops only its observation.
             hold_writes(True)
@@ -80,6 +87,26 @@ async def main():
                 "orders", checkpoint=saved, partitions=[1]
             ) as consumer:
                 assert (await consumer.next()).parts == (b"after cancel",)
+
+            # Concurrent observers each resolve once their own record confirms.
+            hold_writes(True)
+            pending = [await producer.send(bytes([n]), partition=3) for n in range(64)]
+            await until(lambda: held_writes() > 0)
+            waiting = [asyncio.ensure_future(p.confirmed()) for p in pending]
+            # A waiting flush does not hold the producer, so sends continue.
+            flushing = asyncio.create_task(producer.flush())
+            await asyncio.sleep(0)
+            late = await producer.send(b"during flush", partition=3)
+            assert not flushing.done() and not any(task.done() for task in waiting)
+            hold_writes(False)
+            receipts = await asyncio.gather(*waiting)
+            assert [r.sequence for r in receipts] == list(range(64))
+            await flushing
+            assert (await late.confirmed()).sequence == 64
+            # Native awaitables follow the coroutine protocol.
+            native = producer._native.aflush()
+            assert asyncio.iscoroutine(native)
+            await asyncio.create_task(native)
 
             # Bound intake under held storage. Cancel the first blocked send,
             # then verify every admitted record and its contiguous sequence.

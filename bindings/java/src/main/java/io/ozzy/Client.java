@@ -37,12 +37,7 @@ public final class Client implements AutoCloseable {
             ids[2 * i] = b.nodeId().getMostSignificantBits();
             ids[2 * i + 1] = b.nodeId().getLeastSignificantBits();
         }
-        try {
-            future.install(Native.open(future, endpoints, ids, config.settings()));
-        } catch (Throwable error) {
-            future.released();
-            future.completeExceptionally(error);
-        }
+        future.open(endpoints, ids, config.settings());
         return future;
     }
 
@@ -72,17 +67,7 @@ public final class Client implements AutoCloseable {
             throw new IllegalArgumentException("identity must be 32 bytes");
         if (takeover && identity == null)
             throw new IllegalArgumentException("takeover requires identity");
-        resource.enter();
-        return NativeFuture.leased(
-                resource,
-                1,
-                topic,
-                new long[] {takeover ? 1 : 0},
-                null,
-                null,
-                null,
-                identity,
-                config);
+        return open(1, topic, new long[] {takeover ? 1 : 0}, identity);
     }
 
     /** Read earliest retained history from all partitions. */
@@ -104,9 +89,20 @@ public final class Client implements AutoCloseable {
     public CompletableFuture<Consumer> consumerAsync(String topic, ReaderOptions options) {
         Objects.requireNonNull(topic);
         Objects.requireNonNull(options);
-        long[] settings = options.settings();
-        resource.enter();
-        return NativeFuture.leased(resource, 2, topic, settings, null, null, null, null, config);
+        return open(2, topic, options.settings(), null);
+    }
+
+    // An open clones the client's shared links during the native call, so the
+    // client's lease ends on return and other opens may run concurrently.
+    private <T> CompletableFuture<T> open(int op, String topic, long[] options, byte[] identity) {
+        long pointer = resource.enter();
+        try {
+            var future = new NativeFuture<T>(null, config, false, null);
+            future.start(pointer, op, topic, options, null, null, null, identity);
+            return future;
+        } finally {
+            resource.exit();
+        }
     }
 
     /** Shut down shared links and native runtime; idempotent. */

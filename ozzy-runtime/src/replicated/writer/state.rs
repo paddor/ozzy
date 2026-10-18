@@ -462,9 +462,9 @@ impl Driver {
         self.stage(end.min(self.ready_next));
         let progress = &self.shared.progress;
         let records = &mut self.admission.records;
-        let bytes = progress.confirm(first, end, self.ready_next, |count| {
-            records
-                .drain(..count)
+        let (count, bytes) = progress.confirm(first, end, self.ready_next, |count| {
+            let bytes = records
+                .range(..count)
                 .map(|record| {
                     record.completion.publish(
                         outcomes.first_offset.get() + (record.sequence - first),
@@ -472,8 +472,14 @@ impl Driver {
                     );
                     record.body.len()
                 })
-                .sum()
+                .sum();
+            (count, bytes)
         })?;
+        // Wake claimed observers only after the prefix covering them is public.
+        super::completion::published();
+        for record in records.drain(..count) {
+            record.completion.wake_watched();
+        }
         self.last_outcome = Some(last);
         if outcomes.disposition == AppendDisposition::Stored {
             self.last_stored_offset = Some(last.offset.get());

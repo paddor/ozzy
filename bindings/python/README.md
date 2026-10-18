@@ -83,8 +83,12 @@ Receipt fields include the partition-global `offset`, `message_id`, producer
 identity/epoch/sequence, `disposition` (`stored` or `duplicate`), and `policy`
 (`local_durable` or `quorum_durable`). All exposed UUIDs are strings.
 
-`flush()` waits for the current admitted prefix. `close()` seals the producer
-and drains admitted records. Save `producer.identity` (32 bytes) once to resume
+`flush()` waits for the current admitted prefix without holding the producer,
+so other threads or tasks may keep sending. `close()` seals the producer and
+drains admitted records. Blocking `send`, `flush`, `confirmed`, and `next`
+accept `timeout=` in seconds and raise `TimeoutError` on expiry. A timed-out
+send admits nothing; a timed-out flush or confirmation leaves its records in
+flight; a timed-out receive consumes nothing. Save `producer.identity` (32 bytes) once to resume
 with `client.producer(topic, identity=saved)` after the previous process has
 stopped. `takeover=True` explicitly fences that producer. A failed takeover may
 already have fenced some partitions. The SDK has no durable outbox.
@@ -99,13 +103,13 @@ does not establish exactly-once application processing.
 Consumers merge partitions, preserving order within each partition. The Rust
 reader repairs live-stream gaps. `start="earliest"` is the default;
 `start="latest"` selects confirmed ends. `partitions=[0, 2]` filters numeric
-partitions. `next()` waits indefinitely; consumers also support iteration.
-Subscriptions, including latest-end selection, resolve lazily when polled.
-Records retain bounded Rust receive-frame capacity until dropped. Release them
-as you process them; keep `record.parts` copies when retaining bytes for later.
+partitions. `next()` waits indefinitely unless given `timeout=`; consumers also
+support iteration. Subscriptions, including latest-end selection, resolve lazily
+when polled. Each record copies its payload into Python bytes on delivery, so
+retained records never hold Rust receive frames.
 `reader_queue_messages=32` in `ClientConfig` sets the default OMQ reader queue
 window. Values from 1 through 64 trade burst capacity for reserved memory;
-the Rust SDK includes queued and retained frames in its byte reservation.
+the Rust SDK includes queued frames in its byte reservation.
 
 `Checkpoint(topic_id, positions)` contains the first undelivered offset for
 each selected partition. Persist `dataclasses.asdict(checkpoint)` as JSON and
@@ -134,15 +138,18 @@ async def main(config: ClientConfig) -> None:
 
 `await Client.connect(config)` also opens a client. Async methods use the same
 Rust futures as blocking methods. Ready operations complete inline; pending
-operations yield to asyncio. Lifecycle polls and blocking waits release the GIL.
+operations yield to asyncio. SDK threads never take the GIL to wake a task: each
+event loop gets one native notifier that resumes all woken tasks per loop pass.
+Lifecycle polls and blocking waits release the GIL.
 Cancelling `next()` preserves reader delivery state; it does not consume a
 future record in a background Python worker. Cancelling a send before admission
 assigns no sequence. An admitted record remains active independently of its
 observer. An interrupted close leaves the handle sealed.
 
 Handles can move between Python threads; blocking waits release the GIL. One
-producer send or consumer receive may be active per handle; overlapping operations
-are rejected (`BusyError` for a leased async handle). Pending confirmations
+producer send or consumer receive may be active per handle; an overlapping
+operation from any thread or task raises `BusyError`. Threads and tasks may
+open producers and consumers on one client at the same time. Pending confirmations
 support simultaneous observers. Cancel and
 await an outstanding operation before closing its handle. Create new clients
 after fork. Close producers and consumers before closing their client; client

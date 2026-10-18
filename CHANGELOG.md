@@ -4,6 +4,23 @@
 
 ### Changed
 
+- Rust SDK `confirmed()` waits wake only for their own record, so many
+  concurrent observers no longer wake each other on every confirmation.
+- Python SDK asyncio wakeups never take the GIL on SDK or transport threads;
+  one notifier per event loop resumes woken tasks, so concurrent confirmation
+  waits scale linearly.
+- Python SDK records copy payloads on delivery; retained records no longer hold
+  Rust receive frames. Bytearray and memoryview inputs are copied once.
+- Python SDK blocking calls lease their handle while waiting, so an overlapping
+  call from another thread raises `BusyError`. Per-call fork checks no longer
+  issue a system call.
+- Python `flush` and Java `flushAsync` no longer hold the producer while
+  waiting; sends may continue.
+- Python and Java clients open producers and consumers concurrently from
+  several threads or tasks instead of rejecting overlapping opens.
+- Java multipart sends use the FFM fast path, and results ready during the
+  call complete without a common-pool handoff. Blocking waits complete their
+  own futures, and pending handles release in one native call per group.
 - Java pending records share bounded native cleanup groups, reducing per-record
   allocation and reference-processing costs while preserving independent observers.
 - Python SDK ready operations avoid GIL handoffs and per-call waker allocation.
@@ -14,6 +31,9 @@
 
 ### Added
 
+- Python SDK blocking `send`, `flush`, `confirmed`, and `next` accept a
+  `timeout` in seconds and raise `TimeoutError`; nothing is admitted or
+  consumed by a timeout.
 - Java 22+ producer and consumer SDK over the shared Rust SDK, with blocking
   and cancellable CompletableFuture APIs, explicit routing, multipart buffers,
   confirmations, identity resume/takeover, checkpoints, reader statistics, and
@@ -37,6 +57,11 @@
 
 - Python SDK handle destruction releases the GIL while joining native threads,
   preventing a shutdown deadlock with asyncio wakeups.
+- Java SDK futures complete exceptionally instead of waiting forever when a
+  native result cannot be delivered.
+- Java `orTimeout` and `completeOnTimeout` no longer block the JVM-wide timer
+  thread while a canceled native operation returns its lease. Client close no
+  longer joins threads on the shared binding executor.
 
 ## [0.3.0] - 2026-10-17
 

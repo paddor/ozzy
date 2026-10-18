@@ -60,6 +60,9 @@ flowchart LR
   or sequence assignment. It never hashes or falls back to another partition.
 - Dropping the pending record stops observation only. The record still goes
   out. `confirmed` resolves at the confirmation boundary.
+- A waiting `confirmed` wakes only when its own record confirms or the writer
+  fails. Simultaneous observers of one record share the per-confirmation
+  broadcast that `flush` uses.
 - `flush` captures every record admitted before the call, even before it is
   first polled.
 - `close` seals admission and confirms the captured prefix. Canceling `close`
@@ -120,25 +123,35 @@ defaulting to 2,048 each; receive reservations use these bounds. Raw broker
 publications may combine more records than any one producer APPEND.
 
 Ready blocking sends, receives, and confirmations poll inline with a cached
-caller waker; waiting releases the GIL and remains interruptible. Their PyO3
-coroutines poll directly from asyncio and return control when pending. Lifecycle
-polls release the GIL because dropping SDK owners may join Python wakeups.
+caller waker; waiting releases the GIL, remains interruptible, and accepts a
+timeout that cancels the SDK future. Native awaitables poll SDK futures from
+asyncio and implement the coroutine protocol. Their wakers never take the GIL:
+a woken task queues itself and signals one socket per event loop, whose reader
+resolves every queued asyncio future in one pass. SDK and transport threads
+therefore never wait for Python. Lifecycle awaitables poll and drop with the
+GIL released because dropping SDK owners joins threads.
 The asyncio facade probes Rust admission, ready records, and confirmations
-directly; it creates a native coroutine only when the operation would wait.
+directly; it creates a native awaitable only when the operation would wait.
 An admission probe that cannot proceed assigns no sequence and retains no input.
-An exclusive lease moves a mutable SDK handle out of its Python object
-until completion or cancellation, then returns it. `SyncWrapper` requires
-exclusive Rust access without a mutex, so Python garbage collection may destroy
-handles on another thread. Concurrent operations on a leased handle fail;
-immutable receipt observers may run together. SDK admission, identity, retry,
-checkpoint, and close semantics remain owned by the Rust implementation.
-Native handle destruction releases the GIL while dropping Rust state, including
-the last SDK runtime owner, so a joining thread can complete Python wakeups.
-Single-buffer inputs copy directly into Rust SDK storage, keeping small records
-inline. Receipts retain native IDs and format only requested properties. Record
-payload tuples copy bytes on access; metadata-only reads do not copy payloads
-into Python. Lifecycle futures release the GIL when dropped, including cancellation
-before their first poll, because their captured SDK owners may join threads.
+An exclusive lease moves a mutable SDK handle out of its Python object for any
+operation that may wait, blocking or asyncio, then returns it on completion,
+timeout, or cancellation. Other operations borrow the handle only for Rust
+work that runs no Python code, so a lease dropped by garbage collection always
+finds its owner unborrowed. `SyncWrapper` requires exclusive Rust access
+without a mutex. Concurrent operations on a leased handle raise `BusyError`;
+immutable receipt observers may run together. A flush captures its prefix,
+then waits without a lease. Producer and consumer opens clone the client's
+shared links and wait without its lease, so threads and tasks may open handles
+concurrently; connect and close lease the client. SDK admission, identity, retry, checkpoint, and
+close semantics remain owned by the Rust implementation.
+Native handle destruction releases the GIL while dropping Rust state.
+Owners record the process's fork generation, advanced by
+`os.register_at_fork`; a child rejects and never drops inherited owners.
+`bytes` inputs copy directly into Rust SDK storage, keeping small records
+inline; other buffers are copied once and their storage moves into admission.
+Receipts retain native IDs and format only requested properties. Records copy
+payload parts into Python bytes on delivery, so retained records hold no
+receive frame.
 Python `Consumer.stats()` exposes the Rust reader's live deliveries, replayed
 records, and live gap transitions, including its final counters after close.
 
@@ -152,25 +165,36 @@ Java adds no network queues, protocol codecs, retry state, or batching worker.
 
 Java atomically leases one mutable native handle per operation. JNI moves its
 owned box into a Rust SDK future and restores it before returning the lease.
+A flush captures its prefix during the call and waits without the lease.
+Producer and consumer opens clone the client's shared links during the call,
+so concurrent opens on one client proceed.
 One fixed binding executor polls waiting futures; it owns no transport state.
-Cancellation waits for lease return. If Rust already produced a result,
-cancellation loses and the future delivers it, preserving reader progress.
-Close seals admission before waiting, and canceled closes remain sealed.
+Client close joins SDK and transport threads on a blocking thread, never on
+that executor. Cancellation waits for lease return. If Rust already produced a
+result, cancellation loses and the future delivers it, preserving reader
+progress. Timeouts cancel on the common pool, so a lease wait never stalls a
+shared timer thread. Close seals admission before waiting, and canceled closes
+remain sealed.
 
-Native callbacks prepare values and release leases before dispatching Java
-continuations to the common pool. User callbacks never execute on SDK owner or
-binding executor threads. Pending confirmations are immutable shared observers;
-reachability fences prevent their native storage from being reclaimed during
-concurrent calls. Explicit close cleans mutable handles; Cleaner is their leak
-fallback.
-Immutable pending handles share one Cleaner registration per group of at most
-64 admissions. The producer's existing lease serializes group construction;
+Native callbacks prepare values and release leases before completing Java
+futures. A result produced during the starting call completes inline, before
+any continuation exists; a blocking waiter completes its own future; other
+completions run on the common pool. User callbacks never execute on SDK owner
+or binding executor threads. A native operation that ends without a result,
+such as a failed delivery, completes exceptionally. Pending confirmations are
+immutable shared observers; reachability fences prevent their native storage
+from being reclaimed during concurrent calls. Explicit close cleans mutable
+handles; Cleaner is their leak fallback.
+Each pending handle is one strong count of the Rust observer. Handles share one
+Cleaner registration per group of at most 64 admissions, released in one
+native call. The producer's existing lease serializes group construction;
 each observer keeps its group reachable during native calls. Group cleanup
 owns each handle exactly once. One retained observer can retain up to 64 native
 observation handles, never their payloads. Closing the producer drops its
 current group reference without invalidating surviving observers.
 
-FFM copies single inputs directly into Rust SDK storage. Receive calls expose
+FFM copies single inputs directly into Rust SDK storage; multipart inputs pack
+into one Java array copied once into native storage. Receive calls expose
 payload views only while Java holds the consumer lease; Java copies them before
 returning an immutable record. Native receive backing remains bounded to one
 cached record, and no native payload pointer escapes. UUIDs remain two integers

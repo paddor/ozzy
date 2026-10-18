@@ -1,5 +1,6 @@
 use crate::{
-    execution::{Lease, Owner, Slot, drive, ready, wait},
+    awaitable::Awaitable,
+    execution::{Lease, Owner, Slot, borrow, ready, timeout, wait},
     sdk_error,
     values::{Checkpoint, Record},
 };
@@ -58,39 +59,57 @@ impl Consumer {
 
 #[pymethods]
 impl Consumer {
-    fn next(&mut self, py: Python<'_>) -> PyResult<Record> {
-        ready(py, self.slot().get_mut()?.next())?
-            .map(Record::from)
-            .map_err(sdk_error)
+    #[pyo3(signature = (timeout=None))]
+    fn next(slf: Py<Self>, py: Python<'_>, timeout: Option<f64>) -> PyResult<Record> {
+        let timeout = self::timeout(timeout)?;
+        let buffered = {
+            let mut this = borrow(slf.bind(py))?;
+            this.slot().get_mut()?.try_next().map_err(sdk_error)?
+        };
+        let record = if let Some(record) = buffered {
+            record
+        } else {
+            let mut lease = Lease::take(slf)?;
+            ready(py, lease.get_mut()?.next(), timeout)?.map_err(sdk_error)?
+        };
+        Record::new(py, record)
     }
-    async fn anext(slf: Py<Self>) -> PyResult<Record> {
-        let mut lease = Lease::take(slf)?;
-        lease
-            .get_mut()?
-            .next()
-            .await
-            .map(Record::from)
-            .map_err(sdk_error)
+    fn anext(slf: Py<Self>) -> Awaitable {
+        Awaitable::hot(async move {
+            let record = {
+                let mut lease = Lease::take(slf)?;
+                lease.get_mut()?.next().await.map_err(sdk_error)?
+            };
+            Python::attach(|py| Py::new(py, Record::new(py, record)?).map(Py::into_any))
+        })
     }
-    fn try_next(&mut self) -> PyResult<Option<Record>> {
-        self.slot()
-            .get_mut()?
-            .try_next()
-            .map(|record| record.map(Record::from))
-            .map_err(sdk_error)
+    fn try_next(slf: &Bound<'_, Self>) -> PyResult<Option<Record>> {
+        let record = {
+            let mut this = borrow(slf)?;
+            this.slot().get_mut()?.try_next().map_err(sdk_error)?
+        };
+        record
+            .map(|record| Record::new(slf.py(), record))
+            .transpose()
     }
-    fn checkpoint(&mut self) -> PyResult<Checkpoint> {
-        Ok(Checkpoint(self.slot().get()?.checkpoint()))
+    fn checkpoint(slf: &Bound<'_, Self>) -> PyResult<Checkpoint> {
+        let mut this = borrow(slf)?;
+        Ok(Checkpoint(this.slot().get()?.checkpoint()))
     }
-    fn stats(&mut self) -> PyResult<(u64, u64, u64)> {
-        let stats = self.slot().get()?.stats();
+    fn stats(slf: &Bound<'_, Self>) -> PyResult<(u64, u64, u64)> {
+        let mut this = borrow(slf)?;
+        let stats = this.slot().get()?.stats();
         Ok((stats.live_records, stats.replayed_records, stats.live_gaps))
     }
-    fn close(&mut self, py: Python<'_>) -> PyResult<()> {
-        wait(py, self.slot().get_mut()?.close())?.map_err(sdk_error)
-    }
-    async fn aclose(slf: Py<Self>) -> PyResult<()> {
+    fn close(slf: Py<Self>, py: Python<'_>) -> PyResult<()> {
         let mut lease = Lease::take(slf)?;
-        drive(lease.get_mut()?.close()).await?.map_err(sdk_error)
+        wait(py, lease.get_mut()?.close(), None)?.map_err(sdk_error)
+    }
+    fn aclose(slf: Py<Self>) -> Awaitable {
+        Awaitable::lifecycle(async move {
+            let mut lease = Lease::take(slf)?;
+            lease.get_mut()?.close().await.map_err(sdk_error)?;
+            Ok(crate::awaitable::none())
+        })
     }
 }

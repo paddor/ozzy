@@ -9,7 +9,15 @@ import weakref
 from collections.abc import Callable
 from uuid import UUID, uuid4
 
-from ozzy import BrokerAddress, Checkpoint, Client, ClientConfig, ClosedError, OzzyError
+from ozzy import (
+    BrokerAddress,
+    BusyError,
+    Checkpoint,
+    Client,
+    ClientConfig,
+    ClosedError,
+    OzzyError,
+)
 
 BROKERS: list[tuple[str, str, str]] = globals()["BROKERS"]
 POLICY: str = globals()["POLICY"]
@@ -53,6 +61,19 @@ for changes in [
     )
 
 with Client(config) as client:
+    # Threads may open handles at once; opens share the client's links.
+    opened = []
+    openers = [
+        threading.Thread(target=lambda: opened.append(client.consumer("orders")))
+        for _ in range(2)
+    ]
+    for opener in openers:
+        opener.start()
+    for opener in openers:
+        opener.join(timeout=5)
+    assert len(opened) == 2 and not any(opener.is_alive() for opener in openers)
+    for consumer in opened:
+        consumer.close()
     with client.producer("orders") as producer:
         assert producer.partition_count == 4
         identity = producer.identity
@@ -146,6 +167,28 @@ with Client(config) as client:
     raises(OzzyError, consumer.next)
     with client.consumer("orders", checkpoint=saved) as consumer:
         assert consumer.try_next() is None
+    with client.consumer("orders", checkpoint=saved) as idle:
+        # A timeout consumes nothing; invalid timeouts are rejected.
+        raises(TimeoutError, lambda: idle.next(timeout=0.01))
+        raises(ValueError, lambda: idle.next(timeout=-1))
+        # A blocked receive leases its handle; other threads see BusyError.
+        received = []
+        reader = threading.Thread(target=lambda: received.append(idle.next(timeout=5)))
+        reader.start()
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                idle.checkpoint()
+            except BusyError:
+                break
+            assert time.monotonic() < deadline
+            time.sleep(0)
+        raises(BusyError, lambda: idle.next(timeout=0))
+        raises(BusyError, idle.close)
+        with client.producer("orders") as writer:
+            writer.send(b"wake", partition=3)
+        reader.join(timeout=5)
+        assert not reader.is_alive() and received[0].parts == (b"wake",)
     with client.consumer("orders", partitions=[2]) as consumer:
         assert next(consumer).partition == 2
     raises(OzzyError, lambda: client.consumer("orders", partitions=[99]))
@@ -153,6 +196,22 @@ with Client(config) as client:
     raises(ValueError, lambda: client.consumer("orders", start="invalid"))
     wrong_topic = Checkpoint(str(uuid4()), saved.positions)
     raises(OzzyError, lambda: client.consumer("orders", checkpoint=wrong_topic))
+
+    # Blocking waits time out without withdrawing admitted records, and a
+    # waiting flush does not hold the producer.
+    hold_writes(True)
+    with client.producer("orders") as producer:
+        held = producer.send(b"held", partition=1)
+        raises(TimeoutError, lambda: held.confirmed(timeout=0.01))
+        raises(TimeoutError, lambda: producer.flush(timeout=0.01))
+        raises(ValueError, lambda: producer.flush(timeout=float("nan")))
+        flusher = threading.Thread(target=producer.flush)
+        flusher.start()
+        during = producer.send(b"during flush", partition=1)
+        hold_writes(False)
+        flusher.join(timeout=5)
+        assert not flusher.is_alive()
+        assert during.confirmed(timeout=5).policy == held.confirmed().policy == POLICY
 
     # A separate Python thread releases the held disk while confirmed() blocks.
     # It must acquire the GIL for the blocking API to make progress.

@@ -1,12 +1,13 @@
 use crate::{
+    awaitable::Awaitable,
     config::Config,
     consumer::Consumer,
-    execution::{Lease, Owner, Slot, drive, opened, wait},
+    execution::{Lease, Owner, Slot, borrow, opened, wait},
     producer::Producer,
     sdk_error,
     values::Checkpoint,
 };
-use ozzy::{BrokerLinks, WriterRuntime};
+use ozzy::{BrokerLinks, SharedTopicWriterConfig, WriterRuntime};
 use pyo3::prelude::*;
 
 #[derive(Debug)]
@@ -45,38 +46,18 @@ impl State {
         self.runtime = None;
         Ok(())
     }
-    async fn producer(
-        &mut self,
-        topic: String,
-        identity: Option<Vec<u8>>,
-        takeover: bool,
-    ) -> PyResult<Producer> {
-        Producer::open(
-            opened(&mut self.links)?,
-            topic,
-            self.config.writer.clone(),
-            identity,
-            takeover,
-        )
-        .await
-    }
-    async fn consumer(
-        &mut self,
-        topic: String,
-        start: String,
-        checkpoint: Option<Checkpoint>,
-        partitions: Option<Vec<u32>>,
-    ) -> PyResult<Consumer> {
-        Consumer::open(
-            opened(&mut self.links)?.clone(),
-            topic,
-            start,
-            checkpoint,
-            partitions,
-        )
-        .await
-    }
 }
+
+/// Clone the shared links for an open, so other threads and tasks may open
+/// handles meanwhile. Connect and close still lease the client.
+fn shared(client: &Bound<'_, Client>) -> PyResult<(BrokerLinks, SharedTopicWriterConfig)> {
+    let mut this = borrow(client)?;
+    let state = this.0.get_mut()?;
+    let links = opened(&mut state.links)?.clone();
+    Ok((links, state.config.writer.clone()))
+}
+
+type Options = (String, Option<Checkpoint>, Option<Vec<u32>>);
 
 #[pyclass(module = "ozzy._native")]
 #[derive(Debug)]
@@ -99,67 +80,65 @@ impl Client {
             closed: false,
         })))
     }
-    fn connect(&mut self, py: Python<'_>) -> PyResult<()> {
-        wait(py, self.0.get_mut()?.connect())?
-    }
-    async fn aconnect(slf: Py<Self>) -> PyResult<()> {
+    fn connect(slf: Py<Self>, py: Python<'_>) -> PyResult<()> {
         let mut lease = Lease::take(slf)?;
-        drive(lease.get_mut()?.connect()).await?
+        wait(py, lease.get_mut()?.connect(), None)?
+    }
+    fn aconnect(slf: Py<Self>) -> Awaitable {
+        Awaitable::lifecycle(async move {
+            let mut lease = Lease::take(slf)?;
+            lease.get_mut()?.connect().await?;
+            Ok(crate::awaitable::none())
+        })
     }
     #[pyo3(signature = (topic, identity=None, takeover=false))]
     fn producer(
-        &mut self,
-        py: Python<'_>,
+        slf: &Bound<'_, Self>,
         topic: String,
         identity: Option<Vec<u8>>,
         takeover: bool,
     ) -> PyResult<Producer> {
-        wait(py, self.0.get_mut()?.producer(topic, identity, takeover))?
+        let (links, writer) = shared(slf)?;
+        let open = async move { Producer::open(&links, topic, writer, identity, takeover).await };
+        wait(slf.py(), open, None)?
     }
     #[pyo3(signature = (topic, identity=None, takeover=false))]
-    async fn aproducer(
+    fn aproducer(
         slf: Py<Self>,
         topic: String,
         identity: Option<Vec<u8>>,
         takeover: bool,
-    ) -> PyResult<Producer> {
-        let mut lease = Lease::take(slf)?;
-        drive(lease.get_mut()?.producer(topic, identity, takeover)).await?
+    ) -> Awaitable {
+        Awaitable::lifecycle(async move {
+            let (links, writer) = Python::attach(|py| shared(slf.bind(py)))?;
+            let producer = Producer::open(&links, topic, writer, identity, takeover).await?;
+            Python::attach(|py| Py::new(py, producer).map(Py::into_any))
+        })
     }
-    fn consumer(
-        &mut self,
-        py: Python<'_>,
-        topic: String,
-        options: (String, Option<Checkpoint>, Option<Vec<u32>>),
-    ) -> PyResult<Consumer> {
+    fn consumer(slf: &Bound<'_, Self>, topic: String, options: Options) -> PyResult<Consumer> {
         let (start, checkpoint, partitions) = options;
-        wait(
-            py,
-            self.0
-                .get_mut()?
-                .consumer(topic, start, checkpoint, partitions),
-        )?
+        let (links, _) = shared(slf)?;
+        let open = Consumer::open(links, topic, start, checkpoint, partitions);
+        wait(slf.py(), open, None)?
     }
-    async fn aconsumer(
-        slf: Py<Self>,
-        topic: String,
-        options: (String, Option<Checkpoint>, Option<Vec<u32>>),
-    ) -> PyResult<Consumer> {
+    fn aconsumer(slf: Py<Self>, topic: String, options: Options) -> Awaitable {
         let (start, checkpoint, partitions) = options;
-        let mut lease = Lease::take(slf)?;
-        drive(
-            lease
-                .get_mut()?
-                .consumer(topic, start, checkpoint, partitions),
-        )
-        .await?
+        Awaitable::lifecycle(async move {
+            let (links, _) = Python::attach(|py| shared(slf.bind(py)))?;
+            let consumer = Consumer::open(links, topic, start, checkpoint, partitions).await?;
+            Python::attach(|py| Py::new(py, consumer).map(Py::into_any))
+        })
     }
-    fn close(&mut self, py: Python<'_>) -> PyResult<()> {
-        wait(py, self.0.get_mut()?.close())?
-    }
-    async fn aclose(slf: Py<Self>) -> PyResult<()> {
+    fn close(slf: Py<Self>, py: Python<'_>) -> PyResult<()> {
         let mut lease = Lease::take(slf)?;
-        drive(lease.get_mut()?.close()).await?
+        wait(py, lease.get_mut()?.close(), None)?
+    }
+    fn aclose(slf: Py<Self>) -> Awaitable {
+        Awaitable::lifecycle(async move {
+            let mut lease = Lease::take(slf)?;
+            lease.get_mut()?.close().await?;
+            Ok(crate::awaitable::none())
+        })
     }
 }
 

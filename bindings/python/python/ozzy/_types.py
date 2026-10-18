@@ -112,14 +112,18 @@ class Checkpoint:
         return _native.Checkpoint(UUID(self.topic_id).bytes, self.positions)
 
 
-def parts(payload: Payload, config: ClientConfig) -> bytes | tuple[bytes, ...]:
+def parts(payload: Payload, config: ClientConfig) -> Payload:
+    """Validate shape and size. Rust copies each buffer once during send."""
     if isinstance(payload, bytes):
         if config.max_parts < 1 or len(payload) > config.max_record_bytes:
             raise ValueError("payload exceeds client limits")
         return payload
-    if isinstance(payload, (bytes, bytearray, memoryview)):
-        values: Sequence[bytes | bytearray | memoryview] = (payload,)
+    values: Sequence[Buffer]
+    if isinstance(payload, (bytearray, memoryview)):
+        single = True
+        values = (payload,)
     elif isinstance(payload, Sequence) and not isinstance(payload, str):
+        single = False
         values = cast(Sequence[Buffer], payload)
     else:
         raise TypeError("payload must be bytes or a sequence of byte parts")
@@ -132,7 +136,7 @@ def parts(payload: Payload, config: ClientConfig) -> bytes | tuple[bytes, ...]:
         size += value.nbytes if isinstance(value, memoryview) else len(value)
     if size > config.max_record_bytes:
         raise ValueError("payload exceeds max_record_bytes")
-    return tuple(bytes(value) for value in values)
+    return payload if single else tuple(values)
 
 
 def message_id(value: MessageId | None) -> bytes | None:

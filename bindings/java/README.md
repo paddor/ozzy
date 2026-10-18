@@ -78,7 +78,8 @@ Admission does not prove durability. `PendingRecord.confirmed()` waits;
 `tryConfirmed()` returns an Optional. Receipts carry partition-global offsets,
 producer identity/epoch/sequence, disposition, and durability policy.
 Keep several records in flight before confirming. `flush()` confirms the
-admitted prefix; producer close seals and drains it. Single-broker durable
+admitted prefix without holding the producer, so sends may continue while it
+waits; producer close seals and drains it. Single-broker durable
 mode has no failover; disk quorum requires two of three eligible copies.
 
 Save `producer.identity()` once and resume with
@@ -91,9 +92,12 @@ offsets; it does not establish exactly-once application processing.
 
 `Client.connectAsync`, `producerAsync`, `consumerAsync`, `sendAsync`,
 `confirmedAsync`, `flushAsync`, `nextAsync`, and `closeAsync` return
-`CompletableFuture`. Ready sends/reads avoid native task setup. Waiting futures
-are polled by one native binding executor, with no Java worker per operation.
-Blocking waits also park virtual threads.
+`CompletableFuture`. Ready sends (single or multipart), reads, and
+confirmations avoid native task setup, and other ready results complete before
+the call returns. Waiting futures are polled by one native binding executor,
+with no Java worker per operation. Blocking waits park Java and virtual threads
+and complete the future themselves. `orTimeout` and `completeOnTimeout` cancel
+on the common pool, never on a shared timer thread.
 
 ```java
 var receipt = producer.sendAsync(new byte[]{42}, SendOptions.partition(0))
@@ -109,7 +113,8 @@ An interrupted blocking wait cancels pending work and preserves interrupt
 status; an already completed native result wins the race.
 
 Mutable handles allow one active operation; overlapping calls raise
-`BusyException`. Pending confirmations support simultaneous observers. Close
+`BusyException`. Producer and consumer opens on one client may run
+concurrently. Pending confirmations support simultaneous observers. Close
 is idempotent, canceled closes remain sealed, and Cleaner is only a fallback.
 Close child handles before the client. SDK failures raise `OzzyException`;
 closed handles raise `ClosedException`; invalid arguments are rejected locally

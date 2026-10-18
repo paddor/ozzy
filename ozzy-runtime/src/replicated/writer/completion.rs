@@ -1,12 +1,20 @@
 //! Exact receipt data published by the writer's confirmed prefix. The owner
 //! stores offsets before releasing that prefix; observers acquire it first.
+//! One observer per record may claim a targeted waker, so publishing a prefix
+//! wakes only its own observers instead of every waiting record.
 
 #[cfg(all(test, ozzy_loom))]
-use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use loom::future::AtomicWaker;
+#[cfg(all(test, ozzy_loom))]
+use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 use ozzy_proto::{MessageId, append::AppendDisposition};
 use std::sync::Arc;
 #[cfg(not(all(test, ozzy_loom)))]
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
+use std::task::Waker;
+
+#[cfg(not(all(test, ozzy_loom)))]
+use futures::task::AtomicWaker;
 
 /// One record's receipt cell. No payload or admission state. The allocating
 /// caller stores the identity before sharing the receipt; only the driver
@@ -16,6 +24,9 @@ struct Cell {
     message_id: [AtomicU64; 2],
     offset: AtomicU64,
     duplicate: AtomicBool,
+    /// Set while one observer owns `waker`; other observers use the broadcast.
+    watched: AtomicBool,
+    waker: AtomicWaker,
 }
 
 const PAGE_RECORDS: usize = 16;
@@ -29,13 +40,48 @@ impl Page {
             message_id: [AtomicU64::new(0), AtomicU64::new(0)],
             offset: AtomicU64::new(0),
             duplicate: AtomicBool::new(false),
+            watched: AtomicBool::new(false),
+            waker: AtomicWaker::new(),
         }))
     }
 }
 
 // The existing per-record metadata reservation covers even a page whose last
 // retained receipt is its only live slot. Pages retain neither payload nor I/O.
+#[cfg(not(all(test, ozzy_loom)))]
 const _: () = assert!(size_of::<Page>() + 2 * size_of::<usize>() <= 1024);
+
+/// Order the driver's confirmed-prefix store before its `watched` loads. Pairs
+/// with the fence in [`Completion::watch`]: either the driver sees the claim
+/// and wakes, or the observer sees the prefix after claiming.
+pub(super) fn published() {
+    fence(Ordering::SeqCst);
+}
+
+/// Exclusive targeted wakeup for one observer of one record.
+#[derive(Debug)]
+pub(super) struct Watch<'a>(&'a Cell);
+
+impl Watch<'_> {
+    /// Register before checking the confirmed prefix.
+    pub(super) fn register(&self, waker: &Waker) {
+        #[cfg(all(test, ozzy_loom))]
+        self.0.waker.register_by_ref(waker);
+        #[cfg(not(all(test, ozzy_loom)))]
+        self.0.waker.register(waker);
+    }
+}
+
+impl Drop for Watch<'_> {
+    fn drop(&mut self) {
+        // Release the caller's waker before another observer may claim.
+        #[cfg(all(test, ozzy_loom))]
+        drop(self.0.waker.take_waker());
+        #[cfg(not(all(test, ozzy_loom)))]
+        drop(self.0.waker.take());
+        self.0.watched.store(false, Ordering::Release);
+    }
+}
 
 /// Immutable identity and one receipt cell, shared by intake and pending receipt.
 #[derive(Debug, Clone)]
@@ -63,6 +109,25 @@ impl Completion {
             matches!(disposition, AppendDisposition::Duplicate),
             Ordering::Relaxed,
         );
+    }
+
+    /// Claim this record's targeted waker, or `None` while another observer
+    /// holds it. Check the confirmed prefix after claiming.
+    pub(super) fn watch(&self) -> Option<Watch<'_>> {
+        let cell = self.cell();
+        if cell.watched.swap(true, Ordering::Acquire) {
+            return None;
+        }
+        fence(Ordering::SeqCst);
+        Some(Watch(cell))
+    }
+
+    /// Wake a claimed observer. Call after [`published`] follows the prefix store.
+    pub(super) fn wake_watched(&self) {
+        let cell = self.cell();
+        if cell.watched.load(Ordering::Relaxed) {
+            cell.waker.wake();
+        }
     }
 
     /// The caller must first acquire a confirmed prefix covering this record.

@@ -202,8 +202,17 @@ impl PendingRecord {
     }
 
     /// Wait for the exact configured policy. No per-record task is spawned.
+    /// One observer per record is woken only by its own confirmation;
+    /// simultaneous observers of the same record share the broadcast.
     pub async fn confirmed(&self) -> Result<RecordReceipt, WriterError> {
-        self.progress.wait(self.sequence() + 1).await?;
+        let target = self.sequence() + 1;
+        match self.progress.observe(target) {
+            Some(result) => result?,
+            None => match self.completion.watch() {
+                Some(watch) => self.progress.wait_watched(target, &watch).await?,
+                None => self.progress.wait(target).await?,
+            },
+        }
         Ok(self.receipt())
     }
 

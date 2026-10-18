@@ -3,7 +3,8 @@ package io.ozzy;
 import java.lang.ref.Cleaner;
 
 // Immutable observers share cleanup, not progress or a mutable SDK lease. Each producer
-// appends under its existing exclusive lease. A retained observer pins at most 64 handles.
+// appends under its existing exclusive lease. A retained observer pins at most 64 handles,
+// each one shared native observer count. One native call releases a whole group.
 final class PendingHandles {
     private static final Cleaner CLEANER = Cleaner.create();
     private final State state = new State();
@@ -29,8 +30,7 @@ final class PendingHandles {
 
         @Override
         public void run() {
-            int count = size;
-            for (int i = 0; i < count; i++) Native.release(pointers[i]);
+            Fast.releasePending(pointers, size);
         }
     }
 }

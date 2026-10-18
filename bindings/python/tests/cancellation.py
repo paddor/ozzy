@@ -177,31 +177,20 @@ async def next_timeout(client):
 
 
 async def retained_backing(client):
+    # Records own copied bytes, so retaining them never holds receive frames.
     async with await client.producer("orders") as producer:
         for number in range(96):
             pending = await producer.send(bytes([number]) * 4096, partition=0)
             await pending.confirmed()
     async with await client.consumer("orders", partitions=[0]) as consumer:
         retained = []
-        copied = []
         for _ in range(96):
-            task = asyncio.create_task(consumer.next())
-            done, _ = await asyncio.wait([task], timeout=0.1)
-            if not done:
-                await cancel(task)
-                break
-            retained.append(task.result())
-            copied.append(retained[-1].parts)
-        else:
-            raise AssertionError("retained frames did not apply pressure")
-        assert retained
-        consumed = len(retained)
-        assert consumer.checkpoint().positions == ((0, consumed),)
-        retained.clear()
-        for number in range(consumed, 96):
-            assert (await consumer.next()).parts == (bytes([number]) * 4096,)
-        assert copied == [(bytes([number]) * 4096,) for number in range(consumed)]
+            async with asyncio.timeout(5):
+                retained.append(await consumer.next())
         assert consumer.checkpoint().positions == ((0, 96),)
+        assert [record.parts for record in retained] == [
+            (bytes([number]) * 4096,) for number in range(96)
+        ]
 
 
 async def admission_pressure(client):

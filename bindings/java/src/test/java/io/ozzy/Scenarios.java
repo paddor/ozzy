@@ -60,6 +60,7 @@ public final class Scenarios {
                                         case "cancel_race" -> cancelRace(client);
                                         case "completion_race" -> completionRace(client);
                                         case "close_cancel" -> closeCancel(client);
+                                        case "concurrency" -> concurrency(client);
                                         default -> throw new AssertionError(name);
                                     }
                                 } finally {
@@ -508,6 +509,50 @@ public final class Scenarios {
             flush(p);
             Receipt receipt = confirm(send(p, new byte[] {1}, SendOptions.partition(0)));
             check(receipt.sequence() == accepted && receipt.offset() == accepted);
+        } finally {
+            Harness.holdWrites(false);
+        }
+    }
+
+    private static void concurrency(Client client) {
+        var latest = new ReaderOptions(ReaderOptions.Start.LATEST, null, List.of(3));
+        try (Producer p = producer(client);
+                Consumer c = consumer(client, latest)) {
+            // Ready work completes during the call, without a native task.
+            check(p.flushAsync().isDone());
+            var parts = List.of(ByteBuffer.wrap(new byte[] {1}), ByteBuffer.allocate(0));
+            check(p.sendAsync(parts, SendOptions.partition(1)).isDone());
+            Harness.holdWrites(true);
+            var pending = new ArrayList<PendingRecord>();
+            for (int i = 0; i < 64; i++) pending.add(send(p, body(i), SendOptions.partition(2)));
+            until(() -> Harness.heldWrites() > 0);
+            var waiting = new ArrayList<CompletableFuture<Receipt>>();
+            for (PendingRecord item : pending) waiting.add(item.confirmedAsync());
+            // A waiting flush does not lease the producer.
+            CompletableFuture<Void> flushing = p.flushAsync();
+            PendingRecord during = await(p.sendAsync(body(64), SendOptions.partition(2)));
+            check(!flushing.isDone() && waiting.stream().noneMatch(CompletableFuture::isDone));
+            Harness.holdWrites(false);
+            for (int i = 0; i < waiting.size(); i++) check(await(waiting.get(i)).sequence() == i);
+            await(flushing);
+            check(confirm(during).sequence() == 64);
+            // Timeouts cancel off the shared timer thread and return the receive lease.
+            try {
+                c.nextAsync().orTimeout(10, TimeUnit.MILLISECONDS).join();
+                throw new AssertionError("receive did not time out");
+            } catch (java.util.concurrent.CompletionException expected) {
+                check(expected.getCause() instanceof java.util.concurrent.TimeoutException);
+            }
+            check(c.tryNext().isEmpty());
+            check(c.nextAsync().completeOnTimeout(null, 10, TimeUnit.MILLISECONDS).join() == null);
+            check(c.tryNext().isEmpty());
+            // Opens clone the client's links, so they may run concurrently.
+            CompletableFuture<Consumer> first = client.consumerAsync("orders", latest);
+            CompletableFuture<Consumer> second = client.consumerAsync("orders", latest);
+            try (Consumer a = await(first);
+                    Consumer b = await(second)) {
+                check(a != b && a.tryNext().isEmpty() && b.tryNext().isEmpty());
+            }
         } finally {
             Harness.holdWrites(false);
         }

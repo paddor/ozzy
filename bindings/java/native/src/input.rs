@@ -1,4 +1,4 @@
-use crate::{state::Request, state::text};
+use crate::state::{Open, Request, text};
 use jni::{
     JNIEnv,
     objects::{JByteArray, JLongArray, JObjectArray, JString},
@@ -83,12 +83,15 @@ pub(crate) struct Inputs<'a> {
     pub(crate) id: JLongArray<'a>,
     pub(crate) identity: JByteArray<'a>,
 }
+/// `open` carries the client's shared links for producer and consumer opens.
 pub(crate) fn request(
     env: &mut JNIEnv<'_>,
     op: i32,
     input: &Inputs<'_>,
+    open: Option<Open>,
 ) -> Result<Request, String> {
     let opts = longs(env, &input.options)?;
+    let open = || open.ok_or("not a client");
     match op {
         1 => {
             let identity = if input.identity.is_null() {
@@ -106,6 +109,7 @@ pub(crate) fn request(
                 return Err("takeover requires identity".into());
             }
             Ok(Request::Producer(
+                open()?,
                 env.get_string(&input.topic).map_err(text)?.into(),
                 identity,
                 takeover,
@@ -114,13 +118,13 @@ pub(crate) fn request(
         2 => {
             let (start, partitions) = reader(&opts)?;
             Ok(Request::Consumer(
+                open()?,
                 env.get_string(&input.topic).map_err(text)?.into(),
                 start,
                 partitions,
             ))
         }
         3 => send(env, input, &opts),
-        4 => Ok(Request::Flush),
         5 => Ok(Request::Next),
         7 => Ok(Request::Close),
         _ => Err("unknown operation".into()),

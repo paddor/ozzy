@@ -97,19 +97,16 @@ class Values(unittest.TestCase):
                 parts(payload, self.config)
 
     def test_byte_shapes(self):
+        # Buffers pass through unchanged; Rust copies each once during send.
         for value in (b"", b"\x00\xff", bytearray(b"abc"), memoryview(b"abc")[::2]):
-            result = parts(value, self.config)
-            self.assertEqual(
-                (result,) if isinstance(result, bytes) else result, (bytes(value),)
-            )
+            self.assertIs(parts(value, self.config), value)
         source = bytearray(b"abcd")
-        result = parts((source, memoryview(source)), self.config)
-        source[:] = b"zzzz"
-        self.assertEqual(result, (b"abcd", b"abcd"))
+        result = parts([source, memoryview(source)], self.config)
+        self.assertEqual(tuple(map(bytes, result)), (b"abcd", b"abcd"))
 
     def test_typed_views_count_bytes(self):
         small = dataclasses.replace(self.config, max_record_bytes=4)
-        self.assertEqual(parts(memoryview(b"1234").cast("I"), small), (b"1234",))
+        self.assertEqual(bytes(parts(memoryview(b"1234").cast("I"), small)), b"1234")
         with self.assertRaises(ValueError):
             parts(memoryview(b"12345678").cast("I"), small)
 

@@ -169,8 +169,8 @@ macro_rules! matrix {
     ($mode:expr) => {
         mod blocking_raw { use super::*; cases!($mode, "raw", false; roundtrip, payloads, routing, checkpoints, identities, validation, lifetimes, mixed); }
         mod blocking_lz4 { use super::*; cases!($mode, "lz4", false; roundtrip, payloads, routing, checkpoints, identities, validation, lifetimes, mixed); }
-        mod async_raw { use super::*; cases!($mode, "raw", true; roundtrip, payloads, routing, checkpoints, identities, validation, lifetimes, mixed, cancellation, pressure, observers, callbacks, cancel_race, completion_race, close_cancel); }
-        mod async_lz4 { use super::*; cases!($mode, "lz4", true; roundtrip, payloads, routing, checkpoints, identities, validation, lifetimes, mixed, cancellation, pressure, observers, callbacks, cancel_race, completion_race, close_cancel); }
+        mod async_raw { use super::*; cases!($mode, "raw", true; roundtrip, payloads, routing, checkpoints, identities, validation, lifetimes, mixed, cancellation, pressure, observers, callbacks, cancel_race, completion_race, close_cancel, concurrency); }
+        mod async_lz4 { use super::*; cases!($mode, "lz4", true; roundtrip, payloads, routing, checkpoints, identities, validation, lifetimes, mixed, cancellation, pressure, observers, callbacks, cancel_race, completion_race, close_cancel, concurrency); }
     };
 }
 mod single {

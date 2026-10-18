@@ -84,6 +84,8 @@ class Producer:
         route = destination(key, partition)
         pending = self._native.try_send(body, identity, route)
         if pending is None:
+            # TODO: Under backpressure the probe copies the payload into a
+            # record and asend copies it again. Hand the probe's record over.
             pending = await self._native.asend(body, identity, route)
         return PendingRecord(pending)
 

@@ -204,3 +204,94 @@ async fn terminal_failure_rejects_late_confirmation_and_keeps_results_stable() {
         Some(Err(WriterError::Configuration))
     ));
 }
+
+#[derive(Default)]
+struct Wakes(std::sync::atomic::AtomicUsize);
+
+impl std::task::Wake for Wakes {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn poll_counted<F: std::future::Future>(
+    future: std::pin::Pin<&mut F>,
+    wakes: &Arc<Wakes>,
+) -> std::task::Poll<F::Output> {
+    let counted = std::task::Waker::from(wakes.clone());
+    future.poll(&mut std::task::Context::from_waker(&counted))
+}
+
+#[test]
+fn each_waiting_record_wakes_only_for_its_own_confirmation() {
+    let count = 8;
+    let (mut writer, mut driver) = channel(config(count, 128));
+    let pending: Vec<_> = (0..count as u8)
+        .map(|id| writer.admit(&mut input(id, b"x"), 1).unwrap().unwrap())
+        .collect();
+    let wakes: Vec<_> = (0..count).map(|_| Arc::new(Wakes::default())).collect();
+    let mut waits: Vec<_> = pending
+        .iter()
+        .map(|record| Box::pin(record.confirmed()))
+        .collect();
+    for (wait, wakes) in waits.iter_mut().zip(&wakes) {
+        assert!(poll_counted(wait.as_mut(), wakes).is_pending());
+    }
+    for end in 1..=count {
+        confirm(&mut driver, end as u64, 40).unwrap();
+        for (index, wakes) in wakes.iter().enumerate() {
+            let expected = usize::from(index < end);
+            assert_eq!(wakes.0.load(Ordering::Relaxed), expected, "record {index}");
+        }
+        let std::task::Poll::Ready(receipt) =
+            poll_counted(waits[end - 1].as_mut(), &wakes[end - 1])
+        else {
+            panic!("woken record {} was not confirmed", end - 1);
+        };
+        assert_eq!(receipt.unwrap().offset, 40 + end as u64 - 1);
+    }
+}
+
+#[test]
+fn simultaneous_observers_of_one_record_share_the_broadcast_and_release_the_claim() {
+    let (mut writer, mut driver) = channel(config(2, 128));
+    let pending = writer.admit(&mut input(1, b"x"), 1).unwrap().unwrap();
+    let (claimed, shared) = (Arc::new(Wakes::default()), Arc::new(Wakes::default()));
+    let mut first = Box::pin(pending.confirmed());
+    let mut second = Box::pin(pending.confirmed());
+    assert!(poll_counted(first.as_mut(), &claimed).is_pending());
+    assert!(poll_counted(second.as_mut(), &shared).is_pending());
+    drop(first);
+    // The released claim lets a later observer take the targeted waker.
+    let later = Arc::new(Wakes::default());
+    let mut third = Box::pin(pending.confirmed());
+    assert!(poll_counted(third.as_mut(), &later).is_pending());
+    confirm(&mut driver, 1, 9).unwrap();
+    assert_eq!(later.0.load(Ordering::Relaxed), 1);
+    assert!(shared.0.load(Ordering::Relaxed) >= 1);
+    for (wait, wakes) in [(third, later), (second, shared)] {
+        let mut wait = wait;
+        let std::task::Poll::Ready(receipt) = poll_counted(wait.as_mut(), &wakes) else {
+            panic!("observer was not confirmed");
+        };
+        assert_eq!(receipt.unwrap().offset, 9);
+    }
+}
+
+#[test]
+fn terminal_failure_wakes_a_claimed_observer() {
+    let (mut writer, driver) = channel(config(2, 128));
+    let pending = writer.admit(&mut input(1, b"x"), 1).unwrap().unwrap();
+    let wakes = Arc::new(Wakes::default());
+    let mut wait = Box::pin(pending.confirmed());
+    assert!(poll_counted(wait.as_mut(), &wakes).is_pending());
+    driver.fail(WriterError::Configuration);
+    assert!(wakes.0.load(Ordering::Relaxed) >= 1);
+    assert!(matches!(
+        poll_counted(wait.as_mut(), &wakes),
+        std::task::Poll::Ready(Err(WriterError::Configuration))
+    ));
+}

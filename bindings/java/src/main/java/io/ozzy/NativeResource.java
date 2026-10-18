@@ -19,17 +19,13 @@ final class NativeResource {
     final MemorySegment scratch;
 
     NativeResource(long pointer) {
-        Arena arena = Arena.ofShared();
-        try {
-            scratch = arena.allocate(128, 8);
-            state = new State(arena);
-            cleanup = CLEANER.register(this, state);
-            // Nothing that can allocate or throw follows native ownership transfer.
-            state.pointer.set(pointer);
-        } catch (Throwable error) {
-            arena.close();
-            throw error;
-        }
+        // An automatic arena frees with this handle; closing a shared arena would
+        // handshake every JVM thread, here often on the binding executor.
+        scratch = Arena.ofAuto().allocate(128, 8);
+        state = new State();
+        cleanup = CLEANER.register(this, state);
+        // Nothing that can allocate or throw follows native ownership transfer.
+        state.pointer.set(pointer);
     }
 
     PendingHandles observe(long pointer) {
@@ -102,20 +98,11 @@ final class NativeResource {
 
     private static final class State implements Runnable {
         final AtomicLong pointer = new AtomicLong();
-        final Arena arena;
-
-        State(Arena arena) {
-            this.arena = arena;
-        }
 
         @Override
         public void run() {
             long value = pointer.getAndSet(0);
-            try {
-                if (value != 0) Native.release(value);
-            } finally {
-                arena.close();
-            }
+            if (value != 0) Native.release(value);
         }
     }
 }

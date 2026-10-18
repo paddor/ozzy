@@ -97,7 +97,8 @@ final class Native {
                 default -> throw new OzzyException("invalid native result");
             };
         } catch (Throwable error) {
-            if (handle != 0) release(handle);
+            if (handle != 0 && kind == 4) Fast.releasePending(handle);
+            else if (handle != 0) release(handle);
             throw error;
         }
     }

@@ -1,5 +1,6 @@
 use ozzy::{
-    AppendDisposition, Offset, Policy, SharedTopicReceipt, TopicCheckpoint, TopicId, TopicRecord,
+    AppendDisposition, MessageId, Offset, PartitionIncarnation, Policy, SharedTopicReceipt,
+    TopicCheckpoint, TopicId, TopicRecord,
 };
 use pyo3::{
     exceptions::PyValueError,
@@ -85,12 +86,39 @@ impl Receipt {
 
 /// Immutable delivered record with partition-global metadata and opaque payload.
 /// Delivery advances the reader; it does not acknowledge application processing.
+/// Payload parts are copied once on delivery, so a retained record never holds
+/// Rust receive-frame capacity.
 #[pyclass(module = "ozzy._native", frozen)]
 #[derive(Debug)]
-pub(crate) struct Record(TopicRecord);
-impl From<TopicRecord> for Record {
-    fn from(record: TopicRecord) -> Self {
-        Self(record)
+pub(crate) struct Record {
+    topic: TopicId,
+    partition: u32,
+    incarnation: PartitionIncarnation,
+    offset: Offset,
+    message_id: MessageId,
+    parts: Py<PyTuple>,
+}
+impl Record {
+    /// Copy the payload, releasing the record's receive-frame alias at once.
+    pub(crate) fn new(py: Python<'_>, record: TopicRecord) -> PyResult<Self> {
+        let TopicRecord {
+            topic,
+            partition,
+            incarnation,
+            offset,
+            message_id,
+            payload,
+        } = record;
+        let parts = PyTuple::new(py, payload.iter().map(|part| PyBytes::new(py, part)))?;
+        drop(payload);
+        Ok(Self {
+            topic,
+            partition,
+            incarnation,
+            offset,
+            message_id,
+            parts: parts.unbind(),
+        })
     }
 }
 #[pymethods]
@@ -98,32 +126,32 @@ impl Record {
     /// Topic UUID, formatted on access.
     #[getter]
     fn topic_id(&self) -> String {
-        self.0.topic.to_string()
+        self.topic.to_string()
     }
     /// Numeric partition containing this record.
     #[getter]
     fn partition(&self) -> u32 {
-        self.0.partition
+        self.partition
     }
     /// Partition incarnation UUID, formatted on access.
     #[getter]
     fn incarnation(&self) -> String {
-        self.0.incarnation.to_string()
+        self.incarnation.to_string()
     }
     /// Partition-global record offset.
     #[getter]
     fn offset(&self) -> u64 {
-        self.0.offset.get()
+        self.offset.get()
     }
     /// Application event UUID, formatted on access.
     #[getter]
     fn message_id(&self) -> String {
-        self.0.message_id.to_string()
+        self.message_id.to_string()
     }
-    /// Tuple of copied Python bytes. Read once when retaining the payload.
+    /// Tuple of payload bytes, copied once on delivery.
     #[getter]
-    fn parts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        PyTuple::new(py, self.0.payload.iter().map(|part| PyBytes::new(py, part)))
+    fn parts(&self, py: Python<'_>) -> Py<PyTuple> {
+        self.parts.clone_ref(py)
     }
 }
 

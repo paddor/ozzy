@@ -50,8 +50,9 @@ class Producer:
     """One topic writer. Obtain it from Client.producer(), then close or use with.
 
     Calls admit individual records into bounded Rust queues. Admission does not
-    prove persistence; observe a pending confirmation or call flush(). Only one
-    send, flush, or close may be active on this handle at a time.
+    prove persistence; observe a pending confirmation or call flush(). One send
+    or close may be active on this handle at a time; an overlapping call raises
+    BusyError. flush() does not hold the handle.
     """
 
     def __init__(self, native: _native.Producer, config: ClientConfig) -> None:
@@ -75,6 +76,7 @@ class Producer:
         key: bytes | None = None,
         partition: int | None = None,
         id: MessageId | None = None,
+        timeout: float | None = None,
     ) -> PendingRecord:
         """Admit one record, waiting for capacity; return its confirmation handle.
 
@@ -82,16 +84,22 @@ class Producer:
         With neither, Rust selects a partition. id is a nonzero UUID; omission
         generates one. Mutable payloads are copied before admission. Reuse the
         same id when retrying the same application event after an unknown result.
+        A timeout in seconds raises TimeoutError and admits nothing.
         """
         return self._native.send(
             parts(payload, self._config),
             message_id(id),
             destination(key, partition),
+            timeout,
         )
 
-    def flush(self) -> None:
-        """Wait until all records admitted by this producer are confirmed."""
-        self._native.flush()
+    def flush(self, timeout: float | None = None) -> None:
+        """Wait until all records admitted before this call are confirmed.
+
+        Other threads may keep sending meanwhile. A timeout in seconds raises
+        TimeoutError; the captured records still go out.
+        """
+        self._native.flush(timeout)
 
     def close(self) -> None:
         """Seal admission, drain confirmations, and release this writer; idempotent."""
@@ -114,17 +122,22 @@ class Consumer(Iterator[Record]):
 
     Ordering and offsets are per partition. Delivery is not acknowledgment of
     application processing. Use a checkpoint only after processing succeeds.
-    One receive or close may be active on this handle at a time.
+    One receive or close may be active on this handle at a time; an
+    overlapping call raises BusyError.
     """
 
     def __init__(self, native: _native.Consumer) -> None:
         self._native = native
 
-    def next(self) -> Record:
-        """Wait for the next record and advance the delivered checkpoint."""
-        return self._native.next()
+    def next(self, timeout: float | None = None) -> Record:
+        """Wait for the next record and advance the delivered checkpoint.
 
-    __next__ = next
+        A timeout in seconds raises TimeoutError without consuming a record.
+        """
+        return self._native.next(timeout)
+
+    def __next__(self) -> Record:
+        return self._native.next(None)
 
     def try_next(self) -> Record | None:
         """Return an available record and advance, or None without waiting."""

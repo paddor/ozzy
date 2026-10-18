@@ -1,5 +1,6 @@
 use crate::{
-    execution::{Lease, Owner, Slot, drive, opened, ready, wait},
+    awaitable::Awaitable,
+    execution::{Lease, Owner, Slot, borrow, opened, probe, ready, timeout, wait},
     sdk_error,
     values::Receipt,
 };
@@ -8,30 +9,80 @@ use ozzy::{
     BrokerLinks, MessageId, ProducerIdentity, RecordInput, RetryPolicy, SharedTopicPendingRecord,
     SharedTopicWriter, SharedTopicWriterConfig,
 };
-use pyo3::{exceptions::PyValueError, prelude::*, pybacked::PyBackedBytes, types::PyBytes};
-use std::{
-    future::Future,
-    pin::pin,
-    sync::Arc,
-    task::{Context, Poll, Waker},
+use pyo3::{
+    buffer::PyBuffer,
+    exceptions::{PyTypeError, PyValueError},
+    prelude::*,
+    pybacked::PyBackedBytes,
+    types::{PyBytes, PyMemoryView},
 };
+use std::{sync::Arc, task::Poll};
 use sync_wrapper::SyncWrapper;
+
+/// One payload part: a borrowed immutable `bytes` view, or one copy of any
+/// other byte buffer taken before admission.
+#[derive(Debug)]
+pub(crate) enum Part {
+    Shared(PyBackedBytes),
+    Copied(Vec<u8>),
+}
+
+impl<'py> FromPyObject<'_, 'py> for Part {
+    type Error = PyErr;
+
+    fn extract(obj: Borrowed<'_, 'py, PyAny>) -> PyResult<Self> {
+        let py = obj.py();
+        if let Ok(bytes) = obj.cast::<PyBytes>() {
+            return Ok(Self::Shared(bytes.to_owned().into()));
+        }
+        if let Ok(buffer) = PyBuffer::<u8>::get(&obj) {
+            let mut copy = vec![0; buffer.item_count()];
+            buffer.copy_to_slice(py, &mut copy)?;
+            return Ok(Self::Copied(copy));
+        }
+        if obj.is_instance_of::<PyMemoryView>() {
+            // Typed views count bytes, not items; `bytes` flattens any format.
+            let bytes = py
+                .get_type::<PyBytes>()
+                .call1((obj,))?
+                .cast_into::<PyBytes>()?;
+            return Ok(Self::Shared(bytes.into()));
+        }
+        Err(PyTypeError::new_err("payload parts must be bytes-like"))
+    }
+}
+
+impl Part {
+    fn bytes(self) -> Bytes {
+        match self {
+            Self::Shared(body) => Bytes::copy_from_slice(&body),
+            Self::Copied(body) => Bytes::from(body),
+        }
+    }
+    fn record(self, id: MessageId) -> RecordInput {
+        match self {
+            Self::Shared(body) => RecordInput::copy_from_slice(id, &body),
+            // Unique storage moves into admission without another copy.
+            Self::Copied(body) => RecordInput::single(id, Bytes::from(body)),
+        }
+    }
+}
 
 #[derive(Debug, FromPyObject)]
 pub(crate) enum Payload {
     #[pyo3(transparent)]
-    Single(PyBackedBytes),
+    Single(Part),
     #[pyo3(transparent)]
-    Multipart(Vec<PyBackedBytes>),
+    Multipart(Vec<Part>),
 }
 impl Payload {
     fn record(self, id: MessageId) -> RecordInput {
         match self {
-            Self::Single(body) => RecordInput::copy_from_slice(id, &body),
-            Self::Multipart(parts) => match parts.as_slice() {
-                [body] => RecordInput::copy_from_slice(id, body),
-                _ => RecordInput::multipart(id, parts.iter().map(|p| Bytes::copy_from_slice(p))),
-            },
+            Self::Single(part) => part.record(id),
+            Self::Multipart(mut parts) if parts.len() == 1 => parts.remove(0).record(id),
+            Self::Multipart(parts) => {
+                RecordInput::multipart(id, parts.into_iter().map(Part::bytes))
+            }
         }
     }
 }
@@ -76,14 +127,15 @@ impl Producer {
     }
 }
 
-async fn send(
-    writer: &mut SharedTopicWriter,
+type Destination = (Option<Vec<u8>>, Option<u32>);
+
+/// Validate routing and identity, then build the record (one payload copy).
+fn admission(
     parts: Payload,
     id: Option<Vec<u8>>,
-    destination: (Option<Vec<u8>>, Option<u32>),
-) -> PyResult<PendingRecord> {
-    let (key, partition) = destination;
-    if key.is_some() && partition.is_some() {
+    destination: Destination,
+) -> PyResult<(RecordInput, Destination)> {
+    if destination.0.is_some() && destination.1.is_some() {
         return Err(PyValueError::new_err(
             "key and partition are mutually exclusive",
         ));
@@ -100,7 +152,15 @@ async fn send(
         }
         None => MessageId::new(),
     };
-    let record = parts.record(id);
+    Ok((parts.record(id), destination))
+}
+
+async fn send(
+    writer: &mut SharedTopicWriter,
+    record: RecordInput,
+    destination: Destination,
+) -> PyResult<PendingRecord> {
+    let (key, partition) = destination;
     let pending = match partition {
         Some(partition) => writer.send_to_partition(record, partition).await,
         None => writer.send(record, key.as_deref()).await,
@@ -112,95 +172,114 @@ async fn send(
 #[pymethods]
 impl Producer {
     #[getter]
-    fn identity<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let writer = self
-            .0
-            .get_mut()
-            .get()?
-            .as_ref()
-            .ok_or_else(|| crate::ClosedError::new_err("producer is closed"))?;
-        Ok(PyBytes::new(py, &writer.identity().to_bytes()))
+    fn identity<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyBytes>> {
+        let identity = {
+            let mut this = borrow(slf)?;
+            let writer = opened(this.slot().get_mut()?)?;
+            writer.identity().to_bytes()
+        };
+        Ok(PyBytes::new(slf.py(), &identity))
     }
     #[getter]
-    fn partition_count(&mut self) -> PyResult<usize> {
-        Ok(self
-            .0
-            .get_mut()
-            .get()?
-            .as_ref()
-            .ok_or_else(|| crate::ClosedError::new_err("producer is closed"))?
-            .metadata()
-            .partition_count())
+    fn partition_count(slf: &Bound<'_, Self>) -> PyResult<usize> {
+        let mut this = borrow(slf)?;
+        Ok(opened(this.slot().get_mut()?)?.metadata().partition_count())
     }
+    #[pyo3(signature = (parts, id, destination, timeout=None))]
     fn send(
-        &mut self,
-        py: Python<'_>,
+        slf: Bound<'_, Self>,
         parts: Payload,
         id: Option<Vec<u8>>,
-        destination: (Option<Vec<u8>>, Option<u32>),
+        destination: Destination,
+        timeout: Option<f64>,
     ) -> PyResult<PendingRecord> {
+        let timeout = self::timeout(timeout)?;
+        let (record, destination) = admission(parts, id, destination)?;
+        let py = slf.py();
+        let mut lease = Lease::take(slf.unbind())?;
         ready(
             py,
-            send(opened(self.slot().get_mut()?)?, parts, id, destination),
+            send(opened(lease.get_mut()?)?, record, destination),
+            timeout,
         )?
     }
     fn try_send(
-        &mut self,
+        slf: &Bound<'_, Self>,
         parts: Payload,
         id: Option<Vec<u8>>,
-        destination: (Option<Vec<u8>>, Option<u32>),
+        destination: Destination,
     ) -> PyResult<Option<PendingRecord>> {
         // The Rust SDK assigns a sequence only on successful admission.
         // A pending probe is canceled before the asyncio fallback polls again.
-        let mut future = pin!(send(
-            opened(self.slot().get_mut()?)?,
-            parts,
-            id,
-            destination
-        ));
-        match future
-            .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop()))
-        {
+        let (record, destination) = admission(parts, id, destination)?;
+        let mut this = borrow(slf)?;
+        let writer = opened(this.slot().get_mut()?)?;
+        match probe(send(writer, record, destination)) {
             Poll::Ready(result) => result.map(Some),
             Poll::Pending => Ok(None),
         }
     }
-    async fn asend(
+    fn asend(
         slf: Py<Self>,
         parts: Payload,
         id: Option<Vec<u8>>,
-        destination: (Option<Vec<u8>>, Option<u32>),
-    ) -> PyResult<PendingRecord> {
-        let mut lease = Lease::take(slf)?;
-        send(opened(lease.get_mut()?)?, parts, id, destination).await
+        destination: Destination,
+    ) -> PyResult<Awaitable> {
+        let (record, destination) = admission(parts, id, destination)?;
+        Ok(Awaitable::hot(async move {
+            let mut lease = Lease::take(slf)?;
+            let pending = send(opened(lease.get_mut()?)?, record, destination).await?;
+            Python::attach(|py| Py::new(py, pending).map(Py::into_any))
+        }))
     }
-    fn flush(&mut self, py: Python<'_>) -> PyResult<()> {
-        wait(py, opened(self.slot().get_mut()?)?.flush())?.map_err(sdk_error)
+    /// Capture the admitted prefix, then wait without holding the handle,
+    /// so other callers may keep sending meanwhile.
+    #[pyo3(signature = (timeout=None))]
+    fn flush(slf: &Bound<'_, Self>, timeout: Option<f64>) -> PyResult<()> {
+        let timeout = self::timeout(timeout)?;
+        let flushed = {
+            let mut this = borrow(slf)?;
+            opened(this.slot().get_mut()?)?.flush()
+        };
+        wait(slf.py(), flushed, timeout)?.map_err(sdk_error)
     }
-    async fn aflush(slf: Py<Self>) -> PyResult<()> {
-        let mut lease = Lease::take(slf)?;
-        drive(opened(lease.get_mut()?)?.flush())
-            .await?
-            .map_err(sdk_error)
+    fn aflush(slf: &Bound<'_, Self>) -> PyResult<Awaitable> {
+        let flushed = {
+            let mut this = borrow(slf)?;
+            opened(this.slot().get_mut()?)?.flush()
+        };
+        Ok(Awaitable::hot(async move {
+            flushed.await.map_err(sdk_error)?;
+            Ok(crate::awaitable::none())
+        }))
     }
-    fn close(&mut self, py: Python<'_>) -> PyResult<()> {
-        if let Some(writer) = self.slot().get_mut()?.take() {
-            wait(py, writer.close())?.map_err(sdk_error)?;
+    fn close(slf: &Bound<'_, Self>) -> PyResult<()> {
+        let writer = {
+            let mut this = borrow(slf)?;
+            this.slot().get_mut()?.take()
+        };
+        if let Some(writer) = writer {
+            wait(slf.py(), writer.close(), None)?.map_err(sdk_error)?;
         }
         Ok(())
     }
-    async fn aclose(slf: Py<Self>) -> PyResult<()> {
-        let mut lease = Lease::take(slf)?;
-        if let Some(writer) = lease.get_mut()?.take() {
-            drive(writer.close()).await?.map_err(sdk_error)?;
-        }
-        Ok(())
+    fn aclose(slf: Py<Self>) -> Awaitable {
+        Awaitable::lifecycle(async move {
+            // Seal on first poll, as an unawaited close leaves the writer open.
+            let writer = Python::attach(|py| {
+                let mut this = borrow(slf.bind(py))?;
+                this.slot().get_mut().map(Option::take)
+            })?;
+            if let Some(writer) = writer {
+                writer.close().await.map_err(sdk_error)?;
+            }
+            Ok(crate::awaitable::none())
+        })
     }
 }
 
 /// Confirmation observer. Dropping it never cancels an admitted record.
-#[pyclass(module = "ozzy._native")]
+#[pyclass(module = "ozzy._native", frozen)]
 #[derive(Debug)]
 pub(crate) struct PendingRecord(Slot<Arc<SharedTopicPendingRecord>, false>);
 
@@ -222,22 +301,23 @@ impl PendingRecord {
         Ok(self.0.get()?.sequence())
     }
     /// Wait for a durable receipt, releasing the GIL while waiting.
-    fn confirmed(&self, py: Python<'_>) -> PyResult<Receipt> {
-        ready(py, self.0.get()?.confirmed())?
-            .map(Receipt::from)
-            .map_err(sdk_error)
+    #[pyo3(signature = (timeout=None))]
+    fn confirmed(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<Receipt> {
+        let timeout = self::timeout(timeout)?;
+        let pending = self.0.get()?;
+        let result = match pending.try_confirmed() {
+            Some(result) => result,
+            None => wait(py, pending.confirmed(), timeout)?,
+        };
+        result.map(Receipt::from).map_err(sdk_error)
     }
     /// Await a durable receipt. Cancellation cancels only this observation.
-    async fn aconfirmed(slf: Py<Self>) -> PyResult<Receipt> {
-        let pending = Python::attach(|py| {
-            let pending = slf.try_borrow(py)?;
-            Ok::<_, PyErr>(pending.0.get()?.clone())
-        })?;
-        pending
-            .confirmed()
-            .await
-            .map(Receipt::from)
-            .map_err(sdk_error)
+    fn aconfirmed(&self) -> PyResult<Awaitable> {
+        let pending = self.0.get()?.clone();
+        Ok(Awaitable::hot(async move {
+            let receipt = pending.confirmed().await.map_err(sdk_error)?;
+            Python::attach(|py| Py::new(py, Receipt::from(receipt)).map(Py::into_any))
+        }))
     }
     /// Return a receipt if ready, None if pending, or raise on failure.
     fn try_confirmed(&self) -> PyResult<Option<Receipt>> {

@@ -6,7 +6,7 @@
 use crate::{
     execution::{self, Lease},
     input::{self, Inputs},
-    state::{Handle, Request, text},
+    state::{Flush, Handle, Request, text},
     values,
 };
 use jni::{
@@ -14,9 +14,11 @@ use jni::{
     objects::{JByteArray, JClass, JLongArray, JObject, JObjectArray, JString},
     sys::{jbyteArray, jlong, jlongArray},
 };
+use ozzy::{RecordInput, SharedTopicPendingRecord};
 use std::{
     future::Future,
     panic::{AssertUnwindSafe, catch_unwind},
+    sync::Arc,
     task::{Context, Poll, Waker},
 };
 #[cfg(not(target_pointer_width = "64"))]
@@ -74,29 +76,43 @@ pub(crate) extern "system" fn Java_io_ozzy_Native_start(
     identity: JByteArray<'_>,
 ) -> jlong {
     boundary(&mut env, |env| {
-        let request = if op == 6 {
-            // SAFETY: Pending is immutable; Java keeps it reachable through this call.
-            match unsafe { &*(pointer as *const Handle) } {
-                Handle::Pending(value) => Request::Confirm(value.clone()),
-                _ => return Err("not a pending record".into()),
+        let request = match op {
+            // SAFETY: Java keeps the observer reachable through this call.
+            6 => Request::Confirm(unsafe { pending_clone(pointer) }),
+            // SAFETY: Java's lease spans this call. The captured flush borrows
+            // nothing, so the producer's lease ends when the call returns.
+            4 => match unsafe { &*(pointer as *const Handle) } {
+                Handle::Producer(Some(writer)) => Request::Flush(Flush(Box::pin(writer.flush()))),
+                _ => return Err("producer is closed".into()),
+            },
+            _ => {
+                // SAFETY: Java's lease spans this call. Opens clone the shared
+                // links, so the client's lease ends when the call returns.
+                let open = match op {
+                    1 | 2 => match unsafe { &*(pointer as *const Handle) } {
+                        Handle::Client(client) => Some(client.open()?),
+                        _ => return Err("not a client".into()),
+                    },
+                    _ => None,
+                };
+                input::request(
+                    env,
+                    op,
+                    &Inputs {
+                        topic,
+                        options,
+                        parts,
+                        key,
+                        id,
+                        identity,
+                    },
+                    open,
+                )?
             }
-        } else {
-            input::request(
-                env,
-                op,
-                &Inputs {
-                    topic,
-                    options,
-                    parts,
-                    key,
-                    id,
-                    identity,
-                },
-            )?
         };
         let future = env.new_global_ref(future).map_err(text)?;
         // SAFETY: Java's atomic lease excludes close, GC, and other mutable calls.
-        let handle = if op == 6 {
+        let handle = if matches!(op, 1 | 2 | 4 | 6) {
             None
         } else {
             Some(unsafe { Box::from_raw(pointer as *mut Handle) })
@@ -139,8 +155,12 @@ pub(crate) extern "system" fn Java_io_ozzy_Native_addresses(
             try_send as *const () as i64,
             try_next as *const () as i64,
             try_confirmed as *const () as i64,
+            try_send_parts as *const () as i64,
+            release_pending as *const () as i64,
         ];
-        let array = env.new_long_array(3).map_err(text)?;
+        let array = env
+            .new_long_array(i32::try_from(addresses.len()).map_err(text)?)
+            .map_err(text)?;
         env.set_long_array_region(&array, 0, &addresses)
             .map_err(text)?;
         Ok(array.into_raw())
@@ -234,6 +254,63 @@ unsafe fn slice<'a>(pointer: *const u8, len: usize) -> &'a [u8] {
         unsafe { std::slice::from_raw_parts(pointer, len) }
     }
 }
+/// Clone one strong observer count for Rust; Java keeps its own.
+///
+/// # Safety
+/// `pointer` came from `Arc::into_raw` and Java keeps it reachable.
+unsafe fn pending_clone(pointer: i64) -> Arc<SharedTopicPendingRecord> {
+    let pointer = pointer as *const SharedTopicPendingRecord;
+    // SAFETY: Java's strong count keeps the allocation alive during this call.
+    unsafe {
+        Arc::increment_strong_count(pointer);
+        Arc::from_raw(pointer)
+    }
+}
+
+/// Generated or caller-selected identity; Java rejects a zero selected ID.
+fn message_id(hi: u64, lo: u64, generate: i32) -> Result<ozzy::MessageId, String> {
+    if generate != 0 {
+        return Ok(ozzy::MessageId::new());
+    }
+    if hi == 0 && lo == 0 {
+        return Err("message ID must be nonzero".into());
+    }
+    Ok(ozzy::MessageId::from_bytes(input::id(hi, lo)))
+}
+
+/// Probe admission once; a pending probe assigns nothing.
+fn admit(
+    pointer: i64,
+    record: RecordInput,
+    key: &[u8],
+    route: i32,
+    output: *mut [u64; 16],
+) -> Result<i32, String> {
+    // SAFETY: Java holds the producer's exclusive lease for this call.
+    let Handle::Producer(Some(writer)) = (unsafe { &mut *(pointer as *mut Handle) }) else {
+        return Err("producer is closed".into());
+    };
+    let key = (route == -2).then_some(key);
+    let mut work = std::pin::pin!(crate::state::send(
+        writer,
+        record,
+        key,
+        (route >= 0).then_some(route as u32)
+    ));
+    match work.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Pending => Ok(0),
+        Poll::Ready(result) => {
+            let pending = Arc::new(result?);
+            let mut words = values::pending(&pending);
+            words[4] = Arc::into_raw(pending) as u64;
+            // SAFETY: Output is a live aligned 128-byte Java segment.
+            unsafe {
+                output.write(words);
+            }
+            Ok(1)
+        }
+    }
+}
 unsafe extern "C" fn try_send(
     pointer: i64,
     body: *const u8,
@@ -247,47 +324,73 @@ unsafe extern "C" fn try_send(
     output: *mut [u64; 16],
 ) -> i32 {
     fast(output, || {
-        // SAFETY: Java holds the exclusive lease and both input segments are pinned.
-        let (handle, body, key) = unsafe {
+        // SAFETY: Both input segments are pinned for this critical downcall.
+        let (body, key) = unsafe { (slice(body, len), slice(key, key_len)) };
+        let record = RecordInput::copy_from_slice(message_id(hi, lo, generate)?, body);
+        admit(pointer, record, key, route, output)
+    })
+}
+/// Multipart admission from one packed body and its part lengths.
+unsafe extern "C" fn try_send_parts(
+    pointer: i64,
+    body: *const u8,
+    len: usize,
+    lengths: *const i32,
+    count: usize,
+    key: *const u8,
+    key_len: usize,
+    route: i32,
+    hi: u64,
+    lo: u64,
+    generate: i32,
+    output: *mut [u64; 16],
+) -> i32 {
+    fast(output, || {
+        // SAFETY: All three input segments are pinned for this critical downcall.
+        let (body, key, lengths) = unsafe {
             (
-                &mut *(pointer as *mut Handle),
                 slice(body, len),
                 slice(key, key_len),
+                std::slice::from_raw_parts(lengths, count),
             )
         };
-        let Handle::Producer(Some(writer)) = handle else {
-            return Err("producer is closed".into());
-        };
-        if generate == 0 && hi == 0 && lo == 0 {
-            return Err("message ID must be nonzero".into());
+        if count == 0 {
+            return Err("record needs at least one part".into());
         }
-        let id = if generate != 0 {
-            ozzy::MessageId::new()
-        } else {
-            ozzy::MessageId::from_bytes(input::id(hi, lo))
-        };
-        let record = ozzy::RecordInput::copy_from_slice(id, body);
-        let key = (route == -2).then_some(key);
-        let mut work = std::pin::pin!(crate::state::send(
-            writer,
-            record,
-            key,
-            (route >= 0).then_some(route as u32)
-        ));
-        match work.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
-            Poll::Pending => Ok(0),
-            Poll::Ready(result) => {
-                let handle = Box::new(Handle::Pending(std::sync::Arc::new(result?)));
-                let mut words = values::pending(&handle);
-                words[4] = Box::into_raw(handle) as u64;
-                // SAFETY: Output is a live aligned 128-byte Java native segment.
-                unsafe {
-                    output.write(words);
-                }
-                Ok(1)
-            }
+        // One copy of the packed body; parts share it until admission packs it.
+        let packed = bytes::Bytes::copy_from_slice(body);
+        let mut offset = 0_usize;
+        let mut parts = Vec::with_capacity(count);
+        for &length in lengths {
+            let end = usize::try_from(length)
+                .ok()
+                .and_then(|length| offset.checked_add(length))
+                .filter(|&end| end <= packed.len())
+                .ok_or("invalid multipart lengths")?;
+            parts.push(packed.slice(offset..end));
+            offset = end;
         }
+        if offset != packed.len() {
+            return Err("invalid multipart lengths".into());
+        }
+        drop(packed);
+        let record = RecordInput::multipart(message_id(hi, lo, generate)?, parts);
+        admit(pointer, record, key, route, output)
     })
+}
+/// Drop Java's observer counts. Zero entries are skipped.
+unsafe extern "C" fn release_pending(pointers: *const i64, count: usize) {
+    if count == 0 {
+        return;
+    }
+    // SAFETY: Java passes a pinned array of `count` pointers it owns exactly once.
+    let pointers = unsafe { std::slice::from_raw_parts(pointers, count) };
+    for &pointer in pointers {
+        if pointer != 0 {
+            // SAFETY: Each nonzero pointer came from `Arc::into_raw` once.
+            drop(unsafe { Arc::from_raw(pointer as *const SharedTopicPendingRecord) });
+        }
+    }
 }
 unsafe extern "C" fn try_next(pointer: i64, output: *mut [u64; 16]) -> i32 {
     fast(output, || {
@@ -320,9 +423,7 @@ unsafe extern "C" fn try_next(pointer: i64, output: *mut [u64; 16]) -> i32 {
 unsafe extern "C" fn try_confirmed(pointer: i64, output: *mut [u64; 16]) -> i32 {
     fast(output, || {
         // SAFETY: Immutable pending observers are Sync; Java fences reachability.
-        let Handle::Pending(pending) = (unsafe { &*(pointer as *const Handle) }) else {
-            return Err("not a pending record".into());
-        };
+        let pending = unsafe { &*(pointer as *const SharedTopicPendingRecord) };
         match pending.try_confirmed() {
             Some(result) => {
                 let words = values::receipt(&result.map_err(text)?);

@@ -144,8 +144,19 @@ public final class Producer implements AutoCloseable {
         for (ByteBuffer part : parts) total += Objects.requireNonNull(part).remaining();
         if (total > config.limits().recordBytes())
             throw new IllegalArgumentException("record exceeds client limits");
-        byte[][] data = parts.stream().map(Producer::copy).toArray(byte[][]::new);
         resource.enter();
+        byte[][] data;
+        try {
+            PendingRecord pending = Fast.sendParts(resource, parts, (int) total, options);
+            if (pending != null) {
+                resource.exit();
+                return CompletableFuture.completedFuture(pending);
+            }
+            data = parts.stream().map(Producer::copy).toArray(byte[][]::new);
+        } catch (Throwable error) {
+            resource.exit();
+            throw error;
+        }
         return NativeFuture.leased(
                 resource,
                 3,
@@ -177,10 +188,19 @@ public final class Producer implements AutoCloseable {
         NativeFuture.await(flushAsync());
     }
 
-    /** Wait asynchronously; canceling this observation leaves the writer usable. */
+    /**
+     * Wait asynchronously; canceling this observation leaves the writer usable. The captured
+     * prefix does not hold the producer, so sends may continue while it waits.
+     */
     public CompletableFuture<Void> flushAsync() {
-        resource.enter();
-        return NativeFuture.leased(resource, 4, null, null, null, null, null, null, null);
+        long pointer = resource.enter();
+        try {
+            var future = new NativeFuture<Void>(null, null, false, null);
+            future.start(pointer, 4, null, null, null, null, null, null);
+            return future;
+        } finally {
+            resource.exit();
+        }
     }
 
     /** Seal admission and drain admitted records; idempotent. */
