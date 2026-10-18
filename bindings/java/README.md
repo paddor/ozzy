@@ -1,157 +1,155 @@
 # Ozzy Java SDK
 
-Java 22+ blocking and asynchronous producers and consumers over Ozzy's Rust SDK.
-JNI handles lifecycle and async setup; FFM handles ready scalar operations.
-There is no OMQ.java dependency or Java implementation of the wire protocol,
-routing, retries, compression, or batching.
+Blocking and `CompletableFuture` producers and consumers for
+[Ozzy](../../README.md). Java 22+ on Linux, as a thin layer over the Rust SDK.
 
-## Build and run
+## Build
 
-Requires Linux, JDK 22+, Rust 1.93+, Maven, and cargo-nextest. Build and check:
-
-```sh
-export OZZY_ARTIFACT_ROOT=/path/to/artifacts
-source scripts/ozzy_tools.sh
-scripts/check-java.sh
-# OZZY_JAVA_RELEASE=1 scripts/check-java.sh
-```
-
-Use `OZZY_JAVA_RELEASE=1` for optimized native libraries.
-
-Artifacts are under `$CARGO_TARGET_DIR/java`: a Java-only JAR, a platform JAR
-such as `ozzy-java-0.3.0-linux-x86_64.jar`, and `javadoc/`. The platform JAR
-contains the native library and loads it automatically. Packages are built
-locally; no Maven publication is automated. JPMS module: `io.ozzy`.
-
-Enable native access when running:
+Requires JDK 22+, Rust 1.93+, Maven, and cargo-nextest. From the repository
+root, in bash:
 
 ```sh
-java --enable-native-access=ALL-UNNAMED -cp ozzy-java-0.3.0-linux-x86_64.jar:app.jar MyApp
-# On the module path: --enable-native-access=io.ozzy
+source scripts/ozzy_tools.sh  # sets CARGO_TARGET_DIR
+OZZY_JAVA_RELEASE=1 scripts/check-java.sh  # builds and tests the JARs
+JAR=$(ls "$CARGO_TARGET_DIR"/java/ozzy-java-*-linux-*.jar)
 ```
 
-The Java-only JAR can load an explicit library with
-`-Dozzy.native.path=/absolute/path/libozzy_java.so` or `java.library.path`.
-All public types and methods have Javadoc.
+The platform JAR bundles `libozzy_java.so` and loads it on first use. JPMS
+module: `io.ozzy`.
 
-## Produce and consume
+## Try it
 
-Supply persistent broker UUIDs and matching control/data endpoints: one broker
-or all three quorum brokers. Provision topics on the broker first.
+Start a local broker with topic `orders`
+([getting started](../../GETTING_STARTED.md#try-it)):
+
+```sh
+cargo run --release -p ozzy-broker -- quickstart tmp/try
+```
+
+Save as `Quickstart.java` and run it from the repository root:
+
+```sh
+java --enable-native-access=ALL-UNNAMED -cp "$JAR" Quickstart.java
+```
 
 ```java
-import io.ozzy.BrokerAddress;
-import io.ozzy.Client;
-import io.ozzy.ClientConfig;
-import io.ozzy.SendOptions;
-import java.util.List;
-import java.util.UUID;
+import io.ozzy.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.*;
+import java.util.regex.Pattern;
 
-var config = new ClientConfig(List.of(new BrokerAddress(
-    UUID.fromString("11111111-1111-1111-1111-111111111111"),
-    "tcp://127.0.0.1:7000", "tcp://127.0.0.1:7001")));
+public class Quickstart {
+    // Broker ID and endpoints written by `quickstart tmp/try`.
+    static String value(String file, String key) throws Exception {
+        var text = Files.readString(Path.of("tmp/try", file));
+        var match = Pattern.compile("(?m)^" + key + " = \"(.+)\"").matcher(text);
+        if (!match.find()) throw new IllegalStateException(key);
+        return match.group(1);
+    }
 
-try (var client = Client.connect(config);
-     var producer = client.producer("orders");
-     var consumer = client.consumer("orders")) {
-    var pending = producer.send(new byte[]{1, 2, 3}, SendOptions.partition(0));
-    var receipt = pending.confirmed();
-    var record = consumer.next();
-    System.out.println(receipt.offset() + " " + record.messageId());
-    var checkpoint = consumer.checkpoint();
-    // Persist the checkpoint after application processing succeeds.
+    public static void main(String[] args) throws Exception {
+        var broker = new BrokerAddress(
+                UUID.fromString(value("shared.identity", "local")),
+                value("deployment.toml", "peer"),
+                value("deployment.toml", "data_peer"));
+        var config = new ClientConfig(List.of(broker));
+
+        try (var client = Client.connect(config)) {
+            try (var producer = client.producer("orders")) {
+                var key = SendOptions.key("customer-17".getBytes());
+                var pending = new ArrayList<PendingRecord>();
+                for (int n = 0; n < 3; n++)
+                    pending.add(producer.send(("order-" + n).getBytes(), key));
+                for (var record : pending) {
+                    var receipt = record.confirmed(); // durable on the broker
+                    System.out.println("stored " + receipt.partition() + " " + receipt.offset());
+                }
+            }
+            try (var consumer = client.consumer("orders")) {
+                for (int n = 0; n < 3; n++) {
+                    var record = consumer.next();
+                    var body = StandardCharsets.UTF_8.decode(record.body());
+                    System.out.println("read " + record.partition() + " " + record.offset() + " " + body);
+                }
+                var checkpoint = consumer.checkpoint(); // persist after processing
+            }
+        }
+    }
 }
 ```
 
-`send` accepts `byte[]`, the remaining bytes of a `ByteBuffer`, or a nonempty
-`List<ByteBuffer>` for multipart records. Empty parts are preserved. Inputs are
-copied before admission completes; positions are unchanged. Records expose
-read-only `body()` and `parts()` views with independent positions and survive
-handle closure. `body()` requires a single part.
-
-Use `SendOptions.partition(n)`, `SendOptions.key(bytes)`, or `AUTOMATIC`.
-Keys and partitions are exclusive. `withId(UUID)` sets a nonzero application
-identity; omission generates a Rust UUIDv7. UUID objects are created only on
-access; no UUID strings are formatted per record.
-
-Admission does not prove durability. `PendingRecord.confirmed()` waits;
-`tryConfirmed()` returns an Optional. Receipts carry partition-global offsets,
-producer identity/epoch/sequence, disposition, and durability policy.
-Keep several records in flight before confirming. `flush()` confirms the
-admitted prefix without holding the producer, so sends may continue while it
-waits; producer close seals and drains it. Single-broker durable
-mode has no failover; disk quorum requires two of three eligible copies.
-
-Save `producer.identity()` once and resume with
-`client.producer("orders", identity, false)`. Explicit takeover uses `true` and
-can partially fence the old producer even if opening fails. There is no SDK
-durable outbox. Optional broker message-ID deduplication returns original
-offsets; it does not establish exactly-once application processing.
-
-## Async and cancellation
-
-`Client.connectAsync`, `producerAsync`, `consumerAsync`, `sendAsync`,
-`confirmedAsync`, `flushAsync`, `nextAsync`, and `closeAsync` return
-`CompletableFuture`. Ready sends (single or multipart), reads, and
-confirmations avoid native task setup, and other ready results complete before
-the call returns. Waiting futures are polled by one native binding executor,
-with no Java worker per operation. Blocking waits park Java and virtual threads
-and complete the future themselves. `orTimeout` and `completeOnTimeout` cancel
-on the common pool, never on a shared timer thread.
+Each blocking call has an `*Async` twin that returns a `CompletableFuture`:
 
 ```java
-var receipt = producer.sendAsync(new byte[]{42}, SendOptions.partition(0))
-    .thenCompose(io.ozzy.PendingRecord::confirmedAsync);
-receipt.join();
+var receipt = producer.sendAsync("order-42".getBytes(), SendOptions.partition(0))
+        .thenCompose(PendingRecord::confirmedAsync)
+        .orTimeout(5, TimeUnit.SECONDS)
+        .join();
 ```
 
-Canceling a pending operation returns its native lease before cancellation
-completes. If Rust already produced its result, cancellation returns false and
-that result remains available. Canceling an observer never withdraws an
-admitted record. Cancel an outstanding receive before closing its handle.
-An interrupted blocking wait cancels pending work and preserves interrupt
-status; an already completed native result wins the race.
+## How it works
 
-Mutable handles allow one active operation; overlapping calls raise
-`BusyException`. Producer and consumer opens on one client may run
-concurrently. Pending confirmations support simultaneous observers. Close
-is idempotent, canceled closes remain sealed, and Cleaner is only a fallback.
-Close child handles before the client. SDK failures raise `OzzyException`;
-closed handles raise `ClosedException`; invalid arguments are rejected locally
-or by Rust validation. Java continuations run outside native owner threads.
-`obtrudeValue`, `obtrudeException`, and `completeAsync` are unsupported on SDK
-futures because they bypass native completion ownership.
+- `io.ozzy` calls the Rust SDK in `libozzy_java.so`. Routing, batching,
+  retries, LZ4, and OMQ transport stay in Rust. There is no Java wire protocol.
+- Each `Client` runs a Rust SDK thread and OMQ I/O threads. Brokers own the
+  log; the client owns no journal and binds no socket.
+- Ready sends, reads, and confirmations are direct FFM downcalls. They create
+  no future and no native task.
+- Lifecycle calls and waits use JNI. One process-wide native thread
+  (`ozzy/java`) polls all pending operations; there is no Java thread per
+  operation. Blocking calls park the caller, so virtual threads work.
+- Future continuations never run on native threads.
+- `ClientConfig` bounds memory before connecting. Under pressure, `send`
+  waits; no Java queue grows.
 
-## History, bounds, and compression
+## Essentials
 
-`ReaderOptions` selects earliest retained records, latest confirmed ends,
-partition filters, or a `Checkpoint`. Latest-end selection resolves when
-first polled. Checkpoints contain the exact topic UUID and each selected
-partition's first undelivered offset. They record delivery, not application
-transactions, and cannot restore retired history. `stats()` reports live,
-replayed, and gap counters. Final checkpoint/statistics remain available after
-close. Offsets, epochs, sequences, and counters use unsigned long bits;
-use `Long.toUnsignedString` when formatting values beyond signed range.
+| Type | Use |
+| --- | --- |
+| `ClientConfig(brokers)` | Brokers; `withLimits`, `withCapacity`, `withCompression`, `withRequestTimeout` |
+| `BrokerAddress(nodeId, peer, dataPeer)` | Broker UUID and its two endpoints |
+| `Client` | `connect(config)`, `producer(topic)`, `consumer(topic, ReaderOptions)`, `close()` |
+| `Producer` | `send(body, SendOptions)` returns `PendingRecord`; `flush()`; `identity()` |
+| `SendOptions` | `AUTOMATIC`, `key(bytes)`, `partition(n)`, `withId(uuid)` |
+| `PendingRecord` | `confirmed()` returns `Receipt`; `tryConfirmed()` |
+| `Receipt` | `partition()`, `offset()`, `messageId()`, `disposition()`, `policy()` |
+| `Consumer` | `next()`, iteration, `tryNext()`, `checkpoint()`, `stats()` |
+| `Record` | `partition()`, `offset()`, `messageId()`, `body()`, `parts()` |
+| `ReaderOptions` | Earliest or latest start, a `Checkpoint`, or a partition filter |
+| `OzzyException` | SDK failure; `ClosedException` and `BusyException` are subclasses |
 
-`ClientConfig.Limits` separates producer batch bounds from receive-frame
-bounds. Defaults match Python: 1 MiB packets, 64 KiB records, 64 records/256
-parts outbound, 2048/2048 inbound. `Capacity` defaults to 16 partitions, one
-producer, one consumer, and a 32-frame reader queue (range 1..64). Rust charges
-queued and retained backing through the same reservation helpers as Python.
+`send` takes `byte[]`, a `ByteBuffer`, or a `List<ByteBuffer>` of parts. Every
+public API has Javadoc.
 
-`withCompression(Compression.RAW)` disables adaptive APPEND LZ4; consumers
-decode both encodings, including mixed history. The default is adaptive LZ4.
-`lz4+tcp://` selects independent OMQ transport compression; use raw APPENDs to
-avoid applying both layers.
+## Good to know
 
-`scripts/check-java.sh` tests both APIs, codecs, and broker modes over OMQ
-inproc and memory storage, then tests packaged JARs in separate JVMs over TCP
-and LZ4 TCP, including module-path loading, abrupt producer exit, and native
-extraction cleanup. The shared harness remains the
-real broker; these tests do not establish physical-disk or power-loss safety.
+- `send` returns once the record is admitted locally. `confirmed()` waits for
+  durability: the local disk in single-broker mode, two of three copies in disk
+  quorum. Keep many records in flight; confirm or `flush()` later.
+- A key always routes to the same partition. Order holds per partition.
+- Save `producer.identity()` and resume with `client.producer(topic, identity,
+  false)` after a restart. `true` fences an old process still using it.
+- Persist a checkpoint only after processing succeeds, then reopen with
+  `new ReaderOptions(checkpoint)`. It tracks delivery, not application effects.
+  Ozzy gives no exactly-once processing.
+- One active operation per handle; an overlapping call throws
+  `BusyException`. Opens may overlap. Confirmations allow many observers.
+- Canceling a future frees its handle. It never withdraws an admitted record.
+- `Capacity` defaults to one producer and one consumer per client. Raise it
+  for more open handles.
+- Offsets, epochs, and sequences are unsigned 64-bit; format them with
+  `Long.toUnsignedString`.
+- Close producers and consumers before their client. The Cleaner is only a
+  fallback.
+- `Compression.LZ4` (the default) packs APPENDs adaptively. With `lz4+tcp://`
+  endpoints, use `Compression.RAW`.
+- On the module path, use `--enable-native-access=io.ozzy`. The Java-only JAR
+  loads `-Dozzy.native.path=/path/libozzy_java.so`.
 
-## Benchmarks
+## Development
 
-The [SDK process benchmark](../../ozzy-bench/README.md#java-sdk) runs independent
-producer JVMs, the real broker, and a consumer JVM on separate CPU sets. It
-verifies payloads and offsets, bounds backlog, and records CPU and memory.
+`scripts/check-java.sh` tests both APIs against the real broker over OMQ
+inproc and memory storage, then tests the packaged JARs in separate JVMs over
+TCP. The [SDK process benchmark](../../ozzy-bench/README.md#java-sdk) runs
+producer and consumer JVMs against a real broker.
