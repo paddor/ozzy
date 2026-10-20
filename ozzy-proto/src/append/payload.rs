@@ -151,7 +151,7 @@ pub(crate) fn decode_payload_encoding<'a>(
 }
 
 /// Owned payload of a raw or whole-group LZ4 frame: the received `frame`, or
-/// its bytes decompressed into a fresh allocation without zero-filling it.
+/// its bytes decompressed into a fresh allocation.
 pub(crate) fn decode_owned_payload(
     cursor: &mut Reader<'_>,
     frame: &bytes::Bytes,
