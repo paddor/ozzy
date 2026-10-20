@@ -274,13 +274,12 @@ impl Shared {
         if self.sealed() {
             return Some(Err(WriterError::Closed));
         }
-        let reservation = self
-            .inbox
-            .reserve(admission_bytes(bytes, record.parts().len()))?;
+        let parts = record.parts().len();
+        let reservation = self.inbox.reserve(admission_bytes(bytes, parts))?;
         // Normalize caller-owned slices before assigning a sequence. No await
         // or caller destructor interrupts the ticket-to-publication interval,
         // so a flush that captures `next` after the seal covers every ticket.
-        let lengths = if record.shape().0 > 1 {
+        let lengths = if parts > 1 {
             let lengths: Result<Box<[u32]>, _> = record
                 .parts()
                 .map(|part| u32::try_from(part.len()))

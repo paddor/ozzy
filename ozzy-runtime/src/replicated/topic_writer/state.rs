@@ -74,20 +74,19 @@ impl Partitions {
 
     pub(super) async fn send(
         &mut self,
-        record: RecordInput,
+        record: &mut RecordInput,
         selection: TopicSelection<'_>,
     ) -> Result<(u32, PendingRecord), TopicWriterError> {
         let index = self.select(selection)?;
         let partition = &mut self.entries[index];
-        let pending =
-            partition
-                .writer
-                .send(record)
-                .await
-                .map_err(|source| TopicWriterError::Send {
-                    partition: partition.target,
-                    source,
-                })?;
+        let pending = partition
+            .writer
+            .send_input(record)
+            .await
+            .map_err(|source| TopicWriterError::Send {
+                partition: partition.target,
+                source,
+            })?;
         Ok((partition.number, pending))
     }
 

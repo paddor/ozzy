@@ -82,6 +82,7 @@ Clippy and `scripts/check-shape.sh` enforce these:
 
 CI builds with `-C target-cpu=x86-64`. Local builds use `target-cpu=native`
 from `.cargo/config.toml`.
+Release builds use ThinLTO, which increases link time.
 
 ## Nextest profiles
 

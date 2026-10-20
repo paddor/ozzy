@@ -252,11 +252,11 @@ impl SharedTopicWriter {
     /// absent keys remain sticky until an SDK APPEND group forms, then rotate.
     pub async fn send(
         &mut self,
-        record: RecordInput,
+        mut record: RecordInput,
         key: Option<&[u8]>,
     ) -> Result<SharedTopicPendingRecord, TopicWriterError> {
         let selection = key.map_or(TopicSelection::Keyless, TopicSelection::Key);
-        self.send_selected(record, selection).await
+        self.send_selected(&mut record, selection).await
     }
     /// Admit one record to an exact numeric partition, without hashing or
     /// fallback. Unknown partitions fail before admission or sequence assignment.
@@ -267,15 +267,15 @@ impl SharedTopicWriter {
     /// sticky partition, but formed APPENDs still drive keyless rotation.
     pub async fn send_to_partition(
         &mut self,
-        record: RecordInput,
+        mut record: RecordInput,
         partition: u32,
     ) -> Result<SharedTopicPendingRecord, TopicWriterError> {
-        self.send_selected(record, TopicSelection::Partition(partition))
+        self.send_selected(&mut record, TopicSelection::Partition(partition))
             .await
     }
     async fn send_selected(
         &mut self,
-        record: RecordInput,
+        record: &mut RecordInput,
         selection: TopicSelection<'_>,
     ) -> Result<SharedTopicPendingRecord, TopicWriterError> {
         let (number, pending) = self.state.send(record, selection).await?;

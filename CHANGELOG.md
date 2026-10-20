@@ -4,6 +4,8 @@
 
 ### Changed
 
+- Improve small-record producer admission and compressed APPEND validation.
+  Release binaries use ThinLTO.
 - Rust SDK `confirmed()` waits wake only for their own record, so many
   concurrent observers no longer wake each other on every confirmation.
 - Python SDK asyncio wakeups never take the GIL on SDK or transport threads;

@@ -43,6 +43,12 @@ impl InlineBody {
         }
     }
     pub(super) fn from_slice(bytes: &[u8]) -> Self {
+        if let Ok(bytes) = <&[u8; RecordInput::INLINE_BYTES]>::try_from(bytes) {
+            return Self {
+                bytes: *bytes,
+                len: RecordInput::INLINE_BYTES as u8,
+            };
+        }
         let mut body = Self::empty();
         body.bytes[..bytes.len()].copy_from_slice(bytes);
         body.len = bytes.len() as u8;
@@ -126,6 +132,7 @@ impl RecordInput {
     }
 
     /// Borrow opaque parts in their original order, without materializing a table.
+    #[inline]
     pub fn parts(&self) -> impl ExactSizeIterator<Item = &[u8]> + Clone {
         match &self.body {
             InputBody::Packed(payload) => Parts::Single(Some(payload.as_slice())),
@@ -136,6 +143,7 @@ impl RecordInput {
     }
 
     /// Part count and total payload bytes in one pass. `None` on overflow.
+    #[inline]
     pub(super) fn shape(&self) -> (usize, Option<usize>) {
         match &self.body {
             InputBody::Packed(payload) => (1, Some(payload.len())),
@@ -155,7 +163,11 @@ impl RecordInput {
         let InputBody::Inline(body) = &mut self.body else {
             return None;
         };
-        Some(std::mem::replace(body, InlineBody::empty()))
+        let taken = body.clone();
+        // Only the visible length needs clearing; the copied bytes remain
+        // initialized, and the input exposes no payload after admission.
+        body.len = 0;
+        Some(taken)
     }
 
     /// Move the `bytes`-long payload out, leaving an empty body. Called only

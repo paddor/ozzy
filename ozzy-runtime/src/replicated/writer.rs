@@ -393,10 +393,19 @@ impl Writer {
     /// before admission assigns nothing; dropping the returned handle only stops
     /// observation. Waiting immediately on each handle deliberately serializes work.
     pub async fn send(&mut self, mut record: RecordInput) -> Result<PendingRecord, WriterError> {
-        let size = self.shared.validate(&record)?;
+        self.send_input(&mut record).await
+    }
+
+    /// Topic adapters keep the input in their outer future instead of moving
+    /// inline payloads through each private admission future.
+    pub(super) async fn send_input(
+        &mut self,
+        record: &mut RecordInput,
+    ) -> Result<PendingRecord, WriterError> {
+        let size = self.shared.validate(record)?;
         let retained = state::admission_bytes(size, record.parts().len());
         loop {
-            if let Some(result) = self.shared.admit(&mut self.sender, &mut record, size) {
+            if let Some(result) = self.shared.admit(&mut self.sender, record, size) {
                 return result;
             }
             // Capture after rolling back any temporary reservation, then recheck
