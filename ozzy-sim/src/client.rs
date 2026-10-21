@@ -338,14 +338,18 @@ impl Client {
             .collect()
     }
 
-    /// Observe current routing for a controlled broker fault.
-    pub fn leader(&self, partition: u32) -> NodeId {
-        self.routes
-            .route(partition)
-            .unwrap()
-            .unwrap()
-            .leader
-            .unwrap()
+    /// Observe current routing for a controlled broker fault. A view change
+    /// under load can leave the route briefly without a leader.
+    pub async fn leader(&self, partition: u32) -> NodeId {
+        loop {
+            let generation = self.routes.generation();
+            let route = self.routes.route(partition).unwrap();
+            if let Some(leader) = route.and_then(|route| route.leader) {
+                return leader;
+            }
+            self.routes.refresh(partition).unwrap();
+            self.routes.changed_after(generation).await.unwrap();
+        }
     }
 
     /// Resolve the first retained offset through the real reader protocol.

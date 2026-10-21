@@ -107,7 +107,7 @@ async fn inproc_memory_recovery_retries_while_a_donor_completion_is_held() {
         .await;
         let pending = progress(&clock, client.queue(0)).await;
         progress(&clock, client.confirm(pending)).await;
-        let primary = client.leader(0);
+        let primary = progress(&clock, client.leader(0)).await;
         let donor = cluster
             .configs
             .iter()
