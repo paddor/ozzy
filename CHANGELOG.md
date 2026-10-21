@@ -73,6 +73,9 @@
 - A broker no longer stops serving when its connection monitor drops events,
   for example during a burst of short client connections. It rebuilds its
   connection state from the socket instead.
+- SDK broker links no longer fail with "SDK transport monitor lost events"
+  after a stall during broker reconnects. They rebuild each link's connection
+  from the socket instead.
 - A disk-quorum leader whose retention turn came due while an operation waited
   for a lagging follower no longer stalls the partition. The turn also held
   history replay and donor work, so once the other follower failed the
