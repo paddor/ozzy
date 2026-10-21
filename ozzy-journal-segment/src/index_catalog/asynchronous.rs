@@ -52,8 +52,8 @@ impl Catalog {
         validate_sources(&sources)?;
         let handle = access.open_directory(directory.clone()).await?;
         access.done(ozzy_io::Operation::Close { handle }).await?;
-        let mut cache = IndexCache::new();
-        for source in &sources {
+        let mut cache = IndexCache::new(sources.len());
+        for (at, source) in sources.iter().enumerate() {
             let index = crate::index_builder::asynchronous::open(
                 &access,
                 directory.join(segment_index_name(*source)),
@@ -62,6 +62,7 @@ impl Catalog {
                 chunk,
             )
             .await?;
+            cache.filter(at, &index);
             if cache.hot.len() < HOT_INDEX_CAPACITY {
                 cache.hot.push_back(index);
             }
@@ -77,20 +78,30 @@ impl Catalog {
     }
 
     /// Keep only sources of segments from `segment_id` on. Their cached
-    /// indexes move to the narrowed catalog; offset hints start over.
+    /// indexes and operation filters move to the narrowed catalog; offset
+    /// hints start over.
     pub(crate) fn retain_from(&self, segment_id: u64) -> Self {
-        let sources: Rc<[IndexSource]> = self
+        // Sources ascend by segment, so the kept ones are a suffix.
+        let first = self
             .sources
-            .iter()
-            .filter(|source| source.segment_id >= segment_id)
-            .copied()
-            .collect();
-        let mut cache = IndexCache::new();
+            .partition_point(|source| source.segment_id < segment_id);
+        let sources: Rc<[IndexSource]> = self.sources[first..].into();
+        let mut old = self.cache.borrow_mut();
+        let mut cache = IndexCache::new(0);
         cache.hot.extend(
-            std::mem::take(&mut self.cache.borrow_mut().hot)
+            std::mem::take(&mut old.hot)
                 .into_iter()
                 .filter(|index| index.source().segment_id >= segment_id),
         );
+        let kept = first.min(old.filters.len());
+        cache.filters = old.filters.split_off(kept);
+        cache.filtered_ids = cache
+            .filters
+            .iter()
+            .flatten()
+            .map(|filter| filter.0.len())
+            .sum();
+        drop(old);
         Self {
             access: self.access.clone(),
             directory: self.directory.clone(),
@@ -247,7 +258,11 @@ impl Catalog {
             .iter()
             .chain(self.sources.iter().rev().filter(|s| !hot.contains(s)))
         {
-            if source.first_op_number > through {
+            if source.first_op_number > through
+                || self
+                    .position(*source)
+                    .is_some_and(|at| self.cache.borrow().lacks(at, id))
+            {
                 continue;
             }
             if let Some(entry) = self
@@ -290,6 +305,14 @@ impl Catalog {
         Ok(Some(IndexedOperation { source, location }))
     }
 
+    /// Position of exactly `source` in this catalog.
+    fn position(&self, source: IndexSource) -> Option<usize> {
+        self.sources
+            .binary_search_by_key(&source.segment_id, |s| s.segment_id)
+            .ok()
+            .filter(|at| self.sources[*at] == source)
+    }
+
     fn hot_sources(&self, through: u64) -> smallvec::SmallVec<[IndexSource; HOT_INDEX_CAPACITY]> {
         self.cache
             .borrow()
@@ -324,6 +347,9 @@ impl Catalog {
             self.chunk,
         )
         .await?;
+        if let Some(at) = self.position(source) {
+            self.cache.borrow_mut().filter(at, &index);
+        }
         let result = lookup(&index)?;
         if result.is_some() {
             let mut cache = self.cache.borrow_mut();

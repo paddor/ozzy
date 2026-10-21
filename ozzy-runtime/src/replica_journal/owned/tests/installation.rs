@@ -147,10 +147,10 @@ fn selected(controller: &mut Controller, io: Local) -> (Voter, Voter) {
     .unwrap();
     let result = primary
         .driver
-        .select(|source, op| {
+        .select(|source, expected: ozzy_replication::Prefix| {
             [common, protected]
                 .iter()
-                .find(|entry| source == entry.source && op == entry.op)
+                .find(|entry| source == entry.source && expected.op == entry.op)
                 .and_then(|entry| entry.position.map(|position| position.digest))
         })
         .unwrap();
@@ -269,8 +269,8 @@ fn installed_pair(controller: &mut Controller, io: Local) -> (Voter, Voter) {
             primary.source.voter,
             start,
             JournalGeneration(102),
-            |source, op| {
-                (source == protected.source && op == protected.op)
+            |source, expected: ozzy_replication::Prefix| {
+                (source == protected.source && expected.op == protected.op)
                     .then(|| protected.position.unwrap().digest)
             },
         )
@@ -599,10 +599,13 @@ fn owned_history_request_errors_preserve_source_and_bounded_leases() {
         JournalError::History(ozzy_journal_segment::HistoryError::BodyBudget { .. })
     ));
     assert!(!voter.journal.is_faulted());
+    // A predecessor the source does not hold names its boundary to rescan from.
     fetch.max_body_bytes = 8192;
     fetch.predecessor.digest = Digest::from_bytes([99; 32]);
     let buffer = voter.journal.lease_append_buffer().unwrap();
-    assert!(drive(&mut controller, voter.journal.fetch_history(fetch, buffer)).is_err());
+    let fetched = drive(&mut controller, voter.journal.fetch_history(fetch, buffer)).unwrap();
+    assert_eq!(fetched.retired_predecessor(), Some(Prefix::GENESIS));
+    drop(fetched);
     assert!(!voter.journal.is_faulted());
     assert!(
         voter

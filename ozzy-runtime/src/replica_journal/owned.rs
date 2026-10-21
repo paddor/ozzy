@@ -13,6 +13,7 @@ use mode::Mode;
 mod donor;
 mod history;
 mod identities;
+mod indexing;
 pub use donor::{
     CompletedCheckpointRead, CompletedRecoveryRead, PreparedCheckpointRead, PreparedRecoveryRead,
 };
@@ -75,6 +76,10 @@ pub struct OwnedJournal {
     configuration: Mode,
     scope: Scope,
     images: Option<CanonicalImages<JournalIdentityIndex>>,
+    indexing: indexing::Indexing,
+    /// Committed state through `applied` while an election holds no images.
+    /// An installation replays only after it.
+    committed_base: Option<ozzy_core::state::CanonicalState>,
     dedup: dedup::State,
     selected: Option<CanonicalRecoveryCandidate>,
     history: Option<JournalHistory>,
@@ -263,6 +268,8 @@ impl OwnedJournal {
             configuration,
             scope,
             images,
+            committed_base: None,
+            indexing: indexing::Indexing::default(),
             dedup: dedup::State::new(config.deduplication),
             selected: None,
             history: None,
@@ -370,6 +377,20 @@ impl OwnedJournal {
         let next = authority::promise_manifest(self.scope, journal, ticket)?;
         if let Some(next) = next {
             self.abandon_retirement();
+            // Committed state never rolls back; keep it for the installation.
+            let base = self
+                .images
+                .as_ref()
+                .map(CanonicalImages::committed)
+                .or_else(|| {
+                    self.selected
+                        .as_ref()
+                        .map(|candidate| candidate.committed_images().committed())
+                })
+                .cloned();
+            if base.is_some() {
+                self.committed_base = base;
+            }
             self.images = None;
             self.dedup.clear();
             self.reader = None;
@@ -421,6 +442,7 @@ impl OwnedJournal {
             self.storage_validation.clear();
             self.donors = std::array::from_fn(|_| None);
             self.images = None;
+            self.committed_base = None;
             self.selected = None;
             self.journal.take_ready()?.close().await?;
             Ok(())

@@ -28,14 +28,47 @@ impl Journal {
     /// Validate the selected tail privately without retaining historical plans.
     /// The caller must establish group agreement and publish that exact tail
     /// before activation. Application visibility stays at the old commit floor.
-    pub async fn recover_canonical_candidate(
+    pub fn recover_canonical_candidate(
         &mut self,
         limits: CanonicalRecoveryLimits,
+    ) -> impl Future<Output = Result<Candidate, Error>> + '_ {
+        // No wrapping future: callers sit deep in startup futures, and debug
+        // builds give every poll frame its own copy.
+        self.recover_candidate(limits, None)
+    }
+
+    /// As `recover_canonical_candidate`, but replay only after `base`, the
+    /// caller's canonical state through `at`. `at` must be in this selected
+    /// history at or after its checkpoint, and `base` must be the state that
+    /// history gives through `at`; replay checks the position, not the state.
+    pub async fn recover_canonical_candidate_after(
+        &mut self,
+        limits: CanonicalRecoveryLimits,
+        at: LogPosition,
+        base: CanonicalState,
+    ) -> Result<Candidate, Error> {
+        if base.revision() != at.op_number {
+            return Err(Error::PositionMismatch);
+        }
+        Box::pin(self.recover_candidate(limits, Some((at, base)))).await
+    }
+
+    async fn recover_candidate(
+        &mut self,
+        limits: CanonicalRecoveryLimits,
+        base: Option<(LogPosition, CanonicalState)>,
     ) -> Result<Candidate, Error> {
         if self.is_faulted() || self.writer.written_position() != self.writer.durable_position() {
             return Err(Error::SelectionChanged);
         }
-        let mut selected = self.initial_canonical_state(limits).await?;
+        let checkpoint = self
+            .manifest
+            .checkpoint
+            .map_or(LogPosition::GENESIS, |value| value.position);
+        let (start, mut selected) = match base {
+            Some((at, base)) if at.op_number >= checkpoint.op_number => (at, base),
+            _ => (checkpoint, self.initial_canonical_state(limits).await?),
+        };
         let committed_position = self.committed_position()?;
         let accepted_position = self.accepted_position()?;
         let (committed_snapshot, accepted_snapshot) =
@@ -43,7 +76,7 @@ impl Journal {
         let mut committed =
             (selected.revision() == committed_position.op_number).then(|| selected.clone());
         finish_replay(
-            self.replay_accepted_async(async |item| {
+            self.replay_accepted_after_async(start, async |item| {
                 let op = item.operation;
                 let body = decode_operation_body(op.kind, &op.body, self.limits.operations)?;
                 let mut replay =

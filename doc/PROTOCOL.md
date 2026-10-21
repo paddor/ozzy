@@ -569,6 +569,9 @@ History source is `voter_id:u128, writer_generation:u128, accepted:OpPosition`.
   comes from that source, and matches scope, session, predecessor, and limits.
 - Nonzero count and byte limits are ceilings. Empty responses and requests at
   or beyond the tail fail.
+- A history lookup starts at the prefix it expects. A source that does not
+  hold that predecessor answers HISTORY_RETIRED with its retained boundary,
+  possibly genesis, and the lookup rescans from there.
 - Verified transfer is neither installation nor commit.
 
 ### Lost-state recovery
@@ -602,8 +605,9 @@ suspicion of the view; a restart probe still votes.
   private until schema, digest, and original anchor validate.
 - HISTORY_RETIRED (`0x55`) is uncorrelated, with 137 metadata bytes and empty
   payload: common prefix, fence tag `u8` (0 receive epoch, 1 fetch ID),
-  receive epoch or fetch ID `16`, retained predecessor `40`. It tells a
-  receiver to withdraw into recovery and grants no authority. See
+  receive epoch or fetch ID `16`, retained predecessor `40`. Only a fetch
+  fence may name genesis. It tells a receiver to withdraw into recovery, or a
+  lookup to rescan from the boundary, and grants no authority. See
   [retained history](REPLICATION.md#retained-history).
 
 ## Admin console

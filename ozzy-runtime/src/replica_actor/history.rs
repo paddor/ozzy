@@ -111,15 +111,23 @@ impl ReplicaActor {
     /// Look up the digest of `op` in `source`: from the journal when it is the
     /// pinned local source, otherwise through a lookup transfer. `reason`
     /// names the failure when a local source is not pinned.
+    ///
+    /// A remote lookup starts at `expected`, the prefix the caller checks. A
+    /// source that holds it proves it by a short chain to its tail; one that
+    /// does not answers with its retained boundary, and the scan restarts
+    /// there. Without `expected` the scan starts at genesis.
     pub(super) fn lookup_history(
         &mut self,
         source: LogSource,
         op: OpNumber,
+        expected: Option<Prefix>,
         reason: HistoryReason,
     ) -> Result<(), ActorError> {
         if source.voter != self.local {
-            let purpose = TransferPurpose::Lookup { op, found: None };
-            return self.start_transfer(self.driver.scope(), source, Prefix::GENESIS, purpose);
+            let start = expected.filter(|start| start.op == op && op < source.accepted.op);
+            let purpose = TransferPurpose::Lookup { op, found: start };
+            let predecessor = start.unwrap_or(Prefix::GENESIS);
+            return self.start_transfer(self.driver.scope(), source, predecessor, purpose);
         }
         if self.pinned != Some(source) {
             return Err(ActorError::history(reason));
@@ -395,41 +403,31 @@ impl ReplicaActor {
         {
             return Ok(());
         }
-        if request.predecessor.op >= positions.retained_predecessor.op {
-            if positions.positions[0] != Some(request.predecessor) {
-                return Ok(());
+        let retired = request.predecessor.op < positions.retained_predecessor.op;
+        match positions.positions[0] {
+            // A position not read is no evidence either way.
+            None if !retired => return Ok(()),
+            Some(held) if !retired && held == request.predecessor => {}
+            // A retired predecessor, or another prefix at its op: name the
+            // boundary to rescan from.
+            _ => {
+                return self.notify_retired(
+                    to,
+                    request.scope,
+                    wire::HistoryFence::Fetch(request.request_id),
+                    positions.retained_predecessor,
+                );
             }
-            let Some(buffer) = self.buffer.take() else {
-                return Ok(());
-            };
-            self.pending = Some(PendingIo::Fetch(
-                self.journal
-                    .fetch_history(request, buffer)
-                    .map_err(|rejected| rejected.reason)?,
-                FetchPurpose::Serve(to),
-            ));
-            return Ok(());
         }
-        let Some(session) = self.session(to) else {
+        let Some(buffer) = self.buffer.take() else {
             return Ok(());
         };
-        let notice = wire::HistoryRetired {
-            scope: request.scope,
-            fence: wire::HistoryFence::Fetch(request.request_id),
-            before: positions.retained_predecessor,
-        };
-        let encoded = wire::encode_history_retired(
-            self.local,
-            session,
-            notice,
-            &mut self.metadata,
-            self.wire_limits,
-        )?;
-        self.enqueue(
-            to,
-            SendClass::Control,
-            super::control_message(encoded, &self.metadata),
-        )?;
+        self.pending = Some(PendingIo::Fetch(
+            self.journal
+                .fetch_history(request, buffer)
+                .map_err(|rejected| rejected.reason)?,
+            FetchPurpose::Serve(to),
+        ));
         Ok(())
     }
 }
@@ -501,11 +499,29 @@ impl ReplicaActor {
             transfer.request.request_id == id
                 && transfer.request.scope == notice.scope
                 && transfer.request.source.voter == from
-                && transfer.request.predecessor.op < notice.before.op
                 && notice.before.op <= transfer.request.source.accepted.op
         }) else {
             return Ok(false);
         };
+        if notice.before.op <= transfer.request.predecessor.op {
+            // The source does not hold the expected prefix a lookup started
+            // from. Rescan from its boundary; the digest found there is
+            // evidence once the scan reaches the tail.
+            if notice.before != transfer.request.predecessor
+                && let TransferPurpose::Lookup { op, .. } = transfer.purpose
+            {
+                self.start_transfer(
+                    notice.scope,
+                    transfer.request.source,
+                    notice.before,
+                    TransferPurpose::Lookup {
+                        op,
+                        found: (op == notice.before.op).then_some(notice.before),
+                    },
+                )?;
+            }
+            return Ok(false);
+        }
         if let TransferPurpose::Lookup { op, .. } = transfer.purpose
             && op >= notice.before.op
         {

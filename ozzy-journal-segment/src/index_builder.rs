@@ -157,6 +157,10 @@ impl SegmentIndex {
         self.view().offsets()
     }
 
+    pub(crate) fn operation_ids(&self) -> impl ExactSizeIterator<Item = OperationId> + '_ {
+        self.view().operation_ids()
+    }
+
     pub(crate) fn view(&self) -> SegmentIndexView<'_> {
         SegmentIndexView::from_validated(
             &self.bytes,

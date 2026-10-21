@@ -178,7 +178,20 @@ impl OwnedJournal {
         }
         let pending = self.journal.take_installing()?;
         let mut journal = Box::pin(pending.staging.finish()).await?;
-        let candidate = journal.recover_canonical_candidate(self.recovery).await?;
+        // Installation keeps the applied prefix, so replay starts from its
+        // state instead of the checkpoint.
+        let base = self
+            .committed_base
+            .take()
+            .filter(|state| state.revision() == self.applied.op.0);
+        let candidate = match base {
+            Some(base) => {
+                journal
+                    .recover_canonical_candidate_after(self.recovery, position(self.applied), base)
+                    .await?
+            }
+            None => journal.recover_canonical_candidate(self.recovery).await?,
+        };
         if candidate.accepted_position() != position(ticket.accepted())
             || candidate.committed_images().committed().revision() != ticket.committed().op.0
         {
@@ -235,6 +248,7 @@ impl OwnedJournal {
         );
         self.abandon_retirement();
         self.images = Some(candidate.activate(self.journal.ready()?)?);
+        self.committed_base = None;
         self.applied = ticket.through();
         self.pending.clear();
         self.restore_dedup().await?;

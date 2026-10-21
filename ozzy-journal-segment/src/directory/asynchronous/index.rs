@@ -72,13 +72,15 @@ impl Journal {
     ) -> Result<SegmentIndex, DirectoryError> {
         self.healthy()?;
         let (reference, source) = self.index_source(segment)?;
-        // Validate immutable authority before reuse or explicit index repair.
-        let mut validated = self.segment_groups(reference).await?;
-        while validated.next().await?.is_some() {}
-        validated.finish().await?;
-        let groups = self.segment_groups(reference).await?;
+        let scope = self.group_scope(reference)?;
         self.interrupted = true;
-        let index = Builder {
+        let index = Box::pin(build(scope, self.index_builder(), source, limits, repair)).await?;
+        self.interrupted = false;
+        Ok(index)
+    }
+
+    fn index_builder(&self) -> Builder {
+        Builder {
             access: self.access.clone(),
             root: self.root().to_path_buf(),
             io: Limits {
@@ -88,9 +90,110 @@ impl Journal {
             },
             operations: self.limits.operations,
         }
-        .build(groups, source, limits, repair)
-        .await?;
-        self.interrupted = false;
-        Ok(index)
     }
+
+    /// The oldest sealed segment this owner has not validated, as a detached
+    /// index build; `finish_index_job` records it. The caller runs one at a
+    /// time.
+    pub fn prepare_index_job(
+        &self,
+        limits: IndexBuildLimits,
+    ) -> Result<Option<IndexJob>, DirectoryError> {
+        self.healthy()?;
+        for pair in self.manifest.segments.windows(2) {
+            let source = crate::directory::sealed_source(
+                self.manifest.identity.group_id,
+                &pair[0],
+                &pair[1],
+            )?;
+            if self.validated_indexes.borrow().get(&source.segment_id) == Some(&source) {
+                continue;
+            }
+            return Ok(Some(IndexJob {
+                scope: self.group_scope(pair[0])?,
+                builder: self.index_builder(),
+                source,
+                limits,
+            }));
+        }
+        Ok(None)
+    }
+
+    /// Record a finished job while its segment is still selected. A failed
+    /// job publishes nothing; the next snapshot build retries the segment.
+    pub fn finish_index_job(&self, built: &BuiltIndex) {
+        let selected = self
+            .index_source(built.source.segment_id)
+            .is_ok_and(|(_, source)| source == built.source);
+        if built.valid && selected {
+            self.validated_indexes
+                .borrow_mut()
+                .insert(built.source.segment_id, built.source);
+        }
+    }
+}
+
+/// A detached build of one sealed segment's index. It reads only immutable
+/// sealed bytes and writes derived files, so writes continue beside it.
+#[derive(Debug)]
+pub struct IndexJob {
+    scope: super::groups::GroupScope,
+    builder: Builder,
+    source: IndexSource,
+    limits: IndexBuildLimits,
+}
+
+/// The outcome of an `IndexJob`.
+#[derive(Debug)]
+pub struct BuiltIndex {
+    source: IndexSource,
+    valid: bool,
+}
+
+impl BuiltIndex {
+    /// Whether the index was built or validated.
+    pub const fn valid(&self) -> bool {
+        self.valid
+    }
+}
+
+impl IndexJob {
+    /// Build, or validate and reuse, the index. A failure publishes nothing.
+    pub async fn run(self) -> BuiltIndex {
+        let valid = build(self.scope, self.builder, self.source, self.limits, false)
+            .await
+            .is_ok();
+        BuiltIndex {
+            source: self.source,
+            valid,
+        }
+    }
+}
+
+/// Validate the immutable segment once: before reuse or explicit repair, or
+/// by the build itself, which checks every group and the segment end before
+/// it publishes.
+async fn build(
+    scope: super::groups::GroupScope,
+    builder: Builder,
+    source: IndexSource,
+    limits: IndexBuildLimits,
+    repair: bool,
+) -> Result<SegmentIndex, DirectoryError> {
+    let reused = if repair {
+        None
+    } else {
+        builder.reuse_existing(source, limits).await?
+    };
+    if repair || reused.is_some() {
+        let mut validated = scope.clone().open(None).await?;
+        while validated.next().await?.is_some() {}
+        validated.finish().await?;
+    }
+    if let Some(index) = reused {
+        return Ok(index);
+    }
+    // Boxed: index builds run deep inside snapshot and startup futures.
+    let groups = scope.open(None).await?;
+    Box::pin(builder.build(groups, source, limits, repair)).await
 }

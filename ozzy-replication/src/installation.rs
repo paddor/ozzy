@@ -3,9 +3,8 @@
 use ozzy_proto::NodeId;
 
 use crate::{
-    Configuration, Digest, JournalGeneration, LogSource, NormalReplica, OpNumber, Prefix,
-    PreparedOperation, PromiseTicket, ReplicationError, Scope, ViewChange, ViewChangeError,
-    VoterIndex,
+    Configuration, Digest, JournalGeneration, LogSource, NormalReplica, Prefix, PreparedOperation,
+    PromiseTicket, ReplicationError, Scope, ViewChange, ViewChangeError, VoterIndex,
 };
 
 /// Immutable `START_VIEW` sent only after the primary durably installs this log.
@@ -350,7 +349,7 @@ impl ViewChange {
         mut self,
         received: ReceivedStart,
         generation: JournalGeneration,
-        mut lookup: impl FnMut(LogSource, OpNumber) -> Option<Digest>,
+        mut lookup: impl FnMut(LogSource, Prefix) -> Option<Digest>,
     ) -> Result<InstallingView, RejectedInstallation> {
         let admitted = self.admit_backup(received, generation, &mut lookup);
         self.stage(&admitted, Suffix::Streamed)
@@ -395,7 +394,7 @@ impl ViewChange {
         received: ReceivedStart,
         generation: JournalGeneration,
         suffix: &[PreparedOperation],
-        mut lookup: impl FnMut(LogSource, OpNumber) -> Option<Digest>,
+        mut lookup: impl FnMut(LogSource, Prefix) -> Option<Digest>,
     ) -> Result<InstallingView, RejectedInstallation> {
         let admitted = self
             .admit_backup(received, generation, &mut lookup)
@@ -424,7 +423,7 @@ impl ViewChange {
         &mut self,
         ReceivedStart { from, start }: ReceivedStart,
         generation: JournalGeneration,
-        lookup: &mut impl FnMut(LogSource, OpNumber) -> Option<Digest>,
+        lookup: &mut impl FnMut(LogSource, Prefix) -> Option<Digest>,
     ) -> Result<Admitted, ViewChangeError> {
         self.require_scope(start.scope)?;
         let promise = self.require_promised()?;

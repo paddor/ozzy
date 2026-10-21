@@ -12,6 +12,7 @@ pub use checkpoint::{
 pub(crate) mod groups;
 mod history;
 mod index;
+pub use index::{BuiltIndex, IndexJob};
 mod metadata;
 mod opening;
 pub use opening::Opening;
@@ -116,7 +117,7 @@ pub struct Journal {
     pins: std::rc::Rc<crate::retention::PinRegistry>,
     /// Set while a cleanup capture lives; checkpoint selection waits for it.
     cleaning: std::rc::Rc<std::cell::Cell<bool>>,
-    validated_indexes: std::collections::BTreeMap<u64, crate::IndexSource>,
+    validated_indexes: std::cell::RefCell<std::collections::BTreeMap<u64, crate::IndexSource>>,
     /// Validated active-segment prefix reused by the next built snapshot.
     active_prefix: Option<Box<crate::active_index::ActivePrefix>>,
 }
@@ -370,21 +371,47 @@ impl Journal {
     /// The caller must discard partial results if final segment authority fails.
     pub async fn replay_accepted_async<E>(
         &self,
+        visit: impl AsyncFnMut(ReplayedOperation<'_>) -> Result<(), E>,
+    ) -> Result<(), ReplayError<E>>
+    where
+        E: std::error::Error + 'static,
+    {
+        let start = self
+            .manifest
+            .checkpoint
+            .map_or(LogPosition::GENESIS, |value| value.position);
+        self.replay_accepted_after_async(start, visit).await
+    }
+
+    /// Replay the accepted operations after `start` instead of the checkpoint.
+    /// Segments wholly before it are not read. `start` must be at or after the
+    /// checkpoint and in this history: its op, or the chain a segment starts
+    /// from, must carry its digest.
+    pub(crate) async fn replay_accepted_after_async<E>(
+        &self,
+        start: LogPosition,
         mut visit: impl AsyncFnMut(ReplayedOperation<'_>) -> Result<(), E>,
     ) -> Result<(), ReplayError<E>>
     where
         E: std::error::Error + 'static,
     {
         self.healthy().map_err(ReplayError::Journal)?;
-        let start = self
-            .manifest
-            .checkpoint
-            .map_or(LogPosition::GENESIS, |value| value.position);
         let accepted = self.accepted_position().map_err(ReplayError::Journal)?;
         let committed = self.committed_position().map_err(ReplayError::Journal)?;
         let mut replayed = start;
+        let mut anchored = start.op_number == 0;
         let mut budget = crate::cooperative::Budget::default();
-        for reference in &self.manifest.segments {
+        let segments = &self.manifest.segments;
+        for (at, reference) in segments.iter().enumerate() {
+            if segments
+                .get(at + 1)
+                .is_some_and(|next| next.first_chain.next_op_number() <= start.op_number)
+            {
+                continue;
+            }
+            if reference.first_chain.next_op_number() == start.op_number + 1 {
+                anchored = reference.first_chain.previous_digest() == start.digest;
+            }
             let mut groups = self
                 .segment_groups(*reference)
                 .await
@@ -392,6 +419,9 @@ impl Journal {
             while let Some(group) = groups.next().await.map_err(ReplayError::Journal)? {
                 for operation in &group.operations {
                     budget.charge(operation.body.len()).await;
+                    if operation.op_number == start.op_number {
+                        anchored = operation.digest == start.digest;
+                    }
                     if operation.op_number <= start.op_number
                         || operation.op_number > accepted.op_number
                     {
@@ -410,6 +440,11 @@ impl Journal {
                 }
             }
             groups.finish().await.map_err(ReplayError::Journal)?;
+        }
+        if !anchored {
+            return Err(ReplayError::Journal(DirectoryError::PositionMismatch(
+                start.op_number,
+            )));
         }
         if replayed != accepted {
             return Err(ReplayError::Journal(DirectoryError::PositionMismatch(

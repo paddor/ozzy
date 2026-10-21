@@ -106,7 +106,13 @@ impl OwnedJournal {
             .as_ref()
             .is_some_and(|history| source(history) == request.source)
         {
-            fetch(self.history(request.source)?, request, buffer, false).await
+            fetch(
+                self.history(request.source)?,
+                request,
+                buffer,
+                Answer::Rescan,
+            )
+            .await
         } else {
             let journal = self.journal.readable()?;
             if request.source.voter != journal.manifest().identity.replica_node_id
@@ -120,7 +126,7 @@ impl OwnedJournal {
                     self.limits.io.max_segment_bytes as usize,
                 )
                 .await?;
-            fetch(&mut history, request, buffer, false).await
+            fetch(&mut history, request, buffer, Answer::Rescan).await
         };
         self.faulted |= result
             .as_ref()
@@ -130,11 +136,23 @@ impl OwnedJournal {
     }
 }
 
+/// How a fetch answers a request the source cannot serve as asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Answer {
+    /// Any mismatch fails. The request comes from validated local state.
+    Exact,
+    /// A body larger than the credit returns its size for a retry.
+    Backpressure,
+    /// A predecessor outside the source returns the retained boundary, so a
+    /// lookup that started at its expected prefix rescans from there.
+    Rescan,
+}
+
 pub(super) async fn fetch(
     history: &mut JournalHistory,
     request: FetchOps,
     mut buffer: AppendBuffer,
-    backpressure: bool,
+    answer: Answer,
 ) -> Result<FetchedHistory, JournalError> {
     if request.predecessor.op.0 < history.predecessor().op_number {
         return Ok(FetchedHistory {
@@ -154,13 +172,24 @@ pub(super) async fn fetch(
         .await
     {
         Ok(chunk) => chunk,
-        Err(ozzy_journal_segment::HistoryError::BodyBudget { required, .. }) if backpressure => {
+        Err(ozzy_journal_segment::HistoryError::BodyBudget { required, .. })
+            if answer == Answer::Backpressure =>
+        {
             return Ok(FetchedHistory {
                 request,
                 end: request.predecessor,
                 buffer,
                 minimum_body_bytes: Some(required),
                 retired_predecessor: None,
+            });
+        }
+        Err(ozzy_journal_segment::HistoryError::Predecessor) if answer == Answer::Rescan => {
+            return Ok(FetchedHistory {
+                request,
+                end: request.predecessor,
+                buffer,
+                minimum_body_bytes: None,
+                retired_predecessor: Some(prefix(history.predecessor())),
             });
         }
         Err(error) => {

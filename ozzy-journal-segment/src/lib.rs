@@ -66,11 +66,12 @@ pub use codec::{
     encode_group_with_body_encoding, encode_segment_header, scan_segment,
 };
 pub use directory::asynchronous::{
-    Candidate as CanonicalRecoveryCandidate, CanonicalCheckpointImport, CheckpointBuildPlan,
-    CheckpointCursor, CheckpointFiles, CheckpointInbox, CheckpointInboxStream, CheckpointRecovery,
-    CheckpointSource, CheckpointStream, CheckpointWriter, Completed as CompletedJournalWrite,
-    CompletedRoll as CompletedJournalRoll, CompletedSync as CompletedJournalSync, ExpectedStore,
-    Format as JournalFormat, Installer as SuffixInstaller, Journal as GroupJournal,
+    BuiltIndex as BuiltJournalIndex, Candidate as CanonicalRecoveryCandidate,
+    CanonicalCheckpointImport, CheckpointBuildPlan, CheckpointCursor, CheckpointFiles,
+    CheckpointInbox, CheckpointInboxStream, CheckpointRecovery, CheckpointSource, CheckpointStream,
+    CheckpointWriter, Completed as CompletedJournalWrite, CompletedRoll as CompletedJournalRoll,
+    CompletedSync as CompletedJournalSync, ExpectedStore, Format as JournalFormat,
+    IndexJob as JournalIndexJob, Installer as SuffixInstaller, Journal as GroupJournal,
     Limits as JournalLimits, Opening as JournalOpening, PendingRoll as PendingJournalRoll,
     Pipeline as JournalWritePipeline, Prepared as PreparedJournalWrite,
     PreparedRoll as PreparedJournalRoll, PreparedSegment, PreparedSync as PreparedJournalSync,

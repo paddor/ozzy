@@ -3,7 +3,7 @@
 use crate::replica_actor::HistoryReason::ViewInstallation;
 use crate::replica_actor::require_normal;
 use crate::replica_journal::FetchedHistory;
-use ozzy_replication::ViewChangeError;
+use ozzy_replication::{Prefix, ViewChangeError};
 
 use super::history::TransferPurpose;
 use super::io::{Completed, FetchPurpose};
@@ -190,9 +190,9 @@ impl ReplicaActor {
         let generation = self.ids.generation()?;
         let mut missing = None;
         let lookup = &self.lookup;
-        let mut get = |source, op| {
-            lookup.get(source, op).or_else(|| {
-                missing = Some((source, op));
+        let mut get = |source, expected: Prefix| {
+            lookup.get(source, expected.op).or_else(|| {
+                missing = Some((source, expected));
                 None
             })
         };
@@ -220,9 +220,10 @@ impl ReplicaActor {
                 ));
             }
             Err(DriverError::ViewChange(ViewChangeError::HistoryMissing)) => {
-                let (source, op) = missing.ok_or_else(|| ActorError::history(ViewInstallation))?;
-                if !self.lookup.unavailable(source, op) {
-                    self.lookup_history(source, op, ViewInstallation)?;
+                let (source, expected) =
+                    missing.ok_or_else(|| ActorError::history(ViewInstallation))?;
+                if !self.lookup.unavailable(source, expected.op) {
+                    self.lookup_history(source, expected.op, Some(expected), ViewInstallation)?;
                 }
             }
             Err(DriverError::ViewChange(
@@ -342,7 +343,8 @@ impl ReplicaActor {
             .take()
             .ok_or_else(|| ActorError::history(ViewInstallation))?
             .request;
-        if fetched.request() != request {
+        // The local source holds every staged predecessor it installs from.
+        if fetched.request() != request || fetched.retired_predecessor().is_some() {
             return Err(ActorError::history(ViewInstallation));
         }
         let buffer = fetched.into_buffer();

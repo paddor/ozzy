@@ -66,6 +66,18 @@
 
 ### Fixed
 
+- Disk-quorum view changes after a long history finish within the election
+  timeouts instead of retrying elections forever. A backup checks the new
+  leader's history from its own commit point, not from the first operation;
+  installation replays only after the replica's committed state, and the
+  promise reads only the segments holding its positions.
+- Sealed segment indexes are built in the background after each roll. View
+  changes, identity refreshes, and retry lookups no longer build them, twice
+  scanning each segment, while the partition admits nothing.
+- Identity lookups across more than four sealed segments no longer reread an
+  index file for every replayed operation.
+- A history fetch from a predecessor the source does not hold no longer stops
+  the serving partition; it answers `HISTORY_RETIRED` with its boundary.
 - A disk-quorum leader whose retention turn came due while a proposal waited
   to start no longer leaves it waiting for the 100 ms safety sweep. The
   partition did not schedule its next round, which counted as

@@ -26,7 +26,7 @@ use ozzy_proto::NodeId;
 
 use crate::wire::Control;
 use crate::{
-    Configuration, Digest, InstallingView, LogSource, NormalReplica, OpNumber, PromiseTicket,
+    Configuration, Digest, InstallingView, LogSource, NormalReplica, Prefix, PromiseTicket,
     ReplicaSnapshot, ReplicationError, Scope, SelectedView, Status, ViewChange, ViewChangeError,
     VoterIndex, VoterSet, Voters,
 };
@@ -245,7 +245,7 @@ impl ReplicaDriver {
     /// Missing history/quorum is recoverable. Success is not installed authority.
     pub fn select(
         &mut self,
-        lookup: impl FnMut(LogSource, OpNumber) -> Option<Digest>,
+        lookup: impl FnMut(LogSource, Prefix) -> Option<Digest>,
     ) -> Result<SelectedView, DriverError> {
         Ok(self.changing()?.select(lookup)?)
     }

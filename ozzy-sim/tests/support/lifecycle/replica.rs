@@ -438,8 +438,8 @@ impl Replica {
         let mut driver = self.driver.take().unwrap();
         let primary = self.configuration.primary(driver.scope().view) == node(self.id);
         let mut missing = None;
-        let mut lookup = |source, number| {
-            self.lookup(source, number).or_else(|| {
+        let mut lookup = |source, expected: Prefix| {
+            self.lookup(source, expected.op).or_else(|| {
                 missing = Some(source);
                 None
             })
@@ -482,9 +482,12 @@ impl Replica {
             driver.begin_primary_install(generation)
         } else {
             let (from, start) = self.start.unwrap();
-            driver.begin_backup_install(node(from), start, generation, |source, number| {
-                self.lookup(source, number)
-            })
+            driver.begin_backup_install(
+                node(from),
+                start,
+                generation,
+                |source, expected: Prefix| self.lookup(source, expected.op),
+            )
         };
         self.driver = Some(driver);
         match ticket {

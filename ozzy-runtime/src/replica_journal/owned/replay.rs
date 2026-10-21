@@ -71,7 +71,8 @@ impl PreparedReplay {
             buffer,
             slot,
         } = self;
-        let result = history::fetch(&mut history, request, buffer, true).await;
+        let result =
+            history::fetch(&mut history, request, buffer, history::Answer::Backpressure).await;
         CompletedReplay {
             key,
             history,

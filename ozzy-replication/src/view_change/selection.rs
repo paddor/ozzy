@@ -10,7 +10,9 @@ impl ViewChange {
     /// `lookup` must be a nonblocking lookup into already verified, pinned
     /// canonical history anchored by the supplied source's exact tail digest.
     /// An isolated matching hash or a chunk from another generation is not such
-    /// evidence. Missing bytes return `None`; fetch/verify them outside the core.
+    /// evidence. It returns the source's digest at the prefix's op; the prefix
+    /// is the expected value, a fetch hint and never evidence. Missing bytes
+    /// return `None`; fetch/verify them outside the core.
     /// At most six protected-prefix lookups are needed for three voters.
     ///
     /// Selection includes this primary's report and another distinct voter. It
@@ -18,7 +20,7 @@ impl ViewChange {
     /// Higher-normal-view histories may discard only older uncertain suffixes.
     pub fn select(
         &mut self,
-        mut lookup: impl FnMut(LogSource, OpNumber) -> Option<Digest>,
+        mut lookup: impl FnMut(LogSource, Prefix) -> Option<Digest>,
     ) -> Result<SelectedView, ViewChangeError> {
         self.require_promised()?;
         self.require_primary()?;
@@ -80,7 +82,7 @@ impl ViewChange {
         &mut self,
         source: LogSource,
         prefix: Prefix,
-        lookup: &mut impl FnMut(LogSource, OpNumber) -> Option<Digest>,
+        lookup: &mut impl FnMut(LogSource, Prefix) -> Option<Digest>,
     ) -> Result<(), ViewChangeError> {
         if prefix.op > source.accepted.op {
             return Err(self.conflict());
@@ -90,7 +92,7 @@ impl ViewChange {
         } else if prefix.op == source.accepted.op {
             source.accepted.digest
         } else {
-            lookup(source, prefix.op).ok_or(ViewChangeError::HistoryMissing)?
+            lookup(source, prefix).ok_or(ViewChangeError::HistoryMissing)?
         };
         if digest != prefix.digest {
             return Err(self.conflict());

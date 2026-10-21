@@ -82,6 +82,8 @@ pub struct FetchedHistory {
 }
 
 impl FetchedHistory {
+    /// The boundary to fetch from instead: the request predecessor is retired
+    /// or, for election serving, not in the source. No operations follow.
     pub(crate) fn retired_predecessor(&self) -> Option<Prefix> {
         self.retired_predecessor
     }

@@ -99,6 +99,19 @@ impl Builder {
             .await?)
     }
 
+    /// A valid published index of `source`, without reading the segment. The
+    /// caller validates the segment before trusting it.
+    pub(crate) async fn reuse_existing(
+        &self,
+        source: IndexSource,
+        limits: IndexBuildLimits,
+    ) -> Result<Option<SegmentIndex>, crate::DirectoryError> {
+        validate_build_limits(limits)?;
+        Ok(self
+            .reuse(self.index_path(source), source, limits.file, false)
+            .await?)
+    }
+
     fn index_path(&self, source: IndexSource) -> PathBuf {
         self.root.join("indexes").join(segment_index_name(source))
     }
@@ -150,12 +163,30 @@ impl Builder {
             self.io.chunk_bytes,
         )
         .await?;
-        self.access
+        match self
+            .access
             .done(Operation::HardLink {
                 source: temporary,
                 destination: self.index_path(source),
             })
-            .await?;
+            .await
+        {
+            // Another build of this source linked first; derived bytes of one
+            // source are identical, and open checks them.
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                open(
+                    &self.access,
+                    self.index_path(source),
+                    source,
+                    limits,
+                    self.io.chunk_bytes,
+                )
+                .await?;
+            }
+            result => {
+                result?;
+            }
+        }
         self.access
             .sync_directory(self.root.join("indexes"))
             .await?;

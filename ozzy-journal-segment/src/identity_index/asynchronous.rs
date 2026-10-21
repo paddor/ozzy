@@ -104,7 +104,11 @@ impl Index {
         {
             return Err(JournalIdentityHandoffError::SnapshotMismatch);
         }
-        for claim in self.overlay.claims() {
+        // In op order: index reads stay sequential, and the schedule does not
+        // depend on hash order.
+        let mut claims: Vec<_> = self.overlay.claims().collect();
+        claims.sort_unstable_by_key(|claim| claim.op_number);
+        for claim in claims {
             match replacement.identity_claim(claim.key()).await? {
                 Some(persisted) if persisted == claim => {}
                 Some(_) => return Err(JournalIdentityHandoffError::ClaimMismatch),

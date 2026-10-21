@@ -1,5 +1,5 @@
 //! Owner work a shard starts by itself between commands: writes, rolls,
-//! retirement, cleanup and identity refreshes.
+//! retirement, cleanup, sealed indexes and identity refreshes.
 
 use super::{Completed, Install, Job, ShardJournal, State};
 use crate::replica_journal::{OwnedWriteStep, commands::logged_fault};
@@ -8,7 +8,11 @@ use futures::FutureExt;
 impl ShardJournal {
     /// Start or install one piece of owner work. `true` when one step ran.
     pub(super) fn step_owner(&mut self) -> bool {
-        if self.install_completed() || self.start_retirement_job() || self.start_cleanup_job() {
+        if self.install_completed()
+            || self.start_retirement_job()
+            || self.start_cleanup_job()
+            || self.start_index_job()
+        {
             return true;
         }
         self.idle = self.failed;
@@ -74,6 +78,30 @@ impl ShardJournal {
                 let done = Box::pin(work.run()).await;
                 Box::new(move |state: &mut State| {
                     state.owner.complete_cleanup(done);
+                    false
+                }) as Install
+            }
+            .boxed_local(),
+        );
+        true
+    }
+
+    fn start_index_job(&mut self) -> bool {
+        if self.closing {
+            return false;
+        }
+        let Some(job) = self
+            .state
+            .as_mut()
+            .and_then(|state| state.owner.take_index_work())
+        else {
+            return false;
+        };
+        self.jobs.push(
+            async move {
+                let built = Box::pin(job.run()).await;
+                Box::new(move |state: &mut State| {
+                    state.owner.complete_index_work(&built);
                     false
                 }) as Install
             }

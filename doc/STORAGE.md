@@ -333,7 +333,11 @@ format 3. Rows: record offsets 96 bytes, message IDs 80, operation IDs 80, and
 a dense 56-byte numeric selector for every canonical operation, including
 payload-free duplicate results.
 
-- A missing or corrupt index is rebuilt from validated segment bytes.
+- A missing or corrupt index is rebuilt from validated segment bytes. A
+  background job builds each sealed segment's index beside later writes; a
+  build validates the segment once.
+- Identity lookups keep each sealed index's operation IDs resident (up to
+  64Ki IDs), so a miss skips reading that index.
 - Numeric lookup revalidates the operation's framing and digest before use.
 - Time seeks use APPEND-head timestamps. ID seeks search retained segments and
   need an explicit duplicate policy.

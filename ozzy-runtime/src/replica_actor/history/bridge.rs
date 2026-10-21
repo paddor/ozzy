@@ -89,17 +89,18 @@ impl ReplicaActor {
         let Some(bridge) = self.lookup.bridge else {
             return Ok(false);
         };
-        let (source, op) = if bridge.prefix.is_some() {
+        let (source, op, expected) = if bridge.prefix.is_some() {
             if bridge.donor.accepted == bridge.source.accepted {
                 self.lookup
                     .verified(bridge.source, bridge.source.accepted)?;
                 return Ok(true);
             }
-            (bridge.source, bridge.donor.accepted.op)
+            let tail = bridge.donor.accepted;
+            (bridge.source, tail.op, Some(tail))
         } else {
-            (bridge.donor, bridge.op)
+            (bridge.donor, bridge.op, None)
         };
-        self.lookup_history(source, op, HistoryReason::Lookup)?;
+        self.lookup_history(source, op, expected, HistoryReason::Lookup)?;
         Ok(true)
     }
 }

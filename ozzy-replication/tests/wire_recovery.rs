@@ -766,4 +766,37 @@ fn retired_history_notice_is_bound_to_scope_session_and_live_receive_or_fetch() 
         );
         assert_eq!(output, before);
     }
+    // A source without retired history serves a fetch from genesis; a
+    // receive window never restarts there.
+    let fetch = HistoryRetired {
+        scope: configuration().scope(),
+        fence: HistoryFence::Fetch(RequestId::from_bytes([16; 16])),
+        before: Prefix::GENESIS,
+    };
+    let encoded = encode_history_retired(
+        node(0),
+        session(),
+        fetch,
+        &mut output,
+        WireLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        decode_bytes(node(0), &encoded.header, &output[..137], &[]).unwrap(),
+        ReplicaMessage::HistoryRetired(fetch)
+    );
+    let receive = HistoryRetired {
+        fence: HistoryFence::Receive(ozzy_replication::flow::ReceiveEpoch::new(15).unwrap()),
+        ..fetch
+    };
+    assert!(
+        encode_history_retired(
+            node(0),
+            session(),
+            receive,
+            &mut output,
+            WireLimits::default()
+        )
+        .is_err()
+    );
 }

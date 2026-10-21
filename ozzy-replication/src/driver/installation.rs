@@ -8,8 +8,8 @@ use super::{Action, DriverError, ReplicaDriver, Role};
 use crate::wire::Control;
 use crate::{
     Commit, Digest, InstallOutcome, InstallTicket, InstallingView, JournalGeneration, LogSource,
-    OpNumber, Prefix, PreparedOperation, ReceivedStart, ReplicationError, Scope, StartView,
-    ViewChangeError, VoterSet,
+    Prefix, PreparedOperation, ReceivedStart, ReplicationError, Scope, StartView, ViewChangeError,
+    VoterSet,
 };
 
 /// Whole-tail commit authority captured before worker-side image activation.
@@ -121,7 +121,7 @@ impl ReplicaDriver {
         from: NodeId,
         start: StartView,
         generation: JournalGeneration,
-        lookup: impl FnMut(LogSource, OpNumber) -> Option<Digest>,
+        lookup: impl FnMut(LogSource, Prefix) -> Option<Digest>,
     ) -> Result<InstallTicket, DriverError> {
         self.begin_install(Some(ReceivedStart { from, start }), generation, lookup)
     }
@@ -130,7 +130,7 @@ impl ReplicaDriver {
         &mut self,
         backup: Option<ReceivedStart>,
         generation: JournalGeneration,
-        lookup: impl FnMut(LogSource, OpNumber) -> Option<Digest>,
+        lookup: impl FnMut(LogSource, Prefix) -> Option<Digest>,
     ) -> Result<InstallTicket, DriverError> {
         self.changing()?;
         let Role::ViewChanging(changing) = self.take_role() else {
