@@ -87,9 +87,9 @@
 - A history fetch from a predecessor the source does not hold no longer stops
   the serving partition; it answers `HISTORY_RETIRED` with its boundary.
 - A disk-quorum leader whose retention turn came due while a proposal waited
-  to start no longer leaves it waiting for the 100 ms safety sweep. The
-  partition did not schedule its next round, which counted as
-  `partition_sweep_progress`.
+  to start no longer leaves it waiting for the 100 ms safety sweep, and no
+  longer spends an empty round on every visit while the proposal cannot
+  start. Both counted as `partition_sweep_progress`.
 - Brokers retire producer sessions with no open or append for the topic's
   `producer_idle_secs` (default 7 days). Each new writer adds a session to
   every partition it writes, so the table used to fill at about one million

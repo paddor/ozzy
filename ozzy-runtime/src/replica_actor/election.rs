@@ -77,6 +77,12 @@ impl ReplicaActor {
             self.schedule_sync()?;
             return Ok(MaintenanceTurn::Stop);
         }
+        // A waiting proposal goes first, in this round. Deferring it to the
+        // next round would ask for one that does nothing while the proposal
+        // cannot move yet.
+        if kind == Maintenance::Retention && self.work.proposals.blocks_maintenance() {
+            return Ok(MaintenanceTurn::Continue);
+        }
         self.maintenance_round(kind, now)?;
         Ok(if self.pending.is_some() {
             MaintenanceTurn::Stop
