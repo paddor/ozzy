@@ -69,6 +69,15 @@ pub enum ReceivedValidation {
         /// Unadmitted canonical bytes, still within the original receive window.
         buffer: AppendBuffer,
     },
+    /// Identity capacity is full with nothing left to apply. No operations
+    /// were admitted. The first one fits alone; later ones may reuse capacity
+    /// its commit frees, so they validate after it applies.
+    Split {
+        /// Authority that owned the staged suffix before preparation stopped.
+        validation: ValidationTicket,
+        /// Unadmitted canonical bytes, still within the original receive window.
+        buffer: AppendBuffer,
+    },
     /// Invalid input or a storage failure; no arena remains in flight.
     Rejected(JournalError),
 }

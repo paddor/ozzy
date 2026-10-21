@@ -367,27 +367,69 @@ fn a_follower_behind_on_its_writes_waits_to_reuse_identity_capacity() {
     // The leader frees identity capacity at a commit the third broker cannot
     // apply while its writes stall. That broker must wait to validate the
     // replacement identities instead of failing its partition.
-    let (mut devices, mut actors, released, _lane) = deferred_follower();
+    let Lagging {
+        mut devices,
+        mut actors,
+        released,
+        now,
+        lane: _lane,
+        ..
+    } = deferred_follower(Lag::Writes);
     let follower = actors[2].status().normal.unwrap();
     assert_eq!(follower.applied, released, "stalled writes hold apply");
     // Released writes let the follower apply, expire, and validate.
-    let leader = actors[0].status().normal.unwrap().applied;
-    for step in 0..20000 {
-        scheduled::round_at(&mut actors, Duration::from_millis(step), false);
-        settle_devices(&mut devices, false);
-        if actors[2].status().normal.unwrap().applied == leader {
-            break;
-        }
-    }
-    assert_eq!(actors[2].status().normal.unwrap().applied, leader);
+    catch_up(&mut devices, &mut actors, now);
     for (actor, (controller, _)) in actors.into_iter().zip(&mut devices) {
         scheduled::close(controller, actor);
     }
 }
 
 #[test]
+fn a_follower_receiving_expiry_with_the_reused_identities_waits_to_apply_it() {
+    // The third broker misses the watermark and the appends that reuse the
+    // capacity it frees, then stages them as one suffix with nothing earlier
+    // left to apply. It must accept the watermark and validate the rest after
+    // applying it, instead of failing its partition.
+    let Lagging {
+        mut devices,
+        mut actors,
+        released,
+        now,
+        lane: _lane,
+        held,
+    } = deferred_follower(Lag::Messages);
+    assert_eq!(actors[2].status().normal.unwrap().applied, released);
+    for message in &held {
+        actors[2].receive(message, now).unwrap();
+    }
+    catch_up(&mut devices, &mut actors, now);
+    for (actor, (controller, _)) in actors.into_iter().zip(&mut devices) {
+        scheduled::close(controller, actor);
+    }
+}
+
+/// Run until the third broker applies the leader's prefix. The idle leader
+/// announces its commit on its heartbeat.
+fn catch_up(devices: &mut [(Controller, Local)], actors: &mut [ScheduledReplica], now: Duration) {
+    let leader = actors[0].status().normal.unwrap().applied;
+    for step in 0..20000 {
+        scheduled::round_at(actors, now + Duration::from_millis(step), false);
+        settle_devices(devices, false);
+        if actors[2].status().normal.unwrap().applied == leader {
+            break;
+        }
+    }
+    assert_eq!(actors[2].status().normal.unwrap().applied, leader);
+}
+
+#[test]
 fn a_view_change_over_a_deferred_suffix_keeps_its_arena() {
-    let (mut devices, mut actors, _, _lane) = deferred_follower();
+    let Lagging {
+        mut devices,
+        mut actors,
+        lane: _lane,
+        ..
+    } = deferred_follower(Lag::Writes);
     assert_eq!(actors[2].arenas(), (0, true), "the retry holds the arena");
     // Cut the leader off. Brokers 1 and 2 start a view change while broker
     // 2's writes still stall, so its deferred suffix is never retried.
@@ -454,19 +496,35 @@ fn settle_devices(devices: &mut [(Controller, Local)], stalled: bool) {
     }
 }
 
-/// Leave the third broker with a deferred received suffix: its stalled
-/// writes hold the commit that frees the identities the leader reused.
-/// Returns its applied prefix before the stall.
+/// How the third broker falls behind the leader.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lag {
+    /// Its writes stall; it keeps receiving.
+    Writes,
+    /// Messages to it are held and returned.
+    Messages,
+}
+
+/// A cluster whose third broker lags behind the commit that frees the
+/// identities the leader reused.
+struct Lagging {
+    devices: Vec<(Controller, Local)>,
+    actors: Vec<ScheduledReplica>,
+    /// The third broker's applied prefix before it fell behind.
+    released: ozzy_replication::Prefix,
+    /// The fixture's last time.
+    now: Duration,
+    lane: ProposalSubmitter,
+    /// Messages to the third broker held back while it lagged.
+    held: Vec<Message>,
+}
+
+/// With stalled writes, the third broker holds a deferred received suffix.
 #[expect(
     clippy::too_many_lines,
-    reason = "one controlled expiry schedule with a stalled follower"
+    reason = "one controlled expiry schedule with a lagging follower"
 )]
-fn deferred_follower() -> (
-    Vec<(Controller, Local)>,
-    Vec<ScheduledReplica>,
-    ozzy_replication::Prefix,
-    ProposalSubmitter,
-) {
+fn deferred_follower(lag: Lag) -> Lagging {
     let mut devices: Vec<_> = (0..3).map(|_| setup()).collect();
     let pipeline = actor_config().pipeline;
     let limits = crate::replica_journal::dedup_limits(1_000, 4, 256 * 1024, 4, pipeline);
@@ -478,17 +536,27 @@ fn deferred_follower() -> (
         cluster_on(&mut borrowed, limits)
     };
     let mut buffers = Vec::from(buffers);
+    let mut held = Vec::new();
+    let mut now = Duration::ZERO;
     let mut submit = |buffers: &mut Vec<ProposalBuffer>,
                       actors: &mut [ScheduledReplica],
                       devices: &mut [(Controller, Local)],
+                      held: &mut Vec<Message>,
+                      now: Duration,
                       prepare: &dyn Fn(&mut ProposalBuffer),
-                      stalled: bool| {
+                      lagging: bool| {
         let mut buffer = buffers.pop().unwrap();
         prepare(&mut buffer);
         let mut pending = Box::pin(lane.try_submit(buffer).unwrap());
         for _ in 0..20000 {
-            scheduled::round(actors, false);
-            settle_devices(devices, stalled);
+            for (to, message) in scheduled::collect(actors, now, false) {
+                if lagging && lag == Lag::Messages && to == 2 {
+                    held.push(message);
+                } else {
+                    actors[to].receive(&message, now).unwrap();
+                }
+            }
+            settle_devices(devices, lagging && lag == Lag::Writes);
             if let Poll::Ready(reply) = poll(pending.as_mut()) {
                 let mut reply = reply.unwrap();
                 assert!(matches!(reply.outcome, ProposalOutcome::Committed { .. }));
@@ -512,6 +580,8 @@ fn deferred_follower() -> (
             &mut buffers,
             &mut actors,
             &mut devices,
+            &mut held,
+            now,
             &|buffer| {
                 buffer
                     .prepare_append(super::super::super::proposal::request(12, sequence, 1))
@@ -520,6 +590,17 @@ fn deferred_follower() -> (
             false,
         );
     }
+    if lag == Lag::Messages {
+        // The third broker applies the full window before it falls behind,
+        // so nothing earlier is left to apply when the held suffix arrives.
+        let leader = actors[0].status().normal.unwrap().applied;
+        while actors[2].status().normal.unwrap().applied != leader {
+            assert!(now < Duration::from_secs(1), "the follower must catch up");
+            now += Duration::from_millis(1);
+            scheduled::round_at(&mut actors, now, false);
+            settle_devices(&mut devices, false);
+        }
+    }
     let released = actors[2].status().normal.unwrap().applied;
     // Later logical time expires the full window once it commits.
     super::CLOCK.with(|clock| clock.set(5_123));
@@ -527,6 +608,8 @@ fn deferred_follower() -> (
         &mut buffers,
         &mut actors,
         &mut devices,
+        &mut held,
+        now,
         &|buffer| {
             let watermark =
                 OperationBody::DedupWatermark(ozzy_journal::operation::DedupWatermark {
@@ -548,6 +631,8 @@ fn deferred_follower() -> (
             &mut buffers,
             &mut actors,
             &mut devices,
+            &mut held,
+            now,
             &|buffer| {
                 buffer
                     .prepare_append(super::super::super::proposal::request(12, sequence, 1))
@@ -556,5 +641,12 @@ fn deferred_follower() -> (
             true,
         );
     }
-    (devices, actors, released, lane)
+    Lagging {
+        devices,
+        actors,
+        released,
+        now,
+        lane,
+        held,
+    }
 }

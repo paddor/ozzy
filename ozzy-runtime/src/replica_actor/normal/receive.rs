@@ -26,6 +26,8 @@ pub(in crate::replica_actor) struct Receive {
     end: Option<Prefix>,
     flight: Option<Suffix>,
     retry: Option<AppendBuffer>,
+    /// The rest of a split suffix, validated once its head is admitted.
+    tail: Option<AppendBuffer>,
     pub(in crate::replica_actor) ledger: Receiver,
     operations: Vec<Operation>,
     pub(in crate::replica_actor) allocator: Option<crate::memory::Allocator>,
@@ -63,19 +65,20 @@ impl Receive {
             end: None,
             flight: None,
             retry: None,
+            tail: None,
             ledger,
             operations: Vec::with_capacity(limits.max_operations),
             allocator: None,
         })
     }
 
-    /// Drop the staged suffix. Returns the arena a deferred suffix held for
-    /// its retry, which the caller must recycle.
-    pub(super) fn reset(&mut self) -> Option<AppendBuffer> {
+    /// Drop the staged suffix. Returns the arenas a deferred or split suffix
+    /// held for its retry, which the caller must recycle.
+    pub(super) fn reset(&mut self) -> [Option<AppendBuffer>; 2] {
         self.queued.clear();
         self.end = None;
         self.flight = None;
-        self.retry.take()
+        [self.retry.take(), self.tail.take()]
     }
 
     pub(super) fn defer(&mut self, buffer: AppendBuffer) {
@@ -83,9 +86,26 @@ impl Receive {
         assert!(self.retry.replace(buffer).is_none());
     }
 
-    /// The core admitted the suffix in flight and now charges it.
+    /// Validate `head` next and `tail` once the core admits it.
+    pub(super) fn split(&mut self, head: AppendBuffer, tail: AppendBuffer) {
+        assert!(self.flight.is_some());
+        assert!(self.retry.replace(head).is_none());
+        assert!(self.tail.replace(tail).is_none());
+    }
+
+    /// The core admitted the suffix in flight, or a split suffix's head, and
+    /// now charges it.
     pub(super) fn admitted(&mut self) {
-        self.flight = None;
+        let Some(tail) = self.tail.take() else {
+            self.flight = None;
+            return;
+        };
+        // The tail stays in flight under the suffix's end.
+        if let Some(flight) = &mut self.flight {
+            flight.operations = tail.len();
+            flight.bytes = tail.body_bytes();
+        }
+        assert!(self.retry.replace(tail).is_none());
     }
 
     /// True consumes the packet (retained or duplicate); false needs repair/space.
@@ -308,6 +328,29 @@ impl ReplicaActor {
                 normal.snapshot().accepted.op,
             )
         })
+    }
+
+    /// Validate the first operation of the suffix in flight alone and the
+    /// rest after it applies. Without an arena or memory for the copy, retry
+    /// the whole suffix.
+    pub(super) fn split_received(&mut self, mut buffer: AppendBuffer) -> Result<(), ActorError> {
+        if let Some(mut head) = self
+            .buffer
+            .take()
+            .or_else(|| self.spare.take())
+            .or_else(|| self.journal.lease_append_buffer().ok())
+        {
+            if let Some(allocator) = &self.work.receive.allocator {
+                head.bind_allocator(allocator)?;
+            }
+            if buffer.move_front(1, &mut head)? {
+                self.work.receive.split(head, buffer);
+                return Ok(());
+            }
+            self.recycle(head)?;
+        }
+        self.work.receive.defer(buffer);
+        Ok(())
     }
 
     /// Move the staged suffix into flight, replacing its arena. Changes

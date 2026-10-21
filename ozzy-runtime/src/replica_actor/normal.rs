@@ -98,12 +98,13 @@ impl Work {
     }
 
     /// Drop every cursor, staged suffix, and cached packet of the old scope.
-    /// Returns the arena of a deferred received suffix for recycling.
+    /// Returns the arenas of a deferred or split received suffix for
+    /// recycling.
     fn change_scope(
         &mut self,
         scope: Scope,
         now: Duration,
-    ) -> Result<Option<AppendBuffer>, ActorError> {
+    ) -> Result<[Option<AppendBuffer>; 2], ActorError> {
         self.proposals.reject_deferred();
         self.scope = scope;
         self.cursors = [None; 3];
@@ -183,10 +184,15 @@ impl Work {
 
 impl ReplicaActor {
     pub(super) fn normal_round(&mut self, now: Duration) -> Result<(), ActorError> {
-        if self.work.scope != self.driver.scope()
-            && let Some(buffer) = self.work.change_scope(self.driver.scope(), now)?
-        {
-            self.recycle(buffer)?;
+        if self.work.scope != self.driver.scope() {
+            for buffer in self
+                .work
+                .change_scope(self.driver.scope(), now)?
+                .into_iter()
+                .flatten()
+            {
+                self.recycle(buffer)?;
+            }
         }
         let snapshot = self.driver.normal().map(NormalReplica::snapshot);
         self.work.finish_live(snapshot.as_ref());

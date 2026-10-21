@@ -81,7 +81,8 @@ impl OwnedJournal {
     ) -> Result<ValidatedAppend, JournalError> {
         match self.validate_received(ticket, buffer).await {
             super::super::turn::ReceivedValidation::Ready(validated) => Ok(validated),
-            super::super::turn::ReceivedValidation::Deferred { .. } => {
+            super::super::turn::ReceivedValidation::Deferred { .. }
+            | super::super::turn::ReceivedValidation::Split { .. } => {
                 Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into())
             }
             super::super::turn::ReceivedValidation::Rejected(error) => Err(error),
@@ -124,7 +125,7 @@ impl OwnedJournal {
             // The leader admitted this suffix after a commit freed identity
             // capacity. A follower that has not applied that commit, or not
             // yet learned of it, still holds rows its expiry will drop. Retry
-            // once it applies more; with nothing left to apply, reject.
+            // once it applies more.
             Err(JournalError::Dedup(
                 ozzy_core::dedup::Error::Capacity
                 | ozzy_core::dedup::Error::PendingCapacity
@@ -136,6 +137,18 @@ impl OwnedJournal {
                     buffer,
                 }
             }
+            // With nothing left to apply, the commit may be inside this
+            // suffix. The leader admitted its first operation against a
+            // commit this replica has applied, so it fits alone; the rest
+            // waits for it. A single operation that does not fit is invalid.
+            Err(JournalError::Dedup(
+                ozzy_core::dedup::Error::Capacity
+                | ozzy_core::dedup::Error::PendingCapacity
+                | ozzy_core::dedup::Error::SnapshotCapacity,
+            )) if buffer.len() > 1 => ReceivedValidation::Split {
+                validation: ticket,
+                buffer,
+            },
             Err(error) => ReceivedValidation::Rejected(error),
         }
     }

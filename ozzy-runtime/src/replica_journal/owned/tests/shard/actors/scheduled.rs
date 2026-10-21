@@ -108,7 +108,11 @@ pub(super) fn round_at(actors: &mut [Scheduled], now: Duration, blocked: bool) {
     }
 }
 
-fn collect(actors: &mut [Scheduled], now: Duration, blocked: bool) -> Vec<(usize, Message)> {
+pub(super) fn collect(
+    actors: &mut [Scheduled],
+    now: Duration,
+    blocked: bool,
+) -> Vec<(usize, Message)> {
     let mut messages = Vec::new();
     for (from, actor) in actors.iter_mut().enumerate() {
         actor.advance(now).unwrap();

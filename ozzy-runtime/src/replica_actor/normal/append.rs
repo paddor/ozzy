@@ -81,12 +81,18 @@ impl ReplicaActor {
                             validation,
                             buffer,
                         } => {
-                            if self.driver.normal().is_some_and(|normal| {
-                                let state = normal.snapshot();
-                                state.scope == validation.scope()
-                                    && state.journal.generation == validation.generation()
-                            }) {
+                            if self.validation_current(validation) {
                                 self.work.receive.defer(buffer);
+                            } else {
+                                self.recycle(buffer)?;
+                            }
+                        }
+                        crate::replica_journal::ReceivedValidation::Split {
+                            validation,
+                            buffer,
+                        } => {
+                            if self.validation_current(validation) {
+                                self.split_received(buffer)?;
                             } else {
                                 self.recycle(buffer)?;
                             }
@@ -110,6 +116,15 @@ impl ReplicaActor {
             _ => return Err(JournalError::CompletionMismatch.into()),
         }
         Ok(())
+    }
+
+    /// Whether a deferred validation still belongs to the current scope and
+    /// journal generation.
+    fn validation_current(&self, validation: ozzy_replication::driver::ValidationTicket) -> bool {
+        self.driver.normal().is_some_and(|normal| {
+            let state = normal.snapshot();
+            state.scope == validation.scope() && state.journal.generation == validation.generation()
+        })
     }
 
     /// The write is queued on the dedicated writer. The vote waits for its

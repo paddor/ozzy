@@ -356,10 +356,11 @@ impl ReplicaActor {
         buffer.restore_allocator(self.history_allocator.as_ref())?;
         if self.buffer.is_none() {
             self.buffer = Some(buffer);
-        } else {
-            assert!(self.spare.is_none());
+        } else if self.spare.is_none() {
             self.spare = Some(buffer);
         }
+        // Otherwise a split received suffix leased one arena more than the
+        // idle slots hold; dropping it returns that lease to the pool.
         Ok(())
     }
 
