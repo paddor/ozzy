@@ -269,6 +269,19 @@ impl Index {
         }) {
             return Err(Error::StaleCatalog);
         }
+        self.forget(segments);
+        Ok(())
+    }
+
+    /// Forget the sealed segments a pack replaced. The packed segment keeps
+    /// the last one's ID as a new source; its index loads on a read miss.
+    pub fn packed(&mut self, journal: &Journal, segments: &[u64]) -> Result<(), Error> {
+        self.check_owner(journal)?;
+        self.forget(segments);
+        Ok(())
+    }
+
+    fn forget(&mut self, segments: &[u64]) {
         if self
             .previous
             .as_ref()
@@ -281,7 +294,6 @@ impl Index {
             .retain(|index| !segments.contains(&index.source().segment_id));
         cold.bytes = cold.hot.iter().map(|index| index.retained_bytes()).sum();
         self.resident.retired(self.identity.group_id, segments);
-        Ok(())
     }
 
     fn check_owner(&self, journal: &Journal) -> Result<(), Error> {

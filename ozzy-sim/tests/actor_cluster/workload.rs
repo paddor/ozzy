@@ -1,8 +1,8 @@
-//! Clients propose one barrier operation at a time through production
-//! proposal lanes, one lane per broker. A refused proposal moves to another
-//! broker; an unknown outcome resends the same bytes there later. A resend
-//! that finds its operation identity taken learns that an earlier attempt
-//! committed. A journal too full for new operations refuses them; the
+//! Clients propose one proposal of barrier operations at a time through
+//! production proposal lanes, one lane per broker. A refused proposal moves
+//! to another broker; an unknown outcome resends the same bytes there later.
+//! A resend that finds its operation identity taken learns that an earlier
+//! attempt committed. A journal too full for new operations refuses them; the
 //! client backs off and resends.
 
 use crate::{
@@ -57,6 +57,8 @@ pub(crate) struct Counts {
 #[derive(Debug)]
 pub(crate) struct Workload {
     clients: Vec<Client>,
+    /// Barrier operations per proposal.
+    batch: usize,
     rng: Rng,
     /// Every confirmed prefix, in confirmation order.
     pub confirmed: Vec<Prefix>,
@@ -65,7 +67,7 @@ pub(crate) struct Workload {
 
 impl Workload {
     /// `lanes[broker][client]`.
-    pub(crate) fn new(lanes: Vec<Vec<Lane>>, seed: u64) -> Self {
+    pub(crate) fn new(lanes: Vec<Vec<Lane>>, seed: u64, batch: usize) -> Self {
         let count = lanes[0].len();
         let mut by_broker: Vec<_> = lanes.into_iter().map(Vec::into_iter).collect();
         let clients = (0..count)
@@ -84,6 +86,7 @@ impl Workload {
             .collect();
         Self {
             clients,
+            batch,
             rng: Rng::new(seed),
             confirmed: Vec::new(),
             counts: Counts::default(),
@@ -183,9 +186,12 @@ impl Workload {
             let mut body = [0; 16];
             body[0] = client.id + 1;
             body[1..5].copy_from_slice(&client.seq.to_be_bytes());
-            buffer
-                .push(OperationKind::Barrier, &body)
-                .map_err(|error| format!("client {}: {error}", client.id))?;
+            for index in 0..self.batch {
+                body[5] = index as u8;
+                buffer
+                    .push(OperationKind::Barrier, &body)
+                    .map_err(|error| format!("client {}: {error}", client.id))?;
+            }
             match lane.submitter.try_submit(buffer) {
                 Ok(pending) => {
                     self.counts.submitted += 1;

@@ -157,41 +157,47 @@ impl Snapshot {
 
     /// Drop sources before `first`, the first segment the same journal still
     /// selects after retirement, and release their deletion protection. Reads
-    /// no files. When every captured source retired, the view re-anchors at
-    /// the predecessor position `first` binds.
+    /// no files. The cut falls where `first`'s operations start, so a packed
+    /// `first` keeps the captured segments it replaced. When every captured
+    /// source retired, the view re-anchors at the predecessor position
+    /// `first` binds.
     pub(crate) fn retain_from(&self, first: SegmentReference) -> Result<Self, Error> {
         let mismatch = Error::LineageSegmentMismatch(first.segment_id);
+        let start = first.first_chain.next_op_number();
         let at = self
             .references
-            .partition_point(|reference| reference.segment_id < first.segment_id);
-        let mut retained = match self.references.get(at) {
+            .partition_point(|reference| reference.first_chain.next_op_number() < start);
+        let (mut retained, from) = match self.references.get(at) {
+            // The same segment, or a packed one that replaced it and later ones.
             Some(kept)
-                if kept.segment_id != first.segment_id
-                    || kept.file_generation != first.file_generation
-                    || kept.first_chain != first.first_chain =>
+                if kept.first_chain != first.first_chain
+                    || kept.segment_id > first.segment_id
+                    || (kept.segment_id == first.segment_id
+                        && kept.file_generation != first.file_generation) =>
             {
                 return Err(mismatch);
             }
             Some(_) if at == 0 => return Ok(self.clone()),
-            Some(_) => self.clone(),
+            Some(kept) => (self.clone(), kept.segment_id),
             None => {
                 let anchor = anchor(first.first_chain)
                     .filter(|anchor| anchor.op_number >= self.through.op_number)
                     .ok_or(mismatch)?;
-                Self {
+                let retained = Self {
                     active: None,
                     active_bytes: 0,
                     through: anchor,
                     ..self.clone()
-                }
+                };
+                (retained, first.segment_id)
             }
         };
         retained.references.drain(..at);
-        retained.sealed = self.sealed.retain_from(first.segment_id);
+        retained.sealed = self.sealed.retain_from(from);
         retained.leases = self
             .leases
             .iter()
-            .filter(|lease| lease.segment_id() >= first.segment_id)
+            .filter(|lease| lease.segment_id() >= from)
             .map(PreparedSegmentLease::duplicate)
             .collect::<Result<Vec<_>, _>>()
             .map_err(crate::DirectoryError::from)?

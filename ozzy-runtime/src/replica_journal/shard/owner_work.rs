@@ -1,5 +1,5 @@
 //! Owner work a shard starts by itself between commands: writes, rolls,
-//! retirement, cleanup, sealed indexes and identity refreshes.
+//! retirement, cleanup, packs, sealed indexes and identity refreshes.
 
 use super::{Completed, Install, Job, ShardJournal, State};
 use crate::replica_journal::{OwnedWriteStep, commands::logged_fault};
@@ -11,21 +11,28 @@ impl ShardJournal {
         if self.install_completed()
             || self.start_retirement_job()
             || self.start_cleanup_job()
+            || self.start_pack_job()
             || self.start_index_job()
         {
             return true;
         }
         self.idle = self.failed;
-        // Retirement installs with one manifest publication between
-        // writes, like a roll: no new write starts until in-flight
-        // writes drain. Its file work already ran as a job.
+        // Retirement and packs install with one manifest publication between
+        // writes, like a roll: no new write starts until in-flight writes
+        // drain. Their file work already ran as a job.
         let retiring = !self.failed
             && self
                 .state
                 .as_ref()
                 .is_some_and(|state| state.owner.retirement_ready());
+        let packing = !self.failed
+            && self
+                .state
+                .as_ref()
+                .is_some_and(|state| state.owner.pack_ready());
         self.start_retirement_install(retiring)
-            || (!retiring && self.start_write())
+            || self.start_pack_install(packing)
+            || (!retiring && !packing && self.start_write())
             || self.start_identity_refresh()
     }
 
@@ -86,6 +93,30 @@ impl ShardJournal {
         true
     }
 
+    fn start_pack_job(&mut self) -> bool {
+        if self.closing {
+            return false;
+        }
+        let Some(work) = self
+            .state
+            .as_mut()
+            .and_then(|state| state.owner.take_pack_work())
+        else {
+            return false;
+        };
+        self.jobs.push(
+            async move {
+                let done = Box::pin(work.run()).await;
+                Box::new(move |state: &mut State| {
+                    state.owner.complete_pack(done);
+                    false
+                }) as Install
+            }
+            .boxed_local(),
+        );
+        true
+    }
+
     fn start_index_job(&mut self) -> bool {
         if self.closing {
             return false;
@@ -122,6 +153,22 @@ impl ShardJournal {
         }
         self.hold_owner(|mut state| async move {
             let failed = logged_fault(&state.owner.finish_retirement().await);
+            (state, None, failed)
+        })
+    }
+
+    fn start_pack_install(&mut self, packing: bool) -> bool {
+        if !packing
+            || !self.writes.is_empty()
+            || self
+                .state
+                .as_ref()
+                .is_none_or(|state| state.sync_busy || state.rolling)
+        {
+            return false;
+        }
+        self.hold_owner(|mut state| async move {
+            let failed = logged_fault(&state.owner.finish_pack().await);
             (state, None, failed)
         })
     }

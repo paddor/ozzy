@@ -90,6 +90,8 @@ canonical operations.
 - A seal records group number, start and end offsets, entry count, a durable
   mark, and a group digest. The mark is the highest group number already
   durable when this group was prepared; the digest covers it.
+- Group numbers rise through the log. A packed segment's groups can end
+  before the next segment's first.
 - Unknown versions, codecs, flags, or nonzero reserved bytes fail validation.
 - Unused capacity holds zeros, preallocated space, or groups from an earlier
   use of the file, which never validate against the new header. Readers of a
@@ -425,8 +427,28 @@ A partition journal holds at most 256 segments of `segment_bytes`.
 - A retention byte target covers at most 224 segments, so retention that lags
   a few segments still frees space before refusals start.
 - Followers group the same operations on their own timing and can need more
-  space than the leader. A replica whose journal fills anyway holds its
-  writes until a segment retires, instead of failing.
+  space than the leader. Packing gives that space back. A replica whose
+  journal fills anyway holds its writes until a pack or a retirement frees a
+  segment, instead of failing.
+
+### Packing
+
+A replica with at most 24 free segments packs sparse sealed segments.
+
+- It picks the run of adjacent sealed segments that frees the most segments
+  per byte rewritten. The run must fit one segment and free at least what it
+  rewrites.
+- A job beside writes measures the run, then rewrites its operations into
+  groups of at most 8 MiB. It reads and writes at most 8 MiB at a time. One
+  manifest publication between writes selects the packed segment in place of
+  the run.
+- The packed segment is a new file generation of the run's last segment ID,
+  so the next segment's header still names its predecessor. Its groups number
+  from the run's first.
+- Operations, digests, and the chain do not change. A crash before the
+  publication leaves an unselected file for cleanup.
+- A pack starts and installs only while no retirement or cleanup runs, and
+  retirement waits for a pack. A view change abandons an unfinished pack.
 
 ## Operator tuning
 

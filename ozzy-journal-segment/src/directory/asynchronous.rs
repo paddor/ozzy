@@ -16,6 +16,8 @@ pub use index::{BuiltIndex, IndexJob};
 mod metadata;
 mod opening;
 pub use opening::Opening;
+mod pack;
+pub use pack::{PACK_CHUNK_BYTES, PackJob, PackLimits, PackOutcome, PackedSegments};
 mod partition_read;
 mod pipeline;
 pub use partition_read::{
@@ -118,6 +120,8 @@ pub struct Journal {
     /// Set while a cleanup capture lives; checkpoint selection waits for it.
     cleaning: std::rc::Rc<std::cell::Cell<bool>>,
     validated_indexes: std::cell::RefCell<std::collections::BTreeMap<u64, crate::IndexSource>>,
+    /// Packed layouts of sealed segments, by segment ID and file generation.
+    pack_layouts: std::cell::RefCell<std::collections::BTreeMap<(u64, u64), pack::Layout>>,
     /// Validated active-segment prefix reused by the next built snapshot.
     active_prefix: Option<Box<crate::active_index::ActivePrefix>>,
 }

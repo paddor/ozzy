@@ -73,7 +73,11 @@
   Near the limit it refuses new records with NACK 10 (retry after backoff),
   then producer opens and consumer progress. Trims and retention policy
   changes still pass. A replica that fills anyway holds its writes until a
-  segment retires.
+  pack or a retirement frees a segment.
+- A follower that writes smaller groups than its leader no longer fills its
+  journal first and stalls the partition. A replica low on segments packs a
+  run of sparse sealed segments into one in the background, reading and
+  writing at most 8 MiB at a time.
 - Disk-quorum view changes after a long history finish within the election
   timeouts instead of retrying elections forever. A backup checks the new
   leader's history from its own commit point, not from the first operation;

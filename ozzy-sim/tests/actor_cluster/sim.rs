@@ -5,7 +5,7 @@
 //! each broker's view and positions when they change.
 
 use crate::{
-    broker::{Broker, Lane, MAX_SEGMENTS},
+    broker::{Broker, Lane, Shape},
     check::{Checker, converged, leader},
     clock::Clock,
     disk::Disk,
@@ -24,12 +24,21 @@ pub(crate) struct Options {
     /// Further ticks to heal, settle outstanding proposals, and converge.
     pub drain: u64,
     pub clients: usize,
-    /// Journal segment limit. Below the broker's, the journal must fill and
-    /// refuse proposals.
+    /// Barrier operations per proposal.
+    pub batch: usize,
+    /// Journal segment limit and size.
     pub max_segments: usize,
-    /// Vacuity floors: confirmed proposals, and ops two brokers reported.
+    pub segment_bytes: u64,
+    /// Brokers that write one operation per physical group, so their
+    /// journals need several times the space of a leader that packs a
+    /// proposal into one group.
+    pub sparse: &'static [usize],
+    /// Vacuity floors: confirmed proposals, ops two brokers reported, the
+    /// converged op, and proposals a full journal refused.
     pub min_confirmed: usize,
     pub min_compared: u64,
+    pub min_applied: u64,
+    pub min_refused: u64,
     /// Scripted faults in tick order, on top of the profile's random ones.
     pub script: &'static [Fault],
 }
@@ -95,18 +104,26 @@ pub(crate) fn run(seed: u64, profile: Profile, options: Options) -> Result<Repor
     let mut lanes: Vec<Vec<Lane>> = Vec::new();
     for index in 0..BROKERS {
         let disk = Disk::new(disks.next(), profile.disk_mean);
-        let (broker, broker_lanes) =
-            Broker::start(index, &clock, disk, options.clients, options.max_segments).map_err(
-                |reason| {
-                    Box::new(Failure {
-                        tick: 0,
-                        reason,
-                        hash: 0,
-                        profile,
-                        detail: String::new(),
-                    })
-                },
-            )?;
+        let (broker, broker_lanes) = Broker::start(
+            index,
+            &clock,
+            disk,
+            options.clients,
+            Shape {
+                max_segments: options.max_segments,
+                segment_bytes: options.segment_bytes,
+                sparse: options.sparse.contains(&index),
+            },
+        )
+        .map_err(|reason| {
+            Box::new(Failure {
+                tick: 0,
+                reason,
+                hash: 0,
+                profile,
+                detail: String::new(),
+            })
+        })?;
         brokers.push(broker);
         lanes.push(broker_lanes);
     }
@@ -115,7 +132,7 @@ pub(crate) fn run(seed: u64, profile: Profile, options: Options) -> Result<Repor
         network: Network::new(profile, seeds.network),
         executor: Rng::new(seeds.executor),
         brokers,
-        workload: Workload::new(lanes, seeds.workload),
+        workload: Workload::new(lanes, seeds.workload, options.batch),
         checker: Checker::default(),
         trace: Trace::default(),
         options,
@@ -283,7 +300,8 @@ impl Sim {
             }
         }
         let vacuous = self.next_fault < self.options.script.len()
-            || (self.options.max_segments < MAX_SEGMENTS && self.workload.counts.full == 0)
+            || self.workload.counts.full < self.options.min_refused
+            || applied.op.0 < self.options.min_applied
             || self.workload.confirmed.len() < self.options.min_confirmed
             || self.checker.compared < self.options.min_compared;
         Ok((applied.op.0, vacuous))

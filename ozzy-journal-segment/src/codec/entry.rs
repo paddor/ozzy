@@ -75,7 +75,7 @@ pub(super) fn encode_entry_header(
     Ok(())
 }
 
-pub(super) fn encoded_entry_len(body_len: usize) -> Result<usize, CodecError> {
+pub(crate) fn encoded_entry_len(body_len: usize) -> Result<usize, CodecError> {
     align_up(
         ENTRY_HEADER_BYTES
             .checked_add(body_len)

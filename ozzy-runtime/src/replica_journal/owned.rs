@@ -380,6 +380,7 @@ impl OwnedJournal {
         let next = authority::promise_manifest(self.scope, journal, ticket)?;
         if let Some(next) = next {
             self.abandon_retirement();
+            self.abandon_pack();
             // Committed state never rolls back; keep it for the installation.
             let base = self
                 .images

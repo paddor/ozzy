@@ -2,6 +2,7 @@
 
 mod cleanup;
 mod idle;
+mod packing;
 mod plan;
 mod retirement;
 
@@ -32,6 +33,10 @@ pub(super) struct Retention {
     retiring: Retiring,
     /// Unselected-storage cleanup that runs beside writes.
     cleaning: Cleaning,
+    /// A pack of sparse sealed segments that runs beside writes.
+    packing: packing::Packing,
+    /// Manifest generation at which no run was worth packing.
+    unpackable: Option<u64>,
     /// A complete exclusive sweep ran since this owner opened.
     swept: bool,
     /// Retention jobs started, so a stale completion is recognized.
@@ -157,8 +162,9 @@ impl OwnedJournal {
             return self.propose_floors(partition, &plan, seed, leader);
         }
         if !plan.retire.is_empty() {
-            if self.cleaning() {
-                // The prefix retires once the cleanup just captured finishes.
+            if self.cleaning() || self.packing() {
+                // The prefix retires once the cleanup just captured or a
+                // running pack finishes.
                 return Ok(RetentionTurn {
                     more_work: true,
                     ..RetentionTurn::idle(true)

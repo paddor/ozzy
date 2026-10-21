@@ -247,6 +247,7 @@ impl OwnedJournal {
             .await?,
         );
         self.abandon_retirement();
+        self.abandon_pack();
         self.images = Some(candidate.activate(self.journal.ready()?)?);
         self.committed_base = None;
         self.applied = ticket.through();

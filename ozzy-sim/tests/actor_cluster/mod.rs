@@ -24,47 +24,75 @@ mod seeds;
 mod sim;
 mod workload;
 
-use broker::MAX_SEGMENTS;
+use broker::{MAX_SEGMENTS, SEGMENT_BYTES};
 use network::Profile;
 use sim::{
     Fault::{self, IsolateLeader},
     Options, Report,
 };
 
-/// Scripted faults by scenario name, with the ticks of proposals they need
-/// and the journal segment limit. `random` has only the profile's random faults.
+/// One scenario: ticks of proposals, scripted faults, and journal shape.
+/// `random` has only the profile's random faults.
+#[derive(Debug, Clone, Copy)]
+struct Scenario {
+    ticks: u64,
+    script: &'static [Fault],
+    batch: usize,
+    max_segments: usize,
+    segment_bytes: u64,
+    sparse: &'static [usize],
+    /// Caps the profile's floors for confirmed proposals and compared ops,
+    /// where a full journal bounds them.
+    max_floor: usize,
+    min_applied: u64,
+    min_refused: u64,
+}
+
+const RANDOM: Scenario = Scenario {
+    ticks: 1500,
+    script: &[],
+    batch: 1,
+    max_segments: MAX_SEGMENTS,
+    segment_bytes: SEGMENT_BYTES,
+    sparse: &[],
+    max_floor: usize::MAX,
+    min_applied: 0,
+    min_refused: 0,
+};
+
 /// A lost leader stays cut off for 15 s: three view attempts under the
 /// doubling 2 s to 8 s election timeouts, over the slowest profiles.
-fn scenario(name: &str) -> Option<(u64, &'static [Fault], usize)> {
+const LOST_LEADER: Fault = IsolateLeader {
+    at: 2500,
+    ticks: 1500,
+};
+
+fn scenario(name: &str) -> Option<Scenario> {
     Some(match name {
-        "random" => (1500, &[], MAX_SEGMENTS),
-        "failover" => (
-            1500,
-            &[IsolateLeader {
+        "random" => RANDOM,
+        "failover" => Scenario {
+            script: &[IsolateLeader {
                 at: 500,
                 ticks: 1500,
             }],
-            MAX_SEGMENTS,
-        ),
-        "long-history" => (
-            3000,
-            &[IsolateLeader {
-                at: 2500,
-                ticks: 1500,
-            }],
-            MAX_SEGMENTS,
-        ),
-        "very-long-history" => (
-            8000,
-            &[IsolateLeader {
+            ..RANDOM
+        },
+        "long-history" => Scenario {
+            ticks: 3000,
+            script: &[LOST_LEADER],
+            ..RANDOM
+        },
+        "very-long-history" => Scenario {
+            ticks: 8000,
+            script: &[IsolateLeader {
                 at: 7500,
                 ticks: 1500,
             }],
-            MAX_SEGMENTS,
-        ),
-        "repeated-failover" => (
-            3500,
-            &[
+            ..RANDOM
+        },
+        "repeated-failover" => Scenario {
+            ticks: 3500,
+            script: &[
                 IsolateLeader {
                     at: 500,
                     ticks: 800,
@@ -78,18 +106,38 @@ fn scenario(name: &str) -> Option<(u64, &'static [Fault], usize)> {
                     ticks: 800,
                 },
             ],
-            MAX_SEGMENTS,
-        ),
-        // Six segments fill after about 350 operations. Clients are refused,
-        // then the full leader is lost.
-        "full" => (
-            3000,
-            &[IsolateLeader {
-                at: 2500,
+            ..RANDOM
+        },
+        // Packing gives sparse 32 KiB segments' operations dense ones, and
+        // four of the six stay free for followers that need more. Clients are
+        // refused after about 100 operations, then the full leader is lost.
+        "full" => Scenario {
+            ticks: 3000,
+            script: &[LOST_LEADER],
+            max_segments: 6,
+            segment_bytes: 32 * 1024,
+            max_floor: 20,
+            min_refused: 1,
+            ..RANDOM
+        },
+        // Both followers write one operation per group while the first
+        // leader packs each proposal's four into one. Six 64 KiB segments of
+        // 15 groups hold fewer than 90 of their operations, so converging
+        // past 120 needs packing. The lost leader hands over to a sparse one.
+        "sparse-followers" => Scenario {
+            ticks: 3000,
+            script: &[IsolateLeader {
+                at: 800,
                 ticks: 1500,
             }],
-            6,
-        ),
+            batch: 4,
+            max_segments: 6,
+            segment_bytes: 64 * 1024,
+            sparse: &[1, 2],
+            max_floor: 20,
+            min_applied: 120,
+            ..RANDOM
+        },
         _ => return None,
     })
 }
@@ -97,20 +145,26 @@ fn scenario(name: &str) -> Option<(u64, &'static [Fault], usize)> {
 /// Proposals and faults for the scenario, then up to 30 s to heal and
 /// converge. Vacuity floors fit each profile's fault rate.
 fn options(profile: &str, scenario: &str) -> Options {
+    let scenario = self::scenario(scenario).expect("known scenario");
     let floor = match profile {
         "none" | "slow" => 100,
         "light" => 20,
         _ => 5,
-    };
-    let (ticks, script, max_segments) = self::scenario(scenario).expect("known scenario");
+    }
+    .min(scenario.max_floor);
     Options {
-        ticks,
+        ticks: scenario.ticks,
         drain: 3000,
         clients: 3,
-        max_segments,
+        batch: scenario.batch,
+        max_segments: scenario.max_segments,
+        segment_bytes: scenario.segment_bytes,
+        sparse: scenario.sparse,
         min_confirmed: floor,
         min_compared: floor as u64,
-        script,
+        min_applied: scenario.min_applied,
+        min_refused: scenario.min_refused,
+        script: scenario.script,
     }
 }
 
@@ -220,6 +274,13 @@ fn full_journal_refuses_proposals_and_replaces_its_leader() {
     checked(4, "light", "full");
 }
 
+/// Followers that need several times the leader's space pack sparse
+/// segments instead of filling, so the group keeps confirming and converges.
+#[test]
+fn sparse_followers_pack_instead_of_filling() {
+    checked(1, "none", "sparse-followers");
+}
+
 /// Seeds that found bugs. Schedules move with the code, so each names what
 /// it found.
 #[test]
@@ -247,10 +308,11 @@ mod seeded {
         const PROFILES: [&str; 5] = ["none", "light", "heavy", "swarm", "slow"];
         /// Each scenario with its profiles. Heavy and swarm faults leave too
         /// little progress to fill a journal.
-        const SCENARIOS: [(&str, &[&str]); 3] = [
+        const SCENARIOS: [(&str, &[&str]); 4] = [
             ("random", &PROFILES),
             ("failover", &PROFILES),
             ("full", &["none", "light", "slow"]),
+            ("sparse-followers", &["none", "light", "slow"]),
         ];
 
         /// About 4800 operations in 75 segments before the leader is lost. A
@@ -301,7 +363,10 @@ mod seeded {
                         runs += 1;
                         let report = outcome(seed, profile, scenario);
                         if report.vacuous {
-                            eprintln!("vacuous: {}", reproduce(seed, profile, scenario));
+                            eprintln!(
+                                "vacuous: {report:?}\n  {}",
+                                reproduce(seed, profile, scenario)
+                            );
                             vacuous.push((seed, profile, scenario.clone()));
                         }
                     }

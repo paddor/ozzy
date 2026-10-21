@@ -222,9 +222,12 @@ Flags, actions, artifacts, and replay: [ozzy-sim/README.md](ozzy-sim/README.md).
 
 A seed campaign over every profile (`none`, `light`, `heavy`, `swarm`, and
 `slow` disks) and scenario: `random` faults only; `failover`, which also cuts
-the leader off and requires a new one before it rejoins; and `full`, which
-fills a six-segment journal until it refuses proposals, then loses the leader.
-`full` skips `heavy` and `swarm`, which make too little progress to fill it.
+the leader off and requires a new one before it rejoins; `full`, which fills
+a journal of six 32 KiB segments until it refuses proposals, then loses the
+leader; and `sparse-followers`, where both followers write one
+operation per group while proposals carry four, so they converge only by
+packing. The last two skip `heavy` and `swarm`, which make too little
+progress to fill a journal.
 A failing seed prints its parameters, schedule hash, and this command with
 `OZZY_ACTOR_SIM_SEED`, `OZZY_ACTOR_SIM_PROFILE`, and
 `OZZY_ACTOR_SIM_SCENARIO` set. A run whose faults left too little progress

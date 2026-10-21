@@ -166,6 +166,7 @@ impl Journal {
             cleaning: std::rc::Rc::default(),
             pins: std::rc::Rc::default(),
             validated_indexes: std::cell::RefCell::default(),
+            pack_layouts: std::cell::RefCell::default(),
             active_prefix: None,
         })
     }
@@ -266,6 +267,7 @@ impl Journal {
             cleaning: std::rc::Rc::default(),
             pins: std::rc::Rc::default(),
             validated_indexes: std::cell::RefCell::default(),
+            pack_layouts: std::cell::RefCell::default(),
             active_prefix: None,
         };
         if let Some(next) = journal.recovered_manifest(recovered)? {

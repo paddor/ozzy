@@ -1,4 +1,6 @@
-use super::writeback::{Replica, admit, finish, prepare, replica, settle, synchronize};
+use super::writeback::{
+    Replica, admit, finish, prepare, replica_with_pending, settle, synchronize,
+};
 use super::*;
 use crate::replica_journal::{OwnedWriteStep, ProposalValidation};
 use ozzy_journal::operation::{CanonicalOperation, OperationKind};
@@ -33,10 +35,18 @@ fn write(controller: &mut Controller, replica: &mut Replica, groups: usize) {
     }
 }
 
+/// Admit, write, and settle `groups` one-operation groups.
+fn fill(controller: &mut Controller, replica: &mut Replica, groups: usize) {
+    let (_, _, done) = admit(controller, replica, groups);
+    write(controller, replica, groups);
+    settle(replica, done);
+}
+
+/// Roll once nothing waits to be written, or a queued group needs the roll.
 fn roll(controller: &mut Controller, replica: &mut Replica) {
     assert!(matches!(
         replica.journal.prepare_write().unwrap(),
-        OwnedWriteStep::RollRequired
+        OwnedWriteStep::Idle | OwnedWriteStep::RollRequired
     ));
     let work = replica.journal.begin_roll(16).unwrap();
     let done = drive(controller, work.publish());
@@ -46,22 +56,23 @@ fn roll(controller: &mut Controller, replica: &mut Replica) {
 #[test]
 fn full_journal_refuses_client_work_then_holds_writes_without_faulting() {
     let (mut controller, io) = setup();
-    // One operation per 4 KiB group, seven groups per 32 KiB segment.
-    let mut replica = replica(&mut controller, io, 0, 16);
-    replica.journal.limits.metadata.max_segments = 2;
-    let (_, _, first) = admit(&mut controller, &mut replica, 14);
-    write(&mut controller, &mut replica, 7);
-    roll(&mut controller, &mut replica);
-    write(&mut controller, &mut replica, 6);
+    // One operation per 4 KiB group, seven groups per 32 KiB segment. None
+    // applies here, so all 43 stay pending.
+    let mut replica = replica_with_pending(&mut controller, io, 0, 16, 64);
+    replica.journal.limits.metadata.max_segments = 6;
+    for _ in 0..2 {
+        fill(&mut controller, &mut replica, 7);
+        roll(&mut controller, &mut replica);
+    }
+    fill(&mut controller, &mut replica, 1);
 
-    // Less than a group left: records stop, control requests still pass.
+    // Fewer than four segments left: records stop, control requests still
+    // pass.
     assert!(matches!(
         room(&mut replica, OperationKind::Barrier),
         Err(JournalError::RollCapacity)
     ));
     assert!(room(&mut replica, OperationKind::Progress).is_ok());
-    write(&mut controller, &mut replica, 1);
-    settle(&mut replica, first);
     let mut proposal = replica.journal.lease_proposal_buffer().unwrap();
     proposal.push(OperationKind::Barrier, &[200; 16]).unwrap();
     let ticket = replica.driver.begin_validation().unwrap();
@@ -75,16 +86,26 @@ fn full_journal_refuses_client_work_then_holds_writes_without_faulting() {
             ..
         }
     ));
+
+    // Fewer than two left: control requests stop too. Trims and policy
+    // changes free space and always pass.
+    fill(&mut controller, &mut replica, 6);
+    roll(&mut controller, &mut replica);
+    fill(&mut controller, &mut replica, 7);
+    roll(&mut controller, &mut replica);
+    fill(&mut controller, &mut replica, 1);
     assert!(matches!(
         room(&mut replica, OperationKind::Progress),
         Err(JournalError::RollCapacity)
     ));
-    // Trims and policy changes free space and always pass.
     assert!(room(&mut replica, OperationKind::Trim).is_ok());
     assert!(room(&mut replica, OperationKind::PartitionPolicy).is_ok());
 
     // An operation admitted anyway, as on a follower, holds its write.
-    let (_, _, second) = admit(&mut controller, &mut replica, 1);
+    fill(&mut controller, &mut replica, 6);
+    roll(&mut controller, &mut replica);
+    fill(&mut controller, &mut replica, 7);
+    let (_, _, held) = admit(&mut controller, &mut replica, 1);
     assert!(matches!(
         replica.journal.prepare_write().unwrap(),
         OwnedWriteStep::Waiting
@@ -96,14 +117,14 @@ fn full_journal_refuses_client_work_then_holds_writes_without_faulting() {
     assert!(!replica.journal.is_faulted());
 
     // Room for another segment resumes the held write.
-    replica.journal.limits.metadata.max_segments = 3;
+    replica.journal.limits.metadata.max_segments = 7;
     roll(&mut controller, &mut replica);
     write(&mut controller, &mut replica, 1);
-    settle(&mut replica, second);
+    settle(&mut replica, held);
     synchronize(&mut controller, &mut replica);
     assert_eq!(
         replica.driver.normal().unwrap().snapshot().journal.durable,
-        OpNumber(15)
+        OpNumber(43)
     );
     drive(&mut controller, replica.journal.shutdown()).unwrap();
 }

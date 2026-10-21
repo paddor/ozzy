@@ -323,7 +323,7 @@ pub(super) fn group_body_encoding<'a>(
     })
 }
 
-pub(super) fn aligned_group_bytes(entry_bytes: usize) -> Result<usize, CodecError> {
+pub(crate) fn aligned_group_bytes(entry_bytes: usize) -> Result<usize, CodecError> {
     align_up(
         entry_bytes
             .checked_add(GROUP_SEAL_BYTES)

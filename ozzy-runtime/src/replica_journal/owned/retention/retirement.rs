@@ -52,7 +52,7 @@ impl OwnedJournal {
         self.healthy()?;
         self.validate_image(ticket)?;
         self.require_settled(ticket)?;
-        if self.retention_busy() {
+        if self.retention_busy() || self.packing() {
             return Err(JournalError::CompletionMismatch);
         }
         let scratch = self.charge_retention()?;

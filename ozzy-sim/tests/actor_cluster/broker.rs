@@ -46,9 +46,19 @@ pub(crate) const PIPELINE: PipelineLimits = PipelineLimits {
     max_operations: 8,
     max_body_bytes: 8192,
 };
-const SEGMENT_BYTES: u64 = 256 * 1024;
+/// Default journal segment size.
+pub(crate) const SEGMENT_BYTES: u64 = 256 * 1024;
 /// The broker's journal segment limit.
 pub(crate) const MAX_SEGMENTS: usize = 256;
+
+/// A broker's journal: segment limit and size, and whether it writes one
+/// operation per physical group.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Shape {
+    pub max_segments: usize,
+    pub segment_bytes: u64,
+    pub sparse: bool,
+}
 /// Partition visits per shard poll and polls per broker per tick.
 const TURN_ACTORS: usize = 16;
 const POLL_BUDGET: usize = 1000;
@@ -88,15 +98,15 @@ impl Broker {
         clock: &Clock,
         (mut disk, io): (Disk, Local),
         clients: usize,
-        max_segments: usize,
+        shape: Shape,
     ) -> Result<(Self, Vec<Lane>), String> {
         let generation = JournalGeneration(index as u128 + 1);
         let (owner, startup) = disk
             .drive(OwnedJournal::format_new(
-                journal_config(index, max_segments),
+                journal_config(index, shape),
                 io,
                 generation,
-                SEGMENT_BYTES,
+                shape.segment_bytes,
             ))
             .map_err(|error| format!("broker {index}: format: {error}"))?;
         let clock = clock.clone();
@@ -108,8 +118,13 @@ impl Broker {
             std::num::NonZeroU64::new(index as u64 + 1).unwrap(),
             ReceiptHandles::default(),
         );
-        let mut actor = ReplicaActor::new_with_ids(journal, startup, actor_config(index), ids)
-            .map_err(|error| format!("broker {index}: actor: {error}"))?;
+        let mut actor = ReplicaActor::new_with_ids(
+            journal,
+            startup,
+            actor_config(index, shape.segment_bytes),
+            ids,
+        )
+        .map_err(|error| format!("broker {index}: actor: {error}"))?;
         actor.enable_recovery();
         let mut actor = PartitionActor::Replicated(
             ScheduledReplica::new(actor).map_err(|error| format!("broker {index}: {error}"))?,
@@ -305,7 +320,7 @@ fn session(local: usize, peer: usize) -> LinkSessionId {
 
 /// Production timing, flow probes, and queue bounds from
 /// `ozzy-broker/src/actors.rs`, with a small pipeline.
-fn actor_config(index: usize) -> ActorConfig {
+fn actor_config(index: usize, segment_bytes: u64) -> ActorConfig {
     let message_bytes = WireLimits::for_transfer(PIPELINE.max_operations, PIPELINE.max_body_bytes)
         .and_then(WireLimits::message_bytes)
         .expect("replica packet bound");
@@ -341,15 +356,15 @@ fn actor_config(index: usize) -> ActorConfig {
             message_bytes,
         },
         installation: InstallationConfig {
-            segment_capacity: SEGMENT_BYTES,
+            segment_capacity: segment_bytes,
             body_encoding: BodyEncoding::Raw,
-            max_staged_bytes: SEGMENT_BYTES * MAX_SEGMENTS as u64,
+            max_staged_bytes: segment_bytes * MAX_SEGMENTS as u64,
             max_orphan_probes: 16,
         },
     }
 }
 
-fn journal_config(index: usize, max_segments: usize) -> OwnedConfig {
+fn journal_config(index: usize, shape: Shape) -> OwnedConfig {
     let configuration = ConfigurationRecord::new(
         GROUP,
         1,
@@ -372,7 +387,7 @@ fn journal_config(index: usize, max_segments: usize) -> OwnedConfig {
         limits: JournalLimits {
             metadata: MetadataLimits {
                 max_manifest_bytes: 256 * 1024,
-                max_segments,
+                max_segments: shape.max_segments,
             },
             decode: DecodeLimits::default(),
             operations: ozzy_journal::operation::OperationLimits::default(),
@@ -383,9 +398,10 @@ fn journal_config(index: usize, max_segments: usize) -> OwnedConfig {
                 max_state_bytes: 256 * 1024,
             },
             io: SegmentOptions {
-                max_segment_bytes: SEGMENT_BYTES,
-                // As the broker: a quarter of the progress share, at most 64 KiB.
-                chunk_bytes: 64 * 1024,
+                max_segment_bytes: shape.segment_bytes,
+                // As the broker: a quarter of the progress share, at most 64 KiB,
+                // and at most a segment.
+                chunk_bytes: (64 * 1024).min(shape.segment_bytes as usize),
                 direct: false,
                 write_mode: SegmentWriteMode::DataSync,
             },
@@ -402,7 +418,8 @@ fn journal_config(index: usize, max_segments: usize) -> OwnedConfig {
         deduplication: None,
         append_limits: PIPELINE,
         writeback: PIPELINE,
-        write_group_bytes: 8192,
+        // One byte ends each group after its first operation.
+        write_group_bytes: if shape.sparse { 1 } else { 8192 },
         reads: PartitionReadLimits {
             index: IndexBuildLimits::default(),
             max_resident_operations: 128,
