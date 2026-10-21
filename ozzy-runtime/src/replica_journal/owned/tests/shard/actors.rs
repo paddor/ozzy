@@ -330,6 +330,7 @@ fn configured_actor(
         .unwrap();
     let ids = crate::replica_actor::ActorIds::deterministic(
         std::num::NonZeroU64::new(u64::from(group) * 10 + u64::from(broker) + 1).unwrap(),
+        crate::replica_actor::ReceiptHandles::default(),
     );
     let mut actor = ReplicaActor::new_with_ids(
         journal,

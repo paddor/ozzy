@@ -179,6 +179,8 @@ struct ShardRun {
     peers: Vec<NodeId>,
     format: bool,
     plans: Vec<PartitionJournal>,
+    /// Receipt aliases shared by every shard of this broker.
+    handles: ozzy_runtime::replica_actor::ReceiptHandles,
     setup: mpsc::Sender<LaneSetup>,
     completed: mpsc::Sender<(NodeId, u32)>,
 }
@@ -188,6 +190,7 @@ async fn open(
     plans: Vec<PartitionJournal>,
     format: bool,
     local: NodeId,
+    handles: &ozzy_runtime::replica_actor::ReceiptHandles,
 ) -> Result<(PartitionActors, Vec<Creation>, RoutePublisher), StartupError> {
     let mut opening = FuturesUnordered::new();
     for plan in plans {
@@ -209,7 +212,13 @@ async fn open(
             PartitionAuthority::Local(_) => None,
             PartitionAuthority::Replicated(startup) => Some(startup.configuration()),
         };
-        let mut started = start_actor(opened, &context.memory.data, local, &BTreeMap::new())?;
+        let mut started = start_actor(
+            opened,
+            &context.memory.data,
+            local,
+            &BTreeMap::new(),
+            handles,
+        )?;
         started.prepare_partition()?;
         identities.push((started.actor.group(), started.incarnation));
         creations.push(Creation {
@@ -244,7 +253,7 @@ enum ShardEvent {
 async fn serve(mut context: ShardContext, run: ShardRun) -> Result<(), StartupError> {
     use ShardEvent as Event;
     let (mut actors, mut creations, mut publisher) =
-        open(&context, run.plans, run.format, run.local).await?;
+        open(&context, run.plans, run.format, run.local, &run.handles).await?;
     let (data, data_rx) = ozzy_runtime::frontend::data_channel(
         &omq_tokio::Context::new(),
         context.plan.id,
@@ -544,6 +553,7 @@ async fn start(brokers: &[(CheckedConfig, BrokerIdentity, JournalPlan)], format:
         let (devices, lanes) = DevicePools::start(&checked.plan).unwrap();
         let plans = journals.partitions.clone();
         let peers: Vec<_> = all.keys().copied().filter(|peer| *peer != local).collect();
+        let handles = ozzy_runtime::replica_actor::ReceiptHandles::default();
         let shards = ApplicationShards::start(&checked.plan, lanes, {
             let completed = completed.clone();
             let peers = peers.clone();
@@ -560,6 +570,7 @@ async fn start(brokers: &[(CheckedConfig, BrokerIdentity, JournalPlan)], format:
                         peers: peers.clone(),
                         format,
                         plans,
+                        handles: handles.clone(),
                         setup: setup.clone(),
                         completed: completed.clone(),
                     },

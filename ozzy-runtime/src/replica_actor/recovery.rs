@@ -168,13 +168,20 @@ pub struct RecoveryActor<J: RecoveryStorage = ShardRecoveringJournal> {
 impl<J: RecoveryStorage> RecoveryActor<J> {
     /// Reserve bounded transfer resources and generate a fresh recovery nonce.
     /// The actor's transfer bounds must fit the worker's leased arena.
+    /// Receipt aliases come from a private source, as in `ReplicaActor::new`.
     pub fn new(
         journal: J,
         startup: RecoveryStartup,
         config: ActorConfig,
         timing: RecoveryTiming,
     ) -> Result<Self, ActorError> {
-        Self::new_with_ids(journal, startup, config, timing, ActorIds::random())
+        Self::new_with_ids(
+            journal,
+            startup,
+            config,
+            timing,
+            ActorIds::random(super::ReceiptHandles::default()),
+        )
     }
 
     /// Use explicit IDs for recovery attempts, requests, and later journal

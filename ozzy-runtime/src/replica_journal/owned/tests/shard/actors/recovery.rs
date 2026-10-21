@@ -42,7 +42,10 @@ fn recovery_actor(
     owner.bind_append_memory(&memory).unwrap();
     let journal =
         ShardRecoveringJournal::from_owned(owner, ShardJournalConfig::default(), || 123).unwrap();
-    let ids = ActorIds::deterministic(std::num::NonZeroU64::new(9).unwrap());
+    let ids = ActorIds::deterministic(
+        std::num::NonZeroU64::new(9).unwrap(),
+        crate::replica_actor::ReceiptHandles::default(),
+    );
     (
         RecoveryActor::new_with_ids(
             journal,

@@ -22,7 +22,7 @@ pub use groups::{GroupCoordinator, GroupCoordinatorConfig, TopicTopology};
 mod history;
 mod ids;
 mod maintenance;
-pub use ids::ActorIds;
+pub use ids::{ActorIds, ReceiptHandles};
 mod ingress;
 mod io;
 mod local;

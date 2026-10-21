@@ -43,6 +43,8 @@ pub(super) struct Config {
     /// The admin owner's lane and links, when the broker serves an admin
     /// endpoint.
     pub admin: Option<crate::admin::Hooks>,
+    /// Receipt aliases shared by every partition actor of this broker.
+    pub receipt_handles: ozzy_runtime::replica_actor::ReceiptHandles,
 }
 
 impl Config {
@@ -131,6 +133,7 @@ impl Config {
             catalog,
             maximum_partitions: checked.plan.partitions.len(),
             admin: None,
+            receipt_handles: ozzy_runtime::replica_actor::ReceiptHandles::default(),
         })
     }
 

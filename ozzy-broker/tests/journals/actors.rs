@@ -121,6 +121,8 @@ struct Run {
     format: bool,
     plans: Vec<PartitionJournal>,
     sessions: BTreeMap<NodeId, LinkSessionId>,
+    /// Receipt aliases shared by every shard of this broker.
+    handles: ozzy_runtime::replica_actor::ReceiptHandles,
     incoming: mpsc::Receiver<Packet>,
     outgoing: mpsc::Sender<Wire>,
     completed: mpsc::Sender<(NodeId, u32)>,
@@ -135,8 +137,10 @@ fn start_actor(
     memory: &ozzy_runtime::memory::Owner,
     from: NodeId,
     sessions: &BTreeMap<NodeId, LinkSessionId>,
+    handles: &ozzy_runtime::replica_actor::ReceiptHandles,
 ) -> Result<ozzy_broker::StartedPartition, StartupError> {
-    let mut started = opened.into_actor(memory, &BTreeMap::new(), ActorIds::random(), || 123)?;
+    let ids = ActorIds::random(handles.clone());
+    let mut started = opened.into_actor(memory, &BTreeMap::new(), ids, || 123)?;
     if let ozzy_runtime::replica_actor::PartitionActor::Replicated(actor) = &mut started.actor {
         for (&peer, &session) in sessions {
             if peer != from {
@@ -178,7 +182,13 @@ async fn serve(mut context: ShardContext, mut run: Run) -> Result<(), StartupErr
                 Some(startup.configuration())
             }
         };
-        let mut started = start_actor(opened, &context.memory.data, run.from, &run.sessions)?;
+        let mut started = start_actor(
+            opened,
+            &context.memory.data,
+            run.from,
+            &run.sessions,
+            &run.handles,
+        )?;
         let group = started.actor.group();
         if !run.format
             && let PartitionStatus::Replicated(status) = started.actor.status()
@@ -289,6 +299,7 @@ async fn start(brokers: &[(CheckedConfig, BrokerIdentity, JournalPlan)], format:
             }
         }
         let incoming = Arc::new(Mutex::new(incoming));
+        let handles = ozzy_runtime::replica_actor::ReceiptHandles::default();
         let (devices, lanes) = DevicePools::start(&checked.plan).unwrap();
         let shards = ApplicationShards::start(&checked.plan, lanes, {
             let outgoing = outgoing.clone();
@@ -315,6 +326,7 @@ async fn start(brokers: &[(CheckedConfig, BrokerIdentity, JournalPlan)], format:
                         format,
                         plans,
                         sessions: sessions.clone(),
+                        handles: handles.clone(),
                         incoming,
                         outgoing: outgoing.clone(),
                         completed: completed.clone(),

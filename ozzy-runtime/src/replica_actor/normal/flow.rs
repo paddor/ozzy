@@ -468,7 +468,7 @@ impl ReplicaActor {
                     voter,
                     channel,
                     session,
-                    handle: crate::replica_actor::ActorIds::compact_handle()?,
+                    handle: self.ids.compact_handle()?,
                     established: false,
                 };
                 self.work.flow.local_handle = Some(bound);

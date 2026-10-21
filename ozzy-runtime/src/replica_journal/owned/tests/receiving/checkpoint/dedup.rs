@@ -299,7 +299,10 @@ fn recovered_cluster(
             shard,
             startup,
             actor_config(),
-            ActorIds::deterministic(std::num::NonZeroU64::new(broker as u64 + 100).unwrap()),
+            ActorIds::deterministic(
+                std::num::NonZeroU64::new(broker as u64 + 100).unwrap(),
+                crate::replica_actor::ReceiptHandles::default(),
+            ),
         )
         .unwrap();
         actor.enable_recovery();

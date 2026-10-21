@@ -271,7 +271,7 @@ async fn open_actor(
     opened.into_actor(
         &shard.memory.data,
         &BTreeMap::new(),
-        ActorIds::random(),
+        ActorIds::random(config.receipt_handles.clone()),
         move || time.timestamp(),
     )
 }
@@ -294,7 +294,7 @@ async fn open_recovery(
     opened.into_actor(
         &shard.memory.data,
         &BTreeMap::new(),
-        ActorIds::random(),
+        ActorIds::random(config.receipt_handles.clone()),
         move || time.timestamp(),
     )
 }

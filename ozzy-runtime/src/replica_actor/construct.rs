@@ -16,12 +16,19 @@ impl ReplicaActor {
     /// The journal must have two available append-buffer leases at these bounds:
     /// one for journal/transfer work and one for contiguous backup receive staging.
     /// At least two command slots must be available for write/sync overlap.
+    /// Receipt aliases come from a private source. A broker hosting several
+    /// groups shares one `ReceiptHandles` through `new_with_ids`.
     pub fn new(
         journal: ReplicaJournal,
         startup: JournalStartup,
         config: ActorConfig,
     ) -> Result<Self, ActorError> {
-        Self::new_with_ids(journal, startup, config, ActorIds::random())
+        Self::new_with_ids(
+            journal,
+            startup,
+            config,
+            ActorIds::random(super::ReceiptHandles::default()),
+        )
     }
 
     /// Construct with an explicit protocol ID source. The simulator must give
