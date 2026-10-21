@@ -190,7 +190,7 @@ impl OwnedJournal {
     }
 }
 
-fn push(
+pub(super) fn push(
     buffer: &mut ProposalBuffer,
     body: &OperationBody<'_>,
     limits: ozzy_journal::operation::OperationLimits,

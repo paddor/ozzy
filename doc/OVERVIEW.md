@@ -107,6 +107,9 @@ flowchart LR
   confirmed retry returns the original offset.
 - Resume restores producer epochs and sequences; takeover fences the old
   producer. Neither is an outbox: a crash can lose unconfirmed input.
+- A session with no open or append for `producer_idle_secs` (7 days) retires
+  with its retry results. Its writer then fails as fenced; resuming its
+  identity starts fresh sequences.
 
 ### Reading
 

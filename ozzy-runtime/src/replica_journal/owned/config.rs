@@ -61,6 +61,9 @@ pub struct OwnedConfig<C = ConfigurationRecord> {
     pub write_group_bytes: usize,
     /// Incremental reader indexes, payload residency, and detached read limits.
     pub reads: ozzy_journal_segment::PartitionReadLimits,
+    /// A primary retires producer sessions unchanged and unopened this long.
+    /// `None` keeps every session until the producer table fills.
+    pub producer_idle: Option<std::time::Duration>,
 }
 
 impl OwnedConfig {

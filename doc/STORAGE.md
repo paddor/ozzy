@@ -118,7 +118,7 @@ Exact layout: [segment codec](../ozzy-journal-segment/src/codec.rs).
 | 4 | `Progress` | 11 | `DedupWatermark` |
 | 5 | `Assign` | 12 | `GroupPlan` |
 | 6 | `Trim` | 13 | `GroupDelete` |
-| 7 | `PartitionPolicy` | | |
+| 7 | `PartitionPolicy` | 14 | `RetireProducer` |
 
 Integers are big-endian, IDs 16 bytes, counts and text lengths `u32`. Exact
 schema: [operation codec](../ozzy-journal/src/operation/codec/).
@@ -174,6 +174,9 @@ part. General descriptors use:
   the committed revision it retires, operation ID.
 - `CreatePartition` stores the dedup window as `u64` milliseconds; zero
   disables deduplication.
+- `RetireProducer` (kind 14): partition incarnation, producer ID, epoch
+  `u64`, next sequence `u64`. It has no operation ID: the epoch and next
+  sequence fence it against any open or append ordered first.
 
 ## Record identity and deduplication
 
@@ -183,6 +186,10 @@ part. General descriptors use:
 - Exact sequence-to-offset retry ranges survive checkpoints and leader changes.
   Ranges merge only when both sequences and offsets are adjacent. Expired retry
   results fail explicitly.
+- A leader retires sessions idle for `producer_idle_secs` with their ranges.
+  Idleness is the leader's own observation: a new leader starts every session
+  with a full expiry. The partition keeps the highest retired epoch, and a
+  recreated session starts above it.
 - Deduplication is a per-topic option over nonzero message IDs. The first
   record wins within the window, which is fixed at partition creation.
 - A duplicate stores only its outcome and a BLAKE3 fingerprint of message ID,

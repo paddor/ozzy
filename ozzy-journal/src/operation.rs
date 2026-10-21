@@ -87,5 +87,5 @@ pub use schema::{
     CanonicalOperation, ChainPosition, CreatePartition, DedupWatermark, Digest, OpenProducer,
     OperationBody, OperationHeader, OperationKind, OperationLimits, PartitionPolicy,
     ProducerResultFloor, Progress, ProgressAssignment, ProgressOwner, RecordPosition,
-    ResolvedAppend, RetentionPolicy, Trim,
+    ResolvedAppend, RetentionPolicy, RetireProducer, Trim,
 };

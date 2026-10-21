@@ -18,6 +18,7 @@ fn state(writers: usize, spans: usize, metadata: usize) -> CanonicalState {
     };
     let mut partition = CanonicalPartition {
         dedup_time: 0,
+        retired_epoch: 0,
         address: address.clone(),
         owner_epoch: OwnerEpoch::INITIAL,
         producers: ahash::AHashMap::new(),
@@ -110,22 +111,22 @@ fn canonical_snapshot_encoding_bytes_fixture() {
             130,
             0,
             0,
-            10773,
-            0x5036_dd30_aa00_ee6d_2077_9ead_39d0_40f9_u128,
+            10781,
+            0xc642_6cff_a748_e984_2209_988a_1c6a_3e7a_u128,
         ),
         (
             2,
             130,
             130,
-            27573,
-            0x83ff_7993_7593_32bb_bbcc_de4d_0097_fc0f_u128,
+            27581,
+            0x47f3_c15e_23a0_28d2_9c72_7cec_0a3c_f8e7_u128,
         ),
         (
             2,
             6000,
             130,
-            497_173,
-            0x5e7b_8f6f_fa26_1811_c9f5_fd96_2b70_6060_u128,
+            497_181,
+            0x519d_9f10_aaec_4b73_6d0a_7005_e2cd_2a6e_u128,
         ),
     ] {
         let state = state(writers, spans, metadata);
@@ -300,9 +301,9 @@ fn cooperative_state_snapshot_refuses_late_semantic_errors_and_resource_limits()
         .encode_snapshot(StateSnapshotLimits::default())
         .unwrap();
     let partition = STATE_SNAPSHOT_HEADER_BYTES;
-    let fixed: &[u8; 104] = layout::record(&original, partition).unwrap();
+    let fixed: &[u8; 112] = layout::record(&original, partition).unwrap();
     let names = usize::from(fixed.u16_at::<4>()) + usize::from(fixed.u16_at::<6>());
-    let first = partition + 104 + names;
+    let first = partition + 112 + names;
     let second = first + 80 + 130 * 40;
     let progress = partition + fixed.u32_at::<0>() as usize;
     let assignments = progress + 130 * PROGRESS_BYTES;

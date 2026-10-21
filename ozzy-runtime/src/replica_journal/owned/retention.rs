@@ -1,12 +1,14 @@
 //! Confirmed floors precede checkpoint selection and physical retirement.
 
 mod cleanup;
+mod idle;
 mod plan;
 mod retirement;
 
 use super::{JournalError, OwnedJournal};
 use crate::replica_journal::RetentionTurn;
 use cleanup::{Cleaned, Cleaning};
+pub(super) use idle::IdleProducers;
 use ozzy_core::retention::{Plan, Segment};
 use ozzy_journal_segment::{RetirementBudget, RetirementProof};
 use ozzy_proto::{CheckpointId, OperationId, PartitionIncarnation};
@@ -34,9 +36,18 @@ pub(super) struct Retention {
     swept: bool,
     /// Retention jobs started, so a stale completion is recognized.
     attempts: u64,
+    /// Producer sessions this primary saw unchanged, for idle retirement.
+    pub(super) idle: IdleProducers,
 }
 
 impl Retention {
+    pub(super) fn new(idle: Option<std::time::Duration>) -> Self {
+        Self {
+            idle: IdleProducers::new(idle),
+            ..Self::default()
+        }
+    }
+
     /// Forget cached summaries and roll proofs of segments `keep` rejects.
     fn retain_segments(&mut self, keep: impl Fn(u64) -> bool) {
         self.sealed.retain(|id, _| keep(*id));
@@ -100,7 +111,16 @@ impl OwnedJournal {
         let mut turn = self
             .record_retention_turn(ticket, now_millis, seed, leader)
             .await?;
-        turn.enabled |= self.dedup.limits.is_some();
+        if turn.proposal.is_none() {
+            let view = ticket.scope().view;
+            let (proposal, more) = match self.idle_producer_proposal(view, now_millis, leader) {
+                Err(JournalError::AppendCapacity) => (None, true),
+                result => result?,
+            };
+            turn.proposal = proposal;
+            turn.more_work |= more;
+        }
+        turn.enabled |= self.dedup.limits.is_some() || self.retention.idle.expiry().is_some();
         turn.more_work |= identities.more_work;
         turn.expired_identities = identities.expired;
         Ok(turn)

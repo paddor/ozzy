@@ -19,6 +19,7 @@ mod cooperation;
 mod dedup;
 mod faults;
 mod identities;
+mod idle_producers;
 mod native;
 mod partition;
 mod producer_dedup;
@@ -46,6 +47,7 @@ fn local_config() -> OwnedConfig<Configuration> {
         writeback: base.writeback,
         write_group_bytes: base.write_group_bytes,
         reads: base.reads,
+        producer_idle: base.producer_idle,
     }
 }
 

@@ -92,6 +92,7 @@ fn config(root: &str, id: u8) -> OwnedConfig {
             cached_indexes: 2,
             concurrent_reads: 2,
         },
+        producer_idle: None,
     }
 }
 

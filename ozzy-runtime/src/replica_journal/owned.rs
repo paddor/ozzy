@@ -258,7 +258,7 @@ impl OwnedJournal {
         let applied = prefix(journal.committed_position()?);
         let generation = journal.writer().durable_position().generation();
         Ok(Self {
-            retention: retention::Retention::default(),
+            retention: retention::Retention::new(config.producer_idle),
             journal: JournalOwner::Ready(Box::new(journal)),
             configuration,
             scope,

@@ -17,7 +17,7 @@ use ozzy_core::state::{
 use ozzy_journal::operation::{
     Append, AppendBatch, AppendRecord, Assign, Barrier, CreatePartition, OpenProducer,
     OperationBody, PartitionPolicy, ProducerResultFloor, Progress, ProgressAssignment,
-    ProgressOwner, RetentionPolicy, Trim,
+    ProgressOwner, RetentionPolicy, RetireProducer, Trim,
 };
 use ozzy_proto::{
     ConsumerGroupId, ConsumerMemberId, MessageId, Offset, OperationId, OwnerEpoch, PartitionId,

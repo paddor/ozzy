@@ -96,6 +96,7 @@ impl Settings {
             writeback: self.pipeline,
             write_group_bytes: self.pipeline.max_body_bytes,
             reads: self.reads,
+            producer_idle: Some(std::time::Duration::from_secs(placement.producer_idle_secs)),
         }
     }
 

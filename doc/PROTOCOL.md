@@ -243,10 +243,14 @@ with tag `u8=1`. Payload is empty except for APPEND.
 
 OPEN_PRODUCER:
 
-- Mode `0` resume returns the current session, or creates epoch 1 on an
-  unused partition; an expected epoch must match. Mode `1` fence requires an
-  expected epoch and commits a newer one. Mode `2` create forbids an expected
-  epoch and rejects existing identities.
+- Mode `0` resume returns the current session, or creates one when none is
+  live: epoch 1, or one above every retired epoch on the partition. An
+  expected epoch must match. Mode `1` fence requires an expected epoch and
+  commits a newer one. Mode `2` create forbids an expected epoch and rejects
+  existing identities.
+- The leader retires a session with no open or append for the topic's
+  `producer_idle_secs`, retry results included. Its later requests fail with
+  code 6, like a fenced session's.
 - Retries keep the operation ID. The latest transition identity survives
   checkpoints and history retirement. The reply follows confirmation.
 - The retry floor (at most the next sequence) is the exclusive sequence below

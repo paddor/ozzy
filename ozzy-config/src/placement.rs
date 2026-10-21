@@ -84,6 +84,8 @@ pub struct PartitionPlacement {
     pub retention: crate::TopicRetention,
     /// Optional per-partition deduplication policy and index resource bounds.
     pub deduplication: Option<crate::TopicDeduplication>,
+    /// Idle producer session expiry in seconds.
+    pub producer_idle_secs: u64,
 }
 
 impl ValidatedDeployment {
@@ -161,6 +163,7 @@ impl ValidatedDeployment {
                     partition,
                     retention: topic.retention,
                     deduplication: topic.deduplication,
+                    producer_idle_secs: topic.producer_idle_secs,
                     shard: shard.id,
                     device: shard.device.clone(),
                     directory: broker

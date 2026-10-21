@@ -4,7 +4,7 @@ use super::primitives::{Encoder, ReadFields, Reader, validate_name};
 use crate::operation::{
     Assign, CreatePartition, DedupWatermark, OpenProducer, OperationCodecError, OperationLimits,
     OperationOutput, PartitionPolicy, ProducerResultFloor, Progress, ProgressAssignment,
-    ProgressOwner, RetentionPolicy, Trim,
+    ProgressOwner, RetentionPolicy, RetireProducer, Trim,
 };
 use ozzy_proto::{
     ConsumerGroupId, ConsumerMemberId, Offset, OperationId, OwnerEpoch, PartitionId,
@@ -258,6 +258,27 @@ pub(super) fn decode_producer_result_floor(
         expected_floor: ProducerSequence::new(decoder.u64()?),
         new_floor: ProducerSequence::new(decoder.u64()?),
         operation_id: OperationId::from_bytes(decoder.id()?),
+    })
+}
+
+pub(super) fn encode_retire_producer(
+    value: RetireProducer,
+    encoder: &mut Encoder<'_, impl OperationOutput>,
+) -> Result<(), OperationCodecError> {
+    encoder.id(value.partition.as_bytes())?;
+    encoder.id(value.producer_id.as_bytes())?;
+    encoder.u64(value.producer_epoch.get())?;
+    encoder.u64(value.next_sequence.get())
+}
+
+pub(super) fn decode_retire_producer(
+    decoder: &mut Reader<'_>,
+) -> Result<RetireProducer, OperationCodecError> {
+    Ok(RetireProducer {
+        partition: PartitionIncarnation::from_bytes(decoder.id()?),
+        producer_id: ProducerId::from_bytes(decoder.id()?),
+        producer_epoch: ProducerEpoch::new(decoder.u64()?),
+        next_sequence: ProducerSequence::new(decoder.u64()?),
     })
 }
 

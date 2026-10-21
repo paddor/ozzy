@@ -245,6 +245,11 @@ fn validate_topics(config: &Deployment, ids: &mut BTreeSet<Uuid>) -> Result<(), 
             &format!("{path}.retention.max_bytes"),
             "byte target must fit at least one segment",
         )?;
+        require(
+            topic.producer_idle_secs > 0 && topic.producer_idle_secs.checked_mul(1000).is_some(),
+            &format!("{path}.producer_idle_secs"),
+            "idle expiry must be positive and fit milliseconds",
+        )?;
         if let Some(policy) = topic.deduplication {
             validate_deduplication(policy, &path)?;
         }

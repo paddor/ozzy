@@ -132,6 +132,10 @@ pub struct Topic {
     /// Optional first-wins deduplication and per-partition resource limits.
     /// Omitted preserves every producer's records.
     pub deduplication: Option<TopicDeduplication>,
+    /// Seconds a producer session may stay unopened and without appends
+    /// before the partition leader retires it with its retry results.
+    #[serde(default = "default_producer_idle")]
+    pub producer_idle_secs: u64,
 }
 
 /// Deduplicate event identities within each partition, independently of routing.
@@ -150,6 +154,10 @@ pub struct TopicDeduplication {
 
 const fn default_dedup_window() -> u64 {
     300_000
+}
+
+const fn default_producer_idle() -> u64 {
+    7 * 24 * 60 * 60
 }
 
 /// Optional age and stored segment capacity targets. Either limit expires the

@@ -66,6 +66,11 @@
 
 ### Fixed
 
+- Brokers retire producer sessions with no open or append for the topic's
+  `producer_idle_secs` (default 7 days). Each new writer adds a session to
+  every partition it writes, so the table used to fill at about one million
+  and then refuse new writers. A retired session's retry results go with it;
+  resuming its identity starts a new session with fresh sequences.
 - A consumer-group partition that moves again before its new owner activates
   it now waits for the member that still owns it, up to the drain deadline.
   The next owner could start while the original owner was still draining,

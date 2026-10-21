@@ -5,8 +5,9 @@ use ozzy_proto::{PartitionIncarnation, ProducerEpoch, ProducerId, ProducerSequen
 use smallvec::SmallVec;
 
 use super::{
-    AppendCursor, AssignmentKey, AssignmentState, CanonicalProducer, CanonicalState, IdentityIndex,
-    Mutation, PreparedProducerResults, ProgressKey, StateError, TransitionPlan,
+    AppendCursor, AssignmentKey, AssignmentState, CanonicalPartition, CanonicalProducer,
+    CanonicalState, IdentityIndex, Mutation, PreparedProducerResults, ProgressKey, StateError,
+    TransitionPlan,
 };
 
 impl CanonicalState {
@@ -70,10 +71,7 @@ impl CanonicalState {
                 self.groups.remove(&group);
                 self.set_group_counts(members, sources);
             }
-            Mutation::Create { partition, state } => {
-                self.addresses.insert(state.address.clone(), partition);
-                self.partitions.insert(partition, state);
-            }
+            Mutation::Create { partition, state } => self.install_partition(partition, state),
             Mutation::OpenProducer {
                 partition,
                 producer,
@@ -105,12 +103,21 @@ impl CanonicalState {
                 producer,
                 floor,
             } => self.expire_producer_results(partition, producer, floor)?,
+            Mutation::RetireProducer {
+                partition,
+                producer,
+            } => self.retire_producer(partition, producer)?,
             Mutation::DedupTime { partition, time } => {
                 self.partition_mut(partition)?.dedup_time = time;
             }
             Mutation::Barrier => {}
         }
         Ok(())
+    }
+
+    fn install_partition(&mut self, partition: PartitionIncarnation, state: CanonicalPartition) {
+        self.addresses.insert(state.address.clone(), partition);
+        self.partitions.insert(partition, state);
     }
 
     fn set_group_counts(&mut self, members: usize, sources: usize) {
@@ -211,6 +218,24 @@ impl CanonicalState {
             self.count_retry_spans(usize::from(cursor.new_span), 0)?;
         }
         Ok(())
+    }
+
+    fn retire_producer(
+        &mut self,
+        partition: PartitionIncarnation,
+        producer: ProducerId,
+    ) -> Result<(), StateError> {
+        let state = self.partition_mut(partition)?;
+        let retired = state
+            .producers
+            .remove(&producer)
+            .ok_or(StateError::ProducerMismatch)?;
+        state.retired_epoch = state.retired_epoch.max(retired.producer_epoch.get());
+        self.producer_count = self
+            .producer_count
+            .checked_sub(1)
+            .ok_or(StateError::LimitExceeded("producer count"))?;
+        self.count_retry_spans(0, retired.result_spans().len())
     }
 
     fn expire_producer_results(

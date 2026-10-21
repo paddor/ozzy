@@ -8,7 +8,7 @@ use super::{
 use ahash::AHashMap as HashMap;
 use ozzy_journal::operation::{
     Assign, Barrier, CreatePartition, DedupWatermark, OpenProducer, OperationBody, PartitionPolicy,
-    ProducerResultFloor, Progress, ProgressOwner, Trim,
+    ProducerResultFloor, Progress, ProgressOwner, RetireProducer, Trim,
 };
 use ozzy_proto::Offset;
 
@@ -45,6 +45,7 @@ impl CanonicalState {
                 self.prepare_producer_result_floor(*value, op_number, identities)?
             }
             OperationBody::DedupWatermark(value) => self.prepare_dedup_watermark(*value)?,
+            OperationBody::RetireProducer(value) => self.prepare_retire_producer(*value)?,
             OperationBody::GroupPlan(value) => {
                 self.prepare_group_plan(value, op_number, identities)?
             }
@@ -100,6 +101,7 @@ impl CanonicalState {
                     retention: value.retention,
                     dedup_window_millis: value.dedup_window_millis,
                     dedup_time: 0,
+                    retired_epoch: 0,
                 },
             },
             Vec::new(),
@@ -380,6 +382,31 @@ impl CanonicalState {
                 floor: value.new_floor,
             },
             claims,
+        ))
+    }
+
+    /// Retirement needs the exact session the primary saw idle. An open or
+    /// append ordered before it changes the epoch or the next sequence.
+    fn prepare_retire_producer(
+        &self,
+        value: RetireProducer,
+    ) -> Result<(Mutation, Vec<IdentityClaim>), StateError> {
+        let producer = self
+            .require_partition(value.partition)?
+            .producer(value.producer_id)
+            .ok_or(StateError::ProducerMismatch)?;
+        if value.producer_epoch != producer.producer_epoch {
+            return Err(StateError::ProducerEpochMismatch);
+        }
+        if value.next_sequence != producer.next_producer_sequence {
+            return Err(StateError::ProducerSequenceMismatch);
+        }
+        Ok((
+            Mutation::RetireProducer {
+                partition: value.partition,
+                producer: value.producer_id,
+            },
+            Vec::new(),
         ))
     }
 
