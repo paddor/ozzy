@@ -66,6 +66,10 @@
 
 ### Fixed
 
+- A consumer-group partition that moves again before its new owner activates
+  it now waits for the member that still owns it, up to the drain deadline.
+  The next owner could start while the original owner was still draining,
+  which redelivered records that member had not yet acknowledged.
 - A disk-quorum leader whose retention turn came due while an operation waited
   for a lagging follower no longer stalls the partition. The turn also held
   history replay and donor work, so once the other follower failed the

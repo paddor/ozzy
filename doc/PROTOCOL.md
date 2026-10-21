@@ -443,9 +443,11 @@ Rules:
   captures the resume cursor, and fences older revisions.
 - A later join of the same member ID fences the earlier instance. A
   coordinator that no longer holds the join's group ID replies status `3`.
-- A target is activatable once its prior instance released it, left, timed
-  out, or passed the drain deadline. A new coordinator leader treats prior
-  ownership as unknown until a report or a full drain deadline.
+- A target is activatable once every older owner released it, left, timed
+  out, or passed the drain deadline. The owner can be older than the prior
+  member when a target moves again before it activates. A new coordinator
+  leader treats each member's ownership as unknown until its report or a
+  full drain deadline.
 - A repeated plan revision returns the original epoch and cursor. Older
   revisions and fenced joins fail with code 6; a different owner for the same
   revision with code 8; a creation offset outside confirmed retained history
