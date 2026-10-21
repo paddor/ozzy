@@ -204,6 +204,7 @@ impl<J: RecoveryStorage> RecoveryActor<J> {
                 scope,
                 request_id,
                 nonce,
+                nonvoting: true,
             });
         Ok(Self {
             configuration,

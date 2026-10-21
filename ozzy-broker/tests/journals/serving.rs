@@ -471,22 +471,12 @@ async fn live_many<T>(
     stage: &str,
     operation: impl std::future::Future<Output = T>,
 ) -> T {
-    live_many_within(brokers, stage, Duration::from_secs(5), operation).await
-}
-
-/// `live_many` for a stage that waits out protocol deadlines of its own.
-async fn live_many_within<T>(
-    brokers: &[Broker],
-    stage: &str,
-    bound: Duration,
-    operation: impl std::future::Future<Output = T>,
-) -> T {
     tokio::select! {
         result = operation => result,
         (result, broker, _) = futures::future::select_all(brokers.iter().map(|broker| Box::pin(broker.closed()))) => {
             panic!("broker {broker} exited during {stage}: {result:?}")
         },
-        () = tokio::time::sleep(bound) => panic!("no progress during {stage}"),
+        () = tokio::time::sleep(Duration::from_secs(5)) => panic!("no progress during {stage}"),
     }
 }
 

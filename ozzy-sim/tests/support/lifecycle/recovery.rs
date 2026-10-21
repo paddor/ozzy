@@ -125,6 +125,7 @@ impl Replica {
                 scope: self.configuration.scope(),
                 request_id: RequestId::from_bytes(self.next_request.to_be_bytes()),
                 nonce,
+                nonvoting: true,
             }
         });
         self.buffered.clear();

@@ -3,6 +3,8 @@
 use super::{Action, DriverError, ReplicaDriver, Role};
 use crate::wire::Control;
 use crate::{Scope, VoterIndex, VoterSet};
+use ozzy_proto::NodeId;
+use std::time::Duration;
 
 impl ReplicaDriver {
     pub(super) fn receive_exit(
@@ -45,6 +47,23 @@ impl ReplicaDriver {
         }
         self.exit_votes.insert(voter);
         self.advance_if_exit_quorum()
+    }
+
+    /// `from` asked for recovery as a nonvoting copy. When it is the primary of the
+    /// view this replica elects, it cannot install that view, so suspect the
+    /// view now instead of at the election deadline. Leaving the view still
+    /// needs a second voter's suspicion.
+    pub fn observe_recovering(&mut self, from: NodeId, now: Duration) -> Result<(), DriverError> {
+        self.observe_time(now)?;
+        self.require_healthy()?;
+        let voter = self.configuration.voter_index(from)?;
+        if voter != self.local
+            && voter == VoterIndex::primary(self.scope().view)
+            && matches!(self.role, Role::ViewChanging(_))
+        {
+            self.request_exit()?;
+        }
+        Ok(())
     }
 
     pub(super) fn request_exit(&mut self) -> Result<(), DriverError> {

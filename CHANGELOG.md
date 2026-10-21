@@ -9,6 +9,10 @@
 
 ### Changed
 
+- A disk-quorum election whose next leader withdraws into checkpoint recovery
+  ends when that broker's recovery requests arrive, not at the doubled
+  election deadline. A complete cluster restart with an expired copy serves
+  about 4 s sooner.
 - Improve small-record producer admission and compressed APPEND validation.
   Release binaries use ThinLTO.
 - Rust SDK `confirmed()` waits wake only for their own record, so many

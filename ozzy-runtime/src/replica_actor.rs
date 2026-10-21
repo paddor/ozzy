@@ -360,7 +360,7 @@ impl ReplicaActor {
             ReplicaMessage::FetchOps(request) => self.serve(from, request)?,
             ReplicaMessage::Ops(batch) => self.receive_ops(&batch)?,
             ReplicaMessage::Recovery(wire::RecoveryMessage::Request(request)) => {
-                self.receive_recovery(index, request)?;
+                self.receive_recovery(index, request, now)?;
             }
             ReplicaMessage::Recovery(wire::RecoveryMessage::State(_))
             | ReplicaMessage::Checkpoint(wire::CheckpointMessage::Chunk { .. })

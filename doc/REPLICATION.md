@@ -93,7 +93,10 @@ sequenceDiagram
 ## Leader change
 
 A broker suspects the leader when contact, commit progress, or storage
-progress times out. A suspicious leader stops heartbeats.
+progress times out. A suspicious leader stops heartbeats. In an election, a
+nonvoting recovery request from the view's primary is suspicion too: that
+primary cannot install its view. A restart's retained-history probe still
+votes and is not suspicion.
 
 | Step | Gate |
 | --- | --- |
@@ -188,6 +191,9 @@ across the gap.
   Without it the report stays unverified.
 - A broker withdraws only if its own history expired. Withdrawal aborts any
   unpublished installation; the old history and promise stay intact.
+- When the withdrawn broker leads the view in election, its recovery requests
+  let the other two leave that view without waiting for the election
+  deadline.
 
 ## Read authority
 

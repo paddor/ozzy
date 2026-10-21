@@ -179,6 +179,7 @@ fn startup_probe(
         scope: driver.scope(),
         request_id: ids.request()?,
         nonce: ids.request()?,
+        nonvoting: false,
     };
     Ok(Some(startup::Probe::new(request, source.accepted)))
 }

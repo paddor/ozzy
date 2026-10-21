@@ -330,12 +330,11 @@ async fn restart_with_ancient_replica() {
     }
     // The first election, with the ancient copy and one healthy copy,
     // expires without selecting the ancient history. The next view's primary
-    // is the ancient copy, which withdraws into recovery, so the resume can
-    // wait about 4 s for that view's doubled election deadline.
-    let mut writer = live_many_within(
+    // is the ancient copy. It withdraws into recovery, and its recovery
+    // requests end that view without its doubled election deadline.
+    let mut writer = live_many(
         &brokers,
         "resume with ancient replica after complete cluster restart",
-        Duration::from_secs(15),
         SharedTopicWriter::resume(
             &producer,
             "orders",

@@ -424,6 +424,57 @@ fn dropped_election_packets_retry_at_bounded_intervals_then_advance_with_backoff
 }
 
 #[test]
+fn a_recovering_election_primary_ends_its_view_before_the_deadline() {
+    // A normal follower keeps its contact deadline instead.
+    let mut follower = driver(normal(1));
+    follower
+        .observe_recovering(node(0), Duration::ZERO)
+        .unwrap();
+    assert_eq!(follower.poll(Duration::ZERO).unwrap(), None);
+    let changing = ViewChange::recover_intact(
+        configuration(),
+        node(1),
+        JournalGeneration(101),
+        RecoveredState {
+            scope: Scope {
+                view: 2,
+                ..configuration().scope()
+            },
+            log: FrozenLog {
+                last_normal_view: 2,
+                accepted: operation().prefix(),
+                committed: Prefix::GENESIS,
+            },
+        },
+        PipelineLimits {
+            max_operations: 8,
+            max_body_bytes: 1024,
+        },
+    )
+    .unwrap();
+    let mut replica = ReplicaDriver::from_view_change(changing, Duration::ZERO, timing()).unwrap();
+    let now = Duration::ZERO;
+    persist(&mut replica, now);
+    assert_eq!(replica.scope().view, 3, "voter 0 leads this view");
+    start(&mut replica, now);
+    // Another voter's recovery says nothing about this view's primary.
+    replica.observe_recovering(node(2), now).unwrap();
+    assert_eq!(replica.poll(now).unwrap(), None);
+    replica.observe_recovering(node(0), now).unwrap();
+    assert!(matches!(
+        replica.poll(now).unwrap(),
+        Some(Action::Broadcast(Control::ExitView(scope))) if scope.view == 3
+    ));
+    assert_eq!(replica.scope().view, 3, "one suspicion cannot leave a view");
+    // The other healthy voter's suspicion ends the view long before its deadline.
+    peer_exit(&mut replica, 2, now);
+    let Some(Action::PersistPromise(next)) = replica.poll(now).unwrap() else {
+        panic!("the healthy voters leave the recovering primary's view");
+    };
+    assert_eq!(next.scope().view, 4);
+}
+
+#[test]
 fn invalid_peers_scopes_and_time_cannot_postpone_primary_failure() {
     let mut backup = driver(normal(1));
     let commit = Control::Commit(normal(0).announcement().unwrap());

@@ -498,11 +498,11 @@ voter, session, and configuration must match. Decoding grants no trust.
 | OPS | 196 + 86*N | Source descriptor, predecessor op position, list of canonical operation descriptors |
 | PREPARE_OK | 120 | Contiguous durable op position |
 | COMMIT | 120 | Committed op position |
-| EXIT_VIEW | 80 | View to leave in Authority: the sender's current view, or an older view it left, answering a peer's request; volatile timeout suspicion, no additional fields |
+| EXIT_VIEW | 80 | View to leave in Authority: the sender's current view, or an older view it left, answering a peer's request; volatile suspicion, no additional fields |
 | START_VIEW_CHANGE | 80 | Proposed view in Authority; no additional fields |
 | DO_VIEW_CHANGE | 184 | Frozen writer generation `u128`, last normal view `u64`, accepted end, commit floor |
 | START_VIEW | 176 | Installed writer generation `u128`, selected accepted end, commit floor |
-| RECOVERY | 96 | Fresh recovery-attempt nonce `u128`; correlated request ID in envelope |
+| RECOVERY | 97 | Fresh recovery-attempt nonce `u128`, nonvoting `u8` (0 restart probe, 1 nonvoting copy); correlated request ID in envelope |
 | RECOVERY_STATE | 97, 194, or 350 | Echoed nonce `u128`, primary tag `u8`; if primary: writer generation `u128`, accepted and commit `OpPosition` |
 | FETCH_OPS | 200 | Source descriptor, predecessor op position, maximum operations `u32`, maximum canonical body bytes `u32` |
 
@@ -568,7 +568,9 @@ History source is `voter_id:u128, writer_generation:u128, accepted:OpPosition`.
 ### Lost-state recovery
 
 The RECOVERY view is a hint. RECOVERY_STATE echoes request ID and nonce
-under the responder's normal view. Only active normal voters answer.
+under the responder's normal view. Only active normal voters answer. A voter
+in an election treats a nonvoting RECOVERY from that view's primary as
+suspicion of the view; a restart probe still votes.
 
 | RECOVERY_STATE field | Offset / size |
 | --- | --- |

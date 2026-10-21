@@ -1,7 +1,9 @@
 //! Opt-in, nonce-bound donors sharing the actor's bounded journal schedule.
 
 use super::io::FetchPurpose;
-use super::{ActorError, Bytes, Message, NodeId, PendingIo, ReplicaActor, SendClass, wire};
+use super::{
+    ActorError, Bytes, Duration, Message, NodeId, PendingIo, ReplicaActor, SendClass, wire,
+};
 use crate::replica_actor::HistoryReason;
 use crate::replica_actor::require_normal;
 use crate::replica_journal::{FetchedHistory, PinnedRecovery};
@@ -105,8 +107,15 @@ impl ReplicaActor {
         &mut self,
         index: usize,
         request: RecoveryRequest,
+        now: Duration,
     ) -> Result<(), ActorError> {
         if !self.application_ready() {
+            // A nonvoting primary never installs the view this copy elects.
+            // A startup probe still votes.
+            if request.nonvoting {
+                self.driver
+                    .observe_recovering(self.configuration.voters()[index], now)?;
+            }
             return Ok(());
         }
         let Some(donors) = &mut self.donors else {
