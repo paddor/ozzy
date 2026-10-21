@@ -37,11 +37,6 @@ How Ozzy crates reach crates.io. For maintainers.
 - CI's `publish-check` job dry-runs `cargo publish` for every other workspace
   crate.
 
-OMQ's network byte-limit API currently comes from Git. Before publishing Ozzy,
-use a crates.io OMQ release containing that API and remove the Git pin in
-`Cargo.toml`. Cargo strips Git sources from published manifests, so
-`publish-check` verifies the registry dependency.
-
 ## Python package
 
 `bindings/python` builds the `ozzy` Python package with maturin. Its version

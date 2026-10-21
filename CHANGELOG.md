@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Breaking
+
+- The re-exported `Context` and `Endpoint` come from the omq-tokio 0.30
+  release instead of a 0.29 Git revision.
+
 ### Changed
 
 - Improve small-record producer admission and compressed APPEND validation.
