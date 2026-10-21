@@ -420,7 +420,9 @@ impl ReplicaActor {
                 .map_err(TransmitError::from)?;
             self.restart_receipt(now);
         }
-        self.work.receive.reset();
+        if let Some(buffer) = self.work.receive.reset() {
+            self.recycle(buffer)?;
+        }
         Ok(())
     }
 

@@ -298,6 +298,16 @@ impl ScheduledReplica {
         self.actor.status()
     }
 
+    /// Idle arenas this actor owns, and whether a deferred received suffix
+    /// holds another one for its retry.
+    #[cfg(test)]
+    pub(crate) fn arenas(&self) -> (usize, bool) {
+        (
+            usize::from(self.actor.buffer.is_some()) + usize::from(self.actor.spare.is_some()),
+            self.actor.work.receive.retry_pending(),
+        )
+    }
+
     /// Immutable group identity, read without copying the status.
     pub fn group(&self) -> ozzy_proto::GroupId {
         self.actor.driver.scope().group_id

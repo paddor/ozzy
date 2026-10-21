@@ -32,6 +32,11 @@ pub(in crate::replica_actor) struct Receive {
 }
 
 impl Receive {
+    #[cfg(test)]
+    pub(in crate::replica_actor) fn retry_pending(&self) -> bool {
+        self.retry.is_some()
+    }
+
     /// Whether a staged suffix is in journal validation.
     pub(super) fn in_flight(&self) -> bool {
         self.flight.is_some()
@@ -64,11 +69,13 @@ impl Receive {
         })
     }
 
-    pub(super) fn reset(&mut self) {
+    /// Drop the staged suffix. Returns the arena a deferred suffix held for
+    /// its retry, which the caller must recycle.
+    pub(super) fn reset(&mut self) -> Option<AppendBuffer> {
         self.queued.clear();
         self.end = None;
         self.flight = None;
-        self.retry = None;
+        self.retry.take()
     }
 
     pub(super) fn defer(&mut self, buffer: AppendBuffer) {

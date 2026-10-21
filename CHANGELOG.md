@@ -62,6 +62,9 @@
 
 ### Fixed
 
+- A disk-quorum replica that changed views while a received suffix waited for
+  memory or deduplication capacity no longer loses that suffix's arena. The
+  loss could stall the partition's next view installation or history replay.
 - Python SDK handle destruction releases the GIL while joining native threads,
   preventing a shutdown deadlock with asyncio wakeups.
 - Java SDK futures complete exceptionally instead of waiting forever when a

@@ -363,14 +363,110 @@ fn a_follower_behind_on_its_own_writes_validates_two_windows_of_identities() {
 }
 
 #[test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "one controlled expiry schedule with a stalled follower"
-)]
 fn a_follower_behind_on_its_writes_waits_to_reuse_identity_capacity() {
     // The leader frees identity capacity at a commit the third broker cannot
     // apply while its writes stall. That broker must wait to validate the
     // replacement identities instead of failing its partition.
+    let (mut devices, mut actors, released, _lane) = deferred_follower();
+    let follower = actors[2].status().normal.unwrap();
+    assert_eq!(follower.applied, released, "stalled writes hold apply");
+    // Released writes let the follower apply, expire, and validate.
+    let leader = actors[0].status().normal.unwrap().applied;
+    for step in 0..20000 {
+        scheduled::round_at(&mut actors, Duration::from_millis(step), false);
+        settle_devices(&mut devices, false);
+        if actors[2].status().normal.unwrap().applied == leader {
+            break;
+        }
+    }
+    assert_eq!(actors[2].status().normal.unwrap().applied, leader);
+    for (actor, (controller, _)) in actors.into_iter().zip(&mut devices) {
+        scheduled::close(controller, actor);
+    }
+}
+
+#[test]
+fn a_view_change_over_a_deferred_suffix_keeps_its_arena() {
+    let (mut devices, mut actors, _, _lane) = deferred_follower();
+    assert_eq!(actors[2].arenas(), (0, true), "the retry holds the arena");
+    // Cut the leader off. Brokers 1 and 2 start a view change while broker
+    // 2's writes still stall, so its deferred suffix is never retried.
+    let session = actor_config().sessions[0];
+    for (actor, peers) in [(0, &[2_u8, 3][..]), (1, &[1][..]), (2, &[1][..])] {
+        for &peer in peers {
+            actors[actor]
+                .disconnect_session(NodeId::from_bytes([peer; 16]), session, Duration::ZERO)
+                .unwrap();
+        }
+    }
+    let mut now = Duration::from_secs(3);
+    let mut stalled = true;
+    let mut installed = false;
+    for _ in 0..20000 {
+        now += Duration::from_millis(1);
+        scheduled::round_at(&mut actors, now, false);
+        settle_devices(&mut devices, stalled);
+        let status = actors[2].status();
+        stalled &= status.scope.view == 0;
+        if status.scope.view > 0 && status.normal.is_some() && status.application_ready {
+            installed = true;
+            break;
+        }
+    }
+    assert!(
+        installed,
+        "{:#?}",
+        actors
+            .iter()
+            .map(ScheduledReplica::status)
+            .collect::<Vec<_>>()
+    );
+    for _ in 0..100 {
+        now += Duration::from_millis(1);
+        scheduled::round_at(&mut actors, now, false);
+        settle_devices(&mut devices, false);
+    }
+    let (idle, retry) = actors[2].arenas();
+    assert!(!retry, "the new view drops the old suffix");
+    assert_eq!(idle, 1, "the new view keeps the old suffix's arena");
+    for (actor, (controller, _)) in actors.into_iter().zip(&mut devices) {
+        scheduled::close(controller, actor);
+    }
+}
+
+/// Run the third broker's writes, holding them while `stalled`.
+fn settle_devices(devices: &mut [(Controller, Local)], stalled: bool) {
+    for (index, (controller, _)) in devices.iter_mut().enumerate() {
+        let mut held = Vec::new();
+        if stalled && index == 2 {
+            for (id, _) in controller.jobs() {
+                if matches!(
+                    controller
+                        .operation(id)
+                        .map(ozzy_io::Operation::unprotected),
+                    Some(ozzy_io::Operation::Write { .. })
+                ) {
+                    held.push(id);
+                }
+            }
+        }
+        scheduled::settle(controller, &held);
+    }
+}
+
+/// Leave the third broker with a deferred received suffix: its stalled
+/// writes hold the commit that frees the identities the leader reused.
+/// Returns its applied prefix before the stall.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one controlled expiry schedule with a stalled follower"
+)]
+fn deferred_follower() -> (
+    Vec<(Controller, Local)>,
+    Vec<ScheduledReplica>,
+    ozzy_replication::Prefix,
+    ProposalSubmitter,
+) {
     let mut devices: Vec<_> = (0..3).map(|_| setup()).collect();
     let pipeline = actor_config().pipeline;
     let limits = crate::replica_journal::dedup_limits(1_000, 4, 256 * 1024, 4, pipeline);
@@ -380,24 +476,6 @@ fn a_follower_behind_on_its_writes_waits_to_reuse_identity_capacity() {
             .map(|(controller, io)| (controller, &*io))
             .collect();
         cluster_on(&mut borrowed, limits)
-    };
-    let settle = |devices: &mut [(Controller, Local)], stalled: bool| {
-        for (index, (controller, _)) in devices.iter_mut().enumerate() {
-            let mut held = Vec::new();
-            if stalled && index == 2 {
-                for (id, _) in controller.jobs() {
-                    if matches!(
-                        controller
-                            .operation(id)
-                            .map(ozzy_io::Operation::unprotected),
-                        Some(ozzy_io::Operation::Write { .. })
-                    ) {
-                        held.push(id);
-                    }
-                }
-            }
-            scheduled::settle(controller, &held);
-        }
     };
     let mut buffers = Vec::from(buffers);
     let mut submit = |buffers: &mut Vec<ProposalBuffer>,
@@ -410,7 +488,7 @@ fn a_follower_behind_on_its_writes_waits_to_reuse_identity_capacity() {
         let mut pending = Box::pin(lane.try_submit(buffer).unwrap());
         for _ in 0..20000 {
             scheduled::round(actors, false);
-            settle(devices, stalled);
+            settle_devices(devices, stalled);
             if let Poll::Ready(reply) = poll(pending.as_mut()) {
                 let mut reply = reply.unwrap();
                 assert!(matches!(reply.outcome, ProposalOutcome::Committed { .. }));
@@ -424,7 +502,7 @@ fn a_follower_behind_on_its_writes_waits_to_reuse_identity_capacity() {
     let mut bootstrap = Box::pin(bootstrap);
     for _ in 0..10000 {
         scheduled::round(&mut actors, false);
-        settle(&mut devices, false);
+        settle_devices(&mut devices, false);
         if poll(bootstrap.as_mut()).is_ready() {
             break;
         }
@@ -478,19 +556,5 @@ fn a_follower_behind_on_its_writes_waits_to_reuse_identity_capacity() {
             true,
         );
     }
-    let follower = actors[2].status().normal.unwrap();
-    assert_eq!(follower.applied, released, "stalled writes hold apply");
-    // Released writes let the follower apply, expire, and validate.
-    let leader = actors[0].status().normal.unwrap().applied;
-    for step in 0..20000 {
-        scheduled::round_at(&mut actors, Duration::from_millis(step), false);
-        settle(&mut devices, false);
-        if actors[2].status().normal.unwrap().applied == leader {
-            break;
-        }
-    }
-    assert_eq!(actors[2].status().normal.unwrap().applied, leader);
-    for (actor, (controller, _)) in actors.into_iter().zip(&mut devices) {
-        scheduled::close(controller, actor);
-    }
+    (devices, actors, released, lane)
 }
