@@ -172,8 +172,11 @@ with Client(config) as client:
         raises(TimeoutError, lambda: idle.next(timeout=0.01))
         raises(ValueError, lambda: idle.next(timeout=-1))
         # A blocked receive leases its handle; other threads see BusyError.
+        # A timeout past the clock's range waits without a deadline.
         received = []
-        reader = threading.Thread(target=lambda: received.append(idle.next(timeout=5)))
+        reader = threading.Thread(
+            target=lambda: received.append(idle.next(timeout=1e19))
+        )
         reader.start()
         deadline = time.monotonic() + 5
         while True:

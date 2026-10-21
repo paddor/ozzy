@@ -76,6 +76,8 @@
 - SDK broker links no longer fail with "SDK transport monitor lost events"
   after a stall during broker reconnects. They rebuild each link's connection
   from the socket instead.
+- A Python SDK timeout too large for the system clock waits without a deadline
+  instead of raising `PanicException`.
 - A disk-quorum leader whose retention turn came due while an operation waited
   for a lagging follower no longer stalls the partition. The turn also held
   history replay and donor work, so once the other follower failed the

@@ -50,7 +50,8 @@ where
     F: Future + Send,
     F::Output: Send,
 {
-    let deadline = timeout.map(|timeout| Instant::now() + timeout);
+    // A deadline past what `Instant` holds never comes.
+    let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
     let waker = CALLER.with(Clone::clone);
     let mut future: Slot<_> = Slot::new(Box::pin(future));
     loop {
@@ -298,6 +299,15 @@ pub(crate) mod tests {
             assert!(timed_out.is_err_and(|error| error.is_instance_of::<PyTimeoutError>(py)));
         });
         assert!(dropped.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn blocking_wait_treats_an_unrepresentable_deadline_as_none() {
+        Python::initialize();
+        let timeout = super::timeout(Some(1e19));
+        Python::attach(|py| {
+            assert!(timeout.is_ok_and(|timeout| wait(py, async {}, timeout).is_ok()));
+        });
     }
 
     #[test]
