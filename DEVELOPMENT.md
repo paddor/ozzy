@@ -221,9 +221,11 @@ Flags, actions, artifacts, and replay: [ozzy-sim/README.md](ozzy-sim/README.md).
 ### Seeded actor cluster
 
 A seed campaign over every profile (`none`, `light`, `heavy`, `swarm`, and
-`slow` disks) and scenario (`random` faults only, or `failover`, which also
-cuts the leader off and requires a new one before it rejoins). A failing seed
-prints its parameters, schedule hash, and this command with
+`slow` disks) and scenario: `random` faults only; `failover`, which also cuts
+the leader off and requires a new one before it rejoins; and `full`, which
+fills a six-segment journal until it refuses proposals, then loses the leader.
+`full` skips `heavy` and `swarm`, which make too little progress to fill it.
+A failing seed prints its parameters, schedule hash, and this command with
 `OZZY_ACTOR_SIM_SEED`, `OZZY_ACTOR_SIM_PROFILE`, and
 `OZZY_ACTOR_SIM_SCENARIO` set. A run whose faults left too little progress
 to prove much is vacuous: the campaign lists it and fails only above one in

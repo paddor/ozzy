@@ -47,7 +47,8 @@ pub(crate) const PIPELINE: PipelineLimits = PipelineLimits {
     max_body_bytes: 8192,
 };
 const SEGMENT_BYTES: u64 = 256 * 1024;
-const MAX_SEGMENTS: usize = 256;
+/// The broker's journal segment limit.
+pub(crate) const MAX_SEGMENTS: usize = 256;
 /// Partition visits per shard poll and polls per broker per tick.
 const TURN_ACTORS: usize = 16;
 const POLL_BUDGET: usize = 1000;
@@ -87,11 +88,12 @@ impl Broker {
         clock: &Clock,
         (mut disk, io): (Disk, Local),
         clients: usize,
+        max_segments: usize,
     ) -> Result<(Self, Vec<Lane>), String> {
         let generation = JournalGeneration(index as u128 + 1);
         let (owner, startup) = disk
             .drive(OwnedJournal::format_new(
-                journal_config(index),
+                journal_config(index, max_segments),
                 io,
                 generation,
                 SEGMENT_BYTES,
@@ -347,7 +349,7 @@ fn actor_config(index: usize) -> ActorConfig {
     }
 }
 
-fn journal_config(index: usize) -> OwnedConfig {
+fn journal_config(index: usize, max_segments: usize) -> OwnedConfig {
     let configuration = ConfigurationRecord::new(
         GROUP,
         1,
@@ -370,7 +372,7 @@ fn journal_config(index: usize) -> OwnedConfig {
         limits: JournalLimits {
             metadata: MetadataLimits {
                 max_manifest_bytes: 256 * 1024,
-                max_segments: MAX_SEGMENTS,
+                max_segments,
             },
             decode: DecodeLimits::default(),
             operations: ozzy_journal::operation::OperationLimits::default(),

@@ -2,7 +2,8 @@
 //! proposal lanes, one lane per broker. A refused proposal moves to another
 //! broker; an unknown outcome resends the same bytes there later. A resend
 //! that finds its operation identity taken learns that an earlier attempt
-//! committed.
+//! committed. A journal too full for new operations refuses them; the
+//! client backs off and resends.
 
 use crate::{
     broker::Lane,
@@ -47,6 +48,8 @@ pub(crate) struct Counts {
     pub not_admitted: u64,
     pub unknown: u64,
     pub stopped: u64,
+    /// Refusals by a journal too full for new operations.
+    pub full: u64,
     /// Resends whose earlier attempt had committed.
     pub duplicates: u64,
 }
@@ -148,6 +151,11 @@ impl Workload {
                         self.counts.unknown += 1;
                         client.resent = true;
                         client.target = other(&mut self.rng, broker);
+                        client.next_at = tick + RESEND;
+                    }
+                    ProposalOutcome::Invalid(JournalError::RollCapacity) => {
+                        // Nothing was written; the same operation waits for room.
+                        self.counts.full += 1;
                         client.next_at = tick + RESEND;
                     }
                     ProposalOutcome::Invalid(JournalError::Images(

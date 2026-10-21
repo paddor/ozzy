@@ -24,25 +24,27 @@ mod seeds;
 mod sim;
 mod workload;
 
+use broker::MAX_SEGMENTS;
 use network::Profile;
 use sim::{
     Fault::{self, IsolateLeader},
     Options, Report,
 };
 
-/// Scripted faults by scenario name, with the ticks of proposals they need.
-/// `random` has only the profile's random faults.
+/// Scripted faults by scenario name, with the ticks of proposals they need
+/// and the journal segment limit. `random` has only the profile's random faults.
 /// A lost leader stays cut off for 15 s: three view attempts under the
 /// doubling 2 s to 8 s election timeouts, over the slowest profiles.
-fn scenario(name: &str) -> Option<(u64, &'static [Fault])> {
+fn scenario(name: &str) -> Option<(u64, &'static [Fault], usize)> {
     Some(match name {
-        "random" => (1500, &[]),
+        "random" => (1500, &[], MAX_SEGMENTS),
         "failover" => (
             1500,
             &[IsolateLeader {
                 at: 500,
                 ticks: 1500,
             }],
+            MAX_SEGMENTS,
         ),
         "long-history" => (
             3000,
@@ -50,6 +52,7 @@ fn scenario(name: &str) -> Option<(u64, &'static [Fault])> {
                 at: 2500,
                 ticks: 1500,
             }],
+            MAX_SEGMENTS,
         ),
         "very-long-history" => (
             8000,
@@ -57,6 +60,7 @@ fn scenario(name: &str) -> Option<(u64, &'static [Fault])> {
                 at: 7500,
                 ticks: 1500,
             }],
+            MAX_SEGMENTS,
         ),
         "repeated-failover" => (
             3500,
@@ -74,6 +78,17 @@ fn scenario(name: &str) -> Option<(u64, &'static [Fault])> {
                     ticks: 800,
                 },
             ],
+            MAX_SEGMENTS,
+        ),
+        // Six segments fill after about 350 operations. Clients are refused,
+        // then the full leader is lost.
+        "full" => (
+            3000,
+            &[IsolateLeader {
+                at: 2500,
+                ticks: 1500,
+            }],
+            6,
         ),
         _ => return None,
     })
@@ -87,11 +102,12 @@ fn options(profile: &str, scenario: &str) -> Options {
         "light" => 20,
         _ => 5,
     };
-    let (ticks, script) = self::scenario(scenario).expect("known scenario");
+    let (ticks, script, max_segments) = self::scenario(scenario).expect("known scenario");
     Options {
         ticks,
         drain: 3000,
         clients: 3,
+        max_segments,
         min_confirmed: floor,
         min_compared: floor as u64,
         script,
@@ -195,6 +211,15 @@ fn repeatedly_lost_leaders_are_replaced() {
     checked(1, "light", "repeated-failover");
 }
 
+/// A full journal refuses proposals without faulting, and the full group
+/// still replaces its lost leader and converges.
+#[test]
+fn full_journal_refuses_proposals_and_replaces_its_leader() {
+    checked(1, "none", "full");
+    // Light faults also change views before the journal fills.
+    checked(4, "light", "full");
+}
+
 /// Seeds that found bugs. Schedules move with the code, so each names what
 /// it found.
 #[test]
@@ -220,7 +245,13 @@ mod seeded {
         use super::super::{checked, outcome, reproduce};
 
         const PROFILES: [&str; 5] = ["none", "light", "heavy", "swarm", "slow"];
-        const SCENARIOS: [&str; 2] = ["random", "failover"];
+        /// Each scenario with its profiles. Heavy and swarm faults leave too
+        /// little progress to fill a journal.
+        const SCENARIOS: [(&str, &[&str]); 3] = [
+            ("random", &PROFILES),
+            ("failover", &PROFILES),
+            ("full", &["none", "light", "slow"]),
+        ];
 
         /// About 4800 operations in 75 segments before the leader is lost. A
         /// view change still installs well inside its election timeouts.
@@ -229,20 +260,29 @@ mod seeded {
             checked(1, "none", "very-long-history");
         }
 
-        /// `OZZY_ACTOR_SIM_SEEDS` seeds (default 100) over every profile and
-        /// scenario, or `OZZY_ACTOR_SIM_SEED`. `OZZY_ACTOR_SIM_PROFILE` and
+        /// `OZZY_ACTOR_SIM_SEEDS` seeds (default 100) over every scenario and
+        /// its profiles, or `OZZY_ACTOR_SIM_SEED`. `OZZY_ACTOR_SIM_PROFILE` and
         /// `OZZY_ACTOR_SIM_SCENARIO` pick one of each. Any failure fails at once;
         /// vacuous runs fail only above one in twenty.
         #[test]
         fn campaign() {
-            let pick = |name: &str, all: &[&'static str]| -> Vec<String> {
-                std::env::var(name).map_or_else(
-                    |_| all.iter().map(ToString::to_string).collect(),
-                    |one| vec![one],
-                )
-            };
-            let profiles = pick("OZZY_ACTOR_SIM_PROFILE", &PROFILES);
-            let scenarios = pick("OZZY_ACTOR_SIM_SCENARIO", &SCENARIOS);
+            let scenarios: Vec<(String, &[&str])> = std::env::var("OZZY_ACTOR_SIM_SCENARIO")
+                .map_or_else(
+                    |_| {
+                        SCENARIOS
+                            .iter()
+                            .map(|(name, profiles)| ((*name).to_string(), *profiles))
+                            .collect()
+                    },
+                    |one| {
+                        let profiles = SCENARIOS
+                            .iter()
+                            .find(|(name, _)| *name == one)
+                            .map_or(&PROFILES[..], |(_, profiles)| *profiles);
+                        vec![(one, profiles)]
+                    },
+                );
+            let profile = std::env::var("OZZY_ACTOR_SIM_PROFILE").ok();
             let seeds: Vec<u64> = if let Ok(seed) = std::env::var("OZZY_ACTOR_SIM_SEED") {
                 vec![seed.parse().expect("OZZY_ACTOR_SIM_SEED")]
             } else {
@@ -253,13 +293,16 @@ mod seeded {
             let mut runs = 0;
             let mut vacuous = Vec::new();
             for seed in seeds {
-                for profile in &profiles {
-                    for scenario in &scenarios {
+                for (scenario, profiles) in &scenarios {
+                    let profiles = profile
+                        .as_deref()
+                        .map_or(profiles.to_vec(), |one| vec![one]);
+                    for profile in profiles {
                         runs += 1;
                         let report = outcome(seed, profile, scenario);
                         if report.vacuous {
                             eprintln!("vacuous: {}", reproduce(seed, profile, scenario));
-                            vacuous.push((seed, profile.clone(), scenario.clone()));
+                            vacuous.push((seed, profile, scenario.clone()));
                         }
                     }
                 }

@@ -5,7 +5,7 @@
 //! each broker's view and positions when they change.
 
 use crate::{
-    broker::{Broker, Lane},
+    broker::{Broker, Lane, MAX_SEGMENTS},
     check::{Checker, converged, leader},
     clock::Clock,
     disk::Disk,
@@ -24,6 +24,9 @@ pub(crate) struct Options {
     /// Further ticks to heal, settle outstanding proposals, and converge.
     pub drain: u64,
     pub clients: usize,
+    /// Journal segment limit. Below the broker's, the journal must fill and
+    /// refuse proposals.
+    pub max_segments: usize,
     /// Vacuity floors: confirmed proposals, and ops two brokers reported.
     pub min_confirmed: usize,
     pub min_compared: u64,
@@ -54,6 +57,8 @@ pub(crate) struct Report {
     pub confirmed: usize,
     pub compared: u64,
     pub applied: u64,
+    /// Proposals a journal refused as too full.
+    pub refused: u64,
     /// Below a vacuity floor, or a scripted fault never started: the run
     /// converged but proved little.
     pub vacuous: bool,
@@ -91,15 +96,17 @@ pub(crate) fn run(seed: u64, profile: Profile, options: Options) -> Result<Repor
     for index in 0..BROKERS {
         let disk = Disk::new(disks.next(), profile.disk_mean);
         let (broker, broker_lanes) =
-            Broker::start(index, &clock, disk, options.clients).map_err(|reason| {
-                Box::new(Failure {
-                    tick: 0,
-                    reason,
-                    hash: 0,
-                    profile,
-                    detail: String::new(),
-                })
-            })?;
+            Broker::start(index, &clock, disk, options.clients, options.max_segments).map_err(
+                |reason| {
+                    Box::new(Failure {
+                        tick: 0,
+                        reason,
+                        hash: 0,
+                        profile,
+                        detail: String::new(),
+                    })
+                },
+            )?;
         brokers.push(broker);
         lanes.push(broker_lanes);
     }
@@ -132,6 +139,7 @@ pub(crate) fn run(seed: u64, profile: Profile, options: Options) -> Result<Repor
             confirmed: sim.workload.confirmed.len(),
             compared: sim.checker.compared,
             applied,
+            refused: sim.workload.counts.full,
             vacuous,
         })
         .map_err(|reason| {
@@ -275,6 +283,7 @@ impl Sim {
             }
         }
         let vacuous = self.next_fault < self.options.script.len()
+            || (self.options.max_segments < MAX_SEGMENTS && self.workload.counts.full == 0)
             || self.workload.confirmed.len() < self.options.min_confirmed
             || self.checker.compared < self.options.min_compared;
         Ok((applied.op.0, vacuous))
