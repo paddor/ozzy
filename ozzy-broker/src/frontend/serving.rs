@@ -42,7 +42,8 @@ impl FrontendContext {
     /// destination shard. Readiness
     /// does not wait for every broker. The service owns no partition authority.
     /// Input rejection drops this attempt; native record retry identity remains
-    /// with the sender. Accounting failures and monitor loss stop the frontend.
+    /// with the sender. Accounting failures stop the frontend; lost monitor
+    /// events resynchronize from the socket's connection table.
     pub async fn serve(
         self,
         mut service: Service,
@@ -123,8 +124,8 @@ impl FrontendContext {
         loop {
             // Process lifecycle changes before dequeuing native input. Once
             // received, admit synchronously before observing another cutover.
-            let control_ready = control.prepare(service)?;
-            let data_ready = data.prepare(service)?;
+            let control_ready = control.prepare(service).await?;
+            let data_ready = data.prepare(service).await?;
             publishers.publish(service)?;
             // Only an unfinished handshake needs the retry timer; idle links
             // do not wake the dispatcher.
@@ -135,16 +136,12 @@ impl FrontendContext {
             retrying = pending;
             tokio::select! {
                 () = self.shutdown.closed() => return Ok(()),
-                event = control.monitor.recv() => {
-                    control.observe(event.map_err(failure)?, service)?;
-                }
+                event = control.monitor.recv() => control.observe(event, service).await?,
                 message = control.socket.recv_with_receipt(None), if control_ready => {
                     let (receipt, body) = message.map_err(failure)?;
                     control.receive(service, receipt, body)?;
                 }
-                event = data.monitor.recv() => {
-                    data.observe(event.map_err(failure)?, service)?;
-                }
+                event = data.monitor.recv() => data.observe(event, service).await?,
                 message = data.socket.recv_with_receipt(None), if data_ready => {
                     let (receipt, body) = message.map_err(failure)?;
                     data.receive(service, receipt, body)?;

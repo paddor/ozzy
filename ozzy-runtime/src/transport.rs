@@ -25,6 +25,25 @@ pub fn decode_peer_identity(identity: &[u8]) -> Option<NodeId> {
     Some(NodeId::from_bytes(native.try_into().ok()?))
 }
 
+/// Each admitted native peer's newest connection in a socket's own table.
+/// Monitor events are diagnostic and may lag; this table never does.
+pub fn live_peers(
+    connections: Vec<omq_tokio::ConnectionStatus>,
+) -> std::collections::BTreeMap<NodeId, u64> {
+    let mut live = std::collections::BTreeMap::new();
+    for info in connections
+        .into_iter()
+        .filter_map(|status| status.peer_info)
+    {
+        if let Some(peer) = info.peer_identity.as_deref().and_then(decode_peer_identity) {
+            // A handover leaves the newer connection.
+            let newest = live.entry(peer).or_insert(info.connection_id);
+            *newest = info.connection_id.max(*newest);
+        }
+    }
+    live
+}
+
 /// Restore native metadata while retaining the original receive backing.
 pub fn native_peer_identity(identity: Bytes) -> Option<Bytes> {
     decode_peer_identity(&identity)?;
