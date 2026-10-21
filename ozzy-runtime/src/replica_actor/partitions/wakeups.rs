@@ -38,6 +38,8 @@ pub(super) struct Wakeups {
     deadlines: Vec<Option<Duration>>,
     sweep: Duration,
     swept: Option<Duration>,
+    /// Visits where only the sweep found progress: missed wakeups.
+    missed: u64,
     /// A `poll_progress` follows before the shard waits, so input marks
     /// its partition without waking the shard.
     deferred: bool,
@@ -57,6 +59,7 @@ impl Wakeups {
             shard,
             sweep,
             swept: None,
+            missed: 0,
             deferred: false,
         }
     }
@@ -80,6 +83,12 @@ impl PartitionActors {
         }
         self.wakeups = Some(Wakeups::new(self.actors.len(), sweep));
         Ok(self)
+    }
+
+    /// Visits where only the safety sweep found progress, each a wakeup
+    /// nobody registered. Zero without wakeups.
+    pub fn sweep_progress(&self) -> u64 {
+        self.wakeups.as_ref().map_or(0, |wakeups| wakeups.missed)
     }
 
     /// When the caller must poll again without a wakeup: the earliest
@@ -163,6 +172,7 @@ impl PartitionActors {
             match self.visit_woken(&mut wakeups, slot, now, try_send) {
                 Ok(visit) => {
                     if visit.progressed && !due {
+                        wakeups.missed = wakeups.missed.saturating_add(1);
                         crate::profiling::event(crate::profiling::Event::PartitionSweepProgress);
                     }
                     // Progress can leave more to observe in the same partition.
