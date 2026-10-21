@@ -83,7 +83,9 @@ impl ReplicaActor {
         } else if kind != Maintenance::Retention {
             MaintenanceTurn::Continue
         } else if self.maintenance.foreground_due {
-            // A waiting proposal goes first on the next round.
+            // A waiting proposal goes first on the next round. No journal
+            // command completes to start it, so ask for it now.
+            self.more_work = true;
             MaintenanceTurn::Stop
         } else {
             MaintenanceTurn::Hold
