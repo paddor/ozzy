@@ -62,6 +62,10 @@
 
 ### Fixed
 
+- A disk-quorum leader whose retention turn came due while an operation waited
+  for a lagging follower no longer stalls the partition. The turn also held
+  history replay and donor work, so once the other follower failed the
+  operation never committed and the failed broker never recovered.
 - A disk-quorum replica that changed views while a received suffix waited for
   memory or deduplication capacity no longer loses that suffix's arena. The
   loss could stall the partition's next view installation or history replay.

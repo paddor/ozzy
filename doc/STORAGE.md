@@ -382,6 +382,9 @@ Topics set `retention.max_age_secs` and `retention.max_bytes`; see
   floors confirm.
 - Retention debt runs in bounded steps between foreground turns. The periodic
   interval applies only after catching up.
+- A due turn waits for accepted operations to apply. New proposals wait with
+  it; replay, repair, and recovery donor work go on, since the operations may
+  commit only through a lagging or recovering copy.
 - A view change abandons unfinished retirement; its files become unselected
   leftovers.
 - Policy changes become canonical `PartitionPolicy` operations; confirmation

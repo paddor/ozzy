@@ -15,6 +15,20 @@ pub(super) enum Maintenance {
     Retention,
 }
 
+/// What a due maintenance turn leaves to the rest of a schedule round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MaintenanceTurn {
+    /// Nothing is due, or the turn yields to writers.
+    Continue,
+    /// A due retention turn waits for the accepted suffix to settle. Work
+    /// that extends the suffix waits with it. Replay, repair, and donor work
+    /// still run: the suffix may commit only through a lagging or recovering
+    /// backup.
+    Hold,
+    /// A command started, or the turn waits for I/O; the round stops here.
+    Stop,
+}
+
 /// The actor's maintenance schedule and the work it completed.
 #[derive(Debug)]
 pub(super) struct Turns {

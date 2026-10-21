@@ -306,7 +306,10 @@ impl ReplicaActor {
         Ok(())
     }
 
-    pub(super) fn schedule_normal(&mut self, now: Duration) -> Result<(), ActorError> {
+    /// `hold` keeps work that extends the accepted suffix waiting for a due
+    /// retention turn: new proposals, ingress, and a follower's received
+    /// data. Work that settles the suffix still runs.
+    pub(super) fn schedule_normal(&mut self, now: Duration, hold: bool) -> Result<(), ActorError> {
         let snapshot = require_normal(&self.driver)?.snapshot();
         let primary = self.configuration.primary(snapshot.scope.view) == self.local;
         debug_assert!(self.work.ready.is_none(), "ready admission rides its turn");
@@ -325,7 +328,7 @@ impl ReplicaActor {
         if self.schedule_donor(false)? {
             return Ok(());
         }
-        if !primary && self.schedule_received()? {
+        if !primary && !hold && self.schedule_received()? {
             return Ok(());
         }
         if primary && self.schedule_flow_verification()? {
@@ -334,21 +337,23 @@ impl ReplicaActor {
         if primary && self.schedule_replay(now)? {
             return Ok(());
         }
-        if !primary {
-            self.work.proposals.fill(&mut self.ingress);
-            self.work.proposals.reject_all();
-        } else if let Some(propose) = self.take_proposal(&snapshot)? {
-            self.submit_turn(crate::replica_journal::Turn {
-                propose: Some(propose),
-                ..Default::default()
-            })?;
-            return Ok(());
+        if !hold {
+            if !primary {
+                self.work.proposals.fill(&mut self.ingress);
+                self.work.proposals.reject_all();
+            } else if let Some(propose) = self.take_proposal(&snapshot)? {
+                self.submit_turn(crate::replica_journal::Turn {
+                    propose: Some(propose),
+                    ..Default::default()
+                })?;
+                return Ok(());
+            }
         }
         // Pending `DURABLE` evidence publishes only through `sync_due`.
         if !self.work.needs_sync {
             self.schedule_donor(true)?;
         }
-        if self.work.proposals.is_idle() {
+        if !hold && self.work.proposals.is_idle() {
             self.ingress.resume();
         }
         Ok(())

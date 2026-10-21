@@ -6,6 +6,7 @@ type Scheduled = ScheduledReplica;
 mod disconnected;
 mod donors;
 mod groups;
+mod healthy_pair;
 mod history;
 mod native;
 mod publications;

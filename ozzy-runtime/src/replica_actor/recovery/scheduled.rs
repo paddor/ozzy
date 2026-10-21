@@ -484,6 +484,12 @@ impl<J: RecoveryStorage> ScheduledRecovery<J> {
 }
 
 impl ScheduledRecovery<ShardRecoveringJournal> {
+    /// Quarantine a running actor, as checkpoint recovery does.
+    #[cfg(test)]
+    pub(crate) fn quarantined(normal: ScheduledReplica) -> Self {
+        Self::quarantine(normal)
+    }
+
     pub(in crate::replica_actor) fn quarantine(normal: ScheduledReplica) -> Self {
         let owner = normal.receive_owner.clone();
         let super::ReplicaActor {

@@ -7,7 +7,7 @@ use ozzy_replication::ViewChangeError;
 
 use super::history::TransferPurpose;
 use super::io::{Completed, FetchPurpose};
-use super::maintenance::Maintenance;
+use super::maintenance::{Maintenance, MaintenanceTurn};
 use super::{ActorError, DriverError, Duration, PendingIo, ReplicaActor};
 
 impl ReplicaActor {
@@ -31,7 +31,12 @@ impl ReplicaActor {
         if self.pending_replay.is_some() && !self.application_ready() {
             return Ok(());
         }
-        if self.schedule_due_maintenance(now)? || self.schedule_durability()? {
+        let hold = match self.schedule_due_maintenance(now)? {
+            MaintenanceTurn::Stop => return Ok(()),
+            MaintenanceTurn::Hold => true,
+            MaintenanceTurn::Continue => false,
+        };
+        if self.schedule_durability()? {
             return Ok(());
         }
         // Installation publishes and selects storage; a cleanup job beside
@@ -46,7 +51,7 @@ impl ReplicaActor {
             return Ok(());
         }
         if self.driver.normal().is_some() {
-            return self.schedule_activation(now);
+            return self.schedule_activation(now, hold);
         }
         if self.transfer.is_some() || self.schedule_bridge()? {
             return Ok(());
@@ -55,25 +60,34 @@ impl ReplicaActor {
     }
 
     /// Give the oldest due maintenance task a turn once admitted writes
-    /// drain. `true` when scheduling stops here.
-    fn schedule_due_maintenance(&mut self, now: Duration) -> Result<bool, ActorError> {
+    /// drain.
+    fn schedule_due_maintenance(&mut self, now: Duration) -> Result<MaintenanceTurn, ActorError> {
         // A slow maintenance step must not repeatedly win over queued writers.
         let foreground_turn = std::mem::take(&mut self.maintenance.foreground_due);
         let Some(kind) = self
             .due_maintenance(now)
             .filter(|_| !foreground_turn && self.application_ready())
         else {
-            return Ok(false);
+            return Ok(MaintenanceTurn::Continue);
         };
         if self.pending_sync.is_some() || !self.pending_persistence.is_empty() {
-            return Ok(true);
+            return Ok(MaintenanceTurn::Stop);
         }
         if self.work.needs_sync {
             self.schedule_sync()?;
-            return Ok(true);
+            return Ok(MaintenanceTurn::Stop);
         }
         self.maintenance_round(kind, now)?;
-        Ok(self.pending.is_some() || kind == Maintenance::Retention)
+        Ok(if self.pending.is_some() {
+            MaintenanceTurn::Stop
+        } else if kind != Maintenance::Retention {
+            MaintenanceTurn::Continue
+        } else if self.maintenance.foreground_due {
+            // A waiting proposal goes first on the next round.
+            MaintenanceTurn::Stop
+        } else {
+            MaintenanceTurn::Hold
+        })
     }
 
     /// Persist what election evidence needs before a promise. `true` when
@@ -154,7 +168,7 @@ impl ReplicaActor {
         Ok(true)
     }
 
-    fn schedule_activation(&mut self, now: Duration) -> Result<(), ActorError> {
+    fn schedule_activation(&mut self, now: Duration, hold: bool) -> Result<(), ActorError> {
         let snapshot = require_normal(&self.driver)?.snapshot();
         if let Ok(ticket) = self.driver.begin_activation() {
             // Already active normal cores need no repeated manifest publication.
@@ -165,7 +179,7 @@ impl ReplicaActor {
             }
         }
         if self.pending.is_none() && self.application_ready() {
-            self.schedule_normal(now)?;
+            self.schedule_normal(now, hold)?;
         }
         Ok(())
     }
