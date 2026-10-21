@@ -683,7 +683,7 @@ Diagnostics never determine behavior; unknown codes keep raw detail.
 | 7 | Invalid sequence, processing cursor, or group start outside confirmed retained history | permanent |
 | 8 | Retry identity conflicts with retained records | permanent |
 | 9 | Retry or processing history expired | permanent |
-| 10 | Capacity unavailable, including dedup identity capacity, or earlier writer sequences missing | after-backoff |
+| 10 | Capacity unavailable, including a full partition journal, dedup identity capacity, or earlier writer sequences missing | after-backoff |
 | 11 | Storage/validation uncertainty | unknown-outcome |
 | 12 | Writer not admitted by current primary, or reader broker unavailable | after-authority-refresh |
 | 13 | Authority changed after admission | unknown-outcome |

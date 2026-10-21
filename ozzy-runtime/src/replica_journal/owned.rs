@@ -32,6 +32,7 @@ pub(in crate::replica_journal) mod seek;
 pub use read::{CompletedDelivery, CompletedRead, PartitionDelivery, PreparedRead};
 mod replay;
 mod retention;
+mod room;
 pub use replay::{CompletedReplay, PreparedReplay, ReplayRequest};
 mod receiving;
 pub use receiving::{RecoveringJournal, RecoveryGenerations, RecoveryOpen};
@@ -80,6 +81,7 @@ pub struct OwnedJournal {
     /// Committed state through `applied` while an election holds no images.
     /// An installation replays only after it.
     committed_base: Option<ozzy_core::state::CanonicalState>,
+    room: room::Room,
     dedup: dedup::State,
     selected: Option<CanonicalRecoveryCandidate>,
     history: Option<JournalHistory>,
@@ -269,6 +271,7 @@ impl OwnedJournal {
             scope,
             images,
             committed_base: None,
+            room: room::Room::default(),
             indexing: indexing::Indexing::default(),
             dedup: dedup::State::new(config.deduplication),
             selected: None,

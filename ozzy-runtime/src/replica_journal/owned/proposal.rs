@@ -209,6 +209,7 @@ impl OwnedJournal {
         {
             return Ok(Prepared::Retry(through));
         }
+        self.check_room(buffer)?;
         if buffer.is_producer() && self.dedup.limits.is_some() {
             let rewrite = self.resolve_producer_ids(ticket, buffer)?;
             let mut staged = buffer.stage_dedup(rewrite);

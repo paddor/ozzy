@@ -408,8 +408,9 @@ pub enum JournalError {
     /// Payload would exceed its configured arena bounds. No content was added.
     #[error("replica append buffer capacity exhausted")]
     AppendCapacity,
-    /// Another segment would exceed configured manifest count/byte bounds.
-    #[error("replica journal manifest capacity exhausted")]
+    /// Another segment would exceed the segment limit, or new work would take
+    /// the room kept for operations that free space.
+    #[error("replica journal segment capacity exhausted")]
     RollCapacity,
     /// Validation or write no longer matches this active application/journal image.
     #[error("replica append does not match the live journal image")]

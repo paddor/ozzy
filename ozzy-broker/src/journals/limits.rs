@@ -196,7 +196,7 @@ impl Sizes {
         JournalLimits {
             metadata: MetadataLimits {
                 max_manifest_bytes: 64 * 1024,
-                max_segments: 256,
+                max_segments: ozzy_config::MAX_PARTITION_SEGMENTS,
             },
             decode: DecodeLimits {
                 max_groups: self.segment / WRITE_GROUP_ALIGNMENT,

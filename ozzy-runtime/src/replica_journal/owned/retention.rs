@@ -166,7 +166,7 @@ impl OwnedJournal {
             }
             return self.start_retirement(ticket, seed).await;
         }
-        if leader && plan.roll_active {
+        if leader && plan.roll_active && self.can_roll()? {
             let work = self.begin_roll(16)?;
             let done = work.publish().await;
             self.complete_roll(done)?;

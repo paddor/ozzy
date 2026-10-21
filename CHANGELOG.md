@@ -4,6 +4,9 @@
 
 ### Breaking
 
+- A topic's `retention.max_bytes` may cover at most 224 segments, seven
+  eighths of the 256-segment partition limit. A larger target filled the
+  partition before retention started.
 - The re-exported `Context` and `Endpoint` come from the omq-tokio 0.30
   release instead of a 0.29 Git revision.
 
@@ -66,6 +69,11 @@
 
 ### Fixed
 
+- A partition whose journal reaches its 256-segment limit no longer stops.
+  Near the limit it refuses new records with NACK 10 (retry after backoff),
+  then producer opens and consumer progress. Trims and retention policy
+  changes still pass. A replica that fills anyway holds its writes until a
+  segment retires.
 - Disk-quorum view changes after a long history finish within the election
   timeouts instead of retrying elections forever. A backup checks the new
   leader's history from its own commit point, not from the first operation;

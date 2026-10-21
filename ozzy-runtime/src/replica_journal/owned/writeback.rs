@@ -165,6 +165,10 @@ impl Writeback {
     pub(super) fn is_faulted(&self) -> bool {
         self.abandoned.get()
     }
+    /// Retained bytes admitted but not yet written.
+    pub(super) const fn queued_bytes(&self) -> usize {
+        self.bytes
+    }
     pub(super) fn require_idle(&self) -> Result<(), JournalError> {
         if self.is_faulted() || !self.queue.is_empty() || self.encoded.is_some() {
             return Err(JournalError::CompletionMismatch);

@@ -10,6 +10,7 @@ mod proposal;
 mod read;
 mod receiving;
 mod replay;
+mod room;
 mod shard;
 mod sync;
 mod validation;

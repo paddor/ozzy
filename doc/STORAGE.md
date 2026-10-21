@@ -414,6 +414,20 @@ Topics set `retention.max_age_secs` and `retention.max_bytes`; see
   one segment more than `max_bytes` on disk.
 - Opening a store removes recognized `staging/` leftovers.
 
+### Full partitions
+
+A partition journal holds at most 256 segments of `segment_bytes`.
+
+- With less than a sixteenth of that space left, the partition refuses new
+  records with NACK 10 (retry after backoff). With less than a sixty-fourth
+  left, it also refuses producer opens, consumer progress, and assignments.
+- Trims and policy changes always pass, so retention can still free space.
+- A retention byte target covers at most 224 segments, so retention that lags
+  a few segments still frees space before refusals start.
+- Followers group the same operations on their own timing and can need more
+  space than the leader. A replica whose journal fills anyway holds its
+  writes until a segment retires, instead of failing.
+
 ## Operator tuning
 
 Defaults live in [`ozzy-config`](../ozzy-config/README.md).

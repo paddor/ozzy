@@ -82,7 +82,7 @@ fn minimal_single_broker_has_production_defaults() {
 }
 
 #[test]
-fn retention_limits_are_optional_positive_and_fit_a_segment() {
+fn retention_limits_are_optional_positive_and_fit_the_segment_limit() {
     let source =
         format!("{SINGLE}\n[topics.orders.retention]\nmax_age_secs = 60\nmax_bytes = 536870912\n");
     let config = Deployment::parse(&source).unwrap();
@@ -90,10 +90,14 @@ fn retention_limits_are_optional_positive_and_fit_a_segment() {
     assert_eq!(retention.max_age_secs, Some(60));
     assert_eq!(retention.max_bytes, Some(536_870_912));
     config.validate().unwrap();
+    let most = format!("{SINGLE}\n[topics.orders.retention]\nmax_bytes = 60129542144\n");
+    Deployment::parse(&most).unwrap().validate().unwrap();
     for invalid in [
         "max_age_secs = 0",
         "max_bytes = 0",
         "max_bytes = 4096",
+        // Seven eighths of 256 segments of 256 MiB, plus one byte.
+        "max_bytes = 60129542145",
         "max_age_secs = 18446744073709552",
     ] {
         let source = format!("{SINGLE}\n[topics.orders.retention]\n{invalid}\n");

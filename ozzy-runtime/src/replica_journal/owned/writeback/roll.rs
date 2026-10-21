@@ -38,6 +38,9 @@ impl OwnedJournal {
     /// remain owned and may span the roll without changing retry boundaries.
     pub fn begin_roll(&mut self, max_probes: usize) -> Result<PreparedRoll, JournalError> {
         self.healthy()?;
+        if !self.can_roll()? {
+            return Err(JournalError::RollCapacity);
+        }
         self.journal.finish_writes()?;
         let capacity = self.journal.ready()?.writer().header().capacity();
         self.faulted = true;
@@ -87,6 +90,7 @@ impl OwnedJournal {
         }
         observed.armed = false;
         self.faulted = false;
+        self.release_writes();
         Ok(())
     }
 }

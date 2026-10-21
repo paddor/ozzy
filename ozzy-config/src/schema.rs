@@ -177,6 +177,10 @@ pub const MAX_APPEND_BYTES: u64 = 8 * 1024 * 1024;
 /// Upper bound on `limits.max_clients`.
 pub const MAX_CLIENTS: usize = 4096;
 
+/// Segments one partition journal holds. Near this limit a partition refuses
+/// new records, so a retention byte target may cover at most seven eighths.
+pub const MAX_PARTITION_SEGMENTS: usize = 256;
+
 const fn default_partitions() -> u32 {
     16
 }
