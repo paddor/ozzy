@@ -1,6 +1,7 @@
 //! Allocation budget tests. Linking this crate installs a global allocator
 //! that counts allocations on the measuring thread only; other test threads
 //! stay outside every measurement.
+#![warn(missing_docs)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;

@@ -140,6 +140,7 @@ def parts(payload: Payload, config: ClientConfig) -> Payload:
 
 
 def message_id(value: MessageId | None) -> bytes | None:
+    """Convert a UUID or UUID string to its 16 bytes; None stays None."""
     if value is None:
         return None
     return value.bytes if isinstance(value, UUID) else UUID(value).bytes
@@ -148,6 +149,7 @@ def message_id(value: MessageId | None) -> bytes | None:
 def destination(
     key: bytes | None, partition: int | None
 ) -> tuple[bytes | None, int | None]:
+    """Check a routing key or exact partition; at most one may be given."""
     if key is not None and not isinstance(key, bytes):
         raise TypeError("key must be bytes")
     if key is not None and partition is not None:

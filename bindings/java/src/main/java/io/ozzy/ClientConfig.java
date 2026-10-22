@@ -86,7 +86,11 @@ public record ClientConfig(
         }
     }
 
-    /** Construct with default finite limits and adaptive LZ4. */
+    /**
+     * Construct with default finite limits and adaptive LZ4.
+     *
+     * @param brokers one broker or all three quorum brokers
+     */
     public ClientConfig(List<BrokerAddress> brokers) {
         this(brokers, new Limits(), new Capacity(), Duration.ofSeconds(5), Compression.LZ4);
     }
@@ -107,22 +111,42 @@ public record ClientConfig(
         requestTimeout.toNanos();
     }
 
-    /** Return a copy selecting payload compression. */
+    /**
+     * Return a copy selecting payload compression.
+     *
+     * @param value payload compression
+     * @return the updated copy
+     */
     public ClientConfig withCompression(Compression value) {
         return new ClientConfig(brokers, limits, capacity, requestTimeout, value);
     }
 
-    /** Return a copy with new record/frame bounds. */
+    /**
+     * Return a copy with new record/frame bounds.
+     *
+     * @param value record and frame bounds
+     * @return the updated copy
+     */
     public ClientConfig withLimits(Limits value) {
         return new ClientConfig(brokers, value, capacity, requestTimeout, compression);
     }
 
-    /** Return a copy with new role and queue capacity. */
+    /**
+     * Return a copy with new role and queue capacity.
+     *
+     * @param value role and reader-queue capacity
+     * @return the updated copy
+     */
     public ClientConfig withCapacity(Capacity value) {
         return new ClientConfig(brokers, limits, value, requestTimeout, compression);
     }
 
-    /** Return a copy with a positive request timeout. */
+    /**
+     * Return a copy with a positive request timeout.
+     *
+     * @param value positive request timeout
+     * @return the updated copy
+     */
     public ClientConfig withRequestTimeout(Duration value) {
         return new ClientConfig(brokers, limits, capacity, value, compression);
     }

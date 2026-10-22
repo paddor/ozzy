@@ -36,6 +36,8 @@ public final class Consumer implements AutoCloseable, Iterable<Record> {
     /**
      * Wait for one record, preserving order within each partition. Interruption cancels a pending
      * receive and preserves interrupt status. A delivered native result wins cancellation races.
+     *
+     * @return the next record
      */
     public Record next() {
         Object result = submit();
@@ -49,6 +51,8 @@ public final class Consumer implements AutoCloseable, Iterable<Record> {
      * Await one record. Canceling pending work returns its native lease before cancel completes. If
      * native delivery already completed, cancellation returns false and its result remains
      * available.
+     *
+     * @return a future that completes with the next record
      */
     public CompletableFuture<Record> nextAsync() {
         Object result = submit();
@@ -76,6 +80,8 @@ public final class Consumer implements AutoCloseable, Iterable<Record> {
     /**
      * Return a ready record or empty without waiting. Overlapping mutable operations raise
      * BusyException.
+     *
+     * @return a ready record, or empty when none is ready
      */
     public Optional<Record> tryNext() {
         resource.enter();
@@ -89,6 +95,8 @@ public final class Consumer implements AutoCloseable, Iterable<Record> {
     /**
      * Snapshot first undelivered offsets. Persist only after processing succeeds. Available after
      * close.
+     *
+     * @return the first undelivered offset of each selected partition
      */
     public Checkpoint checkpoint() {
         if (resource.isClosed()) return finalCheckpoint;
@@ -100,7 +108,11 @@ public final class Consumer implements AutoCloseable, Iterable<Record> {
         }
     }
 
-    /** Return cumulative delivery and gap-repair counters, including final counters after close. */
+    /**
+     * Return cumulative delivery and gap-repair counters, including final counters after close.
+     *
+     * @return cumulative reader counters
+     */
     public ConsumerStats stats() {
         if (resource.isClosed()) return finalStats;
         long pointer = resource.enter();
@@ -132,7 +144,11 @@ public final class Consumer implements AutoCloseable, Iterable<Record> {
         NativeFuture.await(closeAsync());
     }
 
-    /** Release asynchronously. Cancel an outstanding receive before closing. */
+    /**
+     * Release asynchronously. Cancel an outstanding receive before closing.
+     *
+     * @return a future that completes once subscriptions are released
+     */
     public CompletableFuture<Void> closeAsync() {
         return resource.closeAsync(this);
     }
