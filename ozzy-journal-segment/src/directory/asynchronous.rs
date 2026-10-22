@@ -13,6 +13,7 @@ pub(crate) mod groups;
 mod history;
 mod index;
 pub use index::{BuiltIndex, IndexJob};
+mod format;
 mod metadata;
 mod opening;
 pub use opening::Opening;

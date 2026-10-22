@@ -1,20 +1,57 @@
 //! Shared journal observation for external scheduling and controlled simulation.
 
 use super::super::{ActorError, ReplicaActor};
+use super::PendingIo;
 use std::{task::Poll, time::Duration};
 
 impl ReplicaActor {
+    /// Whether any journal command or persistence is outstanding.
+    pub(in crate::replica_actor) fn disk_pending(&self) -> bool {
+        self.pending.is_some()
+            || self.pending_replay.is_some()
+            || self.pending_sync.is_some()
+            || !self.pending_persistence.is_empty()
+    }
+
+    /// Report outstanding storage work to the driver for this round.
+    pub(in crate::replica_actor) fn observe_storage(
+        &mut self,
+        now: Duration,
+    ) -> Result<(), ActorError> {
+        // The view waits on this copy's own promise or installation I/O;
+        // timing out while it runs would only discard the work.
+        if matches!(
+            self.pending,
+            Some(
+                PendingIo::Promise(_)
+                    | PendingIo::Begin(_)
+                    | PendingIo::Chunk(_)
+                    | PendingIo::Finish(_)
+            )
+        ) {
+            self.driver.history_progress(now)?;
+        }
+        // Storage that has work and completes none of it holds the role as
+        // a stalled write does, though no write was admitted.
+        let busy = self.disk_pending();
+        // A command of many jobs on a slow device is not a stall while its
+        // jobs complete.
+        let jobs = self.journal.completed_jobs();
+        if !busy || jobs != self.storage_jobs {
+            self.storage_progress_at = Some(now);
+            self.storage_jobs = jobs;
+        }
+        let since = *self.storage_progress_at.get_or_insert(now);
+        self.driver.observe_storage(busy.then_some(since), now)?;
+        Ok(())
+    }
+
     pub(crate) async fn observe_journal(
         &mut self,
         now: Duration,
         wait_for_work: bool,
     ) -> Result<bool, ActorError> {
-        if !wait_for_work
-            && self.pending_persistence.is_empty()
-            && self.pending_sync.is_none()
-            && self.pending.is_none()
-            && self.pending_replay.is_none()
-        {
+        if !wait_for_work && !self.disk_pending() {
             // Detached readers/maintenance can have work without core receipts.
             return std::future::poll_fn(|cx| {
                 Poll::Ready(match self.journal.poll_stopped(cx) {
