@@ -4,7 +4,7 @@ use super::{
 };
 use crate::async_files::Access;
 use crate::checkpoint::{
-    CheckpointSpec, ManifestBuilder, checkpoint_name, encode_checkpoint_manifest,
+    CheckpointChunk, CheckpointSpec, ManifestBuilder, checkpoint_name, encode_checkpoint_manifest,
 };
 use ozzy_io::{Handle, OpenMode, Operation};
 use std::{
@@ -159,15 +159,7 @@ impl Builder {
                 let open = match self.file.take() {
                     Some(open) => open,
                     None => {
-                        self.config
-                            .access
-                            .open(
-                                root.join(chunk_name(self.manifest.ordinal() as u32)),
-                                OpenMode::CreateNew,
-                                false,
-                                false,
-                            )
-                            .await?
+                        create_chunk(&self.config.access, root, self.manifest.ordinal()).await?
                     }
                 };
                 self.config
@@ -177,25 +169,36 @@ impl Builder {
                 file = Some(open);
             }
             if let Some(chunk) = self.manifest.append(next)? {
-                match &self.target {
-                    Target::New(_) => {
-                        if let Some(file) = file.take() {
-                            self.config.access.sync(&file).await?;
-                            self.config
-                                .access
-                                .done(Operation::Close { handle: file })
-                                .await?;
-                        }
-                    }
-                    Target::Existing(checkpoint) => {
-                        if checkpoint.manifest.chunks.get(chunk.ordinal as usize) != Some(&chunk) {
-                            return Err(CheckpointError::ImmutableConflict);
-                        }
-                    }
-                }
+                self.complete_chunk(chunk, file.take()).await?;
             }
             self.file = file;
             bytes = rest;
+        }
+        Ok(())
+    }
+
+    /// Sync and close a completed new chunk's `file`, or check a rebuilt
+    /// chunk against the existing checkpoint's.
+    async fn complete_chunk(
+        &self,
+        chunk: CheckpointChunk,
+        file: Option<Handle>,
+    ) -> Result<(), CheckpointError> {
+        match &self.target {
+            Target::New(_) => {
+                if let Some(file) = file {
+                    self.config.access.sync(&file).await?;
+                    self.config
+                        .access
+                        .done(Operation::Close { handle: file })
+                        .await?;
+                }
+            }
+            Target::Existing(checkpoint) => {
+                if checkpoint.manifest.chunks.get(chunk.ordinal as usize) != Some(&chunk) {
+                    return Err(CheckpointError::ImmutableConflict);
+                }
+            }
         }
         Ok(())
     }
@@ -301,6 +304,22 @@ async fn create_staging(
         }
     }
     Err(CheckpointError::StagingConflict)
+}
+
+/// Create the file of the chunk at `ordinal` below a new checkpoint's `root`.
+async fn create_chunk(
+    access: &Access,
+    root: &Path,
+    ordinal: usize,
+) -> Result<Handle, CheckpointError> {
+    Ok(access
+        .open(
+            root.join(chunk_name(ordinal as u32)),
+            OpenMode::CreateNew,
+            false,
+            false,
+        )
+        .await?)
 }
 
 async fn write_new_synced(

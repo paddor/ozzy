@@ -23,19 +23,22 @@ impl SeekQuery {
     pub(crate) fn observe_index(self, index: crate::SegmentIndexView<'_>, result: &mut Selection) {
         match self.start {
             Start::RecordId { id, .. } => {
-                if let Some((first, last)) = index.message_offsets(
+                let Some((first, last)) = index.message_offsets(
                     self.partition,
                     id,
                     self.retained_from,
                     self.confirmed_end,
-                ) {
-                    for offset in [first, last] {
-                        if index
-                            .find_offset(self.partition, offset)
-                            .is_some_and(|entry| entry.location.operation.op_number <= self.through)
-                        {
-                            result.observe_match(offset);
-                        }
+                ) else {
+                    return;
+                };
+                let visible = |offset| {
+                    index
+                        .find_offset(self.partition, offset)
+                        .is_some_and(|entry| entry.location.operation.op_number <= self.through)
+                };
+                for offset in [first, last] {
+                    if visible(offset) {
+                        result.observe_match(offset);
                     }
                 }
             }
