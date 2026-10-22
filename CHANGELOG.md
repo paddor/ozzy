@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-22
+
 ### Breaking
 
 - A topic's `retention.max_bytes` may cover at most 224 segments, seven
