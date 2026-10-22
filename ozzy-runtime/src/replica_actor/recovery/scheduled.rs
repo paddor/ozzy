@@ -1,5 +1,7 @@
 //! Nonvoting recovery on a shared shard, including owned retry and handoff.
 
+mod sessions;
+
 use super::{
     ActorError, ActorStatus, Outcome, RecoveryActor, RecoveryStorage, SharedStatus, Transition,
 };
@@ -7,15 +9,12 @@ use crate::replica_actor::HistoryReason;
 use crate::{
     replica_actor::{ScheduleError, ScheduledReplica},
     replica_journal::ShardRecoveringJournal,
-    replica_transport::SendClass,
 };
 use futures::{FutureExt, future::LocalBoxFuture};
 use omq_tokio::{Message, TrySendError};
 use ozzy_proto::{LinkSessionId, NodeId, PartitionIncarnation, directory::RouteState};
-use ozzy_replication::{
-    Configuration,
-    wire::{FetchOps, PeerBinding},
-};
+use ozzy_replication::{Configuration, wire::FetchOps};
+use sessions::{set_session, switch_session};
 use std::{
     task::{Context, Poll},
     time::Duration,
@@ -161,79 +160,13 @@ impl<J: RecoveryStorage + 'static> ScheduledRecovery<J> {
 
     /// Installing a chunk keeps its receive reservation until backing is freed.
     pub fn receive_has_work(&self) -> bool {
-        matches!(&self.phase, Phase::Active(actor) if matches!(actor.pending, Some(super::Pending::Chunk(_) | super::Pending::Checkpoint(_))))
-    }
-
-    /// Session comes from the frontend's independently established link table.
-    pub fn replace_session(
-        &mut self,
-        peer: NodeId,
-        expected: LinkSessionId,
-        replacement: LinkSessionId,
-        now: Duration,
-    ) -> Result<bool, ScheduleError> {
-        if replacement.as_bytes() == &[0; 16] {
-            return Err(ScheduleError::Binding);
-        }
-        self.change_session(peer, expected, replacement, now)
-    }
-
-    /// A late disconnect cannot fence a newer link. Admitted disk work remains.
-    pub fn disconnect_session(
-        &mut self,
-        peer: NodeId,
-        expected: LinkSessionId,
-        now: Duration,
-    ) -> Result<bool, ScheduleError> {
-        self.change_session(peer, expected, LinkSessionId::from_bytes([0; 16]), now)
-    }
-
-    fn change_session(
-        &mut self,
-        peer: NodeId,
-        expected: LinkSessionId,
-        replacement: LinkSessionId,
-        now: Duration,
-    ) -> Result<bool, ScheduleError> {
-        self.observe(now)?;
-        let slot = self
-            .configuration
-            .voters()
-            .iter()
-            .position(|node| *node == peer && peer != self.local)
-            .ok_or(ScheduleError::Binding)?;
-        let current = self.sessions[slot];
-        if current == replacement {
-            return Ok(false);
-        }
-        if current != expected {
-            return Err(ScheduleError::Binding);
-        }
-        self.sessions[slot] = replacement;
-        if let Phase::Active(actor) = &mut self.phase {
-            set_session(
-                actor,
-                slot,
-                replacement,
-                now.saturating_sub(self.origin.unwrap_or(now)),
-            )?;
-        } else if let Phase::Ready(actor) = &mut self.phase {
-            if replacement.as_bytes() == &[0; 16] {
-                actor.disconnect_session(peer, current, now)?;
-            } else {
-                actor.replace_session(peer, current, replacement, now)?;
-            }
-        }
-        Ok(true)
-    }
-
-    fn session(&self, peer: NodeId) -> Option<LinkSessionId> {
-        let slot = self
-            .configuration
-            .voters()
-            .iter()
-            .position(|node| *node == peer)?;
-        (self.sessions[slot].as_bytes() != &[0; 16]).then_some(self.sessions[slot])
+        let Phase::Active(actor) = &self.phase else {
+            return false;
+        };
+        matches!(
+            actor.pending,
+            Some(super::Pending::Chunk(_) | super::Pending::Checkpoint(_))
+        )
     }
 
     /// Deliver only broker recovery/history commands. Changing lifecycle phases
@@ -334,15 +267,8 @@ impl<J: RecoveryStorage + 'static> ScheduledRecovery<J> {
                     if peer == self.local || prior[slot] == self.sessions[slot] {
                         continue;
                     }
-                    if self.sessions[slot].as_bytes() == &[0; 16] {
-                        actor
-                            .disconnect_session(peer, prior[slot], now)
-                            .map_err(schedule_actor)?;
-                    } else {
-                        actor
-                            .replace_session(peer, prior[slot], self.sessions[slot], now)
-                            .map_err(schedule_actor)?;
-                    }
+                    switch_session(&mut actor, peer, prior[slot], self.sessions[slot], now)
+                        .map_err(schedule_actor)?;
                 }
                 if let Some(owner) = &self.owner {
                     actor.bind_receive_owner(owner)?;
@@ -400,41 +326,6 @@ impl<J: RecoveryStorage + 'static> ScheduledRecovery<J> {
         }
         result.map_err(ScheduleError::Actor)
     }
-}
-
-fn set_session<J: RecoveryStorage>(
-    actor: &mut RecoveryActor<J>,
-    slot: usize,
-    session: LinkSessionId,
-    now: Duration,
-) -> Result<(), ActorError> {
-    let peer = actor.configuration.voters()[slot];
-    actor.config.sessions[slot] = session;
-    actor.bindings[slot] = if session.as_bytes() == &[0; 16] {
-        None
-    } else {
-        Some(PeerBinding::new(actor.configuration, peer, session)?)
-    };
-    for class in [
-        SendClass::Control,
-        SendClass::Data,
-        SendClass::Receipt,
-        SendClass::Exchange,
-    ] {
-        actor.outbox.discard(peer, class);
-    }
-    actor.retries[slot].at = now;
-    if let Some((request, retry)) = &mut actor.checkpoint_fetch
-        && request.source.voter == peer
-    {
-        retry.at = now;
-    }
-    if let Some((request, retry)) = &mut actor.fetch
-        && request.source.voter == peer
-    {
-        retry.at = now;
-    }
-    Ok(())
 }
 
 fn poll_work<J: RecoveryStorage>(

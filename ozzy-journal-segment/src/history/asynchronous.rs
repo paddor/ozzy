@@ -313,14 +313,8 @@ impl History {
             let start = usize::try_from(loaded.valid_bytes).map_err(|_| Error::Capacity)?;
             let seal = self.state.seal(at);
             if loaded.valid_bytes == seal.valid_bytes {
-                let expected = self
-                    .state
-                    .pin
-                    .references
-                    .get(at + 1)
-                    .map_or(self.state.physical_through, |next| before(next.first_chain));
                 return if loaded.digest.finish() == seal.digest
-                    && before(loaded.next_chain) == expected
+                    && before(loaded.next_chain) == self.state.segment_end(at)
                 {
                     Ok(())
                 } else {

@@ -1,7 +1,10 @@
+//! A cursor's broker subscription: open, acknowledge, and return it.
+
 use super::{
     BrokerLinkError, BrokerLinks, Context, Cursor, Duration, Opening, Poll, Returning,
     TopicReaderError, TopicRoutes, reader,
 };
+use ozzy_core::reader::seek::SeekError;
 use ozzy_proto::Offset;
 
 impl Cursor {
@@ -106,65 +109,80 @@ impl Cursor {
         now: Duration,
         cx: &mut Context<'_>,
     ) -> Result<(), TopicReaderError> {
-        if let Some(opening) = &mut self.opening {
-            match opening.request.as_mut().poll(cx) {
-                Poll::Ready(Ok(selected)) => {
-                    if self.selector.take().is_some() {
-                        self.next = selected.2.resolved_offset;
-                        self.live = ozzy_core::live::LiveCursor::new(self.next, self.refresh);
-                    }
-                    self.opening = None;
-                    self.selected = Some(selected);
-                    self.accepted = Some(selected);
+        let Some(opening) = &mut self.opening else {
+            return Ok(());
+        };
+        let Poll::Ready(result) = opening.request.as_mut().poll(cx) else {
+            return Ok(());
+        };
+        self.opening = None;
+        match result {
+            Ok(selected) => {
+                if self.selector.take().is_some() {
+                    self.next = selected.2.resolved_offset;
+                    self.live = ozzy_core::live::LiveCursor::new(self.next, self.refresh);
                 }
-                Poll::Ready(Err(error)) => {
-                    self.opening = None;
-                    self.early = None;
-                    if let BrokerLinkError::RetentionGap { earliest } = error {
-                        return Err(TopicReaderError::RetentionGap {
-                            partition: self.number,
-                            earliest,
-                        });
-                    }
-                    if let BrokerLinkError::Seek(error) = error {
-                        return Err(match error {
-                            ozzy_core::reader::seek::SeekError::NotFound { earliest } => {
-                                TopicReaderError::RecordNotFound {
-                                    partition: self.number,
-                                    earliest,
-                                }
-                            }
-                            ozzy_core::reader::seek::SeekError::Ambiguous { first, last } => {
-                                TopicReaderError::AmbiguousRecordId {
-                                    partition: self.number,
-                                    first,
-                                    last,
-                                }
-                            }
-                        });
-                    }
-                    if !super::retryable(&error) {
-                        return Err(error.into());
-                    }
-                    routes.refresh(self.number)?;
-                    // A temporary refusal names no other source. Ask the same
-                    // broker again as soon as any other refused request.
-                    self.due = now
-                        + if matches!(
-                            error,
-                            BrokerLinkError::Rejected {
-                                retry: ozzy_proto::nack::RetryClass::AfterBackoff,
-                                ..
-                            }
-                        ) {
-                            links.retry_interval().min(self.refresh)
-                        } else {
-                            self.refresh
-                        };
-                }
-                Poll::Pending => {}
+                self.selected = Some(selected);
+                self.accepted = Some(selected);
+                Ok(())
+            }
+            Err(error) => {
+                self.early = None;
+                self.opening_failed(links, routes, now, error)
             }
         }
+    }
+
+    /// A refused subscription: a reader error, or the time to ask again.
+    fn opening_failed(
+        &mut self,
+        links: &BrokerLinks,
+        routes: &TopicRoutes,
+        now: Duration,
+        error: BrokerLinkError,
+    ) -> Result<(), TopicReaderError> {
+        let partition = self.number;
+        let error = match error {
+            BrokerLinkError::RetentionGap { earliest } => {
+                return Err(TopicReaderError::RetentionGap {
+                    partition,
+                    earliest,
+                });
+            }
+            BrokerLinkError::Seek(SeekError::NotFound { earliest }) => {
+                return Err(TopicReaderError::RecordNotFound {
+                    partition,
+                    earliest,
+                });
+            }
+            BrokerLinkError::Seek(SeekError::Ambiguous { first, last }) => {
+                return Err(TopicReaderError::AmbiguousRecordId {
+                    partition,
+                    first,
+                    last,
+                });
+            }
+            error => error,
+        };
+        if !super::retryable(&error) {
+            return Err(error.into());
+        }
+        routes.refresh(self.number)?;
+        // A temporary refusal names no other source. Ask the same broker
+        // again as soon as any other refused request.
+        let backoff = matches!(
+            error,
+            BrokerLinkError::Rejected {
+                retry: ozzy_proto::nack::RetryClass::AfterBackoff,
+                ..
+            }
+        );
+        self.due = now
+            + if backoff {
+                links.retry_interval().min(self.refresh)
+            } else {
+                self.refresh
+            };
         Ok(())
     }
 
@@ -173,28 +191,27 @@ impl Cursor {
         routes: &TopicRoutes,
         cx: &mut Context<'_>,
     ) -> Result<(), TopicReaderError> {
-        {
-            let pending = &mut self.canceling;
-            let result = pending.as_mut().map(|pending| pending.as_mut().poll(cx));
-            match result {
-                Some(Poll::Ready(Ok(()))) => {
-                    *pending = None;
-                    if self.live.is_paused() {
-                        // A held publication may have found its gap while the
-                        // old replay subscription was still closing.
-                        self.due = Duration::ZERO;
-                    }
-                    cx.waker().wake_by_ref();
+        let Some(canceling) = &mut self.canceling else {
+            return Ok(());
+        };
+        match canceling.as_mut().poll(cx) {
+            Poll::Ready(Ok(())) => {
+                self.canceling = None;
+                if self.live.is_paused() {
+                    // A held publication may have found its gap while the
+                    // old replay subscription was still closing.
+                    self.due = Duration::ZERO;
                 }
-                Some(Poll::Ready(Err(error))) => {
-                    if !super::retryable(&error) {
-                        return Err(error.into());
-                    }
-                    self.reset();
-                    routes.refresh(self.number)?;
-                }
-                Some(Poll::Pending) | None => {}
+                cx.waker().wake_by_ref();
             }
+            Poll::Ready(Err(error)) => {
+                if !super::retryable(&error) {
+                    return Err(error.into());
+                }
+                self.reset();
+                routes.refresh(self.number)?;
+            }
+            Poll::Pending => {}
         }
         Ok(())
     }

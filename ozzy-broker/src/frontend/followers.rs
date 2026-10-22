@@ -81,48 +81,38 @@ impl Followers {
             routes,
         };
         let options = frontend.limits.peer();
-        let result = async {
-            for (&(broker, _), &shard) in &transport.routes.destinations {
-                if transport.repair.contains_key(&(broker, shard)) {
-                    continue;
+        let result =
+            async {
+                for (&(broker, _), &shard) in &transport.routes.destinations {
+                    if transport.repair.contains_key(&(broker, shard)) {
+                        continue;
+                    }
+                    let identity = ozzy_runtime::transport::peer_identity(
+                        FollowerRoutes::identity(frontend.local, broker, shard),
+                    );
+                    let socket = frontend
+                        .context
+                        .socket(SocketType::Peer, options.clone().identity(identity))
+                        .identity_routing()?;
+                    transport.repair.insert((broker, shard), socket.clone());
+                    let endpoint =
+                        transport.routes.repairs.get(&broker).ok_or_else(|| {
+                            omq_tokio::Error::Config("unknown repair broker".into())
+                        })?;
+                    socket.connect(endpoint.clone()).await?;
                 }
-                let socket = frontend
-                    .context
-                    .socket(
-                        SocketType::Peer,
-                        options
-                            .clone()
-                            .identity(ozzy_runtime::transport::peer_identity(
-                                FollowerRoutes::identity(frontend.local, broker, shard),
-                            )),
-                    )
-                    .identity_routing()?;
-                transport.repair.insert((broker, shard), socket.clone());
-                socket
-                    .connect(
-                        transport
-                            .routes
-                            .repairs
-                            .get(&broker)
-                            .ok_or_else(|| {
-                                omq_tokio::Error::Config("unknown repair broker".into())
-                            })?
-                            .clone(),
-                    )
-                    .await?;
+                let publications = frontend.limits.publications(&options);
+                for (&broker, endpoint) in &transport.routes.publications {
+                    let socket = frontend
+                        .context
+                        .socket(SocketType::Sub, publications.clone());
+                    transport.subscribers.insert(broker, socket.clone());
+                    socket.subscribe(Bytes::new()).await?;
+                    socket.connect(endpoint.clone()).await?;
+                }
+                Ok::<(), omq_tokio::Error>(())
             }
-            let publications = frontend.limits.publications(&options);
-            for (&broker, endpoint) in &transport.routes.publications {
-                let socket = frontend
-                    .context
-                    .socket(SocketType::Sub, publications.clone());
-                transport.subscribers.insert(broker, socket.clone());
-                socket.subscribe(Bytes::new()).await?;
-                socket.connect(endpoint.clone()).await?;
-            }
-            Ok::<(), omq_tokio::Error>(())
-        }
-        .await;
+            .await;
         if let Err(reason) = result {
             let _ = transport.close().await;
             return Err(error(reason.to_string()));

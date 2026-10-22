@@ -7,7 +7,7 @@
 - A topic's `retention.max_bytes` may cover at most 224 segments, seven
   eighths of the 256-segment partition limit. A larger target filled the
   partition before retention started.
-- The re-exported `Context` and `Endpoint` come from the omq-tokio 0.30
+- The re-exported `Context` and `Endpoint` come from the omq-tokio 0.31
   release instead of a 0.29 Git revision.
 
 ### Changed

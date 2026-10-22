@@ -25,7 +25,11 @@ public record ReaderOptions(Start start, Checkpoint checkpoint, List<Integer> pa
         this(Start.EARLIEST, null, null);
     }
 
-    /** Resume a checkpoint using its partition selection. */
+    /**
+     * Resume a checkpoint using its partition selection.
+     *
+     * @param checkpoint saved delivered progress
+     */
     public ReaderOptions(Checkpoint checkpoint) {
         this(
                 Start.EARLIEST,

@@ -125,17 +125,26 @@ impl Writers {
         }
     }
 
+    /// This client's peer index, assigning a free one to a new trusted client.
     pub(super) fn peer(&mut self, node: NodeId) -> Option<usize> {
+        if let Some(index) = self.known_peer(node) {
+            return Some(index);
+        }
+        if !matches!(self.access, NativeAccess::TrustedClients { .. }) {
+            return None;
+        }
+        let index = self.clients.iter().position(Option::is_none)?;
+        self.clients[index] = Some(node);
+        Some(index)
+    }
+
+    /// This client's peer index, if it has one. Assigns nothing.
+    fn known_peer(&self, node: NodeId) -> Option<usize> {
         match &self.access {
             NativeAccess::Writers(peers) => peers.iter().position(|peer| peer.node == node),
             NativeAccess::Clients { peers, .. } => peers.iter().position(|&peer| peer == node),
             NativeAccess::TrustedClients { .. } => {
-                if let Some(index) = self.clients.iter().position(|&peer| peer == Some(node)) {
-                    return Some(index);
-                }
-                let index = self.clients.iter().position(Option::is_none)?;
-                self.clients[index] = Some(node);
-                Some(index)
+                self.clients.iter().position(|&peer| peer == Some(node))
             }
         }
     }
@@ -156,21 +165,10 @@ impl Writers {
         slots: &[Slot],
         stride: usize,
     ) -> Option<usize> {
-        if let Some((index, entry)) =
-            self.entries
-                .iter_mut()
-                .enumerate()
-                .find_map(|(index, entry)| {
-                    entry
-                        .as_mut()
-                        .filter(|entry| {
-                            entry.client.node == link.binding.peer
-                                && entry.client.producer == producer
-                        })
-                        .map(|entry| (index, entry))
-                })
-        {
-            if !matches!(self.access, NativeAccess::Writers(_)) {
+        if let Some(index) = self.assigned(link.binding.peer, producer) {
+            if !matches!(self.access, NativeAccess::Writers(_))
+                && let Some(entry) = &mut self.entries[index]
+            {
                 entry.session = Some(link.binding.session);
             }
             return Some(index);
@@ -245,14 +243,7 @@ impl Writers {
 
     /// Existing rejection slot of this client. Assigns nothing.
     pub(super) fn assigned_rejection(&self, node: NodeId, stride: usize) -> Option<usize> {
-        let peer = match &self.access {
-            NativeAccess::Writers(peers) => peers.iter().position(|peer| peer.node == node),
-            NativeAccess::Clients { peers, .. } => peers.iter().position(|&peer| peer == node),
-            NativeAccess::TrustedClients { .. } => {
-                self.clients.iter().position(|&peer| peer == Some(node))
-            }
-        }?;
-        Some(self.rejection_slot(peer, stride))
+        Some(self.rejection_slot(self.known_peer(node)?, stride))
     }
 
     /// Writers currently assigned to this client. Assigns nothing.
@@ -293,8 +284,7 @@ impl Writers {
             };
             let rejection = &slots[self.entries.len() * stride + index];
             if current(node).is_none()
-                && rejection.pending.is_none()
-                && rejection.reply.is_none()
+                && !rejection.active()
                 && !self
                     .entries
                     .iter()
@@ -309,5 +299,5 @@ impl Writers {
 fn idle(slots: &[Slot], index: usize, stride: usize) -> bool {
     slots[index * stride..(index + 1) * stride]
         .iter()
-        .all(|slot| slot.buffer.is_some() && slot.pending.is_none() && slot.reply.is_none())
+        .all(|slot| slot.buffer.is_some() && !slot.active())
 }

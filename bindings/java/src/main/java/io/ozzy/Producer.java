@@ -15,7 +15,11 @@ public final class Producer implements AutoCloseable {
         resource = new NativeResource(pointer);
     }
 
-    /** Opaque 32-byte resume identity. Persist once, then resume after the old process stops. */
+    /**
+     * Opaque 32-byte resume identity. Persist once, then resume after the old process stops.
+     *
+     * @return the 32-byte resume identity
+     */
     public byte[] identity() {
         long pointer = resource.enter();
         try {
@@ -25,7 +29,11 @@ public final class Producer implements AutoCloseable {
         }
     }
 
-    /** Number of topic partitions. */
+    /**
+     * Number of topic partitions.
+     *
+     * @return the topic's partition count
+     */
     public int partitionCount() {
         long pointer = resource.enter();
         try {
@@ -35,27 +43,54 @@ public final class Producer implements AutoCloseable {
         }
     }
 
-    /** Admit one buffer using automatic routing; waits for bounded capacity. */
+    /**
+     * Admit one buffer using automatic routing; waits for bounded capacity.
+     *
+     * @param body record bytes
+     * @return an observer of the admitted record
+     */
     public PendingRecord send(byte[] body) {
         return send(body, SendOptions.AUTOMATIC);
     }
 
-    /** Admit bytes with explicit routing and optional ID; input is snapshotted before return. */
+    /**
+     * Admit bytes with explicit routing and optional ID; input is snapshotted before return.
+     *
+     * @param body record bytes
+     * @param options routing and optional event UUID
+     * @return an observer of the admitted record
+     */
     public PendingRecord send(byte[] body, SendOptions options) {
         return send(ByteBuffer.wrap(body), options);
     }
 
-    /** Admit the buffer's remaining bytes using automatic routing. */
+    /**
+     * Admit the buffer's remaining bytes using automatic routing.
+     *
+     * @param body buffer whose remaining bytes form the record
+     * @return an observer of the admitted record
+     */
     public PendingRecord send(ByteBuffer body) {
         return send(body, SendOptions.AUTOMATIC);
     }
 
-    /** Admit multipart data using automatic routing. */
+    /**
+     * Admit multipart data using automatic routing.
+     *
+     * @param parts nonempty record parts, in order
+     * @return an observer of the admitted record
+     */
     public PendingRecord send(List<ByteBuffer> parts) {
         return send(parts, SendOptions.AUTOMATIC);
     }
 
-    /** Admit the buffer's remaining bytes without changing its position. */
+    /**
+     * Admit the buffer's remaining bytes without changing its position.
+     *
+     * @param body buffer whose remaining bytes form the record
+     * @param options routing and optional event UUID
+     * @return an observer of the admitted record
+     */
     public PendingRecord send(ByteBuffer body, SendOptions options) {
         Object result = submit(body, options);
         if (result instanceof PendingRecord pending) return pending;
@@ -64,32 +99,65 @@ public final class Producer implements AutoCloseable {
         return NativeFuture.await(future);
     }
 
-    /** Admit nonempty multipart data, preserving empty parts. */
+    /**
+     * Admit nonempty multipart data, preserving empty parts.
+     *
+     * @param parts nonempty record parts, in order
+     * @param options routing and optional event UUID
+     * @return an observer of the admitted record
+     */
     public PendingRecord send(List<ByteBuffer> parts, SendOptions options) {
         return NativeFuture.await(sendAsync(parts, options));
     }
 
-    /** Asynchronous automatic-route admission. Ready calls stay inline. */
+    /**
+     * Asynchronous automatic-route admission. Ready calls stay inline.
+     *
+     * @param body record bytes
+     * @return a future that completes once the record is admitted
+     */
     public CompletableFuture<PendingRecord> sendAsync(byte[] body) {
         return sendAsync(body, SendOptions.AUTOMATIC);
     }
 
-    /** Asynchronous byte admission. Cancel before admission assigns no sequence. */
+    /**
+     * Asynchronous byte admission. Cancel before admission assigns no sequence.
+     *
+     * @param body record bytes
+     * @param options routing and optional event UUID
+     * @return a future that completes once the record is admitted
+     */
     public CompletableFuture<PendingRecord> sendAsync(byte[] body, SendOptions options) {
         return sendAsync(ByteBuffer.wrap(body), options);
     }
 
-    /** Admit remaining buffer bytes asynchronously using automatic routing. */
+    /**
+     * Admit remaining buffer bytes asynchronously using automatic routing.
+     *
+     * @param body buffer whose remaining bytes form the record
+     * @return a future that completes once the record is admitted
+     */
     public CompletableFuture<PendingRecord> sendAsync(ByteBuffer body) {
         return sendAsync(body, SendOptions.AUTOMATIC);
     }
 
-    /** Admit multipart data asynchronously using automatic routing. */
+    /**
+     * Admit multipart data asynchronously using automatic routing.
+     *
+     * @param parts nonempty record parts, in order
+     * @return a future that completes once the record is admitted
+     */
     public CompletableFuture<PendingRecord> sendAsync(List<ByteBuffer> parts) {
         return sendAsync(parts, SendOptions.AUTOMATIC);
     }
 
-    /** Asynchronous admission of remaining buffer bytes, preserving position. */
+    /**
+     * Asynchronous admission of remaining buffer bytes, preserving position.
+     *
+     * @param body buffer whose remaining bytes form the record
+     * @param options routing and optional event UUID
+     * @return a future that completes once the record is admitted
+     */
     public CompletableFuture<PendingRecord> sendAsync(ByteBuffer body, SendOptions options) {
         Object result = submit(body, options);
         if (result instanceof PendingRecord pending)
@@ -134,7 +202,13 @@ public final class Producer implements AutoCloseable {
                 null);
     }
 
-    /** Snapshot and admit multipart data asynchronously through the same Rust SDK path. */
+    /**
+     * Snapshot and admit multipart data asynchronously through the same Rust SDK path.
+     *
+     * @param parts nonempty record parts, in order
+     * @param options routing and optional event UUID
+     * @return a future that completes once the record is admitted
+     */
     public CompletableFuture<PendingRecord> sendAsync(List<ByteBuffer> parts, SendOptions options) {
         Objects.requireNonNull(parts);
         Objects.requireNonNull(options);
@@ -191,6 +265,8 @@ public final class Producer implements AutoCloseable {
     /**
      * Wait asynchronously; canceling this observation leaves the writer usable. The captured
      * prefix does not hold the producer, so sends may continue while it waits.
+     *
+     * @return a future that completes once the captured records are confirmed
      */
     public CompletableFuture<Void> flushAsync() {
         long pointer = resource.enter();
@@ -209,7 +285,11 @@ public final class Producer implements AutoCloseable {
         NativeFuture.await(closeAsync());
     }
 
-    /** Seal and drain asynchronously. Cancellation leaves the writer sealed. */
+    /**
+     * Seal and drain asynchronously. Cancellation leaves the writer sealed.
+     *
+     * @return a future that completes once admitted records drain
+     */
     public CompletableFuture<Void> closeAsync() {
         return resource.closeAsync(null);
     }

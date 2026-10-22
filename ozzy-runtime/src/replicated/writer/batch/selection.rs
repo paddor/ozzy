@@ -39,6 +39,7 @@ impl Selection {
         cap: usize,
     ) -> Result<(), Error> {
         let payload_limit = limits.envelope.max_payload_bytes;
+        let metadata_limit = limits.envelope.max_metadata_bytes;
         for (bytes, record_parts, encoding) in shapes {
             let original = match encoding {
                 Encoding::Raw => bytes,
@@ -48,19 +49,12 @@ impl Selection {
                 .checked_mul(4)
                 .and_then(|bytes| bytes.checked_add(encoding.head_bytes()))
                 .ok_or(Error::Configuration)?;
+            let metadata_room = metadata_limit.saturating_sub(self.metadata);
             if self.records == 0
                 && (!encoding.validate(record_parts, limits.max_parts, limits.max_record_bytes)
                     || record_parts > limits.max_parts
-                    || descriptors
-                        > limits
-                            .envelope
-                            .max_metadata_bytes
-                            .saturating_sub(self.metadata)
-                    || bytes
-                        > limits
-                            .envelope
-                            .max_payload_bytes
-                            .min(limits.max_record_bytes))
+                    || descriptors > metadata_room
+                    || bytes > payload_limit.min(limits.max_record_bytes))
             {
                 return Err(Error::Configuration);
             }
@@ -71,11 +65,7 @@ impl Selection {
                     && (self.logical >= target_bytes
                         || original > target_bytes.saturating_sub(self.logical)))
                 || record_parts > limits.max_parts.saturating_sub(self.parts)
-                || descriptors
-                    > limits
-                        .envelope
-                        .max_metadata_bytes
-                        .saturating_sub(self.metadata)
+                || descriptors > metadata_room
                 || bytes > payload_limit.saturating_sub(self.bytes)
             {
                 self.full = true;
@@ -91,7 +81,7 @@ impl Selection {
             || self.logical >= target_bytes
             || self.parts == limits.max_parts
             || self.bytes == payload_limit
-            || self.metadata == limits.envelope.max_metadata_bytes;
+            || self.metadata == metadata_limit;
         Ok(())
     }
 }

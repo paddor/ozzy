@@ -77,22 +77,7 @@ impl CheckedConfig {
                 .partitions
                 .chunks(directory::Limits::default().partitions)
             {
-                let partitions = chunk
-                    .iter()
-                    .map(|partition| directory::TopicPartition {
-                        number: partition.partition,
-                        group: GroupId::from_bytes(*partition.group.as_bytes()),
-                        config_epoch: partition.config_epoch,
-                        incarnation: PartitionIncarnation::from_bytes(
-                            *partition.incarnation.as_bytes(),
-                        ),
-                        members: partition
-                            .members
-                            .iter()
-                            .map(|id| NodeId::from_bytes(*id.as_bytes()))
-                            .collect(),
-                    })
-                    .collect();
+                let partitions = chunk.iter().map(topic_partition).collect();
                 pages.push(directory::TopicPage {
                     id: TopicId::from_bytes(*topic.id.as_bytes()),
                     name: name.clone(),
@@ -111,6 +96,21 @@ impl CheckedConfig {
             deployment.limits.max_partitions,
         )
         .map_err(|error| StartupError::Runtime(error.to_string()))
+    }
+}
+
+/// The directory entry of one partition in the identity record.
+fn topic_partition(partition: &ozzy_config::PartitionIdentity) -> directory::TopicPartition {
+    directory::TopicPartition {
+        number: partition.partition,
+        group: GroupId::from_bytes(*partition.group.as_bytes()),
+        config_epoch: partition.config_epoch,
+        incarnation: PartitionIncarnation::from_bytes(*partition.incarnation.as_bytes()),
+        members: partition
+            .members
+            .iter()
+            .map(|id| NodeId::from_bytes(*id.as_bytes()))
+            .collect(),
     }
 }
 

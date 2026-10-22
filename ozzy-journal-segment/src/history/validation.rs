@@ -133,14 +133,9 @@ impl<F> SegmentWork<F> {
         else {
             return Ok(false);
         };
-        let expected = history
-            .pin
-            .references()
-            .get(index + 1)
-            .map_or(history.physical_through, |next| {
-                super::before(next.first_chain)
-            });
-        if digest.finish() != history.seal(index).digest || super::before(self.chain) != expected {
+        if digest.finish() != history.seal(index).digest
+            || super::before(self.chain) != history.segment_end(index)
+        {
             return Err(HistoryError::Source);
         }
         Ok(true)
@@ -174,16 +169,7 @@ impl<F> SegmentWork<F> {
             Err(error) => return Err(error.into()),
         };
         for operation in &group.operations {
-            if operation.configuration_epoch != history.configuration_epoch
-                || operation.original_view > history.promised_view
-            {
-                return Err(HistoryError::Source);
-            }
-            ozzy_journal::operation::validate_operation_body(
-                operation.kind,
-                &operation.body,
-                history.operations,
-            )?;
+            history.check_operation(operation)?;
             self.decoded_bytes = self
                 .decoded_bytes
                 .checked_add(operation.body.len())

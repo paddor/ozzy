@@ -30,23 +30,37 @@ public final class PendingRecord {
         lifetime = owner.observe(pointer);
     }
 
-    /** Topic UUID, constructed only when requested. */
+    /**
+     * Topic UUID, constructed only when requested.
+     *
+     * @return the topic UUID
+     */
     public UUID topicId() {
         return new UUID(topicHi, topicLo);
     }
 
-    /** Numeric destination chosen before admission. */
+    /**
+     * Numeric destination chosen before admission.
+     *
+     * @return the destination partition
+     */
     public int partition() {
         return partition;
     }
 
-    /** Independent producer/partition retry sequence, represented as unsigned long bits. */
+    /**
+     * Independent producer/partition retry sequence, represented as unsigned long bits.
+     *
+     * @return the retry sequence as unsigned long bits
+     */
     public long sequence() {
         return sequence;
     }
 
     /**
      * Observe a receipt without waiting; raise SDK failures, otherwise return empty while pending.
+     *
+     * @return the receipt, or empty while pending
      */
     public Optional<Receipt> tryConfirmed() {
         try {
@@ -56,13 +70,21 @@ public final class PendingRecord {
         }
     }
 
-    /** Wait for durable confirmation. Simultaneous observers are supported. */
+    /**
+     * Wait for durable confirmation. Simultaneous observers are supported.
+     *
+     * @return the durable confirmation
+     */
     public Receipt confirmed() {
         Receipt ready = tryConfirmed().orElse(null);
         return ready != null ? ready : NativeFuture.await(waiting());
     }
 
-    /** Await confirmation; cancellation affects only this observer. */
+    /**
+     * Await confirmation; cancellation affects only this observer.
+     *
+     * @return a future that completes with the durable confirmation
+     */
     public CompletableFuture<Receipt> confirmedAsync() {
         Receipt ready = tryConfirmed().orElse(null);
         return ready != null ? CompletableFuture.completedFuture(ready) : waiting();

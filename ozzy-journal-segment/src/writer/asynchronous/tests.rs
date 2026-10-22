@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_io::{drive, drive_with, poll};
-use crate::{Digest, OperationKind, OperationLimits};
+use crate::{CanonicalRecoveryRequirements, Digest, OperationKind, OperationLimits};
 use ozzy_io::simulation::{self, Controller, Effect, Image, ImageLimits};
 use ozzy_io::{Outcome, Quota, SyncMode};
 use ozzy_proto::GroupId;

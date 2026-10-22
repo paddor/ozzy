@@ -9,7 +9,10 @@ use super::{
 use crate::JournalIndexError as Error;
 use crate::reader::ResidentOperations;
 use crate::retention::PreparedSegmentLease;
-use crate::{DirectoryError, IndexBuildLimits, IndexedReadError, OperationLocation, RecordSpan};
+use crate::{
+    DirectoryError, IndexBuildLimits, IndexedReadError, OffsetIndexEntry, OperationLocation,
+    RecordSpan,
+};
 use ozzy_journal::ReadLimits;
 use ozzy_proto::Offset;
 use std::cell::RefCell;
@@ -170,17 +173,7 @@ impl Read {
                     Some(current) if current.0 == entry.location.operation => current,
                     _ => (
                         entry.location.operation,
-                        extent_reader(
-                            &self.scope.access,
-                            self.scope
-                                .root
-                                .join("segments")
-                                .join(source.reference.file_name()),
-                            source.index,
-                            self.scope.limits,
-                        )
-                        .load(entry)
-                        .await?,
+                        self.load_operation(source, entry).await?,
                     ),
                 };
                 loaded.insert(operation).1.select(entry)?
@@ -206,5 +199,23 @@ impl Read {
             }
         }
         Ok(next)
+    }
+
+    /// Read the operation holding `entry` from its cold source segment.
+    async fn load_operation(
+        &self,
+        source: Source,
+        entry: OffsetIndexEntry,
+    ) -> Result<crate::reader::CachedOperation, Error> {
+        let path = self
+            .scope
+            .root
+            .join("segments")
+            .join(source.reference.file_name());
+        Ok(
+            extent_reader(&self.scope.access, path, source.index, self.scope.limits)
+                .load(entry)
+                .await?,
+        )
     }
 }

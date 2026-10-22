@@ -238,7 +238,7 @@ impl State {
                 let status = self.actors.status(group)?;
                 let route = self.actors.route_state(group, partition)?;
                 let facts = self.actors.facts(group, partition);
-                Some(crate::admin::partition_status(
+                Some(crate::admin::status::partition_status(
                     group,
                     &status,
                     &route,

@@ -19,9 +19,15 @@ __all__ = [
     "__version__",
 ]
 
-class OzzyError(Exception): ...
-class ClosedError(OzzyError): ...
-class BusyError(OzzyError): ...
+class OzzyError(Exception):
+    """Rust SDK failure. An unknown write outcome must be resolved using record
+    identity."""
+
+class ClosedError(OzzyError):
+    """Operation on a closed handle."""
+
+class BusyError(OzzyError):
+    """Another asynchronous operation exclusively leases this handle."""
 
 @final
 class Config:
@@ -86,15 +92,27 @@ class Producer:
 
 @final
 class PendingRecord:
+    """Confirmation observer. Dropping it never cancels an admitted record."""
+
     @property
-    def topic_id(self) -> str: ...
+    def topic_id(self) -> str:
+        """Topic UUID, formatted on access."""
     @property
-    def partition(self) -> int: ...
+    def partition(self) -> int:
+        """Numeric destination partition selected before admission."""
     @property
-    def sequence(self) -> int: ...
-    def confirmed(self, timeout: float | None = None) -> Receipt: ...
-    def aconfirmed(self) -> Coroutine[Any, Any, Receipt]: ...
-    def try_confirmed(self) -> Receipt | None: ...
+    def sequence(self) -> int:
+        """Retry sequence within this producer and partition, independent of
+        batching."""
+    def confirmed(self, timeout: float | None = None) -> Receipt:
+        """Wait for a durable receipt, releasing the GIL while waiting.
+
+        Raises TimeoutError after timeout seconds; the record stays admitted.
+        """
+    def aconfirmed(self) -> Coroutine[Any, Any, Receipt]:
+        """Await a durable receipt. Cancellation cancels only this observation."""
+    def try_confirmed(self) -> Receipt | None:
+        """Return a receipt if ready, None if pending, or raise on failure."""
 
 @final
 class Consumer:
@@ -116,40 +134,71 @@ class Checkpoint:
 
 @final
 class Record:
+    """Immutable delivered record with partition-global metadata and opaque payload.
+
+    Delivery advances the reader; it does not acknowledge application processing.
+    Payload parts are copied once on delivery, so a retained record never holds
+    Rust receive-frame capacity.
+    """
+
     @property
-    def topic_id(self) -> str: ...
+    def topic_id(self) -> str:
+        """Topic UUID, formatted on access."""
     @property
-    def partition(self) -> int: ...
+    def partition(self) -> int:
+        """Numeric partition containing this record."""
     @property
-    def incarnation(self) -> str: ...
+    def incarnation(self) -> str:
+        """Partition incarnation UUID, formatted on access."""
     @property
-    def offset(self) -> int: ...
+    def offset(self) -> int:
+        """Partition-global record offset."""
     @property
-    def message_id(self) -> str: ...
+    def message_id(self) -> str:
+        """Application event UUID, formatted on access."""
     @property
-    def parts(self) -> tuple[bytes, ...]: ...
+    def parts(self) -> tuple[bytes, ...]:
+        """Tuple of payload bytes, copied once on delivery."""
 
 @final
 class Receipt:
+    """Immutable durable confirmation. UUID strings are formatted only on access.
+
+    Confirmation does not prove application processing.
+    """
+
     @property
-    def topic_id(self) -> str: ...
+    def topic_id(self) -> str:
+        """Topic UUID."""
     @property
-    def partition(self) -> int: ...
+    def partition(self) -> int:
+        """Numeric destination partition."""
     @property
-    def incarnation(self) -> str: ...
+    def incarnation(self) -> str:
+        """Partition incarnation UUID, fencing older histories."""
     @property
-    def offset(self) -> int: ...
+    def offset(self) -> int:
+        """Partition-global record offset."""
     @property
-    def message_id(self) -> str: ...
+    def message_id(self) -> str:
+        """Application event UUID used for record identity."""
     @property
-    def producer_id(self) -> str: ...
+    def producer_id(self) -> str:
+        """UUID of the producer that submitted this record."""
     @property
-    def producer_epoch(self) -> int: ...
+    def producer_epoch(self) -> int:
+        """Fencing epoch of the submitting producer."""
     @property
-    def owner_epoch(self) -> int: ...
+    def owner_epoch(self) -> int:
+        """Partition owner epoch that confirmed the record."""
     @property
-    def sequence(self) -> int: ...
+    def sequence(self) -> int:
+        """Retry sequence within this producer and partition, independent of
+        batching."""
     @property
-    def disposition(self) -> str: ...
+    def disposition(self) -> str:
+        """'stored' for a new event or 'duplicate' for an existing deduplicated
+        event."""
     @property
-    def policy(self) -> str: ...
+    def policy(self) -> str:
+        """Durability boundary: 'local_durable' or 'quorum_durable'."""

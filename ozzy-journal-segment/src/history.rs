@@ -1,6 +1,7 @@
 //! Frozen canonical history for replica selection and bounded transfer.
 
 pub(crate) mod asynchronous;
+mod load;
 mod validation;
 pub use validation::{StorageValidationBudget, StorageValidationStep};
 
@@ -11,7 +12,7 @@ use crate::codec::SegmentDigestBuilder;
 use crate::{
     CanonicalOperation, ChainPosition, CodecError, DecodeLimits, DecodedOperation, DirectoryError,
     ENTRY_HEADER_BYTES, GroupIdentity, LogPosition, OperationLimits, SealedSegment, SegmentHeader,
-    SegmentScan, TailState, decode_group, decode_indexed_operation, scan_segment,
+    decode_indexed_operation,
 };
 
 /// Metadata and deletion protection only. Loading bytes is deliberately absent.
@@ -59,27 +60,6 @@ struct IndexedOperation {
     bytes: usize,
     position: LogPosition,
     body_bytes: usize,
-}
-
-/// Index one decoded operation; the entry count stays within `limit`.
-fn push_indexed(
-    entries: &mut Vec<IndexedOperation>,
-    limit: usize,
-    operation: &DecodedOperation<'_>,
-) -> Result<(), HistoryError> {
-    if entries.len() == limit {
-        return Err(HistoryError::Capacity);
-    }
-    entries.push(IndexedOperation {
-        offset: usize::try_from(operation.entry_offset).map_err(|_| HistoryError::Capacity)?,
-        bytes: usize::try_from(operation.entry_bytes).map_err(|_| HistoryError::Capacity)?,
-        position: LogPosition {
-            op_number: operation.op_number,
-            digest: operation.digest,
-        },
-        body_bytes: operation.body.len(),
-    });
-    Ok(())
 }
 
 /// Consecutive whole operations borrowed from one verified source segment.
@@ -281,118 +261,24 @@ impl<S: Source> HistoryState<S> {
             .unwrap_or(self.active_seal)
     }
 
-    fn index_segment(
-        &self,
-        index: usize,
-        entries: &mut Vec<IndexedOperation>,
-    ) -> Result<LoadedSegment, HistoryError> {
-        let scan = self.checked_scan(index)?;
-        let mut digest = SegmentDigestBuilder::new(&scan.header);
-        for group in &scan.groups {
-            digest.push(group.digest);
-        }
-        for operation in scan.groups.iter().flat_map(|group| &group.operations) {
-            push_indexed(entries, self.entry_limit, operation)?;
-        }
-        Ok(LoadedSegment {
-            index,
-            header: scan.header,
-            valid_bytes: scan.valid_bytes,
-            next_group_number: scan.next_group_number,
-            next_chain: scan.next_chain,
-            digest,
-            groups: scan.groups.len(),
-            decoded_body_bytes: scan.decoded_body_bytes,
-        })
-    }
-
-    /// Extend a previously checked, immutable prefix from a newer captured
-    /// suffix. The old bytes and group digest state remain the trust anchor;
-    /// every new group still gets physical and canonical validation.
-    fn extend_loaded(&mut self, index: usize) -> Result<(), HistoryError> {
-        let mut loaded = self.loaded.take().ok_or(HistoryError::Source)?;
-        if loaded.index != index || loaded.valid_bytes as usize > self.bytes.len() {
-            return Err(HistoryError::Source);
-        }
-        let mut offset = loaded.valid_bytes as usize;
-        while offset < self.bytes.len() {
-            offset = self.extend_group(&mut loaded, offset)?;
-        }
-        let expected = self
-            .pin
+    /// Position the segment at `index` ends at: its successor's predecessor,
+    /// or the physical capture end for the last segment.
+    fn segment_end(&self, index: usize) -> LogPosition {
+        self.pin
             .references()
             .get(index + 1)
-            .map_or(self.physical_through, |next| before(next.first_chain));
-        if offset as u64 != self.seal(index).valid_bytes
-            || loaded.digest.finish() != self.seal(index).digest
-            || before(loaded.next_chain) != expected
-        {
-            return Err(HistoryError::Source);
-        }
-        loaded.valid_bytes = offset as u64;
-        self.loaded = Some(loaded);
-        Ok(())
+            .map_or(self.physical_through, |next| before(next.first_chain))
     }
 
-    /// Decode, check, and index the group at `offset`; return its end.
-    fn extend_group(
-        &mut self,
-        loaded: &mut LoadedSegment,
-        offset: usize,
-    ) -> Result<usize, HistoryError> {
-        if loaded.groups == self.decode.max_groups {
-            return Err(CodecError::LimitExceeded {
-                kind: "physical group count",
-                actual: loaded.groups + 1,
-                limit: self.decode.max_groups,
-            }
-            .into());
-        }
-        let group = decode_group(
-            &loaded.header,
-            crate::GroupStart::new(loaded.next_group_number, offset as u64, loaded.next_chain),
-            &self.bytes[offset..],
-            self.decode,
-        )?;
-        for operation in &group.operations {
-            self.admit_extended(loaded, operation)?;
-            push_indexed(&mut self.entries, self.entry_limit, operation)?;
-        }
-        let end = usize::try_from(group.end_offset).map_err(|_| HistoryError::Capacity)?;
-        loaded.next_group_number = loaded
-            .next_group_number
-            .checked_add(1)
-            .ok_or(CodecError::InvalidGroupNumber)?;
-        loaded.next_chain = group.next_chain;
-        loaded.digest.push(group.digest);
-        loaded.groups += 1;
-        Ok(end)
-    }
-
-    /// Admit one new operation: it must match the captured epoch and view and
-    /// carry a valid body. Its body is charged to the segment decoded-body limit.
-    fn admit_extended(
-        &self,
-        loaded: &mut LoadedSegment,
-        operation: &DecodedOperation<'_>,
-    ) -> Result<(), HistoryError> {
+    /// An operation must match the captured epoch and view and carry a valid
+    /// body.
+    fn check_operation(&self, operation: &DecodedOperation<'_>) -> Result<(), HistoryError> {
         if operation.configuration_epoch != self.configuration_epoch
             || operation.original_view > self.promised_view
         {
             return Err(HistoryError::Source);
         }
         validate_operation_body(operation.kind, operation.body.as_ref(), self.operations)?;
-        loaded.decoded_body_bytes = loaded
-            .decoded_body_bytes
-            .checked_add(operation.body.len())
-            .ok_or(HistoryError::Capacity)?;
-        if loaded.decoded_body_bytes > self.decode.max_segment_decoded_body_bytes {
-            return Err(CodecError::SegmentDecodedBodyLimit {
-                actual: loaded.decoded_body_bytes,
-                limit: self.decode.max_segment_decoded_body_bytes,
-            }
-            .into());
-        }
         Ok(())
     }
 
@@ -416,50 +302,11 @@ impl<S: Source> HistoryState<S> {
         if operation.op_number != entry.position.op_number
             || operation.digest != entry.position.digest
             || operation.body.len() != entry.body_bytes
-            || operation.configuration_epoch != self.configuration_epoch
-            || operation.original_view > self.promised_view
         {
             return Err(HistoryError::Source);
         }
-        validate_operation_body(operation.kind, operation.body.as_ref(), self.operations)?;
+        self.check_operation(&operation)?;
         Ok(operation)
-    }
-
-    fn checked_scan(&self, index: usize) -> Result<SegmentScan<'_>, HistoryError> {
-        #[cfg(test)]
-        self.full_scans.set(self.full_scans.get() + 1);
-        let reference = self.pin.references()[index];
-        let scan = scan_segment(
-            &self.bytes,
-            reference.first_group_number,
-            reference.first_chain,
-            self.decode,
-        )?;
-        let seal = self.seal(index);
-        let end = self
-            .pin
-            .references()
-            .get(index + 1)
-            .map_or(self.physical_through, |next| before(next.first_chain));
-        if scan.header.group_id() != self.identity.group_id
-            || scan.header.segment_id() != reference.segment_id
-            || scan.header.capacity() != reference.capacity
-            || scan.valid_bytes != seal.valid_bytes
-            || scan.digest != seal.digest
-            || before(scan.next_chain) != end
-            || scan.tail != TailState::Clean
-        {
-            return Err(HistoryError::Source);
-        }
-        for operation in scan.groups.iter().flat_map(|group| &group.operations) {
-            if operation.configuration_epoch != self.configuration_epoch
-                || operation.original_view > self.promised_view
-            {
-                return Err(HistoryError::Source);
-            }
-            validate_operation_body(operation.kind, operation.body.as_ref(), self.operations)?;
-        }
-        Ok(scan)
     }
 }
 

@@ -23,7 +23,9 @@ use std::{
 };
 use tokio::sync::watch;
 
+mod activation;
 mod requests;
+use activation::ActivationRetry;
 use requests::{assign, join};
 
 /// Placeholder authority; the request helper fills the selected leader's.
@@ -97,11 +99,6 @@ pub(super) struct Channels {
     pub(super) leave: CloseSignal,
     /// Signaled on every published change.
     pub(super) activity: Arc<StateSignal>,
-}
-
-struct ActivationRetry {
-    due: Duration,
-    backoff: Duration,
 }
 
 /// Spawn on the SDK owner. The reader publishes owned sources; this owner
@@ -255,18 +252,6 @@ impl Membership {
         ))
     }
 
-    /// When the earliest retry of a refused activation is due.
-    fn activation_due(&self) -> Option<Duration> {
-        self.activation_retries
-            .iter()
-            .filter(|(key, _)| !self.inflight.contains(key))
-            .filter(|((partition, revision), _)| {
-                find(&self.targets, *partition, *revision).is_some_and(|target| target.activatable)
-            })
-            .map(|(_, retry)| retry.due)
-            .min()
-    }
-
     fn complete_join(
         &mut self,
         result: Result<JoinReply, BrokerLinkError>,
@@ -412,114 +397,6 @@ impl Membership {
         self.activation_retries
             .retain(|&(partition, revision), _| current(partition, revision));
         Ok(false)
-    }
-
-    fn activate(&mut self, assigning: &mut FuturesUnordered<Assigning>, now: Duration) {
-        let Some(group) = self.group else {
-            return;
-        };
-        for target in &self.targets {
-            let key = (target.partition, target.plan_revision);
-            if !target.activatable
-                || self.inflight.contains(&key)
-                || self.skipped.contains(&key)
-                || self
-                    .activation_retries
-                    .get(&key)
-                    .is_some_and(|retry| now < retry.due)
-                || self
-                    .activations
-                    .get(&target.partition)
-                    .is_some_and(|activation| activation.plan_revision == target.plan_revision)
-            {
-                continue;
-            }
-            self.inflight.insert(key);
-            let request = group::AssignRequest {
-                authority: UNSELECTED,
-                partition: target.partition,
-                group,
-                member: Some(self.settings.member),
-                plan_revision: target.plan_revision,
-                initial: self.settings.initial,
-                policy: self.routes.metadata().policy(),
-            };
-            let routes = self.routes.clone();
-            let timeout = self.settings.retry.response_timeout;
-            let target = *target;
-            assigning.push(Box::pin(async move {
-                (
-                    target,
-                    assign(routes, target.number, request, timeout).await,
-                )
-            }));
-        }
-    }
-
-    fn assigned(
-        &mut self,
-        target: Target,
-        result: Result<group::AssignReply, BrokerLinkError>,
-        now: Duration,
-    ) -> Result<(), Failure> {
-        let key = (target.partition, target.plan_revision);
-        self.inflight.remove(&key);
-        if !self.targets.iter().any(|current| {
-            current.partition == target.partition && current.plan_revision == target.plan_revision
-        }) {
-            return Ok(());
-        }
-        match result {
-            Ok(reply) => {
-                self.activation_retries.remove(&key);
-                if reply.partition != target.partition
-                    || Some(reply.group) != self.group
-                    || reply.member != Some(self.settings.member)
-                    || reply.plan_revision != target.plan_revision
-                    || reply.policy != self.routes.metadata().policy()
-                    || reply.epoch == 0
-                    || reply.cursor > reply.end
-                    || reply.retained_from > reply.end
-                {
-                    return Err(Failure::Response);
-                }
-                self.activations.insert(
-                    target.partition,
-                    Activation {
-                        number: target.number,
-                        partition: target.partition,
-                        plan_revision: target.plan_revision,
-                        epoch: reply.epoch,
-                        cursor: reply.cursor,
-                        retained_from: reply.retained_from,
-                    },
-                );
-            }
-            // A newer plan already reached the source; the next reply moves on.
-            Err(BrokerLinkError::Progress(ProgressError::Fenced)) => {
-                self.activation_retries.remove(&key);
-                self.skipped.insert(key);
-            }
-            Err(BrokerLinkError::InitialPosition(position)) => {
-                return Err(Failure::InitialPosition {
-                    partition: target.number,
-                    position,
-                });
-            }
-            Err(error) => {
-                self.retry(target.number, error)?;
-                let retry = self
-                    .activation_retries
-                    .entry(key)
-                    .or_insert(ActivationRetry {
-                        due: now,
-                        backoff: self.settings.retry.initial_backoff,
-                    });
-                retry.due = now.saturating_add(retry.backoff);
-                retry.backoff = self.settings.retry.next_backoff(retry.backoff);
-            }
-        }
-        Ok(())
     }
 
     fn retry(&self, number: u32, error: BrokerLinkError) -> Result<(), Failure> {

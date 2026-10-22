@@ -7,8 +7,7 @@ use super::{
 use crate::replica_actor::HistoryReason;
 use crate::replica_actor::io::Completed;
 use crate::replica_actor::{Bytes, MAX_TRANSFER_OPERATIONS, wire};
-use crate::replica_journal::JournalError;
-use crate::replica_journal::ProposalValidation;
+use crate::replica_journal::{JournalError, ProposalValidation, ReceivedValidation};
 use ozzy_replication::wire::{Operation, Prepare, PrepareBatch};
 use ozzy_replication::{Admission, Commit, NormalReplica, ReplicationError};
 
@@ -73,34 +72,7 @@ impl ReplicaActor {
                     self.complete_proposal(proposal, now)?;
                 }
                 if let Some(validated) = turn.validated {
-                    match validated {
-                        crate::replica_journal::ReceivedValidation::Ready(validated) => {
-                            self.complete_received(validated, now)?;
-                        }
-                        crate::replica_journal::ReceivedValidation::Deferred {
-                            validation,
-                            buffer,
-                        } => {
-                            if self.validation_current(validation) {
-                                self.work.receive.defer(buffer);
-                            } else {
-                                self.recycle(buffer)?;
-                            }
-                        }
-                        crate::replica_journal::ReceivedValidation::Split {
-                            validation,
-                            buffer,
-                        } => {
-                            if self.validation_current(validation) {
-                                self.split_received(buffer)?;
-                            } else {
-                                self.recycle(buffer)?;
-                            }
-                        }
-                        crate::replica_journal::ReceivedValidation::Rejected(error) => {
-                            return Err(error.into());
-                        }
-                    }
+                    self.complete_validation(validated, now)?;
                 }
                 if let Some(ticket) = turn.applied {
                     self.complete_applied(ticket)?;
@@ -116,6 +88,32 @@ impl ReplicaActor {
             _ => return Err(JournalError::CompletionMismatch.into()),
         }
         Ok(())
+    }
+
+    /// Settle a follower's received-suffix validation. A suffix that waits or
+    /// splits stays only while its validation is current.
+    fn complete_validation(
+        &mut self,
+        validated: ReceivedValidation,
+        now: Duration,
+    ) -> Result<(), ActorError> {
+        match validated {
+            ReceivedValidation::Ready(validated) => self.complete_received(validated, now),
+            ReceivedValidation::Deferred { validation, buffer }
+                if self.validation_current(validation) =>
+            {
+                self.work.receive.defer(buffer);
+                Ok(())
+            }
+            ReceivedValidation::Split { validation, buffer }
+                if self.validation_current(validation) =>
+            {
+                self.split_received(buffer)
+            }
+            ReceivedValidation::Deferred { buffer, .. }
+            | ReceivedValidation::Split { buffer, .. } => self.recycle(buffer),
+            ReceivedValidation::Rejected(error) => Err(error.into()),
+        }
     }
 
     /// Whether a deferred validation still belongs to the current scope and

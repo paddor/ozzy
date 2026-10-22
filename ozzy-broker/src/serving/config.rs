@@ -1,6 +1,7 @@
+mod routes;
+
 use super::{Binding, Registration, failure};
 use crate::{CheckedConfig, StartupError, TransportLimits};
-use omq_tokio::Endpoint;
 use ozzy_proto::{NodeId, data::DataLimits, directory::EndpointScheme, handshake};
 use ozzy_runtime::{
     dispatch::{Budget, Budgets},
@@ -9,6 +10,7 @@ use ozzy_runtime::{
     },
     replica_transport::QueueLimits,
 };
+use routes::{follower_routes, peer_endpoints, require_follower_pub_endpoints};
 use std::{collections::BTreeMap, time::Duration};
 
 pub(super) const WRITERS: usize = 32;
@@ -335,23 +337,6 @@ fn transport_limits(body: usize, peers: usize) -> Result<TransportLimits, Startu
     })
 }
 
-/// Replicated brokers each need an explicit follower PUB endpoint.
-fn require_follower_pub_endpoints(checked: &CheckedConfig) -> Result<(), StartupError> {
-    if checked.identity.brokers.len() == 3
-        && checked
-            .deployment
-            .deployment()
-            .brokers
-            .values()
-            .any(|broker| broker.endpoints.follower_pub.is_none())
-    {
-        return Err(failure(
-            "replicated brokers require explicit follower PUB endpoints",
-        ));
-    }
-    Ok(())
-}
-
 /// Receive backing for the local PEER endpoint scheme.
 fn receive_storage(
     checked: &CheckedConfig,
@@ -366,31 +351,6 @@ fn receive_storage(
         Some((scheme, _)) if scheme.compressed() => compressed_storage(message_bytes),
         _ => Ok(ReceiveStorage::Stream { message_bytes }),
     }
-}
-
-/// Control endpoint of every other configured broker.
-fn peer_endpoints(
-    checked: &CheckedConfig,
-    local: NodeId,
-) -> Result<BTreeMap<NodeId, Endpoint>, StartupError> {
-    let deployment = checked.deployment.deployment();
-    checked
-        .identity
-        .brokers
-        .iter()
-        .filter(|(_, id)| NodeId::from_bytes(*id.as_bytes()) != local)
-        .map(|(name, id)| {
-            Ok((
-                NodeId::from_bytes(*id.as_bytes()),
-                deployment
-                    .broker(name)?
-                    .endpoints
-                    .peer
-                    .parse()
-                    .map_err(failure)?,
-            ))
-        })
-        .collect()
 }
 
 /// Data and control admission budgets of each local shard.
@@ -415,71 +375,6 @@ fn shard_budgets(checked: &CheckedConfig) -> BTreeMap<u32, Budgets> {
             (shard.id, budget)
         })
         .collect()
-}
-
-fn follower_routes(
-    checked: &CheckedConfig,
-    local: NodeId,
-    brokers: &BTreeMap<NodeId, Endpoint>,
-) -> Result<crate::FollowerRoutes, StartupError> {
-    let deployment = checked.deployment.deployment();
-    let mut followers = crate::FollowerRoutes::default();
-    for placement in &checked.plan.partitions {
-        let partition = checked
-            .identity
-            .partition(&placement.topic, placement.partition)?;
-        followers.local.insert(
-            ozzy_proto::GroupId::from_bytes(*partition.group.as_bytes()),
-            placement.shard,
-        );
-    }
-    for (name, id) in &checked.identity.brokers {
-        let broker = NodeId::from_bytes(*id.as_bytes());
-        if broker != local {
-            followers.repairs.insert(
-                broker,
-                deployment
-                    .broker(name)?
-                    .endpoints
-                    .data_peer
-                    .parse()
-                    .map_err(failure)?,
-            );
-        }
-        if broker == local {
-            continue;
-        }
-        if let Some(endpoint) = &deployment.broker(name)?.endpoints.follower_pub {
-            followers
-                .publications
-                .insert(broker, endpoint.parse().map_err(failure)?);
-        }
-        for placement in checked.deployment.partition_placements(name)? {
-            let partition = checked
-                .identity
-                .partition(&placement.topic, placement.partition)?;
-            followers.destinations.insert(
-                (
-                    broker,
-                    ozzy_proto::GroupId::from_bytes(*partition.group.as_bytes()),
-                ),
-                placement.shard,
-            );
-        }
-        for shard in &checked.plan.shards {
-            let alias = crate::FollowerRoutes::identity(broker, local, shard.id);
-            if alias == local
-                || brokers.contains_key(&alias)
-                || followers
-                    .incoming
-                    .insert(alias, (broker, shard.id))
-                    .is_some()
-            {
-                return Err(failure("repair identity collision"));
-            }
-        }
-    }
-    Ok(followers)
 }
 
 fn install_data_lanes(

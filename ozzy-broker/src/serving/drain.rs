@@ -82,36 +82,38 @@ impl Drain {
     pub(super) fn request(self: &Arc<Self>) {
         self.frontend.stop.close();
         self.application.stop.close();
-        if !self.started.swap(true, Ordering::AcqRel) {
-            let drain = self.clone();
-            let spawned = std::thread::Builder::new()
-                .name("ozzy/drain".into())
-                .spawn(move || {
-                    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                        futures::executor::block_on(async {
-                            futures::future::join(
-                                drain.application.finished.closed(),
-                                drain.frontend.finished.closed(),
-                            )
-                            .await;
-                        });
-                        // Each owner reported completion as its last action.
-                        // Completion here means its threads have exited.
-                        drain.application.join();
-                        drain.frontend.join();
-                        drain.admin.join();
-                        drain.pools.drain();
-                    }));
-                    if result.is_err() {
-                        let _ = drain.error.set("broker drain worker panicked".into());
-                    }
-                    drain.finished.close();
-                });
-            if let Err(error) = spawned {
-                let _ = self.error.set(format!("broker drain worker: {error}"));
-                self.finished.close();
-            }
+        if self.started.swap(true, Ordering::AcqRel) {
+            return;
         }
+        let drain = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("ozzy/drain".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(AssertUnwindSafe(|| drain.drain_owners()));
+                if result.is_err() {
+                    let _ = drain.error.set("broker drain worker panicked".into());
+                }
+                drain.finished.close();
+            });
+        if let Err(error) = spawned {
+            let _ = self.error.set(format!("broker drain worker: {error}"));
+            self.finished.close();
+        }
+    }
+
+    /// Wait until both owners finish, then join their threads and drain the
+    /// devices.
+    fn drain_owners(&self) {
+        futures::executor::block_on(futures::future::join(
+            self.application.finished.closed(),
+            self.frontend.finished.closed(),
+        ));
+        // Each owner reported completion as its last action.
+        // Completion here means its threads have exited.
+        self.application.join();
+        self.frontend.join();
+        self.admin.join();
+        self.pools.drain();
     }
 
     pub(super) async fn closed(&self) -> Result<(), StartupError> {

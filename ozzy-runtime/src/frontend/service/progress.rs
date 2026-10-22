@@ -1,3 +1,5 @@
+//! Bounded transport progress: handshakes, replies, and send-progress waits.
+
 use futures::{StreamExt, stream::FuturesUnordered};
 use omq_tokio::{IdentitySocket, Message, TrySendError};
 use ozzy_proto::NodeId;
@@ -9,8 +11,11 @@ use std::{
     time::Duration,
 };
 
-use super::Service;
+use super::{Service, route_peer};
+use crate::dispatch::Class;
+use crate::frontend::ReplyError;
 use crate::replica_transport::SendAttempt;
+use crate::transport::Frames;
 
 pub(in crate::frontend) type Wait = Pin<Box<dyn Future<Output = ()>>>;
 
@@ -150,23 +155,24 @@ impl Service {
         let mut created = false;
         for (peer, class, probe) in self.dispatcher.blocked() {
             // Replies held for the handshake wait for it, not for OMQ space.
-            if !self.peers[&peer].awaiting_welcome && !waits.contains_key(&(peer, class)) {
-                let progress = wait(probe.clone());
-                // A delayed wait polls OMQ only after the timer; its first
-                // poll is a state check, so no registration retry is needed.
-                let entry = match delays.get(&(peer, class)) {
-                    Some(&delay) => (
-                        Box::pin(async move {
-                            tokio::time::sleep(delay).await;
-                            progress.await;
-                        }) as Wait,
-                        true,
-                    ),
-                    None => (progress, false),
-                };
-                waits.insert((peer, class), entry);
-                created = true;
+            if self.peers[&peer].awaiting_welcome || waits.contains_key(&(peer, class)) {
+                continue;
             }
+            let progress = wait(probe.clone());
+            // A delayed wait polls OMQ only after the timer; its first poll
+            // is a state check, so no registration retry is needed.
+            let entry = match delays.get(&(peer, class)) {
+                Some(&delay) => (
+                    Box::pin(async move {
+                        tokio::time::sleep(delay).await;
+                        progress.await;
+                    }) as Wait,
+                    true,
+                ),
+                None => (progress, false),
+            };
+            waits.insert((peer, class), entry);
+            created = true;
         }
         created
     }
@@ -199,12 +205,12 @@ impl Service {
             match dispatcher.flush_peer_class(peer, class, &mut *send) {
                 Ok(SendAttempt::Blocked) => {
                     if woke {
-                        let delay = delays
-                            .get(&(peer, class))
-                            .map_or(WASTED_WAKE_DELAY, |delay| {
-                                delay.saturating_mul(2).min(MAX_WASTED_WAKE_DELAY)
-                            });
-                        delays.insert((peer, class), delay);
+                        delays
+                            .entry((peer, class))
+                            .and_modify(|delay| {
+                                *delay = delay.saturating_mul(2).min(MAX_WASTED_WAKE_DELAY);
+                            })
+                            .or_insert(WASTED_WAKE_DELAY);
                     }
                     !woke
                 }
@@ -234,5 +240,98 @@ impl Service {
             }
         }
         probes
+    }
+
+    /// Nonblocking per-peer reply admission under negotiated directional limits.
+    pub fn try_reply(
+        &mut self,
+        class: Class,
+        message: Message,
+    ) -> Result<(), (ReplyError, Message)> {
+        if let Err(error) = self.check_reply(&message) {
+            return Err((error, message));
+        }
+        self.dispatcher.try_reply(class, message)
+    }
+
+    fn check_reply(&self, message: &Message) -> Result<(), ReplyError> {
+        if message.len() == 2 {
+            return Ok(());
+        }
+        let (route, [_, metadata, payload]) = message.routed_packet().ok_or(ReplyError::Frames)?;
+        let peer = NodeId::from_bytes(route.try_into().map_err(|_| ReplyError::Peer)?);
+        let limits = self.links.get(peer).ok_or(ReplyError::Peer)?.send.envelope;
+        if metadata.len() > limits.max_metadata_bytes || payload.len() > limits.max_payload_bytes {
+            return Err(ReplyError::Size);
+        }
+        Ok(())
+    }
+
+    /// Whether any handshake or established-link reply still needs transport.
+    pub fn has_pending(&self) -> bool {
+        self.dispatcher.has_replies() || self.peers.values().any(|peer| peer.handshake.is_some())
+    }
+
+    /// At most one handshake and one peer's two reply classes per turn. Full
+    /// destinations retain their owners and never block another destination.
+    pub fn flush(
+        &mut self,
+        mut send: impl FnMut(Message) -> Result<(), TrySendError>,
+    ) -> Result<bool, omq_tokio::Error> {
+        let mut advanced = false;
+        for handshake in [self.handshake_first, !self.handshake_first] {
+            let progress = if handshake {
+                self.flush_handshake(&mut send)?
+            } else {
+                let peers = &self.peers;
+                let progress = self.dispatcher.flush_replies(|message| {
+                    let awaiting = route_peer(&message)
+                        .and_then(|peer| peers.get(&peer))
+                        .is_some_and(|state| state.awaiting_welcome);
+                    if awaiting {
+                        Err(TrySendError::Full(message))
+                    } else {
+                        send(message)
+                    }
+                })?;
+                [progress.control, progress.data]
+                    .into_iter()
+                    .any(|attempt| {
+                        matches!(attempt, SendAttempt::Submitted | SendAttempt::Unroutable)
+                    })
+            };
+            if progress {
+                self.handshake_first = !handshake;
+                advanced = true;
+            }
+        }
+        Ok(advanced)
+    }
+
+    fn flush_handshake(
+        &mut self,
+        send: &mut impl FnMut(Message) -> Result<(), TrySendError>,
+    ) -> Result<bool, omq_tokio::Error> {
+        let mut advanced = false;
+        if let Some((next, state)) = crate::turn::after_mut(&mut self.peers, self.handshake_turn) {
+            self.handshake_turn = Some(next);
+            if let Some(message) = state.handshake.take() {
+                match send(message) {
+                    Ok(()) => {
+                        state.awaiting_welcome = false;
+                        // Replies refused while the handshake was unsent were
+                        // not refused by OMQ.
+                        self.dispatcher.unblock(next, 0);
+                        self.dispatcher.unblock(next, 1);
+                        advanced = true;
+                    }
+                    Err(TrySendError::Error(omq_tokio::Error::Unroutable)) => advanced = true,
+                    Err(TrySendError::Full(message)) => state.handshake = Some(message),
+                    Err(TrySendError::Closed) => return Err(omq_tokio::Error::Closed),
+                    Err(TrySendError::Error(error)) => return Err(error),
+                }
+            }
+        }
+        Ok(advanced)
     }
 }
