@@ -45,7 +45,7 @@ impl ReplicaActor {
             return Ok(());
         }
         if let Some(ticket) = self.driver.installation_ticket() {
-            return self.schedule_installation(ticket);
+            return self.schedule_installation(&ticket);
         }
         if self.schedule_pin()? {
             return Ok(());
@@ -126,7 +126,7 @@ impl ReplicaActor {
 
     fn schedule_installation(
         &mut self,
-        ticket: ozzy_replication::InstallTicket,
+        ticket: &ozzy_replication::InstallTicket,
     ) -> Result<(), ActorError> {
         let Some(staged) = self.staged else {
             return Ok(());
@@ -135,10 +135,13 @@ impl ReplicaActor {
             // No disk command remains, and publication has not been submitted.
             // Stop fetching the abandoned source; retain old durable promises.
             self.transfer = None;
-            self.pending = Some(PendingIo::Abort(self.journal.abort_installation(ticket)?));
+            self.pending = Some(PendingIo::Abort(self.journal.abort_installation(*ticket)?));
         } else if staged == ticket.accepted() {
-            self.pending = Some(PendingIo::Finish(self.journal.finish_installation(ticket)?));
-        } else if self.transfer.is_none() {
+            self.pending = Some(PendingIo::Finish(
+                self.journal.finish_installation(*ticket)?,
+            ));
+        } else if self.transfer.is_none() && !self.schedule_bridge()? {
+            // A bridge proves a retired staging start first.
             let source = self
                 .lookup
                 .compatible_local(ticket.source(), self.pinned, staged)
@@ -308,11 +311,12 @@ impl ReplicaActor {
             Completed::Fetch(fetched, FetchPurpose::Install) => {
                 self.complete_install_fetch(fetched)?;
             }
-            Completed::Begin(ticket) => self.staged = Some(ticket.protected_committed()),
+            Completed::Begin(ticket) => self.staged = Some(ticket.retained()),
             Completed::Chunk(chunk) => {
                 if !chunk.prepared().is_empty() {
                     self.driver.validate_install_suffix(chunk.prepared())?;
                 }
+                self.driver.history_progress(now)?;
                 self.staged = Some(chunk.end());
                 self.recycle(chunk.into_buffer())?;
             }

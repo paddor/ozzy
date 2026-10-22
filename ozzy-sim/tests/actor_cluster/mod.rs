@@ -27,7 +27,7 @@ mod workload;
 use broker::{MAX_SEGMENTS, SEGMENT_BYTES};
 use network::Profile;
 use sim::{
-    Fault::{self, IsolateLeader},
+    Fault::{self, CrashAll, CrashFollower, CrashLeader, IsolateFollower, IsolateLeader},
     Options, Report,
 };
 
@@ -136,6 +136,53 @@ fn scenario(name: &str) -> Option<Scenario> {
             sparse: &[1, 2],
             max_floor: 20,
             min_applied: 120,
+            ..RANDOM
+        },
+        // A sparse follower misses about 1300 operations, then rejoins just
+        // as the leader is lost. The new view must fetch and install them in
+        // 8-operation transfers, longer than any election timeout, and the
+        // install passes the 24-segment limit unless it packs.
+        "sparse-rejoin" => Scenario {
+            ticks: 5100,
+            script: &[
+                IsolateFollower {
+                    at: 600,
+                    ticks: 1500,
+                },
+                IsolateLeader {
+                    at: 2100,
+                    ticks: 3000,
+                },
+            ],
+            batch: 4,
+            max_segments: 24,
+            segment_bytes: 32 * 1024,
+            sparse: &[1],
+            max_floor: 20,
+            ..RANDOM
+        },
+        // A follower loses power and restarts over what reached its disk,
+        // then the leader does. Each comes back with an empty in-memory
+        // state and must rejoin; the lost leader's peers elect without it.
+        "crash" => Scenario {
+            ticks: 3500,
+            script: &[
+                CrashFollower {
+                    at: 500,
+                    ticks: 300,
+                },
+                CrashLeader {
+                    at: 1300,
+                    ticks: 1500,
+                },
+            ],
+            ..RANDOM
+        },
+        // Every broker loses power at once, mid-traffic, and restarts over
+        // what reached its disk. Each committed operation must survive.
+        "power-loss" => Scenario {
+            ticks: 3000,
+            script: &[CrashAll { at: 1500 }],
             ..RANDOM
         },
         _ => return None,
@@ -281,6 +328,36 @@ fn sparse_followers_pack_instead_of_filling() {
     checked(1, "none", "sparse-followers");
 }
 
+/// A follower that missed a long history catches up within one view
+/// change, packing at the segment limit, while the old leader is away.
+#[test]
+fn lagging_sparse_follower_installs_a_long_suffix_at_the_limit() {
+    // The catch-up outlasts the 8 s longest election timeout, yet ends in
+    // the first view after the old one.
+    assert_eq!(checked(1, "none", "sparse-rejoin").view, 1);
+}
+
+/// A follower, then the leader, lose power and restart over their durable
+/// disks. Each rejoins without losing a confirmed operation.
+#[test]
+fn crashed_brokers_restart_and_rejoin() {
+    checked(1, "none", "crash");
+}
+
+/// All three brokers lose power at once and elect again over their durable
+/// disks without losing a committed operation.
+#[test]
+fn whole_cluster_power_loss_keeps_every_commit() {
+    let report = checked(1, "none", "power-loss");
+    // Rolls publish the applied commit, and an installation replays only
+    // after the state a restart recovered. Refetching or replaying all
+    // history takes twice as long.
+    assert!(
+        report.outage.is_some_and(|ticks| ticks <= 300),
+        "{report:?}"
+    );
+}
+
 /// Seeds that found bugs. Schedules move with the code, so each names what
 /// it found.
 #[test]
@@ -288,6 +365,9 @@ fn regression_seeds() {
     // A retention turn deferred to a waiting proposal ended the round, and
     // nothing started the next one: the safety sweep found the proposal.
     checked(5, "swarm", "random");
+    // A follower refused a proposal it still held, after a due retention
+    // turn had deferred to it. Nothing asked for the next round.
+    checked(74, "slow", "crash");
 }
 
 /// Process-wide state would leak from one run into the next one.
@@ -304,15 +384,19 @@ fn same_seed_replays_in_one_process() {
 mod seeded {
     mod stress {
         use super::super::{checked, outcome, reproduce};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
         const PROFILES: [&str; 5] = ["none", "light", "heavy", "swarm", "slow"];
         /// Each scenario with its profiles. Heavy and swarm faults leave too
         /// little progress to fill a journal.
-        const SCENARIOS: [(&str, &[&str]); 4] = [
+        const SCENARIOS: [(&str, &[&str]); 7] = [
             ("random", &PROFILES),
             ("failover", &PROFILES),
             ("full", &["none", "light", "slow"]),
             ("sparse-followers", &["none", "light", "slow"]),
+            ("sparse-rejoin", &["none", "light", "slow"]),
+            ("crash", &PROFILES),
+            ("power-loss", &PROFILES),
         ];
 
         /// About 4800 operations in 75 segments before the leader is lost. A
@@ -324,8 +408,10 @@ mod seeded {
 
         /// `OZZY_ACTOR_SIM_SEEDS` seeds (default 100) over every scenario and
         /// its profiles, or `OZZY_ACTOR_SIM_SEED`. `OZZY_ACTOR_SIM_PROFILE` and
-        /// `OZZY_ACTOR_SIM_SCENARIO` pick one of each. Any failure fails at once;
-        /// vacuous runs fail only above one in twenty.
+        /// `OZZY_ACTOR_SIM_SCENARIO` pick one of each. Runs share nothing, so
+        /// they spread over `OZZY_ACTOR_SIM_THREADS` threads (default: one per
+        /// core). Any failure stops the campaign; vacuous runs fail only above
+        /// one in twenty.
         #[test]
         fn campaign() {
             let scenarios: Vec<(String, &[&str])> = std::env::var("OZZY_ACTOR_SIM_SCENARIO")
@@ -345,6 +431,7 @@ mod seeded {
                     },
                 );
             let profile = std::env::var("OZZY_ACTOR_SIM_PROFILE").ok();
+            let profile = profile.as_deref();
             let seeds: Vec<u64> = if let Ok(seed) = std::env::var("OZZY_ACTOR_SIM_SEED") {
                 vec![seed.parse().expect("OZZY_ACTOR_SIM_SEED")]
             } else {
@@ -352,33 +439,75 @@ mod seeded {
                     .map_or(100, |count| count.parse().expect("OZZY_ACTOR_SIM_SEEDS"));
                 (1..=count).collect()
             };
-            let mut runs = 0;
-            let mut vacuous = Vec::new();
-            for seed in seeds {
-                for (scenario, profiles) in &scenarios {
-                    let profiles = profile
-                        .as_deref()
-                        .map_or(profiles.to_vec(), |one| vec![one]);
-                    for profile in profiles {
-                        runs += 1;
-                        let report = outcome(seed, profile, scenario);
-                        if report.vacuous {
-                            eprintln!(
-                                "vacuous: {report:?}\n  {}",
-                                reproduce(seed, profile, scenario)
-                            );
-                            vacuous.push((seed, profile, scenario.clone()));
-                        }
+            let threads = std::env::var("OZZY_ACTOR_SIM_THREADS").map_or_else(
+                |_| std::thread::available_parallelism().map_or(1, usize::from),
+                |threads| threads.parse().expect("OZZY_ACTOR_SIM_THREADS"),
+            );
+            let runs: Vec<(u64, &str, &str)> = seeds
+                .iter()
+                .flat_map(|seed| {
+                    scenarios.iter().flat_map(move |(scenario, profiles)| {
+                        profile
+                            .map_or(profiles.to_vec(), |one| vec![one])
+                            .into_iter()
+                            .map(move |profile| (*seed, profile, scenario.as_str()))
+                    })
+                })
+                .collect();
+            let next = AtomicUsize::new(0);
+            let failed = AtomicBool::new(false);
+            let run = || {
+                let _stop = StopOnPanic(&failed);
+                let mut vacuous = Vec::new();
+                while !failed.load(Ordering::Relaxed) {
+                    let Some(&(seed, profile, scenario)) =
+                        runs.get(next.fetch_add(1, Ordering::Relaxed))
+                    else {
+                        break;
+                    };
+                    let report = outcome(seed, profile, scenario);
+                    if report.vacuous {
+                        eprintln!(
+                            "vacuous: {report:?}\n  {}",
+                            reproduce(seed, profile, scenario)
+                        );
+                        vacuous.push((seed, profile, scenario));
                     }
                 }
+                vacuous
+            };
+            let workers: Vec<_> = std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..threads).map(|_| scope.spawn(run)).collect();
+                workers
+                    .into_iter()
+                    .map(std::thread::ScopedJoinHandle::join)
+                    .collect()
+            });
+            let mut vacuous = Vec::new();
+            for worker in workers {
+                // Each failure printed its own reproduction as it panicked.
+                vacuous.extend(worker.unwrap_or_else(|panic| std::panic::resume_unwind(panic)));
             }
+            vacuous.sort_unstable();
             // Faults can leave a run with too little progress to prove much;
             // more than one in twenty means progress itself regressed.
             assert!(
-                vacuous.len() * 20 <= runs,
-                "{} of {runs} runs were vacuous: {vacuous:?}",
-                vacuous.len()
+                vacuous.len() * 20 <= runs.len(),
+                "{} of {} runs were vacuous: {vacuous:?}",
+                vacuous.len(),
+                runs.len()
             );
+        }
+
+        /// Stops the other campaign threads once one fails.
+        struct StopOnPanic<'a>(&'a AtomicBool);
+
+        impl Drop for StopOnPanic<'_> {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    self.0.store(true, Ordering::Relaxed);
+                }
+            }
         }
     }
 }

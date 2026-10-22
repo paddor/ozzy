@@ -38,6 +38,9 @@ pub struct PackLimits {
     /// Largest physical group, at most [`PACK_CHUNK_BYTES`]. It must fit
     /// what one segment write may submit.
     pub max_group_bytes: usize,
+    /// Largest read past the next source group, at most
+    /// [`PACK_CHUNK_BYTES`].
+    pub read_ahead_bytes: usize,
     /// File generations tried past leftovers of earlier attempts.
     pub max_probes: usize,
 }
@@ -134,7 +137,7 @@ impl Journal {
     /// layout, or else a floor. Packing never shrinks entries, and removes
     /// at most each group's padding and seal.
     fn pack_estimate(&self, reference: &SegmentReference, successor: &SegmentReference) -> u64 {
-        if let Some(layout) = self.pack_layouts.borrow().get(&layout_key(reference)) {
+        if let Some(layout) = self.known_layout(reference) {
             return layout.bytes;
         }
         let Some(sealed) = reference.sealed else {
@@ -160,14 +163,31 @@ impl Journal {
     /// segment and frees at least what it rewrites. Reads no files.
     pub fn prepare_pack(&self, limits: PackLimits) -> Result<Option<PackJob>, DirectoryError> {
         self.healthy()?;
-        if limits.max_group_bytes < WRITE_GROUP_ALIGNMENT || limits.max_probes == 0 {
-            return Err(DirectoryError::PackLimits);
-        }
         let segments = &self.manifest.segments;
         let capacity = segments
             .last()
             .ok_or(DirectoryError::MissingActiveSegment)?
             .capacity;
+        let generation = self.writer.written_position().generation();
+        self.pack_job(segments, limits, generation, capacity)
+    }
+
+    /// Capture the best sealed run of `segments`, which end with an active
+    /// one, as `prepare_pack` does. They may hold staged segments a suffix
+    /// installation has not selected yet.
+    pub(super) fn pack_job(
+        &self,
+        segments: &[SegmentReference],
+        limits: PackLimits,
+        generation: JournalGeneration,
+        capacity: u64,
+    ) -> Result<Option<PackJob>, DirectoryError> {
+        if limits.max_group_bytes < WRITE_GROUP_ALIGNMENT
+            || limits.read_ahead_bytes > PACK_CHUNK_BYTES
+            || limits.max_probes == 0
+        {
+            return Err(DirectoryError::PackLimits);
+        }
         let estimates: Vec<u64> = segments
             .windows(2)
             .map(|pair| self.pack_estimate(&pair[0], &pair[1]))
@@ -178,15 +198,11 @@ impl Journal {
         let mut scopes = Vec::with_capacity(run.len());
         let mut leases = Vec::with_capacity(run.len());
         let mut known = Vec::with_capacity(run.len());
-        for reference in &segments[run.clone()] {
-            scopes.push(self.group_scope(*reference)?);
+        for index in run.clone() {
+            let reference = segments[index];
+            scopes.push(self.sealed_scope(reference, &segments[index + 1])?);
             leases.push(self.pins.protect_prepared_segment(reference.segment_id)?);
-            known.push(
-                self.pack_layouts
-                    .borrow()
-                    .get(&layout_key(reference))
-                    .copied(),
-            );
+            known.push(self.known_layout(&reference));
         }
         Ok(Some(PackJob {
             scopes,
@@ -198,7 +214,7 @@ impl Journal {
                 options: self.limits.io,
                 decode: self.limits.decode,
                 group_id: self.manifest.identity.group_id,
-                generation: self.writer.written_position().generation(),
+                generation,
                 capacity,
                 limits,
             },
@@ -206,12 +222,24 @@ impl Journal {
         }))
     }
 
+    /// A selected segment's measured layout. Staged segments reuse IDs of
+    /// files an aborted attempt removed, so only selected ones count.
+    fn known_layout(&self, reference: &SegmentReference) -> Option<Layout> {
+        if !self.manifest.segments.contains(reference) {
+            return None;
+        }
+        self.pack_layouts
+            .borrow()
+            .get(&layout_key(reference))
+            .copied()
+    }
+
     /// Memory one pack job holds: its read-ahead window past one source
     /// group, the open packed group's bodies, and that group's encoding.
     pub fn pack_scratch_bytes(&self, limits: PackLimits) -> Result<usize, DirectoryError> {
         let group = limits.max_group_bytes.min(PACK_CHUNK_BYTES);
         self.group_scan_bytes()?
-            .checked_add(PACK_CHUNK_BYTES)
+            .checked_add(limits.read_ahead_bytes.min(PACK_CHUNK_BYTES))
             .and_then(|bytes| bytes.checked_add(group.checked_mul(2)?))
             .ok_or(DirectoryError::PackLimits)
     }
@@ -456,7 +484,7 @@ impl PackJob {
             let layout = if let Some(layout) = known {
                 *layout
             } else {
-                let layout = measure(scope.clone(), self.target.grouping()).await?;
+                let layout = measure(scope.clone(), &self.target).await?;
                 measured.push((scope.reference(), layout));
                 layout
             };
@@ -492,8 +520,11 @@ impl PackJob {
 }
 
 /// Read one sealed segment and size its operations in packed groups.
-async fn measure(scope: GroupScope, mut grouping: Grouping) -> Result<Layout, DirectoryError> {
-    let mut groups = scope.open_reading_ahead(None, PACK_CHUNK_BYTES).await?;
+async fn measure(scope: GroupScope, target: &Target) -> Result<Layout, DirectoryError> {
+    let mut grouping = target.grouping();
+    let mut groups = scope
+        .open_reading_ahead(None, target.limits.read_ahead_bytes)
+        .await?;
     let mut layout = Layout {
         groups: 0,
         bytes: 0,
@@ -605,7 +636,7 @@ async fn write(
     let groups = sources
         .next()
         .ok_or(mismatch)?
-        .open_reading_ahead(None, PACK_CHUNK_BYTES)
+        .open_reading_ahead(None, target.limits.read_ahead_bytes)
         .await?;
     let source = groups.header();
     let header = SegmentHeader::new(
@@ -667,7 +698,9 @@ async fn copy(
         let Some(scope) = sources.next() else {
             break;
         };
-        groups = scope.open_reading_ahead(None, PACK_CHUNK_BYTES).await?;
+        groups = scope
+            .open_reading_ahead(None, target.limits.read_ahead_bytes)
+            .await?;
     }
     Ok(pending.flush(writer, target).await?)
 }

@@ -26,9 +26,9 @@ use ozzy_proto::NodeId;
 
 use crate::wire::Control;
 use crate::{
-    Configuration, Digest, InstallingView, LogSource, NormalReplica, Prefix, PromiseTicket,
-    ReplicaSnapshot, ReplicationError, Scope, SelectedView, Status, ViewChange, ViewChangeError,
-    VoterIndex, VoterSet, Voters,
+    Configuration, Digest, InstallingView, LogSource, NormalReplica, OpNumber, Prefix,
+    PromiseTicket, ReplicaSnapshot, ReplicationError, Scope, SelectedView, Status, ViewChange,
+    ViewChangeError, VoterIndex, VoterSet, Voters,
 };
 
 /// Independent heartbeat, progress, and election retry intervals.
@@ -255,6 +255,15 @@ impl ReplicaDriver {
         match &self.role {
             Role::ViewChanging(changing) => changing.history_sources(),
             Role::Normal(_) | Role::Installing(_) | Role::Fenced(_) => [None; 3],
+        }
+    }
+
+    /// Operations whose prefixes this election may look up in its chosen
+    /// source. One lookup scan can verify each one it passes.
+    pub fn lookup_ops(&self) -> [Option<OpNumber>; 8] {
+        match &self.role {
+            Role::ViewChanging(changing) => changing.lookup_ops(),
+            Role::Normal(_) | Role::Installing(_) | Role::Fenced(_) => [None; 8],
         }
     }
 

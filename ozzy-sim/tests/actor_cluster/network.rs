@@ -310,6 +310,25 @@ impl Network {
         self.stats.partitions += 1;
     }
 
+    /// `broker` lost power: frames on its links are gone with them. It
+    /// stays cut off until `rejoin`.
+    pub(crate) fn crash(&mut self, broker: usize) {
+        for from in 0..BROKERS {
+            for to in (0..BROKERS).filter(|to| *to != from && (from == broker || *to == broker)) {
+                for class in CLASSES {
+                    self.paths[index(from, to, class)].queue.clear();
+                }
+            }
+            // Senders refused on a cleared path may send again.
+            if let Some(waker) = self.refused[from].take()
+                && from != broker
+            {
+                waker.wake();
+            }
+        }
+        self.isolate(broker);
+    }
+
     pub(crate) fn rejoin(&mut self) {
         self.blocked = [[false; BROKERS]; BROKERS];
         self.isolated = None;

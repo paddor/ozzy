@@ -3,6 +3,7 @@ use crate::{PackLimits, SEGMENT_HEADER_BYTES, WRITE_GROUP_ALIGNMENT};
 
 const PACK: PackLimits = PackLimits {
     max_group_bytes: 8192,
+    read_ahead_bytes: crate::PACK_CHUNK_BYTES,
     max_probes: 4,
 };
 

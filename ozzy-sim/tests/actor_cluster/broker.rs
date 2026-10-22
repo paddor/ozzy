@@ -28,10 +28,12 @@ use ozzy_replication::{
 use ozzy_runtime::{
     replica_actor::{
         ActorConfig, ActorIds, ActorStatus, PartitionActor, PartitionActors, PartitionStatus,
-        ProposalSubmitter, ReceiptHandles, ReplicaActor, ScheduledReplica, SyncBatchTarget,
+        ProposalSubmitter, ReceiptHandles, ReplicaActor, ScheduledReplica, SessionReplacement,
+        SyncBatchTarget,
     },
     replica_journal::{
-        InstallationConfig, OwnedConfig, OwnedJournal, ProposalBuffer, ShardJournalConfig,
+        InstallationConfig, JournalStartup, OwnedConfig, OwnedJournal, ProposalBuffer,
+        ShardJournalConfig,
     },
     replica_transport::QueueLimits,
 };
@@ -79,6 +81,8 @@ pub(crate) struct Lane {
 #[derive(Debug)]
 pub(crate) struct Broker {
     pub index: usize,
+    /// Restarts so far.
+    pub incarnation: u64,
     pub shard: PartitionActors,
     pub disk: Disk,
     pub inbox: Inbox,
@@ -100,28 +104,84 @@ impl Broker {
         clients: usize,
         shape: Shape,
     ) -> Result<(Self, Vec<Lane>), String> {
-        let generation = JournalGeneration(index as u128 + 1);
         let (owner, startup) = disk
             .drive(OwnedJournal::format_new(
                 journal_config(index, shape),
                 io,
-                generation,
+                generation(index, 0),
                 shape.segment_bytes,
             ))
             .map_err(|error| format!("broker {index}: format: {error}"))?;
+        let sessions = std::array::from_fn(|peer| session(index, peer, 0));
+        Self::serve(
+            index, 0, clock, disk, owner, startup, sessions, clients, shape,
+        )
+    }
+
+    /// Lose power, then start again over what reached the disk: reopen the
+    /// journal under a fresh writer generation and ID namespace. The new
+    /// actor has no links until `connect`.
+    pub(crate) fn restart(
+        self,
+        clock: &Clock,
+        clients: usize,
+        shape: Shape,
+    ) -> Result<(Self, Vec<Lane>), String> {
+        let Self {
+            index,
+            incarnation,
+            shard,
+            disk,
+            ..
+        } = self;
+        drop(shard);
+        let incarnation = incarnation + 1;
+        let (mut disk, io) = disk.power_loss();
+        let (owner, startup) = disk
+            .drive(OwnedJournal::open(
+                journal_config(index, shape),
+                io,
+                generation(index, incarnation),
+            ))
+            .map_err(|error| format!("broker {index}: reopen: {error}"))?;
+        let sessions = [LinkSessionId::from_bytes([0; 16]); BROKERS];
+        Self::serve(
+            index,
+            incarnation,
+            clock,
+            disk,
+            owner,
+            startup,
+            sessions,
+            clients,
+            shape,
+        )
+    }
+
+    fn serve(
+        index: usize,
+        incarnation: u64,
+        clock: &Clock,
+        disk: Disk,
+        owner: OwnedJournal,
+        startup: JournalStartup,
+        sessions: [LinkSessionId; BROKERS],
+        clients: usize,
+        shape: Shape,
+    ) -> Result<(Self, Vec<Lane>), String> {
         let clock = clock.clone();
         let journal = owner
             .into_shard_journal(ShardJournalConfig::default(), move || clock.unix_millis())
             .map_err(|error| format!("broker {index}: journal: {error}"))?;
-        // One ID namespace per actor startup; restarts will need fresh ones.
+        // One ID namespace per actor startup.
         let ids = ActorIds::deterministic(
-            std::num::NonZeroU64::new(index as u64 + 1).unwrap(),
+            std::num::NonZeroU64::new(incarnation * BROKERS as u64 + index as u64 + 1).unwrap(),
             ReceiptHandles::default(),
         );
         let mut actor = ReplicaActor::new_with_ids(
             journal,
             startup,
-            actor_config(index, shape.segment_bytes),
+            actor_config(sessions, shape.segment_bytes),
             ids,
         )
         .map_err(|error| format!("broker {index}: actor: {error}"))?;
@@ -136,6 +196,7 @@ impl Broker {
             .map_err(|error| format!("broker {index}: shard: {error}"))?;
         let broker = Self {
             index,
+            incarnation,
             shard,
             disk,
             inbox: Inbox::default(),
@@ -264,6 +325,39 @@ impl Broker {
         Some(message)
     }
 
+    /// Bind a newly established link to `peer`. Receipt aliases do not
+    /// cross link sessions.
+    pub(crate) fn connect(
+        &mut self,
+        peer: usize,
+        session: LinkSessionId,
+        now: Duration,
+    ) -> Result<(), String> {
+        self.aliases[peer] = None;
+        let sessions = SessionReplacement {
+            expected: LinkSessionId::from_bytes([0; 16]),
+            replacement: session,
+        };
+        self.shard
+            .replace_session(GROUP, node(peer), sessions, now)
+            .map(drop)
+            .map_err(|error| format!("broker {}: connect {peer}: {error}", self.index))
+    }
+
+    /// Fence the link to `peer`, which went down.
+    pub(crate) fn disconnect(
+        &mut self,
+        peer: usize,
+        session: LinkSessionId,
+        now: Duration,
+    ) -> Result<(), String> {
+        self.aliases[peer] = None;
+        self.shard
+            .disconnect_session(GROUP, node(peer), session, now)
+            .map(drop)
+            .map_err(|error| format!("broker {}: disconnect {peer}: {error}", self.index))
+    }
+
     pub(crate) fn status(&self) -> ActorStatus {
         match self.shard.status(GROUP) {
             Some(PartitionStatus::Replicated(status)) => status,
@@ -308,25 +402,32 @@ fn lanes(actor: &mut PartitionActor, clients: usize) -> Result<Vec<Lane>, String
         .collect()
 }
 
-/// Both ends of a link use one session. Zero means no link, as for the
-/// local slot.
-fn session(local: usize, peer: usize) -> LinkSessionId {
+/// Both ends of a link use one session, fresh for each `epoch` of that
+/// link. Zero means no link, as for the local slot.
+pub(crate) fn session(local: usize, peer: usize, epoch: u64) -> LinkSessionId {
     if local == peer {
         return LinkSessionId::from_bytes([0; 16]);
     }
     let pair = local.min(peer) * BROKERS + local.max(peer);
-    LinkSessionId::from_bytes([pair as u8 + 1; 16])
+    let mut bytes = [pair as u8 + 1; 16];
+    bytes[8..].copy_from_slice(&epoch.to_be_bytes());
+    LinkSessionId::from_bytes(bytes)
+}
+
+/// A writer generation no other startup in the run uses.
+fn generation(index: usize, incarnation: u64) -> JournalGeneration {
+    JournalGeneration(u128::from(incarnation) * BROKERS as u128 + index as u128 + 1)
 }
 
 /// Production timing, flow probes, and queue bounds from
 /// `ozzy-broker/src/actors.rs`, with a small pipeline.
-fn actor_config(index: usize, segment_bytes: u64) -> ActorConfig {
+fn actor_config(sessions: [LinkSessionId; BROKERS], segment_bytes: u64) -> ActorConfig {
     let message_bytes = WireLimits::for_transfer(PIPELINE.max_operations, PIPELINE.max_body_bytes)
         .and_then(WireLimits::message_bytes)
         .expect("replica packet bound");
     ActorConfig {
         retention_interval: Some(Duration::from_millis(200)),
-        sessions: std::array::from_fn(|peer| session(index, peer)),
+        sessions,
         timing: Timing {
             heartbeat: Duration::from_millis(100),
             retransmit: Duration::from_millis(100),

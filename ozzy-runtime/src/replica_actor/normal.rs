@@ -346,7 +346,11 @@ impl ReplicaActor {
         if !hold {
             if !primary {
                 self.work.proposals.fill(&mut self.ingress);
-                self.work.proposals.reject_all();
+                // A waiting proposal defers due maintenance. No journal
+                // command completes once it leaves, so ask for that round now.
+                if self.work.proposals.reject_all() != 0 {
+                    self.more_work = true;
+                }
             } else if let Some(propose) = self.take_proposal(&snapshot)? {
                 self.submit_turn(crate::replica_journal::Turn {
                     propose: Some(propose),
@@ -430,7 +434,10 @@ impl ReplicaActor {
             .proposals
             .next(&mut self.ingress, || driver.begin_validation())?
         {
-            NextProposal::Idle | NextProposal::Finished | NextProposal::Blocked => {
+            NextProposal::Idle | NextProposal::Blocked => return Ok(None),
+            // As a backup rejection: the next round runs what it deferred.
+            NextProposal::Finished => {
+                self.more_work = true;
                 return Ok(None);
             }
             NextProposal::Ready(submission) => submission,

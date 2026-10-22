@@ -2,12 +2,12 @@
 //! stays read-only until its exact completion is installed.
 
 use super::roll::{RollBoundary, roll_manifest_after, validate_buffered_roll_state};
-use super::{Journal, Limits};
+use super::{Journal, Limits, position_before};
 use crate::directory::segment_name;
 use crate::retention::{PinRegistry, PreparedSegmentLease};
 use crate::{
-    CurrentReference, DirectoryError, GroupIdentity, JournalGroupEncoding, Manifest, SegmentWriter,
-    WriterError, async_files::Access, async_metadata, encode_manifest_with_limits,
+    CurrentReference, DirectoryError, GroupIdentity, JournalGroupEncoding, LogPosition, Manifest,
+    SegmentWriter, WriterError, async_files::Access, async_metadata, encode_manifest_with_limits,
 };
 use ozzy_io::Handle;
 use ozzy_journal::progress::JournalGeneration;
@@ -55,6 +55,7 @@ pub struct Prepared {
     successor: Successor,
     predecessor: Handle,
     boundary: RollBoundary,
+    committed: LogPosition,
     manifest: Manifest,
     current: CurrentReference,
     configuration: Option<Vec<u8>>,
@@ -115,12 +116,15 @@ impl Journal {
 
     /// Freeze physical/metadata mutation while reads and body preparation retain
     /// the old image. Unlike `roll_active`, this may synchronize a buffered tail.
+    /// The new manifest also commits `applied`, an exact durable prefix the
+    /// owner applied, when it is newer than the published commit.
     pub fn begin_owned_roll(
         self,
         capacity: u64,
         max_probes: usize,
+        applied: LogPosition,
     ) -> Result<(Pending, Prepared), DirectoryError> {
-        self.begin_owned_roll_with(capacity, max_probes, None)
+        self.begin_owned_roll_with(capacity, max_probes, applied, None)
     }
 
     /// Reuse a healthy prepared file from this exact owner/segment/generation.
@@ -129,10 +133,12 @@ impl Journal {
         self,
         capacity: u64,
         max_probes: usize,
+        applied: LogPosition,
         prepared: Option<Segment>,
     ) -> Result<(Pending, Prepared), DirectoryError> {
         self.healthy()?;
         let boundary = validate_buffered_roll_state(&self.manifest, self.writer.state())?;
+        let committed = self.rolled_commit(applied)?;
         let preparation = self.prepare_next_segment(capacity, max_probes)?;
         let successor = match prepared {
             Some(file)
@@ -154,12 +160,37 @@ impl Journal {
             successor,
             predecessor: self.writer.buffered(),
             boundary,
+            committed,
             manifest: self.manifest.clone(),
             current: self.current,
             configuration: self.configuration.clone(),
             limits: self.limits,
         };
         Ok((Pending { journal: self, key }, work))
+    }
+
+    /// The newer of the published commit and `applied`. An older `applied`
+    /// is no error: the commit published at a view promise can lead it.
+    pub(super) fn rolled_commit(
+        &self,
+        applied: LogPosition,
+    ) -> Result<LogPosition, DirectoryError> {
+        applied.validate()?;
+        let published = self.manifest.committed;
+        if applied.op_number <= published.op_number {
+            if applied.op_number == published.op_number && applied != published {
+                return Err(DirectoryError::HardStateRegression);
+            }
+            return Ok(published);
+        }
+        let durable = position_before(self.writer.durable_position().next_chain())?;
+        if applied.op_number > durable.op_number {
+            return Err(DirectoryError::PositionNotDurable(applied.op_number));
+        }
+        if applied.op_number == durable.op_number && applied != durable {
+            return Err(DirectoryError::PositionMismatch(applied.op_number));
+        }
+        Ok(applied)
     }
 }
 
@@ -248,6 +279,7 @@ impl Prepared {
         let next = roll_manifest_after(
             &self.manifest,
             self.boundary,
+            self.committed,
             prepared.id,
             prepared.scope.capacity,
         )?;

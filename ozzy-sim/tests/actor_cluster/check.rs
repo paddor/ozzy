@@ -29,6 +29,9 @@ struct Observed {
 pub(crate) struct Checker {
     digests: BTreeMap<u64, Observed>,
     views: [u64; BROKERS],
+    /// The newest view each broker served in normal status. Entering it
+    /// published it, so it survives a restart.
+    normal: [u64; BROKERS],
     committed: [u64; BROKERS],
     /// Operations that two brokers reported with the same digest.
     pub compared: u64,
@@ -47,6 +50,7 @@ impl Checker {
         let Some(normal) = status.normal else {
             return Ok(());
         };
+        self.normal[broker] = view;
         let committed = normal.committed.op.0;
         if committed < self.committed[broker] {
             return Err(format!(
@@ -57,6 +61,13 @@ impl Checker {
         self.committed[broker] = committed;
         self.record(normal.committed, Source::Committed(broker))?;
         self.record(normal.applied, Source::Applied(broker))
+    }
+
+    /// A broker lost power and started again. Its view may fall back to the
+    /// last one it published, and its commit to what it held durably.
+    pub(crate) fn restarted(&mut self, broker: usize) {
+        self.views[broker] = self.normal[broker];
+        self.committed[broker] = 0;
     }
 
     pub(crate) fn confirm(&mut self, through: Prefix) -> Result<(), String> {

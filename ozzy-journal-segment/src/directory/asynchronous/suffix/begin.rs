@@ -33,8 +33,8 @@ impl Journal {
         }
     }
 
-    /// Preserve the exact protected prefix and stage a selected suffix. Copies
-    /// at most one bounded source segment; older sealed predecessors stay shared.
+    /// Keep the exact retained prefix and stage a selected suffix. Copies at
+    /// most one bounded source segment; older sealed predecessors stay shared.
     pub async fn begin_suffix_replacement(
         mut self,
         request: SuffixRequest,
@@ -46,7 +46,7 @@ impl Journal {
         } = request;
         streaming::validate_stream_request(&self.suffix_source(), &request)?;
         self.validate_authority_files().await?;
-        let index = rewrite_segment_index(&self.manifest, replacement.protected_committed)?;
+        let index = rewrite_segment_index(&self.manifest, replacement.retained)?;
         let reference = self.manifest.segments[index];
         if reference.capacity > limits.max_source_segment_bytes {
             return Err(Error::InvalidLimits);
@@ -55,7 +55,7 @@ impl Journal {
         let retained = retained_image(
             &self.suffix_source(),
             reference,
-            replacement.protected_committed,
+            replacement.retained,
             SuffixReplacementLimits {
                 max_operations: usize::try_from(reference.capacity / ENTRY_HEADER_BYTES as u64)
                     .map_err(|_| Error::LengthOverflow)?,
@@ -152,6 +152,7 @@ impl Journal {
             },
         )?;
         if replacement.protected_committed != LogPosition::GENESIS
+            || replacement.retained != LogPosition::GENESIS
             || self.manifest.checkpoint.is_some()
             || self.manifest.segments[0].first_chain != ChainPosition::GENESIS
         {
@@ -220,7 +221,7 @@ impl Journal {
         if !retained.is_empty() || source.first_chain == ChainPosition::GENESIS {
             debug_assert_eq!(
                 position_before(installer.writer.written_position().next_chain())?,
-                replacement.protected_committed
+                replacement.retained
             );
         }
         Ok(installer)

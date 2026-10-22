@@ -5,9 +5,10 @@ use super::Journal;
 use crate::directory::segment_name;
 use crate::suffix::{OwnedOperation, enforce_limit, streaming};
 use crate::{
-    CanonicalOperation, ChainPosition, CodecError, Digest, LogPosition, SEGMENT_HEADER_BYTES,
-    SealedSegment, SegmentHeader, SegmentReference, SegmentStart, SegmentWriter, SuffixReplacement,
-    SuffixReplacementError as Error, SuffixStreamLimits, WriterError, metadata::position_before,
+    CanonicalOperation, ChainPosition, CodecError, Digest, LogPosition, PackLimits,
+    SEGMENT_HEADER_BYTES, SealedSegment, SegmentHeader, SegmentReference, SegmentStart,
+    SegmentWriter, SuffixReplacement, SuffixReplacementError as Error, SuffixStreamLimits,
+    WRITE_GROUP_ALIGNMENT, WriterError, metadata::position_before,
 };
 use ozzy_io::Operation;
 use std::io;
@@ -203,6 +204,9 @@ impl Installer {
     }
 
     async fn roll(&mut self) -> Result<(), Error> {
+        if self.segments.len() >= self.request.limits.max_segments {
+            Box::pin(self.pack()).await?;
+        }
         enforce_limit(
             "selected manifest segments",
             self.segments.len() + 1,
@@ -255,6 +259,68 @@ impl Installer {
         let old = std::mem::replace(&mut self.writer, successor);
         old.close().await?;
         self.staged_bytes = staged;
+        Ok(())
+    }
+
+    /// At the segment limit, pack the sealed run of the new selection that
+    /// frees the most segments per byte rewritten: kept history this copy
+    /// wrote in small groups, or staged segments of small transfer chunks.
+    /// A replaced kept segment stays selected until finish and is cleaned
+    /// up after; a replaced staged one is removed at once. Without a run
+    /// worth packing, the selection stays as it was.
+    async fn pack(&mut self) -> Result<(), Error> {
+        let capacity = self.request.replacement.segment_capacity;
+        let staged = self
+            .staged_bytes
+            .checked_add(capacity)
+            .ok_or(Error::LengthOverflow)?;
+        if staged > self.request.limits.max_staged_bytes {
+            return Ok(());
+        }
+        // Reads and groups as large as staging's own, so a pack holds about
+        // what staging does.
+        let limits = PackLimits {
+            max_group_bytes: self
+                .request
+                .limits
+                .max_group_body_bytes
+                .max(WRITE_GROUP_ALIGNMENT),
+            read_ahead_bytes: self.journal.limits.io.chunk_bytes,
+            max_probes: self.request.limits.max_orphan_probes,
+        };
+        let generation = self.request.replacement.writer_generation;
+        let Some(job) = self
+            .journal
+            .pack_job(&self.segments, limits, generation, capacity)?
+        else {
+            return Ok(());
+        };
+        let mut outcome = job.run().await?;
+        let Some(packed) = outcome.take_packed() else {
+            return Ok(());
+        };
+        let replaced = packed.replaced();
+        let at = self
+            .segments
+            .iter()
+            .position(|reference| Some(reference) == replaced.first())
+            .ok_or(crate::DirectoryError::PackMismatch)?;
+        self.segments
+            .splice(at..at + replaced.len(), [packed.merged()]);
+        let directory = self.journal.root().join("segments");
+        let mut removed = 0;
+        for reference in replaced {
+            if !self.journal.manifest.segments.contains(reference) {
+                self.journal
+                    .access
+                    .done(Operation::RemoveFile {
+                        path: directory.join(reference.file_name()),
+                    })
+                    .await?;
+                removed += reference.capacity;
+            }
+        }
+        self.staged_bytes = staged - removed;
         Ok(())
     }
 

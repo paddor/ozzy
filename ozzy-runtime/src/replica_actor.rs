@@ -192,6 +192,14 @@ impl ReplicaActor {
             self.publish_status(true);
             return Ok(());
         }
+        // The view waits on this copy's own installation I/O; timing out
+        // while it runs would only discard the work.
+        if matches!(
+            self.pending,
+            Some(PendingIo::Begin(_) | PendingIo::Chunk(_) | PendingIo::Finish(_))
+        ) {
+            self.driver.history_progress(now)?;
+        }
         // At most four fixed controls (eight destinations), one history chunk,
         // and one disk submission per iteration. Each chunk has byte/count bounds.
         for _ in 0..4 {
@@ -358,7 +366,7 @@ impl ReplicaActor {
                 }
             }
             ReplicaMessage::FetchOps(request) => self.serve(from, request)?,
-            ReplicaMessage::Ops(batch) => self.receive_ops(&batch)?,
+            ReplicaMessage::Ops(batch) => self.receive_ops(&batch, now)?,
             ReplicaMessage::Recovery(wire::RecoveryMessage::Request(request)) => {
                 self.receive_recovery(index, request, now)?;
             }

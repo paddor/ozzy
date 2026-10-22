@@ -61,6 +61,7 @@ impl OwnedJournal {
             // Live writes submit groups of this body size, so the backend
             // takes packed groups of it.
             max_group_bytes: self.writeback.limits.max_body_bytes,
+            read_ahead_bytes: ozzy_journal_segment::PACK_CHUNK_BYTES,
             max_probes: PACK_PROBES,
         }
     }

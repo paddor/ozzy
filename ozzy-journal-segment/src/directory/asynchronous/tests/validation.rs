@@ -285,6 +285,32 @@ fn roll_rejects_unsynchronized_or_empty_active_segment() {
     );
 }
 
+/// A publication checks the headers of the segments it adds or changes,
+/// not those it keeps, so its cost does not grow with the selection.
+#[test]
+fn publication_reads_only_the_headers_it_adds() {
+    let opens = |sealed: usize| {
+        let (mut controller, mut journal) = empty_journal();
+        for _ in 0..sealed {
+            drive(&mut controller, append_confirmed(&mut journal));
+            drive(&mut controller, journal.roll_active(32768, 4)).unwrap();
+        }
+        drive(&mut controller, append_confirmed(&mut journal));
+        let mut opens = 0;
+        drive_with(&mut controller, journal.roll_active(32768, 4), |operation| {
+            if matches!(operation, Operation::Open { path, .. } if path.starts_with("/group/segments"))
+            {
+                opens += 1;
+            }
+            Effect::Normal
+        })
+        .unwrap();
+        assert_eq!(journal.manifest().segments.len(), sealed + 2);
+        opens
+    };
+    assert_eq!(opens(2), opens(8));
+}
+
 #[test]
 fn decoded_body_limit_forces_a_recoverable_segment_roll() {
     let mut chosen = limits();

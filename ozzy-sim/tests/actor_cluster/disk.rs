@@ -26,6 +26,18 @@ pub(crate) struct Disk {
 
 impl Disk {
     pub(crate) fn new(seed: u64, mean: f64) -> (Self, Local) {
+        Self::with_image(seed, mean, Image::default())
+    }
+
+    /// Lose power: drop every pending job and unsynchronized byte, then
+    /// start a fresh device over what reached media.
+    pub(crate) fn power_loss(mut self) -> (Self, Local) {
+        let seed = self.rng.next();
+        let (image, _) = self.controller.crash(true).expect("simulated power loss");
+        Self::with_image(seed, self.mean, image)
+    }
+
+    fn with_image(seed: u64, mean: f64, image: Image) -> (Self, Local) {
         let (controller, mut clients) = Controller::new(
             Config {
                 limits: Limits {
@@ -50,7 +62,7 @@ impl Disk {
                 // Drained every tick; one tick schedules far fewer events.
                 trace_events: 100_000,
             },
-            Image::default(),
+            image,
         )
         .expect("simulated device");
         let disk = Self {

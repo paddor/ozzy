@@ -66,6 +66,7 @@ fn request(journal: &Journal, committed: LogPosition) -> SuffixReplacement {
     SuffixReplacement {
         expected_current: journal.current(),
         protected_committed: journal.committed_position().unwrap(),
+        retained: journal.committed_position().unwrap(),
         promised_view: 2,
         last_normal_view: 2,
         committed,
@@ -214,6 +215,75 @@ fn async_suffix_preserves_exact_protected_fragment_and_old_captured_history() {
         let journal = drive(&mut controller, open(io, 12)).unwrap();
         assert_eq!(drive(&mut controller, replay(&journal)), expected);
     }
+}
+
+/// Local history verified in the selected lineage stays in place: staging
+/// starts after `retained`, past the old local commit. A retained position
+/// the local history does not hold, or one past the commit, is refused.
+#[test]
+fn async_suffix_keeps_a_verified_prefix_past_the_protected_commit() {
+    let (mut controller, mut journal) = empty_journal();
+    let io = journal.access.io.clone();
+    let old = operations(LogPosition::GENESIS, &BODIES[..6], 0);
+    for (index, chunk) in old.chunks(2).enumerate() {
+        let written = drive(&mut controller, journal.append(chunk, BodyEncoding::Raw)).unwrap();
+        drive(&mut controller, journal.sync_through(written)).unwrap();
+        if index < 2 {
+            drive(&mut controller, journal.roll_active(32768, 4)).unwrap();
+        }
+    }
+    let mut next = journal.next_manifest().unwrap();
+    next.accepted = position(old[5]);
+    drive(&mut controller, journal.install_metadata(next)).unwrap();
+    assert_eq!(journal.committed_position().unwrap(), LogPosition::GENESIS);
+    // The selected log shares the first four operations, then diverges.
+    let new = operations(position(old[3]), &BODIES[6..10], 1);
+    let refused = [
+        LogPosition {
+            digest: Digest::from_bytes([9; 32]),
+            ..position(old[3])
+        },
+        position(new[2]),
+    ];
+    for (generation, retained) in (2..).zip(refused) {
+        let replacement = SuffixReplacement {
+            retained,
+            ..request(&journal, position(new[1]))
+        };
+        assert!(matches!(
+            drive(
+                &mut controller,
+                journal.begin_suffix_replacement(stream_request(replacement, position(new[3])))
+            ),
+            Err(Error::ProtectedCommitMismatch)
+        ));
+        journal = drive(&mut controller, open(io.clone(), generation)).unwrap();
+    }
+    let kept = journal.manifest.segments[..2].to_vec();
+    let replacement = SuffixReplacement {
+        retained: position(old[3]),
+        ..request(&journal, position(new[1]))
+    };
+    let mut installer = drive(
+        &mut controller,
+        journal.begin_suffix_replacement(stream_request(replacement, position(new[3]))),
+    )
+    .unwrap();
+    for chunk in new.chunks(2) {
+        drive(&mut controller, installer.append_chunk(chunk)).unwrap();
+    }
+    let journal = drive(&mut controller, installer.finish()).unwrap();
+    assert_eq!(journal.manifest.segments[..2], kept);
+    assert_eq!(journal.committed_position().unwrap(), position(new[1]));
+    let expected = old[..4]
+        .iter()
+        .chain(&new)
+        .map(|op| (op.op_number, op.body.to_vec()))
+        .collect::<Vec<_>>();
+    assert_eq!(drive(&mut controller, replay(&journal)), expected);
+    drop(journal);
+    let journal = drive(&mut controller, open(io, 12)).unwrap();
+    assert_eq!(drive(&mut controller, replay(&journal)), expected);
 }
 
 #[test]
@@ -645,4 +715,86 @@ fn syntactically_valid_duplicate_identity_cannot_publish_voter_configuration() {
     let journal = drive(&mut controller, reopen_replacement(io, 11)).unwrap();
     assert_eq!(journal.current(), publication.current);
     assert_eq!(journal.manifest.accepted, accepted);
+}
+
+/// Kept history this copy wrote one operation per group, at the segment
+/// limit: staging packs it instead of failing. The packed selection
+/// finishes and reopens; an abort leaves the old one.
+#[test]
+fn suffix_at_the_segment_limit_packs_sparse_segments() {
+    for abort in [false, true] {
+        let (mut controller, mut journal) = empty_journal();
+        let io = journal.access.io.clone();
+        // Fourteen sealed segments of seven one-operation groups and an
+        // active one: fifteen of the sixteen allowed.
+        let mut old = Vec::new();
+        for segment in 0..15 {
+            for _ in 0..7 {
+                old.push(operation(&journal).op_number);
+                drive(&mut controller, append_confirmed(&mut journal));
+            }
+            if segment < 14 {
+                drive(&mut controller, journal.roll_active(32768, 4)).unwrap();
+            }
+        }
+        let mut next = journal.next_manifest().unwrap();
+        next.accepted = journal.accepted_position().unwrap();
+        next.committed = next.accepted;
+        drive(&mut controller, journal.install_metadata(next)).unwrap();
+        let before = journal.manifest.segments.clone();
+        assert_eq!(before.len(), 15);
+        assert_eq!(journal.committed_position().unwrap().op_number, 105);
+        let bodies: &'static [[u8; 16]] =
+            Box::leak((0..30).map(|index| [index + 20; 16]).collect());
+        let new = operations(journal.committed_position().unwrap(), bodies, 1);
+        let last = position(*new.last().unwrap());
+        let replacement = SuffixReplacement {
+            segment_capacity: 32768,
+            ..request(&journal, last)
+        };
+        let mut installer = drive(
+            &mut controller,
+            journal.begin_suffix_replacement(stream_request(replacement, last)),
+        )
+        .unwrap();
+        // Sixteen groups of at most two operations need three staged
+        // segments, one past the limit.
+        for chunk in new.chunks(2) {
+            drive(&mut controller, installer.append_chunk(chunk)).unwrap();
+        }
+        let expected: Vec<_> = old
+            .iter()
+            .map(|&op| (op, vec![1; 16]))
+            .chain(new.iter().map(|op| (op.op_number, op.body.to_vec())))
+            .collect();
+        if abort {
+            let journal = drive(&mut controller, installer.abort()).unwrap();
+            assert_eq!(journal.manifest.segments, before);
+            assert_eq!(drive(&mut controller, replay(&journal)).len(), old.len());
+            drop(journal);
+            let journal = drive(&mut controller, open(io, 12)).unwrap();
+            assert_eq!(journal.manifest.segments, before);
+            continue;
+        }
+        let mut journal = drive(&mut controller, installer.finish()).unwrap();
+        let segments = journal.manifest.segments.clone();
+        assert!(segments.len() < before.len(), "{segments:?}");
+        assert_eq!(journal.accepted_position().unwrap(), last);
+        assert_eq!(drive(&mut controller, replay(&journal)), expected);
+        // Cleanup removes the replaced files once nothing selects them.
+        let removed = drive(&mut controller, journal.reclaim_unreferenced_segments(16))
+            .unwrap()
+            .removed_segment_ids;
+        let replaced: Vec<_> = before
+            .iter()
+            .filter(|reference| !segments.contains(reference))
+            .map(|reference| reference.segment_id)
+            .collect();
+        assert_eq!(removed, replaced);
+        drop(journal);
+        let (mut controller, io) = setup(controller.crash(true).unwrap().0);
+        let journal = drive(&mut controller, open(io, 12)).unwrap();
+        assert_eq!(journal.manifest.segments, segments);
+        assert_eq!(drive(&mut controller, replay(&journal)), expected);
+    }
 }

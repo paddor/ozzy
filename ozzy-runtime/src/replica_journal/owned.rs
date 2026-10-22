@@ -210,10 +210,12 @@ impl OwnedJournal {
         let configuration = config.configuration.configuration();
         let candidate = journal.recover_canonical_candidate(config.recovery).await?;
         let accepted = prefix(journal.accepted_position()?);
-        let images = if fresh {
-            Some(candidate.activate(&journal)?)
+        // A restarted replica holds no images until an election installs. Its
+        // installation replays only after the recovered committed state.
+        let (images, committed_base) = if fresh {
+            (Some(candidate.activate(&journal)?), None)
         } else {
-            None
+            (None, Some(candidate.committed_images().committed().clone()))
         };
         let manifest = journal.manifest();
         let scope = Scope {
@@ -245,6 +247,7 @@ impl OwnedJournal {
             images,
             reader,
         )?;
+        owner.committed_base = committed_base;
         if fresh {
             owner.restore_dedup().await?;
         }

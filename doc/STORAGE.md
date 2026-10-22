@@ -85,6 +85,9 @@ canonical operations.
 - The segment header binds group ID, segment ID, predecessor ID, the chain
   digest before the segment, capacity, and file generation (zero for the
   original file).
+- Open checks every selected header. A manifest publication checks only the
+  segments it adds or changes, or whose predecessor changed; the journal
+  never rewrites a selected header or shortens its file.
 - Entry headers stay uncompressed. They carry kind, operation identity, chain
   and body digests, lengths, and codec.
 - A seal records group number, start and end offsets, entry count, a durable
@@ -260,7 +263,8 @@ With the `aio` backend (the Linux default), segment data writes use a separate
 2. Write and sync its header, which binds the predecessor ID and the chain
    digest before the successor.
 3. Sync the predecessor and the `segments/` directory.
-4. Publish the new manifest, then `CURRENT`.
+4. Publish the new manifest, then `CURRENT`. The manifest also commits the
+   owner's applied prefix when that is newer than its commit.
 
 Selected files are immutable. Replacement uses a fresh `<id>.<generation>.log`.
 An unselected successor is a leftover for cleanup. Reads keep their original
@@ -304,7 +308,9 @@ generation.
   discards both. Overwriting the later group's seal stops a byte-identical
   rewrite of the damaged group from chaining into it again.
 - Replication authorizes suffix replacement; see [replication](REPLICATION.md).
-  Protected committed fragments survive physical regrouping.
+  Protected committed fragments survive physical regrouping. A request may
+  keep a longer verified prefix, never past its commit; its exact position
+  must be in local history.
 - Replacements are staged, validated, synchronized, and selected atomically.
   The old selection stays authoritative until then. Shutdown aborts unpublished
   work without lowering a durable promise.
@@ -449,6 +455,11 @@ A replica with at most 24 free segments packs sparse sealed segments.
   publication leaves an unselected file for cleanup.
 - A pack starts and installs only while no retirement or cleanup runs, and
   retirement waits for a pack. A view change abandons an unfinished pack.
+- Suffix installation at the segment limit packs the best sealed run of its
+  new selection, kept or staged, before it rolls. Reads and groups stay
+  within the staging bounds. A replaced kept segment stays selected until
+  publication and is cleaned up after; a replaced staged one is removed at
+  once.
 
 ## Operator tuning
 

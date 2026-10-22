@@ -165,6 +165,23 @@ impl ReplicaDriver {
         Ok(self.installing_mut()?.validate_suffix(operations)?)
     }
 
+    /// Note progress of this view's selection or installation: a looked-up
+    /// batch, a staged chunk, or local installation I/O still running. A
+    /// lagging copy moves and replays its whole missed suffix in the view
+    /// change, which can outlast any election timeout, so each advance
+    /// pushes the local election deadline out by one election delay. Peer
+    /// suspicion still counts; two other voters can leave the view without
+    /// this one.
+    pub fn history_progress(&mut self, now: Duration) -> Result<(), DriverError> {
+        self.observe_time(now)?;
+        if matches!(self.role, Role::ViewChanging(_) | Role::Installing(_)) {
+            self.election_deadline = self
+                .election_deadline
+                .max(now.saturating_add(self.election_delay));
+        }
+        Ok(())
+    }
+
     /// Finish actual selected-log publication and committed application recovery.
     /// A newer observed/requested view suppresses intermediate normal activation.
     /// A current installed primary still needs whole-tail quorum and application

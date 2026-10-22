@@ -57,7 +57,14 @@ impl Journal {
 
     pub(super) async fn install_selected(&mut self, next: Manifest) -> Result<(), DirectoryError> {
         self.interrupted = true;
-        super::opening::validate_headers(&self.access, self.root(), &next, self.limits).await?;
+        super::opening::validate_headers(
+            &self.access,
+            self.root(),
+            &next,
+            &self.manifest.segments,
+            self.limits,
+        )
+        .await?;
         let (next, current) = publish_selected(
             &mut self.directory,
             &self.manifest,

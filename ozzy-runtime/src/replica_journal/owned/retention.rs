@@ -54,7 +54,7 @@ impl Retention {
     }
 
     /// Forget cached summaries and roll proofs of segments `keep` rejects.
-    fn retain_segments(&mut self, keep: impl Fn(u64) -> bool) {
+    pub(super) fn retain_segments(&mut self, keep: impl Fn(u64) -> bool) {
         self.sealed.retain(|id, _| keep(*id));
         self.proofs.retain(|proof| keep(proof.segment_id()));
     }

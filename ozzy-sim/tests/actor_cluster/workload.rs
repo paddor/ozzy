@@ -100,6 +100,21 @@ impl Workload {
         }
     }
 
+    /// A broker lost power and started again with fresh lanes. Its
+    /// outstanding proposals have unknown outcomes.
+    pub(crate) fn restarted(&mut self, broker: usize, lanes: Vec<Lane>, tick: u64) {
+        for (client, lane) in self.clients.iter_mut().zip(lanes) {
+            if client.pending.as_ref().is_some_and(|(at, _)| *at == broker) {
+                client.pending = None;
+                self.counts.stopped += 1;
+                client.resent = true;
+                client.target = other(&mut self.rng, broker);
+                client.next_at = tick + RESEND;
+            }
+            client.lanes[broker] = Some(lane);
+        }
+    }
+
     /// No proposal is outstanding.
     pub(crate) fn idle(&self) -> bool {
         self.clients.iter().all(|client| client.pending.is_none())

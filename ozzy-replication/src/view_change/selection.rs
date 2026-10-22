@@ -2,7 +2,7 @@
 //! source's pinned history.
 
 use super::{LogSource, SelectedView, ViewChange, ViewChangeError};
-use crate::{Digest, OpNumber, Prefix, VoterSet};
+use crate::{Digest, FrozenLog, OpNumber, Prefix, VoterSet};
 
 impl ViewChange {
     /// Select the highest last-normal-view, then longest accepted lineage.
@@ -31,6 +31,7 @@ impl ViewChange {
         let Some(mut report) = reports[self.local] else {
             return Err(ViewChangeError::ReportQuorumMissing);
         };
+        let local = report.log;
         let mut chosen = self.configuration.voter(self.local);
         let voters: VoterSet = reports
             .iter()
@@ -72,6 +73,7 @@ impl ViewChange {
             scope: self.scope(),
             source,
             committed,
+            retained: retained(local, report.log, committed),
             voters,
         };
         self.selected = Some(selected);
@@ -98,5 +100,37 @@ impl ViewChange {
             return Err(self.conflict());
         }
         Ok(())
+    }
+
+    /// The checks of `prefix` against `source` that need no history. A
+    /// staging stream through it checks the rest.
+    pub(crate) fn require_streamed(
+        &mut self,
+        source: LogSource,
+        prefix: Prefix,
+    ) -> Result<(), ViewChangeError> {
+        if prefix.op > source.accepted.op
+            || (prefix.op == source.accepted.op && prefix != source.accepted)
+            || (prefix.op == OpNumber(0) && prefix.digest != Digest::ZERO)
+        {
+            return Err(self.conflict());
+        }
+        Ok(())
+    }
+}
+
+/// This voter's longest prefix in the selected lineage, at most `committed`.
+/// Selection verifies its accepted prefix when it shares the `chosen` normal
+/// view; otherwise only its commit.
+fn retained(local: FrozenLog, chosen: FrozenLog, committed: Prefix) -> Prefix {
+    let verified = if local.last_normal_view == chosen.last_normal_view {
+        local.accepted
+    } else {
+        local.committed
+    };
+    if verified.op > committed.op {
+        committed
+    } else {
+        verified
     }
 }

@@ -45,6 +45,7 @@ fn async_index_cleanup_preserves_selected_and_captured_segment_ids() {
     let replacement = crate::SuffixReplacement {
         expected_current: journal.current(),
         protected_committed: LogPosition::GENESIS,
+        retained: LogPosition::GENESIS,
         promised_view: 2,
         last_normal_view: 2,
         committed: LogPosition::GENESIS,

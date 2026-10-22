@@ -97,7 +97,7 @@ impl Journal {
         reference: SegmentReference,
     ) -> Result<GroupScope, DirectoryError> {
         self.healthy()?;
-        let (expected, active_header) = if let Some(sealed) = reference.sealed {
+        if reference.sealed.is_some() {
             let at = self
                 .manifest
                 .segments
@@ -109,27 +109,51 @@ impl Journal {
                 .segments
                 .get(at + 1)
                 .ok_or(DirectoryError::SegmentMismatch(reference.segment_id))?;
-            let expected = End {
-                offset: sealed.valid_bytes,
-                digest: sealed.digest,
-                chain: next.first_chain,
-                group_number: next.first_group_number,
-            };
-            (expected, None)
-        } else {
-            let position = self.writer.written_position();
-            let expected = End {
-                offset: position.end_offset(),
-                digest: self.writer.state().structural_digest(),
-                chain: position.next_chain(),
-                group_number: position
-                    .group_number()
-                    .checked_add(1)
-                    .ok_or(CodecError::InvalidGroupNumber)?,
-            };
-            (expected, Some(self.writer.state().header().clone()))
+            return self.sealed_scope(reference, next);
+        }
+        let position = self.writer.written_position();
+        let expected = End {
+            offset: position.end_offset(),
+            digest: self.writer.state().structural_digest(),
+            chain: position.next_chain(),
+            group_number: position
+                .group_number()
+                .checked_add(1)
+                .ok_or(CodecError::InvalidGroupNumber)?,
         };
-        Ok(GroupScope {
+        Ok(self.scope(
+            reference,
+            expected,
+            Some(self.writer.state().header().clone()),
+        ))
+    }
+
+    /// Capture a sealed segment's expected end before `next`, which need
+    /// not be selected yet.
+    pub(crate) fn sealed_scope(
+        &self,
+        reference: SegmentReference,
+        next: &SegmentReference,
+    ) -> Result<GroupScope, DirectoryError> {
+        let sealed = reference
+            .sealed
+            .ok_or(DirectoryError::SegmentMismatch(reference.segment_id))?;
+        let expected = End {
+            offset: sealed.valid_bytes,
+            digest: sealed.digest,
+            chain: next.first_chain,
+            group_number: next.first_group_number,
+        };
+        Ok(self.scope(reference, expected, None))
+    }
+
+    fn scope(
+        &self,
+        reference: SegmentReference,
+        expected: End,
+        active_header: Option<SegmentHeader>,
+    ) -> GroupScope {
+        GroupScope {
             access: self.access.clone(),
             path: self.root().join(super::segment_reference_name(reference)),
             reference,
@@ -139,7 +163,7 @@ impl Journal {
             limits: self.limits,
             configuration_epoch: self.manifest.configuration_epoch,
             promised_view: self.manifest.promised_view,
-        })
+        }
     }
 
     pub(crate) fn group_scan_bytes(&self) -> Result<usize, DirectoryError> {

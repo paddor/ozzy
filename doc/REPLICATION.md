@@ -109,6 +109,24 @@ votes and is not suspicion.
 
 - EXIT_VIEW is volatile suspicion, never a vote. One timeout cannot advance
   views.
+- A lagging copy fetches and replays its missed suffix inside the view
+  change. Each verified lookup batch, staged chunk, or running installation
+  step pushes its election deadline out by one election delay, so a
+  catch-up longer than any timeout still finishes. Peer suspicion still
+  counts.
+- A lookup scans the source from the checked prefix to its exact tail, and
+  records every report position it passes, so a lagging copy's commit and
+  accept cost one scan.
+- A backup looks up neither its commit nor a higher announced commit. Its
+  installation streams the source from its commit to the exact tail and
+  checks both on the way. A lower announced commit is checked locally.
+- When the source retired a staging start that local history covers, the
+  copy proves that prefix through an overlap of its own history with the
+  source and stages it locally. Otherwise it withdraws into recovery.
+- Installation keeps local history through the longest prefix verified in
+  the selected source, at most the selected commit: the new leader's own
+  accepted prefix when it shares the source's normal view, otherwise its
+  commit. Only the rest is fetched and staged.
 - A higher durable promise fences old authority at once.
 - Selection keeps every reported commit and every accepted prefix from the
   selected normal view. Only older uncertain suffixes may be dropped.
@@ -134,6 +152,9 @@ stateDiagram-v2
   lineage, then enters election with a fresh writer incarnation.
 - A restart never resumes old leader authority. It requests the next view or
   resumes an uninstalled promise. A promise alone grants no authority.
+- Each segment roll publishes the applied prefix as the commit. After a
+  restart, installation keeps local history through it and fetches only the
+  rest, and replays only after the state the reopen rebuilt.
 - Lost, rolled-back, or ambiguous stores stay nonvoting. Damage found while
   serving fails closed and never triggers automatic repair.
 

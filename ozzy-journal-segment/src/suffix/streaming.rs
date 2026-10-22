@@ -86,6 +86,15 @@ pub(crate) fn validate_stream_limits(
         return Err(Error::InvalidLimits);
     }
     let protected = replacement.protected_committed;
+    let retained = replacement.retained;
+    if retained.op_number < protected.op_number
+        || (retained.op_number == protected.op_number && retained != protected)
+        || retained.op_number > replacement.committed.op_number
+        || (retained.op_number == replacement.committed.op_number
+            && retained != replacement.committed)
+    {
+        return Err(Error::ProtectedCommitMismatch);
+    }
     if accepted.op_number < protected.op_number
         || (accepted.op_number == protected.op_number && accepted != protected)
         || replacement.committed.op_number < protected.op_number

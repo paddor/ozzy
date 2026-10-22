@@ -6,7 +6,9 @@ use crate::replica_journal::{
     authority::{position, successor},
 };
 use ozzy_journal::operation::{CanonicalOperation, canonical_body_digest};
-use ozzy_journal_segment::{SuffixInstaller, SuffixReplacement, SuffixStreamLimits};
+use ozzy_journal_segment::{
+    SegmentReference, SuffixInstaller, SuffixReplacement, SuffixStreamLimits,
+};
 use ozzy_replication::{InstallTicket, PreparedOperation, driver::ActivationTicket};
 
 /// Stage `operations` in physical groups within the stream's count and body
@@ -40,6 +42,8 @@ pub(super) struct PendingInstallation {
     pub(super) ticket: InstallTicket,
     staging: SuffixInstaller,
     limits: SuffixStreamLimits,
+    /// The old selection, to forget summaries of segments it replaces.
+    selected: Vec<SegmentReference>,
 }
 
 impl OwnedJournal {
@@ -68,6 +72,7 @@ impl OwnedJournal {
             return Err(JournalError::InstallationMismatch);
         }
         let limits = config.stream_limits(&self.limits, self.append_limits)?;
+        let selected = manifest.segments.clone();
         if ticket.source().voter == manifest.identity.replica_node_id
             && self.history.as_ref().map(history::source) != Some(ticket.source())
         {
@@ -76,6 +81,7 @@ impl OwnedJournal {
         let replacement = SuffixReplacement {
             expected_current: journal.current(),
             protected_committed: position(ticket.protected_committed()),
+            retained: position(ticket.retained()),
             promised_view: ticket.scope().view,
             last_normal_view: ticket.scope().view,
             committed: position(ticket.committed()),
@@ -95,6 +101,7 @@ impl OwnedJournal {
             ticket,
             staging,
             limits,
+            selected,
         }));
         self.faulted = false;
         Ok(ticket)
@@ -178,6 +185,17 @@ impl OwnedJournal {
         }
         let pending = self.journal.take_installing()?;
         let mut journal = Box::pin(pending.staging.finish()).await?;
+        // Staging may have packed kept segments into new files under their
+        // IDs, so cached summaries hold only for unchanged references.
+        let segments = &journal.manifest().segments;
+        self.retention.retain_segments(|id| {
+            let find = |list: &[SegmentReference]| {
+                list.iter()
+                    .find(|reference| reference.segment_id == id)
+                    .copied()
+            };
+            find(&pending.selected).is_some_and(|old| find(segments) == Some(old))
+        });
         // Installation keeps the applied prefix, so replay starts from its
         // state instead of the checkpoint.
         let base = self

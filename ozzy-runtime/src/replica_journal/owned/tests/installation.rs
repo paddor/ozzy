@@ -167,12 +167,12 @@ fn policy() -> InstallationConfig {
     }
 }
 
-fn request(ticket: InstallTicket) -> FetchOps {
+fn request(ticket: &InstallTicket) -> FetchOps {
     FetchOps {
         scope: ticket.scope(),
         request_id: RequestId::from_bytes([71; 16]),
         source: ticket.source(),
-        predecessor: ticket.protected_committed(),
+        predecessor: ticket.retained(),
         max_operations: 1,
         max_body_bytes: 8192,
     }
@@ -188,7 +188,7 @@ fn stage_local(controller: &mut Controller, voter: &mut Voter) -> InstallTicket 
         voter.journal.begin_installation(ticket, policy()),
     )
     .unwrap();
-    let mut fetch = request(ticket);
+    let mut fetch = request(&ticket);
     let mut buffer = voter.journal.lease_append_buffer().unwrap();
     while fetch.predecessor != ticket.accepted() {
         let history = drive(controller, voter.journal.fetch_history(fetch, buffer)).unwrap();
@@ -211,8 +211,8 @@ fn stage_local(controller: &mut Controller, voter: &mut Voter) -> InstallTicket 
     ticket
 }
 
-fn finish(controller: &mut Controller, voter: &mut Voter, ticket: InstallTicket) {
-    let installed = drive(controller, voter.journal.finish_installation(ticket)).unwrap();
+fn finish(controller: &mut Controller, voter: &mut Voter, ticket: &InstallTicket) {
+    let installed = drive(controller, voter.journal.finish_installation(*ticket)).unwrap();
     assert_eq!(installed.applied(), ticket.committed());
     assert!(voter.journal.images().is_err());
     voter
@@ -224,7 +224,7 @@ fn finish(controller: &mut Controller, voter: &mut Voter, ticket: InstallTicket)
 fn installed_pair(controller: &mut Controller, io: Local) -> (Voter, Voter) {
     let (mut primary, mut backup) = selected(controller, io);
     let ticket = stage_local(controller, &mut primary);
-    finish(controller, &mut primary, ticket);
+    finish(controller, &mut primary, &ticket);
     assert!(primary.driver.begin_activation().is_err());
     assert!(primary.driver.begin_validation().is_err());
     // Old generation remains readable after replacement publication.
@@ -280,7 +280,7 @@ fn installed_pair(controller: &mut Controller, io: Local) -> (Voter, Voter) {
         backup.journal.begin_installation(ticket, policy()),
     )
     .unwrap();
-    let mut fetch = request(ticket);
+    let mut fetch = request(&ticket);
     let mut output = primary.journal.lease_append_buffer().unwrap();
     let mut input = backup.journal.lease_append_buffer().unwrap();
     while fetch.predecessor != ticket.accepted() {
@@ -301,7 +301,7 @@ fn installed_pair(controller: &mut Controller, io: Local) -> (Voter, Voter) {
         output = history.into_buffer();
         output.clear();
     }
-    finish(controller, &mut backup, ticket);
+    finish(controller, &mut backup, &ticket);
     let normal = backup.driver.normal().unwrap();
     let confirmation = Control::PrepareOk {
         ack: normal.acknowledgment().unwrap(),

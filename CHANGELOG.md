@@ -12,6 +12,10 @@
 
 ### Changed
 
+- A partition manifest publication reads only the headers of segments it adds
+  or changes, not every selected segment. Segment rolls, packing, retention,
+  and view changes no longer cost four file operations per selected segment;
+  a view change over many segments on slow disks finishes in time.
 - A disk-quorum election whose next leader withdraws into checkpoint recovery
   ends when that broker's recovery requests arrive, not at the doubled
   election deadline. A complete cluster restart with an expired copy serves
@@ -78,6 +82,31 @@
   journal first and stalls the partition. A replica low on segments packs a
   run of sparse sealed segments into one in the background, reading and
   writing at most 8 MiB at a time.
+- A disk-quorum replica that missed a long history while cut off no longer
+  keeps the other two from electing a leader when the old one fails. Its
+  catch-up in the view change outlasted every election timeout and restarted
+  in each new view; history transfer and installation progress now extend
+  the view. One history scan now checks both the copy's commit and its
+  accepted prefix, so the catch-up moves the missed history at most twice,
+  not three times.
+- A view change no longer faults a replica's journal worker with "selected
+  manifest segments limit exceeded" when the installed history needs more
+  segments than are left. Installation packs sparse sealed segments at the
+  limit instead.
+- A restarted disk-quorum broker that leads the next view no longer fetches
+  every operation since the previous view change again. Its last published
+  commit can be that old after a power loss; installation now keeps the
+  accepted history the election verified, up to the selected commit.
+- After a whole-cluster power loss, disk-quorum followers no longer fetch
+  every operation since the last view change again. Each segment roll now
+  also publishes the applied commit, so a restart fetches only the history
+  since its last roll. A restarted replica's installation replays only after
+  the state its reopen rebuilt, not from its checkpoint. A simulated power
+  loss serves again after 1.7 s instead of 6.3 s.
+- A disk-quorum backup that installs a new view no longer fetches its missed
+  history twice. It first looked up its own commit in the new leader's
+  history, which moved the same operations; the installation transfer now
+  checks that commit itself.
 - Disk-quorum view changes after a long history finish within the election
   timeouts instead of retrying elections forever. A backup checks the new
   leader's history from its own commit point, not from the first operation;
@@ -94,6 +123,9 @@
   to start no longer leaves it waiting for the 100 ms safety sweep, and no
   longer spends an empty round on every visit while the proposal cannot
   start. Both counted as `partition_sweep_progress`.
+- A disk-quorum follower that refuses a proposal left from its time as leader
+  no longer leaves a due retention turn waiting for the safety sweep. Neither
+  does a leader that drops a canceled or stale waiting proposal.
 - Brokers retire producer sessions with no open or append for the topic's
   `producer_idle_secs` (default 7 days). Each new writer adds a session to
   every partition it writes, so the table used to fill at about one million

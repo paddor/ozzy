@@ -18,6 +18,10 @@ use crate::replica_journal::FetchedHistory;
 pub(super) struct Lookup {
     scope: Option<Scope>,
     entries: [Option<(LogSource, Prefix)>; 6],
+    /// Prefixes a scan verified on its way to the one it was for.
+    passed: [Option<(LogSource, Prefix)>; 8],
+    /// What the running lookup scan has passed so far.
+    scan: Passed,
     unavailable: Option<(LogSource, OpNumber)>,
     bridge: Option<bridge::Bridge>,
     compatible: Option<(LogSource, LogSource)>,
@@ -28,6 +32,8 @@ impl Lookup {
         if self.scope != Some(scope) {
             self.scope = Some(scope);
             self.entries.fill(None);
+            self.passed.fill(None);
+            self.scan = Passed::default();
             self.unavailable = None;
             self.bridge = None;
             self.compatible = None;
@@ -37,8 +43,28 @@ impl Lookup {
     pub(super) fn get(&self, source: LogSource, op: OpNumber) -> Option<Digest> {
         self.entries
             .iter()
+            .chain(&self.passed)
             .flatten()
             .find_map(|&(key, prefix)| (key == source && prefix.op == op).then_some(prefix.digest))
+    }
+
+    /// Add the prefixes the finished scan of `source` passed. Selection
+    /// checks one source, so another one's are dropped; past the slots,
+    /// extras are.
+    fn remember(&mut self, source: LogSource) {
+        if self.passed.iter().flatten().any(|(key, _)| *key != source) {
+            self.passed.fill(None);
+        }
+        let found = self.scan.found;
+        for prefix in found.iter().flatten() {
+            if self.get(source, prefix.op).is_some() {
+                continue;
+            }
+            let Some(slot) = self.passed.iter_mut().find(|slot| slot.is_none()) else {
+                return;
+            };
+            *slot = Some((source, *prefix));
+        }
     }
 
     pub(super) fn unavailable(&self, source: LogSource, op: OpNumber) -> bool {
@@ -77,6 +103,37 @@ pub(super) enum TransferPurpose {
     // A candidate digest is not usable until this scan reaches the source tail.
     Lookup { op: OpNumber, found: Option<Prefix> },
     Install,
+}
+
+/// Other prefixes the election may check, which a lookup scan records as it
+/// passes them. A lagging copy checks its own commit and accept, both far
+/// behind the tail; one scan then verifies both.
+#[derive(Debug, Default)]
+struct Passed {
+    wanted: [Option<OpNumber>; 8],
+    found: [Option<Prefix>; 8],
+}
+
+impl Passed {
+    const fn new(wanted: [Option<OpNumber>; 8]) -> Self {
+        Self {
+            wanted,
+            found: [None; 8],
+        }
+    }
+
+    /// Keep the wants for a scan that starts over.
+    const fn restart(&mut self) {
+        self.found = [None; 8];
+    }
+
+    fn observe(&mut self, prefix: Prefix) {
+        for (wanted, found) in self.wanted.iter().zip(&mut self.found) {
+            if *wanted == Some(prefix.op) {
+                *found = Some(prefix);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -126,6 +183,7 @@ impl ReplicaActor {
         if source.voter != self.local {
             let start = expected.filter(|start| start.op == op && op < source.accepted.op);
             let purpose = TransferPurpose::Lookup { op, found: start };
+            self.lookup.scan = Passed::new(self.driver.lookup_ops());
             let predecessor = start.unwrap_or(Prefix::GENESIS);
             return self.start_transfer(self.driver.scope(), source, predecessor, purpose);
         }
@@ -302,7 +360,11 @@ impl ReplicaActor {
         self.enqueue(to, SendClass::Data, message)
     }
 
-    pub(super) fn receive_ops(&mut self, batch: &OpsBatch<'_>) -> Result<(), ActorError> {
+    pub(super) fn receive_ops(
+        &mut self,
+        batch: &OpsBatch<'_>,
+        now: Duration,
+    ) -> Result<(), ActorError> {
         let Some(mut transfer) = self.transfer else {
             return Ok(());
         };
@@ -314,16 +376,21 @@ impl ReplicaActor {
                 if batch.scope() != self.driver.scope() {
                     return Ok(());
                 }
+                if batch.end().op > transfer.request.predecessor.op {
+                    self.driver.history_progress(now)?;
+                }
                 for operation in batch.operations() {
                     if operation.prefix().op == *op {
                         *found = Some(operation.prefix());
                     }
+                    self.lookup.scan.observe(operation.prefix());
                 }
                 if batch.end() == transfer.request.source.accepted {
                     self.lookup.verified(
                         batch.source(),
                         found.ok_or_else(|| ActorError::history(HistoryReason::Lookup))?,
                     )?;
+                    self.lookup.remember(batch.source());
                     self.transfer = None;
                 } else {
                     transfer.request.predecessor = batch.end();
@@ -503,6 +570,9 @@ impl ReplicaActor {
         }) else {
             return Ok(false);
         };
+        if let TransferPurpose::Install = transfer.purpose {
+            return self.retired_install(transfer.request, notice);
+        }
         if notice.before.op <= transfer.request.predecessor.op {
             // The source does not hold the expected prefix a lookup started
             // from. Rescan from its boundary; the digest found there is
@@ -510,6 +580,7 @@ impl ReplicaActor {
             if notice.before != transfer.request.predecessor
                 && let TransferPurpose::Lookup { op, .. } = transfer.purpose
             {
+                self.lookup.scan.restart();
                 self.start_transfer(
                     notice.scope,
                     transfer.request.source,
@@ -535,6 +606,7 @@ impl ReplicaActor {
             }
             // The boundary is only a scan starting point. No digest
             // enters election evidence until the exact tail verifies.
+            self.lookup.scan.restart();
             self.start_transfer(
                 notice.scope,
                 transfer.request.source,
@@ -555,5 +627,94 @@ impl ReplicaActor {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    /// The source retired history that installation `request` asked for. A
+    /// backup stages from its own commit, which no lookup checked, so other
+    /// history there contradicts that commit. A retired start is proved
+    /// through the local copy, as a lookup would; staging then reads that
+    /// prefix locally. `true` when this copy fell behind.
+    fn retired_install(
+        &mut self,
+        request: FetchOps,
+        notice: wire::HistoryRetired,
+    ) -> Result<bool, ActorError> {
+        if notice.before.op <= request.predecessor.op {
+            if notice.before != request.predecessor {
+                return Err(ActorError::history(HistoryReason::Transfer));
+            }
+            return Ok(false);
+        }
+        let covered = self.pinned.is_some_and(|local| {
+            local.voter == self.local && local.accepted.op >= notice.before.op
+        });
+        if !covered
+            || self
+                .lookup
+                .unavailable(request.source, request.predecessor.op)
+        {
+            return Ok(true);
+        }
+        self.bridge_or_retire(request.source, request.predecessor.op, notice.before);
+        self.transfer = None;
+        Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prefix(op: u64) -> Prefix {
+        Prefix {
+            op: OpNumber(op),
+            digest: Digest::from_bytes([op as u8; 32]),
+        }
+    }
+
+    fn scan(lookup: &mut Lookup, wanted: &[u64], ops: std::ops::Range<u64>) {
+        let mut slots = [None; 8];
+        for (slot, op) in slots.iter_mut().zip(wanted) {
+            *slot = Some(OpNumber(*op));
+        }
+        lookup.scan = Passed::new(slots);
+        for op in ops {
+            lookup.scan.observe(prefix(op));
+        }
+    }
+
+    #[test]
+    fn scans_keep_the_wanted_prefixes_they_passed_for_their_source() {
+        let source = LogSource {
+            voter: NodeId::from_bytes([1; 16]),
+            generation: ozzy_replication::JournalGeneration(1),
+            accepted: prefix(100),
+        };
+        let mut lookup = Lookup::default();
+        scan(&mut lookup, &[10, 20, 95], 10..90);
+        lookup.remember(source);
+        assert_eq!(lookup.get(source, OpNumber(20)), Some(prefix(20).digest));
+        assert_eq!(lookup.get(source, OpNumber(15)), None);
+        assert_eq!(lookup.get(source, OpNumber(95)), None);
+        // A later, shorter scan of the same source adds to them.
+        scan(&mut lookup, &[20, 95], 90..100);
+        lookup.remember(source);
+        assert_eq!(lookup.get(source, OpNumber(10)), Some(prefix(10).digest));
+        assert_eq!(lookup.get(source, OpNumber(95)), Some(prefix(95).digest));
+        // A scan that starts over keeps its wants, not what it saw.
+        let mut restarted = Lookup::default();
+        scan(&mut restarted, &[10], 10..11);
+        restarted.scan.restart();
+        assert_eq!(restarted.scan.found, [None; 8]);
+        assert_eq!(restarted.scan.wanted[0], Some(OpNumber(10)));
+        // Another source's scan replaces them.
+        let other = LogSource {
+            voter: NodeId::from_bytes([2; 16]),
+            ..source
+        };
+        scan(&mut lookup, &[50], 40..60);
+        lookup.remember(other);
+        assert_eq!(lookup.get(source, OpNumber(10)), None);
+        assert_eq!(lookup.get(other, OpNumber(50)), Some(prefix(50).digest));
     }
 }

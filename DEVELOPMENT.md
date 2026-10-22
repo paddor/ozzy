@@ -116,7 +116,7 @@ system tests in that slice.
 | --- | --- | --- | --- |
 | Unit and core | Codecs, state transitions, bounds, authority fences | `src/` and `tests/` of `ozzy-proto`, `ozzy-core`, `ozzy-journal`, `ozzy-journal-segment`, `ozzy-replication`, `ozzy-config` | `default` |
 | Core simulation | Replayable protocol fault schedules with gated time, messages, and file jobs | `ozzy-sim/tests/` | `default`; `stress` in `extended` |
-| Seeded actor cluster | Production partition shards and journals of three brokers on one thread from one seed: link, disk, and client faults, scripted leader loss, per-tick history checks, convergence, missed wakeups | `ozzy-sim/tests/actor_cluster/` | `default`; seed campaign in `extended` |
+| Seeded actor cluster | Production partition shards and journals of three brokers on one thread from one seed: link, disk, and client faults, scripted leader loss, power loss and restart, per-tick history checks, convergence, missed wakeups | `ozzy-sim/tests/actor_cluster/` | `default`; seed campaign in `extended` |
 | Inproc integration | Real SDKs and brokers over OMQ inproc and memory file jobs; owner lifecycle | `ozzy-broker/tests/journals/serving/`, `ozzy-sim/tests/broker/` | `default`; `stress` in `extended` |
 | Full-product simulator | Sustained workload and fault churn over real owners, SDKs, and brokers | `ozzy-sim` `ozzy_sim` binary | Short gate in `default`; long runs manual |
 | Backend conformance | The same owned file operations on the pool and AIO backends | `ozzy-io-pool/tests/`, `ozzy-io-aio/tests/` | `default` |
@@ -131,7 +131,7 @@ What a layer does not prove:
 - Unit and core: only finite state and format cases.
 - Core simulation: only within model bounds and injected faults.
 - Seeded actor cluster: modeled links with OMQ semantics, no sockets, broker
-  frontend, or SDKs. No crashes or restarts yet.
+  frontend, or SDKs.
 - Inproc: no ZMTP wire and no physical disk. Threaded scheduling stays
   nondeterministic.
 - Simulator: seed replay reproduces the fault prefix, not the transport
@@ -224,15 +224,23 @@ A seed campaign over every profile (`none`, `light`, `heavy`, `swarm`, and
 `slow` disks) and scenario: `random` faults only; `failover`, which also cuts
 the leader off and requires a new one before it rejoins; `full`, which fills
 a journal of six 32 KiB segments until it refuses proposals, then loses the
-leader; and `sparse-followers`, where both followers write one
+leader; `sparse-followers`, where both followers write one
 operation per group while proposals carry four, so they converge only by
-packing. The last two skip `heavy` and `swarm`, which make too little
-progress to fill a journal.
+packing; and `sparse-rejoin`, where such a follower misses about 1300
+operations, then rejoins as the leader is lost, so the view change installs
+a suffix that outlasts any election timeout and passes the segment limit;
+`crash`, where a follower and then the leader lose power and restart
+over what reached their disks, with fresh writer generations and link
+sessions; and `power-loss`, where all three lose power at once mid-traffic.
+Its fast test also bounds the outage, which grows when a restart refetches
+or replays all history. The three sparse or full scenarios skip `heavy` and
+`swarm`, which make too little progress to fill a journal.
 A failing seed prints its parameters, schedule hash, and this command with
 `OZZY_ACTOR_SIM_SEED`, `OZZY_ACTOR_SIM_PROFILE`, and
 `OZZY_ACTOR_SIM_SCENARIO` set. A run whose faults left too little progress
 to prove much is vacuous: the campaign lists it and fails only above one in
-twenty. The fast suite also loses the leader after a long history and
+twenty. Runs spread over one thread per core; `OZZY_ACTOR_SIM_THREADS` sets
+the count. The fast suite also loses the leader after a long history and
 repeatedly; `seeded::stress` adds a very long history.
 `OZZY_ACTOR_SIM_TRACE=1` prints each broker's view and positions as they
 change.

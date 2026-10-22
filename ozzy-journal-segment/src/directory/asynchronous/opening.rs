@@ -220,7 +220,7 @@ impl Journal {
         let root = directory.root().to_path_buf();
         let access = directory.access();
         open_data_directories(&access, &root).await?;
-        validate_headers(&access, &root, &selected.manifest, limits).await?;
+        validate_headers(&access, &root, &selected.manifest, &[], limits).await?;
         let checkpoint = selected_checkpoint(&access, &root, &selected.manifest, limits).await?;
         cleanup_staging(&access, &root, limits).await?;
         let evidence = if selected.manifest.durable_evidence {
@@ -458,16 +458,26 @@ pub(super) async fn selected_checkpoint(
     Ok(Some(checkpoint))
 }
 
+/// Check the header of each segment `manifest` selects. A reference that
+/// `selected` holds after the same predecessor was checked when it entered
+/// the selection, and the journal never rewrites a selected header or
+/// shortens its file, so it is not read again. A publication then reads
+/// only the segments it adds or changes.
 pub(super) async fn validate_headers(
     access: &Access,
     root: &Path,
     manifest: &Manifest,
+    selected: &[SegmentReference],
     limits: Limits,
 ) -> Result<(), DirectoryError> {
     let mut previous = None;
     for reference in &manifest.segments {
         if reference.capacity > limits.io.max_segment_bytes {
             return Err(DirectoryError::SegmentMismatch(reference.segment_id));
+        }
+        if checked(selected, previous, reference) {
+            previous = Some(reference);
+            continue;
         }
         let handle = access
             .open(
@@ -492,6 +502,26 @@ pub(super) async fn validate_headers(
         previous = Some(reference);
     }
     Ok(())
+}
+
+/// Whether `selected` holds `reference` after a segment with the ID of
+/// `previous`, or holds it at all when it has no predecessor to check.
+fn checked(
+    selected: &[SegmentReference],
+    previous: Option<&SegmentReference>,
+    reference: &SegmentReference,
+) -> bool {
+    let first = reference.first_chain.next_op_number();
+    let Ok(at) = selected.binary_search_by_key(&first, |old| old.first_chain.next_op_number())
+    else {
+        return false;
+    };
+    selected.get(at) == Some(reference)
+        && previous.is_none_or(|previous| {
+            at.checked_sub(1)
+                .and_then(|before| selected.get(before))
+                .is_some_and(|before| before.segment_id == previous.segment_id)
+        })
 }
 
 async fn validate_sealed(

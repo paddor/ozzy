@@ -6,7 +6,7 @@ mod selection;
 use ozzy_proto::NodeId;
 
 use crate::{
-    Configuration, Digest, JournalGeneration, NormalReplica, Prefix, ReplicaSnapshot,
+    Configuration, Digest, JournalGeneration, NormalReplica, OpNumber, Prefix, ReplicaSnapshot,
     ReplicationError, Scope, Status, SyncTicket, VoterIndex, VoterSet, Voters, WriteTicket,
 };
 
@@ -105,6 +105,7 @@ pub struct SelectedView {
     scope: Scope,
     source: LogSource,
     committed: Prefix,
+    retained: Prefix,
     voters: VoterSet,
 }
 
@@ -120,6 +121,11 @@ impl SelectedView {
     /// Largest compatible known commit floor in the participating reports.
     pub const fn committed(self) -> Prefix {
         self.committed
+    }
+    /// This voter's longest prefix that selection verified in the source,
+    /// at most `committed`.
+    pub(crate) const fn retained(self) -> Prefix {
+        self.retained
     }
     /// Bitset of participating voters in configured order, including the primary.
     pub const fn voter_mask(self) -> u8 {
@@ -178,6 +184,23 @@ impl ViewChange {
                 accepted: report.log.accepted,
             })
         })
+    }
+
+    /// Operations whose prefixes this election may look up in its chosen
+    /// source: each report's commit and accept, and this voter's own.
+    pub fn lookup_ops(&self) -> [Option<OpNumber>; 8] {
+        let local = self.normal.snapshot();
+        let mut ops = [None; 8];
+        ops[6] = Some(local.committed.op);
+        ops[7] = Some(local.accepted.op);
+        let (slots, _) = ops.as_chunks_mut::<2>();
+        for ([committed, accepted], report) in slots.iter_mut().zip(self.reports.values()) {
+            if let Some(report) = report {
+                *committed = Some(report.log.committed.op);
+                *accepted = Some(report.log.accepted.op);
+            }
+        }
+        ops
     }
 
     pub(crate) fn begin(
@@ -426,7 +449,7 @@ impl ViewChange {
         Ok(())
     }
 
-    fn conflict(&mut self) -> ViewChangeError {
+    pub(crate) fn conflict(&mut self) -> ViewChangeError {
         self.normal.fault();
         ViewChangeError::ConflictingHistory
     }
