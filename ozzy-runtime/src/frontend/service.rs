@@ -1,19 +1,17 @@
 //! Shared link negotiation, routing, and bounded transport progress.
 
-use crate::transport::Frames;
 use std::{collections::BTreeMap, sync::Arc};
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use omq_tokio::{Message, TrySendError};
-use ozzy_proto::{NodeId, Opcode, data::DataLimits, decode_packet, handshake, nack};
+use omq_tokio::Message;
+use ozzy_proto::{NodeId, Opcode, data::DataLimits, handshake, nack};
 
 use super::{
-    Binding, CatalogError, Dispatcher, Kind, LinkIds, LinkSessions, ReplyError, Routed, SetupError,
+    Binding, CatalogError, Dispatcher, Kind, LinkIds, LinkSessions, ReplyError, SetupError,
     TopicCatalog, WatchRegistry,
 };
 use crate::dispatch::Class;
-use crate::replica_transport::SendAttempt;
 use crate::signal::StateSignal;
 
 mod admission;
@@ -22,6 +20,7 @@ mod links;
 use links::LinkState;
 pub use links::{Access, Link, Links};
 mod progress;
+mod receive;
 
 const BROKER_ROLE: u32 = 1 << 3;
 
@@ -294,56 +293,6 @@ impl Service {
         self.dispatcher.routes.limits
     }
 
-    /// Lossy group publication from an independently configured SUB connection.
-    /// Full shard capacity discards this attempt; accepted-tail probes repair it.
-    pub fn receive_publication(
-        &mut self,
-        publisher: NodeId,
-        message: &Message,
-        retained_bytes: usize,
-    ) -> Result<Option<Routed>, ReceiveError> {
-        let Some((route, frames)) = message.routed_packet() else {
-            return Err(ReceiveError::Peer);
-        };
-        if self
-            .links
-            .get(publisher)
-            .is_none_or(|link| link.binding.kind != Kind::Broker)
-        {
-            return Err(ReceiveError::Peer);
-        }
-        let packet = decode_packet(&frames, self.dispatcher.routes.limits)?;
-        let scope = ozzy_replication::wire::route(packet, self.dispatcher.routes.limits).map_err(
-            |error| {
-                ReceiveError::Dispatch(super::Rejection::Routing(super::RoutingError::Broker(
-                    error,
-                )))
-            },
-        )?;
-        if packet.envelope.opcode != Opcode::PreparePub
-            || route != scope.group_id.as_bytes()
-            || packet.envelope.sender != publisher
-        {
-            return Err(ReceiveError::Peer);
-        }
-        let (_, packet_frames) = message.routed_packet_bytes().ok_or(ReceiveError::Peer)?;
-        let normalized = Message::multipart(
-            std::iter::once(Bytes::copy_from_slice(publisher.as_bytes())).chain(packet_frames),
-        );
-        self.dispatcher
-            .dispatch_data(publisher, normalized, retained_bytes)
-            .map(Some)
-            .map_err(|rejected| {
-                if matches!(
-                    rejected.reason,
-                    super::Rejection::Data(super::DataPressure::Full { .. })
-                ) {
-                    crate::profiling::event(crate::profiling::Event::ReplicaPublicationQueueDrop);
-                }
-                ReceiveError::Dispatch(rejected.reason)
-            })
-    }
-
     /// Observe producer queue space after a failed enqueue without holding
     /// the service across the wait.
     pub fn data_space_changed_after(
@@ -355,152 +304,6 @@ impl Service {
     ) -> Option<impl std::future::Future<Output = ()> + use<>> {
         self.dispatcher
             .data_space_changed_after(shard, kind, class, generation)
-    }
-
-    /// Receive one PEER frame. Full admission returns pressure without a refusal.
-    /// The transport owner restores its original frame to the same receive source.
-    /// Retained bytes cover backing storage, not just visible payload length.
-    pub fn receive(
-        &mut self,
-        message: Message,
-        retained_bytes: usize,
-    ) -> Result<Option<Routed>, ReceiveError> {
-        if message.len() == 2 {
-            return self.receive_compact(&message, retained_bytes);
-        }
-        let Some((route, frames)) = message.routed_packet() else {
-            return Err(ReceiveError::Peer);
-        };
-        let peer = NodeId::from_bytes(route.try_into().map_err(|_| ReceiveError::Peer)?);
-        let access = self.peers.get(&peer).map(|state| state.access);
-        if access.is_none() && self.trusted_maximum == 0 {
-            return Err(ReceiveError::Peer);
-        }
-        let envelope = self.sessions.receive_limits(peer).envelope;
-        let packet = decode_packet(&frames, envelope)?;
-        if packet.envelope.opcode == Opcode::PreparePub {
-            return Err(ReceiveError::Peer);
-        }
-        let access = match access {
-            Some(access) => access,
-            None => self.admit_trusted_client(peer, packet)?,
-        };
-        if matches!(packet.envelope.opcode, Opcode::Hello | Opcode::Welcome) {
-            self.receive_handshake(peer, access.kind, packet, envelope)?;
-            Ok(None)
-        } else if packet.envelope.opcode == Opcode::StateSnapshotRequest {
-            match packet.metadata.first() {
-                Some(0) => self.receive_topic(peer, packet)?,
-                Some(1) => self.receive_watch(peer, packet)?,
-                _ => {
-                    return Err(ReceiveError::Directory(
-                        ozzy_proto::data::CodecError::Profile,
-                    ));
-                }
-            }
-            Ok(None)
-        } else {
-            if packet.envelope.opcode == Opcode::ReplicaState {
-                self.bind_incoming_channel(peer, packet, envelope)?;
-            }
-            self.dispatcher
-                .dispatch_data(peer, message, retained_bytes)
-                .map(Some)
-                .map_err(|rejected| ReceiveError::Dispatch(rejected.reason))
-        }
-    }
-
-    /// Nonblocking per-peer reply admission under negotiated directional limits.
-    pub fn try_reply(
-        &mut self,
-        class: Class,
-        message: Message,
-    ) -> Result<(), (ReplyError, Message)> {
-        if let Err(error) = self.check_reply(&message) {
-            return Err((error, message));
-        }
-        self.dispatcher.try_reply(class, message)
-    }
-
-    fn check_reply(&self, message: &Message) -> Result<(), ReplyError> {
-        if message.len() == 2 {
-            return Ok(());
-        }
-        let (route, [_, metadata, payload]) = message.routed_packet().ok_or(ReplyError::Frames)?;
-        let peer = NodeId::from_bytes(route.try_into().map_err(|_| ReplyError::Peer)?);
-        let limits = self.links.get(peer).ok_or(ReplyError::Peer)?.send.envelope;
-        if metadata.len() > limits.max_metadata_bytes || payload.len() > limits.max_payload_bytes {
-            return Err(ReplyError::Size);
-        }
-        Ok(())
-    }
-
-    /// Whether any handshake or established-link reply still needs transport.
-    pub fn has_pending(&self) -> bool {
-        self.dispatcher.has_replies() || self.peers.values().any(|peer| peer.handshake.is_some())
-    }
-
-    /// At most one handshake and one peer's two reply classes per turn. Full
-    /// destinations retain their owners and never block another destination.
-    pub fn flush(
-        &mut self,
-        mut send: impl FnMut(Message) -> Result<(), TrySendError>,
-    ) -> Result<bool, omq_tokio::Error> {
-        let mut advanced = false;
-        for handshake in [self.handshake_first, !self.handshake_first] {
-            let progress = if handshake {
-                self.flush_handshake(&mut send)?
-            } else {
-                let peers = &self.peers;
-                let progress = self.dispatcher.flush_replies(|message| {
-                    let awaiting = route_peer(&message)
-                        .and_then(|peer| peers.get(&peer))
-                        .is_some_and(|state| state.awaiting_welcome);
-                    if awaiting {
-                        Err(TrySendError::Full(message))
-                    } else {
-                        send(message)
-                    }
-                })?;
-                [progress.control, progress.data]
-                    .into_iter()
-                    .any(|attempt| {
-                        matches!(attempt, SendAttempt::Submitted | SendAttempt::Unroutable)
-                    })
-            };
-            if progress {
-                self.handshake_first = !handshake;
-                advanced = true;
-            }
-        }
-        Ok(advanced)
-    }
-
-    fn flush_handshake(
-        &mut self,
-        send: &mut impl FnMut(Message) -> Result<(), TrySendError>,
-    ) -> Result<bool, omq_tokio::Error> {
-        let mut advanced = false;
-        if let Some((next, state)) = crate::turn::after_mut(&mut self.peers, self.handshake_turn) {
-            self.handshake_turn = Some(next);
-            if let Some(message) = state.handshake.take() {
-                match send(message) {
-                    Ok(()) => {
-                        state.awaiting_welcome = false;
-                        // Replies refused while the handshake was unsent were
-                        // not refused by OMQ.
-                        self.dispatcher.unblock(next, 0);
-                        self.dispatcher.unblock(next, 1);
-                        advanced = true;
-                    }
-                    Err(TrySendError::Error(omq_tokio::Error::Unroutable)) => advanced = true,
-                    Err(TrySendError::Full(message)) => state.handshake = Some(message),
-                    Err(TrySendError::Closed) => return Err(omq_tokio::Error::Closed),
-                    Err(TrySendError::Error(error)) => return Err(error),
-                }
-            }
-        }
-        Ok(advanced)
     }
 }
 

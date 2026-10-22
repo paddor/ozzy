@@ -137,29 +137,27 @@ impl Dispatcher {
             message,
         };
         let generation = lane.space_generation();
-        match lane.try_send(input, retained_bytes) {
-            Ok(()) => Ok(route),
-            Err(error) => {
-                let (reason, input) = match error {
-                    DataSendError::Full(input) => (
-                        DataPressure::Full {
-                            shard: route.placement.shard,
-                            kind: binding.kind,
-                            class: route.class,
-                            generation,
-                        },
-                        input,
-                    ),
-                    DataSendError::Closed(input) => (DataPressure::Closed, input),
-                    DataSendError::Oversized(input) => (DataPressure::Charge, input),
-                    DataSendError::Invalid(input) => (DataPressure::Invalid, input),
-                };
-                Err(Rejected {
-                    reason: Rejection::Data(reason),
-                    message: input.message,
-                })
-            }
-        }
+        let Err(error) = lane.try_send(input, retained_bytes) else {
+            return Ok(route);
+        };
+        let (reason, input) = match error {
+            DataSendError::Full(input) => (
+                DataPressure::Full {
+                    shard: route.placement.shard,
+                    kind: binding.kind,
+                    class: route.class,
+                    generation,
+                },
+                input,
+            ),
+            DataSendError::Closed(input) => (DataPressure::Closed, input),
+            DataSendError::Oversized(input) => (DataPressure::Charge, input),
+            DataSendError::Invalid(input) => (DataPressure::Invalid, input),
+        };
+        Err(Rejected {
+            reason: Rejection::Data(reason),
+            message: input.message,
+        })
     }
 
     /// Wait for a shard dequeue after the generation captured before a failed
