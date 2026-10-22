@@ -7,7 +7,11 @@ case "${1##*/}" in
         executable=$1
         shift
         alias_path="${executable%/*}/ozzy_unit-${executable##*/ozzy-}"
-        ln -sfn "${executable##*/}" "$alias_path"
+        # Nextest lists each binary twice at once, and multicall coreutils
+        # replace links non-atomically. The link always names the same file,
+        # so one another call made first is correct.
+        [[ -L $alias_path ]] || ln -s "${executable##*/}" "$alias_path" 2> /dev/null ||
+            [[ -L $alias_path ]]
         exec "$alias_path" "$@"
         ;;
     *) exec "$@" ;;
