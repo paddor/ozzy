@@ -102,7 +102,11 @@ fn stopped_broker_is_still_discovered() {
     // between fork and exec. Linux returns ETXTBSY until that FD closes.
     let deadline = std::time::Instant::now() + Duration::from_secs(1);
     let mut child = loop {
-        match Command::new(&exe).arg("30").spawn() {
+        // A multicall coreutils binary picks its program from argv[0]; the
+        // audit reads the name from the executable path.
+        let mut command = Command::new(&exe);
+        std::os::unix::process::CommandExt::arg0(&mut command, "sleep");
+        match command.arg("30").spawn() {
             Ok(child) => break child,
             Err(error)
                 if error.raw_os_error() == Some(26) && std::time::Instant::now() < deadline =>
