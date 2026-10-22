@@ -18,7 +18,7 @@ cp "$CARGO_TARGET_DIR/$ozzy_java_profile/libozzy_java.so" \
 mvn -B -f bindings/java/pom.xml "-Dozzy.buildDir=$ozzy_java_build" \
     "-Dozzy.platform=$ozzy_java_platform" package
 mkdir -p "$ozzy_java_build/javadoc" "$ozzy_java_build/smoke"
-rg --files bindings/java/src/main/java -g '*.java' > "$ozzy_java_build/sources.list"
+find bindings/java/src/main/java -name '*.java' > "$ozzy_java_build/sources.list"
 javadoc -quiet -Xdoclint:all,-missing -Werror --release 22 \
     -d "$ozzy_java_build/javadoc" @"$ozzy_java_build/sources.list"
 ozzy_java_version="$(./scripts/ozzy_cargo metadata --no-deps --format-version 1 --offline | \
