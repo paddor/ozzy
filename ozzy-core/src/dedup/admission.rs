@@ -134,21 +134,17 @@ impl Index {
                 return Err(Error::Batch);
             }
             let hash = self.hash.hash_one(id);
-            let previous = self
-                .scratch
-                .find(hash, id)
-                .map(|row| row.entry.offset)
-                .or_else(|| {
-                    self.lookup_at(id, incoming.logical_time)
-                        .map(|found| match found {
-                            Match::Committed(offset) => offset,
-                            Match::Pending { offset, operation } => {
-                                *pending_original =
-                                    Some(pending_original.unwrap_or(0).max(operation));
-                                offset
-                            }
-                        })
-                });
+            let previous = match self.scratch.find(hash, id) {
+                Some(row) => Some(row.entry.offset),
+                None => match self.lookup_at(id, incoming.logical_time) {
+                    Some(Match::Committed(offset)) => Some(offset),
+                    Some(Match::Pending { offset, operation }) => {
+                        *pending_original = Some(pending_original.unwrap_or(0).max(operation));
+                        Some(offset)
+                    }
+                    None => None,
+                },
+            };
             let outcome = if let Some(offset) = previous {
                 AppendOutcome {
                     disposition: AppendDisposition::Duplicate,
