@@ -311,6 +311,35 @@ fn stored_view<'a>(
 
 /// The IDs of a stored batch that continues `partition` at `first`, with the
 /// log time and record end it leaves.
+/// The partition and logical time after a metadata operation: its creation
+/// names the partition once, and a watermark advances the time.
+fn metadata_effect(
+    operation: CanonicalOperation<'_>,
+    decoding: OperationLimits,
+    limits: Limits,
+    partition: Option<PartitionIncarnation>,
+    time: u64,
+) -> Result<(Option<PartitionIncarnation>, u64), JournalError> {
+    match decode_operation_body(operation.kind, operation.body, decoding)? {
+        OperationBody::CreatePartition(create) => {
+            if partition.is_some()
+                || create.dedup_window_millis.map(std::num::NonZeroU64::get)
+                    != Some(limits.window_millis)
+            {
+                return Err(JournalError::Configuration);
+            }
+            Ok((Some(create.partition), time))
+        }
+        OperationBody::DedupWatermark(watermark) => {
+            if Some(watermark.partition) != partition {
+                return Err(JournalError::AppendMismatch);
+            }
+            Ok((partition, watermark.logical_time))
+        }
+        _ => Ok((partition, time)),
+    }
+}
+
 fn stored_ids(
     view: &ResolvedAppendView<'_>,
     partition: Option<PartitionIncarnation>,
@@ -381,24 +410,8 @@ impl Image {
                 // Enabled partitions require canonical outcomes and log time.
                 OperationKind::Append => return Err(JournalError::UnsupportedHistory),
                 _ => {
-                    match decode_operation_body(operation.kind, operation.body, decoding)? {
-                        OperationBody::CreatePartition(create) => {
-                            if partition.is_some()
-                                || create.dedup_window_millis.map(std::num::NonZeroU64::get)
-                                    != Some(limits.window_millis)
-                            {
-                                return Err(JournalError::Configuration);
-                            }
-                            partition = Some(create.partition);
-                        }
-                        OperationBody::DedupWatermark(watermark) => {
-                            if Some(watermark.partition) != partition {
-                                return Err(JournalError::AppendMismatch);
-                            }
-                            time = watermark.logical_time;
-                        }
-                        _ => {}
-                    }
+                    (partition, time) =
+                        metadata_effect(operation, decoding, limits, partition, time)?;
                     Vec::new()
                 }
             };

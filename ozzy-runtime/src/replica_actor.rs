@@ -12,11 +12,14 @@
 
 mod config;
 mod construct;
+mod data;
 mod deadline;
 mod diagnostics;
 mod donors;
 pub use diagnostics::{HistoryFailure, HistoryReason};
 mod election;
+mod error;
+pub use error::ActorError;
 mod groups;
 pub use groups::{GroupCoordinator, GroupCoordinatorConfig, TopicTopology};
 mod history;
@@ -77,10 +80,8 @@ use ozzy_replication::{
     PromiseTicket, ReplicaSnapshot, Scope, StartView,
 };
 
-use crate::replica_journal::{
-    AppendBuffer, JournalError, ProposalBuffer, ReplicaJournal, SubmitError,
-};
-use crate::replica_transport::{EnqueueError, OutboxError, ReplicaOutbox, SendClass};
+use crate::replica_journal::{AppendBuffer, ProposalBuffer, ReplicaJournal, SubmitError};
+use crate::replica_transport::{EnqueueError, ReplicaOutbox, SendClass};
 use history::{Lookup, Transfer};
 use io::{PendingIo, PendingSync};
 
@@ -372,78 +373,6 @@ impl ReplicaActor {
         Ok(())
     }
 
-    fn receive_data(&mut self, message: &Message, now: Duration) -> Result<bool, ActorError> {
-        let Some((voter, binding, frames)) = routed(self.configuration, &self.bindings, message)
-        else {
-            return Ok(true);
-        };
-        let scope = self.driver.scope();
-        let Some((batch, publication)) = self.decode_data(&scope, frames, binding) else {
-            return Ok(true);
-        };
-        // A missing predecessor cannot be supplied by waiting on this frame.
-        // Drop the gap and let the next correlated probe request the prefix.
-        if batch.predecessor().op > self.work.receive_report().received.op {
-            if publication {
-                crate::profiling::event(crate::profiling::Event::ReplicaPublicationGap);
-                self.work.flow.observe_receipt(
-                    self.work.receive_report().received.op,
-                    Some(batch.end().op),
-                    true,
-                    now,
-                );
-            }
-            return Ok(true);
-        }
-        let end = batch.end().op;
-        let consumed = self.receive_prepare(self.configuration.voters()[voter], batch, now)?;
-        if publication && !consumed {
-            self.work.flow.pending_publication = Some(end);
-        }
-        self.work.flow.observe_receipt(
-            self.work.receive_report().received.op,
-            None,
-            publication,
-            now,
-        );
-        // PUB receipt can advance beyond PEER reservations. Keep its full digest
-        // report so the leader verifies exact history instead of trusting a counter.
-        if publication {
-            self.work.flow.clear_compact_receipt();
-        }
-        Ok(consumed)
-    }
-
-    /// Decode follower data: a group publication from the primary or a PEER
-    /// flow PREPARE. `true` marks a publication; `None` drops the packet.
-    fn decode_data<'a>(
-        &self,
-        scope: &'a Scope,
-        frames: [&'a [u8]; 3],
-        binding: PeerBinding,
-    ) -> Option<(wire::PrepareBatch<'a>, bool)> {
-        let packet = ozzy_proto::decode_packet(&frames, self.wire_limits.envelope).ok()?;
-        if packet.envelope.opcode != ozzy_proto::Opcode::PreparePub {
-            let Ok(ReplicaMessage::Flow(wire::FlowMessage::Prepare { batch, .. })) =
-                wire::decode(&frames, binding, self.wire_limits)
-            else {
-                return None;
-            };
-            return Some((batch, false));
-        }
-        let published = [
-            scope.group_id.as_bytes().as_slice(),
-            frames[0],
-            frames[1],
-            frames[2],
-        ];
-        let batch =
-            wire::decode_publication(&published, binding, self.local, *scope, self.wire_limits)
-                .ok()?;
-        crate::profiling::event(crate::profiling::Event::ReplicaPublicationReceived);
-        Some((batch, true))
-    }
-
     fn ack(&mut self, now: Duration) -> Result<(), ActorError> {
         if now < self.ack_at {
             return Ok(());
@@ -485,50 +414,6 @@ fn require_normal(driver: &ReplicaDriver) -> Result<&ozzy_replication::NormalRep
     driver
         .normal()
         .ok_or_else(|| DriverError::from(ozzy_replication::ReplicationError::NotNormal).into())
-}
-
-/// Fail-closed actor error. No variant grants authority to weaken commit policy.
-#[derive(Debug, thiserror::Error)]
-pub enum ActorError {
-    /// Explicit single-broker state rejected a transition.
-    #[error(transparent)]
-    Local(#[from] ozzy_replication::local::Error),
-    /// Nonvoting recovery rejected authority or history evidence.
-    #[error(transparent)]
-    Recovery(#[from] ozzy_replication::recovery::RecoveryError),
-    /// Volatile receipt/repair policy failed; never interpreted as a disk vote.
-    #[error(transparent)]
-    Flow(#[from] ozzy_replication::flow::TransmitError),
-    /// Storage-validated startup belongs to another worker incarnation.
-    #[error("replica startup does not belong to this journal worker")]
-    StartupMismatch,
-    /// Inconsistent or unrepresentable startup bounds.
-    #[error("invalid replica actor limits")]
-    Limits,
-    /// A bounded actor invariant could not be fulfilled by verified history.
-    #[error(transparent)]
-    History(Box<HistoryFailure>),
-    /// Production protocol core rejected an authority or history transition.
-    #[error(transparent)]
-    Driver(#[from] DriverError),
-    /// A real journal action failed or disappeared.
-    #[error(transparent)]
-    Journal(#[from] JournalError),
-    /// Worker admission closed or unexpectedly exhausted its reserved action budget.
-    #[error(transparent)]
-    Submit(#[from] SubmitError),
-    /// An internally generated packet failed wire validation.
-    #[error(transparent)]
-    Wire(#[from] wire::WireError),
-    /// Configured outbox or OMQ transmission failure.
-    #[error(transparent)]
-    Outbox(#[from] OutboxError),
-    /// Invalid internally generated message, not ordinary queue backpressure.
-    #[error("invalid replica outgoing message: {0:?}")]
-    Enqueue(EnqueueError),
-    /// Local socket failure; never counted as evidence about a remote operation.
-    #[error(transparent)]
-    Transport(#[from] omq_tokio::Error),
 }
 
 /// The voter slot a routed packet came from, its binding, and the packet.

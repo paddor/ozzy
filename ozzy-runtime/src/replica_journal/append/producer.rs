@@ -136,7 +136,7 @@ impl AppendBuffer {
             AppendHeader, OperationKind, OperationLimits, append_wire_record_batch,
         };
         self.check_producer_entry()?;
-        let room = self.limits.max_body_bytes - self.bodies.len();
+        let room = self.room();
         let limits = OperationLimits {
             max_body_bytes: room,
             max_payload_bytes: room,

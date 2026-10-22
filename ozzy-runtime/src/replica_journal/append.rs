@@ -7,15 +7,17 @@ mod metadata;
 mod producer;
 mod progress;
 pub(in crate::replica_journal) use progress::JoinedProgress;
+mod retained;
+pub(in crate::replica_journal) use retained::RetainedAppend;
 mod split;
 mod trim;
+mod validated;
+pub use validated::{AdmittedAppend, ValidatedAppend};
 
 use std::ops::Range;
 
-use ozzy_core::state::PreparedCanonicalGroup;
 use ozzy_journal::operation::{CanonicalOperation, Digest, ValidatedWireAppend};
-use ozzy_replication::driver::ValidationTicket;
-use ozzy_replication::{JournalGeneration, PipelineLimits, PreparedOperation, WriteTicket};
+use ozzy_replication::{JournalGeneration, PipelineLimits, PreparedOperation};
 use tokio::sync::OwnedSemaphorePermit;
 
 use super::JournalError;
@@ -35,60 +37,6 @@ struct Descriptor {
     primary_payload_validated: bool,
     /// Application-thread proof for one producer wire APPEND body.
     proof: Option<ValidatedWireAppend>,
-}
-
-/// Immutable bounded history retained independently of a reusable caller arena.
-#[derive(Debug)]
-pub(super) struct RetainedAppend {
-    entries: Vec<(Descriptor, Digest)>,
-    bodies: bytes::Bytes,
-    retained_bytes: usize,
-    validated: bool,
-    pub(super) prepared: Vec<PreparedOperation>,
-}
-
-impl RetainedAppend {
-    pub(super) fn operations(&self) -> impl ExactSizeIterator<Item = CanonicalOperation<'_>> {
-        self.entries.iter().map(|(entry, _)| CanonicalOperation {
-            body: &self.bodies[entry.body.clone()],
-            ..entry.envelope
-        })
-    }
-
-    pub(super) fn verified_operations(
-        &self,
-    ) -> impl ExactSizeIterator<Item = (CanonicalOperation<'_>, Digest)> {
-        self.operations()
-            .zip(self.entries.iter().map(|(_, digest)| *digest))
-    }
-
-    pub(super) fn payload(&self, part: &[u8]) -> bytes::Bytes {
-        self.bodies.slice_ref(part)
-    }
-    pub(super) fn retained_bytes(&self) -> usize {
-        self.retained_bytes
-    }
-    /// Producer proofs in operation order; `None` for operations without one.
-    pub(super) fn proofs(&self) -> impl ExactSizeIterator<Item = Option<ValidatedWireAppend>> {
-        self.entries.iter().map(|(entry, _)| entry.proof)
-    }
-    /// Whether every operation in `range` has a validated payload, and whether
-    /// all of their payloads are producer-prepared.
-    pub(super) fn validated_payloads_prepared(&self, range: Range<usize>) -> Option<bool> {
-        let mut prepared = true;
-        for (entry, _) in self.entries.get(range)? {
-            prepared &= match entry.proof {
-                Some(proof) => proof.payload_is_prepared(),
-                None if entry.primary_payload_validated => false,
-                None => return None,
-            };
-        }
-        Some(prepared)
-    }
-    /// Whether every immutable body passed the journal owner's limits.
-    pub(super) const fn validated(&self) -> bool {
-        self.validated
-    }
 }
 
 /// Reusable canonical-body arena leased from one journal owner.
@@ -161,7 +109,7 @@ impl AppendBuffer {
     /// Reserve a complete incoming chunk before copying any operation. Shared
     /// shard exhaustion leaves the chunk retryable and its old bytes untouched.
     pub(crate) fn reserve_incoming(&mut self, bytes: usize) -> Result<bool, JournalError> {
-        if bytes > self.limits.max_body_bytes - self.bodies.len() {
+        if bytes > self.room() {
             return Err(JournalError::AppendCapacity);
         }
         match self.bodies.reserve(bytes) {
@@ -174,7 +122,7 @@ impl AppendBuffer {
 
     pub(super) fn reserve_body_bytes(&mut self, bytes: usize) -> Result<(), JournalError> {
         self.check_producer_entry()?;
-        if bytes > self.limits.max_body_bytes - self.bodies.len() {
+        if bytes > self.room() {
             return Err(JournalError::AppendCapacity);
         }
         self.bodies.reserve(bytes)
@@ -190,6 +138,11 @@ impl AppendBuffer {
             return Err(JournalError::AppendCapacity);
         }
         Ok(())
+    }
+
+    /// Body bytes the lease still admits.
+    fn room(&self) -> usize {
+        self.limits.max_body_bytes - self.bodies.len()
     }
 
     pub(super) fn retain(&mut self) -> RetainedAppend {
@@ -301,9 +254,7 @@ impl AppendBuffer {
         primary_payload_validated: bool,
     ) -> Result<(), JournalError> {
         self.validated = false;
-        if self.entries.len() == self.limits.max_operations
-            || operation.body.len() > self.limits.max_body_bytes - self.bodies.len()
-        {
+        if self.entries.len() == self.limits.max_operations || operation.body.len() > self.room() {
             return Err(JournalError::AppendCapacity);
         }
         let start = self.bodies.len();
@@ -411,7 +362,7 @@ impl AppendBuffer {
     /// charged body leases an arena of its exact new total, so growing per
     /// part would lease, clear, and copy the whole read again for every part.
     pub(super) fn reserve_read_parts(&mut self, bytes: usize) -> Result<(), JournalError> {
-        if bytes > self.limits.max_body_bytes - self.bodies.len() {
+        if bytes > self.room() {
             return Err(JournalError::AppendCapacity);
         }
         self.bodies.reserve(bytes)
@@ -421,7 +372,7 @@ impl AppendBuffer {
         &mut self,
         bytes: usize,
     ) -> Result<(), JournalError> {
-        if bytes > self.limits.max_body_bytes - self.bodies.len() {
+        if bytes > self.room() {
             return Err(JournalError::AppendCapacity);
         }
         self.bodies.reserve_when_available(bytes).await
@@ -429,7 +380,7 @@ impl AppendBuffer {
 
     pub(super) fn push_read_part(&mut self, part: &[u8]) -> Result<Range<usize>, JournalError> {
         self.validated = false;
-        if part.len() > self.limits.max_body_bytes - self.bodies.len() {
+        if part.len() > self.room() {
             return Err(JournalError::AppendCapacity);
         }
         let first = self.bodies.len();
@@ -475,35 +426,22 @@ impl AppendBuffer {
         if self.entries.len() == self.limits.max_operations {
             return Err(JournalError::AppendCapacity);
         }
-        let room = self.limits.max_body_bytes - self.bodies.len();
+        let room = self.room();
+        let limits = OperationLimits {
+            max_body_bytes: room,
+            max_payload_bytes: room,
+            // Encoding is bounded by the leased arena. The journal owner
+            // separately enforces its configured canonical record limits.
+            max_records: room / 20,
+            max_parts: room / 4,
+            ..OperationLimits::default()
+        };
         if self.bodies.is_charged() {
             let mut size = body::EncodedSize::default();
-            ozzy_journal::operation::append_operation_body_to(
-                &mut size,
-                body,
-                OperationLimits {
-                    max_body_bytes: room,
-                    max_payload_bytes: room,
-                    max_records: room / 20,
-                    max_parts: room / 4,
-                    ..OperationLimits::default()
-                },
-            )?;
+            ozzy_journal::operation::append_operation_body_to(&mut size, body, limits)?;
             self.bodies.reserve(size.0)?;
         }
-        let range = append_operation_body(
-            self.bodies.mutable()?,
-            body,
-            OperationLimits {
-                max_body_bytes: room,
-                max_payload_bytes: room,
-                // Encoding is bounded by the leased arena. The journal owner
-                // separately enforces its configured canonical record limits.
-                max_records: room / 20,
-                max_parts: room / 4,
-                ..OperationLimits::default()
-            },
-        )?;
+        let range = append_operation_body(self.bodies.mutable()?, body, limits)?;
         self.entries.push(Descriptor {
             envelope: CanonicalOperation {
                 group_id: ozzy_proto::GroupId::from_bytes([0; 16]),
@@ -520,77 +458,5 @@ impl AppendBuffer {
             proof: None,
         });
         Ok(())
-    }
-}
-
-/// Worker-validated application plans, not admission, persistence, or quorum evidence.
-///
-/// Call `ReplicaDriver::prepare_validated` with this ticket and metadata before
-/// submitting a write or transmitting PREPARE. Changed authority/image requires
-/// discarding these plans and validating again. This initial command accepts
-/// only a fresh contiguous suffix; duplicate/overlap handling remains actor work.
-#[derive(Debug)]
-pub struct ValidatedAppend {
-    pub(super) validation: ValidationTicket,
-    pub(super) buffer: AppendBuffer,
-    pub(super) plan: PreparedCanonicalGroup,
-    pub(super) records: Vec<ozzy_journal_segment::PreparedOperationRecords>,
-    pub(super) dedup: Option<Box<super::owned::dedup::Prepared>>,
-}
-
-impl ValidatedAppend {
-    pub(crate) fn shared_bodies(&mut self) -> bytes::Bytes {
-        self.buffer.shared_bodies()
-    }
-
-    /// Exact voter/writer/view and image against which application validation ran.
-    pub const fn validation(&self) -> ValidationTicket {
-        self.validation
-    }
-
-    /// Verified metadata for core admission. Payload remains owned by this value.
-    pub fn prepared(&self) -> &[PreparedOperation] {
-        &self.buffer.prepared
-    }
-
-    /// Immutable payload retained until written, transmitted, or explicitly discarded.
-    pub const fn buffer(&self) -> &AppendBuffer {
-        &self.buffer
-    }
-
-    /// Use worker-computed body digests for wire encoding without hashing payload on the actor.
-    pub fn wire_operations(
-        &self,
-    ) -> impl ExactSizeIterator<Item = ozzy_replication::wire::Operation<'_>> {
-        self.buffer.wire_operations()
-    }
-
-    /// Discard unadmitted plans and recover the reusable payload arena.
-    pub fn into_buffer(mut self) -> AppendBuffer {
-        self.buffer.restore_dedup_original();
-        self.buffer
-    }
-}
-
-/// Installed canonical state with its queued physical write. The write
-/// completion follows independently; returning the caller arena does not
-/// release the configured write backlog.
-#[derive(Debug)]
-pub struct AdmittedAppend {
-    pub(super) ticket: WriteTicket,
-    pub(super) buffer: AppendBuffer,
-    pub(super) persisted: super::JournalCompletion<WriteTicket>,
-}
-
-impl AdmittedAppend {
-    /// Return the exact admission, reusable arena, and independent write completion.
-    pub fn into_parts(
-        self,
-    ) -> (
-        WriteTicket,
-        AppendBuffer,
-        super::JournalCompletion<WriteTicket>,
-    ) {
-        (self.ticket, self.buffer, self.persisted)
     }
 }

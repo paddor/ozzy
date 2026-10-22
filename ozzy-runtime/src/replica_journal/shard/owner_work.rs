@@ -201,22 +201,21 @@ impl ShardJournal {
                 true
             }
             Ok(OwnedWriteStep::RollRequired) if self.writes.is_empty() && !state.sync_busy => {
-                match state.owner.begin_roll(self.config.roll_probes) {
-                    Ok(work) => {
-                        state.rolling = true;
-                        self.jobs.push(
-                            async move {
-                                let done = work.publish().await;
-                                Box::new(move |state: &mut State| {
-                                    state.rolling = false;
-                                    state.owner.complete_roll(done).is_err()
-                                }) as Install
-                            }
-                            .boxed_local(),
-                        );
+                let Ok(work) = state.owner.begin_roll(self.config.roll_probes) else {
+                    self.failed = true;
+                    return true;
+                };
+                state.rolling = true;
+                self.jobs.push(
+                    async move {
+                        let done = work.publish().await;
+                        Box::new(move |state: &mut State| {
+                            state.rolling = false;
+                            state.owner.complete_roll(done).is_err()
+                        }) as Install
                     }
-                    Err(_) => self.failed = true,
-                }
+                    .boxed_local(),
+                );
                 true
             }
             Ok(OwnedWriteStep::Waiting | OwnedWriteStep::RollRequired) => false,
