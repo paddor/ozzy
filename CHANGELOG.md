@@ -103,6 +103,13 @@
   since its last roll. A restarted replica's installation replays only after
   the state its reopen rebuilt, not from its checkpoint. A simulated power
   loss serves again after 1.7 s instead of 6.3 s.
+- A disk-quorum leader whose disk stalls now hands over to the two healthy
+  brokers after about 2 s. A stalled sync or maintenance step held new
+  writes back, so no admitted write was outstanding and nothing timed out;
+  the partition stopped until the disk recovered. A broker still waiting on
+  its own promise also no longer votes to leave a view at its election
+  deadline; with one peer's timeout, that ended views the healthy pair was
+  installing.
 - A disk-quorum backup that installs a new view no longer fetches its missed
   history twice. It first looked up its own commit in the new leader's
   history, which moved the same operations; the installation transfer now

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::ops::Range;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 type Inode = u64;
 
@@ -149,6 +149,46 @@ impl Image {
             .values()
             .map(|node| node.dirty.bytes() + node.durable.bytes())
             .sum()
+    }
+
+    /// Maximal runs of `block`-aligned file blocks whose cached bytes differ
+    /// from media, clamped to the cached length. Each file reachable in the
+    /// cached namespace is listed once, under its first path in name order.
+    pub fn unsynced_runs(&self, block: usize) -> Vec<(PathBuf, Range<usize>)> {
+        let block = block.max(1);
+        let mut runs = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut pending = vec![(PathBuf::from("/"), 0)];
+        while let Some((path, inode)) = pending.pop() {
+            let Some(node) = self.nodes.get(&inode).filter(|_| seen.insert(inode)) else {
+                continue;
+            };
+            let (Contents::File(dirty), Contents::File(durable)) = (&node.dirty, &node.durable)
+            else {
+                if let Contents::Directory(entries) = &node.dirty {
+                    let children = entries.iter().rev();
+                    pending.extend(children.map(|(name, child)| (path.join(name), *child)));
+                }
+                continue;
+            };
+            let mut start = None;
+            for offset in (0..dirty.len()).step_by(block) {
+                let end = dirty.len().min(offset + block);
+                let differs = durable.get(offset..end) != Some(&dirty[offset..end]);
+                match (differs, start) {
+                    (true, None) => start = Some(offset),
+                    (false, Some(from)) => {
+                        runs.push((path.clone(), from..offset));
+                        start = None;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(from) = start {
+                runs.push((path, from..dirty.len()));
+            }
+        }
+        runs
     }
 
     pub(super) fn validate(&self, limits: ImageLimits) -> io::Result<()> {

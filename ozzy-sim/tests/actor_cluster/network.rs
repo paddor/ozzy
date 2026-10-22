@@ -166,7 +166,7 @@ pub(crate) struct Network {
     /// Directed links a partition blocks.
     blocked: [[bool; BROKERS]; BROKERS],
     partitioned: bool,
-    /// A scripted isolation of one broker. Random partitions wait for it.
+    /// The broker of a scripted fault. Random partitions wait for it.
     isolated: Option<usize>,
     /// The final drain stops new faults.
     healed: bool,
@@ -304,7 +304,26 @@ impl Network {
     /// Cut `broker` off both ways until `rejoin`, replacing a random
     /// partition. Clogs continue.
     pub(crate) fn isolate(&mut self, broker: usize) {
-        self.split(broker, 0);
+        self.cut(broker, 0);
+    }
+
+    /// As `isolate`, in one direction only: frames from `broker` when
+    /// `outbound`, else frames to it.
+    pub(crate) fn cut_one_way(&mut self, broker: usize, outbound: bool) {
+        self.cut(broker, if outbound { 1 } else { 2 });
+    }
+
+    /// Heal a random partition and start none until `rejoin`, while a
+    /// scripted fault of `broker` keeps its links up. The other two must
+    /// be able to replace it.
+    pub(crate) fn hold_partitions(&mut self, broker: usize) {
+        self.blocked = [[false; BROKERS]; BROKERS];
+        self.partitioned = false;
+        self.isolated = Some(broker);
+    }
+
+    fn cut(&mut self, broker: usize, direction: u64) {
+        self.split(broker, direction);
         self.partitioned = false;
         self.isolated = Some(broker);
         self.stats.partitions += 1;

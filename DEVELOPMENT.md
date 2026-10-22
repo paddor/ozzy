@@ -231,10 +231,19 @@ operations, then rejoins as the leader is lost, so the view change installs
 a suffix that outlasts any election timeout and passes the segment limit;
 `crash`, where a follower and then the leader lose power and restart
 over what reached their disks, with fresh writer generations and link
-sessions; and `power-loss`, where all three lose power at once mid-traffic.
-Its fast test also bounds the outage, which grows when a restart refetches
-or replays all history. The three sparse or full scenarios skip `heavy` and
-`swarm`, which make too little progress to fill a journal.
+sessions; `power-loss`, where all three lose power at once mid-traffic;
+`recovery-crash`, where power fails again at a seeded tick of that recovery;
+`torn-write`, where every disk stops completing jobs and power then fails
+with the queued writes in flight; `disk-stall`, where the leader's disk
+completes nothing for 15 s while its links stay up, and another broker must
+take over; `pause`, where the leader's process runs nothing for 15 s, then
+resumes into a newer view; and `one-way`, where the leader first hears
+nothing, then a later leader can send nothing. A power loss puts some queued
+writes in the cache unreported, even `O_DSYNC` ones, then lets a seeded share
+of cached 512-byte sectors reach media, so unsynced writes tear and land out
+of order. The power-loss fast test also bounds the outage, which grows when a
+restart refetches or replays all history. The three sparse or full scenarios
+skip `heavy` and `swarm`, which make too little progress to fill a journal.
 A failing seed prints its parameters, schedule hash, and this command with
 `OZZY_ACTOR_SIM_SEED`, `OZZY_ACTOR_SIM_PROFILE`, and
 `OZZY_ACTOR_SIM_SCENARIO` set. A run whose faults left too little progress

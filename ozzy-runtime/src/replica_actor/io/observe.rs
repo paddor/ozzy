@@ -51,6 +51,7 @@ impl ReplicaActor {
             () = std::future::ready(()), if wait_for_work && self.more_work => return Ok(false),
             () = self.ingress.ready(), if wait_for_work && self.pending.is_none() => return Ok(false),
             }
+            self.storage_progress_at = Some(now);
             return Ok(true);
         }
     }

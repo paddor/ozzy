@@ -52,10 +52,7 @@ impl ReplicaActor {
         let configuration = startup.configuration();
         let local = startup.local();
         let (journal_scope, source) = recovered_source(&startup);
-        let activated = startup
-            .recovered()
-            .is_none()
-            .then_some((journal_scope, startup.generation()));
+        let activated = fresh_activation(&startup, journal_scope);
         let wire_limits = config.wire_limits()?;
         let buffer = lease_checked_buffer(&journal, startup.generation(), config)?;
         let (ingress, submitters) = ingress::Ingress::new(
@@ -95,6 +92,7 @@ impl ReplicaActor {
             pending_replay: None,
             pending_sync: None,
             pending_persistence: VecDeque::with_capacity(config.pipeline.max_operations),
+            storage_progress_at: None,
             promise: None,
             pinned: None,
             start: None,
@@ -123,6 +121,14 @@ fn recovered_source(startup: &JournalStartup) -> (Scope, LogSource) {
     };
     let scope = recovered.map_or(startup.configuration().scope(), |state| state.scope);
     (scope, source)
+}
+
+/// A fresh journal's activation, which the first normal view announces.
+fn fresh_activation(startup: &JournalStartup, scope: Scope) -> Option<(Scope, JournalGeneration)> {
+    startup
+        .recovered()
+        .is_none()
+        .then_some((scope, startup.generation()))
 }
 
 /// Lease the actor's append arena once the journal can hold its pipeline.

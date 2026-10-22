@@ -27,7 +27,10 @@ mod workload;
 use broker::{MAX_SEGMENTS, SEGMENT_BYTES};
 use network::Profile;
 use sim::{
-    Fault::{self, CrashAll, CrashFollower, CrashLeader, IsolateFollower, IsolateLeader},
+    Fault::{
+        self, CrashAll, CrashAllMidWrite, CrashFollower, CrashLeader, DeafLeader, IsolateFollower,
+        IsolateLeader, MuteLeader, PauseLeader, Recrash, StallLeader,
+    },
     Options, Report,
 };
 
@@ -183,6 +186,59 @@ fn scenario(name: &str) -> Option<Scenario> {
         "power-loss" => Scenario {
             ticks: 3000,
             script: &[CrashAll { at: 1500 }],
+            ..RANDOM
+        },
+        // Power fails again while the brokers recover from the first loss, at a
+        // seeded tick: mid election, installation, or the first new writes.
+        "recovery-crash" => Scenario {
+            ticks: 3000,
+            script: &[CrashAll { at: 1500 }, Recrash { within: 250 }],
+            ..RANDOM
+        },
+        // Every disk stops completing jobs, then power fails within 300 ms with
+        // the queued writes in flight, so they tear.
+        "torn-write" => Scenario {
+            ticks: 3000,
+            script: &[CrashAllMidWrite {
+                at: 1500,
+                within: 30,
+            }],
+            ..RANDOM
+        },
+        // The leader's disk completes nothing for 15 s while its links stay
+        // up, as a host write stall does. Another broker must take over.
+        "disk-stall" => Scenario {
+            ticks: 3000,
+            script: &[StallLeader {
+                at: 1000,
+                ticks: 1500,
+            }],
+            ..RANDOM
+        },
+        // The leader's process runs nothing for 15 s, then resumes into a
+        // newer view with every timer due and a backlog of input.
+        "pause" => Scenario {
+            ticks: 3000,
+            script: &[PauseLeader {
+                at: 1000,
+                ticks: 1500,
+            }],
+            ..RANDOM
+        },
+        // The leader first hears nothing, then a later leader can send
+        // nothing. Each must be replaced while its other direction works.
+        "one-way" => Scenario {
+            ticks: 4500,
+            script: &[
+                DeafLeader {
+                    at: 500,
+                    ticks: 1500,
+                },
+                MuteLeader {
+                    at: 2500,
+                    ticks: 1500,
+                },
+            ],
             ..RANDOM
         },
         _ => return None,
@@ -358,6 +414,41 @@ fn whole_cluster_power_loss_keeps_every_commit() {
     );
 }
 
+/// Power fails again while the brokers recover from a power loss. The
+/// second recovery keeps every commit too.
+#[test]
+fn power_loss_during_recovery_keeps_every_commit() {
+    checked(1, "none", "recovery-crash");
+}
+
+/// Power fails while every disk holds queued writes. Whatever part of them
+/// reached media, every commit survives.
+#[test]
+fn power_loss_mid_write_keeps_every_commit() {
+    checked(1, "none", "torn-write");
+}
+
+/// A leader whose disk stalls hands over to the two healthy brokers, then
+/// rejoins once its disk recovers.
+#[test]
+fn stalled_leader_disk_is_replaced() {
+    checked(1, "none", "disk-stall");
+}
+
+/// A leader whose process stops is replaced. Once it resumes, its due
+/// timers and stale input do not disturb the newer view.
+#[test]
+fn paused_leader_is_replaced_and_resumes_as_follower() {
+    checked(1, "none", "pause");
+}
+
+/// A leader that only hears, then one that only speaks, is replaced by the
+/// two brokers that still talk both ways.
+#[test]
+fn one_way_cut_leaders_are_replaced() {
+    checked(1, "none", "one-way");
+}
+
 /// Seeds that found bugs. Schedules move with the code, so each names what
 /// it found.
 #[test]
@@ -389,7 +480,7 @@ mod seeded {
         const PROFILES: [&str; 5] = ["none", "light", "heavy", "swarm", "slow"];
         /// Each scenario with its profiles. Heavy and swarm faults leave too
         /// little progress to fill a journal.
-        const SCENARIOS: [(&str, &[&str]); 7] = [
+        const SCENARIOS: [(&str, &[&str]); 12] = [
             ("random", &PROFILES),
             ("failover", &PROFILES),
             ("full", &["none", "light", "slow"]),
@@ -397,6 +488,11 @@ mod seeded {
             ("sparse-rejoin", &["none", "light", "slow"]),
             ("crash", &PROFILES),
             ("power-loss", &PROFILES),
+            ("recovery-crash", &PROFILES),
+            ("torn-write", &PROFILES),
+            ("disk-stall", &PROFILES),
+            ("pause", &PROFILES),
+            ("one-way", &PROFILES),
         ];
 
         /// About 4800 operations in 75 segments before the leader is lost. A

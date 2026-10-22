@@ -9,6 +9,20 @@ use crate::{
 use std::time::Duration;
 
 impl ReplicaDriver {
+    /// Note when local storage last made progress while it had work, or
+    /// `None` while it has none. Busy storage that completes nothing for the
+    /// primary timeout is suspicion, as an undurable admitted write is: other
+    /// storage work can hold admission back.
+    pub fn observe_storage(
+        &mut self,
+        busy_since: Option<Duration>,
+        now: Duration,
+    ) -> Result<(), DriverError> {
+        self.observe_time(now)?;
+        self.storage_busy_since = busy_since;
+        Ok(())
+    }
+
     /// Observe actual durable publication of the exact outstanding promise.
     pub fn complete_promise(&mut self, ticket: PromiseTicket) -> Result<(), DriverError> {
         self.changing()?.complete_promise(ticket)?;

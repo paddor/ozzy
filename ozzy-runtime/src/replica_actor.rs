@@ -118,6 +118,9 @@ pub struct ReplicaActor {
     pending_sync: Option<PendingSync>,
     pending_persistence:
         VecDeque<crate::replica_journal::JournalCompletion<ozzy_replication::WriteTicket>>,
+    /// When the journal last completed a command, or was seen idle; from
+    /// the first round.
+    storage_progress_at: Option<Duration>,
     promise: Option<PromiseTicket>,
     pinned: Option<LogSource>,
     wanted_pin: Option<(Scope, LogSource)>,
@@ -200,6 +203,17 @@ impl ReplicaActor {
         ) {
             self.driver.history_progress(now)?;
         }
+        // Storage that has work and completes none of it holds the role as
+        // a stalled write does, though no write was admitted.
+        let busy = self.pending.is_some()
+            || self.pending_replay.is_some()
+            || self.pending_sync.is_some()
+            || !self.pending_persistence.is_empty();
+        if !busy {
+            self.storage_progress_at = Some(now);
+        }
+        let since = *self.storage_progress_at.get_or_insert(now);
+        self.driver.observe_storage(busy.then_some(since), now)?;
         // At most four fixed controls (eight destinations), one history chunk,
         // and one disk submission per iteration. Each chunk has byte/count bounds.
         for _ in 0..4 {

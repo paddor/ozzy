@@ -72,6 +72,27 @@ pub(crate) enum Fault {
     /// at once and restarts over its durable disk image. Links come back at
     /// once. No committed operation may be lost.
     CrashAll { at: u64 },
+    /// After the last whole-cluster power loss, every broker loses power
+    /// again at a seeded tick within `within`, without waiting for a leader:
+    /// mid election, installation, or activation.
+    Recrash { within: u64 },
+    /// As `CrashAll`, but every disk first stops completing jobs, so writes
+    /// queue up. Power fails at a seeded tick within `within`, with those
+    /// writes in flight.
+    CrashAllMidWrite { at: u64, within: u64 },
+    /// From tick `at`, once a ready leader exists, its disk completes no job
+    /// for `ticks`. Links stay up and random partitions wait. Another broker
+    /// must lead before the disk recovers.
+    StallLeader { at: u64, ticks: u64 },
+    /// From tick `at`, once a ready leader exists, its process runs no turn
+    /// for `ticks`, as a VM pause or a stopped process does. Its disk and
+    /// links keep going; random partitions wait. Another broker must lead
+    /// before it resumes.
+    PauseLeader { at: u64, ticks: u64 },
+    /// As `IsolateLeader`, but only frames to the leader stop.
+    DeafLeader { at: u64, ticks: u64 },
+    /// As `IsolateLeader`, but only frames from the leader stop.
+    MuteLeader { at: u64, ticks: u64 },
 }
 
 impl Fault {
@@ -81,19 +102,37 @@ impl Fault {
             Self::IsolateLeader { at, ticks }
             | Self::IsolateFollower { at, ticks }
             | Self::CrashLeader { at, ticks }
-            | Self::CrashFollower { at, ticks } => (at, ticks),
+            | Self::CrashFollower { at, ticks }
+            | Self::StallLeader { at, ticks }
+            | Self::PauseLeader { at, ticks }
+            | Self::DeafLeader { at, ticks }
+            | Self::MuteLeader { at, ticks }
+            | Self::CrashAllMidWrite { at, within: ticks } => (at, ticks),
             Self::CrashAll { at } => (at, 0),
+            Self::Recrash { within } => (0, within),
         }
     }
 
     const fn leader(self) -> bool {
-        matches!(self, Self::IsolateLeader { .. } | Self::CrashLeader { .. })
+        matches!(
+            self,
+            Self::IsolateLeader { .. }
+                | Self::CrashLeader { .. }
+                | Self::StallLeader { .. }
+                | Self::PauseLeader { .. }
+                | Self::DeafLeader { .. }
+                | Self::MuteLeader { .. }
+        )
     }
 
     const fn crash(self) -> bool {
         matches!(
             self,
-            Self::CrashLeader { .. } | Self::CrashFollower { .. } | Self::CrashAll { .. }
+            Self::CrashLeader { .. }
+                | Self::CrashFollower { .. }
+                | Self::CrashAll { .. }
+                | Self::Recrash { .. }
+                | Self::CrashAllMidWrite { .. }
         )
     }
 }
@@ -103,13 +142,12 @@ struct Isolation {
     broker: usize,
     view: u64,
     until: u64,
-    /// The cut-off broker led `view`, so another must take over.
-    leader: bool,
+    /// After a leader fault another broker must take over. A crashed
+    /// broker has no links until the isolation ends.
+    fault: Fault,
     /// Another broker led a later view at some tick of the isolation. A
     /// fault that ends it may leave no leader at the last tick.
     replaced: bool,
-    /// It restarted and has no links until the isolation ends.
-    crashed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +192,9 @@ struct Sim {
     /// The tick of the last whole-cluster power loss, and how long until a
     /// leader served again.
     power_loss: Option<(u64, Option<u64>)>,
+    /// The seeded tick of a scheduled whole-cluster power loss. It holds
+    /// later faults.
+    crash_due: Option<u64>,
 }
 
 pub(crate) fn run(seed: u64, profile: Profile, options: Options) -> Result<Report, Box<Failure>> {
@@ -191,6 +232,7 @@ pub(crate) fn run(seed: u64, profile: Profile, options: Options) -> Result<Repor
         next_fault: 0,
         isolation: None,
         power_loss: None,
+        crash_due: None,
     };
     let result = sim.run();
     let hash = sim.trace.value();
@@ -249,12 +291,20 @@ impl Sim {
                     .deliver(index, tick, &mut broker.inbox, &mut self.trace);
             }
             // Disks finish jobs in 1 ms steps; each step lets every shard
-            // observe them. Time and the network move per tick.
+            // observe them. Time and the network move per tick. A paused
+            // process observes nothing.
+            let paused = self
+                .isolation
+                .filter(|isolation| matches!(isolation.fault, Fault::PauseLeader { .. }))
+                .map(|isolation| isolation.broker);
             for step in 0..DISK_STEPS {
                 let at = tick * DISK_STEPS + step;
                 for index in order {
                     let broker = &mut self.brokers[index];
                     broker.disk.step(at, index, &mut self.trace);
+                    if paused == Some(index) {
+                        continue;
+                    }
                     if let Some(lanes) = broker.turn(
                         &mut self.network,
                         &self.clock,
@@ -325,17 +375,39 @@ impl Sim {
         if let Some(isolation) = self.isolation
             && tick >= isolation.until
         {
-            if isolation.leader && !isolation.replaced {
+            if isolation.fault.leader() && !isolation.replaced {
+                let how = match isolation.fault {
+                    Fault::StallLeader { .. } => "stalled",
+                    Fault::PauseLeader { .. } => "paused",
+                    _ => "cut off",
+                };
                 return Err(format!(
-                    "no new leader while broker {} was cut off as leader of view {}",
+                    "no new leader while broker {} was {how} as leader of view {}",
                     isolation.broker, isolation.view
                 ));
             }
             self.network.rejoin();
-            if isolation.crashed {
+            if isolation.fault.crash() {
                 self.reconnect(isolation.broker)?;
             }
             self.isolation = None;
+        }
+        if self.isolation.is_none()
+            && let Some(&Fault::Recrash { within }) = self.options.script.get(self.next_fault)
+        {
+            let (at, _) = self
+                .power_loss
+                .ok_or("a recrash needs a power loss first")?;
+            self.next_fault += 1;
+            self.crash_due = Some(at + 1 + self.executor.below(within));
+        }
+        if let Some(due) = self.crash_due {
+            if tick < due {
+                return Ok(());
+            }
+            self.crash_due = None;
+            self.trace.word(tick);
+            return self.crash_all(tick);
         }
         if self.isolation.is_none()
             && let Some(fault) = self.options.script.get(self.next_fault).copied()
@@ -344,12 +416,18 @@ impl Sim {
         {
             self.next_fault += 1;
             self.trace.word(tick);
-            if let Fault::CrashAll { .. } = fault {
-                return self.crash_all(tick);
+            match fault {
+                Fault::CrashAll { .. } => return self.crash_all(tick),
+                Fault::CrashAllMidWrite { within, .. } => {
+                    for broker in &mut self.brokers {
+                        broker.disk.stall(u64::MAX);
+                    }
+                    self.crash_due = Some(tick + 1 + self.executor.below(within));
+                    return Ok(());
+                }
+                _ => {}
             }
-            let leads = fault.leader();
-            let crashed = fault.crash();
-            let broker = if leads {
+            let broker = if fault.leader() {
                 leader
             } else {
                 let followers = (0..BROKERS).filter(|&index| index != leader);
@@ -359,18 +437,24 @@ impl Sim {
                     .or_else(|| followers.clone().next())
                     .expect("two followers")
             };
-            if crashed {
-                self.crash(broker, tick)?;
-            } else {
-                self.network.isolate(broker);
+            match fault {
+                _ if fault.crash() => self.crash(broker, tick)?,
+                Fault::StallLeader { .. } => {
+                    let until = (tick + fault.window().1) * DISK_STEPS;
+                    self.brokers[broker].disk.stall(until);
+                    self.network.hold_partitions(broker);
+                }
+                Fault::PauseLeader { .. } => self.network.hold_partitions(broker),
+                Fault::DeafLeader { .. } => self.network.cut_one_way(broker, false),
+                Fault::MuteLeader { .. } => self.network.cut_one_way(broker, true),
+                _ => self.network.isolate(broker),
             }
             self.isolation = Some(Isolation {
                 broker,
                 view,
                 until: tick + fault.window().1,
-                leader: leads,
+                fault,
                 replaced: false,
-                crashed,
             });
             self.trace.word(broker as u64);
         }

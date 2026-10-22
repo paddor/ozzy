@@ -93,7 +93,7 @@ impl ReplicaDriver {
         self.exit_retry_at = None;
     }
 
-    fn promise_pending(&self) -> bool {
+    pub(super) fn promise_pending(&self) -> bool {
         matches!(
             &self.role,
             Role::ViewChanging(changing) if changing.promised_view() != changing.scope().view

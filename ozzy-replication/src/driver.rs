@@ -114,6 +114,8 @@ pub struct ReplicaDriver {
     contact_deadline: Duration,
     progress_deadline: Duration,
     persistence_deadline: Duration,
+    /// When busy local storage last completed work; `None` while idle.
+    storage_busy_since: Option<Duration>,
     election_deadline: Duration,
     election_delay: Duration,
     retry_at: Duration,
@@ -183,6 +185,7 @@ impl ReplicaDriver {
             now,
             contact_deadline: now.saturating_add(timing.primary_timeout),
             persistence_deadline: now.saturating_add(timing.primary_timeout),
+            storage_busy_since: None,
             progress_deadline: now
                 + if activating {
                     timing.election_timeout
@@ -344,6 +347,9 @@ impl ReplicaDriver {
             || (outstanding && self.now >= self.progress_deadline)
             || (snapshot.accepted.op > snapshot.journal.durable
                 && self.now >= self.persistence_deadline)
+            || self
+                .storage_busy_since
+                .is_some_and(|since| self.now >= since.saturating_add(self.timing.primary_timeout))
     }
 
     fn next_view(&mut self) -> Result<(), DriverError> {

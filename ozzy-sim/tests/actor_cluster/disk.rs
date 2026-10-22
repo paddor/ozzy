@@ -3,7 +3,7 @@
 
 use crate::seeds::{Rng, Trace};
 use ozzy_io::{
-    Limits, Local, Quota,
+    Limits, Local, Operation, Quota,
     simulation::{Config, Controller, Effect, Image, ImageLimits, JobId, Stage},
 };
 use std::{
@@ -16,12 +16,18 @@ use std::{
     task::{Context, Poll, Wake, Waker},
 };
 
+/// The unit a power loss persists whole or not at all, as a drive's atomic
+/// sector write does.
+const SECTOR: usize = 512;
+
 #[derive(Debug)]
 pub(crate) struct Disk {
     controller: Controller,
     rng: Rng,
     mean: f64,
     due: BTreeMap<JobId, u64>,
+    /// No job completes before this step.
+    stalled_until: u64,
 }
 
 impl Disk {
@@ -29,9 +35,32 @@ impl Disk {
         Self::with_image(seed, mean, Image::default())
     }
 
-    /// Lose power: drop every pending job and unsynchronized byte, then
-    /// start a fresh device over what reached media.
+    /// Lose power, then start a fresh device over what reached media. Each
+    /// queued write may have reached the cache unreported, even an `O_DSYNC`
+    /// one. Each cached sector reaches media at one seeded chance per loss,
+    /// so writes tear and land out of order.
     pub(crate) fn power_loss(mut self) -> (Self, Local) {
+        for (id, stage) in self.controller.jobs() {
+            if stage == Stage::Queued
+                && self.controller.operation(id).is_some_and(is_write)
+                && self.rng.chance(0.5)
+            {
+                self.controller
+                    .execute(id, Effect::SkipBarrier)
+                    .expect("execute");
+            }
+        }
+        let chance = (1 + self.rng.below(3)) as f64 / 4.0;
+        for (path, run) in self.controller.image().unsynced_runs(SECTOR) {
+            for start in run.clone().step_by(SECTOR) {
+                if self.rng.chance(chance) {
+                    let sector = start..run.end.min(start + SECTOR);
+                    self.controller
+                        .persist_range(&path, sector)
+                        .expect("persist sector");
+                }
+            }
+        }
         let seed = self.rng.next();
         let (image, _) = self.controller.crash(true).expect("simulated power loss");
         Self::with_image(seed, self.mean, image)
@@ -70,8 +99,15 @@ impl Disk {
             rng: Rng::new(seed),
             mean,
             due: BTreeMap::new(),
+            stalled_until: 0,
         };
         (disk, Local::new(clients.remove(0)))
+    }
+
+    /// Complete no job before step `until`, as a stalled device does. Jobs
+    /// due meanwhile complete once it ends.
+    pub(crate) fn stall(&mut self, until: u64) {
+        self.stalled_until = until;
     }
 
     /// Complete jobs due by step `at`. New jobs draw their completion step
@@ -84,6 +120,10 @@ impl Disk {
             self.due
                 .entry(*id)
                 .or_insert_with(|| at + rng.exponential(mean));
+        }
+        if at < self.stalled_until {
+            self.controller.take_trace();
+            return;
         }
         let mut ready: Vec<_> = jobs
             .into_iter()
@@ -133,6 +173,15 @@ impl Disk {
             }
         }
         panic!("startup storage stalled");
+    }
+}
+
+/// A write, possibly holding extra handles until it runs.
+fn is_write(operation: &Operation) -> bool {
+    match operation {
+        Operation::Write { .. } => true,
+        Operation::Protected { operation, .. } => is_write(operation),
+        _ => false,
     }
 }
 
