@@ -13,7 +13,7 @@ saturation and latency at fixed load. To reproduce them, use the
 | Clients | 8 writers in 4 writer processes and 8 verified readers; each process on one client core in turn |
 | CPUs | Single broker: 2 broker cores. Three brokers: 1 core each. Clients use separate cores |
 | Records | 128 B, 1 KiB, or 8 KiB: an 8-byte clock plus varying JSON event text |
-| Saturation | 2 s warmup, 8 s measurement, two repetitions |
+| Saturation | 2 s warmup, 8 s measurement, two repetitions; four for Ozzy at 128 B |
 | Fixed load | 2 s warmup, 100/s for 30 s, then 1k/s, 10k/s, 100k/s, and for 128 B 1M/s, 8 s each |
 | Fixed-load repetitions | Two for Ozzy, one for Iggy and Redpanda |
 | Fixed-load ceiling | 1M/s for 128 B (Ozzy only), 100k/s for 1 KiB, 10k/s for 8 KiB |

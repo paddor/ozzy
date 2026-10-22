@@ -228,7 +228,7 @@ mod stress {
             .observe("verify native retirement", client.retained_floor())
             .await;
         assert!(floor.get() > 0, "no sealed history retired");
-        let leader = client.leader(0);
+        let leader = brokers.observe("find leader", client.leader(0)).await;
         let index = (0..3)
             .find(|index| {
                 ozzy_proto::NodeId::from_bytes(

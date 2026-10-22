@@ -172,6 +172,7 @@ impl Journal {
         let replacement = SuffixReplacement {
             expected_current: journal.current(),
             protected_committed: protected,
+            retained: protected,
             promised_view: view,
             last_normal_view: view,
             committed,

@@ -123,6 +123,15 @@ pub enum DirectoryError {
     #[error("scanned retirement prefix no longer leads the selected journal")]
     /// Scanned retirement prefix no longer leads the selected journal.
     RetentionPrefixMismatch,
+    #[error("packed segments no longer match the selected run they replace")]
+    /// Packed segments no longer match the selected run they replace.
+    PackMismatch,
+    #[error("pack exhausted its file generation probes")]
+    /// Pack exhausted its file generation probes.
+    PackProbeLimit,
+    #[error("pack limits are invalid")]
+    /// Pack limits are invalid.
+    PackLimits,
     #[error("configuration changes require configuration installation")]
     /// Configuration changes require configuration installation.
     ConfigurationChangeRequiresInstall,

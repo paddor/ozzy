@@ -162,6 +162,9 @@ pub struct HistoryRetired {
     /// Receiver incarnation whose independently checked history is unavailable.
     pub fence: HistoryFence,
     /// Last original operation preceding all required retained operations.
+    /// For a fetch, the first predecessor the source serves from: its
+    /// retained boundary, when the request predecessor is retired or not in
+    /// the source. Only a fetch fence may name genesis.
     pub before: crate::Prefix,
 }
 
@@ -175,7 +178,7 @@ pub fn encode_history_retired(
 ) -> Result<ControlEncoding, WireError> {
     validate_scope(notice.scope)?;
     super::validate_prefix(notice.before)?;
-    if notice.before.op.0 == 0
+    if (notice.before.op.0 == 0 && matches!(notice.fence, HistoryFence::Receive(_)))
         || matches!(notice.fence, HistoryFence::Fetch(id) if id.as_bytes() == &[0; 16])
     {
         return Err(WireError::History);
@@ -232,7 +235,7 @@ pub(super) fn decode_retired(
     let before = reader.prefix()?;
     reader.finish()?;
     super::validate_prefix(before)?;
-    if before.op.0 == 0 {
+    if before.op.0 == 0 && matches!(fence, HistoryFence::Receive(_)) {
         return Err(WireError::History);
     }
     Ok(HistoryRetired {

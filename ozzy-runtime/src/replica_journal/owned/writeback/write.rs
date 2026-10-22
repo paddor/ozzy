@@ -95,6 +95,9 @@ impl OwnedJournal {
     }
 
     fn prepare_write_inner(&mut self) -> Result<WriteStep, JournalError> {
+        if self.writes_held()? {
+            return Ok(WriteStep::Waiting);
+        }
         let encoded = match self.writeback.encoded.take() {
             Some(encoded) => encoded,
             None => match self.encode_write()? {
@@ -113,6 +116,10 @@ impl OwnedJournal {
         if let Err(error) = pipeline.check(&encoded.group) {
             self.writeback.encoded = Some(encoded);
             if crate::replica_journal::canonical::segment_full(&error) {
+                if !self.can_roll()? {
+                    self.hold_writes()?;
+                    return Ok(WriteStep::Waiting);
+                }
                 return Ok(WriteStep::RollRequired);
             }
             return Err(error.into());

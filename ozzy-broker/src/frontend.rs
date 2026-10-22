@@ -66,6 +66,24 @@ impl TransportLimits {
     }
 }
 
+/// Install limits before any broker socket exists. An active shared context
+/// must already match, so one embedded broker cannot alter another's budget.
+pub(crate) fn configure_network(context: &Context, plan: &BrokerPlan) -> Result<(), StartupError> {
+    let limit = |value: ozzy_config::ByteRateLimit| {
+        omq_tokio::ByteRateLimit::new(value.bytes_per_second, value.burst_bytes)
+    };
+    let limits = omq_tokio::NetworkRateLimits {
+        ingress: plan.omq_ingress.map(limit),
+        egress: plan.omq_egress.map(limit),
+    };
+    if context.network_rate_limits() != limits {
+        context
+            .set_network_rate_limits(limits)
+            .map_err(|reason| error(format!("OMQ network limits: {reason}")))?;
+    }
+    Ok(())
+}
+
 /// Owned dispatcher thread. OMQ owns its separate transport workers. Drop only
 /// requests shutdown; thread and socket destruction happen on the worker.
 #[derive(Debug)]
@@ -148,6 +166,8 @@ impl Frontend {
     /// The harness must create it before applying dispatcher affinity. Contexts
     /// borrowing an application runtime are rejected. Reported I/O thread count
     /// belongs to the shared context, not to each broker using it.
+    /// Network limits share that context's allowance and must already match
+    /// the broker plan if any socket was created on it.
     pub async fn start_with_context<F, Fut>(
         plan: FrontendPlan<'_>,
         context: Context,
@@ -181,6 +201,7 @@ impl Frontend {
         if context.io_threads() != io_threads {
             return Err(error("OMQ context worker count differs from broker plan"));
         }
+        configure_network(&context, plan.broker)?;
         let state = startup.state();
         let owner = Self {
             state: state.clone(),

@@ -7,6 +7,7 @@ mod metadata;
 mod producer;
 mod progress;
 pub(in crate::replica_journal) use progress::JoinedProgress;
+mod split;
 mod trim;
 
 use std::ops::Range;

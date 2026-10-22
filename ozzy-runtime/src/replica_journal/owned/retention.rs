@@ -1,12 +1,15 @@
 //! Confirmed floors precede checkpoint selection and physical retirement.
 
 mod cleanup;
+mod idle;
+mod packing;
 mod plan;
 mod retirement;
 
 use super::{JournalError, OwnedJournal};
 use crate::replica_journal::RetentionTurn;
 use cleanup::{Cleaned, Cleaning};
+pub(super) use idle::IdleProducers;
 use ozzy_core::retention::{Plan, Segment};
 use ozzy_journal_segment::{RetirementBudget, RetirementProof};
 use ozzy_proto::{CheckpointId, OperationId, PartitionIncarnation};
@@ -30,15 +33,28 @@ pub(super) struct Retention {
     retiring: Retiring,
     /// Unselected-storage cleanup that runs beside writes.
     cleaning: Cleaning,
+    /// A pack of sparse sealed segments that runs beside writes.
+    packing: packing::Packing,
+    /// Manifest generation at which no run was worth packing.
+    unpackable: Option<u64>,
     /// A complete exclusive sweep ran since this owner opened.
     swept: bool,
     /// Retention jobs started, so a stale completion is recognized.
     attempts: u64,
+    /// Producer sessions this primary saw unchanged, for idle retirement.
+    pub(super) idle: IdleProducers,
 }
 
 impl Retention {
+    pub(super) fn new(idle: Option<std::time::Duration>) -> Self {
+        Self {
+            idle: IdleProducers::new(idle),
+            ..Self::default()
+        }
+    }
+
     /// Forget cached summaries and roll proofs of segments `keep` rejects.
-    fn retain_segments(&mut self, keep: impl Fn(u64) -> bool) {
+    pub(super) fn retain_segments(&mut self, keep: impl Fn(u64) -> bool) {
         self.sealed.retain(|id, _| keep(*id));
         self.proofs.retain(|proof| keep(proof.segment_id()));
     }
@@ -100,7 +116,16 @@ impl OwnedJournal {
         let mut turn = self
             .record_retention_turn(ticket, now_millis, seed, leader)
             .await?;
-        turn.enabled |= self.dedup.limits.is_some();
+        if turn.proposal.is_none() {
+            let view = ticket.scope().view;
+            let (proposal, more) = match self.idle_producer_proposal(view, now_millis, leader) {
+                Err(JournalError::AppendCapacity) => (None, true),
+                result => result?,
+            };
+            turn.proposal = proposal;
+            turn.more_work |= more;
+        }
+        turn.enabled |= self.dedup.limits.is_some() || self.retention.idle.expiry().is_some();
         turn.more_work |= identities.more_work;
         turn.expired_identities = identities.expired;
         Ok(turn)
@@ -137,8 +162,9 @@ impl OwnedJournal {
             return self.propose_floors(partition, &plan, seed, leader);
         }
         if !plan.retire.is_empty() {
-            if self.cleaning() {
-                // The prefix retires once the cleanup just captured finishes.
+            if self.cleaning() || self.packing() {
+                // The prefix retires once the cleanup just captured or a
+                // running pack finishes.
                 return Ok(RetentionTurn {
                     more_work: true,
                     ..RetentionTurn::idle(true)
@@ -146,7 +172,7 @@ impl OwnedJournal {
             }
             return self.start_retirement(ticket, seed).await;
         }
-        if leader && plan.roll_active {
+        if leader && plan.roll_active && self.can_roll()? {
             let work = self.begin_roll(16)?;
             let done = work.publish().await;
             self.complete_roll(done)?;

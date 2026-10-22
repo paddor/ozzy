@@ -10,7 +10,8 @@ broker or a three-broker cluster.
 
 Requires Linux and Rust 1.93. [Try it](GETTING_STARTED.md#try-it) in three
 commands: a broker, the admin console, and a demo writer and reader. Then
-connect applications with the [Rust SDK](ozzy/README.md).
+connect applications with the [Rust SDK](ozzy/README.md) or
+[Python SDK](bindings/python/README.md) or [Java SDK](bindings/java/README.md).
 
 ## Goals
 
@@ -44,6 +45,7 @@ value.
 - Readers start at the earliest or latest record, an offset, a broker timestamp,
   or a record ID, and repair live-stream gaps on their own.
 - Optional per-topic retention by age or size, in whole segments.
+- Optional aggregate ingress and egress network byte limits per broker.
 - Optional `lz4+tcp://` and `zstd+tcp://` endpoints (Cargo features
   `lz4-transport` and `zstd-transport`).
 
@@ -52,6 +54,9 @@ value.
 | Crate | Responsibility |
 | --- | --- |
 | [`ozzy`](ozzy/) | Public producer and consumer SDKs |
+| [`ozzy-python`](bindings/python/) | Blocking and asyncio Python bindings to the Rust SDK |
+| [`ozzy-java`](bindings/java/) | Blocking and CompletableFuture Java bindings to the Rust SDK |
+| [`ozzy-bindings`](bindings/common/) | Shared language-binding configuration and reservations |
 | [`ozzy-broker`](ozzy-broker/) | Server, provisioning, and embedded broker API |
 | [`ozzy-config`](ozzy-config/) | Deployment configuration, identities, and placement |
 | [`ozzy-runtime`](ozzy-runtime/) | Broker actors, SDK owners, OMQ sessions, and readers |

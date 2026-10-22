@@ -1,0 +1,38 @@
+[package]
+name = "ozzy-java"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+autotests = false
+
+[features]
+package-tests = []
+
+[[test]]
+name = "ozzy_java_package"
+path = "tests/package.rs"
+required-features = ["package-tests"]
+
+[lib]
+name = "ozzy_java"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ozzy = { path = "../../../ozzy", features = ["lz4-transport"] }
+ozzy-bindings.workspace = true
+bytes.workspace = true
+futures.workspace = true
+jni = "0.21.1"
+tokio.workspace = true
+
+[dev-dependencies]
+ozzy-broker = { workspace = true, features = ["lz4-transport"] }
+jni = { version = "0.21.1", features = ["invocation"] }
+ozzy-config.workspace = true
+ozzy-sim = { workspace = true, features = ["broker"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -125,7 +125,7 @@ impl PreparedRecoveryRead {
             buffer,
             slot,
         } = self;
-        let result = history::fetch(&mut history, request, buffer, false).await;
+        let result = history::fetch(&mut history, request, buffer, history::Answer::Exact).await;
         CompletedRecoveryRead {
             key,
             pin,

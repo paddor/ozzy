@@ -132,6 +132,10 @@ pub struct Topic {
     /// Optional first-wins deduplication and per-partition resource limits.
     /// Omitted preserves every producer's records.
     pub deduplication: Option<TopicDeduplication>,
+    /// Seconds a producer session may stay unopened and without appends
+    /// before the partition leader retires it with its retry results.
+    #[serde(default = "default_producer_idle")]
+    pub producer_idle_secs: u64,
 }
 
 /// Deduplicate event identities within each partition, independently of routing.
@@ -152,6 +156,10 @@ const fn default_dedup_window() -> u64 {
     300_000
 }
 
+const fn default_producer_idle() -> u64 {
+    7 * 24 * 60 * 60
+}
+
 /// Optional age and stored segment capacity targets. Either limit expires the
 /// oldest sealed prefix; omitted limits keep history indefinitely.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -168,6 +176,10 @@ pub const MAX_APPEND_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Upper bound on `limits.max_clients`.
 pub const MAX_CLIENTS: usize = 4096;
+
+/// Segments one partition journal holds. Near this limit a partition refuses
+/// new records, so a retention byte target may cover at most seven eighths.
+pub const MAX_PARTITION_SEGMENTS: usize = 256;
 
 const fn default_partitions() -> u32 {
     16
@@ -191,18 +203,37 @@ pub struct Affinity {
     pub numa_node: Option<u32>,
 }
 
-/// OMQ worker count only. Unsupported affinity fields are rejected by parsing.
-#[derive(Debug, Clone, Deserialize)]
+/// OMQ workers and aggregate network byte limits. Affinity is unsupported.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Omq {
     /// OMQ-owned transport threads per broker.
     pub io_threads: usize,
+    /// Optional aggregate incoming network bytes, after transport framing.
+    pub ingress: Option<ByteRateLimit>,
+    /// Optional aggregate outgoing network bytes, including each fan-out copy.
+    pub egress: Option<ByteRateLimit>,
 }
 
 impl Default for Omq {
     fn default() -> Self {
-        Self { io_threads: 1 }
+        Self {
+            io_threads: 1,
+            ingress: None,
+            egress: None,
+        }
     }
+}
+
+/// Network byte allowance shared by the broker's OMQ context.
+/// Exhaustion backpressures network I/O. IPC, inproc, and SHM are exempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ByteRateLimit {
+    /// Positive sustained refill rate in transport bytes per second.
+    pub bytes_per_second: u64,
+    /// Positive shared burst allowance. The bucket starts full.
+    pub burst_bytes: u64,
 }
 
 /// Local topology. An omitted shard list becomes one shard on the sole device.

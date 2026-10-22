@@ -2,7 +2,7 @@
 //! source's pinned history.
 
 use super::{LogSource, SelectedView, ViewChange, ViewChangeError};
-use crate::{Digest, OpNumber, Prefix, VoterSet};
+use crate::{Digest, FrozenLog, OpNumber, Prefix, VoterSet};
 
 impl ViewChange {
     /// Select the highest last-normal-view, then longest accepted lineage.
@@ -10,7 +10,9 @@ impl ViewChange {
     /// `lookup` must be a nonblocking lookup into already verified, pinned
     /// canonical history anchored by the supplied source's exact tail digest.
     /// An isolated matching hash or a chunk from another generation is not such
-    /// evidence. Missing bytes return `None`; fetch/verify them outside the core.
+    /// evidence. It returns the source's digest at the prefix's op; the prefix
+    /// is the expected value, a fetch hint and never evidence. Missing bytes
+    /// return `None`; fetch/verify them outside the core.
     /// At most six protected-prefix lookups are needed for three voters.
     ///
     /// Selection includes this primary's report and another distinct voter. It
@@ -18,7 +20,7 @@ impl ViewChange {
     /// Higher-normal-view histories may discard only older uncertain suffixes.
     pub fn select(
         &mut self,
-        mut lookup: impl FnMut(LogSource, OpNumber) -> Option<Digest>,
+        mut lookup: impl FnMut(LogSource, Prefix) -> Option<Digest>,
     ) -> Result<SelectedView, ViewChangeError> {
         self.require_promised()?;
         self.require_primary()?;
@@ -29,6 +31,7 @@ impl ViewChange {
         let Some(mut report) = reports[self.local] else {
             return Err(ViewChangeError::ReportQuorumMissing);
         };
+        let local = report.log;
         let mut chosen = self.configuration.voter(self.local);
         let voters: VoterSet = reports
             .iter()
@@ -70,6 +73,7 @@ impl ViewChange {
             scope: self.scope(),
             source,
             committed,
+            retained: retained(local, report.log, committed),
             voters,
         };
         self.selected = Some(selected);
@@ -80,7 +84,7 @@ impl ViewChange {
         &mut self,
         source: LogSource,
         prefix: Prefix,
-        lookup: &mut impl FnMut(LogSource, OpNumber) -> Option<Digest>,
+        lookup: &mut impl FnMut(LogSource, Prefix) -> Option<Digest>,
     ) -> Result<(), ViewChangeError> {
         if prefix.op > source.accepted.op {
             return Err(self.conflict());
@@ -90,11 +94,43 @@ impl ViewChange {
         } else if prefix.op == source.accepted.op {
             source.accepted.digest
         } else {
-            lookup(source, prefix.op).ok_or(ViewChangeError::HistoryMissing)?
+            lookup(source, prefix).ok_or(ViewChangeError::HistoryMissing)?
         };
         if digest != prefix.digest {
             return Err(self.conflict());
         }
         Ok(())
+    }
+
+    /// The checks of `prefix` against `source` that need no history. A
+    /// staging stream through it checks the rest.
+    pub(crate) fn require_streamed(
+        &mut self,
+        source: LogSource,
+        prefix: Prefix,
+    ) -> Result<(), ViewChangeError> {
+        if prefix.op > source.accepted.op
+            || (prefix.op == source.accepted.op && prefix != source.accepted)
+            || (prefix.op == OpNumber(0) && prefix.digest != Digest::ZERO)
+        {
+            return Err(self.conflict());
+        }
+        Ok(())
+    }
+}
+
+/// This voter's longest prefix in the selected lineage, at most `committed`.
+/// Selection verifies its accepted prefix when it shares the `chosen` normal
+/// view; otherwise only its commit.
+fn retained(local: FrozenLog, chosen: FrozenLog, committed: Prefix) -> Prefix {
+    let verified = if local.last_normal_view == chosen.last_normal_view {
+        local.accepted
+    } else {
+        local.committed
+    };
+    if verified.op > committed.op {
+        committed
+    } else {
+        verified
     }
 }

@@ -22,7 +22,7 @@ pub use groups::{GroupCoordinator, GroupCoordinatorConfig, TopicTopology};
 mod history;
 mod ids;
 mod maintenance;
-pub use ids::ActorIds;
+pub use ids::{ActorIds, ReceiptHandles};
 mod ingress;
 mod io;
 mod local;
@@ -118,6 +118,11 @@ pub struct ReplicaActor {
     pending_sync: Option<PendingSync>,
     pending_persistence:
         VecDeque<crate::replica_journal::JournalCompletion<ozzy_replication::WriteTicket>>,
+    /// When the journal last completed a command or the storage lane a job,
+    /// or the journal was seen idle; from the first round.
+    storage_progress_at: Option<Duration>,
+    /// The storage lane's completed-job count at the last round.
+    storage_jobs: u64,
     promise: Option<PromiseTicket>,
     pinned: Option<LogSource>,
     wanted_pin: Option<(Scope, LogSource)>,
@@ -192,6 +197,7 @@ impl ReplicaActor {
             self.publish_status(true);
             return Ok(());
         }
+        self.observe_storage(now)?;
         // At most four fixed controls (eight destinations), one history chunk,
         // and one disk submission per iteration. Each chunk has byte/count bounds.
         for _ in 0..4 {
@@ -214,10 +220,7 @@ impl ReplicaActor {
             maintenance: self.maintenance.status,
             scope: self.driver.scope(),
             normal: self.driver.normal().map(NormalReplica::snapshot),
-            disk_pending: self.pending.is_some()
-                || self.pending_replay.is_some()
-                || self.pending_sync.is_some()
-                || !self.pending_persistence.is_empty(),
+            disk_pending: self.disk_pending(),
             application_ready: running && self.application_ready(),
             running,
         };
@@ -358,9 +361,9 @@ impl ReplicaActor {
                 }
             }
             ReplicaMessage::FetchOps(request) => self.serve(from, request)?,
-            ReplicaMessage::Ops(batch) => self.receive_ops(&batch)?,
+            ReplicaMessage::Ops(batch) => self.receive_ops(&batch, now)?,
             ReplicaMessage::Recovery(wire::RecoveryMessage::Request(request)) => {
-                self.receive_recovery(index, request)?;
+                self.receive_recovery(index, request, now)?;
             }
             ReplicaMessage::Recovery(wire::RecoveryMessage::State(_))
             | ReplicaMessage::Checkpoint(wire::CheckpointMessage::Chunk { .. })

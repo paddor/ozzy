@@ -10,8 +10,9 @@ use super::{
 use crate::recovery::{CheckpointAnchor, RecoveryLog, RecoveryResponse};
 use crate::{JournalGeneration, Scope};
 
-const REQUEST_BYTES: usize = COMMON_BYTES + 16;
-const BACKUP_BYTES: usize = REQUEST_BYTES + 1;
+const NONCE_BYTES: usize = COMMON_BYTES + 16;
+const REQUEST_BYTES: usize = NONCE_BYTES + 1;
+const BACKUP_BYTES: usize = NONCE_BYTES + 1;
 const PRIMARY_BYTES: usize = BACKUP_BYTES + 16 + 40 + 40 + 1;
 const ANCHOR_BYTES: usize = 40 + 40 + 32 + 32 + 8 + 4;
 
@@ -24,16 +25,27 @@ pub struct RecoveryRequest {
     pub request_id: RequestId,
     /// Globally fresh recovery attempt, stable across retries and link replacement.
     pub nonce: RequestId,
+    /// The requester persisted its nonvoting marker. A restart's retained
+    /// boundary probe asks before it votes and sends false.
+    pub nonvoting: bool,
 }
 
 impl RecoveryRequest {
     fn validate(self) -> Result<(), WireError> {
-        validate_scope(self.scope)?;
-        if self.request_id.as_bytes() == &[0; 16] || self.nonce.as_bytes() == &[0; 16] {
-            return Err(WireError::Correlation);
-        }
-        Ok(())
+        validate_exchange(self.scope, self.request_id, self.nonce)
     }
+}
+
+fn validate_exchange(
+    scope: Scope,
+    request_id: RequestId,
+    nonce: RequestId,
+) -> Result<(), WireError> {
+    validate_scope(scope)?;
+    if request_id.as_bytes() == &[0; 16] || nonce.as_bytes() == &[0; 16] {
+        return Err(WireError::Correlation);
+    }
+    Ok(())
 }
 
 /// Correlated reply retaining the core's nonce-scoped normal-state evidence.
@@ -69,12 +81,7 @@ impl RecoveryState {
     }
 
     fn validate(self) -> Result<(), WireError> {
-        RecoveryRequest {
-            scope: self.response.scope,
-            request_id: self.request_id,
-            nonce: self.response.nonce,
-        }
-        .validate()?;
+        validate_exchange(self.response.scope, self.request_id, self.response.nonce)?;
         if let Some(log) = self.response.primary {
             if let Some(anchor) = log.checkpoint {
                 anchor
@@ -177,6 +184,7 @@ pub fn encode_recovery(
     let mut writer = Writer::with_len(output, REQUEST_BYTES)?;
     writer.scope(request.scope, sender)?;
     writer.bytes(request.nonce.as_bytes())?;
+    writer.bytes(&[u8::from(request.nonvoting)])?;
     Ok(ControlEncoding {
         header,
         metadata_bytes: REQUEST_BYTES,
@@ -201,6 +209,11 @@ pub(super) fn decode_request(
         scope,
         request_id: envelope.request_id.ok_or(WireError::Correlation)?,
         nonce: RequestId::from_bytes(reader.array()?),
+        nonvoting: match reader.array::<1>()? {
+            [0] => false,
+            [1] => true,
+            _ => return Err(WireError::History),
+        },
     };
     reader.finish()?;
     request.validate()?;

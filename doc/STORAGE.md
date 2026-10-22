@@ -85,11 +85,16 @@ canonical operations.
 - The segment header binds group ID, segment ID, predecessor ID, the chain
   digest before the segment, capacity, and file generation (zero for the
   original file).
+- Open checks every selected header. A manifest publication checks only the
+  segments it adds or changes, or whose predecessor changed; the journal
+  never rewrites a selected header or shortens its file.
 - Entry headers stay uncompressed. They carry kind, operation identity, chain
   and body digests, lengths, and codec.
 - A seal records group number, start and end offsets, entry count, a durable
   mark, and a group digest. The mark is the highest group number already
   durable when this group was prepared; the digest covers it.
+- Group numbers rise through the log. A packed segment's groups can end
+  before the next segment's first.
 - Unknown versions, codecs, flags, or nonzero reserved bytes fail validation.
 - Unused capacity holds zeros, preallocated space, or groups from an earlier
   use of the file, which never validate against the new header. Readers of a
@@ -118,7 +123,7 @@ Exact layout: [segment codec](../ozzy-journal-segment/src/codec.rs).
 | 4 | `Progress` | 11 | `DedupWatermark` |
 | 5 | `Assign` | 12 | `GroupPlan` |
 | 6 | `Trim` | 13 | `GroupDelete` |
-| 7 | `PartitionPolicy` | | |
+| 7 | `PartitionPolicy` | 14 | `RetireProducer` |
 
 Integers are big-endian, IDs 16 bytes, counts and text lengths `u32`. Exact
 schema: [operation codec](../ozzy-journal/src/operation/codec/).
@@ -174,6 +179,9 @@ part. General descriptors use:
   the committed revision it retires, operation ID.
 - `CreatePartition` stores the dedup window as `u64` milliseconds; zero
   disables deduplication.
+- `RetireProducer` (kind 14): partition incarnation, producer ID, epoch
+  `u64`, next sequence `u64`. It has no operation ID: the epoch and next
+  sequence fence it against any open or append ordered first.
 
 ## Record identity and deduplication
 
@@ -183,6 +191,10 @@ part. General descriptors use:
 - Exact sequence-to-offset retry ranges survive checkpoints and leader changes.
   Ranges merge only when both sequences and offsets are adjacent. Expired retry
   results fail explicitly.
+- A leader retires sessions idle for `producer_idle_secs` with their ranges.
+  Idleness is the leader's own observation: a new leader starts every session
+  with a full expiry. The partition keeps the highest retired epoch, and a
+  recreated session starts above it.
 - Deduplication is a per-topic option over nonzero message IDs. The first
   record wins within the window, which is fixed at partition creation.
 - A duplicate stores only its outcome and a BLAKE3 fingerprint of message ID,
@@ -251,7 +263,8 @@ With the `aio` backend (the Linux default), segment data writes use a separate
 2. Write and sync its header, which binds the predecessor ID and the chain
    digest before the successor.
 3. Sync the predecessor and the `segments/` directory.
-4. Publish the new manifest, then `CURRENT`.
+4. Publish the new manifest, then `CURRENT`. The manifest also commits the
+   owner's applied prefix when that is newer than its commit.
 
 Selected files are immutable. Replacement uses a fresh `<id>.<generation>.log`.
 An unselected successor is a leftover for cleanup. Reads keep their original
@@ -295,7 +308,9 @@ generation.
   discards both. Overwriting the later group's seal stops a byte-identical
   rewrite of the damaged group from chaining into it again.
 - Replication authorizes suffix replacement; see [replication](REPLICATION.md).
-  Protected committed fragments survive physical regrouping.
+  Protected committed fragments survive physical regrouping. A request may
+  keep a longer verified prefix, never past its commit; its exact position
+  must be in local history.
 - Replacements are staged, validated, synchronized, and selected atomically.
   The old selection stays authoritative until then. Shutdown aborts unpublished
   work without lowering a durable promise.
@@ -326,7 +341,11 @@ format 3. Rows: record offsets 96 bytes, message IDs 80, operation IDs 80, and
 a dense 56-byte numeric selector for every canonical operation, including
 payload-free duplicate results.
 
-- A missing or corrupt index is rebuilt from validated segment bytes.
+- A missing or corrupt index is rebuilt from validated segment bytes. A
+  background job builds each sealed segment's index beside later writes; a
+  build validates the segment once.
+- Identity lookups keep each sealed index's operation IDs resident (up to
+  64Ki IDs), so a miss skips reading that index.
 - Numeric lookup revalidates the operation's framing and digest before use.
 - Time seeks use APPEND-head timestamps. ID seeks search retained segments and
   need an explicit duplicate policy.
@@ -382,6 +401,9 @@ Topics set `retention.max_age_secs` and `retention.max_bytes`; see
   floors confirm.
 - Retention debt runs in bounded steps between foreground turns. The periodic
   interval applies only after catching up.
+- A due turn waits for accepted operations to apply. New proposals wait with
+  it; replay, repair, and recovery donor work go on, since the operations may
+  commit only through a lagging or recovering copy.
 - A view change abandons unfinished retirement; its files become unselected
   leftovers.
 - Policy changes become canonical `PartitionPolicy` operations; confirmation
@@ -399,6 +421,45 @@ Topics set `retention.max_age_secs` and `retention.max_bytes`; see
   of unlinking it, unless a spare exists. So a byte-limited partition can use
   one segment more than `max_bytes` on disk.
 - Opening a store removes recognized `staging/` leftovers.
+
+### Full partitions
+
+A partition journal holds at most 256 segments of `segment_bytes`.
+
+- With less than a sixteenth of that space left, the partition refuses new
+  records with NACK 10 (retry after backoff). With less than a sixty-fourth
+  left, it also refuses producer opens, consumer progress, and assignments.
+- Trims and policy changes always pass, so retention can still free space.
+- A retention byte target covers at most 224 segments, so retention that lags
+  a few segments still frees space before refusals start.
+- Followers group the same operations on their own timing and can need more
+  space than the leader. Packing gives that space back. A replica whose
+  journal fills anyway holds its writes until a pack or a retirement frees a
+  segment, instead of failing.
+
+### Packing
+
+A replica with at most 24 free segments packs sparse sealed segments.
+
+- It picks the run of adjacent sealed segments that frees the most segments
+  per byte rewritten. The run must fit one segment and free at least what it
+  rewrites.
+- A job beside writes measures the run, then rewrites its operations into
+  groups of at most 8 MiB. It reads and writes at most 8 MiB at a time. One
+  manifest publication between writes selects the packed segment in place of
+  the run.
+- The packed segment is a new file generation of the run's last segment ID,
+  so the next segment's header still names its predecessor. Its groups number
+  from the run's first.
+- Operations, digests, and the chain do not change. A crash before the
+  publication leaves an unselected file for cleanup.
+- A pack starts and installs only while no retirement or cleanup runs, and
+  retirement waits for a pack. A view change abandons an unfinished pack.
+- Suffix installation at the segment limit packs the best sealed run of its
+  new selection, kept or staged, before it rolls. Reads and groups stay
+  within the staging bounds. A replaced kept segment stays selected until
+  publication and is cleaned up after; a replaced staged one is removed at
+  once.
 
 ## Operator tuning
 

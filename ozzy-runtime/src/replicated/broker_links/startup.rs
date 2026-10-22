@@ -166,6 +166,8 @@ impl Startup {
         let (registrations, received) = mpsc::channel(driver::TURN);
         // A place per reader slot, so a new inbox never finds it full.
         let (inboxes, installs) = mpsc::channel(readers::Admission::capacity(&config)?.0.max(1));
+        #[cfg(test)]
+        let control = self.control.clone();
         let inputs = driver::Inputs {
             control: self.control,
             data: self.data,
@@ -187,6 +189,8 @@ impl Startup {
             publications: brokers.publications,
             shared: self.shared,
             runtime: self.sdk,
+            #[cfg(test)]
+            control,
         }));
         tokio::task::spawn_local(driver.run());
         for driver in brokers.publication_drivers {

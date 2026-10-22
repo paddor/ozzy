@@ -41,12 +41,13 @@ impl OwnedJournal {
         else {
             return Err(JournalError::AppendMismatch);
         };
-        let current_state = self
+        let partition = self
             .images()?
             .speculative()
             .partition(request.partition)
-            .ok_or(AppendAdmissionError::UnknownPartition)?
-            .producer(request.producer);
+            .ok_or(AppendAdmissionError::UnknownPartition)?;
+        let retired = partition.retired_epoch;
+        let current_state = partition.producer(request.producer);
         let current = current_state.map(coordinates);
         // The latest transition belongs to canonical state, not a historical
         // index. Retiring its segment must not turn an exact fence retry into
@@ -56,7 +57,7 @@ impl OwnedJournal {
             && transition.operation_id == request.operation
         {
             if transition.expected_epoch != expected.expected_epoch
-                || state.producer_epoch != expected.new_epoch
+                || (expected.expected_epoch.is_some() && state.producer_epoch != expected.new_epoch)
             {
                 return Err(JournalError::AppendMismatch);
             }
@@ -65,6 +66,12 @@ impl OwnedJournal {
             self.resolve_producer_open(request, expected, current)
                 .await?
         };
+        let coordinates = if !resolved && current.is_none() && request.mode == Mode::Resume {
+            resume_retired(buffer, expected, retired)?
+        } else {
+            coordinates
+        };
+        self.retention.idle.forget(request.producer);
         buffer
             .producer_session
             .as_mut()
@@ -107,7 +114,7 @@ impl OwnedJournal {
                 self.read_producer_open(request.operation, claim.op_number)
                     .await?
             };
-            if original != expected {
+            if !same_open(original, expected) {
                 return Err(JournalError::AppendMismatch);
             }
             let (epoch, sequence, floor) = current.ok_or(AppendAdmissionError::Fenced)?;
@@ -157,6 +164,34 @@ impl OwnedJournal {
         };
         Ok(open)
     }
+}
+
+/// A fresh resume recreates a retired identity above every retired epoch,
+/// so a fenced writer of an earlier session never matches the new one.
+fn resume_retired(
+    buffer: &mut AppendBuffer,
+    expected: OpenProducer,
+    retired: u64,
+) -> Result<(u64, u64, u64), JournalError> {
+    let epoch = retired.checked_add(1).ok_or(JournalError::AppendMismatch)?;
+    if epoch != expected.new_epoch.get() {
+        buffer.raise_producer_open(epoch)?;
+    }
+    Ok((epoch, 0, 0))
+}
+
+/// Whether a retry asks for `original`. A session opened without an
+/// expected epoch took the epoch its primary chose.
+fn same_open(original: OpenProducer, retry: OpenProducer) -> bool {
+    original
+        == OpenProducer {
+            new_epoch: if retry.expected_epoch.is_none() {
+                original.new_epoch
+            } else {
+                retry.new_epoch
+            },
+            ..retry
+        }
 }
 
 /// Session epoch, next sequence and retry floor.

@@ -59,6 +59,8 @@ pub enum OperationKind {
     GroupPlan = 12,
     /// Retire one coordinator group incarnation and free its name.
     GroupDelete = 13,
+    /// Remove one idle producer session and its retry results.
+    RetireProducer = 14,
 }
 
 impl TryFrom<u16> for OperationKind {
@@ -79,6 +81,7 @@ impl TryFrom<u16> for OperationKind {
             11 => Ok(Self::DedupWatermark),
             12 => Ok(Self::GroupPlan),
             13 => Ok(Self::GroupDelete),
+            14 => Ok(Self::RetireProducer),
             other => Err(OperationCodecError::UnsupportedOperationKind(other)),
         }
     }
@@ -97,6 +100,7 @@ impl OperationKind {
                 | Self::Progress
                 | Self::ResolvedAppend
                 | Self::DedupWatermark
+                | Self::RetireProducer
         )
     }
 }
@@ -455,6 +459,20 @@ pub struct DedupWatermark {
     pub logical_time: u64,
 }
 
+/// Primary-chosen removal of one idle producer session. The expected epoch
+/// and next sequence fence any open or append ordered before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetireProducer {
+    /// Exact partition record incarnation.
+    pub partition: PartitionIncarnation,
+    /// Producer identity scoped to this partition.
+    pub producer_id: ProducerId,
+    /// Expected producer-session fence.
+    pub producer_epoch: ProducerEpoch,
+    /// Expected next producer sequence.
+    pub next_sequence: ProducerSequence,
+}
+
 /// One typed canonical operation body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperationBody<'a> {
@@ -484,6 +502,8 @@ pub enum OperationBody<'a> {
     GroupPlan(super::GroupPlan<'a>),
     /// Retire one coordinator group incarnation and free its name.
     GroupDelete(super::GroupDelete),
+    /// Remove one idle producer session and its retry results.
+    RetireProducer(RetireProducer),
 }
 
 impl OperationBody<'_> {
@@ -497,7 +517,8 @@ impl OperationBody<'_> {
             | Self::Append(_)
             | Self::Progress(_)
             | Self::ResolvedAppend(_)
-            | Self::DedupWatermark(_) => None,
+            | Self::DedupWatermark(_)
+            | Self::RetireProducer(_) => None,
             Self::OpenProducer(value) => Some(value.operation_id),
             Self::Assign(value) => Some(value.operation_id),
             Self::Trim(value) => Some(value.operation_id),
@@ -525,6 +546,7 @@ impl OperationBody<'_> {
             Self::DedupWatermark(_) => OperationKind::DedupWatermark,
             Self::GroupPlan(_) => OperationKind::GroupPlan,
             Self::GroupDelete(_) => OperationKind::GroupDelete,
+            Self::RetireProducer(_) => OperationKind::RetireProducer,
         }
     }
 }

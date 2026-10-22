@@ -40,6 +40,7 @@ fn request() -> RecoveryRequest {
         scope: configuration().scope(),
         request_id: RequestId::from_bytes([11; 16]),
         nonce: RequestId::from_bytes([10; 16]),
+        nonvoting: true,
     }
 }
 
@@ -59,26 +60,36 @@ fn recovery_request_has_frozen_bytes_and_separate_attempt_and_link_identities() 
     header[8..24].fill(11);
     header[24..40].fill(2);
     header[40..56].fill(9);
-    header[59] = 96;
-    let mut golden = [0; 96];
+    header[59] = 97;
+    let mut golden = [0; 97];
     golden[..16].fill(7);
     golden[23] = 1;
     golden[32..48].fill(2);
     golden[48..80].fill(8);
     golden[80..96].fill(10);
+    golden[96] = 1;
     assert_eq!(encoded.header, header);
     assert_eq!(encoded.metadata_bytes, golden.len());
-    assert_eq!(&metadata[..96], &golden);
-    assert_eq!(&metadata[96..], &[0xff; 16]);
+    assert_eq!(&metadata[..97], &golden);
+    assert_eq!(&metadata[97..], &[0xff; 15]);
+    let binding = PeerBinding::new(configuration(), node(1), session()).unwrap();
+    let decoded =
+        |golden: &[u8]| match decode(&[&header, golden, &[]], binding, WireLimits::default()) {
+            Ok(ReplicaMessage::Recovery(RecoveryMessage::Request(request))) => Some(request),
+            _ => None,
+        };
+    assert_eq!(decoded(&golden), Some(request()));
+    // A startup probe asks as a voter; no other marker value decodes.
+    golden[96] = 0;
     assert_eq!(
-        decode(
-            &[&header, &golden, &[]],
-            PeerBinding::new(configuration(), node(1), session()).unwrap(),
-            WireLimits::default(),
-        )
-        .unwrap(),
-        ReplicaMessage::Recovery(RecoveryMessage::Request(request())),
+        decoded(&golden),
+        Some(RecoveryRequest {
+            nonvoting: false,
+            ..request()
+        })
     );
+    golden[96] = 2;
+    assert_eq!(decoded(&golden), None);
 }
 
 fn state() -> RecoveryState {
@@ -755,4 +766,37 @@ fn retired_history_notice_is_bound_to_scope_session_and_live_receive_or_fetch() 
         );
         assert_eq!(output, before);
     }
+    // A source without retired history serves a fetch from genesis; a
+    // receive window never restarts there.
+    let fetch = HistoryRetired {
+        scope: configuration().scope(),
+        fence: HistoryFence::Fetch(RequestId::from_bytes([16; 16])),
+        before: Prefix::GENESIS,
+    };
+    let encoded = encode_history_retired(
+        node(0),
+        session(),
+        fetch,
+        &mut output,
+        WireLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        decode_bytes(node(0), &encoded.header, &output[..137], &[]).unwrap(),
+        ReplicaMessage::HistoryRetired(fetch)
+    );
+    let receive = HistoryRetired {
+        fence: HistoryFence::Receive(ozzy_replication::flow::ReceiveEpoch::new(15).unwrap()),
+        ..fetch
+    };
+    assert!(
+        encode_history_retired(
+            node(0),
+            session(),
+            receive,
+            &mut output,
+            WireLimits::default()
+        )
+        .is_err()
+    );
 }

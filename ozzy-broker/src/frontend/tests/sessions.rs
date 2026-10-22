@@ -325,6 +325,83 @@ async fn serving_lifecycle(trusted: bool, distinct: bool) {
 }
 
 #[tokio::test]
+async fn serving_resynchronizes_connections_after_its_monitor_lags() {
+    use ozzy_runtime::frontend::{ReceiveBuffers, ReceiveStorage};
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let omq = Context::new();
+        let endpoints = endpoints(false);
+        let (reported, report) = oneshot::channel();
+        let (storm, peer) = (omq.clone(), endpoints.peer.clone());
+        let frontend = Frontend::start_with_context(
+            frontend_plan(&plan(), &endpoints),
+            omq.clone(),
+            move |context| async move {
+                // Each short connection emits three monitor events before the
+                // dispatcher reads any: more than the monitor holds.
+                for id in 0..30_u8 {
+                    let socket = storm.socket(
+                        SocketType::Peer,
+                        omq_tokio::Options::default()
+                            .identity(Bytes::copy_from_slice(&[id + 100; 16]))
+                            .linger(Duration::ZERO),
+                    );
+                    socket.connect(&peer).await.unwrap();
+                    socket
+                        .wait_connected(1, Duration::from_secs(5))
+                        .await
+                        .unwrap();
+                    socket.close().await.unwrap();
+                    // The peer limit counts a connection until its teardown.
+                    while !context.peer.connections().await.unwrap().is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                let (service, _receivers) = serving_service(true);
+                reported.send(service.links()).unwrap();
+                let buffers = ReceiveBuffers::new(
+                    DataLimits::default().envelope,
+                    ReceiveStorage::Inproc {
+                        payload_backing_bytes: 4096,
+                    },
+                )
+                .unwrap();
+                context
+                    .serve(
+                        service,
+                        crate::RemoteBrokers::default(),
+                        buffers,
+                        Duration::from_millis(10),
+                    )
+                    .await
+            },
+        )
+        .await
+        .unwrap();
+        let links = report.await.unwrap();
+        let remote = NodeId::from_bytes([1; 16]);
+        let socket = omq.socket(
+            SocketType::Peer,
+            omq_tokio::Options::default()
+                .identity(Bytes::copy_from_slice(remote.as_bytes()))
+                .router_mandatory(true)
+                .linger(Duration::from_millis(5)),
+        );
+        socket.connect(&endpoints.peer).await.unwrap();
+        socket
+            .wait_connected(1, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let mut sessions = source(1, handshake::PRODUCER);
+        let current = negotiate(&socket, &mut sessions).await;
+        assert_eq!(links.get(remote).unwrap().binding.session, current);
+        socket.close().await.unwrap();
+        frontend.shutdown().await.unwrap();
+    })
+    .await
+    .expect("serving after monitor lag stalled");
+}
+
+#[tokio::test]
 async fn paused_repair_source_preserves_control_other_shards_and_reconnect() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let context = Context::new();

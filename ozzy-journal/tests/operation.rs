@@ -26,15 +26,15 @@ mod watermark;
 use ozzy_journal::operation::{
     Append, AppendBatch, AppendRecord, Assign, Barrier, CreatePartition, OpenProducer,
     OperationBody, OperationCodecError, OperationKind, OperationLimits, PartitionPolicy,
-    ProducerResultFloor, Progress, ProgressAssignment, ProgressOwner, RetentionPolicy, Trim,
-    append_operation_body, decode_operation_body, encode_operation_body,
+    ProducerResultFloor, Progress, ProgressAssignment, ProgressOwner, RetentionPolicy,
+    RetireProducer, Trim, append_operation_body, decode_operation_body, encode_operation_body,
 };
 use ozzy_proto::{
     ConsumerGroupId, ConsumerMemberId, MessageId, Offset, OperationId, OwnerEpoch, PartitionId,
     PartitionIncarnation, ProducerEpoch, ProducerId, ProducerSequence, SubscriptionId,
 };
 
-const FIXTURES: [&str; 9] = [
+const FIXTURES: [&str; 10] = [
     concat!(
         "10101010101010101010101010101010",
         "0000000673747265616d00000005746f706963",
@@ -96,6 +96,11 @@ const FIXTURES: [&str; 9] = [
         "20202020202020202020202020202020",
         "000000000000000900000000000000020000000000000004",
         "36363636363636363636363636363636",
+    ),
+    concat!(
+        "10101010101010101010101010101010",
+        "20202020202020202020202020202020",
+        "00000000000000090000000000000004",
     ),
 ];
 
@@ -193,6 +198,12 @@ fn bodies() -> Vec<OperationBody<'static>> {
             expected_floor: ProducerSequence::new(2),
             new_floor: ProducerSequence::new(4),
             operation_id: OperationId::from_bytes([0x36; 16]),
+        }),
+        OperationBody::RetireProducer(RetireProducer {
+            partition,
+            producer_id: producer,
+            producer_epoch: ProducerEpoch::new(9),
+            next_sequence: ProducerSequence::new(4),
         }),
     ]
 }

@@ -13,6 +13,7 @@ use mode::Mode;
 mod donor;
 mod history;
 mod identities;
+mod indexing;
 pub use donor::{
     CompletedCheckpointRead, CompletedRecoveryRead, PreparedCheckpointRead, PreparedRecoveryRead,
 };
@@ -31,6 +32,7 @@ pub(in crate::replica_journal) mod seek;
 pub use read::{CompletedDelivery, CompletedRead, PartitionDelivery, PreparedRead};
 mod replay;
 mod retention;
+mod room;
 pub use replay::{CompletedReplay, PreparedReplay, ReplayRequest};
 mod receiving;
 pub use receiving::{RecoveringJournal, RecoveryGenerations, RecoveryOpen};
@@ -75,6 +77,11 @@ pub struct OwnedJournal {
     configuration: Mode,
     scope: Scope,
     images: Option<CanonicalImages<JournalIdentityIndex>>,
+    indexing: indexing::Indexing,
+    /// Committed state through `applied` while an election holds no images.
+    /// An installation replays only after it.
+    committed_base: Option<ozzy_core::state::CanonicalState>,
+    room: room::Room,
     dedup: dedup::State,
     selected: Option<CanonicalRecoveryCandidate>,
     history: Option<JournalHistory>,
@@ -143,6 +150,7 @@ impl OwnedJournal {
             append_limits: self.append_limits,
             operations: self.limits.operations,
             buffer_generation: self.buffer_generation,
+            io: self.journal.ready()?.backend(),
             execution: super::execution::Execution::Normal(super::ShardJournal::new(
                 self, config, timestamp,
             )),
@@ -203,10 +211,12 @@ impl OwnedJournal {
         let configuration = config.configuration.configuration();
         let candidate = journal.recover_canonical_candidate(config.recovery).await?;
         let accepted = prefix(journal.accepted_position()?);
-        let images = if fresh {
-            Some(candidate.activate(&journal)?)
+        // A restarted replica holds no images until an election installs. Its
+        // installation replays only after the recovered committed state.
+        let (images, committed_base) = if fresh {
+            (Some(candidate.activate(&journal)?), None)
         } else {
-            None
+            (None, Some(candidate.committed_images().committed().clone()))
         };
         let manifest = journal.manifest();
         let scope = Scope {
@@ -238,6 +248,7 @@ impl OwnedJournal {
             images,
             reader,
         )?;
+        owner.committed_base = committed_base;
         if fresh {
             owner.restore_dedup().await?;
         }
@@ -258,11 +269,14 @@ impl OwnedJournal {
         let applied = prefix(journal.committed_position()?);
         let generation = journal.writer().durable_position().generation();
         Ok(Self {
-            retention: retention::Retention::default(),
+            retention: retention::Retention::new(config.producer_idle),
             journal: JournalOwner::Ready(Box::new(journal)),
             configuration,
             scope,
             images,
+            committed_base: None,
+            room: room::Room::default(),
+            indexing: indexing::Indexing::default(),
             dedup: dedup::State::new(config.deduplication),
             selected: None,
             history: None,
@@ -370,6 +384,21 @@ impl OwnedJournal {
         let next = authority::promise_manifest(self.scope, journal, ticket)?;
         if let Some(next) = next {
             self.abandon_retirement();
+            self.abandon_pack();
+            // Committed state never rolls back; keep it for the installation.
+            let base = self
+                .images
+                .as_ref()
+                .map(CanonicalImages::committed)
+                .or_else(|| {
+                    self.selected
+                        .as_ref()
+                        .map(|candidate| candidate.committed_images().committed())
+                })
+                .cloned();
+            if base.is_some() {
+                self.committed_base = base;
+            }
             self.images = None;
             self.dedup.clear();
             self.reader = None;
@@ -421,6 +450,7 @@ impl OwnedJournal {
             self.storage_validation.clear();
             self.donors = std::array::from_fn(|_| None);
             self.images = None;
+            self.committed_base = None;
             self.selected = None;
             self.journal.take_ready()?.close().await?;
             Ok(())

@@ -20,9 +20,9 @@ pub(super) use append::{
 use append::{decode_append, encode_append};
 use control::{
     decode_assign, decode_create, decode_dedup_watermark, decode_open_producer, decode_policy,
-    decode_producer_result_floor, decode_progress, decode_trim, encode_assign, encode_create,
-    encode_dedup_watermark, encode_open_producer, encode_policy, encode_producer_result_floor,
-    encode_progress, encode_trim,
+    decode_producer_result_floor, decode_progress, decode_retire_producer, decode_trim,
+    encode_assign, encode_create, encode_dedup_watermark, encode_open_producer, encode_policy,
+    encode_producer_result_floor, encode_progress, encode_retire_producer, encode_trim,
 };
 pub(super) use primitives::{
     Encoder, ReadFields, Reader, encode_atomic, enforce_limit, validate_limits,
@@ -78,6 +78,7 @@ pub fn append_operation_body_to(
             OperationBody::DedupWatermark(value) => encode_dedup_watermark(*value, encoder)?,
             OperationBody::GroupPlan(value) => group::encode(value, limits, encoder)?,
             OperationBody::GroupDelete(value) => group::encode_delete(*value, encoder)?,
+            OperationBody::RetireProducer(value) => encode_retire_producer(*value, encoder)?,
         }
         Ok(())
     })
@@ -252,6 +253,9 @@ fn decode_body<const MATERIALIZE: bool, const VALIDATE_PREPARED: bool>(
         }
         OperationKind::GroupDelete => {
             OperationBody::GroupDelete(group::decode_delete(&mut decoder)?)
+        }
+        OperationKind::RetireProducer => {
+            OperationBody::RetireProducer(decode_retire_producer(&mut decoder)?)
         }
     };
     decoder.finish()?;

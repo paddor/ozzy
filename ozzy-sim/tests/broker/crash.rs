@@ -52,7 +52,7 @@ async fn inproc_memory_device_cuts_with_held_completions_preserve_retry_identity
                 .await;
                 let pending = progress(&clock, client.queue(0)).await;
                 progress(&clock, client.confirm(pending)).await;
-                let primary = client.leader(0);
+                let primary = progress(&clock, client.leader(0)).await;
                 let index = cluster
                     .configs
                     .iter()

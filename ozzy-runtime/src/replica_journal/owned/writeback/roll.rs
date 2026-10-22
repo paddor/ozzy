@@ -2,6 +2,7 @@
 //! and install it on this owner.
 
 use super::{JournalError, JournalOwner, Observation, OwnedJournal};
+use crate::replica_journal::authority::position;
 use ozzy_journal_segment::{CompletedJournalRoll, PreparedJournalRoll};
 use std::rc::Rc;
 
@@ -38,13 +39,17 @@ impl OwnedJournal {
     /// remain owned and may span the roll without changing retry boundaries.
     pub fn begin_roll(&mut self, max_probes: usize) -> Result<PreparedRoll, JournalError> {
         self.healthy()?;
+        if !self.can_roll()? {
+            return Err(JournalError::RollCapacity);
+        }
         self.journal.finish_writes()?;
         let capacity = self.journal.ready()?.writer().header().capacity();
         self.faulted = true;
-        let (pending, work) = self
-            .journal
-            .take_ready()?
-            .begin_owned_roll(capacity, max_probes)?;
+        let (pending, work) = self.journal.take_ready()?.begin_owned_roll(
+            capacity,
+            max_probes,
+            position(self.applied),
+        )?;
         self.journal = JournalOwner::Rolling(Box::new(pending));
         self.faulted = false;
         Ok(PreparedRoll {
@@ -87,6 +92,7 @@ impl OwnedJournal {
         }
         observed.armed = false;
         self.faulted = false;
+        self.release_writes();
         Ok(())
     }
 }

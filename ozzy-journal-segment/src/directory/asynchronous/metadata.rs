@@ -57,7 +57,14 @@ impl Journal {
 
     pub(super) async fn install_selected(&mut self, next: Manifest) -> Result<(), DirectoryError> {
         self.interrupted = true;
-        super::opening::validate_headers(&self.access, self.root(), &next, self.limits).await?;
+        super::opening::validate_headers(
+            &self.access,
+            self.root(),
+            &next,
+            &self.manifest.segments,
+            self.limits,
+        )
+        .await?;
         let (next, current) = publish_selected(
             &mut self.directory,
             &self.manifest,
@@ -157,9 +164,23 @@ impl Journal {
             return Err(DirectoryError::PositionNotDurable(position.op_number));
         }
         let mut seen = positions.map(|position| position == crate::LogPosition::GENESIS);
-        for reference in &self.manifest.segments {
+        let segments = &self.manifest.segments;
+        for (at, reference) in segments.iter().enumerate() {
             for (found, position) in seen.iter_mut().zip(positions) {
                 *found |= reference.first_chain == position.following_chain()?;
+            }
+            // Read only a segment whose operations could hold a position not
+            // found yet; the manifest chains the segments.
+            let first = reference.first_chain.next_op_number();
+            let next = segments
+                .get(at + 1)
+                .map_or(u64::MAX, |next| next.first_chain.next_op_number());
+            if !seen
+                .iter()
+                .zip(positions)
+                .any(|(found, position)| !found && (first..next).contains(&position.op_number))
+            {
+                continue;
             }
             let mut groups = self.segment_groups(*reference).await?;
             while let Some(group) = groups.next().await? {

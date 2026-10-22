@@ -20,7 +20,12 @@ pub(crate) struct Groups {
     cursor: Cursor,
     digest: SegmentDigestBuilder,
     decoded: usize,
+    /// Bytes read from the file; the unread group starts at `start`.
     bytes: Vec<u8>,
+    start: usize,
+    /// Bytes one read takes beyond the next group, or zero to read each
+    /// group alone.
+    read_ahead: usize,
     configuration_epoch: u64,
     promised_view: u64,
     ended: bool,
@@ -92,7 +97,7 @@ impl Journal {
         reference: SegmentReference,
     ) -> Result<GroupScope, DirectoryError> {
         self.healthy()?;
-        let (expected, active_header) = if let Some(sealed) = reference.sealed {
+        if reference.sealed.is_some() {
             let at = self
                 .manifest
                 .segments
@@ -104,27 +109,51 @@ impl Journal {
                 .segments
                 .get(at + 1)
                 .ok_or(DirectoryError::SegmentMismatch(reference.segment_id))?;
-            let expected = End {
-                offset: sealed.valid_bytes,
-                digest: sealed.digest,
-                chain: next.first_chain,
-                group_number: next.first_group_number,
-            };
-            (expected, None)
-        } else {
-            let position = self.writer.written_position();
-            let expected = End {
-                offset: position.end_offset(),
-                digest: self.writer.state().structural_digest(),
-                chain: position.next_chain(),
-                group_number: position
-                    .group_number()
-                    .checked_add(1)
-                    .ok_or(CodecError::InvalidGroupNumber)?,
-            };
-            (expected, Some(self.writer.state().header().clone()))
+            return self.sealed_scope(reference, next);
+        }
+        let position = self.writer.written_position();
+        let expected = End {
+            offset: position.end_offset(),
+            digest: self.writer.state().structural_digest(),
+            chain: position.next_chain(),
+            group_number: position
+                .group_number()
+                .checked_add(1)
+                .ok_or(CodecError::InvalidGroupNumber)?,
         };
-        Ok(GroupScope {
+        Ok(self.scope(
+            reference,
+            expected,
+            Some(self.writer.state().header().clone()),
+        ))
+    }
+
+    /// Capture a sealed segment's expected end before `next`, which need
+    /// not be selected yet.
+    pub(crate) fn sealed_scope(
+        &self,
+        reference: SegmentReference,
+        next: &SegmentReference,
+    ) -> Result<GroupScope, DirectoryError> {
+        let sealed = reference
+            .sealed
+            .ok_or(DirectoryError::SegmentMismatch(reference.segment_id))?;
+        let expected = End {
+            offset: sealed.valid_bytes,
+            digest: sealed.digest,
+            chain: next.first_chain,
+            group_number: next.first_group_number,
+        };
+        Ok(self.scope(reference, expected, None))
+    }
+
+    fn scope(
+        &self,
+        reference: SegmentReference,
+        expected: End,
+        active_header: Option<SegmentHeader>,
+    ) -> GroupScope {
+        GroupScope {
             access: self.access.clone(),
             path: self.root().join(super::segment_reference_name(reference)),
             reference,
@@ -134,7 +163,7 @@ impl Journal {
             limits: self.limits,
             configuration_epoch: self.manifest.configuration_epoch,
             promised_view: self.manifest.promised_view,
-        })
+        }
     }
 
     pub(crate) fn group_scan_bytes(&self) -> Result<usize, DirectoryError> {
@@ -151,7 +180,19 @@ impl GroupScope {
         self.limits
     }
 
+    /// Open with reads of up to one I/O chunk past the next group.
     pub(crate) async fn open(self, resume: Option<Resume>) -> Result<Box<Groups>, DirectoryError> {
+        let read_ahead = self.limits.io.chunk_bytes;
+        self.open_reading_ahead(resume, read_ahead).await
+    }
+
+    /// Open with reads of up to `read_ahead` bytes past the next group, so a
+    /// scan of many small groups takes few large reads.
+    pub(crate) async fn open_reading_ahead(
+        self,
+        resume: Option<Resume>,
+        read_ahead: usize,
+    ) -> Result<Box<Groups>, DirectoryError> {
         let Self {
             access,
             path,
@@ -198,6 +239,8 @@ impl GroupScope {
             decoded,
             cursor,
             bytes: Vec::new(),
+            start: 0,
+            read_ahead,
             configuration_epoch,
             promised_view,
             ended: false,
@@ -295,7 +338,7 @@ impl Groups {
                 self.cursor.offset,
                 self.cursor.chain,
             ),
-            &self.bytes,
+            &self.bytes[self.start..],
             self.limits.decode,
         )?;
         for operation in &group.operations {
@@ -325,6 +368,7 @@ impl Groups {
             self.work.charge(operation.body.len()).await;
         }
         self.work.charge(group.consumed_bytes()).await;
+        self.start += (group.end_offset - self.cursor.offset) as usize;
         self.cursor.offset = group.end_offset;
         self.cursor.chain = group.next_chain;
         self.cursor.group_number = self
@@ -346,11 +390,18 @@ impl Groups {
     }
 
     /// Whether the digest, chain, and group number read so far are the
-    /// expected end authority.
+    /// expected end authority. A sealed segment's groups may end before its
+    /// successor's first: a pack writes fewer groups than the run it
+    /// replaced. The sealed digest still binds every group's number.
     fn matches_end(&self) -> bool {
+        let groups = if self.reference.sealed.is_some() {
+            self.cursor.group_number <= self.expected.group_number
+        } else {
+            self.cursor.group_number == self.expected.group_number
+        };
         self.digest.finish() == self.expected.digest
             && self.cursor.chain == self.expected.chain
-            && self.cursor.group_number == self.expected.group_number
+            && groups
     }
 
     /// Whether this segment already yielded its decode limit of groups.
@@ -359,28 +410,25 @@ impl Groups {
             >= self.limits.decode.max_groups as u64
     }
 
+    /// Hold the whole next group from `start`. Without read-ahead each group
+    /// is read alone; with it, one read also takes the groups after it.
     async fn read_group(&mut self) -> Result<(), DirectoryError> {
-        self.bytes.clear();
-        let initial =
-            ((self.expected.offset - self.cursor.offset) as usize).min(WRITE_GROUP_ALIGNMENT);
-        self.access
-            .read_append(
-                &self.handle,
-                crate::async_files::Span {
-                    offset: self.cursor.offset,
-                    length: initial,
-                },
-                self.limits.io.chunk_bytes,
-                &mut self.bytes,
-            )
-            .await?;
+        let remaining = (self.expected.offset - self.cursor.offset) as usize;
+        if self.read_ahead == 0 || self.start == self.bytes.len() {
+            self.bytes.clear();
+            self.start = 0;
+        }
+        if self.bytes.is_empty() {
+            self.read_more(remaining.min(WRITE_GROUP_ALIGNMENT.max(self.read_ahead)))
+                .await?;
+        }
         let maximum = group_bytes(self.limits)?;
         loop {
             match crate::codec::group_extent(
                 &self.header,
                 self.cursor.group_number,
                 self.cursor.offset,
-                &self.bytes,
+                &self.bytes[self.start..],
                 self.limits.decode,
             ) {
                 Ok(_) => return Ok(()),
@@ -391,29 +439,36 @@ impl Groups {
                         .checked_sub(available)
                         .filter(|bytes| *bytes > 0)
                         .ok_or(DirectoryError::RetentionScanBudget)?;
-                    let total = self
-                        .bytes
-                        .len()
-                        .checked_add(extra)
-                        .ok_or(DirectoryError::RetentionScanBudget)?;
-                    if total > maximum || total as u64 > self.expected.offset - self.cursor.offset {
+                    if needed > maximum || needed > remaining {
                         return Err(DirectoryError::RetentionScanBudget);
                     }
-                    self.access
-                        .read_append(
-                            &self.handle,
-                            crate::async_files::Span {
-                                offset: self.cursor.offset + self.bytes.len() as u64,
-                                length: extra,
-                            },
-                            self.limits.io.chunk_bytes,
-                            &mut self.bytes,
-                        )
+                    // Keep only the unread bytes, then read past the group.
+                    self.bytes.drain(..self.start);
+                    self.start = 0;
+                    let held = self.bytes.len();
+                    self.read_more(extra.max(self.read_ahead).min(remaining - held))
                         .await?;
                 }
                 Err(error) => return Err(error.into()),
             }
         }
+    }
+
+    /// Append `length` bytes from the end of what is held.
+    async fn read_more(&mut self, length: usize) -> Result<(), DirectoryError> {
+        let held = (self.bytes.len() - self.start) as u64;
+        self.access
+            .read_append(
+                &self.handle,
+                crate::async_files::Span {
+                    offset: self.cursor.offset + held,
+                    length,
+                },
+                self.limits.io.chunk_bytes,
+                &mut self.bytes,
+            )
+            .await?;
+        Ok(())
     }
 
     pub(crate) async fn finish(self: Box<Self>) -> Result<(), DirectoryError> {

@@ -16,7 +16,7 @@ use crate::state::{
     ProducerResultSpan,
 };
 
-const PARTITION_BYTES: usize = 104;
+const PARTITION_BYTES: usize = 112;
 const PRODUCER_BYTES: usize = 80;
 const SPAN_BYTES: usize = 40;
 
@@ -84,6 +84,7 @@ pub(super) async fn encode_partition(
             .dedup_window_millis
             .map_or(0, std::num::NonZeroU64::get),
     );
+    fixed.put_u64::<104>(value.retired_epoch);
     let mut names = Writer::new(rest);
     names.bytes(value.address.stream.as_bytes())?;
     names.bytes(value.address.topic.as_bytes())?;
@@ -222,6 +223,7 @@ fn decode_fields(
         )?,
         dedup_time: fixed.u64_at::<88>(),
         dedup_window_millis: std::num::NonZeroU64::new(fixed.u64_at::<96>()),
+        retired_epoch: fixed.u64_at::<104>(),
     })
 }
 
@@ -297,7 +299,9 @@ async fn validate_partition_cooperative(
     if value.owner_epoch.get() == 0
         || value.policy_revision == 0
         || value.retained_from > value.next_offset
-        || (value.producers.is_empty() && value.next_offset != Offset::ZERO)
+        || (value.producers.is_empty()
+            && value.next_offset != Offset::ZERO
+            && value.retired_epoch == 0)
     {
         return Err(StateSnapshotError::InvalidPartition);
     }

@@ -265,13 +265,15 @@ impl PartitionJournal {
             path: self.placement.directory.clone(),
             source,
         };
+        // Boxed: each journal startup future is large, and debug builds give
+        // this frame room for all four on the shard thread's stack.
         let (journal, authority) = match self.config {
             JournalConfig::Local(config) => {
                 let capacity = config.limits.io.max_segment_bytes;
                 let (journal, driver) = if format {
-                    OwnedJournal::format_local(config, io, generation, capacity).await
+                    Box::pin(OwnedJournal::format_local(config, io, generation, capacity)).await
                 } else {
-                    OwnedJournal::open_local(config, io, generation).await
+                    Box::pin(OwnedJournal::open_local(config, io, generation)).await
                 }
                 .map_err(error)?;
                 (journal, PartitionAuthority::Local(driver))
@@ -279,9 +281,9 @@ impl PartitionJournal {
             JournalConfig::Replicated(config) => {
                 let capacity = config.limits.io.max_segment_bytes;
                 let (journal, startup) = if format {
-                    OwnedJournal::format_new(config, io, generation, capacity).await
+                    Box::pin(OwnedJournal::format_new(config, io, generation, capacity)).await
                 } else {
-                    OwnedJournal::open(config, io, generation).await
+                    Box::pin(OwnedJournal::open(config, io, generation)).await
                 }
                 .map_err(error)?;
                 (journal, PartitionAuthority::Replicated(startup))

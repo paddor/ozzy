@@ -110,9 +110,16 @@ impl ActorSettings {
         config: &JournalConfig,
     ) -> Result<Self, StartupError> {
         let journal = ShardJournalConfig::default();
-        let retention_interval = (placement.retention.max_age_secs.is_some()
-            || placement.retention.max_bytes.is_some())
-        .then_some(Duration::from_secs(1));
+        // Unlimited retention still sweeps idle producer sessions, once per
+        // sixteenth of their expiry.
+        let retention_interval = Some(
+            if placement.retention.max_age_secs.is_some() || placement.retention.max_bytes.is_some()
+            {
+                Duration::from_secs(1)
+            } else {
+                Duration::from_secs(placement.producer_idle_secs / 16).max(Duration::from_secs(1))
+            },
+        );
         let config = match config {
             JournalConfig::Replicated(config) => config,
             JournalConfig::Local(config) => {

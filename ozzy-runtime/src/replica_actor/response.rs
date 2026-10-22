@@ -59,6 +59,8 @@ pub(super) fn rejection(error: &JournalError) -> (u16, RetryClass) {
             | ozzy_core::dedup::Error::Allocation => (10, RetryClass::AfterBackoff),
             _ => (11, RetryClass::UnknownOutcome),
         },
+        // A nearly full journal refuses new work until retention frees room.
+        JournalError::RollCapacity => (10, RetryClass::AfterBackoff),
         JournalError::AppendCapacity | JournalError::AppendMismatch => (1, RetryClass::Permanent),
         _ => (11, RetryClass::UnknownOutcome),
     }
@@ -188,6 +190,14 @@ pub(super) fn client_packet<'a>(
 mod tests {
     use super::*;
     use ozzy_core::dedup::Error;
+
+    #[test]
+    fn full_journal_retries_after_backoff() {
+        assert_eq!(
+            rejection(&JournalError::RollCapacity),
+            (10, RetryClass::AfterBackoff)
+        );
+    }
 
     #[test]
     fn dedup_capacity_retries_after_backoff_and_bad_batches_are_permanent() {

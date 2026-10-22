@@ -8,6 +8,7 @@ mod indexes;
 mod lifecycle;
 mod metadata_cleanup;
 mod orphans;
+mod pack;
 mod partition_read;
 mod pipeline;
 mod prepared_roll;

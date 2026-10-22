@@ -15,10 +15,22 @@ pub(super) fn replica(
     index: u8,
     group_bytes: usize,
 ) -> Replica {
+    replica_with_pending(controller, io, index, group_bytes, 16)
+}
+
+/// A replica that holds up to `pending` accepted operations not yet
+/// confirmed or applied.
+pub(super) fn replica_with_pending(
+    controller: &mut Controller,
+    io: Local,
+    index: u8,
+    group_bytes: usize,
+    pending: usize,
+) -> Replica {
     let mut config = config(&format!("/broker-{index}"), 7);
     config.identity.replica_node_id = NodeId::from_bytes([index + 1; 16]);
-    config.append_limits.max_operations = 16;
-    config.recovery.accepted_transitions = 16;
+    config.append_limits.max_operations = pending;
+    config.recovery.accepted_transitions = pending;
     config.writeback.max_operations = 16;
     config.write_group_bytes = group_bytes;
     // Match physical decode/scratch bounds to this fixture's admitted groups.

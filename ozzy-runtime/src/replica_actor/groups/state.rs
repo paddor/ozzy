@@ -218,9 +218,9 @@ impl GroupState {
     }
 
     fn activatable(&mut self, target: &GroupTarget, now: Duration, deadline: Duration) -> bool {
-        let Some(prior) = target.prior_member else {
+        if target.prior_member.is_none() {
             return true;
-        };
+        }
         let first = *self
             .drains
             .entry((target.partition, target.plan_revision))
@@ -228,18 +228,20 @@ impl GroupState {
         if now.saturating_sub(first) >= deadline {
             return true;
         }
-        match self.members.get(&prior.id) {
-            // Left, timed out, or replaced by a newer instance: nothing to drain.
-            None => true,
-            Some(live) if live.join != prior.join || live.leaving => true,
-            Some(live) => {
-                live.ownership_observed
+        // Any older owner may still drain, not only the prior target: a
+        // target can move again before it activates. Members that left, timed
+        // out, or were replaced by a newer instance have nothing to drain.
+        self.members.iter().all(|(&id, live)| {
+            live.leaving
+                || target
+                    .member
+                    .is_some_and(|owner| owner.id == id && owner.join == live.join)
+                || live.ownership_observed
                     && !live.owned.iter().any(|owned| {
                         owned.partition == target.partition
                             && owned.plan_revision < target.plan_revision
                     })
-            }
-        }
+        })
     }
 
     /// Members the next plan should contain, or `None` when the committed

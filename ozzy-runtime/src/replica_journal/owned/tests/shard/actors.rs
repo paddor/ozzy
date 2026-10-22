@@ -271,6 +271,7 @@ struct ActorSettings {
     identities: usize,
     sessions: [LinkSessionId; 3],
     deduplication: Option<ozzy_core::dedup::Limits>,
+    retention_interval: Option<Duration>,
 }
 
 impl Default for ActorSettings {
@@ -279,6 +280,7 @@ impl Default for ActorSettings {
             identities: 64,
             sessions: actor_config().sessions,
             deduplication: None,
+            retention_interval: None,
         }
     }
 }
@@ -328,12 +330,14 @@ fn configured_actor(
         .unwrap();
     let ids = crate::replica_actor::ActorIds::deterministic(
         std::num::NonZeroU64::new(u64::from(group) * 10 + u64::from(broker) + 1).unwrap(),
+        crate::replica_actor::ReceiptHandles::default(),
     );
     let mut actor = ReplicaActor::new_with_ids(
         journal,
         startup,
         ActorConfig {
             sessions: settings.sessions,
+            retention_interval: settings.retention_interval,
             ..actor_config()
         },
         ids,

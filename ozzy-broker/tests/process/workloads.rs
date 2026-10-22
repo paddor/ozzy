@@ -21,7 +21,7 @@ async fn cli_tcp_varied_payloads_and_live_reader_survive_leader_changes() {
             .observe("admit mixed records", client.queue_varied(wave))
             .await;
         if wave == 6 {
-            let leader = client.leader(0);
+            let leader = brokers.observe("find leader", client.leader(0)).await;
             let index = (0..3)
                 .find(|index| {
                     checked.identity.brokers[&format!("broker-{index}")].as_bytes()

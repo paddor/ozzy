@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::{
     Broker, ConfigError, Deployment, DeploymentMode, QueueBudget, Shard, invalid,
-    schema::{MAX_APPEND_BYTES, MAX_CLIENTS},
+    schema::{MAX_APPEND_BYTES, MAX_CLIENTS, MAX_PARTITION_SEGMENTS},
 };
 
 /// Structurally valid configuration. Host checks are performed for the selected
@@ -238,12 +238,20 @@ fn validate_topics(config: &Deployment, ids: &mut BTreeSet<Uuid>) -> Result<(), 
             "age must be positive and fit milliseconds",
         )?;
         require(
-            topic
-                .retention
-                .max_bytes
-                .is_none_or(|bytes| bytes >= topic.segment_bytes),
+            topic.retention.max_bytes.is_none_or(|bytes| {
+                bytes >= topic.segment_bytes
+                    && bytes
+                        <= topic
+                            .segment_bytes
+                            .saturating_mul(MAX_PARTITION_SEGMENTS as u64 / 8 * 7)
+            }),
             &format!("{path}.retention.max_bytes"),
-            "byte target must fit at least one segment",
+            "byte target must fit one segment and at most seven eighths of the segment limit",
+        )?;
+        require(
+            topic.producer_idle_secs > 0 && topic.producer_idle_secs.checked_mul(1000).is_some(),
+            &format!("{path}.producer_idle_secs"),
+            "idle expiry must be positive and fit milliseconds",
         )?;
         if let Some(policy) = topic.deduplication {
             validate_deduplication(policy, &path)?;
@@ -333,6 +341,18 @@ fn validate_devices(broker: &Broker, path: &str) -> Result<(), ConfigError> {
 
 fn validate_broker(broker: &Broker, path: &str) -> Result<Vec<Shard>, ConfigError> {
     validate_devices(broker, path)?;
+    for (direction, limit) in [
+        ("ingress", broker.topology.omq.ingress),
+        ("egress", broker.topology.omq.egress),
+    ] {
+        if let Some(limit) = limit {
+            require(
+                limit.bytes_per_second > 0 && limit.burst_bytes > 0,
+                &format!("{path}.topology.omq.{direction}"),
+                "network bytes_per_second and burst_bytes must be positive",
+            )?;
+        }
+    }
     require(
         (1..=256).contains(&broker.topology.omq.io_threads),
         path,

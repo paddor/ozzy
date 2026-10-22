@@ -42,15 +42,14 @@ fn assign(
 }
 
 fn restore(state: &CanonicalState) -> CanonicalState {
+    restore_limited(state, StateLimits::default())
+}
+
+fn restore_limited(state: &CanonicalState, limits: StateLimits) -> CanonicalState {
     let bytes = state
         .encode_snapshot(StateSnapshotLimits::default())
         .unwrap();
-    CanonicalState::decode_snapshot(
-        &bytes,
-        StateLimits::default(),
-        StateSnapshotLimits::default(),
-    )
-    .unwrap()
+    CanonicalState::decode_snapshot(&bytes, limits, StateSnapshotLimits::default()).unwrap()
 }
 
 #[test]
@@ -117,7 +116,7 @@ fn checksum_valid_snapshots_reject_ambiguous_or_missing_writer_results() {
         .unwrap();
     let names = usize::from(u16::from_be_bytes(encoded[260..262].try_into().unwrap()))
         + usize::from(u16::from_be_bytes(encoded[262..264].try_into().unwrap()));
-    let first_writer = 256 + 104 + names;
+    let first_writer = 256 + 112 + names;
     let first_span = first_writer + 80;
     let second_writer = first_span + 40;
     let second_span = second_writer + 80;
@@ -292,6 +291,80 @@ fn retry_index_budget_is_aggregate_and_failure_is_atomic() {
             .result_offset(ProducerSequence::new(2)),
         Some(Offset::new(3))
     );
+}
+
+fn retire(writer: ProducerId, epoch: u64, next: u64) -> OperationBody<'static> {
+    OperationBody::RetireProducer(RetireProducer {
+        partition: partition(),
+        producer_id: writer,
+        producer_epoch: ProducerEpoch::new(epoch),
+        next_sequence: ProducerSequence::new(next),
+    })
+}
+
+#[test]
+fn retiring_an_idle_writer_frees_its_slot_spans_and_retry_floor() {
+    let limits = StateLimits {
+        max_retry_spans: 2,
+        max_producers: 2,
+        ..StateLimits::default()
+    };
+    let (mut state, mut index) = initialized(limits);
+    assign(&mut state, &mut index, producer(), 0);
+    assign(&mut state, &mut index, another_producer(), 0);
+    let next = state.revision() + 1;
+    for (body, error) in [
+        (retire(producer(), 4, 1), StateError::ProducerEpochMismatch),
+        (
+            retire(producer(), 3, 0),
+            StateError::ProducerSequenceMismatch,
+        ),
+        (
+            retire(ProducerId::from_bytes([0x66; 16]), 3, 0),
+            StateError::ProducerMismatch,
+        ),
+    ] {
+        assert_eq!(state.prepare(next, &body, &index), Err(error));
+    }
+    apply(&mut state, &mut index, next, &retire(producer(), 3, 1));
+    let partition_state = state.partition(partition()).unwrap();
+    assert!(partition_state.producer(producer()).is_none());
+    assert_eq!(partition_state.retired_epoch, 3);
+    // Its stored result no longer holds the record floor.
+    assert_eq!(
+        partition_state.producer_result_offset_floor(),
+        Some(Offset::new(1))
+    );
+    assert_eq!(
+        state.prepare(next + 1, &assigned(producer(), 3, 1, 2), &index),
+        Err(StateError::ProducerMismatch)
+    );
+    // The freed slot and span admit another writer.
+    let OperationBody::OpenProducer(mut third) = open() else {
+        unreachable!()
+    };
+    third.producer_id = ProducerId::from_bytes([0x66; 16]);
+    third.operation_id = operation(0x57);
+    apply(
+        &mut state,
+        &mut index,
+        next + 1,
+        &OperationBody::OpenProducer(third),
+    );
+    apply(
+        &mut state,
+        &mut index,
+        next + 2,
+        &assigned(third.producer_id, 3, 0, 2),
+    );
+    assert_eq!(restore_limited(&state, limits), state);
+    // A partition whose every writer retired keeps its records.
+    for (writer, sequence) in [(another_producer(), 1), (third.producer_id, 1)] {
+        let next = state.revision() + 1;
+        apply(&mut state, &mut index, next, &retire(writer, 3, sequence));
+    }
+    assert_eq!(state.partition(partition()).unwrap().producers().len(), 0);
+    assert_eq!(restore_limited(&state, limits), state);
 }
 
 #[test]

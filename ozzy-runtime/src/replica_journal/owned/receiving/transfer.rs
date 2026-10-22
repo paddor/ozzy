@@ -66,6 +66,7 @@ impl RecoveringJournal {
         let replacement = SuffixReplacement {
             expected_current: journal.current(),
             protected_committed: position(Prefix::GENESIS),
+            retained: position(Prefix::GENESIS),
             promised_view: ticket.scope().view,
             last_normal_view: ticket.scope().view,
             committed: position(ticket.committed()),

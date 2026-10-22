@@ -351,6 +351,122 @@ broker entries. Clients stay on the controller, using one monotonic clock.
   links.
 - Stop and reap all local and remote workers before the next run.
 
+## Python SDK
+
+For concurrent throughput, run separate producer, broker, and consumer processes:
+
+```sh
+scripts/ozzy_cargo build --release -p ozzy-bench --bin ozzy_sdk_pipeline
+"$CARGO_TARGET_DIR/release/ozzy_sdk_pipeline" --python /path/to/venv/bin/python \
+  --broker-cpus 0,1 --producer-cpus 2,3 --consumer-cpu 4 \
+  --codec lz4 --size 1024 --warmup 2 --duration 8 --repetitions 2
+```
+
+Each producer submits individual records. `flush()` confirms every stage;
+`--confirmation each` additionally materializes each record's receipt. The
+consumer verifies every byte, producer stream order, and partition-global
+offsets. It returns benchmark credit every `--window` records per producer
+(8,192 by default), bounding application backlog while all roles run concurrently.
+Each partition receives an end marker from every producer before a stage ends.
+Rates include final confirmation and consumer drain. Results also record CPU
+time for each SDK process, including its native threads.
+
+This uses TCP and the shared real-broker memory-storage harness, with a 1 GiB
+image budget per broker and bounded retention. It does not measure SSD writes.
+Segments default to 16 MiB and retention to 64 MiB per partition; both are
+explicit controls (`--segment-mib`, `--retention-mib`) recorded in each result.
+CPU sets must be disjoint. Repeat with `--api asyncio`, `--codec raw`,
+`--transport lz4+tcp`, or `--mode quorum`. Quorum needs, for example, broker
+CPUs `0,1,2`, producer CPUs `3,4`, and consumer CPU `5`.
+The three quorum brokers share one child process; this runner measures no
+process isolation between those brokers. `--reader-queue-messages 64` gives
+the consumer more room for publication bursts; keep it fixed when comparing.
+`--profile /path/to/profile --repetitions 1` saves cProfile reports per SDK
+process outside the ledger. Use `--no-ledger` when running native profilers.
+Successful rows use kind `python-pipeline`; compare matching controls and
+workload hashes in `~/.cache/ozzy/python-sdk.jsonl`.
+
+For a continuous 20-minute SDK soak, keep the same processes alive and omit
+the benchmark ledger. The runner reports process RSS, peak RSS, and thread
+counts every 30 seconds, and aborts after 45 seconds without protocol progress.
+Use a 4 GiB image budget to leave room for concurrent retention cleanup:
+
+```sh
+"$CARGO_TARGET_DIR/release/ozzy_sdk_pipeline" --python /path/to/venv/bin/python \
+  --api asyncio --codec raw --size 1024 --reader-queue-messages 64 \
+  --memory-mib 4096 --warmup 2 --duration 1200 --repetitions 1 --no-ledger
+```
+
+Build a release wheel, install it into a Python 3.12+ environment, and build
+the Rust runner. Keep `PYO3_PYTHON` set to that interpreter while building.
+The older combined-client runner measures sequential send/confirm/read windows:
+
+```sh
+scripts/ozzy_cargo build --release -p ozzy-python --example ozzy_python_bench
+"$CARGO_TARGET_DIR/release/examples/ozzy_python_bench" --python /path/to/venv/bin/python \
+  --api blocking --codec raw --size 1024 --broker-cpus 0,1 --client-cpu 2 \
+  --warmup 2 --duration 8 --repetitions 2 --label baseline
+```
+
+Repeat with `--api asyncio`, `--codec lz4`, sizes `128, 1024, 8192` as separate
+runs, and `--mode quorum`. Use `--memory-mib 1024` for 8 KiB cases, including
+their baselines. The default image budget is 256 MiB per broker, counting dirty
+and durable bytes. `--transport lz4+tcp` measures OMQ compression.
+Profile separately with `--profile "$OZZY_ARTIFACT_ROOT/python.prof"` and
+`--repetitions 1`; cProfile data and a text report stay outside the timing ledger.
+
+This boundary uses TCP and the shared real-broker memory-storage harness.
+One Python client sends 256 individual records, confirms them, reads all 256,
+and independently verifies IDs, partitions, offsets, and every payload byte.
+Four partitions use rolling retention. Warmup and measurement finish complete
+windows; measured time includes submission, confirmation, reading, and checking.
+This measures client overhead, not physical-disk throughput. CPU sets must be
+disjoint. Run alone under the same isolation rules as other benchmarks.
+
+Successful unprofiled rows append to `~/.cache/ozzy/python-sdk.jsonl`, including
+interpreter version, extension/Python source hashes, source diff, and controls.
+Compare matching cached baseline/candidate cells; do not combine these rows with
+the eight-producer published chart workloads. Python stderr, broker warnings,
+broker errors, or source changes invalidate a run. The runner polls broker
+diagnostics and stops the child when a warning or error appears.
+`--reader-queue-messages` defaults to 32. Compare it with one while keeping
+other controls fixed to measure the effect of the Python SDK's burst window.
+
+## Java SDK
+
+Build the release SDK with `OZZY_JAVA_RELEASE=1 scripts/check-java.sh`, then
+compile its standalone benchmark worker and the shared Rust process runner:
+
+```sh
+javac --release 22 -Xlint:all -Werror \
+  --class-path "$CARGO_TARGET_DIR/java/ozzy-java-0.3.0-linux-x86_64.jar" \
+  -d "$CARGO_TARGET_DIR/java/bench" bindings/java/examples/io/ozzy/bench/Pipeline.java
+scripts/ozzy_cargo build --release -p ozzy-bench --bin ozzy_sdk_pipeline
+taskset -c 5 "$CARGO_TARGET_DIR/release/ozzy_sdk_pipeline" --java /usr/bin/java \
+  --java-classpath "$CARGO_TARGET_DIR/java/ozzy-java-0.3.0-linux-x86_64.jar:$CARGO_TARGET_DIR/java/bench" \
+  --java-library "$CARGO_TARGET_DIR/release/libozzy_java.so" \
+  --broker-cpus 0,1 --producer-cpus 2,3 --consumer-cpu 4 \
+  --codec raw --size 1024 --memory-mib 4096 --reader-queue-messages 64 \
+  --warmup 5 --duration 8 --repetitions 2
+```
+
+The runner shares the Python process protocol, memory broker, four-partition
+payload corpus, bounded credit, and full-byte verification. Every Java producer
+and consumer runs in its own JVM and CPU set; native SDK threads inherit that
+placement. Java uses a 512 MiB heap and Serial GC on each client core. SDK hashes,
+JVM version, process CPU time, and memory are recorded in
+`~/.cache/ozzy/java-sdk.jsonl`. `--api async` measures CompletableFuture calls.
+`--confirmation each` also materializes every receipt. These runs measure SDK
+and memory-broker throughput, without SSD writes.
+Memory storage charges both dirty and durable copies. Its byte limit must
+cover the active phases plus retention headroom; saturation can delay cleanup.
+
+Profile separately with `--profile /absolute/path/prefix --repetitions 1`.
+This saves JFR files per JVM and omits the timing ledger. Add
+`--java-agent /path/to/libasyncProfiler.so` for CPU stacks in collapsed text
+instead of JFR; profiler diagnostics have separate logs. Keep the explicit
+native library path so profilers can resolve Rust symbols after loading.
+
 ## Other tools
 
 | Tool | Boundary |

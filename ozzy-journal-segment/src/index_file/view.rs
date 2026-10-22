@@ -142,6 +142,15 @@ impl<'a> SegmentIndexView<'a> {
             .map(move |entry| decode_offset_entry(entry, self.source.segment_id))
     }
 
+    /// Control-operation identities in sorted order.
+    pub(crate) fn operation_ids(self) -> impl ExactSizeIterator<Item = OperationId> + 'a {
+        self.operations
+            .as_chunks::<OPERATION_INDEX_ENTRY_BYTES>()
+            .0
+            .iter()
+            .map(|entry| OperationId::from_bytes(entry.array::<0, 16>()))
+    }
+
     pub(crate) fn from_validated(
         bytes: &'a [u8],
         source: IndexSource,

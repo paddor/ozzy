@@ -18,6 +18,7 @@ use state::Partitions;
 enum TopicSelection<'a> {
     Key(&'a [u8]),
     Keyless,
+    Partition(u32),
 }
 
 /// Topic routing or underlying partition-writer failure.
@@ -27,6 +28,12 @@ pub enum TopicWriterError {
     /// Invalid topic metadata or writer bounds.
     #[error("invalid topic writer configuration")]
     Configuration,
+    /// The numeric partition does not exist. No record was admitted.
+    #[error("unknown topic partition {partition}")]
+    UnknownPartition {
+        /// Numeric partition requested by the caller.
+        partition: u32,
+    },
     /// Shared broker metadata or control failure.
     #[error(transparent)]
     Broker(#[from] super::BrokerLinkError),

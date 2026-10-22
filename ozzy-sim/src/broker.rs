@@ -18,6 +18,7 @@ mod config;
 pub use config::{Shape, deployment_with_resources};
 mod cluster;
 pub use cluster::Cluster;
+pub mod network;
 
 /// Backend owner joining admitted memory-file work during broker shutdown.
 #[derive(Debug)]
@@ -439,6 +440,20 @@ pub async fn start_images(
     Vec<Arc<Control>>,
     Vec<tokio::task::JoinHandle<Image>>,
 ) {
+    start_images_sized(context, deployment, reverse, IMAGE_LIMITS).await
+}
+
+/// Start the same broker/storage pipeline with explicit bounded media capacity.
+pub async fn start_images_sized(
+    context: impl Into<ServingContext>,
+    deployment: Vec<(CheckedConfig, BrokerIdentity)>,
+    reverse: bool,
+    limits: ImageLimits,
+) -> (
+    Vec<Broker>,
+    Vec<Arc<Control>>,
+    Vec<tokio::task::JoinHandle<Image>>,
+) {
     let context = context.into();
     let mut brokers = Vec::new();
     let mut controls = Vec::new();
@@ -447,12 +462,21 @@ pub async fn start_images(
         let name = checked.plan.name.clone();
         let image = tokio::time::timeout(
             Duration::from_secs(5),
-            Box::pin(provision(&checked, &local, reverse)),
+            Box::pin(provision_sized(&checked, &local, reverse, limits)),
         )
         .await
         .unwrap_or_else(|_| panic!("virtual provision stalled: {name}"));
-        let (broker, control, task) =
-            start_image(context.clone(), checked, local, Memory::new(image, reverse)).await;
+        let (broker, control, task) = start_image(
+            context.clone(),
+            checked,
+            local,
+            Memory {
+                image,
+                limits,
+                reverse,
+            },
+        )
+        .await;
         brokers.push(broker);
         controls.push(control);
         images.push(task);

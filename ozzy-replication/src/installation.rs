@@ -3,9 +3,8 @@
 use ozzy_proto::NodeId;
 
 use crate::{
-    Configuration, Digest, JournalGeneration, LogSource, NormalReplica, OpNumber, Prefix,
-    PreparedOperation, PromiseTicket, ReplicationError, Scope, ViewChange, ViewChangeError,
-    VoterIndex,
+    Configuration, Digest, JournalGeneration, LogSource, NormalReplica, Prefix, PreparedOperation,
+    PromiseTicket, ReplicationError, Scope, ViewChange, ViewChangeError, VoterIndex,
 };
 
 /// Immutable `START_VIEW` sent only after the primary durably installs this log.
@@ -37,6 +36,8 @@ pub struct ReceivedStart {
 /// Persist the selected log with `promised_view = last_normal_view = scope.view`,
 /// preserving `protected_committed` and installing `committed`. Only then report
 /// completion, with canonical application state rebuilt through `committed`.
+/// Local history through `retained` lies in the selected lineage and is kept;
+/// only what follows is staged. A streamed backup stage proves that lineage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InstallTicket {
     scope: Scope,
@@ -44,6 +45,7 @@ pub struct InstallTicket {
     generation: JournalGeneration,
     source: LogSource,
     protected_committed: Prefix,
+    retained: Prefix,
     committed: Prefix,
 }
 
@@ -67,6 +69,12 @@ impl InstallTicket {
     /// Highest old local commit; replacement must never overwrite it.
     pub const fn protected_committed(self) -> Prefix {
         self.protected_committed
+    }
+    /// Local prefix in the selected lineage, from `protected_committed` through
+    /// `committed`. Staging starts after it. Election verifies it, except a
+    /// streamed backup's, whose stage chains from it to the exact tail.
+    pub const fn retained(self) -> Prefix {
+        self.retained
     }
     /// Complete selected accepted prefix to install durably.
     pub const fn accepted(self) -> Prefix {
@@ -197,7 +205,7 @@ impl InstallingView {
         operations: &[PreparedOperation],
     ) -> Result<(), ViewChangeError> {
         let (through, _) = self.state.pending()?.validate_install_chunk(
-            self.ticket,
+            &self.ticket,
             self.validated_through,
             operations,
         )?;
@@ -241,7 +249,7 @@ impl InstallingView {
         ticket: InstallTicket,
         applied: Prefix,
     ) -> Result<InstallOutcome, ViewChangeError> {
-        self.require_ticket(ticket)?;
+        self.require_ticket(&ticket)?;
         if self.validated_through != ticket.accepted() {
             return Err(ViewChangeError::HistoryMissing);
         }
@@ -269,7 +277,7 @@ impl InstallingView {
         &mut self,
         ticket: InstallTicket,
     ) -> Result<ViewChange, ViewChangeError> {
-        self.require_ticket(ticket)?;
+        self.require_ticket(&ticket)?;
         if self.requested_view <= ticket.scope.view {
             return Err(ViewChangeError::ViewNotHigher);
         }
@@ -282,7 +290,7 @@ impl InstallingView {
 
     /// Ambiguous publication failure requires reopen/recovery, never old-role reuse.
     pub fn fail(&mut self, ticket: InstallTicket) -> Result<(), ViewChangeError> {
-        self.require_ticket(ticket)?;
+        self.require_ticket(&ticket)?;
         self.state = InstallState::Failed;
         Ok(())
     }
@@ -291,9 +299,9 @@ impl InstallingView {
         self.state.pending().map(|_| ())
     }
 
-    fn require_ticket(&self, ticket: InstallTicket) -> Result<(), ViewChangeError> {
+    fn require_ticket(&self, ticket: &InstallTicket) -> Result<(), ViewChangeError> {
         self.require_pending()?;
-        if ticket != self.ticket {
+        if *ticket != self.ticket {
             return Err(ViewChangeError::StaleInstallation);
         }
         Ok(())
@@ -339,7 +347,9 @@ impl ViewChange {
 
     /// Stage bounded-stream backup installation after authenticated `START_VIEW`.
     ///
-    /// Same promise, primary, and protected-prefix checks as `install_backup`.
+    /// Same promise and primary checks as `install_backup`. Staging streams the
+    /// source from the local commit, so it and an announced commit above it
+    /// need no lookup; one below it is looked up in local history.
     /// Every selected byte must be validated and durably published before the
     /// backup can ACK. Fresh prepares also wait for whole-tail commit/application.
     #[expect(
@@ -350,9 +360,9 @@ impl ViewChange {
         mut self,
         received: ReceivedStart,
         generation: JournalGeneration,
-        mut lookup: impl FnMut(LogSource, OpNumber) -> Option<Digest>,
+        mut lookup: impl FnMut(LogSource, Prefix) -> Option<Digest>,
     ) -> Result<InstallingView, RejectedInstallation> {
-        let admitted = self.admit_backup(received, generation, &mut lookup);
+        let admitted = self.admit_backup(received, generation, &mut lookup, Suffix::Streamed);
         self.stage(&admitted, Suffix::Streamed)
     }
 
@@ -395,10 +405,10 @@ impl ViewChange {
         received: ReceivedStart,
         generation: JournalGeneration,
         suffix: &[PreparedOperation],
-        mut lookup: impl FnMut(LogSource, OpNumber) -> Option<Digest>,
+        mut lookup: impl FnMut(LogSource, Prefix) -> Option<Digest>,
     ) -> Result<InstallingView, RejectedInstallation> {
         let admitted = self
-            .admit_backup(received, generation, &mut lookup)
+            .admit_backup(received, generation, &mut lookup, Suffix::Supplied(suffix))
             .and_then(|admitted| self.validate_suffix(&admitted, suffix));
         self.stage(&admitted, Suffix::Supplied(suffix))
     }
@@ -408,7 +418,12 @@ impl ViewChange {
         self.require_primary()?;
         let selected = self.selected.ok_or(ViewChangeError::SelectionRequired)?;
         Ok(Admitted {
-            ticket: self.install_ticket(generation, selected.source(), selected.committed())?,
+            ticket: self.install_ticket(
+                generation,
+                selected.source(),
+                selected.committed(),
+                selected.retained(),
+            )?,
             start: StartView {
                 scope: selected.scope(),
                 generation,
@@ -424,7 +439,8 @@ impl ViewChange {
         &mut self,
         ReceivedStart { from, start }: ReceivedStart,
         generation: JournalGeneration,
-        lookup: &mut impl FnMut(LogSource, OpNumber) -> Option<Digest>,
+        lookup: &mut impl FnMut(LogSource, Prefix) -> Option<Digest>,
+        suffix: Suffix<'_>,
     ) -> Result<Admitted, ViewChangeError> {
         self.require_scope(start.scope)?;
         let promise = self.require_promised()?;
@@ -444,15 +460,42 @@ impl ViewChange {
             accepted: start.accepted,
         };
         let local_commit = self.normal.snapshot().committed;
-        self.verify_prefix(source, local_commit, lookup)?;
-        self.verify_prefix(source, start.committed, lookup)?;
+        if let Suffix::Streamed = suffix {
+            // Staging streams the source from the local commit to its exact
+            // tail and checks the digest at the announced commit on the way.
+            // That chain proves both lie in the source; a lookup first would
+            // move the same suffix twice. An announced commit below the local
+            // one is checked in the local history the installation keeps.
+            self.require_streamed(source, local_commit)?;
+            match start.committed.op.cmp(&local_commit.op) {
+                std::cmp::Ordering::Greater => {
+                    self.require_streamed(source, start.committed)?;
+                }
+                std::cmp::Ordering::Equal => {
+                    if start.committed != local_commit {
+                        return Err(self.conflict());
+                    }
+                }
+                std::cmp::Ordering::Less => {
+                    let local = LogSource {
+                        voter: self.configuration.voter(self.local),
+                        generation: promise.generation(),
+                        accepted: promise.log().accepted,
+                    };
+                    self.verify_prefix(local, start.committed, lookup)?;
+                }
+            }
+        } else {
+            self.verify_prefix(source, local_commit, lookup)?;
+            self.verify_prefix(source, start.committed, lookup)?;
+        }
         let committed = if local_commit.op > start.committed.op {
             local_commit
         } else {
             start.committed
         };
         Ok(Admitted {
-            ticket: self.install_ticket(generation, source, committed)?,
+            ticket: self.install_ticket(generation, source, committed, local_commit)?,
             start,
             promise,
             body_bytes: 0,
@@ -464,7 +507,7 @@ impl ViewChange {
         admitted: &Admitted,
         suffix: &[PreparedOperation],
     ) -> Result<Admitted, ViewChangeError> {
-        let body_bytes = self.normal.validate_install(admitted.ticket, suffix)?;
+        let body_bytes = self.normal.validate_install(&admitted.ticket, suffix)?;
         Ok(Admitted {
             body_bytes,
             ..*admitted
@@ -476,6 +519,7 @@ impl ViewChange {
         generation: JournalGeneration,
         source: LogSource,
         committed: Prefix,
+        retained: Prefix,
     ) -> Result<InstallTicket, ViewChangeError> {
         let previous = self.normal.snapshot();
         if generation == previous.journal.generation {
@@ -487,6 +531,11 @@ impl ViewChange {
             generation,
             source,
             protected_committed: previous.committed,
+            retained: if retained.op > previous.committed.op {
+                retained
+            } else {
+                previous.committed
+            },
             committed,
         })
     }
@@ -516,7 +565,7 @@ impl ViewChange {
         };
         let mut normal =
             self.normal
-                .stage_install(ticket, operations, admitted.start, admitted.body_bytes);
+                .stage_install(&ticket, operations, admitted.start, admitted.body_bytes);
         if let Suffix::Streamed = suffix {
             normal.retain_installed_tail_on_disk();
         }

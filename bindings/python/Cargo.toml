@@ -1,0 +1,45 @@
+[package]
+autotests = false
+name = "ozzy-python"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Python bindings to Ozzy's Rust producer and consumer SDK."
+readme = "README.md"
+publish = false
+
+[lib]
+name = "ozzy_python"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+extension-module = ["pyo3/extension-module"]
+wheel-tests = []
+
+[dependencies]
+ozzy-bindings.workspace = true
+ozzy = { path = "../../ozzy", features = ["lz4-transport"] }
+bytes.workspace = true
+pyo3 = { version = "0.29.3", features = ["abi3-py312", "experimental-async"] }
+sync_wrapper = "1.0.2"
+
+[dev-dependencies]
+pyo3 = { version = "0.29.3", features = ["auto-initialize"] }
+ozzy-config.workspace = true
+ozzy-broker = { workspace = true, features = ["lz4-transport"] }
+ozzy-sim = { workspace = true, features = ["broker"] }
+tokio.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+ozzy-telemetry.workspace = true
+
+[[test]]
+name = "ozzy_python_wheel"
+path = "tests/wheel.rs"
+required-features = ["wheel-tests"]
+
+[lints]
+workspace = true

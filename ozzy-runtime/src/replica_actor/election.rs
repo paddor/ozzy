@@ -3,11 +3,11 @@
 use crate::replica_actor::HistoryReason::ViewInstallation;
 use crate::replica_actor::require_normal;
 use crate::replica_journal::FetchedHistory;
-use ozzy_replication::ViewChangeError;
+use ozzy_replication::{Prefix, ViewChangeError};
 
 use super::history::TransferPurpose;
 use super::io::{Completed, FetchPurpose};
-use super::maintenance::Maintenance;
+use super::maintenance::{Maintenance, MaintenanceTurn};
 use super::{ActorError, DriverError, Duration, PendingIo, ReplicaActor};
 
 impl ReplicaActor {
@@ -31,7 +31,12 @@ impl ReplicaActor {
         if self.pending_replay.is_some() && !self.application_ready() {
             return Ok(());
         }
-        if self.schedule_due_maintenance(now)? || self.schedule_durability()? {
+        let hold = match self.schedule_due_maintenance(now)? {
+            MaintenanceTurn::Stop => return Ok(()),
+            MaintenanceTurn::Hold => true,
+            MaintenanceTurn::Continue => false,
+        };
+        if self.schedule_durability()? {
             return Ok(());
         }
         // Installation publishes and selects storage; a cleanup job beside
@@ -40,13 +45,13 @@ impl ReplicaActor {
             return Ok(());
         }
         if let Some(ticket) = self.driver.installation_ticket() {
-            return self.schedule_installation(ticket);
+            return self.schedule_installation(&ticket);
         }
         if self.schedule_pin()? {
             return Ok(());
         }
         if self.driver.normal().is_some() {
-            return self.schedule_activation(now);
+            return self.schedule_activation(now, hold);
         }
         if self.transfer.is_some() || self.schedule_bridge()? {
             return Ok(());
@@ -55,25 +60,42 @@ impl ReplicaActor {
     }
 
     /// Give the oldest due maintenance task a turn once admitted writes
-    /// drain. `true` when scheduling stops here.
-    fn schedule_due_maintenance(&mut self, now: Duration) -> Result<bool, ActorError> {
+    /// drain.
+    fn schedule_due_maintenance(&mut self, now: Duration) -> Result<MaintenanceTurn, ActorError> {
         // A slow maintenance step must not repeatedly win over queued writers.
         let foreground_turn = std::mem::take(&mut self.maintenance.foreground_due);
         let Some(kind) = self
             .due_maintenance(now)
             .filter(|_| !foreground_turn && self.application_ready())
         else {
-            return Ok(false);
+            return Ok(MaintenanceTurn::Continue);
         };
         if self.pending_sync.is_some() || !self.pending_persistence.is_empty() {
-            return Ok(true);
+            return Ok(MaintenanceTurn::Stop);
         }
         if self.work.needs_sync {
             self.schedule_sync()?;
-            return Ok(true);
+            return Ok(MaintenanceTurn::Stop);
+        }
+        // A waiting proposal goes first, in this round. Deferring it to the
+        // next round would ask for one that does nothing while the proposal
+        // cannot move yet.
+        if kind == Maintenance::Retention && self.work.proposals.blocks_maintenance() {
+            return Ok(MaintenanceTurn::Continue);
         }
         self.maintenance_round(kind, now)?;
-        Ok(self.pending.is_some() || kind == Maintenance::Retention)
+        Ok(if self.pending.is_some() {
+            MaintenanceTurn::Stop
+        } else if kind != Maintenance::Retention {
+            MaintenanceTurn::Continue
+        } else if self.maintenance.foreground_due {
+            // A waiting proposal goes first on the next round. No journal
+            // command completes to start it, so ask for it now.
+            self.more_work = true;
+            MaintenanceTurn::Stop
+        } else {
+            MaintenanceTurn::Hold
+        })
     }
 
     /// Persist what election evidence needs before a promise. `true` when
@@ -104,7 +126,7 @@ impl ReplicaActor {
 
     fn schedule_installation(
         &mut self,
-        ticket: ozzy_replication::InstallTicket,
+        ticket: &ozzy_replication::InstallTicket,
     ) -> Result<(), ActorError> {
         let Some(staged) = self.staged else {
             return Ok(());
@@ -113,10 +135,13 @@ impl ReplicaActor {
             // No disk command remains, and publication has not been submitted.
             // Stop fetching the abandoned source; retain old durable promises.
             self.transfer = None;
-            self.pending = Some(PendingIo::Abort(self.journal.abort_installation(ticket)?));
+            self.pending = Some(PendingIo::Abort(self.journal.abort_installation(*ticket)?));
         } else if staged == ticket.accepted() {
-            self.pending = Some(PendingIo::Finish(self.journal.finish_installation(ticket)?));
-        } else if self.transfer.is_none() {
+            self.pending = Some(PendingIo::Finish(
+                self.journal.finish_installation(*ticket)?,
+            ));
+        } else if self.transfer.is_none() && !self.schedule_bridge()? {
+            // A bridge proves a retired staging start first.
             let source = self
                 .lookup
                 .compatible_local(ticket.source(), self.pinned, staged)
@@ -154,7 +179,7 @@ impl ReplicaActor {
         Ok(true)
     }
 
-    fn schedule_activation(&mut self, now: Duration) -> Result<(), ActorError> {
+    fn schedule_activation(&mut self, now: Duration, hold: bool) -> Result<(), ActorError> {
         let snapshot = require_normal(&self.driver)?.snapshot();
         if let Ok(ticket) = self.driver.begin_activation() {
             // Already active normal cores need no repeated manifest publication.
@@ -165,7 +190,7 @@ impl ReplicaActor {
             }
         }
         if self.pending.is_none() && self.application_ready() {
-            self.schedule_normal(now)?;
+            self.schedule_normal(now, hold)?;
         }
         Ok(())
     }
@@ -174,9 +199,9 @@ impl ReplicaActor {
         let generation = self.ids.generation()?;
         let mut missing = None;
         let lookup = &self.lookup;
-        let mut get = |source, op| {
-            lookup.get(source, op).or_else(|| {
-                missing = Some((source, op));
+        let mut get = |source, expected: Prefix| {
+            lookup.get(source, expected.op).or_else(|| {
+                missing = Some((source, expected));
                 None
             })
         };
@@ -204,9 +229,10 @@ impl ReplicaActor {
                 ));
             }
             Err(DriverError::ViewChange(ViewChangeError::HistoryMissing)) => {
-                let (source, op) = missing.ok_or_else(|| ActorError::history(ViewInstallation))?;
-                if !self.lookup.unavailable(source, op) {
-                    self.lookup_history(source, op, ViewInstallation)?;
+                let (source, expected) =
+                    missing.ok_or_else(|| ActorError::history(ViewInstallation))?;
+                if !self.lookup.unavailable(source, expected.op) {
+                    self.lookup_history(source, expected.op, Some(expected), ViewInstallation)?;
                 }
             }
             Err(DriverError::ViewChange(
@@ -285,11 +311,12 @@ impl ReplicaActor {
             Completed::Fetch(fetched, FetchPurpose::Install) => {
                 self.complete_install_fetch(fetched)?;
             }
-            Completed::Begin(ticket) => self.staged = Some(ticket.protected_committed()),
+            Completed::Begin(ticket) => self.staged = Some(ticket.retained()),
             Completed::Chunk(chunk) => {
                 if !chunk.prepared().is_empty() {
                     self.driver.validate_install_suffix(chunk.prepared())?;
                 }
+                self.driver.history_progress(now)?;
                 self.staged = Some(chunk.end());
                 self.recycle(chunk.into_buffer())?;
             }
@@ -326,7 +353,8 @@ impl ReplicaActor {
             .take()
             .ok_or_else(|| ActorError::history(ViewInstallation))?
             .request;
-        if fetched.request() != request {
+        // The local source holds every staged predecessor it installs from.
+        if fetched.request() != request || fetched.retired_predecessor().is_some() {
             return Err(ActorError::history(ViewInstallation));
         }
         let buffer = fetched.into_buffer();

@@ -180,6 +180,21 @@ impl LinkState {
         Ok(())
     }
 
+    /// Adopt the connection the socket reports after lost monitor events:
+    /// the same fences as the missed handshake or teardown.
+    pub(super) fn resynchronize(&mut self, sessions: &mut LinkSessions, live: Option<u64>) {
+        if self.connection == live {
+            return;
+        }
+        if self.connection.is_some() {
+            self.fence(sessions);
+        }
+        self.connection = live;
+        if live.is_some() {
+            self.missing_route = false;
+        }
+    }
+
     /// Fail every request and admit no more once the owner stops.
     pub(super) fn close(&mut self, sessions: &mut LinkSessions) {
         self.fence(sessions);

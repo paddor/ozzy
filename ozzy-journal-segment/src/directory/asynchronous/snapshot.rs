@@ -102,7 +102,7 @@ impl Journal {
         limits: IndexBuildLimits,
     ) -> Result<Snapshot, JournalIndexError> {
         self.healthy()?;
-        self.validated_indexes.retain(|id, _| {
+        self.validated_indexes.get_mut().retain(|id, _| {
             self.manifest
                 .segments
                 .binary_search_by_key(id, |reference| reference.segment_id)
@@ -111,7 +111,7 @@ impl Journal {
         for at in 0..self.manifest.segments.len() - 1 {
             let id = self.manifest.segments[at].segment_id;
             let (_, source) = self.index_source(id)?;
-            if self.validated_indexes.get(&id) == Some(&source) {
+            if self.validated_indexes.get_mut().get(&id) == Some(&source) {
                 // This owner already validated the immutable physical source.
                 // Recheck the published index's checksum and complete source
                 // binding; explicit repair/scrub still validate physical bytes.
@@ -122,9 +122,9 @@ impl Journal {
                     Err(error) => return Err(error.into()),
                 }
             }
-            self.validated_indexes.remove(&id);
+            self.validated_indexes.get_mut().remove(&id);
             self.build_sealed_index(id, limits).await?;
-            self.validated_indexes.insert(id, source);
+            self.validated_indexes.get_mut().insert(id, source);
         }
         // The prefix is taken first: a canceled or failed build rescans next time.
         let prefix = self.active_prefix.take().map(|prefix| *prefix);

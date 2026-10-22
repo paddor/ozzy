@@ -3,6 +3,7 @@
 use super::*;
 use crate::{Completed, Handle, OpenMode, Quota, SyncMode, WriteBuffer};
 use std::future::Future;
+use std::path::PathBuf;
 
 fn config() -> Config {
     Config {
@@ -288,6 +289,40 @@ async fn later_write_can_reach_media_while_an_earlier_group_is_a_hole() {
     );
     assert_eq!(missing.await.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
     assert_eq!(late.await.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+}
+
+#[tokio::test]
+async fn unsynced_runs_list_cached_blocks_once_per_file() {
+    let mut harness = Harness::new();
+    let file = harness.established(b"protect!").await;
+    harness
+        .run(Operation::HardLink {
+            source: "/data".into(),
+            destination: "/link".into(),
+        })
+        .await;
+    harness.run(write(&file, 2, b"XY")).await;
+    harness.run(write(&file, 12, b"ZZ")).await;
+    let new = harness.open("/new", OpenMode::CreateNew).await;
+    harness.run(write(&new, 0, b"n")).await;
+    assert_eq!(
+        harness.controller.image().unsynced_runs(4),
+        [
+            (PathBuf::from("/data"), 0..4),
+            (PathBuf::from("/data"), 8..14),
+            (PathBuf::from("/new"), 0..1)
+        ]
+    );
+    harness
+        .controller
+        .persist_range(Path::new("/data"), 8..14)
+        .unwrap();
+    let (image, _) = harness.controller.crash(true).unwrap();
+    assert_eq!(
+        image.bytes(Path::new("/data"), true).unwrap(),
+        b"protect!\0\0\0\0ZZ"
+    );
+    assert_eq!(image.unsynced_runs(4), []);
 }
 
 #[tokio::test]
@@ -697,6 +732,59 @@ async fn retired_inodes_are_reclaimed_but_unlinked_open_files_stay_readable() {
         drop(read);
         drop(file);
     }
+}
+
+#[tokio::test]
+async fn unlinked_open_directory_preserves_durable_children_until_its_last_handle_closes() {
+    let mut configuration = config();
+    configuration.image.nodes = 3; // root, directory, file
+    let (controller, clients) = Controller::new(configuration, Image::default()).unwrap();
+    let mut harness = Harness {
+        controller,
+        clients,
+    };
+    harness
+        .run(Operation::CreateDirectory {
+            path: "/dir".into(),
+        })
+        .await;
+    let directory = harness.directory("/dir").await;
+    let file = harness.open("/dir/file", OpenMode::CreateNew).await;
+    harness.run(write(&file, 0, b"retained")).await;
+    harness.sync(&file).await;
+    harness.sync(&directory).await;
+    let root = harness.directory("/").await;
+    harness.sync(&root).await;
+    drop(file);
+    harness
+        .run(Operation::RemoveFile {
+            path: "/dir/file".into(),
+        })
+        .await;
+    harness
+        .run(Operation::RemoveDirectory {
+            path: "/dir".into(),
+        })
+        .await;
+    harness.sync(&root).await;
+    harness.controller.jobs();
+    assert_eq!(harness.controller.image().stored_bytes(), 16);
+    let error = harness
+        .perform(
+            Operation::Open {
+                path: "/other".into(),
+                mode: OpenMode::CreateNew,
+                direct: false,
+                data_sync: false,
+            },
+            Effect::Normal,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+    drop(directory);
+    let _other = harness.open("/other", OpenMode::CreateNew).await;
+    assert_eq!(harness.controller.image().stored_bytes(), 0);
 }
 
 #[tokio::test]

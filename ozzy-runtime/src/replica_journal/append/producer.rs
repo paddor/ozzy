@@ -72,6 +72,34 @@ impl AppendBuffer {
                 return Err(JournalError::AppendMismatch);
             }
         };
+        self.encode_producer_open(request, policy, new_epoch)
+    }
+
+    /// Recreate a retired session at `new_epoch`, above every retired one, so
+    /// no fenced writer's epoch becomes current again.
+    pub(in crate::replica_journal) fn raise_producer_open(
+        &mut self,
+        new_epoch: u64,
+    ) -> Result<(), JournalError> {
+        let request = self
+            .producer_session
+            .as_ref()
+            .ok_or(JournalError::AppendMismatch)?
+            .request;
+        let policy = self.proposal_policy.ok_or(JournalError::AppendMismatch)?;
+        if request.mode != ozzy_proto::producer::Mode::Resume || request.expected_epoch.is_some() {
+            return Err(JournalError::AppendMismatch);
+        }
+        self.clear();
+        self.encode_producer_open(request, policy, new_epoch)
+    }
+
+    fn encode_producer_open(
+        &mut self,
+        request: ozzy_proto::producer::Open,
+        policy: ozzy_proto::append::Policy,
+        new_epoch: u64,
+    ) -> Result<(), JournalError> {
         if new_epoch == 0
             || request.expected_epoch == Some(0)
             || request.authority.group_id.as_bytes() == &[0; 16]

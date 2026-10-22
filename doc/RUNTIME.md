@@ -55,8 +55,14 @@ flowchart LR
 
 - `send` waits for bounded local admission. Canceling it before admission
   assigns nothing.
+- `send_to_partition(record, number)` uses the same admission path for an
+  exact zero-based numeric partition. Unknown numbers fail before admission
+  or sequence assignment. It never hashes or falls back to another partition.
 - Dropping the pending record stops observation only. The record still goes
   out. `confirmed` resolves at the confirmation boundary.
+- A waiting `confirmed` wakes only when its own record confirms or the writer
+  fails. Simultaneous observers of one record share the per-confirmation
+  broadcast that `flush` uses.
 - `flush` captures every record admitted before the call, even before it is
   first polled.
 - `close` seals admission and confirms the captured prefix. Canceling `close`
@@ -71,6 +77,9 @@ flowchart LR
 
 Callers submit individual records. The SDK routes each record to a partition,
 then batches per partition. One APPEND holds one partition.
+Explicit, keyed, and keyless writes to the same partition share sequences,
+batches, and limits. Explicit sends do not select a sticky partition; their
+formed APPENDs still drive the usual keyless rotation.
 
 | Rule | Behavior |
 | --- | --- |
@@ -94,6 +103,103 @@ then batches per partition. One APPEND holds one partition.
 | `batch_target_bytes` | Uncompressed grouping target |
 | `inflight_appends` | Outstanding APPENDs per partition, including partial replies |
 | `compress_payloads` | Adaptive whole-APPEND LZ4; turn off with `lz4+tcp://` or `zstd+tcp://` |
+
+## Python bindings
+
+`bindings/python` delegates log operations to `ozzy`'s `BrokerLinks`,
+`SharedTopicWriter`, and `TopicReader`. Both Python APIs share those Rust
+implementations and the existing owned SDK runtime. Python adds input conversion,
+typed values, context managers, and interpreter scheduling only.
+
+Python `ClientConfig.compression` maps `lz4` (the default) and `raw` directly
+to `SharedTopicWriterConfig.compress_payloads`. Adaptive packing, fallback,
+and decoding remain in Rust. Python wheels include OMQ LZ4 transport support;
+endpoint schemes select transport compression independently of APPEND packing.
+`reader_queue_messages` defaults to 32 and accepts 1 through 64. The Rust
+reader reservation charges its queues and retained aliases before opening.
+Producer `max_records` and `max_parts` do not limit inbound publications.
+`reader_max_records` and `reader_max_parts` independently bound receive frames,
+defaulting to 2,048 each; receive reservations use these bounds. Raw broker
+publications may combine more records than any one producer APPEND.
+
+Ready blocking sends, receives, and confirmations poll inline with a cached
+caller waker; waiting releases the GIL, remains interruptible, and accepts a
+timeout that cancels the SDK future. Native awaitables poll SDK futures from
+asyncio and implement the coroutine protocol. Their wakers never take the GIL:
+a woken task queues itself and signals one socket per event loop, whose reader
+resolves every queued asyncio future in one pass. SDK and transport threads
+therefore never wait for Python. Lifecycle awaitables poll and drop with the
+GIL released because dropping SDK owners joins threads.
+The asyncio facade probes Rust admission, ready records, and confirmations
+directly; it creates a native awaitable only when the operation would wait.
+An admission probe that cannot proceed assigns no sequence and retains no input.
+An exclusive lease moves a mutable SDK handle out of its Python object for any
+operation that may wait, blocking or asyncio, then returns it on completion,
+timeout, or cancellation. Other operations borrow the handle only for Rust
+work that runs no Python code, so a lease dropped by garbage collection always
+finds its owner unborrowed. `SyncWrapper` requires exclusive Rust access
+without a mutex. Concurrent operations on a leased handle raise `BusyError`;
+immutable receipt observers may run together. A flush captures its prefix,
+then waits without a lease. Producer and consumer opens clone the client's
+shared links and wait without its lease, so threads and tasks may open handles
+concurrently; connect and close lease the client. SDK admission, identity, retry, checkpoint, and
+close semantics remain owned by the Rust implementation.
+Native handle destruction releases the GIL while dropping Rust state.
+Owners record the process's fork generation, advanced by
+`os.register_at_fork`; a child rejects and never drops inherited owners.
+`bytes` inputs copy directly into Rust SDK storage, keeping small records
+inline; other buffers are copied once and their storage moves into admission.
+Receipts retain native IDs and format only requested properties. Records copy
+payload parts into Python bytes on delivery, so retained records hold no
+receive frame.
+Python `Consumer.stats()` exposes the Rust reader's live deliveries, replayed
+records, and live gap transitions, including its final counters after close.
+
+## Java bindings
+
+`bindings/java` calls the same `BrokerLinks`, `SharedTopicWriter`, and
+`TopicReader` as Python. Both bindings construct checked reservations through
+`bindings/common`. JNI handles lifecycle, multipart conversion, and async setup;
+FFM polls ready single-buffer admission, reads, and confirmations directly.
+Java adds no network queues, protocol codecs, retry state, or batching worker.
+
+Java atomically leases one mutable native handle per operation. JNI moves its
+owned box into a Rust SDK future and restores it before returning the lease.
+A flush captures its prefix during the call and waits without the lease.
+Producer and consumer opens clone the client's shared links during the call,
+so concurrent opens on one client proceed.
+One fixed binding executor polls waiting futures; it owns no transport state.
+Client close joins SDK and transport threads on a blocking thread, never on
+that executor. Cancellation waits for lease return. If Rust already produced a
+result, cancellation loses and the future delivers it, preserving reader
+progress. Timeouts cancel on the common pool, so a lease wait never stalls a
+shared timer thread. Close seals admission before waiting, and canceled closes
+remain sealed.
+
+Native callbacks prepare values and release leases before completing Java
+futures. A result produced during the starting call completes inline, before
+any continuation exists; a blocking waiter completes its own future; other
+completions run on the common pool. User callbacks never execute on SDK owner
+or binding executor threads. A native operation that ends without a result,
+such as a failed delivery, completes exceptionally. Pending confirmations are
+immutable shared observers; reachability fences prevent their native storage
+from being reclaimed during concurrent calls. Explicit close cleans mutable
+handles; Cleaner is their leak fallback.
+Each pending handle is one strong count of the Rust observer. Handles share one
+Cleaner registration per group of at most 64 admissions, released in one
+native call. The producer's existing lease serializes group construction;
+each observer keeps its group reachable during native calls. Group cleanup
+owns each handle exactly once. One retained observer can retain up to 64 native
+observation handles, never their payloads. Closing the producer drops its
+current group reference without invalidating surviving observers.
+
+FFM copies single inputs directly into Rust SDK storage; multipart inputs pack
+into one Java array copied once into native storage. Receive calls expose
+payload views only while Java holds the consumer lease; Java copies them before
+returning an immutable record. Native receive backing remains bounded to one
+cached record, and no native payload pointer escapes. UUIDs remain two integers
+until requested, and unsigned offsets/epochs retain their bits in Java longs.
+Scalar failures use caller-owned output storage, including on virtual threads.
 
 ## Readers
 
@@ -253,6 +359,8 @@ runs. A HELLO beyond `max_clients` is dropped, counted as
 | Key in `[brokers.NAME.topology]` | Meaning |
 | --- | --- |
 | `omq.io_threads` | OMQ I/O threads |
+| `omq.ingress.bytes_per_second`, `.burst_bytes` | Aggregate incoming network rate and burst |
+| `omq.egress.bytes_per_second`, `.burst_bytes` | Aggregate outgoing network rate and burst |
 | `dispatcher.cpu`, `dispatcher.numa_node` | Dispatcher affinity |
 | `shards[].id`, `shards[].device` | Shard ID and the device it writes to |
 | `shards[].affinity.cpu`, `shards[].affinity.numa_node` | Shard affinity |
@@ -264,6 +372,22 @@ runs. A HELLO beyond `max_clients` is dropped, counted as
 - Omitting `shards` gives one shard on the sole device. Multiple devices need
   explicit shard assignments.
 - CPU and NUMA values are OS IDs. NUMA placement needs an explicit CPU.
+
+### Network byte limits
+
+Each optional direction sets positive `bytes_per_second` and `burst_bytes`.
+Omission disables that direction. Buckets start full and refill up to the burst;
+exhaustion backpressures transport I/O. Changes take effect on broker restart.
+
+OMQ owns one allowance per broker context, shared across every socket and I/O
+thread. All network traffic on that context counts, including control, readers,
+replication, and repair. Accounting uses transport bytes after framing and
+compression; each PUB subscriber copy counts separately. TCP setup and lower
+network-layer overhead are exempt, as are IPC, inproc, and SHM.
+
+Embedded brokers sharing an injected OMQ context share its allowance. Configure
+limits before its first socket, or supply a context whose limits already match
+the broker plan. Startup rejects conflicting active contexts.
 
 ### Devices
 

@@ -114,8 +114,8 @@ fn remote_report(index: u8, count: u8, view: u64) -> DoViewChange {
     local_report(&mut promised(index, count, view), (index + 1) % 3)
 }
 
-fn lookup(_: ozzy_replication::LogSource, op: OpNumber) -> Option<Digest> {
-    let count = u8::try_from(op.0).ok()?;
+fn lookup(_: ozzy_replication::LogSource, expected: Prefix) -> Option<Digest> {
+    let count = u8::try_from(expected.op.0).ok()?;
     operations(count)
         .last()
         .map(|operation| operation.prefix().digest)

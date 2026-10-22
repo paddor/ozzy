@@ -8,8 +8,11 @@ in [RELEASING.md](RELEASING.md); benchmark rules live in
 
 - Rust 1.93 or newer, edition 2024, ASCII-only source.
 - [`cargo-nextest`](https://nexte.st/).
-- Optional, for [verification](#verification): Kani, Java, ripgrep, and the
+- CPython 3.12+ and its development library for the Python binding workspace
+  member. Select the interpreter with `PYO3_PYTHON` when needed.
+- Optional, for [verification](#verification): Kani, ripgrep, and the
   TLA+ tools jar.
+- JDK 22+ for the Java binding workspace member; Maven for packaged JAR checks.
 
 ## Local checks
 
@@ -32,6 +35,19 @@ RUSTDOCFLAGS='-D warnings' cargo doc -p ozzy -p ozzy-runtime -p ozzy-proto --no-
 - `scripts/ozzy_cargo <args>` runs Cargo with the same artifact paths.
 - `ozzy-bench` is not a default member. A plain `cargo build` skips it; use
   `cargo build -p ozzy-bench` or `--workspace`.
+
+`scripts/check-python.sh` uses uv to select Python, keeps its virtual environment
+and wheels under `OZZY_ARTIFACT_ROOT`, and runs Python lint/type checks, inproc
+memory-broker tests, and installed-wheel TCP process tests in both broker modes.
+Set `OZZY_PYTHON_VERSION=3.14` to test another supported interpreter. TCP/process
+tests are opt-in through `wheel-tests` and run in the extended Nextest profile.
+
+`scripts/check-java.sh` compiles Java with warnings as errors, generates Javadoc,
+builds native platform JARs, and runs the Java inproc matrix and packaged-JAR
+TCP/process tests. Set `OZZY_JAVA_RELEASE=1` for release native libraries.
+Cargo compiles Java test classes under its artifact directory; Nextest starts
+a JVM per case over the same real-broker memory harness. `package-tests` enables
+the separate-JVM layer in the extended profile. Test Java 22 and a newer JDK.
 
 ### Artifact paths
 
@@ -66,6 +82,7 @@ Clippy and `scripts/check-shape.sh` enforce these:
 
 CI builds with `-C target-cpu=x86-64`. Local builds use `target-cpu=native`
 from `.cargo/config.toml`.
+Release builds use ThinLTO, which increases link time.
 
 ## Nextest profiles
 
@@ -99,6 +116,7 @@ system tests in that slice.
 | --- | --- | --- | --- |
 | Unit and core | Codecs, state transitions, bounds, authority fences | `src/` and `tests/` of `ozzy-proto`, `ozzy-core`, `ozzy-journal`, `ozzy-journal-segment`, `ozzy-replication`, `ozzy-config` | `default` |
 | Core simulation | Replayable protocol fault schedules with gated time, messages, and file jobs | `ozzy-sim/tests/` | `default`; `stress` in `extended` |
+| Seeded actor cluster | Production partition shards and journals of three brokers on one thread from one seed: link, disk, and client faults, scripted leader loss, power loss and restart, per-tick history checks, convergence, missed wakeups | `ozzy-sim/tests/actor_cluster/` | `default`; seed campaign in `extended` |
 | Inproc integration | Real SDKs and brokers over OMQ inproc and memory file jobs; owner lifecycle | `ozzy-broker/tests/journals/serving/`, `ozzy-sim/tests/broker/` | `default`; `stress` in `extended` |
 | Full-product simulator | Sustained workload and fault churn over real owners, SDKs, and brokers | `ozzy-sim` `ozzy_sim` binary | Short gate in `default`; long runs manual |
 | Backend conformance | The same owned file operations on the pool and AIO backends | `ozzy-io-pool/tests/`, `ozzy-io-aio/tests/` | `default` |
@@ -112,6 +130,8 @@ What a layer does not prove:
 
 - Unit and core: only finite state and format cases.
 - Core simulation: only within model bounds and injected faults.
+- Seeded actor cluster: modeled links with OMQ semantics, no sockets, broker
+  frontend, or SDKs.
 - Inproc: no ZMTP wire and no physical disk. Threaded scheduling stays
   nondeterministic.
 - Simulator: seed replay reproduces the fault prefix, not the transport
@@ -197,6 +217,53 @@ scripts/ozzy_cargo run -p ozzy-sim --features broker --bin ozzy_sim -- \
 ```
 
 Flags, actions, artifacts, and replay: [ozzy-sim/README.md](ozzy-sim/README.md).
+
+### Seeded actor cluster
+
+A seed campaign over every profile (`none`, `light`, `heavy`, `swarm`, and
+`slow` disks) and scenario: `random` faults only; `failover`, which also cuts
+the leader off and requires a new one before it rejoins; `slow-follower`,
+where one follower's disk takes 16 ms per job, so once the leader is lost
+the new one commits only through it; `full`, which fills a journal of six
+32 KiB segments until it refuses proposals, then loses the leader;
+`sparse-followers`, where both followers write one operation per group while
+proposals carry four, so they converge only by packing; and
+`sparse-rejoin`, where such a follower misses about 1300
+operations, then rejoins as the leader is lost, so the view change installs
+a suffix that outlasts any election timeout and passes the segment limit;
+`crash`, where a follower and then the leader lose power and restart
+over what reached their disks, with fresh writer generations and link
+sessions; `disk-error`, where a follower's disk and then the leader's fail
+every write and sync, so each broker stops as its process exits, then
+restarts and rejoins; `kill`, as `crash` but only the processes die, so
+restarts see what the disks cached and queued writes may still land;
+`power-loss`, where all three lose power at once mid-traffic;
+`recovery-crash`, where power fails again at a seeded tick of that recovery;
+`torn-write`, where every disk stops completing jobs and power then fails
+with the queued writes in flight; `disk-stall`, where the leader's disk
+completes nothing for 15 s while its links stay up, and another broker must
+take over; `pause`, where the leader's process runs nothing for 15 s, then
+resumes into a newer view; and `one-way`, where the leader first hears
+nothing, then a later leader can send nothing. A power loss puts some queued
+writes in the cache unreported, even `O_DSYNC` ones, then lets a seeded share
+of cached 512-byte sectors reach media, so unsynced writes tear and land out
+of order. The power-loss fast test also bounds the outage, which grows when a
+restart refetches or replays all history. The three sparse or full scenarios
+skip `heavy` and `swarm`, which make too little progress to fill a journal.
+A failing seed prints its parameters, schedule hash, and this command with
+`OZZY_ACTOR_SIM_SEED`, `OZZY_ACTOR_SIM_PROFILE`, and
+`OZZY_ACTOR_SIM_SCENARIO` set. A run whose faults left too little progress
+to prove much is vacuous: the campaign lists it and fails only above one in
+twenty. Runs spread over one thread per core; `OZZY_ACTOR_SIM_THREADS` sets
+the count. The fast suite also loses the leader after a long history and
+repeatedly; `seeded::stress` adds a very long history.
+`OZZY_ACTOR_SIM_TRACE=1` prints each broker's view and positions as they
+change.
+
+```sh
+OZZY_ACTOR_SIM_SEEDS=1000 cargo nextest run -p ozzy-sim \
+  --test ozzy_actor_cluster --profile extended seeded::stress::campaign
+```
 
 ### Memory-only broker churn
 

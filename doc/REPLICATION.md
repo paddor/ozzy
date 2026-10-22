@@ -93,7 +93,14 @@ sequenceDiagram
 ## Leader change
 
 A broker suspects the leader when contact, commit progress, or storage
-progress times out. A suspicious leader stops heartbeats.
+progress times out. Storage stalls when an admitted write stays undurable,
+or when a journal command, such as a sync or maintenance step, is pending
+and the shard's storage lane completes no job for the primary timeout; such
+a command can hold new writes back. A long command whose jobs complete is
+not a stall. A suspicious leader stops heartbeats. In an election, a
+nonvoting recovery request from the view's primary is suspicion too: that
+primary cannot install its view. A restart's retained-history probe still
+votes and is not suspicion.
 
 | Step | Gate |
 | --- | --- |
@@ -105,7 +112,30 @@ progress times out. A suspicious leader stops heartbeats.
 | Activation | A new-view follower vote covers the selected tail before the leader serves |
 
 - EXIT_VIEW is volatile suspicion, never a vote. One timeout cannot advance
-  views.
+  views. A suspicious broker repeats it every retransmission interval, and a
+  peer's request counts for one primary timeout, so a recovered peer's
+  request lapses. A broker whose promise is not durable yet sends none at its
+  election deadline: it knows nothing about the view, and with stalled
+  storage it would help one peer's timeout end views the others install.
+- A lagging copy fetches and replays its missed suffix inside the view
+  change. Each verified lookup batch, staged chunk, or running installation
+  step pushes its election deadline out by one election delay, so a
+  catch-up longer than any timeout still finishes. A running promise does
+  the same, so a slow disk does not end the view as its promise lands.
+  Peer suspicion still counts.
+- A lookup scans the source from the checked prefix to its exact tail, and
+  records every report position it passes, so a lagging copy's commit and
+  accept cost one scan.
+- A backup looks up neither its commit nor a higher announced commit. Its
+  installation streams the source from its commit to the exact tail and
+  checks both on the way. A lower announced commit is checked locally.
+- When the source retired a staging start that local history covers, the
+  copy proves that prefix through an overlap of its own history with the
+  source and stages it locally. Otherwise it withdraws into recovery.
+- Installation keeps local history through the longest prefix verified in
+  the selected source, at most the selected commit: the new leader's own
+  accepted prefix when it shares the source's normal view, otherwise its
+  commit. Only the rest is fetched and staged.
 - A higher durable promise fences old authority at once.
 - Selection keeps every reported commit and every accepted prefix from the
   selected normal view. Only older uncertain suffixes may be dropped.
@@ -131,6 +161,9 @@ stateDiagram-v2
   lineage, then enters election with a fresh writer incarnation.
 - A restart never resumes old leader authority. It requests the next view or
   resumes an uninstalled promise. A promise alone grants no authority.
+- Each segment roll publishes the applied prefix as the commit. After a
+  restart, installation keeps local history through it and fetches only the
+  rest, and replays only after the state the reopen rebuilt.
 - Lost, rolled-back, or ambiguous stores stay nonvoting. Damage found while
   serving fails closed and never triggers automatic repair.
 
@@ -188,6 +221,9 @@ across the gap.
   Without it the report stays unverified.
 - A broker withdraws only if its own history expired. Withdrawal aborts any
   unpublished installation; the old history and promise stay intact.
+- When the withdrawn broker leads the view in election, its recovery requests
+  let the other two leave that view without waiting for the election
+  deadline.
 
 ## Read authority
 

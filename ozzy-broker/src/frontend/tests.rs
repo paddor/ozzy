@@ -8,6 +8,7 @@ use std::{
 use tokio::sync::{Semaphore, oneshot};
 
 mod dispatch;
+mod network;
 mod sessions;
 
 fn plan() -> BrokerPlan {

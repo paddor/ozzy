@@ -10,7 +10,7 @@ owns no journal and binds no broker socket.
 | --- | --- |
 | `WriterRuntime` | Owned SDK and OMQ threads; any caller executor works |
 | `BrokerLinks` | Shared connections to one or three brokers |
-| `SharedTopicWriter` | Send records by optional key; await confirmation |
+| `SharedTopicWriter` | Send by optional key or explicit partition; await confirmation |
 | `TopicReader` | Read every partition from a chosen start |
 | `GroupReader` | Divide a topic's partitions among group members |
 
@@ -38,9 +38,9 @@ Size `control_bytes` with `control_reservation_bytes()` and `reader.bytes` with
 
 ## Produce
 
-`send` picks a partition by optional key and returns after local admission.
-`confirmed()` waits for the cluster mode's confirmation policy, never
-transport receipt.
+`send` picks a partition by optional key. `send_to_partition` writes to an
+exact numeric partition. Both return after local admission. `confirmed()`
+waits for the cluster mode's confirmation policy, never transport receipt.
 
 ```rust,no_run
 use ozzy::{
@@ -55,12 +55,20 @@ async fn write(links: &BrokerLinks, limits: DataLimits) -> Result<(), Box<dyn st
     let pending = writer.send(record, Some(b"customer-17")).await?;
     let receipt = pending.confirmed().await?;
     println!("partition={} offset={}", receipt.partition, receipt.record.offset);
+    let record = RecordInput::copy_from_slice(MessageId::new(), b"order-43");
+    let pending = writer.send_to_partition(record, 0).await?;
+    let receipt = pending.confirmed().await?;
+    assert_eq!(receipt.partition, 0);
     writer.close().await?;
     Ok(())
 }
 ```
 
 - Keep many records in flight; awaiting each confirmation serializes writes.
+- Partition numbers are zero-based and match `writer.metadata().partition(number)`.
+  An unknown number returns `TopicWriterError::UnknownPartition` before admission.
+- Explicit and automatic routing share partition-local sequences and batches.
+  Retries keep their destination across leader changes.
 - Dropping a `confirmed()` future does not withdraw the record.
 - An error after `send` leaves the outcome unknown.
 

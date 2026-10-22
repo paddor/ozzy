@@ -147,10 +147,10 @@ fn selected(controller: &mut Controller, io: Local) -> (Voter, Voter) {
     .unwrap();
     let result = primary
         .driver
-        .select(|source, op| {
+        .select(|source, expected: ozzy_replication::Prefix| {
             [common, protected]
                 .iter()
-                .find(|entry| source == entry.source && op == entry.op)
+                .find(|entry| source == entry.source && expected.op == entry.op)
                 .and_then(|entry| entry.position.map(|position| position.digest))
         })
         .unwrap();
@@ -167,12 +167,12 @@ fn policy() -> InstallationConfig {
     }
 }
 
-fn request(ticket: InstallTicket) -> FetchOps {
+fn request(ticket: &InstallTicket) -> FetchOps {
     FetchOps {
         scope: ticket.scope(),
         request_id: RequestId::from_bytes([71; 16]),
         source: ticket.source(),
-        predecessor: ticket.protected_committed(),
+        predecessor: ticket.retained(),
         max_operations: 1,
         max_body_bytes: 8192,
     }
@@ -188,7 +188,7 @@ fn stage_local(controller: &mut Controller, voter: &mut Voter) -> InstallTicket 
         voter.journal.begin_installation(ticket, policy()),
     )
     .unwrap();
-    let mut fetch = request(ticket);
+    let mut fetch = request(&ticket);
     let mut buffer = voter.journal.lease_append_buffer().unwrap();
     while fetch.predecessor != ticket.accepted() {
         let history = drive(controller, voter.journal.fetch_history(fetch, buffer)).unwrap();
@@ -211,8 +211,8 @@ fn stage_local(controller: &mut Controller, voter: &mut Voter) -> InstallTicket 
     ticket
 }
 
-fn finish(controller: &mut Controller, voter: &mut Voter, ticket: InstallTicket) {
-    let installed = drive(controller, voter.journal.finish_installation(ticket)).unwrap();
+fn finish(controller: &mut Controller, voter: &mut Voter, ticket: &InstallTicket) {
+    let installed = drive(controller, voter.journal.finish_installation(*ticket)).unwrap();
     assert_eq!(installed.applied(), ticket.committed());
     assert!(voter.journal.images().is_err());
     voter
@@ -224,7 +224,7 @@ fn finish(controller: &mut Controller, voter: &mut Voter, ticket: InstallTicket)
 fn installed_pair(controller: &mut Controller, io: Local) -> (Voter, Voter) {
     let (mut primary, mut backup) = selected(controller, io);
     let ticket = stage_local(controller, &mut primary);
-    finish(controller, &mut primary, ticket);
+    finish(controller, &mut primary, &ticket);
     assert!(primary.driver.begin_activation().is_err());
     assert!(primary.driver.begin_validation().is_err());
     // Old generation remains readable after replacement publication.
@@ -269,8 +269,8 @@ fn installed_pair(controller: &mut Controller, io: Local) -> (Voter, Voter) {
             primary.source.voter,
             start,
             JournalGeneration(102),
-            |source, op| {
-                (source == protected.source && op == protected.op)
+            |source, expected: ozzy_replication::Prefix| {
+                (source == protected.source && expected.op == protected.op)
                     .then(|| protected.position.unwrap().digest)
             },
         )
@@ -280,7 +280,7 @@ fn installed_pair(controller: &mut Controller, io: Local) -> (Voter, Voter) {
         backup.journal.begin_installation(ticket, policy()),
     )
     .unwrap();
-    let mut fetch = request(ticket);
+    let mut fetch = request(&ticket);
     let mut output = primary.journal.lease_append_buffer().unwrap();
     let mut input = backup.journal.lease_append_buffer().unwrap();
     while fetch.predecessor != ticket.accepted() {
@@ -301,7 +301,7 @@ fn installed_pair(controller: &mut Controller, io: Local) -> (Voter, Voter) {
         output = history.into_buffer();
         output.clear();
     }
-    finish(controller, &mut backup, ticket);
+    finish(controller, &mut backup, &ticket);
     let normal = backup.driver.normal().unwrap();
     let confirmation = Control::PrepareOk {
         ack: normal.acknowledgment().unwrap(),
@@ -599,10 +599,13 @@ fn owned_history_request_errors_preserve_source_and_bounded_leases() {
         JournalError::History(ozzy_journal_segment::HistoryError::BodyBudget { .. })
     ));
     assert!(!voter.journal.is_faulted());
+    // A predecessor the source does not hold names its boundary to rescan from.
     fetch.max_body_bytes = 8192;
     fetch.predecessor.digest = Digest::from_bytes([99; 32]);
     let buffer = voter.journal.lease_append_buffer().unwrap();
-    assert!(drive(&mut controller, voter.journal.fetch_history(fetch, buffer)).is_err());
+    let fetched = drive(&mut controller, voter.journal.fetch_history(fetch, buffer)).unwrap();
+    assert_eq!(fetched.retired_predecessor(), Some(Prefix::GENESIS));
+    drop(fetched);
     assert!(!voter.journal.is_faulted());
     assert!(
         voter

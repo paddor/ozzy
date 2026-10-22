@@ -3,7 +3,7 @@
 use super::*;
 
 #[tokio::test(flavor = "current_thread")]
-async fn resume_and_takeover_preserve_independent_partition_sequences_after_leader_loss() {
+async fn explicit_partition_writes_retry_resume_and_take_over_after_leader_loss() {
     for mode in [DeploymentMode::Single, DeploymentMode::Three] {
         resume_partitions(mode).await;
     }
@@ -21,7 +21,7 @@ async fn resume_partitions(mode: DeploymentMode) {
         .collect::<Vec<_>>();
     let producer = role_links(&runtime, &deployment[0].0, handshake::PRODUCER).await;
     let replacement = role_links(&runtime, &deployment[0].0, handshake::PRODUCER).await;
-    let (mut brokers, _, mut images) =
+    let (mut brokers, mut controls, mut images) =
         start_images(runtime.context().clone(), deployment, true).await;
     let config = SharedTopicWriterConfig::new(limits());
     let retry = RetryPolicy::default();
@@ -33,32 +33,55 @@ async fn resume_partitions(mode: DeploymentMode) {
     .await
     .unwrap();
     let identity = writer.identity();
-    let keys = (0..4)
-        .map(|partition| {
-            (0_u32..1000)
-                .map(u32::to_be_bytes)
-                .find(|key| writer.metadata().keyed_partition(key).number == partition)
-                .unwrap()
-        })
-        .collect::<Vec<_>>();
     let mut next = [0; 4];
     for round in 0..4 {
-        partition_wave(&brokers, &mut writer, &keys[..=round], &mut next, 1).await;
+        partition_wave(&brokers, &mut writer, round + 1, &mut next, 1).await;
     }
     assert_eq!(next, [4, 3, 2, 1]);
     let routes = producer.routes(writer.metadata().clone()).await.unwrap();
     let old_route = routes.route(0).unwrap().unwrap();
-    live_many(&brokers, "close partitioned producer", writer.close())
-        .await
-        .unwrap();
     if mode != DeploymentMode::Single {
         let leader = nodes
             .iter()
             .position(|&node| Some(node) == old_route.leader)
             .unwrap();
-        brokers.remove(leader).shutdown().await.unwrap();
+        // Kill the leader with an admitted APPEND waiting for local storage.
+        // Its original observer must confirm the same partition and sequence.
+        controls[leader].hold_record_writes(true);
+        let pending = writer.send_to_partition(record(99), 0).await.unwrap();
+        assert_eq!(pending.sequence(), next[0]);
+        live_many(&brokers, "hold explicit APPEND before leader loss", async {
+            while controls[leader].held_writes() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(pending.try_confirmed().is_none());
+        controls[leader].crash(false);
+        // Storage failure can surface before or during shutdown.
+        let _ = brokers.remove(leader).shutdown().await;
+        controls.remove(leader);
         images.remove(leader).await.unwrap();
+        let receipt = live_many(
+            &brokers,
+            "retry explicit APPEND after leader loss",
+            pending.confirmed(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt.partition, 0);
+        assert_eq!(
+            receipt.record.partition,
+            writer.metadata().partition(0).unwrap().incarnation
+        );
+        assert_eq!(receipt.record.key.first_sequence, next[0]);
+        assert_eq!(receipt.record.offset, next[0]);
+        assert_eq!(receipt.record.message_id, MessageId::from_bytes([99; 16]));
+        next[0] += 1;
     }
+    live_many(&brokers, "close partitioned producer", writer.close())
+        .await
+        .unwrap();
     let mut resumed = live_many(
         &brokers,
         "resume every partition after leader loss",
@@ -66,13 +89,16 @@ async fn resume_partitions(mode: DeploymentMode) {
     )
     .await
     .unwrap();
-    partition_wave(&brokers, &mut resumed, &keys, &mut next, 1).await;
+    partition_wave(&brokers, &mut resumed, 4, &mut next, 1).await;
     if mode != DeploymentMode::Single {
         let current = routes.route(0).unwrap().unwrap();
         assert_ne!(current.leader, old_route.leader);
         assert!(current.view > old_route.view);
     }
-    assert_eq!(next, [5, 4, 3, 2]);
+    assert_eq!(
+        next,
+        [5 + u64::from(mode == DeploymentMode::Three), 4, 3, 2]
+    );
     reject_foreign_topic_takeover(&brokers, &producer, identity, config.clone(), retry).await;
     let mut takeover = live_many(
         &brokers,
@@ -81,8 +107,8 @@ async fn resume_partitions(mode: DeploymentMode) {
     )
     .await
     .unwrap();
-    assert_old_epochs_fenced(&brokers, &mut resumed, &keys).await;
-    partition_wave(&brokers, &mut takeover, &keys, &mut [0; 4], 2).await;
+    assert_old_epochs_fenced(&brokers, &mut resumed).await;
+    partition_wave(&brokers, &mut takeover, 4, &mut [0; 4], 2).await;
     live_many(&brokers, "close partitioned takeover", takeover.close())
         .await
         .unwrap();
@@ -107,16 +133,16 @@ fn record(id: u8) -> RecordInput {
 async fn partition_wave(
     brokers: &[Broker],
     writer: &mut SharedTopicWriter,
-    keys: &[[u8; 4]],
+    partitions: usize,
     next: &mut [u64; 4],
     epoch: u64,
 ) {
     let mut pending = Vec::new();
-    for (partition, key) in keys.iter().enumerate() {
+    for partition in 0..partitions {
         pending.push((
             partition,
             writer
-                .send(record(partition as u8 + 1), Some(key))
+                .send_to_partition(record(partition as u8 + 1), partition as u32)
                 .await
                 .unwrap(),
         ));
@@ -156,13 +182,12 @@ async fn reject_foreign_topic_takeover(
     ));
 }
 
-async fn assert_old_epochs_fenced(
-    brokers: &[Broker],
-    writer: &mut SharedTopicWriter,
-    keys: &[[u8; 4]],
-) {
-    for key in keys {
-        let pending = writer.send(record(200), Some(key)).await.unwrap();
+async fn assert_old_epochs_fenced(brokers: &[Broker], writer: &mut SharedTopicWriter) {
+    for partition in 0..4 {
+        let pending = writer
+            .send_to_partition(record(200), partition)
+            .await
+            .unwrap();
         assert!(
             live_many(brokers, "fence old partition epoch", pending.confirmed())
                 .await

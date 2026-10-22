@@ -421,3 +421,34 @@ fn stalled_selected_tail_still_fences_at_the_recovery_deadline() {
     assert!(primary.normal().is_none());
     assert_eq!(primary.scope().view, 2);
 }
+
+#[test]
+fn installation_progress_keeps_its_view_until_one_delay_after_the_last() {
+    let (mut primary, _, now) = selected_pair();
+    let ticket = primary
+        .begin_primary_install(JournalGeneration(10))
+        .unwrap();
+    // Chunks staged more often than the election delay: the other voter's
+    // suspicion finds no partner, long past the first deadline.
+    let step = timing().election_timeout / 2;
+    let mut at = now;
+    for _ in 0..8 {
+        at += step;
+        primary.history_progress(at).unwrap();
+        peer_exit(&mut primary, 2, at);
+        assert_eq!(primary.poll(at).unwrap(), None);
+        assert_eq!(primary.scope().view, 1);
+    }
+    primary.validate_install_suffix(&[operation()]).unwrap();
+    // Progress stops; one delay later local suspicion joins the peer's.
+    let stalled = at + timing().election_timeout;
+    assert_eq!(primary.poll(at + step).unwrap(), None);
+    assert_eq!(primary.scope().view, 1);
+    peer_exit(&mut primary, 2, stalled);
+    assert_eq!(primary.poll(stalled).unwrap(), None);
+    assert_eq!(primary.scope().view, 2);
+    primary
+        .complete_installation(ticket, Prefix::GENESIS, stalled)
+        .unwrap();
+    assert!(primary.normal().is_none());
+}

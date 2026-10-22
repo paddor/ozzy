@@ -26,6 +26,10 @@ pub struct SuffixReplacement {
     pub expected_current: CurrentReference,
     /// Confirmed canonical prefix that replacement must preserve.
     pub protected_committed: LogPosition,
+    /// Local prefix, from `protected_committed` through `committed`, that
+    /// already lies in the selected lineage. Replacement keeps it and stages
+    /// only what follows.
+    pub retained: LogPosition,
     /// Promised election view constraining retained history and authority.
     pub promised_view: u64,
     /// Last installed normal election view.

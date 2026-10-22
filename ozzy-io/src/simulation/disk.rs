@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::ops::Range;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 type Inode = u64;
 
@@ -149,6 +149,46 @@ impl Image {
             .values()
             .map(|node| node.dirty.bytes() + node.durable.bytes())
             .sum()
+    }
+
+    /// Maximal runs of `block`-aligned file blocks whose cached bytes differ
+    /// from media, clamped to the cached length. Each file reachable in the
+    /// cached namespace is listed once, under its first path in name order.
+    pub fn unsynced_runs(&self, block: usize) -> Vec<(PathBuf, Range<usize>)> {
+        let block = block.max(1);
+        let mut runs = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut pending = vec![(PathBuf::from("/"), 0)];
+        while let Some((path, inode)) = pending.pop() {
+            let Some(node) = self.nodes.get(&inode).filter(|_| seen.insert(inode)) else {
+                continue;
+            };
+            let (Contents::File(dirty), Contents::File(durable)) = (&node.dirty, &node.durable)
+            else {
+                if let Contents::Directory(entries) = &node.dirty {
+                    let children = entries.iter().rev();
+                    pending.extend(children.map(|(name, child)| (path.join(name), *child)));
+                }
+                continue;
+            };
+            let mut start = None;
+            for offset in (0..dirty.len()).step_by(block) {
+                let end = dirty.len().min(offset + block);
+                let differs = durable.get(offset..end) != Some(&dirty[offset..end]);
+                match (differs, start) {
+                    (true, None) => start = Some(offset),
+                    (false, Some(from)) => {
+                        runs.push((path.clone(), from..offset));
+                        start = None;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(from) = start {
+                runs.push((path, from..dirty.len()));
+            }
+        }
+        runs
     }
 
     pub(super) fn validate(&self, limits: ImageLimits) -> io::Result<()> {
@@ -563,21 +603,35 @@ impl Image {
         self.reclaim(std::iter::empty());
     }
 
-    pub(super) fn reclaim(&mut self, handles: impl Iterator<Item = Inode>) {
-        let mut pending: Vec<_> = std::iter::once(0).chain(handles).collect();
+    pub(super) fn directory_changed(&self, inode: Inode) -> bool {
+        self.nodes.get(&inode).is_some_and(|node| {
+            matches!((&node.dirty, &node.durable),
+            (Contents::Directory(dirty), Contents::Directory(durable)) if dirty != durable)
+        })
+    }
+
+    /// Retained inodes that need an open handle to remain reachable.
+    pub(super) fn reclaim(&mut self, handles: impl Iterator<Item = Inode>) -> BTreeSet<Inode> {
         let mut reachable = BTreeSet::new();
-        while let Some(inode) = pending.pop() {
-            if !reachable.insert(inode) {
-                continue;
-            }
-            if let Some(node) = self.nodes.get(&inode) {
-                for contents in [&node.dirty, &node.durable] {
-                    if let Contents::Directory(entries) = contents {
-                        pending.extend(entries.values().copied());
+        let mut orphans = BTreeSet::new();
+        for (round, mut pending) in [vec![0], handles.collect()].into_iter().enumerate() {
+            while let Some(inode) = pending.pop() {
+                if !reachable.insert(inode) {
+                    continue;
+                }
+                if let Some(node) = self.nodes.get(&inode) {
+                    if round == 1 {
+                        orphans.insert(inode);
+                    }
+                    for contents in [&node.dirty, &node.durable] {
+                        if let Contents::Directory(entries) = contents {
+                            pending.extend(entries.values().copied());
+                        }
                     }
                 }
             }
         }
         self.nodes.retain(|inode, _| reachable.contains(inode));
+        orphans
     }
 }

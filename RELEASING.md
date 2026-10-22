@@ -31,9 +31,28 @@ How Ozzy crates reach crates.io. For maintainers.
 
 - [release-plz.toml](release-plz.toml) lists the crates that release
   (`release = true`).
-- `ozzy-bench`, `ozzy-sim`, and `ozzy-test-alloc` are `publish = false`.
+- `ozzy-bench`, `ozzy-sim`, `ozzy-test-alloc`, `ozzy-python`, `ozzy-java`, and
+  `ozzy-bindings` are
+  `publish = false`.
 - CI's `publish-check` job dry-runs `cargo publish` for every other workspace
   crate.
+
+## Python package
+
+`bindings/python` builds the `ozzy` Python package with maturin. Its version
+comes from the Rust workspace. Refresh `bindings/python/uv.lock` after a version
+bump and run `scripts/check-python.sh` for Python 3.12 and 3.14 before preparing
+wheels. Build commands and supported APIs live in the
+[Python SDK README](bindings/python/README.md). Python packages are not uploaded
+by the crates.io release workflow.
+
+## Java package
+
+`bindings/java/pom.xml` versions `io.github.paddor:ozzy-java`; keep it aligned
+with the Rust workspace. `scripts/check-java.sh` builds a Java-only JAR and a
+current-platform classifier JAR containing the native library. Test Java 22 and
+a newer JDK before preparing packages. There is no automatic Maven publication.
+Usage and native-loading options: [Java SDK README](bindings/java/README.md).
 
 ## Trusted publisher setup
 

@@ -3,7 +3,8 @@
 use super::{FollowerRoutes, Serving, StartupError, error, failure, fatal};
 use futures::{StreamExt, stream::FuturesUnordered};
 use omq_tokio::{
-    IdentitySocket, Message, MonitorEvent, MonitorStream, ReceiveLane, ReceiveReceipt,
+    IdentitySocket, Message, MonitorEvent, MonitorRecvError, MonitorStream, MonitorTryRecvError,
+    ReceiveLane, ReceiveReceipt,
 };
 use ozzy_proto::{NodeId, Opcode};
 use ozzy_runtime::transport::Frames;
@@ -21,6 +22,8 @@ type Lane = (u32, Kind, Class);
 type LaneWake = Pin<Box<dyn Future<Output = Lane>>>;
 const TURN_MESSAGES: usize = 16;
 const TURN_BYTES: usize = 2 * 1024 * 1024;
+/// Monitor events dropped at most before a lost window resynchronizes.
+const LOST_EVENTS: usize = 1024;
 
 pub(super) struct Ingress<'a> {
     pub(super) socket: &'a IdentitySocket,
@@ -55,18 +58,60 @@ impl<'a> Ingress<'a> {
         &self.serving.followers.routes
     }
 
-    pub(super) fn observe(
+    pub(super) async fn observe(
         &mut self,
-        event: MonitorEvent,
+        event: Result<MonitorEvent, MonitorRecvError>,
         service: &mut Service,
     ) -> Result<(), StartupError> {
-        self.connections
-            .observe(event, service, self.follower_routes())
+        match event {
+            Ok(event) => self
+                .connections
+                .observe(event, service, self.follower_routes()),
+            Err(MonitorRecvError::Lagged(_)) => self.resynchronize(service).await,
+            Err(error) => Err(failure(error)),
+        }
     }
 
-    pub(super) fn prepare(&mut self, service: &mut Service) -> Result<bool, StartupError> {
+    pub(super) async fn prepare(&mut self, service: &mut Service) -> Result<bool, StartupError> {
         let routes = self.follower_routes();
-        self.connections.drain(&mut self.monitor, service, routes)
+        if let Some(ready) = self.connections.drain(&mut self.monitor, service, routes)? {
+            return Ok(ready);
+        }
+        self.resynchronize(service).await?;
+        // Another lost window leaves events queued and wakes the monitor arm.
+        Ok(self
+            .connections
+            .drain(&mut self.monitor, service, routes)?
+            .unwrap_or(false))
+    }
+
+    /// The monitor is diagnostic and drops events when it lags. Rebuild the
+    /// tracked connections from the socket's own table instead. Events
+    /// queued meanwhile replay without effect or in order.
+    async fn resynchronize(&mut self, service: &mut Service) -> Result<(), StartupError> {
+        for _ in 0..LOST_EVENTS {
+            match self.monitor.try_recv() {
+                Ok(_) | Err(MonitorTryRecvError::Lagged(_)) => {}
+                Err(MonitorTryRecvError::Empty) => break,
+                Err(error) => return Err(failure(error)),
+            }
+        }
+        let live =
+            ozzy_runtime::transport::live_peers(self.socket.connections().await.map_err(failure)?);
+        let routes = self.follower_routes();
+        let gone: Vec<_> = (self.connections.map.iter())
+            .filter(|&(peer, connection)| live.get(peer) != Some(connection))
+            .map(|(&peer, &connection)| (peer, connection))
+            .collect();
+        for link in gone {
+            self.connections.apply(link, false, service, routes)?;
+        }
+        for link in live {
+            if self.connections.map.get(&link.0) != Some(&link.1) {
+                self.connections.apply(link, true, service, routes)?;
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn receive(
@@ -301,20 +346,23 @@ impl Connections {
             control,
         }
     }
+    /// Observe up to 64 queued events: `true` once none is left, `None`
+    /// when the monitor lost some.
     fn drain(
         &mut self,
         monitor: &mut omq_tokio::MonitorStream,
         service: &mut Service,
         followers: &FollowerRoutes,
-    ) -> Result<bool, StartupError> {
+    ) -> Result<Option<bool>, StartupError> {
         for _ in 0..64 {
             match monitor.try_recv() {
                 Ok(event) => self.observe(event, service, followers)?,
-                Err(omq_tokio::MonitorTryRecvError::Empty) => return Ok(true),
+                Err(MonitorTryRecvError::Empty) => return Ok(Some(true)),
+                Err(MonitorTryRecvError::Lagged(_)) => return Ok(None),
                 Err(error) => return Err(failure(error)),
             }
         }
-        Ok(false)
+        Ok(Some(false))
     }
 
     fn observe(
@@ -335,16 +383,27 @@ impl Connections {
         else {
             return Ok(());
         };
+        self.apply((peer, info.connection_id), connected, service, followers)
+    }
+
+    /// Track or retire one peer connection.
+    fn apply(
+        &mut self,
+        (peer, connection): (NodeId, u64),
+        connected: bool,
+        service: &mut Service,
+        followers: &FollowerRoutes,
+    ) -> Result<(), StartupError> {
         if followers.incoming.contains_key(&peer) {
             if connected {
                 self.track(
                     peer,
-                    info.connection_id,
+                    connection,
                     service.transport_peer_capacity() + followers.incoming.len(),
                     |node| service.access(node).is_some() || followers.incoming.contains_key(&node),
                 );
             } else {
-                self.changed(peer, info.connection_id, false);
+                self.changed(peer, connection, false);
             }
             return Ok(()); // A repair connection cannot replace the control session.
         }
@@ -352,12 +411,12 @@ impl Connections {
             service.accepts_transport_peer(peer)
                 && self.track(
                     peer,
-                    info.connection_id,
+                    connection,
                     service.transport_peer_capacity() + followers.incoming.len(),
                     |node| service.access(node).is_some() || followers.incoming.contains_key(&node),
                 )
         } else {
-            self.changed(peer, info.connection_id, false)
+            self.changed(peer, connection, false)
         };
         if !changed {
             return Ok(());

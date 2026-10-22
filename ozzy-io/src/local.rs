@@ -1,7 +1,11 @@
 //! One submission lane shared by partition tasks on the same application shard.
 
 use crate::{Admission, Backend, Class, Completed, Completion, Operation, Rejected};
-use std::{cell::RefCell, io, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    io,
+    rc::Rc,
+};
 
 /// Clones share one lane and its budgets. Intentionally not Send or Sync: move
 /// the backend onto its shard before constructing this value. No mutable lane
@@ -11,6 +15,7 @@ pub struct Local {
     backend: Rc<RefCell<Box<dyn Backend>>>,
     admission: Admission,
     shard: usize,
+    completed: Rc<Cell<u64>>,
 }
 
 impl Local {
@@ -20,6 +25,7 @@ impl Local {
             admission: backend.admission().clone(),
             shard: backend.shard(),
             backend: Rc::new(RefCell::new(Box::new(backend))),
+            completed: Rc::default(),
         }
     }
 
@@ -37,6 +43,13 @@ impl Local {
         self.shard
     }
 
+    /// Jobs this lane awaited to physical completion, over all clones. A
+    /// count that stays put while work is pending means the device completes
+    /// nothing.
+    pub fn completed(&self) -> u64 {
+        self.completed.get()
+    }
+
     /// Wait for admission, then physical completion. The caller must account
     /// for pending bytes in its own bounded state until admission succeeds.
     /// Canceling after submission does not cancel physical execution.
@@ -45,7 +58,11 @@ impl Local {
         loop {
             self.admission.ready(self.shard, class, bytes).await?;
             match self.submit(class, operation) {
-                Ok(completion) => return completion.await,
+                Ok(completion) => {
+                    let result = completion.await;
+                    self.completed.set(self.completed.get().wrapping_add(1));
+                    return result;
+                }
                 Err(rejected) if rejected.error.kind() == io::ErrorKind::WouldBlock => {
                     operation = *rejected.operation;
                     // Backend queue availability can lag its admission counter.

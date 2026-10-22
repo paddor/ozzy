@@ -61,12 +61,27 @@ labels. Field names and enum values are fixed.
 | `[brokers.NAME.devices.DEVICE]` | `root`, `controller` |
 | `[brokers.NAME.devices.DEVICE.workers]` | `backend` (`"aio"` on Linux, else `"pool"`), worker, CPU, job, byte, and handle bounds |
 | `[brokers.NAME.topology]` | `omq.io_threads` (1), `dispatcher`, `shards`, `memory_pools`, `partitions` |
-| `[topics.NAME]` | `partitions` (16), `partitioner_seed` (0), `segment_bytes` (256 MiB), `max_append_bytes` (8 MiB) |
+| `[brokers.NAME.topology.omq.ingress]`, `[brokers.NAME.topology.omq.egress]` | Positive `bytes_per_second`, `burst_bytes` (unset: unlimited) |
+| `[topics.NAME]` | `partitions` (16), `partitioner_seed` (0), `segment_bytes` (256 MiB), `max_append_bytes` (8 MiB), `producer_idle_secs` (604800) |
 | `[topics.NAME.retention]` | `max_age_secs`, `max_bytes` (unset: keep all) |
 | `[topics.NAME.deduplication]` | `window_millis` (300000), `max_entries`, `max_bytes` |
 
 The rustdoc of each field in `src/schema.rs` lists the rest, including
 `workers` and shard `budget` defaults.
+
+Optional network limits share one allowance across all broker sockets and I/O
+threads. Rates count transport bytes after compression, including each PUB
+copy; IPC, inproc, and SHM are exempt. Exhaustion backpressures network I/O.
+
+```toml
+[brokers.laptop.topology.omq.ingress]
+bytes_per_second = 100000000
+burst_bytes = 1000000
+
+[brokers.laptop.topology.omq.egress]
+bytes_per_second = 100000000
+burst_bytes = 1000000
+```
 
 ## Confirmation
 
@@ -86,6 +101,8 @@ says what each mode confirms.
 - One device gets one shard by default. Several devices need explicit `shards`.
 - `segment_bytes` is at least 1 MiB, a multiple of 4096, and at least twice
   `max_append_bytes`. `max_append_bytes` is at most 8 MiB.
+- `producer_idle_secs` is positive. A producer session with no open or append
+  that long retires; resuming its identity starts fresh sequences.
 - Shard and device byte budgets must cover the largest `max_append_bytes`.
 - Restart rejects changed mode, brokers, topics, partition counts,
   `partitioner_seed`, or deduplication window. Local shards,
@@ -101,9 +118,13 @@ max_bytes = 1073741824
 
 - Either limit expires the oldest sealed segments; both can be omitted.
 - `max_bytes` counts segment capacities per partition per broker, including the
-  active segment. It must fit at least one segment. A retired file kept for
-  the next new segment adds one segment on disk.
+  active segment. It must fit at least one segment and at most 224, seven
+  eighths of the partition limit. A retired file kept for the next new
+  segment adds one segment on disk.
 - Active work and captured reads can delay deletion.
+- A partition holds at most 256 segments. Near that limit, with or without
+  retention, it refuses new records with NACK 10 until segments retire; see
+  [full partitions](../doc/STORAGE.md#full-partitions).
 
 ## Deduplication
 

@@ -120,3 +120,84 @@ fn recovered_plan_gives_unknown_owner_a_full_drain_deadline() {
     assert!(!target(&mut state, &image, now + Duration::from_millis(4999)).activatable);
     assert!(target(&mut state, &image, now + Duration::from_secs(5)).activatable);
 }
+
+fn report(
+    state: &mut GroupState,
+    image: &CoordinatorGroup,
+    id: u8,
+    owned: Vec<Owned>,
+    now: Duration,
+) -> Vec<Target> {
+    let disposition = state.observe(
+        Some(image),
+        Observation {
+            request: heartbeat(image, id, owned),
+            node: member(id).node,
+            now,
+        },
+        &Targeting {
+            number: &|_| Some(0),
+            drain_deadline: Duration::from_secs(5),
+        },
+    );
+    let Disposition::Reply(_, targets) = disposition else {
+        panic!("committed member must not be fenced")
+    };
+    targets
+}
+
+#[test]
+fn a_target_moved_again_before_activation_waits_for_its_real_owner() {
+    let partitions = [1, 2, 3, 4].map(|id| PartitionIncarnation::from_bytes([id; 16]));
+    let (a, b, c) = (member(1), member(2), member(3));
+    let mut image = CoordinatorGroup {
+        coordinator: partitions[0],
+        group: ConsumerGroupId::from_bytes([3; 16]),
+        name: "workers".into(),
+        revision: 1,
+        initial: Start::Earliest,
+        members: vec![a],
+        targets: group_targets(None, &[a], &partitions, 1).unwrap(),
+        operation: OperationId::from_bytes([4; 16]),
+    };
+    for (revision, members) in [(2, vec![a, b]), (3, vec![a, b, c])] {
+        image.targets = group_targets(Some(&image), &members, &partitions, revision).unwrap();
+        image.members = members;
+        image.revision = revision;
+    }
+    let moved = *image
+        .targets
+        .iter()
+        .find(|target| target.member == Some(c))
+        .unwrap();
+    assert_eq!(moved.prior_member, Some(b), "B never activated it");
+    let owned = |partitions: &[PartitionIncarnation]| {
+        partitions
+            .iter()
+            .map(|&partition| Owned {
+                partition,
+                plan_revision: 1,
+                epoch: 1,
+            })
+            .collect::<Vec<_>>()
+    };
+    let now = Duration::from_secs(20);
+    let mut state = GroupState::default();
+    state.adopt(&image, now);
+    // A still drains everything revision 1 gave it.
+    report(&mut state, &image, 1, owned(&partitions), now);
+    report(&mut state, &image, 2, Vec::new(), now);
+    let [target] = report(&mut state, &image, 3, Vec::new(), now)[..] else {
+        panic!("C owns one partition")
+    };
+    assert!(!target.activatable, "A still holds it");
+    let kept: Vec<_> = partitions
+        .into_iter()
+        .filter(|&partition| partition != moved.partition)
+        .collect();
+    report(&mut state, &image, 1, owned(&kept), now);
+    let [target] = report(&mut state, &image, 3, Vec::new(), now)[..] else {
+        panic!("C owns one partition")
+    };
+    assert!(target.activatable);
+}

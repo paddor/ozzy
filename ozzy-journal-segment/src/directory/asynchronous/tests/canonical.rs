@@ -188,6 +188,69 @@ fn async_canonical_recovery_preserves_committed_and_speculative_identities() {
 }
 
 #[test]
+fn candidate_after_committed_state_matches_full_replay_and_checks_its_anchor() {
+    let (mut controller, mut journal) = empty_journal();
+    for body in [create(), open_producer(1)] {
+        drive(&mut controller, write(&mut journal, &body));
+    }
+    drive(&mut controller, journal.roll_active(32768, 4)).unwrap();
+    for sequence in 0..2 {
+        drive(
+            &mut controller,
+            write(&mut journal, &append(1, sequence, sequence)),
+        );
+    }
+    drive(&mut controller, confirm(&mut journal));
+    let limits = recovery_limits();
+    let images = drive(&mut controller, journal.recover_canonical_images(limits)).unwrap();
+    let base = images.committed().clone();
+    let at = journal.committed_position().unwrap();
+    assert_eq!(base.revision(), 4);
+    for sequence in 2..6 {
+        if sequence % 2 == 0 {
+            drive(&mut controller, journal.roll_active(32768, 4)).unwrap();
+        }
+        drive(
+            &mut controller,
+            write(&mut journal, &append(1, sequence, sequence)),
+        );
+    }
+    drive(&mut controller, confirm(&mut journal));
+    let full = drive(&mut controller, journal.recover_canonical_candidate(limits)).unwrap();
+    // The first segment ends before the base and is not read.
+    let after = drive(
+        &mut controller,
+        journal.recover_canonical_candidate_after(limits, at, base.clone()),
+    )
+    .unwrap();
+    assert_eq!(after.committed_images().committed().revision(), 8);
+    assert_eq!(
+        after.committed_images().committed(),
+        full.committed_images().committed()
+    );
+    assert_eq!(after.accepted_position(), full.accepted_position());
+    // A base off this history, or not at its position, never replays.
+    let mut stranger = at;
+    stranger.digest = Digest::from_bytes([9; 32]);
+    assert!(
+        drive(
+            &mut controller,
+            journal.recover_canonical_candidate_after(limits, stranger, base.clone()),
+        )
+        .is_err()
+    );
+    let mut later = at;
+    later.op_number += 1;
+    assert!(matches!(
+        drive(
+            &mut controller,
+            journal.recover_canonical_candidate_after(limits, later, base),
+        ),
+        Err(Error::PositionMismatch)
+    ));
+}
+
+#[test]
 fn async_candidate_keeps_large_selected_tail_private_and_checks_activation() {
     let (mut controller, mut journal) = empty_journal();
     for body in [create(), open_producer(1)] {

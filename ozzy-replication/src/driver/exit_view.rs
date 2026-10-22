@@ -3,6 +3,8 @@
 use super::{Action, DriverError, ReplicaDriver, Role};
 use crate::wire::Control;
 use crate::{Scope, VoterIndex, VoterSet};
+use ozzy_proto::NodeId;
+use std::time::Duration;
 
 impl ReplicaDriver {
     pub(super) fn receive_exit(
@@ -43,8 +45,26 @@ impl ReplicaDriver {
                 self.withdraw_exit();
             }
         }
+        self.exit_heard_at[voter] = self.now;
         self.exit_votes.insert(voter);
         self.advance_if_exit_quorum()
+    }
+
+    /// `from` asked for recovery as a nonvoting copy. When it is the primary of the
+    /// view this replica elects, it cannot install that view, so suspect the
+    /// view now instead of at the election deadline. Leaving the view still
+    /// needs a second voter's suspicion.
+    pub fn observe_recovering(&mut self, from: NodeId, now: Duration) -> Result<(), DriverError> {
+        self.observe_time(now)?;
+        self.require_healthy()?;
+        let voter = self.configuration.voter_index(from)?;
+        if voter != self.local
+            && voter == VoterIndex::primary(self.scope().view)
+            && matches!(self.role, Role::ViewChanging(_))
+        {
+            self.request_exit()?;
+        }
+        Ok(())
     }
 
     pub(super) fn request_exit(&mut self) -> Result<(), DriverError> {
@@ -54,6 +74,15 @@ impl ReplicaDriver {
     }
 
     fn advance_if_exit_quorum(&mut self) -> Result<(), DriverError> {
+        // A suspicious peer repeats its request every retransmission
+        // interval. One that recovered goes quiet, so its request lapses
+        // instead of helping a later timeout end a healthy view.
+        for voter in self.local.others() {
+            let heard = self.exit_heard_at[voter];
+            if self.now >= heard.saturating_add(self.timing.primary_timeout) {
+                self.exit_votes.remove(voter);
+            }
+        }
         if self.exit_votes.len() >= 2 {
             if self
                 .normal()
@@ -74,7 +103,7 @@ impl ReplicaDriver {
         self.exit_retry_at = None;
     }
 
-    fn promise_pending(&self) -> bool {
+    pub(super) fn promise_pending(&self) -> bool {
         matches!(
             &self.role,
             Role::ViewChanging(changing) if changing.promised_view() != changing.scope().view

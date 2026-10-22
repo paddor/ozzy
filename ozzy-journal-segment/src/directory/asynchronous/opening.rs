@@ -1,18 +1,14 @@
-use super::{
-    ExpectedStore, Format, Journal, Limits, scan_contains_position, validate_operation_bodies,
-};
+use super::{ExpectedStore, Journal, Limits, scan_contains_position, validate_operation_bodies};
 use crate::directory::{
-    CONFIGURATION_FILE, DATA_DIRECTORIES, DirectoryError, GROUP_CONFIGURATION_MAX_BYTES,
-    IDENTITY_FILE, evidence, is_checkpoint_staging_name, is_index_staging_name, manifest_name,
-    segment_name, segment_reference_name, validate_configuration_length, validate_initial_segment,
+    DATA_DIRECTORIES, DirectoryError, GROUP_CONFIGURATION_MAX_BYTES, evidence,
+    is_checkpoint_staging_name, is_index_staging_name, segment_reference_name,
     validate_segment_header,
 };
 use crate::{
-    CanonicalRecoveryRequirements, ChainPosition, CommitMode, CurrentReference, LogPosition,
-    Manifest, SegmentReference, SegmentStart, SegmentWriter, TailState, async_files::Access,
-    async_metadata, checkpoint::asynchronous::Checkpoint, checkpoint_name, decode_segment_header,
-    encode_group_identity, encode_manifest_with_limits, manifest_digest, metadata::position_before,
-    scan_segment_async,
+    CanonicalRecoveryRequirements, ChainPosition, CommitMode, LogPosition, Manifest,
+    SegmentReference, SegmentStart, SegmentWriter, TailState, async_files::Access, async_metadata,
+    checkpoint::asynchronous::Checkpoint, checkpoint_name, decode_segment_header,
+    metadata::position_before, scan_segment_async,
 };
 use ozzy_io::{FileKind, Local, OpenMode, Operation};
 use ozzy_journal::progress::JournalGeneration;
@@ -106,70 +102,6 @@ impl Limits {
 }
 
 impl Journal {
-    /// Format only an absent directory below an existing parent. Every failure
-    /// leaves its artifacts for explicit inspection; this never retries format
-    /// against a partial or established store.
-    pub async fn format(
-        root: PathBuf,
-        io: Local,
-        spec: Format,
-        generation: JournalGeneration,
-        limits: Limits,
-    ) -> Result<Self, DirectoryError> {
-        limits.validate(&io, &root)?;
-        spec.validate()?;
-        let parent = root
-            .parent()
-            .ok_or(DirectoryError::MissingParent)?
-            .to_path_buf();
-        if spec.first_segment.capacity() > limits.io.max_segment_bytes {
-            return Err(DirectoryError::SegmentMismatch(
-                spec.first_segment.segment_id(),
-            ));
-        }
-        let manifest = initial_manifest(&spec);
-        let bytes = encode_manifest_with_limits(&manifest, limits.metadata)?;
-        let mut directory = create_store(&root, &parent, &io, limits).await?;
-        let access = directory.access();
-        directory
-            .install_immutable(IDENTITY_FILE, &encode_group_identity(spec.identity)?)
-            .await?;
-        directory
-            .install_immutable(CONFIGURATION_FILE, &spec.configuration)
-            .await?;
-        let writer = SegmentWriter::create(
-            access.segment_file(root.join(segment_name(spec.first_segment.segment_id()))),
-            spec.first_segment,
-            SegmentStart {
-                generation,
-                first_group_number: 1,
-                initial_chain: ChainPosition::GENESIS,
-            },
-            limits.io,
-        )
-        .await?;
-        access.sync_directory(root.join("segments")).await?;
-        let current = select_initial(&mut directory, &manifest, &bytes, limits).await?;
-        access.sync_directory(parent).await?;
-        let evidence = Some(directory.load_evidence(&manifest).await?);
-        Ok(Self {
-            directory,
-            access,
-            manifest,
-            current,
-            configuration: Some(spec.configuration),
-            writer,
-            evidence,
-            checkpoint: None,
-            limits,
-            interrupted: false,
-            cleaning: std::rc::Rc::default(),
-            pins: std::rc::Rc::default(),
-            validated_indexes: std::collections::BTreeMap::new(),
-            active_prefix: None,
-        })
-    }
-
     /// Validate the exact selected store and protected history before reopening
     /// for writes. A missing or damaged established store is never formatted.
     pub async fn open(
@@ -219,7 +151,7 @@ impl Journal {
         let root = directory.root().to_path_buf();
         let access = directory.access();
         open_data_directories(&access, &root).await?;
-        validate_headers(&access, &root, &selected.manifest, limits).await?;
+        validate_headers(&access, &root, &selected.manifest, &[], limits).await?;
         let checkpoint = selected_checkpoint(&access, &root, &selected.manifest, limits).await?;
         cleanup_staging(&access, &root, limits).await?;
         let evidence = if selected.manifest.durable_evidence {
@@ -265,7 +197,8 @@ impl Journal {
             interrupted: false,
             cleaning: std::rc::Rc::default(),
             pins: std::rc::Rc::default(),
-            validated_indexes: std::collections::BTreeMap::new(),
+            validated_indexes: std::cell::RefCell::default(),
+            pack_layouts: std::cell::RefCell::default(),
             active_prefix: None,
         };
         if let Some(next) = journal.recovered_manifest(recovered)? {
@@ -298,84 +231,6 @@ impl Journal {
     }
 }
 
-impl Format {
-    /// Check the identity, genesis segment, and configuration length.
-    fn validate(&self) -> Result<(), DirectoryError> {
-        self.identity.validate()?;
-        validate_initial_segment(self.identity, &self.first_segment)?;
-        validate_configuration_length(self.configuration.len())
-    }
-}
-
-/// Create the absent store directory and its data directories below an
-/// existing parent. An existing store is never reused.
-async fn create_store(
-    root: &Path,
-    parent: &Path,
-    io: &Local,
-    limits: Limits,
-) -> Result<async_metadata::Directory, DirectoryError> {
-    let access = Access {
-        io: io.clone(),
-        protection: None,
-        readers: std::rc::Rc::default(),
-    };
-    let directory = access.open_directory(parent.to_path_buf()).await?;
-    access.done(Operation::Close { handle: directory }).await?;
-    access
-        .done(Operation::CreateDirectory {
-            path: root.to_path_buf(),
-        })
-        .await
-        .map_err(|error| {
-            if error.kind() == io::ErrorKind::AlreadyExists {
-                DirectoryError::StoreAlreadyExists
-            } else {
-                error.into()
-            }
-        })?;
-    let directory =
-        async_metadata::Directory::open(root.to_path_buf(), io.clone(), limits.metadata_io())
-            .await?;
-    let access = directory.access();
-    for name in DATA_DIRECTORIES {
-        access
-            .done(Operation::CreateDirectory {
-                path: root.join(name),
-            })
-            .await?;
-    }
-    Ok(directory)
-}
-
-/// Publish genesis evidence and the first manifest, then select it as
-/// CURRENT.
-async fn select_initial(
-    directory: &mut async_metadata::Directory,
-    manifest: &Manifest,
-    bytes: &[u8],
-    limits: Limits,
-) -> Result<CurrentReference, DirectoryError> {
-    directory
-        .replace(
-            evidence::NAME,
-            ".DURABLE.tmp",
-            &evidence::image(manifest, LogPosition::GENESIS)?,
-        )
-        .await?;
-    directory
-        .install_immutable(&manifest_name(1), bytes)
-        .await?;
-    let current = CurrentReference {
-        group_id: manifest.identity.group_id,
-        store_id: manifest.identity.store_id,
-        generation: 1,
-        manifest_digest: manifest_digest(bytes, limits.metadata)?,
-    };
-    directory.select_current(current).await?;
-    Ok(current)
-}
-
 /// Checks the active segment's recovery must pass under the selected
 /// authority. It must hold each protected position no sealed segment held.
 fn active_requirements(
@@ -405,30 +260,6 @@ pub(super) async fn open_data_directories(
     Ok(())
 }
 
-fn initial_manifest(spec: &Format) -> Manifest {
-    Manifest {
-        generation: 1,
-        parent_generation: 0,
-        identity: spec.identity,
-        configuration_epoch: spec.configuration_epoch,
-        commit_mode: spec.commit_mode,
-        durable_evidence: true,
-        promised_view: 0,
-        last_normal_view: 0,
-        accepted: LogPosition::GENESIS,
-        committed: LogPosition::GENESIS,
-        checkpoint: None,
-        segments: vec![SegmentReference {
-            segment_id: spec.first_segment.segment_id(),
-            file_generation: 0,
-            first_group_number: 1,
-            first_chain: ChainPosition::GENESIS,
-            capacity: spec.first_segment.capacity(),
-            sealed: None,
-        }],
-    }
-}
-
 pub(super) async fn selected_checkpoint(
     access: &Access,
     root: &Path,
@@ -456,16 +287,26 @@ pub(super) async fn selected_checkpoint(
     Ok(Some(checkpoint))
 }
 
+/// Check the header of each segment `manifest` selects. A reference that
+/// `selected` holds after the same predecessor was checked when it entered
+/// the selection, and the journal never rewrites a selected header or
+/// shortens its file, so it is not read again. A publication then reads
+/// only the segments it adds or changes.
 pub(super) async fn validate_headers(
     access: &Access,
     root: &Path,
     manifest: &Manifest,
+    selected: &[SegmentReference],
     limits: Limits,
 ) -> Result<(), DirectoryError> {
     let mut previous = None;
     for reference in &manifest.segments {
         if reference.capacity > limits.io.max_segment_bytes {
             return Err(DirectoryError::SegmentMismatch(reference.segment_id));
+        }
+        if checked(selected, previous, reference) {
+            previous = Some(reference);
+            continue;
         }
         let handle = access
             .open(
@@ -490,6 +331,26 @@ pub(super) async fn validate_headers(
         previous = Some(reference);
     }
     Ok(())
+}
+
+/// Whether `selected` holds `reference` after a segment with the ID of
+/// `previous`, or holds it at all when it has no predecessor to check.
+fn checked(
+    selected: &[SegmentReference],
+    previous: Option<&SegmentReference>,
+    reference: &SegmentReference,
+) -> bool {
+    let first = reference.first_chain.next_op_number();
+    let Ok(at) = selected.binary_search_by_key(&first, |old| old.first_chain.next_op_number())
+    else {
+        return false;
+    };
+    selected.get(at) == Some(reference)
+        && previous.is_none_or(|previous| {
+            at.checked_sub(1)
+                .and_then(|before| selected.get(before))
+                .is_some_and(|before| before.segment_id == previous.segment_id)
+        })
 }
 
 async fn validate_sealed(

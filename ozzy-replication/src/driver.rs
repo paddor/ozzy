@@ -26,9 +26,9 @@ use ozzy_proto::NodeId;
 
 use crate::wire::Control;
 use crate::{
-    Configuration, Digest, InstallingView, LogSource, NormalReplica, OpNumber, PromiseTicket,
-    ReplicaSnapshot, ReplicationError, Scope, SelectedView, Status, ViewChange, ViewChangeError,
-    VoterIndex, VoterSet, Voters,
+    Configuration, Digest, InstallingView, LogSource, NormalReplica, OpNumber, Prefix,
+    PromiseTicket, ReplicaSnapshot, ReplicationError, Scope, SelectedView, Status, ViewChange,
+    ViewChangeError, VoterIndex, VoterSet, Voters,
 };
 
 /// Independent heartbeat, progress, and election retry intervals.
@@ -114,6 +114,8 @@ pub struct ReplicaDriver {
     contact_deadline: Duration,
     progress_deadline: Duration,
     persistence_deadline: Duration,
+    /// When busy local storage last completed work; `None` while idle.
+    storage_busy_since: Option<Duration>,
     election_deadline: Duration,
     election_delay: Duration,
     retry_at: Duration,
@@ -125,6 +127,8 @@ pub struct ReplicaDriver {
     activation_pending: VoterSet,
     /// Current-view timeout suspicions. Never durable or history-selection votes.
     exit_votes: VoterSet,
+    /// When each peer's suspicion of the current view last arrived.
+    exit_heard_at: Voters<Duration>,
     /// `None` means local suspicion is inactive or was withdrawn after progress.
     exit_retry_at: Option<Duration>,
     /// An older view peers still ask to leave, and which voters asked. This
@@ -183,6 +187,7 @@ impl ReplicaDriver {
             now,
             contact_deadline: now.saturating_add(timing.primary_timeout),
             persistence_deadline: now.saturating_add(timing.primary_timeout),
+            storage_busy_since: None,
             progress_deadline: now
                 + if activating {
                     timing.election_timeout
@@ -202,6 +207,7 @@ impl ReplicaDriver {
             commit_pending: false,
             activation_pending: VoterSet::EMPTY,
             exit_votes: VoterSet::EMPTY,
+            exit_heard_at: Voters::splat(Duration::ZERO),
             exit_retry_at: None,
             exit_echo: None,
             exit_echo_at: Voters::splat(Duration::ZERO),
@@ -245,7 +251,7 @@ impl ReplicaDriver {
     /// Missing history/quorum is recoverable. Success is not installed authority.
     pub fn select(
         &mut self,
-        lookup: impl FnMut(LogSource, OpNumber) -> Option<Digest>,
+        lookup: impl FnMut(LogSource, Prefix) -> Option<Digest>,
     ) -> Result<SelectedView, DriverError> {
         Ok(self.changing()?.select(lookup)?)
     }
@@ -255,6 +261,15 @@ impl ReplicaDriver {
         match &self.role {
             Role::ViewChanging(changing) => changing.history_sources(),
             Role::Normal(_) | Role::Installing(_) | Role::Fenced(_) => [None; 3],
+        }
+    }
+
+    /// Operations whose prefixes this election may look up in its chosen
+    /// source. One lookup scan can verify each one it passes.
+    pub fn lookup_ops(&self) -> [Option<OpNumber>; 8] {
+        match &self.role {
+            Role::ViewChanging(changing) => changing.lookup_ops(),
+            Role::Normal(_) | Role::Installing(_) | Role::Fenced(_) => [None; 8],
         }
     }
 
@@ -335,6 +350,9 @@ impl ReplicaDriver {
             || (outstanding && self.now >= self.progress_deadline)
             || (snapshot.accepted.op > snapshot.journal.durable
                 && self.now >= self.persistence_deadline)
+            || self
+                .storage_busy_since
+                .is_some_and(|since| self.now >= since.saturating_add(self.timing.primary_timeout))
     }
 
     fn next_view(&mut self) -> Result<(), DriverError> {

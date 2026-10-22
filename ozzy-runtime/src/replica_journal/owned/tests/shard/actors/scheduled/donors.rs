@@ -69,6 +69,7 @@ fn recovery_freezes_an_unsent_candidate_after_intervening_commit() {
         scope: actors[0].status().scope,
         request_id: ozzy_proto::RequestId::from_bytes([95; 16]),
         nonce: ozzy_proto::RequestId::from_bytes([96; 16]),
+        nonvoting: true,
     };
     actors[0]
         .receive(&request_message(request, actor_config().sessions[2]), now)
@@ -90,6 +91,74 @@ fn recovery_freezes_an_unsent_candidate_after_intervening_commit() {
         "unpublished donor candidate retained its obsolete commit floor"
     );
     assert!(matches!(poll(pending.as_mut()), Poll::Ready(Ok(_))));
+    for actor in actors {
+        close(&mut controller, actor);
+    }
+}
+
+#[test]
+fn a_nonvoting_primary_ends_the_view_its_peers_elect_but_a_startup_probe_does_not() {
+    let (mut controller, io) = setup();
+    let (mut actors, pending) = cluster(&mut controller, &io, 0);
+    let mut pending = Box::pin(pending);
+    for _ in 0..10000 {
+        round(&mut actors, false);
+        settle(&mut controller, &[]);
+        if poll(pending.as_mut()).is_ready() {
+            break;
+        }
+    }
+    // Cut broker 0 off. Once broker 2 elects view 1, which broker 1 leads,
+    // drop broker 1's traffic to it so it keeps electing.
+    let mut now = Duration::from_secs(3);
+    for actor in &mut actors[1..] {
+        actor
+            .disconnect_session(NodeId::from_bytes([1; 16]), actor_config().sessions[0], now)
+            .unwrap();
+    }
+    for step in 0..10000 {
+        now = Duration::from_secs(3) + Duration::from_millis(step);
+        for (to, message) in collect(&mut actors, now, false) {
+            let from = message.part_slice(0).unwrap()[0];
+            if to == 2 && from == 2 && actors[2].status().scope.view == 1 {
+                continue;
+            }
+            actors[to].receive(&message, now).unwrap();
+        }
+        settle(&mut controller, &[]);
+        if actors[2].status().scope.view == 1 {
+            break;
+        }
+    }
+    let status = actors[2].status();
+    assert_eq!((status.scope.view, status.normal), (1, None));
+    let exits = |actors: &mut [Scheduled]| {
+        collect(&mut actors[2..], now, false)
+            .iter()
+            .filter(|(_, message)| opcode(message) == ozzy_proto::Opcode::ExitView)
+            .count()
+    };
+    exits(&mut actors);
+    let probe = RecoveryRequest {
+        scope: status.scope,
+        request_id: ozzy_proto::RequestId::from_bytes([97; 16]),
+        nonce: ozzy_proto::RequestId::from_bytes([98; 16]),
+        nonvoting: false,
+    };
+    let session = actor_config().sessions[1];
+    actors[2]
+        .receive(&request_from(1, probe, session), now)
+        .unwrap();
+    assert_eq!(exits(&mut actors), 0, "a startup probe still votes");
+    let recovering = RecoveryRequest {
+        request_id: ozzy_proto::RequestId::from_bytes([99; 16]),
+        nonvoting: true,
+        ..probe
+    };
+    actors[2]
+        .receive(&request_from(1, recovering, session), now)
+        .unwrap();
+    assert_ne!(exits(&mut actors), 0, "a nonvoting primary cannot install");
     for actor in actors {
         close(&mut controller, actor);
     }
@@ -129,6 +198,7 @@ fn replace_while_pinning(disconnect: bool) {
         scope: actors[0].status().scope,
         request_id: ozzy_proto::RequestId::from_bytes([42; 16]),
         nonce: ozzy_proto::RequestId::from_bytes([91; 16]),
+        nonvoting: true,
     };
     let old = actor_config().sessions[2];
     let new = LinkSessionId::from_bytes([62; 16]);
@@ -213,9 +283,14 @@ fn observe(actor: &mut Scheduled) {
 }
 
 fn request_message(request: RecoveryRequest, session: LinkSessionId) -> Message {
+    request_from(2, request, session)
+}
+
+/// RECOVERY from broker `sender` over `session`.
+fn request_from(sender: u8, request: RecoveryRequest, session: LinkSessionId) -> Message {
     let mut metadata = [0; 1024];
     let encoded = wire::encode_recovery(
-        NodeId::from_bytes([3; 16]),
+        NodeId::from_bytes([sender + 1; 16]),
         session,
         request,
         &mut metadata,
@@ -223,7 +298,7 @@ fn request_message(request: RecoveryRequest, session: LinkSessionId) -> Message 
     )
     .unwrap();
     Message::multipart([
-        bytes::Bytes::from_static(&[3; 16]),
+        bytes::Bytes::copy_from_slice(&[sender + 1; 16]),
         bytes::Bytes::copy_from_slice(&encoded.header),
         bytes::Bytes::copy_from_slice(&metadata[..encoded.metadata_bytes]),
         bytes::Bytes::new(),

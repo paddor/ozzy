@@ -104,6 +104,9 @@ pub struct CanonicalPartition {
     pub dedup_window_millis: Option<std::num::NonZeroU64>,
     /// Confirmed or speculative replicated deduplication clock watermark.
     pub dedup_time: u64,
+    /// Highest epoch of any retired producer session, zero before the first.
+    /// A recreated session starts above it, so no retired epoch returns.
+    pub retired_epoch: u64,
 }
 
 impl CanonicalPartition {
@@ -245,6 +248,10 @@ enum Mutation {
         partition: PartitionIncarnation,
         producer: ProducerId,
         floor: ProducerSequence,
+    },
+    RetireProducer {
+        partition: PartitionIncarnation,
+        producer: ProducerId,
     },
     DedupTime {
         partition: PartitionIncarnation,

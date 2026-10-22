@@ -107,6 +107,7 @@ fn recovery_request(scope: ozzy_replication::Scope) -> (RecoveryRequest, Message
         scope,
         request_id: RequestId::from_bytes([42; 16]),
         nonce: RequestId::from_bytes([91; 16]),
+        nonvoting: true,
     };
     (
         request,

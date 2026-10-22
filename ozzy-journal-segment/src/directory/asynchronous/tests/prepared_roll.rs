@@ -27,7 +27,7 @@ pub(super) async fn roll_real(journal: Journal) -> Journal {
         .unwrap();
     segment.zero_range(0..32768).await.unwrap();
     let (pending, work) = journal
-        .begin_owned_roll_with(32768, 4, Some(segment))
+        .begin_owned_roll_with(32768, 4, LogPosition::GENESIS, Some(segment))
         .unwrap();
     pending.complete(work.publish().await).unwrap()
 }
@@ -48,7 +48,7 @@ fn async_detached_roll_keeps_written_predecessor_readable_until_exact_installati
     let selected = journal.current();
     let mut history = journal.freeze_written_history(32768).unwrap();
     let (mut pending, work) = journal
-        .begin_owned_roll_with(32768, 4, Some(segment))
+        .begin_owned_roll_with(32768, 4, LogPosition::GENESIS, Some(segment))
         .unwrap();
     let following = CanonicalOperation {
         body: &[2; 16],
@@ -110,7 +110,9 @@ fn async_roll_preserves_data_sync_and_an_occupied_successor_cannot_publish() {
             )
             .unwrap();
         }
-        let (pending, work) = journal.begin_owned_roll(32768, 1).unwrap();
+        let (pending, work) = journal
+            .begin_owned_roll(32768, 1, LogPosition::GENESIS)
+            .unwrap();
         let mut data_sync = false;
         let completed = drive_with(&mut controller, work.publish(), |op| {
             if let Operation::Open {
@@ -173,7 +175,7 @@ fn async_prepared_files_are_pinned_and_failed_or_canceled_zeroing_is_never_selec
         }
         assert!(drive(&mut controller, segment.zero_range(0..4096)).is_err());
         let (pending, work) = journal
-            .begin_owned_roll_with(32768, 4, Some(segment))
+            .begin_owned_roll_with(32768, 4, LogPosition::GENESIS, Some(segment))
             .unwrap();
         let completed = drive(&mut controller, work.publish());
         let mut journal = pending.complete(completed).unwrap();
@@ -214,9 +216,11 @@ fn async_detached_roll_rejects_foreign_results_and_probes_past_stale_preparation
     )
     .unwrap();
     let (left, left_work) = journal
-        .begin_owned_roll_with(32768, 4, Some(segment))
+        .begin_owned_roll_with(32768, 4, LogPosition::GENESIS, Some(segment))
         .unwrap();
-    let (right, right_work) = other.begin_owned_roll(32768, 4).unwrap();
+    let (right, right_work) = other
+        .begin_owned_roll(32768, 4, LogPosition::GENESIS)
+        .unwrap();
     let left_done = drive(&mut controller, left_work.publish());
     let right_done = drive(&mut controller, right_work.publish());
     assert!(left.complete(right_done).is_err());
@@ -235,7 +239,7 @@ fn async_detached_roll_rejects_foreign_results_and_probes_past_stale_preparation
     assert_eq!(journal.writer.header().segment_id(), 3);
     drive(&mut controller, append_confirmed(&mut journal));
     let (pending, work) = journal
-        .begin_owned_roll_with(32768, 4, Some(stale))
+        .begin_owned_roll_with(32768, 4, LogPosition::GENESIS, Some(stale))
         .unwrap();
     let journal = pending
         .complete(drive(&mut controller, work.publish()))
@@ -249,7 +253,9 @@ fn async_detached_roll_failure_preserves_old_readable_image_and_requires_reopen(
     drive(&mut controller, append_confirmed(&mut journal));
     let io = journal.access.io.clone();
     let current = journal.current();
-    let (pending, work) = journal.begin_owned_roll(32768, 4).unwrap();
+    let (pending, work) = journal
+        .begin_owned_roll(32768, 4, LogPosition::GENESIS)
+        .unwrap();
     let mut failed = false;
     let completed = drive_with(&mut controller, work.publish(), |op| {
         if let Operation::Rename { destination, .. } = op
@@ -290,7 +296,12 @@ fn async_preparation_and_roll_crash_cuts_preserve_confirmed_predecessor() {
                         } else {
                             None
                         };
-                        let (pending, work) = journal.begin_owned_roll_with(32768, 4, segment)?;
+                        let (pending, work) = journal.begin_owned_roll_with(
+                            32768,
+                            4,
+                            LogPosition::GENESIS,
+                            segment,
+                        )?;
                         pending.complete(work.publish().await)
                     },
                     cut,
@@ -310,4 +321,58 @@ fn async_preparation_and_roll_crash_cuts_preserve_confirmed_predecessor() {
             assert!(finished);
         }
     }
+}
+
+/// A roll commits the applied prefix, inside the sealed segment or at its
+/// end, so a restart keeps it. An older applied prefix keeps the published
+/// commit. A forked or undurable one fails before any work.
+#[test]
+fn async_roll_publishes_the_applied_commit() {
+    let (mut controller, mut journal) = empty_journal();
+    drive(&mut controller, append_confirmed(&mut journal));
+    let first = journal.accepted_position().unwrap();
+    drive(&mut controller, append_confirmed(&mut journal));
+    let second = journal.accepted_position().unwrap();
+    let forked = LogPosition {
+        digest: first.digest,
+        ..second
+    };
+    assert!(matches!(
+        journal.rolled_commit(forked),
+        Err(DirectoryError::PositionMismatch(2))
+    ));
+    let ahead = LogPosition {
+        op_number: 3,
+        ..second
+    };
+    assert!(matches!(
+        journal.rolled_commit(ahead),
+        Err(DirectoryError::PositionNotDurable(3))
+    ));
+    let (pending, work) = journal.begin_owned_roll(32768, 4, first).unwrap();
+    let mut journal = pending
+        .complete(drive(&mut controller, work.publish()))
+        .unwrap();
+    assert_eq!(journal.committed_position().unwrap(), first);
+    assert_eq!(journal.manifest.accepted, first);
+    assert_eq!(journal.rolled_commit(LogPosition::GENESIS).unwrap(), first);
+    assert!(matches!(
+        journal.rolled_commit(LogPosition {
+            digest: second.digest,
+            ..first
+        }),
+        Err(DirectoryError::HardStateRegression)
+    ));
+    drive(&mut controller, append_confirmed(&mut journal));
+    let third = journal.accepted_position().unwrap();
+    let (pending, work) = journal.begin_owned_roll(32768, 4, third).unwrap();
+    let journal = pending
+        .complete(drive(&mut controller, work.publish()))
+        .unwrap();
+    assert_eq!(journal.committed_position().unwrap(), third);
+    drop(journal);
+    let (mut controller, io) = setup(controller.crash(true).unwrap().0);
+    let journal = drive(&mut controller, open(io, 2)).unwrap();
+    assert_eq!(journal.committed_position().unwrap(), third);
+    assert_eq!(journal.accepted_position().unwrap(), third);
 }

@@ -39,7 +39,9 @@ fn spare_image() -> Image {
 }
 
 fn roll(controller: &mut Controller, journal: Journal) -> Journal {
-    let (pending, work) = journal.begin_owned_roll(32768, 4).unwrap();
+    let (pending, work) = journal
+        .begin_owned_roll(32768, 4, LogPosition::GENESIS)
+        .unwrap();
     pending.complete(drive(controller, work.publish())).unwrap()
 }
 
@@ -125,7 +127,8 @@ fn roll_from_the_spare_crash_cuts_keep_confirmed_history() {
             let done = super::recovery::run_cut(
                 &mut controller,
                 async {
-                    let (pending, work) = journal.begin_owned_roll(32768, 4)?;
+                    let (pending, work) =
+                        journal.begin_owned_roll(32768, 4, LogPosition::GENESIS)?;
                     let mut journal = pending.complete(work.publish().await)?;
                     append_confirmed(&mut journal).await;
                     Ok::<_, DirectoryError>(journal)
@@ -213,12 +216,16 @@ async fn real_files_roll_into_the_spare_with_either_backend() {
         }
         let spare = path.join("segments/spare.log");
         std::fs::copy(path.join("segments/1.log"), &spare).unwrap();
-        let (pending, work) = journal.begin_owned_roll(32768, 4).unwrap();
+        let (pending, work) = journal
+            .begin_owned_roll(32768, 4, LogPosition::GENESIS)
+            .unwrap();
         let mut journal = pending.complete(work.publish().await).unwrap();
         assert!(!spare.exists());
         append_confirmed(&mut journal).await;
         // Seal the reused file with old groups past its end.
-        let (pending, work) = journal.begin_owned_roll(32768, 4).unwrap();
+        let (pending, work) = journal
+            .begin_owned_roll(32768, 4, LogPosition::GENESIS)
+            .unwrap();
         let journal = pending.complete(work.publish().await).unwrap();
         drop(journal);
         backend.shutdown().await;
@@ -242,6 +249,7 @@ fn an_installed_suffix_takes_the_spare() {
     let replacement = crate::SuffixReplacement {
         expected_current: journal.current(),
         protected_committed: protected,
+        retained: protected,
         promised_view: 2,
         last_normal_view: 2,
         committed: protected,

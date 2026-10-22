@@ -30,7 +30,9 @@ Ozzy frames. Transport receipt is never record confirmation.
   limits, and per-partition group, configuration epoch, incarnation, and
   policy. Topic config `partitions` sets the count (default 16).
 - Keyed routing is `XXH3-64(key, seed) % count`. Keyless placement is sticky
-  within SDK batching. Routing precedes sequencing; retries keep the partition.
+  within SDK batching. An explicit numeric partition bypasses both choices;
+  an unknown number fails locally before admission, without fallback.
+  Routing precedes sequencing; retries keep the partition across leader changes.
 - One APPEND carries one producer, epoch, and partition. Producers share
   partition offsets but keep independent sequences.
 - HELLO establishes a broker link, not partition ownership. Groups have one
@@ -241,10 +243,14 @@ with tag `u8=1`. Payload is empty except for APPEND.
 
 OPEN_PRODUCER:
 
-- Mode `0` resume returns the current session, or creates epoch 1 on an
-  unused partition; an expected epoch must match. Mode `1` fence requires an
-  expected epoch and commits a newer one. Mode `2` create forbids an expected
-  epoch and rejects existing identities.
+- Mode `0` resume returns the current session, or creates one when none is
+  live: epoch 1, or one above every retired epoch on the partition. An
+  expected epoch must match. Mode `1` fence requires an expected epoch and
+  commits a newer one. Mode `2` create forbids an expected epoch and rejects
+  existing identities.
+- The leader retires a session with no open or append for the topic's
+  `producer_idle_secs`, retry results included. Its later requests fail with
+  code 6, like a fenced session's.
 - Retries keep the operation ID. The latest transition identity survives
   checkpoints and history retirement. The reply follows confirmation.
 - The retry floor (at most the next sequence) is the exclusive sequence below
@@ -441,9 +447,11 @@ Rules:
   captures the resume cursor, and fences older revisions.
 - A later join of the same member ID fences the earlier instance. A
   coordinator that no longer holds the join's group ID replies status `3`.
-- A target is activatable once its prior instance released it, left, timed
-  out, or passed the drain deadline. A new coordinator leader treats prior
-  ownership as unknown until a report or a full drain deadline.
+- A target is activatable once every older owner released it, left, timed
+  out, or passed the drain deadline. The owner can be older than the prior
+  member when a target moves again before it activates. A new coordinator
+  leader treats each member's ownership as unknown until its report or a
+  full drain deadline.
 - A repeated plan revision returns the original epoch and cursor. Older
   revisions and fenced joins fail with code 6; a different owner for the same
   revision with code 8; a creation offset outside confirmed retained history
@@ -496,11 +504,11 @@ voter, session, and configuration must match. Decoding grants no trust.
 | OPS | 196 + 86*N | Source descriptor, predecessor op position, list of canonical operation descriptors |
 | PREPARE_OK | 120 | Contiguous durable op position |
 | COMMIT | 120 | Committed op position |
-| EXIT_VIEW | 80 | View to leave in Authority: the sender's current view, or an older view it left, answering a peer's request; volatile timeout suspicion, no additional fields |
+| EXIT_VIEW | 80 | View to leave in Authority: the sender's current view, or an older view it left, answering a peer's request; volatile suspicion, no additional fields |
 | START_VIEW_CHANGE | 80 | Proposed view in Authority; no additional fields |
 | DO_VIEW_CHANGE | 184 | Frozen writer generation `u128`, last normal view `u64`, accepted end, commit floor |
 | START_VIEW | 176 | Installed writer generation `u128`, selected accepted end, commit floor |
-| RECOVERY | 96 | Fresh recovery-attempt nonce `u128`; correlated request ID in envelope |
+| RECOVERY | 97 | Fresh recovery-attempt nonce `u128`, nonvoting `u8` (0 restart probe, 1 nonvoting copy); correlated request ID in envelope |
 | RECOVERY_STATE | 97, 194, or 350 | Echoed nonce `u128`, primary tag `u8`; if primary: writer generation `u128`, accepted and commit `OpPosition` |
 | FETCH_OPS | 200 | Source descriptor, predecessor op position, maximum operations `u32`, maximum canonical body bytes `u32` |
 
@@ -561,12 +569,17 @@ History source is `voter_id:u128, writer_generation:u128, accepted:OpPosition`.
   comes from that source, and matches scope, session, predecessor, and limits.
 - Nonzero count and byte limits are ceilings. Empty responses and requests at
   or beyond the tail fail.
+- A history lookup starts at the prefix it expects. A source that does not
+  hold that predecessor answers HISTORY_RETIRED with its retained boundary,
+  possibly genesis, and the lookup rescans from there.
 - Verified transfer is neither installation nor commit.
 
 ### Lost-state recovery
 
 The RECOVERY view is a hint. RECOVERY_STATE echoes request ID and nonce
-under the responder's normal view. Only active normal voters answer.
+under the responder's normal view. Only active normal voters answer. A voter
+in an election treats a nonvoting RECOVERY from that view's primary as
+suspicion of the view; a restart probe still votes.
 
 | RECOVERY_STATE field | Offset / size |
 | --- | --- |
@@ -592,8 +605,9 @@ under the responder's normal view. Only active normal voters answer.
   private until schema, digest, and original anchor validate.
 - HISTORY_RETIRED (`0x55`) is uncorrelated, with 137 metadata bytes and empty
   payload: common prefix, fence tag `u8` (0 receive epoch, 1 fetch ID),
-  receive epoch or fetch ID `16`, retained predecessor `40`. It tells a
-  receiver to withdraw into recovery and grants no authority. See
+  receive epoch or fetch ID `16`, retained predecessor `40`. Only a fetch
+  fence may name genesis. It tells a receiver to withdraw into recovery, or a
+  lookup to rescan from the boundary, and grants no authority. See
   [retained history](REPLICATION.md#retained-history).
 
 ## Admin console
@@ -669,7 +683,7 @@ Diagnostics never determine behavior; unknown codes keep raw detail.
 | 7 | Invalid sequence, processing cursor, or group start outside confirmed retained history | permanent |
 | 8 | Retry identity conflicts with retained records | permanent |
 | 9 | Retry or processing history expired | permanent |
-| 10 | Capacity unavailable, including dedup identity capacity, or earlier writer sequences missing | after-backoff |
+| 10 | Capacity unavailable, including a full partition journal, dedup identity capacity, or earlier writer sequences missing | after-backoff |
 | 11 | Storage/validation uncertainty | unknown-outcome |
 | 12 | Writer not admitted by current primary, or reader broker unavailable | after-authority-refresh |
 | 13 | Authority changed after admission | unknown-outcome |

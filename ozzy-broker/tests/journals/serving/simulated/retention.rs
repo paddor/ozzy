@@ -190,6 +190,97 @@ async fn lagging_follower() {
     }
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn disk_quorum_live_follower_behind_retention_recovers_without_a_restart() {
+    live_follower_behind_retention().await;
+}
+
+async fn live_follower_behind_retention() {
+    let runtime = WriterRuntime::new().unwrap();
+    let root = PathBuf::from(format!("/ozzy-live-retained-lag-{}", Uuid::now_v7()));
+    let deployment = deployment_with(&root, DeploymentMode::Three, 1, |config| {
+        config.topics.get_mut("orders").unwrap().retention = TopicRetention {
+            max_age_secs: None,
+            max_bytes: Some(1024 * 1024),
+        };
+    });
+    let nodes = deployment
+        .iter()
+        .map(|(checked, _)| {
+            ozzy_proto::NodeId::from_bytes(*checked.identity.brokers[&checked.plan.name].as_bytes())
+        })
+        .collect::<Vec<_>>();
+    let directories = deployment
+        .iter()
+        .map(|(checked, _)| checked.plan.partitions[0].directory.clone())
+        .collect::<Vec<_>>();
+    let producer = role_links(&runtime, &deployment[0].0, handshake::PRODUCER).await;
+    let consumer = role_links(&runtime, &deployment[0].0, handshake::CONSUMER).await;
+    let (mut brokers, mut controls, mut images) =
+        start_images(runtime.context().clone(), deployment, true).await;
+    let mut writer = live_many(
+        &brokers,
+        "open live retained lag writer",
+        SharedTopicWriter::open(
+            &producer,
+            "orders",
+            SharedTopicWriterConfig::new(limits()),
+            RetryPolicy::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    append_one(&brokers, &mut writer, 1).await;
+    let routes = producer.routes(writer.metadata().clone()).await.unwrap();
+    let leader = routes.route(0).unwrap().unwrap().leader.unwrap();
+    let mut followers = (0..3).filter(|&index| nodes[index] != leader);
+    let (lagging, other) = (followers.next().unwrap(), followers.next().unwrap());
+    // The lagging copy keeps running and receiving, but writes nothing. It
+    // holds at most two windows of 256 operations past its durable tail.
+    controls[lagging].hold_record_writes(true);
+    let tail = stopped_tail(&controls[lagging].image().await, &directories[lagging]) + 512;
+    let mut number = 1;
+    loop {
+        for _ in 0..50 {
+            number += 1;
+            append_one(&brokers, &mut writer, number).await;
+        }
+        let mut all = true;
+        for index in (0..3).filter(|&index| index != lagging) {
+            all &= retired_past(&controls[index].image().await, &directories[index], tail);
+        }
+        if all {
+            break;
+        }
+        assert!(number < 5000, "retention never passed the lagging copy");
+    }
+    controls[lagging].hold_record_writes(false);
+    let recovered = recovered(&brokers, &controls[lagging], &directories[lagging]).await;
+    joined(
+        &brokers,
+        &controls[lagging],
+        &directories[lagging],
+        recovered.last_normal_view,
+    )
+    .await;
+    // Confirmation now needs the recovered copy.
+    brokers.remove(other).shutdown().await.unwrap();
+    controls.remove(other);
+    images.remove(other).await.unwrap();
+    number += 1;
+    append_one(&brokers, &mut writer, number).await;
+    read_retained(&brokers, &consumer, number as u64, ReaderStart::Earliest).await;
+    writer.close().await.unwrap();
+    producer.shutdown().await.unwrap();
+    consumer.shutdown().await.unwrap();
+    for broker in brokers {
+        broker.shutdown().await.unwrap();
+    }
+    for image in images {
+        image.await.unwrap();
+    }
+}
+
 /// Wait until every listed copy retired the history through `tail`.
 async fn retired(
     brokers: &[Broker],
@@ -328,6 +419,10 @@ async fn restart_with_ancient_replica() {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
     }
+    // The first election, with the ancient copy and one healthy copy,
+    // expires without selecting the ancient history. The next view's primary
+    // is the ancient copy. It withdraws into recovery, and its recovery
+    // requests end that view without its doubled election deadline.
     let mut writer = live_many(
         &brokers,
         "resume with ancient replica after complete cluster restart",

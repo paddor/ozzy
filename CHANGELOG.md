@@ -2,6 +2,184 @@
 
 ## [Unreleased]
 
+### Breaking
+
+- A topic's `retention.max_bytes` may cover at most 224 segments, seven
+  eighths of the 256-segment partition limit. A larger target filled the
+  partition before retention started.
+- The re-exported `Context` and `Endpoint` come from the omq-tokio 0.30
+  release instead of a 0.29 Git revision.
+
+### Changed
+
+- A partition manifest publication reads only the headers of segments it adds
+  or changes, not every selected segment. Segment rolls, packing, retention,
+  and view changes no longer cost four file operations per selected segment;
+  a view change over many segments on slow disks finishes in time.
+- Journal scans read up to one I/O chunk (at most 64 KiB) at a time, not one
+  write group. A view-change promise, restart replay, index build, or
+  retention scan over 4 KiB groups takes 16 times fewer reads.
+- A disk-quorum election whose next leader withdraws into checkpoint recovery
+  ends when that broker's recovery requests arrive, not at the doubled
+  election deadline. A complete cluster restart with an expired copy serves
+  about 4 s sooner.
+- Improve small-record producer admission and compressed APPEND validation.
+  Release binaries use ThinLTO.
+- Rust SDK `confirmed()` waits wake only for their own record, so many
+  concurrent observers no longer wake each other on every confirmation.
+- Python SDK asyncio wakeups never take the GIL on SDK or transport threads;
+  one notifier per event loop resumes woken tasks, so concurrent confirmation
+  waits scale linearly.
+- Python SDK records copy payloads on delivery; retained records no longer hold
+  Rust receive frames. Bytearray and memoryview inputs are copied once.
+- Python SDK blocking calls lease their handle while waiting, so an overlapping
+  call from another thread raises `BusyError`. Per-call fork checks no longer
+  issue a system call.
+- Python `flush` and Java `flushAsync` no longer hold the producer while
+  waiting; sends may continue.
+- Python and Java clients open producers and consumers concurrently from
+  several threads or tasks instead of rejecting overlapping opens.
+- Java multipart sends use the FFM fast path, and results ready during the
+  call complete without a common-pool handoff. Blocking waits complete their
+  own futures, and pending handles release in one native call per group.
+- Java pending records share bounded native cleanup groups, reducing per-record
+  allocation and reference-processing costs while preserving independent observers.
+- Python SDK ready operations avoid GIL handoffs and per-call waker allocation.
+  Single-buffer sends avoid intermediate payload buffers; confirmation IDs are
+  formatted only when requested.
+- Python SDK receive record/part limits are independent of producer batching,
+  defaulting to 2,048 each so larger raw publications avoid unnecessary replay.
+
+### Added
+
+- Python SDK blocking `send`, `flush`, `confirmed`, and `next` accept a
+  `timeout` in seconds and raise `TimeoutError`; nothing is admitted or
+  consumed by a timeout.
+- Java 22+ producer and consumer SDK over the shared Rust SDK, with blocking
+  and cancellable CompletableFuture APIs, explicit routing, multipart buffers,
+  confirmations, identity resume/takeover, checkpoints, reader statistics, and
+  raw/LZ4 payloads and LZ4 transport.
+- Python consumer statistics for live deliveries, replayed records, and gaps.
+- Python 3.12+ SDK with blocking and asyncio producers and consumers over the
+  Rust SDK, including explicit partitions, confirmations, producer resume,
+  multipart records, and consumer checkpoints.
+- Python SDK raw or adaptive LZ4 payload compression and OMQ `lz4+tcp://`
+  transport support.
+- Configurable Python SDK reader queue window, defaulting to 32 messages
+  to absorb bursts without unnecessary stream repair.
+- Optional per-broker ingress and egress byte limits under `topology.omq`.
+  Rates and bursts are shared across broker sockets and OMQ I/O threads;
+  exhaustion backpressures network traffic. IPC and inproc are exempt.
+- `SharedTopicWriter::send_to_partition` writes to an exact numeric partition
+  through the existing admission, batching, retry, and confirmation path.
+  Unknown numbers return `TopicWriterError::UnknownPartition` before admission.
+
+### Fixed
+
+- A partition whose journal reaches its 256-segment limit no longer stops.
+  Near the limit it refuses new records with NACK 10 (retry after backoff),
+  then producer opens and consumer progress. Trims and retention policy
+  changes still pass. A replica that fills anyway holds its writes until a
+  pack or a retirement frees a segment.
+- A follower that writes smaller groups than its leader no longer fills its
+  journal first and stalls the partition. A replica low on segments packs a
+  run of sparse sealed segments into one in the background, reading and
+  writing at most 8 MiB at a time.
+- A disk-quorum replica that missed a long history while cut off no longer
+  keeps the other two from electing a leader when the old one fails. Its
+  catch-up in the view change outlasted every election timeout and restarted
+  in each new view; history transfer and installation progress now extend
+  the view. One history scan now checks both the copy's commit and its
+  accepted prefix, so the catch-up moves the missed history at most twice,
+  not three times.
+- A view change no longer faults a replica's journal worker with "selected
+  manifest segments limit exceeded" when the installed history needs more
+  segments than are left. Installation packs sparse sealed segments at the
+  limit instead.
+- A restarted disk-quorum broker that leads the next view no longer fetches
+  every operation since the previous view change again. Its last published
+  commit can be that old after a power loss; installation now keeps the
+  accepted history the election verified, up to the selected commit.
+- After a whole-cluster power loss, disk-quorum followers no longer fetch
+  every operation since the last view change again. Each segment roll now
+  also publishes the applied commit, so a restart fetches only the history
+  since its last roll. A restarted replica's installation replays only after
+  the state its reopen rebuilt, not from its checkpoint. A simulated power
+  loss serves again after 1.7 s instead of 6.3 s.
+- A disk-quorum leader whose disk stalls now hands over to the two healthy
+  brokers after about 2 s. A stalled sync or maintenance step held new
+  writes back, so no admitted write was outstanding and nothing timed out;
+  the partition stopped until the disk recovered. Only a device that
+  completes no job stalls; a long command on a slow disk does not. A broker
+  still waiting on its own promise also no longer votes to leave a view at
+  its election deadline; with one peer's timeout, that ended views the
+  healthy pair was installing. A promise that outlasts the election timeout
+  no longer ends the view as soon as it lands.
+- A disk-quorum broker that returns after a partition no longer ends the
+  view the other two lead. They kept each other's requests to leave it from
+  before the view was ready, so the returning broker's request completed a
+  quorum. A peer's request now lapses one primary timeout after it last
+  arrives.
+- A disk-quorum backup that installs a new view no longer fetches its missed
+  history twice. It first looked up its own commit in the new leader's
+  history, which moved the same operations; the installation transfer now
+  checks that commit itself.
+- Disk-quorum view changes after a long history finish within the election
+  timeouts instead of retrying elections forever. A backup checks the new
+  leader's history from its own commit point, not from the first operation;
+  installation replays only after the replica's committed state, and the
+  promise reads only the segments holding its positions.
+- Sealed segment indexes are built in the background after each roll. View
+  changes, identity refreshes, and retry lookups no longer build them, twice
+  scanning each segment, while the partition admits nothing.
+- Identity lookups across more than four sealed segments no longer reread an
+  index file for every replayed operation.
+- A history fetch from a predecessor the source does not hold no longer stops
+  the serving partition; it answers `HISTORY_RETIRED` with its boundary.
+- A disk-quorum leader whose retention turn came due while a proposal waited
+  to start no longer leaves it waiting for the 100 ms safety sweep, and no
+  longer spends an empty round on every visit while the proposal cannot
+  start. Both counted as `partition_sweep_progress`.
+- A disk-quorum follower that refuses a proposal left from its time as leader
+  no longer leaves a due retention turn waiting for the safety sweep. Neither
+  does a leader that drops a canceled or stale waiting proposal.
+- Brokers retire producer sessions with no open or append for the topic's
+  `producer_idle_secs` (default 7 days). Each new writer adds a session to
+  every partition it writes, so the table used to fill at about one million
+  and then refuse new writers. A retired session's retry results go with it;
+  resuming its identity starts a new session with fresh sequences.
+- A consumer-group partition that moves again before its new owner activates
+  it now waits for the member that still owns it, up to the drain deadline.
+  The next owner could start while the original owner was still draining,
+  which redelivered records that member had not yet acknowledged.
+- A broker no longer stops serving when its connection monitor drops events,
+  for example during a burst of short client connections. It rebuilds its
+  connection state from the socket instead.
+- SDK broker links no longer fail with "SDK transport monitor lost events"
+  after a stall during broker reconnects. They rebuild each link's connection
+  from the socket instead.
+- A Python SDK timeout too large for the system clock waits without a deadline
+  instead of raising `PanicException`.
+- A disk-quorum leader whose retention turn came due while an operation waited
+  for a lagging follower no longer stalls the partition. The turn also held
+  history replay and donor work, so once the other follower failed the
+  operation never committed and the failed broker never recovered.
+- A disk-quorum replica that changed views while a received suffix waited for
+  memory or deduplication capacity no longer loses that suffix's arena. The
+  loss could stall the partition's next view installation or history replay.
+- A disk-quorum follower no longer fails a deduplicating partition with
+  "deduplication identity capacity exhausted" when one received suffix holds
+  both the commit that frees identity capacity and the appends that reuse it.
+  It now validates the suffix's first operation alone and the rest after that
+  operation applies.
+- Python SDK handle destruction releases the GIL while joining native threads,
+  preventing a shutdown deadlock with asyncio wakeups.
+- Java SDK futures complete exceptionally instead of waiting forever when a
+  native result cannot be delivered.
+- Java `orTimeout` and `completeOnTimeout` no longer block the JVM-wide timer
+  thread while a canceled native operation returns its lease. Client close no
+  longer joins threads on the shared binding executor.
+
 ## [0.3.0] - 2026-10-17
 
 ### Breaking

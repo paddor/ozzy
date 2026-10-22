@@ -53,7 +53,7 @@ fn lz4_sequences(input: &[u8], expected: usize) -> Option<()> {
         rest = tail;
         let literals = lz4_length(&mut rest, token >> 4)?;
         rest = rest.get(literals..)?;
-        produced = produced.checked_add(literals).filter(|&n| n <= expected)?;
+        produced = produced.checked_add(literals)?;
         if rest.is_empty() {
             return (produced == expected).then_some(());
         }
@@ -65,7 +65,9 @@ fn lz4_sequences(input: &[u8], expected: usize) -> Option<()> {
         }
         // Every match copies at least four bytes beyond its nibble.
         let matched = lz4_length(&mut rest, token & 15)?.checked_add(4)?;
-        produced = produced.checked_add(matched).filter(|&n| n <= expected)?;
+        // Lengths only increase, so exact length at the final literal run
+        // also bounds every prefix. No decoded allocation is made here.
+        produced = produced.checked_add(matched)?;
     }
 }
 
@@ -73,16 +75,27 @@ fn lz4_sequences(input: &[u8], expected: usize) -> Option<()> {
 fn lz4_length(rest: &mut &[u8], nibble: u8) -> Option<usize> {
     let mut length = usize::from(nibble);
     if nibble == 15 {
-        loop {
-            let (&extra, tail) = rest.split_first()?;
-            *rest = tail;
-            length = length.checked_add(usize::from(extra))?;
-            if extra != 255 {
-                break;
-            }
+        let (&extra, tail) = rest.split_first()?;
+        *rest = tail;
+        // One extension byte cannot overflow a four-bit initial length.
+        length = length.saturating_add(usize::from(extra));
+        if extra == 255 {
+            return lz4_long_length(rest, length);
         }
     }
     Some(length)
+}
+
+#[cold]
+fn lz4_long_length(rest: &mut &[u8], mut length: usize) -> Option<usize> {
+    loop {
+        let (&extra, tail) = rest.split_first()?;
+        *rest = tail;
+        length = length.checked_add(usize::from(extra))?;
+        if extra != 255 {
+            return Some(length);
+        }
+    }
 }
 
 pub(crate) fn encode_payload_encoding(
@@ -151,7 +164,7 @@ pub(crate) fn decode_payload_encoding<'a>(
 }
 
 /// Owned payload of a raw or whole-group LZ4 frame: the received `frame`, or
-/// its bytes decompressed into a fresh allocation without zero-filling it.
+/// its bytes decompressed into a fresh allocation.
 pub(crate) fn decode_owned_payload(
     cursor: &mut Reader<'_>,
     frame: &bytes::Bytes,

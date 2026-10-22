@@ -10,6 +10,7 @@ mod proposal;
 mod read;
 mod receiving;
 mod replay;
+mod room;
 mod shard;
 mod sync;
 mod validation;
@@ -92,6 +93,7 @@ fn config(root: &str, id: u8) -> OwnedConfig {
             cached_indexes: 2,
             concurrent_reads: 2,
         },
+        producer_idle: None,
     }
 }
 

@@ -11,6 +11,10 @@ Deterministic workload and fault tests around Ozzy production code, plus the
 - The `broker` feature is the shared real-broker harness: production SDKs and
   broker owners over OMQ inproc and the controlled `ozzy-io` memory backend.
   `ozzy-broker` integration tests and `ozzy_sim` both use it.
+- `tests/actor_cluster/` runs the production partition shards and shard
+  journals of three brokers on one thread from one seed, over modeled links,
+  disks, and clients. A failing seed prints its reproduce command; see
+  [seeded actor cluster](../DEVELOPMENT.md#seeded-actor-cluster).
 - An independent record oracle checks every submitted, confirmed, and
   delivered record.
 - Limits: it does not replace TCP/process-crash or real-disk checks. A seed
@@ -114,5 +118,6 @@ scripts/ozzy_cargo run -p ozzy-sim --features broker --bin ozzy_sim -- \
 
 - `src/soak.rs`: sustained runner, actions, report.
 - `src/broker.rs`, `src/broker/`: shared real-broker harness.
+- `src/broker/network.rs`: TCP broker fixtures shared by SDK package tests.
 - `src/client.rs`: SDK client and record oracle.
 - `src/bin/ozzy_sim.rs`: command line.

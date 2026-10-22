@@ -68,7 +68,43 @@ jobs:
         with:
           path: ozzy
       - uses: ./ozzy/.github/actions/setup
-      - run: ./scripts/ozzy_cargo publish --workspace --exclude ozzy-bench --exclude ozzy-sim --dry-run --locked
+      - run: ./scripts/ozzy_cargo publish --workspace --exclude ozzy-bench --exclude ozzy-sim --exclude ozzy-python --exclude ozzy-java --exclude ozzy-bindings --dry-run --locked
         env:
           # Cargo caches staged registry dependencies as immutable at each version.
           CARGO_TARGET_DIR: ${{ runner.temp }}/ozzy-publish-${{ github.run_id }}-${{ github.run_attempt }}
+
+  python:
+    needs: lint
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.12', '3.14']
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: ozzy
+      - uses: ./ozzy/.github/actions/setup
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install uv==0.11.8
+      - run: ./scripts/check-python.sh
+        env:
+          OZZY_PYTHON_VERSION: ${{ matrix.python-version }}
+
+  java:
+    needs: lint
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        java-version: ['22', '25']
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: ozzy
+      - uses: ./ozzy/.github/actions/setup
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java-version }}
+      - run: ./scripts/check-java.sh

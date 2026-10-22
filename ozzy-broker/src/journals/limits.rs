@@ -96,6 +96,7 @@ impl Settings {
             writeback: self.pipeline,
             write_group_bytes: self.pipeline.max_body_bytes,
             reads: self.reads,
+            producer_idle: Some(std::time::Duration::from_secs(placement.producer_idle_secs)),
         }
     }
 
@@ -195,7 +196,7 @@ impl Sizes {
         JournalLimits {
             metadata: MetadataLimits {
                 max_manifest_bytes: 64 * 1024,
-                max_segments: 256,
+                max_segments: ozzy_config::MAX_PARTITION_SEGMENTS,
             },
             decode: DecodeLimits {
                 max_groups: self.segment / WRITE_GROUP_ALIGNMENT,

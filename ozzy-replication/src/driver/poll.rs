@@ -39,7 +39,10 @@ impl ReplicaDriver {
             if self.normal().is_some() {
                 return Ok(self.exit_action());
             }
-        } else if now >= self.election_deadline {
+        } else if now >= self.election_deadline && !self.promise_pending() {
+            // A voter still waiting on its own promise has no evidence about
+            // the view. With stalled storage it would keep helping a peer's
+            // timeout end views the others are installing.
             self.request_exit()?;
         }
         if let Some(action) = self.exit_action() {

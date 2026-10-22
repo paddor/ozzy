@@ -180,6 +180,40 @@ fn terminal_failure_racing_confirmation_seals_the_real_progress_prefix() {
 }
 
 #[test]
+fn a_claimed_confirmation_observer_is_woken_or_sees_its_prefix() {
+    loom::model(|| {
+        let progress = Arc::new(progress::Progress::new(&config()));
+        let mut pool = completion::Pool::default();
+        let record = pool.allocate(ozzy_proto::MessageId::from_bytes([1; 16]));
+        let publisher = {
+            let progress = progress.clone();
+            let record = record.clone();
+            thread::spawn(move || {
+                let count = progress
+                    .confirm(0, 1, 1, |count| {
+                        record.publish(7, AppendDisposition::Stored);
+                        count
+                    })
+                    .unwrap();
+                assert_eq!(count, 1);
+                completion::published();
+                record.wake_watched();
+            })
+        };
+        let watch = record.watch().unwrap();
+        let observed = loom::future::block_on(std::future::poll_fn(|cx| {
+            watch.register(cx.waker());
+            progress.observe(1).map_or(Poll::Pending, Poll::Ready)
+        }));
+        assert!(observed.is_ok());
+        assert_eq!(record.offset(), 7);
+        drop(watch);
+        assert!(record.watch().is_some());
+        publisher.join().unwrap();
+    });
+}
+
+#[test]
 fn concurrent_admission_cancellation_and_release_restore_capacity() {
     let mut model = loom::model::Builder::new();
     model.preemption_bound = Some(2);

@@ -26,9 +26,10 @@ pub use decode::{DecodedGroup, DecodedOperation, decode_group};
 pub(crate) use decode::{decode_indexed_operation, durable_mark_ending_at, group_extent};
 pub use encode::{EncodedGroup, encode_group, encode_group_with_body_encoding};
 pub(crate) use encode::{
-    FinalizedGroup, GroupWrite, PreparedGroupBodies, finalize_group_bodies,
+    FinalizedGroup, GroupWrite, PreparedGroupBodies, aligned_group_bytes, finalize_group_bodies,
     finalize_group_descriptors, prepare_group_bodies,
 };
+pub(crate) use entry::encoded_entry_len;
 pub use error::CodecError;
 pub(crate) use extents::prepare_raw_group_extents;
 pub(crate) use header::validate_segment_capacity;

@@ -125,6 +125,7 @@ fn election_bridges_retired_commit(installed_view: u64) {
                     actor_config(),
                     crate::replica_actor::ActorIds::deterministic(
                         std::num::NonZeroU64::new(100 + index as u64).unwrap(),
+                        crate::replica_actor::ReceiptHandles::default(),
                     ),
                 )
                 .unwrap(),

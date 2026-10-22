@@ -376,6 +376,57 @@ fn idle_heartbeats_do_not_hide_stalled_outstanding_operations() {
     assert_eq!(backup.scope().view, 1);
 }
 
+/// A voter whose promise is not durable yet has no evidence about the view,
+/// so its election deadline passes without an exit vote. With stalled
+/// storage that vote ended views the others were installing.
+#[test]
+fn a_pending_promise_casts_no_exit_vote_at_the_election_deadline() {
+    let mut replica = driver(normal(1));
+    let now = timing().primary_timeout;
+    peer_exit(&mut replica, 2, now);
+    let Some(Action::PersistPromise(ticket)) = replica.poll(now).unwrap() else {
+        panic!("a durable promise comes first");
+    };
+    let late = now + timing().election_timeout;
+    for _ in 0..4 {
+        assert_eq!(replica.poll(late).unwrap(), None);
+    }
+    replica.complete_promise(ticket).unwrap();
+    let exits = (0..4).any(|_| {
+        matches!(
+            replica.poll(late).unwrap(),
+            Some(Action::Broadcast(Control::ExitView(scope))) if scope.view == 1
+        )
+    });
+    assert!(exits, "a durable promise counts its deadline again");
+}
+
+/// Other storage work can hold every write back, so nothing admitted is
+/// undurable. A primary whose busy storage completes nothing for the primary
+/// timeout still suspects itself and stops heartbeats; progress restores it.
+#[test]
+fn busy_storage_without_progress_is_suspicion_without_an_admitted_write() {
+    let mut primary = driver(normal(0));
+    let exits =
+        |action: Option<Action>| matches!(action, Some(Action::Broadcast(Control::ExitView(_))));
+    for (since, millis) in [(10, 50), (60, 109), (60, 159)] {
+        let now = Duration::from_millis(millis);
+        primary
+            .observe_storage(Some(Duration::from_millis(since)), now)
+            .unwrap();
+        assert!(!exits(primary.poll(now).unwrap()), "at {millis} ms");
+    }
+    let now = Duration::from_millis(160);
+    primary
+        .observe_storage(Some(Duration::from_millis(60)), now)
+        .unwrap();
+    assert!(exits(primary.poll(now).unwrap()));
+    assert!(primary.normal().is_some()); // One suspicion is no view change.
+    let now = Duration::from_millis(170);
+    primary.observe_storage(None, now).unwrap();
+    assert!(!exits(primary.poll(now).unwrap()));
+}
+
 #[test]
 fn dropped_election_packets_retry_at_bounded_intervals_then_advance_with_backoff() {
     let mut replica = driver(normal(1));
@@ -421,6 +472,57 @@ fn dropped_election_packets_retry_at_bounded_intervals_then_advance_with_backoff
     };
     assert_eq!(third.scope().view, 3);
     assert!(replica.normal().is_none());
+}
+
+#[test]
+fn a_recovering_election_primary_ends_its_view_before_the_deadline() {
+    // A normal follower keeps its contact deadline instead.
+    let mut follower = driver(normal(1));
+    follower
+        .observe_recovering(node(0), Duration::ZERO)
+        .unwrap();
+    assert_eq!(follower.poll(Duration::ZERO).unwrap(), None);
+    let changing = ViewChange::recover_intact(
+        configuration(),
+        node(1),
+        JournalGeneration(101),
+        RecoveredState {
+            scope: Scope {
+                view: 2,
+                ..configuration().scope()
+            },
+            log: FrozenLog {
+                last_normal_view: 2,
+                accepted: operation().prefix(),
+                committed: Prefix::GENESIS,
+            },
+        },
+        PipelineLimits {
+            max_operations: 8,
+            max_body_bytes: 1024,
+        },
+    )
+    .unwrap();
+    let mut replica = ReplicaDriver::from_view_change(changing, Duration::ZERO, timing()).unwrap();
+    let now = Duration::ZERO;
+    persist(&mut replica, now);
+    assert_eq!(replica.scope().view, 3, "voter 0 leads this view");
+    start(&mut replica, now);
+    // Another voter's recovery says nothing about this view's primary.
+    replica.observe_recovering(node(2), now).unwrap();
+    assert_eq!(replica.poll(now).unwrap(), None);
+    replica.observe_recovering(node(0), now).unwrap();
+    assert!(matches!(
+        replica.poll(now).unwrap(),
+        Some(Action::Broadcast(Control::ExitView(scope))) if scope.view == 3
+    ));
+    assert_eq!(replica.scope().view, 3, "one suspicion cannot leave a view");
+    // The other healthy voter's suspicion ends the view long before its deadline.
+    peer_exit(&mut replica, 2, now);
+    let Some(Action::PersistPromise(next)) = replica.poll(now).unwrap() else {
+        panic!("the healthy voters leave the recovering primary's view");
+    };
+    assert_eq!(next.scope().view, 4);
 }
 
 #[test]

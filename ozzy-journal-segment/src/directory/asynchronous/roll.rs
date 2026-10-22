@@ -1,7 +1,7 @@
 use super::{DirectoryError, Journal};
 use crate::directory::segment_name;
 use crate::{
-    ChainPosition, CodecError, Digest, Manifest, SEGMENT_HEADER_BYTES, SealedSegment,
+    ChainPosition, CodecError, Digest, LogPosition, Manifest, SEGMENT_HEADER_BYTES, SealedSegment,
     SegmentHeader, SegmentReference, SegmentStart, SegmentWriter, WriterError,
     encode_manifest_with_limits,
 };
@@ -88,6 +88,7 @@ pub(super) fn validate_buffered_roll_state(
 pub(super) fn roll_manifest_after(
     manifest: &Manifest,
     boundary: RollBoundary,
+    committed: LogPosition,
     next_segment_id: u64,
     new_capacity: u64,
 ) -> Result<Manifest, DirectoryError> {
@@ -97,6 +98,11 @@ pub(super) fn roll_manifest_after(
         .checked_add(1)
         .ok_or(DirectoryError::ManifestGeneration)?;
     next.parent_generation = manifest.generation;
+    // Accepted history covers the commit. The sealed bytes protect both.
+    next.committed = committed;
+    if committed.op_number > next.accepted.op_number {
+        next.accepted = committed;
+    }
     next.segments
         .last_mut()
         .ok_or(DirectoryError::MissingActiveSegment)?
@@ -137,7 +143,13 @@ impl Journal {
                 .ok_or(DirectoryError::SegmentIdExhausted)?;
             let header =
                 boundary.successor_header(self.manifest.identity.group_id, segment, capacity)?;
-            let next = roll_manifest_after(&self.manifest, boundary, segment, capacity)?;
+            let next = roll_manifest_after(
+                &self.manifest,
+                boundary,
+                self.manifest.committed,
+                segment,
+                capacity,
+            )?;
             encode_manifest_with_limits(&next, self.limits.metadata)?;
             let writer = SegmentWriter::create(
                 self.access

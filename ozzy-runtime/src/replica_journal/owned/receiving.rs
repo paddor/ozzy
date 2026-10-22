@@ -382,6 +382,7 @@ impl OwnedJournal {
             writeback: self.writeback.limits,
             write_group_bytes: self.writeback.group_bytes,
             reads: self.read_limits,
+            producer_idle: self.retention.idle.expiry(),
         };
         Ok((config, journal.backend(), self.append_memory.clone()))
     }

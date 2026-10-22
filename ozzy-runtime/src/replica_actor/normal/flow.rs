@@ -420,7 +420,9 @@ impl ReplicaActor {
                 .map_err(TransmitError::from)?;
             self.restart_receipt(now);
         }
-        self.work.receive.reset();
+        for buffer in self.work.receive.reset().into_iter().flatten() {
+            self.recycle(buffer)?;
+        }
         Ok(())
     }
 
@@ -466,7 +468,7 @@ impl ReplicaActor {
                     voter,
                     channel,
                     session,
-                    handle: crate::replica_actor::ActorIds::compact_handle()?,
+                    handle: self.ids.compact_handle()?,
                     established: false,
                 };
                 self.work.flow.local_handle = Some(bound);

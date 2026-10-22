@@ -26,6 +26,10 @@ pub struct BrokerPlan {
     pub name: String,
     /// Validated OMQ transport worker count.
     pub omq_io_threads: usize,
+    /// Aggregate incoming network byte allowance across broker sockets.
+    pub omq_ingress: Option<crate::ByteRateLimit>,
+    /// Aggregate outgoing network byte allowance across broker sockets.
+    pub omq_egress: Option<crate::ByteRateLimit>,
     /// Validated transport-owner affinity.
     pub dispatcher: Affinity,
     /// Application owners and their local budgets.
@@ -80,6 +84,8 @@ pub struct PartitionPlacement {
     pub retention: crate::TopicRetention,
     /// Optional per-partition deduplication policy and index resource bounds.
     pub deduplication: Option<crate::TopicDeduplication>,
+    /// Idle producer session expiry in seconds.
+    pub producer_idle_secs: u64,
 }
 
 impl ValidatedDeployment {
@@ -109,6 +115,8 @@ impl ValidatedDeployment {
         Ok(BrokerPlan {
             name: name.to_owned(),
             omq_io_threads: broker.topology.omq.io_threads,
+            omq_ingress: broker.topology.omq.ingress,
+            omq_egress: broker.topology.omq.egress,
             dispatcher: broker.topology.dispatcher.clone(),
             controllers: self.controller_plans(name)?,
             memory_pools: broker.topology.memory_pools.clone(),
@@ -155,6 +163,7 @@ impl ValidatedDeployment {
                     partition,
                     retention: topic.retention,
                     deduplication: topic.deduplication,
+                    producer_idle_secs: topic.producer_idle_secs,
                     shard: shard.id,
                     device: shard.device.clone(),
                     directory: broker

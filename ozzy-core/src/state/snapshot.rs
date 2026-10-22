@@ -44,7 +44,7 @@ const SNAPSHOT_DIGEST_END: usize = 88;
 const SNAPSHOT_HASH_CONTEXT: &str = "ozzy canonical state snapshot v1";
 const SNAPSHOT_SCHEMA_CONTEXT: &str = "ozzy canonical state snapshot schema";
 const SNAPSHOT_SCHEMA: &[u8] =
-    b"OZYSTA01:256:partition104-dedup-time-and-window+names+producer80+retry-span40-stored-or-proof-op:progress48:assignment80-plan-and-resume:coordinator-group-plan:network-order";
+    b"OZYSTA01:256:partition112-dedup-time-and-window-retired-epoch+names+producer80+retry-span40-stored-or-proof-op:progress48:assignment80-plan-and-resume:coordinator-group-plan:network-order";
 const RETENTION_MAX_AGE: u32 = 1 << 0;
 const RETENTION_MAX_BYTES: u32 = 1 << 1;
 

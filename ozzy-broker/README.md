@@ -31,6 +31,8 @@ flags.
 
 Features `lz4-transport` and `zstd-transport` serve `lz4+tcp://` and
 `zstd+tcp://` endpoints.
+Optional ingress and egress byte limits under `topology.omq` backpressure
+aggregate broker network traffic; see the configuration keys below.
 
 ## Entry points
 

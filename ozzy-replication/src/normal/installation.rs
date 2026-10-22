@@ -11,7 +11,7 @@ impl NormalReplica {
     /// activate it after exact publication and application completion.
     pub(crate) fn validate_install(
         &self,
-        ticket: crate::InstallTicket,
+        ticket: &crate::InstallTicket,
         operations: &[PreparedOperation],
     ) -> Result<usize, ReplicationError> {
         let (previous, body_bytes) =
@@ -24,7 +24,7 @@ impl NormalReplica {
 
     pub(crate) fn validate_install_chunk(
         &self,
-        ticket: crate::InstallTicket,
+        ticket: &crate::InstallTicket,
         mut previous: Prefix,
         operations: &[PreparedOperation],
     ) -> Result<(Prefix, usize), ReplicationError> {
@@ -66,7 +66,7 @@ impl NormalReplica {
 
     pub(crate) fn stage_install(
         mut self,
-        ticket: crate::InstallTicket,
+        ticket: &crate::InstallTicket,
         operations: &[PreparedOperation],
         start: crate::StartView,
         body_bytes: usize,

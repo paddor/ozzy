@@ -8,8 +8,8 @@ use super::{Action, DriverError, ReplicaDriver, Role};
 use crate::wire::Control;
 use crate::{
     Commit, Digest, InstallOutcome, InstallTicket, InstallingView, JournalGeneration, LogSource,
-    OpNumber, Prefix, PreparedOperation, ReceivedStart, ReplicationError, Scope, StartView,
-    ViewChangeError, VoterSet,
+    Prefix, PreparedOperation, ReceivedStart, ReplicationError, Scope, StartView, ViewChangeError,
+    VoterSet,
 };
 
 /// Whole-tail commit authority captured before worker-side image activation.
@@ -121,7 +121,7 @@ impl ReplicaDriver {
         from: NodeId,
         start: StartView,
         generation: JournalGeneration,
-        lookup: impl FnMut(LogSource, OpNumber) -> Option<Digest>,
+        lookup: impl FnMut(LogSource, Prefix) -> Option<Digest>,
     ) -> Result<InstallTicket, DriverError> {
         self.begin_install(Some(ReceivedStart { from, start }), generation, lookup)
     }
@@ -130,7 +130,7 @@ impl ReplicaDriver {
         &mut self,
         backup: Option<ReceivedStart>,
         generation: JournalGeneration,
-        lookup: impl FnMut(LogSource, OpNumber) -> Option<Digest>,
+        lookup: impl FnMut(LogSource, Prefix) -> Option<Digest>,
     ) -> Result<InstallTicket, DriverError> {
         self.changing()?;
         let Role::ViewChanging(changing) = self.take_role() else {
@@ -163,6 +163,24 @@ impl ReplicaDriver {
         operations: &[PreparedOperation],
     ) -> Result<(), DriverError> {
         Ok(self.installing_mut()?.validate_suffix(operations)?)
+    }
+
+    /// Note progress of this view's election or installation: a looked-up
+    /// batch, a staged chunk, or a local promise or installation I/O still
+    /// running. A lagging copy moves and replays its whole missed suffix in
+    /// the view change, and a slow disk's promise can take as long, which can
+    /// outlast any election timeout, so each advance pushes the local
+    /// election deadline out by one election delay. Peer
+    /// suspicion still counts; two other voters can leave the view without
+    /// this one.
+    pub fn history_progress(&mut self, now: Duration) -> Result<(), DriverError> {
+        self.observe_time(now)?;
+        if matches!(self.role, Role::ViewChanging(_) | Role::Installing(_)) {
+            self.election_deadline = self
+                .election_deadline
+                .max(now.saturating_add(self.election_delay));
+        }
+        Ok(())
     }
 
     /// Finish actual selected-log publication and committed application recovery.

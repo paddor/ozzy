@@ -694,3 +694,111 @@ fn rejected_installation_returns_fenced_ownership_for_missing_data_and_stale_ret
     assert_eq!(backup.snapshot().scope.view, 1);
     assert_eq!(backup.snapshot().committed.op, OpNumber(2));
 }
+
+/// A streamed backup installation looks up neither its own commit nor an
+/// announced commit above it: staging streams the source from the one past
+/// the other. An announced commit below its own is looked up in its local
+/// history. A supplied suffix still needs both looked up in the source.
+#[test]
+fn streamed_backup_installation_leaves_its_commit_to_the_stream() {
+    let start = finish(&mut installing(4, 100))
+        .start_view()
+        .unwrap()
+        .unwrap();
+    let committed = operations(2)[1].prefix();
+    let election = || {
+        let mut old = durable(2, 2);
+        old.receive_commit(
+            node(0),
+            Commit {
+                scope: config().scope(),
+                committed,
+            },
+        )
+        .unwrap();
+        let mut election = old.into_view_change(1).unwrap();
+        let promise = election.begin_promise().unwrap();
+        election.complete_promise(promise).unwrap();
+        election
+    };
+    let received = |start| ReceivedStart {
+        from: node(1),
+        start,
+    };
+    let asked = std::cell::RefCell::new(Vec::new());
+    let ask = |source: ozzy_replication::LogSource, prefix: Prefix| {
+        asked.borrow_mut().push((source.voter, prefix));
+        None
+    };
+    let ticket = election()
+        .begin_backup_install(received(start), JournalGeneration(200), ask)
+        .unwrap()
+        .ticket();
+    assert_eq!(ticket.retained(), committed);
+    assert_eq!(ticket.committed(), committed);
+    let error = election()
+        .install_backup(
+            received(start),
+            JournalGeneration(200),
+            &operations(4)[2..],
+            ask,
+        )
+        .unwrap_err();
+    assert_eq!(error.error(), Error::HistoryMissing);
+    assert_eq!(asked.take(), [(node(1), committed)]);
+    let below = StartView {
+        committed: operations(1)[0].prefix(),
+        ..start
+    };
+    let error = election()
+        .begin_backup_install(received(below), JournalGeneration(200), ask)
+        .unwrap_err();
+    assert_eq!(error.error(), Error::HistoryMissing);
+    assert_eq!(asked.take(), [(node(2), below.committed)]);
+    election()
+        .begin_backup_install(received(below), JournalGeneration(200), |_, prefix| {
+            Some(prefix.digest)
+        })
+        .unwrap();
+    let forked = StartView {
+        committed: Prefix {
+            digest: Digest::from_bytes([99; 32]),
+            ..committed
+        },
+        ..start
+    };
+    let error = election()
+        .begin_backup_install(received(forked), JournalGeneration(200), |_, _| None)
+        .unwrap_err();
+    assert_eq!(error.error(), Error::ConflictingHistory);
+}
+
+/// Primary installation of view 7 by a copy holding `local` operations, from
+/// a source of five committed through three, last normal in `normal_view`.
+fn retained_by_primary(local: u8, normal_view: u64) -> Prefix {
+    let mut candidate = promised(1, local, 7);
+    local_report(&mut candidate, 0);
+    let mut remote = remote_report(0, 5, 7);
+    remote.log.committed = operations(3)[2].prefix();
+    remote.log.last_normal_view = normal_view;
+    candidate.receive_report(node(0), remote).unwrap();
+    candidate.select(lookup).unwrap();
+    let ticket = candidate
+        .begin_primary_install(JournalGeneration(100))
+        .unwrap()
+        .ticket();
+    assert_eq!(ticket.protected_committed(), Prefix::GENESIS);
+    ticket.retained()
+}
+
+/// A primary keeps the accepted history that selection verified in the
+/// source, up to the selected commit, and stages only what follows.
+#[test]
+fn primary_install_keeps_its_verified_accepted_prefix() {
+    assert_eq!(retained_by_primary(2, 0), operations(2)[1].prefix());
+    // Past the selected commit, the commit bounds what is kept.
+    assert_eq!(retained_by_primary(4, 0), operations(3)[2].prefix());
+    // A source from a newer normal view never verified this accepted
+    // prefix, so only the protected commit stays.
+    assert_eq!(retained_by_primary(2, 4), Prefix::GENESIS);
+}
