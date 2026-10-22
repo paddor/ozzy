@@ -97,16 +97,19 @@ fn guard_rejects_overlap_compilers_and_wrong_process_groups() {
 fn stopped_broker_is_still_discovered() {
     let temp = tempfile::tempdir().unwrap();
     let exe = temp.path().join("iggy-server");
-    fs::copy("/bin/sleep", &exe).unwrap();
+    // A multicall coreutils binary picks its program from its own path, so a
+    // copied `sleep` would run nothing. The shell runs under any name and
+    // blocks reading its open stdin.
+    fs::copy("/bin/sh", &exe).unwrap();
     // Concurrent process tests can briefly inherit the copy's writable FD
     // between fork and exec. Linux returns ETXTBSY until that FD closes.
     let deadline = std::time::Instant::now() + Duration::from_secs(1);
     let mut child = loop {
-        // A multicall coreutils binary picks its program from argv[0]; the
-        // audit reads the name from the executable path.
-        let mut command = Command::new(&exe);
-        std::os::unix::process::CommandExt::arg0(&mut command, "sleep");
-        match command.arg("30").spawn() {
+        let spawned = Command::new(&exe)
+            .args(["-c", "read line"])
+            .stdin(std::process::Stdio::piped())
+            .spawn();
+        match spawned {
             Ok(child) => break child,
             Err(error)
                 if error.raw_os_error() == Some(26) && std::time::Instant::now() < deadline =>
