@@ -45,6 +45,7 @@ impl ReplicaDriver {
                 self.withdraw_exit();
             }
         }
+        self.exit_heard_at[voter] = self.now;
         self.exit_votes.insert(voter);
         self.advance_if_exit_quorum()
     }
@@ -73,6 +74,15 @@ impl ReplicaDriver {
     }
 
     fn advance_if_exit_quorum(&mut self) -> Result<(), DriverError> {
+        // A suspicious peer repeats its request every retransmission
+        // interval. One that recovered goes quiet, so its request lapses
+        // instead of helping a later timeout end a healthy view.
+        for voter in self.local.others() {
+            let heard = self.exit_heard_at[voter];
+            if self.now >= heard.saturating_add(self.timing.primary_timeout) {
+                self.exit_votes.remove(voter);
+            }
+        }
         if self.exit_votes.len() >= 2 {
             if self
                 .normal()

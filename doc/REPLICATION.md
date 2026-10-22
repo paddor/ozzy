@@ -94,9 +94,10 @@ sequenceDiagram
 
 A broker suspects the leader when contact, commit progress, or storage
 progress times out. Storage stalls when an admitted write stays undurable,
-or when any journal command, such as a sync or maintenance step, completes
-nothing for the primary timeout; it can hold new writes back. A suspicious
-leader stops heartbeats. In an election, a
+or when a journal command, such as a sync or maintenance step, is pending
+and the shard's storage lane completes no job for the primary timeout; such
+a command can hold new writes back. A long command whose jobs complete is
+not a stall. A suspicious leader stops heartbeats. In an election, a
 nonvoting recovery request from the view's primary is suspicion too: that
 primary cannot install its view. A restart's retained-history probe still
 votes and is not suspicion.
@@ -111,14 +112,17 @@ votes and is not suspicion.
 | Activation | A new-view follower vote covers the selected tail before the leader serves |
 
 - EXIT_VIEW is volatile suspicion, never a vote. One timeout cannot advance
-  views. A broker whose promise is not durable yet sends none at its
+  views. A suspicious broker repeats it every retransmission interval, and a
+  peer's request counts for one primary timeout, so a recovered peer's
+  request lapses. A broker whose promise is not durable yet sends none at its
   election deadline: it knows nothing about the view, and with stalled
   storage it would help one peer's timeout end views the others install.
 - A lagging copy fetches and replays its missed suffix inside the view
   change. Each verified lookup batch, staged chunk, or running installation
   step pushes its election deadline out by one election delay, so a
-  catch-up longer than any timeout still finishes. Peer suspicion still
-  counts.
+  catch-up longer than any timeout still finishes. A running promise does
+  the same, so a slow disk does not end the view as its promise lands.
+  Peer suspicion still counts.
 - A lookup scans the source from the checked prefix to its exact tail, and
   records every report position it passes, so a lagging copy's commit and
   accept cost one scan.

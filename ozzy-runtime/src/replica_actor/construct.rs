@@ -93,6 +93,7 @@ impl ReplicaActor {
             pending_sync: None,
             pending_persistence: VecDeque::with_capacity(config.pipeline.max_operations),
             storage_progress_at: None,
+            storage_jobs: 0,
             promise: None,
             pinned: None,
             start: None,

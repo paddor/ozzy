@@ -165,11 +165,12 @@ impl ReplicaDriver {
         Ok(self.installing_mut()?.validate_suffix(operations)?)
     }
 
-    /// Note progress of this view's selection or installation: a looked-up
-    /// batch, a staged chunk, or local installation I/O still running. A
-    /// lagging copy moves and replays its whole missed suffix in the view
-    /// change, which can outlast any election timeout, so each advance
-    /// pushes the local election deadline out by one election delay. Peer
+    /// Note progress of this view's election or installation: a looked-up
+    /// batch, a staged chunk, or a local promise or installation I/O still
+    /// running. A lagging copy moves and replays its whole missed suffix in
+    /// the view change, and a slow disk's promise can take as long, which can
+    /// outlast any election timeout, so each advance pushes the local
+    /// election deadline out by one election delay. Peer
     /// suspicion still counts; two other voters can leave the view without
     /// this one.
     pub fn history_progress(&mut self, now: Duration) -> Result<(), DriverError> {

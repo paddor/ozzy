@@ -118,11 +118,13 @@ impl Broker {
         )
     }
 
-    /// Lose power, then start again over what reached the disk: reopen the
-    /// journal under a fresh writer generation and ID namespace. The new
-    /// actor has no links until `connect`.
+    /// Lose power, or only the process without `power_loss`, then start
+    /// again over what the disk kept: reopen the journal under a fresh writer
+    /// generation and ID namespace. The new actor has no links until
+    /// `connect`.
     pub(crate) fn restart(
         self,
+        power_loss: bool,
         clock: &Clock,
         clients: usize,
         shape: Shape,
@@ -136,7 +138,11 @@ impl Broker {
         } = self;
         drop(shard);
         let incarnation = incarnation + 1;
-        let (mut disk, io) = disk.power_loss();
+        let (mut disk, io) = if power_loss {
+            disk.power_loss()
+        } else {
+            disk.process_crash()
+        };
         let (owner, startup) = disk
             .drive(OwnedJournal::open(
                 journal_config(index, shape),

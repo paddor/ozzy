@@ -17,6 +17,10 @@ use crate::{
 /// Disk completion steps per 10 ms tick.
 const DISK_STEPS: u64 = 10;
 
+/// Mean disk completion delay of a slow broker, in 1 ms steps: 2 to 16 times
+/// a profile's.
+const SLOW_DISK_MEAN: f64 = 16.0;
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Options {
     /// Ticks of faults and new proposals.
@@ -33,6 +37,8 @@ pub(crate) struct Options {
     /// journals need several times the space of a leader that packs a
     /// proposal into one group.
     pub sparse: &'static [usize],
+    /// Brokers whose disk takes `SLOW_DISK_MEAN` per job.
+    pub slow: &'static [usize],
     /// Vacuity floors: confirmed proposals, ops two brokers reported, the
     /// converged op, and proposals a full journal refused.
     pub min_confirmed: usize,
@@ -93,6 +99,18 @@ pub(crate) enum Fault {
     DeafLeader { at: u64, ticks: u64 },
     /// As `IsolateLeader`, but only frames from the leader stop.
     MuteLeader { at: u64, ticks: u64 },
+    /// From tick `at`, once a ready leader exists, every write and sync on
+    /// its disk fails. The broker stops on one, as a broker process exits,
+    /// restarts over what its disk kept, now healthy, and rejoins `ticks`
+    /// after the fault started. Random partitions wait. Another broker must lead meanwhile.
+    FailLeaderDisk { at: u64, ticks: u64 },
+    /// As `FailLeaderDisk`, on one of its followers, a sparse one if any.
+    FailFollowerDisk { at: u64, ticks: u64 },
+    /// As `CrashLeader`, but only the process dies. The restart sees what
+    /// its disk cached, and queued writes may still land.
+    KillLeader { at: u64, ticks: u64 },
+    /// As `CrashFollower`, but only the process dies.
+    KillFollower { at: u64, ticks: u64 },
 }
 
 impl Fault {
@@ -107,6 +125,10 @@ impl Fault {
             | Self::PauseLeader { at, ticks }
             | Self::DeafLeader { at, ticks }
             | Self::MuteLeader { at, ticks }
+            | Self::FailLeaderDisk { at, ticks }
+            | Self::FailFollowerDisk { at, ticks }
+            | Self::KillLeader { at, ticks }
+            | Self::KillFollower { at, ticks }
             | Self::CrashAllMidWrite { at, within: ticks } => (at, ticks),
             Self::CrashAll { at } => (at, 0),
             Self::Recrash { within } => (0, within),
@@ -122,6 +144,8 @@ impl Fault {
                 | Self::PauseLeader { .. }
                 | Self::DeafLeader { .. }
                 | Self::MuteLeader { .. }
+                | Self::FailLeaderDisk { .. }
+                | Self::KillLeader { .. }
         )
     }
 
@@ -133,6 +157,8 @@ impl Fault {
                 | Self::CrashAll { .. }
                 | Self::Recrash { .. }
                 | Self::CrashAllMidWrite { .. }
+                | Self::KillLeader { .. }
+                | Self::KillFollower { .. }
         )
     }
 }
@@ -148,6 +174,8 @@ struct Isolation {
     /// Another broker led a later view at some tick of the isolation. A
     /// fault that ends it may leave no leader at the last tick.
     replaced: bool,
+    /// It restarted and has no links until the isolation ends.
+    restarted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,7 +232,12 @@ pub(crate) fn run(seed: u64, profile: Profile, options: Options) -> Result<Repor
     let mut brokers = Vec::new();
     let mut lanes: Vec<Vec<Lane>> = Vec::new();
     for index in 0..BROKERS {
-        let disk = Disk::new(disks.next(), profile.disk_mean);
+        let mean = if options.slow.contains(&index) {
+            SLOW_DISK_MEAN
+        } else {
+            profile.disk_mean
+        };
+        let disk = Disk::new(disks.next(), mean);
         let (broker, broker_lanes) =
             Broker::start(index, &clock, disk, options.clients, options.shape(index)).map_err(
                 |reason| {
@@ -297,22 +330,43 @@ impl Sim {
                 .isolation
                 .filter(|isolation| matches!(isolation.fault, Fault::PauseLeader { .. }))
                 .map(|isolation| isolation.broker);
+            // A broker its injected disk error stopped restarts at the end of
+            // the tick.
+            let mut exited = None;
             for step in 0..DISK_STEPS {
                 let at = tick * DISK_STEPS + step;
                 for index in order {
                     let broker = &mut self.brokers[index];
                     broker.disk.step(at, index, &mut self.trace);
-                    if paused == Some(index) {
+                    if paused == Some(index) || exited == Some(index) {
                         continue;
                     }
-                    if let Some(lanes) = broker.turn(
+                    let turn = broker.turn(
                         &mut self.network,
                         &self.clock,
                         &mut self.trace,
                         self.options.clients,
-                    )? {
-                        self.workload.replace(index, lanes);
+                    );
+                    match turn {
+                        Ok(Some(lanes)) => self.workload.replace(index, lanes),
+                        Ok(None) => {}
+                        Err(_)
+                            if broker.disk.failed()
+                                && self.isolation.is_some_and(|isolation| {
+                                    isolation.broker == index && !isolation.restarted
+                                }) =>
+                        {
+                            exited = Some(index);
+                        }
+                        Err(reason) => return Err(reason),
                     }
+                }
+            }
+            if let Some(broker) = exited {
+                // The host stays up, so the cache does too.
+                self.crash(broker, tick, false)?;
+                if let Some(isolation) = &mut self.isolation {
+                    isolation.restarted = true;
                 }
             }
             self.workload
@@ -386,8 +440,18 @@ impl Sim {
                     isolation.broker, isolation.view
                 ));
             }
+            if matches!(
+                isolation.fault,
+                Fault::FailLeaderDisk { .. } | Fault::FailFollowerDisk { .. }
+            ) && !isolation.restarted
+            {
+                return Err(format!(
+                    "broker {} never stopped on its injected disk error",
+                    isolation.broker
+                ));
+            }
             self.network.rejoin();
-            if isolation.fault.crash() {
+            if isolation.restarted {
                 self.reconnect(isolation.broker)?;
             }
             self.isolation = None;
@@ -438,13 +502,21 @@ impl Sim {
                     .expect("two followers")
             };
             match fault {
-                _ if fault.crash() => self.crash(broker, tick)?,
+                _ if fault.crash() => {
+                    let killed =
+                        matches!(fault, Fault::KillLeader { .. } | Fault::KillFollower { .. });
+                    self.crash(broker, tick, !killed)?;
+                }
                 Fault::StallLeader { .. } => {
                     let until = (tick + fault.window().1) * DISK_STEPS;
                     self.brokers[broker].disk.stall(until);
                     self.network.hold_partitions(broker);
                 }
                 Fault::PauseLeader { .. } => self.network.hold_partitions(broker),
+                Fault::FailLeaderDisk { .. } | Fault::FailFollowerDisk { .. } => {
+                    self.brokers[broker].disk.fail_writes();
+                    self.network.hold_partitions(broker);
+                }
                 Fault::DeafLeader { .. } => self.network.cut_one_way(broker, false),
                 Fault::MuteLeader { .. } => self.network.cut_one_way(broker, true),
                 _ => self.network.isolate(broker),
@@ -455,15 +527,17 @@ impl Sim {
                 until: tick + fault.window().1,
                 fault,
                 replaced: false,
+                restarted: fault.crash(),
             });
             self.trace.word(broker as u64);
         }
         Ok(())
     }
 
-    /// `broker` loses power and restarts over its durable image, cut off
-    /// from both peers, which drop their links to it.
-    fn crash(&mut self, broker: usize, tick: u64) -> Result<(), String> {
+    /// `broker` loses power, or only its process without `power_loss`, and
+    /// restarts over what its disk kept, cut off from both peers, which drop
+    /// their links to it.
+    fn crash(&mut self, broker: usize, tick: u64, power_loss: bool) -> Result<(), String> {
         let now = self.clock.now();
         self.network.crash(broker);
         for peer in (0..BROKERS).filter(|peer| *peer != broker) {
@@ -472,6 +546,7 @@ impl Sim {
         }
         let old = self.brokers.remove(broker);
         let (restarted, lanes) = old.restart(
+            power_loss,
             &self.clock,
             self.options.clients,
             self.options.shape(broker),
@@ -487,7 +562,7 @@ impl Sim {
     fn crash_all(&mut self, tick: u64) -> Result<(), String> {
         self.power_loss = Some((tick, None));
         for broker in 0..BROKERS {
-            self.crash(broker, tick)?;
+            self.crash(broker, tick, true)?;
         }
         self.network.rejoin();
         let now = self.clock.now();

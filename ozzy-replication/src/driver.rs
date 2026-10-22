@@ -127,6 +127,8 @@ pub struct ReplicaDriver {
     activation_pending: VoterSet,
     /// Current-view timeout suspicions. Never durable or history-selection votes.
     exit_votes: VoterSet,
+    /// When each peer's suspicion of the current view last arrived.
+    exit_heard_at: Voters<Duration>,
     /// `None` means local suspicion is inactive or was withdrawn after progress.
     exit_retry_at: Option<Duration>,
     /// An older view peers still ask to leave, and which voters asked. This
@@ -205,6 +207,7 @@ impl ReplicaDriver {
             commit_pending: false,
             activation_pending: VoterSet::EMPTY,
             exit_votes: VoterSet::EMPTY,
+            exit_heard_at: Voters::splat(Duration::ZERO),
             exit_retry_at: None,
             exit_echo: None,
             exit_echo_at: Voters::splat(Duration::ZERO),

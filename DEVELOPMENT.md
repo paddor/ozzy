@@ -222,16 +222,22 @@ Flags, actions, artifacts, and replay: [ozzy-sim/README.md](ozzy-sim/README.md).
 
 A seed campaign over every profile (`none`, `light`, `heavy`, `swarm`, and
 `slow` disks) and scenario: `random` faults only; `failover`, which also cuts
-the leader off and requires a new one before it rejoins; `full`, which fills
-a journal of six 32 KiB segments until it refuses proposals, then loses the
-leader; `sparse-followers`, where both followers write one
-operation per group while proposals carry four, so they converge only by
-packing; and `sparse-rejoin`, where such a follower misses about 1300
+the leader off and requires a new one before it rejoins; `slow-follower`,
+where one follower's disk takes 16 ms per job, so once the leader is lost
+the new one commits only through it; `full`, which fills a journal of six
+32 KiB segments until it refuses proposals, then loses the leader;
+`sparse-followers`, where both followers write one operation per group while
+proposals carry four, so they converge only by packing; and
+`sparse-rejoin`, where such a follower misses about 1300
 operations, then rejoins as the leader is lost, so the view change installs
 a suffix that outlasts any election timeout and passes the segment limit;
 `crash`, where a follower and then the leader lose power and restart
 over what reached their disks, with fresh writer generations and link
-sessions; `power-loss`, where all three lose power at once mid-traffic;
+sessions; `disk-error`, where a follower's disk and then the leader's fail
+every write and sync, so each broker stops as its process exits, then
+restarts and rejoins; `kill`, as `crash` but only the processes die, so
+restarts see what the disks cached and queued writes may still land;
+`power-loss`, where all three lose power at once mid-traffic;
 `recovery-crash`, where power fails again at a seeded tick of that recovery;
 `torn-write`, where every disk stops completing jobs and power then fails
 with the queued writes in flight; `disk-stall`, where the leader's disk

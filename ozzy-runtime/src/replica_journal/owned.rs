@@ -150,6 +150,7 @@ impl OwnedJournal {
             append_limits: self.append_limits,
             operations: self.limits.operations,
             buffer_generation: self.buffer_generation,
+            io: self.journal.ready()?.backend(),
             execution: super::execution::Execution::Normal(super::ShardJournal::new(
                 self, config, timestamp,
             )),

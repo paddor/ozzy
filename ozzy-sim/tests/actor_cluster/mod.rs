@@ -28,8 +28,9 @@ use broker::{MAX_SEGMENTS, SEGMENT_BYTES};
 use network::Profile;
 use sim::{
     Fault::{
-        self, CrashAll, CrashAllMidWrite, CrashFollower, CrashLeader, DeafLeader, IsolateFollower,
-        IsolateLeader, MuteLeader, PauseLeader, Recrash, StallLeader,
+        self, CrashAll, CrashAllMidWrite, CrashFollower, CrashLeader, DeafLeader, FailFollowerDisk,
+        FailLeaderDisk, IsolateFollower, IsolateLeader, KillFollower, KillLeader, MuteLeader,
+        PauseLeader, Recrash, StallLeader,
     },
     Options, Report,
 };
@@ -44,6 +45,8 @@ struct Scenario {
     max_segments: usize,
     segment_bytes: u64,
     sparse: &'static [usize],
+    /// Brokers whose disk takes 16 ms per job.
+    slow: &'static [usize],
     /// Caps the profile's floors for confirmed proposals and compared ops,
     /// where a full journal bounds them.
     max_floor: usize,
@@ -58,6 +61,7 @@ const RANDOM: Scenario = Scenario {
     max_segments: MAX_SEGMENTS,
     segment_bytes: SEGMENT_BYTES,
     sparse: &[],
+    slow: &[],
     max_floor: usize::MAX,
     min_applied: 0,
     min_refused: 0,
@@ -83,6 +87,14 @@ fn scenario(name: &str) -> Option<Scenario> {
         "long-history" => Scenario {
             ticks: 3000,
             script: &[LOST_LEADER],
+            ..RANDOM
+        },
+        // A follower's disk takes 16 ms per job. Once the leader is lost,
+        // the new one commits only through that disk.
+        "slow-follower" => Scenario {
+            ticks: 3000,
+            script: &[LOST_LEADER],
+            slow: &[2],
             ..RANDOM
         },
         "very-long-history" => Scenario {
@@ -181,6 +193,39 @@ fn scenario(name: &str) -> Option<Scenario> {
             ],
             ..RANDOM
         },
+        // A follower's disk, then the leader's, fails every write and sync.
+        // Each broker stops on one as its process exits, then restarts over
+        // what its disk kept.
+        "disk-error" => Scenario {
+            ticks: 3500,
+            script: &[
+                FailFollowerDisk {
+                    at: 500,
+                    ticks: 300,
+                },
+                FailLeaderDisk {
+                    at: 1300,
+                    ticks: 1500,
+                },
+            ],
+            ..RANDOM
+        },
+        // As `crash`, but only the processes die: each restart sees what its
+        // disk cached, and writes it had queued may still land.
+        "kill" => Scenario {
+            ticks: 3500,
+            script: &[
+                KillFollower {
+                    at: 500,
+                    ticks: 300,
+                },
+                KillLeader {
+                    at: 1300,
+                    ticks: 1500,
+                },
+            ],
+            ..RANDOM
+        },
         // Every broker loses power at once, mid-traffic, and restarts over
         // what reached its disk. Each committed operation must survive.
         "power-loss" => Scenario {
@@ -263,6 +308,7 @@ fn options(profile: &str, scenario: &str) -> Options {
         max_segments: scenario.max_segments,
         segment_bytes: scenario.segment_bytes,
         sparse: scenario.sparse,
+        slow: scenario.slow,
         min_confirmed: floor,
         min_compared: floor as u64,
         min_applied: scenario.min_applied,
@@ -362,6 +408,12 @@ fn lost_leader_is_replaced_after_long_history() {
     checked(1, "none", "long-history");
 }
 
+/// A new leader commits through a follower's slow disk.
+#[test]
+fn new_leader_commits_through_a_slow_follower() {
+    checked(1, "none", "slow-follower");
+}
+
 /// Each new leader is lost in turn.
 #[test]
 fn repeatedly_lost_leaders_are_replaced() {
@@ -398,6 +450,20 @@ fn lagging_sparse_follower_installs_a_long_suffix_at_the_limit() {
 #[test]
 fn crashed_brokers_restart_and_rejoin() {
     checked(1, "none", "crash");
+}
+
+/// A broker whose disk fails writes and syncs stops, restarts over what its
+/// disk kept, and rejoins. The leader is replaced meanwhile.
+#[test]
+fn failed_disk_stops_and_restarts_its_broker() {
+    checked(1, "none", "disk-error");
+}
+
+/// A follower, then the leader, are killed and restart over their cached
+/// disks. Each rejoins without losing a confirmed operation.
+#[test]
+fn killed_brokers_restart_and_rejoin() {
+    checked(1, "none", "kill");
 }
 
 /// All three brokers lose power at once and elect again over their durable
@@ -480,13 +546,16 @@ mod seeded {
         const PROFILES: [&str; 5] = ["none", "light", "heavy", "swarm", "slow"];
         /// Each scenario with its profiles. Heavy and swarm faults leave too
         /// little progress to fill a journal.
-        const SCENARIOS: [(&str, &[&str]); 12] = [
+        const SCENARIOS: [(&str, &[&str]); 15] = [
             ("random", &PROFILES),
             ("failover", &PROFILES),
+            ("slow-follower", &PROFILES),
             ("full", &["none", "light", "slow"]),
             ("sparse-followers", &["none", "light", "slow"]),
             ("sparse-rejoin", &["none", "light", "slow"]),
             ("crash", &PROFILES),
+            ("disk-error", &PROFILES),
+            ("kill", &PROFILES),
             ("power-loss", &PROFILES),
             ("recovery-crash", &PROFILES),
             ("torn-write", &PROFILES),

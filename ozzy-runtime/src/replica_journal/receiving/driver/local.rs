@@ -183,6 +183,7 @@ impl ShardRecoveringJournal {
             append_limits: config.append_limits,
             operations: config.limits.operations,
             buffer_generation: generations.attempt,
+            io: io.clone(),
             execution: crate::replica_journal::execution::Execution::Recovery(Execution {
                 running: None,
                 retain: false,

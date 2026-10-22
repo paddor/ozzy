@@ -9,6 +9,7 @@ use ozzy_io::{
 use std::{
     collections::BTreeMap,
     future::Future,
+    io,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -28,6 +29,10 @@ pub(crate) struct Disk {
     due: BTreeMap<JobId, u64>,
     /// No job completes before this step.
     stalled_until: u64,
+    /// Every write and sync fails, as on a failing device.
+    failing: bool,
+    /// An injected failure was delivered.
+    failed: bool,
 }
 
 impl Disk {
@@ -40,16 +45,7 @@ impl Disk {
     /// one. Each cached sector reaches media at one seeded chance per loss,
     /// so writes tear and land out of order.
     pub(crate) fn power_loss(mut self) -> (Self, Local) {
-        for (id, stage) in self.controller.jobs() {
-            if stage == Stage::Queued
-                && self.controller.operation(id).is_some_and(is_write)
-                && self.rng.chance(0.5)
-            {
-                self.controller
-                    .execute(id, Effect::SkipBarrier)
-                    .expect("execute");
-            }
-        }
+        self.run_queued_writes(Effect::SkipBarrier);
         let chance = (1 + self.rng.below(3)) as f64 / 4.0;
         for (path, run) in self.controller.image().unsynced_runs(SECTOR) {
             for start in run.clone().step_by(SECTOR) {
@@ -64,6 +60,35 @@ impl Disk {
         let seed = self.rng.next();
         let (image, _) = self.controller.crash(true).expect("simulated power loss");
         Self::with_image(seed, self.mean, image)
+    }
+
+    /// Kill the process, then start a fresh device incarnation over the same
+    /// cache. Each queued write may still run, as the kernel finishes it,
+    /// unless the device is failing. Unsynchronized bytes stay cached.
+    pub(crate) fn process_crash(mut self) -> (Self, Local) {
+        if !self.failing {
+            self.run_queued_writes(Effect::Normal);
+        }
+        let seed = self.rng.next();
+        let (image, _) = self
+            .controller
+            .crash(false)
+            .expect("simulated process crash");
+        Self::with_image(seed, self.mean, image)
+    }
+
+    /// Run each queued write at an even chance, unreported.
+    fn run_queued_writes(&mut self, effect: Effect) {
+        for (id, stage) in self.controller.jobs() {
+            if stage == Stage::Queued
+                && self.controller.operation(id).is_some_and(|operation| {
+                    matches!(unprotected(operation), Operation::Write { .. })
+                })
+                && self.rng.chance(0.5)
+            {
+                self.controller.execute(id, effect).expect("execute");
+            }
+        }
     }
 
     fn with_image(seed: u64, mean: f64, image: Image) -> (Self, Local) {
@@ -100,6 +125,8 @@ impl Disk {
             mean,
             due: BTreeMap::new(),
             stalled_until: 0,
+            failing: false,
+            failed: false,
         };
         (disk, Local::new(clients.remove(0)))
     }
@@ -108,6 +135,18 @@ impl Disk {
     /// due meanwhile complete once it ends.
     pub(crate) fn stall(&mut self, until: u64) {
         self.stalled_until = until;
+    }
+
+    /// Fail every later write and sync, as a failing device does: each one
+    /// before or after its physical effect, or after a write prefix. A
+    /// restart gets a healthy device.
+    pub(crate) fn fail_writes(&mut self) {
+        self.failing = true;
+    }
+
+    /// Whether an injected failure was delivered.
+    pub(crate) fn failed(&self) -> bool {
+        self.failed
     }
 
     /// Complete jobs due by step `at`. New jobs draw their completion step
@@ -151,11 +190,32 @@ impl Disk {
 
     fn finish(&mut self, id: JobId, stage: Stage) {
         if stage == Stage::Queued {
-            self.controller
-                .execute(id, Effect::Normal)
-                .expect("execute");
+            let effect = self.effect(id);
+            self.controller.execute(id, effect).expect("execute");
         }
         self.controller.deliver(id).expect("deliver");
+    }
+
+    /// Normal, or an injected failure of a write or sync.
+    fn effect(&mut self, id: JobId) -> Effect {
+        if !self.failing {
+            return Effect::Normal;
+        }
+        let length = match self.controller.operation(id).map(unprotected) {
+            Some(Operation::Write { data, .. }) => data.len(),
+            Some(Operation::Sync { .. }) => 0,
+            _ => return Effect::Normal,
+        };
+        self.failed = true;
+        let error = io::ErrorKind::Other;
+        match self.rng.below(3) {
+            0 => Effect::FailBefore(error),
+            1 if length > 0 => Effect::WriteThenError {
+                bytes: self.rng.below(length as u64) as usize,
+                error,
+            },
+            _ => Effect::FailAfter(error),
+        }
     }
 
     /// Drive a startup future, completing its storage jobs as it waits.
@@ -176,12 +236,11 @@ impl Disk {
     }
 }
 
-/// A write, possibly holding extra handles until it runs.
-fn is_write(operation: &Operation) -> bool {
+/// The operation inside any handles held until it runs.
+fn unprotected(operation: &Operation) -> &Operation {
     match operation {
-        Operation::Write { .. } => true,
-        Operation::Protected { operation, .. } => is_write(operation),
-        _ => false,
+        Operation::Protected { operation, .. } => unprotected(operation),
+        operation => operation,
     }
 }
 

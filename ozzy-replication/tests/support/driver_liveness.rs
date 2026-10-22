@@ -450,6 +450,20 @@ fn healthy_contact_withdraws_local_suspicion_before_a_late_peer_exit() {
     assert_eq!(backup.poll(now).unwrap(), None);
 }
 
+/// A peer that stops repeating its request recovered. Its old request
+/// lapses after one primary timeout and cannot help a later local timeout
+/// end the view.
+#[test]
+fn a_peer_exit_request_lapses_after_the_primary_timeout() {
+    let mut backup = driver(normal(1));
+    peer_exit(&mut backup, 2, Duration::ZERO);
+    let now = timing().primary_timeout;
+    assert_eq!(backup.poll(now).unwrap(), Some(Action::Broadcast(wish(0))));
+    assert_eq!(backup.scope().view, 0);
+    peer_exit(&mut backup, 2, now);
+    assert_eq!(backup.scope().view, 1);
+}
+
 #[test]
 fn unanswered_election_timeouts_cannot_advance_the_promised_view() {
     let mut replica = driver(normal(1));

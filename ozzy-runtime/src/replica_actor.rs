@@ -118,9 +118,11 @@ pub struct ReplicaActor {
     pending_sync: Option<PendingSync>,
     pending_persistence:
         VecDeque<crate::replica_journal::JournalCompletion<ozzy_replication::WriteTicket>>,
-    /// When the journal last completed a command, or was seen idle; from
-    /// the first round.
+    /// When the journal last completed a command or the storage lane a job,
+    /// or the journal was seen idle; from the first round.
     storage_progress_at: Option<Duration>,
+    /// The storage lane's completed-job count at the last round.
+    storage_jobs: u64,
     promise: Option<PromiseTicket>,
     pinned: Option<LogSource>,
     wanted_pin: Option<(Scope, LogSource)>,
@@ -195,11 +197,16 @@ impl ReplicaActor {
             self.publish_status(true);
             return Ok(());
         }
-        // The view waits on this copy's own installation I/O; timing out
-        // while it runs would only discard the work.
+        // The view waits on this copy's own promise or installation I/O;
+        // timing out while it runs would only discard the work.
         if matches!(
             self.pending,
-            Some(PendingIo::Begin(_) | PendingIo::Chunk(_) | PendingIo::Finish(_))
+            Some(
+                PendingIo::Promise(_)
+                    | PendingIo::Begin(_)
+                    | PendingIo::Chunk(_)
+                    | PendingIo::Finish(_)
+            )
         ) {
             self.driver.history_progress(now)?;
         }
@@ -209,8 +216,12 @@ impl ReplicaActor {
             || self.pending_replay.is_some()
             || self.pending_sync.is_some()
             || !self.pending_persistence.is_empty();
-        if !busy {
+        // A command of many jobs on a slow device is not a stall while its
+        // jobs complete.
+        let jobs = self.journal.completed_jobs();
+        if !busy || jobs != self.storage_jobs {
             self.storage_progress_at = Some(now);
+            self.storage_jobs = jobs;
         }
         let since = *self.storage_progress_at.get_or_insert(now);
         self.driver.observe_storage(busy.then_some(since), now)?;

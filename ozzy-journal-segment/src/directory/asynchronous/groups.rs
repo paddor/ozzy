@@ -180,8 +180,10 @@ impl GroupScope {
         self.limits
     }
 
+    /// Open with reads of up to one I/O chunk past the next group.
     pub(crate) async fn open(self, resume: Option<Resume>) -> Result<Box<Groups>, DirectoryError> {
-        self.open_reading_ahead(resume, 0).await
+        let read_ahead = self.limits.io.chunk_bytes;
+        self.open_reading_ahead(resume, read_ahead).await
     }
 
     /// Open with reads of up to `read_ahead` bytes past the next group, so a

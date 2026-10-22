@@ -16,6 +16,9 @@
   or changes, not every selected segment. Segment rolls, packing, retention,
   and view changes no longer cost four file operations per selected segment;
   a view change over many segments on slow disks finishes in time.
+- Journal scans read up to one I/O chunk (at most 64 KiB) at a time, not one
+  write group. A view-change promise, restart replay, index build, or
+  retention scan over 4 KiB groups takes 16 times fewer reads.
 - A disk-quorum election whose next leader withdraws into checkpoint recovery
   ends when that broker's recovery requests arrive, not at the doubled
   election deadline. A complete cluster restart with an expired copy serves
@@ -106,10 +109,17 @@
 - A disk-quorum leader whose disk stalls now hands over to the two healthy
   brokers after about 2 s. A stalled sync or maintenance step held new
   writes back, so no admitted write was outstanding and nothing timed out;
-  the partition stopped until the disk recovered. A broker still waiting on
-  its own promise also no longer votes to leave a view at its election
-  deadline; with one peer's timeout, that ended views the healthy pair was
-  installing.
+  the partition stopped until the disk recovered. Only a device that
+  completes no job stalls; a long command on a slow disk does not. A broker
+  still waiting on its own promise also no longer votes to leave a view at
+  its election deadline; with one peer's timeout, that ended views the
+  healthy pair was installing. A promise that outlasts the election timeout
+  no longer ends the view as soon as it lands.
+- A disk-quorum broker that returns after a partition no longer ends the
+  view the other two lead. They kept each other's requests to leave it from
+  before the view was ready, so the returning broker's request completed a
+  quorum. A peer's request now lapses one primary timeout after it last
+  arrives.
 - A disk-quorum backup that installs a new view no longer fetches its missed
   history twice. It first looked up its own commit in the new leader's
   history, which moved the same operations; the installation transfer now
