@@ -2,7 +2,7 @@
 //! scheduling live in this fixture; all link, dispatch, and actor state is real.
 
 use super::*;
-use ozzy_broker::{Frontend, FrontendPlan, TransportLimits};
+use ozzy_broker::{Frontend, FrontendPlan, PublicationAdmission, TransportLimits};
 use ozzy_proto::{EnvelopeLimits, Opcode, data::DataLimits, handshake};
 use ozzy_runtime::{
     dispatch::{self, Budget, Budgets, Class},
@@ -631,11 +631,13 @@ async fn start(brokers: &[(CheckedConfig, BrokerIdentity, JournalPlan)], format:
             })
             .collect();
         listeners.remove(&local); // Release test-only ephemeral port reservations.
+        let admission = PublicationAdmission::default();
         let frontend = Frontend::start_with_context(
             FrontendPlan {
                 broker: &checked.plan,
                 local,
                 endpoints: &endpoints,
+                admission: &admission,
                 limits: TransportLimits {
                     send_messages: 8,
                     receive_messages: 8,

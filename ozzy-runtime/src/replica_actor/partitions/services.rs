@@ -74,17 +74,19 @@ impl PartitionActors {
 
     /// Attach bounded reader subscriptions to this partition's existing journal
     /// and frontend sessions. It creates no physical connection or file worker.
+    /// With `grants`, its subscribers' live topic admits them on the reader PUB.
     pub fn install_readers(
         &mut self,
         group: GroupId,
         config: SharedReaderConfig,
         links: Links,
+        grants: Option<crate::frontend::ShardGrants>,
     ) -> Result<(), PartitionError> {
         let slot = *self.index.get(&group).ok_or(PartitionError::Unknown)?;
         if self.stopped || self.readers[slot].is_some() {
             return Err(PartitionError::NativeConfiguration);
         }
-        let readers = SharedReaders::new(&mut self.actors[slot], config, links)
+        let readers = SharedReaders::new(&mut self.actors[slot], config, links, grants)
             .map_err(|source| PartitionError::Actor { group, source })?;
         self.readers[slot] = Some(readers);
         self.touch(slot);

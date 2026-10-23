@@ -144,6 +144,18 @@ pub struct FrontendPlan<'a> {
     pub endpoints: &'a Endpoints,
     /// Directional OMQ queue and frame bounds.
     pub limits: TransportLimits,
+    /// Who may subscribe to each publication socket.
+    pub admission: &'a PublicationAdmission,
+}
+
+/// Who may subscribe to this broker's publications. A subscriber is its SUB's
+/// routing identity, a claim the transport does not authenticate.
+#[derive(Clone, Debug, Default)]
+pub struct PublicationAdmission {
+    /// Clients holding a subscription to a partition admit its live topic.
+    pub readers: ozzy_runtime::frontend::ReaderGrants,
+    /// Brokers that may follow this one's canonical stream.
+    pub followers: std::collections::BTreeSet<NodeId>,
 }
 
 impl Frontend {
@@ -270,6 +282,7 @@ impl Drop for Frontend {
 struct Bindings {
     local: NodeId,
     limits: TransportLimits,
+    admission: PublicationAdmission,
     peer: Endpoint,
     data: Endpoint,
     reader: Endpoint,
@@ -298,6 +311,7 @@ impl Bindings {
         Ok(Self {
             local: plan.local,
             limits: plan.limits,
+            admission: plan.admission.clone(),
             peer: parse(&endpoints.peer)?,
             data: parse(&endpoints.data_peer)?,
             reader: parse(&endpoints.reader_pub)?,
@@ -331,11 +345,24 @@ impl Sockets {
         let sockets = Self {
             data,
             peer,
-            reader: context.socket(SocketType::Pub, publications.clone()),
-            follower: bindings
-                .follower
-                .as_ref()
-                .map(|_| context.socket(SocketType::Pub, publications)),
+            reader: context.socket(
+                SocketType::Pub,
+                (publications.clone())
+                    .subscription_admission(bindings.admission.readers.admission()),
+            ),
+            follower: bindings.follower.as_ref().map(|_| {
+                let followers = bindings.admission.followers.clone();
+                // A follower subscribes to every group it may host.
+                let admission = move |request: &omq_tokio::SubscriptionRequest<'_>| {
+                    (request.peer.identity.as_deref())
+                        .and_then(ozzy_runtime::transport::decode_peer_identity)
+                        .is_some_and(|node| followers.contains(&node))
+                };
+                context.socket(
+                    SocketType::Pub,
+                    publications.subscription_admission(admission),
+                )
+            }),
         };
         let result = async {
             sockets.peer.bind(bindings.peer).await?;

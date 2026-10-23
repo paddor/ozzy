@@ -101,7 +101,12 @@ impl Followers {
                         })?;
                     socket.connect(endpoint.clone()).await?;
                 }
-                let publications = frontend.limits.publications(&options);
+                // Publishers admit this broker by its identity.
+                let publications = frontend.limits.publications(
+                    &options
+                        .clone()
+                        .identity(ozzy_runtime::transport::peer_identity(frontend.local)),
+                );
                 for (&broker, endpoint) in &transport.routes.publications {
                     let socket = frontend
                         .context

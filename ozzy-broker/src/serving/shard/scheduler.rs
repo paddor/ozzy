@@ -215,6 +215,7 @@ impl State {
                         subscriptions: self.config.clients,
                     },
                     binding.links.clone(),
+                    self.grants.clone(),
                 )
                 .map_err(failure)?;
             self.bootstrap[index] = Some(bootstrap);

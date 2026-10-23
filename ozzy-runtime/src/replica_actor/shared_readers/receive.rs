@@ -39,6 +39,7 @@ impl SharedReaders {
         if let Err(error) = result {
             self.reject(client, packet.envelope, error, hint)?;
         }
+        self.grant();
         self.wake.wake();
         Ok(NativeReceive::Accepted)
     }
@@ -130,6 +131,7 @@ impl SharedReaders {
                 || slot.delivery.subscribe.subscription != selected.subscription
                 || slot.delivery.source != selected.source
         });
+        self.slots_changed();
         let header = reader::encode_unsubscribed(
             Envelope {
                 opcode: Opcode::Unsubscribed,
@@ -204,6 +206,7 @@ impl SharedReaders {
                 resolved_offset: None,
                 reply_due: true,
             };
+            self.slots_changed();
             if let Some(index) = old {
                 self.slots[index] = slot;
                 index

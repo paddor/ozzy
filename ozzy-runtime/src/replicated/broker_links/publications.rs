@@ -1,6 +1,6 @@
 //! One bounded SUB socket per broker, shared across every topic reader.
 
-use super::{Arc, BTreeSet, BrokerLinkError, BrokerLinksConfig, Bytes, NodeId, Shared, readers};
+use super::{Arc, BTreeMap, BrokerLinkError, BrokerLinksConfig, Bytes, NodeId, Shared, readers};
 use crate::signal::CloseSignal;
 use omq_tokio::{Socket, SocketType};
 use std::{rc::Rc, time::Duration};
@@ -17,10 +17,11 @@ pub(super) struct Driver {
     link: Arc<Link>,
     broker: NodeId,
     connected: bool,
-    prefixes: BTreeSet<Bytes>,
+    /// Subscribed live topics, each with the acceptance it was sent for.
+    prefixes: BTreeMap<Bytes, u64>,
     limits: ozzy_proto::EnvelopeLimits,
     observed: Option<u64>,
-    desired: BTreeSet<Bytes>,
+    desired: BTreeMap<Bytes, u64>,
     updating: bool,
 }
 
@@ -38,7 +39,9 @@ impl Driver {
             .ok_or(BrokerLinkError::Configuration)?;
         let socket = context.socket(
             SocketType::Sub,
+            // The broker admits a live topic by the subscription this node holds.
             crate::transport::socket_options()
+                .identity(crate::transport::peer_identity(config.local))
                 .recv_hwm(limits.queue_messages as u32)
                 .max_message_size(maximum)
                 .linger(Duration::ZERO),
@@ -53,10 +56,10 @@ impl Driver {
                 link,
                 broker,
                 connected: false,
-                prefixes: BTreeSet::new(),
+                prefixes: BTreeMap::new(),
                 limits: config.parameters.receive.envelope,
                 observed: None,
-                desired: BTreeSet::new(),
+                desired: BTreeMap::new(),
                 updating: false,
             },
         ))
@@ -80,7 +83,7 @@ impl Driver {
             }
             let seen = self.readers.interests.generation();
             if self.observed != Some(seen) {
-                self.desired = self.readers.prefixes();
+                self.desired = self.readers.admitted(self.broker);
                 self.observed = Some(seen);
                 self.updating = true;
             }
@@ -106,15 +109,27 @@ impl Driver {
         }
     }
 
+    /// Move one subscription toward the accepted topics. A newer acceptance
+    /// renews its SUBSCRIBE: the broker admitted none sent before it, nor a
+    /// replay after the subscription was dropped and reopened.
     async fn filters(&mut self) -> Result<bool, BrokerLinkError> {
-        if let Some(prefix) = self.prefixes.difference(&self.desired).next().cloned() {
+        let gone = self
+            .prefixes
+            .keys()
+            .find(|p| !self.desired.contains_key(*p));
+        if let Some(prefix) = gone.cloned() {
             self.socket.unsubscribe(prefix.clone()).await?;
             self.prefixes.remove(&prefix);
             return Ok(true);
         }
-        if let Some(prefix) = self.desired.difference(&self.prefixes).next().cloned() {
+        let renewed = (self.desired.iter()).find(|&(p, token)| self.prefixes.get(p) != Some(token));
+        if let Some((prefix, &token)) = renewed {
+            let prefix = prefix.clone();
+            if self.prefixes.contains_key(&prefix) {
+                self.socket.unsubscribe(prefix.clone()).await?;
+            }
             self.socket.subscribe(prefix.clone()).await?;
-            self.prefixes.insert(prefix);
+            self.prefixes.insert(prefix, token);
             return Ok(true);
         }
         self.updating = false;

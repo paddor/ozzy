@@ -70,6 +70,8 @@ struct State {
     config: Arc<Config>,
     /// Partition status queries from the admin owner, when one runs.
     admin: Option<crate::admin::ShardLane>,
+    /// This shard's reader grants, which the reader PUB admits by.
+    grants: Option<ozzy_runtime::frontend::ShardGrants>,
 }
 
 pub(super) async fn run(
@@ -208,6 +210,7 @@ impl State {
                         subscriptions: self.config.clients,
                     },
                     binding.links.clone(),
+                    self.grants.clone(),
                 )
                 .map_err(failure)?;
         }

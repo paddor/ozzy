@@ -1,7 +1,7 @@
 //! Two SDK PEER sockets across all brokers: control/replies and data/replay.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     sync::{Arc, OnceLock},
     time::Duration,
 };

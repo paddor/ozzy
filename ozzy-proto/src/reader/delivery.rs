@@ -231,9 +231,9 @@ pub fn decode_owned_publication(
     })
 }
 
-/// Live-stream topic of one group partition: the group, then the partition. A
-/// reader that subscribes to the bare group receives all of its partitions.
-/// Local logs have no shared live stream.
+/// Live-stream topic of one group partition: the group, then the partition.
+/// Brokers admit a SUBSCRIBE only for this exact topic. Local logs have no
+/// shared live stream.
 pub fn publication_topic(source: Source) -> Result<[u8; 32], CodecError> {
     let Source::Group {
         authority,

@@ -7,7 +7,10 @@ use super::{
 use crate::transport::Frames;
 use omq_tokio::Message;
 use ozzy_proto::{EnvelopeLimits, Opcode, Packet, SubscriptionId, reader};
-use std::{cell::RefCell, sync::Weak};
+use std::{
+    cell::{Cell, RefCell},
+    sync::Weak,
+};
 
 mod inbox;
 pub(in crate::replicated) use inbox::Inbox;
@@ -152,8 +155,21 @@ pub(super) struct Registry {
     entries: RefCell<BTreeMap<SubscriptionId, Weak<Inbox>>>,
     prefixes: RefCell<BTreeMap<Bytes, BTreeMap<SubscriptionId, Weak<Inbox>>>>,
     endpoints: RefCell<BTreeMap<NodeId, Option<omq_tokio::Endpoint>>>,
+    /// Subscriptions a broker accepted, whose live topic its reader PUB now
+    /// admits from this SDK.
+    accepted: RefCell<BTreeMap<SubscriptionId, Accepted>>,
+    /// Acceptances so far; each renews its SUB's SUBSCRIBE.
+    acceptances: Cell<u64>,
     changed: Arc<StateSignal>,
     pub(super) interests: Arc<StateSignal>,
+}
+
+/// A broker accepted one subscription: its SUB may now subscribe to `topic`.
+#[derive(Debug)]
+struct Accepted {
+    broker: NodeId,
+    topic: Bytes,
+    token: u64,
 }
 
 impl Registry {
@@ -162,6 +178,8 @@ impl Registry {
             entries: RefCell::new(BTreeMap::new()),
             prefixes: RefCell::new(BTreeMap::new()),
             endpoints: RefCell::new(config.brokers.iter().map(|b| (b.node, None)).collect()),
+            accepted: RefCell::new(BTreeMap::new()),
+            acceptances: Cell::new(0),
             changed: admission.changed.clone(),
             interests: admission.interests.clone(),
         }
@@ -218,6 +236,7 @@ impl Registry {
         self.endpoints.borrow().get(&node).cloned().flatten()
     }
 
+    #[cfg(test)]
     pub(super) fn prefixes(&self) -> std::collections::BTreeSet<Bytes> {
         self.prefixes
             .borrow()
@@ -225,6 +244,24 @@ impl Registry {
             .filter(|(_, entries)| entries.values().any(|entry| entry.strong_count() != 0))
             .map(|(prefix, _)| prefix.clone())
             .collect()
+    }
+
+    /// The live topics `broker` accepted a subscription to, each with its
+    /// newest acceptance. That broker's SUB subscribes to exactly these.
+    pub(super) fn admitted(&self, broker: NodeId) -> BTreeMap<Bytes, u64> {
+        let entries = self.entries.borrow();
+        let mut admitted = BTreeMap::new();
+        for (id, accepted) in self.accepted.borrow().iter() {
+            if accepted.broker == broker
+                && entries
+                    .get(id)
+                    .is_some_and(|inbox| inbox.strong_count() != 0)
+            {
+                let token = admitted.entry(accepted.topic.clone()).or_insert(0);
+                *token = accepted.token.max(*token);
+            }
+        }
+        admitted
     }
 
     pub(super) fn publication(&self, broker: NodeId, message: &Message, limits: EnvelopeLimits) {
@@ -296,6 +333,8 @@ impl Registry {
             .and_then(Weak::upgrade)
             && inbox.unselect(selected.subscription)
         {
+            self.accepted.borrow_mut().remove(&selected.subscription.id);
+            self.interests.notify_changed();
             self.changed.notify_changed();
         }
     }
@@ -333,6 +372,33 @@ impl Registry {
             }
         }
         Ok(true)
+    }
+
+    /// `broker` accepted `selected`. Its reader PUB published the grant before
+    /// replying, so a SUBSCRIBE to the live topic sent now is admitted.
+    pub(super) fn accept(&self, broker: NodeId, selected: &reader::Subscribed) {
+        let Ok(topic) = reader::publication_topic(selected.source) else {
+            return;
+        };
+        let token = self.acceptances.get() + 1;
+        self.acceptances.set(token);
+        let entries = self.entries.borrow();
+        let mut accepted = self.accepted.borrow_mut();
+        accepted.retain(|id, _| {
+            entries
+                .get(id)
+                .is_some_and(|inbox| inbox.strong_count() != 0)
+        });
+        accepted.insert(
+            selected.subscription.id,
+            Accepted {
+                broker,
+                topic: Bytes::copy_from_slice(&topic),
+                token,
+            },
+        );
+        drop((accepted, entries));
+        self.interests.notify_changed();
     }
 }
 

@@ -1,5 +1,6 @@
 //! Bounded subscriptions on established shared broker links. No sockets or tasks.
 
+mod grants;
 mod output;
 mod publication;
 mod receive;
@@ -7,7 +8,7 @@ mod receive;
 use super::{ActorError, NativeReceive, PartitionActor, reader_cursor::Cursor};
 use crate::transport::Frames;
 use crate::{
-    frontend::{Kind, Link, Links},
+    frontend::{Kind, Link, Links, ShardGrants},
     reader_service::{Delivery, Failure, reader_frame},
     replica_journal::{PartitionReadBuffer, PartitionReadLimits, ReplicaJournal},
     replicated::payload::Payload,
@@ -77,6 +78,9 @@ pub(super) struct SharedReaders {
     /// arenas and payloads, also from transport threads, wake it.
     wake: Arc<AtomicWaker>,
     publication: publication::Publication,
+    /// This partition's readers in its shard's grants, when a reader PUB
+    /// admits subscriptions.
+    grants: Option<grants::Granted>,
 }
 
 impl std::fmt::Debug for SharedReaders {
@@ -92,8 +96,9 @@ impl SharedReaders {
         actor: &mut PartitionActor,
         config: SharedReaderConfig,
         links: Links,
+        grants: Option<ShardGrants>,
     ) -> Result<Self, ActorError> {
-        let local = actor.native_identity().1;
+        let (group, local, _) = actor.native_identity();
         let (_, journal) = actor.read_access().ok_or(ActorError::StartupMismatch)?;
         let operation = journal.operation_limits();
         if !(1..=65536).contains(&config.subscriptions)
@@ -133,6 +138,12 @@ impl SharedReaders {
             observed: None,
             wake,
             publication,
+            grants: grants.map(|shard| {
+                let mut topic = [0; 32];
+                topic[..16].copy_from_slice(group.as_bytes());
+                topic[16..].copy_from_slice(config.partition.as_bytes());
+                grants::Granted::new(shard, topic)
+            }),
         })
     }
 
@@ -174,11 +185,15 @@ impl SharedReaders {
 
     fn discard_stale(&mut self) {
         let links = &self.links;
+        let before = self.slots.len();
         self.slots.retain(|slot| {
             links
                 .get(slot.peer)
                 .is_some_and(|link| Some(link.binding.session) == slot.delivery.request.session)
         });
+        if self.slots.len() != before {
+            self.slots_changed();
+        }
         if self.rejection.as_ref().is_some_and(|message| {
             let Some(peer) = message
                 .part_slice(0)

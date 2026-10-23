@@ -214,6 +214,8 @@ Scalar failures use caller-owned output storage, including on virtual threads.
 | Behind retention | Fail with `TopicReaderError::RetentionGap`; readers do not extend retention |
 
 - PUB and PEER replay merge by offset. The reader drops duplicates.
+- A reader's SUB joins a partition's live topic once the broker replies
+  SUBSCRIBED, which admits it; each acceptance renews that SUBSCRIBE.
 - `TopicReaderConfig::refresh` sets how long a quiet partition waits before
   it checks for a lost final record.
 - Reader ACK observes delivery, not application processing. Save a

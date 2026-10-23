@@ -17,6 +17,7 @@ impl SharedReaders {
         let hint = actor.authority_hint();
         let (ticket, journal) = actor.read_access().ok_or(ActorError::StartupMismatch)?;
         self.observe(ticket);
+        self.grant();
         let mut visit = Visit {
             local: self.local,
             ticket,
@@ -45,6 +46,7 @@ impl SharedReaders {
                     Ok(changed) => served |= changed,
                     Err(error) => {
                         let slot = self.slots.remove(index);
+                        self.slots_changed();
                         self.next = index;
                         let client = Client {
                             peer: slot.peer,
@@ -61,6 +63,7 @@ impl SharedReaders {
             }
         }
         progress |= self.publication.poll(&mut visit, self.config, cx, send)?;
+        self.grant();
         if progress {
             cx.waker().wake_by_ref();
         }
@@ -81,6 +84,7 @@ impl SharedReaders {
             });
         if fenced {
             self.slots.clear();
+            self.slots_changed();
         }
         self.observed = observed;
         self.publication.changed(fenced, ticket.is_some());

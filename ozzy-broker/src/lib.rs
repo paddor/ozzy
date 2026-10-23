@@ -37,7 +37,8 @@ pub use actors::{ActorSettings, StartedPartition};
 pub use devices::{DevicePools, ShardIo};
 pub use format::format_partition_journals;
 pub use frontend::{
-    FollowerRoutes, Frontend, FrontendContext, FrontendPlan, RemoteBrokers, TransportLimits,
+    FollowerRoutes, Frontend, FrontendContext, FrontendPlan, PublicationAdmission, RemoteBrokers,
+    TransportLimits,
 };
 pub use host::host_resources;
 pub use journals::{

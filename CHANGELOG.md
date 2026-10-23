@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Breaking
+
+- A broker's reader PUB admits a live topic only to a SUB whose routing
+  identity is a client node holding a subscription to that partition, and
+  only for the exact group and incarnation topic. Bare group and empty
+  prefixes are refused, so a SUB that reads the live stream without a
+  SUBSCRIBE receives nothing. SDK readers send their node ID and join the
+  live topic after SUBSCRIBED. The node ID is a claim, not authentication.
+- A broker's follower PUB admits only configured peer brokers, which now
+  send their node ID.
+
 ### Changed
 
 - Brokers and SDK links follow connections through the socket's connection

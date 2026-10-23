@@ -61,6 +61,7 @@ pub(super) async fn build(
             .as_ref()
             .map(|admin| crate::admin::ShardLane::connect(&config.omq, admin, shard.plan.id))
             .transpose()?,
+        grants: config.reader_grants.shard(shard.plan.id),
         config,
     })
 }
