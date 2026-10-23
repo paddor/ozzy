@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Brokers and SDK links follow connections through the socket's connection
+  generation instead of monitor events, which can drop. A broker admits
+  input only from a peer's current connection; input from a connection it
+  has not tracked yet waits for the next connection snapshot instead of
+  being dropped.
+
 ## [0.4.0] - 2026-10-22
 
 ### Breaking

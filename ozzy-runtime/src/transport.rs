@@ -25,8 +25,9 @@ pub fn decode_peer_identity(identity: &[u8]) -> Option<NodeId> {
     Some(NodeId::from_bytes(native.try_into().ok()?))
 }
 
-/// Each admitted native peer's newest connection in a socket's own table.
-/// Monitor events are diagnostic and may lag; this table never does.
+/// Each admitted native peer's newest connection in a socket's ready set.
+/// Owners take it after `connections_generation` moved; unlike monitor
+/// events, the generation never lags.
 pub fn live_peers(
     connections: Vec<omq_tokio::ConnectionStatus>,
 ) -> std::collections::BTreeMap<NodeId, u64> {

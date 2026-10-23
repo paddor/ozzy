@@ -1,9 +1,8 @@
 use super::*;
-use omq_tokio::MonitorTryRecvError;
 use ozzy_proto::{EnvelopeLimits, data::DataLimits};
 
 /// Three brokers whose endpoints are never bound: each dial retries every
-/// 100 ms and emits a monitor event.
+/// 100 ms.
 fn unanswered() -> BrokerLinksConfig {
     let data = DataLimits {
         envelope: EnvelopeLimits {
@@ -43,27 +42,13 @@ fn unanswered() -> BrokerLinksConfig {
 }
 
 #[tokio::test]
-async fn links_resynchronize_after_their_monitor_lags() {
+async fn links_survive_an_owner_stall_during_reconnects() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let runtime = WriterRuntime::new().unwrap();
         let links = BrokerLinks::connect(&runtime, unanswered()).await.unwrap();
-        let control = links.0.control.clone();
-        // Hold the owner thread until the driver's monitor holds more events
-        // than it can keep.
+        // Hold the owner thread across several dial retries to every broker.
         runtime
-            .on_owner(move || async move {
-                let mut probe = control.monitor();
-                let mut events = 0;
-                while events <= 64 {
-                    match probe.try_recv() {
-                        Ok(_) => events += 1,
-                        Err(MonitorTryRecvError::Empty) => {
-                            std::thread::sleep(Duration::from_millis(10));
-                        }
-                        Err(error) => panic!("probe monitor failed: {error:?}"),
-                    }
-                }
-            })
+            .on_owner(|| async { std::thread::sleep(Duration::from_millis(700)) })
             .await
             .unwrap();
         assert!(matches!(
@@ -73,5 +58,5 @@ async fn links_resynchronize_after_their_monitor_lags() {
         links.shutdown().await.unwrap();
     })
     .await
-    .expect("links stalled after monitor lag");
+    .expect("links stalled after an owner stall");
 }

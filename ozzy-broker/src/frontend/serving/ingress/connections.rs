@@ -1,7 +1,6 @@
-//! Peer connections the monitor reports, bounded and fenced by connection ID.
+//! Ready peer connections of one socket, bounded and fenced by connection ID.
 
 use super::{FollowerRoutes, StartupError, failure};
-use omq_tokio::{MonitorEvent, MonitorTryRecvError};
 use ozzy_proto::NodeId;
 use ozzy_runtime::frontend::{Kind, Service};
 use std::collections::BTreeMap;
@@ -23,46 +22,6 @@ impl Connections {
             map: BTreeMap::new(),
             control,
         }
-    }
-
-    /// Observe up to 64 queued events: `true` once none is left, `None`
-    /// when the monitor lost some.
-    pub(super) fn drain(
-        &mut self,
-        monitor: &mut omq_tokio::MonitorStream,
-        service: &mut Service,
-        followers: &FollowerRoutes,
-    ) -> Result<Option<bool>, StartupError> {
-        for _ in 0..64 {
-            match monitor.try_recv() {
-                Ok(event) => self.observe(event, service, followers)?,
-                Err(MonitorTryRecvError::Empty) => return Ok(Some(true)),
-                Err(MonitorTryRecvError::Lagged(_)) => return Ok(None),
-                Err(error) => return Err(failure(error)),
-            }
-        }
-        Ok(Some(false))
-    }
-
-    pub(super) fn observe(
-        &mut self,
-        event: MonitorEvent,
-        service: &mut Service,
-        followers: &FollowerRoutes,
-    ) -> Result<(), StartupError> {
-        let (info, connected) = match event {
-            MonitorEvent::HandshakeSucceeded { peer, .. } => (peer, true),
-            MonitorEvent::Disconnected { peer, .. } => (peer, false),
-            _ => return Ok(()),
-        };
-        let Some(peer) = info
-            .peer_identity
-            .as_ref()
-            .and_then(|identity| ozzy_runtime::transport::decode_peer_identity(identity))
-        else {
-            return Ok(());
-        };
-        self.apply((peer, info.connection_id), connected, service, followers)
     }
 
     /// Track or retire one peer connection.
@@ -105,11 +64,9 @@ impl Connections {
         Ok(())
     }
 
-    pub(super) fn contains(&self, message: &omq_tokio::Message) -> bool {
-        message
-            .part_slice(0)
-            .and_then(|identity| <[u8; 16]>::try_from(identity).ok())
-            .is_some_and(|identity| self.map.contains_key(&NodeId::from_bytes(identity)))
+    /// Whether `connection` is the tracked connection of `peer`.
+    pub(super) fn tracks(&self, peer: NodeId, connection: u64) -> bool {
+        self.map.get(&peer) == Some(&connection)
     }
 
     fn track(

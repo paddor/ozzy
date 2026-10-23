@@ -42,8 +42,8 @@ impl FrontendContext {
     /// destination shard. Readiness
     /// does not wait for every broker. The service owns no partition authority.
     /// Input rejection drops this attempt; native record retry identity remains
-    /// with the sender. Accounting failures stop the frontend; lost monitor
-    /// events resynchronize from the socket's connection table.
+    /// with the sender. Accounting failures stop the frontend; connection changes
+    /// resynchronize from the socket's ready connection set.
     pub async fn serve(
         self,
         mut service: Service,
@@ -115,8 +115,8 @@ impl FrontendContext {
     ) -> Result<(), StartupError> {
         let mut publications = serving.followers.publications();
         self.ready()?;
-        let mut control = Ingress::new(&self.peer, self.monitor, false, &self.shutdown, serving);
-        let mut data = Ingress::new(&self.data, self.data_monitor, true, &self.shutdown, serving);
+        let mut control = Ingress::new(&self.peer, false, &self.shutdown, serving);
+        let mut data = Ingress::new(&self.data, true, &self.shutdown, serving);
         let mut publishers = Publishers::new(self.follower_pub.as_ref(), &self.reader_pub);
         let mut tick = tokio::time::interval(serving.retry);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -124,8 +124,8 @@ impl FrontendContext {
         loop {
             // Process lifecycle changes before dequeuing native input. Once
             // received, admit synchronously before observing another cutover.
-            let control_ready = control.prepare(service).await?;
-            let data_ready = data.prepare(service).await?;
+            control.prepare(service).await?;
+            data.prepare(service).await?;
             publishers.publish(service)?;
             // Only an unfinished handshake needs the retry timer; idle links
             // do not wake the dispatcher.
@@ -136,24 +136,28 @@ impl FrontendContext {
             retrying = pending;
             tokio::select! {
                 () = self.shutdown.closed() => return Ok(()),
-                event = control.monitor.recv() => control.observe(event, service).await?,
-                message = control.socket.recv_with_receipt(None), if control_ready => {
-                    let (receipt, body) = message.map_err(failure)?;
-                    control.receive(service, receipt, body)?;
+                changed = control.socket.connections_changed(control.seen.unwrap_or_default()) => {
+                    changed.map_err(failure)?;
                 }
-                event = data.monitor.recv() => data.observe(event, service).await?,
-                message = data.socket.recv_with_receipt(None), if data_ready => {
+                message = control.socket.recv_with_receipt(None) => {
                     let (receipt, body) = message.map_err(failure)?;
-                    data.receive(service, receipt, body)?;
+                    control.receive(service, receipt, body).await?;
+                }
+                changed = data.socket.connections_changed(data.seen.unwrap_or_default()) => {
+                    changed.map_err(failure)?;
+                }
+                message = data.socket.recv_with_receipt(None) => {
+                    let (receipt, body) = message.map_err(failure)?;
+                    data.receive(service, receipt, body).await?;
                 }
                 (publisher, received) = publications.receive() => {
                     receive_publication(service, serving.buffers, publisher, received)?;
                 }
                 socket = publishers.ready() => publishers.retry(socket)?,
-                Some(lane) = control.paused.writable(), if control_ready => {
+                Some(lane) = control.paused.writable() => {
                     control.retry(lane, service)?;
                 }
-                Some(lane) = data.paused.writable(), if data_ready => {
+                Some(lane) = data.paused.writable() => {
                     data.retry(lane, service)?;
                 }
                 result = service.progress_with(|message| serving.followers.send(outbound_socket(&self.peer, &self.data, &message), message), |probe| serving.followers.wait(outbound_socket(&self.peer, &self.data, &probe), probe)) => {

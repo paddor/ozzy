@@ -84,7 +84,7 @@ async fn serve(mut context: FrontendContext) -> Result<(), StartupError> {
 
 async fn rebound(context: &Context, endpoints: &Endpoints) {
     let bindings = Bindings::parse(frontend_plan(&plan(), endpoints)).unwrap();
-    let (sockets, _) = Sockets::bind(context, bindings)
+    let sockets = Sockets::bind(context, bindings)
         .await
         .expect("frontend left a bound endpoint behind");
     sockets.close().await.unwrap();

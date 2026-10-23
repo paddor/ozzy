@@ -7,7 +7,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use omq_tokio::{IdentitySocket, Message, MonitorEvent, TrySendError};
+use omq_tokio::{IdentitySocket, Message, TrySendError};
 use ozzy_proto::{
     Envelope, EnvelopeLimits, LinkSessionId, NodeId, Opcode, Packet, RequestId, handshake, nack,
 };
@@ -153,37 +153,8 @@ impl LinkState {
             .or_else(|| self.watches.frame())
     }
 
-    pub(super) fn observe(
-        &mut self,
-        sessions: &mut LinkSessions,
-        event: MonitorEvent,
-    ) -> Result<(), BrokerLinkError> {
-        match event {
-            MonitorEvent::HandshakeSucceeded { peer, .. } => {
-                if peer.peer_identity.as_deref().is_some_and(|peer| {
-                    crate::transport::decode_peer_identity(peer) != Some(self.remote)
-                }) {
-                    return Err(BrokerLinkError::Response);
-                }
-                if self.connection.is_some_and(|id| id != peer.connection_id) {
-                    self.fence(sessions);
-                }
-                self.connection = Some(peer.connection_id);
-                self.missing_route = false;
-            }
-            MonitorEvent::Disconnected { peer, .. }
-                if self.connection == Some(peer.connection_id) =>
-            {
-                self.connection = None;
-                self.fence(sessions);
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    /// Adopt the connection the socket reports after lost monitor events:
-    /// the same fences as the missed handshake or teardown.
+    /// Adopt the connection the socket reports: a new one fences the old
+    /// sessions as a handshake or teardown does.
     pub(super) fn resynchronize(&mut self, sessions: &mut LinkSessions, live: Option<u64>) {
         if self.connection == live {
             return;

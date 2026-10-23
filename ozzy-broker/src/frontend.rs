@@ -109,8 +109,6 @@ pub struct FrontendContext {
     /// Shared shutdown request and observation handle.
     pub shutdown: CloseSignal,
     context: Context,
-    monitor: omq_tokio::MonitorStream,
-    data_monitor: omq_tokio::MonitorStream,
     endpoint: Endpoint,
     limits: TransportLimits,
     ready: Option<ozzy_io::Ready<()>>,
@@ -315,14 +313,8 @@ struct Sockets {
     follower: Option<Socket>,
 }
 
-/// Connection event streams of the peer and data sockets.
-struct Monitors {
-    peer: omq_tokio::MonitorStream,
-    data: omq_tokio::MonitorStream,
-}
-
 impl Sockets {
-    async fn bind(context: &Context, bindings: Bindings) -> Result<(Self, Monitors), StartupError> {
+    async fn bind(context: &Context, bindings: Bindings) -> Result<Self, StartupError> {
         let limits = bindings.limits;
         let options = limits
             .peer()
@@ -336,10 +328,6 @@ impl Sockets {
             .socket(SocketType::Peer, options.clone())
             .identity_routing()
             .map_err(|reason| error(reason.to_string()))?;
-        let monitors = Monitors {
-            peer: peer.monitor(),
-            data: data.monitor(),
-        };
         let sockets = Self {
             data,
             peer,
@@ -363,7 +351,7 @@ impl Sockets {
             let _ = sockets.close().await;
             return Err(error(failure.to_string()));
         }
-        Ok((sockets, monitors))
+        Ok(sockets)
     }
 
     async fn close(self) -> Result<(), StartupError> {
@@ -440,7 +428,7 @@ where
     let local = bindings.local;
     let limits = bindings.limits;
     let endpoint = bindings.peer.clone();
-    let (sockets, monitors) = Sockets::bind(context, bindings).await?;
+    let sockets = Sockets::bind(context, bindings).await?;
     let serving = AssertUnwindSafe(async {
         factory(FrontendContext {
             local,
@@ -450,8 +438,6 @@ where
             reader_pub: sockets.reader.clone(),
             follower_pub: sockets.follower.clone(),
             shutdown: worker.stop.clone(),
-            monitor: monitors.peer,
-            data_monitor: monitors.data,
             endpoint,
             limits,
             ready: Some(ready),

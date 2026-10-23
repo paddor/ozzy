@@ -98,9 +98,6 @@ struct Inner {
     publications: Vec<Arc<publications::Link>>,
     shared: Arc<Shared>,
     runtime: WriterRuntime,
-    /// The driver's control socket, for lifecycle tests.
-    #[cfg(test)]
-    control: Arc<IdentitySocket>,
 }
 
 struct ReplyObserver<'a> {
