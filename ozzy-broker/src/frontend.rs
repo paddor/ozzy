@@ -109,6 +109,10 @@ pub struct FrontendContext {
     /// Shared shutdown request and observation handle.
     pub shutdown: CloseSignal,
     context: Context,
+    /// Publication socket monitors, taken before bind.
+    monitors: serving::Monitors,
+    /// What the reader PUB admits; held topics are checked against it.
+    grants: ozzy_runtime::frontend::ReaderGrants,
     endpoint: Endpoint,
     limits: TransportLimits,
     ready: Option<ozzy_io::Ready<()>>,
@@ -328,7 +332,10 @@ struct Sockets {
 }
 
 impl Sockets {
-    async fn bind(context: &Context, bindings: Bindings) -> Result<Self, StartupError> {
+    async fn bind(
+        context: &Context,
+        bindings: Bindings,
+    ) -> Result<(Self, serving::Monitors), StartupError> {
         let limits = bindings.limits;
         let options = limits
             .peer()
@@ -348,6 +355,7 @@ impl Sockets {
             reader: context.socket(
                 SocketType::Pub,
                 (publications.clone())
+                    .monitor_capacity(serving::monitor_capacity(limits.peers))
                     .subscription_admission(bindings.admission.readers.admission()),
             ),
             follower: bindings.follower.as_ref().map(|_| {
@@ -364,6 +372,7 @@ impl Sockets {
                 )
             }),
         };
+        let monitors = serving::Monitors::new(&sockets.reader, sockets.follower.as_ref());
         let result = async {
             sockets.peer.bind(bindings.peer).await?;
             sockets.data.bind(bindings.data).await?;
@@ -378,7 +387,7 @@ impl Sockets {
             let _ = sockets.close().await;
             return Err(error(failure.to_string()));
         }
-        Ok(sockets)
+        Ok((sockets, monitors))
     }
 
     async fn close(self) -> Result<(), StartupError> {
@@ -455,7 +464,8 @@ where
     let local = bindings.local;
     let limits = bindings.limits;
     let endpoint = bindings.peer.clone();
-    let sockets = Sockets::bind(context, bindings).await?;
+    let grants = bindings.admission.readers.clone();
+    let (sockets, monitors) = Sockets::bind(context, bindings).await?;
     let serving = AssertUnwindSafe(async {
         factory(FrontendContext {
             local,
@@ -465,6 +475,8 @@ where
             reader_pub: sockets.reader.clone(),
             follower_pub: sockets.follower.clone(),
             shutdown: worker.stop.clone(),
+            monitors,
+            grants,
             endpoint,
             limits,
             ready: Some(ready),

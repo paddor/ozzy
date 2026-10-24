@@ -481,8 +481,12 @@ Rules:
   Bare group and empty prefixes are refused. The broker grants the topic
   before it replies SUBSCRIBED, so readers subscribe after that reply.
 - The node is a claim: the NULL mechanism authenticates nobody, so any
-  peer that knows a subscribed node ID can claim it. An admitted SUB
-  receives the topic until it cancels or disconnects.
+  peer that knows a subscribed node ID can claim it.
+- An admitted SUB receives the topic until it cancels, disconnects, or its
+  node's subscription ends. A connection that still holds the topic at two
+  checks a second apart is closed; its SUB reconnects and admission checks
+  the replayed SUBSCRIBEs. A topic whose partition incarnation ended here is
+  never published again, so holding it costs nothing.
 
 | State | Delivers | Replay subscription |
 | --- | --- | --- |

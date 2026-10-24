@@ -215,7 +215,9 @@ Scalar failures use caller-owned output storage, including on virtual threads.
 
 - PUB and PEER replay merge by offset. The reader drops duplicates.
 - A reader's SUB joins a partition's live topic once the broker replies
-  SUBSCRIBED, which admits it; each acceptance renews that SUBSCRIBE.
+  SUBSCRIBED, which admits it; each acceptance renews that SUBSCRIBE. The
+  SUB cancels the topic once its subscription ends, before the broker closes
+  a connection that keeps it.
 - `TopicReaderConfig::refresh` sets how long a quiet partition waits before
   it checks for a lost final record.
 - Reader ACK observes delivery, not application processing. Save a

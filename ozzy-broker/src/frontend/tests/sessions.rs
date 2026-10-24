@@ -155,7 +155,7 @@ async fn shared_peer_negotiates_client_and_broker_profiles_with_independent_fenc
     .expect("shared link negotiation stalled");
 }
 
-fn serving_service(
+pub(super) fn serving_service(
     trusted: bool,
 ) -> (
     ozzy_runtime::frontend::Service,
@@ -399,7 +399,7 @@ async fn serving_tracks_live_connections_after_a_connection_burst() {
         frontend.shutdown().await.unwrap();
     })
     .await
-    .expect("serving after monitor lag stalled");
+    .expect("serving after a connection burst stalled");
 }
 
 #[tokio::test]

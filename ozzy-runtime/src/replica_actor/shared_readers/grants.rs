@@ -16,7 +16,9 @@ pub(super) struct Granted {
 }
 
 impl Granted {
+    /// The live topic admits nobody until slots publish their readers.
     pub(super) fn new(shard: ShardGrants, topic: [u8; 32]) -> Self {
+        shard.set(topic, BTreeSet::new());
         Self {
             shard,
             topic,
@@ -28,9 +30,7 @@ impl Granted {
 
 impl Drop for Granted {
     fn drop(&mut self) {
-        if !self.readers.is_empty() {
-            self.shard.set(self.topic, BTreeSet::new());
-        }
+        self.shard.end(self.topic);
     }
 }
 

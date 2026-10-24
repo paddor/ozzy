@@ -434,6 +434,18 @@ async fn publication_check() {
         ozzy_runtime::profiling::totals().get(Event::ReplicaPublicationReceived) > received,
         "followers dropped every PREPARE_PUB"
     );
+    // The granting reader cancels its live topic as it closes. The raw SUBs
+    // claiming its node keep the topic, so the leader closes both.
+    let revoked = ozzy_runtime::profiling::totals().get(Event::ReaderSubscriptionRevoked) + 2;
+    live_many(&brokers, "close granting reader", holder.close())
+        .await
+        .unwrap();
+    live_many(&brokers, "revoke kept live topics", async {
+        while ozzy_runtime::profiling::totals().get(Event::ReaderSubscriptionRevoked) < revoked {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
     live_many(&brokers, "close publication writer", writer.close())
         .await
         .unwrap();
@@ -441,9 +453,6 @@ async fn publication_check() {
     for subscriber in followers.into_iter().chain(sockets) {
         subscriber.close().await.unwrap();
     }
-    live_many(&brokers, "close granting reader", holder.close())
-        .await
-        .unwrap();
     granting.shutdown().await.unwrap();
     sdk.shutdown().await.unwrap();
     for broker in brokers {

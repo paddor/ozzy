@@ -11,8 +11,11 @@ use super::{FollowerRoutes, FrontendContext, StartupError, error, followers::Fol
 
 mod ingress;
 mod publishers;
+mod subscribers;
 use ingress::Ingress;
 use publishers::Publishers;
+use subscribers::Subscribers;
+pub(super) use subscribers::{Monitors, monitor_capacity};
 
 /// Remote brokers a frontend serves: control endpoints and follower routes.
 #[derive(Clone, Debug, Default)]
@@ -107,7 +110,8 @@ impl FrontendContext {
     }
 
     /// Publish readiness, then serve until shutdown: admit PEER input on both
-    /// lanes, forward publications, progress replies, and retry handshakes.
+    /// lanes, forward publications, revoke reader topics whose subscription
+    /// ended, progress replies, and retry handshakes.
     async fn dispatch(
         mut self,
         service: &mut Service,
@@ -118,6 +122,7 @@ impl FrontendContext {
         let mut control = Ingress::new(&self.peer, false, &self.shutdown, serving);
         let mut data = Ingress::new(&self.data, true, &self.shutdown, serving);
         let mut publishers = Publishers::new(self.follower_pub.as_ref(), &self.reader_pub);
+        let mut subscribers = Subscribers::new(&self.reader_pub, &self.grants, self.monitors);
         let mut tick = tokio::time::interval(serving.retry);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut retrying = false;
@@ -154,6 +159,7 @@ impl FrontendContext {
                     receive_publication(service, serving.buffers, publisher, received)?;
                 }
                 socket = publishers.ready() => publishers.retry(socket)?,
+                watched = subscribers.next() => subscribers.turn(watched).await?,
                 Some(lane) = control.paused.writable() => {
                     control.retry(lane, service)?;
                 }

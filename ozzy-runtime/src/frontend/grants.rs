@@ -60,6 +60,25 @@ impl ReaderGrants {
         }
     }
 
+    /// Whether a SUB of `node` may no longer hold `topic`: a partition here
+    /// still publishes it, but grants it to other nodes only. A topic whose
+    /// incarnation ended here is harmless to hold; nothing publishes it.
+    pub fn revokes(&self, topic: &[u8], node: NodeId) -> bool {
+        let Ok(topic) = <[u8; 32]>::try_from(topic) else {
+            return false;
+        };
+        let mut live = false;
+        for (_, shard) in self.shards.iter() {
+            if let Some(readers) = shard.load().get(&topic) {
+                if readers.contains(&node) {
+                    return false;
+                }
+                live = true;
+            }
+        }
+        live
+    }
+
     /// The writer of shard `id`'s snapshot, if there is that shard.
     pub fn shard(&self, id: u32) -> Option<ShardGrants> {
         let index = self.shards.iter().position(|(shard, _)| *shard == id)?;
@@ -78,16 +97,25 @@ pub struct ShardGrants {
 }
 
 impl ShardGrants {
-    /// Replace `topic`'s readers; none removes the topic. Only the shard's own
-    /// thread calls this, so no store races its load.
+    /// Replace the readers of the live `topic`, which stays live with none.
+    /// Only the shard's own thread writes, so no store races its load.
     pub fn set(&self, topic: [u8; 32], readers: BTreeSet<NodeId>) {
+        self.update(|grants| {
+            grants.insert(topic, Arc::new(readers));
+        });
+    }
+
+    /// `topic`'s incarnation ended here: nothing publishes it any more.
+    pub fn end(&self, topic: [u8; 32]) {
+        self.update(|grants| {
+            grants.remove(&topic);
+        });
+    }
+
+    fn update(&self, change: impl FnOnce(&mut Grants)) {
         let slot = &self.grants.shards[self.index].1;
         let mut next = Grants::clone(&slot.load());
-        if readers.is_empty() {
-            next.remove(&topic);
-        } else {
-            next.insert(topic, Arc::new(readers));
-        }
+        change(&mut next);
         slot.store(Arc::new(next));
     }
 }
@@ -110,8 +138,14 @@ mod tests {
         assert!(!grants.admits(&topic, other));
         assert!(!grants.admits(&topic[..16], reader));
         assert!(!grants.admits(&[], reader));
+        assert!(!grants.revokes(&topic, reader));
+        assert!(grants.revokes(&topic, other));
         grants.shard(5).unwrap().set(topic, BTreeSet::new());
         assert!(!grants.admits(&topic, reader));
+        assert!(grants.revokes(&topic, reader));
+        grants.shard(5).unwrap().end(topic);
+        assert!(!grants.revokes(&topic, reader));
+        assert!(!grants.revokes(&[8; 32], reader));
         assert!(grants.shard(4).is_none());
     }
 }

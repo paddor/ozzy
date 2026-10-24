@@ -10,8 +10,23 @@
   prefixes are refused, so a SUB that reads the live stream without a
   SUBSCRIBE receives nothing. SDK readers send their node ID and join the
   live topic after SUBSCRIBED. The node ID is a claim, not authentication.
+- A broker's reader PUB closes a connection that still holds a live topic
+  one to two seconds after its node's subscription ended. The SUB
+  reconnects, and admission checks its replayed SUBSCRIBEs. SDK readers
+  cancel the topic when they unsubscribe.
 - A broker's follower PUB admits only configured peer brokers, which now
   send their node ID.
+- The re-exported `Context` and `Endpoint` come from the omq-tokio 0.32
+  release instead of 0.31.
+
+### Added
+
+- Telemetry counts SUBSCRIBEs the reader and follower PUBs refused
+  (`reader_subscription_rejected`, `follower_subscription_rejected`), reader
+  PUB connections closed for keeping a revoked topic
+  (`reader_subscription_revoked`), and lost reader PUB monitor events
+  (`reader_subscription_lag`), after which the broker reloads every
+  connection's subscriptions from the socket.
 
 ### Changed
 
