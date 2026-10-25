@@ -34,7 +34,11 @@ impl ReplicaActor {
         let Some(snapshot) = self.driver.normal().map(NormalReplica::snapshot) else {
             return Ok(true);
         };
-        if batch.scope() != snapshot.scope || !self.application_ready() {
+        // Until the ledger restarts for this core, repair supplies the suffix.
+        if batch.scope() != snapshot.scope
+            || !self.application_ready()
+            || !self.receipt_current(&snapshot)
+        {
             return Ok(true);
         }
         let consumed = self
