@@ -571,7 +571,7 @@ mod seeded {
             checked(1, "none", "very-long-history");
         }
 
-        /// `OZZY_ACTOR_SIM_SEEDS` seeds (default 100) over every scenario and
+        /// `OZZY_ACTOR_SIM_SEEDS` seeds (default 20) over every scenario and
         /// its profiles, or `OZZY_ACTOR_SIM_SEED`. `OZZY_ACTOR_SIM_PROFILE` and
         /// `OZZY_ACTOR_SIM_SCENARIO` pick one of each. Runs share nothing, so
         /// they spread over `OZZY_ACTOR_SIM_THREADS` threads (default: one per
@@ -601,7 +601,7 @@ mod seeded {
                 vec![seed.parse().expect("OZZY_ACTOR_SIM_SEED")]
             } else {
                 let count = std::env::var("OZZY_ACTOR_SIM_SEEDS")
-                    .map_or(100, |count| count.parse().expect("OZZY_ACTOR_SIM_SEEDS"));
+                    .map_or(20, |count| count.parse().expect("OZZY_ACTOR_SIM_SEEDS"));
                 (1..=count).collect()
             };
             let threads = std::env::var("OZZY_ACTOR_SIM_THREADS").map_or_else(

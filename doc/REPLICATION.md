@@ -80,7 +80,8 @@ sequenceDiagram
 - A receipt reports a retained prefix and cumulative bytes. It grants no vote,
   capacity, or durability.
 - Receive epochs are fresh and nonzero. Reset, view change, or restart fences
-  old repair; a reconnect alone keeps retained work.
+  old repair; a reconnect alone keeps retained work. An activated follower
+  stages nothing until its receipt restarts for the new view.
 - A new epoch needs a correlated probe and verified history. Counters within
   an epoch never retract or wrap.
 - The leader keeps one window in flight past its announced commit. Followers

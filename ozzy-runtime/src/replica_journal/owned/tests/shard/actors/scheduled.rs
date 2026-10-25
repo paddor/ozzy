@@ -3,6 +3,7 @@ use crate::replica_actor::{ScheduleError, ScheduledReplica};
 
 type Scheduled = ScheduledReplica;
 
+mod activation;
 mod disconnected;
 mod donors;
 mod groups;

@@ -280,6 +280,12 @@ impl ReplicaActor {
         Ok(())
     }
 
+    /// Whether the receipt ledger belongs to this core's scope and journal
+    /// generation. Activation leaves the old one until the next `flow_round`.
+    pub(super) fn receipt_current(&self, snapshot: &ozzy_replication::ReplicaSnapshot) -> bool {
+        self.work.flow.key == Some((snapshot.scope, snapshot.journal.generation))
+    }
+
     pub(super) fn flow_round(&mut self, now: Duration) -> Result<(), ActorError> {
         if !self.application_ready() {
             return Ok(());
@@ -287,7 +293,8 @@ impl ReplicaActor {
         let snapshot = require_normal(&self.driver)?.snapshot();
         let key = (snapshot.scope, snapshot.journal.generation);
         if self.work.flow.key != Some(key) {
-            if snapshot.pending_operations != 0 {
+            // A suffix staged in the old ledger would be admitted outside the new one.
+            if snapshot.pending_operations != 0 || self.work.receive_has_work() {
                 return Err(ActorError::history(HistoryReason::ReceiveWindow));
             }
             self.work

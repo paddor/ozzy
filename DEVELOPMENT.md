@@ -254,8 +254,9 @@ A failing seed prints its parameters, schedule hash, and this command with
 `OZZY_ACTOR_SIM_SEED`, `OZZY_ACTOR_SIM_PROFILE`, and
 `OZZY_ACTOR_SIM_SCENARIO` set. A run whose faults left too little progress
 to prove much is vacuous: the campaign lists it and fails only above one in
-twenty. Runs spread over one thread per core; `OZZY_ACTOR_SIM_THREADS` sets
-the count. The fast suite also loses the leader after a long history and
+twenty. It runs 20 seeds unless `OZZY_ACTOR_SIM_SEEDS` sets another count.
+Runs spread over one thread per core; `OZZY_ACTOR_SIM_THREADS` sets the
+count. The fast suite also loses the leader after a long history and
 repeatedly; `seeded::stress` adds a very long history.
 `OZZY_ACTOR_SIM_TRACE=1` prints each broker's view and positions as they
 change.

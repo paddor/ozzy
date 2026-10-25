@@ -36,6 +36,12 @@
   has not tracked yet waits for the next connection snapshot instead of
   being dropped.
 
+### Fixed
+
+- A follower no longer exits with "replica flow history mismatch" after a
+  leader change. A PREPARE that arrived right after its new view activated
+  was staged in the old view's receipt; the leader now repairs it instead.
+
 ## [0.4.0] - 2026-10-22
 
 ### Breaking
