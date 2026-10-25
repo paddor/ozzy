@@ -38,6 +38,8 @@ pub(super) struct Config {
     pub buffers: ReceiveBuffers,
     pub transport: TransportLimits,
     pub remote: crate::RemoteBrokers,
+    /// Live reader topics the reader PUB admits, one snapshot per shard.
+    pub reader_grants: ozzy_runtime::frontend::ReaderGrants,
     pub peers: usize,
     pub budgets: BTreeMap<u32, Budgets>,
     pub catalog: Vec<ozzy_proto::directory::TopicPage>,
@@ -127,6 +129,9 @@ impl Config {
             buffers,
             transport,
             peers: clients + brokers.len(),
+            reader_grants: ozzy_runtime::frontend::ReaderGrants::new(
+                checked.plan.shards.iter().map(|shard| shard.id),
+            ),
             remote: crate::RemoteBrokers {
                 control: brokers,
                 followers,

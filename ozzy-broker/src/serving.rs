@@ -301,11 +301,16 @@ async fn start_frontend(
             )
             .await
     };
+    let admission = crate::PublicationAdmission {
+        readers: config.reader_grants.clone(),
+        followers: config.remote.control.keys().copied().collect(),
+    };
     let plan = crate::FrontendPlan {
         broker: &checked.plan,
         local: config.local,
         endpoints: &checked.local_broker()?.endpoints,
         limits: config.transport,
+        admission: &admission,
     };
     Frontend::start_registered(plan, Some(config.omq.clone()), factory, startup)
         .await

@@ -55,8 +55,6 @@ pub(super) struct Startup {
     pub(super) shared: Arc<Shared>,
     pub(super) control: Arc<IdentitySocket>,
     data: Arc<IdentitySocket>,
-    /// Taken before any connect, so the driver sees every handshake.
-    monitor: omq_tokio::MonitorStream,
     readers: Rc<readers::Registry>,
 }
 
@@ -99,7 +97,6 @@ impl Startup {
                 .socket(SocketType::Peer, options)
                 .identity_routing()?,
         );
-        let monitor = control.monitor();
         let readers = Rc::new(readers::Registry::new(&config, &shared.readers));
         let startup = Self {
             sdk,
@@ -107,7 +104,6 @@ impl Startup {
             shared,
             control,
             data,
-            monitor,
             readers,
         };
         Ok((startup, sessions))
@@ -166,12 +162,9 @@ impl Startup {
         let (registrations, received) = mpsc::channel(driver::TURN);
         // A place per reader slot, so a new inbox never finds it full.
         let (inboxes, installs) = mpsc::channel(readers::Admission::capacity(&config)?.0.max(1));
-        #[cfg(test)]
-        let control = self.control.clone();
         let inputs = driver::Inputs {
             control: self.control,
             data: self.data,
-            monitor: self.monitor,
             registrations: received,
             inboxes: installs,
         };
@@ -189,8 +182,6 @@ impl Startup {
             publications: brokers.publications,
             shared: self.shared,
             runtime: self.sdk,
-            #[cfg(test)]
-            control,
         }));
         tokio::task::spawn_local(driver.run());
         for driver in brokers.publication_drivers {

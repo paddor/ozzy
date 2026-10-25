@@ -5,10 +5,7 @@ mod connections;
 use super::{FollowerRoutes, Serving, StartupError, error, failure, fatal};
 use connections::Connections;
 use futures::{StreamExt, stream::FuturesUnordered};
-use omq_tokio::{
-    IdentitySocket, Message, MonitorEvent, MonitorRecvError, MonitorStream, MonitorTryRecvError,
-    ReceiveLane, ReceiveReceipt,
-};
+use omq_tokio::{IdentitySocket, Message, ReceiveLane, ReceiveReceipt};
 use ozzy_proto::{NodeId, Opcode};
 use ozzy_runtime::transport::Frames;
 use ozzy_runtime::{
@@ -25,14 +22,14 @@ type Lane = (u32, Kind, Class);
 type LaneWake = Pin<Box<dyn Future<Output = Lane>>>;
 const TURN_MESSAGES: usize = 16;
 const TURN_BYTES: usize = 2 * 1024 * 1024;
-/// Monitor events dropped at most before a lost window resynchronizes.
-const LOST_EVENTS: usize = 1024;
 
 pub(super) struct Ingress<'a> {
     pub(super) socket: &'a IdentitySocket,
     shutdown: &'a crate::signal::CloseSignal,
     serving: Serving<'a>,
-    pub(super) monitor: MonitorStream,
+    /// Connection generation the tracked set reflects; `None` before the
+    /// first snapshot.
+    pub(super) seen: Option<u64>,
     connections: Connections,
     pub(super) paused: PausedSources,
     bulk: bool,
@@ -41,7 +38,6 @@ pub(super) struct Ingress<'a> {
 impl<'a> Ingress<'a> {
     pub(super) fn new(
         socket: &'a IdentitySocket,
-        monitor: MonitorStream,
         bulk: bool,
         shutdown: &'a crate::signal::CloseSignal,
         serving: Serving<'a>,
@@ -50,7 +46,7 @@ impl<'a> Ingress<'a> {
             socket,
             shutdown,
             serving,
-            monitor,
+            seen: None,
             connections: Connections::new(!bulk),
             paused: PausedSources::default(),
             bulk,
@@ -61,44 +57,18 @@ impl<'a> Ingress<'a> {
         &self.serving.followers.routes
     }
 
-    pub(super) async fn observe(
-        &mut self,
-        event: Result<MonitorEvent, MonitorRecvError>,
-        service: &mut Service,
-    ) -> Result<(), StartupError> {
-        match event {
-            Ok(event) => self
-                .connections
-                .observe(event, service, self.follower_routes()),
-            Err(MonitorRecvError::Lagged(_)) => self.resynchronize(service).await,
-            Err(error) => Err(failure(error)),
+    /// Bring the tracked connections up to the socket's ready set when it
+    /// changed. A connection's input becomes readable only after the set
+    /// changes for it; input from one that became ready after this snapshot
+    /// is refused until the next turn tracks it, and its sender retries.
+    pub(super) async fn prepare(&mut self, service: &mut Service) -> Result<(), StartupError> {
+        let generation = self.socket.connections_generation();
+        if self.seen == Some(generation) {
+            return Ok(());
         }
-    }
-
-    pub(super) async fn prepare(&mut self, service: &mut Service) -> Result<bool, StartupError> {
-        let routes = self.follower_routes();
-        if let Some(ready) = self.connections.drain(&mut self.monitor, service, routes)? {
-            return Ok(ready);
-        }
-        self.resynchronize(service).await?;
-        // Another lost window leaves events queued and wakes the monitor arm.
-        Ok(self
-            .connections
-            .drain(&mut self.monitor, service, routes)?
-            .unwrap_or(false))
-    }
-
-    /// The monitor is diagnostic and drops events when it lags. Rebuild the
-    /// tracked connections from the socket's own table instead. Events
-    /// queued meanwhile replay without effect or in order.
-    async fn resynchronize(&mut self, service: &mut Service) -> Result<(), StartupError> {
-        for _ in 0..LOST_EVENTS {
-            match self.monitor.try_recv() {
-                Ok(_) | Err(MonitorTryRecvError::Lagged(_)) => {}
-                Err(MonitorTryRecvError::Empty) => break,
-                Err(error) => return Err(failure(error)),
-            }
-        }
+        // The generation precedes the snapshot it describes, so a change
+        // between the two wakes the next turn.
+        self.seen = Some(generation);
         let live =
             ozzy_runtime::transport::live_peers(self.socket.connections().await.map_err(failure)?);
         let routes = self.follower_routes();
@@ -117,12 +87,20 @@ impl<'a> Ingress<'a> {
         Ok(())
     }
 
-    pub(super) fn receive(
+    pub(super) async fn receive(
         &mut self,
         service: &mut Service,
         receipt: ReceiveReceipt,
         body: Message,
     ) -> Result<(), StartupError> {
+        // Input of a connection that became ready after the last snapshot:
+        // track it first. Admission still refuses any older connection.
+        if source(&receipt)
+            .is_some_and(|(peer, connection)| !self.connections.tracks(peer, connection))
+            && self.seen != Some(self.socket.connections_generation())
+        {
+            self.prepare(service).await?;
+        }
         if let Some(pressure) = self.admit(service, receipt, body)? {
             self.paused.hold(service, pressure)?;
         }
@@ -141,11 +119,14 @@ impl<'a> Ingress<'a> {
             .and_then(ozzy_runtime::transport::native_peer_identity)
             .ok_or_else(|| error("PEER receive lacks an identity"))?;
         let message = Message::with_prefix(identity, body.clone());
-        // The owner processed lifecycle changes before receiving this body.
-        // Admission contains no await or lifecycle observation: an old body
-        // cannot cross client retirement into a reused slot. OMQ fences queued
+        // Only the tracked connection of a peer is admitted, so an old body
+        // cannot cross client retirement into a reused slot. Admission itself
+        // contains no await or lifecycle observation. OMQ fences queued
         // generations and rejects restoration to a retired source.
-        if receipt.lane().is_none() || !self.connections.contains(&message) {
+        if receipt.lane().is_none()
+            || !source(&receipt)
+                .is_some_and(|(peer, connection)| self.connections.tracks(peer, connection))
+        {
             return Ok(None);
         }
         let (message, retained) = match self.serving.buffers.prepare_borrowed(&message) {
@@ -281,6 +262,13 @@ impl<'a> Ingress<'a> {
         }
         Ok(())
     }
+}
+
+/// The peer and connection a PEER body arrived on.
+fn source(receipt: &ReceiveReceipt) -> Option<(NodeId, u64)> {
+    let identity = receipt.peer_identity()?;
+    let peer = ozzy_runtime::transport::decode_peer_identity(receipt.identity()?)?;
+    Some((peer, identity.peer_info().connection_id))
 }
 
 struct Pressure {

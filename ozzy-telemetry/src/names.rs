@@ -301,6 +301,16 @@ events! {
         ReplicaPublicationQueueDrop => "replica_publication_queue_drop",
         /// Follower PUB frame arrived beyond the contiguous retained prefix.
         ReplicaPublicationGap => "replica_publication_gap",
+        /// Follower PUB admission refused a SUBSCRIBE of an unconfigured peer.
+        FollowerSubscriptionRejected => "follower_subscription_rejected",
+        /// Reader PUB admission refused a SUBSCRIBE: not a live topic the
+        /// SUB's node holds a subscription to.
+        ReaderSubscriptionRejected => "reader_subscription_rejected",
+        /// Reader PUB connection closed: it held a live topic after its node's
+        /// subscription ended.
+        ReaderSubscriptionRevoked => "reader_subscription_revoked",
+        /// Reader PUB monitor lost events; each connection it knew is closed.
+        ReaderSubscriptionLag => "reader_subscription_lag",
         /// Leader validation check found its journal owner running a command,
         /// rolling, or holding unobserved completions. Counted per check.
         ValidationOwnerWait => "validation_owner_wait",

@@ -109,8 +109,10 @@ pub struct FrontendContext {
     /// Shared shutdown request and observation handle.
     pub shutdown: CloseSignal,
     context: Context,
-    monitor: omq_tokio::MonitorStream,
-    data_monitor: omq_tokio::MonitorStream,
+    /// Publication socket monitors, taken before bind.
+    monitors: serving::Monitors,
+    /// What the reader PUB admits; held topics are checked against it.
+    grants: ozzy_runtime::frontend::ReaderGrants,
     endpoint: Endpoint,
     limits: TransportLimits,
     ready: Option<ozzy_io::Ready<()>>,
@@ -146,6 +148,18 @@ pub struct FrontendPlan<'a> {
     pub endpoints: &'a Endpoints,
     /// Directional OMQ queue and frame bounds.
     pub limits: TransportLimits,
+    /// Who may subscribe to each publication socket.
+    pub admission: &'a PublicationAdmission,
+}
+
+/// Who may subscribe to this broker's publications. A subscriber is its SUB's
+/// routing identity, a claim the transport does not authenticate.
+#[derive(Clone, Debug, Default)]
+pub struct PublicationAdmission {
+    /// Clients holding a subscription to a partition admit its live topic.
+    pub readers: ozzy_runtime::frontend::ReaderGrants,
+    /// Brokers that may follow this one's canonical stream.
+    pub followers: std::collections::BTreeSet<NodeId>,
 }
 
 impl Frontend {
@@ -272,6 +286,7 @@ impl Drop for Frontend {
 struct Bindings {
     local: NodeId,
     limits: TransportLimits,
+    admission: PublicationAdmission,
     peer: Endpoint,
     data: Endpoint,
     reader: Endpoint,
@@ -300,6 +315,7 @@ impl Bindings {
         Ok(Self {
             local: plan.local,
             limits: plan.limits,
+            admission: plan.admission.clone(),
             peer: parse(&endpoints.peer)?,
             data: parse(&endpoints.data_peer)?,
             reader: parse(&endpoints.reader_pub)?,
@@ -315,14 +331,11 @@ struct Sockets {
     follower: Option<Socket>,
 }
 
-/// Connection event streams of the peer and data sockets.
-struct Monitors {
-    peer: omq_tokio::MonitorStream,
-    data: omq_tokio::MonitorStream,
-}
-
 impl Sockets {
-    async fn bind(context: &Context, bindings: Bindings) -> Result<(Self, Monitors), StartupError> {
+    async fn bind(
+        context: &Context,
+        bindings: Bindings,
+    ) -> Result<(Self, serving::Monitors), StartupError> {
         let limits = bindings.limits;
         let options = limits
             .peer()
@@ -336,19 +349,30 @@ impl Sockets {
             .socket(SocketType::Peer, options.clone())
             .identity_routing()
             .map_err(|reason| error(reason.to_string()))?;
-        let monitors = Monitors {
-            peer: peer.monitor(),
-            data: data.monitor(),
-        };
         let sockets = Self {
             data,
             peer,
-            reader: context.socket(SocketType::Pub, publications.clone()),
-            follower: bindings
-                .follower
-                .as_ref()
-                .map(|_| context.socket(SocketType::Pub, publications)),
+            reader: context.socket(
+                SocketType::Pub,
+                (publications.clone())
+                    .monitor_capacity(serving::monitor_capacity(limits.peers))
+                    .subscription_admission(bindings.admission.readers.admission()),
+            ),
+            follower: bindings.follower.as_ref().map(|_| {
+                let followers = bindings.admission.followers.clone();
+                // A follower subscribes to every group it may host.
+                let admission = move |request: &omq_tokio::SubscriptionRequest<'_>| {
+                    (request.peer.identity.as_deref())
+                        .and_then(ozzy_runtime::transport::decode_peer_identity)
+                        .is_some_and(|node| followers.contains(&node))
+                };
+                context.socket(
+                    SocketType::Pub,
+                    publications.subscription_admission(admission),
+                )
+            }),
         };
+        let monitors = serving::Monitors::new(&sockets.reader, sockets.follower.as_ref());
         let result = async {
             sockets.peer.bind(bindings.peer).await?;
             sockets.data.bind(bindings.data).await?;
@@ -440,6 +464,7 @@ where
     let local = bindings.local;
     let limits = bindings.limits;
     let endpoint = bindings.peer.clone();
+    let grants = bindings.admission.readers.clone();
     let (sockets, monitors) = Sockets::bind(context, bindings).await?;
     let serving = AssertUnwindSafe(async {
         factory(FrontendContext {
@@ -450,8 +475,8 @@ where
             reader_pub: sockets.reader.clone(),
             follower_pub: sockets.follower.clone(),
             shutdown: worker.stop.clone(),
-            monitor: monitors.peer,
-            data_monitor: monitors.data,
+            monitors,
+            grants,
             endpoint,
             limits,
             ready: Some(ready),

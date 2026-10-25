@@ -155,7 +155,7 @@ async fn shared_peer_negotiates_client_and_broker_profiles_with_independent_fenc
     .expect("shared link negotiation stalled");
 }
 
-fn serving_service(
+pub(super) fn serving_service(
     trusted: bool,
 ) -> (
     ozzy_runtime::frontend::Service,
@@ -325,7 +325,7 @@ async fn serving_lifecycle(trusted: bool, distinct: bool) {
 }
 
 #[tokio::test]
-async fn serving_resynchronizes_connections_after_its_monitor_lags() {
+async fn serving_tracks_live_connections_after_a_connection_burst() {
     use ozzy_runtime::frontend::{ReceiveBuffers, ReceiveStorage};
     tokio::time::timeout(Duration::from_secs(10), async {
         let omq = Context::new();
@@ -336,9 +336,10 @@ async fn serving_resynchronizes_connections_after_its_monitor_lags() {
             frontend_plan(&plan(), &endpoints),
             omq.clone(),
             move |context| async move {
-                // Each short connection emits three monitor events before the
-                // dispatcher reads any: more than the monitor holds.
-                for id in 0..30_u8 {
+                // Short connections come and go before the dispatcher runs;
+                // only the live set counts. With the client they stay under
+                // the peer limit, so a slow teardown cannot refuse it.
+                for id in 0..4_u8 {
                     let socket = storm.socket(
                         SocketType::Peer,
                         omq_tokio::Options::default()
@@ -398,7 +399,7 @@ async fn serving_resynchronizes_connections_after_its_monitor_lags() {
         frontend.shutdown().await.unwrap();
     })
     .await
-    .expect("serving after monitor lag stalled");
+    .expect("serving after a connection burst stalled");
 }
 
 #[tokio::test]

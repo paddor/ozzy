@@ -24,6 +24,9 @@ pub use port::{
     Pending, Port, PortError, PortSetupError, ProgressError, ReplyResult, RouteError, RouteResult,
 };
 
+mod grants;
+pub use grants::{ReaderGrants, ShardGrants};
+
 mod publication;
 pub use publication::{PublicationError, PublicationResult, PublicationSocket};
 

@@ -3,8 +3,8 @@
 
 use super::{
     Active, Body, BrokerLinkError, Bytes, EnvelopeLimits, Established, LinkSessionId, LinkSessions,
-    LinkState, Local, Message, Opcode, Packet, btree_map, group_rejection, handshake, nack, packet,
-    progress_rejection, reader_rejection,
+    LinkState, Local, Message, Opcode, Packet, Reply, btree_map, group_rejection, handshake, nack,
+    packet, progress_rejection, reader_rejection,
 };
 
 impl LinkState {
@@ -23,7 +23,7 @@ impl LinkState {
         if self.route(local, message, packet, link.map(|link| link.session))? {
             return Ok(());
         }
-        self.complete(message, packet, link)
+        self.complete(local, message, packet, link)
     }
 
     /// Hand watch, APPEND, and uncorrelated reader NACK traffic to its owner.
@@ -57,6 +57,7 @@ impl LinkState {
     /// Complete the active request `packet` answers on the live `link`.
     fn complete(
         &mut self,
+        local: &Local,
         message: &Message,
         packet: Packet<'_>,
         link: Option<Established>,
@@ -89,6 +90,11 @@ impl LinkState {
             self.shared
                 .delivered
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        // The broker granted the live topic before this reply; its SUB may
+        // subscribe now.
+        if let Ok(Reply::Subscribed(selected)) = &result {
+            local.readers.accept(self.remote, selected);
         }
         let _ = active.command.reply.send(result);
         Ok(())

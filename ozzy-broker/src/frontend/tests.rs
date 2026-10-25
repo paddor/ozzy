@@ -7,6 +7,7 @@ use std::{
 };
 use tokio::sync::{Semaphore, oneshot};
 
+mod admission;
 mod dispatch;
 mod network;
 mod sessions;
@@ -67,12 +68,17 @@ fn local() -> NodeId {
     NodeId::from_bytes([9; 16])
 }
 
+/// Publication admission that admits no subscriber.
+static NO_SUBSCRIBERS: std::sync::LazyLock<crate::PublicationAdmission> =
+    std::sync::LazyLock::new(Default::default);
+
 fn frontend_plan<'a>(plan: &'a BrokerPlan, endpoints: &'a Endpoints) -> FrontendPlan<'a> {
     FrontendPlan {
         broker: plan,
         local: local(),
         endpoints,
         limits: limits(),
+        admission: &NO_SUBSCRIBERS,
     }
 }
 

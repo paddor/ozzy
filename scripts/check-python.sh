@@ -14,6 +14,8 @@ ozzy_python_base="$(dirname "$(dirname "$(readlink -f "$PYO3_PYTHON")")")"
 export LD_LIBRARY_PATH="$ozzy_python_base/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 ozzy_python_wheels="$CARGO_TARGET_DIR/python/$ozzy_python_version/wheels"
 mkdir -p "$ozzy_python_wheels"
+# A wheel of an earlier version would conflict with the one built below.
+rm -f "$ozzy_python_wheels"/ozzy-*.whl
 
 uv run --project bindings/python --no-sync ruff check bindings/python/python bindings/python/tests bindings/python/examples
 uv run --project bindings/python --no-sync ruff format --check bindings/python/python bindings/python/tests bindings/python/examples

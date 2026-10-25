@@ -523,3 +523,58 @@ async fn retained_publication_frames_cannot_exceed_one_readers_reserved_storage(
     );
     assert!(healthy.publication().is_some());
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_accepted_subscription_admits_its_live_topic_on_its_broker_until_unselected() {
+    let context = omq_tokio::Context::new();
+    let readers = readers();
+    let inbox = inbox(&readers, &context).await;
+    let subscribe = reader::Subscribe {
+        subscription: subscription(&inbox, 1),
+        target: reader::Target::Group {
+            authority: ozzy_proto::data::Authority {
+                group_id: GroupId::from_bytes([3; 16]),
+                config_epoch: 1,
+                view: 2,
+            },
+            partition: PartitionIncarnation::from_bytes([4; 16]),
+            owner_epoch: 1,
+        },
+        start: reader::Start::Offset(0),
+    };
+    let sent = Sent {
+        broker: broker(),
+        session: LinkSessionId::from_bytes([6; 16]),
+        request: RequestId::from_bytes([1; 16]),
+    };
+    readers
+        .registry
+        .select(&Arc::downgrade(&inbox), sent, &subscribe);
+    assert!(
+        readers.registry.admitted(broker()).is_empty(),
+        "a sent SUBSCRIBE admits nothing yet"
+    );
+    let subscribed = reader::Subscribed {
+        subscription: subscribe.subscription,
+        source: source(),
+        resolved_offset: 0,
+    };
+    readers.registry.accept(broker(), &subscribed);
+    let topic = Bytes::copy_from_slice(&reader::publication_topic(source()).unwrap());
+    let first = readers.registry.admitted(broker());
+    assert_eq!(first.keys().collect::<Vec<_>>(), [&topic]);
+    assert!(
+        readers
+            .registry
+            .admitted(NodeId::from_bytes([9; 16]))
+            .is_empty(),
+        "another broker admits nothing"
+    );
+    readers.registry.accept(broker(), &subscribed);
+    assert!(
+        readers.registry.admitted(broker())[&topic] > first[&topic],
+        "each acceptance renews the SUBSCRIBE"
+    );
+    readers.registry.unselect(&subscribed);
+    assert!(readers.registry.admitted(broker()).is_empty());
+}

@@ -3,10 +3,7 @@ use std::{collections::BTreeMap, rc::Rc, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use futures::StreamExt;
-use omq_tokio::{
-    Identity, IdentitySocket, Message, MonitorEvent, MonitorRecvError, MonitorStream,
-    MonitorTryRecvError,
-};
+use omq_tokio::{Identity, IdentitySocket, Message};
 use ozzy_proto::{EnvelopeLimits, NodeId, Opcode, Packet, RequestId, decode_packet};
 use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
 
@@ -20,8 +17,6 @@ pub(super) use link::LinkState;
 
 pub(super) const TURN: usize = 32;
 const TURN_BYTES: usize = 2 * 1024 * 1024;
-/// Monitor events dropped at most before a lost window resynchronizes.
-const LOST_EVENTS: usize = 1024;
 
 #[derive(Debug)]
 pub(super) struct Lease {
@@ -61,19 +56,15 @@ enum Event {
     Inbox(readers::Registration),
     Control((Identity, Message)),
     Data((omq_tokio::ReceiveReceipt, Message)),
-    Monitor(MonitorEvent),
-    /// The monitor dropped events.
-    Lost,
     Wake,
 }
 
 /// The SDK owner's inputs: control and data sockets, each connected to
-/// every configured broker, the control socket's lifecycle monitor, and the
-/// topics and reader inboxes callers register.
+/// every configured broker, and the topics and reader inboxes callers
+/// register.
 pub(super) struct Inputs {
     pub(super) control: Arc<IdentitySocket>,
     pub(super) data: Arc<IdentitySocket>,
-    pub(super) monitor: MonitorStream,
     pub(super) registrations: mpsc::Receiver<Registration>,
     pub(super) inboxes: mpsc::Receiver<readers::Registration>,
 }
@@ -91,7 +82,9 @@ pub(super) struct Local {
 pub(super) struct Driver {
     control: Arc<IdentitySocket>,
     data: Arc<IdentitySocket>,
-    monitor: MonitorStream,
+    /// Control connection generation the links reflect; `None` before the
+    /// first snapshot.
+    seen: Option<u64>,
     registrations: mpsc::Receiver<Registration>,
     inboxes: mpsc::Receiver<readers::Registration>,
     links: Vec<LinkState>,
@@ -106,7 +99,6 @@ impl Driver {
         Inputs {
             control,
             data,
-            monitor,
             registrations,
             inboxes,
         }: Inputs,
@@ -117,7 +109,7 @@ impl Driver {
         Self {
             control,
             data,
-            monitor,
+            seen: None,
             registrations,
             inboxes,
             links,
@@ -147,41 +139,15 @@ impl Driver {
         self.shared.changed.notify_changed();
     }
 
-    fn observe(&mut self, event: MonitorEvent) -> Result<(), BrokerLinkError> {
-        let (MonitorEvent::HandshakeSucceeded { peer, .. }
-        | MonitorEvent::Disconnected { peer, .. }) = &event
-        else {
+    /// Rebuild each link's connection from the control socket's ready set
+    /// when it changed. The generation precedes the snapshot it describes,
+    /// so a change between the two wakes the next turn.
+    async fn synchronize(&mut self) -> Result<(), BrokerLinkError> {
+        let generation = self.control.connections_generation();
+        if self.seen == Some(generation) {
             return Ok(());
-        };
-        let node = peer
-            .peer_identity
-            .as_deref()
-            .and_then(crate::transport::decode_peer_identity);
-        if let Some(link) = self
-            .links
-            .iter_mut()
-            .find(|link| Some(link.remote) == node || link.connection == Some(peer.connection_id))
-        {
-            link.observe(&mut self.local.sessions, event)?;
         }
-        Ok(())
-    }
-
-    /// The monitor is diagnostic and drops events when it lags. Rebuild each
-    /// link's connection from the socket's own table instead. Events queued
-    /// meanwhile replay without effect or in order.
-    async fn resynchronize(&mut self) -> Result<(), BrokerLinkError> {
-        for _ in 0..LOST_EVENTS {
-            match self.monitor.try_recv() {
-                Ok(_) | Err(MonitorTryRecvError::Lagged(_)) => {}
-                Err(MonitorTryRecvError::Empty) => break,
-                Err(_) => {
-                    return Err(BrokerLinkError::Failed(
-                        "SDK transport monitor closed".into(),
-                    ));
-                }
-            }
-        }
+        self.seen = Some(generation);
         let live = crate::transport::live_peers(self.control.connections().await?);
         for link in &mut self.links {
             let connection = live.get(&link.remote).copied();
@@ -301,13 +267,10 @@ impl Driver {
             }
             let interests = self.shared.interests.generation();
             let readers = self.shared.readers.changed.generation();
-            let mut lost = false;
-            if self.turn(&mut lost)? {
+            // Connection changes fence root sessions before their queued input.
+            self.synchronize().await?;
+            if self.turn()? {
                 tokio::task::yield_now().await;
-                continue;
-            }
-            if lost {
-                self.resynchronize().await?;
                 continue;
             }
             let Some(event) = self.wait(interests, readers).await? else {
@@ -318,18 +281,15 @@ impl Driver {
                 Event::Inbox(registration) => self.install(registration),
                 Event::Control((identity, body)) => self.receive_control(&identity, body)?,
                 Event::Data((receipt, body)) => self.receive_data(receipt, body)?,
-                Event::Monitor(event) => self.observe(event)?,
-                Event::Lost => self.resynchronize().await?,
                 Event::Wake => {}
             }
         }
     }
 
-    /// One bounded turn over registrations, inboxes, monitor, control, and
-    /// data input, then every link's progress. `true` when a bound was
-    /// reached and more may be ready. Sets `lost` when the monitor dropped
-    /// events; input stays queued until links resynchronize.
-    fn turn(&mut self, lost: &mut bool) -> Result<bool, BrokerLinkError> {
+    /// One bounded turn over registrations, inboxes, control, and data input,
+    /// then every link's progress. `true` when a bound was reached and more
+    /// may be ready.
+    fn turn(&mut self) -> Result<bool, BrokerLinkError> {
         let mut full = drained(|| match self.registrations.try_recv() {
             Ok(registration) => {
                 self.register(registration);
@@ -344,21 +304,6 @@ impl Driver {
             }
             Err(_) => Ok(None),
         })?;
-        // Lifecycle events fence root sessions before their queued input.
-        full |= drained(|| match self.monitor.try_recv() {
-            Ok(event) => self.observe(event).map(|()| Some(0)),
-            Err(MonitorTryRecvError::Empty) => Ok(None),
-            Err(MonitorTryRecvError::Lagged(_)) => {
-                *lost = true;
-                Ok(None)
-            }
-            Err(_) => Err(BrokerLinkError::Failed(
-                "SDK transport monitor closed".into(),
-            )),
-        })?;
-        if *lost {
-            return Ok(false);
-        }
         full |= drained(|| match self.control.try_recv_from() {
             Ok((identity, body)) => {
                 let bytes = body.byte_len();
@@ -444,13 +389,10 @@ impl Driver {
             _ = ready.next() => Event::Wake,
             received = self.control.recv_from() => Event::Control(received?),
             received = self.data.recv_with_receipt(None) => Event::Data(received?),
-            event = self.monitor.recv() => match event {
-                Ok(event) => Event::Monitor(event),
-                Err(MonitorRecvError::Lagged(_)) => Event::Lost,
-                Err(_) => {
-                    return Err(BrokerLinkError::Failed("SDK transport monitor closed".into()));
-                }
-            },
+            changed = self.control.connections_changed(self.seen.unwrap_or_default()) => {
+                changed?;
+                Event::Wake
+            }
             () = due => Event::Wake,
         }))
     }

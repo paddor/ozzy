@@ -311,6 +311,16 @@ async fn publication_check() {
     let runtime = WriterRuntime::new().unwrap();
     let deployment = deployment(root.path(), DeploymentMode::Three, 1);
     let sdk = links(&runtime, &deployment[0].0).await;
+    // A separate consumer, so its unread inbox pauses only its own links.
+    let node = NodeId::from_bytes(*Uuid::now_v7().as_bytes());
+    let granting = role_links_with_config(
+        &runtime,
+        &deployment[0].0,
+        handshake::CONSUMER,
+        limits(),
+        |config| config.local = node,
+    )
+    .await;
     let brokers = start_brokers(&runtime, deployment).await;
     let mut config = SharedTopicWriterConfig::new(limits());
     config.compress_payloads = false;
@@ -342,20 +352,40 @@ async fn publication_check() {
         owner_epoch: before.record.owner_epoch,
     };
     let endpoint = &metadata.broker(leader).unwrap().reader_pub;
-    let witness = subscriber(&runtime, endpoint, source, 64).await;
+    // The leader admits a live topic only to a node holding a subscription.
+    // These raw SUBs claim that of a node whose reader holds one.
+    let mut holder = live_many(
+        &brokers,
+        "open granting reader",
+        TopicReader::open(granting.clone(), "orders", TopicReaderConfig::default()),
+    )
+    .await
+    .unwrap();
+    // Its first record shows the leader accepted, and granted, its subscription.
+    live_many(&brokers, "start granting reader", holder.next())
+        .await
+        .unwrap();
+    let claim = Some(node);
+    let outsider = subscriber(&runtime, endpoint, source, 64, None).await;
+    let everything = runtime
+        .context()
+        .socket(SocketType::Sub, Options::default());
+    everything.subscribe(bytes::Bytes::new()).await.unwrap();
+    everything.connect(endpoint.as_str()).await.unwrap();
+    let witness = subscriber(&runtime, endpoint, source, 64, claim).await;
     let history_end =
         settle_publications(&brokers, &mut writer, &witness, leader, source, 0, 1).await;
     witness.close().await.unwrap();
-    let active = subscriber(&runtime, endpoint, source, 64).await;
+    let active = subscriber(&runtime, endpoint, source, 64, claim).await;
     let mut followers = Vec::new();
     for broker in metadata
         .brokers()
         .iter()
         .filter(|broker| broker.node != leader)
     {
-        followers.push(subscriber(&runtime, &broker.reader_pub, source, 64).await);
+        followers.push(subscriber(&runtime, &broker.reader_pub, source, 64, claim).await);
     }
-    let stalled = subscriber(&runtime, endpoint, source, 1).await;
+    let stalled = subscriber(&runtime, endpoint, source, 1, claim).await;
     let next = settle_publications(
         &brokers,
         &mut writer,
@@ -381,11 +411,18 @@ async fn publication_check() {
     )
     .await;
     let quiet = Duration::from_millis(50);
-    let (active_tail, first_follower, second_follower) = tokio::join!(
+    let (active_tail, first_follower, second_follower, outside, all) = tokio::join!(
         tokio::time::timeout(quiet, active.recv()),
         tokio::time::timeout(quiet, followers[0].recv()),
         tokio::time::timeout(quiet, followers[1].recv()),
+        tokio::time::timeout(quiet, outsider.recv()),
+        tokio::time::timeout(quiet, everything.recv()),
     );
+    assert!(
+        outside.is_err(),
+        "an unsubscribed SUB received a live topic"
+    );
+    assert!(all.is_err(), "a SUB of every topic received a live topic");
     assert!(active_tail.is_err(), "leader published a duplicate suffix");
     assert!(first_follower.is_err(), "follower published leader records");
     assert!(
@@ -397,12 +434,26 @@ async fn publication_check() {
         ozzy_runtime::profiling::totals().get(Event::ReplicaPublicationReceived) > received,
         "followers dropped every PREPARE_PUB"
     );
+    // The granting reader cancels its live topic as it closes. The raw SUBs
+    // claiming its node keep the topic, so the leader closes both.
+    let revoked = ozzy_runtime::profiling::totals().get(Event::ReaderSubscriptionRevoked) + 2;
+    live_many(&brokers, "close granting reader", holder.close())
+        .await
+        .unwrap();
+    live_many(&brokers, "revoke kept live topics", async {
+        while ozzy_runtime::profiling::totals().get(Event::ReaderSubscriptionRevoked) < revoked {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
     live_many(&brokers, "close publication writer", writer.close())
         .await
         .unwrap();
-    for subscriber in followers.into_iter().chain([active, stalled]) {
+    let sockets = [active, stalled, outsider, everything];
+    for subscriber in followers.into_iter().chain(sockets) {
         subscriber.close().await.unwrap();
     }
+    granting.shutdown().await.unwrap();
     sdk.shutdown().await.unwrap();
     for broker in brokers {
         broker.shutdown().await.unwrap();
@@ -526,16 +577,19 @@ async fn settle_publications(
     .await
 }
 
+/// A raw SUB of `source`'s live topic, claiming `node`'s subscriptions.
 async fn subscriber(
     runtime: &WriterRuntime,
     endpoint: &str,
     source: reader::Source,
     receive_messages: u32,
+    node: Option<NodeId>,
 ) -> Socket {
-    let socket = runtime.context().socket(
-        SocketType::Sub,
-        Options::default().recv_hwm(receive_messages),
-    );
+    let mut options = Options::default().recv_hwm(receive_messages);
+    if let Some(node) = node {
+        options = options.identity(ozzy_runtime::transport::peer_identity(node));
+    }
+    let socket = runtime.context().socket(SocketType::Sub, options);
     socket
         .subscribe(bytes::Bytes::copy_from_slice(
             &reader::publication_topic(source).unwrap(),

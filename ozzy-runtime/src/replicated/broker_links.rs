@@ -1,7 +1,7 @@
 //! Two SDK PEER sockets across all brokers: control/replies and data/replay.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -98,9 +98,6 @@ struct Inner {
     publications: Vec<Arc<publications::Link>>,
     shared: Arc<Shared>,
     runtime: WriterRuntime,
-    /// The driver's control socket, for lifecycle tests.
-    #[cfg(test)]
-    control: Arc<IdentitySocket>,
 }
 
 struct ReplyObserver<'a> {

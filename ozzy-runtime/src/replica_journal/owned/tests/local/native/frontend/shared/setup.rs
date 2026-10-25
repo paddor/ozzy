@@ -289,6 +289,7 @@ pub(super) async fn setup_shared_directory_profile(
                         subscriptions: 2,
                     },
                     service.links(),
+                    None,
                 )
                 .unwrap();
         }

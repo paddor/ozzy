@@ -476,8 +476,17 @@ Rules:
 - RECORDS_PUB is RECORDS without Subscription. Only group sources (tag 1)
   publish, including single-broker durable.
 - Confirmed applied records are published once, in offset order.
-- A SUB prefix of the bare group ID receives every partition of the group.
-  Any endpoint reader can subscribe to any published partition.
+- The reader PUB admits a SUBSCRIBE only for an exact 32-byte topic whose
+  partition holds a subscription of the SUB's node, its routing identity.
+  Bare group and empty prefixes are refused. The broker grants the topic
+  before it replies SUBSCRIBED, so readers subscribe after that reply.
+- The node is a claim: the NULL mechanism authenticates nobody, so any
+  peer that knows a subscribed node ID can claim it.
+- An admitted SUB receives the topic until it cancels, disconnects, or its
+  node's subscription ends. A connection that still holds the topic at two
+  checks a second apart is closed; its SUB reconnects and admission checks
+  the replayed SUBSCRIBEs. A topic whose partition incarnation ended here is
+  never published again, so holding it costs nothing.
 
 | State | Delivers | Replay subscription |
 | --- | --- | --- |
@@ -537,6 +546,8 @@ bodies; all other replica payloads are empty. Descriptor (86 bytes):
 | 3 | Shared canonical operation bodies |
 
 - One publication reaches both followers without recipient masks or credits.
+- The follower PUB admits only SUBs whose routing identity is a configured
+  peer broker, for any prefix.
 - Publisher, leader, view, group, and configuration checks precede hashing.
   Only contiguous suffixes are admitted; gaps drop. Receipt never votes.
 
