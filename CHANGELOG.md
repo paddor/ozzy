@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-26
+
 ### Breaking
 
 - A broker's reader PUB admits a live topic only to a SUB whose routing
