@@ -1,8 +1,8 @@
 //! An external worker process: one client per lane from the shared start.
 
 use super::{
-    Config, ObservedRecord, Oracle, Result, Value, Window, await_connect, command, config, error,
-    iggy, kafka, launch, metrics, producer, report, system, workload,
+    Config, ObservedRecord, Oracle, Result, System, Value, Window, await_connect, command, config,
+    error, iggy, kafka, launch, metrics, producer, report, system, workload,
 };
 use futures::future::try_join_all;
 use serde_json::json;
@@ -22,7 +22,7 @@ pub(in crate::bench::timed) async fn worker(config: Config) -> Result<()> {
     let mut clients = connect_clients(&config, name, &share).await?;
     launch::reply(&json!({"event":"connected","index":share.index,"pid":std::process::id()}))?;
     let start = command(&mut input, "start").await?;
-    let window = super::window(&start, &config.args)?;
+    let window = super::super::window(&start, &config.args)?;
     window.wait().await;
     let meter = metrics::Meter::start(!config.args.inproc);
     let rows = run_lanes(&config, &share, &mut clients, window, &mut input).await?;

@@ -13,11 +13,9 @@ use super::{
     Config, Window, await_connect, command, config, launch, measurement::Counts, producer, report,
 };
 use bytes::Bytes;
-use futures::future::try_join_all;
 use ozzy_proto::MessageId;
 use serde_json::{Value, json};
 use std::time::Duration;
-use tokio::sync::{mpsc, watch};
 
 pub(super) use lanes::worker;
 
