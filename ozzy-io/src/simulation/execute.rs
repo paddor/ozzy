@@ -136,11 +136,13 @@ impl Files {
 }
 
 /// One physical job against the device: the handle table, the image and its
-/// bounds, the submitting shard, and the effect the schedule chose.
+/// bounds, the device space, the submitting shard, and the effect the
+/// schedule chose.
 pub(super) struct Execution<'a> {
     pub(super) files: &'a mut Files,
     pub(super) image: &'a mut Image,
     pub(super) limits: ImageLimits,
+    pub(super) space: Option<usize>,
     pub(super) origin: usize,
     pub(super) effect: Effect,
 }
@@ -259,8 +261,26 @@ impl Execution<'_> {
     fn set_length(&mut self, handle: &Handle, length: u64) -> io::Result<Outcome> {
         let inode = self.files.writable(handle)?.inode;
         let length = usize::try_from(length).map_err(|_| io::ErrorKind::InvalidInput)?;
+        self.claim_space(inode, length)?;
         self.image.set_length(inode, length, false, self.limits)?;
         Ok(Outcome::Done)
+    }
+
+    /// Refuse growth past the device space, as a full file system does.
+    /// Unchanged extents and preallocated ranges need no new space.
+    fn claim_space(&self, inode: u64, end: usize) -> io::Result<()> {
+        let Some(space) = self.space else {
+            return Ok(());
+        };
+        let used = self.image.used_space();
+        let growth = self.image.space_growth(inode, end)?;
+        if used.saturating_add(growth) > space {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                format!("simulation device space {space} bytes: {used} used, {growth} more needed"),
+            ));
+        }
+        Ok(())
     }
 
     fn sync(&mut self, handle: &Handle) -> io::Result<Outcome> {
@@ -287,9 +307,10 @@ impl Execution<'_> {
                 ),
             ));
         };
-        // KEEP_SIZE changes no readable bytes. Allocation failure is also an
-        // explicit fault event; this model does not emulate extent accounting.
-        // Reserving memory keeps appends into the range from copying the file.
+        // KEEP_SIZE changes no readable bytes. Space counts the allocated
+        // end, not extents. Reserving memory keeps appends into the range
+        // from copying the file.
+        self.claim_space(inode, end)?;
         self.image.reserve(inode, end)?;
         Ok(Outcome::Done)
     }
@@ -378,6 +399,7 @@ impl Execution<'_> {
             _ => data.len(),
         };
         let offset = usize::try_from(offset).map_err(|_| io::ErrorKind::InvalidInput)?;
+        self.claim_space(inode, offset.saturating_add(count))?;
         let mut bytes = Vec::with_capacity(count);
         for part in data.parts() {
             let take = part.len().min(count - bytes.len());

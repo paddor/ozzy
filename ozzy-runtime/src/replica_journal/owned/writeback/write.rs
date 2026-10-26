@@ -120,6 +120,10 @@ impl OwnedJournal {
                     self.hold_writes()?;
                     return Ok(WriteStep::Waiting);
                 }
+                if !self.spare.ready() {
+                    self.await_spare()?;
+                    return Ok(WriteStep::Waiting);
+                }
                 return Ok(WriteStep::RollRequired);
             }
             return Err(error.into());

@@ -1,8 +1,9 @@
 //! Exact subscription selectors and cumulative, generation-fenced capacity.
 
 use super::{
-    Authority, CodecError, ENVELOPE_BYTES, Envelope, EnvelopeLimits, Opcode, Packet, PartitionId,
-    Reader, Source, Subscribed, Subscription, Topic, control, end, prepare, read_text, text,
+    Authority, Cancel, CodecError, ENVELOPE_BYTES, Envelope, EnvelopeLimits, Opcode, Packet,
+    PartitionId, Reader, Source, Subscribed, Subscription, Topic, Unsubscribe, control, end,
+    prepare, read_text, text,
 };
 
 /// Exact log selection. Local logs do not invent replication authority.
@@ -102,13 +103,14 @@ impl Target {
 
 fn encode_close(
     envelope: Envelope,
-    subscription: Subscribed,
+    unsubscribe: Unsubscribe,
     response: bool,
     output: &mut Vec<u8>,
     limits: EnvelopeLimits,
 ) -> Result<[u8; ENVELOPE_BYTES], CodecError> {
-    subscription.subscription.validate()?;
-    subscription.source.validate()?;
+    let selected = unsubscribe.selected;
+    selected.subscription.validate()?;
+    selected.source.validate()?;
     let opcode = if response {
         Opcode::Unsubscribed
     } else {
@@ -117,13 +119,14 @@ fn encode_close(
     let header = prepare(
         envelope,
         opcode,
-        crate::data::add(40, subscription.source.size())?,
+        crate::data::add(41, selected.source.size())?,
         output,
         limits,
     )?;
-    subscription.subscription.encode(output);
-    subscription.source.encode(output);
-    output.extend_from_slice(&subscription.resolved_offset.to_be_bytes());
+    selected.subscription.encode(output);
+    selected.source.encode(output);
+    output.extend_from_slice(&selected.resolved_offset.to_be_bytes());
+    output.push(unsubscribe.cancel as u8);
     Ok(header)
 }
 
@@ -131,54 +134,61 @@ fn decode_close(
     packet: Packet<'_>,
     response: bool,
     limits: EnvelopeLimits,
-) -> Result<Subscribed, CodecError> {
+) -> Result<Unsubscribe, CodecError> {
     let opcode = if response {
         Opcode::Unsubscribed
     } else {
         Opcode::Unsubscribe
     };
     let mut cursor = control(packet, opcode, limits)?;
-    let subscription = Subscribed {
+    let selected = Subscribed {
         subscription: Subscription::decode(&mut cursor)?,
         source: Source::decode(&mut cursor)?,
         resolved_offset: cursor.u64()?,
     };
+    let cancel = match cursor.u8()? {
+        0 => Cancel::Subscription,
+        1 => Cancel::Replay,
+        _ => return Err(CodecError::Profile),
+    };
     end(cursor)?;
-    Ok(subscription)
+    Ok(Unsubscribe { selected, cancel })
 }
 
-/// Encode explicit cancellation of one subscription generation.
+/// Encode explicit cancellation of one subscription generation, or of only
+/// its replay stream.
 pub fn encode_unsubscribe(
     envelope: Envelope,
-    subscription: Subscribed,
+    unsubscribe: Unsubscribe,
     output: &mut Vec<u8>,
     limits: EnvelopeLimits,
 ) -> Result<[u8; ENVELOPE_BYTES], CodecError> {
-    encode_close(envelope, subscription, false, output, limits)
+    encode_close(envelope, unsubscribe, false, output, limits)
 }
 
-/// Decode explicit cancellation of one subscription generation.
+/// Decode explicit cancellation of one subscription generation, or of only
+/// its replay stream.
 pub fn decode_unsubscribe(
     packet: Packet<'_>,
     limits: EnvelopeLimits,
-) -> Result<Subscribed, CodecError> {
+) -> Result<Unsubscribe, CodecError> {
     decode_close(packet, false, limits)
 }
 
-/// Encode confirmation that a subscription generation has been canceled.
+/// Encode confirmation of a cancellation, echoing it.
 pub fn encode_unsubscribed(
     envelope: Envelope,
-    subscription: Subscribed,
+    unsubscribe: Unsubscribe,
     output: &mut Vec<u8>,
     limits: EnvelopeLimits,
 ) -> Result<[u8; ENVELOPE_BYTES], CodecError> {
-    encode_close(envelope, subscription, true, output, limits)
+    encode_close(envelope, unsubscribe, true, output, limits)
 }
 
-/// Decode confirmation that a subscription generation has been canceled.
+/// Decode confirmation of a cancellation.
 pub fn decode_unsubscribed(
     packet: Packet<'_>,
     limits: EnvelopeLimits,
-) -> Result<Subscribed, CodecError> {
+) -> Result<Unsubscribe, CodecError> {
     decode_close(packet, true, limits)
 }

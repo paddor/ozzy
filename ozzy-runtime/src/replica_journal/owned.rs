@@ -33,6 +33,7 @@ pub use read::{CompletedDelivery, CompletedRead, PartitionDelivery, PreparedRead
 mod replay;
 mod retention;
 mod room;
+mod spare;
 pub use replay::{CompletedReplay, PreparedReplay, ReplayRequest};
 mod receiving;
 pub use receiving::{RecoveringJournal, RecoveryGenerations, RecoveryOpen};
@@ -82,6 +83,7 @@ pub struct OwnedJournal {
     /// An installation replays only after it.
     committed_base: Option<ozzy_core::state::CanonicalState>,
     room: room::Room,
+    spare: spare::Spare,
     dedup: dedup::State,
     selected: Option<CanonicalRecoveryCandidate>,
     history: Option<JournalHistory>,
@@ -276,6 +278,7 @@ impl OwnedJournal {
             images,
             committed_base: None,
             room: room::Room::default(),
+            spare: spare::Spare::default(),
             indexing: indexing::Indexing::default(),
             dedup: dedup::State::new(config.deduplication),
             selected: None,

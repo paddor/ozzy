@@ -340,7 +340,7 @@ commands need the consumer role (else code 3).
 | SUBSCRIBED | Subscription, Source, resolved offset:u64 |
 | RECORDS | Subscription, Source, first offset:u64, payload codec:u8, decoded payload bytes:u32, Records |
 | ACK | Subscription, Source, received:optional<u64>, processed:optional<u64> |
-| UNSUBSCRIBE / UNSUBSCRIBED | Subscription, Source, resolved offset:u64 |
+| UNSUBSCRIBE / UNSUBSCRIBED | Subscription, Source, resolved offset:u64, cancel:u8 (0 subscription, 1 replay only) |
 
 | Start tag | Selector/result |
 | ---: | --- |
@@ -485,13 +485,17 @@ Rules:
 - An admitted SUB receives the topic until it cancels, disconnects, or its
   node's subscription ends. A connection that still holds the topic at two
   checks a second apart is closed; its SUB reconnects and admission checks
-  the replayed SUBSCRIBEs. A topic whose partition incarnation ended here is
+  the replayed SUBSCRIBEs.
+- A reader that goes live cancels only its replay stream. Its node keeps the
+  grant until it cancels the subscription, its link session ends, or a view
+  change fences the partition's subscriptions. Live readers count toward the
+  partition's subscription bound. A topic whose partition incarnation ended here is
   never published again, so holding it costs nothing.
 
 | State | Delivers | Replay subscription |
 | --- | --- | --- |
 | Replay | SUBSCRIBE at the next offset, bounded replay | Open |
-| Live | Publications only | Canceled with UNSUBSCRIBE |
+| Live | Publications only | Canceled with UNSUBSCRIBE, replay only |
 
 - A publication covering the next offset ends replay and drops overlap. A
   later one is held while PEER repairs the gap. Quiet loss returns to replay.

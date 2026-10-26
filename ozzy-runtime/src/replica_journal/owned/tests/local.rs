@@ -97,6 +97,7 @@ fn write(
                 let work = journal.begin_roll(16).unwrap();
                 let completed = drive(controller, work.publish());
                 journal.complete_roll(completed).unwrap();
+                ready_spare(controller, journal);
             }
             other => panic!("write did not progress: {other:?}"),
         }
@@ -180,6 +181,7 @@ fn initialize_partition(
     let receipt = admit(controller, journal, driver, buffer);
     write(controller, journal, driver, receipt);
     sync_apply(controller, journal, driver);
+    ready_spare(controller, journal);
 }
 
 fn append(journal: &OwnedJournal, writer: u8, sequence: u64) -> ProposalBuffer {

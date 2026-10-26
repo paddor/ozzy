@@ -1,5 +1,5 @@
-//! Owner work a shard starts by itself between commands: writes, rolls,
-//! retirement, cleanup, packs, sealed indexes and identity refreshes.
+//! Owner work a shard starts by itself between commands: writes, spares,
+//! rolls, retirement, cleanup, packs, sealed indexes and identity refreshes.
 
 use super::{Completed, Install, Job, ShardJournal, State};
 use crate::replica_journal::{OwnedWriteStep, commands::logged_fault};
@@ -11,6 +11,7 @@ impl ShardJournal {
         if self.install_completed()
             || self.start_retirement_job()
             || self.start_cleanup_job()
+            || self.start_spare_job()
             || self.start_pack_job()
             || self.start_index_job()
         {
@@ -85,6 +86,31 @@ impl ShardJournal {
                 let done = Box::pin(work.run()).await;
                 Box::new(move |state: &mut State| {
                     state.owner.complete_cleanup(done);
+                    false
+                }) as Install
+            }
+            .boxed_local(),
+        );
+        true
+    }
+
+    fn start_spare_job(&mut self) -> bool {
+        if self.closing {
+            return false;
+        }
+        let timestamp = &self.timestamp;
+        let Some(work) = self
+            .state
+            .as_mut()
+            .and_then(|state| state.owner.take_spare_work(timestamp))
+        else {
+            return false;
+        };
+        self.jobs.push(
+            async move {
+                let done = work.run().await;
+                Box::new(move |state: &mut State| {
+                    state.owner.complete_spare(done);
                     false
                 }) as Install
             }

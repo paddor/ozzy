@@ -90,6 +90,8 @@ impl OwnedJournal {
             body_encoding: config.body_encoding,
         };
         let journal = self.journal.take_ready()?;
+        // A staged segment may take the spare's file.
+        self.spare.changed();
         let staging = journal
             .begin_suffix_replacement(ozzy_journal_segment::SuffixRequest {
                 replacement,

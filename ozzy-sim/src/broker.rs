@@ -48,6 +48,9 @@ pub struct Control {
     failed: std::sync::atomic::AtomicUsize,
     pending_completions: std::sync::atomic::AtomicUsize,
     physical_events: std::sync::atomic::AtomicU64,
+    space_changed: AtomicBool,
+    /// Free device bytes to leave; `usize::MAX` lifts the limit.
+    free_space: std::sync::atomic::AtomicUsize,
     recent_trace: std::sync::Mutex<std::collections::VecDeque<ozzy_io::simulation::Event>>,
     snapshot: std::sync::Mutex<Snapshot>,
 }
@@ -140,6 +143,15 @@ impl Control {
     /// Number of injected write failures observed by the pump.
     pub fn failures(&self) -> usize {
         self.failed.load(Ordering::Acquire)
+    }
+
+    /// Leave the device this many free bytes from the next pump pass on, as
+    /// a file system that other tenants fill. `None` lifts the limit.
+    pub fn limit_free_space(&self, bytes: Option<usize>) {
+        self.free_space
+            .store(bytes.unwrap_or(usize::MAX), Ordering::Release);
+        self.space_changed.store(true, Ordering::Release);
+        self.wake.mark();
     }
 
     /// Apply only this many bytes of the next segment entry write.
@@ -267,6 +279,11 @@ pub fn pump(
             let crash = scheduling.crash.swap(0, Ordering::AcqRel);
             if crash != 0 {
                 return scheduling.finish(device, crash == 2, &done);
+            }
+            if scheduling.space_changed.swap(false, Ordering::AcqRel) {
+                let free = scheduling.free_space.load(Ordering::Acquire);
+                let used = device.image().used_space();
+                device.limit_space((free != usize::MAX).then(|| used + free));
             }
             if scheduling.stop.load(Ordering::Acquire) && drain.is_none() {
                 drain = Some(Box::pin(device.begin_shutdown().unwrap().wait()));

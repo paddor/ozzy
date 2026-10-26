@@ -260,6 +260,8 @@ impl OwnedJournal {
             return;
         }
         self.retention.cleaning = Cleaning::Idle;
+        // Cleanup may have put a retired segment in place of the spare.
+        self.spare.changed();
         match done.result {
             Ok(true) => self.retention.cleaned = Some(done.next),
             Ok(false) => {}

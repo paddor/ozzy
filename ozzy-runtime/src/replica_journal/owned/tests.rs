@@ -142,6 +142,16 @@ fn drive<T>(controller: &mut Controller, future: impl Future<Output = T>) -> T {
     drive_except(controller, future, None, |_| Effect::Normal)
 }
 
+/// Allocate the spare as a shard's spare job does, so the owner may roll and
+/// fill the tail of its active segment.
+fn ready_spare(controller: &mut Controller, journal: &mut OwnedJournal) {
+    if let Some(work) = journal.take_spare_work(|| 0) {
+        let done = drive(controller, work.run());
+        journal.complete_spare(done);
+    }
+    assert!(journal.spare.ready());
+}
+
 fn drive_except<T>(
     controller: &mut Controller,
     future: impl Future<Output = T>,

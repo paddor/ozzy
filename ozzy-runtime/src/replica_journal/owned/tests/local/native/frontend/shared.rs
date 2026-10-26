@@ -402,6 +402,7 @@ impl Harness {
                     Opcode::Unsubscribe,
                     ozzy_proto::reader::decode_unsubscribe(decoded, self.wire.envelope)
                         .unwrap()
+                        .selected
                         .subscription,
                 )),
                 _ => {}

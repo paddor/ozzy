@@ -51,6 +51,81 @@ fn roll(controller: &mut Controller, replica: &mut Replica) {
     let work = replica.journal.begin_roll(16).unwrap();
     let done = drive(controller, work.publish());
     replica.journal.complete_roll(done).unwrap();
+    ready_spare(controller, &mut replica.journal);
+}
+
+/// Run the spare job the shard would start at `now`, if one is due.
+fn spare_job(controller: &mut Controller, replica: &mut Replica, now: u64) -> bool {
+    let Some(work) = replica.journal.take_spare_work(|| now) else {
+        return false;
+    };
+    let done = drive(controller, work.run());
+    replica.journal.complete_spare(done);
+    true
+}
+
+#[test]
+fn full_device_refuses_records_in_the_tail_and_holds_writes_without_faulting() {
+    let (mut controller, io) = setup();
+    // One operation per 4 KiB group, seven groups per 32 KiB segment.
+    let mut replica = replica_with_pending(&mut controller, io, 0, 16, 64);
+    fill(&mut controller, &mut replica, 7);
+    // Room for metadata, none for another 32 KiB segment. The roll takes
+    // the allocated spare; allocating the next one fails without a fault.
+    assert_eq!(controller.jobs(), []);
+    controller.limit_space(Some(controller.image().used_space() + 16 * 1024));
+    let work = replica.journal.begin_roll(16).unwrap();
+    let done = drive(&mut controller, work.publish());
+    replica.journal.complete_roll(done).unwrap();
+    assert!(spare_job(&mut controller, &mut replica, 0));
+    assert!(!replica.journal.spare.ready());
+    assert!(!replica.journal.is_faulted());
+
+    // Records keep out of the active segment's last sixteenth; control
+    // requests keep out of its last sixty-fourth.
+    fill(&mut controller, &mut replica, 6);
+    assert!(room(&mut replica, OperationKind::Barrier).is_ok());
+    fill(&mut controller, &mut replica, 1);
+    for kind in [OperationKind::Barrier, OperationKind::Progress] {
+        assert!(matches!(
+            room(&mut replica, kind),
+            Err(JournalError::RollCapacity)
+        ));
+    }
+    assert!(room(&mut replica, OperationKind::Trim).is_ok());
+
+    // An operation admitted anyway, as on a follower, holds its write.
+    let (_, _, held) = admit(&mut controller, &mut replica, 1);
+    assert!(matches!(
+        replica.journal.prepare_write().unwrap(),
+        OwnedWriteStep::Waiting
+    ));
+    assert!(!replica.journal.is_faulted());
+
+    // Allocation retries a second after the device was full, or at once
+    // after cleanup may have changed the spare.
+    assert!(!spare_job(&mut controller, &mut replica, 999));
+    assert!(spare_job(&mut controller, &mut replica, 1000));
+    assert!(!replica.journal.spare.ready());
+    replica.journal.spare.changed();
+    controller.limit_space(None);
+    assert!(spare_job(&mut controller, &mut replica, 1001));
+    assert!(replica.journal.spare.ready());
+
+    // With the spare allocated, the held write rolls and lands.
+    assert!(matches!(
+        replica.journal.prepare_write().unwrap(),
+        OwnedWriteStep::RollRequired
+    ));
+    roll(&mut controller, &mut replica);
+    write(&mut controller, &mut replica, 1);
+    settle(&mut replica, held);
+    synchronize(&mut controller, &mut replica);
+    assert_eq!(
+        replica.driver.normal().unwrap().snapshot().journal.durable,
+        OpNumber(15)
+    );
+    drive(&mut controller, replica.journal.shutdown()).unwrap();
 }
 
 #[test]

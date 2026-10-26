@@ -202,6 +202,8 @@ impl OwnedJournal {
             }
             StorageCleanup::Segments => {
                 let result = journal.reclaim_unreferenced_segments(max_objects).await?;
+                // A retired segment may have replaced the spare.
+                self.spare.changed();
                 // A prepared successor stays pinned until its roll selects it.
                 let active = journal
                     .manifest()

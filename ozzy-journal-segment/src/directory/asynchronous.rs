@@ -38,6 +38,7 @@ mod retention;
 mod roll;
 mod snapshot;
 mod spare;
+pub use spare::SparePreparation;
 mod suffix;
 pub use retention::{
     RetirementBudget, RetirementProof, RetirementScan, ScannedPrefix, SegmentFiles,

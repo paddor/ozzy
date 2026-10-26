@@ -24,6 +24,7 @@ fn roll(controller: &mut Controller, journal: &mut OwnedJournal) {
     let work = journal.begin_roll(8).unwrap();
     let done = drive(controller, work.publish());
     journal.complete_roll(done).unwrap();
+    ready_spare(controller, journal);
 }
 
 fn trim(controller: &mut Controller, journal: &mut OwnedJournal, driver: &mut Driver) {

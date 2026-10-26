@@ -102,6 +102,18 @@ impl Contents {
 struct Node {
     dirty: Contents,
     durable: Contents,
+    /// End of the preallocated range; preallocation keeps the length.
+    #[serde(default)]
+    allocated: usize,
+}
+
+impl Node {
+    fn footprint(&self) -> usize {
+        self.dirty
+            .bytes()
+            .max(self.durable.bytes())
+            .max(self.allocated)
+    }
 }
 
 /// Byte and namespace state shared across simulated process incarnations.
@@ -123,6 +135,7 @@ impl Default for Image {
                 Node {
                     dirty: root.clone(),
                     durable: root,
+                    allocated: 0,
                 },
             )]),
             next_inode: 1,
@@ -140,6 +153,18 @@ impl Image {
     /// Test namespace reachability in the selected dirty or durable image.
     pub fn exists(&self, path: &Path, durable: bool) -> bool {
         self.resolve(path, durable).is_ok()
+    }
+
+    /// Device bytes files occupy: each file's longer copy or its
+    /// preallocation, including removed files that open handles still keep.
+    pub fn used_space(&self) -> usize {
+        self.nodes.values().map(Node::footprint).sum()
+    }
+
+    /// Device bytes a file would gain by extending to `end`.
+    pub(super) fn space_growth(&self, inode: Inode, end: usize) -> io::Result<usize> {
+        let node = self.nodes.get(&inode).ok_or(io::ErrorKind::NotFound)?;
+        Ok(end.saturating_sub(node.footprint()))
     }
 
     /// Dirty and durable file bytes the image charges, including removed
@@ -366,6 +391,7 @@ impl Image {
             Node {
                 dirty: empty.clone(),
                 durable: empty,
+                allocated: 0,
             },
         );
         self.directory_mut(parent).insert(name.into(), inode);
@@ -381,7 +407,12 @@ impl Image {
     ) -> io::Result<()> {
         let old = self.file(inode, durable)?;
         self.byte_capacity(old.len(), length, limits)?;
+        let shrinks = length < old.len();
         let node = self.nodes.get_mut(&inode).expect("existing file");
+        // Truncation frees preallocated blocks past the new end.
+        if shrinks && !durable {
+            node.allocated = node.allocated.min(length);
+        }
         // Appends grow in place with amortized capacity, not one copy per write.
         let Contents::File(file) = (if durable {
             &mut node.durable
@@ -394,10 +425,11 @@ impl Image {
         Ok(())
     }
 
-    /// Reserve memory for both copies up to `end` without changing either
-    /// length, as preallocation does for a real file.
+    /// Preallocate up to `end` without changing either length, as
+    /// `FALLOC_FL_KEEP_SIZE` does, and reserve memory for both copies.
     pub(super) fn reserve(&mut self, inode: Inode, end: usize) -> io::Result<()> {
         let node = self.nodes.get_mut(&inode).ok_or(io::ErrorKind::NotFound)?;
+        node.allocated = node.allocated.max(end);
         for contents in [&mut node.dirty, &mut node.durable] {
             if let Contents::File(file) = contents {
                 file.reserve_exact(end.saturating_sub(file.len()));
@@ -574,6 +606,7 @@ impl Image {
         let Node {
             dirty: Contents::File(dirty),
             durable: Contents::File(durable),
+            ..
         } = self.nodes.get_mut(&inode).expect("existing file")
         else {
             unreachable!()

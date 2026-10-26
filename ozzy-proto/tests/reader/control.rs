@@ -165,18 +165,28 @@ fn group_subscription_credit_and_cancellation_are_fenced_and_exact() {
         subscription: subscription(),
         source,
     };
-    let e = envelope(Opcode::Unsubscribe, false);
-    reader::encode_unsubscribe(e, selected, &mut bytes, limits).unwrap();
-    assert_eq!(
-        reader::decode_unsubscribe(packet(e, &bytes), limits).unwrap(),
-        selected
-    );
-    let e = envelope(Opcode::Unsubscribed, true);
-    reader::encode_unsubscribed(e, selected, &mut bytes, limits).unwrap();
-    assert_eq!(
-        reader::decode_unsubscribed(packet(e, &bytes), limits).unwrap(),
-        selected
-    );
+    for cancel in [reader::Cancel::Subscription, reader::Cancel::Replay] {
+        let unsubscribe = reader::Unsubscribe { selected, cancel };
+        let e = envelope(Opcode::Unsubscribe, false);
+        reader::encode_unsubscribe(e, unsubscribe, &mut bytes, limits).unwrap();
+        assert_eq!(
+            reader::decode_unsubscribe(packet(e, &bytes), limits).unwrap(),
+            unsubscribe
+        );
+        for n in 0..bytes.len() {
+            assert!(reader::decode_unsubscribe(packet(e, &bytes[..n]), limits).is_err());
+        }
+        // An unknown cancellation is refused, not read as either kind.
+        let mut unknown = bytes.clone();
+        *unknown.last_mut().unwrap() = 2;
+        assert!(reader::decode_unsubscribe(packet(e, &unknown), limits).is_err());
+        let e = envelope(Opcode::Unsubscribed, true);
+        reader::encode_unsubscribed(e, unsubscribe, &mut bytes, limits).unwrap();
+        assert_eq!(
+            reader::decode_unsubscribed(packet(e, &bytes), limits).unwrap(),
+            unsubscribe
+        );
+    }
 }
 
 #[test]

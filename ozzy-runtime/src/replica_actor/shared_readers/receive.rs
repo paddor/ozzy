@@ -1,6 +1,6 @@
 use super::{
-    ActorError, AuthorityHint, Bytes, Client, Cursor, Delivery, Envelope, Failure, Message,
-    NativeReceive, NodeId, Opcode, Payload, SharedReaders, Slot, decode_packet, reader,
+    ActorError, AuthorityHint, Bytes, Client, Cursor, Delivery, Envelope, Failure, LiveReader,
+    Message, NativeReceive, NodeId, Opcode, Payload, SharedReaders, Slot, decode_packet, reader,
 };
 use crate::transport::Frames;
 use ozzy_proto::Packet;
@@ -121,16 +121,29 @@ impl SharedReaders {
     }
 
     fn unsubscribe(&mut self, client: Client, packet: Packet<'_>) -> Result<(), Failure> {
-        let selected = reader::decode_unsubscribe(packet, self.config.limits.envelope)
+        let unsubscribe = reader::decode_unsubscribe(packet, self.config.limits.envelope)
             .map_err(|_| Failure::new(1))?;
         if self.rejection.is_some() {
             return Err(Failure::new(10));
         }
-        self.slots.retain(|slot| {
-            slot.peer != client.peer
-                || slot.delivery.subscribe.subscription != selected.subscription
-                || slot.delivery.source != selected.source
+        let selected = unsubscribe.selected;
+        let canceled = self.slots.iter().position(|slot| {
+            slot.peer == client.peer
+                && slot.delivery.subscribe.subscription == selected.subscription
+                && slot.delivery.source == selected.source
         });
+        let canceled = canceled.map(|index| self.slots.remove(index));
+        let id = selected.subscription.id;
+        self.live
+            .retain(|live| live.peer != client.peer || live.id != id);
+        // A reader that went live keeps its node's live topic grant.
+        if let (Some(slot), reader::Cancel::Replay) = (canceled, unsubscribe.cancel) {
+            self.live.push(LiveReader {
+                peer: slot.peer,
+                id,
+                session: slot.delivery.request.session,
+            });
+        }
         self.slots_changed();
         let header = reader::encode_unsubscribed(
             Envelope {
@@ -139,7 +152,7 @@ impl SharedReaders {
                 sender: self.local,
                 ..packet.envelope
             },
-            selected,
+            unsubscribe,
             &mut self.metadata,
             client.link.send.envelope,
         )
@@ -187,8 +200,17 @@ impl SharedReaders {
             }
             index
         } else {
-            if old.is_none() && self.slots.len() == self.config.subscriptions {
+            // A live reader that replays again turns its grant back into a slot.
+            let live = (self.live.iter())
+                .position(|live| live.peer == peer && live.id == subscribe.subscription.id);
+            if old.is_none()
+                && live.is_none()
+                && self.slots.len() + self.live.len() == self.config.subscriptions
+            {
                 return Err(Failure::new(10));
+            }
+            if let Some(index) = live {
+                self.live.swap_remove(index);
             }
             let slot = Slot {
                 peer,
