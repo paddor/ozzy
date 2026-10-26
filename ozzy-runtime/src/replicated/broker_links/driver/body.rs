@@ -20,6 +20,8 @@ pub(in crate::replicated::broker_links) enum Body {
         subscribe: reader::Subscribe,
         /// Takes the records once the request is sent.
         inbox: Weak<Inbox>,
+        /// Whether its acceptance renews the SUB's SUBSCRIBE to the live topic.
+        renew: bool,
     },
     Ack(reader::Ack),
     Progress(progress::Request),
@@ -29,7 +31,7 @@ pub(in crate::replicated::broker_links) enum Body {
     Delete(Box<group::DeleteRequest>),
     Unsubscribe {
         session: LinkSessionId,
-        selected: reader::Subscribed,
+        unsubscribe: reader::Unsubscribe,
     },
 }
 
@@ -75,8 +77,8 @@ impl Body {
             Self::Join(request) => group::encode_join(envelope, request, metadata, limits)?,
             Self::Inspect(request) => group::encode_inspect(envelope, request, metadata, limits)?,
             Self::Delete(request) => group::encode_delete(envelope, request, metadata, limits)?,
-            Self::Unsubscribe { selected, .. } => {
-                reader::encode_unsubscribe(envelope, *selected, metadata, limits)?
+            Self::Unsubscribe { unsubscribe, .. } => {
+                reader::encode_unsubscribe(envelope, *unsubscribe, metadata, limits)?
             }
         })
     }
@@ -127,8 +129,8 @@ impl Body {
                 }
                 Ok(Reply::Deleted(reply))
             }
-            Self::Unsubscribe { selected, .. } => {
-                if reader::decode_unsubscribed(packet, limits)? != *selected {
+            Self::Unsubscribe { unsubscribe, .. } => {
+                if reader::decode_unsubscribed(packet, limits)? != *unsubscribe {
                     return Err(BrokerLinkError::Response);
                 }
                 Ok(Reply::Unsubscribed)

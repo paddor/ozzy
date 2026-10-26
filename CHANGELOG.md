@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Breaking
+
+- UNSUBSCRIBE and UNSUBSCRIBED carry what they cancel: the whole
+  subscription, or only the replay stream of a reader that went live. The
+  broker keeps a live reader's node in the topic's grant until it cancels the
+  subscription, its link session ends, or a view change fences it. Live
+  readers count toward the partition's subscription bound. SDKs and brokers
+  must both have this change.
+
 ### Changed
 
 - Brokers allocate each partition's spare segment ahead, beside writes, and
@@ -15,6 +24,11 @@
   sixteenth, holds writes that reach its end, and resumes once allocation
   succeeds. Allocation retries a second after the failure, or at once after
   cleanup.
+- SDK topic readers stay on live PUB delivery. Since 0.5.0 a reader that went
+  live dropped its live topic, and the broker revoked its grant, so most
+  records arrived by PEER replay after the quiet refresh, about ten times
+  later. A reader now renews its live SUBSCRIBE only after a reset or a quiet
+  refresh, not with every replay.
 
 ## [0.5.0] - 2026-10-26
 

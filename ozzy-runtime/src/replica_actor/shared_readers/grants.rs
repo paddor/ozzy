@@ -5,7 +5,8 @@ use super::{NodeId, SharedReaders};
 use crate::frontend::ShardGrants;
 use std::collections::BTreeSet;
 
-/// The clients holding a subscription here, as last published.
+/// The clients holding a subscription here, replaying or live, as last
+/// published.
 #[derive(Debug)]
 pub(super) struct Granted {
     shard: ShardGrants,
@@ -50,7 +51,10 @@ impl SharedReaders {
             return;
         };
         granted.stale = false;
-        let readers: BTreeSet<_> = self.slots.iter().map(|slot| slot.peer).collect();
+        let slots = self.slots.iter().map(|slot| slot.peer);
+        let readers: BTreeSet<_> = slots
+            .chain(self.live.iter().map(|live| live.peer))
+            .collect();
         if readers != granted.readers {
             granted.shard.set(granted.topic, readers.clone());
             granted.readers = readers;

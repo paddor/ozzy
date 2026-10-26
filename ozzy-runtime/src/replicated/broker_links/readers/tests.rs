@@ -525,12 +525,12 @@ async fn retained_publication_frames_cannot_exceed_one_readers_reserved_storage(
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn an_accepted_subscription_admits_its_live_topic_on_its_broker_until_unselected() {
+async fn an_accepted_subscription_keeps_its_live_topic_until_the_subscription_ends() {
     let context = omq_tokio::Context::new();
     let readers = readers();
     let inbox = inbox(&readers, &context).await;
-    let subscribe = reader::Subscribe {
-        subscription: subscription(&inbox, 1),
+    let subscribe = |generation| reader::Subscribe {
+        subscription: subscription(&inbox, generation),
         target: reader::Target::Group {
             authority: ozzy_proto::data::Authority {
                 group_id: GroupId::from_bytes([3; 16]),
@@ -542,39 +542,56 @@ async fn an_accepted_subscription_admits_its_live_topic_on_its_broker_until_unse
         },
         start: reader::Start::Offset(0),
     };
-    let sent = Sent {
+    let sent = |request| Sent {
         broker: broker(),
         session: LinkSessionId::from_bytes([6; 16]),
-        request: RequestId::from_bytes([1; 16]),
+        request: RequestId::from_bytes([request; 16]),
     };
-    readers
-        .registry
-        .select(&Arc::downgrade(&inbox), sent, &subscribe);
-    assert!(
-        readers.registry.admitted(broker()).is_empty(),
-        "a sent SUBSCRIBE admits nothing yet"
-    );
-    let subscribed = reader::Subscribed {
-        subscription: subscribe.subscription,
+    let subscribed = |generation| reader::Subscribed {
+        subscription: subscription(&inbox, generation),
         source: source(),
         resolved_offset: 0,
     };
-    readers.registry.accept(broker(), &subscribed);
+    let cancel = |generation, cancel| reader::Unsubscribe {
+        selected: subscribed(generation),
+        cancel,
+    };
+    let registry = &readers.registry;
+    registry.select(&Arc::downgrade(&inbox), sent(1), &subscribe(1));
+    assert!(
+        registry.admitted(broker()).is_empty(),
+        "a sent SUBSCRIBE admits nothing yet"
+    );
+    registry.accept(broker(), &subscribed(1), true);
     let topic = Bytes::copy_from_slice(&reader::publication_topic(source()).unwrap());
-    let first = readers.registry.admitted(broker());
+    let first = registry.admitted(broker());
     assert_eq!(first.keys().collect::<Vec<_>>(), [&topic]);
     assert!(
-        readers
-            .registry
-            .admitted(NodeId::from_bytes([9; 16]))
-            .is_empty(),
+        registry.admitted(NodeId::from_bytes([9; 16])).is_empty(),
         "another broker admits nothing"
     );
-    readers.registry.accept(broker(), &subscribed);
-    assert!(
-        readers.registry.admitted(broker())[&topic] > first[&topic],
-        "each acceptance renews the SUBSCRIBE"
+
+    // Going live cancels only the replay stream. A later replay keeps the
+    // SUBSCRIBE already admitted, unless the reader asks to renew it.
+    registry.unselect(&cancel(1, reader::Cancel::Replay));
+    assert_eq!(registry.admitted(broker()), first);
+    registry.select(&Arc::downgrade(&inbox), sent(2), &subscribe(2));
+    registry.accept(broker(), &subscribed(2), false);
+    assert_eq!(
+        registry.admitted(broker()),
+        first,
+        "replay renewed the topic"
     );
-    readers.registry.unselect(&subscribed);
-    assert!(readers.registry.admitted(broker()).is_empty());
+    registry.accept(broker(), &subscribed(2), true);
+    assert!(
+        registry.admitted(broker())[&topic] > first[&topic],
+        "a renewing acceptance renews the SUBSCRIBE"
+    );
+
+    // Closing cancels the subscription and leaves the live topic, also
+    // after a replay cancellation.
+    registry.unselect(&cancel(2, reader::Cancel::Replay));
+    assert!(!registry.admitted(broker()).is_empty());
+    registry.unselect(&cancel(2, reader::Cancel::Subscription));
+    assert!(registry.admitted(broker()).is_empty());
 }

@@ -93,8 +93,10 @@ impl LinkState {
         }
         // The broker granted the live topic before this reply; its SUB may
         // subscribe now.
-        if let Ok(Reply::Subscribed(selected)) = &result {
-            local.readers.accept(self.remote, selected);
+        if let (Ok(Reply::Subscribed(selected)), Body::Subscribe { renew, .. }) =
+            (&result, &active.command.body)
+        {
+            local.readers.accept(self.remote, selected, *renew);
         }
         let _ = active.command.reply.send(result);
         Ok(())

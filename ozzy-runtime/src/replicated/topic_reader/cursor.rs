@@ -50,6 +50,9 @@ pub(super) struct Cursor {
     refresh: Duration,
     due: Duration,
     live: LiveCursor,
+    /// The SUB may have lost the live topic, after a reset or quiet live
+    /// delivery: the next acceptance renews its SUBSCRIBE.
+    renew: bool,
     observed_input: Option<(u64, RouteGeneration)>,
     verified_source: Option<RouteGeneration>,
     /// Last route that named a leader, as view and broker.
@@ -90,6 +93,7 @@ impl Cursor {
             refresh,
             due: Duration::ZERO,
             live: LiveCursor::new(from, refresh),
+            renew: true,
             observed_input: None,
             verified_source: None,
             leader: None,
@@ -172,6 +176,7 @@ impl Cursor {
         self.retire(links, routes, cx)?;
         if self.pending.is_none() && self.live.tick(now) {
             self.due = now;
+            self.renew = true;
         }
         if now >= self.due && !self.waiting_for_capacity() {
             self.due = now.saturating_add(self.refresh);
@@ -291,6 +296,7 @@ impl Cursor {
         self.clear_replay();
         self.live = LiveCursor::new(self.next, self.refresh);
         self.due = Duration::ZERO;
+        self.renew = true;
     }
 }
 

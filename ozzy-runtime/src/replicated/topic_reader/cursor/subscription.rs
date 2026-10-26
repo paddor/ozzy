@@ -43,6 +43,7 @@ impl Cursor {
         };
         let links = links.clone();
         let inbox = std::sync::Arc::downgrade(&self.inbox);
+        let renew = self.renew;
         self.opening = Some(Opening {
             broker,
             session,
@@ -52,7 +53,7 @@ impl Cursor {
                 .group_source()
                 .ok_or(BrokerLinkError::Configuration)?,
             request: Box::pin(async move {
-                let selected = links.subscribe(broker, inbox, subscribe).await?;
+                let selected = links.subscribe(broker, inbox, subscribe, renew).await?;
                 Ok((broker, session, selected))
             }),
         });
@@ -83,23 +84,38 @@ impl Cursor {
         Ok(())
     }
 
+    /// End the subscription, including a live reader's topic grant, after
+    /// any replay cancellation still in flight.
     pub(in crate::replicated::topic_reader) fn detach(
         &mut self,
         links: &BrokerLinks,
     ) -> Option<Returning> {
-        let selected = self.selected.take().or_else(|| self.inbox.selected());
+        let selected = (self.selected.take())
+            .or_else(|| self.inbox.selected())
+            .or(self.accepted);
         self.opening = None;
         self.pending = None;
         self.held = None;
         self.ready = None;
         self.clear_replay();
-        self.canceling.take().or_else(|| {
-            selected.map(|(broker, session, selected)| {
-                let links = links.clone();
-                Box::pin(async move { links.unsubscribe(broker, session, selected).await })
-                    as Returning
-            })
-        })
+        let canceling = self.canceling.take();
+        if canceling.is_none() && selected.is_none() {
+            return None;
+        }
+        let links = links.clone();
+        Some(Box::pin(async move {
+            if let Some(canceling) = canceling {
+                canceling.await?;
+            }
+            let Some((broker, session, selected)) = selected else {
+                return Ok(());
+            };
+            let unsubscribe = reader::Unsubscribe {
+                selected,
+                cancel: reader::Cancel::Subscription,
+            };
+            links.unsubscribe(broker, session, unsubscribe).await
+        }))
     }
 
     pub(super) fn poll_opening(
@@ -124,6 +140,7 @@ impl Cursor {
                 }
                 self.selected = Some(selected);
                 self.accepted = Some(selected);
+                self.renew = false;
                 Ok(())
             }
             Err(error) => {
@@ -227,8 +244,13 @@ impl Cursor {
         {
             let links = links.clone();
             self.clear_replay();
+            // Live delivery took over; the live topic stays granted.
+            let unsubscribe = reader::Unsubscribe {
+                selected,
+                cancel: reader::Cancel::Replay,
+            };
             self.canceling = Some(Box::pin(async move {
-                links.unsubscribe(broker, session, selected).await
+                links.unsubscribe(broker, session, unsubscribe).await
             }));
             // Queue the UNSUBSCRIBE now. Until the driver sends it, frames
             // of this generation still enter the inbox.

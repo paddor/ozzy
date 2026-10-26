@@ -84,6 +84,7 @@ impl SharedReaders {
             });
         if fenced {
             self.slots.clear();
+            self.live.clear();
             self.slots_changed();
         }
         self.observed = observed;

@@ -283,6 +283,82 @@ async fn plain_thread(mode: DeploymentMode) {
     }
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn a_live_reader_stays_live_after_canceling_its_replay() {
+    tokio::time::timeout(Duration::from_secs(20), stays_live())
+        .await
+        .unwrap();
+}
+
+async fn stays_live() {
+    let revoked = ozzy_runtime::profiling::totals().get(Event::ReaderSubscriptionRevoked);
+    let root = tempfile::tempdir().unwrap();
+    let runtime = WriterRuntime::new().unwrap();
+    let deployment = deployment(root.path(), DeploymentMode::Single, 1);
+    let sdk = links(&runtime, &deployment[0].0).await;
+    let brokers = start_brokers(&runtime, deployment).await;
+    let mut writer = live_many(
+        &brokers,
+        "open live writer",
+        SharedTopicWriter::open(
+            &sdk,
+            "orders",
+            SharedTopicWriterConfig::new(limits()),
+            RetryPolicy::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    let mut reader = live_many(
+        &brokers,
+        "open live reader",
+        TopicReader::open(sdk.clone(), "orders", TopicReaderConfig::default()),
+    )
+    .await
+    .unwrap();
+    // One record at a time. Once one arrives live, the reader has canceled
+    // its replay subscription; keep going past two revocation checks.
+    let mut live = None;
+    for offset in 0.. {
+        publish_record(&brokers, &mut writer, offset).await;
+        let record = live_many(&brokers, "read live record", reader.next())
+            .await
+            .unwrap();
+        assert_eq!(record.offset.get(), offset);
+        assert_eq!(record.message_id, publication_id(offset));
+        let stats = reader.stats();
+        match live {
+            None if stats.live_records > 0 => {
+                live = Some((std::time::Instant::now(), stats.replayed_records));
+            }
+            Some((since, _)) if since.elapsed() > Duration::from_millis(2500) => break,
+            _ => {}
+        }
+    }
+    let (_, replayed) = live.unwrap();
+    assert_eq!(
+        reader.stats().replayed_records,
+        replayed,
+        "a live reader fell back to replay: {:?}",
+        reader.stats()
+    );
+    assert_eq!(
+        ozzy_runtime::profiling::totals().get(Event::ReaderSubscriptionRevoked),
+        revoked,
+        "the broker revoked a live reader's topic"
+    );
+    live_many(&brokers, "close live reader", reader.close())
+        .await
+        .unwrap();
+    live_many(&brokers, "close live writer", writer.close())
+        .await
+        .unwrap();
+    sdk.shutdown().await.unwrap();
+    for broker in brokers {
+        broker.shutdown().await.unwrap();
+    }
+}
+
 fn compressed_parts(index: u8) -> Vec<bytes::Bytes> {
     match index {
         0 => vec![bytes::Bytes::from_static(b"tiny")],

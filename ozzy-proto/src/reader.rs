@@ -89,6 +89,26 @@ pub struct Subscribed {
     pub resolved_offset: u64,
 }
 
+/// What an UNSUBSCRIBE ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Cancel {
+    /// The whole subscription, including its node's live topic grant.
+    Subscription = 0,
+    /// Only the replay stream: the reader went live, so the broker keeps its
+    /// node's live topic grant.
+    Replay = 1,
+}
+
+/// Cancellation of one subscription generation, echoed by UNSUBSCRIBED.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unsubscribe {
+    /// The canceled generation.
+    pub selected: Subscribed,
+    /// Whether its live topic grant ends too.
+    pub cancel: Cancel,
+}
+
 /// Independent cumulative observations. No durable progress commit is implied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ack {

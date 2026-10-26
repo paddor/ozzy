@@ -120,10 +120,13 @@ pub(super) fn reader(target: Placement, binding: Binding, opcode: Opcode) -> Mes
         ),
         Opcode::Unsubscribe => reader::encode_unsubscribe(
             envelope,
-            reader::Subscribed {
-                resolved_offset: 0,
-                subscription,
-                source,
+            reader::Unsubscribe {
+                selected: reader::Subscribed {
+                    resolved_offset: 0,
+                    subscription,
+                    source,
+                },
+                cancel: reader::Cancel::Subscription,
             },
             &mut metadata,
             limits,

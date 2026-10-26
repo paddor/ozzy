@@ -341,7 +341,9 @@ impl LinkState {
     /// Track a sent request until its response, timeout, or session loss.
     fn activate(&mut self, command: Command, session: LinkSessionId, readers: &readers::Registry) {
         match &command.body {
-            Body::Subscribe { subscribe, inbox } => {
+            Body::Subscribe {
+                subscribe, inbox, ..
+            } => {
                 let sent = readers::Sent {
                     broker: self.remote,
                     session,
@@ -349,7 +351,7 @@ impl LinkState {
                 };
                 readers.select(inbox, sent, subscribe);
             }
-            Body::Unsubscribe { selected, .. } => readers.unselect(selected),
+            Body::Unsubscribe { unsubscribe, .. } => readers.unselect(unsubscribe),
             _ => {}
         }
         self.active.insert(command.id, Active { command, session });

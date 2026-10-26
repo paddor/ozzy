@@ -17,8 +17,8 @@ use bytes::Bytes;
 use futures::task::AtomicWaker;
 use omq_tokio::{Message, TrySendError};
 use ozzy_proto::{
-    Envelope, NodeId, Opcode, PartitionIncarnation, data::DataLimits, decode_packet,
-    nack::AuthorityHint, reader,
+    Envelope, LinkSessionId, NodeId, Opcode, PartitionIncarnation, SubscriptionId,
+    data::DataLimits, decode_packet, nack::AuthorityHint, reader,
 };
 use ozzy_replication::driver::ValidationTicket;
 use ozzy_replication::{JournalGeneration, PipelineLimits, Prefix, Scope};
@@ -63,12 +63,24 @@ struct Slot {
     reply_due: bool,
 }
 
+/// A reader that canceled its replay stream to go live. Its node keeps the
+/// live topic grant until it cancels the subscription, its link session
+/// ends, or the journal view fences every subscription.
+#[derive(Debug)]
+struct LiveReader {
+    peer: NodeId,
+    id: SubscriptionId,
+    session: Option<LinkSessionId>,
+}
+
 pub(super) struct SharedReaders {
     local: NodeId,
     config: SharedReaderConfig,
     links: Links,
-    /// Installed subscriptions, at most `config.subscriptions`, preallocated.
+    /// Installed subscriptions, preallocated. With `live`, at most
+    /// `config.subscriptions`.
     slots: Vec<Slot>,
+    live: Vec<LiveReader>,
     pool: PartitionReadBuffer,
     metadata: Vec<u8>,
     rejection: Option<Message>,
@@ -131,6 +143,7 @@ impl SharedReaders {
             config,
             links,
             slots: Vec::with_capacity(config.subscriptions),
+            live: Vec::new(),
             pool,
             metadata: Vec::with_capacity(config.limits.envelope.max_metadata_bytes),
             rejection: None,
@@ -185,13 +198,16 @@ impl SharedReaders {
 
     fn discard_stale(&mut self) {
         let links = &self.links;
-        let before = self.slots.len();
-        self.slots.retain(|slot| {
+        let before = (self.slots.len(), self.live.len());
+        let current = |peer, session| {
             links
-                .get(slot.peer)
-                .is_some_and(|link| Some(link.binding.session) == slot.delivery.request.session)
-        });
-        if self.slots.len() != before {
+                .get(peer)
+                .is_some_and(|link| Some(link.binding.session) == session)
+        };
+        self.slots
+            .retain(|slot| current(slot.peer, slot.delivery.request.session));
+        self.live.retain(|live| current(live.peer, live.session));
+        if (self.slots.len(), self.live.len()) != before {
             self.slots_changed();
         }
         if self.rejection.as_ref().is_some_and(|message| {

@@ -156,9 +156,9 @@ pub(super) struct Registry {
     prefixes: RefCell<BTreeMap<Bytes, BTreeMap<SubscriptionId, Weak<Inbox>>>>,
     endpoints: RefCell<BTreeMap<NodeId, Option<omq_tokio::Endpoint>>>,
     /// Subscriptions a broker accepted, whose live topic its reader PUB now
-    /// admits from this SDK.
+    /// admits from this SDK. A replay cancellation keeps them.
     accepted: RefCell<BTreeMap<SubscriptionId, Accepted>>,
-    /// Acceptances so far; each renews its SUB's SUBSCRIBE.
+    /// Renewing acceptances so far; each renews its SUB's SUBSCRIBE.
     acceptances: Cell<u64>,
     changed: Arc<StateSignal>,
     pub(super) interests: Arc<StateSignal>,
@@ -325,17 +325,24 @@ impl Registry {
     }
 
     /// An UNSUBSCRIBE was just sent: later frames of that generation are
-    /// dropped here, and a source paused on its full inbox can resume.
-    pub(super) fn unselect(&self, selected: &reader::Subscribed) {
+    /// dropped here, and a source paused on its full inbox can resume. Only
+    /// a cancellation of the whole subscription leaves its live topic.
+    pub(super) fn unselect(&self, unsubscribe: &reader::Unsubscribe) {
+        let subscription = unsubscribe.selected.subscription;
         let entries = self.entries.borrow();
-        if let Some(inbox) = entries
-            .get(&selected.subscription.id)
-            .and_then(Weak::upgrade)
-            && inbox.unselect(selected.subscription)
+        if let Some(inbox) = entries.get(&subscription.id).and_then(Weak::upgrade)
+            && inbox.unselect(subscription)
         {
-            self.accepted.borrow_mut().remove(&selected.subscription.id);
-            self.interests.notify_changed();
             self.changed.notify_changed();
+        }
+        if unsubscribe.cancel == reader::Cancel::Subscription
+            && self
+                .accepted
+                .borrow_mut()
+                .remove(&subscription.id)
+                .is_some()
+        {
+            self.interests.notify_changed();
         }
     }
 
@@ -375,13 +382,14 @@ impl Registry {
     }
 
     /// `broker` accepted `selected`. Its reader PUB published the grant before
-    /// replying, so a SUBSCRIBE to the live topic sent now is admitted.
-    pub(super) fn accept(&self, broker: NodeId, selected: &reader::Subscribed) {
+    /// replying, so a SUBSCRIBE to the live topic sent now is admitted. One
+    /// already sent stays admitted while the subscription kept its grant, so
+    /// only a `renew` acceptance, or one for another broker or topic,
+    /// renews it.
+    pub(super) fn accept(&self, broker: NodeId, selected: &reader::Subscribed, renew: bool) {
         let Ok(topic) = reader::publication_topic(selected.source) else {
             return;
         };
-        let token = self.acceptances.get() + 1;
-        self.acceptances.set(token);
         let entries = self.entries.borrow();
         let mut accepted = self.accepted.borrow_mut();
         accepted.retain(|id, _| {
@@ -389,8 +397,17 @@ impl Registry {
                 .get(id)
                 .is_some_and(|inbox| inbox.strong_count() != 0)
         });
+        let id = selected.subscription.id;
+        let kept = (accepted.get(&id))
+            .filter(|old| !renew && old.broker == broker && *old.topic == topic)
+            .map(|old| old.token);
+        let token = kept.unwrap_or_else(|| {
+            let token = self.acceptances.get() + 1;
+            self.acceptances.set(token);
+            token
+        });
         accepted.insert(
-            selected.subscription.id,
+            id,
             Accepted {
                 broker,
                 topic: Bytes::copy_from_slice(&topic),
@@ -462,16 +479,20 @@ impl BrokerLinks {
         self.0.shared.readers.changed.changed_after(seen).await;
     }
     /// Subscribe `inbox`, which takes the records once the request is sent.
+    /// A `renew` acceptance renews the SUB's SUBSCRIBE to the live topic.
     pub(in crate::replicated) async fn subscribe(
         &self,
         broker: NodeId,
         inbox: Weak<Inbox>,
         subscribe: reader::Subscribe,
+        renew: bool,
     ) -> Result<reader::Subscribed, BrokerLinkError> {
-        match self
-            .request(broker, driver::Body::Subscribe { subscribe, inbox })
-            .await?
-        {
+        let body = driver::Body::Subscribe {
+            subscribe,
+            inbox,
+            renew,
+        };
+        match self.request(broker, body).await? {
             driver::Reply::Subscribed(selected) => Ok(selected),
             _ => Err(BrokerLinkError::Response),
         }
@@ -523,7 +544,7 @@ impl BrokerLinks {
         &self,
         broker: NodeId,
         session: LinkSessionId,
-        selected: reader::Subscribed,
+        unsubscribe: reader::Unsubscribe,
     ) -> Result<(), BrokerLinkError> {
         let deadline = self
             .0
@@ -535,7 +556,10 @@ impl BrokerLinks {
             match self
                 .request_until(
                     broker,
-                    driver::Body::Unsubscribe { session, selected },
+                    driver::Body::Unsubscribe {
+                        session,
+                        unsubscribe,
+                    },
                     deadline,
                 )
                 .await
