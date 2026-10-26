@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Brokers allocate each partition's spare segment ahead, beside writes, and
+  a roll waits for it. Cleanup replaces a preallocated spare with a retired
+  segment, whose written blocks the next roll reuses.
+
+### Fixed
+
+- A device without room for another segment no longer stops the broker. The
+  partition refuses new records with NACK 10 before its active segment's last
+  sixteenth, holds writes that reach its end, and resumes once allocation
+  succeeds. Allocation retries a second after the failure, or at once after
+  cleanup.
+
 ## [0.5.0] - 2026-10-26
 
 ### Breaking

@@ -354,6 +354,7 @@ async fn record_retention_proceeds_while_identity_expiry_has_more_work() {
     let work = journal.begin_roll(8).unwrap();
     let done = drive(&mut controller, work.publish());
     journal.complete_roll(done).unwrap();
+    ready_spare(&mut controller, &mut journal);
     let body = OperationBody::PartitionPolicy(ozzy_journal::operation::PartitionPolicy {
         partition: partition(),
         expected_revision: 1,

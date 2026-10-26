@@ -77,7 +77,8 @@ pub use directory::asynchronous::{
     Pipeline as JournalWritePipeline, Prepared as PreparedJournalWrite,
     PreparedRoll as PreparedJournalRoll, PreparedSegment, PreparedSync as PreparedJournalSync,
     RecoveryDirectory, Repair as SealedRepair, RetirementBudget, RetirementProof, RetirementScan,
-    ScannedPrefix, SegmentFiles, SegmentPreparation, SuffixRequest, UnselectedFiles,
+    ScannedPrefix, SegmentFiles, SegmentPreparation, SparePreparation, SuffixRequest,
+    UnselectedFiles,
 };
 pub use directory::asynchronous::{
     PartitionIndex as JournalPartitionIndex, PartitionRead, PartitionReadLimits, PartitionReadRange,

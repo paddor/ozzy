@@ -589,6 +589,39 @@ async fn invalid_schedule_and_storage_limits_leave_operation_or_image_intact() {
 }
 
 #[tokio::test]
+async fn device_space_refuses_growth_but_not_allocated_or_freed_space() {
+    let allocate = |handle: &Handle, length| Operation::Allocate {
+        handle: handle.clone(),
+        offset: 0,
+        length,
+    };
+    let mut harness = Harness::new();
+    let file = harness.open("/data", OpenMode::CreateNew).await;
+    let other = harness.open("/other", OpenMode::CreateNew).await;
+    harness.controller.limit_space(Some(8192));
+    harness.run(allocate(&file, 4096)).await;
+    harness.run(write(&file, 0, &[1; 4096])).await;
+    harness.run(allocate(&file, 4096)).await;
+    for operation in [allocate(&other, 8192), write(&other, 0, &[2; 8192])] {
+        let error = harness
+            .perform(operation, Effect::Normal)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+    }
+    harness
+        .run(Operation::RemoveFile {
+            path: "/data".into(),
+        })
+        .await;
+    harness.run(Operation::Close { handle: file }).await;
+    harness.run(allocate(&other, 8192)).await;
+    assert_eq!(harness.controller.image().used_space(), 8192);
+    harness.controller.limit_space(None);
+    harness.run(write(&other, 8192, &[3; 4096])).await;
+}
+
+#[tokio::test]
 async fn trace_limit_refuses_the_next_event_without_losing_the_pending_reply() {
     let mut configuration = config();
     configuration.trace_events = 1;

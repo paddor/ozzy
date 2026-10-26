@@ -52,6 +52,7 @@ pub(super) fn replica_with_pending(
     journal
         .bind_append_memory(&payload_owner(1024 * 1024))
         .unwrap();
+    ready_spare(controller, &mut journal);
     let driver = startup
         .into_driver(Duration::ZERO, timing(), config.append_limits)
         .unwrap();

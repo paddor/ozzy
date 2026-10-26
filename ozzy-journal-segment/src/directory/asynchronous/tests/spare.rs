@@ -117,6 +117,61 @@ fn cleanup_keeps_one_unselected_segment_as_the_spare() {
 }
 
 #[test]
+fn a_retired_segment_replaces_a_preallocated_spare() {
+    let (mut controller, io) = setup(baseline());
+    let journal = drive(&mut controller, open(io, 2)).unwrap();
+    drive(&mut controller, journal.prepare_spare().unwrap().run()).unwrap();
+    drive(
+        &mut controller,
+        put_file(&journal, "/group/segments/2.log".into(), b"two"),
+    );
+    let mut journal = journal;
+    let cleanup = drive(&mut controller, journal.reclaim_unreferenced_segments(8)).unwrap();
+    assert_eq!(cleanup.removed_segment_ids, [2]);
+    assert_eq!(
+        controller.image().bytes(Path::new(SPARE), false).unwrap(),
+        b"two",
+        "written blocks win over unwritten ones"
+    );
+    drive(&mut controller, journal.close()).unwrap();
+}
+
+#[test]
+fn spare_preparation_allocates_a_spare_without_writing_it() {
+    let (mut controller, io) = setup(baseline());
+    let journal = drive(&mut controller, open(io, 2)).unwrap();
+    let capacity = journal.writer.header().capacity() as usize;
+    // Collect files removed while open had them.
+    assert_eq!(controller.jobs(), []);
+    let used = controller.image().used_space();
+    drive(&mut controller, journal.prepare_spare().unwrap().run()).unwrap();
+    assert_eq!(
+        controller.image().bytes(Path::new(SPARE), false).unwrap(),
+        b""
+    );
+    assert_eq!(controller.image().used_space(), used + capacity);
+    // An allocated spare needs no new space, neither to prepare again nor
+    // for the roll that takes it.
+    controller.limit_space(Some(used + capacity + capacity / 2));
+    drive(&mut controller, journal.prepare_spare().unwrap().run()).unwrap();
+    let journal = roll(&mut controller, journal);
+    assert_eq!(journal.writer.header().segment_id(), 2);
+    assert!(!controller.image().exists(Path::new(SPARE), false));
+    let full = drive(&mut controller, journal.prepare_spare().unwrap().run()).unwrap_err();
+    assert!(
+        matches!(&full, DirectoryError::Io(error) if error.kind() == io::ErrorKind::StorageFull),
+        "{full:?}"
+    );
+    assert!(
+        !controller.image().exists(Path::new(SPARE), false),
+        "a spare that found no room is removed"
+    );
+    controller.limit_space(None);
+    drive(&mut controller, journal.prepare_spare().unwrap().run()).unwrap();
+    drive(&mut controller, journal.close()).unwrap();
+}
+
+#[test]
 fn roll_from_the_spare_crash_cuts_keep_confirmed_history() {
     let image = spare_image();
     for immediate in [false, true] {

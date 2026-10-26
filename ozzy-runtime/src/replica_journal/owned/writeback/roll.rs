@@ -72,6 +72,8 @@ impl OwnedJournal {
         }
         self.journal =
             JournalOwner::Ready(Box::new(self.journal.take_rolling()?.complete(completed)?));
+        // The new segment took the spare's file.
+        self.spare.changed();
         let reader = self.reader.as_mut().ok_or(JournalError::AppendMismatch)?;
         reader.rolled(self.journal.readable()?)?;
         // The sealed segment's read index already holds its record ends, so

@@ -22,7 +22,7 @@ Each partition store lives in
 | `CURRENT` | Selects one manifest by generation and digest |
 | `DURABLE` | Synchronized accepted-prefix evidence |
 | `segments/<id>.log`, `segments/<id>.<generation>.log` | Operations and payloads; the second form is a replacement |
-| `segments/spare.log` | A retired segment file kept for the next new segment |
+| `segments/spare.log` | The next new segment's file: a retired segment, or preallocated space |
 | `indexes/<segment-id>-<segment-digest-hex>.idx` | Derived, rebuildable lookup |
 | `checkpoints/<id-hex>/` | `manifest` plus `CHUNK.<8-hex-ordinal>` files |
 | `staging/` | Unselected work (`index-*`, `.checkpoint-*.tmp`) |
@@ -248,6 +248,9 @@ With the `aio` backend (the Linux default), segment data writes use a separate
   4 KiB `O_DSYNC` write took 1.6 ms there and 0.65 ms into written blocks. So
   every new segment, from a roll or from a log a new view installs, takes the
   spare when there is one.
+- A job beside writes allocates the spare at full capacity: at open and
+  after each roll, installation, and cleanup. A roll waits for it, so it
+  needs no new space.
 - `format` writes up to 128 MiB of zeros once where a new store's first
   appends land: the first segment of a local store, or a spare in a
   replicated store, whose first election installs its log into a new segment.
@@ -258,8 +261,8 @@ With the `aio` backend (the Linux default), segment data writes use a separate
 
 ### Segment roll
 
-1. Create the successor with a new ID, move the spare over it if there is one,
-   preallocate it, and sync it.
+1. Create the successor with a new ID, move the allocated spare over it, and
+   sync it.
 2. Write and sync its header, which binds the predecessor ID and the chain
    digest before the successor.
 3. Sync the predecessor and the `segments/` directory.
@@ -418,8 +421,9 @@ Topics set `retention.max_age_secs` and `retention.max_bytes`; see
   older than its captured selection, and only while `CURRENT` names that
   generation or a newer one. A failed cleanup job fences the owner.
 - Cleanup renames one unselected segment file to `segments/spare.log` instead
-  of unlinking it, unless a spare exists. So a byte-limited partition can use
-  one segment more than `max_bytes` on disk.
+  of unlinking it, unless a spare with written bytes exists. It replaces a
+  preallocated spare, which has none. So a byte-limited partition can use one
+  segment more than `max_bytes` on disk.
 - Opening a store removes recognized `staging/` leftovers.
 
 ### Full partitions
@@ -436,6 +440,20 @@ A partition journal holds at most 256 segments of `segment_bytes`.
   space than the leader. Packing gives that space back. A replica whose
   journal fills anyway holds its writes until a pack or a retirement frees a
   segment, instead of failing.
+
+### Full devices
+
+A spare the device has no room for (`ENOSPC`, `EDQUOT`) is no fault.
+
+- Without an allocated spare, the partition refuses new records once less than
+  a sixteenth of its active segment is left, and producer opens, consumer
+  progress, and assignments below a sixty-fourth. New work must leave that room
+  free. Trims and policy changes still pass.
+- Writes that reach the end of the active segment hold until the spare is
+  allocated. Followers hold the same way.
+- Allocation retries a second after the failure, or at once after cleanup.
+- Other writes that need new space, such as checkpoints, still fence the
+  owner on `ENOSPC`.
 
 ### Packing
 

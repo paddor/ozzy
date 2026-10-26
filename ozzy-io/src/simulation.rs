@@ -198,6 +198,7 @@ pub struct Controller {
     files: execute::Files,
     image: Image,
     config: Config,
+    space: Option<usize>,
     trace: Vec<Event>,
     reclaim_needed: bool,
 }
@@ -265,6 +266,7 @@ impl Controller {
                 ),
                 image,
                 config,
+                space: None,
                 trace: Vec::new(),
                 reclaim_needed: true,
             },
@@ -344,6 +346,7 @@ impl Controller {
             files: &mut self.files,
             image: &mut self.image,
             limits: self.config.image,
+            space: self.space,
             origin: job.origin,
             effect,
         }
@@ -400,6 +403,11 @@ impl Controller {
     /// Inspect dirty and durable media independently of actor observations.
     pub fn image(&self) -> &Image {
         &self.image
+    }
+    /// Device size in bytes: writes, preallocation, and length changes that
+    /// would occupy more fail with `StorageFull`. `None` lifts the limit.
+    pub fn limit_space(&mut self, bytes: Option<usize>) {
+        self.space = bytes;
     }
     /// Recorded schedule events in application order.
     pub fn trace(&self) -> &[Event] {

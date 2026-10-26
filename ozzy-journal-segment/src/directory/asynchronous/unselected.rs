@@ -145,9 +145,10 @@ impl Reclaim<'_> {
     }
 
     /// Delete at most `max_segments` unselected physical segment generations,
-    /// keeping one regular file as the spare when there is none. Directory
-    /// visits and each segment's derived indexes are bounded by the journal's
-    /// listing limits. Selected generations and captured readers win.
+    /// keeping one regular file as the spare unless one with written bytes
+    /// exists. Directory visits and each segment's derived indexes are bounded
+    /// by the journal's listing limits. Selected generations and captured
+    /// readers win.
     async fn segments(
         &mut self,
         max_segments: usize,
@@ -165,7 +166,15 @@ impl Reclaim<'_> {
             pinned_segment_ids: Vec::new(),
             reclaimed_bytes: 0,
         };
-        let mut spare = entries.iter().any(|entry| entry.name == SPARE_SEGMENT);
+        // A preallocated spare keeps its length at zero: it has no written
+        // blocks, and a retired file replaces it.
+        let mut spare = false;
+        if entries.iter().any(|entry| entry.name == SPARE_SEGMENT) {
+            let path = self.root.join("segments").join(SPARE_SEGMENT);
+            spare = regular_file_length(self.access, path)
+                .await?
+                .is_some_and(|length| length != 0);
+        }
         for entry in entries {
             if result.removed_segment_ids.len() == max_segments {
                 break;
@@ -201,9 +210,10 @@ impl Reclaim<'_> {
         Ok(result)
     }
 
-    /// Unlink one unselected segment file, or rename it to the spare when
-    /// there is no `spare` yet and it is a regular file. The next roll then
-    /// overwrites its written blocks. Returns whether a spare exists.
+    /// Unlink one unselected segment file, or rename it over the spare when
+    /// no `spare` with written bytes exists yet and it is a regular file. The
+    /// next roll then overwrites its written blocks; the rename frees a
+    /// preallocated spare. Returns whether a spare with written bytes exists.
     async fn remove_or_keep(
         &mut self,
         segment: &ozzy_io::Entry,
@@ -393,18 +403,27 @@ impl Reclaim<'_> {
 }
 
 async fn remove_regular_file(access: &Access, path: PathBuf) -> Result<u64, DirectoryError> {
-    let opened = access
-        .open(path.clone(), OpenMode::Read, false, false)
-        .await;
+    let length = regular_file_length(access, path.clone()).await?;
+    if length.is_some() {
+        access.done(Operation::RemoveFile { path }).await?;
+    }
+    Ok(length.unwrap_or(0))
+}
+
+/// A regular file's length, or none when nothing has its name.
+async fn regular_file_length(
+    access: &Access,
+    path: PathBuf,
+) -> Result<Option<u64>, DirectoryError> {
+    let opened = access.open(path, OpenMode::Read, false, false).await;
     let file = match opened {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
     let length = access.length(&file).await?;
     access.done(Operation::Close { handle: file }).await?;
-    access.done(Operation::RemoveFile { path }).await?;
-    Ok(length)
+    Ok(Some(length))
 }
 
 impl Journal {

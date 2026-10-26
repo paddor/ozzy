@@ -26,7 +26,7 @@ fn adapter(
     owner
         .bind_append_memory(&payload_owner(1024 * 1024))
         .unwrap();
-    let adapter = owner
+    let mut adapter = owner
         .into_shard_journal(
             ShardJournalConfig {
                 write_depth: depth,
@@ -36,6 +36,19 @@ fn adapter(
             || 123,
         )
         .unwrap();
+    // Allocate the spare before a test schedules jobs itself.
+    for _ in 0..64 {
+        pump(&mut adapter);
+        let jobs = controller.jobs();
+        if jobs.is_empty() {
+            break;
+        }
+        for (id, _) in jobs {
+            controller.execute(id, Effect::Normal).unwrap();
+            controller.deliver(id).unwrap();
+        }
+    }
+    assert_eq!(controller.jobs(), [], "the spare job did not settle");
     (
         adapter,
         startup

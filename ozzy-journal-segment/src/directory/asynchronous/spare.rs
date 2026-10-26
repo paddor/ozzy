@@ -1,12 +1,73 @@
-//! The spare: one retired segment file per partition, kept for the next new
-//! segment. Appends into its written blocks skip the metadata commit that the
-//! first write into an unwritten extent costs.
+//! The spare: one segment file per partition, kept for the next new segment.
+//! A retired one keeps its written blocks, and appends into them skip the
+//! metadata commit that the first write into an unwritten extent costs.
+//! Preparation allocates the spare ahead, so a roll needs no new space.
 
 use super::Journal;
 use crate::async_files::Access;
 use crate::directory::{DirectoryError, segment_name, spare_segment_name};
 use ozzy_io::{Handle, OpenMode, Operation};
-use std::{io, path::Path};
+use std::{
+    io,
+    path::{Path, PathBuf},
+};
+
+/// Captured spare preparation; it borrows no journal, so it runs beside
+/// writes. It must not overlap a roll, an installation, or cleanup.
+#[derive(Debug)]
+pub struct SparePreparation {
+    access: Access,
+    root: PathBuf,
+    capacity: u64,
+}
+
+impl SparePreparation {
+    /// Make sure the spare exists and has the active segment's capacity
+    /// allocated. A spare this call created and could not allocate is removed
+    /// again; an existing one stays. `StorageFull` means the device lacks room
+    /// for another segment.
+    pub async fn run(self) -> Result<(), DirectoryError> {
+        let path = self.root.join(spare_segment_name());
+        let created = self
+            .access
+            .open(path.clone(), OpenMode::CreateNew, false, false)
+            .await;
+        let (file, created) = match created {
+            Ok(file) => (file, true),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (
+                self.access
+                    .open(path.clone(), OpenMode::ReadWrite, false, false)
+                    .await?,
+                false,
+            ),
+            Err(error) => return Err(error.into()),
+        };
+        let allocated = async {
+            self.access
+                .done(Operation::Allocate {
+                    handle: file.clone(),
+                    offset: 0,
+                    length: self.capacity,
+                })
+                .await?;
+            self.access.sync(&file).await
+        }
+        .await;
+        self.access.done(Operation::Close { handle: file }).await?;
+        if let Err(error) = allocated {
+            if created {
+                self.access.done(Operation::RemoveFile { path }).await?;
+            }
+            return Err(error.into());
+        }
+        if created {
+            self.access
+                .sync_directory(self.root.join("segments"))
+                .await?;
+        }
+        Ok(())
+    }
+}
 
 /// Create segment file `id` under `root`, refusing an existing one, move the
 /// spare over it when there is one, and reserve `capacity` bytes. The spare's
@@ -53,6 +114,16 @@ pub(super) async fn create_segment_file(
 }
 
 impl Journal {
+    /// Capture preparation of a spare with the active segment's capacity.
+    pub fn prepare_spare(&self) -> Result<SparePreparation, DirectoryError> {
+        self.healthy()?;
+        Ok(SparePreparation {
+            access: self.access.clone(),
+            root: self.root().to_path_buf(),
+            capacity: self.writer.header().capacity(),
+        })
+    }
+
     /// Write a spare of up to `bytes` zeros, at most the active segment's
     /// capacity, so the next new segment starts on written blocks. For a new
     /// replicated store, whose first election installs its log into a new
