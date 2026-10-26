@@ -258,6 +258,12 @@ impl GroupReader {
         })
     }
 
+    /// When a refused activation retries.
+    #[cfg(test)]
+    pub(crate) fn activation_retry(&self) -> Option<Duration> {
+        self.view.borrow().retry
+    }
+
     /// Numeric partitions currently delivered to this member.
     pub fn partitions(&self) -> Vec<u32> {
         self.sources.keys().copied().collect()

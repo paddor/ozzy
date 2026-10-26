@@ -38,14 +38,29 @@ async fn sdk_group_activation_retries_before_the_next_heartbeat() {
         tokio::task::yield_now().await;
     }
     assert_eq!(harness.assignment_attempts, 1);
+    // SDK threads run independently of virtual time. It stands still until
+    // the reader has seen the refusal, then expires only the activation
+    // backoff, far from the next heartbeat.
     let refused = clock.now();
+    harness
+        .until(true, "the refusal was not observed", |_| {
+            reader.activation_retry().is_some()
+        })
+        .await;
+    let retry = reader.activation_retry().unwrap();
+    assert_eq!(retry, refused + config.retry.initial_backoff);
+    clock.advance(retry).unwrap();
+    harness
+        .until(true, "the refused activation did not retry", |harness| {
+            harness.assignment_attempts == 2
+        })
+        .await;
     let record = harness
         .drive_advancing(&clock, reader.next(), true)
         .await
         .unwrap();
     assert_eq!(record.record.offset, Offset::ZERO);
     assert_eq!(harness.assignment_attempts, 2);
-    assert!(clock.now().checked_sub(refused).unwrap() < config.heartbeat / 2);
     drop(record);
     harness
         .drive_advancing(&clock, reader.close(), true)

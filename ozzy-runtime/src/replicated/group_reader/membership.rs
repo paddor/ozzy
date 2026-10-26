@@ -68,6 +68,10 @@ pub(super) struct View {
     pub(super) targets: Vec<Target>,
     pub(super) activations: Vec<Activation>,
     pub(super) failure: Option<Failure>,
+    /// When the earliest refused activation retries. Tests observe it without
+    /// a wakeup.
+    #[cfg(test)]
+    pub(super) retry: Option<Duration>,
 }
 
 impl View {
@@ -413,8 +417,14 @@ impl Membership {
             targets: self.targets.clone(),
             activations: self.activations.values().copied().collect(),
             failure: None,
+            #[cfg(test)]
+            retry: self.activation_due(),
         };
         if view.send_if_modified(|current| {
+            #[cfg(test)]
+            {
+                current.retry = next.retry;
+            }
             if *current == next {
                 return false;
             }
