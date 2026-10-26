@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-26
+
 ### Breaking
 
 - UNSUBSCRIBE and UNSUBSCRIBED carry what they cancel: the whole
