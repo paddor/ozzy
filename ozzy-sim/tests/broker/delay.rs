@@ -107,23 +107,24 @@ async fn inproc_memory_scheduled_records_release_in_due_order_in_every_mode() {
             )
             .await;
             let mut writer = writer(&clock, &client).await;
+            let receipts = confirm(
+                &clock,
+                &mut writer,
+                [record(3, Some(broker_now(&clock) - 1)), record(4, None)],
+            )
+            .await;
+            assert_eq!(receipts[0], (Scheduled, 0), "{mode:?}");
+            assert_eq!(receipts[1].0, Stored, "{mode:?}");
+            // Confirming advances the clock, so these due times start after
+            // the first two records are in.
             let now = broker_now(&clock);
             let receipts = confirm(
                 &clock,
                 &mut writer,
-                [
-                    record(1, Some(now + 4_000)),
-                    record(2, Some(now + 2_000)),
-                    record(3, Some(now - 1)),
-                    record(4, None),
-                ],
+                [record(1, Some(now + 4_000)), record(2, Some(now + 2_000))],
             )
             .await;
-            assert_eq!(
-                receipts[..3],
-                [(Scheduled, 0), (Scheduled, 1), (Scheduled, 2)]
-            );
-            assert_eq!(receipts[3].0, Stored, "{mode:?}");
+            assert_eq!(receipts, [(Scheduled, 1), (Scheduled, 2)], "{mode:?}");
             let records = released(&clock, &client, 4).await;
             // A past due time releases at once; the others wait, in due order.
             let order: Vec<_> = records.iter().map(|&(id, _, _)| id).collect();
@@ -135,9 +136,10 @@ async fn inproc_memory_scheduled_records_release_in_due_order_in_every_mode() {
             assert!(records.iter().map(|&(_, offset, _)| offset).eq(0..4));
             assert!(records[2].2 >= now + 2_000 && records[3].2 >= now + 4_000);
 
-            // A due time past the maximum delay fails permanently.
+            // A due time past the maximum delay fails permanently. Twice the
+            // maximum leaves room for the clock to advance before validation.
             let late = writer
-                .send_to_partition(record(5, Some(broker_now(&clock) + 61_000)), 0)
+                .send_to_partition(record(5, Some(broker_now(&clock) + 120_000)), 0)
                 .await
                 .unwrap();
             assert!(
@@ -165,13 +167,18 @@ async fn inproc_memory_held_records_survive_a_restart_or_leader_crash_and_releas
             )
             .await;
             let mut writer = writer(&clock, &client).await;
-            let due = broker_now(&clock) + 2_000;
+            // Confirming advances the clock; leave room for a slow host.
+            let due = broker_now(&clock) + 10_000;
             confirm(
                 &clock,
                 &mut writer,
                 [record(1, Some(due)), record(2, Some(due + 500))],
             )
             .await;
+            assert!(
+                broker_now(&clock) < due,
+                "{mode:?}: released before the fault"
+            );
             if mode == DeploymentMode::Single {
                 progress(&clock, cluster.restart(0)).await;
             } else {
