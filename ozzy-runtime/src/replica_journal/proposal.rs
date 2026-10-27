@@ -70,6 +70,9 @@ pub enum AppendAdmissionError {
     /// The partition already holds its maximum of scheduled records.
     #[error("scheduled-record capacity is full")]
     ScheduleCapacity,
+    /// One scheduled batch holds more records than the partition may hold.
+    #[error("scheduled batch exceeds the held-record limit")]
+    ScheduleTooLarge,
     /// Scheduled records must arrive raw, so a release can copy any prefix.
     #[error("scheduled records use a whole-payload codec")]
     CompressedSchedule,

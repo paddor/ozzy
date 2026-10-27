@@ -16,6 +16,14 @@ pub struct DelayLimits {
     pub max_entries: usize,
 }
 
+impl DelayLimits {
+    /// Core snapshot bytes of a full set of held records.
+    pub const fn snapshot_bytes(self) -> Option<usize> {
+        self.max_entries
+            .checked_mul(ozzy_core::state::PENDING_SCHEDULE_SNAPSHOT_BYTES)
+    }
+}
+
 /// Size a partition's identity reservation for its live pipeline. Pending
 /// identities stay charged until application, and a backup can hold its
 /// whole retained capacity accepted but not yet applied.

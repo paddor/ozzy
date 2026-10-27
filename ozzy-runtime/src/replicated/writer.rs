@@ -141,9 +141,10 @@ pub struct RecordReceipt {
     pub key: AppendKey,
     /// Original application record identity.
     pub message_id: MessageId,
-    /// Stable partition offset.
+    /// Stable partition offset; the schedule sequence of a scheduled record,
+    /// which gets its offset at release.
     pub offset: u64,
-    /// Whether this attempt stored a record or reused its original offset.
+    /// Whether this attempt stored, reused, or scheduled the record.
     pub disposition: ozzy_proto::append::AppendDisposition,
     /// Exact confirmation boundary requested by this writer.
     pub policy: Policy,

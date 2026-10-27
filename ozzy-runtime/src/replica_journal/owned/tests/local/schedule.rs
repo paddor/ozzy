@@ -277,7 +277,7 @@ fn resend_with_other_bytes_due_time_or_kind_conflicts() {
 }
 
 #[test]
-fn leader_refuses_late_due_times_full_capacity_and_plain_partitions() {
+fn leader_refuses_late_due_times_oversized_batches_full_capacity_and_plain_partitions() {
     let (mut controller, mut journal, mut driver) = delayed(2);
     let late = produce(
         &mut controller,
@@ -290,6 +290,18 @@ fn leader_refuses_late_due_times_full_capacity_and_plain_partitions() {
     assert!(matches!(
         rejection(late),
         JournalError::ProducerAppend(AppendAdmissionError::DueOutOfRange)
+    ));
+    let oversized = produce(
+        &mut controller,
+        &mut journal,
+        &driver,
+        request(12, 0, 3),
+        Some(&[NOW; 3]),
+        NOW,
+    );
+    assert!(matches!(
+        rejection(oversized),
+        JournalError::ProducerAppend(AppendAdmissionError::ScheduleTooLarge)
     ));
     let edge = produce(
         &mut controller,

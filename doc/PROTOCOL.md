@@ -277,8 +277,9 @@ APPEND:
   record, in absolute Unix milliseconds. Readers see its records only once
   due. The partition must enable delay and the payload must be raw (else
   code 2). A due time past acceptance plus the maximum delay fails with
-  code 21; a full schedule capacity with code 10. A retry must repeat the
-  tag and due times.
+  code 21; a full schedule capacity with code 10, and a batch above the
+  held-record limit with code 1. A retry must repeat the tag and due
+  times.
 
 List-form APPENDED has a codec, but brokers do not send it: tag, Authority,
 partition, owner epoch, AppendKey, first offset `u64`, count `u32`, achieved
@@ -698,7 +699,7 @@ Diagnostics never determine behavior; unknown codes keep raw detail.
 
 | Code | Meaning | Retry class |
 | ---: | --- | --- |
-| 1 | Malformed or oversized command, including an invalid dedup batch | permanent |
+| 1 | Malformed or oversized command, including an invalid dedup batch or a scheduled batch above the held-record limit | permanent |
 | 2 | Unsupported command or policy | permanent |
 | 3 | Source/producer identity not authorized | permanent |
 | 5 | Stale/foreign group, configuration, or view | after-authority-refresh |

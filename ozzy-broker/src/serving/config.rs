@@ -422,8 +422,12 @@ fn native_limits(checked: &CheckedConfig) -> Result<DataLimits, StartupError> {
         .values()
         .map(|topic| {
             let resolved = topic.deduplication.is_some();
-            let bound = |records| {
+            // A scheduled APPEND adds a due time per record and a first
+            // schedule sequence.
+            let due = if topic.delay.is_some() { 8 } else { 0 };
+            let bound = |records: usize| {
                 ozzy_journal::operation::append_metadata_bound(1, records, resolved)
+                    .and_then(|bytes| bytes.checked_add(due * (records + 1)))
                     .ok_or_else(|| failure("append metadata bound overflows"))
             };
             let header = bound(0)?;

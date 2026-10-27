@@ -36,6 +36,8 @@ pub struct TopicIdentity {
     pub partitioner_seed: u64,
     /// Fixed first-wins window; resource limits do not change event identity.
     pub dedup_window_millis: Option<std::num::NonZeroU64>,
+    /// Fixed maximum delay; the held record limit may change.
+    pub delay_max_millis: Option<std::num::NonZeroU64>,
     /// Numeric partition order, never sorted by random group IDs.
     pub partitions: Vec<PartitionIdentity>,
 }
@@ -110,6 +112,7 @@ impl ValidatedDeployment {
                     dedup_window_millis: topic
                         .deduplication
                         .and_then(|policy| std::num::NonZeroU64::new(policy.window_millis)),
+                    delay_max_millis: topic.delay_max_millis(),
                     partitions,
                 },
             );
@@ -199,9 +202,10 @@ impl ValidatedDeployment {
                     && stored.partitioner_seed == topic.partitioner_seed
                     && stored.dedup_window_millis.map(std::num::NonZeroU64::get)
                         == topic.deduplication.map(|policy| policy.window_millis)
+                    && stored.delay_max_millis == topic.delay_max_millis()
                     && stored.partitions.len() == topic.partitions as usize,
                 "identity.topics",
-                "topic identity, hash parameters, partition count or window changed",
+                "topic identity, hash parameters, partition count, window or maximum delay changed",
             )?;
             for (index, partition) in stored.partitions.iter().enumerate() {
                 let mut ordered = members.clone();

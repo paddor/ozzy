@@ -86,6 +86,7 @@ mod tests {
     fn record(sequence: u64, body: Vec<u8>) -> Queued {
         Queued {
             encoding: Encoding::Raw,
+            due_millis: None,
             admitted_at: None,
             sequence,
             completion: crate::replicated::writer::state::Completion::new(MessageId::from_bytes(

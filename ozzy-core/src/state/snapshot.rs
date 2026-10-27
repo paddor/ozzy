@@ -35,6 +35,9 @@ fn ready<T>(future: impl std::future::Future<Output = T>) -> T {
 /// Exact encoded canonical-state snapshot header length.
 pub const STATE_SNAPSHOT_HEADER_BYTES: usize = 256;
 
+/// Encoded snapshot bytes of one held scheduled record.
+pub const PENDING_SCHEDULE_SNAPSHOT_BYTES: usize = 48;
+
 const SNAPSHOT_MAGIC: &[u8; 8] = b"OZYSTA01";
 const SNAPSHOT_VERSION: u16 = 4;
 const PROGRESS_BYTES: usize = 48;

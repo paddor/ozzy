@@ -23,7 +23,9 @@ framing, reconnects, fairness, and transport backpressure.
 | Consumer group | Named set of `GroupReader` members on one topic. Brokers assign its partitions and store its progress |
 | Coordinator | The partition, chosen by group name, whose journal stores a consumer group's membership and plans |
 | Dedup window | Logical time (`window_millis`) in which the first record with a message ID wins on its partition. Repeats do not extend it |
+| Delay | Topic option that lets producers give each record a due time. Off by default |
 | Dispatcher | Broker thread that owns the public sockets and sessions and routes messages to shards |
+| Due time | Absolute Unix milliseconds a producer gives a scheduled record (`RecordInput::with_due_millis`). The leader's clock decides when it is reached |
 | Durable | History protected by the required barriers and restart evidence |
 | Eligible copy | A partition copy that may vote. Copies in recovery or quarantine are nonvoting |
 | Follower | A broker whose copy of a partition is not the leader in the current view |
@@ -41,12 +43,14 @@ framing, reconnects, fairness, and transport backpressure.
 | Producer epoch | Generation of one producer on one partition. Takeover advances it and fences older writers |
 | Producer sequence | Contiguous per-producer position within one partition and epoch, used for retries. Independent of offsets |
 | Reader | Consumer SDK handle (`TopicReader`, `GroupReader`) that reads confirmed records in partition order |
-| Receipt | Per-record result: confirmed sequence, original offset, achieved policy, and whether this attempt stored the record or found a duplicate |
+| Receipt | Per-record result: confirmed sequence, original offset, achieved policy, and whether this attempt stored the record, found a duplicate, or scheduled it |
+| Release | The leader copies due scheduled records into the log, in due order, at the next offsets. Readers see them from then on |
 | Replica receipt | A follower's report of the prefix it retains |
 | Retained backing | The whole allocation held by messages or aliases. Dequeue frees only the queue slot |
 | Retention floor | Earliest readable offset. Older reads fail explicitly |
 | Retry floor | Earliest producer sequence that still has an exact retained result |
 | Retry identity | Partition, producer ID, epoch, sequence, and the exact record identity and bytes |
+| Schedule sequence | Contiguous per-partition position of a scheduled record. A scheduled receipt carries it instead of an offset |
 | Segment | Append-only journal file of canonical operations and record payloads. Retention deletes whole segments |
 | Session | Fence for one link attempt. Does not replace durable authority |
 | Shard | Broker-local thread that hosts many partition actors. Shard IDs never reach SDKs or storage |
@@ -110,6 +114,11 @@ flowchart LR
 - A session with no open or append for `producer_idle_secs` (7 days) retires
   with its retry results. Its writer then fails as fenced; resuming its
   identity starts fresh sequences.
+- On a topic with delay, a record with a due time is held: its receipt
+  carries a schedule sequence and readers see nothing yet. At its due time
+  the leader releases it at the next offset. Releases follow due time, then
+  acceptance order; a due time already past releases at once. Cancel and
+  deduplication are left to the application.
 
 ### Reading
 

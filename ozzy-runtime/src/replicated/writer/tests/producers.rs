@@ -60,6 +60,7 @@ fn delayed_publication_restores_global_order_across_window_wraps() {
             .sender
             .try_send(state::Queued {
                 encoding: ozzy_proto::data::Encoding::Raw,
+                due_millis: None,
                 admitted_at: None,
                 sequence,
                 completion: state::Completion::new(input.message_id),

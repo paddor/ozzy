@@ -132,6 +132,9 @@ pub struct Topic {
     /// Optional first-wins deduplication and per-partition resource limits.
     /// Omitted preserves every producer's records.
     pub deduplication: Option<TopicDeduplication>,
+    /// Optional delayed delivery: producers may give each record a due time.
+    /// Omitted refuses scheduled records.
+    pub delay: Option<TopicDelay>,
     /// Seconds a producer session may stay unopened and without appends
     /// before the partition leader retires it with its retry results.
     #[serde(default = "default_producer_idle")]
@@ -151,6 +154,34 @@ pub struct TopicDeduplication {
     /// Per-partition byte ceiling for index tables, queues, and scratch storage.
     pub max_bytes: u64,
 }
+
+impl Topic {
+    /// The fixed maximum delay in milliseconds, when delay is enabled.
+    pub fn delay_max_millis(&self) -> Option<std::num::NonZeroU64> {
+        self.delay
+            .and_then(|delay| delay.max_secs.checked_mul(1000))
+            .and_then(std::num::NonZeroU64::new)
+    }
+}
+
+/// Hold scheduled records until their absolute due times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TopicDelay {
+    /// Maximum seconds between acceptance and due time, fixed when the
+    /// partition is created.
+    pub max_secs: u64,
+    /// Maximum held records per partition. Admission backs off when full.
+    #[serde(default = "default_delay_entries")]
+    pub max_entries: u64,
+}
+
+const fn default_delay_entries() -> u64 {
+    100_000
+}
+
+/// Upper bound on `delay.max_entries`, the canonical per-partition limit.
+pub const MAX_DELAY_ENTRIES: u64 = 1_048_576;
 
 const fn default_dedup_window() -> u64 {
     300_000

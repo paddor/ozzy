@@ -58,9 +58,14 @@ impl Sizing {
                 |partial| partial.selection,
             );
         selection.extend(
-            records
-                .range(index + selection.records..)
-                .map(|record| (record.body.len(), record.parts(), record.encoding)),
+            records.range(index + selection.records..).map(|record| {
+                (
+                    record.body.len(),
+                    record.parts(),
+                    record.encoding,
+                    record.due_millis.is_some(),
+                )
+            }),
             self.limits,
             target_bytes,
             self.cap,
@@ -182,6 +187,23 @@ impl Batch {
         true
     }
 
+    /// Whether the selected records are scheduled. Their payload stays raw.
+    pub(super) fn scheduled(&self, driver: &super::state::Driver) -> bool {
+        self.selected(driver)
+            .next()
+            .is_some_and(|record| record.due_millis.is_some())
+    }
+
+    /// Due times of a scheduled selection. Selection never mixes scheduled
+    /// and immediate records.
+    fn due_times(&self, driver: &super::state::Driver) -> Option<Vec<u64>> {
+        self.scheduled(driver).then(|| {
+            self.selected(driver)
+                .filter_map(|record| record.due_millis)
+                .collect()
+        })
+    }
+
     /// Transfer the prepared frame once; descriptor scratch retains no payloads.
     pub(super) fn take_payload(&mut self) -> Option<Payload> {
         self.payload.take()
@@ -230,6 +252,7 @@ impl Batch {
                 view
             })
             .collect();
+        let due_millis = self.due_times(driver);
         let key = AppendKey {
             producer_id: shared.config.producer_id,
             producer_epoch: shared.config.producer_epoch,
@@ -243,7 +266,7 @@ impl Batch {
                 owner_epoch: shared.config.owner_epoch,
                 key,
                 policy: shared.config.policy,
-                due_millis: None,
+                due_millis: due_millis.as_deref(),
                 records: &records,
             },
             metadata,

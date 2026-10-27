@@ -35,8 +35,8 @@ pub use images::{
     RecoveredImages,
 };
 pub use snapshot::{
-    STATE_SNAPSHOT_HEADER_BYTES, StateSnapshotError, StateSnapshotLimits,
-    canonical_state_schema_digest,
+    PENDING_SCHEDULE_SNAPSHOT_BYTES, STATE_SNAPSHOT_HEADER_BYTES, StateSnapshotError,
+    StateSnapshotLimits, canonical_state_schema_digest,
 };
 
 /// Bounds for live application metadata. Historical identities live in indexes.

@@ -9,7 +9,7 @@ use ozzy_journal_segment::{
     SEGMENT_HEADER_BYTES, SegmentOptions, SegmentWriteMode, WRITE_GROUP_ALIGNMENT,
 };
 use ozzy_replication::PipelineLimits;
-use ozzy_runtime::replica_journal::{DedupLimits, OwnedConfig};
+use ozzy_runtime::replica_journal::{DedupLimits, DelayLimits, OwnedConfig};
 
 const CORE_CHECKPOINT_BYTES: usize = 32 * 1024 * 1024;
 
@@ -42,7 +42,7 @@ impl Settings {
             max_body_bytes: sizes.body,
         };
         let mut snapshot = CanonicalRecoveryLimits::default().snapshot;
-        snapshot.max_snapshot_bytes = CORE_CHECKPOINT_BYTES;
+        snapshot.max_snapshot_bytes = core_checkpoint_bytes(placement).map_err(error)?;
         let checkpoint =
             checkpoint_limits(placement, sizes).map_err(|failure| error(&failure.to_string()))?;
         let index = IndexBuildLimits {
@@ -88,7 +88,7 @@ impl Settings {
             configuration,
             limits: self.limits,
             recovery: self.recovery,
-            delay: None,
+            delay: delay_limits(placement),
             deduplication: self.deduplication(placement),
             // Native intake arenas, plus the actor's own receive, transfer,
             // and bootstrap leases.
@@ -376,12 +376,27 @@ fn check_write(
     Ok(())
 }
 
+/// Core image bound: fixed metadata room plus every held scheduled record.
+fn core_checkpoint_bytes(placement: &PartitionPlacement) -> Result<usize, &'static str> {
+    delay_limits(placement)
+        .map_or(Some(0), DelayLimits::snapshot_bytes)
+        .and_then(|held| held.checked_add(CORE_CHECKPOINT_BYTES))
+        .ok_or("held scheduled records overflow the core checkpoint bound")
+}
+
+fn delay_limits(placement: &PartitionPlacement) -> Option<DelayLimits> {
+    placement.delay.map(|delay| DelayLimits {
+        max_entries: usize::try_from(delay.max_entries).unwrap_or(usize::MAX),
+    })
+}
+
 fn checkpoint_limits(
     placement: &PartitionPlacement,
     sizes: Sizes,
 ) -> Result<CheckpointLimits, ozzy_journal_segment::CheckpointError> {
     CheckpointLimits::for_canonical_image(
-        CORE_CHECKPOINT_BYTES,
+        core_checkpoint_bytes(placement)
+            .map_err(|_| ozzy_journal_segment::CheckpointError::LengthOverflow)?,
         placement
             .deduplication
             .map_or(0, |policy| policy.max_entries),

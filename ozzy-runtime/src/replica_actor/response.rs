@@ -30,6 +30,7 @@ pub(super) fn rejection(error: &JournalError) -> (u16, RetryClass) {
             AppendAdmissionError::RetryConflict => (8, RetryClass::Permanent),
             AppendAdmissionError::RetryHistoryExpired => (9, RetryClass::Permanent),
             AppendAdmissionError::DueOutOfRange => (21, RetryClass::Permanent),
+            AppendAdmissionError::ScheduleTooLarge => (1, RetryClass::Permanent),
         },
         JournalError::GroupProgress(error) => match error {
             GroupProgressError::Authority => (5, RetryClass::AfterAuthorityRefresh),

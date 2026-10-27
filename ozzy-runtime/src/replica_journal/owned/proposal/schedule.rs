@@ -27,13 +27,19 @@ impl OwnedJournal {
             .scheduled()
             .ok_or(JournalError::AppendMismatch)?
             .due_millis;
-        if self.delay.is_some_and(|limits| {
-            delay
+        if let Some(limits) = self.delay {
+            // A batch above the limit never fits; a smaller one waits for
+            // releases.
+            if due.len() > limits.max_entries {
+                return Err(AppendAdmissionError::ScheduleTooLarge.into());
+            }
+            if delay
                 .pending_len()
                 .checked_add(due.len())
                 .is_none_or(|total| total > limits.max_entries)
-        }) {
-            return Err(AppendAdmissionError::ScheduleCapacity.into());
+            {
+                return Err(AppendAdmissionError::ScheduleCapacity.into());
+            }
         }
         let time = now_millis.max(delay.time);
         let latest = time.saturating_add(delay.max_delay_millis.get());

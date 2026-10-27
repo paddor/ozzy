@@ -15,6 +15,7 @@ use ozzy_sim::{broker, client::Client};
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 mod clock;
 mod crash;
+mod delay;
 mod runner;
 
 #[tokio::test(flavor = "current_thread")]

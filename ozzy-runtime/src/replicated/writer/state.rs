@@ -102,6 +102,8 @@ pub(super) struct Admission {
 #[derive(Debug)]
 pub(super) struct Queued {
     pub(super) encoding: ozzy_proto::data::Encoding,
+    /// Absolute Unix due time of a scheduled record.
+    pub(super) due_millis: Option<u64>,
     /// Admission time, retained only when stage profiling needs it.
     pub(super) admitted_at: Option<tokio::time::Instant>,
     pub(super) sequence: u64,
@@ -311,6 +313,7 @@ impl Shared {
         let completion = sender.direct.completion(record.message_id);
         let queued = Queued {
             encoding: ozzy_proto::data::Encoding::Raw,
+            due_millis: record.due_millis(),
             admitted_at,
             sequence,
             completion: completion.clone(),

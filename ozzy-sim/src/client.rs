@@ -477,7 +477,7 @@ impl Client {
 }
 
 /// Record bounds shared by the oracle's writers.
-const DATA_LIMITS: DataLimits = DataLimits {
+pub const DATA_LIMITS: DataLimits = DataLimits {
     envelope: EnvelopeLimits {
         max_metadata_bytes: 16 * 1024,
         max_payload_bytes: 4096,

@@ -82,7 +82,10 @@ pub(crate) fn prepare_partition(
             topic: &placement.topic,
             partition_id: PartitionId::new(placement.partition),
             owner_epoch: OwnerEpoch::INITIAL,
-            delay_max_millis: None,
+            delay_max_millis: placement
+                .delay
+                .and_then(|delay| delay.max_secs.checked_mul(1000))
+                .and_then(std::num::NonZeroU64::new),
             dedup_window_millis: placement
                 .deduplication
                 .and_then(|policy| std::num::NonZeroU64::new(policy.window_millis)),

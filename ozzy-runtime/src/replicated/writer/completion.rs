@@ -6,11 +6,11 @@
 #[cfg(all(test, ozzy_loom))]
 use loom::future::AtomicWaker;
 #[cfg(all(test, ozzy_loom))]
-use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
+use loom::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering, fence};
 use ozzy_proto::{MessageId, append::AppendDisposition};
 use std::sync::Arc;
 #[cfg(not(all(test, ozzy_loom)))]
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering, fence};
 use std::task::Waker;
 
 #[cfg(not(all(test, ozzy_loom)))]
@@ -23,7 +23,7 @@ use futures::task::AtomicWaker;
 struct Cell {
     message_id: [AtomicU64; 2],
     offset: AtomicU64,
-    duplicate: AtomicBool,
+    disposition: AtomicU8,
     /// Set while one observer owns `waker`; other observers use the broadcast.
     watched: AtomicBool,
     waker: AtomicWaker,
@@ -39,7 +39,7 @@ impl Page {
         Self(std::array::from_fn(|_| Cell {
             message_id: [AtomicU64::new(0), AtomicU64::new(0)],
             offset: AtomicU64::new(0),
-            duplicate: AtomicBool::new(false),
+            disposition: AtomicU8::new(AppendDisposition::Stored as u8),
             watched: AtomicBool::new(false),
             waker: AtomicWaker::new(),
         }))
@@ -105,10 +105,9 @@ impl Completion {
     /// The driver must publish its confirmed prefix after storing this offset.
     pub(super) fn publish(&self, offset: u64, disposition: AppendDisposition) {
         self.cell().offset.store(offset, Ordering::Relaxed);
-        self.cell().duplicate.store(
-            matches!(disposition, AppendDisposition::Duplicate),
-            Ordering::Relaxed,
-        );
+        self.cell()
+            .disposition
+            .store(disposition as u8, Ordering::Relaxed);
     }
 
     /// Claim this record's targeted waker, or `None` while another observer
@@ -137,11 +136,9 @@ impl Completion {
 
     /// The caller must first acquire the same confirmed prefix as for the offset.
     pub(super) fn disposition(&self) -> AppendDisposition {
-        if self.cell().duplicate.load(Ordering::Relaxed) {
-            AppendDisposition::Duplicate
-        } else {
-            AppendDisposition::Stored
-        }
+        // Only the driver stores, and only decoded dispositions.
+        AppendDisposition::try_from(self.cell().disposition.load(Ordering::Relaxed))
+            .unwrap_or(AppendDisposition::Stored)
     }
 
     #[cfg(all(test, not(ozzy_loom)))]
