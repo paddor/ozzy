@@ -243,6 +243,7 @@ impl Batch {
                 owner_epoch: shared.config.owner_epoch,
                 key,
                 policy: shared.config.policy,
+                due_millis: None,
                 records: &records,
             },
             metadata,

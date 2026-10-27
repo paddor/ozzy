@@ -376,6 +376,7 @@ impl OwnedJournal {
             configuration,
             limits: self.limits,
             recovery: self.recovery,
+            delay: None,
             deduplication: self.dedup.limits,
             append_buffers: self.append_buffers,
             append_limits: self.append_limits,

@@ -1,5 +1,5 @@
 use super::{
-    actor::{actor, actor_with_partition_memory, close, pump},
+    actor::{ActorOptions, actor, actor_with_options, close, pump},
     *,
 };
 use crate::{
@@ -169,6 +169,17 @@ fn open(authority: Authority, link: Link, mode: Mode, old: Option<u64>, id: u8) 
 }
 
 fn append(authority: Authority, link: Link, writer: u8, first: u64, count: u8) -> Message {
+    append_due(authority, link, (writer, first, count), None)
+}
+
+/// An APPEND of `count` records from `writer` at `first`, scheduled when
+/// `due` is present.
+fn append_due(
+    authority: Authority,
+    link: Link,
+    (writer, first, count): (u8, u64, u8),
+    due: Option<&[u64]>,
+) -> Message {
     let records: Vec<_> = (0..count)
         .map(|index| append::Record {
             encoding: Encoding::Raw,
@@ -190,6 +201,7 @@ fn append(authority: Authority, link: Link, writer: u8, first: u64, count: u8) -
                 first_sequence: first,
             },
             policy: Policy::LocalDurable,
+            due_millis: due,
             records: &records,
         },
         &mut metadata,
@@ -502,6 +514,75 @@ fn confirmations(
             append::stream::decode_confirmed(packet(message), limits().envelope).unwrap()
         })
         .collect()
+}
+
+#[test]
+fn native_scheduled_append_confirms_schedule_sequences_and_refuses_late_due_times() {
+    let (mut controller, io) = setup();
+    let mut actor = actor_with_options(
+        &mut controller,
+        io,
+        1,
+        &[12, 30],
+        partition(),
+        PartitionId::ZERO,
+        ActorOptions {
+            delay: Some(crate::replica_journal::DelayLimits { max_entries: 8 }),
+            ..ActorOptions::default()
+        },
+    );
+    let mut intake = intake(&mut actor);
+    let peer = link(71, 81);
+    let mut output = Vec::new();
+    // The actor clock reads 777.
+    let requests = [
+        append_due(
+            actor.authority_hint().authority,
+            peer,
+            (30, 0, 2),
+            Some(&[2_000, 5]),
+        ),
+        append(actor.authority_hint().authority, peer, 30, 2, 1),
+        append_due(
+            actor.authority_hint().authority,
+            peer,
+            (30, 3, 1),
+            Some(&[777 + DELAY_MAX_MILLIS + 1]),
+        ),
+    ];
+    for request in &requests {
+        let hint = actor.authority_hint();
+        assert_eq!(
+            intake.receive(request, peer, hint).unwrap(),
+            NativeReceive::Accepted
+        );
+        settle(&mut controller, &mut actor, &mut intake, &mut output);
+    }
+    let hint = actor.authority_hint();
+    let confirmations = confirmations(&output, hint.primary, peer.binding.peer);
+    assert_eq!(
+        confirmations
+            .iter()
+            .map(|reply| (
+                reply.disposition,
+                reply.first_offset,
+                reply.key.first_sequence,
+                reply.end_sequence
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (append::AppendDisposition::Scheduled, 0, 0, 2),
+            (append::AppendDisposition::Stored, 0, 2, 3),
+        ]
+    );
+    let rejections: Vec<_> = output
+        .iter()
+        .filter(|message| packet(message).envelope.opcode == Opcode::Nack)
+        .map(|message| ozzy_proto::nack::decode(packet(message), limits().envelope).unwrap())
+        .map(|nack| (nack.code, nack.retry))
+        .collect();
+    assert_eq!(rejections, [(21, ozzy_proto::nack::RetryClass::Permanent)]);
+    close(&mut controller, actor);
 }
 
 #[test]

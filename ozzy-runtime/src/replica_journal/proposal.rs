@@ -61,6 +61,15 @@ pub enum AppendAdmissionError {
     /// A retained sequence has a different record ID, payload, or multipart shape.
     #[error("producer retry conflicts with accepted records")]
     RetryConflict,
+    /// Scheduled records need a partition with delay enabled.
+    #[error("partition does not accept scheduled records")]
+    DelayDisabled,
+    /// A due time lies past acceptance plus the partition's maximum delay.
+    #[error("due time exceeds the partition's maximum delay")]
+    DueOutOfRange,
+    /// The partition already holds its maximum of scheduled records.
+    #[error("scheduled-record capacity is full")]
+    ScheduleCapacity,
 }
 
 /// Reusable bounded canonical bodies without caller-selected consensus coordinates.
@@ -125,9 +134,24 @@ impl ProposalBuffer {
     ) -> Result<(), JournalError> {
         let authority = request.authority;
         self.prepare_wire_append(request)?;
+        if let Some(due_millis) = request.due_millis {
+            self.0.schedule(due_millis.iter())?;
+        }
         self.0.producer_stream = true;
         self.0.proposal_authority = Some(authority);
         Ok(())
+    }
+
+    /// Hold the one prepared producer batch until its records' due times, one
+    /// absolute Unix millisecond time per record. The leader assigns schedule
+    /// sequences instead of offsets.
+    pub fn schedule(&mut self, due_millis: &[u64]) -> Result<(), JournalError> {
+        self.0.schedule(due_millis.iter().copied())
+    }
+
+    /// Reply coordinates of a fresh scheduled batch, in schedule sequences.
+    pub(crate) fn scheduled_result(&self) -> Option<ozzy_core::state::ProducerResultSpan> {
+        self.0.scheduled_result()
     }
 
     /// Freeze one native append into an empty leased arena before submission.

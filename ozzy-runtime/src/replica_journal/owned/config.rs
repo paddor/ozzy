@@ -9,6 +9,13 @@ use tokio::sync::Semaphore;
 
 pub use ozzy_core::dedup::Limits as DedupLimits;
 
+/// Leader admission bounds of a partition that holds scheduled records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DelayLimits {
+    /// Scheduled records the partition holds before it refuses more.
+    pub max_entries: usize,
+}
+
 /// Size a partition's identity reservation for its live pipeline. Pending
 /// identities stay charged until application, and a backup can hold its
 /// whole retained capacity accepted but not yet applied.
@@ -49,6 +56,9 @@ pub struct OwnedConfig<C = ConfigurationRecord> {
     /// Optional partition-local identity reservation, separate from core clones.
     /// Its window must exactly match the immutable canonical topic policy.
     pub deduplication: Option<DedupLimits>,
+    /// Leader bounds for scheduled records. Absent leaves only the canonical
+    /// state limit.
+    pub delay: Option<DelayLimits>,
     /// Maximum simultaneously leased APPEND/history arenas for this owner.
     pub append_buffers: usize,
     /// Count/body bounds for each arena, separate from the shared device budget.

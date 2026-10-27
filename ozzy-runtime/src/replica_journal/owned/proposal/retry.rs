@@ -2,9 +2,12 @@
 //! the stored originals or the duplicate proofs its results name.
 
 use super::super::{AppendBuffer, JournalError, OwnedJournal, prefix};
+use crate::replica_journal::AppendAdmissionError;
 use crate::replica_journal::producer::{self, Assignment, Original, Plan};
 use ozzy_core::state::ProducerResultSource;
-use ozzy_journal::operation::{AppendRecordList, OperationBody, RecordIter, decode_operation_body};
+use ozzy_journal::operation::{
+    AppendRecordList, OperationBody, OperationKind, RecordIter, RecordRef, decode_operation_body,
+};
 use ozzy_journal_segment::{DecodedBatches, JournalIndexError, JournalIndexSnapshot};
 use ozzy_replication::Prefix;
 
@@ -78,23 +81,48 @@ impl OwnedJournal {
             through: Prefix::GENESIS,
             duplicate: None,
         };
+        let due = buffer
+            .scheduled()
+            .map(|scheduled| scheduled.due_millis.as_slice());
+        self.verify_retained(&retry, (&expected.records, due), &mut verification)
+            .await?;
+        let timestamp = verification.timestamp.ok_or(JournalError::AppendMismatch)?;
+        Ok(retry.finish(timestamp, verification.through, now))
+    }
+
+    /// Check every retained resent record against what its result names.
+    /// A resend must keep the original's schedule or lack of one.
+    async fn verify_retained(
+        &mut self,
+        retry: &producer::Retry,
+        (expected, due): (&AppendRecordList<'_>, Option<&[u64]>),
+        verification: &mut Verification<'_, '_>,
+    ) -> Result<(), JournalError> {
         let mut index = 0;
         while index < retry.retained {
-            index += match retry.source(index)? {
-                ProducerResultSource::Stored => {
-                    self.verify_stored(&retry, index, &mut verification).await?
+            index += match (retry.source(index)?, due) {
+                (ProducerResultSource::Stored, None) => {
+                    self.verify_stored(retry, index, verification).await?
                 }
-                ProducerResultSource::Duplicate { operation } => {
-                    let duplicate = (operation, &expected.records);
-                    self.verify_duplicate(&retry, index, duplicate, &mut verification)
+                (ProducerResultSource::Duplicate { operation }, None) => {
+                    self.verify_duplicate(retry, index, (operation, expected), verification)
                         .await?;
                     1
                 }
+                (ProducerResultSource::Scheduled { operation }, Some(due)) => {
+                    self.verify_scheduled(retry, index, (operation, due), verification)
+                        .await?
+                }
+                (
+                    ProducerResultSource::Stored
+                    | ProducerResultSource::Duplicate { .. }
+                    | ProducerResultSource::Scheduled { .. },
+                    _,
+                ) => return Err(AppendAdmissionError::RetryConflict.into()),
                 _ => return Err(JournalError::AppendMismatch),
             };
         }
-        let timestamp = verification.timestamp.ok_or(JournalError::AppendMismatch)?;
-        Ok(retry.finish(timestamp, verification.through, now))
+        Ok(())
     }
 
     /// Check resent records whose originals were stored, from writeback or
@@ -174,6 +202,78 @@ impl OwnedJournal {
             .ok_or(JournalError::AppendMismatch)?;
         verification.observe(evidence.proof.timestamp, evidence.through);
         Ok(())
+    }
+
+    /// Check resent records and due times against the `Schedule` operation
+    /// `number` that holds them. Returns how many records it checked.
+    async fn verify_scheduled(
+        &mut self,
+        retry: &producer::Retry,
+        index: usize,
+        (number, due): (u64, &[u64]),
+        verification: &mut Verification<'_, '_>,
+    ) -> Result<usize, JournalError> {
+        let (kind, body, through) = self
+            .operation_body(number, &mut verification.snapshot)
+            .await?;
+        let Ok(OperationBody::Schedule(original)) =
+            decode_operation_body(kind, &body, self.limits.operations)
+        else {
+            return Err(history_mismatch());
+        };
+        let first = retry.batch.first_sequence.get() + index as u64;
+        let start = first
+            .checked_sub(original.batch.first_sequence.get())
+            .and_then(|delta| usize::try_from(delta).ok())
+            .ok_or_else(history_mismatch)?;
+        let mut held = original
+            .batch
+            .records
+            .iter()
+            .zip(&original.due_millis)
+            .skip(start);
+        let source = ProducerResultSource::Scheduled { operation: number };
+        let mut checked = 0;
+        while index + checked < retry.retained && retry.source(index + checked)? == source {
+            let at = index + checked;
+            let (actual, actual_due) = held.next().ok_or_else(history_mismatch)?;
+            if retry.offset(at)?.get() != original.first_schedule + (start + checked) as u64 {
+                return Err(history_mismatch());
+            }
+            let expected = verification
+                .expected
+                .next()
+                .ok_or(JournalError::AppendMismatch)?;
+            if !same_record(&actual, &expected) || due.get(at) != Some(actual_due) {
+                return Err(AppendAdmissionError::RetryConflict.into());
+            }
+            checked += 1;
+        }
+        verification.observe(original.batch.append_timestamp_millis, through);
+        Ok(checked)
+    }
+
+    /// One retained operation's kind, owned body, and position, from
+    /// writeback or a cold read.
+    async fn operation_body(
+        &mut self,
+        number: u64,
+        snapshot: &mut Option<JournalIndexSnapshot>,
+    ) -> Result<(OperationKind, Vec<u8>, Prefix), JournalError> {
+        if let Some((operation, through)) = self.writeback.operation(number) {
+            return Ok((operation.kind, operation.body.to_vec(), through));
+        }
+        let operation = self
+            .retry_snapshot(snapshot)
+            .await?
+            .read_operation_number(number)
+            .await?
+            .ok_or(JournalIndexError::MissingOperationNumber(number))?;
+        let through = Prefix {
+            op: ozzy_replication::OpNumber(number),
+            digest: operation.digest,
+        };
+        Ok((operation.kind, operation.body.as_ref().to_vec(), through))
     }
 
     async fn duplicate_evidence(
@@ -286,6 +386,18 @@ impl OwnedJournal {
         }
         Ok(records)
     }
+}
+
+fn history_mismatch() -> JournalError {
+    JournalIndexError::Read(ozzy_journal_segment::IndexedReadError::RecordMismatch).into()
+}
+
+/// Same codec, identity, and part bytes.
+fn same_record(actual: &RecordRef<'_>, expected: &RecordRef<'_>) -> bool {
+    actual.encoding == expected.encoding
+        && actual.message_id == expected.message_id
+        && actual.parts.len() == expected.parts.len()
+        && actual.parts.iter().eq(expected.parts.iter())
 }
 
 impl OwnedJournal {

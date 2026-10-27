@@ -273,6 +273,11 @@ APPEND:
   conflicts fail with code 8, expired history with code 9.
 - Timeout or cancellation leaves the outcome unknown, including for an
   earlier successful attempt.
+- Tag 2 is a scheduled APPEND: the same layout, then one due time `u64` per
+  record, in absolute Unix milliseconds. Readers see its records only once
+  due. The partition must enable delay (else code 2). A due time past
+  acceptance plus the maximum delay fails with code 21; a full schedule
+  capacity with code 10. A retry must repeat the tag and due times.
 
 List-form APPENDED has a codec, but brokers do not send it: tag, Authority,
 partition, owner epoch, AppendKey, first offset `u64`, count `u32`, achieved
@@ -291,7 +296,7 @@ Negotiated bounds apply. Packet boundaries imply no transaction. APPENDED has
 | 1 | 88 | Authority, partition, owner epoch, append key |
 | 89 | 8 | Exclusive confirmed sequence end |
 | 97 | 8 | First confirmed partition offset |
-| 105 | 1 | Disposition: stored 0, duplicate 1 |
+| 105 | 1 | Disposition: stored 0, duplicate 1, scheduled 2 |
 | 106 | 1 | Achieved policy |
 
 - A nonempty range binds one producer, epoch, partition, owner, policy, and
@@ -301,6 +306,8 @@ Negotiated bounds apply. Packet boundaries imply no transaction. APPENDED has
   sender, session, authority, sent bounds, and the sequence-to-offset mapping.
 - Duplicates return original offsets, which may repeat or move backward
   across ranges. Disposition and offset never change for a confirmed sequence.
+- Scheduled ranges carry schedule sequences in the offset field. Their
+  records get offsets later, at release.
 - Disk quorum replies follow applied synchronized history.
 - Reconnect discards correlation; unresolved records retry unchanged.
   [Runtime](RUNTIME.md#sdk-protocol-batching) owns SDK batching defaults.
@@ -698,7 +705,7 @@ Diagnostics never determine behavior; unknown codes keep raw detail.
 | 7 | Invalid sequence, processing cursor, or group start outside confirmed retained history | permanent |
 | 8 | Retry identity conflicts with retained records | permanent |
 | 9 | Retry or processing history expired | permanent |
-| 10 | Capacity unavailable, including a full partition journal, dedup identity capacity, or earlier writer sequences missing | after-backoff |
+| 10 | Capacity unavailable, including a full partition journal, dedup identity capacity, scheduled-record capacity, or earlier writer sequences missing | after-backoff |
 | 11 | Storage/validation uncertainty | unknown-outcome |
 | 12 | Writer not admitted by current primary, or reader broker unavailable | after-authority-refresh |
 | 13 | Authority changed after admission | unknown-outcome |
@@ -709,6 +716,7 @@ Diagnostics never determine behavior; unknown codes keep raw detail.
 | 18 | Unknown topic, metadata partition, or routing-watch group | permanent |
 | 19 | Record ID missing | permanent |
 | 20 | Record ID ambiguous | permanent |
+| 21 | Due time past the partition's maximum delay | permanent |
 
 - Code 4 reserves stale-session rejection; native stale traffic is dropped.
 - With capability 10, codes 5, 12, and 13 carry exactly 48 detail bytes:

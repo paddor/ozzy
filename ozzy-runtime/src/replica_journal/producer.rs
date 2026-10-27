@@ -43,7 +43,10 @@ pub(super) enum Plan {
 pub(super) struct Retry {
     pub batch: AppendBatchSummary,
     pub retained: usize,
+    /// The next offset, or the next schedule sequence for a scheduled batch.
     next_offset: Offset,
+    /// Whether the resent batch is scheduled.
+    pub scheduled: bool,
     results: SmallVec<[ProducerResultSpan; 2]>,
 }
 
@@ -85,6 +88,13 @@ impl Retry {
                 results: self.results,
             };
         }
+        // A fresh scheduled suffix gets its operation at admission; replies
+        // read only its disposition and schedule sequences.
+        let source = if self.scheduled {
+            ProducerResultSource::Scheduled { operation: 0 }
+        } else {
+            ProducerResultSource::Stored
+        };
         push_result(
             &mut self.results,
             ProducerResultSpan {
@@ -93,7 +103,7 @@ impl Retry {
                 ),
                 first_offset: self.next_offset,
                 records: (self.batch.record_count - self.retained) as u64,
-                source: ProducerResultSource::Stored,
+                source,
             },
         );
         Assignment {
@@ -143,10 +153,9 @@ pub(super) fn plan(
     let batch = summary(buffer, index, limits)?;
     let (state, producer) = current_producer(image, &batch)?;
     let (offset_delta, sequence_delta) = prior_records(buffer, index, &batch, limits)?;
+    let scheduled = buffer.scheduled().is_some();
     let next_offset = Offset::new(
-        state
-            .next_offset
-            .get()
+        next_position(state, scheduled)?
             .checked_add(offset_delta)
             .ok_or(AppendAdmissionError::Sequence)?,
     );
@@ -189,8 +198,21 @@ pub(super) fn plan(
         batch,
         retained,
         next_offset,
+        scheduled,
         results,
     }))
+}
+
+/// The next offset, or the next schedule sequence for a scheduled batch.
+fn next_position(state: &CanonicalPartition, scheduled: bool) -> Result<u64, AppendAdmissionError> {
+    if !scheduled {
+        return Ok(state.next_offset.get());
+    }
+    state
+        .delay
+        .as_ref()
+        .map(|delay| delay.next_schedule)
+        .ok_or(AppendAdmissionError::DelayDisabled)
 }
 
 /// The batch's partition and producer session, unless a newer owner or
@@ -211,7 +233,7 @@ fn current_producer<'a>(
     Ok((state, producer))
 }
 
-fn summary(
+pub(super) fn summary(
     buffer: &AppendBuffer,
     index: usize,
     limits: OperationLimits,

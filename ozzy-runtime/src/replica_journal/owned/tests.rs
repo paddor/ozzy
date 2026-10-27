@@ -82,6 +82,7 @@ fn config(root: &str, id: u8) -> OwnedConfig {
             ..CanonicalRecoveryLimits::default()
         },
         append_buffers: 4,
+        delay: None,
         deduplication: None,
         append_limits: pipeline(),
         writeback: pipeline(),

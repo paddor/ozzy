@@ -522,6 +522,7 @@ fn journal_config(index: usize, shape: Shape) -> OwnedConfig {
             ..CanonicalRecoveryLimits::default()
         },
         append_buffers: 12,
+        delay: None,
         deduplication: None,
         append_limits: PIPELINE,
         writeback: PIPELINE,

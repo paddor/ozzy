@@ -365,6 +365,7 @@ fn append_request_at(actor: &Scheduled, sequence: u8) -> Message {
                 first_sequence: u64::from(sequence),
             },
             policy: append::Policy::QuorumDurable,
+            due_millis: None,
             records: &[append::Record {
                 encoding: ozzy_proto::data::Encoding::Raw,
                 message_id: ozzy_proto::MessageId::from_bytes([45 + sequence; 16]),

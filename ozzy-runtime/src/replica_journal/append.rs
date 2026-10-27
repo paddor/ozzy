@@ -9,6 +9,7 @@ mod progress;
 pub(in crate::replica_journal) use progress::JoinedProgress;
 mod retained;
 pub(in crate::replica_journal) use retained::RetainedAppend;
+mod schedule;
 mod split;
 mod trim;
 mod validated;
@@ -56,6 +57,9 @@ pub struct AppendBuffer {
     /// Exact results for a single streaming retry, including a fresh suffix.
     /// At most one range per admitted record. Fresh-only proposals use headers.
     pub(super) retry_results: Option<Box<ProducerRetryResults>>,
+    /// Due times of a scheduled producer batch, kept beside its APPEND body
+    /// until the leader assigns schedule sequences.
+    schedule: Option<Box<schedule::Scheduled>>,
     dedup_original: Option<Box<dedup::Original>>,
     dedup_charge: Option<crate::memory::Charge>,
     validated: bool,
@@ -211,6 +215,7 @@ impl AppendBuffer {
             dedup_original: None,
             dedup_charge: None,
             retry_results: None,
+            schedule: None,
             validated: false,
             proposal_authority: None,
             proposal_policy: None,
@@ -280,6 +285,7 @@ impl AppendBuffer {
         self.request_kind = RequestKind::Canonical;
         self.producer_stream = false;
         self.retry_results = None;
+        self.schedule = None;
         self.validated = false;
         self.proposal_authority = None;
         self.proposal_policy = None;

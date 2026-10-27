@@ -1,6 +1,7 @@
 //! Writer assignment uses pure shared policy; cold retry reads are file futures.
 
 mod retry;
+mod schedule;
 
 use super::{AppendBuffer, JournalError, OwnedJournal};
 use crate::replica_journal::{
@@ -130,12 +131,14 @@ impl OwnedJournal {
         reason: JournalError,
     ) -> ProposalValidation {
         buffer.restore_dedup_original();
-        let restored = positions
-            .into_iter()
-            .enumerate()
-            .try_for_each(|(index, position)| {
-                buffer.replace_append_position(index, position).map(drop)
-            });
+        let restored = buffer.revert_schedule().and_then(|()| {
+            positions
+                .into_iter()
+                .enumerate()
+                .try_for_each(|(index, position)| {
+                    buffer.replace_append_position(index, position).map(drop)
+                })
+        });
         let deferral = match restored.and_then(|()| self.deferral(&reason)) {
             Ok(deferral) => deferral,
             Err(reason) => {
@@ -209,6 +212,9 @@ impl OwnedJournal {
         {
             return Ok(Prepared::Retry(through));
         }
+        if buffer.scheduled().is_some() {
+            self.schedule_proposal(buffer, timestamp_millis)?;
+        }
         self.check_room(buffer)?;
         if buffer.is_producer() && self.dedup.limits.is_some() {
             let rewrite = self.resolve_producer_ids(ticket, buffer)?;
@@ -281,6 +287,7 @@ impl OwnedJournal {
                     buffer.preserve_dedup_original(charge)?;
                 }
                 buffer.trim_producer_prefix(trim, self.limits.operations)?;
+                buffer.trim_schedule(trim);
             }
             buffer.retry_results = (!results.is_empty()).then(|| {
                 Box::new(ProducerRetryResults {

@@ -88,6 +88,7 @@ impl Settings {
             configuration,
             limits: self.limits,
             recovery: self.recovery,
+            delay: None,
             deduplication: self.deduplication(placement),
             // Native intake arenas, plus the actor's own receive, transfer,
             // and bootstrap leases.
