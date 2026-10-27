@@ -307,24 +307,48 @@ fn body_with_key(body: &[u8], schedule: u64) -> Vec<u8> {
 #[test]
 fn restart_keeps_held_records_and_releases_them() {
     let (mut controller, mut journal, mut driver) = delayed(16);
-    scheduled(&mut controller, &mut journal, &mut driver, 0, &[NOW + 7]);
+    scheduled(
+        &mut controller,
+        &mut journal,
+        &mut driver,
+        0,
+        &[NOW + 7, NOW + 9],
+    );
     let (image, _) = controller.crash(true).unwrap();
     drop(journal);
     let (mut controller, io) = setup_image(image);
+    // A lower limit than the held count only stops new schedules.
     let mut config = local_config();
-    config.delay = Some(DelayLimits { max_entries: 16 });
+    config.delay = Some(DelayLimits { max_entries: 1 });
     let (mut journal, mut driver) = drive(
         &mut controller,
         OwnedJournal::open_local(config, io, JournalGeneration(2)),
     )
     .unwrap();
-    assert_eq!(held(&journal), (1, 1, Offset::ZERO));
+    assert_eq!(held(&journal), (2, 2, Offset::ZERO));
     assert_eq!(journal.next_release(), Some(NOW + 7));
-    let proposal = release(&mut controller, &mut journal, &driver, NOW + 7).unwrap();
-    let result = validate(&mut controller, &mut journal, &driver, proposal, NOW + 7);
+    let more = |controller: &mut Controller, journal: &mut OwnedJournal, driver: &Driver| {
+        produce(
+            controller,
+            journal,
+            driver,
+            request(12, 2, 1),
+            Some(&[NOW + 9]),
+            NOW,
+        )
+    };
+    assert!(matches!(
+        rejection(more(&mut controller, &mut journal, &driver)),
+        JournalError::ProducerAppend(AppendAdmissionError::ScheduleCapacity)
+    ));
+    let proposal = release(&mut controller, &mut journal, &driver, NOW + 9).unwrap();
+    let result = validate(&mut controller, &mut journal, &driver, proposal, NOW + 9);
     accept(&mut controller, &mut journal, &mut driver, result);
-    assert_eq!(held(&journal), (0, 1, Offset::new(1)));
-    assert_eq!(readable(&mut controller, &mut journal, &driver), [1]);
+    assert_eq!(held(&journal), (0, 2, Offset::new(2)));
+    assert_eq!(readable(&mut controller, &mut journal, &driver), [1, 2]);
+    let result = more(&mut controller, &mut journal, &driver);
+    accept(&mut controller, &mut journal, &mut driver, result);
+    assert_eq!(held(&journal), (1, 3, Offset::new(2)));
 }
 
 #[test]
@@ -419,4 +443,45 @@ fn release_takes_a_lone_held_record_as_large_as_its_arena() {
     let result = validate(&mut controller, &mut journal, &driver, proposal, NOW);
     accept(&mut controller, &mut journal, &mut driver, result);
     assert_eq!(held(&journal), (0, 1, Offset::new(1)));
+}
+
+/// Whether the journal has room for one control request.
+fn control_room(journal: &mut OwnedJournal, driver: &Driver) -> bool {
+    let ticket = driver.begin_validation().unwrap();
+    let mut buffer = journal.lease_append_buffer().unwrap();
+    buffer
+        .push(CanonicalOperation {
+            group_id: ticket.scope().group_id,
+            configuration_epoch: ticket.scope().configuration_epoch,
+            original_view: ticket.scope().view,
+            op_number: ticket.accepted().op.0 + 1,
+            previous_digest: ticket.accepted().digest,
+            kind: OperationKind::Progress,
+            body: &[1; 16],
+        })
+        .unwrap();
+    match journal.check_room(&buffer) {
+        Ok(()) => true,
+        Err(JournalError::RollCapacity) => false,
+        Err(error) => panic!("{error:?}"),
+    }
+}
+
+#[test]
+fn held_records_keep_room_to_release_after_control_requests_stop() {
+    let (mut controller, mut journal, mut driver) = delayed(16);
+    scheduled(&mut controller, &mut journal, &mut driver, 0, &[NOW + 1; 8]);
+    // A lower segment limit stands in for writes that used the journal up,
+    // one segment at a time.
+    while control_room(&mut journal, &driver) {
+        let segments = &mut journal.limits.metadata.max_segments;
+        assert!(*segments > 1, "control requests never stopped");
+        *segments -= 1;
+    }
+    // Control requests leave room to release every held record.
+    let proposal = release(&mut controller, &mut journal, &driver, NOW + 1).unwrap();
+    let result = validate(&mut controller, &mut journal, &driver, proposal, NOW + 1);
+    accept(&mut controller, &mut journal, &mut driver, result);
+    assert_eq!(held(&journal), (0, 8, Offset::new(8)));
+    assert!(control_room(&mut journal, &driver));
 }

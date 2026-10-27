@@ -19,7 +19,7 @@ pub struct PendingSchedule {
     pub operation: u64,
     /// Record index inside that operation's batch.
     pub index: u32,
-    /// Sum of the record's stored part lengths.
+    /// The record's encoded bytes: descriptor, part lengths, and payload.
     pub bytes: u32,
     /// Application record identity, kept through release.
     pub message_id: MessageId,
@@ -37,6 +37,8 @@ pub struct DelayState {
     pending: BTreeMap<ReleaseKey, PendingSchedule>,
     /// Held records per `Schedule` operation, for the retention floor.
     operations: BTreeMap<u64, usize>,
+    /// Encoded bytes of every held record.
+    bytes: u64,
 }
 
 impl DelayState {
@@ -48,6 +50,7 @@ impl DelayState {
             time: 0,
             pending: BTreeMap::new(),
             operations: BTreeMap::new(),
+            bytes: 0,
         }
     }
 
@@ -59,6 +62,11 @@ impl DelayState {
     /// Number of held records.
     pub fn pending_len(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Encoded bytes of every held record.
+    pub const fn held_bytes(&self) -> u64 {
+        self.bytes
     }
 
     /// Release key of the next record to release.
@@ -89,12 +97,17 @@ impl DelayState {
         for value in pending.values() {
             *operations.entry(value.operation).or_default() += 1;
         }
+        self.bytes = pending.values().map(|value| u64::from(value.bytes)).sum();
         self.pending = pending;
         self.operations = operations;
     }
 
     fn hold(&mut self, operation: u64, pending: Vec<(ReleaseKey, PendingSchedule)>) {
         self.operations.insert(operation, pending.len());
+        self.bytes += pending
+            .iter()
+            .map(|(_, value)| u64::from(value.bytes))
+            .sum::<u64>();
         self.pending.extend(pending);
     }
 
@@ -103,7 +116,9 @@ impl DelayState {
             if *entry.key() > through {
                 break;
             }
-            let operation = entry.remove().operation;
+            let value = entry.remove();
+            self.bytes -= u64::from(value.bytes);
+            let operation = value.operation;
             if let Some(count) = self.operations.get_mut(&operation) {
                 *count -= 1;
                 if *count == 0 {
@@ -261,9 +276,7 @@ impl CanonicalState {
         let mut last = None;
         for record in &batch.records {
             let (key, pending) = held.next().ok_or(StateError::ReleaseMismatch)?;
-            if record.message_id != pending.message_id
-                || record_bytes(record.parts.iter())? != pending.bytes
-            {
+            if record.message_id != pending.message_id || record_bytes(record)? != pending.bytes {
                 return Err(StateError::ReleaseMismatch);
             }
             last = Some(*key);
@@ -343,7 +356,7 @@ fn held_records(
             PendingSchedule {
                 operation: op_number,
                 index,
-                bytes: record_bytes(record.parts.iter())?,
+                bytes: record_bytes(record)?,
                 message_id: record.message_id,
             },
         ));
@@ -358,7 +371,7 @@ fn is_broker_batch(batch: &AppendBatch<'_>) -> bool {
         && batch.first_sequence == ProducerSequence::ZERO
 }
 
-fn record_bytes<'a>(parts: impl Iterator<Item = &'a [u8]>) -> Result<u32, StateError> {
-    let total = parts.map(<[u8]>::len).sum::<usize>();
+fn record_bytes(record: ozzy_journal::operation::RecordRef<'_>) -> Result<u32, StateError> {
+    let total = ozzy_journal::operation::encoded_record_bytes(record.encoding, record.parts.iter());
     u32::try_from(total).map_err(|_| StateError::LimitExceeded("record bytes"))
 }

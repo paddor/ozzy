@@ -198,10 +198,11 @@ part. General descriptors use:
   sequence)`. Every schedule or release timestamp is at least the
   partition's latest one, so a new key sorts after every released key.
 - Partition state holds each held record's key, `Schedule` operation, record
-  index, stored byte count, and message ID. Payloads stay in the `Schedule`
+  index, encoded byte count (descriptor, part lengths, payload), and message
+  ID. Payloads stay in the `Schedule`
   operation until release.
 - A `Release` copies exactly the held records through its key, in key order.
-  Message IDs and byte counts must match, its timestamp must reach the last
+  Message IDs and encoded byte counts must match, its timestamp must reach the last
   key's time, and its batch takes the next offsets. A repeated release finds
   its records gone and fails.
 - A scheduled attempt's retry result names its `Schedule` operation and maps
@@ -466,6 +467,11 @@ A partition journal holds at most 256 segments of `segment_bytes`.
 - With less than a sixteenth of that space left, the partition refuses new
   records with NACK 10 (retry after backoff). With less than a sixty-fourth
   left, it also refuses producer opens, consumer progress, and assignments.
+- Records and control requests also leave room to release every held
+  scheduled record: its encoded bytes plus a `Release` frame, entry, and write
+  group of its own, and one write group per segment the releases fill. A
+  `Release` needs only the sixty-fourth, so held records can always leave and
+  end their retention hold.
 - Trims and policy changes always pass, so retention can still free space.
 - A retention byte target covers at most 224 segments, so retention that lags
   a few segments still frees space before refusals start.
@@ -481,7 +487,8 @@ A spare the device has no room for (`ENOSPC`, `EDQUOT`) is no fault.
 - Without an allocated spare, the partition refuses new records once less than
   a sixteenth of its active segment is left, and producer opens, consumer
   progress, and assignments below a sixty-fourth. New work must leave that room
-  free. Trims and policy changes still pass.
+  free, beside the segment limit reserves. Trims and policy changes still
+  pass.
 - Writes that reach the end of the active segment hold until the spare is
   allocated. Followers hold the same way.
 - Allocation retries a second after the failure, or at once after cleanup.

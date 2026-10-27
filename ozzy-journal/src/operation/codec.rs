@@ -12,7 +12,9 @@ use std::ops::Range;
 pub(super) mod append;
 mod control;
 mod delay;
-pub use delay::{decode_release_batch, decode_schedule_batch};
+pub use delay::{
+    RELEASE_FRAME_BYTES, decode_release_batch, decode_schedule_batch, encoded_record_bytes,
+};
 mod group;
 mod primitives;
 pub(super) use append::{

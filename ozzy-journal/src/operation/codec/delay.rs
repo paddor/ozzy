@@ -13,6 +13,19 @@ use crate::operation::{
     ReleaseKey, Schedule,
 };
 
+/// Bytes of a `Release` body beyond its records: the one-batch header and
+/// the release key.
+pub const RELEASE_FRAME_BYTES: usize = super::super::append_encoder::ONE_BATCH_HEADER_BYTES + 16;
+
+/// Bytes of one record in the general batch layout: its descriptor head,
+/// then a length and the bytes of each part. The tiny layout is never larger.
+pub fn encoded_record_bytes<'a>(
+    encoding: ozzy_proto::data::Encoding,
+    parts: impl IntoIterator<Item = &'a [u8]>,
+) -> usize {
+    encoding.head_bytes() + parts.into_iter().map(|part| 4 + part.len()).sum::<usize>()
+}
+
 pub(super) fn encode_schedule(
     value: &Schedule<'_>,
     limits: OperationLimits,

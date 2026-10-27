@@ -157,11 +157,15 @@ max_entries = 100000
   `max_secs` fails; a past one releases at once.
 - `max_entries` (at most 1048576) bounds held records per partition. A full
   partition makes producers retry later. Each held record adds 48 bytes to
-  the partition's checkpoint.
+  the partition's checkpoint. It may change on restart; a partition holding
+  more than the new limit takes no new schedules until releases drain it.
 - With `retention.max_age_secs` set, `max_secs` must not exceed it.
   Retention keeps the segment of the oldest held record, so a long delay
   can keep old segments, and a partition at its segment limit refuses new
   records until the held record is released.
+- Each held record keeps room to release it: its size plus up to about 4.5
+  KiB of framing. A partition near its segment limit refuses new records and
+  control requests first, so releases always fit.
 
 ## Docs
 

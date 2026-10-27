@@ -376,10 +376,17 @@ fn check_write(
     Ok(())
 }
 
-/// Core image bound: fixed metadata room plus every held scheduled record.
+/// Core image bound: fixed metadata room plus the most held scheduled records
+/// any `max_entries` allows. Lowering the limit on restart then still reads
+/// existing checkpoints; it only gates new schedules.
 fn core_checkpoint_bytes(placement: &PartitionPlacement) -> Result<usize, &'static str> {
-    delay_limits(placement)
-        .map_or(Some(0), DelayLimits::snapshot_bytes)
+    placement
+        .delay
+        .map_or(Some(0), |_| {
+            usize::try_from(ozzy_config::MAX_DELAY_ENTRIES)
+                .ok()
+                .and_then(|max_entries| DelayLimits { max_entries }.snapshot_bytes())
+        })
         .and_then(|held| held.checked_add(CORE_CHECKPOINT_BYTES))
         .ok_or("held scheduled records overflow the core checkpoint bound")
 }
@@ -407,6 +414,34 @@ fn checkpoint_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoint_bounds_ignore_the_held_record_limit() {
+        let placement = |delay| PartitionPlacement {
+            topic: "orders".into(),
+            partition: 0,
+            shard: 0,
+            device: "data".into(),
+            directory: "/data".into(),
+            retention: ozzy_config::TopicRetention::default(),
+            deduplication: None,
+            delay,
+            producer_idle_secs: 60,
+        };
+        let delay = |max_entries| {
+            core_checkpoint_bytes(&placement(Some(ozzy_config::TopicDelay {
+                max_secs: 60,
+                max_entries,
+            })))
+            .unwrap()
+        };
+        assert_eq!(
+            core_checkpoint_bytes(&placement(None)).unwrap(),
+            CORE_CHECKPOINT_BYTES
+        );
+        assert_eq!(delay(8), CORE_CHECKPOINT_BYTES + 1_048_576 * 48);
+        assert_eq!(delay(8), delay(ozzy_config::MAX_DELAY_ENTRIES));
+    }
 
     #[test]
     fn large_appends_keep_two_complete_backings_within_shared_read_allowance() {

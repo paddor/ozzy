@@ -141,7 +141,9 @@ fn schedule_holds_records_in_release_order_without_offsets() {
         [key(1_000, 2)]
     );
     let held = delay.pending().next().unwrap().1;
-    assert_eq!((held.operation, held.index, held.bytes), (3, 2, 4));
+    // Encoded bytes: a 24-byte descriptor and the 4-byte payload.
+    assert_eq!((held.operation, held.index, held.bytes), (3, 2, 28));
+    assert_eq!(delay.held_bytes(), 3 * 28);
     let writer = state.producer(producer()).unwrap();
     assert_eq!(writer.next_producer_sequence, ProducerSequence::new(3));
     for sequence in 0..3 {
@@ -180,7 +182,7 @@ fn release_takes_the_due_prefix_at_the_next_offsets() {
     let state = images.committed().partition(partition()).unwrap();
     assert_eq!(state.next_offset, Offset::new(3));
     let delay = state.delay.as_ref().unwrap();
-    assert_eq!(delay.pending_len(), 0);
+    assert_eq!((delay.pending_len(), delay.held_bytes()), (0, 0));
     assert_eq!(delay.oldest_operation(), None);
     assert_eq!(delay.time, 6_000);
 }
@@ -393,6 +395,7 @@ fn snapshot_restores_held_records_and_scheduled_results() {
         .as_ref()
         .unwrap();
     assert_eq!(delay.oldest_operation(), Some(3));
+    assert_eq!(delay.held_bytes(), 2 * 28);
     assert_eq!((delay.next_schedule, delay.time), (3, 1_200));
     assert!(matches!(
         CanonicalState::decode_snapshot(

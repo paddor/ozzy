@@ -26,9 +26,9 @@ mod watermark;
 use ozzy_journal::operation::{
     Append, AppendBatch, AppendRecord, Assign, Barrier, CreatePartition, OpenProducer,
     OperationBody, OperationCodecError, OperationKind, OperationLimits, PartitionPolicy,
-    ProducerResultFloor, Progress, ProgressAssignment, ProgressOwner, Release, ReleaseKey,
-    RetentionPolicy, RetireProducer, Schedule, Trim, append_operation_body, decode_operation_body,
-    encode_operation_body,
+    ProducerResultFloor, Progress, ProgressAssignment, ProgressOwner, RELEASE_FRAME_BYTES, Release,
+    ReleaseKey, RetentionPolicy, RetireProducer, Schedule, Trim, append_operation_body,
+    decode_operation_body, encode_operation_body, encoded_record_bytes,
 };
 use ozzy_proto::{
     ConsumerGroupId, ConsumerMemberId, MessageId, Offset, OperationId, OwnerEpoch, PartitionId,
@@ -447,6 +447,54 @@ fn body_decoder_rejects_trailing_bytes_and_unknown_kinds() {
     assert_eq!(
         OperationKind::try_from(u16::MAX),
         Err(OperationCodecError::UnsupportedOperationKind(u16::MAX))
+    );
+}
+
+#[test]
+fn release_body_is_its_frame_plus_each_record_size() {
+    use ozzy_proto::data::Encoding;
+    static LONG: [u8; 300] = [7; 300];
+    let bodies = bodies();
+    let Some(OperationBody::Release(release)) = bodies.last() else {
+        unreachable!()
+    };
+    let long = &LONG;
+    let records = [
+        (Encoding::Raw, vec![long.as_slice()]),
+        (
+            Encoding::Raw,
+            vec![b"ab".as_slice(), long.as_slice(), b"c".as_slice()],
+        ),
+        (Encoding::Lz4 { decoded_bytes: 900 }, vec![long.as_slice()]),
+    ];
+    for count in 1..=records.len() {
+        let mut release = release.clone();
+        release.batch.records = records[..count]
+            .iter()
+            .map(|(encoding, parts)| AppendRecord {
+                encoding: *encoding,
+                message_id: MessageId::from_bytes([0x43; 16]),
+                parts: parts.iter().copied().collect(),
+            })
+            .collect::<Vec<_>>()
+            .into();
+        let body =
+            encode_operation_body(&OperationBody::Release(release), OperationLimits::default())
+                .unwrap();
+        let sizes = records[..count]
+            .iter()
+            .map(|(encoding, parts)| encoded_record_bytes(*encoding, parts.iter().copied()))
+            .sum::<usize>();
+        assert_eq!(body.len(), RELEASE_FRAME_BYTES + sizes, "{count} records");
+    }
+    // Tiny records take fewer bytes than the general layout.
+    let body = encode_operation_body(
+        &OperationBody::Release(release.clone()),
+        OperationLimits::default(),
+    )
+    .unwrap();
+    assert!(
+        body.len() < RELEASE_FRAME_BYTES + encoded_record_bytes(Encoding::Raw, [b"de".as_slice()])
     );
 }
 

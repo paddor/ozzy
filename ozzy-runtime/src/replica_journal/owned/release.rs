@@ -7,8 +7,9 @@ use crate::replica_journal::ProposalBuffer;
 use bytes::Bytes;
 use ozzy_core::state::PendingSchedule;
 use ozzy_journal::operation::{
-    AppendBatch, AppendRecord, OperationBody, OperationKind, OperationLimits, Release, ReleaseKey,
-    Schedule, decode_operation_body, encode_operation_body,
+    AppendBatch, AppendRecord, OperationBody, OperationKind, OperationLimits, RELEASE_FRAME_BYTES,
+    Release, ReleaseKey, Schedule, decode_operation_body, encode_operation_body,
+    encoded_record_bytes,
 };
 use ozzy_journal_segment::{JournalIndexError, JournalIndexSnapshot};
 use ozzy_proto::{
@@ -19,13 +20,6 @@ use std::rc::Rc;
 
 /// Distinct `Schedule` operations one release may read.
 const MAX_SOURCES: usize = 64;
-
-/// Conservative descriptor bytes per record and part.
-const RECORD_BYTES: usize = 24;
-const PART_BYTES: usize = 4;
-
-/// Batch framing and the release key, beyond the record descriptors.
-const FRAME_BYTES: usize = 128;
 
 /// One bounded release step.
 #[derive(Debug, Default)]
@@ -120,10 +114,12 @@ impl OwnedJournal {
             Err(_) => return Err(JournalError::Stopped),
         };
         let limits = self.limits.operations;
+        // Record bytes bound the payload too.
         let budget = buffer
             .limits()
             .max_body_bytes
             .min(limits.max_body_bytes)
+            .saturating_sub(RELEASE_FRAME_BYTES)
             .min(limits.max_payload_bytes);
         let Some((partition, owner_epoch, entries)) =
             self.due_prefix(now_millis, limits.max_records, budget)?
@@ -163,7 +159,7 @@ impl OwnedJournal {
     }
 
     /// The due prefix of the partition with the earliest committed held
-    /// record, bounded by count, payload bytes, and source operations.
+    /// record, bounded by count, record bytes, and source operations.
     #[expect(
         clippy::type_complexity,
         reason = "one private result tuple read by the caller only"
@@ -317,7 +313,7 @@ fn held_records<'a>(
 ) -> Result<(Vec<AppendRecord<'a>>, Option<ReleaseKey>), JournalError> {
     let mut records = Vec::with_capacity(entries.len());
     let mut through = None;
-    let (mut bytes, mut payload, mut parts) = (FRAME_BYTES, 0_usize, 0_usize);
+    let (mut bytes, mut payload, mut parts) = (RELEASE_FRAME_BYTES, 0_usize, 0_usize);
     for (key, pending) in entries {
         let index = sources
             .binary_search_by_key(&pending.operation, |(number, _)| *number)
@@ -331,11 +327,11 @@ fn held_records<'a>(
             .ok_or(JournalError::AppendMismatch)?;
         let size = record.parts.iter().map(<[u8]>::len).sum::<usize>();
         let count = record.parts.len();
-        bytes += RECORD_BYTES + PART_BYTES * count + size;
+        bytes += encoded_record_bytes(record.encoding, record.parts.iter());
         payload += size;
         parts += count;
-        // The estimate runs high, but the first record always fits: its
-        // `Schedule` was at least as large as a `Release` of it alone.
+        // The first record always fits: its `Schedule` was at least as large
+        // as a `Release` of it alone.
         if !records.is_empty()
             && (bytes > room || payload > limits.max_payload_bytes || parts > limits.max_parts)
         {
