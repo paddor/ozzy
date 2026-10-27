@@ -237,6 +237,41 @@ fn retry_gets_the_original_schedule_sequences_and_a_fresh_suffix() {
 }
 
 #[test]
+fn stale_validated_schedule_proposes_again_as_its_append() {
+    let (mut controller, mut journal, mut driver) = delayed(16);
+    let due = [NOW + 2, NOW + 1];
+    let result = produce(
+        &mut controller,
+        &mut journal,
+        &driver,
+        request(12, 0, 2),
+        Some(&due),
+        NOW,
+    );
+    let ProposalValidation::Ready(validated) = result else {
+        panic!("ready: {result:?}")
+    };
+    let mut buffer = ProposalBuffer::from(validated.into_buffer());
+    buffer.revert_schedule().unwrap();
+    assert!(
+        buffer
+            .bodies()
+            .all(|(kind, _)| kind == OperationKind::Append)
+    );
+    let result = drive(
+        &mut controller,
+        journal.propose_append(driver.begin_validation().unwrap(), buffer, NOW + 1),
+    );
+    let body = proposed(&result);
+    assert_eq!(
+        (body.first_schedule, body.timestamp, body.due_millis),
+        (0, NOW + 1, due.to_vec())
+    );
+    accept(&mut controller, &mut journal, &mut driver, result);
+    assert_eq!(held(&journal), (2, 2, Offset::ZERO));
+}
+
+#[test]
 fn resend_with_other_bytes_due_time_or_kind_conflicts() {
     let (mut controller, mut journal, mut driver) = delayed(16);
     let due = [NOW + 1, NOW + 2];

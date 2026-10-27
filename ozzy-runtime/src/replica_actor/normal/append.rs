@@ -300,13 +300,14 @@ impl ReplicaActor {
                 }) => ticket,
                 Err(DriverError::StaleValidation) => {
                     crate::profiling::event(crate::profiling::Event::ReplicaStaleValidation);
-                    let buffer =
+                    let mut buffer =
                         crate::replica_journal::ProposalBuffer::from(validated.into_buffer());
                     if !reply.is_maintenance()
                         && !buffer.has_trimmed_retry()
                         && self.application_ready()
                         && self.driver.scope() == validation.scope()
                     {
+                        buffer.revert_schedule()?;
                         self.work.proposals.requeue(Submission { buffer, reply });
                     } else {
                         reply.finish(buffer, ProposalOutcome::NotAdmitted);

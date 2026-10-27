@@ -296,6 +296,12 @@ impl ProposalBuffer {
             .is_some_and(|results| results.trimmed)
     }
 
+    /// Turn a validated `Schedule` back into its APPEND so the request can
+    /// be proposed again. Validation assigns its position anew.
+    pub(crate) fn revert_schedule(&mut self) -> Result<(), JournalError> {
+        self.0.revert_schedule()
+    }
+
     /// Fixed fields of operation `index`, read from a body built from a
     /// validated writer request. `None` without that request's proof.
     pub(crate) fn validated_producer_summary(
