@@ -277,7 +277,7 @@ fn validate_delay(
         "delay cannot be combined with deduplication",
     )?;
     require(
-        delay.max_secs > 0 && delay.max_secs.checked_mul(1000).is_some(),
+        delay.max_millis().is_some(),
         &format!("{path}.max_secs"),
         "maximum delay must be positive and fit milliseconds",
     )?;

@@ -1,16 +1,9 @@
 //! A release proposal holds one broker-built `Release`. Validation writes its
 //! offset and timestamp, like an APPEND position.
 
-use super::{AppendBuffer, JournalError};
+use super::{AppendBuffer, JournalError, PARTITION, POSITION};
 use ozzy_journal::operation::OperationKind;
 use ozzy_proto::PartitionIncarnation;
-
-/// Byte offset of the partition in a one-batch body, after the batch count.
-const PARTITION: usize = 4;
-
-/// Byte offset of the position: batch count, partition, owner epoch,
-/// producer, producer epoch, first sequence.
-const POSITION: usize = 4 + 16 + 8 + 16 + 8 + 8;
 
 /// Trailing release key: millis, then schedule sequence.
 const THROUGH: usize = 16;
@@ -55,15 +48,9 @@ impl AppendBuffer {
         if !self.is_release() {
             return Err(JournalError::AppendMismatch);
         }
-        let start = self.entries[0].body.start + POSITION;
-        let target = self
-            .bodies
-            .mutable()?
-            .get_mut(start..start + 16)
-            .ok_or(JournalError::AppendMismatch)?;
-        target[..8].copy_from_slice(&first_offset.to_be_bytes());
-        target[8..].copy_from_slice(&timestamp.to_be_bytes());
-        self.validated = false;
-        Ok(())
+        let mut position = [0; 16];
+        position[..8].copy_from_slice(&first_offset.to_be_bytes());
+        position[8..].copy_from_slice(&timestamp.to_be_bytes());
+        self.write_position(0, position).map(drop)
     }
 }

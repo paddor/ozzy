@@ -120,22 +120,24 @@ impl ReplicaActor {
                     .map(Periodic::next)
                     .filter(|_| !self.journal.cleaning()),
             ),
-            // A retirement's file work runs beside writes; the next turn
-            // waits for its installation instead of draining for nothing.
-            // A turn's proposal must also leave validation first.
-            (
-                Maintenance::Retention,
-                self.maintenance.retention.at().filter(|_| {
-                    !self.journal.retention_busy()
-                        && !self.work.proposals.holds_maintenance()
-                        && !self.releases.running()
-                }),
-            ),
+            (Maintenance::Retention, self.retention_at()),
         ]
         .into_iter()
         .filter_map(|(kind, next)| next.filter(|next| now >= *next).map(|next| (kind, next)))
         .min_by_key(|(_, next)| *next)
         .map(|(kind, _)| kind)
+    }
+
+    /// When the next retention turn may start. A retirement's file work runs
+    /// beside writes; the next turn waits for its installation instead of
+    /// draining for nothing. A turn's proposal must also leave validation
+    /// first.
+    fn retention_at(&self) -> Option<Duration> {
+        self.maintenance.retention.at().filter(|_| {
+            !self.journal.retention_busy()
+                && !self.work.proposals.holds_maintenance()
+                && !self.releases.running()
+        })
     }
 
     /// Give one due turn to the journal once admitted writes are settled.
@@ -293,9 +295,13 @@ impl ReplicaActor {
     }
 
     /// Start a due release step. Its reads run beside writes, so it waits
-    /// for no settled journal. `true` when it started.
+    /// for no settled journal. A due retention turn goes first, so steady
+    /// releases cannot starve it. `true` when it started.
     pub(super) fn schedule_release(&mut self, now: Duration) -> Result<bool, ActorError> {
-        if !self.releasing() || !self.releases.due(&self.journal, &self.work.proposals, now) {
+        if !self.releasing()
+            || (self.application_ready() && self.retention_at().is_some_and(|at| now >= at))
+            || !self.releases.due(&self.journal, &self.work.proposals, now)
+        {
             return Ok(false);
         }
         let ticket = self.driver.begin_validation()?;

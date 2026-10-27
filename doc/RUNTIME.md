@@ -299,7 +299,9 @@ On the SDK:
   one step at a time: the owner picks the due prefix, a detached job reads
   its `Schedule` operations beside writes, and the `Release` validates
   ahead of queued producer requests. One step fills at most one proposal
-  arena from at most 64 `Schedule` operations.
+  arena from at most 64 `Schedule` operations. A due retention turn goes
+  first. A step that builds nothing, or whose `Release` the core does not
+  admit, waits 10 ms; one that validation refuses waits 100 ms.
 
 ## Storage backends
 

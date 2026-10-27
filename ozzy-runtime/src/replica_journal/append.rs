@@ -28,6 +28,13 @@ use super::JournalError;
 /// A canonical operation may contain many records; this is not a record limit.
 pub const MAX_APPEND_OPERATIONS: usize = 256;
 
+/// Byte offsets in a one-batch canonical body: batch count, partition, owner
+/// epoch, producer, producer epoch, first sequence, then the position (first
+/// offset and timestamp).
+const PARTITION: usize = 4;
+const FIRST_SEQUENCE: usize = PARTITION + 16 + 8 + 16 + 8;
+const POSITION: usize = FIRST_SEQUENCE + 8;
+
 #[derive(Debug, Clone)]
 struct Descriptor {
     envelope: CanonicalOperation<'static>,

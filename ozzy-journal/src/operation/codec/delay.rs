@@ -79,12 +79,39 @@ pub(super) fn decode_release<'a, const MATERIALIZE: bool, const VALIDATE_PREPARE
     })
 }
 
+/// Validate a whole `Schedule` body and view its batch, for retention.
+/// Records stay borrowed; nothing is materialized.
+pub fn decode_schedule_batch(
+    input: &[u8],
+    limits: OperationLimits,
+) -> Result<AppendBatchView<'_>, OperationCodecError> {
+    let (mut decoder, view) = view_batch(input, limits)?;
+    validate_position_count(decoder.u64()?, view.summary.record_count)?;
+    for _ in 0..view.summary.record_count {
+        decoder.u64()?;
+    }
+    decoder.finish()?;
+    Ok(view)
+}
+
 /// Validate a whole `Release` body and view its batch, for readers. Records
 /// stay borrowed; nothing is materialized.
 pub fn decode_release_batch(
     input: &[u8],
     limits: OperationLimits,
 ) -> Result<AppendBatchView<'_>, OperationCodecError> {
+    let (mut decoder, view) = view_batch(input, limits)?;
+    decoder.u64()?;
+    decoder.u64()?;
+    decoder.finish()?;
+    Ok(view)
+}
+
+/// The one batch at the start of a whole body, and the reader after it.
+fn view_batch(
+    input: &[u8],
+    limits: OperationLimits,
+) -> Result<(Reader<'_>, AppendBatchView<'_>), OperationCodecError> {
     validate_limits(limits)?;
     enforce_limit("operation body bytes", input.len(), limits.max_body_bytes)?;
     let mut decoder = Reader::new(input);
@@ -96,10 +123,7 @@ pub fn decode_release_batch(
         &mut AppendTotals::new(limits),
         None,
     )?;
-    decoder.u64()?;
-    decoder.u64()?;
-    decoder.finish()?;
-    Ok(view)
+    Ok((decoder, view))
 }
 
 fn encode_batch(

@@ -229,15 +229,27 @@ async fn inproc_memory_full_schedule_capacity_backs_off_until_a_release() {
             )
             .await;
             let mut writer = writer(&clock, &client).await;
-            let due = broker_now(&clock) + 1_000;
+            // Confirming advances the clock; leave room for a slow host.
+            let due = broker_now(&clock) + 10_000;
             confirm(&clock, &mut writer, (1..=8).map(|id| record(id, Some(due)))).await;
+            let sent = writer.partition_stats(0).unwrap().requests;
             let waiting = writer
                 .send_to_partition(record(9, Some(due + 1_000)), 0)
                 .await
                 .unwrap();
-            for _ in 0..100 {
-                tokio::task::yield_now().await;
-            }
+            // NACK 10 backs the writer off; its retry is a second request.
+            progress(&clock, async {
+                while writer.partition_stats(0).unwrap().requests < sent + 2
+                    && broker_now(&clock) < due
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            assert!(
+                broker_now(&clock) < due,
+                "{mode:?}: no retry before the release"
+            );
             assert!(waiting.confirmed().now_or_never().is_none(), "{mode:?}");
             // Releasing the first eight makes room; the writer retries.
             let receipt = progress(&clock, waiting.confirmed()).await.unwrap();

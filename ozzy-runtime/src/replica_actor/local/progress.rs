@@ -212,6 +212,9 @@ impl LocalActor {
                 }
             }
             ProposalValidation::Rejected { reason, buffer } => {
+                if reply.is_maintenance() {
+                    self.releases.back_off(self.now, true);
+                }
                 reply.finish(buffer, ProposalOutcome::Invalid(reason));
             }
             ProposalValidation::Resolved {

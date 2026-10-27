@@ -1,4 +1,4 @@
-use super::super::retention::{limit_bytes, roll};
+use super::super::retention::{limit, limit_bytes, roll};
 use super::*;
 use crate::replica_journal::ValidatedAppend;
 use ozzy_journal::operation::{CanonicalOperation, ReleaseKey};
@@ -359,4 +359,64 @@ fn retention_keeps_a_held_schedule_until_its_release() {
     let result = validate(&mut controller, &mut journal, &driver, proposal, NOW + 1);
     accept(&mut controller, &mut journal, &mut driver, result);
     assert_eq!(plan(&mut controller, &mut journal, &driver), Some(vec![1]));
+}
+
+#[test]
+fn retention_ages_a_schedule_only_segment_from_its_acceptance_time() {
+    let (mut controller, mut journal, mut driver) = delayed(16);
+    scheduled(&mut controller, &mut journal, &mut driver, 0, &[NOW + 1]);
+    roll(&mut controller, &mut journal);
+    let proposal = release(&mut controller, &mut journal, &driver, NOW + 1).unwrap();
+    let result = validate(&mut controller, &mut journal, &driver, proposal, NOW + 1);
+    accept(&mut controller, &mut journal, &mut driver, result);
+    roll(&mut controller, &mut journal);
+    limit(
+        &mut controller,
+        &mut journal,
+        &mut driver,
+        ozzy_journal::operation::RetentionPolicy {
+            max_age_millis: std::num::NonZeroU64::new(60_000),
+            max_bytes: None,
+        },
+    );
+    let mut plan = |now| {
+        drive(
+            &mut controller,
+            journal.plan_retention(driver.begin_validation().unwrap(), now, 2),
+        )
+        .unwrap()
+        .map(|(_, plan)| plan.retire)
+    };
+    // The segment holds no stored record, but retries of its schedule
+    // resolve for the retention age.
+    assert_eq!(plan(NOW + 59_999), Some(Vec::new()));
+    assert_eq!(plan(NOW + 60_000), Some(vec![1]));
+}
+
+#[test]
+fn release_takes_a_lone_held_record_as_large_as_its_arena() {
+    let (mut controller, mut journal, mut driver) = delayed(16);
+    let room = journal
+        .lease_proposal_buffer()
+        .unwrap()
+        .limits()
+        .max_body_bytes;
+    // The largest lone record a `Schedule` holds: batch header, descriptor,
+    // payload, and the schedule trailer fill the arena.
+    let payload: &'static [u8] = vec![7; room - 80 - 24 - 16].leak();
+    let mut large = request(12, 0, 1);
+    large.records[0].parts = smallvec::smallvec![payload];
+    let result = produce(
+        &mut controller,
+        &mut journal,
+        &driver,
+        large,
+        Some(&[NOW]),
+        NOW,
+    );
+    accept(&mut controller, &mut journal, &mut driver, result);
+    let proposal = release(&mut controller, &mut journal, &driver, NOW).unwrap();
+    let result = validate(&mut controller, &mut journal, &driver, proposal, NOW);
+    accept(&mut controller, &mut journal, &mut driver, result);
+    assert_eq!(held(&journal), (0, 1, Offset::new(1)));
 }

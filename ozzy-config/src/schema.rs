@@ -158,9 +158,7 @@ pub struct TopicDeduplication {
 impl Topic {
     /// The fixed maximum delay in milliseconds, when delay is enabled.
     pub fn delay_max_millis(&self) -> Option<std::num::NonZeroU64> {
-        self.delay
-            .and_then(|delay| delay.max_secs.checked_mul(1000))
-            .and_then(std::num::NonZeroU64::new)
+        self.delay.and_then(TopicDelay::max_millis)
     }
 }
 
@@ -174,6 +172,16 @@ pub struct TopicDelay {
     /// Maximum held records per partition. Admission backs off when full.
     #[serde(default = "default_delay_entries")]
     pub max_entries: u64,
+}
+
+impl TopicDelay {
+    /// The maximum delay in milliseconds. `None` for a zero or overflowing
+    /// `max_secs`, which validation refuses.
+    pub fn max_millis(self) -> Option<std::num::NonZeroU64> {
+        self.max_secs
+            .checked_mul(1000)
+            .and_then(std::num::NonZeroU64::new)
+    }
 }
 
 const fn default_delay_entries() -> u64 {

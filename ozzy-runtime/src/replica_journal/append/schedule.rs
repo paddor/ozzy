@@ -3,7 +3,7 @@
 //! sequences, the entry becomes a `Schedule`: no offsets, the acceptance
 //! time, then the schedule trailer.
 
-use super::{AppendBuffer, JournalError};
+use super::{AppendBuffer, FIRST_SEQUENCE, JournalError};
 use ozzy_core::state::{ProducerResultSource, ProducerResultSpan};
 use ozzy_journal::operation::OperationKind;
 use ozzy_proto::{Offset, ProducerSequence};
@@ -16,10 +16,6 @@ pub(in crate::replica_journal) struct Scheduled {
     /// First schedule sequence, once the entry is a `Schedule`.
     first_schedule: Option<u64>,
 }
-
-/// Byte offset of the first sequence in a one-batch APPEND body: batch
-/// count, partition, owner epoch, producer, producer epoch.
-const FIRST_SEQUENCE: usize = 4 + 16 + 8 + 16 + 8;
 
 fn trailer_bytes(records: usize) -> Result<usize, JournalError> {
     records

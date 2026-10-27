@@ -10,6 +10,10 @@ use std::time::Duration;
 /// when every proposal arena is leased.
 const RETRY: Duration = Duration::from_millis(10);
 
+/// Wait after validation refused a release, such as when the journal has
+/// no room for it until retention frees some.
+const REFUSED: Duration = Duration::from_millis(100);
+
 /// The release step in flight, and when the next one may start.
 #[derive(Debug, Default)]
 pub(super) struct Releases {
@@ -51,6 +55,13 @@ impl Releases {
     /// The running step, to await.
     pub(super) fn step(&mut self) -> Option<&mut JournalCompletion<ReleaseTurn>> {
         self.running.as_mut()
+    }
+
+    /// Wait before the next step after a maintenance proposal was not
+    /// admitted, so a release that keeps failing cannot spin.
+    pub(super) fn back_off(&mut self, now: Duration, refused: bool) {
+        let wait = if refused { REFUSED } else { RETRY };
+        self.retry_at = Some(now.saturating_add(wait));
     }
 
     /// Queue a finished step's proposal, or wait before the next step.

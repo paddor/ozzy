@@ -197,19 +197,8 @@ impl OwnedJournal {
             reader.packed(journal, &replaced)?;
         }
         self.retention.retain_segments(|id| !replaced.contains(&id));
-        let partition = self.images.as_ref().and_then(|images| {
-            images
-                .speculative()
-                .partitions()
-                .next()
-                .map(|(partition, _)| partition)
-        });
         if let Some(proof) = proof {
-            if let Some(partition) = partition {
-                let summary = proof.retention_segment(partition);
-                self.retention.sealed.insert(summary.id, summary);
-            }
-            self.retention.proofs.push(proof);
+            self.keep_retirement_proof(proof);
         }
         self.replay.clear();
         self.storage_validation.clear();

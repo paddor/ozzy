@@ -1,7 +1,7 @@
 //! Native actor construction from checked journal and deployment bounds.
 
 use crate::{CheckedConfig, JournalConfig, OpenedPartition, PartitionAuthority, StartupError};
-use ozzy_config::PartitionPlacement;
+use ozzy_config::{PartitionPlacement, TopicDelay};
 use ozzy_proto::{LinkSessionId, NodeId, PartitionIncarnation};
 use ozzy_replication::{PipelineLimits, driver::Timing, flow::ProbeTiming};
 use ozzy_runtime::{
@@ -82,10 +82,7 @@ pub(crate) fn prepare_partition(
             topic: &placement.topic,
             partition_id: PartitionId::new(placement.partition),
             owner_epoch: OwnerEpoch::INITIAL,
-            delay_max_millis: placement
-                .delay
-                .and_then(|delay| delay.max_secs.checked_mul(1000))
-                .and_then(std::num::NonZeroU64::new),
+            delay_max_millis: placement.delay.and_then(TopicDelay::max_millis),
             dedup_window_millis: placement
                 .deduplication
                 .and_then(|policy| std::num::NonZeroU64::new(policy.window_millis)),

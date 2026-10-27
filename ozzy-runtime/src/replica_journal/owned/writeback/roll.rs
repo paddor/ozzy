@@ -76,21 +76,9 @@ impl OwnedJournal {
         self.spare.changed();
         let reader = self.reader.as_mut().ok_or(JournalError::AppendMismatch)?;
         reader.rolled(self.journal.readable()?)?;
-        // The sealed segment's read index already holds its record ends, so
-        // neither retention planning nor retirement need scan the segment.
-        let partition = self.images.as_ref().and_then(|images| {
-            images
-                .speculative()
-                .partitions()
-                .next()
-                .map(|(partition, _)| partition)
-        });
+        // The sealed segment's read index already holds its record ends.
         if let Some(proof) = reader.sealed_retirement_proof(self.journal.readable()?)? {
-            if let Some(partition) = partition {
-                let summary = proof.retention_segment(partition);
-                self.retention.sealed.insert(summary.id, summary);
-            }
-            self.retention.proofs.push(proof);
+            self.keep_retirement_proof(proof);
         }
         observed.armed = false;
         self.faulted = false;

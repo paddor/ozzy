@@ -271,11 +271,28 @@ impl ReplicaActor {
                 return Ok(());
             }
             ProposalValidation::Rejected { reason, buffer } => {
+                if reply.is_maintenance() {
+                    self.releases.back_off(now, true);
+                }
                 reply.finish(buffer, ProposalOutcome::Invalid(reason));
                 return Ok(());
             }
         };
         self.admit_proposal(validated, reply, now)
+    }
+
+    /// Finish a proposal the core did not admit. A maintenance proposal
+    /// holds off the next release step.
+    fn not_admitted(
+        &mut self,
+        reply: super::Reply,
+        buffer: crate::replica_journal::ProposalBuffer,
+        now: Duration,
+    ) {
+        if reply.is_maintenance() {
+            self.releases.back_off(now, false);
+        }
+        reply.finish(buffer, ProposalOutcome::NotAdmitted);
     }
 
     fn admit_proposal(
@@ -310,12 +327,12 @@ impl ReplicaActor {
                         buffer.revert_schedule()?;
                         self.work.proposals.requeue(Submission { buffer, reply });
                     } else {
-                        reply.finish(buffer, ProposalOutcome::NotAdmitted);
+                        self.not_admitted(reply, buffer, now);
                     }
                     return Ok(());
                 }
                 Err(DriverError::Replication(ReplicationError::Capacity)) => {
-                    reply.finish(validated.into_buffer().into(), ProposalOutcome::NotAdmitted);
+                    self.not_admitted(reply, validated.into_buffer().into(), now);
                     return Ok(());
                 }
                 Err(error) => return Err(error.into()),

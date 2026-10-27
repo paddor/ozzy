@@ -207,7 +207,9 @@ part. General descriptors use:
 - A scheduled attempt's retry result names its `Schedule` operation and maps
   the sequence to its schedule sequence.
 - Retention keeps the oldest `Schedule` operation that still holds a record,
-  and every later segment.
+  and every later segment. A `Schedule` acceptance time counts toward its
+  segment's age, so retries of a released schedule resolve for the retention
+  age.
 - Readers and indexes treat a `Release` batch like an APPEND batch.
   `Schedule` records have no offsets and are never indexed.
 - Scheduled payloads are raw, so a release can copy any prefix of held

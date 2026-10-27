@@ -334,7 +334,11 @@ fn held_records<'a>(
         bytes += RECORD_BYTES + PART_BYTES * count + size;
         payload += size;
         parts += count;
-        if bytes > room || payload > limits.max_payload_bytes || parts > limits.max_parts {
+        // The estimate runs high, but the first record always fits: its
+        // `Schedule` was at least as large as a `Release` of it alone.
+        if !records.is_empty()
+            && (bytes > room || payload > limits.max_payload_bytes || parts > limits.max_parts)
+        {
             break;
         }
         records.push(AppendRecord {
