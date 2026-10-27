@@ -49,6 +49,7 @@ pub(super) fn encode_create(
     encoder.u32(value.partition_id.get())?;
     encoder.u64(value.owner_epoch.get())?;
     encoder.u64(value.dedup_window_millis.map_or(0, NonZeroU64::get))?;
+    encoder.u64(value.delay_max_millis.map_or(0, NonZeroU64::get))?;
     encode_retention(value.retention, encoder)
 }
 
@@ -66,6 +67,7 @@ pub(super) fn decode_create<'a>(
         partition_id: PartitionId::new(decoder.u32()?),
         owner_epoch: OwnerEpoch::new(decoder.u64()?),
         dedup_window_millis: NonZeroU64::new(decoder.u64()?),
+        delay_max_millis: NonZeroU64::new(decoder.u64()?),
         retention: decode_retention(decoder)?,
     })
 }

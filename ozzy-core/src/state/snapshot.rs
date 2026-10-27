@@ -36,7 +36,7 @@ fn ready<T>(future: impl std::future::Future<Output = T>) -> T {
 pub const STATE_SNAPSHOT_HEADER_BYTES: usize = 256;
 
 const SNAPSHOT_MAGIC: &[u8; 8] = b"OZYSTA01";
-const SNAPSHOT_VERSION: u16 = 3;
+const SNAPSHOT_VERSION: u16 = 4;
 const PROGRESS_BYTES: usize = 48;
 const ASSIGNMENT_BYTES: usize = 80;
 const SNAPSHOT_DIGEST_START: usize = 56;
@@ -44,7 +44,7 @@ const SNAPSHOT_DIGEST_END: usize = 88;
 const SNAPSHOT_HASH_CONTEXT: &str = "ozzy canonical state snapshot v1";
 const SNAPSHOT_SCHEMA_CONTEXT: &str = "ozzy canonical state snapshot schema";
 const SNAPSHOT_SCHEMA: &[u8] =
-    b"OZYSTA01:256:partition112-dedup-time-and-window-retired-epoch+names+producer80+retry-span40-stored-or-proof-op:progress48:assignment80-plan-and-resume:coordinator-group-plan:network-order";
+    b"OZYSTA01:256:partition144-dedup-time-and-window-retired-epoch-delay+names+producer80+retry-span40-stored-proof-or-schedule-op+pending48:progress48:assignment80-plan-and-resume:coordinator-group-plan:network-order";
 const RETENTION_MAX_AGE: u32 = 1 << 0;
 const RETENTION_MAX_BYTES: u32 = 1 << 1;
 

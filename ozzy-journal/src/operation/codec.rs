@@ -11,6 +11,7 @@ use std::ops::Range;
 
 pub(super) mod append;
 mod control;
+mod delay;
 mod group;
 mod primitives;
 pub(super) use append::{
@@ -79,6 +80,8 @@ pub fn append_operation_body_to(
             OperationBody::GroupPlan(value) => group::encode(value, limits, encoder)?,
             OperationBody::GroupDelete(value) => group::encode_delete(*value, encoder)?,
             OperationBody::RetireProducer(value) => encode_retire_producer(*value, encoder)?,
+            OperationBody::Schedule(value) => delay::encode_schedule(value, limits, encoder)?,
+            OperationBody::Release(value) => delay::encode_release(value, limits, encoder)?,
         }
         Ok(())
     })
@@ -257,6 +260,14 @@ fn decode_body<const MATERIALIZE: bool, const VALIDATE_PREPARED: bool>(
         OperationKind::RetireProducer => {
             OperationBody::RetireProducer(decode_retire_producer(&mut decoder)?)
         }
+        OperationKind::Schedule => OperationBody::Schedule(delay::decode_schedule::<
+            MATERIALIZE,
+            VALIDATE_PREPARED,
+        >(&mut decoder, limits)?),
+        OperationKind::Release => OperationBody::Release(delay::decode_release::<
+            MATERIALIZE,
+            VALIDATE_PREPARED,
+        >(&mut decoder, limits)?),
     };
     decoder.finish()?;
     Ok(body)

@@ -36,6 +36,16 @@ pub struct Plan {
     pub roll_active: bool,
 }
 
+/// Operations a plan must keep.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Kept {
+    /// Highest committed operation; segments past it stay.
+    pub committed_operation: u64,
+    /// Oldest operation still holding a scheduled record; its segment and
+    /// every later one stay.
+    pub held_operation: Option<u64>,
+}
+
 /// Invalid summaries, limits, or capacity arithmetic.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 #[error("invalid retention segment summaries or budget")]
@@ -44,13 +54,15 @@ pub struct PlanError;
 impl Plan {
     /// Age and byte targets independently expire the oldest prefix. Newer
     /// timestamps or protected accepted operations stop age-based retirement.
+    /// A segment holding the held operation or later stops both targets.
     pub fn select(
         segments: &[Segment],
         policy: RetentionPolicy,
         now: u64,
-        committed_operation: u64,
+        kept: Kept,
         maximum_segments: usize,
     ) -> Result<Self, PlanError> {
+        let committed_operation = kept.committed_operation;
         let active = segments.last().ok_or(PlanError)?;
         if maximum_segments == 0
             || active.sealed
@@ -79,7 +91,12 @@ impl Plan {
         let mut record_floor = Offset::ZERO;
         let mut operation_floor = 0;
         for segment in segments.iter().take(maximum_segments) {
-            if !segment.sealed || segment.last_operation > committed_operation {
+            if !segment.sealed
+                || segment.last_operation > committed_operation
+                || kept
+                    .held_operation
+                    .is_some_and(|operation| segment.last_operation >= operation)
+            {
                 break;
             }
             let oversized = policy

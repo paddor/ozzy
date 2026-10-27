@@ -77,6 +77,7 @@ fn seed(buffer: &mut ProposalBuffer, phase: Phase) {
             topic: "orders",
             partition_id: PartitionId::ZERO,
             owner_epoch: OwnerEpoch::INITIAL,
+            delay_max_millis: None,
             dedup_window_millis: None,
             retention: RetentionPolicy::default(),
         }),

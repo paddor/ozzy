@@ -110,6 +110,7 @@ impl CanonicalState {
             Mutation::DedupTime { partition, time } => {
                 self.partition_mut(partition)?.dedup_time = time;
             }
+            Mutation::Delay(prepared) => self.install_delay(prepared)?,
             Mutation::Barrier => {}
         }
         Ok(())
@@ -161,7 +162,7 @@ impl CanonicalState {
     }
 
     /// A partition the validated plan names.
-    fn partition_mut(
+    pub(super) fn partition_mut(
         &mut self,
         partition: PartitionIncarnation,
     ) -> Result<&mut super::CanonicalPartition, StateError> {
@@ -193,7 +194,11 @@ impl CanonicalState {
 
     /// Account result spans one applied mutation added and released. The
     /// plan charged them against the image limits before apply.
-    fn count_retry_spans(&mut self, added: usize, released: usize) -> Result<(), StateError> {
+    pub(super) fn count_retry_spans(
+        &mut self,
+        added: usize,
+        released: usize,
+    ) -> Result<(), StateError> {
         self.retry_span_count = self
             .retry_span_count
             .checked_add(added)

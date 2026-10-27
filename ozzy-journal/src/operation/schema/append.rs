@@ -55,6 +55,38 @@ pub struct ResolvedAppend<'a> {
     pub results: AppendResults<'a>,
 }
 
+/// One producer batch held until its records' due times. It assigns schedule
+/// sequences, not offsets: `first_offset` is zero and the timestamp is the
+/// acceptance time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Schedule<'a> {
+    /// Held records in producer sequence order.
+    pub batch: AppendBatch<'a>,
+    /// Schedule sequence of the first record.
+    pub first_schedule: u64,
+    /// Absolute Unix due time in milliseconds, one per record.
+    pub due_millis: Vec<u64>,
+}
+
+/// Position in release order: effective due time, then schedule sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ReleaseKey {
+    /// The later of due and acceptance time, in Unix milliseconds.
+    pub millis: u64,
+    /// Schedule sequence; equal due times keep acceptance order.
+    pub schedule: u64,
+}
+
+/// Due scheduled records copied into the log in release order. The batch has
+/// assigned offsets, the release timestamp, and zero producer fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Release<'a> {
+    /// Copied records in release order.
+    pub batch: AppendBatch<'a>,
+    /// Release key of the last copied record.
+    pub through: ReleaseKey,
+}
+
 /// Metadata needed to validate one append's state transition, without records.
 /// This is not a hash proof or authorization to skip canonical body validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

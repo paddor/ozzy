@@ -36,6 +36,8 @@ mod images;
 mod progress;
 #[path = "state/resolved.rs"]
 mod resolved;
+#[path = "state/schedule.rs"]
+mod schedule;
 #[path = "state/shared.rs"]
 mod shared;
 #[path = "state/watermark.rs"]
@@ -68,6 +70,7 @@ fn create() -> OperationBody<'static> {
         topic: "topic",
         partition_id: PartitionId::new(7),
         owner_epoch: OwnerEpoch::new(9),
+        delay_max_millis: None,
         dedup_window_millis: None,
         retention: RetentionPolicy::default(),
     })
@@ -90,6 +93,7 @@ fn create_another() -> OperationBody<'static> {
         topic: "topic",
         partition_id: PartitionId::new(8),
         owner_epoch: OwnerEpoch::new(10),
+        delay_max_millis: None,
         dedup_window_millis: None,
         retention: RetentionPolicy::default(),
     })
@@ -678,6 +682,7 @@ fn operation_numbers_and_typed_body_shape_are_enforced() {
         topic: "topic",
         partition_id: PartitionId::new(7),
         owner_epoch: OwnerEpoch::new(9),
+        delay_max_millis: None,
         dedup_window_millis: None,
         retention: RetentionPolicy::default(),
     });

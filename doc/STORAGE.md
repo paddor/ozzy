@@ -124,6 +124,8 @@ Exact layout: [segment codec](../ozzy-journal-segment/src/codec.rs).
 | 5 | `Assign` | 12 | `GroupPlan` |
 | 6 | `Trim` | 13 | `GroupDelete` |
 | 7 | `PartitionPolicy` | 14 | `RetireProducer` |
+| | | 15 | `Schedule` |
+| | | 16 | `Release` |
 
 Integers are big-endian, IDs 16 bytes, counts and text lengths `u32`. Exact
 schema: [operation codec](../ozzy-journal/src/operation/codec/).
@@ -177,11 +179,35 @@ part. General descriptors use:
   member; each member optional), operation ID.
 - `GroupDelete` (kind 13): format `u8` (1), coordinator and group incarnations,
   the committed revision it retires, operation ID.
-- `CreatePartition` stores the dedup window as `u64` milliseconds; zero
-  disables deduplication.
+- `CreatePartition` stores the dedup window, then the maximum delay, as
+  `u64` milliseconds; zero disables each. A partition cannot enable both.
 - `RetireProducer` (kind 14): partition incarnation, producer ID, epoch
   `u64`, next sequence `u64`. It has no operation ID: the epoch and next
   sequence fence it against any open or append ordered first.
+- `Schedule` (kind 15): exactly one nonempty producer batch with first
+  offset zero and the acceptance timestamp, then first schedule sequence
+  `u64`, then one due time `u64` (Unix milliseconds) per record. It
+  consumes producer and schedule sequences but no offsets.
+- `Release` (kind 16): exactly one nonempty batch with zero producer fields,
+  the next offsets, and the release timestamp, then the release key of its
+  last record: time `u64`, schedule sequence `u64`.
+
+### Scheduled records
+
+- A held record's release key is `(max(due, acceptance), schedule
+  sequence)`. Every schedule or release timestamp is at least the
+  partition's latest one, so a new key sorts after every released key.
+- Partition state holds each held record's key, `Schedule` operation, record
+  index, stored byte count, and message ID. Payloads stay in the `Schedule`
+  operation until release.
+- A `Release` copies exactly the held records through its key, in key order.
+  Message IDs and byte counts must match, its timestamp must reach the last
+  key's time, and its batch takes the next offsets. A repeated release finds
+  its records gone and fails.
+- A scheduled attempt's retry result names its `Schedule` operation and maps
+  the sequence to its schedule sequence.
+- Retention keeps the oldest `Schedule` operation that still holds a record,
+  and every later segment.
 
 ## Record identity and deduplication
 
@@ -365,7 +391,7 @@ payload-free duplicate results.
 Canonical checkpoint images start with a 104-byte `OZYCIMG\0` header: version
 `u16` (1), six zero bytes, core snapshot length `u64`, partition incarnation
 (16 bytes), and the 64-byte dedup index header. The last 80 bytes are zero
-without an identity section. The core snapshot (`OZYSTA01`, version 3,
+without an identity section. The core snapshot (`OZYSTA01`, version 4,
 256-byte header) follows, then identity rows. Bare snapshots and other versions
 are rejected. Coordinator group images are each a `u32` length plus the
 `GroupPlan` body.
@@ -377,7 +403,8 @@ ID, offset, and logical acceptance time. The enclosing checkpoint supplies
 integrity and partition authority.
 
 - Checkpoints hold state, producer coordinates, retry floors, live confirmed
-  identities, and the original committed operation and digest. Never payloads.
+  identities, held scheduled records (48 bytes each), and the original
+  committed operation and digest. Never payloads.
 - Failed or canceled builds never select themselves. Installation checks the
   captured position and source lineage.
 - Decoded state stays private until every chunk and the state digest match.

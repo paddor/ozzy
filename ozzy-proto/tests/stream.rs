@@ -84,7 +84,7 @@ fn duplicate_confirmation_preserves_its_original_offset_and_rejects_unknown_disp
     assert_eq!(metadata[105], 1);
     let packet = decode_packet(&[&header, &metadata, &[]], limits).unwrap();
     assert_eq!(stream::decode_confirmed(packet, limits).unwrap(), receipt);
-    for disposition in [2, 3, 255] {
+    for disposition in [3, 4, 255] {
         metadata[105] = disposition;
         let packet = decode_packet(&[&header, &metadata, &[]], limits).unwrap();
         assert!(stream::decode_confirmed(packet, limits).is_err());

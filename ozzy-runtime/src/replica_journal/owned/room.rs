@@ -31,7 +31,9 @@ pub(super) const fn record_reserve(max_segments: u64) -> u64 {
 }
 
 /// Room an operation of `kind` must leave: none for operations that free
-/// space, `control` for control requests, and `records` for records.
+/// space, `control` for control requests, and `records` for records. A
+/// release writes records but ends the retention hold of their schedules,
+/// so it takes the control reserve.
 const fn reserve(kind: OperationKind, records: u64, control: u64) -> u64 {
     match kind {
         OperationKind::Trim
@@ -44,8 +46,12 @@ const fn reserve(kind: OperationKind, records: u64, control: u64) -> u64 {
         | OperationKind::OpenProducer
         | OperationKind::Progress
         | OperationKind::Assign
-        | OperationKind::GroupPlan => control,
-        OperationKind::Append | OperationKind::ResolvedAppend | OperationKind::Barrier => records,
+        | OperationKind::GroupPlan
+        | OperationKind::Release => control,
+        OperationKind::Append
+        | OperationKind::ResolvedAppend
+        | OperationKind::Schedule
+        | OperationKind::Barrier => records,
     }
 }
 

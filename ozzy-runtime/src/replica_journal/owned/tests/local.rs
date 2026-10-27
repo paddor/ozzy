@@ -151,6 +151,7 @@ fn initialize_partition(
         topic: "orders",
         partition_id: number,
         owner_epoch: OwnerEpoch::INITIAL,
+        delay_max_millis: None,
         dedup_window_millis: journal
             .dedup
             .limits

@@ -15,6 +15,8 @@ struct Retained {
     policy: ozzy_journal::operation::RetentionPolicy,
     floor: Offset,
     end: Offset,
+    /// Oldest `Schedule` operation that still holds a record.
+    held: Option<u64>,
 }
 
 impl OwnedJournal {
@@ -39,7 +41,10 @@ impl OwnedJournal {
             &segments,
             retained.policy,
             now_millis,
-            ticket.applied().op.0,
+            ozzy_core::retention::Kept {
+                committed_operation: ticket.applied().op.0,
+                held_operation: retained.held,
+            },
             maximum_segments,
         )?;
         Ok(Some((retained.partition, plan)))
@@ -63,6 +68,10 @@ impl OwnedJournal {
             policy,
             floor: state.retained_from,
             end: state.next_offset,
+            held: state
+                .delay
+                .as_ref()
+                .and_then(ozzy_core::state::DelayState::oldest_operation),
         }))
     }
 

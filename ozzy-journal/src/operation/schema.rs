@@ -2,8 +2,8 @@
 
 mod append;
 pub use append::{
-    Append, AppendBatch, AppendBatchSummary, AppendRecord, AppendSummary, RecordPosition,
-    ResolvedAppend,
+    Append, AppendBatch, AppendBatchSummary, AppendRecord, AppendSummary, RecordPosition, Release,
+    ReleaseKey, ResolvedAppend, Schedule,
 };
 
 use super::OperationCodecError;
@@ -66,6 +66,10 @@ pub enum OperationKind {
     GroupDelete = 13,
     /// Remove one idle producer session and its retry results.
     RetireProducer = 14,
+    /// Hold producer records until their due times.
+    Schedule = 15,
+    /// Copy due scheduled records into the log in release order.
+    Release = 16,
 }
 
 impl TryFrom<u16> for OperationKind {
@@ -87,6 +91,8 @@ impl TryFrom<u16> for OperationKind {
             12 => Ok(Self::GroupPlan),
             13 => Ok(Self::GroupDelete),
             14 => Ok(Self::RetireProducer),
+            15 => Ok(Self::Schedule),
+            16 => Ok(Self::Release),
             other => Err(OperationCodecError::UnsupportedOperationKind(other)),
         }
     }
@@ -106,6 +112,8 @@ impl OperationKind {
                 | Self::ResolvedAppend
                 | Self::DedupWatermark
                 | Self::RetireProducer
+                | Self::Schedule
+                | Self::Release
         )
     }
 }
@@ -218,6 +226,9 @@ pub struct CreatePartition<'a> {
     /// Immutable first-wins deduplication window in replicated log milliseconds.
     /// Absent disables event deduplication for this partition incarnation.
     pub dedup_window_millis: Option<NonZeroU64>,
+    /// Immutable maximum delay between acceptance and due time. Absent
+    /// disables scheduled records for this partition incarnation.
+    pub delay_max_millis: Option<NonZeroU64>,
     /// Retention policy stored in canonical state.
     pub retention: RetentionPolicy,
 }
@@ -401,6 +412,10 @@ pub enum OperationBody<'a> {
     GroupDelete(super::GroupDelete),
     /// Remove one idle producer session and its retry results.
     RetireProducer(RetireProducer),
+    /// Hold producer records until their due times.
+    Schedule(Schedule<'a>),
+    /// Copy due scheduled records into the log in release order.
+    Release(Release<'a>),
 }
 
 impl OperationBody<'_> {
@@ -415,7 +430,9 @@ impl OperationBody<'_> {
             | Self::Progress(_)
             | Self::ResolvedAppend(_)
             | Self::DedupWatermark(_)
-            | Self::RetireProducer(_) => None,
+            | Self::RetireProducer(_)
+            | Self::Schedule(_)
+            | Self::Release(_) => None,
             Self::OpenProducer(value) => Some(value.operation_id),
             Self::Assign(value) => Some(value.operation_id),
             Self::Trim(value) => Some(value.operation_id),
@@ -444,6 +461,8 @@ impl OperationBody<'_> {
             Self::GroupPlan(_) => OperationKind::GroupPlan,
             Self::GroupDelete(_) => OperationKind::GroupDelete,
             Self::RetireProducer(_) => OperationKind::RetireProducer,
+            Self::Schedule(_) => OperationKind::Schedule,
+            Self::Release(_) => OperationKind::Release,
         }
     }
 }

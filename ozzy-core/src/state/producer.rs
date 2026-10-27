@@ -24,7 +24,8 @@ pub struct ProducerTransition {
 pub struct ProducerResultSpan {
     /// First producer-local sequence in this span.
     pub first_sequence: ProducerSequence,
-    /// Partition-global offset assigned to that sequence.
+    /// Partition-global offset assigned to that sequence, or its schedule
+    /// sequence when scheduled.
     pub first_offset: Offset,
     /// Number of consecutive sequence and offset coordinates.
     pub records: u64,
@@ -43,14 +44,21 @@ pub enum ProducerResultSource {
         /// Operation containing the attempted bytes' fingerprints.
         operation: u64,
     },
+    /// Exact record bytes remain in this partition's `Schedule` operation.
+    Scheduled {
+        /// `Schedule` operation holding the attempted bytes.
+        operation: u64,
+    },
 }
 
 impl ProducerResultSpan {
-    /// Stored or duplicate, without implying a confirmation boundary.
+    /// Stored, duplicate, or scheduled, without implying a confirmation
+    /// boundary.
     pub const fn disposition(self) -> AppendDisposition {
         match self.source {
             ProducerResultSource::Stored => AppendDisposition::Stored,
             ProducerResultSource::Duplicate { .. } => AppendDisposition::Duplicate,
+            ProducerResultSource::Scheduled { .. } => AppendDisposition::Scheduled,
         }
     }
 
@@ -142,12 +150,14 @@ impl CanonicalProducer {
             .min()
     }
 
-    /// Oldest operation carrying a retained duplicate retry fingerprint.
+    /// Oldest operation carrying a retained duplicate retry fingerprint or
+    /// scheduled record.
     pub fn result_operation_floor(&self) -> Option<u64> {
         self.results
             .iter()
             .filter_map(|span| match span.source {
-                ProducerResultSource::Duplicate { operation } => Some(operation),
+                ProducerResultSource::Duplicate { operation }
+                | ProducerResultSource::Scheduled { operation } => Some(operation),
                 ProducerResultSource::Stored => None,
             })
             .min()
@@ -167,7 +177,9 @@ impl CanonicalProducer {
         operation_floor: u64,
     ) -> ProducerSequence {
         for span in &self.results {
-            if let ProducerResultSource::Duplicate { operation } = span.source {
+            if let ProducerResultSource::Duplicate { operation }
+            | ProducerResultSource::Scheduled { operation } = span.source
+            {
                 if operation >= operation_floor {
                     return span.first_sequence;
                 }
@@ -232,6 +244,32 @@ impl CanonicalProducer {
         }
         self.next_producer_sequence = ProducerSequence::new(next_sequence);
         self.last_stored_end = Offset::new(stored_end);
+        Ok(())
+    }
+
+    /// Map held attempts to their schedule sequences. Each `Schedule` adds
+    /// its own scheduled span; it stores no offsets.
+    pub(super) fn record_schedule(
+        &mut self,
+        span: ProducerResultSpan,
+        max_spans: usize,
+    ) -> Result<(), StateError> {
+        if span.first_sequence != self.next_producer_sequence {
+            return Err(StateError::ProducerSequenceMismatch);
+        }
+        if span.records == 0 || !matches!(span.source, ProducerResultSource::Scheduled { .. }) {
+            return Err(StateError::MalformedBody("invalid scheduled assignment"));
+        }
+        if self.results.len() >= max_spans {
+            return Err(StateError::LimitExceeded("producer retry spans"));
+        }
+        let next_sequence = span
+            .first_sequence
+            .get()
+            .checked_add(span.records)
+            .ok_or(StateError::PositionExhausted)?;
+        self.results.push_back(span);
+        self.next_producer_sequence = ProducerSequence::new(next_sequence);
         Ok(())
     }
 

@@ -59,6 +59,7 @@ fn create(actor: &ReplicaActor) -> crate::replica_journal::ProposalBuffer {
         topic: "orders",
         partition_id: PartitionId::ZERO,
         owner_epoch: OwnerEpoch::INITIAL,
+        delay_max_millis: None,
         dedup_window_millis: None,
         retention: RetentionPolicy::default(),
     });

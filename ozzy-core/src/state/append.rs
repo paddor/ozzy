@@ -227,7 +227,7 @@ impl CanonicalState {
         self.check_retry_span_capacity(additional)
     }
 
-    fn check_retry_span_capacity(&self, additional: usize) -> Result<(), StateError> {
+    pub(super) fn check_retry_span_capacity(&self, additional: usize) -> Result<(), StateError> {
         if self
             .retry_span_count
             .checked_add(additional)

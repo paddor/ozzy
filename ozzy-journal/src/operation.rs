@@ -86,6 +86,6 @@ pub use schema::{
     Append, AppendBatch, AppendBatchSummary, AppendRecord, AppendSummary, Assign, Barrier,
     CanonicalOperation, ChainPosition, CreatePartition, DedupWatermark, Digest, OpenProducer,
     OperationBody, OperationHeader, OperationKind, OperationLimits, PartitionPolicy,
-    ProducerResultFloor, Progress, ProgressAssignment, ProgressOwner, RecordPosition,
-    ResolvedAppend, RetentionPolicy, RetireProducer, Trim,
+    ProducerResultFloor, Progress, ProgressAssignment, ProgressOwner, RecordPosition, Release,
+    ReleaseKey, ResolvedAppend, RetentionPolicy, RetireProducer, Schedule, Trim,
 };
