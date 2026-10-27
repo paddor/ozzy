@@ -74,6 +74,8 @@ impl ProducerResultSpan {
 pub(super) struct PreparedProducerResults {
     pub(super) spans: SmallVec<[ProducerResultSpan; 4]>,
     pub(super) additional: usize,
+    /// Oldest spans the producer drops first to fit the span limit.
+    pub(super) evict: usize,
     pub(super) next_sequence: ProducerSequence,
     pub(super) next_offset: Offset,
     pub(super) last_stored_end: Offset,
@@ -330,6 +332,7 @@ impl CanonicalProducer {
         Ok(PreparedProducerResults {
             spans,
             additional,
+            evict: 0,
             next_sequence,
             next_offset,
             last_stored_end: if results.stored() == 0 {
@@ -341,6 +344,7 @@ impl CanonicalProducer {
     }
 
     pub(super) fn install_results(&mut self, prepared: PreparedProducerResults) {
+        self.evict_results(prepared.evict);
         for next in prepared.spans {
             if let Some(last) = self.results.back_mut()
                 && last.can_extend(next)
@@ -352,6 +356,19 @@ impl CanonicalProducer {
         }
         self.next_producer_sequence = prepared.next_sequence;
         self.last_stored_end = prepared.last_stored_end;
+    }
+
+    /// Drop the oldest `count` result spans: the floor rises to the first
+    /// kept span, or to the next sequence when none is kept.
+    pub(super) fn evict_results(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let floor = self
+            .results
+            .get(count)
+            .map_or(self.next_producer_sequence, |span| span.first_sequence);
+        self.expire_results(floor);
     }
 
     pub(super) fn expire_results(&mut self, floor: ProducerSequence) {

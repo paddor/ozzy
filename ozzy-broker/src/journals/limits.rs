@@ -376,10 +376,12 @@ fn check_write(
     Ok(())
 }
 
-/// Core image bound: fixed metadata room plus the most held scheduled records
-/// any `max_entries` allows. Lowering the limit on restart then still reads
-/// existing checkpoints; it only gates new schedules.
+/// Core image bound: fixed metadata room, every retry span the canonical
+/// limit allows, and the most held scheduled records any `max_entries`
+/// allows. Lowering the limit on restart then still reads existing
+/// checkpoints; it only gates new schedules.
 fn core_checkpoint_bytes(placement: &PartitionPlacement) -> Result<usize, &'static str> {
+    let spans = ozzy_runtime::replica_journal::retry_span_snapshot_bytes();
     placement
         .delay
         .map_or(Some(0), |_| {
@@ -387,8 +389,9 @@ fn core_checkpoint_bytes(placement: &PartitionPlacement) -> Result<usize, &'stat
                 .ok()
                 .and_then(|max_entries| DelayLimits { max_entries }.snapshot_bytes())
         })
+        .and_then(|held| held.checked_add(spans?))
         .and_then(|held| held.checked_add(CORE_CHECKPOINT_BYTES))
-        .ok_or("held scheduled records overflow the core checkpoint bound")
+        .ok_or("retry spans and held scheduled records overflow the core checkpoint bound")
 }
 
 fn delay_limits(placement: &PartitionPlacement) -> Option<DelayLimits> {
@@ -416,7 +419,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn checkpoint_bounds_ignore_the_held_record_limit() {
+    fn checkpoint_bounds_cover_every_retry_span_and_ignore_the_held_record_limit() {
         let placement = |delay| PartitionPlacement {
             topic: "orders".into(),
             partition: 0,
@@ -435,11 +438,14 @@ mod tests {
             })))
             .unwrap()
         };
+        // Every retry span fits, so retirement never builds an image past the
+        // bound.
+        let spans = 1_048_576 * 40;
         assert_eq!(
             core_checkpoint_bytes(&placement(None)).unwrap(),
-            CORE_CHECKPOINT_BYTES
+            CORE_CHECKPOINT_BYTES + spans
         );
-        assert_eq!(delay(8), CORE_CHECKPOINT_BYTES + 1_048_576 * 48);
+        assert_eq!(delay(8), CORE_CHECKPOINT_BYTES + spans + 1_048_576 * 48);
         assert_eq!(delay(8), delay(ozzy_config::MAX_DELAY_ENTRIES));
     }
 

@@ -144,6 +144,8 @@ pub(super) struct PreparedSchedule {
     span: ProducerResultSpan,
     time: u64,
     pending: Vec<(ReleaseKey, PendingSchedule)>,
+    /// Oldest spans the producer drops first to fit the span limit.
+    evict: usize,
 }
 
 /// Coordinates of one validated `Release`.
@@ -177,7 +179,11 @@ impl CanonicalState {
         {
             return Err(StateError::LimitExceeded("pending schedules"));
         }
-        self.check_retry_span_capacity(1)?;
+        let held = self
+            .require_partition(batch.partition)?
+            .producer(batch.producer_id)
+            .map_or(0, |producer| producer.result_spans().len());
+        let evict = self.retry_span_evictions(held, 1)?;
         let latest = time.saturating_add(delay.max_delay_millis.get());
         let pending = held_records(op_number, value, latest)?;
         let span = ProducerResultSpan {
@@ -195,6 +201,7 @@ impl CanonicalState {
                 span,
                 time,
                 pending,
+                evict,
             })),
             Vec::new(),
         ))
@@ -305,16 +312,16 @@ impl CanonicalState {
     fn install_schedule(&mut self, prepared: PreparedSchedule) -> Result<(), StateError> {
         let max_spans = self.limits.max_retry_spans;
         let state = self.partition_mut(prepared.partition)?;
-        state
-            .producer_mut(prepared.producer)?
-            .record_schedule(prepared.span, max_spans)?;
+        let producer = state.producer_mut(prepared.producer)?;
+        producer.evict_results(prepared.evict);
+        producer.record_schedule(prepared.span, max_spans)?;
         let delay = state.delay.as_mut().ok_or(StateError::DelayDisabled)?;
         delay.next_schedule = prepared.span.first_offset.get() + prepared.span.records;
         delay.time = prepared.time;
         if let ProducerResultSource::Scheduled { operation } = prepared.span.source {
             delay.hold(operation, prepared.pending);
         }
-        self.count_retry_spans(1, 0)
+        self.count_retry_spans(1, prepared.evict)
     }
 
     fn install_release(&mut self, prepared: PreparedRelease) -> Result<(), StateError> {

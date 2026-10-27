@@ -255,42 +255,57 @@ fn retention_cannot_destroy_another_writers_retry_evidence() {
 }
 
 #[test]
-fn retry_index_budget_is_aggregate_and_failure_is_atomic() {
+fn retry_index_budget_is_aggregate_and_a_writer_at_the_limit_gives_up_its_own() {
     let limits = StateLimits {
         max_retry_spans: 2,
-        max_producers: 2,
+        max_producers: 3,
         ..StateLimits::default()
     };
     let (mut state, mut index) = initialized(limits);
     assign(&mut state, &mut index, producer(), 0);
     assign(&mut state, &mut index, producer(), 1);
     assign(&mut state, &mut index, another_producer(), 0);
+    let third = ProducerId::from_bytes([0x66; 16]);
+    let OperationBody::OpenProducer(mut opened) = open() else {
+        unreachable!()
+    };
+    opened.producer_id = third;
+    opened.operation_id = operation(0x52);
+    apply(
+        &mut state,
+        &mut index,
+        7,
+        &OperationBody::OpenProducer(opened),
+    );
+    // A writer without retry history has none to give up.
     let before = state.clone();
-    let next = assigned(producer(), 3, 2, 3);
     assert_eq!(
-        state.prepare(7, &next, &index),
+        state.prepare(8, &assigned(third, 3, 0, 3), &index),
         Err(StateError::LimitExceeded("producer retry spans"))
     );
     assert_eq!(state, before);
-    let OperationBody::OpenProducer(mut third) = open() else {
+    let OperationBody::OpenProducer(mut fourth) = open() else {
         unreachable!()
     };
-    third.producer_id = ProducerId::from_bytes([0x66; 16]);
+    fourth.producer_id = ProducerId::from_bytes([0x67; 16]);
     assert_eq!(
-        state.prepare(7, &OperationBody::OpenProducer(third), &index),
+        state.prepare(8, &OperationBody::OpenProducer(fourth), &index),
         Err(StateError::LimitExceeded("producers"))
     );
-    apply(&mut state, &mut index, 7, &floor(producer(), 0, 2, 0x56));
-    apply(&mut state, &mut index, 8, &next);
+    // One with history drops its oldest span for the new one.
+    apply(&mut state, &mut index, 8, &assigned(producer(), 3, 2, 3));
+    let writer = state
+        .partition(partition())
+        .unwrap()
+        .producer(producer())
+        .unwrap();
+    assert_eq!(writer.producer_result_floor, ProducerSequence::new(2));
+    assert_eq!(writer.result_offset(ProducerSequence::ZERO), None);
     assert_eq!(
-        state
-            .partition(partition())
-            .unwrap()
-            .producer(producer())
-            .unwrap()
-            .result_offset(ProducerSequence::new(2)),
+        writer.result_offset(ProducerSequence::new(2)),
         Some(Offset::new(3))
     );
+    assert_eq!(restore_limited(&state, limits), state);
 }
 
 fn retire(writer: ProducerId, epoch: u64, next: u64) -> OperationBody<'static> {

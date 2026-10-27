@@ -2,7 +2,7 @@
 //! No command lane, task, file descriptor or execution pool is created here.
 
 mod config;
-pub use config::{DedupLimits, DelayLimits, OwnedConfig, dedup_limits};
+pub use config::{DedupLimits, DelayLimits, OwnedConfig, dedup_limits, retry_span_snapshot_bytes};
 pub(in crate::replica_journal) mod dedup;
 mod facts;
 pub use facts::{GroupSource, PartitionFacts};

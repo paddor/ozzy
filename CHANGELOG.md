@@ -15,6 +15,17 @@
   the maximum delay (NACK 21), with more records than the held-record limit
   (NACK 1), and back off while the partition is full (NACK 10).
 
+### Changed
+
+- At the limit of 1,048,576 retry ranges per journal, a producer's new range
+  drops its own oldest one and raises its retry floor, instead of refusing
+  the request. A producer without a range of its own is still refused.
+
+### Fixed
+
+- Checkpoints fit every retry range the limit allows. A partition with many
+  ranges no longer faults its journal when retention writes a checkpoint.
+
 ## [0.6.0] - 2026-10-26
 
 ### Breaking

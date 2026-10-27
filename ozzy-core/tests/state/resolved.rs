@@ -355,6 +355,64 @@ fn capacity_fences_counts_and_clock_errors_leave_the_image_unchanged() {
 }
 
 #[test]
+fn a_writer_at_the_span_limit_drops_its_oldest_but_keeps_the_span_it_extends() {
+    use AppendDisposition::{Duplicate, Stored};
+    let (mut state, mut identities) = setup(StateLimits {
+        max_retry_spans: 2,
+        ..StateLimits::default()
+    });
+    resolve(
+        &mut state,
+        &mut identities,
+        producer(),
+        10,
+        &[attempt(Duplicate, 0)],
+    );
+    resolve(
+        &mut state,
+        &mut identities,
+        producer(),
+        11,
+        &[attempt(Stored, 1)],
+    );
+    let writer = |state: &CanonicalState| {
+        state
+            .partition(partition())
+            .unwrap()
+            .producer(producer())
+            .unwrap()
+            .clone()
+    };
+    let current = writer(&state);
+    assert_eq!(current.producer_result_floor, ProducerSequence::new(1));
+    assert_eq!(current.result_outcome(ProducerSequence::ZERO), None);
+    assert_eq!(
+        current.result_outcome(ProducerSequence::new(1)),
+        Some(attempt(Duplicate, 0))
+    );
+    // The first result extends the newest span, so the oldest one goes.
+    resolve(
+        &mut state,
+        &mut identities,
+        producer(),
+        12,
+        &[attempt(Stored, 2), attempt(Duplicate, 0)],
+    );
+    let current = writer(&state);
+    assert_eq!(current.producer_result_floor, ProducerSequence::new(2));
+    assert_eq!(current.result_spans().len(), 2);
+    assert_eq!(
+        current.result_outcome(ProducerSequence::new(3)),
+        Some(attempt(Stored, 2))
+    );
+    // The snapshot counts the same spans.
+    assert_eq!(
+        restore(&state).partition(partition()),
+        state.partition(partition())
+    );
+}
+
+#[test]
 fn empty_legacy_append_cannot_advance_a_revision() {
     let (state, _) = setup(StateLimits::default());
     assert!(

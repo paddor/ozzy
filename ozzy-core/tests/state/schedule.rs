@@ -366,6 +366,30 @@ fn discarded_release_holds_its_records_again() {
 }
 
 #[test]
+fn a_writer_at_the_span_limit_drops_its_oldest_scheduled_result() {
+    let mut images = delayed_with(StateLimits {
+        max_retry_spans: 2,
+        ..StateLimits::default()
+    });
+    for sequence in 0..3 {
+        let body = schedule(sequence, sequence, 1_000, &[(sequence as u8 + 1, 5_000)]);
+        images.admit(sequence + 3, &body).unwrap();
+    }
+    let writer = images
+        .speculative()
+        .partition(partition())
+        .unwrap()
+        .producer(producer())
+        .unwrap();
+    assert_eq!(writer.producer_result_floor, ProducerSequence::new(1));
+    assert_eq!(writer.result_spans().len(), 2);
+    assert_eq!(writer.result_outcome(ProducerSequence::ZERO), None);
+    assert!(writer.result_outcome(ProducerSequence::new(2)).is_some());
+    // Held records stay held; only their retry history goes.
+    assert_eq!(held(&images).pending_len(), 3);
+}
+
+#[test]
 fn snapshot_restores_held_records_and_scheduled_results() {
     let mut images = delayed();
     images

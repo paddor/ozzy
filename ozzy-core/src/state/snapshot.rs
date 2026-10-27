@@ -38,6 +38,9 @@ pub const STATE_SNAPSHOT_HEADER_BYTES: usize = 256;
 /// Encoded snapshot bytes of one held scheduled record.
 pub const PENDING_SCHEDULE_SNAPSHOT_BYTES: usize = 48;
 
+/// Encoded snapshot bytes of one producer retry span.
+pub const RETRY_SPAN_SNAPSHOT_BYTES: usize = 40;
+
 const SNAPSHOT_MAGIC: &[u8; 8] = b"OZYSTA01";
 const SNAPSHOT_VERSION: u16 = 4;
 const PROGRESS_BYTES: usize = 48;

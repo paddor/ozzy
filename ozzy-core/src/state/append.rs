@@ -97,7 +97,7 @@ impl CanonicalState {
             }
             cursors.push(cursor);
         }
-        self.check_retry_span_budget(&cursors)?;
+        self.plan_retry_spans(&mut cursors)?;
         Ok((Mutation::Append(cursors), claims))
     }
 
@@ -118,7 +118,7 @@ impl CanonicalState {
             }
             cursors.push(self.append_cursor(batch)?);
         }
-        self.check_retry_span_budget(&cursors)?;
+        self.plan_retry_spans(&mut cursors)?;
         Ok(TransitionPlan {
             expected_revision: self.revision,
             op_number,
@@ -151,11 +151,21 @@ impl CanonicalState {
         if results.logical_time() < partition.dedup_time {
             return Err(StateError::MalformedBody("deduplication time regressed"));
         }
-        let prepared = partition
+        let producer = partition
             .producer(batch.producer_id)
-            .ok_or(StateError::ProducerMismatch)?
-            .prepare_results(batch.first_sequence, batch.first_offset, results, op_number)?;
-        self.check_retry_span_capacity(prepared.additional)?;
+            .ok_or(StateError::ProducerMismatch)?;
+        let mut prepared = producer.prepare_results(
+            batch.first_sequence,
+            batch.first_offset,
+            results,
+            op_number,
+        )?;
+        // The span its first result extends stays.
+        let kept = prepared.spans.len() - prepared.additional;
+        prepared.evict = self.retry_span_evictions(
+            producer.result_spans().len().saturating_sub(kept),
+            prepared.additional,
+        )?;
         Ok(TransitionPlan {
             expected_revision: self.revision,
             op_number,
@@ -217,24 +227,50 @@ impl CanonicalState {
             first_offset: batch.first_offset,
             records: count,
             new_span: producer.needs_result_span(batch.first_offset),
+            evict: false,
             next_sequence,
             next_offset,
         })
     }
 
-    fn check_retry_span_budget(&self, cursors: &[AppendCursor]) -> Result<(), StateError> {
-        let additional = cursors.iter().filter(|cursor| cursor.new_span).count();
-        self.check_retry_span_capacity(additional)
-    }
-
-    pub(super) fn check_retry_span_capacity(&self, additional: usize) -> Result<(), StateError> {
-        if self
-            .retry_span_count
-            .checked_add(additional)
-            .is_none_or(|total| total > self.limits.max_retry_spans)
-        {
-            return Err(StateError::LimitExceeded("producer retry spans"));
+    /// Charge each batch's new result span against the limit. At the limit,
+    /// a batch's producer drops its own oldest span for the new one.
+    fn plan_retry_spans(&self, cursors: &mut [AppendCursor]) -> Result<(), StateError> {
+        let mut total = self.retry_span_count;
+        for cursor in cursors.iter_mut().filter(|cursor| cursor.new_span) {
+            if total < self.limits.max_retry_spans {
+                total += 1;
+                continue;
+            }
+            let held = self
+                .partitions
+                .get(&cursor.partition)
+                .and_then(|partition| partition.producer(cursor.producer))
+                .map_or(0, |producer| producer.result_spans().len());
+            if held == 0 {
+                return Err(StateError::LimitExceeded("producer retry spans"));
+            }
+            cursor.evict = true;
         }
         Ok(())
+    }
+
+    /// Oldest spans a producer holding `held` drops so `additional` new ones
+    /// fit the limit. A producer gives up only its own retry history; one
+    /// without enough is refused.
+    pub(super) fn retry_span_evictions(
+        &self,
+        held: usize,
+        additional: usize,
+    ) -> Result<usize, StateError> {
+        let excess = self
+            .retry_span_count
+            .checked_add(additional)
+            .ok_or(StateError::LimitExceeded("producer retry spans"))?
+            .saturating_sub(self.limits.max_retry_spans);
+        if excess > held || additional > self.limits.max_retry_spans {
+            return Err(StateError::LimitExceeded("producer retry spans"));
+        }
+        Ok(excess)
     }
 }

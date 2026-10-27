@@ -20,7 +20,7 @@ use crate::state::{
 
 const PARTITION_BYTES: usize = 144;
 const PRODUCER_BYTES: usize = 80;
-const SPAN_BYTES: usize = 40;
+const SPAN_BYTES: usize = super::RETRY_SPAN_SNAPSHOT_BYTES;
 const PENDING_BYTES: usize = super::PENDING_SCHEDULE_SNAPSHOT_BYTES;
 
 pub(super) async fn partition_bytes(

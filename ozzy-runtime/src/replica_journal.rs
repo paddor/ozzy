@@ -32,7 +32,7 @@ pub use owned::{
     RecoveringJournal as OwnedRecoveringJournal, RecoveryGenerations as OwnedRecoveryGenerations,
     RecoveryOpen as OwnedRecoveryOpen, ReleaseTurn, ReplayRequest as OwnedReplayRequest,
     StorageCleanup as OwnedStorageCleanup, WriteStep as OwnedWriteStep,
-    WrittenRecords as OwnedWrittenRecords, dedup_limits,
+    WrittenRecords as OwnedWrittenRecords, dedup_limits, retry_span_snapshot_bytes,
 };
 mod assignment;
 mod producer;

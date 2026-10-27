@@ -224,6 +224,10 @@ part. General descriptors use:
 - Exact sequence-to-offset retry ranges survive checkpoints and leader changes.
   Ranges merge only when both sequences and offsets are adjacent. Expired retry
   results fail explicitly.
+- At most 1,048,576 ranges are kept across a journal's partitions, and
+  checkpoints fit them all. At that limit a new range drops the oldest range
+  of the same producer and raises its retry floor; a producer without one is
+  refused.
 - A leader retires sessions idle for `producer_idle_secs` with their ranges.
   Idleness is the leader's own observation: a new leader starts every session
   with a full expiry. The partition keeps the highest retired epoch, and a

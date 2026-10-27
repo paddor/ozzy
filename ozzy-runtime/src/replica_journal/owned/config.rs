@@ -24,6 +24,13 @@ impl DelayLimits {
     }
 }
 
+/// Core snapshot bytes of every retry span the canonical limit allows.
+pub fn retry_span_snapshot_bytes() -> Option<usize> {
+    ozzy_core::state::StateLimits::default()
+        .max_retry_spans
+        .checked_mul(ozzy_core::state::RETRY_SPAN_SNAPSHOT_BYTES)
+}
+
 /// Size a partition's identity reservation for its live pipeline. Pending
 /// identities stay charged until application, and a backup can hold its
 /// whole retained capacity accepted but not yet applied.
