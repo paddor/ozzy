@@ -80,14 +80,14 @@ fn run_retention_jobs(controller: &mut Controller, journal: &mut OwnedJournal) {
     }
 }
 
-fn roll(controller: &mut Controller, journal: &mut OwnedJournal) {
+pub(super) fn roll(controller: &mut Controller, journal: &mut OwnedJournal) {
     let work = journal.begin_roll(8).unwrap();
     let done = drive(controller, work.publish());
     journal.complete_roll(done).unwrap();
 }
 
 /// Confirm a byte retention target for the partition at revision one.
-fn limit_bytes(
+pub(super) fn limit_bytes(
     controller: &mut Controller,
     journal: &mut OwnedJournal,
     driver: &mut Driver,

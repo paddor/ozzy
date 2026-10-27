@@ -121,7 +121,7 @@ fn decode_body(
     }
     if !matches!(
         operation.kind,
-        OperationKind::Append | OperationKind::ResolvedAppend
+        OperationKind::Append | OperationKind::ResolvedAppend | OperationKind::Release
     ) {
         return Err(IndexedReadError::NotAppend);
     }

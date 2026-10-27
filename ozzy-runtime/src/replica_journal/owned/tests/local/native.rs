@@ -534,7 +534,8 @@ fn native_scheduled_append_confirms_schedule_sequences_and_refuses_late_due_time
     let mut intake = intake(&mut actor);
     let peer = link(71, 81);
     let mut output = Vec::new();
-    // The actor clock reads 777.
+    // The actor clock reads 777, so the record due at 5 releases at once,
+    // at offset 0, ahead of the immediate record.
     let requests = [
         append_due(
             actor.authority_hint().authority,
@@ -572,7 +573,7 @@ fn native_scheduled_append_confirms_schedule_sequences_and_refuses_late_due_time
             .collect::<Vec<_>>(),
         [
             (append::AppendDisposition::Scheduled, 0, 0, 2),
-            (append::AppendDisposition::Stored, 0, 2, 3),
+            (append::AppendDisposition::Stored, 1, 2, 3),
         ]
     );
     let rejections: Vec<_> = output

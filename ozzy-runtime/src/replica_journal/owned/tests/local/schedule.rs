@@ -4,6 +4,8 @@ use ozzy_core::state::ProducerResultSource;
 use ozzy_journal::operation::{OperationKind, OperationLimits, decode_operation_body};
 use ozzy_proto::{ProducerSequence, append::AppendDisposition};
 
+mod release;
+
 const NOW: u64 = 10_000;
 
 fn delayed(max_entries: usize) -> (Controller, OwnedJournal, Driver) {
@@ -330,4 +332,74 @@ fn leader_refuses_late_due_times_full_capacity_and_plain_partitions() {
         rejection(plain),
         JournalError::ProducerAppend(AppendAdmissionError::DelayDisabled)
     ));
+}
+
+/// Pump the actor and run its storage jobs until `done`.
+fn run_until(
+    controller: &mut Controller,
+    actor: &mut crate::replica_actor::LocalActor,
+    mut done: impl FnMut(&mut crate::replica_actor::LocalActor) -> bool,
+) {
+    for _ in 0..10000 {
+        super::actor::pump(actor);
+        for (id, _) in controller.jobs() {
+            controller.execute(id, Effect::Normal).unwrap();
+            controller.deliver(id).unwrap();
+        }
+        if done(actor) {
+            return;
+        }
+    }
+    panic!("actor did not progress");
+}
+
+#[test]
+fn local_actor_releases_held_records_at_their_due_times() {
+    use std::time::Duration;
+    let clock = std::rc::Rc::new(std::cell::Cell::new(NOW));
+    let (mut controller, io) = setup();
+    let mut actor = super::actor::actor_with_options(
+        &mut controller,
+        io,
+        1,
+        &[12, 30],
+        partition(),
+        PartitionId::ZERO,
+        super::actor::ActorOptions {
+            delay: Some(DelayLimits { max_entries: 16 }),
+            clock: Some(clock.clone()),
+            ..Default::default()
+        },
+    );
+    let mut lane = actor.take_submitter().unwrap();
+    let mut buffer = actor.lease_proposal_buffer().unwrap();
+    buffer.prepare_append(request(12, 0, 2)).unwrap();
+    buffer.schedule(&[NOW + 50, NOW + 10]).unwrap();
+    let mut pending = Box::pin(lane.try_submit(buffer).unwrap());
+    run_until(&mut controller, &mut actor, |_| {
+        let Poll::Ready(reply) = poll(pending.as_mut()) else {
+            return false;
+        };
+        assert!(matches!(
+            reply.unwrap().outcome,
+            crate::replica_actor::ProposalOutcome::Committed { .. }
+        ));
+        true
+    });
+    let at = |actor: &crate::replica_actor::LocalActor| {
+        actor
+            .facts(partition())
+            .map(|facts| (facts.next_offset, actor.next_deadline(Duration::ZERO)))
+    };
+    // The actor sleeps until the first due time, on its own clock.
+    let first = Some((Offset::ZERO, Some(Duration::from_millis(10))));
+    run_until(&mut controller, &mut actor, |actor| at(actor) == first);
+    clock.set(NOW + 10);
+    let second = Some((Offset::new(1), Some(Duration::from_millis(40))));
+    run_until(&mut controller, &mut actor, |actor| at(actor) == second);
+    clock.set(NOW + 50);
+    run_until(&mut controller, &mut actor, |actor| {
+        at(actor) == Some((Offset::new(2), None))
+    });
+    super::actor::close(&mut controller, actor);
 }

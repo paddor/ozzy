@@ -67,6 +67,7 @@ impl ReplicaActor {
             bindings: peer_bindings(configuration, local, config, Some(work.receive_epoch()))?,
             startup_probe: startup_probe(config, source, &driver, &mut ids)?,
             maintenance: maintenance::Turns::new(config.retention_interval),
+            releases: super::release_turns::Releases::default(),
             recovery_required: false,
             donors: None,
             more_work: false,

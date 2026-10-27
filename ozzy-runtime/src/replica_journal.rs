@@ -30,7 +30,7 @@ pub use owned::{
     PreparedRoll as OwnedPreparedRoll, PreparedStorageValidation as OwnedPreparedStorageValidation,
     PreparedSync as OwnedPreparedSync, PreparedWrite as OwnedPreparedWrite,
     RecoveringJournal as OwnedRecoveringJournal, RecoveryGenerations as OwnedRecoveryGenerations,
-    RecoveryOpen as OwnedRecoveryOpen, ReplayRequest as OwnedReplayRequest,
+    RecoveryOpen as OwnedRecoveryOpen, ReleaseTurn, ReplayRequest as OwnedReplayRequest,
     StorageCleanup as OwnedStorageCleanup, WriteStep as OwnedWriteStep,
     WrittenRecords as OwnedWrittenRecords, dedup_limits,
 };
@@ -384,6 +384,25 @@ impl ReplicaJournal {
                 done,
             })
         })
+    }
+
+    /// Pick due held records and build their `Release`. The `Schedule` reads
+    /// run beside writes; the proposal goes through ordinary validation.
+    pub fn release_turn(
+        &mut self,
+        ticket: ozzy_replication::driver::ValidationTicket,
+    ) -> Result<JournalCompletion<ReleaseTurn>, SubmitError> {
+        self.command(commands::Gate::Free, |done| {
+            commands::Action::Maintenance(commands::MaintenanceAction::Release { ticket, done })
+        })
+    }
+
+    /// Time until the earliest committed held record is due, by the journal
+    /// clock. `None` while nothing is held or the owner runs a command.
+    pub(crate) fn release_wait(&self) -> Option<std::time::Duration> {
+        self.execution
+            .release_wait()
+            .map(std::time::Duration::from_millis)
     }
 
     /// Plan one sealed segment or retire a previously confirmed prefix.

@@ -30,6 +30,7 @@ impl LocalActor {
         changed |= self.poll_sync(cx)?;
         if self.journal.available_command_slots() != 0 {
             changed |= self.poll_pending(cx)?;
+            changed |= self.poll_release(cx)?;
         }
         changed |= self.reply_committed()?;
         changed |= self.schedule()?;
@@ -96,6 +97,17 @@ impl LocalActor {
                 through: live.through,
             },
         );
+        Ok(true)
+    }
+
+    /// Queue the proposal of a finished release step.
+    fn poll_release(&mut self, cx: &mut Context<'_>) -> Result<bool, ActorError> {
+        let Some(Poll::Ready(result)) = self.releases.step().map(|step| Pin::new(step).poll(cx))
+        else {
+            return Ok(false);
+        };
+        self.releases
+            .complete(result, self.now, &mut self.proposals)?;
         Ok(true)
     }
 

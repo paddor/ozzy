@@ -73,6 +73,12 @@ impl Execution {
             Self::Recovery(_) => false,
         }
     }
+    pub(super) fn release_wait(&self) -> Option<u64> {
+        match self {
+            Self::Normal(owner) => owner.release_wait(),
+            Self::Recovery(_) => None,
+        }
+    }
     pub(super) fn validation_ready(&self, buffer: &super::AppendBuffer) -> bool {
         match self {
             Self::Normal(owner) => owner.validation_ready(buffer),

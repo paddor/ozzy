@@ -126,7 +126,9 @@ impl ReplicaActor {
             (
                 Maintenance::Retention,
                 self.maintenance.retention.at().filter(|_| {
-                    !self.journal.retention_busy() && !self.work.proposals.holds_maintenance()
+                    !self.journal.retention_busy()
+                        && !self.work.proposals.holds_maintenance()
+                        && !self.releases.running()
                 }),
             ),
         ]
@@ -281,6 +283,31 @@ impl ReplicaActor {
         }
         self.maintenance.metadata_cleanup = Some(Periodic::new(interval, budget));
         Ok(self)
+    }
+
+    /// When the primary's next release step is due.
+    pub(super) fn release_deadline(&self, now: Duration) -> Option<Duration> {
+        self.releasing()
+            .then(|| self.releases.at(&self.journal, now))
+            .flatten()
+    }
+
+    /// Start a due release step. Its reads run beside writes, so it waits
+    /// for no settled journal. `true` when it started.
+    pub(super) fn schedule_release(&mut self, now: Duration) -> Result<bool, ActorError> {
+        if !self.releasing() || !self.releases.due(&self.journal, &self.work.proposals, now) {
+            return Ok(false);
+        }
+        let ticket = self.driver.begin_validation()?;
+        self.releases.start(self.journal.release_turn(ticket)?);
+        Ok(true)
+    }
+
+    /// Only a normal primary releases held records.
+    fn releasing(&self) -> bool {
+        self.driver.normal().is_some_and(|normal| {
+            self.configuration.primary(normal.snapshot().scope.view) == self.local
+        })
     }
 
     fn maintenance_ready(&self, now: Duration, next: Duration) -> bool {

@@ -208,6 +208,10 @@ part. General descriptors use:
   the sequence to its schedule sequence.
 - Retention keeps the oldest `Schedule` operation that still holds a record,
   and every later segment.
+- Readers and indexes treat a `Release` batch like an APPEND batch.
+  `Schedule` records have no offsets and are never indexed.
+- Scheduled payloads are raw, so a release can copy any prefix of held
+  records without recompressing.
 
 ## Record identity and deduplication
 

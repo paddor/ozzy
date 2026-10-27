@@ -215,6 +215,9 @@ impl OwnedJournal {
         if buffer.scheduled().is_some() {
             self.schedule_proposal(buffer, timestamp_millis)?;
         }
+        if buffer.is_release() {
+            self.release_proposal(buffer, timestamp_millis)?;
+        }
         self.check_room(buffer)?;
         if buffer.is_producer() && self.dedup.limits.is_some() {
             let rewrite = self.resolve_producer_ids(ticket, buffer)?;

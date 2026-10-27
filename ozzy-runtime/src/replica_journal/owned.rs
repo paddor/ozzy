@@ -36,7 +36,9 @@ mod room;
 mod spare;
 pub use replay::{CompletedReplay, PreparedReplay, ReplayRequest};
 mod receiving;
+pub(in crate::replica_journal) mod release;
 pub use receiving::{RecoveringJournal, RecoveryGenerations, RecoveryOpen};
+pub use release::ReleaseTurn;
 mod validation;
 mod writeback;
 pub use writeback::{

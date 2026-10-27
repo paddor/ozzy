@@ -55,6 +55,17 @@ impl Writeback {
             .map(|(operation, prepared)| (operation, prepared.prefix()))
     }
 
+    /// Shared body bytes of an operation still in writeback.
+    pub(super) fn operation_bytes(&self, number: u64) -> Option<bytes::Bytes> {
+        self.queue.iter().find_map(|entry| {
+            entry
+                .append
+                .operations()
+                .find(|operation| operation.op_number == number)
+                .map(|operation| entry.append.payload(operation.body))
+        })
+    }
+
     pub(super) fn seek_records(&self) -> Vec<PreparedOperationRecords> {
         self.queue
             .iter()

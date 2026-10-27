@@ -9,6 +9,7 @@ impl ReplicaActor {
     pub(in crate::replica_actor) fn disk_pending(&self) -> bool {
         self.pending.is_some()
             || self.pending_replay.is_some()
+            || self.releases.running()
             || self.pending_sync.is_some()
             || !self.pending_persistence.is_empty()
     }
@@ -80,6 +81,9 @@ impl ReplicaActor {
             result = present(self.pending_replay.as_mut().map(super::PendingReplay::wait)), if available && self.pending_replay.is_some() => {
                 self.pending_replay = None;
                 self.complete(result?, now)?;
+            }
+            result = present(self.releases.step()), if available && self.releases.running() => {
+                self.releases.complete(result, now, &mut self.work.proposals)?;
             }
             changed = self.journal.availability_changed(available) => {
                 changed?;

@@ -38,6 +38,19 @@ pub(super) fn seek(
     )
 }
 
+pub(super) fn release(
+    read: journal::owned::release::ReleaseRead,
+    done: Reply<journal::ReleaseTurn>,
+    permit: OwnedSemaphorePermit,
+) -> Job {
+    installed(
+        read.execute(),
+        done,
+        permit,
+        journal::OwnedJournal::complete_release,
+    )
+}
+
 pub(super) fn sync(
     state: &mut State,
     ticket: ozzy_replication::SyncTicket,

@@ -108,6 +108,7 @@ pub fn derive_index_entries(
     let batches = match &body {
         OperationBody::Append(append) => append.batches.as_slice(),
         OperationBody::ResolvedAppend(append) => std::slice::from_ref(&append.batch),
+        OperationBody::Release(release) => std::slice::from_ref(&release.batch),
         _ => {
             return Ok(DerivedIndexEntries {
                 location,

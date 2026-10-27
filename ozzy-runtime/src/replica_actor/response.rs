@@ -17,9 +17,9 @@ pub(super) fn rejection(error: &JournalError) -> (u16, RetryClass) {
     match error {
         JournalError::ProducerAppend(error) => match error {
             AppendAdmissionError::Authority => (5, RetryClass::AfterAuthorityRefresh),
-            AppendAdmissionError::Policy | AppendAdmissionError::DelayDisabled => {
-                (2, RetryClass::Permanent)
-            }
+            AppendAdmissionError::Policy
+            | AppendAdmissionError::DelayDisabled
+            | AppendAdmissionError::CompressedSchedule => (2, RetryClass::Permanent),
             AppendAdmissionError::UnknownPartition | AppendAdmissionError::Fenced => {
                 (6, RetryClass::Permanent)
             }

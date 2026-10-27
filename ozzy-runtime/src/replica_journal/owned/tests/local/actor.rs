@@ -3,10 +3,12 @@ use crate::replica_actor::{LocalActor, LocalActorConfig, ProposalOutcome};
 use ozzy_journal::operation::OperationKind;
 
 /// Optional actor setup beyond its partition and writers.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub(super) struct ActorOptions<'a> {
     pub memory: Option<&'a crate::memory::Owner>,
     pub delay: Option<crate::replica_journal::DelayLimits>,
+    /// Journal clock in Unix milliseconds; 777 when absent.
+    pub clock: Option<std::rc::Rc<std::cell::Cell<u64>>>,
 }
 
 pub(super) fn actor(controller: &mut Controller, io: Local, id: u8) -> LocalActor {
@@ -97,7 +99,7 @@ pub(super) fn actor_with_options(
             },
             ..Default::default()
         },
-        || 777,
+        move || options.clock.as_ref().map_or(777, |clock| clock.get()),
     )
     .unwrap()
 }

@@ -1,5 +1,6 @@
 //! A fresh scheduled batch is checked against its partition's delay state,
-//! then becomes a `Schedule` at the next schedule sequences.
+//! then becomes a `Schedule` at the next schedule sequences. A `Release`
+//! takes the partition's next offsets.
 
 use super::super::{AppendBuffer, JournalError, OwnedJournal};
 use crate::replica_journal::{AppendAdmissionError, producer};
@@ -40,5 +41,27 @@ impl OwnedJournal {
             return Err(AppendAdmissionError::DueOutOfRange.into());
         }
         buffer.convert_schedule(delay.next_schedule, time)
+    }
+
+    /// Place a broker-built `Release` at the partition's next offset. Its
+    /// time covers its last record's release key and never goes below the
+    /// latest schedule or release.
+    pub(super) fn release_proposal(
+        &self,
+        buffer: &mut AppendBuffer,
+        now_millis: u64,
+    ) -> Result<(), JournalError> {
+        let (partition, through) = buffer.release_target()?;
+        let state = self
+            .images()?
+            .speculative()
+            .partition(partition)
+            .ok_or(AppendAdmissionError::UnknownPartition)?;
+        let delay = state
+            .delay
+            .as_ref()
+            .ok_or(AppendAdmissionError::DelayDisabled)?;
+        let time = now_millis.max(delay.time).max(through);
+        buffer.place_release(state.next_offset.get(), time)
     }
 }

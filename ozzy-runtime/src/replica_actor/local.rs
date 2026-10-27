@@ -2,6 +2,7 @@
 //! Transport and shared broker dispatch remain outside partition authority.
 
 mod progress;
+use super::release_turns::Releases;
 use super::retention_turns::{RetentionDue, RetentionStep};
 use super::{
     ActorError, ProposalOutcome, ProposalSubmitter,
@@ -81,6 +82,7 @@ pub struct LocalActor {
     journal: ReplicaJournal,
     now: std::time::Duration,
     retention: RetentionDue,
+    releases: Releases,
     foreground_turn_due: bool,
     driver: Driver,
     config: LocalActorConfig,
@@ -113,7 +115,7 @@ impl LocalActor {
     }
 
     /// Committed facts of `partition` for diagnostics; `None` while busy.
-    pub(super) fn facts(
+    pub(crate) fn facts(
         &self,
         partition: ozzy_proto::PartitionIncarnation,
     ) -> Option<crate::replica_journal::PartitionFacts> {
@@ -209,6 +211,7 @@ impl LocalActor {
             journal,
             now: std::time::Duration::ZERO,
             retention: RetentionDue::new(config.retention_interval),
+            releases: Releases::default(),
             foreground_turn_due: false,
             driver,
             config,
@@ -322,6 +325,7 @@ impl LocalActor {
     fn settled(&self) -> bool {
         let state = self.driver.snapshot();
         self.pending.is_none()
+            && !self.releases.running()
             && self.persistence.is_empty()
             && self.sync.is_none()
             && state.journal.durable == self.evidence_through
@@ -389,6 +393,7 @@ impl LocalActor {
             && self.retention.due(self.now)
             && !self.proposals.blocks_maintenance()
             && !self.proposals.holds_maintenance()
+            && !self.releases.running()
             && !self.journal.retention_busy()
         {
             let Some(step) = self.retention.start(self.now, self.settled(), true) else {
@@ -398,6 +403,17 @@ impl LocalActor {
             return Ok(true);
         }
         Ok(self.schedule_proposal()? | changed)
+    }
+
+    /// Start a due release step. Its reads run beside writes. `true` when
+    /// it started.
+    fn start_release(&mut self) -> Result<bool, ActorError> {
+        if !self.releases.due(&self.journal, &self.proposals, self.now) {
+            return Ok(false);
+        }
+        let ticket = self.driver.begin_validation()?;
+        self.releases.start(self.journal.release_turn(ticket)?);
+        Ok(true)
     }
 
     /// Refuse one unadmitted proposal while closing. `true` when one was.
@@ -436,6 +452,9 @@ impl LocalActor {
     }
 
     fn schedule_proposal(&mut self) -> Result<bool, ActorError> {
+        if self.start_release()? {
+            return Ok(true);
+        }
         let state = self.driver.snapshot();
         if let Some(buffer) = self.proposals.start_maintenance() {
             self.pending = Some(Pending::Propose(
@@ -481,10 +500,11 @@ impl LocalActor {
         self.now = now;
     }
 
-    /// The next retention turn or durable evidence publication.
-    pub(super) fn next_deadline(&self, now: std::time::Duration) -> Option<std::time::Duration> {
+    /// The next retention turn, release, or durable evidence publication.
+    pub(crate) fn next_deadline(&self, now: std::time::Duration) -> Option<std::time::Duration> {
         super::deadline::Earliest::after(now)
             .at(self.retention.at())
+            .at(self.releases.at(&self.journal, now))
             .at(self.evidence_deadline())
             .get()
     }

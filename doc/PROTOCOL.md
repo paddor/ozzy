@@ -275,9 +275,10 @@ APPEND:
   earlier successful attempt.
 - Tag 2 is a scheduled APPEND: the same layout, then one due time `u64` per
   record, in absolute Unix milliseconds. Readers see its records only once
-  due. The partition must enable delay (else code 2). A due time past
-  acceptance plus the maximum delay fails with code 21; a full schedule
-  capacity with code 10. A retry must repeat the tag and due times.
+  due. The partition must enable delay and the payload must be raw (else
+  code 2). A due time past acceptance plus the maximum delay fails with
+  code 21; a full schedule capacity with code 10. A retry must repeat the
+  tag and due times.
 
 List-form APPENDED has a codec, but brokers do not send it: tag, Authority,
 partition, owner epoch, AppendKey, first offset `u64`, count `u32`, achieved

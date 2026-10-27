@@ -8,8 +8,8 @@ use crate::OperationLocation;
 use ozzy_journal::operation::{
     AppendSummary, OperationHeader, OperationKind, OperationLimits, ResolvedAppendView,
     ValidatedWireAppend, decode_append_summary_and_batches,
-    decode_append_summary_and_batches_with_validated_payload, decode_resolved_append,
-    validate_operation_body,
+    decode_append_summary_and_batches_with_validated_payload, decode_release_batch,
+    decode_resolved_append, validate_operation_body,
 };
 use ozzy_proto::{Offset, PartitionIncarnation};
 
@@ -141,6 +141,15 @@ impl PreparedOperationRecords {
             let view = decode_resolved_append(&body, limits)?;
             return Self::new_resolved_append(header, body.clone(), &view);
         }
+        if header.kind == OperationKind::Release {
+            let batch = cache_batch(&body, &decode_release_batch(&body, limits)?)?;
+            return Ok(Self {
+                header,
+                body,
+                shared_backing_bytes: None,
+                batches: vec![batch].into(),
+            });
+        }
         validate_operation_body(header.kind, &body, limits)?;
         Ok(Self {
             header,
@@ -264,7 +273,7 @@ impl PreparedOperationRecords {
     pub(crate) fn bind(&self, location: OperationLocation) -> Option<Arc<CachedOperation>> {
         matches!(
             self.header.kind,
-            OperationKind::Append | OperationKind::ResolvedAppend
+            OperationKind::Append | OperationKind::ResolvedAppend | OperationKind::Release
         )
         .then(|| {
             Arc::new(CachedOperation {

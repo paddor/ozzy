@@ -151,6 +151,7 @@ impl Work {
                                 ozzy_journal::operation::OperationKind::Append
                                     | ozzy_journal::operation::OperationKind::ResolvedAppend
                                     | ozzy_journal::operation::OperationKind::Schedule
+                                    | ozzy_journal::operation::OperationKind::Release
                             )
                         }),
                         packets: live.packets,

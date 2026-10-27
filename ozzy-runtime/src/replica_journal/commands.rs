@@ -116,6 +116,10 @@ pub(super) enum MaintenanceAction {
         leader: bool,
         done: completion::Sender<Result<super::IdentityRetention, JournalError>>,
     },
+    Release {
+        ticket: ValidationTicket,
+        done: completion::Sender<Result<super::ReleaseTurn, JournalError>>,
+    },
     CleanupOrphans {
         ticket: ValidationTicket,
         budget: ozzy_journal_segment::MaintenanceBudget,

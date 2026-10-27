@@ -294,6 +294,12 @@ On the SDK:
 - A periodic safety sweep visits every partition. Work that only the sweep
   finds counts as `partition_sweep_progress`; a nonzero value means a missed
   wakeup.
+- A partition with held scheduled records also wakes when the earliest
+  committed one is due, by the journal clock. Only the primary releases,
+  one step at a time: the owner picks the due prefix, a detached job reads
+  its `Schedule` operations beside writes, and the `Release` validates
+  ahead of queued producer requests. One step fills at most one proposal
+  arena from at most 64 `Schedule` operations.
 
 ## Storage backends
 

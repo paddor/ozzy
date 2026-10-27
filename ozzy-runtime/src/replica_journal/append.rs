@@ -6,6 +6,7 @@ pub(in crate::replica_journal) mod dedup;
 mod metadata;
 mod producer;
 mod progress;
+mod release;
 pub(in crate::replica_journal) use progress::JoinedProgress;
 mod retained;
 pub(in crate::replica_journal) use retained::RetainedAppend;

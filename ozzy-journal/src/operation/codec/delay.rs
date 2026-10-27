@@ -5,10 +5,12 @@
 
 use super::AppendTotals;
 use super::append::{decode_append_batch, encode_append_batch};
-use super::primitives::{Encoder, ReadFields, Reader, validate_position_count};
+use super::primitives::{
+    Encoder, ReadFields, Reader, enforce_limit, validate_limits, validate_position_count,
+};
 use crate::operation::{
-    AppendBatch, OperationCodecError, OperationLimits, OperationOutput, Release, ReleaseKey,
-    Schedule,
+    AppendBatch, AppendBatchView, OperationCodecError, OperationLimits, OperationOutput, Release,
+    ReleaseKey, Schedule,
 };
 
 pub(super) fn encode_schedule(
@@ -75,6 +77,29 @@ pub(super) fn decode_release<'a, const MATERIALIZE: bool, const VALIDATE_PREPARE
             schedule: decoder.u64()?,
         },
     })
+}
+
+/// Validate a whole `Release` body and view its batch, for readers. Records
+/// stay borrowed; nothing is materialized.
+pub fn decode_release_batch(
+    input: &[u8],
+    limits: OperationLimits,
+) -> Result<AppendBatchView<'_>, OperationCodecError> {
+    validate_limits(limits)?;
+    enforce_limit("operation body bytes", input.len(), limits.max_body_bytes)?;
+    let mut decoder = Reader::new(input);
+    if decoder.count("append batch count", limits.max_append_batches)? != 1 {
+        return Err(OperationCodecError::InvalidSchedule);
+    }
+    let (_, view) = decode_append_batch::<false, true, false>(
+        &mut decoder,
+        &mut AppendTotals::new(limits),
+        None,
+    )?;
+    decoder.u64()?;
+    decoder.u64()?;
+    decoder.finish()?;
+    Ok(view)
 }
 
 fn encode_batch(

@@ -9,6 +9,7 @@ use omq_tokio::Message;
 use ozzy_proto::LinkSessionId;
 mod barriers;
 mod dedup;
+mod delay;
 mod identities;
 mod maintenance;
 mod recovery;
@@ -271,6 +272,7 @@ struct ActorSettings {
     identities: usize,
     sessions: [LinkSessionId; 3],
     deduplication: Option<ozzy_core::dedup::Limits>,
+    delay: Option<crate::replica_journal::DelayLimits>,
     retention_interval: Option<Duration>,
 }
 
@@ -280,6 +282,7 @@ impl Default for ActorSettings {
             identities: 64,
             sessions: actor_config().sessions,
             deduplication: None,
+            delay: None,
             retention_interval: None,
         }
     }
@@ -304,6 +307,7 @@ fn configured_actor(
     config.identity.replica_node_id = NodeId::from_bytes([broker + 1; 16]);
     config.append_buffers = 12;
     config.deduplication = settings.deduplication;
+    config.delay = settings.delay;
     config.recovery.retained_identities = if broker == leader {
         settings.identities
     } else {

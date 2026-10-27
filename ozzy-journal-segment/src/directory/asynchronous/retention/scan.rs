@@ -4,7 +4,7 @@
 use super::super::{DirectoryError, Journal, SegmentReference, groups::GroupScope};
 use crate::{CodecError, DecodedOperation, RetentionFloors};
 use ozzy_journal::operation::{
-    OperationKind, decode_append_summary_and_batches, decode_resolved_append,
+    OperationKind, decode_append_summary_and_batches, decode_release_batch, decode_resolved_append,
 };
 use ozzy_proto::{Offset, PartitionIncarnation};
 
@@ -87,6 +87,9 @@ fn fold_retention(
         OperationKind::Append => decode_append_summary_and_batches(&operation.body, limits)?.1,
         OperationKind::ResolvedAppend => {
             smallvec::smallvec![decode_resolved_append(&operation.body, limits)?.batch]
+        }
+        OperationKind::Release => {
+            smallvec::smallvec![decode_release_batch(&operation.body, limits)?]
         }
         _ => return Ok(()),
     };

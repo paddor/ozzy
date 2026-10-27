@@ -70,6 +70,9 @@ pub enum AppendAdmissionError {
     /// The partition already holds its maximum of scheduled records.
     #[error("scheduled-record capacity is full")]
     ScheduleCapacity,
+    /// Scheduled records must arrive raw, so a release can copy any prefix.
+    #[error("scheduled records use a whole-payload codec")]
+    CompressedSchedule,
 }
 
 /// Reusable bounded canonical bodies without caller-selected consensus coordinates.
@@ -133,6 +136,11 @@ impl ProposalBuffer {
         request: ozzy_proto::append::ValidatedAppend<'_>,
     ) -> Result<(), JournalError> {
         let authority = request.authority;
+        if request.due_millis.is_some()
+            && request.payload_encoding != ozzy_proto::append::PayloadEncoding::Raw
+        {
+            return Err(AppendAdmissionError::CompressedSchedule.into());
+        }
         self.prepare_wire_append(request)?;
         if let Some(due_millis) = request.due_millis {
             self.0.schedule(due_millis.iter())?;
