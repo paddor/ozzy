@@ -99,7 +99,7 @@ pub use identity_index::asynchronous::{
 };
 pub use index::{
     DerivedIndexEntries, IndexError, MessageIndexEntry, OffsetIndexEntry, OperationIndexEntry,
-    OperationLocation, RecordLocation, derive_index_entries,
+    OperationLocation, RecordLocation, ScheduleIndexEntry, derive_index_entries,
 };
 pub use index_builder::{IndexBuildError, IndexBuildLimits, SegmentIndex, segment_index_name};
 pub use index_catalog::{
@@ -109,8 +109,8 @@ pub use index_catalog::{
 pub use index_file::{
     INDEX_HEADER_BYTES, IndexEntries, IndexFileError, IndexLimits, IndexSource,
     MESSAGE_INDEX_ENTRY_BYTES, OFFSET_INDEX_ENTRY_BYTES, OPERATION_INDEX_ENTRY_BYTES,
-    OPERATION_LOCATION_BYTES, SegmentIndexImage, SegmentIndexView, decode_segment_index,
-    encode_segment_index,
+    OPERATION_LOCATION_BYTES, SCHEDULE_INDEX_ENTRY_BYTES, SegmentIndexImage, SegmentIndexView,
+    decode_segment_index, encode_segment_index,
 };
 pub use journal_index::asynchronous::Snapshot as JournalIndexSnapshot;
 pub use journal_index::seek::SeekQuery;

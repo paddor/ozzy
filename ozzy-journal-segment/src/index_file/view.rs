@@ -3,15 +3,21 @@
 
 use super::{
     IndexLayout, IndexSource, MESSAGE_INDEX_ENTRY_BYTES, OFFSET_INDEX_ENTRY_BYTES,
-    OPERATION_INDEX_ENTRY_BYTES, OPERATION_LOCATION_BYTES,
-    order::{binary_search_section, compare_message_key, compare_offset_key, lower_bound_section},
+    OPERATION_INDEX_ENTRY_BYTES, OPERATION_LOCATION_BYTES, SCHEDULE_INDEX_ENTRY_BYTES,
+    order::{
+        binary_search_section, compare_message_key, compare_offset_key, compare_schedule_key,
+        lower_bound_section,
+    },
     rows::{
         decode_message_entry, decode_offset_entry, decode_operation_entry,
-        decode_operation_location,
+        decode_operation_location, decode_schedule_entry,
     },
     sections::Sections,
 };
-use crate::{MessageIndexEntry, OffsetIndexEntry, OperationIndexEntry, OperationLocation};
+use crate::{
+    MessageIndexEntry, OffsetIndexEntry, OperationIndexEntry, OperationLocation, ScheduleIndexEntry,
+};
+use ozzy_journal::operation::ReleaseKey;
 use ozzy_proto::layout::Fixed;
 use ozzy_proto::{MessageId, Offset, OperationId, PartitionIncarnation};
 use std::cmp::Ordering;
@@ -25,6 +31,7 @@ pub struct SegmentIndexView<'a> {
     pub(super) messages: &'a [u8],
     pub(super) operations: &'a [u8],
     pub(super) locations: &'a [u8],
+    pub(super) schedules: &'a [u8],
 }
 
 impl SegmentIndexView<'_> {
@@ -56,6 +63,19 @@ impl SegmentIndexView<'_> {
     /// Number of numeric selectors, covering the complete source prefix.
     pub fn location_count(&self) -> usize {
         self.locations.len() / OPERATION_LOCATION_BYTES
+    }
+
+    /// Number of scheduled-record rows.
+    pub fn schedule_count(&self) -> usize {
+        self.schedules.len() / SCHEDULE_INDEX_ENTRY_BYTES
+    }
+
+    /// Release key of the partition's last scheduled record.
+    pub fn last_schedule(&self, partition: PartitionIncarnation) -> Option<ReleaseKey> {
+        let rows = self.schedules.as_chunks::<SCHEDULE_INDEX_ENTRY_BYTES>().0;
+        let end = rows.partition_point(|row| row.array::<0, 16>() <= *partition.as_bytes());
+        let row = rows.get(end.checked_sub(1)?)?;
+        (row.array::<0, 16>() == *partition.as_bytes()).then(|| decode_schedule_entry(row).key)
     }
 
     /// Locate an exact canonical operation without scanning segment payloads.
@@ -134,6 +154,22 @@ impl SegmentIndexView<'_> {
 }
 
 impl<'a> SegmentIndexView<'a> {
+    /// The partition's scheduled records after release key `after`, in
+    /// release order.
+    pub fn schedules_after(
+        self,
+        partition: PartitionIncarnation,
+        after: ReleaseKey,
+    ) -> impl Iterator<Item = ScheduleIndexEntry> + 'a {
+        let rows = self.schedules.as_chunks::<SCHEDULE_INDEX_ENTRY_BYTES>().0;
+        let first = rows.partition_point(|row| compare_schedule_key(row, partition, after).is_le());
+        rows.get(first..)
+            .unwrap_or_default()
+            .iter()
+            .take_while(move |row| row.array::<0, 16>() == *partition.as_bytes())
+            .map(decode_schedule_entry)
+    }
+
     pub(crate) fn offsets(self) -> impl ExactSizeIterator<Item = OffsetIndexEntry> + 'a {
         self.offsets
             .as_chunks::<OFFSET_INDEX_ENTRY_BYTES>()
@@ -176,6 +212,7 @@ impl<'a> SegmentIndexView<'a> {
             messages: sections.messages,
             operations: sections.operations,
             locations: sections.locations,
+            schedules: sections.schedules,
         }
     }
 }

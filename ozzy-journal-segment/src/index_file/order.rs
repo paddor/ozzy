@@ -1,7 +1,12 @@
 //! Row order: sort keys, comparisons, section searches, and order checks.
 
-use super::{IndexFileError, MESSAGE_INDEX_ENTRY_BYTES, OFFSET_INDEX_ENTRY_BYTES};
-use crate::{MessageIndexEntry, OffsetIndexEntry, OperationIndexEntry, OperationLocation};
+use super::{
+    IndexFileError, MESSAGE_INDEX_ENTRY_BYTES, OFFSET_INDEX_ENTRY_BYTES, SCHEDULE_INDEX_ENTRY_BYTES,
+};
+use crate::{
+    MessageIndexEntry, OffsetIndexEntry, OperationIndexEntry, OperationLocation, ScheduleIndexEntry,
+};
+use ozzy_journal::operation::ReleaseKey;
 use ozzy_proto::layout::Fixed;
 use ozzy_proto::{MessageId, Offset, PartitionIncarnation};
 use std::cmp::Ordering;
@@ -47,6 +52,29 @@ pub(crate) fn compare_operation_entries(
     left.operation_id
         .as_bytes()
         .cmp(right.operation_id.as_bytes())
+}
+
+pub(crate) fn compare_schedule_entries(
+    left: &ScheduleIndexEntry,
+    right: &ScheduleIndexEntry,
+) -> Ordering {
+    left.partition
+        .as_bytes()
+        .cmp(right.partition.as_bytes())
+        .then_with(|| left.key.cmp(&right.key))
+}
+
+/// Order of a schedule row against a partition and release key.
+pub(super) fn compare_schedule_key(
+    entry: &[u8; SCHEDULE_INDEX_ENTRY_BYTES],
+    partition: PartitionIncarnation,
+    key: ReleaseKey,
+) -> Ordering {
+    entry
+        .array::<0, 16>()
+        .cmp(partition.as_bytes())
+        .then_with(|| entry.u64_at::<16>().cmp(&key.millis))
+        .then_with(|| entry.u64_at::<24>().cmp(&key.schedule))
 }
 
 pub(super) fn compare_offset_key(

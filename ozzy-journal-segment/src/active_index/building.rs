@@ -1,5 +1,5 @@
 use super::{
-    ActiveIndexError, IndexLimits, IndexSource, SegmentIndexImage, enforce_footprint,
+    ActiveIndexError, IndexCounts, IndexLimits, IndexSource, SegmentIndexImage, enforce_footprint,
     extend_bounded, validate_limits,
 };
 use crate::{
@@ -62,6 +62,12 @@ impl Entries {
                 "active operation entries",
             )?;
         }
+        extend_bounded(
+            &mut selectors.schedules,
+            derived.schedules,
+            self.limits.max_schedule_entries,
+            "active schedule entries",
+        )?;
         self.last = Some(operation.op_number);
         self.digest = operation.digest;
         Ok(())
@@ -101,10 +107,13 @@ impl Entries {
         let base_len = |len: fn(&SegmentIndexImage) -> usize| base.map_or(0, len);
         let selectors = &self.selectors;
         enforce_footprint(
-            selectors.offsets.len() + base_len(|base| base.offsets().len()),
-            selectors.messages.len() + base_len(|base| base.messages().len()),
-            selectors.operations.len() + base_len(|base| base.operations().len()),
-            selectors.locations.len() + base_len(|base| base.locations().len()),
+            IndexCounts {
+                offsets: selectors.offsets.len() + base_len(|base| base.offsets().len()),
+                messages: selectors.messages.len() + base_len(|base| base.messages().len()),
+                operations: selectors.operations.len() + base_len(|base| base.operations().len()),
+                locations: selectors.locations.len() + base_len(|base| base.locations().len()),
+                schedules: selectors.schedules.len() + base_len(|base| base.schedules().len()),
+            },
             self.limits,
         )?;
         Ok(Some(IndexSource {

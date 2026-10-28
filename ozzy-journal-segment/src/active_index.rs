@@ -8,7 +8,8 @@ use crate::{
     INDEX_HEADER_BYTES, IndexFileError, IndexLimits, IndexSource, MESSAGE_INDEX_ENTRY_BYTES,
     MessageIndexEntry, OFFSET_INDEX_ENTRY_BYTES, OPERATION_INDEX_ENTRY_BYTES,
     OPERATION_LOCATION_BYTES, OffsetIndexEntry, OperationIndexEntry, OperationLocation,
-    SealedSegment, SegmentIndexImage, SegmentScan,
+    SCHEDULE_INDEX_ENTRY_BYTES, SealedSegment, SegmentIndexImage, SegmentScan,
+    index_file::IndexCounts,
 };
 
 mod building;
@@ -306,32 +307,22 @@ fn extend_bounded<T>(
     Ok(())
 }
 
-fn enforce_footprint(
-    offsets: usize,
-    messages: usize,
-    operations: usize,
-    locations: usize,
-    limits: IndexLimits,
-) -> Result<(), ActiveIndexError> {
-    let bytes = offsets
-        .checked_mul(OFFSET_INDEX_ENTRY_BYTES)
-        .and_then(|value| {
-            messages
-                .checked_mul(MESSAGE_INDEX_ENTRY_BYTES)
-                .and_then(|section| value.checked_add(section))
-        })
-        .and_then(|value| {
-            operations
-                .checked_mul(OPERATION_INDEX_ENTRY_BYTES)
-                .and_then(|section| value.checked_add(section))
-        })
-        .and_then(|value| {
-            locations
-                .checked_mul(OPERATION_LOCATION_BYTES)
-                .and_then(|section| value.checked_add(section))
-        })
-        .and_then(|value| value.checked_add(INDEX_HEADER_BYTES))
-        .ok_or(ActiveIndexError::LengthOverflow)?;
+fn enforce_footprint(counts: IndexCounts, limits: IndexLimits) -> Result<(), ActiveIndexError> {
+    let bytes = [
+        (counts.offsets, OFFSET_INDEX_ENTRY_BYTES),
+        (counts.messages, MESSAGE_INDEX_ENTRY_BYTES),
+        (counts.operations, OPERATION_INDEX_ENTRY_BYTES),
+        (counts.locations, OPERATION_LOCATION_BYTES),
+        (counts.schedules, SCHEDULE_INDEX_ENTRY_BYTES),
+    ]
+    .into_iter()
+    .try_fold(0_usize, |total, (count, width)| {
+        count
+            .checked_mul(width)
+            .and_then(|section| total.checked_add(section))
+    })
+    .and_then(|value| value.checked_add(INDEX_HEADER_BYTES))
+    .ok_or(ActiveIndexError::LengthOverflow)?;
     if bytes > limits.max_file_bytes {
         return Err(ActiveIndexError::LimitExceeded {
             kind: "active index footprint",
@@ -347,6 +338,7 @@ fn validate_limits(limits: IndexLimits) -> Result<(), ActiveIndexError> {
         || limits.max_offset_entries == 0
         || limits.max_message_entries == 0
         || limits.max_operation_entries == 0
+        || limits.max_schedule_entries == 0
     {
         Err(ActiveIndexError::InvalidLimits)
     } else {

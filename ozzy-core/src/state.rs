@@ -15,7 +15,7 @@ mod groups;
 pub use groups::{CoordinatorGroup, group_targets};
 mod append;
 mod delay;
-pub use delay::{DelayState, PendingSchedule};
+pub use delay::{DelayState, PendingSchedule, schedule_entries};
 mod identity;
 mod images;
 mod installation;

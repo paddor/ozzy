@@ -1,7 +1,8 @@
 use super::{
     Digest, Hasher, INDEX_DIGEST_START, INDEX_HASH_CONTEXT, IndexEntries, IndexFileError,
     IndexLimits, IndexSource, SegmentIndexImage, SegmentIndexView, compare_locations,
-    compare_message_entries, compare_offset_entries, compare_operation_entries, decode_sections,
+    compare_message_entries, compare_offset_entries, compare_operation_entries,
+    compare_schedule_entries, decode_sections,
     validate::{image_checks, section_checks, validate_image_header},
     validate_header,
 };
@@ -14,6 +15,7 @@ impl IndexEntries {
         sort_by(&mut self.messages, compare_message_entries).await;
         sort_by(&mut self.operations, compare_operation_entries).await;
         sort_by(&mut self.locations, compare_locations).await;
+        sort_by(&mut self.schedules, compare_schedule_entries).await;
     }
 }
 
@@ -52,6 +54,7 @@ impl SegmentIndexImage {
             )
             .await,
             locations: merge(&old.locations, entries.locations, compare_locations).await,
+            schedules: merge(&old.schedules, entries.schedules, compare_schedule_entries).await,
         };
         Self {
             source,

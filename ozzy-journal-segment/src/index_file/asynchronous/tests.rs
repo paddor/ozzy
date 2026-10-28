@@ -5,8 +5,10 @@ use crate::index_file::{
 };
 use crate::{
     IndexSource, MessageIndexEntry, OffsetIndexEntry, OperationIndexEntry, OperationLocation,
-    RecordLocation, SegmentIndexImage, test_io::Scheduling,
+    RecordLocation, ScheduleIndexEntry, SegmentIndexImage, test_io::Scheduling,
 };
+use ozzy_core::state::PendingSchedule;
+use ozzy_journal::operation::ReleaseKey;
 use ozzy_proto::{GroupId, MessageId, Offset, OperationId, PartitionIncarnation};
 use std::{future::Future, pin::pin, sync::Arc, task::Poll};
 
@@ -24,6 +26,7 @@ fn fixture(count: usize) -> (Vec<u8>, SegmentIndexImage) {
     let mut offsets = Vec::new();
     let mut messages = Vec::new();
     let mut operations = Vec::new();
+    let mut schedules = Vec::new();
     for index in 0..count {
         let location = OperationLocation {
             segment_id: 1,
@@ -53,6 +56,20 @@ fn fixture(count: usize) -> (Vec<u8>, SegmentIndexImage) {
             operation_id: OperationId::from_bytes(id),
             location,
         });
+        // Later operations hold records due earlier.
+        schedules.push(ScheduleIndexEntry {
+            partition,
+            key: ReleaseKey {
+                millis: 1_000_000 - index as u64,
+                schedule: index as u64,
+            },
+            record: PendingSchedule {
+                operation: location.op_number,
+                index: 0,
+                bytes: 16,
+                message_id: MessageId::from_bytes(id),
+            },
+        });
     }
     let locations = operations.iter().map(|entry| entry.location).collect();
     let image = SegmentIndexImage::new(
@@ -63,6 +80,7 @@ fn fixture(count: usize) -> (Vec<u8>, SegmentIndexImage) {
             messages,
             operations,
             locations,
+            schedules,
         },
     )
     .unwrap();
@@ -292,7 +310,7 @@ fn native_index_open_drives_cooperative_validation_after_owned_file_reads() {
     let (bytes, image) = fixture(3000);
     let quota = Quota {
         operations: 4,
-        bytes: 2 * 1024 * 1024,
+        bytes: 4 * 1024 * 1024,
     };
     let (mut controller, mut clients) = Controller::new(
         ozzy_io::simulation::Config {
@@ -305,7 +323,7 @@ fn native_index_open_drives_cooperative_validation_after_owned_file_reads() {
             image: ImageLimits {
                 nodes: 8,
                 directory_entries: 8,
-                file_bytes: 1024 * 1024,
+                file_bytes: 2 * 1024 * 1024,
                 total_bytes: 4 * 1024 * 1024,
             },
             trace_events: 10_000,
@@ -354,6 +372,7 @@ fn cooperative_index_construction_sorts_all_tables_and_builds_identical_read_run
             messages: image.messages().iter().rev().copied().collect(),
             operations: image.operations().iter().rev().copied().collect(),
             locations: image.locations().iter().rev().copied().collect(),
+            schedules: image.schedules().iter().rev().copied().collect(),
         },
     ));
     assert!(polls > 10);
@@ -368,6 +387,7 @@ fn cooperative_index_construction_sorts_all_tables_and_builds_identical_read_run
             messages,
             operations: image.operations().to_vec(),
             locations: image.locations().to_vec(),
+            schedules: image.schedules().to_vec(),
         },
     ));
     assert!(polls > 1);

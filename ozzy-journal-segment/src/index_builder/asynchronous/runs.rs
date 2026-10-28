@@ -1,12 +1,13 @@
 use super::{Access, IndexBuildError, IndexFileError, PendingRuns, RunKind, Workspace};
 use crate::index_file::{
     compare_locations, compare_message_entries, compare_offset_entries, compare_operation_entries,
-    encode_message_entry, encode_offset_entry, encode_operation_entry, encode_operation_location,
+    compare_schedule_entries, encode_message_entry, encode_offset_entry, encode_operation_entry,
+    encode_operation_location, encode_schedule_entry,
 };
 use crate::{
     MESSAGE_INDEX_ENTRY_BYTES, MessageIndexEntry, OFFSET_INDEX_ENTRY_BYTES,
     OPERATION_INDEX_ENTRY_BYTES, OPERATION_LOCATION_BYTES, OffsetIndexEntry, OperationIndexEntry,
-    OperationLocation,
+    OperationLocation, SCHEDULE_INDEX_ENTRY_BYTES, ScheduleIndexEntry,
 };
 use ozzy_io::{Handle, OpenMode, Operation};
 use std::{cmp::Ordering, path::PathBuf};
@@ -85,6 +86,11 @@ const LOCATIONS: RunFormat<OperationLocation, OPERATION_LOCATION_BYTES> = RunFor
     compare: compare_locations,
     encode: encode_operation_location,
 };
+const SCHEDULES: RunFormat<ScheduleIndexEntry, SCHEDULE_INDEX_ENTRY_BYTES> = RunFormat {
+    kind: RunKind::Schedule,
+    compare: compare_schedule_entries,
+    encode: encode_schedule_entry,
+};
 
 impl PendingRuns {
     pub(super) async fn flush_async(
@@ -120,6 +126,14 @@ impl PendingRuns {
             LOCATIONS,
             workspace,
             &mut self.location_runs,
+            self.max_runs,
+        )
+        .await?;
+        write_typed_run(
+            &mut self.schedules,
+            SCHEDULES,
+            workspace,
+            &mut self.schedule_runs,
             self.max_runs,
         )
         .await?;

@@ -4,12 +4,14 @@
 use super::{
     INDEX_HEADER_BYTES, INDEX_MAGIC, INDEX_VERSION, IndexCounts, IndexFileError, IndexLayout,
     IndexSource, MESSAGE_INDEX_ENTRY_BYTES, OFFSET_INDEX_ENTRY_BYTES, OPERATION_INDEX_ENTRY_BYTES,
-    OPERATION_LOCATION_BYTES, u64_from_usize,
+    OPERATION_LOCATION_BYTES, SCHEDULE_INDEX_ENTRY_BYTES, u64_from_usize,
 };
 use crate::{
     MessageIndexEntry, OffsetIndexEntry, OperationIndexEntry, OperationLocation, RecordLocation,
+    ScheduleIndexEntry,
 };
-use ozzy_journal::operation::Digest;
+use ozzy_core::state::PendingSchedule;
+use ozzy_journal::operation::{Digest, ReleaseKey};
 use ozzy_proto::layout::Fixed;
 use ozzy_proto::{GroupId, MessageId, Offset, OperationId, PartitionIncarnation};
 
@@ -44,6 +46,9 @@ pub(crate) fn encode_index_header(
     header.put_u64::<216>(u64_from_usize(counts.locations)?);
     header.put_u64::<224>(u64_from_usize(layout.location_start)?);
     header.put_u32::<232>(OPERATION_LOCATION_BYTES as u32);
+    header.put_u64::<288>(u64_from_usize(counts.schedules)?);
+    header.put_u64::<296>(u64_from_usize(layout.schedule_start)?);
+    header.put_u32::<304>(SCHEDULE_INDEX_ENTRY_BYTES as u32);
     Ok(header)
 }
 
@@ -152,6 +157,37 @@ pub(super) fn decode_operation_entry(
             entry_offset: input.u64_at::<24>(),
             entry_bytes: input.u64_at::<32>(),
             operation_digest: Digest::from_bytes(input.array::<40, 32>()),
+        },
+    }
+}
+
+pub(crate) fn encode_schedule_entry(
+    entry: &ScheduleIndexEntry,
+    output: &mut [u8; SCHEDULE_INDEX_ENTRY_BYTES],
+) {
+    output[..16].copy_from_slice(entry.partition.as_bytes());
+    output.put_u64::<16>(entry.key.millis);
+    output.put_u64::<24>(entry.key.schedule);
+    output.put_u64::<32>(entry.record.operation);
+    output.put_u32::<40>(entry.record.index);
+    output.put_u32::<44>(entry.record.bytes);
+    output.put::<48, 16>(*entry.record.message_id.as_bytes());
+}
+
+pub(super) fn decode_schedule_entry(
+    input: &[u8; SCHEDULE_INDEX_ENTRY_BYTES],
+) -> ScheduleIndexEntry {
+    ScheduleIndexEntry {
+        partition: PartitionIncarnation::from_bytes(input.array::<0, 16>()),
+        key: ReleaseKey {
+            millis: input.u64_at::<16>(),
+            schedule: input.u64_at::<24>(),
+        },
+        record: PendingSchedule {
+            operation: input.u64_at::<32>(),
+            index: input.u32_at::<40>(),
+            bytes: input.u32_at::<44>(),
+            message_id: MessageId::from_bytes(input.array::<48, 16>()),
         },
     }
 }

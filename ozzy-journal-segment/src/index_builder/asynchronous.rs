@@ -35,7 +35,7 @@ pub(crate) struct Builder {
 /// Merged section runs in file order, with their entry counts.
 struct Merged {
     counts: IndexCounts,
-    runs: [Option<PathBuf>; 4],
+    runs: [Option<PathBuf>; 5],
 }
 
 pub(crate) async fn open(
@@ -252,12 +252,10 @@ impl Builder {
         let mut hasher = IntegrityHasher::new(INDEX_HASH_CONTEXT);
         hasher.update(&header);
         writer.push(&header).await?;
-        for (run, bytes) in runs.into_iter().zip([
-            layout.message_start - INDEX_HEADER_BYTES,
-            layout.operation_start - layout.message_start,
-            layout.location_start - layout.operation_start,
-            layout.file_bytes - layout.location_start,
-        ]) {
+        let lengths = layout
+            .section_lengths()
+            .ok_or(IndexFileError::InvalidSectionLayout)?;
+        for (run, bytes) in runs.into_iter().zip(lengths) {
             self.copy_run(run, bytes, &mut writer, &mut hasher).await?;
         }
         writer.flush().await?;
@@ -313,7 +311,7 @@ impl Builder {
 }
 
 /// Merge each section's runs to one. The complete file's name is reserved
-/// before the location merge, so the workspace bound counts it there.
+/// before the last merge, so the workspace bound counts it there.
 async fn merge_sections(
     pending: PendingRuns,
     fan_in: usize,
@@ -328,11 +326,12 @@ async fn merge_sections(
         workspace,
     )
     .await?;
-    let temporary = workspace.reserve("complete.idx".into())?;
     let locations = merge_all(pending.location_runs, RunKind::Location, fan_in, workspace).await?;
+    let temporary = workspace.reserve("complete.idx".into())?;
+    let schedules = merge_all(pending.schedule_runs, RunKind::Schedule, fan_in, workspace).await?;
     let merged = Merged {
         counts: pending.counts,
-        runs: [offsets, messages, operations, locations],
+        runs: [offsets, messages, operations, locations, schedules],
     };
     Ok((temporary, merged))
 }

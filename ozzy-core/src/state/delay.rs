@@ -334,41 +334,55 @@ impl CanonicalState {
     }
 }
 
-/// Held entries keyed by `(max(due, acceptance), schedule)`, in batch order.
+/// Held entries of a new `Schedule`, each due no later than `latest`.
 fn held_records(
     op_number: u64,
     value: &Schedule<'_>,
     latest: u64,
 ) -> Result<Vec<(ReleaseKey, PendingSchedule)>, StateError> {
+    for record in &value.batch.records {
+        require_id("message", record.message_id.as_bytes())?;
+        require_record_parts(record.parts.len())?;
+    }
+    if value.due_millis.iter().any(|&due| due > latest) {
+        return Err(StateError::DueBeyondMaximum);
+    }
+    schedule_entries(op_number, value)
+}
+
+/// Entries of a `Schedule` keyed by `(max(due, acceptance), schedule)`, in
+/// batch order. Segment indexes derive their held-record rows with it.
+pub fn schedule_entries(
+    op_number: u64,
+    value: &Schedule<'_>,
+) -> Result<Vec<(ReleaseKey, PendingSchedule)>, StateError> {
     let time = value.batch.append_timestamp_millis;
-    let mut pending = Vec::with_capacity(value.batch.records.len());
-    for (index, (record, &due)) in value
+    value
         .batch
         .records
         .iter()
         .zip(&value.due_millis)
         .enumerate()
-    {
-        require_id("message", record.message_id.as_bytes())?;
-        require_record_parts(record.parts.len())?;
-        if due > latest {
-            return Err(StateError::DueBeyondMaximum);
-        }
-        let index = u32::try_from(index).map_err(|_| StateError::PositionExhausted)?;
-        pending.push((
-            ReleaseKey {
-                millis: due.max(time),
-                schedule: value.first_schedule + u64::from(index),
-            },
-            PendingSchedule {
-                operation: op_number,
-                index,
-                bytes: record_bytes(record)?,
-                message_id: record.message_id,
-            },
-        ));
-    }
-    Ok(pending)
+        .map(|(index, (record, &due))| {
+            let index = u32::try_from(index).map_err(|_| StateError::PositionExhausted)?;
+            let schedule = value
+                .first_schedule
+                .checked_add(u64::from(index))
+                .ok_or(StateError::PositionExhausted)?;
+            Ok((
+                ReleaseKey {
+                    millis: due.max(time),
+                    schedule,
+                },
+                PendingSchedule {
+                    operation: op_number,
+                    index,
+                    bytes: record_bytes(record)?,
+                    message_id: record.message_id,
+                },
+            ))
+        })
+        .collect()
 }
 
 /// A release batch is written by the broker, not a producer session.

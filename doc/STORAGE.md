@@ -212,7 +212,7 @@ part. General descriptors use:
   segment's age, so retries of a released schedule resolve for the retention
   age.
 - Readers and indexes treat a `Release` batch like an APPEND batch.
-  `Schedule` records have no offsets and are never indexed.
+  `Schedule` records have no offsets; indexes list them by release key only.
 - Scheduled payloads are raw, so a release can copy any prefix of held
   records without recompressing.
 
@@ -377,9 +377,13 @@ generation.
 ### Indexes and reads
 
 Index files bind one sealed source by name. Header: 4096 bytes, `OZYIDX01`,
-format 3. Rows: record offsets 96 bytes, message IDs 80, operation IDs 80, and
-a dense 56-byte numeric selector for every canonical operation, including
-payload-free duplicate results.
+format 4. Rows: record offsets 96 bytes, message IDs 80, operation IDs 80, a
+dense 56-byte numeric selector for every canonical operation, including
+payload-free duplicate results, and 64-byte scheduled records.
+
+- Scheduled-record rows sort by partition and release key. Each holds the
+  key, its `Schedule` operation, record index, encoded bytes, and message ID,
+  so held records after a release key can be listed without reading payloads.
 
 - A missing or corrupt index is rebuilt from validated segment bytes. A
   background job builds each sealed segment's index beside later writes; a

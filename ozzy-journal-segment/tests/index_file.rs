@@ -8,10 +8,12 @@
     reason = "test code"
 )]
 
+use ozzy_core::state::PendingSchedule;
+use ozzy_journal::operation::ReleaseKey;
 use ozzy_journal_segment::{
     Digest, INDEX_HEADER_BYTES, IndexEntries, IndexFileError, IndexLimits, IndexSource,
     MessageIndexEntry, OffsetIndexEntry, OperationIndexEntry, OperationLocation, RecordLocation,
-    SegmentIndexImage, decode_segment_index, encode_segment_index,
+    ScheduleIndexEntry, SegmentIndexImage, decode_segment_index, encode_segment_index,
 };
 use ozzy_proto::{GroupId, MessageId, Offset, OperationId, PartitionIncarnation};
 
@@ -26,6 +28,20 @@ fn operation_location(number: u64, byte: u8, entry_offset: u64) -> OperationLoca
         entry_bytes: 192,
         op_number: number,
         operation_digest: Digest::from_bytes([byte; 32]),
+    }
+}
+
+/// A scheduled record of operation 2.
+fn schedule(byte: u8, millis: u64, schedule: u64) -> ScheduleIndexEntry {
+    ScheduleIndexEntry {
+        partition: partition(byte),
+        key: ReleaseKey { millis, schedule },
+        record: PendingSchedule {
+            operation: 2,
+            index: u32::try_from(schedule).unwrap(),
+            bytes: 40,
+            message_id: MessageId::from_bytes([0x42; 16]),
+        },
     }
 }
 
@@ -91,6 +107,13 @@ fn image() -> SegmentIndexImage {
                 operation_location(2, 0x80, 4288),
                 last_location,
             ],
+            // Out of release order; the image sorts them.
+            schedules: vec![
+                schedule(0x21, 900, 0),
+                schedule(0x20, 950, 0),
+                schedule(0x20, 900, 2),
+                schedule(0x20, 900, 1),
+            ],
         },
     )
     .unwrap()
@@ -101,7 +124,7 @@ fn immutable_index_round_trips_and_binary_searches_without_entry_allocation() {
     let image = image();
     let encoded = encode_segment_index(&image, IndexLimits::default()).unwrap();
     assert_eq!(&encoded[..8], b"OZYIDX01");
-    assert_eq!(u16::from_be_bytes(encoded[8..10].try_into().unwrap()), 3);
+    assert_eq!(u16::from_be_bytes(encoded[8..10].try_into().unwrap()), 4);
     assert_eq!(
         u16::from_be_bytes(encoded[10..12].try_into().unwrap()),
         INDEX_HEADER_BYTES as u16
@@ -136,6 +159,38 @@ fn immutable_index_round_trips_and_binary_searches_without_entry_allocation() {
         Some(image.operations()[0])
     );
     assert!(view.find_offset(partition(0x20), Offset::new(5)).is_none());
+
+    assert_eq!(view.schedule_count(), 4);
+    let after = |byte, millis, schedule| {
+        view.schedules_after(partition(byte), ReleaseKey { millis, schedule })
+            .map(|entry| (entry.key.millis, entry.key.schedule))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(after(0x20, 0, 0), [(900, 1), (900, 2), (950, 0)]);
+    assert_eq!(after(0x20, 900, 1), [(900, 2), (950, 0)]);
+    assert_eq!(after(0x20, 950, 0), []);
+    assert_eq!(after(0x21, 0, 0), [(900, 0)]);
+    assert_eq!(after(0x22, 0, 0), []);
+    assert_eq!(
+        view.schedules_after(
+            partition(0x20),
+            ReleaseKey {
+                millis: 0,
+                schedule: 0
+            }
+        )
+        .next(),
+        Some(image.schedules()[0])
+    );
+    assert_eq!(
+        view.last_schedule(partition(0x20)),
+        Some(ReleaseKey {
+            millis: 950,
+            schedule: 0
+        })
+    );
+    assert_eq!(view.last_schedule(partition(0x1f)), None);
+    assert_eq!(view.last_schedule(partition(0x22)), None);
 }
 
 #[test]
@@ -155,7 +210,7 @@ fn every_truncated_prefix_and_corruption_is_rejected() {
         IndexFileError::DigestMismatch
     );
     let mut reserved = encoded;
-    reserved[300] = 1;
+    reserved[320] = 1;
     assert_eq!(
         decode_segment_index(&reserved, IndexLimits::default()).unwrap_err(),
         IndexFileError::NonZeroReserved
@@ -174,7 +229,8 @@ fn construction_rejects_duplicate_keys_and_invalid_locations() {
                 offsets: vec![duplicate, duplicate],
                 messages: image.messages().to_vec(),
                 operations: image.operations().to_vec(),
-                locations: image.locations().to_vec()
+                locations: image.locations().to_vec(),
+                schedules: image.schedules().to_vec(),
             }
         )
         .unwrap_err(),
@@ -191,8 +247,38 @@ fn construction_rejects_duplicate_keys_and_invalid_locations() {
                 offsets: vec![invalid, image.offsets()[1]],
                 messages: image.messages().to_vec(),
                 operations: image.operations().to_vec(),
-                locations: image.locations().to_vec()
+                locations: image.locations().to_vec(),
+                schedules: image.schedules().to_vec(),
             }
+        )
+        .unwrap_err(),
+        IndexFileError::InvalidLocation
+    );
+
+    let held = image.schedules()[0];
+    let entries = |schedules| IndexEntries {
+        offsets: image.offsets().to_vec(),
+        messages: image.messages().to_vec(),
+        operations: image.operations().to_vec(),
+        locations: image.locations().to_vec(),
+        schedules,
+    };
+    assert_eq!(
+        SegmentIndexImage::new(
+            image.source(),
+            image.build_memory_limit(),
+            entries(vec![held, held])
+        )
+        .unwrap_err(),
+        IndexFileError::UnsortedOrDuplicate("schedule")
+    );
+    let mut outside = held;
+    outside.record.operation = 4;
+    assert_eq!(
+        SegmentIndexImage::new(
+            image.source(),
+            image.build_memory_limit(),
+            entries(vec![outside])
         )
         .unwrap_err(),
         IndexFileError::InvalidLocation
@@ -224,6 +310,7 @@ fn numeric_selectors_cover_payload_free_operations_near_the_number_limit() {
             messages: Vec::new(),
             operations: Vec::new(),
             locations: locations.clone(),
+            schedules: Vec::new(),
         },
     )
     .unwrap();
@@ -265,7 +352,8 @@ fn numeric_selectors_cover_payload_free_operations_near_the_number_limit() {
                 offsets: Vec::new(),
                 messages: Vec::new(),
                 operations: Vec::new(),
-                locations: locations[..2].to_vec()
+                locations: locations[..2].to_vec(),
+                schedules: Vec::new(),
             }
         )
         .unwrap_err(),
@@ -281,7 +369,8 @@ fn numeric_selectors_cover_payload_free_operations_near_the_number_limit() {
                 offsets: Vec::new(),
                 messages: Vec::new(),
                 operations: Vec::new(),
-                locations: gap
+                locations: gap,
+                schedules: Vec::new(),
             }
         )
         .unwrap_err(),
@@ -297,7 +386,8 @@ fn numeric_selectors_cover_payload_free_operations_near_the_number_limit() {
                 offsets: Vec::new(),
                 messages: Vec::new(),
                 operations: Vec::new(),
-                locations: overlap
+                locations: overlap,
+                schedules: Vec::new(),
             }
         )
         .unwrap_err(),
