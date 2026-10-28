@@ -195,6 +195,68 @@ fn production_runner_verifies_shared_writer_reader_cohorts_and_drains_each_polic
     }
 }
 
+#[test]
+fn production_runner_times_held_records_from_their_release() {
+    let storage = super::support::storage("native-timed-delay-");
+    let output = Command::new(env!("CARGO_BIN_EXE_ozzy_timed_bench"))
+        .args([
+            "--processes",
+            "--network-ingress",
+            "--streaming",
+            "--system",
+            "single-durable",
+            "--duration",
+            "1",
+            "--warmup",
+            "0",
+            "--records-per-second",
+            "70",
+            "--partitions",
+            "2",
+            "--window",
+            "2",
+            "--request-records",
+            "32",
+            "--writer-batch-records",
+            "32",
+            "--reader-records",
+            "32",
+            "--reader-payload-mib",
+            "1",
+            "--segment-mib",
+            "4",
+            "--io-backend",
+            "pool",
+            "--direct-io",
+            "false",
+            "--delay-millis",
+            "700",
+            "--storage-dir",
+        ])
+        .arg(storage.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success() && output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let row: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let delay = &row["delay"];
+    assert_eq!(delay["delay_millis"], 700);
+    assert_eq!(delay["confirmed_scheduled"], 70);
+    assert_eq!(delay["lateness"]["samples"], 70);
+    assert_eq!(
+        row["effective_deployment"]["topics"]["benchmark"]["delay"]["max_secs"],
+        1
+    );
+    // Reader timings start at release, so a held second still delivers in
+    // the measured window, and lateness stays far below the delay.
+    assert!(row["consumer_records_per_second"].as_f64().unwrap() > 0.0);
+    assert!(delay["lateness"]["max_us"].as_f64().unwrap() < 700_000.0);
+    assert_eq!(row["scheduled_load"]["reader_delivery"]["samples"], 70);
+}
+
 fn check(row: &Value, system: &str) {
     check_provenance(row);
     check_scheduled_cohort(row);

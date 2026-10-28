@@ -1,4 +1,5 @@
 mod dedup;
+mod delay;
 mod groups;
 mod scheduled;
 
@@ -132,11 +133,12 @@ pub(super) fn summarize(
         "latency_cohort":"submissions in measurement window; includes final drain",
         "throughput_boundary":"confirmation observed / full record verified inside exact measurement window",
         "writer_drain_seconds":cohort.writer_end.saturating_sub(window.end) as f64 / 1e9,
-        "reader_drain_seconds":cohort.reader_end.saturating_sub(window.end) as f64 / 1e9,
+        "reader_drain_seconds":cohort.reader_end.saturating_sub(window.end + config.delay_ns()) as f64 / 1e9,
         "writers":writers,"readers":readers,"brokers":brokers,
         "scheduled_load":scheduled});
     groups::summarize(&mut row, config)?;
     dedup::summarize(&mut row, config)?;
+    delay::summarize(&mut row, config)?;
     extend_object(&mut row, topology(config, brokers)?)?;
     Ok(row)
 }

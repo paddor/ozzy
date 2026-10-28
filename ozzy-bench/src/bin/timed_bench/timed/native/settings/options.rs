@@ -27,6 +27,13 @@ pub(in crate::bench) struct Options {
     /// Strict per-partition identity-index allocation ceiling, in bytes.
     #[arg(long, requires = "dedup_window_secs")]
     pub(in crate::bench::timed) dedup_max_bytes: Option<u64>,
+    /// Hold every record this many milliseconds past its send time; omitted
+    /// stores records at once.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=100_000))]
+    pub(in crate::bench::timed) delay_millis: Option<u64>,
+    /// Held records per partition before admission backs off.
+    #[arg(long, requires = "delay_millis", value_parser = clap::value_parser!(u64).range(1..))]
+    pub(in crate::bench::timed) delay_max_entries: Option<u64>,
     /// Per-partition retention byte target in MiB; omitted keeps all history.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub(in crate::bench::timed) retention_mib: Option<u64>,
@@ -91,6 +98,8 @@ impl Default for Options {
             dedup_window_secs: None,
             dedup_max_entries: None,
             dedup_max_bytes: None,
+            delay_millis: None,
+            delay_max_entries: None,
         }
     }
 }
@@ -120,6 +129,19 @@ impl Options {
             .transpose()
     }
 
+    /// The deployment's topic delay, admitting `delay_millis`. A due time
+    /// rounds up to a whole millisecond and acceptance follows the send, so
+    /// the maximum keeps a second of slack. The entry limit defaults there.
+    pub(super) fn delay(&self) -> Option<serde_json::Value> {
+        self.delay_millis.map(|millis| {
+            let mut delay = serde_json::json!({"max_secs": millis / 1000 + 1});
+            if let Some(entries) = self.delay_max_entries {
+                delay["max_entries"] = entries.into();
+            }
+            delay
+        })
+    }
+
     /// Command-line flags that reproduce these options in a worker process.
     pub(in crate::bench) fn append(&self, arguments: &mut Vec<String>) {
         self.feeds.append(arguments);
@@ -132,6 +154,8 @@ impl Options {
         push_flag(arguments, "--dedup-window-secs", self.dedup_window_secs);
         push_flag(arguments, "--dedup-max-entries", self.dedup_max_entries);
         push_flag(arguments, "--dedup-max-bytes", self.dedup_max_bytes);
+        push_flag(arguments, "--delay-millis", self.delay_millis);
+        push_flag(arguments, "--delay-max-entries", self.delay_max_entries);
         push_flag(arguments, "--retention-mib", self.retention_mib);
         push_flag(arguments, "--partitions", self.partitions);
         push_flag(
@@ -175,6 +199,8 @@ impl Options {
             && self.dedup_window_secs.is_none()
             && self.dedup_max_entries.is_none()
             && self.dedup_max_bytes.is_none()
+            && self.delay_millis.is_none()
+            && self.delay_max_entries.is_none()
             && self.partitions.is_none()
             && self.backend_write_threads.is_none()
             && self.backend_max_inflight.is_none()

@@ -203,6 +203,35 @@ flags: `--redundant-feeds 4 --records-per-second 60000
 - With `--groups`, each group verifies the same unique records, so one case
   measures dedup and group progress together.
 
+## Delay
+
+Hold every record one second, at 10,000 records/s.
+
+```sh
+ozzy_compare --impl ozzy --modes durable --sizes 128 --partitions 8 \
+  --records-per-second 10000 --delay-millis 1000 \
+  --broker-cpus 0/1/2 --client-cpus 3,4,5 --warmup 2 --duration 30 \
+  --repetitions 2 --no-build
+```
+
+For a 60-second delay at 100,000 records/s, change these flags:
+`--records-per-second 100000 --delay-millis 60000 --delay-max-entries 1000000`.
+
+- `--delay-millis D` installs a topic delay and sends each record due D ms
+  after its send clock.
+- `--delay-max-entries` bounds held records per partition (default 100,000).
+  Size it above rate times delay divided by partitions.
+- Every receipt must be scheduled. Its offset is the schedule sequence.
+- Reader timings start at each record's release: its send clock plus the
+  delay. The due time never precedes it, so `reader_delivery` is
+  due-to-delivered lateness, over by less than 1 ms. `delay.lateness` repeats
+  its percentiles.
+- The reader window, throughput, and intervals move by the delay. A record
+  delivered before its release fails the run.
+- `ozzy_compare` adds the delay to the case drain. Direct `ozzy_timed_bench`
+  runs need `--drain-timeout-secs` above the delay.
+- Delay requires `--impl ozzy` and excludes dedup and `--groups`.
+
 ## What is measured
 
 | Mode | Ozzy confirmation | External configuration |

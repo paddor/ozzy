@@ -195,3 +195,32 @@ fn untimed_records_verify_at_once_and_share_the_flush_clock() {
     );
     assert_eq!(rows[0]["last_ns"], window().start + 300);
 }
+
+#[test]
+fn held_records_time_from_release_and_never_arrive_before_it() {
+    let mut config = configuration();
+    config.args.native.delay_millis = Some(2);
+    let group = config::group(&config.args).unwrap();
+    let payload = payload(&config);
+    let record = Record {
+        partition: 0,
+        offset: 0,
+        id: config::message_id(group, 0, 0),
+        payload: &payload,
+    };
+    // Sent at start + 100 ns, so released no sooner than 2 ms later.
+    let release = window().start + 100 + 2_000_000;
+    let mut early = Oracle::new(&config, 2, &[0], 0, window()).unwrap();
+    let error = early
+        .observe(&config, group, record, release - 1)
+        .unwrap_err();
+    assert!(error.to_string().contains("before its due time"), "{error}");
+    let mut oracle = Oracle::new(&config, 2, &[0], 0, window()).unwrap();
+    oracle
+        .observe(&config, group, record, release + 300)
+        .unwrap();
+    let rows = oracle.rows();
+    assert_eq!(rows[0]["latency"]["max"], 300);
+    // The throughput window moves with the delay, so this release counts.
+    assert_eq!(rows[0]["completed_per_second"], json!([1]));
+}

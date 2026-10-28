@@ -21,6 +21,40 @@ fn comparison_native_commands_use_production_settings() {
 
 #[cfg(feature = "comparisons")]
 #[test]
+fn comparison_delay_cases_drain_past_the_delay() {
+    use ozzy_bench::automation::compare;
+
+    let options = compare::Args::parse_from([
+        "compare",
+        "--impl",
+        "ozzy",
+        "--modes",
+        "durable",
+        "--sizes",
+        "128",
+        "--records-per-second",
+        "1000",
+        "--delay-millis",
+        "60000",
+    ]);
+    let case = &options.cases()[0];
+    let command = options
+        .command(std::path::Path::new("bench"), case, None)
+        .unwrap();
+    let args = Args::try_parse_from(command.into_iter().skip(3)).unwrap();
+    assert_eq!(args.drain_timeout_secs, 70);
+    assert_eq!(Config::production(args).unwrap().delay_ns(), 60_000_000_000);
+    let validate = |implementation| {
+        compare::Args::parse_from(["compare", "--impl", implementation, "--delay-millis", "1"])
+            .validate(&[0, 1, 2, 3, 4, 5])
+    };
+    validate("ozzy").unwrap();
+    let error = validate("iggy").unwrap_err();
+    assert!(error.to_string().contains("--delay-millis"), "{error}");
+}
+
+#[cfg(feature = "comparisons")]
+#[test]
 fn native_and_external_partitions_are_independent_of_writer_count() {
     let args = Args::parse_from([
         "bench",
@@ -396,4 +430,50 @@ fn production_large_batch_byte_caps_reserve_real_sdk_owners_without_io() {
         );
         assert!(config.live_queue_messages() * expected <= 64 * 832 * 1024);
     }
+}
+
+#[test]
+fn delay_needs_plain_production_readers_and_a_drain_past_it() {
+    let args = |extra: &[&str]| {
+        Args::try_parse_from(
+            [
+                "bench",
+                "--processes",
+                "--network-ingress",
+                "--streaming",
+                "--duration",
+                "1",
+            ]
+            .into_iter()
+            .chain(extra.iter().copied()),
+        )
+    };
+    for (extra, valid) in [
+        (&["--delay-millis", "9999"][..], true),
+        (&["--delay-millis", "10000"], false),
+        (
+            &["--delay-millis", "60000", "--drain-timeout-secs", "61"],
+            true,
+        ),
+        (&["--delay-millis", "500", "--groups", "1"], false),
+        (
+            &[
+                "--delay-millis",
+                "500",
+                "--dedup-window-secs",
+                "1",
+                "--dedup-max-entries",
+                "1000",
+                "--dedup-max-bytes",
+                "16777216",
+            ],
+            false,
+        ),
+    ] {
+        let parsed = args(extra).unwrap();
+        assert_eq!(Config::production(parsed).is_ok(), valid, "{extra:?}");
+    }
+    assert!(Config::new(args(&["--delay-millis", "500"]).unwrap()).is_err());
+    assert!(args(&["--delay-max-entries", "10"]).is_err());
+    assert!(args(&["--delay-millis", "0"]).is_err());
 }

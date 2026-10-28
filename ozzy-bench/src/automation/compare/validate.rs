@@ -31,6 +31,13 @@ impl Args {
         } else if self.group_members != 1 || self.ack_window != 1024 {
             return Err("group members and acknowledgment windows require --groups".into());
         }
+        if self.delay_millis.is_some()
+            && (self.implementation != "ozzy"
+                || self.groups != 0
+                || self.dedup_window_secs.is_some())
+        {
+            return Err("--delay-millis requires --impl ozzy without groups or dedup".into());
+        }
         // One broker group admits at most 32 preprovisioned readers.
         if !(1..=32).contains(&self.readers())
             || (self.readers_per_partition != 1 && self.implementation != "ozzy")

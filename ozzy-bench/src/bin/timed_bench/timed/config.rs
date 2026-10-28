@@ -83,7 +83,10 @@ fn prepared_operation_bounds(
         records,
         record_bytes: args.record_bytes,
         target_bytes: sdk_batch_target(args),
-        resolved: args.native.dedup_window_secs.is_some(),
+        metadata: ozzy_bench::native::AppendMetadata {
+            resolved: args.native.dedup_window_secs.is_some(),
+            scheduled: args.native.delay_millis.is_some(),
+        },
     }
     .bounds(capacity)
 }
@@ -205,6 +208,7 @@ impl Config {
         }
         let history = History::new(&args, native_disk, writers)?;
         validate::feeds(&args, &sizing)?;
+        validate::delay(&args, &sizing)?;
         if production && !validate::sdk_owner_counts_valid(&args, &sizing) {
             return Err(error(
                 "native SDK owner count/request bounds exceeded before initialization",
@@ -242,6 +246,11 @@ impl Config {
                 .install_clients(clients, payload_pools)?;
         }
         Ok(config)
+    }
+
+    /// How long brokers hold each record, in nanoseconds; zero stores at once.
+    pub(super) fn delay_ns(&self) -> u64 {
+        self.args.native.delay_millis.unwrap_or(0) * 1_000_000
     }
 
     pub(super) fn logical_writers(&self) -> usize {

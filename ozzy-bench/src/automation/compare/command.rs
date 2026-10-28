@@ -141,7 +141,8 @@ impl Args {
         Ok(())
     }
 
-    /// Redundant and skewed feeds, consumer groups, and deduplication limits.
+    /// Redundant and skewed feeds, consumer groups, deduplication limits, and
+    /// delay.
     fn feed_flags(&self, argv: &mut Argv) -> Result<()> {
         if self.feeds.redundant_producers != 1 {
             argv.add(
@@ -169,6 +170,13 @@ impl Args {
             argv.add("--dedup-max-entries", entries.to_string());
             let bytes = self.dedup_max_bytes.ok_or("missing dedup byte limit")?;
             argv.add("--dedup-max-bytes", bytes.to_string());
+        }
+        if let Some(millis) = self.delay_millis {
+            argv.add("--delay-millis", millis.to_string());
+            if let Some(entries) = self.delay_max_entries {
+                argv.add("--delay-max-entries", entries.to_string());
+            }
+            argv.add("--drain-timeout-secs", self.drain_secs().to_string());
         }
         Ok(())
     }

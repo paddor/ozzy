@@ -31,6 +31,10 @@ pub(in crate::bench::timed) struct Oracle {
     lanes: Vec<Option<Lane>>,
     copy: usize,
     untimed: Vec<Untimed>,
+    /// Held records start their timings at release: the send clock plus
+    /// this delay, which their due time never precedes. The window, pacing
+    /// plan, and so the latency cohort move with it.
+    delay: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -74,6 +78,8 @@ impl Oracle {
         copy: usize,
         window: Window,
     ) -> Result<Self> {
+        let delay = config.delay_ns();
+        let window = window.delayed(delay)?;
         let selected: BTreeSet<_> = partitions.iter().copied().collect();
         if count == 0
             || selected.len() != partitions.len()
@@ -107,6 +113,7 @@ impl Oracle {
             lanes,
             copy,
             untimed: Vec::new(),
+            delay,
         })
     }
 
@@ -173,7 +180,9 @@ impl Oracle {
         let Some(&clock) = bytes.first_chunk() else {
             return Err(error("record lacks its send clock"));
         };
-        let start = u64::from_be_bytes(clock);
+        let start = u64::from_be_bytes(clock)
+            .checked_add(self.delay)
+            .ok_or_else(|| error("record release clock overflow"))?;
         // Compare these original bytes with the writer digest outside broker
         // state. Regenerating bodies on the reader would change the workload.
         state.counts.record_bytes(record.id, bytes);
@@ -188,6 +197,9 @@ impl Oracle {
     }
 
     fn time(&mut self, record: Untimed, completed: u64) -> Result<()> {
+        if completed < record.start && self.delay != 0 {
+            return Err(error("reader saw a held record before its due time"));
+        }
         let counts = &mut self
             .lanes
             .get_mut(record.lane)

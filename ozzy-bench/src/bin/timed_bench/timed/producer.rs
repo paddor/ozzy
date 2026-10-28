@@ -237,9 +237,12 @@ impl Lane<'_> {
         {
             return Err(error("stream confirmation identity mismatch"));
         }
+        // A held record's offset is its schedule sequence, which rises the same.
+        let held = self.config.args.native.delay_millis.is_some();
         let disposition = match receipt.disposition {
-            ozzy_runtime::replicated::AppendDisposition::Stored => 0,
-            ozzy_runtime::replicated::AppendDisposition::Duplicate => 1,
+            ozzy_runtime::replicated::AppendDisposition::Stored if !held => 0,
+            ozzy_runtime::replicated::AppendDisposition::Duplicate if !held => 1,
+            ozzy_runtime::replicated::AppendDisposition::Scheduled if held => 2,
             _ => return Err(error("stream confirmation disposition mismatch")),
         };
         check.dispositions[disposition] += 1;
@@ -261,6 +264,8 @@ struct LaneRun<'a> {
     check: ReceiptCheck,
     /// Records admitted so far, and so the next record's sequence.
     sequence: u64,
+    /// The last due time this lane sent, in Unix milliseconds.
+    due: u64,
     /// What the lane waits for, named in deadline errors.
     stage: &'static str,
 }
@@ -281,6 +286,7 @@ async fn run_lane(
         counts: Counts::new(window),
         check: writer.receipt_check(config.args.native.feeds.enabled()),
         sequence: 0,
+        due: 0,
         stage: "admission",
     };
     let deadline = window.deadline(&config.args);
@@ -309,14 +315,21 @@ impl LaneRun<'_> {
         // Bound caller work so all timed writer lanes get polled before the deadline.
         let turn_records = turn_records(config);
         let mut start = 0;
+        // Held records read the Unix clock with their shared send clock.
+        let held = config.args.native.delay_millis.is_some();
+        let mut unix = 0;
         loop {
             if self.sequence.is_multiple_of(CLOCK_QUANTUM) {
                 start = metrics::monotonic_ns();
                 if start >= window.end {
                     break;
                 }
+                if held {
+                    unix = metrics::unix_ns();
+                }
             }
             let input = self.next_raw_input(&mut scratch, start)?;
+            let input = self.hold(input, || unix);
             self.stage = "admission";
             let record = writer.send(input).await?;
             self.counts.submission(start, 1);
@@ -357,6 +370,20 @@ impl LaneRun<'_> {
         };
         self.counts.record_bytes(id, scratch);
         Ok(input)
+    }
+
+    /// With a delay, hold `input` that long past `unix`, the Unix clock read
+    /// at or after the record's send clock. Its due time is then never before
+    /// that clock plus the delay. A lane's due times never fall, so its
+    /// records release in order.
+    fn hold(&mut self, input: RecordInput, unix: impl FnOnce() -> u64) -> RecordInput {
+        let Some(delay) = self.lane.config.args.native.delay_millis else {
+            return input;
+        };
+        self.due = self
+            .due
+            .max(unix().div_ceil(1_000_000).saturating_add(delay));
+        input.with_due_millis(self.due)
     }
 
     /// Complete every already confirmed record at the front, reading the
@@ -412,8 +439,9 @@ impl LaneRun<'_> {
         let mut row = self.counts.report(self.lane.index);
         row["partition"] = json!(partition);
         row["confirmed_partition_offset_range"] = json!(self.check.offset_range());
+        let [stored, duplicate, scheduled] = self.check.dispositions;
         row["confirmed_dispositions"] =
-            json!({"stored": self.check.dispositions[0], "duplicate": self.check.dispositions[1]});
+            json!({"stored": stored, "duplicate": duplicate, "scheduled": scheduled});
         if self.lane.config.args.native.feeds.enabled() {
             row["confirmed_offset_digest_xxh3_128"] = json!(self.check.offset_digest());
         }
