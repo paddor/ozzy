@@ -24,6 +24,7 @@ impl ReadIndexBody for OperationBody<'_> {
         let batches = match self {
             Self::Append(append) => append.batches.as_slice(),
             Self::ResolvedAppend(append) => std::slice::from_ref(&append.batch),
+            Self::Release(release) => std::slice::from_ref(&release.batch),
             _ => &[],
         };
         batches.iter().map(|batch| ReadBatch {

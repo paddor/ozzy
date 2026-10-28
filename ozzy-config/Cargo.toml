@@ -31,3 +31,7 @@ path = "tests/config.rs"
 [[test]]
 name = "ozzy_dedup_config"
 path = "tests/dedup.rs"
+
+[[test]]
+name = "ozzy_delay_config"
+path = "tests/delay.rs"

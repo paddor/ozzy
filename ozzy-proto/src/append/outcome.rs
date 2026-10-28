@@ -23,6 +23,8 @@ pub enum AppendDisposition {
     Stored = 0,
     /// An earlier occurrence wins; no additional user record is stored.
     Duplicate = 1,
+    /// Held until its due time. The offset slot carries its schedule sequence.
+    Scheduled = 2,
 }
 
 impl TryFrom<u8> for AppendDisposition {
@@ -32,6 +34,7 @@ impl TryFrom<u8> for AppendDisposition {
         match value {
             0 => Ok(Self::Stored),
             1 => Ok(Self::Duplicate),
+            2 => Ok(Self::Scheduled),
             _ => Err(CodecError::Profile),
         }
     }

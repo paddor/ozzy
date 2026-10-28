@@ -37,6 +37,7 @@ fn create() -> OperationBody<'static> {
         topic: "topic",
         partition_id: PartitionId::new(7),
         owner_epoch: OwnerEpoch::new(9),
+        delay_max_millis: None,
         dedup_window_millis: None,
         retention: RetentionPolicy::default(),
     })

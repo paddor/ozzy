@@ -195,14 +195,17 @@ pub(super) async fn setup_shared_directory_profile(
             continue;
         }
         let incarnation = multiple::incarnation(number);
-        let mut actor = actor_with_partition_memory(
+        let mut actor = actor_with_options(
             &mut controller,
             io.clone(),
             number as u8 + 1,
             writers,
             incarnation,
             PartitionId::new(number as u32),
-            Some(&data),
+            ActorOptions {
+                memory: Some(&data),
+                ..ActorOptions::default()
+            },
         );
         groups.push(actor.group());
         native.push(super::super::intake_access_profile(

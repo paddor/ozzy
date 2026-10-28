@@ -183,6 +183,7 @@ fn only_the_supported_header_and_canonical_partition_binding_are_accepted() {
         topic: "orders",
         partition_id: PartitionId::ZERO,
         owner_epoch: OwnerEpoch::INITIAL,
+        delay_max_millis: None,
         dedup_window_millis: std::num::NonZeroU64::new(10),
         retention: RetentionPolicy::default(),
     });

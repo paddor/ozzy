@@ -257,17 +257,31 @@ impl AppendBuffer {
         Ok(())
     }
 
-    // One-batch canonical header: count, partition, owner, producer, epoch,
-    // sequence, then offset and timestamp. Called only after full typed decoding.
+    /// Replace the position of producer batch `index`, returning the old
+    /// one. Called only after full typed decoding.
     pub(in crate::replica_journal) fn replace_append_position(
         &mut self,
         index: usize,
         position: [u8; 16],
     ) -> Result<[u8; 16], JournalError> {
-        const START: usize = 4 + 16 + 8 + 16 + 8 + 8;
-        self.validated = false;
         assert!(self.is_producer() && index < self.len());
-        let start = self.entries[index].body.start + START;
+        self.write_position(index, position)
+    }
+
+    /// Replace the first offset and timestamp of one-batch body `index`.
+    pub(super) fn write_position(
+        &mut self,
+        index: usize,
+        position: [u8; 16],
+    ) -> Result<[u8; 16], JournalError> {
+        self.validated = false;
+        let start = self
+            .entries
+            .get(index)
+            .ok_or(JournalError::AppendMismatch)?
+            .body
+            .start
+            + super::POSITION;
         let target: &mut [u8; 16] = self
             .bodies
             .mutable()?

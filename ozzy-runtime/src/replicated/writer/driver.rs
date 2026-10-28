@@ -329,7 +329,12 @@ impl Session {
         limits: ozzy_proto::append::DataLimits,
         decoded_payload: Payload,
     ) -> Result<Prepared, Failure> {
-        let compressed = self.compress(&decoded_payload)?;
+        // Brokers copy any prefix of held records, so scheduled ones stay raw.
+        let compressed = if self.batch.scheduled(shared) {
+            None
+        } else {
+            self.compress(&decoded_payload)?
+        };
         let (payload_encoding, encoded_payload_bytes) = compressed
             .as_ref()
             .map_or((PayloadEncoding::Raw, decoded_payload.len()), |encoded| {

@@ -49,6 +49,7 @@ fn populated_state() -> CanonicalState {
             topic: "orders",
             partition_id: PartitionId::new(7),
             owner_epoch: OwnerEpoch::INITIAL,
+            delay_max_millis: None,
             dedup_window_millis: None,
             retention: RetentionPolicy {
                 max_age_millis: NonZeroU64::new(3_600_000),

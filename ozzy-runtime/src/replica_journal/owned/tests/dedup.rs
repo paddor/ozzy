@@ -178,6 +178,7 @@ fn enabled_policy_without_an_identity_image_is_rejected_before_admission() {
         topic: "orders",
         partition_id: PartitionId::ZERO,
         owner_epoch: OwnerEpoch::INITIAL,
+        delay_max_millis: None,
         dedup_window_millis: std::num::NonZeroU64::new(10),
         retention: RetentionPolicy::default(),
     });

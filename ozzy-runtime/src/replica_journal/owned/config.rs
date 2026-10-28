@@ -9,6 +9,28 @@ use tokio::sync::Semaphore;
 
 pub use ozzy_core::dedup::Limits as DedupLimits;
 
+/// Leader admission bounds of a partition that holds scheduled records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DelayLimits {
+    /// Scheduled records the partition holds before it refuses more.
+    pub max_entries: usize,
+}
+
+impl DelayLimits {
+    /// Core snapshot bytes of a full set of held records.
+    pub const fn snapshot_bytes(self) -> Option<usize> {
+        self.max_entries
+            .checked_mul(ozzy_core::state::PENDING_SCHEDULE_SNAPSHOT_BYTES)
+    }
+}
+
+/// Core snapshot bytes of every retry span the canonical limit allows.
+pub fn retry_span_snapshot_bytes() -> Option<usize> {
+    ozzy_core::state::StateLimits::default()
+        .max_retry_spans
+        .checked_mul(ozzy_core::state::RETRY_SPAN_SNAPSHOT_BYTES)
+}
+
 /// Size a partition's identity reservation for its live pipeline. Pending
 /// identities stay charged until application, and a backup can hold its
 /// whole retained capacity accepted but not yet applied.
@@ -49,6 +71,9 @@ pub struct OwnedConfig<C = ConfigurationRecord> {
     /// Optional partition-local identity reservation, separate from core clones.
     /// Its window must exactly match the immutable canonical topic policy.
     pub deduplication: Option<DedupLimits>,
+    /// Leader bounds for scheduled records. Absent leaves only the canonical
+    /// state limit.
+    pub delay: Option<DelayLimits>,
     /// Maximum simultaneously leased APPEND/history arenas for this owner.
     pub append_buffers: usize,
     /// Count/body bounds for each arena, separate from the shared device budget.

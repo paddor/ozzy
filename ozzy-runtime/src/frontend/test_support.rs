@@ -57,6 +57,7 @@ pub(super) fn append(target: Placement, binding: Binding) -> Message {
                 first_sequence: 0,
             },
             policy: append::Policy::QuorumDurable,
+            due_millis: None,
             records: &[append::Record {
                 encoding: ozzy_proto::data::Encoding::Raw,
                 message_id: MessageId::from_bytes([5; 16]),

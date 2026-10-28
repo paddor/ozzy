@@ -2,7 +2,7 @@
 //! No command lane, task, file descriptor or execution pool is created here.
 
 mod config;
-pub use config::{DedupLimits, OwnedConfig, dedup_limits};
+pub use config::{DedupLimits, DelayLimits, OwnedConfig, dedup_limits, retry_span_snapshot_bytes};
 pub(in crate::replica_journal) mod dedup;
 mod facts;
 pub use facts::{GroupSource, PartitionFacts};
@@ -36,7 +36,9 @@ mod room;
 mod spare;
 pub use replay::{CompletedReplay, PreparedReplay, ReplayRequest};
 mod receiving;
+pub(in crate::replica_journal) mod release;
 pub use receiving::{RecoveringJournal, RecoveryGenerations, RecoveryOpen};
+pub use release::ReleaseTurn;
 mod validation;
 mod writeback;
 pub use writeback::{
@@ -85,6 +87,7 @@ pub struct OwnedJournal {
     room: room::Room,
     spare: spare::Spare,
     dedup: dedup::State,
+    delay: Option<DelayLimits>,
     selected: Option<CanonicalRecoveryCandidate>,
     history: Option<JournalHistory>,
     replay: replay::Replay,
@@ -281,6 +284,7 @@ impl OwnedJournal {
             spare: spare::Spare::default(),
             indexing: indexing::Indexing::default(),
             dedup: dedup::State::new(config.deduplication),
+            delay: config.delay,
             selected: None,
             history: None,
             replay: replay::Replay::default(),

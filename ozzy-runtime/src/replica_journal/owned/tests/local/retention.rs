@@ -80,27 +80,42 @@ fn run_retention_jobs(controller: &mut Controller, journal: &mut OwnedJournal) {
     }
 }
 
-fn roll(controller: &mut Controller, journal: &mut OwnedJournal) {
+pub(super) fn roll(controller: &mut Controller, journal: &mut OwnedJournal) {
     let work = journal.begin_roll(8).unwrap();
     let done = drive(controller, work.publish());
     journal.complete_roll(done).unwrap();
 }
 
 /// Confirm a byte retention target for the partition at revision one.
-fn limit_bytes(
+pub(super) fn limit_bytes(
     controller: &mut Controller,
     journal: &mut OwnedJournal,
     driver: &mut Driver,
     max_bytes: u64,
 ) {
+    limit(
+        controller,
+        journal,
+        driver,
+        RetentionPolicy {
+            max_age_millis: None,
+            max_bytes: NonZeroU64::new(max_bytes),
+        },
+    );
+}
+
+/// Confirm a retention policy for the partition at revision one.
+pub(super) fn limit(
+    controller: &mut Controller,
+    journal: &mut OwnedJournal,
+    driver: &mut Driver,
+    retention: RetentionPolicy,
+) {
     let body = OperationBody::PartitionPolicy(PartitionPolicy {
         partition: partition(),
         expected_revision: 1,
         new_revision: 2,
-        retention: RetentionPolicy {
-            max_age_millis: None,
-            max_bytes: NonZeroU64::new(max_bytes),
-        },
+        retention,
         operation_id: OperationId::from_bytes([90; 16]),
     });
     let mut buffer = journal.lease_proposal_buffer().unwrap();

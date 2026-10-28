@@ -37,6 +37,7 @@ pub use native::{
     NativeAccess, NativeIntake, NativeIntakeConfig, NativeIntakeError, NativeReceive,
 };
 mod reader_cursor;
+mod release_turns;
 mod response;
 mod retention_turns;
 mod shared_readers;
@@ -89,6 +90,7 @@ use io::{PendingIo, PendingSync};
 #[derive(Debug)]
 pub struct ReplicaActor {
     maintenance: maintenance::Turns,
+    releases: release_turns::Releases,
     startup_probe: Option<startup::Probe>,
     recovery_required: bool,
     donors: Option<Box<donors::Donors>>,

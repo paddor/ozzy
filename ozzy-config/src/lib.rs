@@ -31,9 +31,9 @@ pub use identity::{DeploymentIdentity, PartitionIdentity, TopicIdentity};
 pub use placement::{BrokerPlan, ControllerPlan, HostResources, PartitionPlacement, ShardPlan};
 pub use schema::{
     Affinity, Broker, ByteRateLimit, Cluster, Deployment, DeploymentMode, Device, Endpoints,
-    IoBackend, MAX_APPEND_BYTES, MAX_CLIENTS, MAX_PARTITION_SEGMENTS, MemoryPool, Omq,
-    PartitionOverride, QueueBudget, ResourceLimits, Shard, StorageWorkers, Topic,
-    TopicDeduplication, TopicRetention, Topology,
+    IoBackend, MAX_APPEND_BYTES, MAX_CLIENTS, MAX_DELAY_ENTRIES, MAX_PARTITION_SEGMENTS,
+    MemoryPool, Omq, PartitionOverride, QueueBudget, ResourceLimits, Shard, StorageWorkers, Topic,
+    TopicDeduplication, TopicDelay, TopicRetention, Topology,
 };
 pub use validate::ValidatedDeployment;
 

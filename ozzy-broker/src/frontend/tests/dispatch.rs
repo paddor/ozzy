@@ -73,6 +73,7 @@ fn message(binding: Binding, target: Placement, control: bool) -> Message {
                     first_sequence: 0,
                 },
                 policy: append::Policy::LocalDurable,
+                due_millis: None,
                 records: &[append::Record {
                     encoding: ozzy_proto::data::Encoding::Raw,
                     message_id: MessageId::from_bytes([5; 16]),

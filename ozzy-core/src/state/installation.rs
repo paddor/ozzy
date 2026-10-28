@@ -110,6 +110,7 @@ impl CanonicalState {
             Mutation::DedupTime { partition, time } => {
                 self.partition_mut(partition)?.dedup_time = time;
             }
+            Mutation::Delay(prepared) => self.install_delay(prepared)?,
             Mutation::Barrier => {}
         }
         Ok(())
@@ -132,12 +133,12 @@ impl CanonicalState {
         results: PreparedProducerResults,
         time: u64,
     ) -> Result<(), StateError> {
-        let additional = results.additional;
+        let (additional, evicted) = (results.additional, results.evict);
         let state = self.partition_mut(partition)?;
         state.next_offset = results.next_offset;
         state.dedup_time = time;
         state.producer_mut(producer)?.install_results(results);
-        self.count_retry_spans(additional, 0)
+        self.count_retry_spans(additional, evicted)
     }
 
     fn install_assignment(&mut self, key: AssignmentKey, value: AssignmentState) {
@@ -161,7 +162,7 @@ impl CanonicalState {
     }
 
     /// A partition the validated plan names.
-    fn partition_mut(
+    pub(super) fn partition_mut(
         &mut self,
         partition: PartitionIncarnation,
     ) -> Result<&mut super::CanonicalPartition, StateError> {
@@ -193,7 +194,11 @@ impl CanonicalState {
 
     /// Account result spans one applied mutation added and released. The
     /// plan charged them against the image limits before apply.
-    fn count_retry_spans(&mut self, added: usize, released: usize) -> Result<(), StateError> {
+    pub(super) fn count_retry_spans(
+        &mut self,
+        added: usize,
+        released: usize,
+    ) -> Result<(), StateError> {
         self.retry_span_count = self
             .retry_span_count
             .checked_add(added)
@@ -208,14 +213,16 @@ impl CanonicalState {
                 .partitions
                 .get_mut(&cursor.partition)
                 .ok_or(StateError::UnknownPartition)?;
-            state.producer_mut(cursor.producer)?.record_assignment(
+            let producer = state.producer_mut(cursor.producer)?;
+            producer.evict_results(usize::from(cursor.evict));
+            producer.record_assignment(
                 cursor.first_sequence,
                 cursor.first_offset,
                 cursor.records,
                 self.limits.max_retry_spans,
             )?;
             state.next_offset = cursor.next_offset;
-            self.count_retry_spans(usize::from(cursor.new_span), 0)?;
+            self.count_retry_spans(usize::from(cursor.new_span), usize::from(cursor.evict))?;
         }
         Ok(())
     }

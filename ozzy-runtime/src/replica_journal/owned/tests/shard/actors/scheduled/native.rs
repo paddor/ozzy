@@ -59,6 +59,7 @@ fn create(actor: &ReplicaActor) -> crate::replica_journal::ProposalBuffer {
         topic: "orders",
         partition_id: PartitionId::ZERO,
         owner_epoch: OwnerEpoch::INITIAL,
+        delay_max_millis: None,
         dedup_window_millis: None,
         retention: RetentionPolicy::default(),
     });
@@ -364,6 +365,7 @@ fn append_request_at(actor: &Scheduled, sequence: u8) -> Message {
                 first_sequence: u64::from(sequence),
             },
             policy: append::Policy::QuorumDurable,
+            due_millis: None,
             records: &[append::Record {
                 encoding: ozzy_proto::data::Encoding::Raw,
                 message_id: ozzy_proto::MessageId::from_bytes([45 + sequence; 16]),

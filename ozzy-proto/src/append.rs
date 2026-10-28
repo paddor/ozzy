@@ -30,6 +30,38 @@ pub use receipt::{
 /// Bytes in the common owner-routed identity header, before policy and descriptors.
 pub const IDENTITY_METADATA_BYTES: usize = 89;
 
+/// Profile tag of an APPEND whose records are delivered at once.
+const IMMEDIATE_PROFILE: u8 = 1;
+/// Profile tag of an APPEND whose records wait for their due times. Its
+/// metadata ends with one due time per record.
+const SCHEDULED_PROFILE: u8 = 2;
+
+/// Absolute Unix due times in milliseconds, one per record of a scheduled
+/// APPEND, borrowed from its metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DueTimes<'a>(&'a [u8]);
+
+impl<'a> DueTimes<'a> {
+    /// Number of due times.
+    pub const fn len(self) -> usize {
+        self.0.len() / 8
+    }
+
+    /// Whether no due time is present.
+    pub const fn is_empty(self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Due times in record order.
+    pub fn iter(self) -> impl ExactSizeIterator<Item = u64> + 'a {
+        self.0
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|bytes| u64::from_be_bytes(*bytes))
+    }
+}
+
 /// Stable append identity, independent of link correlation and current primary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppendKey {
@@ -63,8 +95,8 @@ pub fn route(packet: Packet<'_>, limits: crate::EnvelopeLimits) -> Result<Route,
     packet
         .envelope
         .validate_frames(packet.metadata.len(), packet.payload.len(), limits)?;
-    let (authority, partition, owner_epoch, key) =
-        decode_common(&mut Reader::new(packet.metadata))?;
+    let (_, (authority, partition, owner_epoch, key)) =
+        decode_profile(&mut Reader::new(packet.metadata))?;
     Ok(Route {
         authority,
         partition,
@@ -111,6 +143,9 @@ pub struct Append<'a> {
     pub policy: Policy,
     /// Nonempty, ordered records.
     pub records: &'a [Record<'a>],
+    /// One absolute Unix due time in milliseconds per record. Present makes
+    /// this a scheduled APPEND.
+    pub due_millis: Option<&'a [u64]>,
 }
 
 /// Structurally valid append borrowing the received frame storage.
@@ -135,6 +170,8 @@ pub struct DecodedAppend<'a> {
     pub encoded_payload: &'a [u8],
     /// Fully length-checked descriptors and opaque payload.
     pub records: Records<'a>,
+    /// One due time per record of a scheduled APPEND.
+    pub due_millis: Option<DueTimes<'a>>,
 }
 
 /// Structurally validated APPEND retaining its exact payload representation.
@@ -157,6 +194,8 @@ pub struct ValidatedAppend<'a> {
     pub encoded_payload: &'a [u8],
     /// Validated identities and part lengths for the decoded records.
     pub records: super::data::RecordDescriptors<'a>,
+    /// One due time per record of a scheduled APPEND.
+    pub due_millis: Option<DueTimes<'a>>,
 }
 
 /// An already packed APPEND payload frame that the caller sends unchanged.
@@ -255,6 +294,7 @@ fn encode_frames(
     }
     let (descriptors, decoded_bytes) =
         super::data::records_size(append.records, append.key.first_sequence, limits)?;
+    let (profile, due_bytes) = profile(append)?;
     let (encoding, payload_bytes) = match payload {
         PayloadFrame::Prepared(prepared) => (prepared.encoding, prepared.encoded_bytes),
         PayloadFrame::Copied(_) | PayloadFrame::Parts => (PayloadEncoding::Raw, decoded_bytes),
@@ -263,7 +303,7 @@ fn encode_frames(
         return Err(CodecError::Length);
     }
     validate_payload_encoding(encoding, decoded_bytes, payload_bytes, limits)?;
-    let metadata_bytes = add(IDENTITY_METADATA_BYTES + 6, descriptors)?;
+    let metadata_bytes = add(add(IDENTITY_METADATA_BYTES + 6, descriptors)?, due_bytes)?;
     let header = envelope.encode_header(metadata_bytes, payload_bytes, limits.envelope)?;
     capacity(metadata, metadata_bytes)?;
     let mut payload = match payload {
@@ -275,17 +315,35 @@ fn encode_frames(
         payload.clear();
     }
     metadata.clear();
-    encode_common(
+    encode_identity(
         metadata,
-        append.authority,
-        append.partition,
-        append.owner_epoch,
-        append.key,
+        profile,
+        (
+            append.authority,
+            append.partition,
+            append.owner_epoch,
+            append.key,
+        ),
     );
     metadata.push(append.policy as u8);
     encode_payload_encoding(metadata, encoding, decoded_bytes)?;
     super::data::encode_records(append.records, metadata, payload);
+    for due in append.due_millis.into_iter().flatten() {
+        metadata.extend_from_slice(&due.to_be_bytes());
+    }
     Ok(header)
+}
+
+/// The APPEND profile tag and its due-time trailer bytes, one `u64` per record.
+fn profile(append: Append<'_>) -> Result<(u8, usize), CodecError> {
+    match append.due_millis {
+        None => Ok((IMMEDIATE_PROFILE, 0)),
+        Some(due) if due.len() == append.records.len() => Ok((
+            SCHEDULED_PROFILE,
+            due.len().checked_mul(8).ok_or(CodecError::Length)?,
+        )),
+        Some(_) => Err(CodecError::Length),
+    }
 }
 
 /// Decode a raw APPEND without allocation.
@@ -298,8 +356,9 @@ pub fn decode_append(
     if payload_encoding != PayloadEncoding::Raw {
         return Err(CodecError::Profile);
     }
+    let (descriptors, due_millis) = split_due_times(cursor.rest(), header.scheduled)?;
     let records = super::data::decode_records(
-        cursor.rest(),
+        descriptors,
         packet.payload,
         header.key.first_sequence,
         limits,
@@ -313,6 +372,7 @@ pub fn decode_append(
         payload_encoding,
         encoded_payload: packet.payload,
         records,
+        due_millis,
     })
 }
 
@@ -325,8 +385,9 @@ pub fn decode_append_with_scratch<'a>(
     let (header, mut cursor) = decode_header(packet, limits)?;
     let (payload_encoding, payload) =
         decode_payload_encoding(&mut cursor, packet.payload, scratch, limits)?;
+    let (descriptors, due_millis) = split_due_times(cursor.rest(), header.scheduled)?;
     let records =
-        super::data::decode_records(cursor.rest(), payload, header.key.first_sequence, limits)?;
+        super::data::decode_records(descriptors, payload, header.key.first_sequence, limits)?;
     Ok(DecodedAppend {
         authority: header.authority,
         partition: header.partition,
@@ -336,6 +397,7 @@ pub fn decode_append_with_scratch<'a>(
         payload_encoding,
         encoded_payload: packet.payload,
         records,
+        due_millis,
     })
 }
 
@@ -347,8 +409,9 @@ pub fn validate_append(
     let (header, mut cursor) = decode_header(packet, limits)?;
     let (payload_encoding, decoded_bytes) =
         read_payload_encoding(&mut cursor, packet.payload.len(), limits)?;
+    let (descriptors, due_millis) = split_due_times(cursor.rest(), header.scheduled)?;
     let records = super::data::decode_record_descriptors(
-        cursor.rest(),
+        descriptors,
         decoded_bytes,
         header.key.first_sequence,
         limits,
@@ -367,6 +430,7 @@ pub fn validate_append(
         payload_encoding,
         encoded_payload: packet.payload,
         records,
+        due_millis,
     })
 }
 
@@ -395,7 +459,19 @@ fn encode_common(
     owner_epoch: u64,
     key: AppendKey,
 ) {
-    output.push(1);
+    encode_identity(
+        output,
+        IMMEDIATE_PROFILE,
+        (authority, partition, owner_epoch, key),
+    );
+}
+
+fn encode_identity(
+    output: &mut Vec<u8>,
+    profile: u8,
+    (authority, partition, owner_epoch, key): Identity,
+) {
+    output.push(profile);
     output.extend_from_slice(authority.group_id.as_bytes());
     output.extend_from_slice(&authority.config_epoch.to_be_bytes());
     output.extend_from_slice(&authority.view.to_be_bytes());
@@ -413,6 +489,7 @@ struct Header {
     owner_epoch: u64,
     key: AppendKey,
     policy: Policy,
+    scheduled: bool,
 }
 
 /// Check the APPEND command and frame bounds, then read its header fields.
@@ -427,7 +504,7 @@ fn decode_header(
         limits.envelope,
     )?;
     let mut cursor = Reader::new(packet.metadata);
-    let (authority, partition, owner_epoch, key) = decode_common(&mut cursor)?;
+    let (scheduled, (authority, partition, owner_epoch, key)) = decode_profile(&mut cursor)?;
     let policy = Policy::try_from(cursor.u8()?)?;
     let header = Header {
         authority,
@@ -435,16 +512,32 @@ fn decode_header(
         owner_epoch,
         key,
         policy,
+        scheduled,
     };
     Ok((header, cursor))
 }
 
-fn decode_common(
-    cursor: &mut Reader<'_>,
-) -> Result<(Authority, PartitionIncarnation, u64, AppendKey), CodecError> {
-    if cursor.u8()? != 1 {
+type Identity = (Authority, PartitionIncarnation, u64, AppendKey);
+
+/// The identity of a receipt, which only uses the immediate profile.
+fn decode_common(cursor: &mut Reader<'_>) -> Result<Identity, CodecError> {
+    if cursor.u8()? != IMMEDIATE_PROFILE {
         return Err(CodecError::Profile);
     }
+    decode_identity(cursor)
+}
+
+/// Whether an APPEND is scheduled, and its routing identity.
+fn decode_profile(cursor: &mut Reader<'_>) -> Result<(bool, Identity), CodecError> {
+    let scheduled = match cursor.u8()? {
+        IMMEDIATE_PROFILE => false,
+        SCHEDULED_PROFILE => true,
+        _ => return Err(CodecError::Profile),
+    };
+    Ok((scheduled, decode_identity(cursor)?))
+}
+
+fn decode_identity(cursor: &mut Reader<'_>) -> Result<Identity, CodecError> {
     let authority = Authority {
         group_id: GroupId::from_bytes(cursor.array()?),
         config_epoch: cursor.u64()?,
@@ -459,4 +552,22 @@ fn decode_common(
     };
     identities(authority, partition, owner_epoch, key)?;
     Ok((authority, partition, owner_epoch, key))
+}
+
+/// Split a scheduled APPEND's trailing due times, one per counted record,
+/// from its descriptor table.
+fn split_due_times(
+    metadata: &[u8],
+    scheduled: bool,
+) -> Result<(&[u8], Option<DueTimes<'_>>), CodecError> {
+    if !scheduled {
+        return Ok((metadata, None));
+    }
+    let records = Reader::new(metadata).u32()? as usize;
+    let split = records
+        .checked_mul(8)
+        .and_then(|bytes| metadata.len().checked_sub(bytes))
+        .ok_or(CodecError::Length)?;
+    let (descriptors, due) = metadata.split_at(split);
+    Ok((descriptors, Some(DueTimes(due))))
 }

@@ -207,6 +207,9 @@ async fn maintenance(
             state.owner.retain_identities_turn(ticket, leader),
             permit,
         ),
+        MaintenanceAction::Release { ticket, done } => {
+            return release(state, ticket, done, permit, timestamp).await;
+        }
         MaintenanceAction::ValidateStorage {
             ticket,
             budget,
@@ -233,6 +236,25 @@ async fn maintenance(
         }
     };
     Outcome::done(failed)
+}
+
+/// Pick due held records on the owner, then read them as a detached job.
+async fn release(
+    state: &mut State,
+    ticket: ozzy_replication::driver::ValidationTicket,
+    done: Reply<crate::replica_journal::ReleaseTurn>,
+    permit: OwnedSemaphorePermit,
+    timestamp: u64,
+) -> Outcome {
+    use crate::replica_journal::owned::release::ReleaseStep;
+    let turn = match state.owner.prepare_release(ticket, timestamp).await {
+        Ok(ReleaseStep::Read(read)) => {
+            return Outcome::job(super::jobs::release(*read, done, permit));
+        }
+        Ok(ReleaseStep::Idle) => Ok(crate::replica_journal::ReleaseTurn::default()),
+        Err(error) => Err(error),
+    };
+    Outcome::done(finish_read(done, turn, permit))
 }
 
 async fn history(

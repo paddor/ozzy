@@ -26,20 +26,22 @@ mod watermark;
 use ozzy_journal::operation::{
     Append, AppendBatch, AppendRecord, Assign, Barrier, CreatePartition, OpenProducer,
     OperationBody, OperationCodecError, OperationKind, OperationLimits, PartitionPolicy,
-    ProducerResultFloor, Progress, ProgressAssignment, ProgressOwner, RetentionPolicy,
-    RetireProducer, Trim, append_operation_body, decode_operation_body, encode_operation_body,
+    ProducerResultFloor, Progress, ProgressAssignment, ProgressOwner, RELEASE_FRAME_BYTES, Release,
+    ReleaseKey, RetentionPolicy, RetireProducer, Schedule, Trim, append_operation_body,
+    decode_operation_body, encode_operation_body, encoded_record_bytes,
 };
 use ozzy_proto::{
     ConsumerGroupId, ConsumerMemberId, MessageId, Offset, OperationId, OwnerEpoch, PartitionId,
     PartitionIncarnation, ProducerEpoch, ProducerId, ProducerSequence, SubscriptionId,
 };
 
-const FIXTURES: [&str; 10] = [
+const FIXTURES: [&str; 12] = [
     concat!(
         "10101010101010101010101010101010",
         "0000000673747265616d00000005746f706963",
         "000000070000000000000009",
         "0000000000000000",
+        "00000000001b7740",
         "01030000000000000000ea6000000000000f4240",
     ),
     concat!(
@@ -102,6 +104,29 @@ const FIXTURES: [&str; 10] = [
         "20202020202020202020202020202020",
         "00000000000000090000000000000004",
     ),
+    concat!(
+        "00000001",
+        "10101010101010101010101010101010",
+        "0000000000000009",
+        "20202020202020202020202020202020",
+        "000000000000000900000000000000040000000000000000",
+        "0000018bcfe5687b80000002",
+        "4343434343434343434343434343434344444444444444444444444444444444",
+        "0201646566",
+        "000000000000000c",
+        "0000018bcfe652db0000018bcfe56800",
+    ),
+    concat!(
+        "00000001",
+        "10101010101010101010101010101010",
+        "0000000000000009",
+        "00000000000000000000000000000000",
+        "00000000000000000000000000000000000000000000002a",
+        "0000018bcfe652db80000001",
+        "43434343434343434343434343434343",
+        "026465",
+        "0000018bcfe652db000000000000000c",
+    ),
 ];
 
 fn bodies() -> Vec<OperationBody<'static>> {
@@ -114,6 +139,7 @@ fn bodies() -> Vec<OperationBody<'static>> {
             topic: "topic",
             partition_id: PartitionId::new(7),
             owner_epoch: OwnerEpoch::new(9),
+            delay_max_millis: NonZeroU64::new(1_800_000),
             dedup_window_millis: None,
             retention: RetentionPolicy {
                 max_age_millis: NonZeroU64::new(60_000),
@@ -204,6 +230,53 @@ fn bodies() -> Vec<OperationBody<'static>> {
             producer_id: producer,
             producer_epoch: ProducerEpoch::new(9),
             next_sequence: ProducerSequence::new(4),
+        }),
+        OperationBody::Schedule(Schedule {
+            batch: AppendBatch {
+                partition,
+                owner_epoch: OwnerEpoch::new(9),
+                producer_id: producer,
+                producer_epoch: ProducerEpoch::new(9),
+                first_sequence: ProducerSequence::new(4),
+                first_offset: Offset::ZERO,
+                append_timestamp_millis: 1_700_000_000_123,
+                records: vec![
+                    AppendRecord {
+                        encoding: ozzy_proto::data::Encoding::Raw,
+                        message_id: MessageId::from_bytes([0x43; 16]),
+                        parts: vec![b"de".as_slice()].into(),
+                    },
+                    AppendRecord {
+                        encoding: ozzy_proto::data::Encoding::Raw,
+                        message_id: MessageId::from_bytes([0x44; 16]),
+                        parts: vec![b"f".as_slice()].into(),
+                    },
+                ]
+                .into(),
+            },
+            first_schedule: 12,
+            due_millis: vec![1_700_000_060_123, 1_700_000_000_000],
+        }),
+        OperationBody::Release(Release {
+            batch: AppendBatch {
+                partition,
+                owner_epoch: OwnerEpoch::new(9),
+                producer_id: ProducerId::from_bytes([0; 16]),
+                producer_epoch: ProducerEpoch::new(0),
+                first_sequence: ProducerSequence::ZERO,
+                first_offset: Offset::new(42),
+                append_timestamp_millis: 1_700_000_060_123,
+                records: vec![AppendRecord {
+                    encoding: ozzy_proto::data::Encoding::Raw,
+                    message_id: MessageId::from_bytes([0x43; 16]),
+                    parts: vec![b"de".as_slice()].into(),
+                }]
+                .into(),
+            },
+            through: ReleaseKey {
+                millis: 1_700_000_060_123,
+                schedule: 12,
+            },
         }),
     ]
 }
@@ -374,5 +447,93 @@ fn body_decoder_rejects_trailing_bytes_and_unknown_kinds() {
     assert_eq!(
         OperationKind::try_from(u16::MAX),
         Err(OperationCodecError::UnsupportedOperationKind(u16::MAX))
+    );
+}
+
+#[test]
+fn release_body_is_its_frame_plus_each_record_size() {
+    use ozzy_proto::data::Encoding;
+    static LONG: [u8; 300] = [7; 300];
+    let bodies = bodies();
+    let Some(OperationBody::Release(release)) = bodies.last() else {
+        unreachable!()
+    };
+    let long = &LONG;
+    let records = [
+        (Encoding::Raw, vec![long.as_slice()]),
+        (
+            Encoding::Raw,
+            vec![b"ab".as_slice(), long.as_slice(), b"c".as_slice()],
+        ),
+        (Encoding::Lz4 { decoded_bytes: 900 }, vec![long.as_slice()]),
+    ];
+    for count in 1..=records.len() {
+        let mut release = release.clone();
+        release.batch.records = records[..count]
+            .iter()
+            .map(|(encoding, parts)| AppendRecord {
+                encoding: *encoding,
+                message_id: MessageId::from_bytes([0x43; 16]),
+                parts: parts.iter().copied().collect(),
+            })
+            .collect::<Vec<_>>()
+            .into();
+        let body =
+            encode_operation_body(&OperationBody::Release(release), OperationLimits::default())
+                .unwrap();
+        let sizes = records[..count]
+            .iter()
+            .map(|(encoding, parts)| encoded_record_bytes(*encoding, parts.iter().copied()))
+            .sum::<usize>();
+        assert_eq!(body.len(), RELEASE_FRAME_BYTES + sizes, "{count} records");
+    }
+    // Tiny records take fewer bytes than the general layout.
+    let body = encode_operation_body(
+        &OperationBody::Release(release.clone()),
+        OperationLimits::default(),
+    )
+    .unwrap();
+    assert!(
+        body.len() < RELEASE_FRAME_BYTES + encoded_record_bytes(Encoding::Raw, [b"de".as_slice()])
+    );
+}
+
+#[test]
+fn schedule_and_release_need_one_nonempty_batch_and_matching_due_times() {
+    let limits = OperationLimits::default();
+    let bodies = bodies();
+    let [
+        ..,
+        OperationBody::Schedule(schedule),
+        OperationBody::Release(release),
+    ] = bodies.as_slice()
+    else {
+        unreachable!()
+    };
+    let mut short = schedule.clone();
+    short.due_millis.pop();
+    assert_eq!(
+        encode_operation_body(&OperationBody::Schedule(short), limits),
+        Err(OperationCodecError::InvalidSchedule)
+    );
+    let mut empty = release.clone();
+    empty.batch.records = Vec::<AppendRecord<'_>>::new().into();
+    assert_eq!(
+        encode_operation_body(&OperationBody::Release(empty), limits),
+        Err(OperationCodecError::InvalidSchedule)
+    );
+    let mut overflow = schedule.clone();
+    overflow.first_schedule = u64::MAX;
+    assert_eq!(
+        encode_operation_body(&OperationBody::Schedule(overflow), limits),
+        Err(OperationCodecError::AppendPositionOverflow)
+    );
+    // A second batch makes the body invalid.
+    let mut bytes =
+        encode_operation_body(&OperationBody::Release(release.clone()), limits).unwrap();
+    bytes[..4].copy_from_slice(&2_u32.to_be_bytes());
+    assert_eq!(
+        decode_operation_body(OperationKind::Release, &bytes, limits),
+        Err(OperationCodecError::InvalidSchedule)
     );
 }

@@ -106,6 +106,7 @@ fn append_wire_preserves_multipart_identity_without_assigned_offsets() {
             first_sequence: 5,
         },
         policy: Policy::QuorumDurable,
+        due_millis: None,
         records: &records,
     };
     let mut metadata = Vec::with_capacity(1024);
@@ -178,6 +179,7 @@ fn append_metadata_reuses_owned_payload_without_changing_wire_or_capacity() {
             first_sequence: 5,
         },
         policy: Policy::QuorumDurable,
+        due_millis: None,
         records: &records,
     };
     let limits = DataLimits::default();
@@ -230,6 +232,7 @@ fn compressed_group_validates_once_and_restores_clear_record_boundaries() {
             first_sequence: 5,
         },
         policy: Policy::QuorumDurable,
+        due_millis: None,
         records: &records,
     };
     let decoded = [b"".as_slice(), &large, &large, b"end"].concat();
@@ -298,6 +301,7 @@ fn compressed_group_rejects_bad_codec_lengths_syntax_and_trailing_input() {
             first_sequence: 5,
         },
         policy: Policy::QuorumDurable,
+        due_millis: None,
         records: &records,
     };
     let encoded = lz4rip::block::compress(&body);
@@ -420,4 +424,105 @@ fn compressed_group_rejects_bad_codec_lengths_syntax_and_trailing_input() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn scheduled_append_carries_one_due_time_per_record() {
+    let parts: [&[u8]; 1] = [b"ab"];
+    let records = [
+        Record {
+            encoding: ozzy_proto::data::Encoding::Raw,
+            message_id: MessageId::from_bytes([7; 16]),
+            parts: &parts,
+        },
+        Record {
+            encoding: ozzy_proto::data::Encoding::Raw,
+            message_id: MessageId::from_bytes([8; 16]),
+            parts: &parts,
+        },
+    ];
+    let due = [1_700_000_060_000, 1_700_000_000_000];
+    let append = Append {
+        authority: Authority {
+            group_id: GroupId::from_bytes([4; 16]),
+            config_epoch: 1,
+            view: 2,
+        },
+        partition: PartitionIncarnation::from_bytes([5; 16]),
+        owner_epoch: 3,
+        key: AppendKey {
+            producer_id: ProducerId::from_bytes([6; 16]),
+            producer_epoch: 4,
+            first_sequence: 5,
+        },
+        policy: Policy::QuorumDurable,
+        due_millis: Some(&due),
+        records: &records,
+    };
+    let limits = DataLimits::default();
+    let mut metadata = Vec::with_capacity(1024);
+    let mut payload = Vec::with_capacity(1024);
+    let header = encode_append(envelope(), append, &mut metadata, &mut payload, limits).unwrap();
+    // Profile tag 2, then the immediate layout, then the due times.
+    assert_eq!(metadata[0], 2);
+    let mut trailer = Vec::new();
+    for value in due {
+        trailer.extend_from_slice(&value.to_be_bytes());
+    }
+    assert!(metadata.ends_with(&trailer));
+    let mut immediate = Vec::with_capacity(1024);
+    let immediate_header = encode_append(
+        envelope(),
+        Append {
+            due_millis: None,
+            ..append
+        },
+        &mut immediate,
+        &mut Vec::with_capacity(1024),
+        limits,
+    )
+    .unwrap();
+    assert_eq!(metadata[1..metadata.len() - 16], immediate[1..]);
+
+    let packet = decode_packet(&[&header, &metadata, &payload], EnvelopeLimits::default()).unwrap();
+    let validated = validate_append(packet, limits).unwrap();
+    assert_eq!(validated.records.len(), 2);
+    assert_eq!(
+        validated.due_millis.unwrap().iter().collect::<Vec<_>>(),
+        due
+    );
+    let decoded = decode_append(packet, limits).unwrap();
+    assert_eq!(decoded.due_millis.unwrap().iter().collect::<Vec<_>>(), due);
+    assert_eq!(decoded.records.iter().count(), 2);
+    let plain = decode_packet(
+        &[&immediate_header, &immediate, &payload],
+        EnvelopeLimits::default(),
+    )
+    .unwrap();
+    assert!(validate_append(plain, limits).unwrap().due_millis.is_none());
+
+    // One due time per record, on both sides.
+    assert!(
+        encode_append(
+            envelope(),
+            Append {
+                due_millis: Some(&due[..1]),
+                ..append
+            },
+            &mut Vec::with_capacity(1024),
+            &mut Vec::with_capacity(1024),
+            limits,
+        )
+        .is_err()
+    );
+    let short = &metadata[..metadata.len() - 8];
+    let header = envelope()
+        .encode_header(short.len(), payload.len(), limits.envelope)
+        .unwrap();
+    let packet = decode_packet(&[&header, short, &payload], EnvelopeLimits::default()).unwrap();
+    assert!(validate_append(packet, limits).is_err());
+    let mut unknown = metadata.clone();
+    unknown[0] = 3;
+    let packet = decode_packet(&[&header, &unknown, &payload], EnvelopeLimits::default());
+    assert!(packet.is_err() || validate_append(packet.unwrap(), limits).is_err());
 }

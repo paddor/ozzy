@@ -480,6 +480,7 @@ fn compressed(
                 first_sequence: request.first_sequence.get(),
             },
             policy: Policy::LocalDurable,
+            due_millis: None,
             records: &records,
         },
         &mut metadata,

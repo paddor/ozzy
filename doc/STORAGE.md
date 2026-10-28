@@ -124,6 +124,8 @@ Exact layout: [segment codec](../ozzy-journal-segment/src/codec.rs).
 | 5 | `Assign` | 12 | `GroupPlan` |
 | 6 | `Trim` | 13 | `GroupDelete` |
 | 7 | `PartitionPolicy` | 14 | `RetireProducer` |
+| | | 15 | `Schedule` |
+| | | 16 | `Release` |
 
 Integers are big-endian, IDs 16 bytes, counts and text lengths `u32`. Exact
 schema: [operation codec](../ozzy-journal/src/operation/codec/).
@@ -177,11 +179,42 @@ part. General descriptors use:
   member; each member optional), operation ID.
 - `GroupDelete` (kind 13): format `u8` (1), coordinator and group incarnations,
   the committed revision it retires, operation ID.
-- `CreatePartition` stores the dedup window as `u64` milliseconds; zero
-  disables deduplication.
+- `CreatePartition` stores the dedup window, then the maximum delay, as
+  `u64` milliseconds; zero disables each. A partition cannot enable both.
 - `RetireProducer` (kind 14): partition incarnation, producer ID, epoch
   `u64`, next sequence `u64`. It has no operation ID: the epoch and next
   sequence fence it against any open or append ordered first.
+- `Schedule` (kind 15): exactly one nonempty producer batch with first
+  offset zero and the acceptance timestamp, then first schedule sequence
+  `u64`, then one due time `u64` (Unix milliseconds) per record. It
+  consumes producer and schedule sequences but no offsets.
+- `Release` (kind 16): exactly one nonempty batch with zero producer fields,
+  the next offsets, and the release timestamp, then the release key of its
+  last record: time `u64`, schedule sequence `u64`.
+
+### Scheduled records
+
+- A held record's release key is `(max(due, acceptance), schedule
+  sequence)`. Every schedule or release timestamp is at least the
+  partition's latest one, so a new key sorts after every released key.
+- Partition state holds each held record's key, `Schedule` operation, record
+  index, encoded byte count (descriptor, part lengths, payload), and message
+  ID. Payloads stay in the `Schedule`
+  operation until release.
+- A `Release` copies exactly the held records through its key, in key order.
+  Message IDs and encoded byte counts must match, its timestamp must reach the last
+  key's time, and its batch takes the next offsets. A repeated release finds
+  its records gone and fails.
+- A scheduled attempt's retry result names its `Schedule` operation and maps
+  the sequence to its schedule sequence.
+- Retention keeps the oldest `Schedule` operation that still holds a record,
+  and every later segment. A `Schedule` acceptance time counts toward its
+  segment's age, so retries of a released schedule resolve for the retention
+  age.
+- Readers and indexes treat a `Release` batch like an APPEND batch.
+  `Schedule` records have no offsets and are never indexed.
+- Scheduled payloads are raw, so a release can copy any prefix of held
+  records without recompressing.
 
 ## Record identity and deduplication
 
@@ -191,6 +224,10 @@ part. General descriptors use:
 - Exact sequence-to-offset retry ranges survive checkpoints and leader changes.
   Ranges merge only when both sequences and offsets are adjacent. Expired retry
   results fail explicitly.
+- At most 1,048,576 ranges are kept across a journal's partitions, and
+  checkpoints fit them all. At that limit a new range drops the oldest range
+  of the same producer and raises its retry floor; a producer without one is
+  refused.
 - A leader retires sessions idle for `producer_idle_secs` with their ranges.
   Idleness is the leader's own observation: a new leader starts every session
   with a full expiry. The partition keeps the highest retired epoch, and a
@@ -365,7 +402,7 @@ payload-free duplicate results.
 Canonical checkpoint images start with a 104-byte `OZYCIMG\0` header: version
 `u16` (1), six zero bytes, core snapshot length `u64`, partition incarnation
 (16 bytes), and the 64-byte dedup index header. The last 80 bytes are zero
-without an identity section. The core snapshot (`OZYSTA01`, version 3,
+without an identity section. The core snapshot (`OZYSTA01`, version 4,
 256-byte header) follows, then identity rows. Bare snapshots and other versions
 are rejected. Coordinator group images are each a `u32` length plus the
 `GroupPlan` body.
@@ -377,7 +414,8 @@ ID, offset, and logical acceptance time. The enclosing checkpoint supplies
 integrity and partition authority.
 
 - Checkpoints hold state, producer coordinates, retry floors, live confirmed
-  identities, and the original committed operation and digest. Never payloads.
+  identities, held scheduled records (48 bytes each), and the original
+  committed operation and digest. Never payloads.
 - Failed or canceled builds never select themselves. Installation checks the
   captured position and source lineage.
 - Decoded state stays private until every chunk and the state digest match.
@@ -433,6 +471,11 @@ A partition journal holds at most 256 segments of `segment_bytes`.
 - With less than a sixteenth of that space left, the partition refuses new
   records with NACK 10 (retry after backoff). With less than a sixty-fourth
   left, it also refuses producer opens, consumer progress, and assignments.
+- Records and control requests also leave room to release every held
+  scheduled record: its encoded bytes plus a `Release` frame, entry, and write
+  group of its own, and one write group per segment the releases fill. A
+  `Release` needs only the sixty-fourth, so held records can always leave and
+  end their retention hold.
 - Trims and policy changes always pass, so retention can still free space.
 - A retention byte target covers at most 224 segments, so retention that lags
   a few segments still frees space before refusals start.
@@ -448,7 +491,8 @@ A spare the device has no room for (`ENOSPC`, `EDQUOT`) is no fault.
 - Without an allocated spare, the partition refuses new records once less than
   a sixteenth of its active segment is left, and producer opens, consumer
   progress, and assignments below a sixty-fourth. New work must leave that room
-  free. Trims and policy changes still pass.
+  free, beside the segment limit reserves. Trims and policy changes still
+  pass.
 - Writes that reach the end of the active segment hold until the spare is
   allocated. Followers hold the same way.
 - Allocation retries a second after the failure, or at once after cleanup.

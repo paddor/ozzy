@@ -8,7 +8,7 @@ use std::{
 use bytes::Bytes;
 use ozzy_journal::operation::{
     AppendBatchSummary, AppendBatchView, BatchPayload, OperationKind, PreparedAppendPayload,
-    ResolvedAppendView, decode_append_batches, decode_resolved_append,
+    ResolvedAppendView, decode_append_batches, decode_release_batch, decode_resolved_append,
 };
 use ozzy_proto::{MessageId, Offset, ProducerSequence};
 use smallvec::SmallVec;
@@ -52,6 +52,9 @@ impl CachedOperation {
                 cache_resolved_batch(&body, &decode_resolved_append(&body, limits)?)?
                     .into_iter()
                     .collect()
+            }
+            OperationKind::Release => {
+                vec![cache_batch(&body, &decode_release_batch(&body, limits)?)?]
             }
             _ => return Err(IndexedReadError::NotAppend),
         };

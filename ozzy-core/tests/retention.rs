@@ -8,10 +8,17 @@
     reason = "test code"
 )]
 
-use ozzy_core::retention::{Plan, Segment};
+use ozzy_core::retention::{Kept, Plan, Segment};
 use ozzy_journal::operation::RetentionPolicy;
 use ozzy_proto::Offset;
 use std::num::NonZeroU64;
+
+const fn kept(committed_operation: u64, held_operation: Option<u64>) -> Kept {
+    Kept {
+        committed_operation,
+        held_operation,
+    }
+}
 
 #[test]
 fn either_limit_expires_only_a_sealed_prefix_using_newest_append_time() {
@@ -45,7 +52,7 @@ fn either_limit_expires_only_a_sealed_prefix_using_newest_append_time() {
         max_age_millis: NonZeroU64::new(500),
         max_bytes: None,
     };
-    let plan = Plan::select(&segments, policy, 1000, 12, 8).unwrap();
+    let plan = Plan::select(&segments, policy, 1000, kept(12, None), 8).unwrap();
     assert_eq!(plan.retire, vec![1]);
     assert_eq!(plan.record_floor, Offset::new(2));
     assert_eq!(plan.operation_floor, 5);
@@ -54,15 +61,26 @@ fn either_limit_expires_only_a_sealed_prefix_using_newest_append_time() {
         max_bytes: NonZeroU64::new(1024),
         ..policy
     };
-    let plan = Plan::select(&segments, policy, 1000, 12, 8).unwrap();
+    let plan = Plan::select(&segments, policy, 1000, kept(12, None), 8).unwrap();
     assert_eq!(plan.retire, vec![1, 2]);
     assert_eq!(plan.operation_floor, 9);
     assert_eq!(plan.selected_bytes, 1024);
-    let plan = Plan::select(&segments, policy, 1000, 4, 8).unwrap();
+    let plan = Plan::select(&segments, policy, 1000, kept(4, None), 8).unwrap();
     assert_eq!(
         plan.retire,
         vec![1],
         "uncommitted segments remain protected"
     );
     assert!(!plan.roll_active);
+    for (held, retire) in [(Some(5), vec![1]), (Some(4), vec![]), (Some(9), vec![1, 2])] {
+        let plan = Plan::select(&segments, policy, 1000, kept(12, held), 8).unwrap();
+        assert_eq!(
+            plan.retire, retire,
+            "a held schedule at {held:?} stops retention"
+        );
+        assert!(
+            plan.roll_active,
+            "a held schedule does not stop the active roll"
+        );
+    }
 }

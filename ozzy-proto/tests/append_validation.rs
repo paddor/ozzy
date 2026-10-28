@@ -43,6 +43,7 @@ fn request<'a>(records: &'a [Record<'a>]) -> Append<'a> {
             first_sequence: 5,
         },
         policy: Policy::QuorumDurable,
+        due_millis: None,
         records,
     }
 }

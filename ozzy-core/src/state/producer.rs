@@ -24,7 +24,8 @@ pub struct ProducerTransition {
 pub struct ProducerResultSpan {
     /// First producer-local sequence in this span.
     pub first_sequence: ProducerSequence,
-    /// Partition-global offset assigned to that sequence.
+    /// Partition-global offset assigned to that sequence, or its schedule
+    /// sequence when scheduled.
     pub first_offset: Offset,
     /// Number of consecutive sequence and offset coordinates.
     pub records: u64,
@@ -43,14 +44,21 @@ pub enum ProducerResultSource {
         /// Operation containing the attempted bytes' fingerprints.
         operation: u64,
     },
+    /// Exact record bytes remain in this partition's `Schedule` operation.
+    Scheduled {
+        /// `Schedule` operation holding the attempted bytes.
+        operation: u64,
+    },
 }
 
 impl ProducerResultSpan {
-    /// Stored or duplicate, without implying a confirmation boundary.
+    /// Stored, duplicate, or scheduled, without implying a confirmation
+    /// boundary.
     pub const fn disposition(self) -> AppendDisposition {
         match self.source {
             ProducerResultSource::Stored => AppendDisposition::Stored,
             ProducerResultSource::Duplicate { .. } => AppendDisposition::Duplicate,
+            ProducerResultSource::Scheduled { .. } => AppendDisposition::Scheduled,
         }
     }
 
@@ -66,6 +74,8 @@ impl ProducerResultSpan {
 pub(super) struct PreparedProducerResults {
     pub(super) spans: SmallVec<[ProducerResultSpan; 4]>,
     pub(super) additional: usize,
+    /// Oldest spans the producer drops first to fit the span limit.
+    pub(super) evict: usize,
     pub(super) next_sequence: ProducerSequence,
     pub(super) next_offset: Offset,
     pub(super) last_stored_end: Offset,
@@ -142,12 +152,14 @@ impl CanonicalProducer {
             .min()
     }
 
-    /// Oldest operation carrying a retained duplicate retry fingerprint.
+    /// Oldest operation carrying a retained duplicate retry fingerprint or
+    /// scheduled record.
     pub fn result_operation_floor(&self) -> Option<u64> {
         self.results
             .iter()
             .filter_map(|span| match span.source {
-                ProducerResultSource::Duplicate { operation } => Some(operation),
+                ProducerResultSource::Duplicate { operation }
+                | ProducerResultSource::Scheduled { operation } => Some(operation),
                 ProducerResultSource::Stored => None,
             })
             .min()
@@ -167,7 +179,9 @@ impl CanonicalProducer {
         operation_floor: u64,
     ) -> ProducerSequence {
         for span in &self.results {
-            if let ProducerResultSource::Duplicate { operation } = span.source {
+            if let ProducerResultSource::Duplicate { operation }
+            | ProducerResultSource::Scheduled { operation } = span.source
+            {
                 if operation >= operation_floor {
                     return span.first_sequence;
                 }
@@ -235,6 +249,32 @@ impl CanonicalProducer {
         Ok(())
     }
 
+    /// Map held attempts to their schedule sequences. Each `Schedule` adds
+    /// its own scheduled span; it stores no offsets.
+    pub(super) fn record_schedule(
+        &mut self,
+        span: ProducerResultSpan,
+        max_spans: usize,
+    ) -> Result<(), StateError> {
+        if span.first_sequence != self.next_producer_sequence {
+            return Err(StateError::ProducerSequenceMismatch);
+        }
+        if span.records == 0 || !matches!(span.source, ProducerResultSource::Scheduled { .. }) {
+            return Err(StateError::MalformedBody("invalid scheduled assignment"));
+        }
+        if self.results.len() >= max_spans {
+            return Err(StateError::LimitExceeded("producer retry spans"));
+        }
+        let next_sequence = span
+            .first_sequence
+            .get()
+            .checked_add(span.records)
+            .ok_or(StateError::PositionExhausted)?;
+        self.results.push_back(span);
+        self.next_producer_sequence = ProducerSequence::new(next_sequence);
+        Ok(())
+    }
+
     pub(super) fn prepare_results(
         &self,
         first_sequence: ProducerSequence,
@@ -292,6 +332,7 @@ impl CanonicalProducer {
         Ok(PreparedProducerResults {
             spans,
             additional,
+            evict: 0,
             next_sequence,
             next_offset,
             last_stored_end: if results.stored() == 0 {
@@ -303,6 +344,7 @@ impl CanonicalProducer {
     }
 
     pub(super) fn install_results(&mut self, prepared: PreparedProducerResults) {
+        self.evict_results(prepared.evict);
         for next in prepared.spans {
             if let Some(last) = self.results.back_mut()
                 && last.can_extend(next)
@@ -314,6 +356,19 @@ impl CanonicalProducer {
         }
         self.next_producer_sequence = prepared.next_sequence;
         self.last_stored_end = prepared.last_stored_end;
+    }
+
+    /// Drop the oldest `count` result spans: the floor rises to the first
+    /// kept span, or to the next sequence when none is kept.
+    pub(super) fn evict_results(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let floor = self
+            .results
+            .get(count)
+            .map_or(self.next_producer_sequence, |span| span.first_sequence);
+        self.expire_results(floor);
     }
 
     pub(super) fn expire_results(&mut self, floor: ProducerSequence) {

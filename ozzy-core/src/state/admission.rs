@@ -46,6 +46,8 @@ impl CanonicalState {
             }
             OperationBody::DedupWatermark(value) => self.prepare_dedup_watermark(*value)?,
             OperationBody::RetireProducer(value) => self.prepare_retire_producer(*value)?,
+            OperationBody::Schedule(value) => self.prepare_schedule(op_number, value)?,
+            OperationBody::Release(value) => self.prepare_release(value)?,
             OperationBody::GroupPlan(value) => {
                 self.prepare_group_plan(value, op_number, identities)?
             }
@@ -88,6 +90,9 @@ impl CanonicalState {
         if self.addresses.contains_key(&address) {
             return Err(StateError::PartitionAddressExists);
         }
+        if value.delay_max_millis.is_some() && value.dedup_window_millis.is_some() {
+            return Err(StateError::DelayWithDeduplication);
+        }
         Ok((
             Mutation::Create {
                 partition: value.partition,
@@ -102,6 +107,7 @@ impl CanonicalState {
                     dedup_window_millis: value.dedup_window_millis,
                     dedup_time: 0,
                     retired_epoch: 0,
+                    delay: value.delay_max_millis.map(super::DelayState::new),
                 },
             },
             Vec::new(),

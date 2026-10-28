@@ -60,7 +60,7 @@ fn invalid_kind_empty_run_and_overflow_fail_closed() {
         records: 1,
     };
     let bytes = run.encode().unwrap();
-    for tag in 2..=255 {
+    for tag in 3..=255 {
         let mut bad = bytes;
         bad[0] = tag;
         assert_eq!(OutcomeRun::decode(&bad), Err(CodecError::Profile));

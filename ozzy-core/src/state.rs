@@ -14,6 +14,8 @@ mod admission;
 mod groups;
 pub use groups::{CoordinatorGroup, group_targets};
 mod append;
+mod delay;
+pub use delay::{DelayState, PendingSchedule};
 mod identity;
 mod images;
 mod installation;
@@ -33,8 +35,8 @@ pub use images::{
     RecoveredImages,
 };
 pub use snapshot::{
-    STATE_SNAPSHOT_HEADER_BYTES, StateSnapshotError, StateSnapshotLimits,
-    canonical_state_schema_digest,
+    PENDING_SCHEDULE_SNAPSHOT_BYTES, RETRY_SPAN_SNAPSHOT_BYTES, STATE_SNAPSHOT_HEADER_BYTES,
+    StateSnapshotError, StateSnapshotLimits, canonical_state_schema_digest,
 };
 
 /// Bounds for live application metadata. Historical identities live in indexes.
@@ -56,6 +58,8 @@ pub struct StateLimits {
     pub max_group_members: usize,
     /// Maximum source intents across coordinator groups.
     pub max_group_partitions: usize,
+    /// Maximum held scheduled records per partition.
+    pub max_pending_schedules: usize,
 }
 
 impl Default for StateLimits {
@@ -69,6 +73,7 @@ impl Default for StateLimits {
             max_groups: 65_536,
             max_group_members: 1_048_576,
             max_group_partitions: 1_048_576,
+            max_pending_schedules: 1_048_576,
         }
     }
 }
@@ -107,6 +112,8 @@ pub struct CanonicalPartition {
     /// Highest epoch of any retired producer session, zero before the first.
     /// A recreated session starts above it, so no retired epoch returns.
     pub retired_epoch: u64,
+    /// Held scheduled records; absent unless the partition enables delay.
+    pub delay: Option<DelayState>,
 }
 
 impl CanonicalPartition {
@@ -257,6 +264,7 @@ enum Mutation {
         partition: PartitionIncarnation,
         time: u64,
     },
+    Delay(delay::PreparedDelay),
     Barrier,
 }
 
@@ -268,6 +276,8 @@ struct AppendCursor {
     first_offset: Offset,
     records: u64,
     new_span: bool,
+    /// At the span limit, the producer first drops its oldest result span.
+    evict: bool,
     next_sequence: ProducerSequence,
     next_offset: Offset,
 }
@@ -373,6 +383,16 @@ fn require_progress_owner(owner: ProgressOwner) -> Result<(), StateError> {
     match owner {
         ProgressOwner::Subscription(id) => require_id("subscription", id.as_bytes()),
         ProgressOwner::ConsumerGroup(id) => require_id("consumer group", id.as_bytes()),
+    }
+}
+
+fn require_record_parts(parts: usize) -> Result<(), StateError> {
+    if parts == 0 {
+        Err(StateError::MalformedBody(
+            "append record must contain at least one part",
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -507,4 +527,23 @@ pub enum StateError {
     #[error("deduplication logical time did not advance")]
     /// An idle watermark must strictly advance the current logical time.
     DedupTimeNotAdvanced,
+    #[error("partition does not hold scheduled records")]
+    /// A schedule or release names a partition without delay.
+    DelayDisabled,
+    #[error("partition cannot enable both delay and deduplication")]
+    /// Released records would bypass deduplication.
+    DelayWithDeduplication,
+    #[error("schedule sequence does not match")]
+    /// Schedule sequences are not consecutive with partition state.
+    ScheduleMismatch,
+    #[error("schedule or release time went backward")]
+    /// A timestamp is below the latest schedule or release, or a release
+    /// precedes its records' due time.
+    DelayTimeRegressed,
+    #[error("due time exceeds the maximum delay")]
+    /// A due time lies past acceptance plus the maximum delay.
+    DueBeyondMaximum,
+    #[error("release does not match the held records")]
+    /// A release is not exactly the held prefix through its key.
+    ReleaseMismatch,
 }

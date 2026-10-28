@@ -65,6 +65,7 @@ labels. Field names and enum values are fixed.
 | `[topics.NAME]` | `partitions` (16), `partitioner_seed` (0), `segment_bytes` (256 MiB), `max_append_bytes` (8 MiB), `producer_idle_secs` (604800) |
 | `[topics.NAME.retention]` | `max_age_secs`, `max_bytes` (unset: keep all) |
 | `[topics.NAME.deduplication]` | `window_millis` (300000), `max_entries`, `max_bytes` |
+| `[topics.NAME.delay]` | `max_secs`, `max_entries` (100000) |
 
 The rustdoc of each field in `src/schema.rs` lists the rest, including
 `workers` and shard `budget` defaults.
@@ -105,8 +106,8 @@ says what each mode confirms.
   that long retires; resuming its identity starts fresh sequences.
 - Shard and device byte budgets must cover the largest `max_append_bytes`.
 - Restart rejects changed mode, brokers, topics, partition counts,
-  `partitioner_seed`, or deduplication window. Local shards,
-  CPUs, and worker budgets may change.
+  `partitioner_seed`, deduplication window, or `delay.max_secs`. Local
+  shards, CPUs, and worker budgets may change.
 
 ## Retention
 
@@ -141,6 +142,30 @@ max_bytes = 268435456
   index reserves its budget up front: about 1 KiB per entry, so 1M entries
   need about 1 GiB per partition. `ozzy validate` reports the exact minimum.
 - A full index makes producers retry later. It never evicts a live identity.
+
+## Delay
+
+```toml
+[topics.orders.delay]
+max_secs = 86400
+max_entries = 100000
+```
+
+- Off unless the topic sets it. Whether it is on, and `max_secs`, are fixed
+  at initialization. A topic cannot have both delay and deduplication.
+- A producer gives a record an absolute due time. One past acceptance plus
+  `max_secs` fails; a past one releases at once.
+- `max_entries` (at most 1048576) bounds held records per partition. A full
+  partition makes producers retry later. Each held record adds 48 bytes to
+  the partition's checkpoint. It may change on restart; a partition holding
+  more than the new limit takes no new schedules until releases drain it.
+- With `retention.max_age_secs` set, `max_secs` must not exceed it.
+  Retention keeps the segment of the oldest held record, so a long delay
+  can keep old segments, and a partition at its segment limit refuses new
+  records until the held record is released.
+- Each held record keeps room to release it: its size plus up to about 4.5
+  KiB of framing. A partition near its segment limit refuses new records and
+  control requests first, so releases always fit.
 
 ## Docs
 

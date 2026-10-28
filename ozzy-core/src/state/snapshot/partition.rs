@@ -1,10 +1,12 @@
 use ahash::AHashMap;
+use ozzy_journal::operation::ReleaseKey;
 use ozzy_proto::{
-    Offset, OperationId, OwnerEpoch, PartitionId, PartitionIncarnation, ProducerEpoch, ProducerId,
-    ProducerSequence,
+    MessageId, Offset, OperationId, OwnerEpoch, PartitionId, PartitionIncarnation, ProducerEpoch,
+    ProducerId, ProducerSequence,
 };
 
 use ozzy_proto::layout::{self, Fixed, Reader, Writer};
+use std::collections::BTreeMap;
 use std::ops::Range;
 
 use super::{
@@ -12,13 +14,14 @@ use super::{
     require_nonzero, usize_to_u16, usize_to_u32, validate_name,
 };
 use crate::state::{
-    CanonicalPartition, CanonicalProducer, CanonicalState, PartitionAddress, ProducerResultSource,
-    ProducerResultSpan,
+    CanonicalPartition, CanonicalProducer, CanonicalState, DelayState, PartitionAddress,
+    PendingSchedule, ProducerResultSource, ProducerResultSpan,
 };
 
-const PARTITION_BYTES: usize = 112;
+const PARTITION_BYTES: usize = 144;
 const PRODUCER_BYTES: usize = 80;
-const SPAN_BYTES: usize = 40;
+const SPAN_BYTES: usize = super::RETRY_SPAN_SNAPSHOT_BYTES;
+const PENDING_BYTES: usize = super::PENDING_SCHEDULE_SNAPSHOT_BYTES;
 
 pub(super) async fn partition_bytes(
     value: &CanonicalPartition,
@@ -40,6 +43,13 @@ pub(super) async fn partition_bytes(
             .and_then(|bytes| bytes.checked_add(total))
             .ok_or(StateSnapshotError::LengthOverflow)?;
         step(PRODUCER_BYTES).await;
+    }
+    if let Some(delay) = &value.delay {
+        total = delay
+            .pending_len()
+            .checked_mul(PENDING_BYTES)
+            .and_then(|bytes| bytes.checked_add(total))
+            .ok_or(StateSnapshotError::LengthOverflow)?;
     }
     step(PARTITION_BYTES).await;
     Ok(total)
@@ -85,6 +95,9 @@ pub(super) async fn encode_partition(
             .map_or(0, std::num::NonZeroU64::get),
     );
     fixed.put_u64::<104>(value.retired_epoch);
+    if let Some(delay) = &value.delay {
+        encode_delay(fixed, delay)?;
+    }
     let mut names = Writer::new(rest);
     names.bytes(value.address.stream.as_bytes())?;
     names.bytes(value.address.topic.as_bytes())?;
@@ -99,8 +112,33 @@ pub(super) async fn encode_partition(
     for (id, producer) in producers {
         cursor = encode_producer(target, cursor, *id, producer, step).await?;
     }
+    for (key, pending) in value.delay.iter().flat_map(DelayState::pending) {
+        encode_pending(layout::record_mut(target, cursor)?, key, pending);
+        cursor += PENDING_BYTES;
+        step(PENDING_BYTES).await;
+    }
     debug_assert_eq!(cursor, entry_bytes);
     Ok(end)
+}
+
+fn encode_delay(
+    fixed: &mut [u8; PARTITION_BYTES],
+    delay: &DelayState,
+) -> Result<(), StateSnapshotError> {
+    fixed.put_u64::<112>(delay.max_delay_millis.get());
+    fixed.put_u64::<120>(delay.next_schedule);
+    fixed.put_u64::<128>(delay.time);
+    fixed.put_u32::<136>(usize_to_u32(delay.pending_len())?);
+    Ok(())
+}
+
+fn encode_pending(entry: &mut [u8; PENDING_BYTES], key: ReleaseKey, pending: &PendingSchedule) {
+    entry.put_u64::<0>(key.millis);
+    entry.put_u64::<8>(key.schedule);
+    entry.put_u64::<16>(pending.operation);
+    entry.put_u32::<24>(pending.index);
+    entry.put_u32::<28>(pending.bytes);
+    entry.put::<32, 16>(*pending.message_id.as_bytes());
 }
 
 /// Encode one producer and its retry spans at `cursor`; returns their end.
@@ -130,9 +168,16 @@ async fn encode_producer(
         entry.put_u64::<0>(span.first_sequence.get());
         entry.put_u64::<8>(span.first_offset.get());
         entry.put_u64::<16>(span.records);
-        if let ProducerResultSource::Duplicate { operation } = span.source {
-            entry.put_u8::<24>(1);
-            entry.put_u64::<32>(operation);
+        match span.source {
+            ProducerResultSource::Stored => {}
+            ProducerResultSource::Duplicate { operation } => {
+                entry.put_u8::<24>(1);
+                entry.put_u64::<32>(operation);
+            }
+            ProducerResultSource::Scheduled { operation } => {
+                entry.put_u8::<24>(2);
+                entry.put_u64::<32>(operation);
+            }
         }
         cursor += SPAN_BYTES;
         step(SPAN_BYTES).await;
@@ -151,7 +196,7 @@ pub(super) async fn decode_partition(
     let remaining_producers = state.limits.max_producers - state.producer_count;
     let remaining_spans = state.limits.max_retry_spans - state.retry_span_count;
     let fixed: &[u8; PARTITION_BYTES] = layout::record(entries.rest(), 0)?;
-    if fixed.u32_at::<68>() != 0 {
+    if fixed.u32_at::<68>() != 0 || fixed.u32_at::<140>() != 0 {
         return Err(StateSnapshotError::UnsupportedFields);
     }
     let entry_bytes = fixed.u32_at::<0>() as usize;
@@ -161,6 +206,12 @@ pub(super) async fn decode_partition(
     enforce_limit("topic name bytes", topic_bytes, limits.max_name_bytes)?;
     let producer_count = fixed.u32_at::<28>() as usize;
     enforce_limit("producers", producer_count, remaining_producers)?;
+    let pending_count = fixed.u32_at::<136>() as usize;
+    enforce_limit(
+        "pending schedules",
+        pending_count,
+        state.limits.max_pending_schedules,
+    )?;
     let entry = entries.take(entry_bytes)?;
     let stream_end = PARTITION_BYTES + stream_bytes;
     let mut cursor = stream_end + topic_bytes;
@@ -182,6 +233,7 @@ pub(super) async fn decode_partition(
         producers.insert(id, producer);
         cursor = next;
     }
+    let pending = decode_pending(entry, &mut cursor, pending_count, step).await?;
     if cursor != entry_bytes {
         return Err(StateSnapshotError::LengthMismatch);
     }
@@ -191,7 +243,7 @@ pub(super) async fn decode_partition(
         topic,
         partition_id: PartitionId::new(fixed.u32_at::<24>()),
     };
-    let value = decode_fields(fixed, address, producers)?;
+    let value = decode_fields(fixed, address, producers, pending)?;
     validate_partition_cooperative(partition, &value, state.revision, step).await?;
     Ok((partition, value, spans))
 }
@@ -208,7 +260,19 @@ fn decode_fields(
     fixed: &[u8; PARTITION_BYTES],
     address: PartitionAddress,
     producers: AHashMap<ProducerId, CanonicalProducer>,
+    pending: BTreeMap<ReleaseKey, PendingSchedule>,
 ) -> Result<CanonicalPartition, StateSnapshotError> {
+    let delay = match std::num::NonZeroU64::new(fixed.u64_at::<112>()) {
+        None if fixed.array::<120, 20>() == [0; 20] => None,
+        None => return Err(StateSnapshotError::InvalidPartition),
+        Some(max_delay_millis) => {
+            let mut delay = DelayState::new(max_delay_millis);
+            delay.next_schedule = fixed.u64_at::<120>();
+            delay.time = fixed.u64_at::<128>();
+            delay.restore(pending);
+            Some(delay)
+        }
+    };
     Ok(CanonicalPartition {
         address,
         owner_epoch: OwnerEpoch::new(fixed.u64_at::<32>()),
@@ -224,7 +288,44 @@ fn decode_fields(
         dedup_time: fixed.u64_at::<88>(),
         dedup_window_millis: std::num::NonZeroU64::new(fixed.u64_at::<96>()),
         retired_epoch: fixed.u64_at::<104>(),
+        delay,
     })
+}
+
+/// Held records in strictly increasing release order.
+async fn decode_pending(
+    input: &[u8],
+    cursor: &mut usize,
+    count: usize,
+    step: &mut impl AsyncFnMut(usize),
+) -> Result<BTreeMap<ReleaseKey, PendingSchedule>, StateSnapshotError> {
+    let mut pending = BTreeMap::new();
+    let mut previous = None;
+    for _ in 0..count {
+        let entry: &[u8; PENDING_BYTES] = layout::record(input, *cursor)?;
+        let key = ReleaseKey {
+            millis: entry.u64_at::<0>(),
+            schedule: entry.u64_at::<8>(),
+        };
+        if previous.is_some_and(|previous| previous >= key) {
+            return Err(StateSnapshotError::UnsortedOrDuplicate);
+        }
+        previous = Some(key);
+        let message_id = MessageId::from_bytes(entry.array::<32, 16>());
+        require_nonzero("message", message_id.as_bytes())?;
+        pending.insert(
+            key,
+            PendingSchedule {
+                operation: entry.u64_at::<16>(),
+                index: entry.u32_at::<24>(),
+                bytes: entry.u32_at::<28>(),
+                message_id,
+            },
+        );
+        *cursor += PENDING_BYTES;
+        step(PENDING_BYTES).await;
+    }
+    Ok(pending)
 }
 
 async fn decode_producer(
@@ -271,6 +372,7 @@ async fn decode_producer(
         let source = match (entry.u8_at::<24>(), entry.u64_at::<32>()) {
             (0, 0) => ProducerResultSource::Stored,
             (1, operation) if operation != 0 => ProducerResultSource::Duplicate { operation },
+            (2, operation) if operation != 0 => ProducerResultSource::Scheduled { operation },
             _ => return Err(StateSnapshotError::InvalidPartition),
         };
         if entry.array::<25, 7>() != [0; 7] {
@@ -319,7 +421,42 @@ async fn validate_partition_cooperative(
         }
         step(size_of::<(u64, u64)>()).await;
     }
+    if let Some(delay) = &value.delay {
+        validate_delay(value, delay, revision, step).await?;
+    }
     step(PARTITION_BYTES + value.address.stream.len() + value.address.topic.len()).await;
+    Ok(())
+}
+
+/// Held records name earlier `Schedule` operations and distinct issued
+/// schedule sequences. Delay excludes deduplication.
+async fn validate_delay(
+    partition: &CanonicalPartition,
+    delay: &DelayState,
+    revision: u64,
+    step: &mut impl AsyncFnMut(usize),
+) -> Result<(), StateSnapshotError> {
+    if partition.dedup_window_millis.is_some() {
+        return Err(StateSnapshotError::InvalidPartition);
+    }
+    let mut schedules = Vec::with_capacity(delay.pending_len());
+    for (key, pending) in delay.pending() {
+        if key.schedule >= delay.next_schedule
+            || pending.operation == 0
+            || pending.operation > revision
+        {
+            return Err(StateSnapshotError::InvalidPartition);
+        }
+        schedules.push(key.schedule);
+        step(PENDING_BYTES).await;
+    }
+    ozzy_journal::work::sort_by(&mut schedules, u64::cmp, step).await;
+    if schedules
+        .windows(2)
+        .any(|pair| matches!(pair, [left, right] if left == right))
+    {
+        return Err(StateSnapshotError::UnsortedOrDuplicate);
+    }
     Ok(())
 }
 
@@ -344,7 +481,7 @@ async fn validate_producer(
             .ok_or(StateSnapshotError::InvalidPartition)?;
         if span.records == 0
             || span.first_sequence.get() != sequence
-            || end > partition.next_offset.get()
+            || end > span_bound(span, partition)?
             || previous.is_some_and(|previous| previous.can_extend(*span))
         {
             return Err(StateSnapshotError::InvalidPartition);
@@ -364,7 +501,8 @@ async fn validate_producer(
                 previous_stored_end = Some(end);
                 occupied.push((span.first_offset.get(), end));
             }
-            ProducerResultSource::Duplicate { operation } => {
+            ProducerResultSource::Duplicate { operation }
+            | ProducerResultSource::Scheduled { operation } => {
                 if operation == 0 || operation > revision {
                     return Err(StateSnapshotError::InvalidPartition);
                 }
@@ -378,6 +516,24 @@ async fn validate_producer(
     }
     step(PRODUCER_BYTES).await;
     Ok(())
+}
+
+/// Exclusive end of a span's second coordinate: the next offset, or the next
+/// schedule sequence for a scheduled span.
+fn span_bound(
+    span: &ProducerResultSpan,
+    partition: &CanonicalPartition,
+) -> Result<u64, StateSnapshotError> {
+    match span.source {
+        ProducerResultSource::Scheduled { .. } => partition
+            .delay
+            .as_ref()
+            .map(|delay| delay.next_schedule)
+            .ok_or(StateSnapshotError::InvalidPartition),
+        ProducerResultSource::Stored | ProducerResultSource::Duplicate { .. } => {
+            Ok(partition.next_offset.get())
+        }
+    }
 }
 
 /// A producer needs a session epoch, a result floor not past its next

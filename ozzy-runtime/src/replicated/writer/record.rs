@@ -17,6 +17,7 @@ pub struct RecordInput {
     /// Stable application identity, unchanged by transport retries.
     pub message_id: MessageId,
     body: InputBody,
+    due_millis: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +92,7 @@ impl RecordInput {
         Self {
             message_id,
             body: InputBody::Single(bytes),
+            due_millis: None,
         }
     }
 
@@ -103,7 +105,11 @@ impl RecordInput {
         } else {
             InputBody::Single(Bytes::copy_from_slice(bytes))
         };
-        Self { message_id, body }
+        Self {
+            message_id,
+            body,
+            due_millis: None,
+        }
     }
 
     /// One shared part. Retains the supplied backing allocation even for a
@@ -113,6 +119,7 @@ impl RecordInput {
         Self {
             message_id,
             body: InputBody::Shared(bytes),
+            due_millis: None,
         }
     }
 
@@ -128,7 +135,22 @@ impl RecordInput {
         Self {
             message_id,
             body: InputBody::Multipart(parts),
+            due_millis: None,
         }
+    }
+
+    /// Hold this record until `due_millis`, an absolute Unix time in
+    /// milliseconds. Readers see it only once due. The topic must enable
+    /// delay; the receipt offset is then the record's schedule sequence.
+    #[must_use]
+    pub fn with_due_millis(mut self, due_millis: u64) -> Self {
+        self.due_millis = Some(due_millis);
+        self
+    }
+
+    /// The absolute Unix due time in milliseconds of a scheduled record.
+    pub const fn due_millis(&self) -> Option<u64> {
+        self.due_millis
     }
 
     /// Borrow opaque parts in their original order, without materializing a table.

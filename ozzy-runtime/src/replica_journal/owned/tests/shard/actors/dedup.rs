@@ -58,6 +58,7 @@ pub(super) fn cluster_on(
                 topic: "orders",
                 partition_id: PartitionId::ZERO,
                 owner_epoch: OwnerEpoch::INITIAL,
+                delay_max_millis: None,
                 dedup_window_millis: std::num::NonZeroU64::new(limits.window_millis),
                 retention: RetentionPolicy::default(),
             });

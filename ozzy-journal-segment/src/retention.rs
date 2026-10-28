@@ -57,8 +57,9 @@ impl RetentionFloors {
         self.entries.is_empty()
     }
 
-    /// Earliest operation carrying retained duplicate retry fingerprints.
-    /// A checkpoint of coordinates alone cannot replace these proofs.
+    /// Earliest operation carrying retained duplicate retry fingerprints or
+    /// held scheduled records. A checkpoint of coordinates alone cannot
+    /// replace them.
     pub const fn protected_operation(&self) -> Option<u64> {
         self.protected_operation
     }
@@ -83,6 +84,11 @@ impl RetentionFloors {
             .partitions()
             .flat_map(|(_, partition)| partition.producers())
             .filter_map(|(_, producer)| producer.result_operation_floor())
+            .chain(
+                state
+                    .partitions()
+                    .filter_map(|(_, partition)| partition.delay.as_ref()?.oldest_operation()),
+            )
             .min();
         Ok(floors)
     }

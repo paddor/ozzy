@@ -26,6 +26,10 @@ mod producer_dedup;
 mod producer_session;
 mod progress;
 mod retention;
+mod schedule;
+
+/// Maximum delay of a partition created while the journal has delay limits.
+const DELAY_MAX_MILLIS: u64 = 60_000;
 
 fn local_config() -> OwnedConfig<Configuration> {
     let base = config("/local", 7);
@@ -41,6 +45,7 @@ fn local_config() -> OwnedConfig<Configuration> {
         identity: base.identity,
         limits: base.limits,
         recovery: base.recovery,
+        delay: None,
         deduplication: base.deduplication,
         append_buffers: base.append_buffers,
         append_limits: base.append_limits,
@@ -151,6 +156,9 @@ fn initialize_partition(
         topic: "orders",
         partition_id: number,
         owner_epoch: OwnerEpoch::INITIAL,
+        delay_max_millis: journal
+            .delay
+            .and(std::num::NonZeroU64::new(DELAY_MAX_MILLIS)),
         dedup_window_millis: journal
             .dedup
             .limits

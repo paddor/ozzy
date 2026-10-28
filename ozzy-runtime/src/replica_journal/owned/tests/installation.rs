@@ -19,6 +19,7 @@ struct Voter {
 fn voter(controller: &mut Controller, io: Local, index: u8, count: u8) -> Voter {
     let mut config = config(&format!("/broker-{index}"), 7);
     config.identity.replica_node_id = NodeId::from_bytes([index + 1; 16]);
+    config.delay = Some(crate::replica_journal::DelayLimits { max_entries: 16 });
     let (mut journal, _) = drive(
         controller,
         OwnedJournal::format_new(
@@ -428,6 +429,8 @@ fn owned_recovery_parts_abort_unpublished_installation_before_reading_authority(
     let (config, _, memory) = drive(&mut controller, voter.journal.recovery_parts()).unwrap();
     assert_eq!(config.identity, voter.config.identity);
     assert_eq!(config.configuration, voter.config.configuration);
+    // Recovery keeps the leader's admission limits.
+    assert_eq!(config.delay, voter.config.delay);
     assert!(memory.is_none());
     assert!(!voter.journal.is_faulted());
     let journal = voter.journal.journal.ready().unwrap();

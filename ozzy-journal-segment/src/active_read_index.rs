@@ -318,6 +318,7 @@ impl ActiveReadIndex {
                     OperationKind::CreatePartition
                         | OperationKind::Append
                         | OperationKind::ResolvedAppend
+                        | OperationKind::Release
                 )
             })
             .count();

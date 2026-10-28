@@ -17,14 +17,20 @@ pub(super) fn rejection(error: &JournalError) -> (u16, RetryClass) {
     match error {
         JournalError::ProducerAppend(error) => match error {
             AppendAdmissionError::Authority => (5, RetryClass::AfterAuthorityRefresh),
-            AppendAdmissionError::Policy => (2, RetryClass::Permanent),
+            AppendAdmissionError::Policy
+            | AppendAdmissionError::DelayDisabled
+            | AppendAdmissionError::CompressedSchedule => (2, RetryClass::Permanent),
             AppendAdmissionError::UnknownPartition | AppendAdmissionError::Fenced => {
                 (6, RetryClass::Permanent)
             }
             AppendAdmissionError::Sequence => (7, RetryClass::Permanent),
-            AppendAdmissionError::SequenceGap => (10, RetryClass::AfterBackoff),
+            AppendAdmissionError::SequenceGap | AppendAdmissionError::ScheduleCapacity => {
+                (10, RetryClass::AfterBackoff)
+            }
             AppendAdmissionError::RetryConflict => (8, RetryClass::Permanent),
             AppendAdmissionError::RetryHistoryExpired => (9, RetryClass::Permanent),
+            AppendAdmissionError::DueOutOfRange => (21, RetryClass::Permanent),
+            AppendAdmissionError::ScheduleTooLarge => (1, RetryClass::Permanent),
         },
         JournalError::GroupProgress(error) => match error {
             GroupProgressError::Authority => (5, RetryClass::AfterAuthorityRefresh),

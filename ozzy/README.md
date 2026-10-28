@@ -107,6 +107,28 @@ async fn confirm(pending: SharedTopicPendingRecord) -> Result<(), Box<dyn std::e
 Message IDs must be nonzero and unique per event. After the window, a repeat is
 stored again.
 
+## Delayed delivery
+
+A topic with `[topics.NAME.delay]` holds a record with a due time until
+then. The receipt carries its schedule sequence, not an offset; readers see
+the record once the leader releases it.
+
+```rust,no_run
+use ozzy::{AppendDisposition, MessageId, RecordInput, SharedTopicWriter};
+
+async fn remind(writer: &mut SharedTopicWriter, due_millis: u64) -> Result<(), Box<dyn std::error::Error>> {
+    let record = RecordInput::copy_from_slice(MessageId::new(), b"reminder")
+        .with_due_millis(due_millis);
+    let receipt = writer.send(record, None).await?.confirmed().await?;
+    assert_eq!(receipt.record.disposition, AppendDisposition::Scheduled);
+    Ok(())
+}
+```
+
+- Due times are absolute Unix milliseconds, compared with the leader's clock.
+  A due time already past releases at once.
+- Cancel and deduplication are up to the application.
+
 ## Consume
 
 `TopicReader` reads every partition from the earliest retained offset by

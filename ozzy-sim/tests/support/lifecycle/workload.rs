@@ -28,6 +28,7 @@ impl Replica {
                     topic: "orders",
                     partition_id: PartitionId::new(0),
                     owner_epoch: OwnerEpoch::new(1),
+                    delay_max_millis: None,
                     dedup_window_millis: None,
                     retention: RetentionPolicy::default(),
                 }),

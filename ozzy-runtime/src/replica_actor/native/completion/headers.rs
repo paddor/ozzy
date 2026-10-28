@@ -25,6 +25,9 @@ pub(super) fn result_range(
     if index != 0 {
         return Ok(None);
     }
+    if let Some(span) = buffer.scheduled_result() {
+        return Ok(Some(span));
+    }
     let batch = if let Some(batch) = buffer.validated_producer_summary(0) {
         batch
     } else {

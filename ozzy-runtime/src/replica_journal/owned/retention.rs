@@ -74,6 +74,22 @@ impl RetentionTurn {
 }
 
 impl OwnedJournal {
+    /// Keep a sealed segment's retirement proof and the retention summary it
+    /// gives, so neither planning nor retirement scans the segment. A delayed
+    /// partition with no stored record there is scanned once instead: its
+    /// `Schedule` operations carry acceptance times the proof does not hold.
+    pub(super) fn keep_retirement_proof(&mut self, proof: RetirementProof) {
+        let summary = self.images.as_ref().and_then(|images| {
+            let (partition, state) = images.speculative().partitions().next()?;
+            let summary = proof.retention_segment(partition);
+            (summary.newest_append_millis.is_some() || state.delay.is_none()).then_some(summary)
+        });
+        if let Some(summary) = summary {
+            self.retention.sealed.insert(summary.id, summary);
+        }
+        self.retention.proofs.push(proof);
+    }
+
     fn charge_retention(&self) -> Result<Option<crate::memory::Charge>, JournalError> {
         if self.append_memory.is_none() {
             return Ok(None);

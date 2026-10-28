@@ -2,6 +2,15 @@ use super::*;
 use crate::replica_actor::{LocalActor, LocalActorConfig, ProposalOutcome};
 use ozzy_journal::operation::OperationKind;
 
+/// Optional actor setup beyond its partition and writers.
+#[derive(Clone, Default)]
+pub(super) struct ActorOptions<'a> {
+    pub memory: Option<&'a crate::memory::Owner>,
+    pub delay: Option<crate::replica_journal::DelayLimits>,
+    /// Journal clock in Unix milliseconds; 777 when absent.
+    pub clock: Option<std::rc::Rc<std::cell::Cell<u64>>>,
+}
+
 pub(super) fn actor(controller: &mut Controller, io: Local, id: u8) -> LocalActor {
     actor_with_writers(controller, io, id, &[12, 30])
 }
@@ -23,19 +32,28 @@ pub(super) fn actor_with_partition(
     incarnation: PartitionIncarnation,
     number: PartitionId,
 ) -> LocalActor {
-    actor_with_partition_memory(controller, io, id, writers, incarnation, number, None)
+    actor_with_options(
+        controller,
+        io,
+        id,
+        writers,
+        incarnation,
+        number,
+        ActorOptions::default(),
+    )
 }
 
-pub(super) fn actor_with_partition_memory(
+pub(super) fn actor_with_options(
     controller: &mut Controller,
     io: Local,
     id: u8,
     writers: &[u8],
     incarnation: PartitionIncarnation,
     number: PartitionId,
-    memory: Option<&crate::memory::Owner>,
+    options: ActorOptions<'_>,
 ) -> LocalActor {
     let mut config = local_config();
+    config.delay = options.delay;
     config.root = format!("/local-{id}").into();
     config.identity.group_id = GroupId::from_bytes([id; 16]);
     config.configuration = Configuration::new(
@@ -52,7 +70,7 @@ pub(super) fn actor_with_partition_memory(
         OwnedJournal::format_local(config, io, JournalGeneration(u128::from(id)), 32768),
     )
     .unwrap();
-    if let Some(memory) = memory {
+    if let Some(memory) = options.memory {
         journal.bind_append_memory(memory).unwrap();
     }
     initialize_partition(
@@ -81,7 +99,7 @@ pub(super) fn actor_with_partition_memory(
             },
             ..Default::default()
         },
-        || 777,
+        move || options.clock.as_ref().map_or(777, |clock| clock.get()),
     )
     .unwrap()
 }
@@ -324,14 +342,17 @@ fn local_actor_shutdown_drains_after_io_failure_and_closes_callers() {
 fn local_actor_waits_for_retained_backing_before_installing_the_next_append() {
     let (mut controller, io) = setup();
     let memory = payload_owner(32768);
-    let mut actor = actor_with_partition_memory(
+    let mut actor = actor_with_options(
         &mut controller,
         io,
         1,
         &[12],
         partition(),
         PartitionId::ZERO,
-        Some(&memory),
+        ActorOptions {
+            memory: Some(&memory),
+            ..ActorOptions::default()
+        },
     );
     memory.trim_cache();
     let cached = [

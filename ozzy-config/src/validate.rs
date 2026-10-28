@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::{
     Broker, ConfigError, Deployment, DeploymentMode, Shard, invalid,
-    schema::{MAX_APPEND_BYTES, MAX_CLIENTS, MAX_PARTITION_SEGMENTS},
+    schema::{MAX_APPEND_BYTES, MAX_CLIENTS, MAX_DELAY_ENTRIES, MAX_PARTITION_SEGMENTS},
 };
 use broker::validate_broker;
 
@@ -258,8 +258,42 @@ fn validate_topics(config: &Deployment, ids: &mut BTreeSet<Uuid>) -> Result<(), 
         if let Some(policy) = topic.deduplication {
             validate_deduplication(policy, &path)?;
         }
+        if let Some(delay) = topic.delay {
+            validate_delay(topic, delay, &path)?;
+        }
     }
     Ok(())
+}
+
+fn validate_delay(
+    topic: &crate::Topic,
+    delay: crate::TopicDelay,
+    path: &str,
+) -> Result<(), ConfigError> {
+    let path = format!("{path}.delay");
+    require(
+        topic.deduplication.is_none(),
+        &path,
+        "delay cannot be combined with deduplication",
+    )?;
+    require(
+        delay.max_millis().is_some(),
+        &format!("{path}.max_secs"),
+        "maximum delay must be positive and fit milliseconds",
+    )?;
+    require(
+        topic
+            .retention
+            .max_age_secs
+            .is_none_or(|age| delay.max_secs <= age),
+        &format!("{path}.max_secs"),
+        "maximum delay must not exceed retention.max_age_secs",
+    )?;
+    require(
+        delay.max_entries > 0 && delay.max_entries <= MAX_DELAY_ENTRIES,
+        &format!("{path}.max_entries"),
+        "held record limit must be positive and at most 1048576",
+    )
 }
 
 fn validate_deduplication(
