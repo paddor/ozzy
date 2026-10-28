@@ -17,23 +17,33 @@ fn run(mode: DeploymentMode, source: &str) {
 }
 
 fn scenario(mode: DeploymentMode, source: &str, case: &str, asynchronous: bool, codec: &str) {
+    harness(mode, source, (case, asynchronous, codec), |topic| {
+        topic.deduplication = Some(ozzy_config::TopicDeduplication {
+            window_millis: 300_000,
+            max_entries: 128,
+            max_bytes: 4 * 1024 * 1024,
+        });
+    });
+}
+
+/// Run `source` against a cluster whose `orders` topic `configure` sets up.
+fn harness(
+    mode: DeploymentMode,
+    source: &str,
+    globals: (&str, bool, &str),
+    configure: impl FnOnce(&mut ozzy_config::Topic),
+) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .unwrap();
     let cluster = runtime.block_on(Cluster::configured(mode, None, |deployment| {
-        deployment.topics.get_mut("orders").unwrap().deduplication =
-            Some(ozzy_config::TopicDeduplication {
-                window_millis: 300_000,
-                max_entries: 128,
-                max_bytes: 4 * 1024 * 1024,
-            });
+        configure(deployment.topics.get_mut("orders").unwrap());
     }));
     CONTEXT.with(|context| *context.borrow_mut() = Some(cluster.runtime.context().clone()));
     Python::initialize();
-    let passed =
-        Python::attach(|py| execute(py, &cluster, mode, source, (case, asynchronous, codec)));
+    let passed = Python::attach(|py| execute(py, &cluster, mode, source, globals));
     for control in &cluster.controls {
         control.hold_record_writes(false);
     }
@@ -216,6 +226,37 @@ mod cancellation {
     mod quorum_lz4 {
         use super::*;
         cancellation_matrix!(DeploymentMode::Three, "lz4");
+    }
+}
+
+mod delay {
+    use super::*;
+
+    fn delayed(mode: DeploymentMode, asynchronous: bool) {
+        let source = include_str!("../tests/delay.py");
+        harness(mode, source, ("", asynchronous, "lz4"), |topic| {
+            topic.delay = Some(ozzy_config::TopicDelay {
+                max_secs: 60,
+                max_entries: 64,
+            });
+        });
+    }
+
+    #[test]
+    fn single_blocking() {
+        delayed(DeploymentMode::Single, false);
+    }
+    #[test]
+    fn single_asynchronous() {
+        delayed(DeploymentMode::Single, true);
+    }
+    #[test]
+    fn quorum_blocking() {
+        delayed(DeploymentMode::Three, false);
+    }
+    #[test]
+    fn quorum_asynchronous() {
+        delayed(DeploymentMode::Three, true);
     }
 }
 

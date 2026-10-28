@@ -5,7 +5,7 @@ from types import TracebackType
 from typing import Literal, Self
 
 from . import Checkpoint, ClientConfig, ConsumerStats, Receipt, Record, _native
-from ._types import MessageId, Payload, destination, message_id, parts
+from ._types import MessageId, Payload, destination, due, message_id, parts
 
 
 class PendingRecord:
@@ -71,16 +71,19 @@ class Producer:
         key: bytes | None = None,
         partition: int | None = None,
         id: MessageId | None = None,
+        due_millis: int | None = None,
     ) -> PendingRecord:
         """Admit one record, yielding under pressure; return its confirmation handle.
 
         key and partition are mutually exclusive; omitting both lets Rust route.
         id is a nonzero UUID, generated if omitted. Mutable payloads are copied
-        before admission. Cancellation before admission assigns no sequence;
-        admitted records remain active independently of this coroutine.
+        before admission. due_millis holds the record until that absolute Unix
+        time in milliseconds, as in ozzy.Producer.send. Cancellation before
+        admission assigns no sequence; admitted records remain active
+        independently of this coroutine.
         """
         body = parts(payload, self._config)
-        identity = message_id(id)
+        identity = (message_id(id), due(due_millis))
         route = destination(key, partition)
         pending = self._native.try_send(body, identity, route)
         if pending is None:

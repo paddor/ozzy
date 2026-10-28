@@ -69,20 +69,20 @@ class Producer:
     def send(
         self,
         parts: _Buffer | Sequence[_Buffer],
-        id: bytes | None,
+        identity: tuple[bytes | None, int | None],
         destination: tuple[bytes | None, int | None],
         timeout: float | None = None,
     ) -> PendingRecord: ...
     def asend(
         self,
         parts: _Buffer | Sequence[_Buffer],
-        id: bytes | None,
+        identity: tuple[bytes | None, int | None],
         destination: tuple[bytes | None, int | None],
     ) -> Coroutine[Any, Any, PendingRecord]: ...
     def try_send(
         self,
         parts: _Buffer | Sequence[_Buffer],
-        id: bytes | None,
+        identity: tuple[bytes | None, int | None],
         destination: tuple[bytes | None, int | None],
     ) -> PendingRecord | None: ...
     def flush(self, timeout: float | None = None) -> None: ...
@@ -178,7 +178,8 @@ class Receipt:
         """Partition incarnation UUID, fencing older histories."""
     @property
     def offset(self) -> int:
-        """Partition-global record offset."""
+        """Partition-global record offset, or the schedule sequence of a
+        scheduled record."""
     @property
     def message_id(self) -> str:
         """Application event UUID used for record identity."""
@@ -197,8 +198,8 @@ class Receipt:
         batching."""
     @property
     def disposition(self) -> str:
-        """'stored' for a new event or 'duplicate' for an existing deduplicated
-        event."""
+        """'stored' for a new event, 'duplicate' for an existing deduplicated
+        event, or 'scheduled' for a record held until its due time."""
     @property
     def policy(self) -> str:
         """Durability boundary: 'local_durable' or 'quorum_durable'."""
