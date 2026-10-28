@@ -20,6 +20,10 @@ use crate::operation::{
 /// the release key.
 pub const RELEASE_FRAME_BYTES: usize = super::super::append_encoder::ONE_BATCH_HEADER_BYTES + 16;
 
+/// Bytes of a `Carry` body beyond its records and their release keys: the
+/// one-batch header and the two floor positions. Each key takes 16 bytes.
+pub const CARRY_FRAME_BYTES: usize = super::super::append_encoder::ONE_BATCH_HEADER_BYTES + 24;
+
 /// Bytes of one record in the general batch layout: its descriptor head,
 /// then a length and the bytes of each part. The tiny layout is never larger.
 pub fn encoded_record_bytes<'a>(

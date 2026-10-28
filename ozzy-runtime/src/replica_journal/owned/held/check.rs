@@ -43,7 +43,7 @@ impl OwnedJournal {
         let covered = match (covered(buffer.operations(), limits)?, &self.held) {
             (Some((range, limit)), Some(held)) => {
                 let snapshot = self.journal.retry_snapshot(self.recovery.index).await?;
-                held.between(snapshot, range, limit).read().await?
+                held.between(snapshot, range, limit).read().await?.0
             }
             _ => Vec::new(),
         };

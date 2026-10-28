@@ -1,4 +1,4 @@
-use super::super::retention::{limit, limit_bytes, roll};
+use super::super::retention::{limit, limit_bytes, roll, run_retention_jobs};
 use super::*;
 use crate::replica_journal::ValidatedAppend;
 use ozzy_journal::operation::{CanonicalOperation, ReleaseKey};

@@ -195,16 +195,18 @@ impl Catalog {
     }
 
     /// The partition's first `limit` scheduled records after `after` at
-    /// positions from `from` up to `through`, in position order. Only
-    /// sources holding operations in that range are read.
+    /// positions from `from` up to `through`, in position order, and the
+    /// record bytes of every one there. Only sources holding operations in
+    /// that range are read.
     pub(crate) async fn schedules_between(
         &self,
         partition: PartitionIncarnation,
         after: Option<ReleaseKey>,
         (from, through): (HeldPosition, HeldPosition),
         limit: usize,
-    ) -> Result<Vec<ScheduleIndexEntry>, Error> {
+    ) -> Result<(Vec<ScheduleIndexEntry>, u64), Error> {
         let mut rows = std::collections::BTreeMap::new();
+        let mut bytes = 0_u64;
         let mut budget = crate::cooperative::Budget::default();
         let sources: Vec<_> = self
             .last_schedules(partition)
@@ -224,6 +226,7 @@ impl Catalog {
                     if position < from || position >= through {
                         continue;
                     }
+                    bytes += u64::from(entry.record.bytes);
                     if rows.len() == limit {
                         if rows
                             .last_key_value()
@@ -242,7 +245,7 @@ impl Catalog {
                 .charge(visited * crate::SCHEDULE_INDEX_ENTRY_BYTES + 4096)
                 .await;
         }
-        Ok(rows.into_values().collect())
+        Ok((rows.into_values().collect(), bytes))
     }
 
     pub(crate) async fn find_offset(

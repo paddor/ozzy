@@ -305,6 +305,12 @@ On the SDK:
   due retention turn goes first. A step that builds nothing, or whose
   `Release` the core does not admit, waits 10 ms; one that validation
   refuses waits 100 ms.
+- The same step carries held records forward when a primary's retention
+  turn names a carry target. It wakes at once, reads the held rows from the
+  carry floor up to the target in position order beside writes, and builds
+  one `Carry` of at most one proposal arena and 64 source operations. The
+  `Carry` takes its timestamp at validation. When a release is due too,
+  steps alternate between carrying and releasing.
 
 ## Storage backends
 

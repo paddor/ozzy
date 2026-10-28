@@ -13,8 +13,8 @@ pub(super) mod append;
 mod control;
 mod delay;
 pub use delay::{
-    RELEASE_FRAME_BYTES, decode_carry_batch, decode_release_batch, decode_schedule_batch,
-    encoded_record_bytes,
+    CARRY_FRAME_BYTES, RELEASE_FRAME_BYTES, decode_carry_batch, decode_release_batch,
+    decode_schedule_batch, encoded_record_bytes,
 };
 mod group;
 mod primitives;

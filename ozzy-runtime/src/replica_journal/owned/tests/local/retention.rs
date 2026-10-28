@@ -66,7 +66,7 @@ fn append(
 
 /// Run captured cleanup and retirement work and install it, as the shard does
 /// between writes.
-fn run_retention_jobs(controller: &mut Controller, journal: &mut OwnedJournal) {
+pub(super) fn run_retention_jobs(controller: &mut Controller, journal: &mut OwnedJournal) {
     if let Some(work) = journal.take_cleanup_work() {
         let done = drive(controller, Box::pin(work.run()));
         journal.complete_cleanup(done);

@@ -71,8 +71,9 @@ use codec::{
     validate_tiny_descriptors,
 };
 pub use codec::{
-    RELEASE_FRAME_BYTES, append_operation_body, append_operation_body_to, decode_append_summary,
-    decode_append_summary_and_batches, decode_append_summary_and_batches_indexed,
+    CARRY_FRAME_BYTES, RELEASE_FRAME_BYTES, append_operation_body, append_operation_body_to,
+    decode_append_summary, decode_append_summary_and_batches,
+    decode_append_summary_and_batches_indexed,
     decode_append_summary_and_batches_with_validated_payload, decode_append_summary_and_view,
     decode_carry_batch, decode_operation_body, decode_release_batch, decode_schedule_batch,
     encode_operation_body, encoded_record_bytes, validate_operation_body,

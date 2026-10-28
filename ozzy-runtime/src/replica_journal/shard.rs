@@ -262,7 +262,8 @@ impl ShardJournal {
             .is_none_or(|state| state.owner.retention_busy())
     }
     /// Journal-clock milliseconds until the earliest committed held record is
-    /// due. A command holding the owner hides it until the owner returns.
+    /// due, or zero while a carry is pending. A command holding the owner
+    /// hides it until the owner returns.
     pub(super) fn release_wait(&self) -> Option<u64> {
         let due = self.state.as_ref()?.owner.next_release()?;
         Some(due.saturating_sub((self.timestamp)()))

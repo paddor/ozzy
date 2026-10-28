@@ -233,14 +233,15 @@ impl Snapshot {
     }
 
     /// The partition's first `limit` scheduled records in sealed segments
-    /// after `after` at positions in `range`, in position order.
+    /// after `after` at positions in `range`, in position order, and the
+    /// record bytes of every one there.
     pub async fn sealed_schedules_between(
         &self,
         partition: PartitionIncarnation,
         after: Option<ReleaseKey>,
         range: (HeldPosition, HeldPosition),
         limit: usize,
-    ) -> Result<Vec<crate::ScheduleIndexEntry>, Error> {
+    ) -> Result<(Vec<crate::ScheduleIndexEntry>, u64), Error> {
         Ok(self
             .sealed
             .schedules_between(partition, after, range, limit)

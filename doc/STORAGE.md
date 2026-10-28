@@ -246,6 +246,13 @@ part. General descriptors use:
   `Schedule` acceptance time counts toward its segment's age, so retries of a
   released schedule resolve for the retention age. A `Carry` timestamp
   counts too, so carried records stay for the age.
+- When an age or byte target would retire a sealed, committed segment that
+  held records keep, the primary carries them forward to the segment's end.
+  A carry ends where its records stop fitting one operation, and the next
+  one starts there. Retention then trims and retires the segment like any
+  other. A byte target carries only while the held records fill at most
+  half the segment, so a carry frees more than it writes; otherwise byte
+  retention waits.
 - Readers and indexes treat a `Release` batch like an APPEND batch.
   `Schedule` and `Carry` records have no offsets; indexes list them by
   release key only.

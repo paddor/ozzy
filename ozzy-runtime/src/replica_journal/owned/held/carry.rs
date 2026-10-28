@@ -1,9 +1,11 @@
 //! Held rows across a `Carry`. A carry moves its records to rows of the
 //! `Carry` operation, and rows before the carry floor are gone. Held rows of
-//! a position range let a copy check a `Carry`.
+//! a position range let a copy check a `Carry`, and let the primary build
+//! one toward the segment retention would free.
 
 use std::collections::BTreeMap;
 
+use ozzy_core::retention::Carry as Target;
 use ozzy_core::state::PendingSchedule;
 use ozzy_journal::operation::{Carry, HeldPosition, ReleaseKey};
 use ozzy_journal_segment::JournalIndexSnapshot;
@@ -45,6 +47,39 @@ impl Held {
         Ok(())
     }
 
+    pub(in crate::replica_journal::owned) const fn carried(&self) -> HeldPosition {
+        self.carried
+    }
+
+    /// Carry toward `target` from the next delay step on, or stop.
+    pub(in crate::replica_journal::owned) const fn aim(&mut self, target: Option<Target>) {
+        self.target = target;
+    }
+
+    /// Stop carrying toward the segment ending at `end`.
+    pub(in crate::replica_journal::owned) fn drop_target(&mut self, end: u64) {
+        if self.target.is_some_and(|target| target.end == end) {
+            self.target = None;
+        }
+    }
+
+    /// The target while the floor is short of its end.
+    pub(in crate::replica_journal::owned) fn carrying(&self) -> Option<Target> {
+        self.target
+            .filter(|target| self.carried < boundary(target.end))
+    }
+
+    /// The target, when this delay step carries. Carrying and a due release
+    /// take turns, so neither starves the other.
+    pub(in crate::replica_journal::owned) fn carry_turn(
+        &mut self,
+        release_due: bool,
+    ) -> Option<Target> {
+        let target = self.carrying()?;
+        self.carried_last = !(release_due && self.carried_last);
+        self.carried_last.then_some(target)
+    }
+
     /// Read at most `limit` held rows at positions in `range`, in position
     /// order: sealed ones from `snapshot`, later ones from memory.
     pub(in crate::replica_journal::owned) fn between(
@@ -55,7 +90,7 @@ impl Held {
     ) -> Between {
         let (from, through) = range;
         let mut recent = Vec::new();
-        if through.operation >= self.active {
+        if through > boundary(self.active) {
             recent.extend(
                 self.recent
                     .iter()
@@ -74,16 +109,31 @@ impl Held {
     }
 }
 
+/// The position where `operation` starts, after every record of earlier
+/// operations.
+pub(in crate::replica_journal::owned) const fn boundary(operation: u64) -> HeldPosition {
+    HeldPosition {
+        operation,
+        index: 0,
+    }
+}
+
 impl Between {
+    /// The rows, and the record bytes of every held row in the range.
     pub(in crate::replica_journal::owned) async fn read(
         self,
-    ) -> Result<Vec<(ReleaseKey, PendingSchedule)>, JournalError> {
+    ) -> Result<(Vec<(ReleaseKey, PendingSchedule)>, u64), JournalError> {
+        let recent = self
+            .recent
+            .iter()
+            .map(|(_, row)| u64::from(row.bytes))
+            .sum::<u64>();
         let mut rows: BTreeMap<HeldPosition, (ReleaseKey, PendingSchedule)> = self
             .recent
             .into_iter()
             .map(|(key, row)| (row.position(), (key, row)))
             .collect();
-        let sealed = self
+        let (sealed, bytes) = self
             .snapshot
             .sealed_schedules_between(self.partition, self.released, self.range, self.limit)
             .await?;
@@ -92,6 +142,9 @@ impl Between {
                 .into_iter()
                 .map(|entry| (entry.record.position(), (entry.key, entry.record))),
         );
-        Ok(rows.into_values().take(self.limit).collect())
+        Ok((
+            rows.into_values().take(self.limit).collect(),
+            recent + bytes,
+        ))
     }
 }

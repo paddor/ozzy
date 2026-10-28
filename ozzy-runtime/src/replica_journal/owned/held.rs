@@ -21,6 +21,7 @@ use super::JournalError;
 mod carry;
 mod check;
 mod merge;
+pub(super) use carry::{Between, boundary};
 use merge::{merge, rows};
 
 /// Sealed rows a copy loads past the last release by default. Rows are
@@ -65,6 +66,10 @@ pub(super) struct Held {
     loaded: Option<ReleaseKey>,
     /// Sealed ranges with scheduled records, oldest first.
     segments: Vec<Sealed>,
+    /// The segment retention would free by carrying, on the primary.
+    target: Option<ozzy_core::retention::Carry>,
+    /// The last delay step carried, so the next one releases first.
+    carried_last: bool,
 }
 
 /// One bounded read of the sealed rows after the loaded ones.
@@ -103,6 +108,8 @@ impl Held {
             sealed: Rows::new(),
             loaded: None,
             segments: Vec::new(),
+            target: None,
+            carried_last: false,
         }
     }
 

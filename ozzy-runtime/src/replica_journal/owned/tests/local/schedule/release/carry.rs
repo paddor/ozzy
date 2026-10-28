@@ -2,6 +2,8 @@ use super::*;
 use ozzy_core::state::{CanonicalImagesError, StateError};
 use ozzy_journal::operation::{AppendBatch, AppendRecord, Carry, HeldPosition, RetentionPolicy};
 
+mod step;
+
 const fn at(operation: u64, index: u32) -> HeldPosition {
     HeldPosition { operation, index }
 }
