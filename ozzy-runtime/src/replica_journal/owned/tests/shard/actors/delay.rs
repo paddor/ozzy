@@ -68,7 +68,7 @@ fn primary_releases_due_records_and_every_copy_applies_them() {
             0,
             broker,
             ActorSettings {
-                delay: Some(DelayLimits { max_entries: 16 }),
+                delay: Some(DelayLimits::new(16)),
                 ..Default::default()
             },
         );

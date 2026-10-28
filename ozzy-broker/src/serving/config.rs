@@ -92,7 +92,7 @@ impl Config {
         checked: &CheckedConfig,
         context: super::ServingContext,
     ) -> Result<Self, StartupError> {
-        let super::ServingContext { omq, time } = context;
+        let super::ServingContext { omq, time, .. } = context;
         crate::frontend::configure_network(&omq, &checked.plan)?;
         let deployment = checked.deployment.deployment();
         let local = NodeId::from_bytes(*checked.identity.broker_id(&checked.plan.name)?.as_bytes());

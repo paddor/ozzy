@@ -70,7 +70,20 @@ impl RetentionFloors {
         self
     }
 
+    /// Also protect `operation` and later ones, such as the first operation
+    /// of the oldest segment still holding scheduled records.
+    #[must_use]
+    pub fn protect_from(mut self, operation: Option<u64>) -> Self {
+        self.protected_operation = match (self.protected_operation, operation) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (left, right) => left.or(right),
+        };
+        self
+    }
+
     /// Derive every committed partition floor from one canonical state image.
+    /// Held scheduled records live in segment indexes; the owner adds their
+    /// floor with `protect_from`.
     pub fn from_canonical_state(
         state: &ozzy_core::state::CanonicalState,
     ) -> Result<Self, RetentionError> {
@@ -84,11 +97,6 @@ impl RetentionFloors {
             .partitions()
             .flat_map(|(_, partition)| partition.producers())
             .filter_map(|(_, producer)| producer.result_operation_floor())
-            .chain(
-                state
-                    .partitions()
-                    .filter_map(|(_, partition)| partition.delay.as_ref()?.oldest_operation()),
-            )
             .min();
         Ok(floors)
     }

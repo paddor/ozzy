@@ -144,7 +144,7 @@ impl OwnedJournal {
             .fold((0_u64, 0_u64), |(bytes, records), delay| {
                 (
                     bytes.saturating_add(delay.held_bytes()),
-                    records.saturating_add(delay.pending_len() as u64),
+                    records.saturating_add(delay.held_records()),
                 )
             });
         if let Some(scheduled) = buffer.scheduled() {

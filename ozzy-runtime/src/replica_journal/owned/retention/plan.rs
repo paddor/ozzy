@@ -15,7 +15,8 @@ struct Retained {
     policy: ozzy_journal::operation::RetentionPolicy,
     floor: Offset,
     end: Offset,
-    /// Oldest `Schedule` operation that still holds a record.
+    /// First operation of the oldest segment holding a record the last
+    /// committed release left.
     held: Option<u64>,
 }
 
@@ -30,6 +31,7 @@ impl OwnedJournal {
     ) -> Result<Option<(PartitionIncarnation, Plan)>, JournalError> {
         self.healthy()?;
         self.validate_image(ticket)?;
+        self.observe_held()?;
         let Some(retained) = self.retained_partition()? else {
             return Ok(None);
         };
@@ -68,10 +70,14 @@ impl OwnedJournal {
             policy,
             floor: state.retained_from,
             end: state.next_offset,
-            held: state
-                .delay
-                .as_ref()
-                .and_then(ozzy_core::state::DelayState::oldest_operation),
+            held: match &state.delay {
+                Some(delay) => self
+                    .held
+                    .as_ref()
+                    .ok_or(JournalError::AppendMismatch)?
+                    .held_operation(delay.released()),
+                None => None,
+            },
         }))
     }
 

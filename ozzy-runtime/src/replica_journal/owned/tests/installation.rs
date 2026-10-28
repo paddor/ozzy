@@ -19,7 +19,7 @@ struct Voter {
 fn voter(controller: &mut Controller, io: Local, index: u8, count: u8) -> Voter {
     let mut config = config(&format!("/broker-{index}"), 7);
     config.identity.replica_node_id = NodeId::from_bytes([index + 1; 16]);
-    config.delay = Some(crate::replica_journal::DelayLimits { max_entries: 16 });
+    config.delay = Some(crate::replica_journal::DelayLimits::new(16));
     let (mut journal, _) = drive(
         controller,
         OwnedJournal::format_new(

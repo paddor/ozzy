@@ -155,10 +155,12 @@ max_entries = 100000
   at initialization. A topic cannot have both delay and deduplication.
 - A producer gives a record an absolute due time. One past acceptance plus
   `max_secs` fails; a past one releases at once.
-- `max_entries` (at most 1048576) bounds held records per partition. A full
-  partition makes producers retry later. Each held record adds 48 bytes to
-  the partition's checkpoint. It may change on restart; a partition holding
-  more than the new limit takes no new schedules until releases drain it.
+- `max_entries` (at most 4294967296) bounds held records per partition. A
+  full partition makes producers retry later. Held records stay on disk; each
+  copy keeps the next 65536 sealed ones and up to 262144 of the active
+  segment in memory, and rolls the segment early past that. The limit may
+  change on restart; a partition holding more than the new limit takes no
+  new schedules until releases drain it.
 - With `retention.max_age_secs` set, `max_secs` must not exceed it.
   Retention keeps the segment of the oldest held record, so a long delay
   can keep old segments, and a partition at its segment limit refuses new

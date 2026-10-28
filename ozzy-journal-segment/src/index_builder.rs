@@ -18,7 +18,8 @@ use crate::{
     INDEX_HEADER_BYTES, IndexError, IndexFileError, IndexLimits, IndexSource,
     MESSAGE_INDEX_ENTRY_BYTES, MessageIndexEntry, OFFSET_INDEX_ENTRY_BYTES,
     OPERATION_INDEX_ENTRY_BYTES, OPERATION_LOCATION_BYTES, OffsetIndexEntry, OperationIndexEntry,
-    OperationLocation, SegmentIndexView, derive_index_entries,
+    OperationLocation, SCHEDULE_INDEX_ENTRY_BYTES, ScheduleIndexEntry, SegmentIndexView,
+    derive_index_entries,
 };
 
 /// Resource bounds for one external index build.
@@ -88,6 +89,7 @@ impl SegmentIndex {
             messages: view.message_count(),
             operations: view.operation_count(),
             locations: view.location_count(),
+            schedules: view.schedule_count(),
         };
         Ok((
             view.build_memory_limit(),
@@ -118,6 +120,11 @@ impl SegmentIndex {
     /// Number of numeric selectors, including data and payload-free appends.
     pub fn location_count(&self) -> usize {
         self.view().location_count()
+    }
+
+    /// Number of scheduled-record rows.
+    pub fn schedule_count(&self) -> usize {
+        self.view().schedule_count()
     }
 
     /// Locate one canonical operation in constant table work.
@@ -191,10 +198,12 @@ struct PendingRuns {
     messages: Vec<MessageIndexEntry>,
     operations: Vec<OperationIndexEntry>,
     locations: Vec<OperationLocation>,
+    schedules: Vec<ScheduleIndexEntry>,
     offset_runs: Vec<PathBuf>,
     message_runs: Vec<PathBuf>,
     operation_runs: Vec<PathBuf>,
     location_runs: Vec<PathBuf>,
+    schedule_runs: Vec<PathBuf>,
 }
 
 impl PendingRuns {
@@ -209,15 +218,18 @@ impl PendingRuns {
                 messages: 0,
                 operations: 0,
                 locations: 0,
+                schedules: 0,
             },
             offsets: Vec::new(),
             messages: Vec::new(),
             operations: Vec::new(),
             locations: Vec::new(),
+            schedules: Vec::new(),
             offset_runs: Vec::new(),
             message_runs: Vec::new(),
             operation_runs: Vec::new(),
             location_runs: Vec::new(),
+            schedule_runs: Vec::new(),
         }
     }
 
@@ -252,6 +264,7 @@ impl PendingRuns {
                 self.counts.operations,
                 usize::from(derived.operation.is_some()),
             )?,
+            schedules: checked_add(self.counts.schedules, derived.schedules.len())?,
         };
         calculate_index_layout(next_counts, self.file_limits)?;
         self.counts = next_counts;
@@ -263,6 +276,7 @@ impl PendingRuns {
         self.messages.extend(derived.messages);
         self.operations.extend(derived.operation);
         self.locations.push(derived.location);
+        self.schedules.extend(derived.schedules);
         Ok(())
     }
 }
@@ -273,6 +287,7 @@ enum RunKind {
     Message,
     Operation,
     Location,
+    Schedule,
 }
 
 impl RunKind {
@@ -282,6 +297,7 @@ impl RunKind {
             Self::Message => MESSAGE_INDEX_ENTRY_BYTES,
             Self::Operation => OPERATION_INDEX_ENTRY_BYTES,
             Self::Location => OPERATION_LOCATION_BYTES,
+            Self::Schedule => SCHEDULE_INDEX_ENTRY_BYTES,
         }
     }
 
@@ -291,6 +307,7 @@ impl RunKind {
             Self::Message => 40,
             Self::Operation => 16,
             Self::Location => 8,
+            Self::Schedule => 32,
         }
     }
 
@@ -300,6 +317,7 @@ impl RunKind {
             Self::Message => "message",
             Self::Operation => "operation",
             Self::Location => "location",
+            Self::Schedule => "schedule",
         }
     }
 }
@@ -322,6 +340,13 @@ fn derived_entry_bytes(entries: &crate::DerivedIndexEntries) -> Result<usize, In
             )
         })
         .and_then(|total| total.checked_add(size_of::<OperationLocation>()))
+        .and_then(|total| {
+            entries
+                .schedules
+                .len()
+                .checked_mul(size_of::<ScheduleIndexEntry>())
+                .and_then(|bytes| total.checked_add(bytes))
+        })
         .ok_or_else(|| IndexFileError::LengthOverflow.into())
 }
 
@@ -341,6 +366,7 @@ fn validate_build_limits(limits: IndexBuildLimits) -> Result<(), IndexBuildError
             messages: 0,
             operations: 0,
             locations: 0,
+            schedules: 0,
         },
         limits.file,
     )?;

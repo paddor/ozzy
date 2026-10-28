@@ -64,7 +64,8 @@ impl Releases {
         self.retry_at = Some(now.saturating_add(wait));
     }
 
-    /// Queue a finished step's proposal, or wait before the next step.
+    /// Queue a finished step's proposal, or wait before the next step. A
+    /// step that loaded held records lets the next one start at once.
     pub(super) fn complete(
         &mut self,
         turn: Result<ReleaseTurn, JournalError>,
@@ -72,8 +73,11 @@ impl Releases {
         proposals: &mut Proposals,
     ) -> Result<(), JournalError> {
         self.running = None;
-        match turn?.proposal {
+        let turn = turn?;
+        match turn.proposal {
             Some(buffer) => proposals.set_maintenance(buffer),
+            // Loaded held records may be due already.
+            None if turn.loaded => {}
             None => self.retry_at = Some(now.saturating_add(RETRY)),
         }
         Ok(())

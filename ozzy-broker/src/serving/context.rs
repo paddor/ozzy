@@ -11,6 +11,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub struct ServingContext {
     pub(super) omq: Context,
     pub(super) time: Time,
+    /// Held-record memory bounds replacing the defaults: sealed rows loaded
+    /// and active-segment rows.
+    #[cfg(feature = "simulation")]
+    held: Option<(usize, usize)>,
 }
 
 impl From<Context> for ServingContext {
@@ -18,6 +22,8 @@ impl From<Context> for ServingContext {
         Self {
             omq,
             time: Time::default(),
+            #[cfg(feature = "simulation")]
+            held: None,
         }
     }
 }
@@ -37,6 +43,35 @@ impl ServingContext {
                 clock,
                 epoch_millis,
             },
+            held: None,
+        }
+    }
+
+    /// Keep `window` sealed rows loaded and roll a segment early at `active`
+    /// rows in each delay partition, so a simulation passes both bounds
+    /// with few records.
+    #[cfg(feature = "simulation")]
+    #[must_use]
+    pub const fn with_held_bounds(mut self, window: usize, active: usize) -> Self {
+        self.held = Some((window, active));
+        self
+    }
+
+    /// Apply the held-record bounds to every delay partition of `journals`.
+    #[cfg(feature = "simulation")]
+    pub(super) fn bound_held(&self, journals: &mut crate::JournalPlan) {
+        let Some((window, active)) = self.held else {
+            return;
+        };
+        for partition in &mut journals.partitions {
+            let delay = match &mut partition.config {
+                crate::JournalConfig::Local(config) => &mut config.delay,
+                crate::JournalConfig::Replicated(config) => &mut config.delay,
+            };
+            if let Some(delay) = delay {
+                delay.window = window;
+                delay.active = active;
+            }
         }
     }
 }

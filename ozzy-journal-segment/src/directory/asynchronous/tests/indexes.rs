@@ -5,7 +5,7 @@ use crate::{
     segment_index_name,
 };
 use ozzy_journal::operation::{
-    Append, AppendBatch, AppendRecord, OperationBody, encode_operation_body,
+    Append, AppendBatch, AppendRecord, OperationBody, Schedule, encode_operation_body,
 };
 use ozzy_proto::{
     MessageId, Offset, OperationId, OwnerEpoch, PartitionIncarnation, ProducerEpoch, ProducerId,
@@ -22,6 +22,7 @@ pub(super) fn build_limits() -> IndexBuildLimits {
             max_offset_entries: 64,
             max_message_entries: 64,
             max_operation_entries: 64,
+            max_schedule_entries: 64,
         },
         max_resident_bytes: 0,
     }
@@ -161,39 +162,139 @@ async fn async_multi_pass_index_is_byte_identical_to_one_pass_encoding() {
     let image = journal.segment_image(reference).await.unwrap();
     drop(journal);
     pool.shutdown().await;
+    assert_eq!(index.as_bytes(), one_pass(&image, reference, source));
+}
+
+/// Entries derived per operation, sorted and encoded in one pass: the oracle
+/// for a multi-pass build of the same segment.
+fn one_pass(image: &[u8], reference: SegmentReference, source: IndexSource) -> Vec<u8> {
     let scan = scan_segment(
-        &image,
+        image,
         reference.first_group_number,
         reference.first_chain,
         limits().decode,
     )
     .unwrap();
-    // Entries derived per operation, sorted and encoded in one pass, are the oracle.
-    let (mut offsets, mut messages, mut operations, mut locations) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut entries = crate::IndexEntries::default();
     for operation in scan.groups.iter().flat_map(|group| &group.operations) {
         let derived =
             crate::derive_index_entries(&scan.header, operation, limits().operations).unwrap();
-        offsets.extend(derived.offsets);
-        messages.extend(derived.messages);
-        operations.extend(derived.operation);
-        locations.push(derived.location);
+        entries.offsets.extend(derived.offsets);
+        entries.messages.extend(derived.messages);
+        entries.operations.extend(derived.operation);
+        entries.locations.push(derived.location);
+        entries.schedules.extend(derived.schedules);
     }
     let expected = crate::SegmentIndexImage::new(
         source,
         build_limits().max_entry_buffer_bytes as u64,
-        crate::IndexEntries {
-            offsets,
-            messages,
-            operations,
-            locations,
-        },
+        entries,
     )
     .unwrap();
-    assert_eq!(
-        index.as_bytes(),
-        crate::encode_segment_index(&expected, build_limits().file).unwrap()
+    crate::encode_segment_index(&expected, build_limits().file).unwrap()
+}
+
+/// Two scheduled records: the first due later for later schedules, the
+/// second already due.
+fn schedule_body(number: u8) -> Vec<u8> {
+    encode_operation_body(
+        &OperationBody::Schedule(Schedule {
+            batch: AppendBatch {
+                partition: partition(),
+                owner_epoch: OwnerEpoch::new(1),
+                producer_id: ProducerId::from_bytes([0x30; 16]),
+                producer_epoch: ProducerEpoch::INITIAL,
+                first_sequence: ProducerSequence::new(u64::from(number) * 2),
+                first_offset: Offset::ZERO,
+                append_timestamp_millis: 100 + u64::from(number),
+                records: (0..2)
+                    .map(|index| AppendRecord {
+                        encoding: ozzy_proto::data::Encoding::Raw,
+                        message_id: MessageId::from_bytes([0x50 + number * 2 + index; 16]),
+                        parts: vec![b"payload".as_slice()].into(),
+                    })
+                    .collect::<Vec<_>>()
+                    .into(),
+            },
+            first_schedule: u64::from(number) * 2,
+            due_millis: vec![1_000 - u64::from(number) * 10, 0],
+        }),
+        OperationLimits::default(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn async_multi_pass_index_sorts_scheduled_records_by_release_key() {
+    let root = tempfile::tempdir().unwrap();
+    let (pool, mut clients) = ozzy_io_pool::Pool::new(ozzy_io_pool::Config {
+        threads: 1,
+        max_inflight: 1,
+        handles: 32,
+        limits: io_limits(),
+    })
+    .unwrap();
+    let mut journal = Journal::format(
+        root.path().join("group"),
+        Local::new(clients.remove(0)),
+        spec(CommitMode::External),
+        JournalGeneration(1),
+        limits(),
+    )
+    .await
+    .unwrap();
+    for number in 0..6 {
+        let body = schedule_body(number);
+        let op = CanonicalOperation {
+            kind: OperationKind::Schedule,
+            body: &body,
+            ..operation(&journal)
+        };
+        journal.append(&[op], BodyEncoding::Raw).await.unwrap();
+    }
+    append_confirmed(&mut journal).await;
+    journal.roll_active(32768, 4).await.unwrap();
+    // The entry buffer holds a few rows, so they sort across many runs.
+    let index = journal.build_sealed_index(1, build_limits()).await.unwrap();
+    let rows: Vec<_> = index
+        .view()
+        .schedules_after(partition(), None)
+        .map(|row| {
+            (
+                row.key.millis,
+                row.key.schedule,
+                row.record.operation,
+                row.record.index,
+            )
+        })
+        .collect();
+    let mut expected: Vec<_> = (0..6_u64)
+        .flat_map(|number| {
+            [
+                (1_000 - number * 10, number * 2, number + 1, 0),
+                (100 + number, number * 2 + 1, number + 1, 1),
+            ]
+        })
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(rows, expected);
+    let bytes = ozzy_journal::operation::encoded_record_bytes(
+        ozzy_proto::data::Encoding::Raw,
+        [b"payload".as_slice()],
     );
+    assert!(
+        index
+            .view()
+            .schedules_after(partition(), None)
+            .all(|row| row.record.bytes as usize == bytes)
+    );
+    assert_eq!(index.offset_count(), 0);
+    let source = index.source();
+    let reference = journal.manifest.segments[0];
+    let image = journal.segment_image(reference).await.unwrap();
+    drop(journal);
+    pool.shutdown().await;
+    assert_eq!(index.as_bytes(), one_pass(&image, reference, source));
 }
 
 async fn check_snapshot(journal: &Journal) {

@@ -3,8 +3,9 @@
 
 use super::{
     IndexFileError, IndexSource, MESSAGE_INDEX_ENTRY_BYTES, OFFSET_INDEX_ENTRY_BYTES,
-    OPERATION_INDEX_ENTRY_BYTES, OPERATION_LOCATION_BYTES, SegmentIndexImage, SegmentIndexView,
-    compare_message_entries, compare_offset_entries, compare_operation_entries,
+    OPERATION_INDEX_ENTRY_BYTES, OPERATION_LOCATION_BYTES, SCHEDULE_INDEX_ENTRY_BYTES,
+    SegmentIndexImage, SegmentIndexView, compare_message_entries, compare_offset_entries,
+    compare_operation_entries, compare_schedule_entries,
     order::{
         binary_search_section, compare_offset_key, compare_partition_offset, raw_order_checks,
         sorted_entry_checks,
@@ -12,7 +13,7 @@ use super::{
     require_zero,
     rows::{
         decode_message_entry, decode_offset_entry, decode_operation_entry,
-        decode_operation_location,
+        decode_operation_location, decode_schedule_entry,
     },
 };
 use crate::{ENTRY_HEADER_BYTES, OperationLocation, SEGMENT_HEADER_BYTES};
@@ -50,6 +51,7 @@ pub(super) fn image_checks(
             compare_operation_entries,
             "operation",
         ))
+        .chain(schedule_image_checks(image))
         .chain(image.offsets().iter().map(|entry| {
             if entry.location.record_index != 0 && entry.append_timestamp_millis != 0 {
                 return Err(IndexFileError::NonZeroReserved);
@@ -93,6 +95,18 @@ pub(super) fn image_checks(
         }))
 }
 
+/// Sorted schedule rows, each of an in-source operation.
+fn schedule_image_checks(
+    image: &SegmentIndexImage,
+) -> impl Iterator<Item = Result<usize, IndexFileError>> + '_ {
+    sorted_entry_checks(image.schedules(), compare_schedule_entries, "schedule").chain(
+        image.schedules().iter().map(|entry| {
+            validate_schedule_operation(image.source, entry.record.operation)?;
+            Ok(SCHEDULE_INDEX_ENTRY_BYTES)
+        }),
+    )
+}
+
 pub(super) fn validate_source(source: IndexSource) -> Result<(), IndexFileError> {
     if source.group_id.as_bytes().iter().all(|byte| *byte == 0)
         || source.segment_id == 0
@@ -124,6 +138,12 @@ pub(super) fn section_checks(
             16,
             "operation",
         ))
+        .chain(raw_order_checks::<SCHEDULE_INDEX_ENTRY_BYTES>(
+            view.schedules,
+            32,
+            "schedule",
+        ))
+        .chain(schedule_row_checks(view))
         .chain(offset_row_checks(view))
         .chain(message_row_checks(view))
         .chain(operation_row_checks(view))
@@ -181,6 +201,25 @@ fn operation_row_checks(
         validate_indexed_location(location, |number| view.find_operation_number(number))?;
         Ok(OPERATION_INDEX_ENTRY_BYTES)
     })
+}
+
+/// An in-source `Schedule` operation for each schedule row.
+fn schedule_row_checks(
+    view: SegmentIndexView<'_>,
+) -> impl Iterator<Item = Result<usize, IndexFileError>> + '_ {
+    let source = view.source;
+    let rows = view.schedules.as_chunks::<SCHEDULE_INDEX_ENTRY_BYTES>().0;
+    rows.iter().map(move |entry| {
+        validate_schedule_operation(source, decode_schedule_entry(entry).record.operation)?;
+        Ok(SCHEDULE_INDEX_ENTRY_BYTES)
+    })
+}
+
+fn validate_schedule_operation(source: IndexSource, operation: u64) -> Result<(), IndexFileError> {
+    if operation < source.first_op_number || operation > source.last_op_number {
+        return Err(IndexFileError::InvalidLocation);
+    }
+    Ok(())
 }
 
 /// Dense numbering and nonoverlapping extents across the location rows.

@@ -25,15 +25,30 @@ async fn delay_cluster(
     clock: &SdkClock,
     max_entries: u64,
 ) -> broker::Cluster {
-    progress(
-        clock,
-        broker::Cluster::configured(mode, Some(clock.clone()), |config| {
-            config.topics.get_mut("orders").unwrap().delay = Some(ozzy_config::TopicDelay {
-                max_secs: 60,
-                max_entries,
-            });
-        }),
-    )
+    held_cluster(mode, clock, max_entries, None).await
+}
+
+/// A cluster whose delay partitions use the held-record bounds `(window,
+/// active)`, when given.
+async fn held_cluster(
+    mode: DeploymentMode,
+    clock: &SdkClock,
+    max_entries: u64,
+    held: Option<(usize, usize)>,
+) -> broker::Cluster {
+    let configure = |config: &mut ozzy_config::Deployment| {
+        config.topics.get_mut("orders").unwrap().delay = Some(ozzy_config::TopicDelay {
+            max_secs: 60,
+            max_entries,
+        });
+    };
+    let manual = Some(clock.clone());
+    progress(clock, async {
+        match held {
+            Some(held) => broker::Cluster::configured_held(mode, manual, held, configure).await,
+            None => broker::Cluster::configured(mode, manual, configure).await,
+        }
+    })
     .await
 }
 
@@ -294,7 +309,6 @@ mod stress {
     use super::*;
 
     const ROUNDS: u8 = 12;
-    const RECORDS: u8 = 10;
 
     /// A confirmed record. Its leader accepted it between `sent_at` and
     /// `confirmed_at`, broker time.
@@ -312,21 +326,37 @@ mod stress {
     async fn inproc_memory_held_records_release_once_in_order_across_repeated_faults() {
         tokio::time::timeout(Duration::from_secs(120), async {
             for mode in [DeploymentMode::Single, DeploymentMode::Three] {
-                faulted_releases(mode).await;
+                faulted_releases(mode, 10, None).await;
             }
         })
         .await
         .expect("held records made no bounded progress across repeated faults");
     }
 
-    /// Send rounds of records with spread due times and fault one copy in
-    /// each round while earlier rounds release: the primary with its writes
-    /// held, or after its records confirm, with or without power loss, or a
-    /// follower. Then every record must have left exactly once, in release
+    /// Each copy loads four sealed rows and rolls its segment at eight held
+    /// rows, so many small sealed segments hold records and releases read
+    /// most of them from index files.
+    #[tokio::test(flavor = "current_thread")]
+    async fn inproc_memory_held_records_past_small_memory_bounds_release_once_in_order() {
+        tokio::time::timeout(Duration::from_secs(180), async {
+            for mode in [DeploymentMode::Single, DeploymentMode::Three] {
+                faulted_releases(mode, 20, Some((4, 8))).await;
+            }
+        })
+        .await
+        .expect("held records past small memory bounds made no bounded progress");
+    }
+
+    /// Send rounds of `per_round` records with spread due times and fault
+    /// one copy in each round while earlier rounds release: the primary with
+    /// its writes held, or after its records confirm, with or without power
+    /// loss, or a follower. A follower also misses a whole round and
+    /// installs it after, and later restarts empty and installs the whole
+    /// history. Then every record must have left exactly once, in release
     /// order, and none before its due time.
-    async fn faulted_releases(mode: DeploymentMode) {
+    async fn faulted_releases(mode: DeploymentMode, per_round: u8, bounds: Option<(usize, usize)>) {
         let clock = SdkClock::manual();
-        let mut cluster = delay_cluster(mode, &clock, 64).await;
+        let mut cluster = held_cluster(mode, &clock, 64, bounds).await;
         let client = progress(
             &clock,
             Client::open_with_clock(&cluster.configs[0].0, &cluster.runtime, clock.clone()),
@@ -340,7 +370,7 @@ mod stress {
             let clock = clock.clone();
             async move {
                 let mut records = Vec::new();
-                while records.len() < usize::from(ROUNDS * RECORDS) {
+                while records.len() < usize::from(ROUNDS) * usize::from(per_round) {
                     let record = reader.next().await.unwrap();
                     records.push((
                         record.message_id.as_bytes()[0],
@@ -356,10 +386,10 @@ mod stress {
         for round in 0..ROUNDS {
             // (hold writes, crash the primary, power loss, broker millis to
             // release before the fault)
-            let (hold, on_primary, power_loss, advance) = match round % 4 {
+            let (hold, on_primary, power_loss, advance) = match round % 5 {
                 0 => (false, true, false, 2_500),
                 1 => (true, true, true, 0),
-                2 => (false, false, true, 2_500),
+                2 | 4 => (false, false, true, 2_500),
                 _ => (false, true, true, 1_500),
             };
             let primary = primary(&clock, &cluster, &client).await;
@@ -370,10 +400,17 @@ mod stress {
             };
             let control = cluster.controls[target].clone();
             control.hold_completions(hold);
+            // A follower misses a round and installs it after; a later one
+            // restarts empty and installs the whole history.
+            let lagging = (round % 5 == 4 && mode == DeploymentMode::Three).then_some(round < 6);
+            let stopped = match lagging {
+                Some(true) => Some(progress(&clock, cluster.stop(target)).await),
+                _ => None,
+            };
             let sent_at = broker_now(&clock);
             let mut pending = Vec::new();
-            for n in 0..RECORDS {
-                let id = round * RECORDS + n + 1;
+            for n in 0..per_round {
+                let id = round * per_round + n + 1;
                 // From 1 s past due to 8 s ahead, out of send order; every
                 // fourth record is stored at once.
                 let due = (n % 4 != 3)
@@ -403,7 +440,11 @@ mod stress {
             }
             if !hold {
                 wait_until(&clock, broker_now(&clock) + advance).await;
-                progress(&clock, cluster.crash(target, power_loss)).await;
+                match (lagging, stopped) {
+                    (_, Some(image)) => progress(&clock, cluster.restore(target, image)).await,
+                    (Some(_), None) => progress(&clock, cluster.restart_fresh(target)).await,
+                    (None, _) => progress(&clock, cluster.crash(target, power_loss)).await,
+                }
             }
             progress(&clock, cluster.wait_recovered(target)).await;
         }

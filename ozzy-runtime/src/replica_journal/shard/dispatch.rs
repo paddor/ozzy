@@ -249,7 +249,7 @@ async fn release(
     use crate::replica_journal::owned::release::ReleaseStep;
     let turn = match state.owner.prepare_release(ticket, timestamp).await {
         Ok(ReleaseStep::Read(read)) => {
-            return Outcome::job(super::jobs::release(*read, done, permit));
+            return Outcome::job(super::jobs::release(read, done, permit));
         }
         Ok(ReleaseStep::Idle) => Ok(crate::replica_journal::ReleaseTurn::default()),
         Err(error) => Err(error),

@@ -15,7 +15,7 @@ mod groups;
 pub use groups::{CoordinatorGroup, group_targets};
 mod append;
 mod delay;
-pub use delay::{DelayState, PendingSchedule};
+pub use delay::{DelayState, PendingSchedule, schedule_entries};
 mod identity;
 mod images;
 mod installation;
@@ -35,8 +35,8 @@ pub use images::{
     RecoveredImages,
 };
 pub use snapshot::{
-    PENDING_SCHEDULE_SNAPSHOT_BYTES, RETRY_SPAN_SNAPSHOT_BYTES, STATE_SNAPSHOT_HEADER_BYTES,
-    StateSnapshotError, StateSnapshotLimits, canonical_state_schema_digest,
+    RETRY_SPAN_SNAPSHOT_BYTES, STATE_SNAPSHOT_HEADER_BYTES, StateSnapshotError,
+    StateSnapshotLimits, canonical_state_schema_digest,
 };
 
 /// Bounds for live application metadata. Historical identities live in indexes.
@@ -59,7 +59,7 @@ pub struct StateLimits {
     /// Maximum source intents across coordinator groups.
     pub max_group_partitions: usize,
     /// Maximum held scheduled records per partition.
-    pub max_pending_schedules: usize,
+    pub max_pending_schedules: u64,
 }
 
 impl Default for StateLimits {
@@ -73,7 +73,7 @@ impl Default for StateLimits {
             max_groups: 65_536,
             max_group_members: 1_048_576,
             max_group_partitions: 1_048_576,
-            max_pending_schedules: 1_048_576,
+            max_pending_schedules: 1 << 32,
         }
     }
 }

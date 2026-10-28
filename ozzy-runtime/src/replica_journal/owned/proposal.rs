@@ -223,11 +223,13 @@ impl OwnedJournal {
             let rewrite = self.resolve_producer_ids(ticket, buffer)?;
             let mut staged = buffer.stage_dedup(rewrite);
             let (plan, records) = self.prepare_append(ticket, staged.buffer(), true).await?;
+            self.prepare_held(staged.buffer()).await?;
             let dedup = self.prepare_dedup(ticket, staged.buffer())?;
             staged.commit();
             return Ok(Prepared::Fresh(plan, records, dedup));
         }
         let (plan, records) = self.prepare_append(ticket, buffer, true).await?;
+        self.prepare_held(buffer).await?;
         let dedup = self.prepare_dedup(ticket, buffer)?;
         Ok(Prepared::Fresh(plan, records, dedup))
     }

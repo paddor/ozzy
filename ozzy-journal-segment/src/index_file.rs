@@ -19,10 +19,11 @@ pub(crate) use asynchronous::decode_segment_index_async;
 pub use error::IndexFileError;
 pub(crate) use order::{
     compare_locations, compare_message_entries, compare_offset_entries, compare_operation_entries,
+    compare_schedule_entries,
 };
 pub(crate) use rows::{
     encode_index_header, encode_message_entry, encode_offset_entry, encode_operation_entry,
-    encode_operation_location,
+    encode_operation_location, encode_schedule_entry,
 };
 pub(crate) use sections::{IndexCounts, IndexLayout, calculate_index_layout};
 pub use view::SegmentIndexView;
@@ -30,10 +31,12 @@ pub use view::SegmentIndexView;
 use rows::decode_source;
 use validate::{section_checks, validate_image, validate_location_count, validate_source};
 
-use crate::{MessageIndexEntry, OffsetIndexEntry, OperationIndexEntry, OperationLocation};
+use crate::{
+    MessageIndexEntry, OffsetIndexEntry, OperationIndexEntry, OperationLocation, ScheduleIndexEntry,
+};
 
 const INDEX_MAGIC: &[u8; 8] = b"OZYIDX01";
-const INDEX_VERSION: u16 = 3;
+const INDEX_VERSION: u16 = 4;
 pub(crate) const INDEX_HASH_CONTEXT: &str = "ozzy segment index file v1";
 pub(crate) const INDEX_DIGEST_START: usize = 256;
 
@@ -47,6 +50,8 @@ pub const MESSAGE_INDEX_ENTRY_BYTES: usize = 80;
 pub const OPERATION_INDEX_ENTRY_BYTES: usize = 80;
 /// Exact encoded numeric operation selector length.
 pub const OPERATION_LOCATION_BYTES: usize = 56;
+/// Exact encoded scheduled-record row length.
+pub const SCHEDULE_INDEX_ENTRY_BYTES: usize = 64;
 
 /// Exact immutable segment prefix represented by one index file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +83,8 @@ pub struct IndexLimits {
     pub max_message_entries: usize,
     /// Maximum canonical operation selectors per derived index.
     pub max_operation_entries: usize,
+    /// Maximum scheduled-record rows per derived index.
+    pub max_schedule_entries: usize,
 }
 
 impl Default for IndexLimits {
@@ -87,6 +94,7 @@ impl Default for IndexLimits {
             max_offset_entries: 16 * 1024 * 1024,
             max_message_entries: 16 * 1024 * 1024,
             max_operation_entries: 16 * 1024 * 1024,
+            max_schedule_entries: 16 * 1024 * 1024,
         }
     }
 }
@@ -110,6 +118,8 @@ pub struct IndexEntries {
     pub operations: Vec<OperationIndexEntry>,
     /// Numeric selectors, one per canonical operation.
     pub locations: Vec<OperationLocation>,
+    /// Scheduled-record rows.
+    pub schedules: Vec<ScheduleIndexEntry>,
 }
 
 impl IndexEntries {
@@ -119,6 +129,7 @@ impl IndexEntries {
         self.messages.sort_unstable_by(compare_message_entries);
         self.operations.sort_unstable_by(compare_operation_entries);
         self.locations.sort_unstable_by(compare_locations);
+        self.schedules.sort_unstable_by(compare_schedule_entries);
         SegmentIndexImage {
             source,
             build_memory_limit,
@@ -169,6 +180,11 @@ impl SegmentIndexImage {
         &self.entries.locations
     }
 
+    /// Scheduled-record rows by partition and release key.
+    pub fn schedules(&self) -> &[ScheduleIndexEntry] {
+        &self.entries.schedules
+    }
+
     /// Exact operation in this validated dense numeric prefix.
     pub fn find_operation_number(&self, number: u64) -> Option<OperationLocation> {
         let at = usize::try_from(number.checked_sub(self.source.first_op_number)?).ok()?;
@@ -183,27 +199,12 @@ pub fn encode_segment_index(
 ) -> Result<Vec<u8>, IndexFileError> {
     validate_limits(limits)?;
     validate_image(image)?;
-    enforce_count(
-        "offset entries",
-        image.offsets().len(),
-        limits.max_offset_entries,
-    )?;
-    enforce_count(
-        "message entries",
-        image.messages().len(),
-        limits.max_message_entries,
-    )?;
-    enforce_count(
-        "operation entries",
-        image.operations().len(),
-        limits.max_operation_entries,
-    )?;
-
     let counts = IndexCounts {
         offsets: image.offsets().len(),
         messages: image.messages().len(),
         operations: image.operations().len(),
         locations: image.locations().len(),
+        schedules: image.schedules().len(),
     };
     let layout = calculate_index_layout(counts, limits)?;
 
@@ -212,37 +213,29 @@ pub fn encode_segment_index(
         .split_mut(&mut output)
         .ok_or(IndexFileError::InvalidSectionLayout)?;
     *header = encode_index_header(image.source, image.build_memory_limit, counts, layout)?;
-    let offsets = sections
-        .offsets
-        .as_chunks_mut::<OFFSET_INDEX_ENTRY_BYTES>()
-        .0;
-    for (entry, target) in image.offsets().iter().zip(offsets) {
-        encode_offset_entry(entry, target);
-    }
-    let messages = sections
-        .messages
-        .as_chunks_mut::<MESSAGE_INDEX_ENTRY_BYTES>()
-        .0;
-    for (entry, target) in image.messages().iter().zip(messages) {
-        encode_message_entry(entry, target);
-    }
-    let operations = sections
-        .operations
-        .as_chunks_mut::<OPERATION_INDEX_ENTRY_BYTES>()
-        .0;
-    for (entry, target) in image.operations().iter().zip(operations) {
-        encode_operation_entry(entry, target);
-    }
-    let locations = sections
-        .locations
-        .as_chunks_mut::<OPERATION_LOCATION_BYTES>()
-        .0;
-    for (entry, target) in image.locations().iter().zip(locations) {
-        encode_operation_location(entry, target);
-    }
+    encode_rows(image.offsets(), sections.offsets, encode_offset_entry);
+    encode_rows(image.messages(), sections.messages, encode_message_entry);
+    encode_rows(
+        image.operations(),
+        sections.operations,
+        encode_operation_entry,
+    );
+    encode_rows(
+        image.locations(),
+        sections.locations,
+        encode_operation_location,
+    );
+    encode_rows(image.schedules(), sections.schedules, encode_schedule_entry);
     let digest = index_digest(&output);
     layout::patch(&mut output, INDEX_DIGEST_START, *digest.as_bytes())?;
     Ok(output)
+}
+
+/// Encode `entries` into consecutive `W`-byte rows of `section`.
+fn encode_rows<T, const W: usize>(entries: &[T], section: &mut [u8], encode: fn(&T, &mut [u8; W])) {
+    for (entry, target) in entries.iter().zip(section.as_chunks_mut::<W>().0) {
+        encode(entry, target);
+    }
 }
 
 /// Validate one complete index without allocating per-entry state.
@@ -283,11 +276,12 @@ fn validate_header(input: &[u8], limits: IndexLimits) -> Result<(), IndexFileErr
     require_zero(header, 172..176)?;
     require_zero(header, 196..200)?;
     require_zero(header, 236..256)?;
-    require_zero(header, 288..INDEX_HEADER_BYTES)?;
+    require_zero(header, 308..INDEX_HEADER_BYTES)?;
     if header.u32_at::<144>() != OFFSET_INDEX_ENTRY_BYTES as u32
         || header.u32_at::<168>() != MESSAGE_INDEX_ENTRY_BYTES as u32
         || header.u32_at::<192>() != OPERATION_INDEX_ENTRY_BYTES as u32
         || header.u32_at::<232>() != OPERATION_LOCATION_BYTES as u32
+        || header.u32_at::<304>() != SCHEDULE_INDEX_ENTRY_BYTES as u32
     {
         return Err(IndexFileError::UnsupportedEntryWidth);
     }
@@ -315,6 +309,7 @@ fn decode_sections(
         messages: usize_from_u64(header.u64_at::<152>())?,
         operations: usize_from_u64(header.u64_at::<176>())?,
         locations: usize_from_u64(header.u64_at::<216>())?,
+        schedules: usize_from_u64(header.u64_at::<288>())?,
     };
     let expected = calculate_index_layout(counts, limits)?;
     validate_location_count(source, counts.locations)?;
@@ -323,6 +318,7 @@ fn decode_sections(
         message_start: usize_from_u64(header.u64_at::<160>())?,
         operation_start: usize_from_u64(header.u64_at::<184>())?,
         location_start: usize_from_u64(header.u64_at::<224>())?,
+        schedule_start: usize_from_u64(header.u64_at::<296>())?,
         file_bytes: input.len(),
     };
     if usize_from_u64(header.u64_at::<136>())? != INDEX_HEADER_BYTES || stated != expected {

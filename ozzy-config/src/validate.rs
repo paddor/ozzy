@@ -292,7 +292,7 @@ fn validate_delay(
     require(
         delay.max_entries > 0 && delay.max_entries <= MAX_DELAY_ENTRIES,
         &format!("{path}.max_entries"),
-        "held record limit must be positive and at most 1048576",
+        "held record limit must be positive and at most 4294967296",
     )
 }
 

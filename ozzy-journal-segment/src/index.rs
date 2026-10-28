@@ -1,7 +1,9 @@
 //! Exact derived-index entries extracted from validated segment operations.
 
+use ozzy_core::state::PendingSchedule;
 use ozzy_journal::operation::{
-    AppendBatch, Digest, OperationBody, OperationCodecError, OperationLimits, decode_operation_body,
+    AppendBatch, Digest, OperationBody, OperationCodecError, OperationLimits, ReleaseKey,
+    decode_operation_body,
 };
 use ozzy_proto::{MessageId, Offset, OperationId, PartitionIncarnation};
 use thiserror::Error;
@@ -71,6 +73,18 @@ pub struct OperationIndexEntry {
     pub location: OperationLocation,
 }
 
+/// One scheduled record of a `Schedule` operation, by release key. It is
+/// held until a `Release` passes its key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduleIndexEntry {
+    /// Exact partition record incarnation.
+    pub partition: PartitionIncarnation,
+    /// `(max(due, acceptance), schedule sequence)`.
+    pub key: ReleaseKey,
+    /// The `Schedule` operation, record index, encoded bytes, and identity.
+    pub record: PendingSchedule,
+}
+
 /// Entries derived from one canonical operation without retaining its payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DerivedIndexEntries {
@@ -82,6 +96,8 @@ pub struct DerivedIndexEntries {
     pub messages: Vec<MessageIndexEntry>,
     /// Optional canonical control-operation identity selector.
     pub operation: Option<OperationIndexEntry>,
+    /// Scheduled records in batch order.
+    pub schedules: Vec<ScheduleIndexEntry>,
 }
 
 /// Decode one bounded operation and derive exact disposable index entries.
@@ -109,12 +125,31 @@ pub fn derive_index_entries(
         OperationBody::Append(append) => append.batches.as_slice(),
         OperationBody::ResolvedAppend(append) => std::slice::from_ref(&append.batch),
         OperationBody::Release(release) => std::slice::from_ref(&release.batch),
+        OperationBody::Schedule(schedule) => {
+            let schedules = ozzy_core::state::schedule_entries(operation.op_number, schedule)
+                .map_err(|_| IndexError::PositionOverflow)?
+                .into_iter()
+                .map(|(key, record)| ScheduleIndexEntry {
+                    partition: schedule.batch.partition,
+                    key,
+                    record,
+                })
+                .collect();
+            return Ok(DerivedIndexEntries {
+                location,
+                offsets: Vec::new(),
+                messages: Vec::new(),
+                operation: operation_entry,
+                schedules,
+            });
+        }
         _ => {
             return Ok(DerivedIndexEntries {
                 location,
                 offsets: Vec::new(),
                 messages: Vec::new(),
                 operation: operation_entry,
+                schedules: Vec::new(),
             });
         }
     };
@@ -124,6 +159,7 @@ pub fn derive_index_entries(
         offsets,
         messages,
         operation: None,
+        schedules: Vec::new(),
     })
 }
 

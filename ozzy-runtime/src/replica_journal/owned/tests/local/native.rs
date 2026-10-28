@@ -527,7 +527,7 @@ fn native_scheduled_append_confirms_schedule_sequences_and_refuses_late_due_time
         partition(),
         PartitionId::ZERO,
         ActorOptions {
-            delay: Some(crate::replica_journal::DelayLimits { max_entries: 8 }),
+            delay: Some(crate::replica_journal::DelayLimits::new(8)),
             ..ActorOptions::default()
         },
     );
