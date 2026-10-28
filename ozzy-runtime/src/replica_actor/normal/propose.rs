@@ -41,7 +41,7 @@ impl ReplicaActor {
         }
         if submission.buffer.len()
             > self.config.pipeline.max_operations - snapshot.pending_operations
-            || submission.buffer.body_bytes()
+            || submission.buffer.admitted_body_bytes()
                 > self.config.pipeline.max_body_bytes - snapshot.pending_body_bytes
         {
             if !std::mem::replace(&mut self.work.window_full, true) {

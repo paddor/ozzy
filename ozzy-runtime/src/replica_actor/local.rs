@@ -507,7 +507,7 @@ fn has_room(
 ) -> bool {
     let limits = driver.limits();
     buffer.len() <= limits.max_operations - state.pending_operations
-        && buffer.body_bytes() <= limits.max_body_bytes - state.pending_body_bytes
+        && buffer.admitted_body_bytes() <= limits.max_body_bytes - state.pending_body_bytes
         && journal.validation_has_capacity(&buffer.0, state.accepted.op)
 }
 

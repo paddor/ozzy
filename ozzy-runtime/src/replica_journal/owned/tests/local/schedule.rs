@@ -547,3 +547,71 @@ fn local_actor_holds_a_due_release_until_the_pipeline_has_room() {
     }
     super::actor::close(&mut controller, actor);
 }
+
+#[test]
+fn local_actor_charges_the_schedule_trailer_before_admission() {
+    let clock = std::rc::Rc::new(std::cell::Cell::new(NOW));
+    let (mut controller, io) = setup();
+    let mut actor = super::actor::actor_with_options(
+        &mut controller,
+        io,
+        1,
+        &[12, 30],
+        partition(),
+        PartitionId::ZERO,
+        super::actor::ActorOptions {
+            delay: Some(DelayLimits::new(64)),
+            clock: Some(clock.clone()),
+            ..Default::default()
+        },
+    );
+    let mut lane = actor.take_submitter().unwrap();
+    // Validation adds 8 bytes per record and one more field to the body.
+    let due = [NOW + 10; 40];
+    let mut held = actor.lease_proposal_buffer().unwrap();
+    held.prepare_append(request(12, 0, due.len())).unwrap();
+    held.schedule(&due).unwrap();
+    let trailer = 8 * (due.len() + 1);
+    let room = pipeline().max_body_bytes - held.body_bytes();
+    // A stored append leaves room for the scheduled body but not its
+    // trailer.
+    let stored_bytes = |records| {
+        let mut buffer = actor.lease_proposal_buffer().unwrap();
+        buffer.prepare_append(request(30, 0, records)).unwrap();
+        buffer.body_bytes()
+    };
+    let records = (1..=1000)
+        .take_while(|&n| stored_bytes(n) <= room)
+        .last()
+        .unwrap();
+    let stored_body = stored_bytes(records);
+    assert!(stored_body + trailer > room);
+    let mut buffer = actor.lease_proposal_buffer().unwrap();
+    buffer.prepare_append(request(30, 0, records)).unwrap();
+    let mut stored = Box::pin(lane.try_submit(buffer).unwrap());
+    run_holding_writes(&mut controller, &mut actor, |actor| {
+        actor.snapshot().pending_body_bytes == stored_body
+    });
+    // The scheduled batch waits for the stored write instead of failing
+    // the actor.
+    let mut held = Box::pin(lane.try_submit(held).unwrap());
+    let mut rounds = 0;
+    run_holding_writes(&mut controller, &mut actor, |_| {
+        rounds += 1;
+        rounds == 100
+    });
+    assert_eq!(actor.snapshot().pending_body_bytes, stored_body);
+    for pending in [&mut stored, &mut held] {
+        run_until(&mut controller, &mut actor, |_| {
+            let Poll::Ready(reply) = poll(pending.as_mut()) else {
+                return false;
+            };
+            assert!(matches!(
+                reply.unwrap().outcome,
+                crate::replica_actor::ProposalOutcome::Committed { .. }
+            ));
+            true
+        });
+    }
+    super::actor::close(&mut controller, actor);
+}

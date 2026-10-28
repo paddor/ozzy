@@ -55,6 +55,18 @@ impl AppendBuffer {
         self.schedule.as_deref()
     }
 
+    /// Body bytes once validation adds the trailer that `schedule` reserved.
+    /// Admission charges these.
+    pub(in crate::replica_journal) fn admitted_body_bytes(&self) -> usize {
+        let trailer = match self.schedule.as_deref() {
+            Some(scheduled) if scheduled.first_schedule.is_none() => {
+                trailer_bytes(scheduled.due_millis.len()).unwrap_or(usize::MAX)
+            }
+            _ => 0,
+        };
+        self.body_bytes().saturating_add(trailer)
+    }
+
     /// Drop the due times of a verified retry prefix along with its records.
     pub(in crate::replica_journal) fn trim_schedule(&mut self, count: usize) {
         if let Some(scheduled) = self.schedule.as_mut() {

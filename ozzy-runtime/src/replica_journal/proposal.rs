@@ -264,6 +264,12 @@ impl ProposalBuffer {
         self.0.body_bytes()
     }
 
+    /// Body bytes the pipeline charges once validation adds a scheduled
+    /// batch's trailer.
+    pub(crate) fn admitted_body_bytes(&self) -> usize {
+        self.0.admitted_body_bytes()
+    }
+
     /// Operation kinds and bodies, including after validation rejection.
     /// Native offset/timestamp fields are provisional until a committed reply;
     /// IDs, payload bytes, and multipart boundaries stay frozen. Streaming
