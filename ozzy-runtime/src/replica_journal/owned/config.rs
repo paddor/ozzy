@@ -9,14 +9,25 @@ use tokio::sync::Semaphore;
 
 pub use ozzy_core::dedup::Limits as DedupLimits;
 
-/// Leader admission bounds of a partition that holds scheduled records.
+/// Bounds of a partition that holds scheduled records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DelayLimits {
-    /// Scheduled records the partition holds before it refuses more.
+    /// Scheduled records the partition holds before the leader refuses more.
     pub max_entries: usize,
+    /// Held records of sealed segments each copy keeps loaded past the last
+    /// release.
+    pub window: usize,
 }
 
 impl DelayLimits {
+    /// Limits with `max_entries` and the default window.
+    pub const fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            window: super::held::HELD_WINDOW,
+        }
+    }
+
     /// Core snapshot bytes of a full set of held records.
     pub const fn snapshot_bytes(self) -> Option<usize> {
         self.max_entries
@@ -98,6 +109,7 @@ impl OwnedConfig {
             || !configuration
                 .voters()
                 .contains(&self.identity.replica_node_id)
+            || self.delay.is_some_and(|delay| delay.window == 0)
         {
             return Err(JournalError::Configuration);
         }

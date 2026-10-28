@@ -9,9 +9,13 @@ mod release;
 const NOW: u64 = 10_000;
 
 fn delayed(max_entries: usize) -> (Controller, OwnedJournal, Driver) {
+    delayed_with(DelayLimits::new(max_entries))
+}
+
+fn delayed_with(limits: DelayLimits) -> (Controller, OwnedJournal, Driver) {
     let (mut controller, io) = setup();
     let mut config = local_config();
-    config.delay = Some(DelayLimits { max_entries });
+    config.delay = Some(limits);
     let (mut journal, mut driver) = drive(
         &mut controller,
         OwnedJournal::format_local(config, io, JournalGeneration(1), 32768),
@@ -413,7 +417,7 @@ fn local_actor_releases_held_records_at_their_due_times() {
         partition(),
         PartitionId::ZERO,
         super::actor::ActorOptions {
-            delay: Some(DelayLimits { max_entries: 16 }),
+            delay: Some(DelayLimits::new(16)),
             clock: Some(clock.clone()),
             ..Default::default()
         },

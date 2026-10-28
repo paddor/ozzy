@@ -335,6 +335,7 @@ impl OwnedJournal {
             .ok_or(JournalError::AppendMismatch)?
             .install_prepared_group(plan)?;
         self.dedup.install(dedup)?;
+        self.admit_held(&append)?;
         self.pending
             .extend(append.prepared.iter().map(|op| op.prefix()));
         self.writeback.operations += append.prepared.len();

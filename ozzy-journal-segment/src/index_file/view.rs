@@ -78,6 +78,24 @@ impl SegmentIndexView<'_> {
         (row.array::<0, 16>() == *partition.as_bytes()).then(|| decode_schedule_entry(row).key)
     }
 
+    /// Release key of the last scheduled record of each partition, in
+    /// partition order.
+    pub fn last_schedules(&self) -> Vec<(PartitionIncarnation, ReleaseKey)> {
+        let mut rows = self.schedules.as_chunks::<SCHEDULE_INDEX_ENTRY_BYTES>().0;
+        let mut last = Vec::new();
+        while let Some(first) = rows.first() {
+            let partition = first.array::<0, 16>();
+            let (group, rest) =
+                rows.split_at(rows.partition_point(|row| row.array::<0, 16>() == partition));
+            if let Some(row) = group.last() {
+                let entry = decode_schedule_entry(row);
+                last.push((entry.partition, entry.key));
+            }
+            rows = rest;
+        }
+        last
+    }
+
     /// Locate an exact canonical operation without scanning segment payloads.
     pub fn find_operation_number(&self, number: u64) -> Option<OperationLocation> {
         let at = usize::try_from(number.checked_sub(self.source.first_op_number)?).ok()?;
@@ -154,15 +172,20 @@ impl SegmentIndexView<'_> {
 }
 
 impl<'a> SegmentIndexView<'a> {
-    /// The partition's scheduled records after release key `after`, in
-    /// release order.
+    /// The partition's scheduled records after release key `after`, or all
+    /// of them, in release order.
     pub fn schedules_after(
         self,
         partition: PartitionIncarnation,
-        after: ReleaseKey,
+        after: Option<ReleaseKey>,
     ) -> impl Iterator<Item = ScheduleIndexEntry> + 'a {
         let rows = self.schedules.as_chunks::<SCHEDULE_INDEX_ENTRY_BYTES>().0;
-        let first = rows.partition_point(|row| compare_schedule_key(row, partition, after).is_le());
+        let first = match after {
+            Some(after) => {
+                rows.partition_point(|row| compare_schedule_key(row, partition, after).is_le())
+            }
+            None => rows.partition_point(|row| row.array::<0, 16>() < *partition.as_bytes()),
+        };
         rows.get(first..)
             .unwrap_or_default()
             .iter()

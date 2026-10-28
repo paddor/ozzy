@@ -175,6 +175,7 @@ fn release_takes_the_due_prefix_at_the_next_offsets() {
     assert_eq!(held_messages(&images), [(key(5_000, 0), 1)]);
     assert_eq!(held(&images).time, 3_000);
     assert_eq!(held(&images).oldest_operation(), Some(3));
+    assert_eq!(held(&images).released(), Some(key(3_000, 1)));
     images
         .admit(5, &release(2, 6_000, key(5_000, 0), &[1]))
         .unwrap();
@@ -184,6 +185,7 @@ fn release_takes_the_due_prefix_at_the_next_offsets() {
     let delay = state.delay.as_ref().unwrap();
     assert_eq!((delay.pending_len(), delay.held_bytes()), (0, 0));
     assert_eq!(delay.oldest_operation(), None);
+    assert_eq!(delay.released(), Some(key(5_000, 0)));
     assert_eq!(delay.time, 6_000);
 }
 
@@ -506,7 +508,7 @@ fn checksum_valid_snapshots_reject_inconsistent_held_records() {
     let partition = 256;
     let names = usize::from(u16::from_be_bytes(encoded[260..262].try_into().unwrap()))
         + usize::from(u16::from_be_bytes(encoded[262..264].try_into().unwrap()));
-    let first = partition + 144 + names + 80 + 40;
+    let first = partition + 160 + names + 80 + 40;
     let second = first + 48;
     let reseal = |damaged: &mut Vec<u8>| {
         let mut hash =
@@ -516,7 +518,7 @@ fn checksum_valid_snapshots_reject_inconsistent_held_records() {
         hash.update(&damaged[88..]);
         damaged[56..88].copy_from_slice(hash.finish().as_bytes());
     };
-    let cases: [(usize, &[u8], StateSnapshotError); 6] = [
+    let cases: [(usize, &[u8], StateSnapshotError); 8] = [
         // Held sequences must be issued.
         (
             partition + 120,
@@ -531,8 +533,22 @@ fn checksum_valid_snapshots_reject_inconsistent_held_records() {
         ),
         (
             partition + 140,
-            &1_u32.to_be_bytes(),
+            &2_u32.to_be_bytes(),
             StateSnapshotError::UnsupportedFields,
+        ),
+        // A release key needs its flag.
+        (
+            partition + 152,
+            &1_u64.to_be_bytes(),
+            StateSnapshotError::InvalidPartition,
+        ),
+        // Held records sort after the last release.
+        (
+            partition + 140,
+            &[
+                0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0x0b, 0xb8, 0, 0, 0, 0, 0, 0, 0, 1,
+            ],
+            StateSnapshotError::InvalidPartition,
         ),
         // A held record names an operation.
         (

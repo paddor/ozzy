@@ -237,6 +237,10 @@ impl ActiveSegmentIndex {
         self.image.offsets()
     }
 
+    pub(crate) fn schedules(&self) -> &[crate::ScheduleIndexEntry] {
+        self.image.schedules()
+    }
+
     pub(crate) fn find_offset(
         &self,
         partition: PartitionIncarnation,

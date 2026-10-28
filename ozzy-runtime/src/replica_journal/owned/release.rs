@@ -1,6 +1,8 @@
 //! Due scheduled records leave their partition in a broker-built `Release`.
-//! The owner picks the due prefix; a detached job reads the `Schedule`
-//! operations holding it, beside writes, and builds the proposal.
+//! The owner picks the due prefix from its held index; a detached job reads
+//! the `Schedule` operations holding it, beside writes, and builds the
+//! proposal. When no held record is loaded but sealed ones are, the job
+//! loads the next ones instead.
 
 use super::{JournalError, OwnedJournal};
 use crate::replica_journal::ProposalBuffer;
@@ -26,6 +28,8 @@ const MAX_SOURCES: usize = 64;
 pub struct ReleaseTurn {
     /// `Release` of due records, awaiting ordinary confirmation.
     pub proposal: Option<ProposalBuffer>,
+    /// The step loaded held records instead; the next one may start now.
+    pub loaded: bool,
 }
 
 /// A release step's result once the owner picked its records.
@@ -33,14 +37,26 @@ pub struct ReleaseTurn {
 pub(in crate::replica_journal) enum ReleaseStep {
     /// Nothing to release now.
     Idle,
-    /// Read the held records beside writes.
-    Read(Box<ReleaseRead>),
+    /// Read the held records, or load more, beside writes.
+    Read(ReleaseRead),
+}
+
+/// A release step's detached work.
+#[derive(Debug)]
+pub(in crate::replica_journal) struct ReleaseRead {
+    key: Rc<()>,
+    work: Work,
+}
+
+#[derive(Debug)]
+enum Work {
+    Records(Box<Records>),
+    Load(Box<super::held::Refill>),
 }
 
 /// Due held records and where their `Schedule` operations are.
 #[derive(Debug)]
-pub(in crate::replica_journal) struct ReleaseRead {
-    key: Rc<()>,
+struct Records {
     partition: PartitionIncarnation,
     owner_epoch: OwnerEpoch,
     entries: Vec<(ReleaseKey, PendingSchedule)>,
@@ -56,23 +72,21 @@ pub(in crate::replica_journal) struct ReleaseRead {
 #[derive(Debug)]
 pub(in crate::replica_journal) struct CompletedRelease {
     key: Rc<()>,
-    result: Result<Option<ProposalBuffer>, JournalError>,
+    result: Result<Built, JournalError>,
+}
+
+#[derive(Debug)]
+enum Built {
+    Release(Option<Box<ProposalBuffer>>),
+    Load(super::held::Load),
 }
 
 impl OwnedJournal {
     /// Release key millis of the earliest held record whose `Schedule` is
     /// committed. Later records wait for it, since a release is a prefix.
     pub(in crate::replica_journal) fn next_release(&self) -> Option<u64> {
-        let images = self.images().ok()?;
-        let committed = images.committed().revision();
-        images
-            .speculative()
-            .partitions()
-            .filter_map(|(_, state)| {
-                let (key, pending) = state.delay.as_ref()?.pending().next()?;
-                (pending.operation <= committed).then_some(key.millis)
-            })
-            .min()
+        let committed = self.images().ok()?.committed().revision();
+        self.held.as_ref()?.next(committed)
     }
 
     /// Run one release step on the owner, with its reads inline.
@@ -106,6 +120,10 @@ impl OwnedJournal {
         {
             return Ok(ReleaseStep::Idle);
         }
+        self.observe_held()?;
+        if let Some(load) = self.prepare_load().await? {
+            return Ok(load);
+        }
         let buffer = match self.lease_proposal_buffer() {
             Ok(buffer) => buffer,
             Err(crate::replica_journal::SubmitError::Full) => {
@@ -126,6 +144,30 @@ impl OwnedJournal {
         else {
             return Ok(ReleaseStep::Idle);
         };
+        let (hot, cold) = self.sources(&entries);
+        let stored = if cold.is_empty() {
+            None
+        } else {
+            Some(self.journal.retry_snapshot(self.recovery.index).await?)
+        };
+        Ok(ReleaseStep::Read(ReleaseRead {
+            key: self.read_key.clone(),
+            work: Work::Records(Box::new(Records {
+                partition,
+                owner_epoch,
+                entries,
+                hot,
+                cold,
+                stored,
+                buffer,
+                limits,
+            })),
+        }))
+    }
+
+    /// Bodies of the entries' `Schedule` operations still in writeback, and
+    /// the numbers of those to read from storage.
+    fn sources(&self, entries: &[(ReleaseKey, PendingSchedule)]) -> (Vec<(u64, Bytes)>, Vec<u64>) {
         let mut hot = Vec::new();
         let mut cold = Vec::new();
         let mut sources = entries
@@ -140,26 +182,32 @@ impl OwnedJournal {
                 None => cold.push(number),
             }
         }
-        let stored = if cold.is_empty() {
-            None
-        } else {
-            Some(self.journal.retry_snapshot(self.recovery.index).await?)
-        };
-        Ok(ReleaseStep::Read(Box::new(ReleaseRead {
+        (hot, cold)
+    }
+
+    /// Load the next sealed held records when none is loaded.
+    async fn prepare_load(&mut self) -> Result<Option<ReleaseStep>, JournalError> {
+        if !self
+            .held
+            .as_ref()
+            .is_some_and(super::held::Held::needs_refill)
+        {
+            return Ok(None);
+        }
+        let snapshot = self.journal.retry_snapshot(self.recovery.index).await?;
+        let refill = self
+            .held
+            .as_ref()
+            .ok_or(JournalError::AppendMismatch)?
+            .refill(snapshot);
+        Ok(Some(ReleaseStep::Read(ReleaseRead {
             key: self.read_key.clone(),
-            partition,
-            owner_epoch,
-            entries,
-            hot,
-            cold,
-            stored,
-            buffer,
-            limits,
+            work: Work::Load(Box::new(refill)),
         })))
     }
 
-    /// The due prefix of the partition with the earliest committed held
-    /// record, bounded by count, record bytes, and source operations.
+    /// The due prefix of committed held records, bounded by count, record
+    /// bytes, and source operations.
     #[expect(
         clippy::type_complexity,
         reason = "one private result tuple read by the caller only"
@@ -179,23 +227,21 @@ impl OwnedJournal {
     > {
         let images = self.images()?;
         let committed = images.committed().revision();
-        let Some((partition, state, delay)) = images
-            .speculative()
-            .partitions()
-            .filter_map(|(partition, state)| Some((partition, state, state.delay.as_ref()?)))
-            .filter(|(_, _, delay)| {
-                delay.pending().next().is_some_and(|(key, pending)| {
-                    key.millis <= now_millis && pending.operation <= committed
-                })
-            })
-            .min_by_key(|(_, _, delay)| delay.next_release())
-        else {
+        let Some(held) = &self.held else {
             return Ok(None);
         };
+        let partition = held.partition();
+        let state = images
+            .speculative()
+            .partition(partition)
+            .ok_or(JournalError::AppendMismatch)?;
         let mut entries = Vec::new();
         let mut sources = Vec::<u64>::new();
         let mut bytes = 0_usize;
-        for (key, pending) in delay.due(now_millis) {
+        let due = held
+            .prefix()
+            .take_while(|(key, _)| key.millis <= now_millis);
+        for (key, pending) in due {
             let total = bytes.saturating_add(pending.bytes as usize);
             let fresh = !sources.contains(&pending.operation);
             if pending.operation > committed
@@ -211,6 +257,17 @@ impl OwnedJournal {
             bytes = total;
             entries.push((key, *pending));
         }
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        debug_assert!(
+            state.delay.as_ref().is_some_and(|delay| delay
+                .due(now_millis)
+                .map(|(key, row)| (key, *row))
+                .take(entries.len())
+                .eq(entries.iter().copied())),
+            "held index picked other records than canonical state"
+        );
         Ok(Some((partition, state.owner_epoch, entries)))
     }
 
@@ -226,21 +283,42 @@ impl OwnedJournal {
             .as_ref()
             .err()
             .is_some_and(crate::replica_journal::commands::read_fault);
-        Ok(ReleaseTurn {
-            proposal: completed.result?,
-        })
+        match completed.result? {
+            Built::Release(proposal) => Ok(ReleaseTurn {
+                proposal: proposal.map(|proposal| *proposal),
+                loaded: false,
+            }),
+            Built::Load(load) => {
+                if let Some(held) = self.held.as_mut() {
+                    held.load(load);
+                }
+                self.check_held()?;
+                Ok(ReleaseTurn {
+                    proposal: None,
+                    loaded: true,
+                })
+            }
+        }
     }
 }
 
 impl ReleaseRead {
     pub(in crate::replica_journal) async fn execute(self) -> CompletedRelease {
-        let key = self.key.clone();
+        let result = match self.work {
+            Work::Records(records) => records
+                .build()
+                .await
+                .map(|proposal| Built::Release(proposal.map(Box::new))),
+            Work::Load(refill) => refill.read().await.map(Built::Load),
+        };
         CompletedRelease {
-            key,
-            result: self.build().await,
+            key: self.key,
+            result,
         }
     }
+}
 
+impl Records {
     /// Copy the held records in release order into one `Release` with no
     /// position yet. Validation places it at the partition's next offset.
     async fn build(self) -> Result<Option<ProposalBuffer>, JournalError> {
@@ -253,7 +331,6 @@ impl ReleaseRead {
             stored,
             mut buffer,
             limits,
-            ..
         } = self;
         if let Some(stored) = &stored {
             for number in cold {

@@ -15,6 +15,8 @@ use crate::{
 };
 use ozzy_core::state::{IdentityClaim, IdentityKey};
 use ozzy_io::{OpenMode, Operation};
+use ozzy_journal::operation::ReleaseKey;
+use ozzy_proto::PartitionIncarnation;
 
 #[derive(Debug, Clone)]
 /// Exact captured journal index and deletion protection for bounded reads.
@@ -203,6 +205,39 @@ impl Snapshot {
             .map_err(crate::DirectoryError::from)?
             .into();
         Ok(retained)
+    }
+
+    /// Release key of the partition's last scheduled record in each sealed
+    /// segment holding one, oldest first.
+    pub fn sealed_schedules(
+        &self,
+        partition: PartitionIncarnation,
+    ) -> impl Iterator<Item = (crate::IndexSource, ReleaseKey)> + '_ {
+        self.sealed.last_schedules(partition)
+    }
+
+    /// The partition's first `limit` scheduled records in sealed segments
+    /// after `after`, or from its first one, in release order.
+    pub async fn sealed_schedules_after(
+        &self,
+        partition: PartitionIncarnation,
+        after: Option<ReleaseKey>,
+        limit: usize,
+    ) -> Result<Vec<crate::ScheduleIndexEntry>, Error> {
+        Ok(self.sealed.schedules_after(partition, after, limit).await?)
+    }
+
+    /// The partition's scheduled records in the captured active prefix, in
+    /// release order.
+    pub fn active_schedules(
+        &self,
+        partition: PartitionIncarnation,
+    ) -> impl Iterator<Item = crate::ScheduleIndexEntry> + '_ {
+        self.active
+            .iter()
+            .flat_map(|active| active.schedules())
+            .filter(move |entry| entry.partition == partition)
+            .copied()
     }
 
     /// Look up an exact canonical control-operation identity.

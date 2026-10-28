@@ -18,7 +18,7 @@ use crate::state::{
     PendingSchedule, ProducerResultSource, ProducerResultSpan,
 };
 
-const PARTITION_BYTES: usize = 144;
+const PARTITION_BYTES: usize = 160;
 const PRODUCER_BYTES: usize = 80;
 const SPAN_BYTES: usize = super::RETRY_SPAN_SNAPSHOT_BYTES;
 const PENDING_BYTES: usize = super::PENDING_SCHEDULE_SNAPSHOT_BYTES;
@@ -129,6 +129,11 @@ fn encode_delay(
     fixed.put_u64::<120>(delay.next_schedule);
     fixed.put_u64::<128>(delay.time);
     fixed.put_u32::<136>(usize_to_u32(delay.pending_len())?);
+    if let Some(released) = delay.released() {
+        fixed.put_u32::<140>(1);
+        fixed.put_u64::<144>(released.millis);
+        fixed.put_u64::<152>(released.schedule);
+    }
     Ok(())
 }
 
@@ -196,7 +201,7 @@ pub(super) async fn decode_partition(
     let remaining_producers = state.limits.max_producers - state.producer_count;
     let remaining_spans = state.limits.max_retry_spans - state.retry_span_count;
     let fixed: &[u8; PARTITION_BYTES] = layout::record(entries.rest(), 0)?;
-    if fixed.u32_at::<68>() != 0 || fixed.u32_at::<140>() != 0 {
+    if fixed.u32_at::<68>() != 0 || fixed.u32_at::<140>() > 1 {
         return Err(StateSnapshotError::UnsupportedFields);
     }
     let entry_bytes = fixed.u32_at::<0>() as usize;
@@ -263,13 +268,21 @@ fn decode_fields(
     pending: BTreeMap<ReleaseKey, PendingSchedule>,
 ) -> Result<CanonicalPartition, StateSnapshotError> {
     let delay = match std::num::NonZeroU64::new(fixed.u64_at::<112>()) {
-        None if fixed.array::<120, 20>() == [0; 20] => None,
+        None if fixed.array::<120, 40>() == [0; 40] => None,
         None => return Err(StateSnapshotError::InvalidPartition),
         Some(max_delay_millis) => {
             let mut delay = DelayState::new(max_delay_millis);
             delay.next_schedule = fixed.u64_at::<120>();
             delay.time = fixed.u64_at::<128>();
-            delay.restore(pending);
+            let released = match fixed.u32_at::<140>() {
+                0 if fixed.array::<144, 16>() == [0; 16] => None,
+                0 => return Err(StateSnapshotError::InvalidPartition),
+                _ => Some(ReleaseKey {
+                    millis: fixed.u64_at::<144>(),
+                    schedule: fixed.u64_at::<152>(),
+                }),
+            };
+            delay.restore(released, pending);
             Some(delay)
         }
     };
@@ -429,19 +442,25 @@ async fn validate_partition_cooperative(
 }
 
 /// Held records name earlier `Schedule` operations and distinct issued
-/// schedule sequences. Delay excludes deduplication.
+/// schedule sequences, all after the last release. Delay excludes
+/// deduplication.
 async fn validate_delay(
     partition: &CanonicalPartition,
     delay: &DelayState,
     revision: u64,
     step: &mut impl AsyncFnMut(usize),
 ) -> Result<(), StateSnapshotError> {
-    if partition.dedup_window_millis.is_some() {
+    if partition.dedup_window_millis.is_some()
+        || delay.released().is_some_and(|released| {
+            released.schedule >= delay.next_schedule || released.millis > delay.time
+        })
+    {
         return Err(StateSnapshotError::InvalidPartition);
     }
     let mut schedules = Vec::with_capacity(delay.pending_len());
     for (key, pending) in delay.pending() {
         if key.schedule >= delay.next_schedule
+            || delay.released().is_some_and(|released| key <= released)
             || pending.operation == 0
             || pending.operation > revision
         {

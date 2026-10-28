@@ -199,18 +199,24 @@ part. General descriptors use:
   partition's latest one, so a new key sorts after every released key.
 - Partition state holds each held record's key, `Schedule` operation, record
   index, encoded byte count (descriptor, part lengths, payload), and message
-  ID. Payloads stay in the `Schedule`
-  operation until release.
+  ID, plus the last released key. Payloads stay in the `Schedule` operation
+  until release.
+- Each copy also keeps a held index beside that state. Rows of the active
+  segment and later operations stay in memory. Of sealed segments, only the
+  next rows after the last release are loaded from their index files, 65536
+  by default. A row's place is certain once every row before it is loaded,
+  and the primary releases only certain rows.
 - A `Release` copies exactly the held records through its key, in key order.
   Message IDs and encoded byte counts must match, its timestamp must reach the last
   key's time, and its batch takes the next offsets. A repeated release finds
   its records gone and fails.
 - A scheduled attempt's retry result names its `Schedule` operation and maps
   the sequence to its schedule sequence.
-- Retention keeps the oldest `Schedule` operation that still holds a record,
-  and every later segment. A `Schedule` acceptance time counts toward its
-  segment's age, so retries of a released schedule resolve for the retention
-  age.
+- Retention planning keeps the oldest segment whose last scheduled-record
+  key is past the last committed release, and every later segment.
+  Retirement also checks the oldest `Schedule` operation that still holds a
+  record. A `Schedule` acceptance time counts toward its segment's age, so
+  retries of a released schedule resolve for the retention age.
 - Readers and indexes treat a `Release` batch like an APPEND batch.
   `Schedule` records have no offsets; indexes list them by release key only.
 - Scheduled payloads are raw, so a release can copy any prefix of held
@@ -406,7 +412,7 @@ payload-free duplicate results, and 64-byte scheduled records.
 Canonical checkpoint images start with a 104-byte `OZYCIMG\0` header: version
 `u16` (1), six zero bytes, core snapshot length `u64`, partition incarnation
 (16 bytes), and the 64-byte dedup index header. The last 80 bytes are zero
-without an identity section. The core snapshot (`OZYSTA01`, version 4,
+without an identity section. The core snapshot (`OZYSTA01`, version 5,
 256-byte header) follows, then identity rows. Bare snapshots and other versions
 are rejected. Coordinator group images are each a `u32` length plus the
 `GroupPlan` body.
@@ -418,7 +424,8 @@ ID, offset, and logical acceptance time. The enclosing checkpoint supplies
 integrity and partition authority.
 
 - Checkpoints hold state, producer coordinates, retry floors, live confirmed
-  identities, held scheduled records (48 bytes each), and the original
+  identities, held scheduled records (48 bytes each), the last released key,
+  and the original
   committed operation and digest. Never payloads.
 - Failed or canceled builds never select themselves. Installation checks the
   captured position and source lineage.

@@ -387,7 +387,7 @@ fn core_checkpoint_bytes(placement: &PartitionPlacement) -> Result<usize, &'stat
         .map_or(Some(0), |_| {
             usize::try_from(ozzy_config::MAX_DELAY_ENTRIES)
                 .ok()
-                .and_then(|max_entries| DelayLimits { max_entries }.snapshot_bytes())
+                .and_then(|max_entries| DelayLimits::new(max_entries).snapshot_bytes())
         })
         .and_then(|held| held.checked_add(spans?))
         .and_then(|held| held.checked_add(CORE_CHECKPOINT_BYTES))
@@ -395,9 +395,9 @@ fn core_checkpoint_bytes(placement: &PartitionPlacement) -> Result<usize, &'stat
 }
 
 fn delay_limits(placement: &PartitionPlacement) -> Option<DelayLimits> {
-    placement.delay.map(|delay| DelayLimits {
-        max_entries: usize::try_from(delay.max_entries).unwrap_or(usize::MAX),
-    })
+    placement
+        .delay
+        .map(|delay| DelayLimits::new(usize::try_from(delay.max_entries).unwrap_or(usize::MAX)))
 }
 
 fn checkpoint_limits(

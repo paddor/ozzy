@@ -104,6 +104,7 @@ impl OwnedJournal {
         let mode = Mode::Local(config.configuration);
         let mut owner = Self::from_open(&config, mode, journal, Some(images), Some(reader))?;
         owner.restore_dedup().await?;
+        owner.restore_held().await?;
         Ok((owner, driver))
     }
 }

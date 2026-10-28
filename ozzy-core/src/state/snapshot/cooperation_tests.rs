@@ -112,22 +112,22 @@ fn canonical_snapshot_encoding_bytes_fixture() {
             130,
             0,
             0,
-            10813,
-            0x775d_12e0_31ba_66af_b54e_9efc_966f_e013_u128,
+            10829,
+            0xad6f_dfe8_1634_090d_2926_42b6_9640_4128_u128,
         ),
         (
             2,
             130,
             130,
-            27613,
-            0xfa37_d8fb_a2f3_2846_023d_a722_9a83_1528_u128,
+            27629,
+            0x5c7d_6c2b_104b_9eb6_424e_7bf8_d1c9_a840_u128,
         ),
         (
             2,
             6000,
             130,
-            497_213,
-            0xe3aa_6085_1976_fc04_86e4_9e2d_a7cf_a5b3_u128,
+            497_229,
+            0xa578_e72a_234f_0751_0eeb_0785_1d73_3ad2_u128,
         ),
     ] {
         let state = state(writers, spans, metadata);
@@ -302,9 +302,9 @@ fn cooperative_state_snapshot_refuses_late_semantic_errors_and_resource_limits()
         .encode_snapshot(StateSnapshotLimits::default())
         .unwrap();
     let partition = STATE_SNAPSHOT_HEADER_BYTES;
-    let fixed: &[u8; 144] = layout::record(&original, partition).unwrap();
+    let fixed: &[u8; 160] = layout::record(&original, partition).unwrap();
     let names = usize::from(fixed.u16_at::<4>()) + usize::from(fixed.u16_at::<6>());
-    let first = partition + 144 + names;
+    let first = partition + 160 + names;
     let second = first + 80 + 130 * 40;
     let progress = partition + fixed.u32_at::<0>() as usize;
     let assignments = progress + 130 * PROGRESS_BYTES;

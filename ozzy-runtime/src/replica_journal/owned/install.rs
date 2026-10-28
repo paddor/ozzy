@@ -273,6 +273,7 @@ impl OwnedJournal {
         self.applied = ticket.through();
         self.pending.clear();
         self.restore_dedup().await?;
+        self.restore_held().await?;
         self.faulted = false;
         Ok(ticket)
     }

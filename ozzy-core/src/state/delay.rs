@@ -34,6 +34,8 @@ pub struct DelayState {
     pub next_schedule: u64,
     /// Latest schedule or release timestamp; later ones never go below it.
     pub time: u64,
+    /// Release key of the last released record. Every held key is above it.
+    released: Option<ReleaseKey>,
     pending: BTreeMap<ReleaseKey, PendingSchedule>,
     /// Held records per `Schedule` operation, for the retention floor.
     operations: BTreeMap<u64, usize>,
@@ -48,6 +50,7 @@ impl DelayState {
             max_delay_millis,
             next_schedule: 0,
             time: 0,
+            released: None,
             pending: BTreeMap::new(),
             operations: BTreeMap::new(),
             bytes: 0,
@@ -67,6 +70,11 @@ impl DelayState {
     /// Encoded bytes of every held record.
     pub const fn held_bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// Release key of the last released record.
+    pub const fn released(&self) -> Option<ReleaseKey> {
+        self.released
     }
 
     /// Release key of the next record to release.
@@ -92,7 +100,12 @@ impl DelayState {
     }
 
     /// Rebuild from validated snapshot entries in release order.
-    pub(super) fn restore(&mut self, pending: BTreeMap<ReleaseKey, PendingSchedule>) {
+    pub(super) fn restore(
+        &mut self,
+        released: Option<ReleaseKey>,
+        pending: BTreeMap<ReleaseKey, PendingSchedule>,
+    ) {
+        self.released = released;
         let mut operations = BTreeMap::<u64, usize>::new();
         for value in pending.values() {
             *operations.entry(value.operation).or_default() += 1;
@@ -112,6 +125,7 @@ impl DelayState {
     }
 
     fn release_through(&mut self, through: ReleaseKey) {
+        self.released = Some(through);
         while let Some(entry) = self.pending.first_entry() {
             if *entry.key() > through {
                 break;

@@ -5,7 +5,7 @@ use crate::{
     segment_index_name,
 };
 use ozzy_journal::operation::{
-    Append, AppendBatch, AppendRecord, OperationBody, ReleaseKey, Schedule, encode_operation_body,
+    Append, AppendBatch, AppendRecord, OperationBody, Schedule, encode_operation_body,
 };
 use ozzy_proto::{
     MessageId, Offset, OperationId, OwnerEpoch, PartitionIncarnation, ProducerEpoch, ProducerId,
@@ -258,13 +258,7 @@ async fn async_multi_pass_index_sorts_scheduled_records_by_release_key() {
     let index = journal.build_sealed_index(1, build_limits()).await.unwrap();
     let rows: Vec<_> = index
         .view()
-        .schedules_after(
-            partition(),
-            ReleaseKey {
-                millis: 0,
-                schedule: 0,
-            },
-        )
+        .schedules_after(partition(), None)
         .map(|row| {
             (
                 row.key.millis,
@@ -291,13 +285,7 @@ async fn async_multi_pass_index_sorts_scheduled_records_by_release_key() {
     assert!(
         index
             .view()
-            .schedules_after(
-                partition(),
-                ReleaseKey {
-                    millis: 0,
-                    schedule: 0
-                }
-            )
+            .schedules_after(partition(), None)
             .all(|row| row.record.bytes as usize == bytes)
     );
     assert_eq!(index.offset_count(), 0);

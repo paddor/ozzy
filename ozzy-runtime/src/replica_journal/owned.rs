@@ -7,6 +7,7 @@ pub(in crate::replica_journal) mod dedup;
 mod facts;
 pub use facts::{GroupSource, PartitionFacts};
 mod groups;
+mod held;
 mod local;
 mod mode;
 use mode::Mode;
@@ -88,6 +89,7 @@ pub struct OwnedJournal {
     spare: spare::Spare,
     dedup: dedup::State,
     delay: Option<DelayLimits>,
+    held: Option<held::Held>,
     selected: Option<CanonicalRecoveryCandidate>,
     history: Option<JournalHistory>,
     replay: replay::Replay,
@@ -256,6 +258,7 @@ impl OwnedJournal {
         owner.committed_base = committed_base;
         if fresh {
             owner.restore_dedup().await?;
+            owner.restore_held().await?;
         }
         Ok((owner, startup))
     }
@@ -285,6 +288,7 @@ impl OwnedJournal {
             indexing: indexing::Indexing::default(),
             dedup: dedup::State::new(config.deduplication),
             delay: config.delay,
+            held: None,
             selected: None,
             history: None,
             replay: replay::Replay::default(),
@@ -408,6 +412,7 @@ impl OwnedJournal {
             }
             self.images = None;
             self.dedup.clear();
+            self.held = None;
             self.reader = None;
             self.replay.clear();
             self.storage_validation.clear();
@@ -457,6 +462,7 @@ impl OwnedJournal {
             self.storage_validation.clear();
             self.donors = std::array::from_fn(|_| None);
             self.images = None;
+            self.held = None;
             self.committed_base = None;
             self.selected = None;
             self.journal.take_ready()?.close().await?;

@@ -162,7 +162,7 @@ fn immutable_index_round_trips_and_binary_searches_without_entry_allocation() {
 
     assert_eq!(view.schedule_count(), 4);
     let after = |byte, millis, schedule| {
-        view.schedules_after(partition(byte), ReleaseKey { millis, schedule })
+        view.schedules_after(partition(byte), Some(ReleaseKey { millis, schedule }))
             .map(|entry| (entry.key.millis, entry.key.schedule))
             .collect::<Vec<_>>()
     };
@@ -174,10 +174,10 @@ fn immutable_index_round_trips_and_binary_searches_without_entry_allocation() {
     assert_eq!(
         view.schedules_after(
             partition(0x20),
-            ReleaseKey {
+            Some(ReleaseKey {
                 millis: 0,
                 schedule: 0
-            }
+            })
         )
         .next(),
         Some(image.schedules()[0])
@@ -191,6 +191,31 @@ fn immutable_index_round_trips_and_binary_searches_without_entry_allocation() {
     );
     assert_eq!(view.last_schedule(partition(0x1f)), None);
     assert_eq!(view.last_schedule(partition(0x22)), None);
+    assert_eq!(
+        view.last_schedules(),
+        [
+            (
+                partition(0x20),
+                ReleaseKey {
+                    millis: 950,
+                    schedule: 0
+                }
+            ),
+            (
+                partition(0x21),
+                ReleaseKey {
+                    millis: 900,
+                    schedule: 0
+                }
+            )
+        ]
+    );
+    assert_eq!(
+        view.schedules_after(partition(0x21), None)
+            .map(|entry| entry.key.millis)
+            .collect::<Vec<_>>(),
+        [900]
+    );
 }
 
 #[test]
