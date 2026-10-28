@@ -28,6 +28,16 @@ pub struct PendingSchedule {
     pub message_id: MessageId,
 }
 
+impl PendingSchedule {
+    /// Where the record lies in the journal.
+    pub const fn position(&self) -> HeldPosition {
+        HeldPosition {
+            operation: self.operation,
+            index: self.index,
+        }
+    }
+}
+
 /// Held records of one delay-enabled partition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DelayState {
@@ -333,10 +343,14 @@ impl CanonicalState {
         }
         // Carried records are held ones from the floor on, before this
         // operation, with issued schedule sequences after the last release.
+        let end = HeldPosition {
+            operation: op_number,
+            index: 0,
+        };
         if value.keys.len() != batch.records.len()
             || value.from != delay.carried
             || value.through <= value.from
-            || value.through.operation >= op_number
+            || value.through > end
             || records > delay.records
             || bytes > delay.bytes
             || value.keys.iter().any(|key| {

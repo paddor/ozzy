@@ -1,15 +1,16 @@
 //! Held scheduled records each copy keeps beside canonical state, which
-//! holds only the last released key and held totals. Rows of sealed segments
-//! stay in their index files; only the next ones after the last release are
-//! loaded. Rows of later operations stay in memory. Each copy checks a
-//! `Release` against these rows before canonical validation.
+//! holds only the last released key, the carry floor, and held totals. Rows
+//! of sealed segments stay in their index files; only the next ones after
+//! the last release are loaded. Rows of later operations stay in memory.
+//! Rows before the carry floor were released or carried, so loads skip
+//! them. Each copy checks a `Release` or `Carry` against these rows before
+//! canonical validation.
 
 use std::collections::BTreeMap;
-use std::iter::Peekable;
 
 use ozzy_core::state::PendingSchedule;
 use ozzy_journal::operation::{
-    CanonicalOperation, OperationBody, OperationKind, OperationLimits, ReleaseKey,
+    CanonicalOperation, HeldPosition, OperationBody, OperationKind, OperationLimits, ReleaseKey,
     decode_operation_body,
 };
 use ozzy_journal_segment::{JournalIndexSnapshot, SegmentReference};
@@ -17,8 +18,10 @@ use ozzy_proto::PartitionIncarnation;
 
 use super::JournalError;
 
+mod carry;
 mod check;
-use check::{Checked, check};
+mod merge;
+use merge::{merge, rows};
 
 /// Sealed rows a copy loads past the last release by default. Rows are
 /// fixed size, so the count also bounds their memory.
@@ -46,6 +49,8 @@ pub(super) struct Held {
     window: usize,
     /// Release key of the last released record.
     released: Option<ReleaseKey>,
+    /// Every held record before this position was released or carried.
+    carried: HeldPosition,
     /// First operation of the active segment. Index files hold the rows of
     /// earlier operations.
     active: u64,
@@ -74,6 +79,7 @@ pub(super) struct Refill {
 pub(super) struct Load {
     partition: PartitionIncarnation,
     after: Option<ReleaseKey>,
+    from: HeldPosition,
     active: u64,
     window: usize,
     rows: Vec<ozzy_journal_segment::ScheduleIndexEntry>,
@@ -90,6 +96,7 @@ impl Held {
             partition,
             window,
             released: None,
+            carried: HeldPosition::default(),
             active: active_first(references),
             recent: Rows::new(),
             recent_operations: BTreeMap::new(),
@@ -103,13 +110,15 @@ impl Held {
     pub(super) async fn restore(
         partition: PartitionIncarnation,
         window: usize,
-        released: Option<ReleaseKey>,
+        (released, carried): (Option<ReleaseKey>, HeldPosition),
         snapshot: &JournalIndexSnapshot,
     ) -> Result<Self, JournalError> {
         let mut held = Self::new(partition, window, snapshot.segment_references());
         held.released = released;
+        held.carried = carried;
         held.segments = snapshot
             .sealed_schedules(partition)
+            .filter(|(source, _)| source.last_op_number >= carried.operation)
             .map(|(source, key)| Sealed {
                 first: source.first_op_number,
                 last: source.last_op_number,
@@ -117,15 +126,18 @@ impl Held {
             })
             .collect();
         for row in snapshot.active_schedules(partition) {
-            held.schedule(row.key, row.record);
+            if row.record.position() >= carried {
+                held.schedule(row.key, row.record);
+            }
         }
         let load = Load {
             partition,
             after: released,
+            from: carried,
             active: held.active,
             window,
             rows: snapshot
-                .sealed_schedules_after(partition, released, window)
+                .sealed_schedules_after(partition, released, carried, window)
                 .await?,
         };
         held.loaded = released;
@@ -137,7 +149,8 @@ impl Held {
         self.partition
     }
 
-    /// Install the `Schedule` and `Release` operations of one admitted group.
+    /// Install the `Schedule`, `Release`, and `Carry` operations of one
+    /// admitted group.
     pub(super) fn admit<'a>(
         &mut self,
         operations: impl Iterator<Item = CanonicalOperation<'a>>,
@@ -168,6 +181,17 @@ impl Held {
                         return Err(JournalError::AppendMismatch);
                     };
                     self.release_through(release.through);
+                }
+                OperationKind::Carry => {
+                    let OperationBody::Carry(carry) =
+                        decode_operation_body(operation.kind, operation.body, limits)?
+                    else {
+                        return Err(JournalError::AppendMismatch);
+                    };
+                    if carry.batch.partition != self.partition {
+                        return Err(JournalError::AppendMismatch);
+                    }
+                    self.carry(operation.op_number, &carry)?;
                 }
                 _ => {}
             }
@@ -300,6 +324,7 @@ impl Held {
             load: Load {
                 partition: self.partition,
                 after: self.loaded,
+                from: self.carried,
                 active: self.active,
                 window: self.window,
                 rows: Vec::new(),
@@ -327,11 +352,15 @@ impl Held {
         }
         let full = load.rows.len() == load.window;
         let last = load.rows.last().map(|row| row.key);
-        let released = self.released;
+        let (released, carried) = (self.released, self.carried);
+        // Rows read before a release or carry applied may be gone now.
         self.sealed.extend(
             load.rows
                 .into_iter()
-                .filter(|row| released.is_none_or(|released| row.key > released))
+                .filter(|row| {
+                    released.is_none_or(|released| row.key > released)
+                        && row.record.position() >= carried
+                })
                 .map(|row| (row.key, row.record)),
         );
         self.loaded = if full {
@@ -343,17 +372,24 @@ impl Held {
     }
 
     /// First operation retention keeps for held records, given the last
-    /// committed release.
-    pub(super) fn held_operation(&self, released: Option<ReleaseKey>) -> Option<u64> {
-        let held = |key: &ReleaseKey| released.is_none_or(|released| *key > released);
+    /// committed release and carry floor. A segment wholly before the floor
+    /// holds none; one it splits stays from the floor on.
+    pub(super) fn held_operation(
+        &self,
+        released: Option<ReleaseKey>,
+        carried: HeldPosition,
+    ) -> Option<u64> {
+        let held = |last: u64, key: &ReleaseKey| {
+            last >= carried.operation && released.is_none_or(|released| *key > released)
+        };
         self.segments
             .iter()
-            .find(|segment| held(&segment.key))
-            .map(|segment| segment.first)
+            .find(|segment| held(segment.last, &segment.key))
+            .map(|segment| segment.first.max(carried.operation))
             .or_else(|| {
                 self.recent_operations
                     .iter()
-                    .find(|(_, key)| held(key))
+                    .find(|(operation, key)| held(**operation, key))
                     .map(|(operation, _)| *operation)
             })
     }
@@ -373,6 +409,7 @@ impl Held {
                 (records + 1, bytes + u64::from(row.bytes))
             });
         self.released == delay.released()
+            && self.carried == delay.carried()
             && (self.loaded.is_some()
                 || (records, bytes) == (delay.held_records(), delay.held_bytes()))
     }
@@ -383,7 +420,7 @@ impl Refill {
         let load = &mut self.load;
         load.rows = self
             .snapshot
-            .sealed_schedules_after(load.partition, load.after, load.window)
+            .sealed_schedules_after(load.partition, load.after, load.from, load.window)
             .await?;
         Ok(self.load)
     }
@@ -393,47 +430,6 @@ fn active_first(references: &[SegmentReference]) -> u64 {
     references
         .last()
         .map_or(1, |active| active.first_chain.next_op_number())
-}
-
-fn rows(rows: &Rows) -> impl Iterator<Item = (ReleaseKey, &PendingSchedule)> {
-    rows.iter().map(|(key, row)| (*key, row))
-}
-
-fn merge<'a, L, R>(left: L, right: R) -> Merge<L, R>
-where
-    L: Iterator<Item = (ReleaseKey, &'a PendingSchedule)>,
-    R: Iterator<Item = (ReleaseKey, &'a PendingSchedule)>,
-{
-    Merge {
-        left: left.peekable(),
-        right: right.peekable(),
-    }
-}
-
-/// Two row streams with distinct keys, in key order.
-struct Merge<L: Iterator, R: Iterator> {
-    left: Peekable<L>,
-    right: Peekable<R>,
-}
-
-impl<'a, L, R> Iterator for Merge<L, R>
-where
-    L: Iterator<Item = (ReleaseKey, &'a PendingSchedule)>,
-    R: Iterator<Item = (ReleaseKey, &'a PendingSchedule)>,
-{
-    type Item = (ReleaseKey, &'a PendingSchedule);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let take_left = match (self.left.peek(), self.right.peek()) {
-            (Some((left, _)), Some((right, _))) => left < right,
-            (left, _) => left.is_some(),
-        };
-        if take_left {
-            self.left.next()
-        } else {
-            self.right.next()
-        }
-    }
 }
 
 impl super::OwnedJournal {
@@ -454,13 +450,16 @@ impl super::OwnedJournal {
     pub(in crate::replica_journal) async fn restore_held(&mut self) -> Result<(), JournalError> {
         let window = self.held_window();
         // Activation holds the owner faulted until it completes.
-        let Some((partition, released)) = self
+        let Some((partition, floors)) = self
             .images
             .as_ref()
             .ok_or(JournalError::InstallationMismatch)?
             .speculative()
             .partitions()
-            .find_map(|(partition, state)| Some((partition, state.delay.as_ref()?.released())))
+            .find_map(|(partition, state)| {
+                let delay = state.delay.as_ref()?;
+                Some((partition, (delay.released(), delay.carried())))
+            })
         else {
             self.held = None;
             return Ok(());
@@ -473,7 +472,7 @@ impl super::OwnedJournal {
                 self.recovery.index,
             )
             .await?;
-        let held = Held::restore(partition, window, released, &snapshot).await?;
+        let held = Held::restore(partition, window, floors, &snapshot).await?;
         self.held = Some(held);
         self.check_held()
     }
@@ -520,42 +519,8 @@ impl super::OwnedJournal {
         held.recent.len() + held.sealed.len()
     }
 
-    /// Check every `Release` in `buffer` against the held index, first
-    /// loading the sealed rows a release passes. Validation of `buffer` waits
-    /// for those reads.
-    pub(super) async fn prepare_held(
-        &mut self,
-        buffer: &crate::replica_journal::AppendBuffer,
-    ) -> Result<(), JournalError> {
-        if !buffer
-            .operations()
-            .any(|operation| operation.kind == OperationKind::Release)
-        {
-            return Ok(());
-        }
-        self.observe_held()?;
-        while check(
-            self.held.as_ref(),
-            buffer.operations(),
-            self.limits.operations,
-        )? == Checked::Load
-        {
-            let held = self.held.as_ref().ok_or(JournalError::AppendMismatch)?;
-            let before = held.loaded;
-            let snapshot = self.journal.retry_snapshot(self.recovery.index).await?;
-            let load = held.refill(snapshot).read().await?;
-            let held = self.held.as_mut().ok_or(JournalError::AppendMismatch)?;
-            held.extend(load);
-            // Each load reads past the loaded rows or loads every one.
-            if held.loaded == before {
-                return Err(JournalError::AppendMismatch);
-            }
-        }
-        Ok(())
-    }
-
     /// First operation of the oldest segment holding a record the last
-    /// committed release left, for retention.
+    /// committed release and carry left, for retention.
     pub(super) fn held_operation(&self) -> Result<Option<u64>, JournalError> {
         let images = self.images()?;
         let Some((_, delay)) = images
@@ -569,7 +534,7 @@ impl super::OwnedJournal {
             .held
             .as_ref()
             .ok_or(JournalError::AppendMismatch)?
-            .held_operation(delay.released()))
+            .held_operation(delay.released(), delay.carried()))
     }
 
     /// Follow segment rolls and retirement since the last admission.

@@ -357,7 +357,7 @@ fn carry_checks_the_floor_time_keys_and_held_totals() {
             StateError::CarryMismatch,
         ),
         (
-            carry(3_000, at(0, 0), at(5, 0), &[]),
+            carry(3_000, at(0, 0), at(5, 1), &[]),
             StateError::CarryMismatch,
         ),
         // A released key, and an unissued schedule sequence.
@@ -390,12 +390,13 @@ fn carry_checks_the_floor_time_keys_and_held_totals() {
         assert_eq!(images.admit(5, &body), state_error(error));
         assert_eq!(images, before);
     }
+    // The floor may reach the carry itself.
     images
-        .admit(5, &carry(3_000, at(0, 0), at(3, 1), &[]))
+        .admit(5, &carry(3_000, at(0, 0), at(5, 0), &[(1, key(5_000, 0))]))
         .unwrap();
     // A repeated carry does not start at the floor.
     assert_eq!(
-        images.admit(6, &carry(3_000, at(0, 0), at(3, 1), &[])),
+        images.admit(6, &carry(3_000, at(0, 0), at(5, 0), &[])),
         state_error(StateError::CarryMismatch)
     );
 }

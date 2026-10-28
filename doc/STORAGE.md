@@ -210,10 +210,13 @@ part. General descriptors use:
   with their keys, and moves the floor to its end. Every held record before
   the floor was released or carried. Partition state checks the floor, a
   timestamp of at least the partition's latest one, keys past the last
-  release with issued schedule sequences, an end before the `Carry`, and
-  record and byte counts within the held totals. Totals do not change.
-- Each copy keeps a held index of the rest: key, `Schedule` operation,
-  record index, encoded bytes, and message ID. Rows of the active segment
+  release with issued schedule sequences, an end no later than the `Carry`
+  itself, and record and byte counts within the held totals. Totals do not
+  change.
+- Each copy keeps a held index of the rest: key, `Schedule` or `Carry`
+  operation, record index, encoded bytes, and message ID. Rows before the
+  carry floor are skipped; a carried record's row moves to its `Carry`.
+  Rows of the active segment
   and later operations stay in memory. Once 262144 are, a copy rolls its
   segment before its next write when it has room to roll, so they move to
   its index file. Of sealed segments, only the next rows after the last
@@ -229,10 +232,16 @@ part. General descriptors use:
   state then checks the totals, a key past the last release, a timestamp
   that reaches the key's time, and the next offsets. A repeated release does
   not pass the last one and fails.
+- Each copy checks a `Carry` against the held rows in its range, read from
+  index files and memory: keys, message IDs, and encoded byte counts, in
+  position order, after releases and with schedules and carries before it
+  in the same batch. Validation of that batch waits for the read.
 - A scheduled attempt's retry result names its `Schedule` operation and maps
   the sequence to its schedule sequence.
-- Retention keeps the oldest segment whose last scheduled-record key is past
-  the last committed release, and every later segment. Checkpoints do not
+- Retention keeps the oldest segment that reaches the committed carry floor
+  and whose last scheduled-record key is past the last committed release,
+  and every later segment. A segment wholly before the floor holds no record;
+  one the floor splits stays. Checkpoints do not
   hold held records, so retirement checks the same segment floor. A
   `Schedule` acceptance time counts toward its segment's age, so retries of a
   released schedule resolve for the retention age. A `Carry` timestamp

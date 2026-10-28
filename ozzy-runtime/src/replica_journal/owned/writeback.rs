@@ -55,14 +55,17 @@ impl Writeback {
             .map(|(operation, prepared)| (operation, prepared.prefix()))
     }
 
-    /// Shared body bytes of an operation still in writeback.
-    pub(super) fn operation_bytes(&self, number: u64) -> Option<bytes::Bytes> {
+    /// Kind and shared body bytes of an operation still in writeback.
+    pub(super) fn operation_bytes(
+        &self,
+        number: u64,
+    ) -> Option<(ozzy_journal::operation::OperationKind, bytes::Bytes)> {
         self.queue.iter().find_map(|entry| {
             entry
                 .append
                 .operations()
                 .find(|operation| operation.op_number == number)
-                .map(|operation| entry.append.payload(operation.body))
+                .map(|operation| (operation.kind, entry.append.payload(operation.body)))
         })
     }
 

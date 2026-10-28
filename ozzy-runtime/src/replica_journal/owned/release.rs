@@ -1,7 +1,7 @@
 //! Due scheduled records leave their partition in a broker-built `Release`.
 //! The owner picks the due prefix from its held index; a detached job reads
-//! the `Schedule` operations holding it, beside writes, and builds the
-//! proposal. When no held record is loaded but sealed ones are, the job
+//! the `Schedule` or `Carry` operations holding it, beside writes, and builds
+//! the proposal. When no held record is loaded but sealed ones are, the job
 //! loads the next ones instead.
 
 use super::{JournalError, OwnedJournal};
@@ -10,8 +10,7 @@ use bytes::Bytes;
 use ozzy_core::state::PendingSchedule;
 use ozzy_journal::operation::{
     AppendBatch, AppendRecord, OperationBody, OperationKind, OperationLimits, RELEASE_FRAME_BYTES,
-    Release, ReleaseKey, Schedule, decode_operation_body, encode_operation_body,
-    encoded_record_bytes,
+    Release, ReleaseKey, decode_operation_body, encode_operation_body, encoded_record_bytes,
 };
 use ozzy_journal_segment::{JournalIndexError, JournalIndexSnapshot};
 use ozzy_proto::{
@@ -20,7 +19,7 @@ use ozzy_proto::{
 use ozzy_replication::driver::ValidationTicket;
 use std::rc::Rc;
 
-/// Distinct `Schedule` operations one release may read.
+/// Distinct `Schedule` or `Carry` operations one release may read.
 const MAX_SOURCES: usize = 64;
 
 /// One bounded release step.
@@ -54,14 +53,14 @@ enum Work {
     Load(Box<super::held::Refill>),
 }
 
-/// Due held records and where their `Schedule` operations are.
+/// Due held records and where their `Schedule` or `Carry` operations are.
 #[derive(Debug)]
 struct Records {
     partition: PartitionIncarnation,
     owner_epoch: OwnerEpoch,
     entries: Vec<(ReleaseKey, PendingSchedule)>,
-    /// Bodies still in writeback, by operation number.
-    hot: Vec<(u64, Bytes)>,
+    /// Kinds and bodies still in writeback, by operation number.
+    hot: Vec<(u64, OperationKind, Bytes)>,
     /// Operations to read from storage, by number.
     cold: Vec<u64>,
     stored: Option<JournalIndexSnapshot>,
@@ -165,9 +164,12 @@ impl OwnedJournal {
         }))
     }
 
-    /// Bodies of the entries' `Schedule` operations still in writeback, and
-    /// the numbers of those to read from storage.
-    fn sources(&self, entries: &[(ReleaseKey, PendingSchedule)]) -> (Vec<(u64, Bytes)>, Vec<u64>) {
+    /// Kinds and bodies of the entries' `Schedule` or `Carry` operations
+    /// still in writeback, and the numbers of those to read from storage.
+    fn sources(
+        &self,
+        entries: &[(ReleaseKey, PendingSchedule)],
+    ) -> (Vec<(u64, OperationKind, Bytes)>, Vec<u64>) {
         let mut hot = Vec::new();
         let mut cold = Vec::new();
         let mut sources = entries
@@ -178,7 +180,7 @@ impl OwnedJournal {
         sources.dedup();
         for number in sources {
             match self.writeback.operation_bytes(number) {
-                Some(body) => hot.push((number, body)),
+                Some((kind, body)) => hot.push((number, kind, body)),
                 None => cold.push(number),
             }
         }
@@ -330,21 +332,23 @@ impl Records {
                     .read_operation_number(number)
                     .await?
                     .ok_or(JournalIndexError::MissingOperationNumber(number))?;
-                if operation.kind != OperationKind::Schedule {
-                    return Err(JournalError::AppendMismatch);
-                }
-                hot.push((number, Bytes::from(operation.body.into_owned())));
+                hot.push((
+                    number,
+                    operation.kind,
+                    Bytes::from(operation.body.into_owned()),
+                ));
             }
         }
-        hot.sort_unstable_by_key(|(number, _)| *number);
+        hot.sort_unstable_by_key(|(number, _, _)| *number);
         let sources = hot
             .iter()
-            .map(|(number, body)| {
-                match decode_operation_body(OperationKind::Schedule, body, limits)? {
-                    OperationBody::Schedule(schedule) => Ok((*number, schedule)),
+            .map(
+                |(number, kind, body)| match decode_operation_body(*kind, body, limits)? {
+                    OperationBody::Schedule(schedule) => Ok((*number, schedule.batch)),
+                    OperationBody::Carry(carry) => Ok((*number, carry.batch)),
                     _ => Err(JournalError::AppendMismatch),
-                }
-            })
+                },
+            )
             .collect::<Result<Vec<_>, JournalError>>()?;
         let room = buffer.limits().max_body_bytes.min(limits.max_body_bytes);
         let (records, through) = held_records(&sources, &entries, limits, room)?;
@@ -375,7 +379,7 @@ impl Records {
 /// The held records in release order that fit one operation, and the
 /// release key of the last one.
 fn held_records<'a>(
-    sources: &'a [(u64, Schedule<'_>)],
+    sources: &'a [(u64, AppendBatch<'_>)],
     entries: &[(ReleaseKey, PendingSchedule)],
     limits: OperationLimits,
     room: usize,
@@ -389,7 +393,6 @@ fn held_records<'a>(
             .map_err(|_| JournalError::AppendMismatch)?;
         let record = sources[index]
             .1
-            .batch
             .records
             .get(pending.index as usize)
             .filter(|record| record.message_id == pending.message_id)
@@ -399,8 +402,8 @@ fn held_records<'a>(
         bytes += encoded_record_bytes(record.encoding, record.parts.iter());
         payload += size;
         parts += count;
-        // The first record always fits: its `Schedule` was at least as large
-        // as a `Release` of it alone.
+        // The first record always fits: its `Schedule` or `Carry` was at
+        // least as large as a `Release` of it alone.
         if !records.is_empty()
             && (bytes > room || payload > limits.max_payload_bytes || parts > limits.max_parts)
         {

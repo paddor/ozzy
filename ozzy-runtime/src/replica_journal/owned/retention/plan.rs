@@ -16,7 +16,7 @@ struct Retained {
     floor: Offset,
     end: Offset,
     /// First operation of the oldest segment holding a record the last
-    /// committed release left.
+    /// committed release and carry left.
     held: Option<u64>,
 }
 
@@ -75,7 +75,7 @@ impl OwnedJournal {
                     .held
                     .as_ref()
                     .ok_or(JournalError::AppendMismatch)?
-                    .held_operation(delay.released()),
+                    .held_operation(delay.released(), delay.carried()),
                 None => None,
             },
         }))
