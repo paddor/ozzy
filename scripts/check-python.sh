@@ -8,6 +8,11 @@ export UV_PROJECT_ENVIRONMENT="$CARGO_TARGET_DIR/python/$ozzy_python_version/ven
 export RUFF_CACHE_DIR="$CARGO_TARGET_DIR/python/ruff-cache"
 export MYPY_CACHE_DIR="$CARGO_TARGET_DIR/python/mypy-cache"
 export UV_LINK_MODE="${UV_LINK_MODE:-copy}"
+# A restored CI cache can hold a venv without its config, which uv will not
+# replace once the runner's interpreter changes.
+if [[ -d "$UV_PROJECT_ENVIRONMENT" && ! -f "$UV_PROJECT_ENVIRONMENT/pyvenv.cfg" ]]; then
+    rm -rf "$UV_PROJECT_ENVIRONMENT"
+fi
 uv sync --project bindings/python --locked --no-install-project --python "$ozzy_python_version"
 export PYO3_PYTHON="$UV_PROJECT_ENVIRONMENT/bin/python"
 ozzy_python_base="$(dirname "$(dirname "$(readlink -f "$PYO3_PYTHON")")")"
