@@ -57,7 +57,8 @@ impl OwnedJournal {
         }
         let scratch = self.charge_retention()?;
         let state = self.images()?.committed().clone();
-        let floors = RetentionFloors::from_canonical_state(&state)?;
+        let floors =
+            RetentionFloors::from_canonical_state(&state)?.protect_from(self.held_operation()?);
         let applied = position(self.applied);
         // Repeated bounded passes reuse only the exact selected checkpoint.
         // The scan still revalidates its files and checks the floors.

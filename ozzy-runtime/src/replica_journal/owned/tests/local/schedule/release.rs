@@ -296,6 +296,72 @@ fn another_copy_validates_the_release_and_refuses_a_changed_key() {
     assert_eq!(readable(&mut other, &mut copy, &copy_driver), [2, 1]);
 }
 
+#[test]
+fn another_copy_refuses_held_records_out_of_release_order() {
+    let (mut controller, mut journal, mut driver) = delayed(16);
+    let (mut other, mut copy, mut copy_driver) = delayed(16);
+    // Equal due times release in schedule order.
+    let result = produce(
+        &mut controller,
+        &mut journal,
+        &driver,
+        request(12, 0, 2),
+        Some(&[NOW + 2, NOW + 2]),
+        NOW,
+    );
+    let schedule = body(&result);
+    accept(&mut controller, &mut journal, &mut driver, result);
+    let proposal = release(&mut controller, &mut journal, &driver, NOW + 5).unwrap();
+    let result = validate(&mut controller, &mut journal, &driver, proposal, NOW + 5);
+    let (kind, original) = body(&result);
+    replicate(
+        &mut other,
+        &mut copy,
+        &mut copy_driver,
+        schedule.0,
+        &schedule.1,
+    )
+    .unwrap();
+    let OperationBody::Release(decoded) =
+        decode_operation_body(kind, &original, OperationLimits::default()).unwrap()
+    else {
+        panic!("release")
+    };
+    let mut records: Vec<_> = decoded
+        .batch
+        .records
+        .iter()
+        .map(|record| ozzy_journal::operation::AppendRecord {
+            encoding: record.encoding,
+            message_id: record.message_id,
+            parts: record.parts.iter().collect(),
+        })
+        .collect();
+    records.swap(0, 1);
+    let swapped = ozzy_journal::operation::Release {
+        batch: ozzy_journal::operation::AppendBatch {
+            records: records.into(),
+            ..decoded.batch.clone()
+        },
+        through: decoded.through,
+    };
+    let swapped = ozzy_journal::operation::encode_operation_body(
+        &OperationBody::Release(swapped),
+        OperationLimits::default(),
+    )
+    .unwrap();
+    assert!(matches!(
+        replicate(&mut other, &mut copy, &mut copy_driver, kind, &swapped),
+        Err(JournalError::Images(
+            ozzy_core::state::CanonicalImagesError::State(
+                ozzy_core::state::StateError::ReleaseMismatch
+            )
+        ))
+    ));
+    replicate(&mut other, &mut copy, &mut copy_driver, kind, &original).unwrap();
+    assert_eq!(readable(&mut other, &mut copy, &copy_driver), [1, 2]);
+}
+
 /// `body` with its trailing schedule sequence replaced.
 fn body_with_key(body: &[u8], schedule: u64) -> Vec<u8> {
     let mut body = body.to_vec();

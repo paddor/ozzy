@@ -260,14 +260,6 @@ impl OwnedJournal {
         if entries.is_empty() {
             return Ok(None);
         }
-        debug_assert!(
-            state.delay.as_ref().is_some_and(|delay| delay
-                .due(now_millis)
-                .map(|(key, row)| (key, *row))
-                .take(entries.len())
-                .eq(entries.iter().copied())),
-            "held index picked other records than canonical state"
-        );
         Ok(Some((partition, state.owner_epoch, entries)))
     }
 

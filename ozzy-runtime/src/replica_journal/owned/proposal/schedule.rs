@@ -30,12 +30,13 @@ impl OwnedJournal {
         if let Some(limits) = self.delay {
             // A batch above the limit never fits; a smaller one waits for
             // releases.
-            if due.len() > limits.max_entries {
+            let records = due.len() as u64;
+            if records > limits.max_entries {
                 return Err(AppendAdmissionError::ScheduleTooLarge.into());
             }
             if delay
-                .pending_len()
-                .checked_add(due.len())
+                .held_records()
+                .checked_add(records)
                 .is_none_or(|total| total > limits.max_entries)
             {
                 return Err(AppendAdmissionError::ScheduleCapacity.into());

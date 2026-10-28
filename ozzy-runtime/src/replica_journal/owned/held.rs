@@ -1,6 +1,8 @@
-//! Held scheduled records each copy keeps beside canonical state. Rows of
-//! sealed segments stay in their index files; only the next ones after the
-//! last release are loaded. Rows of later operations stay in memory.
+//! Held scheduled records each copy keeps beside canonical state, which
+//! holds only the last released key and held totals. Rows of sealed segments
+//! stay in their index files; only the next ones after the last release are
+//! loaded. Rows of later operations stay in memory. Each copy checks a
+//! `Release` against these rows before canonical validation.
 
 use std::collections::BTreeMap;
 use std::iter::Peekable;
@@ -14,6 +16,9 @@ use ozzy_journal_segment::{JournalIndexSnapshot, SegmentReference};
 use ozzy_proto::PartitionIncarnation;
 
 use super::JournalError;
+
+mod check;
+use check::{Checked, check};
 
 /// Sealed rows a copy loads past the last release by default. Rows are
 /// fixed size, so the count also bounds their memory.
@@ -255,11 +260,8 @@ impl Held {
     /// record before them is loaded.
     pub(super) fn prefix(&self) -> impl Iterator<Item = (ReleaseKey, &PendingSchedule)> {
         let loaded = self.loaded;
-        Merge {
-            left: self.recent.iter().peekable(),
-            right: self.sealed.iter().peekable(),
-        }
-        .take_while(move |(key, _)| loaded.is_none_or(|loaded| *key <= loaded))
+        merge(rows(&self.recent), rows(&self.sealed))
+            .take_while(move |(key, _)| loaded.is_none_or(|loaded| *key <= loaded))
     }
 
     /// Release key millis to wake at: the first held record's, or, when no
@@ -335,18 +337,18 @@ impl Held {
         self.sealed.len()
     }
 
-    /// Whether the certain prefix matches canonical state.
+    /// Whether the index agrees with canonical held totals. Only a fully
+    /// loaded index can count them.
     #[cfg(debug_assertions)]
     pub(super) fn matches(&self, delay: &ozzy_core::state::DelayState) -> bool {
-        let prefix: Vec<_> = self.prefix().map(|(key, row)| (key, *row)).collect();
-        let canonical: Vec<_> = delay
-            .pending()
-            .take(prefix.len() + 1)
-            .map(|(key, row)| (key, *row))
-            .collect();
+        let (records, bytes) = self
+            .prefix()
+            .fold((0_u64, 0_u64), |(records, bytes), (_, row)| {
+                (records + 1, bytes + u64::from(row.bytes))
+            });
         self.released == delay.released()
-            && canonical.starts_with(&prefix)
-            && (self.loaded.is_some() || canonical.len() == prefix.len())
+            && (self.loaded.is_some()
+                || (records, bytes) == (delay.held_records(), delay.held_bytes()))
     }
 }
 
@@ -367,7 +369,22 @@ fn active_first(references: &[SegmentReference]) -> u64 {
         .map_or(1, |active| active.first_chain.next_op_number())
 }
 
-/// Two disjoint row maps in key order.
+fn rows(rows: &Rows) -> impl Iterator<Item = (ReleaseKey, &PendingSchedule)> {
+    rows.iter().map(|(key, row)| (*key, row))
+}
+
+fn merge<'a, L, R>(left: L, right: R) -> Merge<L, R>
+where
+    L: Iterator<Item = (ReleaseKey, &'a PendingSchedule)>,
+    R: Iterator<Item = (ReleaseKey, &'a PendingSchedule)>,
+{
+    Merge {
+        left: left.peekable(),
+        right: right.peekable(),
+    }
+}
+
+/// Two row streams with distinct keys, in key order.
 struct Merge<L: Iterator, R: Iterator> {
     left: Peekable<L>,
     right: Peekable<R>,
@@ -375,8 +392,8 @@ struct Merge<L: Iterator, R: Iterator> {
 
 impl<'a, L, R> Iterator for Merge<L, R>
 where
-    L: Iterator<Item = (&'a ReleaseKey, &'a PendingSchedule)>,
-    R: Iterator<Item = (&'a ReleaseKey, &'a PendingSchedule)>,
+    L: Iterator<Item = (ReleaseKey, &'a PendingSchedule)>,
+    R: Iterator<Item = (ReleaseKey, &'a PendingSchedule)>,
 {
     type Item = (ReleaseKey, &'a PendingSchedule);
 
@@ -385,12 +402,11 @@ where
             (Some((left, _)), Some((right, _))) => left < right,
             (left, _) => left.is_some(),
         };
-        let (key, row) = if take_left {
-            self.left.next()?
+        if take_left {
+            self.left.next()
         } else {
-            self.right.next()?
-        };
-        Some((*key, row))
+            self.right.next()
+        }
     }
 }
 
@@ -461,6 +477,58 @@ impl super::OwnedJournal {
     #[cfg(test)]
     pub(in crate::replica_journal) fn held_rows(&self) -> usize {
         self.held.as_ref().map_or(0, Held::loaded_rows)
+    }
+
+    /// Check every `Release` in `buffer` against the held index, first
+    /// loading the sealed rows a release passes. Validation of `buffer` waits
+    /// for those reads.
+    pub(super) async fn prepare_held(
+        &mut self,
+        buffer: &crate::replica_journal::AppendBuffer,
+    ) -> Result<(), JournalError> {
+        if !buffer
+            .operations()
+            .any(|operation| operation.kind == OperationKind::Release)
+        {
+            return Ok(());
+        }
+        self.observe_held()?;
+        while check(
+            self.held.as_ref(),
+            buffer.operations(),
+            self.limits.operations,
+        )? == Checked::Load
+        {
+            let held = self.held.as_ref().ok_or(JournalError::AppendMismatch)?;
+            let before = held.loaded;
+            let snapshot = self.journal.retry_snapshot(self.recovery.index).await?;
+            let load = held.refill(snapshot).read().await?;
+            let held = self.held.as_mut().ok_or(JournalError::AppendMismatch)?;
+            held.load(load);
+            // Each load reads past the loaded rows or loads every one.
+            if held.loaded == before {
+                return Err(JournalError::AppendMismatch);
+            }
+        }
+        Ok(())
+    }
+
+    /// First operation of the oldest segment holding a record the last
+    /// committed release left, for retention.
+    pub(super) fn held_operation(&self) -> Result<Option<u64>, JournalError> {
+        let images = self.images()?;
+        let Some((_, delay)) = images
+            .committed()
+            .partitions()
+            .find_map(|(partition, state)| Some((partition, state.delay.as_ref()?)))
+        else {
+            return Ok(None);
+        };
+        Ok(self
+            .held
+            .as_ref()
+            .ok_or(JournalError::AppendMismatch)?
+            .held_operation(delay.released()))
     }
 
     /// Follow segment rolls and retirement since the last admission.

@@ -100,6 +100,7 @@ impl OwnedJournal {
         let result = async {
             self.healthy()?;
             let (plan, records) = self.prepare_append(ticket, &mut buffer, false).await?;
+            self.prepare_held(&buffer).await?;
             let dedup = self.prepare_dedup(ticket, &buffer)?;
             Ok::<_, JournalError>((plan, records, dedup))
         }

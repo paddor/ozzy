@@ -1,7 +1,8 @@
 //! Scheduled records held per partition until due. New records always sort
 //! after released ones, so each release takes a prefix in release order.
+//! Partition state keeps only the last released key and held totals; each
+//! copy checks a release's records against its own held index.
 
-use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 
 use ozzy_journal::operation::{AppendBatch, Release, ReleaseKey, Schedule};
@@ -12,7 +13,7 @@ use super::{
     require_id, require_record_parts,
 };
 
-/// One held record. Its payload stays in its `Schedule` operation.
+/// One scheduled record. Its payload stays in its `Schedule` operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PendingSchedule {
     /// `Schedule` operation holding the record.
@@ -26,7 +27,7 @@ pub struct PendingSchedule {
 }
 
 /// Held records of one delay-enabled partition.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DelayState {
     /// Immutable maximum delay between acceptance and due time.
     pub max_delay_millis: NonZeroU64,
@@ -36,9 +37,8 @@ pub struct DelayState {
     pub time: u64,
     /// Release key of the last released record. Every held key is above it.
     released: Option<ReleaseKey>,
-    pending: BTreeMap<ReleaseKey, PendingSchedule>,
-    /// Held records per `Schedule` operation, for the retention floor.
-    operations: BTreeMap<u64, usize>,
+    /// Number of held records.
+    records: u64,
     /// Encoded bytes of every held record.
     bytes: u64,
 }
@@ -51,20 +51,14 @@ impl DelayState {
             next_schedule: 0,
             time: 0,
             released: None,
-            pending: BTreeMap::new(),
-            operations: BTreeMap::new(),
+            records: 0,
             bytes: 0,
         }
     }
 
-    /// Held records in release order.
-    pub fn pending(&self) -> impl ExactSizeIterator<Item = (ReleaseKey, &PendingSchedule)> {
-        self.pending.iter().map(|(key, value)| (*key, value))
-    }
-
     /// Number of held records.
-    pub fn pending_len(&self) -> usize {
-        self.pending.len()
+    pub const fn held_records(&self) -> u64 {
+        self.records
     }
 
     /// Encoded bytes of every held record.
@@ -77,98 +71,42 @@ impl DelayState {
         self.released
     }
 
-    /// Release key of the next record to release.
-    pub fn next_release(&self) -> Option<ReleaseKey> {
-        self.pending.keys().next().copied()
-    }
-
-    /// Held records due at `now_millis`, in release order.
-    pub fn due(&self, now_millis: u64) -> impl Iterator<Item = (ReleaseKey, &PendingSchedule)> {
-        let through = ReleaseKey {
-            millis: now_millis,
-            schedule: u64::MAX,
-        };
-        self.pending
-            .range(..=through)
-            .map(|(key, value)| (*key, value))
-    }
-
-    /// Oldest `Schedule` operation that still holds a record. Retention keeps
-    /// it and every later operation.
-    pub fn oldest_operation(&self) -> Option<u64> {
-        self.operations.keys().next().copied()
-    }
-
-    /// Rebuild from validated snapshot entries in release order.
-    pub(super) fn restore(
-        &mut self,
-        released: Option<ReleaseKey>,
-        pending: BTreeMap<ReleaseKey, PendingSchedule>,
-    ) {
+    /// Rebuild from validated snapshot fields.
+    pub(super) const fn restore(&mut self, released: Option<ReleaseKey>, records: u64, bytes: u64) {
         self.released = released;
-        let mut operations = BTreeMap::<u64, usize>::new();
-        for value in pending.values() {
-            *operations.entry(value.operation).or_default() += 1;
-        }
-        self.bytes = pending.values().map(|value| u64::from(value.bytes)).sum();
-        self.pending = pending;
-        self.operations = operations;
-    }
-
-    fn hold(&mut self, operation: u64, pending: Vec<(ReleaseKey, PendingSchedule)>) {
-        self.operations.insert(operation, pending.len());
-        self.bytes += pending
-            .iter()
-            .map(|(_, value)| u64::from(value.bytes))
-            .sum::<u64>();
-        self.pending.extend(pending);
-    }
-
-    fn release_through(&mut self, through: ReleaseKey) {
-        self.released = Some(through);
-        while let Some(entry) = self.pending.first_entry() {
-            if *entry.key() > through {
-                break;
-            }
-            let value = entry.remove();
-            self.bytes -= u64::from(value.bytes);
-            let operation = value.operation;
-            if let Some(count) = self.operations.get_mut(&operation) {
-                *count -= 1;
-                if *count == 0 {
-                    self.operations.remove(&operation);
-                }
-            }
-        }
+        self.records = records;
+        self.bytes = bytes;
     }
 }
 
 /// One validated schedule or release.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PreparedDelay {
     Schedule(PreparedSchedule),
     Release(PreparedRelease),
 }
 
-/// Held records and coordinates of one validated `Schedule`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Held totals and coordinates of one validated `Schedule`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PreparedSchedule {
     partition: PartitionIncarnation,
     producer: ProducerId,
     span: ProducerResultSpan,
     time: u64,
-    pending: Vec<(ReleaseKey, PendingSchedule)>,
+    bytes: u64,
     /// Oldest spans the producer drops first to fit the span limit.
     evict: usize,
 }
 
-/// Coordinates of one validated `Release`.
+/// Coordinates and released totals of one validated `Release`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PreparedRelease {
     partition: PartitionIncarnation,
     through: ReleaseKey,
     time: u64,
     next_offset: Offset,
+    records: u64,
+    bytes: u64,
 }
 
 impl CanonicalState {
@@ -185,10 +123,11 @@ impl CanonicalState {
         if time < delay.time {
             return Err(StateError::DelayTimeRegressed);
         }
+        let records =
+            u64::try_from(batch.records.len()).map_err(|_| StateError::PositionExhausted)?;
         if delay
-            .pending
-            .len()
-            .checked_add(batch.records.len())
+            .records
+            .checked_add(records)
             .is_none_or(|total| total > self.limits.max_pending_schedules)
         {
             return Err(StateError::LimitExceeded("pending schedules"));
@@ -199,11 +138,14 @@ impl CanonicalState {
             .map_or(0, |producer| producer.result_spans().len());
         let evict = self.retry_span_evictions(held, 1)?;
         let latest = time.saturating_add(delay.max_delay_millis.get());
-        let pending = held_records(op_number, value, latest)?;
+        let bytes = held_records(op_number, value, latest)?
+            .iter()
+            .map(|(_, record)| u64::from(record.bytes))
+            .sum();
         let span = ProducerResultSpan {
             first_sequence: batch.first_sequence,
             first_offset: Offset::new(value.first_schedule),
-            records: u64::try_from(pending.len()).map_err(|_| StateError::PositionExhausted)?,
+            records,
             source: ProducerResultSource::Scheduled {
                 operation: op_number,
             },
@@ -214,7 +156,7 @@ impl CanonicalState {
                 producer: batch.producer_id,
                 span,
                 time,
-                pending,
+                bytes,
                 evict,
             })),
             Vec::new(),
@@ -261,8 +203,9 @@ impl CanonicalState {
         Ok(delay)
     }
 
-    /// A release copies exactly the held records through its key, in release
-    /// order, at the next offsets. Its timestamp is at least their due time.
+    /// A release takes held records through a key past the last release, at
+    /// the next offsets, and its timestamp is at least that key's time. Each
+    /// copy checks the records against its held index before this.
     pub(super) fn prepare_release(
         &self,
         value: &Release<'_>,
@@ -285,24 +228,31 @@ impl CanonicalState {
         if time < delay.time || time < value.through.millis {
             return Err(StateError::DelayTimeRegressed);
         }
-        let count =
+        let records =
             u64::try_from(batch.records.len()).map_err(|_| StateError::PositionExhausted)?;
         let next_offset = batch
             .first_offset
             .get()
-            .checked_add(count)
+            .checked_add(records)
             .map(Offset::new)
             .ok_or(StateError::PositionExhausted)?;
-        let mut held = delay.pending.range(..=value.through);
-        let mut last = None;
+        let mut bytes = 0_u64;
         for record in &batch.records {
-            let (key, pending) = held.next().ok_or(StateError::ReleaseMismatch)?;
-            if record.message_id != pending.message_id || record_bytes(record)? != pending.bytes {
-                return Err(StateError::ReleaseMismatch);
-            }
-            last = Some(*key);
+            require_id("message", record.message_id.as_bytes())?;
+            bytes += u64::from(record_bytes(record)?);
         }
-        if held.next().is_some() || last != Some(value.through) {
+        // Released records are a nonempty prefix of the held ones, after the
+        // last release, with issued schedule sequences.
+        let held = records <= delay.records && bytes <= delay.bytes;
+        let whole = records == delay.records;
+        if records == 0
+            || !held
+            || whole != (bytes == delay.bytes)
+            || value.through.schedule >= delay.next_schedule
+            || delay
+                .released
+                .is_some_and(|released| value.through <= released)
+        {
             return Err(StateError::ReleaseMismatch);
         }
         Ok((
@@ -311,6 +261,8 @@ impl CanonicalState {
                 through: value.through,
                 time,
                 next_offset,
+                records,
+                bytes,
             })),
             Vec::new(),
         ))
@@ -332,9 +284,8 @@ impl CanonicalState {
         let delay = state.delay.as_mut().ok_or(StateError::DelayDisabled)?;
         delay.next_schedule = prepared.span.first_offset.get() + prepared.span.records;
         delay.time = prepared.time;
-        if let ProducerResultSource::Scheduled { operation } = prepared.span.source {
-            delay.hold(operation, prepared.pending);
-        }
+        delay.records += prepared.span.records;
+        delay.bytes += prepared.bytes;
         self.count_retry_spans(1, prepared.evict)
     }
 
@@ -343,7 +294,9 @@ impl CanonicalState {
         state.next_offset = prepared.next_offset;
         let delay = state.delay.as_mut().ok_or(StateError::DelayDisabled)?;
         delay.time = prepared.time;
-        delay.release_through(prepared.through);
+        delay.released = Some(prepared.through);
+        delay.records -= prepared.records;
+        delay.bytes -= prepared.bytes;
         Ok(())
     }
 }

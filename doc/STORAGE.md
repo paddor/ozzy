@@ -197,26 +197,29 @@ part. General descriptors use:
 - A held record's release key is `(max(due, acceptance), schedule
   sequence)`. Every schedule or release timestamp is at least the
   partition's latest one, so a new key sorts after every released key.
-- Partition state holds each held record's key, `Schedule` operation, record
-  index, encoded byte count (descriptor, part lengths, payload), and message
-  ID, plus the last released key. Payloads stay in the `Schedule` operation
-  until release.
-- Each copy also keeps a held index beside that state. Rows of the active
-  segment and later operations stay in memory. Of sealed segments, only the
-  next rows after the last release are loaded from their index files, 65536
-  by default. A row's place is certain once every row before it is loaded,
-  and the primary releases only certain rows.
+- Partition state holds only the last released key and the count and
+  encoded bytes (descriptor, part lengths, payload) of held records.
+  Payloads stay in the `Schedule` operation until release.
+- Each copy keeps a held index of the rest: key, `Schedule` operation,
+  record index, encoded bytes, and message ID. Rows of the active segment
+  and later operations stay in memory. Of sealed segments, only the next
+  rows after the last release are loaded from their index files, 65536 by
+  default. A row's place is certain once every row before it is loaded, and
+  the primary releases only certain rows.
 - A `Release` copies exactly the held records through its key, in key order.
-  Message IDs and encoded byte counts must match, its timestamp must reach the last
-  key's time, and its batch takes the next offsets. A repeated release finds
-  its records gone and fails.
+  Each copy checks message IDs and encoded byte counts against its held
+  index and the `Schedule` operations before it in the same batch, first
+  loading sealed rows the release passes. Validation of that batch waits for
+  those reads. Partition state then checks the totals, a key past the last
+  release, a timestamp that reaches the key's time, and the next offsets. A
+  repeated release does not pass the last one and fails.
 - A scheduled attempt's retry result names its `Schedule` operation and maps
   the sequence to its schedule sequence.
-- Retention planning keeps the oldest segment whose last scheduled-record
-  key is past the last committed release, and every later segment.
-  Retirement also checks the oldest `Schedule` operation that still holds a
-  record. A `Schedule` acceptance time counts toward its segment's age, so
-  retries of a released schedule resolve for the retention age.
+- Retention keeps the oldest segment whose last scheduled-record key is past
+  the last committed release, and every later segment. Checkpoints do not
+  hold held records, so retirement checks the same segment floor. A
+  `Schedule` acceptance time counts toward its segment's age, so retries of a
+  released schedule resolve for the retention age.
 - Readers and indexes treat a `Release` batch like an APPEND batch.
   `Schedule` records have no offsets; indexes list them by release key only.
 - Scheduled payloads are raw, so a release can copy any prefix of held
@@ -424,8 +427,8 @@ ID, offset, and logical acceptance time. The enclosing checkpoint supplies
 integrity and partition authority.
 
 - Checkpoints hold state, producer coordinates, retry floors, live confirmed
-  identities, held scheduled records (48 bytes each), the last released key,
-  and the original
+  identities, the last released key and held-record totals, and the
+  original
   committed operation and digest. Never payloads.
 - Failed or canceled builds never select themselves. Installation checks the
   captured position and source lineage.

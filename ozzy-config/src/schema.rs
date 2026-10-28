@@ -189,7 +189,7 @@ const fn default_delay_entries() -> u64 {
 }
 
 /// Upper bound on `delay.max_entries`, the canonical per-partition limit.
-pub const MAX_DELAY_ENTRIES: u64 = 1_048_576;
+pub const MAX_DELAY_ENTRIES: u64 = 1 << 32;
 
 const fn default_dedup_window() -> u64 {
     300_000

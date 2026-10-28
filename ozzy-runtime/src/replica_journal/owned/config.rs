@@ -13,7 +13,7 @@ pub use ozzy_core::dedup::Limits as DedupLimits;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DelayLimits {
     /// Scheduled records the partition holds before the leader refuses more.
-    pub max_entries: usize,
+    pub max_entries: u64,
     /// Held records of sealed segments each copy keeps loaded past the last
     /// release.
     pub window: usize,
@@ -21,17 +21,11 @@ pub struct DelayLimits {
 
 impl DelayLimits {
     /// Limits with `max_entries` and the default window.
-    pub const fn new(max_entries: usize) -> Self {
+    pub const fn new(max_entries: u64) -> Self {
         Self {
             max_entries,
             window: super::held::HELD_WINDOW,
         }
-    }
-
-    /// Core snapshot bytes of a full set of held records.
-    pub const fn snapshot_bytes(self) -> Option<usize> {
-        self.max_entries
-            .checked_mul(ozzy_core::state::PENDING_SCHEDULE_SNAPSHOT_BYTES)
     }
 }
 

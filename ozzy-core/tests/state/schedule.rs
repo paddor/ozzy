@@ -105,12 +105,10 @@ fn held(images: &CanonicalImages) -> &DelayState {
         .unwrap()
 }
 
-/// Held message bytes in release order.
-fn held_messages(images: &CanonicalImages) -> Vec<(ReleaseKey, u8)> {
-    held(images)
-        .pending()
-        .map(|(key, value)| (key, value.message_id.as_bytes()[0]))
-        .collect()
+/// Held records, their encoded bytes, and the last released key.
+fn totals(images: &CanonicalImages) -> (u64, u64, Option<ReleaseKey>) {
+    let delay = held(images);
+    (delay.held_records(), delay.held_bytes(), delay.released())
 }
 
 fn state_error(error: StateError) -> Result<(), CanonicalImagesError> {
@@ -126,24 +124,28 @@ fn schedule_holds_records_in_release_order_without_offsets() {
             &schedule(0, 0, 1_000, &[(1, 5_000), (2, 3_000), (3, 900)]),
         )
         .unwrap();
-    assert_eq!(
-        held_messages(&images),
-        [(key(1_000, 2), 3), (key(3_000, 1), 2), (key(5_000, 0), 1)]
-    );
+    // Encoded bytes: a 24-byte descriptor and the 4-byte payload.
+    assert_eq!(totals(&images), (3, 3 * 28, None));
     let state = images.speculative().partition(partition()).unwrap();
     assert_eq!(state.next_offset, Offset::ZERO);
     let delay = state.delay.as_ref().unwrap();
     assert_eq!((delay.next_schedule, delay.time), (3, 1_000));
-    assert_eq!(delay.oldest_operation(), Some(3));
-    assert_eq!(delay.next_release(), Some(key(1_000, 2)));
+    let OperationBody::Schedule(body) = schedule(0, 0, 1_000, &[(1, 5_000), (2, 3_000), (3, 900)])
+    else {
+        unreachable!()
+    };
+    let entries = ozzy_core::state::schedule_entries(3, &body).unwrap();
     assert_eq!(
-        delay.due(2_999).map(|(key, _)| key).collect::<Vec<_>>(),
-        [key(1_000, 2)]
+        entries
+            .iter()
+            .map(|(key, value)| (*key, value.index, value.bytes))
+            .collect::<Vec<_>>(),
+        [
+            (key(5_000, 0), 0, 28),
+            (key(3_000, 1), 1, 28),
+            (key(1_000, 2), 2, 28)
+        ]
     );
-    let held = delay.pending().next().unwrap().1;
-    // Encoded bytes: a 24-byte descriptor and the 4-byte payload.
-    assert_eq!((held.operation, held.index, held.bytes), (3, 2, 28));
-    assert_eq!(delay.held_bytes(), 3 * 28);
     let writer = state.producer(producer()).unwrap();
     assert_eq!(writer.next_producer_sequence, ProducerSequence::new(3));
     for sequence in 0..3 {
@@ -172,10 +174,8 @@ fn release_takes_the_due_prefix_at_the_next_offsets() {
         .unwrap();
     let state = images.speculative().partition(partition()).unwrap();
     assert_eq!(state.next_offset, Offset::new(2));
-    assert_eq!(held_messages(&images), [(key(5_000, 0), 1)]);
+    assert_eq!(totals(&images), (1, 28, Some(key(3_000, 1))));
     assert_eq!(held(&images).time, 3_000);
-    assert_eq!(held(&images).oldest_operation(), Some(3));
-    assert_eq!(held(&images).released(), Some(key(3_000, 1)));
     images
         .admit(5, &release(2, 6_000, key(5_000, 0), &[1]))
         .unwrap();
@@ -183,39 +183,17 @@ fn release_takes_the_due_prefix_at_the_next_offsets() {
     let state = images.committed().partition(partition()).unwrap();
     assert_eq!(state.next_offset, Offset::new(3));
     let delay = state.delay.as_ref().unwrap();
-    assert_eq!((delay.pending_len(), delay.held_bytes()), (0, 0));
-    assert_eq!(delay.oldest_operation(), None);
-    assert_eq!(delay.released(), Some(key(5_000, 0)));
+    assert_eq!(
+        (delay.held_records(), delay.held_bytes(), delay.released()),
+        (0, 0, Some(key(5_000, 0)))
+    );
     assert_eq!(delay.time, 6_000);
 }
 
+/// Core checks the cursor and held totals; each copy's held index checks
+/// the records themselves.
 #[test]
-fn equal_due_times_keep_schedule_order() {
-    let mut images = delayed();
-    images
-        .admit(3, &schedule(0, 0, 1_000, &[(1, 2_000), (2, 2_000)]))
-        .unwrap();
-    images
-        .admit(4, &schedule(2, 2, 1_500, &[(3, 2_000)]))
-        .unwrap();
-    assert_eq!(
-        held_messages(&images),
-        [(key(2_000, 0), 1), (key(2_000, 1), 2), (key(2_000, 2), 3)]
-    );
-    let before = images.clone();
-    assert_eq!(
-        images.admit(5, &release(0, 2_000, key(2_000, 2), &[2, 1, 3])),
-        state_error(StateError::ReleaseMismatch)
-    );
-    assert_eq!(images, before);
-    images
-        .admit(5, &release(0, 2_000, key(2_000, 2), &[1, 2, 3]))
-        .unwrap();
-    assert_eq!(held(&images).oldest_operation(), None);
-}
-
-#[test]
-fn release_must_match_the_held_prefix_exactly() {
+fn release_checks_the_cursor_and_held_totals() {
     let mut images = delayed();
     images
         .admit(3, &schedule(0, 0, 1_000, &[(1, 2_000), (2, 3_000)]))
@@ -225,32 +203,32 @@ fn release_must_match_the_held_prefix_exactly() {
         batch: batch(0, 0, 2_000, &[1]),
         through: key(2_000, 0),
     });
-    let OperationBody::Release(mut longer) = release(0, 2_000, key(2_000, 0), &[1]) else {
+    let OperationBody::Release(mut longer) = release(0, 3_000, key(3_000, 1), &[1, 2]) else {
         unreachable!()
     };
-    longer.batch.records = vec![record(1, b"held!")].into();
+    longer.batch.records = vec![record(1, b"held"), record(2, b"held!")].into();
+    let OperationBody::Release(mut shorter) = release(0, 3_000, key(3_000, 1), &[1, 2]) else {
+        unreachable!()
+    };
+    shorter.batch.records = vec![record(1, b"held"), record(2, b"hel")].into();
     let cases = [
         (
             release(0, 1_999, key(2_000, 0), &[1]),
             StateError::DelayTimeRegressed,
         ),
+        // More records or bytes than held.
         (
-            release(0, 2_000, key(2_000, 0), &[2]),
-            StateError::ReleaseMismatch,
-        ),
-        (
-            release(0, 3_000, key(3_000, 1), &[1]),
-            StateError::ReleaseMismatch,
-        ),
-        (
-            release(0, 3_000, key(2_000, 0), &[1, 2]),
-            StateError::ReleaseMismatch,
-        ),
-        (
-            release(0, 2_500, key(2_500, 0), &[1]),
+            release(0, 3_000, key(3_000, 1), &[1, 2, 3]),
             StateError::ReleaseMismatch,
         ),
         (OperationBody::Release(longer), StateError::ReleaseMismatch),
+        // Every held record, but not every held byte.
+        (OperationBody::Release(shorter), StateError::ReleaseMismatch),
+        // An unissued schedule sequence.
+        (
+            release(0, 3_000, key(3_000, 2), &[1]),
+            StateError::ReleaseMismatch,
+        ),
         (
             release(1, 2_000, key(2_000, 0), &[1]),
             StateError::OffsetMismatch,
@@ -266,11 +244,15 @@ fn release_must_match_the_held_prefix_exactly() {
     }
     let first = release(0, 2_000, key(2_000, 0), &[1]);
     images.admit(4, &first).unwrap();
-    // A repeated release finds its records gone.
+    // A repeated release does not pass the last one.
     assert_eq!(
-        images.admit(5, &release(1, 2_000, key(2_000, 0), &[1])),
+        images.admit(5, &release(1, 2_000, key(2_000, 0), &[2])),
         state_error(StateError::ReleaseMismatch)
     );
+    images
+        .admit(5, &release(1, 3_000, key(3_000, 1), &[2]))
+        .unwrap();
+    assert_eq!(totals(&images), (0, 0, Some(key(3_000, 1))));
 }
 
 #[test]
@@ -353,18 +335,18 @@ fn discarded_release_holds_its_records_again() {
         .admit(3, &schedule(0, 0, 1_000, &[(1, 2_000), (2, 3_000)]))
         .unwrap();
     images.commit_through(3).unwrap();
-    let held_before = held_messages(&images);
+    let held_before = totals(&images);
     images
         .admit(4, &release(0, 3_000, key(3_000, 1), &[1, 2]))
         .unwrap();
     images.discard_suffix();
-    assert_eq!(held_messages(&images), held_before);
+    assert_eq!(totals(&images), held_before);
     assert_eq!(images.speculative(), images.committed());
     images
         .admit(4, &release(0, 2_000, key(2_000, 0), &[1]))
         .unwrap();
     images.commit_through(4).unwrap();
-    assert_eq!(held_messages(&images), [(key(3_000, 1), 2)]);
+    assert_eq!(totals(&images), (1, 28, Some(key(2_000, 0))));
 }
 
 #[test]
@@ -388,7 +370,7 @@ fn a_writer_at_the_span_limit_drops_its_oldest_scheduled_result() {
     assert_eq!(writer.result_outcome(ProducerSequence::ZERO), None);
     assert!(writer.result_outcome(ProducerSequence::new(2)).is_some());
     // Held records stay held; only their retry history goes.
-    assert_eq!(held(&images).pending_len(), 3);
+    assert_eq!(held(&images).held_records(), 3);
 }
 
 #[test]
@@ -420,22 +402,11 @@ fn snapshot_restores_held_records_and_scheduled_results() {
         .delay
         .as_ref()
         .unwrap();
-    assert_eq!(delay.oldest_operation(), Some(3));
-    assert_eq!(delay.held_bytes(), 2 * 28);
+    assert_eq!(
+        (delay.held_records(), delay.held_bytes(), delay.released()),
+        (2, 2 * 28, Some(key(1_200, 2)))
+    );
     assert_eq!((delay.next_schedule, delay.time), (3, 1_200));
-    assert!(matches!(
-        CanonicalState::decode_snapshot(
-            &state
-                .encode_snapshot(StateSnapshotLimits::default())
-                .unwrap(),
-            StateLimits {
-                max_pending_schedules: 1,
-                ..StateLimits::default()
-            },
-            StateSnapshotLimits::default(),
-        ),
-        Err(ozzy_core::state::StateSnapshotError::LimitExceeded { .. })
-    ));
 }
 
 #[test]
@@ -452,7 +423,6 @@ fn scheduled_results_hold_their_operation_until_floored() {
         .unwrap();
     images.commit_through(5).unwrap();
     let state = images.committed().partition(partition()).unwrap();
-    assert_eq!(state.delay.as_ref().unwrap().oldest_operation(), Some(4));
     let writer = state.producer(producer()).unwrap();
     assert_eq!(writer.result_operation_floor(), Some(3));
     // A plan that keeps operation 3 keeps its retry result.
@@ -506,10 +476,6 @@ fn checksum_valid_snapshots_reject_inconsistent_held_records() {
         .encode_snapshot(StateSnapshotLimits::default())
         .unwrap();
     let partition = 256;
-    let names = usize::from(u16::from_be_bytes(encoded[260..262].try_into().unwrap()))
-        + usize::from(u16::from_be_bytes(encoded[262..264].try_into().unwrap()));
-    let first = partition + 160 + names + 80 + 40;
-    let second = first + 48;
     let reseal = |damaged: &mut Vec<u8>| {
         let mut hash =
             ozzy_journal::integrity::IntegrityHasher::new("ozzy canonical state snapshot v1");
@@ -519,7 +485,7 @@ fn checksum_valid_snapshots_reject_inconsistent_held_records() {
         damaged[56..88].copy_from_slice(hash.finish().as_bytes());
     };
     let cases: [(usize, &[u8], StateSnapshotError); 8] = [
-        // Held sequences must be issued.
+        // Held records need issued schedule sequences.
         (
             partition + 120,
             &1_u64.to_be_bytes(),
@@ -532,8 +498,13 @@ fn checksum_valid_snapshots_reject_inconsistent_held_records() {
             StateSnapshotError::InvalidPartition,
         ),
         (
-            partition + 140,
+            partition + 136,
             &2_u32.to_be_bytes(),
+            StateSnapshotError::UnsupportedFields,
+        ),
+        (
+            partition + 140,
+            &1_u32.to_be_bytes(),
             StateSnapshotError::UnsupportedFields,
         ),
         // A release key needs its flag.
@@ -542,31 +513,22 @@ fn checksum_valid_snapshots_reject_inconsistent_held_records() {
             &1_u64.to_be_bytes(),
             StateSnapshotError::InvalidPartition,
         ),
-        // Held records sort after the last release.
+        // A released key's time cannot pass the partition's.
         (
-            partition + 140,
-            &[
-                0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0x0b, 0xb8, 0, 0, 0, 0, 0, 0, 0, 1,
-            ],
+            partition + 136,
+            &[0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0x23, 0x28, 0, 0, 0, 0],
             StateSnapshotError::InvalidPartition,
         ),
-        // A held record names an operation.
+        // Held records have bytes, and bytes need records.
         (
-            first + 16,
+            partition + 168,
             &0_u64.to_be_bytes(),
             StateSnapshotError::InvalidPartition,
         ),
-        // Release order is strict.
         (
-            first,
-            &9_000_u64.to_be_bytes(),
-            StateSnapshotError::UnsortedOrDuplicate,
-        ),
-        // One schedule sequence per held record.
-        (
-            second + 8,
-            &1_u64.to_be_bytes(),
-            StateSnapshotError::UnsortedOrDuplicate,
+            partition + 160,
+            &0_u64.to_be_bytes(),
+            StateSnapshotError::InvalidPartition,
         ),
     ];
     for (field, bytes, error) in cases {

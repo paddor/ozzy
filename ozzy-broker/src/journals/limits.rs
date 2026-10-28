@@ -42,7 +42,7 @@ impl Settings {
             max_body_bytes: sizes.body,
         };
         let mut snapshot = CanonicalRecoveryLimits::default().snapshot;
-        snapshot.max_snapshot_bytes = core_checkpoint_bytes(placement).map_err(error)?;
+        snapshot.max_snapshot_bytes = core_checkpoint_bytes().map_err(error)?;
         let checkpoint =
             checkpoint_limits(placement, sizes).map_err(|failure| error(&failure.to_string()))?;
         let index = IndexBuildLimits {
@@ -376,28 +376,18 @@ fn check_write(
     Ok(())
 }
 
-/// Core image bound: fixed metadata room, every retry span the canonical
-/// limit allows, and the most held scheduled records any `max_entries`
-/// allows. Lowering the limit on restart then still reads existing
-/// checkpoints; it only gates new schedules.
-fn core_checkpoint_bytes(placement: &PartitionPlacement) -> Result<usize, &'static str> {
-    let spans = ozzy_runtime::replica_journal::retry_span_snapshot_bytes();
-    placement
-        .delay
-        .map_or(Some(0), |_| {
-            usize::try_from(ozzy_config::MAX_DELAY_ENTRIES)
-                .ok()
-                .and_then(|max_entries| DelayLimits::new(max_entries).snapshot_bytes())
-        })
-        .and_then(|held| held.checked_add(spans?))
-        .and_then(|held| held.checked_add(CORE_CHECKPOINT_BYTES))
-        .ok_or("retry spans and held scheduled records overflow the core checkpoint bound")
+/// Core image bound: fixed metadata room and every retry span the canonical
+/// limit allows. Held scheduled records stay in segment indexes.
+fn core_checkpoint_bytes() -> Result<usize, &'static str> {
+    ozzy_runtime::replica_journal::retry_span_snapshot_bytes()
+        .and_then(|spans| spans.checked_add(CORE_CHECKPOINT_BYTES))
+        .ok_or("retry spans overflow the core checkpoint bound")
 }
 
 fn delay_limits(placement: &PartitionPlacement) -> Option<DelayLimits> {
     placement
         .delay
-        .map(|delay| DelayLimits::new(usize::try_from(delay.max_entries).unwrap_or(usize::MAX)))
+        .map(|delay| DelayLimits::new(delay.max_entries))
 }
 
 fn checkpoint_limits(
@@ -405,7 +395,7 @@ fn checkpoint_limits(
     sizes: Sizes,
 ) -> Result<CheckpointLimits, ozzy_journal_segment::CheckpointError> {
     CheckpointLimits::for_canonical_image(
-        core_checkpoint_bytes(placement)
+        core_checkpoint_bytes()
             .map_err(|_| ozzy_journal_segment::CheckpointError::LengthOverflow)?,
         placement
             .deduplication
@@ -419,34 +409,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn checkpoint_bounds_cover_every_retry_span_and_ignore_the_held_record_limit() {
-        let placement = |delay| PartitionPlacement {
-            topic: "orders".into(),
-            partition: 0,
-            shard: 0,
-            device: "data".into(),
-            directory: "/data".into(),
-            retention: ozzy_config::TopicRetention::default(),
-            deduplication: None,
-            delay,
-            producer_idle_secs: 60,
-        };
-        let delay = |max_entries| {
-            core_checkpoint_bytes(&placement(Some(ozzy_config::TopicDelay {
-                max_secs: 60,
-                max_entries,
-            })))
-            .unwrap()
-        };
+    fn checkpoint_bound_covers_every_retry_span() {
         // Every retry span fits, so retirement never builds an image past the
         // bound.
         let spans = 1_048_576 * 40;
         assert_eq!(
-            core_checkpoint_bytes(&placement(None)).unwrap(),
+            core_checkpoint_bytes().unwrap(),
             CORE_CHECKPOINT_BYTES + spans
         );
-        assert_eq!(delay(8), CORE_CHECKPOINT_BYTES + spans + 1_048_576 * 48);
-        assert_eq!(delay(8), delay(ozzy_config::MAX_DELAY_ENTRIES));
     }
 
     #[test]

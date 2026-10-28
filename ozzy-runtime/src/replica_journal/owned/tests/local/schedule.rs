@@ -8,7 +8,7 @@ mod release;
 
 const NOW: u64 = 10_000;
 
-fn delayed(max_entries: usize) -> (Controller, OwnedJournal, Driver) {
+fn delayed(max_entries: u64) -> (Controller, OwnedJournal, Driver) {
     delayed_with(DelayLimits::new(max_entries))
 }
 
@@ -122,7 +122,7 @@ fn rejection(result: ProposalValidation) -> JournalError {
     reason
 }
 
-fn held(journal: &OwnedJournal) -> (usize, u64, Offset) {
+fn held(journal: &OwnedJournal) -> (u64, u64, Offset) {
     let state = journal
         .images()
         .unwrap()
@@ -130,7 +130,7 @@ fn held(journal: &OwnedJournal) -> (usize, u64, Offset) {
         .partition(partition())
         .unwrap();
     let delay = state.delay.as_ref().unwrap();
-    (delay.pending_len(), delay.next_schedule, state.next_offset)
+    (delay.held_records(), delay.next_schedule, state.next_offset)
 }
 
 #[test]

@@ -9,7 +9,8 @@
   until then. Their receipts carry a schedule sequence with disposition
   `Scheduled`; the leader releases them at the next offsets in due order,
   and readers see them from then on. `max_secs` is fixed at initialization;
-  `max_entries` (default 100000) bounds held records per partition.
+  `max_entries` (default 100000, at most 4294967296) bounds held records per
+  partition. Held records stay on disk until released.
 - APPEND tag 2 carries one due time per record. Brokers refuse it on a
   topic without delay or with an LZ4 payload (NACK 2), with a due time past
   the maximum delay (NACK 21), with more records than the held-record limit
