@@ -5,7 +5,8 @@ use crate::{
     segment_index_name,
 };
 use ozzy_journal::operation::{
-    Append, AppendBatch, AppendRecord, OperationBody, Schedule, encode_operation_body,
+    Append, AppendBatch, AppendRecord, Carry, HeldPosition, OperationBody, ReleaseKey, Schedule,
+    encode_operation_body,
 };
 use ozzy_proto::{
     MessageId, Offset, OperationId, OwnerEpoch, PartitionIncarnation, ProducerEpoch, ProducerId,
@@ -196,7 +197,7 @@ fn one_pass(image: &[u8], reference: SegmentReference, source: IndexSource) -> V
 
 /// Two scheduled records: the first due later for later schedules, the
 /// second already due.
-fn schedule_body(number: u8) -> Vec<u8> {
+pub(super) fn schedule_body(number: u8) -> Vec<u8> {
     encode_operation_body(
         &OperationBody::Schedule(Schedule {
             batch: AppendBatch {
@@ -224,6 +225,45 @@ fn schedule_body(number: u8) -> Vec<u8> {
     .unwrap()
 }
 
+/// The first record of the first and third schedules, copied forward at
+/// time 500. The first keeps a key equal to its original's.
+pub(super) fn carry_body() -> Vec<u8> {
+    let records = [(0_u8, 1_000, 0), (2, 980, 4)];
+    encode_operation_body(
+        &OperationBody::Carry(Carry {
+            batch: AppendBatch {
+                partition: partition(),
+                owner_epoch: OwnerEpoch::new(1),
+                producer_id: ProducerId::from_bytes([0; 16]),
+                producer_epoch: ProducerEpoch::new(0),
+                first_sequence: ProducerSequence::ZERO,
+                first_offset: Offset::ZERO,
+                append_timestamp_millis: 500,
+                records: records
+                    .iter()
+                    .map(|(number, _, _)| AppendRecord {
+                        encoding: ozzy_proto::data::Encoding::Raw,
+                        message_id: MessageId::from_bytes([0x50 + number * 2; 16]),
+                        parts: vec![b"payload".as_slice()].into(),
+                    })
+                    .collect::<Vec<_>>()
+                    .into(),
+            },
+            from: HeldPosition::default(),
+            through: HeldPosition {
+                operation: 4,
+                index: 0,
+            },
+            keys: records
+                .iter()
+                .map(|&(_, millis, schedule)| ReleaseKey { millis, schedule })
+                .collect(),
+        }),
+        OperationLimits::default(),
+    )
+    .unwrap()
+}
+
 #[tokio::test]
 async fn async_multi_pass_index_sorts_scheduled_records_by_release_key() {
     let root = tempfile::tempdir().unwrap();
@@ -243,7 +283,7 @@ async fn async_multi_pass_index_sorts_scheduled_records_by_release_key() {
     )
     .await
     .unwrap();
-    for number in 0..6 {
+    for number in 0..5 {
         let body = schedule_body(number);
         let op = CanonicalOperation {
             kind: OperationKind::Schedule,
@@ -252,9 +292,17 @@ async fn async_multi_pass_index_sorts_scheduled_records_by_release_key() {
         };
         journal.append(&[op], BodyEncoding::Raw).await.unwrap();
     }
+    let body = carry_body();
+    let op = CanonicalOperation {
+        kind: OperationKind::Carry,
+        body: &body,
+        ..operation(&journal)
+    };
+    journal.append(&[op], BodyEncoding::Raw).await.unwrap();
     append_confirmed(&mut journal).await;
     journal.roll_active(32768, 4).await.unwrap();
-    // The entry buffer holds a few rows, so they sort across many runs.
+    // The entry buffer holds a few rows, so they sort across many runs. A
+    // carried copy sorts after its original by position.
     let index = journal.build_sealed_index(1, build_limits()).await.unwrap();
     let rows: Vec<_> = index
         .view()
@@ -268,13 +316,14 @@ async fn async_multi_pass_index_sorts_scheduled_records_by_release_key() {
             )
         })
         .collect();
-    let mut expected: Vec<_> = (0..6_u64)
+    let mut expected: Vec<_> = (0..5_u64)
         .flat_map(|number| {
             [
                 (1_000 - number * 10, number * 2, number + 1, 0),
                 (100 + number, number * 2 + 1, number + 1, 1),
             ]
         })
+        .chain([(1_000, 0, 6, 0), (980, 4, 6, 1)])
         .collect();
     expected.sort_unstable();
     assert_eq!(rows, expected);

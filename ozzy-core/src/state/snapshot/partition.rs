@@ -17,7 +17,7 @@ use crate::state::{
     ProducerResultSource, ProducerResultSpan,
 };
 
-const PARTITION_BYTES: usize = 176;
+const PARTITION_BYTES: usize = 192;
 const PRODUCER_BYTES: usize = 80;
 const SPAN_BYTES: usize = super::RETRY_SPAN_SNAPSHOT_BYTES;
 
@@ -118,6 +118,8 @@ fn encode_delay(fixed: &mut [u8; PARTITION_BYTES], delay: &DelayState) {
     }
     fixed.put_u64::<160>(delay.held_records());
     fixed.put_u64::<168>(delay.held_bytes());
+    fixed.put_u64::<176>(delay.carried().operation);
+    fixed.put_u32::<184>(delay.carried().index);
 }
 
 /// Encode one producer and its retry spans at `cursor`; returns their end.
@@ -175,7 +177,11 @@ pub(super) async fn decode_partition(
     let remaining_producers = state.limits.max_producers - state.producer_count;
     let remaining_spans = state.limits.max_retry_spans - state.retry_span_count;
     let fixed: &[u8; PARTITION_BYTES] = layout::record(entries.rest(), 0)?;
-    if fixed.u32_at::<68>() != 0 || fixed.u32_at::<136>() > 1 || fixed.u32_at::<140>() != 0 {
+    if fixed.u32_at::<68>() != 0
+        || fixed.u32_at::<136>() > 1
+        || fixed.u32_at::<140>() != 0
+        || fixed.u32_at::<188>() != 0
+    {
         return Err(StateSnapshotError::UnsupportedFields);
     }
     let entry_bytes = fixed.u32_at::<0>() as usize;
@@ -234,7 +240,7 @@ fn decode_fields(
     producers: AHashMap<ProducerId, CanonicalProducer>,
 ) -> Result<CanonicalPartition, StateSnapshotError> {
     let delay = match std::num::NonZeroU64::new(fixed.u64_at::<112>()) {
-        None if fixed.array::<120, 56>() == [0; 56] => None,
+        None if fixed.array::<120, 72>() == [0; 72] => None,
         None => return Err(StateSnapshotError::InvalidPartition),
         Some(max_delay_millis) => {
             let mut delay = DelayState::new(max_delay_millis);
@@ -248,7 +254,16 @@ fn decode_fields(
                     schedule: fixed.u64_at::<152>(),
                 }),
             };
-            delay.restore(released, fixed.u64_at::<160>(), fixed.u64_at::<168>());
+            let carried = ozzy_journal::operation::HeldPosition {
+                operation: fixed.u64_at::<176>(),
+                index: fixed.u32_at::<184>(),
+            };
+            delay.restore(
+                released,
+                carried,
+                fixed.u64_at::<160>(),
+                fixed.u64_at::<168>(),
+            );
             Some(delay)
         }
     };
@@ -365,20 +380,23 @@ async fn validate_partition_cooperative(
         step(size_of::<(u64, u64)>()).await;
     }
     if let Some(delay) = &value.delay {
-        validate_delay(value, delay)?;
+        validate_delay(value, delay, revision)?;
     }
     step(PARTITION_BYTES + value.address.stream.len() + value.address.topic.len()).await;
     Ok(())
 }
 
-/// Held totals fit the issued schedule sequences, and a record always has
-/// encoded bytes. Delay excludes deduplication.
+/// Held totals fit the issued schedule sequences, a record always has
+/// encoded bytes, and the carry floor lies before the image's next
+/// operation. Delay excludes deduplication.
 fn validate_delay(
     partition: &CanonicalPartition,
     delay: &DelayState,
+    revision: u64,
 ) -> Result<(), StateSnapshotError> {
     let records = delay.held_records();
     if partition.dedup_window_millis.is_some()
+        || delay.carried().operation > revision
         || records > delay.next_schedule
         || (records == 0) != (delay.held_bytes() == 0)
         || delay.released().is_some_and(|released| {

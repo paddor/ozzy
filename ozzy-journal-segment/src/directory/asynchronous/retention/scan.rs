@@ -4,8 +4,8 @@
 use super::super::{DirectoryError, Journal, SegmentReference, groups::GroupScope};
 use crate::{CodecError, DecodedOperation, RetentionFloors};
 use ozzy_journal::operation::{
-    OperationKind, decode_append_summary_and_batches, decode_release_batch, decode_resolved_append,
-    decode_schedule_batch,
+    OperationKind, decode_append_summary_and_batches, decode_carry_batch, decode_release_batch,
+    decode_resolved_append, decode_schedule_batch,
 };
 use ozzy_proto::{Offset, PartitionIncarnation};
 
@@ -92,10 +92,15 @@ fn fold_retention(
         OperationKind::Release => {
             smallvec::smallvec![decode_release_batch(&operation.body, limits)?]
         }
-        // Held records are not stored, but their acceptance time ages the
-        // segment, so retries of the schedule resolve for the retention age.
-        OperationKind::Schedule => {
-            let batch = decode_schedule_batch(&operation.body, limits)?;
+        // Held records are not stored, but their acceptance or carry time
+        // ages the segment: retries of the schedule resolve for the
+        // retention age, and carried records stay until it passes.
+        OperationKind::Schedule | OperationKind::Carry => {
+            let batch = if operation.kind == OperationKind::Schedule {
+                decode_schedule_batch(&operation.body, limits)?
+            } else {
+                decode_carry_batch(&operation.body, limits)?
+            };
             if partition == Some(batch.summary.partition) {
                 result.segment.newest_append_millis = Some(
                     result

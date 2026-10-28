@@ -2,8 +2,8 @@
 
 mod append;
 pub use append::{
-    Append, AppendBatch, AppendBatchSummary, AppendRecord, AppendSummary, RecordPosition, Release,
-    ReleaseKey, ResolvedAppend, Schedule,
+    Append, AppendBatch, AppendBatchSummary, AppendRecord, AppendSummary, Carry, HeldPosition,
+    RecordPosition, Release, ReleaseKey, ResolvedAppend, Schedule,
 };
 
 use super::OperationCodecError;
@@ -70,6 +70,8 @@ pub enum OperationKind {
     Schedule = 15,
     /// Copy due scheduled records into the log in release order.
     Release = 16,
+    /// Copy held records forward so retention can retire their sources.
+    Carry = 17,
 }
 
 impl TryFrom<u16> for OperationKind {
@@ -93,6 +95,7 @@ impl TryFrom<u16> for OperationKind {
             14 => Ok(Self::RetireProducer),
             15 => Ok(Self::Schedule),
             16 => Ok(Self::Release),
+            17 => Ok(Self::Carry),
             other => Err(OperationCodecError::UnsupportedOperationKind(other)),
         }
     }
@@ -114,6 +117,7 @@ impl OperationKind {
                 | Self::RetireProducer
                 | Self::Schedule
                 | Self::Release
+                | Self::Carry
         )
     }
 }
@@ -416,6 +420,8 @@ pub enum OperationBody<'a> {
     Schedule(Schedule<'a>),
     /// Copy due scheduled records into the log in release order.
     Release(Release<'a>),
+    /// Copy held records forward so retention can retire their sources.
+    Carry(Carry<'a>),
 }
 
 impl OperationBody<'_> {
@@ -432,7 +438,8 @@ impl OperationBody<'_> {
             | Self::DedupWatermark(_)
             | Self::RetireProducer(_)
             | Self::Schedule(_)
-            | Self::Release(_) => None,
+            | Self::Release(_)
+            | Self::Carry(_) => None,
             Self::OpenProducer(value) => Some(value.operation_id),
             Self::Assign(value) => Some(value.operation_id),
             Self::Trim(value) => Some(value.operation_id),
@@ -463,6 +470,7 @@ impl OperationBody<'_> {
             Self::RetireProducer(_) => OperationKind::RetireProducer,
             Self::Schedule(_) => OperationKind::Schedule,
             Self::Release(_) => OperationKind::Release,
+            Self::Carry(_) => OperationKind::Carry,
         }
     }
 }

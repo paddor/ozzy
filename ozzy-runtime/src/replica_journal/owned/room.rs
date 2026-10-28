@@ -45,7 +45,8 @@ pub(super) const fn record_reserve(max_segments: u64) -> u64 {
 /// release writes records but ends the retention hold of their schedules,
 /// so it takes the control reserve alone. Every other request also leaves
 /// `held` free, the room to release every held record, so one can always
-/// leave.
+/// leave. A carry copies held records while their sources stay until
+/// retention, so it leaves that room too.
 const fn reserve(kind: OperationKind, records: u64, control: u64, held: u64) -> u64 {
     match kind {
         OperationKind::Trim
@@ -59,7 +60,8 @@ const fn reserve(kind: OperationKind, records: u64, control: u64, held: u64) -> 
         | OperationKind::OpenProducer
         | OperationKind::Progress
         | OperationKind::Assign
-        | OperationKind::GroupPlan => control.saturating_add(held),
+        | OperationKind::GroupPlan
+        | OperationKind::Carry => control.saturating_add(held),
         OperationKind::Append
         | OperationKind::ResolvedAppend
         | OperationKind::Schedule

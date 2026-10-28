@@ -15,7 +15,7 @@ mod groups;
 pub use groups::{CoordinatorGroup, group_targets};
 mod append;
 mod delay;
-pub use delay::{DelayState, PendingSchedule, schedule_entries};
+pub use delay::{DelayState, PendingSchedule, carry_entries, schedule_entries};
 mod identity;
 mod images;
 mod installation;
@@ -546,4 +546,8 @@ pub enum StateError {
     #[error("release does not match the held records")]
     /// A release is not exactly the held prefix through its key.
     ReleaseMismatch,
+    #[error("carry does not match the held records")]
+    /// A carry does not start at the carry floor or is not exactly the held
+    /// records before its end.
+    CarryMismatch,
 }

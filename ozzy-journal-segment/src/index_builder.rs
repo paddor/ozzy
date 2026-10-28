@@ -307,7 +307,7 @@ impl RunKind {
             Self::Message => 40,
             Self::Operation => 16,
             Self::Location => 8,
-            Self::Schedule => 32,
+            Self::Schedule => 44,
         }
     }
 
