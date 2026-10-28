@@ -481,7 +481,8 @@ Topics set `retention.max_age_secs` and `retention.max_bytes`; see
 [`ozzy-config`](../ozzy-config/README.md).
 
 - Retention removes whole sealed segments, oldest first. An aged active segment
-  rolls first.
+  rolls first. Held scheduled records are carried forward first; see
+  [scheduled records](#scheduled-records).
 - Age uses each segment's newest append time, so backward clocks cannot expire
   newer records early.
 - Byte targets count active and sealed capacities per partition per broker.

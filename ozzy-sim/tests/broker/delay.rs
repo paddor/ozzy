@@ -5,6 +5,8 @@ use ozzy_runtime::replicated::{
     TopicReaderConfig,
 };
 
+mod carry;
+
 /// Broker time at manual clock zero, in Unix milliseconds.
 const EPOCH_MILLIS: u64 = 1_000_000;
 
@@ -25,22 +27,27 @@ async fn delay_cluster(
     clock: &SdkClock,
     max_entries: u64,
 ) -> broker::Cluster {
-    held_cluster(mode, clock, max_entries, None).await
+    held_cluster(mode, clock, max_entries, None, None).await
 }
 
 /// A cluster whose delay partitions use the held-record bounds `(window,
-/// active)`, when given.
+/// active)` and the `retention` policy, when given.
 async fn held_cluster(
     mode: DeploymentMode,
     clock: &SdkClock,
     max_entries: u64,
     held: Option<(usize, usize)>,
+    retention: Option<ozzy_config::TopicRetention>,
 ) -> broker::Cluster {
     let configure = |config: &mut ozzy_config::Deployment| {
-        config.topics.get_mut("orders").unwrap().delay = Some(ozzy_config::TopicDelay {
+        let topic = config.topics.get_mut("orders").unwrap();
+        topic.delay = Some(ozzy_config::TopicDelay {
             max_secs: 60,
             max_entries,
         });
+        if let Some(retention) = retention {
+            topic.retention = retention;
+        }
     };
     let manual = Some(clock.clone());
     progress(clock, async {
@@ -305,28 +312,141 @@ async fn inproc_memory_full_schedule_capacity_backs_off_until_a_release() {
     .expect("full schedule capacity made no bounded progress");
 }
 
+/// A confirmed record. Its leader accepted it between `sent_at` and
+/// `confirmed_at`, broker time.
+struct Receipt {
+    id: u8,
+    due: Option<u64>,
+    sent_at: u64,
+    confirmed_at: u64,
+    disposition: AppendDisposition,
+    /// Offset when stored, schedule sequence when scheduled.
+    position: u64,
+}
+
+/// Send `records` to partition 0 and confirm them.
+async fn send(
+    clock: &SdkClock,
+    writer: &mut SharedTopicWriter,
+    records: impl IntoIterator<Item = (u8, Option<u64>, RecordInput)>,
+) -> Vec<Receipt> {
+    let sent_at = broker_now(clock);
+    let mut pending = Vec::new();
+    for (id, due, record) in records {
+        pending.push((id, due, writer.send_to_partition(record, 0).await.unwrap()));
+    }
+    let mut receipts = Vec::new();
+    for (id, due, confirmed) in pending {
+        let receipt = progress(clock, confirmed.confirmed()).await.unwrap();
+        receipts.push(Receipt {
+            id,
+            due,
+            sent_at,
+            confirmed_at: broker_now(clock),
+            disposition: receipt.record.disposition,
+            position: receipt.record.offset,
+        });
+    }
+    receipts
+}
+
+/// Read `count` records live from the start of partition 0: ID byte,
+/// offset, and broker time when each arrived. The test drives broker time,
+/// so each arrival follows its release closely.
+async fn arrivals(
+    clock: &SdkClock,
+    client: &Client,
+    count: usize,
+) -> tokio::task::JoinHandle<Vec<(u8, u64, u64)>> {
+    let mut reader = partition_reader(clock, client).await;
+    let clock = clock.clone();
+    tokio::spawn(async move {
+        let mut records = Vec::new();
+        while records.len() < count {
+            let record = reader.next().await.unwrap();
+            records.push((
+                record.message_id.as_bytes()[0],
+                record.offset.get(),
+                broker_now(&clock),
+            ));
+        }
+        reader.close().await.unwrap();
+        records
+    })
+}
+
+/// Every `sent` record left exactly once among `records`, at offsets from
+/// zero. A stored one kept its offset; a held one left in release order and
+/// not before its due time.
+fn check_releases(mode: DeploymentMode, sent: &[Receipt], records: &[(u8, u64, u64)]) {
+    assert!(
+        records
+            .iter()
+            .map(|&(_, offset, _)| offset)
+            .eq(0..sent.len() as u64),
+        "{mode:?}"
+    );
+    let offsets: BTreeMap<u8, (u64, u64)> = records
+        .iter()
+        .map(|&(id, offset, arrived)| (id, (offset, arrived)))
+        .collect();
+    assert_eq!(offsets.len(), sent.len(), "{mode:?}: a record left twice");
+    let mut held = Vec::new();
+    for receipt in sent {
+        let (offset, arrived) = *offsets
+            .get(&receipt.id)
+            .unwrap_or_else(|| panic!("{mode:?}: record {} was lost", receipt.id));
+        match (receipt.disposition, receipt.due) {
+            (AppendDisposition::Stored, None) => {
+                assert_eq!(receipt.position, offset, "{mode:?}: record {}", receipt.id);
+            }
+            (AppendDisposition::Scheduled, Some(due)) => held.push((
+                offset,
+                receipt.position,
+                due.max(receipt.sent_at),
+                due.max(receipt.confirmed_at),
+                due,
+                arrived,
+            )),
+            other => panic!("{mode:?}: record {}: {other:?}", receipt.id),
+        }
+    }
+    // A record arrives after its release.
+    for &(offset, _, _, _, due, arrived) in &held {
+        assert!(
+            arrived >= due,
+            "{mode:?}: offset {offset} due at {due} arrived at {arrived}"
+        );
+    }
+    // Each record releases at key (max(due, acceptance), schedule sequence).
+    // Acceptance lies within the send-to-receipt window, so the key lies
+    // within [early, late]; one released before another must not have a key
+    // that is surely larger.
+    let sequences: std::collections::BTreeSet<_> =
+        held.iter().map(|&(_, sequence, ..)| sequence).collect();
+    assert_eq!(sequences.len(), held.len(), "{mode:?}: schedule sequences");
+    for first in &held {
+        for later in held.iter().filter(|later| later.0 > first.0) {
+            let (_, sequence, early, ..) = *first;
+            let (_, later_sequence, _, late, ..) = *later;
+            assert!(
+                late > early || (late == early && later_sequence > sequence),
+                "{mode:?}: released out of order: {first:?} before {later:?}"
+            );
+        }
+    }
+}
+
 mod stress {
     use super::*;
 
     const ROUNDS: u8 = 12;
 
-    /// A confirmed record. Its leader accepted it between `sent_at` and
-    /// `confirmed_at`, broker time.
-    struct Receipt {
-        id: u8,
-        due: Option<u64>,
-        sent_at: u64,
-        confirmed_at: u64,
-        disposition: AppendDisposition,
-        /// Offset when stored, schedule sequence when scheduled.
-        position: u64,
-    }
-
     #[tokio::test(flavor = "current_thread")]
     async fn inproc_memory_held_records_release_once_in_order_across_repeated_faults() {
         tokio::time::timeout(Duration::from_secs(120), async {
             for mode in [DeploymentMode::Single, DeploymentMode::Three] {
-                faulted_releases(mode, 10, None).await;
+                faulted_releases(mode, 10, None, None).await;
             }
         })
         .await
@@ -340,11 +460,28 @@ mod stress {
     async fn inproc_memory_held_records_past_small_memory_bounds_release_once_in_order() {
         tokio::time::timeout(Duration::from_secs(180), async {
             for mode in [DeploymentMode::Single, DeploymentMode::Three] {
-                faulted_releases(mode, 20, Some((4, 8))).await;
+                faulted_releases(mode, 20, Some((4, 8)), None).await;
             }
         })
         .await
         .expect("held records past small memory bounds made no bounded progress");
+    }
+
+    /// Retention ages segments out after two seconds, so copies carry most
+    /// held records forward across the faults, and retire old segments.
+    #[tokio::test(flavor = "current_thread")]
+    async fn inproc_memory_held_records_carried_past_retention_release_once_in_order() {
+        tokio::time::timeout(Duration::from_secs(180), async {
+            for mode in [DeploymentMode::Single, DeploymentMode::Three] {
+                let retention = ozzy_config::TopicRetention {
+                    max_age_secs: Some(2),
+                    max_bytes: None,
+                };
+                faulted_releases(mode, 20, Some((4, 8)), Some(retention)).await;
+            }
+        })
+        .await
+        .expect("carried held records made no bounded progress across repeated faults");
     }
 
     /// Send rounds of `per_round` records with spread due times and fault
@@ -354,34 +491,22 @@ mod stress {
     /// installs it after, and later restarts empty and installs the whole
     /// history. Then every record must have left exactly once, in release
     /// order, and none before its due time.
-    async fn faulted_releases(mode: DeploymentMode, per_round: u8, bounds: Option<(usize, usize)>) {
+    async fn faulted_releases(
+        mode: DeploymentMode,
+        per_round: u8,
+        bounds: Option<(usize, usize)>,
+        retention: Option<ozzy_config::TopicRetention>,
+    ) {
         let clock = SdkClock::manual();
-        let mut cluster = held_cluster(mode, &clock, 64, bounds).await;
+        let mut cluster = held_cluster(mode, &clock, 64, bounds, retention).await;
         let client = progress(
             &clock,
             Client::open_with_clock(&cluster.configs[0].0, &cluster.runtime, clock.clone()),
         )
         .await;
         let mut writer = writer(&clock, &client).await;
-        // Read live, so each record's arrival time follows its release
-        // closely. The test drives broker time.
-        let mut reader = partition_reader(&clock, &client).await;
-        let arrivals = tokio::spawn({
-            let clock = clock.clone();
-            async move {
-                let mut records = Vec::new();
-                while records.len() < usize::from(ROUNDS) * usize::from(per_round) {
-                    let record = reader.next().await.unwrap();
-                    records.push((
-                        record.message_id.as_bytes()[0],
-                        record.offset.get(),
-                        broker_now(&clock),
-                    ));
-                }
-                reader.close().await.unwrap();
-                records
-            }
-        });
+        let count = usize::from(ROUNDS) * usize::from(per_round);
+        let arrivals = arrivals(&clock, &client, count).await;
         let mut sent = Vec::new();
         for round in 0..ROUNDS {
             // (hold writes, crash the primary, power loss, broker millis to
@@ -459,62 +584,7 @@ mod stress {
             [(AppendDisposition::Stored, sent.len() as u64)],
             "{mode:?}"
         );
-        assert!(
-            records
-                .iter()
-                .map(|&(_, offset, _)| offset)
-                .eq(0..sent.len() as u64),
-            "{mode:?}"
-        );
-        let offsets: BTreeMap<u8, (u64, u64)> = records
-            .iter()
-            .map(|&(id, offset, arrived)| (id, (offset, arrived)))
-            .collect();
-        assert_eq!(offsets.len(), sent.len(), "{mode:?}: a record left twice");
-        let mut held = Vec::new();
-        for receipt in &sent {
-            let (offset, arrived) = *offsets
-                .get(&receipt.id)
-                .unwrap_or_else(|| panic!("{mode:?}: record {} was lost", receipt.id));
-            match (receipt.disposition, receipt.due) {
-                (AppendDisposition::Stored, None) => {
-                    assert_eq!(receipt.position, offset, "{mode:?}: record {}", receipt.id);
-                }
-                (AppendDisposition::Scheduled, Some(due)) => held.push((
-                    offset,
-                    receipt.position,
-                    due.max(receipt.sent_at),
-                    due.max(receipt.confirmed_at),
-                    due,
-                    arrived,
-                )),
-                other => panic!("{mode:?}: record {}: {other:?}", receipt.id),
-            }
-        }
-        // A record arrives after its release.
-        for &(offset, _, _, _, due, arrived) in &held {
-            assert!(
-                arrived >= due,
-                "{mode:?}: offset {offset} due at {due} arrived at {arrived}"
-            );
-        }
-        // Each record releases at key (max(due, acceptance), schedule
-        // sequence). Acceptance lies within the send-to-receipt window, so
-        // the key lies within [early, late]; one released before another
-        // must not have a key that is surely larger.
-        let sequences: std::collections::BTreeSet<_> =
-            held.iter().map(|&(_, sequence, ..)| sequence).collect();
-        assert_eq!(sequences.len(), held.len(), "{mode:?}: schedule sequences");
-        for first in &held {
-            for later in held.iter().filter(|later| later.0 > first.0) {
-                let (_, sequence, early, ..) = *first;
-                let (_, later_sequence, _, late, ..) = *later;
-                assert!(
-                    late > early || (late == early && later_sequence > sequence),
-                    "{mode:?}: released out of order: {first:?} before {later:?}"
-                );
-            }
-        }
+        check_releases(mode, &sent, &records);
         drop(writer);
         progress(&clock, client.close()).await;
         progress(&clock, cluster.shutdown()).await;

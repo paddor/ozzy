@@ -46,8 +46,8 @@ fn delay_is_opt_in_with_a_fixed_maximum_and_a_default_held_record_limit() {
 }
 
 #[test]
-fn delay_rejects_zero_overflow_deduplication_and_a_delay_past_retention() {
-    for case in 0..6 {
+fn delay_rejects_zero_overflow_and_deduplication_but_not_a_delay_past_retention() {
+    for case in 0..5 {
         let mut deployment = enabled();
         let topic = deployment.topics.get_mut("orders").unwrap();
         let delay = topic.delay.as_mut().unwrap();
@@ -56,7 +56,6 @@ fn delay_rejects_zero_overflow_deduplication_and_a_delay_past_retention() {
             1 => delay.max_secs = u64::MAX,
             2 => delay.max_entries = 0,
             3 => delay.max_entries = ozzy_config::MAX_DELAY_ENTRIES + 1,
-            4 => topic.retention.max_age_secs = Some(3599),
             _ => {
                 topic.deduplication = Some(ozzy_config::TopicDeduplication {
                     window_millis: 1000,
@@ -73,7 +72,8 @@ fn delay_rejects_zero_overflow_deduplication_and_a_delay_past_retention() {
         .get_mut("orders")
         .unwrap()
         .retention
-        .max_age_secs = Some(3600);
+        .max_age_secs = Some(60);
+    // Retention carries held records forward.
     assert!(deployment.validate().is_ok());
 }
 

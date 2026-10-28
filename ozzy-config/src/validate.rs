@@ -282,14 +282,6 @@ fn validate_delay(
         "maximum delay must be positive and fit milliseconds",
     )?;
     require(
-        topic
-            .retention
-            .max_age_secs
-            .is_none_or(|age| delay.max_secs <= age),
-        &format!("{path}.max_secs"),
-        "maximum delay must not exceed retention.max_age_secs",
-    )?;
-    require(
         delay.max_entries > 0 && delay.max_entries <= MAX_DELAY_ENTRIES,
         &format!("{path}.max_entries"),
         "held record limit must be positive and at most 4294967296",

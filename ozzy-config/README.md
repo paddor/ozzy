@@ -161,10 +161,13 @@ max_entries = 100000
   segment in memory, and rolls the segment early past that. The limit may
   change on restart; a partition holding more than the new limit takes no
   new schedules until releases drain it.
-- With `retention.max_age_secs` set, `max_secs` must not exceed it.
-  Retention keeps the segment of the oldest held record, so a long delay
-  can keep old segments, and a partition at its segment limit refuses new
-  records until the held record is released.
+- `max_secs` may exceed `retention.max_age_secs`. Before retention retires a
+  segment that holds records, the leader copies them forward, so each held
+  record is rewritten about once per `max_age_secs`. A delay of ten times
+  the retention age writes a record about ten times.
+- Byte retention copies only from a segment that held records fill at most
+  half. A segment fuller than that stays until releases thin it, and a
+  partition at its segment limit refuses new records until then.
 - Each held record keeps room to release it: its size plus up to about 4.5
   KiB of framing. A partition near its segment limit refuses new records and
   control requests first, so releases always fit.
