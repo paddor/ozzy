@@ -20,6 +20,9 @@
 - Python SDK: `Producer.send(..., due_millis=)` schedules a record, in the
   blocking and asyncio APIs. Its receipt has disposition `"scheduled"`, and
   its `offset` is the schedule sequence.
+- Java SDK: `SendOptions.withDueMillis(long)` schedules a record. Its receipt
+  has disposition `Receipt.Disposition.SCHEDULED`, and its `offset()` is the
+  schedule sequence.
 
 ### Changed
 

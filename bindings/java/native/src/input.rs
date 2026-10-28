@@ -175,8 +175,19 @@ fn reader(opts: &[i64]) -> Result<(ReaderStart, Option<Vec<u32>>), String> {
     Ok((start, partitions))
 }
 
+/// Hold `record` until `due`, an absolute Unix time in milliseconds; a
+/// negative one means none.
+pub(crate) fn due(record: RecordInput, due: i64) -> RecordInput {
+    match u64::try_from(due) {
+        Ok(due) => record.with_due_millis(due),
+        Err(_) => record,
+    }
+}
+
 fn send(env: &mut JNIEnv<'_>, input: &Inputs<'_>, opts: &[i64]) -> Result<Request, String> {
-    let route = *opts.first().ok_or("missing route")?;
+    let [route, held] = *opts else {
+        return Err("missing route or due time".into());
+    };
     let ids = longs(env, &input.id)?;
     let id = match ids.as_slice() {
         [] => MessageId::new(),
@@ -198,7 +209,7 @@ fn send(env: &mut JNIEnv<'_>, input: &Inputs<'_>, opts: &[i64]) -> Result<Reques
         ));
         env.delete_local_ref(part).map_err(text)?;
     }
-    let record = RecordInput::multipart(id, parts);
+    let record = due(RecordInput::multipart(id, parts), held);
     let key = if route == -2 {
         Some(env.convert_byte_array(&input.key).map_err(text)?)
     } else {

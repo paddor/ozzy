@@ -321,13 +321,14 @@ unsafe extern "C" fn try_send(
     hi: u64,
     lo: u64,
     generate: i32,
+    due: i64,
     output: *mut [u64; 16],
 ) -> i32 {
     fast(output, || {
         // SAFETY: Both input segments are pinned for this critical downcall.
         let (body, key) = unsafe { (slice(body, len), slice(key, key_len)) };
         let record = RecordInput::copy_from_slice(message_id(hi, lo, generate)?, body);
-        admit(pointer, record, key, route, output)
+        admit(pointer, input::due(record, due), key, route, output)
     })
 }
 /// Multipart admission from one packed body and its part lengths.
@@ -343,6 +344,7 @@ unsafe extern "C" fn try_send_parts(
     hi: u64,
     lo: u64,
     generate: i32,
+    due: i64,
     output: *mut [u64; 16],
 ) -> i32 {
     fast(output, || {
@@ -375,7 +377,7 @@ unsafe extern "C" fn try_send_parts(
         }
         drop(packed);
         let record = RecordInput::multipart(message_id(hi, lo, generate)?, parts);
-        admit(pointer, record, key, route, output)
+        admit(pointer, input::due(record, due), key, route, output)
     })
 }
 /// Drop Java's observer counts. Zero entries are skipped.

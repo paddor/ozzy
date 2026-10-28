@@ -21,7 +21,7 @@ final class Fast {
                     MemorySegment.ofAddress(ADDRESSES[0]),
                     FunctionDescriptor.of(
                             JAVA_INT, JAVA_LONG, ADDRESS, JAVA_LONG, ADDRESS, JAVA_LONG, JAVA_INT,
-                            JAVA_LONG, JAVA_LONG, JAVA_INT, ADDRESS),
+                            JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG, ADDRESS),
                     CRITICAL);
     // Reads may decode a whole frame, so they let the JVM reach safepoints.
     private static final MethodHandle NEXT =
@@ -38,7 +38,8 @@ final class Fast {
                     MemorySegment.ofAddress(ADDRESSES[3]),
                     FunctionDescriptor.of(
                             JAVA_INT, JAVA_LONG, ADDRESS, JAVA_LONG, ADDRESS, JAVA_LONG, ADDRESS,
-                            JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT, ADDRESS),
+                            JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG,
+                            ADDRESS),
                     CRITICAL);
     private static final MethodHandle RELEASE_PENDING =
             LINKER.downcallHandle(
@@ -62,6 +63,7 @@ final class Fast {
                                     high(options),
                                     low(options),
                                     options.id == null ? 1 : 0,
+                                    options.due,
                                     owner.scratch);
             return admitted(owner, status);
         } catch (RuntimeException | Error error) {
@@ -100,6 +102,7 @@ final class Fast {
                                     high(options),
                                     low(options),
                                     options.id == null ? 1 : 0,
+                                    options.due,
                                     owner.scratch);
             return admitted(owner, status);
         } catch (RuntimeException | Error error) {

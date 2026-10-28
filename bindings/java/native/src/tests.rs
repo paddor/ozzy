@@ -82,12 +82,16 @@ fn scenario(mode: DeploymentMode, codec: &str, asynchronous: bool, case: &str) {
         .build()
         .unwrap();
     let cluster = runtime.block_on(Cluster::configured(mode, None, |d| {
-        d.topics.get_mut("orders").unwrap().deduplication =
-            (case == "identities").then_some(ozzy_config::TopicDeduplication {
-                window_millis: 300_000,
-                max_entries: 128,
-                max_bytes: 4 * 1024 * 1024,
-            });
+        let topic = d.topics.get_mut("orders").unwrap();
+        topic.deduplication = (case == "identities").then_some(ozzy_config::TopicDeduplication {
+            window_millis: 300_000,
+            max_entries: 128,
+            max_bytes: 4 * 1024 * 1024,
+        });
+        topic.delay = (case == "delay").then_some(ozzy_config::TopicDelay {
+            max_secs: 60,
+            max_entries: 64,
+        });
     }));
     *FIXTURE.lock().unwrap() = Some((cluster.runtime.context().clone(), cluster.controls.clone()));
     let vm = JVM.get_or_init(|| {
@@ -167,10 +171,10 @@ macro_rules! cases {
 }
 macro_rules! matrix {
     ($mode:expr) => {
-        mod blocking_raw { use super::*; cases!($mode, "raw", false; roundtrip, payloads, routing, checkpoints, identities, validation, lifetimes, mixed); }
-        mod blocking_lz4 { use super::*; cases!($mode, "lz4", false; roundtrip, payloads, routing, checkpoints, identities, validation, lifetimes, mixed); }
-        mod async_raw { use super::*; cases!($mode, "raw", true; roundtrip, payloads, routing, checkpoints, identities, validation, lifetimes, mixed, cancellation, pressure, observers, callbacks, cancel_race, completion_race, close_cancel, concurrency); }
-        mod async_lz4 { use super::*; cases!($mode, "lz4", true; roundtrip, payloads, routing, checkpoints, identities, validation, lifetimes, mixed, cancellation, pressure, observers, callbacks, cancel_race, completion_race, close_cancel, concurrency); }
+        mod blocking_raw { use super::*; cases!($mode, "raw", false; roundtrip, payloads, routing, checkpoints, identities, validation, lifetimes, mixed, delay); }
+        mod blocking_lz4 { use super::*; cases!($mode, "lz4", false; roundtrip, payloads, routing, checkpoints, identities, validation, lifetimes, mixed, delay); }
+        mod async_raw { use super::*; cases!($mode, "raw", true; roundtrip, payloads, routing, checkpoints, identities, validation, lifetimes, mixed, delay, cancellation, pressure, observers, callbacks, cancel_race, completion_race, close_cancel, concurrency); }
+        mod async_lz4 { use super::*; cases!($mode, "lz4", true; roundtrip, payloads, routing, checkpoints, identities, validation, lifetimes, mixed, delay, cancellation, pressure, observers, callbacks, cancel_race, completion_race, close_cancel, concurrency); }
     };
 }
 mod single {

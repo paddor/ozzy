@@ -111,7 +111,7 @@ var receipt = producer.sendAsync("order-42".getBytes(), SendOptions.partition(0)
 | `BrokerAddress(nodeId, peer, dataPeer)` | Broker UUID and its two endpoints |
 | `Client` | `connect(config)`, `producer(topic)`, `consumer(topic, ReaderOptions)`, `close()` |
 | `Producer` | `send(body, SendOptions)` returns `PendingRecord`; `flush()`; `identity()` |
-| `SendOptions` | `AUTOMATIC`, `key(bytes)`, `partition(n)`, `withId(uuid)` |
+| `SendOptions` | `AUTOMATIC`, `key(bytes)`, `partition(n)`, `withId(uuid)`, `withDueMillis(ms)` |
 | `PendingRecord` | `confirmed()` returns `Receipt`; `tryConfirmed()` |
 | `Receipt` | `partition()`, `offset()`, `messageId()`, `disposition()`, `policy()` |
 | `Consumer` | `next()`, iteration, `tryNext()`, `checkpoint()`, `stats()` |
@@ -128,6 +128,10 @@ public API has Javadoc.
   durability: the local disk in single-broker mode, two of three copies in disk
   quorum. Keep many records in flight; confirm or `flush()` later.
 - A key always routes to the same partition. Order holds per partition.
+- On a topic with delay, `withDueMillis(ms)` (absolute Unix milliseconds)
+  holds a record until then. Its receipt reports `Disposition.SCHEDULED`, and
+  its `offset()` is the schedule sequence; readers see the record at a new
+  offset once it is due. A due time past the topic's maximum delay fails.
 - Save `producer.identity()` and resume with `client.producer(topic, identity,
   false)` after a restart. `true` fences an old process still using it.
 - Persist a checkpoint only after processing succeeds, then reopen with
