@@ -454,3 +454,96 @@ fn local_actor_releases_held_records_at_their_due_times() {
     });
     super::actor::close(&mut controller, actor);
 }
+
+/// Pump the actor and run its storage jobs, except segment writes, until
+/// `done`. Accepted operations then stay pending in the pipeline.
+fn run_holding_writes(
+    controller: &mut Controller,
+    actor: &mut crate::replica_actor::LocalActor,
+    mut done: impl FnMut(&mut crate::replica_actor::LocalActor) -> bool,
+) {
+    for _ in 0..10000 {
+        super::actor::pump(actor);
+        for (id, _) in controller.jobs() {
+            let operation = controller.operation(id).unwrap().unprotected();
+            if !matches!(operation, Operation::Write { .. }) {
+                controller.execute(id, Effect::Normal).unwrap();
+                controller.deliver(id).unwrap();
+            }
+        }
+        if done(actor) {
+            return;
+        }
+    }
+    panic!("actor did not progress");
+}
+
+#[test]
+fn local_actor_holds_a_due_release_until_the_pipeline_has_room() {
+    let clock = std::rc::Rc::new(std::cell::Cell::new(NOW));
+    let (mut controller, io) = setup();
+    let mut actor = super::actor::actor_with_options(
+        &mut controller,
+        io,
+        1,
+        &[12, 30],
+        partition(),
+        PartitionId::ZERO,
+        super::actor::ActorOptions {
+            delay: Some(DelayLimits::new(16)),
+            clock: Some(clock.clone()),
+            proposals: Some(16),
+            ..Default::default()
+        },
+    );
+    let mut lane = actor.take_submitter().unwrap();
+    let mut buffer = actor.lease_proposal_buffer().unwrap();
+    buffer.prepare_append(request(12, 0, 1)).unwrap();
+    buffer.schedule(&[NOW + 10]).unwrap();
+    let mut held = Box::pin(lane.try_submit(buffer).unwrap());
+    run_until(&mut controller, &mut actor, |_| {
+        poll(held.as_mut()).is_ready()
+    });
+    // Stored records fill the pipeline while their writes wait.
+    let room = actor.snapshot().pending_operations + pipeline().max_operations;
+    let mut stored = Vec::new();
+    run_holding_writes(&mut controller, &mut actor, |actor| {
+        let full = actor.snapshot().pending_operations == room;
+        if !full && let Ok(mut buffer) = actor.lease_proposal_buffer() {
+            buffer
+                .prepare_append(request(30, stored.len() as u64, 1))
+                .unwrap();
+            if let Ok(pending) = lane.try_submit(buffer) {
+                stored.push(Box::pin(pending));
+            }
+        }
+        full
+    });
+    // The release comes due on a full pipeline. It waits instead of
+    // failing the actor.
+    clock.set(NOW + 10);
+    let offset = |actor: &crate::replica_actor::LocalActor| {
+        actor.facts(partition()).map(|facts| facts.next_offset)
+    };
+    let before = offset(&actor);
+    let mut rounds = 0;
+    run_holding_writes(&mut controller, &mut actor, |_| {
+        rounds += 1;
+        rounds == 100
+    });
+    assert_eq!(offset(&actor), before);
+    let total = stored.len() as u64 + 1;
+    run_until(&mut controller, &mut actor, |actor| {
+        offset(actor) == Some(Offset::new(total))
+    });
+    for mut pending in stored {
+        let Poll::Ready(reply) = poll(pending.as_mut()) else {
+            panic!("a stored record stayed unconfirmed");
+        };
+        assert!(matches!(
+            reply.unwrap().outcome,
+            crate::replica_actor::ProposalOutcome::Committed { .. }
+        ));
+    }
+    super::actor::close(&mut controller, actor);
+}

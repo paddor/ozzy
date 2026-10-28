@@ -9,6 +9,8 @@ pub(super) struct ActorOptions<'a> {
     pub delay: Option<crate::replica_journal::DelayLimits>,
     /// Journal clock in Unix milliseconds; 777 when absent.
     pub clock: Option<std::rc::Rc<std::cell::Cell<u64>>>,
+    /// Outstanding proposals across lanes; 4 when absent.
+    pub proposals: Option<usize>,
 }
 
 pub(super) fn actor(controller: &mut Controller, io: Local, id: u8) -> LocalActor {
@@ -91,7 +93,7 @@ pub(super) fn actor_with_options(
         driver,
         LocalActorConfig {
             proposal_lanes: 3,
-            proposal_capacity: 4,
+            proposal_capacity: options.proposals.unwrap_or(4),
             turn_steps: 4,
             journal: crate::replica_journal::ShardJournalConfig {
                 turn_steps: 4,
