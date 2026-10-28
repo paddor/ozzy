@@ -70,6 +70,9 @@ pub(super) struct Held {
     target: Option<ozzy_core::retention::Carry>,
     /// The last delay step carried, so the next one releases first.
     carried_last: bool,
+    /// The index snapshot of the last release that read storage, which
+    /// later releases reuse while it holds their sources.
+    pub(super) index: Option<JournalIndexSnapshot>,
 }
 
 /// One bounded read of the sealed rows after the loaded ones.
@@ -110,6 +113,7 @@ impl Held {
             segments: Vec::new(),
             target: None,
             carried_last: false,
+            index: None,
         }
     }
 

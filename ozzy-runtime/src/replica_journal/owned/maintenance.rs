@@ -192,6 +192,10 @@ impl OwnedJournal {
             return Err(HistoryError::Capacity.into());
         }
         self.journal.ready()?;
+        // A cached release index pins segments this cleanup may free.
+        if let Some(held) = self.held.as_mut() {
+            held.index = None;
+        }
         self.faulted = true;
         let journal = self.journal.ready_mut()?;
         let (mut pinned_segment_ids, mut pinned_checkpoint_ids) = (Vec::new(), Vec::new());

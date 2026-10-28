@@ -169,10 +169,9 @@ impl OwnedJournal {
             return Ok(ReleaseStep::Idle);
         };
         let (hot, cold) = self.sources(&entries);
-        let stored = if cold.is_empty() {
-            None
-        } else {
-            Some(self.journal.retry_snapshot(self.recovery.index).await?)
+        let stored = match cold.last() {
+            Some(&last) => Some(self.release_index(last).await?),
+            None => None,
         };
         Ok(ReleaseStep::Read(ReleaseRead {
             key: self.read_key.clone(),
@@ -187,6 +186,25 @@ impl OwnedJournal {
                 limits,
             })),
         }))
+    }
+
+    /// An index snapshot holding operations through `last`. Building one
+    /// holds the owner while it opens indexes and scans the active segment.
+    /// Due records were scheduled about a delay ago, so one snapshot serves
+    /// the releases of about that long. It pins its segments until a later
+    /// build or storage cleanup drops it.
+    async fn release_index(&mut self, last: u64) -> Result<JournalIndexSnapshot, JournalError> {
+        let held = self.held.as_ref().ok_or(JournalError::AppendMismatch)?;
+        if let Some(index) = &held.index
+            && index.through().op_number >= last
+        {
+            return Ok(index.clone());
+        }
+        let index = self.journal.retry_snapshot(self.recovery.index).await?;
+        if let Some(held) = self.held.as_mut() {
+            held.index = Some(index.clone());
+        }
+        Ok(index)
     }
 
     /// Kinds and bodies of the entries' `Schedule` or `Carry` operations
