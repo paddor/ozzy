@@ -48,6 +48,7 @@ impl CanonicalState {
             OperationBody::RetireProducer(value) => self.prepare_retire_producer(*value)?,
             OperationBody::Schedule(value) => self.prepare_schedule(op_number, value)?,
             OperationBody::Release(value) => self.prepare_release(value)?,
+            OperationBody::Carry(value) => self.prepare_carry(op_number, value)?,
             OperationBody::GroupPlan(value) => {
                 self.prepare_group_plan(value, op_number, identities)?
             }

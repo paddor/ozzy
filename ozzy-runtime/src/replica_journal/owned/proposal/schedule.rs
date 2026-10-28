@@ -1,6 +1,6 @@
 //! A fresh scheduled batch is checked against its partition's delay state,
 //! then becomes a `Schedule` at the next schedule sequences. A `Release`
-//! takes the partition's next offsets.
+//! takes the partition's next offsets; a `Carry` takes only a time.
 
 use super::super::{AppendBuffer, JournalError, OwnedJournal};
 use crate::replica_journal::{AppendAdmissionError, producer};
@@ -70,5 +70,24 @@ impl OwnedJournal {
             .ok_or(AppendAdmissionError::DelayDisabled)?;
         let time = now_millis.max(delay.time).max(through);
         buffer.place_release(state.next_offset.get(), time)
+    }
+
+    /// Stamp a broker-built `Carry`. Its time never goes below the latest
+    /// schedule, release, or carry.
+    pub(super) fn carry_proposal(
+        &self,
+        buffer: &mut AppendBuffer,
+        now_millis: u64,
+    ) -> Result<(), JournalError> {
+        let partition = buffer.carry_partition()?;
+        let delay = self
+            .images()?
+            .speculative()
+            .partition(partition)
+            .ok_or(AppendAdmissionError::UnknownPartition)?
+            .delay
+            .as_ref()
+            .ok_or(AppendAdmissionError::DelayDisabled)?;
+        buffer.place_carry(now_millis.max(delay.time))
     }
 }

@@ -17,6 +17,7 @@ framing, reconnects, fairness, and transport backpressure.
 | Authority | The fences a request or job must match: group, configuration, view, partition, owner |
 | Broker | One server process, named under `[brokers.NAME]`. Owns its journals, replication state, and confirmations |
 | Canonical operation | One validated history entry, with a partition-local operation number and digest |
+| Carry | Before retention retires a segment, the leader copies its held records forward with their release order, so they can wait past the retention age |
 | Committed | History that met the cluster mode's confirmation policy |
 | Confirmation | The broker's statement that records met the cluster mode's confirmation policy. The writer turns it into receipts |
 | Consumer checkpoint | Next offset per partition, saved by the application (`TopicCheckpoint`) |
@@ -119,6 +120,8 @@ flowchart LR
   the leader releases it at the next offset. Releases follow due time, then
   acceptance order; a due time already past releases at once. Cancel and
   deduplication are left to the application.
+- A held record may wait past the retention age: the leader carries it
+  forward before retention retires its segment.
 
 ### Reading
 

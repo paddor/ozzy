@@ -386,8 +386,9 @@ impl ReplicaJournal {
         })
     }
 
-    /// Pick due held records and build their `Release`. The `Schedule` reads
-    /// run beside writes; the proposal goes through ordinary validation.
+    /// Pick due held records and build their `Release`, or carry held
+    /// records forward toward the retention target. The source reads run
+    /// beside writes; the proposal goes through ordinary validation.
     pub fn release_turn(
         &mut self,
         ticket: ozzy_replication::driver::ValidationTicket,
@@ -398,7 +399,8 @@ impl ReplicaJournal {
     }
 
     /// Time until the earliest committed held record is due, by the journal
-    /// clock. `None` while nothing is held or the owner runs a command.
+    /// clock, or zero while a carry is pending. `None` while nothing is held
+    /// or the owner runs a command.
     pub(crate) fn release_wait(&self) -> Option<std::time::Duration> {
         self.execution
             .release_wait()

@@ -297,14 +297,20 @@ On the SDK:
 - A partition with held scheduled records also wakes when the earliest
   committed one is due, by the journal clock. Only the primary releases,
   one step at a time: the owner picks the due prefix from its held index, a
-  detached job reads its `Schedule` operations beside writes, and the
-  `Release` validates ahead of queued producer requests. One step fills at
-  most one proposal arena from at most 64 `Schedule` operations. When no
+  detached job reads its `Schedule` or `Carry` operations beside writes,
+  and the `Release` validates ahead of queued producer requests. One step
+  fills at most one proposal arena from at most 64 such operations. When no
   sealed held record is loaded but some remain, the step loads the next
   ones from the sealed indexes instead, and the next step starts at once. A
   due retention turn goes first. A step that builds nothing, or whose
   `Release` the core does not admit, waits 10 ms; one that validation
   refuses waits 100 ms.
+- The same step carries held records forward when a primary's retention
+  turn names a carry target. It wakes at once, reads the held rows from the
+  carry floor up to the target in position order beside writes, and builds
+  one `Carry` of at most one proposal arena and 64 source operations. The
+  `Carry` takes its timestamp at validation. When a release is due too,
+  steps alternate between carrying and releasing.
 
 ## Storage backends
 

@@ -62,6 +62,10 @@ pub(crate) fn compare_schedule_entries(
         .as_bytes()
         .cmp(right.partition.as_bytes())
         .then_with(|| left.key.cmp(&right.key))
+        .then_with(|| {
+            (left.record.operation, left.record.index)
+                .cmp(&(right.record.operation, right.record.index))
+        })
 }
 
 /// Order of a schedule row against a partition and release key.

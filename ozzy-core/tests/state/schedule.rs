@@ -1,6 +1,6 @@
 use super::*;
 use ozzy_core::state::{DelayState, StateSnapshotLimits};
-use ozzy_journal::operation::{Release, ReleaseKey, Schedule};
+use ozzy_journal::operation::{Carry, HeldPosition, Release, ReleaseKey, Schedule};
 use ozzy_proto::append::{AppendDisposition, AppendOutcome};
 
 const MAX_DELAY: u64 = 60_000;
@@ -81,6 +81,26 @@ fn release(
 
 const fn key(millis: u64, schedule: u64) -> ReleaseKey {
     ReleaseKey { millis, schedule }
+}
+
+const fn at(operation: u64, index: u32) -> HeldPosition {
+    HeldPosition { operation, index }
+}
+
+/// Records `(message, key)` copied at `time` from `from` up to `through`.
+fn carry(
+    time: u64,
+    from: HeldPosition,
+    through: HeldPosition,
+    records: &[(u8, ReleaseKey)],
+) -> OperationBody<'static> {
+    let messages: Vec<u8> = records.iter().map(|(message, _)| *message).collect();
+    OperationBody::Carry(Carry {
+        batch: release_batch(0, time, &messages),
+        from,
+        through,
+        keys: records.iter().map(|(_, key)| *key).collect(),
+    })
 }
 
 fn delayed_with(limits: StateLimits) -> CanonicalImages {
@@ -256,6 +276,132 @@ fn release_checks_the_cursor_and_held_totals() {
 }
 
 #[test]
+fn carry_moves_the_floor_and_keeps_held_totals() {
+    let mut images = delayed();
+    images
+        .admit(3, &schedule(0, 0, 1_000, &[(1, 5_000), (2, 3_000)]))
+        .unwrap();
+    images
+        .admit(4, &release(0, 3_000, key(3_000, 1), &[2]))
+        .unwrap();
+    let before = totals(&images);
+    images
+        .admit(5, &carry(3_500, at(0, 0), at(4, 0), &[(1, key(5_000, 0))]))
+        .unwrap();
+    assert_eq!(totals(&images), before);
+    let delay = held(&images);
+    assert_eq!((delay.carried(), delay.time), (at(4, 0), 3_500));
+    assert_eq!(
+        images
+            .speculative()
+            .partition(partition())
+            .unwrap()
+            .next_offset,
+        Offset::new(1)
+    );
+    // A range whose held records were all released carries nothing.
+    images
+        .admit(6, &carry(3_500, at(4, 0), at(5, 0), &[]))
+        .unwrap();
+    assert_eq!(held(&images).carried(), at(5, 0));
+    let OperationBody::Carry(body) = carry(3_500, at(0, 0), at(4, 0), &[(1, key(5_000, 0))]) else {
+        unreachable!()
+    };
+    let entries = ozzy_core::state::carry_entries(5, &body).unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .map(|(key, value)| (*key, value.operation, value.index, value.bytes))
+            .collect::<Vec<_>>(),
+        [(key(5_000, 0), 5, 0, 28)]
+    );
+}
+
+/// Core checks the floor, time, keys, and held totals; each copy's held
+/// index checks the records themselves.
+#[test]
+fn carry_checks_the_floor_time_keys_and_held_totals() {
+    let mut images = delayed();
+    images
+        .admit(3, &schedule(0, 0, 1_000, &[(1, 5_000), (2, 3_000)]))
+        .unwrap();
+    images
+        .admit(4, &release(0, 3_000, key(3_000, 1), &[2]))
+        .unwrap();
+    let before = images.clone();
+    let OperationBody::Carry(mut named) = carry(3_000, at(0, 0), at(4, 0), &[]) else {
+        unreachable!()
+    };
+    named.batch.producer_id = producer();
+    let OperationBody::Carry(mut placed) = carry(3_000, at(0, 0), at(4, 0), &[]) else {
+        unreachable!()
+    };
+    placed.batch.first_offset = Offset::new(1);
+    let OperationBody::Carry(mut larger) = carry(3_000, at(0, 0), at(4, 0), &[(1, key(5_000, 0))])
+    else {
+        unreachable!()
+    };
+    larger.batch.records = vec![record(1, b"held!")].into();
+    let cases = [
+        (
+            carry(2_999, at(0, 0), at(4, 0), &[]),
+            StateError::DelayTimeRegressed,
+        ),
+        // The floor must match and advance, and stay before this operation.
+        (
+            carry(3_000, at(3, 0), at(4, 0), &[]),
+            StateError::CarryMismatch,
+        ),
+        (
+            carry(3_000, at(0, 0), at(0, 0), &[]),
+            StateError::CarryMismatch,
+        ),
+        (
+            carry(3_000, at(0, 0), at(5, 1), &[]),
+            StateError::CarryMismatch,
+        ),
+        // A released key, and an unissued schedule sequence.
+        (
+            carry(3_000, at(0, 0), at(4, 0), &[(2, key(3_000, 1))]),
+            StateError::CarryMismatch,
+        ),
+        (
+            carry(3_000, at(0, 0), at(4, 0), &[(1, key(5_000, 2))]),
+            StateError::CarryMismatch,
+        ),
+        // More records or bytes than held.
+        (
+            carry(
+                3_000,
+                at(0, 0),
+                at(4, 0),
+                &[(1, key(5_000, 0)), (2, key(6_000, 0))],
+            ),
+            StateError::CarryMismatch,
+        ),
+        (OperationBody::Carry(larger), StateError::CarryMismatch),
+        (
+            OperationBody::Carry(named),
+            StateError::MalformedBody("carry batch must not name a producer"),
+        ),
+        (OperationBody::Carry(placed), StateError::OffsetMismatch),
+    ];
+    for (body, error) in cases {
+        assert_eq!(images.admit(5, &body), state_error(error));
+        assert_eq!(images, before);
+    }
+    // The floor may reach the carry itself.
+    images
+        .admit(5, &carry(3_000, at(0, 0), at(5, 0), &[(1, key(5_000, 0))]))
+        .unwrap();
+    // A repeated carry does not start at the floor.
+    assert_eq!(
+        images.admit(6, &carry(3_000, at(0, 0), at(5, 0), &[])),
+        state_error(StateError::CarryMismatch)
+    );
+}
+
+#[test]
 fn schedule_checks_delay_sequences_time_and_capacity() {
     let mut images = delayed();
     images
@@ -385,7 +531,10 @@ fn snapshot_restores_held_records_and_scheduled_results() {
     images
         .admit(5, &release(0, 1_200, key(1_200, 2), &[3]))
         .unwrap();
-    images.commit_through(5).unwrap();
+    images
+        .admit(6, &carry(1_300, at(0, 0), at(3, 1), &[(1, key(5_000, 0))]))
+        .unwrap();
+    images.commit_through(6).unwrap();
     let state = images.committed();
     let restored = CanonicalState::decode_snapshot(
         &state
@@ -406,7 +555,8 @@ fn snapshot_restores_held_records_and_scheduled_results() {
         (delay.held_records(), delay.held_bytes(), delay.released()),
         (2, 2 * 28, Some(key(1_200, 2)))
     );
-    assert_eq!((delay.next_schedule, delay.time), (3, 1_200));
+    assert_eq!((delay.next_schedule, delay.time), (3, 1_300));
+    assert_eq!(delay.carried(), at(3, 1));
 }
 
 #[test]
@@ -484,7 +634,7 @@ fn checksum_valid_snapshots_reject_inconsistent_held_records() {
         hash.update(&damaged[88..]);
         damaged[56..88].copy_from_slice(hash.finish().as_bytes());
     };
-    let cases: [(usize, &[u8], StateSnapshotError); 8] = [
+    let cases: [(usize, &[u8], StateSnapshotError); 10] = [
         // Held records need issued schedule sequences.
         (
             partition + 120,
@@ -529,6 +679,17 @@ fn checksum_valid_snapshots_reject_inconsistent_held_records() {
             partition + 160,
             &0_u64.to_be_bytes(),
             StateSnapshotError::InvalidPartition,
+        ),
+        // The carry floor lies before the image's next operation.
+        (
+            partition + 176,
+            &4_u64.to_be_bytes(),
+            StateSnapshotError::InvalidPartition,
+        ),
+        (
+            partition + 188,
+            &1_u32.to_be_bytes(),
+            StateSnapshotError::UnsupportedFields,
         ),
     ];
     for (field, bytes, error) in cases {

@@ -84,9 +84,9 @@ pub enum OperationCodecError {
     #[error("record range is outside its batch")]
     /// A selected record range is reversed or ends past its batch.
     RecordRange,
-    #[error("invalid scheduled-record or release body")]
-    /// A schedule or release has no single nonempty batch, or its due times
-    /// do not match its records.
+    #[error("invalid scheduled-record, release, or carry body")]
+    /// A schedule or release has no single nonempty batch, a carry has no
+    /// single batch, or due times or keys do not match the records.
     InvalidSchedule,
     #[error("record list cannot extend another representation")]
     /// An extension does not match the record list representation.

@@ -140,7 +140,7 @@ pub(super) fn section_checks(
         ))
         .chain(raw_order_checks::<SCHEDULE_INDEX_ENTRY_BYTES>(
             view.schedules,
-            32,
+            44,
             "schedule",
         ))
         .chain(schedule_row_checks(view))

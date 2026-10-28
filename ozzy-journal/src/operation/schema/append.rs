@@ -77,6 +77,32 @@ pub struct ReleaseKey {
     pub schedule: u64,
 }
 
+/// Where a held record lies: the `Schedule` or `Carry` operation holding it
+/// and its index in that operation's batch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HeldPosition {
+    /// Operation number.
+    pub operation: u64,
+    /// Record index inside the operation's batch.
+    pub index: u32,
+}
+
+/// Held records copied forward in position order, so retention can retire
+/// the operations before `through`. The batch has zero producer fields,
+/// offset zero, and the carry timestamp. It is empty when every held record
+/// in the range was released.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Carry<'a> {
+    /// Copied records in position order.
+    pub batch: AppendBatch<'a>,
+    /// The partition's carry floor before this operation.
+    pub from: HeldPosition,
+    /// The carry floor after it.
+    pub through: HeldPosition,
+    /// Release key of each copied record.
+    pub keys: Vec<ReleaseKey>,
+}
+
 /// Due scheduled records copied into the log in release order. The batch has
 /// assigned offsets, the release timestamp, and zero producer fields.
 #[derive(Debug, Clone, PartialEq, Eq)]

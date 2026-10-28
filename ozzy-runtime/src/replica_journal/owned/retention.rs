@@ -170,6 +170,12 @@ impl OwnedJournal {
             Err(JournalError::AppendCapacity) => return Ok(deferred()),
             result => result?,
         };
+        // The leader carries held records forward from a segment a target
+        // would retire.
+        let carry = planned.as_ref().and_then(|(_, plan)| plan.carry);
+        if let Some(held) = self.held.as_mut() {
+            held.aim(carry.filter(|_| leader));
+        }
         let Some((partition, plan)) = planned else {
             return Ok(RetentionTurn::idle(false));
         };

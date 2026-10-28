@@ -11,7 +11,7 @@ use crate::{
     IndexLimits, IndexSource, ScheduleIndexEntry, SegmentIndex, async_files::Access,
     segment_index_name,
 };
-use ozzy_journal::operation::ReleaseKey;
+use ozzy_journal::operation::{HeldPosition, ReleaseKey};
 use ozzy_proto::{MessageId, Offset, OperationId, PartitionIncarnation};
 
 /// Release key of each partition's last scheduled record in one source.
@@ -145,19 +145,23 @@ impl Catalog {
     }
 
     /// The partition's first `limit` scheduled records after `after`, or
-    /// from its first one, in release order across every source. Only
-    /// sources with a later record are read.
+    /// from its first one, in release order across every source. Rows
+    /// before `from` were carried or released and are skipped. Only sources
+    /// with a later record and an operation from `from` on are read.
     pub(crate) async fn schedules_after(
         &self,
         partition: PartitionIncarnation,
         after: Option<ReleaseKey>,
+        from: HeldPosition,
         limit: usize,
     ) -> Result<Vec<ScheduleIndexEntry>, Error> {
         let mut rows = std::collections::BTreeMap::new();
         let mut budget = crate::cooperative::Budget::default();
         let sources: Vec<_> = self
             .last_schedules(partition)
-            .filter(|(_, last)| after.is_none_or(|after| *last > after))
+            .filter(|(source, last)| {
+                source.last_op_number >= from.operation && after.is_none_or(|after| *last > after)
+            })
             .map(|(source, _)| source)
             .collect();
         for source in sources {
@@ -165,6 +169,9 @@ impl Catalog {
             self.with_source(source, |index| {
                 for entry in index.view().schedules_after(partition, after) {
                     visited += 1;
+                    if entry.record.position() < from {
+                        continue;
+                    }
                     if rows.len() == limit {
                         // Later rows of this source sort after every kept one.
                         if rows
@@ -185,6 +192,60 @@ impl Catalog {
                 .await;
         }
         Ok(rows.into_values().collect())
+    }
+
+    /// The partition's first `limit` scheduled records after `after` at
+    /// positions from `from` up to `through`, in position order, and the
+    /// record bytes of every one there. Only sources holding operations in
+    /// that range are read.
+    pub(crate) async fn schedules_between(
+        &self,
+        partition: PartitionIncarnation,
+        after: Option<ReleaseKey>,
+        (from, through): (HeldPosition, HeldPosition),
+        limit: usize,
+    ) -> Result<(Vec<ScheduleIndexEntry>, u64), Error> {
+        let mut rows = std::collections::BTreeMap::new();
+        let mut bytes = 0_u64;
+        let mut budget = crate::cooperative::Budget::default();
+        let sources: Vec<_> = self
+            .last_schedules(partition)
+            .filter(|(source, last)| {
+                source.last_op_number >= from.operation
+                    && source.first_op_number <= through.operation
+                    && after.is_none_or(|after| *last > after)
+            })
+            .map(|(source, _)| source)
+            .collect();
+        for source in sources {
+            let mut visited = 0;
+            self.with_source(source, |index| {
+                for entry in index.view().schedules_after(partition, after) {
+                    visited += 1;
+                    let position = entry.record.position();
+                    if position < from || position >= through {
+                        continue;
+                    }
+                    bytes += u64::from(entry.record.bytes);
+                    if rows.len() == limit {
+                        if rows
+                            .last_key_value()
+                            .is_none_or(|(last, _)| *last < position)
+                        {
+                            continue;
+                        }
+                        rows.pop_last();
+                    }
+                    rows.insert(position, entry);
+                }
+                Ok(Some(()))
+            })
+            .await?;
+            budget
+                .charge(visited * crate::SCHEDULE_INDEX_ENTRY_BYTES + 4096)
+                .await;
+        }
+        Ok((rows.into_values().collect(), bytes))
     }
 
     pub(crate) async fn find_offset(

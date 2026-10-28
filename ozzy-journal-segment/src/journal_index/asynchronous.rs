@@ -15,7 +15,7 @@ use crate::{
 };
 use ozzy_core::state::{IdentityClaim, IdentityKey};
 use ozzy_io::{OpenMode, Operation};
-use ozzy_journal::operation::ReleaseKey;
+use ozzy_journal::operation::{HeldPosition, ReleaseKey};
 use ozzy_proto::PartitionIncarnation;
 
 #[derive(Debug, Clone)]
@@ -217,14 +217,35 @@ impl Snapshot {
     }
 
     /// The partition's first `limit` scheduled records in sealed segments
-    /// after `after`, or from its first one, in release order.
+    /// after `after`, or from its first one, in release order. Rows before
+    /// the carry floor `from` are skipped.
     pub async fn sealed_schedules_after(
         &self,
         partition: PartitionIncarnation,
         after: Option<ReleaseKey>,
+        from: HeldPosition,
         limit: usize,
     ) -> Result<Vec<crate::ScheduleIndexEntry>, Error> {
-        Ok(self.sealed.schedules_after(partition, after, limit).await?)
+        Ok(self
+            .sealed
+            .schedules_after(partition, after, from, limit)
+            .await?)
+    }
+
+    /// The partition's first `limit` scheduled records in sealed segments
+    /// after `after` at positions in `range`, in position order, and the
+    /// record bytes of every one there.
+    pub async fn sealed_schedules_between(
+        &self,
+        partition: PartitionIncarnation,
+        after: Option<ReleaseKey>,
+        range: (HeldPosition, HeldPosition),
+        limit: usize,
+    ) -> Result<(Vec<crate::ScheduleIndexEntry>, u64), Error> {
+        Ok(self
+            .sealed
+            .schedules_between(partition, after, range, limit)
+            .await?)
     }
 
     /// The partition's scheduled records in the captured active prefix, in

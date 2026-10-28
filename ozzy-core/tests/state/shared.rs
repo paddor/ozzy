@@ -116,7 +116,7 @@ fn checksum_valid_snapshots_reject_ambiguous_or_missing_writer_results() {
         .unwrap();
     let names = usize::from(u16::from_be_bytes(encoded[260..262].try_into().unwrap()))
         + usize::from(u16::from_be_bytes(encoded[262..264].try_into().unwrap()));
-    let first_writer = 256 + 176 + names;
+    let first_writer = 256 + 192 + names;
     let first_span = first_writer + 80;
     let second_writer = first_span + 40;
     let second_span = second_writer + 80;

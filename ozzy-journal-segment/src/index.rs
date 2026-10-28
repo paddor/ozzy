@@ -100,6 +100,35 @@ pub struct DerivedIndexEntries {
     pub schedules: Vec<ScheduleIndexEntry>,
 }
 
+/// Held-record rows of a `Schedule` or `Carry`; `None` for other operations.
+fn held_rows(
+    op_number: u64,
+    body: &OperationBody<'_>,
+) -> Result<Option<Vec<ScheduleIndexEntry>>, IndexError> {
+    let (partition, entries) = match body {
+        OperationBody::Schedule(schedule) => (
+            schedule.batch.partition,
+            ozzy_core::state::schedule_entries(op_number, schedule),
+        ),
+        OperationBody::Carry(carry) => (
+            carry.batch.partition,
+            ozzy_core::state::carry_entries(op_number, carry),
+        ),
+        _ => return Ok(None),
+    };
+    Ok(Some(
+        entries
+            .map_err(|_| IndexError::PositionOverflow)?
+            .into_iter()
+            .map(|(key, record)| ScheduleIndexEntry {
+                partition,
+                key,
+                record,
+            })
+            .collect(),
+    ))
+}
+
 /// Decode one bounded operation and derive exact disposable index entries.
 pub fn derive_index_entries(
     segment: &SegmentHeader,
@@ -121,28 +150,20 @@ pub fn derive_index_entries(
         operation_id,
         location,
     });
+    // Held records have no offsets; indexes list them by release key.
+    if let Some(schedules) = held_rows(operation.op_number, &body)? {
+        return Ok(DerivedIndexEntries {
+            location,
+            offsets: Vec::new(),
+            messages: Vec::new(),
+            operation: operation_entry,
+            schedules,
+        });
+    }
     let batches = match &body {
         OperationBody::Append(append) => append.batches.as_slice(),
         OperationBody::ResolvedAppend(append) => std::slice::from_ref(&append.batch),
         OperationBody::Release(release) => std::slice::from_ref(&release.batch),
-        OperationBody::Schedule(schedule) => {
-            let schedules = ozzy_core::state::schedule_entries(operation.op_number, schedule)
-                .map_err(|_| IndexError::PositionOverflow)?
-                .into_iter()
-                .map(|(key, record)| ScheduleIndexEntry {
-                    partition: schedule.batch.partition,
-                    key,
-                    record,
-                })
-                .collect();
-            return Ok(DerivedIndexEntries {
-                location,
-                offsets: Vec::new(),
-                messages: Vec::new(),
-                operation: operation_entry,
-                schedules,
-            });
-        }
         _ => {
             return Ok(DerivedIndexEntries {
                 location,

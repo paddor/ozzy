@@ -71,11 +71,13 @@ use codec::{
     validate_tiny_descriptors,
 };
 pub use codec::{
-    RELEASE_FRAME_BYTES, append_operation_body, append_operation_body_to, decode_append_summary,
-    decode_append_summary_and_batches, decode_append_summary_and_batches_indexed,
+    CARRY_FRAME_BYTES, RELEASE_FRAME_BYTES, append_operation_body, append_operation_body_to,
+    decode_append_summary, decode_append_summary_and_batches,
+    decode_append_summary_and_batches_indexed,
     decode_append_summary_and_batches_with_validated_payload, decode_append_summary_and_view,
-    decode_operation_body, decode_release_batch, decode_schedule_batch, encode_operation_body,
-    encoded_record_bytes, validate_operation_body, validate_operation_body_with_validated_payload,
+    decode_carry_batch, decode_operation_body, decode_release_batch, decode_schedule_batch,
+    encode_operation_body, encoded_record_bytes, validate_operation_body,
+    validate_operation_body_with_validated_payload,
 };
 pub use error::OperationCodecError;
 pub use integrity::{
@@ -84,8 +86,9 @@ pub use integrity::{
 };
 pub use schema::{
     Append, AppendBatch, AppendBatchSummary, AppendRecord, AppendSummary, Assign, Barrier,
-    CanonicalOperation, ChainPosition, CreatePartition, DedupWatermark, Digest, OpenProducer,
-    OperationBody, OperationHeader, OperationKind, OperationLimits, PartitionPolicy,
-    ProducerResultFloor, Progress, ProgressAssignment, ProgressOwner, RecordPosition, Release,
-    ReleaseKey, ResolvedAppend, RetentionPolicy, RetireProducer, Schedule, Trim,
+    CanonicalOperation, Carry, ChainPosition, CreatePartition, DedupWatermark, Digest,
+    HeldPosition, OpenProducer, OperationBody, OperationHeader, OperationKind, OperationLimits,
+    PartitionPolicy, ProducerResultFloor, Progress, ProgressAssignment, ProgressOwner,
+    RecordPosition, Release, ReleaseKey, ResolvedAppend, RetentionPolicy, RetireProducer, Schedule,
+    Trim,
 };

@@ -24,18 +24,18 @@ mod validation;
 mod watermark;
 
 use ozzy_journal::operation::{
-    Append, AppendBatch, AppendRecord, Assign, Barrier, CreatePartition, OpenProducer,
-    OperationBody, OperationCodecError, OperationKind, OperationLimits, PartitionPolicy,
-    ProducerResultFloor, Progress, ProgressAssignment, ProgressOwner, RELEASE_FRAME_BYTES, Release,
-    ReleaseKey, RetentionPolicy, RetireProducer, Schedule, Trim, append_operation_body,
-    decode_operation_body, encode_operation_body, encoded_record_bytes,
+    Append, AppendBatch, AppendRecord, Assign, Barrier, Carry, CreatePartition, HeldPosition,
+    OpenProducer, OperationBody, OperationCodecError, OperationKind, OperationLimits,
+    PartitionPolicy, ProducerResultFloor, Progress, ProgressAssignment, ProgressOwner,
+    RELEASE_FRAME_BYTES, Release, ReleaseKey, RetentionPolicy, RetireProducer, Schedule, Trim,
+    append_operation_body, decode_operation_body, encode_operation_body, encoded_record_bytes,
 };
 use ozzy_proto::{
     ConsumerGroupId, ConsumerMemberId, MessageId, Offset, OperationId, OwnerEpoch, PartitionId,
     PartitionIncarnation, ProducerEpoch, ProducerId, ProducerSequence, SubscriptionId,
 };
 
-const FIXTURES: [&str; 12] = [
+const FIXTURES: [&str; 13] = [
     concat!(
         "10101010101010101010101010101010",
         "0000000673747265616d00000005746f706963",
@@ -126,6 +126,19 @@ const FIXTURES: [&str; 12] = [
         "43434343434343434343434343434343",
         "026465",
         "0000018bcfe652db000000000000000c",
+    ),
+    concat!(
+        "00000001",
+        "10101010101010101010101010101010",
+        "0000000000000009",
+        "00000000000000000000000000000000",
+        "000000000000000000000000000000000000000000000000",
+        "0000018bcfe73d3b80000001",
+        "44444444444444444444444444444444",
+        "0166",
+        "000000000000000700000001",
+        "000000000000000900000000",
+        "0000018bcfe5687b000000000000000d",
     ),
 ];
 
@@ -277,6 +290,35 @@ fn bodies() -> Vec<OperationBody<'static>> {
                 millis: 1_700_000_060_123,
                 schedule: 12,
             },
+        }),
+        OperationBody::Carry(Carry {
+            batch: AppendBatch {
+                partition,
+                owner_epoch: OwnerEpoch::new(9),
+                producer_id: ProducerId::from_bytes([0; 16]),
+                producer_epoch: ProducerEpoch::new(0),
+                first_sequence: ProducerSequence::ZERO,
+                first_offset: Offset::ZERO,
+                append_timestamp_millis: 1_700_000_120_123,
+                records: vec![AppendRecord {
+                    encoding: ozzy_proto::data::Encoding::Raw,
+                    message_id: MessageId::from_bytes([0x44; 16]),
+                    parts: vec![b"f".as_slice()].into(),
+                }]
+                .into(),
+            },
+            from: HeldPosition {
+                operation: 7,
+                index: 1,
+            },
+            through: HeldPosition {
+                operation: 9,
+                index: 0,
+            },
+            keys: vec![ReleaseKey {
+                millis: 1_700_000_000_123,
+                schedule: 13,
+            }],
         }),
     ]
 }
@@ -455,7 +497,7 @@ fn release_body_is_its_frame_plus_each_record_size() {
     use ozzy_proto::data::Encoding;
     static LONG: [u8; 300] = [7; 300];
     let bodies = bodies();
-    let Some(OperationBody::Release(release)) = bodies.last() else {
+    let [.., OperationBody::Release(release), _] = bodies.as_slice() else {
         unreachable!()
     };
     let long = &LONG;
@@ -506,6 +548,7 @@ fn schedule_and_release_need_one_nonempty_batch_and_matching_due_times() {
         ..,
         OperationBody::Schedule(schedule),
         OperationBody::Release(release),
+        _,
     ] = bodies.as_slice()
     else {
         unreachable!()
@@ -534,6 +577,41 @@ fn schedule_and_release_need_one_nonempty_batch_and_matching_due_times() {
     bytes[..4].copy_from_slice(&2_u32.to_be_bytes());
     assert_eq!(
         decode_operation_body(OperationKind::Release, &bytes, limits),
+        Err(OperationCodecError::InvalidSchedule)
+    );
+}
+
+#[test]
+fn carry_may_be_empty_but_needs_one_batch_and_a_key_per_record() {
+    let limits = OperationLimits::default();
+    let bodies = bodies();
+    let Some(OperationBody::Carry(carry)) = bodies.last() else {
+        unreachable!()
+    };
+    let mut empty = carry.clone();
+    empty.batch.records = Vec::<AppendRecord<'_>>::new().into();
+    empty.keys.clear();
+    let bytes = encode_operation_body(&OperationBody::Carry(empty), limits).unwrap();
+    let Ok(OperationBody::Carry(decoded)) =
+        decode_operation_body(OperationKind::Carry, &bytes, limits)
+    else {
+        panic!("an empty carry decodes")
+    };
+    assert!(decoded.batch.records.is_empty() && decoded.keys.is_empty());
+    assert_eq!((decoded.from, decoded.through), (carry.from, carry.through));
+    let view = ozzy_journal::operation::decode_carry_batch(&bytes, limits).unwrap();
+    assert_eq!(view.summary.record_count, 0);
+    assert_eq!(view.append_timestamp_millis, 1_700_000_120_123);
+    let mut short = carry.clone();
+    short.keys.clear();
+    assert_eq!(
+        encode_operation_body(&OperationBody::Carry(short), limits),
+        Err(OperationCodecError::InvalidSchedule)
+    );
+    let mut bytes = encode_operation_body(&OperationBody::Carry(carry.clone()), limits).unwrap();
+    bytes[..4].copy_from_slice(&2_u32.to_be_bytes());
+    assert_eq!(
+        decode_operation_body(OperationKind::Carry, &bytes, limits),
         Err(OperationCodecError::InvalidSchedule)
     );
 }

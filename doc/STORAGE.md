@@ -126,6 +126,7 @@ Exact layout: [segment codec](../ozzy-journal-segment/src/codec.rs).
 | 7 | `PartitionPolicy` | 14 | `RetireProducer` |
 | | | 15 | `Schedule` |
 | | | 16 | `Release` |
+| | | 17 | `Carry` |
 
 Integers are big-endian, IDs 16 bytes, counts and text lengths `u32`. Exact
 schema: [operation codec](../ozzy-journal/src/operation/codec/).
@@ -191,17 +192,31 @@ part. General descriptors use:
 - `Release` (kind 16): exactly one nonempty batch with zero producer fields,
   the next offsets, and the release timestamp, then the release key of its
   last record: time `u64`, schedule sequence `u64`.
+- `Carry` (kind 17): exactly one batch, possibly empty, with zero producer
+  fields, first offset zero, and the carry timestamp; then the carry floor
+  before and after it, each an operation `u64` and record index `u32`;
+  then one release key per record. It consumes no offsets or sequences.
 
 ### Scheduled records
 
 - A held record's release key is `(max(due, acceptance), schedule
   sequence)`. Every schedule or release timestamp is at least the
   partition's latest one, so a new key sorts after every released key.
-- Partition state holds only the last released key and the count and
-  encoded bytes (descriptor, part lengths, payload) of held records.
-  Payloads stay in the `Schedule` operation until release.
-- Each copy keeps a held index of the rest: key, `Schedule` operation,
-  record index, encoded bytes, and message ID. Rows of the active segment
+- Partition state holds only the last released key, the carry floor, and
+  the count and encoded bytes (descriptor, part lengths, payload) of held
+  records. Payloads stay in the `Schedule` operation, or the `Carry` that
+  last copied them, until release.
+- A `Carry` copies held records from the carry floor on, in position order,
+  with their keys, and moves the floor to its end. Every held record before
+  the floor was released or carried. Partition state checks the floor, a
+  timestamp of at least the partition's latest one, keys past the last
+  release with issued schedule sequences, an end no later than the `Carry`
+  itself, and record and byte counts within the held totals. Totals do not
+  change.
+- Each copy keeps a held index of the rest: key, `Schedule` or `Carry`
+  operation, record index, encoded bytes, and message ID. Rows before the
+  carry floor are skipped; a carried record's row moves to its `Carry`.
+  Rows of the active segment
   and later operations stay in memory. Once 262144 are, a copy rolls its
   segment before its next write when it has room to roll, so they move to
   its index file. Of sealed segments, only the next rows after the last
@@ -217,15 +232,30 @@ part. General descriptors use:
   state then checks the totals, a key past the last release, a timestamp
   that reaches the key's time, and the next offsets. A repeated release does
   not pass the last one and fails.
+- Each copy checks a `Carry` against the held rows in its range, read from
+  index files and memory: keys, message IDs, and encoded byte counts, in
+  position order, after releases and with schedules and carries before it
+  in the same batch. Validation of that batch waits for the read.
 - A scheduled attempt's retry result names its `Schedule` operation and maps
   the sequence to its schedule sequence.
-- Retention keeps the oldest segment whose last scheduled-record key is past
-  the last committed release, and every later segment. Checkpoints do not
+- Retention keeps the oldest segment that reaches the committed carry floor
+  and whose last scheduled-record key is past the last committed release,
+  and every later segment. A segment wholly before the floor holds no record;
+  one the floor splits stays. Checkpoints do not
   hold held records, so retirement checks the same segment floor. A
   `Schedule` acceptance time counts toward its segment's age, so retries of a
-  released schedule resolve for the retention age.
+  released schedule resolve for the retention age. A `Carry` timestamp
+  counts too, so carried records stay for the age.
+- When an age or byte target would retire a sealed, committed segment that
+  held records keep, the primary carries them forward to the segment's end.
+  A carry ends where its records stop fitting one operation, and the next
+  one starts there. Retention then trims and retires the segment like any
+  other. A byte target carries only while the held records fill at most
+  half the segment, so a carry frees more than it writes; otherwise byte
+  retention waits.
 - Readers and indexes treat a `Release` batch like an APPEND batch.
-  `Schedule` records have no offsets; indexes list them by release key only.
+  `Schedule` and `Carry` records have no offsets; indexes list them by
+  release key only.
 - Scheduled payloads are raw, so a release can copy any prefix of held
   records without recompressing.
 
@@ -394,9 +424,11 @@ format 4. Rows: record offsets 96 bytes, message IDs 80, operation IDs 80, a
 dense 56-byte numeric selector for every canonical operation, including
 payload-free duplicate results, and 64-byte scheduled records.
 
-- Scheduled-record rows sort by partition and release key. Each holds the
-  key, its `Schedule` operation, record index, encoded bytes, and message ID,
-  so held records after a release key can be listed without reading payloads.
+- Scheduled-record rows sort by partition, release key, then operation and
+  record index, since a carried copy keeps its original's key. Each holds
+  the key, its `Schedule` or `Carry` operation, record index, encoded bytes,
+  and message ID, so held records after a release key can be listed without
+  reading payloads.
 
 - A missing or corrupt index is rebuilt from validated segment bytes. A
   background job builds each sealed segment's index beside later writes; a
@@ -419,7 +451,7 @@ payload-free duplicate results, and 64-byte scheduled records.
 Canonical checkpoint images start with a 104-byte `OZYCIMG\0` header: version
 `u16` (1), six zero bytes, core snapshot length `u64`, partition incarnation
 (16 bytes), and the 64-byte dedup index header. The last 80 bytes are zero
-without an identity section. The core snapshot (`OZYSTA01`, version 5,
+without an identity section. The core snapshot (`OZYSTA01`, version 6,
 256-byte header) follows, then identity rows. Bare snapshots and other versions
 are rejected. Coordinator group images are each a `u32` length plus the
 `GroupPlan` body.
@@ -431,9 +463,8 @@ ID, offset, and logical acceptance time. The enclosing checkpoint supplies
 integrity and partition authority.
 
 - Checkpoints hold state, producer coordinates, retry floors, live confirmed
-  identities, the last released key and held-record totals, and the
-  original
-  committed operation and digest. Never payloads.
+  identities, the last released key, carry floor, and held-record totals,
+  and the original committed operation and digest. Never payloads.
 - Failed or canceled builds never select themselves. Installation checks the
   captured position and source lineage.
 - Decoded state stays private until every chunk and the state digest match.
@@ -450,7 +481,8 @@ Topics set `retention.max_age_secs` and `retention.max_bytes`; see
 [`ozzy-config`](../ozzy-config/README.md).
 
 - Retention removes whole sealed segments, oldest first. An aged active segment
-  rolls first.
+  rolls first. Held scheduled records are carried forward first; see
+  [scheduled records](#scheduled-records).
 - Age uses each segment's newest append time, so backward clocks cannot expire
   newer records early.
 - Byte targets count active and sealed capacities per partition per broker.
@@ -493,7 +525,8 @@ A partition journal holds at most 256 segments of `segment_bytes`.
   scheduled record: its encoded bytes plus a `Release` frame, entry, and write
   group of its own, and one write group per segment the releases fill. A
   `Release` needs only the sixty-fourth, so held records can always leave and
-  end their retention hold.
+  end their retention hold. A `Carry` needs the sixty-fourth and that room,
+  since its sources stay until retention frees them.
 - Trims and policy changes always pass, so retention can still free space.
 - A retention byte target covers at most 224 segments, so retention that lags
   a few segments still frees space before refusals start.

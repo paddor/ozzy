@@ -1,6 +1,6 @@
-//! Release timing shared by the local and replicated actors. Only the primary
-//! releases; one step runs at a time, and its proposal takes the maintenance
-//! slot.
+//! Delay step timing shared by the local and replicated actors. Only the
+//! primary releases or carries; one step runs at a time, and its proposal
+//! takes the maintenance slot.
 
 use super::ingress::Proposals;
 use crate::replica_journal::{JournalCompletion, JournalError, ReleaseTurn, ReplicaJournal};
@@ -23,7 +23,8 @@ pub(super) struct Releases {
 
 impl Releases {
     /// When the next step is due: the earliest committed held record's due
-    /// time by the journal clock, placed on actor time.
+    /// time by the journal clock, placed on actor time, or now while a carry
+    /// is pending.
     pub(super) fn at(&self, journal: &ReplicaJournal, now: Duration) -> Option<Duration> {
         if self.running.is_some() {
             return None;

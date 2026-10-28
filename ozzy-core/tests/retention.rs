@@ -8,7 +8,7 @@
     reason = "test code"
 )]
 
-use ozzy_core::retention::{Kept, Plan, Segment};
+use ozzy_core::retention::{Carry, Kept, Plan, Segment};
 use ozzy_journal::operation::RetentionPolicy;
 use ozzy_proto::Offset;
 use std::num::NonZeroU64;
@@ -72,15 +72,38 @@ fn either_limit_expires_only_a_sealed_prefix_using_newest_append_time() {
         "uncommitted segments remain protected"
     );
     assert!(!plan.roll_active);
-    for (held, retire) in [(Some(5), vec![1]), (Some(4), vec![]), (Some(9), vec![1, 2])] {
+    let carry = |end, expired| {
+        Some(Carry {
+            end,
+            expired,
+            capacity: 1024,
+        })
+    };
+    for (held, retire, target) in [
+        (Some(5), vec![1], carry(9, false)),
+        (Some(4), vec![], carry(5, true)),
+        (Some(9), vec![1, 2], None),
+    ] {
         let plan = Plan::select(&segments, policy, 1000, kept(12, held), 8).unwrap();
         assert_eq!(
             plan.retire, retire,
             "a held schedule at {held:?} stops retention"
         );
+        assert_eq!(plan.carry, target, "the held segment is carried");
         assert!(
             plan.roll_active,
             "a held schedule does not stop the active roll"
         );
     }
+    // A held segment no target would retire is not carried.
+    let policy = RetentionPolicy {
+        max_bytes: NonZeroU64::new(4096),
+        ..policy
+    };
+    let plan = Plan::select(&segments, policy, 1000, kept(12, Some(5)), 8).unwrap();
+    assert_eq!((plan.retire, plan.carry), (vec![1], None));
+    let plan = Plan::select(&segments, policy, 1000, kept(4, Some(1)), 8).unwrap();
+    assert_eq!(plan.carry, carry(5, true));
+    let plan = Plan::select(&segments, policy, 1000, kept(3, Some(1)), 8).unwrap();
+    assert_eq!(plan.carry, None, "an uncommitted segment is not carried");
 }

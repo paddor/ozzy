@@ -55,20 +55,30 @@ fn next_offsets(actors: &mut [ScheduledReplica]) -> Option<Vec<Offset>> {
         .collect()
 }
 
-#[test]
-fn primary_releases_due_records_and_every_copy_applies_them() {
-    let (mut controller, io) = setup();
-    CLOCK.with(|clock| clock.set(1_000));
+/// Three copies of a delay partition with `retention`, its creation
+/// confirmed through the leader's lane, and `spare` buffers of the leader.
+fn delay_group(
+    controller: &mut Controller,
+    io: &Local,
+    retention: RetentionPolicy,
+    retention_interval: Option<Duration>,
+    spare: usize,
+) -> (
+    Vec<ScheduledReplica>,
+    crate::replica_actor::ProposalSubmitter,
+    Vec<crate::replica_journal::ProposalBuffer>,
+) {
     let mut actors = Vec::new();
     let mut started = None;
     for broker in 0..3 {
         let mut actor = configured_actor(
-            &mut controller,
-            &io,
+            controller,
+            io,
             0,
             broker,
             ActorSettings {
                 delay: Some(DelayLimits::new(16)),
+                retention_interval,
                 ..Default::default()
             },
         );
@@ -84,7 +94,7 @@ fn primary_releases_due_records_and_every_copy_applies_them() {
                     owner_epoch: OwnerEpoch::INITIAL,
                     delay_max_millis: std::num::NonZeroU64::new(60_000),
                     dedup_window_millis: None,
-                    retention: RetentionPolicy::default(),
+                    retention,
                 }),
             );
             push(
@@ -99,19 +109,67 @@ fn primary_releases_due_records_and_every_copy_applies_them() {
             );
             let mut lane = actor.take_submitter().unwrap();
             let pending = lane.try_submit(buffer).unwrap();
-            let mut scheduled = actor.lease_proposal_buffer().unwrap();
-            scheduled
-                .prepare_append(super::super::super::proposal::request(12, 0, 2))
-                .unwrap();
-            scheduled.schedule(&[1_010, 1_005]).unwrap();
-            started = Some((pending, lane, scheduled));
+            let buffers = (0..spare)
+                .map(|_| actor.lease_proposal_buffer().unwrap())
+                .collect();
+            started = Some((pending, lane, buffers));
         }
         actors.push(ScheduledReplica::new(actor).unwrap());
     }
-    let (bootstrap, mut lane, scheduled) = started.unwrap();
-    finish(&mut controller, &mut actors, Box::pin(bootstrap));
-    let pending = lane.try_submit(scheduled).unwrap();
-    finish(&mut controller, &mut actors, Box::pin(pending));
+    let (bootstrap, lane, buffers) = started.unwrap();
+    finish(controller, &mut actors, Box::pin(bootstrap));
+    (actors, lane, buffers)
+}
+
+/// Confirm `buffer`, after `prepare` fills it, through `lane`.
+fn submit(
+    controller: &mut Controller,
+    actors: &mut [ScheduledReplica],
+    lane: &mut crate::replica_actor::ProposalSubmitter,
+    mut buffer: crate::replica_journal::ProposalBuffer,
+    prepare: impl FnOnce(&mut crate::replica_journal::ProposalBuffer),
+) {
+    prepare(&mut buffer);
+    let pending = lane.try_submit(buffer).unwrap();
+    finish(controller, actors, Box::pin(pending));
+}
+
+/// Run rounds at advancing actor time until `done`.
+fn run_until(
+    controller: &mut Controller,
+    actors: &mut [ScheduledReplica],
+    now: &mut Duration,
+    mut done: impl FnMut(&mut Controller, &mut [ScheduledReplica]) -> bool,
+) -> bool {
+    for _ in 0..10000 {
+        *now += Duration::from_millis(1);
+        scheduled::round_at(actors, *now, false);
+        scheduled::settle(controller, &[]);
+        if done(controller, actors) {
+            return true;
+        }
+    }
+    false
+}
+
+#[test]
+fn primary_releases_due_records_and_every_copy_applies_them() {
+    let (mut controller, io) = setup();
+    CLOCK.with(|clock| clock.set(1_000));
+    let (mut actors, mut lane, mut buffers) =
+        delay_group(&mut controller, &io, RetentionPolicy::default(), None, 1);
+    submit(
+        &mut controller,
+        &mut actors,
+        &mut lane,
+        buffers.pop().unwrap(),
+        |buffer| {
+            buffer
+                .prepare_append(super::super::super::proposal::request(12, 0, 2))
+                .unwrap();
+            buffer.schedule(&[1_010, 1_005]).unwrap();
+        },
+    );
     for _ in 0..100 {
         scheduled::round(&mut actors, false);
         scheduled::settle(&mut controller, &[]);
@@ -128,6 +186,79 @@ fn primary_releases_due_records_and_every_copy_applies_them() {
         }
     }
     assert_eq!(next_offsets(&mut actors), released);
+    CLOCK.with(|clock| clock.set(123));
+    for actor in actors {
+        scheduled::close(&mut controller, actor);
+    }
+}
+
+/// The leader's oldest segment file.
+fn oldest_segment(controller: &Controller) -> Option<u64> {
+    (0..64).find(|id| {
+        controller.image().exists(
+            std::path::Path::new(&format!("/g0-b0/segments/{id}.log")),
+            false,
+        )
+    })
+}
+
+#[test]
+fn the_primary_carries_aged_held_records_and_every_copy_checks_them() {
+    let (mut controller, io) = setup();
+    CLOCK.with(|clock| clock.set(1_000));
+    let retention = RetentionPolicy {
+        max_age_millis: std::num::NonZeroU64::new(1_000),
+        max_bytes: None,
+    };
+    let (mut actors, mut lane, mut buffers) = delay_group(
+        &mut controller,
+        &io,
+        retention,
+        Some(Duration::from_millis(1)),
+        2,
+    );
+    let request = super::super::super::proposal::request;
+    submit(
+        &mut controller,
+        &mut actors,
+        &mut lane,
+        buffers.pop().unwrap(),
+        |buffer| {
+            buffer.prepare_append(request(12, 0, 2)).unwrap();
+            buffer.schedule(&[30_000, 20_000]).unwrap();
+        },
+    );
+    // A stored record lets the active segment age and roll.
+    submit(
+        &mut controller,
+        &mut actors,
+        &mut lane,
+        buffers.pop().unwrap(),
+        |buffer| buffer.prepare_append(request(12, 2, 1)).unwrap(),
+    );
+    let first = oldest_segment(&controller).unwrap();
+
+    // The leader rolls the aged segment, carries its held records forward,
+    // trims the stored record, and retires the segment. Each copy checks
+    // the carry.
+    CLOCK.with(|clock| clock.set(5_000));
+    let mut now = Duration::ZERO;
+    assert!(run_until(
+        &mut controller,
+        &mut actors,
+        &mut now,
+        |controller, _| { oldest_segment(controller).is_some_and(|oldest| oldest > first) }
+    ));
+    assert_eq!(next_offsets(&mut actors), Some(vec![Offset::new(1); 3]));
+
+    CLOCK.with(|clock| clock.set(30_000));
+    let released = Some(vec![Offset::new(3); 3]);
+    assert!(run_until(
+        &mut controller,
+        &mut actors,
+        &mut now,
+        |_, actors| { next_offsets(actors) == released }
+    ));
     CLOCK.with(|clock| clock.set(123));
     for actor in actors {
         scheduled::close(&mut controller, actor);

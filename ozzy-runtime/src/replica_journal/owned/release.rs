@@ -1,8 +1,9 @@
 //! Due scheduled records leave their partition in a broker-built `Release`.
 //! The owner picks the due prefix from its held index; a detached job reads
-//! the `Schedule` operations holding it, beside writes, and builds the
-//! proposal. When no held record is loaded but sealed ones are, the job
-//! loads the next ones instead.
+//! the `Schedule` or `Carry` operations holding it, beside writes, and builds
+//! the proposal. When no held record is loaded but sealed ones are, the job
+//! loads the next ones instead. The same delay step carries held records
+//! forward when retention would free their segment.
 
 use super::{JournalError, OwnedJournal};
 use crate::replica_journal::ProposalBuffer;
@@ -10,8 +11,7 @@ use bytes::Bytes;
 use ozzy_core::state::PendingSchedule;
 use ozzy_journal::operation::{
     AppendBatch, AppendRecord, OperationBody, OperationKind, OperationLimits, RELEASE_FRAME_BYTES,
-    Release, ReleaseKey, Schedule, decode_operation_body, encode_operation_body,
-    encoded_record_bytes,
+    Release, ReleaseKey, decode_operation_body, encode_operation_body, encoded_record_bytes,
 };
 use ozzy_journal_segment::{JournalIndexError, JournalIndexSnapshot};
 use ozzy_proto::{
@@ -20,28 +20,32 @@ use ozzy_proto::{
 use ozzy_replication::driver::ValidationTicket;
 use std::rc::Rc;
 
-/// Distinct `Schedule` operations one release may read.
+mod carry;
+
+/// Distinct `Schedule` or `Carry` operations one release may read.
 const MAX_SOURCES: usize = 64;
 
-/// One bounded release step.
+/// One bounded delay step: a release or a carry.
 #[derive(Debug, Default)]
 pub struct ReleaseTurn {
-    /// `Release` of due records, awaiting ordinary confirmation.
+    /// `Release` of due records or `Carry` of held ones, awaiting ordinary
+    /// confirmation.
     pub proposal: Option<ProposalBuffer>,
-    /// The step loaded held records instead; the next one may start now.
+    /// The step loaded held records or stopped carrying instead; the next
+    /// one may start now.
     pub loaded: bool,
 }
 
-/// A release step's result once the owner picked its records.
+/// A delay step's result once the owner picked its records.
 #[derive(Debug)]
 pub(in crate::replica_journal) enum ReleaseStep {
-    /// Nothing to release now.
+    /// Nothing to release or carry now.
     Idle,
     /// Read the held records, or load more, beside writes.
     Read(ReleaseRead),
 }
 
-/// A release step's detached work.
+/// A delay step's detached work.
 #[derive(Debug)]
 pub(in crate::replica_journal) struct ReleaseRead {
     key: Rc<()>,
@@ -52,16 +56,17 @@ pub(in crate::replica_journal) struct ReleaseRead {
 enum Work {
     Records(Box<Records>),
     Load(Box<super::held::Refill>),
+    Carry(Box<carry::Carrying>),
 }
 
-/// Due held records and where their `Schedule` operations are.
+/// Due held records and where their `Schedule` or `Carry` operations are.
 #[derive(Debug)]
 struct Records {
     partition: PartitionIncarnation,
     owner_epoch: OwnerEpoch,
     entries: Vec<(ReleaseKey, PendingSchedule)>,
-    /// Bodies still in writeback, by operation number.
-    hot: Vec<(u64, Bytes)>,
+    /// Kinds and bodies still in writeback, by operation number.
+    hot: Vec<(u64, OperationKind, Bytes)>,
     /// Operations to read from storage, by number.
     cold: Vec<u64>,
     stored: Option<JournalIndexSnapshot>,
@@ -79,12 +84,23 @@ pub(in crate::replica_journal) struct CompletedRelease {
 enum Built {
     Release(Option<Box<ProposalBuffer>>),
     Load(super::held::Load),
+    /// Stop carrying toward the segment ending at this operation.
+    Stop(u64),
 }
 
 impl OwnedJournal {
     /// Release key millis of the earliest held record whose `Schedule` is
-    /// committed. Later records wait for it, since a release is a prefix.
+    /// committed, or zero while a carry is pending. Later records wait for
+    /// it, since a release is a prefix.
     pub(in crate::replica_journal) fn next_release(&self) -> Option<u64> {
+        let held = self.held.as_ref()?;
+        if held.carrying().is_some() {
+            return Some(0);
+        }
+        self.next_due()
+    }
+
+    fn next_due(&self) -> Option<u64> {
         let committed = self.images().ok()?.committed().revision();
         self.held.as_ref()?.next(committed)
     }
@@ -106,7 +122,8 @@ impl OwnedJournal {
     }
 
     /// Pick the due prefix of committed held records on one partition,
-    /// bounded by one proposal arena. Only the primary releases.
+    /// bounded by one proposal arena, or carry held records toward the
+    /// retention target. Only the primary releases and carries.
     pub(in crate::replica_journal) async fn prepare_release(
         &mut self,
         ticket: ValidationTicket,
@@ -116,8 +133,15 @@ impl OwnedJournal {
         self.validate_image(ticket)?;
         if self.configuration.primary(ticket.scope().view)
             != self.journal.readable()?.manifest().identity.replica_node_id
-            || self.next_release().is_none_or(|due| due > now_millis)
         {
+            return Ok(ReleaseStep::Idle);
+        }
+        let due = self.next_due().is_some_and(|due| due <= now_millis);
+        if let Some(target) = self.held.as_mut().and_then(|held| held.carry_turn(due)) {
+            self.observe_held()?;
+            return self.prepare_carry(target).await;
+        }
+        if !due {
             return Ok(ReleaseStep::Idle);
         }
         self.observe_held()?;
@@ -165,9 +189,12 @@ impl OwnedJournal {
         }))
     }
 
-    /// Bodies of the entries' `Schedule` operations still in writeback, and
-    /// the numbers of those to read from storage.
-    fn sources(&self, entries: &[(ReleaseKey, PendingSchedule)]) -> (Vec<(u64, Bytes)>, Vec<u64>) {
+    /// Kinds and bodies of the entries' `Schedule` or `Carry` operations
+    /// still in writeback, and the numbers of those to read from storage.
+    fn sources(
+        &self,
+        entries: &[(ReleaseKey, PendingSchedule)],
+    ) -> (Vec<(u64, OperationKind, Bytes)>, Vec<u64>) {
         let mut hot = Vec::new();
         let mut cold = Vec::new();
         let mut sources = entries
@@ -178,7 +205,7 @@ impl OwnedJournal {
         sources.dedup();
         for number in sources {
             match self.writeback.operation_bytes(number) {
-                Some(body) => hot.push((number, body)),
+                Some((kind, body)) => hot.push((number, kind, body)),
                 None => cold.push(number),
             }
         }
@@ -290,6 +317,15 @@ impl OwnedJournal {
                     loaded: true,
                 })
             }
+            Built::Stop(end) => {
+                if let Some(held) = self.held.as_mut() {
+                    held.drop_target(end);
+                }
+                Ok(ReleaseTurn {
+                    proposal: None,
+                    loaded: true,
+                })
+            }
         }
     }
 }
@@ -302,6 +338,7 @@ impl ReleaseRead {
                 .await
                 .map(|proposal| Built::Release(proposal.map(Box::new))),
             Work::Load(refill) => refill.read().await.map(Built::Load),
+            Work::Carry(carrying) => carrying.build().await,
         };
         CompletedRelease {
             key: self.key,
@@ -318,37 +355,18 @@ impl Records {
             partition,
             owner_epoch,
             entries,
-            mut hot,
+            hot,
             cold,
             stored,
             mut buffer,
             limits,
         } = self;
-        if let Some(stored) = &stored {
-            for number in cold {
-                let operation = stored
-                    .read_operation_number(number)
-                    .await?
-                    .ok_or(JournalIndexError::MissingOperationNumber(number))?;
-                if operation.kind != OperationKind::Schedule {
-                    return Err(JournalError::AppendMismatch);
-                }
-                hot.push((number, Bytes::from(operation.body.into_owned())));
-            }
-        }
-        hot.sort_unstable_by_key(|(number, _)| *number);
-        let sources = hot
-            .iter()
-            .map(|(number, body)| {
-                match decode_operation_body(OperationKind::Schedule, body, limits)? {
-                    OperationBody::Schedule(schedule) => Ok((*number, schedule)),
-                    _ => Err(JournalError::AppendMismatch),
-                }
-            })
-            .collect::<Result<Vec<_>, JournalError>>()?;
+        let bodies = read_sources(hot, &cold, stored.as_ref()).await?;
+        let sources = batches(&bodies, limits)?;
         let room = buffer.limits().max_body_bytes.min(limits.max_body_bytes);
-        let (records, through) = held_records(&sources, &entries, limits, room)?;
-        let Some(through) = through else {
+        let (records, _) =
+            held_records(&sources, &entries, limits, room, (RELEASE_FRAME_BYTES, 0))?;
+        let Some(through) = records.len().checked_sub(1).map(|last| entries[last].0) else {
             return Ok(None);
         };
         let body = OperationBody::Release(Release {
@@ -372,46 +390,87 @@ impl Records {
     }
 }
 
-/// The held records in release order that fit one operation, and the
-/// release key of the last one.
+/// Kinds and bodies of the source operations: `hot` ones, then `cold` ones
+/// read from `stored`, by number.
+async fn read_sources(
+    mut hot: Vec<(u64, OperationKind, Bytes)>,
+    cold: &[u64],
+    stored: Option<&JournalIndexSnapshot>,
+) -> Result<Vec<(u64, OperationKind, Bytes)>, JournalError> {
+    if let Some(stored) = stored {
+        for &number in cold {
+            let operation = stored
+                .read_operation_number(number)
+                .await?
+                .ok_or(JournalIndexError::MissingOperationNumber(number))?;
+            hot.push((
+                number,
+                operation.kind,
+                Bytes::from(operation.body.into_owned()),
+            ));
+        }
+    }
+    hot.sort_unstable_by_key(|(number, _, _)| *number);
+    Ok(hot)
+}
+
+/// The batch of each `Schedule` or `Carry` source, by number.
+fn batches(
+    bodies: &[(u64, OperationKind, Bytes)],
+    limits: OperationLimits,
+) -> Result<Vec<(u64, AppendBatch<'_>)>, JournalError> {
+    bodies
+        .iter()
+        .map(
+            |(number, kind, body)| match decode_operation_body(*kind, body, limits)? {
+                OperationBody::Schedule(schedule) => Ok((*number, schedule.batch)),
+                OperationBody::Carry(carry) => Ok((*number, carry.batch)),
+                _ => Err(JournalError::AppendMismatch),
+            },
+        )
+        .collect()
+}
+
+/// The first held records of `entries` that fit one operation of `room`
+/// bytes, and that operation's size. `framing` is its bytes beyond the
+/// records, and the bytes it adds per record.
 fn held_records<'a>(
-    sources: &'a [(u64, Schedule<'_>)],
+    sources: &'a [(u64, AppendBatch<'_>)],
     entries: &[(ReleaseKey, PendingSchedule)],
     limits: OperationLimits,
     room: usize,
-) -> Result<(Vec<AppendRecord<'a>>, Option<ReleaseKey>), JournalError> {
+    (frame, extra): (usize, usize),
+) -> Result<(Vec<AppendRecord<'a>>, usize), JournalError> {
     let mut records = Vec::with_capacity(entries.len());
-    let mut through = None;
-    let (mut bytes, mut payload, mut parts) = (RELEASE_FRAME_BYTES, 0_usize, 0_usize);
-    for (key, pending) in entries {
+    let (mut bytes, mut payload, mut parts) = (frame, 0_usize, 0_usize);
+    for (_, pending) in entries {
         let index = sources
             .binary_search_by_key(&pending.operation, |(number, _)| *number)
             .map_err(|_| JournalError::AppendMismatch)?;
         let record = sources[index]
             .1
-            .batch
             .records
             .get(pending.index as usize)
             .filter(|record| record.message_id == pending.message_id)
             .ok_or(JournalError::AppendMismatch)?;
         let size = record.parts.iter().map(<[u8]>::len).sum::<usize>();
         let count = record.parts.len();
-        bytes += encoded_record_bytes(record.encoding, record.parts.iter());
+        let total = bytes + encoded_record_bytes(record.encoding, record.parts.iter()) + extra;
         payload += size;
         parts += count;
-        // The first record always fits: its `Schedule` was at least as large
-        // as a `Release` of it alone.
+        // The first record always fits a `Release`: its `Schedule` or
+        // `Carry` was at least as large as a `Release` of it alone.
         if !records.is_empty()
-            && (bytes > room || payload > limits.max_payload_bytes || parts > limits.max_parts)
+            && (total > room || payload > limits.max_payload_bytes || parts > limits.max_parts)
         {
             break;
         }
+        bytes = total;
         records.push(AppendRecord {
             encoding: record.encoding,
             message_id: record.message_id,
             parts: record.parts.iter().collect(),
         });
-        through = Some(*key);
     }
-    Ok((records, through))
+    Ok((records, bytes))
 }

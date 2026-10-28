@@ -39,7 +39,7 @@ pub const STATE_SNAPSHOT_HEADER_BYTES: usize = 256;
 pub const RETRY_SPAN_SNAPSHOT_BYTES: usize = 40;
 
 const SNAPSHOT_MAGIC: &[u8; 8] = b"OZYSTA01";
-const SNAPSHOT_VERSION: u16 = 5;
+const SNAPSHOT_VERSION: u16 = 6;
 const PROGRESS_BYTES: usize = 48;
 const ASSIGNMENT_BYTES: usize = 80;
 const SNAPSHOT_DIGEST_START: usize = 56;

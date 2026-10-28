@@ -28,6 +28,36 @@ fn sealed(controller: &mut Controller, mut journal: Journal, encoding: BodyEncod
 }
 
 #[test]
+fn held_records_age_their_segment_by_acceptance_and_carry_time() {
+    let (mut controller, mut journal) = empty_journal();
+    for (kind, body) in [
+        (OperationKind::Schedule, indexes::schedule_body(0)),
+        (OperationKind::Carry, indexes::carry_body()),
+    ] {
+        let operation = CanonicalOperation {
+            kind,
+            body: &body,
+            ..operation(&journal)
+        };
+        let written = drive(
+            &mut controller,
+            journal.append(&[operation], BodyEncoding::Raw),
+        )
+        .unwrap();
+        drive(&mut controller, journal.sync_through(written)).unwrap();
+    }
+    drive(&mut controller, journal.roll_active(32768, 4)).unwrap();
+    let summary = drive(
+        &mut controller,
+        journal.retention_segment(1, indexes::partition()),
+    )
+    .unwrap();
+    // Neither stores a record, but carried records stay for the age.
+    assert_eq!(summary.newest_append_millis, Some(500));
+    assert_eq!(summary.record_end, ozzy_proto::Offset::ZERO);
+}
+
+#[test]
 fn retention_scratch_depends_on_group_limits_instead_of_segment_capacity() {
     let (mut controller, journal) = empty_journal();
     let mut journal = sealed(&mut controller, journal, BodyEncoding::Raw);
