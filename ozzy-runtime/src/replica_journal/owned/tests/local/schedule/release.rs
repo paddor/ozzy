@@ -552,13 +552,16 @@ fn held_records_keep_room_to_release_after_control_requests_stop() {
     assert!(control_room(&mut journal, &driver));
 }
 
+type Copy<'a> = (&'a mut Controller, &'a mut OwnedJournal, &'a mut Driver);
+
 /// Run release steps at `now` until nothing is held, copying each release
-/// to `copy`. Returns the released record IDs and how many steps loaded
-/// sealed records instead.
+/// to `copy`. Each step keeps at most `window` sealed rows loaded. Returns
+/// the released record IDs and how many steps loaded sealed records
+/// instead.
 fn release_all(
-    primary: (&mut Controller, &mut OwnedJournal, &mut Driver),
-    copy: (&mut Controller, &mut OwnedJournal, &mut Driver),
-    now: u64,
+    primary: Copy<'_>,
+    copy: Copy<'_>,
+    window: usize,
     mut until: impl FnMut(usize) -> bool,
 ) -> (Vec<u8>, usize) {
     let (controller, journal, driver) = primary;
@@ -567,16 +570,16 @@ fn release_all(
     while held(journal).0 > 0 && !until(ids.len()) {
         let turn = drive(
             controller,
-            journal.release_turn(driver.begin_validation().unwrap(), now),
+            journal.release_turn(driver.begin_validation().unwrap(), NOW + 1_000),
         )
         .unwrap();
-        assert!(journal.held_rows() <= 2);
+        assert!(journal.held_rows() <= window);
         let Some(proposal) = turn.proposal else {
             assert!(turn.loaded);
             loads += 1;
             continue;
         };
-        let result = validate(controller, journal, driver, proposal, now);
+        let result = validate(controller, journal, driver, proposal, NOW + 1_000);
         ids.extend(released(&result).3.iter().map(|id| id.as_bytes()[0]));
         let (kind, body) = body(&result);
         accept(controller, journal, driver, result);
@@ -585,66 +588,111 @@ fn release_all(
     (ids, loads)
 }
 
-#[test]
-fn held_records_release_in_order_through_a_small_window_across_segments() {
-    let limits = DelayLimits {
-        max_entries: 64,
-        window: 2,
-    };
-    let (mut controller, mut journal, mut driver) = delayed_with(limits);
-    let (mut other, mut copy, mut copy_driver) = delayed_with(limits);
+/// Schedule `batches` batches of three records with due times out of
+/// order, copying each to `copy`. After each batch, `rolls` says whether the
+/// primary and the copy roll. Returns the record IDs in release order.
+fn schedule_batches(
+    primary: Copy<'_>,
+    copy: Copy<'_>,
+    batches: u64,
+    mut rolls: impl FnMut(u64) -> (bool, bool),
+    mut after: impl FnMut(&OwnedJournal, &OwnedJournal),
+) -> Vec<u8> {
+    let (controller, journal, driver) = primary;
+    let (other, copy, copy_driver) = copy;
     let mut expected = Vec::new();
-    for batch in 0..5_u64 {
+    for batch in 0..batches {
         let first = batch * 3;
         let due: Vec<_> = (0..3)
             .map(|at| NOW - 50 + (batch * 7 + at * 5) % 13 * 10)
             .collect();
         let result = produce(
-            &mut controller,
-            &mut journal,
-            &driver,
+            controller,
+            journal,
+            driver,
             request(12, first, 3),
             Some(&due),
             NOW,
         );
         let (kind, schedule) = body(&result);
-        accept(&mut controller, &mut journal, &mut driver, result);
-        replicate(&mut other, &mut copy, &mut copy_driver, kind, &schedule).unwrap();
+        accept(controller, journal, driver, result);
+        replicate(other, copy, copy_driver, kind, &schedule).unwrap();
         for (at, due) in (0..).zip(&due) {
             expected.push(((*due.max(&NOW), first + at), (first + at + 1) as u8));
         }
-        // Four sealed segments hold records; the last batch stays active.
-        if batch < 4 {
-            roll(&mut controller, &mut journal);
-            roll(&mut other, &mut copy);
+        let (primary, copied) = rolls(batch);
+        if primary {
+            roll(controller, journal);
         }
+        if copied {
+            roll(other, copy);
+        }
+        after(journal, copy);
     }
     expected.sort_unstable();
-    let expected: Vec<_> = expected.into_iter().map(|(_, id)| id).collect();
+    expected.into_iter().map(|(_, id)| id).collect()
+}
 
-    // The copy never loads sealed records; its releases pass them unread.
-    let (mut ids, mut loads) = release_all(
-        (&mut controller, &mut journal, &mut driver),
-        (&mut other, &mut copy, &mut copy_driver),
-        NOW + 1_000,
-        |released| released >= 6,
-    );
+/// Reopen `journal` from its crash image after a power loss.
+fn restart(
+    controller: Controller,
+    journal: OwnedJournal,
+    limits: DelayLimits,
+) -> (Controller, OwnedJournal, Driver) {
     let (image, _) = controller.crash(true).unwrap();
     drop(journal);
     let (mut controller, io) = setup_image(image);
     let mut config = local_config();
     config.delay = Some(limits);
-    let (mut journal, mut driver) = drive(
+    let (journal, driver) = drive(
         &mut controller,
         OwnedJournal::open_local(config, io, JournalGeneration(2)),
     )
     .unwrap();
+    (controller, journal, driver)
+}
+
+fn segments(journal: &OwnedJournal) -> usize {
+    journal
+        .journal
+        .readable()
+        .unwrap()
+        .manifest()
+        .segments
+        .len()
+}
+
+#[test]
+fn held_records_release_in_order_through_a_small_window_across_segments() {
+    let limits = DelayLimits {
+        window: 2,
+        ..DelayLimits::new(64)
+    };
+    let (mut controller, mut journal, mut driver) = delayed_with(limits);
+    let (mut other, mut copy, mut copy_driver) = delayed_with(limits);
+    // Four sealed segments hold records; the last batch stays active.
+    let expected = schedule_batches(
+        (&mut controller, &mut journal, &mut driver),
+        (&mut other, &mut copy, &mut copy_driver),
+        5,
+        |batch| (batch < 4, batch < 4),
+        |_, _| {},
+    );
+
+    // The copy never loads sealed records; its releases pass them unread.
+    let (mut ids, mut loads) = release_all(
+        (&mut controller, &mut journal, &mut driver),
+        (&mut other, &mut copy, &mut copy_driver),
+        2,
+        |released| released >= 6,
+    );
+    let (mut controller, mut journal, mut driver) = restart(controller, journal, limits);
     // Restart loads the window from the sealed indexes.
     assert!(journal.held_rows() > 0);
     let (rest, more) = release_all(
         (&mut controller, &mut journal, &mut driver),
         (&mut other, &mut copy, &mut copy_driver),
-        NOW + 1_000,
+        2,
         |_| false,
     );
     ids.extend(rest);
@@ -654,4 +702,130 @@ fn held_records_release_in_order_through_a_small_window_across_segments() {
     assert_eq!(held(&journal), (0, 15, Offset::new(15)));
     assert_eq!(held(&copy), (0, 15, Offset::new(15)));
     assert_eq!(journal.next_release(), None);
+}
+
+/// Pack the sealed segments of a journal low on segments.
+fn pack(controller: &mut Controller, journal: &mut OwnedJournal) {
+    let max = journal.limits.metadata.max_segments;
+    journal.limits.metadata.max_segments = segments(journal) + 1;
+    let work = journal.take_pack_work().expect("a pack is due");
+    journal.limits.metadata.max_segments = max;
+    let done = drive(controller, work.run());
+    journal.complete_pack(done);
+    assert!(journal.pack_ready());
+    drive(controller, journal.finish_pack()).unwrap();
+}
+
+#[test]
+fn held_records_release_in_order_from_packed_segments() {
+    let limits = DelayLimits {
+        window: 2,
+        ..DelayLimits::new(64)
+    };
+    let (mut controller, mut journal, mut driver) = delayed_with(limits);
+    let (mut other, mut copy, mut copy_driver) = delayed_with(limits);
+    let expected = schedule_batches(
+        (&mut controller, &mut journal, &mut driver),
+        (&mut other, &mut copy, &mut copy_driver),
+        5,
+        |batch| (batch < 4, batch < 4),
+        |_, _| {},
+    );
+    let (mut ids, _) = release_all(
+        (&mut controller, &mut journal, &mut driver),
+        (&mut other, &mut copy, &mut copy_driver),
+        2,
+        |released| released >= 4,
+    );
+    // One packed segment replaces the sealed ones; loading continues from
+    // its index, before and after a restart.
+    let before = segments(&journal);
+    pack(&mut controller, &mut journal);
+    assert!(segments(&journal) < before - 1, "{before} segments");
+    let (more, loads) = release_all(
+        (&mut controller, &mut journal, &mut driver),
+        (&mut other, &mut copy, &mut copy_driver),
+        2,
+        |released| released >= 4,
+    );
+    assert!(loads > 0);
+    ids.extend(more);
+    let (mut controller, mut journal, mut driver) = restart(controller, journal, limits);
+    let (rest, _) = release_all(
+        (&mut controller, &mut journal, &mut driver),
+        (&mut other, &mut copy, &mut copy_driver),
+        2,
+        |_| false,
+    );
+    ids.extend(rest);
+    assert_eq!(ids, expected);
+    assert_eq!(held(&journal), (0, 15, Offset::new(15)));
+    assert_eq!(held(&copy), (0, 15, Offset::new(15)));
+}
+
+#[test]
+fn a_copy_loads_past_its_window_to_check_a_release_of_rows_it_sealed() {
+    let (mut controller, mut journal, mut driver) = delayed(64);
+    let limits = DelayLimits {
+        window: 2,
+        ..DelayLimits::new(64)
+    };
+    let (mut other, mut copy, mut copy_driver) = delayed_with(limits);
+    // The primary keeps every held row in its active segment; the copy seals
+    // them in four segments.
+    let expected = schedule_batches(
+        (&mut controller, &mut journal, &mut driver),
+        (&mut other, &mut copy, &mut copy_driver),
+        5,
+        |batch| (false, batch < 4),
+        |_, _| {},
+    );
+    // One release passes every row, so the copy loads past its window.
+    let (ids, loads) = release_all(
+        (&mut controller, &mut journal, &mut driver),
+        (&mut other, &mut copy, &mut copy_driver),
+        0,
+        |_| false,
+    );
+    assert_eq!((ids, loads), (expected, 0));
+    assert_eq!(held(&copy), (0, 15, Offset::new(15)));
+    // The applied release leaves the copy's window bounded again.
+    assert!(copy.held_rows() <= limits.window);
+}
+
+#[test]
+fn held_records_in_memory_stay_within_the_window_and_the_active_cap() {
+    let limits = DelayLimits {
+        window: 4,
+        active: 7,
+        ..DelayLimits::new(64)
+    };
+    let (mut controller, mut journal, mut driver) = delayed_with(limits);
+    let (mut other, mut copy, mut copy_driver) = delayed_with(limits);
+    let (first, copied) = (segments(&journal), segments(&copy));
+    // Each copy rolls early once seven rows are in memory, so the rows of
+    // its sealed segments past the window stay on disk.
+    let expected = schedule_batches(
+        (&mut controller, &mut journal, &mut driver),
+        (&mut other, &mut copy, &mut copy_driver),
+        8,
+        |_| (false, false),
+        |journal, copy| {
+            for journal in [journal, copy] {
+                let rows = journal.held_memory();
+                assert!(rows <= limits.window + limits.active, "{rows} rows");
+            }
+        },
+    );
+    assert_eq!(segments(&journal) - first, 3);
+    assert_eq!(segments(&copy) - copied, 3);
+    let (ids, loads) = release_all(
+        (&mut controller, &mut journal, &mut driver),
+        (&mut other, &mut copy, &mut copy_driver),
+        4,
+        |_| false,
+    );
+    assert_eq!(ids, expected);
+    assert!(loads > 0);
+    assert_eq!(held(&copy), (0, 24, Offset::new(24)));
 }

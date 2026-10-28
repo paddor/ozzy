@@ -17,14 +17,18 @@ pub struct DelayLimits {
     /// Held records of sealed segments each copy keeps loaded past the last
     /// release.
     pub window: usize,
+    /// Held records of the active segment each copy keeps in memory before
+    /// it rolls the segment early.
+    pub active: usize,
 }
 
 impl DelayLimits {
-    /// Limits with `max_entries` and the default window.
+    /// Limits with `max_entries` and the default memory bounds.
     pub const fn new(max_entries: u64) -> Self {
         Self {
             max_entries,
             window: super::held::HELD_WINDOW,
+            active: super::held::HELD_ACTIVE,
         }
     }
 }
@@ -103,7 +107,9 @@ impl OwnedConfig {
             || !configuration
                 .voters()
                 .contains(&self.identity.replica_node_id)
-            || self.delay.is_some_and(|delay| delay.window == 0)
+            || self
+                .delay
+                .is_some_and(|delay| delay.window == 0 || delay.active == 0)
         {
             return Err(JournalError::Configuration);
         }

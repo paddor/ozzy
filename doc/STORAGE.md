@@ -202,17 +202,21 @@ part. General descriptors use:
   Payloads stay in the `Schedule` operation until release.
 - Each copy keeps a held index of the rest: key, `Schedule` operation,
   record index, encoded bytes, and message ID. Rows of the active segment
-  and later operations stay in memory. Of sealed segments, only the next
-  rows after the last release are loaded from their index files, 65536 by
-  default. A row's place is certain once every row before it is loaded, and
-  the primary releases only certain rows.
+  and later operations stay in memory. Once 262144 are, a copy rolls its
+  segment before its next write when it has room to roll, so they move to
+  its index file. Of sealed segments, only the next rows after the last
+  release are loaded from their index files, 65536 by default. A row's
+  place is certain once every row before it is loaded, and the primary
+  releases only certain rows.
 - A `Release` copies exactly the held records through its key, in key order.
   Each copy checks message IDs and encoded byte counts against its held
   index and the `Schedule` operations before it in the same batch, first
   loading sealed rows the release passes. Validation of that batch waits for
-  those reads. Partition state then checks the totals, a key past the last
-  release, a timestamp that reaches the key's time, and the next offsets. A
-  repeated release does not pass the last one and fails.
+  those reads. Segments differ between copies, so a release can pass more
+  sealed rows than the window; they stay loaded until it applies. Partition
+  state then checks the totals, a key past the last release, a timestamp
+  that reaches the key's time, and the next offsets. A repeated release does
+  not pass the last one and fails.
 - A scheduled attempt's retry result names its `Schedule` operation and maps
   the sequence to its schedule sequence.
 - Retention keeps the oldest segment whose last scheduled-record key is past
@@ -551,7 +555,8 @@ Defaults live in [`ozzy-config`](../ozzy-config/README.md).
 | `workers.progress_jobs`, `progress_bytes` | Capacity reserved for progress jobs |
 | Shard `budget` | Backlog of accepted work: burst and stall tolerance versus RAM |
 
-- A segment rolls at its physical or decoded limit, whichever comes first.
+- A segment rolls at its physical or decoded limit, whichever comes first,
+  or early at its held-record bound.
 - Backlog must cover write and roll stalls. It cannot fix a sustained disk
   deficit. Transport aliases, reads, and dirty pages need additional RAM.
 

@@ -56,11 +56,35 @@ impl Cluster {
         memory_limits: ImageLimits,
         configure: impl FnOnce(&mut ozzy_config::Deployment),
     ) -> Self {
+        Self::start(mode, clock, memory_limits, None, configure).await
+    }
+
+    /// Keep `window` sealed held rows loaded and roll a segment early at
+    /// `active` held rows in every broker, across restarts.
+    pub async fn configured_held(
+        mode: DeploymentMode,
+        clock: Option<SdkClock>,
+        (window, active): (usize, usize),
+        configure: impl FnOnce(&mut ozzy_config::Deployment),
+    ) -> Self {
+        Self::start(mode, clock, IMAGE_LIMITS, Some((window, active)), configure).await
+    }
+
+    async fn start(
+        mode: DeploymentMode,
+        clock: Option<SdkClock>,
+        memory_limits: ImageLimits,
+        held: Option<(usize, usize)>,
+        configure: impl FnOnce(&mut ozzy_config::Deployment),
+    ) -> Self {
         let runtime = WriterRuntime::new().unwrap();
-        let context = clock.map_or_else(
+        let mut context = clock.map_or_else(
             || ServingContext::from(runtime.context().clone()),
             |clock| ServingContext::simulated(runtime.context().clone(), clock, 1_000_000),
         );
+        if let Some((window, active)) = held {
+            context = context.with_held_bounds(window, active);
+        }
         let root = PathBuf::from(format!("/ozzy-churn-{}", Uuid::now_v7()));
         let resources = ozzy_config::HostResources {
             cpus: std::collections::BTreeMap::from([(0, Some(0))]),

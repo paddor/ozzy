@@ -105,6 +105,10 @@ impl OwnedJournal {
                 None => return Ok(WriteStep::Waiting),
             },
         };
+        if self.roll_early(&encoded)? {
+            self.writeback.encoded = Some(encoded);
+            return Ok(WriteStep::RollRequired);
+        }
         // A group that does not fit stays encoded until the journal rolls.
         let pipeline = match self.journal.pipeline(self.writeback.limits.max_operations) {
             Ok(pipeline) => pipeline,
@@ -151,6 +155,20 @@ impl OwnedJournal {
             work,
             observed: self.writeback.observation(),
         }))
+    }
+
+    /// Whether to roll before `encoded` because the active segment holds
+    /// too many held records. Without room to roll it writes on.
+    fn roll_early(&mut self, encoded: &Encoded) -> Result<bool, JournalError> {
+        let Some(next) = encoded.parts.first().and_then(|part| {
+            part.append
+                .operations()
+                .nth(part.range.start)
+                .map(|operation| operation.op_number)
+        }) else {
+            return Ok(false);
+        };
+        Ok(self.held_crowded(next)? && self.can_roll()? && self.spare.ready())
     }
 
     /// Select and encode the next bounded group; `None` when nothing waits.

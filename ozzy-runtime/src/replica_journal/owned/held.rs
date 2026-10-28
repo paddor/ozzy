@@ -24,6 +24,10 @@ use check::{Checked, check};
 /// fixed size, so the count also bounds their memory.
 pub(super) const HELD_WINDOW: usize = 65_536;
 
+/// Held rows of the active segment and later operations at which a copy
+/// rolls the segment early by default, so they move to its index file.
+pub(super) const HELD_ACTIVE: usize = 262_144;
+
 type Rows = BTreeMap<ReleaseKey, PendingSchedule>;
 
 /// A sealed operation range holding scheduled records.
@@ -238,11 +242,22 @@ impl Held {
         self.segments.retain(|segment| segment.last >= retained);
     }
 
+    /// Whether `active` held rows are in memory and the active segment
+    /// holds a `Schedule` before `next`, the first operation not yet
+    /// written. Rolling then moves that segment's rows to its index file.
+    pub(super) fn crowded(&self, next: u64, active: usize) -> bool {
+        self.recent.len() >= active && self.recent_operations.range(..next).next().is_some()
+    }
+
     /// Bound `sealed` by the window, and mark every sealed row loaded once
     /// no segment has one past `loaded`.
     fn settle(&mut self) {
+        self.settle_within(self.window);
+    }
+
+    fn settle_within(&mut self, window: usize) {
         let mut trimmed = false;
-        while self.sealed.len() > self.window {
+        while self.sealed.len() > window {
             self.sealed.pop_last();
             trimmed = true;
         }
@@ -296,6 +311,17 @@ impl Held {
     /// Install rows read after the loaded bound. Rows read before a segment
     /// rolled may miss its rows, so they are dropped.
     pub(super) fn load(&mut self, load: Load) {
+        self.load_within(load, self.window);
+    }
+
+    /// Install rows a release needs checked. Another copy's segments may
+    /// hold in memory rows that are sealed here, so one release can pass
+    /// more than the window; its rows stay loaded until it applies.
+    fn extend(&mut self, load: Load) {
+        self.load_within(load, usize::MAX);
+    }
+
+    fn load_within(&mut self, load: Load, window: usize) {
         if load.active != self.active || load.partition != self.partition {
             return;
         }
@@ -313,7 +339,7 @@ impl Held {
         } else {
             None
         };
-        self.settle();
+        self.settle_within(window);
     }
 
     /// First operation retention keeps for held records, given the last
@@ -415,6 +441,14 @@ impl super::OwnedJournal {
         self.delay.map_or(HELD_WINDOW, |limits| limits.window)
     }
 
+    /// Whether to roll before writing operations from `next` on, to bound
+    /// the held rows in memory.
+    pub(super) fn held_crowded(&mut self, next: u64) -> Result<bool, JournalError> {
+        self.observe_held()?;
+        let active = self.delay.map_or(HELD_ACTIVE, |limits| limits.active);
+        Ok(matches!(&self.held, Some(held) if held.crowded(next, active)))
+    }
+
     /// Rebuild the held index from indexes and the active segment before
     /// admission. Accepted operations are all written here.
     pub(in crate::replica_journal) async fn restore_held(&mut self) -> Result<(), JournalError> {
@@ -479,6 +513,13 @@ impl super::OwnedJournal {
         self.held.as_ref().map_or(0, Held::loaded_rows)
     }
 
+    /// Held rows in memory, loaded or of the active segment on.
+    #[cfg(test)]
+    pub(in crate::replica_journal) fn held_memory(&self) -> usize {
+        let Some(held) = &self.held else { return 0 };
+        held.recent.len() + held.sealed.len()
+    }
+
     /// Check every `Release` in `buffer` against the held index, first
     /// loading the sealed rows a release passes. Validation of `buffer` waits
     /// for those reads.
@@ -504,7 +545,7 @@ impl super::OwnedJournal {
             let snapshot = self.journal.retry_snapshot(self.recovery.index).await?;
             let load = held.refill(snapshot).read().await?;
             let held = self.held.as_mut().ok_or(JournalError::AppendMismatch)?;
-            held.load(load);
+            held.extend(load);
             // Each load reads past the loaded rows or loads every one.
             if held.loaded == before {
                 return Err(JournalError::AppendMismatch);
@@ -539,8 +580,8 @@ impl super::OwnedJournal {
         Ok(())
     }
 
-    /// Debug builds compare the held index with canonical state, which
-    /// still holds every record.
+    /// Debug builds compare the held index with the canonical cursor and
+    /// held totals.
     pub(super) fn check_held(&self) -> Result<(), JournalError> {
         #[cfg(debug_assertions)]
         if let Some(held) = &self.held {

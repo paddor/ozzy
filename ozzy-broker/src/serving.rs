@@ -136,10 +136,13 @@ impl Broker {
         context: impl Into<ServingContext>,
         storage: ShardStorage<B, impl StorageOwner>,
     ) -> Result<Self, StartupError> {
-        let journals = Arc::new(
-            JournalPlan::from_trusted_deployment(&checked, &local)?.select_recovery(selections)?,
-        );
-        Self::start_on_storage(checked, journals, context.into(), storage).await
+        let context = context.into();
+        #[cfg_attr(not(feature = "simulation"), expect(unused_mut))]
+        let mut journals =
+            JournalPlan::from_trusted_deployment(&checked, &local)?.select_recovery(selections)?;
+        #[cfg(feature = "simulation")]
+        context.bound_held(&mut journals);
+        Self::start_on_storage(checked, Arc::new(journals), context, storage).await
     }
 
     async fn start_on_storage<B: ozzy_io::Backend + 'static>(
