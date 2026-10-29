@@ -227,9 +227,11 @@ impl Shared {
     pub(super) fn validate(&self, record: &RecordInput) -> Result<usize, WriterError> {
         let limits = self.config.limits;
         let (parts, bytes) = record.shape();
+        // A scheduled record also carries its due time.
+        let due = if record.due_millis().is_some() { 8 } else { 0 };
         let metadata = parts
             .checked_mul(4)
-            .and_then(|n| n.checked_add(ozzy_proto::append::IDENTITY_METADATA_BYTES + 30));
+            .and_then(|n| n.checked_add(ozzy_proto::append::IDENTITY_METADATA_BYTES + 30 + due));
         let Some(bytes) = bytes.filter(|&n| {
             n <= limits
                 .envelope

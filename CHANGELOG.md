@@ -16,13 +16,17 @@
 - APPEND tag 2 carries one due time per record. Brokers refuse it on a
   topic without delay or with an LZ4 payload (NACK 2), with a due time past
   the maximum delay (NACK 21), with more records than the held-record limit
-  (NACK 1), and back off while the partition is full (NACK 10).
+  (NACK 1), and back off while the partition is full (NACK 10). Brokers
+  advertise at most the held-record limit as records per APPEND, so SDK
+  batches fit it.
 - Python SDK: `Producer.send(..., due_millis=)` schedules a record, in the
   blocking and asyncio APIs. Its receipt has disposition `"scheduled"`, and
   its `offset` is the schedule sequence.
 - Java SDK: `SendOptions.withDueMillis(long)` schedules a record. Its receipt
   has disposition `Receipt.Disposition.SCHEDULED`, and its `offset()` is the
   schedule sequence.
+- `ozzy quickstart` also serves topic `delayed`, which takes due times up to
+  an hour ahead.
 
 ### Changed
 
@@ -34,6 +38,11 @@
 
 - Checkpoints fit every retry range the limit allows. A partition with many
   ranges no longer faults its journal when retention writes a checkpoint.
+- A record within the SDK's limits but over the broker's fails its own
+  `send` with `RecordLimits`. Before, it failed the whole partition writer
+  with `Configuration`. Delay topics leave less room per record.
+- Java SDK: `PendingRecord.confirmedAsync` returns a failed future for a
+  failure it already knows, instead of throwing `OzzyException`.
 
 ## [0.6.0] - 2026-10-26
 

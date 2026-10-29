@@ -279,7 +279,7 @@ impl Writer {
     async fn start_shared(
         routes: &super::TopicRoutes,
         number: u32,
-        config: WriterConfig,
+        mut config: WriterConfig,
         retry: RetryPolicy,
         open: bool,
     ) -> Result<Self, WriterError> {
@@ -288,6 +288,7 @@ impl Writer {
             .metadata()
             .partition(number)
             .ok_or(WriterError::Configuration)?;
+        config.limits = broker_limits(routes.links(), &partition.members, config.limits);
         let local = partition.members.len() == 1;
         config.parameters_with_local_group(local)?;
         if config.partition != partition.incarnation
@@ -299,17 +300,11 @@ impl Writer {
         let reservation =
             super::broker_links::append::Connection::writer_reservation(routes.links(), &config)
                 .ok_or(WriterError::Configuration)?;
-        let operation = if open {
-            Some(ozzy_proto::OperationId::from_bytes(
-                *routes
-                    .links()
-                    .next_request()
-                    .map_err(Error::from)?
-                    .as_bytes(),
-            ))
-        } else {
-            None
-        };
+        let operation = open
+            .then(|| routes.links().next_request())
+            .transpose()
+            .map_err(Error::from)?
+            .map(|id| ozzy_proto::OperationId::from_bytes(*id.as_bytes()));
         let routes = routes.clone();
         let runtime = routes.links().runtime().clone();
         runtime
@@ -445,6 +440,29 @@ impl Writer {
         self.shared.finished.closed().await;
         result
     }
+}
+
+/// `limits` within the receive limits of each member with a live link.
+/// Admission then refuses a record the brokers cannot take, instead of the
+/// driver failing on it. One deployment gives every broker the same limits;
+/// members without a live link yet are skipped.
+fn broker_limits(
+    links: &super::BrokerLinks,
+    members: &[ozzy_proto::NodeId],
+    limits: DataLimits,
+) -> DataLimits {
+    // FIXME: if no member has a live link when the writer starts, admission
+    // checks only the client's limits. A record over the broker's then fails
+    // the whole partition writer with `Configuration` once the driver forms
+    // its APPEND (`batch::selection`); later records fail with it. Wait for
+    // a member link here, or give admission the session's limits when the
+    // driver binds one.
+    members
+        .iter()
+        .filter_map(|&member| links.link(member))
+        .fold(limits, |limits, link| {
+            limits.intersection(link.remote.receive)
+        })
 }
 
 impl Drop for Writer {

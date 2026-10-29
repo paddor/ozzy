@@ -18,6 +18,8 @@ use ozzy_config::Deployment;
 
 const BROKER: &str = "local";
 const TOPIC: &str = "orders";
+/// A topic whose records may carry a due time.
+const DELAYED: &str = "delayed";
 
 /// Files of one quickstart directory.
 struct Paths {
@@ -50,15 +52,31 @@ pub(super) fn run(directory: &Path) -> Result<(), StartupError> {
     )?;
     let local = load_broker_identity(&checked, &paths.local)?;
     let config = paths.config.display();
-    println!("Broker {BROKER} with topic {TOPIC}: {config}");
-    println!("Watch it:");
-    println!("  cargo run --release -p ozzy-ui -- --config {config} --broker {BROKER}");
-    println!("Write and read records:");
-    println!(
-        "  cargo run --release -p ozzy-broker --example ozzy_demo -- --config {config} \
+    let demo = format!(
+        "cargo run --release -p ozzy-broker --example ozzy_demo -- --config {config} \
          --broker {BROKER} --identity {}",
         paths.shared.display()
     );
+    // A directory provisioned before topic `delayed` existed lacks it.
+    let delayed = checked
+        .deployment
+        .deployment()
+        .topics
+        .get(DELAYED)
+        .is_some_and(|topic| topic.delay.is_some());
+    if delayed {
+        println!("Broker {BROKER} with topics {TOPIC} and {DELAYED}: {config}");
+    } else {
+        println!("Broker {BROKER} with topic {TOPIC}: {config}");
+    }
+    println!("Watch it:");
+    println!("  cargo run --release -p ozzy-ui -- --config {config} --broker {BROKER}");
+    println!("Write and read records:");
+    println!("  {demo}");
+    if delayed {
+        println!("Deliver each record 10 s after writing it:");
+        println!("  {demo} --topic {DELAYED} --due-secs 10");
+    }
     println!("Ctrl-C stops the broker. Run the same command again to restart it.");
     super::runtime()?.block_on(super::serve::run(checked, local, &[]))
 }
@@ -115,8 +133,8 @@ fn provision(paths: Paths) -> Result<Paths, StartupError> {
     Ok(paths)
 }
 
-/// Small segments and retention, so formatting writes 64 MiB and a long demo
-/// keeps at most about 1 GiB.
+/// Small segments and retention, so formatting writes 128 MiB and a long
+/// demo keeps at most about 1 GiB per topic.
 fn deployment_text(
     data: &Path,
     [peer, data_peer, reader]: [u16; 3],
@@ -152,6 +170,17 @@ segment_bytes = 16777216
 
 [topics.{TOPIC}.retention]
 max_bytes = 268435456
+
+[topics.{DELAYED}]
+partitions = 4
+segment_bytes = 16777216
+
+[topics.{DELAYED}.retention]
+max_bytes = 268435456
+
+[topics.{DELAYED}.delay]
+max_secs = 3600
+max_entries = 1000000
 "#
     ))
 }
@@ -190,6 +219,14 @@ mod tests {
         let root = &deployment.deployment().brokers[BROKER].devices["data"].root;
         assert_eq!(root, Path::new("/tmp/a \"b\" \\c/data"));
         assert_eq!(deployment.deployment().topics[TOPIC].partitions, 4);
+        assert!(deployment.deployment().topics[TOPIC].delay.is_none());
+        assert_eq!(
+            deployment.deployment().topics[DELAYED]
+                .delay
+                .unwrap()
+                .max_secs,
+            3600
+        );
     }
 
     #[test]

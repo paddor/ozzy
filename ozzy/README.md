@@ -127,6 +127,10 @@ async fn remind(writer: &mut SharedTopicWriter, due_millis: u64) -> Result<(), B
 
 - Due times are absolute Unix milliseconds, compared with the leader's clock.
   A due time already past releases at once.
+- A due time past acceptance plus the topic's `max_secs` is refused, and the
+  refusal ends that partition's writer: its unconfirmed and later sends fail
+  with `WriterError::Failed`. Open a new writer. The same holds for a due
+  time on a topic without delay.
 - Cancel and deduplication are up to the application.
 
 ## Consume

@@ -431,13 +431,18 @@ fn native_limits(checked: &CheckedConfig) -> Result<DataLimits, StartupError> {
                     .ok_or_else(|| failure("append metadata bound overflows"))
             };
             let header = bound(0)?;
+            // A batch above a partition's dedup or held-record limit never
+            // fits, so the SDK must not form one.
+            let entries = topic
+                .deduplication
+                .map(|policy| policy.max_entries)
+                .or(topic.delay.map(|delay| delay.max_entries))
+                .map_or(2048, |entries| entries.min(2048) as usize);
             Ok((
                 topic.max_append_bytes as usize,
                 header,
                 bound(1)? - header,
-                topic
-                    .deduplication
-                    .map_or(2048, |policy| (policy.max_entries as usize).min(2048)),
+                entries,
             ))
         })
         .collect::<Result<Vec<_>, StartupError>>()?;

@@ -139,6 +139,10 @@ impl RecordInput {
         }
     }
 
+    // FIXME: a due time past acceptance plus the topic's `max_secs`, or one on
+    // a topic without delay, is refused permanently, which fails the whole
+    // partition writer. The writer cannot check either: topic metadata
+    // carries no delay settings. Carry them so admission refuses the record.
     /// Hold this record until `due_millis`, an absolute Unix time in
     /// milliseconds. Readers see it only once due. The topic must enable
     /// delay; the receipt offset is then the record's schedule sequence.

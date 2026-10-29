@@ -81,12 +81,18 @@ public final class PendingRecord {
     }
 
     /**
-     * Await confirmation; cancellation affects only this observer.
+     * Await confirmation; cancellation affects only this observer. A failure, even one known
+     * already, completes the future exceptionally.
      *
      * @return a future that completes with the durable confirmation
      */
     public CompletableFuture<Receipt> confirmedAsync() {
-        Receipt ready = tryConfirmed().orElse(null);
+        Receipt ready;
+        try {
+            ready = tryConfirmed().orElse(null);
+        } catch (OzzyException error) {
+            return CompletableFuture.failedFuture(error);
+        }
         return ready != null ? CompletableFuture.completedFuture(ready) : waiting();
     }
 

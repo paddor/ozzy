@@ -117,7 +117,9 @@ API has docstrings: `help(ozzy.Producer.send)`.
 - On a topic with delay, `due_millis=` (absolute Unix milliseconds) holds a
   record until then. Its receipt says `disposition == "scheduled"`, and its
   `offset` is the schedule sequence; readers see the record at a new offset
-  once it is due. A due time past the topic's maximum delay fails.
+  once it is due. A due time past the topic's maximum delay fails, and so do
+  the producer's unconfirmed and later sends to that partition. Open a new
+  producer.
 - Save `producer.identity` and pass it back as `identity=` to resume after a
   restart. `takeover=True` fences an old process still using it.
 - Persist a checkpoint only after processing succeeds, then reopen with

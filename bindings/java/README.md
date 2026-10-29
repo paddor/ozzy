@@ -131,7 +131,9 @@ public API has Javadoc.
 - On a topic with delay, `withDueMillis(ms)` (absolute Unix milliseconds)
   holds a record until then. Its receipt reports `Disposition.SCHEDULED`, and
   its `offset()` is the schedule sequence; readers see the record at a new
-  offset once it is due. A due time past the topic's maximum delay fails.
+  offset once it is due. A due time past the topic's maximum delay fails,
+  and so do the producer's unconfirmed and later sends to that partition.
+  Open a new producer.
 - Save `producer.identity()` and resume with `client.producer(topic, identity,
   false)` after a restart. `true` fences an old process still using it.
 - Persist a checkpoint only after processing succeeds, then reopen with

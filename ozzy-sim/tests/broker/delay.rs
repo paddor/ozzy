@@ -74,14 +74,14 @@ async fn writer(clock: &SdkClock, client: &Client) -> SharedTopicWriter {
 }
 
 /// Index of the broker that leads partition 0.
-async fn primary(clock: &SdkClock, cluster: &broker::Cluster, client: &Client) -> usize {
-    let primary = progress(clock, client.leader(0)).await;
+async fn leader(clock: &SdkClock, cluster: &broker::Cluster, client: &Client) -> usize {
+    let leader = progress(clock, client.leader(0)).await;
     cluster
         .configs
         .iter()
         .position(|(config, _)| {
             ozzy_proto::NodeId::from_bytes(*config.identity.brokers[&config.plan.name].as_bytes())
-                == primary
+                == leader
         })
         .unwrap()
 }
@@ -236,8 +236,8 @@ async fn inproc_memory_held_records_survive_a_restart_or_leader_crash_and_releas
             if mode == DeploymentMode::Single {
                 progress(&clock, cluster.restart(0)).await;
             } else {
-                // Crash the primary as its first release comes due.
-                let index = primary(&clock, &cluster, &client).await;
+                // Crash the leader as its first release comes due.
+                let index = leader(&clock, &cluster, &client).await;
                 wait_until(&clock, due).await;
                 progress(&clock, cluster.crash(index, false)).await;
                 progress(&clock, cluster.wait_recovered(index)).await;
@@ -310,6 +310,107 @@ async fn inproc_memory_full_schedule_capacity_backs_off_until_a_release() {
     })
     .await
     .expect("full schedule capacity made no bounded progress");
+}
+
+/// A delay topic leaves less room per record: with a 64 KiB APPEND of up to
+/// 2048 records, each broker takes records of about 2 KiB. A larger record
+/// within the client's limits fails its own send; the writer keeps going.
+#[tokio::test(flavor = "current_thread")]
+async fn inproc_memory_a_record_over_the_broker_limit_fails_only_its_send() {
+    use ozzy_runtime::replicated::{TopicWriterError, WriterError};
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let clock = SdkClock::manual();
+        let cluster = delay_cluster(DeploymentMode::Three, &clock, 2048).await;
+        let client = progress(
+            &clock,
+            Client::open_with_clock(&cluster.configs[0].0, &cluster.runtime, clock.clone()),
+        )
+        .await;
+        let mut limits = ozzy_sim::client::DATA_LIMITS;
+        limits.envelope.max_payload_bytes = 16 * 1024;
+        limits.max_record_bytes = 16 * 1024;
+        let mut writer = progress(
+            &clock,
+            SharedTopicWriter::open(
+                &client.links,
+                "orders",
+                SharedTopicWriterConfig::new(limits),
+                RetryPolicy::default(),
+            ),
+        )
+        .await
+        .unwrap();
+        let due = broker_now(&clock) + 10_000;
+        let large = RecordInput::copy_from_slice(MessageId::from_bytes([1; 16]), &[1; 4096])
+            .with_due_millis(due);
+        let error = writer.send_to_partition(large, 0).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                TopicWriterError::Send {
+                    source: WriterError::RecordLimits,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        let receipts = confirm(&clock, &mut writer, [record(2, Some(due))]).await;
+        assert_eq!(receipts, [(AppendDisposition::Scheduled, 0)]);
+        drop(writer);
+        progress(&clock, client.close()).await;
+        progress(&clock, cluster.shutdown()).await;
+    })
+    .await
+    .expect("an oversized record made no bounded progress");
+}
+
+/// The broker caps APPEND records at the held-record limit, so a burst
+/// larger than the limit goes out in batches that fit and backs off until
+/// releases make room.
+#[tokio::test(flavor = "current_thread")]
+async fn inproc_memory_a_burst_above_the_held_limit_confirms_in_fitting_batches() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let clock = SdkClock::manual();
+        let cluster = delay_cluster(DeploymentMode::Single, &clock, 8).await;
+        let client = progress(
+            &clock,
+            Client::open_with_clock(&cluster.configs[0].0, &cluster.runtime, clock.clone()),
+        )
+        .await;
+        // The client alone would batch up to 64 records.
+        let mut limits = ozzy_sim::client::DATA_LIMITS;
+        limits.max_records = 64;
+        limits.max_parts = 64;
+        let mut writer = progress(
+            &clock,
+            SharedTopicWriter::open(
+                &client.links,
+                "orders",
+                SharedTopicWriterConfig::new(limits),
+                RetryPolicy::default(),
+            ),
+        )
+        .await
+        .unwrap();
+        let due = broker_now(&clock);
+        let receipts = confirm(
+            &clock,
+            &mut writer,
+            (1..=32).map(|id| record(id, Some(due))),
+        )
+        .await;
+        assert!(
+            receipts
+                .iter()
+                .all(|&(disposition, _)| disposition == AppendDisposition::Scheduled)
+        );
+        assert_eq!(released(&clock, &client, 32).await.len(), 32);
+        drop(writer);
+        progress(&clock, client.close()).await;
+        progress(&clock, cluster.shutdown()).await;
+    })
+    .await
+    .expect("a burst above the held limit made no bounded progress");
 }
 
 /// A confirmed record. Its leader accepted it between `sent_at` and
@@ -485,7 +586,7 @@ mod stress {
     }
 
     /// Send rounds of `per_round` records with spread due times and fault
-    /// one copy in each round while earlier rounds release: the primary with
+    /// one copy in each round while earlier rounds release: the leader with
     /// its writes held, or after its records confirm, with or without power
     /// loss, or a follower. A follower also misses a whole round and
     /// installs it after, and later restarts empty and installs the whole
@@ -509,19 +610,19 @@ mod stress {
         let arrivals = arrivals(&clock, &client, count).await;
         let mut sent = Vec::new();
         for round in 0..ROUNDS {
-            // (hold writes, crash the primary, power loss, broker millis to
+            // (hold writes, crash the leader, power loss, broker millis to
             // release before the fault)
-            let (hold, on_primary, power_loss, advance) = match round % 5 {
+            let (hold, on_leader, power_loss, advance) = match round % 5 {
                 0 => (false, true, false, 2_500),
                 1 => (true, true, true, 0),
                 2 | 4 => (false, false, true, 2_500),
                 _ => (false, true, true, 1_500),
             };
-            let primary = primary(&clock, &cluster, &client).await;
-            let target = if on_primary || mode == DeploymentMode::Single {
-                primary
+            let leader = leader(&clock, &cluster, &client).await;
+            let target = if on_leader || mode == DeploymentMode::Single {
+                leader
             } else {
-                (primary + 1) % cluster.configs.len()
+                (leader + 1) % cluster.configs.len()
             };
             let control = cluster.controls[target].clone();
             control.hold_completions(hold);

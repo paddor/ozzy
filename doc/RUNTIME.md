@@ -89,6 +89,7 @@ formed APPENDs still drive the usual keyless rotation.
 | Full batch or `flush` | Goes at once into a free APPEND slot |
 | Records per APPEND | Negotiated limit, capped at 2,048 (`MAX_APPEND_RECORDS`) |
 | Large record | A permitted record above the byte target goes alone |
+| Oversized record | Over the client's or broker's limits, it fails its `send` with `RecordLimits` |
 | Keyless records | Stick to one partition until an APPEND forms, then rotate |
 
 - Every batch is bounded by record count and bytes.

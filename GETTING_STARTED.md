@@ -19,8 +19,9 @@ cargo run --release -p ozzy-broker --example ozzy_demo -- \
 ```
 
 1. `quickstart` provisions broker `local` in `tmp/try` with the steps below,
-   then serves topic `orders` (4 partitions) on loopback TCP ports it picks.
-   Formatting writes 64 MiB; retention keeps at most 256 MiB per partition.
+   then serves topics `orders` and `delayed` (4 partitions each) on loopback
+   TCP ports it picks. Formatting writes 128 MiB; retention keeps at most
+   256 MiB per partition.
 2. `ozzy-tui` shows the broker. Keys and screens: [ozzy-ui](ozzy-ui/README.md).
 3. `ozzy_demo` writes 100 records a second (`--rate`) and reads them as a
    member of group `workers`. It stops on Ctrl-C or when you delete the group
@@ -32,6 +33,27 @@ cargo run --release -p ozzy-broker --example ozzy_demo -- \
   `tmp/try` to start over.
 - Like `serve --trusted-transport`, it does not authenticate clients: any
   local user can connect.
+
+## Try delayed delivery
+
+Topic `delayed` takes records with a due time. With the quickstart broker
+running:
+
+```bash
+cargo run --release -p ozzy-broker --example ozzy_demo -- \
+  --config tmp/try/deployment.toml --broker local --identity tmp/try/shared.identity \
+  --topic delayed --due-secs 10
+```
+
+- Each record is due 10 seconds after it is written. The broker confirms it
+  at once, and readers get it at its due time.
+- Each second, the demo prints how late records arrived after their due
+  time: p50, p99, and max.
+- The topic allows delays up to an hour and holds up to 1,000,000 records per
+  partition. Past that, producers back off until records are released.
+- A `tmp/try` provisioned before topic `delayed` existed does not have it.
+  Remove `tmp/try` and run `quickstart` again.
+- For your own topics, see [delay keys](ozzy-config/README.md#delay).
 
 ## Build
 
