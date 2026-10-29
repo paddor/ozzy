@@ -222,6 +222,12 @@ impl ProposalBuffer {
         self.0.owner_generation()
     }
 
+    /// Reserve `bytes` for a journal-built body, waiting while the shard's
+    /// charged memory is exhausted, so its `push` cannot fail on memory.
+    pub(crate) async fn reserve_payload(&mut self, bytes: usize) -> Result<(), JournalError> {
+        self.0.reserve_payload(bytes).await
+    }
+
     /// Copy one encoded body without hashing, decoding, or allocating past capacity.
     /// Bodies are private until worker validation establishes their canonical form.
     pub fn push(&mut self, kind: OperationKind, body: &[u8]) -> Result<(), JournalError> {

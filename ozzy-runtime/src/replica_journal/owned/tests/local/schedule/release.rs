@@ -831,3 +831,40 @@ fn held_records_in_memory_stay_within_the_window_and_the_active_cap() {
     assert!(loads > 0);
     assert_eq!(held(&copy), (0, 24, Offset::new(24)));
 }
+
+#[test]
+fn release_waits_for_shard_memory_instead_of_failing() {
+    let (mut controller, io) = setup();
+    let mut config = local_config();
+    config.delay = Some(DelayLimits::new(16));
+    let (mut journal, mut driver) = drive(
+        &mut controller,
+        OwnedJournal::format_local(config, io, JournalGeneration(1), 32768),
+    )
+    .unwrap();
+    let memory = payload_owner(4096);
+    journal.bind_append_memory(&memory).unwrap();
+    initialize(&mut controller, &mut journal, &mut driver);
+    scheduled(&mut controller, &mut journal, &mut driver, 0, &[NOW]);
+    memory.trim_cache();
+    let mut occupied = journal.lease_append_buffer().unwrap();
+    occupied.push_read_part(&[0; 4096]).unwrap();
+
+    let proposal = {
+        let mut step =
+            std::pin::pin!(journal.release_turn(driver.begin_validation().unwrap(), NOW));
+        let mut context = Context::from_waker(Waker::noop());
+        for _ in 0..100 {
+            assert!(step.as_mut().poll(&mut context).is_pending());
+            for (id, _) in controller.jobs() {
+                controller.execute(id, Effect::Normal).unwrap();
+                controller.deliver(id).unwrap();
+            }
+        }
+        drop(occupied);
+        drive(&mut controller, step).unwrap().proposal.unwrap()
+    };
+    let result = validate(&mut controller, &mut journal, &driver, proposal, NOW);
+    accept(&mut controller, &mut journal, &mut driver, result);
+    assert_eq!(held(&journal), (0, 1, Offset::new(1)));
+}

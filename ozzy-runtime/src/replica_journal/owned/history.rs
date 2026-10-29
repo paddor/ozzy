@@ -200,7 +200,7 @@ pub(super) async fn fetch(
         .operations()
         .map(|operation| operation.body.len())
         .sum();
-    buffer.reserve_history_payload(bytes).await?;
+    buffer.reserve_payload(bytes).await?;
     for (operation, digest) in chunk.verified_operations() {
         buffer.push(operation)?;
         buffer.body_digests.push(digest);

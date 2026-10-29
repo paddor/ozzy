@@ -400,10 +400,9 @@ impl Records {
             },
             through,
         });
-        buffer.push(
-            OperationKind::Release,
-            &encode_operation_body(&body, limits)?,
-        )?;
+        let encoded = encode_operation_body(&body, limits)?;
+        buffer.reserve_payload(encoded.len()).await?;
+        buffer.push(OperationKind::Release, &encoded)?;
         Ok(Some(buffer))
     }
 }
