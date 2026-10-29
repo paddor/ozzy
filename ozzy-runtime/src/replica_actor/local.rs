@@ -368,13 +368,15 @@ impl LocalActor {
             self.sync_started_at = crate::profiling::start();
             changed = true;
         }
-        changed |= self.start_held_load()?;
+        // A validated write waiting for writeback room has moved the
+        // driver's image past the owner's, so a load waits for its admission.
         if let Some(Pending::Ready(_)) = self.pending
             && let Some(Pending::Ready(ready)) = self.pending.take()
         {
             let (ticket, validated) = *ready;
             return Ok(self.admit_ready(ticket, validated)? | changed);
         }
+        changed |= self.start_held_load()?;
         if self.pending.is_some() || self.journal.available_command_slots() == 0 {
             return Ok(changed);
         }
