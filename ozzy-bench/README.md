@@ -468,11 +468,11 @@ compile its standalone benchmark worker and the shared Rust process runner:
 
 ```sh
 javac --release 22 -Xlint:all -Werror \
-  --class-path "$CARGO_TARGET_DIR/java/ozzy-java-0.6.0-linux-x86_64.jar" \
+  --class-path "$CARGO_TARGET_DIR/java/ozzy-java-0.7.0-linux-x86_64.jar" \
   -d "$CARGO_TARGET_DIR/java/bench" bindings/java/examples/io/ozzy/bench/Pipeline.java
 scripts/ozzy_cargo build --release -p ozzy-bench --bin ozzy_sdk_pipeline
 taskset -c 5 "$CARGO_TARGET_DIR/release/ozzy_sdk_pipeline" --java /usr/bin/java \
-  --java-classpath "$CARGO_TARGET_DIR/java/ozzy-java-0.6.0-linux-x86_64.jar:$CARGO_TARGET_DIR/java/bench" \
+  --java-classpath "$CARGO_TARGET_DIR/java/ozzy-java-0.7.0-linux-x86_64.jar:$CARGO_TARGET_DIR/java/bench" \
   --java-library "$CARGO_TARGET_DIR/release/libozzy_java.so" \
   --broker-cpus 0,1 --producer-cpus 2,3 --consumer-cpu 4 \
   --codec raw --size 1024 --memory-mib 4096 --reader-queue-messages 64 \
