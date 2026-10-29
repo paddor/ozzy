@@ -119,6 +119,11 @@ impl Work {
         Ok(retry)
     }
 
+    /// An admitted maintenance proposal has not finished yet.
+    pub(super) fn committing_maintenance(&self) -> bool {
+        self.live.iter().any(|live| live.reply.is_maintenance())
+    }
+
     /// Reply to live entries whose writes returned their arenas: committed
     /// once applied in the same scope and generation, unknown once fenced.
     fn finish_live(&mut self, snapshot: Option<&ReplicaSnapshot>) {

@@ -36,7 +36,11 @@ pub(crate) fn receipt(receipt: &SharedTopicReceipt) -> [u64; 16] {
     words[10] = r.key.producer_epoch;
     words[11] = r.owner_epoch;
     words[12] = r.key.first_sequence;
-    words[13] = u64::from(r.disposition == AppendDisposition::Duplicate);
+    words[13] = match r.disposition {
+        AppendDisposition::Duplicate => 1,
+        AppendDisposition::Scheduled => 2,
+        _ => 0,
+    };
     words[14] = match r.policy {
         Policy::LocalDurable => 1,
         Policy::QuorumDurable => 2,

@@ -101,6 +101,12 @@ pub(super) fn monotonic_ns() -> u64 {
     now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64
 }
 
+/// Unix time in nanoseconds, the clock brokers release held records by.
+pub(super) fn unix_ns() -> u64 {
+    let now = rustix::time::clock_gettime(rustix::time::ClockId::Realtime);
+    u64::try_from(now.tv_sec).unwrap_or(0) * 1_000_000_000 + now.tv_nsec as u64
+}
+
 impl Drop for Meter {
     fn drop(&mut self) {
         #[cfg(feature = "allocation-counting")]

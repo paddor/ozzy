@@ -15,8 +15,8 @@ mod prepare;
 pub use prepare::{PreparedBroker, Transport};
 mod batch;
 pub use batch::{
-    AppendBudget, DEFAULT_SDK_BATCH_TARGET_BYTES, peer_payload_capacity, reader_queue_messages,
-    segment_body_capacity,
+    AppendBudget, AppendMetadata, DEFAULT_SDK_BATCH_TARGET_BYTES, peer_payload_capacity,
+    reader_queue_messages, segment_body_capacity,
 };
 
 /// Shared TOML and persistent identity for one benchmark run.

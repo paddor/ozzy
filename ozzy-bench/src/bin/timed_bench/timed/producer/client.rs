@@ -34,7 +34,8 @@ pub(super) struct ReceiptCheck {
     first: Option<u64>,
     previous: Option<u64>,
     digest: Option<ozzy_journal::integrity::IntegrityHasher>,
-    pub(super) dispositions: [u64; 2],
+    /// Stored, duplicate, and scheduled receipts.
+    pub(super) dispositions: [u64; 3],
 }
 
 impl ReceiptCheck {
@@ -86,7 +87,7 @@ impl Writer {
             partition: self.partition,
             first: None,
             previous: None,
-            dispositions: [0; 2],
+            dispositions: [0; 3],
             digest: offsets.then(|| {
                 ozzy_journal::integrity::IntegrityHasher::new("ozzy benchmark confirmed offsets v1")
             }),

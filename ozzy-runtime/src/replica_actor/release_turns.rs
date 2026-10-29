@@ -34,14 +34,19 @@ impl Releases {
     }
 
     /// Whether a step may start now. A queued or validating maintenance
-    /// proposal goes first, so the next step sees its release.
+    /// proposal goes first, so the next step sees its release. An admitted
+    /// one still `committing` goes first too: the next step then gathers
+    /// what came due meanwhile, so steps grow with load.
     pub(super) fn due(
         &self,
         journal: &ReplicaJournal,
         proposals: &Proposals,
+        committing: bool,
         now: Duration,
     ) -> bool {
-        !proposals.holds_maintenance() && self.at(journal, now).is_some_and(|at| at <= now)
+        !proposals.holds_maintenance()
+            && !committing
+            && self.at(journal, now).is_some_and(|at| at <= now)
     }
 
     pub(super) fn start(&mut self, step: JournalCompletion<ReleaseTurn>) {

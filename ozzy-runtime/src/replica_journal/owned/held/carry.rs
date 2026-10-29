@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use ozzy_core::retention::Carry as Target;
 use ozzy_core::state::PendingSchedule;
-use ozzy_journal::operation::{Carry, HeldPosition, ReleaseKey};
+use ozzy_journal::operation::{CanonicalOperation, Carry, HeldPosition, ReleaseKey};
 use ozzy_journal_segment::JournalIndexSnapshot;
 use ozzy_proto::PartitionIncarnation;
 
@@ -31,9 +31,16 @@ pub(in crate::replica_journal::owned) struct Between {
 impl Held {
     /// Move a carry's records to its rows. Every row before its end is
     /// gone, so segments wholly before it hold none.
-    pub(super) fn carry(&mut self, operation: u64, carry: &Carry<'_>) -> Result<(), JournalError> {
+    pub(super) fn carry(
+        &mut self,
+        operation: u64,
+        carry: &Carry<'_>,
+        canonical: &CanonicalOperation<'_>,
+    ) -> Result<(), JournalError> {
         let entries = ozzy_core::state::carry_entries(operation, carry)
             .map_err(|_| JournalError::AppendMismatch)?;
+        self.bodies.carried(carry.through.operation);
+        self.keep_body(canonical, &entries);
         for (key, record) in entries {
             // The earlier row is loaded, in memory, or in its index file.
             self.sealed.remove(&key);

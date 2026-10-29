@@ -13,7 +13,7 @@ pub(super) fn summarize(row: &mut Value, config: &Config) -> Result<()> {
         .as_u64()
         .ok_or_else(|| error("missing verified unique record count"))?;
     let dispositions = confirmed_dispositions(row)?;
-    if dispositions != [unique, total - unique] {
+    if dispositions != [unique, total - unique, 0] {
         return Err(error(
             "SDK dispositions disagree with independently verified unique records",
         ));
@@ -45,9 +45,10 @@ pub(super) fn summarize(row: &mut Value, config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Stored and duplicate SDK receipt dispositions over every writer lane.
-fn confirmed_dispositions(row: &Value) -> Result<[u64; 2]> {
-    let mut dispositions = [0_u64; 2];
+/// Stored, duplicate, and scheduled SDK receipt dispositions over every
+/// writer lane.
+pub(super) fn confirmed_dispositions(row: &Value) -> Result<[u64; 3]> {
+    let mut dispositions = [0_u64; 3];
     for worker in row["writers"]
         .as_array()
         .ok_or_else(|| error("missing writers"))?
@@ -56,7 +57,10 @@ fn confirmed_dispositions(row: &Value) -> Result<[u64; 2]> {
             .as_array()
             .ok_or_else(|| error("missing writer lanes"))?
         {
-            for (total, key) in dispositions.iter_mut().zip(["stored", "duplicate"]) {
+            for (total, key) in dispositions
+                .iter_mut()
+                .zip(["stored", "duplicate", "scheduled"])
+            {
                 *total += lane["confirmed_dispositions"][key]
                     .as_u64()
                     .ok_or_else(|| error("missing confirmed dispositions"))?;

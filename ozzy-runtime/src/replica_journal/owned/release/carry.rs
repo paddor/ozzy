@@ -151,7 +151,9 @@ impl Carrying {
             through,
             keys,
         });
-        buffer.push(OperationKind::Carry, &encode_operation_body(&body, limits)?)?;
+        let encoded = encode_operation_body(&body, limits)?;
+        buffer.reserve_payload(encoded.len()).await?;
+        buffer.push(OperationKind::Carry, &encoded)?;
         Ok(Built::Release(Some(Box::new(buffer))))
     }
 }

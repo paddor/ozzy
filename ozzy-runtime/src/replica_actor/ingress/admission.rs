@@ -190,6 +190,11 @@ impl Proposals {
         Some(submission.buffer)
     }
 
+    /// The pending maintenance proposal, before it starts.
+    pub(in crate::replica_actor) fn maintenance(&self) -> Option<&ProposalBuffer> {
+        self.maintenance.as_ref()
+    }
+
     /// Take the pending maintenance proposal into validation, if any.
     pub(in crate::replica_actor) fn start_maintenance(&mut self) -> Option<ProposalBuffer> {
         let buffer = self.maintenance.take()?;

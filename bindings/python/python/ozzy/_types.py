@@ -146,6 +146,17 @@ def message_id(value: MessageId | None) -> bytes | None:
     return value.bytes if isinstance(value, UUID) else UUID(value).bytes
 
 
+def due(value: int | None) -> int | None:
+    """Check an absolute Unix due time in milliseconds; None stays None."""
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError("due_millis must be an int")
+    if not 0 <= value < 2**64:
+        raise ValueError("due_millis must fit an unsigned 64-bit integer")
+    return value
+
+
 def destination(
     key: bytes | None, partition: int | None
 ) -> tuple[bytes | None, int | None]:

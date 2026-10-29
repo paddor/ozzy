@@ -35,7 +35,8 @@ impl Receipt {
     fn incarnation(&self) -> String {
         self.0.record.partition.to_string()
     }
-    /// Partition-global record offset.
+    /// Partition-global record offset, or the schedule sequence of a
+    /// scheduled record.
     #[getter]
     fn offset(&self) -> u64 {
         self.0.record.offset
@@ -65,12 +66,14 @@ impl Receipt {
     fn sequence(&self) -> u64 {
         self.0.record.key.first_sequence
     }
-    /// 'stored' for a new event or 'duplicate' for an existing deduplicated event.
+    /// 'stored' for a new event, 'duplicate' for an existing deduplicated
+    /// event, or 'scheduled' for a record held until its due time.
     #[getter]
     fn disposition(&self) -> &'static str {
         match self.0.record.disposition {
             AppendDisposition::Stored => "stored",
             AppendDisposition::Duplicate => "duplicate",
+            AppendDisposition::Scheduled => "scheduled",
             _ => "unknown",
         }
     }

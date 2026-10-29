@@ -382,10 +382,9 @@ impl AppendBuffer {
         self.bodies.reserve(bytes)
     }
 
-    pub(super) async fn reserve_history_payload(
-        &mut self,
-        bytes: usize,
-    ) -> Result<(), JournalError> {
+    /// Reserve `bytes` more body bytes, waiting while the shard's charged
+    /// memory is exhausted. A later push of them only copies.
+    pub(super) async fn reserve_payload(&mut self, bytes: usize) -> Result<(), JournalError> {
         if bytes > self.room() {
             return Err(JournalError::AppendCapacity);
         }

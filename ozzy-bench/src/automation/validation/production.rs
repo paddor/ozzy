@@ -98,6 +98,7 @@ pub(super) fn production_comparison(
     append_window(row, append_window_limit, &config["partitions"])?;
     production_topology(row, config, partitions, policy.brokers)?;
     dedup_controls(row, config)?;
+    delay_controls(row, config)?;
     requested_window(row, config)?;
     derived_rates(&mut result, row, size as f64)?;
     schedule::scheduled_measurements(case, row, config, &mut result)?;
@@ -177,7 +178,10 @@ fn production_append_bounds(case: &Value, row: &Value, config: &Value) -> Result
                 .ok_or("missing request bound")?,
         )?,
         record_bytes: usize::try_from(size)?,
-        resolved: !config["dedup_window_secs"].is_null(),
+        metadata: crate::native::AppendMetadata {
+            resolved: !config["dedup_window_secs"].is_null(),
+            scheduled: !config["delay_millis"].is_null(),
+        },
         target_bytes: usize::try_from(
             config["native_batch_target_bytes"]
                 .as_u64()
@@ -309,6 +313,26 @@ impl Topology<'_> {
         }
         Ok(())
     }
+}
+
+/// The topic holds records exactly when the case asked for a delay.
+fn delay_controls(row: &Value, config: &Value) -> Result<()> {
+    let delay = &row["effective_deployment"]["topics"]["benchmark"]["delay"];
+    let requested = config["delay_millis"].as_u64();
+    let matches = match requested {
+        Some(millis) => {
+            delay["max_secs"] == millis / 1000 + 1
+                && config["delay_max_entries_per_partition"]
+                    .as_u64()
+                    .is_none_or(|entries| delay["max_entries"] == entries)
+                && row["delay"]["delay_millis"] == millis
+        }
+        None => delay.is_null() && row["delay"].is_null(),
+    };
+    if !matches {
+        return Err("delay policy differs from requested configuration".into());
+    }
+    Ok(())
 }
 
 fn dedup_controls(row: &Value, config: &Value) -> Result<()> {

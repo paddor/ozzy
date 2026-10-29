@@ -17,6 +17,12 @@
   topic without delay or with an LZ4 payload (NACK 2), with a due time past
   the maximum delay (NACK 21), with more records than the held-record limit
   (NACK 1), and back off while the partition is full (NACK 10).
+- Python SDK: `Producer.send(..., due_millis=)` schedules a record, in the
+  blocking and asyncio APIs. Its receipt has disposition `"scheduled"`, and
+  its `offset` is the schedule sequence.
+- Java SDK: `SendOptions.withDueMillis(long)` schedules a record. Its receipt
+  has disposition `Receipt.Disposition.SCHEDULED`, and its `offset()` is the
+  schedule sequence.
 
 ### Changed
 

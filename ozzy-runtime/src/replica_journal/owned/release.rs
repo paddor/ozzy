@@ -169,10 +169,9 @@ impl OwnedJournal {
             return Ok(ReleaseStep::Idle);
         };
         let (hot, cold) = self.sources(&entries);
-        let stored = if cold.is_empty() {
-            None
-        } else {
-            Some(self.journal.retry_snapshot(self.recovery.index).await?)
+        let stored = match cold.last() {
+            Some(&last) => Some(self.release_index(last).await?),
+            None => None,
         };
         Ok(ReleaseStep::Read(ReleaseRead {
             key: self.read_key.clone(),
@@ -189,8 +188,30 @@ impl OwnedJournal {
         }))
     }
 
+    /// An index snapshot holding operations through `last`. Building one
+    /// holds the owner while it opens indexes and scans the active segment.
+    /// Due records were scheduled about a delay ago, so one snapshot serves
+    /// the releases of about that long. It pins its segments until a later
+    /// build or storage cleanup drops it.
+    async fn release_index(&mut self, last: u64) -> Result<JournalIndexSnapshot, JournalError> {
+        let held = self.held.as_ref().ok_or(JournalError::AppendMismatch)?;
+        if let Some(index) = &held.index
+            && index.through().op_number >= last
+        {
+            return Ok(index.clone());
+        }
+        // OPTIMIZE: read cold release sources without rebuilding the index.
+        // The partition reader sees each written group's operation locations.
+        let index = self.journal.retry_snapshot(self.recovery.index).await?;
+        if let Some(held) = self.held.as_mut() {
+            held.index = Some(index.clone());
+        }
+        Ok(index)
+    }
+
     /// Kinds and bodies of the entries' `Schedule` or `Carry` operations
-    /// still in writeback, and the numbers of those to read from storage.
+    /// still in writeback or kept with the held rows, and the numbers of
+    /// those to read from storage.
     fn sources(
         &self,
         entries: &[(ReleaseKey, PendingSchedule)],
@@ -204,7 +225,8 @@ impl OwnedJournal {
         sources.sort_unstable();
         sources.dedup();
         for number in sources {
-            match self.writeback.operation_bytes(number) {
+            let kept = || self.held.as_ref()?.body(number);
+            match self.writeback.operation_bytes(number).or_else(kept) {
                 Some((kind, body)) => hot.push((number, kind, body)),
                 None => cold.push(number),
             }
@@ -382,10 +404,9 @@ impl Records {
             },
             through,
         });
-        buffer.push(
-            OperationKind::Release,
-            &encode_operation_body(&body, limits)?,
-        )?;
+        let encoded = encode_operation_body(&body, limits)?;
+        buffer.reserve_payload(encoded.len()).await?;
+        buffer.push(OperationKind::Release, &encoded)?;
         Ok(Some(buffer))
     }
 }

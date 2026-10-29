@@ -408,7 +408,11 @@ impl LocalActor {
     /// Start a due release step. Its reads run beside writes. `true` when
     /// it started.
     fn start_release(&mut self) -> Result<bool, ActorError> {
-        if !self.releases.due(&self.journal, &self.proposals, self.now) {
+        let committing = self.live.iter().any(|live| live.reply.is_maintenance());
+        if !self
+            .releases
+            .due(&self.journal, &self.proposals, committing, self.now)
+        {
             return Ok(false);
         }
         let ticket = self.driver.begin_validation()?;
@@ -456,6 +460,14 @@ impl LocalActor {
             return Ok(true);
         }
         let state = self.driver.snapshot();
+        // Maintenance waits for room like any proposal, ahead of queued ones.
+        if self
+            .proposals
+            .maintenance()
+            .is_some_and(|buffer| !has_room(&self.driver, &self.journal, buffer, &state))
+        {
+            return Ok(false);
+        }
         if let Some(buffer) = self.proposals.start_maintenance() {
             self.pending = Some(Pending::Propose(
                 self.journal
@@ -473,13 +485,7 @@ impl LocalActor {
             NextProposal::Finished => return Ok(true),
             NextProposal::Ready(waiting) => waiting,
         };
-        let limits = self.driver.limits();
-        if waiting.buffer.len() > limits.max_operations - state.pending_operations
-            || waiting.buffer.body_bytes() > limits.max_body_bytes - state.pending_body_bytes
-            || !self
-                .journal
-                .validation_has_capacity(&waiting.buffer.0, state.accepted.op)
-        {
+        if !has_room(driver, &self.journal, &waiting.buffer, &state) {
             return Ok(false);
         }
         let Some(buffer) = self.proposals.start() else {
@@ -493,6 +499,20 @@ impl LocalActor {
         self.propose_started_at = crate::profiling::start();
         Ok(true)
     }
+}
+
+/// Whether `buffer` fits the pipeline beside the operations `state` holds,
+/// so its admission cannot fail for capacity.
+fn has_room(
+    driver: &Driver,
+    journal: &ReplicaJournal,
+    buffer: &ProposalBuffer,
+    state: &Snapshot,
+) -> bool {
+    let limits = driver.limits();
+    buffer.len() <= limits.max_operations - state.pending_operations
+        && buffer.admitted_body_bytes() <= limits.max_body_bytes - state.pending_body_bytes
+        && journal.validation_has_capacity(&buffer.0, state.accepted.op)
 }
 
 impl LocalActor {

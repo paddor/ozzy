@@ -3,14 +3,21 @@ package io.ozzy;
 import java.util.Objects;
 import java.util.UUID;
 
-/** Immutable routing and optional application identity. Reuse options across records. */
+/**
+ * Immutable routing, optional application identity, and optional due time. Reuse options across
+ * records.
+ */
 public final class SendOptions {
     /** Rust SDK automatic routing and generated UUIDv7 identity. */
     public static final SendOptions AUTOMATIC = new SendOptions(null, null, null);
 
+    /** No due time: the record is stored at once. */
+    private static final long IMMEDIATE = -1;
+
     final byte[] key;
     final Integer partition;
     final UUID id;
+    final long due;
 
     /**
      * Choose at most one of key and partition. Reuse a nonzero ID for the same event after an
@@ -21,6 +28,10 @@ public final class SendOptions {
      * @param id nonzero event UUID, or null for a generated UUIDv7
      */
     public SendOptions(byte[] key, Integer partition, UUID id) {
+        this(key, partition, id, IMMEDIATE);
+    }
+
+    private SendOptions(byte[] key, Integer partition, UUID id, long due) {
         if (key != null && partition != null)
             throw new IllegalArgumentException("key and partition are exclusive");
         if (partition != null && partition < 0)
@@ -30,6 +41,7 @@ public final class SendOptions {
         this.key = key == null ? null : key.clone();
         this.partition = partition;
         this.id = id;
+        this.due = due;
     }
 
     /**
@@ -59,7 +71,20 @@ public final class SendOptions {
      * @return the updated copy
      */
     public SendOptions withId(UUID id) {
-        return new SendOptions(key, partition, Objects.requireNonNull(id));
+        return new SendOptions(key, partition, Objects.requireNonNull(id), due);
+    }
+
+    /**
+     * Return a copy that holds the record until an absolute Unix time, on a topic with delay. Its
+     * receipt then reports {@link Receipt.Disposition#SCHEDULED}; a due time past the topic's
+     * maximum delay fails.
+     *
+     * @param dueMillis absolute Unix time in milliseconds, not negative
+     * @return the updated copy
+     */
+    public SendOptions withDueMillis(long dueMillis) {
+        if (dueMillis < 0) throw new IllegalArgumentException("negative due time");
+        return new SendOptions(key, partition, id, dueMillis);
     }
 
     int route() {

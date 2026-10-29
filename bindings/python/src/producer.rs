@@ -129,10 +129,14 @@ impl Producer {
 
 type Destination = (Option<Vec<u8>>, Option<u32>);
 
-/// Validate routing and identity, then build the record (one payload copy).
+/// A record's message ID and due time, each optional.
+type Identity = (Option<Vec<u8>>, Option<u64>);
+
+/// Validate routing and identity, then build the record (one payload copy),
+/// held until its due time when given.
 fn admission(
     parts: Payload,
-    id: Option<Vec<u8>>,
+    (id, due): Identity,
     destination: Destination,
 ) -> PyResult<(RecordInput, Destination)> {
     if destination.0.is_some() && destination.1.is_some() {
@@ -152,7 +156,12 @@ fn admission(
         }
         None => MessageId::new(),
     };
-    Ok((parts.record(id), destination))
+    let record = parts.record(id);
+    let record = match due {
+        Some(due) => record.with_due_millis(due),
+        None => record,
+    };
+    Ok((record, destination))
 }
 
 async fn send(
@@ -185,16 +194,16 @@ impl Producer {
         let mut this = borrow(slf)?;
         Ok(opened(this.slot().get_mut()?)?.metadata().partition_count())
     }
-    #[pyo3(signature = (parts, id, destination, timeout=None))]
+    #[pyo3(signature = (parts, identity, destination, timeout=None))]
     fn send(
         slf: Bound<'_, Self>,
         parts: Payload,
-        id: Option<Vec<u8>>,
+        identity: Identity,
         destination: Destination,
         timeout: Option<f64>,
     ) -> PyResult<PendingRecord> {
         let timeout = self::timeout(timeout)?;
-        let (record, destination) = admission(parts, id, destination)?;
+        let (record, destination) = admission(parts, identity, destination)?;
         let py = slf.py();
         let mut lease = Lease::take(slf.unbind())?;
         ready(
@@ -206,12 +215,12 @@ impl Producer {
     fn try_send(
         slf: &Bound<'_, Self>,
         parts: Payload,
-        id: Option<Vec<u8>>,
+        identity: Identity,
         destination: Destination,
     ) -> PyResult<Option<PendingRecord>> {
         // The Rust SDK assigns a sequence only on successful admission.
         // A pending probe is canceled before the asyncio fallback polls again.
-        let (record, destination) = admission(parts, id, destination)?;
+        let (record, destination) = admission(parts, identity, destination)?;
         let mut this = borrow(slf)?;
         let writer = opened(this.slot().get_mut()?)?;
         match probe(send(writer, record, destination)) {
@@ -222,10 +231,10 @@ impl Producer {
     fn asend(
         slf: Py<Self>,
         parts: Payload,
-        id: Option<Vec<u8>>,
+        identity: Identity,
         destination: Destination,
     ) -> PyResult<Awaitable> {
-        let (record, destination) = admission(parts, id, destination)?;
+        let (record, destination) = admission(parts, identity, destination)?;
         Ok(Awaitable::hot(async move {
             let mut lease = Lease::take(slf)?;
             let pending = send(opened(lease.get_mut()?)?, record, destination).await?;

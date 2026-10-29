@@ -98,7 +98,7 @@ asyncio.run(main())
 | `ClientConfig(brokers, ...)` | Brokers plus finite limits, e.g. `max_record_bytes`, `max_producers` |
 | `BrokerAddress(node_id, peer, data_peer)` | Broker UUID and its two endpoints |
 | `Client(config)` | `producer(topic)`, `consumer(topic, start=, checkpoint=, partitions=)`, `close()` |
-| `Producer` | `send(payload, key=/partition=, id=)` returns `PendingRecord`; `flush()`; `identity` |
+| `Producer` | `send(payload, key=/partition=, id=, due_millis=)` returns `PendingRecord`; `flush()`; `identity` |
 | `PendingRecord` | `confirmed()` returns `Receipt`; `try_confirmed()` |
 | `Receipt` | `partition`, `offset`, `message_id`, `disposition`, `policy` |
 | `Consumer` | `next()`, iteration, `try_next()`, `checkpoint()`, `stats()` |
@@ -114,6 +114,10 @@ API has docstrings: `help(ozzy.Producer.send)`.
   durability: the local disk in single-broker mode, two of three copies in disk
   quorum. Keep many records in flight; confirm or `flush()` later.
 - A key always routes to the same partition. Order holds per partition.
+- On a topic with delay, `due_millis=` (absolute Unix milliseconds) holds a
+  record until then. Its receipt says `disposition == "scheduled"`, and its
+  `offset` is the schedule sequence; readers see the record at a new offset
+  once it is due. A due time past the topic's maximum delay fails.
 - Save `producer.identity` and pass it back as `identity=` to resume after a
   restart. `takeover=True` fences an old process still using it.
 - Persist a checkpoint only after processing succeeds, then reopen with

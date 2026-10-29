@@ -12,6 +12,8 @@ pub(in crate::bench) use options::Options;
 #[derive(Debug, Clone)]
 pub(in crate::bench::timed) struct Settings {
     deduplication: Option<ozzy_config::TopicDeduplication>,
+    /// The topic delay object, when records are held.
+    delay: Option<Value>,
     retention_bytes: Option<u64>,
     pub(in crate::bench::timed) partitions: usize,
     mode: DeploymentMode,
@@ -92,14 +94,17 @@ impl Settings {
         let segment_bytes = scaled(args.segment_mib as u64, 1024 * 1024)?;
         let decoded_segment_bytes = scaled(args.segment_decoded_mib as u64, 1024 * 1024)?;
         let deduplication = options.deduplication()?;
-        let append_bytes = append_bytes(options, operation, segment_bytes)?;
+        let metadata = ozzy_bench::native::AppendMetadata {
+            resolved: deduplication.is_some(),
+            scheduled: options.delay_millis.is_some(),
+        };
+        let append_bytes = append_bytes(metadata, operation, segment_bytes)?;
         // Bounded by `MAX_APPEND_BYTES`, so it fits every target `usize`.
-        let append_payload_bytes = ozzy_bench::native::peer_payload_capacity(
-            append_bytes as usize,
-            deduplication.is_some(),
-        )?;
+        let append_payload_bytes =
+            ozzy_bench::native::peer_payload_capacity(append_bytes as usize, metadata)?;
         let settings = Self {
             deduplication,
+            delay: options.delay(),
             retention_bytes: options.retention_bytes()?,
             clients: None,
             reservation_bytes: 0,
@@ -190,22 +195,9 @@ impl Settings {
         let mut deployment = json!({
             "cluster": {"mode": self.mode},
             "limits": {"max_topics": 1, "max_partitions": self.partitions},
-            "topics": {"benchmark": {
-                "partitions": self.partitions,
-                "partitioner_seed": 0, "segment_bytes": self.segment_bytes,
-                "max_append_bytes": self.append_bytes,
-            }},
+            "topics": {"benchmark": self.topic()},
             "brokers": {},
         });
-        if let Some(bytes) = self.retention_bytes {
-            deployment["topics"]["benchmark"]["retention"] = json!({"max_bytes": bytes});
-        }
-        if let Some(policy) = self.deduplication {
-            deployment["topics"]["benchmark"]["deduplication"] = json!({
-                "window_millis": policy.window_millis, "max_entries": policy.max_entries,
-                "max_bytes": policy.max_bytes,
-            });
-        }
         for broker in brokers {
             if deployment["brokers"].get(&broker.name).is_some() {
                 return Err(error("duplicate native benchmark broker name"));
@@ -251,6 +243,28 @@ impl Settings {
         Ok(source)
     }
 
+    /// The one benchmark topic and its optional policies.
+    fn topic(&self) -> Value {
+        let mut topic = json!({
+            "partitions": self.partitions,
+            "partitioner_seed": 0, "segment_bytes": self.segment_bytes,
+            "max_append_bytes": self.append_bytes,
+        });
+        if let Some(bytes) = self.retention_bytes {
+            topic["retention"] = json!({"max_bytes": bytes});
+        }
+        if let Some(policy) = self.deduplication {
+            topic["deduplication"] = json!({
+                "window_millis": policy.window_millis, "max_entries": policy.max_entries,
+                "max_bytes": policy.max_bytes,
+            });
+        }
+        if let Some(delay) = &self.delay {
+            topic["delay"] = delay.clone();
+        }
+        topic
+    }
+
     fn worker_settings(&self) -> Value {
         let workers = &self.workers;
         json!({
@@ -266,16 +280,13 @@ impl Settings {
 /// The topic APPEND bound. The production HELLO reserves metadata for its
 /// maximum record count; a small SDK group still needs its full payload to fit.
 fn append_bytes(
-    options: &Options,
+    metadata: ozzy_bench::native::AppendMetadata,
     operation: ozzy_journal::operation::OperationLimits,
     segment_bytes: u64,
 ) -> Result<u64> {
-    let metadata = ozzy_journal::operation::append_metadata_bound(
-        1,
-        ozzy_runtime::replicated::MAX_APPEND_RECORDS,
-        options.dedup_window_secs.is_some(),
-    )
-    .ok_or("APPEND metadata overflow")?;
+    let metadata = metadata
+        .bound(1, ozzy_runtime::replicated::MAX_APPEND_RECORDS)
+        .ok_or("APPEND metadata overflow")?;
     let body = operation
         .max_body_bytes
         .max(metadata + operation.max_payload_bytes)

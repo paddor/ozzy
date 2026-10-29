@@ -180,6 +180,15 @@ impl Window {
             end,
         })
     }
+    /// This window `ns` later.
+    pub(super) fn delayed(self, ns: u64) -> Result<Self> {
+        let later = |at: u64| at.checked_add(ns).ok_or_else(|| error("clock overflow"));
+        Ok(Self {
+            start: later(self.start)?,
+            measured: later(self.measured)?,
+            end: later(self.end)?,
+        })
+    }
     pub(super) fn contains(self, at: u64) -> bool {
         self.measured <= at && at < self.end
     }

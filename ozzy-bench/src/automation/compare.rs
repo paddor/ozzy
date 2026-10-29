@@ -86,6 +86,13 @@ pub struct Args {
     /// Identity index allocation ceiling per partition.
     #[arg(long, requires = "dedup_window_secs")]
     pub dedup_max_bytes: Option<u64>,
+    /// Ozzy holds every record this many milliseconds past its send time.
+    /// The case drain grows by the delay.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=100_000))]
+    pub delay_millis: Option<u64>,
+    /// Held records per partition before admission backs off.
+    #[arg(long, requires = "delay_millis")]
+    pub delay_max_entries: Option<u64>,
     /// Ozzy disk groups: readers take live records from one shared publication
     /// per partition instead of their own subscription.
     #[arg(long)]
@@ -180,13 +187,14 @@ pub const fn default_segment_mib(record_bytes: u64) -> u64 {
 }
 
 impl Args {
-    /// Time limits of one case. Cases run with the default drain.
+    /// Time limits of one case.
     fn budget(&self) -> crate::budget::RunBudget {
-        crate::budget::RunBudget::new(
-            self.warmup,
-            self.duration,
-            crate::budget::DEFAULT_DRAIN_SECS,
-        )
+        crate::budget::RunBudget::new(self.warmup, self.duration, self.drain_secs())
+    }
+
+    /// The default drain, plus the delay that holds the last records.
+    fn drain_secs(&self) -> u64 {
+        crate::budget::DEFAULT_DRAIN_SECS + self.delay_millis.map_or(0, |ms| ms.div_ceil(1000))
     }
 
     fn local_shards(&self) -> u64 {

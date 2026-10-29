@@ -12,12 +12,14 @@ public final class Receipt {
         QUORUM_DURABLE
     }
 
-    /** First-wins deduplication result, when broker deduplication is enabled. */
+    /** Stored, first-wins duplicate, or scheduled result. */
     public enum Disposition {
         /** Newly stored event. */
         STORED,
-        /** Existing event, using its original offset. */
-        DUPLICATE
+        /** Existing event, using its original offset, when broker deduplication is enabled. */
+        DUPLICATE,
+        /** Held until its due time; the offset is its schedule sequence. */
+        SCHEDULED
     }
 
     private final long[] metadata;
@@ -54,9 +56,10 @@ public final class Receipt {
     }
 
     /**
-     * Partition-global offset, represented as unsigned long bits.
+     * Partition-global offset, or the schedule sequence of a scheduled record, represented as
+     * unsigned long bits.
      *
-     * @return the offset as unsigned long bits
+     * @return the offset or schedule sequence as unsigned long bits
      */
     public long offset() {
         return metadata[5];
@@ -108,12 +111,13 @@ public final class Receipt {
     }
 
     /**
-     * Stored or first-wins duplicate result.
+     * Stored, first-wins duplicate, or scheduled result.
      *
-     * @return {@link Disposition#STORED} or {@link Disposition#DUPLICATE}
+     * @return {@link Disposition#STORED}, {@link Disposition#DUPLICATE}, or {@link
+     *     Disposition#SCHEDULED}
      */
     public Disposition disposition() {
-        return metadata[13] == 0 ? Disposition.STORED : Disposition.DUPLICATE;
+        return Disposition.values()[(int) metadata[13]];
     }
 
     /**

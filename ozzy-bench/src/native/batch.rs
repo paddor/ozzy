@@ -23,8 +23,8 @@ pub struct AppendBudget {
     pub record_bytes: usize,
     /// Requested SDK collection target before record and segment clamping.
     pub target_bytes: usize,
-    /// Canonical operations include producer attempt outcomes and retry proofs.
-    pub resolved: bool,
+    /// Outcomes and due times the operation metadata carries.
+    pub metadata: AppendMetadata,
 }
 
 impl AppendBudget {
@@ -36,12 +36,10 @@ impl AppendBudget {
             .checked_mul(self.record_bytes)
             .ok_or_else(overflow)?
             .min(self.target_bytes.max(self.record_bytes));
-        let fixed = ozzy_journal::operation::append_metadata_bound(
-            self.writers,
-            self.records,
-            self.resolved,
-        )
-        .ok_or_else(overflow)?;
+        let fixed = self
+            .metadata
+            .bound(self.writers, self.records)
+            .ok_or_else(overflow)?;
         let payload = requested.min(body_capacity.saturating_sub(fixed) / 2);
         if self.record_bytes == 0 || payload < self.record_bytes {
             return Err(bench_error(
@@ -66,27 +64,44 @@ impl AppendBudget {
             .ok_or_else(|| bench_error("prepared APPEND budget overflow"))?;
         let message = body
             .max(
-                ozzy_journal::operation::append_metadata_bound(
-                    1,
-                    ozzy_runtime::replicated::MAX_APPEND_RECORDS,
-                    self.resolved,
-                )
-                .ok_or_else(|| bench_error("prepared APPEND budget overflow"))?
+                self.metadata
+                    .bound(1, ozzy_runtime::replicated::MAX_APPEND_RECORDS)
+                    .ok_or_else(|| bench_error("prepared APPEND budget overflow"))?
                     + payload,
             )
             .max(1024)
             .min(ozzy_config::MAX_APPEND_BYTES as usize)
             .min(segment / 2);
         Ok(payload
-            .min(peer_payload_capacity(message, self.resolved)?)
+            .min(peer_payload_capacity(message, self.metadata)?)
             .min(records * self.record_bytes))
     }
 }
 
+/// What one topic's APPEND metadata carries besides its record table.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AppendMetadata {
+    /// Canonical operations include producer attempt outcomes and retry proofs.
+    pub resolved: bool,
+    /// Each record carries a due time, after a first schedule sequence.
+    pub scheduled: bool,
+}
+
+impl AppendMetadata {
+    /// The metadata bound for `batches` holding `records` in all.
+    #[must_use]
+    pub fn bound(self, batches: usize, records: usize) -> Option<usize> {
+        let due = if self.scheduled { 8 } else { 0 };
+        ozzy_journal::operation::append_metadata_bound(batches, records, self.resolved)?
+            .checked_add(records.checked_add(batches)?.checked_mul(due)?)
+    }
+}
+
 /// Payload fitting broker PEER framing at the production APPEND record ceiling.
-pub fn peer_payload_capacity(message: usize, resolved: bool) -> BenchResult<usize> {
+pub fn peer_payload_capacity(message: usize, metadata: AppendMetadata) -> BenchResult<usize> {
     let bound = |records| {
-        ozzy_journal::operation::append_metadata_bound(1, records, resolved)
+        metadata
+            .bound(1, records)
             .ok_or_else(|| bench_error("APPEND metadata bound overflow"))
     };
     let header = bound(0)?;
@@ -126,7 +141,7 @@ mod tests {
                 records: 2048,
                 record_bytes,
                 target_bytes,
-                resolved: false,
+                metadata: AppendMetadata::default(),
             }
             .bounds(64 * 1024 * 1024)
             .unwrap();
@@ -137,7 +152,7 @@ mod tests {
                 records: 2048,
                 record_bytes,
                 target_bytes,
-                resolved: false,
+                metadata: AppendMetadata::default(),
             }
             .bounds(fixed + record_bytes * 2)
             .unwrap();
@@ -152,7 +167,7 @@ mod tests {
             records: 2048,
             record_bytes: 8192,
             target_bytes: 4 * 1024 * 1024,
-            resolved: false,
+            metadata: AppendMetadata::default(),
         };
         assert_eq!(
             budget
@@ -160,7 +175,19 @@ mod tests {
                 .unwrap(),
             2 * 1024 * 1024 - 49_241
         );
-        assert_eq!(peer_payload_capacity(0, false).unwrap(), 0);
+        assert_eq!(
+            peer_payload_capacity(0, AppendMetadata::default()).unwrap(),
+            0
+        );
+        // Each record carries a due time, and each batch a first sequence.
+        let scheduled = AppendMetadata {
+            resolved: false,
+            scheduled: true,
+        };
+        assert_eq!(
+            scheduled.bound(2, 100).unwrap() - AppendMetadata::default().bound(2, 100).unwrap(),
+            8 * 102
+        );
         assert!(budget.bounds(49_773 + 2 * 8192 - 1).is_err());
     }
 }

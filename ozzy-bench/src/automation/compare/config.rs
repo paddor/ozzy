@@ -52,12 +52,16 @@ impl Args {
         Ok(())
     }
 
-    /// Deduplication limits and redundant or skewed feeds.
+    /// Deduplication limits, delay, and redundant or skewed feeds.
     fn feed_settings(&self, config: &mut Value) {
         if let Some(window) = self.dedup_window_secs {
             config["dedup_window_secs"] = json!(window);
             config["dedup_max_entries_per_partition"] = json!(self.dedup_max_entries);
             config["dedup_max_bytes_per_partition"] = json!(self.dedup_max_bytes);
+        }
+        if let Some(millis) = self.delay_millis {
+            config["delay_millis"] = json!(millis);
+            config["delay_max_entries_per_partition"] = json!(self.delay_max_entries);
         }
         if self.feeds.enabled() {
             config["redundant_producers"] = json!(self.feeds.redundant_producers);

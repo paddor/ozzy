@@ -194,6 +194,24 @@ pub(super) fn feeds(args: &Args, sizing: &Sizing) -> Result<()> {
     Ok(())
 }
 
+/// Held records need native delay, plain readers, and a drain that outlasts
+/// the delay, so the last records released still arrive before the deadline.
+pub(super) fn delay(args: &Args, sizing: &Sizing) -> Result<()> {
+    let Some(millis) = args.native.delay_millis else {
+        return Ok(());
+    };
+    if !sizing.production || external(args) {
+        return Err(error("--delay-millis requires the production adapter"));
+    }
+    if args.native.dedup_window_secs.is_some() || args.native.groups != 0 {
+        return Err(error("--delay-millis excludes dedup and --groups"));
+    }
+    if args.drain_timeout_secs.saturating_mul(1000) <= millis {
+        return Err(error("--drain-timeout-secs must exceed --delay-millis"));
+    }
+    Ok(())
+}
+
 pub(super) fn sdk_owner_counts_valid(args: &Args, sizing: &Sizing) -> bool {
     let Sizing {
         writers,

@@ -350,3 +350,34 @@ fn group_members_reserve_full_topic_subscriptions_and_dedup_uses_production_limi
     assert!(settings.append_bytes as usize >= 113 + 69 * 2048 + payload);
     assert!(Config::production(args(&["--groups", "1", "--reader-workers", "2"])).is_err());
 }
+
+#[test]
+fn delay_holds_records_with_slack_and_reserves_due_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let document = |extra: &[&str]| {
+        let config =
+            Config::production(args(&[&["--system", "single-durable"], extra].concat())).unwrap();
+        let settings = config.native.unwrap();
+        let document = settings
+            .document(&broker_specs(directory.path(), 1))
+            .unwrap();
+        (settings, ozzy_config::Deployment::parse(&document).unwrap())
+    };
+    let (plain, parsed) = document(&[]);
+    assert!(parsed.topics["benchmark"].delay.is_none());
+    let (held, parsed) = document(&[
+        "--delay-millis",
+        "60000",
+        "--delay-max-entries",
+        "500000",
+        "--drain-timeout-secs",
+        "70",
+    ]);
+    let delay = parsed.topics["benchmark"].delay.unwrap();
+    assert_eq!((delay.max_secs, delay.max_entries), (61, 500_000));
+    // Due times take room from the payload of every full APPEND.
+    assert!(held.append_payload_bytes() < plain.append_payload_bytes());
+    let (_, parsed) = document(&["--delay-millis", "999"]);
+    let delay = parsed.topics["benchmark"].delay.unwrap();
+    assert_eq!((delay.max_secs, delay.max_entries), (1, 100_000));
+}

@@ -82,6 +82,7 @@ pub(super) async fn produce(
         let input = run
             .lane
             .logical_input(run.sequence, event_clock, &mut scratch)?;
+        let input = run.hold(input, metrics::unix_ns);
         let Some(body) = input.parts().next() else {
             return Err(error("paced record has no payload part"));
         };

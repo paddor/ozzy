@@ -22,6 +22,7 @@ from ._types import (
     MessageId,
     Payload,
     destination,
+    due,
     message_id,
     parts,
 )
@@ -76,6 +77,7 @@ class Producer:
         key: bytes | None = None,
         partition: int | None = None,
         id: MessageId | None = None,
+        due_millis: int | None = None,
         timeout: float | None = None,
     ) -> PendingRecord:
         """Admit one record, waiting for capacity; return its confirmation handle.
@@ -84,11 +86,13 @@ class Producer:
         With neither, Rust selects a partition. id is a nonzero UUID; omission
         generates one. Mutable payloads are copied before admission. Reuse the
         same id when retrying the same application event after an unknown result.
+        due_millis, an absolute Unix time in milliseconds, holds the record
+        until then on a topic with delay; its receipt is then 'scheduled'.
         A timeout in seconds raises TimeoutError and admits nothing.
         """
         return self._native.send(
             parts(payload, self._config),
-            message_id(id),
+            (message_id(id), due(due_millis)),
             destination(key, partition),
             timeout,
         )

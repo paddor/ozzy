@@ -61,6 +61,7 @@ public final class Scenarios {
                                         case "completion_race" -> completionRace(client);
                                         case "close_cancel" -> closeCancel(client);
                                         case "concurrency" -> concurrency(client);
+                                        case "delay" -> delay(client);
                                         default -> throw new AssertionError(name);
                                     }
                                 } finally {
@@ -116,6 +117,10 @@ public final class Scenarios {
 
     private static PendingRecord send(Producer p, byte[] body, SendOptions o) {
         return asynchronous ? await(p.sendAsync(body, o)) : p.send(body, o);
+    }
+
+    private static PendingRecord send(Producer p, List<ByteBuffer> parts, SendOptions o) {
+        return asynchronous ? await(p.sendAsync(parts, o)) : p.send(parts, o);
     }
 
     private static Receipt confirm(PendingRecord p) {
@@ -511,6 +516,96 @@ public final class Scenarios {
             check(receipt.sequence() == accepted && receipt.offset() == accepted);
         } finally {
             Harness.holdWrites(false);
+        }
+    }
+
+    /** Scheduled records on a topic with delay. */
+    private static void delay(Client client) {
+        rejects(IllegalArgumentException.class, () -> SendOptions.partition(0).withDueMillis(-1));
+        var only = new ReaderOptions(ReaderOptions.Start.EARLIEST, null, List.of(0));
+        try (Producer p = producer(client);
+                Consumer c = consumer(client, only)) {
+            // A fresh group's first commit can take most of a second, which
+            // would accept the records below after the earliest due time.
+            confirm(send(p, new byte[] {9}, SendOptions.partition(0)));
+            check(next(c).parts().get(0).get(0) == 9);
+            // Two out of due order, one stored at once, and one already due.
+            long start = System.currentTimeMillis();
+            long[] due = {start + 2_000, start + 1_000, -1, start - 1_000};
+            var receipts = new ArrayList<Receipt>();
+            var pending = new ArrayList<PendingRecord>();
+            for (int i = 0; i < due.length; i++) {
+                var options = SendOptions.partition(0);
+                if (due[i] >= 0) options = options.withDueMillis(due[i]);
+                byte[] body = {(byte) i};
+                // Single and multipart records take separate native calls.
+                pending.add(
+                        i % 2 == 0
+                                ? send(p, body, options)
+                                : send(p, List.of(ByteBuffer.wrap(body)), options));
+            }
+            for (PendingRecord item : pending) receipts.add(confirm(item));
+            var dispositions = receipts.stream().map(Receipt::disposition).toList();
+            var scheduled = Receipt.Disposition.SCHEDULED;
+            check(
+                    dispositions.equals(
+                            List.of(scheduled, scheduled, Receipt.Disposition.STORED, scheduled)));
+            // A scheduled receipt's offset is its schedule sequence.
+            var sequences =
+                    java.util.stream.Stream.of(0, 1, 3)
+                            .map(i -> receipts.get(i).offset())
+                            .sorted()
+                            .toList();
+            check(sequences.equals(List.of(0L, 1L, 2L)));
+            var order = new ArrayList<Integer>();
+            for (int i = 0; i < due.length; i++) {
+                int id = next(c).parts().get(0).get(0);
+                check(due[id] < 0 || System.currentTimeMillis() >= due[id]);
+                order.add(id);
+            }
+            check(
+                    java.util.Set.copyOf(order.subList(0, 2)).equals(java.util.Set.of(2, 3))
+                            && order.subList(2, 4).equals(List.of(1, 0)));
+        }
+        // A send that waits for admission goes through the native task. A
+        // delay topic leaves room for small records only in a 64 KiB APPEND.
+        try (Producer p = producer(client)) {
+            boolean queued;
+            CompletableFuture<PendingRecord> waiting;
+            try {
+                Harness.holdWrites(true);
+                CompletableFuture<PendingRecord> blocked = null;
+                for (int i = 0; i < 32768 && blocked == null; i++) {
+                    var item = p.sendAsync(new byte[1024], SendOptions.partition(1));
+                    if (!item.isDone()) blocked = item;
+                }
+                check(blocked != null && blocked.cancel(true));
+                long past = System.currentTimeMillis() - 1;
+                waiting = p.sendAsync(new byte[1024], SendOptions.partition(1).withDueMillis(past));
+                queued = !waiting.isDone();
+            } finally {
+                Harness.holdWrites(false);
+            }
+            check(queued);
+            check(confirm(await(waiting)).disposition() == Receipt.Disposition.SCHEDULED);
+        }
+        // Past the topic's maximum delay fails permanently. The refusal fails
+        // its writer, so closing it may report the refusal again.
+        Producer late = producer(client);
+        var options = SendOptions.partition(0).withDueMillis(System.currentTimeMillis() + 120_000);
+        var refused = send(late, new byte[] {9}, options).confirmedAsync();
+        try {
+            refused.get(5, TimeUnit.SECONDS);
+            throw new AssertionError("a due time past the maximum delay was scheduled");
+        } catch (java.util.concurrent.ExecutionException error) {
+            check(error.getCause() instanceof OzzyException);
+        } catch (InterruptedException | java.util.concurrent.TimeoutException error) {
+            throw new AssertionError(error);
+        }
+        try {
+            late.close();
+        } catch (OzzyException expected) {
+            // The refusal failed the writer.
         }
     }
 
