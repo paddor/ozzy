@@ -200,6 +200,8 @@ impl OwnedJournal {
         {
             return Ok(index.clone());
         }
+        // OPTIMIZE: read cold release sources without rebuilding the index.
+        // The partition reader sees each written group's operation locations.
         let index = self.journal.retry_snapshot(self.recovery.index).await?;
         if let Some(held) = self.held.as_mut() {
             held.index = Some(index.clone());
@@ -208,7 +210,8 @@ impl OwnedJournal {
     }
 
     /// Kinds and bodies of the entries' `Schedule` or `Carry` operations
-    /// still in writeback, and the numbers of those to read from storage.
+    /// still in writeback or kept with the held rows, and the numbers of
+    /// those to read from storage.
     fn sources(
         &self,
         entries: &[(ReleaseKey, PendingSchedule)],
@@ -222,7 +225,8 @@ impl OwnedJournal {
         sources.sort_unstable();
         sources.dedup();
         for number in sources {
-            match self.writeback.operation_bytes(number) {
+            let kept = || self.held.as_ref()?.body(number);
+            match self.writeback.operation_bytes(number).or_else(kept) {
                 Some((kind, body)) => hot.push((number, kind, body)),
                 None => cold.push(number),
             }

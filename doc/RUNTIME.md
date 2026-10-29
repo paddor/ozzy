@@ -309,6 +309,8 @@ Only the leader releases, one step at a time.
   takes more records.
 - A step fills at most one proposal arena from at most 64 operations. It
   waits for shard memory when none is free.
+- Each delay partition keeps up to 4 MiB of held operation bodies in
+  memory, so most steps read no storage.
 - Other operations no longer in writeback are read through a journal index
   snapshot. Steps reuse it while it covers their operations. It pins its
   segments until the next build or storage cleanup.

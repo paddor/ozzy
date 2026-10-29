@@ -868,3 +868,24 @@ fn release_waits_for_shard_memory_instead_of_failing() {
     accept(&mut controller, &mut journal, &mut driver, result);
     assert_eq!(held(&journal), (0, 1, Offset::new(1)));
 }
+
+#[test]
+fn release_reads_kept_bodies_instead_of_storage() {
+    let (mut controller, mut journal, mut driver) = delayed(16);
+    scheduled(
+        &mut controller,
+        &mut journal,
+        &mut driver,
+        0,
+        &[NOW, NOW + 1_000],
+    );
+    for now in [NOW, NOW + 1_000] {
+        let proposal = release(&mut controller, &mut journal, &driver, now).unwrap();
+        let result = validate(&mut controller, &mut journal, &driver, proposal, now);
+        accept(&mut controller, &mut journal, &mut driver, result);
+    }
+    // No release built an index snapshot to read its source.
+    assert!(journal.held.as_ref().unwrap().index.is_none());
+    assert_eq!(held(&journal), (0, 2, Offset::new(2)));
+    assert_eq!(readable(&mut controller, &mut journal, &driver), [1, 2]);
+}

@@ -18,6 +18,7 @@ use ozzy_proto::PartitionIncarnation;
 
 use super::JournalError;
 
+mod bodies;
 mod carry;
 mod check;
 mod merge;
@@ -73,6 +74,8 @@ pub(super) struct Held {
     /// The index snapshot of the last release that read storage, which
     /// later releases reuse while it holds their sources.
     pub(super) index: Option<JournalIndexSnapshot>,
+    /// Bodies of held operations, which releases read before storage.
+    bodies: bodies::Bodies,
 }
 
 /// One bounded read of the sealed rows after the loaded ones.
@@ -114,6 +117,7 @@ impl Held {
             target: None,
             carried_last: false,
             index: None,
+            bodies: bodies::Bodies::default(),
         }
     }
 
@@ -181,6 +185,7 @@ impl Held {
                     let entries =
                         ozzy_core::state::schedule_entries(operation.op_number, &schedule)
                             .map_err(|_| JournalError::AppendMismatch)?;
+                    self.keep_body(&operation, &entries);
                     for (key, record) in entries {
                         self.schedule(key, record);
                     }
@@ -202,7 +207,7 @@ impl Held {
                     if carry.batch.partition != self.partition {
                         return Err(JournalError::AppendMismatch);
                     }
-                    self.carry(operation.op_number, &carry)?;
+                    self.carry(operation.op_number, &carry, &operation)?;
                 }
                 _ => {}
             }
@@ -223,6 +228,7 @@ impl Held {
 
     fn release_through(&mut self, through: ReleaseKey) {
         self.released = Some(through);
+        self.bodies.release(through);
         for rows in [&mut self.recent, &mut self.sealed] {
             while rows
                 .first_key_value()
