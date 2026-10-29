@@ -31,6 +31,7 @@ impl LocalActor {
         if self.journal.available_command_slots() != 0 {
             changed |= self.poll_pending(cx)?;
             changed |= self.poll_release(cx)?;
+            changed |= self.poll_held_load(cx)?;
         }
         changed |= self.reply_committed()?;
         changed |= self.schedule()?;
@@ -108,6 +109,20 @@ impl LocalActor {
         };
         self.releases
             .complete(result, self.now, &mut self.proposals)?;
+        Ok(true)
+    }
+
+    /// Finish a held-row load.
+    fn poll_held_load(&mut self, cx: &mut Context<'_>) -> Result<bool, ActorError> {
+        let Some(Poll::Ready(result)) = self
+            .releases
+            .loads
+            .step()
+            .map(|load| Pin::new(load).poll(cx))
+        else {
+            return Ok(false);
+        };
+        self.releases.loads.complete(result, self.now)?;
         Ok(true)
     }
 

@@ -82,8 +82,8 @@ impl ReplicaActor {
                 self.pending_replay = None;
                 self.complete(result?, now)?;
             }
-            result = present(self.releases.step()), if available && self.releases.running() => {
-                self.releases.complete(result, now, &mut self.work.proposals)?;
+            finished = self.releases.finished(), if available && self.releases.busy() => {
+                self.releases.finish(finished, now, &mut self.work.proposals)?;
             }
             changed = self.journal.availability_changed(available) => {
                 changed?;

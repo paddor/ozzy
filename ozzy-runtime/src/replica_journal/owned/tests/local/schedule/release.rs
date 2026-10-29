@@ -711,6 +711,76 @@ fn held_records_release_in_order_through_a_small_window_across_segments() {
     assert_eq!(journal.next_release(), None);
 }
 
+/// Build every missing sealed index, as the detached index jobs do.
+fn index_all(controller: &mut Controller, journal: &mut OwnedJournal) {
+    while let Some(job) = journal.take_index_work() {
+        let built = drive(controller, job.run());
+        journal.complete_index_work(&built);
+    }
+}
+
+/// Run held-row loads while `journal` wants one, as an actor does beside
+/// writes. Returns how many ran.
+fn load_beside(controller: &mut Controller, journal: &mut OwnedJournal, driver: &Driver) -> usize {
+    use crate::replica_journal::owned::release::ReleaseStep;
+    let mut loads = 0;
+    while journal.wants_held_load() {
+        assert!(loads < 100, "loads stopped progressing");
+        let ReleaseStep::Read(read) = journal
+            .prepare_held_load(driver.begin_validation().unwrap())
+            .unwrap()
+        else {
+            panic!("a wanted load starts");
+        };
+        let done = drive(controller, read.execute());
+        assert!(journal.complete_release(done).unwrap().loaded);
+        loads += 1;
+    }
+    loads
+}
+
+#[test]
+fn every_copy_loads_held_rows_beside_writes_before_they_are_needed() {
+    let limits = DelayLimits {
+        window: 4,
+        ..DelayLimits::new(64)
+    };
+    let (mut controller, mut journal, mut driver) = delayed_with(limits);
+    let (mut other, mut copy, mut copy_driver) = delayed_with(limits);
+    let expected = schedule_batches(
+        (&mut controller, &mut journal, &mut driver),
+        (&mut other, &mut copy, &mut copy_driver),
+        5,
+        |batch| (batch < 4, batch < 4),
+        |_, _| {},
+    );
+    index_all(&mut controller, &mut journal);
+    index_all(&mut other, &mut copy);
+    let (mut ids, mut loads) = (Vec::new(), 0);
+    while held(&journal).0 > 0 {
+        loads += load_beside(&mut controller, &mut journal, &driver);
+        loads += load_beside(&mut other, &mut copy, &copy_driver);
+        // Loaded rows wait for every step, so none loads instead.
+        let proposal = release(&mut controller, &mut journal, &driver, NOW + 1_000)
+            .expect("a step releases loaded rows");
+        let result = validate(
+            &mut controller,
+            &mut journal,
+            &driver,
+            proposal,
+            NOW + 1_000,
+        );
+        ids.extend(released(&result).3.iter().map(|id| id.as_bytes()[0]));
+        let (kind, body) = body(&result);
+        accept(&mut controller, &mut journal, &mut driver, result);
+        replicate(&mut other, &mut copy, &mut copy_driver, kind, &body).unwrap();
+    }
+    assert_eq!(ids, expected);
+    assert!(loads >= 4, "{loads} loads");
+    assert_eq!(held(&copy), (0, 15, Offset::new(15)));
+    assert!(!journal.wants_held_load() && !copy.wants_held_load());
+}
+
 /// Pack the sealed segments of a journal low on segments.
 fn pack(controller: &mut Controller, journal: &mut OwnedJournal) {
     let max = journal.limits.metadata.max_segments;

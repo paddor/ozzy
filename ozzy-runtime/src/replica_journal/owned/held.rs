@@ -7,6 +7,7 @@
 //! canonical validation.
 
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 use ozzy_core::state::PendingSchedule;
 use ozzy_journal::operation::{
@@ -85,6 +86,9 @@ pub(super) struct Held {
     bodies: bodies::Bodies,
     /// Places of held operations, which releases read without a snapshot.
     locations: locations::Locations,
+    /// Replaced by each installed load, so a load read before another one,
+    /// or before a rebuild, is dropped.
+    loads: Rc<()>,
 }
 
 /// One bounded read of the sealed rows after the loaded ones.
@@ -109,8 +113,10 @@ pub(super) struct Load {
     after: Option<ReleaseKey>,
     from: HeldPosition,
     active: u64,
-    window: usize,
+    /// Rows asked for. Reading this many leaves later sealed rows unloaded.
+    limit: usize,
     rows: Vec<ozzy_journal_segment::ScheduleIndexEntry>,
+    loads: Rc<()>,
 }
 
 impl Held {
@@ -137,6 +143,7 @@ impl Held {
             sealed_indexes: None,
             bodies: bodies::Bodies::default(),
             locations: locations::Locations::default(),
+            loads: Rc::new(()),
         }
     }
 
@@ -169,10 +176,11 @@ impl Held {
             after: released,
             from: carried,
             active: held.active,
-            window,
+            limit: window,
             rows: snapshot
                 .sealed_schedules_after(partition, released, carried, window)
                 .await?,
+            loads: held.loads.clone(),
         };
         held.loaded = released;
         held.load(load);
@@ -311,6 +319,11 @@ impl Held {
             }
             self.recent_operations = self.recent_operations.split_off(&active);
             let loaded = self.loaded;
+            // OPTIMIZE: a crowded roll moves up to `HELD_ACTIVE` rows here,
+            // then `settle` trims all but the window one row at a time: 80-120
+            // ms per partition at 100k records/s, ack p999 ~0.8 s in disk
+            // quorum. Keep only the first window keys and build the map from
+            // sorted rows instead.
             let (kept, sealed): (Rows, Rows) = std::mem::take(&mut self.recent)
                 .into_iter()
                 .partition(|(_, record)| record.operation >= active);
@@ -381,16 +394,32 @@ impl Held {
         self.loaded.is_some() && self.prefix().next().is_none()
     }
 
-    /// Read the next sealed rows from `sealed`.
+    /// Whether held sealed records are unloaded and at most half the window
+    /// is loaded, so a load beside writes should read more.
+    pub(super) fn wants_load(&self) -> bool {
+        self.loaded.is_some() && self.sealed.len() <= self.window / 2
+    }
+
+    /// Read the next window of sealed rows from `sealed`.
     pub(super) fn refill(&self, sealed: SealedRows) -> Refill {
+        self.read_next(sealed, self.window)
+    }
+
+    /// Read from `sealed` the next sealed rows the window lacks.
+    pub(super) fn top_up(&self, sealed: SealedRows) -> Refill {
+        self.read_next(sealed, self.window.saturating_sub(self.sealed.len()).max(1))
+    }
+
+    fn read_next(&self, sealed: SealedRows, rows: usize) -> Refill {
         Refill {
             load: Load {
                 partition: self.partition,
                 after: self.loaded,
                 from: self.carried,
                 active: self.active,
-                window: self.window,
+                limit: rows,
                 rows: Vec::new(),
+                loads: self.loads.clone(),
             },
             sealed,
         }
@@ -410,10 +439,14 @@ impl Held {
     }
 
     fn load_within(&mut self, load: Load, window: usize) {
-        if load.active != self.active || load.partition != self.partition {
+        if load.active != self.active
+            || load.partition != self.partition
+            || !Rc::ptr_eq(&load.loads, &self.loads)
+        {
             return;
         }
-        let full = load.rows.len() == load.window;
+        self.loads = Rc::new(());
+        let full = load.rows.len() == load.limit;
         let last = load.rows.last().map(|row| row.key);
         let (released, carried) = (self.released, self.carried);
         // Rows read before a release or carry applied may be gone now.
@@ -481,12 +514,12 @@ impl Held {
 impl Refill {
     pub(super) async fn read(mut self) -> Result<Load, JournalError> {
         let load = &mut self.load;
-        let (partition, after, from, window) = (load.partition, load.after, load.from, load.window);
+        let (partition, after, from, limit) = (load.partition, load.after, load.from, load.limit);
         load.rows = match &self.sealed {
-            SealedRows::Validated(sealed) => sealed.after(partition, after, from, window).await?,
+            SealedRows::Validated(sealed) => sealed.after(partition, after, from, limit).await?,
             SealedRows::Snapshot(snapshot) => {
                 snapshot
-                    .sealed_schedules_after(partition, after, from, window)
+                    .sealed_schedules_after(partition, after, from, limit)
                     .await?
             }
         };

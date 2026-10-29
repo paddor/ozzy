@@ -3,6 +3,7 @@
 
 use super::super::{JournalError, OwnedJournal};
 use super::{HELD_ACTIVE, HELD_WINDOW, Held, SealedRows};
+use ozzy_journal_segment::SealedSchedules;
 
 impl OwnedJournal {
     fn held_window(&self) -> usize {
@@ -119,6 +120,19 @@ impl OwnedJournal {
     pub(in crate::replica_journal::owned) async fn sealed_rows(
         &mut self,
     ) -> Result<SealedRows, JournalError> {
+        Ok(match self.validated_sealed_rows()? {
+            Some(sealed) => SealedRows::Validated(sealed),
+            None => SealedRows::Snapshot(Box::new(
+                self.journal.retry_snapshot(self.recovery.index).await?,
+            )),
+        })
+    }
+
+    /// The sealed indexes, while this owner validated every one. Later
+    /// loads reuse them until a segment seals or retires.
+    pub(in crate::replica_journal::owned) fn validated_sealed_rows(
+        &mut self,
+    ) -> Result<Option<SealedSchedules>, JournalError> {
         let kept = self
             .held
             .as_ref()
@@ -130,12 +144,7 @@ impl OwnedJournal {
         if let Some(held) = self.held.as_mut() {
             held.sealed_indexes.clone_from(&validated);
         }
-        Ok(match validated {
-            Some(sealed) => SealedRows::Validated(sealed),
-            None => SealedRows::Snapshot(Box::new(
-                self.journal.retry_snapshot(self.recovery.index).await?,
-            )),
-        })
+        Ok(validated)
     }
 
     /// Follow segment rolls and retirement since the last admission.

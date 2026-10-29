@@ -15,7 +15,7 @@ use ozzy_journal::operation::{
     AppendBatch, AppendRecord, OperationBody, OperationKind, OperationLimits, RELEASE_FRAME_BYTES,
     Release, ReleaseKey, decode_operation_body, encode_operation_body, encoded_record_bytes,
 };
-use ozzy_journal_segment::{JournalIndexError, JournalIndexSnapshot, OperationRead};
+use ozzy_journal_segment::{GroupJournal, JournalIndexError, JournalIndexSnapshot, OperationRead};
 use ozzy_proto::{
     Offset, OwnerEpoch, PartitionIncarnation, ProducerEpoch, ProducerId, ProducerSequence,
 };
@@ -256,6 +256,46 @@ impl OwnedJournal {
             }
         }
         Ok((hot, located, cold))
+    }
+
+    /// Whether this copy wants a held-row load beside writes: at most half
+    /// its window is loaded, more is sealed, and every sealed index is
+    /// validated here.
+    pub(in crate::replica_journal) fn wants_held_load(&self) -> bool {
+        self.held
+            .as_ref()
+            .is_some_and(super::held::Held::wants_load)
+            && self
+                .journal
+                .readable()
+                .is_ok_and(GroupJournal::sealed_indexes_validated)
+    }
+
+    /// Load the next sealed held records beside writes when this copy, the
+    /// leader or a follower, wants them. Release steps and follower checks
+    /// then rarely wait for a load.
+    pub(in crate::replica_journal) fn prepare_held_load(
+        &mut self,
+        ticket: ValidationTicket,
+    ) -> Result<ReleaseStep, JournalError> {
+        self.healthy()?;
+        self.validate_image(ticket)?;
+        self.observe_held()?;
+        if !self.wants_held_load() {
+            return Ok(ReleaseStep::Idle);
+        }
+        let Some(sealed) = self.validated_sealed_rows()? else {
+            return Ok(ReleaseStep::Idle);
+        };
+        let refill = self
+            .held
+            .as_ref()
+            .ok_or(JournalError::AppendMismatch)?
+            .top_up(super::held::SealedRows::Validated(sealed));
+        Ok(ReleaseStep::Read(ReleaseRead {
+            key: self.read_key.clone(),
+            work: Work::Load(Box::new(refill)),
+        }))
     }
 
     /// Load the next sealed held records when none is loaded. Indexes this

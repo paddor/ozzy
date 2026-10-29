@@ -46,11 +46,7 @@ impl Journal {
         {
             return Ok(Some(kept.clone()));
         }
-        let validated = self.validated_indexes.borrow();
-        if sources
-            .iter()
-            .any(|source| validated.get(&source.segment_id) != Some(source))
-        {
+        if !self.validated(&sources) {
             return Ok(None);
         }
         let leases = sources
@@ -69,6 +65,21 @@ impl Journal {
                 _leases: leases,
             }),
         }))
+    }
+}
+
+impl Journal {
+    /// Whether this owner validated every sealed index.
+    pub fn sealed_indexes_validated(&self) -> bool {
+        self.sealed_sources()
+            .is_ok_and(|sources| self.validated(&sources))
+    }
+
+    fn validated(&self, sources: &[IndexSource]) -> bool {
+        let validated = self.validated_indexes.borrow();
+        sources
+            .iter()
+            .all(|source| validated.get(&source.segment_id) == Some(source))
     }
 }
 

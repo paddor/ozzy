@@ -322,8 +322,14 @@ Only the leader releases, one step at a time.
 - Loads read only sealed indexes this owner validated, with no scan of the
   active segment. They reuse the opened indexes until a segment seals or
   retires, or storage cleanup runs.
-- A follower loads the same way when a `Release` passes held rows it has
-  not loaded.
+- Every copy, leader or follower, also loads the next sealed held rows
+  beside writes once at most half its window is loaded. It reads only the
+  rows the window lacks, one such load at a time. Steps and follower checks
+  then rarely wait for a load.
+- A follower loads inline when a `Release` passes held rows it has not
+  loaded.
+- A load read before another one installed, or before the held index was
+  rebuilt, is dropped.
 - A due retention turn goes first.
 - A step that builds nothing, or is not admitted, waits 10 ms. A refused
   one waits 100 ms.
