@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-29
+
+### Breaking
+
+- Journal operations, checkpoints, and segment index files carry delay
+  state. Brokers refuse stores written by 0.6 (`truncated operation body`);
+  format stores again. Remove an old quickstart directory.
+- `ozzy_proto::append::Append`, `DecodedAppend`, and `ValidatedAppend` have
+  a `due_millis` field.
+
 ### Added
 
 - Delayed delivery: a topic with `[topics.NAME.delay]` holds records with a
