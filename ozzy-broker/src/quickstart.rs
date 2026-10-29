@@ -57,13 +57,26 @@ pub(super) fn run(directory: &Path) -> Result<(), StartupError> {
          --broker {BROKER} --identity {}",
         paths.shared.display()
     );
-    println!("Broker {BROKER} with topics {TOPIC} and {DELAYED}: {config}");
+    // A directory provisioned before topic `delayed` existed lacks it.
+    let delayed = checked
+        .deployment
+        .deployment()
+        .topics
+        .get(DELAYED)
+        .is_some_and(|topic| topic.delay.is_some());
+    if delayed {
+        println!("Broker {BROKER} with topics {TOPIC} and {DELAYED}: {config}");
+    } else {
+        println!("Broker {BROKER} with topic {TOPIC}: {config}");
+    }
     println!("Watch it:");
     println!("  cargo run --release -p ozzy-ui -- --config {config} --broker {BROKER}");
     println!("Write and read records:");
     println!("  {demo}");
-    println!("Deliver each record 10 s after writing it:");
-    println!("  {demo} --topic {DELAYED} --due-secs 10");
+    if delayed {
+        println!("Deliver each record 10 s after writing it:");
+        println!("  {demo} --topic {DELAYED} --due-secs 10");
+    }
     println!("Ctrl-C stops the broker. Run the same command again to restart it.");
     super::runtime()?.block_on(super::serve::run(checked, local, &[]))
 }
