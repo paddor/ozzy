@@ -311,11 +311,18 @@ Only the leader releases, one step at a time.
   waits for shard memory when none is free.
 - Each delay partition keeps up to 4 MiB of held operation bodies in
   memory, so most steps read no storage.
-- Other operations no longer in writeback are read through a journal index
-  snapshot. Steps reuse it while it covers their operations. It pins its
-  segments until the next build or storage cleanup.
+- Held state also keeps where up to 65536 held operations per partition
+  were written. Steps read those there, in the detached job.
+- Other operations, as after a restart or a pack, are read through a
+  journal index snapshot. Steps reuse it while it covers their operations.
+  It pins its segments until the next build or storage cleanup.
 - With no sealed held record loaded, a step loads the next ones from the
   sealed indexes. The next step starts at once.
+- Loads read only sealed indexes this owner validated, with no scan of the
+  active segment. They reuse the opened indexes until a segment seals or
+  retires, or storage cleanup runs.
+- A follower loads the same way when a `Release` passes held rows it has
+  not loaded.
 - A due retention turn goes first.
 - A step that builds nothing, or is not admitted, waits 10 ms. A refused
   one waits 100 ms.

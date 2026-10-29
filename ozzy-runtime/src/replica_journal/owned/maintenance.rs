@@ -192,9 +192,10 @@ impl OwnedJournal {
             return Err(HistoryError::Capacity.into());
         }
         self.journal.ready()?;
-        // A cached release index pins segments this cleanup may free.
+        // Cached release and load indexes pin segments this cleanup may free.
         if let Some(held) = self.held.as_mut() {
             held.index = None;
+            held.sealed_indexes = None;
         }
         self.faulted = true;
         let journal = self.journal.ready_mut()?;

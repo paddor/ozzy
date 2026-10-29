@@ -13,7 +13,9 @@ use ozzy_journal::operation::{
     CanonicalOperation, HeldPosition, OperationBody, OperationKind, OperationLimits, ReleaseKey,
     decode_operation_body,
 };
-use ozzy_journal_segment::{JournalIndexSnapshot, SegmentReference};
+use ozzy_journal_segment::{
+    JournalIndexSnapshot, SealedSchedules, SegmentReference, WrittenOperation,
+};
 use ozzy_proto::PartitionIncarnation;
 
 use super::JournalError;
@@ -21,7 +23,9 @@ use super::JournalError;
 mod bodies;
 mod carry;
 mod check;
+mod locations;
 mod merge;
+mod owner;
 pub(super) use carry::{Between, boundary};
 use merge::{merge, rows};
 
@@ -67,22 +71,35 @@ pub(super) struct Held {
     loaded: Option<ReleaseKey>,
     /// Sealed ranges with scheduled records, oldest first.
     segments: Vec<Sealed>,
-    /// The segment retention would free by carrying, on the primary.
+    /// The segment retention would free by carrying, on the leader.
     target: Option<ozzy_core::retention::Carry>,
     /// The last delay step carried, so the next one releases first.
     carried_last: bool,
     /// The index snapshot of the last release that read storage, which
     /// later releases reuse while it holds their sources.
     pub(super) index: Option<JournalIndexSnapshot>,
+    /// The sealed indexes the last load read, which later loads reuse
+    /// while no segment seals or retires.
+    pub(super) sealed_indexes: Option<SealedSchedules>,
     /// Bodies of held operations, which releases read before storage.
     bodies: bodies::Bodies,
+    /// Places of held operations, which releases read without a snapshot.
+    locations: locations::Locations,
 }
 
 /// One bounded read of the sealed rows after the loaded ones.
 #[derive(Debug)]
 pub(super) struct Refill {
     load: Load,
-    snapshot: JournalIndexSnapshot,
+    sealed: SealedRows,
+}
+
+/// Where a refill reads sealed rows: indexes the owner already validated,
+/// or a snapshot that validates them.
+#[derive(Debug)]
+pub(super) enum SealedRows {
+    Validated(SealedSchedules),
+    Snapshot(Box<JournalIndexSnapshot>),
 }
 
 /// Sealed rows read after a key, for the copy that asked.
@@ -117,7 +134,9 @@ impl Held {
             target: None,
             carried_last: false,
             index: None,
+            sealed_indexes: None,
             bodies: bodies::Bodies::default(),
+            locations: locations::Locations::default(),
         }
     }
 
@@ -185,7 +204,7 @@ impl Held {
                     let entries =
                         ozzy_core::state::schedule_entries(operation.op_number, &schedule)
                             .map_err(|_| JournalError::AppendMismatch)?;
-                    self.keep_body(&operation, &entries);
+                    self.keep_source(&operation, &entries);
                     for (key, record) in entries {
                         self.schedule(key, record);
                     }
@@ -215,6 +234,32 @@ impl Held {
         Ok(())
     }
 
+    /// Keep the body of an operation that still holds records, and its
+    /// place once written.
+    fn keep_source(
+        &mut self,
+        operation: &CanonicalOperation<'_>,
+        entries: &[(ReleaseKey, PendingSchedule)],
+    ) {
+        if let Some(last) = entries.iter().map(|(key, _)| *key).max()
+            && self.released.is_none_or(|released| last > released)
+        {
+            self.bodies
+                .keep(operation.op_number, operation.kind, operation.body, last);
+            self.locations.admit(operation.op_number, last);
+        }
+    }
+
+    /// Keep the places of a written group's held operations.
+    pub(super) fn written(&mut self, operations: impl Iterator<Item = WrittenOperation>) {
+        self.locations.written(operations);
+    }
+
+    /// Where a held operation was written, while it is kept.
+    pub(super) fn location(&self, number: u64) -> Option<WrittenOperation> {
+        self.locations.get(number)
+    }
+
     fn schedule(&mut self, key: ReleaseKey, record: PendingSchedule) {
         let last = self
             .recent_operations
@@ -229,6 +274,7 @@ impl Held {
     fn release_through(&mut self, through: ReleaseKey) {
         self.released = Some(through);
         self.bodies.release(through);
+        self.locations.release(through);
         for rows in [&mut self.recent, &mut self.sealed] {
             while rows
                 .first_key_value()
@@ -335,8 +381,8 @@ impl Held {
         self.loaded.is_some() && self.prefix().next().is_none()
     }
 
-    /// Read the next sealed rows from `snapshot`.
-    pub(super) fn refill(&self, snapshot: JournalIndexSnapshot) -> Refill {
+    /// Read the next sealed rows from `sealed`.
+    pub(super) fn refill(&self, sealed: SealedRows) -> Refill {
         Refill {
             load: Load {
                 partition: self.partition,
@@ -346,7 +392,7 @@ impl Held {
                 window: self.window,
                 rows: Vec::new(),
             },
-            snapshot,
+            sealed,
         }
     }
 
@@ -435,10 +481,15 @@ impl Held {
 impl Refill {
     pub(super) async fn read(mut self) -> Result<Load, JournalError> {
         let load = &mut self.load;
-        load.rows = self
-            .snapshot
-            .sealed_schedules_after(load.partition, load.after, load.from, load.window)
-            .await?;
+        let (partition, after, from, window) = (load.partition, load.after, load.from, load.window);
+        load.rows = match &self.sealed {
+            SealedRows::Validated(sealed) => sealed.after(partition, after, from, window).await?,
+            SealedRows::Snapshot(snapshot) => {
+                snapshot
+                    .sealed_schedules_after(partition, after, from, window)
+                    .await?
+            }
+        };
         Ok(self.load)
     }
 }
@@ -447,136 +498,4 @@ fn active_first(references: &[SegmentReference]) -> u64 {
     references
         .last()
         .map_or(1, |active| active.first_chain.next_op_number())
-}
-
-impl super::OwnedJournal {
-    fn held_window(&self) -> usize {
-        self.delay.map_or(HELD_WINDOW, |limits| limits.window)
-    }
-
-    /// Whether to roll before writing operations from `next` on, to bound
-    /// the held rows in memory.
-    pub(super) fn held_crowded(&mut self, next: u64) -> Result<bool, JournalError> {
-        self.observe_held()?;
-        let active = self.delay.map_or(HELD_ACTIVE, |limits| limits.active);
-        Ok(matches!(&self.held, Some(held) if held.crowded(next, active)))
-    }
-
-    /// Rebuild the held index from indexes and the active segment before
-    /// admission. Accepted operations are all written here.
-    pub(in crate::replica_journal) async fn restore_held(&mut self) -> Result<(), JournalError> {
-        let window = self.held_window();
-        // Activation holds the owner faulted until it completes.
-        let Some((partition, floors)) = self
-            .images
-            .as_ref()
-            .ok_or(JournalError::InstallationMismatch)?
-            .speculative()
-            .partitions()
-            .find_map(|(partition, state)| {
-                let delay = state.delay.as_ref()?;
-                Some((partition, (delay.released(), delay.carried())))
-            })
-        else {
-            self.held = None;
-            return Ok(());
-        };
-        let snapshot = self
-            .journal
-            .ready_mut()?
-            .build_index_snapshot(
-                ozzy_journal_segment::JournalIndexBoundary::Accepted,
-                self.recovery.index,
-            )
-            .await?;
-        let held = Held::restore(partition, window, floors, &snapshot).await?;
-        self.held = Some(held);
-        self.check_held()
-    }
-
-    /// Install an admitted group's schedules and releases. A delay
-    /// partition it creates starts with no held records.
-    pub(super) fn admit_held(
-        &mut self,
-        append: &crate::replica_journal::append::RetainedAppend,
-    ) -> Result<(), JournalError> {
-        if self.held.is_none() {
-            let window = self.held_window();
-            // Admission holds the owner faulted until it completes.
-            let Some(partition) = self
-                .images
-                .as_ref()
-                .ok_or(JournalError::AppendMismatch)?
-                .speculative()
-                .partitions()
-                .find_map(|(partition, state)| state.delay.is_some().then_some(partition))
-            else {
-                return Ok(());
-            };
-            let references = &self.journal.readable()?.manifest().segments;
-            self.held = Some(Held::new(partition, window, references));
-        }
-        let references = &self.journal.readable()?.manifest().segments;
-        let held = self.held.as_mut().ok_or(JournalError::AppendMismatch)?;
-        held.admit(append.operations(), self.limits.operations)?;
-        held.observe(references);
-        self.check_held()
-    }
-
-    /// Sealed held records loaded now.
-    #[cfg(test)]
-    pub(in crate::replica_journal) fn held_rows(&self) -> usize {
-        self.held.as_ref().map_or(0, Held::loaded_rows)
-    }
-
-    /// Held rows in memory, loaded or of the active segment on.
-    #[cfg(test)]
-    pub(in crate::replica_journal) fn held_memory(&self) -> usize {
-        let Some(held) = &self.held else { return 0 };
-        held.recent.len() + held.sealed.len()
-    }
-
-    /// First operation of the oldest segment holding a record the last
-    /// committed release and carry left, for retention.
-    pub(super) fn held_operation(&self) -> Result<Option<u64>, JournalError> {
-        let images = self.images()?;
-        let Some((_, delay)) = images
-            .committed()
-            .partitions()
-            .find_map(|(partition, state)| Some((partition, state.delay.as_ref()?)))
-        else {
-            return Ok(None);
-        };
-        Ok(self
-            .held
-            .as_ref()
-            .ok_or(JournalError::AppendMismatch)?
-            .held_operation(delay.released(), delay.carried()))
-    }
-
-    /// Follow segment rolls and retirement since the last admission.
-    pub(super) fn observe_held(&mut self) -> Result<(), JournalError> {
-        if let Some(held) = self.held.as_mut() {
-            held.observe(&self.journal.readable()?.manifest().segments);
-        }
-        Ok(())
-    }
-
-    /// Debug builds compare the held index with the canonical cursor and
-    /// held totals.
-    pub(super) fn check_held(&self) -> Result<(), JournalError> {
-        #[cfg(debug_assertions)]
-        if let Some(held) = &self.held {
-            let delay = self
-                .images
-                .as_ref()
-                .ok_or(JournalError::AppendMismatch)?
-                .speculative()
-                .partition(held.partition())
-                .and_then(|state| state.delay.as_ref())
-                .ok_or(JournalError::AppendMismatch)?;
-            assert!(held.matches(delay), "held index diverged: {held:?}");
-        }
-        Ok(())
-    }
 }

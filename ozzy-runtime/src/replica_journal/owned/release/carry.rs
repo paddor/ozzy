@@ -1,4 +1,4 @@
-//! The primary carries held records forward so retention can free their
+//! The leader carries held records forward so retention can free their
 //! segment. A carry step reads the held rows from the carry floor up to the
 //! target's end in position order, beside writes, and copies a bounded prefix
 //! into one `Carry` that ends where the next row starts. A byte target
@@ -174,7 +174,7 @@ async fn read_used(
         .into_iter()
         .filter(|(number, _, _)| sources.contains(number))
         .collect();
-    read_sources(hot, &cold, Some(stored)).await
+    read_sources(hot, Vec::new(), &cold, Some(stored)).await
 }
 
 /// How many of the first `rows` one `Carry` of `room` bytes may take,

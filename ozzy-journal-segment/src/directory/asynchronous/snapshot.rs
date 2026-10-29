@@ -1,4 +1,8 @@
 use super::Journal;
+
+mod sealed;
+pub use sealed::SealedSchedules;
+
 use crate::{
     ActiveSegmentIndex, DirectoryError, IndexBuildLimits, IndexLimits, JournalIndexBoundary,
     JournalIndexError, active_index::ActivePrefix, index_catalog::asynchronous::Catalog,

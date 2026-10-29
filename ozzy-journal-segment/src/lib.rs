@@ -77,11 +77,12 @@ pub use directory::asynchronous::{
     Pipeline as JournalWritePipeline, Prepared as PreparedJournalWrite,
     PreparedRoll as PreparedJournalRoll, PreparedSegment, PreparedSync as PreparedJournalSync,
     RecoveryDirectory, Repair as SealedRepair, RetirementBudget, RetirementProof, RetirementScan,
-    ScannedPrefix, SegmentFiles, SegmentPreparation, SparePreparation, SuffixRequest,
-    UnselectedFiles,
+    ScannedPrefix, SealedSchedules, SegmentFiles, SegmentPreparation, SparePreparation,
+    SuffixRequest, UnselectedFiles,
 };
 pub use directory::asynchronous::{
-    PartitionIndex as JournalPartitionIndex, PartitionRead, PartitionReadLimits, PartitionReadRange,
+    OperationRead, PartitionIndex as JournalPartitionIndex, PartitionRead, PartitionReadLimits,
+    PartitionReadRange, WrittenOperation,
 };
 pub use directory::{
     DirectoryError, GROUP_CONFIGURATION_MAX_BYTES, JournalGroupEncoder, JournalGroupEncoding,
