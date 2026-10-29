@@ -41,6 +41,8 @@
 - A record within the SDK's limits but over the broker's fails its own
   `send` with `RecordLimits`. Before, it failed the whole partition writer
   with `Configuration`. Delay topics leave less room per record.
+- Java SDK: `PendingRecord.confirmedAsync` returns a failed future for a
+  failure it already knows, instead of throwing `OzzyException`.
 
 ## [0.6.0] - 2026-10-26
 
