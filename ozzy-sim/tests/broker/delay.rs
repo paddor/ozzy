@@ -312,15 +312,15 @@ async fn inproc_memory_full_schedule_capacity_backs_off_until_a_release() {
     .expect("full schedule capacity made no bounded progress");
 }
 
-/// A delay topic leaves less room per record: with a 64 KiB APPEND, each
-/// broker takes records of about 2 KiB. A larger record within the client's
-/// limits fails its own send; the writer keeps going.
+/// A delay topic leaves less room per record: with a 64 KiB APPEND of up to
+/// 2048 records, each broker takes records of about 2 KiB. A larger record
+/// within the client's limits fails its own send; the writer keeps going.
 #[tokio::test(flavor = "current_thread")]
 async fn inproc_memory_a_record_over_the_broker_limit_fails_only_its_send() {
     use ozzy_runtime::replicated::{TopicWriterError, WriterError};
     tokio::time::timeout(Duration::from_secs(30), async {
         let clock = SdkClock::manual();
-        let cluster = delay_cluster(DeploymentMode::Three, &clock, 8).await;
+        let cluster = delay_cluster(DeploymentMode::Three, &clock, 2048).await;
         let client = progress(
             &clock,
             Client::open_with_clock(&cluster.configs[0].0, &cluster.runtime, clock.clone()),
@@ -362,6 +362,55 @@ async fn inproc_memory_a_record_over_the_broker_limit_fails_only_its_send() {
     })
     .await
     .expect("an oversized record made no bounded progress");
+}
+
+/// The broker caps APPEND records at the held-record limit, so a burst
+/// larger than the limit goes out in batches that fit and backs off until
+/// releases make room.
+#[tokio::test(flavor = "current_thread")]
+async fn inproc_memory_a_burst_above_the_held_limit_confirms_in_fitting_batches() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let clock = SdkClock::manual();
+        let cluster = delay_cluster(DeploymentMode::Single, &clock, 8).await;
+        let client = progress(
+            &clock,
+            Client::open_with_clock(&cluster.configs[0].0, &cluster.runtime, clock.clone()),
+        )
+        .await;
+        // The client alone would batch up to 64 records.
+        let mut limits = ozzy_sim::client::DATA_LIMITS;
+        limits.max_records = 64;
+        limits.max_parts = 64;
+        let mut writer = progress(
+            &clock,
+            SharedTopicWriter::open(
+                &client.links,
+                "orders",
+                SharedTopicWriterConfig::new(limits),
+                RetryPolicy::default(),
+            ),
+        )
+        .await
+        .unwrap();
+        let due = broker_now(&clock);
+        let receipts = confirm(
+            &clock,
+            &mut writer,
+            (1..=32).map(|id| record(id, Some(due))),
+        )
+        .await;
+        assert!(
+            receipts
+                .iter()
+                .all(|&(disposition, _)| disposition == AppendDisposition::Scheduled)
+        );
+        assert_eq!(released(&clock, &client, 32).await.len(), 32);
+        drop(writer);
+        progress(&clock, client.close()).await;
+        progress(&clock, cluster.shutdown()).await;
+    })
+    .await
+    .expect("a burst above the held limit made no bounded progress");
 }
 
 /// A confirmed record. Its leader accepted it between `sent_at` and
