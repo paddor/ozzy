@@ -304,7 +304,8 @@ Only the leader releases, one step at a time.
 - The owner picks the due records from its held index.
 - A detached job reads their `Schedule` or `Carry` operations beside writes.
 - The `Release` waits for pipeline room, then validates before queued
-  producer requests.
+  producer requests. In disk quorum it also waits for a free live slot,
+  since it holds no ingress permit.
 - The next step starts once this `Release` commits. Under load, each step
   takes more records.
 - A step fills at most one proposal arena from at most 64 operations. It

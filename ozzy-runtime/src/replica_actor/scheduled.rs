@@ -308,6 +308,13 @@ impl ScheduledReplica {
         )
     }
 
+    /// Whether a built release or carry waits in, or holds, the
+    /// maintenance slot.
+    #[cfg(test)]
+    pub(crate) fn holds_maintenance(&self) -> bool {
+        self.actor.work.proposals.holds_maintenance()
+    }
+
     /// Immutable group identity, read without copying the status.
     pub fn group(&self) -> ozzy_proto::GroupId {
         self.actor.driver.scope().group_id
