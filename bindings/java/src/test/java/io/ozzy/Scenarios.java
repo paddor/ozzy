@@ -525,6 +525,10 @@ public final class Scenarios {
         var only = new ReaderOptions(ReaderOptions.Start.EARLIEST, null, List.of(0));
         try (Producer p = producer(client);
                 Consumer c = consumer(client, only)) {
+            // A fresh group's first commit can take most of a second, which
+            // would accept the records below after the earliest due time.
+            confirm(send(p, new byte[] {9}, SendOptions.partition(0)));
+            check(next(c).parts().get(0).get(0) == 9);
             // Two out of due order, one stored at once, and one already due.
             long start = System.currentTimeMillis();
             long[] due = {start + 2_000, start + 1_000, -1, start - 1_000};

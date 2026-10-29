@@ -75,6 +75,11 @@ def blocking() -> None:
                         error, lambda value=value: producer.send(b"x", due_millis=value)
                     )
             with client.consumer("orders", partitions=[0]) as consumer:
+                # A fresh group's first commit can take most of a second,
+                # which would accept the records below after the earliest
+                # due time.
+                producer.send(b"w", partition=0).confirmed(timeout=10)
+                assert consumer.next(timeout=10).parts[0] == b"w"
                 start = now()
                 pending = [
                     producer.send(payload, partition=0, due_millis=due)
@@ -99,6 +104,9 @@ async def asynchronous() -> None:
     async with ozzy.asyncio.Client(config) as client:
         async with await client.producer("orders") as producer:
             async with await client.consumer("orders", partitions=[0]) as consumer:
+                await (await producer.send(b"w", partition=0)).confirmed()
+                async with asyncio.timeout(10):
+                    assert (await consumer.next()).parts[0] == b"w"
                 start = now()
                 pending = [
                     await producer.send(payload, partition=0, due_millis=due)
