@@ -408,7 +408,11 @@ impl LocalActor {
     /// Start a due release step. Its reads run beside writes. `true` when
     /// it started.
     fn start_release(&mut self) -> Result<bool, ActorError> {
-        if !self.releases.due(&self.journal, &self.proposals, self.now) {
+        let committing = self.live.iter().any(|live| live.reply.is_maintenance());
+        if !self
+            .releases
+            .due(&self.journal, &self.proposals, committing, self.now)
+        {
             return Ok(false);
         }
         let ticket = self.driver.begin_validation()?;

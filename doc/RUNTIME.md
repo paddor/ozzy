@@ -294,27 +294,32 @@ On the SDK:
 - A periodic safety sweep visits every partition. Work that only the sweep
   finds counts as `partition_sweep_progress`; a nonzero value means a missed
   wakeup.
-- A partition with held scheduled records also wakes when the earliest
-  committed one is due, by the journal clock. Only the primary releases,
-  one step at a time: the owner picks the due prefix from its held index, a
-  detached job reads its `Schedule` or `Carry` operations beside writes,
-  and the `Release` waits for pipeline room, then validates ahead of
-  queued producer requests. One step fills at most one proposal arena from
-  at most 64 such operations. Operations no longer in writeback are read
-  through a journal index snapshot. Building one holds the owner, so steps
-  reuse it while it holds their operations: one snapshot serves about one
-  delay of steps. It pins its segments until a later build or storage
-  cleanup drops it. When no sealed held record is loaded but some remain,
-  the step loads the next ones from the sealed indexes instead, and the
-  next step starts at once. A due retention turn goes first. A step that
-  builds nothing, or whose `Release` the core does not admit, waits 10 ms;
-  one that validation refuses waits 100 ms.
-- The same step carries held records forward when a primary's retention
-  turn names a carry target. It wakes at once, reads the held rows from the
-  carry floor up to the target in position order beside writes, and builds
-  one `Carry` of at most one proposal arena and 64 source operations. The
-  `Carry` takes its timestamp at validation. When a release is due too,
-  steps alternate between carrying and releasing.
+- A partition with held scheduled records wakes when the earliest
+  committed one is due, by the journal clock.
+
+### Release steps
+
+Only the leader releases, one step at a time.
+
+- The owner picks the due records from its held index.
+- A detached job reads their `Schedule` or `Carry` operations beside writes.
+- The `Release` waits for pipeline room, then validates before queued
+  producer requests.
+- The next step starts once this `Release` commits. Under load, each step
+  takes more records.
+- A step fills at most one proposal arena from at most 64 operations. It
+  waits for shard memory when none is free.
+- Other operations no longer in writeback are read through a journal index
+  snapshot. Steps reuse it while it covers their operations. It pins its
+  segments until the next build or storage cleanup.
+- With no sealed held record loaded, a step loads the next ones from the
+  sealed indexes. The next step starts at once.
+- A due retention turn goes first.
+- A step that builds nothing, or is not admitted, waits 10 ms. A refused
+  one waits 100 ms.
+- A leader's retention turn can name a carry target. Steps then carry held
+  rows up to it, in position order, into one `Carry` per step. A `Carry` is
+  timestamped at validation. Carrying and releasing alternate.
 
 ## Storage backends
 

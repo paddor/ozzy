@@ -300,7 +300,12 @@ impl ReplicaActor {
     pub(super) fn schedule_release(&mut self, now: Duration) -> Result<bool, ActorError> {
         if !self.releasing()
             || (self.application_ready() && self.retention_at().is_some_and(|at| now >= at))
-            || !self.releases.due(&self.journal, &self.work.proposals, now)
+            || !self.releases.due(
+                &self.journal,
+                &self.work.proposals,
+                self.work.committing_maintenance(),
+                now,
+            )
         {
             return Ok(false);
         }
