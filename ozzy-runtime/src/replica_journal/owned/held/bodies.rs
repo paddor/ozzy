@@ -4,8 +4,7 @@
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
-use ozzy_core::state::PendingSchedule;
-use ozzy_journal::operation::{CanonicalOperation, OperationKind, ReleaseKey};
+use ozzy_journal::operation::{OperationKind, ReleaseKey};
 
 use super::Held;
 
@@ -14,26 +13,19 @@ use super::Held;
 const HELD_BODY_BYTES: usize = 4 << 20;
 
 impl Held {
-    /// Keep the body of an operation that still holds records.
-    pub(super) fn keep_body(
-        &mut self,
-        operation: &CanonicalOperation<'_>,
-        entries: &[(ReleaseKey, PendingSchedule)],
-    ) {
-        if let Some(last) = entries.iter().map(|(key, _)| *key).max()
-            && self.released.is_none_or(|released| last > released)
-        {
-            self.bodies
-                .keep(operation.op_number, operation.kind, operation.body, last);
-        }
-    }
-
     /// Kind and body of a held operation kept in memory.
     pub(in crate::replica_journal::owned) fn body(
         &self,
         number: u64,
     ) -> Option<(OperationKind, Bytes)> {
         self.bodies.get(number)
+    }
+
+    /// Drop every kept body and keep no more.
+    #[cfg(test)]
+    pub(in crate::replica_journal::owned) fn keep_no_bodies(&mut self) {
+        self.bodies.budget = 0;
+        self.bodies.retain(|_, _| false);
     }
 }
 
@@ -46,16 +38,27 @@ struct Body {
 }
 
 /// Held operation bodies by number, within `HELD_BODY_BYTES`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct Bodies {
     by_operation: BTreeMap<u64, Body>,
     bytes: usize,
+    budget: usize,
+}
+
+impl Default for Bodies {
+    fn default() -> Self {
+        Self {
+            by_operation: BTreeMap::new(),
+            bytes: 0,
+            budget: HELD_BODY_BYTES,
+        }
+    }
 }
 
 impl Bodies {
     /// Keep a copy of `body` while it fits.
     pub(super) fn keep(&mut self, number: u64, kind: OperationKind, body: &[u8], last: ReleaseKey) {
-        if body.len() > HELD_BODY_BYTES - self.bytes || self.by_operation.contains_key(&number) {
+        if body.len() > self.budget - self.bytes || self.by_operation.contains_key(&number) {
             return;
         }
         self.bytes += body.len();

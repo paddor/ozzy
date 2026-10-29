@@ -368,6 +368,7 @@ impl LocalActor {
             self.sync_started_at = crate::profiling::start();
             changed = true;
         }
+        changed |= self.start_held_load()?;
         if let Some(Pending::Ready(_)) = self.pending
             && let Some(Pending::Ready(ready)) = self.pending.take()
         {
@@ -417,6 +418,18 @@ impl LocalActor {
         }
         let ticket = self.driver.begin_validation()?;
         self.releases.start(self.journal.release_turn(ticket)?);
+        Ok(true)
+    }
+
+    /// Start a held-row load beside writes. `true` when it started.
+    fn start_held_load(&mut self) -> Result<bool, ActorError> {
+        if self.journal.available_command_slots() == 0
+            || !self.releases.loads.due(&self.journal, self.now)
+        {
+            return Ok(false);
+        }
+        let ticket = self.driver.begin_validation()?;
+        self.releases.loads.start(self.journal.load_held(ticket)?);
         Ok(true)
     }
 
@@ -525,6 +538,7 @@ impl LocalActor {
         super::deadline::Earliest::after(now)
             .at(self.retention.at())
             .at(self.releases.at(&self.journal, now))
+            .at(self.releases.loads.at(&self.journal, now))
             .at(self.evidence_deadline())
             .get()
     }

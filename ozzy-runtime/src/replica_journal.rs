@@ -398,6 +398,23 @@ impl ReplicaJournal {
         })
     }
 
+    /// Load the next sealed held rows beside writes, on the leader or a
+    /// follower, once few are loaded.
+    pub fn load_held(
+        &mut self,
+        ticket: ozzy_replication::driver::ValidationTicket,
+    ) -> Result<JournalCompletion<ReleaseTurn>, SubmitError> {
+        self.command(commands::Gate::Free, |done| {
+            commands::Action::Maintenance(commands::MaintenanceAction::LoadHeld { ticket, done })
+        })
+    }
+
+    /// Whether the copy wants a held-row load. `false` while the owner runs
+    /// a command.
+    pub(crate) fn held_load_wanted(&self) -> bool {
+        self.execution.held_load_wanted()
+    }
+
     /// Time until the earliest committed held record is due, by the journal
     /// clock, or zero while a carry is pending. `None` while nothing is held
     /// or the owner runs a command.

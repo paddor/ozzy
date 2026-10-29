@@ -1,6 +1,6 @@
 //! Held rows across a `Carry`. A carry moves its records to rows of the
 //! `Carry` operation, and rows before the carry floor are gone. Held rows of
-//! a position range let a copy check a `Carry`, and let the primary build
+//! a position range let a copy check a `Carry`, and let the leader build
 //! one toward the segment retention would free.
 
 use std::collections::BTreeMap;
@@ -40,7 +40,8 @@ impl Held {
         let entries = ozzy_core::state::carry_entries(operation, carry)
             .map_err(|_| JournalError::AppendMismatch)?;
         self.bodies.carried(carry.through.operation);
-        self.keep_body(canonical, &entries);
+        self.locations.carried(carry.through.operation);
+        self.keep_source(canonical, &entries);
         for (key, record) in entries {
             // The earlier row is loaded, in memory, or in its index file.
             self.sealed.remove(&key);

@@ -50,8 +50,9 @@ impl OwnedJournal {
         while check(self.held.as_ref(), buffer.operations(), limits, &covered)? == Checked::Load {
             let held = self.held.as_ref().ok_or(JournalError::AppendMismatch)?;
             let before = held.loaded;
-            let snapshot = self.journal.retry_snapshot(self.recovery.index).await?;
-            let load = held.refill(snapshot).read().await?;
+            let sealed = self.sealed_rows().await?;
+            let held = self.held.as_ref().ok_or(JournalError::AppendMismatch)?;
+            let load = held.refill(sealed).read().await?;
             let held = self.held.as_mut().ok_or(JournalError::AppendMismatch)?;
             held.extend(load);
             // Each load reads past the loaded rows or loads every one.

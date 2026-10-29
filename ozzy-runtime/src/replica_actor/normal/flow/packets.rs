@@ -25,6 +25,12 @@ impl ReplicaActor {
         if !self.application_ready() {
             return Ok(());
         }
+        // TODO: one publication slot per actor. At high operation rates a
+        // live entry can commit through a follower in PEER catch-up and
+        // retire before it is published. A PUB-only follower then sees a gap
+        // and falls back to probe-paced catch-up. Let one publication carry
+        // several live entries, bounded by count and bytes; an unbounded
+        // queue exhausted shard memory.
         if self.work.flow.publication_enabled && self.work.flow.publication.is_none() {
             let snapshot = require_normal(&self.driver)?.snapshot();
             if let Some(live) = self

@@ -301,6 +301,9 @@ impl OwnedJournal {
             .as_mut()
             .ok_or(JournalError::AppendMismatch)?
             .appended(pipeline.journal(), &written.locations, &written.records)?;
+        if let Some(held) = self.held.as_mut() {
+            held.written(pipeline.journal().written_operations(&written.locations));
+        }
         self.writeback.release_written(parts)?;
         if let JournalOwner::Writing(pipeline) = &self.journal
             && pipeline.pending() == 0

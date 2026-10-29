@@ -287,7 +287,7 @@ impl ReplicaActor {
         Ok(self)
     }
 
-    /// When the primary's next release step is due.
+    /// When the leader's next release step is due.
     pub(super) fn release_deadline(&self, now: Duration) -> Option<Duration> {
         self.releasing()
             .then(|| self.releases.at(&self.journal, now))
@@ -314,11 +314,31 @@ impl ReplicaActor {
         Ok(true)
     }
 
-    /// Only a normal primary releases held records.
+    /// Only a normal leader releases held records.
     fn releasing(&self) -> bool {
         self.driver.normal().is_some_and(|normal| {
             self.configuration.primary(normal.snapshot().scope.view) == self.local
         })
+    }
+
+    /// When this normal copy's next held-row load may start.
+    pub(super) fn held_load_deadline(&self, now: Duration) -> Option<Duration> {
+        self.driver
+            .normal()
+            .is_some()
+            .then(|| self.releases.loads.at(&self.journal, now))
+            .flatten()
+    }
+
+    /// Start a held-row load beside writes on a normal copy, the leader or
+    /// a follower. `true` when it started.
+    pub(super) fn schedule_held_load(&mut self, now: Duration) -> Result<bool, ActorError> {
+        if self.driver.normal().is_none() || !self.releases.loads.due(&self.journal, now) {
+            return Ok(false);
+        }
+        let ticket = self.driver.begin_validation()?;
+        self.releases.loads.start(self.journal.load_held(ticket)?);
+        Ok(true)
     }
 
     fn maintenance_ready(&self, now: Duration, next: Duration) -> bool {

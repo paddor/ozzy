@@ -22,8 +22,8 @@ pub use pack::{PACK_CHUNK_BYTES, PackJob, PackLimits, PackOutcome, PackedSegment
 mod partition_read;
 mod pipeline;
 pub use partition_read::{
-    Index as PartitionIndex, Limits as PartitionReadLimits, Read as PartitionRead,
-    ReadRange as PartitionReadRange,
+    Index as PartitionIndex, Limits as PartitionReadLimits, OperationRead, Read as PartitionRead,
+    ReadRange as PartitionReadRange, WrittenOperation,
 };
 pub use pipeline::{Completed, CompletedSync, Pipeline, Prepared, PreparedSync};
 mod prepared_roll;
@@ -37,6 +37,7 @@ pub use recovery::{RecoveryDirectory, Repair};
 mod retention;
 mod roll;
 mod snapshot;
+pub use snapshot::SealedSchedules;
 mod spare;
 pub use spare::SparePreparation;
 mod suffix;

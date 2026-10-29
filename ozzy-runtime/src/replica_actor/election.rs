@@ -31,7 +31,7 @@ impl ReplicaActor {
         if self.pending_replay.is_some() && !self.application_ready() {
             return Ok(());
         }
-        if self.schedule_release(now)? {
+        if self.schedule_release(now)? || self.schedule_held_load(now)? {
             return Ok(());
         }
         let hold = match self.schedule_due_maintenance(now)? {

@@ -19,9 +19,11 @@ use std::{
     rc::Rc,
 };
 
+mod operation;
 mod read;
 mod sources;
 
+pub use operation::{OperationRead, WrittenOperation};
 pub use read::Read;
 use sources::scan_index;
 

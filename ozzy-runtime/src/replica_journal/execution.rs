@@ -79,6 +79,12 @@ impl Execution {
             Self::Recovery(_) => None,
         }
     }
+    pub(super) fn held_load_wanted(&self) -> bool {
+        match self {
+            Self::Normal(owner) => owner.held_load_wanted(),
+            Self::Recovery(_) => false,
+        }
+    }
     pub(super) fn validation_ready(&self, buffer: &super::AppendBuffer) -> bool {
         match self {
             Self::Normal(owner) => owner.validation_ready(buffer),

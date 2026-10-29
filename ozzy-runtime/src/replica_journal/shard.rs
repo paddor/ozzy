@@ -268,6 +268,13 @@ impl ShardJournal {
         let due = self.state.as_ref()?.owner.next_release()?;
         Some(due.saturating_sub((self.timestamp)()))
     }
+    /// Whether the copy wants a held-row load beside writes. A command
+    /// holding the owner hides it until the owner returns.
+    pub(super) fn held_load_wanted(&self) -> bool {
+        self.state
+            .as_ref()
+            .is_some_and(|state| state.owner.wants_held_load())
+    }
     /// Whether a cleanup job runs. A command holding the owner counts as busy.
     pub(super) fn cleaning(&self) -> bool {
         self.state

@@ -120,6 +120,10 @@ pub(super) enum MaintenanceAction {
         ticket: ValidationTicket,
         done: completion::Sender<Result<super::ReleaseTurn, JournalError>>,
     },
+    LoadHeld {
+        ticket: ValidationTicket,
+        done: completion::Sender<Result<super::ReleaseTurn, JournalError>>,
+    },
     CleanupOrphans {
         ticket: ValidationTicket,
         budget: ozzy_journal_segment::MaintenanceBudget,

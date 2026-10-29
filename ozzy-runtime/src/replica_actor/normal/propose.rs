@@ -1,4 +1,4 @@
-//! Primary proposals: the next one that fits the live window, and the
+//! Leader proposals: the next one that fits the live window, and the
 //! install turn of an admitted batch.
 
 use super::{ActorError, Duration, NextProposal, PendingIo, ReplicaActor};
@@ -16,7 +16,18 @@ impl ReplicaActor {
         )>,
         ActorError,
     > {
-        if let Some(buffer) = self.work.proposals.start_maintenance() {
+        // Maintenance waits for room like any proposal, ahead of queued ones.
+        // It holds no ingress permit, so it also waits for a live slot.
+        if let Some(buffer) = self.work.proposals.maintenance() {
+            let slot = self.work.live.len() < self.config.proposal_capacity;
+            let room = room(&self.journal, self.config.pipeline, buffer, snapshot)
+                .map(|fits| fits && slot);
+            if !self.note_room(room) {
+                return Ok(None);
+            }
+            let Some(buffer) = self.work.proposals.start_maintenance() else {
+                return Ok(None);
+            };
             return Ok(Some((self.driver.begin_validation()?, buffer)));
         }
         let driver = &self.driver;
@@ -33,28 +44,37 @@ impl ReplicaActor {
             }
             NextProposal::Ready(submission) => submission,
         };
-        if !self
-            .journal
-            .validation_has_capacity(&submission.buffer.0, snapshot.accepted.op)
-        {
+        let room = room(
+            &self.journal,
+            self.config.pipeline,
+            &submission.buffer,
+            snapshot,
+        );
+        if !self.note_room(room) {
             return Ok(None);
         }
-        if submission.buffer.len()
-            > self.config.pipeline.max_operations - snapshot.pending_operations
-            || submission.buffer.admitted_body_bytes()
-                > self.config.pipeline.max_body_bytes - snapshot.pending_body_bytes
-        {
-            if !std::mem::replace(&mut self.work.window_full, true) {
-                crate::profiling::event(crate::profiling::Event::LiveWindowFull);
-            }
-            return Ok(None);
-        }
-        self.work.window_full = false;
         let Some(buffer) = self.work.proposals.start() else {
             return Ok(None);
         };
         let ticket = self.driver.begin_validation()?;
         Ok(Some((ticket, buffer)))
+    }
+
+    /// Whether `room` admits a proposal. Reports the live window filling.
+    fn note_room(&mut self, room: Option<bool>) -> bool {
+        match room {
+            None => false,
+            Some(false) => {
+                if !std::mem::replace(&mut self.work.window_full, true) {
+                    crate::profiling::event(crate::profiling::Event::LiveWindowFull);
+                }
+                false
+            }
+            Some(true) => {
+                self.work.window_full = false;
+                true
+            }
+        }
     }
 
     /// Install the accepted batch directly. The next validation observes its
@@ -107,4 +127,21 @@ impl ReplicaActor {
             );
         }
     }
+}
+
+/// Whether `buffer` fits beside the operations `snapshot` holds: `None`
+/// when validation is full, `Some(false)` when the live window is.
+fn room(
+    journal: &crate::replica_journal::ReplicaJournal,
+    limits: ozzy_replication::PipelineLimits,
+    buffer: &crate::replica_journal::ProposalBuffer,
+    snapshot: &ozzy_replication::ReplicaSnapshot,
+) -> Option<bool> {
+    if !journal.validation_has_capacity(&buffer.0, snapshot.accepted.op) {
+        return None;
+    }
+    Some(
+        buffer.len() <= limits.max_operations - snapshot.pending_operations
+            && buffer.admitted_body_bytes() <= limits.max_body_bytes - snapshot.pending_body_bytes,
+    )
 }

@@ -304,18 +304,32 @@ Only the leader releases, one step at a time.
 - The owner picks the due records from its held index.
 - A detached job reads their `Schedule` or `Carry` operations beside writes.
 - The `Release` waits for pipeline room, then validates before queued
-  producer requests.
+  producer requests. In disk quorum it also waits for a free live slot,
+  since it holds no ingress permit.
 - The next step starts once this `Release` commits. Under load, each step
   takes more records.
 - A step fills at most one proposal arena from at most 64 operations. It
   waits for shard memory when none is free.
 - Each delay partition keeps up to 4 MiB of held operation bodies in
   memory, so most steps read no storage.
-- Other operations no longer in writeback are read through a journal index
-  snapshot. Steps reuse it while it covers their operations. It pins its
-  segments until the next build or storage cleanup.
+- Held state also keeps where up to 65536 held operations per partition
+  were written. Steps read those there, in the detached job.
+- Other operations, as after a restart or a pack, are read through a
+  journal index snapshot. Steps reuse it while it covers their operations.
+  It pins its segments until the next build or storage cleanup.
 - With no sealed held record loaded, a step loads the next ones from the
   sealed indexes. The next step starts at once.
+- Loads read only sealed indexes this owner validated, with no scan of the
+  active segment. They reuse the opened indexes until a segment seals or
+  retires, or storage cleanup runs.
+- Every copy, leader or follower, also loads the next sealed held rows
+  beside writes once at most half its window is loaded. It reads only the
+  rows the window lacks, one such load at a time. Steps and follower checks
+  then rarely wait for a load.
+- A follower loads inline when a `Release` passes held rows it has not
+  loaded.
+- A load read before another one installed, or before the held index was
+  rebuilt, is dropped.
 - A due retention turn goes first.
 - A step that builds nothing, or is not admitted, waits 10 ms. A refused
   one waits 100 ms.

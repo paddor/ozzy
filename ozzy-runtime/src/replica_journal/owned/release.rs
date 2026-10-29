@@ -1,9 +1,11 @@
 //! Due scheduled records leave their partition in a broker-built `Release`.
 //! The owner picks the due prefix from its held index; a detached job reads
 //! the `Schedule` or `Carry` operations holding it, beside writes, and builds
-//! the proposal. When no held record is loaded but sealed ones are, the job
-//! loads the next ones instead. The same delay step carries held records
-//! forward when retention would free their segment.
+//! the proposal. Sources past the kept bodies are read where they were
+//! written, or through an index snapshot when that place is not kept. When
+//! no held record is loaded but sealed ones are, the job loads the next ones
+//! instead. The same delay step carries held records forward when retention
+//! would free their segment.
 
 use super::{JournalError, OwnedJournal};
 use crate::replica_journal::ProposalBuffer;
@@ -13,7 +15,7 @@ use ozzy_journal::operation::{
     AppendBatch, AppendRecord, OperationBody, OperationKind, OperationLimits, RELEASE_FRAME_BYTES,
     Release, ReleaseKey, decode_operation_body, encode_operation_body, encoded_record_bytes,
 };
-use ozzy_journal_segment::{JournalIndexError, JournalIndexSnapshot};
+use ozzy_journal_segment::{GroupJournal, JournalIndexError, JournalIndexSnapshot, OperationRead};
 use ozzy_proto::{
     Offset, OwnerEpoch, PartitionIncarnation, ProducerEpoch, ProducerId, ProducerSequence,
 };
@@ -67,7 +69,9 @@ struct Records {
     entries: Vec<(ReleaseKey, PendingSchedule)>,
     /// Kinds and bodies still in writeback, by operation number.
     hot: Vec<(u64, OperationKind, Bytes)>,
-    /// Operations to read from storage, by number.
+    /// Operations to read where they were written, by number.
+    located: Vec<(u64, OperationRead)>,
+    /// Operations to read through `stored`, by number.
     cold: Vec<u64>,
     stored: Option<JournalIndexSnapshot>,
     buffer: ProposalBuffer,
@@ -123,7 +127,7 @@ impl OwnedJournal {
 
     /// Pick the due prefix of committed held records on one partition,
     /// bounded by one proposal arena, or carry held records toward the
-    /// retention target. Only the primary releases and carries.
+    /// retention target. Only the leader releases and carries.
     pub(in crate::replica_journal) async fn prepare_release(
         &mut self,
         ticket: ValidationTicket,
@@ -168,7 +172,7 @@ impl OwnedJournal {
         else {
             return Ok(ReleaseStep::Idle);
         };
-        let (hot, cold) = self.sources(&entries);
+        let (hot, located, cold) = self.sources(&entries)?;
         let stored = match cold.last() {
             Some(&last) => Some(self.release_index(last).await?),
             None => None,
@@ -180,6 +184,7 @@ impl OwnedJournal {
                 owner_epoch,
                 entries,
                 hot,
+                located,
                 cold,
                 stored,
                 buffer,
@@ -188,11 +193,12 @@ impl OwnedJournal {
         }))
     }
 
-    /// An index snapshot holding operations through `last`. Building one
-    /// holds the owner while it opens indexes and scans the active segment.
-    /// Due records were scheduled about a delay ago, so one snapshot serves
-    /// the releases of about that long. It pins its segments until a later
-    /// build or storage cleanup drops it.
+    /// An index snapshot holding operations through `last`, for sources
+    /// whose place is not kept, as after a restart. Building one holds the
+    /// owner while it opens indexes and scans the active segment. Due
+    /// records were scheduled about a delay ago, so one snapshot serves the
+    /// releases of about that long. It pins its segments until a later build
+    /// or storage cleanup drops it.
     async fn release_index(&mut self, last: u64) -> Result<JournalIndexSnapshot, JournalError> {
         let held = self.held.as_ref().ok_or(JournalError::AppendMismatch)?;
         if let Some(index) = &held.index
@@ -200,8 +206,6 @@ impl OwnedJournal {
         {
             return Ok(index.clone());
         }
-        // OPTIMIZE: read cold release sources without rebuilding the index.
-        // The partition reader sees each written group's operation locations.
         let index = self.journal.retry_snapshot(self.recovery.index).await?;
         if let Some(held) = self.held.as_mut() {
             held.index = Some(index.clone());
@@ -210,13 +214,25 @@ impl OwnedJournal {
     }
 
     /// Kinds and bodies of the entries' `Schedule` or `Carry` operations
-    /// still in writeback or kept with the held rows, and the numbers of
-    /// those to read from storage.
+    /// still in writeback or kept with the held rows, reads of those whose
+    /// place is kept, and the numbers of the rest.
+    #[expect(
+        clippy::type_complexity,
+        reason = "one private result tuple read by the caller only"
+    )]
     fn sources(
         &self,
         entries: &[(ReleaseKey, PendingSchedule)],
-    ) -> (Vec<(u64, OperationKind, Bytes)>, Vec<u64>) {
+    ) -> Result<
+        (
+            Vec<(u64, OperationKind, Bytes)>,
+            Vec<(u64, OperationRead)>,
+            Vec<u64>,
+        ),
+        JournalError,
+    > {
         let mut hot = Vec::new();
+        let mut located = Vec::new();
         let mut cold = Vec::new();
         let mut sources = entries
             .iter()
@@ -226,15 +242,64 @@ impl OwnedJournal {
         sources.dedup();
         for number in sources {
             let kept = || self.held.as_ref()?.body(number);
-            match self.writeback.operation_bytes(number).or_else(kept) {
-                Some((kind, body)) => hot.push((number, kind, body)),
+            if let Some((kind, body)) = self.writeback.operation_bytes(number).or_else(kept) {
+                hot.push((number, kind, body));
+                continue;
+            }
+            let written = self.held.as_ref().and_then(|held| held.location(number));
+            match written {
+                Some(written) => match self.journal.readable()?.prepare_operation_read(written)? {
+                    Some(read) => located.push((number, read)),
+                    None => cold.push(number),
+                },
                 None => cold.push(number),
             }
         }
-        (hot, cold)
+        Ok((hot, located, cold))
     }
 
-    /// Load the next sealed held records when none is loaded.
+    /// Whether this copy wants a held-row load beside writes: at most half
+    /// its window is loaded, more is sealed, and every sealed index is
+    /// validated here.
+    pub(in crate::replica_journal) fn wants_held_load(&self) -> bool {
+        self.held
+            .as_ref()
+            .is_some_and(super::held::Held::wants_load)
+            && self
+                .journal
+                .readable()
+                .is_ok_and(GroupJournal::sealed_indexes_validated)
+    }
+
+    /// Load the next sealed held records beside writes when this copy, the
+    /// leader or a follower, wants them. Release steps and follower checks
+    /// then rarely wait for a load.
+    pub(in crate::replica_journal) fn prepare_held_load(
+        &mut self,
+        ticket: ValidationTicket,
+    ) -> Result<ReleaseStep, JournalError> {
+        self.healthy()?;
+        self.validate_image(ticket)?;
+        self.observe_held()?;
+        if !self.wants_held_load() {
+            return Ok(ReleaseStep::Idle);
+        }
+        let Some(sealed) = self.validated_sealed_rows()? else {
+            return Ok(ReleaseStep::Idle);
+        };
+        let refill = self
+            .held
+            .as_ref()
+            .ok_or(JournalError::AppendMismatch)?
+            .top_up(super::held::SealedRows::Validated(sealed));
+        Ok(ReleaseStep::Read(ReleaseRead {
+            key: self.read_key.clone(),
+            work: Work::Load(Box::new(refill)),
+        }))
+    }
+
+    /// Load the next sealed held records when none is loaded. Indexes this
+    /// owner validated are read beside writes; a snapshot validates others.
     async fn prepare_load(&mut self) -> Result<Option<ReleaseStep>, JournalError> {
         if !self
             .held
@@ -243,12 +308,12 @@ impl OwnedJournal {
         {
             return Ok(None);
         }
-        let snapshot = self.journal.retry_snapshot(self.recovery.index).await?;
+        let sealed = self.sealed_rows().await?;
         let refill = self
             .held
             .as_ref()
             .ok_or(JournalError::AppendMismatch)?
-            .refill(snapshot);
+            .refill(sealed);
         Ok(Some(ReleaseStep::Read(ReleaseRead {
             key: self.read_key.clone(),
             work: Work::Load(Box::new(refill)),
@@ -378,12 +443,13 @@ impl Records {
             owner_epoch,
             entries,
             hot,
+            located,
             cold,
             stored,
             mut buffer,
             limits,
         } = self;
-        let bodies = read_sources(hot, &cold, stored.as_ref()).await?;
+        let bodies = read_sources(hot, located, &cold, stored.as_ref()).await?;
         let sources = batches(&bodies, limits)?;
         let room = buffer.limits().max_body_bytes.min(limits.max_body_bytes);
         let (records, _) =
@@ -411,13 +477,22 @@ impl Records {
     }
 }
 
-/// Kinds and bodies of the source operations: `hot` ones, then `cold` ones
-/// read from `stored`, by number.
+/// Kinds and bodies of the source operations: `hot` ones, `located` ones,
+/// then `cold` ones read from `stored`, by number.
 async fn read_sources(
     mut hot: Vec<(u64, OperationKind, Bytes)>,
+    located: Vec<(u64, OperationRead)>,
     cold: &[u64],
     stored: Option<&JournalIndexSnapshot>,
 ) -> Result<Vec<(u64, OperationKind, Bytes)>, JournalError> {
+    for (number, read) in located {
+        let operation = read.read().await?;
+        hot.push((
+            number,
+            operation.kind,
+            Bytes::from(operation.body.into_owned()),
+        ));
+    }
     if let Some(stored) = stored {
         for &number in cold {
             let operation = stored

@@ -210,6 +210,9 @@ async fn maintenance(
         MaintenanceAction::Release { ticket, done } => {
             return release(state, ticket, done, permit, timestamp).await;
         }
+        MaintenanceAction::LoadHeld { ticket, done } => {
+            return detach_step(state.owner.prepare_held_load(ticket), done, permit);
+        }
         MaintenanceAction::ValidateStorage {
             ticket,
             budget,
@@ -246,8 +249,18 @@ async fn release(
     permit: OwnedSemaphorePermit,
     timestamp: u64,
 ) -> Outcome {
+    let step = state.owner.prepare_release(ticket, timestamp).await;
+    detach_step(step, done, permit)
+}
+
+/// Continue a prepared delay step or held-row load as a detached job.
+fn detach_step(
+    step: Result<crate::replica_journal::owned::release::ReleaseStep, JournalError>,
+    done: Reply<crate::replica_journal::ReleaseTurn>,
+    permit: OwnedSemaphorePermit,
+) -> Outcome {
     use crate::replica_journal::owned::release::ReleaseStep;
-    let turn = match state.owner.prepare_release(ticket, timestamp).await {
+    let turn = match step {
         Ok(ReleaseStep::Read(read)) => {
             return Outcome::job(super::jobs::release(read, done, permit));
         }

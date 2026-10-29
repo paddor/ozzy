@@ -561,12 +561,12 @@ type Copy<'a> = (&'a mut Controller, &'a mut OwnedJournal, &'a mut Driver);
 /// the released record IDs and how many steps loaded sealed records
 /// instead.
 fn release_all(
-    primary: Copy<'_>,
+    leader: Copy<'_>,
     copy: Copy<'_>,
     window: usize,
     mut until: impl FnMut(usize) -> bool,
 ) -> (Vec<u8>, usize) {
-    let (controller, journal, driver) = primary;
+    let (controller, journal, driver) = leader;
     let (other, copy, copy_driver) = copy;
     let (mut ids, mut loads) = (Vec::new(), 0);
     while held(journal).0 > 0 && !until(ids.len()) {
@@ -592,15 +592,15 @@ fn release_all(
 
 /// Schedule `batches` batches of three records with due times out of
 /// order, copying each to `copy`. After each batch, `rolls` says whether the
-/// primary and the copy roll. Returns the record IDs in release order.
+/// leader and the copy roll. Returns the record IDs in release order.
 fn schedule_batches(
-    primary: Copy<'_>,
+    leader: Copy<'_>,
     copy: Copy<'_>,
     batches: u64,
     mut rolls: impl FnMut(u64) -> (bool, bool),
     mut after: impl FnMut(&OwnedJournal, &OwnedJournal),
 ) -> Vec<u8> {
-    let (controller, journal, driver) = primary;
+    let (controller, journal, driver) = leader;
     let (other, copy, copy_driver) = copy;
     let mut expected = Vec::new();
     for batch in 0..batches {
@@ -622,8 +622,8 @@ fn schedule_batches(
         for (at, due) in (0..).zip(&due) {
             expected.push(((*due.max(&NOW), first + at), (first + at + 1) as u8));
         }
-        let (primary, copied) = rolls(batch);
-        if primary {
+        let (leader, copied) = rolls(batch);
+        if leader {
             roll(controller, journal);
         }
         if copied {
@@ -680,6 +680,7 @@ fn held_records_release_in_order_through_a_small_window_across_segments() {
         |batch| (batch < 4, batch < 4),
         |_, _| {},
     );
+    journal.held.as_mut().unwrap().keep_no_bodies();
 
     // The copy never loads sealed records; its releases pass them unread.
     let (mut ids, mut loads) = release_all(
@@ -688,6 +689,10 @@ fn held_records_release_in_order_through_a_small_window_across_segments() {
         2,
         |released| released >= 6,
     );
+    // Releases read their sources where they were written, and loads the
+    // sealed indexes they validated once.
+    assert!(journal.held.as_ref().unwrap().index.is_none());
+    assert!(journal.held.as_ref().unwrap().sealed_indexes.is_some());
     let (mut controller, mut journal, mut driver) = restart(controller, journal, limits);
     // Restart loads the window from the sealed indexes.
     assert!(journal.held_rows() > 0);
@@ -704,6 +709,76 @@ fn held_records_release_in_order_through_a_small_window_across_segments() {
     assert_eq!(held(&journal), (0, 15, Offset::new(15)));
     assert_eq!(held(&copy), (0, 15, Offset::new(15)));
     assert_eq!(journal.next_release(), None);
+}
+
+/// Build every missing sealed index, as the detached index jobs do.
+fn index_all(controller: &mut Controller, journal: &mut OwnedJournal) {
+    while let Some(job) = journal.take_index_work() {
+        let built = drive(controller, job.run());
+        journal.complete_index_work(&built);
+    }
+}
+
+/// Run held-row loads while `journal` wants one, as an actor does beside
+/// writes. Returns how many ran.
+fn load_beside(controller: &mut Controller, journal: &mut OwnedJournal, driver: &Driver) -> usize {
+    use crate::replica_journal::owned::release::ReleaseStep;
+    let mut loads = 0;
+    while journal.wants_held_load() {
+        assert!(loads < 100, "loads stopped progressing");
+        let ReleaseStep::Read(read) = journal
+            .prepare_held_load(driver.begin_validation().unwrap())
+            .unwrap()
+        else {
+            panic!("a wanted load starts");
+        };
+        let done = drive(controller, read.execute());
+        assert!(journal.complete_release(done).unwrap().loaded);
+        loads += 1;
+    }
+    loads
+}
+
+#[test]
+fn every_copy_loads_held_rows_beside_writes_before_they_are_needed() {
+    let limits = DelayLimits {
+        window: 4,
+        ..DelayLimits::new(64)
+    };
+    let (mut controller, mut journal, mut driver) = delayed_with(limits);
+    let (mut other, mut copy, mut copy_driver) = delayed_with(limits);
+    let expected = schedule_batches(
+        (&mut controller, &mut journal, &mut driver),
+        (&mut other, &mut copy, &mut copy_driver),
+        5,
+        |batch| (batch < 4, batch < 4),
+        |_, _| {},
+    );
+    index_all(&mut controller, &mut journal);
+    index_all(&mut other, &mut copy);
+    let (mut ids, mut loads) = (Vec::new(), 0);
+    while held(&journal).0 > 0 {
+        loads += load_beside(&mut controller, &mut journal, &driver);
+        loads += load_beside(&mut other, &mut copy, &copy_driver);
+        // Loaded rows wait for every step, so none loads instead.
+        let proposal = release(&mut controller, &mut journal, &driver, NOW + 1_000)
+            .expect("a step releases loaded rows");
+        let result = validate(
+            &mut controller,
+            &mut journal,
+            &driver,
+            proposal,
+            NOW + 1_000,
+        );
+        ids.extend(released(&result).3.iter().map(|id| id.as_bytes()[0]));
+        let (kind, body) = body(&result);
+        accept(&mut controller, &mut journal, &mut driver, result);
+        replicate(&mut other, &mut copy, &mut copy_driver, kind, &body).unwrap();
+    }
+    assert_eq!(ids, expected);
+    assert!(loads >= 4, "{loads} loads");
+    assert_eq!(held(&copy), (0, 15, Offset::new(15)));
+    assert!(!journal.wants_held_load() && !copy.wants_held_load());
 }
 
 /// Pack the sealed segments of a journal low on segments.
@@ -733,14 +808,17 @@ fn held_records_release_in_order_from_packed_segments() {
         |batch| (batch < 4, batch < 4),
         |_, _| {},
     );
+    journal.held.as_mut().unwrap().keep_no_bodies();
     let (mut ids, _) = release_all(
         (&mut controller, &mut journal, &mut driver),
         (&mut other, &mut copy, &mut copy_driver),
         2,
         |released| released >= 4,
     );
+    assert!(journal.held.as_ref().unwrap().index.is_none());
     // One packed segment replaces the sealed ones; loading continues from
-    // its index, before and after a restart.
+    // its index, before and after a restart. Sources written before the
+    // pack are read through an index snapshot.
     let before = segments(&journal);
     pack(&mut controller, &mut journal);
     assert!(segments(&journal) < before - 1, "{before} segments");
@@ -751,6 +829,7 @@ fn held_records_release_in_order_from_packed_segments() {
         |released| released >= 4,
     );
     assert!(loads > 0);
+    assert!(journal.held.as_ref().unwrap().index.is_some());
     ids.extend(more);
     let (mut controller, mut journal, mut driver) = restart(controller, journal, limits);
     let (rest, _) = release_all(
@@ -773,7 +852,7 @@ fn a_copy_loads_past_its_window_to_check_a_release_of_rows_it_sealed() {
         ..DelayLimits::new(64)
     };
     let (mut other, mut copy, mut copy_driver) = delayed_with(limits);
-    // The primary keeps every held row in its active segment; the copy seals
+    // The leader keeps every held row in its active segment; the copy seals
     // them in four segments.
     let expected = schedule_batches(
         (&mut controller, &mut journal, &mut driver),
@@ -886,6 +965,33 @@ fn release_reads_kept_bodies_instead_of_storage() {
     }
     // No release built an index snapshot to read its source.
     assert!(journal.held.as_ref().unwrap().index.is_none());
+    assert_eq!(held(&journal), (0, 2, Offset::new(2)));
+    assert_eq!(readable(&mut controller, &mut journal, &driver), [1, 2]);
+}
+
+#[test]
+fn release_reads_sources_where_they_were_written() {
+    let (mut controller, mut journal, mut driver) = delayed(16);
+    scheduled(
+        &mut controller,
+        &mut journal,
+        &mut driver,
+        0,
+        &[NOW, NOW + 1_000],
+    );
+    let rows = journal.held.as_mut().unwrap();
+    rows.keep_no_bodies();
+    let source = rows.prefix().next().unwrap().1.operation;
+    assert!(rows.location(source).is_some());
+    assert!(journal.writeback.operation_bytes(source).is_none());
+    for now in [NOW, NOW + 1_000] {
+        let proposal = release(&mut controller, &mut journal, &driver, now).unwrap();
+        let result = validate(&mut controller, &mut journal, &driver, proposal, now);
+        accept(&mut controller, &mut journal, &mut driver, result);
+    }
+    // No release built an index snapshot to read its source.
+    assert!(journal.held.as_ref().unwrap().index.is_none());
+    assert!(journal.held.as_ref().unwrap().location(source).is_none());
     assert_eq!(held(&journal), (0, 2, Offset::new(2)));
     assert_eq!(readable(&mut controller, &mut journal, &driver), [1, 2]);
 }
