@@ -1,6 +1,8 @@
 //! Write records at a steady rate while one consumer-group member reads and
 //! acknowledges them, until Ctrl-C or the group is deleted. Gives the admin
-//! console live rates, lag, and a group to look at.
+//! console live rates, lag, and a group to look at. With `--due-secs`, each
+//! record is due that long after writing, and the demo reports how late
+//! records arrive after their due time.
 //!
 //! ```sh
 //! cargo run --release -p ozzy-broker --example ozzy_demo -- \
@@ -11,14 +13,21 @@ use clap::Parser;
 use futures::{StreamExt, stream::FuturesUnordered};
 use ozzy_broker::{CheckedConfig, check_config, host_resources, load_deployment};
 use ozzy_proto::{
-    ConsumerMemberId, EnvelopeLimits, MessageId, NodeId, data::DataLimits, handshake,
+    ConsumerMemberId, EnvelopeLimits, MessageId, NodeId,
+    data::{DataLimits, RecordPayload},
+    handshake,
 };
 use ozzy_runtime::replicated::{
     AppendLinkLimits, BrokerLinks, BrokerLinksConfig, GroupReader, GroupReaderConfig,
     GroupReaderError, ReaderLinkLimits, RecordInput, RetryPolicy, SdkClock, SharedTopicWriter,
     SharedTopicWriterConfig, TopicRoutes, WriterRuntime,
 };
-use std::{error::Error, path::PathBuf, pin::pin, time::Duration};
+use std::{
+    error::Error,
+    path::PathBuf,
+    pin::pin,
+    time::{Duration, SystemTime},
+};
 use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
 
@@ -55,6 +64,10 @@ struct Args {
     /// Stop writing after this many records; 0 writes until stopped.
     #[arg(long, default_value_t = 0)]
     records: u64,
+    /// Make each record due this many seconds after writing it. The topic
+    /// needs `[topics.NAME.delay]`, like quickstart's `delayed`.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    due_secs: Option<u64>,
 }
 
 /// Records awaiting confirmation at once. Pacing stops while this many wait.
@@ -66,7 +79,20 @@ async fn main() -> Result<()> {
     let deployment = load_deployment(&args.config)?;
     let checked = check_config(deployment, &args.identity, &args.broker, &host_resources()?)?;
     let topic = checked.deployment.deployment().topics.get(&args.topic);
-    let partitions = topic.ok_or("no such topic")?.partitions as usize;
+    let topic = topic.ok_or("no such topic")?;
+    if let Some(due) = args.due_secs {
+        let delay = topic
+            .delay
+            .ok_or("--due-secs needs a topic with [topics.NAME.delay], like `delayed`")?;
+        if due > delay.max_secs {
+            return Err(format!(
+                "--due-secs is above the topic's max_secs {}",
+                delay.max_secs
+            )
+            .into());
+        }
+    }
+    let partitions = topic.partitions as usize;
     let runtime = WriterRuntime::new()?;
 
     let config = writer_config(&checked, partitions)?;
@@ -82,6 +108,9 @@ async fn main() -> Result<()> {
         "member {member} reads group {}/{}; delete the group or press Ctrl-C",
         args.topic, args.group
     );
+    if let Some(due) = args.due_secs {
+        println!("records are due {due} s after writing; late counts from the due time");
+    }
     run(writer, reader, &args).await?;
     writer_links.shutdown().await?;
     reader_links.shutdown().await?;
@@ -168,6 +197,59 @@ impl std::fmt::Display for Totals {
     }
 }
 
+/// How late records arrived after their due time since the last report, in
+/// milliseconds.
+#[derive(Debug, Default)]
+struct Lateness(Vec<u64>);
+
+impl Lateness {
+    /// Count a record whose payload is its due time; skip any other.
+    fn arrived(&mut self, payload: &RecordPayload) -> Result<()> {
+        if let [part] = payload.as_slice()
+            && let Ok(due) = <[u8; 8]>::try_from(part.as_ref())
+        {
+            self.0
+                .push(unix_millis()?.saturating_sub(u64::from_be_bytes(due)));
+        }
+        Ok(())
+    }
+
+    /// Percentiles of the arrivals since the last report, then forget them.
+    fn report(&mut self) -> String {
+        if self.0.is_empty() {
+            return String::new();
+        }
+        self.0.sort_unstable();
+        let at = |q: usize| self.0[(self.0.len() - 1) * q / 100];
+        let line = format!(
+            "; late p50 {} ms, p99 {} ms, max {} ms",
+            at(50),
+            at(99),
+            at(100)
+        );
+        self.0.clear();
+        line
+    }
+}
+
+fn unix_millis() -> Result<u64> {
+    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?;
+    Ok(u64::try_from(now.as_millis())?)
+}
+
+/// A plain record, or one due `due_secs` from now carrying its due time as
+/// its payload.
+fn record(due_secs: Option<u64>) -> Result<RecordInput> {
+    let Some(secs) = due_secs else {
+        return Ok(RecordInput::copy_from_slice(
+            MessageId::new(),
+            b"ozzy demo record",
+        ));
+    };
+    let due = unix_millis()? + secs * 1000;
+    Ok(RecordInput::copy_from_slice(MessageId::new(), &due.to_be_bytes()).with_due_millis(due))
+}
+
 /// Write at `args.rate` and read the group in one loop. Prints totals once a
 /// second.
 async fn run(mut writer: SharedTopicWriter, mut reader: GroupReader, args: &Args) -> Result<()> {
@@ -177,6 +259,7 @@ async fn run(mut writer: SharedTopicWriter, mut reader: GroupReader, args: &Args
     let mut stop = pin!(tokio::signal::ctrl_c());
     let mut pending = FuturesUnordered::new();
     let mut totals = Totals::default();
+    let mut lateness = Lateness::default();
     let reader = loop {
         let writing = args.records == 0 || totals.written < args.records;
         tokio::select! {
@@ -185,7 +268,7 @@ async fn run(mut writer: SharedTopicWriter, mut reader: GroupReader, args: &Args
                 break Some(reader);
             }
             _ = pace.tick(), if writing && pending.len() < IN_FLIGHT => {
-                let record = RecordInput::copy_from_slice(MessageId::new(), b"ozzy demo record");
+                let record = record(args.due_secs)?;
                 let sent = writer.send(record, Some(&totals.written.to_be_bytes())).await?;
                 pending.push(async move { sent.confirmed().await });
                 totals.written += 1;
@@ -196,6 +279,9 @@ async fn run(mut writer: SharedTopicWriter, mut reader: GroupReader, args: &Args
             }
             delivered = reader.next() => match delivered {
                 Ok(delivered) => {
+                    if args.due_secs.is_some() {
+                        lateness.arrived(&delivered.record.payload)?;
+                    }
                     drop(reader.acknowledge(delivered.token)?);
                     totals.read += 1;
                 }
@@ -205,7 +291,7 @@ async fn run(mut writer: SharedTopicWriter, mut reader: GroupReader, args: &Args
                 }
                 Err(error) => return Err(error.into()),
             },
-            _ = report.tick() => println!("{totals}"),
+            _ = report.tick() => println!("{totals}{}", lateness.report()),
         }
     };
     // Bounded, so a stopped broker cannot hang the exit.

@@ -23,6 +23,8 @@
 - Java SDK: `SendOptions.withDueMillis(long)` schedules a record. Its receipt
   has disposition `Receipt.Disposition.SCHEDULED`, and its `offset()` is the
   schedule sequence.
+- `ozzy quickstart` also serves topic `delayed`, which takes due times up to
+  an hour ahead.
 
 ### Changed
 
