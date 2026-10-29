@@ -34,6 +34,9 @@
 
 - Checkpoints fit every retry range the limit allows. A partition with many
   ranges no longer faults its journal when retention writes a checkpoint.
+- A record within the SDK's limits but over the broker's fails its own
+  `send` with `RecordLimits`. Before, it failed the whole partition writer
+  with `Configuration`. Delay topics leave less room per record.
 
 ## [0.6.0] - 2026-10-26
 
