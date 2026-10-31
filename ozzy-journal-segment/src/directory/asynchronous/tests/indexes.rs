@@ -621,6 +621,52 @@ fn sort_and_workspace_limits_bound_failed_builds_without_touching_history() {
 }
 
 #[test]
+fn a_dense_segment_indexes_within_a_small_workspace() {
+    const RECORDS: u8 = 48;
+    let (mut controller, io) = setup(Image::default());
+    let capacity = 256 * 1024;
+    let format = Format {
+        first_segment: SegmentHeader::new(identity().group_id, 1, None, Digest::ZERO, capacity)
+            .unwrap(),
+        ..spec(CommitMode::External)
+    };
+    let mut roomy = limits();
+    roomy.io.max_segment_bytes = capacity;
+    let mut journal = drive(
+        &mut controller,
+        Journal::format("/group".into(), io, format, JournalGeneration(1), roomy),
+    )
+    .unwrap();
+    drive(&mut controller, async {
+        for number in 0..RECORDS {
+            let body = append_body(number);
+            let template = operation(&journal);
+            let op = CanonicalOperation {
+                kind: OperationKind::Append,
+                body: &body,
+                ..template
+            };
+            journal.append(&[op], BodyEncoding::Raw).await.unwrap();
+        }
+        append_confirmed(&mut journal).await;
+        journal.roll_active(32768, 4).await.unwrap();
+    });
+    // The small entry buffer writes three runs per record: 144 without merging.
+    journal.limits.directory_entries = 32;
+    let index = drive(
+        &mut controller,
+        journal.build_sealed_index(1, build_limits()),
+    )
+    .unwrap();
+    assert_eq!(index.offset_count(), usize::from(RECORDS));
+    assert_eq!(index.message_count(), usize::from(RECORDS));
+    for number in 0..u64::from(RECORDS) {
+        let entry = index.find_offset(partition(), Offset::new(number)).unwrap();
+        assert_eq!(entry.location.operation.op_number, number + 1);
+    }
+}
+
+#[test]
 fn index_publication_crash_cuts_rebuild_or_reuse_without_changing_history() {
     let image = sealed_image();
     for immediate in [false, true] {

@@ -29,7 +29,7 @@ pub struct IndexBuildLimits {
     pub max_entry_buffer_bytes: usize,
     /// Maximum input runs opened by one merge.
     pub max_merge_fan_in: usize,
-    /// Maximum initial staging runs per index section.
+    /// Maximum staging runs one index section holds at once.
     pub max_run_files: usize,
     /// Bounds for final file counts and bytes.
     pub file: IndexLimits,
@@ -187,10 +187,18 @@ pub fn segment_index_name(source: IndexSource) -> String {
     )
 }
 
+/// One section's staged runs, oldest first, and how many it has written.
+#[derive(Debug, Default)]
+struct SectionRuns {
+    paths: Vec<PathBuf>,
+    written: u64,
+}
+
 #[derive(Debug)]
 struct PendingRuns {
     max_bytes: usize,
     max_runs: usize,
+    fan_in: usize,
     file_limits: IndexLimits,
     buffered_bytes: usize,
     counts: IndexCounts,
@@ -199,18 +207,19 @@ struct PendingRuns {
     operations: Vec<OperationIndexEntry>,
     locations: Vec<OperationLocation>,
     schedules: Vec<ScheduleIndexEntry>,
-    offset_runs: Vec<PathBuf>,
-    message_runs: Vec<PathBuf>,
-    operation_runs: Vec<PathBuf>,
-    location_runs: Vec<PathBuf>,
-    schedule_runs: Vec<PathBuf>,
+    offset_runs: SectionRuns,
+    message_runs: SectionRuns,
+    operation_runs: SectionRuns,
+    location_runs: SectionRuns,
+    schedule_runs: SectionRuns,
 }
 
 impl PendingRuns {
-    fn new(max_bytes: usize, max_runs: usize, file_limits: IndexLimits) -> Self {
+    fn new(max_bytes: usize, max_runs: usize, fan_in: usize, file_limits: IndexLimits) -> Self {
         Self {
             max_bytes,
             max_runs,
+            fan_in,
             file_limits,
             buffered_bytes: 0,
             counts: IndexCounts {
@@ -225,11 +234,11 @@ impl PendingRuns {
             operations: Vec::new(),
             locations: Vec::new(),
             schedules: Vec::new(),
-            offset_runs: Vec::new(),
-            message_runs: Vec::new(),
-            operation_runs: Vec::new(),
-            location_runs: Vec::new(),
-            schedule_runs: Vec::new(),
+            offset_runs: SectionRuns::default(),
+            message_runs: SectionRuns::default(),
+            operation_runs: SectionRuns::default(),
+            location_runs: SectionRuns::default(),
+            schedule_runs: SectionRuns::default(),
         }
     }
 

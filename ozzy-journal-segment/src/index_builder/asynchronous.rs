@@ -7,7 +7,7 @@ mod workspace;
 use super::{
     INDEX_DIGEST_START, INDEX_HASH_CONTEXT, INDEX_HEADER_BYTES, IndexBuildError, IndexBuildLimits,
     IndexCounts, IndexFileError, IndexLimits, IndexSource, OperationLimits, PendingRuns, RunKind,
-    SegmentIndex, calculate_index_layout, derive_index_entries, encode_index_header,
+    SectionRuns, SegmentIndex, calculate_index_layout, derive_index_entries, encode_index_header,
     segment_index_name, validate_build_limits,
 };
 use crate::async_files::Access;
@@ -127,6 +127,7 @@ impl Builder {
         let mut pending = PendingRuns::new(
             limits.max_entry_buffer_bytes,
             limits.max_run_files,
+            limits.max_merge_fan_in,
             limits.file,
         );
         let header = groups.header().clone();
@@ -317,18 +318,42 @@ async fn merge_sections(
     fan_in: usize,
     workspace: &mut Workspace,
 ) -> Result<(PathBuf, Merged), IndexBuildError> {
-    let offsets = merge_all(pending.offset_runs, RunKind::Offset, fan_in, workspace).await?;
-    let messages = merge_all(pending.message_runs, RunKind::Message, fan_in, workspace).await?;
+    let offsets = merge_all(
+        pending.offset_runs.paths,
+        RunKind::Offset,
+        fan_in,
+        workspace,
+    )
+    .await?;
+    let messages = merge_all(
+        pending.message_runs.paths,
+        RunKind::Message,
+        fan_in,
+        workspace,
+    )
+    .await?;
     let operations = merge_all(
-        pending.operation_runs,
+        pending.operation_runs.paths,
         RunKind::Operation,
         fan_in,
         workspace,
     )
     .await?;
-    let locations = merge_all(pending.location_runs, RunKind::Location, fan_in, workspace).await?;
+    let locations = merge_all(
+        pending.location_runs.paths,
+        RunKind::Location,
+        fan_in,
+        workspace,
+    )
+    .await?;
     let temporary = workspace.reserve("complete.idx".into())?;
-    let schedules = merge_all(pending.schedule_runs, RunKind::Schedule, fan_in, workspace).await?;
+    let schedules = merge_all(
+        pending.schedule_runs.paths,
+        RunKind::Schedule,
+        fan_in,
+        workspace,
+    )
+    .await?;
     let merged = Merged {
         counts: pending.counts,
         runs: [offsets, messages, operations, locations, schedules],

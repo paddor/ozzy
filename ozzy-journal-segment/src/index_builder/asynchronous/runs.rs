@@ -1,4 +1,6 @@
-use super::{Access, IndexBuildError, IndexFileError, PendingRuns, RunKind, Workspace};
+use super::{
+    Access, IndexBuildError, IndexFileError, PendingRuns, RunKind, SectionRuns, Workspace,
+};
 use crate::index_file::{
     compare_locations, compare_message_entries, compare_offset_entries, compare_operation_entries,
     compare_schedule_entries, encode_message_entry, encode_offset_entry, encode_operation_entry,
@@ -92,17 +94,27 @@ const SCHEDULES: RunFormat<ScheduleIndexEntry, SCHEDULE_INDEX_ENTRY_BYTES> = Run
     encode: encode_schedule_entry,
 };
 
+#[derive(Clone, Copy)]
+struct RunBounds {
+    max_runs: usize,
+    fan_in: usize,
+}
+
 impl PendingRuns {
     pub(super) async fn flush_async(
         &mut self,
         workspace: &mut Workspace,
     ) -> Result<(), IndexBuildError> {
+        let bounds = RunBounds {
+            max_runs: self.max_runs,
+            fan_in: self.fan_in,
+        };
         write_typed_run(
             &mut self.offsets,
             OFFSETS,
             workspace,
             &mut self.offset_runs,
-            self.max_runs,
+            bounds,
         )
         .await?;
         write_typed_run(
@@ -110,7 +122,7 @@ impl PendingRuns {
             MESSAGES,
             workspace,
             &mut self.message_runs,
-            self.max_runs,
+            bounds,
         )
         .await?;
         write_typed_run(
@@ -118,7 +130,7 @@ impl PendingRuns {
             OPERATIONS,
             workspace,
             &mut self.operation_runs,
-            self.max_runs,
+            bounds,
         )
         .await?;
         write_typed_run(
@@ -126,7 +138,7 @@ impl PendingRuns {
             LOCATIONS,
             workspace,
             &mut self.location_runs,
-            self.max_runs,
+            bounds,
         )
         .await?;
         write_typed_run(
@@ -134,7 +146,7 @@ impl PendingRuns {
             SCHEDULES,
             workspace,
             &mut self.schedule_runs,
-            self.max_runs,
+            bounds,
         )
         .await?;
         self.buffered_bytes = 0;
@@ -146,8 +158,8 @@ async fn write_typed_run<T, const W: usize>(
     entries: &mut Vec<T>,
     format: RunFormat<T, W>,
     workspace: &mut Workspace,
-    runs: &mut Vec<PathBuf>,
-    max_runs: usize,
+    runs: &mut SectionRuns,
+    bounds: RunBounds,
 ) -> Result<(), IndexBuildError> {
     let RunFormat {
         kind,
@@ -157,8 +169,8 @@ async fn write_typed_run<T, const W: usize>(
     if entries.is_empty() {
         return Ok(());
     }
-    if runs.len() >= max_runs {
-        return Err(IndexBuildError::RunLimitExceeded(max_runs));
+    if runs.paths.len() >= bounds.max_runs {
+        return Err(IndexBuildError::RunLimitExceeded(bounds.max_runs));
     }
     crate::cooperative::sort_by(entries, compare).await;
     let mut budget = crate::cooperative::Budget::default();
@@ -187,9 +199,32 @@ async fn write_typed_run<T, const W: usize>(
         .access
         .done(Operation::Close { handle: file })
         .await?;
-    runs.push(path);
     entries.clear();
-    Ok(())
+    runs.add(path, kind, bounds.fan_in, workspace).await
+}
+
+impl SectionRuns {
+    /// Keep a written run and merge each tier that fills, like carrying digits
+    /// in base `fan_in`. A section then holds a few runs per tier, so a dense
+    /// segment stays within the workspace bound.
+    async fn add(
+        &mut self,
+        path: PathBuf,
+        kind: RunKind,
+        fan_in: usize,
+        workspace: &mut Workspace,
+    ) -> Result<(), IndexBuildError> {
+        self.paths.push(path);
+        self.written += 1;
+        let mut carry = self.written;
+        while carry.is_multiple_of(fan_in as u64) {
+            let tier = self.paths.split_off(self.paths.len() - fan_in);
+            self.paths
+                .extend(merge_all(tier, kind, fan_in, workspace).await?);
+            carry /= fan_in as u64;
+        }
+        Ok(())
+    }
 }
 
 pub(super) async fn merge_all(

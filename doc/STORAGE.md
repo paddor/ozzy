@@ -430,6 +430,8 @@ payload-free duplicate results, and 64-byte scheduled records.
   and message ID, so held records after a release key can be listed without
   reading payloads.
 
+- An index build sorts entries into `staging/` runs and merges them as they
+  build up, so a segment of many small records stays within the staging bound.
 - A missing or corrupt index is rebuilt from validated segment bytes. A
   background job builds each sealed segment's index beside later writes; a
   build validates the segment once.

@@ -9,6 +9,9 @@
   for over a second now drop and repair over PEER, and small control frames
   (votes, commits, replies) no longer hold shard budget while queued for a
   stalled peer.
+- Sealing a segment of many small records no longer fails its index build.
+  The failure was silent until a later index lookup stopped the partition, and
+  each failed build left its files in `staging/` until the next restart.
 
 ## [0.7.0] - 2026-10-29
 
