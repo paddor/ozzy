@@ -52,6 +52,9 @@ terms.
 - A full leader PUB socket delays publications. Full subscriber queues and
   gaps drop them; PEER repair fills them. Follower and reader publications
   use separate backing.
+- OMQ keeps frames queued for a stalled subscriber, and they hold the shard's
+  publication budget. After one second of refusal, publications drop until
+  the budget has room. Writes continue with the other follower over PEER.
 - Repair uses one data PEER connection per destination shard. A full shard
   pauses only that source; control and healthy copies continue.
 - If both followers stall, the unconfirmed window fills and producers see

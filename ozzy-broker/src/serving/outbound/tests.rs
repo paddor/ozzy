@@ -55,6 +55,18 @@ fn dispatcher(
     Port,
     ozzy_runtime::frontend::DataReceiver,
 ) {
+    dispatcher_with(queued, None)
+}
+
+/// The same dispatcher, with a publication budget on its port.
+fn dispatcher_with(
+    queued: usize,
+    publications: Option<ozzy_runtime::dispatch::Budget>,
+) -> (
+    ozzy_runtime::frontend::Service,
+    Port,
+    ozzy_runtime::frontend::DataReceiver,
+) {
     use ozzy_proto::{GroupId, PartitionIncarnation, data::DataLimits, handshake};
     use ozzy_runtime::{
         dispatch::{Budget, Budgets},
@@ -131,10 +143,68 @@ fn dispatcher(
         LinkIds::random(),
     )
     .unwrap();
-    let port = service
-        .port(&omq_tokio::Context::new(), 0, budgets)
-        .unwrap();
+    let context = omq_tokio::Context::new();
+    let port = match publications {
+        Some(publications) => service.port_with_publications(&context, 0, budgets, publications),
+        None => service.port(&context, 0, budgets),
+    }
+    .unwrap();
     (service, port, shard)
+}
+
+#[test]
+fn publications_refused_past_their_wait_drop_until_the_port_admits_one() {
+    let (mut service, mut port, _shard) = dispatcher_with(
+        1,
+        Some(ozzy_runtime::dispatch::Budget {
+            queue_slots: 2,
+            retained_messages: 2,
+            bytes: 256 * 1024,
+        }),
+    );
+    let publication = || {
+        Message::multipart([
+            Bytes::from(vec![1; 32]),
+            Bytes::new(),
+            Bytes::new(),
+            Bytes::from_static(b"records"),
+        ])
+    };
+    // Frames a stalled subscriber keeps fill the budget.
+    let mut held: Vec<_> = (0..2)
+        .map(|_| port.try_publish(publication(), 64 * 1024).unwrap())
+        .collect();
+    let mut outbound = Outbound::new(1, 62 * 1024, limits());
+    let waker = std::task::Waker::noop();
+    let mut cx = Context::from_waker(waker);
+
+    outbound.send(publication()).unwrap();
+    outbound.poll(&mut cx, &mut port, Duration::ZERO).unwrap();
+    assert!(outbound.port_refused());
+    assert_eq!(outbound.next_retry(Duration::ZERO), Some(PUBLICATION_WAIT));
+    let before = PUBLICATION_WAIT.saturating_sub(Duration::from_millis(1));
+    outbound.poll(&mut cx, &mut port, before).unwrap();
+    assert!(outbound.publications[1].is_some(), "still within its wait");
+
+    outbound.poll(&mut cx, &mut port, PUBLICATION_WAIT).unwrap();
+    assert!(outbound.publications[1].is_none(), "PEER repairs the drop");
+    assert_eq!(outbound.next_retry(PUBLICATION_WAIT), None);
+    // The budget is still full, so the next one does not wait again.
+    outbound.send(publication()).unwrap();
+    outbound.poll(&mut cx, &mut port, PUBLICATION_WAIT).unwrap();
+    assert!(outbound.publications[1].is_none());
+
+    // Capacity back: publications flow, and the next refusal waits again.
+    held.clear();
+    while service.poll_command().unwrap() {}
+    outbound.send(publication()).unwrap();
+    let later = PUBLICATION_WAIT * 2;
+    outbound.poll(&mut cx, &mut port, later).unwrap();
+    assert!(matches!(
+        outbound.publications[1],
+        Some(Publication::Pending(_))
+    ));
+    assert_eq!(outbound.publication_refused, None);
 }
 
 /// Bind peer 4 as a broker link and return its binding.

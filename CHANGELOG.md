@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- A stalled follower or consumer, one that keeps its connection open but stops
+  reading, no longer stops writes on the other brokers. Publications refused
+  for over a second now drop and repair over PEER, and small control frames
+  (votes, commits, replies) no longer hold shard budget while queued for a
+  stalled peer.
+
 ## [0.7.0] - 2026-10-29
 
 ### Breaking

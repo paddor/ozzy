@@ -272,6 +272,9 @@ On the broker:
 - A reply to a full destination waits for that destination's send progress.
   Later replies to it keep their order. Other destinations continue.
 - Dequeue frees a queue slot. Bytes return when the last payload alias drops.
+- Control frames up to 4 KiB reach OMQ as copies, so frames queued for a
+  stalled peer hold no shard budget. OMQ's per-peer queue bound limits them.
+- A publication the port refuses for one second drops. PEER repairs it.
 - OMQ provides fairness between connections inside each socket.
 
 On the SDK:
