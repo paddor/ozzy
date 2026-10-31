@@ -13,6 +13,8 @@
   The failure was silent until a later index lookup stopped the partition, and
   each failed build left its files in `staging/` until the next restart.
 - Failed background index builds now log a warning with their cause.
+- Index builds for segments of many small records write fewer staging files and
+  finish sooner, which shortens failover on those partitions.
 
 ## [0.7.0] - 2026-10-29
 
