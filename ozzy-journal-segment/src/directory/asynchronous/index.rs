@@ -125,7 +125,7 @@ impl Journal {
         let selected = self
             .index_source(built.source.segment_id)
             .is_ok_and(|(_, source)| source == built.source);
-        if built.valid && selected {
+        if built.valid() && selected {
             self.validated_indexes
                 .borrow_mut()
                 .insert(built.source.segment_id, built.source);
@@ -147,25 +147,30 @@ pub struct IndexJob {
 #[derive(Debug)]
 pub struct BuiltIndex {
     source: IndexSource,
-    valid: bool,
+    failure: Option<crate::DirectoryError>,
 }
 
 impl BuiltIndex {
     /// Whether the index was built or validated.
     pub const fn valid(&self) -> bool {
-        self.valid
+        self.failure.is_none()
+    }
+
+    /// Why the build failed.
+    pub const fn failure(&self) -> Option<&crate::DirectoryError> {
+        self.failure.as_ref()
     }
 }
 
 impl IndexJob {
     /// Build, or validate and reuse, the index. A failure publishes nothing.
     pub async fn run(self) -> BuiltIndex {
-        let valid = build(self.scope, self.builder, self.source, self.limits, false)
+        let failure = build(self.scope, self.builder, self.source, self.limits, false)
             .await
-            .is_ok();
+            .err();
         BuiltIndex {
             source: self.source,
-            valid,
+            failure,
         }
     }
 }

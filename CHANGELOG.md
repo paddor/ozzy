@@ -12,6 +12,7 @@
 - Sealing a segment of many small records no longer fails its index build.
   The failure was silent until a later index lookup stopped the partition, and
   each failed build left its files in `staging/` until the next restart.
+- Failed background index builds now log a warning with their cause.
 
 ## [0.7.0] - 2026-10-29
 

@@ -33,6 +33,12 @@ impl OwnedJournal {
     /// the next snapshot build meets it again and fails there.
     pub(in crate::replica_journal) fn complete_index_work(&mut self, built: &BuiltJournalIndex) {
         self.indexing.running = false;
+        if let Some(failure) = built.failure() {
+            crate::profiling::log(
+                crate::profiling::Level::Warn,
+                &format!("sealed segment index build failed: {failure}"),
+            );
+        }
         let Ok(journal) = self.journal.readable() else {
             return;
         };
