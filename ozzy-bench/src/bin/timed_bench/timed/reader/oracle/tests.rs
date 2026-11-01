@@ -223,4 +223,40 @@ fn held_records_time_from_release_and_never_arrive_before_it() {
     assert_eq!(rows[0]["latency"]["max"], 300);
     // The throughput window moves with the delay, so this release counts.
     assert_eq!(rows[0]["completed_per_second"], json!([1]));
+    assert_eq!(rows[0]["early_held_records"], 0);
+}
+
+/// The leader's clock decides release, so a reader on another host can see a
+/// record early by their clock difference, and by no more.
+#[test]
+fn held_records_may_arrive_early_only_within_the_tolerance() {
+    let mut config = configuration();
+    config.args.native.delay_millis = Some(2);
+    config.args.native.due_tolerance_millis = Some(1);
+    let group = config::group(&config.args).unwrap();
+    let payload = payload(&config);
+    let record = Record {
+        partition: 0,
+        offset: 0,
+        id: config::message_id(group, 0, 0),
+        payload: &payload,
+    };
+    let release = window().start + 100 + 2_000_000;
+    let mut oracle = Oracle::new(&config, 2, &[0], 0, window()).unwrap();
+    oracle
+        .observe(&config, group, record, release - 1_000_000)
+        .unwrap();
+    let rows = oracle.rows();
+    assert_eq!(rows[0]["early_held_records"], 1);
+    assert_eq!(rows[0]["max_early_held_ns"], 1_000_000);
+    // Counted as on time: an early record has no lateness to report.
+    assert_eq!(rows[0]["latency"]["max"], 0);
+    let mut late = Oracle::new(&config, 2, &[0], 0, window()).unwrap();
+    let error = late
+        .observe(&config, group, record, release - 1_000_001)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("1000001 ns before its due time"),
+        "{error}"
+    );
 }

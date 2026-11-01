@@ -231,6 +231,10 @@ For a 60-second delay at 100,000 records/s, change these flags:
   its percentiles.
 - The reader window, throughput, and intervals move by the delay. A record
   delivered before its release fails the run.
+- The leader's clock decides release, so a reader on another host can see a
+  record early by their clock difference. `--due-tolerance-millis` allows that
+  much (default 0). Reader lanes report `early_held_records` and
+  `max_early_held_ns`.
 - `ozzy_compare` adds the delay to the case drain. Direct `ozzy_timed_bench`
   runs need `--drain-timeout-secs` above the delay.
 - Delay requires `--impl ozzy` and excludes dedup and `--groups`.
