@@ -227,6 +227,9 @@ Route entry: group ID `16`, config epoch `u64`, incarnation `16`, member count
 - Views compare only within matching group, incarnation, configuration, and
   membership. Equal-view conflicting leaders fail; an unknown leader may
   become known.
+- Clients use the highest view naming a leader. A newer view with no leader
+  hides it only once a majority of members report newer views, because one
+  copy in recovery can report a view no other broker joined.
 - Updates coalesce; overflow emits STATE_RESYNC. Lost notices, timeouts, or
   wrong-leader replies trigger a fresh snapshot. Replacement drops interests.
 

@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Producers and consumers no longer stop for minutes while one broker's copy of
+  a partition recovers. That copy could report a newer view with no leader, and
+  clients then refused the healthy leader until recovery finished.
 - A stalled follower or consumer, one that keeps its connection open but stops
   reading, no longer stops writes on the other brokers. Publications refused
   for over a second now drop and repair over PEER, and small control frames

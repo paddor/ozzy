@@ -73,7 +73,7 @@ impl RouteObservations {
             self.0
                 .iter()
                 .filter(|(peer, session, _)| current(*peer, *session))
-                .map(|(_, _, route)| route),
+                .map(|(peer, _, route)| (*peer, route)),
         )
     }
 }
@@ -288,13 +288,14 @@ impl RouteCache {
             .is_some_and(|registration| !registration.snapshot || registration.resync)
     }
 
-    /// Highest observed view among current snapshots. No older leader wins over
-    /// a newer view with no leader. Conflicting equal-view hints are rejected.
+    /// Leader of the view [`Self::route`] selects, if it names one.
     pub fn leader(&self, group: GroupId) -> Result<Option<NodeId>, RouteCacheError> {
         Ok(self.route(group)?.and_then(|route| route.leader))
     }
 
-    /// Highest current observation, including a newer view with no leader.
+    /// Highest current view naming a leader. A newer view with no leader hides
+    /// it only once a majority of members report newer views. Without a known
+    /// leader, the highest view. Conflicting equal-view leaders are rejected.
     pub fn route(&self, group: GroupId) -> Result<Option<RouteState>, RouteCacheError> {
         self.route_matching(group, |_, _| true)
     }
@@ -311,7 +312,7 @@ impl RouteCache {
         select_route(
             self.observations(group)
                 .filter(|(peer, session, _)| current(*peer, *session))
-                .map(|(_, _, route)| route),
+                .map(|(peer, _, route)| (peer, route)),
         )
     }
 
@@ -381,32 +382,40 @@ fn validate_route(topic: &TopicMetadata, route: &RouteState) -> Result<(), Route
     Ok(())
 }
 
+/// A copy outside the quorum, such as one in recovery, can report a view no
+/// other broker joined. Hints grant nothing, and a replaced leader refuses or
+/// stays silent, so only a majority fences a known leader.
 fn select_route<'a>(
-    routes: impl Iterator<Item = &'a RouteState>,
+    routes: impl Iterator<Item = (NodeId, &'a RouteState)>,
 ) -> Result<Option<RouteState>, RouteCacheError> {
-    let mut best: Option<&RouteState> = None;
-    let mut conflict = false;
-    for route in routes {
-        match best {
-            None => best = Some(route),
-            Some(current) if route.view > current.view => {
-                best = Some(route);
-                conflict = false;
-            }
-            Some(current) if route.view == current.view && route.leader != current.leader => {
-                if current.leader.is_none() {
-                    best = Some(route);
-                } else if route.leader.is_some() {
-                    conflict = true;
-                }
-            }
-            _ => {}
-        }
-    }
-    if conflict {
+    let routes: Vec<_> = routes.collect();
+    let newest = routes
+        .iter()
+        .map(|(_, route)| *route)
+        .max_by_key(|route| route.view);
+    let Some(led) = routes
+        .iter()
+        .map(|(_, route)| *route)
+        .filter(|route| route.leader.is_some())
+        .max_by_key(|route| route.view)
+    else {
+        return Ok(newest.cloned());
+    };
+    let ahead = routes
+        .iter()
+        .filter(|(_, route)| route.view > led.view)
+        .map(|(peer, _)| *peer)
+        .collect::<BTreeSet<_>>()
+        .len();
+    let conflict = routes.iter().any(|(_, route)| {
+        route.view == led.view && route.leader.is_some() && route.leader != led.leader
+    });
+    if ahead > led.members.len() / 2 || (conflict && ahead != 0) {
+        Ok(newest.cloned())
+    } else if conflict {
         Err(RouteCacheError::Conflict)
     } else {
-        Ok(best.cloned())
+        Ok(Some(led.clone()))
     }
 }
 

@@ -279,6 +279,93 @@ fn highest_view_resolves_old_conflicts_and_bad_snapshot_is_atomic() {
     assert_eq!(cache.leader(group), Ok(Some(peer(3))));
 }
 
+/// `broker` watches the group and reports `reported` in a first snapshot.
+fn report(cache: &mut RouteCache, broker: NodeId, reported: RouteState) {
+    cache.bind(broker, session(4)).unwrap();
+    cache
+        .register(broker, session(4), watch(5), &[reported.group])
+        .unwrap();
+    cache
+        .snapshot(
+            broker,
+            session(4),
+            Snapshot {
+                watch: watch(5),
+                routes: vec![reported],
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn one_copys_newer_view_without_a_leader_does_not_hide_the_leader() {
+    let mut cache = cache();
+    let group = route(0, None).group;
+    report(&mut cache, peer(1), route(7, Some(peer(2))));
+    report(&mut cache, peer(2), route(7, Some(peer(2))));
+    // A recovering copy can report a view the other two never joined.
+    report(&mut cache, peer(3), route(8, None));
+    assert_eq!(cache.leader(group), Ok(Some(peer(2))));
+    assert_eq!(cache.route(group).unwrap().unwrap().view, 7);
+}
+
+#[test]
+fn a_majority_in_a_newer_view_hides_the_old_leader_until_it_names_a_new_one() {
+    let mut cache = cache();
+    let group = route(0, None).group;
+    report(&mut cache, peer(1), route(7, Some(peer(2))));
+    report(&mut cache, peer(2), route(7, Some(peer(2))));
+    report(&mut cache, peer(3), route(8, None));
+    let update = |cache: &mut RouteCache, broker, reported| {
+        cache
+            .update(
+                broker,
+                session(4),
+                Update {
+                    watch: watch(5),
+                    route: reported,
+                },
+            )
+            .unwrap();
+    };
+    update(&mut cache, peer(2), route(8, None));
+    assert_eq!(cache.route(group), Ok(Some(route(8, None))));
+    // One broker naming the new leader is enough.
+    update(&mut cache, peer(1), route(8, Some(peer(3))));
+    assert_eq!(cache.leader(group), Ok(Some(peer(3))));
+}
+
+#[test]
+fn a_newer_view_is_followed_when_no_older_leader_is_known() {
+    let mut cache = cache();
+    let group = route(0, None).group;
+    report(&mut cache, peer(1), route(7, None));
+    report(&mut cache, peer(3), route(8, None));
+    assert_eq!(cache.route(group), Ok(Some(route(8, None))));
+    assert_eq!(cache.leader(group), Ok(None));
+}
+
+#[test]
+fn a_lone_newer_view_naming_a_leader_wins() {
+    let mut cache = cache();
+    let group = route(0, None).group;
+    report(&mut cache, peer(1), route(7, Some(peer(2))));
+    report(&mut cache, peer(2), route(7, Some(peer(2))));
+    report(&mut cache, peer(3), route(8, Some(peer(3))));
+    assert_eq!(cache.leader(group), Ok(Some(peer(3))));
+}
+
+#[test]
+fn conflicting_leaders_fail_unless_a_newer_view_is_reported() {
+    let mut cache = cache();
+    let group = route(0, None).group;
+    report(&mut cache, peer(1), route(7, Some(peer(1))));
+    report(&mut cache, peer(2), route(7, Some(peer(2))));
+    assert_eq!(cache.leader(group), Err(RouteCacheError::Conflict));
+    report(&mut cache, peer(3), route(8, None));
+    assert_eq!(cache.route(group), Ok(Some(route(8, None))));
+}
+
 #[test]
 fn foreign_configuration_cannot_replace_a_trusted_hint_at_any_view() {
     let mut cache = cache();
