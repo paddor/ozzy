@@ -153,6 +153,10 @@ impl Process {
         if let Some(rate) = args.records_per_second {
             arguments.extend(["--records-per-second".into(), rate.to_string()]);
         }
+        arguments.extend([
+            "--max-admission-lag-secs".into(),
+            args.max_admission_lag_secs.to_string(),
+        ]);
         if let Some(ramp) = &args.ramp {
             arguments.extend(["--ramp".into(), ramp.to_string()]);
         }

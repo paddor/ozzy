@@ -110,6 +110,9 @@ ozzy_compare --impl ozzy --modes durable --sizes 8192 \
   stages.
 - An arrival unadmitted for 1 s ends the ramp. That stage and all later stages
   are failed loads.
+- At a fixed rate, the same arrival fails the run. `--max-admission-lag-secs`
+  raises the 1 s limit for long runs on a slow disk; `scheduling_lag` in the row
+  shows the lag reached.
 - Latency starts at the scheduled arrival and includes admission delay and
   final drain. Late records keep their original timestamp.
 - A writer lane timer wakes at most every 250 us. Arrivals due sooner are
