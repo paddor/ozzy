@@ -188,6 +188,8 @@ ozzy_three serve --broker broker-0 --identity "$ozzy_dir/shared.identity" \
 - All brokers share one `shared.identity`. Each keeps its own local identity
   and stores.
 - Writes confirm while two of the three brokers are up.
+- Keep broker clocks in sync, for example with NTP. Delayed release and age
+  retention follow the leader's clock, and nothing checks it against the others.
 
 ## Watch a broker
 

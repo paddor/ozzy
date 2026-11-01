@@ -245,6 +245,9 @@ across the gap.
 - Crash failures only: no Byzantine peers or reconstruction from arbitrary
   distributed corruption.
 - Recovery requires both other brokers in normal operation.
+- Broker clocks must stay in sync; nothing compares them. Delayed release, age
+  retention, and producer idle expiry follow the leader's clock, so a fast clock
+  acts early. The deduplication window uses logical time and is not affected.
 - No online membership change, larger groups, partition movement, or follower
   reads.
 - [Storage](STORAGE.md#supported-failure-model) defines physical failure
