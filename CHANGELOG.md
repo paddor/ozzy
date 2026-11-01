@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- A broker that keeps falling behind no longer fills its disk. Each recovery
+  left the old copy's segment files in place until the partition settled, which
+  a copy recovering again and again never did. A copy that fell behind now
+  removes them when its recovery starts. `--quarantine` still keeps them.
 - Producers and consumers no longer stop for minutes while one broker's copy of
   a partition recovers. That copy could report a newer view with no leader, and
   clients then refused the healthy leader until recovery finished.

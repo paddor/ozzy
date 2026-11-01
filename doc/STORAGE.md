@@ -399,6 +399,9 @@ generation.
   work without lowering a durable promise.
 - Quarantine replaces `CONFIGURATION` with the `OZYRECOV` marker, removing
   voting eligibility. Old files stay for inspection until normal cleanup.
+- A copy that withdraws because it fell behind removes them when full
+  replacement starts. Nothing is known to be damaged, and a copy that keeps
+  falling behind may never settle for normal cleanup to run.
 - Recovery transfers checkpoint state, required retained operations, and the
   full accepted suffix. Schema, digest, anchor, chain, and destination
   publication all validate before voting.

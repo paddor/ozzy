@@ -135,6 +135,33 @@ fn owned_recovery_repairs_only_damaged_sealed_history_and_keeps_original_files()
     drive(&mut controller, backup.journal.shutdown()).unwrap();
 }
 
+/// Falling behind proves nothing about the disk: damage still gets repair, so
+/// a withdrawing copy keeps its files until it knows it needs none of them.
+#[test]
+fn owned_withdrawal_with_sealed_damage_keeps_its_files_for_repair() {
+    let (mut controller, io) = setup();
+    let config = damaged(&mut controller, &io);
+    let files = ["segments/1.log", "segments/2.log"].map(|file| {
+        let bytes = controller.image().bytes(&config.root.join(file), false);
+        (file, bytes.unwrap().to_vec())
+    });
+    let (receiver, _) = drive(
+        &mut controller,
+        RecoveringJournal::start(
+            config.clone(),
+            io.clone(),
+            generations(50),
+            RecoveryOpen::Withdraw,
+        ),
+    )
+    .unwrap();
+    for (file, bytes) in &files {
+        let kept = controller.image().bytes(&config.root.join(file), false);
+        assert_eq!(kept.unwrap(), &bytes[..], "{file}");
+    }
+    drive(&mut controller, receiver.shutdown()).unwrap();
+}
+
 #[test]
 fn owned_recovery_conflicting_sealed_donor_requires_fresh_full_transfer() {
     use super::super::writeback::{admit_encoded, finish, prepare, settle, synchronize};
