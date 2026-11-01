@@ -15,6 +15,10 @@
 - Failed background index builds now log a warning with their cause.
 - Index builds for segments of many small records write fewer staging files and
   finish sooner, which shortens failover on those partitions.
+- Resent appends on a deduplicated topic no longer reload every sealed index.
+  After a leader change, those reloads could outlast the SDK response timeout,
+  so writers resent forever and writes stopped on every partition of that
+  broker.
 
 ## [0.7.0] - 2026-10-29
 

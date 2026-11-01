@@ -71,12 +71,53 @@ impl ActiveReadRun {
 pub(crate) struct ActiveReadIndex {
     source: IndexSource,
     partitions: HashMap<PartitionIncarnation, Vec<ActiveReadRun>>,
+    /// Operations no run names, in number order: control operations and
+    /// appends of only duplicates.
+    recordless: Vec<OperationLocation>,
     records: usize,
     operations: usize,
     locations: usize,
 }
 
 impl ActiveReadIndex {
+    /// Whether operation `number` belongs to this index's source.
+    pub(crate) const fn holds_operation(&self, number: u64) -> bool {
+        self.source.first_op_number <= number && number <= self.source.last_op_number
+    }
+
+    /// Where operation `number` is, without file access.
+    pub(crate) fn operation(&self, number: u64) -> Option<OperationLocation> {
+        self.run_operation(number).or_else(|| {
+            let at = self
+                .recordless
+                .binary_search_by_key(&number, |location| location.op_number)
+                .ok()?;
+            Some(self.recordless[at])
+        })
+    }
+
+    fn run_operation(&self, number: u64) -> Option<OperationLocation> {
+        self.partitions.values().find_map(|runs| {
+            let at = runs.partition_point(|run| run.operation.op_number < number);
+            runs.get(at)
+                .map(|run| run.operation)
+                .filter(|operation| operation.op_number == number)
+        })
+    }
+
+    /// Note the operations no run names, given where each one in the source is.
+    async fn find_recordless(&mut self, find: impl Fn(u64) -> Option<OperationLocation>) {
+        let mut budget = crate::cooperative::Budget::default();
+        for number in self.source.first_op_number..=self.source.last_op_number {
+            if self.run_operation(number).is_none()
+                && let Some(location) = find(number)
+            {
+                self.recordless.push(location);
+            }
+            budget.charge(OPERATION_LOCATION_BYTES).await;
+        }
+    }
+
     /// Record end and newest append time of every partition with records.
     pub(crate) fn partition_ends(
         &self,
@@ -104,6 +145,7 @@ impl ActiveReadIndex {
         let mut index = Self {
             source: persisted.source(),
             partitions: HashMap::new(),
+            recordless: Vec::new(),
             records: 0,
             operations: persisted.operation_count(),
             locations: persisted.location_count(),
@@ -113,6 +155,9 @@ impl ActiveReadIndex {
             index.push_entry(entry)?;
             budget.charge(OFFSET_INDEX_ENTRY_BYTES).await;
         }
+        index
+            .find_recordless(|number| persisted.find_operation_number(number))
+            .await;
         Ok(index)
     }
 
@@ -124,6 +169,11 @@ impl ActiveReadIndex {
         size_of::<Self>()
             .saturating_add(16)
             .saturating_add(self.partitions.capacity().saturating_mul(2 * bucket))
+            .saturating_add(
+                self.recordless
+                    .capacity()
+                    .saturating_mul(size_of::<OperationLocation>()),
+            )
             .saturating_add(self.partitions.values().fold(0_usize, |total, runs| {
                 total.saturating_add(runs.capacity().saturating_mul(size_of::<ActiveReadRun>()))
             }))
@@ -135,6 +185,7 @@ impl ActiveReadIndex {
         let mut index = Self {
             source: active.source(),
             partitions: HashMap::new(),
+            recordless: Vec::new(),
             records: 0,
             operations: active.operation_count(),
             locations: active.location_count(),
@@ -144,6 +195,9 @@ impl ActiveReadIndex {
             index.push_entry(*entry)?;
             budget.charge(OFFSET_INDEX_ENTRY_BYTES).await;
         }
+        index
+            .find_recordless(|number| active.find_operation_number(number))
+            .await;
         Ok(index)
     }
 
@@ -156,6 +210,7 @@ impl ActiveReadIndex {
         let mut index = Self {
             source,
             partitions: HashMap::new(),
+            recordless: Vec::new(),
             records: 0,
             operations: 0,
             locations: 0,
@@ -369,7 +424,11 @@ impl ActiveReadIndex {
         let (actual, operations, operation_count) =
             Self::capacity_after(Some(self), bodies, limits)?;
         for (location, body) in locations.iter().zip(bodies) {
-            for (batch_index, batch) in body.batches().enumerate() {
+            let mut batches = body.batches().enumerate().peekable();
+            if batches.peek().is_none() {
+                self.recordless.push(*location);
+            }
+            for (batch_index, batch) in batches {
                 let records = u32::try_from(batch.records)
                     .map_err(|_| ActiveReadIndexError::PositionOverflow)?;
                 let batch_index = u32::try_from(batch_index)

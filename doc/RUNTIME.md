@@ -72,6 +72,9 @@ flowchart LR
 - A duplicate retry is checked against the original attempt's persisted
   fingerprint, without the original payload or a dedup window. It returns
   the original offsets after the confirmation boundary.
+- A retry check reads one operation through the partition's read selectors. A
+  new leader loads the newest sealed segment's selectors once. A stored record
+  older than that still falls back to a full index snapshot.
 
 ### SDK protocol batching
 

@@ -181,10 +181,7 @@ impl OwnedJournal {
             .filter(|evidence| evidence.number == number)
         {
             Some(evidence) => evidence,
-            None => {
-                self.duplicate_evidence(retry, number, expected, &mut verification.snapshot)
-                    .await?
-            }
+            None => self.duplicate_evidence(retry, number, expected).await?,
         };
         if !evidence
             .proof
@@ -213,9 +210,7 @@ impl OwnedJournal {
         (number, due): (u64, &[u64]),
         verification: &mut Verification<'_, '_>,
     ) -> Result<usize, JournalError> {
-        let (kind, body, through) = self
-            .operation_body(number, &mut verification.snapshot)
-            .await?;
+        let (kind, body, through) = self.operation_body(number).await?;
         let Ok(OperationBody::Schedule(original)) =
             decode_operation_body(kind, &body, self.limits.operations)
         else {
@@ -258,17 +253,11 @@ impl OwnedJournal {
     async fn operation_body(
         &mut self,
         number: u64,
-        snapshot: &mut Option<JournalIndexSnapshot>,
     ) -> Result<(OperationKind, Vec<u8>, Prefix), JournalError> {
         if let Some((operation, through)) = self.writeback.operation(number) {
             return Ok((operation.kind, operation.body.to_vec(), through));
         }
-        let operation = self
-            .retry_snapshot(snapshot)
-            .await?
-            .read_operation_number(number)
-            .await?
-            .ok_or(JournalIndexError::MissingOperationNumber(number))?;
+        let operation = self.written_operation(number).await?;
         let through = Prefix {
             op: ozzy_replication::OpNumber(number),
             digest: operation.digest,
@@ -281,7 +270,6 @@ impl OwnedJournal {
         retry: &producer::Retry,
         number: u64,
         expected: &ozzy_journal::operation::AppendRecordList<'_>,
-        snapshot: &mut Option<ozzy_journal_segment::JournalIndexSnapshot>,
     ) -> Result<DuplicateEvidence, JournalError> {
         if let Some((operation, through)) = self.writeback.operation(number) {
             return Ok(DuplicateEvidence {
@@ -300,12 +288,7 @@ impl OwnedJournal {
                     .await?,
             });
         }
-        let operation = self
-            .retry_snapshot(snapshot)
-            .await?
-            .read_operation_number(number)
-            .await?
-            .ok_or(JournalIndexError::MissingOperationNumber(number))?;
+        let operation = self.written_operation(number).await?;
         Ok(DuplicateEvidence {
             number,
             through: Prefix {
@@ -362,17 +345,18 @@ impl OwnedJournal {
             max_records: RETRY_READ_RECORDS,
             max_bytes: self.limits.operations.max_payload_bytes,
         };
-        let recent = self
-            .reader
-            .as_ref()
-            .ok_or(JournalError::AppendMismatch)?
-            .read_offsets_with_positions(
-                self.journal.readable()?,
-                retry.batch.partition,
-                &offsets,
-                limits,
-            )
+        let journal = self.journal.readable()?;
+        let reader = self.reader.as_mut().ok_or(JournalError::AppendMismatch)?;
+        let partition = retry.batch.partition;
+        let mut recent = reader
+            .read_offsets_with_positions(journal, partition, &offsets, limits)
             .await?;
+        // A new leader's first retries often name the segment just sealed.
+        if recent.is_none() && reader.load_predecessor(journal).await? {
+            recent = reader
+                .read_offsets_with_positions(journal, partition, &offsets, limits)
+                .await?;
+        }
         let records = if let Some(records) = recent {
             records
         } else {
@@ -401,6 +385,22 @@ fn same_record(actual: &RecordRef<'_>, expected: &RecordRef<'_>) -> bool {
 }
 
 impl OwnedJournal {
+    /// A retained operation a retry names. Each retry of a window asks for one,
+    /// so this reads through the owner's selectors, not an index snapshot.
+    async fn written_operation(
+        &mut self,
+        number: u64,
+    ) -> Result<ozzy_journal_segment::DecodedOperation<'static>, JournalError> {
+        let journal = self.journal.readable()?;
+        let operation = self
+            .reader
+            .as_mut()
+            .ok_or(JournalError::AppendMismatch)?
+            .read_operation_number(journal, number)
+            .await?;
+        Ok(operation.ok_or(JournalIndexError::MissingOperationNumber(number))?)
+    }
+
     /// The journal index snapshot a retry check reads, captured on first use.
     async fn retry_snapshot<'s>(
         &mut self,

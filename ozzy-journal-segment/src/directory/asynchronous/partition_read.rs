@@ -2,7 +2,7 @@
 
 use super::{Journal, validate_operation_bodies};
 use crate::{
-    DirectoryError, GroupIdentity, IndexBuildLimits, IndexSource, IndexedRecord,
+    DecodedOperation, DirectoryError, GroupIdentity, IndexBuildLimits, IndexSource, IndexedRecord,
     JournalIndexError as Error, LogPosition, OperationLocation, PreparedOperationRecords,
     SegmentReference,
     active_read_index::{ActiveReadIndex, CapturedReadEntries},
@@ -25,7 +25,7 @@ mod sources;
 
 pub use operation::{OperationRead, WrittenOperation};
 pub use read::Read;
-use sources::scan_index;
+use sources::{cached_index, load_index, scan_index};
 
 /// Per-owner bounds, separate from backend queue limits and caller output leases.
 #[derive(Debug, Clone, Copy)]
@@ -361,6 +361,64 @@ impl Index {
             .read_entries(source, &entries, limits)
             .await
             .map(Some)
+    }
+
+    /// A new owner starts without its predecessor's selectors. Load them from
+    /// the newest sealed segment, once. `true` when this added any.
+    pub async fn load_predecessor(&mut self, journal: &Journal) -> Result<bool, Error> {
+        self.check_owner(journal)?;
+        let segments = &journal.manifest.segments;
+        let Some(at) = segments.len().checked_sub(2) else {
+            return Ok(false);
+        };
+        if self.previous.is_some() {
+            return Ok(false);
+        }
+        let source = journal.sealed_record_source(segments[at].segment_id)?;
+        self.previous = Some(load_index(&journal.read_scope(), source, self.limits.index).await?);
+        Ok(true)
+    }
+
+    /// Read operation `number` as written, or `None` outside retained history.
+    /// Only the index of the segment holding it loads, and its selectors stay,
+    /// so a burst of retries costs one load rather than one per retry.
+    pub async fn read_operation_number(
+        &mut self,
+        journal: &Journal,
+        number: u64,
+    ) -> Result<Option<DecodedOperation<'static>>, Error> {
+        self.check_owner(journal)?;
+        if let Some(active) = self
+            .active
+            .as_ref()
+            .filter(|index| index.holds_operation(number))
+        {
+            let location = active
+                .operation(number)
+                .ok_or(Error::InconsistentActiveIndex)?;
+            let source = journal.indexed_source(active, true)?;
+            return journal.read_operation_at(source, location).await.map(Some);
+        }
+        let Some(id) = journal.sealed_segment_holding(number) else {
+            return Ok(None);
+        };
+        let source = journal.sealed_record_source(id)?;
+        let newest = journal.manifest.segments.len().checked_sub(2);
+        if newest.is_some_and(|at| journal.manifest.segments[at].segment_id == id) {
+            self.load_predecessor(journal).await?;
+        }
+        let location = match self
+            .previous
+            .as_ref()
+            .filter(|index| index.source() == source.index)
+        {
+            Some(index) => index.operation(number),
+            None => cached_index(&journal.read_scope(), &self.cold, self.limits.index, source)
+                .await?
+                .operation(number),
+        };
+        let location = location.ok_or(Error::InconsistentActiveIndex)?;
+        journal.read_operation_at(source, location).await.map(Some)
     }
 
     /// Install exactly the selectors and placements returned by an observed

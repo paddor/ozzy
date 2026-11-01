@@ -10,6 +10,7 @@ use ozzy_proto::{
 mod checkpoint;
 mod expiry;
 mod overlap;
+mod retry;
 mod timing;
 mod wait;
 
