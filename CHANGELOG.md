@@ -2,11 +2,18 @@
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-01
+
 ### Breaking
 
-- Segment index files have a new format. Format stores again, or remove the
-  `.idx` files in each journal's `indexes/` directory, which rebuilds them from
-  segments.
+- Segment index files have a new format, and a broker refuses to open a store
+  with old ones (`unsupported segment index version 4`). To keep the data, stop
+  the broker and remove the `.idx` files in each journal's `indexes/` directory;
+  it rebuilds them from segments. Formatting again also works, but drops the data.
+- `ozzy-journal-segment`'s index API follows the new rows: `max_offset_entries`
+  and `offset_count` became `max_batch_entries` and `batch_count`, and
+  `Journal::finish_index_job` is gone, as a job now records its own result.
+  `ozzy-runtime`'s `RecoveryOpen` gained `Withdraw`.
 
 ### Changed
 
