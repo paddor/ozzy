@@ -87,6 +87,9 @@ sequenceDiagram
   stages nothing until its receipt restarts for the new view.
 - A new epoch needs a correlated probe and verified history. Counters within
   an epoch never retract or wrap.
+- A channel's base is verified once, at open, so retention may retire it. Later
+  receipts verify only the received prefix, and one journal lookup answers one
+  report.
 - The leader keeps one window in flight past its announced commit. Followers
   admit only inside it, and every owner of accepted but unapplied state holds
   up to two windows.

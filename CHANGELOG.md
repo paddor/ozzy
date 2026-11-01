@@ -19,6 +19,10 @@
   After a leader change, those reloads could outlast the SDK response timeout,
   so writers resent forever and writes stopped on every partition of that
   broker.
+- A follower that falls behind on a long-lived partition no longer stops writes
+  on its leader. Once retention had removed the start of the replication
+  channel, the leader repeated a history check ahead of proposals and repair,
+  so every partition it led stayed stuck.
 
 ## [0.7.0] - 2026-10-29
 
