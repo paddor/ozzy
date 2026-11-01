@@ -142,6 +142,9 @@ max_bytes = 268435456
   index reserves its budget up front: about 1 KiB per entry, so 1M entries
   need about 1 GiB per partition. `ozzy validate` reports the exact minimum.
 - A full index makes producers retry later. It never evicts a live identity.
+- Set `max_entries` above the partition's unique records per window. After a
+  stall, a backlog drains only as old identities expire, so the spare entries
+  set how fast it catches up: with 10% spare, at a tenth of the normal rate.
 
 ## Delay
 
