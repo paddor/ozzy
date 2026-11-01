@@ -3,6 +3,40 @@
 use super::{Bytes, Client, MessageId, Pending, RecordInput, Submitted};
 use ozzy_runtime::replicated::{RetryPolicy, SharedTopicWriter, SharedTopicWriterConfig};
 
+/// Payload sizes of one paced soak.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SizeMix {
+    /// Up to 1 KiB, about 250 B on average.
+    Small,
+    /// Up to 64 KiB, about 6 KiB on average.
+    Large,
+}
+
+impl SizeMix {
+    fn length(self, index: usize) -> usize {
+        match self {
+            Self::Small => [0, 1, 62, 128, 257, 1024][index % 6],
+            Self::Large if index % 32 == 31 => 64 * 1024,
+            Self::Large => [0, 128, 1024, 4096, 16 * 1024][index % 5],
+        }
+    }
+}
+
+/// Seeded bytes. Compressible bodies repeat one block.
+fn paced_body(seed: u64, length: usize, compressible: bool) -> Bytes {
+    let mut state = seed.wrapping_add(1);
+    let mut body = vec![0; length];
+    for block in body.chunks_mut(8) {
+        if !compressible {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+        }
+        block.copy_from_slice(&state.to_be_bytes()[..block.len()]);
+    }
+    body.into()
+}
+
 impl Client {
     pub(super) async fn admit(
         &mut self,
@@ -150,5 +184,61 @@ impl Client {
             }
         }
         pending
+    }
+
+    /// Scale `queue_varied`'s shapes by `scale`, with sizes from `mix`. A
+    /// redundant producer repeats each record, ahead of it on odd waves.
+    pub async fn queue_paced(&mut self, wave: usize, scale: usize, mix: SizeMix) -> Vec<Pending> {
+        let pattern = wave % 6;
+        let records = [4, 1, 32, 64, 4, 1][pattern] * scale;
+        let mut pending = Vec::new();
+        for partition in 0..self.keys.len() {
+            if pattern == 3 && partition != (wave / 6) % self.keys.len() {
+                continue;
+            }
+            for record in 0..records {
+                let seed = ((wave as u64) << 40) | ((partition as u64) << 32) | record as u64;
+                let id = MessageId::from_bytes(((3_u128 << 120) | u128::from(seed)).to_be_bytes());
+                let length = if pattern == 1 {
+                    1024
+                } else {
+                    mix.length(wave + partition + record)
+                };
+                let body = paced_body(seed, length, record.is_multiple_of(4));
+                let parts = if pattern == 4 {
+                    vec![
+                        Bytes::new(),
+                        body.slice(..body.len() / 2),
+                        body.slice(body.len() / 2..),
+                        Bytes::new(),
+                    ]
+                } else {
+                    vec![body]
+                };
+                if wave % 2 == 1 {
+                    self.repeat(partition, id, &parts).await;
+                }
+                pending.push(self.admit(partition, id, parts.clone()).await);
+                if wave.is_multiple_of(2) {
+                    self.repeat(partition, id, &parts).await;
+                }
+            }
+        }
+        pending
+    }
+
+    async fn repeat(&mut self, partition: usize, id: MessageId, parts: &[Bytes]) {
+        let Some(redundant) = &mut self.redundant else {
+            return;
+        };
+        let record = redundant
+            .send(
+                RecordInput::multipart(id, parts.to_vec()),
+                Some(&self.keys[partition]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(record.partition(), partition as u32);
+        self.repeated.push((id, record));
     }
 }

@@ -8,6 +8,7 @@ pub(super) struct Fleet {
     pub(super) retention_gaps: u64,
     pub(super) slow_consumers: u64,
     pub(super) replayed_records: u64,
+    pub(super) load: Load,
     hosts: Vec<String>,
     directories: Vec<PathBuf>,
     cpus: Vec<usize>,
@@ -28,17 +29,26 @@ impl Fleet {
     ) -> (ozzy_runtime::replicated::TopicReader, usize) {
         let positions = client.positions();
         let before = reader.stats();
-        let pending = observe(
-            &mut self.brokers,
-            "admit soak records",
-            client.queue_varied(wave),
-        )
-        .await;
+        let pending = if self.load.rate.is_some() {
+            observe(
+                &mut self.brokers,
+                "admit soak records",
+                client.queue_paced(wave, self.load.scale(), self.load.mix),
+            )
+            .await
+        } else {
+            observe(
+                &mut self.brokers,
+                "admit soak records",
+                client.queue_varied(wave),
+            )
+            .await
+        };
         let records = pending.len();
         observe(
             &mut self.brokers,
             "confirm soak records",
-            client.confirm(pending),
+            client.confirm_paced(pending),
         )
         .await;
         if wave % 6 == 2 {
@@ -114,6 +124,7 @@ impl Fleet {
             retention_gaps: 0,
             slow_consumers: 0,
             replayed_records: 0,
+            load: Load::from_env(),
             hosts,
             directories,
             cpus,
@@ -176,9 +187,25 @@ impl Fleet {
         let mode = self.checked.deployment.deployment().cluster.mode;
         if let Some((index, deadline)) = self.stopped {
             if elapsed >= deadline {
-                self.brokers[index] = Some(self.start_one(index, self.memory).await);
+                if self.load.pause {
+                    self.brokers[index].as_ref().unwrap().signal("CONT");
+                } else {
+                    self.brokers[index] = Some(self.start_one(index, self.memory).await);
+                }
                 self.stopped = None;
             }
+        } else if elapsed >= self.next_kill && self.load.pause {
+            let index = self.kills as usize % self.hosts.len();
+            self.brokers[index].as_ref().unwrap().signal("STOP");
+            self.kills += 1;
+            println!(
+                "paused {} on {} at {} seconds",
+                NAMES[index],
+                self.hosts[index],
+                elapsed.as_secs()
+            );
+            self.stopped = Some((index, elapsed + Duration::from_secs(15)));
+            self.next_kill = elapsed + Duration::from_secs(90);
         } else if elapsed >= self.next_kill {
             let index = self.kills as usize % self.hosts.len();
             let unclean = self.kills % 4 != 3;

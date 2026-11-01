@@ -3,7 +3,9 @@
 use bytes::Bytes;
 use ozzy_broker::CheckedConfig;
 use ozzy_proto::{
-    EnvelopeLimits, MessageId, NodeId, Offset, ProducerId, append::Policy, data::DataLimits,
+    EnvelopeLimits, MessageId, NodeId, Offset, ProducerId,
+    append::{AppendDisposition, Policy},
+    data::DataLimits,
     handshake,
 };
 use ozzy_runtime::replicated::{
@@ -23,6 +25,7 @@ mod consumers;
 mod progress;
 mod workload;
 pub use progress::{ProgressTimeout, progress_timeout};
+pub use workload::SizeMix;
 
 /// Production SDK client with an independent bounded record and offset oracle.
 pub struct Client {
@@ -40,6 +43,14 @@ pub struct Client {
     submitted: Vec<Submitted>,
     policy: Policy,
     verified: Arc<AtomicU64>,
+    writer_config: SharedTopicWriterConfig,
+    /// One retention-gap check writes at most this many 64 KiB chunks.
+    retention_chunks: usize,
+    /// Second producer repeating every paced record, for topic deduplication.
+    redundant: Option<Box<SharedTopicWriter>>,
+    repeated: Vec<(MessageId, SharedTopicPendingRecord)>,
+    stored: u64,
+    duplicates: u64,
 }
 
 /// Admitted observation paired with independently retained record evidence.
@@ -79,16 +90,54 @@ impl Client {
         runtime: &WriterRuntime,
         clock: SdkClock,
     ) -> Self {
+        let writer_config = SharedTopicWriterConfig::new(DATA_LIMITS);
+        Self::open_shaped(checked, runtime, clock, writer_config).await
+    }
+
+    /// Open with packets and windows sized for paced waves. A redundant
+    /// client's second producer repeats every paced record.
+    pub async fn open_paced(checked: &CheckedConfig, redundant: bool) -> Self {
+        let runtime = WriterRuntime::new().unwrap();
+        let mut writer_config = SharedTopicWriterConfig::new(PACED_LIMITS);
+        writer_config.batch_target_bytes = 256 * 1024;
+        writer_config.inflight_appends = 4;
+        let mut client = Self::open_shaped(
+            checked,
+            &runtime,
+            SdkClock::default(),
+            writer_config.clone(),
+        )
+        .await;
+        if redundant {
+            let writer = SharedTopicWriter::open(
+                &client.links,
+                "orders",
+                writer_config,
+                RetryPolicy::default(),
+            )
+            .await
+            .unwrap();
+            client.redundant = Some(Box::new(writer));
+        }
+        client
+    }
+
+    async fn open_shaped(
+        checked: &CheckedConfig,
+        runtime: &WriterRuntime,
+        clock: SdkClock,
+        writer_config: SharedTopicWriterConfig,
+    ) -> Self {
         let topic = &checked.deployment.deployment().topics["orders"];
         let partitions = topic.partitions as usize;
-        let links_config = links_config(checked, partitions, clock);
+        let links_config = links_config(checked, partitions, clock, writer_config.limits);
         let links = BrokerLinks::connect(runtime, links_config.clone())
             .await
             .unwrap();
         let writer = SharedTopicWriter::open(
             &links,
             "orders",
-            SharedTopicWriterConfig::new(DATA_LIMITS),
+            writer_config.clone(),
             RetryPolicy::default(),
         )
         .await
@@ -107,6 +156,16 @@ impl Client {
             submitted: Vec::new(),
             policy: checked.identity.mode.policy(),
             verified: Arc::default(),
+            writer_config,
+            retention_chunks: usize::try_from(
+                (topic.retention.max_bytes.unwrap_or(0) + 2 * topic.segment_bytes) / (64 * 1024),
+            )
+            .unwrap()
+            .max(256),
+            redundant: None,
+            repeated: Vec::new(),
+            stored: 0,
+            duplicates: 0,
         }
     }
 
@@ -122,7 +181,7 @@ impl Client {
             println!("producer close started, takeover={takeover}");
         }
         let identity = self.writer.identity();
-        let config = SharedTopicWriterConfig::new(DATA_LIMITS);
+        let config = self.writer_config.clone();
         let writer = if takeover {
             let writer = SharedTopicWriter::takeover(
                 &self.links,
@@ -236,6 +295,7 @@ impl Client {
         let mut confirmed = Vec::with_capacity(pending.len());
         for pending in pending {
             let receipt = self.confirm_record(&pending.record).await;
+            self.count_disposition(&receipt);
             assert_eq!(receipt.record.policy, self.policy);
             assert_eq!(receipt.topic, pending.record.topic());
             assert_eq!(receipt.partition, pending.record.partition());
@@ -260,6 +320,39 @@ impl Client {
             );
             history.push((pending.id, pending.parts));
         }
+    }
+
+    /// Confirm a paced wave. Each repeat must report its twin's offset, and
+    /// each identity must report exactly one stored occurrence.
+    pub async fn confirm_paced(&mut self, pending: Vec<Pending>) {
+        let records = pending.len() as u64;
+        let stored = self.stored;
+        self.confirm(pending).await;
+        if self.redundant.is_none() {
+            return;
+        }
+        for (id, record) in std::mem::take(&mut self.repeated) {
+            let receipt = self.confirm_record(&record).await;
+            self.count_disposition(&receipt);
+            assert_eq!(receipt.record.message_id, id);
+            let partition = receipt.partition as usize;
+            let slot = receipt.record.offset as usize - self.bases[partition];
+            assert_eq!(self.history[partition][slot].0, id);
+        }
+        assert_eq!(self.stored - stored, records);
+    }
+
+    fn count_disposition(&mut self, receipt: &ozzy_runtime::replicated::SharedTopicReceipt) {
+        match receipt.record.disposition {
+            AppendDisposition::Stored => self.stored += 1,
+            AppendDisposition::Duplicate => self.duplicates += 1,
+            _ => {}
+        }
+    }
+
+    /// Stored and duplicate receipts observed so far.
+    pub fn dispositions(&self) -> (u64, u64) {
+        (self.stored, self.duplicates)
     }
 
     async fn confirm_record(
@@ -429,6 +522,9 @@ impl Client {
 
     /// Close producer admission and join the real SDK links.
     pub async fn close(self) {
+        if let Some(redundant) = self.redundant {
+            redundant.close().await.unwrap();
+        }
         self.writer.close().await.unwrap();
         self.links.shutdown().await.unwrap();
     }
@@ -487,31 +583,53 @@ pub const DATA_LIMITS: DataLimits = DataLimits {
     max_record_bytes: 1024,
 };
 
+/// Larger packets for paced waves, up to 64 KiB per record.
+const PACED_LIMITS: DataLimits = DataLimits {
+    envelope: EnvelopeLimits {
+        max_metadata_bytes: 64 * 1024,
+        max_payload_bytes: 512 * 1024,
+    },
+    max_records: 256,
+    max_parts: 1024,
+    max_record_bytes: 64 * 1024,
+};
+
 /// Producer and consumer links to every configured broker under a fresh node id.
-fn links_config(checked: &CheckedConfig, partitions: usize, clock: SdkClock) -> BrokerLinksConfig {
+fn links_config(
+    checked: &CheckedConfig,
+    partitions: usize,
+    clock: SdkClock,
+    limits: DataLimits,
+) -> BrokerLinksConfig {
     let mut parameters =
-        handshake::Parameters::streaming(DATA_LIMITS, handshake::PRODUCER | handshake::CONSUMER)
+        handshake::Parameters::streaming(limits, handshake::PRODUCER | handshake::CONSUMER)
             .unwrap();
     parameters.capabilities |= handshake::OWNER_ROUTING | handshake::OWNER_READ;
+    let brokers = checked.broker_addresses().unwrap();
+    let mut reader = ReaderLinkLimits {
+        subscriptions: 8,
+        bytes: 16 * 1024 * 1024,
+        queue_messages: 4,
+    };
+    reader.bytes = reader
+        .reservation_bytes(limits, brokers.len())
+        .unwrap()
+        .max(reader.bytes);
     BrokerLinksConfig {
         local: NodeId::from_bytes(*uuid::Uuid::now_v7().as_bytes()),
-        brokers: checked.broker_addresses().unwrap(),
+        brokers,
         parameters,
         requests: 12,
-        control_bytes: 1024 * 1024,
+        control_bytes: (1024 * 1024).max(32 * limits.envelope.max_payload_bytes),
         routing_bytes: 1024 * 1024,
         append: Some(AppendLinkLimits {
             writers: 32,
             requests: 32,
-            records: 128,
-            bytes: 256 * 1024 * 1024,
+            records: 32 * limits.max_records,
+            bytes: (256 * 1024 * 1024).max(2048 * limits.envelope.max_payload_bytes),
         }),
         maximum_partitions: partitions,
-        reader: Some(ReaderLinkLimits {
-            subscriptions: 8,
-            bytes: 16 * 1024 * 1024,
-            queue_messages: 4,
-        }),
+        reader: Some(reader),
         request_timeout: Duration::from_secs(5),
         retry_interval: Duration::from_millis(10),
         clock,
