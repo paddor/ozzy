@@ -448,7 +448,7 @@ impl ShardJournal {
             config,
             io,
             generations,
-            super::OwnedRecoveryOpen::Quarantine,
+            super::OwnedRecoveryOpen::Withdraw,
         )
         .await?;
         if let Some(memory) = memory {

@@ -16,6 +16,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// How long a publication waits for port capacity before it is dropped. OMQ
+/// keeps the frames it queued for a stalled subscriber until that subscriber
+/// reads them, and those frames hold the shard's publication budget. Writes
+/// must not wait for it: PUB is lossy and PEER repairs what this drops.
+const PUBLICATION_WAIT: Duration = Duration::from_secs(1);
+
 enum State {
     Ready(Message),
     Pending(Pending<ReplyResult>),
@@ -50,6 +56,9 @@ pub(super) struct Outbound {
     /// Destination classes whose oldest unsent reply stayed unsent this turn.
     held: Vec<(NodeId, Class)>,
     publications: [Option<Publication>; 2],
+    /// When the port started refusing publications. Reset by the next one it
+    /// admits, so publications after the wait drop at once.
+    publication_refused: Option<Duration>,
     publication_bytes: usize,
     envelope: EnvelopeLimits,
     /// A send was refused as full. The next freed slot wakes the shard so
@@ -61,13 +70,23 @@ pub(super) struct Outbound {
 }
 
 impl Outbound {
-    /// The earliest retry of a refused reply. Nothing else announces it.
+    /// The earliest retry of a refused reply, or the end of a publication's
+    /// wait. Nothing else announces them.
     pub(super) fn next_retry(&self, now: Duration) -> Option<Duration> {
+        let publication = self
+            .publication_refused
+            .filter(|_| {
+                self.publications
+                    .iter()
+                    .any(|slot| matches!(slot, Some(Publication::Ready(_))))
+            })
+            .map(|refused| refused.saturating_add(PUBLICATION_WAIT));
         self.order
             .iter()
             .filter_map(|&(_, index)| self.slots[index].as_ref())
             .filter(|entry| matches!(entry.state, State::Ready(_)))
             .map(|entry| entry.retry)
+            .chain(publication)
             .filter(|retry| *retry > now)
             .min()
     }
@@ -85,6 +104,7 @@ impl Outbound {
             order: VecDeque::with_capacity(slots),
             held: Vec::with_capacity(8),
             publications: [None, None],
+            publication_refused: None,
             publication_bytes: message_bytes.saturating_add(2048),
             envelope,
             refused: false,
@@ -180,7 +200,7 @@ impl Outbound {
         port.poll_progress(cx).map_err(failure)?;
         self.port_refused = false;
         for slot in 0..2 {
-            self.poll_publication(cx, port, slot)?;
+            self.poll_publication(cx, port, slot, now)?;
         }
         // Visit the oldest entries first, at most 64 per turn. One destination
         // class is handed over in send order: once its oldest unsent reply
@@ -287,6 +307,7 @@ impl Outbound {
         cx: &mut Context<'_>,
         port: &mut Port,
         slot: usize,
+        now: Duration,
     ) -> Result<(), StartupError> {
         let mut pending = match self.publications[slot].take() {
             None => return Ok(()),
@@ -295,9 +316,17 @@ impl Outbound {
             // registers this turn's waker for its result.
             Some(Publication::Ready(message)) => {
                 match port.try_publish(message, self.publication_bytes) {
-                    Ok(pending) => pending,
+                    Ok(pending) => {
+                        self.publication_refused = None;
+                        pending
+                    }
                     Err((ozzy_runtime::frontend::PortError::Admission(_), message)) => {
-                        self.publications[slot] = Some(Publication::Ready(message));
+                        let refused = *self.publication_refused.get_or_insert(now);
+                        if now.saturating_sub(refused) < PUBLICATION_WAIT {
+                            self.publications[slot] = Some(Publication::Ready(message));
+                        } else {
+                            self.wake_refused(cx);
+                        }
                         self.port_refused = true;
                         return Ok(());
                     }

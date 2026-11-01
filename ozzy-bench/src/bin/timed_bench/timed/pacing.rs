@@ -11,10 +11,6 @@ use tokio::io::unix::AsyncFd;
 use super::super::{Result, error, metrics};
 use super::{Config, Window, measurement::Counts};
 
-/// An arrival not admitted this long after its due time means the system did
-/// not sustain the offered load. Unadmitted arrivals are ordinals, not memory.
-pub(super) const MAX_ADMISSION_LAG_NS: u64 = 1_000_000_000;
-
 #[derive(Clone, Copy)]
 pub(super) struct Plan {
     schedule: Schedule,
@@ -26,6 +22,10 @@ pub(super) struct Plan {
     bounds: [u64; MAX_STAGES + 1],
     stages: usize,
     ramp: bool,
+    /// An arrival not admitted this long after its due time means the system
+    /// did not sustain the offered load. Unadmitted arrivals are ordinals, not
+    /// memory.
+    max_lag_ns: u64,
 }
 
 impl Plan {
@@ -70,6 +70,7 @@ impl Plan {
             bounds,
             stages,
             ramp: config.args.ramp.is_some(),
+            max_lag_ns: config.args.max_admission_lag_ns(),
         }))
     }
 
@@ -129,13 +130,13 @@ impl Plan {
     }
 
     /// Never drop arrivals or move their original clock when admission is
-    /// late. Once the oldest unadmitted arrival is `MAX_ADMISSION_LAG_NS` late,
+    /// late. Once the oldest unadmitted arrival is `max_lag_ns` late,
     /// a fixed rate fails and a ramp returns that arrival's stage. Every earlier
     /// stage was admitted completely; the lane then admits nothing more.
     pub(super) fn check_backlog(self, admitted: u64, now: u64) -> Result<Option<usize>> {
         if admitted < self.total() {
             let due = self.due(admitted)?;
-            if due.saturating_add(MAX_ADMISSION_LAG_NS) <= now {
+            if due.saturating_add(self.max_lag_ns) <= now {
                 if self.ramp {
                     return Ok(Some(self.stage(due)));
                 }
@@ -282,6 +283,7 @@ mod tests {
             bounds: [1_010_000_000; MAX_STAGES + 1],
             stages: 1,
             ramp: false,
+            max_lag_ns: 1_000_000_000,
         }
     }
 
@@ -321,6 +323,34 @@ mod tests {
     }
 
     #[test]
+    fn a_raised_lag_limit_keeps_a_late_arrival_admissible() {
+        let config = Config::new(super::super::super::Args::parse_from([
+            "bench",
+            "--system",
+            "single-durable",
+            "--processes",
+            "--network-ingress",
+            "--streaming",
+            "--duration",
+            "1",
+            "--records-per-second",
+            "7",
+            "--max-admission-lag-secs",
+            "30",
+        ]))
+        .unwrap();
+        let window = Window {
+            start: 10_000_000,
+            measured: 510_000_000,
+            end: 1_010_000_000,
+        };
+        let plan = Plan::new(&config, window, 0).unwrap().unwrap();
+        let due = plan.due(0).unwrap();
+        assert!(plan.check_backlog(0, due + 29_000_000_000).is_ok());
+        assert!(plan.check_backlog(0, due + 30_000_000_000).is_err());
+    }
+
+    #[test]
     fn uneven_lanes_preserve_every_half_open_arrival() {
         assert_eq!(
             (0..3).map(|lane| plan(lane).total()).collect::<Vec<_>>(),
@@ -353,10 +383,11 @@ mod tests {
     fn lateness_is_bounded_without_resetting_clock_or_skipping_drain() {
         let p = plan(0);
         let due = p.due(0).unwrap();
-        assert!(p.check_backlog(0, due + MAX_ADMISSION_LAG_NS - 1).is_ok());
-        assert!(p.check_backlog(0, due + MAX_ADMISSION_LAG_NS).is_err());
+        assert_eq!(p.max_lag_ns, 1_000_000_000);
+        assert!(p.check_backlog(0, due + p.max_lag_ns - 1).is_ok());
+        assert!(p.check_backlog(0, due + p.max_lag_ns).is_err());
         let last = p.total() - 1;
-        let late = p.due(last).unwrap() + MAX_ADMISSION_LAG_NS;
+        let late = p.due(last).unwrap() + p.max_lag_ns;
         assert!(p.check_backlog(last, late - 1).is_ok());
         assert!(p.check_backlog(last, late).is_err());
         // Fully admitted lanes only drain; lateness no longer applies.

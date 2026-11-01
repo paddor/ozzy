@@ -37,21 +37,85 @@ pub struct RecordLocation {
     pub record_index: u32,
 }
 
-/// Exact partition-offset lookup entry.
+/// One batch's record range. Its records share everything here, so an index
+/// holds one of these per batch, not per record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchIndexEntry {
+    /// Offset of the batch's first record.
+    pub first_offset: Offset,
+    /// Broker append time of the batch.
+    pub append_timestamp_millis: u64,
+    /// Canonical operation holding the batch.
+    pub op_number: u64,
+    /// Zero-based addressed batch within the canonical APPEND.
+    pub batch_index: u32,
+    /// Records in the batch, at least one.
+    pub records: u32,
+}
+
+impl BatchIndexEntry {
+    /// The zero-based record at `offset`, if this batch holds it.
+    pub(crate) fn record_index(self, offset: Offset) -> Option<u32> {
+        let delta = offset.get().checked_sub(self.first_offset.get())?;
+        u32::try_from(delta)
+            .ok()
+            .filter(|&index| index < self.records)
+    }
+
+    /// One past the batch's last offset.
+    pub(crate) fn end_offset(self) -> Option<u64> {
+        self.first_offset.get().checked_add(u64::from(self.records))
+    }
+
+    /// The offset entry of record `record_index`, which the batch holds, given
+    /// where its operation is.
+    pub(crate) fn entry(
+        self,
+        partition: PartitionIncarnation,
+        operation: OperationLocation,
+        record_index: u32,
+    ) -> OffsetIndexEntry {
+        OffsetIndexEntry {
+            partition,
+            offset: Offset::new(self.first_offset.get() + u64::from(record_index)),
+            append_timestamp_millis: if record_index == 0 {
+                self.append_timestamp_millis
+            } else {
+                0
+            },
+            location: RecordLocation {
+                operation,
+                batch_index: self.batch_index,
+                record_index,
+            },
+        }
+    }
+}
+
+/// One record's identity, sorted by identity then offset. Its batch row gives
+/// the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageRow {
+    /// Application record identity preserved through retry and replay.
+    pub message_id: MessageId,
+    /// Partition-global record offset.
+    pub offset: Offset,
+}
+
+/// Exact partition-offset lookup result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OffsetIndexEntry {
     /// Exact partition record incarnation.
     pub partition: PartitionIncarnation,
     /// Partition-global record offset.
     pub offset: Offset,
-    /// Broker append time on the first record of a batch; zero on other rows.
-    /// Uses the offset table's existing eight reserved bytes.
+    /// Broker append time on the first record of a batch; zero on other records.
     pub append_timestamp_millis: u64,
     /// Exact physical operation and record coordinates.
     pub location: RecordLocation,
 }
 
-/// Exact idempotency lookup entry. Resolve its offset through the offset index.
+/// Exact idempotency lookup result. Resolve its offset through the batch rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MessageIndexEntry {
     /// Exact partition record incarnation.
@@ -90,10 +154,12 @@ pub struct ScheduleIndexEntry {
 pub struct DerivedIndexEntries {
     /// Numeric selector for every operation, including payload-free appends.
     pub location: OperationLocation,
-    /// Record-offset selectors in canonical sorted order.
-    pub offsets: Vec<OffsetIndexEntry>,
-    /// Message-identity selectors in canonical sorted order.
-    pub messages: Vec<MessageIndexEntry>,
+    /// Partition of the records below; `None` without records.
+    pub partition: Option<PartitionIncarnation>,
+    /// One row per batch with records, in batch order.
+    pub batches: Vec<BatchIndexEntry>,
+    /// One row per record, in record order.
+    pub messages: Vec<MessageRow>,
     /// Optional canonical control-operation identity selector.
     pub operation: Option<OperationIndexEntry>,
     /// Scheduled records in batch order.
@@ -154,7 +220,8 @@ pub fn derive_index_entries(
     if let Some(schedules) = held_rows(operation.op_number, &body)? {
         return Ok(DerivedIndexEntries {
             location,
-            offsets: Vec::new(),
+            partition: None,
+            batches: Vec::new(),
             messages: Vec::new(),
             operation: operation_entry,
             schedules,
@@ -167,38 +234,47 @@ pub fn derive_index_entries(
         _ => {
             return Ok(DerivedIndexEntries {
                 location,
-                offsets: Vec::new(),
+                partition: None,
+                batches: Vec::new(),
                 messages: Vec::new(),
                 operation: operation_entry,
                 schedules: Vec::new(),
             });
         }
     };
-    let (offsets, messages) = record_entries(batches, location)?;
-    Ok(DerivedIndexEntries {
-        location,
-        offsets,
-        messages,
-        operation: None,
-        schedules: Vec::new(),
-    })
+    record_entries(batches, location)
 }
 
-/// Offset and message selectors for every record of one APPEND's batches.
+/// Entries of every record of one APPEND's batches. An index holds one partition,
+/// as a journal does.
 fn record_entries(
     batches: &[AppendBatch<'_>],
     location: OperationLocation,
-) -> Result<(Vec<OffsetIndexEntry>, Vec<MessageIndexEntry>), IndexError> {
+) -> Result<DerivedIndexEntries, IndexError> {
     let record_count = batches
         .iter()
         .try_fold(0_usize, |count, batch| {
             count.checked_add(batch.records.len())
         })
         .ok_or(IndexError::PositionOverflow)?;
-    let mut offsets = Vec::with_capacity(record_count);
+    let mut partition = None;
+    let mut rows = Vec::with_capacity(batches.len());
     let mut messages = Vec::with_capacity(record_count);
     for (batch_index, batch) in batches.iter().enumerate() {
-        let batch_index = u32::try_from(batch_index).map_err(|_| IndexError::PositionOverflow)?;
+        if batch.records.is_empty() {
+            continue;
+        }
+        if *partition.get_or_insert(batch.partition) != batch.partition {
+            return Err(IndexError::MixedPartitions);
+        }
+        rows.push(BatchIndexEntry {
+            first_offset: batch.first_offset,
+            append_timestamp_millis: batch.append_timestamp_millis,
+            op_number: location.op_number,
+            batch_index: u32::try_from(batch_index).map_err(|_| IndexError::PositionOverflow)?,
+            records: u32::try_from(batch.records.len())
+                .map_err(|_| IndexError::PositionOverflow)?,
+        });
         for (record_index, record) in batch.records.iter().enumerate() {
             let delta = u64::try_from(record_index).map_err(|_| IndexError::PositionOverflow)?;
             let offset = batch
@@ -207,31 +283,20 @@ fn record_entries(
                 .checked_add(delta)
                 .map(Offset::new)
                 .ok_or(IndexError::PositionOverflow)?;
-            let record_index =
-                u32::try_from(record_index).map_err(|_| IndexError::PositionOverflow)?;
-            offsets.push(OffsetIndexEntry {
-                partition: batch.partition,
-                offset,
-                append_timestamp_millis: if record_index == 0 {
-                    batch.append_timestamp_millis
-                } else {
-                    0
-                },
-                location: RecordLocation {
-                    operation: location,
-                    batch_index,
-                    record_index,
-                },
-            });
-            messages.push(MessageIndexEntry {
-                partition: batch.partition,
+            messages.push(MessageRow {
                 message_id: record.message_id,
                 offset,
-                operation_digest: location.operation_digest,
             });
         }
     }
-    Ok((offsets, messages))
+    Ok(DerivedIndexEntries {
+        location,
+        partition,
+        batches: rows,
+        messages,
+        operation: None,
+        schedules: Vec::new(),
+    })
 }
 
 pub(crate) fn operation_id(body: &OperationBody<'_>) -> Option<OperationId> {
@@ -250,4 +315,7 @@ pub enum IndexError {
     #[error("derived index position overflow")]
     /// Derived index position overflow.
     PositionOverflow,
+    #[error("one operation holds records of more than one partition")]
+    /// One operation holds records of more than one partition.
+    MixedPartitions,
 }

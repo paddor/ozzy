@@ -11,9 +11,10 @@
 use ozzy_core::state::PendingSchedule;
 use ozzy_journal::operation::ReleaseKey;
 use ozzy_journal_segment::{
-    Digest, INDEX_HEADER_BYTES, IndexEntries, IndexFileError, IndexLimits, IndexSource,
-    MessageIndexEntry, OffsetIndexEntry, OperationIndexEntry, OperationLocation, RecordLocation,
-    ScheduleIndexEntry, SegmentIndexImage, decode_segment_index, encode_segment_index,
+    BatchIndexEntry, Digest, INDEX_HEADER_BYTES, IndexEntries, IndexFileError, IndexLimits,
+    IndexSource, MessageIndexEntry, MessageRow, OffsetIndexEntry, OperationIndexEntry,
+    OperationLocation, RecordLocation, ScheduleIndexEntry, SegmentIndexImage, decode_segment_index,
+    encode_segment_index,
 };
 use ozzy_proto::{GroupId, MessageId, Offset, OperationId, PartitionIncarnation};
 
@@ -45,11 +46,16 @@ fn schedule(byte: u8, millis: u64, schedule: u64) -> ScheduleIndexEntry {
     }
 }
 
+fn message(id: u8, offset: u64) -> MessageRow {
+    MessageRow {
+        message_id: MessageId::from_bytes([id; 16]),
+        offset: Offset::new(offset),
+    }
+}
+
 fn image() -> SegmentIndexImage {
     let first_location = operation_location(1, 0x70, 4096);
     let last_location = operation_location(3, 0x90, 4480);
-    let first_partition = partition(0x20);
-    let second_partition = partition(0x21);
     SegmentIndexImage::new(
         IndexSource {
             group_id: GroupId::from_bytes([0x10; 16]),
@@ -62,42 +68,25 @@ fn image() -> SegmentIndexImage {
         },
         64 * 1024,
         IndexEntries {
-            offsets: vec![
-                OffsetIndexEntry {
+            partition: Some(partition(0x20)),
+            batches: vec![
+                // Out of order; the image sorts them.
+                BatchIndexEntry {
+                    first_offset: Offset::new(6),
+                    append_timestamp_millis: 88,
+                    op_number: 1,
+                    batch_index: 1,
+                    records: 1,
+                },
+                BatchIndexEntry {
+                    first_offset: Offset::new(4),
                     append_timestamp_millis: 77,
-                    partition: second_partition,
-                    offset: Offset::new(8),
-                    location: RecordLocation {
-                        operation: first_location,
-                        batch_index: 1,
-                        record_index: 0,
-                    },
-                },
-                OffsetIndexEntry {
-                    append_timestamp_millis: 0,
-                    partition: first_partition,
-                    offset: Offset::new(4),
-                    location: RecordLocation {
-                        operation: first_location,
-                        batch_index: 0,
-                        record_index: 2,
-                    },
+                    op_number: 1,
+                    batch_index: 0,
+                    records: 2,
                 },
             ],
-            messages: vec![
-                MessageIndexEntry {
-                    partition: second_partition,
-                    message_id: MessageId::from_bytes([0x41; 16]),
-                    offset: Offset::new(8),
-                    operation_digest: Digest::from_bytes([0x51; 32]),
-                },
-                MessageIndexEntry {
-                    partition: first_partition,
-                    message_id: MessageId::from_bytes([0x40; 16]),
-                    offset: Offset::new(4),
-                    operation_digest: Digest::from_bytes([0x50; 32]),
-                },
-            ],
+            messages: vec![message(0x41, 6), message(0x40, 4), message(0x41, 5)],
             operations: vec![OperationIndexEntry {
                 operation_id: OperationId::from_bytes([0x30; 16]),
                 location: last_location,
@@ -124,7 +113,7 @@ fn immutable_index_round_trips_and_binary_searches_without_entry_allocation() {
     let image = image();
     let encoded = encode_segment_index(&image, IndexLimits::default()).unwrap();
     assert_eq!(&encoded[..8], b"OZYIDX01");
-    assert_eq!(u16::from_be_bytes(encoded[8..10].try_into().unwrap()), 4);
+    assert_eq!(u16::from_be_bytes(encoded[8..10].try_into().unwrap()), 5);
     assert_eq!(
         u16::from_be_bytes(encoded[10..12].try_into().unwrap()),
         INDEX_HEADER_BYTES as u16
@@ -133,8 +122,9 @@ fn immutable_index_round_trips_and_binary_searches_without_entry_allocation() {
     let view = decode_segment_index(&encoded, IndexLimits::default()).unwrap();
     assert_eq!(view.source(), image.source());
     assert_eq!(view.build_memory_limit(), 64 * 1024);
-    assert_eq!(view.offset_count(), 2);
-    assert_eq!(view.message_count(), 2);
+    assert_eq!(view.partition(), Some(partition(0x20)));
+    assert_eq!(view.batch_count(), 2);
+    assert_eq!(view.message_count(), 3);
     assert_eq!(view.operation_count(), 1);
     assert_eq!(view.location_count(), 3);
     for location in image.locations() {
@@ -146,19 +136,76 @@ fn immutable_index_round_trips_and_binary_searches_without_entry_allocation() {
     for missing in [0, 4, u64::MAX] {
         assert!(view.find_operation_number(missing).is_none());
     }
+    // Every record of a batch resolves from its one row; only the first has a time.
+    for (offset, batch_index, record_index, millis) in [(4, 0, 0, 77), (5, 0, 1, 0), (6, 1, 0, 88)]
+    {
+        let expected = OffsetIndexEntry {
+            partition: partition(0x20),
+            offset: Offset::new(offset),
+            append_timestamp_millis: millis,
+            location: RecordLocation {
+                operation: image.locations()[0],
+                batch_index,
+                record_index,
+            },
+        };
+        assert_eq!(
+            view.find_offset(partition(0x20), Offset::new(offset)),
+            Some(expected)
+        );
+        assert_eq!(
+            image.find_offset(partition(0x20), Offset::new(offset)),
+            Some(expected)
+        );
+    }
+    for missing in [0, 3, 7, u64::MAX] {
+        assert!(
+            view.find_offset(partition(0x20), Offset::new(missing))
+                .is_none()
+        );
+        assert!(
+            image
+                .find_offset(partition(0x20), Offset::new(missing))
+                .is_none()
+        );
+    }
+    assert!(view.find_offset(partition(0x21), Offset::new(4)).is_none());
+
+    // The oldest row of a repeated identity answers; its digest is its operation's.
+    let repeated = MessageId::from_bytes([0x41; 16]);
+    let expected = MessageIndexEntry {
+        partition: partition(0x20),
+        message_id: repeated,
+        offset: Offset::new(5),
+        operation_digest: image.locations()[0].operation_digest,
+    };
+    assert_eq!(view.find_message(partition(0x20), repeated), Some(expected));
     assert_eq!(
-        view.find_offset(partition(0x20), Offset::new(4)),
-        Some(image.offsets()[0])
+        image.find_message(partition(0x20), repeated),
+        Some(expected)
     );
-    assert_eq!(
-        view.find_message(partition(0x21), MessageId::from_bytes([0x41; 16])),
-        Some(image.messages()[1])
+    assert!(view.find_message(partition(0x21), repeated).is_none());
+    assert!(
+        view.find_message(partition(0x20), MessageId::from_bytes([0x3f; 16]))
+            .is_none()
     );
+    let matches = |floor, end| {
+        view.message_offsets(
+            partition(0x20),
+            repeated,
+            Offset::new(floor),
+            Offset::new(end),
+        )
+    };
+    let offsets = |first, last| Some((Offset::new(first), Offset::new(last)));
+    assert_eq!(matches(0, 100), offsets(5, 6));
+    assert_eq!(matches(6, 100), offsets(6, 6));
+    assert_eq!(matches(0, 6), offsets(5, 5));
+    assert_eq!(matches(7, 100), None);
     assert_eq!(
         view.find_operation(OperationId::from_bytes([0x30; 16])),
         Some(image.operations()[0])
     );
-    assert!(view.find_offset(partition(0x20), Offset::new(5)).is_none());
 
     assert_eq!(view.schedule_count(), 4);
     let after = |byte, millis, schedule| {
@@ -235,7 +282,7 @@ fn every_truncated_prefix_and_corruption_is_rejected() {
         IndexFileError::DigestMismatch
     );
     let mut reserved = encoded;
-    reserved[320] = 1;
+    reserved[340] = 1;
     assert_eq!(
         decode_segment_index(&reserved, IndexLimits::default()).unwrap_err(),
         IndexFileError::NonZeroReserved
@@ -245,44 +292,116 @@ fn every_truncated_prefix_and_corruption_is_rejected() {
 #[test]
 fn construction_rejects_duplicate_keys_and_invalid_locations() {
     let image = image();
-    let duplicate = image.offsets()[0];
-    assert_eq!(
+    let with_batches = |partition, batches: Vec<BatchIndexEntry>| {
         SegmentIndexImage::new(
             image.source(),
             image.build_memory_limit(),
             IndexEntries {
-                offsets: vec![duplicate, duplicate],
+                partition,
+                batches,
                 messages: image.messages().to_vec(),
                 operations: image.operations().to_vec(),
                 locations: image.locations().to_vec(),
                 schedules: image.schedules().to_vec(),
-            }
+            },
         )
-        .unwrap_err(),
-        IndexFileError::UnsortedOrDuplicate("offset")
+        .unwrap_err()
+    };
+    let [first, second] = image.batches() else {
+        panic!("two batches");
+    };
+    let (first, second) = (*first, *second);
+    let records = Some(partition(0x20));
+    assert_eq!(
+        with_batches(records, vec![second, second, second]),
+        IndexFileError::UnsortedOrDuplicate("batch")
+    );
+    let overlap = BatchIndexEntry {
+        first_offset: Offset::new(5),
+        ..second
+    };
+    assert_eq!(
+        with_batches(records, vec![first, overlap]),
+        IndexFileError::UnsortedOrDuplicate("batch")
+    );
+    let backwards = BatchIndexEntry {
+        batch_index: 0,
+        ..second
+    };
+    assert_eq!(
+        with_batches(records, vec![first, backwards]),
+        IndexFileError::UnsortedOrDuplicate("batch")
+    );
+    for op_number in [0, 4] {
+        assert_eq!(
+            with_batches(
+                records,
+                vec![BatchIndexEntry { op_number, ..first }, second]
+            ),
+            IndexFileError::InvalidLocation
+        );
+    }
+    assert_eq!(
+        with_batches(
+            records,
+            vec![
+                BatchIndexEntry {
+                    records: 0,
+                    ..first
+                },
+                BatchIndexEntry {
+                    records: 3,
+                    ..second
+                }
+            ]
+        ),
+        IndexFileError::InvalidLocation
+    );
+    assert_eq!(
+        with_batches(
+            records,
+            vec![
+                first,
+                BatchIndexEntry {
+                    records: 2,
+                    ..second
+                }
+            ]
+        ),
+        IndexFileError::RecordIndexCountMismatch
+    );
+    assert_eq!(
+        with_batches(None, vec![first, second]),
+        IndexFileError::InvalidRecordRange
+    );
+    assert_eq!(
+        with_batches(records, Vec::new()),
+        IndexFileError::InvalidRecordRange
     );
 
-    let mut invalid = image.offsets()[0];
-    invalid.location.operation.entry_offset = 8184;
+    let mut messages = image.messages().to_vec();
+    messages[2].offset = Offset::new(7);
     assert_eq!(
         SegmentIndexImage::new(
             image.source(),
             image.build_memory_limit(),
             IndexEntries {
-                offsets: vec![invalid, image.offsets()[1]],
-                messages: image.messages().to_vec(),
+                partition: records,
+                batches: image.batches().to_vec(),
+                messages,
                 operations: image.operations().to_vec(),
                 locations: image.locations().to_vec(),
                 schedules: image.schedules().to_vec(),
             }
         )
         .unwrap_err(),
-        IndexFileError::InvalidLocation
+        IndexFileError::MissingBatchEntry
     );
 
     let held = image.schedules()[0];
     let entries = |schedules| IndexEntries {
-        offsets: image.offsets().to_vec(),
+        partition: image.partition(),
+        batches: image.batches().to_vec(),
         messages: image.messages().to_vec(),
         operations: image.operations().to_vec(),
         locations: image.locations().to_vec(),
@@ -331,7 +450,8 @@ fn numeric_selectors_cover_payload_free_operations_near_the_number_limit() {
         source,
         0,
         IndexEntries {
-            offsets: Vec::new(),
+            partition: None,
+            batches: Vec::new(),
             messages: Vec::new(),
             operations: Vec::new(),
             locations: locations.clone(),
@@ -343,7 +463,7 @@ fn numeric_selectors_cover_payload_free_operations_near_the_number_limit() {
     let view = decode_segment_index(&bytes, IndexLimits::default()).unwrap();
     assert_eq!(
         (
-            view.offset_count(),
+            view.batch_count(),
             view.message_count(),
             view.operation_count()
         ),
@@ -374,7 +494,8 @@ fn numeric_selectors_cover_payload_free_operations_near_the_number_limit() {
             source,
             0,
             IndexEntries {
-                offsets: Vec::new(),
+                partition: None,
+                batches: Vec::new(),
                 messages: Vec::new(),
                 operations: Vec::new(),
                 locations: locations[..2].to_vec(),
@@ -391,7 +512,8 @@ fn numeric_selectors_cover_payload_free_operations_near_the_number_limit() {
             source,
             0,
             IndexEntries {
-                offsets: Vec::new(),
+                partition: None,
+                batches: Vec::new(),
                 messages: Vec::new(),
                 operations: Vec::new(),
                 locations: gap,
@@ -408,7 +530,8 @@ fn numeric_selectors_cover_payload_free_operations_near_the_number_limit() {
             source,
             0,
             IndexEntries {
-                offsets: Vec::new(),
+                partition: None,
+                batches: Vec::new(),
                 messages: Vec::new(),
                 operations: Vec::new(),
                 locations: overlap,

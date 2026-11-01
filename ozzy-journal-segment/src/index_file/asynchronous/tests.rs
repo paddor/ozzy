@@ -1,11 +1,11 @@
 use super::*;
 use crate::index_file::{
-    INDEX_HEADER_BYTES, MESSAGE_INDEX_ENTRY_BYTES, OFFSET_INDEX_ENTRY_BYTES,
+    BATCH_INDEX_ENTRY_BYTES, INDEX_HEADER_BYTES, MESSAGE_INDEX_ENTRY_BYTES,
     OPERATION_INDEX_ENTRY_BYTES, decode_segment_index, encode_segment_index, index_digest,
 };
 use crate::{
-    IndexSource, MessageIndexEntry, OffsetIndexEntry, OperationIndexEntry, OperationLocation,
-    RecordLocation, ScheduleIndexEntry, SegmentIndexImage, test_io::Scheduling,
+    BatchIndexEntry, IndexSource, MessageRow, OperationIndexEntry, OperationLocation,
+    ScheduleIndexEntry, SegmentIndexImage, test_io::Scheduling,
 };
 use ozzy_core::state::PendingSchedule;
 use ozzy_journal::operation::ReleaseKey;
@@ -23,7 +23,7 @@ fn fixture(count: usize) -> (Vec<u8>, SegmentIndexImage) {
         last_op_number: count as u64,
         last_operation_digest: Digest::from_bytes([3; 32]),
     };
-    let mut offsets = Vec::new();
+    let mut batches = Vec::new();
     let mut messages = Vec::new();
     let mut operations = Vec::new();
     let mut schedules = Vec::new();
@@ -36,21 +36,16 @@ fn fixture(count: usize) -> (Vec<u8>, SegmentIndexImage) {
             operation_digest: source.last_operation_digest,
         };
         let id = (index as u128 + 1).to_be_bytes();
-        offsets.push(OffsetIndexEntry {
+        batches.push(BatchIndexEntry {
+            first_offset: Offset::new(index as u64),
             append_timestamp_millis: 0,
-            partition,
-            offset: Offset::new(index as u64),
-            location: RecordLocation {
-                operation: location,
-                batch_index: 0,
-                record_index: 0,
-            },
+            op_number: location.op_number,
+            batch_index: 0,
+            records: 1,
         });
-        messages.push(MessageIndexEntry {
-            partition,
+        messages.push(MessageRow {
             message_id: MessageId::from_bytes(id),
             offset: Offset::new(index as u64),
-            operation_digest: location.operation_digest,
         });
         operations.push(OperationIndexEntry {
             operation_id: OperationId::from_bytes(id),
@@ -76,7 +71,8 @@ fn fixture(count: usize) -> (Vec<u8>, SegmentIndexImage) {
         source,
         64 * 1024,
         crate::IndexEntries {
-            offsets,
+            partition: Some(partition),
+            batches,
             messages,
             operations,
             locations,
@@ -113,24 +109,23 @@ fn cooperative_index_open_preserves_every_lookup_and_yields_within_each_table() 
         let view = result.unwrap();
         assert_eq!(view.source(), image.source());
         assert_eq!(view.build_memory_limit(), image.build_memory_limit());
-        assert_eq!(view.offset_count(), count);
+        assert_eq!(view.batch_count(), count);
         assert_eq!(view.message_count(), count);
         assert_eq!(view.operation_count(), count);
-        assert!(polls > (6 * count - 3) / 64);
-        for ((offset, message), operation) in image
-            .offsets()
+        assert!(polls > (6 * count - 3) / 1024);
+        let partition = image.partition().unwrap();
+        for ((batch, message), operation) in image
+            .batches()
             .iter()
             .zip(image.messages())
             .zip(image.operations())
         {
-            assert_eq!(
-                view.find_offset(offset.partition, offset.offset),
-                Some(*offset)
-            );
-            assert_eq!(
-                view.find_message(message.partition, message.message_id),
-                Some(*message)
-            );
+            let offset = view.find_offset(partition, batch.first_offset);
+            assert!(offset.is_some());
+            assert_eq!(offset, image.find_offset(partition, batch.first_offset));
+            let found = view.find_message(partition, message.message_id);
+            assert!(found.is_some());
+            assert_eq!(found, image.find_message(partition, message.message_id));
             assert_eq!(
                 view.find_operation(operation.operation_id),
                 Some(*operation)
@@ -176,11 +171,16 @@ fn rejects(bytes: &[u8], expected: &IndexFileError) {
 fn cooperative_index_open_refuses_late_table_corruption_even_with_a_valid_checksum() {
     let count = 130;
     let (original, _) = fixture(count);
-    let message_start = INDEX_HEADER_BYTES + count * OFFSET_INDEX_ENTRY_BYTES;
+    let message_start = INDEX_HEADER_BYTES + count * BATCH_INDEX_ENTRY_BYTES;
     let operation_start = message_start + count * MESSAGE_INDEX_ENTRY_BYTES;
     for (start, width, key, kind) in [
-        (INDEX_HEADER_BYTES, OFFSET_INDEX_ENTRY_BYTES, 24, "offset"),
-        (message_start, MESSAGE_INDEX_ENTRY_BYTES, 40, "message"),
+        (INDEX_HEADER_BYTES, BATCH_INDEX_ENTRY_BYTES, 8, "batch"),
+        (
+            message_start,
+            MESSAGE_INDEX_ENTRY_BYTES,
+            MESSAGE_INDEX_ENTRY_BYTES,
+            "message",
+        ),
         (
             operation_start,
             OPERATION_INDEX_ENTRY_BYTES,
@@ -193,20 +193,41 @@ fn cooperative_index_open_refuses_late_table_corruption_even_with_a_valid_checks
         bytes.copy_within(last - width..last - width + key, last);
         repair_digest(&mut bytes);
         rejects(&bytes, &IndexFileError::UnsortedOrDuplicate(kind));
-        let mut bytes = original.clone();
-        if kind == "offset" {
-            // Timestamp bytes belong only to batch heads.
-            bytes[last + 84..last + 88].copy_from_slice(&1u32.to_be_bytes());
+        // Message rows have no reserved bytes.
+        if kind != "message" {
+            let mut bytes = original.clone();
+            bytes[last + width - 1] = 1;
+            repair_digest(&mut bytes);
+            rejects(&bytes, &IndexFileError::NonZeroReserved);
         }
-        bytes[last + width - 1] = 1;
-        repair_digest(&mut bytes);
-        rejects(&bytes, &IndexFileError::NonZeroReserved);
     }
     let mut bytes = original.clone();
     let last_message = message_start + (count - 1) * MESSAGE_INDEX_ENTRY_BYTES;
-    bytes[last_message + 32..last_message + 40].copy_from_slice(&9999u64.to_be_bytes());
+    bytes[last_message + 16..last_message + 20].copy_from_slice(&9999u32.to_be_bytes());
     repair_digest(&mut bytes);
-    rejects(&bytes, &IndexFileError::MissingOffsetEntry);
+    rejects(&bytes, &IndexFileError::MissingBatchEntry);
+    let last_batch = message_start - BATCH_INDEX_ENTRY_BYTES;
+    // Batch rows count records and name an operation of this source.
+    for (at, value, expected) in [
+        (24, 2u32, IndexFileError::RecordIndexCountMismatch),
+        (24, 0, IndexFileError::InvalidLocation),
+        (16, count as u32, IndexFileError::InvalidLocation),
+        (16, 0, IndexFileError::UnsortedOrDuplicate("batch")),
+    ] {
+        let mut bytes = original.clone();
+        bytes[last_batch + at..last_batch + at + 4].copy_from_slice(&value.to_be_bytes());
+        repair_digest(&mut bytes);
+        rejects(&bytes, &expected);
+    }
+    // The header's record range must match the batch rows.
+    let mut bytes = original.clone();
+    bytes[312..320].copy_from_slice(&1u64.to_be_bytes());
+    repair_digest(&mut bytes);
+    rejects(&bytes, &IndexFileError::InvalidRecordRange);
+    let mut bytes = original.clone();
+    bytes[320..336].fill(0);
+    repair_digest(&mut bytes);
+    rejects(&bytes, &IndexFileError::InvalidRecordRange);
     let mut bytes = original.clone();
     let last_operation = operation_start + (count - 1) * OPERATION_INDEX_ENTRY_BYTES;
     bytes[last_operation + 16..last_operation + 24].copy_from_slice(&0u64.to_be_bytes());
@@ -223,7 +244,7 @@ fn numeric_operation_table_refuses_gaps_and_conflicting_coordinates() {
     let (original, _) = fixture(count);
     let start = INDEX_HEADER_BYTES
         + count
-            * (OFFSET_INDEX_ENTRY_BYTES + MESSAGE_INDEX_ENTRY_BYTES + OPERATION_INDEX_ENTRY_BYTES);
+            * (BATCH_INDEX_ENTRY_BYTES + MESSAGE_INDEX_ENTRY_BYTES + OPERATION_INDEX_ENTRY_BYTES);
     for (field, value) in [(0, 17u64), (8, 4096u64), (16, 200u64)] {
         let mut bytes = original.clone();
         let at = start + 64 * super::super::OPERATION_LOCATION_BYTES + field;
@@ -247,7 +268,7 @@ fn cooperative_index_open_cancellation_and_limits_never_expose_partial_tables() 
     let before = bytes.clone();
     // First turn hashes a partial file. Later turns validate complete checksum
     // but only a prefix of the tables. Neither permits an index to escape.
-    for cut in [1, 2, 3, 64] {
+    for cut in [1, 2, 3, 16] {
         let mut future = Box::pin(decode_segment_index_async(&bytes, IndexLimits::default()));
         let scheduling = Arc::new(Scheduling::default());
         for _ in 0..cut {
@@ -263,7 +284,7 @@ fn cooperative_index_open_cancellation_and_limits_never_expose_partial_tables() 
             ..IndexLimits::default()
         },
         IndexLimits {
-            max_offset_entries: 2999,
+            max_batch_entries: 2999,
             ..IndexLimits::default()
         },
         IndexLimits {
@@ -283,7 +304,7 @@ fn cooperative_index_open_cancellation_and_limits_never_expose_partial_tables() 
         );
     }
     let (result, polls) = run(decode_segment_index_async(&bytes, IndexLimits::default()));
-    assert!(polls > 64);
+    assert!(polls > 16);
     assert_eq!(result.unwrap().operation_count(), 3000);
     for length in [
         0,
@@ -355,20 +376,23 @@ fn native_index_open_drives_cooperative_validation_after_owned_file_reads() {
     .unwrap();
     assert_eq!(opened.as_bytes(), bytes);
     assert_eq!(opened.operation_count(), 3000);
+    let partition = image.partition().unwrap();
+    assert!(image.find_offset(partition, Offset::new(2999)).is_some());
     assert_eq!(
-        opened.find_offset(image.offsets()[2999].partition, Offset::new(2999)),
-        Some(image.offsets()[2999])
+        opened.find_offset(partition, Offset::new(2999)),
+        image.find_offset(partition, Offset::new(2999))
     );
 }
 
 #[test]
 fn cooperative_index_construction_sorts_all_tables_and_builds_identical_read_runs() {
-    let (bytes, image) = fixture(130);
+    let (bytes, image) = fixture(3000);
     let (actual, polls) = run(SegmentIndexImage::new_async(
         image.source(),
         image.build_memory_limit(),
         crate::IndexEntries {
-            offsets: image.offsets().iter().rev().copied().collect(),
+            partition: image.partition(),
+            batches: image.batches().iter().rev().copied().collect(),
             messages: image.messages().iter().rev().copied().collect(),
             operations: image.operations().iter().rev().copied().collect(),
             locations: image.locations().iter().rev().copied().collect(),
@@ -378,12 +402,13 @@ fn cooperative_index_construction_sorts_all_tables_and_builds_identical_read_run
     assert!(polls > 10);
     assert_eq!(actual.unwrap(), image);
     let mut messages = image.messages().to_vec();
-    messages[129].offset = Offset::new(9999);
+    messages[2999].offset = Offset::new(9999);
     let (invalid, polls) = run(SegmentIndexImage::new_async(
         image.source(),
         0,
         crate::IndexEntries {
-            offsets: image.offsets().to_vec(),
+            partition: image.partition(),
+            batches: image.batches().to_vec(),
             messages,
             operations: image.operations().to_vec(),
             locations: image.locations().to_vec(),
@@ -391,7 +416,7 @@ fn cooperative_index_construction_sorts_all_tables_and_builds_identical_read_run
         },
     ));
     assert!(polls > 1);
-    assert_eq!(invalid.unwrap_err(), IndexFileError::MissingOffsetEntry);
+    assert_eq!(invalid.unwrap_err(), IndexFileError::MissingBatchEntry);
     let (persisted, _) = run(crate::SegmentIndex::from_bytes_async(
         bytes,
         image.source(),
@@ -402,10 +427,11 @@ fn cooperative_index_construction_sorts_all_tables_and_builds_identical_read_run
         run(crate::active_read_index::ActiveReadIndex::from_persisted_async(&persisted));
     let read = read.unwrap();
     assert!(polls > 1);
-    for offset in image.offsets() {
+    let partition = image.partition().unwrap();
+    for batch in image.batches() {
         assert_eq!(
-            read.entry(offset.partition, offset.offset).unwrap(),
-            *offset
+            read.entry(partition, batch.first_offset).ok(),
+            image.find_offset(partition, batch.first_offset)
         );
     }
 }

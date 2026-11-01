@@ -16,6 +16,9 @@ struct Lane {
     partition: usize,
     /// Verified records. Leads `counts.total` while timings wait for a flush.
     verified: u64,
+    /// Held records that arrived before their due time, within the tolerance.
+    early: u64,
+    max_early: u64,
 }
 
 /// A verified record whose completion time is read later.
@@ -35,6 +38,8 @@ pub(in crate::bench::timed) struct Oracle {
     /// this delay, which their due time never precedes. The window, pacing
     /// plan, and so the latency cohort move with it.
     delay: u64,
+    /// How far before its due time a held record may arrive by this clock.
+    due_tolerance: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -103,6 +108,8 @@ impl Oracle {
                 plan,
                 partition: config.feed_partition(lane, count),
                 verified: 0,
+                early: 0,
+                max_early: 0,
             }));
         }
         let offsets = (0..count)
@@ -114,6 +121,7 @@ impl Oracle {
             copy,
             untimed: Vec::new(),
             delay,
+            due_tolerance: config.due_tolerance_ns(),
         })
     }
 
@@ -197,18 +205,26 @@ impl Oracle {
     }
 
     fn time(&mut self, record: Untimed, completed: u64) -> Result<()> {
-        if completed < record.start && self.delay != 0 {
-            return Err(error("reader saw a held record before its due time"));
-        }
-        let counts = &mut self
+        let lane = self
             .lanes
             .get_mut(record.lane)
             .and_then(Option::as_mut)
-            .ok_or_else(|| error("reader returned an unknown writer"))?
-            .counts;
+            .ok_or_else(|| error("reader returned an unknown writer"))?;
+        let mut finished = completed;
+        if completed < record.start && self.delay != 0 {
+            let early = record.start - completed;
+            if early > self.due_tolerance {
+                return Err(error(format!(
+                    "reader saw a held record {early} ns before its due time"
+                )));
+            }
+            lane.early += 1;
+            lane.max_early = lane.max_early.max(early);
+            finished = record.start;
+        }
         match record.due {
-            Some(due) => counts.scheduled_complete(due, record.start, completed),
-            None => counts.complete(record.start, completed, 1),
+            Some(due) => lane.counts.scheduled_complete(due, record.start, finished),
+            None => lane.counts.complete(record.start, finished, 1),
         }
     }
 
@@ -262,6 +278,8 @@ impl Oracle {
                     let mut row = state.counts.report(lane);
                     row["copy"] = json!(self.copy);
                     row["partition"] = json!(state.partition);
+                    row["early_held_records"] = json!(state.early);
+                    row["max_early_held_ns"] = json!(state.max_early);
                     row
                 })
             })

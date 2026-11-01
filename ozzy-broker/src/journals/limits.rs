@@ -46,7 +46,7 @@ impl Settings {
         let checkpoint =
             checkpoint_limits(placement, sizes).map_err(|failure| error(&failure.to_string()))?;
         let index = IndexBuildLimits {
-            max_entry_buffer_bytes: sizes.chunk,
+            max_entry_buffer_bytes: INDEX_ENTRY_BUFFER_BYTES,
             max_merge_fan_in: 8,
             max_resident_bytes: 0,
             ..IndexBuildLimits::default()
@@ -147,6 +147,11 @@ pub fn check_partition_limits(
     Ok(())
 }
 
+/// Sorted index entries one build holds before it writes a staging run. A segment
+/// of small records has far more entry bytes than a physical transfer holds, and
+/// each run is a file that later merges must read and rewrite.
+const INDEX_ENTRY_BUFFER_BYTES: usize = 1024 * 1024;
+
 /// Checked write path sizes of one partition, from its topic and its share of
 /// the device lane.
 #[derive(Debug, Clone, Copy)]
@@ -154,7 +159,7 @@ struct Sizes {
     operations: usize,
     body: usize,
     segment: usize,
-    /// Physical transfer size, also the index entry buffer.
+    /// Physical transfer size.
     chunk: usize,
     /// Directory entries one listing may return.
     directory_entries: usize,

@@ -6,9 +6,9 @@ mod workspace;
 
 use super::{
     INDEX_DIGEST_START, INDEX_HASH_CONTEXT, INDEX_HEADER_BYTES, IndexBuildError, IndexBuildLimits,
-    IndexCounts, IndexFileError, IndexLimits, IndexSource, OperationLimits, PendingRuns, RunKind,
-    SegmentIndex, calculate_index_layout, derive_index_entries, encode_index_header,
-    segment_index_name, validate_build_limits,
+    IndexCounts, IndexFileError, IndexLimits, IndexSource, OperationLimits, OrderedRun,
+    PendingRuns, RowBase, RunKind, SectionRuns, SegmentIndex, calculate_index_layout,
+    derive_index_entries, encode_index_header, segment_index_name, validate_build_limits,
 };
 use crate::async_files::Access;
 use ozzy_io::{OpenMode, Operation, SyncMode};
@@ -35,6 +35,7 @@ pub(crate) struct Builder {
 /// Merged section runs in file order, with their entry counts.
 struct Merged {
     counts: IndexCounts,
+    base: RowBase,
     runs: [Option<PathBuf>; 5],
 }
 
@@ -89,7 +90,7 @@ impl Builder {
             self.io,
         )
         .await?;
-        let pending = self.stage(groups, limits, &mut workspace).await?;
+        let pending = self.stage(groups, source, limits, &mut workspace).await?;
         let (temporary, merged) =
             merge_sections(pending, limits.max_merge_fan_in, &mut workspace).await?;
         self.write_complete(temporary.clone(), source, limits, merged)
@@ -121,12 +122,15 @@ impl Builder {
     async fn stage(
         &self,
         mut groups: Box<crate::directory::asynchronous::groups::Groups>,
+        source: IndexSource,
         limits: IndexBuildLimits,
         workspace: &mut Workspace,
     ) -> Result<PendingRuns, crate::DirectoryError> {
         let mut pending = PendingRuns::new(
+            source.first_op_number,
             limits.max_entry_buffer_bytes,
             limits.max_run_files,
+            limits.max_merge_fan_in,
             limits.file,
         );
         let header = groups.header().clone();
@@ -239,7 +243,7 @@ impl Builder {
         path: PathBuf,
         source: IndexSource,
         limits: IndexBuildLimits,
-        Merged { counts, runs }: Merged,
+        Merged { counts, base, runs }: Merged,
     ) -> Result<(), IndexBuildError> {
         let layout = calculate_index_layout(counts, limits.file)?;
         let file = self
@@ -247,8 +251,13 @@ impl Builder {
             .open(path, OpenMode::CreateNew, false, false)
             .await?;
         let mut writer = Output::new(&self.access, &file, self.io.chunk_bytes);
-        let header =
-            encode_index_header(source, limits.max_entry_buffer_bytes as u64, counts, layout)?;
+        let header = encode_index_header(
+            source,
+            limits.max_entry_buffer_bytes as u64,
+            base,
+            counts,
+            layout,
+        )?;
         let mut hasher = IntegrityHasher::new(INDEX_HASH_CONTEXT);
         hasher.update(&header);
         writer.push(&header).await?;
@@ -317,21 +326,34 @@ async fn merge_sections(
     fan_in: usize,
     workspace: &mut Workspace,
 ) -> Result<(PathBuf, Merged), IndexBuildError> {
-    let offsets = merge_all(pending.offset_runs, RunKind::Offset, fan_in, workspace).await?;
-    let messages = merge_all(pending.message_runs, RunKind::Message, fan_in, workspace).await?;
+    let batches = pending.batch_run.finish(&workspace.access).await?;
+    let messages = merge_all(
+        pending.message_runs.paths,
+        RunKind::Message,
+        fan_in,
+        workspace,
+    )
+    .await?;
     let operations = merge_all(
-        pending.operation_runs,
+        pending.operation_runs.paths,
         RunKind::Operation,
         fan_in,
         workspace,
     )
     .await?;
-    let locations = merge_all(pending.location_runs, RunKind::Location, fan_in, workspace).await?;
+    let locations = pending.location_run.finish(&workspace.access).await?;
     let temporary = workspace.reserve("complete.idx".into())?;
-    let schedules = merge_all(pending.schedule_runs, RunKind::Schedule, fan_in, workspace).await?;
+    let schedules = merge_all(
+        pending.schedule_runs.paths,
+        RunKind::Schedule,
+        fan_in,
+        workspace,
+    )
+    .await?;
     let merged = Merged {
         counts: pending.counts,
-        runs: [offsets, messages, operations, locations, schedules],
+        base: pending.base,
+        runs: [batches, messages, operations, locations, schedules],
     };
     Ok((temporary, merged))
 }

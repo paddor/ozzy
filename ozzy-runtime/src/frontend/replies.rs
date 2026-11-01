@@ -1,11 +1,15 @@
 use crate::transport::Frames;
 
+use bytes::Bytes;
 use omq_tokio::{Message, TrySendError};
 use ozzy_proto::{EnvelopeLimits, NodeId, Opcode, decode_packet};
 
 use super::{Dispatcher, SetupError, dispatch::Peer};
 use crate::dispatch::Class;
 use crate::replica_transport::{QueueLimits, SendAttempt};
+
+/// Largest control frame copied at socket admission.
+const CONTROL_COPY_BYTES: usize = 4096;
 
 /// Per-peer queued frame bounds. Full backing allocations remain the payload
 /// owner's responsibility; queued slices can retain larger allocations.
@@ -269,7 +273,11 @@ fn flush_class(
     class: usize,
     try_send: &mut impl FnMut(Message) -> Result<(), TrySendError>,
 ) -> Result<SendAttempt, omq_tokio::Error> {
-    let attempt = peer.replies[class].flush(try_send)?;
+    let attempt = if class == index(Class::Control) {
+        peer.replies[class].flush(&mut |message| send_control(message, try_send))?
+    } else {
+        peer.replies[class].flush(try_send)?
+    };
     match attempt {
         SendAttempt::Submitted => {
             crate::profiling::event(crate::profiling::Event::DispatcherReplySent);
@@ -285,6 +293,25 @@ fn flush_class(
         SendAttempt::Idle | SendAttempt::Unroutable => {}
     }
     Ok(attempt)
+}
+
+/// Give OMQ a copy of a small control frame. OMQ keeps what it queued for a
+/// stalled peer until that peer reads it, and an alias would hold the shard's
+/// small control budget for that long, stopping votes and replies to every
+/// other peer. The socket's message bound still limits the copies. A refused
+/// frame stays the original, so its charge lasts until it is sent.
+fn send_control(
+    message: Message,
+    try_send: &mut impl FnMut(Message) -> Result<(), TrySendError>,
+) -> Result<(), TrySendError> {
+    if message.byte_len() > CONTROL_COPY_BYTES {
+        return try_send(message);
+    }
+    let copy = Message::multipart(message.slices().map(Bytes::copy_from_slice));
+    match try_send(copy) {
+        Err(TrySendError::Full(_)) => Err(TrySendError::Full(message)),
+        result => result,
+    }
 }
 
 const fn index(class: Class) -> usize {

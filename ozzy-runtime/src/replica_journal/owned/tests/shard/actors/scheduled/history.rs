@@ -151,7 +151,7 @@ fn history_fixture(controller: &mut Controller, io: &Local) -> (Vec<Scheduled>, 
     (actors, now)
 }
 
-fn fetch_message(request: wire::FetchOps) -> Message {
+pub(super) fn fetch_message(request: wire::FetchOps) -> Message {
     let mut metadata = [0; 1024];
     let encoded = wire::encode_fetch(
         NodeId::from_bytes([3; 16]),

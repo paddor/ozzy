@@ -1,20 +1,54 @@
 //! Journal-side record sources for reads: active and sealed segment sources,
 //! index scans, and extent readers.
 
-use super::{ActiveReadIndex, Journal, Scope, Source, index_error, validate_operation_bodies};
+use super::{
+    ActiveReadIndex, Cache, Journal, Scope, Source, index_error, validate_operation_bodies,
+};
 use crate::JournalIndexError as Error;
 use crate::async_files::Access;
 use crate::directory::asynchronous::active_segment;
 use crate::reader::asynchronous::ExtentReader;
 use crate::{
-    ActiveSegmentIndex, DirectoryError, IndexBuildLimits, IndexSource, IndexedRecord,
-    JournalLimits, LogPosition, OffsetIndexEntry, SegmentScan, TailState,
+    ActiveSegmentIndex, DecodedOperation, DirectoryError, IndexBuildError, IndexBuildLimits,
+    IndexSource, IndexedRecord, JournalLimits, LogPosition, OffsetIndexEntry, OperationLocation,
+    SegmentScan, TailState,
 };
 use ozzy_io::{OpenMode, Operation};
 use ozzy_journal::ReadLimits;
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 impl Journal {
+    /// The sealed segment holding operation `number`, if one is retained.
+    pub(super) fn sealed_segment_holding(&self, number: u64) -> Option<u64> {
+        let segments = &self.manifest.segments;
+        let after = segments.partition_point(|r| r.first_chain.next_op_number() <= number);
+        if after == segments.len() {
+            return None;
+        }
+        Some(segments[after.checked_sub(1)?].segment_id)
+    }
+
+    /// Read and verify the operation at `location`.
+    pub(super) async fn read_operation_at(
+        &self,
+        source: Source,
+        location: OperationLocation,
+    ) -> Result<DecodedOperation<'static>, Error> {
+        let _lease = self
+            .pins
+            .protect_prepared_segment(source.index.segment_id)
+            .map_err(DirectoryError::from)?;
+        let path = self
+            .root()
+            .join("segments")
+            .join(source.reference.file_name());
+        Ok(extent_reader(&self.access, path, source.index, self.limits)
+            .operation(location)
+            .await?)
+    }
+
     pub(super) fn record_source(&self) -> Result<Option<Source>, Error> {
         self.healthy()?;
         let reference = *active_segment(&self.manifest.segments)?;
@@ -146,6 +180,50 @@ impl Journal {
             promised_view: self.manifest.promised_view,
         }
     }
+}
+
+/// One sealed segment's selectors, from its published index or, before that
+/// exists, a scan of the segment.
+pub(super) async fn load_index(
+    scope: &Scope,
+    source: Source,
+    limits: IndexBuildLimits,
+) -> Result<ActiveReadIndex, Error> {
+    let loaded = crate::index_builder::asynchronous::open(
+        &scope.access,
+        scope
+            .root
+            .join("indexes")
+            .join(crate::segment_index_name(source.index)),
+        source.index,
+        limits.file,
+        scope.limits.io.chunk_bytes,
+    )
+    .await;
+    match loaded {
+        Ok(index) => ActiveReadIndex::from_persisted_async(&index)
+            .await
+            .map_err(index_error),
+        Err(IndexBuildError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            scan_index(scope, source, limits).await
+        }
+        Err(error) => Err(DirectoryError::from(error).into()),
+    }
+}
+
+/// `source`'s selectors from the cold cache, or loaded and offered to it.
+pub(super) async fn cached_index(
+    scope: &Scope,
+    cold: &RefCell<Cache>,
+    limits: IndexBuildLimits,
+    source: Source,
+) -> Result<Rc<ActiveReadIndex>, Error> {
+    if let Some(index) = cold.borrow().find(source.index) {
+        return Ok(index);
+    }
+    let index = Rc::new(load_index(scope, source, limits).await?);
+    cold.borrow_mut().remember(index.clone());
+    Ok(index)
 }
 
 pub(super) async fn scan_index(

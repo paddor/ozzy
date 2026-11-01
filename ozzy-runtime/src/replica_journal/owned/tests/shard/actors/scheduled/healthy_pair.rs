@@ -9,6 +9,8 @@ use bytes::Bytes;
 use ozzy_proto::Opcode;
 use std::collections::VecDeque;
 
+mod retired_base;
+
 #[test]
 fn lagging_follower_catches_up_after_the_other_follower_stops() {
     for lagging in [2, 12] {
@@ -244,6 +246,8 @@ struct Transport {
     stopped: Option<usize>,
     /// Sends to the stopped actor find a full queue instead of vanishing.
     refusing: bool,
+    /// Receivers whose data waits unread in their lanes.
+    held: Vec<usize>,
     lanes: [VecDeque<Message>; 3],
 }
 
@@ -286,6 +290,9 @@ impl Transport {
         for (to, lane) in self.lanes.iter_mut().enumerate() {
             if Some(to) == self.stopped {
                 lane.clear();
+                continue;
+            }
+            if self.held.contains(&to) {
                 continue;
             }
             while let Some(message) = lane.front() {
@@ -449,11 +456,18 @@ impl Cluster {
 
     /// Confirm one single-operation proposal through `leader`.
     fn propose(&mut self, leader: usize, body: u8, context: &str) {
+        self.submit(leader, &format!("{context}: proposal {body}"), |buffer| {
+            buffer
+                .push(ozzy_journal::operation::OperationKind::Barrier, &[body; 16])
+                .unwrap();
+        });
+    }
+
+    /// Confirm the proposal `fill` writes through `leader`.
+    fn submit(&mut self, leader: usize, context: &str, fill: impl FnOnce(&mut ProposalBuffer)) {
         let mut buffer = self.buffers[leader].take().unwrap();
         buffer.clear();
-        buffer
-            .push(ozzy_journal::operation::OperationKind::Barrier, &[body; 16])
-            .unwrap();
+        fill(&mut buffer);
         let mut pending = Box::pin(self.lanes[leader].try_submit(buffer).unwrap());
         let mut reply = None;
         self.run_until(|_| {
@@ -463,7 +477,7 @@ impl Cluster {
             reply.is_some()
         });
         let Some(reply) = reply else {
-            panic!("{context}: proposal {body} stalled: {:#?}", self.statuses());
+            panic!("{context} stalled: {:#?}", self.statuses());
         };
         assert!(
             matches!(reply.outcome, ProposalOutcome::Committed { .. }),

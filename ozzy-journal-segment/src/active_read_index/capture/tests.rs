@@ -34,6 +34,7 @@ fn index() -> ActiveReadIndex {
             last_op_number: 3,
             last_operation_digest: Digest::from_bytes([3; 32]),
         },
+        recordless: Vec::new(),
         partitions: ahash::AHashMap::from([(
             partition(),
             vec![

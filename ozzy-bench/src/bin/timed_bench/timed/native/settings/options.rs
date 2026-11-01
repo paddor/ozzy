@@ -34,6 +34,11 @@ pub(in crate::bench) struct Options {
     /// Held records per partition before admission backs off.
     #[arg(long, requires = "delay_millis", value_parser = clap::value_parser!(u64).range(1..))]
     pub(in crate::bench::timed) delay_max_entries: Option<u64>,
+    /// How far before its due time, by the reader's clock, a held record may
+    /// arrive. The leader's clock decides release, so across hosts this must
+    /// cover their clock difference. Default: 0.
+    #[arg(long, requires = "delay_millis", value_parser = clap::value_parser!(u64).range(1..=1_000))]
+    pub(in crate::bench::timed) due_tolerance_millis: Option<u64>,
     /// Per-partition retention byte target in MiB; omitted keeps all history.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub(in crate::bench::timed) retention_mib: Option<u64>,
@@ -99,6 +104,7 @@ impl Default for Options {
             dedup_max_entries: None,
             dedup_max_bytes: None,
             delay_millis: None,
+            due_tolerance_millis: None,
             delay_max_entries: None,
         }
     }
@@ -156,6 +162,11 @@ impl Options {
         push_flag(arguments, "--dedup-max-bytes", self.dedup_max_bytes);
         push_flag(arguments, "--delay-millis", self.delay_millis);
         push_flag(arguments, "--delay-max-entries", self.delay_max_entries);
+        push_flag(
+            arguments,
+            "--due-tolerance-millis",
+            self.due_tolerance_millis,
+        );
         push_flag(arguments, "--retention-mib", self.retention_mib);
         push_flag(arguments, "--partitions", self.partitions);
         push_flag(

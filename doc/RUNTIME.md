@@ -72,6 +72,9 @@ flowchart LR
 - A duplicate retry is checked against the original attempt's persisted
   fingerprint, without the original payload or a dedup window. It returns
   the original offsets after the confirmation boundary.
+- A retry check reads one operation through the partition's read selectors. A
+  new leader loads the newest sealed segment's selectors once. A stored record
+  older than that still falls back to a full index snapshot.
 
 ### SDK protocol batching
 
@@ -272,6 +275,9 @@ On the broker:
 - A reply to a full destination waits for that destination's send progress.
   Later replies to it keep their order. Other destinations continue.
 - Dequeue frees a queue slot. Bytes return when the last payload alias drops.
+- Control frames up to 4 KiB reach OMQ as copies, so frames queued for a
+  stalled peer hold no shard budget. OMQ's per-peer queue bound limits them.
+- A publication the port refuses for one second drops. PEER repairs it.
 - OMQ provides fairness between connections inside each socket.
 
 On the SDK:

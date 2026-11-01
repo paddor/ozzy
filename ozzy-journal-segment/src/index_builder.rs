@@ -11,12 +11,12 @@ use ozzy_proto::{MessageId, Offset, OperationId, PartitionIncarnation};
 use thiserror::Error;
 
 use crate::index_file::{
-    INDEX_DIGEST_START, INDEX_HASH_CONTEXT, IndexCounts, calculate_index_layout,
+    INDEX_DIGEST_START, INDEX_HASH_CONTEXT, IndexCounts, RowBase, calculate_index_layout,
     encode_index_header,
 };
 use crate::{
-    INDEX_HEADER_BYTES, IndexError, IndexFileError, IndexLimits, IndexSource,
-    MESSAGE_INDEX_ENTRY_BYTES, MessageIndexEntry, OFFSET_INDEX_ENTRY_BYTES,
+    BATCH_INDEX_ENTRY_BYTES, BatchIndexEntry, INDEX_HEADER_BYTES, IndexError, IndexFileError,
+    IndexLimits, IndexSource, MESSAGE_INDEX_ENTRY_BYTES, MessageIndexEntry, MessageRow,
     OPERATION_INDEX_ENTRY_BYTES, OPERATION_LOCATION_BYTES, OffsetIndexEntry, OperationIndexEntry,
     OperationLocation, SCHEDULE_INDEX_ENTRY_BYTES, ScheduleIndexEntry, SegmentIndexView,
     derive_index_entries,
@@ -29,7 +29,7 @@ pub struct IndexBuildLimits {
     pub max_entry_buffer_bytes: usize,
     /// Maximum input runs opened by one merge.
     pub max_merge_fan_in: usize,
-    /// Maximum initial staging runs per index section.
+    /// Maximum staging runs one index section holds at once.
     pub max_run_files: usize,
     /// Bounds for final file counts and bytes.
     pub file: IndexLimits,
@@ -85,7 +85,7 @@ impl SegmentIndex {
             return Err(IndexBuildError::SourceMismatch);
         }
         let counts = IndexCounts {
-            offsets: view.offset_count(),
+            batches: view.batch_count(),
             messages: view.message_count(),
             operations: view.operation_count(),
             locations: view.location_count(),
@@ -102,12 +102,12 @@ impl SegmentIndex {
         self.view().source()
     }
 
-    /// Number of record-offset selectors.
-    pub fn offset_count(&self) -> usize {
-        self.view().offset_count()
+    /// Number of batch rows.
+    pub fn batch_count(&self) -> usize {
+        self.view().batch_count()
     }
 
-    /// Number of message-identity selectors.
+    /// Number of message rows, one per record.
     pub fn message_count(&self) -> usize {
         self.view().message_count()
     }
@@ -160,10 +160,6 @@ impl SegmentIndex {
         &self.bytes
     }
 
-    pub(crate) fn offsets(&self) -> impl ExactSizeIterator<Item = OffsetIndexEntry> + '_ {
-        self.view().offsets()
-    }
-
     pub(crate) fn operation_ids(&self) -> impl ExactSizeIterator<Item = OperationId> + '_ {
         self.view().operation_ids()
     }
@@ -187,50 +183,103 @@ pub fn segment_index_name(source: IndexSource) -> String {
     )
 }
 
+/// One section's staged runs, oldest first, and how many it has written.
+#[derive(Debug, Default)]
+struct SectionRuns {
+    paths: Vec<PathBuf>,
+    written: u64,
+}
+
+/// A section whose rows arrive in order: one file, extended at each flush.
+#[derive(Debug, Default)]
+struct OrderedRun {
+    path: Option<PathBuf>,
+    file: Option<ozzy_io::Handle>,
+    written: u64,
+    last_key: Vec<u8>,
+}
+
 #[derive(Debug)]
 struct PendingRuns {
     max_bytes: usize,
     max_runs: usize,
+    fan_in: usize,
     file_limits: IndexLimits,
     buffered_bytes: usize,
     counts: IndexCounts,
-    offsets: Vec<OffsetIndexEntry>,
-    messages: Vec<MessageIndexEntry>,
+    base: RowBase,
+    batches: Vec<BatchIndexEntry>,
+    messages: Vec<MessageRow>,
     operations: Vec<OperationIndexEntry>,
     locations: Vec<OperationLocation>,
     schedules: Vec<ScheduleIndexEntry>,
-    offset_runs: Vec<PathBuf>,
-    message_runs: Vec<PathBuf>,
-    operation_runs: Vec<PathBuf>,
-    location_runs: Vec<PathBuf>,
-    schedule_runs: Vec<PathBuf>,
+    batch_run: OrderedRun,
+    message_runs: SectionRuns,
+    operation_runs: SectionRuns,
+    location_run: OrderedRun,
+    schedule_runs: SectionRuns,
 }
 
 impl PendingRuns {
-    fn new(max_bytes: usize, max_runs: usize, file_limits: IndexLimits) -> Self {
+    fn new(
+        first_op_number: u64,
+        max_bytes: usize,
+        max_runs: usize,
+        fan_in: usize,
+        file_limits: IndexLimits,
+    ) -> Self {
         Self {
             max_bytes,
             max_runs,
+            fan_in,
             file_limits,
             buffered_bytes: 0,
             counts: IndexCounts {
-                offsets: 0,
+                batches: 0,
                 messages: 0,
                 operations: 0,
                 locations: 0,
                 schedules: 0,
             },
-            offsets: Vec::new(),
+            base: RowBase {
+                partition: None,
+                first_offset: 0,
+                first_op_number,
+            },
+            batches: Vec::new(),
             messages: Vec::new(),
             operations: Vec::new(),
             locations: Vec::new(),
             schedules: Vec::new(),
-            offset_runs: Vec::new(),
-            message_runs: Vec::new(),
-            operation_runs: Vec::new(),
-            location_runs: Vec::new(),
-            schedule_runs: Vec::new(),
+            batch_run: OrderedRun::default(),
+            message_runs: SectionRuns::default(),
+            operation_runs: SectionRuns::default(),
+            location_run: OrderedRun::default(),
+            schedule_runs: SectionRuns::default(),
         }
+    }
+
+    /// Adopt the first record's partition and offset, and check that `derived`
+    /// fits them. Every later row counts from these.
+    fn observe_records(
+        &mut self,
+        derived: &crate::DerivedIndexEntries,
+    ) -> Result<(), IndexBuildError> {
+        if let Some(partition) = derived.partition {
+            if *self.base.partition.get_or_insert(partition) != partition {
+                return Err(IndexFileError::MixedPartitions.into());
+            }
+            if let (0, Some(first)) = (self.counts.batches, derived.batches.first()) {
+                self.base.first_offset = first.first_offset.get();
+            }
+        }
+        for message in &derived.messages {
+            let delta = message.offset.get().checked_sub(self.base.first_offset);
+            if delta.and_then(|delta| u32::try_from(delta).ok()).is_none() {
+                return Err(IndexFileError::LengthOverflow.into());
+            }
+        }
+        Ok(())
     }
 
     fn requires_flush(
@@ -256,9 +305,10 @@ impl PendingRuns {
         if self.requires_flush(&derived)? {
             return Err(IndexBuildError::InvalidBuildLimits);
         }
+        self.observe_records(&derived)?;
         let next_counts = IndexCounts {
             locations: checked_add(self.counts.locations, 1)?,
-            offsets: checked_add(self.counts.offsets, derived.offsets.len())?,
+            batches: checked_add(self.counts.batches, derived.batches.len())?,
             messages: checked_add(self.counts.messages, derived.messages.len())?,
             operations: checked_add(
                 self.counts.operations,
@@ -272,7 +322,7 @@ impl PendingRuns {
             .buffered_bytes
             .checked_add(derived_bytes)
             .ok_or(IndexFileError::LengthOverflow)?;
-        self.offsets.extend(derived.offsets);
+        self.batches.extend(derived.batches);
         self.messages.extend(derived.messages);
         self.operations.extend(derived.operation);
         self.locations.push(derived.location);
@@ -283,7 +333,7 @@ impl PendingRuns {
 
 #[derive(Debug, Clone, Copy)]
 enum RunKind {
-    Offset,
+    Batch,
     Message,
     Operation,
     Location,
@@ -293,7 +343,7 @@ enum RunKind {
 impl RunKind {
     const fn width(self) -> usize {
         match self {
-            Self::Offset => OFFSET_INDEX_ENTRY_BYTES,
+            Self::Batch => BATCH_INDEX_ENTRY_BYTES,
             Self::Message => MESSAGE_INDEX_ENTRY_BYTES,
             Self::Operation => OPERATION_INDEX_ENTRY_BYTES,
             Self::Location => OPERATION_LOCATION_BYTES,
@@ -303,17 +353,16 @@ impl RunKind {
 
     const fn key_bytes(self) -> usize {
         match self {
-            Self::Offset => 24,
-            Self::Message => 40,
+            Self::Batch | Self::Location => 8,
+            Self::Message => MESSAGE_INDEX_ENTRY_BYTES,
             Self::Operation => 16,
-            Self::Location => 8,
             Self::Schedule => 44,
         }
     }
 
     const fn name(self) -> &'static str {
         match self {
-            Self::Offset => "offset",
+            Self::Batch => "batch",
             Self::Message => "message",
             Self::Operation => "operation",
             Self::Location => "location",
@@ -324,14 +373,14 @@ impl RunKind {
 
 fn derived_entry_bytes(entries: &crate::DerivedIndexEntries) -> Result<usize, IndexBuildError> {
     entries
-        .offsets
+        .batches
         .len()
-        .checked_mul(size_of::<OffsetIndexEntry>())
+        .checked_mul(size_of::<BatchIndexEntry>())
         .and_then(|total| {
             entries
                 .messages
                 .len()
-                .checked_mul(size_of::<MessageIndexEntry>())
+                .checked_mul(size_of::<MessageRow>())
                 .and_then(|bytes| total.checked_add(bytes))
         })
         .and_then(|total| {
@@ -351,9 +400,8 @@ fn derived_entry_bytes(entries: &crate::DerivedIndexEntries) -> Result<usize, In
 }
 
 fn validate_build_limits(limits: IndexBuildLimits) -> Result<(), IndexBuildError> {
-    let minimum = size_of::<OffsetIndexEntry>()
-        + size_of::<MessageIndexEntry>()
-        + size_of::<OperationLocation>();
+    let minimum =
+        size_of::<BatchIndexEntry>() + size_of::<MessageRow>() + size_of::<OperationLocation>();
     if limits.max_entry_buffer_bytes < minimum
         || limits.max_merge_fan_in < 2
         || limits.max_run_files == 0
@@ -362,7 +410,7 @@ fn validate_build_limits(limits: IndexBuildLimits) -> Result<(), IndexBuildError
     }
     calculate_index_layout(
         IndexCounts {
-            offsets: 0,
+            batches: 0,
             messages: 0,
             operations: 0,
             locations: 0,

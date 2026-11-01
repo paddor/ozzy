@@ -335,12 +335,18 @@ Use `process::soak::cross_host_single_crash_soak` for single durable.
 | `OZZY_SOAK_SECONDS` | Duration; default 3600 |
 | `OZZY_SOAK_IDENTITY` | Controller's `shared.identity` when the first broker is remote |
 | `OZZY_SOAK_MEMORY` | `1` runs memory-only brokers, see below |
+| `OZZY_SOAK_RATE` | Unique records per second, in larger packets; default is about 300/s at most, in small packets |
+| `OZZY_SOAK_MIX` | With a rate: `small` (0 B-1 KiB, default) or `large` (0 B-64 KiB, about 6 KiB mean) |
+| `OZZY_SOAK_FAULT` | `kill` (default), or `pause` to `SIGSTOP` a broker for 15 s |
+| `OZZY_SOAK_DEDUP` | With a rate: `1` adds a second producer repeating every record; the topic needs `deduplication` |
 
 - On separate hosts, brokers use core 0 and the SDK uses cores 4-5.
 - For three local processes, set all hosts to `si-dev` and use distinct
   directories and endpoints. Brokers then use cores 0, 1, and 2.
 - Single durable restarts its only broker before it waits for progress.
 - Process failure, or 30 seconds without progress, fails the run.
+- With a rate, the retention-gap check writes up to `max_bytes` plus two
+  segments of 1 KiB records. Set any dedup `max_entries` above that count.
 
 With `OZZY_SOAK_MEMORY=1`, copy the `ozzy_broker_config` test executable as
 `memory-broker` into every directory. Each broker then runs over TCP with

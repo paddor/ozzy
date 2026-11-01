@@ -331,6 +331,80 @@ fn owned_recovery_quarantine_rejects_unsupported_profile_before_marker_publicati
     drive(&mut controller, journal.shutdown()).unwrap();
 }
 
+/// A stopped store with three segments, and the broker that confirmed them.
+fn rolled_store(controller: &mut Controller, io: &Local) -> (OwnedConfig, Replica) {
+    let mut store = replica(controller, io.clone(), 0, 8192);
+    let mut other = replica(controller, io.clone(), 2, 8192);
+    for _ in 0..2 {
+        persist(controller, &mut store);
+        persist(controller, &mut other);
+        confirm(&mut store, &other);
+        let roll = store.journal.begin_roll(8).unwrap();
+        let done = drive(controller, roll.publish());
+        store.journal.complete_roll(done).unwrap();
+    }
+    let config = store.config.clone();
+    assert!(
+        controller
+            .image()
+            .exists(&config.root.join("segments/3.log"), false)
+    );
+    drive(controller, store.journal.shutdown()).unwrap();
+    (config, other)
+}
+
+/// A copy that keeps falling behind recovers again before it settles, so no
+/// retention turn gets to remove the history it replaced.
+#[test]
+fn owned_withdrawal_removes_the_history_it_replaces() {
+    let (mut controller, io) = setup();
+    let (config, other) = rolled_store(&mut controller, &io);
+    let (receiver, _) = drive(
+        &mut controller,
+        RecoveringJournal::start(
+            config.clone(),
+            io.clone(),
+            generations(50),
+            RecoveryOpen::Withdraw,
+        ),
+    )
+    .unwrap();
+    for old in ["1.log", "2.log", "3.log"] {
+        let path = config.root.join("segments").join(old);
+        assert!(!controller.image().exists(&path, false), "{old}");
+    }
+    assert!(
+        controller
+            .image()
+            .exists(&config.root.join("segments/4.log"), false)
+    );
+    drive(&mut controller, receiver.shutdown()).unwrap();
+    drive(&mut controller, other.journal.shutdown()).unwrap();
+}
+
+/// An operator quarantines a copy to look at it, so its files stay.
+#[test]
+fn owned_quarantine_keeps_the_history_it_replaces() {
+    let (mut controller, io) = setup();
+    let (config, other) = rolled_store(&mut controller, &io);
+    let (receiver, _) = drive(
+        &mut controller,
+        RecoveringJournal::start(
+            config.clone(),
+            io.clone(),
+            generations(50),
+            RecoveryOpen::Quarantine,
+        ),
+    )
+    .unwrap();
+    for old in ["1.log", "2.log", "3.log"] {
+        let path = config.root.join("segments").join(old);
+        assert!(controller.image().exists(&path, false), "{old}");
+    }
+    drive(&mut controller, receiver.shutdown()).unwrap();
+    drive(&mut controller, other.journal.shutdown()).unwrap();
+}
+
 #[test]
 fn owned_checkpoint_recovery_after_retirement_preserves_confirmed_anchor_and_accepted_tail() {
     let (mut controller, io) = setup();

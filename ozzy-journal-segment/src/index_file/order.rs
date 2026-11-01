@@ -1,47 +1,26 @@
 //! Row order: sort keys, comparisons, section searches, and order checks.
 
-use super::{
-    IndexFileError, MESSAGE_INDEX_ENTRY_BYTES, OFFSET_INDEX_ENTRY_BYTES, SCHEDULE_INDEX_ENTRY_BYTES,
-};
+use super::{IndexFileError, SCHEDULE_INDEX_ENTRY_BYTES};
 use crate::{
-    MessageIndexEntry, OffsetIndexEntry, OperationIndexEntry, OperationLocation, ScheduleIndexEntry,
+    BatchIndexEntry, MessageRow, OperationIndexEntry, OperationLocation, ScheduleIndexEntry,
 };
 use ozzy_journal::operation::ReleaseKey;
+use ozzy_proto::PartitionIncarnation;
 use ozzy_proto::layout::Fixed;
-use ozzy_proto::{MessageId, Offset, PartitionIncarnation};
 use std::cmp::Ordering;
 
 pub(crate) fn compare_locations(left: &OperationLocation, right: &OperationLocation) -> Ordering {
     left.op_number.cmp(&right.op_number)
 }
 
-pub(crate) fn compare_offset_entries(
-    left: &OffsetIndexEntry,
-    right: &OffsetIndexEntry,
-) -> Ordering {
-    compare_partition_offset(left.partition, left.offset, right.partition, right.offset)
+pub(crate) fn compare_batch_entries(left: &BatchIndexEntry, right: &BatchIndexEntry) -> Ordering {
+    left.first_offset.cmp(&right.first_offset)
 }
 
-pub(super) fn compare_partition_offset(
-    left_partition: PartitionIncarnation,
-    left_offset: Offset,
-    right_partition: PartitionIncarnation,
-    right_offset: Offset,
-) -> Ordering {
-    left_partition
+pub(crate) fn compare_message_rows(left: &MessageRow, right: &MessageRow) -> Ordering {
+    left.message_id
         .as_bytes()
-        .cmp(right_partition.as_bytes())
-        .then_with(|| left_offset.get().cmp(&right_offset.get()))
-}
-
-pub(crate) fn compare_message_entries(
-    left: &MessageIndexEntry,
-    right: &MessageIndexEntry,
-) -> Ordering {
-    left.partition
-        .as_bytes()
-        .cmp(right.partition.as_bytes())
-        .then_with(|| left.message_id.as_bytes().cmp(right.message_id.as_bytes()))
+        .cmp(right.message_id.as_bytes())
         .then_with(|| left.offset.cmp(&right.offset))
 }
 
@@ -79,28 +58,6 @@ pub(super) fn compare_schedule_key(
         .cmp(partition.as_bytes())
         .then_with(|| entry.u64_at::<16>().cmp(&key.millis))
         .then_with(|| entry.u64_at::<24>().cmp(&key.schedule))
-}
-
-pub(super) fn compare_offset_key(
-    entry: &[u8; OFFSET_INDEX_ENTRY_BYTES],
-    partition: PartitionIncarnation,
-    offset: Offset,
-) -> Ordering {
-    entry
-        .array::<0, 16>()
-        .cmp(partition.as_bytes())
-        .then_with(|| entry.u64_at::<16>().cmp(&offset.get()))
-}
-
-pub(super) fn compare_message_key(
-    entry: &[u8; MESSAGE_INDEX_ENTRY_BYTES],
-    partition: PartitionIncarnation,
-    message_id: MessageId,
-) -> Ordering {
-    entry
-        .array::<0, 16>()
-        .cmp(partition.as_bytes())
-        .then_with(|| entry.array::<16, 16>().cmp(message_id.as_bytes()))
 }
 
 pub(super) fn binary_search_section<const W: usize>(

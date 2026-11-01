@@ -8,6 +8,7 @@ use crate::{
     JournalIndexError, active_index::ActivePrefix, index_catalog::asynchronous::Catalog,
     journal_index::asynchronous::Snapshot,
 };
+use ozzy_io::{OpenMode, Operation};
 
 impl Journal {
     /// Capture a deletion-protected read view using already-published indexes.
@@ -106,29 +107,42 @@ impl Journal {
         limits: IndexBuildLimits,
     ) -> Result<Snapshot, JournalIndexError> {
         self.healthy()?;
-        self.validated_indexes.get_mut().retain(|id, _| {
+        let validated = self.validated_indexes.clone();
+        validated.retain(|id| {
             self.manifest
                 .segments
-                .binary_search_by_key(id, |reference| reference.segment_id)
+                .binary_search_by_key(&id, |reference| reference.segment_id)
                 .is_ok()
         });
         for at in 0..self.manifest.segments.len() - 1 {
             let id = self.manifest.segments[at].segment_id;
             let (_, source) = self.index_source(id)?;
-            if self.validated_indexes.get_mut().get(&id) == Some(&source) {
-                // This owner already validated the immutable physical source.
-                // Recheck the published index's checksum and complete source
-                // binding; explicit repair/scrub still validate physical bytes.
-                match self.open_sealed_index(id, limits.file).await {
-                    Ok(_) => continue,
-                    Err(DirectoryError::Index(crate::IndexBuildError::Io(error)))
-                        if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
+            // A second build beside a running one would only slow both.
+            validated.build_finished(source).await;
+            if validated.holds(source) {
+                // This owner already validated the immutable physical source,
+                // and the capture below rechecks the published index's checksum
+                // and complete source binding. Only a missing index needs a build;
+                // explicit repair/scrub still validate physical bytes.
+                let path = self
+                    .root()
+                    .join("indexes")
+                    .join(crate::segment_index_name(source));
+                match self.access.open(path, OpenMode::Read, false, false).await {
+                    Ok(handle) => {
+                        self.access
+                            .done(Operation::Close { handle })
+                            .await
+                            .map_err(DirectoryError::from)?;
+                        continue;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(DirectoryError::from(error).into()),
                 }
             }
-            self.validated_indexes.get_mut().remove(&id);
+            validated.forget(id);
             self.build_sealed_index(id, limits).await?;
-            self.validated_indexes.get_mut().insert(id, source);
+            validated.record(source);
         }
         // The prefix is taken first: a canceled or failed build rescans next time.
         let prefix = self.active_prefix.take().map(|prefix| *prefix);

@@ -323,6 +323,14 @@ impl Transmitter {
         self.candidate_limit = None;
     }
 
+    /// Drop `request` once its lookup is done and adopted nothing. Only a newer
+    /// report can change the answer, so the same lookup must not run again.
+    pub fn forget_candidate(&mut self, request: OpenRequest) {
+        if self.candidate == Some(request) {
+            self.clear_candidate();
+        }
+    }
+
     /// Retire reservations the current channel reports received.
     fn observe_receipt(&mut self, report: Report, now: Duration) -> Result<bool, FlowError> {
         let Some(sender) = self.sender.as_mut() else {

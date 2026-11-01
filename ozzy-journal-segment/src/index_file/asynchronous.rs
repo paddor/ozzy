@@ -1,8 +1,8 @@
 use super::{
     Digest, Hasher, INDEX_DIGEST_START, INDEX_HASH_CONTEXT, IndexEntries, IndexFileError,
-    IndexLimits, IndexSource, SegmentIndexImage, SegmentIndexView, compare_locations,
-    compare_message_entries, compare_offset_entries, compare_operation_entries,
-    compare_schedule_entries, decode_sections,
+    IndexLimits, IndexSource, SegmentIndexImage, SegmentIndexView, compare_batch_entries,
+    compare_locations, compare_message_rows, compare_operation_entries, compare_schedule_entries,
+    decode_sections,
     validate::{image_checks, section_checks, validate_image_header},
     validate_header,
 };
@@ -11,8 +11,8 @@ use crate::cooperative::{Budget, sort_by};
 impl IndexEntries {
     /// Sort each section, yielding between bounded steps.
     async fn sort_async(&mut self) {
-        sort_by(&mut self.offsets, compare_offset_entries).await;
-        sort_by(&mut self.messages, compare_message_entries).await;
+        sort_by(&mut self.batches, compare_batch_entries).await;
+        sort_by(&mut self.messages, compare_message_rows).await;
         sort_by(&mut self.operations, compare_operation_entries).await;
         sort_by(&mut self.locations, compare_locations).await;
         sort_by(&mut self.schedules, compare_schedule_entries).await;
@@ -44,9 +44,14 @@ impl SegmentIndexImage {
     ) -> Result<Self, IndexFileError> {
         entries.sort_async().await;
         let old = &self.entries;
+        let partition = match (old.partition, entries.partition) {
+            (Some(old), Some(new)) if old != new => return Err(IndexFileError::MixedPartitions),
+            (old, new) => old.or(new),
+        };
         let entries = IndexEntries {
-            offsets: merge(&old.offsets, entries.offsets, compare_offset_entries).await,
-            messages: merge(&old.messages, entries.messages, compare_message_entries).await,
+            partition,
+            batches: merge(&old.batches, entries.batches, compare_batch_entries).await,
+            messages: merge(&old.messages, entries.messages, compare_message_rows).await,
             operations: merge(
                 &old.operations,
                 entries.operations,
@@ -70,7 +75,7 @@ impl SegmentIndexImage {
         validate_image_header(&self)?;
         let mut budget = Budget::default();
         for check in image_checks(&self) {
-            budget.charge(check?).await;
+            budget.charge_row(check?).await;
         }
         Ok(self)
     }
@@ -121,7 +126,7 @@ pub(crate) async fn decode_segment_index_async(
     let view = decode_sections(input, limits)?;
     let mut budget = Budget::default();
     for check in section_checks(view) {
-        budget.charge(check?).await;
+        budget.charge_row(check?).await;
     }
     Ok(view)
 }

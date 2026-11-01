@@ -1,5 +1,6 @@
 use super::*;
 mod cooperation;
+mod dense;
 use crate::{
     IndexBuildError, IndexBuildLimits, IndexLimits, IndexSource, SegmentIndex, scan_segment,
     segment_index_name,
@@ -20,7 +21,7 @@ pub(super) fn build_limits() -> IndexBuildLimits {
         max_run_files: 16,
         file: IndexLimits {
             max_file_bytes: 65536,
-            max_offset_entries: 64,
+            max_batch_entries: 64,
             max_message_entries: 64,
             max_operation_entries: 64,
             max_schedule_entries: 64,
@@ -75,7 +76,7 @@ async fn populate_encoded(journal: &mut Journal, encoding: BodyEncoding) {
 }
 
 fn check_index(index: &SegmentIndex) {
-    assert_eq!(index.offset_count(), 6);
+    assert_eq!(index.batch_count(), 6);
     assert_eq!(index.message_count(), 6);
     assert_eq!(index.operation_count(), 1);
     assert_eq!(index.location_count(), 7);
@@ -163,12 +164,20 @@ async fn async_multi_pass_index_is_byte_identical_to_one_pass_encoding() {
     let image = journal.segment_image(reference).await.unwrap();
     drop(journal);
     pool.shutdown().await;
-    assert_eq!(index.as_bytes(), one_pass(&image, reference, source));
+    assert_eq!(
+        index.as_bytes(),
+        one_pass(&image, reference, source, build_limits())
+    );
 }
 
 /// Entries derived per operation, sorted and encoded in one pass: the oracle
 /// for a multi-pass build of the same segment.
-fn one_pass(image: &[u8], reference: SegmentReference, source: IndexSource) -> Vec<u8> {
+fn one_pass(
+    image: &[u8],
+    reference: SegmentReference,
+    source: IndexSource,
+    build: IndexBuildLimits,
+) -> Vec<u8> {
     let scan = scan_segment(
         image,
         reference.first_group_number,
@@ -180,19 +189,17 @@ fn one_pass(image: &[u8], reference: SegmentReference, source: IndexSource) -> V
     for operation in scan.groups.iter().flat_map(|group| &group.operations) {
         let derived =
             crate::derive_index_entries(&scan.header, operation, limits().operations).unwrap();
-        entries.offsets.extend(derived.offsets);
+        entries.partition = entries.partition.or(derived.partition);
+        entries.batches.extend(derived.batches);
         entries.messages.extend(derived.messages);
         entries.operations.extend(derived.operation);
         entries.locations.push(derived.location);
         entries.schedules.extend(derived.schedules);
     }
-    let expected = crate::SegmentIndexImage::new(
-        source,
-        build_limits().max_entry_buffer_bytes as u64,
-        entries,
-    )
-    .unwrap();
-    crate::encode_segment_index(&expected, build_limits().file).unwrap()
+    let expected =
+        crate::SegmentIndexImage::new(source, build.max_entry_buffer_bytes as u64, entries)
+            .unwrap();
+    crate::encode_segment_index(&expected, build.file).unwrap()
 }
 
 /// Two scheduled records: the first due later for later schedules, the
@@ -337,13 +344,16 @@ async fn async_multi_pass_index_sorts_scheduled_records_by_release_key() {
             .schedules_after(partition(), None)
             .all(|row| row.record.bytes as usize == bytes)
     );
-    assert_eq!(index.offset_count(), 0);
+    assert_eq!(index.batch_count(), 0);
     let source = index.source();
     let reference = journal.manifest.segments[0];
     let image = journal.segment_image(reference).await.unwrap();
     drop(journal);
     pool.shutdown().await;
-    assert_eq!(index.as_bytes(), one_pass(&image, reference, source));
+    assert_eq!(
+        index.as_bytes(),
+        one_pass(&image, reference, source, build_limits())
+    );
 }
 
 async fn check_snapshot(journal: &Journal) {
@@ -617,6 +627,52 @@ fn sort_and_workspace_limits_bound_failed_builds_without_touching_history() {
             DirectoryError::Index(IndexBuildError::RunLimitExceeded(_))
         ));
         assert_eq!(journal.manifest.committed, before);
+    }
+}
+
+#[test]
+fn a_dense_segment_indexes_within_a_small_workspace() {
+    const RECORDS: u8 = 48;
+    let (mut controller, io) = setup(Image::default());
+    let capacity = 256 * 1024;
+    let format = Format {
+        first_segment: SegmentHeader::new(identity().group_id, 1, None, Digest::ZERO, capacity)
+            .unwrap(),
+        ..spec(CommitMode::External)
+    };
+    let mut roomy = limits();
+    roomy.io.max_segment_bytes = capacity;
+    let mut journal = drive(
+        &mut controller,
+        Journal::format("/group".into(), io, format, JournalGeneration(1), roomy),
+    )
+    .unwrap();
+    drive(&mut controller, async {
+        for number in 0..RECORDS {
+            let body = append_body(number);
+            let template = operation(&journal);
+            let op = CanonicalOperation {
+                kind: OperationKind::Append,
+                body: &body,
+                ..template
+            };
+            journal.append(&[op], BodyEncoding::Raw).await.unwrap();
+        }
+        append_confirmed(&mut journal).await;
+        journal.roll_active(32768, 4).await.unwrap();
+    });
+    // The small entry buffer writes a message run per two records.
+    journal.limits.directory_entries = 32;
+    let index = drive(
+        &mut controller,
+        journal.build_sealed_index(1, build_limits()),
+    )
+    .unwrap();
+    assert_eq!(index.batch_count(), usize::from(RECORDS));
+    assert_eq!(index.message_count(), usize::from(RECORDS));
+    for number in 0..u64::from(RECORDS) {
+        let entry = index.find_offset(partition(), Offset::new(number)).unwrap();
+        assert_eq!(entry.location.operation.op_number, number + 1);
     }
 }
 

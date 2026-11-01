@@ -3,7 +3,8 @@ use super::{
     extend_bounded, validate_limits,
 };
 use crate::{
-    DecodedOperation, Digest, IndexEntries, SealedSegment, SegmentHeader, derive_index_entries,
+    DecodedOperation, Digest, IndexEntries, IndexFileError, SealedSegment, SegmentHeader,
+    derive_index_entries,
 };
 use ozzy_journal::operation::OperationLimits;
 
@@ -36,6 +37,11 @@ impl Entries {
         self.first.get_or_insert(operation.op_number);
         let derived = derive_index_entries(header, operation, limits)?;
         let selectors = &mut self.selectors;
+        if let Some(partition) = derived.partition
+            && *selectors.partition.get_or_insert(partition) != partition
+        {
+            return Err(IndexFileError::MixedPartitions.into());
+        }
         extend_bounded(
             &mut selectors.locations,
             [derived.location],
@@ -43,10 +49,10 @@ impl Entries {
             "active operation locations",
         )?;
         extend_bounded(
-            &mut selectors.offsets,
-            derived.offsets,
-            self.limits.max_offset_entries,
-            "active offset entries",
+            &mut selectors.batches,
+            derived.batches,
+            self.limits.max_batch_entries,
+            "active batch entries",
         )?;
         extend_bounded(
             &mut selectors.messages,
@@ -108,7 +114,7 @@ impl Entries {
         let selectors = &self.selectors;
         enforce_footprint(
             IndexCounts {
-                offsets: selectors.offsets.len() + base_len(|base| base.offsets().len()),
+                batches: selectors.batches.len() + base_len(|base| base.batches().len()),
                 messages: selectors.messages.len() + base_len(|base| base.messages().len()),
                 operations: selectors.operations.len() + base_len(|base| base.operations().len()),
                 locations: selectors.locations.len() + base_len(|base| base.locations().len()),

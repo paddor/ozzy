@@ -1,6 +1,7 @@
 //! Opt-in cross-host crash soak. Reuses the process suite's SDK record oracle.
 
 use super::Client;
+use ozzy_sim::client::SizeMix;
 
 mod fleet;
 mod single;
@@ -231,6 +232,62 @@ async fn observe_progress<T>(
     }
 }
 
+/// Optional `OZZY_SOAK_*` workload. Without a rate, the default waves run.
+#[derive(Clone, Copy)]
+struct Load {
+    /// Unique records per second.
+    rate: Option<u64>,
+    mix: SizeMix,
+    dedup: bool,
+    pause: bool,
+}
+
+impl Load {
+    fn from_env() -> Self {
+        let rate = std::env::var("OZZY_SOAK_RATE")
+            .ok()
+            .map(|value| value.parse().unwrap());
+        let mix = match std::env::var("OZZY_SOAK_MIX").as_deref() {
+            Err(_) | Ok("small") => SizeMix::Small,
+            Ok("large") => SizeMix::Large,
+            Ok(other) => panic!("unknown OZZY_SOAK_MIX {other}"),
+        };
+        let pause = match std::env::var("OZZY_SOAK_FAULT").as_deref() {
+            Err(_) | Ok("kill") => false,
+            Ok("pause") => true,
+            Ok(other) => panic!("unknown OZZY_SOAK_FAULT {other}"),
+        };
+        let dedup = std::env::var("OZZY_SOAK_DEDUP").is_ok_and(|value| value == "1");
+        assert!(
+            rate.is_some() || !dedup,
+            "OZZY_SOAK_DEDUP needs OZZY_SOAK_RATE"
+        );
+        Self {
+            rate,
+            mix,
+            dedup,
+            pause,
+        }
+    }
+
+    /// Wave scale for one 6-wave cycle (232 base records) per 4 s. A cycle
+    /// spends about 2 s on confirmation, gap repair, and reader churn at any scale.
+    fn scale(self) -> usize {
+        (self.rate.unwrap_or(0) as usize * 4 / 232).max(1)
+    }
+
+    /// Hold to the rate between waves, catching up after any outage.
+    async fn pace(self, start: Instant, paced: usize, wave: usize) {
+        if let Some(rate) = self.rate {
+            let due = start + Duration::from_secs_f64(paced as f64 / rate as f64);
+            tokio::time::sleep_until(due.into()).await;
+        } else {
+            let idle = if wave.is_multiple_of(6) { 150 } else { 10 };
+            tokio::time::sleep(Duration::from_millis(idle)).await;
+        }
+    }
+}
+
 fn checked(config: &Path, identity: &Path, host: &str) -> CheckedConfig {
     check_config(
         load_deployment(config).unwrap(),
@@ -267,12 +324,22 @@ async fn run_crash_soak() {
     let mut fleet = Fleet::start().await;
     let mode = fleet.checked.deployment.deployment().cluster.mode;
     let mut ledger = File::create(std::env::var("OZZY_SOAK_RESULTS").unwrap()).unwrap();
-    let mut client = observe(
-        &mut fleet.brokers,
-        "open soak SDK",
-        Client::open(&fleet.checked),
-    )
-    .await;
+    let load = fleet.load;
+    let mut client = if load.rate.is_some() {
+        observe(
+            &mut fleet.brokers,
+            "open soak SDK",
+            Client::open_paced(&fleet.checked, load.dedup),
+        )
+        .await
+    } else {
+        observe(
+            &mut fleet.brokers,
+            "open soak SDK",
+            Client::open(&fleet.checked),
+        )
+        .await
+    };
     let mut reader = observe(
         &mut fleet.brokers,
         "open live soak reader",
@@ -286,6 +353,8 @@ async fn run_crash_soak() {
     let (mut resumes, mut takeovers) = (0, 0);
     let mut wave = 0;
     let mut verified = 0;
+    // Wave records only; maintenance bursts must not stretch the pace.
+    let mut paced = 0;
     while start.elapsed() < Duration::from_secs(seconds) {
         let elapsed = start.elapsed();
         fleet.churn(elapsed).await;
@@ -319,10 +388,12 @@ async fn run_crash_soak() {
         client.discard_verified();
         wave += 1;
         verified += records;
+        paced += records;
         if elapsed >= next_report {
             let kills = fleet.kills;
+            let (stored, duplicates) = client.dispositions();
             let record = format!(
-                "{{\"mode\":\"{mode:?}\",\"elapsed_secs\":{},\"verified_records\":{},\"kills\":{kills},\"resumes\":{resumes},\"takeovers\":{takeovers},\"consumers\":{},\"retention_gaps\":{},\"slow_consumers\":{},\"replayed_records\":{}}}",
+                "{{\"mode\":\"{mode:?}\",\"elapsed_secs\":{},\"verified_records\":{},\"paced_records\":{paced},\"kills\":{kills},\"resumes\":{resumes},\"takeovers\":{takeovers},\"consumers\":{},\"retention_gaps\":{},\"slow_consumers\":{},\"replayed_records\":{},\"stored\":{stored},\"duplicates\":{duplicates}}}",
                 elapsed.as_secs(),
                 verified,
                 fleet.consumers,
@@ -335,8 +406,9 @@ async fn run_crash_soak() {
             println!("{record}");
             next_report = elapsed + Duration::from_secs(60);
         }
-        tokio::time::sleep(Duration::from_millis(if wave % 6 == 0 { 150 } else { 10 })).await;
+        load.pace(start, paced, wave).await;
     }
+    let (stored, duplicates) = client.dispositions();
     observe(&mut fleet.brokers, "close live soak reader", reader.close())
         .await
         .unwrap();
@@ -351,7 +423,7 @@ async fn run_crash_soak() {
     }
     writeln!(
         ledger,
-        "{{\"complete\":true,\"elapsed_secs\":{},\"verified_records\":{},\"kills\":{kills},\"resumes\":{resumes},\"takeovers\":{takeovers},\"consumers\":{consumers},\"retention_gaps\":{retention_gaps},\"slow_consumers\":{slow_consumers},\"replayed_records\":{replayed_records}}}",
+        "{{\"complete\":true,\"elapsed_secs\":{},\"verified_records\":{},\"paced_records\":{paced},\"kills\":{kills},\"resumes\":{resumes},\"takeovers\":{takeovers},\"consumers\":{consumers},\"retention_gaps\":{retention_gaps},\"slow_consumers\":{slow_consumers},\"replayed_records\":{replayed_records},\"stored\":{stored},\"duplicates\":{duplicates}}}",
         start.elapsed().as_secs(),
         verified
     )

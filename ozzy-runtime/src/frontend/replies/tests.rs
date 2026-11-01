@@ -257,3 +257,58 @@ fn data_cannot_enter_control_queue_and_socket_failure_is_not_confirmation() {
         Err(omq_tokio::Error::Closed)
     ));
 }
+
+#[test]
+fn a_stalled_peer_keeps_copies_of_small_control_frames() {
+    /// Counts the aliases of one frame.
+    struct Owned {
+        bytes: Vec<u8>,
+        _owner: std::sync::Arc<()>,
+    }
+    impl AsRef<[u8]> for Owned {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+    let frame = |bytes: usize, owner: &std::sync::Arc<()>| {
+        Message::multipart([
+            Bytes::from_static(b"route"),
+            Bytes::from_owner(Owned {
+                bytes: vec![7; bytes],
+                _owner: owner.clone(),
+            }),
+        ])
+    };
+    let mut queued = Vec::new();
+    let mut admit = |message| {
+        queued.push(message);
+        Ok(())
+    };
+
+    let small = std::sync::Arc::new(());
+    send_control(frame(128, &small), &mut admit).unwrap();
+    assert_eq!(std::sync::Arc::strong_count(&small), 1, "only a copy stays");
+
+    let large = std::sync::Arc::new(());
+    send_control(frame(CONTROL_COPY_BYTES + 1, &large), &mut admit).unwrap();
+    assert_eq!(
+        std::sync::Arc::strong_count(&large),
+        2,
+        "its charge follows"
+    );
+
+    let refused = std::sync::Arc::new(());
+    let Err(TrySendError::Full(original)) = send_control(frame(128, &refused), &mut |message| {
+        Err(TrySendError::Full(message))
+    }) else {
+        panic!("a full socket must refuse the frame");
+    };
+    assert_eq!(
+        std::sync::Arc::strong_count(&refused),
+        2,
+        "still the original"
+    );
+    assert_eq!(original.part_slice(1), Some([7; 128].as_slice()));
+    assert_eq!(queued[0].part_slice(0), Some(b"route".as_slice()));
+    assert_eq!(queued[0].part_slice(1), Some([7; 128].as_slice()));
+}

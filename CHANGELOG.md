@@ -2,6 +2,54 @@
 
 ## [Unreleased]
 
+### Breaking
+
+- Segment index files have a new format. Format stores again, or remove the
+  `.idx` files in each journal's `indexes/` directory, which rebuilds them from
+  segments.
+
+### Changed
+
+- Segment indexes keep one 32-byte row per batch and one 20-byte row per record,
+  in place of 176 bytes per record. Indexes of segments with many small records
+  shrink to about a tenth, which shortens index builds and failover and lowers
+  broker memory use.
+
+### Fixed
+
+- A broker that keeps falling behind no longer fills its disk. Each recovery
+  left the old copy's segment files in place until the partition settled, which
+  a copy recovering again and again never did. A copy that fell behind now
+  removes them when its recovery starts. `--quarantine` still keeps them.
+- Producers and consumers no longer stop for minutes while one broker's copy of
+  a partition recovers. That copy could report a newer view with no leader, and
+  clients then refused the healthy leader until recovery finished.
+- A stalled follower or consumer, one that keeps its connection open but stops
+  reading, no longer stops writes on the other brokers. Publications refused
+  for over a second now drop and repair over PEER, and small control frames
+  (votes, commits, replies) no longer hold shard budget while queued for a
+  stalled peer.
+- Sealing a segment of many small records no longer fails its index build.
+  The failure was silent until a later index lookup stopped the partition, and
+  each failed build left its files in `staging/` until the next restart.
+- Failed background index builds now log a warning with their cause.
+- Index builds for segments of many small records write fewer staging files and
+  finish sooner, which shortens failover on those partitions.
+- Resent appends on a deduplicated topic no longer reload every sealed index.
+  After a leader change, those reloads could outlast the SDK response timeout,
+  so writers resent forever and writes stopped on every partition of that
+  broker.
+- A follower that falls behind on a long-lived partition no longer stops writes
+  on its leader. Once retention had removed the start of the replication
+  channel, the leader repeated a history check ahead of proposals and repair,
+  so every partition it led stayed stuck.
+- A leader no longer exits when a recovering follower fetches history while
+  another follower is being repaired from disk.
+- Failover no longer waits on duplicate index work. A new leader waits for a
+  running index build instead of repeating it, and opens each sealed index once.
+  On partitions of many small records, a three-host soak's write stall at failover
+  dropped from about 30 s to about 2 s.
+
 ## [0.7.0] - 2026-10-29
 
 ### Breaking

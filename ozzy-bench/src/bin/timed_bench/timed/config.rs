@@ -253,6 +253,10 @@ impl Config {
         self.args.native.delay_millis.unwrap_or(0) * 1_000_000
     }
 
+    pub(super) fn due_tolerance_ns(&self) -> u64 {
+        self.args.native.due_tolerance_millis.unwrap_or(0) * 1_000_000
+    }
+
     pub(super) fn logical_writers(&self) -> usize {
         self.args.native.feeds.logical_writers(self.writers)
     }

@@ -23,6 +23,7 @@ pub(in crate::bench::timed) async fn run(config: Config) -> Result<()> {
     let mut result = tokio::select! {
         result = measure(&config, &worker, &broker, &mut input) => result,
         result = broker.closed() => {
+            print_diagnostics();
             result?;
             Err(error("production broker stopped before drain"))
         },
@@ -70,6 +71,15 @@ pub(in crate::bench::timed) async fn run(config: Config) -> Result<()> {
         return Err(error("production broker command after drain"));
     }
     Ok(())
+}
+
+/// A failed broker reports only its fence; the bounded log names the cause.
+fn print_diagnostics() {
+    for entry in ozzy_telemetry::recent_logs() {
+        if entry.level != ozzy_telemetry::Level::Info {
+            eprintln!("{entry:?}");
+        }
+    }
 }
 
 /// The broker's usage after drain: metered before shutdown when inproc,

@@ -59,23 +59,23 @@ fn packed_segment_can_exceed_default_index_file_limit() {
     )
     .unwrap();
     // A 256 MiB canonical body can hold roughly eight million 16-byte
-    // records. Compact RAM runs do not shrink their persisted index entries.
+    // records. Compact RAM runs do not shrink their persisted message rows.
     index.records = 256 * 1024 * 1024 / (16 + 17);
-    assert_eq!(
-        ActiveReadIndex::capacity_after(Some(&index), &[append_body(1, 1)], IndexLimits::default()),
-        Err(ActiveReadIndexError::LimitExceeded),
-    );
-    assert!(
+    let with_file_bytes = |max_file_bytes| {
         ActiveReadIndex::capacity_after(
             Some(&index),
             &[append_body(1, 1)],
             IndexLimits {
-                max_file_bytes: 2 * 1024 * 1024 * 1024,
+                max_file_bytes,
                 ..IndexLimits::default()
-            }
+            },
         )
-        .is_ok()
+    };
+    assert_eq!(
+        with_file_bytes(index.records * crate::MESSAGE_INDEX_ENTRY_BYTES),
+        Err(ActiveReadIndexError::LimitExceeded),
     );
+    assert!(with_file_bytes(IndexLimits::default().max_file_bytes).is_ok());
 }
 
 #[test]

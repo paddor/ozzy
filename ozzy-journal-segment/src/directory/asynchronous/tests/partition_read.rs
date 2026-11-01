@@ -356,6 +356,109 @@ fn two_complete_backings_serve_prior_operations_without_file_jobs() {
     drive(&mut controller, journal.close()).unwrap();
 }
 
+/// Write one record-free operation: control work, or an append of duplicates.
+fn barrier(controller: &mut Controller, journal: Journal, index: &mut Index) -> Journal {
+    let body = [1_u8; 16];
+    let operation = operation(&journal);
+    let records = PreparedOperationRecords::new(
+        operation.header(),
+        body.to_vec().into(),
+        limits().operations,
+    )
+    .unwrap();
+    let mut pipeline = journal.begin_write_pipeline(1).unwrap();
+    let group = pipeline
+        .begin_group_encoding()
+        .unwrap()
+        .encode_shared_raw(vec![SharedJournalOperation {
+            header: operation.header(),
+            body_digest: canonical_body_digest(&body),
+            body: body.to_vec().into(),
+        }])
+        .unwrap();
+    let work = pipeline.prepare(group, body.len()).unwrap();
+    let completed = drive(controller, work.write());
+    let locations = pipeline.complete(completed).unwrap();
+    let journal = pipeline.finish().unwrap();
+    index.appended(&journal, &locations, &[records]).unwrap();
+    journal
+}
+
+/// The operation read, checked to be `number`, and the file jobs it took.
+fn read_operation(
+    controller: &mut Controller,
+    index: &mut Index,
+    journal: &Journal,
+    number: u64,
+) -> usize {
+    let mut jobs = 0;
+    let operation = drive_with(
+        controller,
+        index.read_operation_number(journal, number),
+        |_| {
+            jobs += 1;
+            Effect::Normal
+        },
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(operation.op_number, number);
+    jobs
+}
+
+/// Operations 1 and 2 in the first segment, 3 and 4 in the second, 5 and 6 in
+/// the active one. Even numbers hold no record.
+fn three_segments() -> (Controller, Journal, Index, ReadConfig) {
+    let (mut controller, mut journal) = empty_journal();
+    let config = read_config(0);
+    let mut index = drive(&mut controller, Index::open(&journal, config)).unwrap();
+    for number in 0..3 {
+        if number != 0 {
+            drive(&mut controller, journal.roll_active(32768, 4)).unwrap();
+            index.rolled(&journal).unwrap();
+        }
+        journal = append(&mut controller, journal, &mut index, number, 0);
+        journal = barrier(&mut controller, journal, &mut index);
+    }
+    (controller, journal, index, config)
+}
+
+#[test]
+fn operations_read_from_selectors_with_or_without_records() {
+    let (mut controller, journal, mut index, _) = three_segments();
+    for number in 1..=6 {
+        read_operation(&mut controller, &mut index, &journal, number);
+    }
+    let beyond = drive(&mut controller, index.read_operation_number(&journal, 7)).unwrap();
+    assert!(beyond.is_none());
+    let before = drive(&mut controller, index.read_operation_number(&journal, 0)).unwrap();
+    assert!(before.is_none());
+    drive(&mut controller, journal.close()).unwrap();
+}
+
+#[test]
+fn a_new_owner_loads_only_the_segment_an_operation_is_in() {
+    let (mut controller, mut journal, _, config) = three_segments();
+    for segment in [1, 2] {
+        drive(
+            &mut controller,
+            journal.build_sealed_index(segment, config.index),
+        )
+        .unwrap();
+    }
+    let mut index = drive(&mut controller, Index::open(&journal, config)).unwrap();
+    let payload = read_operation(&mut controller, &mut index, &journal, 6);
+    let first = read_operation(&mut controller, &mut index, &journal, 4);
+    assert!(first > payload, "the first read loads the predecessor");
+    for number in [3, 4] {
+        let jobs = read_operation(&mut controller, &mut index, &journal, number);
+        assert!(jobs <= payload, "its selectors stay: {number}");
+    }
+    read_operation(&mut controller, &mut index, &journal, 2);
+    read_operation(&mut controller, &mut index, &journal, 1);
+    drive(&mut controller, journal.close()).unwrap();
+}
+
 #[test]
 fn async_reader_predecessors_survive_rolls_and_cold_cache_misses() {
     let (mut controller, mut journal) = empty_journal();

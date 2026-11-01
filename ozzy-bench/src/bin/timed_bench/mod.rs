@@ -231,6 +231,9 @@ struct Args {
     #[arg(long, requires_all = ["network_ingress", "streaming"],
         value_parser = clap::value_parser!(u64).range(1..=1_000_000_000))]
     records_per_second: Option<u64>,
+    /// Seconds an arrival may wait for admission before a scheduled load fails.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    max_admission_lag_secs: u64,
     /// Continuous offered-load ramp, `RATE:SECONDS,...` with rising rates.
     /// Sets the measurement duration; an overloaded stage ends the ramp.
     #[arg(long, requires_all = ["network_ingress", "streaming"], conflicts_with = "records_per_second")]
@@ -265,6 +268,10 @@ struct Args {
 }
 
 impl Args {
+    const fn max_admission_lag_ns(&self) -> u64 {
+        self.max_admission_lag_secs * 1_000_000_000
+    }
+
     /// Offered arrivals follow a schedule instead of completions.
     fn scheduled(&self) -> bool {
         self.records_per_second.is_some() || self.ramp.is_some()

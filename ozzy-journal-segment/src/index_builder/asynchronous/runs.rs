@@ -1,13 +1,15 @@
-use super::{Access, IndexBuildError, IndexFileError, PendingRuns, RunKind, Workspace};
+use super::{
+    Access, IndexBuildError, IndexFileError, OrderedRun, PendingRuns, RowBase, RunKind,
+    SectionRuns, Workspace,
+};
 use crate::index_file::{
-    compare_locations, compare_message_entries, compare_offset_entries, compare_operation_entries,
-    compare_schedule_entries, encode_message_entry, encode_offset_entry, encode_operation_entry,
-    encode_operation_location, encode_schedule_entry,
+    compare_message_rows, compare_operation_entries, compare_schedule_entries, encode_batch_entry,
+    encode_message_row, encode_operation_entry, encode_operation_location, encode_schedule_entry,
 };
 use crate::{
-    MESSAGE_INDEX_ENTRY_BYTES, MessageIndexEntry, OFFSET_INDEX_ENTRY_BYTES,
-    OPERATION_INDEX_ENTRY_BYTES, OPERATION_LOCATION_BYTES, OffsetIndexEntry, OperationIndexEntry,
-    OperationLocation, SCHEDULE_INDEX_ENTRY_BYTES, ScheduleIndexEntry,
+    BATCH_INDEX_ENTRY_BYTES, BatchIndexEntry, MESSAGE_INDEX_ENTRY_BYTES, MessageRow,
+    OPERATION_INDEX_ENTRY_BYTES, OPERATION_LOCATION_BYTES, OperationIndexEntry, OperationLocation,
+    SCHEDULE_INDEX_ENTRY_BYTES, ScheduleIndexEntry,
 };
 use ozzy_io::{Handle, OpenMode, Operation};
 use std::{cmp::Ordering, path::PathBuf};
@@ -22,12 +24,15 @@ pub(super) struct Output<'a> {
 
 impl<'a> Output<'a> {
     pub(super) fn new(access: &'a Access, file: &'a Handle, chunk: usize) -> Self {
+        Self::at(access, file, chunk, 0)
+    }
+    fn at(access: &'a Access, file: &'a Handle, chunk: usize, offset: u64) -> Self {
         Self {
             access,
             file,
             chunk,
             buffer: Vec::with_capacity(chunk),
-            offset: 0,
+            offset,
         }
     }
     pub(super) const fn position(&self) -> u64 {
@@ -59,58 +64,74 @@ impl<'a> Output<'a> {
     }
 }
 
-/// One staging-run section: its kind, entry order, and fixed-width encoding.
-struct RunFormat<T, const W: usize> {
+/// One staged section's kind and fixed-width encoding.
+struct RowFormat<T, const W: usize> {
     kind: RunKind,
-    compare: fn(&T, &T) -> Ordering,
-    encode: fn(&T, &mut [u8; W]),
+    encode: fn(&T, RowBase, &mut [u8; W]),
 }
 
-const OFFSETS: RunFormat<OffsetIndexEntry, OFFSET_INDEX_ENTRY_BYTES> = RunFormat {
-    kind: RunKind::Offset,
-    compare: compare_offset_entries,
-    encode: encode_offset_entry,
+/// A sorted section's format and entry order.
+struct RunFormat<T, const W: usize> {
+    rows: RowFormat<T, W>,
+    compare: fn(&T, &T) -> Ordering,
+}
+
+const BATCHES: RowFormat<BatchIndexEntry, BATCH_INDEX_ENTRY_BYTES> = RowFormat {
+    kind: RunKind::Batch,
+    encode: encode_batch_entry,
 };
-const MESSAGES: RunFormat<MessageIndexEntry, MESSAGE_INDEX_ENTRY_BYTES> = RunFormat {
-    kind: RunKind::Message,
-    compare: compare_message_entries,
-    encode: encode_message_entry,
+const LOCATIONS: RowFormat<OperationLocation, OPERATION_LOCATION_BYTES> = RowFormat {
+    kind: RunKind::Location,
+    encode: |entry, _, row| encode_operation_location(entry, row),
+};
+const MESSAGES: RunFormat<MessageRow, MESSAGE_INDEX_ENTRY_BYTES> = RunFormat {
+    rows: RowFormat {
+        kind: RunKind::Message,
+        encode: encode_message_row,
+    },
+    compare: compare_message_rows,
 };
 const OPERATIONS: RunFormat<OperationIndexEntry, OPERATION_INDEX_ENTRY_BYTES> = RunFormat {
-    kind: RunKind::Operation,
+    rows: RowFormat {
+        kind: RunKind::Operation,
+        encode: |entry, _, row| encode_operation_entry(entry, row),
+    },
     compare: compare_operation_entries,
-    encode: encode_operation_entry,
-};
-const LOCATIONS: RunFormat<OperationLocation, OPERATION_LOCATION_BYTES> = RunFormat {
-    kind: RunKind::Location,
-    compare: compare_locations,
-    encode: encode_operation_location,
 };
 const SCHEDULES: RunFormat<ScheduleIndexEntry, SCHEDULE_INDEX_ENTRY_BYTES> = RunFormat {
-    kind: RunKind::Schedule,
+    rows: RowFormat {
+        kind: RunKind::Schedule,
+        encode: |entry, _, row| encode_schedule_entry(entry, row),
+    },
     compare: compare_schedule_entries,
-    encode: encode_schedule_entry,
 };
+
+#[derive(Clone, Copy)]
+struct RunBounds {
+    max_runs: usize,
+    fan_in: usize,
+    base: RowBase,
+}
 
 impl PendingRuns {
     pub(super) async fn flush_async(
         &mut self,
         workspace: &mut Workspace,
     ) -> Result<(), IndexBuildError> {
-        write_typed_run(
-            &mut self.offsets,
-            OFFSETS,
-            workspace,
-            &mut self.offset_runs,
-            self.max_runs,
-        )
-        .await?;
+        let bounds = RunBounds {
+            max_runs: self.max_runs,
+            fan_in: self.fan_in,
+            base: self.base,
+        };
+        self.batch_run
+            .extend(&mut self.batches, BATCHES, self.base, workspace)
+            .await?;
         write_typed_run(
             &mut self.messages,
             MESSAGES,
             workspace,
             &mut self.message_runs,
-            self.max_runs,
+            bounds,
         )
         .await?;
         write_typed_run(
@@ -118,23 +139,18 @@ impl PendingRuns {
             OPERATIONS,
             workspace,
             &mut self.operation_runs,
-            self.max_runs,
+            bounds,
         )
         .await?;
-        write_typed_run(
-            &mut self.locations,
-            LOCATIONS,
-            workspace,
-            &mut self.location_runs,
-            self.max_runs,
-        )
-        .await?;
+        self.location_run
+            .extend(&mut self.locations, LOCATIONS, self.base, workspace)
+            .await?;
         write_typed_run(
             &mut self.schedules,
             SCHEDULES,
             workspace,
             &mut self.schedule_runs,
-            self.max_runs,
+            bounds,
         )
         .await?;
         self.buffered_bytes = 0;
@@ -142,23 +158,78 @@ impl PendingRuns {
     }
 }
 
+impl OrderedRun {
+    /// Append `entries`, which continue this section's order.
+    async fn extend<T, const W: usize>(
+        &mut self,
+        entries: &mut Vec<T>,
+        format: RowFormat<T, W>,
+        base: RowBase,
+        workspace: &mut Workspace,
+    ) -> Result<(), IndexBuildError> {
+        let RowFormat { kind, encode } = format;
+        if entries.is_empty() {
+            return Ok(());
+        }
+        if self.file.is_none() {
+            let path = workspace.next_run(kind)?;
+            self.file = Some(
+                workspace
+                    .access
+                    .open(path.clone(), OpenMode::CreateNew, false, false)
+                    .await?,
+            );
+            self.path = Some(path);
+        }
+        let file = self.file.as_ref().ok_or(IndexBuildError::InvalidRun)?;
+        let chunk = workspace.limits.chunk_bytes;
+        let mut output = Output::at(&workspace.access, file, chunk, self.written);
+        debug_assert_eq!(kind.width(), W);
+        let mut buffer = [0; W];
+        let mut budget = crate::cooperative::Budget::default();
+        for entry in entries.iter() {
+            buffer.fill(0);
+            encode(entry, base, &mut buffer);
+            let key = &buffer[..kind.key_bytes()];
+            if !self.last_key.is_empty() && self.last_key.as_slice() >= key {
+                return Err(IndexFileError::UnsortedOrDuplicate(kind.name()).into());
+            }
+            self.last_key.clear();
+            self.last_key.extend_from_slice(key);
+            output.push(&buffer).await?;
+            budget.charge_row(W).await;
+        }
+        output.flush().await?;
+        self.written = output.position();
+        entries.clear();
+        Ok(())
+    }
+
+    /// Close the section's file. `None` when it had no rows.
+    pub(super) async fn finish(self, access: &Access) -> Result<Option<PathBuf>, IndexBuildError> {
+        if let Some(handle) = self.file {
+            access.done(Operation::Close { handle }).await?;
+        }
+        Ok(self.path)
+    }
+}
+
 async fn write_typed_run<T, const W: usize>(
     entries: &mut Vec<T>,
     format: RunFormat<T, W>,
     workspace: &mut Workspace,
-    runs: &mut Vec<PathBuf>,
-    max_runs: usize,
+    runs: &mut SectionRuns,
+    bounds: RunBounds,
 ) -> Result<(), IndexBuildError> {
     let RunFormat {
-        kind,
+        rows: RowFormat { kind, encode },
         compare,
-        encode,
     } = format;
     if entries.is_empty() {
         return Ok(());
     }
-    if runs.len() >= max_runs {
-        return Err(IndexBuildError::RunLimitExceeded(max_runs));
+    if runs.paths.len() >= bounds.max_runs {
+        return Err(IndexBuildError::RunLimitExceeded(bounds.max_runs));
     }
     crate::cooperative::sort_by(entries, compare).await;
     let mut budget = crate::cooperative::Budget::default();
@@ -166,7 +237,7 @@ async fn write_typed_run<T, const W: usize>(
         if compare(&pair[0], &pair[1]) != Ordering::Less {
             return Err(IndexFileError::UnsortedOrDuplicate(kind.name()).into());
         }
-        budget.charge(size_of::<T>()).await;
+        budget.charge_row(size_of::<T>()).await;
     }
     let path = workspace.next_run(kind)?;
     let file = workspace
@@ -178,18 +249,41 @@ async fn write_typed_run<T, const W: usize>(
     let mut buffer = [0; W];
     for entry in entries.iter() {
         buffer.fill(0);
-        encode(entry, &mut buffer);
+        encode(entry, bounds.base, &mut buffer);
         output.push(&buffer).await?;
-        budget.charge(buffer.len()).await;
+        budget.charge_row(buffer.len()).await;
     }
     output.flush().await?;
     workspace
         .access
         .done(Operation::Close { handle: file })
         .await?;
-    runs.push(path);
     entries.clear();
-    Ok(())
+    runs.add(path, kind, bounds.fan_in, workspace).await
+}
+
+impl SectionRuns {
+    /// Keep a written run and merge each tier that fills, like carrying digits
+    /// in base `fan_in`. A section then holds a few runs per tier, so a dense
+    /// segment stays within the workspace bound.
+    async fn add(
+        &mut self,
+        path: PathBuf,
+        kind: RunKind,
+        fan_in: usize,
+        workspace: &mut Workspace,
+    ) -> Result<(), IndexBuildError> {
+        self.paths.push(path);
+        self.written += 1;
+        let mut carry = self.written;
+        while carry.is_multiple_of(fan_in as u64) {
+            let tier = self.paths.split_off(self.paths.len() - fan_in);
+            self.paths
+                .extend(merge_all(tier, kind, fan_in, workspace).await?);
+            carry /= fan_in as u64;
+        }
+        Ok(())
+    }
 }
 
 pub(super) async fn merge_all(
@@ -257,7 +351,7 @@ async fn merge_runs(
         previous.extend_from_slice(key);
         readers[selected].advance(&workspace.access).await?;
         budget
-            .charge(kind.width().saturating_mul(readers.len()))
+            .charge_row(kind.width().saturating_mul(readers.len()))
             .await;
     }
     output.flush().await?;

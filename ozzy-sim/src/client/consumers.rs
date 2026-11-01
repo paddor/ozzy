@@ -20,9 +20,15 @@ impl Client {
             let mut next = std::pin::pin!(paused.next());
             assert!(futures::poll!(next.as_mut()).is_pending());
         }
-        let pending = self.queue_varied(wave * 6 + 2).await;
-        let records = pending.len();
-        self.confirm(pending).await;
+        // One wave of small packets overruns the paused queue. Larger packets
+        // pack that wave into fewer messages, so paced clients send several.
+        let paced = self.writer_config.limits.max_records > super::DATA_LIMITS.max_records;
+        let mut records = 0;
+        for round in 0..if paced { 8 } else { 1 } {
+            let pending = self.queue_varied((wave + round) * 6 + 2).await;
+            records += pending.len();
+            self.confirm(pending).await;
+        }
         self.read(reader, positions.clone()).await;
         let mut positions = positions;
         let mut aliases = Vec::new();
@@ -98,7 +104,7 @@ impl Client {
             assert!(futures::poll!(next.as_mut()).is_pending());
         }
         let mut records = 0;
-        for chunk in 0..256 {
+        for chunk in 0..self.retention_chunks {
             let positions = self.positions();
             let number = u32::try_from(wave.checked_mul(256).unwrap() + chunk).unwrap();
             let pending = self.queue_large(number, 64).await;

@@ -28,6 +28,10 @@ pub enum RecoveryOpen {
     ResumeFull,
     /// Durably remove an existing store's voting eligibility; preserve old files.
     Quarantine,
+    /// Quarantine a copy that fell behind. Nothing is known to be damaged, so
+    /// a full replacement removes the old files. A copy that keeps falling
+    /// behind recovers again before it settles, so no retention turn would.
+    Withdraw,
 }
 
 /// Caller-supplied fresh identities. Simulation need not generate wall-clock UUIDs.
@@ -152,7 +156,7 @@ impl RecoveringJournal {
         mode: RecoveryOpen,
     ) -> Result<State, JournalError> {
         let bytes = config.configuration.encode();
-        let mut directory = if mode == RecoveryOpen::Quarantine {
+        let mut directory = if matches!(mode, RecoveryOpen::Quarantine | RecoveryOpen::Withdraw) {
             let directory = RecoveryDirectory::open_for_repair(
                 config.root.clone(),
                 io.clone(),
@@ -182,7 +186,13 @@ impl RecoveringJournal {
         if repair {
             return Ok(State::Directory(Box::new(directory)));
         }
-        recover_nonvoting(directory, config, temporary).await
+        let mut state = recover_nonvoting(directory, config, temporary).await?;
+        if mode == RecoveryOpen::Withdraw
+            && let State::Journal(journal) = &mut state
+        {
+            remove_replaced_history(journal).await?;
+        }
+        Ok(state)
     }
 
     /// True after an interrupted or failed state-changing operation.
@@ -250,7 +260,7 @@ impl RecoveringJournal {
         Ok(())
     }
 
-    /// Retire unpublished work; retain the nonvoting marker and original files.
+    /// Retire unpublished work; retain the nonvoting marker and any original files.
     /// This incarnation cannot begin a second attempt. Reopen with fresh IDs.
     pub async fn abort_recovery(
         &mut self,
@@ -352,6 +362,40 @@ async fn recover_nonvoting(
         )
         .await?;
     Ok(State::Journal(Box::new(journal)))
+}
+
+/// Remove every file the fresh selection left behind, a budget at a time. Only
+/// a fresh segment stays selected, and nothing selects the old history again.
+async fn remove_replaced_history(journal: &mut GroupJournal) -> Result<(), JournalError> {
+    const BUDGET: usize = 64;
+    while journal
+        .reclaim_unreferenced_segments(BUDGET)
+        .await?
+        .removed_segment_ids
+        .len()
+        == BUDGET
+    {}
+    while journal
+        .reclaim_unreferenced_checkpoints(BUDGET)
+        .await?
+        .removed_checkpoint_ids
+        .len()
+        == BUDGET
+    {}
+    while journal
+        .reclaim_unreferenced_indexes(BUDGET)
+        .await?
+        .removed_files
+        == BUDGET
+    {}
+    loop {
+        let removed = journal.reclaim_unreferenced_metadata(BUDGET).await?;
+        if removed.removed_manifest_generations.len() + removed.removed_temporary_files.len()
+            < BUDGET
+        {
+            return Ok(());
+        }
+    }
 }
 
 impl OwnedJournal {

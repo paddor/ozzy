@@ -1,7 +1,7 @@
 //! Scheduled load summary: per-lane arrival plans, per-stage latency
 //! cohorts, and where an overloaded ramp ended.
 
-use super::super::pacing::{MAX_ADMISSION_LAG_NS, Plan};
+use super::super::pacing::Plan;
 use super::{Args, Config, Histogram, Result, Value, Window, error, json, reader_copy, totals};
 
 fn all_lanes(workers: &[Value]) -> Result<Vec<Value>> {
@@ -163,7 +163,7 @@ fn scheduled_row(config: &Config, plans: &[Plan], stages: Vec<Value>) -> Result<
         "scope":"total across writer connections; global ordinal modulo connections",
         "release_quantum_ns":0,
         "release_timer":"CLOCK_MONOTONIC timerfd with absolute deadlines; no additional quantization",
-        "maximum_admission_lag_ns":MAX_ADMISSION_LAG_NS,
+        "maximum_admission_lag_ns":config.args.max_admission_lag_ns(),
         "overload":if config.args.ramp.is_some() {
             "an arrival unadmitted for the maximum lag ends the ramp at its stage; admitted records drain"
         } else {

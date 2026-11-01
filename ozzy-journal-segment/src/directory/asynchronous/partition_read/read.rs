@@ -3,16 +3,12 @@
 
 use super::{
     ActiveReadIndex, Admission, Cache, CapturedReadEntries, ReadRange, Scope, Selection, Source,
-    index_error,
-    sources::{extent_reader, scan_index},
+    sources::{cached_index, extent_reader},
 };
 use crate::JournalIndexError as Error;
 use crate::reader::ResidentOperations;
 use crate::retention::PreparedSegmentLease;
-use crate::{
-    DirectoryError, IndexBuildLimits, IndexedReadError, OffsetIndexEntry, OperationLocation,
-    RecordSpan,
-};
+use crate::{IndexBuildLimits, IndexedReadError, OffsetIndexEntry, OperationLocation, RecordSpan};
 use ozzy_journal::ReadLimits;
 use ozzy_proto::Offset;
 use std::cell::RefCell;
@@ -120,34 +116,7 @@ impl Read {
     }
 
     async fn load_index(&self, source: Source) -> Result<Rc<ActiveReadIndex>, Error> {
-        if let Some(index) = self.cold.borrow().find(source.index) {
-            return Ok(index);
-        }
-        let loaded = crate::index_builder::asynchronous::open(
-            &self.scope.access,
-            self.scope
-                .root
-                .join("indexes")
-                .join(crate::segment_index_name(source.index)),
-            source.index,
-            self.index_limits.file,
-            self.scope.limits.io.chunk_bytes,
-        )
-        .await;
-        let index = match loaded {
-            Ok(index) => ActiveReadIndex::from_persisted_async(&index)
-                .await
-                .map_err(index_error)?,
-            Err(crate::IndexBuildError::Io(error))
-                if error.kind() == std::io::ErrorKind::NotFound =>
-            {
-                scan_index(&self.scope, source, self.index_limits).await?
-            }
-            Err(error) => return Err(DirectoryError::from(error).into()),
-        };
-        let index = Rc::new(index);
-        self.cold.borrow_mut().remember(index.clone());
-        Ok(index)
+        cached_index(&self.scope, &self.cold, self.index_limits, source).await
     }
 
     /// Visit borrowed spans, loading each operation once per read. A callback

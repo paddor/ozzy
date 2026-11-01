@@ -52,6 +52,9 @@ terms.
 - A full leader PUB socket delays publications. Full subscriber queues and
   gaps drop them; PEER repair fills them. Follower and reader publications
   use separate backing.
+- OMQ keeps frames queued for a stalled subscriber, and they hold the shard's
+  publication budget. After one second of refusal, publications drop until
+  the budget has room. Writes continue with the other follower over PEER.
 - Repair uses one data PEER connection per destination shard. A full shard
   pauses only that source; control and healthy copies continue.
 - If both followers stall, the unconfirmed window fills and producers see
@@ -84,6 +87,9 @@ sequenceDiagram
   stages nothing until its receipt restarts for the new view.
 - A new epoch needs a correlated probe and verified history. Counters within
   an epoch never retract or wrap.
+- A channel's base is verified once, at open, so retention may retire it. Later
+  receipts verify only the received prefix, and one journal lookup answers one
+  report.
 - The leader keeps one window in flight past its announced commit. Followers
   admit only inside it, and every owner of accepted but unapplied state holds
   up to two windows.
@@ -208,7 +214,8 @@ A copy that needs retired history withdraws into recovery instead of voting
 across the gap.
 
 - A follower told `HISTORY_RETIRED` for its next needed operation closes
-  intake, quarantines itself, and recovers.
+  intake, quarantines itself, and recovers. Unlike `--quarantine`, full
+  transfer removes its old files first; sealed damage still goes to repair.
 - A retained-topic restart probes the other brokers first. If both answer in
   one view and the primary's retained boundary is past the local accepted
   prefix, it persists a nonvoting marker and recovers.
@@ -238,6 +245,9 @@ across the gap.
 - Crash failures only: no Byzantine peers or reconstruction from arbitrary
   distributed corruption.
 - Recovery requires both other brokers in normal operation.
+- Broker clocks must stay in sync; nothing compares them. Delayed release, age
+  retention, and producer idle expiry follow the leader's clock, so a fast clock
+  acts early. The deduplication window uses logical time and is not affected.
 - No online membership change, larger groups, partition movement, or follower
   reads.
 - [Storage](STORAGE.md#supported-failure-model) defines physical failure

@@ -7,7 +7,7 @@ use crate::replica_actor::{
 };
 use crate::replica_journal::ReplicationPositions;
 use ozzy_replication::Commit;
-use ozzy_replication::flow::{OpenRequest, Transmitter};
+use ozzy_replication::flow::{OpenRequest, Report, Transmitter};
 use std::time::Duration;
 
 impl ReplicaActor {
@@ -50,6 +50,24 @@ impl ReplicaActor {
         }
     }
 
+    /// The base of `report`'s channel, if that channel is open here. It was
+    /// verified at open, and retention may have retired it since, so neither a
+    /// live receipt nor a later journal lookup reads it again.
+    fn established_base(&self, voter: usize, report: Report) -> Result<Option<Prefix>, ActorError> {
+        let Some(sender) = self.work.flow.peers[voter]
+            .as_ref()
+            .and_then(Transmitter::sender)
+            .filter(|sender| sender.channel() == report.channel)
+        else {
+            return Ok(None);
+        };
+        let base = sender.report().base;
+        if base != report.base {
+            return Err(ActorError::history(HistoryReason::ReceiveWindow));
+        }
+        Ok(Some(base))
+    }
+
     pub(super) fn try_open_flow(
         &mut self,
         voter: usize,
@@ -57,20 +75,9 @@ impl ReplicaActor {
         now: Duration,
     ) -> Result<bool, ActorError> {
         let report = request.report();
-        // A channel's base was independently verified at open. Do not reread
-        // old journal history on every live PUB receipt after cache eviction.
-        let established = self.work.flow.peers[voter]
-            .as_ref()
-            .and_then(Transmitter::sender)
-            .filter(|sender| sender.channel() == report.channel);
-        let base = if let Some(sender) = established {
-            let base = sender.report().base;
-            if base != report.base {
-                return Err(ActorError::history(HistoryReason::ReceiveWindow));
-            }
-            Some(base)
-        } else {
-            self.known_prefix(report.base)?
+        let base = match self.established_base(voter, report)? {
+            Some(base) => Some(base),
+            None => self.known_prefix(report.base)?,
         };
         let (Some(base), Some(received)) = (base, self.known_prefix(report.received)?) else {
             return Ok(false);
@@ -148,10 +155,15 @@ impl ReplicaActor {
             if self.pending_sync.is_some() || !self.pending_persistence.is_empty() {
                 return Ok(true); // Reserve quiescence only for an eligible lookup.
             }
+            let oldest = if self.established_base(voter, report)?.is_some() {
+                report.received.op
+            } else {
+                report.base.op
+            };
             self.pending = Some(PendingIo::FlowPositions(
                 self.journal.replication_positions(
                     self.driver.begin_validation()?,
-                    [report.base.op, report.received.op],
+                    [oldest, report.received.op],
                 )?,
                 voter,
                 request,
@@ -181,18 +193,23 @@ impl ReplicaActor {
         {
             return Ok(());
         }
-        let [Some(base), Some(received)] = positions.positions else {
-            if request.report().base.op < positions.retained_predecessor.op {
-                return self.notify_retired(
-                    self.configuration.voters()[voter],
-                    snapshot.scope,
-                    wire::HistoryFence::Receive(request.report().channel.epoch),
-                    positions.retained_predecessor,
-                );
-            }
+        let [base, received] = positions.positions;
+        let base = self.established_base(voter, request.report())?.or(base);
+        if let (Some(base), Some(received)) = (base, received) {
+            self.adopt_flow(voter, request, [base, received], now)?;
+        } else if positions.requested[0] < positions.retained_predecessor.op {
+            self.notify_retired(
+                self.configuration.voters()[voter],
+                snapshot.scope,
+                wire::HistoryFence::Receive(request.report().channel.epoch),
+                positions.retained_predecessor,
+            )?;
+        } else {
             return Err(ActorError::history(HistoryReason::ReceiveWindow));
-        };
-        self.adopt_flow(voter, request, [base, received], now)?;
+        }
+        // Proposals and repair wait behind a pending lookup, and repair is what
+        // moves a lagging peer's report. Repeating this one would hold both.
+        remote_peer(&mut self.work.flow.peers, voter)?.forget_candidate(request);
         Ok(())
     }
 }

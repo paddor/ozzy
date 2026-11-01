@@ -2,22 +2,35 @@
 //! locations.
 
 use super::{
-    INDEX_HEADER_BYTES, INDEX_MAGIC, INDEX_VERSION, IndexCounts, IndexFileError, IndexLayout,
-    IndexSource, MESSAGE_INDEX_ENTRY_BYTES, OFFSET_INDEX_ENTRY_BYTES, OPERATION_INDEX_ENTRY_BYTES,
-    OPERATION_LOCATION_BYTES, SCHEDULE_INDEX_ENTRY_BYTES, u64_from_usize,
+    BATCH_INDEX_ENTRY_BYTES, INDEX_HEADER_BYTES, INDEX_MAGIC, INDEX_VERSION, IndexCounts,
+    IndexFileError, IndexLayout, IndexSource, MESSAGE_INDEX_ENTRY_BYTES,
+    OPERATION_INDEX_ENTRY_BYTES, OPERATION_LOCATION_BYTES, SCHEDULE_INDEX_ENTRY_BYTES,
+    u64_from_usize,
 };
 use crate::{
-    MessageIndexEntry, OffsetIndexEntry, OperationIndexEntry, OperationLocation, RecordLocation,
-    ScheduleIndexEntry,
+    BatchIndexEntry, MessageRow, OperationIndexEntry, OperationLocation, ScheduleIndexEntry,
 };
 use ozzy_core::state::PendingSchedule;
 use ozzy_journal::operation::{Digest, ReleaseKey};
 use ozzy_proto::layout::Fixed;
 use ozzy_proto::{GroupId, MessageId, Offset, OperationId, PartitionIncarnation};
 
+/// What batch and message rows count from, so they need not repeat it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RowBase {
+    /// Partition of every record; `None` without records.
+    pub partition: Option<PartitionIncarnation>,
+    /// Offset of the first record, which message rows count from; zero without
+    /// records.
+    pub first_offset: u64,
+    /// First operation of the source, which batch rows count from.
+    pub first_op_number: u64,
+}
+
 pub(crate) fn encode_index_header(
     source: IndexSource,
     build_memory_limit: u64,
+    base: RowBase,
     counts: IndexCounts,
     layout: IndexLayout,
 ) -> Result<[u8; INDEX_HEADER_BYTES], IndexFileError> {
@@ -32,9 +45,9 @@ pub(crate) fn encode_index_header(
     header.put_u64::<80>(source.first_op_number);
     header.put_u64::<88>(source.last_op_number);
     header.put::<96, 32>(*source.last_operation_digest.as_bytes());
-    header.put_u64::<128>(u64_from_usize(counts.offsets)?);
+    header.put_u64::<128>(u64_from_usize(counts.batches)?);
     header.put_u64::<136>(INDEX_HEADER_BYTES as u64);
-    header.put_u32::<144>(OFFSET_INDEX_ENTRY_BYTES as u32);
+    header.put_u32::<144>(BATCH_INDEX_ENTRY_BYTES as u32);
     header.put_u64::<152>(u64_from_usize(counts.messages)?);
     header.put_u64::<160>(u64_from_usize(layout.message_start)?);
     header.put_u32::<168>(MESSAGE_INDEX_ENTRY_BYTES as u32);
@@ -49,7 +62,20 @@ pub(crate) fn encode_index_header(
     header.put_u64::<288>(u64_from_usize(counts.schedules)?);
     header.put_u64::<296>(u64_from_usize(layout.schedule_start)?);
     header.put_u32::<304>(SCHEDULE_INDEX_ENTRY_BYTES as u32);
+    header.put_u64::<312>(base.first_offset);
+    if let Some(partition) = base.partition {
+        header.put::<320, 16>(*partition.as_bytes());
+    }
     Ok(header)
+}
+
+pub(super) fn decode_row_base(header: &[u8; INDEX_HEADER_BYTES], first_op_number: u64) -> RowBase {
+    let partition = header.array::<320, 16>();
+    RowBase {
+        partition: (partition != [0; 16]).then(|| PartitionIncarnation::from_bytes(partition)),
+        first_offset: header.u64_at::<312>(),
+        first_op_number,
+    }
 }
 
 pub(super) fn decode_source(header: &[u8; INDEX_HEADER_BYTES]) -> IndexSource {
@@ -64,50 +90,47 @@ pub(super) fn decode_source(header: &[u8; INDEX_HEADER_BYTES]) -> IndexSource {
     }
 }
 
-pub(crate) fn encode_offset_entry(
-    entry: &OffsetIndexEntry,
-    output: &mut [u8; OFFSET_INDEX_ENTRY_BYTES],
+pub(crate) fn encode_batch_entry(
+    entry: &BatchIndexEntry,
+    base: RowBase,
+    output: &mut [u8; BATCH_INDEX_ENTRY_BYTES],
 ) {
-    output[..16].copy_from_slice(entry.partition.as_bytes());
-    output.put_u64::<16>(entry.offset.get());
-    output.put::<24, 56>(location_bytes(entry.location.operation));
-    output.put_u32::<80>(entry.location.batch_index);
-    output.put_u32::<84>(entry.location.record_index);
-    output.put_u64::<88>(entry.append_timestamp_millis);
+    output.put_u64::<0>(entry.first_offset.get());
+    output.put_u64::<8>(entry.append_timestamp_millis);
+    output.put_u32::<16>(entry.op_number.wrapping_sub(base.first_op_number) as u32);
+    output.put_u32::<20>(entry.batch_index);
+    output.put_u32::<24>(entry.records);
 }
 
-pub(super) fn decode_offset_entry(
-    input: &[u8; OFFSET_INDEX_ENTRY_BYTES],
-    segment_id: u64,
-) -> OffsetIndexEntry {
-    OffsetIndexEntry {
-        partition: PartitionIncarnation::from_bytes(input.array::<0, 16>()),
-        offset: Offset::new(input.u64_at::<16>()),
-        append_timestamp_millis: input.u64_at::<88>(),
-        location: RecordLocation {
-            operation: read_location(input.array::<24, 56>(), segment_id),
-            batch_index: input.u32_at::<80>(),
-            record_index: input.u32_at::<84>(),
-        },
+pub(super) fn decode_batch_entry(
+    input: &[u8; BATCH_INDEX_ENTRY_BYTES],
+    first_op_number: u64,
+) -> BatchIndexEntry {
+    BatchIndexEntry {
+        first_offset: Offset::new(input.u64_at::<0>()),
+        append_timestamp_millis: input.u64_at::<8>(),
+        op_number: first_op_number.saturating_add(u64::from(input.u32_at::<16>())),
+        batch_index: input.u32_at::<20>(),
+        records: input.u32_at::<24>(),
     }
 }
 
-pub(crate) fn encode_message_entry(
-    entry: &MessageIndexEntry,
+pub(crate) fn encode_message_row(
+    entry: &MessageRow,
+    base: RowBase,
     output: &mut [u8; MESSAGE_INDEX_ENTRY_BYTES],
 ) {
-    output[..16].copy_from_slice(entry.partition.as_bytes());
-    output.put::<16, 16>(*entry.message_id.as_bytes());
-    output.put_u64::<32>(entry.offset.get());
-    output.put::<40, 32>(*entry.operation_digest.as_bytes());
+    output[..16].copy_from_slice(entry.message_id.as_bytes());
+    output.put_u32::<16>(entry.offset.get().wrapping_sub(base.first_offset) as u32);
 }
 
-pub(super) fn decode_message_entry(input: &[u8; MESSAGE_INDEX_ENTRY_BYTES]) -> MessageIndexEntry {
-    MessageIndexEntry {
-        partition: PartitionIncarnation::from_bytes(input.array::<0, 16>()),
-        message_id: MessageId::from_bytes(input.array::<16, 16>()),
-        offset: Offset::new(input.u64_at::<32>()),
-        operation_digest: Digest::from_bytes(input.array::<40, 32>()),
+pub(super) fn decode_message_row(
+    input: &[u8; MESSAGE_INDEX_ENTRY_BYTES],
+    first_offset: u64,
+) -> MessageRow {
+    MessageRow {
+        message_id: MessageId::from_bytes(input.array::<0, 16>()),
+        offset: Offset::new(first_offset.saturating_add(u64::from(input.u32_at::<16>()))),
     }
 }
 
@@ -189,25 +212,5 @@ pub(super) fn decode_schedule_entry(
             bytes: input.u32_at::<44>(),
             message_id: MessageId::from_bytes(input.array::<48, 16>()),
         },
-    }
-}
-
-/// A record's operation location as stored in its offset entry.
-pub(super) fn location_bytes(location: OperationLocation) -> [u8; 56] {
-    let mut bytes = [0; 56];
-    bytes.put_u64::<0>(location.entry_offset);
-    bytes.put_u64::<8>(location.entry_bytes);
-    bytes.put_u64::<16>(location.op_number);
-    bytes.put::<24, 32>(*location.operation_digest.as_bytes());
-    bytes
-}
-
-fn read_location(bytes: [u8; 56], segment_id: u64) -> OperationLocation {
-    OperationLocation {
-        segment_id,
-        entry_offset: bytes.u64_at::<0>(),
-        entry_bytes: bytes.u64_at::<8>(),
-        op_number: bytes.u64_at::<16>(),
-        operation_digest: Digest::from_bytes(bytes.array::<24, 32>()),
     }
 }

@@ -130,9 +130,12 @@ async fn cli_zstd_tcp_three_brokers_restart_and_confirm_disk_quorum() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn cli_tcp_saved_producer_resumes_and_takes_over_after_broker_kills() {
-    tokio::time::timeout(Duration::from_secs(60), saved_identity_after_crashes())
-        .await
-        .unwrap();
+    Box::pin(tokio::time::timeout(
+        Duration::from_secs(60),
+        saved_identity_after_crashes(),
+    ))
+    .await
+    .unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]

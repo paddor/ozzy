@@ -5,10 +5,10 @@ use ozzy_proto::{MessageId, Offset, OperationId, PartitionIncarnation};
 use thiserror::Error;
 
 use crate::{
-    INDEX_HEADER_BYTES, IndexFileError, IndexLimits, IndexSource, MESSAGE_INDEX_ENTRY_BYTES,
-    MessageIndexEntry, OFFSET_INDEX_ENTRY_BYTES, OPERATION_INDEX_ENTRY_BYTES,
-    OPERATION_LOCATION_BYTES, OffsetIndexEntry, OperationIndexEntry, OperationLocation,
-    SCHEDULE_INDEX_ENTRY_BYTES, SealedSegment, SegmentIndexImage, SegmentScan,
+    BATCH_INDEX_ENTRY_BYTES, BatchIndexEntry, INDEX_HEADER_BYTES, IndexFileError, IndexLimits,
+    IndexSource, MESSAGE_INDEX_ENTRY_BYTES, MessageIndexEntry, MessageRow,
+    OPERATION_INDEX_ENTRY_BYTES, OPERATION_LOCATION_BYTES, OffsetIndexEntry, OperationIndexEntry,
+    OperationLocation, SCHEDULE_INDEX_ENTRY_BYTES, SealedSegment, SegmentIndexImage, SegmentScan,
     index_file::IndexCounts,
 };
 
@@ -64,21 +64,20 @@ impl ActiveSegmentIndex {
         // In-memory active rows use the same validated image order as disk.
         match query.start {
             ozzy_proto::reader::Start::RecordId { id, .. } => {
+                if self.image.partition() != Some(query.partition) {
+                    return;
+                }
                 let messages = self.image.messages();
-                let key =
-                    |entry: &MessageIndexEntry| (entry.partition, entry.message_id, entry.offset);
-                let first = messages.partition_point(|entry| {
-                    key(entry) < (query.partition, id, query.retained_from)
-                });
-                let after = messages.partition_point(|entry| {
-                    key(entry) < (query.partition, id, query.confirmed_end)
-                });
+                let key = |entry: &MessageRow| (entry.message_id, entry.offset);
+                let first =
+                    messages.partition_point(|entry| key(entry) < (id, query.retained_from));
+                let after =
+                    messages.partition_point(|entry| key(entry) < (id, query.confirmed_end));
                 if let Some(matching) = messages.get(first..after)
                     && let (Some(first), Some(last)) = (matching.first(), matching.last())
                 {
                     for entry in [first, last] {
-                        if entry.partition == query.partition
-                            && entry.message_id == id
+                        if entry.message_id == id
                             && self.find_offset(query.partition, entry.offset).is_some_and(
                                 |offset| offset.location.operation.op_number <= query.through,
                             )
@@ -89,9 +88,9 @@ impl ActiveSegmentIndex {
                 }
             }
             ozzy_proto::reader::Start::Timestamp(timestamp) => {
-                let offsets = self.image.offsets().iter().copied();
+                let heads = self.image.batch_heads();
                 let find = |partition, offset| self.find_offset(partition, offset);
-                if let Some(offset) = query.timestamp_offset(timestamp, offsets, find) {
+                if let Some(offset) = query.timestamp_offset(timestamp, heads, find) {
                     result.observe_match(offset);
                 }
             }
@@ -233,8 +232,12 @@ impl ActiveSegmentIndex {
         self.image.find_operation_number(number)
     }
 
-    pub(crate) fn offsets(&self) -> &[OffsetIndexEntry] {
-        self.image.offsets()
+    pub(crate) fn partition(&self) -> Option<PartitionIncarnation> {
+        self.image.partition()
+    }
+
+    pub(crate) fn batches(&self) -> &[BatchIndexEntry] {
+        self.image.batches()
     }
 
     pub(crate) fn schedules(&self) -> &[crate::ScheduleIndexEntry] {
@@ -246,17 +249,7 @@ impl ActiveSegmentIndex {
         partition: PartitionIncarnation,
         offset: Offset,
     ) -> Option<OffsetIndexEntry> {
-        self.image
-            .offsets()
-            .binary_search_by(|entry| {
-                entry
-                    .partition
-                    .as_bytes()
-                    .cmp(partition.as_bytes())
-                    .then_with(|| entry.offset.cmp(&offset))
-            })
-            .ok()
-            .map(|index| self.image.offsets()[index])
+        self.image.find_offset(partition, offset)
     }
 
     pub(crate) fn find_message(
@@ -264,19 +257,7 @@ impl ActiveSegmentIndex {
         partition: PartitionIncarnation,
         message_id: MessageId,
     ) -> Option<MessageIndexEntry> {
-        let messages = self.image.messages();
-        let index = messages.partition_point(|entry| {
-            entry
-                .partition
-                .as_bytes()
-                .cmp(partition.as_bytes())
-                .then_with(|| entry.message_id.as_bytes().cmp(message_id.as_bytes()))
-                .is_lt()
-        });
-        messages
-            .get(index)
-            .copied()
-            .filter(|entry| entry.partition == partition && entry.message_id == message_id)
+        self.image.find_message(partition, message_id)
     }
 
     pub(crate) fn find_operation(&self, operation_id: OperationId) -> Option<OperationIndexEntry> {
@@ -313,7 +294,7 @@ fn extend_bounded<T>(
 
 fn enforce_footprint(counts: IndexCounts, limits: IndexLimits) -> Result<(), ActiveIndexError> {
     let bytes = [
-        (counts.offsets, OFFSET_INDEX_ENTRY_BYTES),
+        (counts.batches, BATCH_INDEX_ENTRY_BYTES),
         (counts.messages, MESSAGE_INDEX_ENTRY_BYTES),
         (counts.operations, OPERATION_INDEX_ENTRY_BYTES),
         (counts.locations, OPERATION_LOCATION_BYTES),
@@ -339,7 +320,7 @@ fn enforce_footprint(counts: IndexCounts, limits: IndexLimits) -> Result<(), Act
 
 fn validate_limits(limits: IndexLimits) -> Result<(), ActiveIndexError> {
     if limits.max_file_bytes < INDEX_HEADER_BYTES
-        || limits.max_offset_entries == 0
+        || limits.max_batch_entries == 0
         || limits.max_message_entries == 0
         || limits.max_operation_entries == 0
         || limits.max_schedule_entries == 0
