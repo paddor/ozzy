@@ -23,6 +23,8 @@
   on its leader. Once retention had removed the start of the replication
   channel, the leader repeated a history check ahead of proposals and repair,
   so every partition it led stayed stuck.
+- A leader no longer exits when a recovering follower fetches history while
+  another follower is being repaired from disk.
 
 ## [0.7.0] - 2026-10-29
 

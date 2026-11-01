@@ -4,7 +4,6 @@ use super::io::FetchPurpose;
 use super::{
     ActorError, Bytes, Duration, Message, NodeId, PendingIo, ReplicaActor, SendClass, wire,
 };
-use crate::replica_actor::HistoryReason;
 use crate::replica_actor::require_normal;
 use crate::replica_journal::{FetchedHistory, PinnedRecovery};
 use ozzy_replication::recovery::RecoveryResponse;
@@ -282,10 +281,11 @@ impl ReplicaActor {
                     self.configuration.voters()[index],
                 ))
             } else if let (Some(pin), Some(request)) = (slot.pin.held(), slot.fetch) {
-                let buffer = self
-                    .buffer
-                    .take()
-                    .ok_or_else(|| ActorError::history(HistoryReason::BufferUnavailable))?;
+                // A replay running beside this turn may hold the buffer. The
+                // fetch stays queued, and that replay finishing brings another turn.
+                let Some(buffer) = self.buffer.take() else {
+                    continue;
+                };
                 slot.fetch = None;
                 Some(PendingIo::Fetch(
                     self.journal

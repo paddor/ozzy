@@ -96,6 +96,133 @@ fn recovery_freezes_an_unsent_candidate_after_intervening_commit() {
     }
 }
 
+/// A replay to a lagging follower runs beside the next journal turn and holds
+/// the leader's one fetch buffer. A recovering peer's fetch waits for it.
+#[test]
+fn a_recovery_fetch_waits_while_a_replay_holds_the_fetch_buffer() {
+    let (mut controller, io) = setup();
+    let mut actors = (0..3)
+        .map(|broker| Scheduled::new(unstarted_actor(&mut controller, &io, 0, broker, 64)).unwrap())
+        .collect::<Vec<_>>();
+    for _ in 0..100 {
+        round(&mut actors, false);
+        settle(&mut controller, &[]);
+    }
+    assert!(actors.iter().all(|actor| actor.status().application_ready));
+
+    // Follower 1 misses more operations than the replay cache holds.
+    let mut lane = actors[0].take_submitter().unwrap();
+    let mut buffer = actors[0]
+        .lease_proposal_buffer_with_limits(actor_config().pipeline)
+        .unwrap();
+    for body in 0..32 {
+        buffer.clear();
+        buffer
+            .push(ozzy_journal::operation::OperationKind::Barrier, &[body; 16])
+            .unwrap();
+        let mut pending = Box::pin(lane.try_submit(buffer).unwrap());
+        let mut reply = None;
+        for _ in 0..10000 {
+            for (to, message) in collect(&mut actors, Duration::ZERO, false) {
+                if to != 1 {
+                    actors[to].receive(&message, Duration::ZERO).unwrap();
+                }
+            }
+            settle(&mut controller, &[]);
+            if let Poll::Ready(result) = poll(pending.as_mut()) {
+                reply = Some(result.unwrap());
+                break;
+            }
+        }
+        buffer = reply.expect("the pair confirms").buffer;
+    }
+
+    // Its probe answer starts a replay from disk, which takes the buffer.
+    // Hold that read.
+    let idle = actors[0].arenas().0;
+    let mut now = Duration::ZERO;
+    let mut held = Vec::new();
+    for _ in 0..10000 {
+        now += Duration::from_millis(1);
+        for (to, message) in collect(&mut actors, now, false) {
+            actors[to].receive(&message, now).unwrap();
+        }
+        if actors[0].arenas().0 < idle {
+            held = controller.jobs().iter().map(|(id, _)| *id).collect();
+            break;
+        }
+        settle(&mut controller, &[]);
+    }
+    assert!(!held.is_empty(), "a replay reads the journal");
+
+    let request = RecoveryRequest {
+        scope: actors[0].status().scope,
+        request_id: ozzy_proto::RequestId::from_bytes([97; 16]),
+        nonce: ozzy_proto::RequestId::from_bytes([98; 16]),
+        nonvoting: true,
+    };
+    actors[0]
+        .receive(&request_message(request, actor_config().sessions[2]), now)
+        .unwrap();
+    let response = expect_response_holding(
+        &mut controller,
+        &mut actors[0],
+        request,
+        actor_config().sessions[2],
+        now,
+        &held,
+    );
+    let log = response.primary.unwrap();
+    let fetch = wire::FetchOps {
+        scope: request.scope,
+        request_id: ozzy_proto::RequestId::from_bytes([99; 16]),
+        source: ozzy_replication::LogSource {
+            voter: NodeId::from_bytes([1; 16]),
+            generation: log.generation,
+            accepted: log.accepted,
+        },
+        predecessor: Prefix::GENESIS,
+        max_operations: actor_config().transfer.max_operations as u32,
+        max_body_bytes: actor_config().transfer.max_body_bytes as u32,
+    };
+    actors[0]
+        .receive(&super::history::fetch_message(fetch), now)
+        .unwrap();
+    actors[0].advance(now).unwrap();
+
+    // The replay finishes and returns the buffer, and the fetch gets its turn.
+    let mut served = false;
+    for _ in 0..1000 {
+        settle(&mut controller, &[]);
+        actors[0].advance(now).unwrap();
+        observe_at(&mut actors[0], now);
+        actors[0]
+            .flush(|message| {
+                served |= opcode(&message) == ozzy_proto::Opcode::Ops;
+                Ok(())
+            })
+            .unwrap();
+        if served {
+            break;
+        }
+    }
+    assert!(
+        served,
+        "the fetch must be served: {:#?}",
+        actors[0].status()
+    );
+    for actor in actors {
+        close(&mut controller, actor);
+    }
+}
+
+fn observe_at(actor: &mut Scheduled, now: Duration) {
+    let mut event = std::pin::pin!(actor.changed(now));
+    if let Poll::Ready(result) = poll(event.as_mut()) {
+        result.unwrap();
+    }
+}
+
 #[test]
 fn a_nonvoting_primary_ends_the_view_its_peers_elect_but_a_startup_probe_does_not() {
     let (mut controller, io) = setup();
@@ -312,6 +439,17 @@ fn expect_response(
     session: LinkSessionId,
     now: Duration,
 ) -> ozzy_replication::recovery::RecoveryResponse {
+    expect_response_holding(controller, actor, request, session, now, &[])
+}
+
+fn expect_response_holding(
+    controller: &mut Controller,
+    actor: &mut Scheduled,
+    request: RecoveryRequest,
+    session: LinkSessionId,
+    now: Duration,
+    held: &[JobId],
+) -> ozzy_replication::recovery::RecoveryResponse {
     let binding = wire::PeerBinding::new(
         config("/unused", 4).configuration.configuration(),
         NodeId::from_bytes([1; 16]),
@@ -326,7 +464,7 @@ fn expect_response(
                 result.unwrap();
             }
         }
-        settle(controller, &[]);
+        settle(controller, held);
         let mut replied = None;
         actor
             .flush(|message| {
