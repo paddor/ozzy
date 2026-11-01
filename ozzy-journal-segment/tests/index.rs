@@ -13,8 +13,8 @@ use ozzy_journal::operation::{
     OperationLimits, encode_operation_body, logical_operation_digest,
 };
 use ozzy_journal_segment::{
-    DecodeLimits, Digest, GroupStart, IndexError, SEGMENT_HEADER_BYTES, SegmentHeader,
-    decode_group, derive_index_entries, encode_group,
+    BatchIndexEntry, DecodeLimits, Digest, GroupStart, IndexError, MessageRow,
+    SEGMENT_HEADER_BYTES, SegmentHeader, decode_group, derive_index_entries, encode_group,
 };
 use ozzy_proto::{
     GroupId, MessageId, Offset, OperationId, OwnerEpoch, PartitionIncarnation, ProducerEpoch,
@@ -25,7 +25,8 @@ fn partition(byte: u8) -> PartitionIncarnation {
     PartitionIncarnation::from_bytes([byte; 16])
 }
 
-fn append_body() -> OperationBody<'static> {
+/// An APPEND of two batches, the second addressed to `second`.
+fn append_body(second: u8) -> OperationBody<'static> {
     OperationBody::Append(Append {
         batches: vec![
             AppendBatch {
@@ -51,7 +52,7 @@ fn append_body() -> OperationBody<'static> {
                 .into(),
             },
             AppendBatch {
-                partition: partition(0x21),
+                partition: partition(second),
                 owner_epoch: OwnerEpoch::new(2),
                 producer_id: ProducerId::from_bytes([0x31; 16]),
                 producer_epoch: ProducerEpoch::new(3),
@@ -73,7 +74,7 @@ fn append_body() -> OperationBody<'static> {
 fn validated_operations_yield_exact_record_and_retry_entries() {
     let group_id = GroupId::from_bytes([0x10; 16]);
     let header = SegmentHeader::new(group_id, 7, None, Digest::ZERO, 16 * 1024).unwrap();
-    let append = append_body();
+    let append = append_body(0x20);
     let append_bytes = encode_operation_body(&append, OperationLimits::default()).unwrap();
     let append_operation = CanonicalOperation {
         group_id,
@@ -119,19 +120,38 @@ fn validated_operations_yield_exact_record_and_retry_entries() {
 
     let entries =
         derive_index_entries(&header, &decoded.operations[0], OperationLimits::default()).unwrap();
-    assert_eq!(entries.offsets.len(), 3);
-    assert_eq!(entries.messages.len(), 3);
-    assert!(entries.operation.is_none());
-    assert_eq!(entries.offsets[0].offset, Offset::new(40));
-    assert_eq!(entries.offsets[1].offset, Offset::new(41));
-    assert_eq!(entries.offsets[2].offset, Offset::new(80));
-    assert_eq!(entries.offsets[2].location.batch_index, 1);
-    assert_eq!(entries.offsets[2].location.record_index, 0);
-    assert_eq!(entries.offsets[0].location.operation.segment_id, 7);
-    assert_eq!(entries.offsets[0].location.operation.op_number, 1);
-    assert_eq!(entries.messages[1].offset, Offset::new(41));
+    assert_eq!(entries.partition, Some(partition(0x20)));
     assert_eq!(
-        entries.messages[0].operation_digest,
+        entries.batches,
+        [
+            BatchIndexEntry {
+                first_offset: Offset::new(40),
+                append_timestamp_millis: 123,
+                op_number: 1,
+                batch_index: 0,
+                records: 2,
+            },
+            BatchIndexEntry {
+                first_offset: Offset::new(80),
+                append_timestamp_millis: 123,
+                op_number: 1,
+                batch_index: 1,
+                records: 1,
+            },
+        ]
+    );
+    assert_eq!(
+        entries.messages,
+        [(0x40, 40), (0x41, 41), (0x42, 80)].map(|(id, offset)| MessageRow {
+            message_id: MessageId::from_bytes([id; 16]),
+            offset: Offset::new(offset),
+        })
+    );
+    assert!(entries.operation.is_none());
+    assert_eq!(entries.location.segment_id, 7);
+    assert_eq!(entries.location.op_number, 1);
+    assert_eq!(
+        entries.location.operation_digest,
         logical_operation_digest(&append_operation)
     );
     let wrong_header = SegmentHeader::new(
@@ -160,6 +180,32 @@ fn validated_operations_yield_exact_record_and_retry_entries() {
         operation.location.entry_offset,
         decoded.operations[1].entry_offset
     );
-    assert_eq!(entries.offsets.len(), 0);
+    assert_eq!(entries.partition, None);
+    assert_eq!(entries.batches.len(), 0);
     assert_eq!(entries.messages.len(), 0);
+}
+
+#[test]
+fn an_operation_of_two_partitions_has_no_index_entries() {
+    let group_id = GroupId::from_bytes([0x10; 16]);
+    let header = SegmentHeader::new(group_id, 7, None, Digest::ZERO, 16 * 1024).unwrap();
+    let append = append_body(0x21);
+    let append_bytes = encode_operation_body(&append, OperationLimits::default()).unwrap();
+    let operation = CanonicalOperation {
+        group_id,
+        configuration_epoch: 1,
+        original_view: 0,
+        op_number: 1,
+        previous_digest: Digest::ZERO,
+        kind: append.kind(),
+        body: &append_bytes,
+    };
+    let start = GroupStart::new(1, SEGMENT_HEADER_BYTES as u64, ChainPosition::GENESIS);
+    let encoded = encode_group(&header, start, &[operation]).unwrap();
+    let decoded =
+        decode_group(&header, start, encoded.as_bytes(), DecodeLimits::default()).unwrap();
+    assert_eq!(
+        derive_index_entries(&header, &decoded.operations[0], OperationLimits::default()),
+        Err(IndexError::MixedPartitions)
+    );
 }

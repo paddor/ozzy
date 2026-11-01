@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Breaking
+
+- Segment index files have a new format. Format stores again, or remove the
+  `.idx` files in each journal's `indexes/` directory, which rebuilds them from
+  segments.
+
+### Changed
+
+- Segment indexes keep one 32-byte row per batch and one 20-byte row per record,
+  in place of 176 bytes per record. Indexes of segments with many small records
+  shrink to about a tenth, which shortens index builds and failover and lowers
+  broker memory use.
+
 ### Fixed
 
 - A broker that keeps falling behind no longer fills its disk. Each recovery

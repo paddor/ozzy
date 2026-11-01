@@ -2,23 +2,19 @@
 //! locations.
 
 use super::{
-    IndexFileError, IndexSource, MESSAGE_INDEX_ENTRY_BYTES, OFFSET_INDEX_ENTRY_BYTES,
+    BATCH_INDEX_ENTRY_BYTES, IndexFileError, IndexSource, MESSAGE_INDEX_ENTRY_BYTES,
     OPERATION_INDEX_ENTRY_BYTES, OPERATION_LOCATION_BYTES, SCHEDULE_INDEX_ENTRY_BYTES,
-    SegmentIndexImage, SegmentIndexView, compare_message_entries, compare_offset_entries,
+    SegmentIndexImage, SegmentIndexView, compare_batch_entries, compare_message_rows,
     compare_operation_entries, compare_schedule_entries,
-    order::{
-        binary_search_section, compare_offset_key, compare_partition_offset, raw_order_checks,
-        sorted_entry_checks,
-    },
+    order::{raw_order_checks, sorted_entry_checks},
     require_zero,
     rows::{
-        decode_message_entry, decode_offset_entry, decode_operation_entry,
-        decode_operation_location, decode_schedule_entry,
+        decode_batch_entry, decode_message_row, decode_operation_entry, decode_operation_location,
+        decode_schedule_entry,
     },
 };
-use crate::{ENTRY_HEADER_BYTES, OperationLocation, SEGMENT_HEADER_BYTES};
+use crate::{BatchIndexEntry, ENTRY_HEADER_BYTES, OperationLocation, SEGMENT_HEADER_BYTES};
 use ozzy_journal::operation::Digest;
-use ozzy_proto::layout::Fixed;
 
 pub(super) fn validate_image(image: &SegmentIndexImage) -> Result<(), IndexFileError> {
     validate_image_header(image)?;
@@ -31,7 +27,13 @@ pub(super) fn validate_image(image: &SegmentIndexImage) -> Result<(), IndexFileE
 pub(super) fn validate_image_header(image: &SegmentIndexImage) -> Result<(), IndexFileError> {
     validate_source(image.source)?;
     validate_location_count(image.source, image.locations().len())?;
-    if image.offsets().len() != image.messages().len() {
+    if image.partition().is_some() == image.batches().is_empty() {
+        return Err(IndexFileError::InvalidRecordRange);
+    }
+    let records = image.batches().iter().try_fold(0_usize, |total, batch| {
+        total.checked_add(batch.records as usize)
+    });
+    if records != Some(image.messages().len()) {
         return Err(IndexFileError::RecordIndexCountMismatch);
     }
     Ok(())
@@ -40,10 +42,11 @@ pub(super) fn validate_image_header(image: &SegmentIndexImage) -> Result<(), Ind
 pub(super) fn image_checks(
     image: &SegmentIndexImage,
 ) -> impl Iterator<Item = Result<usize, IndexFileError>> + '_ {
-    sorted_entry_checks(image.offsets(), compare_offset_entries, "offset")
+    let first_offset = image.base().first_offset;
+    sorted_entry_checks(image.batches(), compare_batch_entries, "batch")
         .chain(sorted_entry_checks(
             image.messages(),
-            compare_message_entries,
+            compare_message_rows,
             "message",
         ))
         .chain(sorted_entry_checks(
@@ -52,15 +55,13 @@ pub(super) fn image_checks(
             "operation",
         ))
         .chain(schedule_image_checks(image))
-        .chain(image.offsets().iter().map(|entry| {
-            if entry.location.record_index != 0 && entry.append_timestamp_millis != 0 {
-                return Err(IndexFileError::NonZeroReserved);
-            }
-            validate_location(image.source, entry.location.operation)?;
-            validate_indexed_location(entry.location.operation, |number| {
-                image.find_operation_number(number)
-            })?;
-            Ok(OFFSET_INDEX_ENTRY_BYTES)
+        .chain(image.batches().iter().enumerate().map(|(at, &batch)| {
+            let previous = at
+                .checked_sub(1)
+                .and_then(|at| image.batches().get(at))
+                .copied();
+            validate_batch(image.source, previous, batch)?;
+            Ok(size_of::<BatchIndexEntry>())
         }))
         .chain(image.operations().iter().map(|entry| {
             validate_location(image.source, entry.location)?;
@@ -76,20 +77,13 @@ pub(super) fn image_checks(
             }
             Ok(OPERATION_LOCATION_BYTES)
         }))
-        .chain(image.messages().iter().map(|message| {
-            if image
-                .offsets()
-                .binary_search_by(|entry| {
-                    compare_partition_offset(
-                        entry.partition,
-                        entry.offset,
-                        message.partition,
-                        message.offset,
-                    )
-                })
-                .is_err()
-            {
-                return Err(IndexFileError::MissingOffsetEntry);
+        .chain(image.messages().iter().map(move |message| {
+            if image.batch_holding(message.offset).is_none() {
+                return Err(IndexFileError::MissingBatchEntry);
+            }
+            // Message rows store the offset as a 32-bit delta.
+            if u32::try_from(message.offset.get().saturating_sub(first_offset)).is_err() {
+                return Err(IndexFileError::LengthOverflow);
             }
             Ok(MESSAGE_INDEX_ENTRY_BYTES)
         }))
@@ -123,14 +117,14 @@ pub(super) fn validate_source(source: IndexSource) -> Result<(), IndexFileError>
 
 /// Check ordering first so later binary searches only see validated ordering.
 /// The iterator retains no entry allocation and each step checks at most one
-/// entry (including a logarithmic offset lookup for message entries).
+/// entry (including a logarithmic batch lookup for message entries).
 pub(super) fn section_checks(
     view: SegmentIndexView<'_>,
 ) -> impl Iterator<Item = Result<usize, IndexFileError>> + '_ {
-    raw_order_checks::<OFFSET_INDEX_ENTRY_BYTES>(view.offsets, 24, "offset")
+    raw_order_checks::<BATCH_INDEX_ENTRY_BYTES>(view.batches, 8, "batch")
         .chain(raw_order_checks::<MESSAGE_INDEX_ENTRY_BYTES>(
             view.messages,
-            40,
+            MESSAGE_INDEX_ENTRY_BYTES,
             "message",
         ))
         .chain(raw_order_checks::<OPERATION_INDEX_ENTRY_BYTES>(
@@ -144,48 +138,76 @@ pub(super) fn section_checks(
             "schedule",
         ))
         .chain(schedule_row_checks(view))
-        .chain(offset_row_checks(view))
+        .chain(location_row_checks(view))
+        .chain(batch_row_checks(view))
         .chain(message_row_checks(view))
         .chain(operation_row_checks(view))
-        .chain(location_row_checks(view))
 }
 
-/// Reserved bytes and an indexed, in-source operation for each offset row.
-fn offset_row_checks(
+/// Each batch row against the one before it, then record counts that sum to the
+/// message rows.
+fn batch_row_checks(
     view: SegmentIndexView<'_>,
 ) -> impl Iterator<Item = Result<usize, IndexFileError>> + '_ {
     let source = view.source;
-    let rows = view.offsets.as_chunks::<OFFSET_INDEX_ENTRY_BYTES>().0;
-    rows.iter().map(move |entry| {
-        if entry.u32_at::<84>() != 0 {
-            require_zero(entry, 88..96)?;
-        }
-        let operation = decode_offset_entry(entry, source.segment_id)
-            .location
-            .operation;
-        validate_location(source, operation)?;
-        validate_indexed_location(operation, |number| view.find_operation_number(number))?;
-        Ok(OFFSET_INDEX_ENTRY_BYTES)
-    })
+    let expected = view.message_count() as u64;
+    let rows = view.batches.as_chunks::<BATCH_INDEX_ENTRY_BYTES>().0;
+    rows.iter().map(Some).chain(std::iter::once(None)).scan(
+        (0_u64, None),
+        move |(records, previous), row| {
+            Some(match row {
+                Some(row) => {
+                    let batch = decode_batch_entry(row, source.first_op_number);
+                    *records = records.saturating_add(u64::from(batch.records));
+                    let checked = require_zero(row, 28..32)
+                        .and_then(|()| validate_batch(source, *previous, batch))
+                        .map(|()| BATCH_INDEX_ENTRY_BYTES);
+                    *previous = Some(batch);
+                    checked
+                }
+                None if *records == expected => Ok(0),
+                None => Err(IndexFileError::RecordIndexCountMismatch),
+            })
+        },
+    )
 }
 
-/// Reserved bytes and a matching offset row for each message row.
+/// A batch row holding each message row's offset.
 fn message_row_checks(
     view: SegmentIndexView<'_>,
 ) -> impl Iterator<Item = Result<usize, IndexFileError>> + '_ {
     let rows = view.messages.as_chunks::<MESSAGE_INDEX_ENTRY_BYTES>().0;
     rows.iter().map(move |entry| {
-        require_zero(entry, 72..80)?;
-        let message = decode_message_entry(entry);
-        if binary_search_section(view.offsets, |entry| {
-            compare_offset_key(entry, message.partition, message.offset)
-        })
-        .is_none()
-        {
-            return Err(IndexFileError::MissingOffsetEntry);
+        let message = decode_message_row(entry, view.base.first_offset);
+        if view.batch_holding(message.offset).is_none() {
+            return Err(IndexFileError::MissingBatchEntry);
         }
         Ok(MESSAGE_INDEX_ENTRY_BYTES)
     })
+}
+
+/// Records in an in-source operation, after and in log order with `previous`.
+fn validate_batch(
+    source: IndexSource,
+    previous: Option<BatchIndexEntry>,
+    batch: BatchIndexEntry,
+) -> Result<(), IndexFileError> {
+    if batch.records == 0
+        || batch.op_number < source.first_op_number
+        || batch.op_number > source.last_op_number
+    {
+        return Err(IndexFileError::InvalidLocation);
+    }
+    batch.end_offset().ok_or(IndexFileError::LengthOverflow)?;
+    if let Some(previous) = previous
+        && (previous
+            .end_offset()
+            .is_none_or(|end| end > batch.first_offset.get())
+            || (previous.op_number, previous.batch_index) >= (batch.op_number, batch.batch_index))
+    {
+        return Err(IndexFileError::UnsortedOrDuplicate("batch"));
+    }
+    Ok(())
 }
 
 /// Reserved bytes and an indexed, in-source location for each operation row.

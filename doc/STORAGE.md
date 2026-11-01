@@ -423,18 +423,28 @@ generation.
 ### Indexes and reads
 
 Index files bind one sealed source by name. Header: 4096 bytes, `OZYIDX01`,
-format 4. Rows: record offsets 96 bytes, message IDs 80, operation IDs 80, a
-dense 56-byte numeric selector for every canonical operation, including
-payload-free duplicate results, and 64-byte scheduled records.
+format 5. Rows: batches 32 bytes, message IDs 20, operation IDs 80, a dense
+56-byte numeric selector for every canonical operation, including payload-free
+duplicate results, and 64-byte scheduled records.
 
+- The header holds the records' partition and first offset, so rows do not
+  repeat them. One index holds one partition, as a journal does.
+- A batch row holds the batch's first offset, append time, operation, batch
+  index, and record count. A record's location comes from its batch row and that
+  operation's numeric selector, so a segment of many small records keeps one row
+  per batch.
+- A message row holds one record's ID and its offset as a 32-bit delta from the
+  header's first offset, sorted by ID, then offset.
 - Scheduled-record rows sort by partition, release key, then operation and
   record index, since a carried copy keeps its original's key. Each holds
   the key, its `Schedule` or `Carry` operation, record index, encoded bytes,
   and message ID, so held records after a release key can be listed without
   reading payloads.
 
-- An index build sorts entries into `staging/` runs and merges them as they
-  build up, so a segment of many small records stays within the staging bound.
+- An index build writes batch rows and numeric selectors straight to their
+  sections, since they arrive in order. It sorts other rows into `staging/` runs
+  and merges them as they build up, so a segment of many small records stays
+  within the staging bound.
 - A missing or corrupt index is rebuilt from validated segment bytes. A
   background job builds each sealed segment's index beside later writes; a
   build validates the segment once. A view change or other snapshot build waits

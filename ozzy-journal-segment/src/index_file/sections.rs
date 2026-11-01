@@ -1,14 +1,14 @@
 //! Index file sections: counts, byte offsets, and total size.
 
 use super::{
-    INDEX_HEADER_BYTES, IndexFileError, IndexLimits, MESSAGE_INDEX_ENTRY_BYTES,
-    OFFSET_INDEX_ENTRY_BYTES, OPERATION_INDEX_ENTRY_BYTES, OPERATION_LOCATION_BYTES,
+    BATCH_INDEX_ENTRY_BYTES, INDEX_HEADER_BYTES, IndexFileError, IndexLimits,
+    MESSAGE_INDEX_ENTRY_BYTES, OPERATION_INDEX_ENTRY_BYTES, OPERATION_LOCATION_BYTES,
     SCHEDULE_INDEX_ENTRY_BYTES, enforce_count, validate_limits,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct IndexCounts {
-    pub offsets: usize,
+    pub batches: usize,
     pub messages: usize,
     pub operations: usize,
     pub locations: usize,
@@ -27,7 +27,7 @@ pub(crate) struct IndexLayout {
 /// An index file's sections after its header, in file order.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct Sections<T> {
-    pub(super) offsets: T,
+    pub(super) batches: T,
     pub(super) messages: T,
     pub(super) operations: T,
     pub(super) locations: T,
@@ -53,21 +53,21 @@ impl IndexLayout {
         bytes: &'a [u8],
     ) -> Option<(&'a [u8; INDEX_HEADER_BYTES], Sections<&'a [u8]>)> {
         let [
-            offset_bytes,
+            batch_bytes,
             message_bytes,
             operation_bytes,
             location_bytes,
             schedule_bytes,
         ] = self.section_lengths()?;
         let (header, rest) = bytes.split_first_chunk::<INDEX_HEADER_BYTES>()?;
-        let (offsets, rest) = rest.split_at_checked(offset_bytes)?;
+        let (batches, rest) = rest.split_at_checked(batch_bytes)?;
         let (messages, rest) = rest.split_at_checked(message_bytes)?;
         let (operations, rest) = rest.split_at_checked(operation_bytes)?;
         let (locations, schedules) = rest.split_at_checked(location_bytes)?;
         (schedules.len() == schedule_bytes).then_some((
             header,
             Sections {
-                offsets,
+                batches,
                 messages,
                 operations,
                 locations,
@@ -82,21 +82,21 @@ impl IndexLayout {
         bytes: &'a mut [u8],
     ) -> Option<(&'a mut [u8; INDEX_HEADER_BYTES], Sections<&'a mut [u8]>)> {
         let [
-            offset_bytes,
+            batch_bytes,
             message_bytes,
             operation_bytes,
             location_bytes,
             schedule_bytes,
         ] = self.section_lengths()?;
         let (header, rest) = bytes.split_first_chunk_mut::<INDEX_HEADER_BYTES>()?;
-        let (offsets, rest) = rest.split_at_mut_checked(offset_bytes)?;
+        let (batches, rest) = rest.split_at_mut_checked(batch_bytes)?;
         let (messages, rest) = rest.split_at_mut_checked(message_bytes)?;
         let (operations, rest) = rest.split_at_mut_checked(operation_bytes)?;
         let (locations, schedules) = rest.split_at_mut_checked(location_bytes)?;
         (schedules.len() == schedule_bytes).then_some((
             header,
             Sections {
-                offsets,
+                batches,
                 messages,
                 operations,
                 locations,
@@ -117,7 +117,7 @@ pub(crate) fn calculate_index_layout(
     limits: IndexLimits,
 ) -> Result<IndexLayout, IndexFileError> {
     validate_limits(limits)?;
-    enforce_count("offset entries", counts.offsets, limits.max_offset_entries)?;
+    enforce_count("batch entries", counts.batches, limits.max_batch_entries)?;
     enforce_count(
         "message entries",
         counts.messages,
@@ -128,9 +128,6 @@ pub(crate) fn calculate_index_layout(
         counts.operations,
         limits.max_operation_entries,
     )?;
-    if counts.offsets != counts.messages {
-        return Err(IndexFileError::RecordIndexCountMismatch);
-    }
     enforce_count(
         "operation locations",
         counts.locations,
@@ -142,7 +139,7 @@ pub(crate) fn calculate_index_layout(
         limits.max_schedule_entries,
     )?;
     let message_start = INDEX_HEADER_BYTES
-        .checked_add(section_bytes(counts.offsets, OFFSET_INDEX_ENTRY_BYTES)?)
+        .checked_add(section_bytes(counts.batches, BATCH_INDEX_ENTRY_BYTES)?)
         .ok_or(IndexFileError::LengthOverflow)?;
     let operation_start = message_start
         .checked_add(section_bytes(counts.messages, MESSAGE_INDEX_ENTRY_BYTES)?)

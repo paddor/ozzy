@@ -2,32 +2,30 @@
 //! timestamp, and operation.
 
 use super::{
-    IndexLayout, IndexSource, MESSAGE_INDEX_ENTRY_BYTES, OFFSET_INDEX_ENTRY_BYTES,
+    BATCH_INDEX_ENTRY_BYTES, IndexLayout, IndexSource, MESSAGE_INDEX_ENTRY_BYTES,
     OPERATION_INDEX_ENTRY_BYTES, OPERATION_LOCATION_BYTES, SCHEDULE_INDEX_ENTRY_BYTES,
-    order::{
-        binary_search_section, compare_message_key, compare_offset_key, compare_schedule_key,
-        lower_bound_section,
-    },
+    order::{binary_search_section, compare_schedule_key, lower_bound_section},
     rows::{
-        decode_message_entry, decode_offset_entry, decode_operation_entry,
-        decode_operation_location, decode_schedule_entry,
+        RowBase, decode_batch_entry, decode_message_row, decode_operation_entry,
+        decode_operation_location, decode_row_base, decode_schedule_entry,
     },
     sections::Sections,
 };
 use crate::{
-    MessageIndexEntry, OffsetIndexEntry, OperationIndexEntry, OperationLocation, ScheduleIndexEntry,
+    BatchIndexEntry, MessageIndexEntry, OffsetIndexEntry, OperationIndexEntry, OperationLocation,
+    ScheduleIndexEntry,
 };
 use ozzy_journal::operation::ReleaseKey;
 use ozzy_proto::layout::Fixed;
 use ozzy_proto::{MessageId, Offset, OperationId, PartitionIncarnation};
-use std::cmp::Ordering;
 
 /// Validated zero-copy view over one complete immutable index file.
 #[derive(Debug, Clone, Copy)]
 pub struct SegmentIndexView<'a> {
     pub(super) source: IndexSource,
     build_memory_limit: u64,
-    pub(super) offsets: &'a [u8],
+    pub(super) base: RowBase,
+    pub(super) batches: &'a [u8],
     pub(super) messages: &'a [u8],
     pub(super) operations: &'a [u8],
     pub(super) locations: &'a [u8],
@@ -45,12 +43,17 @@ impl SegmentIndexView<'_> {
         self.build_memory_limit
     }
 
-    /// Number of record-offset selectors.
-    pub fn offset_count(&self) -> usize {
-        self.offsets.len() / OFFSET_INDEX_ENTRY_BYTES
+    /// Partition of the indexed records; `None` without records.
+    pub const fn partition(&self) -> Option<PartitionIncarnation> {
+        self.base.partition
     }
 
-    /// Number of message-identity selectors.
+    /// Number of batch rows.
+    pub fn batch_count(&self) -> usize {
+        self.batches.len() / BATCH_INDEX_ENTRY_BYTES
+    }
+
+    /// Number of message rows, one per record.
     pub fn message_count(&self) -> usize {
         self.messages.len() / MESSAGE_INDEX_ENTRY_BYTES
     }
@@ -107,16 +110,31 @@ impl SegmentIndexView<'_> {
         Some(decode_operation_location(entry, self.source.segment_id))
     }
 
+    /// The batch holding `offset`.
+    pub(super) fn batch_holding(&self, offset: Offset) -> Option<BatchIndexEntry> {
+        let rows = self.batches.as_chunks::<BATCH_INDEX_ENTRY_BYTES>().0;
+        let at = rows
+            .partition_point(|row| row.u64_at::<0>() <= offset.get())
+            .checked_sub(1)?;
+        let batch = decode_batch_entry(rows.get(at)?, self.source.first_op_number);
+        batch.record_index(offset).map(|_| batch)
+    }
+
     /// Look up an exact partition incarnation and global record offset.
     pub fn find_offset(
         &self,
         partition: PartitionIncarnation,
         offset: Offset,
     ) -> Option<OffsetIndexEntry> {
-        binary_search_section(self.offsets, |entry| {
-            compare_offset_key(entry, partition, offset)
-        })
-        .map(|entry| decode_offset_entry(entry, self.source.segment_id))
+        if self.base.partition != Some(partition) {
+            return None;
+        }
+        let batch = self.batch_holding(offset)?;
+        Some(batch.entry(
+            partition,
+            self.find_operation_number(batch.op_number)?,
+            batch.record_index(offset)?,
+        ))
     }
 
     /// Look up an exact partition incarnation and record identity.
@@ -125,11 +143,24 @@ impl SegmentIndexView<'_> {
         partition: PartitionIncarnation,
         message_id: MessageId,
     ) -> Option<MessageIndexEntry> {
-        lower_bound_section(self.messages, |entry| {
-            compare_message_key(entry, partition, message_id) == Ordering::Less
+        if self.base.partition != Some(partition) {
+            return None;
+        }
+        let row = lower_bound_section(self.messages, |row: &[u8; MESSAGE_INDEX_ENTRY_BYTES]| {
+            row.array::<0, 16>() < *message_id.as_bytes()
         })
-        .filter(|entry| compare_message_key(entry, partition, message_id) == Ordering::Equal)
-        .map(decode_message_entry)
+        .filter(|row| row.array::<0, 16>() == *message_id.as_bytes())?;
+        let offset = decode_message_row(row, self.base.first_offset).offset;
+        Some(MessageIndexEntry {
+            partition,
+            message_id,
+            offset,
+            operation_digest: self
+                .find_offset(partition, offset)?
+                .location
+                .operation
+                .operation_digest,
+        })
     }
 
     /// Oldest/newest matches inside one retained partition range. Binary search
@@ -141,21 +172,26 @@ impl SegmentIndexView<'_> {
         floor: Offset,
         end: Offset,
     ) -> Option<(Offset, Offset)> {
+        if self.base.partition != Some(partition) {
+            return None;
+        }
+        let first_offset = self.base.first_offset;
         let rows = self.messages.as_chunks::<MESSAGE_INDEX_ENTRY_BYTES>().0;
         let before = |row: &[u8; MESSAGE_INDEX_ENTRY_BYTES], offset: Offset| {
-            compare_message_key(row, partition, id)
-                .then_with(|| row.u64_at::<32>().cmp(&offset.get()))
+            row.array::<0, 16>()
+                .cmp(id.as_bytes())
+                .then_with(|| decode_message_row(row, first_offset).offset.cmp(&offset))
                 .is_lt()
         };
         let first = rows.partition_point(|row| before(row, floor));
         let after = rows.partition_point(|row| before(row, end));
         let matching = rows.get(first..after)?.split_first()?;
-        if compare_message_key(matching.0, partition, id) != Ordering::Equal {
+        if matching.0.array::<0, 16>() != *id.as_bytes() {
             return None;
         }
         Some((
-            Offset::new(matching.0.u64_at::<32>()),
-            Offset::new(matching.1.last().unwrap_or(matching.0).u64_at::<32>()),
+            decode_message_row(matching.0, first_offset).offset,
+            decode_message_row(matching.1.last().unwrap_or(matching.0), first_offset).offset,
         ))
     }
 
@@ -193,12 +229,25 @@ impl<'a> SegmentIndexView<'a> {
             .map(decode_schedule_entry)
     }
 
-    pub(crate) fn offsets(self) -> impl ExactSizeIterator<Item = OffsetIndexEntry> + 'a {
-        self.offsets
-            .as_chunks::<OFFSET_INDEX_ENTRY_BYTES>()
+    pub(crate) fn batches(self) -> impl ExactSizeIterator<Item = BatchIndexEntry> + 'a {
+        let first_op_number = self.source.first_op_number;
+        self.batches
+            .as_chunks::<BATCH_INDEX_ENTRY_BYTES>()
             .0
             .iter()
-            .map(move |entry| decode_offset_entry(entry, self.source.segment_id))
+            .map(move |entry| decode_batch_entry(entry, first_op_number))
+    }
+
+    /// The first record of each batch, in offset order. Only these carry an
+    /// append time.
+    pub(crate) fn batch_heads(self) -> impl Iterator<Item = OffsetIndexEntry> + 'a {
+        self.batches().filter_map(move |batch| {
+            Some(batch.entry(
+                self.base.partition?,
+                self.find_operation_number(batch.op_number)?,
+                0,
+            ))
+        })
     }
 
     /// Control-operation identities in sorted order.
@@ -218,20 +267,35 @@ impl<'a> SegmentIndexView<'a> {
     ) -> Self {
         // The builder validated these bytes against this layout; a mismatch
         // would only leave the view empty.
-        let sections = layout.split(bytes).map(|(_, sections)| sections);
-        debug_assert!(sections.is_some(), "built index matches its layout");
-        Self::new(source, build_memory_limit, sections.unwrap_or_default())
+        let split = layout.split(bytes);
+        debug_assert!(split.is_some(), "built index matches its layout");
+        let base = split.map_or(
+            RowBase {
+                partition: None,
+                first_offset: 0,
+                first_op_number: source.first_op_number,
+            },
+            |(header, _)| decode_row_base(header, source.first_op_number),
+        );
+        Self::new(
+            source,
+            build_memory_limit,
+            base,
+            split.map(|(_, sections)| sections).unwrap_or_default(),
+        )
     }
 
     pub(super) fn new(
         source: IndexSource,
         build_memory_limit: u64,
+        base: RowBase,
         sections: Sections<&'a [u8]>,
     ) -> Self {
         Self {
             source,
             build_memory_limit,
-            offsets: sections.offsets,
+            base,
+            batches: sections.batches,
             messages: sections.messages,
             operations: sections.operations,
             locations: sections.locations,

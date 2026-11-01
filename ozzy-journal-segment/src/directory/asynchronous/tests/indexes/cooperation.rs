@@ -63,7 +63,7 @@ fn native_index_build_yields_during_sort_and_merge_without_changing_control_loca
         let (index, turns) = drive_counted(&mut controller, journal.build_sealed_index(1, limits));
         let index = index.unwrap();
         assert!(
-            turns > 10,
+            turns > 1,
             "ready memory work must yield independently of file I/O"
         );
         assert_eq!(index.source().last_op_number, 130);

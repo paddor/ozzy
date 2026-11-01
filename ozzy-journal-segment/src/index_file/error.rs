@@ -59,18 +59,24 @@ pub enum IndexFileError {
     #[error("invalid segment index section layout")]
     /// Invalid segment index section layout.
     InvalidSectionLayout,
-    #[error("offset and message index counts differ")]
-    /// Offset and message index counts differ.
+    #[error("batch record counts and message row count differ")]
+    /// Batch record counts and message row count differ.
     RecordIndexCountMismatch,
+    #[error("index partition or first offset does not match its batch rows")]
+    /// Index partition or first offset does not match its batch rows.
+    InvalidRecordRange,
+    #[error("one segment index cannot hold more than one partition")]
+    /// One segment index cannot hold more than one partition.
+    MixedPartitions,
     #[error("{0} index keys are unsorted or duplicated")]
     /// The named object index keys are unsorted or duplicated.
     UnsortedOrDuplicate(&'static str),
     #[error("derived index operation location is invalid")]
     /// Derived index operation location is invalid.
     InvalidLocation,
-    #[error("message index entry has no corresponding offset entry")]
-    /// Message index entry has no corresponding offset entry.
-    MissingOffsetEntry,
+    #[error("message row's offset lies in no batch row")]
+    /// Message row's offset lies in no batch row.
+    MissingBatchEntry,
     #[error("invalid segment index resource limits")]
     /// Invalid segment index resource limits.
     InvalidLimits,
