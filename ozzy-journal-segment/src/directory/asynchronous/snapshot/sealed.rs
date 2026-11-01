@@ -76,10 +76,9 @@ impl Journal {
     }
 
     fn validated(&self, sources: &[IndexSource]) -> bool {
-        let validated = self.validated_indexes.borrow();
         sources
             .iter()
-            .all(|source| validated.get(&source.segment_id) == Some(source))
+            .all(|source| self.validated_indexes.holds(*source))
     }
 }
 

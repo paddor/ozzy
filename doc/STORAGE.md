@@ -437,7 +437,8 @@ payload-free duplicate results, and 64-byte scheduled records.
   build up, so a segment of many small records stays within the staging bound.
 - A missing or corrupt index is rebuilt from validated segment bytes. A
   background job builds each sealed segment's index beside later writes; a
-  build validates the segment once.
+  build validates the segment once. A view change or other snapshot build waits
+  for a running job instead of building that index again.
 - Identity lookups keep each sealed index's operation IDs resident (up to
   64Ki IDs), so a miss skips reading that index.
 - Numeric lookup revalidates the operation's framing and digest before use.

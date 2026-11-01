@@ -49,6 +49,5 @@ impl OwnedJournal {
                 .last()
                 .map(|reference| reference.segment_id);
         }
-        journal.finish_index_job(built);
     }
 }

@@ -123,7 +123,7 @@ pub struct Journal {
     pins: std::rc::Rc<crate::retention::PinRegistry>,
     /// Set while a cleanup capture lives; checkpoint selection waits for it.
     cleaning: std::rc::Rc<std::cell::Cell<bool>>,
-    validated_indexes: std::cell::RefCell<std::collections::BTreeMap<u64, crate::IndexSource>>,
+    validated_indexes: std::rc::Rc<index::ValidatedIndexes>,
     /// Packed layouts of sealed segments, by segment ID and file generation.
     pack_layouts: std::cell::RefCell<std::collections::BTreeMap<(u64, u64), pack::Layout>>,
     /// Validated active-segment prefix reused by the next built snapshot.

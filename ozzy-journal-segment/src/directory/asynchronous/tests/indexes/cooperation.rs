@@ -85,3 +85,77 @@ fn native_index_build_yields_during_sort_and_merge_without_changing_control_loca
         );
     }
 }
+
+#[test]
+fn a_snapshot_build_waits_for_the_running_index_job_instead_of_building_again() {
+    let (mut controller, io) = setup(sealed_image());
+    let mut journal = drive(&mut controller, open(io, 3)).unwrap();
+    let job = journal.prepare_index_job(build_limits()).unwrap().unwrap();
+    let mut built = None;
+    let mut snapshot = None;
+    let mut workspaces = 0;
+    {
+        let mut run = std::pin::pin!(job.run());
+        let mut capture = std::pin::pin!(
+            journal.build_index_snapshot(crate::JournalIndexBoundary::Accepted, build_limits())
+        );
+        crate::test_io::drive_with(
+            &mut controller,
+            std::future::poll_fn(|cx| {
+                if built.is_none()
+                    && let Poll::Ready(result) = run.as_mut().poll(cx)
+                {
+                    built = Some(result);
+                }
+                if snapshot.is_none()
+                    && let Poll::Ready(result) = capture.as_mut().poll(cx)
+                {
+                    snapshot = Some(result);
+                }
+                if built.is_some() && snapshot.is_some() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }),
+            |operation| {
+                if let ozzy_io::Operation::CreateDirectory { path } = operation
+                    && path.to_string_lossy().contains("staging/index-")
+                {
+                    workspaces += 1;
+                }
+                ozzy_io::simulation::Effect::Normal
+            },
+        );
+    }
+    assert!(built.unwrap().valid());
+    snapshot.unwrap().unwrap();
+    assert_eq!(workspaces, 1);
+    assert!(journal.sealed_indexes_validated());
+}
+
+#[test]
+fn a_snapshot_build_builds_for_itself_when_the_index_job_is_dropped() {
+    let (mut controller, io) = setup(sealed_image());
+    let mut journal = drive(&mut controller, open(io, 3)).unwrap();
+    let mut job = journal.prepare_index_job(build_limits()).unwrap();
+    assert!(job.is_some());
+    {
+        let mut capture = std::pin::pin!(
+            journal.build_index_snapshot(crate::JournalIndexBoundary::Accepted, build_limits())
+        );
+        drive(
+            &mut controller,
+            std::future::poll_fn(|cx| {
+                let polled = capture.as_mut().poll(cx);
+                if polled.is_pending() {
+                    drop(job.take());
+                }
+                polled
+            }),
+        )
+        .unwrap();
+    }
+    assert!(job.is_none());
+    assert!(journal.sealed_indexes_validated());
+}

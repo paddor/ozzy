@@ -1,6 +1,67 @@
 use super::{DirectoryError, Journal, SegmentReference};
 use crate::index_builder::asynchronous::{self, Builder, Limits};
 use crate::{IndexBuildLimits, IndexLimits, IndexSource, SegmentIndex, segment_index_name};
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
+use std::rc::Rc;
+use std::task::{Poll, Waker};
+
+/// Sealed indexes this owner validated, and the detached build running beside
+/// it. A build holds these so a snapshot can wait for it and use its result.
+#[derive(Debug, Default)]
+pub(super) struct ValidatedIndexes {
+    validated: RefCell<BTreeMap<u64, IndexSource>>,
+    running: Cell<Option<IndexSource>>,
+    waiter: RefCell<Option<Waker>>,
+}
+
+impl ValidatedIndexes {
+    /// Whether this owner validated exactly `source`.
+    pub(super) fn holds(&self, source: IndexSource) -> bool {
+        self.validated.borrow().get(&source.segment_id) == Some(&source)
+    }
+
+    pub(super) fn record(&self, source: IndexSource) {
+        self.validated
+            .borrow_mut()
+            .insert(source.segment_id, source);
+    }
+
+    pub(super) fn forget(&self, segment: u64) {
+        self.validated.borrow_mut().remove(&segment);
+    }
+
+    pub(super) fn retain(&self, mut selected: impl FnMut(u64) -> bool) {
+        self.validated.borrow_mut().retain(|&id, _| selected(id));
+    }
+
+    /// Wait until no detached build of `source` is running. One snapshot at a
+    /// time waits, since it holds the journal.
+    pub(super) async fn build_finished(&self, source: IndexSource) {
+        std::future::poll_fn(|cx| {
+            if self.running.get() == Some(source) {
+                self.waiter.replace(Some(cx.waker().clone()));
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        })
+        .await;
+    }
+}
+
+/// Marks a prepared build as running until it finishes or is dropped.
+#[derive(Debug)]
+struct RunningBuild(Rc<ValidatedIndexes>);
+
+impl Drop for RunningBuild {
+    fn drop(&mut self) {
+        self.0.running.set(None);
+        if let Some(waiter) = self.0.waiter.take() {
+            waiter.wake();
+        }
+    }
+}
 
 impl Journal {
     pub(super) fn index_source(
@@ -93,8 +154,8 @@ impl Journal {
     }
 
     /// The oldest sealed segment this owner has not validated, as a detached
-    /// index build; `finish_index_job` records it. The caller runs one at a
-    /// time.
+    /// index build, which records its result. The caller runs one at a time,
+    /// and a snapshot build waits for it, so it must be running beside them.
     pub fn prepare_index_job(
         &self,
         limits: IndexBuildLimits,
@@ -106,30 +167,19 @@ impl Journal {
                 &pair[0],
                 &pair[1],
             )?;
-            if self.validated_indexes.borrow().get(&source.segment_id) == Some(&source) {
+            if self.validated_indexes.holds(source) {
                 continue;
             }
+            self.validated_indexes.running.set(Some(source));
             return Ok(Some(IndexJob {
                 scope: self.group_scope(pair[0])?,
                 builder: self.index_builder(),
                 source,
                 limits,
+                running: RunningBuild(self.validated_indexes.clone()),
             }));
         }
         Ok(None)
-    }
-
-    /// Record a finished job while its segment is still selected. A failed
-    /// job publishes nothing; the next snapshot build retries the segment.
-    pub fn finish_index_job(&self, built: &BuiltIndex) {
-        let selected = self
-            .index_source(built.source.segment_id)
-            .is_ok_and(|(_, source)| source == built.source);
-        if built.valid() && selected {
-            self.validated_indexes
-                .borrow_mut()
-                .insert(built.source.segment_id, built.source);
-        }
     }
 }
 
@@ -141,12 +191,12 @@ pub struct IndexJob {
     builder: Builder,
     source: IndexSource,
     limits: IndexBuildLimits,
+    running: RunningBuild,
 }
 
 /// The outcome of an `IndexJob`.
 #[derive(Debug)]
 pub struct BuiltIndex {
-    source: IndexSource,
     failure: Option<crate::DirectoryError>,
 }
 
@@ -168,10 +218,10 @@ impl IndexJob {
         let failure = build(self.scope, self.builder, self.source, self.limits, false)
             .await
             .err();
-        BuiltIndex {
-            source: self.source,
-            failure,
+        if failure.is_none() {
+            self.running.0.record(self.source);
         }
+        BuiltIndex { failure }
     }
 }
 

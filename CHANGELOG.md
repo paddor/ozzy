@@ -32,6 +32,10 @@
   so every partition it led stayed stuck.
 - A leader no longer exits when a recovering follower fetches history while
   another follower is being repaired from disk.
+- Failover no longer waits on duplicate index work. A new leader waits for a
+  running index build instead of repeating it, and opens each sealed index once.
+  On partitions of many small records, a three-host soak's write stall at failover
+  dropped from about 30 s to about 2 s.
 
 ## [0.7.0] - 2026-10-29
 
