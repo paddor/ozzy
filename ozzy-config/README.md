@@ -123,6 +123,8 @@ max_bytes = 1073741824
   eighths of the partition limit. A retired file kept for the next new
   segment adds one segment on disk.
 - Active work and captured reads can delay deletion.
+- Age follows the leader's clock, so keep broker clocks in sync. Nothing checks
+  them against each other: a leader whose clock runs fast expires records early.
 - A partition holds at most 256 segments. Near that limit, with or without
   retention, it refuses new records with NACK 10 until segments retire; see
   [full partitions](../doc/STORAGE.md#full-partitions).
@@ -158,6 +160,9 @@ max_entries = 100000
   at initialization. A topic cannot have both delay and deduplication.
 - A producer gives a record an absolute due time. One past acceptance plus
   `max_secs` fails; a past one releases at once.
+- The leader's clock decides when a due time is reached, so keep producer and
+  broker clocks in sync. A reader can see a record early or late by the
+  difference between its clock and the leader's.
 - `max_entries` (at most 4294967296) bounds held records per partition. A
   full partition makes producers retry later. Held records stay on disk; each
   copy keeps the next 65536 sealed ones and up to 262144 of the active
