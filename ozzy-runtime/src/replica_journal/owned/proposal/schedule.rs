@@ -3,17 +3,19 @@
 //! takes the partition's next offsets; a `Carry` takes only a time.
 
 use super::super::{AppendBuffer, JournalError, OwnedJournal};
-use crate::replica_journal::{AppendAdmissionError, producer};
+use crate::replica_journal::{AppendAdmissionError, ClockReading, producer};
 
 impl OwnedJournal {
     /// Refuse a scheduled batch the partition cannot hold, then convert it.
     /// Its acceptance time never goes below the partition's latest schedule
-    /// or release, so new records sort after every released one.
+    /// or release, so new records sort after every released one. A paused
+    /// clock refuses it for now.
     pub(super) fn schedule_proposal(
         &self,
         buffer: &mut AppendBuffer,
-        now_millis: u64,
+        clock: ClockReading,
     ) -> Result<(), JournalError> {
+        let now_millis = clock.decision().ok_or(AppendAdmissionError::ClockPaused)?;
         let batch = producer::summary(buffer, 0, self.limits.operations)?;
         let delay = self
             .images()?
@@ -52,11 +54,11 @@ impl OwnedJournal {
 
     /// Place a broker-built `Release` at the partition's next offset. Its
     /// time covers its last record's release key and never goes below the
-    /// latest schedule or release.
+    /// latest schedule or release, and a paused clock adds nothing to it.
     pub(super) fn release_proposal(
         &self,
         buffer: &mut AppendBuffer,
-        now_millis: u64,
+        clock: ClockReading,
     ) -> Result<(), JournalError> {
         let (partition, through) = buffer.release_target()?;
         let state = self
@@ -68,16 +70,16 @@ impl OwnedJournal {
             .delay
             .as_ref()
             .ok_or(AppendAdmissionError::DelayDisabled)?;
-        let time = now_millis.max(delay.time).max(through);
+        let time = clock.decision().unwrap_or(0).max(delay.time).max(through);
         buffer.place_release(state.next_offset.get(), time)
     }
 
     /// Stamp a broker-built `Carry`. Its time never goes below the latest
-    /// schedule, release, or carry.
+    /// schedule, release, or carry, and a paused clock adds nothing to it.
     pub(super) fn carry_proposal(
         &self,
         buffer: &mut AppendBuffer,
-        now_millis: u64,
+        clock: ClockReading,
     ) -> Result<(), JournalError> {
         let partition = buffer.carry_partition()?;
         let delay = self
@@ -88,6 +90,6 @@ impl OwnedJournal {
             .delay
             .as_ref()
             .ok_or(AppendAdmissionError::DelayDisabled)?;
-        buffer.place_carry(now_millis.max(delay.time))
+        buffer.place_carry(clock.decision().unwrap_or(0).max(delay.time))
     }
 }

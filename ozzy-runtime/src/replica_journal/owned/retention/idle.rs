@@ -97,11 +97,12 @@ impl IdleProducers {
 impl OwnedJournal {
     /// Propose retiring the sessions idle past the expiry, and whether more
     /// remain. Observations last one view: opens served by another primary
-    /// change no state, so a new primary starts every session fresh.
+    /// change no state, so a new primary starts every session fresh. Without
+    /// a trusted time nothing retires; the observations keep their times.
     pub(in crate::replica_journal::owned) fn idle_producer_proposal(
         &mut self,
         view: u64,
-        now_millis: u64,
+        now_millis: Option<u64>,
         leader: bool,
     ) -> Result<(Option<ProposalBuffer>, bool), JournalError> {
         let idle = &mut self.retention.idle;
@@ -111,9 +112,9 @@ impl OwnedJournal {
                 ..IdleProducers::new(idle.expiry)
             };
         }
-        if !leader {
+        let Some(now_millis) = now_millis.filter(|_| leader) else {
             return Ok((None, false));
-        }
+        };
         self.healthy()?;
         let limit = self.append_limits.max_operations;
         // Field access keeps the image borrow apart from the observations.

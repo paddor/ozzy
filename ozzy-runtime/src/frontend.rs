@@ -17,7 +17,10 @@ pub use replies::{ReplyError, ReplyLimits, ReplyProgress};
 pub use crate::peer_sessions::{Handled as Negotiated, LinkIds, Sessions as LinkSessions};
 
 mod service;
-pub use service::{Access, Link, Links, ReceiveError, Service, ServiceError};
+pub use service::{
+    Access, ClockNow, ClockSampling, ClockStatus, ClockTrust, Link, Links, ReceiveError, Service,
+    ServiceError,
+};
 
 mod port;
 pub use port::{

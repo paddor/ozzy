@@ -188,8 +188,11 @@ ozzy_three serve --broker broker-0 --identity "$ozzy_dir/shared.identity" \
 - All brokers share one `shared.identity`. Each keeps its own local identity
   and stores.
 - Writes confirm while two of the three brokers are up.
-- Keep broker clocks in sync, for example with NTP. Delayed release and age
-  retention follow the leader's clock, and nothing checks it against the others.
+- Keep broker clocks in sync, for example with NTP. A broker over 1 s from the
+  others warns on stderr and pauses delayed release, age retention, and producer
+  idle expiry until its clock is fixed. A paused leader holds due records and
+  makes producers of new scheduled records retry. See the
+  [clock guard](doc/REPLICATION.md#clock-guard).
 
 ## Watch a broker
 

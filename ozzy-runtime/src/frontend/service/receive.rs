@@ -53,6 +53,10 @@ impl Service {
                 }
                 return Ok(None);
             }
+            Opcode::ClockSample => {
+                self.receive_clock(peer, access.kind, packet, envelope)?;
+                return Ok(None);
+            }
             Opcode::ReplicaState => self.bind_incoming_channel(peer, packet, envelope)?,
             _ => {}
         }

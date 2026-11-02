@@ -3,6 +3,7 @@
 mod config;
 mod context;
 pub use context::ServingContext;
+pub(crate) use context::{Alarm, Timer};
 mod drain;
 mod outbound;
 mod shard;
@@ -30,6 +31,7 @@ pub struct Broker {
     frontend: Frontend,
     devices: DeviceDrain,
     serving: Vec<tokio::sync::watch::Receiver<bool>>,
+    clock: ozzy_runtime::frontend::ClockTrust,
 }
 
 struct Registration {
@@ -195,6 +197,7 @@ impl Broker {
                     frontend,
                     devices,
                     serving,
+                    clock: config.clock.clone(),
                 });
             }
             (Err(error), Err(_)) => error,
@@ -223,6 +226,11 @@ impl Broker {
     /// Number of OMQ-owned transport threads.
     pub fn io_threads(&self) -> usize {
         self.frontend.io_threads()
+    }
+
+    /// What the clock guard last concluded about this broker's clock.
+    pub fn clock(&self) -> ozzy_runtime::frontend::ClockStatus {
+        self.clock.status()
     }
 
     /// Resolve once every local partition can serve clients: it finished
@@ -292,9 +300,10 @@ async fn start_frontend(
         .map(|registration| registration.serving.clone())
         .collect::<Vec<_>>();
     let serving_config = config.clone();
-    let factory = move |frontend: crate::FrontendContext| async move {
+    let factory = move |mut frontend: crate::FrontendContext| async move {
         let (mut service, handoffs) = serving_config.service(registered.into_values().collect())?;
         serving_config.handoff(&mut service, handoffs)?;
+        frontend.sample_clock(serving_config.install_clock(&mut service));
         frontend
             .serve(
                 service,

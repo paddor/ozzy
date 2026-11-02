@@ -171,11 +171,11 @@ impl LocalActor {
 
     /// Take matching local storage and driver authority after format/recovery.
     /// The timestamp source is injected; simulations need no wall-clock input.
-    pub fn new(
+    pub fn new<T: Into<crate::replica_journal::ClockReading>>(
         owner: OwnedJournal,
         driver: Driver,
         mut config: LocalActorConfig,
-        timestamp: impl Fn() -> u64 + 'static,
+        timestamp: impl Fn() -> T + 'static,
     ) -> Result<Self, ActorError> {
         owner.check_local_driver(&driver)?;
         if config

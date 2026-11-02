@@ -74,6 +74,7 @@ opcodes! {
     RecordsPub = 0x53 => "`RECORDS_PUB`: publish confirmed records to every live reader.",
     ReplicaReceipt = 0x54 => "`REPLICA_RECEIPT`: compact same-channel volatile receipt.",
     HistoryRetired = 0x55 => "`HISTORY_RETIRED`: require nonvoting checkpoint recovery below retained history.",
+    ClockSample = 0x56 => "`CLOCK_SAMPLE`: report a broker's wall time to a peer.",
     GroupJoin = 0x60 => "`GROUP_JOIN`: join, heartbeat, or leave a consumer group on its coordinator.",
     GroupJoined = 0x61 => "`GROUP_JOINED`: describe the committed membership view of one instance.",
     GroupAssign = 0x62 => "`GROUP_ASSIGN`: relay a committed plan revision to a source partition.",

@@ -3,6 +3,11 @@
 use omq_tokio::Context;
 use std::future::Future;
 use std::pin::Pin;
+#[cfg(feature = "simulation")]
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::task::{self, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -41,9 +46,18 @@ impl ServingContext {
             omq,
             time: Time::Manual {
                 clock,
-                epoch_millis,
+                epoch_millis: Arc::new(AtomicU64::new(epoch_millis)),
             },
             held: None,
+        }
+    }
+
+    /// Step the manual wall clock of every broker on this context, as a broken
+    /// or repaired host clock would. Monotonic time does not move.
+    #[cfg(feature = "simulation")]
+    pub fn set_epoch_millis(&self, epoch: u64) {
+        if let Time::Manual { epoch_millis, .. } = &self.time {
+            epoch_millis.store(epoch, Ordering::Relaxed);
         }
     }
 
@@ -83,11 +97,12 @@ pub(super) enum Time {
     #[cfg(feature = "simulation")]
     Manual {
         clock: ozzy_runtime::replicated::SdkClock,
-        epoch_millis: u64,
+        epoch_millis: Arc<AtomicU64>,
     },
 }
 
-pub(super) enum Timer {
+#[derive(Clone, Debug)]
+pub(crate) enum Timer {
     System(Instant),
     #[cfg(feature = "simulation")]
     Manual {
@@ -130,13 +145,14 @@ impl Time {
                 clock,
                 epoch_millis,
             } => epoch_millis
+                .load(Ordering::Relaxed)
                 .saturating_add(u64::try_from(clock.now().as_millis()).unwrap_or(u64::MAX)),
         }
     }
 }
 
 impl Timer {
-    pub(super) fn elapsed(&self) -> Duration {
+    pub(crate) fn elapsed(&self) -> Duration {
         match self {
             Self::System(start) => start.elapsed(),
             #[cfg(feature = "simulation")]
@@ -145,7 +161,7 @@ impl Timer {
     }
 
     /// One alarm on this timer's clock, re-armed in place for each deadline.
-    pub(super) fn alarm(&self) -> Alarm {
+    pub(crate) fn alarm(&self) -> Alarm {
         let wait = match self {
             Self::System(start) => Wait::System {
                 start: *start,
@@ -166,7 +182,7 @@ impl Timer {
 
 /// Fires once the clock reaches the deadline it was last polled with. Polling
 /// with a new deadline moves the same registration instead of making another.
-pub(super) struct Alarm {
+pub(crate) struct Alarm {
     wait: Wait,
     armed: Option<Duration>,
 }
@@ -187,7 +203,7 @@ enum Wait {
 impl Alarm {
     /// Ready once `deadline` since the start has passed. Without a deadline,
     /// never ready.
-    pub(super) fn poll_at(
+    pub(crate) fn poll_at(
         &mut self,
         cx: &mut task::Context<'_>,
         deadline: Option<Duration>,

@@ -472,10 +472,25 @@ pub async fn start_images_sized(
     Vec<tokio::task::JoinHandle<Image>>,
 ) {
     let context = context.into();
+    let contexts = deployment.iter().map(|_| context.clone()).collect();
+    start_each(contexts, deployment, reverse, limits).await
+}
+
+/// Start each broker on its own context, so each can have its own wall clock.
+pub(crate) async fn start_each(
+    contexts: Vec<ServingContext>,
+    deployment: Vec<(CheckedConfig, BrokerIdentity)>,
+    reverse: bool,
+    limits: ImageLimits,
+) -> (
+    Vec<Broker>,
+    Vec<Arc<Control>>,
+    Vec<tokio::task::JoinHandle<Image>>,
+) {
     let mut brokers = Vec::new();
     let mut controls = Vec::new();
     let mut images = Vec::new();
-    for (checked, local) in deployment {
+    for (context, (checked, local)) in contexts.into_iter().zip(deployment) {
         let name = checked.plan.name.clone();
         let image = tokio::time::timeout(
             Duration::from_secs(5),
@@ -484,7 +499,7 @@ pub async fn start_images_sized(
         .await
         .unwrap_or_else(|_| panic!("virtual provision stalled: {name}"));
         let (broker, control, task) = start_image(
-            context.clone(),
+            context,
             checked,
             local,
             Memory {

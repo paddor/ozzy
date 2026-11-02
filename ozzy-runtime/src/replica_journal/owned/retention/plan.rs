@@ -26,7 +26,7 @@ impl OwnedJournal {
     pub async fn plan_retention(
         &mut self,
         ticket: ValidationTicket,
-        now_millis: u64,
+        now_millis: Option<u64>,
         maximum_segments: usize,
     ) -> Result<Option<(PartitionIncarnation, Plan)>, JournalError> {
         self.healthy()?;

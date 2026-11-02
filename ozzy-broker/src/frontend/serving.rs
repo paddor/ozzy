@@ -126,6 +126,7 @@ impl FrontendContext {
         let mut tick = tokio::time::interval(serving.retry);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut retrying = false;
+        let mut clock = self.clock.as_ref().map(crate::serving::Timer::alarm);
         loop {
             // Process lifecycle changes before dequeuing native input. Once
             // received, admit synchronously before observing another cutover.
@@ -166,19 +167,35 @@ impl FrontendContext {
                 Some(lane) = data.paused.writable() => {
                     data.retry(lane, service)?;
                 }
+                () = clock_due(&mut clock, service.clock_deadline()) => service.clock_tick(),
                 result = service.progress_with(|message| serving.followers.send(outbound_socket(&self.peer, &self.data, &message), message), |probe| serving.followers.wait(outbound_socket(&self.peer, &self.data, &probe), probe)) => {
                     if !self.shutdown.is_closed() {
                         result.map_err(failure)?;
                     }
                 },
-                _ = tick.tick(), if retrying => {
-                    for &peer in serving.brokers.keys() {
-                        service.retry(peer).map_err(failure)?;
-                    }
-                }
+                _ = tick.tick(), if retrying => retry_handshakes(service, serving.brokers)?,
             }
         }
     }
+}
+
+/// Ready once the clock sampling's deadline passes. Without sampling, never.
+async fn clock_due(alarm: &mut Option<crate::serving::Alarm>, deadline: Option<Duration>) {
+    std::future::poll_fn(|cx| match alarm {
+        Some(alarm) => alarm.poll_at(cx, deadline),
+        None => std::task::Poll::Pending,
+    })
+    .await;
+}
+
+fn retry_handshakes(
+    service: &mut Service,
+    brokers: &BTreeMap<NodeId, Endpoint>,
+) -> Result<(), StartupError> {
+    for &peer in brokers.keys() {
+        service.retry(peer).map_err(failure)?;
+    }
+    Ok(())
 }
 
 /// Admit one follower publication. PUB receive is lossy; it never holds a

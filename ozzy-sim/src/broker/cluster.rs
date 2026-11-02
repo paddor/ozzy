@@ -1,7 +1,7 @@
 //! Production cluster lifecycle and storage faults shared with the simulator.
 use super::{
-    Control, IMAGE_LIMITS, Memory, Shape, deployment_with_resources, provision_sized,
-    start_image_selected, start_images_sized,
+    Control, IMAGE_LIMITS, Memory, Shape, deployment_with_resources, provision_sized, start_each,
+    start_image_selected,
 };
 use crate::client::Client;
 use ozzy_broker::{Broker, CheckedConfig, RecoveryIntent, RecoverySelection, ServingContext};
@@ -26,7 +26,8 @@ pub struct Cluster {
     /// Tasks yielding memory images after physical drain.
     pub images: Vec<tokio::task::JoinHandle<Image>>,
     mode: DeploymentMode,
-    context: ServingContext,
+    /// Each broker's context, so one wall clock can go wrong alone.
+    contexts: Vec<ServingContext>,
     retired_physical_events: u64,
     memory_limits: ImageLimits,
     stopped: std::collections::BTreeMap<usize, Arc<Control>>,
@@ -78,13 +79,16 @@ impl Cluster {
         configure: impl FnOnce(&mut ozzy_config::Deployment),
     ) -> Self {
         let runtime = WriterRuntime::new().unwrap();
-        let mut context = clock.map_or_else(
-            || ServingContext::from(runtime.context().clone()),
-            |clock| ServingContext::simulated(runtime.context().clone(), clock, 1_000_000),
-        );
-        if let Some((window, active)) = held {
-            context = context.with_held_bounds(window, active);
-        }
+        let context = || {
+            let context = clock.clone().map_or_else(
+                || ServingContext::from(runtime.context().clone()),
+                |clock| ServingContext::simulated(runtime.context().clone(), clock, 1_000_000),
+            );
+            match held {
+                Some((window, active)) => context.with_held_bounds(window, active),
+                None => context,
+            }
+        };
         let root = PathBuf::from(format!("/ozzy-churn-{}", Uuid::now_v7()));
         let resources = ozzy_config::HostResources {
             cpus: std::collections::BTreeMap::from([(0, Some(0))]),
@@ -107,8 +111,9 @@ impl Cluster {
             },
         );
         let configs = deployment.clone();
+        let contexts: Vec<_> = deployment.iter().map(|_| context()).collect();
         let (brokers, controls, images) =
-            start_images_sized(context.clone(), deployment, true, memory_limits).await;
+            start_each(contexts.clone(), deployment, true, memory_limits).await;
         Self {
             runtime,
             configs,
@@ -116,12 +121,18 @@ impl Cluster {
             controls,
             images,
             mode,
-            context,
+            contexts,
             retired_physical_events: 0,
             memory_limits,
             stopped: std::collections::BTreeMap::new(),
             faults: 0,
         }
+    }
+
+    /// Step one broker's manual wall clock, stopped or running, as a broken or
+    /// repaired host clock would. It reads `epoch_millis` at manual time zero.
+    pub fn set_wall_clock(&self, index: usize, epoch_millis: u64) {
+        self.contexts[index].set_epoch_millis(epoch_millis);
     }
 
     /// Restore one stopped broker from its explicitly supplied memory image.
@@ -161,7 +172,7 @@ impl Cluster {
     async fn install(&mut self, index: usize, image: Image, selections: &[RecoverySelection]) {
         let (checked, local) = self.configs[index].clone();
         let (broker, control, task) = start_image_selected(
-            self.context.clone(),
+            self.contexts[index].clone(),
             checked,
             local,
             selections,

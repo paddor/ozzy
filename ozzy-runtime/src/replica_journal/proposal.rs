@@ -70,6 +70,11 @@ pub enum AppendAdmissionError {
     /// The partition already holds its maximum of scheduled records.
     #[error("scheduled-record capacity is full")]
     ScheduleCapacity,
+    /// The clocks disagree. A schedule's stamp keys its records and never goes
+    /// back, so a bad one would hold this partition's records until real time
+    /// caught up.
+    #[error("scheduled records wait for the broker clocks to agree")]
+    ClockPaused,
     /// One scheduled batch holds more records than the partition may hold.
     #[error("scheduled batch exceeds the held-record limit")]
     ScheduleTooLarge,

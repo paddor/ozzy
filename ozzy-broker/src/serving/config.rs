@@ -8,6 +8,7 @@ use ozzy_runtime::{
     frontend::{
         self, Access, DataLaneLimits, DataSender, Kind, ReceiveBuffers, ReceiveStorage, Service,
     },
+    replica_journal::ClockReading,
     replica_transport::QueueLimits,
 };
 use routes::{follower_routes, peer_endpoints, require_follower_pub_endpoints};
@@ -49,6 +50,10 @@ pub(super) struct Config {
     pub admin: Option<crate::admin::Hooks>,
     /// Receipt aliases shared by every partition actor of this broker.
     pub receipt_handles: ozzy_runtime::replica_actor::ReceiptHandles,
+    /// Whether this broker's clock agrees with its peers.
+    pub clock: frontend::ClockTrust,
+    /// The monotonic origin of the clock guard's readings.
+    pub clock_timer: super::context::Timer,
 }
 
 impl Config {
@@ -119,6 +124,15 @@ impl Config {
         let buffers = ReceiveBuffers::new(envelope, storage).map_err(failure)?;
         let budgets = shard_budgets(checked);
         let catalog = catalog(checked)?;
+        let clock = if brokers.is_empty() {
+            frontend::ClockTrust::unguarded()
+        } else {
+            frontend::ClockTrust::guarded(
+                brokers.keys().copied(),
+                deployment.cluster.max_clock_offset_millis,
+            )
+        };
+        let clock_timer = time.start();
         Ok(Self {
             time,
             omq,
@@ -141,6 +155,8 @@ impl Config {
             maximum_partitions: checked.plan.partitions.len(),
             admin: None,
             receipt_handles: ozzy_runtime::replica_actor::ReceiptHandles::default(),
+            clock,
+            clock_timer,
         })
     }
 
@@ -150,7 +166,7 @@ impl Config {
         handoffs: Handoffs,
     ) -> Result<(), StartupError> {
         if let Some(admin) = &self.admin {
-            admin.publish_links(service.links());
+            admin.publish_links(service.links(), self.clock.clone());
         }
         for (id, handoff) in handoffs {
             let port = service
@@ -173,6 +189,44 @@ impl Config {
                 .map_err(|_| failure("shard handoff observer disappeared"))?;
         }
         Ok(())
+    }
+
+    /// The clock a partition journal reads. Commands stamp with its wall time
+    /// and decide only while it is trusted.
+    pub(super) fn journal_clock(&self) -> impl Fn() -> ClockReading + 'static + use<> {
+        let (time, clock, timer) = (
+            self.time.clone(),
+            self.clock.clone(),
+            self.clock_timer.clone(),
+        );
+        move || {
+            let wall_millis = time.timestamp();
+            ClockReading {
+                wall_millis,
+                trusted: clock.trusted(|| frontend::ClockNow {
+                    wall_millis,
+                    monotonic: timer.elapsed(),
+                }),
+            }
+        }
+    }
+
+    /// Sample this broker's clock against its peers. A single broker has no
+    /// peers and no guard.
+    pub(super) fn install_clock(&self, service: &mut Service) -> Option<super::context::Timer> {
+        if self.remote.control.is_empty() {
+            return None;
+        }
+        let (time, timer) = (self.time.clone(), self.clock_timer.clone());
+        service.install_clock(frontend::ClockSampling::new(
+            self.remote.control.keys().copied(),
+            self.clock.clone(),
+            move || frontend::ClockNow {
+                wall_millis: time.timestamp(),
+                monotonic: timer.elapsed(),
+            },
+        ));
+        Some(self.clock_timer.clone())
     }
 
     pub(super) fn service(

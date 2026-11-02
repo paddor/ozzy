@@ -6,7 +6,7 @@ mod jobs;
 mod owner_work;
 
 use super::commands::{Command, Gate};
-use super::{JournalError, OwnedJournal};
+use super::{ClockReading, JournalError, OwnedJournal};
 use futures::{
     FutureExt, StreamExt,
     future::LocalBoxFuture,
@@ -56,7 +56,7 @@ pub struct ShardJournal {
     writes: FuturesOrdered<LocalBoxFuture<'static, super::OwnedCompletedWrite>>,
     completed: VecDeque<Completed>,
     config: ShardJournalConfig,
-    timestamp: Box<dyn Fn() -> u64>,
+    timestamp: Box<dyn Fn() -> ClockReading>,
     idle: bool,
     closing: bool,
     failed: bool,
@@ -160,10 +160,10 @@ impl Admitted<'_> {
 }
 
 impl ShardJournal {
-    pub(super) fn new(
+    pub(super) fn new<T: Into<ClockReading>>(
         owner: OwnedJournal,
         config: ShardJournalConfig,
-        timestamp: impl Fn() -> u64 + 'static,
+        timestamp: impl Fn() -> T + 'static,
     ) -> Self {
         Self {
             state: Some(Box::new(State {
@@ -181,7 +181,7 @@ impl ShardJournal {
             writes: FuturesOrdered::new(),
             completed: VecDeque::with_capacity(config.commands + config.write_depth),
             config,
-            timestamp: Box::new(timestamp),
+            timestamp: Box::new(move || timestamp().into()),
             idle: true,
             closing: false,
             failed: false,
@@ -263,10 +263,10 @@ impl ShardJournal {
     }
     /// Journal-clock milliseconds until the earliest committed held record is
     /// due, or zero while a carry is pending. A command holding the owner
-    /// hides it until the owner returns.
+    /// hides it until the owner returns. A paused clock retries at the sample
+    /// interval.
     pub(super) fn release_wait(&self) -> Option<u64> {
-        let due = self.state.as_ref()?.owner.next_release()?;
-        Some(due.saturating_sub((self.timestamp)()))
+        (self.state.as_ref()?.owner).release_wait(&self.timestamp)
     }
     /// Whether the copy wants a held-row load beside writes. A command
     /// holding the owner hides it until the owner returns.
@@ -454,7 +454,7 @@ impl ShardJournal {
         if let Some(memory) = memory {
             owner.bind_append_source(memory)?;
         }
-        let timestamp = std::mem::replace(&mut self.timestamp, Box::new(|| 0));
+        let timestamp = std::mem::replace(&mut self.timestamp, Box::new(|| ClockReading::from(0)));
         let journal = super::ShardRecoveringJournal::from_owned(owner, self.config, timestamp)?;
         Ok((journal, startup))
     }

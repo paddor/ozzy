@@ -59,7 +59,7 @@ fn retain(controller: &mut Controller, journal: &mut OwnedJournal, driver: &mut 
         let ticket = driver.begin_validation().unwrap();
         let turn = drive(
             controller,
-            journal.retention_turn(ticket, now, OperationId::from_bytes([seed; 16]), true),
+            journal.retention_turn(ticket, Some(now), OperationId::from_bytes([seed; 16]), true),
         )
         .unwrap();
         if let Some(buffer) = turn.proposal {
@@ -295,4 +295,50 @@ fn a_byte_target_carries_only_a_segment_its_held_records_fill_at_most_half() {
     accept(&mut controller, &mut journal, &mut driver, result);
     retain(&mut controller, &mut journal, &mut driver, AGED);
     assert!(first_segment(&journal) > 1);
+}
+
+#[test]
+fn a_paused_clock_still_carries_and_stamps_no_time_of_its_own() {
+    let (mut controller, mut journal, mut driver) = delayed(16);
+    sealed(
+        &mut controller,
+        &mut journal,
+        &mut driver,
+        policy(Some(10_000), None),
+    );
+    // A paused retention turn sees no aged segment, so aims no carry.
+    let ticket = driver.begin_validation().unwrap();
+    let (_, plan) = drive(&mut controller, journal.plan_retention(ticket, None, 2))
+        .unwrap()
+        .unwrap();
+    assert_eq!(plan.carry, None);
+    assert_eq!(plan.retire, Vec::<u64>::new());
+
+    // A carry aimed before the pause goes on: it depends on no clock.
+    retain(&mut controller, &mut journal, &mut driver, AGED);
+    assert_eq!(journal.next_release(), Some(0));
+    let paused = crate::replica_journal::ClockReading {
+        wall_millis: AGED + 1_000_000,
+        trusted: false,
+    };
+    assert_eq!(journal.release_wait(|| paused), Some(0));
+    let ticket = driver.begin_validation().unwrap();
+    let step = drive(&mut controller, journal.prepare_release(ticket, None)).unwrap();
+    let crate::replica_journal::owned::release::ReleaseStep::Read(read) = step else {
+        panic!("the carry reads held records");
+    };
+    let completed = drive(&mut controller, read.execute());
+    let proposal = journal
+        .complete_release(completed)
+        .unwrap()
+        .proposal
+        .unwrap();
+    let ticket = driver.begin_validation().unwrap();
+    let result = drive(
+        &mut controller,
+        journal.propose_append(ticket, proposal, paused),
+    );
+    // Its stamp is the partition's latest time, not this clock's.
+    let (time, ..) = carried_by(&result);
+    assert!(time < AGED + 1_000_000, "stamped {time}");
 }

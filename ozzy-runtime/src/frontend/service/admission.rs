@@ -29,7 +29,12 @@ impl Service {
         validate_roles(kind, hello.parameters.roles)?;
         let handled = self.sessions.receive(peer, packet)?;
         let link = match handled.replaced {
-            Some(established) => Some(self.establish(peer, kind, established)?),
+            Some(established) => {
+                if kind == Kind::Broker {
+                    self.sample_soon();
+                }
+                Some(self.establish(peer, kind, established)?)
+            }
             None => None,
         };
         let state = self.peers.get_mut(&peer).ok_or(ReceiveError::Peer)?;

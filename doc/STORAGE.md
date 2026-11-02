@@ -500,8 +500,8 @@ Topics set `retention.max_age_secs` and `retention.max_bytes`; see
   rolls first. Held scheduled records are carried forward first; see
   [scheduled records](#scheduled-records).
 - Age uses each segment's newest append time, so backward clocks cannot expire
-  newer records early. A leader whose clock runs fast does expire them early;
-  nothing checks it against the other brokers.
+  newer records early. A broker whose clock disagrees with the others stops
+  expiring by age; see the [clock guard](REPLICATION.md#clock-guard).
 - Byte targets count active and sealed capacities per partition per broker.
 - Order: confirm `ProducerResultFloor` and `Trim` operations, sync and select
   a checkpoint, publish a manifest without the prefix, then delete files.

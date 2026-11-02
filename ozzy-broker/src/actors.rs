@@ -280,12 +280,12 @@ impl OpenedPartition {
     /// Deterministic harnesses inject both IDs and record timestamps.
     /// Normal followers retain within their local bounds. The shard binds
     /// their payload allocator before serving and provides bounded PUB/PEER intake.
-    pub fn into_actor(
+    pub fn into_actor<T: Into<ozzy_runtime::replica_journal::ClockReading>>(
         mut self,
         memory: &ozzy_runtime::memory::Owner,
         sessions: &BTreeMap<NodeId, LinkSessionId>,
         ids: ActorIds,
-        timestamp: impl Fn() -> u64 + 'static,
+        timestamp: impl Fn() -> T + 'static,
     ) -> Result<StartedPartition, StartupError> {
         self.journal
             .bind_append_memory(memory)
@@ -296,11 +296,11 @@ impl OpenedPartition {
         self.start_actor(sessions, ids, timestamp)
     }
 
-    fn start_actor(
+    fn start_actor<T: Into<ozzy_runtime::replica_journal::ClockReading>>(
         self,
         sessions: &BTreeMap<NodeId, LinkSessionId>,
         ids: ActorIds,
-        timestamp: impl Fn() -> u64 + 'static,
+        timestamp: impl Fn() -> T + 'static,
     ) -> Result<StartedPartition, StartupError> {
         let error = |reason: String| {
             StartupError::Runtime(format!(

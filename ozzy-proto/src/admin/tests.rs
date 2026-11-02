@@ -115,6 +115,8 @@ fn replies() -> Vec<Reply> {
         Reply::Connections(Connections {
             brokers: vec![(node, true), (NodeId::from_bytes([5; 16]), false)],
             clients: 12,
+            clock_paused: true,
+            clock_offsets: vec![(node, -3_600_000), (NodeId::from_bytes([5; 16]), 7)],
         }),
         Reply::Error("unknown request".into()),
         Reply::GroupDeleted(Some(ConsumerGroupId::from_bytes([11; 16]))),

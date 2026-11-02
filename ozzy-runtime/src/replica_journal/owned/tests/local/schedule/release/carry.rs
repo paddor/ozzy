@@ -117,7 +117,7 @@ fn carry_frees_the_schedule_segment_and_releases_read_the_carry() {
     let plan = |controller: &mut Controller, journal: &mut OwnedJournal, driver: &Driver| {
         drive(
             controller,
-            journal.plan_retention(driver.begin_validation().unwrap(), NOW + 60_000, 2),
+            journal.plan_retention(driver.begin_validation().unwrap(), Some(NOW + 60_000), 2),
         )
         .unwrap()
         .map(|(_, plan)| plan.retire)

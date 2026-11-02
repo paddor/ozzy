@@ -15,8 +15,10 @@ use crate::dispatch::Class;
 use crate::signal::StateSignal;
 
 mod admission;
+mod clock;
 mod directory;
 mod links;
+pub use clock::{ClockNow, ClockSampling, ClockStatus, ClockTrust};
 use links::LinkState;
 pub use links::{Access, Link, Links};
 mod progress;
@@ -79,6 +81,8 @@ pub struct Service {
     /// Per shard and destination class, the lowest reply sequence refused for
     /// capacity and not yet re-admitted. Later sequences wait behind it.
     pub(super) refused_replies: BTreeMap<(u32, NodeId, Class), u64>,
+    /// Sampling of this broker's clock against its peers, when it has peers.
+    clock: Option<ClockSampling>,
 }
 
 impl Service {
@@ -151,6 +155,7 @@ impl Service {
             refused_replies: BTreeMap::new(),
             publications: [None, None],
             publication_next: 0,
+            clock: None,
         })
     }
 

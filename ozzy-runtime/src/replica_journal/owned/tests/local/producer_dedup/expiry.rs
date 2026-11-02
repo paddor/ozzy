@@ -21,7 +21,7 @@ fn retention(
         controller,
         journal.retention_turn(
             driver.begin_validation().unwrap(),
-            u64::MAX,
+            Some(u64::MAX),
             OperationId::from_bytes([71; 16]),
             leader,
         ),

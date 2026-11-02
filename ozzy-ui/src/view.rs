@@ -169,7 +169,7 @@ impl App {
             .connections
             .as_ref()
             .map_or_else(|| "?".into(), |links| format::count(links.clients.into()));
-        vec![
+        let mut facts = vec![
             ("Name", broker.name.clone()),
             ("ID", broker.id.to_string()),
             ("PID", broker.pid.to_string()),
@@ -180,7 +180,27 @@ impl App {
                 format!("{clients} of {}", format::count(broker.max_clients.into())),
             ),
             admin,
-        ]
+        ];
+        if let Some(clock) = self.paused_clock() {
+            facts.push(("Clock", clock));
+        }
+        facts
+    }
+
+    /// How far the peers' clocks are, while clock-driven decisions wait for them.
+    fn paused_clock(&self) -> Option<String> {
+        let links = self
+            .connections
+            .as_ref()
+            .filter(|links| links.clock_paused)?;
+        let offsets: Vec<_> = (links.clock_offsets.iter())
+            .map(|(_, offset)| format!("{offset} ms"))
+            .collect();
+        Some(if offsets.is_empty() {
+            "paused".into()
+        } else {
+            format!("paused ({})", offsets.join(", "))
+        })
     }
 
     fn cluster(&self, width: u16) -> Table<'static> {

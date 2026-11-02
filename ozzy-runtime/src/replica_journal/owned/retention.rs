@@ -101,7 +101,7 @@ impl OwnedJournal {
     pub(in crate::replica_journal) async fn retention_turn(
         &mut self,
         ticket: ValidationTicket,
-        now_millis: u64,
+        now_millis: Option<u64>,
         seed: OperationId,
         leader: bool,
     ) -> Result<RetentionTurn, JournalError> {
@@ -156,7 +156,7 @@ impl OwnedJournal {
     async fn record_retention_turn(
         &mut self,
         ticket: ValidationTicket,
-        now_millis: u64,
+        now_millis: Option<u64>,
         seed: OperationId,
         leader: bool,
     ) -> Result<RetentionTurn, JournalError> {

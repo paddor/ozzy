@@ -27,6 +27,7 @@
     )
 )]
 
+pub mod clock;
 mod configuration_record;
 pub mod driver;
 pub mod flow;
