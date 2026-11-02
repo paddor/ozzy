@@ -157,9 +157,9 @@ What a layer does not prove:
   same process hold it back too, so run these under Nextest, one process per
   test. Wait for a broker time with a clock deadline, as `wait_until` does, so
   a step stops there.
-- `broker::Cluster::cut` and `isolate` drop broker traffic between live
-  brokers, as a network partition would. Client links stay up, and a cut
-  outlasts restarts.
+- `broker::Cluster::cut`, `cut_one_way`, and `isolate` drop broker traffic
+  between live brokers, as a network partition would. Client links stay up,
+  and a cut outlasts restarts.
 - Test under bounded load first.
 - Run builds, heavy checks, benchmarks, and profiling serially.
 

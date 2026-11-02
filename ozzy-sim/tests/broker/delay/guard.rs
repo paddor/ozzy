@@ -339,6 +339,39 @@ async fn inproc_memory_a_restart_with_a_fast_clock_pauses_from_the_first_turn() 
     .expect("restart with a fast clock made no bounded progress");
 }
 
+/// A partition that leaves one good clock and one bad one: neither can tell
+/// which is wrong, so both pause. Healing and fixing the clock resumes them,
+/// and delayed delivery works again.
+#[tokio::test(flavor = "current_thread")]
+async fn inproc_memory_a_partition_leaving_one_bad_clock_pauses_both_sides() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let mut guarded = Guarded::start(None).await;
+        confirm(&guarded.clock, &mut guarded.writer, [record(1, None)]).await;
+        let leader = guarded.leader().await;
+        let (fast, good) = ((leader + 1) % 3, (leader + 2) % 3);
+        guarded.skew(fast, SKEW);
+        guarded.until_paused(fast, true).await;
+        assert!(!guarded.cluster.brokers[good].clock().paused);
+        guarded.cluster.isolate(leader, true);
+        // Its sample from the cut-off leader goes stale, leaving one peer,
+        // far off.
+        guarded.until_paused(good, true).await;
+        assert!(guarded.cluster.brokers[fast].clock().paused);
+        guarded.cluster.isolate(leader, false);
+        guarded.until_paused(good, false).await;
+        guarded.skew(fast, 0);
+        guarded.until_paused(fast, false).await;
+        let due = broker_now(&guarded.clock) + 2_000;
+        confirm(&guarded.clock, &mut guarded.writer, [record(2, Some(due))]).await;
+        let records = released(&guarded.clock, &guarded.client, 2).await;
+        assert_eq!(records[1].0, 2);
+        assert!(records[1].2 >= due, "released before its due time");
+        guarded.finish().await;
+    })
+    .await
+    .expect("a partition with one bad clock made no bounded progress");
+}
+
 /// Byte retention reads no clock, and a carry toward it needs none.
 mod stress {
     use super::*;

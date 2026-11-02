@@ -139,8 +139,14 @@ impl Cluster {
     /// between them would, or with `cut` false heal it. Client links stay up,
     /// and a cut outlasts restarts.
     pub fn cut(&self, a: usize, b: usize, cut: bool) {
-        self.contexts[a].cut_peer(self.node(b), cut);
-        self.contexts[b].cut_peer(self.node(a), cut);
+        self.cut_one_way(a, b, cut);
+        self.cut_one_way(b, a, cut);
+    }
+
+    /// Drop broker traffic from `from` to `to` only, or with `cut` false
+    /// deliver it again. `from` still hears `to`.
+    pub fn cut_one_way(&self, from: usize, to: usize, cut: bool) {
+        self.contexts[to].cut_peer(self.node(from), cut);
     }
 
     /// Cut broker `index` from every other broker, or heal it.

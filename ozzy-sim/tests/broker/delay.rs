@@ -7,6 +7,7 @@ use ozzy_runtime::replicated::{
 
 mod carry;
 mod guard;
+mod partition;
 
 /// Broker time at manual clock zero, in Unix milliseconds.
 const EPOCH_MILLIS: u64 = 1_000_000;
