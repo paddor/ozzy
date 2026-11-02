@@ -48,6 +48,19 @@ impl ReplicaDriver {
             }
             return Ok(());
         }
+        if scope.view > self.scope().view {
+            // A request to leave a newer view says nothing about this one,
+            // but it shows this view is stale. An idle primary has no timeout
+            // of its own, and only the newer view's primary would tell it of
+            // that view. With that primary gone, the sender could never form
+            // a view with it. Ask the sender to leave this view instead: its
+            // answer is the newer view's fence, which brings this voter in.
+            if matches!(self.role, Role::Normal(_)) && self.now >= self.exit_echo_at[voter] {
+                self.exit_echo_at[voter] = self.now.saturating_add(self.timing.retransmit);
+                self.stale_answers.insert(voter);
+            }
+            return Ok(());
+        }
         if scope != self.scope() {
             return Ok(());
         }
@@ -122,8 +135,10 @@ impl ReplicaDriver {
         )
     }
 
-    /// Support one sender's exit from an older view per call. The sender
-    /// retransmits, so a lost answer is repeated after that interval.
+    /// Answer one sender's request to leave another view per call: support
+    /// for an older view's exit, that view's fence, or this stale view's exit.
+    /// The sender retransmits, so a lost answer is repeated after that
+    /// interval.
     pub(super) fn exit_echo_action(&mut self) -> Option<Action> {
         if let Some((scope, mut asked)) = self.exit_echo.take()
             && let Some(voter) = asked.pop_first()
@@ -136,12 +151,18 @@ impl ReplicaDriver {
                 message: Control::ExitView(scope),
             });
         }
-        let voter = self.fence_answers.pop_first()?;
+        if let Some(voter) = self.fence_answers.pop_first() {
+            return Some(Action::Send {
+                to: self.configuration.voter(voter),
+                message: Control::StartViewChange(StartViewChange {
+                    scope: self.scope(),
+                }),
+            });
+        }
+        let voter = self.stale_answers.pop_first()?;
         Some(Action::Send {
             to: self.configuration.voter(voter),
-            message: Control::StartViewChange(StartViewChange {
-                scope: self.scope(),
-            }),
+            message: Control::ExitView(self.scope()),
         })
     }
 

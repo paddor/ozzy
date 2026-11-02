@@ -549,3 +549,41 @@ async fn inproc_memory_a_lagging_broker_cut_from_the_leader_catches_up_through_a
     )
     .await;
 }
+
+/// A leader cut off while the other two form a newer view stays primary of its
+/// old view. It heals towards the newer view's backup just as that view's
+/// primary is cut off, so it never hears the newer view. The backup suspects
+/// the lost primary, and the old leader must form a view with it within a few
+/// election timeouts, not wait for work it cannot commit.
+#[tokio::test(flavor = "current_thread")]
+async fn inproc_memory_a_stale_leader_joins_the_view_it_missed_once_that_view_loses_its_leader() {
+    bounded(
+        async {
+            let mut split = Split::start().await;
+            let old = split.leading(0).await;
+            split.cluster.isolate(old, true);
+            split.until_heard(old, false).await;
+            split.write().await;
+            let new = split.leading(0).await;
+            let backup = 3 - old - new;
+            split.cluster.isolate(new, true);
+            split.cluster.cut(old, backup, false);
+            split.until_hears(old, backup, true).await;
+            split.until_hears(backup, old, true).await;
+            let since = split.clock.now();
+            split.write().await;
+            let waited = split.clock.now().saturating_sub(since);
+            assert!(
+                waited < Duration::from_secs(10),
+                "the write waited {waited:?} of broker time"
+            );
+            split.cluster.isolate(new, false);
+            for index in 0..3 {
+                split.until_heard(index, true).await;
+            }
+            split.finish().await;
+        },
+        "a stale leader",
+    )
+    .await;
+}

@@ -27,6 +27,12 @@
   old view, so if the new leader then failed, the two remaining brokers could
   not elect, and the partition stopped for good. Brokers that started at
   different times and lost a link early could hit this.
+- A leader that missed a newer view now joins it when that view's leader is
+  lost. Before, an idle old leader ignored the remaining follower's request
+  to leave the newer view and never suspected its own, so the two could not
+  elect. The partition stopped until the old leader had work it could not
+  commit, such as an age retention turn, or for good without one. A leader
+  that came back from a short network partition could hit this.
 - Byte retention of a delay partition no longer stalls after a broker that
   caught up by installing history becomes leader. Installation left its
   active segment holding more held records than a write rolls at, so it saw

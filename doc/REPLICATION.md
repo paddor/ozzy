@@ -130,6 +130,11 @@ votes and is not suspicion.
   that view is installed. Only a leader sends normal traffic, so a broker
   that missed a view and cannot hear its leader learns of it this way.
   Otherwise, with that leader gone, the other two could not form a view.
+- A normal broker asked to leave a newer view answers the sender, at most
+  once per retransmission interval, with EXIT_VIEW for its own view, and the
+  sender's fence brings it into the newer view. The request is no evidence
+  about either view. It covers a leader that missed a view: an idle leader
+  has no timeout of its own, so it would otherwise never leave its old view.
 - A lagging copy fetches and replays its missed suffix inside the view
   change. Each verified lookup batch, staged chunk, or running installation
   step pushes its election deadline out by one election delay, so a
