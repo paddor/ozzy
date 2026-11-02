@@ -20,6 +20,14 @@
   its clock is fixed or leadership moves. `ozzy-tui` and admin Connections show
   the pause and the offsets.
 
+### Fixed
+
+- Byte retention of a delay partition no longer stalls after a broker that
+  caught up by installing history becomes leader. Installation left its
+  active segment holding more held records than a write rolls at, so it saw
+  nothing to carry or retire, and the other copies stayed over their byte
+  target until the next write. A retention turn now rolls that segment.
+
 ## [0.8.0] - 2026-11-01
 
 ### Breaking

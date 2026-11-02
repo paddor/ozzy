@@ -166,6 +166,15 @@ impl OwnedJournal {
             crate::profiling::event(crate::profiling::Event::RetentionRetiring);
             return Ok(RetentionTurn::idle(true));
         }
+        // A write rolls the active segment once it holds the bound of held
+        // rows, but an installed suffix fills segments by capacity alone. A
+        // copy that caught up that way rolls here, as no write may come. As
+        // leader it would otherwise find nothing to carry or retire, and the
+        // other copies would stay over their byte target.
+        let next = ticket.applied().op.0.saturating_add(1);
+        if self.held_crowded(next)? && self.can_roll()? && self.spare.ready() {
+            return self.roll_for_retention().await;
+        }
         let planned = match self.plan_retention(ticket, now_millis, 1).await {
             Err(JournalError::AppendCapacity) => return Ok(deferred()),
             result => result?,
@@ -195,15 +204,20 @@ impl OwnedJournal {
             return self.start_retirement(ticket, seed).await;
         }
         if leader && plan.roll_active && self.can_roll()? && self.spare.ready() {
-            let work = self.begin_roll(16)?;
-            let done = work.publish().await;
-            self.complete_roll(done)?;
-            return Ok(RetentionTurn {
-                more_work: true,
-                ..RetentionTurn::idle(true)
-            });
+            return self.roll_for_retention().await;
         }
         Ok(RetentionTurn::idle(true))
+    }
+
+    /// Seal the active segment; the next turn plans with it sealed.
+    async fn roll_for_retention(&mut self) -> Result<RetentionTurn, JournalError> {
+        let work = self.begin_roll(16)?;
+        let done = work.publish().await;
+        self.complete_roll(done)?;
+        Ok(RetentionTurn {
+            more_work: true,
+            ..RetentionTurn::idle(true)
+        })
     }
 
     /// Whether the plan's record floor or a producer's retry floor must

@@ -6,6 +6,7 @@ use ozzy_proto::MessageId;
 
 mod carry;
 mod paused;
+mod roll;
 
 /// Run one release step at `now`, with its reads inline.
 fn release(
