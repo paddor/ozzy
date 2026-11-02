@@ -37,6 +37,9 @@ struct Serving<'a> {
     buffers: &'a ReceiveBuffers,
     /// Handshake retry interval.
     retry: Duration,
+    /// Broker peers whose traffic this simulated broker drops.
+    #[cfg(feature = "simulation")]
+    cut: &'a crate::serving::CutPeers,
 }
 
 impl FrontendContext {
@@ -65,11 +68,15 @@ impl FrontendContext {
             service.start(peer).map_err(failure)?;
         }
         let followers = Followers::open(&self, brokers.followers).await?;
+        #[cfg(feature = "simulation")]
+        let cut = self.cut.clone();
         let serving = Serving {
             brokers: &brokers.control,
             followers: &followers,
             buffers: &buffers,
             retry,
+            #[cfg(feature = "simulation")]
+            cut: &cut,
         };
         // Dispatch consumes this context before followers close. The dispatcher
         // thread still owns the bound sockets and OMQ context until we return.
@@ -157,7 +164,7 @@ impl FrontendContext {
                     data.receive(service, receipt, body).await?;
                 }
                 (publisher, received) = publications.receive() => {
-                    receive_publication(service, serving.buffers, publisher, received)?;
+                    receive_publication(service, serving, publisher, received)?;
                 }
                 socket = publishers.ready() => publishers.retry(socket)?,
                 watched = subscribers.next() => subscribers.turn(watched).await?,
@@ -202,12 +209,17 @@ fn retry_handshakes(
 /// source on capacity, and only fatal admission failures stop the frontend.
 fn receive_publication(
     service: &mut Service,
-    buffers: &ReceiveBuffers,
+    serving: Serving<'_>,
     publisher: NodeId,
     received: Result<omq_tokio::Message, omq_tokio::Error>,
 ) -> Result<(), StartupError> {
     let message = received.map_err(failure)?;
-    if let Ok((message, retained)) = buffers.prepare_borrowed(&message)
+    // A simulated network partition drops what the cut peers publish.
+    #[cfg(feature = "simulation")]
+    if !serving.cut.hears(publisher) {
+        return Ok(());
+    }
+    if let Ok((message, retained)) = serving.buffers.prepare_borrowed(&message)
         && let Err(reason) = service.receive_publication(publisher, &message, retained)
         && fatal(&reason)
     {

@@ -84,17 +84,38 @@ async fn inproc_memory_manual_broker_time_drives_timestamp_seeks_and_age_retenti
     .expect("manual broker time did not preserve bounded progress");
 }
 
+/// Most broker time one step may pass. Steps come at most every 2 ms, so broker
+/// time runs at most ten times real time, and parts that run on real time, such
+/// as OMQ reconnects and handshake retries, keep pace.
+const MAX_STEP: Duration = Duration::from_millis(20);
+
+/// Drive `operation` while broker time advances. Each step waits until no
+/// broker, storage, or SDK thread of this process can run, so a busy host slows
+/// broker time instead of outrunning the brokers. A step then goes to the next
+/// deadline anything waits for, at most [`MAX_STEP`] on. Threads of other tests
+/// in the same process hold time back too, so run these one process per test,
+/// as Nextest does.
 pub(super) async fn progress<T>(
     clock: &SdkClock,
     operation: impl std::future::Future<Output = T>,
 ) -> T {
+    let _advancing = ozzy_sim::idle::Advancing::enter();
     let mut operation = std::pin::pin!(operation);
     let mut tick = tokio::time::interval(Duration::from_millis(2));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            biased;
             result = &mut operation => return result,
-            _ = tick.tick() => clock.advance(clock.now() + Duration::from_millis(10)).unwrap(),
+            _ = tick.tick() => {
+                // The operation waits too, so its own requests drain.
+                while !ozzy_sim::idle::quiescent() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                let now = clock.now();
+                let next = clock.next_deadline().unwrap_or(Duration::MAX);
+                clock.advance(next.min(now + MAX_STEP)).unwrap();
+            }
         }
     }
 }

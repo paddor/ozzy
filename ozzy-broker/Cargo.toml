@@ -14,13 +14,14 @@ categories = ["database-implementations", "network-programming", "command-line-u
 include = ["/src/**/*.rs", "/README.md", "/LICENSE", "/three.toml", "/container.toml", "/Containerfile"]
 
 [features]
-simulation = []
+simulation = ["dep:arc-swap"]
 # Serve `lz4+tcp://` endpoints.
 lz4-transport = ["omq-tokio/lz4", "ozzy-runtime/lz4-transport"]
 # Serve `zstd+tcp://` endpoints.
 zstd-transport = ["omq-tokio/zstd", "ozzy-runtime/zstd-transport"]
 
 [dependencies]
+arc-swap = { workspace = true, optional = true }
 bytes.workspace = true
 clap.workspace = true
 futures.workspace = true

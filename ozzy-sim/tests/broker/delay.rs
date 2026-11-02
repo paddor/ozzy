@@ -104,14 +104,11 @@ async fn leader(clock: &SdkClock, cluster: &broker::Cluster, client: &Client) ->
         .unwrap()
 }
 
-/// Advance broker time to `millis`.
+/// Advance broker time to `millis`. The wait is a deadline, so broker time
+/// steps to it rather than past it.
 async fn wait_until(clock: &SdkClock, millis: u64) {
-    progress(clock, async {
-        while broker_now(clock) < millis {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await;
+    let deadline = Duration::from_millis(millis.saturating_sub(EPOCH_MILLIS));
+    progress(clock, clock.until(deadline)).await;
 }
 
 /// Send records to partition 0 and return their receipts.

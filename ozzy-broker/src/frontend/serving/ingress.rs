@@ -137,6 +137,9 @@ impl<'a> Ingress<'a> {
         let Some(message) = self.route(service, message)? else {
             return Ok(None);
         };
+        if !self.heard(&message) {
+            return Ok(None);
+        }
         match service.receive(message, retained) {
             Err(ReceiveError::Dispatch(Rejection::Data(DataPressure::Full {
                 shard,
@@ -175,6 +178,23 @@ impl<'a> Ingress<'a> {
             }
             Ok(_) => Ok(None),
         }
+    }
+
+    /// Whether a routed message still arrives. A simulated network partition
+    /// drops traffic from the peers it cut; routing put the logical sender
+    /// first, also for repair connections.
+    #[cfg(feature = "simulation")]
+    fn heard(&self, message: &Message) -> bool {
+        message
+            .part_slice(0)
+            .and_then(|peer| <[u8; 16]>::try_from(peer).ok())
+            .is_none_or(|peer| self.serving.cut.hears(NodeId::from_bytes(peer)))
+    }
+
+    #[cfg(not(feature = "simulation"))]
+    #[expect(clippy::unused_self, reason = "the simulated build checks partitions")]
+    const fn heard(&self, _message: &Message) -> bool {
+        true
     }
 
     fn route(

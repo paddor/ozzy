@@ -150,6 +150,16 @@ What a layer does not prove:
   bytes, sequence numbers, and offsets.
 - Poll for conditions. Never sleep a fixed time. Drive long timers with manual
   broker time.
+- In `ozzy-sim/tests/broker/`, `progress` steps manual broker time only once
+  no broker, storage, or SDK thread of the process can run, then to the next
+  deadline anything waits for, at most 20 ms per 2 ms. A loaded host slows
+  broker time instead of outrunning the brokers. Other tests' threads in the
+  same process hold it back too, so run these under Nextest, one process per
+  test. Wait for a broker time with a clock deadline, as `wait_until` does, so
+  a step stops there.
+- `broker::Cluster::cut` and `isolate` drop broker traffic between live
+  brokers, as a network partition would. Client links stay up, and a cut
+  outlasts restarts.
 - Test under bounded load first.
 - Run builds, heavy checks, benchmarks, and profiling serially.
 

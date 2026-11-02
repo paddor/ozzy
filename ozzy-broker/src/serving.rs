@@ -2,6 +2,8 @@
 
 mod config;
 mod context;
+#[cfg(feature = "simulation")]
+pub(crate) use context::CutPeers;
 pub use context::ServingContext;
 pub(crate) use context::{Alarm, Timer};
 mod drain;
@@ -304,6 +306,8 @@ async fn start_frontend(
         let (mut service, handoffs) = serving_config.service(registered.into_values().collect())?;
         serving_config.handoff(&mut service, handoffs)?;
         frontend.sample_clock(serving_config.install_clock(&mut service));
+        #[cfg(feature = "simulation")]
+        frontend.cut_peers(serving_config.cut.clone());
         frontend
             .serve(
                 service,

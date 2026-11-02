@@ -135,6 +135,27 @@ impl Cluster {
         self.contexts[index].set_epoch_millis(epoch_millis);
     }
 
+    /// Stop brokers `a` and `b` hearing each other, as a network partition
+    /// between them would, or with `cut` false heal it. Client links stay up,
+    /// and a cut outlasts restarts.
+    pub fn cut(&self, a: usize, b: usize, cut: bool) {
+        self.contexts[a].cut_peer(self.node(b), cut);
+        self.contexts[b].cut_peer(self.node(a), cut);
+    }
+
+    /// Cut broker `index` from every other broker, or heal it.
+    pub fn isolate(&self, index: usize, isolated: bool) {
+        for other in (0..self.configs.len()).filter(|&other| other != index) {
+            self.cut(index, other, isolated);
+        }
+    }
+
+    /// Broker `index`'s persistent identity.
+    pub fn node(&self, index: usize) -> ozzy_proto::NodeId {
+        let (config, _) = &self.configs[index];
+        ozzy_proto::NodeId::from_bytes(*config.identity.brokers[&config.plan.name].as_bytes())
+    }
+
     /// Restore one stopped broker from its explicitly supplied memory image.
     pub async fn restore(&mut self, index: usize, image: Image) {
         let (checked, _) = &self.configs[index];

@@ -257,6 +257,26 @@ impl Drop for Storage {
     }
 }
 
+/// Run one pump on its own thread, as a device has its own hardware: its work
+/// is a runnable thread that simulated time waits for, and no other pump can
+/// starve it. The handle resolves on the caller's runtime.
+fn on_own_thread(
+    pump: impl std::future::Future<Output = Image> + Send + 'static,
+) -> tokio::task::JoinHandle<Image> {
+    let (send, receive) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("ozzy-sim-pump".into())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            let _ = send.send(runtime.block_on(pump));
+        })
+        .unwrap();
+    tokio::spawn(async move { receive.await.unwrap() })
+}
+
 /// Execution and delivery alternate. Reversed schedules deliver newer jobs
 /// first; awaiting one partition cannot prevent another from submitting work.
 /// An idle pump waits for a submission or an external control change.
@@ -271,7 +291,7 @@ pub fn pump(
     };
     let done = storage.done.clone();
     let scheduling = control.clone();
-    let task = tokio::spawn(async move {
+    let task = on_own_thread(async move {
         let mut drain = None;
         loop {
             // Clear before inspecting controls; a later change marks again.

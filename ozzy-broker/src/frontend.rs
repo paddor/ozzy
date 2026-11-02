@@ -118,6 +118,9 @@ pub struct FrontendContext {
     ready: Option<ozzy_io::Ready<()>>,
     /// Origin of the service's clock sampling, when it samples.
     clock: Option<crate::serving::Timer>,
+    /// Broker peers whose traffic this simulated broker drops.
+    #[cfg(feature = "simulation")]
+    cut: crate::serving::CutPeers,
 }
 
 impl FrontendContext {
@@ -129,6 +132,12 @@ impl FrontendContext {
     /// Run the service's clock sampling on `timer` while serving.
     pub(crate) fn sample_clock(&mut self, timer: Option<crate::serving::Timer>) {
         self.clock = timer;
+    }
+
+    /// Drop broker traffic from the peers in `cut`.
+    #[cfg(feature = "simulation")]
+    pub(crate) fn cut_peers(&mut self, cut: crate::serving::CutPeers) {
+        self.cut = cut;
     }
 
     /// Publish readiness after route/session queues are installed. The factory
@@ -488,6 +497,8 @@ where
             limits,
             ready: Some(ready),
             clock: None,
+            #[cfg(feature = "simulation")]
+            cut: crate::serving::CutPeers::default(),
         })
         .await
     })

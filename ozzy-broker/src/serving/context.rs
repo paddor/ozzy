@@ -20,6 +20,9 @@ pub struct ServingContext {
     /// and active-segment rows.
     #[cfg(feature = "simulation")]
     held: Option<(usize, usize)>,
+    /// Broker peers whose traffic the brokers on this context drop.
+    #[cfg(feature = "simulation")]
+    pub(super) cut: CutPeers,
 }
 
 impl From<Context> for ServingContext {
@@ -29,6 +32,8 @@ impl From<Context> for ServingContext {
             time: Time::default(),
             #[cfg(feature = "simulation")]
             held: None,
+            #[cfg(feature = "simulation")]
+            cut: CutPeers::default(),
         }
     }
 }
@@ -49,6 +54,7 @@ impl ServingContext {
                 epoch_millis: Arc::new(AtomicU64::new(epoch_millis)),
             },
             held: None,
+            cut: CutPeers::default(),
         }
     }
 
@@ -59,6 +65,22 @@ impl ServingContext {
         if let Time::Manual { epoch_millis, .. } = &self.time {
             epoch_millis.store(epoch, Ordering::Relaxed);
         }
+    }
+
+    /// Drop, or with `cut` false resume, all broker traffic arriving from
+    /// `peer` at every broker on this context, as a network partition would.
+    /// Messages already admitted still run, and client links stay up.
+    #[cfg(feature = "simulation")]
+    pub fn cut_peer(&self, peer: ozzy_proto::NodeId, cut: bool) {
+        self.cut.0.rcu(|peers| {
+            let mut peers = std::collections::BTreeSet::clone(peers);
+            if cut {
+                peers.insert(peer);
+            } else {
+                peers.remove(&peer);
+            }
+            peers
+        });
     }
 
     /// Keep `window` sealed rows loaded and roll a segment early at `active`
@@ -87,6 +109,19 @@ impl ServingContext {
                 delay.active = active;
             }
         }
+    }
+}
+
+/// Broker peers whose traffic a simulated broker no longer hears.
+#[cfg(feature = "simulation")]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CutPeers(Arc<arc_swap::ArcSwap<std::collections::BTreeSet<ozzy_proto::NodeId>>>);
+
+#[cfg(feature = "simulation")]
+impl CutPeers {
+    /// Whether traffic from `peer` still arrives.
+    pub(crate) fn hears(&self, peer: ozzy_proto::NodeId) -> bool {
+        !self.0.load().contains(&peer)
     }
 }
 

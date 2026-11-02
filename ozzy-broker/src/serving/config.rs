@@ -54,6 +54,21 @@ pub(super) struct Config {
     pub clock: frontend::ClockTrust,
     /// The monotonic origin of the clock guard's readings.
     pub clock_timer: super::context::Timer,
+    /// Broker peers whose traffic this simulated broker drops.
+    #[cfg(feature = "simulation")]
+    pub cut: super::context::CutPeers,
+}
+
+/// A guard against `brokers`, or none for a single broker.
+fn clock_trust(
+    brokers: &BTreeMap<NodeId, omq_tokio::Endpoint>,
+    tolerance_millis: u64,
+) -> frontend::ClockTrust {
+    if brokers.is_empty() {
+        frontend::ClockTrust::unguarded()
+    } else {
+        frontend::ClockTrust::guarded(brokers.keys().copied(), tolerance_millis)
+    }
 }
 
 impl Config {
@@ -97,6 +112,8 @@ impl Config {
         checked: &CheckedConfig,
         context: super::ServingContext,
     ) -> Result<Self, StartupError> {
+        #[cfg(feature = "simulation")]
+        let cut = context.cut.clone();
         let super::ServingContext { omq, time, .. } = context;
         crate::frontend::configure_network(&omq, &checked.plan)?;
         let deployment = checked.deployment.deployment();
@@ -124,14 +141,7 @@ impl Config {
         let buffers = ReceiveBuffers::new(envelope, storage).map_err(failure)?;
         let budgets = shard_budgets(checked);
         let catalog = catalog(checked)?;
-        let clock = if brokers.is_empty() {
-            frontend::ClockTrust::unguarded()
-        } else {
-            frontend::ClockTrust::guarded(
-                brokers.keys().copied(),
-                deployment.cluster.max_clock_offset_millis,
-            )
-        };
+        let clock = clock_trust(&brokers, deployment.cluster.max_clock_offset_millis);
         let clock_timer = time.start();
         Ok(Self {
             time,
@@ -157,6 +167,8 @@ impl Config {
             receipt_handles: ozzy_runtime::replica_actor::ReceiptHandles::default(),
             clock,
             clock_timer,
+            #[cfg(feature = "simulation")]
+            cut,
         })
     }
 
