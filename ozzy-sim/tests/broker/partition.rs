@@ -6,6 +6,7 @@
 
 use super::*;
 use futures::FutureExt;
+use ozzy_runtime::replicated::TopicReader;
 
 /// Three brokers on manual time and one SDK client writing waves.
 struct Split {
@@ -100,6 +101,11 @@ impl Split {
         for peer in (0..3).filter(|&peer| peer != index) {
             self.until_hears(index, peer, heard).await;
         }
+    }
+
+    /// Read and check every confirmed record past `positions`.
+    async fn read(&self, reader: &mut TopicReader, positions: Vec<usize>) {
+        progress(&self.clock, self.client.read(reader, positions)).await;
     }
 
     /// Advance broker time by `millis`.
@@ -213,6 +219,17 @@ async fn inproc_memory_a_follower_that_cannot_hear_the_leader_leaves_it_alone() 
     bounded(
         leader_keeps(|cluster, leader, cut| cluster.cut_one_way(leader, (leader + 1) % 3, cut)),
         "a follower deaf to the leader",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn inproc_memory_a_follower_deaf_to_the_other_follower_leaves_the_leader_alone() {
+    bounded(
+        leader_keeps(|cluster, leader, cut| {
+            cluster.cut_one_way((leader + 1) % 3, (leader + 2) % 3, cut);
+        }),
+        "a follower deaf to the other follower",
     )
     .await;
 }
@@ -355,6 +372,218 @@ async fn inproc_memory_a_broker_that_missed_a_view_joins_it_through_a_follower()
             split.finish().await;
         },
         "a broker that missed a view",
+    )
+    .await;
+}
+
+/// A reader opened before the leader is cut off keeps reading while the cut
+/// lasts: the next leader's records reach it before the cut heals, and so do
+/// the records written after, each once and in order.
+#[tokio::test(flavor = "current_thread")]
+async fn inproc_memory_a_reader_moves_off_a_cut_off_leader() {
+    bounded(
+        async {
+            let mut split = Split::start().await;
+            let mut reader = progress(&split.clock, split.client.reader(false)).await;
+            let start = vec![0; split.client.positions().len()];
+            split.read(&mut reader, start).await;
+            let leader = split.leading(0).await;
+            split.cluster.isolate(leader, true);
+            split.until_heard(leader, false).await;
+            let positions = split.client.positions();
+            split.write().await;
+            split.read(&mut reader, positions).await;
+            split.cluster.isolate(leader, false);
+            split.until_heard(leader, true).await;
+            let positions = split.client.positions();
+            split.write().await;
+            split.read(&mut reader, positions).await;
+            progress(&split.clock, reader.close()).await.unwrap();
+            split.finish().await;
+        },
+        "a reader on a cut-off leader",
+    )
+    .await;
+}
+
+/// Links flap while writes wait. Cuts run shorter than the primary timeout,
+/// past it, and past the election timeout; heals run shorter and longer than a
+/// heartbeat. Every queued write confirms once the links hold, once and in
+/// order.
+#[tokio::test(flavor = "current_thread")]
+async fn inproc_memory_flapping_links_keep_every_write_once() {
+    bounded(
+        async {
+            let mut split = Split::start().await;
+            let first = split.leading(0).await;
+            // The broker cut off, or every broker when `None`, how long the cut
+            // lasts, and how long the heal after it, in milliseconds.
+            let flaps = [
+                (Some(first), 600, 150),
+                (None, 1_200, 50),
+                (Some(first), 1_500, 250),
+                (None, 2_500, 150),
+                (Some((first + 1) % 3), 900, 100),
+                (Some(first), 1_100, 50),
+                (None, 700, 300),
+            ];
+            let mut pending = Vec::new();
+            for (target, cut, healed) in flaps {
+                pending.extend(split.queue().await);
+                for index in target.map_or(0..3, |index| index..index + 1) {
+                    split.cluster.isolate(index, true);
+                }
+                split.pass(cut).await;
+                for index in 0..3 {
+                    split.cluster.isolate(index, false);
+                }
+                split.pass(healed).await;
+            }
+            progress(&split.clock, split.client.confirm(pending)).await;
+            for index in 0..3 {
+                split.until_heard(index, true).await;
+            }
+            split.finish().await;
+        },
+        "flapping links",
+    )
+    .await;
+}
+
+/// The leader is cut off while its followers cannot hear each other either.
+/// Each suspects it alone, and its election attempts go unanswered through
+/// growing timeouts. Once the followers hear each other they form a view
+/// without the leader, and the writes queued meanwhile confirm.
+#[tokio::test(flavor = "current_thread")]
+async fn inproc_memory_followers_that_suspected_the_leader_apart_form_a_view_once_they_meet() {
+    bounded(
+        async {
+            let mut split = Split::start().await;
+            let leader = split.leading(0).await;
+            for index in 0..3 {
+                split.cluster.isolate(index, true);
+            }
+            for index in 0..3 {
+                split.until_heard(index, false).await;
+            }
+            let pending = split.queue().await;
+            // Past several election timeouts as they double.
+            split.pass(10_000).await;
+            split.cluster.cut((leader + 1) % 3, (leader + 2) % 3, false);
+            progress(&split.clock, split.client.confirm(pending)).await;
+            split.write().await;
+            assert_ne!(
+                split.leading(0).await,
+                leader,
+                "the cut-off leader still leads"
+            );
+            split.cluster.isolate(leader, false);
+            split.until_heard(leader, true).await;
+            split.finish().await;
+        },
+        "followers that suspected the leader apart",
+    )
+    .await;
+}
+
+/// A follower cut off from both peers loses power and restarts still cut off,
+/// so it can recover nothing until the cut heals. Once healed it recovers from
+/// its peers, and with the leader cut off it forms the quorum for the next
+/// wave.
+#[tokio::test(flavor = "current_thread")]
+async fn inproc_memory_a_follower_that_crashes_while_cut_off_rejoins_the_quorum() {
+    bounded(
+        async {
+            let mut split = Split::start().await;
+            let leader = split.leading(0).await;
+            let follower = (leader + 1) % 3;
+            split.cluster.isolate(follower, true);
+            split.until_heard(follower, false).await;
+            split.write().await;
+            progress(&split.clock, split.cluster.crash(follower, true)).await;
+            split.write().await;
+            split.cluster.isolate(follower, false);
+            split.until_heard(follower, true).await;
+            progress(&split.clock, split.cluster.wait_recovered(follower)).await;
+            split.cluster.isolate(leader, true);
+            split.until_heard(leader, false).await;
+            split.write().await;
+            split.cluster.isolate(leader, false);
+            split.until_heard(leader, true).await;
+            split.finish().await;
+        },
+        "a follower that crashes while cut off",
+    )
+    .await;
+}
+
+/// A broker cut off from the start misses several waves. Once healed it loses
+/// the leader again as soon as it hears it, so it can catch up only through
+/// the other follower. With the leader then cut off, the two form the quorum
+/// over the whole history.
+#[tokio::test(flavor = "current_thread")]
+async fn inproc_memory_a_lagging_broker_cut_from_the_leader_catches_up_through_a_follower() {
+    bounded(
+        async {
+            let mut split = Split::start_isolated(Some(2)).await;
+            for _ in 0..4 {
+                split.write().await;
+            }
+            let leader = split.leading(0).await;
+            let follower = 1 - leader;
+            split.cluster.isolate(2, false);
+            split.until_hears(2, leader, true).await;
+            split.cluster.cut(leader, 2, true);
+            split.write().await;
+            split.until_hears(2, follower, true).await;
+            split.cluster.isolate(leader, true);
+            split.until_heard(leader, false).await;
+            split.write().await;
+            split.cluster.isolate(leader, false);
+            for index in 0..3 {
+                split.until_heard(index, true).await;
+            }
+            split.finish().await;
+        },
+        "a lagging broker cut from the leader",
+    )
+    .await;
+}
+
+/// A leader cut off while the other two form a newer view stays primary of its
+/// old view. It heals towards the newer view's backup just as that view's
+/// primary is cut off, so it never hears the newer view. The backup suspects
+/// the lost primary, and the old leader must form a view with it within a few
+/// election timeouts, not wait for work it cannot commit.
+#[tokio::test(flavor = "current_thread")]
+async fn inproc_memory_a_stale_leader_joins_the_view_it_missed_once_that_view_loses_its_leader() {
+    bounded(
+        async {
+            let mut split = Split::start().await;
+            let old = split.leading(0).await;
+            split.cluster.isolate(old, true);
+            split.until_heard(old, false).await;
+            split.write().await;
+            let new = split.leading(0).await;
+            let backup = 3 - old - new;
+            split.cluster.isolate(new, true);
+            split.cluster.cut(old, backup, false);
+            split.until_hears(old, backup, true).await;
+            split.until_hears(backup, old, true).await;
+            let since = split.clock.now();
+            split.write().await;
+            let waited = split.clock.now().saturating_sub(since);
+            assert!(
+                waited < Duration::from_secs(10),
+                "the write waited {waited:?} of broker time"
+            );
+            split.cluster.isolate(new, false);
+            for index in 0..3 {
+                split.until_heard(index, true).await;
+            }
+            split.finish().await;
+        },
+        "a stale leader",
     )
     .await;
 }

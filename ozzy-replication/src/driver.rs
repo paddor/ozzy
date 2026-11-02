@@ -139,6 +139,9 @@ pub struct ReplicaDriver {
     /// Voters still asking to leave a view older than this voter's durably
     /// promised one. Each gets that view's `START_VIEW_CHANGE`.
     fence_answers: VoterSet,
+    /// Voters asking to leave a view newer than this normal voter's. Each gets
+    /// a request to leave this view, which it answers with its fence.
+    stale_answers: VoterSet,
 }
 
 impl ReplicaDriver {
@@ -215,6 +218,7 @@ impl ReplicaDriver {
             exit_echo: None,
             exit_echo_at: Voters::splat(Duration::ZERO),
             fence_answers: VoterSet::EMPTY,
+            stale_answers: VoterSet::EMPTY,
         })
     }
 
@@ -385,8 +389,10 @@ impl ReplicaDriver {
         }
         self.exit_votes = VoterSet::EMPTY;
         self.exit_retry_at = None;
-        // A new view is not durably promised yet.
+        // A new view is not durably promised yet, and this voter left the
+        // view it would ask others to leave.
         self.fence_answers = VoterSet::EMPTY;
+        self.stale_answers = VoterSet::EMPTY;
         self.election_deadline = self.now.saturating_add(self.election_delay);
         self.retry_at = self.now.saturating_add(self.timing.retransmit);
         self.start_pending = true;

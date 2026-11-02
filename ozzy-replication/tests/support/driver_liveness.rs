@@ -586,3 +586,67 @@ fn an_installed_voter_answers_an_old_request_with_its_view_fence() {
         .unwrap();
     assert_eq!(lagging.scope().view, 1);
 }
+
+/// An idle primary that missed a newer view has no timeout of its own, and
+/// only the newer view's primary would tell it of that view. A request to
+/// leave the newer view makes it ask the sender to leave its own, once per
+/// retransmission interval, and the sender's fence brings it into the newer
+/// view. Otherwise, with the newer primary gone, the two could never form one.
+#[test]
+fn a_stale_primary_answers_a_newer_request_with_its_own() {
+    let (mut replicas, mut stable, acknowledged) = rejoining_fixture();
+    let now = admit_rejoin(&mut replicas, &mut stable, acknowledged);
+    // Voter 1 leads view 1; voter 2 follows it. Voter 0 still leads view 0.
+    let mut old_leader = driver(normal(0));
+    old_leader
+        .receive(node(2), wire_control(2, wish(1)), now)
+        .unwrap();
+    assert_eq!(
+        old_leader.scope().view,
+        0,
+        "a request is no evidence of a view"
+    );
+    let Some(Action::Send {
+        to,
+        message: Control::ExitView(request),
+    }) = old_leader.poll(now).unwrap()
+    else {
+        panic!("a stale voter asks the sender to leave its view");
+    };
+    assert_eq!(to, node(2));
+    assert_eq!(request.view, 0);
+    old_leader
+        .receive(node(2), wire_control(2, wish(1)), now)
+        .unwrap();
+    assert!(
+        !matches!(
+            old_leader.poll(now).unwrap(),
+            Some(Action::Send {
+                message: Control::ExitView(_),
+                ..
+            })
+        ),
+        "asked twice within one retransmission interval"
+    );
+    let follower = &mut replicas[2];
+    assert_eq!(follower.scope().view, 1);
+    follower
+        .receive(node(0), wire_control(0, Control::ExitView(request)), now)
+        .unwrap();
+    let Some(Action::Send {
+        to,
+        message: Control::StartViewChange(fence),
+    }) = follower.poll(now).unwrap()
+    else {
+        panic!("the newer voter answers with its view's fence");
+    };
+    assert_eq!(to, node(0));
+    old_leader
+        .receive(
+            node(2),
+            wire_control(2, Control::StartViewChange(fence)),
+            now,
+        )
+        .unwrap();
+    assert_eq!(old_leader.scope().view, 1);
+}
