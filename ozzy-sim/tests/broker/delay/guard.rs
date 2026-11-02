@@ -8,6 +8,11 @@ use futures::FutureExt;
 /// slow clock stays above zero.
 const SKEW: i64 = 500_000;
 
+/// Broker time here runs faster than real time, so a sample that waits for a
+/// busy thread arrives seconds of broker time late and reads as an offset. A
+/// wide tolerance keeps that noise from pausing a broker.
+const TOLERANCE_MILLIS: u64 = 5_000;
+
 const AGE: ozzy_config::TopicRetention = ozzy_config::TopicRetention {
     max_age_secs: Some(5),
     max_bytes: None,
@@ -21,16 +26,22 @@ struct Guarded {
 }
 
 impl Guarded {
-    async fn start(retention: ozzy_config::TopicRetention) -> Self {
+    /// Start with `retention`, or the cluster's own, whose age is far past
+    /// these tests.
+    async fn start(retention: Option<ozzy_config::TopicRetention>) -> Self {
         Self::start_held(None, retention).await
     }
 
     async fn start_held(
         held: Option<(usize, usize)>,
-        retention: ozzy_config::TopicRetention,
+        retention: Option<ozzy_config::TopicRetention>,
     ) -> Self {
         let clock = SdkClock::manual();
-        let cluster = held_cluster(DeploymentMode::Three, &clock, 64, held, Some(retention)).await;
+        let cluster = tuned_cluster(DeploymentMode::Three, &clock, held, |config| {
+            delay_topic(64, retention)(config);
+            config.cluster.max_clock_offset_millis = TOLERANCE_MILLIS;
+        })
+        .await;
         let client = progress(
             &clock,
             Client::open_with_clock(&cluster.configs[0].0, &cluster.runtime, clock.clone()),
@@ -100,7 +111,7 @@ async fn nothing_until(clock: &SdkClock, reader: &mut TopicReader, until: u64) {
 /// while other writes and reads go on. Fixing it resumes them on time, and every
 /// record arrives once.
 async fn paused_leader(skew: i64) {
-    let mut guarded = Guarded::start(AGE).await;
+    let mut guarded = Guarded::start(Some(AGE)).await;
     confirm(&guarded.clock, &mut guarded.writer, [record(1, None)]).await;
     let leader = guarded.leader().await;
 
@@ -195,17 +206,19 @@ async fn inproc_memory_a_slow_leader_pauses_release_and_age_retention() {
 #[tokio::test(flavor = "current_thread")]
 async fn inproc_memory_a_fast_follower_leaves_the_leader_on_time() {
     tokio::time::timeout(Duration::from_secs(60), async {
-        let mut guarded = Guarded::start(AGE).await;
+        let mut guarded = Guarded::start(None).await;
+        // Leadership can still move until the first write confirms.
+        confirm(&guarded.clock, &mut guarded.writer, [record(1, None)]).await;
         let leader = guarded.leader().await;
         let follower = (leader + 1) % 3;
         guarded.skew(follower, SKEW);
         guarded.until_paused(follower, true).await;
         let now = broker_now(&guarded.clock);
         let due = now + 3_000;
-        confirm(&guarded.clock, &mut guarded.writer, [record(1, Some(due))]).await;
-        let records = released(&guarded.clock, &guarded.client, 1).await;
-        assert_eq!(records[0].0, 1);
-        assert!(records[0].2 >= due, "released before its due time");
+        confirm(&guarded.clock, &mut guarded.writer, [record(2, Some(due))]).await;
+        let records = released(&guarded.clock, &guarded.client, 2).await;
+        assert_eq!(records[1].0, 2);
+        assert!(records[1].2 >= due, "released before its due time");
         // The other two clocks never moved.
         let status = guarded.cluster.brokers[leader].clock();
         assert!(!status.paused, "{status:?}");
@@ -224,7 +237,7 @@ async fn inproc_memory_a_fast_follower_leaves_the_leader_on_time() {
 #[tokio::test(flavor = "current_thread")]
 async fn inproc_memory_samples_lost_from_both_peers_pause_until_they_return() {
     tokio::time::timeout(Duration::from_secs(60), async {
-        let mut guarded = Guarded::start(AGE).await;
+        let mut guarded = Guarded::start(None).await;
         // Higher index first; see `Cluster::stop`.
         let (clock, cluster) = (&guarded.clock, &mut guarded.cluster);
         let second = progress(clock, cluster.stop(2)).await;
@@ -242,32 +255,49 @@ async fn inproc_memory_samples_lost_from_both_peers_pause_until_they_return() {
     .expect("lost samples made no bounded progress");
 }
 
+/// Run `operation`, failing if any broker pauses meanwhile.
+async fn never_paused<T>(
+    cluster: &broker::Cluster,
+    operation: impl std::future::Future<Output = T>,
+) -> T {
+    let mut operation = std::pin::pin!(operation);
+    loop {
+        for broker in &cluster.brokers {
+            let status = broker.clock();
+            assert!(!status.paused, "{status:?}");
+        }
+        if let std::task::Poll::Ready(result) = futures::poll!(operation.as_mut()) {
+            return result;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn inproc_memory_offsets_inside_the_tolerance_never_pause() {
+    /// Two clocks this far from true time, in both directions.
+    const OFFSET: i64 = 1_000;
     tokio::time::timeout(Duration::from_secs(60), async {
-        let mut guarded = Guarded::start(AGE).await;
-        guarded.skew(0, 400);
-        guarded.skew(1, -400);
-        let due = broker_now(&guarded.clock) + 3_000;
-        confirm(
-            &guarded.clock,
-            &mut guarded.writer,
-            [record(1, Some(due)), record(2, None)],
-        )
-        .await;
-        let until = broker_now(&guarded.clock) + 6_000;
-        progress(&guarded.clock, async {
-            while broker_now(&guarded.clock) < until {
-                for broker in &guarded.cluster.brokers {
-                    assert!(!broker.clock().paused, "{:?}", broker.clock());
-                }
-                tokio::task::yield_now().await;
-            }
+        let mut guarded = Guarded::start(None).await;
+        guarded.skew(0, OFFSET);
+        guarded.skew(1, -OFFSET);
+        let (clock, cluster, client) = (&guarded.clock, &guarded.cluster, &guarded.client);
+        let writer = &mut guarded.writer;
+        let (due, records) = never_paused(cluster, async {
+            let due = broker_now(clock) + 3_000;
+            confirm(clock, writer, [record(1, Some(due)), record(2, None)]).await;
+            let records = released(clock, client, 2).await;
+            // Several more sample rounds.
+            wait_until(clock, broker_now(clock) + 6_000).await;
+            (due, records)
         })
         .await;
-        let records = released(&guarded.clock, &guarded.client, 2).await;
-        let ids: Vec<_> = records.iter().map(|&(id, _, _)| id).collect();
-        assert_eq!(ids, [2, 1]);
+        let mut ids: Vec<_> = records.iter().map(|&(id, _, _)| id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, [1, 2]);
+        // The leader releases by its own clock, at most `OFFSET` fast.
+        let held = records.iter().find(|&&(id, _, _)| id == 1).unwrap();
+        assert!(held.2 + OFFSET.unsigned_abs() >= due, "released early");
         guarded.finish().await;
     })
     .await
@@ -277,7 +307,7 @@ async fn inproc_memory_offsets_inside_the_tolerance_never_pause() {
 #[tokio::test(flavor = "current_thread")]
 async fn inproc_memory_a_restart_with_a_fast_clock_pauses_from_the_first_turn() {
     tokio::time::timeout(Duration::from_secs(60), async {
-        let mut guarded = Guarded::start(AGE).await;
+        let mut guarded = Guarded::start(None).await;
         let (clock, cluster) = (&guarded.clock, &mut guarded.cluster);
         let image = progress(clock, cluster.stop(2)).await;
         guarded.skew(2, SKEW);
@@ -320,7 +350,7 @@ mod stress {
                 max_age_secs: None,
                 max_bytes: Some(1024 * 1024),
             };
-            let mut guarded = Guarded::start_held(Some((4, 8)), retention).await;
+            let mut guarded = Guarded::start_held(Some((4, 8)), Some(retention)).await;
             let leader = guarded.leader().await;
             let now = broker_now(&guarded.clock);
             let stored = (1..=4_u8).map(|id| record(id, None));
