@@ -2,8 +2,15 @@
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-02
+
 ### Breaking
 
+- Brokers before 0.9.0 send no clock samples. In a cluster that mixes
+  versions, a 0.9.0 broker stays paused until another broker runs 0.9.0.
+  Partitions it leads hold delayed records, skip age retention and producer
+  idle expiry, and refuse new scheduled records with NACK 10, which SDKs
+  retry. Upgrade the second broker right after the first.
 - `ozzy_proto::admin::Connections` has new `clock_paused` and `clock_offsets`
   fields, and its reply carries them.
 - `ozzy_core::retention::Plan::select` takes `Option<u64>` for its time. `None`
