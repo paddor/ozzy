@@ -124,6 +124,12 @@ votes and is not suspicion.
   request lapses. A broker whose promise is not durable yet sends none at its
   election deadline: it knows nothing about the view, and with stalled
   storage it would help one peer's timeout end views the others install.
+- A broker asked to leave a view it already left answers the sender, at most
+  once per retransmission interval: with EXIT_VIEW for that view while its
+  own promise is pending, or with its current view's START_VIEW_CHANGE once
+  that view is installed. Only a leader sends normal traffic, so a broker
+  that missed a view and cannot hear its leader learns of it this way.
+  Otherwise, with that leader gone, the other two could not form a view.
 - A lagging copy fetches and replays its missed suffix inside the view
   change. Each verified lookup batch, staged chunk, or running installation
   step pushes its election deadline out by one election delay, so a

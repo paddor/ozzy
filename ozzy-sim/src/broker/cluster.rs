@@ -12,6 +12,20 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use uuid::Uuid;
 mod quorum;
 
+/// What `Cluster::start` sets up beyond the deployment.
+#[derive(Debug, Default)]
+struct Setup {
+    /// Held-record bounds `(window, active)` replacing the defaults.
+    held: Option<(usize, usize)>,
+    /// A broker cut off from both peers from the start.
+    isolated: Option<usize>,
+}
+
+/// A broker's persistent identity.
+fn node(config: &CheckedConfig) -> ozzy_proto::NodeId {
+    ozzy_proto::NodeId::from_bytes(*config.identity.brokers[&config.plan.name].as_bytes())
+}
+
 /// Sustained real-broker cluster shared by integration tests and overnight runs.
 #[derive(Debug)]
 pub struct Cluster {
@@ -57,7 +71,23 @@ impl Cluster {
         memory_limits: ImageLimits,
         configure: impl FnOnce(&mut ozzy_config::Deployment),
     ) -> Self {
-        Self::start(mode, clock, memory_limits, None, configure).await
+        Self::start(mode, clock, memory_limits, Setup::default(), configure).await
+    }
+
+    /// Start with broker `index` cut off from both peers, as one that boots
+    /// after the others or behind a partition would. `isolate(index, false)`
+    /// heals it.
+    pub async fn configured_isolated(
+        mode: DeploymentMode,
+        clock: Option<SdkClock>,
+        index: usize,
+        configure: impl FnOnce(&mut ozzy_config::Deployment),
+    ) -> Self {
+        let setup = Setup {
+            isolated: Some(index),
+            ..Setup::default()
+        };
+        Self::start(mode, clock, IMAGE_LIMITS, setup, configure).await
     }
 
     /// Keep `window` sealed held rows loaded and roll a segment early at
@@ -68,16 +98,21 @@ impl Cluster {
         (window, active): (usize, usize),
         configure: impl FnOnce(&mut ozzy_config::Deployment),
     ) -> Self {
-        Self::start(mode, clock, IMAGE_LIMITS, Some((window, active)), configure).await
+        let setup = Setup {
+            held: Some((window, active)),
+            ..Setup::default()
+        };
+        Self::start(mode, clock, IMAGE_LIMITS, setup, configure).await
     }
 
     async fn start(
         mode: DeploymentMode,
         clock: Option<SdkClock>,
         memory_limits: ImageLimits,
-        held: Option<(usize, usize)>,
+        setup: Setup,
         configure: impl FnOnce(&mut ozzy_config::Deployment),
     ) -> Self {
+        let held = setup.held;
         let runtime = WriterRuntime::new().unwrap();
         let context = || {
             let context = clock.clone().map_or_else(
@@ -112,6 +147,12 @@ impl Cluster {
         );
         let configs = deployment.clone();
         let contexts: Vec<_> = deployment.iter().map(|_| context()).collect();
+        if let Some(index) = setup.isolated {
+            for other in (0..deployment.len()).filter(|&other| other != index) {
+                contexts[index].cut_peer(node(&deployment[other].0), true);
+                contexts[other].cut_peer(node(&deployment[index].0), true);
+            }
+        }
         let (brokers, controls, images) =
             start_each(contexts.clone(), deployment, true, memory_limits).await;
         Self {
@@ -158,8 +199,7 @@ impl Cluster {
 
     /// Broker `index`'s persistent identity.
     pub fn node(&self, index: usize) -> ozzy_proto::NodeId {
-        let (config, _) = &self.configs[index];
-        ozzy_proto::NodeId::from_bytes(*config.identity.brokers[&config.plan.name].as_bytes())
+        node(&self.configs[index].0)
     }
 
     /// Restore one stopped broker from its explicitly supplied memory image.

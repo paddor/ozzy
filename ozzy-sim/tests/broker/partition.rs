@@ -17,11 +17,27 @@ struct Split {
 
 impl Split {
     async fn start() -> Self {
+        Self::start_isolated(None).await
+    }
+
+    /// Start with broker `isolated` cut off, when given.
+    async fn start_isolated(isolated: Option<usize>) -> Self {
         let clock = SdkClock::manual();
-        let cluster = progress(
-            &clock,
-            broker::Cluster::configured(DeploymentMode::Three, Some(clock.clone()), |_| {}),
-        )
+        let manual = Some(clock.clone());
+        let cluster = progress(&clock, async {
+            match isolated {
+                Some(index) => {
+                    broker::Cluster::configured_isolated(
+                        DeploymentMode::Three,
+                        manual,
+                        index,
+                        |_| {},
+                    )
+                    .await
+                }
+                None => broker::Cluster::configured(DeploymentMode::Three, manual, |_| {}).await,
+            }
+        })
         .await;
         let client = progress(
             &clock,
@@ -36,6 +52,12 @@ impl Split {
         };
         // Leadership can still move until the first write confirms.
         split.write().await;
+        // Every broker link is up before a scenario cuts one.
+        for index in (0..3).filter(|&index| Some(index) != isolated) {
+            for peer in (0..3).filter(|&peer| peer != index && Some(peer) != isolated) {
+                split.until_hears(index, peer, true).await;
+            }
+        }
         split
     }
 
@@ -266,7 +288,6 @@ async fn inproc_memory_a_full_split_confirms_nothing_until_it_heals() {
 /// Each broker in turn is cut off while a wave goes through the other two and
 /// rejoins before the next. Every confirmed record replays once, in order.
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "a broker can stay in view change for the view it was to lead at startup; cutting off one of the other two then stops that group"]
 async fn inproc_memory_cutting_off_each_broker_in_turn_keeps_every_write_once() {
     bounded(
         async {
@@ -283,6 +304,57 @@ async fn inproc_memory_cutting_off_each_broker_in_turn_keeps_every_write_once() 
             split.finish().await;
         },
         "cutting off each broker in turn",
+    )
+    .await;
+}
+
+/// A broker cut off from the start misses the views the other two form
+/// without it. Once healed it must join every group, so that either of the
+/// others can then be cut off in turn.
+#[tokio::test(flavor = "current_thread")]
+async fn inproc_memory_a_broker_cut_off_from_the_start_joins_every_group_once_healed() {
+    bounded(
+        async {
+            let mut split = Split::start_isolated(Some(2)).await;
+            split.cluster.isolate(2, false);
+            split.until_heard(2, true).await;
+            for target in [0, 1] {
+                split.cluster.isolate(target, true);
+                split.until_heard(target, false).await;
+                split.write().await;
+                split.cluster.isolate(target, false);
+                split.until_heard(target, true).await;
+            }
+            split.finish().await;
+        },
+        "a broker cut off from the start",
+    )
+    .await;
+}
+
+/// A broker that missed a view and cannot hear that view's primary joins it
+/// through the follower it does hear. Once the primary is cut off too, the two
+/// form a view of their own in every group. Brokers 0 and 1 elect while
+/// broker 2 is cut off, so a group whose first primary is broker 2 moves on
+/// to a view broker 0 leads.
+#[tokio::test(flavor = "current_thread")]
+async fn inproc_memory_a_broker_that_missed_a_view_joins_it_through_a_follower() {
+    bounded(
+        async {
+            let mut split = Split::start_isolated(Some(2)).await;
+            split.cluster.cut(1, 2, false);
+            split.until_hears(2, 1, true).await;
+            split.until_hears(1, 2, true).await;
+            split.cluster.isolate(0, true);
+            split.until_heard(0, false).await;
+            split.write().await;
+            split.cluster.isolate(0, false);
+            for index in 0..3 {
+                split.until_heard(index, true).await;
+            }
+            split.finish().await;
+        },
+        "a broker that missed a view",
     )
     .await;
 }

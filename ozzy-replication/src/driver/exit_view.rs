@@ -2,7 +2,7 @@
 
 use super::{Action, DriverError, ReplicaDriver, Role};
 use crate::wire::Control;
-use crate::{Scope, VoterIndex, VoterSet};
+use crate::{Scope, StartViewChange, VoterIndex, VoterSet};
 use ozzy_proto::NodeId;
 use std::time::Duration;
 
@@ -20,12 +20,15 @@ impl ReplicaDriver {
             // plus a local timeout, before its suspicion went out. Without
             // support the sender cannot leave until this voter's durable
             // promise lets START_VIEW_CHANGE reach it. After that promise,
-            // election and normal traffic carry the newer view themselves.
+            // election traffic carries the newer view while it lasts.
             //
             // A peer that also left the view cannot tell this answer from a
             // request. Answer only the sender, and each sender at most once
             // per retransmission interval, so two such voters fall silent.
-            if self.promise_pending() && self.now >= self.exit_echo_at[voter] {
+            if self.now < self.exit_echo_at[voter] {
+                return Ok(());
+            }
+            if self.promise_pending() {
                 self.exit_echo_at[voter] = self.now.saturating_add(self.timing.retransmit);
                 let mut asked = match self.exit_echo {
                     Some((old, asked)) if old == scope => asked,
@@ -33,6 +36,15 @@ impl ReplicaDriver {
                 };
                 asked.insert(voter);
                 self.exit_echo = Some((scope, asked));
+            } else if matches!(self.role, Role::Normal(_) | Role::Installing(_)) {
+                // Election traffic stops once a view is normal, and normal
+                // traffic carries the view only from its primary. A sender
+                // that cannot hear that primary would never learn of the
+                // view, and with the primary gone the two survivors could
+                // never form another. Answer with this view's durable fence
+                // instead, which brings the sender into it.
+                self.exit_echo_at[voter] = self.now.saturating_add(self.timing.retransmit);
+                self.fence_answers.insert(voter);
             }
             return Ok(());
         }
@@ -113,14 +125,23 @@ impl ReplicaDriver {
     /// Support one sender's exit from an older view per call. The sender
     /// retransmits, so a lost answer is repeated after that interval.
     pub(super) fn exit_echo_action(&mut self) -> Option<Action> {
-        let (scope, mut asked) = self.exit_echo.take()?;
-        let voter = asked.pop_first()?;
-        if !asked.is_empty() {
-            self.exit_echo = Some((scope, asked));
+        if let Some((scope, mut asked)) = self.exit_echo.take()
+            && let Some(voter) = asked.pop_first()
+        {
+            if !asked.is_empty() {
+                self.exit_echo = Some((scope, asked));
+            }
+            return Some(Action::Send {
+                to: self.configuration.voter(voter),
+                message: Control::ExitView(scope),
+            });
         }
+        let voter = self.fence_answers.pop_first()?;
         Some(Action::Send {
             to: self.configuration.voter(voter),
-            message: Control::ExitView(scope),
+            message: Control::StartViewChange(StartViewChange {
+                scope: self.scope(),
+            }),
         })
     }
 

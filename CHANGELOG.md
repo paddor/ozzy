@@ -22,6 +22,11 @@
 
 ### Fixed
 
+- A broker that missed a leader change and cannot reach the new leader now
+  joins the new view through the other broker. Before, it kept waiting in the
+  old view, so if the new leader then failed, the two remaining brokers could
+  not elect, and the partition stopped for good. Brokers that started at
+  different times and lost a link early could hit this.
 - Byte retention of a delay partition no longer stalls after a broker that
   caught up by installing history becomes leader. Installation left its
   active segment holding more held records than a write rolls at, so it saw
