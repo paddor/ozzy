@@ -2259,6 +2259,7 @@ dependencies = [
 name = "ozzy-broker"
 version = "0.8.0"
 dependencies = [
+ "arc-swap",
  "bytes",
  "clap",
  "futures",

@@ -257,6 +257,26 @@ impl Drop for Storage {
     }
 }
 
+/// Run one pump on its own thread, as a device has its own hardware: its work
+/// is a runnable thread that simulated time waits for, and no other pump can
+/// starve it. The handle resolves on the caller's runtime.
+fn on_own_thread(
+    pump: impl std::future::Future<Output = Image> + Send + 'static,
+) -> tokio::task::JoinHandle<Image> {
+    let (send, receive) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("ozzy-sim-pump".into())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            let _ = send.send(runtime.block_on(pump));
+        })
+        .unwrap();
+    tokio::spawn(async move { receive.await.unwrap() })
+}
+
 /// Execution and delivery alternate. Reversed schedules deliver newer jobs
 /// first; awaiting one partition cannot prevent another from submitting work.
 /// An idle pump waits for a submission or an external control change.
@@ -271,7 +291,7 @@ pub fn pump(
     };
     let done = storage.done.clone();
     let scheduling = control.clone();
-    let task = tokio::spawn(async move {
+    let task = on_own_thread(async move {
         let mut drain = None;
         loop {
             // Clear before inspecting controls; a later change marks again.
@@ -472,10 +492,25 @@ pub async fn start_images_sized(
     Vec<tokio::task::JoinHandle<Image>>,
 ) {
     let context = context.into();
+    let contexts = deployment.iter().map(|_| context.clone()).collect();
+    start_each(contexts, deployment, reverse, limits).await
+}
+
+/// Start each broker on its own context, so each can have its own wall clock.
+pub(crate) async fn start_each(
+    contexts: Vec<ServingContext>,
+    deployment: Vec<(CheckedConfig, BrokerIdentity)>,
+    reverse: bool,
+    limits: ImageLimits,
+) -> (
+    Vec<Broker>,
+    Vec<Arc<Control>>,
+    Vec<tokio::task::JoinHandle<Image>>,
+) {
     let mut brokers = Vec::new();
     let mut controls = Vec::new();
     let mut images = Vec::new();
-    for (checked, local) in deployment {
+    for (context, (checked, local)) in contexts.into_iter().zip(deployment) {
         let name = checked.plan.name.clone();
         let image = tokio::time::timeout(
             Duration::from_secs(5),
@@ -484,7 +519,7 @@ pub async fn start_images_sized(
         .await
         .unwrap_or_else(|_| panic!("virtual provision stalled: {name}"));
         let (broker, control, task) = start_image(
-            context.clone(),
+            context,
             checked,
             local,
             Memory {

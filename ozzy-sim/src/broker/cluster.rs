@@ -1,7 +1,7 @@
 //! Production cluster lifecycle and storage faults shared with the simulator.
 use super::{
-    Control, IMAGE_LIMITS, Memory, Shape, deployment_with_resources, provision_sized,
-    start_image_selected, start_images_sized,
+    Control, IMAGE_LIMITS, Memory, Shape, deployment_with_resources, provision_sized, start_each,
+    start_image_selected,
 };
 use crate::client::Client;
 use ozzy_broker::{Broker, CheckedConfig, RecoveryIntent, RecoverySelection, ServingContext};
@@ -11,6 +11,20 @@ use ozzy_runtime::replicated::{SdkClock, TopicReader, WriterRuntime};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use uuid::Uuid;
 mod quorum;
+
+/// What `Cluster::start` sets up beyond the deployment.
+#[derive(Debug, Default)]
+struct Setup {
+    /// Held-record bounds `(window, active)` replacing the defaults.
+    held: Option<(usize, usize)>,
+    /// A broker cut off from both peers from the start.
+    isolated: Option<usize>,
+}
+
+/// A broker's persistent identity.
+fn node(config: &CheckedConfig) -> ozzy_proto::NodeId {
+    ozzy_proto::NodeId::from_bytes(*config.identity.brokers[&config.plan.name].as_bytes())
+}
 
 /// Sustained real-broker cluster shared by integration tests and overnight runs.
 #[derive(Debug)]
@@ -26,7 +40,8 @@ pub struct Cluster {
     /// Tasks yielding memory images after physical drain.
     pub images: Vec<tokio::task::JoinHandle<Image>>,
     mode: DeploymentMode,
-    context: ServingContext,
+    /// Each broker's context, so one wall clock can go wrong alone.
+    contexts: Vec<ServingContext>,
     retired_physical_events: u64,
     memory_limits: ImageLimits,
     stopped: std::collections::BTreeMap<usize, Arc<Control>>,
@@ -56,7 +71,23 @@ impl Cluster {
         memory_limits: ImageLimits,
         configure: impl FnOnce(&mut ozzy_config::Deployment),
     ) -> Self {
-        Self::start(mode, clock, memory_limits, None, configure).await
+        Self::start(mode, clock, memory_limits, Setup::default(), configure).await
+    }
+
+    /// Start with broker `index` cut off from both peers, as one that boots
+    /// after the others or behind a partition would. `isolate(index, false)`
+    /// heals it.
+    pub async fn configured_isolated(
+        mode: DeploymentMode,
+        clock: Option<SdkClock>,
+        index: usize,
+        configure: impl FnOnce(&mut ozzy_config::Deployment),
+    ) -> Self {
+        let setup = Setup {
+            isolated: Some(index),
+            ..Setup::default()
+        };
+        Self::start(mode, clock, IMAGE_LIMITS, setup, configure).await
     }
 
     /// Keep `window` sealed held rows loaded and roll a segment early at
@@ -67,24 +98,32 @@ impl Cluster {
         (window, active): (usize, usize),
         configure: impl FnOnce(&mut ozzy_config::Deployment),
     ) -> Self {
-        Self::start(mode, clock, IMAGE_LIMITS, Some((window, active)), configure).await
+        let setup = Setup {
+            held: Some((window, active)),
+            ..Setup::default()
+        };
+        Self::start(mode, clock, IMAGE_LIMITS, setup, configure).await
     }
 
     async fn start(
         mode: DeploymentMode,
         clock: Option<SdkClock>,
         memory_limits: ImageLimits,
-        held: Option<(usize, usize)>,
+        setup: Setup,
         configure: impl FnOnce(&mut ozzy_config::Deployment),
     ) -> Self {
+        let held = setup.held;
         let runtime = WriterRuntime::new().unwrap();
-        let mut context = clock.map_or_else(
-            || ServingContext::from(runtime.context().clone()),
-            |clock| ServingContext::simulated(runtime.context().clone(), clock, 1_000_000),
-        );
-        if let Some((window, active)) = held {
-            context = context.with_held_bounds(window, active);
-        }
+        let context = || {
+            let context = clock.clone().map_or_else(
+                || ServingContext::from(runtime.context().clone()),
+                |clock| ServingContext::simulated(runtime.context().clone(), clock, 1_000_000),
+            );
+            match held {
+                Some((window, active)) => context.with_held_bounds(window, active),
+                None => context,
+            }
+        };
         let root = PathBuf::from(format!("/ozzy-churn-{}", Uuid::now_v7()));
         let resources = ozzy_config::HostResources {
             cpus: std::collections::BTreeMap::from([(0, Some(0))]),
@@ -107,8 +146,15 @@ impl Cluster {
             },
         );
         let configs = deployment.clone();
+        let contexts: Vec<_> = deployment.iter().map(|_| context()).collect();
+        if let Some(index) = setup.isolated {
+            for other in (0..deployment.len()).filter(|&other| other != index) {
+                contexts[index].cut_peer(node(&deployment[other].0), true);
+                contexts[other].cut_peer(node(&deployment[index].0), true);
+            }
+        }
         let (brokers, controls, images) =
-            start_images_sized(context.clone(), deployment, true, memory_limits).await;
+            start_each(contexts.clone(), deployment, true, memory_limits).await;
         Self {
             runtime,
             configs,
@@ -116,12 +162,44 @@ impl Cluster {
             controls,
             images,
             mode,
-            context,
+            contexts,
             retired_physical_events: 0,
             memory_limits,
             stopped: std::collections::BTreeMap::new(),
             faults: 0,
         }
+    }
+
+    /// Step one broker's manual wall clock, stopped or running, as a broken or
+    /// repaired host clock would. It reads `epoch_millis` at manual time zero.
+    pub fn set_wall_clock(&self, index: usize, epoch_millis: u64) {
+        self.contexts[index].set_epoch_millis(epoch_millis);
+    }
+
+    /// Stop brokers `a` and `b` hearing each other, as a network partition
+    /// between them would, or with `cut` false heal it. Client links stay up,
+    /// and a cut outlasts restarts.
+    pub fn cut(&self, a: usize, b: usize, cut: bool) {
+        self.cut_one_way(a, b, cut);
+        self.cut_one_way(b, a, cut);
+    }
+
+    /// Drop broker traffic from `from` to `to` only, or with `cut` false
+    /// deliver it again. `from` still hears `to`.
+    pub fn cut_one_way(&self, from: usize, to: usize, cut: bool) {
+        self.contexts[to].cut_peer(self.node(from), cut);
+    }
+
+    /// Cut broker `index` from every other broker, or heal it.
+    pub fn isolate(&self, index: usize, isolated: bool) {
+        for other in (0..self.configs.len()).filter(|&other| other != index) {
+            self.cut(index, other, isolated);
+        }
+    }
+
+    /// Broker `index`'s persistent identity.
+    pub fn node(&self, index: usize) -> ozzy_proto::NodeId {
+        node(&self.configs[index].0)
     }
 
     /// Restore one stopped broker from its explicitly supplied memory image.
@@ -161,7 +239,7 @@ impl Cluster {
     async fn install(&mut self, index: usize, image: Image, selections: &[RecoverySelection]) {
         let (checked, local) = self.configs[index].clone();
         let (broker, control, task) = start_image_selected(
-            self.context.clone(),
+            self.contexts[index].clone(),
             checked,
             local,
             selections,

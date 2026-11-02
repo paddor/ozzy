@@ -1,6 +1,7 @@
 use std::{
+    collections::BTreeMap,
     sync::{
-        Arc,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -29,6 +30,8 @@ struct State {
     manual: bool,
     manual_nanos: AtomicU64,
     changed: StateSignal,
+    /// Deadlines that manual waiters wait for, each with its waiter count.
+    deadlines: Mutex<BTreeMap<Duration, usize>>,
 }
 
 /// Clock mode or monotonic observation was invalid.
@@ -50,6 +53,7 @@ impl SdkClock {
                 manual,
                 manual_nanos: AtomicU64::new(0),
                 changed: StateSignal::default(),
+                deadlines: Mutex::default(),
             }),
         }
     }
@@ -98,6 +102,51 @@ impl SdkClock {
         }
         Ok(())
     }
+
+    /// The earliest deadline a waiter of this manual clock still waits for.
+    /// Nothing that waits on this clock can happen before it, so simulated
+    /// time can step straight there.
+    pub fn next_deadline(&self) -> Option<Duration> {
+        let now = self.now();
+        let deadlines = self.state.deadlines();
+        deadlines
+            .range((std::ops::Bound::Excluded(now), std::ops::Bound::Unbounded))
+            .next()
+            .map(|(&deadline, _)| deadline)
+    }
+}
+
+impl State {
+    fn deadlines(&self) -> std::sync::MutexGuard<'_, BTreeMap<Duration, usize>> {
+        self.deadlines
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// One manual waiter's deadline, listed while it waits.
+struct Waiting<'a> {
+    state: &'a State,
+    deadline: Duration,
+}
+
+impl<'a> Waiting<'a> {
+    fn new(state: &'a State, deadline: Duration) -> Self {
+        *state.deadlines().entry(deadline).or_default() += 1;
+        Self { state, deadline }
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        let mut deadlines = self.state.deadlines();
+        if let Some(waiters) = deadlines.get_mut(&self.deadline) {
+            *waiters -= 1;
+            if *waiters == 0 {
+                deadlines.remove(&self.deadline);
+            }
+        }
+    }
 }
 
 impl SdkClock {
@@ -105,6 +154,7 @@ impl SdkClock {
     /// is advanced past it; a real one sleeps on the current Tokio runtime.
     pub async fn until(&self, deadline: Duration) {
         if self.state.manual {
+            let _waiting = Waiting::new(&self.state, deadline);
             self.state
                 .changed
                 .wait_for(|| (self.now() >= deadline).then_some(()))
@@ -163,5 +213,25 @@ mod tests {
         manual.clone().advance(Duration::from_secs(2)).unwrap();
         replacement.await;
         assert!(SdkClock::default().advance(Duration::ZERO).is_err());
+    }
+
+    #[tokio::test]
+    async fn manual_waiters_list_their_deadlines_until_they_end() {
+        let clock = SdkClock::manual();
+        assert_eq!(clock.next_deadline(), None);
+        let mut late = Box::pin(clock.until(Duration::from_secs(5)));
+        let mut early = Box::pin(clock.until(Duration::from_secs(2)));
+        let mut again = Box::pin(clock.until(Duration::from_secs(2)));
+        for waiter in [&mut late, &mut early, &mut again] {
+            assert!(futures::poll!(waiter.as_mut()).is_pending());
+        }
+        assert_eq!(clock.next_deadline(), Some(Duration::from_secs(2)));
+        drop(early);
+        assert_eq!(clock.next_deadline(), Some(Duration::from_secs(2)));
+        clock.advance(Duration::from_secs(2)).unwrap();
+        again.await;
+        assert_eq!(clock.next_deadline(), Some(Duration::from_secs(5)));
+        drop(late);
+        assert_eq!(clock.next_deadline(), None);
     }
 }

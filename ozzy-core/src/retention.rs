@@ -69,11 +69,12 @@ impl Plan {
     /// Age and byte targets independently expire the oldest prefix. Newer
     /// timestamps or protected accepted operations stop age-based retirement.
     /// A segment holding the held operation or later stops both targets; when
-    /// one would retire it, it is the carry target.
+    /// one would retire it, it is the carry target. Without a trusted `now`
+    /// the age target and the age roll are off; the byte target still works.
     pub fn select(
         segments: &[Segment],
         policy: RetentionPolicy,
-        now: u64,
+        now: Option<u64>,
         kept: Kept,
         maximum_segments: usize,
     ) -> Result<Self, PlanError> {
@@ -83,7 +84,7 @@ impl Plan {
             total.checked_add(segment.capacity).ok_or(PlanError)
         })?;
         let expired = |segment: &Segment| {
-            policy.max_age_millis.is_some_and(|age| {
+            policy.max_age_millis.zip(now).is_some_and(|(age, now)| {
                 segment.newest_append_millis.is_none_or(|newest| {
                     now.checked_sub(newest)
                         .is_some_and(|elapsed| elapsed >= age.get())

@@ -11,7 +11,7 @@ use ozzy_proto::admin::{
 };
 use ozzy_proto::{GroupId, NodeId};
 use ozzy_runtime::{
-    frontend::{Kind, Links},
+    frontend::{ClockTrust, Kind, Links},
     profiling,
 };
 use std::{
@@ -211,12 +211,15 @@ impl Admin {
     /// Links to the other brokers and the number of connected clients. Empty
     /// until the frontend has bound.
     fn connections(&self) -> Connections {
-        let Some(links) = self.hooks.links.get() else {
+        let Some((links, clock)) = self.hooks.links.get() else {
             return Connections {
                 brokers: Vec::new(),
                 clients: 0,
+                clock_paused: false,
+                clock_offsets: Vec::new(),
             };
         };
+        let clock = clock.status();
         Connections {
             brokers: self
                 .broker
@@ -226,6 +229,12 @@ impl Admin {
                 .map(|(_, id)| (*id, links.get(*id).is_some()))
                 .collect(),
             clients: u32::try_from(links.established(Kind::Client)).unwrap_or(u32::MAX),
+            clock_paused: clock.paused,
+            clock_offsets: clock
+                .offsets
+                .into_iter()
+                .filter_map(|(peer, offset)| Some((peer, offset?)))
+                .collect(),
         }
     }
 
@@ -286,13 +295,14 @@ impl Admin {
 #[derive(Clone, Debug)]
 pub(crate) struct Hooks {
     lane: Endpoint,
-    links: Arc<OnceLock<Links>>,
+    links: Arc<OnceLock<(Links, ClockTrust)>>,
 }
 
 impl Hooks {
-    /// Hand over the frontend's links. Only the first call counts.
-    pub(crate) fn publish_links(&self, links: Links) {
-        let _ = self.links.set(links);
+    /// Hand over the frontend's links and the broker's clock status. Only the
+    /// first call counts.
+    pub(crate) fn publish_links(&self, links: Links, clock: ClockTrust) {
+        let _ = self.links.set((links, clock));
     }
 }
 

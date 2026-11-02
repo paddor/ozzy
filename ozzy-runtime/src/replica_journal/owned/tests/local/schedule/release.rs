@@ -5,6 +5,8 @@ use ozzy_journal::operation::{CanonicalOperation, ReleaseKey};
 use ozzy_proto::MessageId;
 
 mod carry;
+mod paused;
+mod roll;
 
 /// Run one release step at `now`, with its reads inline.
 fn release(
@@ -438,7 +440,7 @@ fn retention_keeps_a_held_schedule_until_its_release() {
     let plan = |controller: &mut Controller, journal: &mut OwnedJournal, driver: &Driver| {
         drive(
             controller,
-            journal.plan_retention(driver.begin_validation().unwrap(), NOW, 2),
+            journal.plan_retention(driver.begin_validation().unwrap(), Some(NOW), 2),
         )
         .unwrap()
         .map(|(_, plan)| plan.retire)
@@ -481,8 +483,8 @@ fn retention_ages_a_schedule_only_segment_from_its_acceptance_time() {
     };
     // The segment holds no stored record, but retries of its schedule
     // resolve for the retention age.
-    assert_eq!(plan(NOW + 59_999), Some(Vec::new()));
-    assert_eq!(plan(NOW + 60_000), Some(vec![1]));
+    assert_eq!(plan(Some(NOW + 59_999)), Some(Vec::new()));
+    assert_eq!(plan(Some(NOW + 60_000)), Some(vec![1]));
 }
 
 #[test]

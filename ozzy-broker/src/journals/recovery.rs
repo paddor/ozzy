@@ -210,12 +210,12 @@ impl PartitionJournal {
 }
 
 impl OpenedRecovery {
-    pub(crate) fn into_actor(
+    pub(crate) fn into_actor<T: Into<ozzy_runtime::replica_journal::ClockReading>>(
         mut self,
         memory: &Owner,
         sessions: &BTreeMap<NodeId, LinkSessionId>,
         ids: ActorIds,
-        timestamp: impl Fn() -> u64 + 'static,
+        timestamp: impl Fn() -> T + 'static,
     ) -> Result<PartitionActor, StartupError> {
         let error = |source| StartupError::Journal {
             path: self.path.clone(),

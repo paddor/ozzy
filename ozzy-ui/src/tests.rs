@@ -291,9 +291,11 @@ fn broker_screen_summarizes_the_cluster_and_key_counters() {
     app.reply(Reply::Connections(Connections {
         brokers: vec![(B, true), (C, false)],
         clients: 3,
+        clock_paused: true,
+        clock_offsets: vec![(B, -3_600_000)],
     }));
     let text = screen(&mut app);
-    for expected in ["3 of 64", "up", "down"] {
+    for expected in ["3 of 64", "up", "down", "paused", "-3600000 ms"] {
         assert!(text.contains(expected), "{expected}:\n{text}");
     }
 }

@@ -8,7 +8,7 @@
 //! would free their segment.
 
 use super::{JournalError, OwnedJournal};
-use crate::replica_journal::ProposalBuffer;
+use crate::replica_journal::{ClockReading, ProposalBuffer};
 use bytes::Bytes;
 use ozzy_core::state::PendingSchedule;
 use ozzy_journal::operation::{
@@ -26,6 +26,9 @@ mod carry;
 
 /// Distinct `Schedule` or `Carry` operations one release may read.
 const MAX_SOURCES: usize = 64;
+
+/// Wait between release checks while the clocks disagree.
+const PAUSED_WAIT_MILLIS: u64 = ozzy_replication::clock::SAMPLE_INTERVAL.as_millis() as u64;
 
 /// One bounded delay step: a release or a carry.
 #[derive(Debug, Default)]
@@ -104,6 +107,20 @@ impl OwnedJournal {
         self.next_due()
     }
 
+    /// Milliseconds until the next release step. A carry reads no clock, so it
+    /// runs at once; a paused clock retries at the sample interval.
+    pub(in crate::replica_journal) fn release_wait(
+        &self,
+        clock: impl FnOnce() -> ClockReading,
+    ) -> Option<u64> {
+        let due = self.next_release()?;
+        Some(match clock().decision() {
+            Some(now) => due.saturating_sub(now),
+            None if due == 0 => 0,
+            None => PAUSED_WAIT_MILLIS,
+        })
+    }
+
     fn next_due(&self) -> Option<u64> {
         let committed = self.images().ok()?.committed().revision();
         self.held.as_ref()?.next(committed)
@@ -116,7 +133,7 @@ impl OwnedJournal {
         ticket: ValidationTicket,
         now_millis: u64,
     ) -> Result<ReleaseTurn, JournalError> {
-        match self.prepare_release(ticket, now_millis).await? {
+        match self.prepare_release(ticket, Some(now_millis)).await? {
             ReleaseStep::Idle => Ok(ReleaseTurn::default()),
             ReleaseStep::Read(read) => {
                 let completed = read.execute().await;
@@ -127,11 +144,12 @@ impl OwnedJournal {
 
     /// Pick the due prefix of committed held records on one partition,
     /// bounded by one proposal arena, or carry held records toward the
-    /// retention target. Only the leader releases and carries.
+    /// retention target. Only the leader releases and carries. Without a
+    /// trusted time nothing is due, and a pending carry still runs.
     pub(in crate::replica_journal) async fn prepare_release(
         &mut self,
         ticket: ValidationTicket,
-        now_millis: u64,
+        now_millis: Option<u64>,
     ) -> Result<ReleaseStep, JournalError> {
         self.healthy()?;
         self.validate_image(ticket)?;
@@ -140,14 +158,15 @@ impl OwnedJournal {
         {
             return Ok(ReleaseStep::Idle);
         }
-        let due = self.next_due().is_some_and(|due| due <= now_millis);
+        let now_due = now_millis.filter(|&now| self.next_due().is_some_and(|due| due <= now));
+        let due = now_due.is_some();
         if let Some(target) = self.held.as_mut().and_then(|held| held.carry_turn(due)) {
             self.observe_held()?;
             return self.prepare_carry(target).await;
         }
-        if !due {
+        let Some(now_millis) = now_due else {
             return Ok(ReleaseStep::Idle);
-        }
+        };
         self.observe_held()?;
         if let Some(load) = self.prepare_load().await? {
             return Ok(load);

@@ -6,6 +6,8 @@ use ozzy_runtime::replicated::{
 };
 
 mod carry;
+mod guard;
+mod partition;
 
 /// Broker time at manual clock zero, in Unix milliseconds.
 const EPOCH_MILLIS: u64 = 1_000_000;
@@ -39,7 +41,15 @@ async fn held_cluster(
     held: Option<(usize, usize)>,
     retention: Option<ozzy_config::TopicRetention>,
 ) -> broker::Cluster {
-    let configure = |config: &mut ozzy_config::Deployment| {
+    tuned_cluster(mode, clock, held, delay_topic(max_entries, retention)).await
+}
+
+/// Delay on the topic, and `retention` when given.
+fn delay_topic(
+    max_entries: u64,
+    retention: Option<ozzy_config::TopicRetention>,
+) -> impl FnOnce(&mut ozzy_config::Deployment) {
+    move |config| {
         let topic = config.topics.get_mut("orders").unwrap();
         topic.delay = Some(ozzy_config::TopicDelay {
             max_secs: 60,
@@ -48,7 +58,16 @@ async fn held_cluster(
         if let Some(retention) = retention {
             topic.retention = retention;
         }
-    };
+    }
+}
+
+/// A cluster on manual `clock` with the held-record bounds, when given.
+async fn tuned_cluster(
+    mode: DeploymentMode,
+    clock: &SdkClock,
+    held: Option<(usize, usize)>,
+    configure: impl FnOnce(&mut ozzy_config::Deployment),
+) -> broker::Cluster {
     let manual = Some(clock.clone());
     progress(clock, async {
         match held {
@@ -86,14 +105,11 @@ async fn leader(clock: &SdkClock, cluster: &broker::Cluster, client: &Client) ->
         .unwrap()
 }
 
-/// Advance broker time to `millis`.
+/// Advance broker time to `millis`. The wait is a deadline, so broker time
+/// steps to it rather than past it.
 async fn wait_until(clock: &SdkClock, millis: u64) {
-    progress(clock, async {
-        while broker_now(clock) < millis {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await;
+    let deadline = Duration::from_millis(millis.saturating_sub(EPOCH_MILLIS));
+    progress(clock, clock.until(deadline)).await;
 }
 
 /// Send records to partition 0 and return their receipts.

@@ -5,7 +5,8 @@ mod schedule;
 
 use super::{AppendBuffer, JournalError, OwnedJournal};
 use crate::replica_journal::{
-    AppendAdmissionError, ProposalBuffer, ProposalDeferral, ProposalValidation, ValidatedAppend,
+    AppendAdmissionError, ClockReading, ProposalBuffer, ProposalDeferral, ProposalValidation,
+    ValidatedAppend,
     append::ProducerRetryResults,
     commands::read_fault,
     producer::{self, Assignment, Plan},
@@ -94,12 +95,12 @@ impl OwnedJournal {
         &mut self,
         ticket: ValidationTicket,
         ProposalBuffer(mut buffer): ProposalBuffer,
-        timestamp_millis: u64,
+        clock: impl Into<ClockReading>,
     ) -> ProposalValidation {
         self.begin_validation_memory();
         let mut positions = smallvec::SmallVec::<[[u8; 16]; 8]>::new();
         let result = self
-            .prepare_proposal(ticket, &mut buffer, timestamp_millis, &mut positions)
+            .prepare_proposal(ticket, &mut buffer, clock.into(), &mut positions)
             .await;
         self.faulted |= result.as_ref().err().is_some_and(read_fault);
         match result {
@@ -185,7 +186,7 @@ impl OwnedJournal {
         &mut self,
         ticket: ValidationTicket,
         buffer: &mut AppendBuffer,
-        timestamp_millis: u64,
+        clock: ClockReading,
         positions: &mut smallvec::SmallVec<[[u8; 16]; 8]>,
     ) -> Result<Prepared, JournalError> {
         self.healthy()?;
@@ -207,19 +208,19 @@ impl OwnedJournal {
         }
         if buffer.is_producer()
             && let Some(through) = self
-                .assign_producers(buffer, timestamp_millis, positions)
+                .assign_producers(buffer, clock.wall_millis, positions)
                 .await?
         {
             return Ok(Prepared::Retry(through));
         }
         if buffer.scheduled().is_some() {
-            self.schedule_proposal(buffer, timestamp_millis)?;
+            self.schedule_proposal(buffer, clock)?;
         }
         if buffer.is_release() {
-            self.release_proposal(buffer, timestamp_millis)?;
+            self.release_proposal(buffer, clock)?;
         }
         if buffer.is_carry() {
-            self.carry_proposal(buffer, timestamp_millis)?;
+            self.carry_proposal(buffer, clock)?;
         }
         self.check_room(buffer)?;
         if buffer.is_producer() && self.dedup.limits.is_some() {

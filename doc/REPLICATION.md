@@ -124,6 +124,12 @@ votes and is not suspicion.
   request lapses. A broker whose promise is not durable yet sends none at its
   election deadline: it knows nothing about the view, and with stalled
   storage it would help one peer's timeout end views the others install.
+- A broker asked to leave a view it already left answers the sender, at most
+  once per retransmission interval: with EXIT_VIEW for that view while its
+  own promise is pending, or with its current view's START_VIEW_CHANGE once
+  that view is installed. Only a leader sends normal traffic, so a broker
+  that missed a view and cannot hear its leader learns of it this way.
+  Otherwise, with that leader gone, the other two could not form a view.
 - A lagging copy fetches and replays its missed suffix inside the view
   change. Each verified lookup batch, staged chunk, or running installation
   step pushes its election deadline out by one election delay, so a
@@ -240,14 +246,54 @@ across the gap.
   retries. Other brokers reject with an authority hint.
 - Retention gaps are explicit errors. Readers never hold back retention.
 
+## Clock guard
+
+Delayed release, age retention, and producer idle expiry follow the leader's
+wall clock. A broker whose clock disagrees with the others stops them.
+
+- Each dispatcher sends its wall time to each other broker once per second as
+  [CLOCK_SAMPLE](PROTOCOL.md#clock-samples). It keeps each peer's latest offset,
+  peer minus local at receipt.
+- A sample counts for 5 s of monotonic time. The median of zero (this clock) and
+  the fresh offsets decides, within `cluster.max_clock_offset_millis`:
+
+| Fresh samples | Agrees when | Why |
+| --- | --- | --- |
+| Two | Absolute median within the limit | One bad clock is outvoted, whichever it is |
+| One | Absolute offset within the limit | Neither clock can outvote the other |
+| None | Never | Without a second copy nothing commits anyway |
+
+- A broker with peers starts paused until samples arrive.
+- Each clock read also compares wall minus monotonic time with its value when the
+  clocks last agreed. A step past the limit pauses on the next read, and drops the
+  offsets measured before it.
+- While paused, nothing held comes due and the age target and age roll are off.
+  No producer session retires by idle time.
+- While paused, a leader refuses new scheduled records with NACK 10 and producers
+  retry. Their stamp keys the records and never goes back, so a fast clock would
+  hold that partition's records until real time caught up. A carry or a release
+  already under way keeps the partition's latest time instead of the clock's.
+- Other writes, reads, byte retention and its carries, and deduplication continue.
+  Followers need no check: only the leader proposes these.
+- A paused leader holds due records until its clock is fixed or leadership moves.
+  A paused leader does not give up its view.
+- A disagreement lasting a sample interval warns once on stderr and in the admin
+  log, and again when it ends. Startup and lost peers pause without a warning.
+- Admin Connections reports the pause and the offsets. `ozzy-tui` shows them while
+  paused.
+- A single broker has no peers and no guard.
+
 ## Limits
 
 - Crash failures only: no Byzantine peers or reconstruction from arbitrary
   distributed corruption.
 - Recovery requires both other brokers in normal operation.
-- Broker clocks must stay in sync; nothing compares them. Delayed release, age
-  retention, and producer idle expiry follow the leader's clock, so a fast clock
-  acts early. The deduplication window uses logical time and is not affected.
+- The [clock guard](#clock-guard) sees clock drift, and a bad clock at startup,
+  only by samples. Two bad clocks that agree outvote a good one.
+- Append stamps written while a clock was bad stay. Stamps ahead delay age expiry
+  until real time catches up.
+- Producer and reader clocks stay outside the guard.
+- The deduplication window uses logical time and is not affected.
 - No online membership change, larger groups, partition movement, or follower
   reads.
 - [Storage](STORAGE.md#supported-failure-model) defines physical failure

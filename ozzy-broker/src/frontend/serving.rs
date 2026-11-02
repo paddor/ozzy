@@ -37,6 +37,9 @@ struct Serving<'a> {
     buffers: &'a ReceiveBuffers,
     /// Handshake retry interval.
     retry: Duration,
+    /// Broker peers whose traffic this simulated broker drops.
+    #[cfg(feature = "simulation")]
+    cut: &'a crate::serving::CutPeers,
 }
 
 impl FrontendContext {
@@ -65,11 +68,15 @@ impl FrontendContext {
             service.start(peer).map_err(failure)?;
         }
         let followers = Followers::open(&self, brokers.followers).await?;
+        #[cfg(feature = "simulation")]
+        let cut = self.cut.clone();
         let serving = Serving {
             brokers: &brokers.control,
             followers: &followers,
             buffers: &buffers,
             retry,
+            #[cfg(feature = "simulation")]
+            cut: &cut,
         };
         // Dispatch consumes this context before followers close. The dispatcher
         // thread still owns the bound sockets and OMQ context until we return.
@@ -126,6 +133,7 @@ impl FrontendContext {
         let mut tick = tokio::time::interval(serving.retry);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut retrying = false;
+        let mut clock = self.clock.as_ref().map(crate::serving::Timer::alarm);
         loop {
             // Process lifecycle changes before dequeuing native input. Once
             // received, admit synchronously before observing another cutover.
@@ -156,7 +164,7 @@ impl FrontendContext {
                     data.receive(service, receipt, body).await?;
                 }
                 (publisher, received) = publications.receive() => {
-                    receive_publication(service, serving.buffers, publisher, received)?;
+                    receive_publication(service, serving, publisher, received)?;
                 }
                 socket = publishers.ready() => publishers.retry(socket)?,
                 watched = subscribers.next() => subscribers.turn(watched).await?,
@@ -166,31 +174,52 @@ impl FrontendContext {
                 Some(lane) = data.paused.writable() => {
                     data.retry(lane, service)?;
                 }
+                () = clock_due(&mut clock, service.clock_deadline()) => service.clock_tick(),
                 result = service.progress_with(|message| serving.followers.send(outbound_socket(&self.peer, &self.data, &message), message), |probe| serving.followers.wait(outbound_socket(&self.peer, &self.data, &probe), probe)) => {
                     if !self.shutdown.is_closed() {
                         result.map_err(failure)?;
                     }
                 },
-                _ = tick.tick(), if retrying => {
-                    for &peer in serving.brokers.keys() {
-                        service.retry(peer).map_err(failure)?;
-                    }
-                }
+                _ = tick.tick(), if retrying => retry_handshakes(service, serving.brokers)?,
             }
         }
     }
+}
+
+/// Ready once the clock sampling's deadline passes. Without sampling, never.
+async fn clock_due(alarm: &mut Option<crate::serving::Alarm>, deadline: Option<Duration>) {
+    std::future::poll_fn(|cx| match alarm {
+        Some(alarm) => alarm.poll_at(cx, deadline),
+        None => std::task::Poll::Pending,
+    })
+    .await;
+}
+
+fn retry_handshakes(
+    service: &mut Service,
+    brokers: &BTreeMap<NodeId, Endpoint>,
+) -> Result<(), StartupError> {
+    for &peer in brokers.keys() {
+        service.retry(peer).map_err(failure)?;
+    }
+    Ok(())
 }
 
 /// Admit one follower publication. PUB receive is lossy; it never holds a
 /// source on capacity, and only fatal admission failures stop the frontend.
 fn receive_publication(
     service: &mut Service,
-    buffers: &ReceiveBuffers,
+    serving: Serving<'_>,
     publisher: NodeId,
     received: Result<omq_tokio::Message, omq_tokio::Error>,
 ) -> Result<(), StartupError> {
     let message = received.map_err(failure)?;
-    if let Ok((message, retained)) = buffers.prepare_borrowed(&message)
+    // A simulated network partition drops what the cut peers publish.
+    #[cfg(feature = "simulation")]
+    if !serving.cut.hears(publisher) {
+        return Ok(());
+    }
+    if let Ok((message, retained)) = serving.buffers.prepare_borrowed(&message)
         && let Err(reason) = service.receive_publication(publisher, &message, retained)
         && fatal(&reason)
     {

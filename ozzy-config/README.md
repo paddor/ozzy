@@ -50,12 +50,15 @@ labels. Field names and enum values are fixed.
 - Optional `id` keys pin the UUIDs that initialization would generate. Omit
   them.
 - CPU and NUMA values are OS IDs.
+- `max_clock_offset_millis` is how far broker clocks may disagree before the
+  [clock guard](../doc/REPLICATION.md#clock-guard) pauses clock-driven decisions.
+  It may change on restart. A single broker has no peers and ignores it.
 
 ## Keys
 
 | Table | Keys (default) |
 | --- | --- |
-| `[cluster]` | `mode`: `"single"` or `"three"` |
+| `[cluster]` | `mode`: `"single"` or `"three"`; `max_clock_offset_millis` (1000) |
 | `[limits]` | `max_topics` (1024), `max_partitions` (65536), `max_clients` (128, at most 4096) |
 | `[brokers.NAME.endpoints]` | `peer` (control), `data_peer` (APPEND, replay), `reader_pub` (live records); optional `follower_pub`, `admin` |
 | `[brokers.NAME.devices.DEVICE]` | `root`, `controller` |
@@ -123,8 +126,9 @@ max_bytes = 1073741824
   eighths of the partition limit. A retired file kept for the next new
   segment adds one segment on disk.
 - Active work and captured reads can delay deletion.
-- Age follows the leader's clock, so keep broker clocks in sync. Nothing checks
-  them against each other: a leader whose clock runs fast expires records early.
+- Age follows the leader's clock, so keep broker clocks in sync. A leader whose
+  clock disagrees with the other brokers stops expiring by age until it is fixed;
+  see the [clock guard](../doc/REPLICATION.md#clock-guard). `max_bytes` still applies.
 - A partition holds at most 256 segments. Near that limit, with or without
   retention, it refuses new records with NACK 10 until segments retire; see
   [full partitions](../doc/STORAGE.md#full-partitions).
@@ -162,7 +166,9 @@ max_entries = 100000
   `max_secs` fails; a past one releases at once.
 - The leader's clock decides when a due time is reached, so keep producer and
   broker clocks in sync. A reader can see a record early or late by the
-  difference between its clock and the leader's.
+  difference between its clock and the leader's. A leader whose clock disagrees
+  with the other brokers holds due records until it is fixed; see the
+  [clock guard](../doc/REPLICATION.md#clock-guard).
 - `max_entries` (at most 4294967296) bounds held records per partition. A
   full partition makes producers retry later. Held records stay on disk; each
   copy keeps the next 65536 sealed ones and up to 262144 of the active

@@ -7,7 +7,8 @@ use crate::replica_journal::install::InstallAction;
 use crate::replica_journal::read::ReadAction;
 use crate::replica_journal::recovery::RecoveryAction;
 use crate::replica_journal::{
-    JournalError, OwnedReplayRequest, OwnedSemaphorePermit, ProposalValidation, Turn, TurnResult,
+    ClockReading, JournalError, OwnedReplayRequest, OwnedSemaphorePermit, ProposalValidation, Turn,
+    TurnResult,
 };
 
 /// Detached file work a command left behind, and whether it fenced the owner.
@@ -46,7 +47,7 @@ fn detach<W, T>(
 pub(super) async fn run(
     mut state: Box<State>,
     command: Command,
-    timestamp: u64,
+    time: ClockReading,
 ) -> (Box<State>, Option<Job>, bool) {
     let Command {
         action,
@@ -54,8 +55,8 @@ pub(super) async fn run(
     } = command;
     let outcome = match action {
         Action::Read(action) => read(&mut state, action, permit).await,
-        Action::Append(action) => append(&mut state, action, permit, timestamp).await,
-        Action::Maintenance(action) => maintenance(&mut state, action, permit, timestamp).await,
+        Action::Append(action) => append(&mut state, action, permit, time).await,
+        Action::Maintenance(action) => maintenance(&mut state, action, permit, time).await,
         Action::History(action) => history(&mut state, action, permit).await,
         Action::Install(action) => install(&mut state, action, permit).await,
         Action::Recovery(action) => recovery(&mut state, action, permit).await,
@@ -94,7 +95,7 @@ async fn append(
     state: &mut State,
     action: AppendAction,
     permit: OwnedSemaphorePermit,
-    timestamp: u64,
+    time: ClockReading,
 ) -> Outcome {
     let failed = match action {
         AppendAction::Promise { ticket, done } => {
@@ -114,7 +115,7 @@ async fn append(
             buffer,
             done,
         } => {
-            let result = state.owner.propose_append(ticket, buffer, timestamp).await;
+            let result = state.owner.propose_append(ticket, buffer, time).await;
             reply_proposal(result, done, permit)
         }
         AppendAction::Admit {
@@ -124,7 +125,7 @@ async fn append(
         } => finish(done, state.owner.admit_append(ticket, validated), permit),
         AppendAction::Apply { ticket, done } => finish(done, state.owner.apply(ticket), permit),
         AppendAction::Turn { turn, done } => {
-            let result = Box::pin(turn_work(state, *turn, timestamp)).await;
+            let result = Box::pin(turn_work(state, *turn, time)).await;
             reply_turn(result.map(Box::new), done, permit)
         }
         AppendAction::Sync { ticket, done } => finish(done, state.owner.sync(ticket).await, permit),
@@ -186,7 +187,7 @@ async fn maintenance(
     state: &mut State,
     action: MaintenanceAction,
     permit: OwnedSemaphorePermit,
-    timestamp: u64,
+    time: ClockReading,
 ) -> Outcome {
     let failed = match action {
         MaintenanceAction::Retention {
@@ -195,7 +196,9 @@ async fn maintenance(
             leader,
             done,
         } => {
-            let turn = state.owner.retention_turn(ticket, timestamp, seed, leader);
+            let turn = state
+                .owner
+                .retention_turn(ticket, time.decision(), seed, leader);
             finish_read(done, turn.await, permit)
         }
         MaintenanceAction::RetainIdentities {
@@ -208,7 +211,7 @@ async fn maintenance(
             permit,
         ),
         MaintenanceAction::Release { ticket, done } => {
-            return release(state, ticket, done, permit, timestamp).await;
+            return release(state, ticket, done, permit, time).await;
         }
         MaintenanceAction::LoadHeld { ticket, done } => {
             return detach_step(state.owner.prepare_held_load(ticket), done, permit);
@@ -247,9 +250,9 @@ async fn release(
     ticket: ozzy_replication::driver::ValidationTicket,
     done: Reply<crate::replica_journal::ReleaseTurn>,
     permit: OwnedSemaphorePermit,
-    timestamp: u64,
+    time: ClockReading,
 ) -> Outcome {
-    let step = state.owner.prepare_release(ticket, timestamp).await;
+    let step = state.owner.prepare_release(ticket, time.decision()).await;
     detach_step(step, done, permit)
 }
 
@@ -399,7 +402,7 @@ async fn recovery(
 async fn turn_work(
     state: &mut State,
     turn: Turn,
-    timestamp: u64,
+    time: ClockReading,
 ) -> Result<TurnResult, JournalError> {
     let admitted = turn
         .admit
@@ -429,7 +432,7 @@ async fn turn_work(
         });
     }
     let proposal = match turn.propose {
-        Some((ticket, buffer)) => Some(state.owner.propose_append(ticket, buffer, timestamp).await),
+        Some((ticket, buffer)) => Some(state.owner.propose_append(ticket, buffer, time).await),
         None => None,
     };
     let validated = match turn.validate {

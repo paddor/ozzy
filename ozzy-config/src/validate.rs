@@ -30,6 +30,12 @@ impl Deployment {
         self.check_counts()?;
         let mut ids = BTreeSet::new();
         optional_id(self.cluster.id, &mut ids, "cluster.id")?;
+        if self.cluster.max_clock_offset_millis == 0 {
+            return Err(invalid(
+                "cluster.max_clock_offset_millis",
+                "must be positive",
+            ));
+        }
         validate_topics(&self, &mut ids)?;
         let max_append = self
             .topics

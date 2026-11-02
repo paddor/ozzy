@@ -17,7 +17,7 @@ fn retention_waits_for_partition_creation_before_disabling_an_unlimited_policy()
         &mut controller,
         journal.retention_turn(
             driver.begin_validation().unwrap(),
-            999,
+            Some(999),
             OperationId::from_bytes([93; 16]),
             true,
         ),
@@ -34,7 +34,7 @@ fn retention_waits_for_partition_creation_before_disabling_an_unlimited_policy()
         &mut controller,
         journal.retention_turn(
             driver.begin_validation().unwrap(),
-            999,
+            Some(999),
             OperationId::from_bytes([94; 16]),
             true,
         ),
@@ -159,7 +159,7 @@ fn retention_reclaims_bounded_orphans_without_advancing_the_record_floor() {
     for remaining in [11, 3, 0] {
         let turn = drive(
             &mut controller,
-            journal.retention_turn(ticket, 999, OperationId::from_bytes([91; 16]), true),
+            journal.retention_turn(ticket, Some(999), OperationId::from_bytes([91; 16]), true),
         )
         .unwrap();
         assert!(turn.enabled);
@@ -211,7 +211,7 @@ fn a_clean_storage_pass_repeats_only_after_the_next_manifest_publication() {
             controller,
             journal.retention_turn(
                 driver.begin_validation().unwrap(),
-                999,
+                Some(999),
                 OperationId::from_bytes([92; 16]),
                 true,
             ),
@@ -261,7 +261,7 @@ fn a_released_pin_reopens_cleanup_without_a_manifest_publication() {
             controller,
             journal.retention_turn(
                 driver.begin_validation().unwrap(),
-                999,
+                Some(999),
                 OperationId::from_bytes([93; 16]),
                 true,
             ),
@@ -305,7 +305,7 @@ fn retention_plans_rolled_segments_without_reading_them() {
     let mut read = false;
     let (_, plan) = drive_except(
         &mut controller,
-        journal.plan_retention(driver.begin_validation().unwrap(), 999, 2),
+        journal.plan_retention(driver.begin_validation().unwrap(), Some(999), 2),
         None,
         |operation| {
             if let Operation::Open { path, .. } = operation
@@ -363,9 +363,12 @@ fn retention_confirms_retry_floors_before_checkpoint_retirement_and_identity_res
     write(&mut controller, &mut journal, &mut driver, receipt);
     sync_apply(&mut controller, &mut journal, &mut driver);
     let ticket = driver.begin_validation().unwrap();
-    let (partition, plan) = drive(&mut controller, journal.plan_retention(ticket, 999, 1))
-        .unwrap()
-        .unwrap();
+    let (partition, plan) = drive(
+        &mut controller,
+        journal.plan_retention(ticket, Some(999), 1),
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(plan.retire, [1]);
     assert_eq!(plan.record_floor, Offset::new(2));
     let buffer = journal
@@ -559,7 +562,7 @@ fn capture_cleanup_beside_writes(
             controller,
             journal.retention_turn(
                 driver.begin_validation().unwrap(),
-                999,
+                Some(999),
                 OperationId::from_bytes([94; 16]),
                 true,
             ),

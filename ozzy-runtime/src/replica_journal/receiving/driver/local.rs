@@ -1,6 +1,7 @@
 //! Serial recovery commands polled by their nonvoting partition actor.
 
 use super::RecoveryStorage;
+use crate::replica_journal::ClockReading;
 use crate::replica_journal::{
     AppendBuffer, InstallationConfig, JournalCompletion, JournalError, JournalStartup, OwnedConfig,
     OwnedJournal, OwnedRecoveringJournal, OwnedRecoveryGenerations, OwnedRecoveryOpen,
@@ -124,7 +125,7 @@ pub struct ShardRecoveringJournal {
     io: ozzy_io::Local,
     memory: Option<crate::memory::Owner>,
     scheduler: ShardJournalConfig,
-    timestamp: Rc<dyn Fn() -> u64>,
+    timestamp: Rc<dyn Fn() -> ClockReading>,
 }
 
 impl std::fmt::Debug for ShardRecoveringJournal {
@@ -139,18 +140,18 @@ impl std::fmt::Debug for ShardRecoveringJournal {
 impl ShardRecoveringJournal {
     /// Consume a freshly opened nonvoting owner. Outstanding transfer attempts
     /// must finish on their original owner; they cannot change execution mode.
-    pub fn from_owned(
+    pub fn from_owned<T: Into<ClockReading>>(
         owner: OwnedRecoveringJournal,
         scheduler: ShardJournalConfig,
-        timestamp: impl Fn() -> u64 + 'static,
+        timestamp: impl Fn() -> T + 'static,
     ) -> Result<Self, JournalError> {
-        Self::build(owner, scheduler, Rc::new(timestamp))
+        Self::build(owner, scheduler, Rc::new(move || timestamp().into()))
     }
 
     fn build(
         owner: OwnedRecoveringJournal,
         scheduler: ShardJournalConfig,
-        timestamp: Rc<dyn Fn() -> u64>,
+        timestamp: Rc<dyn Fn() -> ClockReading>,
     ) -> Result<Self, JournalError> {
         if scheduler.commands < 2
             || scheduler.commands > 65536

@@ -116,10 +116,10 @@ impl OwnedJournal {
     /// Transfer this owner into an actor-polled adapter. No journal task or
     /// thread is spawned. The caller supplies wall-clock timestamps; tests can
     /// inject a deterministic clock. Backend workers remain shared by shards.
-    pub fn into_shard_journal(
+    pub fn into_shard_journal<T: Into<super::ClockReading>>(
         self,
         config: super::ShardJournalConfig,
-        timestamp: impl Fn() -> u64 + 'static,
+        timestamp: impl Fn() -> T + 'static,
     ) -> Result<super::ReplicaJournal, JournalError> {
         self.healthy()?;
         self.writeback.require_idle()?;

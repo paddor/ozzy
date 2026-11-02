@@ -11,7 +11,7 @@ Ozzy frames. Transport receipt is never record confirmation.
 
 | Socket | Carries |
 | --- | --- |
-| Control PEER | HELLO/WELCOME, NACK, topic lookup, routing watches, producer open, APPENDED, subscription control and ACK, progress, groups, replica control, REPLICA_RECEIPT |
+| Control PEER | HELLO/WELCOME, NACK, topic lookup, routing watches, producer open, APPENDED, subscription control and ACK, progress, groups, replica control, REPLICA_RECEIPT, CLOCK_SAMPLE |
 | Data PEER | APPEND, RECORDS replay, PREPARE_FLOW, OPS, SNAPSHOT_CHUNK |
 | Reader PUB | RECORDS_PUB |
 | Follower PUB | PREPARE_PUB |
@@ -170,7 +170,7 @@ Link rules:
 | `20..28` | SUBSCRIBE, SUBSCRIBED, RECORDS, ACK, PROGRESS_COMMIT, PROGRESS_COMMITTED, unassigned, UNSUBSCRIBE, UNSUBSCRIBED |
 | `30..3f` | REPLICA_OPEN, REPLICA_STATE, PREPARE, PREPARE_OK, COMMIT, START_VIEW_CHANGE, DO_VIEW_CHANGE, START_VIEW, RECOVERY, RECOVERY_STATE, FETCH_OPS, OPS, SNAPSHOT_BEGIN, SNAPSHOT_CHUNK, SNAPSHOT_END, SNAPSHOT_INSTALLED |
 | `40..43` | STATE_SNAPSHOT_REQUEST, STATE_SNAPSHOT, STATE_UPDATE, STATE_RESYNC |
-| `50..55` | EXIT_VIEW, PREPARE_FLOW, PREPARE_PUB, RECORDS_PUB, REPLICA_RECEIPT, HISTORY_RETIRED |
+| `50..56` | EXIT_VIEW, PREPARE_FLOW, PREPARE_PUB, RECORDS_PUB, REPLICA_RECEIPT, HISTORY_RETIRED, CLOCK_SAMPLE |
 | `60..67` | GROUP_JOIN, GROUP_JOINED, GROUP_ASSIGN, GROUP_ASSIGNED, GROUP_INSPECT, GROUP_INSPECTED, GROUP_DELETE, GROUP_DELETED |
 | `7f` | NACK |
 
@@ -637,6 +637,15 @@ suspicion of the view; a restart probe still votes.
   lookup to rescan from the boundary, and grants no authority. See
   [retained history](REPLICATION.md#retained-history).
 
+### Clock samples
+
+- CLOCK_SAMPLE (`0x56`) is uncorrelated, with 8 metadata bytes and empty payload:
+  the sender's wall time in Unix milliseconds, `u64`.
+- One broker sends it to another on their established session about once per
+  second, and at once on a new session. Only configured brokers may send it.
+- The dispatcher consumes it. It names no partition, is lossy, and grants no
+  authority. See the [clock guard](REPLICATION.md#clock-guard).
+
 ## Admin console
 
 The optional `admin` endpoint is a PEER that announces the broker's peer
@@ -655,7 +664,7 @@ request has a body. Integers are big-endian, IDs 16 bytes. A string is a
 | 1 | Broker | name, ID, pid `u32`, uptime ms `u64`, `max_clients` `u32`, shards `u32`, brokers (name, ID), partitions (group, topic, partition `u32`, shard `u32`) |
 | 2 | Counters | uptime ms `u64`, events (name, kind `u8`: 0 count, 1 peak, 2 gauge), totals (`u64` per event), threads (name, `u64` per event) |
 | 3 | Partitions | uptime ms `u64`, missing shards `u32`, rows |
-| 4 | Connections | other brokers (ID, link up `u8`), connected clients `u32` |
+| 4 | Connections | other brokers (ID, link up `u8`), connected clients `u32`, clock paused `u8`, fresh clock offsets (ID, milliseconds `i64`, peer minus local) |
 | 5 | Delete group: topic, name | deleted `u8`, then the group ID when 1 |
 | 6 | Logs | entries, oldest first (broker uptime ms `u64`, level `u8`: 0 info, 1 warn, 2 error, thread, message) |
 | 255 | none | error message |

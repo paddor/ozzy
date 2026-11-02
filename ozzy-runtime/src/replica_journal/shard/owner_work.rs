@@ -98,7 +98,7 @@ impl ShardJournal {
         if self.closing {
             return false;
         }
-        let timestamp = &self.timestamp;
+        let timestamp = || (self.timestamp)().wall_millis;
         let Some(work) = self
             .state
             .as_mut()

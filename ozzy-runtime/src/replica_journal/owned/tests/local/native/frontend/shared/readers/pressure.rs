@@ -112,7 +112,7 @@ async fn pause_controls(harness: &mut Harness, readers: &mut [TopicReader], opco
 
 #[tokio::test(flavor = "current_thread")]
 async fn retained_payloads_pause_shared_data_without_blocking_control() {
-    tokio::time::timeout(Duration::from_secs(10), pressure())
+    tokio::time::timeout(Duration::from_secs(10), Box::pin(pressure()))
         .await
         .unwrap();
 }

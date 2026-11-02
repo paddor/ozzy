@@ -160,7 +160,7 @@ async fn small_appends_and_expiry_fit_a_small_owner_with_a_large_identity_capaci
             &mut controller,
             journal.retention_turn(
                 driver.begin_validation().unwrap(),
-                0,
+                Some(0),
                 OperationId::new(),
                 true,
             ),

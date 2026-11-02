@@ -268,12 +268,11 @@ async fn open_actor(
         () = shard.shutdown.closed() => return Err(failure("partition startup stopped")),
         opened = plan.clone().open(shard.io.clone(), JournalGeneration(uuid::Uuid::now_v7().as_u128())) => opened?,
     };
-    let time = config.time.clone();
     opened.into_actor(
         &shard.memory.data,
         &BTreeMap::new(),
         ActorIds::random(config.receipt_handles.clone()),
-        move || time.timestamp(),
+        config.journal_clock(),
     )
 }
 
@@ -291,12 +290,11 @@ async fn open_recovery(
         () = shard.shutdown.closed() => return Err(failure("partition recovery startup stopped")),
         opened = plan.clone().recover(shard.io.clone(), generations, intent) => opened?,
     };
-    let time = config.time.clone();
     opened.into_actor(
         &shard.memory.data,
         &BTreeMap::new(),
         ActorIds::random(config.receipt_handles.clone()),
-        move || time.timestamp(),
+        config.journal_clock(),
     )
 }
 

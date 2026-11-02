@@ -9,7 +9,7 @@ formats. [Overview](OVERVIEW.md) defines the terms.
 
 | Thread | Count | Owns |
 | --- | --- | --- |
-| Dispatcher `ozzy/dispatch` | One per broker | Public sockets, sessions, routing, source pause and resume |
+| Dispatcher `ozzy/dispatch` | One per broker | Public sockets, sessions, routing, source pause and resume, clock samples |
 | OMQ I/O `ozzy/omq/IO/N` | `topology.omq.io_threads` per broker | Connections, framing, socket queues |
 | Shard `ozzy/shard/N` | One per `topology.shards` entry | Partition actors, journals, readers, group coordinators |
 | Disk worker `ozzy/disk/N` | `write_threads` per `controller` | Segment data writes; with `aio`, only those without `O_DIRECT` |
@@ -302,7 +302,8 @@ On the SDK:
   finds counts as `partition_sweep_progress`; a nonzero value means a missed
   wakeup.
 - A partition with held scheduled records wakes when the earliest
-  committed one is due, by the journal clock.
+  committed one is due, by the journal clock. While the
+  [clock guard](REPLICATION.md#clock-guard) pauses, it checks once per second.
 
 ### Release steps
 

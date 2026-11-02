@@ -2,6 +2,37 @@
 
 ## [Unreleased]
 
+### Breaking
+
+- `ozzy_proto::admin::Connections` has new `clock_paused` and `clock_offsets`
+  fields, and its reply carries them.
+- `ozzy_core::retention::Plan::select` takes `Option<u64>` for its time. `None`
+  turns off the age target.
+
+### Added
+
+- Brokers now compare clocks. A broker more than
+  `cluster.max_clock_offset_millis` (default 1000) from the other brokers pauses
+  delayed release, age retention, and producer idle expiry, and warns on stderr.
+  New scheduled records retry until it agrees again.
+  Before, a fast leader released and expired records early. Writes, reads, byte
+  retention, and deduplication continue. A paused leader holds due records until
+  its clock is fixed or leadership moves. `ozzy-tui` and admin Connections show
+  the pause and the offsets.
+
+### Fixed
+
+- A broker that missed a leader change and cannot reach the new leader now
+  joins the new view through the other broker. Before, it kept waiting in the
+  old view, so if the new leader then failed, the two remaining brokers could
+  not elect, and the partition stopped for good. Brokers that started at
+  different times and lost a link early could hit this.
+- Byte retention of a delay partition no longer stalls after a broker that
+  caught up by installing history becomes leader. Installation left its
+  active segment holding more held records than a write rolls at, so it saw
+  nothing to carry or retire, and the other copies stayed over their byte
+  target until the next write. A retention turn now rolls that segment.
+
 ## [0.8.0] - 2026-11-01
 
 ### Breaking

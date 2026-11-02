@@ -219,7 +219,11 @@ part. General descriptors use:
   Rows of the active segment
   and later operations stay in memory. Once 262144 are, a copy rolls its
   segment before its next write when it has room to roll, so they move to
-  its index file. Of sealed segments, only the next rows after the last
+  its index file. A retention turn rolls it too when no write did, such as
+  after a copy installed a suffix: installation fills segments by capacity
+  alone. Otherwise that copy, as primary, would see no segment for a byte
+  target to carry or retire, and the other copies would stay over theirs.
+  Of sealed segments, only the next rows after the last
   release are loaded from their index files, 65536 by default. A row's
   place is certain once every row before it is loaded, and the primary
   releases only certain rows.
@@ -500,8 +504,8 @@ Topics set `retention.max_age_secs` and `retention.max_bytes`; see
   rolls first. Held scheduled records are carried forward first; see
   [scheduled records](#scheduled-records).
 - Age uses each segment's newest append time, so backward clocks cannot expire
-  newer records early. A leader whose clock runs fast does expire them early;
-  nothing checks it against the other brokers.
+  newer records early. A broker whose clock disagrees with the others stops
+  expiring by age; see the [clock guard](REPLICATION.md#clock-guard).
 - Byte targets count active and sealed capacities per partition per broker.
 - Order: confirm `ProducerResultFloor` and `Trim` operations, sync and select
   a checkpoint, publish a manifest without the prefix, then delete files.

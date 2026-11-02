@@ -6,9 +6,11 @@
 mod append;
 mod authority;
 mod canonical;
+mod clock;
 mod commands;
 mod error;
 mod execution;
+pub use clock::ClockReading;
 pub use error::{JournalError, SubmitError};
 mod shard;
 pub use owned::dedup::IdentityRetention;

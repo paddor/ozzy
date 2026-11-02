@@ -251,6 +251,11 @@ pub struct Connections {
     pub brokers: Vec<(NodeId, bool)>,
     /// Clients with an established session.
     pub clients: u32,
+    /// Delayed release, age retention, and idle expiry wait for the clocks to
+    /// agree. Always false on a single broker.
+    pub clock_paused: bool,
+    /// Each peer's fresh clock offset in milliseconds, peer minus local.
+    pub clock_offsets: Vec<(NodeId, i64)>,
 }
 
 /// A diagnostic the broker process logged.
@@ -363,6 +368,12 @@ pub fn encode_reply(id: u64, reply: &Reply) -> Result<Vec<u8>, CodecError> {
                 out.push(u8::from(*up));
             }
             out.extend_from_slice(&connections.clients.to_be_bytes());
+            out.push(u8::from(connections.clock_paused));
+            count(&mut out, connections.clock_offsets.len())?;
+            for (id, offset) in &connections.clock_offsets {
+                out.extend_from_slice(id.as_bytes());
+                out.extend_from_slice(&offset.to_be_bytes());
+            }
         }
         Reply::Logs(entries) => encode_logs(&mut out, entries)?,
         Reply::GroupDeleted(group) => {
@@ -405,6 +416,15 @@ pub fn decode_reply(input: &[u8]) -> Result<(u64, Reply), CodecError> {
                 Ok((id, up))
             })?,
             clients: reader.u32()?,
+            clock_paused: match reader.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(CodecError::Profile),
+            },
+            clock_offsets: list(&mut reader, |reader| {
+                let id = NodeId::from_bytes(reader.array()?);
+                Ok((id, i64::from_be_bytes(reader.array()?)))
+            })?,
         }),
         LOGS => Reply::Logs(decode_logs(&mut reader)?),
         DELETE_GROUP => Reply::GroupDeleted(match reader.u8()? {

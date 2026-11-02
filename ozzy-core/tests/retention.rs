@@ -52,7 +52,7 @@ fn either_limit_expires_only_a_sealed_prefix_using_newest_append_time() {
         max_age_millis: NonZeroU64::new(500),
         max_bytes: None,
     };
-    let plan = Plan::select(&segments, policy, 1000, kept(12, None), 8).unwrap();
+    let plan = Plan::select(&segments, policy, Some(1000), kept(12, None), 8).unwrap();
     assert_eq!(plan.retire, vec![1]);
     assert_eq!(plan.record_floor, Offset::new(2));
     assert_eq!(plan.operation_floor, 5);
@@ -61,11 +61,11 @@ fn either_limit_expires_only_a_sealed_prefix_using_newest_append_time() {
         max_bytes: NonZeroU64::new(1024),
         ..policy
     };
-    let plan = Plan::select(&segments, policy, 1000, kept(12, None), 8).unwrap();
+    let plan = Plan::select(&segments, policy, Some(1000), kept(12, None), 8).unwrap();
     assert_eq!(plan.retire, vec![1, 2]);
     assert_eq!(plan.operation_floor, 9);
     assert_eq!(plan.selected_bytes, 1024);
-    let plan = Plan::select(&segments, policy, 1000, kept(4, None), 8).unwrap();
+    let plan = Plan::select(&segments, policy, Some(1000), kept(4, None), 8).unwrap();
     assert_eq!(
         plan.retire,
         vec![1],
@@ -84,7 +84,7 @@ fn either_limit_expires_only_a_sealed_prefix_using_newest_append_time() {
         (Some(4), vec![], carry(5, true)),
         (Some(9), vec![1, 2], None),
     ] {
-        let plan = Plan::select(&segments, policy, 1000, kept(12, held), 8).unwrap();
+        let plan = Plan::select(&segments, policy, Some(1000), kept(12, held), 8).unwrap();
         assert_eq!(
             plan.retire, retire,
             "a held schedule at {held:?} stops retention"
@@ -100,10 +100,46 @@ fn either_limit_expires_only_a_sealed_prefix_using_newest_append_time() {
         max_bytes: NonZeroU64::new(4096),
         ..policy
     };
-    let plan = Plan::select(&segments, policy, 1000, kept(12, Some(5)), 8).unwrap();
+    let plan = Plan::select(&segments, policy, Some(1000), kept(12, Some(5)), 8).unwrap();
     assert_eq!((plan.retire, plan.carry), (vec![1], None));
-    let plan = Plan::select(&segments, policy, 1000, kept(4, Some(1)), 8).unwrap();
+    let plan = Plan::select(&segments, policy, Some(1000), kept(4, Some(1)), 8).unwrap();
     assert_eq!(plan.carry, carry(5, true));
-    let plan = Plan::select(&segments, policy, 1000, kept(3, Some(1)), 8).unwrap();
+    let plan = Plan::select(&segments, policy, Some(1000), kept(3, Some(1)), 8).unwrap();
     assert_eq!(plan.carry, None, "an uncommitted segment is not carried");
+}
+
+#[test]
+fn without_a_trusted_time_only_the_byte_target_retires() {
+    let segment = |id: u64, sealed: bool, last_operation: u64, newest: u64| Segment {
+        id,
+        capacity: 1024,
+        sealed,
+        last_operation,
+        record_end: Offset::new(id),
+        newest_append_millis: Some(newest),
+    };
+    let segments = [
+        segment(1, true, 4, 100),
+        segment(2, true, 8, 200),
+        segment(3, false, 12, 300),
+    ];
+    let aged = RetentionPolicy {
+        max_age_millis: NonZeroU64::new(500),
+        max_bytes: None,
+    };
+    let trusted = Plan::select(&segments, aged, Some(1000), kept(12, None), 8).unwrap();
+    assert_eq!(trusted.retire, vec![1, 2]);
+    assert!(trusted.roll_active);
+    let paused = Plan::select(&segments, aged, None, kept(12, None), 8).unwrap();
+    assert_eq!(paused.retire, Vec::<u64>::new());
+    assert!(!paused.roll_active);
+    assert_eq!(paused.carry, None);
+
+    let sized = RetentionPolicy {
+        max_bytes: NonZeroU64::new(2048),
+        ..aged
+    };
+    let paused = Plan::select(&segments, sized, None, kept(12, None), 8).unwrap();
+    assert_eq!(paused.retire, vec![1]);
+    assert!(!paused.roll_active);
 }

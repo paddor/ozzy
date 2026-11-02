@@ -407,6 +407,17 @@ fn persisted_identity_rejects_wrong_order_reused_ids_and_unknown_algorithm() {
 }
 
 #[test]
+fn clock_tolerance_defaults_to_one_second_and_must_be_positive() {
+    assert_eq!(single().cluster.max_clock_offset_millis, 1000);
+    let mut deployment = single();
+    deployment.cluster.max_clock_offset_millis = 250;
+    assert!(deployment.validate().is_ok());
+    let mut deployment = single();
+    deployment.cluster.max_clock_offset_millis = 0;
+    assert!(deployment.validate().is_err());
+}
+
+#[test]
 fn parse_rejects_unknown_fields_including_unsupported_omq_affinity() {
     for suffix in [
         "\n[brokers.laptop.topology.omq]\nio_threads = 2\ncpu = 2\n",

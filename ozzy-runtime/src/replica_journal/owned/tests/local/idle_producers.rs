@@ -18,7 +18,7 @@ fn turn(
         controller,
         journal.retention_turn(
             driver.begin_validation().unwrap(),
-            now,
+            Some(now),
             OperationId::from_bytes([93; 16]),
             true,
         ),
@@ -189,12 +189,41 @@ fn idle_observations_last_one_view_and_end_on_a_follower() {
             .0
             .map(|proposal| proposal.0.len())
     };
-    assert_eq!(sweep(view, 1_000, true), None);
+    assert_eq!(sweep(view, Some(1_000), true), None);
     // Another view starts every session fresh, and so does a follower turn.
-    assert_eq!(sweep(view + 1, 17_000, true), None);
-    assert_eq!(sweep(view + 1, 33_000, false), None);
-    assert_eq!(sweep(view + 1, 34_000, true), None);
-    assert_eq!(sweep(view + 1, 49_000, true), None);
-    assert_eq!(sweep(view + 1, 50_000, true), Some(2));
+    assert_eq!(sweep(view + 1, Some(17_000), true), None);
+    assert_eq!(sweep(view + 1, Some(33_000), false), None);
+    assert_eq!(sweep(view + 1, Some(34_000), true), None);
+    assert_eq!(sweep(view + 1, Some(49_000), true), None);
+    assert_eq!(sweep(view + 1, Some(50_000), true), Some(2));
+    drive(&mut controller, journal.shutdown()).unwrap();
+}
+
+#[test]
+fn a_paused_clock_retires_nothing_and_keeps_the_observations() {
+    let (mut controller, io) = setup();
+    let config = OwnedConfig {
+        producer_idle: Some(Duration::from_secs(16)),
+        ..local_config()
+    };
+    let (mut journal, mut driver) = drive(
+        &mut controller,
+        OwnedJournal::format_local(config, io, JournalGeneration(1), 32768),
+    )
+    .unwrap();
+    initialize(&mut controller, &mut journal, &mut driver);
+    let view = driver.begin_validation().unwrap().scope().view;
+    let mut sweep = |now| {
+        journal
+            .idle_producer_proposal(view, now, true)
+            .unwrap()
+            .0
+            .map(|proposal| proposal.0.len())
+    };
+    assert_eq!(sweep(Some(1_000)), None);
+    // Far past the expiry by this clock, which nobody can vouch for.
+    assert_eq!(sweep(None), None);
+    assert_eq!(sweep(None), None);
+    assert_eq!(sweep(Some(17_000)), Some(2), "the first sight still counts");
     drive(&mut controller, journal.shutdown()).unwrap();
 }

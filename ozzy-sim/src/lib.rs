@@ -14,6 +14,7 @@ pub mod broker;
 pub mod canonical;
 #[cfg(feature = "broker")]
 pub mod client;
+pub mod idle;
 pub mod schedule;
 #[cfg(feature = "broker")]
 pub mod soak;

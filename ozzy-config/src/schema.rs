@@ -27,6 +27,14 @@ pub struct Cluster {
     pub id: Option<Uuid>,
     /// Single-broker or fixed-three deployment; never inferred from reachability.
     pub mode: DeploymentMode,
+    /// Disagreement between broker clocks that clock-driven decisions allow.
+    /// A single broker has no peers and ignores it.
+    #[serde(default = "default_max_clock_offset_millis")]
+    pub max_clock_offset_millis: u64,
+}
+
+const fn default_max_clock_offset_millis() -> u64 {
+    1000
 }
 
 /// No automatic fallback from three brokers to one.
