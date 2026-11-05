@@ -14,6 +14,11 @@
   due release waits for room. With the pipeline full and records queued behind
   the release, the partition asked for another turn at once, again and again,
   until the pipeline drained.
+- A deduplicating partition opens much faster on a long history, at restart
+  and when a copy activates a new view. Opening replays the operations since
+  the last dedup checkpoint, or all of them on a topic without retention, and
+  read each one with about three disk jobs. On a slow disk that kept the copy
+  out of the view for minutes. It now reads them in runs from each segment.
 
 ## [0.10.0] - 2026-11-05
 

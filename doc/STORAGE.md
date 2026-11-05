@@ -495,6 +495,9 @@ integrity and partition authority.
   or incomplete identity image supplies no admission state.
 - Recovery restores the matching identity image before admission. Canonical
   state alone cannot authorize an empty index.
+- Restore replays the operations after the checkpoint, or all of them
+  without one, in runs of up to 256 operations or 1 MiB from one segment.
+  Each run costs one length check and one read.
 - Received checkpoints stage privately; limits apply before allocation.
   Unselected input authorizes neither voting nor admission.
 

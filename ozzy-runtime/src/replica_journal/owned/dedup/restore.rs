@@ -5,6 +5,12 @@ use ozzy_journal_segment::{
     JournalIndexError,
 };
 
+/// Operations and bytes one replay read covers. Each read costs a few disk
+/// jobs, so activating a copy reads its history since the checkpoint in
+/// runs, not one operation at a time.
+const REPLAY_OPERATIONS: usize = 256;
+const REPLAY_BYTES: usize = 1 << 20;
+
 impl OwnedJournal {
     /// Rebuild only independently validated canonical history before admission.
     /// Missing identities are never replaced with an empty recovered index.
@@ -20,10 +26,17 @@ impl OwnedJournal {
             let snapshot = journal
                 .build_index_snapshot(JournalIndexBoundary::Accepted, self.recovery.index)
                 .await?;
+            let mut run = Vec::new().into_iter();
             for number in first..=accepted {
-                let decoded = snapshot
-                    .read_operation_number(number)
-                    .await?
+                if run.as_slice().is_empty() {
+                    run = snapshot
+                        .read_operation_run(number, REPLAY_OPERATIONS, REPLAY_BYTES)
+                        .await?
+                        .into_iter();
+                }
+                let decoded = run
+                    .next()
+                    .filter(|decoded| decoded.op_number == number)
                     .ok_or(JournalIndexError::MissingOperationNumber(number))?;
                 let operation = canonical(&decoded);
                 let (partition, row) = image.row(operation, self.limits.operations, limits)?;
