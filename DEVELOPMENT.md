@@ -301,7 +301,14 @@ offset so far, passed since the first send. No session retires before its
 idle time, less that slack, since it surely last changed. At the end the consumers
 must have read every copy's whole log, every confirmed record among it,
 scheduled ones too, and an unconfirmed record only from a batch whose
-outcome stayed unknown.
+outcome stayed unknown. In `retention`, both partitions retire records 2 s
+old in 32 KiB segments, below the latest due time, so held records are
+carried. A consumer told of a retention gap reads on from the earliest
+retained offset, and a producer whose resend finds its batch retired moves
+on. Every record a copy's log start or a gap passes must be the age old,
+less twice that slack, since its first send, or since its due time less
+the tolerance for a released one; the end check starts at the highest such
+floor.
 `sparse-rejoin` runs without records: they fill the leader, and a sparse
 copy of a full leader does not fit. Scripted cases in the fast suite host
 one partition, with two producers and two consumers, to stay near ten
@@ -312,7 +319,8 @@ before a power loss, and the checks must fail; in
 the guard and must be caught releasing early; in
 `partition_without_dedup_stores_resends_twice` a restart's resend must be
 caught at a second offset; in `early_idle_expiry_fails_the_run` sessions
-retire after 0.5 s and must be caught.
+retire after 0.5 s and must be caught; in `young_retention_fails_the_run`
+records retire after 0.5 s and must be caught.
 
 A failing seed prints its parameters, schedule hash, and this command with
 `OZZY_ACTOR_SIM_SEED`, `OZZY_ACTOR_SIM_PROFILE`,

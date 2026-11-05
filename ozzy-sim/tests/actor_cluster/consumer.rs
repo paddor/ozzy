@@ -9,7 +9,8 @@
 //! The live topic is a PUB: each joined consumer whose grant admits it gets
 //! a copy, dropped when its queue is full or by the profile's PUB loss.
 //! Every delivered record goes to the `Ledger`, and its offset must be the
-//! consumer's own next one, apart from what the cursor decides.
+//! consumer's own next one, apart from what the cursor decides. A retention
+//! gap moves it to the earliest retained offset, as an application would.
 
 use crate::{
     broker::{Broker, GROUPS, PARTITIONS},
@@ -104,6 +105,8 @@ pub(crate) struct Counts {
     pub stale: u64,
     /// Replay streams the cursor had moved past, reopened.
     pub reopened: u64,
+    /// Offsets retention retired before the consumer read them.
+    pub skipped: u64,
 }
 
 #[derive(Debug)]
@@ -113,11 +116,13 @@ pub(crate) struct Consumers {
     rng: Rng,
     /// Chance that a live copy is lost.
     loss: f64,
+    /// The age at which retention may retire records, if it does.
+    age: Option<u64>,
     pub counts: Counts,
 }
 
 impl Consumers {
-    pub(crate) fn new(seed: u64, partitions: usize, loss: f64) -> Self {
+    pub(crate) fn new(seed: u64, partitions: usize, loss: f64, age: Option<u64>) -> Self {
         Self {
             readers: (0..PER_PARTITION * partitions)
                 .map(|_| Consumer {
@@ -134,6 +139,7 @@ impl Consumers {
             partitions,
             rng: Rng::new(seed),
             loss,
+            age,
             counts: Counts::default(),
         }
     }
@@ -402,6 +408,32 @@ impl Consumers {
             Opcode::Nack => {
                 if current.is_some_and(|replay| packet.envelope.request_id == Some(replay.request))
                 {
+                    let nack = ozzy_proto::nack::decode(packet, LIMITS.envelope)
+                        .map_err(|error| format!("consumer {index}: nack: {error}"))?;
+                    let earliest = <[u8; 8]>::try_from(nack.detail)
+                        .ok()
+                        .map(u64::from_be_bytes)
+                        .filter(|earliest| nack.code == 14 && *earliest > consumer.next);
+                    if let Some(earliest) = earliest {
+                        let age = self.age.ok_or_else(|| {
+                            format!(
+                                "consumer {index}: broker {broker} reported a retention gap at \
+                                 {} without retention",
+                                consumer.next
+                            )
+                        })?;
+                        ledger
+                            .retire(earliest, clock::wall_millis(now), age, producers)
+                            .map_err(|reason| format!("consumer {index}: {reason}"))?;
+                        self.counts.skipped += earliest - consumer.next;
+                        consumer.next = earliest;
+                        consumer.cursor = LiveCursor::new(earliest, QUIET);
+                        consumer.live.clear();
+                        consumer.held = None;
+                        consumer.replay = None;
+                        consumer.next_at = tick;
+                        return Ok(());
+                    }
                     self.counts.refusals += 1;
                     consumer.replay = None;
                     consumer.next_at = tick + RETRY;

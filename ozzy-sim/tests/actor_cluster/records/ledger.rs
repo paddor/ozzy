@@ -6,6 +6,11 @@
 //! A message ID has one offset. On a dedup partition a resend under a new
 //! epoch may store it again once the window passed since its first send,
 //! less the clock slack.
+//!
+//! With age retention, a record may retire unread once it is old enough:
+//! the floor that passes it, a copy's log start or a consumer's retention
+//! gap, comes at least the age after its first send, less twice the slack.
+//! Two leaders' clocks stamp its time and judge its age.
 
 use super::Producers;
 use crate::broker::CLOCK_TOLERANCE;
@@ -35,6 +40,8 @@ pub(crate) struct Ledger {
     /// Schedule sequence of each confirmed scheduled record, and the reverse.
     schedules: BTreeMap<(usize, u64), u64>,
     scheduled: BTreeMap<u64, (usize, u64)>,
+    /// Offsets below this one may have retired unread.
+    retired: u64,
 }
 
 impl Ledger {
@@ -53,11 +60,66 @@ impl Ledger {
         self.repeats
     }
 
-    /// Every confirmed scheduled record was read.
-    pub(crate) fn released(&self) -> bool {
-        self.schedules
-            .keys()
-            .all(|record| self.records.contains_key(record))
+    /// The offset below which records may have retired unread.
+    pub(crate) fn retired(&self) -> u64 {
+        self.retired
+    }
+
+    /// Every confirmed scheduled record was read, or its release may have
+    /// retired unread by true time `wall`.
+    pub(crate) fn released(&self, wall: u64, age: Option<u64>, producers: &Producers) -> bool {
+        self.schedules.keys().all(|&record| {
+            self.records.contains_key(&record) || self.release_retired(record, wall, age, producers)
+        })
+    }
+
+    /// A release may have retired unread by true time `wall`: retention
+    /// passed some offset, and the age passed since the record was due.
+    fn release_retired(
+        &self,
+        (producer, sequence): (usize, u64),
+        wall: u64,
+        age: Option<u64>,
+        producers: &Producers,
+    ) -> bool {
+        let (Some(age), Some(due)) = (age, producers.due(producer, sequence)) else {
+            return false;
+        };
+        self.retired > 0
+            && wall + 2 * producers.slack() >= due.saturating_sub(CLOCK_TOLERANCE) + age
+    }
+
+    /// Retention passed every offset below `floor` by true time `wall`:
+    /// a copy's log starts there, or a consumer was told so. Each record
+    /// there must be `age` old. One released no earlier than its due time
+    /// less the tolerance.
+    pub(crate) fn retire(
+        &mut self,
+        floor: u64,
+        wall: u64,
+        age: u64,
+        producers: &Producers,
+    ) -> Result<(), String> {
+        if floor <= self.retired {
+            return Ok(());
+        }
+        for (&offset, entry) in self.offsets.range(self.retired..floor) {
+            let (producer, sequence) = entry.record;
+            let sent = producers.first_sent(producer, sequence).unwrap_or(0);
+            let stored = producers
+                .due(producer, sequence)
+                .map_or(sent, |due| sent.max(due.saturating_sub(CLOCK_TOLERANCE)));
+            if wall + 2 * producers.slack() < stored + age {
+                return Err(format!(
+                    "offset {offset} (producer {producer} record {sequence}) retired at true \
+                     time {wall}, though stored no earlier than {stored}, with a {age} ms age \
+                     and {} ms clock slack",
+                    producers.slack()
+                ));
+            }
+        }
+        self.retired = floor;
+        Ok(())
     }
 
     /// Records `records` of `producer` stored, or found stored before,
@@ -218,14 +280,15 @@ impl Ledger {
     }
 
     /// At the end, on a copy whose log ends at `end`: consumers read every
-    /// offset below it, each confirmed record is among them, scheduled ones
-    /// in release order, and a record nobody confirmed comes from a batch
-    /// whose outcome stayed unknown.
+    /// offset below it but retired ones, each confirmed record is among
+    /// them, scheduled ones in release order, and a record nobody confirmed
+    /// comes from a batch whose outcome stayed unknown.
     pub(crate) fn check_log(
         &self,
         broker: usize,
         end: u64,
         read_through: u64,
+        (wall, age): (u64, Option<u64>),
         producers: &Producers,
     ) -> Result<(), String> {
         if let Some((&offset, entry)) = self.offsets.range(end..).next() {
@@ -240,15 +303,17 @@ impl Ledger {
                 "broker {broker}: log ends at offset {end}, consumers read through {read_through}"
             ));
         }
-        if self.offsets.len() as u64 != end {
+        let floor = self.retired.min(end);
+        let seen = self.offsets.range(floor..).count() as u64;
+        if seen != end - floor {
             return Err(format!(
-                "broker {broker}: log ends at offset {end}, but {} offsets were seen",
-                self.offsets.len()
+                "broker {broker}: log ends at offset {end}, but {seen} offsets from {floor} were \
+                 seen"
             ));
         }
         for (&offset, entry) in &self.offsets {
             let (producer, sequence) = entry.record;
-            if !entry.read {
+            if !entry.read && offset >= floor {
                 return Err(format!(
                     "broker {broker}: confirmed offset {offset} was never read"
                 ));
@@ -266,17 +331,26 @@ impl Ledger {
                 ));
             }
         }
-        self.check_releases(broker, producers)
+        self.check_releases(broker, wall, age, producers)
     }
 
     /// Every confirmed scheduled record was released, in order of due time,
     /// then schedule sequence: a later schedule sequence that is due no
     /// later never releases first. Acceptance times only grow with the
     /// schedule sequence, so they cannot reverse that.
-    fn check_releases(&self, broker: usize, producers: &Producers) -> Result<(), String> {
+    fn check_releases(
+        &self,
+        broker: usize,
+        wall: u64,
+        age: Option<u64>,
+        producers: &Producers,
+    ) -> Result<(), String> {
         let mut released = Vec::new();
         for (&(producer, sequence), &schedule) in &self.schedules {
             let Some(&(offset, _)) = self.records.get(&(producer, sequence)) else {
+                if self.release_retired((producer, sequence), wall, age, producers) {
+                    continue;
+                }
                 return Err(format!(
                     "broker {broker}: producer {producer} record {sequence}, confirmed as \
                      schedule {schedule}, was never released"

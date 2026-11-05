@@ -42,6 +42,9 @@ pub(crate) const DEDUP_GROUP: usize = 1;
 /// identities its index holds: about four windows of records.
 pub(crate) const DEDUP_WINDOW: u64 = 5_000;
 pub(crate) const PRODUCER_IDLE: u64 = 3_000;
+/// Record age at which retention may retire a segment, where a scenario
+/// turns it on: below the latest due time, so held records need a carry.
+pub(crate) const RETENTION_AGE: u64 = 2_000;
 const DEDUP_ENTRIES: usize = 4096;
 
 /// The bootstrap lane with its partition creation prepared, and native intake
@@ -66,7 +69,10 @@ pub(super) fn services(
             owner_epoch: OwnerEpoch::INITIAL,
             delay_max_millis: std::num::NonZeroU64::new(MAX_DELAY).filter(|_| group != DEDUP_GROUP),
             dedup_window_millis: std::num::NonZeroU64::new(DEDUP_WINDOW).filter(|_| dedup),
-            retention: RetentionPolicy::default(),
+            retention: RetentionPolicy {
+                max_age_millis: shape.max_age(),
+                max_bytes: None,
+            },
         })
         .map_err(|error| failure(&error))?;
     let bootstrap = Bootstrap {

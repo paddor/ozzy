@@ -57,6 +57,8 @@ struct Scenario {
     chaos: bool,
     /// The safeguard a negative control turns off, if any.
     control: Control,
+    /// Both partitions retire records after `RETENTION_AGE`.
+    retention: bool,
     /// Caps the profile's floors for confirmed proposals, records, and
     /// compared ops, where a full journal bounds them.
     max_floor: usize,
@@ -77,6 +79,7 @@ const RANDOM: Scenario = Scenario {
     records: true,
     chaos: false,
     control: Control::None,
+    retention: false,
     max_floor: usize::MAX,
     max_record_floor: usize::MAX,
     min_applied: 0,
@@ -295,6 +298,28 @@ fn scenario(name: &str) -> Option<Scenario> {
             control: Control::EarlyIdle,
             ..RANDOM
         },
+        // Both partitions retire records after 2 s in 32 KiB segments, below
+        // the latest due time, so held records are carried. A follower cut
+        // off for 6 s catches up past retired history.
+        "retention" => Scenario {
+            ticks: 2000,
+            script: &[IsolateFollower {
+                at: 600,
+                ticks: 600,
+            }],
+            segment_bytes: 32 * 1024,
+            retention: true,
+            ..RANDOM
+        },
+        // Negative control: as `retention`, but records retire after 0.5 s.
+        // The run must fail.
+        "retention-young" => Scenario {
+            ticks: 3000,
+            segment_bytes: 32 * 1024,
+            retention: true,
+            control: Control::YoungRetention,
+            ..RANDOM
+        },
         // Negative control: every disk loses the last 5 s it reported done.
         // The run must fail.
         "rewind" => Scenario {
@@ -385,6 +410,7 @@ fn options(profile: &str, scenario: &str, partitions: usize) -> Options {
         records: scenario.records,
         chaos: scenario.chaos,
         control: scenario.control,
+        retention: scenario.retention,
         min_confirmed: floor,
         min_records: floor.min(scenario.max_record_floor),
         min_compared: floor as u64,
@@ -668,6 +694,28 @@ fn early_idle_expiry_fails_the_run() {
     );
 }
 
+/// Both partitions retire records 2 s old. Consumers skip what retired
+/// before they read it, held records survive by carry, and a lagging
+/// follower catches up past retired history. Its leader once replayed the
+/// retired history to it on every turn, a busy loop.
+#[test]
+fn age_retention_retires_old_records_and_carries_held_ones() {
+    let report = checked(2, "none", "retention");
+    assert!(
+        report.retained_from > 0 && report.scheduled >= 20,
+        "{report:?}"
+    );
+    eprintln!("{report:?}");
+}
+
+/// Negative control: records retire after a quarter of the age the checks
+/// hold retention to, and they must notice.
+#[test]
+fn young_retention_fails_the_run() {
+    let reason = failure_on(GROUPS.len(), 1, "none", "retention-young");
+    assert!(reason.contains("retired at true time"), "{reason}");
+}
+
 /// Negative control: every disk loses what it reported done in the last 5 s.
 /// The checks must notice the lost confirmed operations.
 #[test]
@@ -722,6 +770,9 @@ fn regression_seeds() {
     // A stalled disk completed a job for one partition's visit. The other
     // partition's leader kept suspecting storage until the safety sweep.
     checked(6, "slow", "chaos");
+    // A retirement's file work ended inside a visit, and nothing asked for
+    // the next round: the safety sweep started the due retention turn.
+    checked(23, "none", "retention");
 }
 
 /// Process-wide state would leak from one run into the next one.
@@ -742,8 +793,8 @@ mod seeded {
 
         const PROFILES: [&str; 5] = ["none", "light", "heavy", "swarm", "slow"];
         /// Each scenario with its profiles. Heavy and swarm faults leave too
-        /// little progress to fill a journal.
-        const SCENARIOS: [(&str, &[&str]); 17] = [
+        /// little progress to fill a journal, or to retire a segment.
+        const SCENARIOS: [(&str, &[&str]); 18] = [
             ("random", &PROFILES),
             ("failover", &PROFILES),
             ("slow-follower", &PROFILES),
@@ -761,6 +812,7 @@ mod seeded {
             ("one-way", &PROFILES),
             ("chaos", &PROFILES),
             ("skew", &PROFILES),
+            ("retention", &["none", "light", "slow"]),
         ];
 
         /// About 4800 operations in 75 segments before the leader is lost. A

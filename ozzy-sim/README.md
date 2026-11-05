@@ -16,8 +16,8 @@ Deterministic workload and fault tests around Ozzy production code, plus the
   one seed, over modeled links, disks, clients, and host clocks: barrier
   proposals, producers through native intake, some records scheduled under
   the production clock guard, a dedup partition whose producers restart and
-  idle out, and consumers through the reader service and
-  its live topic. A failing seed prints its reproduce command; see
+  idle out, optional age retention, and consumers through the reader
+  service and its live topic. A failing seed prints its reproduce command; see
   [seeded actor cluster](../DEVELOPMENT.md#seeded-actor-cluster).
 - An independent record oracle checks every submitted, confirmed, and
   delivered record.

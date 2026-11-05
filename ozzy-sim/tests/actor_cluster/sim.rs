@@ -4,6 +4,7 @@
 //! and submit. Checks run after every tick. `OZZY_ACTOR_SIM_TRACE` prints
 //! each broker's view and positions when they change.
 
+mod floors;
 mod script;
 
 pub(crate) use script::Fault;
@@ -60,6 +61,8 @@ pub(crate) struct Options {
     pub chaos: bool,
     /// The safeguard a negative control turns off, if any.
     pub control: Control,
+    /// Both partitions retire records after `RETENTION_AGE`.
+    pub retention: bool,
     /// Vacuity floors: confirmed proposals, confirmed records per partition,
     /// ops two brokers reported, the converged op, and proposals a full
     /// journal refused.
@@ -80,6 +83,7 @@ impl Options {
             max_segments: self.max_segments,
             segment_bytes: self.segment_bytes,
             sparse: self.sparse.contains(&broker),
+            retention: self.retention,
         }
     }
 }
@@ -137,6 +141,10 @@ pub(crate) struct Report {
     pub retired: u64,
     pub duplicates: u64,
     pub repeats: usize,
+    /// Offsets retention retired, summed over partitions, and offsets
+    /// consumers skipped as a retention gap.
+    pub retained_from: u64,
+    pub skipped: u64,
     /// Visits only the safety sweep found work for within 1 s of a clock
     /// step, before the guard's next look could see it.
     pub clock_wakeups: u64,
@@ -188,6 +196,8 @@ struct Sim {
     /// Visits only the safety sweep found work for right after a clock step
     /// or the guard resuming.
     clock_wakeups: u64,
+    /// Each copy's log start at the last look, by partition and broker.
+    floors: Vec<[u64; BROKERS]>,
 }
 
 pub(crate) fn run(seed: u64, profile: Profile, options: Options) -> Result<Report, Box<Failure>> {
@@ -224,8 +234,17 @@ pub(crate) fn run(seed: u64, profile: Profile, options: Options) -> Result<Repor
         executor: Rng::new(seeds.executor),
         brokers,
         workload: Workload::new(lanes, seeds.workload, options.batch),
-        producers: Producers::new(seeds.producers, options.partitions),
-        consumers: Consumers::new(seeds.consumers, options.partitions, profile.pub_loss),
+        producers: Producers::new(
+            seeds.producers,
+            options.partitions,
+            options.retention.then_some(crate::broker::RETENTION_AGE),
+        ),
+        consumers: Consumers::new(
+            seeds.consumers,
+            options.partitions,
+            profile.pub_loss,
+            options.retention.then_some(crate::broker::RETENTION_AGE),
+        ),
         ledgers: (0..options.partitions).map(|_| Ledger::default()).collect(),
         checkers: (0..options.partitions)
             .map(|_| Checker::default())
@@ -241,6 +260,7 @@ pub(crate) fn run(seed: u64, profile: Profile, options: Options) -> Result<Repor
         links: [[0; BROKERS]; BROKERS],
         connected: [[true; BROKERS]; BROKERS],
         clock_wakeups: 0,
+        floors: vec![[0; BROKERS]; options.partitions],
     };
     let result = sim.run();
     let hash = sim.trace.value();
@@ -275,6 +295,8 @@ pub(crate) fn run(seed: u64, profile: Profile, options: Options) -> Result<Repor
             retired: sim.producers.counts.retired,
             duplicates: sim.producers.counts.duplicates,
             repeats: sim.ledgers.iter().map(Ledger::repeats).sum(),
+            retained_from: sim.ledgers.iter().map(Ledger::retired).sum(),
+            skipped: sim.consumers.counts.skipped,
             clock_wakeups: sim.clock_wakeups,
             vacuous,
         })
@@ -382,6 +404,7 @@ impl Sim {
                 .step(tick, !draining, &mut self.checkers[0], &mut self.trace)?;
             if self.options.records {
                 self.clients(tick, !draining)?;
+                self.watch_floors()?;
             }
             for broker in &mut self.brokers {
                 let status = broker.status(0);
@@ -428,8 +451,13 @@ impl Sim {
                     || ((0..self.options.partitions).all(|partition| {
                         log_end(&self.brokers, partition)
                             .is_some_and(|end| self.consumers.caught_up(partition, end))
-                    }) && self.ledgers.iter().all(Ledger::released)
-                        && self.facts_ready()))
+                    }) && self.ledgers.iter().all(|ledger| {
+                        ledger.released(
+                            crate::clock::wall_millis(self.clock.now()),
+                            self.age(),
+                            &self.producers,
+                        )
+                    }) && self.facts_ready()))
                 && (1..self.options.partitions)
                     .all(|group| converged(&self.brokers, group).is_some())
                 && let Some(applied) = converged(&self.brokers, 0)
@@ -856,6 +884,7 @@ impl Sim {
                         broker.index,
                         facts.next_offset.get(),
                         self.consumers.read_through(partition),
+                        (crate::clock::wall_millis(self.clock.now()), self.age()),
                         &self.producers,
                     )
                     .map_err(|reason| format!("partition {partition}: {reason}"))?;
@@ -879,7 +908,8 @@ impl Sim {
                     .ledgers
                     .iter()
                     .any(|ledger| ledger.len() < self.options.min_records))
-            || self.checkers[0].compared < self.options.min_compared;
+            || self.checkers[0].compared < self.options.min_compared
+            || (self.options.retention && self.ledgers.iter().any(|ledger| ledger.retired() == 0));
         Ok((applied.op.0, vacuous))
     }
 

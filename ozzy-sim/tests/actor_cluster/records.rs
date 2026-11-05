@@ -80,6 +80,8 @@ const RESTART: f64 = 1.0 / 150.0;
 const PAUSE: f64 = 1.0 / 50.0;
 /// NACK code of a fenced or unknown session.
 const FENCED: u16 = 6;
+/// NACK code of a retry whose records or results retired.
+const EXPIRED: u16 = 9;
 /// The first byte of every producer node ID.
 const NODE: u8 = 0xc0;
 
@@ -124,6 +126,9 @@ struct Producer {
     changed: u64,
     /// Every batch so far, by its first record.
     batches: BTreeMap<u64, Batch>,
+    /// Batches a resend found retired: each may have been read, and none
+    /// confirmed.
+    expired: std::collections::BTreeSet<u64>,
     /// First record of the current batch.
     first: u64,
     /// Records of the current batch confirmed so far.
@@ -163,6 +168,8 @@ pub(crate) struct Counts {
     pub restarts: u64,
     pub retired: u64,
     pub duplicates: u64,
+    /// Batches a resend found retired.
+    pub expired: u64,
 }
 
 #[derive(Debug)]
@@ -175,11 +182,13 @@ pub(crate) struct Producers {
     /// The largest host clock offset so far, in milliseconds. Stamps of a
     /// stepped leader stay, so time windows may close this much early.
     slack: u64,
+    /// The age at which retention may retire records, if it does.
+    age: Option<u64>,
     pub counts: Counts,
 }
 
 impl Producers {
-    pub(crate) fn new(seed: u64, partitions: usize) -> Self {
+    pub(crate) fn new(seed: u64, partitions: usize, age: Option<u64>) -> Self {
         let mut producers = Self {
             writers: (0..PER_PARTITION * partitions)
                 .map(|index| Producer {
@@ -191,6 +200,7 @@ impl Producers {
                     takeover: false,
                     changed: 0,
                     batches: BTreeMap::new(),
+                    expired: std::collections::BTreeSet::new(),
                     first: 0,
                     done: [false; RECORDS as usize],
                     uncertain: false,
@@ -210,6 +220,7 @@ impl Producers {
             rng: Rng::new(seed),
             draining: false,
             slack: 0,
+            age,
             counts: Counts::default(),
         };
         for (index, producer) in producers.writers.iter_mut().enumerate() {
@@ -247,6 +258,20 @@ impl Producers {
         })
     }
 
+    /// The true time producer `producer` first sent record `record`: no
+    /// copy holds it from earlier.
+    pub(crate) fn first_sent(&self, producer: usize, record: u64) -> Option<u64> {
+        let batch = self.writers[producer]
+            .batches
+            .get(&(record - record % RECORDS))?;
+        Some(wall(batch.sent))
+    }
+
+    /// The largest host clock offset so far, in milliseconds.
+    pub(crate) fn slack(&self) -> u64 {
+        self.slack
+    }
+
     /// The due time of producer `producer`'s record `sequence`, if scheduled.
     pub(crate) fn due(&self, producer: usize, sequence: u64) -> Option<u64> {
         self.writers[producer].scheduled.get(&sequence).copied()
@@ -269,7 +294,8 @@ impl Producers {
     /// its batch's outcome stayed unknown.
     pub(crate) fn may_hold(&self, producer: usize, sequence: u64) -> bool {
         let producer = &self.writers[producer];
-        producer.unresolved() && (producer.first..producer.first + RECORDS).contains(&sequence)
+        (producer.unresolved() && (producer.first..producer.first + RECORDS).contains(&sequence))
+            || producer.expired.contains(&(sequence - sequence % RECORDS))
     }
 
     /// Send due requests. `submit` false only finishes the current batches.
@@ -641,6 +667,32 @@ impl Producers {
                     RetryClass::Permanent if dedup && refusal.code == FENCED => {
                         producer.reopen(Phase::Resume);
                         producer.next_at = tick + REDIRECT;
+                    }
+                    // A resend found the batch's records retired, so they
+                    // were stored at least the age ago. Go on to the next.
+                    RetryClass::Permanent
+                        if refusal.code == EXPIRED
+                            && producer.phase == Phase::Append
+                            && self.age.is_some() =>
+                    {
+                        let age = self.age.unwrap_or_default();
+                        let sent = producer.batches.get(&producer.first).map_or(0, |b| b.sent);
+                        if wall(tick) + 2 * self.slack < wall(sent) + age {
+                            return Err(format!(
+                                "producer {index}: record {} retired {} ms after its first \
+                                 send, before the {age} ms age",
+                                producer.first,
+                                wall(tick) - wall(sent)
+                            ));
+                        }
+                        self.counts.expired += 1;
+                        producer.expired.insert(producer.first);
+                        producer.first += RECORDS;
+                        plan(&mut self.rng, producer, tick, !dedup);
+                        producer.done = [false; RECORDS as usize];
+                        producer.uncertain = false;
+                        producer.drain_refusals = 0;
+                        producer.next_at = tick;
                     }
                     RetryClass::Permanent => {
                         return Err(format!(

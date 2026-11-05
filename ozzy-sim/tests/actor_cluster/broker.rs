@@ -6,7 +6,7 @@
 
 mod setup;
 
-pub(crate) use setup::{DEDUP_GROUP, DEDUP_WINDOW, PRODUCER_IDLE};
+pub(crate) use setup::{DEDUP_GROUP, DEDUP_WINDOW, PRODUCER_IDLE, RETENTION_AGE};
 use setup::{actor_config, generation, journal_clock, journal_config, lanes, readers, services};
 
 use crate::{
@@ -82,6 +82,8 @@ pub(crate) struct Shape {
     pub max_segments: usize,
     pub segment_bytes: u64,
     pub sparse: bool,
+    /// Both partitions retire records after `RETENTION_AGE`.
+    pub retention: bool,
 }
 /// A negative control: one safeguard off, so the checks must fail.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -94,6 +96,8 @@ pub(crate) enum Control {
     NoDedup,
     /// Producer sessions retire after a sixth of `PRODUCER_IDLE`.
     EarlyIdle,
+    /// Records retire after a quarter of `RETENTION_AGE`.
+    YoungRetention,
 }
 
 impl Shape {
@@ -115,6 +119,16 @@ impl Shape {
             PRODUCER_IDLE
         };
         Duration::from_millis(millis)
+    }
+
+    /// The age at which both partitions retire records, if they do.
+    pub(crate) fn max_age(self) -> Option<std::num::NonZeroU64> {
+        let millis = if self.control == Control::YoungRetention {
+            RETENTION_AGE / 4
+        } else {
+            RETENTION_AGE
+        };
+        std::num::NonZeroU64::new(millis).filter(|_| self.retention)
     }
 }
 
