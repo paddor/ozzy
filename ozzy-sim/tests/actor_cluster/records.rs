@@ -3,13 +3,19 @@
 //! `RECORDS` records at a time. A NACK's authority hint redirects; an unknown
 //! outcome or a silent broker resends the same identity elsewhere later.
 //!
+//! A third of the batches are scheduled, each record due between 0.5 s ago
+//! and 3 s ahead by true time; their confirmations carry schedule sequences.
+//!
 //! Every confirmation goes to the `Ledger`, stale ones too: two records at
-//! one offset, one record at two offsets, or a producer's records out of
-//! order fail the run. At the end, every copy's log must hold exactly the
-//! confirmed records, at offsets from zero without a gap.
+//! one offset or schedule sequence, one record at two, or a producer's
+//! unscheduled records out of order fail the run. Scheduled records release
+//! in order of due time, then schedule sequence, and never before their due
+//! time minus the clock tolerance. At the end, every copy's log must hold
+//! exactly the confirmed records, at offsets from zero without a gap.
 
 use crate::{
-    broker::{Broker, GROUPS, PARTITIONS},
+    broker::{Broker, CLOCK_TOLERANCE, GROUPS, PARTITIONS},
+    clock,
     network::{BROKERS, node},
     seeds::{Rng, Trace},
 };
@@ -18,7 +24,7 @@ use omq_tokio::Message;
 use ozzy_proto::{
     Envelope, EnvelopeLimits, LinkSessionId, MessageId, NodeId, Opcode, OperationId, ProducerId,
     RequestId,
-    append::{self, AppendKey, Authority, Policy},
+    append::{self, AppendDisposition, AppendKey, Authority, Policy},
     data::{DataLimits, Encoding, Record},
     decode_packet, handshake,
     nack::{self, AuthorityHint, RetryClass},
@@ -44,6 +50,11 @@ pub(crate) const LIMITS: DataLimits = DataLimits {
 };
 /// Records per APPEND.
 const RECORDS: u64 = 3;
+/// The share of scheduled batches, and their records' due times from the
+/// batch start: the earliest, in milliseconds, and the span.
+const SCHEDULED: f64 = 1.0 / 3.0;
+const EARLIEST: i64 = -500;
+const SPAN: u64 = 3500;
 /// Ticks without a reply before a request is resent elsewhere, and before a
 /// retry after a refusal.
 const TIMEOUT: u64 = 300;
@@ -83,6 +94,10 @@ struct Producer {
     abandoned: bool,
     /// End of every sequence sent so far.
     sent_end: u64,
+    /// Due times of the current batch, when it is scheduled.
+    due: Option<[u64; RECORDS as usize]>,
+    /// Due time of every scheduled sequence so far.
+    scheduled: BTreeMap<u64, u64>,
     target: usize,
     /// The newest view any reply or hint named.
     view: u64,
@@ -111,20 +126,37 @@ struct Entry {
 }
 
 /// Every confirmed and every read record, checked as it arrives: one
-/// offset per record, one record per offset, and each producer's records in
-/// sequence order.
+/// offset and schedule sequence per record, one record per offset and
+/// schedule sequence, and each producer's unscheduled records in sequence
+/// order.
 #[derive(Debug, Default)]
 pub(crate) struct Ledger {
-    /// Offset of each record, by producer and sequence.
-    records: BTreeMap<(usize, u64), u64>,
+    /// Offset of each record, by producer and sequence, and whether it was
+    /// scheduled.
+    records: BTreeMap<(usize, u64), (u64, bool)>,
     offsets: BTreeMap<u64, Entry>,
     confirmed: usize,
+    /// Schedule sequence of each confirmed scheduled record, and the reverse.
+    schedules: BTreeMap<(usize, u64), u64>,
+    scheduled: BTreeMap<u64, (usize, u64)>,
 }
 
 impl Ledger {
     /// Distinct confirmed records.
     pub(crate) fn len(&self) -> usize {
-        self.confirmed
+        self.confirmed + self.schedules.len()
+    }
+
+    /// Confirmed scheduled records.
+    pub(crate) fn scheduled(&self) -> usize {
+        self.schedules.len()
+    }
+
+    /// Every confirmed scheduled record was read.
+    pub(crate) fn released(&self) -> bool {
+        self.schedules
+            .keys()
+            .all(|record| self.records.contains_key(record))
     }
 
     fn confirm(
@@ -135,19 +167,65 @@ impl Ledger {
     ) -> Result<(), String> {
         for sequence in sequences.clone() {
             let offset = first_offset + (sequence - sequences.start);
-            self.note(producer, sequence, offset, true)?;
+            self.note(producer, sequence, offset, true, false)?;
         }
         Ok(())
     }
 
-    /// A consumer read producer `producer`'s record `sequence` at `offset`.
+    /// Records held until due, confirmed with schedule sequences from
+    /// `first_schedule`.
+    fn schedule(
+        &mut self,
+        producer: usize,
+        sequences: std::ops::Range<u64>,
+        first_schedule: u64,
+    ) -> Result<(), String> {
+        for sequence in sequences.clone() {
+            let schedule = first_schedule + (sequence - sequences.start);
+            let record = (producer, sequence);
+            if let Some(&old) = self.schedules.get(&record)
+                && old != schedule
+            {
+                return Err(format!(
+                    "producer {producer} sequence {sequence} scheduled as {schedule}, as {old} \
+                     before"
+                ));
+            }
+            if let Some(&other) = self.scheduled.get(&schedule)
+                && other != record
+            {
+                return Err(format!(
+                    "schedule sequence {schedule} confirmed for producer {producer} sequence \
+                     {sequence}, for {other:?} before"
+                ));
+            }
+            self.schedules.insert(record, schedule);
+            self.scheduled.insert(schedule, record);
+        }
+        Ok(())
+    }
+
+    /// A consumer read producer `producer`'s record `sequence` at `offset`
+    /// at true time `wall`. A scheduled record, due at `due`, released at
+    /// most the clock tolerance early.
     pub(crate) fn read(
         &mut self,
         producer: usize,
         sequence: u64,
         offset: u64,
+        due: Option<u64>,
+        wall: u64,
     ) -> Result<(), String> {
-        self.note(producer, sequence, offset, false)
+        if let Some(due) = due
+            && due > wall + CLOCK_TOLERANCE
+        {
+            return Err(format!(
+                "producer {producer} sequence {sequence} read at offset {offset} {} ms before \
+                 its due time",
+                due - wall
+            ));
+        }
+        self.note(producer, sequence, offset, false, due.is_some())
     }
 
     fn note(
@@ -156,9 +234,10 @@ impl Ledger {
         sequence: u64,
         offset: u64,
         confirmed: bool,
+        scheduled: bool,
     ) -> Result<(), String> {
         let how = if confirmed { "confirmed" } else { "read" };
-        if let Some(&old) = self.records.get(&(producer, sequence))
+        if let Some(&(old, _)) = self.records.get(&(producer, sequence))
             && old != offset
         {
             return Err(format!(
@@ -175,24 +254,28 @@ impl Ledger {
                 entry.record
             ));
         }
-        // One producer's records keep their sequence order.
+        // One producer's unscheduled records keep their sequence order.
+        let unscheduled = |(_, (_, scheduled)): &(&(usize, u64), &(u64, bool))| !*scheduled;
         let before = self
             .records
             .range((producer, 0)..(producer, sequence))
-            .next_back();
+            .rev()
+            .find(unscheduled);
         let after = self
             .records
             .range((producer, sequence + 1)..(producer + 1, 0))
-            .next();
-        if before.is_some_and(|(_, &earlier)| earlier >= offset)
-            || after.is_some_and(|(_, &later)| later <= offset)
+            .find(unscheduled);
+        if !scheduled
+            && (before.is_some_and(|(_, &(earlier, _))| earlier >= offset)
+                || after.is_some_and(|(_, &(later, _))| later <= offset))
         {
             return Err(format!(
                 "producer {producer} sequence {sequence} {how} at offset {offset}, out of order \
                  with {before:?} and {after:?}"
             ));
         }
-        self.records.insert((producer, sequence), offset);
+        self.records
+            .insert((producer, sequence), (offset, scheduled));
         let entry = self.offsets.entry(offset).or_insert(Entry {
             record: (producer, sequence),
             confirmed: false,
@@ -207,8 +290,9 @@ impl Ledger {
     }
 
     /// At the end, on a copy whose log ends at `end`: consumers read every
-    /// offset below it, each confirmed record is among them, and a record
-    /// nobody confirmed comes from a batch whose outcome stayed unknown.
+    /// offset below it, each confirmed record is among them, scheduled ones
+    /// in release order, and a record nobody confirmed comes from a batch
+    /// whose outcome stayed unknown.
     pub(crate) fn check_log(
         &self,
         broker: usize,
@@ -241,10 +325,47 @@ impl Ledger {
                     "broker {broker}: confirmed offset {offset} was never read"
                 ));
             }
-            if !entry.confirmed && !producers.may_hold(producer, sequence) {
+            let confirmed = entry.confirmed || self.schedules.contains_key(&entry.record);
+            if !confirmed && !producers.may_hold(producer, sequence) {
                 return Err(format!(
                     "broker {broker}: offset {offset} holds producer {producer} sequence \
                      {sequence}, never confirmed though its batch was settled"
+                ));
+            }
+        }
+        self.check_releases(broker, producers)
+    }
+
+    /// Every confirmed scheduled record was released, in order of due time,
+    /// then schedule sequence: a later schedule sequence that is due no
+    /// later never releases first. Acceptance times only grow with the
+    /// schedule sequence, so they cannot reverse that.
+    fn check_releases(&self, broker: usize, producers: &Producers) -> Result<(), String> {
+        let mut released = Vec::new();
+        for (&(producer, sequence), &schedule) in &self.schedules {
+            let Some(&(offset, _)) = self.records.get(&(producer, sequence)) else {
+                return Err(format!(
+                    "broker {broker}: producer {producer} sequence {sequence}, confirmed as \
+                     schedule {schedule}, was never released"
+                ));
+            };
+            let due = producers.due(producer, sequence).ok_or_else(|| {
+                format!("producer {producer} sequence {sequence} has no due time")
+            })?;
+            released.push((offset, due, schedule));
+        }
+        released.sort_unstable();
+        for (at, &(offset, due, schedule)) in released.iter().enumerate() {
+            if let Some(&(later, later_due, later_schedule)) =
+                released[at + 1..]
+                    .iter()
+                    .find(|(_, later_due, later_schedule)| {
+                        *later_schedule < schedule && *later_due <= due
+                    })
+            {
+                return Err(format!(
+                    "broker {broker}: schedule {later_schedule} due {later_due} released at offset \
+                     {later}, after schedule {schedule} due {due} at offset {offset}"
                 ));
             }
         }
@@ -264,7 +385,7 @@ pub(crate) struct Producers {
 
 impl Producers {
     pub(crate) fn new(seed: u64, partitions: usize) -> Self {
-        Self {
+        let mut producers = Self {
             writers: (0..PER_PARTITION * partitions)
                 .map(|index| Producer {
                     phase: Phase::Open,
@@ -275,6 +396,8 @@ impl Producers {
                     drain_refusals: 0,
                     abandoned: false,
                     sent_end: 0,
+                    due: None,
+                    scheduled: BTreeMap::new(),
                     target: index % BROKERS,
                     view: 0,
                     pending: None,
@@ -286,7 +409,16 @@ impl Producers {
             rng: Rng::new(seed),
             draining: false,
             counts: Counts::default(),
+        };
+        for producer in &mut producers.writers {
+            plan(&mut producers.rng, producer, 0);
         }
+        producers
+    }
+
+    /// The due time of producer `producer`'s record `sequence`, if scheduled.
+    pub(crate) fn due(&self, producer: usize, sequence: u64) -> Option<u64> {
+        self.writers[producer].scheduled.get(&sequence).copied()
     }
 
     /// No request is outstanding, and no batch that may be stored awaits its
@@ -416,7 +548,7 @@ impl Producers {
                             first_sequence: producer.first,
                         },
                         policy: Policy::QuorumDurable,
-                        due_millis: None,
+                        due_millis: producer.due.as_ref().map(|due| &due[..]),
                         records: &records,
                     },
                     &mut metadata,
@@ -479,11 +611,22 @@ impl Producers {
                 if key.producer_id != producer_id(index) {
                     return Err(format!("producer {index}: confirmation for {key:?}"));
                 }
-                ledger.confirm(
-                    index,
-                    key.first_sequence..confirmed.end_sequence,
-                    confirmed.first_offset,
-                )?;
+                let sequences = key.first_sequence..confirmed.end_sequence;
+                let scheduled = confirmed.disposition == AppendDisposition::Scheduled;
+                if let Some(sequence) = sequences
+                    .clone()
+                    .find(|&sequence| self.due(index, sequence).is_some() != scheduled)
+                {
+                    return Err(format!(
+                        "producer {index}: sequence {sequence} confirmed as {:?}",
+                        confirmed.disposition
+                    ));
+                }
+                if scheduled {
+                    ledger.schedule(index, sequences, confirmed.first_offset)?;
+                } else {
+                    ledger.confirm(index, sequences, confirmed.first_offset)?;
+                }
                 let producer = &mut self.writers[index];
                 producer.view = producer.view.max(confirmed.authority.view);
                 if key.producer_epoch == producer.epoch {
@@ -498,6 +641,7 @@ impl Producers {
                 }
                 if producer.done.iter().all(|done| *done) {
                     producer.first += RECORDS;
+                    plan(&mut self.rng, producer, tick);
                     producer.done = [false; RECORDS as usize];
                     producer.uncertain = false;
                     producer.drain_refusals = 0;
@@ -646,6 +790,23 @@ fn broker_of(primary: NodeId) -> Option<usize> {
 }
 
 /// A random broker other than `broker`.
+/// Decide whether the batch starting now at `tick` is scheduled, and when
+/// each of its records is due.
+fn plan(rng: &mut Rng, producer: &mut Producer, tick: u64) {
+    let start = clock::wall_millis(clock::TICK * u32::try_from(tick).expect("tick fits u32"));
+    producer.due = rng.chance(SCHEDULED).then(|| {
+        std::array::from_fn(|_| {
+            start
+                .checked_add_signed(EARLIEST)
+                .expect("due time in range")
+                + rng.below(SPAN)
+        })
+    });
+    if let Some(due) = producer.due {
+        producer.scheduled.extend((producer.first..).zip(due));
+    }
+}
+
 fn other(rng: &mut Rng, broker: usize) -> usize {
     (broker + 1 + rng.below(BROKERS as u64 - 1) as usize) % BROKERS
 }

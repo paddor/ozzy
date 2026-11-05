@@ -1,7 +1,7 @@
 //! Random overlapping faults, as a Jepsen nemesis draws them: power loss,
 //! process kills, pauses, disk stalls and failures, cuts in either
-//! direction, and connection resets between brokers or to clients. Any two
-//! brokers may be down at once, so quorum comes and goes; only safety holds
+//! direction, connection resets between brokers or to clients, and clock
+//! steps. Any two brokers may be down at once, so quorum comes and goes; only safety holds
 //! meanwhile. Every fault ends when the drain starts, and the group must then
 //! converge.
 
@@ -17,6 +17,9 @@ const CAP: u64 = 1500;
 const RECONNECT: u64 = 50;
 /// At most this many brokers are down, paused, stalled, or failing at once.
 const DOWN: usize = 2;
+/// Clock steps within the tolerance, and past it, in milliseconds.
+const SMALL_STEP: (u64, u64) = (100, 900);
+const LARGE_STEP: (u64, u64) = (2_000, 60_000);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kind {
@@ -43,9 +46,12 @@ pub(crate) enum Kind {
     /// Every client connection to the broker drops; clients reconnect at
     /// once with fresh sessions.
     ClientReset,
+    /// The host's wall clock steps `offset` from true time, and back when
+    /// the fault ends. One host at a time, so two clocks always agree.
+    Skew,
 }
 
-const KINDS: [Kind; 10] = [
+const KINDS: [Kind; 11] = [
     Kind::PowerLoss,
     Kind::Kill,
     Kind::Pause,
@@ -56,6 +62,7 @@ const KINDS: [Kind; 10] = [
     Kind::Mute,
     Kind::LinkReset,
     Kind::ClientReset,
+    Kind::Skew,
 ];
 
 impl Kind {
@@ -80,6 +87,8 @@ pub(crate) struct Fault {
     pub broker: usize,
     /// The other end of a `LinkReset`.
     pub peer: usize,
+    /// A `Skew`'s clock offset in milliseconds.
+    pub offset: i64,
     pub until: u64,
 }
 
@@ -150,15 +159,28 @@ impl Chaos {
                 .iter()
                 .any(|fault| fault.broker == broker && fault.kind.cut()),
             Kind::LinkReset => connected(broker, peer),
+            Kind::Skew => !self.active.iter().any(|fault| fault.kind == Kind::Skew),
             _ => true,
         };
         if !allowed {
             return None;
         }
+        let offset = if kind == Kind::Skew {
+            let (low, high) = if self.rng.chance(0.5) {
+                SMALL_STEP
+            } else {
+                LARGE_STEP
+            };
+            let step = i64::try_from(low + self.rng.below(high - low + 1)).unwrap();
+            if self.rng.chance(0.5) { step } else { -step }
+        } else {
+            0
+        };
         let fault = Fault {
             kind,
             broker,
             peer,
+            offset,
             until: tick + length,
         };
         self.started[KINDS.iter().position(|known| *known == kind).unwrap()] += 1;

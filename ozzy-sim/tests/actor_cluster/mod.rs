@@ -34,7 +34,7 @@ use sim::{
     Fault::{
         self, CrashAll, CrashAllMidWrite, CrashFollower, CrashLeader, DeafLeader, FailFollowerDisk,
         FailLeaderDisk, IsolateFollower, IsolateLeader, KillFollower, KillLeader, MuteLeader,
-        PauseLeader, Recrash, Rewind, StallLeader,
+        PauseLeader, Recrash, Rewind, SkewLeader, StallLeader,
     },
     Options, Report,
 };
@@ -55,9 +55,13 @@ struct Scenario {
     records: bool,
     /// Random overlapping faults.
     chaos: bool,
-    /// Caps the profile's floors for confirmed proposals and compared ops,
-    /// where a full journal bounds them.
+    /// Clock-driven decisions wait for the clock guard.
+    guarded: bool,
+    /// Caps the profile's floors for confirmed proposals, records, and
+    /// compared ops, where a full journal bounds them.
     max_floor: usize,
+    /// Caps the records floor further.
+    max_record_floor: usize,
     min_applied: u64,
     min_refused: u64,
 }
@@ -72,7 +76,9 @@ const RANDOM: Scenario = Scenario {
     slow: &[],
     records: true,
     chaos: false,
+    guarded: true,
     max_floor: usize::MAX,
+    max_record_floor: usize::MAX,
     min_applied: 0,
     min_refused: 0,
 };
@@ -81,6 +87,11 @@ const RANDOM: Scenario = Scenario {
 /// doubling 2 s to 8 s election timeouts, over the slowest profiles.
 const LOST_LEADER: Fault = IsolateLeader {
     at: 2500,
+    ticks: 1500,
+};
+
+const SKEWED_LEADER: Fault = SkewLeader {
+    at: 500,
     ticks: 1500,
 };
 
@@ -136,13 +147,16 @@ fn scenario(name: &str) -> Option<Scenario> {
         // Packing gives sparse 32 KiB segments' operations dense ones, and
         // four of the six stay free for followers that need more. Clients and
         // producers share the space and are refused after about 80
-        // operations, then the full leader is lost.
+        // operations, then the full leader is lost. A scheduled batch also
+        // needs room to release each record alone, so it is refused early
+        // and its producer stays on it: a partition may get no records.
         "full" => Scenario {
             ticks: 3000,
             script: &[LOST_LEADER],
             max_segments: 6,
             segment_bytes: 32 * 1024,
             max_floor: 10,
+            max_record_floor: 0,
             min_refused: 1,
             ..RANDOM
         },
@@ -256,6 +270,19 @@ fn scenario(name: &str) -> Option<Scenario> {
             max_floor: 20,
             ..RANDOM
         },
+        // The leader's clock is 5 s ahead for 15 s. Its guard holds every
+        // release meanwhile, as no peer agrees.
+        "skew" => Scenario {
+            script: &[SKEWED_LEADER],
+            ..RANDOM
+        },
+        // Negative control: as `skew` without the guard. The leader releases
+        // records before they are due, and the run must fail.
+        "skew-unguarded" => Scenario {
+            script: &[SKEWED_LEADER],
+            guarded: false,
+            ..RANDOM
+        },
         // Negative control: every disk loses the last 5 s it reported done.
         // The run must fail.
         "rewind" => Scenario {
@@ -345,7 +372,9 @@ fn options(profile: &str, scenario: &str, partitions: usize) -> Options {
         slow: scenario.slow,
         records: scenario.records,
         chaos: scenario.chaos,
+        guarded: scenario.guarded,
         min_confirmed: floor,
+        min_records: floor.min(scenario.max_record_floor),
         min_compared: floor as u64,
         min_applied: scenario.min_applied,
         min_refused: scenario.min_refused,
@@ -581,6 +610,22 @@ fn one_way_cut_leaders_are_replaced() {
     one_partition(1, "none", "one-way");
 }
 
+/// A leader whose clock runs 5 s ahead releases nothing early, and releases
+/// every held record once its clock agrees again.
+#[test]
+fn skewed_leader_holds_releases_until_its_clock_agrees() {
+    let report = one_partition(1, "none", "skew");
+    assert!(report.scheduled >= 20, "{report:?}");
+}
+
+/// Negative control: without the clock guard, the skewed leader releases
+/// records early, and the checks must notice.
+#[test]
+fn unguarded_skewed_leader_releases_early() {
+    let reason = failure(1, "none", "skew-unguarded");
+    assert!(reason.contains("before its due time"), "{reason}");
+}
+
 /// Negative control: every disk loses what it reported done in the last 5 s.
 /// The checks must notice the lost confirmed operations.
 #[test]
@@ -596,15 +641,17 @@ fn rewound_disks_fail_the_run() {
 }
 
 /// Random overlapping faults, two brokers down at times, keep every
-/// confirmed record and converge once they end.
+/// confirmed record and converge once they end. One partition: a quiet
+/// network carries several thousand records.
 #[test]
 fn random_overlapping_faults_keep_history_and_converge() {
-    let report = checked(1, "none", "chaos");
+    let report = one_partition(1, "none", "chaos");
     assert!(report.faults >= 20, "{report:?}");
     eprintln!("{report:?}");
 }
 
-/// As above, with the light profile's loss, delay, and short cuts too.
+/// As above on both partitions, with the light profile's loss, delay, and
+/// short cuts too.
 #[test]
 fn random_overlapping_and_network_faults_keep_history_and_converge() {
     let report = checked(2, "light", "chaos");
@@ -622,6 +669,10 @@ fn regression_seeds() {
     // A follower refused a proposal it still held, after a due retention
     // turn had deferred to it. Nothing asked for the next round.
     one_partition(74, "slow", "crash");
+    // A due release waited for room in the leader's full pipeline, with a
+    // record queued behind it. The leader kept asking for another round, so
+    // its shard woke itself for a whole turn.
+    checked(8, "none", "sparse-followers");
 }
 
 /// Process-wide state would leak from one run into the next one.
@@ -643,7 +694,7 @@ mod seeded {
         const PROFILES: [&str; 5] = ["none", "light", "heavy", "swarm", "slow"];
         /// Each scenario with its profiles. Heavy and swarm faults leave too
         /// little progress to fill a journal.
-        const SCENARIOS: [(&str, &[&str]); 16] = [
+        const SCENARIOS: [(&str, &[&str]); 17] = [
             ("random", &PROFILES),
             ("failover", &PROFILES),
             ("slow-follower", &PROFILES),
@@ -660,6 +711,7 @@ mod seeded {
             ("pause", &PROFILES),
             ("one-way", &PROFILES),
             ("chaos", &PROFILES),
+            ("skew", &PROFILES),
         ];
 
         /// About 4800 operations in 75 segments before the leader is lost. A

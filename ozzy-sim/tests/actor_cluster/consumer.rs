@@ -14,6 +14,7 @@
 use crate::{
     broker::{Broker, GROUPS, PARTITIONS},
     check::leader,
+    clock,
     records::{LIMITS, Ledger, Producers},
     seeds::{Rng, Trace},
 };
@@ -373,6 +374,7 @@ impl Consumers {
                             first,
                             delivery.records,
                             0,
+                            now,
                             ledger,
                             producers,
                         )?;
@@ -384,13 +386,14 @@ impl Consumers {
                             first,
                             delivery.records,
                             0,
+                            now,
                             ledger,
                             producers,
                         )?;
                         let held = consumer.held.take();
                         if let (Some(skip), Some((held_first, records))) = (skip, held) {
                             deliver(
-                                index, consumer, held_first, records, skip, ledger, producers,
+                                index, consumer, held_first, records, skip, now, ledger, producers,
                             )?;
                         }
                     }
@@ -456,6 +459,7 @@ fn publication(
                 first,
                 delivery.records,
                 skip,
+                now,
                 ledger,
                 producers,
             )?;
@@ -475,13 +479,15 @@ fn owned(records: Records<'_>) -> Held {
         .collect()
 }
 
-/// Deliver `records` from offset `first`, after the first `skip`.
+/// Deliver `records` from offset `first`, after the first `skip`, at
+/// monotonic time `now`.
 fn read(
     index: usize,
     consumer: &mut Consumer,
     first: u64,
     records: Records<'_>,
     skip: u64,
+    now: Duration,
     ledger: &mut Ledger,
     producers: &Producers,
 ) -> Result<(), String> {
@@ -491,6 +497,7 @@ fn read(
         first,
         owned(records),
         skip,
+        now,
         ledger,
         producers,
     )
@@ -502,6 +509,7 @@ fn deliver(
     first: u64,
     records: Held,
     skip: u64,
+    now: Duration,
     ledger: &mut Ledger,
     producers: &Producers,
 ) -> Result<(), String> {
@@ -527,7 +535,13 @@ fn deliver(
                  {sequence}, which it never sent"
             ));
         }
-        ledger.read(producer, sequence, offset)?;
+        ledger.read(
+            producer,
+            sequence,
+            offset,
+            producers.due(producer, sequence),
+            clock::wall_millis(now),
+        )?;
         consumer.next += 1;
     }
     Ok(())

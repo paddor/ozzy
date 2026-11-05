@@ -231,6 +231,24 @@ impl Network {
         Ok(())
     }
 
+    /// A dispatcher's clock sample, already routed from `from`, on the
+    /// control lane to `to`. Dropped when that lane is full, as the
+    /// dispatcher drops it; the next one replaces it.
+    pub(crate) fn sample(
+        &mut self,
+        from: usize,
+        to: usize,
+        tick: u64,
+        message: Message,
+        trace: &mut Trace,
+    ) {
+        if self.path(from, to, Class::Control).queue.len() >= self.profile.capacity(Class::Control)
+        {
+            return;
+        }
+        self.enqueue(from, to, Class::Control, tick, message, trace);
+    }
+
     fn enqueue(
         &mut self,
         from: usize,

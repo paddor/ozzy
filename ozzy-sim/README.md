@@ -13,9 +13,10 @@ Deterministic workload and fault tests around Ozzy production code, plus the
   `ozzy-broker` integration tests and `ozzy_sim` both use it.
 - `tests/actor_cluster/` runs the production partition shards, up to two
   partitions each, and shard journals of three brokers on one thread from
-  one seed, over modeled links, disks, and clients: barrier proposals,
-  producers through native intake, and consumers through the reader service
-  and its live topic. A failing seed prints its reproduce command; see
+  one seed, over modeled links, disks, clients, and host clocks: barrier
+  proposals, producers through native intake, some records scheduled under
+  the production clock guard, and consumers through the reader service and
+  its live topic. A failing seed prints its reproduce command; see
   [seeded actor cluster](../DEVELOPMENT.md#seeded-actor-cluster).
 - An independent record oracle checks every submitted, confirmed, and
   delivered record.

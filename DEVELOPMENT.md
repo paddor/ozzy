@@ -116,7 +116,7 @@ system tests in that slice.
 | --- | --- | --- | --- |
 | Unit and core | Codecs, state transitions, bounds, authority fences | `src/` and `tests/` of `ozzy-proto`, `ozzy-core`, `ozzy-journal`, `ozzy-journal-segment`, `ozzy-replication`, `ozzy-config` | `default` |
 | Core simulation | Replayable protocol fault schedules with gated time, messages, and file jobs | `ozzy-sim/tests/` | `default`; `stress` in `extended` |
-| Seeded actor cluster | Production partition shards of three brokers, each with two partitions on one device, on one thread from one seed: link, disk, and client faults, scripted leader loss, power loss and restart, per-tick history checks, record and read checks, convergence, missed wakeups | `ozzy-sim/tests/actor_cluster/` | `default`; seed campaign in `extended` |
+| Seeded actor cluster | Production partition shards of three brokers, each with two partitions on one device, on one thread from one seed: link, disk, client, and clock faults, scripted leader loss, power loss and restart, per-tick history checks, record, release, and read checks, convergence, missed wakeups | `ozzy-sim/tests/actor_cluster/` | `default`; seed campaign in `extended` |
 | Inproc integration | Real SDKs and brokers over OMQ inproc and memory file jobs; owner lifecycle | `ozzy-broker/tests/journals/serving/`, `ozzy-sim/tests/broker/` | `default`; `stress` in `extended` |
 | Full-product simulator | Sustained workload and fault churn over real owners, SDKs, and brokers | `ozzy-sim` `ozzy_sim` binary | Short gate in `default`; long runs manual |
 | Backend conformance | The same owned file operations on the pool and AIO backends | `ozzy-io-pool/tests/`, `ozzy-io-aio/tests/` | `default` |
@@ -130,8 +130,9 @@ What a layer does not prove:
 
 - Unit and core: only finite state and format cases.
 - Core simulation: only within model bounds and injected faults.
-- Seeded actor cluster: modeled links with OMQ semantics, no sockets, broker
-  frontend, or SDKs.
+- Seeded actor cluster: modeled links with OMQ semantics, no sockets or
+  SDKs. Of the broker frontend, only the clock guard, client links, and
+  reader grants run.
 - Inproc: no ZMTP wire and no physical disk. Threaded scheduling stays
   nondeterministic.
 - Simulator: seed replay reproduces the fault prefix, not the transport
@@ -254,10 +255,12 @@ with the queued writes in flight; `disk-stall`, where the leader's disk
 completes nothing for 15 s while its links stay up, and another broker must
 take over; `pause`, where the leader's process runs nothing for 15 s, then
 resumes into a newer view; `one-way`, where the leader first hears
-nothing, then a later leader can send nothing; and `chaos`, where random
-overlapping faults hit any broker: power loss, kills, pauses, disk stalls
-and failures, cuts in either direction, and broker or client connection
-resets that drop queued frames. Up to two brokers are down at once, so only
+nothing, then a later leader can send nothing; `skew`, where the leader's
+clock runs 5 s ahead for 15 s; and `chaos`, where random overlapping faults
+hit any broker: power loss, kills, pauses, disk stalls and failures, cuts
+in either direction, broker or client connection resets that drop queued
+frames, and clock steps on one host at a time, within the 1000 ms tolerance
+or far past it. Up to two brokers are down at once, so only
 safety holds until the drain ends every fault. A power loss puts some queued
 writes in the cache unreported, even `O_DSYNC` ones, then lets a seeded share
 of cached 512-byte sectors reach media, so unsynced writes tear and land out
@@ -265,6 +268,12 @@ of order. The power-loss fast test also bounds the outage, which grows when a
 restart refetches or replays all history. The three sparse or full scenarios
 skip `heavy` and `swarm`, which make too little progress to fill a journal.
 
+Each broker's dispatcher runs the production clock guard, sampling its
+host's wall clock against its peers over the modeled control links, and its
+journals decide clock-driven work only while the guard trusts that clock.
+Nothing wakes a partition when the guard resumes or a trusted clock steps,
+so a safety sweep that finds work within 4 s of either only counts in
+`Report::clock_wakeups`; any other sweep that finds work fails the run.
 Each broker's shard hosts two partitions on one device. Beside barrier
 proposals on the first, four producers append records through each broker's
 production native intake, and four consumers read the partitions as the SDK
@@ -273,17 +282,24 @@ reader service, then its live topic, merged by the production `LiveCursor`.
 A live copy goes only to a consumer the broker's reader grants admit and
 drops on a full queue or by the profile's PUB loss; a gap holds it and
 replays up to it. A leader change or silence replays from the next offset
-again. Every confirmation and delivery goes through one ledger per
-partition: one offset per record, one record per offset, each producer's
-records in sequence order, and payloads as sent. At the end the consumers
-must have read every copy's whole log, every confirmed record among it, and
-an unconfirmed record only from a batch whose outcome stayed unknown.
+again. A third of the batches are scheduled, each record due between
+0.5 s ago and 3 s ahead. Every confirmation and delivery goes through one
+ledger per partition: one offset and schedule sequence per record, one
+record per offset and schedule sequence, each producer's unscheduled
+records in sequence order, scheduled ones released in order of due time,
+then schedule sequence, never more than the tolerance early by true time,
+and payloads as sent. At the end the consumers
+must have read every copy's whole log, every confirmed record among it,
+scheduled ones too, and an unconfirmed record only from a batch whose
+outcome stayed unknown.
 `sparse-rejoin` runs without records: they fill the leader, and a sparse
 copy of a full leader does not fit. Scripted cases in the fast suite host
 one partition, with two producers and two consumers, to stay near ten
 seconds; campaigns run every scenario over both. In the negative control
 `rewound_disks_fail_the_run`, every disk restarts from a copy taken 5 s
-before a power loss, and the checks must fail.
+before a power loss, and the checks must fail; in
+`unguarded_skewed_leader_releases_early`, the skewed leader decides without
+the guard and must be caught releasing early.
 
 A failing seed prints its parameters, schedule hash, and this command with
 `OZZY_ACTOR_SIM_SEED`, `OZZY_ACTOR_SIM_PROFILE`,

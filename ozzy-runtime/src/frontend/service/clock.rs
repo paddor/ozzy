@@ -134,6 +134,40 @@ impl ClockSampling {
         }
     }
 
+    /// Age out stale samples and publish what the rest say. Returns this
+    /// broker's wall time once a sample to each broker peer is due.
+    pub fn tick(&mut self) -> Option<u64> {
+        let now = (self.now)();
+        self.forget_after_step(now);
+        self.evaluate(now);
+        if now.monotonic < self.next_sample {
+            return None;
+        }
+        self.next_sample = now.monotonic.saturating_add(SAMPLE_INTERVAL);
+        Some(now.wall_millis)
+    }
+
+    /// Keep `peer`'s sample of its wall time, received on its current
+    /// session, and publish the verdict.
+    pub fn observe(&mut self, peer: NodeId, wall_millis: u64) {
+        let now = (self.now)();
+        self.forget_after_step(now);
+        self.guard
+            .observe(peer, wall_millis, now.wall_millis, now.monotonic);
+        self.evaluate(now);
+    }
+
+    /// When [`Self::tick`] next returns a sample, on the deadlines' origin.
+    pub fn deadline(&self) -> Duration {
+        self.next_sample
+    }
+
+    /// Send the next sample without waiting for the interval, as for a new
+    /// broker link.
+    pub fn sample_soon(&mut self) {
+        self.next_sample = Duration::ZERO;
+    }
+
     /// Offsets measured before a clock step mean nothing after it. Keeping them
     /// would let one new sample and one old one outvote the truth.
     fn forget_after_step(&mut self, now: ClockNow) {
@@ -215,23 +249,16 @@ impl Service {
 
     /// When [`Self::clock_tick`] is next due, on the deadlines' origin.
     pub fn clock_deadline(&self) -> Option<Duration> {
-        self.clock.as_ref().map(|clock| clock.next_sample)
+        self.clock.as_ref().map(ClockSampling::deadline)
     }
 
     /// Age out stale samples and send each broker peer this broker's wall time
     /// when due. A sample that does not fit its queue is dropped; the next one
     /// replaces it.
     pub fn clock_tick(&mut self) {
-        let Some(clock) = &mut self.clock else {
+        let Some(wall_millis) = self.clock.as_mut().and_then(ClockSampling::tick) else {
             return;
         };
-        let now = (clock.now)();
-        clock.forget_after_step(now);
-        clock.evaluate(now);
-        if now.monotonic < clock.next_sample {
-            return;
-        }
-        clock.next_sample = now.monotonic.saturating_add(SAMPLE_INTERVAL);
         let links: Vec<_> = (self.peers.iter())
             .filter(|(_, state)| state.access.kind == Kind::Broker)
             .filter_map(|(&peer, state)| Some((peer, state.link?.binding.session)))
@@ -245,7 +272,7 @@ impl Service {
                 session: Some(session),
             };
             let limits = EnvelopeLimits::default();
-            if let Ok((header, wall)) = clock::encode_sample(envelope, now.wall_millis, limits) {
+            if let Ok((header, wall)) = clock::encode_sample(envelope, wall_millis, limits) {
                 let frames = vec![
                     Bytes::copy_from_slice(&header),
                     Bytes::copy_from_slice(&wall),
@@ -259,7 +286,7 @@ impl Service {
     /// A new broker link sends its first sample without waiting for the tick.
     pub(super) fn sample_soon(&mut self) {
         if let Some(clock) = &mut self.clock {
-            clock.next_sample = Duration::ZERO;
+            clock.sample_soon();
         }
     }
 
@@ -281,12 +308,7 @@ impl Service {
             return Err(ReceiveError::Peer);
         }
         if let Some(clock) = &mut self.clock {
-            let now = (clock.now)();
-            clock.forget_after_step(now);
-            clock
-                .guard
-                .observe(peer, wall, now.wall_millis, now.monotonic);
-            clock.evaluate(now);
+            clock.observe(peer, wall);
         }
         Ok(())
     }
